@@ -24,7 +24,8 @@ class GenerationService:
                 "gpt-4": "gpt-4",
             },
             "deepseek": {
-                "deepseek-chat": "deepseek-chat",
+                "deepseek-v3": "deepseek-chat",
+                "deepseek-r1": "deepseek-reasoner",
             }
         }
         
@@ -123,7 +124,8 @@ class GenerationService:
         model_name: str,
         query: str,
         context: str,
-        api_key: Optional[str] = None
+        api_key: Optional[str] = None,
+        show_reasoning: bool = True
     ) -> str:
         """使用DeepSeek API生成回答"""
         try:
@@ -132,29 +134,34 @@ class GenerationService:
                 if not api_key:
                     raise ValueError("DeepSeek API key not provided")
                     
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            data = {
-                "model": self.models["deepseek"][model_name],
-                "messages": [
-                    {"role": "system", "content": "You are a helpful assistant. Use the provided context to answer the question."},
-                    {"role": "user", "content": f"Context: {context}\n\nQuestion: {query}"}
-                ]
-            }
-            
-            response = requests.post(
-                "https://api.deepseek.com/v1/chat/completions",
-                headers=headers,
-                json=data
+            client = OpenAI(
+                api_key=api_key,
+                base_url="https://api.deepseek.com"
             )
             
-            if response.status_code != 200:
-                raise Exception(f"DeepSeek API error: {response.text}")
+            messages = [
+                {"role": "system", "content": "You are a helpful assistant. Use the provided context to answer the question."},
+                {"role": "user", "content": f"Context: {context}\n\nQuestion: {query}"}
+            ]
+            
+            response = client.chat.completions.create(
+                model=self.models["deepseek"][model_name],
+                messages=messages,
+                max_tokens=512,
+                stream=False
+            )
+            
+            # 如果是推理模型，处理思维链输出
+            if model_name == "deepseek-r1":
+                message = response.choices[0].message
+                reasoning = message.reasoning_content
+                answer = message.content
                 
-            return response.json()["choices"][0]["message"]["content"].strip()
+                if show_reasoning and reasoning:
+                    return f"【思维过程】\n{reasoning}\n\n【最终答案】\n{answer}"
+                return answer
+            
+            return response.choices[0].message.content.strip()
             
         except Exception as e:
             logger.error(f"Error generating with DeepSeek: {str(e)}")
@@ -166,7 +173,8 @@ class GenerationService:
         model_name: str,
         query: str,
         search_results: List[Dict],
-        api_key: Optional[str] = None
+        api_key: Optional[str] = None,
+        show_reasoning: bool = True
     ) -> Dict:
         """生成回答并保存结果"""
         try:
@@ -182,7 +190,7 @@ class GenerationService:
             elif provider == "openai":
                 response = self._generate_with_openai(model_name, query, context, api_key)
             elif provider == "deepseek":
-                response = self._generate_with_deepseek(model_name, query, context, api_key)
+                response = self._generate_with_deepseek(model_name, query, context, api_key, show_reasoning)
             else:
                 raise ValueError(f"Unsupported provider: {provider}")
                 

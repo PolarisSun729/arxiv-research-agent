@@ -15,6 +15,7 @@ const Generation = () => {
   const [searchResults, setSearchResults] = useState([]);
   const [selectedFile, setSelectedFile] = useState('');
   const [searchFiles, setSearchFiles] = useState([]);
+  const [showReasoning, setShowReasoning] = useState(true);
 
   // 加载可用模型列表和搜索结果文件列表
   useEffect(() => {
@@ -94,7 +95,8 @@ const Generation = () => {
           provider,
           model_name: modelName,
           search_results: searchResults,
-          api_key: apiKey || null
+          api_key: apiKey || null,
+          show_reasoning: showReasoning
         }),
       });
 
@@ -174,7 +176,11 @@ const Generation = () => {
                       >
                         <option value="">Select model...</option>
                         {Object.entries(models[provider] || {}).map(([id, name]) => (
-                          <option key={id} value={id}>{name}</option>
+                          <option key={id} value={id}>
+                            {id === 'deepseek-v3' ? 'DeepSeek V3' :
+                             id === 'deepseek-r1' ? 'DeepSeek R1' :
+                             name}
+                          </option>
                         ))}
                       </select>
                     </div>
@@ -190,6 +196,21 @@ const Generation = () => {
                         placeholder="Enter your API key..."
                         className="block w-full p-2 border rounded"
                       />
+                    </div>
+                  )}
+
+                  {provider === 'deepseek' && modelName === 'deepseek-r1' && (
+                    <div className="flex items-center space-x-2">
+                      <input
+                        type="checkbox"
+                        id="showReasoning"
+                        checked={showReasoning}
+                        onChange={(e) => setShowReasoning(e.target.checked)}
+                        className="rounded border-gray-300 text-green-500 focus:ring-green-500"
+                      />
+                      <label htmlFor="showReasoning" className="text-sm font-medium">
+                        显示思维链过程
+                      </label>
                     </div>
                   )}
 
