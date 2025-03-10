@@ -1,3 +1,2 @@
+启动后端
 uvicorn main:app --reload --port 8001
-
-https://blog.csdn.net/qq_27586341/article/details/105432400
