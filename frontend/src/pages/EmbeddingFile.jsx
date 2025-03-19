@@ -1,6 +1,7 @@
 // src/pages/EmbeddingFile.jsx
 import React, { useState, useEffect } from 'react';
 import RandomImage from '../components/RandomImage';
+import { apiBaseUrl } from '../config/config';
 
 const EmbeddingFile = () => {
   const [selectedDoc, setSelectedDoc] = useState('');
@@ -40,7 +41,7 @@ const EmbeddingFile = () => {
   const fetchAvailableDocs = async () => {
     try {
       // 获取所有可用于embedding的文档（包括loaded和chunked）
-      const response = await fetch('http://localhost:8001/documents?type=all');
+      const response = await fetch('http://192.168.172.128:8001/documents?type=all');
       const data = await response.json();
       setAvailableDocs(data.documents);
     } catch (error) {
@@ -50,7 +51,7 @@ const EmbeddingFile = () => {
 
   const fetchEmbeddedDocs = async () => {
     try {
-      const response = await fetch('http://localhost:8001/list-embedded');
+      const response = await fetch(`${apiBaseUrl}/list-embedded`);
       const data = await response.json();
       setEmbeddedDocs(data.documents);
     } catch (error) {
@@ -66,7 +67,7 @@ const EmbeddingFile = () => {
     
     setStatus('Processing...');
     try {
-      const response = await fetch('http://localhost:8001/embed', {
+      const response = await fetch('http://192.168.172.128:8001/embed', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -95,7 +96,7 @@ const EmbeddingFile = () => {
 
   const handleDeleteEmbedding = async (docName) => {
     try {
-      const response = await fetch(`http://localhost:8001/embedded-docs/${docName}`, {
+      const response = await fetch(`http://192.168.172.128:8001/embedded-docs/${docName}`, {
         method: 'DELETE',
       });
 
@@ -117,7 +118,7 @@ const EmbeddingFile = () => {
   const handleViewEmbedding = async (docName) => {
     try {
       setStatus('Loading embedding...');
-      const response = await fetch(`http://localhost:8001/embedded-docs/${docName}`);
+      const response = await fetch(`http://192.168.172.128:8001/embedded-docs/${docName}`);
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
