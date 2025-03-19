@@ -44,9 +44,33 @@ git clone https://github.com/huangjia2019/rag-project01-framework.git
 
 - 运行 `npm install` 命令来安装项目依赖的前端组件。
 
-4. #### 运行前端组件：
+#### 4. 运行前端组件：
 
-- 运行 `npm run dev` 命令来安装项目依赖的前端组件。
+修改`frontend\src\config\config.js`中的代码环境地址`apiBaseUrl`
+
+```bash
+const config = {
+              development: {
+                apiBaseUrl: 'http://192.168.172.128:8001'
+              },
+              production: {
+                apiBaseUrl: 'http://api.example.com'
+              },
+              test: {
+                apiBaseUrl: 'http://localhost:8001'
+              }
+            };
+```
+
+运行 `npm run dev` 命令来安装项目依赖的前端组件。
+
+```bash
+# 默认是 development 环境
+npm run dev
+
+# 或者指定环境
+npm run dev -- --mode production
+```
 
 ### 部署后端 (Ubuntu) 
 
