@@ -8,7 +8,48 @@ from datetime import datetime
 import json
 
 logger = logging.getLogger(__name__)
-
+"""
+PDF文档加载服务类
+    这个服务类提供了多种PDF文档加载方法，支持不同的加载策略和分块选项。
+    主要功能：
+    1. 支持多种PDF解析库：
+        - PyMuPDF (fitz): 适合快速处理大量PDF文件，性能最佳
+        - PyPDF: 适合简单的PDF文本提取，依赖较少
+        - pdfplumber: 适合需要处理表格或需要文本位置信息的场景
+        - unstructured: 适合需要更好的文档结构识别和灵活分块策略的场景
+    
+    2. 文档加载特性：
+        - 保持页码信息
+        - 支持文本分块
+        - 提供元数据存储
+        - 支持不同的加载策略（使用unstructured时）
+    
+    使用示例:
+        ```python
+        loader = LoadingService()
+        
+        # 使用PyMuPDF加载
+        text = loader.load_pdf("document.pdf", method="pymupdf")
+        
+        # 使用unstructured加载，带策略
+        text = loader.load_pdf(
+            "document.pdf",
+            method="unstructured",
+            strategy="fast",
+            chunking_strategy="basic",
+            chunking_options={
+                "maxCharacters": 4000,
+                "newAfterNChars": 3000
+            }
+        )
+        
+        # 获取总页数
+        total_pages = loader.get_total_pages()
+        
+        # 获取页面映射
+        page_map = loader.get_page_map()
+        ```
+ """
 class LoadingService:
     def __init__(self):
         self.total_pages = 0
