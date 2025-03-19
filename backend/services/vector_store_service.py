@@ -11,30 +11,92 @@ from utils.config import VectorDBProvider, MILVUS_CONFIG  # Updated import
 logger = logging.getLogger(__name__)
 
 class VectorDBConfig:
+    """
+    向量数据库配置类，用于存储和管理向量数据库的配置信息
+    """
     def __init__(self, provider: str, index_mode: str):
+        """
+        初始化向量数据库配置
+        
+        参数:
+            provider: 向量数据库提供商名称
+            index_mode: 索引模式
+        """
         self.provider = provider
         self.index_mode = index_mode
         self.milvus_uri = MILVUS_CONFIG["uri"]
 
     def _get_milvus_index_type(self, index_mode: str) -> str:
+        """
+        根据索引模式获取Milvus索引类型
+        
+        参数:
+            index_mode: 索引模式
+            
+        返回:
+            对应的Milvus索引类型
+        """
         return MILVUS_CONFIG["index_types"].get(index_mode, "FLAT")
     
     def _get_milvus_index_params(self, index_mode: str) -> Dict[str, Any]:
+        """
+        根据索引模式获取Milvus索引参数
+        
+        参数:
+            index_mode: 索引模式
+            
+        返回:
+            对应的Milvus索引参数字典
+        """
         return MILVUS_CONFIG["index_params"].get(index_mode, {})
 
 class VectorStoreService:
+    """
+    向量存储服务类，提供向量数据的索引、查询和管理功能
+    """
     def __init__(self):
+        """
+        初始化向量存储服务
+        """
         self.initialized_dbs = {}
         # 确保存储目录存在
         os.makedirs("03-vector-store", exist_ok=True)
     
     def _get_milvus_index_type(self, config: VectorDBConfig) -> str:
+        """
+        从配置对象获取Milvus索引类型
+        
+        参数:
+            config: 向量数据库配置对象
+            
+        返回:
+            Milvus索引类型
+        """
         return config._get_milvus_index_type(config.index_mode)
     
     def _get_milvus_index_params(self, config: VectorDBConfig) -> Dict[str, Any]:
+        """
+        从配置对象获取Milvus索引参数
+        
+        参数:
+            config: 向量数据库配置对象
+            
+        返回:
+            Milvus索引参数字典
+        """
         return config._get_milvus_index_params(config.index_mode)
     
     def index_embeddings(self, embedding_file: str, config: VectorDBConfig) -> Dict[str, Any]:
+        """
+        将嵌入向量索引到向量数据库
+        
+        参数:
+            embedding_file: 嵌入向量文件路径
+            config: 向量数据库配置对象
+            
+        返回:
+            索引结果信息字典
+        """
         start_time = datetime.now()
         
         # 读取embedding文件
@@ -57,7 +119,15 @@ class VectorStoreService:
         }
     
     def _load_embeddings(self, file_path: str) -> Dict[str, Any]:
-        """加载embedding文件，返回配置信息和embeddings"""
+        """
+        加载embedding文件，返回配置信息和embeddings
+        
+        参数:
+            file_path: 嵌入向量文件路径
+            
+        返回:
+            包含嵌入向量和元数据的字典
+        """
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -75,6 +145,16 @@ class VectorStoreService:
             raise
     
     def _index_to_milvus(self, embeddings_data: Dict[str, Any], config: VectorDBConfig) -> Dict[str, Any]:
+        """
+        将嵌入向量索引到Milvus数据库
+        
+        参数:
+            embeddings_data: 嵌入向量数据
+            config: 向量数据库配置对象
+            
+        返回:
+            索引结果信息字典
+        """
         try:
             # 使用 filename 作为 collection 名称前缀
             filename = embeddings_data.get("filename", "")
@@ -205,6 +285,15 @@ class VectorStoreService:
             connections.disconnect("default")
 
     def list_collections(self, provider: str) -> List[str]:
+        """
+        列出指定提供商的所有集合
+        
+        参数:
+            provider: 向量数据库提供商
+            
+        返回:
+            集合名称列表
+        """
         if provider == VectorDBProvider.MILVUS:
             try:
                 connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
@@ -215,6 +304,16 @@ class VectorStoreService:
         return []
 
     def delete_collection(self, provider: str, collection_name: str) -> bool:
+        """
+        删除指定的集合
+        
+        参数:
+            provider: 向量数据库提供商
+            collection_name: 集合名称
+            
+        返回:
+            是否删除成功
+        """
         if provider == VectorDBProvider.MILVUS:
             try:
                 connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
@@ -225,6 +324,16 @@ class VectorStoreService:
         return False
 
     def get_collection_info(self, provider: str, collection_name: str) -> Dict[str, Any]:
+        """
+        获取指定集合的信息
+        
+        参数:
+            provider: 向量数据库提供商
+            collection_name: 集合名称
+            
+        返回:
+            集合信息字典
+        """
         if provider == VectorDBProvider.MILVUS:
             try:
                 connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])

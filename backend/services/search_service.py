@@ -10,20 +10,44 @@ import json
 logger = logging.getLogger(__name__)
 
 class SearchService:
+    """
+    搜索服务类，负责向量数据库的连接和向量搜索功能
+    提供集合列表查询、向量相似度搜索和搜索结果保存等功能
+    """
     def __init__(self):
+        """
+        初始化搜索服务
+        创建嵌入服务实例，设置Milvus连接URI，初始化搜索结果保存目录
+        """
         self.embedding_service = EmbeddingService()
         self.milvus_uri = MILVUS_CONFIG["uri"]
         self.search_results_dir = "04-search-results"
         os.makedirs(self.search_results_dir, exist_ok=True)
 
     def get_providers(self) -> List[Dict[str, str]]:
-        """获取支持的向量数据库列表"""
+        """
+        获取支持的向量数据库列表
+        
+        Returns:
+            List[Dict[str, str]]: 支持的向量数据库提供商列表
+        """
         return [
             {"id": VectorDBProvider.MILVUS.value, "name": "Milvus"}
         ]
 
     def list_collections(self, provider: str = VectorDBProvider.MILVUS.value) -> List[Dict[str, Any]]:
-        """获取指定向量数据库中的所有集合"""
+        """
+        获取指定向量数据库中的所有集合
+        
+        Args:
+            provider (str): 向量数据库提供商，默认为Milvus
+            
+        Returns:
+            List[Dict[str, Any]]: 集合信息列表，包含id、名称和实体数量
+            
+        Raises:
+            Exception: 连接或查询集合时发生错误
+        """
         try:
             connections.connect(
                 alias="default",
@@ -53,7 +77,20 @@ class SearchService:
             connections.disconnect("default")
 
     def save_search_results(self, query: str, collection_id: str, results: List[Dict[str, Any]]) -> str:
-        """保存搜索结果"""
+        """
+        保存搜索结果到JSON文件
+        
+        Args:
+            query (str): 搜索查询文本
+            collection_id (str): 集合ID
+            results (List[Dict[str, Any]]): 搜索结果列表
+            
+        Returns:
+            str: 保存文件的路径
+            
+        Raises:
+            Exception: 保存文件时发生错误
+        """
         try:
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             # 使用集合ID的基础名称（去掉路径相关字符）
@@ -87,7 +124,23 @@ class SearchService:
                     threshold: float = 0.7,
                     word_count_threshold: int = 20,
                     save_results: bool = False) -> Dict[str, Any]:
-        """执行向量搜索"""
+        """
+        执行向量搜索
+        
+        Args:
+            query (str): 搜索查询文本
+            collection_id (str): 要搜索的集合ID
+            top_k (int): 返回的最大结果数量，默认为3
+            threshold (float): 相似度阈值，低于此值的结果将被过滤，默认为0.7
+            word_count_threshold (int): 文本字数阈值，低于此值的结果将被过滤，默认为20
+            save_results (bool): 是否保存搜索结果，默认为False
+            
+        Returns:
+            Dict[str, Any]: 包含搜索结果的字典，如果保存结果则包含保存路径
+            
+        Raises:
+            Exception: 搜索过程中发生错误
+        """
         try:
             # 添加参数日志
             logger.info(f"Search parameters:")
