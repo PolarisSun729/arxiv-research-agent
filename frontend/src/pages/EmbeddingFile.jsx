@@ -95,7 +95,7 @@ const EmbeddingFile = () => {
     
     setStatus('Processing...');
     try {
-      const response = await fetch('http://{apiBaseUrl}/embed', {
+      const response = await fetch(`${apiBaseUrl}/embed`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
