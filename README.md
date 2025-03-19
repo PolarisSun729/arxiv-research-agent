@@ -1,0 +1,274 @@
+# 手工制作一个RAG框架
+
+一个从零开始实现的 RAG (Retrieval Augmented Generation) 系统，不依赖现有的 RAG 框架。该项目旨在提供一个轻量级、可定制的知识库问答解决方案。
+![RAG Frontend](images/RAG-fontend.png)
+
+## 项目概述
+
+本项目是一个完全自主实现的 RAG 系统，通过将文档分块、向量化存储、相似度检索等核心功能模块化实现，使用户能够构建自己的知识库问答系统。
+
+### 核心特性
+
+- 文档分块：支持自定义大小的文档分块策略
+- 向量化存储：将文本块转换为向量并高效存储
+- 相似度检索：基于向量相似度进行智能匹配
+- 无框架依赖：不依赖 LangChain 等重量级 RAG 框架
+- 跨平台支持：同时支持 Windows 和 Ubuntu 环境
+
+## 部署安装
+
+### 拉取代码
+
+你可以通过克隆此仓库到你的本地机器来开始：
+
+```shell
+git clone https://github.com/huangjia2019/rag-project01-framework.git
+```
+
+然后导航至目录，并按照部署前端或后端的指示开始操作。
+
+### 部署前端 (Ubuntu) 
+
+#### 1. 检查是否已安装 npm：
+
+- 进入前端项目目录（例如 `cd frontend/`）。
+- 在终端中运行命令：`npm -v`
+- 如果已安装，将显示 npm 的版本号。
+
+#### 2. 安装 Node.js 和 npm：
+
+- 更新 apt 软件包列表：`sudo apt update`
+- 安装 Node.js 和 npm：`sudo apt install nodejs npm -y`
+
+#### 3. 安装前端组件：
+
+- 运行 `npm install` 命令来安装项目依赖的前端组件。
+
+4. #### 运行前端组件：
+
+- 运行 `npm run dev` 命令来安装项目依赖的前端组件。
+
+### 部署后端 (Ubuntu) 
+
+本项目使用 Python v3.10 开发，完整 Python 依赖软件包见[requirements_ubun.txt](https://github.com/huangjia2019/rag-project01-framework/blob/master/requirements_ubun.txt) 和 [requirements_win.txt](https://github.com/huangjia2019/rag-project01-framework/blob/master/requirements_win.txt)。
+
+- Windows 环境： [requirements_win.txt](https://github.com/huangjia2019/rag-project01-framework/blob/master/requirements_win.txt)
+- Ubuntu 环境： [requirements_ubun.txt](https://github.com/huangjia2019/rag-project01-framework/blob/master/requirements_ubun.txt)
+
+关键依赖的官方文档如下：
+
+- Python 环境管理 [Miniconda](https://docs.conda.io/projects/miniconda/en/latest/)
+
+#### 1. 安装 Miniconda
+
+```shell
+mkdir -p ~/miniconda3
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda3/miniconda.sh
+bash ~/miniconda3/miniconda.sh -b -u -p ~/miniconda3
+rm -rf ~/miniconda3/miniconda.sh
+```
+
+安装完成后，建议新建一个 Python 虚拟环境，命名为 `langchain`。
+
+```shell
+conda create -n Project01 python=3.10
+
+# 激活环境
+conda activate Project01 
+```
+
+#### 2. 安装后端依赖：
+
+```
+pip install -r requirements_ubun.txt
+```
+
+#### 3. 配置 OpenAI API Key
+
+根据你使用的命令行工具，在 `~/.bashrc` 或 `~/.zshrc` 中配置 `OPENAI_API_KEY` 环境变量：
+
+```shell
+export OPENAI_API_KEY="xxxx"
+export DEEPSEEK_API_KEY="xxxx"
+```
+
+#### 4. 启动后端
+
+上述开发环境安装完成后，使用`uvicorn`启动后端
+
+```shell
+uvicorn main:app --reload --port 8001
+```
+
+*(请确保您的后端主文件是 `main.py` 并且 FastAPI 应用实例名为 `app`。如果端口 `8001` 被占用，请更换为其他可用端口。)*
+
+
+## 技术架构
+
+### 技术栈
+- 后端：Python FastAPI
+- 向量数据库：Milvus
+- 传统数据库：PostgreSQL
+- 前端：React + TypeScript
+- 部署：Docker + Kubernetes
+
+### 系统架构
+1. 数据处理层
+   - 文档解析器：支持 PDF、Word、Markdown 等格式
+   - 文本分块器：基于语义的动态分块策略
+   - 向量化模块：使用 BERT/OpenAI Embeddings 进行文本向量化
+
+2. 存储层
+   - 向量存储：使用 Milvus/FAISS 进行高效向量检索
+   - 元数据存储：PostgreSQL 存储文档元信息和用户数据
+   - 缓存层：Redis 用于查询缓存和会话管理
+
+3. 检索层
+   - 语义检索：基于余弦相似度的向量检索
+   - 混合排序：结合 TF-IDF 和向量相似度的混合排序策略
+   - 上下文增强：动态调整上下文窗口大小
+
+4. 应用层
+   - RESTful API：标准化的 HTTP 接口
+   - WebSocket：实时对话功能支持
+   - 认证授权：JWT based 身份认证
+
+### 核心功能模块
+1. 文档管理模块
+   - 文档上传与解析
+   - 文档版本控制
+   - 批量导入导出
+
+2. 知识库管理
+   - 知识库创建与维护
+   - 文档分类与标签管理
+   - 索引更新与优化
+
+3. 检索问答模块
+   - 智能问答
+   - 相关度反馈
+   - 答案解释与溯源
+
+4. 系统管理模块
+   - 用户权限管理
+   - 系统监控告警
+   - 运营数据分析
+
+## 项目架构 
+
+### 后端项目架构 
+```
+bac
+├── main.py                                 # 主入口文件
+│
+├── services/                               # 服务层目录
+│   ├── archive/                           # 归档服务目录
+│   │   └── vector_store_service_langchain.py  # LangChain向量存储实现
+│   │
+│   ├── chunking_service.py                # 文本分块服务
+│   ├── embedding_service.py               # 文本嵌入服务
+│   ├── generation_service.py              # 内容生成服务
+│   ├── loading_service.py                 # 数据加载服务
+│   ├── parsing_service.py                 # 文本解析服务
+│   ├── search_service.py                  # 搜索服务
+│   └── vector_store_service.py            # 向量存储基础服务
+│
+└── utils/                                 # 工具目录
+    └── config.py                          # 配置文件
+```
+### 前端项目架构 
+```
+frontend/
+├── public/                # 静态资源目录
+│   └── vite.svg          # Vite logo
+├── src/                  # 源代码目录
+│   ├── assets/          # 项目资源文件(图片、字体等)
+│   ├── components/      # 可复用的 React 组件
+│   ├── pages/           # 页面级组件
+│   ├── App.css         # App 组件样式
+│   ├── App.jsx         # 根组件
+│   ├── index.css       # 全局样式
+│   └── main.jsx        # 应用入口文件
+├── .gitignore           # Git 忽略文件配置
+├── eslint.config.js     # ESLint 代码规范配置
+├── index.html          # 项目 HTML 模板
+├── note.txt            # 项目笔记
+├── package.json        # 项目依赖和脚本配置
+├── package-lock.json   # 依赖版本锁定文件
+├── postcss.config.js   # PostCSS 配置
+├── README.md          # 项目说明文档
+├── tailwind.config.js  # Tailwind CSS 配置
+└── vite.config.js     # Vite 构建工具配置 
+```
+
+## 常见部署异常
+
+### 1. vite报错
+
+```bash
+npm run dev
+
+> frontend-241123@0.0.0 dev
+> vite
+
+file:///root/AI-Box/code/rag/rag-project01-framework/frontend/node_modules/vite/bin/vite.js:7
+    await import('source-map-support').then((r) => r.default.install())
+    ^^^^^
+
+SyntaxError: Unexpected reserved word
+    at Loader.moduleStrategy (internal/modules/esm/translators.js:133:18)
+    at async link (internal/modules/esm/module_job.js:42:21)
+```
+
+这个错误通常是因为 Node.js 版本过低导致的。Vite 需要 Node.js 14.18+ 或 16+ 版本才能正常运行。让我们来解决这个问题：
+
+1. 首先，检查当前 Node.js 版本：
+```bash
+node -v
+```
+
+2. 如果版本低于要求，我们需要更新 Node.js。以下是几种更新方法：
+
+方法 1：使用 nvm（Node Version Manager）安装新版本（推荐）：
+```bash
+# 如果还没有安装 nvm，先安装 nvm
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+
+# 重新加载 shell 配置
+source ~/.bashrc  # 或 source ~/.zshrc
+
+# 安装最新的 LTS 版本的 Node.js
+nvm install --lts
+
+# 使用新安装的版本
+nvm use --lts
+```
+
+方法 2：直接通过包管理器更新（以 Ubuntu/Debian 为例）：
+```bash
+# 添加 NodeSource 仓库
+curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+
+# 安装 Node.js
+sudo apt-get install -y nodejs
+```
+
+3. 安装完新版本后，验证版本：
+```bash
+node -v
+npm -v
+```
+
+4. 然后重新安装项目依赖：
+```bash
+cd /path/to/your/frontend/project
+rm -rf node_modules package-lock.json
+npm install
+```
+
+5. 最后重新启动项目：
+```bash
+npm run dev
+```
+
+这样应该就能解决启动错误的问题了。如果还有其他问题，请告诉我具体的错误信息。
