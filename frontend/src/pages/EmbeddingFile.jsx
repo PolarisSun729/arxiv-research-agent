@@ -40,12 +40,40 @@ const EmbeddingFile = () => {
 
   const fetchAvailableDocs = async () => {
     try {
-      // 获取所有可用于embedding的文档（包括loaded和chunked）
-      const response = await fetch('http://192.168.172.128:8001/documents?type=all');
+      console.log('开始获取文档列表...');
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5秒超时
+      
+      const response = await fetch(`${apiBaseUrl}/documents?type=all`, {
+        signal: controller.signal,
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
+      console.log('API响应状态:', response.status);
       const data = await response.json();
+      console.log('API响应数据:', data);
+      console.log('文档列表:', data.documents);
+      if (!Array.isArray(data.documents)) {
+        console.error('文档数据不是数组格式:', data.documents);
+        return;
+      }
       setAvailableDocs(data.documents);
     } catch (error) {
-      console.error('Error fetching available documents:', error);
+      console.error('获取文档列表出错:', error);
+      if (error.name === 'AbortError') {
+        setStatus('获取文档列表超时，请检查后端服务是否正常运行');
+      } else {
+        setStatus('获取文档列表失败: ' + error.message);
+      }
     }
   };
 
@@ -67,7 +95,7 @@ const EmbeddingFile = () => {
     
     setStatus('Processing...');
     try {
-      const response = await fetch('http://192.168.172.128:8001/embed', {
+      const response = await fetch('http://{apiBaseUrl}/embed', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -96,7 +124,7 @@ const EmbeddingFile = () => {
 
   const handleDeleteEmbedding = async (docName) => {
     try {
-      const response = await fetch(`http://192.168.172.128:8001/embedded-docs/${docName}`, {
+      const response = await fetch(`${apiBaseUrl}/embedded-docs/${docName}`, {
         method: 'DELETE',
       });
 
@@ -118,7 +146,7 @@ const EmbeddingFile = () => {
   const handleViewEmbedding = async (docName) => {
     try {
       setStatus('Loading embedding...');
-      const response = await fetch(`http://192.168.172.128:8001/embedded-docs/${docName}`);
+      const response = await fetch(`${apiBaseUrl}/embedded-docs/${docName}`);
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
@@ -246,6 +274,9 @@ const EmbeddingFile = () => {
           <div className="p-4 border rounded-lg bg-white shadow-sm">
             <div>
               <label className="block text-sm font-medium mb-1">Select Document</label>
+              <div className="text-sm text-gray-500 mb-2">
+                可用文档数量: {availableDocs.length}
+              </div>
               <select
                 value={selectedDoc}
                 onChange={(e) => setSelectedDoc(e.target.value)}

@@ -1,6 +1,6 @@
 const config = {
               development: {
-                apiBaseUrl: 'http://192.168.172.128:8001'
+                apiBaseUrl: 'http://localhost:8001'
               },
               production: {
                 apiBaseUrl: 'http://api.example.com'
