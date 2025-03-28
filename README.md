@@ -39,6 +39,7 @@ git clone https://github.com/huangjia2019/rag-project01-framework.git
 
 - 更新 apt 软件包列表：`sudo apt update`
 - 安装 Node.js 和 npm：`sudo apt install nodejs npm -y`
+- **备注**：项目中使用的`node`版本为`v22.14.0` ， `npm`版本为`10.9.2`
 
 #### 3. 安装前端组件：
 
