@@ -138,10 +138,13 @@ conda activate rag-project01
 
 #### 2. 安装后端依赖：
 
-**注意：** MacOS也可以使用 requirements_ubun.txt 时，但需要移除所有 NVIDIA 相关依赖和 tritonclient==3.0.0，以避免不必要的依赖安装。
+**注意：** MacOS需要移除所有 NVIDIA 相关依赖和 tritonclient==3.0.0，以避免不必要的依赖安装。
 
 ```shell
+# ubuntu
 pip install -r requirements_ubun.txt
+# mac
+pip install -r requirements_mac.txt
 ```
 
 #### 3. 配置 OpenAI API Key
