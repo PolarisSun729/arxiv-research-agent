@@ -73,11 +73,45 @@ npm run dev
 npm run dev -- --mode production
 ```
 
-### 部署后端 (Ubuntu) 
+### 部署前端 (MacOS)
+- **备注**：项目中使用的`node`版本为`v22.14.0` ， `npm`版本为`10.9.2`
+#### 1. 安装 Node.js
+
+```shell
+# 1. 安装Homebrew（若未安装）
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# 2. 更新Homebrew
+brew update
+
+# 3. 安装Node.js（含npm）
+brew install node
+
+# 4. 验证安装
+node -v  # 输出Node.js版本号
+npm -v   # 输出npm版本号
+```
+
+#### 2. 安装前端依赖并启动
+
+```shell
+# 进入前端项目目录并安装依赖
+cd frontend && npm install
+
+# 如果提示vite未安装，执行以下命令
+npm install vite
+
+# 启动项目
+npm run dev
+```
+
+### 部署后端 (Ubuntu/MacOS) 
 
 本项目使用 Python v3.10 开发，完整 Python 依赖软件包见[requirements_ubun.txt](https://github.com/huangjia2019/rag-project01-framework/blob/master/requirements_ubun.txt) 和 [requirements_win.txt](https://github.com/huangjia2019/rag-project01-framework/blob/master/requirements_win.txt)。
 
 - Windows 环境： [requirements_win.txt](https://github.com/huangjia2019/rag-project01-framework/blob/master/requirements_win.txt)
+  - 由于Windows不支持Milvus数据库，可以采用docker安装Milvus数据库或者更换为Chroma(本项目有个佳哥的Chroma分支)
+
 - Ubuntu 环境： [requirements_ubun.txt](https://github.com/huangjia2019/rag-project01-framework/blob/master/requirements_ubun.txt)
 
 关键依赖的官方文档如下：
@@ -104,7 +138,9 @@ conda activate rag-project01
 
 #### 2. 安装后端依赖：
 
-```
+**注意：** MacOS也可以使用 requirements_ubun.txt 时，但需要移除所有 NVIDIA 相关依赖和 tritonclient==3.0.0，以避免不必要的依赖安装。
+
+```shell
 pip install -r requirements_ubun.txt
 ```
 
