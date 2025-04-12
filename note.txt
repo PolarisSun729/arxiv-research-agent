@@ -1,0 +1,18 @@
+Windows下面无法安装这些包
+
+milvus-lite==2.4.9
+所有 NVIDIA CUDA 相关的包（12个包）：
+nvidia-cublas-cu12
+nvidia-cuda-cupti-cu12
+nvidia-cuda-nvrtc-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cudnn-cu12
+nvidia-cufft-cu12
+nvidia-curand-cu12
+nvidia-cusolver-cu12
+nvidia-cusparse-cu12
+nvidia-nccl-cu12
+nvidia-nvjitlink-cu12
+nvidia-nvtx-cu12
+triton==3.0.0
+uvloop==0.20.0

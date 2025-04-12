@@ -1,5 +1,7 @@
 # 手工制作一个RAG框架
 
+[学习链接](https://u.geekbang.org/subject/airag/1009927) https://u.geekbang.org/subject/airag/1009927
+
 一个从零开始实现的 RAG (Retrieval Augmented Generation) 系统，不依赖现有的 RAG 框架。该项目旨在提供一个轻量级、可定制的知识库问答解决方案。
 ![RAG Frontend](images/RAG-fontend.png)
 
