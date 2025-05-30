@@ -138,6 +138,36 @@ conda create -n rag-project01 python=3.11.9
 conda activate rag-project01 
 ```
 
+** 注意：** 如果 Mac 已安装过的 python 版本不符合要求，可参照如下命令安装多版本 python 环境：
+> 在 MacOS Sonama 14.5 版本上测试OK
+
+```shell
+# 本机默认安装的 python3 版本过低，不满足要求
+python3 -V
+# ==> Python 3.9.6
+
+# 国内环境，可使用「清华源」加速 Homebrew 下载
+export HOMEBREW_BREW_GIT_REMOTE="https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/brew.git"
+export HOMEBREW_API_DOMAIN="https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles/api"
+export HOMEBREW_BOTTLE_DOMAIN="https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles"
+
+# 搜索支持安装的 python3 版本
+brew search python@
+# ==> Formulae
+# python@3.10  python@3.12  python@3.8   bpython      wxpython     cython       ptpython
+# python@3.11  python@3.13  python@3.9   ipython      pythran      jython
+
+brew install python@3.11
+
+# Python is installed as
+#   /usr/local/bin/python3.11
+# You can install Python packages with
+#   pip3.11 install <package>
+
+python3.11 -V
+# ==> Python 3.11.12
+```
+
 #### 2. 安装后端依赖：
 
 **注意：** MacOS需要移除所有 NVIDIA 相关依赖和 tritonclient==3.0.0，以避免不必要的依赖安装。
@@ -147,6 +177,12 @@ conda activate rag-project01
 pip install -r requirements_ubun.txt
 # mac
 pip install -r requirements_mac.txt
+
+# Mac Apple M1 芯片（在 MacOS Sonama 14.5 版本上测试OK）
+# 清华镜像源
+pip3.11 install --default-timeout=1000 install -r requirements_mac_m1_py3.11.12.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 阿里云镜像源
+pip3.11 install --default-timeout=1000 install -r requirements_mac_m1_py3.11.12.txt -i https://mirrors.aliyun.com/pypi/simple
 ```
 
 #### 3. 配置 OpenAI API Key
