@@ -184,8 +184,34 @@ pip3.11 install --default-timeout=1000 install -r requirements_mac_m1_py3.11.12.
 # 阿里云镜像源
 pip3.11 install --default-timeout=1000 install -r requirements_mac_m1_py3.11.12.txt -i https://mirrors.aliyun.com/pypi/simple
 ```
+#### 3. 使用本地下载的 HuggingFace 模型（可选步骤）
 
-#### 3. 配置 OpenAI API Key
+* 下载 HuggingFace 模型，以 `sentence-transformers/all-MiniLM-L6-v2` 为例：
+
+```shell
+# 创建 HF_MODEL_PATH 目录
+mkdir -p /Users/yakoo5/hf_model_path
+export HF_MODEL_PATH="/Users/yakoo5/hf_model_path"
+
+cd $HF_MODEL_PATH
+
+# 获取 HuggingFace 模型下载脚本
+wget https://hf-mirror.com/hfd/hfd.sh
+chmod u+x hfd.sh
+
+# 下载 sentence-transformers/all-MiniLM-L6-v2 模型文件
+mkdir -p sentence-transformers/all-MiniLM-L6-v2
+./hfd.sh sentence-transformers/all-MiniLM-L6-v2 --tool wget -x 4 -j 1 --local-dir sentence-transformers/all-MiniLM-L6-v2
+```
+
+* 设置 HuggingFace 本地模型文件目录 `HF_MODEL_PATH` 环境变量：
+
+```shell
+export HF_MODEL_PATH="/Users/yakoo5/hf_model_path"
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+#### 4. 配置 OpenAI API Key
 
 根据你使用的命令行工具，在 `~/.bashrc` 或 `~/.zshrc` 中配置 `OPENAI_API_KEY` 环境变量：
 
@@ -194,7 +220,7 @@ export OPENAI_API_KEY="xxxx"
 export DEEPSEEK_API_KEY="xxxx"
 ```
 
-#### 4. 启动后端
+#### 5. 启动后端
 
 上述开发环境安装完成后，使用`uvicorn`启动后端
 
