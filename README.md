@@ -201,6 +201,7 @@ chmod u+x hfd.sh
 
 # 下载 sentence-transformers/all-MiniLM-L6-v2 模型文件
 mkdir -p sentence-transformers/all-MiniLM-L6-v2
+# 建议上午下载，上午网速较快（10MB/s左右）。大概几分钟左右会被限速（近乎停止），可以终止命令，再重新执行，又可以变成高速下载
 ./hfd.sh sentence-transformers/all-MiniLM-L6-v2 --tool wget -x 4 -j 1 --local-dir sentence-transformers/all-MiniLM-L6-v2
 ```
 
