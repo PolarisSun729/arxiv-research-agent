@@ -8,6 +8,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 from openai import OpenAI
 import requests
+from utils.model_utils import get_huggingface_model_path
+
+# 设置环境变量以启用 Apple Silicon (MPS) 回退到 CPU (当遇到不支持的操作时会自动回退到 CPU 执行)
+# 目前 PyTorch 版本 ≥ 1.13 时，才支持 Apple 的 Metal Performance Shaders (MPS) ，而且暂不支持「多 GPU」，另外，部分训练操作尚未完全实现
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 logger = logging.getLogger(__name__)
 
@@ -51,13 +56,15 @@ class GenerationService:
             tokenizer: 对应的分词器
         """
         try:
+            model_name = self.models["huggingface"][model_name]
+            model_name = get_huggingface_model_path(model_name)
             model = AutoModelForCausalLM.from_pretrained(
-                self.models["huggingface"][model_name],
+                model_name,
                 torch_dtype=torch.float16,
                 device_map="auto"
             )
             tokenizer = AutoTokenizer.from_pretrained(
-                self.models["huggingface"][model_name]
+                model_name,
             )
             return model, tokenizer
         except Exception as e:

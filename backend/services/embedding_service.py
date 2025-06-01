@@ -6,6 +6,7 @@ from datetime import datetime
 from enum import Enum
 import boto3
 from langchain_community.embeddings import BedrockEmbeddings, OpenAIEmbeddings, HuggingFaceEmbeddings
+from utils.model_utils import get_huggingface_model_path
 
 class EmbeddingProvider(str, Enum):
     """
@@ -273,8 +274,9 @@ class EmbeddingFactory:
             )
             
         elif config.provider == EmbeddingProvider.HUGGINGFACE:
+            model_name = get_huggingface_model_path(config.model_name)
             return HuggingFaceEmbeddings(
-                model_name=config.model_name
+                model_name=model_name
             )
             
         raise ValueError(f"Unsupported embedding provider: {config.provider}")

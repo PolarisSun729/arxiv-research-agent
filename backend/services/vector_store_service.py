@@ -7,6 +7,7 @@ from pathlib import Path
 from pymilvus import connections, utility
 from pymilvus import Collection, DataType, FieldSchema, CollectionSchema
 from utils.config import VectorDBProvider, MILVUS_CONFIG  # Updated import
+from pypinyin import lazy_pinyin, Style
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,12 @@ class VectorStoreService:
             filename = embeddings_data.get("filename", "")
             # 如果有 .pdf 后缀，移除它
             base_name = filename.replace('.pdf', '') if filename else "doc"
+            
+            # Convert Chinese characters to pinyin
+            base_name = ''.join(lazy_pinyin(base_name, style=Style.NORMAL))
+            
+            # Replace hyphens with underscores in the base name
+            base_name = base_name.replace('-', '_')
             
             # Ensure the collection name starts with a letter or underscore
             if not base_name[0].isalpha() and base_name[0] != '_':
