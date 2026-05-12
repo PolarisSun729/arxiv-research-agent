@@ -7,6 +7,12 @@ from enum import Enum
 import boto3
 from langchain_community.embeddings import BedrockEmbeddings, OpenAIEmbeddings, HuggingFaceEmbeddings
 from utils.model_utils import get_huggingface_model_path
+from modelscope.pipelines import pipeline
+from modelscope.utils.constant import Tasks
+import numpy as np
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '00-models', 'Qwen3-VL-Embedding-2B', 'scripts'))
+from qwen3_vl_embedding import Qwen3VLEmbedder
 
 class EmbeddingProvider(str, Enum):
     """
@@ -15,6 +21,8 @@ class EmbeddingProvider(str, Enum):
     OPENAI = "openai"
     BEDROCK = "bedrock"
     HUGGINGFACE = "huggingface"
+    MODELSCOPE = "modelscope"
+    LOCAL = "local"
 
 class EmbeddingConfig:
     """
@@ -36,9 +44,43 @@ class EmbeddingService:
     """
     嵌入服务类，提供创建和管理文本嵌入的功能
     """
+    
+    LOCAL_EMBEDDING_MODEL_PATH = os.path.join(os.path.dirname(__file__), '..', '..', '00-models', 'Qwen3-VL-Embedding-2B')
+    
     def __init__(self):
-        """初始化嵌入服务，创建嵌入工厂实例"""
+        """初始化嵌入服务，创建嵌入工厂实例（模型采用懒加载）"""
         self.embedding_factory = EmbeddingFactory()
+        self._local_embedder = None
+    
+    @property
+    def local_embedder(self):
+        """懒加载本地Qwen3-VL-Embedding-2B模型"""
+        if self._local_embedder is None:
+            self._local_embedder = self._load_local_qwen3_embedding_model()
+        return self._local_embedder
+    
+    def _load_local_qwen3_embedding_model(self):
+        """
+        预加载本地的Qwen3-VL-Embedding-2B模型
+        
+        返回:
+            Qwen3VLEmbedder实例，如果加载失败返回None
+        """
+        try:
+            if os.path.exists(self.LOCAL_EMBEDDING_MODEL_PATH):
+                print(f"Loading local Qwen3-VL-Embedding-2B model from {self.LOCAL_EMBEDDING_MODEL_PATH}...")
+                embedder = Qwen3VLEmbedder(
+                    model_name_or_path=self.LOCAL_EMBEDDING_MODEL_PATH,
+                    device_map="auto"
+                )
+                print("Local Qwen3-VL-Embedding-2B model loaded successfully!")
+                return embedder
+            else:
+                print(f"Local model path not found: {self.LOCAL_EMBEDDING_MODEL_PATH}")
+                return None
+        except Exception as e:
+            print(f"Error loading local Qwen3-VL-Embedding-2B model: {str(e)}")
+            return None
 
     def create_embeddings(self, input_data: dict, config: EmbeddingConfig) -> tuple:
         """
@@ -51,8 +93,6 @@ class EmbeddingService:
         返回:
             包含嵌入结果和元数据的元组
         """
-        embedding_function = self.embedding_factory.create_embedding_function(config)
-        
         chunks = input_data.get('chunks', [])
         filename = input_data.get('metadata', {}).get('filename', '')  # 获取文件名
         
@@ -60,17 +100,44 @@ class EmbeddingService:
         BATCH_SIZE = 20
         results = []
         
+        # 如果是本地模型，使用预加载的模型
+        if config.provider == EmbeddingProvider.LOCAL:
+            if self.local_embedder is None:
+                raise ValueError("Local Qwen3-VL-Embedding-2B model not loaded")
+            
+            for chunk in chunks:
+                embedding_vector = self.create_single_embedding_local(chunk["content"])
+                metadata = {
+                    "chunk_id": chunk["metadata"]["chunk_id"],
+                    "page_number": chunk["metadata"]["page_number"],
+                    "page_range": chunk["metadata"]["page_range"],
+                    "content": chunk["content"],
+                    "word_count": chunk["metadata"]["word_count"],
+                    "total_chunks": len(chunks),
+                    "embedding_provider": config.provider,
+                    "embedding_model": "Qwen3-VL-Embedding-2B",
+                    "embedding_timestamp": datetime.now().isoformat(),
+                    "vector_dimension": len(embedding_vector),
+                    "filename": filename
+                }
+                
+                embedding_result = {
+                    "embedding": embedding_vector,
+                    "metadata": metadata
+                }
+                results.append(embedding_result)
+            return results, {}
+        
+        embedding_function = self.embedding_factory.create_embedding_function(config)
+        
         # 如果是OpenAI，使用批处理
         if config.provider == EmbeddingProvider.OPENAI:
             for i in range(0, len(chunks), BATCH_SIZE):
                 batch = chunks[i:i + BATCH_SIZE]
-                # 提取当前批次的文本内容
                 texts = [chunk.get("content", "") for chunk in batch]
                 
-                # 批量获取embeddings
                 embedding_vectors = embedding_function.embed_documents(texts)
                 
-                # 将结果与原始chunk数据组合
                 for chunk, embedding_vector in zip(batch, embedding_vectors):
                     metadata = {
                         "chunk_id": chunk["metadata"]["chunk_id"],
@@ -78,13 +145,12 @@ class EmbeddingService:
                         "page_range": chunk["metadata"]["page_range"],
                         "content": chunk["content"],
                         "word_count": chunk["metadata"]["word_count"],
-                        # "chunking_method": input_data.get("chunking_method", "loaded"),
                         "total_chunks": len(chunks),
                         "embedding_provider": config.provider,
                         "embedding_model": config.model_name,
                         "embedding_timestamp": datetime.now().isoformat(),
                         "vector_dimension": len(embedding_vector),
-                        "filename": filename  # 添加文件名到metadata
+                        "filename": filename
                     }
                     
                     embedding_result = {
@@ -102,13 +168,12 @@ class EmbeddingService:
                     "page_range": chunk["metadata"]["page_range"],
                     "content": chunk["content"],
                     "word_count": chunk["metadata"]["word_count"],
-                    # "chunking_method": input_data.get("chunking_method", "loaded"),
                     "total_chunks": len(chunks),
                     "embedding_provider": config.provider,
                     "embedding_model": config.model_name,
                     "embedding_timestamp": datetime.now().isoformat(),
                     "vector_dimension": len(embedding_vector),
-                    "filename": filename  # 添加文件名到metadata
+                    "filename": filename
                 }
                 
                 embedding_result = {
@@ -117,7 +182,6 @@ class EmbeddingService:
                 }
                 results.append(embedding_result)
         
-        # 返回结果和空的metadata（因为metadata已经包含在每个embedding中）
         return results, {}
 
     def save_embeddings(self, doc_name: str, embeddings: list) -> str:
@@ -203,6 +267,62 @@ class EmbeddingService:
         embedding_function = self.embedding_factory.create_embedding_function(config)
         return embedding_function.embed_query(text)
 
+    def create_single_embedding_local(self, text: str) -> list:
+        """
+        使用预加载的本地Qwen3-VL-Embedding-2B模型创建单个文本的嵌入向量
+        
+        参数:
+            text: 需要嵌入的文本
+            
+        返回:
+            嵌入向量列表
+            
+        异常:
+            ValueError: 当本地模型未加载时抛出
+        """
+        if self.local_embedder is None:
+            raise ValueError("Local Qwen3-VL-Embedding-2B model not loaded")
+        
+        try:
+            inputs = [{'text': text}]
+            embeddings = self.local_embedder.process(inputs)
+            embedding = embeddings[0].cpu().detach().numpy().tolist()
+            return embedding
+        except Exception as e:
+            print(f"Error creating embedding with local model: {str(e)}")
+            raise
+    
+    def create_single_embedding_modelscope(self, text: str, model: str = "Qwen/Qwen3-VL-Embedding-2B") -> list:
+        """
+        使用ModelScope模型创建单个文本的嵌入向量
+        
+        参数:
+            text: 需要嵌入的文本
+            model: ModelScope模型名称，默认为Qwen/Qwen3-VL-Embedding-2B
+            
+        返回:
+            嵌入向量列表
+        """
+        try:
+            pipe = pipeline(Tasks.multi_modal_embedding, model=model)
+            result = pipe({'text': text})
+            if isinstance(result, dict) and 'text_embedding' in result:
+                embedding = result['text_embedding']
+            elif isinstance(result, list) and len(result) > 0:
+                embedding = result[0]
+            else:
+                embedding = result
+            
+            if isinstance(embedding, np.ndarray):
+                embedding = embedding.tolist()
+            elif not isinstance(embedding, list):
+                embedding = [float(x) for x in embedding]
+            
+            return embedding
+        except Exception as e:
+            logger.error(f"Error creating embedding with ModelScope: {str(e)}")
+            raise
+
     def get_document_embedding_config(self, collection_name: str) -> EmbeddingConfig:
         """
         从已存在的文档中获取嵌入配置
@@ -278,5 +398,31 @@ class EmbeddingFactory:
             return HuggingFaceEmbeddings(
                 model_name=model_name
             )
+            
+        elif config.provider == EmbeddingProvider.MODELSCOPE:
+            class ModelScopeEmbedding:
+                def __init__(self, model_name):
+                    self.model_name = model_name
+                    self.pipe = pipeline(Tasks.multi_modal_embedding, model=model_name)
+                
+                def embed_query(self, text):
+                    result = self.pipe({'text': text})
+                    if isinstance(result, dict) and 'text_embedding' in result:
+                        embedding = result['text_embedding']
+                    elif isinstance(result, list) and len(result) > 0:
+                        embedding = result[0]
+                    else:
+                        embedding = result
+                    
+                    if isinstance(embedding, np.ndarray):
+                        return embedding.tolist()
+                    elif not isinstance(embedding, list):
+                        return [float(x) for x in embedding]
+                    return embedding
+                
+                def embed_documents(self, texts):
+                    return [self.embed_query(text) for text in texts]
+            
+            return ModelScopeEmbedding(config.model_name)
             
         raise ValueError(f"Unsupported embedding provider: {config.provider}")

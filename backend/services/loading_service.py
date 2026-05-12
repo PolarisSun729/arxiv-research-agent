@@ -299,7 +299,7 @@ class LoadingService:
                 "loading_method": str(loading_method),
                 "loading_strategy": str(strategy) if loading_method == "unstructured" and strategy else None,
                 "chunking_strategy": str(chunking_strategy) if loading_method == "unstructured" and chunking_strategy else None,
-                "chunking_method": "loaded",
+                "chunking_method": str(chunking_strategy or strategy or "loaded"),
                 "timestamp": datetime.now().isoformat(),
                 "chunks": chunks
             }

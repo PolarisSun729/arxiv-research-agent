@@ -165,8 +165,8 @@ class VectorStoreService:
             # Convert Chinese characters to pinyin
             base_name = ''.join(lazy_pinyin(base_name, style=Style.NORMAL))
             
-            # Replace hyphens with underscores in the base name
-            base_name = base_name.replace('-', '_')
+            # Replace hyphens and dots with underscores in the base name
+            base_name = base_name.replace('-', '_').replace('.', '_')
             
             # Ensure the collection name starts with a letter or underscore
             if not base_name[0].isalpha() and base_name[0] != '_':
@@ -193,7 +193,7 @@ class VectorStoreService:
             # 定义字段
             fields = [
                 {"name": "id", "dtype": "INT64", "is_primary": True, "auto_id": True},
-                {"name": "content", "dtype": "VARCHAR", "max_length": 5000},
+                {"name": "content", "dtype": "VARCHAR", "max_length": 10000},
                 {"name": "document_name", "dtype": "VARCHAR", "max_length": 255},
                 {"name": "chunk_id", "dtype": "INT64"},
                 {"name": "total_chunks", "dtype": "INT64"},
@@ -215,8 +215,13 @@ class VectorStoreService:
             # 准备数据为列表格式
             entities = []
             for emb in embeddings_data["embeddings"]:
+                content = str(emb["metadata"].get("content", ""))
+                if len(content) > 10000:
+                    content = content[:10000]
+                    logger.warning(f"Content truncated to 10000 characters for chunk {emb['metadata'].get('chunk_id', 0)}")
+                
                 entity = {
-                    "content": str(emb["metadata"].get("content", "")),
+                    "content": content,
                     "document_name": embeddings_data.get("filename", ""),  # 使用 filename 而不是 document_name
                     "chunk_id": int(emb["metadata"].get("chunk_id", 0)),
                     "total_chunks": int(emb["metadata"].get("total_chunks", 0)),
@@ -353,3 +358,126 @@ class VectorStoreService:
             finally:
                 connections.disconnect("default")
         return {}
+
+    def insert_single_embedding(self, collection_name: str, embedding: List[float], metadata: Dict[str, Any]) -> int:
+        """
+        插入单个嵌入向量到指定集合
+        
+        参数:
+            collection_name: 集合名称
+            embedding: 嵌入向量
+            metadata: 元数据字典，包含content, arxiv_id, title等信息
+            
+        返回:
+            插入的向量ID（primary key）
+        """
+        try:
+            connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
+            
+            if utility.has_collection(collection_name):
+                collection = Collection(collection_name)
+            else:
+                vector_dim = len(embedding)
+                fields = [
+                    FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
+                    FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=5000),
+                    FieldSchema(name="arxiv_id", dtype=DataType.VARCHAR, max_length=100),
+                    FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=1000),
+                    FieldSchema(name="authors", dtype=DataType.VARCHAR, max_length=2000),
+                    FieldSchema(name="categories", dtype=DataType.VARCHAR, max_length=500),
+                    FieldSchema(name="published_date", dtype=DataType.VARCHAR, max_length=50),
+                    FieldSchema(name="url", dtype=DataType.VARCHAR, max_length=500),
+                    FieldSchema(name="embedding_model", dtype=DataType.VARCHAR, max_length=100),
+                    FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=vector_dim)
+                ]
+                schema = CollectionSchema(fields=fields, description=f"arXiv paper abstract embeddings collection")
+                collection = Collection(name=collection_name, schema=schema)
+                
+                index_params = {
+                    "metric_type": "COSINE",
+                    "index_type": "FLAT",
+                    "params": {}
+                }
+                collection.create_index(field_name="vector", index_params=index_params)
+            
+            entity = {
+                "content": str(metadata.get("content", "")),
+                "arxiv_id": str(metadata.get("arxiv_id", "")),
+                "title": str(metadata.get("title", "")),
+                "authors": str(metadata.get("authors", "")),
+                "categories": str(metadata.get("categories", "")),
+                "published_date": str(metadata.get("published_date", "")),
+                "url": str(metadata.get("url", "")),
+                "embedding_model": str(metadata.get("embedding_model", "")),
+                "vector": [float(x) for x in embedding]
+            }
+            
+            insert_result = collection.insert([entity])
+            collection.load()
+            
+            return insert_result.primary_keys[0]
+            
+        except Exception as e:
+            logger.error(f"Error inserting single embedding: {str(e)}")
+            raise
+        finally:
+            connections.disconnect("default")
+
+    def search_similar_vectors(self, collection_name: str, query_vector: List[float], top_k: int = 10, filter_arxiv_ids: List[str] = None) -> List[Dict[str, Any]]:
+        """
+        在指定集合中搜索与查询向量最相似的向量
+        
+        参数:
+            collection_name: 集合名称
+            query_vector: 查询向量
+            top_k: 返回最相似的前k个结果
+            filter_arxiv_ids: 需要排除的arxiv_id列表（已标记的论文）
+            
+        返回:
+            相似向量的列表，包含相似度和元数据
+        """
+        try:
+            connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
+            
+            if not utility.has_collection(collection_name):
+                logger.warning(f"Collection {collection_name} does not exist")
+                return []
+            
+            collection = Collection(collection_name)
+            collection.load()
+            
+            search_params = {
+                "metric_type": "COSINE",
+                "params": {}
+            }
+            
+            results = collection.search(
+                data=[query_vector],
+                anns_field="vector",
+                param=search_params,
+                limit=top_k,
+                expr=None if not filter_arxiv_ids else f"arxiv_id not in {filter_arxiv_ids}",
+                output_fields=["arxiv_id", "title", "authors", "categories", "published_date", "url", "content"]
+            )
+            
+            similar_vectors = []
+            for hit in results[0]:
+                similar_vectors.append({
+                    "arxiv_id": hit.get("arxiv_id") or "",
+                    "title": hit.get("title") or "",
+                    "authors": hit.get("authors") or "",
+                    "categories": hit.get("categories") or "",
+                    "published_date": hit.get("published_date") or "",
+                    "url": hit.get("url") or "",
+                    "abstract": hit.get("content") or "",
+                    "similarity": hit.score,
+                    "distance": hit.distance
+                })
+            
+            return similar_vectors
+            
+        except Exception as e:
+            logger.error(f"Error searching similar vectors: {str(e)}")
+            raise
+        finally:
+            connections.disconnect("default")

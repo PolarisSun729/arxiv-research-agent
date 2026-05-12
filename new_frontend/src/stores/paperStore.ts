@@ -1,0 +1,263 @@
+import { defineStore } from 'pinia'
+import { ref } from 'vue'
+import type { Paper, RecommendedPaper, LabeledPaper, ArxivSearchParams } from '@/types/paper'
+import {
+  searchPapers,
+  getPaperById,
+  getRecommendations,
+  getLabeledPapers,
+  getStats,
+  searchArxiv,
+  getUserPreferences,
+  likePaper,
+  dislikePaper,
+  removePaperPreference,
+  generateInterestVector,
+  getInterestVector,
+  recommendPapers,
+  type InterestVectorResult,
+  type InterestVector,
+  type RecommendationResult
+} from '@/api/papers'
+
+export const usePaperStore = defineStore('paper', () => {
+  const papers = ref<Paper[]>([])
+  const allPapers = ref<Paper[]>([])
+  const totalPapers = ref(0)
+  const currentPaper = ref<Paper | null>(null)
+  const recommendations = ref<RecommendedPaper[]>([])
+  const totalRecommendations = ref(0)
+  const labeledPapers = ref<LabeledPaper[]>([])
+  const totalLabeledPapers = ref(0)
+  const stats = ref({
+    totalPapers: 0,
+    labeledPapers: 0,
+    todayNewPapers: 0,
+    recommendedPapers: 0
+  })
+  const loading = ref(false)
+  const interestVectorGenerating = ref(false)
+  const lastInterestVector = ref<InterestVector | null>(null)
+
+  function applyPreferenceLabels(targetPapers: Paper[], likedIds: string[], dislikedIds: string[]) {
+    targetPapers.forEach(paper => {
+      const arxivId = paper.arxivId || paper.id
+      if (likedIds.includes(arxivId)) {
+        paper.label = 'liked'
+      } else if (dislikedIds.includes(arxivId)) {
+        paper.label = 'disliked'
+      } else {
+        paper.label = null
+      }
+    })
+  }
+
+  async function fetchPapers(params: {
+    keyword?: string
+    category?: string
+    page: number
+    pageSize: number
+    sortBy?: string
+  }) {
+    loading.value = true
+    try {
+      const result = await searchPapers(params)
+      papers.value = result.items
+      totalPapers.value = result.total
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function fetchPaperById(id: string) {
+    loading.value = true
+    try {
+      currentPaper.value = await getPaperById(id)
+      return currentPaper.value
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function fetchRecommendations(params: { page: number; pageSize: number }) {
+    loading.value = true
+    try {
+      const result = await getRecommendations(params)
+      recommendations.value = result.items.map((p: any) => ({
+        id: p.arxiv_id || p.id,
+        arxivId: p.arxiv_id || p.id,
+        title: p.title,
+        authors: Array.isArray(p.authors) ? p.authors : (p.authors ? p.authors.split(',').map((a: string) => a.trim()).filter((a: string) => a) : []),
+        summary: p.abstract || p.summary,
+        publishedAt: p.published_date || p.publishedAt,
+        categories: Array.isArray(p.categories) ? p.categories : (p.categories ? p.categories.split(',').map((c: string) => c.trim()).filter((c: string) => c) : []),
+        pdfUrl: p.url || p.pdfUrl,
+        absUrl: p.url || p.absUrl,
+        similarityScore: typeof p.similarity === 'number' ? p.similarity : (p.similarityScore || 0),
+        label: p.label || null
+      }))
+      totalRecommendations.value = result.total
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function fetchLabeledPapers(params: {
+    label?: 'liked' | 'disliked'
+    page: number
+    pageSize: number
+  }) {
+    loading.value = true
+    try {
+      const result = await getLabeledPapers(params)
+      labeledPapers.value = result.items
+      totalLabeledPapers.value = result.total
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function updateLabel(id: string, label: 'liked' | 'disliked' | null) {
+    const paper = [...papers.value, ...recommendations.value, ...allPapers.value]
+      .find(item => item.id === id || item.arxivId === id)
+    if (!paper) {
+      throw new Error('Paper not found')
+    }
+
+    if (label === null) {
+      if (paper.label) {
+        await removePaperPreference(paper, paper.label)
+      }
+    } else if (paper.label === label) {
+      await removePaperPreference(paper, label)
+      label = null
+    } else if (label === 'liked') {
+      await likePaper(paper)
+    } else {
+      await dislikePaper(paper)
+    }
+
+    if (currentPaper.value?.id === id) {
+      currentPaper.value.label = label
+    }
+    const paperIndex = papers.value.findIndex(p => p.id === id)
+    if (paperIndex !== -1) {
+      papers.value[paperIndex].label = label
+    }
+    const recIndex = recommendations.value.findIndex(r => r.id === id)
+    if (recIndex !== -1) {
+      recommendations.value[recIndex].label = label
+    }
+    const allPaperIndex = allPapers.value.findIndex(p => p.id === id)
+    if (allPaperIndex !== -1) {
+      allPapers.value[allPaperIndex].label = label
+    }
+  }
+
+  async function fetchStats() {
+    loading.value = true
+    try {
+      stats.value = await getStats()
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function fetchArxivPapers(params: ArxivSearchParams, page: number = 1, pageSize: number = 10) {
+    loading.value = true
+    try {
+      const result = await searchArxiv(params)
+      allPapers.value = [...result.items]
+      const preferences = await getUserPreferences()
+      applyPreferenceLabels(allPapers.value, preferences.liked_papers || [], preferences.disliked_papers || [])
+      totalPapers.value = result.total
+      const start = (page - 1) * pageSize
+      const end = start + pageSize
+      papers.value = allPapers.value.slice(start, end)
+    } finally {
+      loading.value = false
+    }
+  }
+
+  function paginatePapers(page: number, pageSize: number) {
+    const start = (page - 1) * pageSize
+    const end = start + pageSize
+    papers.value = allPapers.value.slice(start, end)
+  }
+
+  async function generateUserInterestVector(): Promise<InterestVectorResult> {
+    interestVectorGenerating.value = true
+    try {
+      const result = await generateInterestVector()
+      if (result.status === 'success') {
+        await fetchUserInterestVector()
+      }
+      return result
+    } finally {
+      interestVectorGenerating.value = false
+    }
+  }
+
+  async function fetchUserInterestVector() {
+    try {
+      lastInterestVector.value = await getInterestVector()
+    } catch (error) {
+      lastInterestVector.value = null
+    }
+  }
+
+  const recommendationsGenerating = ref(false)
+
+  async function generateRecommendations(topN: number = 10): Promise<RecommendationResult> {
+    recommendationsGenerating.value = true
+    try {
+      const result = await recommendPapers(topN)
+      if (result.status === 'success') {
+        recommendations.value = result.recommendations.map((p: any) => ({
+          id: p.arxiv_id,
+          arxivId: p.arxiv_id,
+          title: p.title,
+          authors: Array.isArray(p.authors) ? p.authors : (p.authors ? p.authors.split(',').map((a: string) => a.trim()).filter((a: string) => a) : []),
+          summary: p.abstract,
+          publishedAt: p.published_date,
+          categories: Array.isArray(p.categories) ? p.categories : (p.categories ? p.categories.split(',').map((c: string) => c.trim()).filter((c: string) => c) : []),
+          pdfUrl: p.url,
+          absUrl: p.url,
+          similarityScore: typeof p.similarity === 'number' ? p.similarity : (p.similarityScore || 0),
+          label: null
+        }))
+        totalRecommendations.value = result.total_found
+      }
+      return result
+    } finally {
+      recommendationsGenerating.value = false
+    }
+  }
+
+  return {
+    papers,
+    allPapers,
+    totalPapers,
+    currentPaper,
+    recommendations,
+    totalRecommendations,
+    labeledPapers,
+    totalLabeledPapers,
+    stats,
+    loading,
+    interestVectorGenerating,
+    lastInterestVector,
+    recommendationsGenerating,
+    fetchPapers,
+    fetchPaperById,
+    fetchRecommendations,
+    fetchLabeledPapers,
+    updateLabel,
+    fetchStats,
+    fetchArxivPapers,
+    paginatePapers,
+    generateUserInterestVector,
+    fetchUserInterestVector,
+    generateRecommendations
+  }
+})

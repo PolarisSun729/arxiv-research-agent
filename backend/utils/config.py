@@ -5,9 +5,11 @@ class VectorDBProvider(str, Enum):
     MILVUS = "milvus"
     # More providers can be added later
 
-# 可以在这里添加其他配置相关的内容
+class DatabaseType(str, Enum):
+    SQLITE = "sqlite"
+
 MILVUS_CONFIG = {
-    "uri": "03-vector-store/langchain_milvus.db",
+    "uri": "http://localhost:19530",
     "index_types": {
         "flat": "FLAT",
         "ivf_flat": "IVF_FLAT",
@@ -24,3 +26,8 @@ MILVUS_CONFIG = {
         }
     }
 } 
+
+SQLITE_CONFIG = {
+    "database_path": "06-database/recommendation.db",
+    "check_same_thread": False
+}

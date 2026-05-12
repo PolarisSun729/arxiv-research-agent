@@ -3,12 +3,16 @@ import json
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from numpy import False_
 from services.loading_service import LoadingService
 from services.chunking_service import ChunkingService
 from services.embedding_service import EmbeddingService, EmbeddingConfig
 from services.vector_store_service import VectorStoreService, VectorDBConfig
 from services.search_service import SearchService
 from services.parsing_service import ParsingService
+from services.arxiv_search_service import ArxivSearchService
+from services.local_arxiv_service import LocalArxivService
+from services.database_service import DatabaseService
 import logging
 from enum import Enum
 from utils.config import VectorDBProvider
@@ -16,10 +20,27 @@ import pandas as pd
 from pathlib import Path
 from services.generation_service import GenerationService
 from typing import List, Dict, Optional
+import requests
+
+# # 设置 Clash 代理 (默认端口 7890)
+# PROXY_URL = "http://127.0.0.1:7897"
+# os.environ["HTTP_PROXY"] = PROXY_URL
+# os.environ["HTTPS_PROXY"] = PROXY_URL
+# os.environ["http_proxy"] = PROXY_URL
+# os.environ["https_proxy"] = PROXY_URL
+
+# # 配置 requests 使用代理
+# requests.Session.proxies = {
+#     'http': PROXY_URL,
+#     'https': PROXY_URL,
+# }
 
 # 设置日志
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+
+BASE_DIR = Path(__file__).resolve().parent
+CHUNK_DOCS_DIR = BASE_DIR / "01-loaded-docs"
 
 app = FastAPI()
 
@@ -31,941 +52,756 @@ os.makedirs("02-embedded-docs", exist_ok=True)
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    # allow_origins=["*"],
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.post("/process")
-async def process_file(
-    file: UploadFile = File(...),
-    loading_method: str = Form(...),
-    chunking_option: str = Form(...),
-    chunk_size: int = Form(1000)
+# 数据源配置
+DATA_SOURCE = os.environ.get("ARXIV_DATA_SOURCE", "local")  
+LOCAL_DATA_PATH = os.environ.get("ARXIV_LOCAL_PATH", r"D:\极客时间大模型RAG进阶实战营\rag-project01-framework\07-local-arxiv\arxiv-2026-04-papers.json")
+
+# 初始化服务
+db_service = DatabaseService()
+embedding_service = EmbeddingService()
+vector_store_service = VectorStoreService()
+
+# 初始化 arXiv 服务
+local_arxiv_service = LocalArxivService(data_path=LOCAL_DATA_PATH)
+
+def get_arxiv_service():
+    """根据配置获取当前使用的 arXiv 服务"""
+    if DATA_SOURCE == "api":
+        return ArxivSearchService()
+    else:
+        return local_arxiv_service
+
+
+# arXiv 论文搜索接口
+@app.post("/arxiv/search")
+async def arxiv_search(
+    search_query: Optional[str] = Body(None, description="搜索查询字符串，支持字段前缀语法如 ti:deep learning"),
+    id_list: Optional[List[str]] = Body(None, description="arXiv论文ID列表，用于精确匹配"),
+    title: Optional[str] = Body(None, description="标题关键词"),
+    author: Optional[str] = Body(None, description="作者姓名"),
+    abstract: Optional[str] = Body(None, description="摘要关键词"),
+    category: Optional[str] = Body(None, description="学科分类代码，如 cs.AI"),
+    comment: Optional[str] = Body(None, description="评论关键词"),
+    journal_ref: Optional[str] = Body(None, description="期刊引用关键词"),
+    report_number: Optional[str] = Body(None, description="报告编号关键词"),
+    operator: Optional[str] = Body("AND", description="逻辑操作符：AND 或 OR"),
+    max_results: int = Body(10),
+    start: int = Body(0),
+    sort_by: str = Body("relevance"),
+    sort_order: str = Body("descending"),
+    submitted_days_ago: Optional[int] = Body(None, description="搜索提交日期在多少天内的文章（本地数据源暂不支持）")
 ):
-    try:
-        # 保存上传的文件
-        temp_path = os.path.join("temp", file.filename)
-        with open(temp_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-        
-        # 准备元数据
-        metadata = {
-            "filename": file.filename,
-            "loading_method": loading_method,
-            "original_file_size": len(content),
-            "processing_date": datetime.now().isoformat(),
-            "chunking_method": chunking_option,
-        }
-        
-        loading_service = LoadingService()
-        raw_text = loading_service.load_pdf(temp_path, loading_method)
-        metadata["total_pages"] = loading_service.get_total_pages()
-        
-        page_map = loading_service.get_page_map()
-        
-        chunking_service = ChunkingService()
-        chunks = chunking_service.chunk_text(
-            raw_text, 
-            chunking_option, 
-            metadata,
-            page_map=page_map,
-            chunk_size=chunk_size
-        )
-        
-        # 清理临时文件
-        os.remove(temp_path)
-        
-        return {"chunks": chunks}
-    except Exception as e:
-        logger.error(f"Error processing file: {str(e)}")
-        raise
-
-@app.post("/save")
-async def save_chunks(data: dict):
-    try:
-        doc_name = data.get("docName")
-        chunks = data.get("chunks")
-        metadata = data.get("metadata", {})
-        
-        if not doc_name or not chunks:
-            raise ValueError("Missing required fields")
-        
-        # 构建文件名
-        filename = f"{doc_name}.json"
-        filepath = os.path.join("01-chunked-docs", filename)
-        
-        # 保存数据
-        document_data = {
-            "document_name": doc_name,
-            "metadata": metadata,
-            "chunks": chunks
-        }
-        
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(document_data, f, ensure_ascii=False, indent=2)
-        
-        return {
-            "status": "success",
-            "message": "Document saved successfully",
-            "filepath": filepath
-        }
-    except Exception as e:
-        logger.error(f"Error saving document: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-@app.get("/list-docs")
-async def list_documents():
-    try:
-        docs = []
-        docs_dir = "01-chunked-docs"
-        for filename in os.listdir(docs_dir):
-            if filename.endswith('.json'):
-                file_path = os.path.join(docs_dir, filename)
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    doc_data = json.load(f)
-                    docs.append({
-                        "id": filename,
-                        "name": doc_data["document_name"]
-                    })
-        return {"documents": docs}
-    except Exception as e:
-        logger.error(f"Error listing documents: {str(e)}")
-        raise
-
-@app.post("/embed")
-async def embed_document(data: dict = Body(...)):
-    try:
-        doc_id = data.get("documentId")
-        provider = data.get("provider")
-        model = data.get("model")
-        
-        if not all([doc_id, provider, model]):
-            raise HTTPException(status_code=400, detail="Missing required parameters")
-            
-        # 直接使用完整文件名查找
-        loaded_path = os.path.join("01-loaded-docs", doc_id)
-        chunked_path = os.path.join("01-chunked-docs", doc_id)
-        
-        doc_path = None
-        if os.path.exists(loaded_path):
-            doc_path = loaded_path
-        elif os.path.exists(chunked_path):
-            doc_path = chunked_path
-            
-        if not doc_path:
-            raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
-            
-        with open(doc_path, 'r', encoding='utf-8') as f:
-            doc_data = json.load(f)
-        
-        # 创建 EmbeddingConfig 和 EmbeddingService
-        config = EmbeddingConfig(provider=provider, model_name=model)
-        embedding_service = EmbeddingService()
-        
-        # 准备输入数据
-        input_data = {
-            "chunks": doc_data["chunks"],
-            "metadata": {
-                "filename": doc_data["filename"],
-                "total_chunks": doc_data["total_chunks"],
-                "total_pages": doc_data["total_pages"],
-                "loading_method": doc_data["loading_method"],
-                "chunking_method": doc_data["chunking_method"]
-            }
-        }
-        
-        # 创建嵌入 - 只接收两个返回值
-        embeddings, _ = embedding_service.create_embeddings(input_data, config)
-        
-        # 保存嵌入结果
-        output_path = embedding_service.save_embeddings(doc_id, embeddings)
-        
-        return {
-            "status": "success",
-            "message": "Embeddings created successfully",
-            "filepath": output_path,
-            "embeddings": embeddings  # 添加embeddings到响应中
-        }
-        
-    except Exception as e:
-        logger.error(f"Error creating embeddings: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/list-embedded")
-async def list_embedded_docs():
-    """List all embedded documents"""
-    try:
-        documents = []
-        embedded_dir = "02-embedded-docs"
-        logger.info(f"Scanning directory: {embedded_dir}")
-        
-        if not os.path.exists(embedded_dir):
-            logger.warning(f"Directory {embedded_dir} does not exist")
-            return {"documents": []}
-            
-        for filename in os.listdir(embedded_dir):
-            if filename.endswith('.json'):
-                file_path = os.path.join(embedded_dir, filename)
-                logger.info(f"Reading file: {file_path}")
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        # 使用实际的文件名，而不是文档名
-                        doc_info = {
-                            "name": filename,  # 保持原始文件名
-                            "metadata": {
-                                "document_name": data.get("document_name", filename),
-                                "embedding_model": data.get("embedding_model", ""),
-                                "embedding_provider": data.get("embedding_provider", ""),
-                                "embedding_timestamp": data.get("created_at", ""),
-                                "vector_dimension": data.get("vector_dimension", 0)
-                            }
-                        }
-                        logger.info(f"Added document info: {doc_info}")
-                        documents.append(doc_info)
-                except Exception as e:
-                    logger.error(f"Error reading file {file_path}: {str(e)}")
-                    
-        logger.info(f"Total documents found: {len(documents)}")
-        return {"documents": documents}
-    except Exception as e:
-        logger.error(f"Error listing embedded documents: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/index")
-async def index_embeddings(data: dict):
-    try:
-        file_id = data.get("fileId")
-        vector_db = data.get("vectorDb")
-        index_mode = data.get("indexMode")
-        
-        if not all([file_id, vector_db, index_mode]):
-            raise ValueError("Missing required fields")
-            
-        embedding_file = os.path.join("02-embedded-docs", file_id)
-        if not os.path.exists(embedding_file):
-            raise FileNotFoundError(f"Embedding file not found: {file_id}")
-            
-        config = VectorDBConfig(provider=vector_db, index_mode=index_mode)
-        vector_store_service = VectorStoreService()
-        result = vector_store_service.index_embeddings(embedding_file, config)
-        
-        return result
-    except Exception as e:
-        logger.error(f"Error during indexing: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-@app.get("/providers")
-async def get_providers():
-    """获取支持的向量数据库列表"""
-    try:
-        search_service = SearchService()
-        providers = search_service.get_providers()
-        return {"providers": providers}
-    except Exception as e:
-        logger.error(f"Error getting providers: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-@app.get("/collections")
-async def get_collections(
-    provider: VectorDBProvider = Query(default=VectorDBProvider.MILVUS)
-):
-    """获取指定向量数据库中的集合"""
-    try:
-        search_service = SearchService()
-        collections = search_service.list_collections(provider.value)
-        return {"collections": collections}
-    except Exception as e:
-        logger.error(f"Error getting collections: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-@app.post("/search")
-async def search(
-    query: str = Body(...),
-    collection_id: str = Body(...),
-    top_k: int = Body(3),
-    threshold: float = Body(0.7),
-    word_count_threshold: int = Body(100)
-):
-    """执行向量搜索"""
-    try:
-        # Log the incoming search request details
-        logger.info(f"Search request - Query: {query}, Collection: {collection_id}, Top K: {top_k}, Threshold: {threshold}, Word Count Threshold: {word_count_threshold}")
-        
-        search_service = SearchService()
-        
-        # Log before calling the search function
-        logger.info("Calling search service...")
-        
-        results = await search_service.search(
-            query=query,
-            collection_id=collection_id,
-            top_k=top_k,
-            threshold=threshold,
-            word_count_threshold=word_count_threshold
-        )
-        
-        # Log the search results
-        logger.info(f"Search response: {results}")
-        
-        return {"results": results}
-    except Exception as e:
-        logger.error(f"Error performing search: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-@app.get("/collections/{provider}")
-async def get_provider_collections(provider: str):
-    """Get collections for a specific vector database provider"""
-    try:
-        vector_store_service = VectorStoreService()
-        collections = vector_store_service.list_collections(provider)
-        return {"collections": collections}
-    except Exception as e:
-        logger.error(f"Error getting collections for provider {provider}: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-@app.get("/collections/{provider}/{collection_name}")
-async def get_collection_info(provider: str, collection_name: str):
-    """Get detailed information about a specific collection"""
-    try:
-        vector_store_service = VectorStoreService()
-        info = vector_store_service.get_collection_info(provider, collection_name)
-        return info
-    except Exception as e:
-        logger.error(f"Error getting collection info: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-@app.delete("/collections/{provider}/{collection_name}")
-async def delete_collection(provider: str, collection_name: str):
-    """Delete a specific collection"""
-    try:
-        vector_store_service = VectorStoreService()
-        success = vector_store_service.delete_collection(provider, collection_name)
-        if success:
-            return {"message": f"Collection {collection_name} deleted successfully"}
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Failed to delete collection {collection_name}"
-            )
-    except Exception as e:
-        logger.error(f"Error deleting collection: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-@app.get("/documents")
-async def get_documents(type: str = Query("all")):
-    try:
-        documents = []
-        
-        # 读取loaded文档
-        if type in ["all", "loaded"]:
-            loaded_dir = "01-loaded-docs"
-            if os.path.exists(loaded_dir):
-                for filename in os.listdir(loaded_dir):
-                    if filename.endswith('.json'):
-                        file_path = os.path.join(loaded_dir, filename)
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            doc_data = json.load(f)
-                            documents.append({
-                                "id": filename,
-                                "name": filename,
-                                "type": "loaded",
-                                "metadata": {
-                                    "total_pages": doc_data.get("total_pages"),
-                                    "total_chunks": doc_data.get("total_chunks"),
-                                    "loading_method": doc_data.get("loading_method"),
-                                    "chunking_method": doc_data.get("chunking_method"),
-                                    "timestamp": doc_data.get("timestamp")
-                                }
-                            })
-
-        # 读取chunked文档
-        if type in ["all", "chunked"]:
-            chunked_dir = "01-chunked-docs"
-            if os.path.exists(chunked_dir):
-                for filename in os.listdir(chunked_dir):
-                    if filename.endswith('.json'):
-                        file_path = os.path.join(chunked_dir, filename)
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            doc_data = json.load(f)
-                            documents.append({
-                                "id": filename,
-                                "name": filename,  # 保持原始文件名
-                                "type": "chunked"
-                            })
-        
-        return {"documents": documents}
-    except Exception as e:
-        logger.error(f"Error getting documents: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/documents/{doc_name}")
-async def get_document(doc_name: str, type: str = Query("loaded")):
-    try:
-
-        base_name = doc_name.replace('.json', '')
-        file_name = f"{base_name}.json"
-        
-        # 根据类型选择不同的目录
-        directory = "01-loaded-docs" if type == "loaded" else "01-chunked-docs"
-        file_path = os.path.join(directory, file_name)
-        
-        logger.info(f"Attempting to read document from: {file_path}")
-        
-        if not os.path.exists(file_path):
-            logger.error(f"Document not found at path: {file_path}")
-            raise HTTPException(status_code=404, detail="Document not found")
-            
-        with open(file_path, 'r', encoding='utf-8') as f:
-            doc_data = json.load(f)
-            
-        return doc_data
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error reading document: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/documents/{doc_name}")
-async def delete_document(doc_name: str, type: str = Query("loaded")):
-    try:
-        # 移除已有的 .json 扩展名（如果有）然后添加一个
-        base_name = doc_name.replace('.json', '')
-        file_name = f"{base_name}.json"
-        
-        # 根据类型选择不同的目录
-        directory = "01-loaded-docs" if type == "loaded" else "01-chunked-docs"
-        file_path = os.path.join(directory, file_name)
-        
-        logger.info(f"Attempting to delete document: {file_path}")
-        
-        if not os.path.exists(file_path):
-            logger.error(f"Document not found at path: {file_path}")
-            raise HTTPException(status_code=404, detail="Document not found")
-            
-        # 删除文件
-        os.remove(file_path)
-        
-        return {
-            "status": "success",
-            "message": f"Document {doc_name} deleted successfully"
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting document: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/embedded-docs/{doc_name}")
-async def get_embedded_doc(doc_name: str):
-    """Get specific embedded document"""
-    try:
-        logger.info(f"Attempting to read document: {doc_name}")
-        file_path = os.path.join("02-embedded-docs", doc_name)
-        
-        if not os.path.exists(file_path):
-            logger.error(f"Document not found: {file_path}")
-            raise HTTPException(
-                status_code=404,
-                detail=f"Document {doc_name} not found"
-            )
-            
-        with open(file_path, 'r', encoding='utf-8') as f:
-            doc_data = json.load(f)
-            logger.info(f"Successfully read document: {doc_name}")
-            
-            return {
-                "embeddings": [
-                    {
-                        "embedding": embedding["embedding"],
-                        "metadata": {
-                            "document_name": doc_data.get("document_name", doc_name),
-                            "chunk_id": idx + 1,
-                            "total_chunks": len(doc_data["embeddings"]),
-                            "content": embedding["metadata"].get("content", ""),
-                            "page_number": embedding["metadata"].get("page_number", ""),
-                            "page_range": embedding["metadata"].get("page_range", ""),
-                            # "chunking_method": embedding["metadata"].get("chunking_method", ""),
-                            "embedding_model": doc_data.get("embedding_model", ""),
-                            "embedding_provider": doc_data.get("embedding_provider", ""),
-                            "embedding_timestamp": doc_data.get("created_at", ""),
-                            "vector_dimension": doc_data.get("vector_dimension", 0)
-                        }
-                    }
-                    for idx, embedding in enumerate(doc_data["embeddings"])
-                ]
-            }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting embedded document {doc_name}: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/embedded-docs/{doc_name}")
-async def delete_embedded_doc(doc_name: str):
-    """Delete specific embedded document"""
-    try:
-        file_path = os.path.join("02-embedded-docs", doc_name)
-        if not os.path.exists(file_path):
-            raise HTTPException(
-                status_code=404,
-                detail=f"Document {doc_name} not found"
-            )
-            
-        os.remove(file_path)
-        return {"message": f"Document {doc_name} deleted successfully"}
-    except Exception as e:
-        logger.error(f"Error deleting embedded document {doc_name}: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/parse")
-async def parse_file(
-    file: UploadFile = File(...),
-    loading_method: str = Form(...),
-    parsing_option: str = Form(...)
-):
-    try:
-        # Save uploaded file
-        temp_path = os.path.join("temp", file.filename)
-        with open(temp_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-        
-        # Prepare metadata
-        metadata = {
-            "filename": file.filename,
-            "loading_method": loading_method,
-            "original_file_size": len(content),
-            "processing_date": datetime.now().isoformat(),
-            "parsing_method": parsing_option,
-        }
-        
-        loading_service = LoadingService()
-        raw_text = loading_service.load_pdf(temp_path, loading_method)
-        metadata["total_pages"] = loading_service.get_total_pages()
-        
-        page_map = loading_service.get_page_map()
-        
-        parsing_service = ParsingService()
-        parsed_content = parsing_service.parse_pdf(
-            raw_text, 
-            parsing_option, 
-            metadata,
-            page_map=page_map
-        )
-        
-        # Clean up temp file
-        os.remove(temp_path)
-        
-        return {"parsed_content": parsed_content}
-    except Exception as e:
-        logger.error(f"Error parsing file: {str(e)}")
-        raise
-
-@app.post("/load")
-async def load_file(
-    file: UploadFile = File(...),
-    loading_method: str = Form(...),
-    strategy: str = Form(None),
-    chunking_strategy: str = Form(None),
-    chunking_options: str = Form(None)
-):
-    try:
-        # 保存上传的文件
-        temp_path = os.path.join("temp", file.filename)
-        with open(temp_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-        
-        # 准备元数据
-        metadata = {
-            "filename": file.filename,
-            "total_chunks": 0,  # 将在后面更新
-            "total_pages": 0,   # 将在后面更新
-            "loading_method": loading_method,
-            "loading_strategy": strategy,  
-            "chunking_strategy": chunking_strategy, 
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        # Parse chunking options if provided
-        chunking_options_dict = None
-        if chunking_options:
-            chunking_options_dict = json.loads(chunking_options)
-        
-        # 使用 LoadingService 加载文档
-        loading_service = LoadingService()
-        raw_text = loading_service.load_pdf(
-            temp_path, 
-            loading_method, 
-            strategy=strategy,
-            chunking_strategy=chunking_strategy,
-            chunking_options=chunking_options_dict
-        )
-        
-        metadata["total_pages"] = loading_service.get_total_pages()
-        
-        page_map = loading_service.get_page_map()
-        
-        # 转换成标准化的chunks格式
-        chunks = []
-        for idx, page in enumerate(page_map, 1):
-            chunk_metadata = {
-                "chunk_id": idx,
-                "page_number": page["page"],
-                "page_range": str(page["page"]),
-                "word_count": len(page["text"].split())
-            }
-            if "metadata" in page:
-                chunk_metadata.update(page["metadata"])
-            
-            chunks.append({
-                "content": page["text"],
-                "metadata": chunk_metadata
-            })
-        
-        # 使用 LoadingService 保存文档，传递strategy参数
-        filepath = loading_service.save_document(
-            filename=file.filename,
-            chunks=chunks,
-            metadata=metadata,
-            loading_method=loading_method,
-            strategy=strategy,
-            chunking_strategy=chunking_strategy,
-        )
-        
-        # 读取保存的文档以返回
-        with open(filepath, "r", encoding="utf-8") as f:
-            document_data = json.load(f)
-        
-        # 清理临时文件
-        os.remove(temp_path)
-        
-        return {"loaded_content": document_data, "filepath": filepath}
-    except Exception as e:
-        logger.error(f"Error loading file: {str(e)}")
-        raise
-
-@app.post("/chunk")
-async def chunk_document(data: dict = Body(...)):
-    try:
-        doc_id = data.get("doc_id")
-        chunking_option = data.get("chunking_option")
-        chunk_size = data.get("chunk_size", 1000)
-        
-        if not doc_id or not chunking_option:
-            raise HTTPException(
-                status_code=400, 
-                detail="Missing required parameters: doc_id and chunking_option"
-            )
-        
-        # 读取已加载的文档
-        file_path = os.path.join("01-loaded-docs", doc_id)
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail="Document not found")
-            
-        with open(file_path, 'r', encoding='utf-8') as f:
-            doc_data = json.load(f)
-            
-        # 构建页面映射
-        page_map = [
-            {
-                'page': chunk['metadata']['page_number'],
-                'text': chunk['content']
-            }
-            for chunk in doc_data['chunks']
-        ]
-            
-        # 准备元数据
-        metadata = {
-            "filename": doc_data['filename'],
-            "loading_method": doc_data['loading_method'],
-            "total_pages": doc_data['total_pages']
-        }
-            
-        chunking_service = ChunkingService()
-        result = chunking_service.chunk_text(
-            text="",  # 不需要传递文本，因为我们使用 page_map
-            method=chunking_option,
-            metadata=metadata,
-            page_map=page_map,
-            chunk_size=chunk_size
-        )
-        
-        # 生成输出文件名
-        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-        base_name = doc_data['filename'].replace('.pdf', '').split('_')[0]
-        output_filename = f"{base_name}_{chunking_option}_{timestamp}.json"
-        
-        output_path = os.path.join("01-chunked-docs", output_filename)
-        os.makedirs("01-chunked-docs", exist_ok=True)
-        
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error chunking document: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/evaluate")
-async def evaluate_search(
-    file: UploadFile = File(...),
-    collection_id: str = Form(...),
-    top_k: int = Form(10),
-    threshold: float = Form(0.7)
-):
-    try:
-        # 读取CSV文件
-        df = pd.read_csv(file.file)
-        
-        # 只合并前四列的文本内容
-        df['combined_text'] = df.apply(
-            lambda row: ' '.join(
-                str(val) for i, val in enumerate(row) 
-                if i < 4 and pd.notna(val) and val != '[]'
-            ), 
-            axis=1
-        )
-        
-        # 初始化SearchService
-        search_service = SearchService()
-        
-        results = []
-        total_score_hit = 0
-        total_score_find = 0
-        valid_queries = 0
-        
-        # 处理每个查询
-        for _, row in df.iterrows():
-            # 跳过没有标签的行
-            if pd.isna(row['LABEL']) or row['LABEL'] == '[]':
-                continue
-                
-            try:
-                # 解析标签页码列表
-                label_str = str(row['LABEL']).strip('[]').replace(' ', '')
-                if label_str:
-                    expected_pages = [int(x.strip()) for x in label_str.split(',') if x.strip()]
-                else:
-                    continue
-                
-                # 执行搜索
-                search_results = await search_service.search(
-                    query=row['combined_text'],
-                    collection_id=collection_id,
-                    top_k=top_k,
-                    threshold=threshold
-                )
-                
-                # 提取找到的页码
-                found_pages = [int(result['metadata']['page']) for result in search_results]
-                
-                # 计算分数
-                hits = sum(1 for page in found_pages if page in expected_pages)
-                score_hit = hits / len(found_pages) if found_pages else 0
-                score_find = len(set(found_pages) & set(expected_pages)) / len(expected_pages)
-                
-                # 添加到结果列表，包括所有top_k结果的文本
-                result_entry = {
-                    "query": row['combined_text'],
-                    "expected_pages": expected_pages,
-                    "found_pages": found_pages,
-                    "score_hit": score_hit,
-                    "score_find": score_find
-                }
-                
-                # 添加每个top_k结果的文本作为单独的字段
-                for i, result in enumerate(search_results, 1):
-                    result_entry[f"text_{i}"] = result['text']
-                    result_entry[f"page_{i}"] = result['metadata']['page']
-                    result_entry[f"score_{i}"] = result['score']
-                
-                results.append(result_entry)
-                
-                total_score_hit += score_hit
-                total_score_find += score_find
-                valid_queries += 1
-                
-            except Exception as e:
-                logger.warning(f"Error processing row: {str(e)}")
-                continue
-        
-        if valid_queries == 0:
-            raise ValueError("No valid queries found in the CSV file")
-        
-        # 计算平均分数
-        average_scores = {
-            "score_hit": total_score_hit / valid_queries,
-            "score_find": total_score_find / valid_queries
-        }
-        
-        # 保存结果
-        output_dir = Path("06-evaluation-result")
-        output_dir.mkdir(exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # 保存详细的JSON结果
-        output_path = output_dir / f"evaluation_results_{timestamp}.json"
-        evaluation_results = {
-            "results": results,
-            "average_scores": average_scores,
-            "total_queries": valid_queries,
-            "parameters": {
-                "collection_id": collection_id,
-                "top_k": top_k,
-                "threshold": threshold
-            }
-        }
-        
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(evaluation_results, f, indent=2)
-            
-        # 保存CSV格式的结果，每个top_k结果单独一列
-        results_df = pd.DataFrame(results)
-        
-        # 重新排列列的顺序，使其更有逻辑性
-        column_order = ['query', 'expected_pages', 'found_pages', 'score_hit', 'score_find']
-        for i in range(1, top_k + 1):
-            column_order.extend([f'page_{i}', f'score_{i}', f'text_{i}'])
-        
-        # 只选择存在的列
-        existing_columns = [col for col in column_order if col in results_df.columns]
-        results_df = results_df[existing_columns]
-        
-        csv_path = output_dir / f"evaluation_results_{timestamp}.csv"
-        results_df.to_csv(csv_path, index=False)
-        
-        return evaluation_results
-        
-    except Exception as e:
-        logger.error(f"Error during evaluation: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """
+    搜索 arXiv 论文
+    支持两种方式：
+    1. 直接传入 search_query 字符串，如 "ti:deep learning+AND+au:John"
+    2. 传入各字段自动构建查询，如 title="deep learning", author="John", category="cs.AI"
     
-@app.post("/save-search")
-async def save_search_results(request: Request):
+    支持的数据源：
+    - 本地数据集（默认）：从 Kaggle 下载的 JSON 文件
+    - API：直接调用 arXiv 官方 API
+    
+    通过环境变量 ARXIV_DATA_SOURCE 切换数据源（local/api）
+    """
     try:
-        data = await request.json()
-        query = data.get("query")
-        collection_id = data.get("collection_id")
-        results = data.get("results")
+        arxiv_service = get_arxiv_service()
         
-        if not all([query, collection_id, results]):
-            raise HTTPException(status_code=400, detail="Missing required parameters")
+        if search_query and not any([title, author, abstract, category, comment, journal_ref, report_number]):
+            results = arxiv_service.search_papers(
+                search_query=search_query,
+                id_list=id_list,
+                max_results=max_results,
+                start=start,
+                sort_by=sort_by,
+                sort_order=sort_order,
+                submitted_days_ago=submitted_days_ago
+            )
+        else:
+            effective_operator = operator if operator and operator.strip() else "AND"
+            results = arxiv_service.search_advanced(
+                title=title,
+                author=author,
+                abstract=abstract,
+                category=category,
+                comment=comment,
+                journal_ref=journal_ref,
+                report_number=report_number,
+                operator=effective_operator,
+                id_list=id_list,
+                max_results=max_results,
+                start=start,
+                sort_by=sort_by,
+                sort_order=sort_order,
+                submitted_days_ago=submitted_days_ago
+            )
         
-        # 直接创建 SearchService 实例
-        search_service = SearchService()
-        filepath = search_service.save_search_results(query, collection_id, results)
-        return {"saved_filepath": filepath}
-        
+        return results
     except Exception as e:
-        logger.error(f"Error saving search results: {str(e)}")
+        logger.error(f"Error searching arXiv: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/generation/models")
-async def get_generation_models():
-    """获取可用的生成模型列表"""
+@app.get("/arxiv/fields")
+async def arxiv_get_fields():
+    """获取支持的搜索字段列表"""
     try:
-        generation_service = GenerationService()
-        models = generation_service.get_available_models()
-        return {"models": models}
+        arxiv_service = get_arxiv_service()
+        fields = arxiv_service.get_available_fields()
+        return {"fields": fields}
     except Exception as e:
-        logger.error(f"Error getting generation models: {str(e)}")
+        logger.error(f"Error getting arXiv fields: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/generate")
-async def generate_response(
-    query: str = Body(...),
-    provider: str = Body(...),
-    model_name: str = Body(...),
-    search_results: List[Dict] = Body(...),
-    api_key: Optional[str] = Body(None)
+@app.get("/arxiv/categories")
+async def arxiv_get_categories():
+    """获取常用的arXiv学科分类"""
+    try:
+        arxiv_service = get_arxiv_service()
+        categories = arxiv_service.get_subject_categories()
+        return {"categories": categories}
+    except Exception as e:
+        logger.error(f"Error getting arXiv categories: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/arxiv/download")
+async def arxiv_download(
+    arxiv_id: str = Body(...),
+    pdf_url: str = Body(...)
 ):
-    """生成回答"""
+    """下载 arXiv 论文 PDF"""
     try:
-        generation_service = GenerationService()
-        result = generation_service.generate(
-            provider=provider,
-            model_name=model_name,
-            query=query,
-            search_results=search_results,
-            api_key=api_key
-        )
-        return result
+        arxiv_service = ArxivSearchService()
+        filepath = arxiv_service.download_pdf(pdf_url, arxiv_id)
+        return {"status": "success", "filepath": filepath}
     except Exception as e:
-        logger.error(f"Error generating response: {str(e)}")
+        logger.error(f"Error downloading arXiv paper: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/search-results")
-async def list_search_results():
-    """获取所有搜索结果文件列表"""
+@app.post("/arxiv/search-and-save")
+async def arxiv_search_and_save(
+    search_query: str = Body(""),
+    id_list: Optional[List[str]] = Body(None),
+    max_results: int = Body(10),
+    download_pdfs: bool = Body(False),
+    **kwargs
+):
+    """搜索 arXiv 论文并保存结果，可选择下载 PDF"""
     try:
-        search_results_dir = "04-search-results"
-        if not os.path.exists(search_results_dir):
-            return {"files": []}
+        arxiv_service = ArxivSearchService()
+        results = await arxiv_service.search_and_save(
+            search_query=search_query,
+            id_list=id_list,
+            max_results=max_results,
+            download_pdfs=download_pdfs,
+            **kwargs
+        )
+        return results
+    except Exception as e:
+        logger.error(f"Error in arXiv search and save: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# 用户偏好管理 API
+@app.post("/user/preferences")
+async def upsert_user_preferences(
+    user_id: str = Body("local_user")
+):
+    """创建或更新用户偏好"""
+    try:
+        preferences = db_service.get_user_preferences(user_id=user_id)
+        return {"status": "success", "message": "User preferences retrieved", "preferences": preferences}
+    except Exception as e:
+        logger.error(f"Error getting user preferences: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/user/preferences/{user_id}")
+async def get_user_preferences(user_id: str):
+    """获取用户偏好"""
+    try:
+        preferences = db_service.get_user_preferences(user_id=user_id)
+        return preferences
+    except Exception as e:
+        logger.error(f"Error getting user preferences: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/user/like-paper")
+async def like_paper(
+    arxiv_id: str = Body(...),
+    user_id: str = Body("local_user")
+):
+    """标记论文为喜欢"""
+    try:
+        success = db_service.add_liked_paper(user_id=user_id, arxiv_id=arxiv_id)
+        if success:
+            return {"status": "success", "message": "Paper added to liked list"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to like paper")
+    except Exception as e:
+        logger.error(f"Error liking paper: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/user/dislike-paper")
+async def dislike_paper(
+    arxiv_id: str = Body(...),
+    user_id: str = Body("local_user")
+):
+    """标记论文为不喜欢"""
+    try:
+        success = db_service.add_disliked_paper(user_id=user_id, arxiv_id=arxiv_id)
+        if success:
+            return {"status": "success", "message": "Paper added to disliked list"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to dislike paper")
+    except Exception as e:
+        logger.error(f"Error disliking paper: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/user/like-paper")
+async def remove_like(
+    arxiv_id: str = Body(...),
+    user_id: str = Body("local_user")
+):
+    """从喜欢列表中移除论文"""
+    try:
+        success = db_service.remove_liked_paper(user_id=user_id, arxiv_id=arxiv_id)
+        if success:
+            return {"status": "success", "message": "Paper removed from liked list"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to remove from liked list")
+    except Exception as e:
+        logger.error(f"Error removing liked paper: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/user/dislike-paper")
+async def remove_dislike(
+    arxiv_id: str = Body(...),
+    user_id: str = Body("local_user")
+):
+    """从不喜欢列表中移除论文"""
+    try:
+        success = db_service.remove_disliked_paper(user_id=user_id, arxiv_id=arxiv_id)
+        if success:
+            return {"status": "success", "message": "Paper removed from disliked list"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to remove from disliked list")
+    except Exception as e:
+        logger.error(f"Error removing disliked paper: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/user/generate-interest-vector")
+async def generate_user_interest_vector(
+    user_id: str = Body("local_user")
+):
+    """
+    生成用户兴趣向量
+    流程：获取用户喜欢的论文 -> 提取title+abstract -> 计算embedding -> 聚合为兴趣向量
+    """
+    try:
+        logger.info(f"Generating interest vector for user: {user_id}")
+        
+        liked_papers = db_service.get_liked_papers_with_details(user_id=user_id)
+        
+        if not liked_papers:
+            raise HTTPException(status_code=400, detail="No liked papers found for user")
+        
+        logger.info(f"Found {len(liked_papers)} liked papers for user {user_id}")
+        
+        embeddings = []
+        embedding_model = "Qwen3-VL-Embedding-2B (local)"
+        
+        for paper in liked_papers:
+            title = paper.get('title', '')
+            abstract = paper.get('abstract', '')
+            text_to_embed = f"{title}\n\n摘要：{abstract}"
             
-        files = []
-        for filename in os.listdir(search_results_dir):
-            if filename.endswith('.json'):
-                file_path = os.path.join(search_results_dir, filename)
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    files.append({
-                        "id": filename,
-                        "name": f"Search: {data.get('query', 'Unknown')} ({filename})",
-                        "timestamp": data.get('timestamp', '')
-                    })
-                    
-        # 按时间戳排序，最新的在前面
-        files.sort(key=lambda x: x['timestamp'], reverse=True)
-        return {"files": files}
+            embedding = embedding_service.create_single_embedding_local(text_to_embed)
+            embeddings.append(embedding)
+        
+        if not embeddings:
+            raise HTTPException(status_code=500, detail="Failed to create embeddings")
+        
+        embedding_dimension = len(embeddings[0])
+        logger.info(f"Embedding dimension: {embedding_dimension}")
+        
+        interest_vector = []
+        for i in range(embedding_dimension):
+            dimension_sum = sum(emb[i] for emb in embeddings)
+            interest_vector.append(dimension_sum / len(embeddings))
+        
+        logger.info(f"Calculated interest vector with {len(interest_vector)} dimensions")
+        
+        success = db_service.save_user_interest_vector(
+            user_id=user_id,
+            vector_data=interest_vector,
+            paper_count=len(liked_papers),
+            embedding_model=embedding_model,
+            vector_dimension=embedding_dimension
+        )
+        
+        if success:
+            return {
+                "status": "success",
+                "message": "User interest vector generated successfully",
+                "paper_count": len(liked_papers),
+                "vector_dimension": embedding_dimension,
+                "embedding_model": embedding_model
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to save interest vector")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating interest vector: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/user/interest-vector")
+async def get_user_interest_vector(
+    user_id: str = "local_user"
+):
+    """获取用户兴趣向量"""
+    try:
+        result = db_service.get_user_interest_vector(user_id=user_id)
+        if result:
+            return result
+        else:
+            raise HTTPException(status_code=404, detail="User interest vector not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting interest vector: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/user/recommend-papers")
+async def recommend_papers(
+    user_id: str = Body("local_user"),
+    top_n: int = Body(10)
+):
+    """
+    根据用户兴趣向量推荐论文
+    流程：获取用户兴趣向量 -> 在Milvus中搜索相似向量 -> 返回最相似的top_n篇
+    """
+    try:
+        logger.info(f"Generating recommendations for user: {user_id}, top_n: {top_n}")
+        
+        interest_vector_data = db_service.get_user_interest_vector(user_id=user_id)
+        if not interest_vector_data:
+            raise HTTPException(status_code=400, detail="User interest vector not found. Please generate it first.")
+        
+        user_vector = interest_vector_data['vector_data']
+        logger.info(f"User interest vector dimension: {len(user_vector)}")
+        
+        preferences = db_service.get_user_preferences(user_id=user_id)
+        labeled_ids = preferences.get('liked_papers', []) + preferences.get('disliked_papers', [])
+        
+        logger.info(f"User has {len(labeled_ids)} labeled papers, will filter them out")
+        
+        results = vector_store_service.search_similar_vectors(
+            collection_name="arxiv_paper_embeddings",
+            query_vector=user_vector,
+            top_k=top_n * 2,
+            filter_arxiv_ids=labeled_ids if labeled_ids else None
+        )
+        
+        if not results:
+            raise HTTPException(status_code=400, detail="No papers found for recommendation")
+        
+        recommendations = results[:top_n]
+        
+        logger.info(f"Generated {len(recommendations)} recommendations from Milvus")
+        
+        return {
+            "status": "success",
+            "message": f"Generated {len(recommendations)} recommendations",
+            "total_found": len(results),
+            "recommendations": recommendations
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating recommendations: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 论文元数据管理 API
+@app.post("/paper")
+async def add_paper(
+    arxiv_id: str = Body(...),
+    title: str = Body(...),
+    authors: str = Body(...),
+    abstract: str = Body(...),
+    categories: str = Body(...),
+    published_date: str = Body(...),
+    url: str = Body(...),
+    collection_name: str = Body("arxiv_abstracts")
+):
+    """
+    添加论文元数据，并自动使用本地Qwen3-VL-Embedding-2B模型生成embedding
+    将embedding向量存储到向量数据库，并将embedding_id保存到SQLite
+    """
+    try:
+        logger.info(f"Adding paper with embedding: {arxiv_id}")
+        
+        logger.info("Creating embedding for abstract using local Qwen3-VL-Embedding-2B model")
+        text_to_embed = f"{title}\n\n摘要：{abstract}"
+        embedding = embedding_service.create_single_embedding_local(text_to_embed)
+        
+        logger.info(f"Embedding created, dimension: {len(embedding)}")
+        
+        local_model_name = "Qwen3-VL-Embedding-2B (local)"
+        metadata = {
+            "content": abstract,
+            "arxiv_id": arxiv_id,
+            "title": title,
+            "authors": authors,
+            "categories": categories,
+            "published_date": published_date,
+            "url": url,
+            "embedding_model": local_model_name
+        }
+        
+        logger.info(f"Inserting embedding to collection: {collection_name}")
+        embedding_id = vector_store_service.insert_single_embedding(collection_name, embedding, metadata)
+        
+        logger.info(f"Embedding inserted with ID: {embedding_id}")
+        
+        # 打印要添加的论文元数据
+        logger.info(f"Adding paper to database: {metadata}, embedding_id: {embedding_id}")
+
+        success = db_service.add_paper({
+            'arxiv_id': arxiv_id,
+            'title': title,
+            'authors': authors,
+            'abstract': abstract,
+            'categories': categories,
+            'published_date': published_date,
+            'url': url,
+            'embedding_id': str(embedding_id),
+            'embedding_model': local_model_name
+        })
+        
+        if success:
+            logger.info(f"Paper {arxiv_id} added successfully with embedding")
+            return {
+                "status": "success",
+                "message": "Paper added with embedding",
+                "arxiv_id": arxiv_id,
+                "embedding_id": embedding_id,
+                "embedding_model": local_model_name,
+                "vector_dimension": len(embedding),
+                "collection_name": collection_name
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to add paper")
+    except Exception as e:
+        logger.error(f"Error adding paper: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/paper/{arxiv_id}")
+async def get_paper(arxiv_id: str):
+    """获取论文元数据"""
+    try:
+        paper = db_service.get_paper(arxiv_id)
+        if paper:
+            return paper
+        else:
+            raise HTTPException(status_code=404, detail="Paper not found")
+    except Exception as e:
+        logger.error(f"Error getting paper: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/paper/{arxiv_id}")
+async def delete_paper(arxiv_id: str):
+    """删除论文元数据"""
+    try:
+        success = db_service.delete_paper(arxiv_id)
+        if success:
+            return {"status": "success", "message": "Paper deleted"}
+        else:
+            raise HTTPException(status_code=404, detail="Paper not found")
+    except Exception as e:
+        logger.error(f"Error deleting paper: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/papers")
+async def get_all_papers():
+    """获取所有论文列表"""
+    try:
+        papers = db_service.get_all_papers()
+        return {"papers": papers}
+    except Exception as e:
+        logger.error(f"Error getting all papers: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/papers/category/{category}")
+async def search_papers_by_category(category: str):
+    """按学科分类搜索论文"""
+    try:
+        papers = db_service.search_papers_by_category(category)
+        return {"papers": papers}
+    except Exception as e:
+        logger.error(f"Error searching papers by category: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/paper/{arxiv_id}/qa-status")
+async def get_paper_qa_status(arxiv_id: str):
+    """检查论文是否已有问答索引"""
+    try:
+        qa_index = db_service.get_paper_qa_index(arxiv_id)
+        if qa_index:
+            return {
+                "arxiv_id": arxiv_id,
+                "has_index": qa_index['status'] == 'indexed',
+                "status": qa_index['status'],
+                "collection_name": qa_index['collection_name'],
+                "chunk_count": qa_index['chunk_count'],
+                "embedding_model": qa_index['embedding_model']
+            }
+        else:
+            return {
+                "arxiv_id": arxiv_id,
+                "has_index": False,
+                "status": "not_indexed"
+            }
+    except Exception as e:
+        logger.error(f"Error getting paper QA status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/paper/{arxiv_id}/create-qa-index")
+async def create_paper_qa_index(arxiv_id: str):
+    """
+    为论文创建问答索引
+    流程：下载PDF -> 解析正文 -> 切分chunks -> 计算embeddings -> 保存到向量数据库
+    """
+    try:
+        logger.info(f"Creating QA index for paper: {arxiv_id}")
+        
+        db_service.insert_paper_qa_index(arxiv_id, status='processing')
+        
+        arxiv_service = ArxivSearchService()
+        
+        paper = db_service.get_paper(arxiv_id)
+        if not paper:
+            raise HTTPException(status_code=404, detail="Paper not found in database")
+        
+        pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+        logger.info(f"Downloading PDF from: {pdf_url}")
+        
+        pdf_path = arxiv_service.download_pdf(pdf_url, arxiv_id)
+        logger.info(f"PDF downloaded to: {pdf_path}")
+        
+        loading_service = LoadingService()
+        logger.info("Loading PDF content...")
+        text = loading_service.load_pdf(pdf_path, method='pymupdf')
+        
+        page_map = loading_service.get_page_map()
+        logger.info(f"Loaded {len(page_map)} pages from PDF")
+        
+        chunking_service = ChunkingService()
+        logger.info("Chunking text...")
+        metadata = {"filename": f"{arxiv_id}.pdf", "loading_method": "pymupdf"}
+        chunked_data = chunking_service.chunk_text(text, method='by_paragraphs', metadata=metadata, page_map=page_map)
+        
+        chunks = chunked_data['chunks']
+        logger.info(f"Created {len(chunks)} chunks")
+
+        # Persist the chunked document so the frontend can inspect the actual chunks.
+        chunk_file = loading_service.save_document(
+            filename=f"{arxiv_id}.pdf",
+            chunks=chunks,
+            metadata={"total_pages": len(page_map)},
+            loading_method="pymupdf",
+            chunking_strategy="by_paragraphs"
+        )
+        logger.info(f"Chunked document saved to: {chunk_file}")
+        
+        embedding_config = EmbeddingConfig(provider="local", model_name="Qwen3-VL-Embedding-2B")
+        logger.info("Creating embeddings with local Qwen3-VL-Embedding-2B model...")
+        
+        input_data = {
+            'chunks': chunks,
+            'metadata': {'filename': f"{arxiv_id}.pdf"}
+        }
+        embeddings, _ = embedding_service.create_embeddings(input_data, embedding_config)
+        
+        logger.info(f"Created {len(embeddings)} embeddings")
+        
+        embedding_file = embedding_service.save_embeddings(f"{arxiv_id}.pdf", embeddings)
+        logger.info(f"Embeddings saved to: {embedding_file}")
+        
+        vector_db_config = VectorDBConfig(provider="milvus", index_mode="default")
+        index_result = vector_store_service.index_embeddings(embedding_file, vector_db_config)
+        
+        collection_name = index_result.get('collection_name', '')
+        logger.info(f"Index created in collection: {collection_name}")
+        
+        db_service.update_paper_qa_index(
+            arxiv_id,
+            collection_name=collection_name,
+            status='indexed',
+            chunk_count=len(chunks),
+            embedding_model="Qwen3-VL-Embedding-2B",
+            pdf_path=pdf_path
+        )
+        
+        return {
+            "status": "success",
+            "message": "QA index created successfully",
+            "arxiv_id": arxiv_id,
+            "collection_name": collection_name,
+            "chunk_count": len(chunks),
+            "embedding_model": "Qwen3-VL-Embedding-2B",
+            "pdf_path": pdf_path,
+            "chunk_file": chunk_file
+        }
+        
+    except HTTPException:
+        db_service.update_paper_qa_index(arxiv_id, status='failed')
+        raise
+    except Exception as e:
+        logger.error(f"Error creating QA index: {str(e)}")
+        db_service.update_paper_qa_index(arxiv_id, status='failed')
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/paper/{arxiv_id}/qa")
+async def qa_paper(arxiv_id: str, question: str = Body(..., description="用户问题")):
+    """
+    对论文进行问答
+    流程：检查索引 -> 搜索相似chunks -> 生成回答
+    """
+    try:
+        logger.info(f"QA request for paper: {arxiv_id}, question: {question}")
+        
+        qa_index = db_service.get_paper_qa_index(arxiv_id)
+        if not qa_index or qa_index['status'] != 'indexed':
+            raise HTTPException(status_code=400, detail="Paper does not have QA index. Please create index first.")
+        
+        collection_name = qa_index['collection_name']
+        
+        question_embedding = embedding_service.create_single_embedding_local(question)
+        
+        search_results = vector_store_service.search_similar_vectors(
+            collection_name=collection_name,
+            query_vector=question_embedding,
+            top_k=5
+        )
+        
+        if not search_results:
+            raise HTTPException(status_code=400, detail="No relevant chunks found")
+        
+        context = "\n\n".join([result.get('content', '') for result in search_results])
+        
+        prompt = f"""基于以下论文内容回答问题：
+
+{context}
+
+问题：{question}
+
+请根据上述内容给出详细的回答。"""
+        
+        logger.info("Generating answer...")
+        
+        try:
+            generation_service = GenerationService()
+            answer = generation_service.generate_text(
+                prompt=prompt,
+                model_type="local",
+                model_name="Qwen/Qwen2-7B-Instruct"
+            )
+        except Exception as e:
+            logger.warning(f"Local generation failed, using fallback: {str(e)}")
+            answer = f"根据论文内容，关于您的问题 \"{question}\" 的相关信息如下：\n\n{context[:1000]}..."
+        
+        return {
+            "status": "success",
+            "arxiv_id": arxiv_id,
+            "question": question,
+            "answer": answer,
+            "sources": [{"content": r.get('content', '')[:200], "page_number": r.get('page_number', '')} for r in search_results]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in QA: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/chunks/files")
+async def list_chunk_files():
+    """
+    获取所有已切片的文档文件列表
+    """
+    try:
+        chunk_files = []
+        if not CHUNK_DOCS_DIR.exists():
+            logger.warning(f"Chunk docs directory does not exist: {CHUNK_DOCS_DIR}")
+            return {"status": "success", "files": []}
+
+        for file_path in CHUNK_DOCS_DIR.iterdir():
+            if file_path.is_file() and file_path.suffix.lower() == ".json":
+                file_size = file_path.stat().st_size
+                modified_time = file_path.stat().st_mtime
+                chunk_files.append({
+                    "filename": file_path.name,
+                    "size": file_size,
+                    "modified_time": modified_time
+                })
+        
+        chunk_files.sort(key=lambda x: x["modified_time"], reverse=True)
+        
+        return {
+            "status": "success",
+            "files": chunk_files
+        }
         
     except Exception as e:
-        logger.error(f"Error listing search results: {str(e)}")
+        logger.error(f"Error listing chunk files: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/search-results/{file_id}")
-async def get_search_result(file_id: str):
-    """获取特定搜索结果文件的内容"""
+
+@app.get("/chunks/file/{filename}")
+async def get_chunk_file(filename: str):
+    """
+    获取指定切片文件的内容
+    """
     try:
-        file_path = os.path.join("04-search-results", file_id)
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail="Search result file not found")
-            
-        with open(file_path, 'r', encoding='utf-8') as f:
+        file_path = CHUNK_DOCS_DIR / filename
+        
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            return data
-            
+        
+        return {
+            "status": "success",
+            "filename": filename,
+            "data": data
+        }
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error reading search result file: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e)) 
+        logger.error(f"Error reading chunk file: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("Starting FastAPI server...")
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8001,
+        reload=False,
+        log_level="debug"
+    )

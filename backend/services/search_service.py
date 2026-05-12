@@ -224,7 +224,7 @@ class SearchService:
             
             for hits in results:
                 for hit in hits:
-                    logger.info(f"Processing hit - Score: {hit.score}, Word Count: {hit.entity.get('word_count')}")
+                    logger.info(f"Processing hit - Score: {hit.score}, Word Count: {hit.get('word_count')}")
                     if hit.score >= threshold:
                         processed_results.append({
                             "text": hit.entity.content,

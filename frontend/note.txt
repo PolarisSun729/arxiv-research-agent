@@ -1,4 +1,0 @@
-安装npm组件：npm install
-启动前端：npm run dev
-
-
