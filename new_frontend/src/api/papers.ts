@@ -295,12 +295,205 @@ export interface QaResult {
   arxiv_id: string
   question: string
   answer: string
+  retrieval_debug?: RetrievalDebug | null
   sources: Array<{
     content: string
     page_number: string
+    source?: string
+    subchunk_label?: string
   }>
 }
 
-export async function qaPaper(arxivId: string, question: string): Promise<QaResult> {
-  return request.post(`/paper/${arxivId}/qa`, { question })
+export interface QaRequestOptions {
+  top_k?: number
+  enable_query_rewrite?: boolean
+  enable_hyde?: boolean
+  enable_keyword_search?: boolean
+  debug?: boolean
+}
+
+export interface RetrievalDebugChunk {
+  chunk_id?: number
+  original_chunk_id?: number
+  page_number?: string
+  page_range?: string
+  score?: number
+  route_score?: number
+  retrieval_route?: string
+  matched_routes?: string[]
+  source_query?: string
+  source_queries?: string[]
+  subchunk_label?: string
+  preview?: string
+}
+
+export interface RetrievalDebug {
+  original_query: string
+  rewritten_queries: string[]
+  hyde_text: string
+  routes: Record<string, RetrievalDebugChunk[]>
+  final_chunks: RetrievalDebugChunk[]
+  config?: Record<string, any>
+  fusion?: Record<string, any>
+}
+
+export async function qaPaper(arxivId: string, question: string, options: QaRequestOptions = {}): Promise<QaResult> {
+  return request.post(`/paper/${arxivId}/qa`, { question, ...options })
+}
+
+export interface QaStreamHandlers {
+  onMeta?: (meta: {
+    status: string
+    arxiv_id: string
+    question: string
+      sources: Array<{
+        content: string
+        page_number: string
+        source?: string
+      }>
+      retrieval_debug?: RetrievalDebug | null
+  }) => void
+  onDelta?: (delta: string) => void
+  onDone?: (payload: {
+    status: string
+    answer: string
+    sources: Array<{
+      content: string
+      page_number: string
+      source?: string
+    }>
+    retrieval_debug?: RetrievalDebug | null
+    usage?: {
+      input_tokens?: number | null
+      output_tokens?: number | null
+      total_tokens?: number | null
+    } | null
+  }) => void
+  onError?: (detail: string) => void
+  signal?: AbortSignal
+}
+
+function parseSseEvent(rawEvent: string): { event: string; data: any } | null {
+  const lines = rawEvent
+    .split(/\r?\n/)
+    .filter(Boolean)
+
+  if (!lines.length) return null
+
+  let event = 'message'
+  const dataLines: string[] = []
+
+  for (const line of lines) {
+    if (line.startsWith('event:')) {
+      event = line.slice(6).trim()
+    } else if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).replace(/^ /, ''))
+    }
+  }
+
+  const dataText = dataLines.join('\n')
+  if (!dataText) return { event, data: null }
+
+  try {
+    return { event, data: JSON.parse(dataText) }
+  } catch {
+    return { event, data: dataText }
+  }
+}
+
+export async function qaPaperStream(
+  arxivId: string,
+  question: string,
+  handlers: QaStreamHandlers = {},
+  options: QaRequestOptions = {}
+): Promise<QaResult> {
+  const response = await fetch(`/api/paper/${arxivId}/qa/stream`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream'
+    },
+    body: JSON.stringify({ question, ...options }),
+    signal: handlers.signal
+  })
+
+  if (!response.ok) {
+    const detail = await response.text()
+    throw new Error(detail || `Request failed with status ${response.status}`)
+  }
+
+  if (!response.body) {
+    throw new Error('Streaming response body is empty')
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buffer = ''
+  let finalAnswer = ''
+  let finalSources: Array<{
+    content: string
+    page_number: string
+    source?: string
+  }> = []
+  let finalRetrievalDebug: RetrievalDebug | null = null
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+
+    const parts = buffer.split(/\r?\n\r?\n/)
+    buffer = parts.pop() || ''
+
+    for (const part of parts) {
+      const parsed = parseSseEvent(part)
+      if (!parsed) continue
+
+      if (parsed.event === 'meta' && parsed.data) {
+        handlers.onMeta?.(parsed.data)
+        if (Array.isArray(parsed.data.sources)) {
+          finalSources = parsed.data.sources
+        }
+        if (parsed.data.retrieval_debug) {
+          finalRetrievalDebug = parsed.data.retrieval_debug
+        }
+      } else if (parsed.event === 'delta' && parsed.data?.delta) {
+        finalAnswer += parsed.data.delta
+        handlers.onDelta?.(parsed.data.delta)
+      } else if (parsed.event === 'done' && parsed.data) {
+        if (typeof parsed.data.answer === 'string') {
+          finalAnswer = parsed.data.answer
+        }
+        if (Array.isArray(parsed.data.sources)) {
+          finalSources = parsed.data.sources
+        }
+        if (parsed.data.retrieval_debug) {
+          finalRetrievalDebug = parsed.data.retrieval_debug
+        }
+        handlers.onDone?.(parsed.data)
+        return {
+          status: parsed.data.status || 'success',
+          arxiv_id: arxivId,
+          question,
+          answer: finalAnswer,
+          sources: finalSources,
+          retrieval_debug: finalRetrievalDebug
+        }
+      } else if (parsed.event === 'error' && parsed.data) {
+        const detail = parsed.data.detail || 'Streaming request failed'
+        handlers.onError?.(detail)
+        throw new Error(detail)
+      }
+    }
+  }
+
+  return {
+    status: 'success',
+    arxiv_id: arxivId,
+    question,
+    answer: finalAnswer,
+    sources: finalSources,
+    retrieval_debug: finalRetrievalDebug
+  }
 }

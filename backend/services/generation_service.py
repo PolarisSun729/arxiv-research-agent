@@ -1,7 +1,8 @@
 import os
 import json
+import re
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Iterator, Any
 import logging
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -15,6 +16,12 @@ from utils.model_utils import get_huggingface_model_path
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 logger = logging.getLogger(__name__)
+
+# 阿里云百炼 / 通义千问 API Key。
+# 按你的要求这里直接写在代码里；请替换为你自己的真实 Key。
+QWEN_API_KEY = "<REMOVED_API_KEY>"
+QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+QWEN_MODEL_NAME = "qwen3.6-plus"
 
 class GenerationService:
     """
@@ -34,6 +41,9 @@ class GenerationService:
             "openai": {
                 "gpt-3.5-turbo": "gpt-3.5-turbo",
                 "gpt-4": "gpt-4",
+            },
+            "qwen": {
+                "qwen3.6-plus": "qwen3.6-plus",
             },
             "deepseek": {
                 "deepseek-v3": "deepseek-chat",
@@ -164,6 +174,228 @@ class GenerationService:
             logger.error(f"Error generating with OpenAI: {str(e)}")
             raise
 
+    def _generate_with_qwen_responses(
+        self,
+        query: str,
+        context: str,
+        api_key: Optional[str] = None,
+        model_name: str = QWEN_MODEL_NAME,
+    ) -> str:
+        """
+        使用阿里云百炼的 OpenAI 兼容 Responses API 生成答案。
+
+        这里采用 Qwen3.6-Plus，输入为检索到的上下文 + 问题。
+        """
+        try:
+            if not api_key:
+                api_key = QWEN_API_KEY
+            if not api_key or api_key == "PASTE_YOUR_QWEN_API_KEY_HERE":
+                raise ValueError("Qwen API key not provided")
+
+            client = OpenAI(
+                api_key=api_key,
+                base_url=QWEN_BASE_URL,
+            )
+
+            prompt = (
+                "你是一个严谨的论文问答助手。"
+                "请仅根据给定的论文上下文回答问题；"
+                "如果上下文中没有足够信息，请明确说明无法从当前论文内容中确定。"
+                "\n\n论文上下文：\n"
+                f"{context}\n\n"
+                f"问题：{query}\n\n"
+                "回答："
+            )
+
+            response = client.responses.create(
+                model=model_name,
+                input=prompt,
+            )
+
+            answer = getattr(response, "output_text", None)
+            if answer:
+                return answer.strip()
+
+            # 兜底解析，防止 SDK 返回结构变化时拿不到 output_text。
+            output_parts = []
+            for item in getattr(response, "output", []) or []:
+                if getattr(item, "type", None) == "message":
+                    for content in getattr(item, "content", []) or []:
+                        text = getattr(content, "text", None)
+                        if text:
+                            output_parts.append(text)
+            if output_parts:
+                return "".join(output_parts).strip()
+
+            raise ValueError("Qwen response did not contain output text")
+
+        except Exception as e:
+            logger.error(f"Error generating with Qwen Responses API: {str(e)}")
+            raise
+
+    def complete_with_qwen(
+        self,
+        prompt: str,
+        api_key: Optional[str] = None,
+        model_name: str = QWEN_MODEL_NAME,
+    ) -> str:
+        try:
+            if not api_key:
+                api_key = QWEN_API_KEY
+            if not api_key:
+                raise ValueError("Qwen API key not provided")
+
+            client = OpenAI(
+                api_key=api_key,
+                base_url=QWEN_BASE_URL,
+            )
+            response = client.responses.create(
+                model=model_name,
+                input=prompt,
+            )
+
+            answer = getattr(response, "output_text", None)
+            if answer:
+                return answer.strip()
+
+            output_parts = []
+            for item in getattr(response, "output", []) or []:
+                if getattr(item, "type", None) == "message":
+                    for content in getattr(item, "content", []) or []:
+                        text = getattr(content, "text", None)
+                        if text:
+                            output_parts.append(text)
+            if output_parts:
+                return "".join(output_parts).strip()
+
+            raise ValueError("Qwen response did not contain output text")
+        except Exception as e:
+            logger.error(f"Error completing prompt with Qwen: {str(e)}")
+            raise
+
+    def rewrite_query_for_retrieval(
+        self,
+        question: str,
+        max_queries: int = 3,
+        api_key: Optional[str] = None,
+        model_name: str = QWEN_MODEL_NAME,
+    ) -> List[str]:
+        prompt = (
+            "You are helping a retrieval system search an English academic paper.\n"
+            "Rewrite the user's question into concise retrieval-oriented English queries.\n"
+            "Rules:\n"
+            "1. Return JSON only.\n"
+            "2. Output format: {\"queries\": [\"...\", \"...\"]}\n"
+            "3. Keep each query short and retrieval-friendly.\n"
+            "4. Preserve the user's intent.\n"
+            "5. Focus on terminology likely to appear in a research paper.\n"
+            f"6. Return at most {max_queries} rewritten queries.\n\n"
+            f"User question: {question}"
+        )
+        response = self.complete_with_qwen(prompt, api_key=api_key, model_name=model_name)
+        data = json.loads(self._extract_json_block(response))
+        queries = data.get("queries", [])
+        return [str(query).strip() for query in queries if str(query).strip()]
+
+    def generate_hyde_document(
+        self,
+        question: str,
+        api_key: Optional[str] = None,
+        model_name: str = QWEN_MODEL_NAME,
+    ) -> str:
+        prompt = (
+            "You are writing a hypothetical passage to help semantic retrieval over a single English research paper.\n"
+            "Write one short paragraph that likely resembles a relevant paper chunk answering the question.\n"
+            "Rules:\n"
+            "1. Use English.\n"
+            "2. Do not mention that the passage is hypothetical.\n"
+            "3. Keep it under 120 words.\n"
+            "4. Focus on paper-style terminology, section wording, and likely evidence.\n\n"
+            f"Question: {question}"
+        )
+        return self.complete_with_qwen(prompt, api_key=api_key, model_name=model_name).strip()
+
+    def _extract_json_block(self, text: str) -> str:
+        fenced_match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if fenced_match:
+            return fenced_match.group(1)
+
+        plain_match = re.search(r"(\{.*\})", text, re.DOTALL)
+        if plain_match:
+            return plain_match.group(1)
+
+        return text
+
+    def _build_qwen_prompt(self, query: str, context: str) -> str:
+        return (
+            "你是一个严谨的论文问答助手。"
+            "请仅根据给定的论文上下文回答问题；"
+            "如果上下文中没有足够信息，请明确说明无法从当前论文内容中确定。"
+            "\n\n论文上下文：\n"
+            f"{context}\n\n"
+            f"问题：{query}\n\n"
+            "回答："
+        )
+
+    def stream_qwen_responses(
+        self,
+        query: str,
+        context: str,
+        api_key: Optional[str] = None,
+        model_name: str = QWEN_MODEL_NAME,
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        使用 Qwen Responses API 的流式输出，逐段返回增量文本。
+        """
+        try:
+            if not api_key:
+                api_key = QWEN_API_KEY
+            if not api_key:
+                raise ValueError("Qwen API key not provided")
+
+            client = OpenAI(
+                api_key=api_key,
+                base_url=QWEN_BASE_URL,
+            )
+
+            stream = client.responses.create(
+                model=model_name,
+                input=self._build_qwen_prompt(query, context),
+                stream=True,
+            )
+
+            answer_parts: List[str] = []
+            for event in stream:
+                event_type = getattr(event, "type", "")
+                if event_type == "response.output_text.delta":
+                    delta = getattr(event, "delta", "") or ""
+                    if delta:
+                        answer_parts.append(delta)
+                        yield {"type": "delta", "delta": delta}
+                elif event_type == "response.completed":
+                    response = getattr(event, "response", None)
+                    usage = getattr(response, "usage", None) if response else None
+                    yield {
+                        "type": "completed",
+                        "answer": "".join(answer_parts),
+                        "usage": {
+                            "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
+                            "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
+                            "total_tokens": getattr(usage, "total_tokens", None) if usage else None,
+                        },
+                    }
+                    return
+
+            yield {
+                "type": "completed",
+                "answer": "".join(answer_parts),
+                "usage": None,
+            }
+
+        except Exception as e:
+            logger.error(f"Error streaming with Qwen Responses API: {str(e)}")
+            raise
+
     def _generate_with_deepseek(
         self,
         model_name: str,
@@ -259,6 +491,8 @@ class GenerationService:
                 response = self._generate_with_huggingface(model_name, query, context)
             elif provider == "openai":
                 response = self._generate_with_openai(model_name, query, context, api_key)
+            elif provider == "qwen":
+                response = self._generate_with_qwen_responses(query, context, api_key, model_name)
             elif provider == "deepseek":
                 response = self._generate_with_deepseek(model_name, query, context, api_key, show_reasoning)
             else:

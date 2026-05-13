@@ -1,167 +1,706 @@
 from datetime import datetime
 import logging
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+import re
+from typing import Any, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
+MAX_CHUNK_CONTENT_LENGTH = 8000
+CHUNK_OVERLAP_LENGTH = 200
+
+
 class ChunkingService:
     """
-    文本分块服务，提供多种文本分块策略
-    
-    该服务支持以下分块方法：
-    - by_pages: 按页面分块，每页作为一个块
-    - fixed_size: 按固定大小分块
-    - by_paragraphs: 按段落分块
-    - by_sentences: 按句子分块
+    Chunk PDF pages using page and heading structure only.
     """
-    
-    def chunk_text(self, text: str, method: str, metadata: dict, page_map: list = None, chunk_size: int = 1000) -> dict:
-        """
-        将文本按指定方法分块
-        
-        Args:
-            text: 原始文本内容
-            method: 分块方法，支持 'by_pages', 'fixed_size', 'by_paragraphs', 'by_sentences'
-            metadata: 文档元数据
-            page_map: 页面映射列表，每个元素包含页码和页面文本
-            chunk_size: 固定大小分块时的块大小
-            
-        Returns:
-            包含分块结果的文档数据结构
-        
-        Raises:
-            ValueError: 当分块方法不支持或页面映射为空时
-        """
+
+    def chunk_text(
+        self,
+        text: Union[str, dict],
+        method: str,
+        metadata: dict,
+        page_map: list = None,
+        chunk_size: int = 1000,
+    ) -> dict:
         try:
-            if not page_map:
+            normalized_page_map = self._normalize_page_map(text, page_map)
+            if not normalized_page_map:
                 raise ValueError("Page map is required for chunking.")
-            
-            chunks = []
-            total_pages = len(page_map)
-            
+
+            filename = metadata.get("filename", "")
+            source_name = metadata.get("filename", "") or metadata.get("source", "")
             if method == "by_pages":
-                # 直接使用 page_map 中的每页作为一个 chunk
-                for page_data in page_map:
-                    chunk_metadata = {
-                        "chunk_id": len(chunks) + 1,
-                        "page_number": page_data['page'],
-                        "page_range": str(page_data['page']),
-                        "word_count": len(page_data['text'].split())
-                    }
-                    chunks.append({
-                        "content": page_data['text'],
-                        "metadata": chunk_metadata
-                    })
-            
+                chunks = self._chunk_by_pages(normalized_page_map, source_name)
             elif method == "fixed_size":
-                # 对每页内容进行固定大小分块
-                for page_data in page_map:
-                    page_chunks = self._fixed_size_chunks(page_data['text'], chunk_size)
-                    for idx, chunk in enumerate(page_chunks, 1):
-                        chunk_metadata = {
-                            "chunk_id": len(chunks) + 1,
-                            "page_number": page_data['page'],
-                            "page_range": str(page_data['page']),
-                            "word_count": len(chunk["text"].split())
-                        }
-                        chunks.append({
-                            "content": chunk["text"],
-                            "metadata": chunk_metadata
-                        })
-            
-            elif method in ["by_paragraphs", "by_sentences"]:
-                # 对每页内容进行段落或句子分块
-                splitter_method = self._paragraph_chunks if method == "by_paragraphs" else self._sentence_chunks
-                for page_data in page_map:
-                    page_chunks = splitter_method(page_data['text'])
-                    for chunk in page_chunks:
-                        chunk_metadata = {
-                            "chunk_id": len(chunks) + 1,
-                            "page_number": page_data['page'],
-                            "page_range": str(page_data['page']),
-                            "word_count": len(chunk["text"].split())
-                        }
-                        chunks.append({
-                            "content": chunk["text"],
-                            "metadata": chunk_metadata
-                        })
+                chunks = self._chunk_fixed_size(normalized_page_map, source_name, chunk_size)
+            elif method == "by_titles":
+                chunks = self._chunk_by_titles(normalized_page_map, source_name, chunk_size)
+            elif method == "by_paragraphs":
+                chunks = self._chunk_by_paragraphs(normalized_page_map, source_name, chunk_size)
+            elif method == "by_sentences":
+                chunks = self._chunk_by_sentences(normalized_page_map, source_name, chunk_size)
             else:
                 raise ValueError(f"Unsupported chunking method: {method}")
 
-            # 创建标准化的文档数据结构
-            document_data = {
-                "filename": metadata.get("filename", ""),
+            for index, chunk in enumerate(chunks, start=1):
+                chunk["metadata"]["chunk_index"] = index
+                chunk["metadata"]["chunk_id"] = index
+                chunk["metadata"]["total_chunks"] = len(chunks)
+
+            chunks = self._expand_overlong_chunks(
+                chunks,
+                max_length=MAX_CHUNK_CONTENT_LENGTH,
+                overlap=CHUNK_OVERLAP_LENGTH,
+            )
+
+            for index, chunk in enumerate(chunks, start=1):
+                metadata = chunk["metadata"]
+                metadata["chunk_index"] = index
+                metadata["chunk_id"] = index
+                metadata["total_chunks"] = len(chunks)
+                metadata["parent_chunk_id"] = int(metadata.get("parent_chunk_id", index))
+                metadata["subchunk_index"] = int(metadata.get("subchunk_index", 1))
+                metadata["subchunk_count"] = int(metadata.get("subchunk_count", 1))
+                metadata["subchunk_label"] = str(
+                    metadata.get(
+                        "subchunk_label",
+                        f"chunk {metadata['parent_chunk_id']} part {metadata['subchunk_index']}/{metadata['subchunk_count']}",
+                    )
+                )
+
+            return {
+                "filename": filename,
                 "total_chunks": len(chunks),
-                "total_pages": total_pages,
+                "total_pages": len(normalized_page_map),
                 "loading_method": metadata.get("loading_method", ""),
                 "chunking_method": method,
                 "timestamp": datetime.now().isoformat(),
-                "chunks": chunks
+                "pages": normalized_page_map,
+                "chunks": chunks,
             }
-            
-            return document_data
-            
         except Exception as e:
             logger.error(f"Error in chunk_text: {str(e)}")
             raise
 
-    def _fixed_size_chunks(self, text: str, chunk_size: int) -> list[dict]:
-        """
-        将文本按固定大小分块
-        
-        Args:
-            text: 要分块的文本
-            chunk_size: 每块的最大字符数
-            
-        Returns:
-            分块后的文本列表
-        """
-        chunks = []
-        words = text.split()
-        current_chunk = []
-        current_length = 0
-        
-        for word in words:
-            word_length = len(word) + (1 if current_length > 0 else 0)
-            if current_length + word_length > chunk_size and current_chunk:
-                chunks.append({"text": " ".join(current_chunk)})
-                current_chunk = []
-                current_length = 0
-            current_chunk.append(word)
-            current_length += word_length
-            
-        if current_chunk:
-            chunks.append({"text": " ".join(current_chunk)})
-            
+    def _expand_overlong_chunks(
+        self,
+        chunks: List[Dict[str, Any]],
+        max_length: int,
+        overlap: int,
+    ) -> List[Dict[str, Any]]:
+        expanded: List[Dict[str, Any]] = []
+        for chunk in chunks:
+            content = str(chunk.get("content", "") or "")
+            metadata = dict(chunk.get("metadata", {}))
+            parent_chunk_id = int(metadata.get("chunk_id", metadata.get("chunk_index", len(expanded) + 1)))
+
+            if len(content) <= max_length:
+                metadata["parent_chunk_id"] = parent_chunk_id
+                metadata["subchunk_index"] = 1
+                metadata["subchunk_count"] = 1
+                metadata["subchunk_label"] = f"chunk {parent_chunk_id} part 1/1"
+                metadata["word_count"] = len(content.split())
+                expanded.append({"content": content, "metadata": metadata})
+                continue
+
+            parts = self._split_overlong_content(content, max_length=max_length, overlap=overlap)
+            part_count = len(parts)
+            for part_index, part in enumerate(parts, start=1):
+                part_metadata = {
+                    **metadata,
+                    "parent_chunk_id": parent_chunk_id,
+                    "subchunk_index": part_index,
+                    "subchunk_count": part_count,
+                    "subchunk_label": f"chunk {parent_chunk_id} part {part_index}/{part_count}",
+                    "word_count": len(part.split()),
+                }
+                expanded.append({"content": part, "metadata": part_metadata})
+
+        return expanded
+
+    def _split_overlong_content(self, text: str, max_length: int, overlap: int) -> List[str]:
+        normalized = (text or "").replace("\r\n", "\n").strip()
+        if not normalized:
+            return [""]
+        if len(normalized) <= max_length:
+            return [normalized]
+
+        parts: List[str] = []
+        start = 0
+        text_length = len(normalized)
+
+        while start < text_length:
+            end = min(start + max_length, text_length)
+            if end < text_length:
+                boundary = self._find_split_boundary(normalized, start, end)
+                if boundary > start:
+                    end = boundary
+
+            part = normalized[start:end].strip()
+            if part:
+                parts.append(part)
+
+            if end >= text_length:
+                break
+
+            next_start = max(end - overlap, start + 1)
+            start = next_start
+
+        return parts or [normalized[:max_length]]
+
+    def _find_split_boundary(self, text: str, start: int, end: int, search_window: int = 400) -> int:
+        lower = max(start + 1, end - search_window)
+        candidates = ["\n\n", "\n", "。", "！", "？", ". ", "! ", "? ", " "]
+        best = start
+
+        for token in candidates:
+            idx = text.rfind(token, lower, end)
+            if idx != -1:
+                boundary = idx + len(token)
+                if boundary > best:
+                    best = boundary
+
+        return best
+
+    def _normalize_page_map(self, text: Union[str, dict], page_map: Optional[list]) -> List[Dict[str, Any]]:
+        if page_map:
+            normalized = []
+            for page in page_map:
+                if not isinstance(page, dict):
+                    continue
+                normalized.append(
+                    {
+                        **page,
+                        "page": int(page.get("page", page.get("page_number", len(normalized) + 1))),
+                        "text": str(page.get("text", "") or page.get("content", "")),
+                    }
+                )
+            return normalized
+
+        if isinstance(text, dict):
+            pages = text.get("pages") or text.get("content") or []
+            if isinstance(pages, list):
+                return self._normalize_page_map("", pages)
+
+        if isinstance(text, str) and text.strip():
+            return [{"page": 1, "text": text.strip()}]
+
+        return []
+
+    def _build_chunk_metadata(
+        self,
+        source: str,
+        page_start: int,
+        page_end: int,
+        chunk_text: str,
+        chunk_index: int,
+        total_chunks: int,
+        chunking_method: str,
+        extra_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        metadata = {
+            "source": source,
+            "document_name": source,
+            "chunk_index": int(chunk_index),
+            "chunk_id": int(chunk_index),
+            "page_start": int(page_start),
+            "page_end": int(page_end),
+            "page_number": str(page_start),
+            "page_range": f"{page_start}-{page_end}",
+            "word_count": len(chunk_text.split()),
+            "total_chunks": int(total_chunks),
+            "chunking_method": chunking_method,
+        }
+        if extra_metadata:
+            metadata.update(extra_metadata)
+        return metadata
+
+    def _chunk_by_pages(self, normalized_page_map: List[Dict[str, Any]], source_name: str) -> List[Dict[str, Any]]:
+        chunks: List[Dict[str, Any]] = []
+        for page in normalized_page_map:
+            text = self._page_text(page)
+            if not text:
+                continue
+
+            page_num = int(page.get("page", page.get("page_number", 1)))
+            chunks.append(
+                {
+                    "content": text,
+                    "metadata": self._build_chunk_metadata(
+                        source=source_name,
+                        page_start=page_num,
+                        page_end=page_num,
+                        chunk_text=text,
+                        chunk_index=0,
+                        total_chunks=0,
+                        chunking_method="by_pages",
+                    ),
+                }
+            )
         return chunks
 
-    def _paragraph_chunks(self, text: str) -> list[dict]:
-        """
-        将文本按段落分块
-        
-        Args:
-            text: 要分块的文本
-            
-        Returns:
-            分块后的段落列表
-        """
-        paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-        return [{"text": para} for para in paragraphs]
+    def _chunk_fixed_size(
+        self,
+        normalized_page_map: List[Dict[str, Any]],
+        source_name: str,
+        chunk_size: int,
+    ) -> List[Dict[str, Any]]:
+        chunks: List[Dict[str, Any]] = []
+        for page in normalized_page_map:
+            text = self._page_text(page)
+            if not text:
+                continue
 
-    def _sentence_chunks(self, text: str) -> list[dict]:
-        """
-        将文本按句子分块
-        
-        Args:
-            text: 要分块的文本
-            
-        Returns:
-            分块后的句子列表
-        """
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            separators=[".", "!", "?", "\n", " "]
-        )
-        texts = splitter.split_text(text)
-        return [{"text": t} for t in texts]
+            page_num = int(page.get("page", page.get("page_number", 1)))
+            for part in self._split_text_by_words(text, chunk_size):
+                part = part.strip()
+                if not part:
+                    continue
+                chunks.append(
+                    {
+                        "content": part,
+                        "metadata": self._build_chunk_metadata(
+                            source=source_name,
+                            page_start=page_num,
+                            page_end=page_num,
+                            chunk_text=part,
+                            chunk_index=0,
+                            total_chunks=0,
+                            chunking_method="fixed_size",
+                        ),
+                    }
+                )
+        return chunks
+
+    def _chunk_by_titles(
+        self,
+        normalized_page_map: List[Dict[str, Any]],
+        source_name: str,
+        chunk_size: int,
+    ) -> List[Dict[str, Any]]:
+        lines = self._merge_heading_fragments(self._flatten_document_lines(normalized_page_map))
+        if not lines:
+            return []
+
+        chunks: List[Dict[str, Any]] = []
+        current_title: Optional[str] = None
+        current_level: int = 0
+        current_lines: List[Dict[str, Any]] = []
+
+        def flush_section() -> None:
+            nonlocal current_title, current_level, current_lines
+            if not current_lines:
+                return
+
+            section_lines = current_lines[1:] if current_title else current_lines
+            section_body = self._compose_text_from_lines(section_lines).strip()
+            section_title = current_title or "Preamble"
+            page_start = int(current_lines[0]["page"])
+            page_end = int(current_lines[-1]["page"])
+
+            if current_title:
+                section_text = f"{current_title}\n{section_body}".strip() if section_body else current_title
+            else:
+                section_text = section_body
+
+            if not section_text:
+                current_title = None
+                current_level = 0
+                current_lines = []
+                return
+
+            chunks.append(
+                {
+                    "content": section_text,
+                    "metadata": self._build_chunk_metadata(
+                        source=source_name,
+                        page_start=page_start,
+                        page_end=page_end,
+                        chunk_text=section_text,
+                        chunk_index=0,
+                        total_chunks=0,
+                        chunking_method="by_titles",
+                        extra_metadata={
+                            "section_title": section_title,
+                            "section_level": current_level,
+                        },
+                    ),
+                }
+            )
+
+            current_title = None
+            current_level = 0
+            current_lines = []
+
+        for line in lines:
+            text = str(line.get("text", "")).strip()
+            if not text:
+                continue
+
+            heading_level = self._heading_level(line)
+            if heading_level == 1:
+                flush_section()
+                current_title = text
+                current_level = int(heading_level)
+                current_lines = [line]
+                continue
+
+            if not current_lines:
+                current_lines = [line]
+            else:
+                current_lines.append(line)
+
+        flush_section()
+        return chunks
+
+    def _merge_heading_fragments(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not lines:
+            return []
+
+        merged: List[Dict[str, Any]] = []
+        index = 0
+        while index < len(lines):
+            current = dict(lines[index])
+            next_line = lines[index + 1] if index + 1 < len(lines) else None
+
+            if next_line and current.get("page") == next_line.get("page"):
+                current_text = str(current.get("text", "")).strip()
+                next_text = str(next_line.get("text", "")).strip()
+                if self._is_section_number_only(current_text) and self._looks_like_heading_text(next_text):
+                    try:
+                        section_number = int(current_text.split(".")[0])
+                    except ValueError:
+                        section_number = None
+                    if section_number is None or section_number > 20:
+                        merged.append(current)
+                        index += 1
+                        continue
+                    current["text"] = f"{current_text} {next_text}".strip()
+                    current["heading_level"] = 1 if "." not in current_text else None
+                    current["font_size"] = max(
+                        [value for value in [current.get("font_size"), next_line.get("font_size")] if isinstance(value, (int, float))],
+                        default=current.get("font_size"),
+                    )
+                    merged.append(current)
+                    index += 2
+                    continue
+
+            merged.append(current)
+            index += 1
+
+        return merged
+
+    def _chunk_by_paragraphs(
+        self,
+        normalized_page_map: List[Dict[str, Any]],
+        source_name: str,
+        chunk_size: int,
+    ) -> List[Dict[str, Any]]:
+        chunks: List[Dict[str, Any]] = []
+        for page in normalized_page_map:
+            text = self._page_text(page)
+            if not text:
+                continue
+
+            page_num = int(page.get("page", page.get("page_number", 1)))
+            paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+            if not paragraphs:
+                paragraphs = [text.strip()]
+
+            chunks.extend(
+                self._pack_text_units(
+                    paragraphs,
+                    source_name=source_name,
+                    page_start=page_num,
+                    page_end=page_num,
+                    chunk_size=chunk_size,
+                    chunking_method="by_paragraphs",
+                )
+            )
+        return chunks
+
+    def _chunk_by_sentences(
+        self,
+        normalized_page_map: List[Dict[str, Any]],
+        source_name: str,
+        chunk_size: int,
+    ) -> List[Dict[str, Any]]:
+        chunks: List[Dict[str, Any]] = []
+        for page in normalized_page_map:
+            text = self._page_text(page)
+            if not text:
+                continue
+
+            page_num = int(page.get("page", page.get("page_number", 1)))
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
+            if not sentences:
+                sentences = [text.strip()]
+
+            chunks.extend(
+                self._pack_text_units(
+                    sentences,
+                    source_name=source_name,
+                    page_start=page_num,
+                    page_end=page_num,
+                    chunk_size=chunk_size,
+                    chunking_method="by_sentences",
+                )
+            )
+        return chunks
+
+    def _pack_text_units(
+        self,
+        units: List[str],
+        source_name: str,
+        page_start: int,
+        page_end: int,
+        chunk_size: int,
+        chunking_method: str,
+    ) -> List[Dict[str, Any]]:
+        chunks: List[Dict[str, Any]] = []
+        current_units: List[str] = []
+
+        def flush() -> None:
+            nonlocal current_units
+            if not current_units:
+                return
+            content = " ".join(current_units).strip()
+            if content:
+                chunks.append(
+                    {
+                        "content": content,
+                        "metadata": self._build_chunk_metadata(
+                            source=source_name,
+                            page_start=page_start,
+                            page_end=page_end,
+                            chunk_text=content,
+                            chunk_index=0,
+                            total_chunks=0,
+                            chunking_method=chunking_method,
+                        ),
+                    }
+                )
+            current_units = []
+
+        for unit in units:
+            text = str(unit).strip()
+            if not text:
+                continue
+
+            if len(text.split()) > chunk_size:
+                flush()
+                for part in self._split_text_by_words(text, chunk_size):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    chunks.append(
+                        {
+                            "content": part,
+                            "metadata": self._build_chunk_metadata(
+                                source=source_name,
+                                page_start=page_start,
+                                page_end=page_end,
+                                chunk_text=part,
+                                chunk_index=0,
+                                total_chunks=0,
+                                chunking_method=chunking_method,
+                            ),
+                        }
+                    )
+                continue
+
+            candidate = " ".join(current_units + [text]).strip()
+            if current_units and len(candidate.split()) > chunk_size:
+                flush()
+            current_units.append(text)
+
+        flush()
+        return chunks
+
+    def _flatten_document_lines(self, normalized_page_map: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        lines: List[Dict[str, Any]] = []
+        for page in normalized_page_map:
+            page_num = int(page.get("page", page.get("page_number", len(lines) + 1)))
+            page_lines = page.get("lines")
+
+            if isinstance(page_lines, list) and page_lines:
+                ordered_page_lines = list(page_lines)
+                for index, item in enumerate(ordered_page_lines):
+                    text = str(item.get("text", "")).strip()
+                    if not text:
+                        continue
+
+                    current = {**item, "page": page_num, "text": text}
+                    bbox = current.get("bbox") if isinstance(current.get("bbox"), (list, tuple)) and len(current.get("bbox")) >= 4 else None
+                    prev_item = ordered_page_lines[index - 1] if index > 0 else None
+                    next_item = ordered_page_lines[index + 1] if index + 1 < len(ordered_page_lines) else None
+
+                    if bbox and prev_item and isinstance(prev_item.get("bbox"), (list, tuple)) and len(prev_item.get("bbox")) >= 4:
+                        current["gap_before"] = float(bbox[1]) - float(prev_item["bbox"][3])
+                    else:
+                        current["gap_before"] = None
+
+                    if bbox and next_item and isinstance(next_item.get("bbox"), (list, tuple)) and len(next_item.get("bbox")) >= 4:
+                        current["gap_after"] = float(next_item["bbox"][1]) - float(bbox[3])
+                    else:
+                        current["gap_after"] = None
+
+                    lines.append(current)
+                continue
+
+            raw_text = self._page_text(page)
+            for line_no, text in enumerate(raw_text.split("\n"), start=1):
+                text = text.strip()
+                if not text:
+                    continue
+                lines.append(
+                    {
+                        "page": page_num,
+                        "text": text,
+                        "font_size": None,
+                        "role": None,
+                        "heading_level": None,
+                        "line_no": line_no,
+                    }
+                )
+
+        return lines
+
+    def _compose_text_from_lines(self, lines: List[Dict[str, Any]]) -> str:
+        if not lines:
+            return ""
+
+        parts: List[str] = []
+        for line in lines:
+            text = str(line.get("text", "")).strip()
+            if not text:
+                continue
+            if not parts:
+                parts.append(text)
+                continue
+            if parts[-1].endswith("-") and text and text[0].isalnum():
+                parts[-1] = parts[-1][:-1] + text
+            else:
+                parts.append(text)
+        return " ".join(parts).strip()
+
+    def _heading_level(self, line: Dict[str, Any]) -> Optional[int]:
+        text = str(line.get("text", "")).strip()
+        if not text:
+            return None
+
+        if line.get("role") == "heading":
+            return int(line.get("heading_level") or 1)
+
+        if line.get("heading_level") is not None:
+            try:
+                return int(line["heading_level"])
+            except (TypeError, ValueError):
+                return 1
+
+        if text in {"Abstract", "References"}:
+            return 1
+
+        numbered_match = re.match(r"^([1-9]\d*(?:\.\d+)*)\s+([A-Z].{0,140})$", text)
+        if numbered_match and len(text) <= 160:
+            prefix = numbered_match.group(1)
+            try:
+                leading_number = int(prefix.split(".")[0])
+            except ValueError:
+                return None
+            if leading_number > 20:
+                return None
+            # Only split on first-level numbered sections such as "1 Introduction".
+            # Subsections like "2.1 ..." stay inside the parent chunk.
+            if "." in prefix:
+                return None
+            return 1
+
+        words = text.split()
+        if len(words) > 6 or len(text) > 80:
+            return None
+        if text.endswith((".", ",", ";", ":")):
+            return None
+        if any(ch.isdigit() for ch in text):
+            return None
+        if "," in text or "/" in text:
+            return None
+        if not (text[0].isupper() or text.isupper()):
+            return None
+
+        bbox = line.get("bbox")
+        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+            line_height = float(bbox[3]) - float(bbox[1])
+        else:
+            line_height = None
+
+        gap_before = line.get("gap_before")
+        gap_after = line.get("gap_after")
+        if not (
+            isinstance(line_height, (int, float))
+            and line_height > 0
+            and isinstance(gap_before, (int, float))
+            and isinstance(gap_after, (int, float))
+            and gap_before >= line_height * 0.75
+            and gap_after >= line_height * 0.6
+        ):
+            return None
+
+        font_size = line.get("font_size")
+        if not (isinstance(font_size, (int, float)) and float(font_size) >= 10.0):
+            return None
+
+        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+            if float(bbox[0]) > 85.0:
+                return None
+
+        if text.isupper() and len(words) <= 6:
+            return 1
+
+        if len(words) <= 4:
+            return 1
+
+        return None
+
+    def _looks_like_heading_text(self, text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+        if len(normalized) > 80:
+            return False
+        if normalized.endswith((".", ",", ";", ":")):
+            return False
+        if any(ch.isdigit() for ch in normalized):
+            return False
+        if "," in normalized or "/" in normalized:
+            return False
+        words = normalized.split()
+        if len(words) > 5:
+            return False
+        return normalized[0].isupper() or normalized.isupper()
+
+    def _is_section_number_only(self, text: str) -> bool:
+        normalized = str(text or "").strip()
+        return bool(re.match(r"^[1-9]\d*(?:\.\d+)*$", normalized))
+
+    def _page_text(self, page: Dict[str, Any]) -> str:
+        text = page.get("text") or page.get("content") or ""
+        return str(text).strip()
+
+    def _split_text_by_words(self, text: str, chunk_size: int) -> List[str]:
+        words = str(text or "").split()
+        if not words:
+            return []
+        if len(words) <= chunk_size:
+            return [" ".join(words)]
+
+        chunks: List[str] = []
+        current: List[str] = []
+        for word in words:
+            if current and len(current) + 1 > chunk_size:
+                chunks.append(" ".join(current))
+                current = []
+            current.append(word)
+        if current:
+            chunks.append(" ".join(current))
+        return chunks

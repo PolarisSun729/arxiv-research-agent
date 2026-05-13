@@ -207,11 +207,20 @@ class SearchService:
                 output_fields=[
                     "content",
                     "document_name",
+                    "source",
                     "chunk_id",
+                    "chunk_index",
+                    "parent_chunk_id",
+                    "original_chunk_id",
                     "total_chunks",
                     "word_count",
                     "page_number",
+                    "page_start",
+                    "page_end",
                     "page_range",
+                    "subchunk_index",
+                    "subchunk_count",
+                    "subchunk_label",
                     "embedding_provider",
                     "embedding_model",
                     "embedding_timestamp"
@@ -226,15 +235,28 @@ class SearchService:
                 for hit in hits:
                     logger.info(f"Processing hit - Score: {hit.score}, Word Count: {hit.get('word_count')}")
                     if hit.score >= threshold:
+                        page_start = getattr(hit.entity, "page_start", "")
+                        page_end = getattr(hit.entity, "page_end", "")
+                        # 把页码、chunk 序号和来源一起返回，前端展示和 QA 回答都能直接使用。
                         processed_results.append({
                             "text": hit.entity.content,
                             "score": float(hit.score),
                             "metadata": {
-                                "source": hit.entity.document_name,
+                                "source": getattr(hit.entity, "source", "") or hit.entity.document_name,
+                                "document_name": hit.entity.document_name,
                                 "page": hit.entity.page_number,
-                                "chunk": hit.entity.chunk_id,
-                                "total_chunks": hit.entity.total_chunks,
+                                "page_start": page_start,
+                                "page_end": page_end,
                                 "page_range": hit.entity.page_range,
+                                "chunk": int(getattr(hit.entity, "parent_chunk_id", hit.entity.chunk_id) or hit.entity.chunk_id),
+                                "chunk_id": hit.entity.chunk_id,
+                                "chunk_index": int(getattr(hit.entity, "chunk_index", hit.entity.chunk_id) or hit.entity.chunk_id),
+                                "parent_chunk_id": int(getattr(hit.entity, "parent_chunk_id", hit.entity.chunk_id) or hit.entity.chunk_id),
+                                "original_chunk_id": int(getattr(hit.entity, "original_chunk_id", hit.entity.chunk_id) or hit.entity.chunk_id),
+                                "subchunk_index": int(getattr(hit.entity, "subchunk_index", 0) or 0),
+                                "subchunk_count": int(getattr(hit.entity, "subchunk_count", 0) or 0),
+                                "subchunk_label": str(getattr(hit.entity, "subchunk_label", "") or ""),
+                                "total_chunks": hit.entity.total_chunks,
                                 "embedding_provider": hit.entity.embedding_provider,
                                 "embedding_model": hit.entity.embedding_model,
                                 "embedding_timestamp": hit.entity.embedding_timestamp

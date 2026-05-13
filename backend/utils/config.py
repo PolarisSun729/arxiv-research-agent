@@ -31,3 +31,19 @@ SQLITE_CONFIG = {
     "database_path": "06-database/recommendation.db",
     "check_same_thread": False
 }
+
+RETRIEVAL_CONFIG = {
+    "default_top_k": 5,
+    "candidate_multiplier": 3,
+    "enable_query_rewrite": True,
+    "enable_hyde": True,
+    "enable_keyword_search": True,
+    "debug": False,
+    "rrf_k": 60,
+    "route_weights": {
+        "vector_original": 1.0,
+        "vector_rewrite": 0.9,
+        "vector_hyde": 0.85,
+        "keyword": 0.75,
+    },
+}

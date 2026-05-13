@@ -2,6 +2,7 @@ import os
 import json
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body, Query, Request, Depends
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from numpy import False_
 from services.loading_service import LoadingService
@@ -13,6 +14,7 @@ from services.parsing_service import ParsingService
 from services.arxiv_search_service import ArxivSearchService
 from services.local_arxiv_service import LocalArxivService
 from services.database_service import DatabaseService
+from services.enhanced_retrieval_service import EnhancedRetrievalService, RetrievalOptions
 import logging
 from enum import Enum
 from utils.config import VectorDBProvider
@@ -21,6 +23,7 @@ from pathlib import Path
 from services.generation_service import GenerationService
 from typing import List, Dict, Optional
 import requests
+from pydantic import BaseModel
 
 # # 设置 Clash 代理 (默认端口 7890)
 # PROXY_URL = "http://127.0.0.1:7897"
@@ -66,6 +69,12 @@ LOCAL_DATA_PATH = os.environ.get("ARXIV_LOCAL_PATH", r"D:\极客时间大模型R
 db_service = DatabaseService()
 embedding_service = EmbeddingService()
 vector_store_service = VectorStoreService()
+generation_service = GenerationService()
+enhanced_retrieval_service = EnhancedRetrievalService(
+    embedding_service=embedding_service,
+    vector_store_service=vector_store_service,
+    generation_service=generation_service,
+)
 
 # 初始化 arXiv 服务
 local_arxiv_service = LocalArxivService(data_path=LOCAL_DATA_PATH)
@@ -76,6 +85,41 @@ def get_arxiv_service():
         return ArxivSearchService()
     else:
         return local_arxiv_service
+
+
+class QaRequest(BaseModel):
+    question: str
+    top_k: Optional[int] = None
+    enable_query_rewrite: Optional[bool] = None
+    enable_hyde: Optional[bool] = None
+    enable_keyword_search: Optional[bool] = None
+    debug: Optional[bool] = None
+
+
+def build_qa_context(arxiv_id: str, payload: QaRequest):
+    qa_index = db_service.get_paper_qa_index(arxiv_id)
+    if not qa_index or qa_index['status'] != 'indexed':
+        raise HTTPException(status_code=400, detail="Paper does not have QA index. Please create index first.")
+
+    collection_name = qa_index['collection_name']
+    retrieval_result = enhanced_retrieval_service.enhanced_retrieve(
+        collection_name=collection_name,
+        user_query=payload.question.strip(),
+        options=RetrievalOptions(
+            top_k=payload.top_k or 5,
+            enable_query_rewrite=payload.enable_query_rewrite,
+            enable_hyde=payload.enable_hyde,
+            enable_keyword_search=payload.enable_keyword_search,
+            debug=payload.debug,
+        ),
+    )
+    search_results = retrieval_result["chunks"]
+
+    if not search_results:
+        raise HTTPException(status_code=400, detail="No relevant chunks found")
+
+    context = "\n\n".join([result.get('content', '') for result in search_results])
+    return qa_index, search_results, context, retrieval_result.get("debug")
 
 
 # arXiv 论文搜索接口
@@ -599,15 +643,15 @@ async def create_paper_qa_index(arxiv_id: str):
         
         loading_service = LoadingService()
         logger.info("Loading PDF content...")
-        text = loading_service.load_pdf(pdf_path, method='pymupdf')
+        document = loading_service.load_pdf(pdf_path, method='pymupdf')
         
         page_map = loading_service.get_page_map()
         logger.info(f"Loaded {len(page_map)} pages from PDF")
         
         chunking_service = ChunkingService()
         logger.info("Chunking text...")
-        metadata = {"filename": f"{arxiv_id}.pdf", "loading_method": "pymupdf"}
-        chunked_data = chunking_service.chunk_text(text, method='by_paragraphs', metadata=metadata, page_map=page_map)
+        metadata = {"filename": f"{arxiv_id}.pdf", "loading_method": "pymupdf", "source": f"{arxiv_id}.pdf"}
+        chunked_data = chunking_service.chunk_text(document, method='by_titles', metadata=metadata, page_map=page_map)
         
         chunks = chunked_data['chunks']
         logger.info(f"Created {len(chunks)} chunks")
@@ -618,7 +662,7 @@ async def create_paper_qa_index(arxiv_id: str):
             chunks=chunks,
             metadata={"total_pages": len(page_map)},
             loading_method="pymupdf",
-            chunking_strategy="by_paragraphs"
+            chunking_strategy="by_titles",
         )
         logger.info(f"Chunked document saved to: {chunk_file}")
         
@@ -672,60 +716,57 @@ async def create_paper_qa_index(arxiv_id: str):
 
 
 @app.post("/paper/{arxiv_id}/qa")
-async def qa_paper(arxiv_id: str, question: str = Body(..., description="用户问题")):
+async def qa_paper(arxiv_id: str, payload: QaRequest):
     """
     对论文进行问答
     流程：检查索引 -> 搜索相似chunks -> 生成回答
     """
     try:
+        question = payload.question.strip()
         logger.info(f"QA request for paper: {arxiv_id}, question: {question}")
-        
-        qa_index = db_service.get_paper_qa_index(arxiv_id)
-        if not qa_index or qa_index['status'] != 'indexed':
-            raise HTTPException(status_code=400, detail="Paper does not have QA index. Please create index first.")
-        
-        collection_name = qa_index['collection_name']
-        
-        question_embedding = embedding_service.create_single_embedding_local(question)
-        
-        search_results = vector_store_service.search_similar_vectors(
-            collection_name=collection_name,
-            query_vector=question_embedding,
-            top_k=5
-        )
-        
-        if not search_results:
-            raise HTTPException(status_code=400, detail="No relevant chunks found")
-        
-        context = "\n\n".join([result.get('content', '') for result in search_results])
-        
-        prompt = f"""基于以下论文内容回答问题：
-
-{context}
-
-问题：{question}
-
-请根据上述内容给出详细的回答。"""
+        _, search_results, context, retrieval_debug = build_qa_context(arxiv_id, payload)
         
         logger.info("Generating answer...")
         
         try:
-            generation_service = GenerationService()
-            answer = generation_service.generate_text(
-                prompt=prompt,
-                model_type="local",
-                model_name="Qwen/Qwen2-7B-Instruct"
+            qwen_search_results = [
+                {
+                    "text": result.get("content", ""),
+                    "page_number": result.get("page_number", ""),
+                    "source": result.get("source", ""),
+                    "subchunk_label": result.get("subchunk_label", ""),
+                    "chunk_label": result.get("subchunk_label", ""),
+                }
+                for result in search_results
+            ]
+            generation_result = generation_service.generate(
+                provider="qwen",
+                model_name="qwen3.6-plus",
+                query=question,
+                search_results=qwen_search_results,
             )
+            answer = generation_result["response"]
         except Exception as e:
-            logger.warning(f"Local generation failed, using fallback: {str(e)}")
-            answer = f"根据论文内容，关于您的问题 \"{question}\" 的相关信息如下：\n\n{context[:1000]}..."
+            logger.warning(f"Qwen generation failed, using fallback: {str(e)}")
+            answer = f'根据论文内容，关于您的问题 "{question}" 的相关信息如下：\n\n{context[:1000]}...'
         
         return {
             "status": "success",
             "arxiv_id": arxiv_id,
             "question": question,
             "answer": answer,
-            "sources": [{"content": r.get('content', '')[:200], "page_number": r.get('page_number', '')} for r in search_results]
+            "sources": [
+                {
+                    "content": r.get('content', '')[:200],
+                    "page_number": r.get('page_number', ''),
+                    "source": r.get('source', ''),
+                    "subchunk_label": r.get('subchunk_label', ''),
+                    "chunk_label": r.get('subchunk_label', ''),
+                    "parent_chunk_id": r.get('parent_chunk_id', r.get('chunk_id', 0)),
+                }
+                for r in search_results
+            ],
+            "retrieval_debug": retrieval_debug,
         }
         
     except HTTPException:
@@ -733,6 +774,96 @@ async def qa_paper(arxiv_id: str, question: str = Body(..., description="用户�
     except Exception as e:
         logger.error(f"Error in QA: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/paper/{arxiv_id}/qa/stream")
+async def qa_paper_stream(arxiv_id: str, payload: QaRequest):
+    """
+    流式论文问答，SSE 输出。
+    """
+    question = payload.question.strip()
+    logger.info(f"QA stream request for paper: {arxiv_id}, question: {question}")
+
+    _, search_results, context, retrieval_debug = build_qa_context(arxiv_id, payload)
+
+    source_payload = [
+        {
+            "content": r.get("content", "")[:500],
+            "page_number": r.get("page_number", ""),
+            "source": r.get("source", ""),
+            "subchunk_label": r.get("subchunk_label", ""),
+            "chunk_label": r.get("subchunk_label", ""),
+        }
+        for r in search_results
+    ]
+
+    def sse_event(event_name: str, data: dict) -> str:
+        return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    def event_stream():
+        try:
+            yield sse_event(
+                "meta",
+                {
+                    "status": "started",
+                    "arxiv_id": arxiv_id,
+                    "question": question,
+                    "sources": source_payload,
+                    "retrieval_debug": retrieval_debug,
+                },
+            )
+
+            qwen_context = "\n\n".join([r.get("content", "") for r in search_results])
+            for chunk in generation_service.stream_qwen_responses(
+                query=question,
+                context=qwen_context,
+                model_name="qwen3.6-plus",
+            ):
+                if chunk.get("type") == "delta":
+                    yield sse_event("delta", {"delta": chunk.get("delta", "")})
+                elif chunk.get("type") == "completed":
+                    yield sse_event(
+                        "done",
+                        {
+                            "status": "success",
+                            "answer": chunk.get("answer", ""),
+                            "sources": source_payload,
+                            "retrieval_debug": retrieval_debug,
+                            "usage": chunk.get("usage"),
+                        },
+                    )
+                    return
+
+            yield sse_event(
+                "done",
+                {
+                    "status": "success",
+                    "answer": "",
+                    "sources": source_payload,
+                    "retrieval_debug": retrieval_debug,
+                    "usage": None,
+                },
+            )
+
+        except Exception as e:
+            logger.error(f"Error in QA stream: {str(e)}")
+            yield sse_event(
+                "error",
+                {
+                    "status": "error",
+                    "detail": str(e),
+                },
+            )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/chunks/files")
@@ -805,3 +936,4 @@ if __name__ == "__main__":
         reload=False,
         log_level="debug"
     )
+
