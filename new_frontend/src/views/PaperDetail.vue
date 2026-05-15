@@ -16,8 +16,10 @@ import {
 import { usePaperStore } from '@/stores/paperStore'
 import {
   createPaperQaIndex,
+  getPaperQaDiagnostic,
   getPaperQaStatus,
   qaPaperStream,
+  type QaDiagnosticResult,
   type QaStatusResult,
   type RetrievalDebug
 } from '@/api/papers'
@@ -48,6 +50,7 @@ const qaMode = ref(false)
 const qaLoading = ref(false)
 const creatingIndex = ref(false)
 const qaStatus = ref<QaStatusResult | null>(null)
+const qaDiagnostic = ref<QaDiagnosticResult | null>(null)
 const question = ref('')
 const chatContainerRef = ref<HTMLElement | null>(null)
 const qaResults = ref<QaTurn[]>([])
@@ -55,11 +58,17 @@ const retrievalOptions = reactive({
   enableQueryRewrite: true,
   enableHyde: true,
   enableKeywordSearch: true,
-  debug: false,
-  topK: 5
+  debug: true,
+  topK: 15
 })
 
 const modelBadge = 'Qwen 3.6 Plus'
+const debugRouteLabels: Record<string, string> = {
+  vector_original: '原始向量召回',
+  vector_rewrite: '重写向量召回',
+  vector_hyde: 'HyDE 向量召回',
+  keyword: '关键词召回'
+}
 
 const quickPrompts = computed(() => [
   '请总结这篇论文的核心贡献。',
@@ -86,6 +95,190 @@ function getSourceLabel(source: QaSource, index: number) {
   return `Source ${index + 1}`
 }
 
+function getDebugRouteLabel(routeName: string) {
+  return debugRouteLabels[routeName] || routeName
+}
+
+function getQuerySourceLabel(source?: string) {
+  if (source === 'model') return '模型输出'
+  if (source === 'heuristic') return '启发式补充'
+  return source || '未知来源'
+}
+
+function getQueryCandidateReasonLabel(reason?: string) {
+  if (reason === 'kept') return '已采用'
+  if (reason === 'duplicate') return '重复项'
+  if (reason === 'same_as_original') return '与原问题重复'
+  if (reason === 'trimmed_to_top_k') return '超过上限'
+  if (reason === 'empty') return '空内容'
+  return reason || '未说明'
+}
+
+function formatDebugQueryList(queries?: string[]) {
+  if (!queries || queries.length === 0) {
+    return '无'
+  }
+  return queries.join(' | ')
+}
+
+function formatDebugNumber(value?: number | null) {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(4) : '-'
+}
+
+function formatRouteScores(routeScores?: Record<string, number>) {
+  const entries = Object.entries(routeScores || {})
+  if (!entries.length) {
+    return '无'
+  }
+  return entries.map(([route, score]) => `${getDebugRouteLabel(route)} ${formatDebugNumber(score)}`).join(' · ')
+}
+
+function escapeHtml(text: string) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function escapeAttr(text: string) {
+  return escapeHtml(text).replace(/`/g, '&#96;')
+}
+
+function formatInlineMarkdown(text: string) {
+  let output = escapeHtml(text)
+
+  output = output.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => {
+    return `<a href="${escapeAttr(url)}" target="_blank" rel="noreferrer noopener">${label}</a>`
+  })
+  output = output.replace(/`([^`]+)`/g, '<code>$1</code>')
+  output = output.replace(/\*\*([\s\S]+?)\*\*/g, '<strong>$1</strong>')
+  output = output.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>')
+
+  return output
+}
+
+function renderMarkdown(text: string) {
+  const content = (text || '').replace(/\r\n/g, '\n').trim()
+  if (!content) {
+    return '<p class="md-paragraph md-empty">回答生成中...</p>'
+  }
+
+  const lines = content.split('\n')
+  const blocks: string[] = []
+  let paragraphLines: string[] = []
+  let quoteLines: string[] = []
+  let unorderedList: string[] = []
+  let orderedList: string[] = []
+  let codeLines: string[] = []
+  let inCodeBlock = false
+
+  const flushParagraph = () => {
+    if (!paragraphLines.length) return
+    blocks.push(`<p class="md-paragraph">${paragraphLines.map(formatInlineMarkdown).join('<br />')}</p>`)
+    paragraphLines = []
+  }
+
+  const flushQuote = () => {
+    if (!quoteLines.length) return
+    blocks.push(`<blockquote class="md-quote">${quoteLines.map(formatInlineMarkdown).join('<br />')}</blockquote>`)
+    quoteLines = []
+  }
+
+  const flushLists = () => {
+    if (unorderedList.length) {
+      blocks.push(`<ul class="md-list md-list-unordered">${unorderedList.map(item => `<li>${formatInlineMarkdown(item)}</li>`).join('')}</ul>`)
+      unorderedList = []
+    }
+    if (orderedList.length) {
+      blocks.push(`<ol class="md-list md-list-ordered">${orderedList.map(item => `<li>${formatInlineMarkdown(item)}</li>`).join('')}</ol>`)
+      orderedList = []
+    }
+  }
+
+  const flushCode = () => {
+    if (!codeLines.length) return
+    blocks.push(`<pre class="md-code"><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`)
+    codeLines = []
+  }
+
+  for (const line of lines) {
+    const trimmed = line.trim()
+
+    if (inCodeBlock) {
+      if (trimmed.startsWith('```')) {
+        flushCode()
+        inCodeBlock = false
+      } else {
+        codeLines.push(line)
+      }
+      continue
+    }
+
+    if (!trimmed) {
+      flushParagraph()
+      flushQuote()
+      flushLists()
+      continue
+    }
+
+    if (trimmed.startsWith('```')) {
+      flushParagraph()
+      flushQuote()
+      flushLists()
+      inCodeBlock = true
+      continue
+    }
+
+    const headingMatch = trimmed.match(/^(#{1,6})\s+(.*)$/)
+    if (headingMatch) {
+      flushParagraph()
+      flushQuote()
+      flushLists()
+      const level = headingMatch[1].length
+      blocks.push(`<h${level} class="md-heading md-heading-${level}">${formatInlineMarkdown(headingMatch[2])}</h${level}>`)
+      continue
+    }
+
+    const quoteMatch = trimmed.match(/^>\s?(.*)$/)
+    if (quoteMatch) {
+      flushParagraph()
+      flushLists()
+      quoteLines.push(quoteMatch[1])
+      continue
+    }
+
+    const unorderedMatch = trimmed.match(/^[-*+]\s+(.*)$/)
+    if (unorderedMatch) {
+      flushParagraph()
+      flushQuote()
+      unorderedList.push(unorderedMatch[1])
+      continue
+    }
+
+    const orderedMatch = trimmed.match(/^\d+\.\s+(.*)$/)
+    if (orderedMatch) {
+      flushParagraph()
+      flushQuote()
+      orderedList.push(orderedMatch[1])
+      continue
+    }
+
+    if (unorderedList.length || orderedList.length) {
+      flushLists()
+    }
+    paragraphLines.push(line)
+  }
+
+  flushParagraph()
+  flushQuote()
+  flushLists()
+  flushCode()
+
+  return blocks.join('')
+}
+
 function goBack() {
   router.back()
 }
@@ -103,10 +296,19 @@ function scrollToBottom() {
 
 async function fetchQaStatus() {
   try {
-    qaStatus.value = await getPaperQaStatus(paperId.value)
+    const [statusResult, diagnosticResult] = await Promise.all([
+      getPaperQaStatus(paperId.value),
+      getPaperQaDiagnostic(paperId.value).catch(error => {
+        console.error('Failed to fetch QA diagnostic:', error)
+        return null
+      })
+    ])
+    qaStatus.value = statusResult
+    qaDiagnostic.value = diagnosticResult
   } catch (error) {
     console.error('Failed to fetch QA status:', error)
     qaStatus.value = { arxiv_id: paperId.value, has_index: false, status: 'not_indexed' }
+    qaDiagnostic.value = null
   }
 }
 
@@ -140,7 +342,7 @@ async function handleQaSubmit(customQuestion?: string) {
     createdAt: new Date().toISOString(),
     streaming: true
   })
-  qaResults.value.unshift(turn)
+  qaResults.value.push(turn)
   question.value = ''
   scrollToBottom()
 
@@ -391,7 +593,7 @@ watch(qaLoading, () => scrollToBottom())
                 <div class="message message-assistant">
                   <div class="message-label">Qwen</div>
                   <div class="assistant-card">
-                    <div class="assistant-text">{{ turn.answer }}</div>
+                    <div class="assistant-markdown" v-html="renderMarkdown(turn.answer)" />
                     <div v-if="turn.streaming" class="streaming-indicator">
                       <el-icon class="spin"><Loading /></el-icon>
                       <span>正在流式生成中...</span>
@@ -426,41 +628,193 @@ watch(qaLoading, () => scrollToBottom())
                       这次回答没有返回结构化来源。
                     </div>
 
-                    <details v-if="turn.retrievalDebug" class="debug-panel">
-                      <summary class="debug-summary">检索调试信息</summary>
-                      <div class="debug-section">
-                        <div class="debug-row"><strong>原始 Query:</strong> {{ turn.retrievalDebug.original_query }}</div>
-                        <div class="debug-row"><strong>Rewrite:</strong> {{ turn.retrievalDebug.rewritten_queries.join(' | ') || '无' }}</div>
-                        <div class="debug-row"><strong>HyDE:</strong> {{ turn.retrievalDebug.hyde_text || '无' }}</div>
-                      </div>
-                      <div v-for="(routeChunks, routeName) in turn.retrievalDebug.routes" :key="routeName" class="debug-section">
-                        <div class="debug-route-title">{{ routeName }}</div>
-                        <div v-if="routeChunks.length" class="debug-route-list">
-                          <div v-for="(chunk, idx) in routeChunks" :key="`${routeName}-${idx}`" class="debug-chunk">
-                            <div class="debug-chunk-meta">
-                              <span>#{{ idx + 1 }}</span>
-                              <span>chunk {{ chunk.chunk_id ?? '-' }}</span>
-                              <span>page {{ chunk.page_number || chunk.page_range || '-' }}</span>
-                              <span>score {{ typeof chunk.route_score === 'number' ? chunk.route_score.toFixed(4) : '-' }}</span>
+                    <details v-if="turn.retrievalDebug" class="debug-panel" open>
+                      <summary class="debug-summary">
+                        <span>检索调试信息</span>
+                        <span class="debug-summary-badge">Debug Trace</span>
+                      </summary>
+
+                      <div class="debug-grid">
+                        <section class="debug-card">
+                          <div class="debug-card-title">1. 原始问题</div>
+                          <div class="debug-text">{{ turn.retrievalDebug.original_query }}</div>
+                        </section>
+
+                        <section class="debug-card">
+                          <div class="debug-card-title">2. 查询重写</div>
+                          <div class="debug-subsection">
+                            <div class="debug-subtitle">模型输出</div>
+                            <div v-if="turn.retrievalDebug.query_rewrite?.model_queries?.length" class="debug-chip-group">
+                              <span
+                                v-for="(query, idx) in turn.retrievalDebug.query_rewrite.model_queries"
+                                :key="`model-${idx}`"
+                                class="debug-chip"
+                              >
+                                {{ query }}
+                              </span>
                             </div>
-                            <div class="debug-chunk-text">{{ chunk.preview }}</div>
+                            <div v-else class="debug-empty-inline">无</div>
                           </div>
-                        </div>
-                        <div v-else class="debug-empty">无召回</div>
-                      </div>
-                      <div class="debug-section">
-                        <div class="debug-route-title">final_chunks</div>
-                        <div class="debug-route-list">
-                          <div v-for="(chunk, idx) in turn.retrievalDebug.final_chunks" :key="`final-${idx}`" class="debug-chunk">
-                            <div class="debug-chunk-meta">
-                              <span>#{{ idx + 1 }}</span>
-                              <span>chunk {{ chunk.chunk_id ?? '-' }}</span>
-                              <span>page {{ chunk.page_number || chunk.page_range || '-' }}</span>
-                              <span>fused {{ typeof chunk.score === 'number' ? chunk.score.toFixed(4) : '-' }}</span>
+
+                          <div class="debug-subsection">
+                            <div class="debug-subtitle">最终参与检索</div>
+                            <div v-if="turn.retrievalDebug.query_rewrite?.selected_queries?.length" class="debug-chip-group">
+                              <span
+                                v-for="(query, idx) in turn.retrievalDebug.query_rewrite.selected_queries"
+                                :key="`selected-${idx}`"
+                                class="debug-chip debug-chip-primary"
+                              >
+                                {{ query }}
+                              </span>
                             </div>
-                            <div class="debug-chunk-text">{{ chunk.preview }}</div>
+                            <div v-else class="debug-empty-inline">无</div>
                           </div>
-                        </div>
+
+                          <div v-if="turn.retrievalDebug.query_rewrite?.heuristic_queries?.length" class="debug-subsection">
+                            <div class="debug-subtitle">启发式补充</div>
+                            <div class="debug-chip-group">
+                              <span
+                                v-for="(query, idx) in turn.retrievalDebug.query_rewrite.heuristic_queries"
+                                :key="`heuristic-${idx}`"
+                                class="debug-chip"
+                              >
+                                {{ query }}
+                              </span>
+                            </div>
+                          </div>
+
+                          <div v-if="turn.retrievalDebug.query_rewrite?.llm_error" class="debug-warning">
+                            重写模型错误：{{ turn.retrievalDebug.query_rewrite.llm_error }}
+                          </div>
+
+                          <div v-if="turn.retrievalDebug.query_rewrite?.candidates?.length" class="debug-subsection">
+                            <div class="debug-subtitle">所有候选与生效状态</div>
+                            <div class="debug-detail-list">
+                              <div
+                                v-for="(candidate, idx) in turn.retrievalDebug.query_rewrite.candidates"
+                                :key="`candidate-${idx}`"
+                                class="debug-detail-item"
+                              >
+                                <div class="debug-detail-query">
+                                  <span class="debug-candidate-source">{{ getQuerySourceLabel(candidate.source) }}</span>
+                                  {{ candidate.query }}
+                                </div>
+                                <div class="debug-detail-meta">
+                                  <span>状态: {{ candidate.selected ? '最终采用' : '未采用' }}</span>
+                                  <span>原因: {{ getQueryCandidateReasonLabel(candidate.reason) }}</span>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        </section>
+
+                        <section class="debug-card">
+                          <div class="debug-card-title">3. HyDE</div>
+                          <div class="debug-text">
+                            {{ turn.retrievalDebug.hyde?.text || turn.retrievalDebug.hyde_text || '无' }}
+                          </div>
+                          <div class="debug-mini-meta">
+                            <span>来源查询：</span>
+                            <strong>{{ formatDebugQueryList(turn.retrievalDebug.hyde?.source_queries) }}</strong>
+                          </div>
+                          <div class="debug-mini-meta">
+                            <span>聚焦关键词：</span>
+                            <strong>{{ formatDebugQueryList(turn.retrievalDebug.hyde?.focus_queries) }}</strong>
+                          </div>
+                        </section>
+
+                        <section class="debug-card">
+                          <div class="debug-card-title">4. 关键词检索</div>
+                          <div class="debug-subsection">
+                            <div class="debug-subtitle">实际参与检索的 Query</div>
+                            <div class="debug-text">{{ formatDebugQueryList(turn.retrievalDebug.keyword_search?.queries) }}</div>
+                          </div>
+
+                          <div class="debug-subsection" v-if="turn.retrievalDebug.keyword_search?.selected_rewrite_queries?.length">
+                            <div class="debug-subtitle">参与关键词检索的重写 Query</div>
+                            <div class="debug-chip-group">
+                              <span
+                                v-for="(query, idx) in turn.retrievalDebug.keyword_search.selected_rewrite_queries"
+                                :key="`keyword-rewrite-${idx}`"
+                                class="debug-chip debug-chip-primary"
+                              >
+                                {{ query }}
+                              </span>
+                            </div>
+                          </div>
+                        </section>
+
+                        <section class="debug-card debug-card-wide">
+                          <div class="debug-card-title">5. 各路召回</div>
+                          <div v-for="(routeChunks, routeName) in turn.retrievalDebug.routes" :key="routeName" class="debug-route-section">
+                            <div class="debug-route-title">
+                              {{ getDebugRouteLabel(routeName) }}
+                              <span class="debug-route-count">{{ routeChunks.length }} 条</span>
+                            </div>
+                            <div v-if="routeChunks.length" class="debug-route-list">
+                              <div v-for="(chunk, idx) in routeChunks" :key="`${routeName}-${idx}`" class="debug-chunk">
+                                <div class="debug-chunk-meta">
+                                  <span>#{{ idx + 1 }}</span>
+                                  <span>chunk {{ chunk.chunk_id ?? '-' }}</span>
+                                  <span>page {{ chunk.page_number || chunk.page_range || '-' }}</span>
+                                  <span>score {{ formatDebugNumber(chunk.route_score) }}</span>
+                                </div>
+                                <div v-if="chunk.source_query" class="debug-chunk-source">
+                                  来源 Query: {{ chunk.source_query }}
+                                </div>
+                                <div class="debug-chunk-text">{{ chunk.preview }}</div>
+                              </div>
+                            </div>
+                            <div v-else class="debug-empty">无召回</div>
+                          </div>
+                        </section>
+
+                        <section class="debug-card debug-card-wide">
+                          <div class="debug-card-title">6. 最终融合</div>
+                          <div class="debug-fusion-grid">
+                            <div class="debug-mini-meta">
+                              <span>算法：</span>
+                              <strong>{{ turn.retrievalDebug.fusion?.algorithm || 'weighted_rrf' }}</strong>
+                            </div>
+                            <div class="debug-mini-meta">
+                              <span>RRF k：</span>
+                              <strong>{{ turn.retrievalDebug.fusion?.rrf_k ?? '-' }}</strong>
+                            </div>
+                            <div class="debug-mini-meta">
+                              <span>Top K：</span>
+                              <strong>{{ turn.retrievalDebug.config?.top_k ?? '-' }}</strong>
+                            </div>
+                            <div class="debug-mini-meta">
+                              <span>候选数：</span>
+                              <strong>{{ turn.retrievalDebug.config?.candidate_k ?? '-' }}</strong>
+                            </div>
+                            <div class="debug-mini-meta debug-fusion-full">
+                              <span>路由权重：</span>
+                              <strong>{{ formatRouteScores(turn.retrievalDebug.fusion?.route_weights) }}</strong>
+                            </div>
+                          </div>
+
+                          <div class="debug-route-list">
+                            <div v-for="(chunk, idx) in turn.retrievalDebug.final_chunks" :key="`final-${idx}`" class="debug-chunk">
+                              <div class="debug-chunk-meta">
+                                <span>#{{ idx + 1 }}</span>
+                                <span>chunk {{ chunk.chunk_id ?? '-' }}</span>
+                                <span>page {{ chunk.page_number || chunk.page_range || '-' }}</span>
+                                <span>fused {{ formatDebugNumber(chunk.score) }}</span>
+                              </div>
+                              <div v-if="chunk.matched_routes?.length" class="debug-chunk-source">
+                                命中路由: {{ formatDebugQueryList(chunk.matched_routes) }}
+                              </div>
+                              <div v-if="chunk.route_scores && Object.keys(chunk.route_scores).length" class="debug-chunk-source">
+                                路由分数: {{ formatRouteScores(chunk.route_scores) }}
+                              </div>
+                              <div v-if="chunk.source_queries?.length" class="debug-chunk-source">
+                                来源 Queries: {{ formatDebugQueryList(chunk.source_queries) }}
+                              </div>
+                              <div class="debug-chunk-text">{{ chunk.preview }}</div>
+                            </div>
+                          </div>
+                        </section>
                       </div>
                     </details>
 
@@ -519,6 +873,74 @@ watch(qaLoading, () => scrollToBottom())
             </div>
 
             <div class="side-card">
+              <div class="side-title">索引诊断</div>
+              <div v-if="qaDiagnostic" class="diagnostic-block">
+                <div class="diagnostic-summary">
+                  <div class="side-row">
+                    <span>Collection</span>
+                    <strong>{{ qaDiagnostic.collection?.name || qaStatus?.collection_name || '-' }}</strong>
+                  </div>
+                  <div class="side-row">
+                    <span>Milvus 实体数</span>
+                    <strong>{{ qaDiagnostic.collection?.info?.num_entities ?? 0 }}</strong>
+                  </div>
+                  <div class="side-row">
+                    <span>一致性</span>
+                    <strong :class="qaDiagnostic.checks.entity_count_matches_metadata ? 'ok-text' : 'warn-text'">
+                      {{ qaDiagnostic.checks.entity_count_matches_metadata ? '一致' : '不一致' }}
+                    </strong>
+                  </div>
+                  <div class="side-row">
+                    <span>关键词检索</span>
+                    <strong :class="qaDiagnostic.checks.likely_keyword_search_will_work ? 'ok-text' : 'warn-text'">
+                      {{ qaDiagnostic.checks.likely_keyword_search_will_work ? '可用' : '有风险' }}
+                    </strong>
+                  </div>
+                </div>
+
+                <details class="diagnostic-details">
+                  <summary>查看详细诊断</summary>
+                  <div class="diagnostic-json">
+                    <div class="diagnostic-line">
+                      <span>DB chunk_count</span>
+                      <strong>{{ qaDiagnostic.checks.qa_chunk_count ?? 0 }}</strong>
+                    </div>
+                    <div class="diagnostic-line">
+                      <span>Milvus num_entities</span>
+                      <strong>{{ qaDiagnostic.checks.milvus_num_entities ?? 0 }}</strong>
+                    </div>
+                    <div class="diagnostic-line">
+                      <span>collection_exists</span>
+                      <strong>{{ qaDiagnostic.checks.collection_exists ? 'true' : 'false' }}</strong>
+                    </div>
+                    <div class="diagnostic-line">
+                      <span>sample_chunks</span>
+                      <strong>{{ qaDiagnostic.checks.sample_chunks_returned ?? 0 }}</strong>
+                    </div>
+                    <div v-if="qaDiagnostic.collection?.error" class="diagnostic-error">
+                      {{ qaDiagnostic.collection.error }}
+                    </div>
+                    <div v-if="qaDiagnostic.sample_chunks.length" class="diagnostic-samples">
+                      <div v-for="(chunk, idx) in qaDiagnostic.sample_chunks" :key="idx" class="diagnostic-sample">
+                        <div class="diagnostic-sample-meta">
+                          <span>#{{ idx + 1 }}</span>
+                          <span>chunk {{ chunk.chunk_id ?? chunk.id ?? '-' }}</span>
+                          <span>page {{ chunk.page_number || chunk.page_range || '-' }}</span>
+                        </div>
+                        <div class="diagnostic-sample-text">
+                          {{ chunk.content || '-' }}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </details>
+              </div>
+              <div v-else class="diagnostic-empty">
+                暂无诊断数据，点击上方“刷新状态”加载。
+              </div>
+            </div>
+
+            <div class="side-card">
               <div class="side-title">使用说明</div>
               <ul class="hint-list">
                 <li>问题会先转成向量，在对应论文索引中检索相似片段。</li>
@@ -547,7 +969,7 @@ watch(qaLoading, () => scrollToBottom())
                 </div>
                 <div class="control-column">
                   <span>Top K</span>
-                  <el-input-number v-model="retrievalOptions.topK" :min="1" :max="12" size="small" />
+                  <el-input-number v-model="retrievalOptions.topK" :min="1" :max="15" size="small" />
                 </div>
               </div>
             </div>
@@ -874,16 +1296,130 @@ watch(qaLoading, () => scrollToBottom())
 .assistant-card {
   width: 100%;
   border-radius: 22px;
-  padding: 16px 16px 14px;
+  padding: 18px 18px 14px;
   background: #ffffff;
   border: 1px solid rgba(148, 163, 184, 0.2);
   box-shadow: 0 10px 26px rgba(15, 23, 42, 0.05);
 }
 
-.assistant-text {
-  white-space: pre-wrap;
-  line-height: 1.85;
+.assistant-markdown {
+  max-width: 100%;
   color: #1e293b;
+  line-height: 1.85;
+  font-size: 15px;
+  letter-spacing: 0.01em;
+  overflow-wrap: anywhere;
+}
+
+.assistant-markdown :deep(p) {
+  margin: 0 0 14px;
+}
+
+.assistant-markdown :deep(p:last-child) {
+  margin-bottom: 0;
+}
+
+.assistant-markdown :deep(.md-paragraph) {
+  white-space: pre-wrap;
+}
+
+.assistant-markdown :deep(h1),
+.assistant-markdown :deep(h2),
+.assistant-markdown :deep(h3),
+.assistant-markdown :deep(h4),
+.assistant-markdown :deep(h5),
+.assistant-markdown :deep(h6) {
+  margin: 22px 0 10px;
+  line-height: 1.35;
+  color: #0f172a;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+
+.assistant-markdown :deep(h1) {
+  font-size: 24px;
+}
+
+.assistant-markdown :deep(h2) {
+  font-size: 20px;
+}
+
+.assistant-markdown :deep(h3) {
+  font-size: 18px;
+}
+
+.assistant-markdown :deep(h4),
+.assistant-markdown :deep(h5),
+.assistant-markdown :deep(h6) {
+  font-size: 16px;
+}
+
+.assistant-markdown :deep(blockquote) {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border-left: 4px solid rgba(59, 130, 246, 0.4);
+  border-radius: 0 14px 14px 0;
+  background: rgba(59, 130, 246, 0.06);
+  color: #334155;
+}
+
+.assistant-markdown :deep(ul),
+.assistant-markdown :deep(ol) {
+  margin: 10px 0 14px;
+  padding-left: 1.35em;
+}
+
+.assistant-markdown :deep(li) {
+  margin: 6px 0;
+}
+
+.assistant-markdown :deep(code) {
+  padding: 0.15em 0.45em;
+  border-radius: 6px;
+  background: rgba(148, 163, 184, 0.14);
+  color: #1d4ed8;
+  font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+  font-size: 0.92em;
+}
+
+.assistant-markdown :deep(pre) {
+  margin: 14px 0;
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: #0f172a;
+  color: #e2e8f0;
+  overflow-x: auto;
+  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.08);
+}
+
+.assistant-markdown :deep(pre code) {
+  display: block;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  white-space: pre;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.assistant-markdown :deep(a) {
+  color: #2563eb;
+  text-decoration: none;
+  border-bottom: 1px solid rgba(37, 99, 235, 0.22);
+}
+
+.assistant-markdown :deep(a:hover) {
+  border-bottom-color: rgba(37, 99, 235, 0.65);
+}
+
+.assistant-markdown :deep(strong) {
+  color: #0f172a;
+  font-weight: 800;
+}
+
+.assistant-markdown :deep(em) {
+  color: #0f172a;
+  font-style: italic;
 }
 
 .streaming-indicator {
@@ -1018,31 +1554,188 @@ watch(qaLoading, () => scrollToBottom())
 
 .debug-panel {
   margin-top: 16px;
-  border: 1px solid rgba(148, 163, 184, 0.32);
-  border-radius: 16px;
-  background: rgba(248, 250, 252, 0.9);
-  padding: 12px 14px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 20px;
+  background: rgba(248, 250, 252, 0.96);
+  padding: 14px;
 }
 
 .debug-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   cursor: pointer;
   font-weight: 700;
   color: #1e293b;
 }
 
-.debug-section {
+.debug-summary-badge {
+  font-size: 12px;
+  font-weight: 700;
+  color: #2563eb;
+  background: rgba(37, 99, 235, 0.1);
+  padding: 4px 10px;
+  border-radius: 999px;
+}
+
+.debug-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.debug-card,
+.debug-card-wide {
+  border-radius: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: #ffffff;
+  padding: 12px 12px 10px;
+}
+
+.debug-card-wide {
+  grid-column: 1 / -1;
+}
+
+.debug-card-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #0f172a;
+  margin-bottom: 10px;
+}
+
+.debug-subsection {
+  margin-top: 10px;
+}
+
+.debug-subtitle {
+  font-size: 12px;
+  font-weight: 700;
+  color: #475569;
+  margin-bottom: 8px;
+}
+
+.debug-text {
+  white-space: pre-wrap;
+  line-height: 1.7;
+  color: #1e293b;
+  font-size: 13px;
+}
+
+.debug-chip-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.debug-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.12);
+  color: #334155;
+  font-size: 12px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.debug-chip-primary {
+  background: rgba(37, 99, 235, 0.12);
+  color: #1d4ed8;
+}
+
+.debug-chip-soft {
+  background: rgba(99, 102, 241, 0.1);
+  color: #4f46e5;
+}
+
+.debug-detail-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.debug-detail-item {
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(248, 250, 252, 0.96);
+  border: 1px solid rgba(203, 213, 225, 0.85);
+}
+
+.debug-detail-query {
+  font-size: 13px;
+  font-weight: 600;
+  color: #0f172a;
+  line-height: 1.6;
+}
+
+.debug-candidate-source {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(37, 99, 235, 0.1);
+  color: #1d4ed8;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.debug-detail-meta,
+.debug-mini-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  color: #334155;
+  margin-top: 6px;
+}
+
+.debug-empty-inline,
+.debug-warning {
+  font-size: 12px;
+  line-height: 1.5;
+  margin-top: 8px;
+}
+
+.debug-empty-inline {
+  color: #64748b;
+}
+
+.debug-warning {
+  color: #b45309;
+  background: rgba(251, 191, 36, 0.12);
+  border: 1px solid rgba(251, 191, 36, 0.24);
+  border-radius: 12px;
+  padding: 8px 10px;
+}
+
+.debug-route-section {
   margin-top: 12px;
 }
 
-.debug-row,
 .debug-route-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   font-size: 13px;
+  font-weight: 700;
   color: #334155;
+  margin-bottom: 8px;
 }
 
-.debug-route-title {
+.debug-route-count {
+  font-size: 12px;
   font-weight: 700;
-  margin-bottom: 8px;
+  color: #2563eb;
+  background: rgba(37, 99, 235, 0.1);
+  padding: 3px 8px;
+  border-radius: 999px;
 }
 
 .debug-route-list {
@@ -1056,6 +1749,13 @@ watch(qaLoading, () => scrollToBottom())
   border-radius: 12px;
   background: #ffffff;
   border: 1px solid rgba(203, 213, 225, 0.8);
+}
+
+.debug-chunk-source {
+  margin-bottom: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #475569;
 }
 
 .debug-chunk-meta {
@@ -1072,6 +1772,17 @@ watch(qaLoading, () => scrollToBottom())
   font-size: 13px;
   color: #1f2937;
   line-height: 1.6;
+}
+
+.debug-fusion-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 14px;
+  margin-bottom: 10px;
+}
+
+.debug-fusion-full {
+  grid-column: 1 / -1;
 }
 
 .answer-meta {
@@ -1173,6 +1884,92 @@ watch(qaLoading, () => scrollToBottom())
 .side-card {
   border-radius: 24px;
   padding: 18px;
+}
+
+.diagnostic-block {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.diagnostic-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.diagnostic-details {
+  border-top: 1px solid rgba(148, 163, 184, 0.16);
+  padding-top: 10px;
+}
+
+.diagnostic-details summary {
+  cursor: pointer;
+  font-size: 13px;
+  color: #2563eb;
+  font-weight: 600;
+}
+
+.diagnostic-json {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.diagnostic-line,
+.diagnostic-sample-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  color: #475569;
+}
+
+.diagnostic-error {
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(239, 68, 68, 0.08);
+  color: #b91c1c;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.diagnostic-samples {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.diagnostic-sample {
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(248, 250, 252, 0.92);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.diagnostic-sample-text {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #334155;
+  max-height: 120px;
+  overflow: auto;
+}
+
+.diagnostic-empty {
+  font-size: 13px;
+  color: #64748b;
+  line-height: 1.6;
+}
+
+.ok-text {
+  color: #15803d;
+}
+
+.warn-text {
+  color: #b45309;
 }
 
 .side-title {

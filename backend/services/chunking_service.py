@@ -20,7 +20,7 @@ class ChunkingService:
         method: str,
         metadata: dict,
         page_map: list = None,
-        chunk_size: int = 1000,
+        chunk_size: int = 500,
     ) -> dict:
         try:
             normalized_page_map = self._normalize_page_map(text, page_map)
@@ -298,35 +298,42 @@ class ChunkingService:
             page_start = int(current_lines[0]["page"])
             page_end = int(current_lines[-1]["page"])
 
-            if current_title:
-                section_text = f"{current_title}\n{section_body}".strip() if section_body else current_title
-            else:
-                section_text = section_body
-
+            section_text = f"{current_title}\n{section_body}".strip() if current_title else section_body
             if not section_text:
                 current_title = None
                 current_level = 0
                 current_lines = []
                 return
 
-            chunks.append(
-                {
-                    "content": section_text,
-                    "metadata": self._build_chunk_metadata(
-                        source=source_name,
-                        page_start=page_start,
-                        page_end=page_end,
-                        chunk_text=section_text,
-                        chunk_index=0,
-                        total_chunks=0,
-                        chunking_method="by_titles",
-                        extra_metadata={
-                            "section_title": section_title,
-                            "section_level": current_level,
-                        },
-                    ),
-                }
-            )
+            section_chunks = self._split_text_by_sentence_chunks(section_body, chunk_size)
+            if not section_chunks:
+                section_chunks = [section_body or section_text]
+
+            for part_index, part in enumerate(section_chunks, start=1):
+                part_text = part.strip()
+                if current_title:
+                    part_text = f"{current_title}\n{part_text}".strip()
+
+                chunks.append(
+                    {
+                        "content": part_text,
+                        "metadata": self._build_chunk_metadata(
+                            source=source_name,
+                            page_start=page_start,
+                            page_end=page_end,
+                            chunk_text=part_text,
+                            chunk_index=0,
+                            total_chunks=0,
+                            chunking_method="by_titles",
+                            extra_metadata={
+                                "section_title": section_title,
+                                "section_level": current_level,
+                                "section_part_index": part_index,
+                                "section_part_count": len(section_chunks),
+                            },
+                        ),
+                    }
+                )
 
             current_title = None
             current_level = 0
@@ -338,7 +345,15 @@ class ChunkingService:
                 continue
 
             heading_level = self._heading_level(line)
-            if heading_level == 1:
+            # Keep the old level-1 split logic for later reuse.
+            # if heading_level == 1:
+            #     flush_section()
+            #     current_title = text
+            #     current_level = int(heading_level)
+            #     current_lines = [line]
+            #     continue
+
+            if heading_level == 2:
                 flush_section()
                 current_title = text
                 current_level = int(heading_level)
@@ -610,10 +625,10 @@ class ChunkingService:
                 return None
             if leading_number > 20:
                 return None
-            # Only split on first-level numbered sections such as "1 Introduction".
-            # Subsections like "2.1 ..." stay inside the parent chunk.
+            # Numbered top-level sections such as "1 Introduction" remain level 1.
+            # Numbered subsections such as "2.1 ..." are treated as level 2.
             if "." in prefix:
-                return None
+                return 2
             return 1
 
         words = text.split()
@@ -704,3 +719,56 @@ class ChunkingService:
         if current:
             chunks.append(" ".join(current))
         return chunks
+
+    def _split_text_by_sentence_chunks(self, text: str, max_words: int) -> List[str]:
+        normalized = re.sub(r"\s+", " ", str(text or "").replace("\r\n", "\n")).strip()
+        if not normalized:
+            return []
+
+        sentences = self._split_into_sentences(normalized)
+        if not sentences:
+            return [normalized]
+
+        chunks: List[str] = []
+        current_sentences: List[str] = []
+        current_words = 0
+
+        def flush() -> None:
+            nonlocal current_sentences, current_words
+            if not current_sentences:
+                return
+            chunk = " ".join(current_sentences).strip()
+            if chunk:
+                chunks.append(chunk)
+            current_sentences = []
+            current_words = 0
+
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+
+            sentence_words = self._word_count(sentence)
+            if sentence_words > max_words:
+                flush()
+                chunks.extend(self._split_text_by_words(sentence, max_words))
+                continue
+
+            if current_sentences and current_words + sentence_words > max_words:
+                flush()
+
+            current_sentences.append(sentence)
+            current_words += sentence_words
+
+        flush()
+        return chunks or [normalized]
+
+    def _split_into_sentences(self, text: str) -> List[str]:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return []
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?。！？；;])\s+", normalized) if part.strip()]
+        return sentences or [normalized]
+
+    def _word_count(self, text: str) -> int:
+        return len(str(text or "").split())

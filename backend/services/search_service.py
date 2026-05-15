@@ -3,6 +3,7 @@ import logging
 from datetime import datetime
 from pymilvus import connections, Collection, utility
 from services.embedding_service import EmbeddingService
+from services.vector_store_service import normalize_collection_name
 from utils.config import VectorDBProvider, MILVUS_CONFIG
 import os
 import json
@@ -161,8 +162,9 @@ class SearchService:
             )
             
             # 获取collection
-            logger.info(f"Loading collection: {collection_id}")
-            collection = Collection(collection_id)
+            normalized_collection_id = normalize_collection_name(collection_id)
+            logger.info(f"Loading collection: {normalized_collection_id}")
+            collection = Collection(normalized_collection_id)
             collection.load()
             
             # 记录collection的基本信息
@@ -183,10 +185,19 @@ class SearchService:
             
             # 使用collection中存储的配置创建查询向量
             logger.info("Creating query embedding")
+            vector_field = next((field for field in collection.schema.fields if field.name == "vector"), None)
+            embedding_dimension = None
+            if vector_field is not None:
+                embedding_dimension = getattr(vector_field, "dim", None)
+                if embedding_dimension is None:
+                    params = getattr(vector_field, "params", None)
+                    if isinstance(params, dict):
+                        embedding_dimension = params.get("dim")
             query_embedding = self.embedding_service.create_single_embedding(
                 query,
                 provider=sample_entity[0]["embedding_provider"],
-                model=sample_entity[0]["embedding_model"]
+                model=sample_entity[0]["embedding_model"],
+                dimension=int(embedding_dimension) if embedding_dimension else None,
             )
             logger.info(f"Query embedding created with dimension: {len(query_embedding)}")
             

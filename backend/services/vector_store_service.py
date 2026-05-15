@@ -1,29 +1,50 @@
 ﻿import os
 from datetime import datetime
 import json
+import re
 from typing import List, Dict, Any, Optional
 import logging
 from pathlib import Path
 from pymilvus import connections, utility
 from pymilvus import Collection, DataType, FieldSchema, CollectionSchema
-from utils.config import VectorDBProvider, MILVUS_CONFIG  # Updated import
+from utils.config import VectorDBProvider, MILVUS_CONFIG
 from pypinyin import lazy_pinyin, Style
 
 logger = logging.getLogger(__name__)
 
 CONTENT_MAX_LENGTH = 12000
 
+COLLECTION_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def normalize_collection_name(collection_name: str) -> str:
+    name = (collection_name or "").strip()
+    if not name:
+        return "collection"
+    name = name.replace("-", "_").replace(".", "_")
+    name = re.sub(r"[^0-9A-Za-z_]+", "_", name)
+    name = re.sub(r"_+", "_", name).strip("_")
+    if not name:
+        name = "collection"
+    if not name[0].isalpha() and name[0] != "_":
+        name = f"_{name}"
+    return name
+
+
+def is_valid_collection_name(collection_name: str) -> bool:
+    return bool(COLLECTION_NAME_PATTERN.match(collection_name or ""))
+
 class VectorDBConfig:
     """
-    鍚戦噺鏁版嵁搴撻厤缃被锛岀敤浜庡瓨鍌ㄥ拰绠＄悊鍚戦噺鏁版嵁搴撶殑閰嶇疆淇℃伅
+    向量数据库配置类，用于存储和管理向量数据库的配置信息。
     """
     def __init__(self, provider: str, index_mode: str):
         """
-        鍒濆鍖栧悜閲忔暟鎹簱閰嶇疆
-        
-        鍙傛暟:
-            provider: 鍚戦噺鏁版嵁搴撴彁渚涘晢鍚嶇О
-            index_mode: 绱㈠紩妯″紡
+        初始化向量数据库配置。
+
+        参数:
+            provider: 向量数据库提供商名称
+            index_mode: 索引模式
         """
         self.provider = provider
         self.index_mode = index_mode
@@ -31,81 +52,97 @@ class VectorDBConfig:
 
     def _get_milvus_index_type(self, index_mode: str) -> str:
         """
-        鏍规嵁绱㈠紩妯″紡鑾峰彇Milvus绱㈠紩绫诲瀷
-        
-        鍙傛暟:
-            index_mode: 绱㈠紩妯″紡
-            
-        杩斿洖:
-            瀵瑰簲鐨凪ilvus绱㈠紩绫诲瀷
+        根据索引模式获取 Milvus 索引类型。
+
+        参数:
+            index_mode: 索引模式
+
+        返回:
+            对应的 Milvus 索引类型
         """
         return MILVUS_CONFIG["index_types"].get(index_mode, "FLAT")
     
     def _get_milvus_index_params(self, index_mode: str) -> Dict[str, Any]:
         """
-        鏍规嵁绱㈠紩妯″紡鑾峰彇Milvus绱㈠紩鍙傛暟
-        
-        鍙傛暟:
-            index_mode: 绱㈠紩妯″紡
-            
-        杩斿洖:
-            瀵瑰簲鐨凪ilvus绱㈠紩鍙傛暟瀛楀吀
+        根据索引模式获取 Milvus 索引参数。
+
+        参数:
+            index_mode: 索引模式
+
+        返回:
+            对应的 Milvus 索引参数字典
         """
         return MILVUS_CONFIG["index_params"].get(index_mode, {})
 
 class VectorStoreService:
     """
-    鍚戦噺瀛樺偍鏈嶅姟绫伙紝鎻愪緵鍚戦噺鏁版嵁鐨勭储寮曘€佹煡璇㈠拰绠＄悊鍔熻兘
+    向量存储服务类，提供向量数据的索引、查询和管理功能。
     """
     def __init__(self):
         """
-        鍒濆鍖栧悜閲忓瓨鍌ㄦ湇鍔?
+        初始化向量存储服务。
         """
         self.initialized_dbs = {}
-        # 纭繚瀛樺偍鐩綍瀛樺湪
+        # 确保存储目录存在
         os.makedirs("03-vector-store", exist_ok=True)
+
+    def resolve_collection_name(self, collection_name: str) -> str:
+        """
+        将任意 collection 名称规范化为 Milvus 可接受的形式。
+        """
+        return normalize_collection_name(collection_name)
+
+    def collection_exists(self, provider: str, collection_name: str) -> bool:
+        if provider == VectorDBProvider.MILVUS:
+            try:
+                connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
+                resolved = self.resolve_collection_name(collection_name)
+                return utility.has_collection(resolved)
+            finally:
+                connections.disconnect("default")
+        return False
     
     def _get_milvus_index_type(self, config: VectorDBConfig) -> str:
         """
-        浠庨厤缃璞¤幏鍙朚ilvus绱㈠紩绫诲瀷
-        
-        鍙傛暟:
-            config: 鍚戦噺鏁版嵁搴撻厤缃璞?
-            
-        杩斿洖:
-            Milvus绱㈠紩绫诲瀷
+        从配置对象获取 Milvus 索引类型。
+
+        参数:
+            config: 向量数据库配置对象
+
+        返回:
+            Milvus 索引类型
         """
         return config._get_milvus_index_type(config.index_mode)
     
     def _get_milvus_index_params(self, config: VectorDBConfig) -> Dict[str, Any]:
         """
-        浠庨厤缃璞¤幏鍙朚ilvus绱㈠紩鍙傛暟
-        
-        鍙傛暟:
-            config: 鍚戦噺鏁版嵁搴撻厤缃璞?
-            
-        杩斿洖:
-            Milvus绱㈠紩鍙傛暟瀛楀吀
+        从配置对象获取 Milvus 索引参数。
+
+        参数:
+            config: 向量数据库配置对象
+
+        返回:
+            Milvus 索引参数字典
         """
         return config._get_milvus_index_params(config.index_mode)
     
     def index_embeddings(self, embedding_file: str, config: VectorDBConfig) -> Dict[str, Any]:
         """
-        灏嗗祵鍏ュ悜閲忕储寮曞埌鍚戦噺鏁版嵁搴?
-        
-        鍙傛暟:
-            embedding_file: 宓屽叆鍚戦噺鏂囦欢璺緞
-            config: 鍚戦噺鏁版嵁搴撻厤缃璞?
-            
-        杩斿洖:
-            绱㈠紩缁撴灉淇℃伅瀛楀吀
+        将 embedding 文件索引到向量数据库。
+
+        参数:
+            embedding_file: embedding 文件路径
+            config: 向量数据库配置对象
+
+        返回:
+            索引结果信息字典
         """
         start_time = datetime.now()
         
-        # 璇诲彇embedding鏂囦欢
+                # 读取 embedding 文件
         embeddings_data = self._load_embeddings(embedding_file)
         
-        # 鏍规嵁涓嶅悓鐨勬暟鎹簱杩涜绱㈠紩
+        # 根据提供商选择索引方法
         if config.provider == VectorDBProvider.MILVUS:
             result = self._index_to_milvus(embeddings_data, config)
         
@@ -123,13 +160,13 @@ class VectorStoreService:
     
     def _load_embeddings(self, file_path: str) -> Dict[str, Any]:
         """
-        鍔犺浇embedding鏂囦欢锛岃繑鍥為厤缃俊鎭拰embeddings
-        
-        鍙傛暟:
-            file_path: 宓屽叆鍚戦噺鏂囦欢璺緞
-            
-        杩斿洖:
-            鍖呭惈宓屽叆鍚戦噺鍜屽厓鏁版嵁鐨勫瓧鍏?
+        加载 embedding 文件，返回配置和 embeddings。
+
+        参数:
+            file_path: embedding 文件路径
+
+        返回:
+            包含 embedding 数据和顶层配置的字典
         """
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -139,7 +176,7 @@ class VectorStoreService:
                 if not isinstance(data, dict) or "embeddings" not in data:
                     raise ValueError("Invalid embedding file format: missing 'embeddings' key")
                     
-                # 杩斿洖瀹屾暣鐨勬暟鎹紝鍖呮嫭椤跺眰閰嶇疆
+                # 返回完整数据，包括顶层配置
                 logger.info(f"Found {len(data['embeddings'])} embeddings")
                 return data
                 
@@ -149,55 +186,56 @@ class VectorStoreService:
     
     def _index_to_milvus(self, embeddings_data: Dict[str, Any], config: VectorDBConfig) -> Dict[str, Any]:
         """
-        灏嗗祵鍏ュ悜閲忕储寮曞埌Milvus鏁版嵁搴?
-        
-        鍙傛暟:
-            embeddings_data: 宓屽叆鍚戦噺鏁版嵁
-            config: 鍚戦噺鏁版嵁搴撻厤缃璞?
-            
-        杩斿洖:
-            绱㈠紩缁撴灉淇℃伅瀛楀吀
+        将 embedding 数据索引到 Milvus。
+
+        参数:
+            embeddings_data: embedding 数据
+            config: 向量数据库配置对象
+
+        返回:
+            索引结果信息字典
         """
         try:
-            # 浣跨敤 filename 浣滀负 collection 鍚嶇О鍓嶇紑
+            # 使用 filename 作为 collection 名称前缀
             filename = embeddings_data.get("filename", "")
-            # 濡傛灉鏈?.pdf 鍚庣紑锛岀Щ闄ゅ畠
+            # 如果有 .pdf 后缀则去掉
             base_name = filename.replace('.pdf', '') if filename else "doc"
             
-            # Convert Chinese characters to pinyin
+            # 将中文文件名转换为拼音，避免 Milvus collection 名称非法
             base_name = ''.join(lazy_pinyin(base_name, style=Style.NORMAL))
             
-            # Replace hyphens and dots with underscores in the base name
+            # 把连字符和点号替换为下划线
             base_name = base_name.replace('-', '_').replace('.', '_')
             
-            # Ensure the collection name starts with a letter or underscore
+            # 确保 collection 名称以字母或下划线开头
             if not base_name[0].isalpha() and base_name[0] != '_':
                 base_name = f"_{base_name}"
             
-            # Get embedding provider
+            # 生成 collection 名称
             embedding_provider = embeddings_data.get("embedding_provider", "unknown")
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            collection_name = f"{base_name}_{embedding_provider}_{timestamp}"
+            collection_name = normalize_collection_name(f"{base_name}_{embedding_provider}_{timestamp}")
             
-            # 杩炴帴鍒癕ilvus
+            # 连接 Milvus
             connections.connect(
                 alias="default", 
                 uri=config.milvus_uri
             )
             
-            # 浠庨《灞傞厤缃幏鍙栧悜閲忕淮搴?
+            # 从配置中读取向量维度
             vector_dim = int(embeddings_data.get("vector_dimension"))
             if not vector_dim:
                 raise ValueError("Missing vector_dimension in embedding file")
             
             logger.info(f"Creating collection with dimension: {vector_dim}")
             
-            # 瀹氫箟瀛楁
+            # 定义 collection 字段
             fields = [
                 {"name": "id", "dtype": "INT64", "is_primary": True, "auto_id": True},
                 {"name": "content", "dtype": "VARCHAR", "max_length": CONTENT_MAX_LENGTH},
                 {"name": "document_name", "dtype": "VARCHAR", "max_length": 255},
-                # 杩欓噷鍗曠嫭瀛?source锛屽悗闈?QA / 妫€绱㈠睍绀烘椂鍙互鐩存帴鍥炲埌鍘熷 PDF 鏂囦欢鍚嶃€?                {"name": "source", "dtype": "VARCHAR", "max_length": 255},
+                # 单独保留 source，方便 QA / 检索时直接回溯到原始 PDF 文件名
+                {"name": "source", "dtype": "VARCHAR", "max_length": 255},
                 {"name": "chunk_id", "dtype": "INT64"},
                 {"name": "chunk_index", "dtype": "INT64"},
                 {"name": "parent_chunk_id", "dtype": "INT64"},
@@ -205,7 +243,8 @@ class VectorStoreService:
                 {"name": "total_chunks", "dtype": "INT64"},
                 {"name": "word_count", "dtype": "INT64"},
                 {"name": "page_number", "dtype": "VARCHAR", "max_length": 10},
-                # page_start / page_end 棰勭暀缁欐湭鏉ヨ法椤?chunk锛岀洰鍓嶉〉鍐呭垏鍒嗘椂涓よ€呯浉鍚屻€?                {"name": "page_start", "dtype": "INT64"},
+                # page_start / page_end 预留给未来跨页 chunk 使用，目前页内切分时两者相同
+                {"name": "page_start", "dtype": "INT64"},
                 {"name": "page_end", "dtype": "INT64"},
                 {"name": "page_range", "dtype": "VARCHAR", "max_length": 10},
                 {"name": "subchunk_index", "dtype": "INT64"},
@@ -226,7 +265,7 @@ class VectorStoreService:
                 }
             ]
             
-            # 鍑嗗鏁版嵁涓哄垪琛ㄦ牸寮?
+            # 准备写入 collection 的实体数据
             entities = []
             for emb in embeddings_data["embeddings"]:
                 metadata = emb["metadata"]
@@ -239,7 +278,7 @@ class VectorStoreService:
                     metadata.get("subchunk_label", f"chunk {parent_chunk_id} part {subchunk_index}/{subchunk_count}")
                 )
 
-                # 鍏ュ簱鍓嶆妸椤电爜銆佹潵婧愬拰 chunk 搴忓彿缁熶竴钀藉埌鍚戦噺搴撳瓧娈甸噷锛岄伩鍏嶅悗缁绱涪淇℃伅銆?
+                # 入库前把页码、来源和 chunk 序号统一落到向量库字段里，方便后续检索回溯
                 page_start = int(metadata.get("page_start", metadata.get("page_number", 0)))
                 page_end = int(metadata.get("page_end", page_start))
                 source = str(metadata.get("source", embeddings_data.get("filename", "")))
@@ -278,7 +317,7 @@ class VectorStoreService:
             
             logger.info(f"Creating Milvus collection: {collection_name}")
             
-            # 鍒涘缓collection
+            # 创建 collection
             # field_schemas = [
             #     FieldSchema(name=field["name"], 
             #                dtype=getattr(DataType, field["dtype"]),
@@ -311,7 +350,7 @@ class VectorStoreService:
             schema = CollectionSchema(fields=field_schemas, description=f"Collection for {collection_name}")
             collection = Collection(name=collection_name, schema=schema)
             
-            # 鎻掑叆鏁版嵁
+            # 插入数据
             logger.info(f"Inserting {len(entities)} vectors")
             insertable_fields = [field.name for field in collection.schema.fields if not getattr(field, "auto_id", False)]
             normalized_entities = [
@@ -325,7 +364,7 @@ class VectorStoreService:
             ]
             insert_result = collection.insert(insert_columns)
             
-            # 鍒涘缓绱㈠紩
+            # 创建索引
             index_params = {
                 "metric_type": "COSINE",
                 "index_type": self._get_milvus_index_type(config),
@@ -375,13 +414,7 @@ class VectorStoreService:
 
     def list_collections(self, provider: str) -> List[str]:
         """
-        鍒楀嚭鎸囧畾鎻愪緵鍟嗙殑鎵€鏈夐泦鍚?
-        
-        鍙傛暟:
-            provider: 鍚戦噺鏁版嵁搴撴彁渚涘晢
-            
-        杩斿洖:
-            闆嗗悎鍚嶇О鍒楄〃
+        列出指定提供商的所有 collection。
         """
         if provider == VectorDBProvider.MILVUS:
             try:
@@ -394,41 +427,33 @@ class VectorStoreService:
 
     def delete_collection(self, provider: str, collection_name: str) -> bool:
         """
-        鍒犻櫎鎸囧畾鐨勯泦鍚?
-        
-        鍙傛暟:
-            provider: 鍚戦噺鏁版嵁搴撴彁渚涘晢
-            collection_name: 闆嗗悎鍚嶇О
-            
-        杩斿洖:
-            鏄惁鍒犻櫎鎴愬姛
+        删除指定 collection。
         """
         if provider == VectorDBProvider.MILVUS:
             try:
                 connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
-                utility.drop_collection(collection_name)
-                return True
+                resolved_name = self.resolve_collection_name(collection_name)
+                if utility.has_collection(resolved_name):
+                    utility.drop_collection(resolved_name)
+                    return True
+                return False
             finally:
                 connections.disconnect("default")
         return False
 
     def get_collection_info(self, provider: str, collection_name: str) -> Dict[str, Any]:
         """
-        鑾峰彇鎸囧畾闆嗗悎鐨勪俊鎭?
-        
-        鍙傛暟:
-            provider: 鍚戦噺鏁版嵁搴撴彁渚涘晢
-            collection_name: 闆嗗悎鍚嶇О
-            
-        杩斿洖:
-            闆嗗悎淇℃伅瀛楀吀
+        获取指定 collection 的信息。
         """
         if provider == VectorDBProvider.MILVUS:
             try:
                 connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
-                collection = Collection(collection_name)
+                resolved_name = self.resolve_collection_name(collection_name)
+                if not utility.has_collection(resolved_name):
+                    return {}
+                collection = Collection(resolved_name)
                 return {
-                    "name": collection_name,
+                    "name": resolved_name,
                     "num_entities": collection.num_entities,
                     "schema": collection.schema.to_dict()
                 }
@@ -438,21 +463,28 @@ class VectorStoreService:
 
     def insert_single_embedding(self, collection_name: str, embedding: List[float], metadata: Dict[str, Any]) -> int:
         """
-        鎻掑叆鍗曚釜宓屽叆鍚戦噺鍒版寚瀹氶泦鍚?
-        
-        鍙傛暟:
-            collection_name: 闆嗗悎鍚嶇О
-            embedding: 宓屽叆鍚戦噺
-            metadata: 鍏冩暟鎹瓧鍏革紝鍖呭惈content, arxiv_id, title绛変俊鎭?
-            
-        杩斿洖:
-            鎻掑叆鐨勫悜閲廔D锛坧rimary key锛?
+        将单个 embedding 插入到指定 collection。
         """
         try:
             connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
+            resolved_name = normalize_collection_name(collection_name)
             
-            if utility.has_collection(collection_name):
-                collection = Collection(collection_name)
+            if utility.has_collection(resolved_name):
+                collection = Collection(resolved_name)
+                vector_field = next((field for field in collection.schema.fields if field.name == "vector"), None)
+                existing_dim = None
+                if vector_field is not None:
+                    existing_dim = getattr(vector_field, "dim", None)
+                    if existing_dim is None:
+                        params = getattr(vector_field, "params", None)
+                        if isinstance(params, dict):
+                            existing_dim = params.get("dim")
+                if existing_dim and int(existing_dim) != len(embedding):
+                    raise ValueError(
+                        f"Collection '{resolved_name}' already uses vector dimension {existing_dim}, "
+                        f"but the new embedding has dimension {len(embedding)}. "
+                        "Rebuild the collection or keep the embedding model/dimension consistent."
+                    )
             else:
                 vector_dim = len(embedding)
                 fields = [
@@ -468,7 +500,7 @@ class VectorStoreService:
                     FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=vector_dim)
                 ]
                 schema = CollectionSchema(fields=fields, description=f"arXiv paper abstract embeddings collection")
-                collection = Collection(name=collection_name, schema=schema)
+                collection = Collection(name=resolved_name, schema=schema)
                 
                 index_params = {
                     "metric_type": "COSINE",
@@ -504,16 +536,18 @@ class VectorStoreService:
 
     def search_similar_vectors(self, collection_name: str, query_vector: List[float], top_k: int = 10, filter_arxiv_ids: List[str] = None) -> List[Dict[str, Any]]:
         """
-        鎼滅储 chunk 绾у悜閲忥紝骞舵妸椤电爜淇℃伅涓€骞惰繑鍥炪€?
-        杩欐牱 QA 鐢熸垚绛旀鏃跺氨鑳界洿鎺ュ甫鍑烘潵婧愰〉鐮侊紝鑰屼笉鏄彧缁欎竴娈典笉鐭ュ嚭澶勭殑鏂囨湰銆?        """
+        检索 chunk 级向量，并把页码等溯源信息一起返回。
+        这样生成答案时就能直接带出来源页码，而不是只给一段不知道出处的文本。
+        """
         try:
             connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
+            resolved_name = self.resolve_collection_name(collection_name)
 
-            if not utility.has_collection(collection_name):
+            if not utility.has_collection(resolved_name):
                 logger.warning(f"Collection {collection_name} does not exist")
                 return []
 
-            collection = Collection(collection_name)
+            collection = Collection(resolved_name)
             collection.load()
 
             field_names = {field.name for field in collection.schema.fields}
@@ -582,12 +616,13 @@ class VectorStoreService:
     def get_all_chunks(self, collection_name: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         try:
             connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
+            resolved_name = self.resolve_collection_name(collection_name)
 
-            if not utility.has_collection(collection_name):
+            if not utility.has_collection(resolved_name):
                 logger.warning(f"Collection {collection_name} does not exist")
                 return []
 
-            collection = Collection(collection_name)
+            collection = Collection(resolved_name)
             collection.load()
 
             field_names = {field.name for field in collection.schema.fields}
@@ -623,7 +658,12 @@ class VectorStoreService:
                 "url",
             ]
             output_fields = [field for field in candidate_fields if field in field_names]
-            query_limit = limit or collection.num_entities
+            query_limit = limit if limit is not None else collection.num_entities
+            if query_limit <= 0:
+                logger.warning(
+                    f"Collection {collection_name} has no entities or requested limit is non-positive: {query_limit}"
+                )
+                return []
             entities = collection.query(
                 expr="id >= 0",
                 output_fields=output_fields,
@@ -724,4 +764,3 @@ class VectorStoreService:
             "metadata": metadata,
         }
         return payload
-

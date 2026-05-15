@@ -17,11 +17,11 @@ from services.database_service import DatabaseService
 from services.enhanced_retrieval_service import EnhancedRetrievalService, RetrievalOptions
 import logging
 from enum import Enum
-from utils.config import VectorDBProvider
+from utils.config import CORE_CONFIG, VectorDBProvider
 import pandas as pd
 from pathlib import Path
 from services.generation_service import GenerationService
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import requests
 from pydantic import BaseModel
 
@@ -62,8 +62,8 @@ app.add_middleware(
 )
 
 # 数据源配置
-DATA_SOURCE = os.environ.get("ARXIV_DATA_SOURCE", "local")  
-LOCAL_DATA_PATH = os.environ.get("ARXIV_LOCAL_PATH", r"D:\极客时间大模型RAG进阶实战营\rag-project01-framework\07-local-arxiv\arxiv-2026-04-papers.json")
+DATA_SOURCE = CORE_CONFIG["arxiv_data_source"]
+LOCAL_DATA_PATH = CORE_CONFIG["arxiv_local_path"]
 
 # 初始化服务
 db_service = DatabaseService()
@@ -79,6 +79,24 @@ enhanced_retrieval_service = EnhancedRetrievalService(
 # 初始化 arXiv 服务
 local_arxiv_service = LocalArxivService(data_path=LOCAL_DATA_PATH)
 
+
+def get_current_embedding_config() -> EmbeddingConfig:
+    return embedding_service.get_default_embedding_config()
+
+
+def embed_text_with_current_config(text: str) -> tuple[list, EmbeddingConfig]:
+    config = get_current_embedding_config()
+    embedding = embedding_service.create_single_embedding(
+        text,
+        provider=config.provider,
+        model=config.model_name,
+        api_key=config.api_key,
+        base_url=config.base_url,
+        dimension=config.dimension,
+    )
+    return embedding, config
+
+
 def get_arxiv_service():
     """根据配置获取当前使用的 arXiv 服务"""
     if DATA_SOURCE == "api":
@@ -93,6 +111,7 @@ class QaRequest(BaseModel):
     enable_query_rewrite: Optional[bool] = None
     enable_hyde: Optional[bool] = None
     enable_keyword_search: Optional[bool] = None
+    enable_llm_rerank: Optional[bool] = None
     debug: Optional[bool] = None
 
 
@@ -106,10 +125,11 @@ def build_qa_context(arxiv_id: str, payload: QaRequest):
         collection_name=collection_name,
         user_query=payload.question.strip(),
         options=RetrievalOptions(
-            top_k=payload.top_k or 5,
+            top_k=payload.top_k or 15,
             enable_query_rewrite=payload.enable_query_rewrite,
             enable_hyde=payload.enable_hyde,
             enable_keyword_search=payload.enable_keyword_search,
+            enable_llm_rerank=payload.enable_llm_rerank,
             debug=payload.debug,
         ),
     )
@@ -120,6 +140,74 @@ def build_qa_context(arxiv_id: str, payload: QaRequest):
 
     context = "\n\n".join([result.get('content', '') for result in search_results])
     return qa_index, search_results, context, retrieval_result.get("debug")
+
+
+def build_qa_diagnostic(arxiv_id: str, sample_limit: int = 3) -> Dict[str, Any]:
+    qa_index = db_service.get_paper_qa_index(arxiv_id)
+    all_collections = vector_store_service.list_collections(VectorDBProvider.MILVUS.value)
+
+    diagnostic: Dict[str, Any] = {
+        "arxiv_id": arxiv_id,
+        "qa_index": qa_index,
+        "milvus": {
+            "provider": VectorDBProvider.MILVUS.value,
+            "collections": all_collections,
+        },
+        "collection": None,
+        "sample_chunks": [],
+        "checks": {},
+    }
+
+    if not qa_index:
+        diagnostic["checks"] = {
+            "has_qa_index": False,
+            "collection_exists": False,
+            "entity_count_matches_metadata": False,
+        }
+        return diagnostic
+
+    collection_name = qa_index.get("collection_name", "")
+    collection_exists = vector_store_service.collection_exists(VectorDBProvider.MILVUS.value, collection_name)
+    collection_info = {}
+    sample_chunks: List[Dict[str, Any]] = []
+    collection_error: Optional[str] = None
+
+    if collection_name and collection_exists:
+        try:
+            collection_info = vector_store_service.get_collection_info(VectorDBProvider.MILVUS.value, collection_name)
+            num_entities = int(collection_info.get("num_entities") or 0)
+            if num_entities > 0:
+                sample_chunks = vector_store_service.get_all_chunks(
+                    collection_name,
+                    limit=min(max(sample_limit, 1), num_entities),
+                )
+        except Exception as exc:
+            collection_error = str(exc)
+    elif collection_name:
+        collection_error = "collection_name not found in Milvus list_collections()"
+
+    num_entities = int(collection_info.get("num_entities") or 0)
+    chunk_count = int(qa_index.get("chunk_count") or 0)
+
+    diagnostic["collection"] = {
+        "name": collection_name,
+        "exists_in_milvus": collection_exists,
+        "info": collection_info or None,
+        "error": collection_error,
+    }
+    diagnostic["sample_chunks"] = sample_chunks
+    diagnostic["checks"] = {
+        "has_qa_index": True,
+        "indexed_status": qa_index.get("status") == "indexed",
+        "collection_exists": collection_exists,
+        "qa_chunk_count": chunk_count,
+        "milvus_num_entities": num_entities,
+        "entity_count_matches_metadata": chunk_count == num_entities,
+        "milvus_has_entities": num_entities > 0,
+        "sample_chunks_returned": len(sample_chunks),
+        "likely_keyword_search_will_work": collection_exists and num_entities > 0,
+    }
+    return diagnostic
 
 
 # arXiv 论文搜索接口
@@ -356,14 +444,22 @@ async def generate_user_interest_vector(
         logger.info(f"Found {len(liked_papers)} liked papers for user {user_id}")
         
         embeddings = []
-        embedding_model = "Qwen3-VL-Embedding-2B (local)"
+        embedding_config = get_current_embedding_config()
+        embedding_model = embedding_config.model_name
         
         for paper in liked_papers:
             title = paper.get('title', '')
             abstract = paper.get('abstract', '')
             text_to_embed = f"{title}\n\n摘要：{abstract}"
             
-            embedding = embedding_service.create_single_embedding_local(text_to_embed)
+            embedding = embedding_service.create_single_embedding(
+                text_to_embed,
+                provider=embedding_config.provider,
+                model=embedding_config.model_name,
+                api_key=embedding_config.api_key,
+                base_url=embedding_config.base_url,
+                dimension=embedding_config.dimension,
+            )
             embeddings.append(embedding)
         
         if not embeddings:
@@ -485,19 +581,30 @@ async def add_paper(
     collection_name: str = Body("arxiv_abstracts")
 ):
     """
-    添加论文元数据，并自动使用本地Qwen3-VL-Embedding-2B模型生成embedding
+    添加论文元数据，并自动使用当前配置的 embedding 模型生成 embedding
     将embedding向量存储到向量数据库，并将embedding_id保存到SQLite
     """
     try:
         logger.info(f"Adding paper with embedding: {arxiv_id}")
         
-        logger.info("Creating embedding for abstract using local Qwen3-VL-Embedding-2B model")
+        embedding_config = get_current_embedding_config()
+        logger.info(
+            "Creating embedding for abstract using %s / %s",
+            embedding_config.provider,
+            embedding_config.model_name,
+        )
         text_to_embed = f"{title}\n\n摘要：{abstract}"
-        embedding = embedding_service.create_single_embedding_local(text_to_embed)
+        embedding = embedding_service.create_single_embedding(
+            text_to_embed,
+            provider=embedding_config.provider,
+            model=embedding_config.model_name,
+            api_key=embedding_config.api_key,
+            base_url=embedding_config.base_url,
+            dimension=embedding_config.dimension,
+        )
         
         logger.info(f"Embedding created, dimension: {len(embedding)}")
         
-        local_model_name = "Qwen3-VL-Embedding-2B (local)"
         metadata = {
             "content": abstract,
             "arxiv_id": arxiv_id,
@@ -506,7 +613,7 @@ async def add_paper(
             "categories": categories,
             "published_date": published_date,
             "url": url,
-            "embedding_model": local_model_name
+            "embedding_model": embedding_config.model_name
         }
         
         logger.info(f"Inserting embedding to collection: {collection_name}")
@@ -526,7 +633,7 @@ async def add_paper(
             'published_date': published_date,
             'url': url,
             'embedding_id': str(embedding_id),
-            'embedding_model': local_model_name
+            'embedding_model': embedding_config.model_name
         })
         
         if success:
@@ -536,7 +643,7 @@ async def add_paper(
                 "message": "Paper added with embedding",
                 "arxiv_id": arxiv_id,
                 "embedding_id": embedding_id,
-                "embedding_model": local_model_name,
+                "embedding_model": embedding_config.model_name,
                 "vector_dimension": len(embedding),
                 "collection_name": collection_name
             }
@@ -618,6 +725,16 @@ async def get_paper_qa_status(arxiv_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/paper/{arxiv_id}/qa-diagnose")
+async def diagnose_paper_qa(arxiv_id: str, sample_limit: int = Query(3, ge=0, le=20)):
+    """返回论文 QA 索引与 Milvus 现场状态的诊断信息。"""
+    try:
+        return build_qa_diagnostic(arxiv_id, sample_limit=sample_limit)
+    except Exception as e:
+        logger.error(f"Error diagnosing paper QA: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/paper/{arxiv_id}/create-qa-index")
 async def create_paper_qa_index(arxiv_id: str):
     """
@@ -666,8 +783,12 @@ async def create_paper_qa_index(arxiv_id: str):
         )
         logger.info(f"Chunked document saved to: {chunk_file}")
         
-        embedding_config = EmbeddingConfig(provider="local", model_name="Qwen3-VL-Embedding-2B")
-        logger.info("Creating embeddings with local Qwen3-VL-Embedding-2B model...")
+        embedding_config = get_current_embedding_config()
+        logger.info(
+            "Creating embeddings with %s / %s...",
+            embedding_config.provider,
+            embedding_config.model_name,
+        )
         
         input_data = {
             'chunks': chunks,
@@ -691,7 +812,7 @@ async def create_paper_qa_index(arxiv_id: str):
             collection_name=collection_name,
             status='indexed',
             chunk_count=len(chunks),
-            embedding_model="Qwen3-VL-Embedding-2B",
+            embedding_model=embedding_config.model_name,
             pdf_path=pdf_path
         )
         
@@ -701,7 +822,7 @@ async def create_paper_qa_index(arxiv_id: str):
             "arxiv_id": arxiv_id,
             "collection_name": collection_name,
             "chunk_count": len(chunks),
-            "embedding_model": "Qwen3-VL-Embedding-2B",
+            "embedding_model": embedding_config.model_name,
             "pdf_path": pdf_path,
             "chunk_file": chunk_file
         }

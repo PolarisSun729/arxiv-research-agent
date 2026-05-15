@@ -276,6 +276,54 @@ export async function getPaperQaStatus(arxivId: string): Promise<QaStatusResult>
   return request.get(`/paper/${arxivId}/qa-status`)
 }
 
+export interface QaDiagnosticCollectionInfo {
+  name?: string
+  exists_in_milvus?: boolean
+  info?: {
+    name?: string
+    num_entities?: number
+    schema?: Record<string, any>
+  } | null
+  error?: string | null
+}
+
+export interface QaDiagnosticResult {
+  arxiv_id: string
+  qa_index: QaStatusResult | null
+  milvus: {
+    provider: string
+    collections: string[]
+  }
+  collection: QaDiagnosticCollectionInfo | null
+  sample_chunks: Array<{
+    id?: number
+    content?: string
+    page_number?: string
+    page_range?: string
+    chunk_id?: number
+    chunk_index?: number
+    subchunk_label?: string
+    source?: string
+  }>
+  checks: {
+    has_qa_index?: boolean
+    indexed_status?: boolean
+    collection_exists?: boolean
+    qa_chunk_count?: number
+    milvus_num_entities?: number
+    entity_count_matches_metadata?: boolean
+    milvus_has_entities?: boolean
+    sample_chunks_returned?: number
+    likely_keyword_search_will_work?: boolean
+  }
+}
+
+export async function getPaperQaDiagnostic(arxivId: string, sampleLimit: number = 3): Promise<QaDiagnosticResult> {
+  return request.get(`/paper/${arxivId}/qa-diagnose`, {
+    params: { sample_limit: sampleLimit }
+  })
+}
+
 export interface CreateQaIndexResult {
   status: string
   message: string
@@ -309,6 +357,7 @@ export interface QaRequestOptions {
   enable_query_rewrite?: boolean
   enable_hyde?: boolean
   enable_keyword_search?: boolean
+  enable_llm_rerank?: boolean
   debug?: boolean
 }
 
@@ -321,16 +370,62 @@ export interface RetrievalDebugChunk {
   route_score?: number
   retrieval_route?: string
   matched_routes?: string[]
+  route_scores?: Record<string, number>
   source_query?: string
   source_queries?: string[]
   subchunk_label?: string
   preview?: string
 }
 
+export interface RetrievalDebugQueryDetail {
+  query: string
+  keywords: string[]
+  keyword_count?: number
+}
+
+export interface RetrievalDebugQueryCandidate {
+  query: string
+  source?: 'model' | 'heuristic' | string
+  source_index?: number
+  normalized?: string
+  selected?: boolean
+  reason?: string
+}
+
+export interface RetrievalDebugQueryRewrite {
+  enabled?: boolean
+  original_query?: string
+  model_queries?: string[]
+  heuristic_queries?: string[]
+  selected_queries?: string[]
+  selected_keywords?: string[]
+  selected_query_details?: RetrievalDebugQueryDetail[]
+  candidates?: RetrievalDebugQueryCandidate[]
+  llm_error?: string | null
+}
+
+export interface RetrievalDebugHyde {
+  enabled?: boolean
+  text?: string
+  source_queries?: string[]
+  focus_queries?: string[]
+}
+
+export interface RetrievalDebugKeywordSearch {
+  enabled?: boolean
+  queries?: string[]
+  selected_rewrite_queries?: string[]
+  query_details?: RetrievalDebugQueryDetail[]
+  keywords?: string[]
+}
+
 export interface RetrievalDebug {
   original_query: string
   rewritten_queries: string[]
   hyde_text: string
+  query_rewrite?: RetrievalDebugQueryRewrite
+  hyde?: RetrievalDebugHyde
+  keyword_search?: RetrievalDebugKeywordSearch
   routes: Record<string, RetrievalDebugChunk[]>
   final_chunks: RetrievalDebugChunk[]
   config?: Record<string, any>

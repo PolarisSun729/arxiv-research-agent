@@ -1,43 +1,192 @@
-import os
-import dotenv
-
-dotenv.load_dotenv()
-
 import json
 from datetime import datetime
+import logging
 from enum import Enum
+from typing import Optional
+import os
 import torch
 from utils.model_utils import get_huggingface_model_path
 import numpy as np
 import sys
+import requests
+from utils.config import EMBEDDING_CONFIG
+
+logger = logging.getLogger(__name__)
 
 class EmbeddingProvider(str, Enum):
     OPENAI = "openai"
     BEDROCK = "bedrock"
     HUGGINGFACE = "huggingface"
     MODELSCOPE = "modelscope"
+    DASHSCOPE = "dashscope"
     LOCAL = "local"
 
 
 class EmbeddingConfig:
-    def __init__(self, provider: str, model_name: str):
+    def __init__(
+        self,
+        provider: str,
+        model_name: str,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        dimension: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        enable_fusion: bool = False,
+    ):
         self.provider = provider
         self.model_name = model_name
+        self.api_key = api_key
+        self.base_url = base_url
+        self.dimension = dimension
+        self.batch_size = batch_size
+        self.enable_fusion = enable_fusion
         self.aws_region = "ap-southeast-1"
+
+    @classmethod
+    def from_env(
+        cls,
+        provider: Optional[str] = None,
+        model_name: Optional[str] = None,
+    ) -> "EmbeddingConfig":
+        normalized_provider = str(provider or EMBEDDING_CONFIG["provider"]).strip().lower()
+        normalized_model = str(model_name or EMBEDDING_CONFIG["model_name"]).strip()
+
+        if normalized_provider == EmbeddingProvider.DASHSCOPE.value:
+            return cls(
+                provider=normalized_provider,
+                model_name=normalized_model or EMBEDDING_CONFIG["model_name"],
+                api_key=EMBEDDING_CONFIG["dashscope_api_key"] or EMBEDDING_CONFIG["api_key"],
+                base_url=EMBEDDING_CONFIG["base_url"],
+                dimension=int(EMBEDDING_CONFIG["dimension"]),
+                batch_size=int(EMBEDDING_CONFIG["batch_size"]) or 10,
+            )
+
+        if normalized_provider == EmbeddingProvider.LOCAL.value:
+            return cls(
+                provider=normalized_provider,
+                model_name=normalized_model or EMBEDDING_CONFIG["model_name"],
+                batch_size=int(EMBEDDING_CONFIG["batch_size"]) or 20,
+            )
+
+        if normalized_provider == EmbeddingProvider.OPENAI.value:
+            return cls(
+                provider=normalized_provider,
+                model_name=normalized_model or EMBEDDING_CONFIG["openai_model"],
+                api_key=EMBEDDING_CONFIG["openai_api_key"],
+                base_url=EMBEDDING_CONFIG["openai_base_url"] or None,
+                dimension=int(EMBEDDING_CONFIG["dimension"]) or None,
+                batch_size=int(EMBEDDING_CONFIG["batch_size"]) or 20,
+            )
+
+        return cls(provider=normalized_provider, model_name=normalized_model)
 
 
 class EmbeddingService:
-    LOCAL_EMBEDDING_MODEL_PATH = os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "..",
-        "00-models",
-        "Qwen3-VL-Embedding-2B",
-    )
+    LOCAL_EMBEDDING_MODEL_PATH = EMBEDDING_CONFIG["local_model_path"]
+    LOCAL_EMBEDDING_MODEL_SCRIPTS_PATH = EMBEDDING_CONFIG["local_model_scripts_path"]
+    DASHSCOPE_EMBEDDING_URL = EMBEDDING_CONFIG["base_url"]
+    DEFAULT_LOCAL_MODEL_NAME = EMBEDDING_CONFIG["model_name"]
+    DEFAULT_DASHSCOPE_MODEL_NAME = EMBEDDING_CONFIG["model_name"]
+    DEFAULT_DASHSCOPE_DIMENSION = int(EMBEDDING_CONFIG["dimension"])
 
     def __init__(self):
         self.embedding_factory = EmbeddingFactory()
         self._local_embedder = None
+
+    def get_default_embedding_config(self) -> EmbeddingConfig:
+        return EmbeddingConfig.from_env()
+
+    @staticmethod
+    def _normalize_vector_output(embedding) -> list:
+        if isinstance(embedding, np.ndarray):
+            return embedding.tolist()
+        if isinstance(embedding, torch.Tensor):
+            return embedding.to(dtype=torch.float32).cpu().tolist()
+        if isinstance(embedding, list):
+            return [float(x) for x in embedding]
+        return [float(x) for x in np.asarray(embedding, dtype=np.float32).tolist()]
+
+    def _extract_dashscope_embeddings(self, payload: dict) -> list:
+        output = payload.get("output", {}) if isinstance(payload, dict) else {}
+        candidates = []
+        for source in (
+            output.get("embeddings") if isinstance(output, dict) else None,
+            output.get("data") if isinstance(output, dict) else None,
+            payload.get("embeddings") if isinstance(payload, dict) else None,
+            payload.get("data") if isinstance(payload, dict) else None,
+        ):
+            if source:
+                candidates = source
+                break
+
+        if not candidates and isinstance(output, dict) and "embedding" in output:
+            candidates = [output]
+
+        vectors = []
+        for item in candidates or []:
+            if isinstance(item, dict):
+                vector = (
+                    item.get("embedding")
+                    or item.get("vector")
+                    or item.get("text_embedding")
+                    or item.get("embedding_vector")
+                )
+                if vector is None and "output" in item:
+                    vector = item.get("output")
+                if vector is not None:
+                    vectors.append((int(item.get("index", item.get("text_index", len(vectors)))), self._normalize_vector_output(vector)))
+            elif item is not None:
+                vectors.append((len(vectors), self._normalize_vector_output(item)))
+
+        vectors.sort(key=lambda item: item[0])
+        return [vector for _, vector in vectors]
+
+    def _create_dashscope_embeddings(self, texts: list, config: EmbeddingConfig) -> list:
+        api_key = config.api_key or EMBEDDING_CONFIG["dashscope_api_key"] or EMBEDDING_CONFIG["api_key"]
+        if not api_key:
+            raise ValueError("DashScope API key not provided. Set DASHSCOPE_API_KEY.")
+
+        url = config.base_url or self.DASHSCOPE_EMBEDDING_URL
+        payload = {
+            "model": config.model_name,
+            "input": {
+                "contents": [{"text": text} for text in texts],
+            },
+            "parameters": {
+                "dimension": int(config.dimension or self.DEFAULT_DASHSCOPE_DIMENSION),
+            },
+        }
+        if config.enable_fusion:
+            payload["parameters"]["enable_fusion"] = True
+
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=180,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        vectors = self._extract_dashscope_embeddings(data)
+        if not vectors:
+            raise ValueError(f"DashScope embedding response did not contain vectors: {data}")
+        if len(vectors) == len(texts):
+            return vectors
+        if len(texts) == 1:
+            return [vectors[0]]
+        logger.warning(
+            "DashScope returned %s vectors for %s inputs; falling back to single-item requests",
+            len(vectors),
+            len(texts),
+        )
+        return [self._create_dashscope_embedding(text, config) for text in texts]
+
+    def _create_dashscope_embedding(self, text: str, config: EmbeddingConfig) -> list:
+        return self._create_dashscope_embeddings([text], config)[0]
 
     @property
     def local_embedder(self):
@@ -48,7 +197,7 @@ class EmbeddingService:
     def _load_local_qwen3_embedding_model(self):
         try:
             if os.path.exists(self.LOCAL_EMBEDDING_MODEL_PATH):
-                sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "00-models", "Qwen3-VL-Embedding-2B", "scripts"))
+                sys.path.append(self.LOCAL_EMBEDDING_MODEL_SCRIPTS_PATH)
                 from qwen3_vl_embedding import Qwen3VLEmbedder
                 print(f"Loading local Qwen3-VL-Embedding-2B model from {self.LOCAL_EMBEDDING_MODEL_PATH}...")
                 embedder = Qwen3VLEmbedder(
@@ -73,10 +222,11 @@ class EmbeddingService:
         input_metadata = input_data.get("metadata", {})
         filename = input_metadata.get("filename", "")
 
-        batch_size = 20
+        provider_key = str(config.provider).strip().lower()
+        batch_size = int(config.batch_size or (10 if provider_key == EmbeddingProvider.DASHSCOPE.value else 20))
         results = []
 
-        if config.provider == EmbeddingProvider.LOCAL:
+        if provider_key == EmbeddingProvider.LOCAL.value:
             if self.local_embedder is None:
                 raise ValueError("Local Qwen3-VL-Embedding-2B model not loaded")
 
@@ -89,17 +239,39 @@ class EmbeddingService:
                             chunk=chunk,
                             chunk_count=len(chunks),
                             embedding_vector=embedding_vector,
-                            provider=config.provider,
-                            model="Qwen3-VL-Embedding-2B",
+                            provider=provider_key,
+                            model=config.model_name,
                             filename=filename,
                         ),
                     }
                 )
             return results, {}
 
+        if provider_key == EmbeddingProvider.DASHSCOPE.value:
+            for i in range(0, len(chunks), batch_size):
+                batch = chunks[i : i + batch_size]
+                texts = [chunk.get("content", "") for chunk in batch]
+                embedding_vectors = self._create_dashscope_embeddings(texts, config)
+
+                for chunk, embedding_vector in zip(batch, embedding_vectors):
+                    results.append(
+                        {
+                            "embedding": embedding_vector,
+                            "metadata": self._build_embedding_metadata(
+                                chunk=chunk,
+                                chunk_count=len(chunks),
+                                embedding_vector=embedding_vector,
+                                provider=provider_key,
+                                model=config.model_name,
+                                filename=filename,
+                            ),
+                        }
+                    )
+            return results, {}
+
         embedding_function = self.embedding_factory.create_embedding_function(config)
 
-        if config.provider == EmbeddingProvider.OPENAI:
+        if provider_key == EmbeddingProvider.OPENAI.value:
             for i in range(0, len(chunks), batch_size):
                 batch = chunks[i : i + batch_size]
                 texts = [chunk.get("content", "") for chunk in batch]
@@ -113,7 +285,7 @@ class EmbeddingService:
                                 chunk=chunk,
                                 chunk_count=len(chunks),
                                 embedding_vector=embedding_vector,
-                                provider=config.provider,
+                                provider=provider_key,
                                 model=config.model_name,
                                 filename=filename,
                             ),
@@ -125,15 +297,15 @@ class EmbeddingService:
                 results.append(
                     {
                         "embedding": embedding_vector,
-                        "metadata": self._build_embedding_metadata(
-                            chunk=chunk,
-                            chunk_count=len(chunks),
-                            embedding_vector=embedding_vector,
-                            provider=config.provider,
-                            model=config.model_name,
-                            filename=filename,
-                        ),
-                    }
+                            "metadata": self._build_embedding_metadata(
+                                chunk=chunk,
+                                chunk_count=len(chunks),
+                                embedding_vector=embedding_vector,
+                                provider=provider_key,
+                                model=config.model_name,
+                                filename=filename,
+                            ),
+                        }
                 )
 
         return results, {}
@@ -231,10 +403,47 @@ class EmbeddingService:
 
         return filepath
 
-    def create_single_embedding(self, text: str, provider: str, model: str) -> list:
-        config = EmbeddingConfig(provider=provider, model_name=model)
+    def create_single_embedding(
+        self,
+        text: str,
+        provider: str,
+        model: str,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        dimension: Optional[int] = None,
+    ) -> list:
+        config = EmbeddingConfig(
+            provider=provider,
+            model_name=model,
+            api_key=api_key,
+            base_url=base_url,
+            dimension=dimension,
+        )
+        normalized_provider = str(provider).strip().lower()
+        if normalized_provider == EmbeddingProvider.LOCAL.value:
+            return self.create_single_embedding_local(text)
+        if normalized_provider == EmbeddingProvider.DASHSCOPE.value:
+            return self._create_dashscope_embedding(text, config)
+
         embedding_function = self.embedding_factory.create_embedding_function(config)
         return embedding_function.embed_query(text)
+
+    def create_single_embedding_dashscope(
+        self,
+        text: str,
+        model: str = None,
+        dimension: Optional[int] = None,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+    ) -> list:
+        config = EmbeddingConfig(
+            provider=EmbeddingProvider.DASHSCOPE.value,
+            model_name=model or self.DEFAULT_DASHSCOPE_MODEL_NAME,
+            api_key=api_key or EMBEDDING_CONFIG["dashscope_api_key"] or EMBEDDING_CONFIG["api_key"],
+            base_url=base_url,
+            dimension=dimension or self.DEFAULT_DASHSCOPE_DIMENSION,
+        )
+        return self._create_dashscope_embedding(text, config)
 
     def create_single_embedding_local(self, text: str) -> list:
         if self.local_embedder is None:
@@ -288,6 +497,7 @@ class EmbeddingService:
                             return EmbeddingConfig(
                                 provider=data.get("embedding_provider"),
                                 model_name=data.get("embedding_model"),
+                                dimension=int(data.get("vector_dimension")) if data.get("vector_dimension") else None,
                             )
             raise ValueError(f"No matching embedding configuration found for collection: {collection_name}")
         except Exception as e:
@@ -303,14 +513,14 @@ class EmbeddingFactory:
             bedrock_client = boto3.client(
                 service_name="bedrock-runtime",
                 region_name=config.aws_region,
-                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-                aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+                aws_access_key_id=EMBEDDING_CONFIG["aws_access_key_id"] or None,
+                aws_secret_access_key=EMBEDDING_CONFIG["aws_secret_access_key"] or None,
             )
             return BedrockEmbeddings(client=bedrock_client, model_id=config.model_name)
 
         if config.provider == EmbeddingProvider.OPENAI:
             from langchain_community.embeddings import OpenAIEmbeddings
-            return OpenAIEmbeddings(model=config.model_name, openai_api_key=os.getenv("OPENAI_API_KEY"))
+            return OpenAIEmbeddings(model=config.model_name, openai_api_key=EMBEDDING_CONFIG["openai_api_key"] or None)
 
         if config.provider == EmbeddingProvider.HUGGINGFACE:
             from langchain_community.embeddings import HuggingFaceEmbeddings

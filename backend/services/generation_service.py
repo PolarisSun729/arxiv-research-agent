@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 import re
 from datetime import datetime
@@ -10,34 +10,29 @@ import torch
 from openai import OpenAI
 import requests
 from utils.model_utils import get_huggingface_model_path
-
-# 设置环境变量以启用 Apple Silicon (MPS) 回退到 CPU (当遇到不支持的操作时会自动回退到 CPU 执行)
-# 目前 PyTorch 版本 ≥ 1.13 时，才支持 Apple 的 Metal Performance Shaders (MPS) ，而且暂不支持「多 GPU」，另外，部分训练操作尚未完全实现
+from utils.config import GENERATION_CONFIG
+# 璁剧疆鐜鍙橀噺浠ュ惎鐢?Apple Silicon (MPS) 鍥為€€鍒?CPU (褰撻亣鍒颁笉鏀寔鐨勬搷浣滄椂浼氳嚜鍔ㄥ洖閫€鍒?CPU 鎵ц)
+# 鐩墠 PyTorch 鐗堟湰 鈮?1.13 鏃讹紝鎵嶆敮鎸?Apple 鐨?Metal Performance Shaders (MPS) 锛岃€屼笖鏆備笉鏀寔銆屽 GPU銆嶏紝鍙﹀锛岄儴鍒嗚缁冩搷浣滃皻鏈畬鍏ㄥ疄鐜?
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 logger = logging.getLogger(__name__)
 
-# 阿里云百炼 / 通义千问 API Key。
-# 按你的要求这里直接写在代码里；请替换为你自己的真实 Key。
-QWEN_API_KEY = "<REMOVED_API_KEY>"
-QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-QWEN_MODEL_NAME = "qwen3.6-plus"
+# 闃块噷浜戠櫨鐐?/ 閫氫箟鍗冮棶 API Key銆?
+# 鎸変綘鐨勮姹傝繖閲岀洿鎺ュ啓鍦ㄤ唬鐮侀噷锛涜鏇挎崲涓轰綘鑷繁鐨勭湡瀹?Key銆?
+QWEN_API_KEY = GENERATION_CONFIG["qwen_api_key"]
+QWEN_BASE_URL = GENERATION_CONFIG["qwen_base_url"]
+QWEN_MODEL_NAME = GENERATION_CONFIG["qwen_model_name"]
 
 class GenerationService:
     """
-    生成服务类：负责调用不同的模型提供商（HuggingFace、OpenAI、DeepSeek）生成回答
-    支持本地模型和API调用，并将生成结果保存到文件
+    鐢熸垚鏈嶅姟绫伙細璐熻矗璋冪敤涓嶅悓鐨勬ā鍨嬫彁渚涘晢锛圚uggingFace銆丱penAI銆丏eepSeek锛夌敓鎴愬洖绛?
+    鏀寔鏈湴妯″瀷鍜孉PI璋冪敤锛屽苟灏嗙敓鎴愮粨鏋滀繚瀛樺埌鏂囦欢
     """
     def __init__(self):
         """
-        初始化生成服务，配置支持的模型列表和创建输出目录
+        鍒濆鍖栫敓鎴愭湇鍔★紝閰嶇疆鏀寔鐨勬ā鍨嬪垪琛ㄥ拰鍒涘缓杈撳嚭鐩綍
         """
         self.models = {
-            "huggingface": {
-                "Llama-2-7b-chat": "meta-llama/Llama-2-7b-chat-hf",
-                "DeepSeek-7b": "deepseek-ai/deepseek-llm-7b-chat",
-                "DeepSeek-R1-Distill-Qwen": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-            },
             "openai": {
                 "gpt-3.5-turbo": "gpt-3.5-turbo",
                 "gpt-4": "gpt-4",
@@ -51,19 +46,19 @@ class GenerationService:
             }
         }
         
-        # 确保输出目录存在
+        # 纭繚杈撳嚭鐩綍瀛樺湪
         os.makedirs("05-generation-results", exist_ok=True)
         
     def _load_huggingface_model(self, model_name: str):
         """
-        加载HuggingFace模型
+        鍔犺浇HuggingFace妯″瀷
         
-        参数:
-            model_name: 模型名称，对应self.models["huggingface"]中的键
+        鍙傛暟:
+            model_name: 妯″瀷鍚嶇О锛屽搴攕elf.models["huggingface"]涓殑閿?
             
-        返回:
-            model: 加载的模型
-            tokenizer: 对应的分词器
+        杩斿洖:
+            model: 鍔犺浇鐨勬ā鍨?
+            tokenizer: 瀵瑰簲鐨勫垎璇嶅櫒
         """
         try:
             model_name = self.models["huggingface"][model_name]
@@ -89,29 +84,29 @@ class GenerationService:
         max_length: int = 512
     ) -> str:
         """
-        使用HuggingFace模型生成回答
+        浣跨敤HuggingFace妯″瀷鐢熸垚鍥炵瓟
         
-        参数:
-            model_name: 模型名称
-            query: 用户查询
-            context: 上下文信息
-            max_length: 生成文本的最大长度
+        鍙傛暟:
+            model_name: 妯″瀷鍚嶇О
+            query: 鐢ㄦ埛鏌ヨ
+            context: 涓婁笅鏂囦俊鎭?
+            max_length: 鐢熸垚鏂囨湰鐨勬渶澶ч暱搴?
             
-        返回:
-            生成的回答文本
+        杩斿洖:
+            鐢熸垚鐨勫洖绛旀枃鏈?
         """
         try:
             model, tokenizer = self._load_huggingface_model(model_name)
             
-            # 构建提示
-            prompt = f"""请基于以下上下文回答问题。如果上下文中没有相关信息，请说明无法回答。
+            prompt = f"""Answer the question strictly based on the provided context.
+If the context does not contain enough information, say you cannot determine it.
 
-                        问题：{query}
+Question: {query}
 
-                        上下文：
-                        {context}
+Context:
+{context}
 
-                        回答："""
+Answer:"""
         
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
             outputs = model.generate(
@@ -123,7 +118,7 @@ class GenerationService:
             )
             
             response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            return response.split("回答：")[-1].strip()
+            return response.split("Answer:")[-1].strip()
             
         except Exception as e:
             logger.error(f"Error generating with HuggingFace: {str(e)}")
@@ -137,20 +132,20 @@ class GenerationService:
         api_key: Optional[str] = None
     ) -> str:
         """
-        使用OpenAI API生成回答
+        浣跨敤OpenAI API鐢熸垚鍥炵瓟
         
-        参数:
-            model_name: 模型名称
-            query: 用户查询
-            context: 上下文信息
-            api_key: OpenAI API密钥，如不提供则从环境变量获取
+        鍙傛暟:
+            model_name: 妯″瀷鍚嶇О
+            query: 鐢ㄦ埛鏌ヨ
+            context: 涓婁笅鏂囦俊鎭?
+            api_key: OpenAI API瀵嗛挜锛屽涓嶆彁渚涘垯浠庣幆澧冨彉閲忚幏鍙?
             
-        返回:
-            生成的回答文本
+        杩斿洖:
+            鐢熸垚鐨勫洖绛旀枃鏈?
         """
         try:
             if not api_key:
-                api_key = os.getenv("OPENAI_API_KEY")
+                api_key = GENERATION_CONFIG["openai_api_key"]
                 if not api_key:
                     raise ValueError("OpenAI API key not provided")
                     
@@ -182,14 +177,14 @@ class GenerationService:
         model_name: str = QWEN_MODEL_NAME,
     ) -> str:
         """
-        使用阿里云百炼的 OpenAI 兼容 Responses API 生成答案。
+        浣跨敤闃块噷浜戠櫨鐐肩殑 OpenAI 鍏煎 Responses API 鐢熸垚绛旀銆?
 
-        这里采用 Qwen3.6-Plus，输入为检索到的上下文 + 问题。
+        杩欓噷閲囩敤 Qwen3.6-Plus锛岃緭鍏ヤ负妫€绱㈠埌鐨勪笂涓嬫枃 + 闂銆?
         """
         try:
             if not api_key:
                 api_key = QWEN_API_KEY
-            if not api_key or api_key == "PASTE_YOUR_QWEN_API_KEY_HERE":
+            if not api_key:
                 raise ValueError("Qwen API key not provided")
 
             client = OpenAI(
@@ -198,13 +193,11 @@ class GenerationService:
             )
 
             prompt = (
-                "你是一个严谨的论文问答助手。"
-                "请仅根据给定的论文上下文回答问题；"
-                "如果上下文中没有足够信息，请明确说明无法从当前论文内容中确定。"
-                "\n\n论文上下文：\n"
-                f"{context}\n\n"
-                f"问题：{query}\n\n"
-                "回答："
+                "You are a strict academic QA assistant. Answer only from the provided context.\n"
+                "If the context is insufficient, say you cannot determine it.\n\n"
+                f"Context:\n{context}\n\n"
+                f"Question: {query}\n\n"
+                "Answer:"
             )
 
             response = client.responses.create(
@@ -216,7 +209,7 @@ class GenerationService:
             if answer:
                 return answer.strip()
 
-            # 兜底解析，防止 SDK 返回结构变化时拿不到 output_text。
+            # 鍏滃簳瑙ｆ瀽锛岄槻姝?SDK 杩斿洖缁撴瀯鍙樺寲鏃舵嬁涓嶅埌 output_text銆?
             output_parts = []
             for item in getattr(response, "output", []) or []:
                 if getattr(item, "type", None) == "message":
@@ -328,13 +321,11 @@ class GenerationService:
 
     def _build_qwen_prompt(self, query: str, context: str) -> str:
         return (
-            "你是一个严谨的论文问答助手。"
-            "请仅根据给定的论文上下文回答问题；"
-            "如果上下文中没有足够信息，请明确说明无法从当前论文内容中确定。"
-            "\n\n论文上下文：\n"
-            f"{context}\n\n"
-            f"问题：{query}\n\n"
-            "回答："
+            "You are a strict academic QA assistant. Answer only from the provided context.\n"
+            "If the context is insufficient, say you cannot determine it.\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question: {query}\n\n"
+            "Answer:"
         )
 
     def stream_qwen_responses(
@@ -344,20 +335,14 @@ class GenerationService:
         api_key: Optional[str] = None,
         model_name: str = QWEN_MODEL_NAME,
     ) -> Iterator[Dict[str, Any]]:
-        """
-        使用 Qwen Responses API 的流式输出，逐段返回增量文本。
-        """
+        """Stream a Qwen Responses API answer chunk by chunk."""
         try:
             if not api_key:
                 api_key = QWEN_API_KEY
             if not api_key:
                 raise ValueError("Qwen API key not provided")
 
-            client = OpenAI(
-                api_key=api_key,
-                base_url=QWEN_BASE_URL,
-            )
-
+            client = OpenAI(api_key=api_key, base_url=QWEN_BASE_URL)
             stream = client.responses.create(
                 model=model_name,
                 input=self._build_qwen_prompt(query, context),
@@ -391,7 +376,6 @@ class GenerationService:
                 "answer": "".join(answer_parts),
                 "usage": None,
             }
-
         except Exception as e:
             logger.error(f"Error streaming with Qwen Responses API: {str(e)}")
             raise
@@ -402,60 +386,38 @@ class GenerationService:
         query: str,
         context: str,
         api_key: Optional[str] = None,
-        show_reasoning: bool = True
+        show_reasoning: bool = True,
     ) -> str:
-        """
-        使用DeepSeek API生成回答
-        
-        参数:
-            model_name: 模型名称
-            query: 用户查询
-            context: 上下文信息
-            api_key: DeepSeek API密钥，如不提供则从环境变量获取
-            show_reasoning: 是否显示推理过程（仅对推理模型有效）
-            
-        返回:
-            生成的回答文本，对于推理模型可能包含思维过程
-        """
         try:
             if not api_key:
-                api_key = os.getenv("DEEPSEEK_API_KEY")
-                if not api_key:
-                    raise ValueError("DeepSeek API key not provided")
-                    
-            client = OpenAI(
-                api_key=api_key,
-                base_url="https://api.deepseek.com"
-            )
-            
+                api_key = GENERATION_CONFIG["deepseek_api_key"]
+            if not api_key:
+                raise ValueError("DeepSeek API key not provided")
+
+            client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
             messages = [
                 {"role": "system", "content": "You are a helpful assistant. Use the provided context to answer the question."},
-                {"role": "user", "content": f"Context: {context}\n\nQuestion: {query}"}
+                {"role": "user", "content": f"Context: {context}\n\nQuestion: {query}"},
             ]
-            
             response = client.chat.completions.create(
                 model=self.models["deepseek"][model_name],
                 messages=messages,
                 max_tokens=512,
-                stream=False
+                stream=False,
             )
-            
-            # 如果是推理模型，处理思维链输出
+
             if model_name == "deepseek-r1":
                 message = response.choices[0].message
-                reasoning = message.reasoning_content
+                reasoning = getattr(message, "reasoning_content", None)
                 answer = message.content
-                
                 if show_reasoning and reasoning:
-                    return f"【思维过程】\n{reasoning}\n\n【最终答案】\n{answer}"
+                    return f"[Reasoning]\n{reasoning}\n\n[Answer]\n{answer}"
                 return answer
-            
+
             return response.choices[0].message.content.strip()
-            
         except Exception as e:
             logger.error(f"Error generating with DeepSeek: {str(e)}")
             raise
-
     def generate(
         self,
         provider: str,
@@ -466,39 +428,39 @@ class GenerationService:
         show_reasoning: bool = True
     ) -> Dict:
         """
-        生成回答并保存结果
+        鐢熸垚鍥炵瓟骞朵繚瀛樼粨鏋?
         
-        参数:
-            provider: 模型提供商，可选值为"huggingface"、"openai"、"deepseek"
-            model_name: 模型名称
-            query: 用户查询
-            search_results: 搜索结果列表，用于构建上下文
-            api_key: API密钥（对于API调用）
-            show_reasoning: 是否显示推理过程（仅对DeepSeek推理模型有效）
+        鍙傛暟:
+            provider: 妯″瀷鎻愪緵鍟嗭紝鍙€夊€间负"openai"銆?qwen"銆?deepseek"
+            model_name: 妯″瀷鍚嶇О
+            query: 鐢ㄦ埛鏌ヨ
+            search_results: 鎼滅储缁撴灉鍒楄〃锛岀敤浜庢瀯寤轰笂涓嬫枃
+            api_key: API瀵嗛挜锛堝浜嶢PI璋冪敤锛?
+            show_reasoning: 鏄惁鏄剧ず鎺ㄧ悊杩囩▼锛堜粎瀵笵eepSeek鎺ㄧ悊妯″瀷鏈夋晥锛?
             
-        返回:
-            包含生成回答和保存路径的字典
+        杩斿洖:
+            鍖呭惈鐢熸垚鍥炵瓟鍜屼繚瀛樿矾寰勭殑瀛楀吀
         """
         try:
-            # 准备上下文
+            # 鍑嗗涓婁笅鏂?
             context = "\n\n".join([
                 f"[Source {i+1}]: {result['text']}"
                 for i, result in enumerate(search_results)
             ])
             
-            # 根据不同提供商生成回答
-            if provider == "huggingface":
-                response = self._generate_with_huggingface(model_name, query, context)
-            elif provider == "openai":
+            # 鏍规嵁涓嶅悓鎻愪緵鍟嗙敓鎴愬洖绛?
+            if provider == "openai":
                 response = self._generate_with_openai(model_name, query, context, api_key)
             elif provider == "qwen":
                 response = self._generate_with_qwen_responses(query, context, api_key, model_name)
             elif provider == "deepseek":
                 response = self._generate_with_deepseek(model_name, query, context, api_key, show_reasoning)
+            elif provider == "huggingface":
+                raise ValueError("Local HuggingFace generation has been disabled; use openai, qwen, or deepseek.")
             else:
                 raise ValueError(f"Unsupported provider: {provider}")
                 
-            # 准备保存的结果
+            # 鍑嗗淇濆瓨鐨勭粨鏋?
             result = {
                 "query": query,
                 "timestamp": datetime.now().isoformat(),
@@ -508,7 +470,7 @@ class GenerationService:
                 "context": search_results
             }
             
-            # 生成文件名并保存
+            # 鐢熸垚鏂囦欢鍚嶅苟淇濆瓨
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             filename = f"generation_{provider}_{model_name}_{timestamp}.json"
             filepath = os.path.join("05-generation-results", filename)
@@ -527,9 +489,10 @@ class GenerationService:
 
     def get_available_models(self) -> Dict:
         """
-        获取可用的模型列表
+        鑾峰彇鍙敤鐨勬ā鍨嬪垪琛?
         
-        返回:
-            包含所有支持模型的字典
+        杩斿洖:
+            鍖呭惈鎵€鏈夋敮鎸佹ā鍨嬬殑瀛楀吀
         """
         return self.models 
+

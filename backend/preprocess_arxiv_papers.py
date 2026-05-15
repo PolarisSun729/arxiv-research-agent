@@ -77,7 +77,15 @@ def main():
         
         try:
             text_to_embed = f"{title}\n\n摘要：{abstract}"
-            embedding = embedding_service.create_single_embedding_local(text_to_embed)
+            embedding_config = embedding_service.get_default_embedding_config()
+            embedding = embedding_service.create_single_embedding(
+                text_to_embed,
+                provider=embedding_config.provider,
+                model=embedding_config.model_name,
+                api_key=embedding_config.api_key,
+                base_url=embedding_config.base_url,
+                dimension=embedding_config.dimension,
+            )
             
             published_date = get_published_date(paper)
             url = f"https://arxiv.org/abs/{arxiv_id}"
@@ -90,7 +98,7 @@ def main():
                 "categories": categories,
                 "published_date": published_date,
                 "url": url,
-                "embedding_model": "Qwen3-VL-Embedding-2B (local)"
+                "embedding_model": embedding_config.model_name
             }
             
             embedding_id = vector_store_service.insert_single_embedding(
@@ -108,7 +116,7 @@ def main():
                 'published_date': published_date,
                 'url': url,
                 'embedding_id': str(embedding_id),
-                'embedding_model': 'Qwen3-VL-Embedding-2B (local)'
+                'embedding_model': embedding_config.model_name
             })
             
             if success:
