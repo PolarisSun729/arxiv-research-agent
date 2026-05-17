@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body, Query, Request, Depends
@@ -121,9 +121,18 @@ def build_qa_context(arxiv_id: str, payload: QaRequest):
         raise HTTPException(status_code=400, detail="Paper does not have QA index. Please create index first.")
 
     collection_name = qa_index['collection_name']
+    paper = db_service.get_paper(arxiv_id) or {}
     retrieval_result = enhanced_retrieval_service.enhanced_retrieve(
         collection_name=collection_name,
         user_query=payload.question.strip(),
+        paper_context={
+            "title": paper.get("title", ""),
+            "abstract": paper.get("abstract", ""),
+            "authors": paper.get("authors", ""),
+            "categories": paper.get("categories", ""),
+            "published_date": paper.get("published_date", ""),
+            "url": paper.get("url", ""),
+        },
         options=RetrievalOptions(
             top_k=payload.top_k or 15,
             enable_query_rewrite=payload.enable_query_rewrite,
@@ -736,13 +745,16 @@ async def diagnose_paper_qa(arxiv_id: str, sample_limit: int = Query(3, ge=0, le
 
 
 @app.post("/paper/{arxiv_id}/create-qa-index")
-async def create_paper_qa_index(arxiv_id: str):
+async def create_paper_qa_index(arxiv_id: str, loading_method: str = Query("docling")):
     """
     为论文创建问答索引
     流程：下载PDF -> 解析正文 -> 切分chunks -> 计算embeddings -> 保存到向量数据库
     """
     try:
         logger.info(f"Creating QA index for paper: {arxiv_id}")
+        loading_method = str(loading_method or "pymupdf").strip().lower()
+        if loading_method not in {"pymupdf", "docling"}:
+            raise HTTPException(status_code=400, detail="loading_method must be either pymupdf or docling")
         
         db_service.insert_paper_qa_index(arxiv_id, status='processing')
         
@@ -760,16 +772,21 @@ async def create_paper_qa_index(arxiv_id: str):
         
         loading_service = LoadingService()
         logger.info("Loading PDF content...")
-        document = loading_service.load_pdf(pdf_path, method='pymupdf')
-        
+        document = loading_service.load_pdf(pdf_path, method=loading_method)
+
         page_map = loading_service.get_page_map()
         logger.info(f"Loaded {len(page_map)} pages from PDF")
-        
+
         chunking_service = ChunkingService()
         logger.info("Chunking text...")
-        metadata = {"filename": f"{arxiv_id}.pdf", "loading_method": "pymupdf", "source": f"{arxiv_id}.pdf"}
-        chunked_data = chunking_service.chunk_text(document, method='by_titles', metadata=metadata, page_map=page_map)
-        
+        metadata = {"filename": f"{arxiv_id}.pdf", "loading_method": loading_method, "source": f"{arxiv_id}.pdf"}
+        if loading_method == "docling":
+            chunked_data = chunking_service.chunk_docling(document, metadata=metadata, page_map=page_map)
+            chunking_strategy = "docling_sections"
+        else:
+            chunked_data = chunking_service.chunk_pymupdf(document, method="by_titles", metadata=metadata, page_map=page_map)
+            chunking_strategy = "pymupdf_by_titles"
+
         chunks = chunked_data['chunks']
         logger.info(f"Created {len(chunks)} chunks")
 
@@ -778,8 +795,9 @@ async def create_paper_qa_index(arxiv_id: str):
             filename=f"{arxiv_id}.pdf",
             chunks=chunks,
             metadata={"total_pages": len(page_map)},
-            loading_method="pymupdf",
-            chunking_strategy="by_titles",
+            loading_method=loading_method,
+            chunking_strategy=chunking_strategy,
+            document_data=document,
         )
         logger.info(f"Chunked document saved to: {chunk_file}")
         
@@ -815,15 +833,16 @@ async def create_paper_qa_index(arxiv_id: str):
             embedding_model=embedding_config.model_name,
             pdf_path=pdf_path
         )
-        
+
         return {
             "status": "success",
             "message": "QA index created successfully",
             "arxiv_id": arxiv_id,
+            "loading_method": loading_method,
+            "pdf_path": pdf_path,
             "collection_name": collection_name,
             "chunk_count": len(chunks),
             "embedding_model": embedding_config.model_name,
-            "pdf_path": pdf_path,
             "chunk_file": chunk_file
         }
         
@@ -857,6 +876,7 @@ async def qa_paper(arxiv_id: str, payload: QaRequest):
                     "source": result.get("source", ""),
                     "subchunk_label": result.get("subchunk_label", ""),
                     "chunk_label": result.get("subchunk_label", ""),
+                    "section_path": result.get("section_path", ""),
                 }
                 for result in search_results
             ]
@@ -878,11 +898,12 @@ async def qa_paper(arxiv_id: str, payload: QaRequest):
             "answer": answer,
             "sources": [
                 {
-                    "content": r.get('content', '')[:200],
+                    "content": r.get('content', ''),
                     "page_number": r.get('page_number', ''),
                     "source": r.get('source', ''),
                     "subchunk_label": r.get('subchunk_label', ''),
                     "chunk_label": r.get('subchunk_label', ''),
+                    "section_path": r.get('section_path', ''),
                     "parent_chunk_id": r.get('parent_chunk_id', r.get('chunk_id', 0)),
                 }
                 for r in search_results
@@ -909,11 +930,12 @@ async def qa_paper_stream(arxiv_id: str, payload: QaRequest):
 
     source_payload = [
         {
-            "content": r.get("content", "")[:500],
+            "content": r.get("content", ""),
             "page_number": r.get("page_number", ""),
             "source": r.get("source", ""),
             "subchunk_label": r.get("subchunk_label", ""),
             "chunk_label": r.get("subchunk_label", ""),
+            "section_path": r.get("section_path", ""),
         }
         for r in search_results
     ]

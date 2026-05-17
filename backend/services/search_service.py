@@ -232,6 +232,7 @@ class SearchService:
                     "subchunk_index",
                     "subchunk_count",
                     "subchunk_label",
+                    "section_path",
                     "embedding_provider",
                     "embedding_model",
                     "embedding_timestamp"
@@ -267,6 +268,7 @@ class SearchService:
                                 "subchunk_index": int(getattr(hit.entity, "subchunk_index", 0) or 0),
                                 "subchunk_count": int(getattr(hit.entity, "subchunk_count", 0) or 0),
                                 "subchunk_label": str(getattr(hit.entity, "subchunk_label", "") or ""),
+                                "section_path": str(getattr(hit.entity, "section_path", "") or ""),
                                 "total_chunks": hit.entity.total_chunks,
                                 "embedding_provider": hit.entity.embedding_provider,
                                 "embedding_model": hit.entity.embedding_model,

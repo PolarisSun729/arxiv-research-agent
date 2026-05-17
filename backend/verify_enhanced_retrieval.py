@@ -10,6 +10,8 @@ if str(BACKEND_DIR) not in sys.path:
 def print_route(title: str, retrieval_debug: dict):
     print(f"\n=== {title} ===")
     print(f"original_query: {retrieval_debug.get('original_query')}")
+    if retrieval_debug.get("query_plan"):
+        print(f"query_plan: {retrieval_debug.get('query_plan')}")
     print(f"rewritten_queries: {retrieval_debug.get('rewritten_queries')}")
     hyde_text = retrieval_debug.get("hyde_text") or ""
     print(f"hyde_text: {hyde_text[:180]}{'...' if len(hyde_text) > 180 else ''}")

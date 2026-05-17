@@ -152,6 +152,7 @@ pydantic-settings
 pydantic_core
 Pygments
 pymilvus
+docling
 PyMuPDF
 pyparsing
 pypdf

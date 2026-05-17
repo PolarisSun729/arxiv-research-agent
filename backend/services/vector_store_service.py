@@ -254,6 +254,7 @@ class VectorStoreService:
                 {"name": "content_part_count", "dtype": "INT64"},
                 {"name": "content_part_label", "dtype": "VARCHAR", "max_length": 32},
                 # {"name": "chunking_method", "dtype": "VARCHAR", "max_length": 50},
+                {"name": "section_path", "dtype": "VARCHAR", "max_length": 1024},
                 {"name": "embedding_provider", "dtype": "VARCHAR", "max_length": 50},
                 {"name": "embedding_model", "dtype": "VARCHAR", "max_length": 50},
                 {"name": "embedding_timestamp", "dtype": "VARCHAR", "max_length": 50},
@@ -307,6 +308,7 @@ class VectorStoreService:
                     "content_part_label": str(
                         metadata.get("content_part_label", subchunk_label)
                     ),
+                    "section_path": str(metadata.get("section_path", "")),
                     # "chunking_method": str(metadata.get("chunking_method", "")),
                     "embedding_provider": embeddings_data.get("embedding_provider", ""),
                     "embedding_model": embeddings_data.get("embedding_model", ""),
@@ -571,6 +573,11 @@ class VectorStoreService:
                 "content_part_index",
                 "content_part_count",
                 "content_part_label",
+                "section_path",
+                "section_title",
+                "section_level",
+                "section_part_index",
+                "section_part_count",
                 "embedding_provider",
                 "embedding_model",
                 "embedding_timestamp",
@@ -647,6 +654,11 @@ class VectorStoreService:
                 "content_part_index",
                 "content_part_count",
                 "content_part_label",
+                "section_path",
+                "section_title",
+                "section_level",
+                "section_part_index",
+                "section_part_count",
                 "embedding_provider",
                 "embedding_model",
                 "embedding_timestamp",
@@ -706,6 +718,11 @@ class VectorStoreService:
         content_part_index = getter("content_part_index", None)
         content_part_count = getter("content_part_count", None)
         content_part_label = getter("content_part_label", "") or ""
+        section_path = getter("section_path", "") or ""
+        section_title = getter("section_title", "") or ""
+        section_level = getter("section_level", None)
+        section_part_index = getter("section_part_index", None)
+        section_part_count = getter("section_part_count", None)
 
         if not source:
             source = document_name or getter("arxiv_id", "") or ""
@@ -735,6 +752,11 @@ class VectorStoreService:
             "content_part_index": int(content_part_index or 0),
             "content_part_count": int(content_part_count or 0),
             "content_part_label": str(content_part_label or ""),
+            "section_path": str(section_path or ""),
+            "section_title": str(section_title or ""),
+            "section_level": int(section_level or 0) if section_level is not None else None,
+            "section_part_index": int(section_part_index or 0) if section_part_index is not None else None,
+            "section_part_count": int(section_part_count or 0) if section_part_count is not None else None,
             "embedding_provider": getter("embedding_provider", "") or "",
             "embedding_model": getter("embedding_model", "") or "",
             "embedding_timestamp": getter("embedding_timestamp", "") or "",
@@ -761,6 +783,11 @@ class VectorStoreService:
             "content_part_index": metadata["content_part_index"],
             "content_part_count": metadata["content_part_count"],
             "content_part_label": metadata["content_part_label"],
+            "section_path": metadata["section_path"],
+            "section_title": metadata["section_title"],
+            "section_level": metadata["section_level"],
+            "section_part_index": metadata["section_part_index"],
+            "section_part_count": metadata["section_part_count"],
             "metadata": metadata,
         }
         return payload

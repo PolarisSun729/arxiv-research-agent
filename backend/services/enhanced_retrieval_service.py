@@ -30,6 +30,7 @@ else:
 
 
 QUERY_VIEW_LIMIT = 6
+QUERY_PLAN_LIMIT = 5
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +226,151 @@ SECTION_TAG_RULES = {
 
 NOISY_SECTION_TAGS = {"appendix", "prompt", "figure", "table", "references"}
 
+QUESTION_TYPE_RULES = {
+    "method_flow": {
+        "keywords": [
+            "method",
+            "methods",
+            "approach",
+            "framework",
+            "workflow",
+            "pipeline",
+            "algorithm",
+            "model",
+            "architecture",
+            "training",
+            "inference",
+            "流程",
+            "方法",
+            "框架",
+            "模型",
+            "算法",
+        ],
+        "preferred_sections": ["method", "approach", "model", "architecture", "introduction"],
+    },
+    "experiment_setup": {
+        "keywords": [
+            "experiment",
+            "experiments",
+            "evaluation",
+            "dataset",
+            "baseline",
+            "metric",
+            "implementation",
+            "setup",
+            "setting",
+            "实验",
+            "数据集",
+            "baseline",
+            "指标",
+        ],
+        "preferred_sections": ["experiment", "evaluation", "results", "ablation"],
+    },
+    "results_analysis": {
+        "keywords": [
+            "result",
+            "results",
+            "performance",
+            "comparison",
+            "ablation",
+            "analysis",
+            "effect",
+            "improve",
+            "效果",
+            "结果",
+            "对比",
+            "分析",
+        ],
+        "preferred_sections": ["results", "evaluation", "ablation", "discussion"],
+    },
+    "contribution": {
+        "keywords": [
+            "contribution",
+            "contributions",
+            "novel",
+            "novelty",
+            "idea",
+            "propose",
+            "proposed",
+            "创新",
+            "贡献",
+            "提出",
+        ],
+        "preferred_sections": ["abstract", "introduction", "conclusion"],
+    },
+    "limitation": {
+        "keywords": [
+            "limitation",
+            "limitations",
+            "weakness",
+            "future work",
+            "failure",
+            "constraint",
+            "不足",
+            "局限",
+            "未来工作",
+        ],
+        "preferred_sections": ["discussion", "conclusion", "limitations", "appendix"],
+    },
+    "dataset": {
+        "keywords": [
+            "dataset",
+            "datasets",
+            "corpus",
+            "benchmark",
+            "data",
+            "training data",
+            "语料",
+            "数据",
+            "基准",
+        ],
+        "preferred_sections": ["experiment", "dataset", "data", "setup"],
+    },
+    "metric": {
+        "keywords": [
+            "metric",
+            "metrics",
+            "measure",
+            "evaluation",
+            "formula",
+            "objective",
+            "指标",
+            "公式",
+            "评价",
+        ],
+        "preferred_sections": ["method", "experiment", "evaluation"],
+    },
+    "figure_table": {
+        "keywords": [
+            "figure",
+            "fig.",
+            "table",
+            "chart",
+            "diagram",
+            "图",
+            "表",
+        ],
+        "preferred_sections": ["figure", "table", "appendix", "results"],
+    },
+    "summary": {
+        "keywords": [
+            "summary",
+            "summarize",
+            "overview",
+            "paper",
+            "whole paper",
+            "总体",
+            "总结",
+            "概述",
+        ],
+        "preferred_sections": ["abstract", "introduction", "conclusion"],
+    },
+    "other": {
+        "keywords": [],
+        "preferred_sections": ["abstract", "introduction", "method", "experiment", "conclusion"],
+    },
+}
+
 
 @dataclass
 class RetrievalOptions:
@@ -244,11 +390,15 @@ class QueryProfile:
     tokens: List[str]
     keywords: List[str]
     intent_tags: List[str]
+    question_type: str
+    intent_summary: str
+    paper_terms: List[str]
     ambiguity_score: float
     semantic_query: str
     evidence_query: str
     keyword_query: str
     section_preferences: List[str]
+    query_plan: Dict[str, Any]
 
 
 class EnhancedRetrievalService:
@@ -298,6 +448,7 @@ class EnhancedRetrievalService:
         self,
         user_query: str,
         collection_name: str,
+        paper_context: Optional[Dict[str, Any]] = None,
         options: Optional[RetrievalOptions] = None,
     ) -> Dict[str, Any]:
         options = options or RetrievalOptions()
@@ -315,7 +466,8 @@ class EnhancedRetrievalService:
         debug_enabled = self._resolve_option(options.debug, RETRIEVAL_CONFIG["debug"])
         candidate_k = max(effective_top_k, effective_top_k * self.candidate_multiplier)
 
-        query_profile = self._build_query_profile(user_query)
+        normalized_collection_name = self._resolve_collection_name(collection_name)
+        query_profile = self._build_query_profile(user_query, normalized_collection_name, paper_context=paper_context)
         query_views = self._build_query_views(user_query, query_profile, enable_query_rewrite)
 
         hyde_text = ""
@@ -341,7 +493,6 @@ class EnhancedRetrievalService:
                 ),
             }
 
-        normalized_collection_name = self._resolve_collection_name(collection_name)
         routes: Dict[str, List[Dict[str, Any]]] = {}
         routes["vector_original"] = self._vector_retrieve(
             collection_name=normalized_collection_name,
@@ -425,6 +576,7 @@ class EnhancedRetrievalService:
             result["debug"] = {
                 "original_query": user_query,
                 "query_profile": self._debug_query_profile(query_profile),
+                "query_plan": query_profile.query_plan,
                 "query_views": query_views,
                 "rewritten_queries": query_views["selected_queries"],
                 "hyde_text": hyde_text,
@@ -900,17 +1052,569 @@ class EnhancedRetrievalService:
             return resolver(collection_name)
         return collection_name
 
-    def _build_query_profile(self, user_query: str) -> QueryProfile:
+    def _build_paper_context(
+        self,
+        collection_name: str,
+        paper_context: Optional[Dict[str, Any]] = None,
+        sample_limit: int = 24,
+    ) -> Dict[str, Any]:
+        merged: Dict[str, Any] = {
+            "title": "",
+            "abstract": "",
+            "section_titles": [],
+            "candidate_terms": [],
+            "source_samples": [],
+        }
+
+        if paper_context:
+            merged["title"] = str(paper_context.get("title", "") or "").strip()
+            merged["abstract"] = str(paper_context.get("abstract", "") or "").strip()
+            merged["section_titles"] = [
+                str(item).strip()
+                for item in (paper_context.get("section_titles", []) or [])
+                if str(item).strip()
+            ]
+            merged["candidate_terms"] = [
+                str(item).strip()
+                for item in (paper_context.get("candidate_terms", []) or [])
+                if str(item).strip()
+            ]
+
+        try:
+            sample_chunks = self.vector_store_service.get_all_chunks(collection_name, limit=sample_limit)
+        except Exception:
+            sample_chunks = []
+
+        section_titles = list(merged["section_titles"])
+        source_samples: List[str] = []
+        abstract_candidates: List[str] = []
+        for chunk in sample_chunks:
+            title = str(chunk.get("title", "") or "").strip()
+            content = str(chunk.get("content", "") or "").strip()
+            section_title = str(
+                chunk.get("section_title")
+                or chunk.get("content_part_label")
+                or chunk.get("subchunk_label")
+                or ""
+            ).strip()
+            if not merged["title"] and title:
+                merged["title"] = title
+            if section_title:
+                normalized_section = self._normalize_query_text(section_title)
+                if normalized_section and normalized_section not in {self._normalize_query_text(item) for item in section_titles}:
+                    section_titles.append(section_title)
+            if content and len(source_samples) < 6:
+                source_samples.append(content[:260])
+            section_tags = chunk.get("section_tags", []) or []
+            if any(tag == "abstract" for tag in section_tags) and content:
+                abstract_candidates.append(content)
+            elif any(tag in {"introduction", "conclusion", "method", "experiment"} for tag in section_tags) and content:
+                source_samples.append(content[:180])
+
+        if not merged["abstract"] and abstract_candidates:
+            merged["abstract"] = max(abstract_candidates, key=len)[:1800]
+
+        merged["section_titles"] = self._dedupe_list(section_titles)
+        merged["candidate_terms"] = self._merge_candidate_terms(
+            merged["candidate_terms"],
+            [
+                merged["title"],
+                merged["abstract"][:900],
+                " ".join(merged["section_titles"][:20]),
+                " ".join(source_samples[:6]),
+            ],
+        )
+        merged["source_samples"] = source_samples[:6]
+        return merged
+
+    def _merge_candidate_terms(self, existing_terms: List[str], texts: List[str], limit: int = 24) -> List[str]:
+        terms: List[str] = []
+        for item in existing_terms:
+            if str(item).strip():
+                terms.append(str(item).strip())
+        for text in texts:
+            if not text:
+                continue
+            for token in self._extract_paper_terms_from_text(text):
+                if token not in terms:
+                    terms.append(token)
+                if len(terms) >= limit:
+                    return terms[:limit]
+        return terms[:limit]
+
+    def _extract_paper_terms_from_text(self, text: str, limit: int = 10) -> List[str]:
+        tokens = self._tokenize_for_keyword_search(text)
+        filtered = [token for token in tokens if token not in EN_STOPWORDS and token not in ZH_STOPWORDS]
+        seen: List[str] = []
+        for token in filtered:
+            if token not in seen:
+                seen.append(token)
+        return seen[:limit]
+
+    def _build_query_plan(
+        self,
+        user_query: str,
+        paper_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        query_plan: Dict[str, Any] = {}
+        llm_error: Optional[str] = None
+
+        if self.generation_service is not None:
+            try:
+                if hasattr(self.generation_service, "plan_queries_for_retrieval"):
+                    query_plan = self.generation_service.plan_queries_for_retrieval(
+                        question=user_query,
+                        max_queries=QUERY_PLAN_LIMIT,
+                        paper_context=paper_context,
+                    )
+                else:
+                    rewrites = self.generation_service.rewrite_query_for_retrieval(
+                        question=user_query,
+                        max_queries=QUERY_PLAN_LIMIT,
+                        paper_context=paper_context,
+                    )
+                    query_plan = {
+                        "question_type": "other",
+                        "intent_summary": "",
+                        "paper_terms": paper_context.get("candidate_terms", [])[:8],
+                        "preferred_sections": [],
+                        "rewrite_queries": [
+                            {
+                                "query": query,
+                                "focus": "retrieval",
+                                "channels": ["vector", "keyword"],
+                            }
+                            for query in rewrites
+                        ],
+                    }
+            except Exception as exc:  # pragma: no cover - remote model failures are environment dependent
+                llm_error = str(exc)
+
+        if not query_plan:
+            query_plan = self._heuristic_query_plan(user_query, paper_context)
+        else:
+            if not isinstance(query_plan, dict):
+                query_plan = {}
+            query_plan = self._normalize_query_plan(query_plan, user_query, paper_context)
+
+        if llm_error and not query_plan.get("llm_error"):
+            query_plan["llm_error"] = llm_error
+        return query_plan
+
+    def _normalize_query_plan(
+        self,
+        query_plan: Dict[str, Any],
+        user_query: str,
+        paper_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        normalized = dict(query_plan or {})
+        rewrite_queries = self._extract_plan_queries(normalized)
+        if not rewrite_queries:
+            normalized = self._heuristic_query_plan(user_query, paper_context)
+            rewrite_queries = self._extract_plan_queries(normalized)
+        normalized["rewrite_queries"] = rewrite_queries
+        normalized["question_type"] = str(normalized.get("question_type", "other")).strip() or "other"
+        normalized["intent_summary"] = str(normalized.get("intent_summary", "")).strip()
+        normalized["paper_terms"] = [
+            str(item).strip()
+            for item in (normalized.get("paper_terms", []) or [])
+            if str(item).strip()
+        ]
+        normalized["paper_terms"] = self._dedupe_list(normalized["paper_terms"])
+        normalized["preferred_sections"] = [
+            str(item).strip()
+            for item in (normalized.get("preferred_sections", []) or [])
+            if str(item).strip()
+        ]
+        normalized["preferred_sections"] = self._dedupe_list(normalized["preferred_sections"])
+        normalized["paper_title"] = str(paper_context.get("title", "") or "").strip()
+        normalized["paper_abstract"] = str(paper_context.get("abstract", "") or "").strip()
+        normalized["section_titles"] = [
+            str(item).strip()
+            for item in (paper_context.get("section_titles", []) or [])
+            if str(item).strip()
+        ]
+        return normalized
+
+    def _heuristic_query_plan(self, user_query: str, paper_context: Dict[str, Any]) -> Dict[str, Any]:
+        normalized_query = self._normalize_query_text(user_query)
+        tokens = self._tokenize_for_keyword_search(user_query)
+        intent_tags = self._detect_intent_tags(normalized_query, tokens)
+        question_type = self._classify_question_type(normalized_query, intent_tags)
+        paper_terms = paper_context.get("candidate_terms", []) or []
+        paper_terms = [str(item).strip() for item in paper_terms if str(item).strip()]
+        section_titles = [str(item).strip() for item in (paper_context.get("section_titles", []) or []) if str(item).strip()]
+        preferred_sections = self._preferred_sections_for_question_type(question_type, intent_tags)
+        term_focus = self._compact_terms(paper_terms, limit=5)
+        section_focus = self._compact_terms(section_titles, limit=4)
+        type_terms = self._query_type_terms(question_type)
+
+        def join_parts(parts: List[str]) -> str:
+            return self._dedupe_terms([part for part in parts if part]).strip() or user_query.strip()
+
+        queries: List[Dict[str, Any]] = []
+        if question_type == "method_flow":
+            queries = [
+                {
+                    "query": join_parts([*term_focus[:3], "method", "framework", "algorithm"]),
+                    "focus": "method overview",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*term_focus[:3], "training", "inference", "architecture"]),
+                    "focus": "training and inference",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*section_focus[:2], "approach", "model", "pipeline"]),
+                    "focus": "paper structure",
+                    "channels": ["vector", "keyword"],
+                },
+            ]
+        elif question_type == "experiment_setup":
+            queries = [
+                {
+                    "query": join_parts([*term_focus[:3], "experiment", "dataset", "baseline"]),
+                    "focus": "setup",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*term_focus[:3], "evaluation", "metric", "implementation"]),
+                    "focus": "evaluation details",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*section_focus[:2], "ablation", "results", "benchmark"]),
+                    "focus": "experiment sections",
+                    "channels": ["vector", "keyword"],
+                },
+            ]
+        elif question_type == "results_analysis":
+            queries = [
+                {
+                    "query": join_parts([*term_focus[:3], "results", "performance", "comparison"]),
+                    "focus": "results",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*term_focus[:3], "ablation", "analysis", "effect"]),
+                    "focus": "ablation and analysis",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*section_focus[:2], "table", "figure", "result"]),
+                    "focus": "tables and figures",
+                    "channels": ["vector", "keyword"],
+                },
+            ]
+        elif question_type == "contribution":
+            queries = [
+                {
+                    "query": join_parts([*term_focus[:3], "contribution", "novel", "proposed"]),
+                    "focus": "contribution",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*term_focus[:3], "key idea", "main findings", "summary"]),
+                    "focus": "summary",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*section_focus[:2], "abstract", "introduction", "conclusion"]),
+                    "focus": "paper overview",
+                    "channels": ["vector", "keyword"],
+                },
+            ]
+        elif question_type == "limitation":
+            queries = [
+                {
+                    "query": join_parts([*term_focus[:3], "limitation", "future work", "constraint"]),
+                    "focus": "limitations",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*term_focus[:3], "failure case", "assumption", "weakness"]),
+                    "focus": "failure cases",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*section_focus[:2], "discussion", "appendix", "future work"]),
+                    "focus": "discussion",
+                    "channels": ["vector", "keyword"],
+                },
+            ]
+        elif question_type == "dataset":
+            queries = [
+                {
+                    "query": join_parts([*term_focus[:3], "dataset", "corpus", "benchmark"]),
+                    "focus": "data source",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*term_focus[:3], "data split", "training data", "evaluation"]),
+                    "focus": "data splits",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*section_focus[:2], "dataset", "setup", "experiment"]),
+                    "focus": "dataset section",
+                    "channels": ["vector", "keyword"],
+                },
+            ]
+        elif question_type == "metric":
+            queries = [
+                {
+                    "query": join_parts([*term_focus[:3], "metric", "formula", "evaluation"]),
+                    "focus": "metric",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*term_focus[:3], "objective", "measure", "score"]),
+                    "focus": "measurement",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*section_focus[:2], "method", "experiment", "evaluation"]),
+                    "focus": "evaluation sections",
+                    "channels": ["vector", "keyword"],
+                },
+            ]
+        elif question_type == "figure_table":
+            queries = [
+                {
+                    "query": join_parts([*term_focus[:3], "figure", "table", "diagram"]),
+                    "focus": "visuals",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*term_focus[:3], "figure", "table", "result"]),
+                    "focus": "figure or table caption",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*section_focus[:2], "appendix", "results", "experiment"]),
+                    "focus": "visual evidence",
+                    "channels": ["vector", "keyword"],
+                },
+            ]
+        elif question_type == "summary":
+            queries = [
+                {
+                    "query": join_parts([*term_focus[:3], "summary", "overview", "contribution"]),
+                    "focus": "overview",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*term_focus[:3], "abstract", "introduction", "conclusion"]),
+                    "focus": "paper arc",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*section_focus[:2], "main findings", "key idea"]),
+                    "focus": "core findings",
+                    "channels": ["vector", "keyword"],
+                },
+            ]
+        else:
+            queries = [
+                {
+                    "query": join_parts([*term_focus[:4], *type_terms[:2]]),
+                    "focus": "semantic",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([*term_focus[:3], *section_focus[:2], *type_terms[2:4]]),
+                    "focus": "section-aware",
+                    "channels": ["vector", "keyword"],
+                },
+                {
+                    "query": join_parts([user_query, *term_focus[:2], *type_terms[:3]]),
+                    "focus": "query expansion",
+                    "channels": ["vector", "keyword"],
+                },
+            ]
+
+        return {
+            "question_type": question_type,
+            "intent_summary": self._summarize_intent(question_type, intent_tags, term_focus),
+            "paper_terms": term_focus,
+            "preferred_sections": preferred_sections,
+            "rewrite_queries": queries[:QUERY_VIEW_LIMIT],
+            "paper_title": str(paper_context.get("title", "") or "").strip(),
+            "paper_abstract": str(paper_context.get("abstract", "") or "").strip(),
+            "section_titles": section_titles,
+        }
+
+    def _extract_plan_queries(self, query_plan: Dict[str, Any]) -> List[str]:
+        rewrites: List[str] = []
+        raw_queries = query_plan.get("rewrite_queries", [])
+        if not isinstance(raw_queries, list):
+            raw_queries = query_plan.get("queries", [])
+        if not isinstance(raw_queries, list):
+            return rewrites
+
+        for item in raw_queries:
+            if isinstance(item, dict):
+                query = str(item.get("query", "")).strip()
+                if query:
+                    rewrites.append(query)
+            elif isinstance(item, str) and item.strip():
+                rewrites.append(item.strip())
+        return self._dedupe_list(rewrites)[:QUERY_VIEW_LIMIT]
+
+    def _build_query_views_from_plan(
+        self,
+        user_query: str,
+        query_plan: Dict[str, Any],
+        query_profile: Optional[QueryProfile],
+        keywords: List[str],
+        intent_tags: List[str],
+        language: str,
+        paper_context: Dict[str, Any],
+    ) -> Tuple[str, str, str]:
+        plan_queries = self._extract_plan_queries(query_plan)
+        paper_terms = [str(item).strip() for item in (query_plan.get("paper_terms", []) or []) if str(item).strip()]
+        section_titles = [str(item).strip() for item in (query_plan.get("section_titles", []) or []) if str(item).strip()]
+        question_type = str(query_plan.get("question_type", "other")).strip() or "other"
+
+        if not paper_terms:
+            paper_terms = self._extract_paper_terms_from_text(
+                " ".join(
+                    [
+                        str(paper_context.get("title", "") or ""),
+                        str(paper_context.get("abstract", "") or ""),
+                        " ".join(section_titles),
+                    ]
+                ),
+                limit=6,
+            )
+
+        if plan_queries:
+            semantic_query = plan_queries[0]
+            evidence_query = plan_queries[1] if len(plan_queries) > 1 else plan_queries[0]
+            keyword_query = plan_queries[2] if len(plan_queries) > 2 else " ".join(
+                self._dedupe_list([*paper_terms[:4], *keywords[:4], question_type])
+            ).strip()
+        else:
+            semantic_query = self._build_semantic_query(user_query, keywords + paper_terms, intent_tags)
+            evidence_query = self._build_evidence_query(keywords + paper_terms, intent_tags, language)
+            keyword_query = self._build_keyword_query(keywords + paper_terms, intent_tags)
+
+        if not semantic_query:
+            semantic_query = self._build_semantic_query(user_query, keywords + paper_terms, intent_tags)
+        if not evidence_query:
+            evidence_query = self._build_evidence_query(keywords + paper_terms, intent_tags, language)
+        if not keyword_query:
+            keyword_query = self._build_keyword_query(keywords + paper_terms, intent_tags)
+
+        return semantic_query, evidence_query, keyword_query
+
+    def _preferred_sections_for_question_type(self, question_type: str, intent_tags: List[str]) -> List[str]:
+        preferred = list(QUESTION_TYPE_RULES.get(question_type, QUESTION_TYPE_RULES["other"]).get("preferred_sections", []))
+        preferred.extend(self._preferred_section_tags(intent_tags))
+        return self._dedupe_list(preferred)[:6]
+
+    def _classify_question_type(self, normalized_query: str, intent_tags: List[str]) -> str:
+        query_text = normalized_query.lower()
+        for question_type, spec in QUESTION_TYPE_RULES.items():
+            if question_type == "other":
+                continue
+            if any(keyword.lower() in query_text for keyword in spec.get("keywords", [])):
+                return question_type
+        if "summary" in intent_tags:
+            return "summary"
+        return "other"
+
+    def _query_type_terms(self, question_type: str) -> List[str]:
+        spec = QUESTION_TYPE_RULES.get(question_type, QUESTION_TYPE_RULES["other"])
+        return self._dedupe_list([str(item).strip() for item in spec.get("keywords", []) if str(item).strip()])
+
+    def _preferred_section_tags_from_plan(self, query_plan: Dict[str, Any], intent_tags: List[str]) -> List[str]:
+        preferred = [
+            str(item).strip()
+            for item in (query_plan.get("preferred_sections", []) or [])
+            if str(item).strip()
+        ]
+        question_type = str(query_plan.get("question_type", "other")).strip() or "other"
+        preferred.extend(QUESTION_TYPE_RULES.get(question_type, QUESTION_TYPE_RULES["other"]).get("preferred_sections", []))
+        preferred.extend(self._preferred_section_tags(intent_tags))
+        return self._dedupe_list(preferred)[:6]
+
+    def _compact_terms(self, terms: List[str], limit: int = 5) -> List[str]:
+        compacted: List[str] = []
+        for term in terms:
+            normalized = str(term).strip()
+            if not normalized:
+                continue
+            if normalized not in compacted:
+                compacted.append(normalized)
+            if len(compacted) >= limit:
+                break
+        return compacted
+
+    def _summarize_intent(self, question_type: str, intent_tags: List[str], paper_terms: List[str]) -> str:
+        if question_type == "method_flow":
+            return "understand the method flow and paper-specific implementation details"
+        if question_type == "experiment_setup":
+            return "understand the experimental setup, datasets, baselines, and evaluation details"
+        if question_type == "results_analysis":
+            return "understand the results, comparison, and ablation analysis"
+        if question_type == "contribution":
+            return "understand the main contribution and novelty of the paper"
+        if question_type == "limitation":
+            return "understand the limitations and future work"
+        if question_type == "dataset":
+            return "understand the dataset or benchmark used in the paper"
+        if question_type == "metric":
+            return "understand the metric, formula, or evaluation protocol"
+        if question_type == "figure_table":
+            return "find the relevant figure or table and interpret it"
+        if question_type == "summary":
+            return "summarize the paper around its main ideas and findings"
+        if intent_tags:
+            return f"understand the paper with focus on {', '.join(intent_tags[:3])}"
+        if paper_terms:
+            return f"retrieve evidence around {', '.join(paper_terms[:3])}"
+        return "retrieve the most relevant paper evidence"
+
+    def _dedupe_list(self, items: List[str]) -> List[str]:
+        seen_normalized: List[str] = []
+        unique: List[str] = []
+        for item in items:
+            raw = str(item).strip()
+            normalized = self._normalize_query_text(raw)
+            if normalized and normalized not in seen_normalized:
+                seen_normalized.append(normalized)
+                unique.append(raw)
+        return unique
+
+    def _build_query_profile(
+        self,
+        user_query: str,
+        collection_name: str,
+        paper_context: Optional[Dict[str, Any]] = None,
+    ) -> QueryProfile:
         normalized_query = self._normalize_query_text(user_query)
         tokens = self._tokenize_for_keyword_search(user_query)
         keywords = self._extract_query_keywords(tokens)
         language = self._detect_language(user_query, tokens)
         intent_tags = self._detect_intent_tags(normalized_query, tokens)
+        paper_context_payload = self._build_paper_context(collection_name, paper_context=paper_context)
+        query_plan = self._build_query_plan(user_query, paper_context_payload)
+        question_type = str(query_plan.get("question_type", "other")).strip() or "other"
+        intent_summary = str(query_plan.get("intent_summary", "")).strip()
+        paper_terms = [str(item).strip() for item in query_plan.get("paper_terms", []) if str(item).strip()]
+        section_preferences = self._preferred_section_tags_from_plan(query_plan, intent_tags)
         ambiguity_score = self._estimate_ambiguity(keywords, intent_tags, language, user_query)
-        semantic_query = self._build_semantic_query(user_query, keywords, intent_tags)
-        evidence_query = self._build_evidence_query(keywords, intent_tags, language)
-        keyword_query = self._build_keyword_query(keywords, intent_tags)
-        section_preferences = self._preferred_section_tags(intent_tags)
+        semantic_query, evidence_query, keyword_query = self._build_query_views_from_plan(
+            user_query=user_query,
+            query_plan=query_plan,
+            query_profile=None,
+            keywords=keywords,
+            intent_tags=intent_tags,
+            language=language,
+            paper_context=paper_context_payload,
+        )
         return QueryProfile(
             original_query=user_query,
             normalized_query=normalized_query,
@@ -918,11 +1622,15 @@ class EnhancedRetrievalService:
             tokens=tokens,
             keywords=keywords,
             intent_tags=intent_tags,
+            question_type=question_type,
+            intent_summary=intent_summary,
+            paper_terms=paper_terms,
             ambiguity_score=ambiguity_score,
             semantic_query=semantic_query,
             evidence_query=evidence_query,
             keyword_query=keyword_query,
             section_preferences=section_preferences,
+            query_plan=query_plan,
         )
 
     def _build_query_views(
@@ -931,32 +1639,50 @@ class EnhancedRetrievalService:
         query_profile: QueryProfile,
         enable_query_rewrite: bool,
     ) -> Dict[str, Any]:
+        query_plan = query_profile.query_plan or {}
+        plan_queries = self._extract_plan_queries(query_plan)
+        fallback_rewrites = self._heuristic_query_rewrites(query_profile)
         llm_rewrites: List[str] = []
         llm_error: Optional[str] = None
-        if enable_query_rewrite and self.generation_service is not None:
+
+        if plan_queries:
+            llm_rewrites = plan_queries[:QUERY_VIEW_LIMIT]
+        elif enable_query_rewrite and self.generation_service is not None:
             try:
-                llm_rewrites = self.generation_service.rewrite_query_for_retrieval(user_query, max_queries=3)
+                llm_rewrites = self.generation_service.rewrite_query_for_retrieval(
+                    user_query,
+                    max_queries=QUERY_VIEW_LIMIT,
+                    paper_context={
+                        "title": query_plan.get("paper_title", ""),
+                        "abstract": query_plan.get("paper_abstract", ""),
+                        "section_titles": query_plan.get("section_titles", []),
+                        "candidate_terms": query_profile.paper_terms,
+                    },
+                )
             except Exception as exc:  # pragma: no cover - remote model failures are environment dependent
                 llm_error = str(exc)
 
-        heuristic_rewrites = self._heuristic_query_rewrites(query_profile)
-        core_views = [
-            query_profile.original_query,
-            query_profile.semantic_query,
-            query_profile.evidence_query,
-            query_profile.keyword_query,
+        candidate_sources = [
+            ("core", query_profile.original_query),
+            ("core", query_profile.semantic_query),
+            ("core", query_profile.evidence_query),
+            ("core", query_profile.keyword_query),
         ]
+        if enable_query_rewrite:
+            candidate_sources.extend(("plan", query) for query in llm_rewrites)
+            candidate_sources.extend(("heuristic", query) for query in fallback_rewrites)
+
         candidate_rows: List[Dict[str, Any]] = []
         seen = set()
         selected_queries: List[str] = []
 
-        def add_candidate(source: str, query: str, rank: int) -> None:
-            stripped = query.strip()
+        for idx, (source, query) in enumerate(candidate_sources):
+            stripped = str(query).strip()
             normalized = self._normalize_query_text(stripped)
             row = {
                 "query": stripped,
                 "source": source,
-                "source_index": rank,
+                "source_index": idx,
                 "normalized": normalized,
                 "selected": False,
                 "reason": "kept",
@@ -964,15 +1690,15 @@ class EnhancedRetrievalService:
             if not normalized:
                 row["reason"] = "empty"
                 candidate_rows.append(row)
-                return
+                continue
             if normalized == query_profile.normalized_query:
                 row["reason"] = "same_as_original"
                 candidate_rows.append(row)
-                return
+                continue
             if normalized in seen:
                 row["reason"] = "duplicate"
                 candidate_rows.append(row)
-                return
+                continue
             seen.add(normalized)
             candidate_rows.append(row)
             if len(selected_queries) < QUERY_VIEW_LIMIT:
@@ -981,22 +1707,15 @@ class EnhancedRetrievalService:
             else:
                 row["reason"] = "trimmed_to_top_k"
 
-        for idx, query in enumerate(core_views):
-            add_candidate("core", query, idx)
-        if enable_query_rewrite:
-            for idx, query in enumerate(llm_rewrites, start=len(core_views)):
-                add_candidate("llm", query, idx)
-            for idx, query in enumerate(heuristic_rewrites, start=len(core_views) + len(llm_rewrites)):
-                add_candidate("heuristic", query, idx)
-
         if not selected_queries:
             selected_queries.append(query_profile.semantic_query)
 
         rewrite_debug = {
             "enabled": enable_query_rewrite,
             "original_query": user_query,
+            "query_plan": query_plan,
             "model_queries": llm_rewrites,
-            "heuristic_queries": heuristic_rewrites,
+            "heuristic_queries": fallback_rewrites,
             "selected_queries": selected_queries,
             "selected_keywords": self._build_query_keywords(selected_queries),
             "selected_query_details": self._build_query_term_details(selected_queries),
@@ -1013,8 +1732,9 @@ class EnhancedRetrievalService:
         return {
             "enabled": enable_query_rewrite,
             "original_query": user_query,
+            "query_plan": query_plan,
             "model_queries": llm_rewrites,
-            "heuristic_queries": heuristic_rewrites,
+            "heuristic_queries": fallback_rewrites,
             "selected_queries": selected_queries,
             "selected_keywords": self._build_query_keywords(selected_queries),
             "selected_query_details": self._build_query_term_details(selected_queries),
@@ -1220,7 +1940,13 @@ class EnhancedRetrievalService:
     def _normalize_chunk(self, item: Dict[str, Any]) -> Dict[str, Any]:
         metadata = item.get("metadata", {})
         chunk = dict(item)
-        chunk["content"] = item.get("content") or item.get("text") or ""
+        chunk["content"] = (
+            item.get("content")
+            or item.get("text")
+            or metadata.get("content")
+            or metadata.get("text")
+            or ""
+        )
         chunk["text"] = chunk["content"]
         chunk["source"] = item.get("source") or metadata.get("source", "")
         chunk["document_name"] = item.get("document_name") or metadata.get("document_name", "")
@@ -1266,58 +1992,73 @@ class EnhancedRetrievalService:
         if query_profile.keyword_query and query_profile.keyword_query not in rewrites:
             rewrites.append(query_profile.keyword_query)
 
+        question_type = query_profile.question_type or "other"
+        paper_terms = query_profile.paper_terms[:4]
+
+        type_templates = {
+            "method_flow": [
+                "method framework algorithm training inference",
+                "architecture component pipeline implementation",
+            ],
+            "experiment_setup": [
+                "experiment dataset baseline metric implementation",
+                "evaluation setup data split benchmark",
+            ],
+            "results_analysis": [
+                "results performance comparison ablation analysis",
+                "result table figure effect improvement",
+            ],
+            "contribution": [
+                "main contribution novel proposed method",
+                "key idea summary contribution overview",
+            ],
+            "limitation": [
+                "limitations future work failure cases",
+                "discussion constraints assumptions weaknesses",
+            ],
+            "dataset": [
+                "dataset corpus benchmark data split",
+                "training data evaluation dataset",
+            ],
+            "metric": [
+                "metric formula evaluation objective",
+                "score measure evaluation protocol",
+            ],
+            "figure_table": [
+                "figure table diagram caption",
+                "table figure result appendix",
+            ],
+            "summary": [
+                "abstract introduction conclusion summary",
+                "main findings key contribution overview",
+            ],
+            "other": [
+                "paper evidence section relevant passages",
+                "retrieval relevant chunks academic paper",
+            ],
+        }
+
+        for template in type_templates.get(question_type, type_templates["other"]):
+            terms = [*paper_terms, template]
+            rewrites.append(" ".join(self._dedupe_list(terms)))
+
         for intent in query_profile.intent_tags:
             if intent == "summary":
-                rewrites.extend(
-                    [
-                        "main contributions key findings paper summary",
-                        "abstract introduction conclusion contributions",
-                    ]
-                )
+                rewrites.append(" ".join(self._dedupe_list([*paper_terms, "abstract", "introduction", "conclusion"])))
             elif intent == "method":
-                rewrites.extend(
-                    [
-                        "proposed method approach architecture implementation details",
-                        "model framework training objective algorithm design",
-                    ]
-                )
+                rewrites.append(" ".join(self._dedupe_list([*paper_terms, "method", "framework", "architecture", "implementation"])))
             elif intent == "experiment":
-                rewrites.extend(
-                    [
-                        "experimental results evaluation benchmarks ablation",
-                        "results comparison metrics dataset setup",
-                    ]
-                )
+                rewrites.append(" ".join(self._dedupe_list([*paper_terms, "experiment", "evaluation", "benchmark", "ablation"])))
             elif intent == "comparison":
-                rewrites.extend(
-                    [
-                        "baseline comparison ablation study competing methods",
-                        "comparison with previous methods experimental comparison",
-                    ]
-                )
+                rewrites.append(" ".join(self._dedupe_list([*paper_terms, "baseline", "comparison", "ablation"])))
             elif intent == "limitation":
-                rewrites.extend(
-                    [
-                        "limitations future work failure cases",
-                        "discussion limitations assumptions",
-                    ]
-                )
+                rewrites.append(" ".join(self._dedupe_list([*paper_terms, "limitations", "future work", "failure cases"])))
             elif intent == "definition":
-                rewrites.extend(
-                    [
-                        "problem formulation definition task setup",
-                        "what is the task definition and setup",
-                    ]
-                )
+                rewrites.append(" ".join(self._dedupe_list([*paper_terms, "problem formulation", "task setup"])))
             elif intent == "dataset":
-                rewrites.extend(
-                    [
-                        "datasets corpus data splits evaluation setup",
-                        "training data benchmark datasets",
-                    ]
-                )
+                rewrites.append(" ".join(self._dedupe_list([*paper_terms, "dataset", "corpus", "benchmark", "data"])))
 
-        return rewrites[: QUERY_VIEW_LIMIT]
+        return self._dedupe_list(rewrites)[: QUERY_VIEW_LIMIT]
 
     def _heuristic_hyde_document(
         self,
@@ -1615,11 +2356,15 @@ class EnhancedRetrievalService:
             "tokens": query_profile.tokens,
             "keywords": query_profile.keywords,
             "intent_tags": query_profile.intent_tags,
+            "question_type": query_profile.question_type,
+            "intent_summary": query_profile.intent_summary,
+            "paper_terms": query_profile.paper_terms,
             "ambiguity_score": query_profile.ambiguity_score,
             "semantic_query": query_profile.semantic_query,
             "evidence_query": query_profile.evidence_query,
             "keyword_query": query_profile.keyword_query,
             "section_preferences": query_profile.section_preferences,
+            "query_plan": query_profile.query_plan,
         }
 
     def _debug_chunk_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
@@ -1641,5 +2386,6 @@ class EnhancedRetrievalService:
             "source_queries": item.get("source_queries", []),
             "subchunk_label": item.get("subchunk_label"),
             "section_tags": item.get("section_tags", []),
+            "content": item.get("content", ""),
             "preview": preview,
         }

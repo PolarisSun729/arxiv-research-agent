@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -13,6 +13,10 @@ import {
   RefreshRight,
   Search
 } from '@element-plus/icons-vue'
+import MarkdownIt from 'markdown-it'
+import dollarmathPlugin from 'markdown-it-dollarmath'
+import { renderToString } from 'katex'
+import 'katex/dist/katex.min.css'
 import { usePaperStore } from '@/stores/paperStore'
 import {
   createPaperQaIndex,
@@ -49,11 +53,14 @@ const loading = ref(true)
 const qaMode = ref(false)
 const qaLoading = ref(false)
 const creatingIndex = ref(false)
+const loadingMethod = ref<'pymupdf' | 'docling'>('docling')
 const qaStatus = ref<QaStatusResult | null>(null)
 const qaDiagnostic = ref<QaDiagnosticResult | null>(null)
 const question = ref('')
 const chatContainerRef = ref<HTMLElement | null>(null)
 const qaResults = ref<QaTurn[]>([])
+const evidenceDrawerOpen = ref(false)
+const activeEvidenceTurn = ref<QaTurn | null>(null)
 const retrievalOptions = reactive({
   enableQueryRewrite: true,
   enableHyde: true,
@@ -76,8 +83,28 @@ const quickPrompts = computed(() => [
   '实验结果说明了什么，局限性有哪些？'
 ])
 
+const markdownRenderer = new MarkdownIt({
+  html: false,
+  linkify: true,
+  breaks: true,
+  typographer: true
+}).use(dollarmathPlugin, {
+  allow_space: true,
+  allow_digits: true,
+  double_inline: true,
+  allow_labels: true,
+  renderer(content: string, { displayMode }: { displayMode: boolean }) {
+    return renderToString(content, {
+      displayMode,
+      throwOnError: false
+    })
+  }
+})
+
 const hasQaIndex = computed(() => Boolean(qaStatus.value?.has_index))
 const chatTurns = computed(() => qaResults.value)
+const loadingMethodLabel = computed(() => (loadingMethod.value === 'docling' ? 'Docling' : 'PyMuPDF'))
+const loadingMethodHint = computed(() => (loadingMethod.value === 'docling' ? '更适合论文结构' : '保留传统解析'))
 
 function formatDate(dateStr: string) {
   return new Date(dateStr).toLocaleDateString('zh-CN', {
@@ -99,21 +126,6 @@ function getDebugRouteLabel(routeName: string) {
   return debugRouteLabels[routeName] || routeName
 }
 
-function getQuerySourceLabel(source?: string) {
-  if (source === 'model') return '模型输出'
-  if (source === 'heuristic') return '启发式补充'
-  return source || '未知来源'
-}
-
-function getQueryCandidateReasonLabel(reason?: string) {
-  if (reason === 'kept') return '已采用'
-  if (reason === 'duplicate') return '重复项'
-  if (reason === 'same_as_original') return '与原问题重复'
-  if (reason === 'trimmed_to_top_k') return '超过上限'
-  if (reason === 'empty') return '空内容'
-  return reason || '未说明'
-}
-
 function formatDebugQueryList(queries?: string[]) {
   if (!queries || queries.length === 0) {
     return '无'
@@ -133,150 +145,21 @@ function formatRouteScores(routeScores?: Record<string, number>) {
   return entries.map(([route, score]) => `${getDebugRouteLabel(route)} ${formatDebugNumber(score)}`).join(' · ')
 }
 
-function escapeHtml(text: string) {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
-}
-
-function escapeAttr(text: string) {
-  return escapeHtml(text).replace(/`/g, '&#96;')
-}
-
-function formatInlineMarkdown(text: string) {
-  let output = escapeHtml(text)
-
-  output = output.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => {
-    return `<a href="${escapeAttr(url)}" target="_blank" rel="noreferrer noopener">${label}</a>`
-  })
-  output = output.replace(/`([^`]+)`/g, '<code>$1</code>')
-  output = output.replace(/\*\*([\s\S]+?)\*\*/g, '<strong>$1</strong>')
-  output = output.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>')
-
-  return output
-}
-
 function renderMarkdown(text: string) {
   const content = (text || '').replace(/\r\n/g, '\n').trim()
   if (!content) {
-    return '<p class="md-paragraph md-empty">回答生成中...</p>'
+    return '<p class="md-empty">回答生成中...</p>'
   }
+  return markdownRenderer.render(content)
+}
 
-  const lines = content.split('\n')
-  const blocks: string[] = []
-  let paragraphLines: string[] = []
-  let quoteLines: string[] = []
-  let unorderedList: string[] = []
-  let orderedList: string[] = []
-  let codeLines: string[] = []
-  let inCodeBlock = false
+function openEvidence(turn: QaTurn) {
+  activeEvidenceTurn.value = turn
+  evidenceDrawerOpen.value = true
+}
 
-  const flushParagraph = () => {
-    if (!paragraphLines.length) return
-    blocks.push(`<p class="md-paragraph">${paragraphLines.map(formatInlineMarkdown).join('<br />')}</p>`)
-    paragraphLines = []
-  }
-
-  const flushQuote = () => {
-    if (!quoteLines.length) return
-    blocks.push(`<blockquote class="md-quote">${quoteLines.map(formatInlineMarkdown).join('<br />')}</blockquote>`)
-    quoteLines = []
-  }
-
-  const flushLists = () => {
-    if (unorderedList.length) {
-      blocks.push(`<ul class="md-list md-list-unordered">${unorderedList.map(item => `<li>${formatInlineMarkdown(item)}</li>`).join('')}</ul>`)
-      unorderedList = []
-    }
-    if (orderedList.length) {
-      blocks.push(`<ol class="md-list md-list-ordered">${orderedList.map(item => `<li>${formatInlineMarkdown(item)}</li>`).join('')}</ol>`)
-      orderedList = []
-    }
-  }
-
-  const flushCode = () => {
-    if (!codeLines.length) return
-    blocks.push(`<pre class="md-code"><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`)
-    codeLines = []
-  }
-
-  for (const line of lines) {
-    const trimmed = line.trim()
-
-    if (inCodeBlock) {
-      if (trimmed.startsWith('```')) {
-        flushCode()
-        inCodeBlock = false
-      } else {
-        codeLines.push(line)
-      }
-      continue
-    }
-
-    if (!trimmed) {
-      flushParagraph()
-      flushQuote()
-      flushLists()
-      continue
-    }
-
-    if (trimmed.startsWith('```')) {
-      flushParagraph()
-      flushQuote()
-      flushLists()
-      inCodeBlock = true
-      continue
-    }
-
-    const headingMatch = trimmed.match(/^(#{1,6})\s+(.*)$/)
-    if (headingMatch) {
-      flushParagraph()
-      flushQuote()
-      flushLists()
-      const level = headingMatch[1].length
-      blocks.push(`<h${level} class="md-heading md-heading-${level}">${formatInlineMarkdown(headingMatch[2])}</h${level}>`)
-      continue
-    }
-
-    const quoteMatch = trimmed.match(/^>\s?(.*)$/)
-    if (quoteMatch) {
-      flushParagraph()
-      flushLists()
-      quoteLines.push(quoteMatch[1])
-      continue
-    }
-
-    const unorderedMatch = trimmed.match(/^[-*+]\s+(.*)$/)
-    if (unorderedMatch) {
-      flushParagraph()
-      flushQuote()
-      unorderedList.push(unorderedMatch[1])
-      continue
-    }
-
-    const orderedMatch = trimmed.match(/^\d+\.\s+(.*)$/)
-    if (orderedMatch) {
-      flushParagraph()
-      flushQuote()
-      orderedList.push(orderedMatch[1])
-      continue
-    }
-
-    if (unorderedList.length || orderedList.length) {
-      flushLists()
-    }
-    paragraphLines.push(line)
-  }
-
-  flushParagraph()
-  flushQuote()
-  flushLists()
-  flushCode()
-
-  return blocks.join('')
+function closeEvidence() {
+  evidenceDrawerOpen.value = false
 }
 
 function goBack() {
@@ -317,7 +200,7 @@ async function handleCreateIndex() {
 
   creatingIndex.value = true
   try {
-    await createPaperQaIndex(paperId.value)
+    await createPaperQaIndex(paperId.value, loadingMethod.value)
     ElMessage.success('问答索引创建成功')
     await fetchQaStatus()
   } catch (error: any) {
@@ -526,16 +409,26 @@ watch(qaLoading, () => scrollToBottom())
                   查看原文
                 </el-button>
               </a>
+              <div class="parser-card">
+                <div class="parser-card-head">
+                  <span class="parser-label">PDF 解析</span>
+                  <span class="parser-hint">{{ loadingMethodHint }}</span>
+                </div>
+                <el-radio-group v-model="loadingMethod" class="parser-segment" :disabled="creatingIndex" size="small">
+                  <el-radio-button label="docling">Docling</el-radio-button>
+                  <el-radio-button label="pymupdf">PyMuPDF</el-radio-button>
+                </el-radio-group>
+              </div>
               <el-button size="large" type="primary" class="action-button ask-button" @click="handleAskPaper" :loading="creatingIndex">
                 <el-icon><ChatDotRound /></el-icon>
-                {{ creatingIndex ? '创建索引中...' : '开始问答' }}
+                {{ creatingIndex ? `创建 ${loadingMethodLabel} 索引中...` : `开始问答 · ${loadingMethodLabel}` }}
               </el-button>
             </div>
 
             <div class="status-note" v-if="qaStatus">
               <el-icon><Compass /></el-icon>
               <span>
-                {{ qaStatus.has_index ? `索引已完成，${qaStatus.chunk_count || 0} 个 chunks 可供检索` : '先创建索引，再进入问答' }}
+                {{ qaStatus.has_index ? `索引已完成，${qaStatus.chunk_count || 0} 个 chunks 可供检索` : `先创建索引，默认解析方式：${loadingMethodLabel}` }}
               </span>
             </div>
           </div>
@@ -599,224 +492,30 @@ watch(qaLoading, () => scrollToBottom())
                       <span>正在流式生成中...</span>
                     </div>
 
-                    <el-divider content-position="left">参考来源</el-divider>
-
-                    <div v-if="turn.sources.length" class="source-list">
-                      <details v-for="(source, index) in turn.sources" :key="index" class="source-item">
-                        <summary class="source-summary">
-                          <div class="source-summary-main">
-                            <span class="source-index">{{ index + 1 }}</span>
-                            <div class="source-summary-text">
-                              <div class="source-title-row">
-                                <span class="source-title">{{ source.source || '论文片段' }}</span>
-                                <span class="source-badge">{{ getSourceLabel(source, index) }}</span>
-                              </div>
-                              <div class="source-snippet">
-                                {{ source.content }}
-                              </div>
-                            </div>
-                          </div>
-                          <el-icon class="source-chevron"><ArrowDown /></el-icon>
-                        </summary>
-                        <div class="source-body">
-                          <p>{{ source.content }}</p>
-                        </div>
-                      </details>
+                    <div v-if="turn.streaming && (turn.sources.length || turn.retrievalDebug)" class="streaming-evidence-note">
+                      召回内容和调试信息将在回答完成后进入右侧抽屉
                     </div>
 
-                    <div v-else class="source-empty">
-                      这次回答没有返回结构化来源。
-                    </div>
-
-                    <details v-if="turn.retrievalDebug" class="debug-panel" open>
-                      <summary class="debug-summary">
-                        <span>检索调试信息</span>
-                        <span class="debug-summary-badge">Debug Trace</span>
-                      </summary>
-
-                      <div class="debug-grid">
-                        <section class="debug-card">
-                          <div class="debug-card-title">1. 原始问题</div>
-                          <div class="debug-text">{{ turn.retrievalDebug.original_query }}</div>
-                        </section>
-
-                        <section class="debug-card">
-                          <div class="debug-card-title">2. 查询重写</div>
-                          <div class="debug-subsection">
-                            <div class="debug-subtitle">模型输出</div>
-                            <div v-if="turn.retrievalDebug.query_rewrite?.model_queries?.length" class="debug-chip-group">
-                              <span
-                                v-for="(query, idx) in turn.retrievalDebug.query_rewrite.model_queries"
-                                :key="`model-${idx}`"
-                                class="debug-chip"
-                              >
-                                {{ query }}
-                              </span>
-                            </div>
-                            <div v-else class="debug-empty-inline">无</div>
-                          </div>
-
-                          <div class="debug-subsection">
-                            <div class="debug-subtitle">最终参与检索</div>
-                            <div v-if="turn.retrievalDebug.query_rewrite?.selected_queries?.length" class="debug-chip-group">
-                              <span
-                                v-for="(query, idx) in turn.retrievalDebug.query_rewrite.selected_queries"
-                                :key="`selected-${idx}`"
-                                class="debug-chip debug-chip-primary"
-                              >
-                                {{ query }}
-                              </span>
-                            </div>
-                            <div v-else class="debug-empty-inline">无</div>
-                          </div>
-
-                          <div v-if="turn.retrievalDebug.query_rewrite?.heuristic_queries?.length" class="debug-subsection">
-                            <div class="debug-subtitle">启发式补充</div>
-                            <div class="debug-chip-group">
-                              <span
-                                v-for="(query, idx) in turn.retrievalDebug.query_rewrite.heuristic_queries"
-                                :key="`heuristic-${idx}`"
-                                class="debug-chip"
-                              >
-                                {{ query }}
-                              </span>
-                            </div>
-                          </div>
-
-                          <div v-if="turn.retrievalDebug.query_rewrite?.llm_error" class="debug-warning">
-                            重写模型错误：{{ turn.retrievalDebug.query_rewrite.llm_error }}
-                          </div>
-
-                          <div v-if="turn.retrievalDebug.query_rewrite?.candidates?.length" class="debug-subsection">
-                            <div class="debug-subtitle">所有候选与生效状态</div>
-                            <div class="debug-detail-list">
-                              <div
-                                v-for="(candidate, idx) in turn.retrievalDebug.query_rewrite.candidates"
-                                :key="`candidate-${idx}`"
-                                class="debug-detail-item"
-                              >
-                                <div class="debug-detail-query">
-                                  <span class="debug-candidate-source">{{ getQuerySourceLabel(candidate.source) }}</span>
-                                  {{ candidate.query }}
-                                </div>
-                                <div class="debug-detail-meta">
-                                  <span>状态: {{ candidate.selected ? '最终采用' : '未采用' }}</span>
-                                  <span>原因: {{ getQueryCandidateReasonLabel(candidate.reason) }}</span>
-                                </div>
-                              </div>
-                            </div>
-                          </div>
-                        </section>
-
-                        <section class="debug-card">
-                          <div class="debug-card-title">3. HyDE</div>
-                          <div class="debug-text">
-                            {{ turn.retrievalDebug.hyde?.text || turn.retrievalDebug.hyde_text || '无' }}
-                          </div>
-                          <div class="debug-mini-meta">
-                            <span>来源查询：</span>
-                            <strong>{{ formatDebugQueryList(turn.retrievalDebug.hyde?.source_queries) }}</strong>
-                          </div>
-                          <div class="debug-mini-meta">
-                            <span>聚焦关键词：</span>
-                            <strong>{{ formatDebugQueryList(turn.retrievalDebug.hyde?.focus_queries) }}</strong>
-                          </div>
-                        </section>
-
-                        <section class="debug-card">
-                          <div class="debug-card-title">4. 关键词检索</div>
-                          <div class="debug-subsection">
-                            <div class="debug-subtitle">实际参与检索的 Query</div>
-                            <div class="debug-text">{{ formatDebugQueryList(turn.retrievalDebug.keyword_search?.queries) }}</div>
-                          </div>
-
-                          <div class="debug-subsection" v-if="turn.retrievalDebug.keyword_search?.selected_rewrite_queries?.length">
-                            <div class="debug-subtitle">参与关键词检索的重写 Query</div>
-                            <div class="debug-chip-group">
-                              <span
-                                v-for="(query, idx) in turn.retrievalDebug.keyword_search.selected_rewrite_queries"
-                                :key="`keyword-rewrite-${idx}`"
-                                class="debug-chip debug-chip-primary"
-                              >
-                                {{ query }}
-                              </span>
-                            </div>
-                          </div>
-                        </section>
-
-                        <section class="debug-card debug-card-wide">
-                          <div class="debug-card-title">5. 各路召回</div>
-                          <div v-for="(routeChunks, routeName) in turn.retrievalDebug.routes" :key="routeName" class="debug-route-section">
-                            <div class="debug-route-title">
-                              {{ getDebugRouteLabel(routeName) }}
-                              <span class="debug-route-count">{{ routeChunks.length }} 条</span>
-                            </div>
-                            <div v-if="routeChunks.length" class="debug-route-list">
-                              <div v-for="(chunk, idx) in routeChunks" :key="`${routeName}-${idx}`" class="debug-chunk">
-                                <div class="debug-chunk-meta">
-                                  <span>#{{ idx + 1 }}</span>
-                                  <span>chunk {{ chunk.chunk_id ?? '-' }}</span>
-                                  <span>page {{ chunk.page_number || chunk.page_range || '-' }}</span>
-                                  <span>score {{ formatDebugNumber(chunk.route_score) }}</span>
-                                </div>
-                                <div v-if="chunk.source_query" class="debug-chunk-source">
-                                  来源 Query: {{ chunk.source_query }}
-                                </div>
-                                <div class="debug-chunk-text">{{ chunk.preview }}</div>
-                              </div>
-                            </div>
-                            <div v-else class="debug-empty">无召回</div>
-                          </div>
-                        </section>
-
-                        <section class="debug-card debug-card-wide">
-                          <div class="debug-card-title">6. 最终融合</div>
-                          <div class="debug-fusion-grid">
-                            <div class="debug-mini-meta">
-                              <span>算法：</span>
-                              <strong>{{ turn.retrievalDebug.fusion?.algorithm || 'weighted_rrf' }}</strong>
-                            </div>
-                            <div class="debug-mini-meta">
-                              <span>RRF k：</span>
-                              <strong>{{ turn.retrievalDebug.fusion?.rrf_k ?? '-' }}</strong>
-                            </div>
-                            <div class="debug-mini-meta">
-                              <span>Top K：</span>
-                              <strong>{{ turn.retrievalDebug.config?.top_k ?? '-' }}</strong>
-                            </div>
-                            <div class="debug-mini-meta">
-                              <span>候选数：</span>
-                              <strong>{{ turn.retrievalDebug.config?.candidate_k ?? '-' }}</strong>
-                            </div>
-                            <div class="debug-mini-meta debug-fusion-full">
-                              <span>路由权重：</span>
-                              <strong>{{ formatRouteScores(turn.retrievalDebug.fusion?.route_weights) }}</strong>
-                            </div>
-                          </div>
-
-                          <div class="debug-route-list">
-                            <div v-for="(chunk, idx) in turn.retrievalDebug.final_chunks" :key="`final-${idx}`" class="debug-chunk">
-                              <div class="debug-chunk-meta">
-                                <span>#{{ idx + 1 }}</span>
-                                <span>chunk {{ chunk.chunk_id ?? '-' }}</span>
-                                <span>page {{ chunk.page_number || chunk.page_range || '-' }}</span>
-                                <span>fused {{ formatDebugNumber(chunk.score) }}</span>
-                              </div>
-                              <div v-if="chunk.matched_routes?.length" class="debug-chunk-source">
-                                命中路由: {{ formatDebugQueryList(chunk.matched_routes) }}
-                              </div>
-                              <div v-if="chunk.route_scores && Object.keys(chunk.route_scores).length" class="debug-chunk-source">
-                                路由分数: {{ formatRouteScores(chunk.route_scores) }}
-                              </div>
-                              <div v-if="chunk.source_queries?.length" class="debug-chunk-source">
-                                来源 Queries: {{ formatDebugQueryList(chunk.source_queries) }}
-                              </div>
-                              <div class="debug-chunk-text">{{ chunk.preview }}</div>
-                            </div>
-                          </div>
-                        </section>
+                    <div class="assistant-actions">
+                      <div class="assistant-badges">
+                        <el-tag size="small" effect="plain" type="info">
+                          {{ turn.sources.length }} 条来源
+                        </el-tag>
+                        <el-tag v-if="turn.retrievalDebug" size="small" effect="plain" type="warning">
+                          Debug 可查看
+                        </el-tag>
                       </div>
-                    </details>
+                      <el-button
+                        v-if="turn.sources.length || turn.retrievalDebug"
+                        size="small"
+                        text
+                        type="primary"
+                        class="evidence-button"
+                        @click="openEvidence(turn)"
+                      >
+                        查看来源与调试
+                      </el-button>
+                    </div>
 
                     <div class="answer-meta">
                       <span>{{ turn.createdAt }}</span>
@@ -975,6 +674,199 @@ watch(qaLoading, () => scrollToBottom())
             </div>
           </aside>
         </section>
+
+        <el-drawer
+          v-model="evidenceDrawerOpen"
+          :with-header="false"
+          size="42%"
+          class="evidence-drawer"
+          @close="closeEvidence"
+        >
+          <div v-if="activeEvidenceTurn" class="evidence-drawer-body">
+            <div class="evidence-drawer-head">
+              <div>
+                <div class="drawer-title">来源与调试</div>
+                <div class="drawer-question">{{ activeEvidenceTurn.question }}</div>
+              </div>
+              <el-button text @click="closeEvidence">关闭</el-button>
+            </div>
+
+            <section class="drawer-section">
+              <div class="drawer-section-title">参考来源</div>
+              <div v-if="activeEvidenceTurn.sources.length" class="source-list drawer-source-list">
+                <details v-for="(source, index) in activeEvidenceTurn.sources" :key="index" class="source-item">
+                  <summary class="source-summary">
+                    <div class="source-summary-main">
+                      <span class="source-index">{{ index + 1 }}</span>
+                      <div class="source-summary-text">
+                        <div class="source-title-row">
+                          <span class="source-title">{{ source.source || '论文片段' }}</span>
+                          <span class="source-badge">{{ getSourceLabel(source, index) }}</span>
+                        </div>
+                      </div>
+                    </div>
+                    <el-icon class="source-chevron"><ArrowDown /></el-icon>
+                  </summary>
+                  <div class="source-body">
+                    <p>{{ source.content }}</p>
+                  </div>
+                </details>
+              </div>
+              <div v-else class="source-empty">这次回答没有返回结构化来源。</div>
+            </section>
+
+            <section v-if="activeEvidenceTurn.retrievalDebug" class="drawer-section">
+              <div class="drawer-section-title">检索调试</div>
+
+              <div class="debug-grid debug-grid-drawer">
+                <section class="debug-card">
+                  <div class="debug-card-title">原始问题</div>
+                  <div class="debug-text">{{ activeEvidenceTurn.retrievalDebug.original_query }}</div>
+                </section>
+
+                <section class="debug-card">
+                  <div class="debug-card-title">查询重写</div>
+                  <div class="debug-subsection">
+                    <div class="debug-subtitle">模型输出</div>
+                    <div v-if="activeEvidenceTurn.retrievalDebug.query_rewrite?.model_queries?.length" class="debug-chip-group">
+                      <span
+                        v-for="(query, idx) in activeEvidenceTurn.retrievalDebug.query_rewrite.model_queries"
+                        :key="`drawer-model-${idx}`"
+                        class="debug-chip"
+                      >
+                        {{ query }}
+                      </span>
+                    </div>
+                    <div v-else class="debug-empty-inline">无</div>
+                  </div>
+                  <div class="debug-subsection">
+                    <div class="debug-subtitle">最终参与检索</div>
+                    <div v-if="activeEvidenceTurn.retrievalDebug.query_rewrite?.selected_queries?.length" class="debug-chip-group">
+                      <span
+                        v-for="(query, idx) in activeEvidenceTurn.retrievalDebug.query_rewrite.selected_queries"
+                        :key="`drawer-selected-${idx}`"
+                        class="debug-chip debug-chip-primary"
+                      >
+                        {{ query }}
+                      </span>
+                    </div>
+                    <div v-else class="debug-empty-inline">无</div>
+                  </div>
+                </section>
+
+                <section class="debug-card">
+                  <div class="debug-card-title">HyDE 与关键词</div>
+                  <div class="debug-subsection">
+                    <div class="debug-subtitle">HyDE</div>
+                    <div class="debug-text">
+                      {{ activeEvidenceTurn.retrievalDebug.hyde?.text || activeEvidenceTurn.retrievalDebug.hyde_text || '无' }}
+                    </div>
+                  </div>
+                  <div class="debug-subsection">
+                    <div class="debug-subtitle">关键词查询</div>
+                    <div class="debug-text">{{ formatDebugQueryList(activeEvidenceTurn.retrievalDebug.keyword_search?.queries) }}</div>
+                  </div>
+                </section>
+
+                <section class="debug-card debug-card-wide">
+                  <div class="debug-card-title">各路召回</div>
+                  <div
+                    v-for="(routeChunks, routeName) in activeEvidenceTurn.retrievalDebug.routes"
+                    :key="`drawer-route-${routeName}`"
+                    class="debug-route-section"
+                  >
+                    <div class="debug-route-title">
+                      {{ getDebugRouteLabel(routeName) }}
+                      <span class="debug-route-count">{{ routeChunks.length }} 条</span>
+                    </div>
+                    <div v-if="routeChunks.length" class="debug-route-list">
+                      <details
+                        v-for="(chunk, idx) in routeChunks"
+                        :key="`drawer-route-${routeName}-${idx}`"
+                        class="debug-chunk-fold"
+                        :open="idx === 0"
+                      >
+                        <summary class="debug-chunk-summary">
+                          <div class="debug-chunk-meta">
+                            <span>#{{ idx + 1 }}</span>
+                            <span>chunk {{ chunk.chunk_id ?? '-' }}</span>
+                            <span>page {{ chunk.page_number || chunk.page_range || '-' }}</span>
+                            <span>score {{ formatDebugNumber(chunk.route_score) }}</span>
+                          </div>
+                          <el-icon class="debug-chunk-chevron"><ArrowDown /></el-icon>
+                        </summary>
+                        <div class="debug-chunk-body">
+                          <div v-if="chunk.matched_routes?.length" class="debug-chunk-source">
+                            命中路由: {{ formatDebugQueryList(chunk.matched_routes) }}
+                          </div>
+                          <div v-if="chunk.route_scores && Object.keys(chunk.route_scores).length" class="debug-chunk-source">
+                            路由分数: {{ formatRouteScores(chunk.route_scores) }}
+                          </div>
+                          <div v-if="chunk.source_queries?.length" class="debug-chunk-source">
+                            来源 Queries: {{ formatDebugQueryList(chunk.source_queries) }}
+                          </div>
+                          <div class="debug-chunk-text debug-chunk-text-full">
+                            {{ chunk.content || chunk.preview || '-' }}
+                          </div>
+                        </div>
+                      </details>
+                    </div>
+                    <div v-else class="debug-empty">无召回</div>
+                  </div>
+                </section>
+
+                <section class="debug-card debug-card-wide">
+                  <div class="debug-card-title">最终融合</div>
+                  <div class="debug-mini-meta">
+                    <span>算法</span>
+                    <strong>{{ activeEvidenceTurn.retrievalDebug.fusion?.algorithm || 'weighted_rrf' }}</strong>
+                  </div>
+                  <div class="debug-mini-meta">
+                    <span>RRF k</span>
+                    <strong>{{ activeEvidenceTurn.retrievalDebug.fusion?.rrf_k ?? '-' }}</strong>
+                  </div>
+                  <div class="debug-mini-meta">
+                    <span>路由权重</span>
+                    <strong>{{ formatRouteScores(activeEvidenceTurn.retrievalDebug.fusion?.route_weights) }}</strong>
+                  </div>
+
+                  <div class="debug-route-list">
+                    <details
+                      v-for="(chunk, idx) in activeEvidenceTurn.retrievalDebug.final_chunks"
+                      :key="`drawer-final-${idx}`"
+                      class="debug-chunk-fold"
+                      :open="idx === 0"
+                    >
+                      <summary class="debug-chunk-summary">
+                        <div class="debug-chunk-meta">
+                          <span>#{{ idx + 1 }}</span>
+                          <span>chunk {{ chunk.chunk_id ?? '-' }}</span>
+                          <span>page {{ chunk.page_number || chunk.page_range || '-' }}</span>
+                          <span>fused {{ formatDebugNumber(chunk.score) }}</span>
+                        </div>
+                        <el-icon class="debug-chunk-chevron"><ArrowDown /></el-icon>
+                      </summary>
+                      <div class="debug-chunk-body">
+                        <div v-if="chunk.matched_routes?.length" class="debug-chunk-source">
+                          命中路由: {{ formatDebugQueryList(chunk.matched_routes) }}
+                        </div>
+                        <div v-if="chunk.route_scores && Object.keys(chunk.route_scores).length" class="debug-chunk-source">
+                          路由分数: {{ formatRouteScores(chunk.route_scores) }}
+                        </div>
+                        <div v-if="chunk.source_queries?.length" class="debug-chunk-source">
+                          来源 Queries: {{ formatDebugQueryList(chunk.source_queries) }}
+                        </div>
+                        <div class="debug-chunk-text debug-chunk-text-full">
+                          {{ chunk.content || chunk.preview || '-' }}
+                        </div>
+                      </div>
+                    </details>
+                  </div>
+                </section>
+              </div>
+            </section>
+          </div>
+        </el-drawer>
       </template>
 
       <el-empty v-else description="论文不存在" />
@@ -1128,6 +1020,66 @@ watch(qaLoading, () => scrollToBottom())
   flex-wrap: wrap;
   gap: 12px;
   margin-top: 4px;
+}
+
+.parser-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 210px;
+  padding: 12px 14px;
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgba(248, 250, 252, 0.96) 0%, rgba(241, 245, 249, 0.82) 100%);
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.04);
+}
+
+.parser-card-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.parser-label {
+  font-size: 12px;
+  font-weight: 800;
+  color: #334155;
+  letter-spacing: 0.02em;
+}
+
+.parser-hint {
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.parser-segment {
+  width: 100%;
+}
+
+.parser-segment :deep(.el-radio-button__inner) {
+  padding: 8px 14px;
+  border-color: rgba(148, 163, 184, 0.28);
+  background: rgba(255, 255, 255, 0.92);
+  color: #475569;
+  font-weight: 700;
+}
+
+.parser-segment :deep(.el-radio-button:first-child .el-radio-button__inner) {
+  border-radius: 12px 0 0 12px;
+}
+
+.parser-segment :deep(.el-radio-button:last-child .el-radio-button__inner) {
+  border-radius: 0 12px 12px 0;
+}
+
+.parser-segment :deep(.el-radio-button__orig-radio:checked + .el-radio-button__inner) {
+  background: linear-gradient(135deg, #4f8cff 0%, #6e7cff 100%);
+  border-color: #4f8cff;
+  box-shadow: 0 10px 18px rgba(79, 140, 255, 0.18);
+}
+
+.parser-segment :deep(.el-radio-button__inner:hover) {
+  color: #1d4ed8;
 }
 
 .action-link {
@@ -1323,6 +1275,47 @@ watch(qaLoading, () => scrollToBottom())
   white-space: pre-wrap;
 }
 
+.assistant-markdown :deep(.md-empty) {
+  margin: 0;
+  color: #64748b;
+}
+
+.assistant-markdown :deep(.katex-display) {
+  margin: 0.8em 0;
+  overflow-x: auto;
+}
+
+.assistant-markdown :deep(table) {
+  display: block;
+  width: 100%;
+  margin: 14px 0;
+  border-collapse: collapse;
+  border-spacing: 0;
+  overflow-x: auto;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 16px;
+  background: #ffffff;
+}
+
+.assistant-markdown :deep(th),
+.assistant-markdown :deep(td) {
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+  border-right: 1px solid rgba(148, 163, 184, 0.12);
+  text-align: left;
+  vertical-align: top;
+}
+
+.assistant-markdown :deep(th) {
+  background: #f8fafc;
+  color: #0f172a;
+  font-weight: 700;
+}
+
+.assistant-markdown :deep(tr:last-child td) {
+  border-bottom: none;
+}
+
 .assistant-markdown :deep(h1),
 .assistant-markdown :deep(h2),
 .assistant-markdown :deep(h3),
@@ -1374,22 +1367,24 @@ watch(qaLoading, () => scrollToBottom())
 }
 
 .assistant-markdown :deep(code) {
-  padding: 0.15em 0.45em;
-  border-radius: 6px;
-  background: rgba(148, 163, 184, 0.14);
-  color: #1d4ed8;
+  padding: 0.18em 0.48em;
+  border-radius: 8px;
+  background: rgba(37, 99, 235, 0.08);
+  color: #0f172a;
   font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
   font-size: 0.92em;
 }
 
 .assistant-markdown :deep(pre) {
   margin: 14px 0;
-  padding: 14px 16px;
-  border-radius: 16px;
-  background: #0f172a;
+  padding: 16px 18px;
+  border-radius: 18px;
+  background: linear-gradient(180deg, #0f172a, #111827);
   color: #e2e8f0;
   overflow-x: auto;
-  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.08);
+  box-shadow:
+    inset 0 0 0 1px rgba(148, 163, 184, 0.08),
+    0 12px 28px rgba(15, 23, 42, 0.12);
 }
 
 .assistant-markdown :deep(pre code) {
@@ -1422,6 +1417,28 @@ watch(qaLoading, () => scrollToBottom())
   font-style: italic;
 }
 
+.assistant-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(248, 250, 252, 0.96), rgba(241, 245, 249, 0.96));
+  border: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.assistant-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.evidence-button {
+  padding-inline: 10px;
+}
+
 .streaming-indicator {
   display: inline-flex;
   align-items: center;
@@ -1429,6 +1446,82 @@ watch(qaLoading, () => scrollToBottom())
   margin-top: 12px;
   font-size: 13px;
   color: #64748b;
+}
+
+.streaming-evidence-note {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(59, 130, 246, 0.08);
+  color: #2563eb;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.evidence-drawer {
+  --el-drawer-padding-primary: 0;
+}
+
+.evidence-drawer :deep(.el-drawer__body) {
+  padding: 0;
+  overflow: hidden;
+}
+
+.evidence-drawer-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  height: 100%;
+  padding: 20px;
+  overflow: auto;
+  background:
+    radial-gradient(circle at top right, rgba(96, 165, 250, 0.08), transparent 30%),
+    linear-gradient(180deg, #ffffff, #f8fbff);
+}
+
+.evidence-drawer-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.drawer-title {
+  font-size: 18px;
+  font-weight: 800;
+  color: #0f172a;
+}
+
+.drawer-question {
+  margin-top: 6px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #475569;
+}
+
+.drawer-section {
+  padding: 16px;
+  border-radius: 20px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.04);
+}
+
+.drawer-section-title {
+  font-size: 15px;
+  font-weight: 800;
+  color: #0f172a;
+  margin-bottom: 12px;
+}
+
+.drawer-source-list {
+  max-height: none;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.debug-grid-drawer {
+  grid-template-columns: 1fr;
 }
 
 .source-list {
@@ -1513,16 +1606,6 @@ watch(qaLoading, () => scrollToBottom())
   color: #0f172a;
 }
 
-.source-snippet {
-  color: #475569;
-  font-size: 13px;
-  line-height: 1.65;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
 .source-chevron {
   flex: 0 0 auto;
   color: #94a3b8;
@@ -1545,6 +1628,7 @@ watch(qaLoading, () => scrollToBottom())
   color: #475569;
   line-height: 1.7;
   white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .source-empty {
@@ -1745,10 +1829,11 @@ watch(qaLoading, () => scrollToBottom())
 }
 
 .debug-chunk {
-  padding: 10px 12px;
-  border-radius: 12px;
+  padding: 0;
+  border-radius: 16px;
   background: #ffffff;
-  border: 1px solid rgba(203, 213, 225, 0.8);
+  border: 1px solid rgba(203, 213, 225, 0.85);
+  overflow: hidden;
 }
 
 .debug-chunk-source {
@@ -1764,7 +1849,54 @@ watch(qaLoading, () => scrollToBottom())
   gap: 8px;
   font-size: 12px;
   color: #64748b;
-  margin-bottom: 6px;
+}
+
+.debug-chunk-fold {
+  border-radius: 16px;
+  background: #ffffff;
+}
+
+.debug-chunk-summary {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  cursor: pointer;
+  list-style: none;
+  background:
+    linear-gradient(180deg, rgba(248, 250, 252, 0.98), rgba(241, 245, 249, 0.92));
+  border-bottom: 1px solid rgba(203, 213, 225, 0.55);
+}
+
+.debug-chunk-summary::-webkit-details-marker {
+  display: none;
+}
+
+.debug-chunk-fold:not([open]) .debug-chunk-summary {
+  border-bottom-color: transparent;
+}
+
+.debug-chunk-fold[open] .debug-chunk-summary {
+  background:
+    linear-gradient(180deg, rgba(248, 250, 252, 1), rgba(255, 255, 255, 1));
+}
+
+.debug-chunk-chevron {
+  flex: none;
+  margin-top: 1px;
+  color: #94a3b8;
+  transition: transform 0.2s ease, color 0.2s ease;
+}
+
+.debug-chunk-fold[open] .debug-chunk-chevron {
+  transform: rotate(180deg);
+  color: #334155;
+}
+
+.debug-chunk-body {
+  padding: 14px 16px 16px;
+  background: #ffffff;
 }
 
 .debug-chunk-text,
@@ -1772,6 +1904,24 @@ watch(qaLoading, () => scrollToBottom())
   font-size: 13px;
   color: #1f2937;
   line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.debug-chunk-text-full {
+  margin-top: 6px;
+  font-size: 14px;
+  line-height: 1.75;
+  color: #0f172a;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.debug-chunk-fold .debug-chunk-body .debug-chunk-text-full {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: #f8fafc;
+  border: 1px solid rgba(226, 232, 240, 0.95);
 }
 
 .debug-fusion-grid {

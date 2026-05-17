@@ -14,6 +14,41 @@ class ChunkingService:
     Chunk PDF pages using page and heading structure only.
     """
 
+    def chunk_pymupdf(
+        self,
+        text: Union[str, dict],
+        metadata: dict,
+        page_map: list = None,
+        method: str = "by_titles",
+        chunk_size: int = 500,
+    ) -> dict:
+        pymupdf_metadata = dict(metadata or {})
+        pymupdf_metadata["loading_method"] = "pymupdf"
+        return self.chunk_text(
+            text=text,
+            method=method,
+            metadata=pymupdf_metadata,
+            page_map=page_map,
+            chunk_size=chunk_size,
+        )
+
+    def chunk_docling(
+        self,
+        text: Union[str, dict],
+        metadata: dict,
+        page_map: list = None,
+        chunk_size: int = 500,
+    ) -> dict:
+        docling_metadata = dict(metadata or {})
+        docling_metadata["loading_method"] = "docling"
+        return self.chunk_text(
+            text=text,
+            method="docling_sections",
+            metadata=docling_metadata,
+            page_map=page_map,
+            chunk_size=chunk_size,
+        )
+
     def chunk_text(
         self,
         text: Union[str, dict],
@@ -29,7 +64,10 @@ class ChunkingService:
 
             filename = metadata.get("filename", "")
             source_name = metadata.get("filename", "") or metadata.get("source", "")
-            if method == "by_pages":
+            loading_method = str(metadata.get("loading_method", "") or "").strip().lower()
+            if loading_method == "docling":
+                chunks = self._chunk_docling_sections(text, normalized_page_map, source_name, chunk_size)
+            elif method == "by_pages":
                 chunks = self._chunk_by_pages(normalized_page_map, source_name)
             elif method == "fixed_size":
                 chunks = self._chunk_fixed_size(normalized_page_map, source_name, chunk_size)
@@ -42,45 +80,63 @@ class ChunkingService:
             else:
                 raise ValueError(f"Unsupported chunking method: {method}")
 
-            for index, chunk in enumerate(chunks, start=1):
-                chunk["metadata"]["chunk_index"] = index
-                chunk["metadata"]["chunk_id"] = index
-                chunk["metadata"]["total_chunks"] = len(chunks)
-
-            chunks = self._expand_overlong_chunks(
-                chunks,
-                max_length=MAX_CHUNK_CONTENT_LENGTH,
-                overlap=CHUNK_OVERLAP_LENGTH,
+            return self._finalize_chunk_output(
+                filename=filename,
+                chunks=chunks,
+                total_pages=len(normalized_page_map),
+                loading_method=metadata.get("loading_method", ""),
+                chunking_method=method,
+                pages=normalized_page_map,
             )
-
-            for index, chunk in enumerate(chunks, start=1):
-                metadata = chunk["metadata"]
-                metadata["chunk_index"] = index
-                metadata["chunk_id"] = index
-                metadata["total_chunks"] = len(chunks)
-                metadata["parent_chunk_id"] = int(metadata.get("parent_chunk_id", index))
-                metadata["subchunk_index"] = int(metadata.get("subchunk_index", 1))
-                metadata["subchunk_count"] = int(metadata.get("subchunk_count", 1))
-                metadata["subchunk_label"] = str(
-                    metadata.get(
-                        "subchunk_label",
-                        f"chunk {metadata['parent_chunk_id']} part {metadata['subchunk_index']}/{metadata['subchunk_count']}",
-                    )
-                )
-
-            return {
-                "filename": filename,
-                "total_chunks": len(chunks),
-                "total_pages": len(normalized_page_map),
-                "loading_method": metadata.get("loading_method", ""),
-                "chunking_method": method,
-                "timestamp": datetime.now().isoformat(),
-                "pages": normalized_page_map,
-                "chunks": chunks,
-            }
         except Exception as e:
             logger.error(f"Error in chunk_text: {str(e)}")
             raise
+
+    def _finalize_chunk_output(
+        self,
+        filename: str,
+        chunks: List[Dict[str, Any]],
+        total_pages: int,
+        loading_method: str,
+        chunking_method: str,
+        pages: List[Dict[str, Any]],
+    ) -> dict:
+        for index, chunk in enumerate(chunks, start=1):
+            chunk["metadata"]["chunk_index"] = index
+            chunk["metadata"]["chunk_id"] = index
+            chunk["metadata"]["total_chunks"] = len(chunks)
+
+        chunks = self._expand_overlong_chunks(
+            chunks,
+            max_length=MAX_CHUNK_CONTENT_LENGTH,
+            overlap=CHUNK_OVERLAP_LENGTH,
+        )
+
+        for index, chunk in enumerate(chunks, start=1):
+            metadata = chunk["metadata"]
+            metadata["chunk_index"] = index
+            metadata["chunk_id"] = index
+            metadata["total_chunks"] = len(chunks)
+            metadata["parent_chunk_id"] = int(metadata.get("parent_chunk_id", index))
+            metadata["subchunk_index"] = int(metadata.get("subchunk_index", 1))
+            metadata["subchunk_count"] = int(metadata.get("subchunk_count", 1))
+            metadata["subchunk_label"] = str(
+                metadata.get(
+                    "subchunk_label",
+                    f"chunk {metadata['parent_chunk_id']} part {metadata['subchunk_index']}/{metadata['subchunk_count']}",
+                )
+            )
+
+        return {
+            "filename": filename,
+            "total_chunks": len(chunks),
+            "total_pages": total_pages,
+            "loading_method": loading_method,
+            "chunking_method": chunking_method,
+            "timestamp": datetime.now().isoformat(),
+            "pages": pages,
+            "chunks": chunks,
+        }
 
     def _expand_overlong_chunks(
         self,
@@ -367,6 +423,380 @@ class ChunkingService:
 
         flush_section()
         return chunks
+
+    def _chunk_docling_sections(
+        self,
+        text: Union[str, dict],
+        normalized_page_map: List[Dict[str, Any]],
+        source_name: str,
+        chunk_size: int,
+    ) -> List[Dict[str, Any]]:
+        docling_items = self._collect_docling_items(text, normalized_page_map)
+        if not docling_items:
+            return self._chunk_by_titles(normalized_page_map, source_name, chunk_size)
+
+        sections = self._build_docling_sections(docling_items)
+        if not sections:
+            return self._chunk_by_titles(normalized_page_map, source_name, chunk_size)
+
+        chunks: List[Dict[str, Any]] = []
+        for section in sections:
+            section_chunks = self._split_docling_section(section, chunk_size)
+            section_part_count = len(section_chunks)
+            if not section_part_count:
+                continue
+
+            for part_index, part in enumerate(section_chunks, start=1):
+                part_text = part.strip()
+                if not part_text:
+                    continue
+
+                chunks.append(
+                    {
+                        "content": part_text,
+                        "metadata": self._build_chunk_metadata(
+                            source=source_name,
+                            page_start=int(section["page_start"]),
+                            page_end=int(section["page_end"]),
+                            chunk_text=part_text,
+                            chunk_index=0,
+                            total_chunks=0,
+                            chunking_method="docling_sections",
+                            extra_metadata={
+                                "section_title": str(section["title"]),
+                                "section_level": int(section["level"]),
+                                "section_path": str(section["path"]),
+                                "section_part_index": part_index,
+                                "section_part_count": section_part_count,
+                            },
+                        ),
+                    }
+                )
+
+        return chunks
+
+    def _collect_docling_items(
+        self,
+        text: Union[str, dict],
+        normalized_page_map: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        collected: List[Dict[str, Any]] = []
+        seen: set[tuple] = set()
+
+        def append_item(item: Dict[str, Any]) -> None:
+            normalized = self._normalize_docling_item(item)
+            if not normalized:
+                return
+            parent = str(normalized.get("parent", "") or "").strip().lower()
+            if self._docling_parent_is_visual_context(parent):
+                return
+            if str(normalized.get("node_kind", "") or "").strip().lower() in {"visual_text", "noise"}:
+                return
+            key = (
+                normalized.get("label", ""),
+                normalized.get("text", ""),
+                normalized.get("page_start"),
+                normalized.get("page_end"),
+                normalized.get("order_index"),
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            collected.append(normalized)
+
+        if isinstance(text, dict):
+            raw_items = text.get("docling_text_items")
+            if not isinstance(raw_items, list):
+                raw_items = text.get("docling_items")
+            if isinstance(raw_items, list):
+                for item in raw_items:
+                    append_item(item)
+
+            structure = text.get("docling_structure")
+            if isinstance(structure, dict):
+                structured_items = structure.get("items")
+                if isinstance(structured_items, list) and not collected:
+                    for item in structured_items:
+                        append_item(item)
+
+        if not collected:
+            for page in normalized_page_map:
+                page_items = page.get("docling_text_items")
+                if not isinstance(page_items, list):
+                    page_items = page.get("docling_items")
+                if isinstance(page_items, list):
+                    for item in page_items:
+                        append_item(item)
+
+        collected.sort(
+            key=lambda item: (
+                int(item.get("page_start") or item.get("page") or 0),
+                int(item.get("order_index") or 0),
+            )
+        )
+        return collected
+
+    def _normalize_docling_item(self, item: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(item, dict):
+            return None
+
+        text = str(item.get("text", "") or item.get("content", "") or item.get("orig", "") or "").strip()
+        if not text:
+            return None
+
+        label = str(item.get("label", "") or "").strip()
+        role = str(item.get("role", "") or "").strip().lower()
+        node_kind = str(item.get("node_kind", "") or "").strip().lower()
+        heading_level = self._safe_int(item.get("heading_level", item.get("level")))
+        content_layer = str(item.get("content_layer", "") or "").strip()
+        parent = str(item.get("parent", "") or "").strip().lower()
+        page_start = self._safe_int(item.get("page_start", item.get("page", item.get("page_number"))))
+        page_end = self._safe_int(item.get("page_end", page_start))
+        order_index = self._safe_int(item.get("order_index", item.get("line_no", item.get("index"))))
+
+        if not node_kind:
+            if role == "heading":
+                node_kind = "section_header"
+            elif role == "title":
+                node_kind = "title"
+            elif heading_level is not None:
+                node_kind = "section_header"
+            elif self._looks_like_heading_text(text):
+                node_kind = "section_header"
+            else:
+                node_kind = "paragraph"
+
+        if self._docling_parent_is_visual_context(parent) and node_kind == "section_header":
+            if label not in {"caption", "table_caption", "figure_caption"}:
+                node_kind = "paragraph"
+                heading_level = None
+
+        if not heading_level and node_kind == "section_header":
+            heading_level = self._heading_level({"text": text, "role": "heading"})
+            if heading_level is None:
+                heading_level = 1
+
+        normalized = {
+            "text": text,
+            "label": label,
+            "role": role or ("heading" if node_kind == "section_header" else "text"),
+            "heading_level": heading_level,
+            "content_layer": content_layer,
+            "parent": self._serialize_docling_value(item.get("parent")),
+            "formatting": self._serialize_docling_value(item.get("formatting")),
+            "hyperlink": self._serialize_docling_value(item.get("hyperlink")),
+            "prov": self._serialize_docling_value(item.get("prov")),
+            "page_start": page_start,
+            "page_end": page_end or page_start,
+            "page": page_start,
+            "page_number": page_start,
+            "order_index": order_index if order_index is not None else 0,
+            "node_kind": node_kind,
+            "is_heading": node_kind == "section_header",
+        }
+        return normalized
+
+    def _docling_item_is_noise(self, item: Dict[str, Any]) -> bool:
+        content_layer = str(item.get("content_layer", "") or "").strip().lower()
+        label = str(item.get("label", "") or "").strip().lower()
+        node_kind = str(item.get("node_kind", "") or "").strip().lower()
+
+        if node_kind in {"noise", "visual_text"}:
+            return True
+        if content_layer in {"header", "footer"}:
+            return True
+        if label in {"page_number", "pageheader", "pagefooter"}:
+            return True
+        return False
+
+    def _docling_item_is_heading(self, item: Dict[str, Any]) -> bool:
+        if self._docling_item_is_noise(item):
+            return False
+
+        node_kind = str(item.get("node_kind", "") or "").strip().lower()
+        if node_kind == "section_header":
+            return True
+
+        label = str(item.get("label", "") or "").strip().lower()
+        if label in {"section_header", "sectionheaderitem"}:
+            return True
+
+        parent = str(item.get("parent", "") or "").strip().lower()
+        if self._docling_parent_is_visual_context(parent):
+            return False
+
+        heading_level = item.get("heading_level")
+        text = str(item.get("text", "") or "").strip()
+        if heading_level is not None and text:
+            return True
+        if self._looks_like_heading_text(text):
+            return True
+        return False
+
+    def _docling_heading_level(self, item: Dict[str, Any]) -> int:
+        heading_level = self._safe_int(item.get("heading_level"))
+        if heading_level is not None and heading_level > 0:
+            return heading_level
+
+        text = str(item.get("text", "") or "").strip()
+        inferred = self._heading_level({"text": text, "role": "heading"}) if text else None
+        if inferred is not None:
+            return int(inferred)
+        return 1
+
+    def _build_docling_sections(self, docling_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        sections: List[Dict[str, Any]] = []
+        stack: List[Dict[str, Any]] = []
+        current_section: Optional[Dict[str, Any]] = None
+
+        def flush_current_section() -> None:
+            nonlocal current_section
+            if not current_section:
+                return
+            if current_section.get("heading_text") or current_section.get("body_items"):
+                sections.append(current_section)
+            current_section = None
+
+        for item in docling_items:
+            if self._docling_item_is_noise(item):
+                continue
+
+            if self._docling_item_is_heading(item):
+                heading_text = str(item.get("text", "") or "").strip()
+                heading_level = self._docling_heading_level(item)
+
+                flush_current_section()
+
+                while stack and int(stack[-1]["level"]) >= heading_level:
+                    stack.pop()
+
+                path_titles = [str(entry["title"]) for entry in stack] + [heading_text]
+                current_section = {
+                    "title": heading_text,
+                    "level": heading_level,
+                    "path": " > ".join(path_titles),
+                    "heading_text": heading_text,
+                    "heading_item": item,
+                    "body_items": [],
+                    "section_items": [item],
+                    "page_start": item.get("page_start") or item.get("page") or 1,
+                    "page_end": item.get("page_end") or item.get("page_start") or item.get("page") or 1,
+                }
+                stack.append({"title": heading_text, "level": heading_level})
+                continue
+
+            if current_section is None:
+                current_section = {
+                    "title": "Preamble",
+                    "level": 0,
+                    "path": "Preamble",
+                    "heading_text": "",
+                    "heading_item": None,
+                    "body_items": [],
+                    "section_items": [],
+                    "page_start": item.get("page_start") or item.get("page") or 1,
+                    "page_end": item.get("page_end") or item.get("page_start") or item.get("page") or 1,
+                }
+
+            current_section["body_items"].append(item)
+            current_section["section_items"].append(item)
+            page_start = item.get("page_start") or item.get("page") or current_section["page_start"]
+            page_end = item.get("page_end") or item.get("page_start") or item.get("page") or current_section["page_end"]
+            current_section["page_start"] = min(int(current_section["page_start"]), int(page_start))
+            current_section["page_end"] = max(int(current_section["page_end"]), int(page_end))
+
+        flush_current_section()
+        return [section for section in sections if section.get("heading_text") or section.get("body_items")]
+
+    def _split_docling_section(self, section: Dict[str, Any], chunk_size: int) -> List[str]:
+        heading_text = str(section.get("heading_text", "") or "").strip()
+        body_items = section.get("body_items", []) or []
+        body_units: List[str] = []
+
+        for item in body_items:
+            text = str(item.get("text", "") or "").strip()
+            if not text:
+                continue
+            if item.get("node_kind") in {"list_item", "caption", "code", "formula"}:
+                body_units.append(text)
+                continue
+            paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+            body_units.extend(paragraphs or [text])
+
+        body_text = self._compose_docling_body_text(body_units)
+        if not body_text and heading_text:
+            return [heading_text]
+
+        if heading_text:
+            combined = f"{heading_text}\n{body_text}".strip() if body_text else heading_text
+        else:
+            combined = body_text
+
+        if not combined:
+            return []
+
+        if len(combined.split()) <= chunk_size:
+            return [combined]
+
+        body_chunks = self._pack_text_units(
+            body_units or [body_text],
+            source_name="",
+            page_start=int(section.get("page_start") or 1),
+            page_end=int(section.get("page_end") or section.get("page_start") or 1),
+            chunk_size=chunk_size,
+            chunking_method="docling_sections",
+        )
+        if not body_chunks:
+            return [combined]
+
+        packed = []
+        for chunk in body_chunks:
+            text = str(chunk.get("content", "") or "").strip()
+            if not text:
+                continue
+            if heading_text and not text.startswith(heading_text):
+                text = f"{heading_text}\n{text}".strip()
+            packed.append(text)
+        return packed or [combined]
+
+    def _compose_docling_body_text(self, units: List[str]) -> str:
+        cleaned = [re.sub(r"\s+", " ", str(unit or "")).strip() for unit in units if str(unit or "").strip()]
+        if not cleaned:
+            return ""
+        return "\n\n".join(cleaned).strip()
+
+    def _safe_int(self, value: Any) -> Optional[int]:
+        try:
+            if value is None:
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _serialize_docling_value(self, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {str(key): self._serialize_docling_value(val) for key, val in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._serialize_docling_value(item) for item in value]
+        if hasattr(value, "__dict__") and value.__dict__:
+            return {
+                str(key): self._serialize_docling_value(val)
+                for key, val in value.__dict__.items()
+                if not str(key).startswith("_")
+            }
+        if hasattr(value, "value"):
+            return self._serialize_docling_value(getattr(value, "value"))
+        return str(value)
+
+    def _stringify_docling_value(self, value: Any) -> str:
+        serialized = self._serialize_docling_value(value)
+        if serialized is None:
+            return ""
+        return str(serialized).strip()
 
     def _merge_heading_fragments(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not lines:
@@ -693,6 +1123,12 @@ class ChunkingService:
         if len(words) > 5:
             return False
         return normalized[0].isupper() or normalized.isupper()
+
+    def _docling_parent_is_visual_context(self, parent: str) -> bool:
+        normalized = str(parent or "").strip().lower()
+        if not normalized:
+            return False
+        return any(token in normalized for token in ("#/pictures/", "#/figures/", "#/tables/"))
 
     def _is_section_number_only(self, text: str) -> bool:
         normalized = str(text or "").strip()

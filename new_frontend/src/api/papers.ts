@@ -328,14 +328,21 @@ export interface CreateQaIndexResult {
   status: string
   message: string
   arxiv_id: string
-  collection_name: string
-  chunk_count: number
-  embedding_model: string
+  loading_method?: string
   pdf_path: string
+  document_path?: string
+  filename?: string
+  total_pages?: number
+  document_text_length?: number
+  document_markdown_length?: number
 }
 
-export async function createPaperQaIndex(arxivId: string): Promise<CreateQaIndexResult> {
-  return request.post(`/paper/${arxivId}/create-qa-index`)
+export async function createPaperQaIndex(arxivId: string, loadingMethod: string = 'pymupdf'): Promise<CreateQaIndexResult> {
+  return request.post(`/paper/${arxivId}/create-qa-index`, null, {
+    params: {
+      loading_method: loadingMethod
+    }
+  })
 }
 
 export interface QaResult {
@@ -374,6 +381,7 @@ export interface RetrievalDebugChunk {
   source_query?: string
   source_queries?: string[]
   subchunk_label?: string
+  content?: string
   preview?: string
 }
 
@@ -395,6 +403,7 @@ export interface RetrievalDebugQueryCandidate {
 export interface RetrievalDebugQueryRewrite {
   enabled?: boolean
   original_query?: string
+  query_plan?: Record<string, any>
   model_queries?: string[]
   heuristic_queries?: string[]
   selected_queries?: string[]
@@ -423,6 +432,7 @@ export interface RetrievalDebug {
   original_query: string
   rewritten_queries: string[]
   hyde_text: string
+  query_plan?: Record<string, any>
   query_rewrite?: RetrievalDebugQueryRewrite
   hyde?: RetrievalDebugHyde
   keyword_search?: RetrievalDebugKeywordSearch

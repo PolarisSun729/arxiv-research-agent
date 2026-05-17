@@ -270,25 +270,65 @@ Answer:"""
         self,
         question: str,
         max_queries: int = 3,
+        paper_context: Optional[Dict[str, Any]] = None,
         api_key: Optional[str] = None,
         model_name: str = QWEN_MODEL_NAME,
     ) -> List[str]:
+        data = self.plan_queries_for_retrieval(
+            question=question,
+            max_queries=max_queries,
+            paper_context=paper_context,
+            api_key=api_key,
+            model_name=model_name,
+        )
+        queries = data.get("rewrite_queries", [])
+        normalized_queries: List[str] = []
+        for item in queries:
+            if isinstance(item, dict):
+                query = str(item.get("query", "")).strip()
+                if query:
+                    normalized_queries.append(query)
+            elif isinstance(item, str) and item.strip():
+                normalized_queries.append(item.strip())
+        return normalized_queries
+
+    def plan_queries_for_retrieval(
+        self,
+        question: str,
+        max_queries: int = 5,
+        paper_context: Optional[Dict[str, Any]] = None,
+        api_key: Optional[str] = None,
+        model_name: str = QWEN_MODEL_NAME,
+    ) -> Dict[str, Any]:
+        paper_context = paper_context or {}
+        title = str(paper_context.get("title", "") or "").strip()
+        abstract = str(paper_context.get("abstract", "") or "").strip()
+        section_titles = [str(item).strip() for item in (paper_context.get("section_titles", []) or []) if str(item).strip()]
+        candidate_terms = [str(item).strip() for item in (paper_context.get("candidate_terms", []) or []) if str(item).strip()]
+
         prompt = (
-            "You are helping a retrieval system search an English academic paper.\n"
-            "Rewrite the user's question into concise retrieval-oriented English queries.\n"
+            "You are a query planner for retrieval over a single academic paper.\n"
+            "Classify the user's question, infer the user's intent, and produce retrieval queries grounded in the paper context.\n"
             "Rules:\n"
             "1. Return JSON only.\n"
-            "2. Output format: {\"queries\": [\"...\", \"...\"]}\n"
-            "3. Keep each query short and retrieval-friendly.\n"
-            "4. Preserve the user's intent.\n"
-            "5. Focus on terminology likely to appear in a research paper.\n"
-            f"6. Return at most {max_queries} rewritten queries.\n\n"
-            f"User question: {question}"
+            "2. Do not invent paper-specific names, datasets, modules, or methods.\n"
+            "3. Prefer terms copied from the paper title, abstract, and section titles.\n"
+            "4. Keep each query short and retrieval-friendly.\n"
+            "5. Generate 3 to 5 queries with different retrieval angles, not paraphrase duplicates.\n"
+            "6. Prefer English retrieval queries unless the paper context is clearly Chinese.\n"
+            "7. Use one of these question types only: method_flow, experiment_setup, results_analysis, contribution, limitation, dataset, metric, figure_table, summary, other.\n"
+            "8. The JSON schema must be:\n"
+            "   {\"question_type\": \"...\", \"intent_summary\": \"...\", \"paper_terms\": [\"...\"], \"preferred_sections\": [\"...\"], \"rewrite_queries\": [{\"query\": \"...\", \"focus\": \"...\", \"channels\": [\"vector\", \"keyword\"]}]}\n"
+            f"9. Return at most {max_queries} rewrite queries.\n\n"
+            f"User question: {question}\n\n"
+            f"Paper title: {title or 'N/A'}\n"
+            f"Paper abstract: {abstract[:1800] or 'N/A'}\n"
+            f"Section titles: {', '.join(section_titles[:16]) or 'N/A'}\n"
+            f"Candidate paper terms: {', '.join(candidate_terms[:24]) or 'N/A'}"
         )
         response = self.complete_with_qwen(prompt, api_key=api_key, model_name=model_name)
         data = json.loads(self._extract_json_block(response))
-        queries = data.get("queries", [])
-        return [str(query).strip() for query in queries if str(query).strip()]
+        return self._normalize_query_plan(data, question, max_queries=max_queries, paper_context=paper_context)
 
     def generate_hyde_document(
         self,
@@ -318,6 +358,148 @@ Answer:"""
             return plain_match.group(1)
 
         return text
+
+    def _normalize_query_plan(
+        self,
+        data: Dict[str, Any],
+        question: str,
+        max_queries: int = 5,
+        paper_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        paper_context = paper_context or {}
+        paper_terms = [str(item).strip() for item in (data.get("paper_terms", []) or []) if str(item).strip()]
+        preferred_sections = [str(item).strip() for item in (data.get("preferred_sections", []) or []) if str(item).strip()]
+        paper_terms = list(dict.fromkeys(paper_terms))
+        preferred_sections = list(dict.fromkeys(preferred_sections))
+
+        rewrite_queries: List[Dict[str, Any]] = []
+        raw_queries = data.get("rewrite_queries")
+        if isinstance(raw_queries, list):
+            for item in raw_queries:
+                if isinstance(item, dict):
+                    query = str(item.get("query", "")).strip()
+                    if not query:
+                        continue
+                    rewrite_queries.append(
+                        {
+                            "query": query,
+                            "focus": str(item.get("focus", "")).strip(),
+                            "channels": [
+                                str(channel).strip()
+                                for channel in (item.get("channels", []) or [])
+                                if str(channel).strip()
+                            ]
+                            or ["vector", "keyword"],
+                        }
+                    )
+                elif isinstance(item, str) and item.strip():
+                    rewrite_queries.append(
+                        {
+                            "query": item.strip(),
+                            "focus": "",
+                            "channels": ["vector", "keyword"],
+                        }
+                    )
+        else:
+            legacy_queries = data.get("queries", [])
+            if isinstance(legacy_queries, list):
+                for item in legacy_queries:
+                    if isinstance(item, str) and item.strip():
+                        rewrite_queries.append(
+                            {
+                                "query": item.strip(),
+                                "focus": "",
+                                "channels": ["vector", "keyword"],
+                            }
+                        )
+
+        if len(rewrite_queries) > max_queries:
+            rewrite_queries = rewrite_queries[:max_queries]
+
+        if not rewrite_queries:
+            fallback_terms = paper_terms[:4]
+            if not fallback_terms:
+                fallback_terms = self._extract_fallback_terms(
+                    " ".join(
+                        [
+                            str(paper_context.get("title", "") or ""),
+                            str(paper_context.get("abstract", "") or ""),
+                            " ".join(paper_context.get("section_titles", []) or []),
+                            question,
+                        ]
+                    )
+                )
+            fallback_query = " ".join(fallback_terms[:6]).strip() or question.strip()
+            rewrite_queries = [
+                {
+                    "query": fallback_query,
+                    "focus": "semantic",
+                    "channels": ["vector", "keyword"],
+                }
+            ]
+        elif len(rewrite_queries) < 3:
+            question_type = str(data.get("question_type", "other")).strip() or "other"
+            fallback_terms = paper_terms[:4]
+            if not fallback_terms:
+                fallback_terms = self._extract_fallback_terms(
+                    " ".join(
+                        [
+                            str(paper_context.get("title", "") or ""),
+                            str(paper_context.get("abstract", "") or ""),
+                            " ".join(paper_context.get("section_titles", []) or []),
+                            question,
+                        ]
+                    )
+                )
+
+            def build_extra_query(extra_focus: str, focus_label: str) -> Dict[str, Any]:
+                query = " ".join([*fallback_terms[:4], extra_focus]).strip() or question.strip()
+                return {"query": query, "focus": focus_label, "channels": ["vector", "keyword"]}
+
+            fillers: List[Dict[str, Any]] = []
+            if question_type == "method_flow":
+                fillers = [
+                    build_extra_query("method framework algorithm", "method"),
+                    build_extra_query("training inference architecture", "implementation"),
+                ]
+            elif question_type == "experiment_setup":
+                fillers = [
+                    build_extra_query("experiment dataset baseline", "setup"),
+                    build_extra_query("evaluation metric implementation", "evaluation"),
+                ]
+            elif question_type == "results_analysis":
+                fillers = [
+                    build_extra_query("results performance comparison", "results"),
+                    build_extra_query("ablation analysis effect", "analysis"),
+                ]
+            else:
+                fillers = [
+                    build_extra_query("paper summary overview", "overview"),
+                    build_extra_query("section evidence key findings", "evidence"),
+                ]
+
+            for item in fillers:
+                if len(rewrite_queries) >= 3 or len(rewrite_queries) >= max_queries:
+                    break
+                if item["query"] not in {str(entry.get("query", "")) for entry in rewrite_queries if isinstance(entry, dict)}:
+                    rewrite_queries.append(item)
+
+        return {
+            "question_type": str(data.get("question_type", "other")).strip() or "other",
+            "intent_summary": str(data.get("intent_summary", "")).strip(),
+            "paper_terms": paper_terms,
+            "preferred_sections": preferred_sections,
+            "rewrite_queries": rewrite_queries,
+        }
+
+    def _extract_fallback_terms(self, text: str, limit: int = 8) -> List[str]:
+        tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-]{1,}|[\u4e00-\u9fff]{2,}", text or "")
+        seen: List[str] = []
+        for token in tokens:
+            token = token.strip()
+            if token and token not in seen:
+                seen.append(token)
+        return seen[:limit]
 
     def _build_qwen_prompt(self, query: str, context: str) -> str:
         return (

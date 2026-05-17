@@ -152,6 +152,7 @@ pydantic-settings==2.6.1
 pydantic_core==2.20.1
 Pygments==2.18.0
 pymilvus==2.4.5
+docling
 PyMuPDF==1.24.14
 pyparsing==3.1.4
 pypdf==4.3.1
