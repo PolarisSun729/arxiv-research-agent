@@ -145,19 +145,55 @@ class LoadingService:
         pages: List[Dict[str, Any]] = []
         try:
             try:
-                from docling.document_converter import DocumentConverter
+                from docling.datamodel.base_models import InputFormat
+                from docling.datamodel.pipeline_options import PdfPipelineOptions
+                from docling.document_converter import DocumentConverter, PdfFormatOption
             except ImportError as exc:
                 raise ImportError(
                     "Docling is not installed. Install the `docling` package to enable this loading method."
                 ) from exc
 
-            converter = DocumentConverter()
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.generate_page_images = True
+            pipeline_options.generate_picture_images = True
+            pipeline_options.images_scale = 2.0
+
+            converter = DocumentConverter(
+                allowed_formats=[InputFormat.PDF],
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+                },
+            )
             result = converter.convert(file_path)
             document = result.document
             docling_assets = self._extract_docling_assets(document, file_path)
             docling_text_items = docling_assets["text_items"]
             docling_picture_items = docling_assets["picture_items"]
             docling_table_items = docling_assets["table_items"]
+            docling_asset_manifest = docling_assets.get("asset_manifest", {})
+
+            logger.info(
+                "Docling asset summary for %s: picture_raw=%s, picture_extracted=%s, picture_exported=%s, table_raw=%s, table_exported=%s, asset_root=%s",
+                file_path,
+                docling_asset_manifest.get("picture_raw_count", 0),
+                docling_asset_manifest.get("picture_item_count", len(docling_picture_items)),
+                docling_asset_manifest.get("picture_exported_count", 0),
+                docling_asset_manifest.get("table_raw_count", 0),
+                docling_asset_manifest.get("table_exported_count", 0),
+                docling_asset_manifest.get("asset_root", ""),
+            )
+            if docling_asset_manifest.get("picture_raw_count", 0) == 0:
+                logger.warning(
+                    "Docling did not expose any raw pictures for %s. The PDF may not contain raster images or Docling did not detect them.",
+                    file_path,
+                )
+            elif docling_asset_manifest.get("picture_exported_count", 0) == 0:
+                logger.warning(
+                    "Docling found %s picture item(s) for %s but exported none. Picture samples: %s",
+                    docling_asset_manifest.get("picture_raw_count", 0),
+                    file_path,
+                    docling_asset_manifest.get("picture_debug_samples", []),
+                )
 
             docling_text_items_by_page = self._group_docling_items_by_page(docling_text_items)
             docling_picture_items_by_page = self._group_docling_items_by_page(docling_picture_items)
@@ -232,7 +268,7 @@ class LoadingService:
                 "docling_table_items": docling_table_items,
                 "docling_table_item_count": len(docling_table_items),
                 "docling_asset_root": docling_assets.get("asset_root"),
-                "docling_asset_manifest": docling_assets.get("asset_manifest", {}),
+                "docling_asset_manifest": docling_asset_manifest,
             }
         except Exception as e:
             logger.error(f"Docling error: {str(e)}")
@@ -726,6 +762,8 @@ class LoadingService:
 
     def _extract_docling_assets(self, document: Any, source_path: str) -> Dict[str, Any]:
         asset_root = self._build_docling_asset_root(source_path)
+        raw_picture_items = list(getattr(document, "pictures", []) or [])
+        raw_table_items = list(getattr(document, "tables", []) or [])
         text_items = self._extract_docling_text_items(document)
         picture_items = self._extract_docling_picture_items(document, asset_root, source_path)
         table_items = self._extract_docling_table_items(document, asset_root, source_path)
@@ -735,6 +773,18 @@ class LoadingService:
             "table_items": table_items,
             "asset_root": asset_root,
             "asset_manifest": {
+                "picture_raw_count": len(raw_picture_items),
+                "picture_item_count": len(picture_items),
+                "picture_exported_count": sum(1 for item in picture_items if item.get("asset_exported")),
+                "picture_failed_count": sum(1 for item in picture_items if item.get("asset_exported") is False),
+                "picture_debug_samples": [
+                    item.get("asset_export_reason")
+                    for item in picture_items
+                    if item.get("asset_export_reason")
+                ][:10],
+                "table_raw_count": len(raw_table_items),
+                "table_item_count": len(table_items),
+                "table_exported_count": sum(1 for item in table_items if item.get("asset_exported")),
                 "picture_count": len(picture_items),
                 "table_count": len(table_items),
             },
@@ -759,8 +809,20 @@ class LoadingService:
             normalized_item = self._normalize_docling_asset_item(item, index, asset_kind="picture")
             if normalized_item:
                 export_info = self._export_docling_picture_asset(document, item, asset_root, source_path, index)
-                if export_info:
-                    normalized_item.update(export_info)
+                normalized_item.update(export_info)
+                if export_info.get("asset_exported") is not True:
+                    logger.warning(
+                        "Docling picture export did not produce a file for %s (picture #%s): %s",
+                        source_path,
+                        index,
+                        self._summarize_docling_asset_item(normalized_item),
+                    )
+                    logger.warning(
+                        "Docling picture raw object details for %s (picture #%s): %s",
+                        source_path,
+                        index,
+                        self._summarize_docling_asset_item(item),
+                    )
                 normalized.append(normalized_item)
 
         return normalized
@@ -913,11 +975,61 @@ class LoadingService:
                 except TypeError:
                     continue
                 except Exception as exc:
-                    logger.warning("Docling picture export failed for %s: %s", source_path, exc)
-                    return {}
+                    logger.warning(
+                        "Docling picture get_image raised for %s (picture #%s): %s",
+                        source_path,
+                        order_index,
+                        exc,
+                        exc_info=True,
+                    )
+                    return {
+                        "asset_exported": False,
+                        "asset_export_reason": "get_image_exception",
+                        "asset_export_error": str(exc),
+                    }
 
         if image_obj is None:
-            return {}
+            image_attr = getattr(picture_item, "image", None)
+            if image_attr is not None:
+                logger.warning(
+                    "Docling picture get_image returned None for %s (picture #%s), trying image attribute fallback.",
+                    source_path,
+                    order_index,
+                )
+                image_obj = image_attr
+
+        if image_obj is None:
+            bbox_export = self._export_docling_picture_from_bbox(
+                source_path=source_path,
+                picture_item=picture_item,
+                asset_root=asset_root,
+                order_index=order_index,
+            )
+            if bbox_export:
+                logger.warning(
+                    "Docling picture exported via PDF bbox fallback for %s (picture #%s).",
+                    source_path,
+                    order_index,
+                )
+                return bbox_export
+
+        if image_obj is None:
+            logger.warning(
+                "Docling picture get_image returned None for %s (picture #%s). Item: %s",
+                source_path,
+                order_index,
+                self._summarize_docling_asset_item(picture_item),
+            )
+            logger.warning(
+                "Docling picture available attributes for %s (picture #%s): %s",
+                source_path,
+                order_index,
+                self._list_docling_public_attrs(picture_item),
+            )
+            return {
+                "asset_exported": False,
+                "asset_export_reason": "get_image_returned_none",
+            }
 
         try:
             if hasattr(image_obj, "save"):
@@ -929,8 +1041,19 @@ class LoadingService:
                 with open(output_path, "wb") as f:
                     f.write(bytes(image_obj))
         except Exception as exc:
-            logger.warning("Failed to write docling picture asset for %s: %s", source_path, exc)
-            return {}
+            logger.warning(
+                "Failed to write docling picture asset for %s (picture #%s) to %s: %s",
+                source_path,
+                order_index,
+                output_path,
+                exc,
+                exc_info=True,
+            )
+            return {
+                "asset_exported": False,
+                "asset_export_reason": "write_failed",
+                "asset_export_error": str(exc),
+            }
 
         size = getattr(image_obj, "size", None)
         width = height = None
@@ -944,12 +1067,90 @@ class LoadingService:
             summary = f"{summary} ({width}x{height})"
 
         return {
+            "asset_exported": True,
             "asset_path": rel_path,
             "asset_abs_path": os.path.abspath(output_path),
             "asset_summary": summary,
             "asset_file_name": output_name,
             "asset_size": [width, height] if width and height else None,
         }
+
+    def _export_docling_picture_from_bbox(
+        self,
+        source_path: str,
+        picture_item: Any,
+        asset_root: str,
+        order_index: int,
+    ) -> Dict[str, Any]:
+        location = self._extract_docling_picture_location(picture_item)
+        page_no = location.get("page_no")
+        bbox = location.get("bbox")
+        if page_no is None or bbox is None:
+            return {}
+
+        try:
+            import fitz  # PyMuPDF
+        except Exception as exc:
+            logger.warning(
+                "PyMuPDF is unavailable for docling picture bbox fallback on %s (picture #%s): %s",
+                source_path,
+                order_index,
+                exc,
+            )
+            return {}
+
+        try:
+            pdf_doc = fitz.open(source_path)
+        except Exception as exc:
+            logger.warning(
+                "Failed to open PDF for docling picture bbox fallback on %s (picture #%s): %s",
+                source_path,
+                order_index,
+                exc,
+                exc_info=True,
+            )
+            return {}
+
+        try:
+            if page_no < 1 or page_no > len(pdf_doc):
+                return {}
+
+            page = pdf_doc[page_no - 1]
+            rect = self._normalize_docling_bbox_for_pymupdf(bbox, page.rect.height)
+            if rect is None:
+                return {}
+
+            pixmap = page.get_pixmap(clip=rect, dpi=200, alpha=False)
+            picture_dir = os.path.join(asset_root, "pictures")
+            os.makedirs(picture_dir, exist_ok=True)
+            output_name = f"picture-{order_index:03d}.png"
+            output_path = os.path.join(picture_dir, output_name)
+            pixmap.save(output_path)
+
+            caption = self._stringify_docling_value(
+                getattr(picture_item, "caption", None) or getattr(picture_item, "text", None) or getattr(picture_item, "orig", None)
+            )
+            summary = caption or f"picture {order_index}"
+            return {
+                "asset_exported": True,
+                "asset_export_reason": "bbox_fallback",
+                "asset_path": os.path.relpath(output_path, start=os.getcwd()),
+                "asset_abs_path": os.path.abspath(output_path),
+                "asset_summary": summary,
+                "asset_file_name": output_name,
+                "asset_size": [pixmap.width, pixmap.height],
+            }
+        except Exception as exc:
+            logger.warning(
+                "Failed to export docling picture via bbox fallback for %s (picture #%s): %s",
+                source_path,
+                order_index,
+                exc,
+                exc_info=True,
+            )
+            return {}
+        finally:
+            pdf_doc.close()
 
     def _export_docling_table_asset(
         self,
@@ -978,22 +1179,42 @@ class LoadingService:
                     continue
                 except Exception as exc:
                     logger.warning("Docling table dataframe export failed for %s: %s", source_path, exc)
-                    return {}
+                    return {
+                        "asset_exported": False,
+                        "asset_export_reason": "dataframe_export_failed",
+                        "asset_export_error": str(exc),
+                    }
 
         if dataframe is None:
-            return {}
+            return {
+                "asset_exported": False,
+                "asset_export_reason": "dataframe_missing",
+            }
 
         try:
             if hasattr(dataframe, "to_csv"):
                 dataframe.to_csv(csv_path, index=False)
-            if hasattr(dataframe, "to_json"):
-                dataframe.to_json(json_path, orient="records", force_ascii=False, indent=2)
+            json_ready_frame = self._make_json_safe_dataframe(dataframe)
+            if json_ready_frame is not None and hasattr(json_ready_frame, "to_json"):
+                json_ready_frame.to_json(json_path, orient="records", force_ascii=False, indent=2)
             else:
                 with open(json_path, "w", encoding="utf-8") as f:
                     json.dump(self._serialize_docling_value(dataframe), f, ensure_ascii=False, indent=2)
         except Exception as exc:
-            logger.warning("Failed to write docling table asset for %s: %s", source_path, exc)
-            return {}
+            logger.warning(
+                "Failed to write docling table asset for %s (table #%s). columns=%s duplicates=%s error=%s",
+                source_path,
+                order_index,
+                self._summarize_dataframe_columns(dataframe),
+                self._summarize_dataframe_duplicate_columns(dataframe),
+                exc,
+                exc_info=True,
+            )
+            return {
+                "asset_exported": False,
+                "asset_export_reason": "write_failed",
+                "asset_export_error": str(exc),
+            }
 
         rel_csv_path = os.path.relpath(csv_path, start=os.getcwd())
         rel_json_path = os.path.relpath(json_path, start=os.getcwd())
@@ -1013,13 +1234,17 @@ class LoadingService:
             summary = f"{summary} ({row_count}x{column_count})"
 
         preview = None
-        if hasattr(dataframe, "head"):
+        preview_frame = self._make_json_safe_dataframe(dataframe)
+        if preview_frame is None:
+            preview_frame = dataframe
+        if hasattr(preview_frame, "head"):
             try:
-                preview = self._serialize_docling_value(dataframe.head(5).to_dict(orient="records"))
+                preview = self._serialize_docling_value(preview_frame.head(5).to_dict(orient="records"))
             except Exception:
                 preview = None
 
         return {
+            "asset_exported": True,
             "asset_path": rel_csv_path,
             "asset_json_path": rel_json_path,
             "asset_abs_path": os.path.abspath(csv_path),
@@ -1029,6 +1254,153 @@ class LoadingService:
             "asset_columns": column_count,
             "asset_preview": preview,
         }
+
+    def _summarize_docling_asset_item(self, item: Any) -> Dict[str, Any]:
+        if item is None:
+            return {}
+
+        if isinstance(item, dict):
+            return {
+                "type": str(item.get("asset_kind") or item.get("node_kind") or item.get("type") or "dict"),
+                "label": self._stringify_docling_value(item.get("label")),
+                "caption": self._stringify_docling_value(item.get("caption")),
+                "text": self._stringify_docling_value(item.get("text") or item.get("orig")),
+                "parent": self._stringify_docling_value(item.get("parent")),
+                "page_no": self._safe_int(item.get("page_no") or item.get("page_number")),
+                "bbox": self._serialize_docling_value(item.get("bbox")),
+                "asset_export_reason": self._stringify_docling_value(item.get("asset_export_reason")),
+            }
+
+        return {
+            "type": item.__class__.__name__,
+            "label": self._stringify_docling_value(getattr(item, "label", None)),
+            "caption": self._stringify_docling_value(getattr(item, "caption", None)),
+            "text": self._stringify_docling_value(getattr(item, "text", None) or getattr(item, "orig", None)),
+            "parent": self._stringify_docling_value(getattr(item, "parent", None)),
+            "page_no": self._safe_int(getattr(item, "page_no", None) or getattr(item, "page_number", None)),
+            "bbox": self._serialize_docling_value(getattr(item, "bbox", None)),
+        }
+
+    def _extract_docling_picture_location(self, item: Any) -> Dict[str, Any]:
+        if item is None:
+            return {"page_no": None, "bbox": None}
+
+        raw_prov = getattr(item, "prov", None)
+        if raw_prov is None and isinstance(item, dict):
+            raw_prov = item.get("prov")
+
+        provenance = self._normalize_docling_provenance(raw_prov)
+        for entry in provenance:
+            page_no = entry.get("page_no")
+            bbox = entry.get("bbox")
+            if page_no is not None and bbox:
+                return {"page_no": page_no, "bbox": bbox}
+
+        page_no = self._safe_int(getattr(item, "page_no", None) or getattr(item, "page_number", None))
+        bbox = getattr(item, "bbox", None)
+        if bbox is None and isinstance(item, dict):
+            bbox = item.get("bbox")
+        return {"page_no": page_no, "bbox": self._normalize_bbox(bbox)}
+
+    def _normalize_docling_bbox_for_pymupdf(self, bbox: Any, page_height: float) -> Optional["fitz.Rect"]:
+        coord_origin = ""
+        if isinstance(bbox, dict):
+            try:
+                left = float(bbox.get("l", bbox.get("left")))
+                right = float(bbox.get("r", bbox.get("right")))
+                top = float(bbox.get("t", bbox.get("top")))
+                bottom = float(bbox.get("b", bbox.get("bottom")))
+            except (TypeError, ValueError):
+                return None
+            coord_origin = str(self._serialize_docling_value(bbox.get("coord_origin")) or "").upper()
+        elif isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+            try:
+                left = float(bbox[0])
+                top = float(bbox[1])
+                right = float(bbox[2])
+                bottom = float(bbox[3])
+            except (TypeError, ValueError):
+                return None
+        else:
+            return None
+
+        if coord_origin.endswith("BOTTOMLEFT"):
+            top = page_height - top
+            bottom = page_height - bottom
+
+        y0 = min(top, bottom)
+        y1 = max(top, bottom)
+        try:
+            import fitz  # PyMuPDF
+            return fitz.Rect(left, y0, right, y1)
+        except Exception:
+            return None
+
+    def _list_docling_public_attrs(self, item: Any, limit: int = 40) -> List[str]:
+        if item is None:
+            return []
+        try:
+            attrs = [name for name in dir(item) if not name.startswith("_")]
+        except Exception:
+            return []
+        return attrs[:limit]
+
+    def _summarize_dataframe_columns(self, dataframe: Any, limit: int = 40) -> List[str]:
+        columns = getattr(dataframe, "columns", None)
+        if columns is None:
+            return []
+        try:
+            values = [self._stringify_docling_value(col) for col in list(columns)]
+        except Exception:
+            return []
+        return values[:limit]
+
+    def _summarize_dataframe_duplicate_columns(self, dataframe: Any) -> List[str]:
+        columns = self._summarize_dataframe_columns(dataframe)
+        if not columns:
+            return []
+        seen = set()
+        duplicates = []
+        for col in columns:
+            if col in seen and col not in duplicates:
+                duplicates.append(col)
+            seen.add(col)
+        return duplicates
+
+    def _make_json_safe_dataframe(self, dataframe: Any) -> Any:
+        if dataframe is None or not hasattr(dataframe, "copy") or not hasattr(dataframe, "columns"):
+            return None
+
+        try:
+            columns = [self._stringify_docling_value(col) for col in list(dataframe.columns)]
+        except Exception:
+            return dataframe
+
+        if len(columns) == len(set(columns)):
+            return dataframe
+
+        deduped: List[str] = []
+        seen: Dict[str, int] = {}
+        for col in columns:
+            count = seen.get(col, 0) + 1
+            seen[col] = count
+            if count == 1:
+                deduped.append(col)
+            else:
+                deduped.append(f"{col}__{count}")
+
+        try:
+            safe_frame = dataframe.copy()
+            safe_frame.columns = deduped
+            logger.warning(
+                "Docling table columns were deduplicated for JSON export: original=%s deduped=%s",
+                columns,
+                deduped,
+            )
+            return safe_frame
+        except Exception as exc:
+            logger.warning("Failed to build JSON-safe dataframe: %s", exc)
+            return dataframe
 
     def _classify_docling_item_kind(
         self,
@@ -1098,6 +1470,15 @@ class LoadingService:
         return normalized
 
     def _normalize_bbox(self, bbox: Any) -> Optional[List[float]]:
+        if isinstance(bbox, dict):
+            try:
+                left = float(bbox.get("l", bbox.get("left")))
+                top = float(bbox.get("t", bbox.get("top")))
+                right = float(bbox.get("r", bbox.get("right")))
+                bottom = float(bbox.get("b", bbox.get("bottom")))
+                return [left, top, right, bottom]
+            except (TypeError, ValueError):
+                return None
         if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
             return None
         try:
