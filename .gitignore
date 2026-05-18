@@ -18,6 +18,8 @@ backend/03-vector-store/
 backend/04-search-results/
 backend/05-generation-results/
 backend/06-daily-arxiv-paper/
+03-docling-assets/
+backend/03-docling-assets/
 
 
 # C extensions
