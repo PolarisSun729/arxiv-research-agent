@@ -553,21 +553,28 @@ class ChunkingService:
         page_start = self._safe_int(item.get("page_start", item.get("page", item.get("page_number"))))
         page_end = self._safe_int(item.get("page_end", page_start))
         order_index = self._safe_int(item.get("order_index", item.get("line_no", item.get("index"))))
+        heading_candidate = self._is_docling_heading_candidate(text, heading_level)
+        caption_labels = {"caption", "table_caption", "figure_caption"}
 
-        if not node_kind:
-            if role == "heading":
-                node_kind = "section_header"
-            elif role == "title":
-                node_kind = "title"
-            elif heading_level is not None:
-                node_kind = "section_header"
-            elif self._looks_like_heading_text(text):
-                node_kind = "section_header"
-            else:
-                node_kind = "paragraph"
+        if label in caption_labels:
+            node_kind = "caption"
+        elif node_kind == "title":
+            node_kind = "title"
+        elif node_kind == "section_header":
+            node_kind = "section_header" if heading_candidate else "paragraph"
+        elif role == "title":
+            node_kind = "title"
+        elif role == "heading":
+            node_kind = "section_header" if heading_candidate else "paragraph"
+        elif heading_level is not None:
+            node_kind = "section_header" if heading_candidate else "paragraph"
+        elif heading_candidate:
+            node_kind = "section_header"
+        else:
+            node_kind = "paragraph"
 
         if self._docling_parent_is_visual_context(parent) and node_kind == "section_header":
-            if label not in {"caption", "table_caption", "figure_caption"}:
+            if label not in caption_labels:
                 node_kind = "paragraph"
                 heading_level = None
 
@@ -579,7 +586,7 @@ class ChunkingService:
         normalized = {
             "text": text,
             "label": label,
-            "role": role or ("heading" if node_kind == "section_header" else "text"),
+            "role": "heading" if node_kind == "section_header" else ("title" if node_kind == "title" else "text"),
             "heading_level": heading_level,
             "content_layer": content_layer,
             "parent": self._serialize_docling_value(item.get("parent")),
@@ -614,11 +621,19 @@ class ChunkingService:
             return False
 
         node_kind = str(item.get("node_kind", "") or "").strip().lower()
+        if node_kind == "caption":
+            return False
         if node_kind == "section_header":
+            return True
+        if node_kind == "title":
             return True
 
         label = str(item.get("label", "") or "").strip().lower()
+        if label in {"caption", "table_caption", "figure_caption"}:
+            return False
         if label in {"section_header", "sectionheaderitem"}:
+            return self._is_docling_heading_candidate(str(item.get("text", "") or ""), self._safe_int(item.get("heading_level", item.get("level"))))
+        if label in {"title", "titleitem"}:
             return True
 
         parent = str(item.get("parent", "") or "").strip().lower()
@@ -628,10 +643,8 @@ class ChunkingService:
         heading_level = item.get("heading_level")
         text = str(item.get("text", "") or "").strip()
         if heading_level is not None and text:
-            return True
-        if self._looks_like_heading_text(text):
-            return True
-        return False
+            return self._is_docling_heading_candidate(text, self._safe_int(heading_level))
+        return self._is_docling_heading_candidate(text)
 
     def _docling_heading_level(self, item: Dict[str, Any]) -> int:
         heading_level = self._safe_int(item.get("heading_level"))
@@ -1113,7 +1126,9 @@ class ChunkingService:
             return False
         if len(normalized) > 80:
             return False
-        if normalized.endswith((".", ",", ";", ":")):
+        if ":" in normalized:
+            return False
+        if normalized.endswith((".", ",", ";")):
             return False
         if any(ch.isdigit() for ch in normalized):
             return False
@@ -1122,7 +1137,39 @@ class ChunkingService:
         words = normalized.split()
         if len(words) > 5:
             return False
+        if len(words) == 1 and normalized.isupper() and len(normalized) <= 4:
+            return False
         return normalized[0].isupper() or normalized.isupper()
+
+    def _is_docling_numbered_heading_text(self, text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+        return bool(
+            re.fullmatch(
+                r"(?:\d+(?:\.\d+)*|[IVXLCM]+\.?|[A-Z]\.?)\s+[A-Z].{0,160}",
+                normalized,
+            )
+        )
+
+    def _is_docling_heading_candidate(self, text: str, heading_level: Optional[int] = None) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+
+        if self._is_docling_numbered_heading_text(normalized):
+            return True
+
+        if normalized.lower() in {"abstract", "references", "acknowledgements", "acknowledgments"}:
+            return True
+
+        if self._looks_like_heading_text(normalized):
+            return True
+
+        if heading_level is not None and heading_level > 0 and len(normalized) <= 80:
+            return self._looks_like_heading_text(normalized)
+
+        return False
 
     def _docling_parent_is_visual_context(self, parent: str) -> bool:
         normalized = str(parent or "").strip().lower()

@@ -1,7 +1,10 @@
+import json
 import math
 import re
 import logging
 import threading
+import uuid
+from datetime import datetime
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -438,6 +441,8 @@ class EnhancedRetrievalService:
         self.llm_rerank_batch_size = int(RETRIEVAL_CONFIG.get("llm_rerank_batch_size", 8))
         self.llm_rerank_candidate_limit = int(RETRIEVAL_CONFIG.get("llm_rerank_candidate_limit", 24))
         self.llm_rerank_max_doc_chars = int(RETRIEVAL_CONFIG.get("llm_rerank_max_doc_chars", 4096))
+        self.trace_export_enabled = bool(RETRIEVAL_CONFIG.get("trace_export_enabled", True))
+        self.trace_export_dir = Path(str(RETRIEVAL_CONFIG.get("trace_export_dir", "temp/retrieval-traces")))
         self._llm_reranker = None
         self._llm_reranker_lock = threading.Lock()
         self._llm_reranker_path: Optional[str] = None
@@ -464,7 +469,10 @@ class EnhancedRetrievalService:
             options.enable_llm_rerank, RETRIEVAL_CONFIG.get("enable_llm_rerank", False)
         )
         debug_enabled = self._resolve_option(options.debug, RETRIEVAL_CONFIG["debug"])
-        candidate_k = max(effective_top_k, effective_top_k * self.candidate_multiplier)
+        recall_candidate_limit = 30
+        rrf_candidate_limit = 30
+        rerank_candidate_limit = 30
+        final_context_top_k = 15
 
         normalized_collection_name = self._resolve_collection_name(collection_name)
         query_profile = self._build_query_profile(user_query, normalized_collection_name, paper_context=paper_context)
@@ -497,7 +505,7 @@ class EnhancedRetrievalService:
         routes["vector_original"] = self._vector_retrieve(
             collection_name=normalized_collection_name,
             query=user_query,
-            top_k=candidate_k,
+            top_k=recall_candidate_limit,
             route_name="vector_original",
             source_query=user_query,
             query_profile=query_profile,
@@ -508,14 +516,14 @@ class EnhancedRetrievalService:
             rewrite_hits: List[Dict[str, Any]] = []
             for query in query_views["selected_queries"]:
                 rewrite_hits.extend(
-                    self._vector_retrieve(
-                        collection_name=normalized_collection_name,
-                        query=query,
-                        top_k=candidate_k,
-                        route_name="vector_rewrite",
-                        source_query=query,
-                        query_profile=query_profile,
-                        route_queries=query_views["selected_queries"],
+                        self._vector_retrieve(
+                            collection_name=normalized_collection_name,
+                            query=query,
+                            top_k=recall_candidate_limit,
+                            route_name="vector_rewrite",
+                            source_query=query,
+                            query_profile=query_profile,
+                            route_queries=query_views["selected_queries"],
                     )
                 )
             routes["vector_rewrite"] = self._dedupe_preserve_order(rewrite_hits)
@@ -526,7 +534,7 @@ class EnhancedRetrievalService:
             routes["vector_hyde"] = self._vector_retrieve(
                 collection_name=normalized_collection_name,
                 query=hyde_text,
-                top_k=candidate_k,
+                top_k=recall_candidate_limit,
                 route_name="vector_hyde",
                 source_query="hyde",
                 query_profile=query_profile,
@@ -540,7 +548,7 @@ class EnhancedRetrievalService:
             routes["keyword"] = self._keyword_retrieve(
                 collection_name=normalized_collection_name,
                 queries=keyword_queries,
-                top_k=candidate_k,
+                top_k=recall_candidate_limit,
                 query_profile=query_profile,
             )
         else:
@@ -555,8 +563,21 @@ class EnhancedRetrievalService:
             "keywords": self._build_query_keywords(keyword_queries),
         }
 
-        fused_limit = candidate_k if enable_llm_rerank else effective_top_k
-        fused_results = self._fuse_routes(routes, fused_limit, query_profile)
+        fused_limit = rrf_candidate_limit if enable_llm_rerank else final_context_top_k
+        deduped_routes = {
+            route_name: self._dedupe_route_results(route_results)
+            for route_name, route_results in routes.items()
+        }
+        raw_retrieval_top30 = self._build_raw_retrieval_top_n(deduped_routes, limit=recall_candidate_limit)
+        self._log_retrieval_stage("raw_retrieval_top30", raw_retrieval_top30)
+
+        fused_results = self._fuse_routes(deduped_routes, fused_limit, query_profile)
+        fused_top30 = fused_results[:rrf_candidate_limit]
+        self._log_retrieval_stage("fused_top30", fused_top30)
+
+        reranked_results = fused_results
+        final_results = fused_results
+        rerank_query = self._build_rerank_query(user_query, query_profile)
         rerank_debug: Dict[str, Any] = {
             "enabled": enable_llm_rerank,
             "applied": False,
@@ -566,40 +587,77 @@ class EnhancedRetrievalService:
             "output_chunks": len(fused_results),
         }
         if enable_llm_rerank:
-            rerank_result = self.llm_rerank(user_query, fused_results, effective_top_k, query_profile=query_profile)
-            fused_results = rerank_result["chunks"]
+            # 打印log信息，说明进入了rerank模块
+            logger.debug("*" * 50)
+            logger.debug("Entering LLM rerank module with %d candidate chunks", len(fused_results))
+            logger.debug("LLM rerank configuration: model=%s, provider=%s, batch_size=%d, candidate_limit=%d, fallback_local=%s",
+                self.llm_rerank_model_name_or_path,
+                self.llm_rerank_provider,
+                self.llm_rerank_batch_size,
+                rerank_candidate_limit,
+                self.llm_rerank_fallback_local,
+            )
+            logger.debug("*" * 50)
+            rerank_result = self.llm_rerank(
+                rerank_query,
+                fused_results,
+                final_context_top_k,
+                query_profile=query_profile,
+                original_question=user_query,
+                candidate_limit=rerank_candidate_limit,
+            )
+            reranked_results = rerank_result.get("reranked_chunks", rerank_result["chunks"])
+            final_results = self._mark_final_context_chunks(rerank_result["chunks"])
+            self._log_retrieval_stage("reranked_top30", reranked_results[:rrf_candidate_limit])
+            self._log_retrieval_stage("final_context_top15", final_results[:final_context_top_k])
             rerank_debug = rerank_result["debug"]
+        else:
+            self._log_retrieval_stage("reranked_top30", reranked_results[:rrf_candidate_limit])
+            final_results = self._mark_final_context_chunks(fused_results[:final_context_top_k])
+            self._log_retrieval_stage("final_context_top15", final_results[:final_context_top_k])
 
-        result: Dict[str, Any] = {"chunks": fused_results}
+        result: Dict[str, Any] = {"chunks": final_results}
 
         if debug_enabled:
             result["debug"] = {
                 "original_query": user_query,
+                "original_question": user_query,
                 "query_profile": self._debug_query_profile(query_profile),
                 "query_plan": query_profile.query_plan,
                 "query_views": query_views,
                 "rewritten_queries": query_views["selected_queries"],
+                "rerank_query": rerank_query,
                 "hyde_text": hyde_text,
                 "query_rewrite": query_views["rewrite_debug"],
                 "hyde": hyde_debug,
                 "keyword_search": keyword_debug,
                 "routes": {
                     route_name: [self._debug_chunk_item(item) for item in route_results]
-                    for route_name, route_results in routes.items()
+                    for route_name, route_results in deduped_routes.items()
                 },
-                "final_chunks": [self._debug_chunk_item(item) for item in fused_results],
+                "stages": {
+                    "raw_retrieval_top30": [self._debug_chunk_item(item) for item in raw_retrieval_top30],
+                    "fused_top30": [self._debug_chunk_item(item) for item in fused_top30],
+                    "reranked_top30": [self._debug_chunk_item(item) for item in reranked_results[:rrf_candidate_limit]],
+                    "final_context_top15": [self._debug_chunk_item(item) for item in final_results[:final_context_top_k]],
+                },
+                "final_chunks": [self._debug_chunk_item(item) for item in final_results],
                 "config": {
                     "top_k": effective_top_k,
-                    "candidate_k": candidate_k,
+                    "candidate_k": recall_candidate_limit,
+                    "rrf_candidate_limit": rrf_candidate_limit,
+                    "rerank_candidate_limit": rerank_candidate_limit,
+                    "final_context_top_k": final_context_top_k,
                     "enable_query_rewrite": enable_query_rewrite,
                     "enable_hyde": enable_hyde,
                     "enable_keyword_search": enable_keyword_search,
                     "enable_llm_rerank": enable_llm_rerank,
                 },
                 "fusion": {
-                    "algorithm": "weighted_rrf",
+                    "algorithm": "pure_rrf",
                     "rrf_k": self.rrf_k,
                     "route_weights": self.route_weights,
+                    "dedupe_per_route": True,
                     "route_confidence": {
                         route_name: self._route_confidence(
                             route_name,
@@ -613,22 +671,57 @@ class EnhancedRetrievalService:
                 "llm_rerank": rerank_debug,
             }
 
+        trace_export = self._export_retrieval_trace(
+            original_question=user_query,
+            user_query=user_query,
+            collection_name=normalized_collection_name,
+            paper_context=paper_context or {},
+            options={
+                "top_k": effective_top_k,
+                "candidate_k": recall_candidate_limit,
+                "enable_query_rewrite": enable_query_rewrite,
+                "enable_hyde": enable_hyde,
+                "enable_keyword_search": enable_keyword_search,
+                "enable_llm_rerank": enable_llm_rerank,
+                "debug": debug_enabled,
+            },
+            query_profile=query_profile,
+            rerank_query=rerank_query,
+            query_views=query_views,
+            hyde_debug=hyde_debug,
+            routes=deduped_routes,
+            raw_retrieval_top30=raw_retrieval_top30,
+            fused_results=fused_results,
+            reranked_results=reranked_results,
+            final_results=final_results,
+            rerank_debug=rerank_debug,
+            final_context_top_k=final_context_top_k,
+        )
+        if trace_export:
+            result["trace_export"] = trace_export
+        if trace_export and debug_enabled and "debug" in result:
+            result["debug"]["trace_export"] = trace_export
+
         return result
 
     def llm_rerank(
         self,
-        user_query: str,
+        rerank_query: str,
         chunks: List[Dict[str, Any]],
         top_k: int,
         query_profile: Optional[QueryProfile] = None,
+        original_question: Optional[str] = None,
+        candidate_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
-        rerank_limit = min(len(chunks), max(top_k, self.llm_rerank_candidate_limit))
+        rerank_limit = min(len(chunks), max(1, int(candidate_limit or self.llm_rerank_candidate_limit)))
         rerank_limit = max(0, rerank_limit)
         limited_chunks = chunks[: max(1, top_k)]
+        original_question = original_question or rerank_query
 
         if not chunks:
             return {
                 "chunks": [],
+                "reranked_chunks": [],
                 "debug": {
                     "enabled": True,
                     "applied": False,
@@ -638,20 +731,22 @@ class EnhancedRetrievalService:
                     "input_chunks": 0,
                     "output_chunks": 0,
                     "candidate_limit": rerank_limit,
-                    "query": user_query,
+                    "query": rerank_query,
+                    "original_question": original_question,
                     "query_profile": self._debug_query_profile(query_profile) if query_profile else None,
                 },
             }
 
         candidate_chunks = [dict(chunk) for chunk in chunks[:rerank_limit]]
         rerank_documents = [
-            self._build_rerank_document_text(chunk, query_profile)
+            self._build_rerank_document_text(chunk)
             for chunk in candidate_chunks
         ]
+        self._log_rerank_inputs(original_question, rerank_query, candidate_chunks, rerank_documents)
 
         if self.llm_rerank_provider == "dashscope":
             remote_result = self._rerank_with_dashscope(
-                user_query=user_query,
+                user_query=rerank_query,
                 chunks=chunks,
                 candidate_chunks=candidate_chunks,
                 rerank_documents=rerank_documents,
@@ -664,6 +759,7 @@ class EnhancedRetrievalService:
             if not self.llm_rerank_fallback_local:
                 return {
                     "chunks": limited_chunks,
+                    "reranked_chunks": limited_chunks,
                     "debug": {
                         "enabled": True,
                         "applied": False,
@@ -676,7 +772,8 @@ class EnhancedRetrievalService:
                         "output_chunks": len(limited_chunks),
                         "candidate_limit": rerank_limit,
                         "batch_size": self.llm_rerank_batch_size,
-                        "query": user_query,
+                        "query": rerank_query,
+                        "original_question": original_question,
                         "query_profile": self._debug_query_profile(query_profile) if query_profile else None,
                     },
                 }
@@ -685,6 +782,7 @@ class EnhancedRetrievalService:
         if reranker is None:
             return {
                 "chunks": limited_chunks,
+                "reranked_chunks": limited_chunks,
                 "debug": {
                     "enabled": True,
                     "applied": False,
@@ -693,15 +791,16 @@ class EnhancedRetrievalService:
                     "model_path": self._llm_reranker_path,
                     "device": self._llm_reranker_device,
                     "input_chunks": len(chunks),
-                    "output_chunks": len(limited_chunks),
-                    "candidate_limit": rerank_limit,
+                        "output_chunks": len(limited_chunks),
+                        "candidate_limit": rerank_limit,
                     "batch_size": self.llm_rerank_batch_size,
-                    "query": user_query,
+                    "query": rerank_query,
+                    "original_question": original_question,
                     "query_profile": self._debug_query_profile(query_profile) if query_profile else None,
                 },
             }
 
-        pairs = [(user_query, document_text) for document_text in rerank_documents]
+        pairs = [(rerank_query, document_text) for document_text in rerank_documents]
 
         try:
             raw_scores = reranker.predict(
@@ -713,10 +812,15 @@ class EnhancedRetrievalService:
                 device=self._llm_reranker_device,
             )
             rerank_scores = torch.sigmoid(torch.as_tensor(raw_scores, dtype=torch.float32)).tolist()
+            self._log_rerank_raw_scores(
+                provider="local",
+                raw_results=[{"returned_index": idx, "relevance_score": float(score)} for idx, score in enumerate(rerank_scores, start=1)],
+            )
         except Exception as exc:  # pragma: no cover - model/runtime failures are environment dependent
             logger.exception("Failed to rerank chunks with Qwen3-VL-Reranker")
             return {
                 "chunks": limited_chunks,
+                "reranked_chunks": limited_chunks,
                 "debug": {
                     "enabled": True,
                     "applied": False,
@@ -725,15 +829,16 @@ class EnhancedRetrievalService:
                     "model_path": self._llm_reranker_path,
                     "device": self._llm_reranker_device,
                     "input_chunks": len(chunks),
-                    "output_chunks": len(limited_chunks),
-                    "candidate_limit": rerank_limit,
+                        "output_chunks": len(limited_chunks),
+                        "candidate_limit": rerank_limit,
                     "batch_size": self.llm_rerank_batch_size,
-                    "query": user_query,
+                    "query": rerank_query,
+                    "original_question": original_question,
                     "query_profile": self._debug_query_profile(query_profile) if query_profile else None,
                 },
             }
 
-        ranked_candidates: List[Dict[str, Any]] = []
+        mapped_candidates: List[Dict[str, Any]] = []
         candidate_debug: List[Dict[str, Any]] = []
         for idx, (chunk, score, document_text) in enumerate(zip(candidate_chunks, rerank_scores, rerank_documents), start=1):
             rerank_score = float(score)
@@ -745,9 +850,23 @@ class EnhancedRetrievalService:
             reranked_chunk["llm_rerank_model"] = self._llm_reranker_path
             reranked_chunk["llm_rerank_prompt"] = self.llm_rerank_prompt
             reranked_chunk["llm_rerank_input_rank"] = idx
+            reranked_chunk["llm_rerank_returned_index"] = idx
             reranked_chunk["llm_rerank_document_preview"] = document_text[:220]
+            reranked_chunk["llm_rerank_used_compressed_text"] = bool(reranked_chunk.get("rerank_text"))
             reranked_chunk["score"] = rerank_score
-            ranked_candidates.append(reranked_chunk)
+            mapped_candidates.append(
+                {
+                    "rerank_rank": None,
+                    "returned_index": idx,
+                    "chunk_id": reranked_chunk.get("chunk_id"),
+                    "page_number": reranked_chunk.get("page_number"),
+                    "fusion_rank": reranked_chunk.get("fusion_rank"),
+                    "fusion_score": fused_score,
+                    "rerank_score": rerank_score,
+                    "text_preview": document_text[:100],
+                    "chunk": reranked_chunk,
+                }
+            )
             candidate_debug.append(
                 {
                     "input_rank": idx,
@@ -755,14 +874,19 @@ class EnhancedRetrievalService:
                     "page_number": reranked_chunk.get("page_number"),
                     "fusion_score": fused_score,
                     "rerank_score": rerank_score,
+                    "rerank_text_preview": self._short_text_preview(reranked_chunk.get("rerank_text", ""), 100),
+                    "rerank_document_preview": reranked_chunk.get("llm_rerank_document_preview", "")[:100],
                     "section_tags": reranked_chunk.get("section_tags", []),
                     "source_query": reranked_chunk.get("source_query", ""),
                 }
             )
 
-        ranked_candidates.sort(key=lambda item: float(item.get("score", 0.0) or 0.0), reverse=True)
-        for rank, item in enumerate(ranked_candidates, start=1):
-            item["llm_rerank_rank"] = rank
+        mapped_candidates.sort(key=lambda item: float(item.get("rerank_score", 0.0) or 0.0), reverse=True)
+        for rank, item in enumerate(mapped_candidates, start=1):
+            item["rerank_rank"] = rank
+            item["chunk"]["llm_rerank_rank"] = rank
+        self._log_rerank_mapped_results(provider="local", mapped_results=mapped_candidates)
+        ranked_candidates = [item["chunk"] for item in mapped_candidates]
 
         tail_chunks: List[Dict[str, Any]] = []
         for idx, chunk in enumerate(chunks[rerank_limit:], start=rerank_limit + 1):
@@ -781,6 +905,7 @@ class EnhancedRetrievalService:
 
         return {
             "chunks": final_chunks,
+            "reranked_chunks": reranked_chunks,
             "debug": {
                 "enabled": True,
                 "applied": True,
@@ -792,7 +917,8 @@ class EnhancedRetrievalService:
                 "candidate_limit": rerank_limit,
                 "input_chunks": len(chunks),
                 "output_chunks": len(final_chunks),
-                "query": user_query,
+                "query": rerank_query,
+                "original_question": original_question,
                 "query_profile": self._debug_query_profile(query_profile) if query_profile else None,
                 "candidate_scores": candidate_debug[: min(10, len(candidate_debug))],
             },
@@ -844,6 +970,7 @@ class EnhancedRetrievalService:
         if not isinstance(results, list):
             self._llm_reranker_error = f"dashscope_rerank_invalid_response: {data}"
             return None
+        self._log_rerank_raw_scores(provider="dashscope", raw_results=results)
 
         score_by_index: Dict[int, float] = {}
         for item in results:
@@ -869,6 +996,7 @@ class EnhancedRetrievalService:
         ranked_candidates: List[Dict[str, Any]] = []
         candidate_debug: List[Dict[str, Any]] = []
         for idx, (chunk, document_text) in enumerate(zip(candidate_chunks, rerank_documents), start=1):
+            returned_index = idx if idx in score_by_index else (idx - 1 if (idx - 1) in score_by_index else None)
             rerank_score = float(score_by_index.get(idx - 1, score_by_index.get(idx, 0.0)))
             fused_score = float(chunk.get("score", 0.0) or 0.0)
             reranked_chunk = dict(chunk)
@@ -878,7 +1006,9 @@ class EnhancedRetrievalService:
             reranked_chunk["llm_rerank_model"] = self.llm_rerank_model_name
             reranked_chunk["llm_rerank_prompt"] = self.llm_rerank_prompt
             reranked_chunk["llm_rerank_input_rank"] = idx
+            reranked_chunk["llm_rerank_returned_index"] = returned_index
             reranked_chunk["llm_rerank_document_preview"] = document_text[:220]
+            reranked_chunk["llm_rerank_used_compressed_text"] = bool(reranked_chunk.get("rerank_text"))
             reranked_chunk["score"] = rerank_score
             ranked_candidates.append(reranked_chunk)
             candidate_debug.append(
@@ -888,6 +1018,8 @@ class EnhancedRetrievalService:
                     "page_number": reranked_chunk.get("page_number"),
                     "fusion_score": fused_score,
                     "rerank_score": rerank_score,
+                    "rerank_text_preview": self._short_text_preview(reranked_chunk.get("rerank_text", ""), 100),
+                    "rerank_document_preview": reranked_chunk.get("llm_rerank_document_preview", "")[:100],
                     "section_tags": reranked_chunk.get("section_tags", []),
                     "source_query": reranked_chunk.get("source_query", ""),
                 }
@@ -896,6 +1028,21 @@ class EnhancedRetrievalService:
         ranked_candidates.sort(key=lambda item: float(item.get("score", 0.0) or 0.0), reverse=True)
         for rank, item in enumerate(ranked_candidates, start=1):
             item["llm_rerank_rank"] = rank
+        mapped_candidates = []
+        for rank, item in enumerate(ranked_candidates, start=1):
+            mapped_candidates.append(
+                {
+                    "rerank_rank": rank,
+                    "returned_index": item.get("llm_rerank_returned_index", item.get("llm_rerank_input_rank", rank)),
+                    "chunk_id": item.get("chunk_id"),
+                    "page_number": item.get("page_number"),
+                    "fusion_rank": item.get("fusion_rank"),
+                    "fusion_score": item.get("fusion_score"),
+                    "rerank_score": item.get("llm_rerank_score"),
+                    "text_preview": item.get("llm_rerank_document_preview", "")[:100],
+                }
+            )
+        self._log_rerank_mapped_results(provider="dashscope", mapped_results=mapped_candidates)
 
         tail_chunks: List[Dict[str, Any]] = []
         for idx, chunk in enumerate(chunks[rerank_limit:], start=rerank_limit + 1):
@@ -914,6 +1061,7 @@ class EnhancedRetrievalService:
 
         return {
             "chunks": final_chunks,
+            "reranked_chunks": reranked_chunks,
             "debug": {
                 "enabled": True,
                 "applied": True,
@@ -1004,38 +1152,39 @@ class EnhancedRetrievalService:
             return str(raw_candidate)
         return hf_candidate
 
-    def _build_rerank_document_text(self, chunk: Dict[str, Any], query_profile: Optional[QueryProfile]) -> str:
-        metadata_bits: List[str] = []
-        title = str(chunk.get("title", "") or "").strip()
-        source = str(chunk.get("source", "") or "").strip()
-        page_range = str(chunk.get("page_range", "") or "").strip()
-        page_number = str(chunk.get("page_number", "") or "").strip()
-        content_part_label = str(chunk.get("content_part_label", "") or "").strip()
-        section_tags = chunk.get("section_tags", []) or []
-
-        if title:
-            metadata_bits.append(f"Title: {title}")
-        if source:
-            metadata_bits.append(f"Source: {source}")
-        if page_range:
-            metadata_bits.append(f"Pages: {page_range}")
-        elif page_number:
-            metadata_bits.append(f"Page: {page_number}")
-        if content_part_label:
-            metadata_bits.append(f"Chunk: {content_part_label}")
-        if section_tags:
-            metadata_bits.append(f"Section tags: {', '.join(str(tag) for tag in section_tags[:4])}")
-        if query_profile and query_profile.intent_tags:
-            metadata_bits.append(f"Query intent: {', '.join(query_profile.intent_tags[:3])}")
-
-        content = self._limit_rerank_text(str(chunk.get("content", "") or ""), self.llm_rerank_max_doc_chars)
+    def _build_rerank_document_text(self, chunk: Dict[str, Any]) -> str:
+        content = self._limit_rerank_text(str(chunk.get("rerank_text", "") or ""), self.llm_rerank_max_doc_chars)
         if not content:
-            content = str(chunk.get("text", "") or "")
-        content = self._limit_rerank_text(content, self.llm_rerank_max_doc_chars)
+            content = self._limit_rerank_text(str(chunk.get("content", "") or ""), self.llm_rerank_max_doc_chars)
+        if not content:
+            content = self._limit_rerank_text(str(chunk.get("text", "") or ""), self.llm_rerank_max_doc_chars)
 
-        if metadata_bits:
-            return "\n".join(metadata_bits + ["", content]).strip()
-        return content.strip()
+        section_title = str(chunk.get("section_title", "") or "").strip()
+        if section_title:
+            normalized_title = self._normalize_query_text(section_title)
+            normalized_content = self._normalize_query_text(content)
+            if normalized_title and normalized_title not in normalized_content[: max(len(normalized_title), 1) * 2]:
+                content = f"{section_title}\n{content}".strip()
+
+        return self._limit_rerank_text(content, self.llm_rerank_max_doc_chars)
+
+    def _build_rerank_query(self, user_query: str, query_profile: QueryProfile) -> str:
+        if self.generation_service is not None and hasattr(self.generation_service, "build_rerank_query"):
+            try:
+                rerank_query = self.generation_service.build_rerank_query(
+                    user_query,
+                )
+                if rerank_query and rerank_query.strip():
+                    actual_rerank_query = rerank_query.strip()
+                    logger.debug("original_question=%s", user_query)
+                    logger.debug("actual_rerank_query=%s", actual_rerank_query)
+                    return actual_rerank_query
+            except Exception as exc:  # pragma: no cover - generation depends on environment
+                logger.debug("Failed to rewrite rerank query with model: %s", exc)
+        actual_rerank_query = self._fallback_rerank_query(user_query)
+        logger.debug("original_question=%s", user_query)
+        logger.debug("actual_rerank_query=%s", actual_rerank_query)
+        return actual_rerank_query
 
     def _limit_rerank_text(self, text: str, max_chars: int) -> str:
         normalized = re.sub(r"\s+", " ", text or "").strip()
@@ -1894,8 +2043,6 @@ class EnhancedRetrievalService:
             for rank, item in enumerate(route_results):
                 chunk_key = self._chunk_unique_key(item)
                 route_confidence = float(item.get("route_confidence", 1.0) or 1.0)
-                normalized_route_score = float(item.get("normalized_route_score", 0.0) or 0.0)
-                structural_bonus = float(item.get("structural_bonus", 0.0) or 0.0)
                 entry = aggregated.setdefault(
                     chunk_key,
                     {
@@ -1903,20 +2050,14 @@ class EnhancedRetrievalService:
                         "score": 0.0,
                         "matched_routes": [],
                         "route_scores": {},
-                        "normalized_route_scores": {},
+                        "route_confidences": {},
                         "source_queries": [],
                     },
                 )
-                vote = weight * route_confidence * (
-                    (1.0 / (self.rrf_k + rank + 1))
-                    + (0.12 * normalized_route_score)
-                    + structural_bonus
-                )
+                vote = weight * route_confidence * (1.0 / (self.rrf_k + rank + 1))
                 entry["score"] += vote
                 entry["matched_routes"].append(route_name)
                 entry["route_scores"][route_name] = item.get("route_score")
-                entry["normalized_route_scores"][route_name] = normalized_route_score
-                entry["route_confidences"] = entry.get("route_confidences", {})
                 entry["route_confidences"][route_name] = route_confidence
                 if item.get("source_query") and item["source_query"] not in entry["source_queries"]:
                     entry["source_queries"].append(item["source_query"])
@@ -1925,17 +2066,13 @@ class EnhancedRetrievalService:
             aggregated.values(),
             key=lambda item: (
                 float(item.get("score", 0.0)),
-                max(item.get("normalized_route_scores", {}).values() or [0.0]),
                 max(item.get("route_scores", {}).values() or [0.0]),
+                max(item.get("route_confidences", {}).values() or [0.0]),
             ),
             reverse=True,
         )
 
-        fused = fused[:top_k]
-        if query_profile.section_preferences:
-            for chunk in fused:
-                chunk["structural_bonus"] = float(self._compute_structural_bonus(chunk, query_profile))
-        return fused
+        return fused[:top_k]
 
     def _normalize_chunk(self, item: Dict[str, Any]) -> Dict[str, Any]:
         metadata = item.get("metadata", {})
@@ -2325,6 +2462,121 @@ class EnhancedRetrievalService:
             deduped.append(item)
         return deduped
 
+    def _dedupe_route_results(self, route_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        deduped: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in route_results:
+            key = self._chunk_unique_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(dict(item))
+        return deduped
+
+    def _build_raw_retrieval_top_n(
+        self,
+        routes: Dict[str, List[Dict[str, Any]]],
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        raw_results: List[Dict[str, Any]] = []
+        for route_results in routes.values():
+            for item in route_results:
+                raw_results.append(dict(item))
+                if len(raw_results) >= limit:
+                    return raw_results[:limit]
+        return raw_results[:limit]
+
+    def _log_retrieval_stage(self, stage_name: str, chunks: List[Dict[str, Any]]) -> None:
+        logger.debug("%s count=%d", stage_name, len(chunks))
+        for idx, chunk in enumerate(chunks[:10], start=1):
+            logger.debug(
+                "%s[%d] chunk_id=%s route=%s route_rank=%s route_score=%s fused_score=%s rerank_score=%s final_context_uses_original_chunk=%s key=%s",
+                stage_name,
+                idx,
+                chunk.get("chunk_id"),
+                chunk.get("retrieval_route"),
+                chunk.get("route_rank"),
+                chunk.get("route_score"),
+                chunk.get("score"),
+                chunk.get("llm_rerank_score"),
+                chunk.get("final_context_uses_original_chunk"),
+                self._chunk_unique_key(chunk),
+            )
+            if stage_name == "final_context_top15":
+                logger.info(
+                    "final_context[%d] chunk_id=%s rerank_score=%s uses_original_chunk=%s original_chunk_preview=%s rerank_preview=%s",
+                    idx,
+                    chunk.get("chunk_id"),
+                    chunk.get("llm_rerank_score"),
+                    chunk.get("final_context_uses_original_chunk"),
+                    self._short_text_preview(chunk.get("content", ""), 100),
+                    self._short_text_preview(chunk.get("rerank_text", ""), 100),
+                )
+
+    def _short_text_preview(self, text: Any, limit: int = 100) -> str:
+        normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[:limit]
+
+    def _log_rerank_inputs(
+        self,
+        original_question: str,
+        rerank_query: str,
+        candidate_chunks: List[Dict[str, Any]],
+        rerank_documents: List[str],
+    ) -> None:
+        logger.debug("original_question=%s", original_question)
+        logger.debug("actual_rerank_query=%s", rerank_query)
+        logger.debug("document_count=%d", len(rerank_documents))
+        for idx, (chunk, document_text) in enumerate(zip(candidate_chunks, rerank_documents), start=1):
+            logger.debug(
+                "rerank_input[%d] input_index=%s chunk_id=%s page=%s fusion_rank=%s fusion_score=%s raw_chunk_preview=%s rerank_text_preview=%s clean_document_preview=%s",
+                idx,
+                idx,
+                chunk.get("chunk_id"),
+                chunk.get("page_number") or chunk.get("page_range"),
+                chunk.get("fusion_rank"),
+                chunk.get("fusion_score", chunk.get("score")),
+                self._short_text_preview(chunk.get("content", "") or chunk.get("text", ""), 100),
+                self._short_text_preview(chunk.get("rerank_text", ""), 100),
+                self._short_text_preview(document_text, 100),
+            )
+
+    def _log_rerank_raw_scores(self, provider: str, raw_results: List[Any]) -> None:
+        logger.debug("rerank_raw_results provider=%s count=%d", provider, len(raw_results))
+        for idx, item in enumerate(raw_results[:20], start=1):
+            if isinstance(item, dict):
+                returned_index = item.get("index", item.get("document_index", idx))
+                relevance_score = item.get("relevance_score", item.get("score"))
+                document_text = item.get("document", item.get("text", ""))
+            else:
+                returned_index = idx
+                relevance_score = item
+                document_text = ""
+            logger.debug(
+                "rerank_raw_result[%d] returned_index=%s relevance_score=%s document_preview=%s",
+                idx,
+                returned_index,
+                relevance_score,
+                self._short_text_preview(document_text, 100) if document_text else "",
+            )
+
+    def _log_rerank_mapped_results(self, provider: str, mapped_results: List[Dict[str, Any]]) -> None:
+        logger.debug("rerank_mapped_results provider=%s count=%d", provider, len(mapped_results))
+        for item in mapped_results[:20]:
+            logger.debug(
+                "rerank_mapped_result rerank_rank=%s returned_index=%s chunk_id=%s page=%s fusion_rank=%s fusion_score=%s rerank_score=%s text_preview=%s",
+                item.get("rerank_rank"),
+                item.get("returned_index"),
+                item.get("chunk_id"),
+                item.get("page_number") or item.get("page_range"),
+                item.get("fusion_rank"),
+                item.get("fusion_score"),
+                item.get("rerank_score"),
+                self._short_text_preview(item.get("text_preview", ""), 100),
+            )
+
     def _collect_route_queries(
         self,
         route_results: List[Dict[str, Any]],
@@ -2380,12 +2632,214 @@ class EnhancedRetrievalService:
             "route_confidence": item.get("route_confidence"),
             "structural_bonus": item.get("structural_bonus"),
             "retrieval_route": item.get("retrieval_route"),
+            "route_rank": item.get("route_rank"),
             "matched_routes": item.get("matched_routes", []),
             "route_scores": item.get("route_scores", {}),
             "source_query": item.get("source_query"),
             "source_queries": item.get("source_queries", []),
+            "rerank_text": item.get("rerank_text", ""),
+            "rerank_text_preview": self._short_text_preview(item.get("rerank_text", ""), 160),
+            "final_context_uses_original_chunk": item.get("final_context_uses_original_chunk"),
             "subchunk_label": item.get("subchunk_label"),
             "section_tags": item.get("section_tags", []),
             "content": item.get("content", ""),
             "preview": preview,
         }
+
+    def _mark_final_context_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        marked_chunks: List[Dict[str, Any]] = []
+        for chunk in chunks:
+            marked = dict(chunk)
+            marked["final_context_uses_original_chunk"] = True
+            marked_chunks.append(marked)
+        return marked_chunks
+
+    def _export_retrieval_trace(
+        self,
+        original_question: str,
+        user_query: str,
+        collection_name: str,
+        paper_context: Dict[str, Any],
+        options: Dict[str, Any],
+        query_profile: QueryProfile,
+        rerank_query: str,
+        query_views: Dict[str, Any],
+        hyde_debug: Dict[str, Any],
+        routes: Dict[str, List[Dict[str, Any]]],
+        raw_retrieval_top30: List[Dict[str, Any]],
+        fused_results: List[Dict[str, Any]],
+        reranked_results: List[Dict[str, Any]],
+        final_results: List[Dict[str, Any]],
+        rerank_debug: Dict[str, Any],
+        final_context_top_k: int,
+    ) -> Optional[Dict[str, str]]:
+        if not self.trace_export_enabled:
+            return None
+
+        try:
+            paper_id = self._sanitize_trace_slug(str(paper_context.get("arxiv_id", "") or collection_name or "query"))
+            export_dir = self.trace_export_dir / paper_id
+            export_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            short_id = uuid.uuid4().hex[:8]
+            slug = self._sanitize_trace_slug(user_query)
+            base_name = f"{stamp}_{collection_name}_{slug}_{short_id}"
+            json_path = export_dir / f"{base_name}.json"
+            md_path = export_dir / f"{base_name}.md"
+
+            payload = {
+                "exported_at": datetime.now().isoformat(timespec="seconds"),
+                "arxiv_id": str(paper_context.get("arxiv_id", "") or ""),
+                "collection_name": collection_name,
+                "original_question": original_question,
+                "user_query": user_query,
+                "rerank_query": rerank_query,
+                "paper_context": self._normalize_trace_value(paper_context),
+                "options": self._normalize_trace_value(options),
+                "query_profile": self._normalize_trace_value(self._debug_query_profile(query_profile)),
+                "query_views": self._normalize_trace_value(query_views),
+                "steps": [
+                    {
+                        "step": "query_profile",
+                        "result": self._normalize_trace_value(self._debug_query_profile(query_profile)),
+                    },
+                    {
+                        "step": "query_rewrite",
+                        "result": self._normalize_trace_value(query_views.get("rewrite_debug", {})),
+                    },
+                    {
+                        "step": "original_question",
+                        "result": self._normalize_trace_value(original_question),
+                    },
+                    {
+                        "step": "rerank_query",
+                        "result": self._normalize_trace_value(rerank_query),
+                    },
+                    {
+                        "step": "hyde",
+                        "result": self._normalize_trace_value(hyde_debug),
+                    },
+                    {
+                        "step": "routes",
+                        "result": {
+                            route_name: [self._normalize_trace_value(self._debug_chunk_item(item)) for item in route_results]
+                            for route_name, route_results in routes.items()
+                        },
+                    },
+                    {
+                        "step": "raw_retrieval_top30",
+                        "result": [self._normalize_trace_value(self._debug_chunk_item(item)) for item in raw_retrieval_top30],
+                    },
+                    {
+                        "step": "fused_top30",
+                        "result": [self._normalize_trace_value(self._debug_chunk_item(item)) for item in fused_results[:30]],
+                    },
+                    {
+                        "step": "reranked_top30",
+                        "result": [self._normalize_trace_value(self._debug_chunk_item(item)) for item in reranked_results[:30]],
+                    },
+                    {
+                        "step": "final_context_top15",
+                        "result": [self._normalize_trace_value(self._debug_chunk_item(item)) for item in final_results],
+                    },
+                ],
+            }
+
+            with json_path.open("w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+
+            with md_path.open("w", encoding="utf-8") as f:
+                f.write(self._render_retrieval_trace_text(payload))
+
+            return {"json": str(json_path), "md": str(md_path)}
+        except Exception as exc:  # pragma: no cover - trace export should never break retrieval
+            logger.warning("Failed to export retrieval trace: %s", exc)
+            return None
+
+    def _render_retrieval_trace_text(self, payload: Dict[str, Any]) -> str:
+        lines: List[str] = []
+        lines.append("# Retrieval Trace")
+        lines.append("")
+        lines.append(f"- exported_at: {payload.get('exported_at', '')}")
+        lines.append(f"- collection_name: {payload.get('collection_name', '')}")
+        lines.append("")
+        lines.append("## User Query")
+        lines.append("")
+        lines.append("```text")
+        lines.append(self._normalize_trace_newlines(str(payload.get("user_query", ""))))
+        lines.append("```")
+        lines.append("")
+        lines.append("## Options")
+        for key, value in (payload.get("options") or {}).items():
+            lines.append(f"- {key}: {value}")
+
+        for step in payload.get("steps", []):
+            lines.append("")
+            lines.append(f"## {step.get('step', '')}")
+            lines.append("")
+            lines.append("```text")
+            lines.append(self._format_trace_block(step.get("result")))
+            lines.append("```")
+
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _format_trace_block(self, value: Any, indent: int = 0) -> str:
+        pad = "  " * indent
+        if isinstance(value, dict):
+            if not value:
+                return f"{pad}{{}}"
+            lines: List[str] = []
+            for key, item in value.items():
+                if isinstance(item, (dict, list)):
+                    lines.append(f"{pad}{key}:")
+                    lines.append(self._format_trace_block(item, indent + 1))
+                else:
+                    lines.append(f"{pad}{key}: {self._normalize_trace_newlines(str(item))}")
+            return "\n".join(lines)
+        if isinstance(value, list):
+            if not value:
+                return f"{pad}[]"
+            lines = []
+            for item in value:
+                if isinstance(item, (dict, list)):
+                    lines.append(f"{pad}-")
+                    lines.append(self._format_trace_block(item, indent + 1))
+                else:
+                    lines.append(f"{pad}- {self._normalize_trace_newlines(str(item))}")
+            return "\n".join(lines)
+        return f"{pad}{self._normalize_trace_newlines(str(value))}"
+
+    def _build_fusion_trace(
+        self,
+        routes: Dict[str, List[Dict[str, Any]]],
+        fused_results: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        return {
+            "algorithm": "pure_rrf",
+            "rrf_k": self.rrf_k,
+            "route_weights": self.route_weights,
+            "route_counts": {route_name: len(route_results) for route_name, route_results in routes.items()},
+            "final_count": len(fused_results),
+            "dedupe_per_route": True,
+        }
+
+    def _normalize_trace_value(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self._normalize_trace_newlines(value)
+        if isinstance(value, dict):
+            return {key: self._normalize_trace_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._normalize_trace_value(item) for item in value]
+        return value
+
+    def _normalize_trace_newlines(self, text: str) -> str:
+        if not text:
+            return text
+        return text.replace("\r\n", "\n").replace("\\r\\n", "\n").replace("\\n", "\n")
+
+    def _sanitize_trace_slug(self, text: str, max_length: int = 40) -> str:
+        slug = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "_", (text or "").strip())
+        slug = re.sub(r"_+", "_", slug).strip("_")
+        if not slug:
+            slug = "query"
+        return slug[:max_length]

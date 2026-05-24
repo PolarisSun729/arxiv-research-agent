@@ -337,6 +337,7 @@ class EmbeddingService:
             "page_number": str(page_start),
             "page_range": chunk_metadata.get("page_range", f"{page_start}-{page_end}"),
             "content": chunk["content"],
+            "rerank_text": str(chunk.get("rerank_text", chunk_metadata.get("rerank_text", "")) or ""),
             "word_count": int(chunk_metadata.get("word_count", len(chunk["content"].split()))),
             "total_chunks": int(chunk_count),
             "embedding_provider": provider,

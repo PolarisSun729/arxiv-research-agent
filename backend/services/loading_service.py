@@ -157,6 +157,10 @@ class LoadingService:
             pipeline_options.generate_page_images = True
             pipeline_options.generate_picture_images = True
             pipeline_options.images_scale = 2.0
+            # Temporary debug mode: keep Docling on the basic parsing path only.
+            # Re-enable enrichments later if you want picture classification, formula
+            # enrichment, code enrichment, or picture descriptions.
+            # self._enable_docling_enrichments(pipeline_options)
 
             converter = DocumentConverter(
                 allowed_formats=[InputFormat.PDF],
@@ -271,8 +275,15 @@ class LoadingService:
                 "docling_asset_manifest": docling_asset_manifest,
             }
         except Exception as e:
-            logger.error(f"Docling error: {str(e)}")
+            logger.exception("Docling error: %s", str(e))
             raise
+
+    def _enable_docling_enrichments(self, pipeline_options: Any) -> None:
+        """
+        Docling enrichment switches are disabled for now so only the base parser runs.
+        """
+        _ = pipeline_options
+        logger.info("Docling enrichments are disabled; running base parsing only.")
 
     def _extract_pymupdf_page(self, page, page_num: int, filename: str) -> Dict[str, Any]:
         page_width = float(page.rect.width)
@@ -841,6 +852,99 @@ class LoadingService:
 
         return normalized
 
+    def _resolve_docling_table_page_no(self, table_item: Any) -> Optional[int]:
+        provenance = self._normalize_docling_provenance(getattr(table_item, "prov", None))
+        page_numbers = [entry.get("page_no") for entry in provenance if isinstance(entry.get("page_no"), int)]
+        if page_numbers:
+            return min(page_numbers)
+
+        page_no = self._safe_int(getattr(table_item, "page_no", None) or getattr(table_item, "page_number", None))
+        return page_no
+
+    def _resolve_docling_table_caption(self, document: Any, table_item: Any, order_index: int) -> str:
+        if table_item is None:
+            return ""
+
+        caption_text = ""
+        caption_method = getattr(table_item, "caption_text", None)
+        if callable(caption_method):
+            try:
+                caption_text = self._stringify_docling_value(
+                    caption_method(document) if document is not None else caption_method()
+                )
+            except TypeError:
+                try:
+                    caption_text = self._stringify_docling_value(caption_method())
+                except Exception:
+                    caption_text = ""
+            except Exception:
+                caption_text = ""
+
+        if not caption_text:
+            caption_text = self._stringify_docling_value(
+                getattr(table_item, "caption", None)
+                or getattr(table_item, "text", None)
+                or getattr(table_item, "orig", None)
+            )
+
+        if caption_text:
+            return re.sub(r"\s+", " ", caption_text).strip()
+
+        page_no = self._resolve_docling_table_page_no(table_item)
+        if page_no is None or document is None:
+            return ""
+
+        page_text = self._safe_docling_export(document, "text", page_no=page_no)
+        if not page_text:
+            return ""
+
+        caption_from_page = self._extract_docling_table_caption_from_page_text(page_text, order_index)
+        return re.sub(r"\s+", " ", caption_from_page or "").strip()
+
+    def _extract_docling_table_caption_from_page_text(self, page_text: str, order_index: int) -> str:
+        lines = self._split_docling_lines(page_text)
+        if not lines:
+            return ""
+
+        table_label = re.compile(rf"(?i)^\s*table\s*{order_index}\b")
+        any_table_label = re.compile(r"(?i)^\s*table\s*\d+\b")
+
+        for idx, line in enumerate(lines):
+            text = str(line.get("text", "") or "").strip()
+            if not text:
+                continue
+            if not table_label.search(text):
+                continue
+
+            caption_parts: List[str] = []
+            current = re.sub(rf"(?i)^\s*table\s*{order_index}\s*[:.\-]?\s*", "", text).strip()
+            if current:
+                caption_parts.append(current)
+
+            for next_line in lines[idx + 1 : idx + 3]:
+                next_text = str(next_line.get("text", "") or "").strip()
+                if not next_text:
+                    continue
+                if any_table_label.search(next_text) or re.match(r"(?i)^(figure|fig\.|table)\s*\d+", next_text):
+                    break
+                if len(next_text.split()) <= 8 and not re.search(r"[,:;.!?]$", next_text):
+                    break
+                caption_parts.append(next_text)
+
+            caption = " ".join(caption_parts).strip()
+            if caption:
+                return caption
+
+        for idx, line in enumerate(lines):
+            text = str(line.get("text", "") or "").strip()
+            if not text or not any_table_label.search(text):
+                continue
+            caption = re.sub(r"(?i)^\s*table\s*\d+\s*[:.\-]?\s*", "", text).strip()
+            if caption:
+                return caption
+
+        return ""
+
     def _normalize_docling_text_item(self, item: Any, order_index: int) -> Optional[Dict[str, Any]]:
         if item is None:
             return None
@@ -961,7 +1065,8 @@ class LoadingService:
         picture_dir = os.path.join(asset_root, "pictures")
         os.makedirs(picture_dir, exist_ok=True)
 
-        output_name = f"picture-{order_index:03d}.png"
+        picture_caption = self._resolve_docling_picture_caption(document, picture_item)
+        output_name = self._build_docling_picture_filename(picture_caption, order_index)
         output_path = os.path.join(picture_dir, output_name)
 
         image_obj = None
@@ -1061,7 +1166,9 @@ class LoadingService:
             width, height = size[0], size[1]
 
         rel_path = os.path.relpath(output_path, start=os.getcwd())
-        caption = self._stringify_docling_value(getattr(picture_item, "caption", None) or getattr(picture_item, "text", None) or getattr(picture_item, "orig", None))
+        caption = picture_caption or self._stringify_docling_value(
+            getattr(picture_item, "caption", None) or getattr(picture_item, "text", None) or getattr(picture_item, "orig", None)
+        )
         summary = caption or f"picture {order_index}"
         if width and height:
             summary = f"{summary} ({width}x{height})"
@@ -1123,11 +1230,12 @@ class LoadingService:
             pixmap = page.get_pixmap(clip=rect, dpi=200, alpha=False)
             picture_dir = os.path.join(asset_root, "pictures")
             os.makedirs(picture_dir, exist_ok=True)
-            output_name = f"picture-{order_index:03d}.png"
+            picture_caption = self._resolve_docling_picture_caption(None, picture_item)
+            output_name = self._build_docling_picture_filename(picture_caption, order_index)
             output_path = os.path.join(picture_dir, output_name)
             pixmap.save(output_path)
 
-            caption = self._stringify_docling_value(
+            caption = picture_caption or self._stringify_docling_value(
                 getattr(picture_item, "caption", None) or getattr(picture_item, "text", None) or getattr(picture_item, "orig", None)
             )
             summary = caption or f"picture {order_index}"
@@ -1152,6 +1260,53 @@ class LoadingService:
         finally:
             pdf_doc.close()
 
+    def _resolve_docling_picture_caption(self, document: Any, picture_item: Any) -> str:
+        if picture_item is None:
+            return ""
+
+        caption_text = ""
+        caption_method = getattr(picture_item, "caption_text", None)
+        if callable(caption_method):
+            try:
+                caption_text = self._stringify_docling_value(caption_method(document)) if document is not None else self._stringify_docling_value(caption_method())
+            except TypeError:
+                try:
+                    caption_text = self._stringify_docling_value(caption_method())
+                except Exception:
+                    caption_text = ""
+            except Exception:
+                caption_text = ""
+
+        if not caption_text:
+            caption_text = self._stringify_docling_value(
+                getattr(picture_item, "caption", None)
+                or getattr(picture_item, "text", None)
+                or getattr(picture_item, "orig", None)
+            )
+
+        caption_text = re.sub(r"\s+", " ", caption_text or "").strip()
+        return caption_text
+
+    def _build_docling_picture_filename(self, caption_text: str, order_index: int, extension: str = "png") -> str:
+        return self._build_docling_asset_filename(
+            caption_text=caption_text,
+            order_index=order_index,
+            fallback_prefix="no-title-figure",
+            extension=extension,
+        )
+
+    def _slugify_docling_filename_piece(self, value: str, max_length: int = 96) -> str:
+        text = re.sub(r"\s+", " ", self._stringify_docling_value(value) or "").strip()
+        if not text:
+            return ""
+
+        text = re.sub(r'[\\/:*?"<>|]+', "-", text)
+        text = re.sub(r"\s+", "-", text)
+        text = re.sub(r"-{2,}", "-", text).strip("-_. ")
+        if len(text) > max_length:
+            text = text[:max_length].rstrip("-_. ")
+        return text
+
     def _export_docling_table_asset(
         self,
         document: Any,
@@ -1163,7 +1318,8 @@ class LoadingService:
         table_dir = os.path.join(asset_root, "tables")
         os.makedirs(table_dir, exist_ok=True)
 
-        output_base = f"table-{order_index:03d}"
+        table_caption = self._resolve_docling_table_caption(document, table_item, order_index)
+        output_base = self._build_docling_asset_filename(table_caption, order_index, fallback_prefix="no-title-table")
         csv_path = os.path.join(table_dir, f"{output_base}.csv")
         json_path = os.path.join(table_dir, f"{output_base}.json")
 
@@ -1228,7 +1384,7 @@ class LoadingService:
             row_count = None
             column_count = None
 
-        caption = self._stringify_docling_value(getattr(table_item, "caption", None) or getattr(table_item, "text", None) or getattr(table_item, "orig", None))
+        caption = self._resolve_docling_table_caption(document, table_item, order_index)
         summary = caption or f"table {order_index}"
         if row_count is not None and column_count is not None:
             summary = f"{summary} ({row_count}x{column_count})"
@@ -1254,6 +1410,20 @@ class LoadingService:
             "asset_columns": column_count,
             "asset_preview": preview,
         }
+
+    def _build_docling_asset_filename(
+        self,
+        caption_text: str,
+        order_index: int,
+        fallback_prefix: str,
+        extension: str = "",
+    ) -> str:
+        stem = self._slugify_docling_filename_piece(caption_text)
+        if not stem:
+            stem = f"{fallback_prefix}-{order_index:03d}"
+        if extension:
+            return f"{stem}.{extension}"
+        return stem
 
     def _summarize_docling_asset_item(self, item: Any) -> Dict[str, Any]:
         if item is None:
@@ -1415,10 +1585,6 @@ class LoadingService:
         normalized_layer = str(content_layer or "").strip().lower()
         normalized_parent = str(parent or "").strip().lower()
 
-        if normalized_label in {"section_header", "sectionheaderitem"}:
-            return "section_header"
-        if normalized_label in {"title", "titleitem"}:
-            return "title"
         if normalized_layer in {"header", "footer"}:
             return "noise"
 
@@ -1427,6 +1593,9 @@ class LoadingService:
 
         if normalized_label in {"caption", "table_caption", "figure_caption"}:
             return "caption"
+        if normalized_label in {"title", "titleitem"}:
+            return "title"
+
         if normalized_label in {"list_item", "listitem"}:
             return "list_item"
         if normalized_label in {"code", "codeitem"}:
@@ -1434,10 +1603,10 @@ class LoadingService:
         if normalized_label in {"formula", "formulaitem"}:
             return "formula"
 
-        if level is not None and normalized_text:
-            return "section_header"
+        if normalized_label in {"section_header", "sectionheaderitem"}:
+            return "section_header" if self._is_docling_heading_candidate(normalized_text, level) else "paragraph"
 
-        if normalized_text and self._looks_like_heading_text(normalized_text):
+        if self._is_docling_heading_candidate(normalized_text, level):
             return "section_header"
 
         return "paragraph"
@@ -1517,7 +1686,9 @@ class LoadingService:
             return False
         if len(normalized) > 80:
             return False
-        if normalized.endswith((".", ",", ";", ":")):
+        if ":" in normalized:
+            return False
+        if normalized.endswith((".", ",", ";")):
             return False
         if any(ch.isdigit() for ch in normalized):
             return False
@@ -1526,7 +1697,39 @@ class LoadingService:
         words = normalized.split()
         if len(words) > 5:
             return False
+        if len(words) == 1 and normalized.isupper() and len(normalized) <= 4:
+            return False
         return normalized[0].isupper() or normalized.isupper()
+
+    def _is_docling_numbered_heading_text(self, text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+        return bool(
+            re.fullmatch(
+                r"(?:\d+(?:\.\d+)*|[IVXLCM]+\.?|[A-Z]\.?)\s+[A-Z].{0,160}",
+                normalized,
+            )
+        )
+
+    def _is_docling_heading_candidate(self, text: str, level: Optional[int] = None) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+
+        if self._is_docling_numbered_heading_text(normalized):
+            return True
+
+        if normalized.lower() in {"abstract", "references", "acknowledgements", "acknowledgments"}:
+            return True
+
+        if self._looks_like_heading_text(normalized):
+            return True
+
+        if level is not None and level > 0 and len(normalized) <= 80:
+            return self._looks_like_heading_text(normalized)
+
+        return False
 
     def _docling_parent_is_visual_context(self, parent: str) -> bool:
         normalized = str(parent or "").strip().lower()

@@ -1,4 +1,5 @@
 ﻿import os
+import warnings
 from datetime import datetime
 import json
 import re
@@ -12,7 +13,14 @@ from pypinyin import lazy_pinyin, Style
 
 logger = logging.getLogger(__name__)
 
+warnings.filterwarnings(
+    "ignore",
+    message=r".*ORM-style PyMilvus API.*",
+    category=DeprecationWarning,
+)
+
 CONTENT_MAX_LENGTH = 12000
+RERANK_TEXT_MAX_LENGTH = 6000
 
 COLLECTION_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -233,6 +241,7 @@ class VectorStoreService:
             fields = [
                 {"name": "id", "dtype": "INT64", "is_primary": True, "auto_id": True},
                 {"name": "content", "dtype": "VARCHAR", "max_length": CONTENT_MAX_LENGTH},
+                {"name": "rerank_text", "dtype": "VARCHAR", "max_length": RERANK_TEXT_MAX_LENGTH},
                 {"name": "document_name", "dtype": "VARCHAR", "max_length": 255},
                 # 单独保留 source，方便 QA / 检索时直接回溯到原始 PDF 文件名
                 {"name": "source", "dtype": "VARCHAR", "max_length": 255},
@@ -271,6 +280,7 @@ class VectorStoreService:
             for emb in embeddings_data["embeddings"]:
                 metadata = emb["metadata"]
                 content = str(metadata.get("content", ""))
+                rerank_text = str(metadata.get("rerank_text", ""))
                 parent_chunk_id = int(metadata.get("parent_chunk_id", metadata.get("chunk_id", metadata.get("chunk_index", 0))))
                 original_chunk_id = int(metadata.get("original_chunk_id", parent_chunk_id))
                 subchunk_index = int(metadata.get("subchunk_index", 1))
@@ -288,6 +298,7 @@ class VectorStoreService:
                 base_chunk_id = int(metadata.get("chunk_id", chunk_index))
                 entity = {
                     "content": content,
+                    "rerank_text": rerank_text,
                     "document_name": embeddings_data.get("filename", ""),
                     "source": source,
                     "chunk_id": base_chunk_id,
@@ -365,6 +376,7 @@ class VectorStoreService:
                 for field_name in insertable_fields
             ]
             insert_result = collection.insert(insert_columns)
+            collection.flush()
             
             # 创建索引
             index_params = {
@@ -526,6 +538,7 @@ class VectorStoreService:
             insertable_fields = [field.name for field in collection.schema.fields if not getattr(field, "auto_id", False)]
             insert_columns = [[entity.get(field_name)] for field_name in insertable_fields]
             insert_result = collection.insert(insert_columns)
+            collection.flush()
             collection.load()
             
             return insert_result.primary_keys[0]
@@ -555,6 +568,7 @@ class VectorStoreService:
             field_names = {field.name for field in collection.schema.fields}
             candidate_fields = [
                 "content",
+                "rerank_text",
                 "document_name",
                 "source",
                 "chunk_id",
@@ -636,6 +650,7 @@ class VectorStoreService:
             candidate_fields = [
                 "id",
                 "content",
+                "rerank_text",
                 "document_name",
                 "source",
                 "chunk_id",
@@ -702,6 +717,7 @@ class VectorStoreService:
         getter = (lambda key, default=None: reader.get(key, default)) if reader is not None else (lambda key, default=None: getattr(entity, key, default))
 
         content = getter("content", "") or ""
+        rerank_text = getter("rerank_text", "") or ""
         source = getter("source", "") or ""
         document_name = getter("document_name", "") or ""
         page_start = getter("page_start", None)
@@ -742,6 +758,7 @@ class VectorStoreService:
             "original_chunk_id": int(original_chunk_id or 0),
             "total_chunks": int(getter("total_chunks", 0) or 0),
             "word_count": int(getter("word_count", 0) or 0),
+            "rerank_text": str(rerank_text or ""),
             "page_number": str(page_number or ""),
             "page_start": int(page_start or 0) if page_start is not None else None,
             "page_end": int(page_end or 0) if page_end is not None else None,
@@ -765,6 +782,7 @@ class VectorStoreService:
         payload = {
             "text": content,
             "content": content,
+            "rerank_text": metadata["rerank_text"],
             "score": score,
             "distance": distance,
             "source": source,

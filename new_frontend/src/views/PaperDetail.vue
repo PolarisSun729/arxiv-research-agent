@@ -22,6 +22,7 @@ import {
   createPaperQaIndex,
   getPaperQaDiagnostic,
   getPaperQaStatus,
+  getPaperRetrievalTraceDownloadUrl,
   qaPaperStream,
   type QaDiagnosticResult,
   type QaStatusResult,
@@ -61,10 +62,12 @@ const chatContainerRef = ref<HTMLElement | null>(null)
 const qaResults = ref<QaTurn[]>([])
 const evidenceDrawerOpen = ref(false)
 const activeEvidenceTurn = ref<QaTurn | null>(null)
+const traceDownloading = ref(false)
 const retrievalOptions = reactive({
   enableQueryRewrite: true,
   enableHyde: true,
   enableKeywordSearch: true,
+  enableLlmRerank: true,
   debug: true,
   topK: 15
 })
@@ -75,6 +78,12 @@ const debugRouteLabels: Record<string, string> = {
   vector_rewrite: '重写向量召回',
   vector_hyde: 'HyDE 向量召回',
   keyword: '关键词召回'
+}
+const debugStageLabels: Record<string, string> = {
+  raw_retrieval_top15: 'raw_retrieval_top15',
+  fused_top15: 'fused_top15',
+  reranked_top15: 'reranked_top15',
+  final_context_top15: 'final_context_top15'
 }
 
 const quickPrompts = computed(() => [
@@ -126,6 +135,10 @@ function getDebugRouteLabel(routeName: string) {
   return debugRouteLabels[routeName] || routeName
 }
 
+function getDebugStageLabel(stageName: string) {
+  return debugStageLabels[stageName] || stageName
+}
+
 function formatDebugQueryList(queries?: string[]) {
   if (!queries || queries.length === 0) {
     return '无'
@@ -160,6 +173,27 @@ function openEvidence(turn: QaTurn) {
 
 function closeEvidence() {
   evidenceDrawerOpen.value = false
+}
+
+function getTraceFileName(pathValue?: string) {
+  if (!pathValue) return ''
+  const parts = pathValue.split(/[/\\]+/)
+  return parts[parts.length - 1] || ''
+}
+
+function downloadRetrievalTrace(format: 'md' | 'json' = 'md') {
+  if (traceDownloading.value || !paperId.value) return
+
+  traceDownloading.value = true
+  try {
+    const traceName = activeEvidenceTurn.value?.retrievalDebug?.trace_export?.[format]
+      ? getTraceFileName(activeEvidenceTurn.value.retrievalDebug.trace_export[format])
+      : ''
+    const url = getPaperRetrievalTraceDownloadUrl(paperId.value, format, traceName || undefined)
+    window.open(url, '_blank', 'noopener,noreferrer')
+  } finally {
+    traceDownloading.value = false
+  }
 }
 
 function goBack() {
@@ -262,6 +296,7 @@ async function handleQaSubmit(customQuestion?: string) {
       enable_query_rewrite: retrievalOptions.enableQueryRewrite,
       enable_hyde: retrievalOptions.enableHyde,
       enable_keyword_search: retrievalOptions.enableKeywordSearch,
+      enable_llm_rerank: retrievalOptions.enableLlmRerank,
       debug: retrievalOptions.debug
     })
 
@@ -663,6 +698,10 @@ watch(qaLoading, () => scrollToBottom())
                   <el-switch v-model="retrievalOptions.enableKeywordSearch" />
                 </div>
                 <div class="control-row">
+                  <span>LLM Rerank</span>
+                  <el-switch v-model="retrievalOptions.enableLlmRerank" />
+                </div>
+                <div class="control-row">
                   <span>Debug</span>
                   <el-switch v-model="retrievalOptions.debug" />
                 </div>
@@ -694,7 +733,7 @@ watch(qaLoading, () => scrollToBottom())
             <section class="drawer-section">
               <div class="drawer-section-title">参考来源</div>
               <div v-if="activeEvidenceTurn.sources.length" class="source-list drawer-source-list">
-                <details v-for="(source, index) in activeEvidenceTurn.sources" :key="index" class="source-item">
+                <details v-for="(source, index) in activeEvidenceTurn.sources" :key="index" class="source-item" open>
                   <summary class="source-summary">
                     <div class="source-summary-main">
                       <span class="source-index">{{ index + 1 }}</span>
@@ -716,7 +755,17 @@ watch(qaLoading, () => scrollToBottom())
             </section>
 
             <section v-if="activeEvidenceTurn.retrievalDebug" class="drawer-section">
-              <div class="drawer-section-title">检索调试</div>
+              <div class="drawer-section-head">
+                <div class="drawer-section-title">检索调试</div>
+                <el-button
+                  size="small"
+                  text
+                  :loading="traceDownloading"
+                  @click="downloadRetrievalTrace('md')"
+                >
+                  下载 trace
+                </el-button>
+              </div>
 
               <div class="debug-grid debug-grid-drawer">
                 <section class="debug-card">
@@ -784,7 +833,7 @@ watch(qaLoading, () => scrollToBottom())
                         v-for="(chunk, idx) in routeChunks"
                         :key="`drawer-route-${routeName}-${idx}`"
                         class="debug-chunk-fold"
-                        :open="idx === 0"
+                        open
                       >
                         <summary class="debug-chunk-summary">
                           <div class="debug-chunk-meta">
@@ -819,7 +868,7 @@ watch(qaLoading, () => scrollToBottom())
                   <div class="debug-card-title">最终融合</div>
                   <div class="debug-mini-meta">
                     <span>算法</span>
-                    <strong>{{ activeEvidenceTurn.retrievalDebug.fusion?.algorithm || 'weighted_rrf' }}</strong>
+                    <strong>{{ activeEvidenceTurn.retrievalDebug.fusion?.algorithm || 'pure_rrf' }}</strong>
                   </div>
                   <div class="debug-mini-meta">
                     <span>RRF k</span>
@@ -835,7 +884,7 @@ watch(qaLoading, () => scrollToBottom())
                       v-for="(chunk, idx) in activeEvidenceTurn.retrievalDebug.final_chunks"
                       :key="`drawer-final-${idx}`"
                       class="debug-chunk-fold"
-                      :open="idx === 0"
+                      open
                     >
                       <summary class="debug-chunk-summary">
                         <div class="debug-chunk-meta">
@@ -861,6 +910,53 @@ watch(qaLoading, () => scrollToBottom())
                         </div>
                       </div>
                     </details>
+                  </div>
+                </section>
+
+                <section v-if="activeEvidenceTurn.retrievalDebug.stages" class="debug-card debug-card-wide">
+                  <div class="debug-card-title">四个阶段</div>
+                  <div
+                    v-for="(stageChunks, stageName) in activeEvidenceTurn.retrievalDebug.stages"
+                    :key="`drawer-stage-${stageName}`"
+                    class="debug-route-section"
+                  >
+                    <div class="debug-route-title">
+                      {{ getDebugStageLabel(stageName) }}
+                      <span class="debug-route-count">{{ stageChunks.length }} 条</span>
+                    </div>
+                    <div v-if="stageChunks.length" class="debug-route-list">
+                      <details
+                        v-for="(chunk, idx) in stageChunks"
+                        :key="`drawer-stage-${stageName}-${idx}`"
+                        class="debug-chunk-fold"
+                        open
+                      >
+                        <summary class="debug-chunk-summary">
+                          <div class="debug-chunk-meta">
+                            <span>#{{ idx + 1 }}</span>
+                            <span>chunk {{ chunk.chunk_id ?? '-' }}</span>
+                            <span>page {{ chunk.page_number || chunk.page_range || '-' }}</span>
+                            <span>score {{ formatDebugNumber(chunk.score) }}</span>
+                          </div>
+                          <el-icon class="debug-chunk-chevron"><ArrowDown /></el-icon>
+                        </summary>
+                        <div class="debug-chunk-body">
+                          <div v-if="chunk.retrieval_route" class="debug-chunk-source">
+                            来源路由: {{ getDebugRouteLabel(chunk.retrieval_route) }}
+                          </div>
+                          <div v-if="chunk.matched_routes?.length" class="debug-chunk-source">
+                            命中路由: {{ formatDebugQueryList(chunk.matched_routes) }}
+                          </div>
+                          <div v-if="chunk.source_queries?.length" class="debug-chunk-source">
+                            来源 Queries: {{ formatDebugQueryList(chunk.source_queries) }}
+                          </div>
+                          <div class="debug-chunk-text debug-chunk-text-full">
+                            {{ chunk.content || chunk.preview || '-' }}
+                          </div>
+                        </div>
+                      </details>
+                    </div>
+                    <div v-else class="debug-empty">无数据</div>
                   </div>
                 </section>
               </div>
@@ -1507,11 +1603,19 @@ watch(qaLoading, () => scrollToBottom())
   box-shadow: 0 10px 24px rgba(15, 23, 42, 0.04);
 }
 
+.drawer-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
 .drawer-section-title {
   font-size: 15px;
   font-weight: 800;
   color: #0f172a;
-  margin-bottom: 12px;
+  margin-bottom: 0;
 }
 
 .drawer-source-list {

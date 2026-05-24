@@ -37,7 +37,7 @@ ALIYUN_API_KEY = _env_str("ALIYUN_API_KEY", "<REMOVED_API_KEY>")
 
 
 CORE_CONFIG: Dict[str, Any] = {
-    "arxiv_data_source": _env_str("ARXIV_DATA_SOURCE", "local"),
+    "arxiv_data_source": _env_str("ARXIV_DATA_SOURCE", "api"),
     "arxiv_local_path": _env_str(
         "ARXIV_LOCAL_PATH",
         str(REPO_ROOT / "07-local-arxiv" / "arxiv-2026-04-papers.json"),
@@ -120,6 +120,11 @@ RERANK_CONFIG: Dict[str, Any] = {
         "vector_hyde": 0.85,
         "keyword": 0.75,
     },
+    "trace_export_enabled": _env_bool("RETRIEVAL_TRACE_EXPORT_ENABLED", True),
+    "trace_export_dir": _env_str(
+        "RETRIEVAL_TRACE_EXPORT_DIR",
+        str(REPO_ROOT / "temp" / "retrieval-traces"),
+    ),
 }
 
 RETRIEVAL_CONFIG: Dict[str, Any] = {
@@ -142,6 +147,8 @@ RETRIEVAL_CONFIG: Dict[str, Any] = {
     "llm_rerank_candidate_limit": RERANK_CONFIG["candidate_limit"],
     "llm_rerank_max_doc_chars": RERANK_CONFIG["max_doc_chars"],
     "llm_rerank_prompt": RERANK_CONFIG["prompt"],
+    "trace_export_enabled": RERANK_CONFIG["trace_export_enabled"],
+    "trace_export_dir": RERANK_CONFIG["trace_export_dir"],
 }
 
 GENERATION_CONFIG: Dict[str, Any] = {

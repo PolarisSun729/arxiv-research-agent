@@ -324,6 +324,18 @@ export async function getPaperQaDiagnostic(arxivId: string, sampleLimit: number 
   })
 }
 
+export function getPaperRetrievalTraceDownloadUrl(
+  arxivId: string,
+  format: 'md' | 'json' = 'md',
+  traceName?: string
+): string {
+  const params = new URLSearchParams({ format })
+  if (traceName) {
+    params.set('trace_name', traceName)
+  }
+  return `/api/paper/${arxivId}/qa-trace/latest?${params.toString()}`
+}
+
 export interface CreateQaIndexResult {
   status: string
   message: string
@@ -373,6 +385,7 @@ export interface RetrievalDebugChunk {
   original_chunk_id?: number
   page_number?: string
   page_range?: string
+  route_rank?: number
   score?: number
   route_score?: number
   retrieval_route?: string
@@ -437,9 +450,11 @@ export interface RetrievalDebug {
   hyde?: RetrievalDebugHyde
   keyword_search?: RetrievalDebugKeywordSearch
   routes: Record<string, RetrievalDebugChunk[]>
+  stages?: Record<string, RetrievalDebugChunk[]>
   final_chunks: RetrievalDebugChunk[]
   config?: Record<string, any>
   fusion?: Record<string, any>
+  trace_export?: Record<string, string>
 }
 
 export async function qaPaper(arxivId: string, question: string, options: QaRequestOptions = {}): Promise<QaResult> {

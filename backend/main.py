@@ -2,7 +2,7 @@
 import json
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body, Query, Request, Depends
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from numpy import False_
 from services.loading_service import LoadingService
@@ -126,6 +126,7 @@ def build_qa_context(arxiv_id: str, payload: QaRequest):
         collection_name=collection_name,
         user_query=payload.question.strip(),
         paper_context={
+            "arxiv_id": arxiv_id,
             "title": paper.get("title", ""),
             "abstract": paper.get("abstract", ""),
             "authors": paper.get("authors", ""),
@@ -142,13 +143,39 @@ def build_qa_context(arxiv_id: str, payload: QaRequest):
             debug=payload.debug,
         ),
     )
-    search_results = retrieval_result["chunks"]
+    final_context_results = retrieval_result["chunks"]
+    search_results = final_context_results
 
     if not search_results:
         raise HTTPException(status_code=400, detail="No relevant chunks found")
 
     context = "\n\n".join([result.get('content', '') for result in search_results])
     return qa_index, search_results, context, retrieval_result.get("debug")
+
+
+def _sanitize_trace_slug(text: str, max_length: int = 40) -> str:
+    import re
+
+    slug = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "_", (text or "").strip())
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    if not slug:
+        slug = "query"
+    return slug[:max_length]
+
+
+def _get_latest_retrieval_trace(arxiv_id: str, format_name: str = "md") -> Optional[Path]:
+    trace_root = Path(str(enhanced_retrieval_service.trace_export_dir))
+    paper_dir = trace_root / _sanitize_trace_slug(arxiv_id)
+    if not paper_dir.exists() or not paper_dir.is_dir():
+        return None
+
+    suffix = ".json" if format_name == "json" else ".md"
+    trace_files = sorted(
+        paper_dir.glob(f"*{suffix}"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return trace_files[0] if trace_files else None
 
 
 def build_qa_diagnostic(arxiv_id: str, sample_limit: int = 3) -> Dict[str, Any]:
@@ -744,6 +771,47 @@ async def diagnose_paper_qa(arxiv_id: str, sample_limit: int = Query(3, ge=0, le
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/paper/{arxiv_id}/qa-trace/latest")
+async def download_latest_qa_trace(
+    arxiv_id: str,
+    format: str = Query("md"),
+    trace_name: Optional[str] = Query(None),
+):
+    """下载该论文最近一次检索的 trace 文件，或下载指定文件名的 trace。"""
+    try:
+        normalized_format = str(format or "md").strip().lower()
+        if normalized_format not in {"md", "json"}:
+            raise HTTPException(status_code=400, detail="format must be md or json")
+
+        trace_root = Path(str(enhanced_retrieval_service.trace_export_dir))
+        paper_dir = trace_root / _sanitize_trace_slug(arxiv_id)
+        trace_file: Optional[Path] = None
+
+        if trace_name:
+            safe_name = Path(str(trace_name)).name
+            if safe_name != trace_name:
+                raise HTTPException(status_code=400, detail="Invalid trace_name")
+            candidate = paper_dir / safe_name
+            if candidate.exists() and candidate.is_file():
+                trace_file = candidate
+        else:
+            trace_file = _get_latest_retrieval_trace(arxiv_id, normalized_format)
+
+        if trace_file is None:
+            raise HTTPException(status_code=404, detail="No retrieval trace found for this paper")
+
+        return FileResponse(
+            path=str(trace_file),
+            filename=f"{arxiv_id}_retrieval_trace.{normalized_format}",
+            media_type="application/json" if normalized_format == "json" else "text/markdown",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error downloading QA trace: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/paper/{arxiv_id}/create-qa-index")
 async def create_paper_qa_index(arxiv_id: str, loading_method: str = Query("docling")):
     """
@@ -789,6 +857,13 @@ async def create_paper_qa_index(arxiv_id: str, loading_method: str = Query("docl
 
         chunks = chunked_data['chunks']
         logger.info(f"Created {len(chunks)} chunks")
+
+        logger.info("Compressing chunk text for rerank with Qwen...")
+        chunks = generation_service.compress_chunks_for_rerank(
+            chunks=chunks,
+            model_name="qwen3.6-plus",
+        )
+        logger.info("Generated rerank_text for %d chunks", len(chunks))
 
         # Persist the chunked document so the frontend can inspect the actual chunks.
         chunk_file = loading_service.save_document(
@@ -850,7 +925,7 @@ async def create_paper_qa_index(arxiv_id: str, loading_method: str = Query("docl
         db_service.update_paper_qa_index(arxiv_id, status='failed')
         raise
     except Exception as e:
-        logger.error(f"Error creating QA index: {str(e)}")
+        logger.exception("Error creating QA index: %s", str(e))
         db_service.update_paper_qa_index(arxiv_id, status='failed')
         raise HTTPException(status_code=500, detail=str(e))
 

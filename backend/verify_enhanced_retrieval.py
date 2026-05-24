@@ -26,12 +26,19 @@ def print_route(title: str, retrieval_debug: dict):
                 f"  {idx}. chunk={item.get('chunk_id')} page={item.get('page_number') or item.get('page_range')} "
                 f"route_score={item.get('route_score')} preview={preview}"
             )
-    print("\n[final_chunks]")
-    for idx, item in enumerate(retrieval_debug.get("final_chunks", []), start=1):
-        print(
-            f"  {idx}. chunk={item.get('chunk_id')} page={item.get('page_number') or item.get('page_range')} "
-            f"fused_score={item.get('score')} matched_routes={item.get('matched_routes')} preview={item.get('preview')}"
-        )
+
+    stages = retrieval_debug.get("stages", {})
+    for stage_name in ["raw_retrieval_top15", "fused_top15", "reranked_top15", "final_context_top15"]:
+        print(f"\n[{stage_name}]")
+        items = stages.get(stage_name, [])
+        if not items:
+            print("  no hits")
+            continue
+        for idx, item in enumerate(items[:10], start=1):
+            print(
+                f"  {idx}. chunk={item.get('chunk_id')} page={item.get('page_number') or item.get('page_range')} "
+                f"score={item.get('score')} route={item.get('retrieval_route')} preview={item.get('preview')}"
+            )
 
 
 def main():

@@ -11,26 +11,28 @@ from openai import OpenAI
 import requests
 from utils.model_utils import get_huggingface_model_path
 from utils.config import GENERATION_CONFIG
-# 璁剧疆鐜鍙橀噺浠ュ惎鐢?Apple Silicon (MPS) 鍥為€€鍒?CPU (褰撻亣鍒颁笉鏀寔鐨勬搷浣滄椂浼氳嚜鍔ㄥ洖閫€鍒?CPU 鎵ц)
-# 鐩墠 PyTorch 鐗堟湰 鈮?1.13 鏃讹紝鎵嶆敮鎸?Apple 鐨?Metal Performance Shaders (MPS) 锛岃€屼笖鏆備笉鏀寔銆屽 GPU銆嶏紝鍙﹀锛岄儴鍒嗚缁冩搷浣滃皻鏈畬鍏ㄥ疄鐜?
+# 启用 MPS 失败时自动回退到 CPU，避免 Apple Silicon 环境下推理直接报错。
+# 当前 PyTorch 对 MPS 的支持仍有边界场景，回退是更稳妥的默认行为。
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 logger = logging.getLogger(__name__)
 
-# 闃块噷浜戠櫨鐐?/ 閫氫箟鍗冮棶 API Key銆?
-# 鎸変綘鐨勮姹傝繖閲岀洿鎺ュ啓鍦ㄤ唬鐮侀噷锛涜鏇挎崲涓轰綘鑷繁鐨勭湡瀹?Key銆?
+# 阿里云百炼 / 通义千问 API Key。
+# 如果你有自己的真实 Key，请通过环境变量注入，不要直接写死在代码里。
 QWEN_API_KEY = GENERATION_CONFIG["qwen_api_key"]
 QWEN_BASE_URL = GENERATION_CONFIG["qwen_base_url"]
 QWEN_MODEL_NAME = GENERATION_CONFIG["qwen_model_name"]
+RERANK_QWEN_MODEL_NAME = "qwen3.6-flash"
+QWEN_ENABLE_THINKING = False
 
 class GenerationService:
     """
-    鐢熸垚鏈嶅姟绫伙細璐熻矗璋冪敤涓嶅悓鐨勬ā鍨嬫彁渚涘晢锛圚uggingFace銆丱penAI銆丏eepSeek锛夌敓鎴愬洖绛?
-    鏀寔鏈湴妯″瀷鍜孉PI璋冪敤锛屽苟灏嗙敓鎴愮粨鏋滀繚瀛樺埌鏂囦欢
+    生成服务类，负责调用不同模型提供商生成结果。
+    支持本地模型和 API 调用，并将生成结果保存到文件。
     """
     def __init__(self):
         """
-        鍒濆鍖栫敓鎴愭湇鍔★紝閰嶇疆鏀寔鐨勬ā鍨嬪垪琛ㄥ拰鍒涘缓杈撳嚭鐩綍
+        初始化生成服务，配置支持的模型列表和输出目录。
         """
         self.models = {
             "openai": {
@@ -46,19 +48,101 @@ class GenerationService:
             }
         }
         
-        # 纭繚杈撳嚭鐩綍瀛樺湪
+        # 确保输出目录存在
         os.makedirs("05-generation-results", exist_ok=True)
+
+    def compress_chunk_for_rerank(
+        self,
+        chunk_text: str,
+        chunk_metadata: Optional[Dict[str, Any]] = None,
+        api_key: Optional[str] = None,
+        model_name: str = RERANK_QWEN_MODEL_NAME,
+    ) -> str:
+        chunk_metadata = chunk_metadata or {}
+        normalized_text = re.sub(r"\s+", " ", str(chunk_text or "")).strip()
+        if not normalized_text:
+            return self._build_low_information_rerank_text("empty text", "unknown topic")
+
+        prompt = self._build_rerank_chunk_compression_prompt(normalized_text, chunk_metadata)
+        structured_fallback = self._build_structured_rerank_text(normalized_text, chunk_metadata)
+        try:
+            compressed = self.complete_with_qwen(
+                prompt,
+                api_key=api_key,
+                model_name=model_name,
+                enable_thinking=False,
+            )
+            compressed = self._normalize_rerank_chunk_text(compressed)
+            if compressed:
+                if self._rerank_text_has_evidence_structure(compressed):
+                    return compressed
+                logger.debug(
+                    "Rerank model output did not match card structure for chunk_id=%s, using structured fallback",
+                    chunk_metadata.get("chunk_id", chunk_metadata.get("chunk_index", "")),
+                )
+        except Exception as exc:
+            logger.warning(
+                "Failed to compress chunk %s for rerank with Qwen, falling back to structured heuristic rerank text: %s",
+                chunk_metadata.get("chunk_id", chunk_metadata.get("chunk_index", "")),
+                exc,
+            )
+
+        return structured_fallback
+
+    def compress_chunks_for_rerank(
+        self,
+        chunks: List[Dict[str, Any]],
+        api_key: Optional[str] = None,
+        model_name: str = RERANK_QWEN_MODEL_NAME,
+    ) -> List[Dict[str, Any]]:
+        compressed_chunks: List[Dict[str, Any]] = []
+        logger.info(
+            "Preparing rerank_text for %d chunks with model=%s enable_thinking=%s",
+            len(chunks),
+            model_name,
+            False,
+        )
+
+        for chunk in chunks:
+            updated_chunk = dict(chunk)
+            metadata = dict(updated_chunk.get("metadata", {}) or {})
+            chunk_id = metadata.get("chunk_id", metadata.get("chunk_index", len(compressed_chunks) + 1))
+            raw_content = str(updated_chunk.get("content", "") or "")
+            rerank_text = self.compress_chunk_for_rerank(
+                chunk_text=raw_content,
+                chunk_metadata=metadata,
+                api_key=api_key,
+                model_name=model_name,
+            )
+
+            metadata["rerank_text"] = rerank_text
+            metadata["rerank_text_model"] = model_name
+            metadata["rerank_text_generated_at"] = datetime.now().isoformat()
+            updated_chunk["metadata"] = metadata
+            updated_chunk["rerank_text"] = rerank_text
+
+            logger.info(
+                "Prepared rerank_text for chunk_id=%s model=%s enable_thinking=%s raw_preview=%s rerank_preview=%s",
+                chunk_id,
+                model_name,
+                False,
+                self._preview_text(raw_content, 120),
+                self._preview_text(rerank_text, 120),
+            )
+            compressed_chunks.append(updated_chunk)
+
+        return compressed_chunks
         
     def _load_huggingface_model(self, model_name: str):
         """
-        鍔犺浇HuggingFace妯″瀷
+        加载 HuggingFace 模型。
         
-        鍙傛暟:
-            model_name: 妯″瀷鍚嶇О锛屽搴攕elf.models["huggingface"]涓殑閿?
+        参数:
+            model_name: 模型名称，对应 self.models["huggingface"] 中的键。
             
-        杩斿洖:
-            model: 鍔犺浇鐨勬ā鍨?
-            tokenizer: 瀵瑰簲鐨勫垎璇嶅櫒
+        返回:
+            model: 加载后的模型。
+            tokenizer: 对应的分词器。
         """
         try:
             model_name = self.models["huggingface"][model_name]
@@ -84,16 +168,16 @@ class GenerationService:
         max_length: int = 512
     ) -> str:
         """
-        浣跨敤HuggingFace妯″瀷鐢熸垚鍥炵瓟
+        使用 HuggingFace 模型生成回答。
         
-        鍙傛暟:
-            model_name: 妯″瀷鍚嶇О
-            query: 鐢ㄦ埛鏌ヨ
-            context: 涓婁笅鏂囦俊鎭?
-            max_length: 鐢熸垚鏂囨湰鐨勬渶澶ч暱搴?
+        参数:
+            model_name: 模型名称。
+            query: 用户查询。
+            context: 上下文信息。
+            max_length: 生成文本的最大长度。
             
-        杩斿洖:
-            鐢熸垚鐨勫洖绛旀枃鏈?
+        返回:
+            生成的回答文本。
         """
         try:
             model, tokenizer = self._load_huggingface_model(model_name)
@@ -132,16 +216,16 @@ Answer:"""
         api_key: Optional[str] = None
     ) -> str:
         """
-        浣跨敤OpenAI API鐢熸垚鍥炵瓟
+        使用 OpenAI API 生成回答。
         
-        鍙傛暟:
-            model_name: 妯″瀷鍚嶇О
-            query: 鐢ㄦ埛鏌ヨ
-            context: 涓婁笅鏂囦俊鎭?
-            api_key: OpenAI API瀵嗛挜锛屽涓嶆彁渚涘垯浠庣幆澧冨彉閲忚幏鍙?
+        参数:
+            model_name: 模型名称。
+            query: 用户查询。
+            context: 上下文信息。
+            api_key: OpenAI API 密钥；如果不提供则从环境变量读取。
             
-        杩斿洖:
-            鐢熸垚鐨勫洖绛旀枃鏈?
+        返回:
+            生成的回答文本。
         """
         try:
             if not api_key:
@@ -175,11 +259,12 @@ Answer:"""
         context: str,
         api_key: Optional[str] = None,
         model_name: str = QWEN_MODEL_NAME,
+        enable_thinking: bool = QWEN_ENABLE_THINKING,
     ) -> str:
         """
-        浣跨敤闃块噷浜戠櫨鐐肩殑 OpenAI 鍏煎 Responses API 鐢熸垚绛旀銆?
+        使用阿里云百炼兼容的 OpenAI Responses API 生成答案。
 
-        杩欓噷閲囩敤 Qwen3.6-Plus锛岃緭鍏ヤ负妫€绱㈠埌鐨勪笂涓嬫枃 + 闂銆?
+        这里采用 Qwen3.6-Plus，输入由检索到的上下文和问题组成。
         """
         try:
             if not api_key:
@@ -203,13 +288,14 @@ Answer:"""
             response = client.responses.create(
                 model=model_name,
                 input=prompt,
+                extra_body={"enable_thinking": enable_thinking},
             )
 
             answer = getattr(response, "output_text", None)
             if answer:
                 return answer.strip()
 
-            # 鍏滃簳瑙ｆ瀽锛岄槻姝?SDK 杩斿洖缁撴瀯鍙樺寲鏃舵嬁涓嶅埌 output_text銆?
+            # 兜底解析，防止 SDK 返回结构变化时拿不到 output_text。
             output_parts = []
             for item in getattr(response, "output", []) or []:
                 if getattr(item, "type", None) == "message":
@@ -231,6 +317,7 @@ Answer:"""
         prompt: str,
         api_key: Optional[str] = None,
         model_name: str = QWEN_MODEL_NAME,
+        enable_thinking: bool = QWEN_ENABLE_THINKING,
     ) -> str:
         try:
             if not api_key:
@@ -245,6 +332,7 @@ Answer:"""
             response = client.responses.create(
                 model=model_name,
                 input=prompt,
+                extra_body={"enable_thinking": enable_thinking},
             )
 
             answer = getattr(response, "output_text", None)
@@ -291,6 +379,31 @@ Answer:"""
             elif isinstance(item, str) and item.strip():
                 normalized_queries.append(item.strip())
         return normalized_queries
+
+    def rewrite_query_for_rerank(
+        self,
+        question: str,
+        paper_context: Optional[Dict[str, Any]] = None,
+        api_key: Optional[str] = None,
+        model_name: str = QWEN_MODEL_NAME,
+    ) -> str:
+        return self.build_rerank_query(
+            question,
+            api_key=api_key,
+            model_name=model_name,
+        )
+
+    def build_rerank_query(
+        self,
+        original_question: str,
+        api_key: Optional[str] = None,
+        model_name: str = QWEN_MODEL_NAME,
+    ) -> str:
+        normalized_question = re.sub(r"\s+", " ", (original_question or "")).strip()
+        rerank_query = self._build_evidence_selection_rerank_query(normalized_question)
+        logger.debug("original_question=%s", normalized_question)
+        logger.debug("actual_rerank_query=%s", rerank_query)
+        return rerank_query
 
     def plan_queries_for_retrieval(
         self,
@@ -347,6 +460,20 @@ Answer:"""
             f"Question: {question}"
         )
         return self.complete_with_qwen(prompt, api_key=api_key, model_name=model_name).strip()
+
+    def _fallback_rerank_query(self, question: str) -> str:
+        return self._build_evidence_selection_rerank_query(question)
+
+    def _build_evidence_selection_rerank_query(self, original_question: str) -> str:
+        normalized_question = re.sub(r"\s+", " ", (original_question or "")).strip()
+        base_query = (
+            "Select the passage that most directly supports an answer to the user's question. "
+            "Prefer evidence-bearing chunks with explicit facts, definitions, steps, causes, results, comparisons, or other answerable statements; "
+            "down-rank passages that are only loosely topic-related or background. "
+        )
+        if normalized_question:
+            return f"{base_query}Original question: {normalized_question}"
+        return base_query.rstrip()
 
     def _extract_json_block(self, text: str) -> str:
         fenced_match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
@@ -501,6 +628,243 @@ Answer:"""
                 seen.append(token)
         return seen[:limit]
 
+    def _build_rerank_chunk_compression_prompt(
+        self,
+        chunk_text: str,
+        chunk_metadata: Dict[str, Any],
+    ) -> str:
+        section_title = str(chunk_metadata.get("section_title", "") or "").strip()
+        section_path = str(chunk_metadata.get("section_path", "") or "").strip()
+        page_range = str(chunk_metadata.get("page_range", "") or "").strip()
+        word_count = int(chunk_metadata.get("word_count", len(chunk_text.split())) or 0)
+        role_label, useful_scope = self._infer_rerank_card_fields(chunk_text, chunk_metadata)
+
+        return (
+            "You are preparing a passage for a reranker in an academic RAG system.\n"
+            "Transform the chunk into a compact evidence card for reranking.\n"
+            "Requirements:\n"
+            "1. Use exactly this structure:\n"
+            "Role: {content_role}\n"
+            "Useful for: {positive_question_scope}\n"
+            "Core evidence:\n"
+            "{concise_core_content}\n"
+            "2. Keep Role short and specific.\n"
+            "3. Useful for must only describe positive question scope.\n"
+            "4. Core evidence must be 1 to 3 short sentences.\n"
+            "5. Do not add negative scope labels or generic summary padding.\n"
+            "6. If the chunk is low-information, use the low-information template and do not elaborate.\n"
+            "7. Do not invent facts that are not in the chunk.\n"
+            "8. Output plain text only.\n\n"
+            f"Section title: {section_title or 'N/A'}\n"
+            f"Section path: {section_path or 'N/A'}\n"
+            f"Page range: {page_range or 'N/A'}\n"
+            f"Word count: {word_count}\n\n"
+            f"Likely role: {role_label}\n"
+            f"Likely useful scope: {useful_scope}\n\n"
+            "Chunk:\n"
+            f"{chunk_text}\n\n"
+            "Evidence card:"
+        )
+
+    def _normalize_rerank_chunk_text(self, text: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+        normalized = re.sub(r"^(compressed rerank text|evidence-value rerank text|evidence card|rerank text|answer)\s*:\s*", "", normalized, flags=re.IGNORECASE)
+        return normalized.strip()
+
+    def _build_structured_rerank_text(self, chunk_text: str, chunk_metadata: Dict[str, Any]) -> str:
+        normalized = re.sub(r"\s+", " ", str(chunk_text or "")).strip()
+        if self._looks_like_low_information_chunk(normalized, chunk_metadata):
+            return self._build_low_information_rerank_text()
+
+        role_label, useful_scope = self._infer_rerank_card_fields(normalized, chunk_metadata)
+        core_content = self._extract_rerank_core_content(normalized, chunk_metadata, role_label)
+        return self._compose_rerank_card_text(role_label, useful_scope, core_content)
+
+    def _compose_rerank_card_text(self, role_label: str, useful_scope: str, core_content: str) -> str:
+        return (
+            f"Role: {role_label}.\n"
+            f"Useful for: {useful_scope}.\n"
+            "Core evidence:\n"
+            f"{core_content}"
+        )
+
+    def _build_low_information_rerank_text(self) -> str:
+        return (
+            "Role: low-information.\n"
+            "Useful for: document metadata or structure identification.\n"
+            "Core evidence:\n"
+            "Not standalone evidence."
+        )
+
+    def _infer_rerank_card_fields(self, text: str, chunk_metadata: Dict[str, Any]) -> tuple[str, str]:
+        normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+        lowered = normalized.lower()
+        section_title = str(chunk_metadata.get("section_title", "") or "").strip().lower()
+        section_path = str(chunk_metadata.get("section_path", "") or "").strip().lower()
+        section_tags = {str(tag).strip().lower() for tag in (chunk_metadata.get("section_tags", []) or []) if str(tag).strip()}
+        heading_hint = f"{section_path} {section_title}".strip()
+
+        if self._looks_like_low_information_chunk(normalized, chunk_metadata):
+            return (
+                "low-information",
+                "document metadata or structure identification",
+            )
+
+        if any(tag in {"method", "methods", "model", "approach", "framework"} for tag in section_tags) or re.search(
+            r"\b(method|methods|approach|framework|architecture|pipeline|algorithm|training loop|reward|optimization|objective)\b",
+            lowered,
+        ):
+            if re.search(r"\breward\b|\bpolicy\b|\bgrpo\b|\bppo\b|\brl\b|\breinforcement learning\b", lowered):
+                return (
+                    "method / training objective",
+                    "method, training, reward design, and optimization process questions",
+                )
+            if re.search(r"\balgorithm\b|\bpseudocode\b|\bstep\b|\bprocedure\b", lowered):
+                return (
+                    "algorithm / procedure",
+                    "algorithm flow, step-by-step procedure, and component interaction questions",
+                )
+            return (
+                "method / framework",
+                "method, framework, component, or pipeline questions",
+            )
+
+        if any(tag in {"experiment", "experiments", "results", "result", "analysis", "ablation"} for tag in section_tags) or re.search(
+            r"\b(experiment|experiments|results?|analysis|ablation|baseline|benchmarks?|table|figure|score|metric|accuracy|f1|recall|precision|improvement|dataset|setting|hyperparameter)\b",
+            lowered,
+        ):
+            if re.search(r"\bablation\b|\bremove\b|\bwithout\b|\bvariant\b|\bcomponent\b", lowered):
+                return (
+                    "ablation",
+                    "ablation, component contribution, and design choice comparison questions",
+                )
+            if re.search(r"\bsetup\b|\bimplementation\b|\bhyperparameter\b|\btraining details\b|\bdata\b|\bdataset\b|\bbaseline\b", lowered):
+                return (
+                    "experiment setup",
+                    "dataset, baseline, metric, implementation, and evaluation setting questions",
+                )
+            return (
+                "result / analysis",
+                "result interpretation, performance comparison, and empirical finding questions",
+            )
+
+        if any(tag in {"appendix", "supplementary"} for tag in section_tags) or re.search(
+            r"\b(appendix|supplementary|additional results|extra analysis|case study|qualitative|transferability)\b",
+            lowered,
+        ):
+            return (
+                "appendix / supplementary",
+                "supplementary analysis, transferability, or additional evidence questions",
+            )
+
+        if any(tag in {"limitation", "limitations", "ethics", "ethic", "broader-impact"} for tag in section_tags) or re.search(
+            r"\b(limitation|limitations|ethic|ethics|bias|risk|responsible|misuse|privacy|safety)\b",
+            lowered,
+        ):
+            return (
+                "limitation / ethics",
+                "limitations, bias, safety, or responsible-use questions",
+            )
+
+        if any(tag in {"related-work", "background", "related"} for tag in section_tags) or re.search(
+            r"\b(related work|background|prior work|motivation|survey)\b",
+            lowered,
+        ):
+            return (
+                "background / related work",
+                "motivation, prior work, and literature context questions",
+            )
+
+        if re.search(r"\bconclusion\b|\bsummary\b", section_title + " " + section_path + " " + lowered):
+            return (
+                "conclusion",
+                "takeaway, closing claim, or paper summary questions",
+            )
+
+        return (
+            "substantive evidence",
+            "local factual claims, definitions, or conceptual explanation questions",
+        )
+
+    def _extract_rerank_core_content(self, text: str, chunk_metadata: Dict[str, Any], role_label: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+        section_title = str(chunk_metadata.get("section_title", "") or "").strip()
+
+        if not normalized:
+            return "No substantive text was provided."
+
+        if section_title and section_title.lower() not in normalized.lower():
+            normalized = f"{section_title}. {normalized}"
+
+        if len(normalized) <= 360:
+            return normalized
+
+        sentences = re.split(r"(?<=[.!?。！？；;])\s+", normalized)
+        selected: List[str] = []
+        key_terms = self._role_key_terms(role_label)
+        for sentence in sentences:
+            cleaned = sentence.strip()
+            if not cleaned:
+                continue
+            lowered = cleaned.lower()
+            if key_terms and any(term in lowered for term in key_terms):
+                selected.append(cleaned)
+            elif not selected and len(cleaned) > 32:
+                selected.append(cleaned)
+            if len(selected) >= 3:
+                break
+
+        if not selected:
+            selected = [self._preview_text(normalized, 320)]
+        return " ".join(selected).strip()
+
+    def _role_key_terms(self, role_label: str) -> List[str]:
+        role = role_label.lower()
+        if "method" in role or "algorithm" in role or "framework" in role or "training" in role:
+            return ["method", "framework", "algorithm", "training", "reward", "policy", "optimization"]
+        if "experiment" in role or "result" in role or "ablation" in role:
+            return ["experiment", "result", "baseline", "ablation", "table", "dataset", "metric", "score"]
+        if "appendix" in role or "supplementary" in role:
+            return ["appendix", "supplementary", "additional", "case study", "analysis"]
+        if "ethics" in role or "limitation" in role:
+            return ["limit", "ethic", "bias", "risk", "safety", "privacy"]
+        return []
+
+    def _rerank_text_has_evidence_structure(self, text: str) -> bool:
+        lowered = str(text or "").lower()
+        return "role:" in lowered and "useful for:" in lowered and "core evidence:" in lowered
+
+    def _looks_like_low_information_chunk(self, text: str, chunk_metadata: Dict[str, Any]) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return True
+
+        word_count = len(normalized.split())
+        lowered = normalized.lower()
+        section_title = str(chunk_metadata.get("section_title", "") or "").strip().lower()
+
+        if word_count <= 14 and "\n" not in normalized and normalized == normalized.title():
+            return True
+        if any(token in lowered for token in ("references", "bibliography")):
+            return True
+        if re.match(r"^\[?\d+\]?\s+[A-Z]", normalized):
+            return True
+        if re.search(r"\b(email|university|institute|department)\b", lowered) and word_count <= 40:
+            return True
+        if re.search(r"\barxiv\b|\bdoi\b|http[s]?://", lowered) and word_count <= 40:
+            return True
+        if section_title and normalized.lower() == section_title:
+            return True
+        if word_count <= 8:
+            return True
+        return False
+
+    def _preview_text(self, text: str, limit: int = 120) -> str:
+        normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[:limit].rstrip()
+
     def _build_qwen_prompt(self, query: str, context: str) -> str:
         return (
             "You are a strict academic QA assistant. Answer only from the provided context.\n"
@@ -516,6 +880,7 @@ Answer:"""
         context: str,
         api_key: Optional[str] = None,
         model_name: str = QWEN_MODEL_NAME,
+        enable_thinking: bool = QWEN_ENABLE_THINKING,
     ) -> Iterator[Dict[str, Any]]:
         """Stream a Qwen Responses API answer chunk by chunk."""
         try:
@@ -529,6 +894,7 @@ Answer:"""
                 model=model_name,
                 input=self._build_qwen_prompt(query, context),
                 stream=True,
+                extra_body={"enable_thinking": enable_thinking},
             )
 
             answer_parts: List[str] = []
@@ -610,31 +976,37 @@ Answer:"""
         show_reasoning: bool = True
     ) -> Dict:
         """
-        鐢熸垚鍥炵瓟骞朵繚瀛樼粨鏋?
+        生成回答并保存结果。
         
-        鍙傛暟:
-            provider: 妯″瀷鎻愪緵鍟嗭紝鍙€夊€间负"openai"銆?qwen"銆?deepseek"
-            model_name: 妯″瀷鍚嶇О
-            query: 鐢ㄦ埛鏌ヨ
-            search_results: 鎼滅储缁撴灉鍒楄〃锛岀敤浜庢瀯寤轰笂涓嬫枃
-            api_key: API瀵嗛挜锛堝浜嶢PI璋冪敤锛?
-            show_reasoning: 鏄惁鏄剧ず鎺ㄧ悊杩囩▼锛堜粎瀵笵eepSeek鎺ㄧ悊妯″瀷鏈夋晥锛?
+        参数:
+            provider: 模型提供商，可选值为 "openai"、"qwen"、"deepseek"。
+            model_name: 模型名称。
+            query: 用户查询。
+            search_results: 检索结果列表，用于构建上下文。
+            api_key: API 密钥，对应不同提供商。
+            show_reasoning: 是否显示推理过程（仅对 DeepSeek 推理模型有效）。
             
-        杩斿洖:
-            鍖呭惈鐢熸垚鍥炵瓟鍜屼繚瀛樿矾寰勭殑瀛楀吀
+        返回:
+            包含生成回答和保存路径的字典。
         """
         try:
-            # 鍑嗗涓婁笅鏂?
+            # 准备上下文
             context = "\n\n".join([
                 f"[Source {i+1}]: {result['text']}"
                 for i, result in enumerate(search_results)
             ])
             
-            # 鏍规嵁涓嶅悓鎻愪緵鍟嗙敓鎴愬洖绛?
+            # 根据不同提供商生成回答
             if provider == "openai":
                 response = self._generate_with_openai(model_name, query, context, api_key)
             elif provider == "qwen":
-                response = self._generate_with_qwen_responses(query, context, api_key, model_name)
+                response = self._generate_with_qwen_responses(
+                    query,
+                    context,
+                    api_key,
+                    model_name,
+                    enable_thinking=QWEN_ENABLE_THINKING,
+                )
             elif provider == "deepseek":
                 response = self._generate_with_deepseek(model_name, query, context, api_key, show_reasoning)
             elif provider == "huggingface":
@@ -642,7 +1014,7 @@ Answer:"""
             else:
                 raise ValueError(f"Unsupported provider: {provider}")
                 
-            # 鍑嗗淇濆瓨鐨勭粨鏋?
+            # 准备保存结果
             result = {
                 "query": query,
                 "timestamp": datetime.now().isoformat(),
@@ -652,7 +1024,7 @@ Answer:"""
                 "context": search_results
             }
             
-            # 鐢熸垚鏂囦欢鍚嶅苟淇濆瓨
+            # 生成文件名并保存
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             filename = f"generation_{provider}_{model_name}_{timestamp}.json"
             filepath = os.path.join("05-generation-results", filename)
@@ -671,10 +1043,10 @@ Answer:"""
 
     def get_available_models(self) -> Dict:
         """
-        鑾峰彇鍙敤鐨勬ā鍨嬪垪琛?
+        获取可用模型列表。
         
-        杩斿洖:
-            鍖呭惈鎵€鏈夋敮鎸佹ā鍨嬬殑瀛楀吀
+        返回:
+            包含所有支持模型的字典。
         """
         return self.models 
 
