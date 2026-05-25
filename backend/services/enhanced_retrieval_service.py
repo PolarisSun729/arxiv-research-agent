@@ -17,6 +17,7 @@ from services.embedding_service import EmbeddingService
 from services.vector_store_service import VectorStoreService
 from utils.config import RETRIEVAL_CONFIG
 from utils.model_utils import get_huggingface_model_path
+from services.intent_service import IntentProfile, IntentService
 
 try:  # pragma: no cover - optional dependency import is environment dependent
     from sentence_transformers import CrossEncoder
@@ -390,6 +391,7 @@ class QueryProfile:
     original_query: str
     normalized_query: str
     language: str
+    intent_profile: IntentProfile
     tokens: List[str]
     keywords: List[str]
     intent_tags: List[str]
@@ -414,6 +416,7 @@ class EnhancedRetrievalService:
         self.embedding_service = embedding_service
         self.vector_store_service = vector_store_service
         self.generation_service = generation_service
+        self.intent_service = IntentService(generation_service=self.generation_service)
         self.rrf_k = RETRIEVAL_CONFIG["rrf_k"]
         self.route_weights = RETRIEVAL_CONFIG["route_weights"]
         self.candidate_multiplier = RETRIEVAL_CONFIG["candidate_multiplier"]
@@ -475,7 +478,13 @@ class EnhancedRetrievalService:
         final_context_top_k = 15
 
         normalized_collection_name = self._resolve_collection_name(collection_name)
-        query_profile = self._build_query_profile(user_query, normalized_collection_name, paper_context=paper_context)
+        intent_profile = self._build_intent_profile(user_query, paper_context=paper_context)
+        query_profile = self._build_query_profile(
+            user_query,
+            normalized_collection_name,
+            paper_context=paper_context,
+            intent_profile=intent_profile,
+        )
         query_views = self._build_query_views(user_query, query_profile, enable_query_rewrite)
 
         hyde_text = ""
@@ -498,6 +507,7 @@ class EnhancedRetrievalService:
                     query_profile,
                     hyde_text or user_query,
                     route_queries=query_views["selected_queries"] or [user_query],
+                    intent_profile=intent_profile,
                 ),
             }
 
@@ -629,6 +639,7 @@ class EnhancedRetrievalService:
             result["debug"] = {
                 "original_query": user_query,
                 "original_question": user_query,
+                "intent_profile": self._debug_intent_profile(intent_profile),
                 "query_profile": self._debug_query_profile(query_profile),
                 "query_plan": query_profile.query_plan,
                 "query_views": query_views,
@@ -664,7 +675,7 @@ class EnhancedRetrievalService:
                 "fusion": {
                     "algorithm": "pure_rrf",
                     "rrf_k": self.rrf_k,
-                    "route_weights": self.route_weights,
+                    "route_weights": self._route_weights_for_intent(intent_profile),
                     "dedupe_per_route": True,
                     "route_confidence": {
                         route_name: self._route_confidence(
@@ -672,11 +683,13 @@ class EnhancedRetrievalService:
                             query_profile,
                             (route_results[0]["source_query"] if route_results else user_query),
                             route_queries=self._collect_route_queries(route_results, query_views["selected_queries"], user_query),
+                            intent_profile=intent_profile,
                         )
                         for route_name, route_results in routes.items()
                     },
                 },
                 "llm_rerank": rerank_debug,
+                "intent": self._debug_intent_profile(intent_profile),
             }
 
         trace_export = self._export_retrieval_trace(
@@ -694,6 +707,7 @@ class EnhancedRetrievalService:
                 "debug": debug_enabled,
             },
             query_profile=query_profile,
+            intent_profile=intent_profile,
             rerank_query=rerank_query,
             query_views=query_views,
             hyde_debug=hyde_debug,
@@ -1194,6 +1208,7 @@ class EnhancedRetrievalService:
             try:
                 rerank_query = self.generation_service.build_rerank_query(
                     user_query,
+                    intent_profile=query_profile.intent_profile.to_dict(),
                 )
                 if rerank_query and rerank_query.strip():
                     actual_rerank_query = rerank_query.strip()
@@ -1202,10 +1217,68 @@ class EnhancedRetrievalService:
                     return actual_rerank_query
             except Exception as exc:  # pragma: no cover - generation depends on environment
                 logger.debug("Failed to rewrite rerank query with model: %s", exc)
-        actual_rerank_query = self._fallback_rerank_query(user_query)
+        actual_rerank_query = self._fallback_rerank_query(user_query, intent_profile=query_profile.intent_profile)
         logger.debug("original_question=%s", user_query)
         logger.debug("actual_rerank_query=%s", actual_rerank_query)
         return actual_rerank_query
+
+    def _legacy_intent_bucket(self, intent: str) -> str:
+        intent = str(intent or "other").strip().lower() or "other"
+        aliases = {
+            "contribution": "summary",
+            "paper_overview": "summary",
+            "method_flow": "method",
+            "implementation_detail": "method",
+            "definition": "method",
+            "experiment_setup": "experiment",
+            "result_analysis": "experiment",
+            "comparison": "comparison",
+            "dataset": "dataset",
+            "limitation": "limitation",
+            "figure_table": "figure_table",
+            "other": "other",
+            "summary": "summary",
+            "method": "method",
+            "experiment": "experiment",
+            "results_analysis": "experiment",
+        }
+        return aliases.get(intent, intent)
+
+    def _fallback_rerank_query(self, user_query: str, intent_profile: Optional[IntentProfile] = None) -> str:
+        normalized_question = re.sub(r"\s+", " ", (user_query or "")).strip()
+        base_query = (
+            "Select the passage that most directly supports an answer to the user's question. "
+            "Prefer evidence-bearing chunks with explicit facts, definitions, steps, causes, results, comparisons, or other answerable statements; "
+            "down-rank passages that are only loosely topic-related or background. "
+        )
+        if intent_profile is not None:
+            main_intent = self._legacy_intent_bucket(intent_profile.main_intent)
+            intent_clauses = {
+                "summary": "Prioritize abstract, introduction, and conclusion passages that state the paper's main contribution or findings. ",
+                "method": "Prioritize method, architecture, training, inference, and implementation details. ",
+                "experiment": "Prioritize experiment, evaluation, results, metric, baseline, and ablation evidence. ",
+                "comparison": "Prioritize direct baseline comparisons and ablation evidence. ",
+                "dataset": "Prioritize dataset, corpus, benchmark, split, and data description passages. ",
+                "limitation": "Prioritize limitations, failure cases, discussion, and future work. ",
+                "figure_table": "Prioritize figure captions, table captions, appendix references, and visual explanations. ",
+            }
+            base_query += intent_clauses.get(main_intent, "")
+            if intent_profile.preferred_sections:
+                base_query += f"Favor sections such as: {', '.join(intent_profile.preferred_sections[:4])}. "
+            if intent_profile.sub_intents:
+                if "paper_overview" in intent_profile.sub_intents:
+                    base_query += "Prefer passages that summarize the paper at a high level. "
+                if "evidence_seeking" in intent_profile.sub_intents:
+                    base_query += "Prefer passages that provide direct answer-bearing evidence. "
+                if "result_check" in intent_profile.sub_intents:
+                    base_query += "Prefer passages with concrete numbers, metrics, and outcome descriptions. "
+                if "table_lookup" in intent_profile.sub_intents:
+                    base_query += "Prefer passages tied to figures, tables, captions, or appendix visual material. "
+                if "deep_method" in intent_profile.sub_intents:
+                    base_query += "Prefer passages that explain the technical pipeline and implementation. "
+        if normalized_question:
+            return f"{base_query}Original question: {normalized_question}"
+        return base_query.rstrip()
 
     def _limit_rerank_text(self, text: str, max_chars: int) -> str:
         normalized = re.sub(r"\s+", " ", text or "").strip()
@@ -1325,9 +1398,11 @@ class EnhancedRetrievalService:
         self,
         user_query: str,
         paper_context: Dict[str, Any],
+        intent_profile: Optional[IntentProfile] = None,
     ) -> Dict[str, Any]:
         query_plan: Dict[str, Any] = {}
         llm_error: Optional[str] = None
+        intent_payload = intent_profile.to_dict() if intent_profile is not None else None
 
         if self.generation_service is not None:
             try:
@@ -1336,6 +1411,7 @@ class EnhancedRetrievalService:
                         question=user_query,
                         max_queries=QUERY_PLAN_LIMIT,
                         paper_context=paper_context,
+                        intent_profile=intent_payload,
                     )
                 else:
                     rewrites = self.generation_service.rewrite_query_for_retrieval(
@@ -1356,16 +1432,20 @@ class EnhancedRetrievalService:
                             }
                             for query in rewrites
                         ],
+                        "main_intent": intent_profile.main_intent if intent_profile else "other",
+                        "sub_intents": intent_profile.sub_intents if intent_profile else [],
+                        "intent_summary": intent_profile.intent_summary if intent_profile else "",
+                        "preferred_sections": intent_profile.preferred_sections if intent_profile else [],
                     }
             except Exception as exc:  # pragma: no cover - remote model failures are environment dependent
                 llm_error = str(exc)
 
         if not query_plan:
-            query_plan = self._heuristic_query_plan(user_query, paper_context)
+            query_plan = self._heuristic_query_plan(user_query, paper_context, intent_profile=intent_profile)
         else:
             if not isinstance(query_plan, dict):
                 query_plan = {}
-            query_plan = self._normalize_query_plan(query_plan, user_query, paper_context)
+            query_plan = self._normalize_query_plan(query_plan, user_query, paper_context, intent_profile=intent_profile)
 
         if llm_error and not query_plan.get("llm_error"):
             query_plan["llm_error"] = llm_error
@@ -1376,11 +1456,12 @@ class EnhancedRetrievalService:
         query_plan: Dict[str, Any],
         user_query: str,
         paper_context: Dict[str, Any],
+        intent_profile: Optional[IntentProfile] = None,
     ) -> Dict[str, Any]:
         normalized = dict(query_plan or {})
         rewrite_queries = self._extract_plan_queries(normalized)
         if not rewrite_queries:
-            normalized = self._heuristic_query_plan(user_query, paper_context)
+            normalized = self._heuristic_query_plan(user_query, paper_context, intent_profile=intent_profile)
             rewrite_queries = self._extract_plan_queries(normalized)
         normalized["rewrite_queries"] = rewrite_queries
         normalized["question_type"] = str(normalized.get("question_type", "other")).strip() or "other"
@@ -1404,13 +1485,33 @@ class EnhancedRetrievalService:
             for item in (paper_context.get("section_titles", []) or [])
             if str(item).strip()
         ]
+        if intent_profile is not None:
+            normalized["question_type"] = intent_profile.main_intent
+            normalized["main_intent"] = intent_profile.main_intent
+            normalized["sub_intents"] = list(intent_profile.sub_intents)
+            normalized["intent_confidence"] = intent_profile.confidence
+            normalized["intent_fallback_reason"] = intent_profile.fallback_reason
+            normalized["preferred_sections"] = self._dedupe_list(
+                [*intent_profile.preferred_sections, *normalized.get("preferred_sections", [])]
+            )
+            normalized["route_weights"] = dict(intent_profile.route_weights)
+            normalized["rewrite_count"] = intent_profile.rewrite_count
+            normalized["use_keyword_search"] = intent_profile.use_keyword_search
+            normalized["use_hyde"] = intent_profile.use_hyde
         return normalized
 
-    def _heuristic_query_plan(self, user_query: str, paper_context: Dict[str, Any]) -> Dict[str, Any]:
+    def _heuristic_query_plan(
+        self,
+        user_query: str,
+        paper_context: Dict[str, Any],
+        intent_profile: Optional[IntentProfile] = None,
+    ) -> Dict[str, Any]:
         normalized_query = self._normalize_query_text(user_query)
         tokens = self._tokenize_for_keyword_search(user_query)
-        intent_tags = self._detect_intent_tags(normalized_query, tokens)
-        question_type = self._classify_question_type(normalized_query, intent_tags)
+        if intent_profile is None:
+            intent_profile = self._build_intent_profile(user_query, paper_context=paper_context)
+        intent_tags = list(intent_profile.sub_intents)
+        question_type = self._legacy_intent_bucket(intent_profile.main_intent or self._classify_question_type(normalized_query, intent_tags))
         paper_terms = paper_context.get("candidate_terms", []) or []
         paper_terms = [str(item).strip() for item in paper_terms if str(item).strip()]
         section_titles = [str(item).strip() for item in (paper_context.get("section_titles", []) or []) if str(item).strip()]
@@ -1422,197 +1523,73 @@ class EnhancedRetrievalService:
         def join_parts(parts: List[str]) -> str:
             return self._dedupe_terms([part for part in parts if part]).strip() or user_query.strip()
 
-        queries: List[Dict[str, Any]] = []
-        if question_type == "method_flow":
-            queries = [
-                {
-                    "query": join_parts([*term_focus[:3], "method", "framework", "algorithm"]),
-                    "focus": "method overview",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*term_focus[:3], "training", "inference", "architecture"]),
-                    "focus": "training and inference",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*section_focus[:2], "approach", "model", "pipeline"]),
-                    "focus": "paper structure",
-                    "channels": ["vector", "keyword"],
-                },
-            ]
-        elif question_type == "experiment_setup":
-            queries = [
-                {
-                    "query": join_parts([*term_focus[:3], "experiment", "dataset", "baseline"]),
-                    "focus": "setup",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*term_focus[:3], "evaluation", "metric", "implementation"]),
-                    "focus": "evaluation details",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*section_focus[:2], "ablation", "results", "benchmark"]),
-                    "focus": "experiment sections",
-                    "channels": ["vector", "keyword"],
-                },
-            ]
-        elif question_type == "results_analysis":
-            queries = [
-                {
-                    "query": join_parts([*term_focus[:3], "results", "performance", "comparison"]),
-                    "focus": "results",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*term_focus[:3], "ablation", "analysis", "effect"]),
-                    "focus": "ablation and analysis",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*section_focus[:2], "table", "figure", "result"]),
-                    "focus": "tables and figures",
-                    "channels": ["vector", "keyword"],
-                },
-            ]
-        elif question_type == "contribution":
-            queries = [
-                {
-                    "query": join_parts([*term_focus[:3], "contribution", "novel", "proposed"]),
-                    "focus": "contribution",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*term_focus[:3], "key idea", "main findings", "summary"]),
-                    "focus": "summary",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*section_focus[:2], "abstract", "introduction", "conclusion"]),
-                    "focus": "paper overview",
-                    "channels": ["vector", "keyword"],
-                },
-            ]
-        elif question_type == "limitation":
-            queries = [
-                {
-                    "query": join_parts([*term_focus[:3], "limitation", "future work", "constraint"]),
-                    "focus": "limitations",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*term_focus[:3], "failure case", "assumption", "weakness"]),
-                    "focus": "failure cases",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*section_focus[:2], "discussion", "appendix", "future work"]),
-                    "focus": "discussion",
-                    "channels": ["vector", "keyword"],
-                },
-            ]
-        elif question_type == "dataset":
-            queries = [
-                {
-                    "query": join_parts([*term_focus[:3], "dataset", "corpus", "benchmark"]),
-                    "focus": "data source",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*term_focus[:3], "data split", "training data", "evaluation"]),
-                    "focus": "data splits",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*section_focus[:2], "dataset", "setup", "experiment"]),
-                    "focus": "dataset section",
-                    "channels": ["vector", "keyword"],
-                },
-            ]
-        elif question_type == "metric":
-            queries = [
-                {
-                    "query": join_parts([*term_focus[:3], "metric", "formula", "evaluation"]),
-                    "focus": "metric",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*term_focus[:3], "objective", "measure", "score"]),
-                    "focus": "measurement",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*section_focus[:2], "method", "experiment", "evaluation"]),
-                    "focus": "evaluation sections",
-                    "channels": ["vector", "keyword"],
-                },
-            ]
-        elif question_type == "figure_table":
-            queries = [
-                {
-                    "query": join_parts([*term_focus[:3], "figure", "table", "diagram"]),
-                    "focus": "visuals",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*term_focus[:3], "figure", "table", "result"]),
-                    "focus": "figure or table caption",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*section_focus[:2], "appendix", "results", "experiment"]),
-                    "focus": "visual evidence",
-                    "channels": ["vector", "keyword"],
-                },
-            ]
-        elif question_type == "summary":
-            queries = [
-                {
-                    "query": join_parts([*term_focus[:3], "summary", "overview", "contribution"]),
-                    "focus": "overview",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*term_focus[:3], "abstract", "introduction", "conclusion"]),
-                    "focus": "paper arc",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*section_focus[:2], "main findings", "key idea"]),
-                    "focus": "core findings",
-                    "channels": ["vector", "keyword"],
-                },
-            ]
-        else:
-            queries = [
-                {
-                    "query": join_parts([*term_focus[:4], *type_terms[:2]]),
-                    "focus": "semantic",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([*term_focus[:3], *section_focus[:2], *type_terms[2:4]]),
-                    "focus": "section-aware",
-                    "channels": ["vector", "keyword"],
-                },
-                {
-                    "query": join_parts([user_query, *term_focus[:2], *type_terms[:3]]),
-                    "focus": "query expansion",
-                    "channels": ["vector", "keyword"],
-                },
-            ]
+        templates_by_intent = {
+            "summary": [
+                ([*term_focus[:3], "summary", "overview", "contribution"], "overview"),
+                ([*term_focus[:3], "abstract", "introduction", "conclusion"], "paper arc"),
+            ],
+            "method": [
+                ([*term_focus[:3], "method", "framework", "architecture"], "method overview"),
+                ([*term_focus[:3], "training", "inference", "implementation"], "technical details"),
+                ([*section_focus[:2], "approach", "model", "pipeline"], "paper structure"),
+            ],
+            "experiment": [
+                ([*term_focus[:3], "experiment", "dataset", "baseline"], "setup"),
+                ([*term_focus[:3], "evaluation", "metric", "implementation"], "evaluation details"),
+                ([*section_focus[:2], "ablation", "results", "benchmark"], "experiment sections"),
+            ],
+            "comparison": [
+                ([*term_focus[:3], "results", "performance", "comparison"], "results"),
+                ([*term_focus[:3], "baseline", "ablation", "effect"], "comparison evidence"),
+                ([*section_focus[:2], "table", "figure", "result"], "tables and figures"),
+            ],
+            "dataset": [
+                ([*term_focus[:3], "dataset", "corpus", "benchmark"], "data source"),
+                ([*term_focus[:3], "data split", "training data", "evaluation"], "data splits"),
+                ([*section_focus[:2], "dataset", "setup", "experiment"], "dataset section"),
+            ],
+            "limitation": [
+                ([*term_focus[:3], "limitation", "future work", "constraint"], "limitations"),
+                ([*term_focus[:3], "failure case", "assumption", "weakness"], "failure cases"),
+                ([*section_focus[:2], "discussion", "appendix", "future work"], "discussion"),
+            ],
+            "figure_table": [
+                ([*term_focus[:3], "figure", "table", "diagram"], "visuals"),
+                ([*term_focus[:3], "figure", "table", "result"], "figure or table caption"),
+                ([*section_focus[:2], "appendix", "results", "experiment"], "visual evidence"),
+            ],
+            "other": [
+                ([*term_focus[:4], *type_terms[:2]], "semantic"),
+                ([*term_focus[:3], *section_focus[:2], *type_terms[2:4]], "section-aware"),
+                ([user_query, *term_focus[:2], *type_terms[:3]], "query expansion"),
+            ],
+        }
+        template_items = templates_by_intent.get(question_type, templates_by_intent["other"])
+        queries = [
+            {
+                "query": join_parts(parts),
+                "focus": focus,
+                "channels": ["vector", "keyword"],
+            }
+            for parts, focus in template_items
+        ]
 
+        rewrite_limit = intent_profile.rewrite_count if intent_profile else QUERY_VIEW_LIMIT
         return {
             "question_type": question_type,
-            "intent_summary": self._summarize_intent(question_type, intent_tags, term_focus),
+            "intent_summary": intent_profile.intent_summary if intent_profile else self._summarize_intent(question_type, intent_tags, term_focus),
             "paper_terms": term_focus,
             "preferred_sections": preferred_sections,
-            "rewrite_queries": queries[:QUERY_VIEW_LIMIT],
+            "rewrite_queries": queries[:rewrite_limit],
             "paper_title": str(paper_context.get("title", "") or "").strip(),
             "paper_abstract": str(paper_context.get("abstract", "") or "").strip(),
             "section_titles": section_titles,
+            "main_intent": question_type,
+            "sub_intents": intent_tags,
+            "intent_confidence": intent_profile.confidence if intent_profile else None,
+            "intent_fallback_reason": intent_profile.fallback_reason if intent_profile else "",
+            "route_weights": intent_profile.route_weights if intent_profile else self.route_weights,
+            "rewrite_count": intent_profile.rewrite_count if intent_profile else len(queries),
         }
 
     def _extract_plan_queries(self, query_plan: Dict[str, Any]) -> List[str]:
@@ -1641,11 +1618,12 @@ class EnhancedRetrievalService:
         intent_tags: List[str],
         language: str,
         paper_context: Dict[str, Any],
+        intent_profile: Optional[IntentProfile] = None,
     ) -> Tuple[str, str, str]:
         plan_queries = self._extract_plan_queries(query_plan)
         paper_terms = [str(item).strip() for item in (query_plan.get("paper_terms", []) or []) if str(item).strip()]
         section_titles = [str(item).strip() for item in (query_plan.get("section_titles", []) or []) if str(item).strip()]
-        question_type = str(query_plan.get("question_type", "other")).strip() or "other"
+        question_type = str((intent_profile.main_intent if intent_profile else query_plan.get("question_type", "other")) or "other").strip() or "other"
 
         if not paper_terms:
             paper_terms = self._extract_paper_terms_from_text(
@@ -1666,21 +1644,39 @@ class EnhancedRetrievalService:
                 self._dedupe_list([*paper_terms[:4], *keywords[:4], question_type])
             ).strip()
         else:
-            semantic_query = self._build_semantic_query(user_query, keywords + paper_terms, intent_tags)
-            evidence_query = self._build_evidence_query(keywords + paper_terms, intent_tags, language)
-            keyword_query = self._build_keyword_query(keywords + paper_terms, intent_tags)
+            semantic_query = self._build_semantic_query(user_query, keywords + paper_terms, intent_tags, intent_profile=intent_profile)
+            evidence_query = self._build_evidence_query(keywords + paper_terms, intent_tags, language, intent_profile=intent_profile)
+            keyword_query = self._build_keyword_query(keywords + paper_terms, intent_tags, intent_profile=intent_profile)
 
         if not semantic_query:
-            semantic_query = self._build_semantic_query(user_query, keywords + paper_terms, intent_tags)
+            semantic_query = self._build_semantic_query(user_query, keywords + paper_terms, intent_tags, intent_profile=intent_profile)
         if not evidence_query:
-            evidence_query = self._build_evidence_query(keywords + paper_terms, intent_tags, language)
+            evidence_query = self._build_evidence_query(keywords + paper_terms, intent_tags, language, intent_profile=intent_profile)
         if not keyword_query:
-            keyword_query = self._build_keyword_query(keywords + paper_terms, intent_tags)
+            keyword_query = self._build_keyword_query(keywords + paper_terms, intent_tags, intent_profile=intent_profile)
 
         return semantic_query, evidence_query, keyword_query
 
     def _preferred_sections_for_question_type(self, question_type: str, intent_tags: List[str]) -> List[str]:
-        preferred = list(QUESTION_TYPE_RULES.get(question_type, QUESTION_TYPE_RULES["other"]).get("preferred_sections", []))
+        question_type_alias = {
+            "contribution": "contribution",
+            "paper_overview": "paper_overview",
+            "method": "method_flow",
+            "method_flow": "method_flow",
+            "experiment": "experiment_setup",
+            "experiment_setup": "experiment_setup",
+            "result_analysis": "results_analysis",
+            "results_analysis": "results_analysis",
+            "comparison": "results_analysis",
+            "dataset": "dataset",
+            "definition": "summary",
+            "implementation_detail": "method_flow",
+            "figure_table": "figure_table",
+            "summary": "summary",
+            "limitation": "limitation",
+        }
+        rule_key = question_type_alias.get(question_type, question_type)
+        preferred = list(QUESTION_TYPE_RULES.get(rule_key, QUESTION_TYPE_RULES["other"]).get("preferred_sections", []))
         preferred.extend(self._preferred_section_tags(intent_tags))
         return self._dedupe_list(preferred)[:6]
 
@@ -1696,7 +1692,24 @@ class EnhancedRetrievalService:
         return "other"
 
     def _query_type_terms(self, question_type: str) -> List[str]:
-        spec = QUESTION_TYPE_RULES.get(question_type, QUESTION_TYPE_RULES["other"])
+        question_type_alias = {
+            "contribution": "contribution",
+            "paper_overview": "summary",
+            "method": "method_flow",
+            "method_flow": "method_flow",
+            "experiment": "experiment_setup",
+            "experiment_setup": "experiment_setup",
+            "result_analysis": "results_analysis",
+            "results_analysis": "results_analysis",
+            "comparison": "results_analysis",
+            "dataset": "dataset",
+            "definition": "summary",
+            "implementation_detail": "method_flow",
+            "figure_table": "figure_table",
+            "summary": "summary",
+            "limitation": "limitation",
+        }
+        spec = QUESTION_TYPE_RULES.get(question_type_alias.get(question_type, question_type), QUESTION_TYPE_RULES["other"])
         return self._dedupe_list([str(item).strip() for item in spec.get("keywords", []) if str(item).strip()])
 
     def _preferred_section_tags_from_plan(self, query_plan: Dict[str, Any], intent_tags: List[str]) -> List[str]:
@@ -1705,7 +1718,7 @@ class EnhancedRetrievalService:
             for item in (query_plan.get("preferred_sections", []) or [])
             if str(item).strip()
         ]
-        question_type = str(query_plan.get("question_type", "other")).strip() or "other"
+        question_type = self._legacy_intent_bucket(query_plan.get("question_type", "other"))
         preferred.extend(QUESTION_TYPE_RULES.get(question_type, QUESTION_TYPE_RULES["other"]).get("preferred_sections", []))
         preferred.extend(self._preferred_section_tags(intent_tags))
         return self._dedupe_list(preferred)[:6]
@@ -1723,14 +1736,34 @@ class EnhancedRetrievalService:
         return compacted
 
     def _summarize_intent(self, question_type: str, intent_tags: List[str], paper_terms: List[str]) -> str:
+        question_type_alias = {
+            "contribution": "contribution",
+            "paper_overview": "summary",
+            "method": "method_flow",
+            "method_flow": "method_flow",
+            "experiment": "experiment_setup",
+            "experiment_setup": "experiment_setup",
+            "result_analysis": "results_analysis",
+            "results_analysis": "results_analysis",
+            "comparison": "results_analysis",
+            "dataset": "dataset",
+            "definition": "summary",
+            "implementation_detail": "method_flow",
+            "figure_table": "figure_table",
+            "summary": "summary",
+            "limitation": "limitation",
+        }
+        question_type = question_type_alias.get(question_type, question_type)
+        if question_type == "paper_overview":
+            return "understand the paper overview and key ideas"
+        if question_type == "contribution":
+            return "understand the paper's main contribution and novelty"
         if question_type == "method_flow":
             return "understand the method flow and paper-specific implementation details"
         if question_type == "experiment_setup":
             return "understand the experimental setup, datasets, baselines, and evaluation details"
         if question_type == "results_analysis":
             return "understand the results, comparison, and ablation analysis"
-        if question_type == "contribution":
-            return "understand the main contribution and novelty of the paper"
         if question_type == "limitation":
             return "understand the limitations and future work"
         if question_type == "dataset":
@@ -1741,6 +1774,10 @@ class EnhancedRetrievalService:
             return "find the relevant figure or table and interpret it"
         if question_type == "summary":
             return "summarize the paper around its main ideas and findings"
+        if question_type == "definition":
+            return "understand the definition or concept being asked about"
+        if question_type == "implementation_detail":
+            return "understand the implementation details and training settings"
         if intent_tags:
             return f"understand the paper with focus on {', '.join(intent_tags[:3])}"
         if paper_terms:
@@ -1758,24 +1795,34 @@ class EnhancedRetrievalService:
                 unique.append(raw)
         return unique
 
+    def _build_intent_profile(
+        self,
+        user_query: str,
+        paper_context: Optional[Dict[str, Any]] = None,
+    ) -> IntentProfile:
+        return self.intent_service.build_intent_profile(user_query, paper_context=paper_context or {})
+
     def _build_query_profile(
         self,
         user_query: str,
         collection_name: str,
         paper_context: Optional[Dict[str, Any]] = None,
+        intent_profile: Optional[IntentProfile] = None,
     ) -> QueryProfile:
         normalized_query = self._normalize_query_text(user_query)
         tokens = self._tokenize_for_keyword_search(user_query)
         keywords = self._extract_query_keywords(tokens)
         language = self._detect_language(user_query, tokens)
-        intent_tags = self._detect_intent_tags(normalized_query, tokens)
         paper_context_payload = self._build_paper_context(collection_name, paper_context=paper_context)
-        query_plan = self._build_query_plan(user_query, paper_context_payload)
-        question_type = str(query_plan.get("question_type", "other")).strip() or "other"
-        intent_summary = str(query_plan.get("intent_summary", "")).strip()
+        intent_profile = intent_profile or self._build_intent_profile(user_query, paper_context=paper_context)
+        query_plan = self._build_query_plan(user_query, paper_context_payload, intent_profile=intent_profile)
+        question_type = str(intent_profile.main_intent or query_plan.get("question_type", "other")).strip() or "other"
+        intent_tags = list(intent_profile.sub_intents)
+        intent_summary = str(intent_profile.intent_summary or query_plan.get("intent_summary", "")).strip()
         paper_terms = [str(item).strip() for item in query_plan.get("paper_terms", []) if str(item).strip()]
         section_preferences = self._preferred_section_tags_from_plan(query_plan, intent_tags)
-        ambiguity_score = self._estimate_ambiguity(keywords, intent_tags, language, user_query)
+        section_preferences = self._dedupe_list([*intent_profile.preferred_sections, *section_preferences])
+        ambiguity_score = intent_profile.ambiguity_score
         semantic_query, evidence_query, keyword_query = self._build_query_views_from_plan(
             user_query=user_query,
             query_plan=query_plan,
@@ -1784,11 +1831,13 @@ class EnhancedRetrievalService:
             intent_tags=intent_tags,
             language=language,
             paper_context=paper_context_payload,
+            intent_profile=intent_profile,
         )
         return QueryProfile(
             original_query=user_query,
             normalized_query=normalized_query,
             language=language,
+            intent_profile=intent_profile,
             tokens=tokens,
             keywords=keywords,
             intent_tags=intent_tags,
@@ -1828,6 +1877,7 @@ class EnhancedRetrievalService:
                         "section_titles": query_plan.get("section_titles", []),
                         "candidate_terms": query_profile.paper_terms,
                     },
+                    intent_profile=query_profile.intent_profile.to_dict(),
                 )
             except Exception as exc:  # pragma: no cover - remote model failures are environment dependent
                 llm_error = str(exc)
@@ -1883,6 +1933,7 @@ class EnhancedRetrievalService:
         rewrite_debug = {
             "enabled": enable_query_rewrite,
             "original_query": user_query,
+            "intent_profile": self._debug_intent_profile(query_profile.intent_profile),
             "query_plan": query_plan,
             "model_queries": llm_rewrites,
             "heuristic_queries": fallback_rewrites,
@@ -1960,6 +2011,7 @@ class EnhancedRetrievalService:
             query_profile,
             source_query,
             route_queries=route_queries,
+            intent_profile=query_profile.intent_profile,
         )
         return self._normalize_route_results(results, route_name, source_query, route_confidence, query_profile)
 
@@ -2010,6 +2062,7 @@ class EnhancedRetrievalService:
             query_profile,
             " | ".join(query_signatures) if query_signatures else query_profile.original_query,
             route_queries=query_signatures or [query_profile.keyword_query],
+            intent_profile=query_profile.intent_profile,
         )
         normalized_scores = self._normalize_scores(raw_scores)
 
@@ -2059,8 +2112,9 @@ class EnhancedRetrievalService:
         query_profile: QueryProfile,
     ) -> List[Dict[str, Any]]:
         aggregated: Dict[str, Dict[str, Any]] = {}
+        route_weights = self._route_weights_for_intent(query_profile.intent_profile)
         for route_name, route_results in routes.items():
-            weight = self.route_weights.get(route_name, 1.0)
+            weight = route_weights.get(route_name, self.route_weights.get(route_name, 1.0))
             for rank, item in enumerate(route_results):
                 chunk_key = self._chunk_unique_key(item)
                 route_confidence = float(item.get("route_confidence", 1.0) or 1.0)
@@ -2242,8 +2296,16 @@ class EnhancedRetrievalService:
             f"{query_profile.original_query}"
         )
 
-    def _build_semantic_query(self, user_query: str, keywords: List[str], intent_tags: List[str]) -> str:
+    def _build_semantic_query(
+        self,
+        user_query: str,
+        keywords: List[str],
+        intent_tags: List[str],
+        intent_profile: Optional[IntentProfile] = None,
+    ) -> str:
         parts: List[str] = []
+        if intent_profile and intent_profile.rewrite_focus:
+            parts.extend(intent_profile.rewrite_focus[:4])
         if intent_tags:
             parts.extend(self._intent_to_terms(intent_tags))
         parts.extend(keywords[:6])
@@ -2251,8 +2313,10 @@ class EnhancedRetrievalService:
             parts.extend(self._tokenize_for_keyword_search(user_query)[:6])
         return self._dedupe_terms(parts) or self._normalize_query_text(user_query)
 
-    def _build_evidence_query(self, keywords: List[str], intent_tags: List[str], language: str) -> str:
+    def _build_evidence_query(self, keywords: List[str], intent_tags: List[str], language: str, intent_profile: Optional[IntentProfile] = None) -> str:
         parts = self._intent_to_evidence_terms(intent_tags)
+        if intent_profile and intent_profile.rerank_focus:
+            parts.extend(intent_profile.rerank_focus[:4])
         parts.extend(keywords[:4])
         if language == "zh":
             parts.extend(["论文", "证据", "段落"])
@@ -2260,8 +2324,10 @@ class EnhancedRetrievalService:
             parts.extend(["paper", "evidence", "passage"])
         return self._dedupe_terms(parts)
 
-    def _build_keyword_query(self, keywords: List[str], intent_tags: List[str]) -> str:
+    def _build_keyword_query(self, keywords: List[str], intent_tags: List[str], intent_profile: Optional[IntentProfile] = None) -> str:
         parts = keywords[:8] + self._intent_to_terms(intent_tags)
+        if intent_profile and intent_profile.rewrite_focus:
+            parts.extend(intent_profile.rewrite_focus[:4])
         if not parts:
             parts = keywords[:8]
         return self._dedupe_terms(parts)
@@ -2394,25 +2460,38 @@ class EnhancedRetrievalService:
         scale = max_score - min_score
         return [(score - min_score) / scale for score in scores]
 
+    def _route_weights_for_intent(self, intent_profile: Optional[IntentProfile]) -> Dict[str, float]:
+        if intent_profile is None:
+            return dict(self.route_weights)
+        return dict(intent_profile.route_weights or self.route_weights)
+
     def _route_confidence(
         self,
         route_name: str,
         query_profile: QueryProfile,
         source_query: str,
         route_queries: Optional[List[str]] = None,
+        intent_profile: Optional[IntentProfile] = None,
     ) -> float:
         route_queries = route_queries or [source_query]
         source_text = " ".join(route_queries) if route_queries else source_query
         similarity = self._query_similarity(query_profile.normalized_query, source_text)
         ambiguity = query_profile.ambiguity_score
+        main_intent = self._legacy_intent_bucket(intent_profile.main_intent if intent_profile else query_profile.question_type)
         if route_name == "vector_original":
-            base = 1.0
+            base = 1.05 if main_intent in {"summary", "other"} else 0.95
         elif route_name == "vector_rewrite":
-            base = 0.62 + 0.22 * ambiguity
+            base = 0.72 + 0.18 * ambiguity
+            if main_intent in {"method", "experiment", "comparison", "dataset"}:
+                base += 0.08
         elif route_name == "vector_hyde":
             base = 0.45 + 0.25 * ambiguity
+            if main_intent == "summary":
+                base += 0.05
         elif route_name == "keyword":
-            base = 0.56 + 0.16 * min(1.0, len(query_profile.keywords) / 8.0)
+            base = 0.52 + 0.18 * min(1.0, len(query_profile.keywords) / 8.0)
+            if main_intent in {"method", "experiment", "figure_table"}:
+                base += 0.08
         else:
             base = 0.5
         return max(0.2, min(1.0, base * (0.65 + 0.35 * similarity)))
@@ -2436,14 +2515,15 @@ class EnhancedRetrievalService:
             bonus += 0.045 * len(section_tags & preferred)
         chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
         noisy_tags = set(section_tags & NOISY_SECTION_TAGS)
-        if chunk_type in {"figure", "table"} and ("figure_table" in query_profile.intent_tags or query_profile.question_type == "figure_table"):
+        main_intent = self._legacy_intent_bucket(query_profile.intent_profile.main_intent if query_profile.intent_profile else query_profile.question_type)
+        if chunk_type in {"figure", "table"} and (main_intent == "figure_table" or "figure_table" in query_profile.intent_tags):
             noisy_tags -= {"figure", "table"}
             bonus += 0.05
         if noisy_tags:
             bonus -= 0.02 * len(noisy_tags)
-        if "abstract" in section_tags and "summary" in query_profile.intent_tags:
+        if "abstract" in section_tags and (main_intent == "summary" or "paper_overview" in query_profile.intent_tags or "contribution" in query_profile.intent_tags):
             bonus += 0.03
-        if "conclusion" in section_tags and "summary" in query_profile.intent_tags:
+        if "conclusion" in section_tags and (main_intent == "summary" or "paper_overview" in query_profile.intent_tags or "contribution" in query_profile.intent_tags):
             bonus += 0.02
         return max(-0.05, min(0.12, bonus))
 
@@ -2653,6 +2733,7 @@ class EnhancedRetrievalService:
             "original_query": query_profile.original_query,
             "normalized_query": query_profile.normalized_query,
             "language": query_profile.language,
+            "intent_profile": self._debug_intent_profile(query_profile.intent_profile),
             "tokens": query_profile.tokens,
             "keywords": query_profile.keywords,
             "intent_tags": query_profile.intent_tags,
@@ -2665,6 +2746,29 @@ class EnhancedRetrievalService:
             "keyword_query": query_profile.keyword_query,
             "section_preferences": query_profile.section_preferences,
             "query_plan": query_profile.query_plan,
+        }
+
+    def _debug_intent_profile(self, intent_profile: Optional[IntentProfile]) -> Optional[Dict[str, Any]]:
+        if intent_profile is None:
+            return None
+        return {
+            "original_query": intent_profile.original_query,
+            "normalized_query": intent_profile.normalized_query,
+            "language": intent_profile.language,
+            "main_intent": intent_profile.main_intent,
+            "sub_intents": intent_profile.sub_intents,
+            "confidence": intent_profile.confidence,
+            "ambiguity_score": intent_profile.ambiguity_score,
+            "intent_summary": intent_profile.intent_summary,
+            "preferred_sections": intent_profile.preferred_sections,
+            "route_weights": intent_profile.route_weights,
+            "rewrite_count": intent_profile.rewrite_count,
+            "use_keyword_search": intent_profile.use_keyword_search,
+            "use_hyde": intent_profile.use_hyde,
+            "rewrite_focus": intent_profile.rewrite_focus,
+            "rerank_focus": intent_profile.rerank_focus,
+            "fallback_reason": intent_profile.fallback_reason,
+            "source": intent_profile.source,
         }
 
     def _debug_chunk_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
@@ -2723,6 +2827,7 @@ class EnhancedRetrievalService:
         paper_context: Dict[str, Any],
         options: Dict[str, Any],
         query_profile: QueryProfile,
+        intent_profile: IntentProfile,
         rerank_query: str,
         query_views: Dict[str, Any],
         hyde_debug: Dict[str, Any],
@@ -2755,6 +2860,7 @@ class EnhancedRetrievalService:
                 "original_question": original_question,
                 "user_query": user_query,
                 "rerank_query": rerank_query,
+                "intent_profile": self._normalize_trace_value(self._debug_intent_profile(intent_profile)),
                 "paper_context": self._normalize_trace_value(paper_context),
                 "options": self._normalize_trace_value(options),
                 "query_profile": self._normalize_trace_value(self._debug_query_profile(query_profile)),
@@ -2763,6 +2869,10 @@ class EnhancedRetrievalService:
                     {
                         "step": "query_profile",
                         "result": self._normalize_trace_value(self._debug_query_profile(query_profile)),
+                    },
+                    {
+                        "step": "intent_profile",
+                        "result": self._normalize_trace_value(self._debug_intent_profile(intent_profile)),
                     },
                     {
                         "step": "query_rewrite",

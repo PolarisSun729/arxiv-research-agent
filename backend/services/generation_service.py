@@ -408,11 +408,13 @@ Answer:"""
         paper_context: Optional[Dict[str, Any]] = None,
         api_key: Optional[str] = None,
         model_name: str = QWEN_MODEL_NAME,
+        intent_profile: Optional[Dict[str, Any]] = None,
     ) -> str:
         return self.build_rerank_query(
             question,
             api_key=api_key,
             model_name=model_name,
+            intent_profile=intent_profile,
         )
 
     def build_rerank_query(
@@ -420,10 +422,18 @@ Answer:"""
         original_question: str,
         api_key: Optional[str] = None,
         model_name: str = QWEN_MODEL_NAME,
+        intent_profile: Optional[Dict[str, Any]] = None,
     ) -> str:
         normalized_question = re.sub(r"\s+", " ", (original_question or "")).strip()
-        rerank_query = self._build_evidence_selection_rerank_query(normalized_question)
+        rerank_query = self._build_evidence_selection_rerank_query(normalized_question, intent_profile=intent_profile)
         logger.debug("original_question=%s", normalized_question)
+        if intent_profile:
+            logger.debug(
+                "intent_profile_for_rerank main_intent=%s sub_intents=%s confidence=%s",
+                intent_profile.get("main_intent"),
+                intent_profile.get("sub_intents"),
+                intent_profile.get("confidence"),
+            )
         logger.debug("actual_rerank_query=%s", rerank_query)
         return rerank_query
 
@@ -434,12 +444,17 @@ Answer:"""
         paper_context: Optional[Dict[str, Any]] = None,
         api_key: Optional[str] = None,
         model_name: str = QWEN_MODEL_NAME,
+        intent_profile: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         paper_context = paper_context or {}
         title = str(paper_context.get("title", "") or "").strip()
         abstract = str(paper_context.get("abstract", "") or "").strip()
         section_titles = [str(item).strip() for item in (paper_context.get("section_titles", []) or []) if str(item).strip()]
         candidate_terms = [str(item).strip() for item in (paper_context.get("candidate_terms", []) or []) if str(item).strip()]
+        main_intent = str((intent_profile or {}).get("main_intent", "other") or "other").strip() or "other"
+        intent_summary = str((intent_profile or {}).get("intent_summary", "") or "").strip()
+        preferred_sections = [str(item).strip() for item in (intent_profile or {}).get("preferred_sections", []) or [] if str(item).strip()]
+        sub_intents = [str(item).strip() for item in (intent_profile or {}).get("sub_intents", []) or [] if str(item).strip()]
 
         prompt = (
             "You are a query planner for retrieval over a single academic paper.\n"
@@ -455,6 +470,7 @@ Answer:"""
             "8. The JSON schema must be:\n"
             "   {\"question_type\": \"...\", \"intent_summary\": \"...\", \"paper_terms\": [\"...\"], \"preferred_sections\": [\"...\"], \"rewrite_queries\": [{\"query\": \"...\", \"focus\": \"...\", \"channels\": [\"vector\", \"keyword\"]}]}\n"
             f"9. Return at most {max_queries} rewrite queries.\n\n"
+            f"10. Current intent profile: main_intent={main_intent}, intent_summary={intent_summary or 'N/A'}, sub_intents={', '.join(sub_intents) or 'N/A'}, preferred_sections={', '.join(preferred_sections) or 'N/A'}.\n\n"
             f"User question: {question}\n\n"
             f"Paper title: {title or 'N/A'}\n"
             f"Paper abstract: {abstract[:1800] or 'N/A'}\n"
@@ -483,19 +499,74 @@ Answer:"""
         )
         return self.complete_with_qwen(prompt, api_key=api_key, model_name=model_name).strip()
 
-    def _fallback_rerank_query(self, question: str) -> str:
-        return self._build_evidence_selection_rerank_query(question)
+    def _fallback_rerank_query(self, question: str, intent_profile: Optional[Dict[str, Any]] = None) -> str:
+        return self._build_evidence_selection_rerank_query(question, intent_profile=intent_profile)
 
-    def _build_evidence_selection_rerank_query(self, original_question: str) -> str:
+    def _build_evidence_selection_rerank_query(self, original_question: str, intent_profile: Optional[Dict[str, Any]] = None) -> str:
         normalized_question = re.sub(r"\s+", " ", (original_question or "")).strip()
         base_query = (
             "Select the passage that most directly supports an answer to the user's question. "
             "Prefer evidence-bearing chunks with explicit facts, definitions, steps, causes, results, comparisons, or other answerable statements; "
             "down-rank passages that are only loosely topic-related or background. "
         )
+        intent_clause = self._build_intent_rerank_clause(intent_profile)
         if normalized_question:
-            return f"{base_query}Original question: {normalized_question}"
-        return base_query.rstrip()
+            return f"{base_query}{intent_clause}Original question: {normalized_question}"
+        return f"{base_query}{intent_clause}".rstrip()
+
+    def _legacy_intent_bucket(self, intent: str) -> str:
+        intent = str(intent or "other").strip().lower() or "other"
+        aliases = {
+            "contribution": "summary",
+            "paper_overview": "summary",
+            "method_flow": "method",
+            "implementation_detail": "method",
+            "definition": "method",
+            "experiment_setup": "experiment",
+            "result_analysis": "experiment",
+            "results_analysis": "experiment",
+            "comparison": "comparison",
+            "dataset": "dataset",
+            "limitation": "limitation",
+            "figure_table": "figure_table",
+            "other": "other",
+            "summary": "summary",
+            "method": "method",
+            "experiment": "experiment",
+        }
+        return aliases.get(intent, intent)
+
+    def _build_intent_rerank_clause(self, intent_profile: Optional[Dict[str, Any]]) -> str:
+        if not intent_profile:
+            return ""
+
+        main_intent = self._legacy_intent_bucket(intent_profile.get("main_intent", "other"))
+        preferred_sections = [str(item).strip() for item in (intent_profile.get("preferred_sections", []) or []) if str(item).strip()]
+        sub_intents = [str(item).strip() for item in (intent_profile.get("sub_intents", []) or []) if str(item).strip()]
+
+        intent_clauses = {
+            "summary": "Prioritize abstract, introduction, and conclusion passages that state the paper's main contribution or findings. ",
+            "method": "Prioritize method, architecture, training, inference, and implementation details. ",
+            "experiment": "Prioritize experiment, evaluation, results, metric, baseline, and ablation evidence. ",
+            "comparison": "Prioritize direct baseline comparisons and ablation evidence. ",
+            "dataset": "Prioritize dataset, corpus, benchmark, split, and data description passages. ",
+            "limitation": "Prioritize limitations, failure cases, discussion, and future work. ",
+            "figure_table": "Prioritize figure captions, table captions, appendix references, and visual explanations. ",
+        }
+        parts = [intent_clauses.get(main_intent, "")]
+        if "paper_overview" in sub_intents:
+            parts.append("Prefer passages that summarize the paper at a high level. ")
+        if "evidence_seeking" in sub_intents:
+            parts.append("Prefer passages that provide direct answer-bearing evidence. ")
+        if "result_check" in sub_intents:
+            parts.append("Prefer passages with concrete numbers, metrics, and outcome descriptions. ")
+        if "table_lookup" in sub_intents:
+            parts.append("Prefer passages tied to figures, tables, captions, or appendix visual material. ")
+        if "deep_method" in sub_intents:
+            parts.append("Prefer passages that explain the technical pipeline and implementation. ")
+        if preferred_sections:
+            parts.append(f"Favor sections such as: {', '.join(preferred_sections[:4])}. ")
+        return "".join(parts)
 
     def _extract_json_block(self, text: str) -> str:
         fenced_match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
@@ -587,7 +658,7 @@ Answer:"""
                 }
             ]
         elif len(rewrite_queries) < 3:
-            question_type = str(data.get("question_type", "other")).strip() or "other"
+            question_type = self._legacy_intent_bucket(data.get("question_type", "other"))
             fallback_terms = paper_terms[:4]
             if not fallback_terms:
                 fallback_terms = self._extract_fallback_terms(
@@ -634,7 +705,7 @@ Answer:"""
                     rewrite_queries.append(item)
 
         return {
-            "question_type": str(data.get("question_type", "other")).strip() or "other",
+            "question_type": self._legacy_intent_bucket(data.get("question_type", "other")),
             "intent_summary": str(data.get("intent_summary", "")).strip(),
             "paper_terms": paper_terms,
             "preferred_sections": preferred_sections,
