@@ -21,6 +21,9 @@ warnings.filterwarnings(
 
 CONTENT_MAX_LENGTH = 12000
 RERANK_TEXT_MAX_LENGTH = 6000
+ASSET_PATH_MAX_LENGTH = 2048
+ASSET_SUMMARY_MAX_LENGTH = 4096
+ASSET_PREVIEW_MAX_LENGTH = 6000
 
 COLLECTION_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -242,6 +245,16 @@ class VectorStoreService:
                 {"name": "id", "dtype": "INT64", "is_primary": True, "auto_id": True},
                 {"name": "content", "dtype": "VARCHAR", "max_length": CONTENT_MAX_LENGTH},
                 {"name": "rerank_text", "dtype": "VARCHAR", "max_length": RERANK_TEXT_MAX_LENGTH},
+                {"name": "chunk_type", "dtype": "VARCHAR", "max_length": 24},
+                {"name": "asset_kind", "dtype": "VARCHAR", "max_length": 24},
+                {"name": "asset_path", "dtype": "VARCHAR", "max_length": ASSET_PATH_MAX_LENGTH},
+                {"name": "asset_abs_path", "dtype": "VARCHAR", "max_length": ASSET_PATH_MAX_LENGTH},
+                {"name": "asset_summary", "dtype": "VARCHAR", "max_length": ASSET_SUMMARY_MAX_LENGTH},
+                {"name": "asset_preview_text", "dtype": "VARCHAR", "max_length": ASSET_PREVIEW_MAX_LENGTH},
+                {"name": "asset_caption", "dtype": "VARCHAR", "max_length": ASSET_SUMMARY_MAX_LENGTH},
+                {"name": "asset_rows", "dtype": "INT64"},
+                {"name": "asset_columns", "dtype": "INT64"},
+                {"name": "order_index", "dtype": "INT64"},
                 {"name": "document_name", "dtype": "VARCHAR", "max_length": 255},
                 # 单独保留 source，方便 QA / 检索时直接回溯到原始 PDF 文件名
                 {"name": "source", "dtype": "VARCHAR", "max_length": 255},
@@ -299,6 +312,16 @@ class VectorStoreService:
                 entity = {
                     "content": content,
                     "rerank_text": rerank_text,
+                    "chunk_type": str(metadata.get("chunk_type", "text") or "text"),
+                    "asset_kind": str(metadata.get("asset_kind", "") or ""),
+                    "asset_path": str(metadata.get("asset_path", "") or ""),
+                    "asset_abs_path": str(metadata.get("asset_abs_path", "") or ""),
+                    "asset_summary": str(metadata.get("asset_summary", "") or ""),
+                    "asset_preview_text": str(metadata.get("asset_preview_text", "") or ""),
+                    "asset_caption": str(metadata.get("asset_caption", "") or ""),
+                    "asset_rows": int(metadata.get("asset_rows", 0) or 0),
+                    "asset_columns": int(metadata.get("asset_columns", 0) or 0),
+                    "order_index": int(metadata.get("order_index", 0) or 0),
                     "document_name": embeddings_data.get("filename", ""),
                     "source": source,
                     "chunk_id": base_chunk_id,
@@ -569,6 +592,16 @@ class VectorStoreService:
             candidate_fields = [
                 "content",
                 "rerank_text",
+                "chunk_type",
+                "asset_kind",
+                "asset_path",
+                "asset_abs_path",
+                "asset_summary",
+                "asset_preview_text",
+                "asset_caption",
+                "asset_rows",
+                "asset_columns",
+                "order_index",
                 "document_name",
                 "source",
                 "chunk_id",
@@ -651,6 +684,16 @@ class VectorStoreService:
                 "id",
                 "content",
                 "rerank_text",
+                "chunk_type",
+                "asset_kind",
+                "asset_path",
+                "asset_abs_path",
+                "asset_summary",
+                "asset_preview_text",
+                "asset_caption",
+                "asset_rows",
+                "asset_columns",
+                "order_index",
                 "document_name",
                 "source",
                 "chunk_id",
@@ -718,6 +761,16 @@ class VectorStoreService:
 
         content = getter("content", "") or ""
         rerank_text = getter("rerank_text", "") or ""
+        chunk_type = getter("chunk_type", "text") or "text"
+        asset_kind = getter("asset_kind", "") or ""
+        asset_path = getter("asset_path", "") or ""
+        asset_abs_path = getter("asset_abs_path", "") or ""
+        asset_summary = getter("asset_summary", "") or ""
+        asset_preview_text = getter("asset_preview_text", "") or ""
+        asset_caption = getter("asset_caption", "") or ""
+        asset_rows = getter("asset_rows", None)
+        asset_columns = getter("asset_columns", None)
+        order_index = getter("order_index", None)
         source = getter("source", "") or ""
         document_name = getter("document_name", "") or ""
         page_start = getter("page_start", None)
@@ -759,6 +812,16 @@ class VectorStoreService:
             "total_chunks": int(getter("total_chunks", 0) or 0),
             "word_count": int(getter("word_count", 0) or 0),
             "rerank_text": str(rerank_text or ""),
+            "chunk_type": str(chunk_type or "text"),
+            "asset_kind": str(asset_kind or ""),
+            "asset_path": str(asset_path or ""),
+            "asset_abs_path": str(asset_abs_path or ""),
+            "asset_summary": str(asset_summary or ""),
+            "asset_preview_text": str(asset_preview_text or ""),
+            "asset_caption": str(asset_caption or ""),
+            "asset_rows": int(asset_rows or 0),
+            "asset_columns": int(asset_columns or 0),
+            "order_index": int(order_index or 0),
             "page_number": str(page_number or ""),
             "page_start": int(page_start or 0) if page_start is not None else None,
             "page_end": int(page_end or 0) if page_end is not None else None,
@@ -783,6 +846,16 @@ class VectorStoreService:
             "text": content,
             "content": content,
             "rerank_text": metadata["rerank_text"],
+            "chunk_type": metadata["chunk_type"],
+            "asset_kind": metadata["asset_kind"],
+            "asset_path": metadata["asset_path"],
+            "asset_abs_path": metadata["asset_abs_path"],
+            "asset_summary": metadata["asset_summary"],
+            "asset_preview_text": metadata["asset_preview_text"],
+            "asset_caption": metadata["asset_caption"],
+            "asset_rows": metadata["asset_rows"],
+            "asset_columns": metadata["asset_columns"],
+            "order_index": metadata["order_index"],
             "score": score,
             "distance": distance,
             "source": source,

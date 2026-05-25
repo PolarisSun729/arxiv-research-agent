@@ -102,6 +102,9 @@ class ChunkingService:
         pages: List[Dict[str, Any]],
     ) -> dict:
         for index, chunk in enumerate(chunks, start=1):
+            chunk.setdefault("content", str(chunk.get("content", "") or ""))
+            metadata = chunk.setdefault("metadata", {})
+            metadata.setdefault("chunk_type", "text")
             chunk["metadata"]["chunk_index"] = index
             chunk["metadata"]["chunk_id"] = index
             chunk["metadata"]["total_chunks"] = len(chunks)
@@ -382,6 +385,7 @@ class ChunkingService:
                             total_chunks=0,
                             chunking_method="by_titles",
                             extra_metadata={
+                                "chunk_type": "text",
                                 "section_title": section_title,
                                 "section_level": current_level,
                                 "section_part_index": part_index,
@@ -463,6 +467,7 @@ class ChunkingService:
                             total_chunks=0,
                             chunking_method="docling_sections",
                             extra_metadata={
+                                "chunk_type": "text",
                                 "section_title": str(section["title"]),
                                 "section_level": int(section["level"]),
                                 "section_path": str(section["path"]),
@@ -473,7 +478,233 @@ class ChunkingService:
                     }
                 )
 
-        return chunks
+        asset_chunks = self._build_docling_asset_chunks(
+            text=text,
+            normalized_page_map=normalized_page_map,
+            source_name=source_name,
+            sections=sections,
+        )
+        return chunks + asset_chunks
+
+    def _build_docling_asset_chunks(
+        self,
+        text: Union[str, dict],
+        normalized_page_map: List[Dict[str, Any]],
+        source_name: str,
+        sections: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        asset_chunks: List[Dict[str, Any]] = []
+        assets = self._collect_docling_assets(text=text, normalized_page_map=normalized_page_map)
+        for asset in assets:
+            asset_kind = str(asset.get("asset_kind", "") or "").strip().lower()
+            chunk_type = "figure" if asset_kind == "picture" else ("table" if asset_kind == "table" else "text")
+            if chunk_type == "text":
+                continue
+
+            page_start = int(asset.get("page_start") or asset.get("page") or 1)
+            page_end = int(asset.get("page_end") or page_start)
+            section = self._match_docling_asset_section(asset, sections)
+            section_title = str(section.get("title", "") or "").strip()
+            section_level = int(section.get("level") or 0) if section else 0
+            section_path = str(section.get("path", "") or "").strip()
+            asset_summary = self._normalize_asset_summary(asset)
+            asset_preview_text = self._build_asset_preview_text(asset)
+            content = self._build_docling_asset_content(
+                asset=asset,
+                chunk_type=chunk_type,
+                asset_summary=asset_summary,
+                asset_preview_text=asset_preview_text,
+                section_title=section_title,
+                section_path=section_path,
+            )
+            if not content:
+                continue
+
+            extra_metadata = {
+                "chunk_type": chunk_type,
+                "asset_kind": asset_kind,
+                "asset_path": str(asset.get("asset_path", "") or ""),
+                "asset_abs_path": str(asset.get("asset_abs_path", "") or ""),
+                "asset_summary": asset_summary,
+                "asset_preview_text": asset_preview_text,
+                "asset_rows": int(asset.get("asset_rows") or 0),
+                "asset_columns": int(asset.get("asset_columns") or 0),
+                "asset_caption": str(asset.get("caption", "") or asset.get("text", "") or ""),
+                "section_title": section_title,
+                "section_level": section_level,
+                "section_path": section_path,
+                "order_index": int(asset.get("order_index") or 0),
+            }
+
+            asset_chunks.append(
+                {
+                    "content": content,
+                    "metadata": self._build_chunk_metadata(
+                        source=source_name,
+                        page_start=page_start,
+                        page_end=page_end,
+                        chunk_text=content,
+                        chunk_index=0,
+                        total_chunks=0,
+                        chunking_method="docling_assets",
+                        extra_metadata=extra_metadata,
+                    ),
+                }
+            )
+
+        return asset_chunks
+
+    def _collect_docling_assets(
+        self,
+        text: Union[str, dict],
+        normalized_page_map: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        collected: List[Dict[str, Any]] = []
+        seen: set[tuple] = set()
+
+        def append_asset(item: Dict[str, Any]) -> None:
+            if not isinstance(item, dict):
+                return
+            asset_kind = str(item.get("asset_kind", "") or "").strip().lower()
+            asset_path = str(item.get("asset_path", "") or "")
+            page_start = self._safe_int(item.get("page_start", item.get("page")))
+            page_end = self._safe_int(item.get("page_end", page_start))
+            order_index = self._safe_int(item.get("order_index", item.get("index")))
+            key = (asset_kind, asset_path, page_start, page_end, order_index)
+            if key in seen:
+                return
+            seen.add(key)
+            collected.append(dict(item))
+
+        if isinstance(text, dict):
+            for key in ("docling_picture_items", "docling_table_items"):
+                raw_items = text.get(key)
+                if isinstance(raw_items, list):
+                    for item in raw_items:
+                        append_asset(item)
+
+        if not collected:
+            for page in normalized_page_map:
+                for key in ("docling_picture_items", "docling_table_items"):
+                    raw_items = page.get(key)
+                    if isinstance(raw_items, list):
+                        for item in raw_items:
+                            append_asset(item)
+
+        collected.sort(
+            key=lambda item: (
+                int(item.get("page_start") or item.get("page") or 0),
+                int(item.get("order_index") or 0),
+            )
+        )
+        return collected
+
+    def _match_docling_asset_section(
+        self,
+        asset: Dict[str, Any],
+        sections: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not sections:
+            return {}
+
+        asset_page = int(asset.get("page_start") or asset.get("page") or 0)
+        asset_order = int(asset.get("order_index") or 0)
+        best_section: Dict[str, Any] = {}
+        best_score: Optional[tuple] = None
+
+        for section in sections:
+            section_start = int(section.get("page_start") or 0)
+            section_end = int(section.get("page_end") or section_start)
+            if section_start <= asset_page <= section_end:
+                page_gap = asset_page - section_start
+                heading_order = int((section.get("heading_item") or {}).get("order_index") or 0)
+                order_gap = abs(asset_order - heading_order)
+                score = (0, page_gap, order_gap)
+            elif section_end < asset_page:
+                score = (1, asset_page - section_end, abs(asset_order - int((section.get("heading_item") or {}).get("order_index") or 0)))
+            else:
+                score = (2, section_start - asset_page, abs(asset_order - int((section.get("heading_item") or {}).get("order_index") or 0)))
+
+            if best_score is None or score < best_score:
+                best_score = score
+                best_section = section
+
+        return best_section
+
+    def _normalize_asset_summary(self, asset: Dict[str, Any]) -> str:
+        summary = str(asset.get("asset_summary", "") or "").strip()
+        if summary:
+            return re.sub(r"\s+", " ", summary).strip()
+        caption = str(asset.get("caption", "") or asset.get("text", "") or "").strip()
+        return re.sub(r"\s+", " ", caption).strip()
+
+    def _build_asset_preview_text(self, asset: Dict[str, Any], max_rows: int = 5) -> str:
+        asset_kind = str(asset.get("asset_kind", "") or "").strip().lower()
+        if asset_kind != "table":
+            return self._normalize_asset_summary(asset)
+
+        preview = asset.get("asset_preview")
+        if not isinstance(preview, list) or not preview:
+            return self._normalize_asset_summary(asset)
+
+        preview_lines: List[str] = []
+        for row in preview[:max_rows]:
+            if not isinstance(row, dict):
+                continue
+            parts = []
+            for key, value in row.items():
+                key_text = re.sub(r"\s+", " ", str(key or "")).strip()
+                value_text = re.sub(r"\s+", " ", str(value or "")).strip()
+                if key_text or value_text:
+                    parts.append(f"{key_text}: {value_text}".strip(": "))
+            if parts:
+                preview_lines.append("; ".join(parts))
+
+        return " | ".join(preview_lines).strip()
+
+    def _build_docling_asset_content(
+        self,
+        asset: Dict[str, Any],
+        chunk_type: str,
+        asset_summary: str,
+        asset_preview_text: str,
+        section_title: str,
+        section_path: str,
+    ) -> str:
+        page_text = f"page {int(asset.get('page_start') or asset.get('page') or 1)}"
+        anchor_parts = [part for part in [section_title, section_path, page_text] if part]
+        anchor_text = " | ".join(self._dedupe_text_units(anchor_parts))
+
+        if chunk_type == "figure":
+            parts = [
+                "Figure evidence",
+                asset_summary,
+                asset_preview_text if asset_preview_text and asset_preview_text != asset_summary else "",
+                anchor_text,
+            ]
+            return "\n".join(part for part in parts if part).strip()
+
+        if chunk_type == "table":
+            parts = [
+                "Table evidence",
+                asset_summary,
+                asset_preview_text,
+                anchor_text,
+            ]
+            return "\n".join(part for part in parts if part).strip()
+
+        return ""
+
+    def _dedupe_text_units(self, units: List[str]) -> List[str]:
+        deduped: List[str] = []
+        seen: set[str] = set()
+        for unit in units:
+            normalized = re.sub(r"\s+", " ", str(unit or "")).strip()
+            if not normalized or normalized.lower() in seen:
+                continue
+            seen.add(normalized.lower())
+            deduped.append(normalized)
+        return deduped
 
     def _collect_docling_items(
         self,

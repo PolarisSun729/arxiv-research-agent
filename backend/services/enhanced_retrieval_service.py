@@ -616,6 +616,13 @@ class EnhancedRetrievalService:
             final_results = self._mark_final_context_chunks(fused_results[:final_context_top_k])
             self._log_retrieval_stage("final_context_top15", final_results[:final_context_top_k])
 
+        asset_type_counts = {
+            "raw_retrieval_top30": self._count_chunk_types(raw_retrieval_top30),
+            "fused_top30": self._count_chunk_types(fused_top30),
+            "reranked_top30": self._count_chunk_types(reranked_results[:rrf_candidate_limit]),
+            "final_context_top15": self._count_chunk_types(final_results[:final_context_top_k]),
+        }
+
         result: Dict[str, Any] = {"chunks": final_results}
 
         if debug_enabled:
@@ -653,6 +660,7 @@ class EnhancedRetrievalService:
                     "enable_keyword_search": enable_keyword_search,
                     "enable_llm_rerank": enable_llm_rerank,
                 },
+                "asset_type_counts": asset_type_counts,
                 "fusion": {
                     "algorithm": "pure_rrf",
                     "rrf_k": self.rrf_k,
@@ -1153,6 +1161,19 @@ class EnhancedRetrievalService:
         return hf_candidate
 
     def _build_rerank_document_text(self, chunk: Dict[str, Any]) -> str:
+        chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
+        if chunk_type in {"figure", "table"}:
+            parts = [
+                str(chunk.get("asset_summary", "") or "").strip(),
+                str(chunk.get("asset_preview_text", "") or "").strip(),
+                str(chunk.get("section_title", "") or "").strip(),
+                str(chunk.get("section_path", "") or "").strip(),
+                f"page {chunk.get('page_number') or chunk.get('page_range') or ''}".strip(),
+            ]
+            content = "\n".join(part for part in parts if part).strip()
+            if content:
+                return self._limit_rerank_text(content, self.llm_rerank_max_doc_chars)
+
         content = self._limit_rerank_text(str(chunk.get("rerank_text", "") or ""), self.llm_rerank_max_doc_chars)
         if not content:
             content = self._limit_rerank_text(str(chunk.get("content", "") or ""), self.llm_rerank_max_doc_chars)
@@ -2102,6 +2123,16 @@ class EnhancedRetrievalService:
         chunk["categories"] = item.get("categories") or metadata.get("categories", "")
         chunk["published_date"] = item.get("published_date") or metadata.get("published_date", "")
         chunk["url"] = item.get("url") or metadata.get("url", "")
+        chunk["chunk_type"] = item.get("chunk_type") or metadata.get("chunk_type", "text")
+        chunk["asset_kind"] = item.get("asset_kind") or metadata.get("asset_kind", "")
+        chunk["asset_path"] = item.get("asset_path") or metadata.get("asset_path", "")
+        chunk["asset_abs_path"] = item.get("asset_abs_path") or metadata.get("asset_abs_path", "")
+        chunk["asset_summary"] = item.get("asset_summary") or metadata.get("asset_summary", "")
+        chunk["asset_preview_text"] = item.get("asset_preview_text") or metadata.get("asset_preview_text", "")
+        chunk["asset_caption"] = item.get("asset_caption") or metadata.get("asset_caption", "")
+        chunk["asset_rows"] = item.get("asset_rows") or metadata.get("asset_rows", 0)
+        chunk["asset_columns"] = item.get("asset_columns") or metadata.get("asset_columns", 0)
+        chunk["order_index"] = item.get("order_index") or metadata.get("order_index", 0)
         chunk["section_tags"] = self._detect_section_tags(chunk["content"])
         return chunk
 
@@ -2403,8 +2434,13 @@ class EnhancedRetrievalService:
         bonus = 0.0
         if preferred:
             bonus += 0.045 * len(section_tags & preferred)
-        if section_tags & NOISY_SECTION_TAGS:
-            bonus -= 0.02 * len(section_tags & NOISY_SECTION_TAGS)
+        chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
+        noisy_tags = set(section_tags & NOISY_SECTION_TAGS)
+        if chunk_type in {"figure", "table"} and ("figure_table" in query_profile.intent_tags or query_profile.question_type == "figure_table"):
+            noisy_tags -= {"figure", "table"}
+            bonus += 0.05
+        if noisy_tags:
+            bonus -= 0.02 * len(noisy_tags)
         if "abstract" in section_tags and "summary" in query_profile.intent_tags:
             bonus += 0.03
         if "conclusion" in section_tags and "summary" in query_profile.intent_tags:
@@ -2490,10 +2526,12 @@ class EnhancedRetrievalService:
         logger.debug("%s count=%d", stage_name, len(chunks))
         for idx, chunk in enumerate(chunks[:10], start=1):
             logger.debug(
-                "%s[%d] chunk_id=%s route=%s route_rank=%s route_score=%s fused_score=%s rerank_score=%s final_context_uses_original_chunk=%s key=%s",
+                "%s[%d] chunk_id=%s chunk_type=%s asset_kind=%s route=%s route_rank=%s route_score=%s fused_score=%s rerank_score=%s final_context_uses_original_chunk=%s key=%s",
                 stage_name,
                 idx,
                 chunk.get("chunk_id"),
+                chunk.get("chunk_type"),
+                chunk.get("asset_kind"),
                 chunk.get("retrieval_route"),
                 chunk.get("route_rank"),
                 chunk.get("route_score"),
@@ -2504,12 +2542,15 @@ class EnhancedRetrievalService:
             )
             if stage_name == "final_context_top15":
                 logger.info(
-                    "final_context[%d] chunk_id=%s rerank_score=%s uses_original_chunk=%s original_chunk_preview=%s rerank_preview=%s",
+                    "final_context[%d] chunk_id=%s chunk_type=%s asset_kind=%s rerank_score=%s uses_original_chunk=%s original_chunk_preview=%s asset_summary_preview=%s rerank_preview=%s",
                     idx,
                     chunk.get("chunk_id"),
+                    chunk.get("chunk_type"),
+                    chunk.get("asset_kind"),
                     chunk.get("llm_rerank_score"),
                     chunk.get("final_context_uses_original_chunk"),
                     self._short_text_preview(chunk.get("content", ""), 100),
+                    self._short_text_preview(chunk.get("asset_summary", ""), 100),
                     self._short_text_preview(chunk.get("rerank_text", ""), 100),
                 )
 
@@ -2531,14 +2572,17 @@ class EnhancedRetrievalService:
         logger.debug("document_count=%d", len(rerank_documents))
         for idx, (chunk, document_text) in enumerate(zip(candidate_chunks, rerank_documents), start=1):
             logger.debug(
-                "rerank_input[%d] input_index=%s chunk_id=%s page=%s fusion_rank=%s fusion_score=%s raw_chunk_preview=%s rerank_text_preview=%s clean_document_preview=%s",
+                "rerank_input[%d] input_index=%s chunk_id=%s chunk_type=%s asset_kind=%s page=%s fusion_rank=%s fusion_score=%s raw_chunk_preview=%s asset_summary_preview=%s rerank_text_preview=%s clean_document_preview=%s",
                 idx,
                 idx,
                 chunk.get("chunk_id"),
+                chunk.get("chunk_type"),
+                chunk.get("asset_kind"),
                 chunk.get("page_number") or chunk.get("page_range"),
                 chunk.get("fusion_rank"),
                 chunk.get("fusion_score", chunk.get("score")),
                 self._short_text_preview(chunk.get("content", "") or chunk.get("text", ""), 100),
+                self._short_text_preview(chunk.get("asset_summary", ""), 100),
                 self._short_text_preview(chunk.get("rerank_text", ""), 100),
                 self._short_text_preview(document_text, 100),
             )
@@ -2591,10 +2635,14 @@ class EnhancedRetrievalService:
     def _chunk_unique_key(self, item: Dict[str, Any]) -> str:
         return "|".join(
             [
+                str(item.get("chunk_type", "text")),
+                str(item.get("asset_kind", "")),
+                str(item.get("asset_path", "")),
                 str(item.get("source", "")),
                 str(item.get("original_chunk_id", item.get("parent_chunk_id", item.get("chunk_id", 0)))),
                 str(item.get("content_part_label", "")),
                 str(item.get("page_range", "")),
+                str(item.get("order_index", "")),
             ]
         )
 
@@ -2624,6 +2672,12 @@ class EnhancedRetrievalService:
         return {
             "chunk_id": item.get("chunk_id"),
             "original_chunk_id": item.get("original_chunk_id"),
+            "chunk_type": item.get("chunk_type", "text"),
+            "asset_kind": item.get("asset_kind", ""),
+            "asset_path": item.get("asset_path", ""),
+            "asset_summary": item.get("asset_summary", ""),
+            "asset_summary_preview": self._short_text_preview(item.get("asset_summary", ""), 160),
+            "asset_preview_text": item.get("asset_preview_text", ""),
             "page_number": item.get("page_number"),
             "page_range": item.get("page_range"),
             "score": item.get("score"),
@@ -2645,6 +2699,13 @@ class EnhancedRetrievalService:
             "content": item.get("content", ""),
             "preview": preview,
         }
+
+    def _count_chunk_types(self, chunks: List[Dict[str, Any]]) -> Dict[str, int]:
+        counts: Dict[str, int] = {"text": 0, "figure": 0, "table": 0}
+        for chunk in chunks:
+            chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
+            counts[chunk_type] = counts.get(chunk_type, 0) + 1
+        return counts
 
     def _mark_final_context_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         marked_chunks: List[Dict[str, Any]] = []

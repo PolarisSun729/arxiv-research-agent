@@ -65,7 +65,7 @@ const activeEvidenceTurn = ref<QaTurn | null>(null)
 const traceDownloading = ref(false)
 const retrievalOptions = reactive({
   enableQueryRewrite: true,
-  enableHyde: true,
+  enableHyde: false,
   enableKeywordSearch: true,
   enableLlmRerank: true,
   debug: true,

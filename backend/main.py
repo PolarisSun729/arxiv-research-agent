@@ -149,8 +149,85 @@ def build_qa_context(arxiv_id: str, payload: QaRequest):
     if not search_results:
         raise HTTPException(status_code=400, detail="No relevant chunks found")
 
-    context = "\n\n".join([result.get('content', '') for result in search_results])
-    return qa_index, search_results, context, retrieval_result.get("debug")
+    text_context, image_inputs, asset_metadata = build_generation_context(search_results)
+    return qa_index, search_results, {
+        "text_context": text_context,
+        "image_inputs": image_inputs,
+        "asset_metadata": asset_metadata,
+    }, retrieval_result.get("debug")
+
+
+def build_generation_context(search_results: List[Dict[str, Any]]) -> tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    text_parts: List[str] = []
+    image_inputs: List[Dict[str, Any]] = []
+    asset_metadata: List[Dict[str, Any]] = []
+
+    for index, result in enumerate(search_results, start=1):
+        chunk_type = str(result.get("chunk_type", "text") or "text").strip().lower()
+        asset_info = {
+            "chunk_type": chunk_type,
+            "asset_kind": result.get("asset_kind", ""),
+            "asset_path": result.get("asset_path", ""),
+            "asset_abs_path": result.get("asset_abs_path", ""),
+            "asset_summary": result.get("asset_summary", ""),
+            "asset_preview_text": result.get("asset_preview_text", ""),
+            "page_number": result.get("page_number", ""),
+            "page_range": result.get("page_range", ""),
+            "section_path": result.get("section_path", ""),
+            "section_title": result.get("section_title", ""),
+            "source": result.get("source", ""),
+        }
+
+        if chunk_type == "figure" and asset_info["asset_abs_path"]:
+            image_inputs.append(
+                {
+                    "image_path": asset_info["asset_abs_path"],
+                    "page_number": asset_info["page_number"],
+                    "asset_summary": asset_info["asset_summary"],
+                    "section_path": asset_info["section_path"],
+                }
+            )
+            asset_metadata.append(asset_info)
+            continue
+
+        if chunk_type == "table":
+            table_text = "\n".join(
+                part for part in [
+                    f"[Table {index}]",
+                    str(result.get("asset_summary", "") or "").strip(),
+                    str(result.get("asset_preview_text", "") or "").strip(),
+                ] if part
+            ).strip()
+            if table_text:
+                text_parts.append(table_text)
+            asset_metadata.append(asset_info)
+            continue
+
+        content = str(result.get("content", "") or "").strip()
+        if content:
+            text_parts.append(content)
+
+    return "\n\n".join(text_parts), image_inputs, asset_metadata
+
+
+def build_source_payload(search_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "content": r.get("content", ""),
+            "page_number": r.get("page_number", ""),
+            "source": r.get("source", ""),
+            "subchunk_label": r.get("subchunk_label", ""),
+            "chunk_label": r.get("subchunk_label", ""),
+            "section_path": r.get("section_path", ""),
+            "parent_chunk_id": r.get("parent_chunk_id", r.get("chunk_id", 0)),
+            "chunk_type": r.get("chunk_type", "text"),
+            "asset_kind": r.get("asset_kind", ""),
+            "asset_path": r.get("asset_path", ""),
+            "asset_summary": r.get("asset_summary", ""),
+            "asset_preview_text": r.get("asset_preview_text", ""),
+        }
+        for r in search_results
+    ]
 
 
 def _sanitize_trace_slug(text: str, max_length: int = 40) -> str:
@@ -857,13 +934,12 @@ async def create_paper_qa_index(arxiv_id: str, loading_method: str = Query("docl
 
         chunks = chunked_data['chunks']
         logger.info(f"Created {len(chunks)} chunks")
-
-        logger.info("Compressing chunk text for rerank with Qwen...")
-        chunks = generation_service.compress_chunks_for_rerank(
-            chunks=chunks,
-            model_name="qwen3.6-plus",
+        logger.info(
+            "Chunk composition: text=%d figure=%d table=%d",
+            sum(1 for chunk in chunks if str((chunk.get("metadata", {}) or {}).get("chunk_type", "text")) == "text"),
+            sum(1 for chunk in chunks if str((chunk.get("metadata", {}) or {}).get("chunk_type", "")) == "figure"),
+            sum(1 for chunk in chunks if str((chunk.get("metadata", {}) or {}).get("chunk_type", "")) == "table"),
         )
-        logger.info("Generated rerank_text for %d chunks", len(chunks))
 
         # Persist the chunked document so the frontend can inspect the actual chunks.
         chunk_file = loading_service.save_document(
@@ -875,38 +951,51 @@ async def create_paper_qa_index(arxiv_id: str, loading_method: str = Query("docl
             document_data=document,
         )
         logger.info(f"Chunked document saved to: {chunk_file}")
-        
+
+        logger.info("Compressing chunk text for rerank with Qwen...")
+        chunks = generation_service.compress_chunks_for_rerank(
+            chunks=chunks,
+            model_name="qwen3.6-plus",
+        )
+        logger.info("Generated rerank_text for %d chunks", len(chunks))
+
         embedding_config = get_current_embedding_config()
         logger.info(
             "Creating embeddings with %s / %s...",
             embedding_config.provider,
             embedding_config.model_name,
         )
-        
+
         input_data = {
-            'chunks': chunks,
-            'metadata': {'filename': f"{arxiv_id}.pdf"}
+            "chunks": chunks,
+            "metadata": {"filename": f"{arxiv_id}.pdf"},
         }
         embeddings, _ = embedding_service.create_embeddings(input_data, embedding_config)
-        
+
         logger.info(f"Created {len(embeddings)} embeddings")
-        
+        logger.info(
+            "Embedding composition: text=%d figure=%d table=%d",
+            sum(1 for item in embeddings if str((item.get("metadata", {}) or {}).get("chunk_type", "text")) == "text"),
+            sum(1 for item in embeddings if str((item.get("metadata", {}) or {}).get("chunk_type", "")) == "figure"),
+            sum(1 for item in embeddings if str((item.get("metadata", {}) or {}).get("chunk_type", "")) == "table"),
+        )
+
         embedding_file = embedding_service.save_embeddings(f"{arxiv_id}.pdf", embeddings)
         logger.info(f"Embeddings saved to: {embedding_file}")
-        
+
         vector_db_config = VectorDBConfig(provider="milvus", index_mode="default")
         index_result = vector_store_service.index_embeddings(embedding_file, vector_db_config)
-        
-        collection_name = index_result.get('collection_name', '')
+
+        collection_name = index_result.get("collection_name", "")
         logger.info(f"Index created in collection: {collection_name}")
-        
+
         db_service.update_paper_qa_index(
             arxiv_id,
             collection_name=collection_name,
-            status='indexed',
+            status="indexed",
             chunk_count=len(chunks),
             embedding_model=embedding_config.model_name,
-            pdf_path=pdf_path
+            pdf_path=pdf_path,
         )
 
         return {
@@ -918,7 +1007,7 @@ async def create_paper_qa_index(arxiv_id: str, loading_method: str = Query("docl
             "collection_name": collection_name,
             "chunk_count": len(chunks),
             "embedding_model": embedding_config.model_name,
-            "chunk_file": chunk_file
+            "chunk_file": chunk_file,
         }
         
     except HTTPException:
@@ -939,7 +1028,8 @@ async def qa_paper(arxiv_id: str, payload: QaRequest):
     try:
         question = payload.question.strip()
         logger.info(f"QA request for paper: {arxiv_id}, question: {question}")
-        _, search_results, context, retrieval_debug = build_qa_context(arxiv_id, payload)
+        _, search_results, qa_context, retrieval_debug = build_qa_context(arxiv_id, payload)
+        source_payload = build_source_payload(search_results)
         
         logger.info("Generating answer...")
         
@@ -952,6 +1042,10 @@ async def qa_paper(arxiv_id: str, payload: QaRequest):
                     "subchunk_label": result.get("subchunk_label", ""),
                     "chunk_label": result.get("subchunk_label", ""),
                     "section_path": result.get("section_path", ""),
+                    "chunk_type": result.get("chunk_type", "text"),
+                    "asset_kind": result.get("asset_kind", ""),
+                    "asset_summary": result.get("asset_summary", ""),
+                    "asset_preview_text": result.get("asset_preview_text", ""),
                 }
                 for result in search_results
             ]
@@ -960,29 +1054,22 @@ async def qa_paper(arxiv_id: str, payload: QaRequest):
                 model_name="qwen3.6-plus",
                 query=question,
                 search_results=qwen_search_results,
+                image_inputs=qa_context["image_inputs"],
+                asset_metadata=[item for item in qa_context["asset_metadata"] if item.get("chunk_type") == "figure"],
             )
             answer = generation_result["response"]
         except Exception as e:
             logger.warning(f"Qwen generation failed, using fallback: {str(e)}")
-            answer = f'根据论文内容，关于您的问题 "{question}" 的相关信息如下：\n\n{context[:1000]}...'
+            answer = f'根据论文内容，关于您的问题 "{question}" 的相关信息如下：\n\n{qa_context["text_context"][:1000]}...'
         
         return {
             "status": "success",
             "arxiv_id": arxiv_id,
             "question": question,
             "answer": answer,
-            "sources": [
-                {
-                    "content": r.get('content', ''),
-                    "page_number": r.get('page_number', ''),
-                    "source": r.get('source', ''),
-                    "subchunk_label": r.get('subchunk_label', ''),
-                    "chunk_label": r.get('subchunk_label', ''),
-                    "section_path": r.get('section_path', ''),
-                    "parent_chunk_id": r.get('parent_chunk_id', r.get('chunk_id', 0)),
-                }
-                for r in search_results
-            ],
+            "sources": source_payload,
+            "image_inputs": qa_context["image_inputs"],
+            "asset_metadata": qa_context["asset_metadata"],
             "retrieval_debug": retrieval_debug,
         }
         
@@ -1001,19 +1088,9 @@ async def qa_paper_stream(arxiv_id: str, payload: QaRequest):
     question = payload.question.strip()
     logger.info(f"QA stream request for paper: {arxiv_id}, question: {question}")
 
-    _, search_results, context, retrieval_debug = build_qa_context(arxiv_id, payload)
+    _, search_results, qa_context, retrieval_debug = build_qa_context(arxiv_id, payload)
 
-    source_payload = [
-        {
-            "content": r.get("content", ""),
-            "page_number": r.get("page_number", ""),
-            "source": r.get("source", ""),
-            "subchunk_label": r.get("subchunk_label", ""),
-            "chunk_label": r.get("subchunk_label", ""),
-            "section_path": r.get("section_path", ""),
-        }
-        for r in search_results
-    ]
+    source_payload = build_source_payload(search_results)
 
     def sse_event(event_name: str, data: dict) -> str:
         return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -1027,15 +1104,18 @@ async def qa_paper_stream(arxiv_id: str, payload: QaRequest):
                     "arxiv_id": arxiv_id,
                     "question": question,
                     "sources": source_payload,
+                    "image_inputs": qa_context["image_inputs"],
+                    "asset_metadata": qa_context["asset_metadata"],
                     "retrieval_debug": retrieval_debug,
                 },
             )
 
-            qwen_context = "\n\n".join([r.get("content", "") for r in search_results])
             for chunk in generation_service.stream_qwen_responses(
                 query=question,
-                context=qwen_context,
+                context=qa_context["text_context"],
                 model_name="qwen3.6-plus",
+                image_inputs=qa_context["image_inputs"],
+                asset_metadata=[item for item in qa_context["asset_metadata"] if item.get("chunk_type") == "figure"],
             ):
                 if chunk.get("type") == "delta":
                     yield sse_event("delta", {"delta": chunk.get("delta", "")})
@@ -1046,6 +1126,8 @@ async def qa_paper_stream(arxiv_id: str, payload: QaRequest):
                             "status": "success",
                             "answer": chunk.get("answer", ""),
                             "sources": source_payload,
+                            "image_inputs": qa_context["image_inputs"],
+                            "asset_metadata": qa_context["asset_metadata"],
                             "retrieval_debug": retrieval_debug,
                             "usage": chunk.get("usage"),
                         },
@@ -1058,6 +1140,8 @@ async def qa_paper_stream(arxiv_id: str, payload: QaRequest):
                     "status": "success",
                     "answer": "",
                     "sources": source_payload,
+                    "image_inputs": qa_context["image_inputs"],
+                    "asset_metadata": qa_context["asset_metadata"],
                     "retrieval_debug": retrieval_debug,
                     "usage": None,
                 },

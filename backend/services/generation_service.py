@@ -1,6 +1,8 @@
 ﻿import os
 import json
 import re
+import base64
+import mimetypes
 from datetime import datetime
 from typing import List, Dict, Optional, Iterator, Any
 import logging
@@ -59,6 +61,9 @@ class GenerationService:
         model_name: str = RERANK_QWEN_MODEL_NAME,
     ) -> str:
         chunk_metadata = chunk_metadata or {}
+        chunk_type = str(chunk_metadata.get("chunk_type", "text") or "text").strip().lower()
+        if chunk_type in {"figure", "table"}:
+            return self._build_asset_rerank_text(chunk_metadata)
         normalized_text = re.sub(r"\s+", " ", str(chunk_text or "")).strip()
         if not normalized_text:
             return self._build_low_information_rerank_text("empty text", "unknown topic")
@@ -132,6 +137,24 @@ class GenerationService:
             compressed_chunks.append(updated_chunk)
 
         return compressed_chunks
+
+    def _build_asset_rerank_text(self, chunk_metadata: Dict[str, Any]) -> str:
+        chunk_type = str(chunk_metadata.get("chunk_type", "text") or "text").strip().lower()
+        summary = str(chunk_metadata.get("asset_summary", "") or "").strip()
+        preview = str(chunk_metadata.get("asset_preview_text", "") or "").strip()
+        section_title = str(chunk_metadata.get("section_title", "") or "").strip()
+        section_path = str(chunk_metadata.get("section_path", "") or "").strip()
+        page_number = str(chunk_metadata.get("page_number", "") or chunk_metadata.get("page_range", "") or "").strip()
+        label = "Figure evidence" if chunk_type == "figure" else "Table evidence"
+        parts = [
+            label,
+            summary,
+            preview if preview and preview != summary else "",
+            section_title,
+            section_path,
+            f"page {page_number}".strip() if page_number else "",
+        ]
+        return "\n".join(part for part in parts if part).strip()
         
     def _load_huggingface_model(self, model_name: str):
         """
@@ -260,6 +283,8 @@ Answer:"""
         api_key: Optional[str] = None,
         model_name: str = QWEN_MODEL_NAME,
         enable_thinking: bool = QWEN_ENABLE_THINKING,
+        image_inputs: Optional[List[Dict[str, Any]]] = None,
+        asset_metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
         使用阿里云百炼兼容的 OpenAI Responses API 生成答案。
@@ -277,17 +302,14 @@ Answer:"""
                 base_url=QWEN_BASE_URL,
             )
 
-            prompt = (
-                "You are a strict academic QA assistant. Answer only from the provided context.\n"
-                "If the context is insufficient, say you cannot determine it.\n\n"
-                f"Context:\n{context}\n\n"
-                f"Question: {query}\n\n"
-                "Answer:"
-            )
-
             response = client.responses.create(
                 model=model_name,
-                input=prompt,
+                input=self._build_qwen_input(
+                    query=query,
+                    context=context,
+                    image_inputs=image_inputs,
+                    asset_metadata=asset_metadata,
+                ),
                 extra_body={"enable_thinking": enable_thinking},
             )
 
@@ -874,6 +896,44 @@ Answer:"""
             "Answer:"
         )
 
+    def _build_qwen_input(
+        self,
+        query: str,
+        context: str,
+        image_inputs: Optional[List[Dict[str, Any]]] = None,
+        asset_metadata: Optional[List[Dict[str, Any]]] = None,
+    ) -> Any:
+        image_inputs = image_inputs or []
+        asset_metadata = asset_metadata or []
+        if not image_inputs:
+            return self._build_qwen_prompt(query, context)
+
+        evidence_lines = []
+        for index, item in enumerate(asset_metadata, start=1):
+            evidence_lines.append(
+                f"[Image {index}] page={item.get('page_number', '')} summary={item.get('asset_summary', '')} section={item.get('section_path', '')}"
+            )
+
+        intro_text = (
+            "You are a strict academic QA assistant. Answer only from the provided context and image evidence.\n"
+            "If the context is insufficient, say you cannot determine it.\n\n"
+            f"Text Context:\n{context}\n\n"
+            f"Image Evidence Notes:\n{chr(10).join(evidence_lines) if evidence_lines else 'None'}\n\n"
+            f"Question: {query}"
+        )
+        content = [{"type": "input_text", "text": intro_text}]
+        for image in image_inputs:
+            image_path = str(image.get("image_path", "") or "").strip()
+            if not image_path:
+                continue
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": self._image_path_to_data_url(image_path),
+                }
+            )
+        return [{"role": "user", "content": content}]
+
     def stream_qwen_responses(
         self,
         query: str,
@@ -881,6 +941,8 @@ Answer:"""
         api_key: Optional[str] = None,
         model_name: str = QWEN_MODEL_NAME,
         enable_thinking: bool = QWEN_ENABLE_THINKING,
+        image_inputs: Optional[List[Dict[str, Any]]] = None,
+        asset_metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> Iterator[Dict[str, Any]]:
         """Stream a Qwen Responses API answer chunk by chunk."""
         try:
@@ -892,7 +954,12 @@ Answer:"""
             client = OpenAI(api_key=api_key, base_url=QWEN_BASE_URL)
             stream = client.responses.create(
                 model=model_name,
-                input=self._build_qwen_prompt(query, context),
+                input=self._build_qwen_input(
+                    query=query,
+                    context=context,
+                    image_inputs=image_inputs,
+                    asset_metadata=asset_metadata,
+                ),
                 stream=True,
                 extra_body={"enable_thinking": enable_thinking},
             )
@@ -973,7 +1040,9 @@ Answer:"""
         query: str,
         search_results: List[Dict],
         api_key: Optional[str] = None,
-        show_reasoning: bool = True
+        show_reasoning: bool = True,
+        image_inputs: Optional[List[Dict[str, Any]]] = None,
+        asset_metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict:
         """
         生成回答并保存结果。
@@ -1006,6 +1075,8 @@ Answer:"""
                     api_key,
                     model_name,
                     enable_thinking=QWEN_ENABLE_THINKING,
+                    image_inputs=image_inputs,
+                    asset_metadata=asset_metadata,
                 )
             elif provider == "deepseek":
                 response = self._generate_with_deepseek(model_name, query, context, api_key, show_reasoning)
@@ -1021,7 +1092,9 @@ Answer:"""
                 "provider": provider,
                 "model": model_name,
                 "response": response,
-                "context": search_results
+                "context": search_results,
+                "image_inputs": image_inputs or [],
+                "asset_metadata": asset_metadata or [],
             }
             
             # 生成文件名并保存
@@ -1049,4 +1122,14 @@ Answer:"""
             包含所有支持模型的字典。
         """
         return self.models 
+
+    def _image_path_to_data_url(self, image_path: str) -> str:
+        if not image_path:
+            raise ValueError("Image path is required for multimodal generation")
+        if not os.path.exists(image_path):
+            raise ValueError(f"Image path does not exist: {image_path}")
+        mime_type = mimetypes.guess_type(image_path)[0] or "image/png"
+        with open(image_path, "rb") as image_file:
+            encoded = base64.b64encode(image_file.read()).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
 

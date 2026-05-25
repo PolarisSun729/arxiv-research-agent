@@ -4,6 +4,8 @@ import logging
 from enum import Enum
 from typing import Optional
 import os
+import base64
+import mimetypes
 import torch
 from utils.model_utils import get_huggingface_model_path
 import numpy as np
@@ -141,16 +143,33 @@ class EmbeddingService:
         vectors.sort(key=lambda item: item[0])
         return [vector for _, vector in vectors]
 
-    def _create_dashscope_embeddings(self, texts: list, config: EmbeddingConfig) -> list:
+    def _create_dashscope_embeddings_from_inputs(self, embedding_inputs: list, config: EmbeddingConfig) -> list:
         api_key = config.api_key or EMBEDDING_CONFIG["dashscope_api_key"] or EMBEDDING_CONFIG["api_key"]
         if not api_key:
             raise ValueError("DashScope API key not provided. Set DASHSCOPE_API_KEY.")
 
         url = config.base_url or self.DASHSCOPE_EMBEDDING_URL
+        contents = []
+        for item in embedding_inputs:
+            if item.get("mode") == "text":
+                contents.append({"text": item["text"]})
+                continue
+            if item.get("mode") == "multimodal":
+                if not item.get("image"):
+                    raise ValueError("DashScope multimodal embedding input requires image data")
+                contents.append(
+                    {
+                        "text": item["text"],
+                        "image": item["image"],
+                    }
+                )
+                continue
+            raise ValueError(f"Unsupported DashScope embedding input mode: {item.get('mode')}")
+
         payload = {
             "model": config.model_name,
             "input": {
-                "contents": [{"text": text} for text in texts],
+                "contents": contents,
             },
             "parameters": {
                 "dimension": int(config.dimension or self.DEFAULT_DASHSCOPE_DIMENSION),
@@ -174,19 +193,26 @@ class EmbeddingService:
         vectors = self._extract_dashscope_embeddings(data)
         if not vectors:
             raise ValueError(f"DashScope embedding response did not contain vectors: {data}")
-        if len(vectors) == len(texts):
+        if len(vectors) == len(embedding_inputs):
             return vectors
-        if len(texts) == 1:
+        if len(embedding_inputs) == 1:
             return [vectors[0]]
         logger.warning(
             "DashScope returned %s vectors for %s inputs; falling back to single-item requests",
             len(vectors),
-            len(texts),
+            len(embedding_inputs),
         )
-        return [self._create_dashscope_embedding(text, config) for text in texts]
+        return [self._create_dashscope_embedding_from_input(item, config) for item in embedding_inputs]
+
+    def _create_dashscope_embeddings(self, texts: list, config: EmbeddingConfig) -> list:
+        embedding_inputs = [{"mode": "text", "text": text} for text in texts]
+        return self._create_dashscope_embeddings_from_inputs(embedding_inputs, config)
 
     def _create_dashscope_embedding(self, text: str, config: EmbeddingConfig) -> list:
         return self._create_dashscope_embeddings([text], config)[0]
+
+    def _create_dashscope_embedding_from_input(self, embedding_input: dict, config: EmbeddingConfig) -> list:
+        return self._create_dashscope_embeddings_from_inputs([embedding_input], config)[0]
 
     @property
     def local_embedder(self):
@@ -225,13 +251,21 @@ class EmbeddingService:
         provider_key = str(config.provider).strip().lower()
         batch_size = int(config.batch_size or (10 if provider_key == EmbeddingProvider.DASHSCOPE.value else 20))
         results = []
+        prepared_inputs = [
+            {
+                "chunk": chunk,
+                "embedding_input": self.build_embedding_input(chunk, provider_key),
+            }
+            for chunk in chunks
+        ]
 
         if provider_key == EmbeddingProvider.LOCAL.value:
             if self.local_embedder is None:
                 raise ValueError("Local Qwen3-VL-Embedding-2B model not loaded")
 
-            for chunk in chunks:
-                embedding_vector = self.create_single_embedding_local(chunk["content"])
+            for prepared in prepared_inputs:
+                chunk = prepared["chunk"]
+                embedding_vector = self.create_single_embedding_local_input(prepared["embedding_input"])
                 results.append(
                     {
                         "embedding": embedding_vector,
@@ -248,12 +282,10 @@ class EmbeddingService:
             return results, {}
 
         if provider_key == EmbeddingProvider.DASHSCOPE.value:
-            for i in range(0, len(chunks), batch_size):
-                batch = chunks[i : i + batch_size]
-                texts = [chunk.get("content", "") for chunk in batch]
-                embedding_vectors = self._create_dashscope_embeddings(texts, config)
-
-                for chunk, embedding_vector in zip(batch, embedding_vectors):
+            if any(item["embedding_input"].get("mode") == "multimodal" for item in prepared_inputs):
+                for prepared in prepared_inputs:
+                    chunk = prepared["chunk"]
+                    embedding_vector = self._create_dashscope_embedding_from_input(prepared["embedding_input"], config)
                     results.append(
                         {
                             "embedding": embedding_vector,
@@ -267,17 +299,45 @@ class EmbeddingService:
                             ),
                         }
                     )
+            else:
+                for i in range(0, len(prepared_inputs), batch_size):
+                    batch = prepared_inputs[i : i + batch_size]
+                    texts = [item["embedding_input"]["text"] for item in batch]
+                    embedding_vectors = self._create_dashscope_embeddings(texts, config)
+
+                    for prepared, embedding_vector in zip(batch, embedding_vectors):
+                        chunk = prepared["chunk"]
+                        results.append(
+                            {
+                                "embedding": embedding_vector,
+                                "metadata": self._build_embedding_metadata(
+                                    chunk=chunk,
+                                    chunk_count=len(chunks),
+                                    embedding_vector=embedding_vector,
+                                    provider=provider_key,
+                                    model=config.model_name,
+                                    filename=filename,
+                                ),
+                            }
+                        )
             return results, {}
 
         embedding_function = self.embedding_factory.create_embedding_function(config)
+        if any(item["embedding_input"].get("mode") == "multimodal" for item in prepared_inputs):
+            unsupported = provider_key not in {EmbeddingProvider.MODELSCOPE.value}
+            if unsupported:
+                raise ValueError(
+                    f"Embedding provider/model does not support multimodal figure embedding: provider={config.provider}, model={config.model_name}"
+                )
 
         if provider_key == EmbeddingProvider.OPENAI.value:
-            for i in range(0, len(chunks), batch_size):
-                batch = chunks[i : i + batch_size]
-                texts = [chunk.get("content", "") for chunk in batch]
+            for i in range(0, len(prepared_inputs), batch_size):
+                batch = prepared_inputs[i : i + batch_size]
+                texts = [item["embedding_input"]["text"] for item in batch]
                 embedding_vectors = embedding_function.embed_documents(texts)
 
-                for chunk, embedding_vector in zip(batch, embedding_vectors):
+                for prepared, embedding_vector in zip(batch, embedding_vectors):
+                    chunk = prepared["chunk"]
                     results.append(
                         {
                             "embedding": embedding_vector,
@@ -292,8 +352,13 @@ class EmbeddingService:
                         }
                     )
         else:
-            for chunk in chunks:
-                embedding_vector = embedding_function.embed_query(chunk["content"])
+            for prepared in prepared_inputs:
+                chunk = prepared["chunk"]
+                embedding_input = prepared["embedding_input"]
+                if embedding_input.get("mode") == "multimodal":
+                    embedding_vector = embedding_function.embed_query(embedding_input)
+                else:
+                    embedding_vector = embedding_function.embed_query(embedding_input["text"])
                 results.append(
                     {
                         "embedding": embedding_vector,
@@ -309,6 +374,48 @@ class EmbeddingService:
                 )
 
         return results, {}
+
+    def build_embedding_input(self, chunk: dict, provider_key: str) -> dict:
+        metadata = chunk.get("metadata", {}) or {}
+        chunk_type = str(chunk.get("chunk_type") or metadata.get("chunk_type") or "text").strip().lower()
+        text = str(
+            chunk.get("content")
+            or metadata.get("content")
+            or chunk.get("text")
+            or metadata.get("text")
+            or ""
+        ).strip()
+
+        if chunk_type == "figure":
+            if provider_key not in {
+                EmbeddingProvider.DASHSCOPE.value,
+                EmbeddingProvider.LOCAL.value,
+                EmbeddingProvider.MODELSCOPE.value,
+            }:
+                raise ValueError(
+                    f"Embedding provider/model does not support multimodal figure embedding: provider={provider_key}"
+                )
+            image_path = str(chunk.get("asset_abs_path") or metadata.get("asset_abs_path") or "").strip()
+            if not image_path:
+                raise ValueError("Figure chunk is missing asset_abs_path for multimodal embedding")
+            if not os.path.exists(image_path):
+                raise ValueError(f"Figure asset image path does not exist: {image_path}")
+            image_input = image_path
+            if provider_key == EmbeddingProvider.DASHSCOPE.value:
+                image_input = self._image_path_to_data_url(image_path)
+            return {
+                "mode": "multimodal",
+                "text": text,
+                "image": image_input,
+                "image_path": image_path,
+                "chunk_type": chunk_type,
+            }
+
+        return {
+            "mode": "text",
+            "text": text,
+            "chunk_type": chunk_type,
+        }
 
     def _build_embedding_metadata(
         self,
@@ -338,6 +445,16 @@ class EmbeddingService:
             "page_range": chunk_metadata.get("page_range", f"{page_start}-{page_end}"),
             "content": chunk["content"],
             "rerank_text": str(chunk.get("rerank_text", chunk_metadata.get("rerank_text", "")) or ""),
+            "chunk_type": str(chunk.get("chunk_type", chunk_metadata.get("chunk_type", "text")) or "text"),
+            "asset_kind": str(chunk.get("asset_kind", chunk_metadata.get("asset_kind", "")) or ""),
+            "asset_path": str(chunk.get("asset_path", chunk_metadata.get("asset_path", "")) or ""),
+            "asset_abs_path": str(chunk.get("asset_abs_path", chunk_metadata.get("asset_abs_path", "")) or ""),
+            "asset_summary": str(chunk.get("asset_summary", chunk_metadata.get("asset_summary", "")) or ""),
+            "asset_preview_text": str(chunk.get("asset_preview_text", chunk_metadata.get("asset_preview_text", "")) or ""),
+            "asset_rows": int(chunk.get("asset_rows", chunk_metadata.get("asset_rows", 0)) or 0),
+            "asset_columns": int(chunk.get("asset_columns", chunk_metadata.get("asset_columns", 0)) or 0),
+            "asset_caption": str(chunk.get("asset_caption", chunk_metadata.get("asset_caption", "")) or ""),
+            "order_index": int(chunk.get("order_index", chunk_metadata.get("order_index", 0)) or 0),
             "word_count": int(chunk_metadata.get("word_count", len(chunk["content"].split()))),
             "total_chunks": int(chunk_count),
             "embedding_provider": provider,
@@ -404,6 +521,23 @@ class EmbeddingService:
 
         return filepath
 
+    def create_single_embedding_local_input(self, embedding_input: dict) -> list:
+        if self.local_embedder is None:
+            raise ValueError("Local Qwen3-VL-Embedding-2B model not loaded")
+
+        try:
+            payload = {"text": embedding_input.get("text", "")}
+            if embedding_input.get("mode") == "multimodal":
+                payload["image"] = embedding_input.get("image_path") or embedding_input.get("image")
+            embeddings = self.local_embedder.process([payload])
+            embedding_tensor = embeddings[0]
+            if isinstance(embedding_tensor, torch.Tensor):
+                return embedding_tensor.to(dtype=torch.float32).cpu().tolist()
+            return np.asarray(embedding_tensor, dtype=np.float32).tolist()
+        except Exception as e:
+            print(f"Error creating embedding with local model: {str(e)}")
+            raise
+
     def create_single_embedding(
         self,
         text: str,
@@ -447,28 +581,15 @@ class EmbeddingService:
         return self._create_dashscope_embedding(text, config)
 
     def create_single_embedding_local(self, text: str) -> list:
-        if self.local_embedder is None:
-            raise ValueError("Local Qwen3-VL-Embedding-2B model not loaded")
-
-        try:
-            inputs = [{"text": text}]
-            embeddings = self.local_embedder.process(inputs)
-            embedding_tensor = embeddings[0]
-            if isinstance(embedding_tensor, torch.Tensor):
-                embedding = embedding_tensor.to(dtype=torch.float32).cpu().tolist()
-            else:
-                embedding = np.asarray(embedding_tensor, dtype=np.float32).tolist()
-            return embedding
-        except Exception as e:
-            print(f"Error creating embedding with local model: {str(e)}")
-            raise
+        return self.create_single_embedding_local_input({"mode": "text", "text": text})
 
     def create_single_embedding_modelscope(self, text: str, model: str = "Qwen/Qwen3-VL-Embedding-2B") -> list:
         try:
             from modelscope.pipelines import pipeline
             from modelscope.utils.constant import Tasks
             pipe = pipeline(Tasks.multi_modal_embedding, model=model)
-            result = pipe({"text": text})
+            payload = text if isinstance(text, dict) else {"text": text}
+            result = pipe(payload)
             if isinstance(result, dict) and "text_embedding" in result:
                 embedding = result["text_embedding"]
             elif isinstance(result, list) and len(result) > 0:
@@ -504,6 +625,12 @@ class EmbeddingService:
         except Exception as e:
             raise ValueError(f"Error getting embedding config: {str(e)}")
 
+    def _image_path_to_data_url(self, image_path: str) -> str:
+        mime_type = mimetypes.guess_type(image_path)[0] or "image/png"
+        with open(image_path, "rb") as image_file:
+            encoded = base64.b64encode(image_file.read()).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+
 
 class EmbeddingFactory:
     @staticmethod
@@ -537,7 +664,8 @@ class EmbeddingFactory:
                     self.pipe = pipeline(Tasks.multi_modal_embedding, model=model_name)
 
                 def embed_query(self, text):
-                    result = self.pipe({"text": text})
+                    payload = text if isinstance(text, dict) else {"text": text}
+                    result = self.pipe(payload)
                     if isinstance(result, dict) and "text_embedding" in result:
                         embedding = result["text_embedding"]
                     elif isinstance(result, list) and len(result) > 0:

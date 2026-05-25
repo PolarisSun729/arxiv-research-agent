@@ -44,6 +44,11 @@ CORE_CONFIG: Dict[str, Any] = {
     ),
 }
 
+DOCLING_CONFIG: Dict[str, Any] = {
+    "do_ocr_enabled": _env_bool("DOCLING_OCR_ENABLED", False),
+    "annotated_pdf_export_enabled": _env_bool("DOCLING_ANNOTATED_PDF_EXPORT_ENABLED", True),
+}
+
 MILVUS_CONFIG: Dict[str, Any] = {
     "uri": _env_str("MILVUS_URI", "http://localhost:19530"),
     "index_types": {
@@ -107,7 +112,7 @@ RERANK_CONFIG: Dict[str, Any] = {
     "candidate_limit": _env_int("RERANK_CANDIDATE_LIMIT", 24),
     "max_doc_chars": _env_int("RERANK_MAX_DOC_CHARS", 4096),
     "enable_query_rewrite": _env_bool("ENABLE_QUERY_REWRITE", True),
-    "enable_hyde": _env_bool("ENABLE_HYDE", True),
+    "enable_hyde": _env_bool("ENABLE_HYDE", False),
     "enable_keyword_search": _env_bool("ENABLE_KEYWORD_SEARCH", True),
     "enable_llm_rerank": _env_bool("ENABLE_LLM_RERANK", True),
     "debug": _env_bool("RETRIEVAL_DEBUG", False),

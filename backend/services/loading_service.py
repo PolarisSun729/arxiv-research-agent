@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional
 
 import fitz  # PyMuPDF
 
+from utils.config import DOCLING_CONFIG
+
 logger = logging.getLogger(__name__)
 
 
@@ -157,6 +159,10 @@ class LoadingService:
             pipeline_options.generate_page_images = True
             pipeline_options.generate_picture_images = True
             pipeline_options.images_scale = 2.0
+            pipeline_options.do_ocr = bool(DOCLING_CONFIG.get("do_ocr_enabled", False))
+            pipeline_options.force_backend_text = True
+            if not pipeline_options.do_ocr:
+                logger.info("Docling OCR disabled; using backend text extraction for PDF parsing.")
             # Temporary debug mode: keep Docling on the basic parsing path only.
             # Re-enable enrichments later if you want picture classification, formula
             # enrichment, code enrichment, or picture descriptions.
@@ -170,15 +176,36 @@ class LoadingService:
             )
             result = converter.convert(file_path)
             document = result.document
-            docling_assets = self._extract_docling_assets(document, file_path)
+            docling_asset_root = self._build_docling_asset_root(file_path)
+            docling_document_export = self._export_docling_document(document, docling_asset_root, file_path)
+            docling_assets = self._extract_docling_assets(document, file_path, asset_root=docling_asset_root)
+            annotated_pdf_enabled = bool(DOCLING_CONFIG.get("annotated_pdf_export_enabled", False))
+            if annotated_pdf_enabled:
+                docling_annotated_pdf = self._export_docling_annotated_pdf(
+                    source_path=file_path,
+                    asset_root=docling_asset_root,
+                    document_json_path=docling_document_export.get("document_export_path"),
+                    text_items=docling_assets["text_items"],
+                    picture_items=docling_assets["picture_items"],
+                    table_items=docling_assets["table_items"],
+                )
+            else:
+                docling_annotated_pdf = {
+                    "annotated_pdf_exported": False,
+                    "annotated_pdf_path": os.path.join(docling_asset_root, "document", "annotated_layout.pdf"),
+                    "annotated_pdf_reason": "disabled_by_config",
+                }
             docling_text_items = docling_assets["text_items"]
             docling_picture_items = docling_assets["picture_items"]
             docling_table_items = docling_assets["table_items"]
             docling_asset_manifest = docling_assets.get("asset_manifest", {})
 
             logger.info(
-                "Docling asset summary for %s: picture_raw=%s, picture_extracted=%s, picture_exported=%s, table_raw=%s, table_exported=%s, asset_root=%s",
+                "Docling asset summary for %s: document_exported=%s, annotated_pdf_enabled=%s, annotated_pdf_exported=%s, picture_raw=%s, picture_extracted=%s, picture_exported=%s, table_raw=%s, table_exported=%s, asset_root=%s",
                 file_path,
+                docling_document_export.get("document_exported", False),
+                annotated_pdf_enabled,
+                docling_annotated_pdf.get("annotated_pdf_exported", False),
                 docling_asset_manifest.get("picture_raw_count", 0),
                 docling_asset_manifest.get("picture_item_count", len(docling_picture_items)),
                 docling_asset_manifest.get("picture_exported_count", 0),
@@ -273,6 +300,13 @@ class LoadingService:
                 "docling_table_item_count": len(docling_table_items),
                 "docling_asset_root": docling_assets.get("asset_root"),
                 "docling_asset_manifest": docling_asset_manifest,
+                "docling_document_exported": docling_document_export.get("document_exported", False),
+                "docling_document_export_path": docling_document_export.get("document_export_path"),
+                "docling_document_export_reason": docling_document_export.get("document_export_reason"),
+                "docling_annotated_pdf_enabled": annotated_pdf_enabled,
+                "docling_annotated_pdf_exported": docling_annotated_pdf.get("annotated_pdf_exported", False),
+                "docling_annotated_pdf_path": docling_annotated_pdf.get("annotated_pdf_path"),
+                "docling_annotated_pdf_reason": docling_annotated_pdf.get("annotated_pdf_reason"),
             }
         except Exception as e:
             logger.exception("Docling error: %s", str(e))
@@ -771,8 +805,8 @@ class LoadingService:
             logger.warning("Docling %s export failed for page %s: %s", export_type, page_no, exc)
         return ""
 
-    def _extract_docling_assets(self, document: Any, source_path: str) -> Dict[str, Any]:
-        asset_root = self._build_docling_asset_root(source_path)
+    def _extract_docling_assets(self, document: Any, source_path: str, asset_root: Optional[str] = None) -> Dict[str, Any]:
+        asset_root = asset_root or self._build_docling_asset_root(source_path)
         raw_picture_items = list(getattr(document, "pictures", []) or [])
         raw_table_items = list(getattr(document, "tables", []) or [])
         text_items = self._extract_docling_text_items(document)
@@ -800,6 +834,358 @@ class LoadingService:
                 "table_count": len(table_items),
             },
         }
+
+    def _export_docling_document(self, document: Any, asset_root: str, source_path: str) -> Dict[str, Any]:
+        export_dir = os.path.join(asset_root, "document")
+        os.makedirs(export_dir, exist_ok=True)
+
+        output_path = os.path.join(export_dir, "docling_document.json")
+        try:
+            save_as_json = getattr(document, "save_as_json", None)
+            if callable(save_as_json):
+                save_as_json(output_path)
+                export_reason = "save_as_json"
+            else:
+                document_dict = None
+                export_to_dict = getattr(document, "export_to_dict", None)
+                if callable(export_to_dict):
+                    document_dict = export_to_dict(mode="json", by_alias=True, exclude_none=True)
+                    export_reason = "export_to_dict"
+                elif hasattr(document, "model_dump"):
+                    document_dict = document.model_dump(mode="json", by_alias=True, exclude_none=True)
+                    export_reason = "model_dump"
+                elif hasattr(document, "dict"):
+                    document_dict = document.dict(by_alias=True, exclude_none=True)
+                    export_reason = "dict"
+                else:
+                    document_dict = self._serialize_docling_value(document)
+                    export_reason = "serialized_value"
+
+                with open(output_path, "w", encoding="utf-8") as f:
+                    json.dump(document_dict, f, ensure_ascii=False, indent=2)
+
+            logger.info("Docling document exported for %s to %s", source_path, output_path)
+            return {
+                "document_exported": True,
+                "document_export_path": output_path,
+                "document_export_reason": export_reason,
+            }
+        except Exception as exc:
+            logger.warning("Failed to export Docling document for %s to %s: %s", source_path, output_path, exc)
+            return {
+                "document_exported": False,
+                "document_export_path": output_path,
+                "document_export_reason": str(exc),
+            }
+
+    def _export_docling_annotated_pdf(
+        self,
+        source_path: str,
+        asset_root: str,
+        document_json_path: Optional[str],
+        text_items: List[Dict[str, Any]],
+        picture_items: List[Dict[str, Any]],
+        table_items: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        export_dir = os.path.join(asset_root, "document")
+        os.makedirs(export_dir, exist_ok=True)
+        output_path = os.path.join(export_dir, "annotated_layout.pdf")
+
+        try:
+            source_pdf = fitz.open(source_path)
+        except Exception as exc:
+            logger.warning("Failed to open source PDF for Docling annotation export: %s", exc)
+            return {
+                "annotated_pdf_exported": False,
+                "annotated_pdf_path": output_path,
+                "annotated_pdf_reason": f"open_failed: {exc}",
+            }
+
+        annotated_pdf = None
+        try:
+            annotated_pdf = fitz.open()
+            page_count = len(source_pdf)
+            annotated_pdf.insert_pdf(source_pdf)
+
+            page_boxes: Dict[int, List[Dict[str, Any]]] = {}
+            summary_counts = {"title": 0, "body": 0, "picture": 0, "table": 0}
+            raw_docling_data = self._load_json_file(document_json_path) if document_json_path else None
+            if raw_docling_data:
+                logger.info("Docling annotation export will use raw JSON bbox data from %s", document_json_path)
+                candidates = self._collect_docling_bbox_candidates_from_raw_json(raw_docling_data)
+            else:
+                logger.warning(
+                    "Raw Docling JSON was unavailable for %s; falling back to normalized items for annotation export.",
+                    source_path,
+                )
+                candidates = []
+                for items in (text_items, picture_items, table_items):
+                    for item in items or []:
+                        candidates.extend(self._collect_docling_bbox_candidates(item))
+
+            for candidate in candidates:
+                page_no = self._safe_int(candidate.get("page_no"))
+                bbox = candidate.get("bbox")
+                if page_no is None or not bbox or page_no < 1 or page_no > page_count:
+                    continue
+
+                source_page = source_pdf[page_no - 1]
+                rect = self._normalize_docling_bbox_for_pymupdf(
+                    bbox,
+                    float(source_page.rect.height),
+                    candidate.get("coord_origin"),
+                )
+                if rect is None or rect.is_empty or rect.width <= 0 or rect.height <= 0:
+                    continue
+
+                style = self._get_docling_annotation_style(candidate.get("category"))
+                page_boxes.setdefault(page_no, []).append(
+                    {
+                        "rect": rect,
+                        "color": style["color"],
+                        "kind": style["kind"],
+                        "label": style["label"],
+                        "line_width": style["line_width"],
+                    }
+                )
+                summary_counts[style["kind"]] = summary_counts.get(style["kind"], 0) + 1
+
+            for page_no, boxes in page_boxes.items():
+                page = annotated_pdf[page_no - 1]
+                legend_entries = []
+                seen_rects = set()
+                for box in boxes:
+                    rect = box["rect"]
+                    rect_key = (
+                        round(float(rect.x0), 1),
+                        round(float(rect.y0), 1),
+                        round(float(rect.x1), 1),
+                        round(float(rect.y1), 1),
+                        box["kind"],
+                    )
+                    if rect_key in seen_rects:
+                        continue
+                    seen_rects.add(rect_key)
+                    page.draw_rect(rect, color=box["color"], width=float(box["line_width"]), overlay=True)
+                    legend_entries.append((box["label"], box["color"]))
+
+                self._draw_docling_annotation_legend(page, legend_entries)
+
+            annotated_pdf.save(output_path)
+            annotated_pdf.close()
+            source_pdf.close()
+            summary_path = os.path.join(export_dir, "annotated_layout_summary.json")
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "source_path": source_path,
+                        "output_path": output_path,
+                        "page_count": page_count,
+                        "box_counts": summary_counts,
+                        "total_boxes": sum(summary_counts.values()),
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            logger.info(
+                "Docling annotated PDF exported for %s to %s (boxes=%s)",
+                source_path,
+                output_path,
+                summary_counts,
+            )
+            return {
+                "annotated_pdf_exported": True,
+                "annotated_pdf_path": output_path,
+                "annotated_pdf_reason": "exported",
+            }
+        except Exception as exc:
+            logger.warning("Failed to export annotated Docling PDF for %s to %s: %s", source_path, output_path, exc)
+            try:
+                source_pdf.close()
+            except Exception:
+                pass
+            try:
+                annotated_pdf.close()
+            except Exception:
+                pass
+            return {
+                "annotated_pdf_exported": False,
+                "annotated_pdf_path": output_path,
+                "annotated_pdf_reason": str(exc),
+            }
+
+    def _load_json_file(self, path: Optional[str]) -> Any:
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as exc:
+            logger.warning("Failed to load JSON file %s: %s", path, exc)
+            return None
+
+    def _get_docling_annotation_style(self, category: Optional[str]) -> Dict[str, Any]:
+        normalized = str(category or "body").strip().lower()
+        if normalized in {"title", "heading"}:
+            return {"kind": "title", "label": "标题 / Title", "color": (0.14, 0.36, 0.84), "line_width": 1.8}
+        if normalized == "picture":
+            return {"kind": "picture", "label": "图片 / Picture", "color": (0.14, 0.62, 0.34), "line_width": 1.4}
+        if normalized == "table":
+            return {"kind": "table", "label": "表格 / Table", "color": (0.86, 0.52, 0.12), "line_width": 1.4}
+        return {"kind": "body", "label": "正文 / Body", "color": (0.32, 0.32, 0.32), "line_width": 0.9}
+
+    def _draw_docling_annotation_legend(self, page: Any, legend_entries: List[tuple[str, tuple[float, float, float]]]) -> None:
+        try:
+            seen_labels: List[str] = []
+            deduped_entries: List[tuple[str, tuple[float, float, float]]] = []
+            for label, color in legend_entries:
+                if label in seen_labels:
+                    continue
+                seen_labels.append(label)
+                deduped_entries.append((label, color))
+
+            if not deduped_entries:
+                deduped_entries = [
+                    self._get_docling_annotation_style("title"),
+                    self._get_docling_annotation_style("body"),
+                    self._get_docling_annotation_style("picture"),
+                    self._get_docling_annotation_style("table"),
+                ]
+                deduped_entries = [(entry["label"], entry["color"]) for entry in deduped_entries]
+
+            page_rect = page.rect
+            legend_padding = 8.0
+            legend_width = 165.0
+            legend_row_height = 13.0
+            legend_title_height = 12.0
+            legend_height = legend_padding * 2 + legend_title_height + len(deduped_entries) * legend_row_height
+            margin = 12.0
+            left = max(margin, float(page_rect.width) - legend_width - margin)
+            top = max(margin, margin)
+            right = min(float(page_rect.width) - margin, left + legend_width)
+            bottom = min(float(page_rect.height) - margin, top + legend_height)
+            legend_rect = fitz.Rect(left, top, right, bottom)
+
+            page.draw_rect(legend_rect, color=(0.72, 0.72, 0.72), fill=(1, 1, 1), width=0.8, overlay=True)
+            page.insert_text(
+                fitz.Point(legend_rect.x0 + legend_padding, legend_rect.y0 + 10),
+                "图例 / Legend",
+                fontsize=8,
+                color=(0.1, 0.1, 0.1),
+                overlay=True,
+            )
+
+            y = legend_rect.y0 + legend_padding + legend_title_height + 1
+            for label, color in deduped_entries[:4]:
+                swatch = fitz.Rect(legend_rect.x0 + legend_padding, y + 2, legend_rect.x0 + legend_padding + 8, y + 10)
+                page.draw_rect(swatch, color=color, fill=color, width=0.8, overlay=True)
+                page.insert_text(
+                    fitz.Point(swatch.x1 + 6, y + 9),
+                    label,
+                    fontsize=7,
+                    color=(0.12, 0.12, 0.12),
+                    overlay=True,
+                )
+                y += legend_row_height
+        except Exception as exc:
+            logger.warning("Failed to draw Docling annotation legend: %s", exc)
+
+    def _collect_docling_bbox_candidates(self, item: Dict[str, Any]) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        if not isinstance(item, dict):
+            return candidates
+
+        page_no = self._safe_int(item.get("page_number") or item.get("page") or item.get("page_start"))
+        item_bbox = item.get("bbox")
+        item_coord_origin = self._stringify_docling_value(item.get("coord_origin"))
+        item_category = self._docling_annotation_category(item)
+        if page_no is not None and item_bbox:
+            candidates.append(
+                {
+                    "page_no": page_no,
+                    "bbox": item_bbox,
+                    "coord_origin": item_coord_origin,
+                    "category": item_category,
+                    "source": "item_bbox",
+                }
+            )
+
+        provenance = item.get("prov")
+        if isinstance(provenance, list):
+            for entry in provenance:
+                if not isinstance(entry, dict):
+                    continue
+                prov_page_no = self._safe_int(entry.get("page_no"))
+                prov_bbox = entry.get("bbox")
+                if prov_page_no is None or not prov_bbox:
+                    continue
+                candidates.append(
+                    {
+                        "page_no": prov_page_no,
+                        "bbox": prov_bbox,
+                        "coord_origin": self._stringify_docling_value(entry.get("coord_origin")),
+                        "category": item_category,
+                        "source": "prov",
+                    }
+                )
+
+        return candidates
+
+    def _collect_docling_bbox_candidates_from_raw_json(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        if not isinstance(data, dict):
+            return candidates
+
+        raw_groups = [
+            ("texts", "body"),
+            ("pictures", "picture"),
+            ("tables", "table"),
+        ]
+        for key, default_category in raw_groups:
+            items = data.get(key) or []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                category = self._docling_annotation_category(item) if key == "texts" else default_category
+                provenance = item.get("prov") or []
+                if not isinstance(provenance, list):
+                    provenance = [provenance]
+                for entry in provenance:
+                    if not isinstance(entry, dict):
+                        continue
+                    page_no = self._safe_int(entry.get("page_no"))
+                    bbox = entry.get("bbox")
+                    if page_no is None or not bbox:
+                        continue
+                    candidates.append(
+                        {
+                            "page_no": page_no,
+                            "bbox": bbox,
+                            "coord_origin": self._stringify_docling_value(entry.get("coord_origin")),
+                            "category": category,
+                            "source": key,
+                        }
+                    )
+
+        return candidates
+
+    def _docling_annotation_category(self, item: Dict[str, Any]) -> str:
+        if not isinstance(item, dict):
+            return "body"
+
+        asset_kind = str(item.get("asset_kind") or "").strip().lower()
+        if asset_kind in {"picture", "table"}:
+            return asset_kind
+
+        label = str(item.get("label") or "").strip().lower()
+        role = str(item.get("role") or "").strip().lower()
+        node_kind = str(item.get("node_kind") or "").strip().lower()
+        if label in {"title", "section_header", "sectionheaderitem", "page_header"}:
+            return "title"
+        if role in {"title", "heading"} or node_kind in {"title", "section_header"}:
+            return "title"
+        return "body"
 
     def _extract_docling_text_items(self, document: Any) -> List[Dict[str, Any]]:
         raw_items = list(getattr(document, "texts", []) or [])
@@ -861,6 +1247,64 @@ class LoadingService:
         page_no = self._safe_int(getattr(table_item, "page_no", None) or getattr(table_item, "page_number", None))
         return page_no
 
+    def _build_docling_ref_index(self, document: Any) -> Dict[str, Any]:
+        ref_index: Dict[str, Any] = {}
+        if document is None:
+            return ref_index
+
+        for collection_name in ("texts", "pictures", "tables", "key_value_items", "form_items"):
+            items = getattr(document, collection_name, None)
+            if not items:
+                continue
+            for item in items:
+                ref = self._stringify_docling_value(getattr(item, "self_ref", None) or getattr(item, "id", None))
+                if ref and ref not in ref_index:
+                    ref_index[ref] = item
+        return ref_index
+
+    def _extract_docling_ref_strings(self, refs: Any) -> List[str]:
+        if refs is None:
+            return []
+
+        if isinstance(refs, dict):
+            refs = [refs]
+        elif not isinstance(refs, (list, tuple, set)):
+            refs = [refs]
+
+        ref_strings: List[str] = []
+        for ref in refs:
+            if isinstance(ref, dict):
+                ref_value = ref.get("$ref") or ref.get("ref") or ref.get("self_ref")
+            else:
+                ref_value = getattr(ref, "ref", None) or getattr(ref, "self_ref", None)
+            ref_text = self._stringify_docling_value(ref_value)
+            if ref_text:
+                ref_strings.append(ref_text)
+        return ref_strings
+
+    def _resolve_docling_caption_from_refs(self, document: Any, table_item: Any) -> str:
+        if document is None or table_item is None:
+            return ""
+
+        ref_index = self._build_docling_ref_index(document)
+        if not ref_index:
+            return ""
+
+        for attr_name in ("captions", "children"):
+            raw_refs = getattr(table_item, attr_name, None)
+            for ref in self._extract_docling_ref_strings(raw_refs):
+                target = ref_index.get(ref)
+                if target is None:
+                    continue
+                caption_text = self._stringify_docling_value(
+                    getattr(target, "text", None)
+                    or getattr(target, "orig", None)
+                    or getattr(target, "caption", None)
+                )
+                if caption_text:
+                    return caption_text
+        return ""
+
     def _resolve_docling_table_caption(self, document: Any, table_item: Any, order_index: int) -> str:
         if table_item is None:
             return ""
@@ -879,6 +1323,9 @@ class LoadingService:
                     caption_text = ""
             except Exception:
                 caption_text = ""
+
+        if not caption_text:
+            caption_text = self._resolve_docling_caption_from_refs(document, table_item)
 
         if not caption_text:
             caption_text = self._stringify_docling_value(
@@ -982,6 +1429,8 @@ class LoadingService:
             "formatting": formatting,
             "hyperlink": hyperlink,
             "prov": provenance,
+            "bbox": None,
+            "coord_origin": self._stringify_docling_value(getattr(item, "coord_origin", None)),
             "page_start": page_start,
             "page_end": page_end,
             "page_number": page_start,
@@ -1001,6 +1450,15 @@ class LoadingService:
             normalized["orig"] = self._stringify_docling_value(getattr(item, "orig", None))
         if hasattr(item, "url"):
             normalized["url"] = self._stringify_docling_value(getattr(item, "url", None))
+        bbox = self._normalize_bbox(getattr(item, "bbox", None))
+        if bbox is None:
+            for provenance_entry in provenance:
+                if provenance_entry.get("bbox"):
+                    bbox = provenance_entry.get("bbox")
+                    if not normalized["coord_origin"]:
+                        normalized["coord_origin"] = self._stringify_docling_value(provenance_entry.get("coord_origin"))
+                    break
+        normalized["bbox"] = bbox
 
         return normalized
 
@@ -1027,6 +1485,8 @@ class LoadingService:
             "label": label,
             "content_layer": content_layer,
             "prov": provenance,
+            "bbox": None,
+            "coord_origin": self._stringify_docling_value(getattr(item, "coord_origin", None)),
             "page_start": page_start,
             "page_end": page_end,
             "page_number": page_start,
@@ -1043,6 +1503,15 @@ class LoadingService:
                 if attr == "image":
                     continue
                 normalized[attr] = self._serialize_docling_value(value)
+        bbox = self._normalize_bbox(getattr(item, "bbox", None))
+        if bbox is None:
+            for provenance_entry in provenance:
+                if provenance_entry.get("bbox"):
+                    bbox = provenance_entry.get("bbox")
+                    if not normalized["coord_origin"]:
+                        normalized["coord_origin"] = self._stringify_docling_value(provenance_entry.get("coord_origin"))
+                    break
+        normalized["bbox"] = bbox
 
         return normalized
 
@@ -1091,6 +1560,8 @@ class LoadingService:
                         "asset_exported": False,
                         "asset_export_reason": "get_image_exception",
                         "asset_export_error": str(exc),
+                        "asset_caption": picture_caption,
+                        "asset_file_name": output_name,
                     }
 
         if image_obj is None:
@@ -1134,6 +1605,8 @@ class LoadingService:
             return {
                 "asset_exported": False,
                 "asset_export_reason": "get_image_returned_none",
+                "asset_caption": picture_caption,
+                "asset_file_name": output_name,
             }
 
         try:
@@ -1158,6 +1631,8 @@ class LoadingService:
                 "asset_exported": False,
                 "asset_export_reason": "write_failed",
                 "asset_export_error": str(exc),
+                "asset_caption": picture_caption,
+                "asset_file_name": output_name,
             }
 
         size = getattr(image_obj, "size", None)
@@ -1179,6 +1654,7 @@ class LoadingService:
             "asset_abs_path": os.path.abspath(output_path),
             "asset_summary": summary,
             "asset_file_name": output_name,
+            "asset_caption": picture_caption,
             "asset_size": [width, height] if width and height else None,
         }
 
@@ -1246,6 +1722,7 @@ class LoadingService:
                 "asset_abs_path": os.path.abspath(output_path),
                 "asset_summary": summary,
                 "asset_file_name": output_name,
+                "asset_caption": picture_caption,
                 "asset_size": [pixmap.width, pixmap.height],
             }
         except Exception as exc:
@@ -1295,7 +1772,7 @@ class LoadingService:
             extension=extension,
         )
 
-    def _slugify_docling_filename_piece(self, value: str, max_length: int = 96) -> str:
+    def _slugify_docling_filename_piece(self, value: str, max_length: int = 120) -> str:
         text = re.sub(r"\s+", " ", self._stringify_docling_value(value) or "").strip()
         if not text:
             return ""
@@ -1326,6 +1803,7 @@ class LoadingService:
         dataframe = None
         export_df = getattr(table_item, "export_to_dataframe", None)
         if callable(export_df):
+            last_error: Optional[Exception] = None
             for args in ((document,), tuple()):
                 try:
                     dataframe = export_df(*args)
@@ -1334,17 +1812,23 @@ class LoadingService:
                 except TypeError:
                     continue
                 except Exception as exc:
+                    last_error = exc
                     logger.warning("Docling table dataframe export failed for %s: %s", source_path, exc)
-                    return {
-                        "asset_exported": False,
-                        "asset_export_reason": "dataframe_export_failed",
-                        "asset_export_error": str(exc),
-                    }
+            if dataframe is None:
+                return {
+                    "asset_exported": False,
+                    "asset_export_reason": "dataframe_export_failed",
+                    "asset_export_error": str(last_error) if last_error is not None else "unknown_error",
+                    "asset_caption": table_caption,
+                    "asset_file_name": f"{output_base}.csv",
+                }
 
         if dataframe is None:
             return {
                 "asset_exported": False,
                 "asset_export_reason": "dataframe_missing",
+                "asset_caption": table_caption,
+                "asset_file_name": f"{output_base}.csv",
             }
 
         try:
@@ -1370,6 +1854,8 @@ class LoadingService:
                 "asset_exported": False,
                 "asset_export_reason": "write_failed",
                 "asset_export_error": str(exc),
+                "asset_caption": table_caption,
+                "asset_file_name": f"{output_base}.csv",
             }
 
         rel_csv_path = os.path.relpath(csv_path, start=os.getcwd())
@@ -1406,6 +1892,7 @@ class LoadingService:
             "asset_abs_path": os.path.abspath(csv_path),
             "asset_summary": summary,
             "asset_file_name": os.path.basename(csv_path),
+            "asset_caption": table_caption,
             "asset_rows": row_count,
             "asset_columns": column_count,
             "asset_preview": preview,
@@ -1435,6 +1922,7 @@ class LoadingService:
                 "label": self._stringify_docling_value(item.get("label")),
                 "caption": self._stringify_docling_value(item.get("caption")),
                 "text": self._stringify_docling_value(item.get("text") or item.get("orig")),
+                "asset_caption": self._stringify_docling_value(item.get("asset_caption")),
                 "parent": self._stringify_docling_value(item.get("parent")),
                 "page_no": self._safe_int(item.get("page_no") or item.get("page_number")),
                 "bbox": self._serialize_docling_value(item.get("bbox")),
@@ -1446,6 +1934,7 @@ class LoadingService:
             "label": self._stringify_docling_value(getattr(item, "label", None)),
             "caption": self._stringify_docling_value(getattr(item, "caption", None)),
             "text": self._stringify_docling_value(getattr(item, "text", None) or getattr(item, "orig", None)),
+            "asset_caption": self._stringify_docling_value(getattr(item, "asset_caption", None)),
             "parent": self._stringify_docling_value(getattr(item, "parent", None)),
             "page_no": self._safe_int(getattr(item, "page_no", None) or getattr(item, "page_number", None)),
             "bbox": self._serialize_docling_value(getattr(item, "bbox", None)),
@@ -1472,8 +1961,9 @@ class LoadingService:
             bbox = item.get("bbox")
         return {"page_no": page_no, "bbox": self._normalize_bbox(bbox)}
 
-    def _normalize_docling_bbox_for_pymupdf(self, bbox: Any, page_height: float) -> Optional["fitz.Rect"]:
-        coord_origin = ""
+    def _normalize_docling_bbox_for_pymupdf(self, bbox: Any, page_height: float, coord_origin: Optional[str] = None) -> Optional["fitz.Rect"]:
+        explicit_coord_origin = str(coord_origin or "").upper()
+        detected_coord_origin = explicit_coord_origin
         if isinstance(bbox, dict):
             try:
                 left = float(bbox.get("l", bbox.get("left")))
@@ -1482,7 +1972,16 @@ class LoadingService:
                 bottom = float(bbox.get("b", bbox.get("bottom")))
             except (TypeError, ValueError):
                 return None
-            coord_origin = str(self._serialize_docling_value(bbox.get("coord_origin")) or "").upper()
+            detected_coord_origin = detected_coord_origin or str(self._serialize_docling_value(bbox.get("coord_origin")) or "").upper()
+        elif hasattr(bbox, "l") or hasattr(bbox, "left"):
+            try:
+                left = float(getattr(bbox, "l", getattr(bbox, "left")))
+                right = float(getattr(bbox, "r", getattr(bbox, "right")))
+                top = float(getattr(bbox, "t", getattr(bbox, "top")))
+                bottom = float(getattr(bbox, "b", getattr(bbox, "bottom")))
+            except (TypeError, ValueError, AttributeError):
+                return None
+            detected_coord_origin = detected_coord_origin or str(self._serialize_docling_value(getattr(bbox, "coord_origin", None)) or "").upper()
         elif isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
             try:
                 left = float(bbox[0])
@@ -1494,7 +1993,7 @@ class LoadingService:
         else:
             return None
 
-        if coord_origin.endswith("BOTTOMLEFT"):
+        if detected_coord_origin.endswith("BOTTOMLEFT"):
             top = page_height - top
             bottom = page_height - bottom
 
@@ -1632,6 +2131,7 @@ class LoadingService:
                 {
                     "page_no": self._safe_int(page_no),
                     "bbox": self._normalize_bbox(bbox),
+                    "coord_origin": self._stringify_docling_value(getattr(entry, "coord_origin", None) or (entry.get("coord_origin") if isinstance(entry, dict) else None)),
                     "char_span": self._serialize_docling_value(getattr(entry, "charspan", None) or getattr(entry, "char_span", None) or (entry.get("char_span") if isinstance(entry, dict) else None)),
                     "source": self._stringify_docling_value(getattr(entry, "source", None) or (entry.get("source") if isinstance(entry, dict) else None)),
                 }
@@ -1647,6 +2147,15 @@ class LoadingService:
                 bottom = float(bbox.get("b", bbox.get("bottom")))
                 return [left, top, right, bottom]
             except (TypeError, ValueError):
+                return None
+        if hasattr(bbox, "l") or hasattr(bbox, "left"):
+            try:
+                left = float(getattr(bbox, "l", getattr(bbox, "left")))
+                top = float(getattr(bbox, "t", getattr(bbox, "top")))
+                right = float(getattr(bbox, "r", getattr(bbox, "right")))
+                bottom = float(getattr(bbox, "b", getattr(bbox, "bottom")))
+                return [left, top, right, bottom]
+            except (TypeError, ValueError, AttributeError):
                 return None
         if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
             return None
