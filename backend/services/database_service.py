@@ -79,6 +79,10 @@ class DatabaseService:
                     paper_count INTEGER NOT NULL,
                     embedding_model TEXT NOT NULL,
                     vector_dimension INTEGER NOT NULL,
+                    cluster_count INTEGER DEFAULT 0,
+                    profile_mode TEXT DEFAULT 'mean',
+                    interest_clusters TEXT,
+                    disliked_vector_data TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -97,9 +101,27 @@ class DatabaseService:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            
+
             conn.commit()
             logger.info("Database tables initialized successfully")
+            self._ensure_user_interest_vector_columns(conn)
+
+    def _ensure_user_interest_vector_columns(self, conn):
+        required_columns = {
+            "cluster_count": "INTEGER DEFAULT 0",
+            "profile_mode": "TEXT DEFAULT 'mean'",
+            "interest_clusters": "TEXT",
+            "disliked_vector_data": "TEXT",
+        }
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(user_interest_vectors)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        for column_name, column_definition in required_columns.items():
+            if column_name not in existing_columns:
+                cursor.execute(
+                    f"ALTER TABLE user_interest_vectors ADD COLUMN {column_name} {column_definition}"
+                )
+        conn.commit()
 
     def add_liked_paper(self, user_id: str = DEFAULT_USER_ID, arxiv_id: str = None) -> bool:
         try:
@@ -473,21 +495,29 @@ class DatabaseService:
         vector_data: List[float],
         paper_count: int,
         embedding_model: str,
-        vector_dimension: int
+        vector_dimension: int,
+        cluster_count: int = 0,
+        profile_mode: str = "mean",
+        interest_clusters: Optional[List[Dict[str, Any]]] = None,
+        disliked_vector_data: Optional[List[float]] = None,
     ) -> bool:
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     INSERT OR REPLACE INTO user_interest_vectors 
-                    (user_id, vector_data, paper_count, embedding_model, vector_dimension, updated_at)
-                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    (user_id, vector_data, paper_count, embedding_model, vector_dimension, cluster_count, profile_mode, interest_clusters, disliked_vector_data, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ''', (
                     user_id,
                     json.dumps(vector_data),
                     paper_count,
                     embedding_model,
-                    vector_dimension
+                    vector_dimension,
+                    cluster_count,
+                    profile_mode,
+                    json.dumps(interest_clusters) if interest_clusters is not None else None,
+                    json.dumps(disliked_vector_data) if disliked_vector_data is not None else None,
                 ))
                 
                 conn.commit()
@@ -502,20 +532,36 @@ class DatabaseService:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    SELECT user_id, vector_data, paper_count, embedding_model, vector_dimension, created_at, updated_at
+                    SELECT user_id, vector_data, paper_count, embedding_model, vector_dimension, cluster_count, profile_mode, interest_clusters, disliked_vector_data, created_at, updated_at
                     FROM user_interest_vectors WHERE user_id = ?
                 ''', (user_id,))
                 
                 row = cursor.fetchone()
                 if row:
+                    interest_clusters = None
+                    disliked_vector_data = None
+                    if row[7]:
+                        try:
+                            interest_clusters = json.loads(row[7])
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            interest_clusters = []
+                    if row[8]:
+                        try:
+                            disliked_vector_data = json.loads(row[8])
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            disliked_vector_data = None
                     return {
                         'user_id': row[0],
                         'vector_data': json.loads(row[1]),
                         'paper_count': row[2],
                         'embedding_model': row[3],
                         'vector_dimension': row[4],
-                        'created_at': row[5],
-                        'updated_at': row[6]
+                        'cluster_count': row[5] or 0,
+                        'profile_mode': row[6] or 'mean',
+                        'interest_clusters': interest_clusters or [],
+                        'disliked_vector_data': disliked_vector_data,
+                        'created_at': row[9],
+                        'updated_at': row[10]
                     }
                 return None
         except Exception as e:

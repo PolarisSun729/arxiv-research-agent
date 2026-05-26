@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import datetime
 import logging
@@ -6,6 +7,7 @@ from typing import Optional
 import os
 import base64
 import mimetypes
+import threading
 import torch
 from utils.model_utils import get_huggingface_model_path
 import numpy as np
@@ -94,6 +96,8 @@ class EmbeddingService:
     def __init__(self):
         self.embedding_factory = EmbeddingFactory()
         self._local_embedder = None
+        self._embedding_cache: dict[str, list] = {}
+        self._embedding_cache_lock = threading.Lock()
 
     def get_default_embedding_config(self) -> EmbeddingConfig:
         return EmbeddingConfig.from_env()
@@ -107,6 +111,44 @@ class EmbeddingService:
         if isinstance(embedding, list):
             return [float(x) for x in embedding]
         return [float(x) for x in np.asarray(embedding, dtype=np.float32).tolist()]
+
+    @staticmethod
+    def build_paper_embedding_text(title: str, abstract: str) -> str:
+        title_value = str(title or "").strip()
+        abstract_value = str(abstract or "").strip()
+        return f"{title_value}\n\nAbstract: {abstract_value}".strip()
+
+    def _build_embedding_cache_key(
+        self,
+        text: str,
+        provider: str,
+        model: str,
+        api_key: Optional[str],
+        base_url: Optional[str],
+        dimension: Optional[int],
+    ) -> str:
+        text_hash = hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
+        return "|".join(
+            [
+                str(provider or "").strip().lower(),
+                str(model or "").strip(),
+                str(api_key or "").strip(),
+                str(base_url or "").strip(),
+                str(dimension or ""),
+                text_hash,
+            ]
+        )
+
+    def _get_cached_embedding(self, cache_key: str) -> Optional[list]:
+        with self._embedding_cache_lock:
+            cached = self._embedding_cache.get(cache_key)
+            if cached is None:
+                return None
+            return [float(value) for value in cached]
+
+    def _set_cached_embedding(self, cache_key: str, embedding: list) -> None:
+        with self._embedding_cache_lock:
+            self._embedding_cache[cache_key] = [float(value) for value in embedding]
 
     def _extract_dashscope_embeddings(self, payload: dict) -> list:
         output = payload.get("output", {}) if isinstance(payload, dict) else {}
@@ -554,14 +596,33 @@ class EmbeddingService:
             base_url=base_url,
             dimension=dimension,
         )
+        cache_key = self._build_embedding_cache_key(
+            text=text,
+            provider=config.provider,
+            model=config.model_name,
+            api_key=config.api_key,
+            base_url=config.base_url,
+            dimension=config.dimension,
+        )
+        cached_embedding = self._get_cached_embedding(cache_key)
+        if cached_embedding is not None:
+            return cached_embedding
+
         normalized_provider = str(provider).strip().lower()
         if normalized_provider == EmbeddingProvider.LOCAL.value:
-            return self.create_single_embedding_local(text)
+            embedding = self.create_single_embedding_local(text)
+            self._set_cached_embedding(cache_key, embedding)
+            return embedding
         if normalized_provider == EmbeddingProvider.DASHSCOPE.value:
-            return self._create_dashscope_embedding(text, config)
+            embedding = self._create_dashscope_embedding(text, config)
+            self._set_cached_embedding(cache_key, embedding)
+            return embedding
 
         embedding_function = self.embedding_factory.create_embedding_function(config)
-        return embedding_function.embed_query(text)
+        embedding = embedding_function.embed_query(text)
+        normalized_embedding = self._normalize_vector_output(embedding)
+        self._set_cached_embedding(cache_key, normalized_embedding)
+        return normalized_embedding
 
     def create_single_embedding_dashscope(
         self,

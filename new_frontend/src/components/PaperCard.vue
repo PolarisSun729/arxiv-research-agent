@@ -33,6 +33,11 @@ const recommendationScoreBreakdown = computed(() => {
   return isRecommended(props.paper) ? props.paper.scoreBreakdown || null : null
 })
 
+const bestMatchedClusterId = computed(() => {
+  if (!isRecommended(props.paper)) return ''
+  return props.paper.best_matched_cluster_id || ''
+})
+
 const finalScoreText = computed(() => {
   if (!isRecommended(props.paper) || typeof props.paper.finalScore !== 'number') {
     return ''
@@ -141,6 +146,9 @@ const labelOptions = [
       <span class="similarity-label">相似度：</span>
       <SimilarityTag :score="(paper as any).similarityScore || (paper as any).similarity || 0" />
       <span v-if="finalScoreText" class="final-score-label">最终 {{ finalScoreText }}</span>
+      <el-tag v-if="bestMatchedClusterId" size="small" type="success" effect="plain">
+        命中 {{ bestMatchedClusterId }}
+      </el-tag>
       <p v-if="recommendationReason" class="recommendation-reason">
         {{ recommendationReason }}
       </p>

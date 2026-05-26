@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue';
+import { ref, onMounted, watch, computed } from 'vue';
 import { useRouter } from 'vue-router';
 import { usePaperStore } from '@/stores/paperStore';
 import { ElMessage } from 'element-plus';
@@ -17,8 +17,13 @@ const filterOptions = [
   { value: 'disliked', label: '不喜欢' }
 ];
 
+const interestVector = computed(() => store.lastInterestVector);
+const interestClusters = computed(() => interestVector.value?.interest_clusters || []);
+const clusterModeText = computed(() => interestVector.value?.profile_mode || 'mean');
+
 onMounted(() => {
   fetchLabeledPapers();
+  store.fetchUserInterestVector();
 });
 
 watch([filterLabel, currentPage], () => {
@@ -116,6 +121,46 @@ async function handleGenerateInterestVector() {
       </el-select>
     </div>
 
+    <div v-if="interestVector" class="interest-cluster-panel">
+      <div class="interest-cluster-panel__header">
+        <div>
+          <h2>兴趣簇概览</h2>
+          <p>
+            当前画像模式：{{ clusterModeText }}，
+            聚类数：{{ interestVector.cluster_count || interestClusters.length || 0 }}
+          </p>
+        </div>
+        <el-tag type="success" effect="dark">
+          {{ interestClusters.length > 0 ? 'clustered' : 'mean fallback' }}
+        </el-tag>
+      </div>
+
+      <div v-if="interestClusters.length > 0" class="interest-cluster-grid">
+        <el-card v-for="cluster in interestClusters" :key="cluster.cluster_id" class="interest-cluster-card">
+          <div class="cluster-card__top">
+            <strong>{{ cluster.cluster_id }}</strong>
+            <span>{{ cluster.paper_count }} papers</span>
+          </div>
+          <div class="cluster-paper-ids">
+            <el-tag
+              v-for="paperId in cluster.paper_ids.slice(0, 4)"
+              :key="paperId"
+              size="small"
+              type="info"
+            >
+              {{ paperId }}
+            </el-tag>
+            <span v-if="cluster.paper_ids.length > 4" class="more-ids">
+              +{{ cluster.paper_ids.length - 4 }} more
+            </span>
+          </div>
+        </el-card>
+      </div>
+      <div v-else class="interest-cluster-empty">
+        当前 liked papers 数量不足或聚类回退到了单一均值向量。
+      </div>
+    </div>
+
     <div v-if="store.loading" class="loading">
       <div class="el-loading-spinner"></div>
       <p>加载中...</p>
@@ -191,6 +236,71 @@ async function handleGenerateInterestVector() {
 
 .filter-bar {
   margin-bottom: 20px;
+}
+
+.interest-cluster-panel {
+  margin-bottom: 20px;
+  padding: 18px 20px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, rgba(17, 24, 39, 0.96), rgba(31, 41, 55, 0.92));
+  color: #f8fafc;
+  box-shadow: 0 16px 32px rgba(15, 23, 42, 0.18);
+}
+
+.interest-cluster-panel__header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  margin-bottom: 16px;
+}
+
+.interest-cluster-panel__header h2 {
+  margin: 0 0 6px 0;
+  font-size: 18px;
+  color: #fff;
+}
+
+.interest-cluster-panel__header p {
+  margin: 0;
+  color: rgba(226, 232, 240, 0.84);
+  font-size: 13px;
+}
+
+.interest-cluster-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.interest-cluster-card {
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.cluster-card__top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+  color: #e2e8f0;
+}
+
+.cluster-paper-ids {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.more-ids {
+  font-size: 12px;
+  color: rgba(226, 232, 240, 0.76);
+}
+
+.interest-cluster-empty {
+  color: rgba(226, 232, 240, 0.84);
+  font-size: 13px;
 }
 
 .loading {

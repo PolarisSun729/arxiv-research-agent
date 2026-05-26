@@ -8,7 +8,10 @@ import type {
   PaginatedResponse,
   ArxivSearchParams,
   PaperMaterializationPayload,
-  PaperPreferenceRequest
+  PaperPreferenceRequest,
+  InterestVector,
+  InterestVectorResult,
+  RecommendationResult
 } from '@/types/paper'
 import { mockPapers, mockRecommendedPapers, mockLabeledPapers, mockStats } from '@/mock/papers'
 
@@ -246,49 +249,12 @@ export async function searchArxiv(params: ArxivSearchParams): Promise<PaginatedR
   }
 }
 
-export interface InterestVectorResult {
-  status: string
-  message: string
-  paper_count: number
-  used_count?: number
-  milvus_used_count?: number
-  fallback_used_count?: number
-  unresolved_count?: number
-  liked_count?: number
-  disliked_count?: number
-  liked_milvus_count?: number
-  disliked_milvus_count?: number
-  liked_fallback_count?: number
-  disliked_fallback_count?: number
-  liked_unresolved_count?: number
-  disliked_unresolved_count?: number
-  vector_dimension: number
-  embedding_model: string
-}
-
-export interface InterestVector {
-  user_id: string
-  vector_data: number[]
-  paper_count: number
-  embedding_model: string
-  vector_dimension: number
-  created_at: string
-  updated_at: string
-}
-
 export async function generateInterestVector(): Promise<InterestVectorResult> {
   return request.post('/user/generate-interest-vector')
 }
 
 export async function getInterestVector(): Promise<InterestVector> {
   return request.get('/user/interest-vector')
-}
-
-export interface RecommendationResult {
-  status: string
-  message: string
-  total_found: number
-  recommendations: RecommendedPaper[]
 }
 
 export async function recommendPapers(topN: number = 10, maxAgeMonths: number = 6): Promise<RecommendationResult> {

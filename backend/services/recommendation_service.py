@@ -1,4 +1,5 @@
 import ast
+import json
 import logging
 import math
 import threading
@@ -9,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import HTTPException
 
+from services.arxiv_oai_service import ArxivOaiDatabaseService
 from services.database_service import DatabaseService
 from services.embedding_service import EmbeddingConfig, EmbeddingService
 from services.arxiv_search_service import ArxivSearchService
@@ -19,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 class RecommendationService:
     ARXIV_BACKFILL_REQUEST_INTERVAL_SECONDS = 8.0
+    MIN_LIKED_PAPERS_FOR_CLUSTERING = 4
+    MAX_INTEREST_CLUSTERS = 4
     RECOMMEND_CANDIDATE_CATEGORIES = [
         "cs.CL",
         "cs.LG",
@@ -33,6 +37,7 @@ class RecommendationService:
         vector_store_service: VectorStoreService,
         get_embedding_config: Callable[[], EmbeddingConfig],
         arxiv_service_factory: Optional[Callable[[], Any]] = None,
+        oai_db_service: Optional[ArxivOaiDatabaseService] = None,
         collection_name: str = "arxiv_paper_embeddings",
     ):
         self.db_service = db_service
@@ -40,6 +45,7 @@ class RecommendationService:
         self.vector_store_service = vector_store_service
         self.get_embedding_config = get_embedding_config
         self.arxiv_service_factory = arxiv_service_factory or (lambda: ArxivSearchService())
+        self.oai_db_service = oai_db_service or ArxivOaiDatabaseService()
         self.collection_name = collection_name
         self._arxiv_backfill_lock = threading.Lock()
         self._arxiv_backfill_next_allowed_time = 0.0
@@ -68,25 +74,25 @@ class RecommendationService:
             arxiv_ids=disliked_ids,
         )
 
-        liked_vectors, liked_milvus_ids, liked_fallback_ids, liked_unresolved_ids = self._hydrate_vectors(
+        liked_records = self._hydrate_vectors_with_metadata(
             requested_ids=liked_ids,
             milvus_embeddings=liked_embeddings,
             config=config,
             label="liked",
         )
-        disliked_vectors, disliked_milvus_ids, disliked_fallback_ids, disliked_unresolved_ids = self._hydrate_vectors(
+        disliked_records = self._hydrate_vectors_with_metadata(
             requested_ids=disliked_ids,
             milvus_embeddings=disliked_embeddings,
             config=config,
             label="disliked",
         )
 
-        if not liked_vectors:
+        if not liked_records:
             raise HTTPException(status_code=500, detail="No reusable embeddings found for liked papers")
 
-        liked_mean = self._mean_vector(liked_vectors)
-        if disliked_vectors:
-            disliked_mean = self._mean_vector(disliked_vectors)
+        liked_mean = self._mean_vector([record["vector"] for record in liked_records])
+        disliked_mean = self._mean_vector([record["vector"] for record in disliked_records]) if disliked_records else []
+        if disliked_mean:
             raw_vector = [
                 liked_value - negative_weight * disliked_value
                 for liked_value, disliked_value in zip(liked_mean, disliked_mean)
@@ -94,19 +100,53 @@ class RecommendationService:
         else:
             raw_vector = liked_mean
 
-        interest_vector = self._normalize_vector(raw_vector)
-        vector_dimension = len(interest_vector)
-        milvus_used_count = len(liked_milvus_ids) + len(disliked_milvus_ids)
-        fallback_used_count = len(liked_fallback_ids) + len(disliked_fallback_ids)
-        used_count = len(liked_vectors) + len(disliked_vectors)
-        unresolved_count = len(liked_unresolved_ids) + len(disliked_unresolved_ids)
+        fallback_interest_vector = self._normalize_vector(raw_vector)
+        interest_clusters: List[Dict[str, Any]] = []
+        profile_mode = "mean"
+        if len(liked_records) >= self.MIN_LIKED_PAPERS_FOR_CLUSTERING:
+            try:
+                interest_clusters = self._cluster_interest_vectors(liked_records)
+                if interest_clusters:
+                    profile_mode = "clustered"
+                    cluster_summary = [
+                        {
+                            "cluster_id": cluster.get("cluster_id"),
+                            "paper_count": cluster.get("paper_count", 0),
+                            "paper_ids": cluster.get("paper_ids", []),
+                        }
+                        for cluster in interest_clusters
+                    ]
+                    logger.info(
+                        "User %s liked papers clustered into %s interest clusters: %s",
+                        user_id,
+                        len(interest_clusters),
+                        cluster_summary,
+                    )
+                else:
+                    logger.info(
+                        "User %s did not produce stable interest clusters; using mean fallback",
+                        user_id,
+                    )
+            except Exception as exc:  # pragma: no cover - clustering should be deterministic but safe to fallback
+                logger.warning("Failed to cluster liked papers for user %s, falling back to mean vector: %s", user_id, exc)
+                interest_clusters = []
+
+        vector_dimension = len(fallback_interest_vector)
+        milvus_used_count = sum(1 for record in liked_records + disliked_records if record.get("source") == "milvus")
+        fallback_used_count = sum(1 for record in liked_records + disliked_records if record.get("source") == "fallback")
+        used_count = len(liked_records) + len(disliked_records)
+        unresolved_count = len(liked_ids) + len(disliked_ids) - used_count
 
         success = self.db_service.save_user_interest_vector(
             user_id=user_id,
-            vector_data=interest_vector,
+            vector_data=fallback_interest_vector,
             paper_count=used_count,
             embedding_model=config.model_name,
             vector_dimension=vector_dimension,
+            cluster_count=len(interest_clusters),
+            profile_mode=profile_mode,
+            interest_clusters=interest_clusters,
+            disliked_vector_data=self._normalize_vector(disliked_mean) if disliked_mean else None,
         )
         if not success:
             raise HTTPException(status_code=500, detail="Failed to save interest vector")
@@ -124,21 +164,40 @@ class RecommendationService:
             "milvus_used_count": milvus_used_count,
             "fallback_used_count": fallback_used_count,
             "unresolved_count": unresolved_count,
-            "liked_count": len(liked_vectors),
-            "disliked_count": len(disliked_vectors),
-            "liked_milvus_count": len(liked_milvus_ids),
-            "disliked_milvus_count": len(disliked_milvus_ids),
-            "liked_fallback_count": len(liked_fallback_ids),
-            "disliked_fallback_count": len(disliked_fallback_ids),
-            "liked_unresolved_count": len(liked_unresolved_ids),
-            "disliked_unresolved_count": len(disliked_unresolved_ids),
+            "liked_count": len(liked_records),
+            "disliked_count": len(disliked_records),
+            "liked_milvus_count": sum(1 for record in liked_records if record.get("source") == "milvus"),
+            "disliked_milvus_count": sum(1 for record in disliked_records if record.get("source") == "milvus"),
+            "liked_fallback_count": sum(1 for record in liked_records if record.get("source") == "fallback"),
+            "disliked_fallback_count": sum(1 for record in disliked_records if record.get("source") == "fallback"),
+            "liked_unresolved_count": len(liked_ids) - len(liked_records),
+            "disliked_unresolved_count": len(disliked_ids) - len(disliked_records),
             "vector_dimension": vector_dimension,
             "embedding_model": config.model_name,
+            "cluster_count": len(interest_clusters),
+            "profile_mode": profile_mode,
+            "cluster_summary": [
+                {
+                    "cluster_id": cluster.get("cluster_id"),
+                    "paper_count": cluster.get("paper_count", 0),
+                    "paper_ids": cluster.get("paper_ids", []),
+                }
+                for cluster in interest_clusters
+            ],
         }
 
     def recommend_papers(self, user_id: str, top_n: int = 10, max_age_months: int = 6) -> Dict[str, Any]:
         user_vector_data = self._get_or_refresh_interest_vector(user_id)
         user_vector = user_vector_data["vector_data"]
+        interest_clusters = user_vector_data.get("interest_clusters", []) or []
+        disliked_vector = user_vector_data.get("disliked_vector_data")
+
+        logger.info(
+            "Starting paper recommendation for user %s with top_n=%s max_age_months=%s",
+            user_id,
+            top_n,
+            max_age_months,
+        )
 
         preferences = self.db_service.get_user_preferences(user_id=user_id)
         liked_ids = preferences.get("liked_papers", [])
@@ -149,37 +208,118 @@ class RecommendationService:
         liked_category_freq = self._build_liked_category_frequency(liked_details)
 
         candidate_limit = max(top_n * 5, 50)
-        candidates = self._fetch_recent_api_candidates(
+        candidates = self._fetch_recent_db_candidates(
             liked_category_freq=liked_category_freq,
             max_age_months=max_age_months,
             max_results=max(candidate_limit * 2, candidate_limit),
         )
+        logger.info(
+            "Fetched %s candidate papers from OAI DB for user %s before deduplication",
+            len(candidates),
+            user_id,
+        )
 
         filtered_candidates = self._deduplicate_candidates(candidates, excluded_ids)
+        logger.info(
+            "Retained %s candidate papers after deduplication against %s excluded papers for user %s",
+            len(filtered_candidates),
+            len(excluded_ids),
+            user_id,
+        )
         if not filtered_candidates:
             raise HTTPException(
                 status_code=400,
                 detail=f"No papers found for recommendation within the last {max_age_months} months",
             )
 
+        materialized_candidates, materialize_stats = self._materialize_candidate_papers_for_recommendation(filtered_candidates)
+        logger.info(
+            "Materialized candidate papers for user %s: total=%s reused=%s db_only=%s batch_embedded=%s batch_inserted=%s unresolved=%s",
+            user_id,
+            materialize_stats.get("total", 0),
+            materialize_stats.get("reused_existing", 0),
+            materialize_stats.get("db_only", 0),
+            materialize_stats.get("batch_embedded", 0),
+            materialize_stats.get("batch_inserted", 0),
+            materialize_stats.get("unresolved", 0),
+        )
+
         embedding_config = self.get_embedding_config()
+        candidate_ids = [str(candidate.get("arxiv_id", "") or "").strip() for candidate in materialized_candidates]
+        existing_candidate_embeddings = self.vector_store_service.get_paper_embeddings_by_arxiv_ids(
+            collection_name=self.collection_name,
+            arxiv_ids=candidate_ids,
+        )
+        logger.info(
+            "Loaded %s stored candidate embeddings from Milvus for user %s",
+            len(existing_candidate_embeddings),
+            user_id,
+        )
+        candidate_embedding_map = {
+            str(item.get("arxiv_id", "") or "").strip(): item.get("vector", [])
+            for item in existing_candidate_embeddings
+            if item.get("arxiv_id") and item.get("vector")
+        }
+        reused_vector_count = 0
+        for candidate in materialized_candidates:
+            arxiv_id = str(candidate.get("arxiv_id", "") or "").strip()
+            if arxiv_id in candidate_embedding_map:
+                candidate["_stored_vector"] = candidate_embedding_map[arxiv_id]
+                reused_vector_count += 1
+
+        logger.info(
+            "Reused %s/%s candidate vectors from Milvus for user %s",
+            reused_vector_count,
+            len(materialized_candidates),
+            user_id,
+        )
+
         scored_candidates = []
-        for candidate in filtered_candidates:
-            scored_candidates.append(
-                self._build_candidate_score(
-                    candidate=candidate,
-                    liked_category_freq=liked_category_freq,
-                    user_vector=user_vector,
-                    embedding_config=embedding_config,
-                )
+        recomputed_vector_count = 0
+        missing_vector_count = 0
+        for candidate in materialized_candidates:
+            scored_candidate = self._build_candidate_score(
+                candidate=candidate,
+                liked_category_freq=liked_category_freq,
+                user_vector=user_vector,
+                interest_clusters=interest_clusters,
+                disliked_vector=disliked_vector,
+                embedding_config=embedding_config,
             )
+            scored_candidates.append(scored_candidate)
+            embedding_source = str(scored_candidate.get("_embedding_source", "") or "")
+            if embedding_source == "recomputed":
+                recomputed_vector_count += 1
+            elif embedding_source == "missing":
+                missing_vector_count += 1
+
+        logger.info(
+            "Candidate embedding summary for user %s: total=%s reused=%s recomputed=%s missing=%s",
+            user_id,
+            len(materialized_candidates),
+            reused_vector_count,
+            recomputed_vector_count,
+            missing_vector_count,
+        )
 
         selected = self._select_diverse_candidates(scored_candidates, top_n)
+
+        logger.info(
+            "Recommendation finished for user %s: scored=%s selected=%s reused=%s recomputed=%s missing=%s",
+            user_id,
+            len(scored_candidates),
+            len(selected),
+            reused_vector_count,
+            recomputed_vector_count,
+            missing_vector_count,
+        )
 
         return {
             "status": "success",
             "message": f"Generated {len(selected)} recommendations",
             "total_found": len(scored_candidates),
+            "interest_profile_mode": user_vector_data.get("profile_mode", "mean"),
+            "interest_cluster_count": user_vector_data.get("cluster_count", 0),
             "recommendations": selected,
         }
 
@@ -237,6 +377,156 @@ class RecommendationService:
             raise HTTPException(status_code=400, detail="User interest vector not found. Please generate it first.")
 
         return vector_data
+
+    def _materialize_candidate_papers_for_recommendation(
+        self,
+        candidates: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+        stats = {
+            "total": len(candidates),
+            "reused_existing": 0,
+            "db_only": 0,
+            "batch_embedded": 0,
+            "batch_inserted": 0,
+            "unresolved": 0,
+        }
+        materialized_by_id: Dict[str, Dict[str, Any]] = {}
+        batch_jobs: List[Dict[str, Any]] = []
+        embedding_config = self.get_embedding_config()
+        candidate_ids = [str(candidate.get("arxiv_id", "") or "").strip() for candidate in candidates if str(candidate.get("arxiv_id", "") or "").strip()]
+        candidate_embedding_rows = self.vector_store_service.get_paper_embeddings_by_arxiv_ids(
+            collection_name=self.collection_name,
+            arxiv_ids=candidate_ids,
+        )
+        candidate_embedding_map = {
+            str(item.get("arxiv_id", "") or "").strip(): item
+            for item in candidate_embedding_rows
+            if item.get("arxiv_id")
+        }
+
+        for candidate in candidates:
+            arxiv_id = str(candidate.get("arxiv_id", "") or "").strip()
+            if not arxiv_id:
+                stats["unresolved"] += 1
+                continue
+
+            try:
+                existing_paper = self.db_service.get_paper(arxiv_id)
+                existing_embedding = candidate_embedding_map.get(arxiv_id)
+            except Exception as exc:  # pragma: no cover - storage/runtime dependent fallback
+                logger.warning("Failed to inspect candidate paper %s before materialization: %s", arxiv_id, exc)
+                existing_paper = None
+                existing_embedding = None
+
+            if existing_paper and existing_paper.get("embedding_id") and existing_embedding:
+                materialized_by_id[arxiv_id] = existing_paper
+                stats["reused_existing"] += 1
+                continue
+
+            if existing_paper and existing_embedding and not existing_paper.get("embedding_id"):
+                updated = self.db_service.update_paper_embedding(
+                    arxiv_id=arxiv_id,
+                    embedding_id=int(existing_embedding.get("embedding_id") or 0),
+                    embedding_model=str(existing_embedding.get("embedding_model") or existing_paper.get("embedding_model") or embedding_config.model_name),
+                )
+                refreshed = self.db_service.get_paper(arxiv_id) if updated else None
+                materialized_by_id[arxiv_id] = refreshed or {**existing_paper, "embedding_id": existing_embedding.get("embedding_id")}
+                stats["db_only"] += 1
+                continue
+
+            if existing_embedding and not existing_paper:
+                stored = {
+                    "arxiv_id": str(candidate.get("arxiv_id", "") or "").strip(),
+                    "title": str(candidate.get("title", "") or "").strip(),
+                    "authors": candidate.get("authors", []),
+                    "abstract": str(candidate.get("abstract", "") or "").strip(),
+                    "categories": candidate.get("categories", []),
+                    "published_date": str(candidate.get("published_date", "") or "").strip(),
+                    "url": str(candidate.get("url", "") or candidate.get("abs_url", "") or candidate.get("pdf_url", "") or "").strip(),
+                    "embedding_id": str(existing_embedding.get("embedding_id") or ""),
+                    "embedding_model": str(existing_embedding.get("embedding_model") or embedding_config.model_name),
+                }
+                if self.db_service.add_paper(stored):
+                    materialized_by_id[arxiv_id] = self.db_service.get_paper(arxiv_id) or stored
+                    stats["db_only"] += 1
+                else:
+                    stats["unresolved"] += 1
+                continue
+
+            normalized_paper = self._normalize_paper_record(candidate, arxiv_id)
+            text_to_embed = self.embedding_service.build_paper_embedding_text(
+                normalized_paper["title"],
+                normalized_paper["abstract"],
+            )
+            if not text_to_embed:
+                stats["unresolved"] += 1
+                continue
+
+            try:
+                embedding = self.embedding_service.create_single_embedding(
+                    text_to_embed,
+                    provider=embedding_config.provider,
+                    model=embedding_config.model_name,
+                    api_key=embedding_config.api_key,
+                    base_url=embedding_config.base_url,
+                    dimension=embedding_config.dimension,
+                )
+            except Exception as exc:  # pragma: no cover - embedding/runtime dependent fallback
+                logger.warning("Failed to embed candidate paper %s for recommendation: %s", arxiv_id, exc)
+                stats["unresolved"] += 1
+                continue
+
+            batch_jobs.append(
+                {
+                    "arxiv_id": arxiv_id,
+                    "normalized_paper": normalized_paper,
+                    "embedding": [float(value) for value in embedding],
+                }
+            )
+
+        if batch_jobs:
+            try:
+                batch_insert_payload = [
+                    {
+                        "embedding": job["embedding"],
+                        "metadata": {
+                            "content": job["normalized_paper"]["abstract"],
+                            "arxiv_id": job["normalized_paper"]["arxiv_id"],
+                            "title": job["normalized_paper"]["title"],
+                            "authors": job["normalized_paper"]["authors"],
+                            "categories": job["normalized_paper"]["categories"],
+                            "published_date": job["normalized_paper"]["published_date"],
+                            "url": job["normalized_paper"]["url"],
+                            "embedding_model": job["normalized_paper"]["embedding_model"],
+                        },
+                    }
+                    for job in batch_jobs
+                ]
+                embedding_ids = self.vector_store_service.insert_embeddings(self.collection_name, batch_insert_payload)
+                stats["batch_embedded"] = len(batch_jobs)
+                stats["batch_inserted"] = len(embedding_ids)
+                for job, embedding_id in zip(batch_jobs, embedding_ids):
+                    stored = {
+                        "arxiv_id": job["normalized_paper"]["arxiv_id"],
+                        "title": job["normalized_paper"]["title"],
+                        "authors": job["normalized_paper"]["authors"],
+                        "abstract": job["normalized_paper"]["abstract"],
+                        "categories": job["normalized_paper"]["categories"],
+                        "published_date": job["normalized_paper"]["published_date"],
+                        "url": job["normalized_paper"]["url"],
+                        "embedding_id": str(embedding_id),
+                        "embedding_model": job["normalized_paper"]["embedding_model"],
+                    }
+                    if self.db_service.add_paper(stored):
+                        materialized_by_id[job["arxiv_id"]] = self.db_service.get_paper(job["arxiv_id"]) or stored
+                    else:
+                        stats["unresolved"] += 1
+            except Exception as exc:  # pragma: no cover - storage/runtime dependent fallback
+                logger.warning("Failed batch materialization for recommendation candidates: %s", exc)
+                stats["unresolved"] += len(batch_jobs)
+
+        ordered_candidates = [materialized_by_id[str(candidate.get("arxiv_id", "") or "").strip()] for candidate in candidates if str(candidate.get("arxiv_id", "") or "").strip() in materialized_by_id]
+        return ordered_candidates, stats
 
     def _ensure_paper_materialized(
         self,
@@ -396,7 +686,10 @@ class RecommendationService:
 
     def _build_and_insert_paper_embedding(self, normalized_paper: Dict[str, Any]) -> tuple[int, List[float]]:
         embedding_config = self.get_embedding_config()
-        text_to_embed = f"{normalized_paper['title']}\n\nAbstract: {normalized_paper['abstract']}".strip()
+        text_to_embed = self.embedding_service.build_paper_embedding_text(
+            normalized_paper["title"],
+            normalized_paper["abstract"],
+        )
         if not text_to_embed:
             raise HTTPException(status_code=400, detail=f"Paper {normalized_paper['arxiv_id']} has no text to embed")
 
@@ -448,24 +741,32 @@ class RecommendationService:
             for index in range(dimension)
         ]
 
-    def _hydrate_vectors(
+    def _hydrate_vectors_with_metadata(
         self,
         requested_ids: List[str],
         milvus_embeddings: List[Dict[str, Any]],
         config: EmbeddingConfig,
         label: str,
-    ) -> tuple[List[List[float]], List[str], List[str], List[str]]:
+    ) -> List[Dict[str, Any]]:
         milvus_map = {
             str(item.get("arxiv_id", "")).strip(): item.get("vector", [])
             for item in milvus_embeddings
             if item.get("arxiv_id") and item.get("vector")
         }
-        milvus_used_ids = [arxiv_id for arxiv_id in requested_ids if arxiv_id in milvus_map]
         missing_ids = [arxiv_id for arxiv_id in requested_ids if arxiv_id not in milvus_map]
+        vector_records: Dict[str, Dict[str, Any]] = {
+            arxiv_id: {
+                "arxiv_id": arxiv_id,
+                "vector": milvus_map[arxiv_id],
+                "source": "milvus",
+            }
+            for arxiv_id in requested_ids
+            if arxiv_id in milvus_map
+        }
 
         if missing_ids:
             logger.warning(
-                "Missing paper embeddings for %s papers in collection %s, attempting arXiv backfill: %s",
+                "Missing paper embeddings for %s papers in collection %s, attempting OAI DB backfill: %s",
                 label,
                 self.collection_name,
                 ", ".join(sorted(missing_ids)),
@@ -473,14 +774,12 @@ class RecommendationService:
 
         recovered_vectors, recovered_ids, _ = self._backfill_missing_vectors_from_arxiv(missing_ids, label)
         for arxiv_id, vector in recovered_vectors.items():
-            milvus_map[arxiv_id] = vector
-        for arxiv_id in recovered_ids:
-            if arxiv_id not in milvus_used_ids:
-                milvus_used_ids.append(arxiv_id)
+            vector_records[arxiv_id] = {
+                "arxiv_id": arxiv_id,
+                "vector": vector,
+                "source": "milvus",
+            }
 
-        fallback_vectors: List[List[float]] = []
-        fallback_ids: List[str] = []
-        unresolved_ids: List[str] = []
         remaining_missing = [arxiv_id for arxiv_id in missing_ids if arxiv_id not in recovered_vectors]
         if remaining_missing:
             fallback_papers = [
@@ -494,7 +793,12 @@ class RecommendationService:
                 if item.get("arxiv_id") and item.get("vector")
             }
             fallback_ids = [arxiv_id for arxiv_id in remaining_missing if arxiv_id in fallback_map]
-            fallback_vectors = [fallback_map[arxiv_id] for arxiv_id in fallback_ids]
+            for arxiv_id in fallback_ids:
+                vector_records[arxiv_id] = {
+                    "arxiv_id": arxiv_id,
+                    "vector": fallback_map[arxiv_id],
+                    "source": "fallback",
+                }
             unresolved_ids = [arxiv_id for arxiv_id in remaining_missing if arxiv_id not in fallback_map]
 
             if unresolved_ids:
@@ -504,8 +808,27 @@ class RecommendationService:
                     ", ".join(sorted(unresolved_ids)),
                 )
 
-        vectors = [milvus_map[arxiv_id] for arxiv_id in milvus_used_ids] + fallback_vectors
-        return vectors, milvus_used_ids, fallback_ids, unresolved_ids
+        ordered_records = [vector_records[arxiv_id] for arxiv_id in requested_ids if arxiv_id in vector_records]
+        return ordered_records
+
+    def _hydrate_vectors(
+        self,
+        requested_ids: List[str],
+        milvus_embeddings: List[Dict[str, Any]],
+        config: EmbeddingConfig,
+        label: str,
+    ) -> tuple[List[List[float]], List[str], List[str], List[str]]:
+        records = self._hydrate_vectors_with_metadata(
+            requested_ids=requested_ids,
+            milvus_embeddings=milvus_embeddings,
+            config=config,
+            label=label,
+        )
+        vectors = [record["vector"] for record in records]
+        milvus_ids = [record["arxiv_id"] for record in records if record.get("source") == "milvus"]
+        fallback_ids = [record["arxiv_id"] for record in records if record.get("source") == "fallback"]
+        unresolved_ids = [arxiv_id for arxiv_id in requested_ids if arxiv_id not in {record["arxiv_id"] for record in records}]
+        return vectors, milvus_ids, fallback_ids, unresolved_ids
 
     def _backfill_missing_vectors_from_arxiv(
         self,
@@ -561,6 +884,112 @@ class RecommendationService:
             return vector
         return [value / norm for value in vector]
 
+    def _cluster_interest_vectors(self, liked_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if len(liked_records) < self.MIN_LIKED_PAPERS_FOR_CLUSTERING:
+            return []
+
+        valid_records = [record for record in liked_records if record.get("vector")]
+        vectors = [
+            self._normalize_vector([float(value) for value in record["vector"]])
+            for record in valid_records
+        ]
+        paper_ids = [str(record.get("arxiv_id", "") or "").strip() for record in valid_records]
+        if len(vectors) < self.MIN_LIKED_PAPERS_FOR_CLUSTERING:
+            return []
+
+        cluster_count = min(self.MAX_INTEREST_CLUSTERS, max(2, len(vectors) // 3))
+        cluster_count = min(cluster_count, len(vectors))
+        if cluster_count < 2:
+            return []
+
+        centroids = self._initialize_cluster_centroids(vectors, cluster_count)
+        assignments: List[int] = [-1] * len(vectors)
+
+        for _ in range(20):
+            updated_assignments = []
+            for vector in vectors:
+                best_cluster_index = max(
+                    range(len(centroids)),
+                    key=lambda index: self._cosine_similarity(vector, centroids[index]),
+                )
+                updated_assignments.append(best_cluster_index)
+
+            if updated_assignments == assignments:
+                break
+            assignments = updated_assignments
+
+            new_centroids: List[List[float]] = []
+            for cluster_index in range(cluster_count):
+                cluster_vectors = [
+                    vectors[index]
+                    for index, assignment in enumerate(assignments)
+                    if assignment == cluster_index
+                ]
+                if not cluster_vectors:
+                    logger.info("Interest clustering produced an empty cluster; using mean fallback")
+                    return []
+                centroid = self._normalize_vector(self._mean_vector(cluster_vectors))
+                new_centroids.append(centroid)
+            centroids = new_centroids
+
+        cluster_members: Dict[int, List[int]] = {index: [] for index in range(cluster_count)}
+        for vector_index, cluster_index in enumerate(assignments):
+            if cluster_index not in cluster_members:
+                cluster_members[cluster_index] = []
+            cluster_members[cluster_index].append(vector_index)
+
+        if any(not members for members in cluster_members.values()):
+            logger.info("Interest clustering ended with an empty cluster; using mean fallback")
+            return []
+
+        clusters: List[Dict[str, Any]] = []
+        for cluster_index, members in cluster_members.items():
+            member_paper_ids = [paper_ids[index] for index in members if paper_ids[index]]
+            cluster_vectors = [vectors[index] for index in members]
+            clusters.append(
+                {
+                    "cluster_id": f"cluster_{cluster_index}",
+                    "centroid_vector": self._normalize_vector(self._mean_vector(cluster_vectors)),
+                    "paper_count": len(member_paper_ids),
+                    "paper_ids": member_paper_ids,
+                }
+            )
+
+        clusters.sort(
+            key=lambda item: (
+                -int(item.get("paper_count", 0) or 0),
+                (item.get("paper_ids") or [""])[0],
+            )
+        )
+        for index, cluster in enumerate(clusters):
+            cluster["cluster_id"] = f"cluster_{index}"
+        return clusters
+
+    def _initialize_cluster_centroids(self, vectors: List[List[float]], cluster_count: int) -> List[List[float]]:
+        if not vectors or cluster_count <= 0:
+            return []
+
+        centroids = [vectors[0]]
+        chosen_indices = {0}
+        while len(centroids) < cluster_count:
+            remaining_indices = [index for index in range(len(vectors)) if index not in chosen_indices]
+            if not remaining_indices:
+                break
+
+            candidate_index = max(
+                remaining_indices,
+                key=lambda index: min(
+                    1.0 - self._cosine_similarity(vectors[index], centroid)
+                    for centroid in centroids
+                ),
+            )
+            centroids.append(vectors[candidate_index])
+            chosen_indices.add(candidate_index)
+
+        while len(centroids) < cluster_count:
+            centroids.append(vectors[0])
+        return centroids
+
     def _build_liked_category_frequency(self, liked_papers: List[Dict[str, Any]]) -> Counter:
         counter: Counter = Counter()
         for paper in liked_papers:
@@ -588,21 +1017,70 @@ class RecommendationService:
         candidate: Dict[str, Any],
         liked_category_freq: Counter,
         user_vector: Optional[List[float]] = None,
+        interest_clusters: Optional[List[Dict[str, Any]]] = None,
+        disliked_vector: Optional[List[float]] = None,
         embedding_config: Optional[EmbeddingConfig] = None,
     ) -> Dict[str, Any]:
         semantic_score = float(candidate.get("similarity_score", candidate.get("score", 0.0)) or 0.0)
+        best_matched_cluster_id = None
+        best_matched_cluster_similarity = None
+        cluster_similarities: List[Dict[str, Any]] = []
+        disliked_penalty = 0.0
+        embedding_source = "none"
         if user_vector and embedding_config:
-            text_to_embed = f"{candidate.get('title', '')}\n\nAbstract: {candidate.get('abstract', '')}".strip()
-            if text_to_embed:
-                candidate_embedding = self.embedding_service.create_single_embedding(
-                    text_to_embed,
-                    provider=embedding_config.provider,
-                    model=embedding_config.model_name,
-                    api_key=embedding_config.api_key,
-                    base_url=embedding_config.base_url,
-                    dimension=embedding_config.dimension,
+            candidate_embedding = None
+            stored_vector = candidate.get("_stored_vector") or []
+            if stored_vector:
+                candidate_embedding = [float(value) for value in stored_vector]
+                embedding_source = "stored"
+            else:
+                text_to_embed = self.embedding_service.build_paper_embedding_text(
+                    candidate.get("title", ""),
+                    candidate.get("abstract", ""),
                 )
-                semantic_score = self._cosine_similarity(user_vector, [float(value) for value in candidate_embedding])
+                if text_to_embed:
+                    candidate_embedding = [
+                        float(value)
+                        for value in self.embedding_service.create_single_embedding(
+                            text_to_embed,
+                            provider=embedding_config.provider,
+                            model=embedding_config.model_name,
+                            api_key=embedding_config.api_key,
+                            base_url=embedding_config.base_url,
+                            dimension=embedding_config.dimension,
+                        )
+                    ]
+                    embedding_source = "recomputed"
+                else:
+                    embedding_source = "missing"
+            if candidate_embedding:
+                if interest_clusters:
+                    cluster_similarities = [
+                        {
+                            "cluster_id": cluster.get("cluster_id"),
+                            "similarity": self._cosine_similarity(
+                                candidate_embedding,
+                                [float(value) for value in cluster.get("centroid_vector", [])],
+                            ),
+                        }
+                        for cluster in interest_clusters
+                        if cluster.get("centroid_vector")
+                    ]
+                    if cluster_similarities:
+                        best_cluster = max(
+                            cluster_similarities,
+                            key=lambda item: float(item.get("similarity", 0.0) or 0.0),
+                        )
+                        best_matched_cluster_id = best_cluster.get("cluster_id")
+                        best_matched_cluster_similarity = float(best_cluster.get("similarity", 0.0) or 0.0)
+                        semantic_score = best_matched_cluster_similarity
+                    else:
+                        semantic_score = self._cosine_similarity(user_vector, candidate_embedding)
+                else:
+                    semantic_score = self._cosine_similarity(user_vector, candidate_embedding)
+
+                if interest_clusters and disliked_vector:
+                    disliked_penalty = self._cosine_similarity(disliked_vector, candidate_embedding)
         categories = self._split_categories(candidate.get("categories"))
         category_score = self._calculate_category_score(categories, liked_category_freq)
         recency_score = 0.0
@@ -611,17 +1089,24 @@ class RecommendationService:
             semantic_score * 0.65
             + category_score * 0.08
             + recency_score * 0.0
+            - disliked_penalty * 0.15
         )
 
         return {
             **candidate,
             "similarity_score": semantic_score,
             "semantic_score": semantic_score,
+            "best_matched_cluster_id": best_matched_cluster_id,
+            "best_matched_cluster_similarity": best_matched_cluster_similarity,
+            "cluster_similarities": cluster_similarities,
+            "disliked_penalty": disliked_penalty,
+            "_embedding_source": embedding_source,
             "final_score": base_score,
             "score_breakdown": {
                 "semantic_score": semantic_score,
                 "category_score": category_score,
                 "recency_score": recency_score,
+                "disliked_penalty": disliked_penalty,
                 "diversity_score": 0.0,
             },
             "_candidate_categories": categories,
@@ -633,7 +1118,7 @@ class RecommendationService:
             arxiv_id = str(paper.get("arxiv_id", "") or "").strip()
             title = str(paper.get("title", "") or "").strip()
             abstract = str(paper.get("abstract", "") or "").strip()
-            text_to_embed = f"{title}\n\nAbstract: {abstract}".strip()
+            text_to_embed = self.embedding_service.build_paper_embedding_text(title, abstract)
             if not arxiv_id or not text_to_embed:
                 continue
             embedding = self.embedding_service.create_single_embedding(
@@ -650,42 +1135,47 @@ class RecommendationService:
             })
         return embedded
 
-    def _fetch_recent_api_candidates(
+    def _fetch_recent_db_candidates(
         self,
         liked_category_freq: Counter,
         max_age_months: int,
         max_results: int,
     ) -> List[Dict[str, Any]]:
-        arxiv_service = self.arxiv_service_factory()
-        category_query = self._build_category_query(liked_category_freq)
+        categories = self.RECOMMEND_CANDIDATE_CATEGORIES[:]
 
         logger.info(
-            "Fetching recent API candidates with query=%s, max_age_months=%s, max_results=%s",
-            category_query,
+            "Fetching recent OAI DB candidates with categories=%s, max_age_months=%s, max_results=%s",
+            categories,
             max_age_months,
             max_results,
         )
 
-        search_result = arxiv_service.search_papers(
-            search_query=category_query,
+        papers = self.oai_db_service.get_recent_papers(
+            categories=categories,
+            max_age_months=max_age_months,
             max_results=max_results,
-            sort_by="submittedDate",
-            sort_order="descending",
-            submitted_days_ago=max_age_months * 30,
         )
-
-        papers = search_result.get("papers", []) if isinstance(search_result, dict) else []
         candidates: List[Dict[str, Any]] = []
         for paper in papers:
             candidate = {
-                "arxiv_id": paper.get("arxiv_id", ""),
-                "title": paper.get("title", ""),
+                "arxiv_id": str(paper.get("arxiv_id", "") or "").strip(),
+                "title": str(paper.get("title", "") or "").strip(),
                 "authors": paper.get("authors", []),
-                "abstract": paper.get("summary", "") or paper.get("abstract", ""),
+                "abstract": str(paper.get("abstract", "") or "").strip(),
                 "categories": paper.get("categories", []),
-                "published_date": paper.get("published", "") or paper.get("published_date", ""),
-                "url": paper.get("abs_url", "") or paper.get("url", ""),
+                "published_date": str(
+                    paper.get("created")
+                    or paper.get("updated")
+                    or paper.get("oai_datestamp")
+                    or ""
+                ).strip(),
+                "url": str(paper.get("abs_url") or paper.get("pdf_url") or "").strip(),
                 "score": 0.0,
+                "abs_url": paper.get("abs_url", ""),
+                "pdf_url": paper.get("pdf_url", ""),
+                "primary_category": paper.get("primary_category", ""),
+                "oai_datestamp": paper.get("oai_datestamp", ""),
+                "fetched_at": paper.get("fetched_at", ""),
             }
             candidates.append(candidate)
 

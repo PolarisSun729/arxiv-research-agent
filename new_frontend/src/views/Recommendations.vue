@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { usePaperStore } from '@/stores/paperStore'
@@ -13,10 +13,17 @@ const recommendationCount = ref(10)
 const recommendationAgeMonths = ref(6)
 const topRecommendation = computed(() => store.recommendations[0] || null)
 const topBreakdown = computed(() => topRecommendation.value?.scoreBreakdown || null)
+const interestVector = computed(() => store.lastInterestVector)
+const interestClusterCount = computed(() => interestVector.value?.cluster_count || 0)
+const interestProfileMode = computed(() => interestVector.value?.profile_mode || 'mean')
 const topFinalScore = computed(() => {
   const paper = topRecommendation.value
   if (!paper) return 0
   return typeof paper.finalScore === 'number' ? paper.finalScore : paper.similarityScore || 0
+})
+
+onMounted(() => {
+  store.fetchUserInterestVector()
 })
 
 const countOptions = [
@@ -127,6 +134,11 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
           <SimilarityTag :score="topRecommendation?.similarityScore || 0" />
           <div class="summary-score__value">最终 {{ Math.round(topFinalScore * 100) }}%</div>
         </div>
+      </div>
+
+      <div v-if="interestVector" class="summary-interest">
+        <span>兴趣画像模式：{{ interestProfileMode }}</span>
+        <span>兴趣簇数量：{{ interestClusterCount }}</span>
       </div>
 
       <div v-if="topBreakdown" class="summary-breakdown">
@@ -269,6 +281,18 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
   font-size: 18px;
   font-weight: 700;
   color: #fff;
+}
+
+.summary-interest {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.36);
+  color: rgba(226, 232, 240, 0.9);
+  font-size: 13px;
 }
 
 .summary-breakdown {

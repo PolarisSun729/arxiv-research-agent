@@ -74,6 +74,11 @@ SQLITE_CONFIG: Dict[str, Any] = {
     "check_same_thread": _env_bool("SQLITE_CHECK_SAME_THREAD", False),
 }
 
+OAI_SQLITE_CONFIG: Dict[str, Any] = {
+    "database_path": _env_str("OAI_SQLITE_DATABASE_PATH", str(REPO_ROOT / "06-database" / "arxiv_oai.db")),
+    "check_same_thread": _env_bool("OAI_SQLITE_CHECK_SAME_THREAD", False),
+}
+
 EMBEDDING_CONFIG: Dict[str, Any] = {
     "provider": _env_str("EMBEDDING_PROVIDER", "dashscope"),
     "model_name": _env_str("EMBEDDING_MODEL", "qwen3-vl-embedding"),

@@ -1,6 +1,14 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import type { Paper, RecommendedPaper, LabeledPaper, ArxivSearchParams } from '@/types/paper'
+import type {
+  Paper,
+  RecommendedPaper,
+  LabeledPaper,
+  ArxivSearchParams,
+  InterestVector,
+  InterestVectorResult,
+  RecommendationResult
+} from '@/types/paper'
 import {
   searchPapers,
   getPaperById,
@@ -14,10 +22,7 @@ import {
   removePaperPreference,
   generateInterestVector,
   getInterestVector,
-  recommendPapers,
-  type InterestVectorResult,
-  type InterestVector,
-  type RecommendationResult
+  recommendPapers
 } from '@/api/papers'
 
 export const usePaperStore = defineStore('paper', () => {

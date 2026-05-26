@@ -504,9 +504,27 @@ class VectorStoreService:
         将单个 embedding 插入到指定 collection。
         """
         try:
+            return self.insert_embeddings(collection_name, [{"embedding": embedding, "metadata": metadata}])[0]
+        except Exception as e:
+            logger.error(f"Error inserting single embedding: {str(e)}")
+            raise
+
+    def insert_embeddings(self, collection_name: str, items: List[Dict[str, Any]]) -> List[int]:
+        """
+        批量插入多个 embedding 到指定 collection。
+        """
+        if not items:
+            return []
+
+        try:
             connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
             resolved_name = normalize_collection_name(collection_name)
-            
+
+            embeddings = [[float(value) for value in item.get("embedding", [])] for item in items]
+            vector_dim = len(embeddings[0]) if embeddings and embeddings[0] else 0
+            if not vector_dim:
+                raise ValueError("Cannot insert empty embeddings")
+
             if utility.has_collection(resolved_name):
                 collection = Collection(resolved_name)
                 vector_field = next((field for field in collection.schema.fields if field.name == "vector"), None)
@@ -517,14 +535,13 @@ class VectorStoreService:
                         params = getattr(vector_field, "params", None)
                         if isinstance(params, dict):
                             existing_dim = params.get("dim")
-                if existing_dim and int(existing_dim) != len(embedding):
+                if existing_dim and int(existing_dim) != vector_dim:
                     raise ValueError(
                         f"Collection '{resolved_name}' already uses vector dimension {existing_dim}, "
-                        f"but the new embedding has dimension {len(embedding)}. "
+                        f"but the new embeddings have dimension {vector_dim}. "
                         "Rebuild the collection or keep the embedding model/dimension consistent."
                     )
             else:
-                vector_dim = len(embedding)
                 fields = [
                     FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
                     FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=CONTENT_MAX_LENGTH),
@@ -535,40 +552,43 @@ class VectorStoreService:
                     FieldSchema(name="published_date", dtype=DataType.VARCHAR, max_length=50),
                     FieldSchema(name="url", dtype=DataType.VARCHAR, max_length=500),
                     FieldSchema(name="embedding_model", dtype=DataType.VARCHAR, max_length=100),
-                    FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=vector_dim)
+                    FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=vector_dim),
                 ]
                 schema = CollectionSchema(fields=fields, description=f"arXiv paper abstract embeddings collection")
                 collection = Collection(name=resolved_name, schema=schema)
-                
+
                 index_params = {
                     "metric_type": "COSINE",
                     "index_type": "FLAT",
                     "params": {}
                 }
                 collection.create_index(field_name="vector", index_params=index_params)
-            
-            entity = {
-                "content": str(metadata.get("content", "")),
-                "arxiv_id": str(metadata.get("arxiv_id", "")),
-                "title": str(metadata.get("title", "")),
-                "authors": str(metadata.get("authors", "")),
-                "categories": str(metadata.get("categories", "")),
-                "published_date": str(metadata.get("published_date", "")),
-                "url": str(metadata.get("url", "")),
-                "embedding_model": str(metadata.get("embedding_model", "")),
-                "vector": [float(x) for x in embedding]
-            }
-            self._validate_varchar_lengths([entity], collection.schema.fields)
+
+            entities = []
+            for embedding, metadata in zip(embeddings, [item.get("metadata", {}) for item in items]):
+                entity = {
+                    "content": str(metadata.get("content", "")),
+                    "arxiv_id": str(metadata.get("arxiv_id", "")),
+                    "title": str(metadata.get("title", "")),
+                    "authors": str(metadata.get("authors", "")),
+                    "categories": str(metadata.get("categories", "")),
+                    "published_date": str(metadata.get("published_date", "")),
+                    "url": str(metadata.get("url", "")),
+                    "embedding_model": str(metadata.get("embedding_model", "")),
+                    "vector": [float(x) for x in embedding],
+                }
+                entities.append(entity)
+
+            self._validate_varchar_lengths(entities, collection.schema.fields)
             insertable_fields = [field.name for field in collection.schema.fields if not getattr(field, "auto_id", False)]
-            insert_columns = [[entity.get(field_name)] for field_name in insertable_fields]
+            insert_columns = [[entity.get(field_name) for entity in entities] for field_name in insertable_fields]
             insert_result = collection.insert(insert_columns)
             collection.flush()
             collection.load()
-            
-            return insert_result.primary_keys[0]
-            
+
+            return [int(primary_key) for primary_key in insert_result.primary_keys]
         except Exception as e:
-            logger.error(f"Error inserting single embedding: {str(e)}")
+            logger.error(f"Error inserting embeddings batch: {str(e)}")
             raise
         finally:
             connections.disconnect("default")

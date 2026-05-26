@@ -14,6 +14,7 @@ from services.parsing_service import ParsingService
 from services.arxiv_search_service import ArxivSearchService
 from services.local_arxiv_service import LocalArxivService
 from services.database_service import DatabaseService
+from services.arxiv_oai_service import ArxivOaiDatabaseService
 from services.recommendation_service import RecommendationService
 from services.enhanced_retrieval_service import EnhancedRetrievalService, RetrievalOptions
 import logging
@@ -69,6 +70,7 @@ ARXIV_PROXY_URL = CORE_CONFIG.get("arxiv_proxy_url", "")
 
 # 初始化服务
 db_service = DatabaseService()
+oai_db_service = ArxivOaiDatabaseService()
 embedding_service = EmbeddingService()
 vector_store_service = VectorStoreService()
 generation_service = GenerationService()
@@ -92,6 +94,7 @@ recommendation_service = RecommendationService(
     vector_store_service=vector_store_service,
     get_embedding_config=get_current_embedding_config,
     arxiv_service_factory=lambda: get_arxiv_service(),
+    oai_db_service=oai_db_service,
 )
 
 
@@ -630,7 +633,7 @@ async def add_paper(
             embedding_config.provider,
             embedding_config.model_name,
         )
-        text_to_embed = f"{title}\n\n摘要：{abstract}"
+        text_to_embed = embedding_service.build_paper_embedding_text(title, abstract)
         embedding = embedding_service.create_single_embedding(
             text_to_embed,
             provider=embedding_config.provider,
@@ -697,8 +700,12 @@ async def get_paper(arxiv_id: str):
         paper = db_service.get_paper(arxiv_id)
         if paper:
             return paper
-        else:
-            raise HTTPException(status_code=404, detail="Paper not found")
+        source_paper = recommendation_service._fetch_paper_from_arxiv_with_rate_limit(arxiv_id)
+        if source_paper:
+            return recommendation_service._materialize_paper_from_source(source_paper, arxiv_id)
+        raise HTTPException(status_code=404, detail="Paper not found")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting paper: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
