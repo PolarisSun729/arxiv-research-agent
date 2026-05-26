@@ -38,6 +38,10 @@ ALIYUN_API_KEY = _env_str("ALIYUN_API_KEY", "<REMOVED_API_KEY>")
 
 CORE_CONFIG: Dict[str, Any] = {
     "arxiv_data_source": _env_str("ARXIV_DATA_SOURCE", "api"),
+    "arxiv_proxy_url": _env_str(
+        "ARXIV_PROXY_URL",
+        "http://127.0.0.1:7897",
+    ),
     "arxiv_local_path": _env_str(
         "ARXIV_LOCAL_PATH",
         str(REPO_ROOT / "07-local-arxiv" / "arxiv-2026-04-papers.json"),

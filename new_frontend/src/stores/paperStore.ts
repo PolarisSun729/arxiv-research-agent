@@ -39,6 +39,33 @@ export const usePaperStore = defineStore('paper', () => {
   const interestVectorGenerating = ref(false)
   const lastInterestVector = ref<InterestVector | null>(null)
 
+  function toStringArray(value: any): string[] {
+    if (Array.isArray(value)) {
+      return value.map((item: any) => String(item).trim()).filter((item: string) => item)
+    }
+    if (!value) return []
+    return String(value)
+      .replace(/[\[\]\(\)]/g, '')
+      .split(/[,;]/)
+      .map((item: string) => item.trim())
+      .filter((item: string) => item)
+  }
+
+  function buildRecommendationReason(item: any): string {
+    const breakdown = item?.score_breakdown || item?.scoreBreakdown || {}
+    const parts: string[] = []
+    if (typeof breakdown.semantic_score === 'number' && breakdown.semantic_score > 0) {
+      parts.push(`语义相似 ${Math.round(breakdown.semantic_score * 100)}%`)
+    }
+    if (typeof breakdown.category_score === 'number' && breakdown.category_score > 0) {
+      parts.push(`分类匹配 ${Math.round(breakdown.category_score * 100)}%`)
+    }
+    if (typeof breakdown.recency_score === 'number' && breakdown.recency_score > 0) {
+      parts.push(`较新论文 ${Math.round(breakdown.recency_score * 100)}%`)
+    }
+    return parts.length ? parts.join(' · ') : '基于用户兴趣画像生成'
+  }
+
   function applyPreferenceLabels(targetPapers: Paper[], likedIds: string[], dislikedIds: string[]) {
     targetPapers.forEach(paper => {
       const arxivId = paper.arxivId || paper.id
@@ -208,22 +235,27 @@ export const usePaperStore = defineStore('paper', () => {
 
   const recommendationsGenerating = ref(false)
 
-  async function generateRecommendations(topN: number = 10): Promise<RecommendationResult> {
+  async function generateRecommendations(topN: number = 10, maxAgeMonths: number = 6): Promise<RecommendationResult> {
     recommendationsGenerating.value = true
     try {
-      const result = await recommendPapers(topN)
+      const result = await recommendPapers(topN, maxAgeMonths)
       if (result.status === 'success') {
         recommendations.value = result.recommendations.map((p: any) => ({
           id: p.arxiv_id,
           arxivId: p.arxiv_id,
           title: p.title,
-          authors: Array.isArray(p.authors) ? p.authors : (p.authors ? p.authors.split(',').map((a: string) => a.trim()).filter((a: string) => a) : []),
+          authors: toStringArray(p.authors),
           summary: p.abstract,
           publishedAt: p.published_date,
-          categories: Array.isArray(p.categories) ? p.categories : (p.categories ? p.categories.split(',').map((c: string) => c.trim()).filter((c: string) => c) : []),
+          categories: toStringArray(p.categories),
           pdfUrl: p.url,
           absUrl: p.url,
-          similarityScore: typeof p.similarity === 'number' ? p.similarity : (p.similarityScore || 0),
+          similarityScore: typeof p.similarity_score === 'number'
+            ? p.similarity_score
+            : (typeof p.similarityScore === 'number' ? p.similarityScore : (typeof p.score === 'number' ? p.score : 0)),
+          finalScore: typeof p.final_score === 'number' ? p.final_score : undefined,
+          reason: buildRecommendationReason(p),
+          scoreBreakdown: p.score_breakdown || p.scoreBreakdown || undefined,
           label: null
         }))
         totalRecommendations.value = result.total_found

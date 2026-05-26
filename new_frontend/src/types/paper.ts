@@ -12,14 +12,41 @@ export interface Paper {
   label?: 'liked' | 'disliked' | null
 }
 
+export interface RecommendationScoreBreakdown {
+  semantic_score: number
+  category_score: number
+  recency_score: number
+  diversity_score: number
+}
+
 export interface RecommendedPaper extends Paper {
   similarityScore: number
+  finalScore?: number
   reason?: string
+  scoreBreakdown?: RecommendationScoreBreakdown
 }
 
 export interface LabeledPaper extends Paper {
   label: 'liked' | 'disliked'
   labeledAt: string
+}
+
+export interface PaperMaterializationPayload {
+  arxiv_id: string
+  title: string
+  authors: string[]
+  abstract: string
+  categories: string[]
+  published_date: string
+  url: string
+  abs_url?: string
+  pdf_url?: string
+  publishedAt?: string
+}
+
+export interface PaperPreferenceRequest {
+  arxiv_id: string
+  paper: PaperMaterializationPayload
 }
 
 export interface SearchParams {

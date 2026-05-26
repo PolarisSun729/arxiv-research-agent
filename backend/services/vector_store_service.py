@@ -1,5 +1,6 @@
 ﻿import os
 import warnings
+import ast
 from datetime import datetime
 import json
 import re
@@ -667,6 +668,133 @@ class VectorStoreService:
         finally:
             connections.disconnect("default")
 
+    def search_similar_papers(
+        self,
+        collection_name: str,
+        query_vector: List[float],
+        top_k: int = 10,
+        filter_arxiv_ids: List[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        检索论文级向量，并返回论文展示所需的顶层字段。
+        这个方法专门用于 arxiv_paper_embeddings 这类论文集合，不沿用 chunk 级 payload。
+        """
+        try:
+            connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
+            resolved_name = self.resolve_collection_name(collection_name)
+
+            if not utility.has_collection(resolved_name):
+                logger.warning(f"Collection {collection_name} does not exist")
+                return []
+
+            collection = Collection(resolved_name)
+            collection.load()
+
+            field_names = {field.name for field in collection.schema.fields}
+            candidate_fields = [
+                "arxiv_id",
+                "title",
+                "authors",
+                "abstract",
+                "categories",
+                "published_date",
+                "url",
+                "embedding_model",
+                "content",
+            ]
+            output_fields = [field for field in candidate_fields if field in field_names]
+
+            expr = None
+            if filter_arxiv_ids and "arxiv_id" in field_names:
+                quoted_ids = ", ".join(f'"{arxiv_id}"' for arxiv_id in filter_arxiv_ids if arxiv_id)
+                if quoted_ids:
+                    expr = f"arxiv_id not in [{quoted_ids}]"
+
+            results = collection.search(
+                data=[query_vector],
+                anns_field="vector",
+                param={"metric_type": "COSINE", "params": {}},
+                limit=top_k,
+                expr=expr,
+                output_fields=output_fields,
+            )
+
+            return [
+                self._build_paper_payload(
+                    entity=hit.entity,
+                    score=float(hit.score),
+                    distance=float(hit.distance) if hasattr(hit, "distance") else None,
+                )
+                for hit in results[0]
+            ]
+
+        except Exception as e:
+            logger.error(f"Error searching similar papers: {str(e)}")
+            raise
+        finally:
+            connections.disconnect("default")
+
+    def get_paper_embeddings_by_arxiv_ids(
+        self,
+        collection_name: str,
+        arxiv_ids: List[str],
+    ) -> List[Dict[str, Any]]:
+        """
+        按 arxiv_id 批量读取论文级向量和元数据。
+        主要用于复用已经写入 Milvus 的论文 embedding，避免重复重算。
+        """
+        try:
+            normalized_ids = [str(arxiv_id).strip() for arxiv_id in arxiv_ids if str(arxiv_id).strip()]
+            if not normalized_ids:
+                return []
+
+            connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
+            resolved_name = self.resolve_collection_name(collection_name)
+
+            if not utility.has_collection(resolved_name):
+                logger.warning(f"Collection {collection_name} does not exist")
+                return []
+
+            collection = Collection(resolved_name)
+            collection.load()
+
+            field_names = {field.name for field in collection.schema.fields}
+            if "arxiv_id" not in field_names or "vector" not in field_names:
+                logger.warning(
+                    "Collection %s does not expose required fields arxiv_id/vector",
+                    resolved_name,
+                )
+                return []
+
+            quoted_ids = ", ".join(f'"{arxiv_id}"' for arxiv_id in normalized_ids)
+            expr = f"arxiv_id in [{quoted_ids}]"
+
+            candidate_fields = [
+                "id",
+                "arxiv_id",
+                "title",
+                "authors",
+                "categories",
+                "published_date",
+                "url",
+                "embedding_model",
+                "vector",
+            ]
+            output_fields = [field for field in candidate_fields if field in field_names]
+
+            results = collection.query(
+                expr=expr,
+                output_fields=output_fields,
+                limit=len(normalized_ids),
+            )
+
+            return [self._build_paper_embedding_payload(entity=row) for row in results]
+        except Exception as e:
+            logger.error(f"Error reading paper embeddings by arxiv ids: {str(e)}")
+            raise
+        finally:
+            connections.disconnect("default")
+
     def get_all_chunks(self, collection_name: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         try:
             connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
@@ -882,3 +1010,88 @@ class VectorStoreService:
             "metadata": metadata,
         }
         return payload
+
+    def _build_paper_payload(self, entity: Any, score: Optional[float], distance: Optional[float]) -> Dict[str, Any]:
+        if entity is None:
+            return {
+                "arxiv_id": "",
+                "title": "",
+                "authors": [],
+                "abstract": "",
+                "categories": [],
+                "published_date": "",
+                "url": "",
+                "similarity_score": score,
+                "score": score,
+                "distance": distance,
+                "metadata": {},
+            }
+
+        reader = entity if isinstance(entity, dict) else None
+        getter = (lambda key, default=None: reader.get(key, default)) if reader is not None else (lambda key, default=None: getattr(entity, key, default))
+
+        authors_raw = getter("authors", "") or ""
+        categories_raw = getter("categories", "") or ""
+        abstract = getter("abstract", "") or getter("content", "") or ""
+        published_date = getter("published_date", "") or ""
+
+        def _split_values(value: Any) -> List[str]:
+            if isinstance(value, list):
+                return [str(item).strip() for item in value if str(item).strip()]
+            if not value:
+                return []
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped.startswith("[") or stripped.startswith("("):
+                    try:
+                        parsed = ast.literal_eval(stripped)
+                        if isinstance(parsed, (list, tuple)):
+                            return [str(item).strip() for item in parsed if str(item).strip()]
+                    except (ValueError, SyntaxError):
+                        pass
+            normalized = str(value).replace(";", ",").replace("|", ",")
+            parts = []
+            for token in normalized.replace("\n", " ").split():
+                if "," in token:
+                    parts.extend(token.split(","))
+                else:
+                    parts.append(token)
+            parts = [part.strip() for part in parts]
+            return [part for part in parts if part]
+
+        payload = {
+            "arxiv_id": str(getter("arxiv_id", "") or ""),
+            "title": str(getter("title", "") or ""),
+            "authors": _split_values(authors_raw),
+            "abstract": str(abstract),
+            "categories": _split_values(categories_raw),
+            "published_date": str(published_date),
+            "url": str(getter("url", "") or ""),
+            "similarity_score": score,
+            "score": score,
+            "distance": distance,
+            "metadata": {
+                "embedding_model": str(getter("embedding_model", "") or ""),
+            },
+        }
+        return payload
+
+    def _build_paper_embedding_payload(self, entity: Any) -> Dict[str, Any]:
+        reader = entity if isinstance(entity, dict) else None
+        getter = (lambda key, default=None: reader.get(key, default)) if reader is not None else (lambda key, default=None: getattr(entity, key, default))
+
+        vector_value = getter("vector", []) or []
+        if vector_value and isinstance(vector_value[0], (list, tuple)):
+            vector_value = vector_value[0]
+
+        return {
+            "embedding_id": int(getter("id", 0) or 0),
+            "arxiv_id": str(getter("arxiv_id", "") or ""),
+            "title": str(getter("title", "") or ""),
+            "authors": getter("authors", []) or [],
+            "categories": getter("categories", []) or [],
+            "published_date": str(getter("published_date", "") or ""),
+            "url": str(getter("url", "") or ""),
+            "embedding_model": str(getter("embedding_model", "") or ""),
+            "vector": [float(value) for value in vector_value] if vector_value else [],
+        }

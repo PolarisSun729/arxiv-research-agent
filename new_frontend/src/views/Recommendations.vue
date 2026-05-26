@@ -1,14 +1,23 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { usePaperStore } from '@/stores/paperStore'
 import PaperCard from '@/components/PaperCard.vue'
+import SimilarityTag from '@/components/SimilarityTag.vue'
 
 const router = useRouter()
 const store = usePaperStore()
 
 const recommendationCount = ref(10)
+const recommendationAgeMonths = ref(6)
+const topRecommendation = computed(() => store.recommendations[0] || null)
+const topBreakdown = computed(() => topRecommendation.value?.scoreBreakdown || null)
+const topFinalScore = computed(() => {
+  const paper = topRecommendation.value
+  if (!paper) return 0
+  return typeof paper.finalScore === 'number' ? paper.finalScore : paper.similarityScore || 0
+})
 
 const countOptions = [
   { value: 5, label: '5篇' },
@@ -17,10 +26,16 @@ const countOptions = [
   { value: 50, label: '50篇' }
 ]
 
+const ageOptions = [
+  { value: 3, label: '最近3个月' },
+  { value: 6, label: '最近6个月' },
+  { value: 12, label: '最近12个月' }
+]
+
 async function handleGenerateRecommendations() {
   try {
-    await store.generateRecommendations(recommendationCount.value)
-    ElMessage.success(`已生成 ${recommendationCount.value} 篇推荐论文`)
+    await store.generateRecommendations(recommendationCount.value, recommendationAgeMonths.value)
+    ElMessage.success(`已生成 ${recommendationCount.value} 篇最近${recommendationAgeMonths.value}个月内的 CS.AI 推荐论文`)
   } catch (error: any) {
     if (error?.response?.data?.detail) {
       ElMessage.error(error.response.data.detail)
@@ -32,6 +47,11 @@ async function handleGenerateRecommendations() {
 
 function handleViewDetail(id: string) {
   router.push(`/paper/${id}`)
+}
+
+function toPercent(value?: number) {
+  if (typeof value !== 'number' || Number.isNaN(value)) return 0
+  return Math.max(0, Math.min(100, Math.round(value * 100)))
 }
 
 async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
@@ -54,7 +74,7 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
       <div>
         <h1>推荐论文</h1>
         <p class="description">
-          根据你已经标记过的论文，系统会生成一批相似度较高的推荐结果。
+          根据你已经标记过的论文，系统会从 CS.AI 论文中生成一批相似度较高的推荐结果。
         </p>
       </div>
 
@@ -71,6 +91,18 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
             :label="option.label"
           />
         </el-select>
+        <el-select
+          v-model="recommendationAgeMonths"
+          placeholder="时间范围"
+          style="width: 140px; margin-right: 12px"
+        >
+          <el-option
+            v-for="option in ageOptions"
+            :key="option.value"
+            :value="option.value"
+            :label="option.label"
+          />
+        </el-select>
         <el-button
           type="primary"
           :loading="store.recommendationsGenerating"
@@ -78,6 +110,51 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
         >
           生成推荐
         </el-button>
+      </div>
+    </div>
+
+    <div v-if="store.recommendations.length > 0" class="summary-panel">
+      <div class="summary-panel__lead">
+        <div class="summary-copy-wrap">
+          <div class="summary-kicker">为什么推荐这篇</div>
+          <h2 class="summary-title">{{ topRecommendation?.title }}</h2>
+          <p class="summary-copy">
+            这篇 CS.AI 论文在语义相似度、主题匹配上更符合你当前的兴趣画像，且限定在最近 {{ recommendationAgeMonths }} 个月内。
+          </p>
+        </div>
+
+        <div class="summary-score">
+          <SimilarityTag :score="topRecommendation?.similarityScore || 0" />
+          <div class="summary-score__value">最终 {{ Math.round(topFinalScore * 100) }}%</div>
+        </div>
+      </div>
+
+      <div v-if="topBreakdown" class="summary-breakdown">
+        <div class="breakdown-row">
+          <div class="breakdown-meta">
+            <span>语义相似</span>
+            <strong>{{ toPercent(topBreakdown.semantic_score) }}%</strong>
+          </div>
+          <el-progress :percentage="toPercent(topBreakdown.semantic_score)" :show-text="false" />
+        </div>
+        <div class="breakdown-row">
+          <div class="breakdown-meta">
+            <span>分类匹配</span>
+            <strong>{{ toPercent(topBreakdown.category_score) }}%</strong>
+          </div>
+          <el-progress :percentage="toPercent(topBreakdown.category_score)" :show-text="false" color="#8b5cf6" />
+        </div>
+        <div class="breakdown-row">
+          <div class="breakdown-meta">
+            <span>新鲜度</span>
+            <strong>{{ toPercent(topBreakdown.recency_score) }}%</strong>
+          </div>
+          <el-progress :percentage="toPercent(topBreakdown.recency_score)" :show-text="false" color="#0ea5e9" />
+        </div>
+      </div>
+
+      <div v-if="topRecommendation?.reason" class="summary-reason">
+        {{ topRecommendation.reason }}
       </div>
     </div>
 
@@ -90,7 +167,7 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
     </div>
 
     <div v-else class="recommendations-list">
-      <div class="sort-info">按相似度排序</div>
+      <div class="sort-info">按相似度排序，候选范围仅限 CS.AI</div>
       <div class="paper-grid">
         <PaperCard
           v-for="paper in store.recommendations"
@@ -135,6 +212,97 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
   align-items: center;
 }
 
+.summary-panel {
+  margin-bottom: 24px;
+  padding: 20px;
+  border-radius: 18px;
+  background:
+    linear-gradient(135deg, rgba(15, 23, 42, 0.96), rgba(30, 41, 59, 0.92)),
+    radial-gradient(circle at top right, rgba(56, 189, 248, 0.18), transparent 38%),
+    radial-gradient(circle at bottom left, rgba(16, 185, 129, 0.14), transparent 34%);
+  color: #f8fafc;
+  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.18);
+}
+
+.summary-panel__lead {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+  align-items: flex-start;
+}
+
+.summary-copy-wrap {
+  min-width: 0;
+}
+
+.summary-kicker {
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #7dd3fc;
+  margin-bottom: 8px;
+}
+
+.summary-title {
+  margin: 0;
+  font-size: 22px;
+  line-height: 1.35;
+  color: #fff;
+}
+
+.summary-copy {
+  margin: 10px 0 0;
+  max-width: 760px;
+  color: rgba(226, 232, 240, 0.88);
+  line-height: 1.65;
+}
+
+.summary-score {
+  min-width: 180px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-end;
+}
+
+.summary-score__value {
+  font-size: 18px;
+  font-weight: 700;
+  color: #fff;
+}
+
+.summary-breakdown {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 18px;
+  margin-top: 18px;
+}
+
+.breakdown-row {
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.34);
+  border: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.breakdown-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 13px;
+  color: rgba(226, 232, 240, 0.88);
+}
+
+.summary-reason {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(148, 163, 184, 0.16);
+  color: #e2e8f0;
+  line-height: 1.65;
+  font-size: 14px;
+}
+
 .loading {
   padding: 24px 0;
 }
@@ -159,6 +327,18 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
   .page-header {
     flex-direction: column;
     gap: 16px;
+  }
+
+  .summary-panel__lead {
+    flex-direction: column;
+  }
+
+  .summary-score {
+    align-items: flex-start;
+  }
+
+  .summary-breakdown {
+    grid-template-columns: 1fr;
   }
 
   .paper-grid {

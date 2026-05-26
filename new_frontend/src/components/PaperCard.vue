@@ -29,6 +29,22 @@ const recommendationReason = computed(() => {
   return isRecommended(props.paper) ? props.paper.reason || '' : ''
 })
 
+const recommendationScoreBreakdown = computed(() => {
+  return isRecommended(props.paper) ? props.paper.scoreBreakdown || null : null
+})
+
+const finalScoreText = computed(() => {
+  if (!isRecommended(props.paper) || typeof props.paper.finalScore !== 'number') {
+    return ''
+  }
+  return `${Math.round(props.paper.finalScore * 100)}%`
+})
+
+function toPercent(value?: number) {
+  if (typeof value !== 'number' || Number.isNaN(value)) return 0
+  return Math.max(0, Math.min(100, Math.round(value * 100)))
+}
+
 const authorsDisplay = computed(() => {
   if (Array.isArray(props.paper.authors)) {
     return props.paper.authors.join(', ')
@@ -124,9 +140,33 @@ const labelOptions = [
     <div v-if="isRecommendation || isRecommended(paper)" class="paper-similarity">
       <span class="similarity-label">相似度：</span>
       <SimilarityTag :score="(paper as any).similarityScore || (paper as any).similarity || 0" />
+      <span v-if="finalScoreText" class="final-score-label">最终 {{ finalScoreText }}</span>
       <p v-if="recommendationReason" class="recommendation-reason">
         {{ recommendationReason }}
       </p>
+      <div v-if="recommendationScoreBreakdown" class="score-breakdown">
+        <div class="score-breakdown-row">
+          <div class="score-breakdown-meta">
+            <span class="breakdown-label">语义</span>
+            <strong>{{ toPercent(recommendationScoreBreakdown.semantic_score) }}%</strong>
+          </div>
+          <el-progress :percentage="toPercent(recommendationScoreBreakdown.semantic_score)" :show-text="false" />
+        </div>
+        <div class="score-breakdown-row">
+          <div class="score-breakdown-meta">
+            <span class="breakdown-label">分类</span>
+            <strong>{{ toPercent(recommendationScoreBreakdown.category_score) }}%</strong>
+          </div>
+          <el-progress :percentage="toPercent(recommendationScoreBreakdown.category_score)" :show-text="false" color="#8b5cf6" />
+        </div>
+        <div class="score-breakdown-row">
+          <div class="score-breakdown-meta">
+            <span class="breakdown-label">新鲜度</span>
+            <strong>{{ toPercent(recommendationScoreBreakdown.recency_score) }}%</strong>
+          </div>
+          <el-progress :percentage="toPercent(recommendationScoreBreakdown.recency_score)" :show-text="false" color="#0ea5e9" />
+        </div>
+      </div>
     </div>
 
     <div class="paper-actions">
@@ -261,6 +301,14 @@ const labelOptions = [
   border-radius: 8px;
 }
 
+.final-score-label {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: 12px;
+  color: #111827;
+  font-weight: 600;
+}
+
 .similarity-label {
   font-size: 13px;
   color: #6b7280;
@@ -272,6 +320,33 @@ const labelOptions = [
   color: #059669;
   margin: 8px 0 0 0;
   font-style: italic;
+}
+
+.score-breakdown {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.breakdown-label {
+  font-weight: 600;
+  color: #374151;
+}
+
+.score-breakdown-row {
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.65);
+  border-radius: 12px;
+}
+
+.score-breakdown-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: #4b5563;
 }
 
 .paper-actions {

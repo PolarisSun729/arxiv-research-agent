@@ -3,55 +3,81 @@ import { ref, onMounted, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { usePaperStore } from '@/stores/paperStore';
 import { ElMessage } from 'element-plus';
+
 const router = useRouter();
 const store = usePaperStore();
+
 const filterLabel = ref<string>('');
 const currentPage = ref(1);
 const pageSize = ref(10);
+
 const filterOptions = [
- { value: '', label: '全部' },
- { value: 'liked', label: '喜欢' },
- { value: 'disliked', label: '不喜欢' }
+  { value: '', label: '全部' },
+  { value: 'liked', label: '喜欢' },
+  { value: 'disliked', label: '不喜欢' }
 ];
+
 onMounted(() => {
- fetchLabeledPapers();
+  fetchLabeledPapers();
 });
+
 watch([filterLabel, currentPage], () => {
- fetchLabeledPapers();
+  fetchLabeledPapers();
 });
+
 async function fetchLabeledPapers() {
- await store.fetchLabeledPapers({
-  label: filterLabel.value ? filterLabel.value as 'liked' | 'disliked' : undefined,
-  page: currentPage.value,
-  pageSize: pageSize.value
- });
+  await store.fetchLabeledPapers({
+    label: filterLabel.value ? (filterLabel.value as 'liked' | 'disliked') : undefined,
+    page: currentPage.value,
+    pageSize: pageSize.value
+  });
 }
+
 function handleViewDetail(id: string) {
- router.push(`/paper/${id}`);
+  router.push(`/paper/${id}`);
 }
+
 function handlePageChange(page: number) {
- currentPage.value = page;
+  currentPage.value = page;
 }
+
 function formatDate(dateStr: string) {
- return new Date(dateStr).toLocaleString('zh-CN');
+  return new Date(dateStr).toLocaleString('zh-CN');
 }
+
 function getLabelClass(label: string) {
- return label === 'liked' ? 'el-tag--success' : 'el-tag--danger';
+  return label === 'liked' ? 'el-tag--success' : 'el-tag--danger';
 }
+
 function getLabelText(label: string) {
- return label === 'liked' ? '喜欢' : '不喜欢';
+  return label === 'liked' ? '喜欢' : '不喜欢';
 }
+
 async function handleGenerateInterestVector() {
- try {
-  const result = await store.generateUserInterestVector();
-  ElMessage.success(`用户兴趣向量生成成功！使用了 ${result.paper_count} 篇论文，生成 ${result.vector_dimension} 维向量`);
- } catch (error: any) {
-  if (error?.response?.data?.detail) {
-   ElMessage.error(error.response.data.detail);
-  } else {
-   ElMessage.error('生成用户兴趣向量失败');
+  try {
+    const result = await store.generateUserInterestVector();
+    const milvusUsedCount = result.milvus_used_count ?? 0;
+    const fallbackUsedCount = result.fallback_used_count ?? 0;
+    const unresolvedCount = result.unresolved_count ?? 0;
+    const totalUsedCount = result.used_count ?? result.paper_count ?? (milvusUsedCount + fallbackUsedCount);
+    const parts = [
+      `使用了 ${milvusUsedCount} 条已存 Milvus 向量`,
+      fallbackUsedCount > 0 ? `并对 ${fallbackUsedCount} 条缺失向量做了 fallback 重算` : ''
+    ].filter(Boolean);
+    const warning = unresolvedCount > 0
+      ? `，另有 ${unresolvedCount} 条论文仍缺少可用向量`
+      : '';
+
+    ElMessage.success(
+      `用户兴趣向量生成成功！${parts.join('，')}，共计 ${totalUsedCount} 条，生成 ${result.vector_dimension} 维向量${warning}`
+    );
+  } catch (error: any) {
+    if (error?.response?.data?.detail) {
+      ElMessage.error(error.response.data.detail);
+    } else {
+      ElMessage.error('生成用户兴趣向量失败');
+    }
   }
- }
 }
 </script>
 
@@ -69,7 +95,7 @@ async function handleGenerateInterestVector() {
           :disabled="store.labeledPapers.length === 0"
           @click="handleGenerateInterestVector"
         >
-          生成用户兴趣向量
+          生成用户偏好向量
         </el-button>
       </div>
     </div>
@@ -111,9 +137,9 @@ async function handleGenerateInterestVector() {
             {{ getLabelText(paper.label) }}
           </el-tag>
         </div>
-        
+
         <p class="paper-summary">{{ paper.summary.slice(0, 100) }}...</p>
-        
+
         <div class="card-footer">
           <span class="labeled-time">标记时间：{{ formatDate(paper.labeledAt) }}</span>
           <el-button size="small" type="primary" @click="handleViewDetail(paper.id)">

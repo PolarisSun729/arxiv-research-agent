@@ -1,5 +1,15 @@
 import request from './request'
-import type { Paper, RecommendedPaper, LabeledPaper, SearchParams, LabelParams, PaginatedResponse, ArxivSearchParams } from '@/types/paper'
+import type {
+  Paper,
+  RecommendedPaper,
+  LabeledPaper,
+  SearchParams,
+  LabelParams,
+  PaginatedResponse,
+  ArxivSearchParams,
+  PaperMaterializationPayload,
+  PaperPreferenceRequest
+} from '@/types/paper'
 import { mockPapers, mockRecommendedPapers, mockLabeledPapers, mockStats } from '@/mock/papers'
 
 const isMockMode = false
@@ -42,28 +52,38 @@ export async function getUserPreferences(): Promise<{
   }
 }
 
-export async function savePaperMetadata(paper: Paper): Promise<void> {
-  await request.post('/paper', {
-    arxiv_id: getPaperArxivId(paper),
+function buildPaperMaterializationPayload(paper: Paper): PaperMaterializationPayload {
+  const arxivId = getPaperArxivId(paper)
+  return {
+    arxiv_id: arxivId,
     title: paper.title,
-    authors: paper.authors.join(', '),
+    authors: paper.authors,
     abstract: paper.summary,
-    categories: paper.categories.join(', '),
+    categories: paper.categories,
     published_date: paper.publishedAt,
-    url: paper.absUrl || paper.pdfUrl
-  })
+    url: paper.absUrl || paper.pdfUrl,
+    abs_url: paper.absUrl,
+    pdf_url: paper.pdfUrl,
+    publishedAt: paper.publishedAt
+  }
 }
 
 export async function likePaper(paper: Paper): Promise<void> {
   const arxivId = getPaperArxivId(paper)
-  await savePaperMetadata(paper)
-  await request.post('/user/like-paper', { arxiv_id: arxivId })
+  const payload: PaperPreferenceRequest = {
+    arxiv_id: arxivId,
+    paper: buildPaperMaterializationPayload(paper)
+  }
+  await request.post('/user/like-paper', payload)
 }
 
 export async function dislikePaper(paper: Paper): Promise<void> {
   const arxivId = getPaperArxivId(paper)
-  await savePaperMetadata(paper)
-  await request.post('/user/dislike-paper', { arxiv_id: arxivId })
+  const payload: PaperPreferenceRequest = {
+    arxiv_id: arxivId,
+    paper: buildPaperMaterializationPayload(paper)
+  }
+  await request.post('/user/dislike-paper', payload)
 }
 
 export async function removePaperPreference(paper: Paper, label: LabelParams['label']): Promise<void> {
@@ -230,6 +250,18 @@ export interface InterestVectorResult {
   status: string
   message: string
   paper_count: number
+  used_count?: number
+  milvus_used_count?: number
+  fallback_used_count?: number
+  unresolved_count?: number
+  liked_count?: number
+  disliked_count?: number
+  liked_milvus_count?: number
+  disliked_milvus_count?: number
+  liked_fallback_count?: number
+  disliked_fallback_count?: number
+  liked_unresolved_count?: number
+  disliked_unresolved_count?: number
   vector_dimension: number
   embedding_model: string
 }
@@ -256,11 +288,11 @@ export interface RecommendationResult {
   status: string
   message: string
   total_found: number
-  recommendations: Paper[]
+  recommendations: RecommendedPaper[]
 }
 
-export async function recommendPapers(topN: number = 10): Promise<RecommendationResult> {
-  return request.post('/user/recommend-papers', { top_n: topN })
+export async function recommendPapers(topN: number = 10, maxAgeMonths: number = 6): Promise<RecommendationResult> {
+  return request.post('/user/recommend-papers', { top_n: topN, max_age_months: maxAgeMonths })
 }
 
 export interface QaStatusResult {

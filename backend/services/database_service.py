@@ -287,6 +287,30 @@ class DatabaseService:
                 'disliked_papers': []
             }
 
+    def get_latest_user_preference_timestamp(self, user_id: str = DEFAULT_USER_ID) -> Optional[str]:
+        """
+        返回该用户最新一次偏好的创建时间。
+        用于判断兴趣向量是否已经过期。
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT MAX(latest_at) FROM (
+                        SELECT created_at AS latest_at FROM user_liked_papers WHERE user_id = ?
+                        UNION ALL
+                        SELECT created_at AS latest_at FROM user_disliked_papers WHERE user_id = ?
+                    )
+                    ''',
+                    (user_id, user_id),
+                )
+                row = cursor.fetchone()
+                return row[0] if row and row[0] else None
+        except Exception as e:
+            logger.error(f"Error getting latest preference timestamp: {str(e)}")
+            return None
+
     def add_paper(self, paper: Dict[str, Any]) -> bool:
         try:
             with self._get_connection() as conn:

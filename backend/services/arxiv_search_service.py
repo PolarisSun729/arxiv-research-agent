@@ -60,17 +60,38 @@ class ArxivSearchService:
     RATE_LIMIT_SECONDS = 15
     _last_request_time = 0
     
-    def __init__(self):
+    def __init__(self, proxy_url: Optional[str] = None):
         """
         初始化arXiv搜索服务
         设置API端点和保存目录
         """
-        self.api_base_url = "http://export.arxiv.org/api/query"
+        self.api_base_url = "https://export.arxiv.org/api/query"
         self.papers_dir = "06-daily-arxiv-paper"
         os.makedirs(self.papers_dir, exist_ok=True)
         
         self.session = requests.Session()
         self.session.headers.update(self.DEFAULT_HEADERS)
+        self._configure_proxy(proxy_url)
+
+    def _configure_proxy(self, proxy_url: Optional[str] = None) -> None:
+        resolved_proxy = (
+            proxy_url
+            or os.getenv("ARXIV_PROXY_URL")
+            or os.getenv("HTTPS_PROXY")
+            or os.getenv("HTTP_PROXY")
+            or os.getenv("https_proxy")
+            or os.getenv("http_proxy")
+            or ""
+        ).strip()
+        if not resolved_proxy:
+            return
+
+        self.session.proxies.update({
+            "http": resolved_proxy,
+            "https": resolved_proxy,
+        })
+        self.proxy_url = resolved_proxy
+        logger.info("Configured arXiv proxy: %s", resolved_proxy)
     
     def _get_random_user_agent(self) -> str:
         """
@@ -236,6 +257,12 @@ class ArxivSearchService:
             requests.exceptions.RequestException: 其他请求错误
         """
         self._wait_for_rate_limit()
+        logger.debug(
+            "arXiv request prepared: url=%s, proxy_http=%s, proxy_https=%s",
+            url,
+            self.session.proxies.get("http", ""),
+            self.session.proxies.get("https", ""),
+        )
         
         @retry(
             stop=stop_after_attempt(5),

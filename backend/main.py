@@ -14,6 +14,7 @@ from services.parsing_service import ParsingService
 from services.arxiv_search_service import ArxivSearchService
 from services.local_arxiv_service import LocalArxivService
 from services.database_service import DatabaseService
+from services.recommendation_service import RecommendationService
 from services.enhanced_retrieval_service import EnhancedRetrievalService, RetrievalOptions
 import logging
 from enum import Enum
@@ -64,6 +65,7 @@ app.add_middleware(
 # 数据源配置
 DATA_SOURCE = CORE_CONFIG["arxiv_data_source"]
 LOCAL_DATA_PATH = CORE_CONFIG["arxiv_local_path"]
+ARXIV_PROXY_URL = CORE_CONFIG.get("arxiv_proxy_url", "")
 
 # 初始化服务
 db_service = DatabaseService()
@@ -84,6 +86,15 @@ def get_current_embedding_config() -> EmbeddingConfig:
     return embedding_service.get_default_embedding_config()
 
 
+recommendation_service = RecommendationService(
+    db_service=db_service,
+    embedding_service=embedding_service,
+    vector_store_service=vector_store_service,
+    get_embedding_config=get_current_embedding_config,
+    arxiv_service_factory=lambda: get_arxiv_service(),
+)
+
+
 def embed_text_with_current_config(text: str) -> tuple[list, EmbeddingConfig]:
     config = get_current_embedding_config()
     embedding = embedding_service.create_single_embedding(
@@ -100,9 +111,14 @@ def embed_text_with_current_config(text: str) -> tuple[list, EmbeddingConfig]:
 def get_arxiv_service():
     """根据配置获取当前使用的 arXiv 服务"""
     if DATA_SOURCE == "api":
-        return ArxivSearchService()
+        return ArxivSearchService(proxy_url=ARXIV_PROXY_URL)
     else:
         return local_arxiv_service
+
+
+def get_arxiv_api_service() -> ArxivSearchService:
+    """始终返回走代理配置的 arXiv API 服务。"""
+    return ArxivSearchService(proxy_url=ARXIV_PROXY_URL)
 
 
 class QaRequest(BaseModel):
@@ -420,7 +436,7 @@ async def arxiv_download(
 ):
     """下载 arXiv 论文 PDF"""
     try:
-        arxiv_service = ArxivSearchService()
+        arxiv_service = get_arxiv_api_service()
         filepath = arxiv_service.download_pdf(pdf_url, arxiv_id)
         return {"status": "success", "filepath": filepath}
     except Exception as e:
@@ -437,7 +453,7 @@ async def arxiv_search_and_save(
 ):
     """搜索 arXiv 论文并保存结果，可选择下载 PDF"""
     try:
-        arxiv_service = ArxivSearchService()
+        arxiv_service = get_arxiv_api_service()
         results = await arxiv_service.search_and_save(
             search_query=search_query,
             id_list=id_list,
@@ -477,15 +493,19 @@ async def get_user_preferences(user_id: str):
 @app.post("/user/like-paper")
 async def like_paper(
     arxiv_id: str = Body(...),
-    user_id: str = Body("local_user")
+    user_id: str = Body("local_user"),
+    paper: Optional[Dict[str, Any]] = Body(None)
 ):
     """标记论文为喜欢"""
     try:
-        success = db_service.add_liked_paper(user_id=user_id, arxiv_id=arxiv_id)
-        if success:
-            return {"status": "success", "message": "Paper added to liked list"}
-        else:
-            raise HTTPException(status_code=500, detail="Failed to like paper")
+        return recommendation_service.record_user_paper_preference(
+            user_id=user_id,
+            arxiv_id=arxiv_id,
+            liked=True,
+            paper_payload=paper,
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error liking paper: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -493,15 +513,19 @@ async def like_paper(
 @app.post("/user/dislike-paper")
 async def dislike_paper(
     arxiv_id: str = Body(...),
-    user_id: str = Body("local_user")
+    user_id: str = Body("local_user"),
+    paper: Optional[Dict[str, Any]] = Body(None)
 ):
     """标记论文为不喜欢"""
     try:
-        success = db_service.add_disliked_paper(user_id=user_id, arxiv_id=arxiv_id)
-        if success:
-            return {"status": "success", "message": "Paper added to disliked list"}
-        else:
-            raise HTTPException(status_code=500, detail="Failed to dislike paper")
+        return recommendation_service.record_user_paper_preference(
+            user_id=user_id,
+            arxiv_id=arxiv_id,
+            liked=False,
+            paper_payload=paper,
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error disliking paper: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -542,71 +566,8 @@ async def remove_dislike(
 async def generate_user_interest_vector(
     user_id: str = Body("local_user")
 ):
-    """
-    生成用户兴趣向量
-    流程：获取用户喜欢的论文 -> 提取title+abstract -> 计算embedding -> 聚合为兴趣向量
-    """
     try:
-        logger.info(f"Generating interest vector for user: {user_id}")
-        
-        liked_papers = db_service.get_liked_papers_with_details(user_id=user_id)
-        
-        if not liked_papers:
-            raise HTTPException(status_code=400, detail="No liked papers found for user")
-        
-        logger.info(f"Found {len(liked_papers)} liked papers for user {user_id}")
-        
-        embeddings = []
-        embedding_config = get_current_embedding_config()
-        embedding_model = embedding_config.model_name
-        
-        for paper in liked_papers:
-            title = paper.get('title', '')
-            abstract = paper.get('abstract', '')
-            text_to_embed = f"{title}\n\n摘要：{abstract}"
-            
-            embedding = embedding_service.create_single_embedding(
-                text_to_embed,
-                provider=embedding_config.provider,
-                model=embedding_config.model_name,
-                api_key=embedding_config.api_key,
-                base_url=embedding_config.base_url,
-                dimension=embedding_config.dimension,
-            )
-            embeddings.append(embedding)
-        
-        if not embeddings:
-            raise HTTPException(status_code=500, detail="Failed to create embeddings")
-        
-        embedding_dimension = len(embeddings[0])
-        logger.info(f"Embedding dimension: {embedding_dimension}")
-        
-        interest_vector = []
-        for i in range(embedding_dimension):
-            dimension_sum = sum(emb[i] for emb in embeddings)
-            interest_vector.append(dimension_sum / len(embeddings))
-        
-        logger.info(f"Calculated interest vector with {len(interest_vector)} dimensions")
-        
-        success = db_service.save_user_interest_vector(
-            user_id=user_id,
-            vector_data=interest_vector,
-            paper_count=len(liked_papers),
-            embedding_model=embedding_model,
-            vector_dimension=embedding_dimension
-        )
-        
-        if success:
-            return {
-                "status": "success",
-                "message": "User interest vector generated successfully",
-                "paper_count": len(liked_papers),
-                "vector_dimension": embedding_dimension,
-                "embedding_model": embedding_model
-            }
-        else:
-            raise HTTPException(status_code=500, detail="Failed to save interest vector")
-            
+        return recommendation_service.generate_user_interest_vector(user_id=user_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -633,48 +594,11 @@ async def get_user_interest_vector(
 @app.post("/user/recommend-papers")
 async def recommend_papers(
     user_id: str = Body("local_user"),
-    top_n: int = Body(10)
+    top_n: int = Body(10),
+    max_age_months: int = Body(6)
 ):
-    """
-    根据用户兴趣向量推荐论文
-    流程：获取用户兴趣向量 -> 在Milvus中搜索相似向量 -> 返回最相似的top_n篇
-    """
     try:
-        logger.info(f"Generating recommendations for user: {user_id}, top_n: {top_n}")
-        
-        interest_vector_data = db_service.get_user_interest_vector(user_id=user_id)
-        if not interest_vector_data:
-            raise HTTPException(status_code=400, detail="User interest vector not found. Please generate it first.")
-        
-        user_vector = interest_vector_data['vector_data']
-        logger.info(f"User interest vector dimension: {len(user_vector)}")
-        
-        preferences = db_service.get_user_preferences(user_id=user_id)
-        labeled_ids = preferences.get('liked_papers', []) + preferences.get('disliked_papers', [])
-        
-        logger.info(f"User has {len(labeled_ids)} labeled papers, will filter them out")
-        
-        results = vector_store_service.search_similar_vectors(
-            collection_name="arxiv_paper_embeddings",
-            query_vector=user_vector,
-            top_k=top_n * 2,
-            filter_arxiv_ids=labeled_ids if labeled_ids else None
-        )
-        
-        if not results:
-            raise HTTPException(status_code=400, detail="No papers found for recommendation")
-        
-        recommendations = results[:top_n]
-        
-        logger.info(f"Generated {len(recommendations)} recommendations from Milvus")
-        
-        return {
-            "status": "success",
-            "message": f"Generated {len(recommendations)} recommendations",
-            "total_found": len(results),
-            "recommendations": recommendations
-        }
-        
+        return recommendation_service.recommend_papers(user_id=user_id, top_n=top_n, max_age_months=max_age_months)
     except HTTPException:
         raise
     except Exception as e:
@@ -903,7 +827,7 @@ async def create_paper_qa_index(arxiv_id: str, loading_method: str = Query("docl
         
         db_service.insert_paper_qa_index(arxiv_id, status='processing')
         
-        arxiv_service = ArxivSearchService()
+        arxiv_service = get_arxiv_api_service()
         
         paper = db_service.get_paper(arxiv_id)
         if not paper:
