@@ -7,8 +7,15 @@ import re
 from typing import List, Dict, Any, Optional
 import logging
 from pathlib import Path
-from pymilvus import connections, utility
-from pymilvus import Collection, DataType, FieldSchema, CollectionSchema
+from pymilvus import (
+    Collection,
+    CollectionSchema,
+    DataType,
+    FieldSchema,
+    MilvusClient,
+    connections,
+    utility,
+)
 from utils.config import VectorDBProvider, MILVUS_CONFIG
 from pypinyin import lazy_pinyin, Style
 
@@ -98,6 +105,9 @@ class VectorStoreService:
         # 确保存储目录存在
         os.makedirs("03-vector-store", exist_ok=True)
 
+    def _get_client(self) -> MilvusClient:
+        return MilvusClient(uri=MILVUS_CONFIG["uri"])
+
     def resolve_collection_name(self, collection_name: str) -> str:
         """
         将任意 collection 名称规范化为 Milvus 可接受的形式。
@@ -106,12 +116,14 @@ class VectorStoreService:
 
     def collection_exists(self, provider: str, collection_name: str) -> bool:
         if provider == VectorDBProvider.MILVUS:
+            client = None
             try:
-                connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
+                client = self._get_client()
                 resolved = self.resolve_collection_name(collection_name)
-                return utility.has_collection(resolved)
+                return client.has_collection(collection_name=resolved)
             finally:
-                connections.disconnect("default")
+                if client is not None:
+                    del client
         return False
     
     def _get_milvus_index_type(self, config: VectorDBConfig) -> str:
@@ -157,6 +169,8 @@ class VectorStoreService:
         # 根据提供商选择索引方法
         if config.provider == VectorDBProvider.MILVUS:
             result = self._index_to_milvus(embeddings_data, config)
+        else:
+            raise ValueError(f"Unsupported vector database provider: {config.provider}")
         
         end_time = datetime.now()
         processing_time = (end_time - start_time).total_seconds()
@@ -423,11 +437,18 @@ class VectorStoreService:
         finally:
             connections.disconnect("default")
 
-    def _validate_varchar_lengths(self, entities: List[Dict[str, Any]], fields: List[FieldSchema]) -> None:
+    def _validate_varchar_lengths(self, entities: List[Dict[str, Any]], fields: List[Any]) -> None:
+        varchar_type = getattr(DataType.VARCHAR, "value", DataType.VARCHAR)
         varchar_limits = {
-            field.name: getattr(field, "max_length", None)
+            (field.get("name") if isinstance(field, dict) else getattr(field, "name", "")): (
+                (field.get("params", {}) or {}).get("max_length")
+                if isinstance(field, dict)
+                else getattr(field, "max_length", None)
+            )
             for field in fields
-            if getattr(field, "dtype", None) == DataType.VARCHAR
+            if (
+                (field.get("type") if isinstance(field, dict) else getattr(field, "dtype", None)) == varchar_type
+            )
         }
 
         violations = []
@@ -456,11 +477,11 @@ class VectorStoreService:
         """
         if provider == VectorDBProvider.MILVUS:
             try:
-                connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
-                collections = utility.list_collections()
-                return collections
-            finally:
-                connections.disconnect("default")
+                client = self._get_client()
+                return client.list_collections()
+            except Exception:
+                logger.exception("Error listing Milvus collections")
+                raise
         return []
 
     def delete_collection(self, provider: str, collection_name: str) -> bool:
@@ -469,14 +490,15 @@ class VectorStoreService:
         """
         if provider == VectorDBProvider.MILVUS:
             try:
-                connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
+                client = self._get_client()
                 resolved_name = self.resolve_collection_name(collection_name)
-                if utility.has_collection(resolved_name):
-                    utility.drop_collection(resolved_name)
+                if client.has_collection(collection_name=resolved_name):
+                    client.drop_collection(collection_name=resolved_name)
                     return True
                 return False
-            finally:
-                connections.disconnect("default")
+            except Exception:
+                logger.exception("Error deleting Milvus collection: %s", collection_name)
+                raise
         return False
 
     def get_collection_info(self, provider: str, collection_name: str) -> Dict[str, Any]:
@@ -485,18 +507,20 @@ class VectorStoreService:
         """
         if provider == VectorDBProvider.MILVUS:
             try:
-                connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
+                client = self._get_client()
                 resolved_name = self.resolve_collection_name(collection_name)
-                if not utility.has_collection(resolved_name):
+                if not client.has_collection(collection_name=resolved_name):
                     return {}
-                collection = Collection(resolved_name)
+                collection_desc = client.describe_collection(collection_name=resolved_name)
+                collection_stats = client.get_collection_stats(collection_name=resolved_name)
                 return {
                     "name": resolved_name,
-                    "num_entities": collection.num_entities,
-                    "schema": collection.schema.to_dict()
+                    "num_entities": int(collection_stats.get("row_count", 0) or 0),
+                    "schema": collection_desc,
                 }
-            finally:
-                connections.disconnect("default")
+            except Exception:
+                logger.exception("Error getting Milvus collection info: %s", collection_name)
+                raise
         return {}
 
     def insert_single_embedding(self, collection_name: str, embedding: List[float], metadata: Dict[str, Any]) -> int:
@@ -504,20 +528,20 @@ class VectorStoreService:
         将单个 embedding 插入到指定 collection。
         """
         try:
-            return self.insert_embeddings(collection_name, [{"embedding": embedding, "metadata": metadata}])[0]
+            return self.insert_embeddings(collection_name, [{"embedding": embedding, "metadata": metadata}])
         except Exception as e:
             logger.error(f"Error inserting single embedding: {str(e)}")
             raise
 
-    def insert_embeddings(self, collection_name: str, items: List[Dict[str, Any]]) -> List[int]:
+    def insert_embeddings(self, collection_name: str, items: List[Dict[str, Any]]) -> int:
         """
         批量插入多个 embedding 到指定 collection。
         """
         if not items:
-            return []
+            return 0
 
         try:
-            connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
+            client = self._get_client()
             resolved_name = normalize_collection_name(collection_name)
 
             embeddings = [[float(value) for value in item.get("embedding", [])] for item in items]
@@ -525,16 +549,13 @@ class VectorStoreService:
             if not vector_dim:
                 raise ValueError("Cannot insert empty embeddings")
 
-            if utility.has_collection(resolved_name):
-                collection = Collection(resolved_name)
-                vector_field = next((field for field in collection.schema.fields if field.name == "vector"), None)
+            if client.has_collection(collection_name=resolved_name):
+                collection_desc = client.describe_collection(collection_name=resolved_name)
+                vector_field = next((field for field in collection_desc.get("fields", []) if field.get("name") == "vector"), None)
                 existing_dim = None
                 if vector_field is not None:
-                    existing_dim = getattr(vector_field, "dim", None)
-                    if existing_dim is None:
-                        params = getattr(vector_field, "params", None)
-                        if isinstance(params, dict):
-                            existing_dim = params.get("dim")
+                    params = vector_field.get("params", {}) or {}
+                    existing_dim = params.get("dim")
                 if existing_dim and int(existing_dim) != vector_dim:
                     raise ValueError(
                         f"Collection '{resolved_name}' already uses vector dimension {existing_dim}, "
@@ -542,27 +563,26 @@ class VectorStoreService:
                         "Rebuild the collection or keep the embedding model/dimension consistent."
                     )
             else:
-                fields = [
-                    FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-                    FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=CONTENT_MAX_LENGTH),
-                    FieldSchema(name="arxiv_id", dtype=DataType.VARCHAR, max_length=100),
-                    FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=1000),
-                    FieldSchema(name="authors", dtype=DataType.VARCHAR, max_length=2000),
-                    FieldSchema(name="categories", dtype=DataType.VARCHAR, max_length=500),
-                    FieldSchema(name="published_date", dtype=DataType.VARCHAR, max_length=50),
-                    FieldSchema(name="url", dtype=DataType.VARCHAR, max_length=500),
-                    FieldSchema(name="embedding_model", dtype=DataType.VARCHAR, max_length=100),
-                    FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=vector_dim),
-                ]
-                schema = CollectionSchema(fields=fields, description=f"arXiv paper abstract embeddings collection")
-                collection = Collection(name=resolved_name, schema=schema)
+                schema = MilvusClient.create_schema(auto_id=True, enable_dynamic_field=False)
+                schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
+                schema.add_field(field_name="content", datatype=DataType.VARCHAR, max_length=CONTENT_MAX_LENGTH)
+                schema.add_field(field_name="arxiv_id", datatype=DataType.VARCHAR, max_length=100)
+                schema.add_field(field_name="title", datatype=DataType.VARCHAR, max_length=1000)
+                schema.add_field(field_name="authors", datatype=DataType.VARCHAR, max_length=2000)
+                schema.add_field(field_name="categories", datatype=DataType.VARCHAR, max_length=500)
+                schema.add_field(field_name="published_date", datatype=DataType.VARCHAR, max_length=50)
+                schema.add_field(field_name="url", datatype=DataType.VARCHAR, max_length=500)
+                schema.add_field(field_name="embedding_model", datatype=DataType.VARCHAR, max_length=100)
+                schema.add_field(field_name="vector", datatype=DataType.FLOAT_VECTOR, dim=vector_dim)
+                client.create_collection(collection_name=resolved_name, schema=schema)
 
-                index_params = {
-                    "metric_type": "COSINE",
-                    "index_type": "FLAT",
-                    "params": {}
-                }
-                collection.create_index(field_name="vector", index_params=index_params)
+                index_params = MilvusClient.prepare_index_params()
+                index_params.add_index(
+                    field_name="vector",
+                    index_type="FLAT",
+                    metric_type="COSINE",
+                )
+                client.create_index(collection_name=resolved_name, index_params=index_params)
 
             entities = []
             for embedding, metadata in zip(embeddings, [item.get("metadata", {}) for item in items]):
@@ -579,19 +599,22 @@ class VectorStoreService:
                 }
                 entities.append(entity)
 
-            self._validate_varchar_lengths(entities, collection.schema.fields)
-            insertable_fields = [field.name for field in collection.schema.fields if not getattr(field, "auto_id", False)]
-            insert_columns = [[entity.get(field_name) for entity in entities] for field_name in insertable_fields]
-            insert_result = collection.insert(insert_columns)
-            collection.flush()
-            collection.load()
+            collection_desc = client.describe_collection(collection_name=resolved_name)
+            self._validate_varchar_lengths(entities, collection_desc.get("fields", []))
+            insert_result = client.insert(collection_name=resolved_name, data=entities)
+            client.flush(collection_name=resolved_name)
+            client.load_collection(collection_name=resolved_name)
 
-            return [int(primary_key) for primary_key in insert_result.primary_keys]
+            if isinstance(insert_result, dict):
+                return int(insert_result.get("insert_count", len(entities)))
+            if hasattr(insert_result, "insert_count"):
+                return int(getattr(insert_result, "insert_count", len(entities)))
+            if isinstance(insert_result, list):
+                return len(insert_result)
+            return len(entities)
         except Exception as e:
             logger.error(f"Error inserting embeddings batch: {str(e)}")
             raise
-        finally:
-            connections.disconnect("default")
 
     def search_similar_vectors(self, collection_name: str, query_vector: List[float], top_k: int = 10, filter_arxiv_ids: List[str] = None) -> List[Dict[str, Any]]:
         """
@@ -599,17 +622,15 @@ class VectorStoreService:
         这样生成答案时就能直接带出来源页码，而不是只给一段不知道出处的文本。
         """
         try:
-            connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
+            client = self._get_client()
             resolved_name = self.resolve_collection_name(collection_name)
 
-            if not utility.has_collection(resolved_name):
+            if not client.has_collection(collection_name=resolved_name):
                 logger.warning(f"Collection {collection_name} does not exist")
                 return []
 
-            collection = Collection(resolved_name)
-            collection.load()
-
-            field_names = {field.name for field in collection.schema.fields}
+            collection_desc = client.describe_collection(collection_name=resolved_name)
+            field_names = {field.get("name") for field in collection_desc.get("fields", [])}
             candidate_fields = [
                 "content",
                 "rerank_text",
@@ -660,22 +681,25 @@ class VectorStoreService:
 
             expr = None
             if filter_arxiv_ids and "arxiv_id" in field_names:
-                expr = f"arxiv_id not in {filter_arxiv_ids}"
+                quoted_ids = ", ".join(f'"{arxiv_id}"' for arxiv_id in filter_arxiv_ids if arxiv_id)
+                if quoted_ids:
+                    expr = f"arxiv_id not in [{quoted_ids}]"
 
-            results = collection.search(
+            results = client.search(
+                collection_name=resolved_name,
                 data=[query_vector],
-                anns_field="vector",
-                param={"metric_type": "COSINE", "params": {}},
+                filter=expr or "",
                 limit=top_k,
-                expr=expr,
+                anns_field="vector",
                 output_fields=output_fields,
+                search_params={"metric_type": "COSINE", "params": {}},
             )
 
             similar_vectors = [
                 self._build_chunk_payload(
-                    entity=hit.entity,
-                    score=float(hit.score),
-                    distance=float(hit.distance) if hasattr(hit, "distance") else None,
+                    entity=hit.get("entity", hit),
+                    score=float(hit.get("score")) if hit.get("score") is not None else None,
+                    distance=float(hit.get("distance")) if hit.get("distance") is not None else None,
                 )
                 for hit in results[0]
             ]
@@ -685,8 +709,6 @@ class VectorStoreService:
         except Exception as e:
             logger.error(f"Error searching similar vectors: {str(e)}")
             raise
-        finally:
-            connections.disconnect("default")
 
     def search_similar_papers(
         self,
@@ -700,17 +722,15 @@ class VectorStoreService:
         这个方法专门用于 arxiv_paper_embeddings 这类论文集合，不沿用 chunk 级 payload。
         """
         try:
-            connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
+            client = self._get_client()
             resolved_name = self.resolve_collection_name(collection_name)
 
-            if not utility.has_collection(resolved_name):
+            if not client.has_collection(collection_name=resolved_name):
                 logger.warning(f"Collection {collection_name} does not exist")
                 return []
 
-            collection = Collection(resolved_name)
-            collection.load()
-
-            field_names = {field.name for field in collection.schema.fields}
+            collection_desc = client.describe_collection(collection_name=resolved_name)
+            field_names = {field.get("name") for field in collection_desc.get("fields", [])}
             candidate_fields = [
                 "arxiv_id",
                 "title",
@@ -730,20 +750,21 @@ class VectorStoreService:
                 if quoted_ids:
                     expr = f"arxiv_id not in [{quoted_ids}]"
 
-            results = collection.search(
+            results = client.search(
+                collection_name=resolved_name,
                 data=[query_vector],
-                anns_field="vector",
-                param={"metric_type": "COSINE", "params": {}},
+                filter=expr or "",
                 limit=top_k,
-                expr=expr,
+                anns_field="vector",
                 output_fields=output_fields,
+                search_params={"metric_type": "COSINE", "params": {}},
             )
 
             return [
                 self._build_paper_payload(
-                    entity=hit.entity,
-                    score=float(hit.score),
-                    distance=float(hit.distance) if hasattr(hit, "distance") else None,
+                    entity=hit.get("entity", hit),
+                    score=float(hit.get("score")) if hit.get("score") is not None else None,
+                    distance=float(hit.get("distance")) if hit.get("distance") is not None else None,
                 )
                 for hit in results[0]
             ]
@@ -751,8 +772,6 @@ class VectorStoreService:
         except Exception as e:
             logger.error(f"Error searching similar papers: {str(e)}")
             raise
-        finally:
-            connections.disconnect("default")
 
     def get_paper_embeddings_by_arxiv_ids(
         self,
@@ -768,17 +787,15 @@ class VectorStoreService:
             if not normalized_ids:
                 return []
 
-            connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
+            client = self._get_client()
             resolved_name = self.resolve_collection_name(collection_name)
 
-            if not utility.has_collection(resolved_name):
+            if not client.has_collection(collection_name=resolved_name):
                 logger.warning(f"Collection {collection_name} does not exist")
                 return []
 
-            collection = Collection(resolved_name)
-            collection.load()
-
-            field_names = {field.name for field in collection.schema.fields}
+            collection_desc = client.describe_collection(collection_name=resolved_name)
+            field_names = {field.get("name") for field in collection_desc.get("fields", [])}
             if "arxiv_id" not in field_names or "vector" not in field_names:
                 logger.warning(
                     "Collection %s does not expose required fields arxiv_id/vector",
@@ -802,8 +819,9 @@ class VectorStoreService:
             ]
             output_fields = [field for field in candidate_fields if field in field_names]
 
-            results = collection.query(
-                expr=expr,
+            results = client.query(
+                collection_name=resolved_name,
+                filter=expr,
                 output_fields=output_fields,
                 limit=len(normalized_ids),
             )
@@ -812,22 +830,18 @@ class VectorStoreService:
         except Exception as e:
             logger.error(f"Error reading paper embeddings by arxiv ids: {str(e)}")
             raise
-        finally:
-            connections.disconnect("default")
 
     def get_all_chunks(self, collection_name: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         try:
-            connections.connect(alias="default", uri=MILVUS_CONFIG["uri"])
+            client = self._get_client()
             resolved_name = self.resolve_collection_name(collection_name)
 
-            if not utility.has_collection(resolved_name):
+            if not client.has_collection(collection_name=resolved_name):
                 logger.warning(f"Collection {collection_name} does not exist")
                 return []
 
-            collection = Collection(resolved_name)
-            collection.load()
-
-            field_names = {field.name for field in collection.schema.fields}
+            collection_desc = client.describe_collection(collection_name=resolved_name)
+            field_names = {field.get("name") for field in collection_desc.get("fields", [])}
             candidate_fields = [
                 "id",
                 "content",
@@ -876,14 +890,15 @@ class VectorStoreService:
                 "url",
             ]
             output_fields = [field for field in candidate_fields if field in field_names]
-            query_limit = limit if limit is not None else collection.num_entities
+            query_limit = limit if limit is not None else 10000
             if query_limit <= 0:
                 logger.warning(
                     f"Collection {collection_name} has no entities or requested limit is non-positive: {query_limit}"
                 )
                 return []
-            entities = collection.query(
-                expr="id >= 0",
+            entities = client.query(
+                collection_name=resolved_name,
+                filter="id >= 0",
                 output_fields=output_fields,
                 limit=query_limit,
             )
@@ -891,8 +906,6 @@ class VectorStoreService:
         except Exception as e:
             logger.error(f"Error reading collection chunks: {str(e)}")
             raise
-        finally:
-            connections.disconnect("default")
 
     def _build_chunk_payload(self, entity: Any, score: Optional[float], distance: Optional[float]) -> Dict[str, Any]:
         if entity is None:

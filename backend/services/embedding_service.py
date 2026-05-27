@@ -3,7 +3,7 @@ import json
 from datetime import datetime
 import logging
 from enum import Enum
-from typing import Optional
+from typing import List, Optional
 import os
 import base64
 import mimetypes
@@ -185,7 +185,12 @@ class EmbeddingService:
         vectors.sort(key=lambda item: item[0])
         return [vector for _, vector in vectors]
 
-    def _create_dashscope_embeddings_from_inputs(self, embedding_inputs: list, config: EmbeddingConfig) -> list:
+    @staticmethod
+    def _extract_dashscope_usage(payload: dict) -> dict:
+        usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
+        return usage if isinstance(usage, dict) else {}
+
+    def _create_dashscope_embeddings_from_inputs(self, embedding_inputs: list, config: EmbeddingConfig) -> tuple[list, dict]:
         api_key = config.api_key or EMBEDDING_CONFIG["dashscope_api_key"] or EMBEDDING_CONFIG["api_key"]
         if not api_key:
             raise ValueError("DashScope API key not provided. Set DASHSCOPE_API_KEY.")
@@ -233,28 +238,74 @@ class EmbeddingService:
         data = response.json()
 
         vectors = self._extract_dashscope_embeddings(data)
+        usage = self._extract_dashscope_usage(data)
         if not vectors:
             raise ValueError(f"DashScope embedding response did not contain vectors: {data}")
         if len(vectors) == len(embedding_inputs):
-            return vectors
+            return vectors, usage
         if len(embedding_inputs) == 1:
-            return [vectors[0]]
+            return [vectors[0]], usage
         logger.warning(
             "DashScope returned %s vectors for %s inputs; falling back to single-item requests",
             len(vectors),
             len(embedding_inputs),
         )
-        return [self._create_dashscope_embedding_from_input(item, config) for item in embedding_inputs]
+        fallback_vectors = [self._create_dashscope_embedding_from_input(item, config) for item in embedding_inputs]
+        return fallback_vectors, usage
 
     def _create_dashscope_embeddings(self, texts: list, config: EmbeddingConfig) -> list:
         embedding_inputs = [{"mode": "text", "text": text} for text in texts]
-        return self._create_dashscope_embeddings_from_inputs(embedding_inputs, config)
+        vectors, _ = self._create_dashscope_embeddings_from_inputs(embedding_inputs, config)
+        return vectors
 
     def _create_dashscope_embedding(self, text: str, config: EmbeddingConfig) -> list:
         return self._create_dashscope_embeddings([text], config)[0]
 
     def _create_dashscope_embedding_from_input(self, embedding_input: dict, config: EmbeddingConfig) -> list:
-        return self._create_dashscope_embeddings_from_inputs([embedding_input], config)[0]
+        vectors, _ = self._create_dashscope_embeddings_from_inputs([embedding_input], config)
+        return vectors[0]
+
+    def _create_dashscope_embeddings_with_usage(self, texts: list, config: EmbeddingConfig) -> tuple[list, dict]:
+        embedding_inputs = [{"mode": "text", "text": text} for text in texts]
+        return self._create_dashscope_embeddings_from_inputs(embedding_inputs, config)
+
+    def create_single_embedding_with_usage(
+        self,
+        text: str,
+        provider: str,
+        model: str,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        dimension: Optional[int] = None,
+    ) -> tuple[list, dict]:
+        config = EmbeddingConfig(
+            provider=provider,
+            model_name=model,
+            api_key=api_key,
+            base_url=base_url,
+            dimension=dimension,
+        )
+        cache_key = self._build_embedding_cache_key(
+            text=text,
+            provider=config.provider,
+            model=config.model_name,
+            api_key=config.api_key,
+            base_url=config.base_url,
+            dimension=config.dimension,
+        )
+        cached_embedding = self._get_cached_embedding(cache_key)
+        if cached_embedding is not None:
+            return cached_embedding, {}
+
+        normalized_provider = str(provider).strip().lower()
+        if normalized_provider == EmbeddingProvider.DASHSCOPE.value:
+            embedding, usage = self._create_dashscope_embeddings_with_usage([text], config)
+            normalized_embedding = embedding[0]
+            self._set_cached_embedding(cache_key, normalized_embedding)
+            return normalized_embedding, usage
+
+        embedding = self.create_single_embedding(text, provider, model, api_key, base_url, dimension)
+        return embedding, {}
 
     @property
     def local_embedder(self):
@@ -623,6 +674,137 @@ class EmbeddingService:
         normalized_embedding = self._normalize_vector_output(embedding)
         self._set_cached_embedding(cache_key, normalized_embedding)
         return normalized_embedding
+
+    def create_text_embeddings(
+        self,
+        texts: List[str],
+        provider: str,
+        model: str,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        dimension: Optional[int] = None,
+        batch_size: Optional[int] = None,
+    ) -> List[list]:
+        embeddings, _ = self.create_text_embeddings_with_usage(
+            texts=texts,
+            provider=provider,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            dimension=dimension,
+            batch_size=batch_size,
+        )
+        return embeddings
+
+    def create_text_embeddings_with_usage(
+        self,
+        texts: List[str],
+        provider: str,
+        model: str,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        dimension: Optional[int] = None,
+        batch_size: Optional[int] = None,
+    ) -> tuple[List[list], dict]:
+        normalized_texts = [str(text or "") for text in texts]
+        if not normalized_texts:
+            return [], {}
+
+        config = EmbeddingConfig(
+            provider=provider,
+            model_name=model,
+            api_key=api_key,
+            base_url=base_url,
+            dimension=dimension,
+            batch_size=batch_size,
+        )
+
+        normalized_provider = str(config.provider).strip().lower()
+        results: List[Optional[list]] = [None] * len(normalized_texts)
+        pending_indexes: List[int] = []
+        pending_texts: List[str] = []
+        usage: dict = {}
+
+        for index, text in enumerate(normalized_texts):
+            cache_key = self._build_embedding_cache_key(
+                text=text,
+                provider=config.provider,
+                model=config.model_name,
+                api_key=config.api_key,
+                base_url=config.base_url,
+                dimension=config.dimension,
+            )
+            cached_embedding = self._get_cached_embedding(cache_key)
+            if cached_embedding is not None:
+                results[index] = cached_embedding
+                continue
+            pending_indexes.append(index)
+            pending_texts.append(text)
+
+        if pending_texts:
+            if normalized_provider == EmbeddingProvider.DASHSCOPE.value:
+                effective_batch_size = max(1, int(batch_size or config.batch_size or 20))
+                for start in range(0, len(pending_texts), effective_batch_size):
+                    batch_indexes = pending_indexes[start : start + effective_batch_size]
+                    batch_texts = pending_texts[start : start + effective_batch_size]
+                    batch_embeddings, batch_usage = self._create_dashscope_embeddings_with_usage(batch_texts, config)
+                    if len(batch_embeddings) != len(batch_texts):
+                        raise ValueError(
+                            f"DashScope returned {len(batch_embeddings)} embeddings for {len(batch_texts)} texts"
+                        )
+                    if batch_usage:
+                        usage = {
+                            "input_tokens": int(usage.get("input_tokens", 0) or 0) + int(batch_usage.get("input_tokens", 0) or 0),
+                            "output_tokens": int(usage.get("output_tokens", 0) or 0) + int(batch_usage.get("output_tokens", 0) or 0),
+                            "total_tokens": int(usage.get("total_tokens", 0) or 0) + int(batch_usage.get("total_tokens", 0) or 0),
+                        }
+                    for index, text, embedding in zip(batch_indexes, batch_texts, batch_embeddings):
+                        cache_key = self._build_embedding_cache_key(
+                            text=text,
+                            provider=config.provider,
+                            model=config.model_name,
+                            api_key=config.api_key,
+                            base_url=config.base_url,
+                            dimension=config.dimension,
+                        )
+                        normalized_embedding = self._normalize_vector_output(embedding)
+                        self._set_cached_embedding(cache_key, normalized_embedding)
+                        results[index] = normalized_embedding
+            elif normalized_provider == EmbeddingProvider.OPENAI.value:
+                embedding_function = self.embedding_factory.create_embedding_function(config)
+                effective_batch_size = max(1, int(batch_size or config.batch_size or 20))
+                for start in range(0, len(pending_texts), effective_batch_size):
+                    batch_indexes = pending_indexes[start : start + effective_batch_size]
+                    batch_texts = pending_texts[start : start + effective_batch_size]
+                    batch_embeddings = embedding_function.embed_documents(batch_texts)
+                    if len(batch_embeddings) != len(batch_texts):
+                        raise ValueError(
+                            f"OpenAI-compatible embedder returned {len(batch_embeddings)} embeddings for {len(batch_texts)} texts"
+                        )
+                    for index, text, embedding in zip(batch_indexes, batch_texts, batch_embeddings):
+                        cache_key = self._build_embedding_cache_key(
+                            text=text,
+                            provider=config.provider,
+                            model=config.model_name,
+                            api_key=config.api_key,
+                            base_url=config.base_url,
+                            dimension=config.dimension,
+                        )
+                        normalized_embedding = self._normalize_vector_output(embedding)
+                        self._set_cached_embedding(cache_key, normalized_embedding)
+                        results[index] = normalized_embedding
+            else:
+                for index, text in zip(pending_indexes, pending_texts):
+                    results[index] = self.create_single_embedding(
+                        text=text,
+                        provider=provider,
+                        model=model,
+                        api_key=api_key,
+                        base_url=base_url,
+                        dimension=dimension,
+                    )
+
+        return [embedding if embedding is not None else [] for embedding in results], usage
 
     def create_single_embedding_dashscope(
         self,

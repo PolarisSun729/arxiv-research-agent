@@ -26,6 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--from", dest="from_date", required=True, type=_parse_date, help="Start date in YYYY-MM-DD format.")
     parser.add_argument("--until", dest="until_date", required=True, type=_parse_date, help="End date in YYYY-MM-DD format.")
     parser.add_argument("--dry-run", action="store_true", help="Parse and log results without writing to the database.")
+    parser.add_argument("--count-only", action="store_true", help="Count matching papers only. Skip database writes and embeddings.")
     parser.add_argument("--interval", type=float, default=5.0, help="Sleep interval between requests in seconds.")
     parser.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout in seconds.")
     parser.add_argument("--max-retries", type=int, default=5, help="Maximum retry attempts for each page request.")
@@ -44,13 +45,15 @@ def main() -> int:
 
     if args.from_date > args.until_date:
         parser.error("--from must be less than or equal to --until")
+    if args.count_only and args.dry_run:
+        parser.error("--count-only cannot be combined with --dry-run")
 
     service = ArxivOaiSyncService(
         request_interval_seconds=args.interval,
         request_timeout_seconds=args.timeout,
         max_retries=args.max_retries,
     )
-    stats = service.sync(args.from_date, args.until_date, dry_run=args.dry_run)
+    stats = service.sync(args.from_date, args.until_date, dry_run=args.dry_run, count_only=args.count_only)
 
     summary = stats.to_dict()
     logging.getLogger(__name__).info("Sync finished with summary: %s", summary)

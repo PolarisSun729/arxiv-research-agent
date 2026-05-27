@@ -75,7 +75,8 @@ SQLITE_CONFIG: Dict[str, Any] = {
 }
 
 OAI_SQLITE_CONFIG: Dict[str, Any] = {
-    "database_path": _env_str("OAI_SQLITE_DATABASE_PATH", str(REPO_ROOT / "06-database" / "arxiv_oai.db")),
+    # Keep the OAI database under backend/06-database so backend launches and tools share the same store.
+    "database_path": _env_str("OAI_SQLITE_DATABASE_PATH", str(BASE_DIR.parent / "06-database" / "arxiv_oai.db")),
     "check_same_thread": _env_bool("OAI_SQLITE_CHECK_SAME_THREAD", False),
 }
 

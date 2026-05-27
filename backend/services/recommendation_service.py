@@ -542,10 +542,10 @@ class RecommendationService:
                     }
                     for job in batch_jobs
                 ]
-                embedding_ids = self.vector_store_service.insert_embeddings(self.collection_name, batch_insert_payload)
+                embedding_count = self.vector_store_service.insert_embeddings(self.collection_name, batch_insert_payload)
                 stats["batch_embedded"] = len(batch_jobs)
-                stats["batch_inserted"] = len(embedding_ids)
-                for job, embedding_id in zip(batch_jobs, embedding_ids):
+                stats["batch_inserted"] = int(embedding_count)
+                for job in batch_jobs:
                     stored = {
                         "arxiv_id": job["normalized_paper"]["arxiv_id"],
                         "title": job["normalized_paper"]["title"],
@@ -554,7 +554,7 @@ class RecommendationService:
                         "categories": job["normalized_paper"]["categories"],
                         "published_date": job["normalized_paper"]["published_date"],
                         "url": job["normalized_paper"]["url"],
-                        "embedding_id": str(embedding_id),
+                        "embedding_id": "",
                         "embedding_model": job["normalized_paper"]["embedding_model"],
                     }
                     if self.db_service.add_paper(stored):
