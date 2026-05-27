@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
@@ -13,6 +13,16 @@ const recommendationCount = ref(10)
 const recommendationAgeMonths = ref(6)
 const topRecommendation = computed(() => store.recommendations[0] || null)
 const topBreakdown = computed(() => topRecommendation.value?.scoreBreakdown || null)
+const topDiversityDebug = computed(() => topRecommendation.value?.diversityDebug || null)
+const topDiversityMatch = computed(() => {
+  if (topDiversityDebug.value && typeof topDiversityDebug.value.diversity_penalty_value === 'number') {
+    return Math.max(0, Math.min(1, 1 - topDiversityDebug.value.diversity_penalty_value))
+  }
+  if (topBreakdown.value && typeof topBreakdown.value.diversity_score === 'number') {
+    return topBreakdown.value.diversity_score
+  }
+  return 0
+})
 const interestVector = computed(() => store.lastInterestVector)
 const interestClusterCount = computed(() => interestVector.value?.cluster_count || 0)
 const interestProfileMode = computed(() => interestVector.value?.profile_mode || 'mean')
@@ -162,6 +172,13 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
             <strong>{{ toPercent(topBreakdown.recency_score) }}%</strong>
           </div>
           <el-progress :percentage="toPercent(topBreakdown.recency_score)" :show-text="false" color="#0ea5e9" />
+        </div>
+        <div class="breakdown-row">
+          <div class="breakdown-meta">
+            <span>多样性</span>
+            <strong>{{ toPercent(topDiversityMatch) }}%</strong>
+          </div>
+          <el-progress :percentage="toPercent(topDiversityMatch)" :show-text="false" color="#22c55e" />
         </div>
       </div>
 
@@ -370,3 +387,5 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
   }
 }
 </style>
+
+

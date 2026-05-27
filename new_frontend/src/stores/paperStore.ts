@@ -288,6 +288,7 @@ export const usePaperStore = defineStore('paper', () => {
           cluster_similarities: Array.isArray(p.cluster_similarities)
             ? p.cluster_similarities
             : (Array.isArray(p.clusterSimilarities) ? p.clusterSimilarities : undefined),
+          diversityDebug: p.diversity_debug || p.diversityDebug || undefined,
           label: null
         }))
         totalRecommendations.value = result.total_found

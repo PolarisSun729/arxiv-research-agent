@@ -17,6 +17,11 @@ export interface RecommendationScoreBreakdown {
   category_score: number
   recency_score: number
   diversity_score: number
+  relevance_score?: number
+  selection_score?: number
+  semantic_diversity_score?: number | null
+  cluster_diversity_score?: number | null
+  category_diversity_score?: number | null
   disliked_penalty?: number
 }
 
@@ -41,6 +46,14 @@ export interface RecommendedPaper extends Paper {
     similarity?: number
   }>
   disliked_penalty?: number
+  diversityDebug?: {
+    diversity_reason?: string
+    diversity_penalty_source?: string | null
+    diversity_penalty_value?: number | null
+    semantic_diversity_score?: number | null
+    cluster_diversity_score?: number | null
+    category_diversity_score?: number | null
+  }
 }
 
 export interface LabeledPaper extends Paper {

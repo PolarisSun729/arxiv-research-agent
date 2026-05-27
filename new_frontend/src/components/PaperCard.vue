@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { ref, watch, computed } from 'vue'
 import type { Paper, RecommendedPaper } from '@/types/paper'
 import SimilarityTag from './SimilarityTag.vue'
@@ -31,6 +31,35 @@ const recommendationReason = computed(() => {
 
 const recommendationScoreBreakdown = computed(() => {
   return isRecommended(props.paper) ? props.paper.scoreBreakdown || null : null
+})
+
+const diversityDebug = computed(() => {
+  return isRecommended(props.paper) ? props.paper.diversityDebug || null : null
+})
+
+const diversityMatchScore = computed(() => {
+  if (diversityDebug.value && typeof diversityDebug.value.diversity_penalty_value === 'number') {
+    return Math.max(0, Math.min(1, 1 - diversityDebug.value.diversity_penalty_value))
+  }
+  if (recommendationScoreBreakdown.value && typeof recommendationScoreBreakdown.value.diversity_score === 'number') {
+    return recommendationScoreBreakdown.value.diversity_score
+  }
+  return 0
+})
+
+const diversityReason = computed(() => {
+  const reason = diversityDebug.value?.diversity_reason || ''
+  const reasonMap: Record<string, string> = {
+    seed: '种子项',
+    semantic_repeat: '语义相似',
+    cluster_repeat: '簇相似',
+    category_repeat: '类别相似',
+    semantic_guidance: '语义补充',
+    cluster_guidance: '簇补充',
+    semantic_cluster_mix: '语义+簇综合',
+    no_previous_selection: '首篇',
+  }
+  return reasonMap[reason] || reason
 })
 
 const bestMatchedClusterId = computed(() => {
@@ -162,16 +191,22 @@ const labelOptions = [
       <SimilarityTag :score="(paper as any).similarityScore || (paper as any).similarity || 0" />
       <span v-if="finalScoreText" class="final-score-label">最终 {{ finalScoreText }}</span>
       <el-tag v-if="bestMatchedClusterId" size="small" type="success" effect="plain">
-        命中 {{ bestMatchedClusterId }}
+        命中簇 {{ bestMatchedClusterId }}
       </el-tag>
       <el-tag v-if="recallClusterId" size="small" type="warning" effect="plain">
-        召回 {{ recallClusterId }}
+        召回来源 {{ recallClusterId }}
       </el-tag>
       <el-tag v-if="recallClusterId" size="small" type="info" effect="plain">
-        召回相似 {{ toPercent(recallClusterSimilarity) }}%
+        簇召回相似度 {{ toPercent(recallClusterSimilarity) }}%
       </el-tag>
       <el-tag v-if="recallClusterHitsCount > 1" size="small" type="info" effect="plain">
         多簇命中 {{ recallClusterHitsCount }}
+      </el-tag>
+      <el-tag size="small" type="success" effect="plain">
+        多样性得分 {{ toPercent(diversityMatchScore) }}%
+      </el-tag>
+      <el-tag v-if="diversityReason" size="small" type="warning" effect="plain">
+        {{ diversityReason }}
       </el-tag>
       <p v-if="recommendationReason" class="recommendation-reason">
         {{ recommendationReason }}
@@ -197,6 +232,13 @@ const labelOptions = [
             <strong>{{ toPercent(recommendationScoreBreakdown.recency_score) }}%</strong>
           </div>
           <el-progress :percentage="toPercent(recommendationScoreBreakdown.recency_score)" :show-text="false" color="#0ea5e9" />
+        </div>
+        <div class="score-breakdown-row" v-if="typeof recommendationScoreBreakdown.diversity_score === 'number'">
+          <div class="score-breakdown-meta">
+            <span class="breakdown-label">多样性</span>
+            <strong>{{ toPercent(recommendationScoreBreakdown.diversity_score) }}%</strong>
+          </div>
+          <el-progress :percentage="toPercent(recommendationScoreBreakdown.diversity_score)" :show-text="false" color="#22c55e" />
         </div>
       </div>
     </div>
@@ -403,3 +445,5 @@ const labelOptions = [
   text-align: center;
 }
 </style>
+
+
