@@ -335,6 +335,18 @@ class DatabaseService:
 
     def add_paper(self, paper: Dict[str, Any]) -> bool:
         try:
+            normalized_paper = {
+                "arxiv_id": self._serialize_paper_db_value(paper.get("arxiv_id")),
+                "title": self._serialize_paper_db_value(paper.get("title")),
+                "authors": self._serialize_paper_db_value(paper.get("authors")),
+                "abstract": self._serialize_paper_db_value(paper.get("abstract")),
+                "categories": self._serialize_paper_db_value(paper.get("categories")),
+                "published_date": self._serialize_paper_db_value(paper.get("published_date")),
+                "url": self._serialize_paper_db_value(paper.get("url")),
+                "embedding_id": self._serialize_paper_db_value(paper.get("embedding_id")),
+                "embedding_model": self._serialize_paper_db_value(paper.get("embedding_model")),
+            }
+
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
@@ -342,23 +354,51 @@ class DatabaseService:
                     (arxiv_id, title, authors, abstract, categories, published_date, url, embedding_id, embedding_model, embedded_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ''', (
-                    paper.get('arxiv_id'),
-                    paper.get('title'),
-                    paper.get('authors'),
-                    paper.get('abstract'),
-                    paper.get('categories'),
-                    paper.get('published_date'),
-                    paper.get('url'),
-                    paper.get('embedding_id'),
-                    paper.get('embedding_model')
+                    normalized_paper["arxiv_id"],
+                    normalized_paper["title"],
+                    normalized_paper["authors"],
+                    normalized_paper["abstract"],
+                    normalized_paper["categories"],
+                    normalized_paper["published_date"],
+                    normalized_paper["url"],
+                    normalized_paper["embedding_id"],
+                    normalized_paper["embedding_model"],
                 ))
                 
                 conn.commit()
-                logger.info(f"Paper added: {paper.get('arxiv_id')}")
+                logger.info(f"Paper added: {normalized_paper.get('arxiv_id')}")
                 return True
         except Exception as e:
             logger.error(f"Error adding paper: {str(e)}")
             return False
+
+    def _serialize_paper_db_value(self, value: Any) -> str:
+        if value is None:
+            return ""
+
+        if isinstance(value, (list, tuple, set)):
+            return json.dumps(list(value), ensure_ascii=False)
+
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)
+
+        return str(value).strip()
+
+    def _deserialize_paper_db_value(self, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+
+        text = value.strip()
+        if not text:
+            return ""
+
+        if text.startswith("[") or text.startswith("{"):
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return value
+
+        return value
 
     def get_paper(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
         try:
@@ -374,9 +414,9 @@ class DatabaseService:
                     return {
                         'arxiv_id': row[0],
                         'title': row[1],
-                        'authors': row[2],
+                        'authors': self._deserialize_paper_db_value(row[2]),
                         'abstract': row[3],
-                        'categories': row[4],
+                        'categories': self._deserialize_paper_db_value(row[4]),
                         'published_date': row[5],
                         'url': row[6],
                         'embedding_id': row[7],
@@ -402,9 +442,9 @@ class DatabaseService:
                     results.append({
                         'arxiv_id': row[0],
                         'title': row[1],
-                        'authors': row[2],
+                        'authors': self._deserialize_paper_db_value(row[2]),
                         'abstract': row[3],
-                        'categories': row[4],
+                        'categories': self._deserialize_paper_db_value(row[4]),
                         'published_date': row[5],
                         'url': row[6],
                         'embedding_id': row[7],
@@ -429,9 +469,9 @@ class DatabaseService:
                     results.append({
                         'arxiv_id': row[0],
                         'title': row[1],
-                        'authors': row[2],
+                        'authors': self._deserialize_paper_db_value(row[2]),
                         'abstract': row[3],
-                        'categories': row[4],
+                        'categories': self._deserialize_paper_db_value(row[4]),
                         'published_date': row[5],
                         'url': row[6],
                         'embedding_id': row[7],

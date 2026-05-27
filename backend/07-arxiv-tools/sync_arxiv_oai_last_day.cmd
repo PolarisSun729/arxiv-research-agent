@@ -4,7 +4,7 @@ setlocal enabledelayedexpansion
 rem Double-click launcher for the last 1 day arXiv OAI-PMH sync.
 rem Edit these values if you want to change the default behavior.
 set "PROJECT_ROOT=%~dp0"
-set "PYTHON_EXE=python"
+set "CONDA_ENV_NAME=new_rag"
 set "DAYS_BACK=1"
 set "DRY_RUN=0"
 set "INTERVAL_SECONDS=5"
@@ -20,7 +20,30 @@ if not exist "%PROJECT_ROOT%sync_arxiv_oai.py" (
 for /f %%I in ('powershell -NoProfile -Command "(Get-Date).Date.AddDays(-%DAYS_BACK%).ToString('yyyy-MM-dd')"') do set "FROM_DATE=%%I"
 for /f %%I in ('powershell -NoProfile -Command "(Get-Date).Date.ToString('yyyy-MM-dd')"') do set "UNTIL_DATE=%%I"
 
+set "CONDA_EXE_PATH="
+if defined CONDA_EXE (
+    set "CONDA_EXE_PATH=%CONDA_EXE%"
+) else (
+    for /f "delims=" %%I in ('where conda 2^>nul') do (
+        set "CONDA_EXE_PATH=%%I"
+        goto :conda_found
+    )
+)
+:conda_found
+if not defined CONDA_EXE_PATH (
+    echo conda was not found on PATH, and CONDA_EXE is not set.
+    exit /b 1
+)
+
+call "%CONDA_EXE_PATH%" activate %CONDA_ENV_NAME%
+if errorlevel 1 (
+    echo Failed to activate conda environment: %CONDA_ENV_NAME%
+    exit /b 1
+)
+
+set "PYTHON_EXE=python"
 echo [%DATE% %TIME%] Running arXiv OAI-PMH sync from !FROM_DATE! to !UNTIL_DATE!
+echo [%DATE% %TIME%] Conda environment: %CONDA_ENV_NAME%
 echo [%DATE% %TIME%] Python: %PYTHON_EXE%
 echo [%DATE% %TIME%] Interval: %INTERVAL_SECONDS% seconds, Timeout: %TIMEOUT_SECONDS% seconds, MaxRetries: %MAX_RETRIES%, LogLevel: %LOG_LEVEL%
 

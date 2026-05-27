@@ -25,6 +25,15 @@ export interface RecommendedPaper extends Paper {
   finalScore?: number
   reason?: string
   scoreBreakdown?: RecommendationScoreBreakdown
+  recall_source?: string
+  recall_cluster_id?: string | null
+  recall_cluster_similarity?: number | null
+  recall_cluster_rank?: number | null
+  recall_cluster_hits?: Array<{
+    cluster_id?: string | null
+    similarity?: number
+    rank?: number | null
+  }>
   best_matched_cluster_id?: string | null
   best_matched_cluster_similarity?: number | null
   cluster_similarities?: Array<{
@@ -146,5 +155,6 @@ export interface RecommendationResult {
   total_found: number
   interest_profile_mode?: string
   interest_cluster_count?: number
+  recall_mode?: string
   recommendations: RecommendedPaper[]
 }

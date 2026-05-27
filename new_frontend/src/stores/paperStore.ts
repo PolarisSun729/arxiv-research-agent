@@ -71,6 +71,17 @@ export const usePaperStore = defineStore('paper', () => {
     return parts.length ? parts.join(' · ') : '基于用户兴趣画像生成'
   }
 
+  function toRecallClusterHits(value: any): Array<{ cluster_id?: string | null; similarity?: number; rank?: number | null }> {
+    if (!Array.isArray(value)) return []
+    return value
+      .map((item: any) => ({
+        cluster_id: item?.cluster_id || item?.clusterId || null,
+        similarity: typeof item?.similarity === 'number' ? item.similarity : undefined,
+        rank: typeof item?.rank === 'number' ? item.rank : null
+      }))
+      .filter((item: any) => item.cluster_id || typeof item.similarity === 'number' || typeof item.rank === 'number')
+  }
+
   function applyPreferenceLabels(targetPapers: Paper[], likedIds: string[], dislikedIds: string[]) {
     targetPapers.forEach(paper => {
       const arxivId = paper.arxivId || paper.id
@@ -261,6 +272,22 @@ export const usePaperStore = defineStore('paper', () => {
           finalScore: typeof p.final_score === 'number' ? p.final_score : undefined,
           reason: buildRecommendationReason(p),
           scoreBreakdown: p.score_breakdown || p.scoreBreakdown || undefined,
+          recall_source: p.recall_source || p.recallSource || undefined,
+          recall_cluster_id: p.recall_cluster_id || p.recallClusterId || null,
+          recall_cluster_similarity: typeof p.recall_cluster_similarity === 'number'
+            ? p.recall_cluster_similarity
+            : (typeof p.recallClusterSimilarity === 'number' ? p.recallClusterSimilarity : null),
+          recall_cluster_rank: typeof p.recall_cluster_rank === 'number'
+            ? p.recall_cluster_rank
+            : (typeof p.recallClusterRank === 'number' ? p.recallClusterRank : null),
+          recall_cluster_hits: toRecallClusterHits(p.recall_cluster_hits || p.recallClusterHits),
+          best_matched_cluster_id: p.best_matched_cluster_id || p.bestMatchedClusterId || null,
+          best_matched_cluster_similarity: typeof p.best_matched_cluster_similarity === 'number'
+            ? p.best_matched_cluster_similarity
+            : (typeof p.bestMatchedClusterSimilarity === 'number' ? p.bestMatchedClusterSimilarity : null),
+          cluster_similarities: Array.isArray(p.cluster_similarities)
+            ? p.cluster_similarities
+            : (Array.isArray(p.clusterSimilarities) ? p.clusterSimilarities : undefined),
           label: null
         }))
         totalRecommendations.value = result.total_found

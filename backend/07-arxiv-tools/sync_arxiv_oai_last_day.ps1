@@ -10,6 +10,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$CondaEnvName = "new_rag"
 
 if (-not (Test-Path -LiteralPath $ProjectRoot)) {
     throw "ProjectRoot not found: $ProjectRoot"
@@ -19,6 +20,14 @@ $scriptPath = Join-Path $ProjectRoot "sync_arxiv_oai.py"
 if (-not (Test-Path -LiteralPath $scriptPath)) {
     throw "sync_arxiv_oai.py not found at: $scriptPath"
 }
+
+$condaCommand = Get-Command conda -ErrorAction SilentlyContinue
+if (-not $condaCommand) {
+    throw "conda was not found on PATH."
+}
+
+& $condaCommand.Source "shell.powershell" "hook" | Out-String | Invoke-Expression
+conda activate $CondaEnvName
 
 # OAI-PMH datestamps are date-based, so this uses a calendar-day window:
 # from yesterday 00:00 to today 00:00 by default.
@@ -43,6 +52,7 @@ if ($DryRun.IsPresent) {
 }
 
 Write-Host ("[{0}] Running arXiv OAI-PMH sync for {1} -> {2}" -f (Get-Date), $from, $until)
+Write-Host ("[{0}] Conda environment: {1}" -f (Get-Date), $CondaEnvName)
 Write-Host ("[{0}] Command: {1} {2}" -f (Get-Date), $PythonExe, ($arguments -join " "))
 
 & $PythonExe @arguments

@@ -208,16 +208,35 @@ class RecommendationService:
         liked_category_freq = self._build_liked_category_frequency(liked_details)
 
         candidate_limit = max(top_n * 5, 50)
-        candidates = self._fetch_recent_db_candidates(
-            liked_category_freq=liked_category_freq,
-            max_age_months=max_age_months,
-            max_results=max(candidate_limit * 2, candidate_limit),
-        )
-        logger.info(
-            "Fetched %s candidate papers from OAI DB for user %s before deduplication",
-            len(candidates),
-            user_id,
-        )
+        cluster_recall_candidates: List[Dict[str, Any]] = []
+        if interest_clusters:
+            cluster_recall_candidates = self._fetch_cluster_recall_candidates(
+                interest_clusters=interest_clusters,
+                excluded_ids=excluded_ids,
+                top_k=max(top_n * 3, 20),
+            )
+            logger.info(
+                "Fetched %s cluster recall candidates for user %s from %s interest clusters",
+                len(cluster_recall_candidates),
+                user_id,
+                len(interest_clusters),
+            )
+
+        if cluster_recall_candidates:
+            candidates = cluster_recall_candidates
+            recall_mode = "cluster_recall"
+        else:
+            candidates = self._fetch_recent_db_candidates(
+                liked_category_freq=liked_category_freq,
+                max_age_months=max_age_months,
+                max_results=max(candidate_limit * 2, candidate_limit),
+            )
+            recall_mode = "recent_pool"
+            logger.info(
+                "Fetched %s recent OAI DB candidates for user %s before deduplication",
+                len(candidates),
+                user_id,
+            )
 
         filtered_candidates = self._deduplicate_candidates(candidates, excluded_ids)
         logger.info(
@@ -227,10 +246,30 @@ class RecommendationService:
             user_id,
         )
         if not filtered_candidates:
-            raise HTTPException(
-                status_code=400,
-                detail=f"No papers found for recommendation within the last {max_age_months} months",
-            )
+            if recall_mode == "cluster_recall":
+                candidates = self._fetch_recent_db_candidates(
+                    liked_category_freq=liked_category_freq,
+                    max_age_months=max_age_months,
+                    max_results=max(candidate_limit * 2, candidate_limit),
+                )
+                logger.info(
+                    "Cluster recall returned no candidates for user %s; falling back to recent OAI DB pool with %s papers",
+                    user_id,
+                    len(candidates),
+                )
+                filtered_candidates = self._deduplicate_candidates(candidates, excluded_ids)
+                logger.info(
+                    "Retained %s fallback candidate papers after deduplication against %s excluded papers for user %s",
+                    len(filtered_candidates),
+                    len(excluded_ids),
+                    user_id,
+                )
+                recall_mode = "cluster_recall_fallback_recent_pool"
+            if not filtered_candidates:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No papers found for recommendation within the last {max_age_months} months",
+                )
 
         materialized_candidates, materialize_stats = self._materialize_candidate_papers_for_recommendation(filtered_candidates)
         logger.info(
@@ -320,6 +359,7 @@ class RecommendationService:
             "total_found": len(scored_candidates),
             "interest_profile_mode": user_vector_data.get("profile_mode", "mean"),
             "interest_cluster_count": user_vector_data.get("cluster_count", 0),
+            "recall_mode": recall_mode,
             "recommendations": selected,
         }
 
@@ -525,7 +565,16 @@ class RecommendationService:
                 logger.warning("Failed batch materialization for recommendation candidates: %s", exc)
                 stats["unresolved"] += len(batch_jobs)
 
-        ordered_candidates = [materialized_by_id[str(candidate.get("arxiv_id", "") or "").strip()] for candidate in candidates if str(candidate.get("arxiv_id", "") or "").strip() in materialized_by_id]
+        ordered_candidates = []
+        for candidate in candidates:
+            arxiv_id = str(candidate.get("arxiv_id", "") or "").strip()
+            if not arxiv_id or arxiv_id not in materialized_by_id:
+                continue
+            merged_candidate = {**candidate, **materialized_by_id[arxiv_id]}
+            for key, value in candidate.items():
+                if key.startswith("recall_") or key in {"similarity_score", "score", "distance", "metadata"}:
+                    merged_candidate[key] = value
+            ordered_candidates.append(merged_candidate)
         return ordered_candidates, stats
 
     def _ensure_paper_materialized(
@@ -1195,6 +1244,113 @@ class RecommendationService:
         for candidate in selected:
             candidate.pop("_candidate_categories", None)
         return selected
+
+    def _fetch_cluster_recall_candidates(
+        self,
+        interest_clusters: List[Dict[str, Any]],
+        excluded_ids: List[str],
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
+        normalized_excluded_ids = [str(arxiv_id).strip() for arxiv_id in excluded_ids if str(arxiv_id).strip()]
+        candidates_by_id: Dict[str, Dict[str, Any]] = {}
+
+        for cluster_index, cluster in enumerate(interest_clusters):
+            centroid_vector = cluster.get("centroid_vector") or []
+            if not centroid_vector:
+                continue
+
+            cluster_id = str(cluster.get("cluster_id") or f"cluster_{cluster_index}").strip() or f"cluster_{cluster_index}"
+            try:
+                recalled_papers = self.vector_store_service.search_similar_papers(
+                    collection_name=self.collection_name,
+                    query_vector=[float(value) for value in centroid_vector],
+                    top_k=max(1, int(top_k)),
+                    filter_arxiv_ids=normalized_excluded_ids,
+                )
+            except Exception as exc:  # pragma: no cover - vector store runtime dependent
+                logger.warning("Failed cluster recall for user cluster %s: %s", cluster_id, exc)
+                continue
+
+            for rank, paper in enumerate(recalled_papers, start=1):
+                arxiv_id = str(paper.get("arxiv_id", "") or "").strip()
+                if not arxiv_id:
+                    continue
+
+                similarity = float(paper.get("similarity_score", paper.get("score", 0.0)) or 0.0)
+                recall_hit = {
+                    "cluster_id": cluster_id,
+                    "similarity": similarity,
+                    "rank": rank,
+                }
+                candidate = {
+                    **paper,
+                    "recall_source": "cluster_recall",
+                    "recall_cluster_id": cluster_id,
+                    "recall_cluster_similarity": similarity,
+                    "recall_cluster_rank": rank,
+                    "recall_cluster_hits": [recall_hit],
+                }
+
+                existing_candidate = candidates_by_id.get(arxiv_id)
+                if existing_candidate is None:
+                    candidates_by_id[arxiv_id] = candidate
+                    continue
+
+                existing_hits = list(existing_candidate.get("recall_cluster_hits", []))
+                combined_hits = self._sort_recall_hits(existing_hits + [recall_hit])
+                existing_candidate["recall_cluster_hits"] = combined_hits
+
+                if self._is_better_cluster_recall_candidate(candidate, existing_candidate):
+                    candidate["recall_cluster_hits"] = combined_hits
+                    candidates_by_id[arxiv_id] = candidate
+
+        candidates = list(candidates_by_id.values())
+        candidates.sort(
+            key=lambda item: (
+                -float(item.get("recall_cluster_similarity", 0.0) or 0.0),
+                int(item.get("recall_cluster_rank", 0) or 0),
+                str(item.get("arxiv_id", "") or ""),
+            )
+        )
+        return candidates
+
+    def _sort_recall_hits(self, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        unique_hits: List[Dict[str, Any]] = []
+        seen = set()
+        for hit in hits:
+            cluster_id = str(hit.get("cluster_id", "") or "").strip()
+            rank = int(hit.get("rank", 0) or 0)
+            similarity = float(hit.get("similarity", 0.0) or 0.0)
+            key = (cluster_id, rank, similarity)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_hits.append(
+                {
+                    "cluster_id": cluster_id or None,
+                    "similarity": similarity,
+                    "rank": rank,
+                }
+            )
+        unique_hits.sort(
+            key=lambda item: (
+                -float(item.get("similarity", 0.0) or 0.0),
+                int(item.get("rank", 0) or 0),
+                str(item.get("cluster_id", "") or ""),
+            )
+        )
+        return unique_hits
+
+    def _is_better_cluster_recall_candidate(self, candidate: Dict[str, Any], existing_candidate: Dict[str, Any]) -> bool:
+        candidate_key = (
+            float(candidate.get("recall_cluster_similarity", 0.0) or 0.0),
+            -int(candidate.get("recall_cluster_rank", 0) or 0),
+        )
+        existing_key = (
+            float(existing_candidate.get("recall_cluster_similarity", 0.0) or 0.0),
+            -int(existing_candidate.get("recall_cluster_rank", 0) or 0),
+        )
+        return candidate_key > existing_key
 
     def _calculate_category_score(self, categories: List[str], liked_category_freq: Counter) -> float:
         if not categories or not liked_category_freq:

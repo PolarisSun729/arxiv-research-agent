@@ -11,6 +11,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
 
+from services.embedding_service import EmbeddingService
+from services.vector_store_service import VectorStoreService
 from utils.config import OAI_SQLITE_CONFIG
 
 logger = logging.getLogger(__name__)
@@ -33,6 +35,10 @@ class ArxivOaiSyncStats:
     skipped_no_categories: int = 0
     skipped_category_filter: int = 0
     skipped_parse_errors: int = 0
+    embeddings_attempted: int = 0
+    embeddings_written: int = 0
+    embeddings_skipped_existing: int = 0
+    embedding_errors: int = 0
     errors: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -310,6 +316,9 @@ class ArxivOaiSyncService:
         request_timeout_seconds: float = 60.0,
         max_retries: int = 5,
         database_service: Optional[ArxivOaiDatabaseService] = None,
+        embedding_service: Optional[EmbeddingService] = None,
+        vector_store_service: Optional[VectorStoreService] = None,
+        embedding_collection_name: str = "arxiv_paper_embeddings",
         user_agent: str = "rag-project01-framework-oai-sync/1.0",
     ):
         self.endpoint = endpoint
@@ -317,6 +326,10 @@ class ArxivOaiSyncService:
         self.request_timeout_seconds = float(request_timeout_seconds)
         self.max_retries = max(1, int(max_retries))
         self.database_service = database_service
+        self.embedding_service = embedding_service or EmbeddingService()
+        self.vector_store_service = vector_store_service or VectorStoreService()
+        self.embedding_collection_name = embedding_collection_name
+        self.embedding_config = self.embedding_service.get_default_embedding_config()
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": user_agent})
 
@@ -377,13 +390,17 @@ class ArxivOaiSyncService:
         logger.info(
             (
                 "OAI-PMH sync summary: requests=%s pages=%s seen=%s matched=%s "
-                "written=%s skipped=%s filtered=%s no_metadata=%s no_categories=%s errors=%s dry_run=%s"
+                "written=%s embeddings_written=%s embeddings_skipped_existing=%s embedding_errors=%s "
+                "skipped=%s filtered=%s no_metadata=%s no_categories=%s errors=%s dry_run=%s"
             ),
             stats.requests_made,
             stats.pages_processed,
             stats.records_seen,
             stats.records_matched,
             stats.records_written,
+            stats.embeddings_written,
+            stats.embeddings_skipped_existing,
+            stats.embedding_errors,
             stats.records_skipped,
             stats.skipped_category_filter,
             stats.skipped_no_metadata + stats.skipped_no_arxiv_id + stats.skipped_parse_errors,
@@ -513,9 +530,73 @@ class ArxivOaiSyncService:
 
         if self.database_service.upsert_arxiv_oai_paper(paper):
             stats.records_written += 1
+            self._maybe_store_paper_embedding(paper, stats)
         else:
             stats.errors += 1
             logger.error("Failed to upsert %s", arxiv_id)
+
+    def _maybe_store_paper_embedding(self, paper: Dict[str, Any], stats: ArxivOaiSyncStats) -> None:
+        arxiv_id = str(paper.get("arxiv_id", "") or "").strip()
+        title = str(paper.get("title", "") or "").strip()
+        abstract = str(paper.get("abstract", "") or "").strip()
+        if not arxiv_id or not title or not abstract:
+            logger.debug("Skipping embedding for OAI paper %s because title or abstract is missing", arxiv_id or "<unknown>")
+            return
+
+        try:
+            existing_embeddings = self.vector_store_service.get_paper_embeddings_by_arxiv_ids(
+                collection_name=self.embedding_collection_name,
+                arxiv_ids=[arxiv_id],
+            )
+        except Exception as exc:  # pragma: no cover - vector store runtime dependent
+            logger.warning("Failed to inspect existing embedding for OAI paper %s: %s", arxiv_id, exc)
+            existing_embeddings = []
+
+        if existing_embeddings:
+            stats.embeddings_skipped_existing += 1
+            return
+
+        stats.embeddings_attempted += 1
+        text_to_embed = self.embedding_service.build_paper_embedding_text(title, abstract)
+        if not text_to_embed:
+            stats.embedding_errors += 1
+            logger.warning("Skipping OAI embedding for %s because embedding text is empty", arxiv_id)
+            return
+
+        try:
+            embedding = self.embedding_service.create_single_embedding(
+                text_to_embed,
+                provider=self.embedding_config.provider,
+                model=self.embedding_config.model_name,
+                api_key=self.embedding_config.api_key,
+                base_url=self.embedding_config.base_url,
+                dimension=self.embedding_config.dimension,
+            )
+            metadata = {
+                "content": abstract,
+                "arxiv_id": arxiv_id,
+                "title": title,
+                "authors": paper.get("authors", ""),
+                "categories": paper.get("categories", ""),
+                "published_date": str(
+                    paper.get("created")
+                    or paper.get("updated")
+                    or paper.get("oai_datestamp")
+                    or ""
+                ).strip(),
+                "url": str(paper.get("abs_url") or paper.get("pdf_url") or "").strip(),
+                "embedding_model": self.embedding_config.model_name,
+            }
+            self.vector_store_service.insert_single_embedding(
+                self.embedding_collection_name,
+                embedding,
+                metadata,
+            )
+            stats.embeddings_written += 1
+            logger.info("Embedded OAI paper into vector store: %s", arxiv_id)
+        except Exception as exc:  # pragma: no cover - embedding/vector store runtime dependent
+            stats.embedding_errors += 1
+            logger.warning("Failed to embed OAI paper %s into vector store: %s", arxiv_id, exc)
 
     def _parse_paper_metadata(self, record: ET.Element, paper_elem: ET.Element) -> Optional[Dict[str, Any]]:
         try:

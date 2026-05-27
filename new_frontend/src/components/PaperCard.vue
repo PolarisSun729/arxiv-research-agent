@@ -38,6 +38,21 @@ const bestMatchedClusterId = computed(() => {
   return props.paper.best_matched_cluster_id || ''
 })
 
+const recallClusterId = computed(() => {
+  if (!isRecommended(props.paper)) return ''
+  return props.paper.recall_cluster_id || ''
+})
+
+const recallClusterSimilarity = computed(() => {
+  if (!isRecommended(props.paper) || typeof props.paper.recall_cluster_similarity !== 'number') return 0
+  return props.paper.recall_cluster_similarity
+})
+
+const recallClusterHitsCount = computed(() => {
+  if (!isRecommended(props.paper) || !Array.isArray(props.paper.recall_cluster_hits)) return 0
+  return props.paper.recall_cluster_hits.length
+})
+
 const finalScoreText = computed(() => {
   if (!isRecommended(props.paper) || typeof props.paper.finalScore !== 'number') {
     return ''
@@ -148,6 +163,15 @@ const labelOptions = [
       <span v-if="finalScoreText" class="final-score-label">最终 {{ finalScoreText }}</span>
       <el-tag v-if="bestMatchedClusterId" size="small" type="success" effect="plain">
         命中 {{ bestMatchedClusterId }}
+      </el-tag>
+      <el-tag v-if="recallClusterId" size="small" type="warning" effect="plain">
+        召回 {{ recallClusterId }}
+      </el-tag>
+      <el-tag v-if="recallClusterId" size="small" type="info" effect="plain">
+        召回相似 {{ toPercent(recallClusterSimilarity) }}%
+      </el-tag>
+      <el-tag v-if="recallClusterHitsCount > 1" size="small" type="info" effect="plain">
+        多簇命中 {{ recallClusterHitsCount }}
       </el-tag>
       <p v-if="recommendationReason" class="recommendation-reason">
         {{ recommendationReason }}
