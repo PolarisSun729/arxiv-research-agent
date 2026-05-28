@@ -42,10 +42,6 @@ CORE_CONFIG: Dict[str, Any] = {
         "ARXIV_PROXY_URL",
         "http://127.0.0.1:7897",
     ),
-    "arxiv_local_path": _env_str(
-        "ARXIV_LOCAL_PATH",
-        str(REPO_ROOT / "07-local-arxiv" / "arxiv-2026-04-papers.json"),
-    ),
 }
 
 DOCLING_CONFIG: Dict[str, Any] = {

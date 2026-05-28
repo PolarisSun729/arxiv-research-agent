@@ -11,12 +11,19 @@ from services.embedding_service import EmbeddingService, EmbeddingConfig
 from services.vector_store_service import VectorStoreService, VectorDBConfig
 from services.search_service import SearchService
 from services.parsing_service import ParsingService
-from services.arxiv_search_service import ArxivSearchService
+from services.arxiv_search_service import (
+    ArxivSearchService,
+    ArxivSearchValidationError,
+    build_arxiv_query_from_structured_params,
+    build_arxiv_submitted_date_query,
+    validate_arxiv_search_request,
+)
 from services.local_arxiv_service import LocalArxivService
 from services.database_service import DatabaseService
 from services.arxiv_oai_service import ArxivOaiDatabaseService
 from services.recommendation_service import RecommendationService
 from services.enhanced_retrieval_service import EnhancedRetrievalService, RetrievalOptions
+from services.paper_qa_service import PaperQAService
 import logging
 from enum import Enum
 from utils.config import CORE_CONFIG, VectorDBProvider
@@ -65,7 +72,6 @@ app.add_middleware(
 
 # 数据源配置
 DATA_SOURCE = CORE_CONFIG["arxiv_data_source"]
-LOCAL_DATA_PATH = CORE_CONFIG["arxiv_local_path"]
 ARXIV_PROXY_URL = CORE_CONFIG.get("arxiv_proxy_url", "")
 
 # 初始化服务
@@ -81,7 +87,7 @@ enhanced_retrieval_service = EnhancedRetrievalService(
 )
 
 # 初始化 arXiv 服务
-local_arxiv_service = LocalArxivService(data_path=LOCAL_DATA_PATH)
+local_arxiv_service = LocalArxivService()
 
 
 def get_current_embedding_config() -> EmbeddingConfig:
@@ -95,6 +101,16 @@ recommendation_service = RecommendationService(
     get_embedding_config=get_current_embedding_config,
     arxiv_service_factory=lambda: get_arxiv_service(),
     oai_db_service=oai_db_service,
+)
+
+paper_qa_service = PaperQAService(
+    db_service=db_service,
+    embedding_service=embedding_service,
+    vector_store_service=vector_store_service,
+    generation_service=generation_service,
+    enhanced_retrieval_service=enhanced_retrieval_service,
+    arxiv_service_factory=lambda: get_arxiv_api_service(),
+    get_embedding_config=get_current_embedding_config,
 )
 
 
@@ -135,118 +151,15 @@ class QaRequest(BaseModel):
 
 
 def build_qa_context(arxiv_id: str, payload: QaRequest):
-    qa_index = db_service.get_paper_qa_index(arxiv_id)
-    if not qa_index or qa_index['status'] != 'indexed':
-        raise HTTPException(status_code=400, detail="Paper does not have QA index. Please create index first.")
-
-    collection_name = qa_index['collection_name']
-    paper = db_service.get_paper(arxiv_id) or {}
-    retrieval_result = enhanced_retrieval_service.enhanced_retrieve(
-        collection_name=collection_name,
-        user_query=payload.question.strip(),
-        paper_context={
-            "arxiv_id": arxiv_id,
-            "title": paper.get("title", ""),
-            "abstract": paper.get("abstract", ""),
-            "authors": paper.get("authors", ""),
-            "categories": paper.get("categories", ""),
-            "published_date": paper.get("published_date", ""),
-            "url": paper.get("url", ""),
-        },
-        options=RetrievalOptions(
-            top_k=payload.top_k or 15,
-            enable_query_rewrite=payload.enable_query_rewrite,
-            enable_hyde=payload.enable_hyde,
-            enable_keyword_search=payload.enable_keyword_search,
-            enable_llm_rerank=payload.enable_llm_rerank,
-            debug=payload.debug,
-        ),
-    )
-    final_context_results = retrieval_result["chunks"]
-    search_results = final_context_results
-
-    if not search_results:
-        raise HTTPException(status_code=400, detail="No relevant chunks found")
-
-    text_context, image_inputs, asset_metadata = build_generation_context(search_results)
-    return qa_index, search_results, {
-        "text_context": text_context,
-        "image_inputs": image_inputs,
-        "asset_metadata": asset_metadata,
-    }, retrieval_result.get("debug")
+    return paper_qa_service.build_qa_context(arxiv_id, payload)
 
 
 def build_generation_context(search_results: List[Dict[str, Any]]) -> tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
-    text_parts: List[str] = []
-    image_inputs: List[Dict[str, Any]] = []
-    asset_metadata: List[Dict[str, Any]] = []
-
-    for index, result in enumerate(search_results, start=1):
-        chunk_type = str(result.get("chunk_type", "text") or "text").strip().lower()
-        asset_info = {
-            "chunk_type": chunk_type,
-            "asset_kind": result.get("asset_kind", ""),
-            "asset_path": result.get("asset_path", ""),
-            "asset_abs_path": result.get("asset_abs_path", ""),
-            "asset_summary": result.get("asset_summary", ""),
-            "asset_preview_text": result.get("asset_preview_text", ""),
-            "page_number": result.get("page_number", ""),
-            "page_range": result.get("page_range", ""),
-            "section_path": result.get("section_path", ""),
-            "section_title": result.get("section_title", ""),
-            "source": result.get("source", ""),
-        }
-
-        if chunk_type == "figure" and asset_info["asset_abs_path"]:
-            image_inputs.append(
-                {
-                    "image_path": asset_info["asset_abs_path"],
-                    "page_number": asset_info["page_number"],
-                    "asset_summary": asset_info["asset_summary"],
-                    "section_path": asset_info["section_path"],
-                }
-            )
-            asset_metadata.append(asset_info)
-            continue
-
-        if chunk_type == "table":
-            table_text = "\n".join(
-                part for part in [
-                    f"[Table {index}]",
-                    str(result.get("asset_summary", "") or "").strip(),
-                    str(result.get("asset_preview_text", "") or "").strip(),
-                ] if part
-            ).strip()
-            if table_text:
-                text_parts.append(table_text)
-            asset_metadata.append(asset_info)
-            continue
-
-        content = str(result.get("content", "") or "").strip()
-        if content:
-            text_parts.append(content)
-
-    return "\n\n".join(text_parts), image_inputs, asset_metadata
+    return paper_qa_service.build_generation_context(search_results)
 
 
 def build_source_payload(search_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [
-        {
-            "content": r.get("content", ""),
-            "page_number": r.get("page_number", ""),
-            "source": r.get("source", ""),
-            "subchunk_label": r.get("subchunk_label", ""),
-            "chunk_label": r.get("subchunk_label", ""),
-            "section_path": r.get("section_path", ""),
-            "parent_chunk_id": r.get("parent_chunk_id", r.get("chunk_id", 0)),
-            "chunk_type": r.get("chunk_type", "text"),
-            "asset_kind": r.get("asset_kind", ""),
-            "asset_path": r.get("asset_path", ""),
-            "asset_summary": r.get("asset_summary", ""),
-            "asset_preview_text": r.get("asset_preview_text", ""),
-        }
-        for r in search_results
-    ]
+    return paper_qa_service.build_source_payload(search_results)
 
 
 def _sanitize_trace_slug(text: str, max_length: int = 40) -> str:
@@ -375,37 +288,64 @@ async def arxiv_search(
     """
     try:
         arxiv_service = get_arxiv_service()
-        
-        if search_query and not any([title, author, abstract, category, comment, journal_ref, report_number]):
-            results = arxiv_service.search_papers(
+
+        structured_fields_present = any([title, author, abstract, category, comment, journal_ref, report_number])
+        if structured_fields_present:
+            structured = build_arxiv_query_from_structured_params(
+                query=search_query,
+                title_query=title,
+                author_query=author,
+                abstract_query=abstract,
+                categories=[category] if category else None,
+                comment_query=comment,
+                journal_ref_query=journal_ref,
+                report_number_query=report_number,
+                id_list=id_list,
+                field_operator=operator if operator and operator.strip() else "AND",
+                category_operator="OR",
+                submitted_days_ago=submitted_days_ago,
+            )
+            validate_arxiv_search_request(
+                search_query=structured["final_search_query"],
+                id_list=structured["id_list"],
+                max_results=max_results,
+                start=start,
+                sort_by=sort_by,
+                sort_order=sort_order,
+            )
+            results = arxiv_service.search(
+                search_query=structured["final_search_query"],
+                id_list=structured["id_list"],
+                max_results=max_results,
+                start=start,
+                sort_by=sort_by,
+                sort_order=sort_order,
+            )
+        else:
+            validate_arxiv_search_request(
                 search_query=search_query,
                 id_list=id_list,
                 max_results=max_results,
                 start=start,
                 sort_by=sort_by,
                 sort_order=sort_order,
-                submitted_days_ago=submitted_days_ago
             )
-        else:
-            effective_operator = operator if operator and operator.strip() else "AND"
-            results = arxiv_service.search_advanced(
-                title=title,
-                author=author,
-                abstract=abstract,
-                category=category,
-                comment=comment,
-                journal_ref=journal_ref,
-                report_number=report_number,
-                operator=effective_operator,
+            normalized_search_query = search_query
+            if submitted_days_ago is not None and submitted_days_ago >= 0 and normalized_search_query and not id_list:
+                normalized_search_query = f"({normalized_search_query}) AND {build_arxiv_submitted_date_query(submitted_days_ago)}"
+            results = arxiv_service.search(
+                search_query=normalized_search_query,
                 id_list=id_list,
                 max_results=max_results,
                 start=start,
                 sort_by=sort_by,
                 sort_order=sort_order,
-                submitted_days_ago=submitted_days_ago
             )
-        
+
         return results
+    except ArxivSearchValidationError as exc:
+        logger.error(f"Invalid arXiv search query: {str(exc)}")
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as e:
         logger.error(f"Error searching arXiv: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -748,22 +688,7 @@ async def search_papers_by_category(category: str):
 async def get_paper_qa_status(arxiv_id: str):
     """检查论文是否已有问答索引"""
     try:
-        qa_index = db_service.get_paper_qa_index(arxiv_id)
-        if qa_index:
-            return {
-                "arxiv_id": arxiv_id,
-                "has_index": qa_index['status'] == 'indexed',
-                "status": qa_index['status'],
-                "collection_name": qa_index['collection_name'],
-                "chunk_count": qa_index['chunk_count'],
-                "embedding_model": qa_index['embedding_model']
-            }
-        else:
-            return {
-                "arxiv_id": arxiv_id,
-                "has_index": False,
-                "status": "not_indexed"
-            }
+        return paper_qa_service.get_qa_status(arxiv_id)
     except Exception as e:
         logger.error(f"Error getting paper QA status: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -827,126 +752,11 @@ async def create_paper_qa_index(arxiv_id: str, loading_method: str = Query("docl
     流程：下载PDF -> 解析正文 -> 切分chunks -> 计算embeddings -> 保存到向量数据库
     """
     try:
-        logger.info(f"Creating QA index for paper: {arxiv_id}")
-        loading_method = str(loading_method or "pymupdf").strip().lower()
-        if loading_method not in {"pymupdf", "docling"}:
-            raise HTTPException(status_code=400, detail="loading_method must be either pymupdf or docling")
-        
-        db_service.insert_paper_qa_index(arxiv_id, status='processing')
-        
-        arxiv_service = get_arxiv_api_service()
-        
-        paper = db_service.get_paper(arxiv_id)
-        if not paper:
-            raise HTTPException(status_code=404, detail="Paper not found in database")
-        
-        pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
-        logger.info(f"Downloading PDF from: {pdf_url}")
-        
-        pdf_path = arxiv_service.download_pdf(pdf_url, arxiv_id)
-        logger.info(f"PDF downloaded to: {pdf_path}")
-        
-        loading_service = LoadingService()
-        logger.info("Loading PDF content...")
-        document = loading_service.load_pdf(pdf_path, method=loading_method)
-
-        page_map = loading_service.get_page_map()
-        logger.info(f"Loaded {len(page_map)} pages from PDF")
-
-        chunking_service = ChunkingService()
-        logger.info("Chunking text...")
-        metadata = {"filename": f"{arxiv_id}.pdf", "loading_method": loading_method, "source": f"{arxiv_id}.pdf"}
-        if loading_method == "docling":
-            chunked_data = chunking_service.chunk_docling(document, metadata=metadata, page_map=page_map)
-            chunking_strategy = "docling_sections"
-        else:
-            chunked_data = chunking_service.chunk_pymupdf(document, method="by_titles", metadata=metadata, page_map=page_map)
-            chunking_strategy = "pymupdf_by_titles"
-
-        chunks = chunked_data['chunks']
-        logger.info(f"Created {len(chunks)} chunks")
-        logger.info(
-            "Chunk composition: text=%d figure=%d table=%d",
-            sum(1 for chunk in chunks if str((chunk.get("metadata", {}) or {}).get("chunk_type", "text")) == "text"),
-            sum(1 for chunk in chunks if str((chunk.get("metadata", {}) or {}).get("chunk_type", "")) == "figure"),
-            sum(1 for chunk in chunks if str((chunk.get("metadata", {}) or {}).get("chunk_type", "")) == "table"),
-        )
-
-        # Persist the chunked document so the frontend can inspect the actual chunks.
-        chunk_file = loading_service.save_document(
-            filename=f"{arxiv_id}.pdf",
-            chunks=chunks,
-            metadata={"total_pages": len(page_map)},
-            loading_method=loading_method,
-            chunking_strategy=chunking_strategy,
-            document_data=document,
-        )
-        logger.info(f"Chunked document saved to: {chunk_file}")
-
-        logger.info("Compressing chunk text for rerank with Qwen...")
-        chunks = generation_service.compress_chunks_for_rerank(
-            chunks=chunks,
-            model_name="qwen3.6-plus",
-        )
-        logger.info("Generated rerank_text for %d chunks", len(chunks))
-
-        embedding_config = get_current_embedding_config()
-        logger.info(
-            "Creating embeddings with %s / %s...",
-            embedding_config.provider,
-            embedding_config.model_name,
-        )
-
-        input_data = {
-            "chunks": chunks,
-            "metadata": {"filename": f"{arxiv_id}.pdf"},
-        }
-        embeddings, _ = embedding_service.create_embeddings(input_data, embedding_config)
-
-        logger.info(f"Created {len(embeddings)} embeddings")
-        logger.info(
-            "Embedding composition: text=%d figure=%d table=%d",
-            sum(1 for item in embeddings if str((item.get("metadata", {}) or {}).get("chunk_type", "text")) == "text"),
-            sum(1 for item in embeddings if str((item.get("metadata", {}) or {}).get("chunk_type", "")) == "figure"),
-            sum(1 for item in embeddings if str((item.get("metadata", {}) or {}).get("chunk_type", "")) == "table"),
-        )
-
-        embedding_file = embedding_service.save_embeddings(f"{arxiv_id}.pdf", embeddings)
-        logger.info(f"Embeddings saved to: {embedding_file}")
-
-        vector_db_config = VectorDBConfig(provider="milvus", index_mode="default")
-        index_result = vector_store_service.index_embeddings(embedding_file, vector_db_config)
-
-        collection_name = index_result.get("collection_name", "")
-        logger.info(f"Index created in collection: {collection_name}")
-
-        db_service.update_paper_qa_index(
-            arxiv_id,
-            collection_name=collection_name,
-            status="indexed",
-            chunk_count=len(chunks),
-            embedding_model=embedding_config.model_name,
-            pdf_path=pdf_path,
-        )
-
-        return {
-            "status": "success",
-            "message": "QA index created successfully",
-            "arxiv_id": arxiv_id,
-            "loading_method": loading_method,
-            "pdf_path": pdf_path,
-            "collection_name": collection_name,
-            "chunk_count": len(chunks),
-            "embedding_model": embedding_config.model_name,
-            "chunk_file": chunk_file,
-        }
-        
+        return paper_qa_service.build_qa_index(arxiv_id, loading_method=loading_method)
     except HTTPException:
-        db_service.update_paper_qa_index(arxiv_id, status='failed')
         raise
     except Exception as e:
         logger.exception("Error creating QA index: %s", str(e))
-        db_service.update_paper_qa_index(arxiv_id, status='failed')
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -957,53 +767,7 @@ async def qa_paper(arxiv_id: str, payload: QaRequest):
     流程：检查索引 -> 搜索相似chunks -> 生成回答
     """
     try:
-        question = payload.question.strip()
-        logger.info(f"QA request for paper: {arxiv_id}, question: {question}")
-        _, search_results, qa_context, retrieval_debug = build_qa_context(arxiv_id, payload)
-        source_payload = build_source_payload(search_results)
-        
-        logger.info("Generating answer...")
-        
-        try:
-            qwen_search_results = [
-                {
-                    "text": result.get("content", ""),
-                    "page_number": result.get("page_number", ""),
-                    "source": result.get("source", ""),
-                    "subchunk_label": result.get("subchunk_label", ""),
-                    "chunk_label": result.get("subchunk_label", ""),
-                    "section_path": result.get("section_path", ""),
-                    "chunk_type": result.get("chunk_type", "text"),
-                    "asset_kind": result.get("asset_kind", ""),
-                    "asset_summary": result.get("asset_summary", ""),
-                    "asset_preview_text": result.get("asset_preview_text", ""),
-                }
-                for result in search_results
-            ]
-            generation_result = generation_service.generate(
-                provider="qwen",
-                model_name="qwen3.6-plus",
-                query=question,
-                search_results=qwen_search_results,
-                image_inputs=qa_context["image_inputs"],
-                asset_metadata=[item for item in qa_context["asset_metadata"] if item.get("chunk_type") == "figure"],
-            )
-            answer = generation_result["response"]
-        except Exception as e:
-            logger.warning(f"Qwen generation failed, using fallback: {str(e)}")
-            answer = f'根据论文内容，关于您的问题 "{question}" 的相关信息如下：\n\n{qa_context["text_context"][:1000]}...'
-        
-        return {
-            "status": "success",
-            "arxiv_id": arxiv_id,
-            "question": question,
-            "answer": answer,
-            "sources": source_payload,
-            "image_inputs": qa_context["image_inputs"],
-            "asset_metadata": qa_context["asset_metadata"],
-            "retrieval_debug": retrieval_debug,
-        }
-        
+        return paper_qa_service.answer_question(arxiv_id, payload)
     except HTTPException:
         raise
     except Exception as e:
@@ -1019,9 +783,9 @@ async def qa_paper_stream(arxiv_id: str, payload: QaRequest):
     question = payload.question.strip()
     logger.info(f"QA stream request for paper: {arxiv_id}, question: {question}")
 
-    _, search_results, qa_context, retrieval_debug = build_qa_context(arxiv_id, payload)
+    _, search_results, qa_context, retrieval_debug = paper_qa_service.build_qa_context(arxiv_id, payload)
 
-    source_payload = build_source_payload(search_results)
+    source_payload = paper_qa_service.build_source_payload(search_results)
 
     def sse_event(event_name: str, data: dict) -> str:
         return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"

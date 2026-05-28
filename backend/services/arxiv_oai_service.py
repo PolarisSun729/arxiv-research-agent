@@ -232,6 +232,316 @@ class ArxivOaiDatabaseService:
             logger.error("Error getting recent OAI papers: %s", exc)
             return []
 
+    def _normalize_text_value(self, value: Optional[str]) -> str:
+        return " ".join(str(value or "").strip().split())
+
+    def _strip_outer_parentheses(self, query: str) -> str:
+        text = query.strip()
+        while text.startswith("(") and text.endswith(")"):
+            depth = 0
+            balanced = True
+            for index, char in enumerate(text):
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                    if depth == 0 and index != len(text) - 1:
+                        balanced = False
+                        break
+            if balanced and depth == 0:
+                text = text[1:-1].strip()
+            else:
+                break
+        return text
+
+    def _split_top_level(self, query: str, token: str) -> List[str]:
+        text = query.strip()
+        parts: List[str] = []
+        depth = 0
+        start = 0
+        index = 0
+        token_length = len(token)
+        while index < len(text):
+            char = text[index]
+            if char == "(":
+                depth += 1
+                index += 1
+                continue
+            if char == ")":
+                depth = max(depth - 1, 0)
+                index += 1
+                continue
+            if depth == 0 and text.startswith(token, index):
+                parts.append(text[start:index].strip())
+                index += token_length
+                start = index
+                continue
+            index += 1
+        parts.append(text[start:].strip())
+        return [part for part in parts if part]
+
+    def _parse_row(self, row: Sequence[Any]) -> Dict[str, Any]:
+        return {
+            "arxiv_id": row[0],
+            "title": row[1],
+            "abstract": row[2],
+            "authors": self._parse_list_field(row[3]),
+            "categories": self._parse_list_field(row[4]),
+            "primary_category": row[5],
+            "created": row[6],
+            "updated": row[7],
+            "abs_url": row[8],
+            "pdf_url": row[9],
+            "oai_datestamp": row[10],
+            "fetched_at": row[11],
+            "created_at": row[12],
+            "updated_at": row[13],
+        }
+
+    def _paper_to_search_fields(self, paper: Dict[str, Any]) -> Dict[str, str]:
+        authors = paper.get("authors", "")
+        categories = paper.get("categories", "")
+        if isinstance(authors, (list, tuple)):
+            authors_text = ", ".join([str(item).strip() for item in authors if str(item).strip()])
+        else:
+            authors_text = str(authors or "")
+        if isinstance(categories, (list, tuple)):
+            categories_text = ", ".join([str(item).strip() for item in categories if str(item).strip()])
+        else:
+            categories_text = str(categories or "")
+        return {
+            "ti": str(paper.get("title", "") or "").lower(),
+            "title": str(paper.get("title", "") or "").lower(),
+            "au": authors_text.lower(),
+            "authors": authors_text.lower(),
+            "abs": str(paper.get("abstract", "") or "").lower(),
+            "abstract": str(paper.get("abstract", "") or "").lower(),
+            "cat": categories_text.lower(),
+            "category": categories_text.lower(),
+            "all": " ".join(
+                [
+                    str(paper.get("title", "") or ""),
+                    authors_text,
+                    str(paper.get("abstract", "") or ""),
+                    categories_text,
+                    str(paper.get("primary_category", "") or ""),
+                ]
+            ).lower(),
+        }
+
+    def _matches_submitted_date(self, paper: Dict[str, Any], query: str) -> bool:
+        match = re.match(r"submittedDate:\[(\d{12})\s+TO\s+(\d{12})\]", query.strip())
+        if not match:
+            return True
+        start_raw, end_raw = match.groups()
+        candidate = paper.get("updated") or paper.get("created") or paper.get("oai_datestamp") or ""
+        if not candidate:
+            return True
+        candidate_text = str(candidate).strip()
+        try:
+            if len(candidate_text) >= 16 and "T" in candidate_text:
+                candidate_dt = datetime.fromisoformat(candidate_text.replace("Z", "+00:00"))
+            elif len(candidate_text) >= 16 and " " in candidate_text:
+                candidate_dt = datetime.strptime(candidate_text[:16], "%Y-%m-%d %H:%M")
+            else:
+                candidate_dt = datetime.strptime(candidate_text[:10], "%Y-%m-%d")
+            start_dt = datetime.strptime(start_raw, "%Y%m%d%H%M")
+            end_dt = datetime.strptime(end_raw, "%Y%m%d%H%M")
+            return start_dt <= candidate_dt.replace(tzinfo=None) <= end_dt
+        except Exception:
+            return True
+
+    def _matches_atomic_clause(self, paper: Dict[str, Any], clause: str) -> bool:
+        text = self._strip_outer_parentheses(clause.strip())
+        if not text:
+            return True
+        if text.startswith("submittedDate:["):
+            return self._matches_submitted_date(paper, text)
+        if ":" in text:
+            field, raw_query = text.split(":", 1)
+            field = field.strip().lower()
+            query_text = self._strip_outer_parentheses(raw_query.strip())
+            if query_text.startswith('"') and query_text.endswith('"'):
+                query_text = query_text[1:-1]
+            query_text = query_text.replace('\\"', '"').replace("\\\\", "\\").lower()
+            haystack = self._paper_to_search_fields(paper).get(field, self._paper_to_search_fields(paper)["all"])
+            return query_text in haystack
+        query_text = text.replace('"', "").lower()
+        return query_text in self._paper_to_search_fields(paper)["all"]
+
+    def _matches_query(self, paper: Dict[str, Any], query: str) -> bool:
+        text = self._strip_outer_parentheses(query.strip())
+        if not text:
+            return True
+        if " ANDNOT " in text:
+            parts = self._split_top_level(text, " ANDNOT ")
+            if not parts:
+                return True
+            return self._matches_query(paper, parts[0]) and all(
+                not self._matches_query(paper, part) for part in parts[1:]
+            )
+        if " AND " in text:
+            parts = self._split_top_level(text, " AND ")
+            return all(self._matches_query(paper, part) for part in parts)
+        if " OR " in text:
+            parts = self._split_top_level(text, " OR ")
+            return any(self._matches_query(paper, part) for part in parts)
+        return self._matches_atomic_clause(paper, text)
+
+    def _build_paper_response(self, paper: Dict[str, Any]) -> Dict[str, Any]:
+        arxiv_id = str(paper.get("arxiv_id", "") or "").strip()
+        return {
+            "id": f"http://arxiv.org/abs/{arxiv_id}",
+            "title": str(paper.get("title", "") or "").replace("\n", " ").strip(),
+            "summary": str(paper.get("abstract", "") or "").replace("\n", " ").strip(),
+            "published": str(paper.get("created", "") or paper.get("updated", "") or ""),
+            "updated": str(paper.get("updated", "") or paper.get("created", "") or ""),
+            "authors": self._parse_list_field(paper.get("authors", "")),
+            "categories": self._parse_list_field(paper.get("categories", "")),
+            "pdf_url": str(paper.get("pdf_url", "") or ""),
+            "abs_url": str(paper.get("abs_url", "") or f"https://arxiv.org/abs/{arxiv_id}"),
+            "journal_reference": "",
+            "comment": "",
+            "doi": "",
+            "arxiv_id": arxiv_id,
+            "submitter": "",
+            "versions": [],
+            "authors_parsed": [],
+        }
+
+    def _fetch_all_searchable_papers(self, id_list: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
+        columns = """
+            arxiv_id,
+            title,
+            abstract,
+            authors,
+            categories,
+            primary_category,
+            created,
+            updated,
+            abs_url,
+            pdf_url,
+            oai_datestamp,
+            fetched_at,
+            created_at,
+            updated_at
+        """
+        query = f"SELECT {columns} FROM arxiv_oai_papers"
+        params: List[Any] = []
+        normalized_ids = [str(item).strip() for item in (id_list or []) if str(item).strip()]
+        if normalized_ids:
+            placeholders = ",".join("?" for _ in normalized_ids)
+            query += f" WHERE arxiv_id IN ({placeholders})"
+            params.extend(normalized_ids)
+        query += " ORDER BY COALESCE(created, updated, oai_datestamp, fetched_at) DESC, arxiv_id DESC"
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+        return [self._parse_row(row) for row in rows]
+
+    def search(
+        self,
+        search_query: str = "",
+        id_list: Optional[List[str]] = None,
+        max_results: int = 10,
+        start: int = 0,
+        sort_by: str = "relevance",
+        sort_order: str = "descending",
+    ) -> Dict[str, Any]:
+        normalized_query = str(search_query or "").strip()
+        normalized_id_list = [str(item).strip() for item in (id_list or []) if str(item).strip()]
+        rows = self._fetch_all_searchable_papers(normalized_id_list or None)
+
+        if normalized_query:
+            rows = [paper for paper in rows if self._matches_query(paper, normalized_query)]
+
+        reverse = sort_order == "descending"
+        if sort_by in {"submittedDate", "lastUpdatedDate"}:
+            rows.sort(key=lambda p: p.get("updated") or p.get("created") or "", reverse=reverse)
+
+        paginated_rows = rows[start:start + max_results]
+        papers = [self._build_paper_response(paper) for paper in paginated_rows]
+        return {
+            "query": normalized_query,
+            "id_list": normalized_id_list,
+            "total_results": len(rows),
+            "start_index": start,
+            "items_per_page": len(papers),
+            "papers": papers,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    def search_papers(
+        self,
+        search_query: str = "",
+        id_list: Optional[List[str]] = None,
+        max_results: int = 10,
+        start: int = 0,
+        sort_by: str = "relevance",
+        sort_order: str = "descending",
+        submitted_days_ago: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if submitted_days_ago is not None:
+            if submitted_days_ago < 0:
+                raise ValueError("submitted_days_ago must be greater than or equal to 0")
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=int(submitted_days_ago))
+            submitted_date_query = f"submittedDate:[{start_date.strftime('%Y%m%d%H%M')} TO {end_date.strftime('%Y%m%d%H%M')}]"
+            search_query = f"({search_query}) AND {submitted_date_query}" if search_query else submitted_date_query
+        return self.search(
+            search_query=search_query,
+            id_list=id_list,
+            max_results=max_results,
+            start=start,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        )
+
+    def search_advanced(
+        self,
+        title: Optional[str] = None,
+        author: Optional[str] = None,
+        abstract: Optional[str] = None,
+        category: Optional[str] = None,
+        comment: Optional[str] = None,
+        journal_ref: Optional[str] = None,
+        report_number: Optional[str] = None,
+        operator: str = "AND",
+        id_list: Optional[List[str]] = None,
+        max_results: int = 10,
+        start: int = 0,
+        sort_by: str = "relevance",
+        sort_order: str = "descending",
+        submitted_days_ago: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        query_parts: List[str] = []
+        if title:
+            query_parts.append(f'ti:"{title}"' if " " in title else f"ti:{title}")
+        if author:
+            query_parts.append(f'au:"{author}"' if " " in author else f"au:{author}")
+        if abstract:
+            query_parts.append(f'abs:"{abstract}"' if " " in abstract else f"abs:{abstract}")
+        if category:
+            query_parts.append(f"cat:{category}")
+        if comment:
+            query_parts.append(f'co:"{comment}"' if " " in comment else f"co:{comment}")
+        if journal_ref:
+            query_parts.append(f'jr:"{journal_ref}"' if " " in journal_ref else f"jr:{journal_ref}")
+        if report_number:
+            query_parts.append(f'rn:"{report_number}"' if " " in report_number else f"rn:{report_number}")
+        combined_query = f" {operator} ".join(query_parts)
+        return self.search_papers(
+            search_query=combined_query,
+            id_list=id_list,
+            max_results=max_results,
+            start=start,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            submitted_days_ago=submitted_days_ago,
+        )
+
     def _initialize_database(self) -> None:
         with self._get_connection() as conn:
             cursor = conn.cursor()
