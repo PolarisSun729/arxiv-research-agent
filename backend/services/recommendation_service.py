@@ -1276,6 +1276,16 @@ class RecommendationService:
                 cluster_id = str(candidate.get("recall_cluster_id", "") or "").strip()
             return cluster_id or None
 
+        def candidate_priority(candidate: Dict[str, Any]) -> tuple[float, float, float, float, str]:
+            relevance_score = float(candidate.get("relevance_score", candidate.get("final_score", 0.0)) or 0.0)
+            return (
+                normalize_relevance(relevance_score),
+                relevance_score,
+                float(candidate.get("semantic_score", 0.0) or 0.0),
+                float(candidate.get("final_score", 0.0) or 0.0),
+                str(candidate.get("arxiv_id", "") or ""),
+            )
+
         selected: List[Dict[str, Any]] = []
         selected_embeddings: List[List[float]] = []
         selected_cluster_counts: Counter = Counter()
@@ -1387,38 +1397,95 @@ class RecommendationService:
                 semantic_similarity_penalty,
             )
 
-        first_candidate = max(
-            remaining,
-            key=lambda item: (
-                normalize_relevance(float(item.get("relevance_score", item.get("final_score", 0.0)) or 0.0)),
-                float(item.get("relevance_score", item.get("final_score", 0.0)) or 0.0),
-                float(item.get("semantic_score", 0.0) or 0.0),
-                str(item.get("arxiv_id", "") or ""),
-            ),
-        )
-        remaining.remove(first_candidate)
-        first_relevance = float(first_candidate.get("relevance_score", first_candidate.get("final_score", 0.0)) or 0.0)
-        first_selection_score = normalize_relevance(first_relevance)
-        first_candidate["final_score"] = first_selection_score
-        annotate_selected_candidate(
-            candidate=first_candidate,
-            selection_rank=1,
-            relevance_score=first_relevance,
-            diversity_score=1.0,
-            semantic_diversity_score=None,
-            cluster_diversity_score=None,
-            category_diversity_score=None,
-            diversity_reason="seed",
-        )
-        selected_embeddings_candidate = candidate_embedding(first_candidate)
-        if selected_embeddings_candidate:
-            selected_embeddings.append(selected_embeddings_candidate)
-        first_cluster_id = candidate_cluster_id(first_candidate)
-        if first_cluster_id:
-            selected_cluster_counts[first_cluster_id] += 1
-        for category in first_candidate.get("_candidate_categories", []) or []:
-            selected_category_counts[category] += 1
-        selected.append(finalize_candidate(first_candidate))
+        def commit_selected_candidate(
+            candidate: Dict[str, Any],
+            selection_rank: int,
+            diversity_reason: str,
+            diversity_score: float,
+            semantic_diversity_score: Optional[float],
+            cluster_diversity_score: Optional[float],
+            category_diversity_score: Optional[float],
+            diversity_penalty_source: Optional[str] = None,
+            diversity_penalty_value: Optional[float] = None,
+        ) -> None:
+            relevance_score = float(candidate.get("relevance_score", candidate.get("final_score", 0.0)) or 0.0)
+            annotate_selected_candidate(
+                candidate=candidate,
+                selection_rank=selection_rank,
+                relevance_score=relevance_score,
+                diversity_score=diversity_score,
+                semantic_diversity_score=semantic_diversity_score,
+                cluster_diversity_score=cluster_diversity_score,
+                category_diversity_score=category_diversity_score,
+                diversity_reason=diversity_reason,
+                diversity_penalty_source=diversity_penalty_source,
+                diversity_penalty_value=diversity_penalty_value,
+            )
+            selected_embeddings_candidate = candidate_embedding(candidate)
+            if selected_embeddings_candidate:
+                selected_embeddings.append(selected_embeddings_candidate)
+            cluster_id = candidate_cluster_id(candidate)
+            if cluster_id:
+                selected_cluster_counts[cluster_id] += 1
+            for category in candidate.get("_candidate_categories", []) or []:
+                selected_category_counts[category] += 1
+            selected.append(finalize_candidate(candidate))
+
+        if interest_clusters:
+            cluster_representatives: Dict[str, Dict[str, Any]] = {}
+            for candidate in remaining:
+                cluster_id = candidate_cluster_id(candidate)
+                if not cluster_id:
+                    continue
+                existing_candidate = cluster_representatives.get(cluster_id)
+                if existing_candidate is None or candidate_priority(candidate) > candidate_priority(existing_candidate):
+                    cluster_representatives[cluster_id] = candidate
+
+            ordered_cluster_candidates = sorted(
+                cluster_representatives.values(),
+                key=candidate_priority,
+                reverse=True,
+            )
+            for candidate in ordered_cluster_candidates:
+                if len(selected) >= top_n:
+                    break
+                if candidate not in remaining:
+                    continue
+                remaining.remove(candidate)
+                relevance_score = float(candidate.get("relevance_score", candidate.get("final_score", 0.0)) or 0.0)
+                candidate["final_score"] = normalize_relevance(relevance_score)
+                commit_selected_candidate(
+                    candidate=candidate,
+                    selection_rank=len(selected) + 1,
+                    diversity_reason="cluster_seed",
+                    diversity_score=1.0,
+                    semantic_diversity_score=None,
+                    cluster_diversity_score=None,
+                    category_diversity_score=None,
+                )
+
+        if not selected and remaining:
+            first_candidate = max(
+                remaining,
+                key=lambda item: (
+                    normalize_relevance(float(item.get("relevance_score", item.get("final_score", 0.0)) or 0.0)),
+                    float(item.get("relevance_score", item.get("final_score", 0.0)) or 0.0),
+                    float(item.get("semantic_score", 0.0) or 0.0),
+                    str(item.get("arxiv_id", "") or ""),
+                ),
+            )
+            remaining.remove(first_candidate)
+            first_relevance = float(first_candidate.get("relevance_score", first_candidate.get("final_score", 0.0)) or 0.0)
+            first_candidate["final_score"] = normalize_relevance(first_relevance)
+            commit_selected_candidate(
+                candidate=first_candidate,
+                selection_rank=1,
+                diversity_reason="seed",
+                diversity_score=1.0,
+                semantic_diversity_score=None,
+                cluster_diversity_score=None,
+                category_diversity_score=None,
+            )
 
         while remaining and len(selected) < top_n:
             best_candidate: Optional[Dict[str, Any]] = None
@@ -1459,27 +1526,17 @@ class RecommendationService:
             diversity_score, semantic_diversity_score, cluster_diversity_score, category_diversity_score, diversity_reason, diversity_cluster_id, semantic_similarity_penalty = best_diversity_data
             best_candidate["final_score"] = best_selection_score
             diversity_penalty_value = semantic_similarity_penalty if semantic_similarity_penalty is not None else max(0.0, 1.0 - diversity_score)
-            annotate_selected_candidate(
+            commit_selected_candidate(
                 candidate=best_candidate,
                 selection_rank=len(selected) + 1,
-                relevance_score=relevance_score,
+                diversity_reason=diversity_reason,
                 diversity_score=diversity_score,
                 semantic_diversity_score=semantic_diversity_score,
                 cluster_diversity_score=cluster_diversity_score,
                 category_diversity_score=category_diversity_score,
-                diversity_reason=diversity_reason,
                 diversity_penalty_source="semantic" if semantic_similarity_penalty is not None else ("cluster" if cluster_diversity_score is not None else ("category" if category_diversity_score is not None else None)),
                 diversity_penalty_value=diversity_penalty_value,
             )
-            best_candidate_embedding = candidate_embedding(best_candidate)
-            if best_candidate_embedding:
-                selected_embeddings.append(best_candidate_embedding)
-            best_cluster_id = diversity_cluster_id
-            if best_cluster_id:
-                selected_cluster_counts[best_cluster_id] += 1
-            for category in best_candidate.get("_candidate_categories", []) or []:
-                selected_category_counts[category] += 1
-            selected.append(finalize_candidate(best_candidate))
 
         return selected
 
