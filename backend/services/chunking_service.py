@@ -3,10 +3,13 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Union
 
+from utils.config import get_chunking_runtime_config
+
 logger = logging.getLogger(__name__)
 
-MAX_CHUNK_CONTENT_LENGTH = 8000
-CHUNK_OVERLAP_LENGTH = 200
+CHUNKING_CONFIG = get_chunking_runtime_config()
+MAX_CHUNK_CONTENT_LENGTH = CHUNKING_CONFIG["max_chunk_content_length"]
+CHUNK_OVERLAP_LENGTH = CHUNKING_CONFIG["chunk_overlap_length"]
 
 
 class ChunkingService:
@@ -207,7 +210,7 @@ class ChunkingService:
 
         return parts or [normalized[:max_length]]
 
-    def _find_split_boundary(self, text: str, start: int, end: int, search_window: int = 400) -> int:
+    def _find_split_boundary(self, text: str, start: int, end: int, search_window: int = CHUNKING_CONFIG["split_search_window"]) -> int:
         lower = max(start + 1, end - search_window)
         candidates = ["\n\n", "\n", "。", "！", "？", ". ", "! ", "? ", " "]
         best = start

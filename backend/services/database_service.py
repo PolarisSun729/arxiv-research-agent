@@ -82,6 +82,7 @@ class DatabaseService:
                     cluster_count INTEGER DEFAULT 0,
                     profile_mode TEXT DEFAULT 'mean',
                     interest_clusters TEXT,
+                    weak_interest_pool TEXT,
                     disliked_vector_data TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -111,6 +112,7 @@ class DatabaseService:
             "cluster_count": "INTEGER DEFAULT 0",
             "profile_mode": "TEXT DEFAULT 'mean'",
             "interest_clusters": "TEXT",
+            "weak_interest_pool": "TEXT",
             "disliked_vector_data": "TEXT",
         }
         cursor = conn.cursor()
@@ -539,6 +541,7 @@ class DatabaseService:
         cluster_count: int = 0,
         profile_mode: str = "mean",
         interest_clusters: Optional[List[Dict[str, Any]]] = None,
+        weak_interest_pool: Optional[Dict[str, Any]] = None,
         disliked_vector_data: Optional[List[float]] = None,
     ) -> bool:
         try:
@@ -546,8 +549,8 @@ class DatabaseService:
                 cursor = conn.cursor()
                 cursor.execute('''
                     INSERT OR REPLACE INTO user_interest_vectors 
-                    (user_id, vector_data, paper_count, embedding_model, vector_dimension, cluster_count, profile_mode, interest_clusters, disliked_vector_data, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    (user_id, vector_data, paper_count, embedding_model, vector_dimension, cluster_count, profile_mode, interest_clusters, weak_interest_pool, disliked_vector_data, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ''', (
                     user_id,
                     json.dumps(vector_data),
@@ -557,6 +560,7 @@ class DatabaseService:
                     cluster_count,
                     profile_mode,
                     json.dumps(interest_clusters) if interest_clusters is not None else None,
+                    json.dumps(weak_interest_pool) if weak_interest_pool is not None else None,
                     json.dumps(disliked_vector_data) if disliked_vector_data is not None else None,
                 ))
                 
@@ -572,13 +576,14 @@ class DatabaseService:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    SELECT user_id, vector_data, paper_count, embedding_model, vector_dimension, cluster_count, profile_mode, interest_clusters, disliked_vector_data, created_at, updated_at
+                    SELECT user_id, vector_data, paper_count, embedding_model, vector_dimension, cluster_count, profile_mode, interest_clusters, weak_interest_pool, disliked_vector_data, created_at, updated_at
                     FROM user_interest_vectors WHERE user_id = ?
                 ''', (user_id,))
                 
                 row = cursor.fetchone()
                 if row:
                     interest_clusters = None
+                    weak_interest_pool = None
                     disliked_vector_data = None
                     if row[7]:
                         try:
@@ -587,7 +592,12 @@ class DatabaseService:
                             interest_clusters = []
                     if row[8]:
                         try:
-                            disliked_vector_data = json.loads(row[8])
+                            weak_interest_pool = json.loads(row[8])
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            weak_interest_pool = None
+                    if row[9]:
+                        try:
+                            disliked_vector_data = json.loads(row[9])
                         except (TypeError, ValueError, json.JSONDecodeError):
                             disliked_vector_data = None
                     return {
@@ -599,9 +609,10 @@ class DatabaseService:
                         'cluster_count': row[5] or 0,
                         'profile_mode': row[6] or 'mean',
                         'interest_clusters': interest_clusters or [],
+                        'weak_interest_pool': weak_interest_pool,
                         'disliked_vector_data': disliked_vector_data,
-                        'created_at': row[9],
-                        'updated_at': row[10]
+                        'created_at': row[10],
+                        'updated_at': row[11]
                     }
                 return None
         except Exception as e:

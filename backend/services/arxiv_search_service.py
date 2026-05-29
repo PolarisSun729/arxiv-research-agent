@@ -9,14 +9,16 @@ import urllib.parse
 from enum import Enum
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
 import random
+from utils.config import get_arxiv_search_runtime_config
 
 logger = logging.getLogger(__name__)
 
+ARXIV_SEARCH_CONFIG = get_arxiv_search_runtime_config()
 VALID_SORT_BY = {"relevance", "lastUpdatedDate", "submittedDate"}
 VALID_SORT_ORDER = {"ascending", "descending"}
 VALID_FIELD_OPERATORS = {"AND", "OR", "ANDNOT"}
 VALID_CATEGORY_OPERATORS = {"AND", "OR"}
-MAX_ALLOWED_RESULTS = 100
+MAX_ALLOWED_RESULTS = ARXIV_SEARCH_CONFIG["max_allowed_results"]
 
 
 class ArxivSearchValidationError(ValueError):

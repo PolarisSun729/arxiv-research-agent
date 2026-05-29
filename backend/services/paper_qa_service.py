@@ -11,7 +11,7 @@ from services.chunking_service import ChunkingService
 from services.database_service import DatabaseService
 from services.embedding_service import EmbeddingConfig, EmbeddingService
 from services.enhanced_retrieval_service import EnhancedRetrievalService, RetrievalOptions
-from services.generation_service import GenerationService
+from services.generation_service import GenerationService, RERANK_QWEN_MODEL_NAME
 from services.loading_service import LoadingService
 from services.vector_store_service import VectorDBConfig, VectorStoreService
 
@@ -129,7 +129,7 @@ class PaperQAService:
             logger.info("Compressing chunk text for rerank with Qwen...")
             chunks = self.generation_service.compress_chunks_for_rerank(
                 chunks=chunks,
-                model_name="qwen3.6-plus",
+                model_name=RERANK_QWEN_MODEL_NAME,
             )
             logger.info("Generated rerank_text for %d chunks", len(chunks))
 

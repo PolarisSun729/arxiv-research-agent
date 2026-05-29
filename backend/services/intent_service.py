@@ -71,58 +71,10 @@ SUB_INTENT_RULES = {
 }
 
 
-DEFAULT_ROUTE_WEIGHTS = {
-    "vector_original": 1.0,
-    "vector_rewrite": 0.9,
-    "vector_hyde": 0.85,
-    "keyword": 0.75,
-}
+DEFAULT_ROUTE_WEIGHTS = dict(RETRIEVAL_CONFIG["route_weights"])
 
 
-INTENT_ROUTE_WEIGHTS = {
-    "summary": {
-        "vector_original": 1.15,
-        "vector_rewrite": 1.1,
-        "vector_hyde": 0.9,
-        "keyword": 0.6,
-    },
-    "method": {
-        "vector_original": 0.95,
-        "vector_rewrite": 1.15,
-        "vector_hyde": 0.85,
-        "keyword": 1.0,
-    },
-    "experiment": {
-        "vector_original": 0.9,
-        "vector_rewrite": 1.15,
-        "vector_hyde": 0.8,
-        "keyword": 1.1,
-    },
-    "comparison": {
-        "vector_original": 0.85,
-        "vector_rewrite": 1.15,
-        "vector_hyde": 0.8,
-        "keyword": 1.0,
-    },
-    "dataset": {
-        "vector_original": 0.9,
-        "vector_rewrite": 1.1,
-        "vector_hyde": 0.8,
-        "keyword": 1.05,
-    },
-    "limitation": {
-        "vector_original": 0.85,
-        "vector_rewrite": 1.05,
-        "vector_hyde": 0.8,
-        "keyword": 0.95,
-    },
-    "figure_table": {
-        "vector_original": 0.75,
-        "vector_rewrite": 0.95,
-        "vector_hyde": 0.7,
-        "keyword": 1.2,
-    },
-}
+INTENT_ROUTE_WEIGHTS = get_intent_routing_runtime_config()["intent_route_weights"]
 
 # New schema used by the LLM router prompt. This overrides the legacy table above
 # while keeping the old definitions around for reference until all consumers are migrated.
@@ -196,80 +148,7 @@ INTENT_ALIASES = {
     "results_analysis": "result_analysis",
 }
 
-INTENT_ROUTE_WEIGHTS = {
-    "contribution": {
-        "vector_original": 1.15,
-        "vector_rewrite": 1.1,
-        "vector_hyde": 0.9,
-        "keyword": 0.6,
-    },
-    "paper_overview": {
-        "vector_original": 1.15,
-        "vector_rewrite": 1.1,
-        "vector_hyde": 0.9,
-        "keyword": 0.6,
-    },
-    "method_flow": {
-        "vector_original": 0.95,
-        "vector_rewrite": 1.15,
-        "vector_hyde": 0.85,
-        "keyword": 1.0,
-    },
-    "experiment_setup": {
-        "vector_original": 0.9,
-        "vector_rewrite": 1.15,
-        "vector_hyde": 0.8,
-        "keyword": 1.1,
-    },
-    "result_analysis": {
-        "vector_original": 0.88,
-        "vector_rewrite": 1.18,
-        "vector_hyde": 0.82,
-        "keyword": 1.08,
-    },
-    "comparison": {
-        "vector_original": 0.85,
-        "vector_rewrite": 1.15,
-        "vector_hyde": 0.8,
-        "keyword": 1.0,
-    },
-    "dataset": {
-        "vector_original": 0.9,
-        "vector_rewrite": 1.1,
-        "vector_hyde": 0.8,
-        "keyword": 1.05,
-    },
-    "limitation": {
-        "vector_original": 0.85,
-        "vector_rewrite": 1.05,
-        "vector_hyde": 0.8,
-        "keyword": 0.95,
-    },
-    "definition": {
-        "vector_original": 0.9,
-        "vector_rewrite": 1.05,
-        "vector_hyde": 0.85,
-        "keyword": 1.0,
-    },
-    "implementation_detail": {
-        "vector_original": 0.95,
-        "vector_rewrite": 1.15,
-        "vector_hyde": 0.85,
-        "keyword": 1.0,
-    },
-    "figure_table": {
-        "vector_original": 0.75,
-        "vector_rewrite": 0.95,
-        "vector_hyde": 0.7,
-        "keyword": 1.2,
-    },
-    "other": {
-        "vector_original": 1.0,
-        "vector_rewrite": 0.9,
-        "vector_hyde": 0.85,
-        "keyword": 0.75,
-    },
-}
+INTENT_ROUTE_WEIGHTS = get_intent_routing_runtime_config()["intent_route_weights"]
 
 
 def _normalize_text(text: str) -> str:

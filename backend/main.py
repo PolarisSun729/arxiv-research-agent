@@ -26,7 +26,7 @@ from services.enhanced_retrieval_service import EnhancedRetrievalService, Retrie
 from services.paper_qa_service import PaperQAService
 import logging
 from enum import Enum
-from utils.config import CORE_CONFIG, VectorDBProvider
+from utils.config import CORE_CONFIG, VectorDBProvider, get_recommendation_clustering_runtime_config
 import pandas as pd
 from pathlib import Path
 from services.generation_service import GenerationService
@@ -94,11 +94,16 @@ def get_current_embedding_config() -> EmbeddingConfig:
     return embedding_service.get_default_embedding_config()
 
 
+def get_current_recommendation_clustering_config() -> dict:
+    return get_recommendation_clustering_runtime_config()
+
+
 recommendation_service = RecommendationService(
     db_service=db_service,
     embedding_service=embedding_service,
     vector_store_service=vector_store_service,
     get_embedding_config=get_current_embedding_config,
+    get_clustering_config=get_current_recommendation_clustering_config,
     arxiv_service_factory=lambda: get_arxiv_service(),
     oai_db_service=oai_db_service,
 )

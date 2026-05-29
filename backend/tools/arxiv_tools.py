@@ -14,7 +14,7 @@ from services.arxiv_search_service import (
 from services.database_service import DatabaseService
 from services.local_arxiv_service import LocalArxivService
 from tools.tool_result import make_tool_error, make_tool_result, make_tool_trace
-from utils.config import CORE_CONFIG
+from utils.config import CORE_CONFIG, get_recommendation_clustering_runtime_config
 
 DATA_SOURCE = CORE_CONFIG["arxiv_data_source"]
 ARXIV_PROXY_URL = CORE_CONFIG.get("arxiv_proxy_url", "")
@@ -37,6 +37,7 @@ def _get_recommendation_service():
         embedding_service=embedding_service,
         vector_store_service=vector_store_service,
         get_embedding_config=embedding_service.get_default_embedding_config,
+        get_clustering_config=get_recommendation_clustering_runtime_config,
         arxiv_service_factory=lambda: get_arxiv_service(),
         oai_db_service=oai_db_service,
     )

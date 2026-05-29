@@ -15,7 +15,7 @@ import requests
 
 from services.embedding_service import EmbeddingService
 from services.vector_store_service import VectorStoreService
-from utils.config import RETRIEVAL_CONFIG
+from utils.config import RETRIEVAL_CONFIG, get_enhanced_retrieval_runtime_config
 from utils.model_utils import get_huggingface_model_path
 from services.intent_service import IntentProfile, IntentService
 
@@ -33,8 +33,9 @@ else:
         GenerationService = Any  # type: ignore
 
 
-QUERY_VIEW_LIMIT = 6
-QUERY_PLAN_LIMIT = 5
+ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
+QUERY_VIEW_LIMIT = ENHANCED_RETRIEVAL_CONFIG["query_view_limit"]
+QUERY_PLAN_LIMIT = ENHANCED_RETRIEVAL_CONFIG["query_plan_limit"]
 
 logger = logging.getLogger(__name__)
 
@@ -472,10 +473,10 @@ class EnhancedRetrievalService:
             options.enable_llm_rerank, RETRIEVAL_CONFIG.get("enable_llm_rerank", False)
         )
         debug_enabled = self._resolve_option(options.debug, RETRIEVAL_CONFIG["debug"])
-        recall_candidate_limit = 30
-        rrf_candidate_limit = 30
-        rerank_candidate_limit = 30
-        final_context_top_k = 15
+        recall_candidate_limit = ENHANCED_RETRIEVAL_CONFIG["recall_candidate_limit"]
+        rrf_candidate_limit = ENHANCED_RETRIEVAL_CONFIG["rrf_candidate_limit"]
+        rerank_candidate_limit = ENHANCED_RETRIEVAL_CONFIG["rerank_candidate_limit"]
+        final_context_top_k = ENHANCED_RETRIEVAL_CONFIG["final_context_top_k"]
 
         normalized_collection_name = self._resolve_collection_name(collection_name)
         intent_profile = self._build_intent_profile(user_query, paper_context=paper_context)
@@ -873,7 +874,7 @@ class EnhancedRetrievalService:
             reranked_chunk["llm_rerank_prompt"] = self.llm_rerank_prompt
             reranked_chunk["llm_rerank_input_rank"] = idx
             reranked_chunk["llm_rerank_returned_index"] = idx
-            reranked_chunk["llm_rerank_document_preview"] = document_text[:220]
+            reranked_chunk["llm_rerank_document_preview"] = document_text[: ENHANCED_RETRIEVAL_CONFIG["rerank_document_preview_limit"]]
             reranked_chunk["llm_rerank_used_compressed_text"] = bool(reranked_chunk.get("rerank_text"))
             reranked_chunk["score"] = rerank_score
             mapped_candidates.append(
@@ -885,7 +886,7 @@ class EnhancedRetrievalService:
                     "fusion_rank": reranked_chunk.get("fusion_rank"),
                     "fusion_score": fused_score,
                     "rerank_score": rerank_score,
-                    "text_preview": document_text[:100],
+                    "text_preview": document_text[: ENHANCED_RETRIEVAL_CONFIG["preview_text_limit"]],
                     "chunk": reranked_chunk,
                 }
             )
@@ -896,8 +897,13 @@ class EnhancedRetrievalService:
                     "page_number": reranked_chunk.get("page_number"),
                     "fusion_score": fused_score,
                     "rerank_score": rerank_score,
-                    "rerank_text_preview": self._short_text_preview(reranked_chunk.get("rerank_text", ""), 100),
-                    "rerank_document_preview": reranked_chunk.get("llm_rerank_document_preview", "")[:100],
+                    "rerank_text_preview": self._short_text_preview(
+                        reranked_chunk.get("rerank_text", ""),
+                        ENHANCED_RETRIEVAL_CONFIG["preview_text_limit"],
+                    ),
+                    "rerank_document_preview": reranked_chunk.get("llm_rerank_document_preview", "")[
+                        : ENHANCED_RETRIEVAL_CONFIG["preview_text_limit"]
+                    ],
                     "section_tags": reranked_chunk.get("section_tags", []),
                     "source_query": reranked_chunk.get("source_query", ""),
                 }
@@ -942,7 +948,7 @@ class EnhancedRetrievalService:
                 "query": rerank_query,
                 "original_question": original_question,
                 "query_profile": self._debug_query_profile(query_profile) if query_profile else None,
-                "candidate_scores": candidate_debug[: min(10, len(candidate_debug))],
+                "candidate_scores": candidate_debug[: min(ENHANCED_RETRIEVAL_CONFIG["candidate_debug_limit"], len(candidate_debug))],
             },
         }
 
@@ -1029,7 +1035,7 @@ class EnhancedRetrievalService:
             reranked_chunk["llm_rerank_prompt"] = self.llm_rerank_prompt
             reranked_chunk["llm_rerank_input_rank"] = idx
             reranked_chunk["llm_rerank_returned_index"] = returned_index
-            reranked_chunk["llm_rerank_document_preview"] = document_text[:220]
+            reranked_chunk["llm_rerank_document_preview"] = document_text[: ENHANCED_RETRIEVAL_CONFIG["rerank_document_preview_limit"]]
             reranked_chunk["llm_rerank_used_compressed_text"] = bool(reranked_chunk.get("rerank_text"))
             reranked_chunk["score"] = rerank_score
             ranked_candidates.append(reranked_chunk)
@@ -1040,8 +1046,13 @@ class EnhancedRetrievalService:
                     "page_number": reranked_chunk.get("page_number"),
                     "fusion_score": fused_score,
                     "rerank_score": rerank_score,
-                    "rerank_text_preview": self._short_text_preview(reranked_chunk.get("rerank_text", ""), 100),
-                    "rerank_document_preview": reranked_chunk.get("llm_rerank_document_preview", "")[:100],
+                    "rerank_text_preview": self._short_text_preview(
+                        reranked_chunk.get("rerank_text", ""),
+                        ENHANCED_RETRIEVAL_CONFIG["short_text_preview_limit"],
+                    ),
+                    "rerank_document_preview": reranked_chunk.get("llm_rerank_document_preview", "")[
+                        : ENHANCED_RETRIEVAL_CONFIG["preview_text_limit"]
+                    ],
                     "section_tags": reranked_chunk.get("section_tags", []),
                     "source_query": reranked_chunk.get("source_query", ""),
                 }
@@ -1061,7 +1072,9 @@ class EnhancedRetrievalService:
                     "fusion_rank": item.get("fusion_rank"),
                     "fusion_score": item.get("fusion_score"),
                     "rerank_score": item.get("llm_rerank_score"),
-                    "text_preview": item.get("llm_rerank_document_preview", "")[:100],
+                    "text_preview": item.get("llm_rerank_document_preview", "")[
+                        : ENHANCED_RETRIEVAL_CONFIG["preview_text_limit"]
+                    ],
                 }
             )
         self._log_rerank_mapped_results(provider="dashscope", mapped_results=mapped_candidates)
@@ -1098,7 +1111,7 @@ class EnhancedRetrievalService:
                 "output_chunks": len(final_chunks),
                 "query": user_query,
                 "query_profile": self._debug_query_profile(query_profile) if query_profile else None,
-                "candidate_scores": candidate_debug[: min(10, len(candidate_debug))],
+                "candidate_scores": candidate_debug[: min(ENHANCED_RETRIEVAL_CONFIG["candidate_debug_limit"], len(candidate_debug))],
             },
         }
 
@@ -1299,7 +1312,7 @@ class EnhancedRetrievalService:
         self,
         collection_name: str,
         paper_context: Optional[Dict[str, Any]] = None,
-        sample_limit: int = 24,
+        sample_limit: int = ENHANCED_RETRIEVAL_CONFIG["sample_limit"],
     ) -> Dict[str, Any]:
         merged: Dict[str, Any] = {
             "title": "",
@@ -1346,13 +1359,13 @@ class EnhancedRetrievalService:
                 normalized_section = self._normalize_query_text(section_title)
                 if normalized_section and normalized_section not in {self._normalize_query_text(item) for item in section_titles}:
                     section_titles.append(section_title)
-            if content and len(source_samples) < 6:
-                source_samples.append(content[:260])
+            if content and len(source_samples) < ENHANCED_RETRIEVAL_CONFIG["source_sample_limit"]:
+                source_samples.append(content[: ENHANCED_RETRIEVAL_CONFIG["source_sample_primary_limit"]])
             section_tags = chunk.get("section_tags", []) or []
             if any(tag == "abstract" for tag in section_tags) and content:
                 abstract_candidates.append(content)
             elif any(tag in {"introduction", "conclusion", "method", "experiment"} for tag in section_tags) and content:
-                source_samples.append(content[:180])
+                source_samples.append(content[: ENHANCED_RETRIEVAL_CONFIG["source_sample_secondary_limit"]])
 
         if not merged["abstract"] and abstract_candidates:
             merged["abstract"] = max(abstract_candidates, key=len)[:1800]
@@ -1364,13 +1377,13 @@ class EnhancedRetrievalService:
                 merged["title"],
                 merged["abstract"][:900],
                 " ".join(merged["section_titles"][:20]),
-                " ".join(source_samples[:6]),
+                " ".join(source_samples[: ENHANCED_RETRIEVAL_CONFIG["source_sample_limit"]]),
             ],
         )
-        merged["source_samples"] = source_samples[:6]
+        merged["source_samples"] = source_samples[: ENHANCED_RETRIEVAL_CONFIG["source_sample_limit"]]
         return merged
 
-    def _merge_candidate_terms(self, existing_terms: List[str], texts: List[str], limit: int = 24) -> List[str]:
+    def _merge_candidate_terms(self, existing_terms: List[str], texts: List[str], limit: int = ENHANCED_RETRIEVAL_CONFIG["merge_candidate_terms_limit"]) -> List[str]:
         terms: List[str] = []
         for item in existing_terms:
             if str(item).strip():
@@ -1385,7 +1398,7 @@ class EnhancedRetrievalService:
                     return terms[:limit]
         return terms[:limit]
 
-    def _extract_paper_terms_from_text(self, text: str, limit: int = 10) -> List[str]:
+    def _extract_paper_terms_from_text(self, text: str, limit: int = ENHANCED_RETRIEVAL_CONFIG["extract_paper_terms_limit"]) -> List[str]:
         tokens = self._tokenize_for_keyword_search(text)
         filtered = [token for token in tokens if token not in EN_STOPWORDS and token not in ZH_STOPWORDS]
         seen: List[str] = []
@@ -1422,7 +1435,7 @@ class EnhancedRetrievalService:
                     query_plan = {
                         "question_type": "other",
                         "intent_summary": "",
-                        "paper_terms": paper_context.get("candidate_terms", [])[:8],
+                        "paper_terms": paper_context.get("candidate_terms", [])[: ENHANCED_RETRIEVAL_CONFIG["paper_terms_preview_limit"]],
                         "preferred_sections": [],
                         "rewrite_queries": [
                             {
@@ -1723,7 +1736,7 @@ class EnhancedRetrievalService:
         preferred.extend(self._preferred_section_tags(intent_tags))
         return self._dedupe_list(preferred)[:6]
 
-    def _compact_terms(self, terms: List[str], limit: int = 5) -> List[str]:
+    def _compact_terms(self, terms: List[str], limit: int = ENHANCED_RETRIEVAL_CONFIG["compact_terms_limit"]) -> List[str]:
         compacted: List[str] = []
         for term in terms:
             normalized = str(term).strip()
@@ -2325,11 +2338,11 @@ class EnhancedRetrievalService:
         return self._dedupe_terms(parts)
 
     def _build_keyword_query(self, keywords: List[str], intent_tags: List[str], intent_profile: Optional[IntentProfile] = None) -> str:
-        parts = keywords[:8] + self._intent_to_terms(intent_tags)
+        parts = keywords[: ENHANCED_RETRIEVAL_CONFIG["keyword_parts_limit"]] + self._intent_to_terms(intent_tags)
         if intent_profile and intent_profile.rewrite_focus:
             parts.extend(intent_profile.rewrite_focus[:4])
         if not parts:
-            parts = keywords[:8]
+            parts = keywords[: ENHANCED_RETRIEVAL_CONFIG["keyword_parts_limit"]]
         return self._dedupe_terms(parts)
 
     def _detect_language(self, user_query: str, tokens: List[str]) -> str:
@@ -2352,12 +2365,18 @@ class EnhancedRetrievalService:
         return detected
 
     def _estimate_ambiguity(self, keywords: List[str], intent_tags: List[str], language: str, user_query: str) -> float:
-        content_weight = min(1.0, len(keywords) / 8.0)
+        content_weight = min(1.0, len(keywords) / ENHANCED_RETRIEVAL_CONFIG["extract_query_keywords_limit"])
         intent_weight = min(1.0, len(intent_tags) / 3.0)
         length_weight = min(1.0, len(user_query.strip()) / 50.0)
-        language_weight = 0.1 if language in {"zh", "mixed"} else 0.0
-        specificity = min(1.0, 0.45 * content_weight + 0.3 * intent_weight + 0.15 * length_weight + language_weight)
-        return max(0.1, min(1.0, 1.0 - specificity))
+        language_weight = ENHANCED_RETRIEVAL_CONFIG["language_weight_zh_mixed"] if language in {"zh", "mixed"} else 0.0
+        specificity = min(
+            1.0,
+            ENHANCED_RETRIEVAL_CONFIG["specificity_content_weight"] * content_weight
+            + ENHANCED_RETRIEVAL_CONFIG["specificity_intent_weight"] * intent_weight
+            + ENHANCED_RETRIEVAL_CONFIG["specificity_length_weight"] * length_weight
+            + language_weight,
+        )
+        return max(ENHANCED_RETRIEVAL_CONFIG["specificity_floor"], min(1.0, 1.0 - specificity))
 
     def _preferred_section_tags(self, intent_tags: List[str]) -> List[str]:
         preferred: List[str] = []
@@ -2403,7 +2422,7 @@ class EnhancedRetrievalService:
                 terms.extend(["dataset", "corpus", "data"])
         return self._dedupe_terms(terms).split()
 
-    def _extract_query_keywords(self, tokens: List[str], limit: int = 8) -> List[str]:
+    def _extract_query_keywords(self, tokens: List[str], limit: int = ENHANCED_RETRIEVAL_CONFIG["extract_query_keywords_limit"]) -> List[str]:
         filtered = [token for token in tokens if token not in EN_STOPWORDS and token not in ZH_STOPWORDS]
         if not filtered:
             filtered = [token for token in tokens if len(token) > 1]
@@ -2419,7 +2438,7 @@ class EnhancedRetrievalService:
         chinese_tokens = re.findall(r"[\u4e00-\u9fff]{2,}", lowered)
         return english_tokens + chinese_tokens
 
-    def _build_query_keywords(self, queries: List[str], limit: int = 12) -> List[str]:
+    def _build_query_keywords(self, queries: List[str], limit: int = ENHANCED_RETRIEVAL_CONFIG["build_query_keywords_limit"]) -> List[str]:
         token_counter: Counter = Counter()
         for query in queries:
             token_counter.update(self._tokenize_for_keyword_search(query))
@@ -2479,22 +2498,32 @@ class EnhancedRetrievalService:
         ambiguity = query_profile.ambiguity_score
         main_intent = self._legacy_intent_bucket(intent_profile.main_intent if intent_profile else query_profile.question_type)
         if route_name == "vector_original":
-            base = 1.05 if main_intent in {"summary", "other"} else 0.95
+            base = ENHANCED_RETRIEVAL_CONFIG["query_weight_base_summary_other"] if main_intent in {"summary", "other"} else ENHANCED_RETRIEVAL_CONFIG["query_weight_base_default"]
         elif route_name == "vector_rewrite":
-            base = 0.72 + 0.18 * ambiguity
+            base = ENHANCED_RETRIEVAL_CONFIG["query_weight_base_ambiguous_keyword"] + 0.18 * ambiguity
             if main_intent in {"method", "experiment", "comparison", "dataset"}:
-                base += 0.08
+                base += ENHANCED_RETRIEVAL_CONFIG["route_focus_bonus"]
         elif route_name == "vector_hyde":
-            base = 0.45 + 0.25 * ambiguity
+            base = ENHANCED_RETRIEVAL_CONFIG["query_weight_base_ambiguous_other"] + 0.25 * ambiguity
             if main_intent == "summary":
-                base += 0.05
+                base += ENHANCED_RETRIEVAL_CONFIG["route_summary_bonus"]
         elif route_name == "keyword":
-            base = 0.52 + 0.18 * min(1.0, len(query_profile.keywords) / 8.0)
+            base = ENHANCED_RETRIEVAL_CONFIG["query_weight_base_keyword"] + 0.18 * min(1.0, len(query_profile.keywords) / ENHANCED_RETRIEVAL_CONFIG["extract_query_keywords_limit"])
             if main_intent in {"method", "experiment", "figure_table"}:
-                base += 0.08
+                base += ENHANCED_RETRIEVAL_CONFIG["route_keyword_bonus"]
         else:
-            base = 0.5
-        return max(0.2, min(1.0, base * (0.65 + 0.35 * similarity)))
+            base = ENHANCED_RETRIEVAL_CONFIG["query_weight_base_fallback"]
+        return max(
+            ENHANCED_RETRIEVAL_CONFIG["route_default_floor"],
+            min(
+                1.0,
+                base
+                * (
+                    ENHANCED_RETRIEVAL_CONFIG["route_confidence_multiplier"]
+                    + ENHANCED_RETRIEVAL_CONFIG["route_confidence_similarity_weight"] * similarity
+                ),
+            ),
+        )
 
     def _query_similarity(self, left: str, right: str) -> float:
         left_tokens = set(self._tokenize_for_keyword_search(left))
@@ -2512,19 +2541,19 @@ class EnhancedRetrievalService:
         preferred = set(query_profile.section_preferences)
         bonus = 0.0
         if preferred:
-            bonus += 0.045 * len(section_tags & preferred)
+            bonus += ENHANCED_RETRIEVAL_CONFIG["section_bonus_weight"] * len(section_tags & preferred)
         chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
         noisy_tags = set(section_tags & NOISY_SECTION_TAGS)
         main_intent = self._legacy_intent_bucket(query_profile.intent_profile.main_intent if query_profile.intent_profile else query_profile.question_type)
         if chunk_type in {"figure", "table"} and (main_intent == "figure_table" or "figure_table" in query_profile.intent_tags):
             noisy_tags -= {"figure", "table"}
-            bonus += 0.05
+            bonus += ENHANCED_RETRIEVAL_CONFIG["figure_table_bonus_weight"]
         if noisy_tags:
-            bonus -= 0.02 * len(noisy_tags)
+            bonus -= ENHANCED_RETRIEVAL_CONFIG["noisy_section_penalty_weight"] * len(noisy_tags)
         if "abstract" in section_tags and (main_intent == "summary" or "paper_overview" in query_profile.intent_tags or "contribution" in query_profile.intent_tags):
-            bonus += 0.03
+            bonus += ENHANCED_RETRIEVAL_CONFIG["preferred_section_bonus_weight"]
         if "conclusion" in section_tags and (main_intent == "summary" or "paper_overview" in query_profile.intent_tags or "contribution" in query_profile.intent_tags):
-            bonus += 0.02
+            bonus += ENHANCED_RETRIEVAL_CONFIG["section_path_bonus_weight"]
         return max(-0.05, min(0.12, bonus))
 
     def _detect_section_tags(self, content: str) -> List[str]:
@@ -2546,8 +2575,8 @@ class EnhancedRetrievalService:
     ) -> float:
         doc_counts = Counter(doc_tokens)
         doc_len = max(len(doc_tokens), 1)
-        k1 = 1.5
-        b = 0.75
+        k1 = ENHANCED_RETRIEVAL_CONFIG["bm25_k1"]
+        b = ENHANCED_RETRIEVAL_CONFIG["bm25_b"]
         score = 0.0
         content_lower = content.lower()
 
@@ -2563,7 +2592,7 @@ class EnhancedRetrievalService:
 
             if token in {"method", "methods", "dataset", "datasets", "baseline", "ablation", "limitation", "limitations"}:
                 if token in content_lower[:300]:
-                    score += 0.2
+                    score += ENHANCED_RETRIEVAL_CONFIG["bm25_token_boost"]
 
         return score
 
@@ -2629,12 +2658,12 @@ class EnhancedRetrievalService:
                     chunk.get("asset_kind"),
                     chunk.get("llm_rerank_score"),
                     chunk.get("final_context_uses_original_chunk"),
-                    self._short_text_preview(chunk.get("content", ""), 100),
-                    self._short_text_preview(chunk.get("asset_summary", ""), 100),
-                    self._short_text_preview(chunk.get("rerank_text", ""), 100),
+                    self._short_text_preview(chunk.get("content", ""), ENHANCED_RETRIEVAL_CONFIG["short_text_preview_limit"]),
+                    self._short_text_preview(chunk.get("asset_summary", ""), ENHANCED_RETRIEVAL_CONFIG["short_text_preview_limit"]),
+                    self._short_text_preview(chunk.get("rerank_text", ""), ENHANCED_RETRIEVAL_CONFIG["short_text_preview_limit"]),
                 )
 
-    def _short_text_preview(self, text: Any, limit: int = 100) -> str:
+    def _short_text_preview(self, text: Any, limit: int = ENHANCED_RETRIEVAL_CONFIG["short_text_preview_limit"]) -> str:
         normalized = re.sub(r"\s+", " ", str(text or "")).strip()
         if len(normalized) <= limit:
             return normalized
@@ -2661,10 +2690,10 @@ class EnhancedRetrievalService:
                 chunk.get("page_number") or chunk.get("page_range"),
                 chunk.get("fusion_rank"),
                 chunk.get("fusion_score", chunk.get("score")),
-                self._short_text_preview(chunk.get("content", "") or chunk.get("text", ""), 100),
-                self._short_text_preview(chunk.get("asset_summary", ""), 100),
-                self._short_text_preview(chunk.get("rerank_text", ""), 100),
-                self._short_text_preview(document_text, 100),
+                self._short_text_preview(chunk.get("content", "") or chunk.get("text", ""), ENHANCED_RETRIEVAL_CONFIG["short_text_preview_limit"]),
+                self._short_text_preview(chunk.get("asset_summary", ""), ENHANCED_RETRIEVAL_CONFIG["short_text_preview_limit"]),
+                self._short_text_preview(chunk.get("rerank_text", ""), ENHANCED_RETRIEVAL_CONFIG["short_text_preview_limit"]),
+                self._short_text_preview(document_text, ENHANCED_RETRIEVAL_CONFIG["short_text_preview_limit"]),
             )
 
     def _log_rerank_raw_scores(self, provider: str, raw_results: List[Any]) -> None:
@@ -2683,7 +2712,7 @@ class EnhancedRetrievalService:
                 idx,
                 returned_index,
                 relevance_score,
-                self._short_text_preview(document_text, 100) if document_text else "",
+                self._short_text_preview(document_text, ENHANCED_RETRIEVAL_CONFIG["short_text_preview_limit"]) if document_text else "",
             )
 
     def _log_rerank_mapped_results(self, provider: str, mapped_results: List[Dict[str, Any]]) -> None:
@@ -2698,7 +2727,7 @@ class EnhancedRetrievalService:
                 item.get("fusion_rank"),
                 item.get("fusion_score"),
                 item.get("rerank_score"),
-                self._short_text_preview(item.get("text_preview", ""), 100),
+                self._short_text_preview(item.get("text_preview", ""), ENHANCED_RETRIEVAL_CONFIG["short_text_preview_limit"]),
             )
 
     def _collect_route_queries(
@@ -2772,7 +2801,7 @@ class EnhancedRetrievalService:
         }
 
     def _debug_chunk_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        preview = item.get("content", "")[:220].replace("\n", " ").strip()
+        preview = item.get("content", "")[: ENHANCED_RETRIEVAL_CONFIG["rerank_document_preview_limit"]].replace("\n", " ").strip()
         return {
             "chunk_id": item.get("chunk_id"),
             "original_chunk_id": item.get("original_chunk_id"),
@@ -3008,7 +3037,7 @@ class EnhancedRetrievalService:
             return text
         return text.replace("\r\n", "\n").replace("\\r\\n", "\n").replace("\\n", "\n")
 
-    def _sanitize_trace_slug(self, text: str, max_length: int = 40) -> str:
+    def _sanitize_trace_slug(self, text: str, max_length: int = ENHANCED_RETRIEVAL_CONFIG["sanitize_trace_slug_max_length"]) -> str:
         slug = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "_", (text or "").strip())
         slug = re.sub(r"_+", "_", slug).strip("_")
         if not slug:

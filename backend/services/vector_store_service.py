@@ -16,10 +16,12 @@ from pymilvus import (
     connections,
     utility,
 )
-from utils.config import VectorDBProvider, MILVUS_CONFIG
+from utils.config import VectorDBProvider, MILVUS_CONFIG, get_vector_store_runtime_config
 from pypinyin import lazy_pinyin, Style
 
 logger = logging.getLogger(__name__)
+
+VECTOR_STORE_CONFIG = get_vector_store_runtime_config()
 
 warnings.filterwarnings(
     "ignore",
@@ -27,11 +29,11 @@ warnings.filterwarnings(
     category=DeprecationWarning,
 )
 
-CONTENT_MAX_LENGTH = 12000
-RERANK_TEXT_MAX_LENGTH = 6000
-ASSET_PATH_MAX_LENGTH = 2048
-ASSET_SUMMARY_MAX_LENGTH = 4096
-ASSET_PREVIEW_MAX_LENGTH = 6000
+CONTENT_MAX_LENGTH = VECTOR_STORE_CONFIG["content_max_length"]
+RERANK_TEXT_MAX_LENGTH = VECTOR_STORE_CONFIG["rerank_text_max_length"]
+ASSET_PATH_MAX_LENGTH = VECTOR_STORE_CONFIG["asset_path_max_length"]
+ASSET_SUMMARY_MAX_LENGTH = VECTOR_STORE_CONFIG["asset_summary_max_length"]
+ASSET_PREVIEW_MAX_LENGTH = VECTOR_STORE_CONFIG["asset_preview_max_length"]
 
 COLLECTION_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 

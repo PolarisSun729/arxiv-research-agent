@@ -24,8 +24,13 @@ logger = logging.getLogger(__name__)
 QWEN_API_KEY = GENERATION_CONFIG["qwen_api_key"]
 QWEN_BASE_URL = GENERATION_CONFIG["qwen_base_url"]
 QWEN_MODEL_NAME = GENERATION_CONFIG["qwen_model_name"]
-RERANK_QWEN_MODEL_NAME = "qwen3.6-flash"
-QWEN_ENABLE_THINKING = False
+RERANK_QWEN_MODEL_NAME = GENERATION_CONFIG["rerank_qwen_model_name"]
+QWEN_ENABLE_THINKING = GENERATION_CONFIG["rerank_qwen_enable_thinking"]
+HF_GENERATE_MAX_LENGTH = GENERATION_CONFIG["huggingface_generate_max_length"]
+HF_GENERATE_TEMPERATURE = GENERATION_CONFIG["huggingface_generate_temperature"]
+HF_GENERATE_DO_SAMPLE = GENERATION_CONFIG["huggingface_generate_do_sample"]
+REWRITE_QUERY_MAX_QUERIES_DEFAULT = GENERATION_CONFIG["rewrite_query_max_queries_default"]
+PLAN_QUERY_MAX_QUERIES_DEFAULT = GENERATION_CONFIG["plan_query_max_queries_default"]
 
 class GenerationService:
     """
@@ -188,7 +193,7 @@ class GenerationService:
         model_name: str,
         query: str,
         context: str,
-        max_length: int = 512
+        max_length: int = HF_GENERATE_MAX_LENGTH
     ) -> str:
         """
         使用 HuggingFace 模型生成回答。
@@ -220,8 +225,8 @@ Answer:"""
                 **inputs,
                 max_length=max_length,
                 num_return_sequences=1,
-                temperature=0.7,
-                do_sample=True
+                temperature=HF_GENERATE_TEMPERATURE,
+                do_sample=HF_GENERATE_DO_SAMPLE
             )
             
             response = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -266,8 +271,8 @@ Answer:"""
             response = client.chat.completions.create(
                 model=self.models["openai"][model_name],
                 messages=messages,
-                temperature=0.7,
-                max_tokens=512
+                temperature=GENERATION_CONFIG["openai_chat_temperature"],
+                max_tokens=GENERATION_CONFIG["openai_chat_max_tokens"]
             )
             
             return response.choices[0].message.content.strip()
@@ -379,7 +384,7 @@ Answer:"""
     def rewrite_query_for_retrieval(
         self,
         question: str,
-        max_queries: int = 3,
+        max_queries: int = REWRITE_QUERY_MAX_QUERIES_DEFAULT,
         paper_context: Optional[Dict[str, Any]] = None,
         api_key: Optional[str] = None,
         model_name: str = QWEN_MODEL_NAME,
@@ -440,7 +445,7 @@ Answer:"""
     def plan_queries_for_retrieval(
         self,
         question: str,
-        max_queries: int = 5,
+        max_queries: int = PLAN_QUERY_MAX_QUERIES_DEFAULT,
         paper_context: Optional[Dict[str, Any]] = None,
         api_key: Optional[str] = None,
         model_name: str = QWEN_MODEL_NAME,

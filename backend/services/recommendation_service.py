@@ -9,20 +9,23 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import HTTPException
+from sklearn.cluster import HDBSCAN
 
 from services.arxiv_oai_service import ArxivOaiDatabaseService
 from services.database_service import DatabaseService
 from services.embedding_service import EmbeddingConfig, EmbeddingService
 from services.arxiv_search_service import ArxivSearchService
 from services.vector_store_service import VectorStoreService
+from utils.config import get_recommendation_clustering_runtime_config, get_recommendation_runtime_config
 
 logger = logging.getLogger(__name__)
 
 
 class RecommendationService:
-    ARXIV_BACKFILL_REQUEST_INTERVAL_SECONDS = 8.0
-    MIN_LIKED_PAPERS_FOR_CLUSTERING = 4
-    MAX_INTEREST_CLUSTERS = 4
+    RECOMMENDATION_CONFIG = get_recommendation_runtime_config()
+    ARXIV_BACKFILL_REQUEST_INTERVAL_SECONDS = RECOMMENDATION_CONFIG["backfill_request_interval_seconds"]
+    MIN_LIKED_PAPERS_FOR_CLUSTERING = RECOMMENDATION_CONFIG["min_liked_papers_for_clustering"]
+    MAX_INTEREST_CLUSTERS = RECOMMENDATION_CONFIG["max_interest_clusters"]
     RECOMMEND_CANDIDATE_CATEGORIES = [
         "cs.CL",
         "cs.LG",
@@ -36,6 +39,7 @@ class RecommendationService:
         embedding_service: EmbeddingService,
         vector_store_service: VectorStoreService,
         get_embedding_config: Callable[[], EmbeddingConfig],
+        get_clustering_config: Optional[Callable[[], Dict[str, Any]]] = None,
         arxiv_service_factory: Optional[Callable[[], Any]] = None,
         oai_db_service: Optional[ArxivOaiDatabaseService] = None,
         collection_name: str = "arxiv_paper_embeddings",
@@ -44,13 +48,18 @@ class RecommendationService:
         self.embedding_service = embedding_service
         self.vector_store_service = vector_store_service
         self.get_embedding_config = get_embedding_config
+        self.get_clustering_config = get_clustering_config or get_recommendation_clustering_runtime_config
         self.arxiv_service_factory = arxiv_service_factory or (lambda: ArxivSearchService())
         self.oai_db_service = oai_db_service or ArxivOaiDatabaseService()
         self.collection_name = collection_name
         self._arxiv_backfill_lock = threading.Lock()
         self._arxiv_backfill_next_allowed_time = 0.0
 
-    def generate_user_interest_vector(self, user_id: str, negative_weight: float = 0.3) -> Dict[str, Any]:
+    def generate_user_interest_vector(
+        self,
+        user_id: str,
+        negative_weight: float = RECOMMENDATION_CONFIG["negative_weight_default"],
+    ) -> Dict[str, Any]:
         liked_ids = self.db_service.get_liked_papers(user_id=user_id)
         disliked_ids = self.db_service.get_disliked_papers(user_id=user_id)
 
@@ -92,6 +101,7 @@ class RecommendationService:
 
         liked_mean = self._mean_vector([record["vector"] for record in liked_records])
         disliked_mean = self._mean_vector([record["vector"] for record in disliked_records]) if disliked_records else []
+        weak_interest_pool: Optional[Dict[str, Any]] = None
         if disliked_mean:
             raw_vector = [
                 liked_value - negative_weight * disliked_value
@@ -105,9 +115,9 @@ class RecommendationService:
         profile_mode = "mean"
         if len(liked_records) >= self.MIN_LIKED_PAPERS_FOR_CLUSTERING:
             try:
-                interest_clusters = self._cluster_interest_vectors(liked_records)
+                interest_clusters, weak_interest_pool = self._cluster_interest_vectors(liked_records)
                 if interest_clusters:
-                    profile_mode = "clustered"
+                    profile_mode = "clustered_with_weak_pool" if weak_interest_pool else "clustered"
                     cluster_summary = [
                         {
                             "cluster_id": cluster.get("cluster_id"),
@@ -127,9 +137,12 @@ class RecommendationService:
                         "User %s did not produce stable interest clusters; using mean fallback",
                         user_id,
                     )
+                    if weak_interest_pool:
+                        profile_mode = "mean_with_weak_pool"
             except Exception as exc:  # pragma: no cover - clustering should be deterministic but safe to fallback
                 logger.warning("Failed to cluster liked papers for user %s, falling back to mean vector: %s", user_id, exc)
                 interest_clusters = []
+                weak_interest_pool = None
 
         vector_dimension = len(fallback_interest_vector)
         milvus_used_count = sum(1 for record in liked_records + disliked_records if record.get("source") == "milvus")
@@ -146,6 +159,7 @@ class RecommendationService:
             cluster_count=len(interest_clusters),
             profile_mode=profile_mode,
             interest_clusters=interest_clusters,
+            weak_interest_pool=weak_interest_pool,
             disliked_vector_data=self._normalize_vector(disliked_mean) if disliked_mean else None,
         )
         if not success:
@@ -176,6 +190,8 @@ class RecommendationService:
             "embedding_model": config.model_name,
             "cluster_count": len(interest_clusters),
             "profile_mode": profile_mode,
+            "weak_interest_pool": weak_interest_pool,
+            "weak_interest_pool_count": weak_interest_pool.get("paper_count", 0) if weak_interest_pool else 0,
             "cluster_summary": [
                 {
                     "cluster_id": cluster.get("cluster_id"),
@@ -186,7 +202,12 @@ class RecommendationService:
             ],
         }
 
-    def recommend_papers(self, user_id: str, top_n: int = 10, max_age_months: int = 6) -> Dict[str, Any]:
+    def recommend_papers(
+        self,
+        user_id: str,
+        top_n: int = RECOMMENDATION_CONFIG["default_top_n"],
+        max_age_months: int = RECOMMENDATION_CONFIG["default_max_age_months"],
+    ) -> Dict[str, Any]:
         user_vector_data = self._get_or_refresh_interest_vector(user_id)
         user_vector = user_vector_data["vector_data"]
         interest_clusters = user_vector_data.get("interest_clusters", []) or []
@@ -937,9 +958,9 @@ class RecommendationService:
             return vector
         return [value / norm for value in vector]
 
-    def _cluster_interest_vectors(self, liked_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _cluster_interest_vectors(self, liked_records: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
         if len(liked_records) < self.MIN_LIKED_PAPERS_FOR_CLUSTERING:
-            return []
+            return [], None
 
         valid_records = [record for record in liked_records if record.get("vector")]
         vectors = [
@@ -948,52 +969,59 @@ class RecommendationService:
         ]
         paper_ids = [str(record.get("arxiv_id", "") or "").strip() for record in valid_records]
         if len(vectors) < self.MIN_LIKED_PAPERS_FOR_CLUSTERING:
-            return []
+            return [], None
 
-        cluster_count = min(self.MAX_INTEREST_CLUSTERS, max(2, len(vectors) // 3))
-        cluster_count = min(cluster_count, len(vectors))
-        if cluster_count < 2:
-            return []
+        if len(vectors) < 2:
+            return [], None
 
-        centroids = self._initialize_cluster_centroids(vectors, cluster_count)
-        assignments: List[int] = [-1] * len(vectors)
+        clustering_config = self.get_clustering_config() or {}
+        min_cluster_size = max(2, int(clustering_config.get("hdbscan_min_cluster_size", 2) or 2))
+        min_samples = max(1, int(clustering_config.get("hdbscan_min_samples", 1) or 1))
+        metric = str(clustering_config.get("hdbscan_metric", "cosine") or "cosine").strip() or "cosine"
+        cluster_selection_method = str(
+            clustering_config.get("hdbscan_cluster_selection_method", "eom") or "eom"
+        ).strip() or "eom"
+        allow_single_cluster = bool(clustering_config.get("hdbscan_allow_single_cluster", True))
 
-        for _ in range(20):
-            updated_assignments = []
-            for vector in vectors:
-                best_cluster_index = max(
-                    range(len(centroids)),
-                    key=lambda index: self._cosine_similarity(vector, centroids[index]),
-                )
-                updated_assignments.append(best_cluster_index)
+        try:
+            clusterer = HDBSCAN(
+                min_cluster_size=min_cluster_size,
+                min_samples=min_samples,
+                metric=metric,
+                cluster_selection_method=cluster_selection_method,
+                allow_single_cluster=allow_single_cluster,
+            )
+            labels = clusterer.fit_predict(vectors)
+        except Exception as exc:  # pragma: no cover - clustering backend should stay safe to fallback
+            logger.info("HDBSCAN interest clustering failed; using mean fallback: %s", exc)
+            return [], None
 
-            if updated_assignments == assignments:
-                break
-            assignments = updated_assignments
+        cluster_members: Dict[int, List[int]] = {}
+        weak_member_indices: List[int] = []
+        for vector_index, cluster_label in enumerate(labels):
+            if cluster_label < 0:
+                weak_member_indices.append(vector_index)
+                continue
+            cluster_members.setdefault(int(cluster_label), []).append(vector_index)
 
-            new_centroids: List[List[float]] = []
-            for cluster_index in range(cluster_count):
-                cluster_vectors = [
-                    vectors[index]
-                    for index, assignment in enumerate(assignments)
-                    if assignment == cluster_index
-                ]
-                if not cluster_vectors:
-                    logger.info("Interest clustering produced an empty cluster; using mean fallback")
-                    return []
-                centroid = self._normalize_vector(self._mean_vector(cluster_vectors))
-                new_centroids.append(centroid)
-            centroids = new_centroids
+        weak_interest_pool: Optional[Dict[str, Any]] = None
+        if weak_member_indices:
+            weak_paper_ids = [paper_ids[index] for index in weak_member_indices if paper_ids[index]]
+            weak_vectors = [vectors[index] for index in weak_member_indices]
+            if weak_vectors:
+                weak_interest_pool = {
+                    "pool_id": "weak_interest_pool",
+                    "paper_count": len(weak_paper_ids),
+                    "paper_ids": weak_paper_ids,
+                    "centroid_vector": self._normalize_vector(self._mean_vector(weak_vectors)),
+                }
 
-        cluster_members: Dict[int, List[int]] = {index: [] for index in range(cluster_count)}
-        for vector_index, cluster_index in enumerate(assignments):
-            if cluster_index not in cluster_members:
-                cluster_members[cluster_index] = []
-            cluster_members[cluster_index].append(vector_index)
-
-        if any(not members for members in cluster_members.values()):
-            logger.info("Interest clustering ended with an empty cluster; using mean fallback")
-            return []
+        if not cluster_members:
+            if weak_interest_pool:
+                logger.info("HDBSCAN produced only weak-interest noise points; keeping weak pool and using mean fallback")
+                return [], weak_interest_pool
+            logger.info("HDBSCAN produced no stable interest clusters; using mean fallback")
+            return [], None
 
         clusters: List[Dict[str, Any]] = []
         for cluster_index, members in cluster_members.items():
@@ -1014,34 +1042,16 @@ class RecommendationService:
                 (item.get("paper_ids") or [""])[0],
             )
         )
+        if len(clusters) > self.MAX_INTEREST_CLUSTERS:
+            logger.info(
+                "HDBSCAN produced %s interest clusters; keeping top %s by size",
+                len(clusters),
+                self.MAX_INTEREST_CLUSTERS,
+            )
+            clusters = clusters[: self.MAX_INTEREST_CLUSTERS]
         for index, cluster in enumerate(clusters):
             cluster["cluster_id"] = f"cluster_{index}"
-        return clusters
-
-    def _initialize_cluster_centroids(self, vectors: List[List[float]], cluster_count: int) -> List[List[float]]:
-        if not vectors or cluster_count <= 0:
-            return []
-
-        centroids = [vectors[0]]
-        chosen_indices = {0}
-        while len(centroids) < cluster_count:
-            remaining_indices = [index for index in range(len(vectors)) if index not in chosen_indices]
-            if not remaining_indices:
-                break
-
-            candidate_index = max(
-                remaining_indices,
-                key=lambda index: min(
-                    1.0 - self._cosine_similarity(vectors[index], centroid)
-                    for centroid in centroids
-                ),
-            )
-            centroids.append(vectors[candidate_index])
-            chosen_indices.add(candidate_index)
-
-        while len(centroids) < cluster_count:
-            centroids.append(vectors[0])
-        return centroids
+        return clusters, weak_interest_pool
 
     def _build_liked_category_frequency(self, liked_papers: List[Dict[str, Any]]) -> Counter:
         counter: Counter = Counter()
@@ -1138,11 +1148,12 @@ class RecommendationService:
         category_score = self._calculate_category_score(categories, liked_category_freq)
         recency_score = self._calculate_recency_score(candidate.get("published_date"))
 
+        score_weights = self.RECOMMENDATION_CONFIG["score_weights"]
         base_score = (
-            semantic_score * 0.65
-            + category_score * 0.08
-            + recency_score * 0.05
-            - disliked_penalty * 0.15
+            semantic_score * score_weights["semantic"]
+            + category_score * score_weights["category"]
+            + recency_score * score_weights["recency"]
+            - disliked_penalty * score_weights["disliked_penalty"]
         )
 
         return {
@@ -1237,7 +1248,11 @@ class RecommendationService:
 
         return candidates
 
-    def _build_category_query(self, liked_category_freq: Counter, max_categories: int = 5) -> str:
+    def _build_category_query(
+        self,
+        liked_category_freq: Counter,
+        max_categories: int = RECOMMENDATION_CONFIG["category_query_max_categories"],
+    ) -> str:
         categories = self.RECOMMEND_CANDIDATE_CATEGORIES[:max_categories] if max_categories > 0 else self.RECOMMEND_CANDIDATE_CATEGORIES
         return " OR ".join(f"cat:{category}" for category in categories)
 
@@ -1353,20 +1368,32 @@ class RecommendationService:
             cluster_repeat_count: Optional[int] = None
             if cluster_id and interest_clusters:
                 cluster_repeat_count = int(selected_cluster_counts.get(cluster_id, 0))
-                cluster_diversity_score = max(0.0, 1.0 - min(cluster_repeat_count / 4.0, 1.0))
+                cluster_diversity_score = max(
+                    0.0,
+                    1.0 - min(
+                        cluster_repeat_count / self.RECOMMENDATION_CONFIG["cluster_repeat_divisor"],
+                        1.0,
+                    ),
+                )
 
             categories = candidate.get("_candidate_categories", []) or []
             category_diversity_score: Optional[float] = None
             category_repeat_count: Optional[int] = None
             if not embedding and cluster_diversity_score is None and categories:
                 category_repeat_count = max((int(selected_category_counts.get(category, 0)) for category in categories), default=0)
-                category_diversity_score = max(0.0, 1.0 - min(category_repeat_count / 4.0, 1.0))
+                category_diversity_score = max(
+                    0.0,
+                    1.0 - min(
+                        category_repeat_count / self.RECOMMENDATION_CONFIG["category_repeat_divisor"],
+                        1.0,
+                    ),
+                )
 
             components: List[tuple[float, float]] = []
             if semantic_diversity_score is not None:
-                components.append((semantic_diversity_score, 0.7))
+                components.append((semantic_diversity_score, self.RECOMMENDATION_CONFIG["semantic_diversity_component_weight"]))
             if cluster_diversity_score is not None:
-                components.append((cluster_diversity_score, 0.3))
+                components.append((cluster_diversity_score, self.RECOMMENDATION_CONFIG["cluster_diversity_component_weight"]))
             if not components and category_diversity_score is not None:
                 components.append((category_diversity_score, 1.0))
 
@@ -1380,7 +1407,7 @@ class RecommendationService:
                 diversity_score = 1.0
                 diversity_reason = "no_previous_selection"
 
-            if semantic_similarity_penalty is not None and semantic_similarity_penalty >= 0.75:
+            if semantic_similarity_penalty is not None and semantic_similarity_penalty >= self.RECOMMENDATION_CONFIG["semantic_similarity_penalty_threshold"]:
                 diversity_reason = "semantic_repeat"
             elif cluster_repeat_count and cluster_repeat_count > 0:
                 diversity_reason = "cluster_repeat"
@@ -1504,7 +1531,10 @@ class RecommendationService:
                     diversity_cluster_id,
                     semantic_similarity_penalty,
                 ) = compute_diversity(candidate)
-                selection_score = normalized_relevance * 0.75 + diversity_score * 0.25
+                selection_score = (
+                    normalized_relevance * self.RECOMMENDATION_CONFIG["selection_relevance_weight"]
+                    + diversity_score * self.RECOMMENDATION_CONFIG["selection_diversity_weight"]
+                )
                 if selection_score > best_selection_score:
                     best_candidate = candidate
                     best_selection_score = selection_score

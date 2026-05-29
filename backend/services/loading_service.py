@@ -158,7 +158,7 @@ class LoadingService:
             pipeline_options = PdfPipelineOptions()
             pipeline_options.generate_page_images = True
             pipeline_options.generate_picture_images = True
-            pipeline_options.images_scale = 2.0
+            pipeline_options.images_scale = float(DOCLING_CONFIG.get("images_scale", 2.0))
             pipeline_options.do_ocr = bool(DOCLING_CONFIG.get("do_ocr_enabled", False))
             pipeline_options.force_backend_text = True
             if not pipeline_options.do_ocr:
@@ -1055,12 +1055,12 @@ class LoadingService:
                 deduped_entries = [(entry["label"], entry["color"]) for entry in deduped_entries]
 
             page_rect = page.rect
-            legend_padding = 8.0
-            legend_width = 165.0
-            legend_row_height = 13.0
-            legend_title_height = 12.0
+            legend_padding = float(DOCLING_CONFIG.get("legend_padding", 8.0))
+            legend_width = float(DOCLING_CONFIG.get("legend_width", 165.0))
+            legend_row_height = float(DOCLING_CONFIG.get("legend_row_height", 13.0))
+            legend_title_height = float(DOCLING_CONFIG.get("legend_title_height", 12.0))
             legend_height = legend_padding * 2 + legend_title_height + len(deduped_entries) * legend_row_height
-            margin = 12.0
+            margin = float(DOCLING_CONFIG.get("legend_margin", 12.0))
             left = max(margin, float(page_rect.width) - legend_width - margin)
             top = max(margin, margin)
             right = min(float(page_rect.width) - margin, left + legend_width)
@@ -1374,7 +1374,7 @@ class LoadingService:
                     continue
                 if any_table_label.search(next_text) or re.match(r"(?i)^(figure|fig\.|table)\s*\d+", next_text):
                     break
-                if len(next_text.split()) <= 8 and not re.search(r"[,:;.!?]$", next_text):
+                if len(next_text.split()) <= int(DOCLING_CONFIG.get("table_caption_short_text_limit", 8)) and not re.search(r"[,:;.!?]$", next_text):
                     break
                 caption_parts.append(next_text)
 
@@ -2206,7 +2206,7 @@ class LoadingService:
         words = normalized.split()
         if len(words) > 5:
             return False
-        if len(words) == 1 and normalized.isupper() and len(normalized) <= 4:
+        if len(words) == 1 and normalized.isupper() and len(normalized) <= int(DOCLING_CONFIG.get("normalized_upper_short_length", 4)):
             return False
         return normalized[0].isupper() or normalized.isupper()
 
@@ -2235,7 +2235,7 @@ class LoadingService:
         if self._looks_like_heading_text(normalized):
             return True
 
-        if level is not None and level > 0 and len(normalized) <= 80:
+        if level is not None and level > 0 and len(normalized) <= int(DOCLING_CONFIG.get("normalized_heading_length", 80)):
             return self._looks_like_heading_text(normalized)
 
         return False
@@ -2372,10 +2372,10 @@ class LoadingService:
         current_h = max(current_y1 - current_y0, 1.0)
         next_h = max(next_y1 - next_y0, 1.0)
 
-        x_aligned = abs(current_x0 - next_x0) <= 24.0
-        tight_vertical_gap = 0 <= (next_y0 - current_y1) <= max(current_h, next_h) * 1.6
-        same_column = abs((current_x0 + current_x1) / 2 - (next_x0 + next_x1) / 2) <= 80.0
-        is_not_too_long = len(next_text.split()) <= 8
+        x_aligned = abs(current_x0 - next_x0) <= float(DOCLING_CONFIG.get("x_aligned_tolerance", 24.0))
+        tight_vertical_gap = 0 <= (next_y0 - current_y1) <= max(current_h, next_h) * float(DOCLING_CONFIG.get("vertical_gap_multiplier", 1.6))
+        same_column = abs((current_x0 + current_x1) / 2 - (next_x0 + next_x1) / 2) <= float(DOCLING_CONFIG.get("same_column_tolerance", 80.0))
+        is_not_too_long = len(next_text.split()) <= int(DOCLING_CONFIG.get("table_caption_short_text_limit", 8))
 
         return x_aligned and tight_vertical_gap and same_column and is_not_too_long
 

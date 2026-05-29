@@ -13,15 +13,16 @@ import requests
 
 from services.embedding_service import EmbeddingService
 from services.vector_store_service import VectorStoreService
-from utils.config import OAI_SQLITE_CONFIG
+from utils.config import OAI_SQLITE_CONFIG, get_arxiv_oai_runtime_config
 
 logger = logging.getLogger(__name__)
 
-OAI_ENDPOINT = "https://oaipmh.arxiv.org/oai"
-TARGET_CATEGORIES = {"cs.CL", "cs.LG", "cs.IR", "cs.AI"}
-OAI_EMBEDDING_BATCH_SIZE = 20
-OAI_VECTOR_QUERY_BATCH_SIZE = 100
-OAI_DASHSCOPE_TEXT_TOKEN_PRICE_PER_1K = 0.0007
+ARXIV_OAI_CONFIG = get_arxiv_oai_runtime_config()
+OAI_ENDPOINT = ARXIV_OAI_CONFIG["endpoint"]
+TARGET_CATEGORIES = set(ARXIV_OAI_CONFIG["target_categories"])
+OAI_EMBEDDING_BATCH_SIZE = ARXIV_OAI_CONFIG["embedding_batch_size"]
+OAI_VECTOR_QUERY_BATCH_SIZE = ARXIV_OAI_CONFIG["vector_query_batch_size"]
+OAI_DASHSCOPE_TEXT_TOKEN_PRICE_PER_1K = ARXIV_OAI_CONFIG["dashscope_text_token_price_per_1k"]
 
 
 @dataclass
