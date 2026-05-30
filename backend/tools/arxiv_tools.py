@@ -4,52 +4,20 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
+from dependencies import get_arxiv_service as get_dependency_arxiv_service
+from dependencies import get_database_service, get_recommendation_service
+
 from services.arxiv_search_service import (
-    ArxivSearchService,
     ArxivSearchValidationError,
     build_arxiv_query_from_structured_params,
     build_arxiv_submitted_date_query,
     validate_arxiv_search_request,
 )
-from services.database_service import DatabaseService
-from services.local_arxiv_service import LocalArxivService
 from tools.tool_result import make_tool_error, make_tool_result, make_tool_trace
-from utils.config import CORE_CONFIG, get_recommendation_clustering_runtime_config
-
-DATA_SOURCE = CORE_CONFIG["arxiv_data_source"]
-ARXIV_PROXY_URL = CORE_CONFIG.get("arxiv_proxy_url", "")
-
-db_service = DatabaseService()
-_local_arxiv_service: Optional[LocalArxivService] = None
-
-
-def _get_recommendation_service():
-    from services.arxiv_oai_service import ArxivOaiDatabaseService
-    from services.embedding_service import EmbeddingService
-    from services.recommendation_service import RecommendationService
-    from services.vector_store_service import VectorStoreService
-
-    embedding_service = EmbeddingService()
-    vector_store_service = VectorStoreService()
-    oai_db_service = ArxivOaiDatabaseService()
-    return RecommendationService(
-        db_service=db_service,
-        embedding_service=embedding_service,
-        vector_store_service=vector_store_service,
-        get_embedding_config=embedding_service.get_default_embedding_config,
-        get_clustering_config=get_recommendation_clustering_runtime_config,
-        arxiv_service_factory=lambda: get_arxiv_service(),
-        oai_db_service=oai_db_service,
-    )
 
 
 def get_arxiv_service():
-    global _local_arxiv_service
-    if DATA_SOURCE == "api":
-        return ArxivSearchService(proxy_url=ARXIV_PROXY_URL)
-    if _local_arxiv_service is None:
-        _local_arxiv_service = LocalArxivService()
-    return _local_arxiv_service
+    return get_dependency_arxiv_service()
 
 
 def _normalize_source_paper(source_paper: Dict[str, Any], fallback_arxiv_id: str) -> Dict[str, Any]:
@@ -392,10 +360,10 @@ def get_paper_metadata(arxiv_id: str) -> Dict[str, Any]:
     tool_name = "get_paper_metadata"
     trace_inputs = {"arxiv_id": arxiv_id}
     try:
-        paper = db_service.get_paper(arxiv_id)
+        paper = get_database_service().get_paper(arxiv_id)
         source = "database"
         if not paper:
-            recommendation_service = _get_recommendation_service()
+            recommendation_service = get_recommendation_service()
             source_paper = recommendation_service._fetch_paper_from_arxiv_with_rate_limit(arxiv_id)
             if not source_paper:
                 raise HTTPException(status_code=404, detail="Paper not found")
@@ -430,13 +398,13 @@ def get_paper_metadata(arxiv_id: str) -> Dict[str, Any]:
 
 
 def get_paper_or_materialize(arxiv_id: str, paper_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    paper = db_service.get_paper(arxiv_id)
+    paper = get_database_service().get_paper(arxiv_id)
     if paper:
         return paper
     if paper_payload:
         normalized = _normalize_source_paper(paper_payload, arxiv_id)
-        return _get_recommendation_service()._materialize_paper_from_source(normalized, arxiv_id)
-    recommendation_service = _get_recommendation_service()
+        return get_recommendation_service()._materialize_paper_from_source(normalized, arxiv_id)
+    recommendation_service = get_recommendation_service()
     source_paper = recommendation_service._fetch_paper_from_arxiv_with_rate_limit(arxiv_id)
     if not source_paper:
         raise HTTPException(status_code=404, detail="Paper not found")

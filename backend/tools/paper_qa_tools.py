@@ -3,14 +3,13 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any, Dict, Optional
 
+from dependencies import get_paper_qa_service as get_dependency_paper_qa_service
 from tools.tool_result import make_tool_error, make_tool_result, make_tool_trace
 
 
 @lru_cache(maxsize=1)
 def _get_paper_qa_service():
-    from services.paper_qa_service import PaperQAService
-
-    return PaperQAService()
+    return get_dependency_paper_qa_service()
 
 
 def check_paper_qa_index(arxiv_id: str) -> Dict[str, Any]:

@@ -352,9 +352,19 @@ class DatabaseService:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    INSERT OR REPLACE INTO arxiv_papers 
+                    INSERT INTO arxiv_papers
                     (arxiv_id, title, authors, abstract, categories, published_date, url, embedding_id, embedding_model, embedded_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(arxiv_id) DO UPDATE SET
+                        title = excluded.title,
+                        authors = excluded.authors,
+                        abstract = excluded.abstract,
+                        categories = excluded.categories,
+                        published_date = excluded.published_date,
+                        url = excluded.url,
+                        embedding_id = excluded.embedding_id,
+                        embedding_model = excluded.embedding_model,
+                        embedded_at = excluded.embedded_at
                 ''', (
                     normalized_paper["arxiv_id"],
                     normalized_paper["title"],
@@ -719,31 +729,27 @@ class DatabaseService:
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                
                 fields = ['arxiv_id']
                 values = [arxiv_id]
-                
-                if 'collection_name' in kwargs:
-                    fields.append('collection_name')
-                    values.append(kwargs['collection_name'])
-                if 'status' in kwargs:
-                    fields.append('status')
-                    values.append(kwargs['status'])
-                if 'chunk_count' in kwargs:
-                    fields.append('chunk_count')
-                    values.append(kwargs['chunk_count'])
-                if 'embedding_model' in kwargs:
-                    fields.append('embedding_model')
-                    values.append(kwargs['embedding_model'])
-                if 'pdf_path' in kwargs:
-                    fields.append('pdf_path')
-                    values.append(kwargs['pdf_path'])
-                
+                update_fields = []
+
+                for field_name in ['collection_name', 'status', 'chunk_count', 'embedding_model', 'pdf_path']:
+                    if field_name in kwargs:
+                        fields.append(field_name)
+                        values.append(kwargs[field_name])
+                        update_fields.append(f"{field_name} = excluded.{field_name}")
+
                 placeholders = ', '.join(['?' for _ in values])
-                
+                if update_fields:
+                    update_fields.append('updated_at = CURRENT_TIMESTAMP')
+                else:
+                    update_fields = ['updated_at = CURRENT_TIMESTAMP']
+
                 cursor.execute(f'''
-                    INSERT OR REPLACE INTO paper_qa_index ({", ".join(fields)})
+                    INSERT INTO paper_qa_index ({", ".join(fields)})
                     VALUES ({placeholders})
+                    ON CONFLICT(arxiv_id) DO UPDATE SET
+                        {", ".join(update_fields)}
                 ''', values)
                 
                 conn.commit()
