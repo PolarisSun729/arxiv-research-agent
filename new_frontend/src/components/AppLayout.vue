@@ -41,6 +41,11 @@ function handleMenuClick(path: string) {
           <span>论文搜索</span>
         </el-menu-item>
 
+        <el-menu-item index="/agent-search" class="menu-item-agent" @click="handleMenuClick('/agent-search')">
+          <span class="menu-icon-badge badge-agent">AI</span>
+          <span>Agent 搜索</span>
+        </el-menu-item>
+
         <el-menu-item index="/recommendations" class="menu-item-star" @click="handleMenuClick('/recommendations')">
           <span class="menu-icon-badge badge-star">⭐</span>
           <span>推荐论文</span>
@@ -189,6 +194,10 @@ function handleMenuClick(path: string) {
 
 .badge-search {
   background: linear-gradient(135deg, #6ad1ff 0%, #3f8cff 100%);
+}
+
+.badge-agent {
+  background: linear-gradient(135deg, #8b7cff 0%, #4f46e5 100%);
 }
 
 .badge-star {

@@ -13,7 +13,7 @@ from services.arxiv.arxiv_query_builder import (
     build_arxiv_raw_query,
     validate_arxiv_search_request,
 )
-from tools.tool_result import make_tool_error, make_tool_result, make_tool_trace
+from .tool_result import make_tool_error, make_tool_result, make_tool_trace
 
 
 def get_arxiv_service():

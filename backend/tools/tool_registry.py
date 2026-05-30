@@ -5,8 +5,8 @@ from typing import Any, Callable, Dict, Mapping, Type
 
 from pydantic import BaseModel, ValidationError
 
-from tools import arxiv_tools, paper_qa_tools, recommendation_tools
-from tools.schemas import (
+from . import arxiv_tools, paper_qa_tools, recommendation_tools
+from .schemas import (
     AnswerPaperQuestionInput,
     BuildPaperQAIndexInput,
     CheckPaperQAIndexInput,
@@ -16,7 +16,7 @@ from tools.schemas import (
     SearchArxivRawInput,
     SearchArxivStructuredInput,
 )
-from tools.tool_result import make_tool_error, make_tool_result
+from .tool_result import make_tool_error, make_tool_result
 
 
 @dataclass(frozen=True)

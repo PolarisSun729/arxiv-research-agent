@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from routers.arxiv_router import router as arxiv_router
+from routers.agent_router import router as agent_router
 from routers.chunk_router import router as chunk_router
 from routers.paper_router import router as paper_router
 from routers.qa_router import router as qa_router
@@ -24,6 +25,7 @@ app.add_middleware(
 )
 
 app.include_router(arxiv_router)
+app.include_router(agent_router)
 app.include_router(user_router)
 app.include_router(paper_router)
 app.include_router(qa_router)

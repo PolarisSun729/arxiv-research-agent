@@ -4,7 +4,7 @@ from functools import lru_cache
 from typing import Any, Dict, Optional
 
 from dependencies import get_paper_qa_service as get_dependency_paper_qa_service
-from tools.tool_result import make_tool_error, make_tool_result, make_tool_trace
+from .tool_result import make_tool_error, make_tool_result, make_tool_trace
 
 
 @lru_cache(maxsize=1)
