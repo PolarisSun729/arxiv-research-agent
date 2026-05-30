@@ -85,6 +85,24 @@ def get_current_recommendation_clustering_config() -> dict:
 
 
 @lru_cache(maxsize=1)
+def get_paper_qa_index_builder() -> PaperQAIndexBuilder:
+    from services.chunking_service import ChunkingService
+    from services.loading_service import LoadingService
+    from services.paper_qa_index_builder import PaperQAIndexBuilder
+
+    return PaperQAIndexBuilder(
+        db_service=get_database_service(),
+        embedding_service=get_embedding_service(),
+        vector_store_service=get_vector_store_service(),
+        generation_service=get_generation_service(),
+        arxiv_service_factory=lambda: get_arxiv_api_service(),
+        get_embedding_config=get_current_embedding_config,
+        loading_service_factory=LoadingService,
+        chunking_service_factory=ChunkingService,
+    )
+
+
+@lru_cache(maxsize=1)
 def get_recommendation_service() -> RecommendationService:
     from services.recommendation_service import RecommendationService
 
@@ -111,4 +129,5 @@ def get_paper_qa_service() -> PaperQAService:
         enhanced_retrieval_service=get_enhanced_retrieval_service(),
         arxiv_service_factory=lambda: get_arxiv_api_service(),
         get_embedding_config=get_current_embedding_config,
+        qa_index_builder=get_paper_qa_index_builder(),
     )

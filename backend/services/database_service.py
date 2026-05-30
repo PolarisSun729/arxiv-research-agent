@@ -362,9 +362,18 @@ class DatabaseService:
                         categories = excluded.categories,
                         published_date = excluded.published_date,
                         url = excluded.url,
-                        embedding_id = excluded.embedding_id,
-                        embedding_model = excluded.embedding_model,
-                        embedded_at = excluded.embedded_at
+                        embedding_id = CASE
+                            WHEN NULLIF(excluded.embedding_id, '') IS NOT NULL THEN excluded.embedding_id
+                            ELSE arxiv_papers.embedding_id
+                        END,
+                        embedding_model = CASE
+                            WHEN NULLIF(excluded.embedding_id, '') IS NOT NULL THEN excluded.embedding_model
+                            ELSE arxiv_papers.embedding_model
+                        END,
+                        embedded_at = CASE
+                            WHEN NULLIF(excluded.embedding_id, '') IS NOT NULL THEN excluded.embedded_at
+                            ELSE arxiv_papers.embedded_at
+                        END
                 ''', (
                     normalized_paper["arxiv_id"],
                     normalized_paper["title"],

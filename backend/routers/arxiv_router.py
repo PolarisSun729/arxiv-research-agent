@@ -6,10 +6,10 @@ from typing import List, Optional
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from dependencies import get_arxiv_api_service, get_arxiv_service
-from services.arxiv_search_service import (
+from services.arxiv_query_builder import (
     ArxivSearchValidationError,
     build_arxiv_query_from_structured_params,
-    build_arxiv_submitted_date_query,
+    build_arxiv_raw_query,
     validate_arxiv_search_request,
 )
 
@@ -71,20 +71,23 @@ async def arxiv_search(
                 sort_order=sort_order,
             )
         else:
-            validate_arxiv_search_request(
+            raw_query = build_arxiv_raw_query(
                 search_query=search_query,
                 id_list=id_list,
+                submitted_days_ago=submitted_days_ago,
+                append_date_when_query_missing=False,
+            )
+            validate_arxiv_search_request(
+                search_query=raw_query["final_search_query"],
+                id_list=raw_query["id_list"],
                 max_results=max_results,
                 start=start,
                 sort_by=sort_by,
                 sort_order=sort_order,
             )
-            normalized_search_query = search_query
-            if submitted_days_ago is not None and submitted_days_ago >= 0 and normalized_search_query and not id_list:
-                normalized_search_query = f"({normalized_search_query}) AND {build_arxiv_submitted_date_query(submitted_days_ago)}"
             results = arxiv_service.search(
-                search_query=normalized_search_query,
-                id_list=id_list,
+                search_query=raw_query["final_search_query"],
+                id_list=raw_query["id_list"],
                 max_results=max_results,
                 start=start,
                 sort_by=sort_by,
@@ -155,4 +158,3 @@ async def arxiv_search_and_save(
     except Exception as exc:
         logger.error("Error in arXiv search and save: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
-

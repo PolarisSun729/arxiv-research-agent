@@ -11,9 +11,10 @@ from services.chunking_service import ChunkingService
 from services.database_service import DatabaseService
 from services.embedding_service import EmbeddingConfig, EmbeddingService
 from services.enhanced_retrieval_service import EnhancedRetrievalService, RetrievalOptions
-from services.generation_service import GenerationService, RERANK_QWEN_MODEL_NAME
+from services.generation_service import GenerationService
 from services.loading_service import LoadingService
-from services.vector_store_service import VectorDBConfig, VectorStoreService
+from services.paper_qa_index_builder import PaperQAIndexBuilder
+from services.vector_store_service import VectorStoreService
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class PaperQAService:
         get_embedding_config: Optional[Callable[[], EmbeddingConfig]] = None,
         loading_service_factory: Optional[Callable[[], LoadingService]] = None,
         chunking_service_factory: Optional[Callable[[], ChunkingService]] = None,
+        qa_index_builder: Optional[PaperQAIndexBuilder] = None,
     ):
         self.db_service = db_service or DatabaseService()
         self.embedding_service = embedding_service or EmbeddingService()
@@ -45,6 +47,16 @@ class PaperQAService:
         self.get_embedding_config = get_embedding_config or self.embedding_service.get_default_embedding_config
         self.loading_service_factory = loading_service_factory or LoadingService
         self.chunking_service_factory = chunking_service_factory or ChunkingService
+        self.qa_index_builder = qa_index_builder or PaperQAIndexBuilder(
+            db_service=self.db_service,
+            embedding_service=self.embedding_service,
+            vector_store_service=self.vector_store_service,
+            generation_service=self.generation_service,
+            arxiv_service_factory=self.arxiv_service_factory,
+            get_embedding_config=self.get_embedding_config,
+            loading_service_factory=self.loading_service_factory,
+            chunking_service_factory=self.chunking_service_factory,
+        )
 
     @staticmethod
     def _payload_get(payload: Any, key: str, default: Any = None) -> Any:
@@ -72,122 +84,7 @@ class PaperQAService:
         }
 
     def build_qa_index(self, arxiv_id: str, loading_method: str = "docling") -> Dict[str, Any]:
-        logger.info("Creating QA index for paper: %s", arxiv_id)
-        try:
-            loading_method = str(loading_method or "pymupdf").strip().lower()
-            if loading_method not in {"pymupdf", "docling"}:
-                raise HTTPException(status_code=400, detail="loading_method must be either pymupdf or docling")
-
-            self.db_service.insert_paper_qa_index(arxiv_id, status="processing")
-
-            arxiv_service = self.arxiv_service_factory()
-            paper = self.db_service.get_paper(arxiv_id)
-            if not paper:
-                raise HTTPException(status_code=404, detail="Paper not found in database")
-
-            pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
-            logger.info("Downloading PDF from: %s", pdf_url)
-            pdf_path = arxiv_service.download_pdf(pdf_url, arxiv_id)
-            logger.info("PDF downloaded to: %s", pdf_path)
-
-            loading_service = self.loading_service_factory()
-            logger.info("Loading PDF content...")
-            document = loading_service.load_pdf(pdf_path, method=loading_method)
-
-            page_map = loading_service.get_page_map()
-            logger.info("Loaded %s pages from PDF", len(page_map))
-
-            chunking_service = self.chunking_service_factory()
-            logger.info("Chunking text...")
-            metadata = {"filename": f"{arxiv_id}.pdf", "loading_method": loading_method, "source": f"{arxiv_id}.pdf"}
-            if loading_method == "docling":
-                chunked_data = chunking_service.chunk_docling(document, metadata=metadata, page_map=page_map)
-                chunking_strategy = "docling_sections"
-            else:
-                chunked_data = chunking_service.chunk_pymupdf(document, method="by_titles", metadata=metadata, page_map=page_map)
-                chunking_strategy = "pymupdf_by_titles"
-
-            chunks = chunked_data["chunks"]
-            logger.info("Created %s chunks", len(chunks))
-            logger.info(
-                "Chunk composition: text=%d figure=%d table=%d",
-                sum(1 for chunk in chunks if str((chunk.get("metadata", {}) or {}).get("chunk_type", "text")) == "text"),
-                sum(1 for chunk in chunks if str((chunk.get("metadata", {}) or {}).get("chunk_type", "")) == "figure"),
-                sum(1 for chunk in chunks if str((chunk.get("metadata", {}) or {}).get("chunk_type", "")) == "table"),
-            )
-
-            chunk_file = loading_service.save_document(
-                filename=f"{arxiv_id}.pdf",
-                chunks=chunks,
-                metadata={"total_pages": len(page_map)},
-                loading_method=loading_method,
-                chunking_strategy=chunking_strategy,
-                document_data=document,
-            )
-            logger.info("Chunked document saved to: %s", chunk_file)
-
-            logger.info("Compressing chunk text for rerank with Qwen...")
-            chunks = self.generation_service.compress_chunks_for_rerank(
-                chunks=chunks,
-                model_name=RERANK_QWEN_MODEL_NAME,
-            )
-            logger.info("Generated rerank_text for %d chunks", len(chunks))
-
-            embedding_config = self.get_embedding_config()
-            logger.info(
-                "Creating embeddings with %s / %s...",
-                embedding_config.provider,
-                embedding_config.model_name,
-            )
-
-            input_data = {
-                "chunks": chunks,
-                "metadata": {"filename": f"{arxiv_id}.pdf"},
-            }
-            embeddings, _ = self.embedding_service.create_embeddings(input_data, embedding_config)
-
-            logger.info("Created %d embeddings", len(embeddings))
-            logger.info(
-                "Embedding composition: text=%d figure=%d table=%d",
-                sum(1 for item in embeddings if str((item.get("metadata", {}) or {}).get("chunk_type", "text")) == "text"),
-                sum(1 for item in embeddings if str((item.get("metadata", {}) or {}).get("chunk_type", "")) == "figure"),
-                sum(1 for item in embeddings if str((item.get("metadata", {}) or {}).get("chunk_type", "")) == "table"),
-            )
-
-            embedding_file = self.embedding_service.save_embeddings(f"{arxiv_id}.pdf", embeddings)
-            logger.info("Embeddings saved to: %s", embedding_file)
-
-            vector_db_config = VectorDBConfig(provider="milvus", index_mode="default")
-            index_result = self.vector_store_service.index_embeddings(embedding_file, vector_db_config)
-            collection_name = index_result.get("collection_name", "")
-            logger.info("Index created in collection: %s", collection_name)
-
-            self.db_service.update_paper_qa_index(
-                arxiv_id,
-                collection_name=collection_name,
-                status="indexed",
-                chunk_count=len(chunks),
-                embedding_model=embedding_config.model_name,
-                pdf_path=pdf_path,
-            )
-
-            return {
-                "status": "success",
-                "message": "QA index created successfully",
-                "arxiv_id": arxiv_id,
-                "loading_method": loading_method,
-                "pdf_path": pdf_path,
-                "collection_name": collection_name,
-                "chunk_count": len(chunks),
-                "embedding_model": embedding_config.model_name,
-                "chunk_file": chunk_file,
-            }
-        except HTTPException:
-            self.db_service.update_paper_qa_index(arxiv_id, status="failed")
-            raise
-        except Exception:
-            self.db_service.update_paper_qa_index(arxiv_id, status="failed")
-            raise
+        return self.qa_index_builder.build_qa_index(arxiv_id, loading_method=loading_method)
 
     def build_generation_context(self, search_results: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
         text_parts: List[str] = []

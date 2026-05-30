@@ -4,13 +4,13 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
-from dependencies import get_arxiv_service as get_dependency_arxiv_service
+from dependencies import DATA_SOURCE, get_arxiv_service as get_dependency_arxiv_service
 from dependencies import get_database_service, get_recommendation_service
 
-from services.arxiv_search_service import (
+from services.arxiv_query_builder import (
     ArxivSearchValidationError,
     build_arxiv_query_from_structured_params,
-    build_arxiv_submitted_date_query,
+    build_arxiv_raw_query,
     validate_arxiv_search_request,
 )
 from tools.tool_result import make_tool_error, make_tool_result, make_tool_trace
@@ -152,18 +152,15 @@ def search_arxiv_raw(
         "submitted_days_ago": submitted_days_ago,
     }
     try:
-        normalized_search_query = " ".join(str(search_query or "").strip().split())
-        normalized_id_list = [str(item).strip() for item in (id_list or []) if str(item).strip()]
-        final_search_query = normalized_search_query or None
-        submitted_days_ago_applied = False
-        if submitted_days_ago is not None:
-            if submitted_days_ago < 0:
-                raise ArxivSearchValidationError(
-                    "arxiv_invalid_query: submitted_days_ago must be greater than or equal to 0"
-                )
-            submitted_days_ago_applied = True
-            submitted_date_query = build_arxiv_submitted_date_query(submitted_days_ago)
-            final_search_query = f"({final_search_query}) AND {submitted_date_query}" if final_search_query else submitted_date_query
+        raw_query = build_arxiv_raw_query(
+            search_query=search_query,
+            id_list=id_list,
+            submitted_days_ago=submitted_days_ago,
+            append_date_when_query_missing=True,
+            strict_submitted_days_ago=True,
+        )
+        final_search_query = raw_query["final_search_query"]
+        normalized_id_list = raw_query["id_list"]
 
         validate_arxiv_search_request(
             search_query=final_search_query,
@@ -175,10 +172,10 @@ def search_arxiv_raw(
         )
 
         normalized_inputs = {
-            "search_query": normalized_search_query,
+            "search_query": raw_query["normalized_inputs"]["search_query"],
             "id_list": normalized_id_list,
             "submitted_days_ago": submitted_days_ago,
-            "submitted_days_ago_applied": submitted_days_ago_applied,
+            "submitted_days_ago_applied": raw_query["submitted_days_ago_applied"],
         }
         return _run_search(
             tool_name=tool_name,
@@ -190,7 +187,7 @@ def search_arxiv_raw(
             start=start,
             sort_by=sort_by,
             sort_order=sort_order,
-            submitted_days_ago_applied=submitted_days_ago_applied,
+            submitted_days_ago_applied=raw_query["submitted_days_ago_applied"],
         )
     except ArxivSearchValidationError as exc:
         return make_tool_result(
