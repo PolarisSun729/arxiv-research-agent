@@ -5,12 +5,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 
-from services.chunking_service import ChunkingService
-from services.database_service import DatabaseService
-from services.embedding_service import EmbeddingConfig, EmbeddingService
-from services.generation_service import GenerationService, RERANK_QWEN_MODEL_NAME
-from services.loading_service import LoadingService
-from services.vector_store_service import VectorDBConfig, VectorStoreService
+from services.document.chunking_service import ChunkingService
+from services.storage.database_service import DatabaseService
+from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
+from services.llm.generation_service import GenerationService, RERANK_QWEN_MODEL_NAME
+from services.document.loading_service import LoadingService
+from services.storage.vector_store_service import VectorDBConfig, VectorStoreService
 
 logger = logging.getLogger(__name__)
 

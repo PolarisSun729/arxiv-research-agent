@@ -10,7 +10,7 @@ from enum import Enum
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
 import random
 
-from services.arxiv_query_builder import (
+from services.arxiv.arxiv_query_builder import (
     ARXIV_SEARCH_CONFIG,
     MAX_ALLOWED_RESULTS,
     VALID_CATEGORY_OPERATORS,

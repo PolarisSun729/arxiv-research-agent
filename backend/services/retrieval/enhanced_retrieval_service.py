@@ -13,11 +13,11 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 import torch
 import requests
 
-from services.embedding_service import EmbeddingService
-from services.vector_store_service import VectorStoreService
+from services.embedding.embedding_service import EmbeddingService
+from services.storage.vector_store_service import VectorStoreService
 from utils.config import RETRIEVAL_CONFIG, get_enhanced_retrieval_runtime_config
 from utils.model_utils import get_huggingface_model_path
-from services.intent_service import IntentProfile, IntentService
+from services.intent.intent_service import IntentProfile, IntentService
 
 try:  # pragma: no cover - optional dependency import is environment dependent
     from sentence_transformers import CrossEncoder
@@ -25,10 +25,10 @@ except Exception:  # pragma: no cover
     CrossEncoder = None  # type: ignore
 
 if TYPE_CHECKING:
-    from services.generation_service import GenerationService
+    from services.llm.generation_service import GenerationService
 else:
     try:
-        from services.generation_service import GenerationService
+        from services.llm.generation_service import GenerationService
     except Exception:  # pragma: no cover - optional dependency fallback
         GenerationService = Any  # type: ignore
 

@@ -2,8 +2,8 @@ from typing import List, Dict, Any, Optional
 import logging
 from datetime import datetime
 from pymilvus import connections, Collection, utility
-from services.embedding_service import EmbeddingService
-from services.vector_store_service import normalize_collection_name
+from services.embedding.embedding_service import EmbeddingService
+from services.storage.vector_store_service import normalize_collection_name
 from utils.config import VectorDBProvider, MILVUS_CONFIG
 import os
 import json

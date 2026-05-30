@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from dependencies import DATA_SOURCE, get_arxiv_service as get_dependency_arxiv_service
 from dependencies import get_database_service, get_recommendation_service
 
-from services.arxiv_query_builder import (
+from services.arxiv.arxiv_query_builder import (
     ArxivSearchValidationError,
     build_arxiv_query_from_structured_params,
     build_arxiv_raw_query,

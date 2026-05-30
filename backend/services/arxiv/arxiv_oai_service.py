@@ -11,8 +11,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
 
-from services.embedding_service import EmbeddingService
-from services.vector_store_service import VectorStoreService
+from services.embedding.embedding_service import EmbeddingService
+from services.storage.vector_store_service import VectorStoreService
 from utils.config import OAI_SQLITE_CONFIG, get_arxiv_oai_runtime_config
 
 logger = logging.getLogger(__name__)

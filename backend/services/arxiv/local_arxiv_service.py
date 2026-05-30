@@ -18,7 +18,7 @@ class LocalArxivService:
         check_same_thread: Optional[bool] = None,
     ):
         self.data_path = data_path
-        from services.arxiv_oai_service import ArxivOaiDatabaseService
+        from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
 
         self.database_service = ArxivOaiDatabaseService(db_path=db_path, check_same_thread=check_same_thread)
 

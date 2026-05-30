@@ -6,11 +6,11 @@ from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import HTTPException
 
-from services.arxiv_oai_service import ArxivOaiDatabaseService
-from services.arxiv_search_service import ArxivSearchService
-from services.database_service import DatabaseService
-from services.embedding_service import EmbeddingConfig, EmbeddingService
-from services.vector_store_service import VectorStoreService
+from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
+from services.arxiv.arxiv_search_service import ArxivSearchService
+from services.storage.database_service import DatabaseService
+from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
+from services.storage.vector_store_service import VectorStoreService
 from utils.config import (
     get_enhanced_retrieval_runtime_config,
     get_recommendation_clustering_runtime_config,
@@ -243,4 +243,3 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             "recall_mode": recall_mode,
             "recommendations": selected,
         }
-

@@ -1,2 +1,1 @@
-from .recommendation_service import RecommendationService
-
+"""Recommendation services."""

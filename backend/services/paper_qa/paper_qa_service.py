@@ -6,15 +6,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 
-from services.arxiv_search_service import ArxivSearchService
-from services.chunking_service import ChunkingService
-from services.database_service import DatabaseService
-from services.embedding_service import EmbeddingConfig, EmbeddingService
-from services.enhanced_retrieval_service import EnhancedRetrievalService, RetrievalOptions
-from services.generation_service import GenerationService
-from services.loading_service import LoadingService
-from services.paper_qa_index_builder import PaperQAIndexBuilder
-from services.vector_store_service import VectorStoreService
+from services.arxiv.arxiv_search_service import ArxivSearchService
+from services.document.chunking_service import ChunkingService
+from services.storage.database_service import DatabaseService
+from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
+from services.retrieval.enhanced_retrieval_service import EnhancedRetrievalService, RetrievalOptions
+from services.llm.generation_service import GenerationService
+from services.document.loading_service import LoadingService
+from services.paper_qa.paper_qa_index_builder import PaperQAIndexBuilder
+from services.storage.vector_store_service import VectorStoreService
 
 logger = logging.getLogger(__name__)
 

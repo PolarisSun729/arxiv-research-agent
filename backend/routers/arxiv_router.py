@@ -6,7 +6,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from dependencies import get_arxiv_api_service, get_arxiv_service
-from services.arxiv_query_builder import (
+from services.arxiv.arxiv_query_builder import (
     ArxivSearchValidationError,
     build_arxiv_query_from_structured_params,
     build_arxiv_raw_query,

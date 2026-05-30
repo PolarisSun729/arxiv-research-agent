@@ -8,9 +8,9 @@ logger = logging.getLogger(__name__)
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-from services.database_service import DatabaseService
-from services.embedding_service import EmbeddingService
-from services.vector_store_service import VectorStoreService
+from services.storage.database_service import DatabaseService
+from services.embedding.embedding_service import EmbeddingService
+from services.storage.vector_store_service import VectorStoreService
 
 PAPER_EMBEDDING_COLLECTION = "arxiv_paper_embeddings"
 
