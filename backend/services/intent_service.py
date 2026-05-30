@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
 
+from utils.config import RETRIEVAL_CONFIG, get_intent_routing_runtime_config
+
 
 logger = logging.getLogger(__name__)
 
@@ -147,8 +149,6 @@ INTENT_ALIASES = {
     "experiment": "experiment_setup",
     "results_analysis": "result_analysis",
 }
-
-INTENT_ROUTE_WEIGHTS = get_intent_routing_runtime_config()["intent_route_weights"]
 
 
 def _normalize_text(text: str) -> str:

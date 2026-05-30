@@ -16,13 +16,18 @@ from services.database_service import DatabaseService
 from services.embedding_service import EmbeddingConfig, EmbeddingService
 from services.arxiv_search_service import ArxivSearchService
 from services.vector_store_service import VectorStoreService
-from utils.config import get_recommendation_clustering_runtime_config, get_recommendation_runtime_config
+from utils.config import (
+    get_enhanced_retrieval_runtime_config,
+    get_recommendation_clustering_runtime_config,
+    get_recommendation_runtime_config,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class RecommendationService:
     RECOMMENDATION_CONFIG = get_recommendation_runtime_config()
+    ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
     ARXIV_BACKFILL_REQUEST_INTERVAL_SECONDS = RECOMMENDATION_CONFIG["backfill_request_interval_seconds"]
     MIN_LIKED_PAPERS_FOR_CLUSTERING = RECOMMENDATION_CONFIG["min_liked_papers_for_clustering"]
     MAX_INTEREST_CLUSTERS = RECOMMENDATION_CONFIG["max_interest_clusters"]
@@ -1371,7 +1376,7 @@ class RecommendationService:
                 cluster_diversity_score = max(
                     0.0,
                     1.0 - min(
-                        cluster_repeat_count / self.RECOMMENDATION_CONFIG["cluster_repeat_divisor"],
+                        cluster_repeat_count / self.ENHANCED_RETRIEVAL_CONFIG["cluster_repeat_divisor"],
                         1.0,
                     ),
                 )
@@ -1384,7 +1389,7 @@ class RecommendationService:
                 category_diversity_score = max(
                     0.0,
                     1.0 - min(
-                        category_repeat_count / self.RECOMMENDATION_CONFIG["category_repeat_divisor"],
+                        category_repeat_count / self.ENHANCED_RETRIEVAL_CONFIG["category_repeat_divisor"],
                         1.0,
                     ),
                 )
