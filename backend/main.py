@@ -24,12 +24,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(arxiv_router)
-app.include_router(agent_router)
-app.include_router(user_router)
-app.include_router(paper_router)
-app.include_router(qa_router)
-app.include_router(chunk_router)
+# 统一把后端公开接口挂在 /api 下，前端只需要保留一个稳定的基础前缀。
+app.include_router(arxiv_router, prefix="/api")
+app.include_router(agent_router, prefix="/api")
+app.include_router(user_router, prefix="/api")
+app.include_router(paper_router, prefix="/api")
+app.include_router(qa_router, prefix="/api")
+app.include_router(chunk_router, prefix="/api")
 
 
 if __name__ == "__main__":

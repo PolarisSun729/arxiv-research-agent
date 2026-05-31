@@ -31,6 +31,40 @@ def get_valid_arxiv_categories() -> Set[str]:
     return {"cs.AI", "cs.CL", "cs.IR", "cs.LG"}
 
 
+@lru_cache(maxsize=1)
+def get_default_agent_arxiv_categories() -> List[str]:
+    """
+    Return the fixed category scope for the arXiv search agent.
+
+    The agent should search within the repository-configured category set rather
+    than asking the LLM to invent or choose categories per request.
+    """
+    valid_categories = get_valid_arxiv_categories()
+
+    try:
+        from utils.config import get_arxiv_oai_runtime_config
+
+        configured_categories = [
+            str(item).strip()
+            for item in get_arxiv_oai_runtime_config().get("target_categories", [])
+            if str(item).strip()
+        ]
+    except Exception:
+        configured_categories = []
+
+    normalized: List[str] = []
+    seen = set()
+    for category in configured_categories:
+        if category in valid_categories and category not in seen:
+            seen.add(category)
+            normalized.append(category)
+
+    if normalized:
+        return normalized
+
+    return [category for category in ("cs.CL", "cs.LG", "cs.IR", "cs.AI") if category in valid_categories]
+
+
 class ArxivSearchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

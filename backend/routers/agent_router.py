@@ -8,7 +8,7 @@ from agents.arxiv_search_agent import ArxivSearchRequest, ArxivSearchResponse, r
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/agent", tags=["agent"])
+router = APIRouter(prefix="/agent", tags=["agent"])
 
 
 @router.post("/arxiv-search", response_model=ArxivSearchResponse)

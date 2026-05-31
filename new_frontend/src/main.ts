@@ -3,7 +3,8 @@ import { createPinia } from 'pinia'
 import ElementPlus from 'element-plus'
 import 'element-plus/dist/index.css'
 
-import router from '@/router'
+// Use the explicit index file so Vite does not rely on directory index resolution here.
+import router from '@/router/index'
 import App from '@/App.vue'
 import '@/styles/global.css'
 

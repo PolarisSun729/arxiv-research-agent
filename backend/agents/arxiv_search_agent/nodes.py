@@ -17,7 +17,7 @@ try:  # pragma: no cover - import path differs between backend cwd and package i
 except ModuleNotFoundError:  # pragma: no cover
     from backend.tools.tool_registry import invoke_tool
 
-from .schemas import AgentToolCall, ArxivSearchSpec, get_valid_arxiv_categories
+from .schemas import AgentToolCall, ArxivSearchSpec, get_default_agent_arxiv_categories, get_valid_arxiv_categories
 from .state import AgentState
 
 SEARCH_TOOL_NAME = "search_arxiv_structured"
@@ -422,8 +422,6 @@ def _build_search_spec(
         if llm_spec is not None:
             enriched = _apply_rule_enrichment(message, llm_spec)
             if enriched is not None:
-                if not enriched.categories:
-                    warnings.append("未能自动补全 categories")
                 return enriched, _dedupe_preserve_order(warnings)
         warnings.append("LLM 输出未通过校验，已回退到规则解析")
 
@@ -433,8 +431,6 @@ def _build_search_spec(
         warnings.append(f"规则解析结果未通过结构校验: {_validation_error_summary(exc)}")
         return None, _dedupe_preserve_order(warnings)
 
-    if spec is not None and not spec.categories:
-        warnings.append("未能自动补全 categories")
     return spec, _dedupe_preserve_order(warnings)
 
 
@@ -453,7 +449,6 @@ def _parse_with_llm(message: str, generation_service: Optional[Any]) -> Optional
         "\"query\":null|string,"
         "\"title_query\":null|string,"
         "\"abstract_query\":null|string,"
-        "\"categories\":[\"cs.AI\"],"
         "\"submitted_days_ago\":null|int,"
         "\"max_results\":10,"
         "\"sort_by\":\"submittedDate|relevance|lastUpdatedDate\","
@@ -468,6 +463,7 @@ def _parse_with_llm(message: str, generation_service: Optional[Any]) -> Optional
         "- If the user is searching but topic is missing or too vague, use unclear.\n"
         "- Use max_results between 1 and 20. Default to 10 if not specified.\n"
         "- Use submitted_days_ago for recent-time expressions.\n"
+        "- Do not output categories; the system applies a fixed configured category scope.\n"
         f"User message: {message}"
     )
 
@@ -490,7 +486,7 @@ def _normalize_and_validate_spec(payload: Mapping[str, Any]) -> Optional[ArxivSe
         query=_normalize_optional_str(payload.get("query")),
         title_query=_normalize_optional_str(payload.get("title_query")),
         abstract_query=_normalize_optional_str(payload.get("abstract_query")),
-        categories=_normalize_categories(payload.get("categories")),
+        categories=get_default_agent_arxiv_categories(),
         submitted_days_ago=_safe_optional_int(payload.get("submitted_days_ago")),
         max_results=_clamp(_safe_int(payload.get("max_results"), default=10), 1, 20),
         sort_by=_normalize_sort_by(payload.get("sort_by")),
@@ -505,7 +501,7 @@ def _build_spec_from_rules(message: str) -> Optional[ArxivSearchSpec]:
     query = _extract_query_from_message(message)
     title_query = _extract_marked_query(message, TITLE_HINT_PATTERNS)
     abstract_query = _extract_marked_query(message, ABSTRACT_HINT_PATTERNS)
-    categories = _infer_categories(message, query, title_query, abstract_query)
+    categories = get_default_agent_arxiv_categories()
     submitted_days_ago = _extract_submitted_days_ago(message)
     max_results = _extract_max_results(message)
     sort_by, sort_order = _extract_sorting(message)
@@ -533,7 +529,8 @@ def _apply_rule_enrichment(message: str, spec: ArxivSearchSpec) -> Optional[Arxi
     query = spec.query or _extract_query_from_message(message)
     title_query = spec.title_query or _extract_marked_query(message, TITLE_HINT_PATTERNS)
     abstract_query = spec.abstract_query or _extract_marked_query(message, ABSTRACT_HINT_PATTERNS)
-    categories = list(spec.categories or []) or _infer_categories(message, query, title_query, abstract_query)
+    # Always use the configured category scope for this agent instead of model-generated categories.
+    categories = get_default_agent_arxiv_categories()
     submitted_days_ago = spec.submitted_days_ago if spec.submitted_days_ago is not None else _extract_submitted_days_ago(message)
     max_results = _clamp(spec.max_results or 10, 1, 20)
     sort_by, sort_order = _extract_sorting(message)
