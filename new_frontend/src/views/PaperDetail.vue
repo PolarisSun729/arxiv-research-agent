@@ -319,12 +319,39 @@ watch(paperId, async () => {
               :messages="ragChatMessages"
               :loading="qaLoading"
               :quick-prompts="quickPrompts"
-              :paper-title="store.currentPaper.title"
-              :paper-id="store.currentPaper.arxivId"
+              title="论文问答"
+              :description="`围绕《${store.currentPaper.title}》提问，系统会先召回相关 chunk，再生成答案。`"
+              prompt-title="快捷问题"
+              assistant-label="Qwen"
+              sender-placeholder="输入你想问论文的问题，Enter 发送，Shift+Enter 换行"
               @submit-question="submitQuestion"
               @select-prompt="applyPrompt"
-              @open-evidence="handlePanelOpenEvidence"
-            />
+            >
+              <template #message-footer="{ item }">
+                <div
+                  v-if="item.role === 'assistant' && ((item.sources?.length || 0) > 0 || item.retrievalDebug)"
+                  class="assistant-actions"
+                >
+                  <div class="assistant-badges">
+                    <el-tag size="small" effect="plain" type="info">
+                      {{ item.sources?.length || 0 }} 条来源
+                    </el-tag>
+                    <el-tag v-if="item.retrievalDebug" size="small" effect="plain" type="warning">
+                      Debug 可查看
+                    </el-tag>
+                  </div>
+                  <el-button
+                    size="small"
+                    text
+                    type="primary"
+                    class="evidence-button"
+                    @click="handlePanelOpenEvidence(item.turnId || '')"
+                  >
+                    查看来源与调试
+                  </el-button>
+                </div>
+              </template>
+            </RagChatPanel>
           </div>
 
           <aside class="qa-side">

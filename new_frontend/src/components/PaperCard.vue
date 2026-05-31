@@ -14,7 +14,6 @@ const emit = defineEmits<{
   (e: 'label', id: string, label: 'liked' | 'disliked' | null): void
 }>()
 
-const showFullSummary = ref(false)
 const selectedLabel = ref(props.paper.label === 'liked' ? 'liked' : props.paper.label === 'disliked' ? 'disliked' : '')
 
 watch(() => props.paper.label, (newLabel) => {
@@ -135,157 +134,172 @@ const labelOptions = [
 
 <template>
   <el-card class="paper-card">
-    <div class="paper-header">
-      <div class="paper-title">
-        <el-tooltip :content="paper.title" placement="top">
-          <h3 class="title-text">{{ paper.title }}</h3>
-        </el-tooltip>
+    <div class="paper-main">
+      <div class="paper-header">
+        <div class="paper-title">
+          <el-tooltip :content="paper.title" placement="top">
+            <h3 class="title-text">{{ paper.title }}</h3>
+          </el-tooltip>
+        </div>
+        <div class="paper-labels">
+          <el-tag
+            v-if="paper.label"
+            :class="getLabelClass(paper.label)"
+            size="small"
+          >
+            {{ getLabelText(paper.label) }}
+          </el-tag>
+        </div>
       </div>
-      <div class="paper-labels">
-        <el-tag
-          v-if="paper.label"
-          :class="getLabelClass(paper.label)"
-          size="small"
-        >
-          {{ getLabelText(paper.label) }}
+
+      <div class="paper-authors">
+        <span class="authors-label">作者：</span>
+        <span class="authors-list">{{ authorsDisplay }}</span>
+      </div>
+
+      <div class="paper-summary">
+        <p class="summary-expanded">
+          {{ paper.summary }}
+        </p>
+      </div>
+    </div>
+
+    <div class="paper-footer">
+      <div class="paper-meta">
+        <div class="meta-item">
+          <el-tag size="small">{{ formatDate(paper.publishedAt) }}</el-tag>
+        </div>
+        <div class="meta-item">
+          <el-tag
+            v-for="cat in paper.categories"
+            :key="cat"
+            size="small"
+            type="info"
+          >
+            {{ cat }}
+          </el-tag>
+        </div>
+      </div>
+
+      <div v-if="isRecommendation || isRecommended(paper)" class="paper-similarity">
+        <span class="similarity-label">相似度：</span>
+        <SimilarityTag :score="(paper as any).similarityScore || (paper as any).similarity || 0" />
+        <span v-if="finalScoreText" class="final-score-label">最终 {{ finalScoreText }}</span>
+        <el-tag v-if="bestMatchedClusterId" size="small" type="success" effect="plain">
+          命中簇 {{ bestMatchedClusterId }}
         </el-tag>
-      </div>
-    </div>
-
-    <div class="paper-authors">
-      <span class="authors-label">作者：</span>
-      <span class="authors-list">{{ authorsDisplay }}</span>
-    </div>
-
-    <div class="paper-summary">
-      <p :class="{ 'summary-collapsed': !showFullSummary && paper.summary.length > 150 }">
-        {{ showFullSummary ? paper.summary : paper.summary.slice(0, 150) + '...' }}
-      </p>
-      <button
-        v-if="paper.summary.length > 150"
-        class="toggle-summary"
-        @click="showFullSummary = !showFullSummary"
-      >
-        {{ showFullSummary ? '收起' : '展开' }}
-      </button>
-    </div>
-
-    <div class="paper-meta">
-      <div class="meta-item">
-        <el-tag size="small">{{ formatDate(paper.publishedAt) }}</el-tag>
-      </div>
-      <div class="meta-item">
-        <el-tag
-          v-for="cat in paper.categories"
-          :key="cat"
-          size="small"
-          type="info"
-        >
-          {{ cat }}
+        <el-tag v-if="recallClusterId" size="small" type="warning" effect="plain">
+          召回来源 {{ recallClusterId }}
         </el-tag>
-      </div>
-    </div>
-
-    <div v-if="isRecommendation || isRecommended(paper)" class="paper-similarity">
-      <span class="similarity-label">相似度：</span>
-      <SimilarityTag :score="(paper as any).similarityScore || (paper as any).similarity || 0" />
-      <span v-if="finalScoreText" class="final-score-label">最终 {{ finalScoreText }}</span>
-      <el-tag v-if="bestMatchedClusterId" size="small" type="success" effect="plain">
-        命中簇 {{ bestMatchedClusterId }}
-      </el-tag>
-      <el-tag v-if="recallClusterId" size="small" type="warning" effect="plain">
-        召回来源 {{ recallClusterId }}
-      </el-tag>
-      <el-tag v-if="recallClusterId" size="small" type="info" effect="plain">
-        簇召回相似度 {{ toPercent(recallClusterSimilarity) }}%
-      </el-tag>
-      <el-tag v-if="recallClusterHitsCount > 1" size="small" type="info" effect="plain">
-        多簇命中 {{ recallClusterHitsCount }}
-      </el-tag>
-      <el-tag size="small" type="success" effect="plain">
-        多样性得分 {{ toPercent(diversityMatchScore) }}%
-      </el-tag>
-      <el-tag v-if="diversityReason" size="small" type="warning" effect="plain">
-        {{ diversityReason }}
-      </el-tag>
-      <p v-if="recommendationReason" class="recommendation-reason">
-        {{ recommendationReason }}
-      </p>
-      <div v-if="recommendationScoreBreakdown" class="score-breakdown">
-        <div class="score-breakdown-row">
-          <div class="score-breakdown-meta">
-            <span class="breakdown-label">语义</span>
-            <strong>{{ toPercent(recommendationScoreBreakdown.semantic_score) }}%</strong>
+        <el-tag v-if="recallClusterId" size="small" type="info" effect="plain">
+          簇召回相似度 {{ toPercent(recallClusterSimilarity) }}%
+        </el-tag>
+        <el-tag v-if="recallClusterHitsCount > 1" size="small" type="info" effect="plain">
+          多簇命中 {{ recallClusterHitsCount }}
+        </el-tag>
+        <el-tag size="small" type="success" effect="plain">
+          多样性得分 {{ toPercent(diversityMatchScore) }}%
+        </el-tag>
+        <el-tag v-if="diversityReason" size="small" type="warning" effect="plain">
+          {{ diversityReason }}
+        </el-tag>
+        <p v-if="recommendationReason" class="recommendation-reason">
+          {{ recommendationReason }}
+        </p>
+        <div v-if="recommendationScoreBreakdown" class="score-breakdown">
+          <div class="score-breakdown-row">
+            <div class="score-breakdown-meta">
+              <span class="breakdown-label">语义</span>
+              <strong>{{ toPercent(recommendationScoreBreakdown.semantic_score) }}%</strong>
+            </div>
+            <el-progress :percentage="toPercent(recommendationScoreBreakdown.semantic_score)" :show-text="false" />
           </div>
-          <el-progress :percentage="toPercent(recommendationScoreBreakdown.semantic_score)" :show-text="false" />
-        </div>
-        <div class="score-breakdown-row">
-          <div class="score-breakdown-meta">
-            <span class="breakdown-label">分类</span>
-            <strong>{{ toPercent(recommendationScoreBreakdown.category_score) }}%</strong>
+          <div class="score-breakdown-row">
+            <div class="score-breakdown-meta">
+              <span class="breakdown-label">分类</span>
+              <strong>{{ toPercent(recommendationScoreBreakdown.category_score) }}%</strong>
+            </div>
+            <el-progress :percentage="toPercent(recommendationScoreBreakdown.category_score)" :show-text="false" color="#8b5cf6" />
           </div>
-          <el-progress :percentage="toPercent(recommendationScoreBreakdown.category_score)" :show-text="false" color="#8b5cf6" />
-        </div>
-        <div class="score-breakdown-row">
-          <div class="score-breakdown-meta">
-            <span class="breakdown-label">新鲜度</span>
-            <strong>{{ toPercent(recommendationScoreBreakdown.recency_score) }}%</strong>
+          <div class="score-breakdown-row">
+            <div class="score-breakdown-meta">
+              <span class="breakdown-label">新鲜度</span>
+              <strong>{{ toPercent(recommendationScoreBreakdown.recency_score) }}%</strong>
+            </div>
+            <el-progress :percentage="toPercent(recommendationScoreBreakdown.recency_score)" :show-text="false" color="#0ea5e9" />
           </div>
-          <el-progress :percentage="toPercent(recommendationScoreBreakdown.recency_score)" :show-text="false" color="#0ea5e9" />
-        </div>
-        <div class="score-breakdown-row" v-if="typeof recommendationScoreBreakdown.diversity_score === 'number'">
-          <div class="score-breakdown-meta">
-            <span class="breakdown-label">多样性</span>
-            <strong>{{ toPercent(recommendationScoreBreakdown.diversity_score) }}%</strong>
+          <div class="score-breakdown-row" v-if="typeof recommendationScoreBreakdown.diversity_score === 'number'">
+            <div class="score-breakdown-meta">
+              <span class="breakdown-label">多样性</span>
+              <strong>{{ toPercent(recommendationScoreBreakdown.diversity_score) }}%</strong>
+            </div>
+            <el-progress :percentage="toPercent(recommendationScoreBreakdown.diversity_score)" :show-text="false" color="#22c55e" />
           </div>
-          <el-progress :percentage="toPercent(recommendationScoreBreakdown.diversity_score)" :show-text="false" color="#22c55e" />
         </div>
       </div>
-    </div>
 
-    <div class="paper-actions">
-      <a
-        :href="paper.pdfUrl"
-        target="_blank"
-        class="pdf-link"
-      >
-        <el-button size="small" type="default">
-          📘 打开 PDF
+      <div class="paper-actions">
+        <a
+          :href="paper.pdfUrl"
+          target="_blank"
+          class="pdf-link"
+        >
+          <el-button size="small" type="default">
+            📘 打开 PDF
+          </el-button>
+        </a>
+        <el-button
+          size="small"
+          type="primary"
+          @click="handleViewDetail"
+        >
+          🧾 查看详情
         </el-button>
-      </a>
-      <el-button
-        size="small"
-        type="primary"
-        @click="handleViewDetail"
-      >
-        🧾 查看详情
-      </el-button>
-      <el-select
-        v-model="selectedLabel"
-        placeholder="选择兴趣"
-        size="small"
-        :style="{ width: '120px' }"
-        @change="handleLabelChange"
-      >
-        <el-option
-          v-for="option in labelOptions"
-          :key="option.value"
-          :label="option.label"
-          :value="option.value"
+        <el-select
+          v-model="selectedLabel"
+          placeholder="选择兴趣"
+          size="small"
+          :style="{ width: '120px' }"
+          @change="handleLabelChange"
         >
-          <span class="option-row">
-            <span class="option-emoji">{{ option.emoji }}</span>
-            <span>{{ option.label }}</span>
-          </span>
-        </el-option>
-      </el-select>
+          <el-option
+            v-for="option in labelOptions"
+            :key="option.value"
+            :label="option.label"
+            :value="option.value"
+          >
+            <span class="option-row">
+              <span class="option-emoji">{{ option.emoji }}</span>
+              <span>{{ option.label }}</span>
+            </span>
+          </el-option>
+        </el-select>
+      </div>
     </div>
   </el-card>
 </template>
 
 <style scoped>
 .paper-card {
-  margin-bottom: 16px;
+  height: auto;
+  overflow: hidden;
+  margin-bottom: 0;
+}
+
+.paper-card :deep(.el-card__body) {
+  height: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.paper-main {
+  height: 320px;
+  overflow: hidden;
+}
+
+/* 上半部分固定，方便多张卡片对齐；内容超出时只在自身区域里截断。 */
+.paper-main :deep(.el-tooltip__trigger) {
+  display: block;
 }
 
 .paper-header {
@@ -307,12 +321,20 @@ const labelOptions = [
   margin: 0;
   line-height: 1.4;
   word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .paper-authors {
   margin-bottom: 12px;
   font-size: 14px;
   color: #6b7280;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .authors-label {
@@ -325,6 +347,10 @@ const labelOptions = [
 
 .paper-summary {
   margin-bottom: 12px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .paper-summary p {
@@ -332,27 +358,13 @@ const labelOptions = [
   color: #4b5563;
   line-height: 1.6;
   margin: 0;
+  min-height: 0;
 }
 
-.summary-collapsed {
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.toggle-summary {
-  background: none;
-  border: none;
-  color: #1890ff;
-  font-size: 13px;
-  cursor: pointer;
-  margin-top: 8px;
-  padding: 0;
-}
-
-.toggle-summary:hover {
-  text-decoration: underline;
+.summary-expanded {
+  max-height: 180px;
+  overflow-y: auto;
+  padding-right: 6px;
 }
 
 .paper-meta {
@@ -426,6 +438,8 @@ const labelOptions = [
 .paper-actions {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
   padding-top: 12px;
   border-top: 1px solid #e5e7eb;
 }
@@ -443,6 +457,23 @@ const labelOptions = [
 .option-emoji {
   width: 18px;
   text-align: center;
+}
+
+@media (max-width: 900px) {
+  .paper-card {
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+  }
+
+  .paper-card :deep(.el-card__body) {
+    height: auto;
+  }
+
+  .paper-main {
+    height: auto;
+    overflow: visible;
+  }
 }
 </style>
 

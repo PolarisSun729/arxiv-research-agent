@@ -42,6 +42,7 @@ CORE_CONFIG: Dict[str, Any] = {
         "ARXIV_PROXY_URL",
         "http://127.0.0.1:7897",
     ),
+    "service_load_mode": _env_str("BACKEND_SERVICE_LOAD_MODE", "lazy"),
 }
 
 DOCLING_CONFIG: Dict[str, Any] = {

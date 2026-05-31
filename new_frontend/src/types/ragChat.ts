@@ -1,4 +1,5 @@
 import type { RetrievalDebug } from '@/api/papers'
+import type { AgentChatMessage } from '@/types/agentChat'
 
 export type RagChatRole = 'user' | 'assistant'
 
@@ -20,13 +21,8 @@ export interface QaTurnForRagChat {
   streaming?: boolean
 }
 
-export interface RagChatMessage {
-  id: string
+export interface RagChatMessage extends AgentChatMessage<QaTurnForRagChat> {
   turnId: string
-  role: RagChatRole
-  content: string
-  loading: boolean
-  createdAt: string
   sources: RagChatSource[]
   retrievalDebug: RetrievalDebug | null
 }
@@ -41,6 +37,8 @@ export function qaTurnToRagMessages(turn: QaTurnForRagChat): RagChatMessage[] {
     content: turn.question,
     loading: false,
     createdAt: turn.createdAt,
+    response: null,
+    error: null,
     sources: [],
     retrievalDebug: null
   }
@@ -52,6 +50,8 @@ export function qaTurnToRagMessages(turn: QaTurnForRagChat): RagChatMessage[] {
     content: turn.answer,
     loading: Boolean(turn.streaming),
     createdAt: turn.createdAt,
+    response: turn,
+    error: null,
     sources: turn.sources,
     retrievalDebug: turn.retrievalDebug ?? null
   }
