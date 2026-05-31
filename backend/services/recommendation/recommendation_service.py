@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections import Counter
 from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import HTTPException
@@ -242,4 +243,199 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             "interest_cluster_count": user_vector_data.get("cluster_count", 0),
             "recall_mode": recall_mode,
             "recommendations": selected,
+        }
+
+    def rerank_search_results_for_user(
+        self,
+        user_id: str,
+        papers: List[Dict[str, Any]],
+        query: Optional[str],
+        top_n: int,
+        search_spec: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Deterministically rerank search results for a specific user.
+
+        The method keeps the existing search results intact when personalization
+        cannot be applied, and it reuses the same embedding/vector logic that the
+        recommendation pipeline already uses.
+        """
+        normalized_papers = [paper for paper in papers if isinstance(paper, dict)]
+        limit = max(1, min(int(top_n or len(normalized_papers) or 1), len(normalized_papers) or 1))
+        warnings: List[str] = []
+
+        if not normalized_papers:
+            return {
+                "status": "success",
+                "message": "No papers to rerank",
+                "personalized_applied": False,
+                "warnings": warnings,
+                "papers": [],
+            }
+
+        query_text = str(query or "").strip()
+        title_query = str((search_spec or {}).get("title_query") or "").strip()
+        abstract_query = str((search_spec or {}).get("abstract_query") or "").strip()
+        search_categories = list((search_spec or {}).get("categories") or [])
+        try:
+            user_vector_data = self._get_or_refresh_interest_vector(user_id)
+            personalized_available = True
+        except Exception as exc:
+            user_vector_data = None
+            personalized_available = False
+            warnings.append(f"用户兴趣向量不可用，已退化为普通搜索排序: {exc}")
+
+        try:
+            preferences = self.db_service.get_user_preferences(user_id=user_id)
+            liked_ids = preferences.get("liked_papers", [])
+            disliked_ids = preferences.get("disliked_papers", [])
+            liked_details = self.db_service.get_liked_papers_with_details(user_id=user_id)
+            liked_category_freq = self._build_liked_category_frequency(liked_details)
+        except Exception as exc:
+            warnings.append(f"读取用户偏好失败，已退化为普通搜索排序: {exc}")
+            preferences = {"liked_papers": [], "disliked_papers": []}
+            liked_ids = []
+            disliked_ids = []
+            liked_category_freq = Counter()
+            personalized_available = False
+            user_vector = None
+            interest_clusters = []
+            disliked_vector = None
+            embedding_config = None
+
+        user_vector = user_vector_data.get("vector_data") if user_vector_data else None
+        interest_clusters = user_vector_data.get("interest_clusters", []) if user_vector_data else []
+        disliked_vector = user_vector_data.get("disliked_vector_data") if user_vector_data else None
+        embedding_config = self.get_embedding_config() if personalized_available else None
+
+        candidate_ids = [str(paper.get("arxiv_id", "") or paper.get("id", "") or "").strip() for paper in normalized_papers if str(paper.get("arxiv_id", "") or paper.get("id", "") or "").strip()]
+        stored_embeddings: Dict[str, List[float]] = {}
+        if personalized_available and candidate_ids:
+            try:
+                candidate_embedding_rows = self.vector_store_service.get_paper_embeddings_by_arxiv_ids(
+                    collection_name=self.collection_name,
+                    arxiv_ids=candidate_ids,
+                )
+                stored_embeddings = {
+                    str(item.get("arxiv_id", "") or "").strip(): [float(value) for value in item.get("vector", [])]
+                    for item in candidate_embedding_rows
+                    if item.get("arxiv_id") and item.get("vector")
+                }
+            except Exception as exc:
+                warnings.append(f"复用候选论文向量失败，已使用文本特征继续排序: {exc}")
+                stored_embeddings = {}
+
+        scored_candidates: List[Dict[str, Any]] = []
+        for paper in normalized_papers:
+            fallback_arxiv_id = str(paper.get("arxiv_id", "") or paper.get("id", "") or "").strip()
+            normalized_paper = self._normalize_paper_record(paper, fallback_arxiv_id or "unknown")
+            candidate = {**paper, **normalized_paper}
+
+            if personalized_available and fallback_arxiv_id and fallback_arxiv_id in stored_embeddings:
+                candidate["_stored_vector"] = stored_embeddings[fallback_arxiv_id]
+
+            query_breakdown = self._build_query_match_score(
+                candidate,
+                query=query_text or normalized_paper.get("query", ""),
+                title_query=title_query,
+                abstract_query=abstract_query,
+                search_categories=search_categories,
+            )
+            candidate["query_match_score"] = query_breakdown["query_match_score"]
+            candidate["matched_terms"] = query_breakdown["matched_terms"]
+            candidate["query_score_breakdown"] = query_breakdown["query_score_breakdown"]
+
+            if personalized_available and user_vector:
+                try:
+                    ranked_candidate = self._build_candidate_score(
+                        candidate=candidate,
+                        liked_category_freq=liked_category_freq,
+                        user_vector=user_vector,
+                        interest_clusters=interest_clusters,
+                        disliked_vector=disliked_vector,
+                        embedding_config=embedding_config,
+                    )
+                    personalization_score = float(ranked_candidate.get("relevance_score", 0.0) or 0.0)
+                    score_breakdown = dict(ranked_candidate.get("score_breakdown", {}))
+                    score_breakdown.update(query_breakdown["query_score_breakdown"])
+                except Exception as exc:
+                    warnings.append(f"论文 {fallback_arxiv_id or 'unknown'} 个性化打分失败，已退化为查询排序: {exc}")
+                    ranked_candidate = dict(candidate)
+                    personalization_score = 0.0
+                    score_breakdown = {
+                        "semantic_score": 0.0,
+                        "category_score": 0.0,
+                        "recency_score": 0.0,
+                        "disliked_penalty": 0.0,
+                        "relevance_score": 0.0,
+                        "diversity_score": 0.0,
+                    }
+                    score_breakdown.update(query_breakdown["query_score_breakdown"])
+            else:
+                ranked_candidate = dict(candidate)
+                personalization_score = 0.0
+                score_breakdown = {
+                    "semantic_score": 0.0,
+                    "category_score": 0.0,
+                    "recency_score": 0.0,
+                    "disliked_penalty": 0.0,
+                    "relevance_score": 0.0,
+                    "diversity_score": 0.0,
+                }
+                score_breakdown.update(query_breakdown["query_score_breakdown"])
+
+            query_match_score = float(query_breakdown["query_match_score"] or 0.0)
+            final_score = query_match_score * 0.65 + personalization_score * 0.35
+            ranked_candidate["query_match_score"] = query_match_score
+            ranked_candidate["personalization_score"] = personalization_score
+            ranked_candidate["final_score"] = final_score
+            ranked_candidate["score_breakdown"] = {
+                **score_breakdown,
+                "query_match_score": query_match_score,
+                "personalization_score": personalization_score,
+                "final_score": final_score,
+            }
+            ranked_candidate["match_reason"] = self._build_match_reason(query_match_score, list(query_breakdown["matched_terms"]))
+            ranked_candidate["personalized_reason"] = self._build_personalized_reason(ranked_candidate, ranked_candidate["score_breakdown"])
+            ranked_candidate["priority"] = 0
+
+            ranked_candidate.pop("_candidate_embedding", None)
+            ranked_candidate.pop("_candidate_categories", None)
+            ranked_candidate.pop("_stored_vector", None)
+            ranked_candidate.pop("query_score_breakdown", None)
+            scored_candidates.append(ranked_candidate)
+
+        scored_candidates.sort(
+            key=lambda item: (
+                float(item.get("final_score", 0.0) or 0.0),
+                float(item.get("query_match_score", 0.0) or 0.0),
+                float(item.get("personalization_score", 0.0) or 0.0),
+                float(item.get("score_breakdown", {}).get("semantic_score", 0.0) or 0.0),
+                str(item.get("published_date", "") or ""),
+                str(item.get("arxiv_id", "") or item.get("id", "") or ""),
+            ),
+            reverse=True,
+        )
+
+        for index, paper in enumerate(scored_candidates, start=1):
+            paper["priority"] = index
+            paper["score_breakdown"]["priority"] = index
+
+        selected = scored_candidates[:limit]
+        personalized_applied = bool(personalized_available and user_vector)
+        if personalized_applied:
+            personalized_count = sum(1 for paper in selected if float(paper.get("personalization_score", 0.0) or 0.0) > 0.0)
+            if personalized_count == 0:
+                warnings.append("已获取用户兴趣向量，但当前候选论文未形成有效个性化增益")
+
+        return {
+            "status": "success",
+            "message": "Search results reranked successfully",
+            "personalized_applied": personalized_applied,
+            "warnings": warnings,
+            "papers": selected,
+            "total_found": len(scored_candidates),
+            "top_n": limit,
+            "liked_papers_count": len(liked_ids),
+            "disliked_papers_count": len(disliked_ids),
         }

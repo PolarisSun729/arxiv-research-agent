@@ -23,3 +23,4 @@ class AgentState(BaseModel):
     answer: Optional[str] = None
     next_actions: List[str] = Field(default_factory=list)
     errors: List[Dict[str, Any]] = Field(default_factory=list)
+    personalized_rerank_applied: bool = False

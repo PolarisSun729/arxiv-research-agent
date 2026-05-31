@@ -229,8 +229,15 @@ export async function getStats(): Promise<typeof mockStats> {
   if (isMockMode) {
     return mockStats
   }
-  
-  return request.get('/stats')
+
+  // 先关闭对后端 /stats 的真实请求，前端暂时直接走零值兜底。
+  // return request.get('/stats')
+  return {
+    totalPapers: 0,
+    labeledPapers: 0,
+    todayNewPapers: 0,
+    recommendedPapers: 0
+  }
 }
 
 export async function searchArxiv(params: ArxivSearchParams): Promise<PaginatedResponse<Paper>> {

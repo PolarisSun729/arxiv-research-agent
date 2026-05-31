@@ -13,6 +13,7 @@ from .nodes import (
     check_search_result,
     invoke_search_tool,
     parse_search_request,
+    personalized_rank_and_annotate_papers,
     synthesize_response,
 )
 from .state import AgentState
@@ -107,6 +108,7 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
     graph.add_node("build_search_tool_args", build_search_tool_args)
     graph.add_node("invoke_search_tool", invoke_search_tool)
     graph.add_node("check_search_result", check_search_result)
+    graph.add_node("personalized_rank_and_annotate_papers", personalized_rank_and_annotate_papers)
     graph.add_node("synthesize_response", synthesize_response)
 
     graph.add_edge(START, "parse_search_request")
@@ -121,7 +123,8 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
     )
     graph.add_edge("build_search_tool_args", "invoke_search_tool")
     graph.add_edge("invoke_search_tool", "check_search_result")
-    graph.add_edge("check_search_result", "synthesize_response")
+    graph.add_edge("check_search_result", "personalized_rank_and_annotate_papers")
+    graph.add_edge("personalized_rank_and_annotate_papers", "synthesize_response")
     graph.add_edge("synthesize_response", END)
 
     return graph.compile()

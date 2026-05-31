@@ -17,6 +17,11 @@ try:  # pragma: no cover - import path differs between backend cwd and package i
 except ModuleNotFoundError:  # pragma: no cover
     from backend.tools.tool_registry import invoke_tool
 
+try:  # pragma: no cover - import path differs between backend cwd and package import
+    from dependencies import get_recommendation_service
+except ModuleNotFoundError:  # pragma: no cover
+    from backend.dependencies import get_recommendation_service
+
 from .schemas import AgentToolCall, ArxivSearchSpec, get_default_agent_arxiv_categories, get_valid_arxiv_categories
 from .state import AgentState
 
@@ -348,6 +353,58 @@ def check_search_result(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
     return next_state
 
 
+def personalized_rank_and_annotate_papers(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    current_state = _coerce_state(state)
+    next_state = current_state.model_copy(deep=True)
+
+    if next_state.intent != "arxiv_search" or not next_state.user_id or not next_state.papers:
+        next_state.personalized_rerank_applied = False
+        return next_state
+
+    try:
+        recommendation_service = get_recommendation_service()
+    except Exception as exc:
+        next_state.personalized_rerank_applied = False
+        next_state.warnings = _dedupe_preserve_order(
+            list(next_state.warnings) + [f"无法初始化推荐服务，已保留普通搜索排序: {exc}"],
+        )
+        return next_state
+
+    search_spec_payload = next_state.search_spec.model_dump() if next_state.search_spec is not None else None
+    query_text = next_state.search_spec.query if next_state.search_spec is not None else None
+
+    try:
+        rerank_result = recommendation_service.rerank_search_results_for_user(
+            user_id=str(next_state.user_id),
+            papers=list(next_state.papers or []),
+            query=query_text,
+            top_n=_determine_requested_max_results(next_state),
+            search_spec=search_spec_payload,
+        )
+    except Exception as exc:
+        next_state.personalized_rerank_applied = False
+        next_state.warnings = _dedupe_preserve_order(
+            list(next_state.warnings) + [f"个性化重排失败，已保留普通搜索排序: {exc}"],
+        )
+        return next_state
+
+    reranked_papers = rerank_result.get("papers") if isinstance(rerank_result, Mapping) else None
+    if isinstance(reranked_papers, list) and reranked_papers:
+        next_state.papers = [paper for paper in reranked_papers if isinstance(paper, dict)]
+
+    next_state.personalized_rerank_applied = bool(rerank_result.get("personalized_applied")) if isinstance(rerank_result, Mapping) else False
+    rerank_warnings = rerank_result.get("warnings", []) if isinstance(rerank_result, Mapping) else []
+    if isinstance(rerank_warnings, list):
+        next_state.warnings = _dedupe_preserve_order(list(next_state.warnings) + [str(item) for item in rerank_warnings if str(item).strip()])
+
+    if not next_state.personalized_rerank_applied:
+        next_state.warnings = _dedupe_preserve_order(
+            list(next_state.warnings) + ["用户兴趣向量不可用或个性化重排未生效，已退化为普通搜索结果"],
+        )
+
+    return next_state
+
+
 def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
@@ -378,9 +435,18 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
     paper_count = len(papers)
     max_results = spec.max_results if spec is not None else 10
     summary = _summarize_search_spec(spec)
+    priority_titles = _collect_priority_titles(papers, limit=3)
+    personalized_applied = bool(next_state.personalized_rerank_applied)
 
     if paper_count > 0:
         next_state.answer = f"已按“{summary}”搜索 arXiv，当前返回 {paper_count} 篇论文。"
+        if personalized_applied:
+            if priority_titles:
+                next_state.answer += f" 本次结果已根据用户兴趣进行个性化重排，建议优先阅读：{', '.join(priority_titles)}。"
+            else:
+                next_state.answer += " 本次结果已根据用户兴趣进行个性化重排，建议优先阅读排序靠前的论文。"
+        else:
+            next_state.answer += " 本次结果未使用用户兴趣向量，保持普通搜索排序。"
         next_state.next_actions = [
             "继续缩小到某个子方向搜索",
             "选择一篇论文查看详情",
@@ -988,6 +1054,25 @@ def _determine_requested_max_results(state: AgentState) -> int:
     return 10
 
 
+def _collect_priority_titles(papers: List[Dict[str, Any]], limit: int = 3) -> List[str]:
+    prioritized = sorted(
+        [paper for paper in papers if isinstance(paper, dict)],
+        key=lambda paper: (
+            float(paper.get("priority", 0) or 0) if float(paper.get("priority", 0) or 0) > 0 else 10_000.0,
+            -float(paper.get("final_score", 0.0) or 0.0),
+            -float(paper.get("query_match_score", 0.0) or 0.0),
+            str(paper.get("arxiv_id", "") or paper.get("id", "") or ""),
+        ),
+    )
+    titles: List[str] = []
+    for paper in prioritized[: max(1, int(limit or 3))]:
+        title = str(paper.get("title", "") or "").strip()
+        if not title:
+            continue
+        titles.append(title)
+    return titles
+
+
 def _coerce_state(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
     if isinstance(state, AgentState):
         return state.model_copy(deep=True)
@@ -1000,6 +1085,7 @@ __all__ = [
     "check_search_result",
     "invoke_search_tool",
     "parse_search_request",
+    "personalized_rank_and_annotate_papers",
     "route_after_parse",
     "synthesize_response",
 ]

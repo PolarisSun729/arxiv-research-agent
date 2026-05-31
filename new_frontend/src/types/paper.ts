@@ -10,6 +10,14 @@ export interface Paper {
   pdfUrl: string
   absUrl: string
   label?: 'liked' | 'disliked' | null
+  query_match_score?: number
+  personalization_score?: number
+  final_score?: number
+  score_breakdown?: Record<string, any> | null
+  matched_terms?: string[]
+  personalized_reason?: string | null
+  match_reason?: string | null
+  priority?: number
 }
 
 export interface RecommendationScoreBreakdown {

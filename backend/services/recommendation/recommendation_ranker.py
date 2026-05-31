@@ -3,11 +3,31 @@ from __future__ import annotations
 import ast
 import logging
 import math
+import re
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+QUERY_STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "of",
+    "to",
+    "and",
+    "or",
+    "for",
+    "with",
+    "in",
+    "on",
+    "about",
+    "this",
+    "that",
+    "paper",
+    "papers",
+    "arxiv",
+}
 
 
 class RecommendationRanker:
@@ -353,6 +373,130 @@ class RecommendationRanker:
         age_days = max(0, (datetime.now(timezone.utc) - parsed_date).days)
         return 1.0 / (1.0 + age_days / 365.0)
 
+    def _extract_query_terms(self, text: Any) -> List[str]:
+        normalized = str(text or "").strip().lower()
+        if not normalized:
+            return []
+
+        raw_terms = re.findall(r"[a-z0-9][a-z0-9+\-_/\.]*|[\u4e00-\u9fff]{2,}", normalized)
+        terms: List[str] = []
+        seen = set()
+        for term in raw_terms:
+            cleaned = term.strip("._-+/")
+            if not cleaned or cleaned in QUERY_STOPWORDS or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            terms.append(cleaned)
+        return terms
+
+    def _build_query_match_score(
+        self,
+        candidate: Dict[str, Any],
+        query: Optional[str] = None,
+        title_query: Optional[str] = None,
+        abstract_query: Optional[str] = None,
+        search_categories: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        title = str(candidate.get("title", "") or "").strip()
+        abstract = str(candidate.get("abstract", "") or candidate.get("summary", "") or "").strip()
+        categories = self._split_categories(candidate.get("categories"))
+        candidate_text = " ".join([title, abstract, " ".join(categories)]).lower()
+
+        query_terms = self._extract_query_terms(query)
+        title_terms = self._extract_query_terms(title_query)
+        abstract_terms = self._extract_query_terms(abstract_query)
+        normalized_search_categories = [
+            str(item).strip() for item in (search_categories or []) if str(item).strip()
+        ]
+        normalized_search_categories_set = {item.lower() for item in normalized_search_categories}
+        normalized_candidate_categories_set = {item.lower() for item in categories}
+
+        matched_terms: List[str] = []
+        query_hits = [term for term in query_terms if term in candidate_text]
+        title_hits = [term for term in title_terms if term in title.lower()]
+        abstract_hits = [term for term in abstract_terms if term in abstract.lower()]
+        category_hits = [
+            category
+            for category in normalized_search_categories
+            if category.lower() in normalized_candidate_categories_set
+        ]
+        for term in [*query_hits, *title_hits, *abstract_hits, *category_hits]:
+            if term not in matched_terms:
+                matched_terms.append(term)
+
+        query_term_score = (len(query_hits) / len(query_terms)) if query_terms else 0.0
+        title_term_score = (len(title_hits) / len(title_terms)) if title_terms else 0.0
+        abstract_term_score = (len(abstract_hits) / len(abstract_terms)) if abstract_terms else 0.0
+        category_term_score = (
+            len(category_hits) / len(normalized_search_categories_set)
+            if normalized_search_categories_set
+            else 0.0
+        )
+        source_search_score = float(candidate.get("score", candidate.get("similarity_score", 0.0)) or 0.0)
+        source_search_score = max(0.0, min(1.0, source_search_score))
+
+        phrase_bonus = 0.0
+        if title_query and title_query.lower() in title.lower():
+            phrase_bonus += 0.1
+        if abstract_query and abstract_query.lower() in abstract.lower():
+            phrase_bonus += 0.05
+
+        query_match_score = (
+            max(query_term_score, source_search_score) * 0.55
+            + title_term_score * 0.2
+            + abstract_term_score * 0.15
+            + category_term_score * 0.1
+            + phrase_bonus
+        )
+        query_match_score = max(0.0, min(1.0, query_match_score))
+
+        return {
+            "query_match_score": query_match_score,
+            "matched_terms": matched_terms,
+            "query_score_breakdown": {
+                "query_term_score": query_term_score,
+                "title_term_score": title_term_score,
+                "abstract_term_score": abstract_term_score,
+                "category_term_score": category_term_score,
+                "source_search_score": source_search_score,
+                "phrase_bonus": phrase_bonus,
+            },
+        }
+
+    def _build_match_reason(self, query_match_score: float, matched_terms: List[str]) -> str:
+        score_text = f"{round(max(0.0, min(1.0, query_match_score)) * 100)}%"
+        if matched_terms:
+            preview = ", ".join(matched_terms[:3])
+            return f"当前查询命中 {preview}，匹配度 {score_text}"
+        return f"当前查询相关度 {score_text}"
+
+    def _build_personalized_reason(self, candidate: Dict[str, Any], score_breakdown: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        semantic_score = float(score_breakdown.get("semantic_score", 0.0) or 0.0)
+        category_score = float(score_breakdown.get("category_score", 0.0) or 0.0)
+        recency_score = float(score_breakdown.get("recency_score", 0.0) or 0.0)
+        disliked_penalty = float(score_breakdown.get("disliked_penalty", 0.0) or 0.0)
+        best_cluster_id = str(candidate.get("best_matched_cluster_id", "") or "").strip()
+
+        if best_cluster_id:
+            parts.append(f"命中兴趣簇 {best_cluster_id}")
+        if semantic_score >= 0.75:
+            parts.append(f"与兴趣向量语义相似度 {round(semantic_score * 100)}%")
+        elif semantic_score >= 0.5:
+            parts.append(f"与兴趣向量有一定相似度 {round(semantic_score * 100)}%")
+        if category_score >= 0.5:
+            parts.append(f"类别偏好匹配 {round(category_score * 100)}%")
+        elif category_score > 0:
+            parts.append(f"部分类别匹配 {round(category_score * 100)}%")
+        if recency_score >= 0.5:
+            parts.append(f"发布时间较新 {round(recency_score * 100)}%")
+        if disliked_penalty >= 0.25:
+            parts.append(f"受到不喜欢论文相似度惩罚 {round(disliked_penalty * 100)}%")
+
+        if not parts:
+            return "基于用户兴趣向量进行了重排"
+        return "；".join(parts)
+
     def _cosine_similarity(self, vector_a: List[float], vector_b: List[float]) -> float:
         if not vector_a or not vector_b:
             return 0.0
@@ -440,4 +584,3 @@ class RecommendationRanker:
             except ValueError:
                 continue
         return None
-

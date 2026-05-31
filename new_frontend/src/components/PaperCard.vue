@@ -82,10 +82,76 @@ const recallClusterHitsCount = computed(() => {
 })
 
 const finalScoreText = computed(() => {
-  if (!isRecommended(props.paper) || typeof props.paper.finalScore !== 'number') {
+  if (isRecommended(props.paper) && typeof props.paper.finalScore === 'number') {
+    return `${Math.round(props.paper.finalScore * 100)}%`
+  }
+  if (agentFinalScore.value > 0) {
+    return `${Math.round(agentFinalScore.value * 100)}%`
+  }
+  if (typeof (props.paper as any).final_score === 'number' && (props.paper as any).final_score > 0) {
+    return `${Math.round((props.paper as any).final_score * 100)}%`
+  }
+  if (typeof (props.paper as any).finalScore !== 'number') {
     return ''
   }
-  return `${Math.round(props.paper.finalScore * 100)}%`
+  return `${Math.round((props.paper as any).finalScore * 100)}%`
+})
+
+function readPaperNumber(keys: string[]) {
+  for (const key of keys) {
+    const value = (props.paper as any)[key]
+    if (typeof value === 'number' && !Number.isNaN(value)) {
+      return value
+    }
+  }
+  return 0
+}
+
+function readPaperString(keys: string[]) {
+  for (const key of keys) {
+    const value = (props.paper as any)[key]
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim()
+    }
+  }
+  return ''
+}
+
+function readPaperStringArray(keys: string[]) {
+  for (const key of keys) {
+    const value = (props.paper as any)[key]
+    if (Array.isArray(value)) {
+      return value.map((item: unknown) => String(item).trim()).filter(Boolean)
+    }
+  }
+  return []
+}
+
+const agentQueryMatchScore = computed(() => readPaperNumber(['queryMatchScore', 'query_match_score']))
+const agentPersonalizationScore = computed(() => readPaperNumber(['personalizationScore', 'personalization_score']))
+const agentFinalScore = computed(() => readPaperNumber(['finalScore', 'final_score']))
+const agentPriority = computed(() => readPaperNumber(['priority']))
+const agentMatchedTerms = computed(() => readPaperStringArray(['matchedTerms', 'matched_terms']))
+const agentMatchReason = computed(() => readPaperString(['matchReason', 'match_reason']))
+const agentPersonalizedReason = computed(() => readPaperString(['personalizedReason', 'personalized_reason']))
+const agentScoreBreakdown = computed(() => (props.paper as any).scoreBreakdown || (props.paper as any).score_breakdown || null)
+const similarityDisplayScore = computed(() => {
+  if (isRecommended(props.paper)) {
+    return (props.paper as any).similarityScore || (props.paper as any).similarity || 0
+  }
+  return agentQueryMatchScore.value || 0
+})
+
+const hasAgentRerankData = computed(() => {
+  return Boolean(
+    agentQueryMatchScore.value ||
+    agentPersonalizationScore.value ||
+    agentFinalScore.value ||
+    agentPriority.value ||
+    agentMatchedTerms.value.length ||
+    agentMatchReason.value ||
+    agentPersonalizedReason.value
+  )
 })
 
 function toPercent(value?: number) {
@@ -164,8 +230,8 @@ const labelOptions = [
       </div>
     </div>
 
-    <div class="paper-footer">
-      <div class="paper-meta">
+      <div class="paper-footer">
+        <div class="paper-meta">
         <div class="meta-item">
           <el-tag size="small">{{ formatDate(paper.publishedAt) }}</el-tag>
         </div>
@@ -181,10 +247,22 @@ const labelOptions = [
         </div>
       </div>
 
-      <div v-if="isRecommendation || isRecommended(paper)" class="paper-similarity">
+      <div v-if="isRecommendation || isRecommended(paper) || hasAgentRerankData" class="paper-similarity">
         <span class="similarity-label">相似度：</span>
-        <SimilarityTag :score="(paper as any).similarityScore || (paper as any).similarity || 0" />
+        <SimilarityTag :score="similarityDisplayScore" />
         <span v-if="finalScoreText" class="final-score-label">最终 {{ finalScoreText }}</span>
+        <el-tag v-if="agentPriority" size="small" type="success" effect="plain">
+          优先级 #{{ agentPriority }}
+        </el-tag>
+        <el-tag v-if="agentQueryMatchScore" size="small" type="info" effect="plain">
+          查询 {{ toPercent(agentQueryMatchScore) }}%
+        </el-tag>
+        <el-tag v-if="agentPersonalizationScore" size="small" type="warning" effect="plain">
+          兴趣 {{ toPercent(agentPersonalizationScore) }}%
+        </el-tag>
+        <el-tag v-if="agentFinalScore" size="small" type="success" effect="plain">
+          综合 {{ toPercent(agentFinalScore) }}%
+        </el-tag>
         <el-tag v-if="bestMatchedClusterId" size="small" type="success" effect="plain">
           命中簇 {{ bestMatchedClusterId }}
         </el-tag>
@@ -200,11 +278,20 @@ const labelOptions = [
         <el-tag size="small" type="success" effect="plain">
           多样性得分 {{ toPercent(diversityMatchScore) }}%
         </el-tag>
+        <el-tag v-if="agentMatchedTerms.length" size="small" type="info" effect="plain">
+          命中词 {{ agentMatchedTerms.slice(0, 3).join(' / ') }}
+        </el-tag>
         <el-tag v-if="diversityReason" size="small" type="warning" effect="plain">
           {{ diversityReason }}
         </el-tag>
         <p v-if="recommendationReason" class="recommendation-reason">
           {{ recommendationReason }}
+        </p>
+        <p v-if="agentMatchReason" class="recommendation-reason">
+          {{ agentMatchReason }}
+        </p>
+        <p v-if="agentPersonalizedReason" class="recommendation-reason">
+          {{ agentPersonalizedReason }}
         </p>
         <div v-if="recommendationScoreBreakdown" class="score-breakdown">
           <div class="score-breakdown-row">
@@ -234,6 +321,29 @@ const labelOptions = [
               <strong>{{ toPercent(recommendationScoreBreakdown.diversity_score) }}%</strong>
             </div>
             <el-progress :percentage="toPercent(recommendationScoreBreakdown.diversity_score)" :show-text="false" color="#22c55e" />
+          </div>
+        </div>
+        <div v-if="agentScoreBreakdown" class="score-breakdown">
+          <div class="score-breakdown-row">
+            <div class="score-breakdown-meta">
+              <span class="breakdown-label">查询</span>
+              <strong>{{ toPercent(agentScoreBreakdown.query_match_score) }}%</strong>
+            </div>
+            <el-progress :percentage="toPercent(agentScoreBreakdown.query_match_score)" :show-text="false" color="#0ea5e9" />
+          </div>
+          <div class="score-breakdown-row">
+            <div class="score-breakdown-meta">
+              <span class="breakdown-label">兴趣</span>
+              <strong>{{ toPercent(agentScoreBreakdown.personalization_score) }}%</strong>
+            </div>
+            <el-progress :percentage="toPercent(agentScoreBreakdown.personalization_score)" :show-text="false" color="#f59e0b" />
+          </div>
+          <div class="score-breakdown-row">
+            <div class="score-breakdown-meta">
+              <span class="breakdown-label">综合</span>
+              <strong>{{ toPercent(agentScoreBreakdown.final_score) }}%</strong>
+            </div>
+            <el-progress :percentage="toPercent(agentScoreBreakdown.final_score)" :show-text="false" color="#22c55e" />
           </div>
         </div>
       </div>

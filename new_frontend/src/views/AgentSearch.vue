@@ -48,7 +48,15 @@ function normalizePaper(raw: AgentPaper): Paper {
     updatedAt: raw.updatedAt || raw.updated || '',
     categories,
     pdfUrl: raw.pdfUrl || raw.pdf_url || '',
-    absUrl: raw.absUrl || raw.abs_url || raw.url || ''
+    absUrl: raw.absUrl || raw.abs_url || raw.url || '',
+    query_match_score: raw.query_match_score,
+    personalization_score: raw.personalization_score,
+    final_score: raw.final_score,
+    score_breakdown: raw.score_breakdown || null,
+    matched_terms: raw.matched_terms || [],
+    personalized_reason: raw.personalized_reason || null,
+    match_reason: raw.match_reason || null,
+    priority: raw.priority
   }
 }
 
