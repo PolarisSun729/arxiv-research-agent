@@ -12,7 +12,11 @@ class AgentState(BaseModel):
     session_id: Optional[str] = None
     message: Optional[str] = None
     intent: Optional[str] = None
+    intent_source: Optional[str] = None
+    fallback_reason: Optional[str] = None
+    llm_confidence: Optional[float] = None
     search_spec: Optional[ArxivSearchSpec] = None
+    debug: Dict[str, Any] = Field(default_factory=dict)
     plan: List[str] = Field(default_factory=list)
     tool_name: Optional[str] = None
     tool_args: Dict[str, Any] = Field(default_factory=dict)

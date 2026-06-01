@@ -256,7 +256,20 @@ class AgentStreamEvent(BaseModel):
 class ArxivSearchResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    intent: Literal["arxiv_search", "unclear", "unsupported"]
+    intent: Literal[
+        "arxiv_search",
+        "paper_detail",
+        "paper_summary",
+        "paper_qa",
+        "recommendation",
+        "preference_action",
+        "reading_list_action",
+        "unclear",
+        "unsupported",
+    ]
+    intent_source: Optional[str] = None
+    fallback_reason: Optional[str] = None
+    llm_confidence: Optional[float] = None
     answer: str
     search_spec: Optional[ArxivSearchSpec] = None
     plan: List[str] = Field(default_factory=list)
@@ -265,3 +278,4 @@ class ArxivSearchResponse(BaseModel):
     warnings: List[str] = Field(default_factory=list)
     next_actions: List[str] = Field(default_factory=list)
     steps: List[AgentStep] = Field(default_factory=list)
+    debug: Dict[str, Any] = Field(default_factory=dict)

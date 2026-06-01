@@ -26,7 +26,74 @@ from .schemas import AgentStep, AgentToolCall, ArxivSearchSpec, get_default_agen
 from .state import AgentState
 
 SEARCH_TOOL_NAME = "search_arxiv_structured"
-SUPPORTED_INTENTS = {"arxiv_search", "unclear", "unsupported"}
+SUPPORTED_INTENTS = {
+    "arxiv_search",
+    "paper_detail",
+    "paper_summary",
+    "paper_qa",
+    "recommendation",
+    "preference_action",
+    "reading_list_action",
+    "unclear",
+    "unsupported",
+}
+SEARCH_INTENTS = {"arxiv_search"}
+NON_SEARCH_INTENTS = {
+    "paper_detail",
+    "paper_summary",
+    "paper_qa",
+    "recommendation",
+    "preference_action",
+    "reading_list_action",
+}
+LLM_CONFIDENCE_THRESHOLD = 0.55
+
+HARD_RULE_PATTERNS: Dict[str, Sequence[str]] = {
+    "paper_summary": (
+        r"总结这篇论文",
+        r"概述这篇论文",
+        r"帮我总结.*这篇",
+        r"讲讲这篇论文",
+        r"这篇论文讲了什么",
+    ),
+    "paper_detail": (
+        r"解释这篇论文的方法",
+        r"这篇论文的方法",
+        r"第一篇讲了什么",
+        r"这篇论文做了什么",
+        r"介绍这篇论文",
+    ),
+    "paper_qa": (
+        r"问一下这篇论文",
+        r"这篇论文.*是否",
+        r"这篇论文.*为什么",
+        r"关于这篇论文",
+    ),
+    "preference_action": (
+        r"加入收藏",
+        r"加入待读",
+        r"标记我喜欢",
+        r"标记.*不喜欢",
+        r"收藏这篇",
+        r"喜欢第一篇",
+        r"不喜欢第一篇",
+    ),
+    "reading_list_action": (
+        r"查看我的收藏",
+        r"我的收藏",
+        r"阅读列表",
+        r"reading list",
+    ),
+}
+
+LLM_INTENT_HINTS: Dict[str, Sequence[str]] = {
+    "paper_summary": ("summary", "summarize", "概述", "总结"),
+    "paper_detail": ("detail", "method", "explain", "方法", "细节"),
+    "paper_qa": ("qa", "question", "ask", "问", "提问"),
+    "recommendation": ("recommend", "推荐", "suggest"),
+    "preference_action": ("like", "dislike", "收藏", "喜欢", "不喜欢"),
+    "reading_list_action": ("reading list", "阅读列表", "收藏夹"),
+}
 
 SEARCH_TRIGGER_PATTERNS: Sequence[str] = (
     r"\barxiv\b",
@@ -284,6 +351,380 @@ CHINESE_NUMBER_MAP = {
     "九": 9,
     "十": 10,
 }
+
+
+def _detect_hard_rule_intent(message: str) -> Optional[Dict[str, Any]]:
+    text = _normalize_text(message)
+    if not text:
+        return None
+
+    for intent, patterns in HARD_RULE_PATTERNS.items():
+        match_text = _first_matching_pattern(text, patterns)
+        if match_text is not None:
+            return {
+                "intent": intent,
+                "intent_source": "hard_rule",
+                "reason": f"matched obvious pattern: {match_text}",
+                "confidence": 1.0,
+                "plan": [
+                    "识别到明确的非搜索请求",
+                    "当前入口先返回意图识别结果，不进入 arXiv 搜索工具链",
+                ],
+                "next_actions": [
+                    "如果你要的是 arXiv 搜索，请改成明确的论文检索需求",
+                    "如果你想要论文总结、解释或问答，请提供目标论文标题或 arXiv ID",
+                ],
+                "warnings": ["hard_rule intercepted obvious non-search request"],
+            }
+    return None
+
+
+def _build_intent_guidance(intent: str) -> Tuple[List[str], List[str], List[str]]:
+    if intent == "arxiv_search":
+        return (
+            [
+                "LLM 已识别为 arXiv 搜索请求",
+                "规则会补全和校验检索参数，然后调用搜索工具",
+                "整理结果并返回给用户",
+            ],
+            [
+                "继续细化检索范围",
+                "选择一篇论文查看详情",
+                "如果需要，可以继续接论文总结或 QA 能力",
+            ],
+            [],
+        )
+
+    if intent in NON_SEARCH_INTENTS:
+        return (
+            [
+                "LLM 已识别出论文系统内的非搜索请求类型",
+                "当前 agent 暂未把该能力完整接入执行链路",
+            ],
+            [
+                "如果你是在找论文，请改成明确的 arXiv 搜索需求",
+                "如果你要总结、解释或问答某篇论文，请提供标题或 arXiv ID",
+            ],
+            [f"identified non-search intent: {intent}"],
+        )
+
+    if intent == "unclear":
+        return (
+            [
+                "LLM 判断用户想要论文相关能力，但主题还不够明确",
+                "需要补充研究方向、关键词或时间范围后再继续",
+            ],
+            [
+                "补充主题、关键词或类别",
+                "例如：RAG、LLM、Agent、NLP、推荐系统",
+            ],
+            ["search topic is unclear"],
+        )
+
+    return (
+        [
+            "当前请求超出 arXiv 搜索 Agent 的处理范围",
+            "先返回可解释的边界说明，再等待用户改写请求",
+        ],
+        [
+            "改写成 arXiv 论文搜索需求",
+            "后续可以接论文总结或 QA 功能",
+        ],
+        ["request is outside the supported search workflow"],
+    )
+
+
+def _build_llm_prompt(message: str) -> str:
+    return (
+        "You are an intent parser for a natural-language arXiv paper agent.\n"
+        "Return JSON only.\n"
+        "Classify the message into one of: arxiv_search, paper_detail, paper_summary, paper_qa, recommendation, preference_action, reading_list_action, unclear, unsupported.\n"
+        "If it is a search request, extract a structured search spec.\n"
+        "Schema:\n"
+        "{"
+        "\"intent\":\"arxiv_search|paper_detail|paper_summary|paper_qa|recommendation|preference_action|reading_list_action|unclear|unsupported\","
+        "\"confidence\":0.0,"
+        "\"query\":null|string,"
+        "\"title_query\":null|string,"
+        "\"abstract_query\":null|string,"
+        "\"submitted_days_ago\":null|int,"
+        "\"max_results\":10,"
+        "\"sort_by\":\"submittedDate|relevance|lastUpdatedDate\","
+        "\"sort_order\":\"ascending|descending\","
+        "\"field_operator\":\"AND|OR|ANDNOT\","
+        "\"category_operator\":\"AND|OR\","
+        "\"reasoning_summary\":null|string,"
+        "\"missing_info\":[],"
+        "\"warnings\":[],"
+        "\"next_actions\":[]"
+        "}\n"
+        "Rules:\n"
+        "- Use arxiv_search when the user wants to search papers on arXiv.\n"
+        "- Use paper_summary when the user asks to summarize a paper.\n"
+        "- Use paper_detail when the user asks to explain a paper's method, contribution, or first section/content.\n"
+        "- Use paper_qa when the user asks questions about a specific paper.\n"
+        "- Use recommendation when the user wants paper recommendations.\n"
+        "- Use preference_action when the user wants to like, dislike, favorite, or bookmark a paper.\n"
+        "- Use reading_list_action when the user wants to inspect a reading list or favorites list.\n"
+        "- Use unclear if the topic is missing or too vague.\n"
+        "- Use unsupported only if the request is clearly outside the paper system.\n"
+        "- Use max_results between 1 and 20. Default to 10 if not specified.\n"
+        "- Use submitted_days_ago for recent-time expressions.\n"
+        "- Do not output categories; the system applies a fixed configured category scope.\n"
+        f"User message: {message}"
+    )
+
+
+def _parse_llm_intent(message: str, generation_service: Optional[Any]) -> Dict[str, Any]:
+    if generation_service is None or not hasattr(generation_service, "complete_with_qwen"):
+        return {
+            "ok": False,
+            "reason": "llm service is unavailable",
+            "payload": None,
+        }
+
+    try:
+        response = generation_service.complete_with_qwen(_build_llm_prompt(message))
+        payload = json.loads(_extract_json_block(str(response)))
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": f"llm parse failed: {exc}",
+            "payload": None,
+        }
+
+    if not isinstance(payload, dict):
+        return {
+            "ok": False,
+            "reason": "llm output is not a JSON object",
+            "payload": None,
+        }
+    return {"ok": True, "reason": None, "payload": payload}
+
+
+def _normalize_llm_intent_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    intent = str(payload.get("intent", "unsupported") or "unsupported").strip().lower()
+    if intent not in SUPPORTED_INTENTS:
+        intent = "unsupported"
+
+    confidence_raw = payload.get("confidence")
+    confidence: Optional[float]
+    try:
+        confidence = float(confidence_raw) if confidence_raw is not None and str(confidence_raw).strip() != "" else None
+    except Exception:
+        confidence = None
+
+    search_spec: Optional[ArxivSearchSpec] = None
+    search_spec_payload: Optional[Dict[str, Any]] = None
+    if intent == "arxiv_search":
+        search_spec = ArxivSearchSpec(
+            intent="arxiv_search",
+            query=_normalize_optional_str(payload.get("query")),
+            title_query=_normalize_optional_str(payload.get("title_query")),
+            abstract_query=_normalize_optional_str(payload.get("abstract_query")),
+            categories=get_default_agent_arxiv_categories(),
+            submitted_days_ago=_safe_optional_int(payload.get("submitted_days_ago")),
+            max_results=_clamp(_safe_int(payload.get("max_results"), default=10), 1, 20),
+            sort_by=_normalize_sort_by(payload.get("sort_by")),
+            sort_order=_normalize_sort_order(payload.get("sort_order")),
+            field_operator=_normalize_field_operator(payload.get("field_operator")),
+            category_operator=_normalize_category_operator(payload.get("category_operator")),
+            reasoning_summary=_normalize_optional_str(payload.get("reasoning_summary")),
+        )
+        search_spec_payload = _compact_search_spec(search_spec)
+
+    missing_info = [str(item).strip() for item in (payload.get("missing_info") or []) if str(item).strip()]
+    warnings = [str(item).strip() for item in (payload.get("warnings") or []) if str(item).strip()]
+    next_actions = [str(item).strip() for item in (payload.get("next_actions") or []) if str(item).strip()]
+
+    return {
+        "intent": intent,
+        "confidence": confidence,
+        "reasoning_summary": _normalize_optional_str(payload.get("reasoning_summary")),
+        "missing_info": missing_info,
+        "warnings": warnings,
+        "next_actions": next_actions,
+        "search_spec": search_spec,
+        "search_spec_payload": search_spec_payload,
+        "raw": dict(payload),
+    }
+
+
+def _build_rule_decision(message: str) -> Dict[str, Any]:
+    hard_rule = _detect_hard_rule_intent(message)
+    if hard_rule is not None:
+        return {
+            "intent": str(hard_rule.get("intent") or "unsupported"),
+            "confidence": 1.0,
+            "reason": hard_rule.get("reason"),
+            "source": "hard_rule",
+            "search_spec_before_enrichment": None,
+            "search_spec_after_enrichment": None,
+            "warnings": list(hard_rule.get("warnings") or []),
+            "next_actions": list(hard_rule.get("next_actions") or []),
+            "plan": list(hard_rule.get("plan") or []),
+        }
+
+    non_search_intent = _detect_non_search_rule_intent(message)
+    if non_search_intent is not None:
+        plan, next_actions, warnings = _build_intent_guidance(non_search_intent)
+        return {
+            "intent": non_search_intent,
+            "confidence": 0.92,
+            "reason": "rule matched non-search intent",
+            "source": "rule",
+            "search_spec_before_enrichment": None,
+            "search_spec_after_enrichment": None,
+            "warnings": warnings,
+            "next_actions": next_actions,
+            "plan": plan,
+        }
+
+    search_spec_before = _build_rule_search_spec(message)
+    if search_spec_before is None:
+        plan, next_actions, warnings = _build_intent_guidance("unclear" if _looks_search_like(message) else "unsupported")
+        intent = "unclear" if _looks_search_like(message) else "unsupported"
+        return {
+            "intent": intent,
+            "confidence": 0.48 if intent == "unclear" else 0.35,
+            "reason": "rule could not build a concrete search spec",
+            "source": "rule",
+            "search_spec_before_enrichment": None,
+            "search_spec_after_enrichment": None,
+            "warnings": warnings,
+            "next_actions": next_actions,
+            "plan": plan,
+        }
+
+    search_spec_after = _apply_rule_enrichment(message, search_spec_before)
+    if search_spec_after is None:
+        plan, next_actions, warnings = _build_intent_guidance("unclear")
+        return {
+            "intent": "unclear",
+            "confidence": 0.5,
+            "reason": "rule search spec failed validation",
+            "source": "rule",
+            "search_spec_before_enrichment": _compact_search_spec(search_spec_before),
+            "search_spec_after_enrichment": None,
+            "warnings": warnings + ["rule search spec validation failed"],
+            "next_actions": next_actions,
+            "plan": plan,
+        }
+
+    plan, next_actions, warnings = _build_intent_guidance("arxiv_search")
+    return {
+        "intent": "arxiv_search",
+        "confidence": 0.68,
+        "reason": "rule built a search spec",
+        "source": "rule",
+        "search_spec_before_enrichment": _compact_search_spec(search_spec_before),
+        "search_spec_after_enrichment": _compact_search_spec(search_spec_after),
+        "warnings": warnings,
+        "next_actions": next_actions,
+        "plan": plan,
+        "search_spec": search_spec_after,
+    }
+
+
+def _detect_non_search_rule_intent(message: str) -> Optional[str]:
+    if _matches_any(message, HARD_RULE_PATTERNS.get("paper_summary", [])):
+        return "paper_summary"
+    if _matches_any(message, HARD_RULE_PATTERNS.get("paper_detail", [])):
+        return "paper_detail"
+    if _matches_any(message, HARD_RULE_PATTERNS.get("paper_qa", [])):
+        return "paper_qa"
+    if _matches_any(message, (
+        r"推荐.*论文",
+        r"给我推荐",
+        r"papers? recommendation",
+        r"recommend.*paper",
+    )):
+        return "recommendation"
+    if _matches_any(message, HARD_RULE_PATTERNS.get("preference_action", [])):
+        return "preference_action"
+    if _matches_any(message, HARD_RULE_PATTERNS.get("reading_list_action", [])):
+        return "reading_list_action"
+    return None
+
+
+def _looks_search_like(message: str) -> bool:
+    lowered = message.lower()
+    explicit_cn_patterns = (
+        r"找.*论文",
+        r"搜.*论文",
+        r"检索.*论文",
+        r"查找.*论文",
+        r"最近.*论文",
+        r"新论文",
+        r"新工作",
+        r"最新进展",
+        r"值得读",
+        r"研究.*论文",
+    )
+    return _matches_any(message, SEARCH_TRIGGER_PATTERNS) or _matches_any(message, explicit_cn_patterns) or any(
+        hint in lowered for hint in ("search", "find", "look for", "recent paper", "recent papers", "latest", "newest", "recent")
+    )
+
+
+def _build_debug_payload(
+    *,
+    message: str,
+    final_intent: str,
+    intent_source: str,
+    llm_result: Optional[Dict[str, Any]],
+    rule_result: Optional[Dict[str, Any]],
+    hard_rule_result: Optional[Dict[str, Any]],
+    fallback_reason: Optional[str],
+    final_search_spec: Optional[ArxivSearchSpec],
+    search_spec_before_enrichment: Optional[Dict[str, Any]],
+    search_spec_after_enrichment: Optional[Dict[str, Any]],
+    warnings: Sequence[str],
+    next_actions: Sequence[str],
+) -> Dict[str, Any]:
+    return {
+        "original_message": message,
+        "final_intent": final_intent,
+        "intent_source": intent_source,
+        "llm_result": llm_result,
+        "rule_result": rule_result,
+        "hard_rule_result": hard_rule_result,
+        "llm_confidence": llm_result.get("confidence") if isinstance(llm_result, dict) else None,
+        "fallback_reason": fallback_reason,
+        "final_search_spec": _compact_search_spec(final_search_spec),
+        "search_spec_before_enrichment": search_spec_before_enrichment,
+        "search_spec_after_enrichment": search_spec_after_enrichment,
+        "warnings": list(warnings),
+        "next_actions": list(next_actions),
+    }
+
+
+def _build_rule_search_spec(message: str) -> Optional[ArxivSearchSpec]:
+    query = _extract_query_from_message(message)
+    title_query = _extract_marked_query(message, TITLE_HINT_PATTERNS)
+    abstract_query = _extract_marked_query(message, ABSTRACT_HINT_PATTERNS)
+    categories = get_default_agent_arxiv_categories()
+    submitted_days_ago = _extract_submitted_days_ago(message)
+    max_results = _extract_max_results(message)
+    sort_by, sort_order = _extract_sorting(message)
+
+    if not any([query, title_query, abstract_query]):
+        return None
+
+    spec = ArxivSearchSpec(
+        intent="arxiv_search",
+        query=query,
+        title_query=title_query,
+        abstract_query=abstract_query,
+        categories=categories,
+        submitted_days_ago=submitted_days_ago,
+        max_results=max_results,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        field_operator="AND",
+        category_operator="OR",
+        reasoning_summary=_build_reasoning_summary(query, categories, submitted_days_ago, max_results, sort_by),
+    )
+    return _apply_rule_enrichment(message, spec)
 
 
 def parse_search_request(
@@ -1405,6 +1846,361 @@ def _coerce_state(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
     if isinstance(state, AgentState):
         return state.model_copy(deep=True)
     return AgentState.model_validate(dict(state))
+
+
+def _first_matching_pattern(text: str, patterns: Sequence[str]) -> Optional[str]:
+    for pattern in patterns:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return pattern
+    return None
+
+
+def parse_search_request(
+    state: Union[AgentState, Mapping[str, Any]],
+    generation_service: Optional[Any] = None,
+) -> AgentState:
+    current_state = _coerce_state(state)
+    message = _normalize_text(current_state.message or "")
+
+    # 先收集所有中间结果，再统一落到 normalized_state，避免分支里直接改原状态。
+    warnings: List[str] = []
+    plan: List[str] = []
+    next_actions: List[str] = []
+    search_spec: Optional[ArxivSearchSpec] = None
+    intent = "unsupported"
+    intent_source = "fallback"
+    fallback_reason: Optional[str] = None
+    llm_result: Optional[Dict[str, Any]] = None
+    rule_result: Optional[Dict[str, Any]] = None
+    hard_rule_result: Optional[Dict[str, Any]] = None
+    search_spec_before_enrichment: Optional[Dict[str, Any]] = None
+    search_spec_after_enrichment: Optional[Dict[str, Any]] = None
+
+    # 硬规则优先：一些明显的非搜索请求直接拦截，不再进入 LLM 解析。
+    hard_rule_result = _detect_hard_rule_intent(message)
+    if hard_rule_result is not None:
+        intent = str(hard_rule_result.get("intent") or "unsupported")
+        intent_source = str(hard_rule_result.get("intent_source") or "hard_rule")
+        plan = list(hard_rule_result.get("plan") or [])
+        next_actions = list(hard_rule_result.get("next_actions") or [])
+        warnings.extend(str(item) for item in hard_rule_result.get("warnings", []) if str(item).strip())
+        rule_result = hard_rule_result
+    else:
+        # 先尝试 LLM，再用规则结果做兜底和校验。
+        llm_payload_result = _parse_llm_intent(message, generation_service=generation_service)
+        if llm_payload_result.get("ok"):
+            try:
+                llm_result = _normalize_llm_intent_payload(llm_payload_result["payload"])
+            except ValidationError as exc:
+                llm_result = None
+                fallback_reason = f"llm output failed schema validation: {_validation_error_summary(exc)}"
+                warnings.append(fallback_reason)
+        else:
+            fallback_reason = str(llm_payload_result.get("reason") or "llm unavailable")
+            warnings.append(fallback_reason)
+
+        rule_result = _build_rule_decision(message)
+
+        if llm_result is not None:
+            # LLM 只有在置信度和结构都满足时，才允许直接主导最终意图。
+            llm_intent = str(llm_result.get("intent") or "unsupported")
+            llm_confidence = llm_result.get("confidence")
+            confidence_value = float(llm_confidence) if isinstance(llm_confidence, (int, float)) else None
+
+            if confidence_value is None:
+                # 没有置信度时，不信任 LLM 输出，退回到规则判断。
+                fallback_reason = "llm confidence missing"
+                warnings.append(fallback_reason)
+                intent = str(rule_result.get("intent") or llm_intent)
+                intent_source = "fallback"
+                search_spec = rule_result.get("search_spec")
+                search_spec_before_enrichment = rule_result.get("search_spec_before_enrichment")
+                search_spec_after_enrichment = rule_result.get("search_spec_after_enrichment")
+            elif llm_intent == "arxiv_search":
+                # 搜索请求需要先拿到结构化 spec，再做规则补全和约束修正。
+                search_spec = llm_result.get("search_spec")
+                search_spec_before_enrichment = llm_result.get("search_spec_payload")
+                if search_spec is None:
+                    fallback_reason = "llm search intent is missing a valid search spec"
+                    warnings.append(fallback_reason)
+                    intent = str(rule_result.get("intent") or "unsupported")
+                    intent_source = "fallback"
+                    search_spec = rule_result.get("search_spec")
+                    search_spec_before_enrichment = rule_result.get("search_spec_before_enrichment")
+                    search_spec_after_enrichment = rule_result.get("search_spec_after_enrichment")
+                else:
+                    search_spec_after_enrichment = _compact_search_spec(search_spec)
+                    enriched_spec = _apply_rule_enrichment(message, search_spec)
+                    if enriched_spec is None:
+                        fallback_reason = "rule enrichment failed after llm search parse"
+                        warnings.append(fallback_reason)
+                        intent = str(rule_result.get("intent") or "unclear")
+                        intent_source = "fallback"
+                        search_spec = rule_result.get("search_spec")
+                        search_spec_before_enrichment = rule_result.get("search_spec_before_enrichment")
+                        search_spec_after_enrichment = rule_result.get("search_spec_after_enrichment")
+                    elif confidence_value is not None and confidence_value < LLM_CONFIDENCE_THRESHOLD:
+                        # 低置信度搜索请求按规则结果回退，避免错误检索参数直接生效。
+                        fallback_reason = f"llm confidence {confidence_value:.2f} below threshold {LLM_CONFIDENCE_THRESHOLD:.2f}"
+                        warnings.append(fallback_reason)
+                        intent = str(rule_result.get("intent") or "arxiv_search")
+                        intent_source = "fallback"
+                        search_spec = rule_result.get("search_spec")
+                        search_spec_before_enrichment = rule_result.get("search_spec_before_enrichment")
+                        search_spec_after_enrichment = rule_result.get("search_spec_after_enrichment")
+                    else:
+                        intent = "arxiv_search"
+                        intent_source = "llm"
+                        search_spec = enriched_spec
+                        search_spec_after_enrichment = _compact_search_spec(enriched_spec)
+                        if rule_result and str(rule_result.get("intent") or "") != "arxiv_search":
+                            # LLM 和规则对意图判断不一致时，只保留提示，不阻断流程。
+                            warnings.append(
+                                f"llm/rule intent conflict: llm={llm_intent}, rule={rule_result.get('intent')}"
+                            )
+            else:
+                if confidence_value is not None and confidence_value < LLM_CONFIDENCE_THRESHOLD:
+                    # 非搜索意图如果置信度不足，也先退回规则判断。
+                    fallback_reason = f"llm confidence {confidence_value:.2f} below threshold {LLM_CONFIDENCE_THRESHOLD:.2f}"
+                    warnings.append(fallback_reason)
+                    intent = str(rule_result.get("intent") or llm_intent)
+                    intent_source = "fallback"
+                    search_spec = rule_result.get("search_spec")
+                    search_spec_before_enrichment = rule_result.get("search_spec_before_enrichment")
+                    search_spec_after_enrichment = rule_result.get("search_spec_after_enrichment")
+                else:
+                    intent = llm_intent
+                    intent_source = "llm"
+                    if llm_intent in NON_SEARCH_INTENTS:
+                        plan, next_actions, intent_warnings = _build_intent_guidance(llm_intent)
+                        warnings.extend(intent_warnings)
+                    if rule_result and str(rule_result.get("intent") or "") != llm_intent:
+                        # 记录冲突，方便后续排查 LLM 与规则的分歧。
+                        warnings.append(
+                            f"llm/rule intent conflict: llm={llm_intent}, rule={rule_result.get('intent')}"
+                        )
+        else:
+            # LLM 不可用时，完全走规则路径。
+            intent = str(rule_result.get("intent") or "unsupported")
+            intent_source = "fallback"
+            search_spec = rule_result.get("search_spec")
+            search_spec_before_enrichment = rule_result.get("search_spec_before_enrichment")
+            search_spec_after_enrichment = rule_result.get("search_spec_after_enrichment")
+            plan = list(rule_result.get("plan") or [])
+            next_actions = list(rule_result.get("next_actions") or [])
+            warnings.extend(str(item) for item in rule_result.get("warnings", []) if str(item).strip())
+            if fallback_reason is None:
+                fallback_reason = str(rule_result.get("reason") or "llm unavailable, rule fallback used")
+
+    # 如果最后既没有 plan 也没有 next_actions，就补一组统一的引导文案。
+    if not plan and not next_actions:
+        plan, next_actions, intent_warnings = _build_intent_guidance(intent)
+        warnings.extend(intent_warnings)
+
+    # 识别成搜索意图但没有有效 search spec 时，强制降级为 unclear。
+    if intent == "arxiv_search" and search_spec is None:
+        plan, next_actions, intent_warnings = _build_intent_guidance("unclear")
+        warnings.extend(intent_warnings)
+        intent = "unclear"
+        if fallback_reason is None:
+            fallback_reason = "search intent was downgraded because no valid search spec was produced"
+
+    # 统一重置派生字段，保证后续节点从干净状态继续执行。
+    normalized_state = current_state.model_copy(deep=True)
+    normalized_state.intent = intent
+    normalized_state.intent_source = intent_source
+    normalized_state.fallback_reason = fallback_reason
+    normalized_state.llm_confidence = float(llm_result.get("confidence")) if llm_result and isinstance(llm_result.get("confidence"), (int, float)) else None
+    normalized_state.search_spec = search_spec
+    normalized_state.plan = plan
+    normalized_state.warnings = _dedupe_preserve_order(warnings)
+    normalized_state.next_actions = next_actions
+    normalized_state.tool_name = None
+    normalized_state.tool_args = {}
+    normalized_state.tool_result = None
+    normalized_state.tool_calls = []
+    normalized_state.papers = []
+    normalized_state.answer = None
+    normalized_state.errors = []
+    normalized_state.debug = _build_debug_payload(
+        message=message,
+        final_intent=intent,
+        intent_source=intent_source,
+        llm_result=llm_result,
+        rule_result=rule_result,
+        hard_rule_result=hard_rule_result,
+        fallback_reason=fallback_reason,
+        final_search_spec=search_spec,
+        search_spec_before_enrichment=search_spec_before_enrichment,
+        search_spec_after_enrichment=search_spec_after_enrichment,
+        warnings=normalized_state.warnings,
+        next_actions=normalized_state.next_actions,
+    )
+    return _append_step(
+        normalized_state,
+        step="intent_recognition",
+        status="success",
+        action="识别用户意图并决定是否进入 arXiv 搜索流程",
+        inputs={"message": message},
+        outputs={
+            "intent": intent,
+            "intent_source": intent_source,
+            "llm_confidence": normalized_state.llm_confidence,
+            "fallback_reason": fallback_reason,
+            "search_spec": _compact_search_spec(search_spec),
+            "plan": list(plan),
+            "warnings": list(normalized_state.warnings),
+            "next_actions": list(next_actions),
+            "debug": normalized_state.debug,
+        },
+    )
+
+
+def _build_non_search_answer(intent: str) -> Tuple[str, List[str]]:
+    if intent == "paper_summary":
+        return (
+            "我已经识别到你想总结某篇论文，但这个入口目前还没有接入论文总结能力。你可以先给我论文标题或 arXiv ID，后续再切到论文总结功能。",
+            [
+                "如果你要的是搜索，请直接描述论文主题或关键词",
+                "如果你要总结某篇论文，请提供标题或 arXiv ID",
+            ],
+        )
+
+    if intent == "paper_detail":
+        return (
+            "我已经识别到你想解释某篇论文的方法或细节，但这个入口目前还没有接入论文详情解读能力。你可以先给我论文标题或 arXiv ID。",
+            [
+                "如果你要的是搜索，请直接描述论文主题或关键词",
+                "如果你已经有论文标题或 arXiv ID，请把它发给我",
+            ],
+        )
+
+    if intent == "paper_qa":
+        return (
+            "我已经识别到你想围绕某篇论文提问，但这个入口目前还没有接入论文问答能力。你可以先给我目标论文标题或 arXiv ID。",
+            [
+                "如果你要的是搜索，请直接描述论文主题或关键词",
+                "如果你已经有论文标题或 arXiv ID，请把它发给我",
+            ],
+        )
+
+    if intent == "recommendation":
+        return (
+            "我已经识别到你想做论文推荐，但这个入口目前还没有接入独立的推荐对话能力。你可以直接给出研究方向，我先帮你做 arXiv 检索。",
+            [
+                "如果你要的是搜索，请直接描述研究方向",
+                "如果你想看推荐结果，请说明偏好方向或关键词",
+            ],
+        )
+
+    if intent == "preference_action":
+        return (
+            "我已经识别到你想做偏好操作，但这个入口目前还没有直接接通偏好写入链路。你可以在论文卡片上继续点击喜欢、不喜欢或收藏。",
+            [
+                "如果你要的是搜索，请直接描述论文主题或关键词",
+                "如果你要标记某篇论文，请在论文卡片上操作",
+            ],
+        )
+
+    if intent == "reading_list_action":
+        return (
+            "我已经识别到你想查看阅读列表或收藏列表，但这个入口目前还没有接通列表查询能力。",
+            [
+                "如果你要的是搜索，请直接描述论文主题或关键词",
+                "如果你要查看收藏，请切换到收藏页或列表页",
+            ],
+        )
+
+    if intent == "unclear":
+        return (
+            "我能确定你是在找论文，但主题还不够明确。",
+            [
+                "补充研究方向、关键词或时间范围",
+                "例如：RAG、LLM、Agent、NLP、推荐系统",
+            ],
+        )
+
+    return (
+        "当前请求超出 arXiv 搜索 Agent 的处理范围，请改写成明确的论文检索需求。",
+        [
+            "改写成 arXiv 论文搜索问题",
+            "如果需要论文总结或问答，请先提供目标论文标题或 arXiv ID",
+        ],
+    )
+
+
+def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    current_state = _coerce_state(state)
+    next_state = current_state.model_copy(deep=True)
+
+    if next_state.intent == "arxiv_search":
+        spec = next_state.search_spec
+        papers = list(next_state.papers or [])
+        paper_count = len(papers)
+        max_results = spec.max_results if spec is not None else 10
+        summary = _summarize_search_spec(spec)
+        priority_titles = _collect_priority_titles(papers, limit=3)
+        personalized_applied = bool(next_state.personalized_rerank_applied)
+
+        if paper_count > 0:
+            next_state.answer = f"已按“{summary}”搜索 arXiv，当前返回 {paper_count} 篇论文。"
+            if personalized_applied:
+                if priority_titles:
+                    next_state.answer += f" 本次结果已根据用户偏好重新排序，建议优先阅读：{', '.join(priority_titles)}。"
+                else:
+                    next_state.answer += " 本次结果已根据用户偏好重新排序，建议优先阅读排序靠前的论文。"
+            else:
+                next_state.answer += " 本次结果未使用用户偏好向量，保持普通搜索排序。"
+            next_state.next_actions = [
+                "继续缩小到某个子方向搜索",
+                "选择一篇论文查看详情",
+                "后续可以接论文总结或 QA 功能",
+            ]
+        else:
+            next_state.answer = f"已按“{summary}”搜索 arXiv，但当前没有找到结果。"
+            next_state.next_actions = [
+                "放宽关键词或扩大时间范围后重试",
+                "只保留核心主题词再搜索",
+                "后续可以接论文总结或 QA 功能",
+            ]
+
+        if max_results and paper_count < max_results:
+            next_state.answer += f" 本次最多期望返回 {max_results} 篇。"
+
+        return _append_step(
+            next_state,
+            step="final_answer_generation",
+            status="success",
+            action="生成最终答复并给出后续动作",
+            inputs={
+                "intent": next_state.intent,
+                "paper_count": paper_count,
+                "personalized_rerank_applied": personalized_applied,
+            },
+            outputs={
+                "answer": next_state.answer,
+                "next_actions": list(next_state.next_actions),
+                "top_papers": _collect_priority_titles(papers, limit=3),
+            },
+        )
+
+    answer, next_actions = _build_non_search_answer(next_state.intent or "unsupported")
+    next_state.answer = answer
+    next_state.next_actions = next_actions
+    return _append_step(
+        next_state,
+        step="final_answer_generation",
+        status="success",
+        action="生成最终答复并给出后续动作",
+        inputs={
+            "intent": next_state.intent,
+            "paper_count": len(next_state.papers or []),
+        },
+        outputs={
+            "answer": next_state.answer,
+            "next_actions": list(next_state.next_actions),
+        },
+    )
 
 
 __all__ = [
