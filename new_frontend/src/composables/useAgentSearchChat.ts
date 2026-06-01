@@ -1,7 +1,7 @@
 import { ref, type Ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { runArxivSearchAgent, streamArxivSearchAgent } from '@/api/agent'
-import type { AgentStep, AgentStreamEvent, AgentToolCall, ArxivSearchResponse } from '@/types/agent'
+import type { AgentPaper, AgentStep, AgentStreamEvent, AgentToolCall, ArxivSearchResponse } from '@/types/agent'
 import type { AgentChatMessage } from '@/types/agentChat'
 
 function createMessageId(prefix: 'user' | 'assistant') {
@@ -26,6 +26,7 @@ function createDraftResponse(): ArxivSearchResponse {
     intent: 'loading',
     answer: '',
     search_spec: null,
+    preference_action_result: null,
     plan: [],
     tool_calls: [],
     papers: [],
@@ -255,6 +256,7 @@ export function useAgentSearchChat() {
   const loading = ref(false)
   const messages: Ref<AgentChatMessage<ArxivSearchResponse>[]> = ref([])
   const latestResponse = ref<ArxivSearchResponse | null>(null)
+  const lastSearchPapers = ref<AgentPaper[]>([])
 
   function setInputMessage(value: string) {
     inputMessage.value = value
@@ -263,7 +265,14 @@ export function useAgentSearchChat() {
   function clearConversation() {
     messages.value = []
     latestResponse.value = null
+    lastSearchPapers.value = []
     inputMessage.value = ''
+  }
+
+  function rememberSearchPapers(response: ArxivSearchResponse | null | undefined) {
+    if (response?.intent === 'arxiv_search' && Array.isArray(response.papers) && response.papers.length > 0) {
+      lastSearchPapers.value = response.papers.map(item => ({ ...item }))
+    }
   }
 
   async function submitMessage(rawMessage?: string) {
@@ -305,11 +314,16 @@ export function useAgentSearchChat() {
       return
     }
 
+    const requestContext = lastSearchPapers.value.length
+      ? { last_papers: lastSearchPapers.value.map(item => ({ ...item })) }
+      : undefined
+
     try {
       const response = await streamArxivSearchAgent(
         {
           message,
-          user_id: 'local_user'
+          user_id: 'local_user',
+          context: requestContext || undefined
         },
         {
           onEvent: event => {
@@ -322,6 +336,7 @@ export function useAgentSearchChat() {
       )
 
       latestResponse.value = response
+      rememberSearchPapers(response)
       if (target.response) {
         target.response = {
           ...target.response,
@@ -335,9 +350,11 @@ export function useAgentSearchChat() {
       try {
         const fallbackResponse = await runArxivSearchAgent({
           message,
-          user_id: 'local_user'
+          user_id: 'local_user',
+          context: requestContext || undefined
         })
         latestResponse.value = fallbackResponse
+        rememberSearchPapers(fallbackResponse)
         setAssistantResponse(target, fallbackResponse)
       } catch (fallbackError) {
         const errorMessage = getErrorMessage(
@@ -370,6 +387,7 @@ export function useAgentSearchChat() {
     loading,
     messages,
     latestResponse,
+    lastSearchPapers,
     setInputMessage,
     submitMessage,
     clearConversation

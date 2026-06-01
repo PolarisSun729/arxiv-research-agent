@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import PaperCard from '@/components/PaperCard.vue'
-import type { AgentPaper, ArxivSearchResponse } from '@/types/agent'
+import type { AgentPaper, AgentPreferenceActionResult, ArxivSearchResponse } from '@/types/agent'
 import type { Paper } from '@/types/paper'
 
 const props = defineProps<{
@@ -39,6 +39,7 @@ function normalizePaper(raw: AgentPaper): Paper {
     categories,
     pdfUrl: raw.pdfUrl || raw.pdf_url || '',
     absUrl: raw.absUrl || raw.abs_url || raw.url || '',
+    label: raw.label || null,
     query_match_score: raw.query_match_score,
     personalization_score: raw.personalization_score,
     final_score: raw.final_score,
@@ -94,6 +95,7 @@ const steps = computed(() => responseData.value.steps || [])
 const toolCalls = computed(() => responseData.value.tool_calls || [])
 const warnings = computed(() => responseData.value.warnings || [])
 const searchSpec = computed(() => responseData.value.search_spec || null)
+const preferenceActionResult = computed(() => responseData.value.preference_action_result || null)
 const streamingState = computed(() => responseData.value.streaming_state || null)
 
 function handleViewDetail(id: string) {
@@ -104,6 +106,14 @@ function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
   const paper = papers.value.find(item => item.id === id)
   if (!paper) return
   emit('label', paper, label)
+}
+
+function getPreferenceActionLabel(result: AgentPreferenceActionResult | null) {
+  if (!result) return ''
+  if (result.status === 'success' && result.action === 'like') return '已标记为感兴趣'
+  if (result.status === 'success' && result.action === 'dislike') return '已标记为不感兴趣'
+  if (result.status === 'success' && result.action === 'remove') return '已取消偏好标记'
+  return result.message || ''
 }
 </script>
 
@@ -219,6 +229,17 @@ function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
       </summary>
       <div v-if="!searchSpec" class="empty-state">暂无 search spec</div>
       <pre v-else class="json-block">{{ formatJson(searchSpec) }}</pre>
+    </details>
+
+    <details v-if="preferenceActionResult" class="agent-collapse">
+      <summary class="agent-collapse__summary">
+        <span>Preference Action</span>
+        <span class="agent-collapse__count">{{ preferenceActionResult.status }}</span>
+      </summary>
+      <div class="preference-result">
+        <div class="preference-result__summary">{{ getPreferenceActionLabel(preferenceActionResult) }}</div>
+        <pre class="json-block">{{ formatJson(preferenceActionResult) }}</pre>
+      </div>
     </details>
 
     <details class="agent-collapse">

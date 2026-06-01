@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .nodes import (
+    apply_preference_action,
     build_search_tool_args,
     check_search_result,
     invoke_search_tool,
@@ -22,6 +23,7 @@ __all__ = [
     "ArxivSearchResponse",
     "ArxivSearchSpec",
     "build_arxiv_search_graph",
+    "apply_preference_action",
     "build_search_tool_args",
     "check_search_result",
     "invoke_search_tool",

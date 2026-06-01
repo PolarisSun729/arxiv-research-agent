@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { dislikePaper, likePaper, removePaperPreference } from '@/api/papers'
@@ -14,6 +15,7 @@ const {
   inputMessage,
   loading,
   messages,
+  latestResponse,
   setInputMessage,
   submitMessage,
   clearConversation
@@ -67,6 +69,44 @@ async function handleLabel(paper: Paper, label: 'liked' | 'disliked' | null) {
 function toAgentResponse(response: unknown): import('@/types/agent').ArxivSearchResponse | null {
   return response as import('@/types/agent').ArxivSearchResponse | null
 }
+
+function syncAgentPreferenceState() {
+  const response = latestResponse.value
+  const result = response?.preference_action_result
+  if (!result || result.status !== 'success') return
+
+  const targetLabel = result.label === 'liked' ? 'liked' : result.label === 'disliked' ? 'disliked' : null
+  const arxivId = result.arxiv_id || result.paper?.arxiv_id || result.paper?.arxivId || result.paper?.id
+
+  if (arxivId) {
+    if (targetLabel) {
+      agentPaperLabels.set(arxivId, targetLabel)
+    } else {
+      agentPaperLabels.delete(arxivId)
+    }
+  }
+
+  for (let i = messages.value.length - 1; i >= 0; i -= 1) {
+    const item = messages.value[i]
+    if (item.role !== 'assistant' || !item.response || !Array.isArray(item.response.papers) || !item.response.papers.length) {
+      continue
+    }
+
+    const matchedPaper = item.response.papers.find((paper: any) => {
+      const paperId = paper.arxiv_id || paper.arxivId || paper.id
+      return arxivId && paperId === arxivId
+    })
+
+    if (matchedPaper) {
+      matchedPaper.label = targetLabel
+      break
+    }
+  }
+}
+
+watch(latestResponse, () => {
+  syncAgentPreferenceState()
+}, { deep: true })
 </script>
 
 <template>

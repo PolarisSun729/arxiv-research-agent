@@ -7,6 +7,7 @@ from langgraph.graph import END, START, StateGraph
 from .nodes import (
     build_search_tool_args,
     check_search_result,
+    apply_preference_action,
     invoke_search_tool,
     parse_search_request,
     personalized_rank_and_annotate_papers,
@@ -41,6 +42,7 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
     graph.add_node("invoke_search_tool", invoke_search_tool)
     graph.add_node("check_search_result", check_search_result)
     graph.add_node("personalized_rank_and_annotate_papers", personalized_rank_and_annotate_papers)
+    graph.add_node("apply_preference_action", apply_preference_action)
     graph.add_node("synthesize_response", synthesize_response)
 
     graph.add_edge(START, "parse_search_request")
@@ -53,12 +55,14 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
             "paper_summary": "synthesize_response",
             "paper_qa": "synthesize_response",
             "recommendation": "synthesize_response",
-            "preference_action": "synthesize_response",
+            # 偏好动作先经过一个轻量占位节点，后续接入真正的写入逻辑时不需要改路由入口。
+            "preference_action": "apply_preference_action",
             "reading_list_action": "synthesize_response",
             "unclear": "synthesize_response",
             "unsupported": "synthesize_response",
         },
     )
+    graph.add_edge("apply_preference_action", "synthesize_response")
     graph.add_edge("build_search_tool_args", "invoke_search_tool")
     graph.add_edge("invoke_search_tool", "check_search_result")
     graph.add_edge("check_search_result", "personalized_rank_and_annotate_papers")

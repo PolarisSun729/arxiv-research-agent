@@ -2,6 +2,9 @@ export interface ArxivSearchRequest {
   user_id?: string | null
   session_id?: string | null
   message: string
+  context?: {
+    last_papers?: AgentPaper[]
+  } | null
 }
 
 export type AgentStepStatus = 'running' | 'success' | 'failed' | 'skipped'
@@ -90,12 +93,25 @@ export interface AgentPaper {
   personalized_reason?: string | null
   match_reason?: string | null
   priority?: number
+  label?: 'liked' | 'disliked' | null
+}
+
+export interface AgentPreferenceActionResult {
+  status: 'success' | 'failed'
+  action: 'like' | 'dislike' | 'remove'
+  label: 'liked' | 'disliked' | 'none'
+  arxiv_id?: string | null
+  title?: string | null
+  message: string
+  paper?: AgentPaper | null
+  error?: string | null
 }
 
 export interface ArxivSearchResponse {
   intent: string
   answer: string
   search_spec?: ArxivSearchSpec | null
+  preference_action_result?: AgentPreferenceActionResult | null
   plan: string[]
   tool_calls: AgentToolCall[]
   papers: AgentPaper[]

@@ -32,6 +32,7 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
             user_id=normalized_request.user_id,
             session_id=normalized_request.session_id,
             message=normalized_request.message,
+            context=dict(normalized_request.context or {}),
         )
         graph = build_arxiv_search_graph(generation_service=generation_service)
         final_state = graph.invoke(initial_state.model_dump())
@@ -64,6 +65,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 user_id=normalized_request.user_id,
                 session_id=normalized_request.session_id,
                 message=normalized_request.message,
+                context=dict(normalized_request.context or {}),
             )
             graph = build_arxiv_search_graph(generation_service=generation_service)
 
@@ -276,6 +278,7 @@ def _state_to_response(state: Any) -> ArxivSearchResponse:
         llm_confidence=final_state.llm_confidence,
         answer=final_state.answer or "",
         search_spec=final_state.search_spec,
+        preference_action_result=final_state.preference_action_result,
         plan=list(final_state.plan or []),
         tool_calls=list(final_state.tool_calls or []),
         papers=list(final_state.papers or []),
@@ -328,6 +331,7 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
         "fallback_reason": state.fallback_reason,
         "llm_confidence": state.llm_confidence,
         "search_spec": state.search_spec.model_dump() if state.search_spec is not None else None,
+        "preference_action_result": state.preference_action_result,
         "tool_name": state.tool_name,
         "tool_args": _compact_tool_args(state.tool_args),
         "tool_call_count": len(state.tool_calls or []),

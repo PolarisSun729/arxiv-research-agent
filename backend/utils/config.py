@@ -1,4 +1,4 @@
-import os
+﻿import os
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict
@@ -319,7 +319,7 @@ INTENT_ROUTING_CONFIG: Dict[str, Any] = {
 
 RERANK_CONFIG: Dict[str, Any] = {
     "provider": _env_str("RERANK_PROVIDER", "dashscope"),
-    "model_name": _env_str("RERANK_MODEL_NAME", "qwen3-rerank"),
+    "model_name": _env_str("RERANK_MODEL_NAME", "qwen3-vl-rerank"),
     "local_model_name_or_path": _env_str(
         "RERANK_LOCAL_MODEL_NAME_OR_PATH",
         str(REPO_ROOT / "00-models" / "Qwen3-VL-Reranker-2B"),
@@ -380,11 +380,14 @@ RETRIEVAL_CONFIG: Dict[str, Any] = {
 GENERATION_CONFIG: Dict[str, Any] = {
     "qwen_api_key": _env_str("QWEN_API_KEY", ALIYUN_API_KEY),
     "qwen_base_url": _env_str("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-    "qwen_model_name": _env_str("QWEN_MODEL_NAME", "qwen3.6-plus"),
+    # 只保留生成链路的小/大模型配置，不再混用旧别名。
+    "small_qwen_model_name": _env_str("QWEN_SMALL_MODEL_NAME", "qwen3.6-flash"),
+    "large_qwen_model_name": _env_str("QWEN_LARGE_MODEL_NAME", "qwen3.6-plus"),
     "openai_api_key": _env_str("OPENAI_API_KEY", ALIYUN_API_KEY),
     "deepseek_api_key": _env_str("DEEPSEEK_API_KEY", ALIYUN_API_KEY),
-    "rerank_qwen_model_name": _env_str("RERANK_QWEN_MODEL_NAME", "qwen3.6-flash"),
-    "rerank_qwen_enable_thinking": _env_bool("RERANK_QWEN_ENABLE_THINKING", False),
+    # rerank 前的 chunk 压缩/摘要使用独立的生成模型配置。
+    "qwen_rerank_compress_model_name": _env_str("QWEN_RERANK_COMPRESS_MODEL_NAME", "qwen3.6-flash"),
+    "qwen_rerank_compress_enable_thinking": _env_bool("QWEN_RERANK_COMPRESS_ENABLE_THINKING", False),
     "huggingface_generate_max_length": _env_int("HF_GENERATE_MAX_LENGTH", 512),
     "huggingface_generate_temperature": float(_env_str("HF_GENERATE_TEMPERATURE", "0.7")),
     "huggingface_generate_do_sample": _env_bool("HF_GENERATE_DO_SAMPLE", True),
@@ -392,8 +395,25 @@ GENERATION_CONFIG: Dict[str, Any] = {
     "openai_chat_max_tokens": _env_int("OPENAI_CHAT_MAX_TOKENS", 512),
     "rewrite_query_max_queries_default": _env_int("REWRITE_QUERY_MAX_QUERIES_DEFAULT", 3),
     "plan_query_max_queries_default": _env_int("PLAN_QUERY_MAX_QUERIES_DEFAULT", 5),
+    # 任务到模型角色的路由表只保留在配置层，业务代码只负责读取，不再硬编码模型名。
+    "task_model_roles": {
+        "intent_recognition": "small",  # 解析用户原始输入以识别高层意图
+        "intent_routing": "small",  # 决定将意图路由到哪个子 agent 或处理流水线
+        "search_spec_parse": "small",  # 将自然语言搜索请求转换为结构化的搜索规范
+        "preference_action_parse": "small",  # 解析用户的喜欢/不喜欢/收藏等偏好操作
+        "query_planning": "small",  # 规划多步或多查询的检索策略
+        "query_rewrite": "small",  # 重写或规范化查询以提升检索效果
+        "rerank_query": "small",  # 为重排阶段生成或调整查询
+        "hyde_generation": "small",  # HYDE 风格的伪文档生成（用于查询扩展）
+        "paper_qa_final_answer": "large",  # 为论文问答生成最终高质量答案
+        "paper_summary": "large",  # 生成论文的综合性摘要
+        "paper_detail": "large",  # 生成方法或技术细节的详尽说明
+        "paper_qa": "large",  # 处理关于具体论文的问答
+        "recommendation_generation": "large",  # 生成个性化推荐文本或推荐理由
+        "general_generation": "large",  # 用于复杂自然语言输出的一般大模型生成
+        "default": "large",  # 当无特定任务映射时的默认模型角色
+    },
 }
-
 
 def get_embedding_runtime_config() -> Dict[str, Any]:
     return dict(EMBEDDING_CONFIG)
@@ -437,3 +457,4 @@ def get_rerank_runtime_config() -> Dict[str, Any]:
 
 def get_generation_runtime_config() -> Dict[str, Any]:
     return dict(GENERATION_CONFIG)
+

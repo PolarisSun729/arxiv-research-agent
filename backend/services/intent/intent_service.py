@@ -286,7 +286,11 @@ class IntentService:
             f"Section titles: {', '.join(section_titles[:24]) or 'N/A'}\n"
             f"Candidate terms: {', '.join(candidate_terms[:24]) or 'N/A'}"
         )
-        response = self.generation_service.complete_with_qwen(prompt)
+        # 意图画像只做路由和检索规划，走小模型即可满足稳定性与成本要求。
+        response = self.generation_service.complete_with_qwen(
+            prompt,
+            task_type="intent_routing",
+        )
         payload = json.loads(self._extract_json_block(response))
         if not isinstance(payload, dict):
             return None

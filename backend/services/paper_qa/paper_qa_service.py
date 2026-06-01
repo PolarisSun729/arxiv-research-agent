@@ -224,7 +224,8 @@ class PaperQAService:
             ]
             generation_result = self.generation_service.generate(
                 provider="qwen",
-                model_name="qwen3.6-plus",
+                # 最终答案生成保留大模型，以保证长上下文综合与表述质量。
+                task_type="paper_qa_final_answer",
                 query=question,
                 search_results=qwen_search_results,
                 image_inputs=qa_context["image_inputs"],

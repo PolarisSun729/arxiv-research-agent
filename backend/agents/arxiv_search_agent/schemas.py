@@ -71,6 +71,7 @@ class ArxivSearchRequest(BaseModel):
     user_id: Optional[str] = None
     session_id: Optional[str] = None
     message: str
+    context: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("user_id", "session_id", "message", mode="before")
     @classmethod
@@ -272,6 +273,7 @@ class ArxivSearchResponse(BaseModel):
     llm_confidence: Optional[float] = None
     answer: str
     search_spec: Optional[ArxivSearchSpec] = None
+    preference_action_result: Optional[Dict[str, Any]] = None
     plan: List[str] = Field(default_factory=list)
     tool_calls: List[AgentToolCall] = Field(default_factory=list)
     papers: List[Dict[str, Any]] = Field(default_factory=list)

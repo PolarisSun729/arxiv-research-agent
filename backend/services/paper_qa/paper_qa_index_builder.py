@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from services.document.chunking_service import ChunkingService
 from services.storage.database_service import DatabaseService
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
-from services.llm.generation_service import GenerationService, RERANK_QWEN_MODEL_NAME
+from services.llm.generation_service import GenerationService, QWEN_RERANK_COMPRESS_MODEL_NAME
 from services.document.loading_service import LoadingService
 from services.storage.vector_store_service import VectorDBConfig, VectorStoreService
 
@@ -134,7 +134,7 @@ class PaperQAIndexBuilder:
         logger.info("Compressing chunk text for rerank with Qwen...")
         compressed_chunks = self.generation_service.compress_chunks_for_rerank(
             chunks=chunks,
-            model_name=RERANK_QWEN_MODEL_NAME,
+            model_name=QWEN_RERANK_COMPRESS_MODEL_NAME,
         )
         logger.info("Generated rerank_text for %d chunks", len(compressed_chunks))
         return compressed_chunks

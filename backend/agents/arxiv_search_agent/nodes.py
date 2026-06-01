@@ -55,6 +55,7 @@ HARD_RULE_PATTERNS: Dict[str, Sequence[str]] = {
         r"帮我总结.*这篇",
         r"讲讲这篇论文",
         r"这篇论文讲了什么",
+        r"(第一篇|这篇|这几篇).*?(讲了什么|讲什么|概述|总结)",
     ),
     "paper_detail": (
         r"解释这篇论文的方法",
@@ -62,12 +63,14 @@ HARD_RULE_PATTERNS: Dict[str, Sequence[str]] = {
         r"第一篇讲了什么",
         r"这篇论文做了什么",
         r"介绍这篇论文",
+        r"(第一篇|这篇|这几篇).*?(方法|细节|原理|流程|怎么做)",
     ),
     "paper_qa": (
         r"问一下这篇论文",
         r"这篇论文.*是否",
         r"这篇论文.*为什么",
         r"关于这篇论文",
+        r"(第一篇|这篇|这几篇).*?(问|提问|QA|question)",
     ),
     "preference_action": (
         r"加入收藏",
@@ -77,22 +80,31 @@ HARD_RULE_PATTERNS: Dict[str, Sequence[str]] = {
         r"收藏这篇",
         r"喜欢第一篇",
         r"不喜欢第一篇",
+        r"取消.*标记",
+        r"取消.*收藏",
+        r"取消.*喜欢",
+        r"撤销.*标记",
+        r"撤销.*收藏",
+        r"撤销.*喜欢",
     ),
     "reading_list_action": (
         r"查看我的收藏",
         r"我的收藏",
         r"阅读列表",
         r"reading list",
+        r"收藏夹",
+        r"我的收藏有哪些",
+        r"阅读列表有哪些",
     ),
 }
 
 LLM_INTENT_HINTS: Dict[str, Sequence[str]] = {
-    "paper_summary": ("summary", "summarize", "概述", "总结"),
-    "paper_detail": ("detail", "method", "explain", "方法", "细节"),
+    "paper_summary": ("summary", "summarize", "概述", "总结", "讲什么"),
+    "paper_detail": ("detail", "method", "explain", "方法", "细节", "流程"),
     "paper_qa": ("qa", "question", "ask", "问", "提问"),
     "recommendation": ("recommend", "推荐", "suggest"),
-    "preference_action": ("like", "dislike", "收藏", "喜欢", "不喜欢"),
-    "reading_list_action": ("reading list", "阅读列表", "收藏夹"),
+    "preference_action": ("like", "dislike", "收藏", "喜欢", "不喜欢", "取消", "撤销"),
+    "reading_list_action": ("reading list", "阅读列表", "收藏夹", "我的收藏"),
 }
 
 SEARCH_TRIGGER_PATTERNS: Sequence[str] = (
@@ -396,6 +408,55 @@ def _build_intent_guidance(intent: str) -> Tuple[List[str], List[str], List[str]
         )
 
     if intent in NON_SEARCH_INTENTS:
+        if intent == "preference_action":
+            return (
+                [
+                    "解析用户偏好动作",
+                    "解析被操作的目标论文",
+                    "保留 intent，等待后续偏好更新节点执行",
+                ],
+                [
+                    "继续对其他论文执行喜欢、不喜欢或收藏动作",
+                    "后续也可以继续搜索、查看推荐或打开论文详情",
+                ],
+                [f"identified non-search intent: {intent}"],
+            )
+        if intent == "reading_list_action":
+            return (
+                [
+                    "识别到用户在查询阅读列表或收藏列表",
+                    "当前入口先保留 intent，等待后续列表查询节点接入",
+                ],
+                [
+                    "如果你想找论文，请改成明确的 arXiv 搜索需求",
+                    "如果你想看收藏内容，可以后续直接进入阅读列表页面",
+                ],
+                [f"identified non-search intent: {intent}"],
+            )
+        if intent in {"paper_summary", "paper_detail", "paper_qa"}:
+            return (
+                [
+                    "识别到论文详情相关请求",
+                    "当前入口先保留 intent，等待论文详情、摘要或 QA 节点接入",
+                ],
+                [
+                    "如果你是在找论文，请改成明确的 arXiv 搜索需求",
+                    "如果你已经有目标论文标题或 arXiv ID，可以直接提供给后续详情能力",
+                ],
+                [f"identified non-search intent: {intent}"],
+            )
+        if intent == "recommendation":
+            return (
+                [
+                    "识别到论文推荐请求",
+                    "当前入口先保留 intent，等待个性化推荐服务接入",
+                ],
+                [
+                    "如果你要的是普通搜索，请直接描述论文主题或关键词",
+                    "如果你想看推荐结果，可以继续补充偏好方向或兴趣主题",
+                ],
+                [f"identified non-search intent: {intent}"],
+            )
         return (
             [
                 "LLM 已识别出论文系统内的非搜索请求类型",
@@ -432,6 +493,38 @@ def _build_intent_guidance(intent: str) -> Tuple[List[str], List[str], List[str]
         ],
         ["request is outside the supported search workflow"],
     )
+
+
+def _looks_like_preference_action_request(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        token in lowered
+        for token in ("like", "dislike", "favorite", "bookmark", "cancel", "unlike", "unbookmark")
+    ) or any(token in message for token in ("喜欢", "不喜欢", "收藏", "标记", "取消", "撤销"))
+
+
+def _looks_like_reading_list_action_request(message: str) -> bool:
+    lowered = message.lower()
+    return any(token in lowered for token in ("reading list", "favorites", "saved papers")) or any(
+        token in message for token in ("我的收藏", "收藏有哪些", "收藏夹", "阅读列表", "待读列表")
+    )
+
+
+def _looks_like_paper_summary_request(message: str) -> bool:
+    return any(token in message for token in ("讲什么", "总结", "概述"))
+
+
+def _looks_like_paper_detail_request(message: str) -> bool:
+    return any(token in message for token in ("方法", "流程", "细节", "原理", "怎么做"))
+
+
+def _looks_like_paper_qa_request(message: str) -> bool:
+    return any(token in message for token in ("问", "提问", "QA", "question"))
+
+
+def _looks_like_recommendation_request(message: str) -> bool:
+    lowered = message.lower()
+    return "推荐" in message or "recommen" in lowered or "suggest" in lowered
 
 
 def _build_llm_prompt(message: str) -> str:
@@ -484,7 +577,11 @@ def _parse_llm_intent(message: str, generation_service: Optional[Any]) -> Dict[s
         }
 
     try:
-        response = generation_service.complete_with_qwen(_build_llm_prompt(message))
+        # 意图识别只负责分流，不需要大模型推理，优先使用小模型降低时延和成本。
+        response = generation_service.complete_with_qwen(
+            _build_llm_prompt(message),
+            task_type="intent_recognition",
+        )
         payload = json.loads(_extract_json_block(str(response)))
     except Exception as exc:
         return {
@@ -580,6 +677,7 @@ def _build_rule_decision(message: str) -> Dict[str, Any]:
             "plan": plan,
         }
 
+    # 只有 arxiv_search 才允许继续构造 search_spec，其余 intent 必须在这里直接保留并退出搜索链路。
     search_spec_before = _build_rule_search_spec(message)
     if search_spec_before is None:
         plan, next_actions, warnings = _build_intent_guidance("unclear" if _looks_search_like(message) else "unsupported")
@@ -629,20 +727,31 @@ def _build_rule_decision(message: str) -> Dict[str, Any]:
 def _detect_non_search_rule_intent(message: str) -> Optional[str]:
     if _matches_any(message, HARD_RULE_PATTERNS.get("paper_summary", [])):
         return "paper_summary"
+    if _looks_like_paper_summary_request(message):
+        return "paper_summary"
     if _matches_any(message, HARD_RULE_PATTERNS.get("paper_detail", [])):
         return "paper_detail"
+    if _looks_like_paper_detail_request(message):
+        return "paper_detail"
     if _matches_any(message, HARD_RULE_PATTERNS.get("paper_qa", [])):
+        return "paper_qa"
+    if _looks_like_paper_qa_request(message):
         return "paper_qa"
     if _matches_any(message, (
         r"推荐.*论文",
         r"给我推荐",
         r"papers? recommendation",
         r"recommend.*paper",
-    )):
+        r"我可能感兴趣",
+    )) or _looks_like_recommendation_request(message):
         return "recommendation"
     if _matches_any(message, HARD_RULE_PATTERNS.get("preference_action", [])):
         return "preference_action"
+    if _looks_like_preference_action_request(message):
+        return "preference_action"
     if _matches_any(message, HARD_RULE_PATTERNS.get("reading_list_action", [])):
+        return "reading_list_action"
+    if _looks_like_reading_list_action_request(message):
         return "reading_list_action"
     return None
 
@@ -1303,7 +1412,11 @@ def _parse_with_llm(message: str, generation_service: Optional[Any]) -> Optional
     )
 
     try:
-        response = generation_service.complete_with_qwen(prompt)
+        # 搜索规格抽取同样属于轻量解析任务，统一走小模型路由。
+        response = generation_service.complete_with_qwen(
+            prompt,
+            task_type="search_spec_parse",
+        )
         payload = json.loads(_extract_json_block(str(response)))
     except Exception:
         return None
@@ -1997,7 +2110,7 @@ def parse_search_request(
         plan, next_actions, intent_warnings = _build_intent_guidance(intent)
         warnings.extend(intent_warnings)
 
-    # 识别成搜索意图但没有有效 search spec 时，强制降级为 unclear。
+    # 只有搜索 intent 才允许因为缺少 search_spec 而回退为 unclear，避免把动作型请求误压成搜索问题。
     if intent == "arxiv_search" and search_spec is None:
         plan, next_actions, intent_warnings = _build_intent_guidance("unclear")
         warnings.extend(intent_warnings)
@@ -2022,6 +2135,7 @@ def parse_search_request(
     normalized_state.papers = []
     normalized_state.answer = None
     normalized_state.errors = []
+    normalized_state.preference_action_result = None
     normalized_state.debug = _build_debug_payload(
         message=message,
         final_intent=intent,
@@ -2040,7 +2154,7 @@ def parse_search_request(
         normalized_state,
         step="intent_recognition",
         status="success",
-        action="识别用户意图并决定是否进入 arXiv 搜索流程",
+        action="识别用户意图并决定要进入什么流程",
         inputs={"message": message},
         outputs={
             "intent": intent,
@@ -2129,9 +2243,461 @@ def _build_non_search_answer(intent: str) -> Tuple[str, List[str]]:
     )
 
 
+_PREFERENCE_ORDINAL_MAP = {
+    "一": 1,
+    "二": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+    "十": 10,
+    "十一": 11,
+    "十二": 12,
+    "十三": 13,
+    "十四": 14,
+    "十五": 15,
+    "十六": 16,
+    "十七": 17,
+    "十八": 18,
+    "十九": 19,
+    "二十": 20,
+}
+
+
+def _normalize_context_paper(raw: Any) -> Dict[str, Any]:
+    paper = raw if isinstance(raw, Mapping) else {}
+    arxiv_id = str(paper.get("arxiv_id") or paper.get("arxivId") or paper.get("id") or "").strip()
+    if arxiv_id.startswith("http"):
+        arxiv_id = arxiv_id.rsplit("/", 1)[-1]
+
+    authors = paper.get("authors", [])
+    if isinstance(authors, str):
+        authors_value = [item.strip() for item in authors.split(",") if item.strip()]
+    elif isinstance(authors, (list, tuple, set)):
+        authors_value = [str(item).strip() for item in authors if str(item).strip()]
+    else:
+        authors_value = []
+
+    categories = paper.get("categories", [])
+    if isinstance(categories, str):
+        categories_value = [item.strip() for item in categories.split(",") if item.strip()]
+    elif isinstance(categories, (list, tuple, set)):
+        categories_value = [str(item).strip() for item in categories if str(item).strip()]
+    else:
+        categories_value = []
+
+    abstract = str(paper.get("abstract") or paper.get("summary") or "").strip()
+    title = str(paper.get("title") or "").strip()
+    published_date = str(
+        paper.get("published_date")
+        or paper.get("published")
+        or paper.get("publishedAt")
+        or paper.get("updated")
+        or paper.get("updatedAt")
+        or ""
+    ).strip()
+    url = str(paper.get("url") or paper.get("abs_url") or paper.get("absUrl") or paper.get("pdf_url") or paper.get("pdfUrl") or "").strip()
+
+    return {
+        "arxiv_id": arxiv_id,
+        "title": title,
+        "abstract": abstract,
+        "summary": abstract,
+        "authors": authors_value,
+        "categories": categories_value,
+        "published_date": published_date,
+        "published": published_date,
+        "url": url,
+        "abs_url": str(paper.get("abs_url") or paper.get("absUrl") or paper.get("url") or "").strip(),
+        "pdf_url": str(paper.get("pdf_url") or paper.get("pdfUrl") or "").strip(),
+    }
+
+
+def _extract_last_papers(context: Any) -> List[Dict[str, Any]]:
+    if not isinstance(context, Mapping):
+        return []
+    last_papers = context.get("last_papers") or []
+    if not isinstance(last_papers, list):
+        return []
+    return [_normalize_context_paper(paper) for paper in last_papers if isinstance(paper, Mapping)]
+
+
+def _parse_preference_action(message: str) -> Optional[Dict[str, str]]:
+    text = _normalize_text(message)
+    lowered = text.lower()
+    if not text:
+        return None
+
+    remove_patterns = (
+        r"取消.*喜欢",
+        r"取消.*不喜欢",
+        r"取消.*标记",
+        r"移除.*标记",
+        r"撤销.*喜欢",
+        r"撤销.*不喜欢",
+        r"撤销.*标记",
+    )
+    dislike_patterns = (
+        r"不喜欢",
+        r"不感兴趣",
+        r"标记.*不喜欢",
+        r"标记.*不感兴趣",
+        r"对.*不感兴趣",
+    )
+    like_patterns = (
+        r"喜欢",
+        r"感兴趣",
+        r"收藏",
+        r"标记.*喜欢",
+        r"标记.*感兴趣",
+        r"对.*感兴趣",
+    )
+
+    remove_scope = "both"
+    if _matches_any(text, (r"取消.*喜欢", r"撤销.*喜欢")):
+        remove_scope = "liked"
+    elif _matches_any(text, (r"取消.*不喜欢", r"撤销.*不喜欢")):
+        remove_scope = "disliked"
+
+    if _matches_any(text, remove_patterns):
+        return {"action": "remove", "remove_scope": remove_scope}
+    if _matches_any(text, dislike_patterns) or "dislike" in lowered:
+        return {"action": "dislike", "remove_scope": "none"}
+    if _matches_any(text, like_patterns) or "like" in lowered:
+        return {"action": "like", "remove_scope": "none"}
+    return None
+
+
+def _parse_target_reference(message: str) -> Optional[Dict[str, Any]]:
+    text = _normalize_text(message)
+    if not text:
+        return None
+
+    arxiv_match = re.search(r"\b\d{4}\.\d{4,5}(?:v\d+)?\b", text, flags=re.IGNORECASE)
+    if arxiv_match:
+        return {
+            "target_type": "arxiv_id",
+            "target_value": arxiv_match.group(0),
+            "arxiv_id": arxiv_match.group(0),
+        }
+
+    ordinal_match = re.search(r"(?:第\s*)?([一二三四五六七八九十]{1,3}|[1-9]|1[0-9]|20)\s*篇", text)
+    if ordinal_match:
+        raw_value = ordinal_match.group(1)
+        ordinal = _PREFERENCE_ORDINAL_MAP.get(raw_value)
+        if ordinal is None:
+            ordinal = _safe_int(raw_value, default=0)
+        if 1 <= ordinal <= 20:
+            return {
+                "target_type": "ordinal",
+                "target_value": ordinal,
+                "ordinal": ordinal,
+            }
+
+    bare_match = re.search(r"(?<!\d)([1-9]|1[0-9]|20)(?!\d)", text)
+    if bare_match and (text.strip() in {bare_match.group(1), f"第{bare_match.group(1)}", f"第{bare_match.group(1)}篇"} or any(token in text for token in ("喜欢", "不喜欢", "收藏", "标记", "取消", "撤销"))):
+        ordinal = _safe_int(bare_match.group(1), default=0)
+        if 1 <= ordinal <= 20:
+            return {
+                "target_type": "ordinal",
+                "target_value": ordinal,
+                "ordinal": ordinal,
+            }
+
+    return None
+
+
+def _resolve_paper_reference(message: str, context: Any) -> Dict[str, Any]:
+    reference = _parse_target_reference(message)
+    last_papers = _extract_last_papers(context)
+
+    if reference is None:
+        return {
+            "status": "failed",
+            "reason": "无法解析目标论文，请使用“第一篇 / 第二篇”或直接提供 arXiv ID",
+            "target": None,
+            "paper": None,
+            "arxiv_id": None,
+            "title": None,
+        }
+
+    if reference["target_type"] == "ordinal":
+        ordinal = int(reference["target_value"])
+        if not last_papers:
+            return {
+                "status": "failed",
+                "reason": "没有可用的上一轮搜索结果，请先搜索论文，或者直接提供 arXiv ID",
+                "target": reference,
+                "paper": None,
+                "arxiv_id": None,
+                "title": None,
+            }
+        if ordinal > len(last_papers):
+            return {
+                "status": "failed",
+                "reason": f"上一轮搜索结果只有 {len(last_papers)} 篇，无法选择第 {ordinal} 篇",
+                "target": reference,
+                "paper": None,
+                "arxiv_id": None,
+                "title": None,
+            }
+        paper = dict(last_papers[ordinal - 1])
+        arxiv_id = str(paper.get("arxiv_id") or "").strip()
+        if not arxiv_id:
+            return {
+                "status": "failed",
+                "reason": "上一轮结果中目标论文缺少 arXiv ID，无法执行偏好动作",
+                "target": reference,
+                "paper": paper,
+                "arxiv_id": None,
+                "title": paper.get("title"),
+            }
+        return {
+            "status": "success",
+            "reason": None,
+            "target": reference,
+            "paper": paper,
+            "arxiv_id": arxiv_id,
+            "title": paper.get("title"),
+        }
+
+    arxiv_id = str(reference.get("arxiv_id") or reference.get("target_value") or "").strip()
+    if not arxiv_id:
+        return {
+            "status": "failed",
+            "reason": "无法解析 arXiv ID",
+            "target": reference,
+            "paper": None,
+            "arxiv_id": None,
+            "title": None,
+        }
+
+    paper = next((paper for paper in last_papers if str(paper.get("arxiv_id") or "").strip() == arxiv_id), None)
+    return {
+        "status": "success",
+        "reason": None,
+        "target": reference,
+        "paper": dict(paper) if paper is not None else None,
+        "arxiv_id": arxiv_id,
+        "title": paper.get("title") if isinstance(paper, Mapping) else None,
+    }
+
+
+def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    current_state = _coerce_state(state)
+    next_state = current_state.model_copy(deep=True)
+
+    if next_state.intent != "preference_action":
+        return _append_step(
+            next_state,
+            step="preference_action_execution",
+            status="skipped",
+            action="执行论文偏好动作",
+            inputs={"intent": next_state.intent},
+            outputs={"reason": "当前请求不是 preference_action"},
+        )
+
+    message = _normalize_text(next_state.message or "")
+    parsed_action = _parse_preference_action(message)
+    resolution = _resolve_paper_reference(message, next_state.context or {})
+    user_id = str(next_state.user_id or "default").strip() or "default"
+    preference_service = get_recommendation_service()
+    tool_args: Dict[str, Any] = {"user_id": user_id, "message": message}
+    tool_name = "apply_preference_action"
+    preference_result: Dict[str, Any]
+    paper_payload = resolution.get("paper")
+    arxiv_id = str(resolution.get("arxiv_id") or "").strip()
+    paper_title = str(resolution.get("title") or (paper_payload or {}).get("title") or "").strip()
+
+    if not next_state.plan:
+        next_state.plan = [
+            "解析偏好动作",
+            "解析目标论文",
+            "更新用户偏好",
+        ]
+
+    # 先把动作和目标解析清楚，再决定是否调用偏好服务，避免把无法定位论文的请求写进数据库。
+    if parsed_action is None:
+        preference_result = {
+            "status": "failed",
+            "action": "remove",
+            "label": "none",
+            "arxiv_id": None,
+            "title": None,
+            "message": "我没有识别到明确的偏好动作，请使用“喜欢 / 不喜欢 / 取消标记”",
+            "paper": None,
+            "error": "unsupported preference action",
+        }
+        next_state.warnings = _dedupe_preserve_order(list(next_state.warnings) + [preference_result["message"]])
+    elif resolution.get("status") != "success" or not arxiv_id:
+        preference_result = {
+            "status": "failed",
+            "action": parsed_action["action"],
+            "label": "none",
+            "arxiv_id": resolution.get("arxiv_id"),
+            "title": resolution.get("title"),
+            "message": str(resolution.get("reason") or "无法解析目标论文，请先搜索论文或直接提供 arXiv ID"),
+            "paper": paper_payload,
+            "error": str(resolution.get("reason") or "paper reference resolution failed"),
+        }
+        next_state.warnings = _dedupe_preserve_order(list(next_state.warnings) + [preference_result["message"]])
+    else:
+        try:
+            if parsed_action["action"] in {"like", "dislike"}:
+                tool_name = "record_user_paper_preference"
+                liked = parsed_action["action"] == "like"
+                service_result = preference_service.record_user_paper_preference(
+                    user_id=user_id,
+                    arxiv_id=arxiv_id,
+                    liked=liked,
+                    paper_payload=paper_payload,
+                )
+                preference_result = {
+                    "status": "success",
+                    "action": parsed_action["action"],
+                    "label": "liked" if liked else "disliked",
+                    "arxiv_id": arxiv_id,
+                    "title": paper_title,
+                    "message": str(service_result.get("message") or "偏好已更新"),
+                    "paper": service_result.get("paper") or paper_payload,
+                    "error": None,
+                }
+            else:
+                tool_name = "remove_user_paper_preference"
+                remove_scope = str(parsed_action.get("remove_scope") or "both")
+                removed_liked = False
+                removed_disliked = False
+                remove_errors: List[str] = []
+                if remove_scope in {"both", "liked"}:
+                    removed_liked = bool(preference_service.db_service.remove_liked_paper(user_id=user_id, arxiv_id=arxiv_id))
+                if remove_scope in {"both", "disliked"}:
+                    removed_disliked = bool(preference_service.db_service.remove_disliked_paper(user_id=user_id, arxiv_id=arxiv_id))
+                if not removed_liked and not removed_disliked:
+                    remove_errors.append("未找到可移除的喜欢/不喜欢标记")
+                preference_result = {
+                    "status": "success" if (removed_liked or removed_disliked) else "failed",
+                    "action": "remove",
+                    "label": "none",
+                    "arxiv_id": arxiv_id,
+                    "title": paper_title,
+                    "message": "已取消偏好标记" if (removed_liked or removed_disliked) else "未找到可取消的偏好标记",
+                    "paper": paper_payload,
+                    "error": None if (removed_liked or removed_disliked) else "; ".join(remove_errors),
+                }
+                if not (removed_liked or removed_disliked):
+                    next_state.warnings = _dedupe_preserve_order(list(next_state.warnings) + remove_errors)
+        except Exception as exc:
+            preference_result = {
+                "status": "failed",
+                "action": parsed_action["action"],
+                "label": "none",
+                "arxiv_id": arxiv_id,
+                "title": paper_title,
+                "message": f"偏好动作执行失败：{exc}",
+                "paper": paper_payload,
+                "error": str(exc),
+            }
+            next_state.warnings = _dedupe_preserve_order(list(next_state.warnings) + [str(exc)])
+
+    next_state.preference_action_result = preference_result
+    if not next_state.next_actions:
+        next_state.next_actions = [
+            "继续对其他论文执行喜欢、不喜欢或收藏动作",
+            "也可以继续搜索、查看推荐或打开论文详情",
+        ]
+
+    next_state.tool_name = tool_name
+    next_state.tool_args = tool_args
+    next_state.tool_result = dict(preference_result)
+    next_state.tool_calls = list(next_state.tool_calls or []) + [
+        AgentToolCall(
+            tool_name=tool_name,
+            arguments=tool_args,
+            status=preference_result["status"],
+            summary=str(preference_result["message"]),
+            trace={
+                "action": parsed_action["action"] if parsed_action else None,
+                "target": resolution.get("target"),
+                "arxiv_id": preference_result.get("arxiv_id"),
+            },
+            error={"message": preference_result["error"]} if preference_result.get("error") else None,
+        )
+    ]
+
+    return _append_step(
+        next_state,
+        step="preference_action_execution",
+        status="success" if preference_result["status"] == "success" else "failed",
+        action="执行论文偏好动作",
+        inputs={"intent": next_state.intent, "message": next_state.message, "context": next_state.context},
+        outputs={
+            "preference_action_result": dict(preference_result),
+            "plan": list(next_state.plan),
+            "next_actions": list(next_state.next_actions),
+        },
+        error=None if preference_result["status"] == "success" else str(preference_result.get("error") or preference_result.get("message") or "preference action failed"),
+    )
+
+
 def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
+
+    if next_state.intent == "preference_action":
+        result = next_state.preference_action_result or {}
+        title = str(result.get("title") or "").strip()
+        arxiv_id = str(result.get("arxiv_id") or "").strip()
+        action = str(result.get("action") or "remove")
+        label = str(result.get("label") or "none")
+        message = str(result.get("message") or "").strip()
+        error = str(result.get("error") or "").strip()
+
+        if result.get("status") == "success":
+            if action == "like":
+                next_state.answer = "已将该论文标记为感兴趣。"
+            elif action == "dislike":
+                next_state.answer = "已将该论文标记为不感兴趣。"
+            else:
+                next_state.answer = "已取消该论文的偏好标记。"
+            if title:
+                next_state.answer += f"\n\n《{title}》"
+            if arxiv_id:
+                next_state.answer += f"\narXiv ID: {arxiv_id}"
+            if action == "like":
+                next_state.answer += "\n\n后续推荐会参考这个偏好。"
+            elif action == "dislike":
+                next_state.answer += "\n\n后续推荐会尽量降低类似论文的权重。"
+            else:
+                next_state.answer += "\n\n后续推荐会恢复对这篇论文的中性处理。"
+            next_state.next_actions = [
+                "继续对其他论文执行喜欢、不喜欢或收藏动作",
+                "也可以继续搜索、查看推荐或打开论文详情",
+            ]
+        else:
+            next_state.answer = message or error or "偏好动作执行失败。"
+            next_state.next_actions = [
+                "先搜索论文，再使用“第一篇 / 第二篇”来标记",
+                "也可以直接提供 arXiv ID 后重试",
+            ]
+
+        return _append_step(
+            next_state,
+            step="final_answer_generation",
+            status="success",
+            action="生成最终答复并给出后续动作",
+            inputs={
+                "intent": next_state.intent,
+                "preference_action_result": dict(result),
+            },
+            outputs={
+                "answer": next_state.answer,
+                "next_actions": list(next_state.next_actions),
+                "label": label,
+            },
+        )
 
     if next_state.intent == "arxiv_search":
         spec = next_state.search_spec
@@ -2205,6 +2771,7 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
 
 __all__ = [
     "SEARCH_TOOL_NAME",
+    "apply_preference_action",
     "build_search_tool_args",
     "check_search_result",
     "invoke_search_tool",

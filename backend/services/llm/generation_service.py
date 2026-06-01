@@ -23,14 +23,16 @@ logger = logging.getLogger(__name__)
 # 如果你有自己的真实 Key，请通过环境变量注入，不要直接写死在代码里。
 QWEN_API_KEY = GENERATION_CONFIG["qwen_api_key"]
 QWEN_BASE_URL = GENERATION_CONFIG["qwen_base_url"]
-QWEN_MODEL_NAME = GENERATION_CONFIG["qwen_model_name"]
-RERANK_QWEN_MODEL_NAME = GENERATION_CONFIG["rerank_qwen_model_name"]
-QWEN_ENABLE_THINKING = GENERATION_CONFIG["rerank_qwen_enable_thinking"]
+QWEN_SMALL_MODEL_NAME = GENERATION_CONFIG["small_qwen_model_name"]
+QWEN_LARGE_MODEL_NAME = GENERATION_CONFIG["large_qwen_model_name"]
+QWEN_RERANK_COMPRESS_MODEL_NAME = GENERATION_CONFIG["qwen_rerank_compress_model_name"]
+QWEN_RERANK_COMPRESS_ENABLE_THINKING = GENERATION_CONFIG["qwen_rerank_compress_enable_thinking"]
 HF_GENERATE_MAX_LENGTH = GENERATION_CONFIG["huggingface_generate_max_length"]
 HF_GENERATE_TEMPERATURE = GENERATION_CONFIG["huggingface_generate_temperature"]
 HF_GENERATE_DO_SAMPLE = GENERATION_CONFIG["huggingface_generate_do_sample"]
 REWRITE_QUERY_MAX_QUERIES_DEFAULT = GENERATION_CONFIG["rewrite_query_max_queries_default"]
 PLAN_QUERY_MAX_QUERIES_DEFAULT = GENERATION_CONFIG["plan_query_max_queries_default"]
+QWEN_TASK_MODEL_ROLES = dict(GENERATION_CONFIG.get("task_model_roles", {}))
 
 class GenerationService:
     """
@@ -47,7 +49,10 @@ class GenerationService:
                 "gpt-4": "gpt-4",
             },
             "qwen": {
-                "qwen3.6-plus": "qwen3.6-plus",
+                "qwen3.6-plus": QWEN_LARGE_MODEL_NAME,
+                "qwen3.6-flash": QWEN_SMALL_MODEL_NAME,
+                "large": QWEN_LARGE_MODEL_NAME,
+                "small": QWEN_SMALL_MODEL_NAME,
             },
             "deepseek": {
                 "deepseek-v3": "deepseek-chat",
@@ -58,12 +63,72 @@ class GenerationService:
         # 确保输出目录存在
         os.makedirs("05-generation-results", exist_ok=True)
 
+    def _normalize_task_type(self, task_type: Optional[str]) -> str:
+        # 任务类型只作为路由提示使用，统一做一次清洗，避免空字符串污染日志和配置查询。
+        return str(task_type or "").strip().lower()
+
+    def _resolve_qwen_model_selection(
+        self,
+        *,
+        task_type: Optional[str] = None,
+        model_name: Optional[str] = None,
+        model_role: Optional[str] = None,
+        default_role: str = "large",
+    ) -> Dict[str, str]:
+        """
+        根据任务类型选择 Qwen 模型。
+
+        这里的职责是把“任务类型 -> 小/大模型 -> 具体模型名”的决策收口，
+        业务调用方只需要传 task_type，不再自己硬编码模型名。
+        """
+        normalized_task_type = self._normalize_task_type(task_type)
+        requested_role = str(model_role or "").strip().lower()
+        configured_role = str(QWEN_TASK_MODEL_ROLES.get(normalized_task_type, "") or "").strip().lower()
+        selected_role = requested_role or configured_role or default_role
+        selected_model = str(model_name or "").strip()
+        routing_source = "explicit_model_name" if selected_model else "task_route"
+        fallback_reason = ""
+
+        if not selected_model:
+            if selected_role == "small":
+                selected_model = QWEN_SMALL_MODEL_NAME
+            else:
+                selected_model = QWEN_LARGE_MODEL_NAME
+
+            if not configured_role and normalized_task_type and normalized_task_type not in {"default", "general_generation"}:
+                fallback_reason = f"task_type={normalized_task_type} 采用默认模型角色={selected_role}"
+                routing_source = "default"
+        else:
+            if selected_model == QWEN_SMALL_MODEL_NAME:
+                selected_role = "small"
+            elif selected_model == QWEN_LARGE_MODEL_NAME:
+                selected_role = "large"
+            else:
+                selected_role = requested_role or "custom"
+                routing_source = "explicit_override"
+
+        logger.debug(
+            "Qwen模型路由 task_type=%s model_role=%s selected_model=%s routing_source=%s fallback_reason=%s",
+            normalized_task_type or "default",
+            selected_role,
+            selected_model,
+            routing_source,
+            fallback_reason or "",
+        )
+        return {
+            "task_type": normalized_task_type or "default",
+            "model_role": selected_role,
+            "selected_model": selected_model,
+            "routing_source": routing_source,
+            "fallback_reason": fallback_reason,
+        }
+
     def compress_chunk_for_rerank(
         self,
         chunk_text: str,
         chunk_metadata: Optional[Dict[str, Any]] = None,
         api_key: Optional[str] = None,
-        model_name: str = RERANK_QWEN_MODEL_NAME,
+        model_name: str = QWEN_RERANK_COMPRESS_MODEL_NAME,
     ) -> str:
         chunk_metadata = chunk_metadata or {}
         chunk_type = str(chunk_metadata.get("chunk_type", "text") or "text").strip().lower()
@@ -103,7 +168,7 @@ class GenerationService:
         self,
         chunks: List[Dict[str, Any]],
         api_key: Optional[str] = None,
-        model_name: str = RERANK_QWEN_MODEL_NAME,
+        model_name: str = QWEN_RERANK_COMPRESS_MODEL_NAME,
     ) -> List[Dict[str, Any]]:
         compressed_chunks: List[Dict[str, Any]] = []
         logger.info(
@@ -286,21 +351,29 @@ Answer:"""
         query: str,
         context: str,
         api_key: Optional[str] = None,
-        model_name: str = QWEN_MODEL_NAME,
-        enable_thinking: bool = QWEN_ENABLE_THINKING,
+        model_name: Optional[str] = None,
+        task_type: Optional[str] = None,
+        enable_thinking: bool = QWEN_RERANK_COMPRESS_ENABLE_THINKING,
         image_inputs: Optional[List[Dict[str, Any]]] = None,
         asset_metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
         使用阿里云百炼兼容的 OpenAI Responses API 生成答案。
 
-        这里采用 Qwen3.6-Plus，输入由检索到的上下文和问题组成。
+        这里会根据 task_type 选择小模型或大模型；如果外部显式传入 model_name，则优先尊重显式配置。
         """
         try:
             if not api_key:
                 api_key = QWEN_API_KEY
             if not api_key:
                 raise ValueError("Qwen API key not provided")
+
+            model_selection = self._resolve_qwen_model_selection(
+                task_type=task_type,
+                model_name=model_name,
+                default_role="large",
+            )
+            model_name = model_selection["selected_model"]
 
             client = OpenAI(
                 api_key=api_key,
@@ -343,14 +416,22 @@ Answer:"""
         self,
         prompt: str,
         api_key: Optional[str] = None,
-        model_name: str = QWEN_MODEL_NAME,
-        enable_thinking: bool = QWEN_ENABLE_THINKING,
+        model_name: Optional[str] = None,
+        task_type: Optional[str] = None,
+        enable_thinking: bool = QWEN_RERANK_COMPRESS_ENABLE_THINKING,
     ) -> str:
         try:
             if not api_key:
                 api_key = QWEN_API_KEY
             if not api_key:
                 raise ValueError("Qwen API key not provided")
+
+            model_selection = self._resolve_qwen_model_selection(
+                task_type=task_type,
+                model_name=model_name,
+                default_role="large",
+            )
+            model_name = model_selection["selected_model"]
 
             client = OpenAI(
                 api_key=api_key,
@@ -387,7 +468,7 @@ Answer:"""
         max_queries: int = REWRITE_QUERY_MAX_QUERIES_DEFAULT,
         paper_context: Optional[Dict[str, Any]] = None,
         api_key: Optional[str] = None,
-        model_name: str = QWEN_MODEL_NAME,
+        model_name: Optional[str] = None,
     ) -> List[str]:
         data = self.plan_queries_for_retrieval(
             question=question,
@@ -412,7 +493,7 @@ Answer:"""
         question: str,
         paper_context: Optional[Dict[str, Any]] = None,
         api_key: Optional[str] = None,
-        model_name: str = QWEN_MODEL_NAME,
+        model_name: Optional[str] = None,
         intent_profile: Optional[Dict[str, Any]] = None,
     ) -> str:
         return self.build_rerank_query(
@@ -426,7 +507,7 @@ Answer:"""
         self,
         original_question: str,
         api_key: Optional[str] = None,
-        model_name: str = QWEN_MODEL_NAME,
+        model_name: Optional[str] = None,
         intent_profile: Optional[Dict[str, Any]] = None,
     ) -> str:
         normalized_question = re.sub(r"\s+", " ", (original_question or "")).strip()
@@ -448,7 +529,7 @@ Answer:"""
         max_queries: int = PLAN_QUERY_MAX_QUERIES_DEFAULT,
         paper_context: Optional[Dict[str, Any]] = None,
         api_key: Optional[str] = None,
-        model_name: str = QWEN_MODEL_NAME,
+        model_name: Optional[str] = None,
         intent_profile: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         paper_context = paper_context or {}
@@ -482,7 +563,12 @@ Answer:"""
             f"Section titles: {', '.join(section_titles[:16]) or 'N/A'}\n"
             f"Candidate paper terms: {', '.join(candidate_terms[:24]) or 'N/A'}"
         )
-        response = self.complete_with_qwen(prompt, api_key=api_key, model_name=model_name)
+        response = self.complete_with_qwen(
+            prompt,
+            api_key=api_key,
+            model_name=model_name,
+            task_type="query_planning",
+        )
         data = json.loads(self._extract_json_block(response))
         return self._normalize_query_plan(data, question, max_queries=max_queries, paper_context=paper_context)
 
@@ -490,7 +576,7 @@ Answer:"""
         self,
         question: str,
         api_key: Optional[str] = None,
-        model_name: str = QWEN_MODEL_NAME,
+        model_name: Optional[str] = None,
     ) -> str:
         prompt = (
             "You are writing a hypothetical passage to help semantic retrieval over a single English research paper.\n"
@@ -502,7 +588,12 @@ Answer:"""
             "4. Focus on paper-style terminology, section wording, and likely evidence.\n\n"
             f"Question: {question}"
         )
-        return self.complete_with_qwen(prompt, api_key=api_key, model_name=model_name).strip()
+        return self.complete_with_qwen(
+            prompt,
+            api_key=api_key,
+            model_name=model_name,
+            task_type="hyde_generation",
+        ).strip()
 
     def _fallback_rerank_query(self, question: str, intent_profile: Optional[Dict[str, Any]] = None) -> str:
         return self._build_evidence_selection_rerank_query(question, intent_profile=intent_profile)
@@ -1015,8 +1106,9 @@ Answer:"""
         query: str,
         context: str,
         api_key: Optional[str] = None,
-        model_name: str = QWEN_MODEL_NAME,
-        enable_thinking: bool = QWEN_ENABLE_THINKING,
+        model_name: Optional[str] = None,
+        task_type: Optional[str] = None,
+        enable_thinking: bool = QWEN_RERANK_COMPRESS_ENABLE_THINKING,
         image_inputs: Optional[List[Dict[str, Any]]] = None,
         asset_metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> Iterator[Dict[str, Any]]:
@@ -1026,6 +1118,13 @@ Answer:"""
                 api_key = QWEN_API_KEY
             if not api_key:
                 raise ValueError("Qwen API key not provided")
+
+            model_selection = self._resolve_qwen_model_selection(
+                task_type=task_type,
+                model_name=model_name,
+                default_role="large",
+            )
+            model_name = model_selection["selected_model"]
 
             client = OpenAI(api_key=api_key, base_url=QWEN_BASE_URL)
             stream = client.responses.create(
@@ -1112,13 +1211,14 @@ Answer:"""
     def generate(
         self,
         provider: str,
-        model_name: str,
         query: str,
         search_results: List[Dict],
+        model_name: Optional[str] = None,
         api_key: Optional[str] = None,
         show_reasoning: bool = True,
         image_inputs: Optional[List[Dict[str, Any]]] = None,
         asset_metadata: Optional[List[Dict[str, Any]]] = None,
+        task_type: Optional[str] = None,
     ) -> Dict:
         """
         生成回答并保存结果。
@@ -1140,9 +1240,28 @@ Answer:"""
                 f"[Source {i+1}]: {result['text']}"
                 for i, result in enumerate(search_results)
             ])
-            
+
+            model_selection: Dict[str, str] = {
+                "task_type": self._normalize_task_type(task_type) or "default",
+                "model_role": "custom" if model_name else "large",
+                "selected_model": str(model_name or "").strip(),
+                "routing_source": "explicit_model_name" if model_name else "task_route",
+                "fallback_reason": "",
+            }
+
+            # Qwen 的模型选择收口到统一路由，避免各业务节点自己硬编码小/大模型名。
+            if provider == "qwen":
+                model_selection = self._resolve_qwen_model_selection(
+                    task_type=task_type,
+                    model_name=model_name,
+                    default_role="large",
+                )
+                model_name = model_selection["selected_model"]
+
             # 根据不同提供商生成回答
             if provider == "openai":
+                if not model_name:
+                    raise ValueError("OpenAI model name is required")
                 response = self._generate_with_openai(model_name, query, context, api_key)
             elif provider == "qwen":
                 response = self._generate_with_qwen_responses(
@@ -1150,11 +1269,14 @@ Answer:"""
                     context,
                     api_key,
                     model_name,
-                    enable_thinking=QWEN_ENABLE_THINKING,
+                    task_type=task_type,
+                    enable_thinking=QWEN_RERANK_COMPRESS_ENABLE_THINKING,
                     image_inputs=image_inputs,
                     asset_metadata=asset_metadata,
                 )
             elif provider == "deepseek":
+                if not model_name:
+                    raise ValueError("DeepSeek model name is required")
                 response = self._generate_with_deepseek(model_name, query, context, api_key, show_reasoning)
             elif provider == "huggingface":
                 raise ValueError("Local HuggingFace generation has been disabled; use openai, qwen, or deepseek.")
@@ -1167,6 +1289,11 @@ Answer:"""
                 "timestamp": datetime.now().isoformat(),
                 "provider": provider,
                 "model": model_name,
+                "task_type": model_selection.get("task_type", "default"),
+                "selected_model": model_selection.get("selected_model", model_name or ""),
+                "model_role": model_selection.get("model_role", ""),
+                "routing_source": model_selection.get("routing_source", ""),
+                "fallback_reason": model_selection.get("fallback_reason", ""),
                 "response": response,
                 "context": search_results,
                 "image_inputs": image_inputs or [],
@@ -1175,7 +1302,7 @@ Answer:"""
             
             # 生成文件名并保存
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            filename = f"generation_{provider}_{model_name}_{timestamp}.json"
+            filename = f"generation_{provider}_{model_name or 'auto'}_{timestamp}.json"
             filepath = os.path.join("05-generation-results", filename)
             
             with open(filepath, "w", encoding="utf-8") as f:

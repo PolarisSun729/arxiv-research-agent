@@ -162,7 +162,8 @@ async def qa_paper_stream(
             for chunk in generation_service.stream_qwen_responses(
                 query=question,
                 context=qa_context["text_context"],
-                model_name="qwen3.6-plus",
+                # 纸面 QA 的最终答案属于高质量生成任务，明确走大模型。
+                task_type="paper_qa_final_answer",
                 image_inputs=qa_context["image_inputs"],
                 asset_metadata=[item for item in qa_context["asset_metadata"] if item.get("chunk_type") == "figure"],
             ):
