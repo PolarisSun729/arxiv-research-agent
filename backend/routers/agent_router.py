@@ -12,13 +12,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/agent", tags=["agent"])
 
 
-@router.post("/arxiv-search", response_model=ArxivSearchResponse)
-async def arxiv_search_agent_endpoint(request: ArxivSearchRequest):
-    logger.info("Running arxiv search agent for user_id=%s session_id=%s", request.user_id, request.session_id)
+@router.post("/chat", response_model=ArxivSearchResponse)
+async def agent_chat_endpoint(request: ArxivSearchRequest):
+    logger.info("Running agent chat for user_id=%s session_id=%s", request.user_id, request.session_id)
     return run_arxiv_search_agent(request)
 
 
-@router.post("/arxiv-search/stream")
-async def arxiv_search_agent_stream_endpoint(request: ArxivSearchRequest) -> StreamingResponse:
-    logger.info("Running arxiv search agent stream for user_id=%s session_id=%s", request.user_id, request.session_id)
+@router.post("/chat/stream")
+async def agent_chat_stream_endpoint(request: ArxivSearchRequest) -> StreamingResponse:
+    logger.info("Running agent chat stream for user_id=%s session_id=%s", request.user_id, request.session_id)
     return stream_arxiv_search_agent(request)

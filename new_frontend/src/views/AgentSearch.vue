@@ -16,6 +16,7 @@ const {
   loading,
   messages,
   latestResponse,
+  pendingAction,
   setInputMessage,
   submitMessage,
   clearConversation
@@ -33,6 +34,14 @@ function handlePromptSelect(prompt: string) {
 
 function handleClear() {
   clearConversation()
+}
+
+function handleConfirmPendingAction() {
+  submitMessage('解析')
+}
+
+function handleCancelPendingAction() {
+  submitMessage('取消')
 }
 
 function handleViewDetail(id: string) {
@@ -128,6 +137,26 @@ watch(latestResponse, () => {
     </section>
 
     <section class="conversation-shell">
+      <div v-if="pendingAction" class="pending-action-banner">
+        <div class="pending-action-banner__copy">
+          <div class="pending-action-banner__label">待确认任务</div>
+          <div class="pending-action-banner__title">
+            {{ pendingAction.title || '当前论文' }}
+          </div>
+          <div class="pending-action-banner__desc">
+            {{ pendingAction.qa_question || pendingAction.original_question || '需要先确认是否解析 PDF 并建立全文索引。' }}
+          </div>
+        </div>
+        <div class="pending-action-banner__actions">
+          <el-button type="primary" :disabled="loading" @click="handleConfirmPendingAction">
+            解析并回答
+          </el-button>
+          <el-button :disabled="loading" @click="handleCancelPendingAction">
+            取消
+          </el-button>
+        </div>
+      </div>
+
       <RagChatPanel
         v-model:sender-text="inputMessage"
         :messages="messages"
@@ -210,8 +239,57 @@ watch(latestResponse, () => {
   gap: 16px;
 }
 
+.pending-action-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 18px;
+  border-radius: 18px;
+  border: 1px solid rgba(14, 165, 233, 0.18);
+  background:
+    radial-gradient(circle at top right, rgba(14, 165, 233, 0.16), transparent 35%),
+    linear-gradient(135deg, rgba(240, 249, 255, 0.96), rgba(255, 255, 255, 0.98));
+}
+
+.pending-action-banner__copy {
+  min-width: 0;
+}
+
+.pending-action-banner__label {
+  color: #0284c7;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.pending-action-banner__title {
+  margin-top: 6px;
+  font-size: 16px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.pending-action-banner__desc {
+  margin-top: 4px;
+  color: #475569;
+  line-height: 1.6;
+}
+
+.pending-action-banner__actions {
+  display: flex;
+  gap: 10px;
+  flex: none;
+}
+
 @media (max-width: 1024px) {
   .hero-card {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .pending-action-banner {
     flex-direction: column;
     align-items: stretch;
   }

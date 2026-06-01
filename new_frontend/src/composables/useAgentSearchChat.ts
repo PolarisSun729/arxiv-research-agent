@@ -1,6 +1,6 @@
 import { ref, type Ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { runArxivSearchAgent, streamArxivSearchAgent } from '@/api/agent'
+import { runAgentChat, streamAgentChat } from '@/api/agent'
 import type { AgentPaper, AgentStep, AgentStreamEvent, AgentToolCall, ArxivSearchResponse } from '@/types/agent'
 import type { AgentChatMessage } from '@/types/agentChat'
 
@@ -26,6 +26,8 @@ function createDraftResponse(): ArxivSearchResponse {
     intent: 'loading',
     answer: '',
     search_spec: null,
+    pending_action: null,
+    paper_qa_result: null,
     preference_action_result: null,
     plan: [],
     tool_calls: [],
@@ -125,6 +127,12 @@ function applyStreamEvent(
       }
       if (event.data.state.search_spec) {
         response.search_spec = event.data.state.search_spec
+      }
+      if (Object.prototype.hasOwnProperty.call(event.data.state, 'pending_action')) {
+        response.pending_action = event.data.state.pending_action || null
+      }
+      if (Object.prototype.hasOwnProperty.call(event.data.state, 'paper_qa_result')) {
+        response.paper_qa_result = event.data.state.paper_qa_result || null
       }
       if (Array.isArray(event.data.state.next_actions)) {
         response.next_actions = event.data.state.next_actions
@@ -232,6 +240,8 @@ function buildFallbackErrorResponse(message: string, detail: string) {
     intent: 'unsupported',
     answer: message,
     search_spec: null,
+    pending_action: null,
+    paper_qa_result: null,
     plan: [],
     tool_calls: [],
     papers: [],
@@ -257,6 +267,7 @@ export function useAgentSearchChat() {
   const messages: Ref<AgentChatMessage<ArxivSearchResponse>[]> = ref([])
   const latestResponse = ref<ArxivSearchResponse | null>(null)
   const lastSearchPapers = ref<AgentPaper[]>([])
+  const pendingAction = ref<Record<string, any> | null>(null)
 
   function setInputMessage(value: string) {
     inputMessage.value = value
@@ -266,12 +277,30 @@ export function useAgentSearchChat() {
     messages.value = []
     latestResponse.value = null
     lastSearchPapers.value = []
+    pendingAction.value = null
     inputMessage.value = ''
   }
 
   function rememberSearchPapers(response: ArxivSearchResponse | null | undefined) {
     if (response?.intent === 'arxiv_search' && Array.isArray(response.papers) && response.papers.length > 0) {
       lastSearchPapers.value = response.papers.map(item => ({ ...item }))
+    }
+  }
+
+  function rememberPendingAction(response: ArxivSearchResponse | null | undefined) {
+    const resultStatus = response?.paper_qa_result?.status
+    if (response?.pending_action && resultStatus === 'waiting_confirmation') {
+      pendingAction.value = { ...response.pending_action }
+      return
+    }
+
+    if (resultStatus === 'success' || resultStatus === 'failed') {
+      pendingAction.value = null
+      return
+    }
+
+    if (!response?.pending_action && resultStatus !== 'waiting_confirmation') {
+      pendingAction.value = null
     }
   }
 
@@ -314,16 +343,22 @@ export function useAgentSearchChat() {
       return
     }
 
-    const requestContext = lastSearchPapers.value.length
+    const requestContext: {
+      last_papers?: AgentPaper[]
+      pending_action?: Record<string, any> | null
+    } = lastSearchPapers.value.length
       ? { last_papers: lastSearchPapers.value.map(item => ({ ...item })) }
-      : undefined
+      : {}
+    if (pendingAction.value) {
+      requestContext.pending_action = { ...pendingAction.value }
+    }
 
     try {
-      const response = await streamArxivSearchAgent(
+      const response = await streamAgentChat(
         {
           message,
           user_id: 'local_user',
-          context: requestContext || undefined
+          context: Object.keys(requestContext).length ? requestContext : undefined
         },
         {
           onEvent: event => {
@@ -337,6 +372,7 @@ export function useAgentSearchChat() {
 
       latestResponse.value = response
       rememberSearchPapers(response)
+      rememberPendingAction(response)
       if (target.response) {
         target.response = {
           ...target.response,
@@ -348,13 +384,14 @@ export function useAgentSearchChat() {
       setAssistantResponse(target, response)
     } catch (streamError) {
       try {
-        const fallbackResponse = await runArxivSearchAgent({
+        const fallbackResponse = await runAgentChat({
           message,
           user_id: 'local_user',
-          context: requestContext || undefined
+          context: Object.keys(requestContext).length ? requestContext : undefined
         })
         latestResponse.value = fallbackResponse
         rememberSearchPapers(fallbackResponse)
+        rememberPendingAction(fallbackResponse)
         setAssistantResponse(target, fallbackResponse)
       } catch (fallbackError) {
         const errorMessage = getErrorMessage(
@@ -388,6 +425,7 @@ export function useAgentSearchChat() {
     messages,
     latestResponse,
     lastSearchPapers,
+    pendingAction,
     setInputMessage,
     submitMessage,
     clearConversation

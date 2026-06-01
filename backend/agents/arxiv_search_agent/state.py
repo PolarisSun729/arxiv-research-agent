@@ -12,6 +12,8 @@ class AgentState(BaseModel):
     session_id: Optional[str] = None
     message: Optional[str] = None
     context: Dict[str, Any] = Field(default_factory=dict)
+    pending_action: Optional[Dict[str, Any]] = None
+    paper_qa_result: Optional[Dict[str, Any]] = None
     intent: Optional[str] = None
     intent_source: Optional[str] = None
     fallback_reason: Optional[str] = None

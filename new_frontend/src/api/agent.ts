@@ -35,15 +35,15 @@ function ensureErrorMessage(error: unknown, fallback: string) {
   return new Error(fallback)
 }
 
-export async function runArxivSearchAgent(payload: ArxivSearchRequest): Promise<ArxivSearchResponse> {
-  return request.post('/agent/arxiv-search', payload)
+export async function runAgentChat(payload: ArxivSearchRequest): Promise<ArxivSearchResponse> {
+  return request.post('/agent/chat', payload)
 }
 
-export async function streamArxivSearchAgent(
+export async function streamAgentChat(
   payload: ArxivSearchRequest,
   handlers: AgentStreamHandlers = {}
 ): Promise<ArxivSearchResponse> {
-  const response = await fetch('/api/agent/arxiv-search/stream', {
+  const response = await fetch('/api/agent/chat/stream', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',

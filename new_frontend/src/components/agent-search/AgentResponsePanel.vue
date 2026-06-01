@@ -95,6 +95,8 @@ const steps = computed(() => responseData.value.steps || [])
 const toolCalls = computed(() => responseData.value.tool_calls || [])
 const warnings = computed(() => responseData.value.warnings || [])
 const searchSpec = computed(() => responseData.value.search_spec || null)
+const pendingAction = computed(() => responseData.value.pending_action || null)
+const paperQaResult = computed(() => responseData.value.paper_qa_result || null)
 const preferenceActionResult = computed(() => responseData.value.preference_action_result || null)
 const streamingState = computed(() => responseData.value.streaming_state || null)
 
@@ -229,6 +231,24 @@ function getPreferenceActionLabel(result: AgentPreferenceActionResult | null) {
       </summary>
       <div v-if="!searchSpec" class="empty-state">暂无 search spec</div>
       <pre v-else class="json-block">{{ formatJson(searchSpec) }}</pre>
+    </details>
+
+    <details class="agent-collapse">
+      <summary class="agent-collapse__summary">
+        <span>Pending Action</span>
+        <span class="agent-collapse__count">{{ pendingAction ? 1 : 0 }}</span>
+      </summary>
+      <div v-if="!pendingAction" class="empty-state">鏆傛棤寰呯‘璁や换鍔?</div>
+      <pre v-else class="json-block">{{ formatJson(pendingAction) }}</pre>
+    </details>
+
+    <details class="agent-collapse">
+      <summary class="agent-collapse__summary">
+        <span>Paper QA Result</span>
+        <span class="agent-collapse__count">{{ paperQaResult ? 1 : 0 }}</span>
+      </summary>
+      <div v-if="!paperQaResult" class="empty-state">鏆傛棤 paper qa 缁撴灉</div>
+      <pre v-else class="json-block">{{ formatJson(paperQaResult) }}</pre>
     </details>
 
     <details v-if="preferenceActionResult" class="agent-collapse">

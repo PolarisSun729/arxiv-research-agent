@@ -401,6 +401,7 @@ GENERATION_CONFIG: Dict[str, Any] = {
         "intent_routing": "small",  # 决定将意图路由到哪个子 agent 或处理流水线
         "search_spec_parse": "small",  # 将自然语言搜索请求转换为结构化的搜索规范
         "preference_action_parse": "small",  # 解析用户的喜欢/不喜欢/收藏等偏好操作
+        "pending_action_confirmation": "small",  # 判断用户是否在确认待执行的论文解析任务
         "query_planning": "small",  # 规划多步或多查询的检索策略
         "query_rewrite": "small",  # 重写或规范化查询以提升检索效果
         "rerank_query": "small",  # 为重排阶段生成或调整查询
@@ -457,4 +458,3 @@ def get_rerank_runtime_config() -> Dict[str, Any]:
 
 def get_generation_runtime_config() -> Dict[str, Any]:
     return dict(GENERATION_CONFIG)
-

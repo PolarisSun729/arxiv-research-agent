@@ -22,6 +22,16 @@ try:  # pragma: no cover - import path differs between backend cwd and package i
 except ModuleNotFoundError:  # pragma: no cover
     from backend.dependencies import get_recommendation_service
 
+try:  # pragma: no cover - import path differs between backend cwd and package import
+    from dependencies import get_paper_qa_service
+except ModuleNotFoundError:  # pragma: no cover
+    from backend.dependencies import get_paper_qa_service
+
+try:  # pragma: no cover - import path differs between backend cwd and package import
+    from dependencies import get_generation_service
+except ModuleNotFoundError:  # pragma: no cover
+    from backend.dependencies import get_generation_service
+
 from .schemas import AgentStep, AgentToolCall, ArxivSearchSpec, get_default_agent_arxiv_categories, get_valid_arxiv_categories
 from .state import AgentState
 
@@ -2486,6 +2496,597 @@ def _resolve_paper_reference(message: str, context: Any) -> Dict[str, Any]:
     }
 
 
+def _resolve_generation_service_instance(generation_service: Optional[Any] = None) -> Optional[Any]:
+    if generation_service is not None:
+        return generation_service
+    try:
+        return get_generation_service()
+    except Exception:
+        return None
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    candidate = _normalize_text(text)
+    if not candidate:
+        return None
+
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE).strip()
+        candidate = re.sub(r"\s*```$", "", candidate).strip()
+
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start >= 0 and end > start:
+        candidate = candidate[start : end + 1]
+
+    try:
+        parsed = json.loads(candidate)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _normalize_confirmation_decision(value: Any) -> str:
+    decision = _normalize_text(str(value or "")).lower()
+    if decision in {"confirm", "confirmed", "accept", "yes", "ok"}:
+        return "confirm"
+    if decision in {"reject", "rejected", "cancel", "cancelled", "no", "rejecting"}:
+        return "reject"
+    if decision in {"unrelated", "other", "new_request"}:
+        return "unrelated"
+    return "unclear"
+
+
+def _fast_path_pending_action_decision(message: str) -> Optional[str]:
+    text = _normalize_text(message)
+    if not text:
+        return None
+
+    confirm_tokens = {
+        "是",
+        "好",
+        "好的",
+        "可以",
+        "继续",
+        "解析",
+        "开始解析",
+        "需要解析",
+        "帮我解析",
+        "ok",
+        "yes",
+        "go ahead",
+        "继续解析",
+    }
+    reject_tokens = {
+        "不用",
+        "取消",
+        "不解析",
+        "暂时不用",
+        "算了",
+        "不要",
+        "先不看",
+        "no",
+        "别解析",
+    }
+
+    if text in confirm_tokens:
+        return "confirm"
+    if text in reject_tokens:
+        return "reject"
+
+    lowered = text.lower()
+    if lowered in confirm_tokens:
+        return "confirm"
+    if lowered in reject_tokens:
+        return "reject"
+    return None
+
+
+def _build_qa_question_for_paper(intent: str, message: str, paper: Mapping[str, Any], reference: Mapping[str, Any]) -> str:
+    original_question = _normalize_text(message)
+    title = _normalize_text(str(paper.get("title") or reference.get("title") or ""))
+
+    if intent == "paper_summary":
+        return (
+            f"请基于论文全文总结这篇论文，包含研究问题、核心贡献、方法流程、实验设置、主要结果和局限性。"
+            f"{f' 论文标题：{title}' if title else ''}"
+        ).strip()
+
+    if intent == "paper_detail":
+        detail_question = original_question
+        if not detail_question:
+            detail_question = "请详细解释这篇论文的主要方法、实验设计和贡献。"
+        return detail_question
+
+    cleaned_question = original_question
+    cleaned_question = re.sub(r"^(问|请问)?\s*(第[一二三四五六七八九十0-9]+篇|[1-9]|1[0-9]|20)\s*[:：]?\s*", "", cleaned_question).strip()
+    cleaned_question = re.sub(r"^(这篇|该论文|这篇论文)\s*", "", cleaned_question).strip()
+    if not cleaned_question:
+        cleaned_question = "请基于论文全文回答这个问题。"
+    return cleaned_question
+
+
+def _make_pending_action_payload(
+    *,
+    arxiv_id: str,
+    title: str,
+    original_question: str,
+    qa_question: str,
+    loading_method: str = "docling",
+) -> Dict[str, Any]:
+    return {
+        "type": "parse_then_qa",
+        "arxiv_id": arxiv_id,
+        "title": title,
+        "original_question": original_question,
+        "qa_question": qa_question,
+        "loading_method": loading_method,
+        "status": "waiting_confirmation",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def classify_pending_action_confirmation(
+    state: Union[AgentState, Mapping[str, Any]],
+    generation_service: Optional[Any] = None,
+) -> AgentState:
+    current_state = _coerce_state(state)
+    next_state = current_state.model_copy(deep=True)
+    pending_action = dict(next_state.pending_action or (next_state.context or {}).get("pending_action") or {})
+    message = _normalize_text(next_state.message or "")
+    debug = dict(next_state.debug or {})
+
+    debug["pending_action"] = pending_action
+    debug["pending_action_confirmation_model"] = "qwen3.6-flash"
+
+    if not pending_action or str(pending_action.get("type") or "").strip() != "parse_then_qa":
+        debug["pending_action_decision"] = "unclear"
+        debug["confirmation_confidence"] = 0.0
+        debug["confirmation_reason"] = "当前没有待确认的论文解析任务"
+        next_state.debug = debug
+        return _append_step(
+            next_state,
+            step="classify_pending_action_confirmation",
+            status="skipped",
+            action="判断用户是否确认解析任务",
+            inputs={"message": message, "pending_action": pending_action},
+            outputs={"decision": "unclear", "reason": debug["confirmation_reason"]},
+        )
+
+    decision = _fast_path_pending_action_decision(message)
+    confidence = 0.99 if decision in {"confirm", "reject"} else 0.0
+    reason = "fast path 命中明确确认/取消表达" if decision in {"confirm", "reject"} else ""
+
+    if decision is None:
+        service = _resolve_generation_service_instance(generation_service)
+        if service is not None:
+            prompt = (
+                "你正在判断用户是否要继续执行一个待确认的论文解析任务。\n"
+                "请只输出严格 JSON，不要输出解释性文本。\n\n"
+                "JSON schema:\n"
+                '{\n'
+                '  "decision": "confirm | reject | unrelated | unclear",\n'
+                '  "confidence": 0.0,\n'
+                '  "reason": "简短原因"\n'
+                '}\n\n'
+                "待确认任务信息：\n"
+                f"- 论文标题: {pending_action.get('title') or ''}\n"
+                f"- arXiv ID: {pending_action.get('arxiv_id') or ''}\n"
+                f"- 原始问题: {pending_action.get('original_question') or ''}\n"
+                f"- qa_question: {pending_action.get('qa_question') or ''}\n"
+                f"- 当前用户输入: {message}\n\n"
+                "判定规则：\n"
+                "- confirm: 用户明确表示继续解析或同意执行\n"
+                "- reject: 用户明确取消或拒绝执行\n"
+                "- unrelated: 用户提出了新的独立请求，而不是确认/取消\n"
+                "- unclear: 无法判断用户是否确认\n"
+            )
+            try:
+                raw_output = service.complete_with_qwen(
+                    prompt,
+                    task_type="pending_action_confirmation",
+                    enable_thinking=False,
+                )
+                parsed = _extract_json_object(raw_output) or {}
+                decision = _normalize_confirmation_decision(parsed.get("decision"))
+                confidence = float(parsed.get("confidence") or 0.0)
+                reason = _normalize_text(str(parsed.get("reason") or ""))
+                if not reason:
+                    reason = "LLM 分类结果未返回原因"
+            except Exception as exc:
+                decision = "unclear"
+                confidence = 0.0
+                reason = f"确认判断失败: {exc}"
+        else:
+            decision = "unclear"
+            confidence = 0.0
+            reason = "缺少生成服务，无法进行确认判断"
+
+    debug["pending_action_decision"] = decision
+    debug["confirmation_decision"] = decision
+    debug["pending_action_confidence"] = confidence
+    debug["confirmation_confidence"] = confidence
+    debug["pending_action_reason"] = reason
+    debug["confirmation_reason"] = reason
+    next_state.debug = debug
+    if not next_state.plan:
+        next_state.plan = [
+            "判断用户是否确认解析任务",
+            "必要时创建论文 QA 索引",
+            "继续回答原始问题",
+        ]
+
+    return _append_step(
+        next_state,
+        step="classify_pending_action_confirmation",
+        status="success",
+        action="判断用户是否确认解析任务",
+        inputs={"message": message, "pending_action": pending_action},
+        outputs={
+            "decision": decision,
+            "confidence": confidence,
+            "reason": reason,
+            "pending_action": pending_action,
+        },
+    )
+
+
+def handle_pending_action_confirmation(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    current_state = _coerce_state(state)
+    next_state = current_state.model_copy(deep=True)
+    pending_action = dict(next_state.pending_action or (next_state.context or {}).get("pending_action") or {})
+    qa_service = get_paper_qa_service()
+    debug = dict(next_state.debug or {})
+
+    arxiv_id = str(pending_action.get("arxiv_id") or "").strip()
+    title = str(pending_action.get("title") or "").strip()
+    qa_question = _normalize_text(str(pending_action.get("qa_question") or ""))
+    loading_method = str(pending_action.get("loading_method") or "docling").strip() or "docling"
+
+    if not arxiv_id:
+        result = {
+            "status": "failed",
+            "arxiv_id": None,
+            "title": title or None,
+            "question": qa_question or None,
+            "answer": "",
+            "sources": [],
+            "retrieval_debug": None,
+            "qa_index_status": None,
+            "index_created": False,
+            "error": "待确认任务缺少 arXiv ID",
+        }
+        next_state.paper_qa_result = result
+        debug["qa_index_status"] = None
+        debug["index_created"] = False
+        next_state.debug = debug
+        return _append_step(
+            next_state,
+            step="handle_pending_action_confirmation",
+            status="failed",
+            action="创建并执行论文问答任务",
+            inputs={"pending_action": pending_action},
+            outputs={"paper_qa_result": result},
+            error=result["error"],
+        )
+
+    try:
+        index_result = qa_service.build_qa_index(arxiv_id, loading_method=loading_method)
+        qa_status = qa_service.get_qa_status(arxiv_id)
+        index_created = str(index_result.get("status") or "").lower() in {"success", "indexed"}
+        answer_result = qa_service.answer_question(
+            arxiv_id,
+            {
+                "question": qa_question or pending_action.get("original_question") or "请基于论文全文回答问题。",
+            },
+        )
+        result = {
+            "status": "success",
+            "arxiv_id": arxiv_id,
+            "title": title or answer_result.get("title") or title,
+            "question": qa_question or pending_action.get("original_question") or "",
+            "answer": answer_result.get("answer", ""),
+            "sources": answer_result.get("sources", []),
+            "retrieval_debug": answer_result.get("retrieval_debug"),
+            "qa_index_status": qa_status,
+            "index_created": index_created,
+            "error": None,
+        }
+        next_state.paper_qa_result = result
+        next_state.answer = result["answer"]
+        next_state.papers = list(answer_result.get("papers", [])) if isinstance(answer_result, Mapping) and answer_result.get("papers") else list(next_state.papers or [])
+        next_state.pending_action = None
+        next_state.context = dict(next_state.context or {})
+        next_state.context.pop("pending_action", None)
+        debug["qa_index_status"] = qa_status
+        debug["index_created"] = index_created
+        debug["qa_question"] = result["question"]
+        debug["paper_qa_arxiv_id"] = arxiv_id
+        next_state.debug = debug
+        next_state.tool_name = "paper_qa"
+        next_state.tool_args = {"arxiv_id": arxiv_id, "question": result["question"], "loading_method": loading_method}
+        next_state.tool_result = dict(result)
+        next_state.tool_calls = list(next_state.tool_calls or []) + [
+            AgentToolCall(
+                tool_name="paper_qa",
+                arguments=next_state.tool_args,
+                status="success",
+                summary=f"已创建 QA 索引并回答论文问题: {title or arxiv_id}",
+                trace={
+                    "arxiv_id": arxiv_id,
+                    "title": title,
+                    "qa_index_status": qa_status,
+                    "index_created": index_created,
+                    "sources_count": len(result.get("sources") or []),
+                    "retrieval_debug_present": bool(result.get("retrieval_debug")),
+                },
+                error=None,
+            )
+        ]
+        if not next_state.next_actions:
+            next_state.next_actions = [
+                "继续追问这篇论文的细节",
+                "切换到其他论文继续解析",
+            ]
+        return _append_step(
+            next_state,
+            step="handle_pending_action_confirmation",
+            status="success",
+            action="创建并执行论文问答任务",
+            inputs={"pending_action": pending_action},
+            outputs={
+                "paper_qa_result": result,
+                "qa_index_status": qa_status,
+                "index_created": index_created,
+            },
+        )
+    except Exception as exc:
+        result = {
+            "status": "failed",
+            "arxiv_id": arxiv_id,
+            "title": title,
+            "question": qa_question or pending_action.get("original_question") or "",
+            "answer": "",
+            "sources": [],
+            "retrieval_debug": None,
+            "qa_index_status": qa_service.get_qa_status(arxiv_id) if hasattr(qa_service, "get_qa_status") else None,
+            "index_created": False,
+            "error": str(exc),
+        }
+        next_state.paper_qa_result = result
+        debug["qa_index_status"] = result["qa_index_status"]
+        debug["index_created"] = False
+        next_state.debug = debug
+        next_state.tool_name = "paper_qa"
+        next_state.tool_args = {"arxiv_id": arxiv_id, "question": result["question"], "loading_method": loading_method}
+        next_state.tool_result = dict(result)
+        next_state.tool_calls = list(next_state.tool_calls or []) + [
+            AgentToolCall(
+                tool_name="paper_qa",
+                arguments=next_state.tool_args,
+                status="failed",
+                summary=f"论文问答执行失败: {title or arxiv_id}",
+                trace={
+                    "arxiv_id": arxiv_id,
+                    "title": title,
+                    "qa_index_status": result["qa_index_status"],
+                    "index_created": False,
+                },
+                error={"message": result["error"]},
+            )
+        ]
+        return _append_step(
+            next_state,
+            step="handle_pending_action_confirmation",
+            status="failed",
+            action="创建并执行论文问答任务",
+            inputs={"pending_action": pending_action},
+            outputs={"paper_qa_result": result},
+            error=result["error"],
+        )
+
+
+def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    current_state = _coerce_state(state)
+    next_state = current_state.model_copy(deep=True)
+    intent = str(next_state.intent or "").strip()
+    if intent not in {"paper_summary", "paper_detail", "paper_qa"}:
+        return _append_step(
+            next_state,
+            step="handle_paper_reading_request",
+            status="skipped",
+            action="处理论文阅读请求",
+            inputs={"intent": intent},
+            outputs={"reason": "当前 intent 不是论文阅读类请求"},
+        )
+
+    message = _normalize_text(next_state.message or "")
+    context = next_state.context or {}
+    resolution = _resolve_paper_reference(message, context)
+    if resolution.get("status") != "success":
+        result = {
+            "status": "failed",
+            "arxiv_id": None,
+            "title": None,
+            "question": message,
+            "answer": str(resolution.get("reason") or "无法解析目标论文"),
+            "sources": [],
+            "retrieval_debug": None,
+            "qa_index_status": None,
+            "index_created": False,
+            "error": str(resolution.get("reason") or "paper reference resolution failed"),
+        }
+        next_state.paper_qa_result = result
+        next_state.answer = result["answer"]
+        next_state.next_actions = [
+            "请先搜索论文，或直接提供 arXiv ID",
+            "也可以用“第一篇 / 第二篇”再次指定目标论文",
+        ]
+        next_state.debug = dict(next_state.debug or {})
+        next_state.debug["qa_question"] = None
+        return _append_step(
+            next_state,
+            step="handle_paper_reading_request",
+            status="failed",
+            action="处理论文阅读请求",
+            inputs={"message": message, "intent": intent, "context": context},
+            outputs={"paper_qa_result": result, "resolution": resolution},
+            error=result["error"],
+        )
+
+    paper = resolution.get("paper") or {}
+    arxiv_id = str(resolution.get("arxiv_id") or "").strip()
+    title = str(resolution.get("title") or paper.get("title") or "").strip()
+    qa_question = _build_qa_question_for_paper(intent, message, paper, resolution)
+    qa_service = get_paper_qa_service()
+    qa_status = qa_service.get_qa_status(arxiv_id)
+    debug = dict(next_state.debug or {})
+    debug["qa_question"] = qa_question
+    debug["qa_index_status"] = qa_status
+    next_state.debug = debug
+    next_state.tool_name = "paper_qa_status"
+    next_state.tool_args = {"arxiv_id": arxiv_id, "intent": intent, "question": qa_question}
+
+    if bool(qa_status.get("has_index")) or str(qa_status.get("status") or "").strip().lower() == "indexed":
+        try:
+            answer_result = qa_service.answer_question(arxiv_id, {"question": qa_question})
+            result = {
+                "status": "success",
+                "arxiv_id": arxiv_id,
+                "title": title,
+                "question": qa_question,
+                "answer": answer_result.get("answer", ""),
+                "sources": answer_result.get("sources", []),
+                "retrieval_debug": answer_result.get("retrieval_debug"),
+                "qa_index_status": qa_status,
+                "index_created": False,
+                "error": None,
+            }
+            next_state.paper_qa_result = result
+            next_state.answer = result["answer"]
+            next_state.papers = list(answer_result.get("papers", [])) if isinstance(answer_result, Mapping) and answer_result.get("papers") else list(next_state.papers or [])
+            next_state.next_actions = [
+                "继续追问这篇论文的其他细节",
+                "切换到其他论文继续阅读",
+            ]
+            next_state.tool_result = dict(result)
+            next_state.tool_calls = list(next_state.tool_calls or []) + [
+                AgentToolCall(
+                    tool_name="paper_qa",
+                    arguments=next_state.tool_args,
+                    status="success",
+                    summary=f"直接回答已建索引论文: {title or arxiv_id}",
+                    trace={
+                        "arxiv_id": arxiv_id,
+                        "title": title,
+                        "qa_index_status": qa_status,
+                        "sources_count": len(result.get("sources") or []),
+                        "retrieval_debug_present": bool(result.get("retrieval_debug")),
+                    },
+                    error=None,
+                )
+            ]
+            return _append_step(
+                next_state,
+                step="handle_paper_reading_request",
+                status="success",
+                action="处理论文阅读请求",
+                inputs={"message": message, "intent": intent, "context": context},
+                outputs={
+                    "paper_qa_result": result,
+                    "qa_index_status": qa_status,
+                    "qa_question": qa_question,
+                },
+            )
+        except Exception as exc:
+            result = {
+                "status": "failed",
+                "arxiv_id": arxiv_id,
+                "title": title,
+                "question": qa_question,
+                "answer": "",
+                "sources": [],
+                "retrieval_debug": None,
+                "qa_index_status": qa_status,
+                "index_created": False,
+                "error": str(exc),
+            }
+            next_state.paper_qa_result = result
+            next_state.answer = f"论文问答执行失败: {exc}"
+            next_state.next_actions = [
+                "稍后重试该论文问答",
+                "或者先确认是否要重新解析 PDF",
+            ]
+            return _append_step(
+                next_state,
+                step="handle_paper_reading_request",
+                status="failed",
+                action="处理论文阅读请求",
+                inputs={"message": message, "intent": intent, "context": context},
+                outputs={"paper_qa_result": result, "qa_index_status": qa_status},
+                error=str(exc),
+            )
+
+    pending_action = _make_pending_action_payload(
+        arxiv_id=arxiv_id,
+        title=title,
+        original_question=message,
+        qa_question=qa_question,
+        loading_method="docling",
+    )
+    next_state.pending_action = pending_action
+    next_state.context = dict(next_state.context or {})
+    next_state.context["pending_action"] = pending_action
+    result = {
+        "status": "waiting_confirmation",
+        "arxiv_id": arxiv_id,
+        "title": title,
+        "question": qa_question,
+        "answer": "",
+        "sources": [],
+        "retrieval_debug": None,
+        "qa_index_status": qa_status,
+        "index_created": False,
+        "error": None,
+    }
+    next_state.paper_qa_result = result
+    next_state.answer = (
+        f"这篇论文还没有建立问答索引。"
+        f"{f'《{title}》' if title else ''}"
+        f"{f' arXiv ID: {arxiv_id}' if arxiv_id else ''}"
+        " 是否现在解析 PDF 并创建全文检索索引？"
+    )
+    next_state.next_actions = ["解析", "取消"]
+    next_state.tool_calls = list(next_state.tool_calls or []) + [
+        AgentToolCall(
+            tool_name="paper_qa_status",
+            arguments={"arxiv_id": arxiv_id, "intent": intent},
+            status="success",
+            summary=f"论文尚未建立 QA 索引，等待用户确认: {title or arxiv_id}",
+            trace={
+                "arxiv_id": arxiv_id,
+                "title": title,
+                "qa_index_status": qa_status,
+                "qa_question": qa_question,
+            },
+            error=None,
+        )
+    ]
+    return _append_step(
+        next_state,
+        step="handle_paper_reading_request",
+        status="success",
+        action="处理论文阅读请求",
+        inputs={"message": message, "intent": intent, "context": context},
+        outputs={
+            "paper_qa_result": result,
+            "pending_action": pending_action,
+            "qa_index_status": qa_status,
+            "qa_question": qa_question,
+        },
+    )
+
+
 def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
@@ -2646,6 +3247,117 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
 
+    pending_action = dict(next_state.pending_action or (next_state.context or {}).get("pending_action") or {})
+    paper_qa_result = dict(next_state.paper_qa_result or {})
+    confirmation_decision = str((next_state.debug or {}).get("pending_action_decision") or "").strip().lower()
+
+    # 论文阅读流优先级最高：要么已经拿到全文问答结果，要么仍然停留在“是否解析 PDF”的确认阶段。
+    if next_state.intent in {"paper_summary", "paper_detail", "paper_qa"} and paper_qa_result.get("status") == "success":
+        next_state.answer = str(paper_qa_result.get("answer") or next_state.answer or "").strip()
+        if not next_state.next_actions:
+            next_state.next_actions = [
+                "继续追问这篇论文的其他细节",
+                "切换到其他论文继续阅读",
+            ]
+        return _append_step(
+            next_state,
+            step="final_answer_generation",
+            status="success",
+            action="生成论文阅读回复",
+            inputs={
+                "intent": next_state.intent,
+                "paper_qa_result": dict(paper_qa_result),
+            },
+            outputs={
+                "answer": next_state.answer,
+                "next_actions": list(next_state.next_actions),
+                "qa_index_status": paper_qa_result.get("qa_index_status"),
+            },
+        )
+
+    if next_state.intent in {"paper_summary", "paper_detail", "paper_qa"} and paper_qa_result.get("status") == "failed" and confirmation_decision == "confirm":
+        error_message = str(paper_qa_result.get("error") or paper_qa_result.get("answer") or "论文解析或问答执行失败").strip()
+        next_state.answer = error_message
+        next_state.next_actions = [
+            "重新确认是否需要解析 PDF",
+            "或稍后重试这篇论文",
+        ]
+        return _append_step(
+            next_state,
+            step="final_answer_generation",
+            status="failed",
+            action="生成论文阅读回复",
+            inputs={
+                "intent": next_state.intent,
+                "paper_qa_result": dict(paper_qa_result),
+            },
+            outputs={
+                "answer": next_state.answer,
+                "next_actions": list(next_state.next_actions),
+            },
+            error=error_message,
+        )
+
+    if isinstance(pending_action, dict) and str(pending_action.get("type") or "").strip() == "parse_then_qa":
+        title = str(pending_action.get("title") or "").strip()
+        arxiv_id = str(pending_action.get("arxiv_id") or "").strip()
+        qa_question = str(pending_action.get("qa_question") or "").strip()
+        base_prompt = (
+            f"《{title}》" if title else "这篇论文"
+        )
+        if confirmation_decision == "reject":
+            next_state.answer = f"已取消解析{base_prompt}。暂时无法基于全文回答。"
+            next_state.paper_qa_result = {
+                **paper_qa_result,
+                "status": "failed",
+                "arxiv_id": arxiv_id or paper_qa_result.get("arxiv_id"),
+                "title": title or paper_qa_result.get("title"),
+                "question": qa_question or paper_qa_result.get("question"),
+                "answer": "",
+                "error": "user cancelled pending action",
+            }
+            next_state.pending_action = None
+            next_state.context = dict(next_state.context or {})
+            next_state.context.pop("pending_action", None)
+            next_state.next_actions = [
+                "继续搜索其他论文",
+                "重新发起论文阅读请求",
+            ]
+        else:
+            pending_message = str(paper_qa_result.get("answer") or "").strip()
+            if not pending_message:
+                pending_message = (
+                    f"{base_prompt} 还没有建立问答索引。是否现在解析 PDF 并创建全文检索索引？"
+                    if confirmation_decision != "unrelated"
+                    else f"当前还有一个待确认的论文解析任务：{base_prompt}。请先回复“解析”或“取消”。"
+                )
+            if confirmation_decision == "unrelated":
+                next_state.answer = f"当前还有一个待确认的论文解析任务：{base_prompt}。请先回复“解析”或“取消”。"
+                next_state.next_actions = ["解析", "取消"]
+            elif confirmation_decision == "unclear" or not confirmation_decision:
+                next_state.answer = f"{base_prompt} 还没有建立问答索引。请回复“解析”继续，或回复“取消”放弃。"
+                next_state.next_actions = ["解析", "取消"]
+            else:
+                next_state.answer = pending_message
+                next_state.next_actions = ["解析", "取消"]
+
+        return _append_step(
+            next_state,
+            step="final_answer_generation",
+            status="success",
+            action="生成论文阅读回复",
+            inputs={
+                "intent": next_state.intent,
+                "pending_action": pending_action,
+                "paper_qa_result": dict(paper_qa_result),
+                "confirmation_decision": confirmation_decision,
+            },
+            outputs={
+                "answer": next_state.answer,
+                "next_actions": list(next_state.next_actions),
+            },
+        )
+
     if next_state.intent == "preference_action":
         result = next_state.preference_action_result or {}
         title = str(result.get("title") or "").strip()
@@ -2774,6 +3486,9 @@ __all__ = [
     "apply_preference_action",
     "build_search_tool_args",
     "check_search_result",
+    "classify_pending_action_confirmation",
+    "handle_paper_reading_request",
+    "handle_pending_action_confirmation",
     "invoke_search_tool",
     "parse_search_request",
     "personalized_rank_and_annotate_papers",

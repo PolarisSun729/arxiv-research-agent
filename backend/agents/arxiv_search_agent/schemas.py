@@ -273,6 +273,8 @@ class ArxivSearchResponse(BaseModel):
     llm_confidence: Optional[float] = None
     answer: str
     search_spec: Optional[ArxivSearchSpec] = None
+    pending_action: Optional[Dict[str, Any]] = None
+    paper_qa_result: Optional[Dict[str, Any]] = None
     preference_action_result: Optional[Dict[str, Any]] = None
     plan: List[str] = Field(default_factory=list)
     tool_calls: List[AgentToolCall] = Field(default_factory=list)

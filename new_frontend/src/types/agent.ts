@@ -4,6 +4,7 @@ export interface ArxivSearchRequest {
   message: string
   context?: {
     last_papers?: AgentPaper[]
+    pending_action?: Record<string, any> | null
   } | null
 }
 
@@ -111,6 +112,8 @@ export interface ArxivSearchResponse {
   intent: string
   answer: string
   search_spec?: ArxivSearchSpec | null
+  pending_action?: Record<string, any> | null
+  paper_qa_result?: Record<string, any> | null
   preference_action_result?: AgentPreferenceActionResult | null
   plan: string[]
   tool_calls: AgentToolCall[]

@@ -33,6 +33,7 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
             session_id=normalized_request.session_id,
             message=normalized_request.message,
             context=dict(normalized_request.context or {}),
+            pending_action=(normalized_request.context or {}).get("pending_action") if isinstance(normalized_request.context, dict) else None,
         )
         graph = build_arxiv_search_graph(generation_service=generation_service)
         final_state = graph.invoke(initial_state.model_dump())
@@ -66,6 +67,9 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 session_id=normalized_request.session_id,
                 message=normalized_request.message,
                 context=dict(normalized_request.context or {}),
+                pending_action=(normalized_request.context or {}).get("pending_action")
+                if isinstance(normalized_request.context, dict)
+                else None,
             )
             graph = build_arxiv_search_graph(generation_service=generation_service)
 
@@ -278,6 +282,8 @@ def _state_to_response(state: Any) -> ArxivSearchResponse:
         llm_confidence=final_state.llm_confidence,
         answer=final_state.answer or "",
         search_spec=final_state.search_spec,
+        pending_action=final_state.pending_action,
+        paper_qa_result=final_state.paper_qa_result,
         preference_action_result=final_state.preference_action_result,
         plan=list(final_state.plan or []),
         tool_calls=list(final_state.tool_calls or []),
@@ -331,6 +337,8 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
         "fallback_reason": state.fallback_reason,
         "llm_confidence": state.llm_confidence,
         "search_spec": state.search_spec.model_dump() if state.search_spec is not None else None,
+        "pending_action": state.pending_action,
+        "paper_qa_result": state.paper_qa_result,
         "preference_action_result": state.preference_action_result,
         "tool_name": state.tool_name,
         "tool_args": _compact_tool_args(state.tool_args),

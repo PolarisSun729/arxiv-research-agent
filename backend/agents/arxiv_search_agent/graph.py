@@ -5,9 +5,12 @@ from typing import Any, Mapping, Optional
 from langgraph.graph import END, START, StateGraph
 
 from .nodes import (
+    apply_preference_action,
     build_search_tool_args,
     check_search_result,
-    apply_preference_action,
+    classify_pending_action_confirmation,
+    handle_paper_reading_request,
+    handle_pending_action_confirmation,
     invoke_search_tool,
     parse_search_request,
     personalized_rank_and_annotate_papers,
@@ -18,6 +21,12 @@ from .state import AgentState
 
 def route_after_parse(state: Any) -> str:
     current_state = _coerce_state(state)
+    pending_action = current_state.context.get("pending_action") if isinstance(current_state.context, dict) else None
+    if isinstance(pending_action, dict) and str(pending_action.get("type") or "").strip() == "parse_then_qa" and str(
+        pending_action.get("status") or ""
+    ).strip() == "waiting_confirmation":
+        return "classify_pending_action_confirmation"
+
     intent = str(current_state.intent or "").strip()
     if intent in {
         "arxiv_search",
@@ -34,6 +43,14 @@ def route_after_parse(state: Any) -> str:
     return "unsupported"
 
 
+def route_after_pending_confirmation(state: Any) -> str:
+    current_state = _coerce_state(state)
+    decision = str((current_state.debug or {}).get("pending_action_decision") or "").strip().lower()
+    if decision == "confirm":
+        return "handle_pending_action_confirmation"
+    return "synthesize_response"
+
+
 def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
     graph = StateGraph(AgentState)
 
@@ -43,6 +60,12 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
     graph.add_node("check_search_result", check_search_result)
     graph.add_node("personalized_rank_and_annotate_papers", personalized_rank_and_annotate_papers)
     graph.add_node("apply_preference_action", apply_preference_action)
+    graph.add_node(
+        "classify_pending_action_confirmation",
+        lambda state: classify_pending_action_confirmation(state, generation_service=generation_service),
+    )
+    graph.add_node("handle_pending_action_confirmation", handle_pending_action_confirmation)
+    graph.add_node("handle_paper_reading_request", handle_paper_reading_request)
     graph.add_node("synthesize_response", synthesize_response)
 
     graph.add_edge(START, "parse_search_request")
@@ -51,18 +74,28 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
         route_after_parse,
         {
             "arxiv_search": "build_search_tool_args",
-            "paper_detail": "synthesize_response",
-            "paper_summary": "synthesize_response",
-            "paper_qa": "synthesize_response",
+            "paper_detail": "handle_paper_reading_request",
+            "paper_summary": "handle_paper_reading_request",
+            "paper_qa": "handle_paper_reading_request",
             "recommendation": "synthesize_response",
-            # 偏好动作先经过一个轻量占位节点，后续接入真正的写入逻辑时不需要改路由入口。
             "preference_action": "apply_preference_action",
+            "classify_pending_action_confirmation": "classify_pending_action_confirmation",
             "reading_list_action": "synthesize_response",
             "unclear": "synthesize_response",
             "unsupported": "synthesize_response",
         },
     )
+    graph.add_conditional_edges(
+        "classify_pending_action_confirmation",
+        route_after_pending_confirmation,
+        {
+            "handle_pending_action_confirmation": "handle_pending_action_confirmation",
+            "synthesize_response": "synthesize_response",
+        },
+    )
     graph.add_edge("apply_preference_action", "synthesize_response")
+    graph.add_edge("handle_pending_action_confirmation", "synthesize_response")
+    graph.add_edge("handle_paper_reading_request", "synthesize_response")
     graph.add_edge("build_search_tool_args", "invoke_search_tool")
     graph.add_edge("invoke_search_tool", "check_search_result")
     graph.add_edge("check_search_result", "personalized_rank_and_annotate_papers")
