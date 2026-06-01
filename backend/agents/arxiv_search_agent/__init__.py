@@ -9,12 +9,14 @@ from .nodes import (
     synthesize_response,
 )
 from .graph import build_arxiv_search_graph, route_after_parse
-from .schemas import AgentToolCall, ArxivSearchRequest, ArxivSearchResponse, ArxivSearchSpec
-from .service import run_arxiv_search_agent
+from .schemas import AgentStep, AgentStreamEvent, AgentToolCall, ArxivSearchRequest, ArxivSearchResponse, ArxivSearchSpec
+from .service import run_arxiv_search_agent, stream_arxiv_search_agent
 from .state import AgentState
 
 __all__ = [
     "AgentState",
+    "AgentStep",
+    "AgentStreamEvent",
     "AgentToolCall",
     "ArxivSearchRequest",
     "ArxivSearchResponse",
@@ -27,5 +29,6 @@ __all__ = [
     "personalized_rank_and_annotate_papers",
     "route_after_parse",
     "run_arxiv_search_agent",
+    "stream_arxiv_search_agent",
     "synthesize_response",
 ]

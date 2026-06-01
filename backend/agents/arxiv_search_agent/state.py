@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from .schemas import AgentToolCall, ArxivSearchSpec
+from .schemas import AgentStep, AgentToolCall, ArxivSearchSpec
 
 
 class AgentState(BaseModel):
@@ -22,5 +22,6 @@ class AgentState(BaseModel):
     warnings: List[str] = Field(default_factory=list)
     answer: Optional[str] = None
     next_actions: List[str] = Field(default_factory=list)
+    steps: List[AgentStep] = Field(default_factory=list)
     errors: List[Dict[str, Any]] = Field(default_factory=list)
     personalized_rerank_applied: bool = False

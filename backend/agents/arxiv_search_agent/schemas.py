@@ -223,6 +223,36 @@ class AgentToolCall(BaseModel):
     error: Optional[Dict[str, Any]] = None
 
 
+class AgentStep(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    step: str
+    status: Literal["success", "failed", "skipped"]
+    action: str
+    inputs: Dict[str, Any] = Field(default_factory=dict)
+    outputs: Dict[str, Any] = Field(default_factory=dict)
+    error: Optional[str] = None
+
+
+class AgentStreamEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event_type: Literal[
+        "run_start",
+        "step_start",
+        "step_end",
+        "tool_call_start",
+        "tool_call_end",
+        "final_response",
+        "exception",
+        "stream_end",
+    ]
+    sequence: int
+    run_id: str
+    timestamp: str
+    data: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ArxivSearchResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -234,3 +264,4 @@ class ArxivSearchResponse(BaseModel):
     papers: List[Dict[str, Any]] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
     next_actions: List[str] = Field(default_factory=list)
+    steps: List[AgentStep] = Field(default_factory=list)

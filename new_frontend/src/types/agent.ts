@@ -4,6 +4,8 @@ export interface ArxivSearchRequest {
   message: string
 }
 
+export type AgentStepStatus = 'running' | 'success' | 'failed' | 'skipped'
+
 export interface ArxivSearchSpec {
   intent: string
   query?: string | null
@@ -26,6 +28,39 @@ export interface AgentToolCall {
   summary?: string | null
   trace?: Record<string, any> | null
   error?: Record<string, any> | null
+}
+
+export interface AgentStep {
+  step: string
+  status: AgentStepStatus
+  action: string
+  inputs: Record<string, any>
+  outputs: Record<string, any>
+  error?: string | null
+}
+
+export interface AgentStreamingState {
+  run_id: string
+  sequence: number
+  event_type: string
+  active_step?: string | null
+  active_tool_call?: AgentToolCall | null
+}
+
+export interface AgentStreamEvent {
+  event_type:
+    | 'run_start'
+    | 'step_start'
+    | 'step_end'
+    | 'tool_call_start'
+    | 'tool_call_end'
+    | 'final_response'
+    | 'exception'
+    | 'stream_end'
+  sequence: number
+  run_id: string
+  timestamp: string
+  data: Record<string, any>
 }
 
 export interface AgentPaper {
@@ -66,4 +101,6 @@ export interface ArxivSearchResponse {
   papers: AgentPaper[]
   warnings: string[]
   next_actions: string[]
+  steps: AgentStep[]
+  streaming_state?: AgentStreamingState | null
 }

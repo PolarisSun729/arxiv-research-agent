@@ -69,6 +69,7 @@ def _build_search_trace(
     sort_order: str,
     start: int,
     max_results: int,
+    returned_count: Optional[int] = None,
     submitted_days_ago_applied: Optional[bool] = None,
 ) -> Dict[str, Any]:
     trace = make_tool_trace(tool_name, inputs=raw_inputs, source=DATA_SOURCE)
@@ -84,6 +85,8 @@ def _build_search_trace(
             "max_results": max_results,
         }
     )
+    if returned_count is not None:
+        trace["returned_count"] = returned_count
     if submitted_days_ago_applied is not None:
         trace["submitted_days_ago_applied"] = submitted_days_ago_applied
     return trace
@@ -127,6 +130,7 @@ def _run_search(
             sort_order=sort_order,
             start=start,
             max_results=max_results,
+            returned_count=len(papers),
             submitted_days_ago_applied=submitted_days_ago_applied,
         ),
     )
@@ -205,6 +209,7 @@ def search_arxiv_raw(
                 sort_order=sort_order,
                 start=start,
                 max_results=max_results,
+                returned_count=0,
                 submitted_days_ago_applied=False,
             ),
             error=make_tool_error("arxiv_invalid_query", str(exc)),
@@ -225,6 +230,7 @@ def search_arxiv_raw(
                 sort_order=sort_order,
                 start=start,
                 max_results=max_results,
+                returned_count=0,
                 submitted_days_ago_applied=False,
             ),
             error=make_tool_error("arxiv_search_failed", str(exc)),
