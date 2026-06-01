@@ -1,10 +1,14 @@
 <script setup lang="ts">
+import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
+import { dislikePaper, likePaper, removePaperPreference } from '@/api/papers'
 import { useAgentSearchChat } from '@/composables/useAgentSearchChat'
 import AgentResponsePanel from '@/components/agent-search/AgentResponsePanel.vue'
 import RagChatPanel from '@/components/rag-chat/RagChatPanel.vue'
+import type { Paper } from '@/types/paper'
 
 const router = useRouter()
+const agentPaperLabels = new Map<string, 'liked' | 'disliked'>()
 
 const {
   inputMessage,
@@ -31,6 +35,33 @@ function handleClear() {
 
 function handleViewDetail(id: string) {
   router.push(`/paper/${id}`)
+}
+
+async function handleLabel(paper: Paper, label: 'liked' | 'disliked' | null) {
+  try {
+    if (label === null) {
+      const currentLabel = agentPaperLabels.get(paper.id)
+      if (currentLabel) {
+        await removePaperPreference(paper, currentLabel)
+        agentPaperLabels.delete(paper.id)
+      }
+      ElMessage.success('已取消标记')
+      return
+    }
+
+    if (label === 'liked') {
+      await likePaper(paper)
+      agentPaperLabels.set(paper.id, label)
+      ElMessage.success('已标记为感兴趣')
+      return
+    }
+
+    await dislikePaper(paper)
+    agentPaperLabels.set(paper.id, label)
+    ElMessage.success('已标记为不感兴趣')
+  } catch (error) {
+    ElMessage.error('偏好保存失败')
+  }
 }
 
 function toAgentResponse(response: unknown): import('@/types/agent').ArxivSearchResponse | null {
@@ -75,6 +106,7 @@ function toAgentResponse(response: unknown): import('@/types/agent').ArxivSearch
             v-if="item.role === 'assistant' && item.response"
             :response="toAgentResponse(item.response)"
             @view-detail="handleViewDetail"
+            @label="handleLabel"
           />
         </template>
       </RagChatPanel>

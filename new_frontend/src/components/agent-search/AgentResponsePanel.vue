@@ -10,6 +10,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (event: 'view-detail', id: string): void
+  (event: 'label', paper: Paper, label: 'liked' | 'disliked' | null): void
 }>()
 
 function normalizePaper(raw: AgentPaper): Paper {
@@ -97,6 +98,12 @@ const streamingState = computed(() => responseData.value.streaming_state || null
 
 function handleViewDetail(id: string) {
   emit('view-detail', id)
+}
+
+function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
+  const paper = papers.value.find(item => item.id === id)
+  if (!paper) return
+  emit('label', paper, label)
 }
 </script>
 
@@ -236,6 +243,7 @@ function handleViewDetail(id: string) {
           :key="paper.id"
           :paper="paper"
           @view-detail="handleViewDetail"
+          @label="handleLabel"
         />
       </div>
     </section>
