@@ -11,6 +11,7 @@ type RagChatPanelMessage = AgentChatMessage & {
   placement: 'start' | 'end'
   variant: 'filled' | 'outlined'
   shape: 'round'
+  maxWidth?: string
   turnId?: string
   sources?: RagChatSource[]
   retrievalDebug?: RetrievalDebug | null
@@ -64,7 +65,8 @@ const bubbleMessages = computed<RagChatPanelMessage[]>(() =>
     ...message,
     placement: message.role === 'user' ? 'end' : 'start',
     variant: message.role === 'user' ? 'filled' : 'outlined',
-    shape: 'round'
+    shape: 'round',
+    maxWidth: message.role === 'user' ? 'min(82%, 720px)' : 'min(100%, 1080px)'
   }))
 )
 
@@ -243,6 +245,23 @@ function handlePromptSelect(item: PromptsItemsProps) {
   min-height: 0;
 }
 
+.rag-chat-panel__bubble-list :deep(.message-start),
+.rag-chat-panel__bubble-list :deep(.message-assistant),
+.rag-chat-panel__bubble-list :deep([data-placement='start']),
+.rag-chat-panel__bubble-list :deep([class*='placement-start']) {
+  width: 100%;
+}
+
+.rag-chat-panel__bubble-list :deep(.message-start .message-bubble),
+.rag-chat-panel__bubble-list :deep(.message-assistant .message-bubble),
+.rag-chat-panel__bubble-list :deep([data-placement='start'] .message-bubble),
+.rag-chat-panel__bubble-list :deep([class*='placement-start'] .message-bubble),
+.rag-chat-panel__bubble-list :deep([data-placement='start'] [class*='bubble']),
+.rag-chat-panel__bubble-list :deep([class*='placement-start'] [class*='bubble']) {
+  max-width: min(100%, 1080px) !important;
+  width: min(100%, 1080px);
+}
+
 .rag-chat-panel__message-label {
   margin-bottom: 8px;
   font-size: 12px;
@@ -267,6 +286,7 @@ function handlePromptSelect(item: PromptsItemsProps) {
 }
 
 .assistant-markdown {
+  width: 100%;
   max-width: 100%;
   color: #1e293b;
   line-height: 1.85;
@@ -483,6 +503,16 @@ function handlePromptSelect(item: PromptsItemsProps) {
 }
 
 @media (max-width: 900px) {
+  .rag-chat-panel__bubble-list :deep(.message-start .message-bubble),
+  .rag-chat-panel__bubble-list :deep(.message-assistant .message-bubble),
+  .rag-chat-panel__bubble-list :deep([data-placement='start'] .message-bubble),
+  .rag-chat-panel__bubble-list :deep([class*='placement-start'] .message-bubble),
+  .rag-chat-panel__bubble-list :deep([data-placement='start'] [class*='bubble']),
+  .rag-chat-panel__bubble-list :deep([class*='placement-start'] [class*='bubble']) {
+    max-width: 100% !important;
+    width: 100%;
+  }
+
   .rag-chat-panel__message-footer {
     gap: 10px;
   }

@@ -123,10 +123,7 @@ function getPreferenceActionLabel(result: AgentPreferenceActionResult | null) {
   <div class="agent-response-panel">
     <section class="agent-response-panel__hero">
       <div>
-        <div class="section-label">最终回答区</div>
-        <div class="agent-response-panel__answer">
-          {{ responseData.answer || '暂无最终回答' }}
-        </div>
+        <div class="section-label">Debug 概览</div>
       </div>
 
       <div class="agent-response-panel__meta">
@@ -306,13 +303,6 @@ function getPreferenceActionLabel(result: AgentPreferenceActionResult | null) {
   border-radius: 20px;
   background: linear-gradient(180deg, #ffffff, #f8fbff);
   border: 1px solid rgba(148, 163, 184, 0.14);
-}
-
-.agent-response-panel__answer {
-  margin-top: 8px;
-  color: #1f2937;
-  line-height: 1.85;
-  font-size: 15px;
 }
 
 .agent-response-panel__meta {
