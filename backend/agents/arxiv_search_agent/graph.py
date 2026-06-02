@@ -14,6 +14,7 @@ from .nodes import (
     invoke_search_tool,
     parse_search_request,
     personalized_rank_and_annotate_papers,
+    relax_search_for_retry,
     synthesize_response,
 )
 from .state import AgentState
@@ -51,6 +52,20 @@ def route_after_pending_confirmation(state: Any) -> str:
     return "synthesize_response"
 
 
+def route_after_check(state: Any) -> str:
+    """搜索结果检查后的路由：空结果且未超重试次数则放宽后重试。"""
+    current_state = _coerce_state(state)
+    papers = list(current_state.papers or [])
+    retry_count = int(current_state.search_retry_count or 0)
+    tool_result = current_state.tool_result
+    tool_ok = bool(tool_result and isinstance(tool_result, dict) and tool_result.get("ok"))
+
+    # 只有搜索成功但结果为空，且未超过最大重试次数时才触发 fallback
+    if tool_ok and not papers and retry_count < 3:
+        return "relax_search_for_retry"
+    return "personalized_rank_and_annotate_papers"
+
+
 def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
     graph = StateGraph(AgentState)
 
@@ -58,6 +73,7 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
     graph.add_node("build_search_tool_args", build_search_tool_args)
     graph.add_node("invoke_search_tool", invoke_search_tool)
     graph.add_node("check_search_result", check_search_result)
+    graph.add_node("relax_search_for_retry", relax_search_for_retry)
     graph.add_node("personalized_rank_and_annotate_papers", personalized_rank_and_annotate_papers)
     graph.add_node("apply_preference_action", apply_preference_action)
     graph.add_node(
@@ -98,7 +114,15 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
     graph.add_edge("handle_paper_reading_request", "synthesize_response")
     graph.add_edge("build_search_tool_args", "invoke_search_tool")
     graph.add_edge("invoke_search_tool", "check_search_result")
-    graph.add_edge("check_search_result", "personalized_rank_and_annotate_papers")
+    graph.add_conditional_edges(
+        "check_search_result",
+        route_after_check,
+        {
+            "relax_search_for_retry": "relax_search_for_retry",
+            "personalized_rank_and_annotate_papers": "personalized_rank_and_annotate_papers",
+        },
+    )
+    graph.add_edge("relax_search_for_retry", "build_search_tool_args")
     graph.add_edge("personalized_rank_and_annotate_papers", "synthesize_response")
     graph.add_edge("synthesize_response", END)
 

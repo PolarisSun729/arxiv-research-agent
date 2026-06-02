@@ -344,10 +344,16 @@ export function useAgentSearchChat() {
     }
 
     const requestContext: {
+      selected_paper?: AgentPaper | null
       last_papers?: AgentPaper[]
       pending_action?: Record<string, any> | null
+      source?: 'button' | 'chat' | 'detail_page'
     } = lastSearchPapers.value.length
-      ? { last_papers: lastSearchPapers.value.map(item => ({ ...item })) }
+      ? {
+          last_papers: lastSearchPapers.value.map(item => ({ ...item })),
+          selected_paper: lastSearchPapers.value[0] ? { ...lastSearchPapers.value[0] } : null,
+          source: 'chat'
+        }
       : {}
     if (pendingAction.value) {
       requestContext.pending_action = { ...pendingAction.value }

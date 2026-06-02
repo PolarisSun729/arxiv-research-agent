@@ -33,3 +33,5 @@ class AgentState(BaseModel):
     steps: List[AgentStep] = Field(default_factory=list)
     errors: List[Dict[str, Any]] = Field(default_factory=list)
     personalized_rerank_applied: bool = False
+    search_retry_count: int = 0
+    fallback_specs: List[Dict[str, Any]] = Field(default_factory=list)

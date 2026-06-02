@@ -3,8 +3,10 @@ export interface ArxivSearchRequest {
   session_id?: string | null
   message: string
   context?: {
+    selected_paper?: AgentPaper | null
     last_papers?: AgentPaper[]
     pending_action?: Record<string, any> | null
+    source?: 'button' | 'chat' | 'detail_page'
   } | null
 }
 
