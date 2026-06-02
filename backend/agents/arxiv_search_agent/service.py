@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,17 +24,31 @@ from .graph import build_arxiv_search_graph
 from .schemas import AgentStep, AgentStreamEvent, ArxivSearchRequest, ArxivSearchResponse
 from .state import AgentState
 
+logger = logging.getLogger(__name__)
+
 
 def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
     try:
         normalized_request = _coerce_request(request)
+        request_context = dict(normalized_request.context or {})
+        # 入口日志只记录状态摘要，便于排查“前端传了但后端没识别到”的问题，不直接打出完整上下文内容。
+        logger.info(
+            "arxiv_agent request received: message=%s context_keys=%s pending_action_status=%s paper_qa_status=%s selected_arxiv_id=%s",
+            normalized_request.message,
+            sorted(request_context.keys()),
+            _safe_status(request_context.get("pending_action")),
+            _safe_status(request_context.get("paper_qa_result")),
+            _safe_selected_arxiv_id(request_context),
+        )
         generation_service = _resolve_generation_service()
         initial_state = AgentState(
             user_id=normalized_request.user_id,
             session_id=normalized_request.session_id,
             message=normalized_request.message,
-            context=dict(normalized_request.context or {}),
-            pending_action=(normalized_request.context or {}).get("pending_action") if isinstance(normalized_request.context, dict) else None,
+            # 把前端回传的待确认状态提升到顶层，避免后续路由只看 context 时漏掉当前待办。
+            context=request_context,
+            pending_action=request_context.get("pending_action"),
+            paper_qa_result=request_context.get("paper_qa_result"),
         )
         graph = build_arxiv_search_graph(generation_service=generation_service)
         final_state = graph.invoke(initial_state.model_dump())
@@ -62,14 +77,24 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
         current_state: Optional[AgentState] = None
 
         try:
+            request_context = dict(normalized_request.context or {})
+            logger.info(
+                "arxiv_agent stream start: run_id=%s message=%s context_keys=%s pending_action_status=%s paper_qa_status=%s selected_arxiv_id=%s",
+                run_id,
+                normalized_request.message,
+                sorted(request_context.keys()),
+                _safe_status(request_context.get("pending_action")),
+                _safe_status(request_context.get("paper_qa_result")),
+                _safe_selected_arxiv_id(request_context),
+            )
             current_state = AgentState(
                 user_id=normalized_request.user_id,
                 session_id=normalized_request.session_id,
                 message=normalized_request.message,
-                context=dict(normalized_request.context or {}),
-                pending_action=(normalized_request.context or {}).get("pending_action")
-                if isinstance(normalized_request.context, dict)
-                else None,
+                # 流式路径和同步路径必须使用同一份状态提升规则，确保确认/解析流程一致。
+                context=request_context,
+                pending_action=request_context.get("pending_action"),
+                paper_qa_result=request_context.get("paper_qa_result"),
             )
             graph = build_arxiv_search_graph(generation_service=generation_service)
 
@@ -254,6 +279,22 @@ def _coerce_request(request: ArxivSearchRequest | Dict[str, Any]) -> ArxivSearch
     if isinstance(request, ArxivSearchRequest):
         return request
     return ArxivSearchRequest.model_validate(dict(request))
+
+
+def _safe_status(value: Any) -> str:
+    if not isinstance(value, Mapping):
+        return "none"
+    return str(value.get("status") or "none").strip() or "none"
+
+
+def _safe_selected_arxiv_id(context: Mapping[str, Any]) -> str:
+    selected = context.get("selected_paper")
+    if isinstance(selected, Mapping):
+        selected_id = str(selected.get("arxiv_id") or selected.get("arxivId") or selected.get("id") or "").strip()
+        if selected_id:
+            return selected_id
+    arxiv_id = str(context.get("arxiv_id") or "").strip()
+    return arxiv_id or "none"
 
 
 def _resolve_generation_service() -> Optional[Any]:

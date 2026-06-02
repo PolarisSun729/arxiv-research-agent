@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Mapping, Optional
 
 from langgraph.graph import END, START, StateGraph
@@ -19,13 +20,31 @@ from .nodes import (
 )
 from .state import AgentState
 
+logger = logging.getLogger(__name__)
+
 
 def route_after_parse(state: Any) -> str:
     current_state = _coerce_state(state)
-    pending_action = current_state.context.get("pending_action") if isinstance(current_state.context, dict) else None
+    # 待确认的论文解析任务可能同时挂在 state.pending_action 和 context.pending_action 上，
+    # 这里两处都检查，避免经过序列化/回填后丢掉待执行状态，导致确认消息又被当成新请求处理。
+    pending_action = current_state.pending_action
+    if pending_action is None and isinstance(current_state.context, dict):
+        pending_action = current_state.context.get("pending_action")
+    # 流式请求在前端回传时，paper_qa_result 也会跟着带回来；这里把“等待确认”的 QA 结果视为同一类待办状态。
+    pending_qa_result = current_state.paper_qa_result
+    if pending_qa_result is None and isinstance(current_state.context, dict):
+        pending_qa_result = current_state.context.get("paper_qa_result")
     if isinstance(pending_action, dict) and str(pending_action.get("type") or "").strip() == "parse_then_qa" and str(
         pending_action.get("status") or ""
     ).strip() == "waiting_confirmation":
+        return "classify_pending_action_confirmation"
+    if isinstance(pending_qa_result, dict) and str(pending_qa_result.get("status") or "").strip() == "waiting_confirmation":
+        logger.info(
+            "arxiv_agent route_after_parse -> classify_pending_action_confirmation: intent=%s pending_action_status=%s paper_qa_status=%s",
+            current_state.intent or "none",
+            str((pending_action or {}).get("status") or "none") if isinstance(pending_action, dict) else "none",
+            str((pending_qa_result or {}).get("status") or "none"),
+        )
         return "classify_pending_action_confirmation"
 
     intent = str(current_state.intent or "").strip()
@@ -40,7 +59,20 @@ def route_after_parse(state: Any) -> str:
         "unclear",
         "unsupported",
     }:
+        logger.info(
+            "arxiv_agent route_after_parse -> %s: intent=%s pending_action_status=%s paper_qa_status=%s",
+            intent,
+            intent or "none",
+            str((pending_action or {}).get("status") or "none") if isinstance(pending_action, dict) else "none",
+            str((pending_qa_result or {}).get("status") or "none"),
+        )
         return intent
+    logger.warning(
+        "arxiv_agent route_after_parse -> unsupported: intent=%s pending_action_status=%s paper_qa_status=%s",
+        intent or "none",
+        str((pending_action or {}).get("status") or "none") if isinstance(pending_action, dict) else "none",
+        str((pending_qa_result or {}).get("status") or "none"),
+    )
     return "unsupported"
 
 

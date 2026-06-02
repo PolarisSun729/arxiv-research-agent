@@ -6,6 +6,8 @@ export interface ArxivSearchRequest {
     selected_paper?: AgentPaper | null
     last_papers?: AgentPaper[]
     pending_action?: Record<string, any> | null
+    paper_qa_result?: Record<string, any> | null
+    arxiv_id?: string | null
     source?: 'button' | 'chat' | 'detail_page'
   } | null
 }

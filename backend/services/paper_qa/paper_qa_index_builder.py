@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 
+from services.arxiv.arxiv_search_service import ArxivSearchService
 from services.document.chunking_service import ChunkingService
 from services.storage.database_service import DatabaseService
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
@@ -53,11 +55,119 @@ class PaperQAIndexBuilder:
     def mark_index_processing(self, arxiv_id: str) -> None:
         self.db_service.insert_paper_qa_index(arxiv_id, status="processing")
 
+    @staticmethod
+    def _exception_detail(exc: Exception) -> str:
+        detail = getattr(exc, "detail", None)
+        if isinstance(detail, dict):
+            message = str(detail.get("message") or detail.get("detail") or detail.get("error") or "").strip()
+            if message:
+                return message
+            return json.dumps(detail, ensure_ascii=False)
+        if detail is not None:
+            text = str(detail).strip()
+            if text:
+                return text
+        text = str(exc).strip()
+        return text or exc.__class__.__name__
+
+    def _log_stage(
+        self,
+        stage: str,
+        arxiv_id: str,
+        loading_method: str,
+        message: str,
+        **extra: Any,
+    ) -> None:
+        # 阶段日志只记录摘要信息，方便定位卡点，同时避免把论文正文或 chunk 内容打进日志。
+        extra_parts = ", ".join(
+            f"{key}={value}"
+            for key, value in extra.items()
+            if value not in (None, "", [], {})
+        )
+        if extra_parts:
+            logger.info(
+                "QA index stage=%s arxiv_id=%s loading_method=%s %s | %s",
+                stage,
+                arxiv_id,
+                loading_method,
+                message,
+                extra_parts,
+            )
+        else:
+            logger.info(
+                "QA index stage=%s arxiv_id=%s loading_method=%s %s",
+                stage,
+                arxiv_id,
+                loading_method,
+                message,
+            )
+
+    def _tag_exception(
+        self,
+        exc: Exception,
+        *,
+        stage: str,
+        arxiv_id: str,
+        loading_method: str,
+    ) -> str:
+        # 把失败阶段挂到异常对象上，后续 agent 层可以直接把它写回结果结构里。
+        detail = self._exception_detail(exc)
+        setattr(exc, "error_stage", stage)
+        setattr(exc, "error_detail", detail)
+        setattr(exc, "error_arxiv_id", arxiv_id)
+        setattr(exc, "error_loading_method", loading_method)
+        return detail
+
     def load_paper_metadata(self, arxiv_id: str) -> Dict[str, Any]:
         paper = self.db_service.get_paper(arxiv_id)
         if not paper:
+            # 索引链路依赖论文元数据；如果本地库里还没有，就先回源 arXiv 补齐，再继续后续解析。
+            logger.info("Paper metadata missing in database, trying arXiv lookup: %s", arxiv_id)
+            paper = self._fetch_and_store_paper_metadata(arxiv_id)
+        if not paper:
             raise HTTPException(status_code=404, detail="Paper not found in database")
         return paper
+
+    def _fetch_and_store_paper_metadata(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            search_service = ArxivSearchService()
+            search_result = search_service.search(id_list=[arxiv_id], max_results=1)
+            papers = list(search_result.get("papers") or [])
+            paper = papers[0] if papers else None
+            if not isinstance(paper, dict):
+                logger.warning("ArXiv lookup returned no paper metadata: %s", arxiv_id)
+                return None
+
+            normalized_paper = {
+                "arxiv_id": str(paper.get("arxiv_id") or arxiv_id).strip(),
+                "title": str(paper.get("title") or "").strip(),
+                "authors": paper.get("authors") or [],
+                # arXiv API 返回的是 summary，这里写入 abstract 供后续建索引和问答复用。
+                "abstract": str(paper.get("summary") or "").strip(),
+                "categories": paper.get("categories") or [],
+                "published_date": str(paper.get("published") or "").strip(),
+                "url": str(paper.get("abs_url") or f"https://arxiv.org/abs/{arxiv_id}").strip(),
+                "embedding_id": "",
+                "embedding_model": "",
+            }
+            if not normalized_paper["title"] or not normalized_paper["abstract"]:
+                logger.warning(
+                    "ArXiv lookup returned incomplete metadata for %s: title=%s abstract=%s",
+                    arxiv_id,
+                    bool(normalized_paper["title"]),
+                    bool(normalized_paper["abstract"]),
+                )
+                return None
+
+            if not self.db_service.add_paper(normalized_paper):
+                logger.error("Failed to persist arXiv metadata into database: %s", arxiv_id)
+                return None
+
+            logger.info("ArXiv metadata fetched and stored for: %s", arxiv_id)
+            return self.db_service.get_paper(arxiv_id) or normalized_paper
+        except Exception as exc:
+            logger.exception("Failed to fetch arXiv metadata for %s: %s", arxiv_id, exc)
+            return None
 
     def download_pdf(self, arxiv_id: str) -> str:
         if self.arxiv_service_factory is None:
@@ -202,15 +312,55 @@ class PaperQAIndexBuilder:
 
     def build_qa_index(self, arxiv_id: str, loading_method: str = "docling") -> Dict[str, Any]:
         logger.info("Creating QA index for paper: %s", arxiv_id)
+        requested_loading_method = str(loading_method or "docling").strip().lower()
+        current_stage = "validate_loading_method"
         try:
-            loading_method = self.validate_loading_method(loading_method)
-            self.mark_index_processing(arxiv_id)
+            loading_method = self.validate_loading_method(requested_loading_method)
+            self._log_stage("validate_loading_method", arxiv_id, loading_method, "loading method validated")
 
-            self.load_paper_metadata(arxiv_id)
+            current_stage = "mark_index_processing"
+            self.mark_index_processing(arxiv_id)
+            self._log_stage("mark_index_processing", arxiv_id, loading_method, "paper QA index marked as processing")
+
+            current_stage = "load_paper_metadata"
+            paper = self.load_paper_metadata(arxiv_id)
+            self._log_stage(
+                "load_paper_metadata",
+                arxiv_id,
+                loading_method,
+                "paper metadata loaded",
+                title=paper.get("title", ""),
+                has_abstract=bool(paper.get("abstract")),
+                has_url=bool(paper.get("url")),
+            )
+
+            current_stage = "download_pdf"
             pdf_path = self.download_pdf(arxiv_id)
+            self._log_stage("download_pdf", arxiv_id, loading_method, "pdf downloaded", pdf_path=pdf_path)
+
+            current_stage = "load_pdf_document"
             loading_service, document, page_map = self.load_pdf_document(pdf_path, loading_method)
+            self._log_stage(
+                "load_pdf_document",
+                arxiv_id,
+                loading_method,
+                "pdf content loaded",
+                page_count=len(page_map),
+            )
+
+            current_stage = "chunk_document"
             chunked_data, chunking_strategy = self.chunk_document(arxiv_id, loading_method, document, page_map)
             chunks = chunked_data["chunks"]
+            self._log_stage(
+                "chunk_document",
+                arxiv_id,
+                loading_method,
+                "document chunked",
+                chunk_count=len(chunks),
+                chunking_strategy=chunking_strategy,
+            )
+
+            current_stage = "save_chunk_file"
             chunk_file = self.save_chunk_file(
                 loading_service=loading_service,
                 arxiv_id=arxiv_id,
@@ -220,19 +370,55 @@ class PaperQAIndexBuilder:
                 document=document,
                 chunking_strategy=chunking_strategy,
             )
+            self._log_stage("save_chunk_file", arxiv_id, loading_method, "chunk file saved", chunk_file=chunk_file)
 
+            current_stage = "compress_chunks_for_rerank"
             chunks = self.compress_chunks_for_rerank(chunks)
+            self._log_stage("compress_chunks_for_rerank", arxiv_id, loading_method, "chunk text compressed", chunk_count=len(chunks))
+
+            current_stage = "create_chunk_embeddings"
             embeddings, embedding_config = self.create_chunk_embeddings(arxiv_id, chunks)
+            self._log_stage(
+                "create_chunk_embeddings",
+                arxiv_id,
+                loading_method,
+                "embeddings created",
+                embedding_provider=embedding_config.provider,
+                embedding_model=embedding_config.model_name,
+                embedding_count=len(embeddings),
+            )
+
+            current_stage = "save_embeddings"
             embedding_file = self.save_embeddings(arxiv_id, embeddings)
+            self._log_stage("save_embeddings", arxiv_id, loading_method, "embedding file saved", embedding_file=embedding_file)
+
+            current_stage = "index_embeddings_to_vector_store"
             index_result = self.index_embeddings_to_vector_store(embedding_file)
             collection_name = index_result.get("collection_name", "")
+            self._log_stage(
+                "index_embeddings_to_vector_store",
+                arxiv_id,
+                loading_method,
+                "embeddings indexed to vector store",
+                collection_name=collection_name,
+            )
 
+            current_stage = "mark_index_success"
             self.mark_index_success(
                 arxiv_id,
                 collection_name=collection_name,
                 chunk_count=len(chunks),
                 embedding_model=embedding_config.model_name,
                 pdf_path=pdf_path,
+            )
+            self._log_stage(
+                "mark_index_success",
+                arxiv_id,
+                loading_method,
+                "paper QA index marked as indexed",
+                collection_name=collection_name,
+                chunk_count=len(chunks),
+                embedding_model=embedding_config.model_name,
             )
 
             return {
@@ -246,9 +432,37 @@ class PaperQAIndexBuilder:
                 "embedding_model": embedding_config.model_name,
                 "chunk_file": chunk_file,
             }
-        except HTTPException:
+        except HTTPException as exc:
+            detail = self._tag_exception(
+                exc,
+                stage=current_stage,
+                arxiv_id=arxiv_id,
+                loading_method=requested_loading_method,
+            )
+            logger.exception(
+                "QA index build failed at stage=%s arxiv_id=%s loading_method=%s error_type=%s detail=%s",
+                current_stage,
+                arxiv_id,
+                requested_loading_method,
+                type(exc).__name__,
+                detail,
+            )
             self.mark_index_failed(arxiv_id)
             raise
-        except Exception:
+        except Exception as exc:
+            detail = self._tag_exception(
+                exc,
+                stage=current_stage,
+                arxiv_id=arxiv_id,
+                loading_method=requested_loading_method,
+            )
+            logger.exception(
+                "QA index build failed at stage=%s arxiv_id=%s loading_method=%s error_type=%s detail=%s",
+                current_stage,
+                arxiv_id,
+                requested_loading_method,
+                type(exc).__name__,
+                detail,
+            )
             self.mark_index_failed(arxiv_id)
             raise

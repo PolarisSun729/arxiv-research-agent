@@ -268,6 +268,8 @@ export function useAgentSearchChat() {
   const latestResponse = ref<ArxivSearchResponse | null>(null)
   const lastSearchPapers = ref<AgentPaper[]>([])
   const pendingAction = ref<Record<string, any> | null>(null)
+  const selectedPaper = ref<AgentPaper | null>(null)
+  const paperQaResult = ref<Record<string, any> | null>(null)
 
   function setInputMessage(value: string) {
     inputMessage.value = value
@@ -278,13 +280,41 @@ export function useAgentSearchChat() {
     latestResponse.value = null
     lastSearchPapers.value = []
     pendingAction.value = null
+    selectedPaper.value = null
+    paperQaResult.value = null
     inputMessage.value = ''
   }
 
   function rememberSearchPapers(response: ArxivSearchResponse | null | undefined) {
     if (response?.intent === 'arxiv_search' && Array.isArray(response.papers) && response.papers.length > 0) {
       lastSearchPapers.value = response.papers.map(item => ({ ...item }))
+      selectedPaper.value = response.papers[0] ? { ...response.papers[0] } : null
     }
+  }
+
+  function rememberSelectedPaper(response: ArxivSearchResponse | null | undefined) {
+    const qaArxivId = response?.paper_qa_result?.arxiv_id
+    const qaTitle = response?.paper_qa_result?.title
+
+    if (qaArxivId || qaTitle) {
+      const fromSearch = lastSearchPapers.value.find(item => {
+        const itemId = item.arxiv_id || item.arxivId || item.id
+        return qaArxivId && itemId === qaArxivId
+      })
+      if (fromSearch) {
+        selectedPaper.value = { ...fromSearch }
+        return
+      }
+      selectedPaper.value = {
+        ...(selectedPaper.value || {}),
+        ...(qaArxivId ? { arxiv_id: qaArxivId } : {}),
+        ...(qaTitle ? { title: qaTitle } : {})
+      }
+    }
+  }
+
+  function rememberPaperQaResult(response: ArxivSearchResponse | null | undefined) {
+    paperQaResult.value = response?.paper_qa_result ? { ...response.paper_qa_result } : null
   }
 
   function rememberPendingAction(response: ArxivSearchResponse | null | undefined) {
@@ -347,11 +377,26 @@ export function useAgentSearchChat() {
       selected_paper?: AgentPaper | null
       last_papers?: AgentPaper[]
       pending_action?: Record<string, any> | null
+      paper_qa_result?: Record<string, any> | null
+      arxiv_id?: string | null
       source?: 'button' | 'chat' | 'detail_page'
-    } = lastSearchPapers.value.length
+    } = lastSearchPapers.value.length || selectedPaper.value || paperQaResult.value
       ? {
-          last_papers: lastSearchPapers.value.map(item => ({ ...item })),
-          selected_paper: lastSearchPapers.value[0] ? { ...lastSearchPapers.value[0] } : null,
+          ...(lastSearchPapers.value.length
+            ? { last_papers: lastSearchPapers.value.map(item => ({ ...item })) }
+            : {}),
+          selected_paper: selectedPaper.value
+            ? { ...selectedPaper.value }
+            : lastSearchPapers.value[0]
+              ? { ...lastSearchPapers.value[0] }
+              : null,
+          ...(paperQaResult.value ? { paper_qa_result: { ...paperQaResult.value } } : {}),
+          arxiv_id:
+            selectedPaper.value?.arxiv_id ||
+            selectedPaper.value?.arxivId ||
+            selectedPaper.value?.id ||
+            paperQaResult.value?.arxiv_id ||
+            null,
           source: 'chat'
         }
       : {}
@@ -378,6 +423,8 @@ export function useAgentSearchChat() {
 
       latestResponse.value = response
       rememberSearchPapers(response)
+      rememberSelectedPaper(response)
+      rememberPaperQaResult(response)
       rememberPendingAction(response)
       if (target.response) {
         target.response = {
@@ -397,6 +444,8 @@ export function useAgentSearchChat() {
         })
         latestResponse.value = fallbackResponse
         rememberSearchPapers(fallbackResponse)
+        rememberSelectedPaper(fallbackResponse)
+        rememberPaperQaResult(fallbackResponse)
         rememberPendingAction(fallbackResponse)
         setAssistantResponse(target, fallbackResponse)
       } catch (fallbackError) {
@@ -432,6 +481,8 @@ export function useAgentSearchChat() {
     latestResponse,
     lastSearchPapers,
     pendingAction,
+    selectedPaper,
+    paperQaResult,
     setInputMessage,
     submitMessage,
     clearConversation
