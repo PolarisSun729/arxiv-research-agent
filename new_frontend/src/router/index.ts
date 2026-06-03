@@ -34,6 +34,11 @@ const router = createRouter({
       component: () => import('@/views/AgentSearch.vue')
     },
     {
+      path: '/agent-graph',
+      name: 'AgentGraph',
+      component: () => import('@/views/AgentGraph.vue')
+    },
+    {
       path: '/labeled',
       name: 'LabeledPapers',
       component: () => import('@/views/LabeledPapers.vue')

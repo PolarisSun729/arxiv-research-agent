@@ -1,5 +1,5 @@
 import request from './request'
-import type { AgentStreamEvent, ArxivSearchRequest, ArxivSearchResponse } from '@/types/agent'
+import type { AgentGraphResponse, AgentStreamEvent, ArxivSearchRequest, ArxivSearchResponse } from '@/types/agent'
 
 export interface AgentStreamHandlers {
   onEvent?: (event: AgentStreamEvent) => void
@@ -37,6 +37,10 @@ function ensureErrorMessage(error: unknown, fallback: string) {
 
 export async function runAgentChat(payload: ArxivSearchRequest): Promise<ArxivSearchResponse> {
   return request.post('/agent/chat', payload)
+}
+
+export async function fetchAgentGraph(): Promise<AgentGraphResponse> {
+  return request.get('/agent/graph')
 }
 
 export async function streamAgentChat(

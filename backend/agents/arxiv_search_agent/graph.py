@@ -22,6 +22,20 @@ from .state import AgentState
 
 logger = logging.getLogger(__name__)
 
+_ARXIV_GRAPH_NODE_NAMES = (
+    "parse_search_request",
+    "build_search_tool_args",
+    "invoke_search_tool",
+    "check_search_result",
+    "relax_search_for_retry",
+    "personalized_rank_and_annotate_papers",
+    "apply_preference_action",
+    "classify_pending_action_confirmation",
+    "handle_pending_action_confirmation",
+    "handle_paper_reading_request",
+    "synthesize_response",
+)
+
 
 def route_after_parse(state: Any) -> str:
     current_state = _coerce_state(state)
@@ -161,6 +175,35 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
     return graph.compile()
 
 
+def export_arxiv_search_graph_mermaid(generation_service: Optional[Any] = None) -> dict[str, Any]:
+    """导出 arXiv Agent 的图结构，方便在调试页或前端直接渲染。
+
+    优先使用 LangGraph 自带的 `get_graph().draw_mermaid()`，这样导出的内容
+    会严格跟随运行时图结构；如果当前环境缺少对应绘图能力，就回退到手工
+    生成的 Mermaid，保证调试入口仍然可用。
+    """
+    compiled_graph = build_arxiv_search_graph(generation_service=generation_service)
+    drawable_graph = None
+    mermaid = ""
+    render_source = "langgraph"
+
+    try:
+        drawable_graph = compiled_graph.get_graph()
+        mermaid = drawable_graph.draw_mermaid()
+    except Exception as exc:  # pragma: no cover - 依赖版本差异时走兜底
+        render_source = "fallback"
+        logger.warning("arxiv_agent graph mermaid export fallback: error=%s", exc)
+        mermaid = _build_fallback_mermaid()
+
+    return {
+        "graph_name": "arxiv_search_agent",
+        "render_source": render_source,
+        "node_names": list(_ARXIV_GRAPH_NODE_NAMES),
+        "mermaid": mermaid,
+        "supports_png": bool(drawable_graph and hasattr(drawable_graph, "draw_mermaid_png")),
+    }
+
+
 def _coerce_state(state: Any) -> AgentState:
     if isinstance(state, AgentState):
         return state.model_copy(deep=True)
@@ -169,4 +212,40 @@ def _coerce_state(state: Any) -> AgentState:
     return AgentState.model_validate(state)
 
 
-__all__ = ["build_arxiv_search_graph", "route_after_parse", "START", "END"]
+def _build_fallback_mermaid() -> str:
+    """在绘图接口不可用时，返回一份静态 Mermaid，避免调试入口失效。"""
+    return "\n".join(
+        [
+            "graph TD;",
+            "    START([START]) --> parse_search_request;",
+            "    parse_search_request --> build_search_tool_args;",
+            "    parse_search_request --> handle_paper_reading_request;",
+            "    parse_search_request --> apply_preference_action;",
+            "    parse_search_request --> classify_pending_action_confirmation;",
+            "    parse_search_request -->|recommendation| synthesize_response;",
+            "    parse_search_request -->|reading_list_action| synthesize_response;",
+            "    parse_search_request -->|unclear| synthesize_response;",
+            "    parse_search_request -->|unsupported| synthesize_response;",
+            "    build_search_tool_args --> invoke_search_tool;",
+            "    invoke_search_tool --> check_search_result;",
+            "    check_search_result --> relax_search_for_retry;",
+            "    check_search_result --> personalized_rank_and_annotate_papers;",
+            "    relax_search_for_retry --> build_search_tool_args;",
+            "    personalized_rank_and_annotate_papers --> synthesize_response;",
+            "    apply_preference_action --> synthesize_response;",
+            "    classify_pending_action_confirmation --> handle_pending_action_confirmation;",
+            "    classify_pending_action_confirmation --> synthesize_response;",
+            "    handle_pending_action_confirmation --> synthesize_response;",
+            "    handle_paper_reading_request --> synthesize_response;",
+            "    synthesize_response --> END([END]);",
+        ]
+    )
+
+
+__all__ = [
+    "build_arxiv_search_graph",
+    "export_arxiv_search_graph_mermaid",
+    "route_after_parse",
+    "START",
+    "END",
+]

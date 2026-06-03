@@ -10,7 +10,16 @@ from .nodes import (
     synthesize_response,
 )
 from .graph import build_arxiv_search_graph, route_after_parse
-from .schemas import AgentStep, AgentStreamEvent, AgentToolCall, ArxivSearchRequest, ArxivSearchResponse, ArxivSearchSpec
+from .graph import export_arxiv_search_graph_mermaid
+from .schemas import (
+    AgentStep,
+    AgentStreamEvent,
+    AgentToolCall,
+    ArxivSearchGraphResponse,
+    ArxivSearchRequest,
+    ArxivSearchResponse,
+    ArxivSearchSpec,
+)
 from .service import run_arxiv_search_agent, stream_arxiv_search_agent
 from .state import AgentState
 
@@ -19,6 +28,7 @@ __all__ = [
     "AgentStep",
     "AgentStreamEvent",
     "AgentToolCall",
+    "ArxivSearchGraphResponse",
     "ArxivSearchRequest",
     "ArxivSearchResponse",
     "ArxivSearchSpec",
@@ -29,6 +39,7 @@ __all__ = [
     "invoke_search_tool",
     "parse_search_request",
     "personalized_rank_and_annotate_papers",
+    "export_arxiv_search_graph_mermaid",
     "route_after_parse",
     "run_arxiv_search_agent",
     "stream_arxiv_search_agent",

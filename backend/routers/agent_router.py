@@ -5,7 +5,14 @@ import logging
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
-from agents.arxiv_search_agent import ArxivSearchRequest, ArxivSearchResponse, run_arxiv_search_agent, stream_arxiv_search_agent
+from agents.arxiv_search_agent import (
+    ArxivSearchGraphResponse,
+    ArxivSearchRequest,
+    ArxivSearchResponse,
+    export_arxiv_search_graph_mermaid,
+    run_arxiv_search_agent,
+    stream_arxiv_search_agent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,3 +29,9 @@ async def agent_chat_endpoint(request: ArxivSearchRequest):
 async def agent_chat_stream_endpoint(request: ArxivSearchRequest) -> StreamingResponse:
     logger.info("Running agent chat stream for user_id=%s session_id=%s", request.user_id, request.session_id)
     return stream_arxiv_search_agent(request)
+
+
+@router.get("/graph", response_model=ArxivSearchGraphResponse)
+async def agent_graph_endpoint():
+    """返回 arXiv Agent 的静态图结构，方便调试页或前端直接渲染。"""
+    return export_arxiv_search_graph_mermaid()

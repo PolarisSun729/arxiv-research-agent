@@ -283,3 +283,13 @@ class ArxivSearchResponse(BaseModel):
     next_actions: List[str] = Field(default_factory=list)
     steps: List[AgentStep] = Field(default_factory=list)
     debug: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ArxivSearchGraphResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    graph_name: str
+    render_source: str
+    node_names: List[str] = Field(default_factory=list)
+    mermaid: str
+    supports_png: bool = False
