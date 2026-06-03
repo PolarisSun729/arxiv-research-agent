@@ -8,15 +8,15 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 from uuid import uuid4
 
+_BACKEND_DIR = str(Path(__file__).resolve().parents[2])
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
 from services.storage.database_service import DatabaseService
 from utils.config import get_memory_runtime_config
-
-_BACKEND_DIR = str(Path(__file__).resolve().parents[2])
-if _BACKEND_DIR not in sys.path:
-    sys.path.insert(0, _BACKEND_DIR)
 
 try:  # pragma: no cover - optional runtime dependency for LLM parsing
     from dependencies import get_generation_service as _get_generation_service

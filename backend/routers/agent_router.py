@@ -5,14 +5,24 @@ import logging
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
-from agents.arxiv_search_agent import (
-    ArxivSearchGraphResponse,
-    ArxivSearchRequest,
-    ArxivSearchResponse,
-    export_arxiv_search_graph_mermaid,
-    run_arxiv_search_agent,
-    stream_arxiv_search_agent,
-)
+try:
+    from agents.arxiv_search_agent import (
+        ArxivSearchGraphResponse,
+        ArxivSearchRequest,
+        ArxivSearchResponse,
+        export_arxiv_search_graph_mermaid,
+        run_arxiv_search_agent,
+        stream_arxiv_search_agent,
+    )
+except ModuleNotFoundError:  # pragma: no cover - package root differs by startup cwd
+    from backend.agents.arxiv_search_agent import (
+        ArxivSearchGraphResponse,
+        ArxivSearchRequest,
+        ArxivSearchResponse,
+        export_arxiv_search_graph_mermaid,
+        run_arxiv_search_agent,
+        stream_arxiv_search_agent,
+    )
 
 logger = logging.getLogger(__name__)
 

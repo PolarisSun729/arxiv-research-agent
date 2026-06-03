@@ -13,12 +13,17 @@ from __future__ import annotations
 # 而不必分别记住每个对象具体定义在哪个文件中。
 
 from .nodes import (
+    SEARCH_TOOL_NAME,
     apply_preference_action,
     build_search_tool_args,
     check_search_result,
+    classify_pending_action_confirmation,
+    handle_paper_reading_request,
+    handle_pending_action_confirmation,
     invoke_search_tool,
     parse_search_request,
     personalized_rank_and_annotate_papers,
+    relax_search_for_retry,
     synthesize_response,
 )
 from .graph import build_arxiv_search_graph, route_after_parse
@@ -49,13 +54,18 @@ __all__ = [
     "ArxivSearchRequest",
     "ArxivSearchResponse",
     "ArxivSearchSpec",
+    "SEARCH_TOOL_NAME",
     "build_arxiv_search_graph",
     "apply_preference_action",
     "build_search_tool_args",
     "check_search_result",
+    "classify_pending_action_confirmation",
+    "handle_paper_reading_request",
+    "handle_pending_action_confirmation",
     "invoke_search_tool",
     "parse_search_request",
     "personalized_rank_and_annotate_papers",
+    "relax_search_for_retry",
     "export_arxiv_search_graph_mermaid",
     "route_after_parse",
     "run_arxiv_search_agent",
