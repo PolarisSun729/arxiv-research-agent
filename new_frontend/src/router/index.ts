@@ -24,6 +24,11 @@ const router = createRouter({
       component: () => import('@/views/Recommendations.vue')
     },
     {
+      path: '/profile',
+      name: 'ResearchProfile',
+      component: () => import('@/views/ResearchProfile.vue')
+    },
+    {
       path: '/agent-search',
       name: 'AgentSearch',
       component: () => import('@/views/AgentSearch.vue')

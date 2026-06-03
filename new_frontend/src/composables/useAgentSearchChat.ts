@@ -3,6 +3,7 @@ import { ElMessage } from 'element-plus'
 import { runAgentChat, streamAgentChat } from '@/api/agent'
 import type { AgentPaper, AgentStep, AgentStreamEvent, AgentToolCall, ArxivSearchResponse } from '@/types/agent'
 import type { AgentChatMessage } from '@/types/agentChat'
+import { usePaperStore } from '@/stores/paperStore'
 
 function createMessageId(prefix: 'user' | 'assistant') {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
@@ -262,6 +263,7 @@ function buildFallbackErrorResponse(message: string, detail: string) {
 }
 
 export function useAgentSearchChat() {
+  const paperStore = usePaperStore()
   const inputMessage = ref('')
   const loading = ref(false)
   const messages: Ref<AgentChatMessage<ArxivSearchResponse>[]> = ref([])
@@ -378,9 +380,11 @@ export function useAgentSearchChat() {
       last_papers?: AgentPaper[]
       pending_action?: Record<string, any> | null
       paper_qa_result?: Record<string, any> | null
+      research_profile?: typeof paperStore.researchProfile.value | null
       arxiv_id?: string | null
       source?: 'button' | 'chat' | 'detail_page'
     } = lastSearchPapers.value.length || selectedPaper.value || paperQaResult.value
+      || paperStore.researchProfile
       ? {
           ...(lastSearchPapers.value.length
             ? { last_papers: lastSearchPapers.value.map(item => ({ ...item })) }
@@ -391,6 +395,7 @@ export function useAgentSearchChat() {
               ? { ...lastSearchPapers.value[0] }
               : null,
           ...(paperQaResult.value ? { paper_qa_result: { ...paperQaResult.value } } : {}),
+          ...(paperStore.researchProfile ? { research_profile: { ...paperStore.researchProfile } } : {}),
           arxiv_id:
             selectedPaper.value?.arxiv_id ||
             selectedPaper.value?.arxivId ||

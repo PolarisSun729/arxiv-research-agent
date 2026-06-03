@@ -473,6 +473,62 @@ class VectorStoreService:
                 "Milvus varchar validation failed: " + "; ".join(violations[:5])
             )
 
+    def _truncate_utf8_text(self, value: str, max_bytes: Optional[int]) -> str:
+        if not isinstance(value, str) or not max_bytes or max_bytes <= 0:
+            return value
+
+        encoded = value.encode("utf-8")
+        if len(encoded) <= max_bytes:
+            return value
+
+        truncated = encoded[:max_bytes]
+        while truncated:
+            try:
+                return truncated.decode("utf-8")
+            except UnicodeDecodeError:
+                truncated = truncated[:-1]
+        return ""
+
+    def _truncate_entities_to_varchar_limits(self, entities: List[Dict[str, Any]], fields: List[Any]) -> List[Dict[str, Any]]:
+        varchar_type = getattr(DataType.VARCHAR, "value", DataType.VARCHAR)
+        varchar_limits = {
+            (field.get("name") if isinstance(field, dict) else getattr(field, "name", "")): (
+                (field.get("params", {}) or {}).get("max_length")
+                if isinstance(field, dict)
+                else getattr(field, "max_length", None)
+            )
+            for field in fields
+            if (
+                (field.get("type") if isinstance(field, dict) else getattr(field, "dtype", None)) == varchar_type
+            )
+        }
+
+        normalized_entities: List[Dict[str, Any]] = []
+        for entity in entities:
+            normalized_entity = dict(entity)
+            chunk_ref = entity.get(
+                "parent_chunk_id",
+                entity.get("original_chunk_id", entity.get("chunk_id", entity.get("chunk_index", 0))),
+            )
+            for field_name, max_length in varchar_limits.items():
+                value = normalized_entity.get(field_name)
+                if not max_length or not isinstance(value, str):
+                    continue
+
+                truncated_value = self._truncate_utf8_text(value, int(max_length))
+                if truncated_value != value:
+                    logger.warning(
+                        "Truncated Milvus varchar field '%s' for chunk %s from %s to %s bytes",
+                        field_name,
+                        chunk_ref,
+                        len(value.encode("utf-8")),
+                        len(truncated_value.encode("utf-8")),
+                    )
+                    normalized_entity[field_name] = truncated_value
+            normalized_entities.append(normalized_entity)
+
+        return normalized_entities
+
     def list_collections(self, provider: str) -> List[str]:
         """
         列出指定提供商的所有 collection。
@@ -602,8 +658,9 @@ class VectorStoreService:
                 entities.append(entity)
 
             collection_desc = client.describe_collection(collection_name=resolved_name)
-            self._validate_varchar_lengths(entities, collection_desc.get("fields", []))
-            insert_result = client.insert(collection_name=resolved_name, data=entities)
+            normalized_entities = self._truncate_entities_to_varchar_limits(entities, collection_desc.get("fields", []))
+            self._validate_varchar_lengths(normalized_entities, collection_desc.get("fields", []))
+            insert_result = client.insert(collection_name=resolved_name, data=normalized_entities)
             client.flush(collection_name=resolved_name)
             client.load_collection(collection_name=resolved_name)
 

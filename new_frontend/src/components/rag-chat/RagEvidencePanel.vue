@@ -39,6 +39,17 @@ function formatRouteScores(routeScores?: Record<string, number>) {
   return entries.map(([route, score]) => `${route} ${formatDebugNumber(score)}`).join(' · ')
 }
 
+function formatYesNo(value?: boolean | null) {
+  if (value === true) return '是'
+  if (value === false) return '否'
+  return '-'
+}
+
+function formatAnyList(values?: Array<string | number>) {
+  if (!values || values.length === 0) return '无'
+  return values.map(value => String(value)).join(' | ')
+}
+
 function describeChunk(chunk: RetrievalDebugChunk, scoreKey: 'score' | 'route_score' = 'score') {
   const score = chunk[scoreKey]
   return [
@@ -100,6 +111,56 @@ const hasEvidence = computed(() => Boolean(props.question || props.sources.lengt
         <div class="rag-evidence-panel__meta-row">
           <span>最终参与检索</span>
           <strong>{{ formatQueryList(retrievalDebug.query_rewrite.selected_queries) }}</strong>
+        </div>
+      </section>
+
+      <section v-if="retrievalDebug?.memory_modules || retrievalDebug?.question_contextualization || retrievalDebug?.memory_context" class="rag-evidence-panel__section">
+        <div class="rag-evidence-panel__section-title">记忆模块状态</div>
+
+        <div v-if="retrievalDebug?.contextualized_question" class="rag-evidence-panel__meta-row">
+          <span>Contextualized Question</span>
+          <strong>{{ retrievalDebug.contextualized_question }}</strong>
+        </div>
+        <div v-if="retrievalDebug?.question_contextualization?.is_follow_up !== undefined" class="rag-evidence-panel__meta-row">
+          <span>识别为追问</span>
+          <strong>{{ formatYesNo(retrievalDebug.question_contextualization?.is_follow_up) }}</strong>
+        </div>
+
+        <div v-if="retrievalDebug?.memory_modules?.short_term_memory" class="rag-evidence-panel__memory-card">
+          <div class="rag-evidence-panel__memory-title">short_term_memory</div>
+          <div class="rag-evidence-panel__meta-row"><span>enabled</span><strong>{{ formatYesNo(retrievalDebug.memory_modules.short_term_memory.enabled) }}</strong></div>
+          <div class="rag-evidence-panel__meta-row"><span>applied</span><strong>{{ formatYesNo(retrievalDebug.memory_modules.short_term_memory.applied) }}</strong></div>
+          <div class="rag-evidence-panel__meta-row"><span>turns</span><strong>{{ retrievalDebug.memory_modules.short_term_memory.used_turn_count ?? 0 }} / {{ retrievalDebug.memory_modules.short_term_memory.provided_turn_count ?? 0 }}</strong></div>
+          <div v-if="retrievalDebug.memory_modules.short_term_memory.reason" class="rag-evidence-panel__meta-row"><span>reason</span><strong>{{ retrievalDebug.memory_modules.short_term_memory.reason }}</strong></div>
+          <div v-if="retrievalDebug.memory_modules.short_term_memory.fallback_reason" class="rag-evidence-panel__meta-row"><span>fallback</span><strong>{{ retrievalDebug.memory_modules.short_term_memory.fallback_reason }}</strong></div>
+        </div>
+
+        <div v-if="retrievalDebug?.memory_modules?.session" class="rag-evidence-panel__memory-card">
+          <div class="rag-evidence-panel__memory-title">session</div>
+          <div class="rag-evidence-panel__meta-row"><span>enabled</span><strong>{{ formatYesNo(retrievalDebug.memory_modules.session.enabled) }}</strong></div>
+          <div class="rag-evidence-panel__meta-row"><span>applied</span><strong>{{ formatYesNo(retrievalDebug.memory_modules.session.applied) }}</strong></div>
+          <div class="rag-evidence-panel__meta-row"><span>session_id</span><strong>{{ retrievalDebug.memory_modules.session.session_id || '-' }}</strong></div>
+          <div v-if="retrievalDebug.memory_modules.session.reason" class="rag-evidence-panel__meta-row"><span>reason</span><strong>{{ retrievalDebug.memory_modules.session.reason }}</strong></div>
+          <div v-if="retrievalDebug.memory_modules.session.fallback_reason" class="rag-evidence-panel__meta-row"><span>fallback</span><strong>{{ retrievalDebug.memory_modules.session.fallback_reason }}</strong></div>
+        </div>
+
+        <div v-if="retrievalDebug?.memory_modules?.memory_retrieval || retrievalDebug?.memory_context" class="rag-evidence-panel__memory-card">
+          <div class="rag-evidence-panel__memory-title">memory_retrieval</div>
+          <div class="rag-evidence-panel__meta-row"><span>enabled</span><strong>{{ formatYesNo(retrievalDebug.memory_modules?.memory_retrieval?.enabled ?? retrievalDebug.memory_context?.enabled) }}</strong></div>
+          <div class="rag-evidence-panel__meta-row"><span>applied</span><strong>{{ formatYesNo(retrievalDebug.memory_modules?.memory_retrieval?.applied) }}</strong></div>
+          <div v-if="retrievalDebug.memory_context?.referenced_turn_ids?.length" class="rag-evidence-panel__meta-row"><span>turn ids</span><strong>{{ formatAnyList(retrievalDebug.memory_context.referenced_turn_ids) }}</strong></div>
+          <div v-if="retrievalDebug.memory_context?.referenced_source_ids?.length" class="rag-evidence-panel__meta-row"><span>source ids</span><strong>{{ formatAnyList(retrievalDebug.memory_context.referenced_source_ids) }}</strong></div>
+          <div v-if="retrievalDebug.memory_context?.query_keywords?.length" class="rag-evidence-panel__meta-row"><span>keywords</span><strong>{{ formatAnyList(retrievalDebug.memory_context.query_keywords) }}</strong></div>
+          <div v-if="retrievalDebug.memory_modules?.memory_retrieval?.reason || retrievalDebug.memory_context?.reason" class="rag-evidence-panel__meta-row"><span>reason</span><strong>{{ retrievalDebug.memory_modules?.memory_retrieval?.reason || retrievalDebug.memory_context?.reason }}</strong></div>
+          <div v-if="retrievalDebug.memory_modules?.memory_retrieval?.fallback_reason || retrievalDebug.memory_context?.fallback_reason" class="rag-evidence-panel__meta-row"><span>fallback</span><strong>{{ retrievalDebug.memory_modules?.memory_retrieval?.fallback_reason || retrievalDebug.memory_context?.fallback_reason }}</strong></div>
+        </div>
+
+        <div v-if="retrievalDebug?.memory_modules?.user_profile" class="rag-evidence-panel__memory-card">
+          <div class="rag-evidence-panel__memory-title">user_profile</div>
+          <div class="rag-evidence-panel__meta-row"><span>enabled</span><strong>{{ formatYesNo(retrievalDebug.memory_modules.user_profile.enabled) }}</strong></div>
+          <div class="rag-evidence-panel__meta-row"><span>applied</span><strong>{{ formatYesNo(retrievalDebug.memory_modules.user_profile.applied) }}</strong></div>
+          <div v-if="retrievalDebug.memory_modules.user_profile.reason" class="rag-evidence-panel__meta-row"><span>reason</span><strong>{{ retrievalDebug.memory_modules.user_profile.reason }}</strong></div>
+          <div v-if="retrievalDebug.memory_modules.user_profile.fallback_reason" class="rag-evidence-panel__meta-row"><span>fallback</span><strong>{{ retrievalDebug.memory_modules.user_profile.fallback_reason }}</strong></div>
         </div>
       </section>
 

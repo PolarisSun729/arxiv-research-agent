@@ -51,6 +51,11 @@ function handleMenuClick(path: string) {
           <span>推荐论文</span>
         </el-menu-item>
 
+        <el-menu-item index="/profile" class="menu-item-profile" @click="handleMenuClick('/profile')">
+          <span class="menu-icon-badge badge-profile">🧭</span>
+          <span>研究画像</span>
+        </el-menu-item>
+
         <el-menu-item index="/labeled" class="menu-item-folder" @click="handleMenuClick('/labeled')">
           <span class="menu-icon-badge badge-folder">📁</span>
           <span>已标记论文</span>
@@ -202,6 +207,10 @@ function handleMenuClick(path: string) {
 
 .badge-star {
   background: linear-gradient(135deg, #ffd976 0%, #ffb84d 100%);
+}
+
+.badge-profile {
+  background: linear-gradient(135deg, #7dd3fc 0%, #38bdf8 100%);
 }
 
 .badge-folder {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { watch } from 'vue'
+import { computed, onMounted, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { dislikePaper, likePaper, removePaperPreference } from '@/api/papers'
@@ -7,9 +7,12 @@ import { useAgentSearchChat } from '@/composables/useAgentSearchChat'
 import AgentResponsePanel from '@/components/agent-search/AgentResponsePanel.vue'
 import RagChatPanel from '@/components/rag-chat/RagChatPanel.vue'
 import type { Paper } from '@/types/paper'
+import { usePaperStore } from '@/stores/paperStore'
 
 const router = useRouter()
+const store = usePaperStore()
 const agentPaperLabels = new Map<string, 'liked' | 'disliked'>()
+const profileTopicPreview = computed(() => (store.researchProfile?.positive_topics || []).slice(0, 4))
 
 const {
   inputMessage,
@@ -27,6 +30,10 @@ const quickPrompts = [
   '检索和 agent search 相关的 arXiv 论文',
   '找一些关于多模态检索增强生成的论文'
 ]
+
+onMounted(() => {
+  store.fetchResearchProfile()
+})
 
 function handlePromptSelect(prompt: string) {
   setInputMessage(prompt)
@@ -46,6 +53,10 @@ function handleCancelPendingAction() {
 
 function handleViewDetail(id: string) {
   router.push(`/paper/${id}`)
+}
+
+function handleGoProfile() {
+  router.push('/profile')
 }
 
 async function handleLabel(paper: Paper, label: 'liked' | 'disliked' | null) {
@@ -134,6 +145,21 @@ watch(latestResponse, () => {
           清空对话
         </el-button>
       </div>
+    </section>
+
+    <section v-if="store.researchProfile" class="profile-banner">
+      <div class="profile-banner__copy">
+        <div class="profile-banner__title">Agent 会轻量参考你的长期研究画像</div>
+        <div class="profile-banner__desc">
+          <template v-if="profileTopicPreview.length">
+            当前重点：{{ profileTopicPreview.join('、') }}
+          </template>
+          <template v-else>
+            你可以补充研究方向、偏好分类和回答风格，帮助 Agent 更好理解模糊请求。
+          </template>
+        </div>
+      </div>
+      <el-button size="small" @click="handleGoProfile">编辑画像</el-button>
     </section>
 
     <section class="conversation-shell">
@@ -237,6 +263,29 @@ watch(latestResponse, () => {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+.profile-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 18px;
+  border-radius: 18px;
+  border: 1px solid rgba(125, 211, 252, 0.26);
+  background: linear-gradient(135deg, rgba(240, 249, 255, 0.96), rgba(248, 250, 252, 0.98));
+}
+
+.profile-banner__title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.profile-banner__desc {
+  margin-top: 4px;
+  color: #475569;
+  line-height: 1.6;
 }
 
 .pending-action-banner {

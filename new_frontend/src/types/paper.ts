@@ -1,3 +1,77 @@
+export type PaperLabel = 'liked' | 'disliked'
+
+export type PaperActionType =
+  | 'like'
+  | 'dislike'
+  | 'favorite'
+  | 'read'
+  | 'later'
+  | 'archived'
+  | 'note_saved'
+  | 'not_interested'
+
+export type UserPaperActionMap = Partial<Record<PaperActionType, string[]>>
+
+export type PaperNoteType =
+  | 'summary'
+  | 'method'
+  | 'experiment'
+  | 'result'
+  | 'limitation'
+  | 'idea'
+  | 'todo'
+  | 'custom'
+
+export interface UserResearchProfile {
+  user_id: string
+  positive_topics: string[]
+  negative_topics: string[]
+  recent_topics: string[]
+  preferred_categories: string[]
+  preferred_answer_style: string
+  common_question_types: string[]
+  representative_papers: string[]
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface UserPaperAction {
+  id?: number
+  user_id: string
+  arxiv_id: string
+  action_type: PaperActionType
+  metadata?: Record<string, any>
+  created_at?: string
+  updated_at?: string
+}
+
+export interface PaperNote {
+  note_id: string
+  user_id: string
+  arxiv_id: string
+  session_id?: string | null
+  source_message_id?: string | null
+  source_turn_id?: string | null
+  title: string
+  content: string
+  note_type: PaperNoteType
+  source_chunk_ids: string[]
+  tags: string[]
+  include_in_profile: boolean
+  created_at?: string | null
+  updated_at?: string | null
+  sources?: Array<{
+    content?: string
+    page_number?: string
+    source?: string
+    section_path?: string
+    parent_chunk_id?: string | number
+    chunk_type?: string
+    asset_summary?: string
+    asset_preview_text?: string
+  }>
+}
+
 export interface Paper {
   id: string
   arxivId: string
@@ -9,7 +83,8 @@ export interface Paper {
   categories: string[]
   pdfUrl: string
   absUrl: string
-  label?: 'liked' | 'disliked' | null
+  label?: PaperLabel | null
+  paperActions?: Partial<Record<PaperActionType, boolean>>
   query_match_score?: number
   personalization_score?: number
   final_score?: number
@@ -65,7 +140,7 @@ export interface RecommendedPaper extends Paper {
 }
 
 export interface LabeledPaper extends Paper {
-  label: 'liked' | 'disliked'
+  label: PaperLabel
   labeledAt: string
 }
 
@@ -114,7 +189,7 @@ export interface ArxivSearchParams {
 }
 
 export interface LabelParams {
-  label: 'liked' | 'disliked'
+  label: PaperLabel
 }
 
 export interface PaginatedResponse<T> {
@@ -177,5 +252,7 @@ export interface RecommendationResult {
   interest_profile_mode?: string
   interest_cluster_count?: number
   recall_mode?: string
+  research_profile?: UserResearchProfile | null
+  paper_actions?: UserPaperActionMap | null
   recommendations: RecommendedPaper[]
 }

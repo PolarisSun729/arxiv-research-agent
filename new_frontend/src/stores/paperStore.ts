@@ -7,7 +7,12 @@ import type {
   ArxivSearchParams,
   InterestVector,
   InterestVectorResult,
-  RecommendationResult
+  RecommendationResult,
+  PaperActionType,
+  PaperNote,
+  PaperNoteType,
+  UserPaperActionMap,
+  UserResearchProfile
 } from '@/types/paper'
 import {
   searchPapers,
@@ -22,7 +27,17 @@ import {
   removePaperPreference,
   generateInterestVector,
   getInterestVector,
-  recommendPapers
+  recommendPapers,
+  getUserResearchProfile,
+  patchUserResearchProfile,
+  getUserPaperActions,
+  recordPaperAction,
+  removePaperAction,
+  listPaperNotes,
+  createPaperNote,
+  updatePaperNote,
+  deletePaperNote,
+  getPaperNotesExportUrl
 } from '@/api/papers'
 
 export const usePaperStore = defineStore('paper', () => {
@@ -43,6 +58,9 @@ export const usePaperStore = defineStore('paper', () => {
   const loading = ref(false)
   const interestVectorGenerating = ref(false)
   const lastInterestVector = ref<InterestVector | null>(null)
+  const researchProfile = ref<UserResearchProfile | null>(null)
+  const paperActionMap = ref<UserPaperActionMap>({})
+  const paperNotes = ref<PaperNote[]>([])
 
   function toStringArray(value: any): string[] {
     if (Array.isArray(value)) {
@@ -95,6 +113,34 @@ export const usePaperStore = defineStore('paper', () => {
     })
   }
 
+  function buildPaperActions(arxivId: string): Partial<Record<PaperActionType, boolean>> {
+    const normalizedId = String(arxivId || '')
+    const result: Partial<Record<PaperActionType, boolean>> = {}
+    Object.entries(paperActionMap.value || {}).forEach(([actionType, ids]) => {
+      if (Array.isArray(ids) && ids.includes(normalizedId)) {
+        result[actionType as PaperActionType] = true
+      }
+    })
+    return result
+  }
+
+  function applyPaperActions(targetPapers: Paper[]) {
+    targetPapers.forEach(paper => {
+      const arxivId = paper.arxivId || paper.id
+      paper.paperActions = buildPaperActions(arxivId)
+    })
+  }
+
+  function syncPaperCollections() {
+    applyPaperActions(papers.value)
+    applyPaperActions(allPapers.value)
+    applyPaperActions(recommendations.value)
+    applyPaperActions(labeledPapers.value)
+    if (currentPaper.value) {
+      currentPaper.value.paperActions = buildPaperActions(currentPaper.value.arxivId || currentPaper.value.id)
+    }
+  }
+
   async function fetchPapers(params: {
     keyword?: string
     category?: string
@@ -116,6 +162,9 @@ export const usePaperStore = defineStore('paper', () => {
     loading.value = true
     try {
       currentPaper.value = await getPaperById(id)
+      if (currentPaper.value) {
+        currentPaper.value.paperActions = buildPaperActions(currentPaper.value.arxivId || currentPaper.value.id)
+      }
       return currentPaper.value
     } finally {
       loading.value = false
@@ -139,6 +188,7 @@ export const usePaperStore = defineStore('paper', () => {
         similarityScore: typeof p.similarity === 'number' ? p.similarity : (p.similarityScore || 0),
         label: p.label || null
       }))
+      applyPaperActions(recommendations.value)
       totalRecommendations.value = result.total
     } finally {
       loading.value = false
@@ -180,6 +230,19 @@ export const usePaperStore = defineStore('paper', () => {
       await dislikePaper(paper)
     }
 
+    if (label === 'liked') {
+      paperActionMap.value.like = Array.from(new Set([...(paperActionMap.value.like || []), paper.arxivId || paper.id]))
+      paperActionMap.value.dislike = (paperActionMap.value.dislike || []).filter(item => item !== (paper.arxivId || paper.id))
+      paperActionMap.value.not_interested = (paperActionMap.value.not_interested || []).filter(item => item !== (paper.arxivId || paper.id))
+    } else if (label === 'disliked') {
+      paperActionMap.value.dislike = Array.from(new Set([...(paperActionMap.value.dislike || []), paper.arxivId || paper.id]))
+      paperActionMap.value.like = (paperActionMap.value.like || []).filter(item => item !== (paper.arxivId || paper.id))
+    } else if (paper.label === 'liked') {
+      paperActionMap.value.like = (paperActionMap.value.like || []).filter(item => item !== (paper.arxivId || paper.id))
+    } else if (paper.label === 'disliked') {
+      paperActionMap.value.dislike = (paperActionMap.value.dislike || []).filter(item => item !== (paper.arxivId || paper.id))
+    }
+
     if (currentPaper.value?.id === id) {
       currentPaper.value.label = label
     }
@@ -195,6 +258,7 @@ export const usePaperStore = defineStore('paper', () => {
     if (allPaperIndex !== -1) {
       allPapers.value[allPaperIndex].label = label
     }
+    syncPaperCollections()
   }
 
   async function fetchStats() {
@@ -212,7 +276,10 @@ export const usePaperStore = defineStore('paper', () => {
       const result = await searchArxiv(params)
       allPapers.value = [...result.items]
       const preferences = await getUserPreferences()
+      paperActionMap.value = preferences.paper_actions || {}
+      researchProfile.value = preferences.research_profile || researchProfile.value
       applyPreferenceLabels(allPapers.value, preferences.liked_papers || [], preferences.disliked_papers || [])
+      applyPaperActions(allPapers.value)
       totalPapers.value = result.total
       const start = (page - 1) * pageSize
       const end = start + pageSize
@@ -251,11 +318,44 @@ export const usePaperStore = defineStore('paper', () => {
 
   const recommendationsGenerating = ref(false)
 
+  async function fetchResearchProfile() {
+    researchProfile.value = await getUserResearchProfile()
+    return researchProfile.value
+  }
+
+  async function saveResearchProfile(profile: Partial<UserResearchProfile>) {
+    researchProfile.value = await patchUserResearchProfile(profile)
+    return researchProfile.value
+  }
+
+  async function fetchPaperActions() {
+    const result = await getUserPaperActions()
+    paperActionMap.value = result.action_map || {}
+    syncPaperCollections()
+    return result
+  }
+
+  async function togglePaperAction(paper: Paper, actionType: PaperActionType, enabled?: boolean) {
+    const arxivId = paper.arxivId || paper.id
+    const exists = (paperActionMap.value[actionType] || []).includes(arxivId)
+    const nextEnabled = typeof enabled === 'boolean' ? enabled : !exists
+    if (nextEnabled) {
+      await recordPaperAction(paper, actionType)
+      paperActionMap.value[actionType] = Array.from(new Set([...(paperActionMap.value[actionType] || []), arxivId]))
+    } else {
+      await removePaperAction(paper, actionType)
+      paperActionMap.value[actionType] = (paperActionMap.value[actionType] || []).filter(item => item !== arxivId)
+    }
+    syncPaperCollections()
+  }
+
   async function generateRecommendations(topN: number = 10, maxAgeMonths: number = 6): Promise<RecommendationResult> {
     recommendationsGenerating.value = true
     try {
       const result = await recommendPapers(topN, maxAgeMonths)
       if (result.status === 'success') {
+        researchProfile.value = result.research_profile || researchProfile.value
+        paperActionMap.value = result.paper_actions || paperActionMap.value
         recommendations.value = result.recommendations.map((p: any) => ({
           id: p.arxiv_id,
           arxivId: p.arxiv_id,
@@ -291,12 +391,72 @@ export const usePaperStore = defineStore('paper', () => {
           diversityDebug: p.diversity_debug || p.diversityDebug || undefined,
           label: null
         }))
+        applyPaperActions(recommendations.value)
         totalRecommendations.value = result.total_found
       }
       return result
     } finally {
       recommendationsGenerating.value = false
     }
+  }
+
+  async function fetchPaperNotes(arxivId: string, noteType?: PaperNoteType) {
+    const result = await listPaperNotes(arxivId, noteType ? { note_type: noteType } : {})
+    paperNotes.value = result.items
+    return result.items
+  }
+
+  async function savePaperNote(
+    arxivId: string,
+    payload: {
+      session_id?: string
+      source_message_id?: string
+      source_turn_id?: string
+      title?: string
+      content: string
+      note_type?: PaperNoteType
+      source_chunk_ids?: string[]
+      tags?: string[]
+      include_in_profile?: boolean
+    }
+  ) {
+    const result = await createPaperNote(arxivId, payload)
+    if (result.item) {
+      const next = [result.item, ...paperNotes.value.filter(item => item.note_id !== result.item?.note_id)]
+      paperNotes.value = next
+    }
+    return result.item
+  }
+
+  async function editPaperNote(
+    arxivId: string,
+    noteId: string,
+    payload: {
+      title?: string
+      content?: string
+      note_type?: PaperNoteType
+      source_chunk_ids?: string[]
+      tags?: string[]
+      include_in_profile?: boolean
+    }
+  ) {
+    const result = await updatePaperNote(arxivId, noteId, payload)
+    if (result.item) {
+      paperNotes.value = paperNotes.value.map(item => item.note_id === noteId ? result.item as PaperNote : item)
+    }
+    return result.item
+  }
+
+  async function removeExistingPaperNote(arxivId: string, noteId: string) {
+    const result = await deletePaperNote(arxivId, noteId)
+    if (result.deleted) {
+      paperNotes.value = paperNotes.value.filter(item => item.note_id !== noteId)
+    }
+    return result.deleted
+  }
+
+  function getPaperNotesExportLink(arxivId: string) {
+    return getPaperNotesExportUrl(arxivId)
   }
 
   return {
@@ -312,6 +472,9 @@ export const usePaperStore = defineStore('paper', () => {
     loading,
     interestVectorGenerating,
     lastInterestVector,
+    researchProfile,
+    paperActionMap,
+    paperNotes,
     recommendationsGenerating,
     fetchPapers,
     fetchPaperById,
@@ -323,6 +486,15 @@ export const usePaperStore = defineStore('paper', () => {
     paginatePapers,
     generateUserInterestVector,
     fetchUserInterestVector,
+    fetchResearchProfile,
+    saveResearchProfile,
+    fetchPaperActions,
+    togglePaperAction,
+    fetchPaperNotes,
+    savePaperNote,
+    editPaperNote,
+    removeExistingPaperNote,
+    getPaperNotesExportLink,
     generateRecommendations
   }
 })

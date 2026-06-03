@@ -15,7 +15,7 @@ import requests
 
 from services.embedding.embedding_service import EmbeddingService
 from services.storage.vector_store_service import VectorStoreService
-from utils.config import RETRIEVAL_CONFIG, get_enhanced_retrieval_runtime_config
+from utils.config import RETRIEVAL_CONFIG, get_enhanced_retrieval_runtime_config, get_memory_runtime_config
 from utils.model_utils import get_huggingface_model_path
 from services.intent.intent_service import IntentProfile, IntentService
 
@@ -34,6 +34,7 @@ else:
 
 
 ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
+MEMORY_RUNTIME_CONFIG = get_memory_runtime_config()
 QUERY_VIEW_LIMIT = ENHANCED_RETRIEVAL_CONFIG["query_view_limit"]
 QUERY_PLAN_LIMIT = ENHANCED_RETRIEVAL_CONFIG["query_plan_limit"]
 
@@ -385,6 +386,7 @@ class RetrievalOptions:
     enable_keyword_search: Optional[bool] = None
     enable_llm_rerank: Optional[bool] = None
     debug: Optional[bool] = None
+    memory_context: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -452,6 +454,10 @@ class EnhancedRetrievalService:
         self._llm_reranker_path: Optional[str] = None
         self._llm_reranker_device: Optional[str] = None
         self._llm_reranker_error: Optional[str] = None
+        self.memory_runtime_config = get_memory_runtime_config()
+
+    def _memory_flag(self, key: str, default: Any = None) -> Any:
+        return self.memory_runtime_config.get(key, default)
 
     def enhanced_retrieve(
         self,
@@ -566,12 +572,42 @@ class EnhancedRetrievalService:
             routes["keyword"] = []
             keyword_queries = []
 
+        memory_context = options.memory_context or {}
+        memory_retrieval_enabled = bool(self._memory_flag("enable_memory_aware_retrieval", True))
+        if memory_retrieval_enabled:
+            try:
+                routes["memory_context"] = self._memory_retrieve(
+                    collection_name=normalized_collection_name,
+                    memory_context=memory_context,
+                    top_k=recall_candidate_limit,
+                    query_profile=query_profile,
+                )
+                memory_fallback_reason = None
+            except Exception as exc:
+                logger.warning("Memory-aware retrieval failed, skipping memory route: %s", exc)
+                routes["memory_context"] = []
+                memory_fallback_reason = str(exc)
+        else:
+            routes["memory_context"] = []
+            memory_fallback_reason = "disabled by runtime config"
+
         keyword_debug = {
             "enabled": enable_keyword_search,
             "queries": keyword_queries,
             "selected_rewrite_queries": query_views["selected_queries"],
             "query_details": self._build_query_term_details(keyword_queries),
             "keywords": self._build_query_keywords(keyword_queries),
+        }
+        memory_debug = {
+            "enabled": memory_retrieval_enabled,
+            "applied": bool(memory_retrieval_enabled and memory_context.get("enabled", False) and routes["memory_context"]),
+            "reason": str(memory_context.get("reason", "") or ""),
+            "referenced_turn_ids": memory_context.get("referenced_turn_ids", []) or [],
+            "referenced_source_ids": memory_context.get("referenced_source_ids", []) or [],
+            "query_keywords": memory_context.get("query_keywords", []) or [],
+            "candidates": memory_context.get("candidates", []) or [],
+            "route_result_count": len(routes["memory_context"]),
+            "fallback_reason": memory_fallback_reason or memory_context.get("fallback_reason"),
         }
 
         fused_limit = rrf_candidate_limit if enable_llm_rerank else final_context_top_k
@@ -650,6 +686,14 @@ class EnhancedRetrievalService:
                 "query_rewrite": query_views["rewrite_debug"],
                 "hyde": hyde_debug,
                 "keyword_search": keyword_debug,
+                "memory": {
+                    **memory_debug,
+                    "final_context_hits": [
+                        self._debug_chunk_item(item)
+                        for item in final_results[:final_context_top_k]
+                        if "memory_context" in (item.get("matched_routes", []) or [item.get("retrieval_route")])
+                    ],
+                },
                 "routes": {
                     route_name: [self._debug_chunk_item(item) for item in route_results]
                     for route_name, route_results in deduped_routes.items()
@@ -671,6 +715,8 @@ class EnhancedRetrievalService:
                     "enable_hyde": enable_hyde,
                     "enable_keyword_search": enable_keyword_search,
                     "enable_llm_rerank": enable_llm_rerank,
+                    "enable_memory_aware_retrieval": memory_retrieval_enabled,
+                    "memory_source_boost_weight": float(self._memory_flag("memory_source_boost_weight", ENHANCED_RETRIEVAL_CONFIG.get("memory_source_boost_weight", 0.12))),
                 },
                 "asset_type_counts": asset_type_counts,
                 "fusion": {
@@ -2092,6 +2138,147 @@ class EnhancedRetrievalService:
             results.append(chunk)
         return results
 
+    def _memory_retrieve(
+        self,
+        collection_name: str,
+        memory_context: Dict[str, Any],
+        top_k: int,
+        query_profile: QueryProfile,
+    ) -> List[Dict[str, Any]]:
+        if not memory_context or not bool(memory_context.get("enabled", False)):
+            return []
+
+        candidates = [item for item in (memory_context.get("candidates", []) or []) if isinstance(item, dict)]
+        if not candidates:
+            return []
+
+        try:
+            chunks = [self._normalize_chunk(chunk) for chunk in self.vector_store_service.get_all_chunks(collection_name)]
+        except Exception as exc:
+            logger.warning("Memory retrieval skipped because chunk load failed: %s", exc)
+            return []
+
+        if not chunks:
+            return []
+
+        query_keywords = memory_context.get("query_keywords", []) or query_profile.keywords or []
+        route_results: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            matched_chunks = [chunk for chunk in chunks if self._memory_candidate_matches(candidate, chunk)]
+            for chunk in matched_chunks:
+                memory_score = self._memory_candidate_score(candidate, chunk, query_keywords, query_profile)
+                route_confidence = min(
+                    0.78,
+                    self._route_confidence(
+                        "memory_context",
+                        query_profile,
+                        str(candidate.get("content_preview", "") or query_profile.original_query),
+                        route_queries=[str(candidate.get("content_preview", "") or query_profile.original_query)],
+                        intent_profile=query_profile.intent_profile,
+                    ) + min(0.18, memory_score * 0.15),
+                )
+                memory_chunk = dict(chunk)
+                memory_chunk["retrieval_route"] = "memory_context"
+                memory_chunk["source_query"] = query_profile.original_query
+                memory_chunk["route_score"] = float(memory_score)
+                memory_chunk["normalized_route_score"] = float(min(1.0, memory_score / 1.4))
+                memory_chunk["route_confidence"] = float(route_confidence)
+                memory_chunk["structural_bonus"] = float(self._compute_structural_bonus(memory_chunk, query_profile))
+                memory_chunk["memory_score"] = float(memory_score)
+                memory_chunk["memory_reason"] = str(candidate.get("memory_reason", "") or memory_context.get("reason", ""))
+                memory_chunk["source_turn_id"] = str(candidate.get("source_turn_id", "") or "")
+                memory_chunk["is_recent_turn"] = bool(candidate.get("is_recent_turn", False))
+                memory_chunk["memory_match_type"] = str(candidate.get("match_type", "metadata") or "metadata")
+                memory_chunk["memory_reference_strength"] = float(candidate.get("reference_strength", 0.0) or 0.0)
+                route_results.append(memory_chunk)
+
+        ranked = sorted(
+            route_results,
+            key=lambda item: (
+                float(item.get("memory_score", 0.0) or 0.0),
+                float(item.get("route_confidence", 0.0) or 0.0),
+                float(item.get("structural_bonus", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        deduped = self._dedupe_route_results(ranked)
+        for rank, item in enumerate(deduped[:top_k], start=1):
+            item["route_rank"] = rank
+        return deduped[:top_k]
+
+    def _memory_candidate_matches(self, candidate: Dict[str, Any], chunk: Dict[str, Any]) -> bool:
+        candidate_ids = {
+            str(candidate.get("chunk_id", "") or "").strip(),
+            str(candidate.get("parent_chunk_id", "") or "").strip(),
+            str(candidate.get("original_chunk_id", "") or "").strip(),
+            str(candidate.get("source_id", "") or "").strip(),
+        }
+        candidate_ids.discard("")
+        chunk_ids = {
+            str(chunk.get("chunk_id", "") or "").strip(),
+            str(chunk.get("parent_chunk_id", "") or "").strip(),
+            str(chunk.get("original_chunk_id", "") or "").strip(),
+        }
+        chunk_ids.discard("")
+        if candidate_ids and candidate_ids & chunk_ids:
+            return True
+
+        candidate_source = str(candidate.get("source", "") or "").strip().lower()
+        candidate_section = str(candidate.get("section_path", "") or "").strip().lower()
+        candidate_page = str(candidate.get("page_number", "") or "").strip()
+        chunk_source = str(chunk.get("source", "") or "").strip().lower()
+        chunk_section = str(chunk.get("section_path", "") or "").strip().lower()
+        chunk_page = str(chunk.get("page_number", "") or "").strip()
+
+        if candidate_source and candidate_section and candidate_source == chunk_source and candidate_section == chunk_section:
+            return True
+        if candidate_source and candidate_page and candidate_source == chunk_source and candidate_page == chunk_page:
+            return True
+        return False
+
+    def _memory_candidate_score(
+        self,
+        candidate: Dict[str, Any],
+        chunk: Dict[str, Any],
+        query_keywords: List[str],
+        query_profile: QueryProfile,
+    ) -> float:
+        score = 0.25
+        if bool(candidate.get("is_recent_turn", False)):
+            score += 0.28
+        score += min(0.24, float(candidate.get("reference_strength", 0.0) or 0.0) * 0.24)
+        candidate_ids = {
+            str(candidate.get("chunk_id", "") or "").strip(),
+            str(candidate.get("parent_chunk_id", "") or "").strip(),
+            str(candidate.get("original_chunk_id", "") or "").strip(),
+            str(candidate.get("source_id", "") or "").strip(),
+        }
+        chunk_ids = {
+            str(chunk.get("chunk_id", "") or "").strip(),
+            str(chunk.get("parent_chunk_id", "") or "").strip(),
+            str(chunk.get("original_chunk_id", "") or "").strip(),
+        }
+        if {item for item in candidate_ids if item} & {item for item in chunk_ids if item}:
+            score += 0.34
+
+        chunk_terms_text = " ".join(
+            [
+                str(chunk.get("content", "") or ""),
+                str(chunk.get("section_path", "") or ""),
+                str(chunk.get("asset_summary", "") or ""),
+            ]
+        ).lower()
+        overlap = 0
+        for keyword in query_keywords[:10]:
+            token = str(keyword or "").strip().lower()
+            if token and token in chunk_terms_text:
+                overlap += 1
+        if query_keywords:
+            score += min(0.28, overlap / max(len(query_keywords[:10]), 1) * 0.28)
+
+        score += max(0.0, float(self._compute_structural_bonus(chunk, query_profile)))
+        return score
+
     def _normalize_route_results(
         self,
         results: List[Dict[str, Any]],
@@ -2481,8 +2668,11 @@ class EnhancedRetrievalService:
 
     def _route_weights_for_intent(self, intent_profile: Optional[IntentProfile]) -> Dict[str, float]:
         if intent_profile is None:
-            return dict(self.route_weights)
-        return dict(intent_profile.route_weights or self.route_weights)
+            weights = dict(self.route_weights)
+        else:
+            weights = dict(intent_profile.route_weights or self.route_weights)
+        weights.setdefault("memory_context", 0.42)
+        return weights
 
     def _route_confidence(
         self,
@@ -2511,6 +2701,10 @@ class EnhancedRetrievalService:
             base = ENHANCED_RETRIEVAL_CONFIG["query_weight_base_keyword"] + 0.18 * min(1.0, len(query_profile.keywords) / ENHANCED_RETRIEVAL_CONFIG["extract_query_keywords_limit"])
             if main_intent in {"method", "experiment", "figure_table"}:
                 base += ENHANCED_RETRIEVAL_CONFIG["route_keyword_bonus"]
+        elif route_name == "memory_context":
+            base = 0.42 + 0.2 * ambiguity
+            if main_intent in {"method", "experiment", "comparison", "figure_table", "dataset"}:
+                base += 0.08
         else:
             base = ENHANCED_RETRIEVAL_CONFIG["query_weight_base_fallback"]
         return max(
@@ -2824,6 +3018,12 @@ class EnhancedRetrievalService:
             "route_scores": item.get("route_scores", {}),
             "source_query": item.get("source_query"),
             "source_queries": item.get("source_queries", []),
+            "memory_score": item.get("memory_score"),
+            "memory_reason": item.get("memory_reason"),
+            "source_turn_id": item.get("source_turn_id"),
+            "is_recent_turn": item.get("is_recent_turn"),
+            "memory_match_type": item.get("memory_match_type"),
+            "memory_reference_strength": item.get("memory_reference_strength"),
             "rerank_text": item.get("rerank_text", ""),
             "rerank_text_preview": self._short_text_preview(item.get("rerank_text", ""), 160),
             "final_context_uses_original_chunk": item.get("final_context_uses_original_chunk"),

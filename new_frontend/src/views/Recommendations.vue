@@ -24,6 +24,10 @@ const topDiversityMatch = computed(() => {
   return 0
 })
 const interestVector = computed(() => store.lastInterestVector)
+const researchProfile = computed(() => store.researchProfile)
+const profileTopicPreview = computed(() => (researchProfile.value?.positive_topics || []).slice(0, 4))
+const profileNegativePreview = computed(() => (researchProfile.value?.negative_topics || []).slice(0, 3))
+const profileCategoryPreview = computed(() => (researchProfile.value?.preferred_categories || []).slice(0, 4))
 const interestClusterCount = computed(() => interestVector.value?.cluster_count || 0)
 const interestProfileMode = computed(() => interestVector.value?.profile_mode || 'mean')
 const topFinalScore = computed(() => {
@@ -34,6 +38,8 @@ const topFinalScore = computed(() => {
 
 onMounted(() => {
   store.fetchUserInterestVector()
+  store.fetchResearchProfile()
+  store.fetchPaperActions()
 })
 
 const countOptions = [
@@ -64,6 +70,10 @@ async function handleGenerateRecommendations() {
 
 function handleViewDetail(id: string) {
   router.push(`/paper/${id}`)
+}
+
+function goToProfile() {
+  router.push('/profile')
 }
 
 function toPercent(value?: number) {
@@ -127,6 +137,33 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
         >
           生成推荐
         </el-button>
+      </div>
+    </div>
+
+    <div v-if="researchProfile" class="profile-summary-card">
+      <div class="profile-summary-card__head">
+        <div>
+          <div class="profile-summary-card__kicker">显式长期画像</div>
+          <div class="profile-summary-card__title">推荐会轻量参考你的研究画像</div>
+        </div>
+        <el-button text type="primary" @click="goToProfile">编辑画像</el-button>
+      </div>
+      <div class="profile-summary-card__body">
+        <div v-if="profileTopicPreview.length" class="profile-line">
+          <span class="profile-label">正向主题</span>
+          <el-tag v-for="item in profileTopicPreview" :key="item" size="small" effect="plain">{{ item }}</el-tag>
+        </div>
+        <div v-if="profileCategoryPreview.length" class="profile-line">
+          <span class="profile-label">偏好分类</span>
+          <el-tag v-for="item in profileCategoryPreview" :key="item" size="small" type="success" effect="plain">{{ item }}</el-tag>
+        </div>
+        <div v-if="profileNegativePreview.length" class="profile-line">
+          <span class="profile-label">负向主题</span>
+          <el-tag v-for="item in profileNegativePreview" :key="item" size="small" type="danger" effect="plain">{{ item }}</el-tag>
+        </div>
+        <div v-if="researchProfile.preferred_answer_style" class="profile-note">
+          偏好回答风格：{{ researchProfile.preferred_answer_style }}
+        </div>
       </div>
     </div>
 
@@ -239,6 +276,61 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
 .action-bar {
   display: flex;
   align-items: center;
+}
+
+.profile-summary-card {
+  margin-bottom: 24px;
+  padding: 18px 20px;
+  border-radius: 18px;
+  background: linear-gradient(135deg, rgba(239, 246, 255, 0.95), rgba(248, 250, 252, 0.98));
+  border: 1px solid rgba(125, 211, 252, 0.35);
+}
+
+.profile-summary-card__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.profile-summary-card__kicker {
+  font-size: 12px;
+  color: #0284c7;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.profile-summary-card__title {
+  margin-top: 6px;
+  font-size: 18px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.profile-summary-card__body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.profile-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.profile-label {
+  min-width: 72px;
+  color: #475569;
+  font-size: 13px;
+}
+
+.profile-note {
+  color: #334155;
+  font-size: 13px;
 }
 
 .summary-panel {
@@ -387,5 +479,4 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
   }
 }
 </style>
-
 

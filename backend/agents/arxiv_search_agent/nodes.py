@@ -584,6 +584,37 @@ def _looks_like_recommendation_request(message: str) -> bool:
 
 
 def _build_llm_prompt(message: str) -> str:
+    return _build_llm_prompt_with_profile(message, research_profile=None)
+
+
+def _compact_research_profile_for_prompt(research_profile: Optional[Mapping[str, Any]]) -> str:
+    if not isinstance(research_profile, Mapping):
+        return "N/A"
+
+    parts: List[str] = []
+    for key, label in (
+        ("positive_topics", "positive_topics"),
+        ("negative_topics", "negative_topics"),
+        ("recent_topics", "recent_topics"),
+        ("preferred_categories", "preferred_categories"),
+        ("common_question_types", "common_question_types"),
+        ("representative_papers", "representative_papers"),
+    ):
+        raw_value = research_profile.get(key)
+        if isinstance(raw_value, list):
+            values = [str(item).strip() for item in raw_value if str(item).strip()]
+            if values:
+                parts.append(f"{label}: {', '.join(values[:5])}")
+
+    preferred_answer_style = str(research_profile.get("preferred_answer_style") or "").strip()
+    if preferred_answer_style:
+        parts.append(f"preferred_answer_style: {preferred_answer_style}")
+
+    return " | ".join(parts) if parts else "N/A"
+
+
+def _build_llm_prompt_with_profile(message: str, research_profile: Optional[Mapping[str, Any]] = None) -> str:
+    profile_hint = _compact_research_profile_for_prompt(research_profile)
     return (
         "You are an intent parser for a natural-language arXiv paper agent.\n"
         "Return JSON only.\n"
@@ -638,11 +669,17 @@ def _build_llm_prompt(message: str) -> str:
         "- Use max_results between 1 and 20. Default to 10 if not specified.\n"
         "- Use submitted_days_ago for recent-time expressions.\n"
         "- Do not output categories; the system applies a fixed configured category scope.\n"
+        "- The research profile is only a lightweight personalization hint. Use it to disambiguate vague requests or recommendation intent, but never override the user's explicit request.\n"
+        f"User research profile: {profile_hint}\n"
         f"User message: {message}"
     )
 
 
-def _parse_llm_intent(message: str, generation_service: Optional[Any]) -> Dict[str, Any]:
+def _parse_llm_intent(
+    message: str,
+    generation_service: Optional[Any],
+    research_profile: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
     if generation_service is None or not hasattr(generation_service, "complete_with_qwen"):
         return {
             "ok": False,
@@ -653,7 +690,7 @@ def _parse_llm_intent(message: str, generation_service: Optional[Any]) -> Dict[s
     try:
         # 意图识别只负责分流，不需要大模型推理，优先使用小模型降低时延和成本。
         response = generation_service.complete_with_qwen(
-            _build_llm_prompt(message),
+            _build_llm_prompt_with_profile(message, research_profile=research_profile),
             task_type="intent_recognition",
         )
         payload = json.loads(_extract_json_block(str(response)))
@@ -907,7 +944,11 @@ def _legacy_parse_search_request(
         warnings.extend(str(item) for item in (resolved.get("warnings") or []) if str(item).strip())
 
     # 先尝试 LLM：它更擅长区分 search / summary / detail / QA / recommendation 等多意图。
-    llm_payload_result = _parse_llm_intent(message, generation_service=generation_service)
+    llm_payload_result = _parse_llm_intent(
+        message,
+        generation_service=generation_service,
+        research_profile=state.context.get("research_profile") if isinstance(state.context, dict) else None,
+    )
     if llm_payload_result.get("ok"):
         try:
             llm_result = _normalize_llm_intent_payload(llm_payload_result["payload"])
@@ -2513,7 +2554,11 @@ def parse_search_request(
         next_actions = list(resolved.get("next_actions") or [])
         warnings.extend(str(item) for item in (resolved.get("warnings") or []) if str(item).strip())
 
-    llm_payload_result = _parse_llm_intent(message, generation_service=generation_service)
+    llm_payload_result = _parse_llm_intent(
+        message,
+        generation_service=generation_service,
+        research_profile=state.context.get("research_profile") if isinstance(state.context, dict) else None,
+    )
     if llm_payload_result.get("ok"):
         try:
             llm_result = _normalize_llm_intent_payload(llm_payload_result["payload"])

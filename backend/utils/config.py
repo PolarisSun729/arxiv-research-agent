@@ -177,6 +177,17 @@ RECOMMENDATION_CONFIG: Dict[str, Any] = {
     "selection_diversity_weight": float(_env_str("RECOMMENDATION_SELECTION_DIVERSITY_WEIGHT", "0.25")),
 }
 
+MEMORY_RUNTIME_CONFIG: Dict[str, Any] = {
+    "enable_short_term_memory": _env_bool("ENABLE_SHORT_TERM_MEMORY", True),
+    "enable_paper_chat_session": _env_bool("ENABLE_PAPER_CHAT_SESSION", True),
+    "enable_memory_aware_retrieval": _env_bool("ENABLE_MEMORY_AWARE_RETRIEVAL", True),
+    "enable_user_research_profile": _env_bool("ENABLE_USER_RESEARCH_PROFILE", False),
+    "short_term_memory_max_turns": _env_int("SHORT_TERM_MEMORY_MAX_TURNS", 5),
+    "short_term_memory_max_chars": _env_int("SHORT_TERM_MEMORY_MAX_CHARS", 280),
+    "memory_source_boost_weight": float(_env_str("MEMORY_SOURCE_BOOST_WEIGHT", "0.12")),
+    "memory_context_debug": _env_bool("MEMORY_CONTEXT_DEBUG", True),
+}
+
 ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     "query_view_limit": _env_int("ENHANCED_RETRIEVAL_QUERY_VIEW_LIMIT", 6),
     "query_plan_limit": _env_int("ENHANCED_RETRIEVAL_QUERY_PLAN_LIMIT", 5),
@@ -207,6 +218,9 @@ ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     ),
     "route_similarity_weight": float(_env_str("ENHANCED_RETRIEVAL_ROUTE_SIMILARITY_WEIGHT", "0.35")),
     "route_base_similarity_weight": float(_env_str("ENHANCED_RETRIEVAL_ROUTE_BASE_SIMILARITY_WEIGHT", "0.65")),
+    "memory_source_boost_weight": float(
+        _env_str("MEMORY_SOURCE_BOOST_WEIGHT", str(MEMORY_RUNTIME_CONFIG["memory_source_boost_weight"]))
+    ),
     "bm25_token_boost": float(_env_str("ENHANCED_RETRIEVAL_BM25_TOKEN_BOOST", "0.2")),
     "cluster_repeat_divisor": float(_env_str("ENHANCED_RETRIEVAL_CLUSTER_REPEAT_DIVISOR", "4.0")),
     "category_repeat_divisor": float(_env_str("ENHANCED_RETRIEVAL_CATEGORY_REPEAT_DIVISOR", "4.0")),
@@ -345,6 +359,7 @@ RERANK_CONFIG: Dict[str, Any] = {
         "vector_rewrite": 0.9,
         "vector_hyde": 0.85,
         "keyword": 0.75,
+        "memory_context": float(_env_str("RETRIEVAL_ROUTE_WEIGHT_MEMORY_CONTEXT", "0.35")),
     },
     "trace_export_enabled": _env_bool("RETRIEVAL_TRACE_EXPORT_ENABLED", True),
     "trace_export_dir": _env_str(
@@ -442,6 +457,10 @@ def get_recommendation_clustering_runtime_config() -> Dict[str, Any]:
 
 def get_recommendation_runtime_config() -> Dict[str, Any]:
     return dict(RECOMMENDATION_CONFIG)
+
+
+def get_memory_runtime_config() -> Dict[str, Any]:
+    return dict(MEMORY_RUNTIME_CONFIG)
 
 
 def get_enhanced_retrieval_runtime_config() -> Dict[str, Any]:

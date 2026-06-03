@@ -1,3 +1,5 @@
+import type { UserResearchProfile } from '@/types/paper'
+
 export interface ArxivSearchRequest {
   user_id?: string | null
   session_id?: string | null
@@ -7,6 +9,7 @@ export interface ArxivSearchRequest {
     last_papers?: AgentPaper[]
     pending_action?: Record<string, any> | null
     paper_qa_result?: Record<string, any> | null
+    research_profile?: UserResearchProfile | null
     arxiv_id?: string | null
     source?: 'button' | 'chat' | 'detail_page'
   } | null

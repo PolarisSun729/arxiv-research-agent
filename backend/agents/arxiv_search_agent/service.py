@@ -11,6 +11,9 @@ from uuid import uuid4
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
+from services.storage.database_service import DatabaseService
+from utils.config import get_memory_runtime_config
+
 _BACKEND_DIR = str(Path(__file__).resolve().parents[2])
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
@@ -26,11 +29,35 @@ from .state import AgentState
 
 logger = logging.getLogger(__name__)
 
+MEMORY_RUNTIME_CONFIG = get_memory_runtime_config()
+
+
+def _inject_research_profile_context(request_context: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
+    enriched_context = dict(request_context or {})
+    if not bool(MEMORY_RUNTIME_CONFIG.get("enable_user_research_profile", False)):
+        return enriched_context
+    normalized_user_id = str(user_id or "").strip()
+    if not normalized_user_id or enriched_context.get("research_profile"):
+        return enriched_context
+
+    try:
+        profile = DatabaseService().get_user_research_profile(user_id=normalized_user_id)
+    except Exception as exc:
+        logger.warning("Failed to load research profile for agent context: user_id=%s error=%s", normalized_user_id, exc)
+        return enriched_context
+
+    if isinstance(profile, dict):
+        enriched_context["research_profile"] = profile
+    return enriched_context
+
 
 def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
     try:
         normalized_request = _coerce_request(request)
-        request_context = dict(normalized_request.context or {})
+        request_context = _inject_research_profile_context(
+            dict(normalized_request.context or {}),
+            normalized_request.user_id,
+        )
         # 入口日志只记录状态摘要，便于排查“前端传了但后端没识别到”的问题，不直接打出完整上下文内容。
         logger.info(
             "arxiv_agent request received: message=%s context_keys=%s pending_action_status=%s paper_qa_status=%s selected_arxiv_id=%s",
@@ -77,7 +104,10 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
         current_state: Optional[AgentState] = None
 
         try:
-            request_context = dict(normalized_request.context or {})
+            request_context = _inject_research_profile_context(
+                dict(normalized_request.context or {}),
+                normalized_request.user_id,
+            )
             logger.info(
                 "arxiv_agent stream start: run_id=%s message=%s context_keys=%s pending_action_status=%s paper_qa_status=%s selected_arxiv_id=%s",
                 run_id,

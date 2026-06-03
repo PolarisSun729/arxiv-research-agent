@@ -7,6 +7,11 @@ export interface RagChatSource {
   content: string
   page_number: string
   source?: string
+  section_path?: string
+  parent_chunk_id?: string | number
+  chunk_type?: string
+  asset_summary?: string
+  asset_preview_text?: string
 }
 
 // This mirrors the current QA turn shape so existing page state can be
@@ -19,6 +24,10 @@ export interface QaTurnForRagChat {
   retrievalDebug?: RetrievalDebug | null
   createdAt: string
   streaming?: boolean
+  originalQuestion?: string
+  contextualizedQuestion?: string
+  usedShortTermMemory?: boolean
+  questionContextualization?: Record<string, any> | null
 }
 
 export interface RagChatMessage extends AgentChatMessage<QaTurnForRagChat> {

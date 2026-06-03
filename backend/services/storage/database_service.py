@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import json
+import uuid
 from typing import Dict, Any, List, Optional
 import logging
 from datetime import datetime
@@ -9,6 +10,34 @@ from utils.config import SQLITE_CONFIG
 logger = logging.getLogger(__name__)
 
 DEFAULT_USER_ID = "local_user"
+PAPER_ACTION_TYPES = {
+    "like",
+    "dislike",
+    "favorite",
+    "read",
+    "later",
+    "archived",
+    "note_saved",
+    "not_interested",
+}
+PROFILE_LIST_FIELDS = {
+    "positive_topics",
+    "negative_topics",
+    "recent_topics",
+    "preferred_categories",
+    "common_question_types",
+    "representative_papers",
+}
+PAPER_NOTE_TYPES = {
+    "summary",
+    "method",
+    "experiment",
+    "result",
+    "limitation",
+    "idea",
+    "todo",
+    "custom",
+}
 
 class DatabaseService:
     def __init__(self):
@@ -103,6 +132,116 @@ class DatabaseService:
                 )
             ''')
 
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS paper_chat_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL DEFAULT 'local_user',
+                    arxiv_id TEXT NOT NULL,
+                    title TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    message_count INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'active',
+                    FOREIGN KEY(arxiv_id) REFERENCES arxiv_papers(arxiv_id)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS paper_chat_messages (
+                    message_id TEXT PRIMARY KEY,
+                    turn_id TEXT,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT,
+                    sources TEXT,
+                    retrieval_debug_snapshot TEXT,
+                    contextualized_question TEXT,
+                    question_contextualization TEXT,
+                    status TEXT DEFAULT 'completed',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(session_id) REFERENCES paper_chat_sessions(session_id) ON DELETE CASCADE
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_paper_actions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL DEFAULT 'local_user',
+                    arxiv_id TEXT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    metadata_json TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, arxiv_id, action_type),
+                    FOREIGN KEY(arxiv_id) REFERENCES arxiv_papers(arxiv_id)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_research_profiles (
+                    user_id TEXT PRIMARY KEY,
+                    positive_topics TEXT,
+                    negative_topics TEXT,
+                    recent_topics TEXT,
+                    preferred_categories TEXT,
+                    preferred_answer_style TEXT,
+                    common_question_types TEXT,
+                    representative_papers TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS paper_notes (
+                    note_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL DEFAULT 'local_user',
+                    arxiv_id TEXT NOT NULL,
+                    session_id TEXT,
+                    source_message_id TEXT,
+                    title TEXT,
+                    content TEXT,
+                    note_type TEXT DEFAULT 'custom',
+                    source_chunk_ids TEXT,
+                    tags TEXT,
+                    include_in_profile INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(arxiv_id) REFERENCES arxiv_papers(arxiv_id),
+                    FOREIGN KEY(session_id) REFERENCES paper_chat_sessions(session_id) ON DELETE SET NULL
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_paper_chat_sessions_user_paper_updated
+                ON paper_chat_sessions(user_id, arxiv_id, updated_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_paper_chat_messages_session_created
+                ON paper_chat_messages(session_id, created_at ASC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_user_paper_actions_user_action_updated
+                ON user_paper_actions(user_id, action_type, updated_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_user_paper_actions_user_paper
+                ON user_paper_actions(user_id, arxiv_id)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_paper_notes_user_paper_updated
+                ON paper_notes(user_id, arxiv_id, updated_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_paper_notes_session_message
+                ON paper_notes(session_id, source_message_id)
+            ''')
+
             conn.commit()
             logger.info("Database tables initialized successfully")
             self._ensure_user_interest_vector_columns(conn)
@@ -125,6 +264,36 @@ class DatabaseService:
                 )
         conn.commit()
 
+    @staticmethod
+    def _normalize_action_type(action_type: Any) -> str:
+        normalized = str(action_type or "").strip().lower()
+        alias_map = {
+            "liked": "like",
+            "disliked": "dislike",
+            "bookmark": "favorite",
+            "bookmarked": "favorite",
+            "saved": "later",
+            "save_for_later": "later",
+            "uninterested": "not_interested",
+            "note": "note_saved",
+        }
+        return alias_map.get(normalized, normalized)
+
+    @staticmethod
+    def _empty_user_research_profile(user_id: str) -> Dict[str, Any]:
+        return {
+            "user_id": user_id,
+            "positive_topics": [],
+            "negative_topics": [],
+            "recent_topics": [],
+            "preferred_categories": [],
+            "preferred_answer_style": "",
+            "common_question_types": [],
+            "representative_papers": [],
+            "created_at": None,
+            "updated_at": None,
+        }
+
     def add_liked_paper(self, user_id: str = DEFAULT_USER_ID, arxiv_id: str = None) -> bool:
         try:
             if arxiv_id is None:
@@ -143,6 +312,9 @@ class DatabaseService:
                 ''', (user_id, arxiv_id))
                 
                 conn.commit()
+                self.record_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="like")
+                self.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="dislike")
+                self.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="not_interested")
                 logger.info(f"Paper {arxiv_id} added to liked list for user: {user_id}")
                 return True
         except Exception as e:
@@ -162,6 +334,7 @@ class DatabaseService:
                 ''', (user_id, arxiv_id))
                 
                 conn.commit()
+                self.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="like")
                 logger.info(f"Paper {arxiv_id} removed from liked list for user: {user_id}")
                 return cursor.rowcount > 0
         except Exception as e:
@@ -242,6 +415,8 @@ class DatabaseService:
                 ''', (user_id, arxiv_id))
                 
                 conn.commit()
+                self.record_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="dislike")
+                self.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="like")
                 logger.info(f"Paper {arxiv_id} added to disliked list for user: {user_id}")
                 return True
         except Exception as e:
@@ -261,6 +436,7 @@ class DatabaseService:
                 ''', (user_id, arxiv_id))
                 
                 conn.commit()
+                self.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="dislike")
                 logger.info(f"Paper {arxiv_id} removed from disliked list for user: {user_id}")
                 return cursor.rowcount > 0
         except Exception as e:
@@ -298,18 +474,258 @@ class DatabaseService:
 
     def get_user_preferences(self, user_id: str = DEFAULT_USER_ID) -> Dict[str, Any]:
         try:
+            paper_actions = self.get_user_paper_action_map(user_id)
             return {
                 'user_id': user_id,
                 'liked_papers': self.get_liked_papers(user_id),
-                'disliked_papers': self.get_disliked_papers(user_id)
+                'disliked_papers': self.get_disliked_papers(user_id),
+                'paper_actions': paper_actions,
+                'research_profile': self.get_user_research_profile(user_id),
             }
         except Exception as e:
             logger.error(f"Error getting user preferences: {str(e)}")
             return {
                 'user_id': user_id,
                 'liked_papers': [],
-                'disliked_papers': []
+                'disliked_papers': [],
+                'paper_actions': {},
+                'research_profile': self._empty_user_research_profile(user_id),
             }
+
+    def record_user_paper_action(
+        self,
+        user_id: str = DEFAULT_USER_ID,
+        arxiv_id: str = None,
+        action_type: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        try:
+            if arxiv_id is None:
+                logger.error("arxiv_id is required")
+                return False
+
+            normalized_action = self._normalize_action_type(action_type)
+            if normalized_action not in PAPER_ACTION_TYPES:
+                logger.error("Unsupported paper action type: %s", action_type)
+                return False
+
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                if normalized_action in {"like", "dislike", "not_interested"}:
+                    cursor.execute(
+                        '''
+                        DELETE FROM user_paper_actions
+                        WHERE user_id = ? AND arxiv_id = ? AND action_type IN ('like', 'dislike', 'not_interested') AND action_type != ?
+                        ''',
+                        (user_id, arxiv_id, normalized_action),
+                    )
+
+                cursor.execute(
+                    '''
+                    INSERT INTO user_paper_actions (user_id, arxiv_id, action_type, metadata_json)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(user_id, arxiv_id, action_type)
+                    DO UPDATE SET metadata_json = excluded.metadata_json, updated_at = CURRENT_TIMESTAMP
+                    ''',
+                    (user_id, arxiv_id, normalized_action, self._serialize_json_field(metadata)),
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error recording paper action: {str(e)}")
+            return False
+
+    def remove_user_paper_action(
+        self,
+        user_id: str = DEFAULT_USER_ID,
+        arxiv_id: str = None,
+        action_type: str = "",
+    ) -> bool:
+        try:
+            if arxiv_id is None:
+                logger.error("arxiv_id is required")
+                return False
+
+            normalized_action = self._normalize_action_type(action_type)
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    DELETE FROM user_paper_actions WHERE user_id = ? AND arxiv_id = ? AND action_type = ?
+                    ''',
+                    (user_id, arxiv_id, normalized_action),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error removing paper action: {str(e)}")
+            return False
+
+    def get_user_paper_actions(
+        self,
+        user_id: str = DEFAULT_USER_ID,
+        action_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                if action_type:
+                    normalized_action = self._normalize_action_type(action_type)
+                    cursor.execute(
+                        '''
+                        SELECT user_id, arxiv_id, action_type, metadata_json, created_at, updated_at
+                        FROM user_paper_actions
+                        WHERE user_id = ? AND action_type = ?
+                        ORDER BY updated_at DESC, created_at DESC
+                        ''',
+                        (user_id, normalized_action),
+                    )
+                else:
+                    cursor.execute(
+                        '''
+                        SELECT user_id, arxiv_id, action_type, metadata_json, created_at, updated_at
+                        FROM user_paper_actions
+                        WHERE user_id = ?
+                        ORDER BY updated_at DESC, created_at DESC
+                        ''',
+                        (user_id,),
+                    )
+
+                return [
+                    {
+                        "user_id": row[0],
+                        "arxiv_id": row[1],
+                        "action_type": row[2],
+                        "metadata": self._deserialize_json_field(row[3]) or {},
+                        "created_at": row[4],
+                        "updated_at": row[5],
+                    }
+                    for row in cursor.fetchall()
+                ]
+        except Exception as e:
+            logger.error(f"Error getting user paper actions: {str(e)}")
+            return []
+
+    def get_user_paper_action_map(self, user_id: str = DEFAULT_USER_ID) -> Dict[str, List[str]]:
+        action_map: Dict[str, List[str]] = {}
+        for item in self.get_user_paper_actions(user_id=user_id):
+            action_key = str(item.get("action_type") or "").strip()
+            arxiv_id = str(item.get("arxiv_id") or "").strip()
+            if not action_key or not arxiv_id:
+                continue
+            action_map.setdefault(action_key, []).append(arxiv_id)
+        return action_map
+
+    def get_user_paper_action_state(self, user_id: str = DEFAULT_USER_ID, arxiv_id: str = None) -> Dict[str, Any]:
+        state = {action_type: False for action_type in PAPER_ACTION_TYPES}
+        state["metadata"] = {}
+        if not arxiv_id:
+            return state
+
+        for item in self.get_user_paper_actions(user_id=user_id):
+            if str(item.get("arxiv_id") or "").strip() != str(arxiv_id or "").strip():
+                continue
+            action_key = str(item.get("action_type") or "").strip()
+            if action_key:
+                state[action_key] = True
+                if item.get("metadata"):
+                    state["metadata"][action_key] = item.get("metadata")
+        return state
+
+    def upsert_user_research_profile(self, user_id: str = DEFAULT_USER_ID, profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = dict(profile or {})
+        normalized: Dict[str, Any] = {}
+        for field_name in PROFILE_LIST_FIELDS:
+            value = payload.get(field_name)
+            if value is None:
+                normalized[field_name] = []
+            elif isinstance(value, list):
+                normalized[field_name] = [str(item).strip() for item in value if str(item).strip()]
+            else:
+                normalized[field_name] = [str(value).strip()] if str(value).strip() else []
+
+        normalized["preferred_answer_style"] = str(payload.get("preferred_answer_style", "") or "").strip()
+
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    INSERT INTO user_research_profiles (
+                        user_id,
+                        positive_topics,
+                        negative_topics,
+                        recent_topics,
+                        preferred_categories,
+                        preferred_answer_style,
+                        common_question_types,
+                        representative_papers,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        positive_topics = excluded.positive_topics,
+                        negative_topics = excluded.negative_topics,
+                        recent_topics = excluded.recent_topics,
+                        preferred_categories = excluded.preferred_categories,
+                        preferred_answer_style = excluded.preferred_answer_style,
+                        common_question_types = excluded.common_question_types,
+                        representative_papers = excluded.representative_papers,
+                        updated_at = CURRENT_TIMESTAMP
+                    ''',
+                    (
+                        user_id,
+                        self._serialize_json_field(normalized["positive_topics"]),
+                        self._serialize_json_field(normalized["negative_topics"]),
+                        self._serialize_json_field(normalized["recent_topics"]),
+                        self._serialize_json_field(normalized["preferred_categories"]),
+                        normalized["preferred_answer_style"],
+                        self._serialize_json_field(normalized["common_question_types"]),
+                        self._serialize_json_field(normalized["representative_papers"]),
+                    ),
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error upserting research profile: {str(e)}")
+
+        return self.get_user_research_profile(user_id)
+
+    def patch_user_research_profile(self, user_id: str = DEFAULT_USER_ID, profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        current = self.get_user_research_profile(user_id)
+        merged = {**current, **dict(profile or {})}
+        return self.upsert_user_research_profile(user_id=user_id, profile=merged)
+
+    def get_user_research_profile(self, user_id: str = DEFAULT_USER_ID) -> Dict[str, Any]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT user_id, positive_topics, negative_topics, recent_topics, preferred_categories,
+                           preferred_answer_style, common_question_types, representative_papers, created_at, updated_at
+                    FROM user_research_profiles WHERE user_id = ?
+                    ''',
+                    (user_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return self._empty_user_research_profile(user_id)
+
+                return {
+                    "user_id": row[0],
+                    "positive_topics": self._deserialize_json_field(row[1]) or [],
+                    "negative_topics": self._deserialize_json_field(row[2]) or [],
+                    "recent_topics": self._deserialize_json_field(row[3]) or [],
+                    "preferred_categories": self._deserialize_json_field(row[4]) or [],
+                    "preferred_answer_style": str(row[5] or ""),
+                    "common_question_types": self._deserialize_json_field(row[6]) or [],
+                    "representative_papers": self._deserialize_json_field(row[7]) or [],
+                    "created_at": row[8],
+                    "updated_at": row[9],
+                }
+        except Exception as e:
+            logger.error(f"Error getting research profile: {str(e)}")
+            return self._empty_user_research_profile(user_id)
 
     def get_latest_user_preference_timestamp(self, user_id: str = DEFAULT_USER_ID) -> Optional[str]:
         """
@@ -334,6 +750,30 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"Error getting latest preference timestamp: {str(e)}")
             return None
+
+    def get_latest_user_signal_timestamp(self, user_id: str = DEFAULT_USER_ID) -> Optional[str]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT MAX(latest_at) FROM (
+                        SELECT created_at AS latest_at FROM user_liked_papers WHERE user_id = ?
+                        UNION ALL
+                        SELECT created_at AS latest_at FROM user_disliked_papers WHERE user_id = ?
+                        UNION ALL
+                        SELECT updated_at AS latest_at FROM user_paper_actions WHERE user_id = ?
+                        UNION ALL
+                        SELECT updated_at AS latest_at FROM user_research_profiles WHERE user_id = ?
+                    )
+                    ''',
+                    (user_id, user_id, user_id, user_id),
+                )
+                row = cursor.fetchone()
+                return row[0] if row and row[0] else None
+        except Exception as e:
+            logger.error(f"Error getting latest user signal timestamp: {str(e)}")
+            return self.get_latest_user_preference_timestamp(user_id)
 
     def add_paper(self, paper: Dict[str, Any]) -> bool:
         try:
@@ -420,6 +860,26 @@ class DatabaseService:
                 return value
 
         return value
+
+    @staticmethod
+    def _serialize_json_field(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False)
+
+    @staticmethod
+    def _deserialize_json_field(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return value
 
     def get_paper(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
         try:
@@ -766,4 +1226,562 @@ class DatabaseService:
                 return True
         except Exception as e:
             logger.error(f"Error inserting paper QA index: {str(e)}")
+            return False
+
+    @staticmethod
+    def _row_to_paper_chat_session(row: Any) -> Dict[str, Any]:
+        return {
+            'session_id': row[0],
+            'user_id': row[1],
+            'arxiv_id': row[2],
+            'title': row[3] or '',
+            'created_at': row[4],
+            'updated_at': row[5],
+            'message_count': row[6] or 0,
+            'status': row[7] or 'active',
+        }
+
+    def _row_to_paper_chat_message(self, row: Any) -> Dict[str, Any]:
+        return {
+            'message_id': row[0],
+            'turn_id': row[1] or '',
+            'session_id': row[2],
+            'role': row[3],
+            'content': row[4] or '',
+            'sources': self._deserialize_json_field(row[5]) or [],
+            'retrieval_debug_snapshot': self._deserialize_json_field(row[6]),
+            'contextualized_question': row[7] or '',
+            'question_contextualization': self._deserialize_json_field(row[8]),
+            'status': row[9] or 'completed',
+            'created_at': row[10],
+        }
+
+    def _row_to_paper_note(self, row: Any) -> Dict[str, Any]:
+        return {
+            'note_id': row[0],
+            'user_id': row[1],
+            'arxiv_id': row[2],
+            'session_id': row[3],
+            'source_message_id': row[4],
+            'title': row[5] or '',
+            'content': row[6] or '',
+            'note_type': row[7] or 'custom',
+            'source_chunk_ids': self._deserialize_json_field(row[8]) or [],
+            'tags': self._deserialize_json_field(row[9]) or [],
+            'include_in_profile': bool(row[10]),
+            'created_at': row[11],
+            'updated_at': row[12],
+        }
+
+    def _refresh_paper_chat_session_stats(self, conn: sqlite3.Connection, session_id: str) -> None:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT COUNT(*), MAX(created_at)
+            FROM paper_chat_messages
+            WHERE session_id = ?
+            ''',
+            (session_id,),
+        )
+        row = cursor.fetchone() or (0, None)
+        message_count = int(row[0] or 0)
+        latest_created_at = row[1]
+        if latest_created_at:
+            cursor.execute(
+                '''
+                UPDATE paper_chat_sessions
+                SET message_count = ?, updated_at = ?, status = COALESCE(status, 'active')
+                WHERE session_id = ?
+                ''',
+                (message_count, latest_created_at, session_id),
+            )
+        else:
+            cursor.execute(
+                '''
+                UPDATE paper_chat_sessions
+                SET message_count = 0, updated_at = CURRENT_TIMESTAMP, status = COALESCE(status, 'active')
+                WHERE session_id = ?
+                ''',
+                (session_id,),
+            )
+
+    def create_paper_chat_session(
+        self,
+        arxiv_id: str,
+        user_id: str = DEFAULT_USER_ID,
+        title: Optional[str] = None,
+        status: str = 'active',
+        session_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            normalized_session_id = str(session_id or uuid.uuid4())
+            normalized_title = str(title or '').strip()
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    INSERT INTO paper_chat_sessions (session_id, user_id, arxiv_id, title, status)
+                    VALUES (?, ?, ?, ?, ?)
+                    ''',
+                    (normalized_session_id, user_id, arxiv_id, normalized_title, status),
+                )
+                conn.commit()
+            return self.get_paper_chat_session(normalized_session_id, user_id=user_id)
+        except Exception as e:
+            logger.error(f"Error creating paper chat session: {str(e)}")
+            return None
+
+    def get_paper_chat_session(self, session_id: str, user_id: str = DEFAULT_USER_ID) -> Optional[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT session_id, user_id, arxiv_id, title, created_at, updated_at, message_count, status
+                    FROM paper_chat_sessions
+                    WHERE session_id = ? AND user_id = ?
+                    ''',
+                    (session_id, user_id),
+                )
+                row = cursor.fetchone()
+                return self._row_to_paper_chat_session(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting paper chat session: {str(e)}")
+            return None
+
+    def list_paper_chat_sessions(
+        self,
+        arxiv_id: str,
+        user_id: str = DEFAULT_USER_ID,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT session_id, user_id, arxiv_id, title, created_at, updated_at, message_count, status
+                    FROM paper_chat_sessions
+                    WHERE arxiv_id = ? AND user_id = ?
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT ?
+                    ''',
+                    (arxiv_id, user_id, limit),
+                )
+                return [self._row_to_paper_chat_session(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error listing paper chat sessions: {str(e)}")
+            return []
+
+    def get_recent_paper_chat_session(self, arxiv_id: str, user_id: str = DEFAULT_USER_ID) -> Optional[Dict[str, Any]]:
+        sessions = self.list_paper_chat_sessions(arxiv_id=arxiv_id, user_id=user_id, limit=1)
+        return sessions[0] if sessions else None
+
+    def update_paper_chat_session(self, session_id: str, user_id: str = DEFAULT_USER_ID, **kwargs) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                update_fields = []
+                update_values = []
+                for field_name in ('title', 'status'):
+                    if field_name in kwargs:
+                        update_fields.append(f'{field_name} = ?')
+                        update_values.append(kwargs[field_name])
+                update_fields.append('updated_at = CURRENT_TIMESTAMP')
+                update_values.extend([session_id, user_id])
+                cursor.execute(
+                    f'''
+                    UPDATE paper_chat_sessions
+                    SET {", ".join(update_fields)}
+                    WHERE session_id = ? AND user_id = ?
+                    ''',
+                    update_values,
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error updating paper chat session: {str(e)}")
+            return False
+
+    def list_paper_chat_messages(self, session_id: str, user_id: str = DEFAULT_USER_ID) -> List[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT m.message_id, m.turn_id, m.session_id, m.role, m.content, m.sources,
+                           m.retrieval_debug_snapshot, m.contextualized_question, m.question_contextualization,
+                           m.status, m.created_at
+                    FROM paper_chat_messages m
+                    JOIN paper_chat_sessions s ON s.session_id = m.session_id
+                    WHERE m.session_id = ? AND s.user_id = ?
+                    ORDER BY m.created_at ASC, m.message_id ASC
+                    ''',
+                    (session_id, user_id),
+                )
+                return [self._row_to_paper_chat_message(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error listing paper chat messages: {str(e)}")
+            return []
+
+    def get_paper_chat_message(self, message_id: str, user_id: str = DEFAULT_USER_ID) -> Optional[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT m.message_id, m.turn_id, m.session_id, m.role, m.content, m.sources,
+                           m.retrieval_debug_snapshot, m.contextualized_question, m.question_contextualization,
+                           m.status, m.created_at
+                    FROM paper_chat_messages m
+                    JOIN paper_chat_sessions s ON s.session_id = m.session_id
+                    WHERE m.message_id = ? AND s.user_id = ?
+                    ''',
+                    (message_id, user_id),
+                )
+                row = cursor.fetchone()
+                return self._row_to_paper_chat_message(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting paper chat message: {str(e)}")
+            return None
+
+    def get_paper_chat_message_by_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        role: str = 'assistant',
+        user_id: str = DEFAULT_USER_ID,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT m.message_id, m.turn_id, m.session_id, m.role, m.content, m.sources,
+                           m.retrieval_debug_snapshot, m.contextualized_question, m.question_contextualization,
+                           m.status, m.created_at
+                    FROM paper_chat_messages m
+                    JOIN paper_chat_sessions s ON s.session_id = m.session_id
+                    WHERE m.session_id = ? AND m.turn_id = ? AND m.role = ? AND s.user_id = ?
+                    ORDER BY m.created_at DESC, m.message_id DESC
+                    LIMIT 1
+                    ''',
+                    (session_id, turn_id, role, user_id),
+                )
+                row = cursor.fetchone()
+                return self._row_to_paper_chat_message(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting paper chat message by turn: {str(e)}")
+            return None
+
+    def append_paper_chat_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        user_id: str = DEFAULT_USER_ID,
+        turn_id: Optional[str] = None,
+        sources: Optional[Any] = None,
+        retrieval_debug_snapshot: Optional[Any] = None,
+        contextualized_question: Optional[str] = None,
+        question_contextualization: Optional[Any] = None,
+        status: str = 'completed',
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT session_id, title FROM paper_chat_sessions
+                    WHERE session_id = ? AND user_id = ?
+                    ''',
+                    (session_id, user_id),
+                )
+                session_row = cursor.fetchone()
+                if not session_row:
+                    return None
+
+                message_id = str(uuid.uuid4())
+                normalized_turn_id = str(turn_id or uuid.uuid4())
+                cursor.execute(
+                    '''
+                    INSERT INTO paper_chat_messages (
+                        message_id, turn_id, session_id, role, content, sources,
+                        retrieval_debug_snapshot, contextualized_question, question_contextualization, status
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        message_id,
+                        normalized_turn_id,
+                        session_id,
+                        role,
+                        content,
+                        self._serialize_json_field(sources),
+                        self._serialize_json_field(retrieval_debug_snapshot),
+                        str(contextualized_question or ''),
+                        self._serialize_json_field(question_contextualization),
+                        status,
+                    ),
+                )
+
+                if role == 'user' and not str(session_row[1] or '').strip() and content:
+                    cursor.execute(
+                        '''
+                        UPDATE paper_chat_sessions
+                        SET title = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE session_id = ?
+                        ''',
+                        (str(content).strip()[:80], session_id),
+                    )
+
+                self._refresh_paper_chat_session_stats(conn, session_id)
+                conn.commit()
+
+            messages = self.list_paper_chat_messages(session_id=session_id, user_id=user_id)
+            return next((item for item in messages if item['message_id'] == message_id), None)
+        except Exception as e:
+            logger.error(f"Error appending paper chat message: {str(e)}")
+            return None
+
+    def clear_paper_chat_session(self, session_id: str, user_id: str = DEFAULT_USER_ID) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    DELETE FROM paper_chat_messages
+                    WHERE session_id = ?
+                      AND session_id IN (
+                        SELECT session_id FROM paper_chat_sessions WHERE session_id = ? AND user_id = ?
+                      )
+                    ''',
+                    (session_id, session_id, user_id),
+                )
+                self._refresh_paper_chat_session_stats(conn, session_id)
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error clearing paper chat session: {str(e)}")
+            return False
+
+    def delete_paper_chat_session(self, session_id: str, user_id: str = DEFAULT_USER_ID) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    DELETE FROM paper_chat_messages
+                    WHERE session_id = ?
+                    ''',
+                    (session_id,),
+                )
+                cursor.execute(
+                    '''
+                    DELETE FROM paper_chat_sessions
+                    WHERE session_id = ? AND user_id = ?
+                    ''',
+                    (session_id, user_id),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error deleting paper chat session: {str(e)}")
+            return False
+
+    def create_paper_note(
+        self,
+        *,
+        user_id: str = DEFAULT_USER_ID,
+        arxiv_id: str,
+        session_id: Optional[str] = None,
+        source_message_id: Optional[str] = None,
+        title: Optional[str] = None,
+        content: str = "",
+        note_type: str = "custom",
+        source_chunk_ids: Optional[List[Any]] = None,
+        tags: Optional[List[str]] = None,
+        include_in_profile: bool = False,
+        note_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            normalized_note_type = str(note_type or "custom").strip().lower() or "custom"
+            if normalized_note_type not in PAPER_NOTE_TYPES:
+                normalized_note_type = "custom"
+
+            normalized_note_id = str(note_id or uuid.uuid4())
+            normalized_title = str(title or "").strip()
+            normalized_content = str(content or "").strip()
+            normalized_tags = [str(item).strip() for item in (tags or []) if str(item).strip()]
+            normalized_chunk_ids = [str(item).strip() for item in (source_chunk_ids or []) if str(item).strip()]
+
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    INSERT INTO paper_notes (
+                        note_id, user_id, arxiv_id, session_id, source_message_id, title, content,
+                        note_type, source_chunk_ids, tags, include_in_profile
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        normalized_note_id,
+                        user_id,
+                        arxiv_id,
+                        session_id,
+                        source_message_id,
+                        normalized_title,
+                        normalized_content,
+                        normalized_note_type,
+                        self._serialize_json_field(normalized_chunk_ids),
+                        self._serialize_json_field(normalized_tags),
+                        1 if include_in_profile else 0,
+                    ),
+                )
+                conn.commit()
+
+            return self.get_paper_note(normalized_note_id, user_id=user_id)
+        except Exception as e:
+            logger.error(f"Error creating paper note: {str(e)}")
+            return None
+
+    def get_paper_note(self, note_id: str, user_id: str = DEFAULT_USER_ID) -> Optional[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT note_id, user_id, arxiv_id, session_id, source_message_id, title, content,
+                           note_type, source_chunk_ids, tags, include_in_profile, created_at, updated_at
+                    FROM paper_notes
+                    WHERE note_id = ? AND user_id = ?
+                    ''',
+                    (note_id, user_id),
+                )
+                row = cursor.fetchone()
+                return self._row_to_paper_note(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting paper note: {str(e)}")
+            return None
+
+    def list_paper_notes(
+        self,
+        *,
+        arxiv_id: str,
+        user_id: str = DEFAULT_USER_ID,
+        note_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                if note_type:
+                    normalized_note_type = str(note_type or "").strip().lower()
+                    cursor.execute(
+                        '''
+                        SELECT note_id, user_id, arxiv_id, session_id, source_message_id, title, content,
+                               note_type, source_chunk_ids, tags, include_in_profile, created_at, updated_at
+                        FROM paper_notes
+                        WHERE arxiv_id = ? AND user_id = ? AND note_type = ?
+                        ORDER BY updated_at DESC, created_at DESC
+                        ''',
+                        (arxiv_id, user_id, normalized_note_type),
+                    )
+                else:
+                    cursor.execute(
+                        '''
+                        SELECT note_id, user_id, arxiv_id, session_id, source_message_id, title, content,
+                               note_type, source_chunk_ids, tags, include_in_profile, created_at, updated_at
+                        FROM paper_notes
+                        WHERE arxiv_id = ? AND user_id = ?
+                        ORDER BY updated_at DESC, created_at DESC
+                        ''',
+                        (arxiv_id, user_id),
+                    )
+                return [self._row_to_paper_note(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error listing paper notes: {str(e)}")
+            return []
+
+    def update_paper_note(
+        self,
+        note_id: str,
+        *,
+        user_id: str = DEFAULT_USER_ID,
+        title: Optional[str] = None,
+        content: Optional[str] = None,
+        note_type: Optional[str] = None,
+        source_chunk_ids: Optional[List[Any]] = None,
+        tags: Optional[List[str]] = None,
+        include_in_profile: Optional[bool] = None,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            update_fields: List[str] = []
+            update_values: List[Any] = []
+
+            if title is not None:
+                update_fields.append("title = ?")
+                update_values.append(str(title or "").strip())
+            if content is not None:
+                update_fields.append("content = ?")
+                update_values.append(str(content or "").strip())
+            if note_type is not None:
+                normalized_note_type = str(note_type or "custom").strip().lower() or "custom"
+                if normalized_note_type not in PAPER_NOTE_TYPES:
+                    normalized_note_type = "custom"
+                update_fields.append("note_type = ?")
+                update_values.append(normalized_note_type)
+            if source_chunk_ids is not None:
+                normalized_chunk_ids = [str(item).strip() for item in source_chunk_ids if str(item).strip()]
+                update_fields.append("source_chunk_ids = ?")
+                update_values.append(self._serialize_json_field(normalized_chunk_ids))
+            if tags is not None:
+                normalized_tags = [str(item).strip() for item in tags if str(item).strip()]
+                update_fields.append("tags = ?")
+                update_values.append(self._serialize_json_field(normalized_tags))
+            if include_in_profile is not None:
+                update_fields.append("include_in_profile = ?")
+                update_values.append(1 if include_in_profile else 0)
+
+            if not update_fields:
+                return self.get_paper_note(note_id, user_id=user_id)
+
+            update_fields.append("updated_at = CURRENT_TIMESTAMP")
+            update_values.extend([note_id, user_id])
+
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    f'''
+                    UPDATE paper_notes
+                    SET {", ".join(update_fields)}
+                    WHERE note_id = ? AND user_id = ?
+                    ''',
+                    update_values,
+                )
+                conn.commit()
+                if cursor.rowcount <= 0:
+                    return None
+
+            return self.get_paper_note(note_id, user_id=user_id)
+        except Exception as e:
+            logger.error(f"Error updating paper note: {str(e)}")
+            return None
+
+    def delete_paper_note(self, note_id: str, user_id: str = DEFAULT_USER_ID) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    DELETE FROM paper_notes
+                    WHERE note_id = ? AND user_id = ?
+                    ''',
+                    (note_id, user_id),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error deleting paper note: {str(e)}")
             return False

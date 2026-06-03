@@ -11,11 +11,18 @@ import type {
   PaperPreferenceRequest,
   InterestVector,
   InterestVectorResult,
-  RecommendationResult
+  RecommendationResult,
+  PaperActionType,
+  PaperNote,
+  PaperNoteType,
+  UserPaperAction,
+  UserPaperActionMap,
+  UserResearchProfile
 } from '@/types/paper'
 import { mockPapers, mockRecommendedPapers, mockLabeledPapers, mockStats } from '@/mock/papers'
 
 const isMockMode = false
+const DEFAULT_USER_ID = 'local_user'
 
 function getPaperArxivId(paper: Pick<Paper, 'id' | 'arxivId'>) {
   return paper.arxivId || paper.id.split('/').pop() || paper.id
@@ -37,19 +44,106 @@ function normalizePaper(raw: any): Paper {
       ? raw.categories
       : String(raw.categories || '').split(',').map(category => category.trim()).filter(Boolean),
     pdfUrl: raw.pdf_url || raw.pdfUrl || '',
-    absUrl: raw.abs_url || raw.absUrl || raw.url || ''
+    absUrl: raw.abs_url || raw.absUrl || raw.url || '',
+    label: raw.label || null,
+    paperActions: raw.paperActions || raw.paper_actions || undefined,
+    query_match_score: raw.query_match_score,
+    personalization_score: raw.personalization_score,
+    final_score: raw.final_score,
+    score_breakdown: raw.score_breakdown || null,
+    matched_terms: Array.isArray(raw.matched_terms) ? raw.matched_terms : undefined,
+    personalized_reason: raw.personalized_reason || null,
+    match_reason: raw.match_reason || null,
+    priority: typeof raw.priority === 'number' ? raw.priority : undefined
+  }
+}
+
+function emptyResearchProfile(): UserResearchProfile {
+  return {
+    user_id: DEFAULT_USER_ID,
+    positive_topics: [],
+    negative_topics: [],
+    recent_topics: [],
+    preferred_categories: [],
+    preferred_answer_style: '',
+    common_question_types: [],
+    representative_papers: []
+  }
+}
+
+function normalizeResearchProfile(raw: any): UserResearchProfile {
+  return {
+    user_id: raw?.user_id || DEFAULT_USER_ID,
+    positive_topics: Array.isArray(raw?.positive_topics) ? raw.positive_topics : [],
+    negative_topics: Array.isArray(raw?.negative_topics) ? raw.negative_topics : [],
+    recent_topics: Array.isArray(raw?.recent_topics) ? raw.recent_topics : [],
+    preferred_categories: Array.isArray(raw?.preferred_categories) ? raw.preferred_categories : [],
+    preferred_answer_style: String(raw?.preferred_answer_style || ''),
+    common_question_types: Array.isArray(raw?.common_question_types) ? raw.common_question_types : [],
+    representative_papers: Array.isArray(raw?.representative_papers) ? raw.representative_papers : [],
+    created_at: raw?.created_at || null,
+    updated_at: raw?.updated_at || null
+  }
+}
+
+function normalizePaperActionMap(raw: any): UserPaperActionMap {
+  if (!raw || typeof raw !== 'object') return {}
+  return Object.fromEntries(
+    Object.entries(raw)
+      .filter(([, value]) => Array.isArray(value))
+      .map(([key, value]) => [key, (value as any[]).map(item => String(item)).filter(Boolean)])
+  ) as UserPaperActionMap
+}
+
+function normalizeUserPaperAction(raw: any): UserPaperAction {
+  return {
+    id: raw?.id,
+    user_id: raw?.user_id || DEFAULT_USER_ID,
+    arxiv_id: String(raw?.arxiv_id || ''),
+    action_type: raw?.action_type,
+    metadata: raw?.metadata || raw?.metadata_json || {},
+    created_at: raw?.created_at,
+    updated_at: raw?.updated_at
+  }
+}
+
+function normalizePaperNote(raw: any): PaperNote {
+  return {
+    note_id: String(raw?.note_id || ''),
+    user_id: raw?.user_id || DEFAULT_USER_ID,
+    arxiv_id: String(raw?.arxiv_id || ''),
+    session_id: raw?.session_id || null,
+    source_message_id: raw?.source_message_id || null,
+    source_turn_id: raw?.source_turn_id || null,
+    title: String(raw?.title || ''),
+    content: String(raw?.content || ''),
+    note_type: (raw?.note_type || 'custom') as PaperNoteType,
+    source_chunk_ids: Array.isArray(raw?.source_chunk_ids) ? raw.source_chunk_ids.map((item: any) => String(item)) : [],
+    tags: Array.isArray(raw?.tags) ? raw.tags.map((item: any) => String(item)) : [],
+    include_in_profile: Boolean(raw?.include_in_profile),
+    created_at: raw?.created_at || null,
+    updated_at: raw?.updated_at || null,
+    sources: Array.isArray(raw?.sources) ? raw.sources : []
   }
 }
 
 export async function getUserPreferences(): Promise<{
   liked_papers: string[]
   disliked_papers: string[]
+  paper_actions?: UserPaperActionMap
+  research_profile?: UserResearchProfile | null
 }> {
   try {
-    return await request.get('/user/preferences/local_user')
+    const response = await request.get(`/user/preferences/${DEFAULT_USER_ID}`)
+    return {
+      liked_papers: Array.isArray(response?.liked_papers) ? response.liked_papers : [],
+      disliked_papers: Array.isArray(response?.disliked_papers) ? response.disliked_papers : [],
+      paper_actions: normalizePaperActionMap(response?.paper_actions),
+      research_profile: response?.research_profile ? normalizeResearchProfile(response.research_profile) : null
+    }
   } catch (error: any) {
     if (error?.response?.status === 404) {
-      return { liked_papers: [], disliked_papers: [] }
+      return { liked_papers: [], disliked_papers: [], paper_actions: {}, research_profile: emptyResearchProfile() }
     }
     throw error
   }
@@ -94,6 +188,77 @@ export async function removePaperPreference(paper: Paper, label: LabelParams['la
   await request.delete(endpoint, {
     data: { arxiv_id: getPaperArxivId(paper) }
   })
+}
+
+export async function recordPaperAction(
+  paper: Paper,
+  actionType: PaperActionType,
+  metadata?: Record<string, any>
+): Promise<void> {
+  await request.post('/user/paper-action', {
+    user_id: DEFAULT_USER_ID,
+    arxiv_id: getPaperArxivId(paper),
+    action_type: actionType,
+    paper: buildPaperMaterializationPayload(paper),
+    metadata: metadata || null
+  })
+}
+
+export async function removePaperAction(paper: Paper, actionType: PaperActionType): Promise<void> {
+  await request.delete('/user/paper-action', {
+    data: {
+      user_id: DEFAULT_USER_ID,
+      arxiv_id: getPaperArxivId(paper),
+      action_type: actionType
+    }
+  })
+}
+
+export async function getUserPaperActions(actionType?: PaperActionType): Promise<{
+  status: string
+  user_id: string
+  action_type?: PaperActionType
+  actions: UserPaperAction[]
+  action_map: UserPaperActionMap
+}> {
+  const response = await request.get(`/user/paper-actions/${DEFAULT_USER_ID}`, {
+    params: actionType ? { action_type: actionType } : undefined
+  })
+  return {
+    status: response?.status || 'success',
+    user_id: response?.user_id || DEFAULT_USER_ID,
+    action_type: response?.action_type,
+    actions: Array.isArray(response?.actions) ? response.actions.map(normalizeUserPaperAction) : [],
+    action_map: normalizePaperActionMap(response?.action_map)
+  }
+}
+
+export async function getUserResearchProfile(): Promise<UserResearchProfile> {
+  try {
+    const response = await request.get(`/user/research-profile/${DEFAULT_USER_ID}`)
+    return normalizeResearchProfile(response)
+  } catch (error: any) {
+    if (error?.response?.status === 404) {
+      return emptyResearchProfile()
+    }
+    throw error
+  }
+}
+
+export async function upsertUserResearchProfile(profile: Partial<UserResearchProfile>): Promise<UserResearchProfile> {
+  const response = await request.put('/user/research-profile', {
+    user_id: DEFAULT_USER_ID,
+    ...profile
+  })
+  return normalizeResearchProfile(response?.profile || response)
+}
+
+export async function patchUserResearchProfile(profile: Partial<UserResearchProfile>): Promise<UserResearchProfile> {
+  const response = await request.patch('/user/research-profile', {
+    user_id: DEFAULT_USER_ID,
+    ...profile
+  })
+  return normalizeResearchProfile(response?.profile || response)
 }
 
 export async function searchPapers(params: SearchParams): Promise<PaginatedResponse<Paper>> {
@@ -265,7 +430,40 @@ export async function getInterestVector(): Promise<InterestVector> {
 }
 
 export async function recommendPapers(topN: number = 10, maxAgeMonths: number = 6): Promise<RecommendationResult> {
-  return request.post('/user/recommend-papers', { top_n: topN, max_age_months: maxAgeMonths })
+  const response = await request.post('/user/recommend-papers', { top_n: topN, max_age_months: maxAgeMonths })
+  return {
+    ...response,
+    research_profile: response?.research_profile ? normalizeResearchProfile(response.research_profile) : null,
+    paper_actions: normalizePaperActionMap(response?.paper_actions),
+    recommendations: Array.isArray(response?.recommendations)
+      ? response.recommendations.map((item: any) => ({
+          ...normalizePaper(item),
+          similarityScore: typeof item.similarity_score === 'number'
+            ? item.similarity_score
+            : (typeof item.similarityScore === 'number' ? item.similarityScore : (typeof item.score === 'number' ? item.score : 0)),
+          finalScore: typeof item.final_score === 'number' ? item.final_score : undefined,
+          reason: item.reason,
+          scoreBreakdown: item.score_breakdown || item.scoreBreakdown || undefined,
+          recall_source: item.recall_source || item.recallSource || undefined,
+          recall_cluster_id: item.recall_cluster_id || item.recallClusterId || null,
+          recall_cluster_similarity: typeof item.recall_cluster_similarity === 'number'
+            ? item.recall_cluster_similarity
+            : (typeof item.recallClusterSimilarity === 'number' ? item.recallClusterSimilarity : null),
+          recall_cluster_rank: typeof item.recall_cluster_rank === 'number'
+            ? item.recall_cluster_rank
+            : (typeof item.recallClusterRank === 'number' ? item.recallClusterRank : null),
+          recall_cluster_hits: Array.isArray(item.recall_cluster_hits) ? item.recall_cluster_hits : [],
+          best_matched_cluster_id: item.best_matched_cluster_id || item.bestMatchedClusterId || null,
+          best_matched_cluster_similarity: typeof item.best_matched_cluster_similarity === 'number'
+            ? item.best_matched_cluster_similarity
+            : (typeof item.bestMatchedClusterSimilarity === 'number' ? item.bestMatchedClusterSimilarity : null),
+          cluster_similarities: Array.isArray(item.cluster_similarities)
+            ? item.cluster_similarities
+            : (Array.isArray(item.clusterSimilarities) ? item.clusterSimilarities : undefined),
+          diversityDebug: item.diversity_debug || item.diversityDebug || undefined
+        }))
+      : []
+  }
 }
 
 export interface QaStatusResult {
@@ -366,6 +564,13 @@ export interface QaResult {
   status: string
   arxiv_id: string
   question: string
+  session_id?: string
+  chat_session?: PaperChatSession | null
+  turn_id?: string
+  original_question?: string
+  contextualized_question?: string
+  used_short_term_memory?: boolean
+  question_contextualization?: Record<string, any> | null
   answer: string
   retrieval_debug?: RetrievalDebug | null
   sources: Array<{
@@ -373,16 +578,136 @@ export interface QaResult {
     page_number: string
     source?: string
     subchunk_label?: string
+    section_path?: string
+    parent_chunk_id?: string | number
+    chunk_type?: string
+    asset_summary?: string
+    asset_preview_text?: string
+  }>
+}
+
+export interface PaperChatSession {
+  session_id: string
+  user_id: string
+  arxiv_id: string
+  title: string
+  created_at: string
+  updated_at: string
+  message_count: number
+  status: string
+}
+
+export interface PaperChatMessage {
+  message_id: string
+  turn_id: string
+  session_id: string
+  role: 'user' | 'assistant'
+  content: string
+  sources: Array<{
+    content?: string
+    page_number?: string
+    source?: string
+    section_path?: string
+    parent_chunk_id?: string | number
+    chunk_type?: string
+    asset_summary?: string
+    asset_preview_text?: string
+  }>
+  retrieval_debug_snapshot?: RetrievalDebug | null
+  contextualized_question?: string
+  question_contextualization?: Record<string, any> | null
+  status?: string
+  created_at: string
+}
+
+export interface PaperNotePayload {
+  user_id?: string
+  session_id?: string
+  source_message_id?: string
+  source_turn_id?: string
+  title?: string
+  content: string
+  note_type?: PaperNoteType
+  source_chunk_ids?: string[]
+  tags?: string[]
+  include_in_profile?: boolean
+}
+
+export async function listPaperNotes(
+  arxivId: string,
+  params: { user_id?: string; note_type?: PaperNoteType } = {}
+): Promise<{ items: PaperNote[] }> {
+  const response = await request.get(`/paper/${arxivId}/notes`, { params })
+  return {
+    items: Array.isArray(response?.items) ? response.items.map(normalizePaperNote) : []
+  }
+}
+
+export async function createPaperNote(
+  arxivId: string,
+  payload: PaperNotePayload
+): Promise<{ item: PaperNote | null }> {
+  const response = await request.post(`/paper/${arxivId}/notes`, payload)
+  return {
+    item: response?.item ? normalizePaperNote(response.item) : null
+  }
+}
+
+export async function updatePaperNote(
+  arxivId: string,
+  noteId: string,
+  payload: Partial<PaperNotePayload>
+): Promise<{ item: PaperNote | null }> {
+  const response = await request.patch(`/paper/${arxivId}/notes/${noteId}`, payload)
+  return {
+    item: response?.item ? normalizePaperNote(response.item) : null
+  }
+}
+
+export async function deletePaperNote(
+  arxivId: string,
+  noteId: string,
+  userId?: string
+): Promise<{ status: string; deleted: boolean }> {
+  return request.delete(`/paper/${arxivId}/notes/${noteId}`, {
+    params: { user_id: userId }
+  })
+}
+
+export function getPaperNotesExportUrl(arxivId: string, userId?: string): string {
+  const params = new URLSearchParams()
+  if (userId) params.set('user_id', userId)
+  const query = params.toString()
+  return `/api/paper/${arxivId}/notes/export${query ? `?${query}` : ''}`
+}
+
+export interface QaConversationContextTurn {
+  turn_id: string
+  question: string
+  answer_summary: string
+  created_at: string
+  sources: Array<{
+    source_id?: string | number
+    content?: string
+    page_number?: string
+    source?: string
+    section_path?: string
+    chunk_type?: string
+    asset_summary?: string
+    asset_preview_text?: string
   }>
 }
 
 export interface QaRequestOptions {
+  user_id?: string
+  session_id?: string
   top_k?: number
   enable_query_rewrite?: boolean
   enable_hyde?: boolean
   enable_keyword_search?: boolean
   enable_llm_rerank?: boolean
   debug?: boolean
+  conversation_context?: QaConversationContextTurn[]
 }
 
 export interface RetrievalDebugChunk {
@@ -446,14 +771,50 @@ export interface RetrievalDebugKeywordSearch {
   keywords?: string[]
 }
 
+export interface RetrievalDebugMemoryContext {
+  enabled?: boolean
+  reason?: string
+  query_keywords?: string[]
+  referenced_turn_ids?: string[]
+  referenced_source_ids?: string[]
+  candidates?: Array<Record<string, any>>
+  fallback_reason?: string | null
+}
+
+export interface RetrievalDebugMemoryRuntime {
+  enabled?: boolean
+  config?: Record<string, any>
+}
+
+export interface RetrievalDebugMemoryModule {
+  enabled?: boolean
+  applied?: boolean
+  reason?: string
+  fallback_reason?: string | null
+  session_id?: string | null
+  provided_turn_count?: number
+  used_turn_count?: number
+}
+
 export interface RetrievalDebug {
   original_query: string
+  original_question?: string
+  contextualized_question?: string
   rewritten_queries: string[]
   hyde_text: string
   query_plan?: Record<string, any>
   query_rewrite?: RetrievalDebugQueryRewrite
   hyde?: RetrievalDebugHyde
   keyword_search?: RetrievalDebugKeywordSearch
+  question_contextualization?: Record<string, any>
+  memory_context?: RetrievalDebugMemoryContext
+  memory_runtime?: RetrievalDebugMemoryRuntime
+  memory_modules?: {
+    short_term_memory?: RetrievalDebugMemoryModule
+    session?: RetrievalDebugMemoryModule
+    memory_retrieval?: RetrievalDebugMemoryModule
+    user_profile?: RetrievalDebugMemoryModule
+  }
   routes: Record<string, RetrievalDebugChunk[]>
   stages?: Record<string, RetrievalDebugChunk[]>
   final_chunks: RetrievalDebugChunk[]
@@ -466,26 +827,112 @@ export async function qaPaper(arxivId: string, question: string, options: QaRequ
   return request.post(`/paper/${arxivId}/qa`, { question, ...options })
 }
 
+export async function listPaperChatSessions(
+  arxivId: string,
+  params: { user_id?: string; limit?: number } = {}
+): Promise<{ items: PaperChatSession[] }> {
+  return request.get(`/paper/${arxivId}/chat-sessions`, { params })
+}
+
+export async function getRecentPaperChatSession(
+  arxivId: string,
+  userId?: string
+): Promise<{ item: PaperChatSession | null }> {
+  return request.get(`/paper/${arxivId}/chat-sessions/recent`, {
+    params: { user_id: userId }
+  })
+}
+
+export async function createPaperChatSession(
+  arxivId: string,
+  payload: { user_id?: string; title?: string } = {}
+): Promise<{ item: PaperChatSession | null }> {
+  return request.post(`/paper/${arxivId}/chat-sessions`, payload)
+}
+
+export async function getPaperChatSession(
+  arxivId: string,
+  sessionId: string,
+  userId?: string
+): Promise<{ item: PaperChatSession | null }> {
+  return request.get(`/paper/${arxivId}/chat-sessions/${sessionId}`, {
+    params: { user_id: userId }
+  })
+}
+
+export async function getPaperChatMessages(
+  arxivId: string,
+  sessionId: string,
+  userId?: string
+): Promise<{ session: PaperChatSession | null; items: PaperChatMessage[] }> {
+  return request.get(`/paper/${arxivId}/chat-sessions/${sessionId}/messages`, {
+    params: { user_id: userId }
+  })
+}
+
+export async function clearPaperChatSession(
+  arxivId: string,
+  sessionId: string,
+  userId?: string
+): Promise<{ item: PaperChatSession | null }> {
+  return request.post(`/paper/${arxivId}/chat-sessions/${sessionId}/clear`, {
+    user_id: userId
+  })
+}
+
+export async function deletePaperChatSession(
+  arxivId: string,
+  sessionId: string,
+  userId?: string
+): Promise<{ status: string; deleted: boolean }> {
+  return request.delete(`/paper/${arxivId}/chat-sessions/${sessionId}`, {
+    params: { user_id: userId }
+  })
+}
+
 export interface QaStreamHandlers {
   onMeta?: (meta: {
     status: string
     arxiv_id: string
     question: string
-      sources: Array<{
-        content: string
-        page_number: string
-        source?: string
-      }>
-      retrieval_debug?: RetrievalDebug | null
+    session_id?: string
+    chat_session?: PaperChatSession | null
+    original_question?: string
+    contextualized_question?: string
+    used_short_term_memory?: boolean
+    question_contextualization?: Record<string, any> | null
+    sources: Array<{
+      content: string
+      page_number: string
+      source?: string
+      section_path?: string
+      parent_chunk_id?: string | number
+      chunk_type?: string
+      asset_summary?: string
+      asset_preview_text?: string
+    }>
+    retrieval_debug?: RetrievalDebug | null
   }) => void
   onDelta?: (delta: string) => void
   onDone?: (payload: {
     status: string
     answer: string
+    session_id?: string
+    chat_session?: PaperChatSession | null
+    turn_id?: string
+    original_question?: string
+    contextualized_question?: string
+    used_short_term_memory?: boolean
+    question_contextualization?: Record<string, any> | null
     sources: Array<{
       content: string
       page_number: string
       source?: string
+      section_path?: string
+      parent_chunk_id?: string | number
+      chunk_type?: string
+      asset_summary?: string
+      asset_preview_text?: string
     }>
     retrieval_debug?: RetrievalDebug | null
     usage?: {
@@ -559,8 +1006,19 @@ export async function qaPaperStream(
     content: string
     page_number: string
     source?: string
+    section_path?: string
+    parent_chunk_id?: string | number
+    chunk_type?: string
+    asset_summary?: string
+    asset_preview_text?: string
   }> = []
   let finalRetrievalDebug: RetrievalDebug | null = null
+  let finalSessionId = options.session_id || ''
+  let finalChatSession: PaperChatSession | null = null
+  let finalOriginalQuestion = question
+  let finalContextualizedQuestion = question
+  let finalUsedShortTermMemory = false
+  let finalQuestionContextualization: Record<string, any> | null = null
 
   while (true) {
     const { value, done } = await reader.read()
@@ -583,6 +1041,24 @@ export async function qaPaperStream(
         if (parsed.data.retrieval_debug) {
           finalRetrievalDebug = parsed.data.retrieval_debug
         }
+        if (typeof parsed.data.session_id === 'string' && parsed.data.session_id) {
+          finalSessionId = parsed.data.session_id
+        }
+        if (parsed.data.chat_session) {
+          finalChatSession = parsed.data.chat_session
+        }
+        if (typeof parsed.data.original_question === 'string' && parsed.data.original_question) {
+          finalOriginalQuestion = parsed.data.original_question
+        }
+        if (typeof parsed.data.contextualized_question === 'string' && parsed.data.contextualized_question) {
+          finalContextualizedQuestion = parsed.data.contextualized_question
+        }
+        if (typeof parsed.data.used_short_term_memory === 'boolean') {
+          finalUsedShortTermMemory = parsed.data.used_short_term_memory
+        }
+        if (parsed.data.question_contextualization) {
+          finalQuestionContextualization = parsed.data.question_contextualization
+        }
       } else if (parsed.event === 'delta' && parsed.data?.delta) {
         finalAnswer += parsed.data.delta
         handlers.onDelta?.(parsed.data.delta)
@@ -596,11 +1072,35 @@ export async function qaPaperStream(
         if (parsed.data.retrieval_debug) {
           finalRetrievalDebug = parsed.data.retrieval_debug
         }
+        if (typeof parsed.data.session_id === 'string' && parsed.data.session_id) {
+          finalSessionId = parsed.data.session_id
+        }
+        if (parsed.data.chat_session) {
+          finalChatSession = parsed.data.chat_session
+        }
+        if (typeof parsed.data.original_question === 'string' && parsed.data.original_question) {
+          finalOriginalQuestion = parsed.data.original_question
+        }
+        if (typeof parsed.data.contextualized_question === 'string' && parsed.data.contextualized_question) {
+          finalContextualizedQuestion = parsed.data.contextualized_question
+        }
+        if (typeof parsed.data.used_short_term_memory === 'boolean') {
+          finalUsedShortTermMemory = parsed.data.used_short_term_memory
+        }
+        if (parsed.data.question_contextualization) {
+          finalQuestionContextualization = parsed.data.question_contextualization
+        }
         handlers.onDone?.(parsed.data)
         return {
           status: parsed.data.status || 'success',
           arxiv_id: arxivId,
           question,
+          session_id: finalSessionId || undefined,
+          chat_session: finalChatSession,
+          original_question: finalOriginalQuestion,
+          contextualized_question: finalContextualizedQuestion,
+          used_short_term_memory: finalUsedShortTermMemory,
+          question_contextualization: finalQuestionContextualization,
           answer: finalAnswer,
           sources: finalSources,
           retrieval_debug: finalRetrievalDebug
@@ -617,6 +1117,12 @@ export async function qaPaperStream(
     status: 'success',
     arxiv_id: arxivId,
     question,
+    session_id: finalSessionId || undefined,
+    chat_session: finalChatSession,
+    original_question: finalOriginalQuestion,
+    contextualized_question: finalContextualizedQuestion,
+    used_short_term_memory: finalUsedShortTermMemory,
+    question_contextualization: finalQuestionContextualization,
     answer: finalAnswer,
     sources: finalSources,
     retrieval_debug: finalRetrievalDebug

@@ -13,6 +13,7 @@ from services.storage.database_service import DatabaseService
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
 from services.storage.vector_store_service import VectorStoreService
 from utils.config import (
+    get_memory_runtime_config,
     get_enhanced_retrieval_runtime_config,
     get_recommendation_clustering_runtime_config,
     get_recommendation_runtime_config,
@@ -60,10 +61,112 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         self.collection_name = collection_name
         self._arxiv_backfill_lock = threading.Lock()
         self._arxiv_backfill_next_allowed_time = 0.0
+        self.memory_runtime_config = get_memory_runtime_config()
+
+    def _memory_flag(self, key: str, default: Any = None) -> Any:
+        return self.memory_runtime_config.get(key, default)
+
+    @staticmethod
+    def _normalize_text_terms(values: Any) -> List[str]:
+        if not values:
+            return []
+        if isinstance(values, list):
+            source = values
+        else:
+            source = [values]
+        normalized: List[str] = []
+        for value in source:
+            text = str(value or "").strip().lower()
+            if text:
+                normalized.append(text)
+        return normalized
+
+    def _build_profile_signal_bundle(self, user_id: str) -> Dict[str, Any]:
+        if not bool(self._memory_flag("enable_user_research_profile", False)):
+            return {
+                "profile": {},
+                "actions": self.db_service.get_user_paper_action_map(user_id),
+                "excluded_ids": [],
+                "disabled": True,
+            }
+        profile = self.db_service.get_user_research_profile(user_id)
+        actions = self.db_service.get_user_paper_action_map(user_id)
+        excluded_ids = list(
+            dict.fromkeys(
+                [
+                    *self._normalize_text_terms(actions.get("like", [])),
+                    *self._normalize_text_terms(actions.get("dislike", [])),
+                    *self._normalize_text_terms(actions.get("not_interested", [])),
+                    *self._normalize_text_terms(actions.get("archived", [])),
+                ]
+            )
+        )
+        return {
+            "profile": profile,
+            "actions": actions,
+            "excluded_ids": excluded_ids,
+            "disabled": False,
+        }
+
+    def _compute_profile_adjustment(
+        self,
+        candidate: Dict[str, Any],
+        profile: Optional[Dict[str, Any]] = None,
+        actions: Optional[Dict[str, List[str]]] = None,
+    ) -> Dict[str, Any]:
+        profile = profile or {}
+        actions = actions or {}
+        arxiv_id = str(candidate.get("arxiv_id", "") or candidate.get("id", "") or "").strip()
+        title = str(candidate.get("title", "") or "").lower()
+        abstract = str(candidate.get("abstract", "") or candidate.get("summary", "") or "").lower()
+        haystack = f"{title}\n{abstract}"
+        categories = {
+            str(item).strip().lower()
+            for item in (candidate.get("categories") if isinstance(candidate.get("categories"), list) else str(candidate.get("categories") or "").split(","))
+            if str(item).strip()
+        }
+
+        positive_topics = self._normalize_text_terms(profile.get("positive_topics"))
+        negative_topics = self._normalize_text_terms(profile.get("negative_topics"))
+        preferred_categories = {item.lower() for item in self._normalize_text_terms(profile.get("preferred_categories"))}
+
+        matched_positive = [topic for topic in positive_topics if topic and topic in haystack]
+        matched_negative = [topic for topic in negative_topics if topic and topic in haystack]
+        matched_categories = sorted(categories & preferred_categories)
+
+        action_boost = 0.0
+        if arxiv_id and arxiv_id in self._normalize_text_terms(actions.get("favorite", [])):
+            action_boost += 0.08
+        if arxiv_id and arxiv_id in self._normalize_text_terms(actions.get("later", [])):
+            action_boost += 0.04
+        if arxiv_id and arxiv_id in self._normalize_text_terms(actions.get("read", [])):
+            action_boost -= 0.03
+
+        profile_score = min(0.24, len(matched_positive) * 0.04 + len(matched_categories) * 0.03 + action_boost)
+        profile_penalty = min(0.24, len(matched_negative) * 0.06)
+        net_adjustment = profile_score - profile_penalty
+
+        reasons: List[str] = []
+        if matched_positive:
+            reasons.append(f"匹配长期主题: {', '.join(matched_positive[:3])}")
+        if matched_categories:
+            reasons.append(f"匹配偏好分类: {', '.join(matched_categories[:3])}")
+        if matched_negative:
+            reasons.append(f"命中负向主题: {', '.join(matched_negative[:3])}")
+
+        return {
+            "profile_score": profile_score,
+            "profile_penalty": profile_penalty,
+            "profile_adjustment": net_adjustment,
+            "matched_positive_topics": matched_positive,
+            "matched_negative_topics": matched_negative,
+            "matched_preferred_categories": matched_categories,
+            "profile_reasons": reasons,
+        }
 
     def _get_or_refresh_interest_vector(self, user_id: str) -> Dict[str, Any]:
         vector_data = self.db_service.get_user_interest_vector(user_id=user_id)
-        latest_preference_ts = self.db_service.get_latest_user_preference_timestamp(user_id=user_id)
+        latest_preference_ts = self.db_service.get_latest_user_signal_timestamp(user_id=user_id)
 
         if vector_data and latest_preference_ts and self._is_vector_stale(vector_data.get("updated_at"), latest_preference_ts):
             logger.info("Interest vector is stale for user %s, rebuilding", user_id)
@@ -96,7 +199,10 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         preferences = self.db_service.get_user_preferences(user_id=user_id)
         liked_ids = preferences.get("liked_papers", [])
         disliked_ids = preferences.get("disliked_papers", [])
-        excluded_ids = list(dict.fromkeys([*liked_ids, *disliked_ids]))
+        profile_bundle = self._build_profile_signal_bundle(user_id)
+        research_profile = profile_bundle.get("profile", {})
+        paper_actions = profile_bundle.get("actions", {})
+        excluded_ids = list(dict.fromkeys([*liked_ids, *disliked_ids, *profile_bundle.get("excluded_ids", [])]))
 
         liked_details = self.db_service.get_liked_papers_with_details(user_id=user_id)
         liked_category_freq = self._build_liked_category_frequency(liked_details)
@@ -203,6 +309,25 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                 disliked_vector=disliked_vector,
                 embedding_config=embedding_config,
             )
+            profile_adjustment = self._compute_profile_adjustment(
+                scored_candidate,
+                profile=research_profile,
+                actions=paper_actions,
+            )
+            scored_candidate["profile_score"] = profile_adjustment["profile_score"]
+            scored_candidate["profile_penalty"] = profile_adjustment["profile_penalty"]
+            scored_candidate["profile_reasons"] = profile_adjustment["profile_reasons"]
+            scored_candidate["matched_positive_topics"] = profile_adjustment["matched_positive_topics"]
+            scored_candidate["matched_negative_topics"] = profile_adjustment["matched_negative_topics"]
+            scored_candidate["matched_preferred_categories"] = profile_adjustment["matched_preferred_categories"]
+            scored_candidate["relevance_score"] = float(scored_candidate.get("relevance_score", 0.0) or 0.0) + profile_adjustment["profile_adjustment"]
+            scored_candidate["final_score"] = float(scored_candidate.get("final_score", 0.0) or 0.0) + profile_adjustment["profile_adjustment"]
+            score_breakdown = dict(scored_candidate.get("score_breakdown", {}))
+            score_breakdown["profile_score"] = profile_adjustment["profile_score"]
+            score_breakdown["profile_penalty"] = profile_adjustment["profile_penalty"]
+            score_breakdown["relevance_score"] = scored_candidate["relevance_score"]
+            score_breakdown["final_score"] = scored_candidate["final_score"]
+            scored_candidate["score_breakdown"] = score_breakdown
             scored_candidates.append(scored_candidate)
             embedding_source = str(scored_candidate.get("_embedding_source", "") or "")
             if embedding_source == "recomputed":
@@ -241,6 +366,8 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             "total_found": len(scored_candidates),
             "interest_profile_mode": user_vector_data.get("profile_mode", "mean"),
             "interest_cluster_count": user_vector_data.get("cluster_count", 0),
+            "research_profile": research_profile,
+            "paper_actions": paper_actions,
             "recall_mode": recall_mode,
             "recommendations": selected,
         }
@@ -277,6 +404,9 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         title_query = str((search_spec or {}).get("title_query") or "").strip()
         abstract_query = str((search_spec or {}).get("abstract_query") or "").strip()
         search_categories = list((search_spec or {}).get("categories") or [])
+        profile_bundle = self._build_profile_signal_bundle(user_id)
+        research_profile = profile_bundle.get("profile", {})
+        paper_actions = profile_bundle.get("actions", {})
         try:
             user_vector_data = self._get_or_refresh_interest_vector(user_id)
             personalized_available = True
@@ -385,14 +515,27 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                 score_breakdown.update(query_breakdown["query_score_breakdown"])
 
             query_match_score = float(query_breakdown["query_match_score"] or 0.0)
-            final_score = query_match_score * 0.65 + personalization_score * 0.35
+            profile_adjustment = self._compute_profile_adjustment(
+                ranked_candidate,
+                profile=research_profile,
+                actions=paper_actions,
+            )
+            final_score = query_match_score * 0.60 + personalization_score * 0.30 + profile_adjustment["profile_adjustment"]
             ranked_candidate["query_match_score"] = query_match_score
             ranked_candidate["personalization_score"] = personalization_score
+            ranked_candidate["profile_score"] = profile_adjustment["profile_score"]
+            ranked_candidate["profile_penalty"] = profile_adjustment["profile_penalty"]
+            ranked_candidate["profile_reasons"] = profile_adjustment["profile_reasons"]
+            ranked_candidate["matched_positive_topics"] = profile_adjustment["matched_positive_topics"]
+            ranked_candidate["matched_negative_topics"] = profile_adjustment["matched_negative_topics"]
+            ranked_candidate["matched_preferred_categories"] = profile_adjustment["matched_preferred_categories"]
             ranked_candidate["final_score"] = final_score
             ranked_candidate["score_breakdown"] = {
                 **score_breakdown,
                 "query_match_score": query_match_score,
                 "personalization_score": personalization_score,
+                "profile_score": profile_adjustment["profile_score"],
+                "profile_penalty": profile_adjustment["profile_penalty"],
                 "final_score": final_score,
             }
             ranked_candidate["match_reason"] = self._build_match_reason(query_match_score, list(query_breakdown["matched_terms"]))
@@ -438,4 +581,6 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             "top_n": limit,
             "liked_papers_count": len(liked_ids),
             "disliked_papers_count": len(disliked_ids),
+            "research_profile": research_profile,
+            "paper_actions": paper_actions,
         }

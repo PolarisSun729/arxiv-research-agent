@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import type { PaperNote, PaperNoteType } from '@/types/paper'
 import {
   ArrowLeft,
   ChatDotRound,
@@ -14,7 +15,7 @@ import RagChatPanel from '@/components/rag-chat/RagChatPanel.vue'
 import RagEvidencePanel from '@/components/rag-chat/RagEvidencePanel.vue'
 import { usePaperRagChat } from '@/composables/usePaperRagChat'
 import { usePaperStore } from '@/stores/paperStore'
-import { qaTurnToRagMessages } from '@/types/ragChat'
+import { qaTurnToRagMessages, type RagChatMessage } from '@/types/ragChat'
 import {
   createPaperQaIndex,
   getPaperQaDiagnostic,
@@ -43,13 +44,20 @@ const modelBadge = 'Qwen 3.6 Plus'
 const {
   qaResults,
   qaLoading,
+  sessionLoading,
   evidenceDrawerOpen,
   activeEvidenceTurn,
+  currentSession,
+  availableSessions,
   retrievalOptions,
   submitQuestion,
   applyPrompt,
   closeEvidence,
-  resetChat
+  resetChat,
+  loadRecentSession,
+  loadSession,
+  createNewSession,
+  clearCurrentSession
 } = usePaperRagChat({
   paperId,
   onEnterQaMode: () => {
@@ -68,6 +76,54 @@ const chatTurns = computed(() => qaResults.value)
 const ragChatMessages = computed(() => chatTurns.value.flatMap(qaTurnToRagMessages))
 const loadingMethodLabel = computed(() => (loadingMethod.value === 'docling' ? 'Docling' : 'PyMuPDF'))
 const loadingMethodHint = computed(() => (loadingMethod.value === 'docling' ? '更适合论文结构' : '保留传统解析'))
+const currentPaperActions = computed(() => store.currentPaper?.paperActions || {})
+const preferredAnswerStyle = computed(() => store.researchProfile?.preferred_answer_style || '')
+const paperNotes = computed(() => store.paperNotes)
+const notesLoading = ref(false)
+const noteSaving = ref(false)
+const noteDialogOpen = ref(false)
+const noteEditorMode = ref<'create' | 'edit'>('create')
+const editingNoteId = ref('')
+const activeNoteTypeFilter = ref<PaperNoteType | 'all'>('all')
+const draftSourceTurnId = ref('')
+const draftSourceMessageId = ref('')
+const draftSources = ref<any[]>([])
+const noteForm = ref({
+  title: '',
+  content: '',
+  note_type: 'summary' as PaperNoteType,
+  tagsText: '',
+  include_in_profile: false,
+  keepSources: true,
+  source_chunk_ids: [] as string[]
+})
+
+const noteTypeOptions: Array<{ label: string; value: PaperNoteType }> = [
+  { label: '总结', value: 'summary' },
+  { label: '方法', value: 'method' },
+  { label: '实验', value: 'experiment' },
+  { label: '结果', value: 'result' },
+  { label: '局限性', value: 'limitation' },
+  { label: '想法', value: 'idea' },
+  { label: '待办', value: 'todo' },
+  { label: '自定义', value: 'custom' }
+]
+
+const noteTypeLabelMap: Record<PaperNoteType, string> = {
+  summary: '总结',
+  method: '方法',
+  experiment: '实验',
+  result: '结果',
+  limitation: '局限性',
+  idea: '想法',
+  todo: '待办',
+  custom: '自定义'
+}
+
+const currentSessionId = computed(() => {
+  const session = currentSession.value as any
+  return String(session?.session_id || session?.sessionId || '').trim()
+})
 
 function formatDate(dateStr: string) {
   return new Date(dateStr).toLocaleDateString('zh-CN', {
@@ -75,6 +131,194 @@ function formatDate(dateStr: string) {
     month: 'long',
     day: 'numeric'
   })
+}
+
+function formatDateTime(dateStr?: string | null) {
+  if (!dateStr) return '-'
+  return new Date(dateStr).toLocaleString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
+  })
+}
+
+function normalizeChunkIds(sources: Array<any> = []) {
+  return Array.from(
+    new Set(
+      sources
+        .map(source => String(source?.parent_chunk_id || '').trim())
+        .filter(Boolean)
+    )
+  )
+}
+
+function buildTagsText(tags: string[] = []) {
+  return tags.filter(Boolean).join(', ')
+}
+
+function parseTagsText(value: string) {
+  return Array.from(
+    new Set(
+      String(value || '')
+        .split(/[，,;；\n]/)
+        .map(item => item.trim())
+        .filter(Boolean)
+    )
+  )
+}
+
+function resetNoteForm() {
+  editingNoteId.value = ''
+  draftSourceTurnId.value = ''
+  draftSourceMessageId.value = ''
+  draftSources.value = []
+  noteForm.value = {
+    title: '',
+    content: '',
+    note_type: 'summary',
+    tagsText: '',
+    include_in_profile: false,
+    keepSources: true,
+    source_chunk_ids: []
+  }
+}
+
+async function fetchPaperNotes() {
+  if (!paperId.value) return []
+  notesLoading.value = true
+  try {
+    return await store.fetchPaperNotes(
+      paperId.value,
+      activeNoteTypeFilter.value === 'all' ? undefined : activeNoteTypeFilter.value
+    )
+  } finally {
+    notesLoading.value = false
+  }
+}
+
+function openBlankNoteDialog() {
+  noteEditorMode.value = 'create'
+  resetNoteForm()
+  noteDialogOpen.value = true
+}
+
+function openAssistantNoteDialog(item: RagChatMessage) {
+  noteEditorMode.value = 'create'
+  resetNoteForm()
+  draftSourceTurnId.value = String(item.turnId || '').trim()
+  draftSources.value = Array.isArray(item.sources) ? item.sources : []
+  noteForm.value = {
+    title: '',
+    content: String(item.content || '').trim(),
+    note_type: 'summary',
+    tagsText: '',
+    include_in_profile: false,
+    keepSources: true,
+    source_chunk_ids: normalizeChunkIds(item.sources || [])
+  }
+  noteDialogOpen.value = true
+}
+
+function openEditNoteDialog(note: PaperNote) {
+  noteEditorMode.value = 'edit'
+  editingNoteId.value = note.note_id
+  draftSourceTurnId.value = String(note.source_turn_id || '').trim()
+  draftSourceMessageId.value = String(note.source_message_id || '').trim()
+  draftSources.value = Array.isArray(note.sources) ? note.sources : []
+  noteForm.value = {
+    title: note.title || '',
+    content: note.content || '',
+    note_type: note.note_type || 'custom',
+    tagsText: buildTagsText(note.tags || []),
+    include_in_profile: Boolean(note.include_in_profile),
+    keepSources: (note.source_chunk_ids || []).length > 0,
+    source_chunk_ids: [...(note.source_chunk_ids || [])]
+  }
+  noteDialogOpen.value = true
+}
+
+async function submitNoteForm() {
+  if (!store.currentPaper || !paperId.value) return
+  const content = String(noteForm.value.content || '').trim()
+  if (!content) {
+    ElMessage.warning('请先填写笔记内容')
+    return
+  }
+
+  noteSaving.value = true
+  try {
+    const payload = {
+      title: String(noteForm.value.title || '').trim() || undefined,
+      content,
+      note_type: noteForm.value.note_type,
+      tags: parseTagsText(noteForm.value.tagsText),
+      include_in_profile: Boolean(noteForm.value.include_in_profile),
+      source_chunk_ids: noteForm.value.keepSources ? [...noteForm.value.source_chunk_ids] : []
+    }
+
+    if (noteEditorMode.value === 'edit' && editingNoteId.value) {
+      await store.editPaperNote(paperId.value, editingNoteId.value, payload)
+      ElMessage.success('笔记已更新')
+    } else {
+      await store.savePaperNote(paperId.value, {
+        ...payload,
+        session_id: currentSessionId.value || undefined,
+        source_message_id: draftSourceMessageId.value || undefined,
+        source_turn_id: draftSourceTurnId.value || undefined
+      })
+      if (store.currentPaper && !currentPaperActions.value.note_saved) {
+        await store.togglePaperAction(store.currentPaper, 'note_saved', true).catch(() => undefined)
+      }
+      ElMessage.success('笔记已保存')
+    }
+
+    noteDialogOpen.value = false
+    await fetchPaperNotes()
+  } catch (error: any) {
+    ElMessage.error(error?.response?.data?.detail || '保存笔记失败')
+  } finally {
+    noteSaving.value = false
+  }
+}
+
+async function handleDeleteNote(note: PaperNote) {
+  if (!paperId.value) return
+  try {
+    await ElMessageBox.confirm('删除后不会影响原始 QA 记录，是否继续？', '删除笔记', {
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+      type: 'warning'
+    })
+  } catch {
+    return
+  }
+
+  try {
+    const deleted = await store.removeExistingPaperNote(paperId.value, note.note_id)
+    if (deleted) {
+      if (store.currentPaper && currentPaperActions.value.note_saved && store.paperNotes.length === 0) {
+        await store.togglePaperAction(store.currentPaper, 'note_saved', false).catch(() => undefined)
+      }
+      ElMessage.success('笔记已删除')
+    }
+  } catch (error: any) {
+    ElMessage.error(error?.response?.data?.detail || '删除笔记失败')
+  }
+}
+
+function handleExportNotes() {
+  if (!paperId.value || typeof window === 'undefined') return
+  window.open(store.getPaperNotesExportLink(paperId.value), '_blank', 'noopener,noreferrer')
+}
+
+async function handleRefreshNotes() {
+  try {
+    await fetchPaperNotes()
+  } catch (error: any) {
+    ElMessage.error(error?.response?.data?.detail || '刷新笔记失败')
+  }
 }
 
 function getTraceFileName(pathValue?: string) {
@@ -115,6 +359,24 @@ function handlePanelOpenEvidence(turnId: string) {
   if (!turn) return
   activeEvidenceTurn.value = turn
   evidenceDrawerOpen.value = isNarrowScreen.value
+}
+
+async function handleTogglePaperAction(actionType: 'favorite' | 'read' | 'later' | 'not_interested' | 'note_saved') {
+  if (!store.currentPaper) return
+  try {
+    const enabled = !currentPaperActions.value[actionType]
+    await store.togglePaperAction(store.currentPaper, actionType, enabled)
+    const actionLabels: Record<string, string> = {
+      favorite: '收藏',
+      read: '已读',
+      later: '稍后读',
+      not_interested: '不感兴趣',
+      note_saved: '已记笔记'
+    }
+    ElMessage.success(`${enabled ? '已添加' : '已取消'}${actionLabels[actionType]}`)
+  } catch (error: any) {
+    ElMessage.error(error?.response?.data?.detail || '操作失败')
+  }
 }
 
 async function fetchQaStatus() {
@@ -169,18 +431,38 @@ async function handleAskPaper() {
   }
 
   qaMode.value = true
+  if (!currentSession.value && !sessionLoading.value) {
+    await loadRecentSession()
+  }
 }
 
 function closeQaMode() {
   qaMode.value = false
 }
 
+async function handleCreateSession() {
+  qaMode.value = true
+  await createNewSession()
+}
+
+async function handleClearSession() {
+  await clearCurrentSession()
+}
+
+async function handleResumeSession(sessionId: string) {
+  qaMode.value = true
+  await loadSession(sessionId)
+}
+
 onMounted(async () => {
   syncViewport()
   window.addEventListener('resize', syncViewport)
   try {
+    await Promise.all([store.fetchResearchProfile(), store.fetchPaperActions()])
     await store.fetchPaperById(paperId.value)
     await fetchQaStatus()
+    await fetchPaperNotes()
+    await loadRecentSession()
   } catch (error) {
     console.error('Failed to fetch paper:', error)
   } finally {
@@ -196,13 +478,25 @@ onBeforeUnmount(() => {
 watch(paperId, async () => {
   loading.value = true
   try {
+    await Promise.all([store.fetchResearchProfile(), store.fetchPaperActions()])
     await store.fetchPaperById(paperId.value)
     await fetchQaStatus()
+    await fetchPaperNotes()
     resetChat()
+    await loadRecentSession()
   } catch (error) {
     console.error('Failed to fetch paper:', error)
   } finally {
     loading.value = false
+  }
+})
+
+watch(activeNoteTypeFilter, async () => {
+  if (loading.value) return
+  try {
+    await fetchPaperNotes()
+  } catch (error) {
+    console.error('Failed to filter paper notes:', error)
   }
 })
 
@@ -269,6 +563,23 @@ watch(paperId, async () => {
                   查看原文
                 </el-button>
               </a>
+              <div class="paper-action-strip">
+                <el-button size="small" plain :type="currentPaperActions.favorite ? 'warning' : 'default'" @click="handleTogglePaperAction('favorite')">
+                  {{ currentPaperActions.favorite ? '已收藏' : '收藏' }}
+                </el-button>
+                <el-button size="small" plain :type="currentPaperActions.read ? 'success' : 'default'" @click="handleTogglePaperAction('read')">
+                  {{ currentPaperActions.read ? '已读' : '标记已读' }}
+                </el-button>
+                <el-button size="small" plain :type="currentPaperActions.later ? 'primary' : 'default'" @click="handleTogglePaperAction('later')">
+                  {{ currentPaperActions.later ? '已加入稍后读' : '稍后读' }}
+                </el-button>
+                <el-button size="small" plain :type="currentPaperActions.note_saved ? 'info' : 'default'" @click="handleTogglePaperAction('note_saved')">
+                  {{ currentPaperActions.note_saved ? '已记笔记' : '记录笔记' }}
+                </el-button>
+                <el-button size="small" plain :type="currentPaperActions.not_interested ? 'danger' : 'default'" @click="handleTogglePaperAction('not_interested')">
+                  {{ currentPaperActions.not_interested ? '已标记不感兴趣' : '不感兴趣' }}
+                </el-button>
+              </div>
               <div class="parser-card">
                 <div class="parser-card-head">
                   <span class="parser-label">PDF 解析</span>
@@ -291,6 +602,9 @@ watch(paperId, async () => {
                 {{ qaStatus.has_index ? `索引已完成，${qaStatus.chunk_count || 0} 个 chunks 可供检索` : `先创建索引，默认解析方式：${loadingMethodLabel}` }}
               </span>
             </div>
+            <div v-if="preferredAnswerStyle" class="answer-style-note">
+              当前回答风格偏好：{{ preferredAnswerStyle }}
+            </div>
           </div>
         </section>
 
@@ -309,15 +623,39 @@ watch(paperId, async () => {
                   <el-icon><RefreshRight /></el-icon>
                   刷新状态
                 </el-button>
+                <el-button text class="refresh-btn" @click="handleCreateSession">
+                  新建会话
+                </el-button>
+                <el-button v-if="currentSession" text class="refresh-btn" @click="handleClearSession">
+                  清空会话
+                </el-button>
                 <el-button v-if="qaMode" text class="refresh-btn" @click="closeQaMode">
                   关闭问答
                 </el-button>
               </div>
             </div>
 
+            <div v-if="currentSession || availableSessions.length" class="session-strip">
+              <div class="session-current" v-if="currentSession">
+                当前会话：{{ currentSession.title || '未命名会话' }}
+              </div>
+              <div v-if="availableSessions.length" class="session-list">
+                <el-button
+                  v-for="session in availableSessions.slice(0, 5)"
+                  :key="session.session_id"
+                  size="small"
+                  :type="session.session_id === currentSession?.session_id ? 'primary' : 'default'"
+                  plain
+                  @click="handleResumeSession(session.session_id)"
+                >
+                  {{ session.title || '未命名会话' }}
+                </el-button>
+              </div>
+            </div>
+
             <RagChatPanel
               :messages="ragChatMessages"
-              :loading="qaLoading"
+              :loading="qaLoading || sessionLoading"
               :quick-prompts="quickPrompts"
               title="论文问答"
               :description="`围绕《${store.currentPaper.title}》提问，系统会先召回相关 chunk，再生成答案。`"
@@ -348,6 +686,15 @@ watch(paperId, async () => {
                     @click="handlePanelOpenEvidence(item.turnId || '')"
                   >
                     查看来源与调试
+                  </el-button>
+                  <el-button
+                    size="small"
+                    text
+                    type="success"
+                    class="note-button"
+                    @click="openAssistantNoteDialog(item)"
+                  >
+                    保存为笔记
                   </el-button>
                 </div>
               </template>
@@ -455,7 +802,7 @@ watch(paperId, async () => {
               <div class="side-title">使用说明</div>
               <ul class="hint-list">
                 <li>问题会先转成向量，在对应论文索引中检索相似片段。</li>
-                <li>当前实现是单轮问答，没有历史上下文记忆。</li>
+                <li>短期上下文会参与问题改写与记忆检索，但不会直接覆盖最终证据。</li>
                 <li>如果后端没有足够相关片段，会返回更保守的答案。</li>
               </ul>
             </div>
@@ -664,6 +1011,12 @@ watch(paperId, async () => {
   flex-wrap: wrap;
   gap: 12px;
   margin-top: 4px;
+}
+
+.paper-action-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .parser-card {

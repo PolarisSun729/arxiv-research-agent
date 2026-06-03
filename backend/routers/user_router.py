@@ -4,12 +4,32 @@ import logging
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
+from pydantic import BaseModel, Field
 
 from dependencies import get_database_service, get_recommendation_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/user", tags=["user"])
+
+
+class PaperActionRequest(BaseModel):
+    user_id: str = Field(default="local_user")
+    arxiv_id: str
+    action_type: str
+    paper: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class ResearchProfileRequest(BaseModel):
+    user_id: str = Field(default="local_user")
+    positive_topics: Optional[list[str]] = None
+    negative_topics: Optional[list[str]] = None
+    recent_topics: Optional[list[str]] = None
+    preferred_categories: Optional[list[str]] = None
+    preferred_answer_style: Optional[str] = None
+    common_question_types: Optional[list[str]] = None
+    representative_papers: Optional[list[str]] = None
 
 
 @router.post("/preferences")
@@ -74,6 +94,102 @@ async def dislike_paper(
         raise
     except Exception as exc:
         logger.error("Error disliking paper: %s", str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/paper-action")
+async def record_paper_action(
+    payload: PaperActionRequest,
+    recommendation_service=Depends(get_recommendation_service),
+):
+    try:
+        return recommendation_service.record_user_paper_action(
+            user_id=payload.user_id,
+            arxiv_id=payload.arxiv_id,
+            action_type=payload.action_type,
+            paper_payload=payload.paper,
+            metadata=payload.metadata,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Error recording paper action: %s", str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.delete("/paper-action")
+async def remove_paper_action(
+    arxiv_id: str = Body(...),
+    action_type: str = Body(...),
+    user_id: str = Body("local_user"),
+    db_service=Depends(get_database_service),
+):
+    try:
+        success = db_service.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type=action_type)
+        if success:
+            return {"status": "success", "message": "Paper action removed"}
+        raise HTTPException(status_code=404, detail="Paper action not found")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Error removing paper action: %s", str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/paper-actions/{user_id}")
+async def get_user_paper_actions(
+    user_id: str,
+    action_type: Optional[str] = None,
+    db_service=Depends(get_database_service),
+):
+    try:
+        actions = db_service.get_user_paper_actions(user_id=user_id, action_type=action_type)
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "action_type": action_type,
+            "actions": actions,
+            "action_map": db_service.get_user_paper_action_map(user_id=user_id),
+        }
+    except Exception as exc:
+        logger.error("Error getting paper actions: %s", str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/research-profile/{user_id}")
+async def get_user_research_profile(user_id: str, db_service=Depends(get_database_service)):
+    try:
+        return db_service.get_user_research_profile(user_id=user_id)
+    except Exception as exc:
+        logger.error("Error getting research profile: %s", str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.put("/research-profile")
+async def upsert_user_research_profile(
+    payload: ResearchProfileRequest,
+    db_service=Depends(get_database_service),
+):
+    try:
+        profile_payload = payload.model_dump(exclude={"user_id"}, exclude_none=True)
+        profile = db_service.upsert_user_research_profile(user_id=payload.user_id, profile=profile_payload)
+        return {"status": "success", "profile": profile}
+    except Exception as exc:
+        logger.error("Error upserting research profile: %s", str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.patch("/research-profile")
+async def patch_user_research_profile(
+    payload: ResearchProfileRequest,
+    db_service=Depends(get_database_service),
+):
+    try:
+        profile_payload = payload.model_dump(exclude={"user_id"}, exclude_none=True)
+        profile = db_service.patch_user_research_profile(user_id=payload.user_id, profile=profile_payload)
+        return {"status": "success", "profile": profile}
+    except Exception as exc:
+        logger.error("Error patching research profile: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -154,4 +270,3 @@ async def recommend_papers(
     except Exception as exc:
         logger.error("Error generating recommendations: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
-

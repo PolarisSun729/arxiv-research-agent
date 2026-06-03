@@ -10,6 +10,43 @@ logger = logging.getLogger(__name__)
 
 
 class CandidateMaterializer:
+    def record_user_paper_action(
+        self,
+        user_id: str,
+        arxiv_id: str,
+        action_type: str,
+        paper_payload: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        normalized_arxiv_id = str(arxiv_id or "").strip()
+        normalized_action = str(action_type or "").strip()
+        if not normalized_arxiv_id:
+            raise HTTPException(status_code=400, detail="arxiv_id is required")
+        if not normalized_action:
+            raise HTTPException(status_code=400, detail="action_type is required")
+
+        paper = self._ensure_paper_materialized(normalized_arxiv_id, paper_payload=paper_payload)
+        if not paper:
+            raise HTTPException(status_code=404, detail=f"Paper {normalized_arxiv_id} could not be materialized")
+
+        success = self.db_service.record_user_paper_action(
+            user_id=user_id,
+            arxiv_id=normalized_arxiv_id,
+            action_type=normalized_action,
+            metadata=metadata,
+        )
+        if not success:
+            raise HTTPException(status_code=500, detail=f"Failed to record paper action {normalized_action}")
+
+        return {
+            "status": "success",
+            "message": f"Paper action '{normalized_action}' saved successfully",
+            "arxiv_id": normalized_arxiv_id,
+            "action_type": normalized_action,
+            "paper": paper,
+            "metadata": metadata or {},
+        }
+
     def record_user_paper_preference(
         self,
         user_id: str,
@@ -361,4 +398,3 @@ class CandidateMaterializer:
             )
             embedded.append({"arxiv_id": arxiv_id, "vector": [float(value) for value in embedding]})
         return embedded
-
