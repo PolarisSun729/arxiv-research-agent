@@ -5,11 +5,11 @@ import uuid
 from typing import Dict, Any, List, Optional
 import logging
 from datetime import datetime
-from utils.config import SQLITE_CONFIG
+from utils.config import SQLITE_CONFIG, get_default_user_id
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_USER_ID = "local_user"
+DEFAULT_USER_ID = get_default_user_id()
 PAPER_ACTION_TYPES = {
     "like",
     "dislike",
@@ -61,6 +61,7 @@ class DatabaseService:
     def _initialize_database(self):
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            default_user_id_sql = DEFAULT_USER_ID.replace("'", "''")
             
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS arxiv_papers (
@@ -78,10 +79,10 @@ class DatabaseService:
                 )
             ''')
             
-            cursor.execute('''
+            cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS user_liked_papers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id TEXT NOT NULL DEFAULT 'local_user',
+                    user_id TEXT NOT NULL DEFAULT '{default_user_id_sql}',
                     arxiv_id TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(user_id, arxiv_id),
@@ -89,10 +90,10 @@ class DatabaseService:
                 )
             ''')
             
-            cursor.execute('''
+            cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS user_disliked_papers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id TEXT NOT NULL DEFAULT 'local_user',
+                    user_id TEXT NOT NULL DEFAULT '{default_user_id_sql}',
                     arxiv_id TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(user_id, arxiv_id),
@@ -133,9 +134,23 @@ class DatabaseService:
             ''')
 
             cursor.execute('''
+                CREATE TABLE IF NOT EXISTS paper_index_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    arxiv_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    current_stage TEXT,
+                    progress INTEGER NOT NULL DEFAULT 0,
+                    error_message TEXT,
+                    loading_method TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS paper_chat_sessions (
                     session_id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL DEFAULT 'local_user',
+                    user_id TEXT NOT NULL DEFAULT '{default_user_id_sql}',
                     arxiv_id TEXT NOT NULL,
                     title TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -163,10 +178,10 @@ class DatabaseService:
                 )
             ''')
 
-            cursor.execute('''
+            cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS user_paper_actions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id TEXT NOT NULL DEFAULT 'local_user',
+                    user_id TEXT NOT NULL DEFAULT '{default_user_id_sql}',
                     arxiv_id TEXT NOT NULL,
                     action_type TEXT NOT NULL,
                     metadata_json TEXT,
@@ -192,10 +207,10 @@ class DatabaseService:
                 )
             ''')
 
-            cursor.execute('''
+            cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS paper_notes (
                     note_id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL DEFAULT 'local_user',
+                    user_id TEXT NOT NULL DEFAULT '{default_user_id_sql}',
                     arxiv_id TEXT NOT NULL,
                     session_id TEXT,
                     source_message_id TEXT,
@@ -215,6 +230,16 @@ class DatabaseService:
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_paper_chat_sessions_user_paper_updated
                 ON paper_chat_sessions(user_id, arxiv_id, updated_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_paper_index_jobs_arxiv_updated
+                ON paper_index_jobs(arxiv_id, updated_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_paper_index_jobs_status_updated
+                ON paper_index_jobs(status, updated_at DESC)
             ''')
 
             cursor.execute('''
@@ -1152,6 +1177,153 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"Error getting paper QA index: {str(e)}")
             return None
+
+    @staticmethod
+    def _row_to_paper_index_job(row: Any) -> Dict[str, Any]:
+        return {
+            'job_id': row[0],
+            'arxiv_id': row[1],
+            'status': row[2],
+            'current_stage': row[3],
+            'progress': row[4],
+            'error_message': row[5],
+            'loading_method': row[6],
+            'created_at': row[7],
+            'updated_at': row[8],
+        }
+
+    def create_paper_index_job(self, arxiv_id: str, loading_method: str) -> Optional[Dict[str, Any]]:
+        try:
+            job_id = str(uuid.uuid4())
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO paper_index_jobs (
+                        job_id, arxiv_id, status, current_stage, progress, error_message, loading_method
+                    )
+                    VALUES (?, ?, 'pending', 'pending', 0, NULL, ?)
+                ''', (job_id, arxiv_id, loading_method))
+
+                conn.commit()
+                logger.info(f"Paper index job created: {job_id} for {arxiv_id}")
+
+            return self.get_paper_index_job(job_id)
+        except Exception as e:
+            logger.error(f"Error creating paper index job: {str(e)}")
+            return None
+
+    def update_paper_index_job(
+        self,
+        job_id: str,
+        status: Optional[str] = None,
+        current_stage: Optional[str] = None,
+        progress: Optional[int] = None,
+        error_message: Optional[str] = None,
+    ) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+
+                update_fields = []
+                update_values = []
+
+                if status is not None:
+                    update_fields.append('status = ?')
+                    update_values.append(status)
+                if current_stage is not None:
+                    update_fields.append('current_stage = ?')
+                    update_values.append(current_stage)
+                if progress is not None:
+                    normalized_progress = max(0, min(100, int(progress)))
+                    update_fields.append('progress = ?')
+                    update_values.append(normalized_progress)
+                if error_message is not None:
+                    update_fields.append('error_message = ?')
+                    update_values.append(error_message)
+
+                if not update_fields:
+                    return False
+
+                update_fields.append('updated_at = CURRENT_TIMESTAMP')
+                update_values.append(job_id)
+
+                cursor.execute(f'''
+                    UPDATE paper_index_jobs
+                    SET {", ".join(update_fields)}
+                    WHERE job_id = ?
+                ''', update_values)
+
+                conn.commit()
+                if cursor.rowcount > 0:
+                    logger.info(f"Paper index job updated: {job_id}")
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error updating paper index job: {str(e)}")
+            return False
+
+    def get_paper_index_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT job_id, arxiv_id, status, current_stage, progress, error_message, loading_method, created_at, updated_at
+                    FROM paper_index_jobs
+                    WHERE job_id = ?
+                ''', (job_id,))
+
+                row = cursor.fetchone()
+                if row:
+                    return self._row_to_paper_index_job(row)
+                return None
+        except Exception as e:
+            logger.error(f"Error getting paper index job: {str(e)}")
+            return None
+
+    def get_latest_paper_index_job(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT job_id, arxiv_id, status, current_stage, progress, error_message, loading_method, created_at, updated_at
+                    FROM paper_index_jobs
+                    WHERE arxiv_id = ?
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT 1
+                ''', (arxiv_id,))
+
+                row = cursor.fetchone()
+                if row:
+                    return self._row_to_paper_index_job(row)
+                return None
+        except Exception as e:
+            logger.error(f"Error getting latest paper index job: {str(e)}")
+            return None
+
+    def list_paper_index_jobs(self, arxiv_id: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+        try:
+            normalized_limit = max(1, int(limit))
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                if arxiv_id:
+                    cursor.execute('''
+                        SELECT job_id, arxiv_id, status, current_stage, progress, error_message, loading_method, created_at, updated_at
+                        FROM paper_index_jobs
+                        WHERE arxiv_id = ?
+                        ORDER BY updated_at DESC, created_at DESC
+                        LIMIT ?
+                    ''', (arxiv_id, normalized_limit))
+                else:
+                    cursor.execute('''
+                        SELECT job_id, arxiv_id, status, current_stage, progress, error_message, loading_method, created_at, updated_at
+                        FROM paper_index_jobs
+                        ORDER BY updated_at DESC, created_at DESC
+                        LIMIT ?
+                    ''', (normalized_limit,))
+
+                return [self._row_to_paper_index_job(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error listing paper index jobs: {str(e)}")
+            return []
 
     def update_paper_qa_index(self, arxiv_id: str, **kwargs) -> bool:
         try:

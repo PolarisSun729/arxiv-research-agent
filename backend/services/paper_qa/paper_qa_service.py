@@ -18,7 +18,7 @@ from services.llm.generation_service import GenerationService
 from services.document.loading_service import LoadingService
 from services.paper_qa.paper_qa_index_builder import PaperQAIndexBuilder
 from services.storage.vector_store_service import VectorStoreService
-from utils.config import get_memory_runtime_config
+from utils.config import get_default_user_id, get_memory_runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -100,10 +100,14 @@ class PaperQAService:
             return payload.get(key, default)
         return getattr(payload, key, default)
 
+    @staticmethod
+    def _resolve_user_id(value: Any = None) -> str:
+        return str(value or get_default_user_id()).strip() or get_default_user_id()
+
     def _get_preferred_answer_style(self, payload: Any) -> str:
         if not bool(self._memory_flag("enable_user_research_profile", False)):
             return ""
-        user_id = str(self._payload_get(payload, "user_id", "local_user") or "local_user").strip() or "local_user"
+        user_id = self._resolve_user_id(self._payload_get(payload, "user_id"))
         try:
             profile = self.db_service.get_user_research_profile(user_id=user_id)
         except Exception:
@@ -121,7 +125,7 @@ class PaperQAService:
     def _resolve_chat_session(self, arxiv_id: str, payload: Any) -> Dict[str, Any]:
         if not bool(self._memory_flag("enable_paper_chat_session", True)):
             return {}
-        user_id = str(self._payload_get(payload, "user_id", "local_user") or "local_user").strip() or "local_user"
+        user_id = self._resolve_user_id(self._payload_get(payload, "user_id"))
         requested_session_id = str(self._payload_get(payload, "session_id", "") or "").strip()
         try:
             if requested_session_id:
@@ -154,7 +158,7 @@ class PaperQAService:
         question_contextualization: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         session_id = str(chat_session.get("session_id", "") or "").strip()
-        user_id = str(chat_session.get("user_id", "local_user") or "local_user").strip() or "local_user"
+        user_id = self._resolve_user_id(chat_session.get("user_id"))
         if not bool(self._memory_flag("enable_paper_chat_session", True)) or not session_id:
             return {
                 "turn_id": "",

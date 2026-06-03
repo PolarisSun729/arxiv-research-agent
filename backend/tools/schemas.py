@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from utils.config import get_default_user_id
+
 
 class ToolResult(BaseModel):
     ok: bool
@@ -76,13 +78,13 @@ class GetPaperMetadataInput(BaseModel):
 
 
 class RecommendPapersInput(BaseModel):
-    user_id: str = "local_user"
+    user_id: str = Field(default_factory=get_default_user_id)
     top_n: int = 10
     max_age_months: int = 6
 
 
 class RecordPaperPreferenceInput(BaseModel):
-    user_id: str = "local_user"
+    user_id: str = Field(default_factory=get_default_user_id)
     arxiv_id: str
     liked: bool
     paper: Optional[Dict[str, Any]] = None

@@ -118,6 +118,30 @@ class PaperQAIndexBuilder:
         setattr(exc, "error_loading_method", loading_method)
         return detail
 
+    def _notify_progress(
+        self,
+        progress_callback: Optional[Callable[..., Any]],
+        *,
+        current_stage: str,
+        progress: int,
+        message: str,
+    ) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(
+                current_stage=current_stage,
+                progress=progress,
+                message=message,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Progress callback failed at stage=%s progress=%s: %s",
+                current_stage,
+                progress,
+                exc,
+            )
+
     def load_paper_metadata(self, arxiv_id: str) -> Dict[str, Any]:
         paper = self.db_service.get_paper(arxiv_id)
         if not paper:
@@ -310,19 +334,42 @@ class PaperQAIndexBuilder:
     def mark_index_failed(self, arxiv_id: str) -> bool:
         return self.db_service.update_paper_qa_index(arxiv_id, status="failed")
 
-    def build_qa_index(self, arxiv_id: str, loading_method: str = "docling") -> Dict[str, Any]:
+    def build_qa_index(
+        self,
+        arxiv_id: str,
+        loading_method: str = "docling",
+        progress_callback: Optional[Callable[..., Any]] = None,
+    ) -> Dict[str, Any]:
         logger.info("Creating QA index for paper: %s", arxiv_id)
         requested_loading_method = str(loading_method or "docling").strip().lower()
         current_stage = "validate_loading_method"
         try:
+            self._notify_progress(
+                progress_callback,
+                current_stage="validate_loading_method",
+                progress=5,
+                message="Validating loading method",
+            )
             loading_method = self.validate_loading_method(requested_loading_method)
             self._log_stage("validate_loading_method", arxiv_id, loading_method, "loading method validated")
 
             current_stage = "mark_index_processing"
+            self._notify_progress(
+                progress_callback,
+                current_stage="mark_index_processing",
+                progress=10,
+                message="Marking QA index as processing",
+            )
             self.mark_index_processing(arxiv_id)
             self._log_stage("mark_index_processing", arxiv_id, loading_method, "paper QA index marked as processing")
 
             current_stage = "load_paper_metadata"
+            self._notify_progress(
+                progress_callback,
+                current_stage="load_paper_metadata",
+                progress=15,
+                message="Loading paper metadata",
+            )
             paper = self.load_paper_metadata(arxiv_id)
             self._log_stage(
                 "load_paper_metadata",
@@ -335,10 +382,22 @@ class PaperQAIndexBuilder:
             )
 
             current_stage = "download_pdf"
+            self._notify_progress(
+                progress_callback,
+                current_stage="download_pdf",
+                progress=25,
+                message="Downloading PDF",
+            )
             pdf_path = self.download_pdf(arxiv_id)
             self._log_stage("download_pdf", arxiv_id, loading_method, "pdf downloaded", pdf_path=pdf_path)
 
             current_stage = "load_pdf_document"
+            self._notify_progress(
+                progress_callback,
+                current_stage="load_pdf_document",
+                progress=35,
+                message="Loading PDF document",
+            )
             loading_service, document, page_map = self.load_pdf_document(pdf_path, loading_method)
             self._log_stage(
                 "load_pdf_document",
@@ -349,6 +408,12 @@ class PaperQAIndexBuilder:
             )
 
             current_stage = "chunk_document"
+            self._notify_progress(
+                progress_callback,
+                current_stage="chunk_document",
+                progress=45,
+                message="Chunking document",
+            )
             chunked_data, chunking_strategy = self.chunk_document(arxiv_id, loading_method, document, page_map)
             chunks = chunked_data["chunks"]
             self._log_stage(
@@ -361,6 +426,12 @@ class PaperQAIndexBuilder:
             )
 
             current_stage = "save_chunk_file"
+            self._notify_progress(
+                progress_callback,
+                current_stage="save_chunk_file",
+                progress=55,
+                message="Saving chunk file",
+            )
             chunk_file = self.save_chunk_file(
                 loading_service=loading_service,
                 arxiv_id=arxiv_id,
@@ -373,10 +444,22 @@ class PaperQAIndexBuilder:
             self._log_stage("save_chunk_file", arxiv_id, loading_method, "chunk file saved", chunk_file=chunk_file)
 
             current_stage = "compress_chunks_for_rerank"
+            self._notify_progress(
+                progress_callback,
+                current_stage="compress_chunks_for_rerank",
+                progress=65,
+                message="Compressing chunk text for rerank",
+            )
             chunks = self.compress_chunks_for_rerank(chunks)
             self._log_stage("compress_chunks_for_rerank", arxiv_id, loading_method, "chunk text compressed", chunk_count=len(chunks))
 
             current_stage = "create_chunk_embeddings"
+            self._notify_progress(
+                progress_callback,
+                current_stage="create_chunk_embeddings",
+                progress=78,
+                message="Creating chunk embeddings",
+            )
             embeddings, embedding_config = self.create_chunk_embeddings(arxiv_id, chunks)
             self._log_stage(
                 "create_chunk_embeddings",
@@ -389,10 +472,22 @@ class PaperQAIndexBuilder:
             )
 
             current_stage = "save_embeddings"
+            self._notify_progress(
+                progress_callback,
+                current_stage="save_embeddings",
+                progress=88,
+                message="Saving embeddings",
+            )
             embedding_file = self.save_embeddings(arxiv_id, embeddings)
             self._log_stage("save_embeddings", arxiv_id, loading_method, "embedding file saved", embedding_file=embedding_file)
 
             current_stage = "index_embeddings_to_vector_store"
+            self._notify_progress(
+                progress_callback,
+                current_stage="index_embeddings_to_vector_store",
+                progress=95,
+                message="Indexing embeddings to vector store",
+            )
             index_result = self.index_embeddings_to_vector_store(embedding_file)
             collection_name = index_result.get("collection_name", "")
             self._log_stage(
@@ -404,6 +499,12 @@ class PaperQAIndexBuilder:
             )
 
             current_stage = "mark_index_success"
+            self._notify_progress(
+                progress_callback,
+                current_stage="mark_index_success",
+                progress=100,
+                message="Marking QA index as success",
+            )
             self.mark_index_success(
                 arxiv_id,
                 collection_name=collection_name,

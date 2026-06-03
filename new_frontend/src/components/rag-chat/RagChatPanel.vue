@@ -66,7 +66,7 @@ const bubbleMessages = computed<RagChatPanelMessage[]>(() =>
     placement: message.role === 'user' ? 'end' : 'start',
     variant: message.role === 'user' ? 'filled' : 'outlined',
     shape: 'round',
-    maxWidth: message.role === 'user' ? 'min(82%, 720px)' : 'min(100%, 1080px)'
+    maxWidth: message.role === 'user' ? 'min(82%, 820px)' : '100%'
   }))
 )
 
@@ -223,7 +223,7 @@ function handlePromptSelect(item: PromptsItemsProps) {
 
 .rag-chat-panel__messages {
   display: flex;
-  flex: none;
+  flex: 1 1 auto;
   min-height: 0;
   flex-direction: column;
   gap: 14px;
@@ -241,7 +241,7 @@ function handlePromptSelect(item: PromptsItemsProps) {
 }
 
 .rag-chat-panel__bubble-list {
-  flex: none;
+  flex: 1 1 auto;
   min-height: 0;
 }
 
@@ -258,8 +258,8 @@ function handlePromptSelect(item: PromptsItemsProps) {
 .rag-chat-panel__bubble-list :deep([class*='placement-start'] .message-bubble),
 .rag-chat-panel__bubble-list :deep([data-placement='start'] [class*='bubble']),
 .rag-chat-panel__bubble-list :deep([class*='placement-start'] [class*='bubble']) {
-  max-width: min(100%, 1080px) !important;
-  width: min(100%, 1080px);
+  max-width: 100% !important;
+  width: 100%;
 }
 
 .rag-chat-panel__message-label {

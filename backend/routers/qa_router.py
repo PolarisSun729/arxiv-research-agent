@@ -14,10 +14,12 @@ from dependencies import (
     get_database_service,
     get_enhanced_retrieval_service,
     get_generation_service,
+    get_index_job_manager,
     get_paper_qa_service,
     get_vector_store_service,
 )
 from routers.qa_utils import build_qa_diagnostic, get_latest_retrieval_trace, sanitize_trace_slug
+from utils.config import get_default_user_id
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +68,7 @@ class UpdatePaperNoteRequest(BaseModel):
 
 
 def _normalize_user_id(value: Optional[str]) -> str:
-    return str(value or "local_user").strip() or "local_user"
+    return str(value or get_default_user_id()).strip() or get_default_user_id()
 
 
 def _serialize_chat_session(chat_session: Optional[dict]) -> Optional[dict]:
@@ -97,6 +99,22 @@ def _serialize_chat_message(message: dict) -> dict:
         "question_contextualization": message.get("question_contextualization"),
         "status": message.get("status", "completed"),
         "created_at": message.get("created_at"),
+    }
+
+
+def _serialize_qa_index_job(job: Optional[dict]) -> Optional[dict]:
+    if not job:
+        return None
+    return {
+        "job_id": job.get("job_id"),
+        "arxiv_id": job.get("arxiv_id"),
+        "status": job.get("status"),
+        "current_stage": job.get("current_stage"),
+        "progress": job.get("progress"),
+        "error_message": job.get("error_message"),
+        "loading_method": job.get("loading_method"),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
     }
 
 
@@ -263,14 +281,63 @@ async def download_latest_qa_trace(
 async def create_paper_qa_index(
     arxiv_id: str,
     loading_method: str = Query("docling"),
+    sync: bool = Query(False),
+    index_job_manager=Depends(get_index_job_manager),
     paper_qa_service=Depends(get_paper_qa_service),
 ):
     try:
-        return paper_qa_service.build_qa_index(arxiv_id, loading_method=loading_method)
+        if sync:
+            return paper_qa_service.build_qa_index(arxiv_id, loading_method=loading_method)
+
+        job = index_job_manager.submit_job(arxiv_id, loading_method)
+        return {
+            "status": "submitted",
+            "job_id": job.get("job_id"),
+            "arxiv_id": job.get("arxiv_id") or arxiv_id,
+            "job_status": job.get("status") or "pending",
+            "current_stage": job.get("current_stage") or "pending",
+            "progress": job.get("progress") if job.get("progress") is not None else 0,
+            "message": "QA index job submitted",
+        }
     except HTTPException:
         raise
     except Exception as exc:
         logger.exception("Error creating QA index: %s", str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/qa-index-jobs/latest")
+async def get_latest_paper_qa_index_job(
+    arxiv_id: str,
+    db_service=Depends(get_database_service),
+):
+    try:
+        job = db_service.get_latest_paper_index_job(arxiv_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="QA index job not found")
+        return _serialize_qa_index_job(job)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Error getting latest QA index job: %s", str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/qa-index-jobs/{job_id}")
+async def get_paper_qa_index_job(
+    arxiv_id: str,
+    job_id: str,
+    db_service=Depends(get_database_service),
+):
+    try:
+        job = db_service.get_paper_index_job(job_id)
+        if not job or job.get("arxiv_id") != arxiv_id:
+            raise HTTPException(status_code=404, detail="QA index job not found")
+        return _serialize_qa_index_job(job)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Error getting QA index job: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
 
 

@@ -14,6 +14,9 @@ import torch
 import requests
 
 from services.embedding.embedding_service import EmbeddingService
+from services.retrieval.query_planner import QueryPlanner
+from services.retrieval.rerank_service import RerankService
+from services.retrieval.route_retriever import RouteRetriever
 from services.storage.vector_store_service import VectorStoreService
 from utils.config import RETRIEVAL_CONFIG, get_enhanced_retrieval_runtime_config, get_memory_runtime_config
 from utils.model_utils import get_huggingface_model_path
@@ -380,7 +383,7 @@ QUESTION_TYPE_RULES = {
 
 @dataclass
 class RetrievalOptions:
-    top_k: int = RETRIEVAL_CONFIG["default_top_k"]
+    top_k: Optional[int] = None
     enable_query_rewrite: Optional[bool] = None
     enable_hyde: Optional[bool] = None
     enable_keyword_search: Optional[bool] = None
@@ -455,6 +458,9 @@ class EnhancedRetrievalService:
         self._llm_reranker_device: Optional[str] = None
         self._llm_reranker_error: Optional[str] = None
         self.memory_runtime_config = get_memory_runtime_config()
+        self.query_planner = QueryPlanner(self)
+        self.route_retriever = RouteRetriever(self)
+        self.rerank_service = RerankService(self)
 
     def _memory_flag(self, key: str, default: Any = None) -> Any:
         return self.memory_runtime_config.get(key, default)
@@ -467,7 +473,14 @@ class EnhancedRetrievalService:
         options: Optional[RetrievalOptions] = None,
     ) -> Dict[str, Any]:
         options = options or RetrievalOptions()
-        effective_top_k = max(1, options.top_k or RETRIEVAL_CONFIG["default_top_k"])
+        default_final_context_top_k = max(1, int(ENHANCED_RETRIEVAL_CONFIG["final_context_top_k"]))
+        max_final_context_top_k = max(
+            1,
+            int(ENHANCED_RETRIEVAL_CONFIG.get("max_final_context_top_k", default_final_context_top_k)),
+        )
+        requested_top_k = options.top_k
+        effective_top_k = requested_top_k if requested_top_k is not None else default_final_context_top_k
+        effective_top_k = min(max_final_context_top_k, max(1, int(effective_top_k)))
         enable_query_rewrite = self._resolve_option(
             options.enable_query_rewrite, RETRIEVAL_CONFIG["enable_query_rewrite"]
         )
@@ -482,135 +495,38 @@ class EnhancedRetrievalService:
         recall_candidate_limit = ENHANCED_RETRIEVAL_CONFIG["recall_candidate_limit"]
         rrf_candidate_limit = ENHANCED_RETRIEVAL_CONFIG["rrf_candidate_limit"]
         rerank_candidate_limit = ENHANCED_RETRIEVAL_CONFIG["rerank_candidate_limit"]
-        final_context_top_k = ENHANCED_RETRIEVAL_CONFIG["final_context_top_k"]
+        final_context_top_k = default_final_context_top_k
 
         normalized_collection_name = self._resolve_collection_name(collection_name)
-        intent_profile = self._build_intent_profile(user_query, paper_context=paper_context)
-        query_profile = self._build_query_profile(
-            user_query,
-            normalized_collection_name,
-            paper_context=paper_context,
-            intent_profile=intent_profile,
-        )
-        query_views = self._build_query_views(user_query, query_profile, enable_query_rewrite)
-
-        hyde_text = ""
-        hyde_debug: Dict[str, Any] = {
-            "enabled": enable_hyde,
-            "text": "",
-            "source_queries": [],
-            "focus_queries": [],
-            "confidence": 0.0,
-        }
-        if enable_hyde:
-            hyde_text = self._generate_hyde_document(user_query, query_profile, query_views["selected_queries"])
-            hyde_debug = {
-                "enabled": True,
-                "text": hyde_text,
-                "source_queries": [user_query, *query_views["selected_queries"]],
-                "focus_queries": query_views["selected_queries"][:2] if query_views["selected_queries"] else [user_query],
-                "confidence": self._route_confidence(
-                    "vector_hyde",
-                    query_profile,
-                    hyde_text or user_query,
-                    route_queries=query_views["selected_queries"] or [user_query],
-                    intent_profile=intent_profile,
-                ),
-            }
-
-        routes: Dict[str, List[Dict[str, Any]]] = {}
-        routes["vector_original"] = self._vector_retrieve(
+        query_bundle = self.query_planner.build_query_bundle(
+            user_query=user_query,
             collection_name=normalized_collection_name,
-            query=user_query,
-            top_k=recall_candidate_limit,
-            route_name="vector_original",
-            source_query=user_query,
-            query_profile=query_profile,
-            route_queries=[user_query],
+            paper_context=paper_context,
+            enable_query_rewrite=enable_query_rewrite,
         )
+        intent_profile = query_bundle["intent_profile"]
+        query_profile = query_bundle["query_profile"]
+        query_views = query_bundle["query_views"]
+        planned_rerank_query = query_bundle["rerank_query"]
 
-        if enable_query_rewrite and query_views["selected_queries"]:
-            rewrite_hits: List[Dict[str, Any]] = []
-            for query in query_views["selected_queries"]:
-                rewrite_hits.extend(
-                        self._vector_retrieve(
-                            collection_name=normalized_collection_name,
-                            query=query,
-                            top_k=recall_candidate_limit,
-                            route_name="vector_rewrite",
-                            source_query=query,
-                            query_profile=query_profile,
-                            route_queries=query_views["selected_queries"],
-                    )
-                )
-            routes["vector_rewrite"] = self._dedupe_preserve_order(rewrite_hits)
-        else:
-            routes["vector_rewrite"] = []
+        route_bundle = self.route_retriever.build_route_bundle(
+            collection_name=normalized_collection_name,
+            user_query=user_query,
+            query_profile=query_profile,
+            query_views=query_views,
+            options=options,
+            enable_hyde=enable_hyde,
+            enable_keyword_search=enable_keyword_search,
+            recall_candidate_limit=recall_candidate_limit,
+        )
+        routes = route_bundle["routes"]
+        hyde_text = route_bundle["hyde_text"]
+        hyde_debug = route_bundle["hyde_debug"]
+        keyword_debug = route_bundle["keyword_debug"]
+        memory_debug = route_bundle["memory_debug"]
+        memory_retrieval_enabled = bool(memory_debug.get("enabled", False))
 
-        if hyde_text:
-            routes["vector_hyde"] = self._vector_retrieve(
-                collection_name=normalized_collection_name,
-                query=hyde_text,
-                top_k=recall_candidate_limit,
-                route_name="vector_hyde",
-                source_query="hyde",
-                query_profile=query_profile,
-                route_queries=[hyde_text],
-            )
-        else:
-            routes["vector_hyde"] = []
-
-        if enable_keyword_search:
-            keyword_queries = [user_query, *query_views["selected_queries"], query_profile.semantic_query, query_profile.evidence_query]
-            routes["keyword"] = self._keyword_retrieve(
-                collection_name=normalized_collection_name,
-                queries=keyword_queries,
-                top_k=recall_candidate_limit,
-                query_profile=query_profile,
-            )
-        else:
-            routes["keyword"] = []
-            keyword_queries = []
-
-        memory_context = options.memory_context or {}
-        memory_retrieval_enabled = bool(self._memory_flag("enable_memory_aware_retrieval", True))
-        if memory_retrieval_enabled:
-            try:
-                routes["memory_context"] = self._memory_retrieve(
-                    collection_name=normalized_collection_name,
-                    memory_context=memory_context,
-                    top_k=recall_candidate_limit,
-                    query_profile=query_profile,
-                )
-                memory_fallback_reason = None
-            except Exception as exc:
-                logger.warning("Memory-aware retrieval failed, skipping memory route: %s", exc)
-                routes["memory_context"] = []
-                memory_fallback_reason = str(exc)
-        else:
-            routes["memory_context"] = []
-            memory_fallback_reason = "disabled by runtime config"
-
-        keyword_debug = {
-            "enabled": enable_keyword_search,
-            "queries": keyword_queries,
-            "selected_rewrite_queries": query_views["selected_queries"],
-            "query_details": self._build_query_term_details(keyword_queries),
-            "keywords": self._build_query_keywords(keyword_queries),
-        }
-        memory_debug = {
-            "enabled": memory_retrieval_enabled,
-            "applied": bool(memory_retrieval_enabled and memory_context.get("enabled", False) and routes["memory_context"]),
-            "reason": str(memory_context.get("reason", "") or ""),
-            "referenced_turn_ids": memory_context.get("referenced_turn_ids", []) or [],
-            "referenced_source_ids": memory_context.get("referenced_source_ids", []) or [],
-            "query_keywords": memory_context.get("query_keywords", []) or [],
-            "candidates": memory_context.get("candidates", []) or [],
-            "route_result_count": len(routes["memory_context"]),
-            "fallback_reason": memory_fallback_reason or memory_context.get("fallback_reason"),
-        }
-
-        fused_limit = rrf_candidate_limit if enable_llm_rerank else final_context_top_k
+        fused_limit = rrf_candidate_limit if enable_llm_rerank else effective_top_k
         deduped_routes = {
             route_name: self._dedupe_route_results(route_results)
             for route_name, route_results in routes.items()
@@ -624,7 +540,7 @@ class EnhancedRetrievalService:
 
         reranked_results = fused_results
         final_results = fused_results
-        rerank_query = self._build_rerank_query(user_query, query_profile)
+        rerank_query = planned_rerank_query
         rerank_debug: Dict[str, Any] = {
             "enabled": enable_llm_rerank,
             "applied": False,
@@ -645,10 +561,10 @@ class EnhancedRetrievalService:
                 self.llm_rerank_fallback_local,
             )
             logger.debug("*" * 50)
-            rerank_result = self.llm_rerank(
+            rerank_result = self.rerank_service.llm_rerank(
                 rerank_query,
                 fused_results,
-                final_context_top_k,
+                effective_top_k,
                 query_profile=query_profile,
                 original_question=user_query,
                 candidate_limit=rerank_candidate_limit,
@@ -656,18 +572,18 @@ class EnhancedRetrievalService:
             reranked_results = rerank_result.get("reranked_chunks", rerank_result["chunks"])
             final_results = self._mark_final_context_chunks(rerank_result["chunks"])
             self._log_retrieval_stage("reranked_top30", reranked_results[:rrf_candidate_limit])
-            self._log_retrieval_stage("final_context_top15", final_results[:final_context_top_k])
+            self._log_retrieval_stage("final_context_top15", final_results[:effective_top_k])
             rerank_debug = rerank_result["debug"]
         else:
             self._log_retrieval_stage("reranked_top30", reranked_results[:rrf_candidate_limit])
-            final_results = self._mark_final_context_chunks(fused_results[:final_context_top_k])
-            self._log_retrieval_stage("final_context_top15", final_results[:final_context_top_k])
+            final_results = self._mark_final_context_chunks(fused_results[:effective_top_k])
+            self._log_retrieval_stage("final_context_top15", final_results[:effective_top_k])
 
         asset_type_counts = {
             "raw_retrieval_top30": self._count_chunk_types(raw_retrieval_top30),
             "fused_top30": self._count_chunk_types(fused_top30),
             "reranked_top30": self._count_chunk_types(reranked_results[:rrf_candidate_limit]),
-            "final_context_top15": self._count_chunk_types(final_results[:final_context_top_k]),
+            "final_context_top15": self._count_chunk_types(final_results[:effective_top_k]),
         }
 
         result: Dict[str, Any] = {"chunks": final_results}
@@ -690,7 +606,7 @@ class EnhancedRetrievalService:
                     **memory_debug,
                     "final_context_hits": [
                         self._debug_chunk_item(item)
-                        for item in final_results[:final_context_top_k]
+                        for item in final_results[:effective_top_k]
                         if "memory_context" in (item.get("matched_routes", []) or [item.get("retrieval_route")])
                     ],
                 },
@@ -702,15 +618,19 @@ class EnhancedRetrievalService:
                     "raw_retrieval_top30": [self._debug_chunk_item(item) for item in raw_retrieval_top30],
                     "fused_top30": [self._debug_chunk_item(item) for item in fused_top30],
                     "reranked_top30": [self._debug_chunk_item(item) for item in reranked_results[:rrf_candidate_limit]],
-                    "final_context_top15": [self._debug_chunk_item(item) for item in final_results[:final_context_top_k]],
+                    "final_context_top15": [self._debug_chunk_item(item) for item in final_results[:effective_top_k]],
                 },
                 "final_chunks": [self._debug_chunk_item(item) for item in final_results],
                 "config": {
+                    "requested_top_k": requested_top_k,
+                    "effective_top_k": effective_top_k,
                     "top_k": effective_top_k,
                     "candidate_k": recall_candidate_limit,
                     "rrf_candidate_limit": rrf_candidate_limit,
                     "rerank_candidate_limit": rerank_candidate_limit,
-                    "final_context_top_k": final_context_top_k,
+                    "final_context_top_k": effective_top_k,
+                    "default_final_context_top_k": default_final_context_top_k,
+                    "max_final_context_top_k": max_final_context_top_k,
                     "enable_query_rewrite": enable_query_rewrite,
                     "enable_hyde": enable_hyde,
                     "enable_keyword_search": enable_keyword_search,
@@ -746,6 +666,9 @@ class EnhancedRetrievalService:
             paper_context=paper_context or {},
             options={
                 "top_k": effective_top_k,
+                "requested_top_k": requested_top_k,
+                "default_final_context_top_k": default_final_context_top_k,
+                "max_final_context_top_k": max_final_context_top_k,
                 "candidate_k": recall_candidate_limit,
                 "enable_query_rewrite": enable_query_rewrite,
                 "enable_hyde": enable_hyde,
@@ -764,7 +687,7 @@ class EnhancedRetrievalService:
             reranked_results=reranked_results,
             final_results=final_results,
             rerank_debug=rerank_debug,
-            final_context_top_k=final_context_top_k,
+            final_context_top_k=effective_top_k,
         )
         if trace_export:
             result["trace_export"] = trace_export
@@ -773,7 +696,7 @@ class EnhancedRetrievalService:
 
         return result
 
-    def llm_rerank(
+    def _llm_rerank_impl(
         self,
         rerank_query: str,
         chunks: List[Dict[str, Any]],
@@ -808,7 +731,7 @@ class EnhancedRetrievalService:
 
         candidate_chunks = [dict(chunk) for chunk in chunks[:rerank_limit]]
         rerank_documents = [
-            self._build_rerank_document_text(chunk)
+            self.rerank_service.build_rerank_document_text(chunk)
             for chunk in candidate_chunks
         ]
         self._log_rerank_inputs(original_question, rerank_query, candidate_chunks, rerank_documents)
@@ -1233,54 +1156,6 @@ class EnhancedRetrievalService:
             return str(raw_candidate)
         return hf_candidate
 
-    def _build_rerank_document_text(self, chunk: Dict[str, Any]) -> str:
-        chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
-        if chunk_type in {"figure", "table"}:
-            parts = [
-                str(chunk.get("asset_summary", "") or "").strip(),
-                str(chunk.get("asset_preview_text", "") or "").strip(),
-                str(chunk.get("section_title", "") or "").strip(),
-                str(chunk.get("section_path", "") or "").strip(),
-                f"page {chunk.get('page_number') or chunk.get('page_range') or ''}".strip(),
-            ]
-            content = "\n".join(part for part in parts if part).strip()
-            if content:
-                return self._limit_rerank_text(content, self.llm_rerank_max_doc_chars)
-
-        content = self._limit_rerank_text(str(chunk.get("rerank_text", "") or ""), self.llm_rerank_max_doc_chars)
-        if not content:
-            content = self._limit_rerank_text(str(chunk.get("content", "") or ""), self.llm_rerank_max_doc_chars)
-        if not content:
-            content = self._limit_rerank_text(str(chunk.get("text", "") or ""), self.llm_rerank_max_doc_chars)
-
-        section_title = str(chunk.get("section_title", "") or "").strip()
-        if section_title:
-            normalized_title = self._normalize_query_text(section_title)
-            normalized_content = self._normalize_query_text(content)
-            if normalized_title and normalized_title not in normalized_content[: max(len(normalized_title), 1) * 2]:
-                content = f"{section_title}\n{content}".strip()
-
-        return self._limit_rerank_text(content, self.llm_rerank_max_doc_chars)
-
-    def _build_rerank_query(self, user_query: str, query_profile: QueryProfile) -> str:
-        if self.generation_service is not None and hasattr(self.generation_service, "build_rerank_query"):
-            try:
-                rerank_query = self.generation_service.build_rerank_query(
-                    user_query,
-                    intent_profile=query_profile.intent_profile.to_dict(),
-                )
-                if rerank_query and rerank_query.strip():
-                    actual_rerank_query = rerank_query.strip()
-                    logger.debug("original_question=%s", user_query)
-                    logger.debug("actual_rerank_query=%s", actual_rerank_query)
-                    return actual_rerank_query
-            except Exception as exc:  # pragma: no cover - generation depends on environment
-                logger.debug("Failed to rewrite rerank query with model: %s", exc)
-        actual_rerank_query = self._fallback_rerank_query(user_query, intent_profile=query_profile.intent_profile)
-        logger.debug("original_question=%s", user_query)
-        logger.debug("actual_rerank_query=%s", actual_rerank_query)
-        return actual_rerank_query
-
     def _legacy_intent_bucket(self, intent: str) -> str:
         intent = str(intent or "other").strip().lower() or "other"
         aliases = {
@@ -1302,42 +1177,6 @@ class EnhancedRetrievalService:
             "results_analysis": "experiment",
         }
         return aliases.get(intent, intent)
-
-    def _fallback_rerank_query(self, user_query: str, intent_profile: Optional[IntentProfile] = None) -> str:
-        normalized_question = re.sub(r"\s+", " ", (user_query or "")).strip()
-        base_query = (
-            "Select the passage that most directly supports an answer to the user's question. "
-            "Prefer evidence-bearing chunks with explicit facts, definitions, steps, causes, results, comparisons, or other answerable statements; "
-            "down-rank passages that are only loosely topic-related or background. "
-        )
-        if intent_profile is not None:
-            main_intent = self._legacy_intent_bucket(intent_profile.main_intent)
-            intent_clauses = {
-                "summary": "Prioritize abstract, introduction, and conclusion passages that state the paper's main contribution or findings. ",
-                "method": "Prioritize method, architecture, training, inference, and implementation details. ",
-                "experiment": "Prioritize experiment, evaluation, results, metric, baseline, and ablation evidence. ",
-                "comparison": "Prioritize direct baseline comparisons and ablation evidence. ",
-                "dataset": "Prioritize dataset, corpus, benchmark, split, and data description passages. ",
-                "limitation": "Prioritize limitations, failure cases, discussion, and future work. ",
-                "figure_table": "Prioritize figure captions, table captions, appendix references, and visual explanations. ",
-            }
-            base_query += intent_clauses.get(main_intent, "")
-            if intent_profile.preferred_sections:
-                base_query += f"Favor sections such as: {', '.join(intent_profile.preferred_sections[:4])}. "
-            if intent_profile.sub_intents:
-                if "paper_overview" in intent_profile.sub_intents:
-                    base_query += "Prefer passages that summarize the paper at a high level. "
-                if "evidence_seeking" in intent_profile.sub_intents:
-                    base_query += "Prefer passages that provide direct answer-bearing evidence. "
-                if "result_check" in intent_profile.sub_intents:
-                    base_query += "Prefer passages with concrete numbers, metrics, and outcome descriptions. "
-                if "table_lookup" in intent_profile.sub_intents:
-                    base_query += "Prefer passages tied to figures, tables, captions, or appendix visual material. "
-                if "deep_method" in intent_profile.sub_intents:
-                    base_query += "Prefer passages that explain the technical pipeline and implementation. "
-        if normalized_question:
-            return f"{base_query}Original question: {normalized_question}"
-        return base_query.rstrip()
 
     def _limit_rerank_text(self, text: str, max_chars: int) -> str:
         normalized = re.sub(r"\s+", " ", text or "").strip()
@@ -2028,256 +1867,6 @@ class EnhancedRetrievalService:
             },
             "rewrite_debug": rewrite_debug,
         }
-
-    def _vector_retrieve(
-        self,
-        collection_name: str,
-        query: str,
-        top_k: int,
-        route_name: str,
-        source_query: str,
-        query_profile: QueryProfile,
-        route_queries: List[str],
-    ) -> List[Dict[str, Any]]:
-        sample_chunks = self.vector_store_service.get_all_chunks(collection_name, limit=1)
-        sample_metadata = sample_chunks[0].get("metadata", {}) if sample_chunks else {}
-        collection_info = self.vector_store_service.get_collection_info("milvus", collection_name)
-        vector_dimension = None
-        schema = collection_info.get("schema", {}) if isinstance(collection_info, dict) else {}
-        for field in schema.get("fields", []) if isinstance(schema, dict) else []:
-            if field.get("name") == "vector":
-                vector_dimension = field.get("dim")
-                if vector_dimension is None:
-                    params = field.get("params", {})
-                    if isinstance(params, dict):
-                        vector_dimension = params.get("dim")
-                break
-        embedding_provider = sample_metadata.get("embedding_provider") or self.embedding_service.get_default_embedding_config().provider
-        embedding_model = sample_metadata.get("embedding_model") or self.embedding_service.get_default_embedding_config().model_name
-        embedding = self.embedding_service.create_single_embedding(
-            query,
-            provider=str(embedding_provider),
-            model=str(embedding_model),
-            dimension=int(vector_dimension) if vector_dimension else None,
-        )
-        results = self.vector_store_service.search_similar_vectors(
-            collection_name=collection_name,
-            query_vector=embedding,
-            top_k=top_k,
-        )
-        route_confidence = self._route_confidence(
-            route_name,
-            query_profile,
-            source_query,
-            route_queries=route_queries,
-            intent_profile=query_profile.intent_profile,
-        )
-        return self._normalize_route_results(results, route_name, source_query, route_confidence, query_profile)
-
-    def _keyword_retrieve(
-        self,
-        collection_name: str,
-        queries: List[str],
-        top_k: int,
-        query_profile: QueryProfile,
-    ) -> List[Dict[str, Any]]:
-        chunks = [self._normalize_chunk(chunk) for chunk in self.vector_store_service.get_all_chunks(collection_name)]
-        if not chunks:
-            return []
-
-        doc_tokens = [self._tokenize_for_keyword_search(chunk.get("content", "")) for chunk in chunks]
-        avgdl = sum(len(tokens) for tokens in doc_tokens) / max(len(doc_tokens), 1)
-        document_frequencies = defaultdict(int)
-        for tokens in doc_tokens:
-            for token in set(tokens):
-                document_frequencies[token] += 1
-
-        per_chunk_scores = [0.0 for _ in chunks]
-        query_signatures: List[str] = []
-        for query in queries:
-            tokens = self._tokenize_for_keyword_search(query)
-            if not tokens:
-                continue
-            query_signatures.append(query)
-            token_counter = Counter(tokens)
-            for idx, chunk in enumerate(chunks):
-                per_chunk_scores[idx] += self._bm25_score(
-                    token_counter=token_counter,
-                    doc_tokens=doc_tokens[idx],
-                    doc_freqs=document_frequencies,
-                    total_docs=len(chunks),
-                    avg_doc_length=avgdl,
-                    content=chunk.get("content", ""),
-                )
-
-        ranked: List[Tuple[int, float]] = [(idx, score) for idx, score in enumerate(per_chunk_scores) if score > 0]
-        ranked.sort(key=lambda item: item[1], reverse=True)
-        if not ranked:
-            return []
-
-        raw_scores = [score for _, score in ranked]
-        route_confidence = self._route_confidence(
-            "keyword",
-            query_profile,
-            " | ".join(query_signatures) if query_signatures else query_profile.original_query,
-            route_queries=query_signatures or [query_profile.keyword_query],
-            intent_profile=query_profile.intent_profile,
-        )
-        normalized_scores = self._normalize_scores(raw_scores)
-
-        results: List[Dict[str, Any]] = []
-        for rank, ((idx, score), normalized_score) in enumerate(zip(ranked[:top_k], normalized_scores[:top_k])):
-            chunk = dict(chunks[idx])
-            chunk["retrieval_route"] = "keyword"
-            chunk["source_query"] = " | ".join(query_signatures)
-            chunk["route_rank"] = rank + 1
-            chunk["route_score"] = float(score)
-            chunk["normalized_route_score"] = float(normalized_score)
-            chunk["route_confidence"] = float(route_confidence)
-            chunk["structural_bonus"] = float(self._compute_structural_bonus(chunk, query_profile))
-            results.append(chunk)
-        return results
-
-    def _memory_retrieve(
-        self,
-        collection_name: str,
-        memory_context: Dict[str, Any],
-        top_k: int,
-        query_profile: QueryProfile,
-    ) -> List[Dict[str, Any]]:
-        if not memory_context or not bool(memory_context.get("enabled", False)):
-            return []
-
-        candidates = [item for item in (memory_context.get("candidates", []) or []) if isinstance(item, dict)]
-        if not candidates:
-            return []
-
-        try:
-            chunks = [self._normalize_chunk(chunk) for chunk in self.vector_store_service.get_all_chunks(collection_name)]
-        except Exception as exc:
-            logger.warning("Memory retrieval skipped because chunk load failed: %s", exc)
-            return []
-
-        if not chunks:
-            return []
-
-        query_keywords = memory_context.get("query_keywords", []) or query_profile.keywords or []
-        route_results: List[Dict[str, Any]] = []
-        for candidate in candidates:
-            matched_chunks = [chunk for chunk in chunks if self._memory_candidate_matches(candidate, chunk)]
-            for chunk in matched_chunks:
-                memory_score = self._memory_candidate_score(candidate, chunk, query_keywords, query_profile)
-                route_confidence = min(
-                    0.78,
-                    self._route_confidence(
-                        "memory_context",
-                        query_profile,
-                        str(candidate.get("content_preview", "") or query_profile.original_query),
-                        route_queries=[str(candidate.get("content_preview", "") or query_profile.original_query)],
-                        intent_profile=query_profile.intent_profile,
-                    ) + min(0.18, memory_score * 0.15),
-                )
-                memory_chunk = dict(chunk)
-                memory_chunk["retrieval_route"] = "memory_context"
-                memory_chunk["source_query"] = query_profile.original_query
-                memory_chunk["route_score"] = float(memory_score)
-                memory_chunk["normalized_route_score"] = float(min(1.0, memory_score / 1.4))
-                memory_chunk["route_confidence"] = float(route_confidence)
-                memory_chunk["structural_bonus"] = float(self._compute_structural_bonus(memory_chunk, query_profile))
-                memory_chunk["memory_score"] = float(memory_score)
-                memory_chunk["memory_reason"] = str(candidate.get("memory_reason", "") or memory_context.get("reason", ""))
-                memory_chunk["source_turn_id"] = str(candidate.get("source_turn_id", "") or "")
-                memory_chunk["is_recent_turn"] = bool(candidate.get("is_recent_turn", False))
-                memory_chunk["memory_match_type"] = str(candidate.get("match_type", "metadata") or "metadata")
-                memory_chunk["memory_reference_strength"] = float(candidate.get("reference_strength", 0.0) or 0.0)
-                route_results.append(memory_chunk)
-
-        ranked = sorted(
-            route_results,
-            key=lambda item: (
-                float(item.get("memory_score", 0.0) or 0.0),
-                float(item.get("route_confidence", 0.0) or 0.0),
-                float(item.get("structural_bonus", 0.0) or 0.0),
-            ),
-            reverse=True,
-        )
-        deduped = self._dedupe_route_results(ranked)
-        for rank, item in enumerate(deduped[:top_k], start=1):
-            item["route_rank"] = rank
-        return deduped[:top_k]
-
-    def _memory_candidate_matches(self, candidate: Dict[str, Any], chunk: Dict[str, Any]) -> bool:
-        candidate_ids = {
-            str(candidate.get("chunk_id", "") or "").strip(),
-            str(candidate.get("parent_chunk_id", "") or "").strip(),
-            str(candidate.get("original_chunk_id", "") or "").strip(),
-            str(candidate.get("source_id", "") or "").strip(),
-        }
-        candidate_ids.discard("")
-        chunk_ids = {
-            str(chunk.get("chunk_id", "") or "").strip(),
-            str(chunk.get("parent_chunk_id", "") or "").strip(),
-            str(chunk.get("original_chunk_id", "") or "").strip(),
-        }
-        chunk_ids.discard("")
-        if candidate_ids and candidate_ids & chunk_ids:
-            return True
-
-        candidate_source = str(candidate.get("source", "") or "").strip().lower()
-        candidate_section = str(candidate.get("section_path", "") or "").strip().lower()
-        candidate_page = str(candidate.get("page_number", "") or "").strip()
-        chunk_source = str(chunk.get("source", "") or "").strip().lower()
-        chunk_section = str(chunk.get("section_path", "") or "").strip().lower()
-        chunk_page = str(chunk.get("page_number", "") or "").strip()
-
-        if candidate_source and candidate_section and candidate_source == chunk_source and candidate_section == chunk_section:
-            return True
-        if candidate_source and candidate_page and candidate_source == chunk_source and candidate_page == chunk_page:
-            return True
-        return False
-
-    def _memory_candidate_score(
-        self,
-        candidate: Dict[str, Any],
-        chunk: Dict[str, Any],
-        query_keywords: List[str],
-        query_profile: QueryProfile,
-    ) -> float:
-        score = 0.25
-        if bool(candidate.get("is_recent_turn", False)):
-            score += 0.28
-        score += min(0.24, float(candidate.get("reference_strength", 0.0) or 0.0) * 0.24)
-        candidate_ids = {
-            str(candidate.get("chunk_id", "") or "").strip(),
-            str(candidate.get("parent_chunk_id", "") or "").strip(),
-            str(candidate.get("original_chunk_id", "") or "").strip(),
-            str(candidate.get("source_id", "") or "").strip(),
-        }
-        chunk_ids = {
-            str(chunk.get("chunk_id", "") or "").strip(),
-            str(chunk.get("parent_chunk_id", "") or "").strip(),
-            str(chunk.get("original_chunk_id", "") or "").strip(),
-        }
-        if {item for item in candidate_ids if item} & {item for item in chunk_ids if item}:
-            score += 0.34
-
-        chunk_terms_text = " ".join(
-            [
-                str(chunk.get("content", "") or ""),
-                str(chunk.get("section_path", "") or ""),
-                str(chunk.get("asset_summary", "") or ""),
-            ]
-        ).lower()
-        overlap = 0
-        for keyword in query_keywords[:10]:
-            token = str(keyword or "").strip().lower()
-            if token and token in chunk_terms_text:
-                overlap += 1
-        if query_keywords:
-            score += min(0.28, overlap / max(len(query_keywords[:10]), 1) * 0.28)
-
-        score += max(0.0, float(self._compute_structural_bonus(chunk, query_profile)))
-        return score
 
     def _normalize_route_results(
         self,

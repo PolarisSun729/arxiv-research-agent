@@ -18,10 +18,13 @@ import { usePaperStore } from '@/stores/paperStore'
 import { qaTurnToRagMessages, type RagChatMessage } from '@/types/ragChat'
 import {
   createPaperQaIndex,
+  getLatestPaperQaIndexJob,
+  getPaperQaIndexJob,
   getPaperQaDiagnostic,
   getPaperQaStatus,
   getPaperRetrievalTraceDownloadUrl,
   type QaDiagnosticResult,
+  type QaIndexJobResult,
   type QaStatusResult
 } from '@/api/papers'
 
@@ -33,6 +36,8 @@ const paperId = computed(() => route.params.id as string)
 const loading = ref(true)
 const qaMode = ref(false)
 const creatingIndex = ref(false)
+const qaIndexJob = ref<QaIndexJobResult | null>(null)
+const qaJobPolling = ref(false)
 const loadingMethod = ref<'pymupdf' | 'docling'>('docling')
 const qaStatus = ref<QaStatusResult | null>(null)
 const qaDiagnostic = ref<QaDiagnosticResult | null>(null)
@@ -72,10 +77,39 @@ const quickPrompts = computed(() => [
 ])
 
 const hasQaIndex = computed(() => Boolean(qaStatus.value?.has_index))
+const hasActiveQaJob = computed(() => ['pending', 'running'].includes(String(qaIndexJob.value?.status || '')))
 const chatTurns = computed(() => qaResults.value)
 const ragChatMessages = computed(() => chatTurns.value.flatMap(qaTurnToRagMessages))
 const loadingMethodLabel = computed(() => (loadingMethod.value === 'docling' ? 'Docling' : 'PyMuPDF'))
 const loadingMethodHint = computed(() => (loadingMethod.value === 'docling' ? '更适合论文结构' : '保留传统解析'))
+const qaJobStatusText = computed(() => {
+  const status = String(qaIndexJob.value?.status || '').trim().toLowerCase()
+  if (status === 'pending') return '等待开始'
+  if (status === 'running') return '构建中'
+  if (status === 'success') return '已完成'
+  if (status === 'failed') return '失败'
+  return status || '未知'
+})
+const qaStageText = computed(() => {
+  const stage = String(qaIndexJob.value?.current_stage || '').trim()
+  const stageMap: Record<string, string> = {
+    pending: '等待开始',
+    starting: '任务启动中',
+    validate_loading_method: '校验解析方式',
+    mark_index_processing: '标记索引处理中',
+    load_paper_metadata: '加载论文元数据',
+    download_pdf: '下载 PDF',
+    load_pdf_document: '解析 PDF 文档',
+    chunk_document: '切分文档 chunks',
+    save_chunk_file: '保存 chunk 文件',
+    compress_chunks_for_rerank: '生成 rerank 文本',
+    create_chunk_embeddings: '生成 embeddings',
+    save_embeddings: '保存 embeddings',
+    index_embeddings_to_vector_store: '写入向量库',
+    mark_index_success: '索引完成'
+  }
+  return stageMap[stage] || stage || '-'
+})
 const currentPaperActions = computed(() => store.currentPaper?.paperActions || {})
 const preferredAnswerStyle = computed(() => store.researchProfile?.preferred_answer_style || '')
 const paperNotes = computed(() => store.paperNotes)
@@ -124,6 +158,8 @@ const currentSessionId = computed(() => {
   const session = currentSession.value as any
   return String(session?.session_id || session?.sessionId || '').trim()
 })
+
+let qaJobPollTimer: ReturnType<typeof window.setTimeout> | null = null
 
 function formatDate(dateStr: string) {
   return new Date(dateStr).toLocaleDateString('zh-CN', {
@@ -348,7 +384,7 @@ function goBack() {
 
 function syncViewport() {
   if (typeof window === 'undefined') return
-  isNarrowScreen.value = window.innerWidth < 1100
+  isNarrowScreen.value = window.innerWidth < 1280
   if (!isNarrowScreen.value) {
     evidenceDrawerOpen.value = false
   }
@@ -397,12 +433,103 @@ async function fetchQaStatus() {
   }
 }
 
+async function handleRefreshQaState() {
+  await fetchQaStatus()
+  await resumeLatestQaJobPolling()
+}
+
+function stopQaJobPolling() {
+  qaJobPolling.value = false
+  if (qaJobPollTimer) {
+    clearTimeout(qaJobPollTimer)
+    qaJobPollTimer = null
+  }
+}
+
+function scheduleQaJobPolling(jobId: string, delayMs: number = 2500) {
+  stopQaJobPolling()
+  qaJobPolling.value = true
+  qaJobPollTimer = window.setTimeout(() => {
+    pollQaJobStatus(jobId).catch(error => {
+      console.error('Failed to poll QA index job:', error)
+    })
+  }, delayMs)
+}
+
+async function pollQaJobStatus(jobId: string) {
+  if (!paperId.value || !jobId) return
+
+  try {
+    const job = await getPaperQaIndexJob(paperId.value, jobId)
+    qaIndexJob.value = job
+
+    if (job.status === 'success') {
+      stopQaJobPolling()
+      ElMessage.success('问答索引创建完成')
+      await fetchQaStatus()
+      return
+    }
+
+    if (job.status === 'failed') {
+      stopQaJobPolling()
+      await fetchQaStatus()
+      ElMessage.error(job.error_message || `索引创建失败：${qaStageText.value}`)
+      return
+    }
+
+    if (job.status === 'pending' || job.status === 'running') {
+      scheduleQaJobPolling(jobId)
+      return
+    }
+
+    stopQaJobPolling()
+  } catch (error: any) {
+    stopQaJobPolling()
+    if (error?.response?.status !== 404) {
+      ElMessage.error(error?.response?.data?.detail || '查询索引任务状态失败')
+    }
+  }
+}
+
+async function resumeLatestQaJobPolling() {
+  stopQaJobPolling()
+  qaIndexJob.value = null
+  if (!paperId.value) return
+
+  try {
+    const job = await getLatestPaperQaIndexJob(paperId.value)
+    qaIndexJob.value = job
+    if (job.status === 'pending' || job.status === 'running') {
+      scheduleQaJobPolling(job.job_id, 1500)
+    }
+  } catch (error: any) {
+    if (error?.response?.status !== 404) {
+      console.error('Failed to fetch latest QA index job:', error)
+    }
+  }
+}
+
 async function handleCreateIndex() {
   if (creatingIndex.value) return
 
   creatingIndex.value = true
   try {
-    await createPaperQaIndex(paperId.value, loadingMethod.value)
+    const result = await createPaperQaIndex(paperId.value, loadingMethod.value)
+    if (result.job_id) {
+      qaIndexJob.value = {
+        job_id: result.job_id,
+        arxiv_id: result.arxiv_id,
+        status: result.job_status || 'pending',
+        current_stage: result.current_stage || 'pending',
+        progress: typeof result.progress === 'number' ? result.progress : 0,
+        loading_method: result.loading_method || loadingMethod.value,
+        error_message: null
+      }
+      ElMessage.success('问答索引任务已提交，正在后台构建')
+      scheduleQaJobPolling(result.job_id, 1500)
+      return
+    }
+
     ElMessage.success('问答索引创建成功')
     await fetchQaStatus()
   } catch (error: any) {
@@ -461,6 +588,7 @@ onMounted(async () => {
     await Promise.all([store.fetchResearchProfile(), store.fetchPaperActions()])
     await store.fetchPaperById(paperId.value)
     await fetchQaStatus()
+    await resumeLatestQaJobPolling()
     await fetchPaperNotes()
     await loadRecentSession()
   } catch (error) {
@@ -471,16 +599,19 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  stopQaJobPolling()
   if (typeof window === 'undefined') return
   window.removeEventListener('resize', syncViewport)
 })
 
 watch(paperId, async () => {
+  stopQaJobPolling()
   loading.value = true
   try {
     await Promise.all([store.fetchResearchProfile(), store.fetchPaperActions()])
     await store.fetchPaperById(paperId.value)
     await fetchQaStatus()
+    await resumeLatestQaJobPolling()
     await fetchPaperNotes()
     resetChat()
     await loadRecentSession()
@@ -585,14 +716,14 @@ watch(activeNoteTypeFilter, async () => {
                   <span class="parser-label">PDF 解析</span>
                   <span class="parser-hint">{{ loadingMethodHint }}</span>
                 </div>
-                <el-radio-group v-model="loadingMethod" class="parser-segment" :disabled="creatingIndex" size="small">
+                <el-radio-group v-model="loadingMethod" class="parser-segment" :disabled="creatingIndex || hasActiveQaJob" size="small">
                   <el-radio-button label="docling">Docling</el-radio-button>
                   <el-radio-button label="pymupdf">PyMuPDF</el-radio-button>
                 </el-radio-group>
               </div>
               <el-button size="large" type="primary" class="action-button ask-button" @click="handleAskPaper" :loading="creatingIndex">
                 <el-icon><ChatDotRound /></el-icon>
-                {{ creatingIndex ? `创建 ${loadingMethodLabel} 索引中...` : `开始问答 · ${loadingMethodLabel}` }}
+                {{ creatingIndex ? '提交索引任务中...' : (hasActiveQaJob ? `索引构建中 · ${qaJobStatusText}` : `开始问答 · ${loadingMethodLabel}`) }}
               </el-button>
             </div>
 
@@ -601,6 +732,21 @@ watch(activeNoteTypeFilter, async () => {
               <span>
                 {{ qaStatus.has_index ? `索引已完成，${qaStatus.chunk_count || 0} 个 chunks 可供检索` : `先创建索引，默认解析方式：${loadingMethodLabel}` }}
               </span>
+            </div>
+            <div v-if="qaIndexJob" class="job-status-card">
+              <div class="job-status-head">
+                <el-tag :type="qaIndexJob.status === 'success' ? 'success' : (qaIndexJob.status === 'failed' ? 'danger' : 'warning')" effect="light">
+                  {{ qaJobStatusText }}
+                </el-tag>
+                <span class="job-stage-text">{{ qaStageText }}</span>
+              </div>
+              <el-progress
+                :percentage="Number(qaIndexJob.progress || 0)"
+                :status="qaIndexJob.status === 'failed' ? 'exception' : (qaIndexJob.status === 'success' ? 'success' : undefined)"
+              />
+              <div v-if="qaIndexJob.error_message" class="job-error-text">
+                {{ qaIndexJob.error_message }}
+              </div>
             </div>
             <div v-if="preferredAnswerStyle" class="answer-style-note">
               当前回答风格偏好：{{ preferredAnswerStyle }}
@@ -619,7 +765,7 @@ watch(activeNoteTypeFilter, async () => {
               </div>
 
               <div class="panel-actions">
-                <el-button text class="refresh-btn" @click="fetchQaStatus">
+                <el-button text class="refresh-btn" @click="handleRefreshQaState">
                   <el-icon><RefreshRight /></el-icon>
                   刷新状态
                 </el-button>
@@ -718,6 +864,22 @@ watch(activeNoteTypeFilter, async () => {
                 <div class="side-row">
                   <span>索引状态</span>
                   <strong>{{ qaStatus?.status || 'unknown' }}</strong>
+                </div>
+                <div class="side-row" v-if="qaIndexJob">
+                  <span>任务状态</span>
+                  <strong>{{ qaJobStatusText }}</strong>
+                </div>
+                <div class="side-row" v-if="qaIndexJob">
+                  <span>当前阶段</span>
+                  <strong>{{ qaStageText }}</strong>
+                </div>
+                <div class="side-row" v-if="qaIndexJob">
+                  <span>任务进度</span>
+                  <strong>{{ Number(qaIndexJob.progress || 0) }}%</strong>
+                </div>
+                <div class="side-row" v-if="qaIndexJob">
+                  <span>轮询状态</span>
+                  <strong>{{ qaJobPolling ? '进行中' : '已停止' }}</strong>
                 </div>
                 <div class="side-row">
                   <span>Chunk 数量</span>
@@ -901,9 +1063,10 @@ watch(activeNoteTypeFilter, async () => {
 
 .paper-detail {
   position: relative;
-  max-width: 1240px;
+  width: min(100%, 1680px);
+  max-width: none;
   margin: 0 auto;
-  padding: 24px 20px 36px;
+  padding: 24px clamp(16px, 3vw, 40px) 36px;
   font-family: 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei UI', 'Microsoft YaHei', sans-serif;
   color: #1f2937;
 }
@@ -2189,7 +2352,7 @@ watch(activeNoteTypeFilter, async () => {
   }
 }
 
-@media (max-width: 1024px) {
+@media (max-width: 1279px) {
   .hero-card,
   .qa-layout {
     grid-template-columns: 1fr;

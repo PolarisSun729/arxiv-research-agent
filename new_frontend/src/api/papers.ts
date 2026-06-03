@@ -543,8 +543,12 @@ export interface CreateQaIndexResult {
   status: string
   message: string
   arxiv_id: string
+  job_id?: string
+  job_status?: string
+  current_stage?: string
+  progress?: number
   loading_method?: string
-  pdf_path: string
+  pdf_path?: string
   document_path?: string
   filename?: string
   total_pages?: number
@@ -558,6 +562,28 @@ export async function createPaperQaIndex(arxivId: string, loadingMethod: string 
       loading_method: loadingMethod
     }
   })
+}
+
+export interface QaIndexJobResult {
+  job_id: string
+  arxiv_id: string
+  status: 'pending' | 'running' | 'success' | 'failed' | string
+  current_stage?: string | null
+  progress?: number | null
+  error_message?: string | null
+  loading_method?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export async function getLatestPaperQaIndexJob(arxivId: string): Promise<QaIndexJobResult> {
+  return request.get(`/paper/${arxivId}/qa-index-jobs/latest`, {
+    params: { arxiv_id: arxivId }
+  })
+}
+
+export async function getPaperQaIndexJob(arxivId: string, jobId: string): Promise<QaIndexJobResult> {
+  return request.get(`/paper/${arxivId}/qa-index-jobs/${jobId}`)
 }
 
 export interface QaResult {

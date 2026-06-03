@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 from dependencies import get_recommendation_service as get_dependency_recommendation_service
 from .tool_result import make_tool_error, make_tool_result, make_tool_trace
+from utils.config import get_default_user_id
 
 
 @lru_cache(maxsize=1)
@@ -12,8 +13,9 @@ def _get_recommendation_service():
     return get_dependency_recommendation_service()
 
 
-def recommend_papers(user_id: str = "local_user", top_n: int = 10, max_age_months: int = 6) -> Dict[str, Any]:
+def recommend_papers(user_id: str = None, top_n: int = 10, max_age_months: int = 6) -> Dict[str, Any]:
     tool_name = "recommend_papers"
+    user_id = str(user_id or get_default_user_id()).strip() or get_default_user_id()
     trace_inputs = {"user_id": user_id, "top_n": top_n, "max_age_months": max_age_months}
     try:
         result = _get_recommendation_service().recommend_papers(

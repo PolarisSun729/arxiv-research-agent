@@ -84,6 +84,10 @@ SQLITE_CONFIG: Dict[str, Any] = {
     "check_same_thread": _env_bool("SQLITE_CHECK_SAME_THREAD", False),
 }
 
+USER_CONFIG: Dict[str, Any] = {
+    "default_user_id": _env_str("DEFAULT_USER_ID", "local_user"),
+}
+
 OAI_SQLITE_CONFIG: Dict[str, Any] = {
     # Keep the OAI database under backend/06-database so backend launches and tools share the same store.
     "database_path": _env_str("OAI_SQLITE_DATABASE_PATH", str(BASE_DIR.parent / "06-database" / "arxiv_oai.db")),
@@ -195,6 +199,7 @@ ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     "rrf_candidate_limit": _env_int("ENHANCED_RETRIEVAL_RRF_CANDIDATE_LIMIT", 30),
     "rerank_candidate_limit": _env_int("ENHANCED_RETRIEVAL_RERANK_CANDIDATE_LIMIT", 30),
     "final_context_top_k": _env_int("ENHANCED_RETRIEVAL_FINAL_CONTEXT_TOP_K", 15),
+    "max_final_context_top_k": _env_int("ENHANCED_RETRIEVAL_MAX_FINAL_CONTEXT_TOP_K", 30),
     "sample_limit": _env_int("ENHANCED_RETRIEVAL_SAMPLE_LIMIT", 24),
     "merge_candidate_terms_limit": _env_int("ENHANCED_RETRIEVAL_MERGE_CANDIDATE_TERMS_LIMIT", 24),
     "extract_paper_terms_limit": _env_int("ENHANCED_RETRIEVAL_EXTRACT_PAPER_TERMS_LIMIT", 10),
@@ -461,6 +466,14 @@ def get_recommendation_runtime_config() -> Dict[str, Any]:
 
 def get_memory_runtime_config() -> Dict[str, Any]:
     return dict(MEMORY_RUNTIME_CONFIG)
+
+
+def get_default_user_id() -> str:
+    return str(USER_CONFIG["default_user_id"] or "local_user").strip() or "local_user"
+
+
+def get_user_runtime_config() -> Dict[str, Any]:
+    return dict(USER_CONFIG)
 
 
 def get_enhanced_retrieval_runtime_config() -> Dict[str, Any]:

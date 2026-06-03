@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import logging
@@ -16,7 +16,7 @@ from routers.paper_router import router as paper_router
 from routers.qa_router import router as qa_router
 from routers.user_router import router as user_router
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 
 def create_app(load_mode: str | None = None) -> FastAPI:

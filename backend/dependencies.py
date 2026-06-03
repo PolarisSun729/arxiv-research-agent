@@ -108,6 +108,16 @@ def get_paper_qa_index_builder() -> PaperQAIndexBuilder:
 
 
 @lru_cache(maxsize=1)
+def get_index_job_manager() -> IndexJobManager:
+    from services.paper_qa.index_job_manager import IndexJobManager
+
+    return IndexJobManager(
+        db_service=get_database_service(),
+        qa_index_builder=get_paper_qa_index_builder(),
+    )
+
+
+@lru_cache(maxsize=1)
 def get_recommendation_service() -> RecommendationService:
     from services.recommendation.recommendation_service import RecommendationService
 
@@ -157,6 +167,7 @@ def iter_service_getters() -> list[tuple[str, Callable[[], Any]]]:
         ("arxiv_api_service", get_arxiv_api_service),
         ("arxiv_service", get_arxiv_service),
         ("paper_qa_index_builder", get_paper_qa_index_builder),
+        ("index_job_manager", get_index_job_manager),
         ("recommendation_service", get_recommendation_service),
         ("paper_qa_service", get_paper_qa_service),
     ]

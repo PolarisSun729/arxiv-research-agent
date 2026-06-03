@@ -3,10 +3,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from dependencies import get_database_service, get_recommendation_service
+from utils.config import get_default_user_id
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +15,7 @@ router = APIRouter(prefix="/user", tags=["user"])
 
 
 class PaperActionRequest(BaseModel):
-    user_id: str = Field(default="local_user")
+    user_id: str = Field(default_factory=get_default_user_id)
     arxiv_id: str
     action_type: str
     paper: Optional[Dict[str, Any]] = None
@@ -22,7 +23,7 @@ class PaperActionRequest(BaseModel):
 
 
 class ResearchProfileRequest(BaseModel):
-    user_id: str = Field(default="local_user")
+    user_id: str = Field(default_factory=get_default_user_id)
     positive_topics: Optional[list[str]] = None
     negative_topics: Optional[list[str]] = None
     recent_topics: Optional[list[str]] = None
@@ -34,7 +35,7 @@ class ResearchProfileRequest(BaseModel):
 
 @router.post("/preferences")
 async def upsert_user_preferences(
-    user_id: str = Body("local_user"),
+    user_id: str = Body(default_factory=get_default_user_id),
     db_service=Depends(get_database_service),
 ):
     try:
@@ -58,7 +59,7 @@ async def get_user_preferences(user_id: str, db_service=Depends(get_database_ser
 @router.post("/like-paper")
 async def like_paper(
     arxiv_id: str = Body(...),
-    user_id: str = Body("local_user"),
+    user_id: str = Body(default_factory=get_default_user_id),
     paper: Optional[Dict[str, Any]] = Body(None),
     recommendation_service=Depends(get_recommendation_service),
 ):
@@ -79,7 +80,7 @@ async def like_paper(
 @router.post("/dislike-paper")
 async def dislike_paper(
     arxiv_id: str = Body(...),
-    user_id: str = Body("local_user"),
+    user_id: str = Body(default_factory=get_default_user_id),
     paper: Optional[Dict[str, Any]] = Body(None),
     recommendation_service=Depends(get_recommendation_service),
 ):
@@ -121,7 +122,7 @@ async def record_paper_action(
 async def remove_paper_action(
     arxiv_id: str = Body(...),
     action_type: str = Body(...),
-    user_id: str = Body("local_user"),
+    user_id: str = Body(default_factory=get_default_user_id),
     db_service=Depends(get_database_service),
 ):
     try:
@@ -196,7 +197,7 @@ async def patch_user_research_profile(
 @router.delete("/like-paper")
 async def remove_like(
     arxiv_id: str = Body(...),
-    user_id: str = Body("local_user"),
+    user_id: str = Body(default_factory=get_default_user_id),
     db_service=Depends(get_database_service),
 ):
     try:
@@ -212,7 +213,7 @@ async def remove_like(
 @router.delete("/dislike-paper")
 async def remove_dislike(
     arxiv_id: str = Body(...),
-    user_id: str = Body("local_user"),
+    user_id: str = Body(default_factory=get_default_user_id),
     db_service=Depends(get_database_service),
 ):
     try:
@@ -227,7 +228,7 @@ async def remove_dislike(
 
 @router.post("/generate-interest-vector")
 async def generate_user_interest_vector(
-    user_id: str = Body("local_user"),
+    user_id: str = Body(default_factory=get_default_user_id),
     recommendation_service=Depends(get_recommendation_service),
 ):
     try:
@@ -241,7 +242,7 @@ async def generate_user_interest_vector(
 
 @router.get("/interest-vector")
 async def get_user_interest_vector(
-    user_id: str = "local_user",
+    user_id: str = Query(default_factory=get_default_user_id),
     db_service=Depends(get_database_service),
 ):
     try:
@@ -258,7 +259,7 @@ async def get_user_interest_vector(
 
 @router.post("/recommend-papers")
 async def recommend_papers(
-    user_id: str = Body("local_user"),
+    user_id: str = Body(default_factory=get_default_user_id),
     top_n: int = Body(10),
     max_age_months: int = Body(6),
     recommendation_service=Depends(get_recommendation_service),
