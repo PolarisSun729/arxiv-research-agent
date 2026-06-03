@@ -41,6 +41,26 @@ from .state import AgentState
 
 logger = logging.getLogger(__name__)
 
+# 这个文件承载的是 arXiv Agent 在 LangGraph 中的大部分“节点实现”。
+# 可以把它理解为：graph.py 负责定义流程怎么走，而 nodes.py 负责每一步具体做什么。
+#
+# 这里的函数大致分成三层：
+# 1. 底层辅助函数：文本清洗、规则匹配、状态归一化、结果压缩、trace 构造等；
+# 2. 意图解析与规则决策：把用户自然语言请求转换成统一的 intent / search_spec；
+# 3. 图节点函数：真正被 graph.py 注册到 LangGraph 里的节点，例如搜索、阅读、偏好更新、最终回复生成。
+#
+# 后续阅读代码时，建议优先关注这些导出的节点函数：
+# - parse_search_request
+# - build_search_tool_args
+# - invoke_search_tool
+# - check_search_result
+# - relax_search_for_retry
+# - personalized_rank_and_annotate_papers
+# - classify_pending_action_confirmation
+# - handle_pending_action_confirmation
+# - handle_paper_reading_request
+# - apply_preference_action
+# - synthesize_response
 SEARCH_TOOL_NAME = "search_arxiv_structured"
 SUPPORTED_INTENTS = {
     "arxiv_search",
@@ -79,6 +99,14 @@ SEARCH_TRIGGER_PATTERNS: Sequence[str] = ()
 
 
 def _compact_search_spec(spec: Optional[ArxivSearchSpec]) -> Dict[str, Any]:
+    """把搜索规格对象压缩成适合日志、调试和 step 输出的轻量字典。
+
+    `ArxivSearchSpec` 往往会在多个节点之间传递，但并不是所有字段都适合原样写进
+    debug payload、步骤轨迹或前端调试信息里。这个函数的目的就是：
+    - 保留最核心、最可读的搜索字段；
+    - 去掉 None、空字符串、空列表这类噪声值；
+    - 让日志和轨迹更短、更稳定，便于排查问题。
+    """
     if spec is None:
         return {}
     payload = {
@@ -99,6 +127,16 @@ def _compact_search_spec(spec: Optional[ArxivSearchSpec]) -> Dict[str, Any]:
 
 
 def _compact_paper_summaries(papers: Sequence[Mapping[str, Any]], limit: int = 3) -> List[Dict[str, Any]]:
+    """从论文列表中抽取少量摘要字段，避免在轨迹里保存完整论文数据。
+
+    这个函数常用于：
+    - step outputs；
+    - 调试信息；
+    - 最终答复前的摘要展示。
+
+    只保留标题、arXiv ID、发布时间、类别、分数、排序位次等关键信息，
+    避免把完整 abstract、作者列表、上下文元数据重复写入状态轨迹。
+    """
     summaries: List[Dict[str, Any]] = []
     for paper in list(papers or [])[: max(0, limit)]:
         if not isinstance(paper, Mapping):
@@ -123,6 +161,17 @@ def _append_step(
     outputs: Optional[Dict[str, Any]] = None,
     error: Optional[str] = None,
 ) -> AgentState:
+    """向状态轨迹中追加一个新的执行步骤，并返回新的 state 副本。
+
+    LangGraph 在这里采用的是“不可变风格”的状态流转：节点不会直接原地修改旧状态，
+    而是先复制、再返回新状态。这个函数把“记录 step 轨迹”这件事集中封装起来，
+    让各个节点在结束时都能统一追加一条结构化执行记录。
+
+    记录 step 的价值主要有三点：
+    1. 调试时可以还原每个节点做了什么；
+    2. 前端/调试页可以可视化展示执行过程；
+    3. 失败时可以快速定位到底卡在哪一阶段。
+    """
     next_state = state.model_copy(deep=True)
     # 轨迹只记录摘要级信息，避免把完整论文列表复制到每个阶段。
     next_state.steps = list(next_state.steps or []) + [
@@ -139,6 +188,7 @@ def _append_step(
 
 
 def _compact_tool_args(tool_args: Mapping[str, Any]) -> Dict[str, Any]:
+    """筛选并压缩工具参数，生成适合展示和追踪的参数快照。"""
     payload: Dict[str, Any] = {}
     for key in (
         "query",
@@ -174,6 +224,20 @@ def _build_tool_call_trace(
     normalized_inputs: Optional[Dict[str, Any]] = None,
     final_search_query: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """构造一次工具调用的 trace 信息，供 tool_calls 和调试页消费。
+
+    与 `_compact_tool_args` 相比，这里不是简单地“保留参数”，而是补齐：
+    - 工具名；
+    - 标准化后的输入；
+    - 最终检索 query；
+    - 排序/分页参数；
+    - 返回数量；
+    - 工具成功失败标记；
+    - 工具层错误信息。
+
+    这样做的目的是把一次搜索调用包装成一个可观测事件，便于后续排查：
+    “到底传了什么参数、工具怎么响应、最终拿到了几篇论文”。
+    """
     trace: Dict[str, Any] = {}
     if isinstance(result, Mapping):
         trace.update(_result_mapping(result, "trace") or {})
@@ -318,6 +382,15 @@ CHINESE_NUMBER_MAP = {
 
 
 def _build_intent_guidance(intent: str) -> Tuple[List[str], List[str], List[str]]:
+    """根据 intent 生成给用户和调试系统使用的计划、后续动作和警告信息。
+
+    这里返回的是三元组：
+    - plan: 当前系统识别后准备怎么处理；
+    - next_actions: 建议用户下一步可以怎么继续；
+    - warnings: 对当前 intent 的限制、回退或注意事项说明。
+
+    它相当于一个“意图 -> 文案与解释策略”的集中映射表，避免这些说明文案散落在各个节点里。
+    """
     if intent == "arxiv_search":
         return (
             [
@@ -422,6 +495,7 @@ def _build_intent_guidance(intent: str) -> Tuple[List[str], List[str], List[str]
 
 
 def _contains_any_term(message: str, terms: Sequence[str]) -> bool:
+    """判断消息里是否包含任意一个中英文关键词。"""
     # 中英文混合匹配：英文统一按 lower() 做子串判断，中文保留原文匹配。
     lowered = message.lower()
     for term in terms:
@@ -437,6 +511,7 @@ def _contains_any_term(message: str, terms: Sequence[str]) -> bool:
 
 
 def _references_specific_paper(message: str) -> bool:
+    """轻量判断用户是否明确指向某一篇具体论文。"""
     # 详情/总结/问答/偏好动作通常都需要一个明确论文目标，这里先做轻量识别。
     lowered = message.lower()
     if bool(re.search(r"\b\d{4}\.\d{4,5}(?:v\d+)?\b", lowered)):
@@ -459,6 +534,7 @@ def _references_specific_paper(message: str) -> bool:
 
 
 def _looks_like_preference_action_request(message: str) -> bool:
+    """判断消息是否像“对某篇论文执行喜欢/不喜欢/收藏”的偏好动作请求。"""
     # 先排除“查看列表”类请求，避免把“打开收藏夹”误判成“收藏某篇论文”。
     if _contains_any_term(message, ("阅读列表", "收藏夹", "reading list", "favorites", "bookmarks")):
         return False
@@ -486,6 +562,7 @@ def _looks_like_preference_action_request(message: str) -> bool:
 
 
 def _looks_like_reading_list_action_request(message: str) -> bool:
+    """判断消息是否像“查看阅读列表/收藏列表”的列表类请求。"""
     return _contains_any_term(
         message,
         (
@@ -503,6 +580,7 @@ def _looks_like_reading_list_action_request(message: str) -> bool:
 
 
 def _looks_like_paper_summary_request(message: str) -> bool:
+    """判断消息是否像“总结某篇论文”的阅读型请求。"""
     # 用户说“摘要包含 xxx”时更像搜索约束，不应该被 summary intent 抢走。
     if _matches_any(message, ABSTRACT_HINT_PATTERNS):
         return False
@@ -521,6 +599,7 @@ def _looks_like_paper_summary_request(message: str) -> bool:
 
 
 def _looks_like_paper_detail_request(message: str) -> bool:
+    """判断消息是否像“解释论文方法/细节”的阅读型请求。"""
     # 先排除普通搜索请求，避免“找讲某个方法的论文”被误判成论文详情。
     if _looks_search_like(message):
         return False
@@ -547,6 +626,7 @@ def _looks_like_paper_detail_request(message: str) -> bool:
 
 
 def _looks_like_paper_qa_request(message: str) -> bool:
+    """判断消息是否像“围绕某篇论文继续提问”的 QA 请求。"""
     # QA 需要同时满足“像个问题”以及“指向具体论文”两个条件。
     question_hit = (
         "?" in message
@@ -559,6 +639,7 @@ def _looks_like_paper_qa_request(message: str) -> bool:
 
 
 def _looks_like_recommendation_request(message: str) -> bool:
+    """判断消息是否是“基于用户兴趣的个性化推荐”请求。"""
     lowered = message.lower()
     # 这里只识别“个性化推荐”语义，避免“推荐几篇 xxx 论文”误入 recommendation 分支。
     if "推荐系统" in message or "recommender system" in lowered or "recommendation system" in lowered:
@@ -584,10 +665,19 @@ def _looks_like_recommendation_request(message: str) -> bool:
 
 
 def _build_llm_prompt(message: str) -> str:
+    """为不带 research_profile 的场景构造默认 LLM 提示词。"""
     return _build_llm_prompt_with_profile(message, research_profile=None)
 
 
 def _compact_research_profile_for_prompt(research_profile: Optional[Mapping[str, Any]]) -> str:
+    """把研究兴趣画像压缩成适合拼进 prompt 的短文本。
+
+    research_profile 往往包含很多列表字段，但意图识别阶段只需要少量“提示信号”，
+    不需要把完整画像原样塞给模型。因此这里会：
+    - 只挑关键字段；
+    - 每个字段最多截取少量条目；
+    - 最终拼成一段紧凑字符串，避免 prompt 过长。
+    """
     if not isinstance(research_profile, Mapping):
         return "N/A"
 
@@ -614,6 +704,18 @@ def _compact_research_profile_for_prompt(research_profile: Optional[Mapping[str,
 
 
 def _build_llm_prompt_with_profile(message: str, research_profile: Optional[Mapping[str, Any]] = None) -> str:
+    """构造给 LLM 的意图识别提示词。
+
+    这个 prompt 的目标不是生成自然语言答案，而是让模型稳定输出一份结构化 JSON，
+    其中同时包含：
+    - intent 分类；
+    - 搜索规格字段；
+    - 清洗后的中英文主题词；
+    - 缺失信息、警告和下一步建议。
+
+    research_profile 在这里仅作为“轻量个性化提示”，用于帮助模型在模糊场景下做更稳妥的判断，
+    但不会覆盖用户的明确意图。
+    """
     profile_hint = _compact_research_profile_for_prompt(research_profile)
     return (
         "You are an intent parser for a natural-language arXiv paper agent.\n"
@@ -680,6 +782,16 @@ def _parse_llm_intent(
     generation_service: Optional[Any],
     research_profile: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """调用生成服务完成意图识别，并把结果解析成统一字典。
+
+    这是“LLM 意图识别层”的最外层封装。它只负责三件事：
+    1. 判断生成服务是否可用；
+    2. 发送 prompt 并解析 JSON；
+    3. 以 `{ok, reason, payload}` 的统一格式返回结果。
+
+    它故意不在这里做复杂业务决策，后续是否采纳 LLM 结果、是否要回退规则系统，
+    都交给 `parse_search_request` 统一处理。
+    """
     if generation_service is None or not hasattr(generation_service, "complete_with_qwen"):
         return {
             "ok": False,
@@ -711,6 +823,7 @@ def _parse_llm_intent(
 
 
 def _normalize_llm_intent_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """把 LLM 返回的原始 JSON 载荷清洗并规整为系统内部格式。"""
     intent = str(payload.get("intent", "unsupported") or "unsupported").strip().lower()
     if intent not in SUPPORTED_INTENTS:
         intent = "unsupported"
@@ -759,8 +872,24 @@ def _normalize_llm_intent_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _build_rule_decision(message: str) -> Dict[str, Any]:
+    """用纯规则系统为当前消息生成一份完整的意图判定结果。
+
+    这个函数可以看作是 LLM 识别链路的“平行备份方案”。
+    它不依赖模型，只基于：
+    - 非搜索类意图规则；
+    - 搜索触发词；
+    - query/time/count/sort 等字段抽取规则；
+    来产出一份尽可能完整的判定结果。
+
+    返回值的结构会故意对齐 LLM 路径后续需要使用的字段，便于：
+    - 在 LLM 不可用时直接兜底；
+    - 在 LLM 与规则冲突时做比对；
+    - 在 debug 中同时展示两套判断结果。
+    """
     non_search_intent = _detect_non_search_rule_intent(message)
     if non_search_intent is not None:
+        # 第 1 步：优先识别非搜索类意图。
+        # 只要命中了论文阅读、推荐、偏好动作等意图，就不再继续构造 search_spec。
         plan, next_actions, warnings = _build_intent_guidance(non_search_intent)
         return {
             "intent": non_search_intent,
@@ -775,8 +904,11 @@ def _build_rule_decision(message: str) -> Dict[str, Any]:
         }
 
     # 只有 arxiv_search 才允许继续构造 search_spec，其余 intent 必须在这里直接保留并退出搜索链路。
+    # 第 2 步：如果不是非搜索意图，则尝试基于规则抽取搜索规格。
     search_spec_before = _build_spec_from_rules(message)
     if search_spec_before is None:
+        # 第 3 步：如果看起来像搜索，但又抽不出明确 query，则标记为 unclear；
+        # 如果连搜索语义都不明显，则标记为 unsupported。
         plan, next_actions, warnings = _build_intent_guidance("unclear" if _looks_search_like(message) else "unsupported")
         intent = "unclear" if _looks_search_like(message) else "unsupported"
         return {
@@ -791,6 +923,7 @@ def _build_rule_decision(message: str) -> Dict[str, Any]:
             "plan": plan,
         }
 
+    # 第 4 步：对初步抽出的 search_spec 继续做 enrichment，补齐默认值并二次校验。
     search_spec_after = _apply_rule_enrichment(message, search_spec_before)
     if search_spec_after is None:
         plan, next_actions, warnings = _build_intent_guidance("unclear")
@@ -806,6 +939,7 @@ def _build_rule_decision(message: str) -> Dict[str, Any]:
             "plan": plan,
         }
 
+    # 第 5 步：规则成功构建出可用 search_spec，则把最终结果标记为 arxiv_search。
     plan, next_actions, warnings = _build_intent_guidance("arxiv_search")
     return {
         "intent": "arxiv_search",
@@ -822,6 +956,7 @@ def _build_rule_decision(message: str) -> Dict[str, Any]:
 
 
 def _detect_non_search_rule_intent(message: str) -> Optional[str]:
+    """使用规则系统识别非搜索类意图。"""
     if _matches_any(message, HARD_RULE_PATTERNS.get("paper_summary", [])):
         return "paper_summary"
     if _looks_like_paper_summary_request(message):
@@ -848,6 +983,7 @@ def _detect_non_search_rule_intent(message: str) -> Optional[str]:
 
 
 def _looks_search_like(message: str) -> bool:
+    """判断消息是否具有明显的论文搜索语义。"""
     lowered = message.lower()
     explicit_cn_patterns = (
         r"找.*论文",
@@ -882,6 +1018,18 @@ def _build_debug_payload(
     next_actions: Sequence[str],
     cleaning_debug: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """把一次意图识别过程中的关键中间结果打包进 debug 字段。
+
+    这个 debug payload 主要是给开发调试和问题排查使用的，它会尽量保留：
+    - 原始消息；
+    - LLM / rule / hard rule 的中间判断；
+    - fallback 原因；
+    - 搜索规格在 enrichment 前后的差异；
+    - 清洗后的 topic 与最终 query。
+
+    这样当用户说“为什么它把我的请求识别成 unclear / unsupported”时，
+    可以直接查看 debug 字段定位原因。
+    """
     payload: Dict[str, Any] = {
         "original_message": message,
         "final_intent": final_intent,
@@ -1328,10 +1476,24 @@ def check_search_result(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
 
 
 def relax_search_for_retry(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
-    """当搜索结果为空时，放宽关键词后重试。"""
+    """当搜索结果为空时，按轮次逐步放宽关键词，准备重新搜索。
+
+    这个节点是搜索链路里的“自动召回增强器”。
+    当前一轮工具调用成功但一篇论文都没搜到时，系统不会立刻结束，而是尝试：
+    - 缩短英文 query；
+    - 或缩短中文主题；
+    - 最终必要时退化为仅按类别搜索。
+
+    它本身不直接重新调工具，而是只负责：
+    1. 递增 retry 轮次；
+    2. 更新 search_spec.query；
+    3. 记录 fallback 历史与 debug 信息；
+    4. 清空上轮工具结果，为 graph 后续重新走 build_search_tool_args -> invoke_search_tool 链路做准备。
+    """
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
 
+    # 第 1 步：先递增当前重试轮次。
     retry_count = int(next_state.search_retry_count or 0)
     next_state.search_retry_count = retry_count + 1
 
@@ -1339,7 +1501,7 @@ def relax_search_for_retry(state: Union[AgentState, Mapping[str, Any]]) -> Agent
         original_query = next_state.search_spec.query
         relaxed_query = _relax_query_for_fallback(original_query, next_state.search_retry_count)
 
-        # 记录 fallback 历史
+        # 第 2 步：把本轮放宽前后的 query 记录进 fallback 历史，便于调试查看召回过程。
         fallback_record = {
             "round": next_state.search_retry_count,
             "original_query": original_query,
@@ -1348,7 +1510,7 @@ def relax_search_for_retry(state: Union[AgentState, Mapping[str, Any]]) -> Agent
         }
         next_state.fallback_specs = list(next_state.fallback_specs) + [fallback_record]
 
-        # 更新 debug 信息
+        # 第 3 步：同步更新 debug，方便前端或日志直接展示每轮 fallback query。
         debug = dict(next_state.debug or {})
         debug["fallback_round"] = next_state.search_retry_count
         fallback_queries = list(debug.get("fallback_queries", []))
@@ -1365,9 +1527,8 @@ def relax_search_for_retry(state: Union[AgentState, Mapping[str, Any]]) -> Agent
             ]
         )
 
-        # 更新 search_spec 为放宽后的查询
+        # 第 4 步：把 search_spec.query 改成放宽后的版本，并刷新 reasoning_summary。
         next_state.search_spec.query = relaxed_query
-        # 重新构建 reasoning_summary
         next_state.search_spec.reasoning_summary = _build_reasoning_summary(
             relaxed_query,
             list(next_state.search_spec.categories or []),
@@ -1376,7 +1537,7 @@ def relax_search_for_retry(state: Union[AgentState, Mapping[str, Any]]) -> Agent
             next_state.search_spec.sort_by or "submittedDate",
         ) + f" (fallback round {next_state.search_retry_count})"
 
-    # 重置搜索工具调用状态，准备重新执行
+    # 第 5 步：清空上轮调用痕迹，让后续节点以“新一轮搜索”重新构造工具参数并执行。
     next_state.tool_name = None
     next_state.tool_args = {}
     next_state.tool_result = None
@@ -1399,9 +1560,25 @@ def relax_search_for_retry(state: Union[AgentState, Mapping[str, Any]]) -> Agent
 
 
 def personalized_rank_and_annotate_papers(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    """基于用户偏好对搜索结果做个性化重排，并补充相关提示信息。
+
+    这个节点位于“搜索成功拿到 papers 之后、最终回复之前”。
+    它的职责不是决定搜索结果有没有命中，而是在已有结果的基础上尝试回答：
+    “这些论文里，哪些更符合当前用户过去的兴趣与偏好？”
+
+    主要流程是：
+    1. 判断是否具备个性化重排的前提条件（搜索意图、user_id、非空 papers）；
+    2. 获取 recommendation_service；
+    3. 调用重排服务返回个性化排序后的 papers；
+    4. 把个性化是否生效、相关 warnings、重排后结果写回 state。
+
+    如果任意一步失败，系统也不会中断，而是保留原始搜索排序继续向下执行。
+    """
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
 
+    # 第 1 步：先判断是否满足个性化重排的基本前提。
+    # 没有 user_id、不是搜索意图、或者压根没有结果时，都没有必要进入推荐服务。
     if next_state.intent != "arxiv_search" or not next_state.user_id or not next_state.papers:
         next_state.personalized_rerank_applied = False
         return _append_step(
@@ -1418,6 +1595,7 @@ def personalized_rank_and_annotate_papers(state: Union[AgentState, Mapping[str, 
         )
 
     try:
+        # 第 2 步：初始化推荐服务。如果服务都拿不到，就只能保留普通排序。
         recommendation_service = get_recommendation_service()
     except Exception as exc:
         next_state.personalized_rerank_applied = False
@@ -1439,10 +1617,11 @@ def personalized_rank_and_annotate_papers(state: Union[AgentState, Mapping[str, 
             error=str(exc),
         )
 
-    search_spec_payload = next_state.search_spec.model_dump() if next_state.search_spec is not None else None
     query_text = next_state.search_spec.query if next_state.search_spec is not None else None
+    search_spec_payload = next_state.search_spec.model_dump() if next_state.search_spec is not None else None
 
     try:
+        # 第 3 步：调用推荐服务进行重排。这里输入的是当前搜索结果，而不是重新检索。
         rerank_result = recommendation_service.rerank_search_results_for_user(
             user_id=str(next_state.user_id),
             papers=list(next_state.papers or []),
@@ -1470,15 +1649,18 @@ def personalized_rank_and_annotate_papers(state: Union[AgentState, Mapping[str, 
             error=str(exc),
         )
 
+    # 第 4 步：如果推荐服务真的返回了新的 papers 列表，则用重排后的结果覆盖原始顺序。
     reranked_papers = rerank_result.get("papers") if isinstance(rerank_result, Mapping) else None
     if isinstance(reranked_papers, list) and reranked_papers:
         next_state.papers = [paper for paper in reranked_papers if isinstance(paper, dict)]
 
+    # 第 5 步：同步记录“个性化是否生效”以及推荐服务给出的 warning。
     next_state.personalized_rerank_applied = bool(rerank_result.get("personalized_applied")) if isinstance(rerank_result, Mapping) else False
     rerank_warnings = rerank_result.get("warnings", []) if isinstance(rerank_result, Mapping) else []
     if isinstance(rerank_warnings, list):
         next_state.warnings = _dedupe_preserve_order(list(next_state.warnings) + [str(item) for item in rerank_warnings if str(item).strip()])
 
+    # 第 6 步：如果个性化没有真正生效，也显式告诉后续回复节点当前仍是普通搜索排序。
     if not next_state.personalized_rerank_applied:
         next_state.warnings = _dedupe_preserve_order(
             list(next_state.warnings) + ["用户兴趣向量不可用或个性化重排未生效，已退化为普通搜索结果"],
@@ -1842,14 +2024,17 @@ def _normalize_and_validate_spec(payload: Mapping[str, Any]) -> Optional[ArxivSe
 
 
 def _contains_chinese(text: str) -> bool:
+    """判断文本中是否包含中文字符。"""
     return bool(re.search(r"[一-鿿]", text))
 
 
 def _user_mentioned_abstract(message: str) -> bool:
+    """判断用户是否明确表达了“要在摘要字段里搜索”。"""
     return bool(re.search(r"(?:摘要|abstract)\s*(?:包含|是|有|为|里|中|搜索|contains|contain)", message, re.IGNORECASE))
 
 
 def _user_mentioned_title(message: str) -> bool:
+    """判断用户是否明确表达了“要在标题字段里搜索”。"""
     return bool(re.search(r"(?:标题|题目|title)\s*(?:包含|是|有|为|里|中|搜索|contains|contain)", message, re.IGNORECASE))
 
 
@@ -1868,6 +2053,8 @@ def _post_process_cleaned_spec(
     """
     warnings: List[str] = []
 
+    # 第 1 步：尽量把 query 收敛成“干净的主题短语”。
+    # 优先级依次是：LLM 给出的英文清洗结果 -> 中文清洗结果 -> spec.query -> 原始消息规则抽取。
     # 优先使用 LLM 已经清洗过的 topic，其次再回退到本地规则抽取，尽量避免把整句口语带进 query。
     normalized_query = _normalize_topic_phrase(cleaned_topic_en or "") if cleaned_topic_en else None
     if not normalized_query:
@@ -1888,6 +2075,8 @@ def _post_process_cleaned_spec(
             f"LLM 输出的 query 未能抽取出稳定主题: \"{spec.query}\"，将继续依赖后续规则兜底"
         )
 
+    # 第 2 步：如果用户并没有明确要求“在摘要里搜索”，就不要让 abstract_query 和 query 同时生效，
+    # 否则会让检索条件变得比用户预期更窄。
     if spec.query and spec.abstract_query and not _user_mentioned_abstract(message):
         warnings.append(
             f"用户未明确要求摘要搜索，已自动清空 abstract_query"
@@ -1895,6 +2084,7 @@ def _post_process_cleaned_spec(
         )
         spec.abstract_query = None
 
+    # 第 3 步：title_query 同理，只有用户明确说了“标题包含/标题搜索”才保留。
     if spec.query and spec.title_query and not _user_mentioned_title(message):
         warnings.append(
             f"用户未明确要求标题搜索，已自动清空 title_query"
@@ -1938,17 +2128,32 @@ MAX_SEARCH_RETRIES = 3
 
 
 def _build_spec_from_rules(message: str) -> Optional[ArxivSearchSpec]:
+    """仅基于本地规则从自然语言中构造一份初始搜索规格。
+
+    这个函数代表的是“最朴素、最保守”的规则抽取版本：
+    - 从消息里抽主题 query；
+    - 抽 title/abstract 显式约束；
+    - 抽最近 N 天、返回篇数、排序方式；
+    - 使用系统配置的默认分类范围。
+
+    它不负责做复杂的容错和二次修正，那部分职责交给 `_apply_rule_enrichment`。
+    因此可以把本函数理解为“先产出一个初稿 search_spec”。
+    """
+    # 第 1 步：分别抽取通用 query、标题定向 query、摘要定向 query。
     query = _extract_query_from_message(message)
     title_query = _extract_marked_query(message, TITLE_HINT_PATTERNS)
     abstract_query = _extract_marked_query(message, ABSTRACT_HINT_PATTERNS)
+    # 第 2 步：补充非 query 类的结构化约束，例如分类范围、时间范围、条数、排序方式。
     categories = get_default_agent_arxiv_categories()
     submitted_days_ago = _extract_submitted_days_ago(message)
     max_results = _extract_max_results(message)
     sort_by, sort_order = _extract_sorting(message)
 
+    # 第 3 步：如果完全抽不出任何有效检索入口，则认为当前规则不足以构造搜索请求。
     if not any([query, title_query, abstract_query]):
         return None
 
+    # 第 4 步：生成一份“规则初版”的 ArxivSearchSpec，供后续 enrichment 继续修正。
     return ArxivSearchSpec(
         intent="arxiv_search",
         query=query,
@@ -1966,13 +2171,31 @@ def _build_spec_from_rules(message: str) -> Optional[ArxivSearchSpec]:
 
 
 def _apply_rule_enrichment(message: str, spec: ArxivSearchSpec) -> Optional[ArxivSearchSpec]:
+    """对已有 search_spec 做规则增强，补齐缺省值并统一收敛字段。
+
+    与 `_build_spec_from_rules` 相比，这个函数不是从零开始抽取，而是站在“已有一份 spec”
+    的前提下做增强和标准化。它最常见的用途有两个：
+    - 给 LLM 解析出的 search_spec 做后端规则兜底；
+    - 给规则初版 search_spec 补齐默认字段并统一格式。
+
+    主要原则包括：
+    1. query 缺失时，允许再从原始消息中兜底抽一次；
+    2. categories 永远采用系统配置范围，不信任模型随意生成；
+    3. submitted_days_ago / sort / max_results 等字段做缺省补齐；
+    4. 最终重新构造一个新的 ArxivSearchSpec，利用模型本身的校验能力做最后把关。
+    """
     # 只有当 LLM 没有提供 query 时，才用规则提取兜底。
     # title_query 和 abstract_query 不由规则自动补全：用户没有明确要求时不应被设置。
+    # 第 1 步：先决定 query/title_query/abstract_query 最终分别取什么值。
     query = spec.query or _extract_query_from_message(message)
     title_query = spec.title_query
     abstract_query = spec.abstract_query
+
+    # 第 2 步：categories 一律收敛到系统配置的合法分类范围。
     # Always use the configured category scope for this agent instead of model-generated categories.
     categories = get_default_agent_arxiv_categories()
+
+    # 第 3 步：补齐时间范围、条数和排序策略的默认值。
     submitted_days_ago = spec.submitted_days_ago if spec.submitted_days_ago is not None else _extract_submitted_days_ago(message)
     max_results = _clamp(spec.max_results or 10, 1, 20)
     sort_by, sort_order = _extract_sorting(message)
@@ -1980,6 +2203,7 @@ def _apply_rule_enrichment(message: str, spec: ArxivSearchSpec) -> Optional[Arxi
         sort_by = spec.sort_by
         sort_order = spec.sort_order or sort_order
 
+    # 第 4 步：重新构造一份新的规范化 search_spec。
     return ArxivSearchSpec(
         intent="arxiv_search",
         query=query,
@@ -2024,6 +2248,16 @@ def _legacy_classify_intent(message: str) -> str:
 
 
 def _extract_query_from_message(message: str) -> Optional[str]:
+    """从自然语言消息中抽取一个适合作为 arXiv 搜索的主题 query。
+
+    这是规则搜索链路里最核心的 query 抽取函数之一。
+    它的总体策略是“两段式”：
+    1. 先尝试命中显式提示模式，例如“关于 xxx”“面向 xxx”“about xxx”；
+    2. 如果没有显式模式，再对整句做降噪、分词、停用词过滤，尽量提炼出主题词。
+
+    返回值会尽量是一个简洁、稳定的主题短语，而不是整句口语请求。
+    """
+    # 第 1 步：优先匹配显式 query 提示模式。
     for pattern in QUERY_HINT_PATTERNS:
         match = re.search(pattern, message, flags=re.IGNORECASE)
         if match:
@@ -2031,6 +2265,7 @@ def _extract_query_from_message(message: str) -> Optional[str]:
             if candidate:
                 return candidate
 
+    # 第 2 步：如果没有显式模式，则对整句做降噪、切词和主题 token 过滤。
     cleaned = _remove_noise(message)
     tokens = [token for token in _tokenize_mixed(cleaned) if _is_topic_token(token)]
     candidate = _normalize_topic_phrase(" ".join(_dedupe_preserve_order(tokens)))
@@ -2038,6 +2273,7 @@ def _extract_query_from_message(message: str) -> Optional[str]:
 
 
 def _extract_marked_query(message: str, patterns: Iterable[str]) -> Optional[str]:
+    """根据一组显式标记模式提取 query 片段，例如标题/摘要定向查询。"""
     for pattern in patterns:
         match = re.search(pattern, message, flags=re.IGNORECASE)
         if match:
@@ -2048,7 +2284,9 @@ def _extract_marked_query(message: str, patterns: Iterable[str]) -> Optional[str
 
 
 def _extract_submitted_days_ago(message: str) -> Optional[int]:
+    """从自然语言中解析“最近 N 天/一周/一个月”等时间范围约束。"""
     lowered = message.lower()
+    # 第 1 步：优先匹配 TIME_PATTERNS 里维护的结构化规则。
     for pattern, fixed_value in TIME_PATTERNS:
         match = re.search(pattern, message, flags=re.IGNORECASE)
         if match:
@@ -2056,6 +2294,7 @@ def _extract_submitted_days_ago(message: str) -> Optional[int]:
                 return fixed_value
             return _clamp(_safe_int(match.group(1), default=7), 1, 365)
 
+    # 第 2 步：兜底处理少量高频自然语言表达。
     if "最近一周" in message or "近一周" in message or "last week" in lowered:
         return 7
     if "最近两周" in message or "近两周" in message:
@@ -2066,6 +2305,7 @@ def _extract_submitted_days_ago(message: str) -> Optional[int]:
 
 
 def _extract_max_results(message: str) -> int:
+    """从用户消息中抽取期望返回的论文数量，并限制在允许区间内。"""
     for pattern in COUNT_PATTERNS:
         match = re.search(pattern, message, flags=re.IGNORECASE)
         if match:
@@ -2078,6 +2318,7 @@ def _extract_max_results(message: str) -> int:
 
 
 def _extract_sorting(message: str) -> Tuple[str, str]:
+    """从用户消息中推断排序方式与排序方向。"""
     lowered = message.lower()
     if any(keyword in lowered for keyword in ("最相关", "相关度高", "most relevant", "relevant", "relevance")):
         return "relevance", "descending"
@@ -2087,6 +2328,11 @@ def _extract_sorting(message: str) -> Tuple[str, str]:
 
 
 def _infer_categories(message: str, *texts: Optional[str]) -> List[str]:
+    """根据消息与相关文本内容粗略推断潜在 arXiv 分类。
+
+    这个函数更像一个轻量启发式工具：它不会替代系统固定分类范围，
+    但可以在某些辅助逻辑或调试场景下，用关键词快速猜测文本可能落在哪些学科方向。
+    """
     valid_categories = get_valid_arxiv_categories()
     allowed_map = {category.lower(): category for category in valid_categories}
     combined = " ".join([message, *[text or "" for text in texts]]).lower()
@@ -2108,6 +2354,7 @@ def _build_reasoning_summary(
     max_results: int,
     sort_by: str,
 ) -> str:
+    """把搜索规格中的核心约束压缩成一段简短说明文本。"""
     parts: List[str] = []
     if query:
         parts.append(f"主题={query}")
@@ -2121,6 +2368,17 @@ def _build_reasoning_summary(
 
 
 def _normalize_topic_phrase(value: Optional[str]) -> Optional[str]:
+    """把候选主题短语清洗成适合搜索的规范 query。
+
+    这个函数是 query 清洗流程里的关键收敛器。它会：
+    1. 先做基础文本标准化；
+    2. 去掉礼貌词、动作词、数量词和标点噪声；
+    3. 对中英文混合文本做切词；
+    4. 过滤明显不是主题词的 token；
+    5. 返回去重后的主题短语。
+
+    它的目标不是保留用户原句，而是尽量得到更适合 arXiv 搜索的关键词串。
+    """
     text = _normalize_text(value or "")
     if not text:
         return None
@@ -2136,6 +2394,7 @@ def _normalize_topic_phrase(value: Optional[str]) -> Optional[str]:
 
 
 def _remove_noise(text: str) -> str:
+    """去除自然语言搜索请求中的礼貌词、动作词、数量词和常见噪声。"""
     result = text
     result = _remove_patterns(result, TIME_PATTERNS)
     result = _strip_count_phrases(result)
@@ -2150,6 +2409,7 @@ def _remove_noise(text: str) -> str:
 
 
 def _remove_patterns(text: str, compiled_patterns: Iterable[Tuple[str, int]]) -> str:
+    """按给定正则模式批量删除文本片段。"""
     result = text
     for pattern, _ in compiled_patterns:
         result = re.sub(pattern, " ", result, flags=re.IGNORECASE)
@@ -2157,6 +2417,7 @@ def _remove_patterns(text: str, compiled_patterns: Iterable[Tuple[str, int]]) ->
 
 
 def _strip_count_phrases(text: str) -> str:
+    """移除“几篇/3篇/十篇论文”这类数量描述短语。"""
     result = text
     for pattern in COUNT_PATTERNS:
         result = re.sub(pattern, " ", result, flags=re.IGNORECASE)
@@ -2164,11 +2425,13 @@ def _strip_count_phrases(text: str) -> str:
 
 
 def _tokenize_mixed(text: str) -> List[str]:
+    """对中英文混合文本做轻量切词，提取可能的主题 token。"""
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9+\-_/\.]*|[\u4e00-\u9fff]{2,}", text)
     return [token.strip() for token in tokens if token and token.strip()]
 
 
 def _is_topic_token(token: str) -> bool:
+    """判断一个 token 是否值得保留为主题关键词。"""
     normalized = token.strip().lower()
     if not normalized:
         return False
@@ -2182,15 +2445,18 @@ def _is_topic_token(token: str) -> bool:
 
 
 def _normalize_text(value: Optional[str]) -> str:
+    """做最基础的文本标准化：转字符串、压缩连续空白、去首尾空格。"""
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 def _normalize_optional_str(value: Any) -> Optional[str]:
+    """把任意值归一化为可选字符串；空白值统一转成 None。"""
     text = _normalize_text(str(value or ""))
     return text or None
 
 
 def _normalize_categories(value: Any) -> List[str]:
+    """把分类输入统一规整成合法、去重、保序的 arXiv 分类列表。"""
     if value is None:
         return []
     if isinstance(value, str):
@@ -2223,6 +2489,7 @@ def _normalize_categories(value: Any) -> List[str]:
 
 
 def _normalize_sort_by(value: Any) -> str:
+    """把排序字段归一化到检索工具支持的标准取值。"""
     text = _normalize_text(str(value or ""))
     lowered = text.lower()
     if lowered in {"relevance"}:
@@ -2233,21 +2500,25 @@ def _normalize_sort_by(value: Any) -> str:
 
 
 def _normalize_sort_order(value: Any) -> str:
+    """把排序方向归一化成 ascending 或 descending。"""
     text = _normalize_text(str(value or "")).lower()
     return "ascending" if text == "ascending" else "descending"
 
 
 def _normalize_field_operator(value: Any) -> str:
+    """把字段级布尔操作符归一化为 AND / OR / ANDNOT。"""
     text = _normalize_text(str(value or "")).upper()
     return text if text in {"AND", "OR", "ANDNOT"} else "AND"
 
 
 def _normalize_category_operator(value: Any) -> str:
+    """把分类级布尔操作符归一化为 AND / OR。"""
     text = _normalize_text(str(value or "")).upper()
     return text if text in {"AND", "OR"} else "OR"
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
+    """尽量把任意值安全转成 int；失败时返回默认值。"""
     try:
         return int(str(value).strip())
     except Exception:
@@ -2255,6 +2526,7 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 
 def _safe_optional_int(value: Any) -> Optional[int]:
+    """把任意值安全转成非负整数；无效时返回 None。"""
     if value is None or value == "":
         return None
     if isinstance(value, bool):
@@ -2267,6 +2539,7 @@ def _safe_optional_int(value: Any) -> Optional[int]:
 
 
 def _parse_small_chinese_number(value: Any) -> Optional[int]:
+    """解析较小范围的中文数字表达，如“三”“十”“十二”。"""
     if value is None:
         return None
     text = str(value).strip()
@@ -2289,14 +2562,17 @@ def _parse_small_chinese_number(value: Any) -> Optional[int]:
 
 
 def _clamp(value: int, minimum: int, maximum: int) -> int:
+    """把数值限制在给定闭区间内。"""
     return max(minimum, min(maximum, int(value)))
 
 
 def _matches_any(text: str, patterns: Iterable[str]) -> bool:
+    """判断文本是否命中任意一个正则模式。"""
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
 
 
 def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
+    """对字符串序列去重，同时保留首次出现的顺序。"""
     seen = set()
     result: List[str] = []
     for item in items:
@@ -2308,6 +2584,7 @@ def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
 
 
 def _validation_error_summary(exc: ValidationError) -> str:
+    """把 Pydantic 校验异常压缩成简短、可读的单行摘要。"""
     errors = exc.errors()
     if not errors:
         return str(exc)
@@ -2318,6 +2595,7 @@ def _validation_error_summary(exc: ValidationError) -> str:
 
 
 def _extract_papers_from_tool_result(result: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """从工具返回结果中提取论文列表，兼容不同嵌套结构。"""
     data = result.get("data")
     candidates: Any = data
     if isinstance(data, dict):
@@ -2331,6 +2609,7 @@ def _extract_papers_from_tool_result(result: Mapping[str, Any]) -> List[Dict[str
 
 
 def _extract_error_message(result: Mapping[str, Any]) -> Optional[str]:
+    """从工具结果的 error 字段中提取适合展示的错误文本。"""
     error = result.get("error")
     if not isinstance(error, dict):
         return None
@@ -2342,6 +2621,7 @@ def _extract_error_message(result: Mapping[str, Any]) -> Optional[str]:
 
 
 def _extract_exception_detail(exc: Exception) -> str:
+    """从异常对象中提取更稳定的 detail 文本，兼容 HTTPException 等结构。"""
     detail = getattr(exc, "detail", None)
     if isinstance(detail, dict):
         message = str(detail.get("message") or detail.get("detail") or detail.get("error") or "").strip()
@@ -2357,6 +2637,7 @@ def _extract_exception_detail(exc: Exception) -> str:
 
 
 def _extract_exception_stage(exc: Exception, default_stage: str) -> str:
+    """尽量从异常对象中恢复失败阶段名；恢复不到时返回默认阶段。"""
     stage = str(getattr(exc, "error_stage", "") or getattr(exc, "failed_stage", "") or "").strip()
     if stage:
         return stage
@@ -2379,6 +2660,7 @@ def _build_pending_action_failure_result(
     error_type: str,
     index_created: bool = False,
 ) -> Dict[str, Any]:
+    """构造待确认论文解析任务失败时的标准结果对象。"""
     # 失败结果需要同时保留阶段、错误类型和原始错误信息，方便前端和日志一起定位问题。
     return {
         "status": "failed",
@@ -2398,6 +2680,7 @@ def _build_pending_action_failure_result(
 
 
 def _format_tool_failure_warning(result: Mapping[str, Any]) -> str:
+    """把工具失败结果格式化成可追加到 warnings 的提示文案。"""
     error_message = _extract_error_message(result)
     if error_message:
         return f"工具调用失败，请检查搜索参数或 arXiv 服务状态: {error_message}"
@@ -2405,6 +2688,7 @@ def _format_tool_failure_warning(result: Mapping[str, Any]) -> str:
 
 
 def _papers_are_significantly_fewer_than_requested(actual_count: int, max_results: int) -> bool:
+    """判断当前返回论文数是否明显少于用户期望数量。"""
     if actual_count <= 0 or max_results <= 0:
         return False
     if max_results <= 3:
@@ -2413,6 +2697,7 @@ def _papers_are_significantly_fewer_than_requested(actual_count: int, max_result
 
 
 def _summarize_search_spec(spec: Optional[ArxivSearchSpec]) -> str:
+    """把 search_spec 压缩成适合最终回复使用的人类可读摘要。"""
     if spec is None:
         return "当前搜索条件"
 
@@ -2433,6 +2718,7 @@ def _summarize_search_spec(spec: Optional[ArxivSearchSpec]) -> str:
 
 
 def _extract_json_block(text: str) -> str:
+    """从模型输出文本中提取 JSON 代码块或裸 JSON 对象。"""
     fenced_match = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
     if fenced_match:
         return fenced_match.group(1)
@@ -2443,6 +2729,7 @@ def _extract_json_block(text: str) -> str:
 
 
 def _to_plain_dict(value: Any) -> Dict[str, Any]:
+    """把可能是 Pydantic 模型或其他对象的值尽量转成普通 dict。"""
     if value is None:
         return {}
     if isinstance(value, dict):
@@ -2457,6 +2744,7 @@ def _to_plain_dict(value: Any) -> Dict[str, Any]:
 
 
 def _result_ok(result: Mapping[str, Any]) -> bool:
+    """统一判断工具结果是否表示成功。"""
     ok = result.get("ok")
     if isinstance(ok, bool):
         return ok
@@ -2466,6 +2754,7 @@ def _result_ok(result: Mapping[str, Any]) -> bool:
 
 
 def _result_text(result: Mapping[str, Any], key: str) -> Optional[str]:
+    """从结果字典中读取指定文本字段，并做基础标准化。"""
     value = result.get(key)
     if value is None:
         return None
@@ -2474,11 +2763,13 @@ def _result_text(result: Mapping[str, Any], key: str) -> Optional[str]:
 
 
 def _result_mapping(result: Mapping[str, Any], key: str) -> Optional[Dict[str, Any]]:
+    """从结果字典中安全读取某个子对象字段，仅当其本身为 dict 时返回。"""
     value = result.get(key)
     return value if isinstance(value, dict) else None
 
 
 def _determine_requested_max_results(state: AgentState) -> int:
+    """推断当前请求期望返回的论文数量上限。"""
     if state.search_spec is not None:
         return max(1, int(state.search_spec.max_results or 10))
     if isinstance(state.tool_args, dict) and state.tool_args.get("max_results") is not None:
@@ -2487,6 +2778,7 @@ def _determine_requested_max_results(state: AgentState) -> int:
 
 
 def _collect_priority_titles(papers: List[Dict[str, Any]], limit: int = 3) -> List[str]:
+    """从论文列表中挑出优先级最高的若干标题，用于回复文案展示。"""
     prioritized = sorted(
         [paper for paper in papers if isinstance(paper, dict)],
         key=lambda paper: (
@@ -2506,12 +2798,18 @@ def _collect_priority_titles(papers: List[Dict[str, Any]], limit: int = 3) -> Li
 
 
 def _coerce_state(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    """把节点收到的 state 统一转换成 AgentState 副本。
+
+    有的节点可能收到的是 AgentState，有的可能是普通 mapping。
+    这里集中做一次归一化，避免每个节点各自处理输入类型分支。
+    """
     if isinstance(state, AgentState):
         return state.model_copy(deep=True)
     return AgentState.model_validate(dict(state))
 
 
 def _first_matching_pattern(text: str, patterns: Sequence[str]) -> Optional[str]:
+    """返回第一个命中的正则模式本身，常用于调试说明“命中了哪条规则”。"""
     for pattern in patterns:
         if re.search(pattern, text, flags=re.IGNORECASE):
             return pattern
@@ -2522,6 +2820,20 @@ def parse_search_request(
     state: Union[AgentState, Mapping[str, Any]],
     generation_service: Optional[Any] = None,
 ) -> AgentState:
+    """解析用户请求，识别意图，并在需要时生成 arXiv 搜索规格。
+
+    这是整个 Agent 流程的第一个核心节点，也是最重要的“入口标准化节点”。
+    它的职责不是去调用搜索工具，而是先把用户的自然语言请求转换成统一的内部状态：
+    - intent：用户究竟是在搜论文、看论文详情、做问答、改偏好，还是请求不明确；
+    - search_spec：如果是搜索请求，需要得到结构化检索参数；
+    - plan / warnings / next_actions：为后续节点和最终回复准备解释信息；
+    - debug：记录本次识别过程中 LLM 与规则系统的关键中间结果。
+
+    整体策略是“LLM 优先，规则兜底”，但实现上分为 3 个阶段：
+    - 阶段 A：输入准备与中间变量初始化；
+    - 阶段 B：LLM 结果与规则结果并行准备，再做采纳/降级决策；
+    - 阶段 C：把最终结果统一写回 state，供 graph 后续路由使用。
+    """
     current_state = _coerce_state(state)
     message = _normalize_text(current_state.message or "")
 
@@ -2540,6 +2852,8 @@ def parse_search_request(
     cleaning_debug: Dict[str, Any] = {}
 
     def apply_rule_result(default_intent: str, override_intent: Optional[str] = None) -> None:
+        # 这是一个局部小工具，用来把 rule_result 一次性投影到当前上下文，
+        # 避免多个 fallback 分支重复写 intent / plan / next_actions / search_spec 赋值逻辑。
         nonlocal intent, intent_source, search_spec
         nonlocal plan, next_actions
         nonlocal search_spec_before_enrichment, search_spec_after_enrichment
@@ -2554,6 +2868,11 @@ def parse_search_request(
         next_actions = list(resolved.get("next_actions") or [])
         warnings.extend(str(item) for item in (resolved.get("warnings") or []) if str(item).strip())
 
+    # 阶段 A：输入准备。
+    # 这里先做 state 归一化、消息标准化，并初始化后续识别与调试会用到的中间变量。
+
+    # 阶段 B-1：先尝试 LLM 意图识别。
+    # 这里关注的不是“回答内容”，而是让模型给出结构化分类结果。
     llm_payload_result = _parse_llm_intent(
         message,
         generation_service=generation_service,
@@ -2575,9 +2894,12 @@ def parse_search_request(
         fallback_reason = str(llm_payload_result.get("reason") or "llm unavailable")
         warnings.append(fallback_reason)
 
+    # 阶段 B-2：无论 LLM 是否可用，都准备一份规则系统的判断结果。
+    # 这样后面既可以在 LLM 失败时直接兜底，也可以在 LLM 与规则冲突时做比对和降级。
     rule_result = _build_rule_decision(message)
 
     if llm_result is None:
+        # 阶段 B-3A：LLM 不可用或解析失败时，整个流程退回规则系统。
         apply_rule_result("unsupported")
         if fallback_reason is None:
             fallback_reason = str((rule_result or {}).get("reason") or "llm unavailable, rule fallback used")
@@ -2587,10 +2909,12 @@ def parse_search_request(
         confidence_value = float(llm_confidence) if isinstance(llm_confidence, (int, float)) else None
 
         if confidence_value is None:
+            # 阶段 B-3B：LLM 没给出置信度，视为不可直接信任，回退规则系统。
             fallback_reason = "llm confidence missing"
             warnings.append(fallback_reason)
             apply_rule_result(llm_intent)
         elif llm_intent == "arxiv_search":
+            # 阶段 B-3C：如果 LLM 认为是搜索请求，除了 intent 对，还必须产出合法 search_spec。
             search_spec = llm_result.get("search_spec")
             search_spec_before_enrichment = llm_result.get("search_spec_payload")
             if search_spec is None:
@@ -2598,6 +2922,7 @@ def parse_search_request(
                 warnings.append(fallback_reason)
                 apply_rule_result("unclear")
             else:
+                # 先做一次强制后处理清洗，再用规则系统补齐默认值和约束值。
                 search_spec, post_warnings = _post_process_cleaned_spec(search_spec, message)
                 warnings.extend(post_warnings)
                 enriched_spec = _apply_rule_enrichment(message, search_spec)
@@ -2606,12 +2931,15 @@ def parse_search_request(
                     warnings.append(fallback_reason)
                     apply_rule_result("unclear")
                 elif confidence_value < LLM_CONFIDENCE_THRESHOLD:
+                    # 即便 spec 合法，只要置信度太低，仍然优先保守地回退规则系统。
                     fallback_reason = (
                         f"llm confidence {confidence_value:.2f} below threshold {LLM_CONFIDENCE_THRESHOLD:.2f}"
                     )
                     warnings.append(fallback_reason)
                     apply_rule_result("arxiv_search")
                 else:
+                    # 只有“LLM 置信度够高 + search_spec 合法 + enrichment 成功”时，
+                    # 才真正采用 LLM 主导的搜索解析结果。
                     intent = "arxiv_search"
                     intent_source = "llm"
                     search_spec = enriched_spec
@@ -2623,6 +2951,8 @@ def parse_search_request(
                             f"llm/rule intent conflict: llm={llm_intent}, rule={rule_result.get('intent')}"
                         )
         else:
+            # 阶段 B-3D：处理非搜索类意图。
+            # 这类请求不要求 search_spec，主要看 intent 与 confidence 是否可信。
             if llm_intent == "recommendation" and not _looks_like_recommendation_request(message):
                 fallback_reason = "llm recommendation intent downgraded because the request is topic-based, not personalized"
                 warnings.append(fallback_reason)
@@ -2646,10 +2976,12 @@ def parse_search_request(
                         f"llm/rule intent conflict: llm={llm_intent}, rule={rule_result.get('intent')}"
                     )
 
+    # 阶段 B-4：有些 fallback 分支只设置了 intent，这里统一补齐 plan / next_actions。
     if not plan and not next_actions:
         plan, next_actions, intent_warnings = _build_intent_guidance(intent)
         warnings.extend(intent_warnings)
 
+    # 阶段 B-5：搜索意图必须附带有效 search_spec；否则统一降级为 unclear。
     if intent == "arxiv_search" and search_spec is None:
         plan, next_actions, intent_warnings = _build_intent_guidance("unclear")
         warnings.extend(intent_warnings)
@@ -2662,6 +2994,8 @@ def parse_search_request(
         cleaning_debug["final_title_query"] = search_spec.title_query
         cleaning_debug["final_abstract_query"] = search_spec.abstract_query
 
+    # 阶段 C：把所有规范化后的字段写回新的 state，
+    # 同时重置后续节点会重新填充的临时字段，确保当前 state 是一份干净的一致性快照。
     normalized_state = current_state.model_copy(deep=True)
     normalized_state.intent = intent
     normalized_state.intent_source = intent_source
@@ -2719,6 +3053,7 @@ def parse_search_request(
 
 
 def _build_non_search_answer(intent: str) -> Tuple[str, List[str]]:
+    """为非搜索类意图生成兜底答复文案与下一步建议。"""
     if intent == "paper_summary":
         return (
             "我已经识别到你想总结某篇论文，但这个入口目前还没有接入论文总结能力。你可以先给我论文标题或 arXiv ID，后续再切到论文总结功能。",
@@ -2816,6 +3151,14 @@ _PREFERENCE_ORDINAL_MAP = {
 
 
 def _normalize_context_paper(raw: Any) -> Dict[str, Any]:
+    """把来自 context/搜索结果/QA 结果的论文对象规整成统一结构。
+
+    上下文中的论文数据来源很多，字段命名也不完全一致，例如：
+    - arxiv_id / arxivId / id
+    - abs_url / url / pdf_url
+    - published / updated / publishedAt
+    因此这里会做一次集中归一化，保证后续所有论文引用解析逻辑都能按统一字段访问。
+    """
     paper = raw if isinstance(raw, Mapping) else {}
     arxiv_id = str(paper.get("arxiv_id") or paper.get("arxivId") or paper.get("id") or "").strip()
     if arxiv_id.startswith("http"):
@@ -2865,6 +3208,7 @@ def _normalize_context_paper(raw: Any) -> Dict[str, Any]:
 
 
 def _merge_context_paper_lists(*paper_lists: Any) -> List[Dict[str, Any]]:
+    """合并多个论文列表来源，并按 arXiv ID/标题做去重。"""
     merged: List[Dict[str, Any]] = []
     seen_keys = set()
 
@@ -2885,6 +3229,7 @@ def _merge_context_paper_lists(*paper_lists: Any) -> List[Dict[str, Any]]:
 
 
 def _extract_selected_paper(context: Any) -> Optional[Dict[str, Any]]:
+    """从上下文中提取当前最可能被“选中”的论文。"""
     if not isinstance(context, Mapping):
         return None
 
@@ -2924,6 +3269,17 @@ def _extract_selected_paper(context: Any) -> Optional[Dict[str, Any]]:
 
 
 def _extract_last_papers(context: Any) -> List[Dict[str, Any]]:
+    """从上下文中汇总“上一轮或最近一批论文结果”。
+
+    论文引用解析常常需要知道：用户说的“第一篇/第二篇/上一篇”到底对应哪篇论文。
+    这些候选论文可能分散保存在不同上下文字段里，例如：
+    - last_papers
+    - papers
+    - search_results
+    - recent_papers
+
+    本函数会把这些来源统一合并成一个标准列表，供 `_resolve_paper_reference` 后续解析目标论文。
+    """
     if not isinstance(context, Mapping):
         return []
     return _merge_context_paper_lists(
@@ -2935,6 +3291,16 @@ def _extract_last_papers(context: Any) -> List[Dict[str, Any]]:
 
 
 def _parse_preference_action(message: str) -> Optional[Dict[str, str]]:
+    """从自然语言中解析用户想执行的偏好动作类型。
+
+    当前支持的动作主要有三类：
+    - like：喜欢 / 感兴趣 / 收藏；
+    - dislike：不喜欢 / 不感兴趣；
+    - remove：取消之前的喜欢或不喜欢标记。
+
+    这个函数只负责识别“动作是什么”，不负责识别“目标是哪篇论文”；
+    目标论文解析由 `_resolve_paper_reference` 负责。
+    """
     text = _normalize_text(message)
     lowered = text.lower()
     if not text:
@@ -2965,12 +3331,14 @@ def _parse_preference_action(message: str) -> Optional[Dict[str, str]]:
         r"对.*感兴趣",
     )
 
+    # 第 1 步：先判断 remove 的作用范围，是取消 liked、取消 disliked，还是两者都尝试移除。
     remove_scope = "both"
     if _matches_any(text, (r"取消.*喜欢", r"撤销.*喜欢")):
         remove_scope = "liked"
     elif _matches_any(text, (r"取消.*不喜欢", r"撤销.*不喜欢")):
         remove_scope = "disliked"
 
+    # 第 2 步：按“remove -> dislike -> like”的优先级匹配，避免关键词重叠造成误判。
     if _matches_any(text, remove_patterns):
         return {"action": "remove", "remove_scope": remove_scope}
     if _matches_any(text, dislike_patterns) or "dislike" in lowered:
@@ -2981,10 +3349,22 @@ def _parse_preference_action(message: str) -> Optional[Dict[str, str]]:
 
 
 def _parse_target_reference(message: str) -> Optional[Dict[str, Any]]:
+    """从用户消息中解析“指向哪篇论文”的目标引用方式。
+
+    这个函数解决的是：用户没有总是直接给论文标题，而可能会用很多不同方式指代论文，例如：
+    - 直接给 arXiv ID；
+    - 说“这篇 / 当前论文 / 本文”；
+    - 说“第一篇 / 第二篇 / 第 3 篇”；
+    - 只输入一个数字序号。
+
+    它的输出不是最终论文对象，而是一份“引用类型描述”，后续再由 `_resolve_paper_reference`
+    结合 context 中的论文列表，解析成具体论文。
+    """
     text = _normalize_text(message)
     if not text:
         return None
 
+    # 第 1 步：优先识别最明确的 arXiv ID。
     arxiv_match = re.search(r"(?:arxiv\.org/(?:abs|pdf)/)?(\d{4}\.\d{4,5}(?:v\d+)?)", text, flags=re.IGNORECASE)
     if arxiv_match:
         return {
@@ -2993,6 +3373,7 @@ def _parse_target_reference(message: str) -> Optional[Dict[str, Any]]:
             "arxiv_id": arxiv_match.group(1),
         }
 
+    # 第 2 步：识别“这篇论文/当前论文”这类依赖上下文的指代。
     if _matches_any(
         text,
         (
@@ -3010,6 +3391,7 @@ def _parse_target_reference(message: str) -> Optional[Dict[str, Any]]:
             "target_value": "selected_or_recent",
         }
 
+    # 第 3 步：识别“第一篇/第二篇/第 N 篇”这类序号引用。
     ordinal_match = re.search(r"(?:第\s*)?([一二三四五六七八九十两]{1,3}|[1-9]|1[0-9]|20)\s*(?:篇|个)?(?:论文|paper)?", text)
     if ordinal_match:
         raw_value = ordinal_match.group(1)
@@ -3023,6 +3405,7 @@ def _parse_target_reference(message: str) -> Optional[Dict[str, Any]]:
                 "ordinal": ordinal,
             }
 
+    # 第 4 步：兜底支持 bare number 场景，例如用户只回复“2”或“第2”。
     bare_match = re.search(r"(?<!\d)([1-9]|1[0-9]|20)(?!\d)", text)
     if bare_match and (text.strip() in {bare_match.group(1), f"第{bare_match.group(1)}", f"第{bare_match.group(1)}篇"} or any(token in text for token in ("喜欢", "不喜欢", "收藏", "标记", "取消", "撤销"))):
         ordinal = _safe_int(bare_match.group(1), default=0)
@@ -3037,11 +3420,29 @@ def _parse_target_reference(message: str) -> Optional[Dict[str, Any]]:
 
 
 def _resolve_paper_reference(message: str, context: Any) -> Dict[str, Any]:
+    """把用户消息中的论文引用解析成一篇具体论文。
+
+    这是论文阅读、偏好动作等链路里的关键辅助函数。
+    其职责是把用户的自然语言指代，结合上下文中的候选论文信息，最终解析成：
+    - arxiv_id
+    - title
+    - 标准化 paper payload
+    - 命中来源 matched_from
+
+    它会综合利用：
+    - `_parse_target_reference` 解析出的引用方式；
+    - context 中的 selected_paper；
+    - 上一轮搜索结果 last_papers；
+    - paper_qa_result 等其他可恢复的论文上下文。
+
+    返回值既可能是 success，也可能是带原因说明的 failed，方便上层节点直接拿来生成用户提示。
+    """
     reference = _parse_target_reference(message)
     last_papers = _extract_last_papers(context)
     selected_paper = _extract_selected_paper(context)
 
     def build_success(paper_payload: Optional[Mapping[str, Any]], *, target: Optional[Dict[str, Any]], matched_from: str) -> Dict[str, Any]:
+        # 统一把命中的论文规整成标准结构，并附带“是从哪里匹配出来的”。
         normalized_paper = _normalize_context_paper(paper_payload or {})
         resolved_arxiv_id = str(normalized_paper.get("arxiv_id") or "").strip() or None
         resolved_title = str(normalized_paper.get("title") or "").strip() or None
@@ -3055,6 +3456,8 @@ def _resolve_paper_reference(message: str, context: Any) -> Dict[str, Any]:
             "matched_from": matched_from,
         }
 
+    # 第 1 步：如果消息里没有显式目标引用，就尝试从上下文自动补：
+    # 优先用 selected_paper，其次在“最近只有一篇论文”时直接默认它。
     if reference is None:
         if selected_paper is not None:
             return build_success(selected_paper, target=None, matched_from="selected_paper")
@@ -3069,6 +3472,7 @@ def _resolve_paper_reference(message: str, context: Any) -> Dict[str, Any]:
             "title": None,
         }
 
+    # 第 2 步：处理“这篇/当前论文”这种纯上下文指代。
     if reference["target_type"] == "context_paper":
         if selected_paper is not None:
             return build_success(selected_paper, target=reference, matched_from="selected_paper")
@@ -3083,6 +3487,7 @@ def _resolve_paper_reference(message: str, context: Any) -> Dict[str, Any]:
             "title": None,
         }
 
+    # 第 3 步：处理“第一篇/第二篇”这种序号引用。
     if reference["target_type"] == "ordinal":
         ordinal = int(reference["target_value"])
         if not last_papers:
@@ -3186,6 +3591,12 @@ def _normalize_confirmation_decision(value: Any) -> str:
 
 
 def _fast_path_pending_action_decision(message: str) -> Optional[str]:
+    """用纯规则快速判断用户是在确认还是取消待执行动作。
+
+    这个函数专门优化“确认 / 取消 / 继续解析”这类极短消息。
+    这些消息如果每次都走 LLM 分类，会增加延迟和成本；
+    因此这里优先用 token 集合和简单正则做快速分流。
+    """
     text = _normalize_text(message)
     if not text:
         return None
@@ -3221,6 +3632,7 @@ def _fast_path_pending_action_decision(message: str) -> Optional[str]:
         "别解析",
     }
 
+    # 第 1 步：先做最严格的整句匹配，处理“确认”“取消”“yes”“no”这类短输入。
     if text in confirm_tokens:
         return "confirm"
     if text in reject_tokens:
@@ -3257,6 +3669,7 @@ def _fast_path_pending_action_decision(message: str) -> Optional[str]:
         r"确认解析",
     )
 
+    # 第 2 步：再用模式匹配处理“先不解析”“创建索引”这类稍长表达。
     if _matches_any(text, reject_patterns) or _matches_any(lowered, reject_patterns):
         return "reject"
     if _matches_any(text, confirm_patterns) or _matches_any(lowered, confirm_patterns):
@@ -3265,9 +3678,23 @@ def _fast_path_pending_action_decision(message: str) -> Optional[str]:
 
 
 def _build_qa_question_for_paper(intent: str, message: str, paper: Mapping[str, Any], reference: Mapping[str, Any]) -> str:
+    """把论文阅读类请求转换成适合 QA 服务消费的标准问题文本。
+
+    论文阅读链路里，用户的原始表达往往并不直接适合作为最终问答 prompt，例如：
+    - 可能包含“第一篇 / 这篇 / arXiv ID”这类定位信息；
+    - 可能只是“解释一下”“讲讲方法”这种不完整短语；
+    - summary / detail / qa 三种意图实际上需要不同风格的问题模板。
+
+    因此本函数会先清洗掉定位性前缀，再根据 intent 生成适合下游 QA 服务执行的问题：
+    - summary：生成标准总结型问题；
+    - detail：生成方法/细节解释型问题；
+    - paper_qa：尽量保留用户原问题。
+    """
     original_question = _normalize_text(message)
     title = _normalize_text(str(paper.get("title") or reference.get("title") or ""))
 
+    # 第 1 步：先移除“问一下”“第一篇”“这篇论文”“arXiv ID: xxx”这类定位或口语前缀，
+    # 尽量把原始问题收敛成更干净的语义主体。
     cleaned_question = original_question
     cleaned_question = re.sub(r"^(问一下|请问一下|请问|问|帮我问一下|帮我问|想问一下)\s*", "", cleaned_question).strip()
     cleaned_question = re.sub(
@@ -3280,12 +3707,14 @@ def _build_qa_question_for_paper(intent: str, message: str, paper: Mapping[str, 
     cleaned_question = re.sub(r"^\d{4}\.\d{4,5}(?:v\d+)?\s*", "", cleaned_question).strip()
     cleaned_question = cleaned_question.lstrip("，,:：.。;； ")
 
+    # 第 2 步：summary intent 使用固定模板，确保输出覆盖研究问题、方法、实验、结果和局限性。
     if intent == "paper_summary":
         return (
             f"请基于论文全文总结这篇论文，包含研究问题、核心贡献、方法流程、实验设置、主要结果和局限性。"
             f"{f' 论文标题：{title}' if title else ''}"
         ).strip()
 
+    # 第 3 步：detail intent 更强调方法细节；如果用户原话太短，就补一版更明确的解释型问题。
     if intent == "paper_detail":
         detail_question = cleaned_question or original_question
         if _matches_any(detail_question, (r"^解释$", r"^讲讲$", r"^介绍一下$", r"^方法$", r"^讲讲方法$", r"^解释方法$")):
@@ -3294,6 +3723,7 @@ def _build_qa_question_for_paper(intent: str, message: str, paper: Mapping[str, 
             detail_question = "请详细解释这篇论文的主要方法、实验设计和贡献。"
         return detail_question
 
+    # 第 4 步：paper_qa 尽量保留用户问题；若完全为空，则给一个保守兜底问句。
     if not cleaned_question:
         cleaned_question = "请基于论文全文回答这个问题。"
     return cleaned_question
@@ -4219,7 +4649,9 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
         )
 
     if next_state.intent == "arxiv_search":
-        spec = next_state.search_spec
+    # 这里把面向业务的 spec 映射成面向工具的参数字典，并补齐默认值，
+    # 保证后续 invoke_tool 时拿到的是完整、稳定的入参。
+    spec = next_state.search_spec
         papers = list(next_state.papers or [])
         paper_count = len(papers)
         max_results = spec.max_results if spec is not None else 10
@@ -4302,3 +4734,7 @@ __all__ = [
     "route_after_parse",
     "synthesize_response",
 ]
+    # 分支 4：如果仍处于 waiting_confirmation，则给用户一个明确的确认提示。
+    # 分支 5：偏好动作类请求，直接基于 preference_action_result 生成回复。
+    # 分支 6：unsupported / unclear 等非正常搜索态，返回解释型文案。
+    # 分支 7：其余非搜索意图走统一文案工厂。
