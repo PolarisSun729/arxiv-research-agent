@@ -38,6 +38,16 @@ class CandidateMaterializer:
         if not success:
             raise HTTPException(status_code=500, detail=f"Failed to record paper action {normalized_action}")
 
+        try:
+            self.memory_service.update_profile_from_paper_action(
+                user_id=user_id,
+                arxiv_id=normalized_arxiv_id,
+                action_type=normalized_action,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.warning("Failed to update profile from paper action: user_id=%s arxiv_id=%s action=%s error=%s", user_id, normalized_arxiv_id, normalized_action, exc)
+
         return {
             "status": "success",
             "message": f"Paper action '{normalized_action}' saved successfully",
@@ -71,6 +81,16 @@ class CandidateMaterializer:
 
         if not success:
             raise HTTPException(status_code=500, detail=f"Failed to add paper to {action} list")
+
+        try:
+            self.memory_service.update_profile_from_preference(
+                user_id=user_id,
+                arxiv_id=normalized_arxiv_id,
+                action_type="like" if liked else "dislike",
+                paper_payload=paper,
+            )
+        except Exception as exc:
+            logger.warning("Failed to update profile from preference: user_id=%s arxiv_id=%s liked=%s error=%s", user_id, normalized_arxiv_id, liked, exc)
 
         return {
             "status": "success",

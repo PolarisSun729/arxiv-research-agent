@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from dependencies import get_database_service, get_recommendation_service
+from dependencies import get_database_service, get_memory_service, get_recommendation_service
 from utils.config import get_default_user_id
 
 logger = logging.getLogger(__name__)
@@ -158,9 +158,9 @@ async def get_user_paper_actions(
 
 
 @router.get("/research-profile/{user_id}")
-async def get_user_research_profile(user_id: str, db_service=Depends(get_database_service)):
+async def get_user_research_profile(user_id: str, memory_service=Depends(get_memory_service)):
     try:
-        return db_service.get_user_research_profile(user_id=user_id)
+        return memory_service.load_user_profile(user_id=user_id)
     except Exception as exc:
         logger.error("Error getting research profile: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
@@ -169,11 +169,11 @@ async def get_user_research_profile(user_id: str, db_service=Depends(get_databas
 @router.put("/research-profile")
 async def upsert_user_research_profile(
     payload: ResearchProfileRequest,
-    db_service=Depends(get_database_service),
+    memory_service=Depends(get_memory_service),
 ):
     try:
         profile_payload = payload.model_dump(exclude={"user_id"}, exclude_none=True)
-        profile = db_service.upsert_user_research_profile(user_id=payload.user_id, profile=profile_payload)
+        profile = memory_service.patch_user_profile(user_id=payload.user_id, patch=profile_payload, source="manual_upsert")
         return {"status": "success", "profile": profile}
     except Exception as exc:
         logger.error("Error upserting research profile: %s", str(exc))
@@ -183,11 +183,11 @@ async def upsert_user_research_profile(
 @router.patch("/research-profile")
 async def patch_user_research_profile(
     payload: ResearchProfileRequest,
-    db_service=Depends(get_database_service),
+    memory_service=Depends(get_memory_service),
 ):
     try:
         profile_payload = payload.model_dump(exclude={"user_id"}, exclude_none=True)
-        profile = db_service.patch_user_research_profile(user_id=payload.user_id, profile=profile_payload)
+        profile = memory_service.patch_user_profile(user_id=payload.user_id, patch=profile_payload, source="manual")
         return {"status": "success", "profile": profile}
     except Exception as exc:
         logger.error("Error patching research profile: %s", str(exc))

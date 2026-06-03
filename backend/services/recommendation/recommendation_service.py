@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
 from services.arxiv.arxiv_search_service import ArxivSearchService
+from services.memory import MemoryService
 from services.storage.database_service import DatabaseService
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
 from services.storage.vector_store_service import VectorStoreService
@@ -43,6 +44,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
     def __init__(
         self,
         db_service: DatabaseService,
+        memory_service: Optional[MemoryService],
         embedding_service: EmbeddingService,
         vector_store_service: VectorStoreService,
         get_embedding_config: Callable[[], EmbeddingConfig],
@@ -52,6 +54,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         collection_name: str = "arxiv_paper_embeddings",
     ):
         self.db_service = db_service
+        self.memory_service = memory_service or MemoryService(db_service=self.db_service)
         self.embedding_service = embedding_service
         self.vector_store_service = vector_store_service
         self.get_embedding_config = get_embedding_config

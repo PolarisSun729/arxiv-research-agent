@@ -15,6 +15,7 @@ if _BACKEND_DIR not in sys.path:
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
+from services.memory import MemoryService
 from services.storage.database_service import DatabaseService
 from utils.config import get_memory_runtime_config
 
@@ -44,33 +45,86 @@ logger = logging.getLogger(__name__)
 MEMORY_RUNTIME_CONFIG = get_memory_runtime_config()
 
 
-def _inject_research_profile_context(request_context: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
-    """按运行时配置决定是否把用户 research profile 注入请求上下文。
-
-    这个函数的目标不是无条件查询数据库，而是“按需增强 context”：
-    - 如果配置关闭，就直接返回原 context；
-    - 如果没有 user_id，也不查；
-    - 如果上游已经传了 research_profile，就不重复覆盖；
-    - 只有在满足条件时，才从数据库读取用户画像。
-
-    这样可以把个性化提示能力集中挂在 service 层，而不需要每个节点各自访问数据库。
-    """
+def _inject_user_memory_context(request_context: Dict[str, Any], user_id: Optional[str]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """加载统一的 user_memory_summary，并兼容保留 research_profile 字段。"""
     enriched_context = dict(request_context or {})
-    if not bool(MEMORY_RUNTIME_CONFIG.get("enable_user_research_profile", False)):
-        return enriched_context
     normalized_user_id = str(user_id or "").strip()
-    if not normalized_user_id or enriched_context.get("research_profile"):
-        return enriched_context
+    debug_flags = {
+        "user_memory_loaded": False,
+        "profile_applied": False,
+        "preference_memory_available": False,
+        "interest_vector_available": False,
+    }
+    if not normalized_user_id:
+        return enriched_context, debug_flags
 
     try:
-        profile = DatabaseService().get_user_research_profile(user_id=normalized_user_id)
+        memory_service = MemoryService()
+        user_memory_summary = memory_service.build_user_memory_summary(normalized_user_id)
+        enriched_context["user_memory_summary"] = user_memory_summary
+        if not enriched_context.get("research_profile"):
+            profile = dict((user_memory_summary or {}).get("profile") or {})
+            if profile:
+                enriched_context["research_profile"] = profile
+        memory_status = dict((user_memory_summary or {}).get("memory_status") or {})
+        debug_flags = {
+            "user_memory_loaded": True,
+            "profile_applied": bool((user_memory_summary or {}).get("profile")),
+            "preference_memory_available": bool(memory_status.get("preference_memory_available")),
+            "interest_vector_available": bool(memory_status.get("interest_vector_available")),
+        }
     except Exception as exc:
-        logger.warning("Failed to load research profile for agent context: user_id=%s error=%s", normalized_user_id, exc)
-        return enriched_context
+        logger.warning("Failed to load user memory summary for agent context: user_id=%s error=%s", normalized_user_id, exc)
+        if not enriched_context.get("research_profile") and bool(MEMORY_RUNTIME_CONFIG.get("enable_user_research_profile", False)):
+            try:
+                profile = DatabaseService().get_user_research_profile(user_id=normalized_user_id)
+            except Exception:
+                profile = {}
+            if isinstance(profile, dict) and profile:
+                enriched_context["research_profile"] = profile
+                debug_flags["profile_applied"] = True
+        return enriched_context, debug_flags
 
-    if isinstance(profile, dict):
-        enriched_context["research_profile"] = profile
-    return enriched_context
+    return enriched_context, debug_flags
+
+
+def _load_agent_request_context(
+    normalized_request: ArxivSearchRequest,
+) -> tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[str], Dict[str, Any]]:
+    frontend_context, user_memory_debug = _inject_user_memory_context(
+        dict(normalized_request.context or {}),
+        normalized_request.user_id,
+    )
+    try:
+        memory_payload = MemoryService().load_agent_memory(
+            normalized_request.user_id,
+            normalized_request.session_id,
+            frontend_context=frontend_context,
+        )
+    except Exception as exc:
+        logger.warning("Failed to load agent session memory: user_id=%s session_id=%s error=%s", normalized_request.user_id, normalized_request.session_id, exc)
+        return frontend_context, None, normalized_request.session_id, user_memory_debug
+
+    merged_context = dict(memory_payload.get("merged_context") or frontend_context)
+    resolved_session_id = str(memory_payload.get("session_id") or normalized_request.session_id or "").strip() or None
+    return merged_context, memory_payload, resolved_session_id, user_memory_debug
+
+
+def _persist_agent_session_memory(final_state: Any) -> None:
+    state = _coerce_state(final_state)
+    try:
+        MemoryService().save_agent_memory(
+            user_id=state.user_id,
+            session_id=state.session_id,
+            final_state=state,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to persist agent session memory: user_id=%s session_id=%s error=%s",
+            state.user_id,
+            state.session_id,
+            exc,
+        )
 
 
 def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
@@ -90,11 +144,8 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
         # 第 1 步：先把入参统一规整成 ArxivSearchRequest，避免上层传 dict 时各处重复判断。
         normalized_request = _coerce_request(request)
 
-        # 第 2 步：把用户画像等运行时上下文补充到 request.context 中。
-        request_context = _inject_research_profile_context(
-            dict(normalized_request.context or {}),
-            normalized_request.user_id,
-        )
+        # 第 2 步：把前端 context 与后端 Agent session memory 合并。
+        request_context, _agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(normalized_request)
         # 入口日志只记录状态摘要，便于排查“前端传了但后端没识别到”的问题，不直接打出完整上下文内容。
         logger.info(
             "arxiv_agent request received: message=%s context_keys=%s pending_action_status=%s paper_qa_status=%s selected_arxiv_id=%s",
@@ -108,19 +159,23 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
         generation_service = _resolve_generation_service()
         initial_state = AgentState(
             user_id=normalized_request.user_id,
-            session_id=normalized_request.session_id,
+            session_id=resolved_session_id,
             message=normalized_request.message,
             # 把前端回传的待确认状态提升到顶层，避免后续路由只看 context 时漏掉当前待办。
             context=request_context,
             pending_action=request_context.get("pending_action"),
             paper_qa_result=request_context.get("paper_qa_result"),
+            debug=dict(user_memory_debug or {}),
         )
 
         # 第 4 步：构建图并同步执行，拿到最终状态。
         graph = build_arxiv_search_graph(generation_service=generation_service)
-        final_state = graph.invoke(initial_state.model_dump())
+        final_state = _coerce_state(graph.invoke(initial_state.model_dump()))
 
-        # 第 5 步：把内部状态转换成对外响应模型。
+        # 第 5 步：把跨轮 Agent memory 回写到后端 session。
+        _persist_agent_session_memory(final_state)
+
+        # 第 6 步：把内部状态转换成对外响应模型。
         return _state_to_response(final_state)
     except ValidationError as exc:
         return _build_error_response(
@@ -161,10 +216,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
 
         try:
             # 阶段 B：构造与同步入口一致的初始上下文和状态，保证两条路径行为一致。
-            request_context = _inject_research_profile_context(
-                dict(normalized_request.context or {}),
-                normalized_request.user_id,
-            )
+            request_context, _agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(normalized_request)
             logger.info(
                 "arxiv_agent stream start: run_id=%s message=%s context_keys=%s pending_action_status=%s paper_qa_status=%s selected_arxiv_id=%s",
                 run_id,
@@ -176,12 +228,13 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
             )
             current_state = AgentState(
                 user_id=normalized_request.user_id,
-                session_id=normalized_request.session_id,
+                session_id=resolved_session_id,
                 message=normalized_request.message,
                 # 流式路径和同步路径必须使用同一份状态提升规则，确保确认/解析流程一致。
                 context=request_context,
                 pending_action=request_context.get("pending_action"),
                 paper_qa_result=request_context.get("paper_qa_result"),
+                debug=dict(user_memory_debug or {}),
             )
             graph = build_arxiv_search_graph(generation_service=generation_service)
 
@@ -195,7 +248,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                         "status": "started",
                         "request": {
                             "user_id": normalized_request.user_id,
-                            "session_id": normalized_request.session_id,
+                            "session_id": resolved_session_id,
                             "message": normalized_request.message,
                         },
                     },
@@ -290,6 +343,8 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     sequence += 1
 
             # 阶段 E：整张图执行完成后，输出最终聚合响应和结束事件。
+            if current_state is not None:
+                _persist_agent_session_memory(current_state)
             final_response = _state_to_response(current_state)
             yield _sse_event(
                 _make_stream_event(
@@ -428,6 +483,7 @@ def _state_to_response(state: Any) -> ArxivSearchResponse:
     """
     final_state = state if isinstance(state, AgentState) else AgentState.model_validate(state)
     return ArxivSearchResponse(
+        session_id=final_state.session_id,
         intent=final_state.intent or "unsupported",
         intent_source=final_state.intent_source,
         fallback_reason=final_state.fallback_reason,

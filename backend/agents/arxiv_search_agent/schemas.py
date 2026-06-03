@@ -345,6 +345,7 @@ class ArxivSearchResponse(BaseModel):
     """
     model_config = ConfigDict(extra="forbid")
 
+    session_id: Optional[str] = None
     intent: Literal[
         "arxiv_search",
         "paper_detail",

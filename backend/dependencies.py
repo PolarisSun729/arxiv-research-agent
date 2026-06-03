@@ -50,6 +50,13 @@ def get_generation_service() -> GenerationService:
 
 
 @lru_cache(maxsize=1)
+def get_memory_service() -> MemoryService:
+    from services.memory import MemoryService
+
+    return MemoryService(db_service=get_database_service())
+
+
+@lru_cache(maxsize=1)
 def get_enhanced_retrieval_service() -> EnhancedRetrievalService:
     from services.retrieval.enhanced_retrieval_service import EnhancedRetrievalService
 
@@ -138,6 +145,7 @@ def get_paper_qa_service() -> PaperQAService:
 
     return PaperQAService(
         db_service=get_database_service(),
+        memory_service=get_memory_service(),
         embedding_service=get_embedding_service(),
         vector_store_service=get_vector_store_service(),
         generation_service=get_generation_service(),
@@ -162,6 +170,7 @@ def iter_service_getters() -> list[tuple[str, Callable[[], Any]]]:
         ("embedding_service", get_embedding_service),
         ("vector_store_service", get_vector_store_service),
         ("generation_service", get_generation_service),
+        ("memory_service", get_memory_service),
         ("enhanced_retrieval_service", get_enhanced_retrieval_service),
         ("local_arxiv_service", get_local_arxiv_service),
         ("arxiv_api_service", get_arxiv_api_service),

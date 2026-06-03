@@ -11,6 +11,7 @@ from fastapi import HTTPException
 
 from services.arxiv.arxiv_search_service import ArxivSearchService
 from services.document.chunking_service import ChunkingService
+from services.memory import MemoryService
 from services.storage.database_service import DatabaseService
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
 from services.retrieval.enhanced_retrieval_service import EnhancedRetrievalService, RetrievalOptions
@@ -39,6 +40,7 @@ class PaperQAService:
         self,
         *,
         db_service: Optional[DatabaseService] = None,
+        memory_service: Optional[MemoryService] = None,
         embedding_service: Optional[EmbeddingService] = None,
         vector_store_service: Optional[VectorStoreService] = None,
         generation_service: Optional[GenerationService] = None,
@@ -50,6 +52,7 @@ class PaperQAService:
         qa_index_builder: Optional[PaperQAIndexBuilder] = None,
     ):
         self.db_service = db_service or DatabaseService()
+        self.memory_service = memory_service or MemoryService(db_service=self.db_service)
         self.embedding_service = embedding_service or EmbeddingService()
         self.vector_store_service = vector_store_service or VectorStoreService()
         self.generation_service = generation_service or GenerationService()
@@ -104,7 +107,23 @@ class PaperQAService:
     def _resolve_user_id(value: Any = None) -> str:
         return str(value or get_default_user_id()).strip() or get_default_user_id()
 
+    def _get_user_memory_summary(self, payload: Any) -> Dict[str, Any]:
+        direct_summary = self._payload_get(payload, "user_memory_summary", None)
+        if isinstance(direct_summary, dict):
+            return direct_summary
+        nested_context = self._payload_get(payload, "context", None)
+        if isinstance(nested_context, dict):
+            nested_summary = nested_context.get("user_memory_summary")
+            if isinstance(nested_summary, dict):
+                return nested_summary
+        return {}
+
     def _get_preferred_answer_style(self, payload: Any) -> str:
+        user_memory_summary = self._get_user_memory_summary(payload)
+        profile = dict(user_memory_summary.get("profile") or {})
+        preferred_answer_style = str(profile.get("preferred_answer_style") or "").strip()
+        if preferred_answer_style:
+            return preferred_answer_style
         if not bool(self._memory_flag("enable_user_research_profile", False)):
             return ""
         user_id = self._resolve_user_id(self._payload_get(payload, "user_id"))
@@ -132,6 +151,14 @@ class PaperQAService:
                 existing_session = self.db_service.get_paper_chat_session(requested_session_id, user_id=user_id)
                 if existing_session and existing_session.get("arxiv_id") == arxiv_id:
                     return existing_session
+
+            recent_sessions = self.db_service.list_paper_chat_sessions(arxiv_id=arxiv_id, user_id=user_id, limit=5)
+            for recent_session in recent_sessions:
+                recent_status = str(recent_session.get("status") or "active").strip().lower()
+                if recent_status == "active":
+                    return recent_session
+            if recent_sessions:
+                return recent_sessions[0]
 
             session_title = self._truncate_text(str(self._payload_get(payload, "question", "") or "").strip(), 80)
             created_session = self.db_service.create_paper_chat_session(
@@ -700,6 +727,9 @@ class PaperQAService:
             raise HTTPException(status_code=400, detail="Paper does not have QA index. Please create index first.")
 
         question = str(self._payload_get(payload, "question", "") or "").strip()
+        user_id = self._resolve_user_id(self._payload_get(payload, "user_id"))
+        requested_session_id = str(self._payload_get(payload, "session_id", "") or "").strip() or None
+        max_turns = max(1, int(self._memory_flag("short_term_memory_max_turns", MAX_CONVERSATION_TURNS)))
         chat_session = self._resolve_chat_session(arxiv_id, payload)
         memory_runtime = self._build_memory_runtime_debug()
         collection_name = qa_index["collection_name"]
@@ -720,13 +750,45 @@ class PaperQAService:
             "reason": "",
             "fallback_reason": None,
             "provided_turn_count": 0,
+            "db_turn_count": 0,
+            "payload_turn_count": 0,
+            "merged_turn_count": 0,
+            "selected_session_id": str(chat_session.get("session_id") or "").strip() or None,
+            "source": "none",
             "used_turn_count": 0,
         }
         raw_context = self._payload_get(payload, "conversation_context", None)
         if short_term_debug["enabled"]:
             try:
-                short_term_debug["provided_turn_count"] = len(raw_context) if isinstance(raw_context, list) else 0
-                conversation_context = self._normalize_conversation_context(raw_context)
+                db_context_payload = self.memory_service.load_paper_conversation_context(
+                    user_id=user_id,
+                    arxiv_id=arxiv_id,
+                    session_id=str(chat_session.get("session_id") or requested_session_id or "").strip() or None,
+                    limit=max_turns,
+                )
+                db_turns = list(db_context_payload.get("turns") or [])
+                payload_turns = list(raw_context or []) if isinstance(raw_context, list) else []
+                merged_raw_context = self.memory_service.merge_conversation_context(
+                    db_turns,
+                    payload_turns,
+                    limit=max_turns,
+                )
+                short_term_debug["selected_session_id"] = (
+                    str(db_context_payload.get("selected_session_id") or chat_session.get("session_id") or "").strip() or None
+                )
+                short_term_debug["db_turn_count"] = len(db_turns)
+                short_term_debug["payload_turn_count"] = len(self._normalize_conversation_context(payload_turns))
+                short_term_debug["provided_turn_count"] = short_term_debug["payload_turn_count"]
+                conversation_context = self._normalize_conversation_context(merged_raw_context)
+                if short_term_debug["db_turn_count"] and short_term_debug["payload_turn_count"]:
+                    short_term_debug["source"] = "db_plus_payload"
+                elif short_term_debug["db_turn_count"]:
+                    short_term_debug["source"] = "db_only"
+                elif short_term_debug["payload_turn_count"]:
+                    short_term_debug["source"] = "payload_only"
+                else:
+                    short_term_debug["source"] = "none"
+                short_term_debug["merged_turn_count"] = len(conversation_context)
                 short_term_debug["used_turn_count"] = len(conversation_context)
             except Exception as exc:
                 logger.warning("Conversation context normalization failed, fallback to single-turn QA: %s", exc)

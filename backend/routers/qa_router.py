@@ -15,6 +15,7 @@ from dependencies import (
     get_enhanced_retrieval_service,
     get_generation_service,
     get_index_job_manager,
+    get_memory_service,
     get_paper_qa_service,
     get_vector_store_service,
 )
@@ -118,15 +119,6 @@ def _serialize_qa_index_job(job: Optional[dict]) -> Optional[dict]:
     }
 
 
-def _merge_unique_strings(existing: List[Any], incoming: List[Any], limit: int = 20) -> List[str]:
-    seen: List[str] = []
-    for item in [*(existing or []), *(incoming or [])]:
-        text = str(item or "").strip()
-        if text and text not in seen:
-            seen.append(text)
-    return seen[:limit]
-
-
 def _serialize_paper_note(note: Optional[dict], db_service=None) -> Optional[dict]:
     if not note:
         return None
@@ -153,30 +145,6 @@ def _serialize_paper_note(note: Optional[dict], db_service=None) -> Optional[dic
         "updated_at": note.get("updated_at"),
         "sources": linked_message.get("sources") if linked_message else [],
     }
-
-
-def _apply_note_to_profile(db_service, note: dict) -> None:
-    if not note or not note.get("include_in_profile"):
-        return
-    user_id = note.get("user_id") or _normalize_user_id(None)
-    current = db_service.get_user_research_profile(user_id=user_id)
-    tags = [str(item).strip() for item in (note.get("tags") or []) if str(item).strip()]
-    note_type = str(note.get("note_type") or "").strip()
-    updated_profile: Dict[str, Any] = {
-        "positive_topics": _merge_unique_strings(current.get("positive_topics") or [], tags, limit=30),
-        "recent_topics": _merge_unique_strings(current.get("recent_topics") or [], tags, limit=30),
-        "common_question_types": _merge_unique_strings(
-            current.get("common_question_types") or [],
-            [note_type] if note_type else [],
-            limit=20,
-        ),
-        "representative_papers": _merge_unique_strings(
-            current.get("representative_papers") or [],
-            [note.get("arxiv_id")] if note.get("arxiv_id") else [],
-            limit=20,
-        ),
-    }
-    db_service.patch_user_research_profile(user_id=user_id, profile=updated_profile)
 
 
 def _build_notes_markdown(arxiv_id: str, notes: List[dict], paper_title: Optional[str] = None) -> str:
@@ -500,6 +468,7 @@ async def create_paper_note(
     arxiv_id: str,
     payload: PaperNoteRequest,
     db_service=Depends(get_database_service),
+    memory_service=Depends(get_memory_service),
 ):
     try:
         user_id = _normalize_user_id(payload.user_id)
@@ -529,7 +498,7 @@ async def create_paper_note(
             raise HTTPException(status_code=500, detail="Failed to create paper note")
 
         if payload.include_in_profile:
-            _apply_note_to_profile(db_service, note)
+            memory_service.update_profile_from_note(user_id=user_id, note=note)
 
         return {"item": _serialize_paper_note(note, db_service=db_service)}
     except HTTPException:
@@ -545,6 +514,7 @@ async def update_paper_note(
     note_id: str,
     payload: UpdatePaperNoteRequest,
     db_service=Depends(get_database_service),
+    memory_service=Depends(get_memory_service),
 ):
     try:
         user_id = _normalize_user_id(payload.user_id)
@@ -566,7 +536,7 @@ async def update_paper_note(
             raise HTTPException(status_code=500, detail="Failed to update paper note")
 
         if note.get("include_in_profile"):
-            _apply_note_to_profile(db_service, note)
+            memory_service.update_profile_from_note(user_id=user_id, note=note)
 
         return {"item": _serialize_paper_note(note, db_service=db_service)}
     except HTTPException:
