@@ -21,6 +21,7 @@ from .node import (
     relax_search_for_retry,
     synthesize_response,
 )
+from .node.recommendation_node import adapt_recommendation_tool_result, build_recommendation_tool_args, invoke_recommendation_tool
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,9 @@ _ARXIV_GRAPH_NODE_NAMES = (
     "check_search_result",
     "relax_search_for_retry",
     "personalized_rank_and_annotate_papers",
+    "build_recommendation_tool_args",
+    "invoke_recommendation_tool",
+    "adapt_recommendation_tool_result",
     "apply_preference_action",
     "classify_pending_action_confirmation",
     "handle_pending_action_confirmation",
@@ -246,6 +250,9 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
     graph.add_node("check_search_result", check_search_result)
     graph.add_node("relax_search_for_retry", relax_search_for_retry)
     graph.add_node("personalized_rank_and_annotate_papers", personalized_rank_and_annotate_papers)
+    graph.add_node("build_recommendation_tool_args", build_recommendation_tool_args)
+    graph.add_node("invoke_recommendation_tool", invoke_recommendation_tool)
+    graph.add_node("adapt_recommendation_tool_result", adapt_recommendation_tool_result)
     graph.add_node("apply_preference_action", apply_preference_action)
     graph.add_node(
         "classify_pending_action_confirmation",
@@ -272,8 +279,8 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
             "paper_detail": "handle_paper_reading_request",
             "paper_summary": "handle_paper_reading_request",
             "paper_qa": "handle_paper_reading_request",
-            # 推荐、阅读清单操作不需要检索流程，直接汇总回复即可。
-            "recommendation": "synthesize_response",
+            # 推荐链路改走统一工具协议，保持与搜索链路相同的执行观测方式。
+            "recommendation": "build_recommendation_tool_args",
             "preference_action": "apply_preference_action",
             # 若当前消息是在确认上一轮待办动作，则进入确认分类节点。
             "classify_pending_action_confirmation": "classify_pending_action_confirmation",
@@ -300,6 +307,9 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
     graph.add_edge("apply_preference_action", "synthesize_response")
     graph.add_edge("handle_pending_action_confirmation", "synthesize_response")
     graph.add_edge("handle_paper_reading_request", "synthesize_response")
+    graph.add_edge("build_recommendation_tool_args", "invoke_recommendation_tool")
+    graph.add_edge("invoke_recommendation_tool", "adapt_recommendation_tool_result")
+    graph.add_edge("adapt_recommendation_tool_result", "synthesize_response")
 
     # 下面是标准搜索链路：
     # 1. 根据解析结果构造搜索参数；
@@ -418,16 +428,20 @@ def _build_fallback_mermaid() -> str:
             "    plan_task --> handle_paper_reading_request;",
             "    plan_task --> apply_preference_action;",
             "    plan_task --> classify_pending_action_confirmation;",
-            "    plan_task -->|recommendation| synthesize_response;",
+            "    plan_task -->|recommendation| build_recommendation_tool_args;",
             "    plan_task -->|reading_list_action| synthesize_response;",
             "    plan_task -->|unclear| synthesize_response;",
             "    plan_task -->|unsupported| synthesize_response;",
             "    build_search_tool_args --> invoke_search_tool;",
-            "    invoke_search_tool --> check_search_result;",
+            "    invoke_search_tool --> adapt_search_tool_result;",
+            "    adapt_search_tool_result --> check_search_result;",
             "    check_search_result --> relax_search_for_retry;",
             "    check_search_result --> personalized_rank_and_annotate_papers;",
             "    relax_search_for_retry --> build_search_tool_args;",
             "    personalized_rank_and_annotate_papers --> synthesize_response;",
+            "    build_recommendation_tool_args --> invoke_recommendation_tool;",
+            "    invoke_recommendation_tool --> adapt_recommendation_tool_result;",
+            "    adapt_recommendation_tool_result --> synthesize_response;",
             "    apply_preference_action --> synthesize_response;",
             "    classify_pending_action_confirmation --> handle_pending_action_confirmation;",
             "    classify_pending_action_confirmation --> synthesize_response;",

@@ -327,9 +327,9 @@ def _build_goal_and_plan(state: AgentState) -> tuple[Goal, List[ExecutionPlanSte
             _build_plan_step(
                 step_id="step_2",
                 step_type="recommendation_generation",
-                description="Generate recommendation candidates based on the available profile and request context.",
+                description="Build and execute the recommendation tool request using available profile, request context, and historical preference signals.",
                 expected_input={"recommendation_profile": "usable personalization context", "message": message},
-                expected_output={"papers": "recommended paper list"},
+                expected_output={"tool_result": "recommendation tool result", "papers": "recommended paper list"},
                 depends_on=["step_1"],
             ),
             _build_plan_step(

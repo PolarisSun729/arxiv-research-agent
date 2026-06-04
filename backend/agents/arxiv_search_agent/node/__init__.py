@@ -44,6 +44,11 @@ from .pending_action_node import (
     classify_pending_action_confirmation,
     handle_pending_action_confirmation,
 )
+from .recommendation_node import (
+    adapt_recommendation_tool_result,
+    build_recommendation_tool_args,
+    invoke_recommendation_tool,
+)
 # 偏好、回复、搜索等节点分别承担独立阶段的状态加工工作：
 # - preference_node 负责写入用户偏好；
 # - response_node 负责把状态收口成最终自然语言答复；
@@ -85,6 +90,8 @@ __all__ = [
     "_references_specific_paper",
     "_validation_error_summary",
     "apply_preference_action",
+    "adapt_recommendation_tool_result",
+    "build_recommendation_tool_args",
     "build_search_tool_args",
     "check_search_result",
     "classify_pending_action_confirmation",
@@ -92,6 +99,7 @@ __all__ = [
     "handle_paper_reading_request",
     "handle_pending_action_confirmation",
     "invoke_search_tool",
+    "invoke_recommendation_tool",
     "parse_search_request",
     "plan_task",
     "personalized_rank_and_annotate_papers",

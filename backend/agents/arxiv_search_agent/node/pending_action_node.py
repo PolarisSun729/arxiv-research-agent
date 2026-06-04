@@ -19,17 +19,31 @@ if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
 try:  # pragma: no cover
-    from dependencies import get_generation_service, get_paper_qa_service
+    from dependencies import get_generation_service
 except ModuleNotFoundError:  # pragma: no cover
-    from backend.dependencies import get_generation_service, get_paper_qa_service
+    from backend.dependencies import get_generation_service
 
-from ..schemas import AgentToolCall
+from ..schemas import ToolCallRequest
 from ..state import AgentState
 from ..utils.result_utils import _extract_exception_detail, _extract_exception_stage
 from ..utils.state_utils import _append_step, _coerce_state
 from ..utils.text_utils import _extract_json_object, _matches_any, _normalize_text
+from .tool_node import execute_tool
 
 logger = logging.getLogger(__name__)
+
+
+def _has_ready_qa_index(payload: Mapping[str, Any]) -> bool:
+    normalized_status = str(payload.get("status") or "").strip().lower()
+    return bool(payload.get("has_index")) or normalized_status in {"indexed", "success"}
+
+
+def _get_plan_step_id(state: AgentState, step_type: str) -> Optional[str]:
+    for step in list(state.execution_plan or []):
+        if str(getattr(step, "step_type", "") or "").strip() == step_type:
+            step_id = str(getattr(step, "step_id", "") or "").strip()
+            return step_id or None
+    return None
 
 
 def _resolve_generation_service_instance(generation_service: Optional[Any] = None) -> Optional[Any]:
@@ -322,14 +336,17 @@ def handle_pending_action_confirmation(state: Union[AgentState, Mapping[str, Any
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
     pending_action = _recover_pending_action(next_state)
-    qa_service = get_paper_qa_service()
-    debug = dict(next_state.debug or {})
 
     arxiv_id = str(pending_action.get("arxiv_id") or "").strip()
     title = str(pending_action.get("title") or "").strip()
     original_question = _normalize_text(str(pending_action.get("original_question") or next_state.message or ""))
     qa_question = _normalize_text(str(pending_action.get("qa_question") or original_question))
     loading_method = str(pending_action.get("loading_method") or "docling").strip() or "docling"
+    debug = dict(next_state.debug or {})
+    debug["paper_qa_target"] = {"arxiv_id": arxiv_id, "title": title}
+    debug["qa_question"] = qa_question
+    debug["waiting_user_confirmation"] = False
+    debug["pending_action"] = pending_action
 
     # arXiv ID 是后续建索引和问答的最小必要条件，缺失时立即终止并返回明确错误。
     if not arxiv_id:
@@ -356,6 +373,8 @@ def handle_pending_action_confirmation(state: Union[AgentState, Mapping[str, Any
             **debug,
             "qa_index_status": None,
             "index_created": False,
+            "waiting_user_confirmation": False,
+            "paper_qa_answer_status": "pending_action_validation_failed",
             "error_stage": result["error_stage"],
             "error_type": result["error_type"],
             "error_detail": result["error"],
@@ -372,10 +391,38 @@ def handle_pending_action_confirmation(state: Union[AgentState, Mapping[str, Any
 
     try:
         # 成功路径固定为：建索引 -> 读取最新索引状态 -> 基于新索引回答原问题。
-        index_result = qa_service.build_qa_index(arxiv_id, loading_method=loading_method)
-        qa_status = qa_service.get_qa_status(arxiv_id)
-        index_created = bool(str((index_result or {}).get("status") or "").lower() in {"success", "indexed"}) or bool((qa_status or {}).get("has_index"))
-        answer_result = qa_service.answer_question(arxiv_id, {"question": qa_question})
+        next_state.tool_call_request = ToolCallRequest(
+            tool_name="build_paper_qa_index",
+            arguments={"arxiv_id": arxiv_id, "loading_method": loading_method},
+            reason="用户已确认解析论文，需要先构建 QA 索引",
+            expected_result="返回索引构建结果和可用状态",
+            plan_step_id=_get_plan_step_id(next_state, "confirmation_gate"),
+        )
+        next_state = execute_tool(next_state)
+        build_tool_result = dict(next_state.tool_result or {})
+        index_result = dict(build_tool_result.get("data") or {}) if isinstance(build_tool_result.get("data"), Mapping) else {}
+        if not bool(build_tool_result.get("ok")):
+            raise RuntimeError(str(((build_tool_result.get("error") or {}).get("message")) or build_tool_result.get("summary") or "构建 QA 索引失败"))
+
+        qa_status = dict(index_result or {})
+        index_created = _has_ready_qa_index(qa_status)
+        debug["qa_index_status"] = qa_status
+        debug["index_created"] = index_created
+        debug["paper_qa_answer_status"] = "index_built"
+
+        next_state.tool_call_request = ToolCallRequest(
+            tool_name="answer_paper_question",
+            arguments={"arxiv_id": arxiv_id, "question": qa_question},
+            reason="论文索引已就绪，继续回答用户原始问题",
+            expected_result="返回论文问题答案、来源片段和检索调试信息",
+            plan_step_id=_get_plan_step_id(next_state, "paper_response"),
+        )
+        next_state = execute_tool(next_state)
+        answer_tool_result = dict(next_state.tool_result or {})
+        answer_result = dict(answer_tool_result.get("data") or {}) if isinstance(answer_tool_result.get("data"), Mapping) else {}
+        if not bool(answer_tool_result.get("ok")):
+            raise RuntimeError(str(((answer_tool_result.get("error") or {}).get("message")) or answer_tool_result.get("summary") or "论文问答执行失败"))
+
         result = {
             "status": "success",
             "arxiv_id": arxiv_id,
@@ -401,34 +448,13 @@ def handle_pending_action_confirmation(state: Union[AgentState, Mapping[str, Any
         ]
         if isinstance(answer_result, Mapping) and answer_result.get("papers"):
             next_state.papers = list(answer_result.get("papers") or [])
-        next_state.tool_name = "paper_qa"
-        next_state.tool_args = {
-            "arxiv_id": arxiv_id,
-            "question": qa_question,
-            "loading_method": loading_method,
-        }
-        next_state.tool_result = dict(result)
-        next_state.tool_calls = list(next_state.tool_calls or []) + [
-            AgentToolCall(
-                tool_name="paper_qa",
-                arguments=dict(next_state.tool_args),
-                status="success",
-                summary=f"完成论文解析与问答: {title or arxiv_id}",
-                trace={
-                    "arxiv_id": arxiv_id,
-                    "title": title,
-                    "qa_index_status": qa_status,
-                    "index_created": index_created,
-                    "sources_count": len(result.get("sources") or []),
-                },
-                error=None,
-            )
-        ]
         next_state.debug = {
             **debug,
             "qa_index_status": qa_status,
             "index_created": index_created,
             "qa_question": qa_question,
+            "waiting_user_confirmation": False,
+            "paper_qa_answer_status": "answered",
         }
         return _append_step(
             next_state,
@@ -464,27 +490,12 @@ def handle_pending_action_confirmation(state: Union[AgentState, Mapping[str, Any
         next_state.pending_action = None
         next_state.context = dict(next_state.context or {})
         next_state.context.pop("pending_action", None)
-        next_state.tool_calls = list(next_state.tool_calls or []) + [
-            AgentToolCall(
-                tool_name="paper_qa",
-                arguments={"arxiv_id": arxiv_id, "question": qa_question, "loading_method": loading_method},
-                status="failed",
-                summary=f"论文解析与问答失败: {title or arxiv_id}",
-                trace={
-                    "arxiv_id": arxiv_id,
-                    "title": title,
-                    "qa_index_status": None,
-                    "index_created": False,
-                    "error_stage": error_stage,
-                    "error_type": type(exc).__name__,
-                },
-                error={"message": result["error"], "stage": error_stage, "type": type(exc).__name__},
-            )
-        ]
         next_state.debug = {
             **debug,
             "qa_index_status": None,
             "index_created": False,
+            "waiting_user_confirmation": False,
+            "paper_qa_answer_status": "failed",
             "error_stage": error_stage,
             "error_type": type(exc).__name__,
             "error_detail": result["error"],

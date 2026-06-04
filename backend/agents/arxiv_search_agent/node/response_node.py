@@ -8,11 +8,53 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 from ..state import AgentState
 from ..utils.state_utils import _append_step, _coerce_state
 from .search_node import _collect_priority_titles, _summarize_search_spec
+
+
+def _latest_tool_observation(state: AgentState, tool_name: str) -> Optional[Dict[str, Any]]:
+    for observation in reversed(list(state.tool_observations or [])):
+        if str(getattr(observation, "tool_name", "") or "").strip() == tool_name:
+            return observation.model_dump()
+    return None
+
+
+def _build_paper_qa_result_from_observation(state: AgentState) -> Optional[Dict[str, Any]]:
+    observation = _latest_tool_observation(state, "answer_paper_question")
+    if not observation or not observation.get("ok"):
+        return None
+
+    tool_result = dict(state.tool_result or {})
+    if str(tool_result.get("tool_name") or "").strip() != "answer_paper_question":
+        return None
+    data = tool_result.get("data") if isinstance(tool_result.get("data"), Mapping) else {}
+    answer = str((data or {}).get("answer") or "").strip()
+    if not answer:
+        return None
+
+    context = dict(state.context or {})
+    selected_paper = context.get("selected_paper") if isinstance(context.get("selected_paper"), Mapping) else {}
+    return {
+        "status": "success",
+        "arxiv_id": context.get("arxiv_id") or selected_paper.get("arxiv_id"),
+        "title": selected_paper.get("title"),
+        "question": (state.debug or {}).get("qa_question"),
+        "answer": answer,
+        "sources": (data or {}).get("sources", []),
+        "retrieval_debug": (data or {}).get("retrieval_debug"),
+        "qa_index_status": (state.debug or {}).get("qa_index_status"),
+        "index_created": bool((state.debug or {}).get("index_created")),
+        "error": None,
+    }
+
+
+def _has_preference_insufficiency_signals(state: AgentState) -> bool:
+    warnings = [str(item).strip() for item in list(state.warnings or []) if str(item).strip()]
+    keywords = ("缺少", "偏好", "画像", "喜欢", "不喜欢", "user_id")
+    return any(any(keyword in warning for keyword in keywords) for warning in warnings)
 
 
 def _build_non_search_answer(intent: str) -> Tuple[str, List[str]]:
@@ -52,10 +94,10 @@ def _build_non_search_answer(intent: str) -> Tuple[str, List[str]]:
 
     if intent == "recommendation":
         return (
-            "我已经识别到你想做论文推荐。当前这一轮会先收口到 arXiv 检索链路，你可以直接给出研究方向、关键词或偏好，我先帮你筛选相关论文。",
+            "我已经识别到你想做论文推荐，但当前这次请求还没有拿到可用的推荐结果。你可以补充研究方向、关键词，或者先标记几篇喜欢 / 不喜欢的论文让我建立更稳定的推荐依据。",
             [
-                "如果你要的是搜索，请直接描述研究方向",
-                "如果你想看推荐结果，请说明偏好方向或关键词",
+                "补充研究方向、关键词或时间范围",
+                "先标记几篇喜欢 / 不喜欢的论文，再让我做推荐",
             ],
         )
 
@@ -112,6 +154,11 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
 
     pending_action = dict(next_state.pending_action or (next_state.context or {}).get("pending_action") or {})
     paper_qa_result = dict(next_state.paper_qa_result or {})
+    if next_state.intent in {"paper_summary", "paper_detail", "paper_qa"} and not paper_qa_result:
+        inferred_paper_qa_result = _build_paper_qa_result_from_observation(next_state)
+        if inferred_paper_qa_result:
+            paper_qa_result = inferred_paper_qa_result
+            next_state.paper_qa_result = inferred_paper_qa_result
     confirmation_decision = str((next_state.debug or {}).get("pending_action_decision") or "").strip().lower()
 
     # 已经拿到论文 QA 的最终答案时，直接复用该答案，不再重新包装过多说明。
@@ -257,6 +304,86 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
             inputs={"intent": next_state.intent, "preference_action_result": dict(result)},
             outputs={"answer": next_state.answer, "next_actions": list(next_state.next_actions), "label": label},
         )
+
+    if next_state.intent == "recommendation":
+        papers = list(next_state.papers or [])
+        tool_result = dict(next_state.tool_result or {})
+        recommendation_debug = dict((next_state.debug or {}).get("recommendation_result") or {})
+        personalization_signals = dict(recommendation_debug.get("personalization_signals") or {})
+        paper_count = len(papers)
+        priority_titles = _collect_priority_titles(papers, limit=3)
+        if paper_count > 0:
+            next_state.answer = f"已生成 {paper_count} 篇个性化论文推荐。"
+            if priority_titles:
+                next_state.answer += f" 建议优先阅读：{', '.join(priority_titles)}。"
+            rationale_parts = []
+            if personalization_signals.get("used_user_memory_summary") or personalization_signals.get("used_research_profile"):
+                rationale_parts.append("已参考用户画像")
+            if personalization_signals.get("has_behavior_history"):
+                rationale_parts.append("已参考历史偏好")
+            if personalization_signals.get("interest_cluster_count"):
+                rationale_parts.append(f"兴趣簇数量={personalization_signals.get('interest_cluster_count')}")
+            if personalization_signals.get("recall_mode"):
+                rationale_parts.append(f"召回模式={personalization_signals.get('recall_mode')}")
+            if rationale_parts:
+                next_state.answer += "\n\n推荐依据：" + "，".join(rationale_parts) + "。"
+            next_state.next_actions = [
+                "继续查看其中某篇论文的详情或总结",
+                "也可以继续标记喜欢 / 不喜欢来优化后续推荐",
+            ]
+            return _append_step(
+                next_state,
+                step="final_answer_generation",
+                status="success",
+                action="生成推荐结果回复",
+                inputs={"intent": next_state.intent, "paper_count": paper_count},
+                outputs={
+                    "answer": next_state.answer,
+                    "next_actions": list(next_state.next_actions),
+                    "personalization_signals": personalization_signals,
+                },
+            )
+
+        if tool_result:
+            if bool(tool_result.get("ok")):
+                if _has_preference_insufficiency_signals(next_state):
+                    next_state.answer = "本次已执行推荐工具，但当前可用的偏好或用户画像还不足，暂时无法生成稳定的个性化推荐结果。"
+                else:
+                    next_state.answer = "本次已执行推荐工具，但暂时没有生成可展示的推荐结果。"
+                if next_state.warnings:
+                    next_state.answer += "\n\n提示：" + "；".join(str(item) for item in next_state.warnings if str(item).strip())
+                next_state.next_actions = [
+                    "补充更明确的研究方向或关键词后重试",
+                    "先标记几篇喜欢 / 不喜欢的论文，再让我重新推荐",
+                ]
+                return _append_step(
+                    next_state,
+                    step="final_answer_generation",
+                    status="success",
+                    action="生成推荐结果回复",
+                    inputs={"intent": next_state.intent, "paper_count": paper_count},
+                    outputs={
+                        "answer": next_state.answer,
+                        "next_actions": list(next_state.next_actions),
+                        "warnings": list(next_state.warnings or []),
+                    },
+                )
+
+            error_message = str(((tool_result.get("error") or {}).get("message")) or tool_result.get("summary") or "推荐论文失败").strip()
+            next_state.answer = error_message
+            next_state.next_actions = [
+                "稍后重试推荐",
+                "也可以先搜索某个明确主题的论文",
+            ]
+            return _append_step(
+                next_state,
+                step="final_answer_generation",
+                status="failed",
+                action="生成推荐结果回复",
+                inputs={"intent": next_state.intent, "paper_count": paper_count},
+                outputs={"answer": next_state.answer, "next_actions": list(next_state.next_actions)},
+                error=error_message,
+            )
 
     # 搜索回复会结合是否做过个性化重排，给出不同的解释和后续建议。
     if next_state.intent == "arxiv_search":

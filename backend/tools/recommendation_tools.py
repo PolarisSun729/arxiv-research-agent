@@ -13,22 +13,60 @@ def _get_recommendation_service():
     return get_dependency_recommendation_service()
 
 
-def recommend_papers(user_id: str = None, top_n: int = 10, max_age_months: int = 6) -> Dict[str, Any]:
+def recommend_papers(
+    user_id: str = None,
+    top_n: int = 10,
+    max_age_months: int = 6,
+    message: Optional[str] = None,
+    topic_hint: Optional[str] = None,
+    user_memory_summary: Optional[str] = None,
+    research_profile: Optional[Dict[str, Any]] = None,
+    request_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     tool_name = "recommend_papers"
     user_id = str(user_id or get_default_user_id()).strip() or get_default_user_id()
-    trace_inputs = {"user_id": user_id, "top_n": top_n, "max_age_months": max_age_months}
+    trace_inputs = {
+        "user_id": user_id,
+        "top_n": top_n,
+        "max_age_months": max_age_months,
+        "topic_hint": topic_hint,
+        "message": message,
+        "has_user_memory_summary": bool(str(user_memory_summary or "").strip()),
+        "has_research_profile": bool(research_profile),
+        "request_context_keys": sorted((request_context or {}).keys()) if isinstance(request_context, dict) else [],
+    }
     try:
         result = _get_recommendation_service().recommend_papers(
             user_id=user_id,
             top_n=top_n,
             max_age_months=max_age_months,
         )
+        payload = dict(result or {})
+        paper_actions = payload.get("paper_actions") if isinstance(payload.get("paper_actions"), dict) else {}
+        payload["personalization_signals"] = {
+            "used_user_memory_summary": bool(str(user_memory_summary or "").strip()),
+            "used_research_profile": bool(research_profile),
+            "used_request_topic": bool(str(topic_hint or message or "").strip()),
+            "interest_profile_mode": payload.get("interest_profile_mode"),
+            "interest_cluster_count": payload.get("interest_cluster_count", 0),
+            "has_behavior_history": any(bool(paper_actions.get(key)) for key in paper_actions),
+            "recall_mode": payload.get("recall_mode"),
+        }
         return make_tool_result(
             ok=True,
             tool_name=tool_name,
             summary=f"已为用户 {user_id} 生成推荐结果",
-            data=result,
-            trace=make_tool_trace(tool_name, inputs=trace_inputs, source="recommendation_service"),
+            data=payload,
+            trace=make_tool_trace(
+                tool_name,
+                inputs=trace_inputs,
+                source="recommendation_service",
+                notes={
+                    "uses_interest_vector": True,
+                    "uses_historical_preferences": True,
+                    "uses_research_profile": bool(research_profile) or bool(payload.get("research_profile")),
+                },
+            ),
         )
     except Exception as exc:
         return make_tool_result(
@@ -71,4 +109,47 @@ def record_paper_preference(
             data=None,
             trace=make_tool_trace(tool_name, inputs=trace_inputs, source="recommendation_service"),
             error=make_tool_error("record_preference_failed", str(exc)),
+        )
+
+
+def remove_user_paper_preference(
+    user_id: str,
+    arxiv_id: str,
+    remove_scope: str = "both",
+) -> Dict[str, Any]:
+    tool_name = "remove_user_paper_preference"
+    normalized_scope = str(remove_scope or "both").strip().lower() or "both"
+    trace_inputs = {"user_id": user_id, "arxiv_id": arxiv_id, "remove_scope": normalized_scope}
+    try:
+        service = _get_recommendation_service()
+        removed_liked = False
+        removed_disliked = False
+        if normalized_scope in {"both", "liked"}:
+            removed_liked = bool(service.db_service.remove_liked_paper(user_id=user_id, arxiv_id=arxiv_id))
+        if normalized_scope in {"both", "disliked"}:
+            removed_disliked = bool(service.db_service.remove_disliked_paper(user_id=user_id, arxiv_id=arxiv_id))
+
+        success = removed_liked or removed_disliked
+        data = {
+            "removed_liked": removed_liked,
+            "removed_disliked": removed_disliked,
+            "remove_scope": normalized_scope,
+            "message": "已取消偏好标记" if success else "未找到可取消的偏好标记",
+        }
+        return make_tool_result(
+            ok=success,
+            tool_name=tool_name,
+            summary=str(data["message"]),
+            data=data,
+            trace=make_tool_trace(tool_name, inputs=trace_inputs, source="recommendation_service"),
+            error=None if success else make_tool_error("remove_preference_not_found", "未找到可移除的喜欢/不喜欢标记"),
+        )
+    except Exception as exc:
+        return make_tool_result(
+            ok=False,
+            tool_name=tool_name,
+            summary="取消论文偏好失败",
+            data=None,
+            trace=make_tool_trace(tool_name, inputs=trace_inputs, source="recommendation_service"),
+            error=make_tool_error("remove_preference_failed", str(exc)),
         )

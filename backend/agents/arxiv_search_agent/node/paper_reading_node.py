@@ -19,16 +19,13 @@ _BACKEND_DIR = str(Path(__file__).resolve().parents[3])
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-try:  # pragma: no cover
-    from dependencies import get_paper_qa_service
-except ModuleNotFoundError:  # pragma: no cover
-    from backend.dependencies import get_paper_qa_service
-
-from ..schemas import AgentToolCall
+from ..schemas import ToolCallRequest
 from ..state import AgentState
+from ..utils.result_utils import _extract_error_message, _result_mapping, _result_ok
 from ..utils.paper_reference_resolver import _normalize_context_paper, _resolve_paper_reference
 from ..utils.state_utils import _append_step, _coerce_state
 from ..utils.text_utils import _matches_any, _normalize_text
+from .tool_node import execute_tool
 
 
 def _build_qa_question_for_paper(intent: str, message: str, paper: Mapping[str, Any], reference: Mapping[str, Any]) -> str:
@@ -102,6 +99,19 @@ def _make_pending_action_payload(
     }
 
 
+def _get_plan_step_id(state: AgentState, step_type: str) -> Optional[str]:
+    for step in list(state.execution_plan or []):
+        if str(getattr(step, "step_type", "") or "").strip() == step_type:
+            step_id = str(getattr(step, "step_id", "") or "").strip()
+            return step_id or None
+    return None
+
+
+def _has_ready_qa_index(qa_status: Mapping[str, Any]) -> bool:
+    normalized_status = str(qa_status.get("status") or "").strip().lower()
+    return bool(qa_status.get("has_index")) or normalized_status == "indexed"
+
+
 def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
     """处理论文阅读类请求，并决定直接回答还是转入待确认流程。
     
@@ -168,14 +178,15 @@ def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) ->
     title = str(resolution.get("title") or paper.get("title") or "").strip()
     # 论文定位成功后，把用户问题重写成更适合全文 QA 的标准化问题。
     qa_question = _build_qa_question_for_paper(intent, message, paper, resolution)
-    qa_service = get_paper_qa_service()
-    qa_status = qa_service.get_qa_status(arxiv_id) if arxiv_id else None
     loading_method = str(context.get("loading_method") or "docling").strip() or "docling"
     debug = dict(next_state.debug or {})
     debug["qa_question"] = qa_question
-    debug["qa_index_status"] = qa_status
+    debug["qa_index_status"] = None
     debug["paper_resolution"] = resolution
     debug["paper_reading_intent"] = intent
+    debug["paper_qa_target"] = {"arxiv_id": arxiv_id, "title": title}
+    debug["waiting_user_confirmation"] = False
+    debug["paper_qa_answer_status"] = "pending"
     next_state.debug = debug
     next_state.context = dict(next_state.context or {})
     # 把本轮解析出的目标论文写回上下文，支持后续“继续问这篇论文”这类省略表达。
@@ -187,23 +198,76 @@ def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) ->
         }
     )
     next_state.context["arxiv_id"] = arxiv_id
-    next_state.tool_name = "paper_qa_status"
+    next_state.tool_name = "check_paper_qa_index"
     next_state.tool_args = {
         "arxiv_id": arxiv_id,
         "intent": intent,
         "question": qa_question,
         "loading_method": loading_method,
     }
+    next_state.tool_call_request = ToolCallRequest(
+        tool_name="check_paper_qa_index",
+        arguments={"arxiv_id": arxiv_id},
+        reason="先确认目标论文是否已有可复用的 QA 索引",
+        expected_result="返回论文 QA 索引状态",
+        plan_step_id=_get_plan_step_id(next_state, "qa_index_check"),
+    )
+    next_state = execute_tool(next_state)
+    qa_status = dict(_result_mapping(next_state.tool_result or {}, "data") or {})
+    next_state.debug = dict(next_state.debug or {})
+    next_state.debug["qa_index_status"] = qa_status
+    next_state.debug["qa_index_checked"] = True
+
+    if not _result_ok(next_state.tool_result or {}):
+        error_message = _extract_error_message(next_state.tool_result or {}) or "检查论文 QA 索引失败"
+        result = {
+            "status": "failed",
+            "arxiv_id": arxiv_id,
+            "title": title,
+            "question": qa_question,
+            "answer": error_message,
+            "sources": [],
+            "retrieval_debug": None,
+            "qa_index_status": qa_status or None,
+            "index_created": False,
+            "error": error_message,
+        }
+        next_state.paper_qa_result = result
+        next_state.answer = error_message
+        next_state.debug["paper_qa_answer_status"] = "check_failed"
+        next_state.next_actions = [
+            "稍后重试该论文问答",
+            "或者改用 arXiv ID 重新指定目标论文",
+        ]
+        return _append_step(
+            next_state,
+            step="handle_paper_reading_request",
+            status="failed",
+            action="处理论文阅读请求",
+            inputs={"message": message, "intent": intent, "context": context},
+            outputs={"paper_qa_result": result, "qa_index_status": qa_status},
+            error=error_message,
+        )
 
     # 统一把索引状态标准化成 dict，避免后续多处分支同时处理 None / Mapping 两种形态。
-    # 统一把空状态折叠成 dict，避免后续 has_index / status 判断分支重复做空值保护。
     qa_status = qa_status or {}
 
     # 已有索引时走快速路径：无需再让用户确认，直接问答即可。
-    if bool(qa_status.get("has_index")) or str(qa_status.get("status") or "").strip().lower() == "indexed":
+    if _has_ready_qa_index(qa_status):
         try:
             # 已有索引时直接进入问答，不再要求用户重复确认，尽量缩短阅读链路延迟。
-            answer_result = qa_service.answer_question(arxiv_id, {"question": qa_question})
+            next_state.tool_call_request = ToolCallRequest(
+                tool_name="answer_paper_question",
+                arguments={"arxiv_id": arxiv_id, "question": qa_question},
+                reason="复用已有论文 QA 索引直接回答阅读问题",
+                expected_result="返回论文问题答案、引用片段和检索调试信息",
+                plan_step_id=_get_plan_step_id(next_state, "paper_response"),
+            )
+            next_state = execute_tool(next_state)
+            if not _result_ok(next_state.tool_result or {}):
+                raise RuntimeError(_extract_error_message(next_state.tool_result or {}) or "论文问答执行失败")
+
+            answer_result = dict(_result_mapping(next_state.tool_result or {}, "data") or {})
             result = {
                 "status": "success",
                 "arxiv_id": arxiv_id,
@@ -225,23 +289,8 @@ def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) ->
             ]
             next_state.pending_action = None
             next_state.context.pop("pending_action", None)
-            next_state.tool_result = dict(result)
-            next_state.tool_calls = list(next_state.tool_calls or []) + [
-                AgentToolCall(
-                    tool_name="paper_qa",
-                    arguments=next_state.tool_args,
-                    status="success",
-                    summary=f"直接回答已建索引论文: {title or arxiv_id}",
-                    trace={
-                        "arxiv_id": arxiv_id,
-                        "title": title,
-                        "qa_index_status": qa_status,
-                        "sources_count": len(result.get("sources") or []),
-                        "retrieval_debug_present": bool(result.get("retrieval_debug")),
-                    },
-                    error=None,
-                )
-            ]
+            next_state.debug["waiting_user_confirmation"] = False
+            next_state.debug["paper_qa_answer_status"] = "answered"
             return _append_step(
                 next_state,
                 step="handle_paper_reading_request",
@@ -317,21 +366,8 @@ def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) ->
         " 是否现在解析 PDF 并创建全文检索索引？"
     )
     next_state.next_actions = ["解析", "取消"]
-    next_state.tool_calls = list(next_state.tool_calls or []) + [
-        AgentToolCall(
-            tool_name="paper_qa_status",
-            arguments={"arxiv_id": arxiv_id, "intent": intent},
-            status="success",
-            summary=f"论文尚未建立 QA 索引，等待用户确认: {title or arxiv_id}",
-            trace={
-                "arxiv_id": arxiv_id,
-                "title": title,
-                "qa_index_status": qa_status,
-                "qa_question": qa_question,
-            },
-            error=None,
-        )
-    ]
+    next_state.debug["waiting_user_confirmation"] = True
+    next_state.debug["paper_qa_answer_status"] = "waiting_confirmation"
     return _append_step(
         next_state,
         step="handle_paper_reading_request",

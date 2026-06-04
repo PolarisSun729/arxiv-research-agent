@@ -81,6 +81,11 @@ class RecommendPapersInput(BaseModel):
     user_id: str = Field(default_factory=get_default_user_id)
     top_n: int = 10
     max_age_months: int = 6
+    message: Optional[str] = None
+    topic_hint: Optional[str] = None
+    user_memory_summary: Optional[str] = None
+    research_profile: Optional[Dict[str, Any]] = None
+    request_context: Optional[Dict[str, Any]] = None
 
 
 class RecordPaperPreferenceInput(BaseModel):
@@ -88,6 +93,12 @@ class RecordPaperPreferenceInput(BaseModel):
     arxiv_id: str
     liked: bool
     paper: Optional[Dict[str, Any]] = None
+
+
+class RemovePaperPreferenceInput(BaseModel):
+    user_id: str = Field(default_factory=get_default_user_id)
+    arxiv_id: str
+    remove_scope: str = "both"
 
 
 class CheckPaperQAIndexInput(BaseModel):

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from fastapi import FastAPI
@@ -8,7 +11,21 @@ from fastapi.testclient import TestClient
 from fastapi.responses import StreamingResponse
 from pydantic_core import PydanticUndefined
 
-from tests.helpers.agent_runtime import load_agent_test_modules
+
+def _load_agent_runtime_helper():
+    helper_path = Path(__file__).resolve().parents[1] / "helpers" / "agent_runtime.py"
+    module_name = "backend.tests.helpers.agent_runtime"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    spec = importlib.util.spec_from_file_location(module_name, helper_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+load_agent_test_modules = _load_agent_runtime_helper().load_agent_test_modules
 
 
 _MODULES = load_agent_test_modules()

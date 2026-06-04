@@ -17,17 +17,14 @@ _BACKEND_DIR = str(Path(__file__).resolve().parents[3])
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-try:  # pragma: no cover
-    from dependencies import get_recommendation_service
-except ModuleNotFoundError:  # pragma: no cover
-    from backend.dependencies import get_recommendation_service
-
 from .intent_support import _dedupe_preserve_order
-from ..schemas import AgentToolCall
+from ..schemas import ToolCallRequest
 from ..state import AgentState
 from ..utils.paper_reference_resolver import _resolve_paper_reference
+from ..utils.result_utils import _extract_error_message, _result_mapping, _result_ok
 from ..utils.state_utils import _append_step, _coerce_state
 from ..utils.text_utils import _matches_any, _normalize_text
+from .tool_node import execute_tool
 
 
 def _parse_preference_action(message: str) -> Optional[Dict[str, str]]:
@@ -87,6 +84,17 @@ def _parse_preference_action(message: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def _get_plan_step_id(state: AgentState, step_type: str) -> Optional[str]:
+    accepted_step_types = {str(step_type or "").strip()}
+    if step_type == "preference_mutation":
+        accepted_step_types.add("preference_update")
+    for step in list(state.execution_plan or []):
+        if str(getattr(step, "step_type", "") or "").strip() in accepted_step_types:
+            step_id = str(getattr(step, "step_id", "") or "").strip()
+            return step_id or None
+    return None
+
+
 def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
     """执行论文偏好更新，并把结果写回 AgentState。
     
@@ -116,7 +124,6 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
     parsed_action = _parse_preference_action(message)
     resolution = _resolve_paper_reference(message, next_state.context or {})
     user_id = str(next_state.user_id or "default").strip() or "default"
-    preference_service = get_recommendation_service()
     tool_args: Dict[str, Any] = {"user_id": user_id, "message": message}
     tool_name = "apply_preference_action"
     preference_result: Dict[str, Any]
@@ -130,6 +137,15 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
             "解析目标论文",
             "更新用户偏好",
         ]
+    debug = dict(next_state.debug or {})
+    debug["preference_action"] = parsed_action
+    debug["preference_target"] = {
+        "arxiv_id": arxiv_id or None,
+        "title": paper_title or None,
+        "resolution_status": resolution.get("status"),
+    }
+    debug["preference_action_status"] = "pending"
+    next_state.debug = debug
 
     # 第一类失败：动作本身就无法识别，此时不再继续做论文解析和服务调用。
     if parsed_action is None:
@@ -162,14 +178,23 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
         try:
             # like / dislike 都走统一的偏好记录接口，只是 liked 标志不同。
             if parsed_action["action"] in {"like", "dislike"}:
-                tool_name = "record_user_paper_preference"
+                tool_name = "record_paper_preference"
                 liked = parsed_action["action"] == "like"
-                service_result = preference_service.record_user_paper_preference(
-                    user_id=user_id,
-                    arxiv_id=arxiv_id,
-                    liked=liked,
-                    paper_payload=paper_payload,
+                tool_args = {"user_id": user_id, "arxiv_id": arxiv_id, "liked": liked, "paper": paper_payload}
+                next_state.tool_call_request = ToolCallRequest(
+                    tool_name=tool_name,
+                    arguments=dict(tool_args),
+                    reason="把用户对目标论文的显式偏好写入推荐系统",
+                    expected_result="返回偏好写入结果以及归一化后的论文信息",
+                    plan_step_id=_get_plan_step_id(next_state, "preference_mutation"),
                 )
+                next_state = execute_tool(next_state)
+                if not _result_ok(next_state.tool_result or {}):
+                    raise RuntimeError(_extract_error_message(next_state.tool_result or {}) or "偏好记录失败")
+                service_result = dict(_result_mapping(next_state.tool_result or {}, "data") or {})
+                if next_state.tool_observations:
+                    next_state.tool_observations[-1].is_sufficient = True
+                    next_state.tool_observations[-1].next_action_hint = None
                 preference_result = {
                     "status": "success",
                     "action": parsed_action["action"],
@@ -181,30 +206,35 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
                     "error": None,
                 }
             else:
-                tool_name = "remove_user_paper_preference"
+                tool_name = "remove_paper_preference"
                 remove_scope = str(parsed_action.get("remove_scope") or "both")
-                removed_liked = False
-                removed_disliked = False
-                remove_errors: List[str] = []
-                # 移除逻辑允许分别删除 liked / disliked，兼容“只取消喜欢”这类表达。
-                if remove_scope in {"both", "liked"}:
-                    removed_liked = bool(preference_service.db_service.remove_liked_paper(user_id=user_id, arxiv_id=arxiv_id))
-                if remove_scope in {"both", "disliked"}:
-                    removed_disliked = bool(preference_service.db_service.remove_disliked_paper(user_id=user_id, arxiv_id=arxiv_id))
-                if not removed_liked and not removed_disliked:
-                    remove_errors.append("未找到可移除的喜欢/不喜欢标记")
+                tool_args = {"user_id": user_id, "arxiv_id": arxiv_id, "remove_scope": remove_scope}
+                next_state.tool_call_request = ToolCallRequest(
+                    tool_name=tool_name,
+                    arguments=dict(tool_args),
+                    reason="移除用户对目标论文的既有偏好标记",
+                    expected_result="返回偏好移除结果以及移除范围",
+                    plan_step_id=_get_plan_step_id(next_state, "preference_mutation"),
+                )
+                next_state = execute_tool(next_state)
+                service_result = dict(_result_mapping(next_state.tool_result or {}, "data") or {})
+                removed_liked = bool(service_result.get("removed_liked"))
+                removed_disliked = bool(service_result.get("removed_disliked"))
+                if next_state.tool_observations:
+                    next_state.tool_observations[-1].is_sufficient = bool(_result_ok(next_state.tool_result or {}))
+                    next_state.tool_observations[-1].next_action_hint = None if _result_ok(next_state.tool_result or {}) else "check_existing_preference_or_retry_mutation"
                 preference_result = {
-                    "status": "success" if (removed_liked or removed_disliked) else "failed",
+                    "status": "success" if _result_ok(next_state.tool_result or {}) else "failed",
                     "action": "remove",
                     "label": "none",
                     "arxiv_id": arxiv_id,
                     "title": paper_title,
-                    "message": "已取消偏好标记" if (removed_liked or removed_disliked) else "未找到可取消的偏好标记",
+                    "message": str(service_result.get("message") or ("已取消偏好标记" if (removed_liked or removed_disliked) else "未找到可取消的偏好标记")),
                     "paper": paper_payload,
-                    "error": None if (removed_liked or removed_disliked) else "; ".join(remove_errors),
+                    "error": None if _result_ok(next_state.tool_result or {}) else _extract_error_message(next_state.tool_result or {}),
                 }
-                if not (removed_liked or removed_disliked):
-                    next_state.warnings = _dedupe_preserve_order(list(next_state.warnings) + remove_errors)
+                if not _result_ok(next_state.tool_result or {}):
+                    next_state.warnings = _dedupe_preserve_order(list(next_state.warnings) + [preference_result["message"]])
         except Exception as exc:
             preference_result = {
                 "status": "failed",
@@ -219,6 +249,11 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
             next_state.warnings = _dedupe_preserve_order(list(next_state.warnings) + [str(exc)])
 
     next_state.preference_action_result = preference_result
+    next_state.debug = {
+        **dict(next_state.debug or {}),
+        "preference_action_result": dict(preference_result),
+        "preference_action_status": preference_result.get("status"),
+    }
     if not next_state.next_actions:
         next_state.next_actions = [
             "继续对其他论文执行喜欢、不喜欢或收藏动作",
@@ -228,21 +263,8 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
     # 即使当前动作失败，也保留统一的工具调用记录，方便前端或日志层复盘原因。
     next_state.tool_name = tool_name
     next_state.tool_args = tool_args
-    next_state.tool_result = dict(preference_result)
-    next_state.tool_calls = list(next_state.tool_calls or []) + [
-        AgentToolCall(
-            tool_name=tool_name,
-            arguments=tool_args,
-            status=preference_result["status"],
-            summary=str(preference_result["message"]),
-            trace={
-                "action": parsed_action["action"] if parsed_action else None,
-                "target": resolution.get("target"),
-                "arxiv_id": preference_result.get("arxiv_id"),
-            },
-            error={"message": preference_result["error"]} if preference_result.get("error") else None,
-        )
-    ]
+    if next_state.tool_result is None:
+        next_state.tool_result = dict(preference_result)
 
     return _append_step(
         next_state,

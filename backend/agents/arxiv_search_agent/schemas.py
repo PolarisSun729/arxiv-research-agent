@@ -304,18 +304,40 @@ class ToolObservation(BaseModel):
 
     与 `ToolCallRequest` 配对使用：前者描述“准备调用什么”，后者描述
     “执行之后观察到了什么、是否足够支持下一步决策”。
-    阶段 2 先只引入统一结构，不改变既有真实执行流。
+
+    这里刻意把语义收敛到一组稳定字段，供 graph 路由和 response_node 直接消费：
+    1. ok：工具是否执行成功；
+    2. status：success / failed / skipped 等稳定状态；
+    3. result_summary：简短结果摘要；
+    4. result_ref：轻量结果引用，不承载巨大原始数据；
+    5. error：结构化错误；
+    6. is_sufficient：当前结果是否足够支持下一步；
+    7. next_action_hint：结果失败或不足时建议的下一步。
     """
     model_config = ConfigDict(extra="forbid")
 
     tool_name: Optional[str] = None
     ok: Optional[bool] = None
-    status: Optional[str] = None
+    status: Optional[Literal["success", "failed", "skipped"]] = None
     result_summary: Optional[str] = None
     result_ref: Optional[Dict[str, Any]] = None
     error: Optional[Dict[str, Any]] = None
     is_sufficient: Optional[bool] = None
-    next_action_hint: Optional[str] = None
+    next_action_hint: Optional[
+        Literal[
+            "retry_with_relaxed_query",
+            "ask_user_confirmation",
+            "ask_user_for_target_paper",
+            "inspect_tool_request_or_choose_alternative",
+            "answer_with_available_context",
+            "fallback_to_normal_search",
+            "request_user_confirmation_before_building_index",
+            "inspect_build_result_or_retry_index_build",
+            "inspect_answer_result_or_retry_with_adjusted_question",
+            "adjust_recommendation_constraints_or_collect_more_preferences",
+            "check_existing_preference_or_retry_mutation",
+        ]
+    ] = None
     raw_trace: Optional[Dict[str, Any]] = None
 
 

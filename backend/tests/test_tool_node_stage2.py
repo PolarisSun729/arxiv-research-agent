@@ -91,7 +91,9 @@ class ExecuteToolNodeStage2Tests(unittest.TestCase):
 
         self.assertEqual(result.steps[-1].step, "execute_tool")
         self.assertEqual(result.steps[-1].status, "skipped")
-        self.assertEqual(result.tool_observations, [])
+        self.assertEqual(len(result.tool_observations), 1)
+        self.assertEqual(result.tool_observations[-1].status, "skipped")
+        self.assertEqual(result.tool_observations[-1].error["code"], "missing_tool_call_request")
 
     def test_execute_tool_generates_failed_observation_for_unknown_tool(self) -> None:
         state = AgentState(

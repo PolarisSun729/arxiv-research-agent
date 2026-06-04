@@ -38,6 +38,33 @@ class ToolRegistryUnitTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["count"], 5)
+        self.assertEqual(result["tool_name"], "demo")
+        self.assertEqual(result["trace"]["requested_tool_name"], "demo")
+        self.assertEqual(result["trace"]["canonical_tool_name"], "demo")
+
+    def test_invoke_tool_normalizes_alias_result_name(self) -> None:
+        spec = tool_registry.ToolSpec(
+            name="demo_alias",
+            description="demo alias tool",
+            input_schema=_DemoInput,
+            func=lambda count: {
+                "ok": True,
+                "tool_name": "demo",
+                "summary": f"count={count}",
+                "data": {"count": count},
+                "trace": {"source": "unit-test"},
+                "error": None,
+            },
+            result_tool_name="demo",
+        )
+        with mock.patch.dict(tool_registry.TOOL_REGISTRY, {"demo_alias": spec}, clear=True):
+            result = tool_registry.invoke_tool("demo_alias", count=5)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tool_name"], "demo_alias")
+        self.assertEqual(result["trace"]["requested_tool_name"], "demo_alias")
+        self.assertEqual(result["trace"]["canonical_tool_name"], "demo")
+        self.assertTrue(result["trace"]["tool_alias"])
 
     def test_invoke_tool_wraps_validation_failure(self) -> None:
         spec = tool_registry.ToolSpec(

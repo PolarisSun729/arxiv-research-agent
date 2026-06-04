@@ -206,6 +206,8 @@ def _ensure_tool_stubs() -> None:
         module.get_paper_metadata = lambda **_kwargs: {}
         module.recommend_papers = lambda **_kwargs: {}
         module.record_paper_preference = lambda **_kwargs: {}
+        module.record_user_paper_preference = lambda **_kwargs: {}
+        module.remove_user_paper_preference = lambda **_kwargs: {}
         module.check_paper_qa_index = lambda **_kwargs: {}
         module.build_paper_qa_index = lambda **_kwargs: {}
         module.answer_paper_question = lambda **_kwargs: {}

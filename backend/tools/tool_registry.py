@@ -11,6 +11,7 @@ from .schemas import (
     BuildPaperQAIndexInput,
     CheckPaperQAIndexInput,
     GetPaperMetadataInput,
+    RemovePaperPreferenceInput,
     RecommendPapersInput,
     RecordPaperPreferenceInput,
     SearchArxivRawInput,
@@ -25,6 +26,27 @@ class ToolSpec:
     description: str
     input_schema: Type[BaseModel]
     func: Callable[..., Dict[str, Any]]
+    result_tool_name: str | None = None
+
+
+def _normalize_tool_result(tool_name: str, spec: ToolSpec, result: Mapping[str, Any]) -> Dict[str, Any]:
+    """Normalize tool outputs so every registry invocation returns the same envelope."""
+    plain_result = dict(result)
+    canonical_tool_name = str(spec.result_tool_name or spec.name)
+    trace = dict(plain_result.get("trace") or {})
+    trace.setdefault("requested_tool_name", tool_name)
+    trace.setdefault("canonical_tool_name", canonical_tool_name)
+    if tool_name != canonical_tool_name:
+        trace.setdefault("tool_alias", True)
+
+    return make_tool_result(
+        ok=bool(plain_result.get("ok", False)),
+        tool_name=tool_name,
+        summary=str(plain_result.get("summary") or "Tool execution completed"),
+        data=plain_result.get("data") if isinstance(plain_result.get("data"), dict) else plain_result.get("data"),
+        trace=trace,
+        error=plain_result.get("error"),
+    )
 
 
 TOOL_REGISTRY: Dict[str, ToolSpec] = {
@@ -57,6 +79,27 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         description="Record a user preference for a paper.",
         input_schema=RecordPaperPreferenceInput,
         func=recommendation_tools.record_paper_preference,
+    ),
+    "record_user_paper_preference": ToolSpec(
+        name="record_user_paper_preference",
+        description="Record a user preference for a paper.",
+        input_schema=RecordPaperPreferenceInput,
+        func=recommendation_tools.record_paper_preference,
+        result_tool_name="record_paper_preference",
+    ),
+    "remove_user_paper_preference": ToolSpec(
+        name="remove_user_paper_preference",
+        description="Remove a user preference for a paper.",
+        input_schema=RemovePaperPreferenceInput,
+        func=recommendation_tools.remove_user_paper_preference,
+        result_tool_name="remove_paper_preference",
+    ),
+    "remove_paper_preference": ToolSpec(
+        name="remove_paper_preference",
+        description="Remove a user preference for a paper.",
+        input_schema=RemovePaperPreferenceInput,
+        func=recommendation_tools.remove_user_paper_preference,
+        result_tool_name="remove_paper_preference",
     ),
     "check_paper_qa_index": ToolSpec(
         name="check_paper_qa_index",
@@ -123,7 +166,7 @@ def invoke_tool(tool_name: str, **kwargs: Any) -> Dict[str, Any]:
         )
 
     try:
-        return spec.func(**validated_arguments)
+        return _normalize_tool_result(tool_name, spec, spec.func(**validated_arguments))
     except Exception as exc:
         return make_tool_result(
             ok=False,

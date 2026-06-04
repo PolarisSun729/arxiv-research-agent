@@ -38,7 +38,37 @@ def _build_result_ref(result: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """从工具结果中提取一个轻量引用，避免 observation 过重。"""
     data = result.get("data")
     if isinstance(data, dict):
-        return data
+        compact: Dict[str, Any] = {}
+        for key in ("status", "message", "arxiv_id", "title", "has_index", "remove_scope", "interest_profile_mode", "interest_cluster_count", "recall_mode"):
+            value = data.get(key)
+            if value not in (None, "", [], {}):
+                compact[key] = value
+
+        answer = str(data.get("answer") or "").strip()
+        if answer:
+            compact["answer_preview"] = answer[:200]
+
+        for key in ("sources", "papers", "recommendations", "recommended_papers", "items"):
+            value = data.get(key)
+            if isinstance(value, list):
+                compact[f"{key}_count"] = len(value)
+                preview_items = []
+                for item in value[:3]:
+                    if isinstance(item, Mapping):
+                        preview = {
+                            "arxiv_id": item.get("arxiv_id") or item.get("id"),
+                            "title": item.get("title"),
+                        }
+                        preview_items.append({k: v for k, v in preview.items() if v not in (None, "")})
+                if preview_items:
+                    compact[f"{key}_preview"] = preview_items
+                break
+
+        retrieval_debug = data.get("retrieval_debug")
+        if isinstance(retrieval_debug, Mapping):
+            compact["retrieval_debug_keys"] = sorted(str(key) for key in retrieval_debug.keys())
+
+        return compact or {"data_keys": sorted(str(key) for key in data.keys())[:20]}
     if data is not None:
         return {"data": data}
 
@@ -63,6 +93,64 @@ def _make_failed_result(tool_name: Optional[str], message: str, *, code: str) ->
         "data": None,
         "trace": {"tool_name": tool_name},
         "error": {"code": code, "message": message},
+    }
+
+
+def _derive_observation_details(tool_name: Optional[str], result: Mapping[str, Any]) -> Dict[str, Any]:
+    """Derive protocol-level observation hints from tool result data."""
+    ok = _result_ok(result)
+    if not ok:
+        return {
+            "is_sufficient": False,
+            "next_action_hint": "inspect_tool_request_or_choose_alternative",
+        }
+
+    data = _result_mapping(result, "data") or {}
+    normalized_tool_name = str(tool_name or "").strip()
+    if normalized_tool_name == "check_paper_qa_index":
+        has_index = bool(data.get("has_index")) or str(data.get("status") or "").strip().lower() == "indexed"
+        return {
+            "is_sufficient": has_index,
+            "next_action_hint": None if has_index else "ask_user_confirmation",
+        }
+
+    if normalized_tool_name == "build_paper_qa_index":
+        has_index = bool(data.get("has_index")) or str(data.get("status") or "").strip().lower() in {"indexed", "success"}
+        return {
+            "is_sufficient": has_index,
+            "next_action_hint": None if has_index else "inspect_build_result_or_retry_index_build",
+        }
+
+    if normalized_tool_name == "answer_paper_question":
+        answer = str(data.get("answer") or "").strip()
+        return {
+            "is_sufficient": bool(answer),
+            "next_action_hint": None if answer else "answer_with_available_context",
+        }
+
+    if normalized_tool_name == "recommend_papers":
+        paper_candidates = []
+        for key in ("recommended_papers", "recommendations", "items", "papers"):
+            value = data.get(key)
+            if isinstance(value, list):
+                paper_candidates = value
+                break
+        personalization_signals = data.get("personalization_signals") if isinstance(data.get("personalization_signals"), Mapping) else {}
+        has_behavior_history = bool(personalization_signals.get("has_behavior_history"))
+        return {
+            "is_sufficient": bool(paper_candidates),
+            "next_action_hint": None if paper_candidates else ("adjust_recommendation_constraints_or_collect_more_preferences" if has_behavior_history else "fallback_to_normal_search"),
+        }
+
+    if normalized_tool_name in {"record_paper_preference", "remove_paper_preference", "record_user_paper_preference", "remove_user_paper_preference"}:
+        return {
+            "is_sufficient": ok,
+            "next_action_hint": None if ok else "check_existing_preference_or_retry_mutation",
+        }
+
+    return {
+        "is_sufficient": ok,
+        "next_action_hint": None,
     }
 
 
@@ -92,8 +180,24 @@ def execute_tool(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
 
     request = next_state.tool_call_request
     if request is None:
+        observation = ToolObservation(
+            tool_name=None,
+            ok=False,
+            status="skipped",
+            result_summary="tool_call_request is missing",
+            result_ref=None,
+            error={"code": "missing_tool_call_request", "message": "tool_call_request is missing"},
+            is_sufficient=False,
+            next_action_hint="inspect_tool_request_or_choose_alternative",
+            raw_trace=None,
+        )
+        _append_observation(next_state, observation)
         debug = dict(next_state.debug or {})
-        debug["last_tool_execution"] = {"status": "skipped", "reason": "missing_tool_call_request"}
+        debug["last_tool_execution"] = {
+            "status": "skipped",
+            "reason": "missing_tool_call_request",
+            "observation": observation.model_dump(),
+        }
         next_state.debug = debug
         return _append_step(
             next_state,
@@ -127,6 +231,7 @@ def execute_tool(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
 
     next_state.tool_result = dict(result)
 
+    observation_details = _derive_observation_details(tool_name, result)
     observation = ToolObservation(
         tool_name=tool_name,
         ok=_result_ok(result),
@@ -134,8 +239,8 @@ def execute_tool(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
         result_summary=_result_text(result, "summary"),
         result_ref=_build_result_ref(result),
         error=_result_mapping(result, "error"),
-        is_sufficient=_result_ok(result),
-        next_action_hint=None if _result_ok(result) else "inspect_tool_request_or_choose_alternative",
+        is_sufficient=bool(observation_details.get("is_sufficient")),
+        next_action_hint=observation_details.get("next_action_hint"),
         raw_trace=_result_mapping(result, "trace"),
     )
     _append_observation(next_state, observation)
