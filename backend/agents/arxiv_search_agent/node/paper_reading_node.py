@@ -1,3 +1,12 @@
+"""处理论文总结、细节解释和论文问答请求。
+
+这个节点负责把“围绕某篇论文继续阅读”的自然语言请求转成可执行流程：
+1. 解析用户引用的目标论文；
+2. 把原始表达改写成更适合全文 QA 的标准问题；
+3. 判断论文是否已有问答索引；
+4. 决定直接回答，还是进入等待解析确认的挂起状态。
+"""
+
 from __future__ import annotations
 
 import re
@@ -23,10 +32,19 @@ from ..utils.text_utils import _matches_any, _normalize_text
 
 
 def _build_qa_question_for_paper(intent: str, message: str, paper: Mapping[str, Any], reference: Mapping[str, Any]) -> str:
+    """把用户原始表达清洗成更适合论文全文问答服务的标准问题。
+    
+    主要步骤：
+    1. 去掉“问一下”“第一篇”“这篇论文”“arXiv ID”这类引用性噪声；
+    2. 在 paper_summary 分支下生成覆盖研究问题、方法、实验和局限性的总结模板；
+    3. 在 paper_detail 分支下把过短的“解释/方法”请求扩展成更完整的问题；
+    4. paper_qa 分支则尽量保留用户原问题，只在空文本时给默认问法。
+    """
     original_question = _normalize_text(message)
     title = _normalize_text(str(paper.get("title") or reference.get("title") or ""))
 
     cleaned_question = original_question
+    # 依次剥离“问一下”“第一篇”“这篇论文”“arXiv ID”这类引用性噪声，只保留真正的问题主体。
     cleaned_question = re.sub(r"^(问一下|请问一下|请问|问|帮我问一下|帮我问|想问一下)\s*", "", cleaned_question).strip()
     cleaned_question = re.sub(
         r"^(?:第\s*[一二三四五六七八九十两0-9]+\s*篇(?:论文|paper)?|[1-9]|1[0-9]|20)\s*[:：,，]?\s*",
@@ -39,6 +57,7 @@ def _build_qa_question_for_paper(intent: str, message: str, paper: Mapping[str, 
     cleaned_question = cleaned_question.lstrip("，,:：.。;； ")
 
     if intent == "paper_summary":
+        # 总结类请求统一扩展成完整的总结模板，保证输出覆盖研究问题、方法和结果等关键维度。
         return (
             f"请基于论文全文总结这篇论文，包含研究问题、核心贡献、方法流程、实验设置、主要结果和局限性。"
             f"{f' 论文标题：{title}' if title else ''}"
@@ -46,6 +65,7 @@ def _build_qa_question_for_paper(intent: str, message: str, paper: Mapping[str, 
 
     if intent == "paper_detail":
         detail_question = cleaned_question or original_question
+        # 对“解释 / 方法 / 介绍一下”这类过短请求，主动补成更完整的细节解释指令。
         if _matches_any(detail_question, (r"^解释$", r"^讲讲$", r"^介绍一下$", r"^方法$", r"^讲讲方法$", r"^解释方法$")):
             detail_question = "请详细解释这篇论文的方法设计、关键模块、输入输出流程，以及这样设计的原因。"
         if not detail_question:
@@ -65,6 +85,11 @@ def _make_pending_action_payload(
     qa_question: str,
     loading_method: str = "docling",
 ) -> Dict[str, Any]:
+    """构造等待用户确认的挂起任务载荷。
+    
+    这个载荷会保存继续执行所需的最小上下文，包括 arxiv_id、title、原始问题、标准化 qa_question、
+    loading_method 和 waiting_confirmation 状态，供后续确认节点无损恢复。
+    """
     return {
         "type": "parse_then_qa",
         "arxiv_id": arxiv_id,
@@ -78,6 +103,16 @@ def _make_pending_action_payload(
 
 
 def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    """处理论文阅读类请求，并决定直接回答还是转入待确认流程。
+    
+    主要分支包括：
+    1. 不是论文阅读 intent，直接跳过；
+    2. 无法解析目标论文，返回失败提示；
+    3. 已有 QA 索引，直接调用问答服务并返回答案；
+    4. 尚无 QA 索引，创建 pending_action，等待用户确认是否解析 PDF。
+    
+    输出：返回更新后的 AgentState，包含 paper_qa_result、answer、next_actions、debug 和上下文中的 selected_paper。
+    """
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
     intent = str(next_state.intent or "").strip()
@@ -91,6 +126,7 @@ def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) ->
             outputs={"reason": "当前 intent 不是论文阅读类请求"},
         )
 
+    # 先基于当前消息和上下文定位“这篇论文 / 第一篇论文”究竟指向哪一篇文献。
     message = _normalize_text(next_state.message or "")
     context = dict(next_state.context or {})
     resolution = _resolve_paper_reference(message, context)
@@ -126,9 +162,11 @@ def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) ->
             error=result["error"],
         )
 
+    # 解析成功后把论文基础信息拆出来，后续无论是直接问答还是挂起确认都会复用这些字段。
     paper = resolution.get("paper") or {}
     arxiv_id = str(resolution.get("arxiv_id") or "").strip()
     title = str(resolution.get("title") or paper.get("title") or "").strip()
+    # 论文定位成功后，把用户问题重写成更适合全文 QA 的标准化问题。
     qa_question = _build_qa_question_for_paper(intent, message, paper, resolution)
     qa_service = get_paper_qa_service()
     qa_status = qa_service.get_qa_status(arxiv_id) if arxiv_id else None
@@ -140,6 +178,7 @@ def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) ->
     debug["paper_reading_intent"] = intent
     next_state.debug = debug
     next_state.context = dict(next_state.context or {})
+    # 把本轮解析出的目标论文写回上下文，支持后续“继续问这篇论文”这类省略表达。
     next_state.context["selected_paper"] = _normalize_context_paper(
         {
             **({} if not isinstance(paper, Mapping) else dict(paper)),
@@ -156,10 +195,14 @@ def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) ->
         "loading_method": loading_method,
     }
 
+    # 统一把索引状态标准化成 dict，避免后续多处分支同时处理 None / Mapping 两种形态。
+    # 统一把空状态折叠成 dict，避免后续 has_index / status 判断分支重复做空值保护。
     qa_status = qa_status or {}
 
+    # 已有索引时走快速路径：无需再让用户确认，直接问答即可。
     if bool(qa_status.get("has_index")) or str(qa_status.get("status") or "").strip().lower() == "indexed":
         try:
+            # 已有索引时直接进入问答，不再要求用户重复确认，尽量缩短阅读链路延迟。
             answer_result = qa_service.answer_question(arxiv_id, {"question": qa_question})
             result = {
                 "status": "success",
@@ -240,6 +283,8 @@ def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) ->
                 error=str(exc),
             )
 
+    # 尚未建立索引时不直接执行重活，而是先挂起任务，等待用户确认是否解析 PDF。
+    # 没有现成索引时先挂起任务，不直接触发重解析，给用户一次明确确认机会。
     pending_action = _make_pending_action_payload(
         arxiv_id=arxiv_id,
         title=title,

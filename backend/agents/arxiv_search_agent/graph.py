@@ -5,7 +5,8 @@ from typing import Any, Mapping, Optional
 
 from langgraph.graph import END, START, StateGraph
 
-from .nodes import (
+from .node import (
+    _coerce_state,
     apply_preference_action,
     build_search_tool_args,
     check_search_result,
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 # 这个文件负责定义 arXiv Agent 的 LangGraph 主流程结构。
 #
 # 可以把它理解为“流程编排层”：
-# - nodes.py 定义每个节点具体做什么；
+# - node/ 下的模块定义每个节点具体做什么；
 # - state.py 定义节点之间共享什么状态；
 # - graph.py 决定这些节点按什么顺序、在什么条件下被执行。
 #

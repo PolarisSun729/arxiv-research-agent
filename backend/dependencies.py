@@ -108,6 +108,7 @@ def get_paper_qa_index_builder() -> PaperQAIndexBuilder:
         vector_store_service=get_vector_store_service(),
         generation_service=get_generation_service(),
         arxiv_service_factory=lambda: get_arxiv_api_service(),
+        oai_db_service=get_oai_database_service(),
         get_embedding_config=get_current_embedding_config,
         loading_service_factory=LoadingService,
         chunking_service_factory=ChunkingService,

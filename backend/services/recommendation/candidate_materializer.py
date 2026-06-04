@@ -18,6 +18,11 @@ class CandidateMaterializer:
         paper_payload: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """记录用户对论文的行为事件，并确保论文已被物化到本地存储链路中。
+
+        这里的“物化”包含论文表记录与向量信息准备，目的是让后续画像更新、
+        推荐召回与排序都能基于一致的数据主键工作。
+        """
         normalized_arxiv_id = str(arxiv_id or "").strip()
         normalized_action = str(action_type or "").strip()
         if not normalized_arxiv_id:
@@ -25,6 +30,7 @@ class CandidateMaterializer:
         if not normalized_action:
             raise HTTPException(status_code=400, detail="action_type is required")
 
+        # 先确保论文已被标准化入库，避免只记录了行为却缺少可追踪的论文实体。
         paper = self._ensure_paper_materialized(normalized_arxiv_id, paper_payload=paper_payload)
         if not paper:
             raise HTTPException(status_code=404, detail=f"Paper {normalized_arxiv_id} could not be materialized")
@@ -39,6 +45,7 @@ class CandidateMaterializer:
             raise HTTPException(status_code=500, detail=f"Failed to record paper action {normalized_action}")
 
         try:
+            # 行为记录成功后再异步风格地更新长期画像；画像失败不应影响主流程成功。
             self.memory_service.update_profile_from_paper_action(
                 user_id=user_id,
                 arxiv_id=normalized_arxiv_id,
@@ -64,6 +71,7 @@ class CandidateMaterializer:
         liked: bool,
         paper_payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """记录用户喜欢或不喜欢的偏好，并同步触发长期兴趣画像更新。"""
         normalized_arxiv_id = str(arxiv_id or "").strip()
         if not normalized_arxiv_id:
             raise HTTPException(status_code=400, detail="arxiv_id is required")
@@ -83,6 +91,7 @@ class CandidateMaterializer:
             raise HTTPException(status_code=500, detail=f"Failed to add paper to {action} list")
 
         try:
+            # 偏好属于强信号，会直接反馈到用户研究画像，但这里仍保持失败降级。
             self.memory_service.update_profile_from_preference(
                 user_id=user_id,
                 arxiv_id=normalized_arxiv_id,
@@ -103,6 +112,11 @@ class CandidateMaterializer:
         self,
         candidates: List[Dict[str, Any]],
     ) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+        """批量物化推荐候选论文，并尽可能复用已有论文记录与向量数据。
+
+        该方法会区分多种场景：完全复用、只补数据库映射、只补论文记录，
+        以及重新生成 embedding 后批量写入向量库。
+        """
         stats = {"total": len(candidates), "reused_existing": 0, "db_only": 0, "batch_embedded": 0, "batch_inserted": 0, "unresolved": 0}
         materialized_by_id: Dict[str, Dict[str, Any]] = {}
         batch_jobs: List[Dict[str, Any]] = []
@@ -124,11 +138,13 @@ class CandidateMaterializer:
                 existing_paper = None
                 existing_embedding = None
 
+            # 数据库和向量库都已有时，直接复用，避免重复写入和重复 embedding。
             if existing_paper and existing_paper.get("embedding_id") and existing_embedding:
                 materialized_by_id[arxiv_id] = existing_paper
                 stats["reused_existing"] += 1
                 continue
 
+            # 数据库有论文、向量库也有 embedding，但二者关联缺失时，只修复映射关系。
             if existing_paper and existing_embedding and not existing_paper.get("embedding_id"):
                 updated = self.db_service.update_paper_embedding(
                     arxiv_id=arxiv_id,
@@ -140,6 +156,7 @@ class CandidateMaterializer:
                 stats["db_only"] += 1
                 continue
 
+            # 只有向量没有论文时，补一份论文表记录，让向量结果能被业务层稳定引用。
             if existing_embedding and not existing_paper:
                 stored = {
                     "arxiv_id": str(candidate.get("arxiv_id", "") or "").strip(),
@@ -166,6 +183,7 @@ class CandidateMaterializer:
                 continue
 
             try:
+                # 只有在完全没有现成向量可复用时，才调用 embedding 服务生成新向量。
                 embedding = self.embedding_service.create_single_embedding(
                     text_to_embed,
                     provider=embedding_config.provider,
@@ -183,6 +201,7 @@ class CandidateMaterializer:
 
         if batch_jobs:
             try:
+                # 先批量写向量库，再逐条补论文表，兼顾吞吐量和业务侧主键可追踪性。
                 batch_insert_payload = [
                     {
                         "embedding": job["embedding"],
@@ -235,6 +254,7 @@ class CandidateMaterializer:
         return ordered_candidates, stats
 
     def _ensure_paper_materialized(self, arxiv_id: str, paper_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """确保单篇论文已经具备论文表记录和可用 embedding 的最小落库状态。"""
         existing_paper = self.db_service.get_paper(arxiv_id)
         existing_embedding = self._get_existing_paper_embedding(arxiv_id)
 
@@ -295,6 +315,7 @@ class CandidateMaterializer:
         return refreshed or stored
 
     def _materialize_paper_from_source(self, source_paper: Dict[str, Any], fallback_arxiv_id: str) -> Dict[str, Any]:
+        """把外部来源论文标准化、生成向量，并写入本地论文表。"""
         normalized_paper = self._normalize_paper_record(source_paper, fallback_arxiv_id)
         embedding_id = self._insert_paper_embedding(normalized_paper)
         stored = {
@@ -315,6 +336,7 @@ class CandidateMaterializer:
         return refreshed or stored
 
     def _fetch_paper_from_arxiv_with_rate_limit(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
+        """按限流策略从 arXiv 拉取单篇论文，避免外部接口在短时间内被频繁调用。"""
         wait_seconds = 0.0
         with self._arxiv_backfill_lock:
             now = time.monotonic()
@@ -332,6 +354,7 @@ class CandidateMaterializer:
         return papers[0] if papers else None
 
     def _normalize_paper_record(self, paper: Dict[str, Any], fallback_arxiv_id: str) -> Dict[str, Any]:
+        """把不同来源的论文字段统一整理为系统内部使用的标准结构。"""
         authors = paper.get("authors", "")
         categories = paper.get("categories", "")
         if isinstance(authors, (list, tuple)):
@@ -364,10 +387,12 @@ class CandidateMaterializer:
         }
 
     def _insert_paper_embedding(self, normalized_paper: Dict[str, Any]) -> int:
+        """为标准化论文生成并插入 embedding，并仅返回向量库主键。"""
         embedding_id, _ = self._build_and_insert_paper_embedding(normalized_paper)
         return embedding_id
 
     def _build_and_insert_paper_embedding(self, normalized_paper: Dict[str, Any]) -> tuple[int, List[float]]:
+        """构造论文 embedding 并写入向量库，同时返回向量内容与其主键。"""
         embedding_config = self.get_embedding_config()
         text_to_embed = self.embedding_service.build_paper_embedding_text(normalized_paper["title"], normalized_paper["abstract"])
         if not text_to_embed:
@@ -396,10 +421,12 @@ class CandidateMaterializer:
         return embedding_id, embedding_vector
 
     def _get_existing_paper_embedding(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
+        """按 arXiv ID 查询现有 embedding，供物化流程判断是否可以复用。"""
         embeddings = self.vector_store_service.get_paper_embeddings_by_arxiv_ids(collection_name=self.collection_name, arxiv_ids=[arxiv_id])
         return embeddings[0] if embeddings else None
 
     def _embed_papers(self, papers: List[Dict[str, Any]], config: Any) -> List[Dict[str, Any]]:
+        """仅基于论文文本临时生成向量，用于回退场景下的画像与排序计算。"""
         embedded: List[Dict[str, Any]] = []
         for paper in papers:
             arxiv_id = str(paper.get("arxiv_id", "") or "").strip()

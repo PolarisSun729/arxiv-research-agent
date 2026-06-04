@@ -1,3 +1,10 @@
+"""arXiv OAI 数据同步与本地检索服务模块。
+
+该模块负责从 arXiv OAI-PMH 接口同步论文元数据到本地 SQLite 数据库，并
+提供围绕这份本地镜像数据的检索、过滤、解析和向量化辅助能力。它是本地
+ arXiv 数据能力的核心实现。
+"""
+
 import json
 import logging
 import os
@@ -27,6 +34,7 @@ OAI_DASHSCOPE_TEXT_TOKEN_PRICE_PER_1K = ARXIV_OAI_CONFIG["dashscope_text_token_p
 
 @dataclass
 class ArxivOaiSyncStats:
+    """记录一次 OAI 同步任务的统计信息。"""
     requests_made: int = 0
     pages_processed: int = 0
     records_seen: int = 0
@@ -51,11 +59,21 @@ class ArxivOaiSyncStats:
     errors: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
+        """把同步统计对象转换成普通字典。"""
         return asdict(self)
 
 
 class ArxivOaiDatabaseService:
     def __init__(self, db_path: Optional[str] = None, check_same_thread: Optional[bool] = None):
+        """初始化 OAI SQLite 数据库服务。
+
+        参数:
+            db_path (Optional[str]): 数据库文件路径；为空时使用运行时配置。
+            check_same_thread (Optional[bool]): SQLite 线程检查配置。
+
+        返回:
+            None
+        """
         self.db_path = db_path or OAI_SQLITE_CONFIG["database_path"]
         self.check_same_thread = (
             OAI_SQLITE_CONFIG["check_same_thread"] if check_same_thread is None else bool(check_same_thread)
@@ -64,15 +82,18 @@ class ArxivOaiDatabaseService:
         self._initialize_database()
 
     def _ensure_database_directory(self) -> None:
+        """确保数据库目录存在，避免首次写入时路径缺失。"""
         directory = os.path.dirname(self.db_path)
         if directory and not os.path.exists(directory):
             os.makedirs(directory, exist_ok=True)
             logger.info("Created OAI database directory: %s", directory)
 
     def _get_connection(self) -> sqlite3.Connection:
+        """创建一个 SQLite 连接。"""
         return sqlite3.connect(self.db_path, check_same_thread=self.check_same_thread)
 
     def _parse_list_field(self, value: Any) -> Any:
+        """把数据库中的列表字段还原成更自然的 Python 结构。"""
         if isinstance(value, (list, tuple)):
             return [str(item).strip() for item in value if str(item).strip()]
         if isinstance(value, str):
@@ -90,6 +111,7 @@ class ArxivOaiDatabaseService:
         return value
 
     def get_paper(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
+        """按 arXiv ID 获取单篇论文元数据。"""
         normalized_arxiv_id = str(arxiv_id or "").strip()
         if not normalized_arxiv_id:
             return None
@@ -148,6 +170,7 @@ class ArxivOaiDatabaseService:
         max_age_months: int = 6,
         max_results: int = 100,
     ) -> List[Dict[str, Any]]:
+        """获取最近若干个月内的论文列表，并可按分类过滤。"""
         try:
             query_parts = [
                 '''
@@ -234,9 +257,11 @@ class ArxivOaiDatabaseService:
             return []
 
     def _normalize_text_value(self, value: Optional[str]) -> str:
+        """规范化文本值，折叠多余空白。"""
         return " ".join(str(value or "").strip().split())
 
     def _strip_outer_parentheses(self, query: str) -> str:
+        """移除查询字符串最外层成对括号。"""
         text = query.strip()
         while text.startswith("(") and text.endswith(")"):
             depth = 0
@@ -256,6 +281,7 @@ class ArxivOaiDatabaseService:
         return text
 
     def _split_top_level(self, query: str, token: str) -> List[str]:
+        """在不破坏括号层级的前提下按顶层逻辑符切分查询字符串。"""
         text = query.strip()
         parts: List[str] = []
         depth = 0
@@ -282,6 +308,7 @@ class ArxivOaiDatabaseService:
         return [part for part in parts if part]
 
     def _parse_row(self, row: Sequence[Any]) -> Dict[str, Any]:
+        """把数据库查询返回的一行记录转换为标准论文字典。"""
         return {
             "arxiv_id": row[0],
             "title": row[1],
@@ -300,6 +327,7 @@ class ArxivOaiDatabaseService:
         }
 
     def _paper_to_search_fields(self, paper: Dict[str, Any]) -> Dict[str, str]:
+        """把论文对象展开为便于搜索匹配的字段视图。"""
         authors = paper.get("authors", "")
         categories = paper.get("categories", "")
         if isinstance(authors, (list, tuple)):

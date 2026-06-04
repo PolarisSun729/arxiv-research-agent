@@ -1,3 +1,12 @@
+"""论文引用解析与上下文目标论文恢复工具。
+
+这个模块负责把用户口语里的“这篇论文”“第一篇”“arXiv ID 2401.12345”
+这类目标引用，解析成统一的论文定位结果，供论文阅读、偏好更新等节点复用。
+
+它本质上做的是“从对话上下文恢复用户到底在指哪篇论文”这件事，
+因此同时依赖消息文本和 state/context 中保留的最近论文列表、当前选中文献等信息。
+"""
+
 from __future__ import annotations
 
 import re
@@ -30,6 +39,11 @@ _PREFERENCE_ORDINAL_MAP = {
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
+    """安全地把任意值转成 int；失败时返回默认值。
+
+    这里主要服务于序号解析场景，目标是让自然语言里的“第3篇”“三”之类表达
+    在转换失败时不要直接抛异常，而是回退到可控默认值。
+    """
     try:
         return int(str(value).strip())
     except Exception:
@@ -37,9 +51,15 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 
 def _normalize_context_paper(raw: Any) -> Dict[str, Any]:
+    """把上下文中的论文对象规范化成统一字段结构。
+
+    上游不同模块保存论文时可能使用 arxivId/id、published/updated、abs_url/url
+    等不同命名，这里统一收口成 node 层可稳定读取的标准字段集合。
+    """
     paper = raw if isinstance(raw, Mapping) else {}
     arxiv_id = str(paper.get("arxiv_id") or paper.get("arxivId") or paper.get("id") or "").strip()
     if arxiv_id.startswith("http"):
+        # 某些上下文里保存的是 arXiv 页面链接，这里统一裁剪成纯 arXiv ID。
         arxiv_id = arxiv_id.rsplit("/", 1)[-1]
 
     authors = paper.get("authors", [])
@@ -86,6 +106,11 @@ def _normalize_context_paper(raw: Any) -> Dict[str, Any]:
 
 
 def _merge_context_paper_lists(*paper_lists: Any) -> List[Dict[str, Any]]:
+    """合并多路论文列表，并按 arXiv ID/标题去重保序。
+
+    该函数主要用于把 recent/search/papers 等不同上下文字段整合成单一候选集，
+    方便后续按序号或显式 ID 做统一定位。
+    """
     merged: List[Dict[str, Any]] = []
     seen_keys = set()
 
@@ -106,6 +131,11 @@ def _merge_context_paper_lists(*paper_lists: Any) -> List[Dict[str, Any]]:
 
 
 def _extract_selected_paper(context: Any) -> Optional[Dict[str, Any]]:
+    """从上下文中恢复当前已选中的目标论文。
+
+    这里会按多个常见字段名依次尝试，并在必要时从 paper_qa_result 或简化字段
+    arxiv_id/title 中补构一个最小论文对象。
+    """
     if not isinstance(context, Mapping):
         return None
 
@@ -145,6 +175,10 @@ def _extract_selected_paper(context: Any) -> Optional[Dict[str, Any]]:
 
 
 def _extract_last_papers(context: Any) -> List[Dict[str, Any]]:
+    """从上下文中提取最近一轮可供引用的论文列表。
+
+    这些结果通常来自搜索返回值或最近浏览记录，是“第一篇/第二篇”这类引用的主要候选池。
+    """
     if not isinstance(context, Mapping):
         return []
     return _merge_context_paper_lists(
@@ -156,10 +190,18 @@ def _extract_last_papers(context: Any) -> List[Dict[str, Any]]:
 
 
 def _parse_target_reference(message: str) -> Optional[Dict[str, Any]]:
+    """从用户消息里解析目标论文引用方式。
+
+    支持三类典型表达：
+    1. 显式 arXiv ID；
+    2. “这篇论文”这类上下文指代；
+    3. “第一篇 / 第 2 篇”这类序号引用。
+    """
     text = _normalize_text(message)
     if not text:
         return None
 
+    # 先尝试识别最明确的显式 arXiv ID，因为这类引用优先级最高、歧义最小。
     arxiv_match = re.search(r"(?:arxiv\.org/(?:abs|pdf)/)?(\d{4}\.\d{4,5}(?:v\d+)?)", text, flags=re.IGNORECASE)
     if arxiv_match:
         return {
@@ -185,6 +227,7 @@ def _parse_target_reference(message: str) -> Optional[Dict[str, Any]]:
             "target_value": "selected_or_recent",
         }
 
+    # 再尝试解析“第几篇”形式的序号引用，用于指向上一轮搜索结果中的论文。
     ordinal_match = re.search(r"(?:第\s*)?([一二三四五六七八九十两]{1,3}|[1-9]|1[0-9]|20)\s*(?:篇|个)?(?:论文|paper)?", text)
     if ordinal_match:
         raw_value = ordinal_match.group(1)
@@ -212,11 +255,17 @@ def _parse_target_reference(message: str) -> Optional[Dict[str, Any]]:
 
 
 def _resolve_paper_reference(message: str, context: Any) -> Dict[str, Any]:
+    """结合消息文本和上下文，解析出用户真正指向的论文对象。
+
+    这是整个模块的主入口。它会先解析引用类型，再按引用类型去 selected_paper、
+    last_papers 或显式 arXiv ID 中定位目标，最终返回统一的 success/failed 结果结构。
+    """
     reference = _parse_target_reference(message)
     last_papers = _extract_last_papers(context)
     selected_paper = _extract_selected_paper(context)
 
     def build_success(paper_payload: Optional[Mapping[str, Any]], *, target: Optional[Dict[str, Any]], matched_from: str) -> Dict[str, Any]:
+        # 所有成功分支都通过统一构造器返回，保证字段形态稳定，便于上层节点直接消费。
         normalized_paper = _normalize_context_paper(paper_payload or {})
         resolved_arxiv_id = str(normalized_paper.get("arxiv_id") or "").strip() or None
         resolved_title = str(normalized_paper.get("title") or "").strip() or None
@@ -231,6 +280,7 @@ def _resolve_paper_reference(message: str, context: Any) -> Dict[str, Any]:
         }
 
     if reference is None:
+        # 用户没有显式说“哪篇”，则优先回退到当前选中论文；如果最近结果里只有一篇，也可直接默认命中。
         if selected_paper is not None:
             return build_success(selected_paper, target=None, matched_from="selected_paper")
         if len(last_papers) == 1:
@@ -245,6 +295,7 @@ def _resolve_paper_reference(message: str, context: Any) -> Dict[str, Any]:
         }
 
     if reference["target_type"] == "context_paper":
+        # “这篇论文”属于纯上下文引用，因此必须依赖 selected_paper 或唯一 recent paper 才能落地。
         if selected_paper is not None:
             return build_success(selected_paper, target=reference, matched_from="selected_paper")
         if len(last_papers) == 1:
@@ -278,6 +329,7 @@ def _resolve_paper_reference(message: str, context: Any) -> Dict[str, Any]:
                 "arxiv_id": None,
                 "title": None,
             }
+        # 序号是按用户视角从 1 开始计数，因此内部访问列表时要减 1。
         paper = dict(last_papers[ordinal - 1])
         arxiv_id = str(paper.get("arxiv_id") or "").strip()
         if not arxiv_id:
@@ -302,6 +354,7 @@ def _resolve_paper_reference(message: str, context: Any) -> Dict[str, Any]:
             "title": None,
         }
 
+    # 对显式 arXiv ID，优先尝试在最近论文列表或当前选中论文中补全完整元数据。
     paper = next((paper for paper in last_papers if str(paper.get("arxiv_id") or "").strip() == arxiv_id), None)
     if paper is None and selected_paper is not None and str(selected_paper.get("arxiv_id") or "").strip() == arxiv_id:
         paper = selected_paper

@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from fastapi import HTTPException
 
 from services.arxiv.arxiv_search_service import ArxivSearchService
+from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
 from services.document.chunking_service import ChunkingService
 from services.memory import MemoryService
 from services.storage.database_service import DatabaseService
@@ -46,11 +47,13 @@ class PaperQAService:
         generation_service: Optional[GenerationService] = None,
         enhanced_retrieval_service: Optional[EnhancedRetrievalService] = None,
         arxiv_service_factory: Optional[Callable[[], Any]] = None,
+        oai_db_service: Optional[ArxivOaiDatabaseService] = None,
         get_embedding_config: Optional[Callable[[], EmbeddingConfig]] = None,
         loading_service_factory: Optional[Callable[[], LoadingService]] = None,
         chunking_service_factory: Optional[Callable[[], ChunkingService]] = None,
         qa_index_builder: Optional[PaperQAIndexBuilder] = None,
     ):
+        """初始化单篇论文问答服务，并组装问答、检索、记忆与索引构建依赖。"""
         self.db_service = db_service or DatabaseService()
         self.memory_service = memory_service or MemoryService(db_service=self.db_service)
         self.embedding_service = embedding_service or EmbeddingService()
@@ -62,6 +65,7 @@ class PaperQAService:
             generation_service=self.generation_service,
         )
         self.arxiv_service_factory = arxiv_service_factory or (lambda: ArxivSearchService())
+        self.oai_db_service = oai_db_service
         self.get_embedding_config = get_embedding_config or self.embedding_service.get_default_embedding_config
         self.loading_service_factory = loading_service_factory or LoadingService
         self.chunking_service_factory = chunking_service_factory or ChunkingService
@@ -71,6 +75,7 @@ class PaperQAService:
             vector_store_service=self.vector_store_service,
             generation_service=self.generation_service,
             arxiv_service_factory=self.arxiv_service_factory,
+            oai_db_service=self.oai_db_service,
             get_embedding_config=self.get_embedding_config,
             loading_service_factory=self.loading_service_factory,
             chunking_service_factory=self.chunking_service_factory,
@@ -78,9 +83,11 @@ class PaperQAService:
         self.memory_runtime_config = get_memory_runtime_config()
 
     def _memory_flag(self, key: str, default: Any = None) -> Any:
+        """读取记忆相关运行时开关，避免在主流程中散落配置访问逻辑。"""
         return self.memory_runtime_config.get(key, default)
 
     def _build_memory_runtime_debug(self) -> Dict[str, Any]:
+        """构造当前记忆开关的调试快照，便于前端或日志观察实际生效配置。"""
         return {
             "enabled": True,
             "config": {
@@ -97,6 +104,7 @@ class PaperQAService:
 
     @staticmethod
     def _payload_get(payload: Any, key: str, default: Any = None) -> Any:
+        """兼容 dict 与对象两种 payload 访问方式，统一读取字段值。"""
         if payload is None:
             return default
         if isinstance(payload, dict):
@@ -105,9 +113,11 @@ class PaperQAService:
 
     @staticmethod
     def _resolve_user_id(value: Any = None) -> str:
+        """解析并兜底用户 ID，确保问答链路始终有稳定的用户标识。"""
         return str(value or get_default_user_id()).strip() or get_default_user_id()
 
     def _get_user_memory_summary(self, payload: Any) -> Dict[str, Any]:
+        """从请求负载中提取用户记忆摘要，兼容直接字段与嵌套 context 两种结构。"""
         direct_summary = self._payload_get(payload, "user_memory_summary", None)
         if isinstance(direct_summary, dict):
             return direct_summary
@@ -119,6 +129,7 @@ class PaperQAService:
         return {}
 
     def _get_preferred_answer_style(self, payload: Any) -> str:
+        """解析用户偏好的回答风格，优先使用本轮上下文，其次回退到长期画像。"""
         user_memory_summary = self._get_user_memory_summary(payload)
         profile = dict(user_memory_summary.get("profile") or {})
         preferred_answer_style = str(profile.get("preferred_answer_style") or "").strip()
@@ -135,6 +146,7 @@ class PaperQAService:
 
     @staticmethod
     def _apply_answer_style_to_question(question: str, preferred_answer_style: str) -> str:
+        """把用户偏好的回答风格附加到问题提示中，但保持事实必须受证据约束。"""
         style = str(preferred_answer_style or "").strip()
         normalized_question = str(question or "").strip()
         if not style:
@@ -142,12 +154,14 @@ class PaperQAService:
         return f"请使用{style}风格回答，但事实必须严格基于本轮检索到的论文证据。问题：{normalized_question}"
 
     def _resolve_chat_session(self, arxiv_id: str, payload: Any) -> Dict[str, Any]:
+        """解析或创建论文问答会话，优先复用当前论文下的活动会话。"""
         if not bool(self._memory_flag("enable_paper_chat_session", True)):
             return {}
         user_id = self._resolve_user_id(self._payload_get(payload, "user_id"))
         requested_session_id = str(self._payload_get(payload, "session_id", "") or "").strip()
         try:
             if requested_session_id:
+                # 调用方显式传入 session_id 时，先验证它是否确实属于当前论文与当前用户。
                 existing_session = self.db_service.get_paper_chat_session(requested_session_id, user_id=user_id)
                 if existing_session and existing_session.get("arxiv_id") == arxiv_id:
                     return existing_session
@@ -160,6 +174,7 @@ class PaperQAService:
             if recent_sessions:
                 return recent_sessions[0]
 
+            # 没有可复用会话时，按当前问题摘要创建一个新的论文对话会话。
             session_title = self._truncate_text(str(self._payload_get(payload, "question", "") or "").strip(), 80)
             created_session = self.db_service.create_paper_chat_session(
                 arxiv_id=arxiv_id,
@@ -184,6 +199,7 @@ class PaperQAService:
         contextualized_question: str,
         question_contextualization: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        """把一次完整问答轮次写入会话消息表，并返回最新会话状态。"""
         session_id = str(chat_session.get("session_id", "") or "").strip()
         user_id = self._resolve_user_id(chat_session.get("user_id"))
         if not bool(self._memory_flag("enable_paper_chat_session", True)) or not session_id:
@@ -195,6 +211,7 @@ class PaperQAService:
             }
         turn_id = str(uuid.uuid4())
         try:
+            # 用户问题和助手回答共享同一个 turn_id，便于后续追踪一整轮对话。
             user_message = self.db_service.append_paper_chat_message(
                 session_id=session_id,
                 user_id=user_id,
@@ -232,6 +249,7 @@ class PaperQAService:
             }
 
     def get_qa_status(self, arxiv_id: str) -> Dict[str, Any]:
+        """查询指定论文当前是否已完成 QA 索引构建，以及索引摘要信息。"""
         qa_index = self.db_service.get_paper_qa_index(arxiv_id)
         if qa_index:
             return {
@@ -304,6 +322,7 @@ class PaperQAService:
         return "\n\n".join(text_parts), image_inputs, asset_metadata
 
     def build_source_payload(self, search_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把检索结果整理成统一的来源载荷，供前端展示与会话持久化复用。"""
         return [
             {
                 "content": r.get("content", ""),
@@ -324,6 +343,7 @@ class PaperQAService:
 
     @staticmethod
     def _truncate_text(value: Any, max_length: int) -> str:
+        """压缩文本长度并清理多余空白，避免上下文与日志字段过长。"""
         text = re.sub(r"\s+", " ", str(value or "")).strip()
         if len(text) <= max_length:
             return text
@@ -331,6 +351,7 @@ class PaperQAService:
 
     @staticmethod
     def _extract_json_object(text: str) -> Dict[str, Any]:
+        """从模型输出中提取 JSON 对象，兼容 fenced code block 与裸 JSON 两种形式。"""
         normalized = str(text or "").strip()
         if not normalized:
             return {}
@@ -344,6 +365,7 @@ class PaperQAService:
         return json.loads(normalized)
 
     def _normalize_context_source(self, source: Any) -> Optional[Dict[str, Any]]:
+        """把历史轮次里的来源信息压缩为短期记忆可消费的统一结构。"""
         if not isinstance(source, dict):
             return None
         source_id = source.get("source_id", source.get("parent_chunk_id", source.get("chunk_id", source.get("id"))))
@@ -362,6 +384,7 @@ class PaperQAService:
         return normalized
 
     def _normalize_conversation_context(self, raw_context: Any) -> List[Dict[str, Any]]:
+        """规范化历史对话上下文，裁剪轮次数量与文本长度以控制提示规模。"""
         if not bool(self._memory_flag("enable_short_term_memory", True)):
             return []
         if not isinstance(raw_context, list):
@@ -403,6 +426,7 @@ class PaperQAService:
 
     @staticmethod
     def _looks_like_follow_up(question: str) -> bool:
+        """基于代词、长度和语气特征，粗略判断问题是否像追问。"""
         normalized = re.sub(r"\s+", " ", str(question or "")).strip()
         if not normalized:
             return False
@@ -418,6 +442,7 @@ class PaperQAService:
         conversation_context: List[Dict[str, Any]],
         referenced_source_ids: List[str],
     ) -> Dict[str, Any]:
+        """当模型改写失败时，使用最近一轮对话构造一个启发式追问改写结果。"""
         latest_turn = conversation_context[-1] if conversation_context else {}
         latest_question = str(latest_turn.get("question", "") or "").strip()
         latest_answer_summary = str(latest_turn.get("answer_summary", "") or "").strip()
@@ -450,6 +475,7 @@ class PaperQAService:
         paper_context: Dict[str, Any],
         conversation_context: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        """结合短期记忆把追问改写成自包含问题，供检索阶段直接使用。"""
         if not bool(self._memory_flag("enable_short_term_memory", True)):
             return {
                 "original_question": question,
@@ -480,6 +506,7 @@ class PaperQAService:
         source_lines: List[str] = []
         turn_lines: List[str] = []
         for index, turn in enumerate(conversation_context, start=1):
+            # 把历史轮次摘要化展开，交给模型判断当前问题是否需要借助上下文改写。
             turn_id = str(turn.get("turn_id", "") or "").strip()
             if turn_id:
                 referenced_turn_ids.append(turn_id)

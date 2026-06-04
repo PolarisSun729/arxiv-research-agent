@@ -1,3 +1,10 @@
+"""文档加载服务模块。
+
+该模块负责把原始 PDF 文件转换为标准化的页级结构数据。模块同时支持
+轻量的 PyMuPDF 路径和富结构的 Docling 路径，并尽量保留版面、文本行、
+图片、表格与页面尺寸等元信息，方便后续解析、切分和可解释检索流程复用。
+"""
+
 import json
 import logging
 import os
@@ -14,10 +21,18 @@ logger = logging.getLogger(__name__)
 
 class LoadingService:
     """
-    Load PDF documents with either PyMuPDF or Docling and keep the page structure intact.
+    负责加载 PDF，并尽可能保留页面级结构信息。
+
+    与只返回纯文本的加载器不同，这里会尽量把页面、行、版面、图片和表格
+    相关信息一起保留下来，方便后续做章节切分、资产抽取和可解释检索。
     """
 
     def __init__(self):
+        """初始化当前文档的页数缓存和页映射缓存。
+
+        返回:
+            None
+        """
         self.total_pages = 0
         self.current_page_map: List[Dict[str, Any]] = []
 
@@ -30,9 +45,26 @@ class LoadingService:
         chunking_options: dict = None,
     ) -> dict:
         """
-        Load a PDF document and return page-level structured data.
+        根据指定加载器读取 PDF，并返回统一的页级结构数据。
+
+        参数:
+            file_path (str): PDF 文件绝对路径或相对路径。
+            method (str): 加载方法，目前支持 pymupdf 和 docling。
+            strategy (str): 为兼容旧调用保留的策略字段。
+            chunking_strategy (str): 为兼容旧调用保留的切分策略字段。
+            chunking_options (dict): 为兼容旧调用保留的切分配置字段。
+
+        返回:
+            dict: 标准化后的文档对象，至少包含 pages、metadata 等核心字段。
+
+        异常:
+            ValueError: 当 method 不受支持时抛出。
+
+        这里故意把不同引擎的输出都收敛到同一数据模型，避免上层调用方
+        需要感知 PyMuPDF 与 Docling 的具体差异。
         """
         normalized_method = str(method or "pymupdf").strip().lower()
+        # 入口处做一次明确分发，避免后续流程判断实现细节。
         if normalized_method == "pymupdf":
             return self._load_with_pymupdf(file_path)
         if normalized_method == "docling":
@@ -40,17 +72,36 @@ class LoadingService:
         raise ValueError(f"Unsupported PDF loading method: {method}")
 
     def get_total_pages(self) -> int:
+        """返回当前已加载文档的总页数。
+
+        返回:
+            int: 当前缓存文档的总页数。
+        """
         return self.total_pages or (max(page_data["page"] for page_data in self.current_page_map) if self.current_page_map else 0)
 
     def get_page_map(self) -> list:
+        """返回当前缓存的页级结构数据。
+
+        返回:
+            list: 当前文档的 page_map。
+        """
         return self.current_page_map
 
     def to_full_text(self, document_data: Optional[dict] = None) -> str:
+        """把页级结构重新拼接成连续全文文本。
+
+        参数:
+            document_data (Optional[dict]): 指定文档对象；若为空则使用内部缓存。
+
+        返回:
+            str: 以双换行连接的全文文本。
+        """
         if document_data and isinstance(document_data, dict):
             pages = document_data.get("pages") or document_data.get("content") or []
         else:
             pages = self.current_page_map
 
+        # 这里只拼接有实际文本的页面，避免空白页把结果拉出多余空段。
         return "\n\n".join(
             page.get("text", "").strip()
             for page in pages
@@ -69,7 +120,23 @@ class LoadingService:
         document_data: Optional[dict] = None,
     ) -> str:
         """
-        Persist the loaded document, chunk metadata, and page map.
+        将加载结果、页映射和 chunk 元数据持久化到磁盘。
+
+        参数:
+            filename (str): 原始文档文件名。
+            chunks (list): 已生成的 chunk 列表。
+            metadata (dict): 文档元数据。
+            loading_method (str): 当前使用的加载方式。
+            strategy (str): 兼容旧流程的加载策略名。
+            chunking_strategy (str): 对应的切分策略名。
+            page_map (list): 待保存的页级结构；为空时使用当前缓存。
+            document_data (Optional[dict]): 上游完整文档对象，用于补充扩展字段。
+
+        返回:
+            str: 保存后的 JSON 文件路径。
+
+        保存后的 JSON 既能作为调试工件，也能作为后续步骤的中间产物，
+        方便复现实验和排查结构化结果问题。
         """
         try:
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -94,6 +161,8 @@ class LoadingService:
             }
 
             if isinstance(document_data, dict):
+                # 把原始 document_data 中的扩展字段一并保留下来，避免 Docling
+                # 等富结构加载路径的重要信息在保存时被裁掉。
                 for key, value in document_data.items():
                     if key in {
                         "filename",
@@ -125,11 +194,20 @@ class LoadingService:
             raise
 
     def _load_with_pymupdf(self, file_path: str) -> dict:
+        """使用 PyMuPDF 提取 PDF 页面文本与版面结构。
+
+        参数:
+            file_path (str): PDF 文件路径。
+
+        返回:
+            dict: 标准化后的文档对象。
+        """
         pages: List[Dict[str, Any]] = []
         try:
             with fitz.open(file_path) as doc:
                 self.total_pages = len(doc)
                 for page_num, page in enumerate(doc, start=1):
+                    # 每页单独归一化，后续 chunking/解析可以直接复用统一结构。
                     pages.append(self._extract_pymupdf_page(page, page_num, os.path.basename(file_path)))
 
             self.current_page_map = pages
@@ -144,6 +222,17 @@ class LoadingService:
             raise
 
     def _load_with_docling(self, file_path: str) -> dict:
+        """使用 Docling 解析 PDF，并保留文本、资产和结构化导出结果。
+
+        参数:
+            file_path (str): PDF 文件路径。
+
+        返回:
+            dict: 包含 pages、markdown、Docling 资产与导出信息的文档对象。
+
+        异常:
+            ImportError: 当运行环境未安装 docling 包时抛出。
+        """
         pages: List[Dict[str, Any]] = []
         try:
             try:
@@ -181,6 +270,7 @@ class LoadingService:
             docling_assets = self._extract_docling_assets(document, file_path, asset_root=docling_asset_root)
             annotated_pdf_enabled = bool(DOCLING_CONFIG.get("annotated_pdf_export_enabled", False))
             if annotated_pdf_enabled:
+                # 标注版 PDF 主要用于人工核查 Docling 的 bbox 和结构是否合理。
                 docling_annotated_pdf = self._export_docling_annotated_pdf(
                     source_path=file_path,
                     asset_root=docling_asset_root,
@@ -239,6 +329,7 @@ class LoadingService:
                 page_items = list(page_items_obj or [])
 
             if not page_items:
+                # 某些文档可能拿不到显式页面对象，这里退化为单页兜底输出。
                 fallback_text_items = docling_text_items_by_page.get(1, [])
                 fallback_text = self._compose_docling_page_text(fallback_text_items)
                 fallback_markdown = self._compose_docling_page_markdown(fallback_text_items)
@@ -264,6 +355,7 @@ class LoadingService:
                     raw_text = self._compose_docling_page_text(page_text_items)
                     markdown_text = self._compose_docling_page_markdown(page_text_items)
                     pages.append(
+                        # 单页记录尽量同时保留 text、markdown 和资产索引信息。
                         self._finalize_docling_page_record(
                             page_num=page_number,
                             filename=os.path.basename(file_path),
@@ -314,18 +406,38 @@ class LoadingService:
 
     def _enable_docling_enrichments(self, pipeline_options: Any) -> None:
         """
-        Docling enrichment switches are disabled for now so only the base parser runs.
+        预留的 Docling 增强开关入口。
+
+        参数:
+            pipeline_options (Any): Docling 的 PDF pipeline 配置对象。
+
+        返回:
+            None
+
+        当前项目先保持基础解析路径稳定，因此这里只记录说明，不主动开启
+        picture classification、formula enrichment 等额外处理流程。
         """
         _ = pipeline_options
         logger.info("Docling enrichments are disabled; running base parsing only.")
 
     def _extract_pymupdf_page(self, page, page_num: int, filename: str) -> Dict[str, Any]:
+        """抽取单页 PyMuPDF 结果，并补齐布局排序后的行级信息。
+
+        参数:
+            page: PyMuPDF 页面对象。
+            page_num (int): 当前页码。
+            filename (str): 来源文件名。
+
+        返回:
+            Dict[str, Any]: 单页标准化结果。
+        """
         page_width = float(page.rect.width)
         page_height = float(page.rect.height)
         raw_dict = page.get_text("dict")
         raw_text = page.get_text("text").strip()
         blocks = self._extract_pymupdf_blocks(raw_dict, page_num, filename, page_width, page_height)
         layout = self._detect_page_layout(blocks, page_width, page_height)
+        # 先检测单双栏，再排序 block，可显著降低论文类 PDF 的阅读顺序错误。
         ordered_blocks = self._order_blocks_by_layout(blocks, layout, page_width, page_height)
         lines = self._flatten_blocks_to_lines(ordered_blocks)
 
@@ -348,6 +460,18 @@ class LoadingService:
         page_width: float,
         page_height: float,
     ) -> List[Dict[str, Any]]:
+        """把 PyMuPDF 的原始 block/line/span 结构归一为文本块列表。
+
+        参数:
+            raw_dict (Dict[str, Any]): ``page.get_text('dict')`` 的原始结果。
+            page_num (int): 当前页码。
+            filename (str): 来源文件名。
+            page_width (float): 页面宽度。
+            page_height (float): 页面高度。
+
+        返回:
+            List[Dict[str, Any]]: 归一化后的文本块列表。
+        """
         blocks: List[Dict[str, Any]] = []
         for block_no, block in enumerate(raw_dict.get("blocks", [])):
             if block.get("type") != 0:
@@ -383,6 +507,7 @@ class LoadingService:
                     }
                 )
 
+            # 同一视觉行可能被拆成多个 span/line，这里先做一次块内合并。
             merged_block_lines = self._merge_block_line_fragments(block_lines)
             if not merged_block_lines:
                 continue
@@ -422,6 +547,14 @@ class LoadingService:
         return blocks
 
     def _merge_block_line_fragments(self, lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """合并被提取器错误切碎、但视觉上仍属于同一行的片段。
+
+        参数:
+            lines (List[Dict[str, Any]]): 原始行片段列表。
+
+        返回:
+            List[Dict[str, Any]]: 合并后的行列表。
+        """
         if not lines:
             return []
 
@@ -446,6 +579,7 @@ class LoadingService:
                 current_group.append(line)
                 continue
 
+            # 一旦判断不在同一视觉行，就把当前组收束成一条标准化记录。
             merged_lines.append(self._merge_line_group(current_group))
             current_group = [line]
 
@@ -455,6 +589,14 @@ class LoadingService:
         return merged_lines
 
     def _merge_line_group(self, group: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """把同一视觉行中的多个片段合并为单条 line 记录。
+
+        参数:
+            group (List[Dict[str, Any]]): 属于同一视觉行的片段列表。
+
+        返回:
+            Dict[str, Any]: 合并后的行记录。
+        """
         if not group:
             return {}
 
@@ -480,6 +622,15 @@ class LoadingService:
         return merged
 
     def _is_same_visual_row(self, first: Dict[str, Any], second: Dict[str, Any]) -> bool:
+        """根据 bbox、字体和水平间距判断两个片段是否属于同一视觉行。
+
+        参数:
+            first (Dict[str, Any]): 前一个片段。
+            second (Dict[str, Any]): 后一个片段。
+
+        返回:
+            bool: 若两者应合并为同一行则返回 True。
+        """
         first_bbox = first.get("bbox") if isinstance(first.get("bbox"), (list, tuple)) and len(first.get("bbox")) >= 4 else None
         second_bbox = second.get("bbox") if isinstance(second.get("bbox"), (list, tuple)) and len(second.get("bbox")) >= 4 else None
         if not first_bbox or not second_bbox:
@@ -583,6 +734,17 @@ class LoadingService:
         page_width: float,
         page_height: float,
     ) -> List[Dict[str, Any]]:
+        """按页面版式重新排序 block，尽量还原自然阅读顺序。
+
+        参数:
+            blocks (List[Dict[str, Any]]): 文本块列表。
+            layout (Dict[str, Any]): 页面布局判定结果。
+            page_width (float): 页面宽度。
+            page_height (float): 页面高度。
+
+        返回:
+            List[Dict[str, Any]]: 按阅读顺序重排后的块列表。
+        """
         if not blocks:
             return []
 
@@ -619,6 +781,7 @@ class LoadingService:
                 return 1
             return 1 if center_x < split_x else 2
 
+        # 多栏场景下先按“通栏标题/左栏/右栏/尾部通栏”粗分，再在各 lane 内排序。
         return sorted(
             blocks,
             key=lambda block: (
@@ -630,6 +793,14 @@ class LoadingService:
         )
 
     def _flatten_blocks_to_lines(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """将 block 级结构扁平化为带上下文的 line 列表。
+
+        参数:
+            blocks (List[Dict[str, Any]]): 块级结构列表。
+
+        返回:
+            List[Dict[str, Any]]: 行级结构列表。
+        """
         lines: List[Dict[str, Any]] = []
         for block in blocks:
             block_lines = block.get("lines")
@@ -656,6 +827,14 @@ class LoadingService:
         ]
 
     def _join_text_fragments(self, parts: List[str]) -> str:
+        """把相邻文本片段拼成自然字符串，并处理断词和标点衔接。
+
+        参数:
+            parts (List[str]): 待拼接的文本片段。
+
+        返回:
+            str: 拼接并规范空白后的文本。
+        """
         if not parts:
             return ""
 
@@ -687,6 +866,21 @@ class LoadingService:
         layout_mode: Optional[str] = None,
         layout_info: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """整理 PyMuPDF 页面记录，输出统一 page_map 结构。
+
+        参数:
+            page_num (int): 当前页码。
+            filename (str): 来源文件名。
+            raw_text (str): 原始全文本。
+            lines (List[Dict[str, Any]]): 已排序的行列表。
+            page_width (Optional[float]): 页面宽度。
+            page_height (Optional[float]): 页面高度。
+            layout_mode (Optional[str]): 布局模式。
+            layout_info (Optional[Dict[str, Any]]): 布局细节。
+
+        返回:
+            Dict[str, Any]: 标准化后的页记录。
+        """
         normalized_lines: List[Dict[str, Any]] = []
         for index, line in enumerate(lines, start=1):
             text = str(line.get("text", "")).strip()
@@ -714,6 +908,7 @@ class LoadingService:
             normalized_line.setdefault("line_no", index)
             normalized_lines.append(normalized_line)
 
+        # 某些论文标题编号会被拆行，最后再补一轮 heading 合并，提升标题完整性。
         normalized_lines = self._merge_heading_number_lines(normalized_lines)
         final_text = "\n".join(line["text"] for line in normalized_lines).strip() or raw_text
         page_record: Dict[str, Any] = {
@@ -750,6 +945,23 @@ class LoadingService:
         page_width: Optional[float] = None,
         page_height: Optional[float] = None,
     ) -> Dict[str, Any]:
+        """整理 Docling 页面记录，保留 markdown 和资产引用信息。
+
+        参数:
+            page_num (int): 当前页码。
+            filename (str): 来源文件名。
+            raw_text (str): 原始文本。
+            markdown_text (str): Markdown 形式文本。
+            lines (List[Dict[str, Any]]): 行级结构。
+            docling_text_items (Optional[List[Dict[str, Any]]]): 文本项列表。
+            docling_picture_items (Optional[List[Dict[str, Any]]]): 图片项列表。
+            docling_table_items (Optional[List[Dict[str, Any]]]): 表格项列表。
+            page_width (Optional[float]): 页面宽度。
+            page_height (Optional[float]): 页面高度。
+
+        返回:
+            Dict[str, Any]: 标准化后的 Docling 页记录。
+        """
         normalized_lines: List[Dict[str, Any]] = []
         for index, line in enumerate(lines, start=1):
             text = str(line.get("text", "")).strip()
@@ -789,6 +1001,16 @@ class LoadingService:
         return page_record
 
     def _safe_docling_export(self, document: Any, export_type: str, page_no: Optional[int] = None) -> str:
+        """安全调用 Docling 导出接口，失败时返回空字符串而不是中断主流程。
+
+        参数:
+            document (Any): Docling 文档对象。
+            export_type (str): 导出类型，目前支持 text 和 markdown。
+            page_no (Optional[int]): 可选页码；为空时导出全文。
+
+        返回:
+            str: 导出的文本结果；失败时返回空字符串。
+        """
         if document is None:
             return ""
 
@@ -806,6 +1028,16 @@ class LoadingService:
         return ""
 
     def _extract_docling_assets(self, document: Any, source_path: str, asset_root: Optional[str] = None) -> Dict[str, Any]:
+        """抽取 Docling 文本项、图片项和表格项，并生成资产清单。
+
+        参数:
+            document (Any): Docling 文档对象。
+            source_path (str): 原始 PDF 路径。
+            asset_root (Optional[str]): 资产导出根目录。
+
+        返回:
+            Dict[str, Any]: 包含文本项、图片项、表格项和资产统计清单的结果。
+        """
         asset_root = asset_root or self._build_docling_asset_root(source_path)
         raw_picture_items = list(getattr(document, "pictures", []) or [])
         raw_table_items = list(getattr(document, "tables", []) or [])
@@ -836,6 +1068,16 @@ class LoadingService:
         }
 
     def _export_docling_document(self, document: Any, asset_root: str, source_path: str) -> Dict[str, Any]:
+        """把完整 Docling 文档对象导出为 JSON，便于调试和复现。
+
+        参数:
+            document (Any): Docling 文档对象。
+            asset_root (str): 资产导出根目录。
+            source_path (str): 原始 PDF 路径。
+
+        返回:
+            Dict[str, Any]: 导出状态、输出路径与采用的导出方式。
+        """
         export_dir = os.path.join(asset_root, "document")
         os.makedirs(export_dir, exist_ok=True)
 
@@ -887,6 +1129,19 @@ class LoadingService:
         picture_items: List[Dict[str, Any]],
         table_items: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        """导出带版面框标注的 PDF，方便人工校验结构识别结果。
+
+        参数:
+            source_path (str): 原始 PDF 路径。
+            asset_root (str): 资产根目录。
+            document_json_path (Optional[str]): 导出的 Docling JSON 路径。
+            text_items (List[Dict[str, Any]]): 文本项列表。
+            picture_items (List[Dict[str, Any]]): 图片项列表。
+            table_items (List[Dict[str, Any]]): 表格项列表。
+
+        返回:
+            Dict[str, Any]: 标注 PDF 的导出状态和输出路径。
+        """
         export_dir = os.path.join(asset_root, "document")
         os.makedirs(export_dir, exist_ok=True)
         output_path = os.path.join(export_dir, "annotated_layout.pdf")
@@ -969,6 +1224,7 @@ class LoadingService:
                     page.draw_rect(rect, color=box["color"], width=float(box["line_width"]), overlay=True)
                     legend_entries.append((box["label"], box["color"]))
 
+                # 每页都绘制图例，便于直接在导出的 PDF 中理解颜色含义。
                 self._draw_docling_annotation_legend(page, legend_entries)
 
             annotated_pdf.save(output_path)
@@ -1016,6 +1272,14 @@ class LoadingService:
             }
 
     def _load_json_file(self, path: Optional[str]) -> Any:
+        """安全加载 JSON 文件，失败时返回 None。
+
+        参数:
+            path (Optional[str]): JSON 文件路径。
+
+        返回:
+            Any: 解析后的对象；加载失败或文件不存在时返回 None。
+        """
         if not path or not os.path.exists(path):
             return None
         try:
@@ -1026,6 +1290,14 @@ class LoadingService:
             return None
 
     def _get_docling_annotation_style(self, category: Optional[str]) -> Dict[str, Any]:
+        """根据元素类别返回标注颜色、标签和线宽配置。
+
+        参数:
+            category (Optional[str]): 元素类别，例如 title、body、picture、table。
+
+        返回:
+            Dict[str, Any]: 标注样式配置。
+        """
         normalized = str(category or "body").strip().lower()
         if normalized in {"title", "heading"}:
             return {"kind": "title", "label": "标题 / Title", "color": (0.14, 0.36, 0.84), "line_width": 1.8}
@@ -1036,6 +1308,15 @@ class LoadingService:
         return {"kind": "body", "label": "正文 / Body", "color": (0.32, 0.32, 0.32), "line_width": 0.9}
 
     def _draw_docling_annotation_legend(self, page: Any, legend_entries: List[tuple[str, tuple[float, float, float]]]) -> None:
+        """在标注 PDF 页面右上角绘制颜色图例。
+
+        参数:
+            page (Any): PyMuPDF 页面对象。
+            legend_entries (List[tuple[str, tuple[float, float, float]]]): 图例标签与颜色列表。
+
+        返回:
+            None
+        """
         try:
             seen_labels: List[str] = []
             deduped_entries: List[tuple[str, tuple[float, float, float]]] = []
@@ -1092,6 +1373,14 @@ class LoadingService:
             logger.warning("Failed to draw Docling annotation legend: %s", exc)
 
     def _collect_docling_bbox_candidates(self, item: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """从标准化条目中提取可用于标注的 bbox 候选框。
+
+        参数:
+            item (Dict[str, Any]): 单个文本、图片或表格条目。
+
+        返回:
+            List[Dict[str, Any]]: 可用于标注导出的 bbox 候选列表。
+        """
         candidates: List[Dict[str, Any]] = []
         if not isinstance(item, dict):
             return candidates
@@ -1133,6 +1422,14 @@ class LoadingService:
         return candidates
 
     def _collect_docling_bbox_candidates_from_raw_json(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """从原始 Docling JSON 中提取 bbox 候选框。
+
+        参数:
+            data (Dict[str, Any]): 已加载的 Docling JSON 数据。
+
+        返回:
+            List[Dict[str, Any]]: 原始 JSON 中的 bbox 候选列表。
+        """
         candidates: List[Dict[str, Any]] = []
         if not isinstance(data, dict):
             return candidates
@@ -1171,6 +1468,14 @@ class LoadingService:
         return candidates
 
     def _docling_annotation_category(self, item: Dict[str, Any]) -> str:
+        """推断条目在标注 PDF 中应归属的类别。
+
+        参数:
+            item (Dict[str, Any]): 单个标准化条目。
+
+        返回:
+            str: 归一化后的标注类别。
+        """
         if not isinstance(item, dict):
             return "body"
 

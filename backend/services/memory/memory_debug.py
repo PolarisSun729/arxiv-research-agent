@@ -6,6 +6,7 @@ from services.memory.memory_models import MemoryDebugPayload
 
 
 def _build_profile_debug(profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """统计用户画像的关键装载信息，便于快速判断画像数据是否可用。"""
     loaded = profile is not None
     profile = profile or {}
     return {
@@ -19,6 +20,7 @@ def _build_profile_debug(profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _build_preference_debug(preference_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """整理偏好摘要的调试指标，方便观察点赞/点踩与动作记忆是否加载成功。"""
     loaded = preference_summary is not None
     preference_summary = preference_summary or {}
     counts = dict(preference_summary.get("counts") or {})
@@ -32,6 +34,7 @@ def _build_preference_debug(preference_summary: Optional[Dict[str, Any]]) -> Dic
 
 
 def _build_notes_debug(paper_notes: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """汇总论文笔记的装载情况与笔记类型分布。"""
     loaded = paper_notes is not None
     paper_notes = paper_notes or []
     return {
@@ -42,6 +45,7 @@ def _build_notes_debug(paper_notes: Optional[List[Dict[str, Any]]]) -> Dict[str,
 
 
 def _build_chat_debug(paper_chat_history: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """汇总论文对话历史的会话与消息规模，便于定位短期记忆来源。"""
     loaded = paper_chat_history is not None
     paper_chat_history = paper_chat_history or {}
     selected_session = paper_chat_history.get("selected_session") or {}
@@ -65,6 +69,7 @@ def build_memory_debug_payload(
     frontend_context: Optional[Dict[str, Any]] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """构造统一的记忆调试载荷，汇总后端装载源与前端上下文键集合。"""
     payload = MemoryDebugPayload(
         user_id=user_id,
         arxiv_id=arxiv_id,

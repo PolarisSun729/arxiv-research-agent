@@ -1,3 +1,11 @@
+"""文档切分服务模块。
+
+该模块负责把已经标准化的页级文档结构转换为适合检索、向量化和入库的
+chunk 数据。这里不仅处理普通文本切分，还统一维护章节恢复、超长文本
+拆分、图片/表格资产补充以及元数据继承等逻辑，确保下游 embedding 流程
+拿到的每一个 chunk 都具备稳定的结构和可追踪来源。
+"""
+
 from datetime import datetime
 import logging
 import re
@@ -14,7 +22,13 @@ CHUNK_OVERLAP_LENGTH = CHUNKING_CONFIG["chunk_overlap_length"]
 
 class ChunkingService:
     """
-    Chunk PDF pages using page and heading structure only.
+    将页级文档结构切分为适合检索和向量化的 chunk。
+
+    除了常规文本切分外，这个服务还负责：
+    1. 统一 page_map 输入格式；
+    2. 识别标题或 Docling section 结构；
+    3. 为图片、表格等资产生成可检索的补充 chunk；
+    4. 在 chunk 过长时继续拆分，并保留父子 chunk 关系。
     """
 
     def chunk_pymupdf(
@@ -25,6 +39,22 @@ class ChunkingService:
         method: str = "by_titles",
         chunk_size: int = 500,
     ) -> dict:
+        """使用 PyMuPDF 页面结构执行切分。
+
+        参数:
+            text (Union[str, dict]): 原始文本或已带结构的文档对象。
+            metadata (dict): 文档元数据，至少应包含文件名、来源等信息。
+            page_map (list): 页级结构列表；若为空，将尝试从 ``text`` 中推断。
+            method (str): 切分策略，例如 by_titles、by_pages 等。
+            chunk_size (int): 目标切分粒度，通常表示词数或句群规模。
+
+        返回:
+            dict: 标准化的切分结果，包含 pages、chunks 及统计信息。
+
+        说明:
+            这里只做入口适配：先补齐 ``loading_method``，再统一委托给
+            ``chunk_text``，避免不同加载器维护各自独立的切分入口。
+        """
         pymupdf_metadata = dict(metadata or {})
         pymupdf_metadata["loading_method"] = "pymupdf"
         return self.chunk_text(
@@ -42,6 +72,21 @@ class ChunkingService:
         page_map: list = None,
         chunk_size: int = 500,
     ) -> dict:
+        """使用 Docling 结构执行切分。
+
+        参数:
+            text (Union[str, dict]): Docling 解析后的文档对象或兼容结构。
+            metadata (dict): 文档元数据。
+            page_map (list): 页级结构数据。
+            chunk_size (int): 目标切分粒度。
+
+        返回:
+            dict: 标准化的切分结果。
+
+        说明:
+            Docling 输出自带更强的章节、图片和表格结构，因此这里固定走
+            ``docling_sections`` 逻辑，让下游优先利用 richer structure。
+        """
         docling_metadata = dict(metadata or {})
         docling_metadata["loading_method"] = "docling"
         return self.chunk_text(
@@ -60,6 +105,25 @@ class ChunkingService:
         page_map: list = None,
         chunk_size: int = 500,
     ) -> dict:
+        """根据指定策略将输入文本或页结构切分为标准 chunk 结果。
+
+        参数:
+            text (Union[str, dict]): 原始文本、文档结构对象或 Docling 结果。
+            method (str): 切分方法，例如 by_titles、fixed_size、by_pages。
+            metadata (dict): 文档元数据。
+            page_map (list): 页级结构列表；若为空则会尝试从 ``text`` 提取。
+            chunk_size (int): 切分粒度配置。
+
+        返回:
+            dict: 统一格式的切分结果，包含 chunk 列表及文档级统计字段。
+
+        异常:
+            ValueError: 当无法构造 page_map 或 method 不受支持时抛出。
+
+        说明:
+            这是整个切分流程的统一入口：先规范化页面数据，再按 loading
+            方法或 chunking method 做策略分发，最后统一补齐输出元数据。
+        """
         try:
             normalized_page_map = self._normalize_page_map(text, page_map)
             if not normalized_page_map:
@@ -68,6 +132,8 @@ class ChunkingService:
             filename = metadata.get("filename", "")
             source_name = metadata.get("filename", "") or metadata.get("source", "")
             loading_method = str(metadata.get("loading_method", "") or "").strip().lower()
+
+            # Docling 的结构信息更完整，优先使用其 section/asset 逻辑。
             if loading_method == "docling":
                 chunks = self._chunk_docling_sections(text, normalized_page_map, source_name, chunk_size)
             elif method == "by_pages":
@@ -104,6 +170,23 @@ class ChunkingService:
         chunking_method: str,
         pages: List[Dict[str, Any]],
     ) -> dict:
+        """统一补齐 chunk 元数据，并对超长 chunk 做二次展开。
+
+        参数:
+            filename (str): 文档文件名。
+            chunks (List[Dict[str, Any]]): 各策略返回的初始 chunk 列表。
+            total_pages (int): 文档总页数。
+            loading_method (str): 上游加载方式。
+            chunking_method (str): 当前采用的切分策略。
+            pages (List[Dict[str, Any]]): 标准化后的页级结构。
+
+        返回:
+            dict: 可直接供下游保存或向量化的统一切分结果。
+
+        说明:
+            这里负责把各个 chunking 策略返回的“半成品 chunk”整理成统一格式，
+            包括 chunk 序号、总数、父子 chunk 关系以及最终输出的公共字段。
+        """
         for index, chunk in enumerate(chunks, start=1):
             chunk.setdefault("content", str(chunk.get("content", "") or ""))
             metadata = chunk.setdefault("metadata", {})
@@ -112,6 +195,7 @@ class ChunkingService:
             chunk["metadata"]["chunk_id"] = index
             chunk["metadata"]["total_chunks"] = len(chunks)
 
+        # 首轮 chunk 可能仍然过长，这里统一执行二次拆分并保留重叠窗口。
         chunks = self._expand_overlong_chunks(
             chunks,
             max_length=MAX_CHUNK_CONTENT_LENGTH,
@@ -120,6 +204,7 @@ class ChunkingService:
 
         for index, chunk in enumerate(chunks, start=1):
             metadata = chunk["metadata"]
+            # 二次拆分后重新分配最终 chunk 编号，保证输出序列连续可用。
             metadata["chunk_index"] = index
             metadata["chunk_id"] = index
             metadata["total_chunks"] = len(chunks)
@@ -150,6 +235,16 @@ class ChunkingService:
         max_length: int,
         overlap: int,
     ) -> List[Dict[str, Any]]:
+        """把超过长度阈值的 chunk 继续拆成多个子 chunk。
+
+        参数:
+            chunks (List[Dict[str, Any]]): 初始 chunk 列表。
+            max_length (int): 单个 chunk 允许的最大字符长度。
+            overlap (int): 相邻子 chunk 之间的重叠长度。
+
+        返回:
+            List[Dict[str, Any]]: 展开后的 chunk 列表。
+        """
         expanded: List[Dict[str, Any]] = []
         for chunk in chunks:
             content = str(chunk.get("content", "") or "")
@@ -157,6 +252,7 @@ class ChunkingService:
             parent_chunk_id = int(metadata.get("chunk_id", metadata.get("chunk_index", len(expanded) + 1)))
 
             if len(content) <= max_length:
+                # 未超长的 chunk 也显式补齐 parent/subchunk 信息，方便下游统一处理。
                 metadata["parent_chunk_id"] = parent_chunk_id
                 metadata["subchunk_index"] = 1
                 metadata["subchunk_count"] = 1
@@ -168,6 +264,7 @@ class ChunkingService:
             parts = self._split_overlong_content(content, max_length=max_length, overlap=overlap)
             part_count = len(parts)
             for part_index, part in enumerate(parts, start=1):
+                # 子 chunk 继承父 chunk 的上下文元数据，同时补充拆分位置信息。
                 part_metadata = {
                     **metadata,
                     "parent_chunk_id": parent_chunk_id,
@@ -181,6 +278,16 @@ class ChunkingService:
         return expanded
 
     def _split_overlong_content(self, text: str, max_length: int, overlap: int) -> List[str]:
+        """按字符长度拆分超长文本，并尽量在自然边界处断开。
+
+        参数:
+            text (str): 待拆分文本。
+            max_length (int): 单段最大长度。
+            overlap (int): 相邻片段保留的重叠长度。
+
+        返回:
+            List[str]: 拆分后的文本片段列表。
+        """
         normalized = (text or "").replace("\r\n", "\n").strip()
         if not normalized:
             return [""]
@@ -194,6 +301,7 @@ class ChunkingService:
         while start < text_length:
             end = min(start + max_length, text_length)
             if end < text_length:
+                # 优先把切分点挪到段落、句子或空格边界，降低语义破碎度。
                 boundary = self._find_split_boundary(normalized, start, end)
                 if boundary > start:
                     end = boundary
@@ -205,12 +313,24 @@ class ChunkingService:
             if end >= text_length:
                 break
 
+            # 通过 overlap 让相邻子块共享少量上下文，改善检索召回效果。
             next_start = max(end - overlap, start + 1)
             start = next_start
 
         return parts or [normalized[:max_length]]
 
     def _find_split_boundary(self, text: str, start: int, end: int, search_window: int = CHUNKING_CONFIG["split_search_window"]) -> int:
+        """在候选窗口内寻找最合适的自然断点。
+
+        参数:
+            text (str): 完整文本。
+            start (int): 当前片段起点。
+            end (int): 当前片段原始终点。
+            search_window (int): 允许向前回溯寻找断点的窗口大小。
+
+        返回:
+            int: 推荐切分位置；若找不到更优断点，则返回接近原始终点的值。
+        """
         lower = max(start + 1, end - search_window)
         candidates = ["\n\n", "\n", "。", "！", "？", ". ", "! ", "? ", " "]
         best = start
@@ -225,6 +345,15 @@ class ChunkingService:
         return best
 
     def _normalize_page_map(self, text: Union[str, dict], page_map: Optional[list]) -> List[Dict[str, Any]]:
+        """把多种输入形态统一转换成标准 page_map。
+
+        参数:
+            text (Union[str, dict]): 原始文本或结构对象。
+            page_map (Optional[list]): 已提供的页级结构。
+
+        返回:
+            List[Dict[str, Any]]: 标准化后的页级结构列表。
+        """
         if page_map:
             normalized = []
             for page in page_map:
@@ -260,6 +389,21 @@ class ChunkingService:
         chunking_method: str,
         extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """构造 chunk 的公共元数据骨架。
+
+        参数:
+            source (str): 文档来源标识。
+            page_start (int): chunk 起始页。
+            page_end (int): chunk 结束页。
+            chunk_text (str): chunk 正文。
+            chunk_index (int): chunk 序号。
+            total_chunks (int): chunk 总数。
+            chunking_method (str): 切分方法名。
+            extra_metadata (Optional[Dict[str, Any]]): 额外补充字段。
+
+        返回:
+            Dict[str, Any]: 统一格式的 chunk 元数据。
+        """
         metadata = {
             "source": source,
             "document_name": source,
@@ -278,6 +422,15 @@ class ChunkingService:
         return metadata
 
     def _chunk_by_pages(self, normalized_page_map: List[Dict[str, Any]], source_name: str) -> List[Dict[str, Any]]:
+        """按页切分，每页生成一个 chunk。
+
+        参数:
+            normalized_page_map (List[Dict[str, Any]]): 标准化后的页级结构。
+            source_name (str): 文档来源名。
+
+        返回:
+            List[Dict[str, Any]]: 每页一个 chunk 的结果列表。
+        """
         chunks: List[Dict[str, Any]] = []
         for page in normalized_page_map:
             text = self._page_text(page)
@@ -307,6 +460,16 @@ class ChunkingService:
         source_name: str,
         chunk_size: int,
     ) -> List[Dict[str, Any]]:
+        """按固定词数窗口切分每一页文本。
+
+        参数:
+            normalized_page_map (List[Dict[str, Any]]): 标准化后的页级结构。
+            source_name (str): 文档来源名。
+            chunk_size (int): 目标词数窗口大小。
+
+        返回:
+            List[Dict[str, Any]]: 固定大小切分结果。
+        """
         chunks: List[Dict[str, Any]] = []
         for page in normalized_page_map:
             text = self._page_text(page)
@@ -340,6 +503,16 @@ class ChunkingService:
         source_name: str,
         chunk_size: int,
     ) -> List[Dict[str, Any]]:
+        """根据标题结构切分文本，并在章节内继续按句群分块。
+
+        参数:
+            normalized_page_map (List[Dict[str, Any]]): 标准化后的页级结构。
+            source_name (str): 文档来源名。
+            chunk_size (int): 章节内二次切分粒度。
+
+        返回:
+            List[Dict[str, Any]]: 按标题组织后的 chunk 列表。
+        """
         lines = self._merge_heading_fragments(self._flatten_document_lines(normalized_page_map))
         if not lines:
             return []
@@ -354,6 +527,7 @@ class ChunkingService:
             if not current_lines:
                 return
 
+            # 标题单独作为结构锚点保留，但正文切分主要基于标题之后的内容。
             section_lines = current_lines[1:] if current_title else current_lines
             section_body = self._compose_text_from_lines(section_lines).strip()
             section_title = current_title or "Preamble"
@@ -416,6 +590,7 @@ class ChunkingService:
             #     current_lines = [line]
             #     continue
 
+            # 当前策略仅把二级标题作为正式切分点，避免一级标题过粗导致块太大。
             if heading_level == 2:
                 flush_section()
                 current_title = text
@@ -438,6 +613,17 @@ class ChunkingService:
         source_name: str,
         chunk_size: int,
     ) -> List[Dict[str, Any]]:
+        """优先使用 Docling 的结构化 section 信息生成 chunk。
+
+        参数:
+            text (Union[str, dict]): Docling 文档对象或兼容结构。
+            normalized_page_map (List[Dict[str, Any]]): 标准化后的页级结构。
+            source_name (str): 文档来源名。
+            chunk_size (int): section 内部切分粒度。
+
+        返回:
+            List[Dict[str, Any]]: 基于 Docling section 和资产扩展生成的 chunk 列表。
+        """
         docling_items = self._collect_docling_items(text, normalized_page_map)
         if not docling_items:
             return self._chunk_by_titles(normalized_page_map, source_name, chunk_size)
@@ -448,6 +634,7 @@ class ChunkingService:
 
         chunks: List[Dict[str, Any]] = []
         for section in sections:
+            # Docling section 已经保留了章节路径和页码范围，适合直接作为主干 chunk。
             section_chunks = self._split_docling_section(section, chunk_size)
             section_part_count = len(section_chunks)
             if not section_part_count:
@@ -481,6 +668,7 @@ class ChunkingService:
                     }
                 )
 
+        # 文本 section 之外，还会为图片/表格资产生成补充 chunk，增强多模态召回。
         asset_chunks = self._build_docling_asset_chunks(
             text=text,
             normalized_page_map=normalized_page_map,
@@ -496,6 +684,17 @@ class ChunkingService:
         source_name: str,
         sections: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """把 Docling 抽取的图片和表格资产转换为可检索的文本 chunk。
+
+        参数:
+            text (Union[str, dict]): Docling 文档对象或兼容结构。
+            normalized_page_map (List[Dict[str, Any]]): 标准化页级结构。
+            source_name (str): 文档来源名。
+            sections (List[Dict[str, Any]]): 已生成的 section 结构。
+
+        返回:
+            List[Dict[str, Any]]: 图片/表格对应的扩展 chunk 列表。
+        """
         asset_chunks: List[Dict[str, Any]] = []
         assets = self._collect_docling_assets(text=text, normalized_page_map=normalized_page_map)
         for asset in assets:
@@ -512,6 +711,9 @@ class ChunkingService:
             section_path = str(section.get("path", "") or "").strip()
             asset_summary = self._normalize_asset_summary(asset)
             asset_preview_text = self._build_asset_preview_text(asset)
+
+            # 资产 chunk 通过摘要、预览文本、章节锚点拼出“可向量化描述”，
+            # 让图片/表格即使没有纯正文，也能参与召回。
             content = self._build_docling_asset_content(
                 asset=asset,
                 chunk_type=chunk_type,
@@ -562,6 +764,15 @@ class ChunkingService:
         text: Union[str, dict],
         normalized_page_map: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """从文档级或页级结构中汇总 Docling 资产并做去重。
+
+        参数:
+            text (Union[str, dict]): 文档级结构对象。
+            normalized_page_map (List[Dict[str, Any]]): 页级结构列表。
+
+        返回:
+            List[Dict[str, Any]]: 去重并排序后的资产列表。
+        """
         collected: List[Dict[str, Any]] = []
         seen: set[tuple] = set()
 
@@ -607,6 +818,15 @@ class ChunkingService:
         asset: Dict[str, Any],
         sections: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        """为资产找到最接近的章节上下文。
+
+        参数:
+            asset (Dict[str, Any]): 单个图片或表格资产。
+            sections (List[Dict[str, Any]]): 已构建的章节列表。
+
+        返回:
+            Dict[str, Any]: 最匹配的 section；若无匹配则返回空字典。
+        """
         if not sections:
             return {}
 
@@ -674,6 +894,19 @@ class ChunkingService:
         section_title: str,
         section_path: str,
     ) -> str:
+        """把图片或表格资产整理成适合向量化的描述文本。
+
+        参数:
+            asset (Dict[str, Any]): 单个资产记录。
+            chunk_type (str): 资产转出的 chunk 类型，例如 figure 或 table。
+            asset_summary (str): 资产摘要。
+            asset_preview_text (str): 表格预览或补充说明。
+            section_title (str): 资产所在章节标题。
+            section_path (str): 资产所在章节路径。
+
+        返回:
+            str: 可直接送入 embedding 的描述文本。
+        """
         page_text = f"page {int(asset.get('page_start') or asset.get('page') or 1)}"
         anchor_parts = [part for part in [section_title, section_path, page_text] if part]
         anchor_text = " | ".join(self._dedupe_text_units(anchor_parts))
@@ -714,6 +947,15 @@ class ChunkingService:
         text: Union[str, dict],
         normalized_page_map: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """收集 Docling 文本项，并过滤噪声与重复项。
+
+        参数:
+            text (Union[str, dict]): 文档级结构对象。
+            normalized_page_map (List[Dict[str, Any]]): 标准化页级结构。
+
+        返回:
+            List[Dict[str, Any]]: 归一化、去重并排序后的文本项列表。
+        """
         collected: List[Dict[str, Any]] = []
         seen: set[tuple] = set()
 
@@ -771,6 +1013,14 @@ class ChunkingService:
         return collected
 
     def _normalize_docling_item(self, item: Any) -> Optional[Dict[str, Any]]:
+        """把不同形态的 Docling item 归一为统一字段集合。
+
+        参数:
+            item (Any): 原始 Docling 文本项对象或字典。
+
+        返回:
+            Optional[Dict[str, Any]]: 归一化结果；若无有效文本则返回 None。
+        """
         if not isinstance(item, dict):
             return None
 
@@ -790,6 +1040,7 @@ class ChunkingService:
         heading_candidate = self._is_docling_heading_candidate(text, heading_level)
         caption_labels = {"caption", "table_caption", "figure_caption"}
 
+        # 先基于显式标签和角色判断，再用启发式补足 heading 分类。
         if label in caption_labels:
             node_kind = "caption"
         elif node_kind == "title":
@@ -807,6 +1058,7 @@ class ChunkingService:
         else:
             node_kind = "paragraph"
 
+        # 图片/表格上下文中的短文本更可能是说明文字，不应误判为章节标题。
         if self._docling_parent_is_visual_context(parent) and node_kind == "section_header":
             if label not in caption_labels:
                 node_kind = "paragraph"
@@ -892,6 +1144,14 @@ class ChunkingService:
         return 1
 
     def _build_docling_sections(self, docling_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """根据归一化后的 Docling item 构建章节树的线性 section 结果。
+
+        参数:
+            docling_items (List[Dict[str, Any]]): 已归一化的 Docling 文本项。
+
+        返回:
+            List[Dict[str, Any]]: 线性 section 列表，每项都保留标题路径和页码范围。
+        """
         sections: List[Dict[str, Any]] = []
         stack: List[Dict[str, Any]] = []
         current_section: Optional[Dict[str, Any]] = None
@@ -914,6 +1174,7 @@ class ChunkingService:
 
                 flush_current_section()
 
+                # 维护一个标题栈，用于恢复 section path，例如 A > B > C。
                 while stack and int(stack[-1]["level"]) >= heading_level:
                     stack.pop()
 
@@ -956,6 +1217,15 @@ class ChunkingService:
         return [section for section in sections if section.get("heading_text") or section.get("body_items")]
 
     def _split_docling_section(self, section: Dict[str, Any], chunk_size: int) -> List[str]:
+        """把单个 Docling section 拆成一个或多个长度可控的 chunk。
+
+        参数:
+            section (Dict[str, Any]): 单个 section 结构。
+            chunk_size (int): 目标切分粒度。
+
+        返回:
+            List[str]: 最终可用于构造 chunk 的文本片段列表。
+        """
         heading_text = str(section.get("heading_text", "") or "").strip()
         body_items = section.get("body_items", []) or []
         body_units: List[str] = []
@@ -964,6 +1234,7 @@ class ChunkingService:
             text = str(item.get("text", "") or "").strip()
             if not text:
                 continue
+            # 列表、公式、代码等短结构优先保持原样，避免过度重排破坏语义。
             if item.get("node_kind") in {"list_item", "caption", "code", "formula"}:
                 body_units.append(text)
                 continue
@@ -1007,12 +1278,28 @@ class ChunkingService:
         return packed or [combined]
 
     def _compose_docling_body_text(self, units: List[str]) -> str:
+        """把 section 内多个正文单元拼成规范段落文本。
+
+        参数:
+            units (List[str]): 正文单元列表。
+
+        返回:
+            str: 清洗后的正文文本。
+        """
         cleaned = [re.sub(r"\s+", " ", str(unit or "")).strip() for unit in units if str(unit or "").strip()]
         if not cleaned:
             return ""
         return "\n\n".join(cleaned).strip()
 
     def _safe_int(self, value: Any) -> Optional[int]:
+        """安全地把任意值转换为整数。
+
+        参数:
+            value (Any): 待转换值。
+
+        返回:
+            Optional[int]: 转换成功后的整数；失败时返回 None。
+        """
         try:
             if value is None:
                 return None
@@ -1021,6 +1308,14 @@ class ChunkingService:
             return None
 
     def _serialize_docling_value(self, value: Any) -> Any:
+        """把 Docling 对象递归序列化为 JSON 友好的原生结构。
+
+        参数:
+            value (Any): 任意待序列化对象。
+
+        返回:
+            Any: 适合写入 JSON 的原生 Python 值。
+        """
         if value is None:
             return None
         if isinstance(value, (str, int, float, bool)):

@@ -1,3 +1,12 @@
+"""执行 arXiv 搜索、结果检查、重试放宽和个性化重排。
+
+这个模块承接 parse_node 产出的 search_spec，负责把结构化条件真正落到执行层：
+1. 构造搜索工具参数并调用 arXiv 工具；
+2. 检查结果是否报错、为空或明显偏少；
+3. 在空结果时自动放宽 query 后重试；
+4. 在具备用户偏好时，对结果做可选的个性化重排。
+"""
+
 from __future__ import annotations
 
 import sys
@@ -37,6 +46,11 @@ MAX_SEARCH_RETRIES = 3
 
 
 def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
+    """按顺序去重字符串列表，主要用于 warning 和提示文案去重。
+    
+    实现上会先做归一化再去重，保证“同义大小写差异”的提示不会重复出现；
+    同时保留第一次出现的顺序，方便前端展示真实执行轨迹。
+    """
     seen = set()
     result: List[str] = []
     for item in items:
@@ -57,10 +71,20 @@ def _build_tool_call_trace(
     normalized_inputs: Optional[Dict[str, Any]] = None,
     final_search_query: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """构造统一的工具调用 trace，便于日志、调试和前端展示。
+    
+    主要步骤：
+    1. 先吸收工具层已经给出的 trace；
+    2. 再补齐 agent 侧压缩后的 inputs、排序参数、返回数量等元信息；
+    3. 若工具结果中缺少 returned_count 或 error，则在这里兜底补全。
+    
+    输出：返回一个尽量结构稳定的 trace 字典。
+    """
     trace: Dict[str, Any] = {}
     if isinstance(result, Mapping):
         trace.update(_result_mapping(result, "trace") or {})
 
+    # 先把输入压缩成适合记录的紧凑结构，再补齐 agent 侧派生出的元信息。
     compact_inputs = _compact_tool_args(tool_args)
     trace.setdefault("tool_name", tool_name)
     trace.setdefault("inputs", compact_inputs)
@@ -85,6 +109,13 @@ def _build_tool_call_trace(
 
 
 def _relax_query_for_fallback(query: Optional[str], retry_count: int) -> Optional[str]:
+    """在自动重试时逐步放宽查询词，尽量提升召回率。
+    
+    分支行为：
+    1. 空 query 或重试轮次过深时直接返回 None；
+    2. 英文多 token 查询通过逐轮删减末尾 token 放宽；
+    3. 连续中文查询则按长度截短，避免一下子把主题语义全部清空。
+    """
     if not query or not str(query).strip():
         return None
 
@@ -93,11 +124,13 @@ def _relax_query_for_fallback(query: Optional[str], retry_count: int) -> Optiona
     if retry_count >= 3:
         return None
 
+    # 英文/空格分词查询优先通过“逐轮减少末尾 token”来放宽条件。
     tokens = query.split()
     if len(tokens) > 1:
         keep = max(1, len(tokens) - retry_count)
         return " ".join(tokens[:keep])
 
+    # 对连续中文查询采用截短策略，避免直接清空查询导致语义损失过大。
     if _contains_chinese(query) and len(query) > 2:
         keep = max(2, len(query) - retry_count * 2)
         return query[:keep]
@@ -106,6 +139,11 @@ def _relax_query_for_fallback(query: Optional[str], retry_count: int) -> Optiona
 
 
 def _format_tool_failure_warning(result: Mapping[str, Any]) -> str:
+    """把工具失败结果转成更适合给用户/日志看的 warning 文案。
+    
+    若工具层已经给出明确错误消息，会拼接到统一中文提示后面；
+    否则返回通用的服务状态或参数异常提示。
+    """
     error_message = _extract_error_message(result)
     if error_message:
         return f"工具调用失败，请检查搜索参数或 arXiv 服务状态: {error_message}"
@@ -113,6 +151,12 @@ def _format_tool_failure_warning(result: Mapping[str, Any]) -> str:
 
 
 def _papers_are_significantly_fewer_than_requested(actual_count: int, max_results: int) -> bool:
+    """判断结果数是否明显偏少，用于提示用户搜索条件可能过窄。
+    
+    这个函数不会判断“空结果”，只关注“有结果但远低于期望值”的情况：
+    - max_results 很小时按严格阈值判断；
+    - 其余情况按一半左右的经验阈值判断。
+    """
     if actual_count <= 0 or max_results <= 0:
         return False
     if max_results <= 3:
@@ -121,6 +165,11 @@ def _papers_are_significantly_fewer_than_requested(actual_count: int, max_result
 
 
 def _summarize_search_spec(spec: Optional[ArxivSearchSpec]) -> str:
+    """把 search spec 压缩成可读的中文摘要，用于最终回复。
+    
+    会按 query、title_query、abstract_query、categories、时间范围、排序方式和数量上限依次拼接，
+    输出适合直接放进 answer 的一句中文说明。
+    """
     if spec is None:
         return "当前搜索条件"
 
@@ -141,6 +190,15 @@ def _summarize_search_spec(spec: Optional[ArxivSearchSpec]) -> str:
 
 
 def _determine_requested_max_results(state: AgentState) -> int:
+    """统一计算本轮搜索真正期望返回的最大论文数。
+    
+    优先级为：
+    1. 优先读取 search_spec.max_results；
+    2. 若缺失则回退到已有 tool_args；
+    3. 两者都没有时使用默认值 10。
+    
+    这样可以保证结果检查、个性化重排和回复生成使用同一套上限口径。
+    """
     if state.search_spec is not None:
         return max(1, int(state.search_spec.max_results or 10))
     if isinstance(state.tool_args, dict) and state.tool_args.get("max_results") is not None:
@@ -149,6 +207,11 @@ def _determine_requested_max_results(state: AgentState) -> int:
 
 
 def _collect_priority_titles(papers: List[Dict[str, Any]], limit: int = 3) -> List[str]:
+    """从结果集中挑出最值得优先展示的论文标题。
+    
+    排序时会综合 priority、final_score、query_match_score 和 arxiv_id，
+    尽量让真正被推荐或匹配度更高的论文排在前面，最后只返回标题列表供回复层使用。
+    """
     prioritized = sorted(
         [paper for paper in papers if isinstance(paper, dict)],
         key=lambda paper: (
@@ -168,6 +231,13 @@ def _collect_priority_titles(papers: List[Dict[str, Any]], limit: int = 3) -> Li
 
 
 def build_search_tool_args(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    """根据 search_spec 构造 arXiv 搜索工具参数。
+    
+    主要步骤：
+    1. 先确认当前 intent 和 search_spec 都合法；
+    2. 把业务对象字段显式映射成工具层需要的纯参数；
+    3. 在 skipped 分支下清空 tool_name/tool_args，避免误复用上一轮状态。
+    """
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
 
@@ -183,6 +253,7 @@ def build_search_tool_args(state: Union[AgentState, Mapping[str, Any]]) -> Agent
             outputs={"reason": "非 arXiv 搜索或搜索条件缺失"},
         )
 
+    # 这里把 schema 字段显式映射成工具调用参数，避免后续工具层感知业务对象。
     spec = next_state.search_spec
     next_state.tool_name = SEARCH_TOOL_NAME
     next_state.tool_args = {
@@ -209,6 +280,14 @@ def build_search_tool_args(state: Union[AgentState, Mapping[str, Any]]) -> Agent
 
 
 def invoke_search_tool(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    """真正调用 arXiv 搜索工具，并把结果和 trace 写回 state。
+    
+    主要分支包括：
+    1. 非搜索 intent 直接跳过；
+    2. 缺少 tool_args 时返回 failed，并补 warning；
+    3. 调用抛异常时写入 failed tool_call；
+    4. 调用成功后提取 papers、tool_result 和统一 trace。
+    """
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
 
@@ -237,6 +316,7 @@ def invoke_search_tool(state: Union[AgentState, Mapping[str, Any]]) -> AgentStat
         )
 
     try:
+        # 工具层异常通常意味着服务不可用或参数不合法，这里统一转成 failed tool_call。
         raw_result = invoke_tool(SEARCH_TOOL_NAME, **dict(next_state.tool_args))
     except Exception as exc:
         next_state.tool_result = {"ok": False, "error": {"message": str(exc)}}
@@ -291,6 +371,8 @@ def invoke_search_tool(state: Union[AgentState, Mapping[str, Any]]) -> AgentStat
     )
     next_state.tool_calls = list(next_state.tool_calls) + [tool_call]
 
+    # 成功时提取论文列表；失败时保留空结果并补 warning，由后续节点决定是否重试。
+    # 成功时提取论文列表；失败时保留空结果并补 warning，由后续节点决定是否重试。
     if _result_ok(result):
         next_state.papers = _extract_papers_from_tool_result(result)
     else:
@@ -315,6 +397,13 @@ def invoke_search_tool(state: Union[AgentState, Mapping[str, Any]]) -> AgentStat
 
 
 def check_search_result(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    """检查搜索结果是否为空、报错或明显偏少，并追加提示信息。
+    
+    判断顺序为：
+    1. 先确认是否存在 tool_result；
+    2. 再区分工具失败、空结果、结果偏少等不同提示；
+    3. 对空结果场景额外结合 search_retry_count 提示是否会继续自动放宽。
+    """
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
 
@@ -342,6 +431,7 @@ def check_search_result(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
         if error_message:
             warnings.append(error_message)
 
+    # 只有工具成功时，才基于论文数判断是否需要提示自动放宽或缩窄查询。
     if _result_ok(tool_result):
         if not papers:
             retry_count = int(next_state.search_retry_count or 0)
@@ -372,16 +462,26 @@ def check_search_result(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
 
 
 def relax_search_for_retry(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    """在搜索结果为空时放宽 query，并重置执行态以便下一轮重试。
+    
+    这个函数会：
+    1. 递增 search_retry_count；
+    2. 记录 fallback_specs 和 debug 中的每轮查询变化；
+    3. 直接修改 search_spec.query 与 reasoning_summary；
+    4. 清空上一轮 tool_name、tool_args、tool_result 和 papers，避免污染重试结果。
+    """
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
 
     retry_count = int(next_state.search_retry_count or 0)
     next_state.search_retry_count = retry_count + 1
 
+    # 只有保留 search_spec 时，后续重试链路才有可放宽的查询上下文。
     if next_state.search_spec is not None:
         original_query = next_state.search_spec.query
         relaxed_query = _relax_query_for_fallback(original_query, next_state.search_retry_count)
 
+        # fallback_specs/debug 会记录每一轮放宽前后的查询词，便于回放问题定位。
         fallback_record = {
             "round": next_state.search_retry_count,
             "original_query": original_query,
@@ -404,6 +504,7 @@ def relax_search_for_retry(state: Union[AgentState, Mapping[str, Any]]) -> Agent
             list(next_state.warnings) + [f"自动放宽关键词: \"{original_query}\" -> \"{relaxed_query or '(仅按类别搜索)'}\""]
         )
 
+        # 直接修改 search_spec，使下一轮 build_search_tool_args 使用放宽后的查询。
         next_state.search_spec.query = relaxed_query
         next_state.search_spec.reasoning_summary = _build_reasoning_summary(
             relaxed_query,
@@ -413,6 +514,7 @@ def relax_search_for_retry(state: Union[AgentState, Mapping[str, Any]]) -> Agent
             next_state.search_spec.sort_by or "submittedDate",
         ) + f" (fallback round {next_state.search_retry_count})"
 
+    # 重试前清空上一轮工具执行残留，避免错误结果污染后续节点。
     next_state.tool_name = None
     next_state.tool_args = {}
     next_state.tool_result = None
@@ -435,9 +537,18 @@ def relax_search_for_retry(state: Union[AgentState, Mapping[str, Any]]) -> Agent
 
 
 def personalized_rank_and_annotate_papers(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    """基于用户偏好对搜索结果做可选的个性化重排。
+    
+    主要分支：
+    1. 缺少搜索结果或 user_id 时直接跳过；
+    2. 推荐服务初始化失败时保留普通排序并补 warning；
+    3. 服务调用成功后，用 reranked papers 覆盖结果，并标记是否真正应用了个性化；
+    4. 若最终没有生效，仍会显式告知已退化为普通搜索排序。
+    """
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
 
+    # 个性化重排依赖三个前提：搜索意图、已有候选论文、以及有效 user_id。
     if next_state.intent != "arxiv_search" or not next_state.papers or not next_state.user_id:
         next_state.personalized_rerank_applied = False
         return _append_step(
@@ -479,6 +590,7 @@ def personalized_rank_and_annotate_papers(state: Union[AgentState, Mapping[str, 
     search_spec_payload = next_state.search_spec.model_dump() if next_state.search_spec is not None else None
 
     try:
+        # 重排服务只调整排序和附加打分，不会改变“本轮搜索主题”的语义边界。
         rerank_result = recommendation_service.rerank_search_results_for_user(
             user_id=str(next_state.user_id),
             papers=list(next_state.papers or []),
@@ -510,6 +622,7 @@ def personalized_rank_and_annotate_papers(state: Union[AgentState, Mapping[str, 
     if isinstance(reranked_papers, list) and reranked_papers:
         next_state.papers = [paper for paper in reranked_papers if isinstance(paper, dict)]
 
+    # 即使服务调用成功，也要区分“真正做了个性化”与“退化为普通排序”两种情况。
     next_state.personalized_rerank_applied = bool(rerank_result.get("personalized_applied")) if isinstance(rerank_result, Mapping) else False
     rerank_warnings = rerank_result.get("warnings", []) if isinstance(rerank_result, Mapping) else []
     if isinstance(rerank_warnings, list):

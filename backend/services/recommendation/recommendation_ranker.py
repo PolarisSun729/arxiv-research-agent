@@ -40,6 +40,11 @@ class RecommendationRanker:
         disliked_vector: Optional[List[float]] = None,
         embedding_config: Optional[Any] = None,
     ) -> Dict[str, Any]:
+        """构建单篇候选论文的基础相关性分数及详细分解信息。
+
+        该方法会综合语义相似度、分类偏好、新鲜度以及负反馈惩罚，输出一个
+        可解释的中间评分结构，供后续画像修正和多样性选择继续加工。
+        """
         semantic_score = float(candidate.get("similarity_score", candidate.get("score", 0.0)) or 0.0)
         best_matched_cluster_id = None
         best_matched_cluster_similarity = None
@@ -50,11 +55,13 @@ class RecommendationRanker:
         if user_vector and embedding_config:
             stored_vector = candidate.get("_stored_vector") or []
             if stored_vector:
+                # 优先复用候选论文已有向量，避免重复调用 embedding 服务。
                 candidate_embedding = [float(value) for value in stored_vector]
                 embedding_source = "stored"
             else:
                 text_to_embed = self.embedding_service.build_paper_embedding_text(candidate.get("title", ""), candidate.get("abstract", ""))
                 if text_to_embed:
+                    # 没有现成向量时，按当前 embedding 配置重新生成，保证排序可继续进行。
                     candidate_embedding = [
                         float(value)
                         for value in self.embedding_service.create_single_embedding(
@@ -71,6 +78,7 @@ class RecommendationRanker:
                     embedding_source = "missing"
             if candidate_embedding:
                 if interest_clusters:
+                    # 有兴趣簇时优先比较候选与各簇中心的相似度，以便识别命中的具体子兴趣。
                     cluster_similarities = [
                         {
                             "cluster_id": cluster.get("cluster_id"),
@@ -89,6 +97,7 @@ class RecommendationRanker:
                 else:
                     semantic_score = self._cosine_similarity(user_vector, candidate_embedding)
                 if interest_clusters and disliked_vector:
+                    # 点踩向量只作为惩罚项参与，避免负反馈直接覆盖正向相关性。
                     disliked_penalty = self._cosine_similarity(disliked_vector, candidate_embedding)
         categories = self._split_categories(candidate.get("categories"))
         category_score = self._calculate_category_score(categories, liked_category_freq)
@@ -131,6 +140,11 @@ class RecommendationRanker:
         top_n: int,
         interest_clusters: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
+        """从已打分候选集中选择兼顾相关性与多样性的最终结果集。
+
+        该策略分两步：先尽量为每个兴趣簇挑一个代表项作为种子，再在剩余候选中按
+        相关性和多样性加权贪心选择，减少推荐列表同质化。
+        """
         if top_n <= 0 or not scored_candidates:
             return []
 
@@ -185,6 +199,7 @@ class RecommendationRanker:
             diversity_penalty_source: Optional[str] = None,
             diversity_penalty_value: Optional[float] = None,
         ) -> None:
+            """为已入选候选补齐选择阶段的解释信息与调试字段。"""
             score_breakdown = dict(candidate.get("score_breakdown", {}))
             score_breakdown.update(
                 {
@@ -211,15 +226,18 @@ class RecommendationRanker:
             }
 
         def finalize_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
+            """移除仅供排序阶段使用的临时字段，并输出可直接返回给上层的结果。"""
             candidate.pop("_candidate_embedding", None)
             candidate.pop("_candidate_categories", None)
             return candidate
 
         def compute_diversity(candidate: Dict[str, Any]) -> tuple[float, Optional[float], Optional[float], Optional[float], str, Optional[str], Optional[float]]:
+            """计算候选相对当前已选集合的多样性得分，以及对应的惩罚来源。"""
             embedding = candidate_embedding(candidate)
             semantic_diversity_score: Optional[float] = None
             semantic_similarity_penalty: Optional[float] = None
             if embedding and selected_embeddings:
+                # 向量越接近已选项，语义多样性越低，需要在选择阶段适度压分。
                 max_similarity = max(self._cosine_similarity(embedding, selected_embedding) for selected_embedding in selected_embeddings)
                 semantic_similarity_penalty = max(0.0, min(1.0, max_similarity))
                 semantic_diversity_score = 1.0 - semantic_similarity_penalty
@@ -235,6 +253,7 @@ class RecommendationRanker:
             category_diversity_score: Optional[float] = None
             category_repeat_count: Optional[int] = None
             if not embedding and cluster_diversity_score is None and categories:
+                # 没有向量和簇信息时，用分类重复度作为最后一道保底多样性信号。
                 category_repeat_count = max((int(selected_category_counts.get(category, 0)) for category in categories), default=0)
                 category_diversity_score = max(0.0, 1.0 - min(category_repeat_count / self.ENHANCED_RETRIEVAL_CONFIG["category_repeat_divisor"], 1.0))
 
@@ -274,6 +293,7 @@ class RecommendationRanker:
             diversity_penalty_source: Optional[str] = None,
             diversity_penalty_value: Optional[float] = None,
         ) -> None:
+            """提交一个候选到结果集，并同步更新后续多样性计算所需状态。"""
             relevance_score = float(candidate.get("relevance_score", candidate.get("final_score", 0.0)) or 0.0)
             annotate_selected_candidate(candidate, selection_rank, relevance_score, diversity_score, semantic_diversity_score, cluster_diversity_score, category_diversity_score, diversity_reason, diversity_penalty_source, diversity_penalty_value)
             selected_embeddings_candidate = candidate_embedding(candidate)
@@ -296,6 +316,7 @@ class RecommendationRanker:
                 if existing_candidate is None or candidate_priority(candidate) > candidate_priority(existing_candidate):
                     cluster_representatives[cluster_id] = candidate
 
+            # 先为每个兴趣簇选一个代表作种子，避免结果被单一兴趣方向垄断。
             ordered_cluster_candidates = sorted(cluster_representatives.values(), key=candidate_priority, reverse=True)
             for candidate in ordered_cluster_candidates:
                 if len(selected) >= top_n:
@@ -330,6 +351,7 @@ class RecommendationRanker:
                 relevance_score = float(candidate.get("relevance_score", candidate.get("final_score", 0.0)) or 0.0)
                 normalized_relevance = normalize_relevance(relevance_score)
                 diversity_score, semantic_diversity_score, cluster_diversity_score, category_diversity_score, diversity_reason, diversity_cluster_id, semantic_similarity_penalty = compute_diversity(candidate)
+                # 以加权方式融合相关性与多样性，做逐步贪心选择。
                 selection_score = normalized_relevance * self.RECOMMENDATION_CONFIG["selection_relevance_weight"] + diversity_score * self.RECOMMENDATION_CONFIG["selection_diversity_weight"]
                 if selection_score > best_selection_score:
                     best_candidate = candidate
@@ -358,6 +380,7 @@ class RecommendationRanker:
         return selected
 
     def _calculate_category_score(self, categories: List[str], liked_category_freq: Counter) -> float:
+        """根据候选分类与用户已点赞分类分布的重叠程度，计算分类偏好分。"""
         if not categories or not liked_category_freq:
             return 0.0
         total_frequency = sum(liked_category_freq.values())
@@ -367,6 +390,7 @@ class RecommendationRanker:
         return min(1.0, matched_frequency / total_frequency)
 
     def _calculate_recency_score(self, published_date: Any) -> float:
+        """把发布时间衰减为 0 到 1 之间的新鲜度分值。"""
         parsed_date = self._parse_datetime(str(published_date or ""))
         if not parsed_date:
             return 0.0
@@ -374,6 +398,7 @@ class RecommendationRanker:
         return 1.0 / (1.0 + age_days / 365.0)
 
     def _extract_query_terms(self, text: Any) -> List[str]:
+        """从查询文本中抽取去重后的有效词项，并过滤停用词与噪声符号。"""
         normalized = str(text or "").strip().lower()
         if not normalized:
             return []
@@ -397,6 +422,7 @@ class RecommendationRanker:
         abstract_query: Optional[str] = None,
         search_categories: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
+        """计算候选论文与搜索查询之间的匹配分，并输出命中明细。"""
         title = str(candidate.get("title", "") or "").strip()
         abstract = str(candidate.get("abstract", "") or candidate.get("summary", "") or "").strip()
         categories = self._split_categories(candidate.get("categories"))
@@ -432,6 +458,7 @@ class RecommendationRanker:
             if normalized_search_categories_set
             else 0.0
         )
+        # 保留原搜索服务的得分作为一个弱信号，避免重排完全忽略上游召回质量。
         source_search_score = float(candidate.get("score", candidate.get("similarity_score", 0.0)) or 0.0)
         source_search_score = max(0.0, min(1.0, source_search_score))
 
@@ -464,6 +491,7 @@ class RecommendationRanker:
         }
 
     def _build_match_reason(self, query_match_score: float, matched_terms: List[str]) -> str:
+        """把查询命中情况转换为面向前端展示的简短说明文案。"""
         score_text = f"{round(max(0.0, min(1.0, query_match_score)) * 100)}%"
         if matched_terms:
             preview = ", ".join(matched_terms[:3])
@@ -471,6 +499,7 @@ class RecommendationRanker:
         return f"当前查询相关度 {score_text}"
 
     def _build_personalized_reason(self, candidate: Dict[str, Any], score_breakdown: Dict[str, Any]) -> str:
+        """根据排序分解结果生成个性化推荐理由，方便前端直接展示。"""
         parts: List[str] = []
         semantic_score = float(score_breakdown.get("semantic_score", 0.0) or 0.0)
         category_score = float(score_breakdown.get("category_score", 0.0) or 0.0)

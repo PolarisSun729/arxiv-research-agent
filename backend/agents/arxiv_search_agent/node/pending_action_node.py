@@ -1,3 +1,12 @@
+"""处理论文解析确认类的挂起动作。
+
+当前模块专门负责“是否要现在解析 PDF 并建立 QA 索引”这类二次确认流程：
+1. 从 state 中恢复待确认任务；
+2. 判断用户是在确认、取消、提出新请求还是语义不清；
+3. 在确认后继续执行建索引与论文问答；
+4. 把执行结果、失败阶段和调试信息统一写回 AgentState。
+"""
+
 from __future__ import annotations
 
 import logging
@@ -24,6 +33,13 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_generation_service_instance(generation_service: Optional[Any] = None) -> Optional[Any]:
+    """优先复用外部传入的生成服务，否则尝试从依赖注入容器获取实例。
+    
+    分支行为：
+    - 传入 generation_service 时直接复用，避免重复初始化；
+    - 未传入时尝试从容器获取；
+    - 获取失败时返回 None，让上层决定是否退化为规则判断。
+    """
     if generation_service is not None:
         return generation_service
     try:
@@ -33,6 +49,11 @@ def _resolve_generation_service_instance(generation_service: Optional[Any] = Non
 
 
 def _normalize_confirmation_decision(value: Any) -> str:
+    """把不同来源的确认标签归一化为统一决策枚举。
+    
+    这个函数把规则、LLM 或外部调用方可能产出的 yes/no/accept/reject/new_request 等标签，
+    统一折叠成 confirm、reject、unrelated、unclear 四类，方便后续流程只处理固定分支。
+    """
     decision = _normalize_text(str(value or "")).lower()
     if decision in {"confirm", "confirmed", "accept", "yes", "ok", "continue"}:
         return "confirm"
@@ -44,6 +65,16 @@ def _normalize_confirmation_decision(value: Any) -> str:
 
 
 def _fast_path_pending_action_decision(message: str) -> Optional[str]:
+    """用显式词表和正则快速识别确认/取消回复。
+    
+    主要步骤：
+    1. 先处理空文本；
+    2. 再用 confirm_tokens / reject_tokens 覆盖最常见的短句回复；
+    3. 对更自然的长句补充正则匹配；
+    4. 若仍无法判断则返回 None，交给更昂贵的 LLM 分类。
+    
+    输出：返回 confirm / reject / None。
+    """
     text = _normalize_text(message)
     if not text:
         return None
@@ -79,6 +110,7 @@ def _fast_path_pending_action_decision(message: str) -> Optional[str]:
         "别解析",
     }
 
+    # 先做集合命中判断，覆盖最常见的单词/短句确认。
     if text in confirm_tokens:
         return "confirm"
     if text in reject_tokens:
@@ -115,6 +147,7 @@ def _fast_path_pending_action_decision(message: str) -> Optional[str]:
         r"确认解析",
     )
 
+    # 对更长的自然语言表达，再补一层正则模式判断。
     if _matches_any(text, reject_patterns) or _matches_any(lowered, reject_patterns):
         return "reject"
     if _matches_any(text, confirm_patterns) or _matches_any(lowered, confirm_patterns):
@@ -123,6 +156,14 @@ def _fast_path_pending_action_decision(message: str) -> Optional[str]:
 
 
 def _recover_pending_action(next_state: AgentState) -> Dict[str, Any]:
+    """从 state 的多个可能来源中恢复待确认动作。
+    
+    主要分支：
+    1. 优先读取显式保存的 pending_action；
+    2. 若缺失，则尝试从 waiting_confirmation 状态的 paper_qa_result 反推出等价任务；
+    3. 恢复成功后补齐 arxiv_id、title、original_question、qa_question 等关键字段。
+    """
+    # 优先使用显式挂在 state/context 上的 pending_action；只有缺失时才尝试从结果反推。
     pending_action = dict(next_state.pending_action or (next_state.context or {}).get("pending_action") or {})
     if not pending_action and isinstance(next_state.paper_qa_result, Mapping):
         paper_qa_result = dict(next_state.paper_qa_result or {})
@@ -148,6 +189,16 @@ def classify_pending_action_confirmation(
     state: Union[AgentState, Mapping[str, Any]],
     generation_service: Optional[Any] = None,
 ) -> AgentState:
+    """判断用户当前输入是确认、取消、无关新请求还是无法判断。
+    
+    主流程顺序固定为：
+    1. 恢复 pending_action；
+    2. 用规则 fast path 识别明确确认/取消；
+    3. 对“解析 / 索引”等关键词做低成本兜底；
+    4. 仅在前面都无法判断时才调用 LLM 细分 unrelated / unclear。
+    
+    输出：返回写入 confirmation_decision、confidence、reason 和 step trace 的 AgentState。
+    """
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
     pending_action = _recover_pending_action(next_state)
@@ -157,6 +208,7 @@ def classify_pending_action_confirmation(
     debug["pending_action"] = pending_action
     debug["pending_action_confirmation_model"] = "qwen3.6-flash"
 
+    # 没有待确认任务时，不应该把普通消息误判成确认结果，直接以 skipped 返回。
     if not pending_action or str(pending_action.get("type") or "").strip() != "parse_then_qa":
         debug["pending_action_decision"] = "unclear"
         debug["confirmation_confidence"] = 0.0
@@ -171,18 +223,23 @@ def classify_pending_action_confirmation(
             outputs={"decision": "unclear", "reason": debug["confirmation_reason"]},
         )
 
+    # 先走规则层；只有规则无法确定时，才考虑更昂贵的 LLM 分类。
     decision = _fast_path_pending_action_decision(message)
     confidence = 0.99 if decision in {"confirm", "reject"} else 0.0
     reason = ""
+    # 用户经常会回复“建索引吧”“继续解析”，这里用关键词兜底覆盖这类半结构化输入。
     if decision is None and any(keyword in message for keyword in ("解析", "索引", "全文检索", "问答索引")):
         decision = "confirm"
         confidence = 0.95
         reason = "关键词兜底命中明确的继续执行意图"
     reason = reason or ("fast path 命中明确确认/取消表达" if decision in {"confirm", "reject"} else "")
 
+    # 只有在规则和兜底都无法判断时，才把上下文交给 LLM 细分 unrelated / unclear 等状态。
+    # 只有低成本规则无法判断时，才值得为确认语义付出一次 LLM 调用成本。
     if decision is None:
         service = _resolve_generation_service_instance(generation_service)
         if service is not None:
+            # 只有简单规则无法判断时，才把完整上下文交给 LLM，尽量把高成本推断放在最后一层。
             prompt = (
                 "你正在判断用户是否要继续执行一个待确认的论文解析任务。\n"
                 "请只输出严格 JSON，不要输出解释性文本。\n\n"
@@ -253,6 +310,15 @@ def classify_pending_action_confirmation(
 
 
 def handle_pending_action_confirmation(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    """在用户确认后继续执行建索引与论文问答流程。
+    
+    主要分支包括：
+    1. 缺少 arXiv ID 等关键字段时直接失败并标记失败阶段；
+    2. 成功创建或复用索引后执行论文问答；
+    3. 任一步异常都写入 error_stage / error_type / error_detail，便于排查。
+    
+    输出：返回更新后的 AgentState，包含 paper_qa_result、answer、debug 和 tool_calls。
+    """
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
     pending_action = _recover_pending_action(next_state)
@@ -265,6 +331,7 @@ def handle_pending_action_confirmation(state: Union[AgentState, Mapping[str, Any
     qa_question = _normalize_text(str(pending_action.get("qa_question") or original_question))
     loading_method = str(pending_action.get("loading_method") or "docling").strip() or "docling"
 
+    # arXiv ID 是后续建索引和问答的最小必要条件，缺失时立即终止并返回明确错误。
     if not arxiv_id:
         result = {
             "status": "failed",
@@ -304,6 +371,7 @@ def handle_pending_action_confirmation(state: Union[AgentState, Mapping[str, Any
         )
 
     try:
+        # 成功路径固定为：建索引 -> 读取最新索引状态 -> 基于新索引回答原问题。
         index_result = qa_service.build_qa_index(arxiv_id, loading_method=loading_method)
         qa_status = qa_service.get_qa_status(arxiv_id)
         index_created = bool(str((index_result or {}).get("status") or "").lower() in {"success", "indexed"}) or bool((qa_status or {}).get("has_index"))
@@ -371,7 +439,8 @@ def handle_pending_action_confirmation(state: Union[AgentState, Mapping[str, Any
             outputs={"paper_qa_result": result, "qa_index_status": qa_status, "index_created": index_created},
         )
     except Exception as exc:
-        error_stage = _extract_exception_stage(exc)
+        # 执行失败时除了错误文案，还会把 stage/type/detail 记录到 debug 和 tool_calls。
+        error_stage = _extract_exception_stage(exc, "handle_pending_action_confirmation")
         error_detail = _extract_exception_detail(exc)
         result = {
             "status": "failed",

@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 #
 # 如果说：
 # - graph.py 负责定义工作流结构，
-# - nodes.py 负责每个节点做什么，
+# - node/ 下的模块负责每个节点做什么，
 # 那么 service.py 负责把“外部请求”真正接到这套工作流上。
 #
 # 它主要承担四类职责：

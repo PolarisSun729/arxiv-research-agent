@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from fastapi import HTTPException
 
 from services.arxiv.arxiv_search_service import ArxivSearchService
+from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
 from services.document.chunking_service import ChunkingService
 from services.storage.database_service import DatabaseService
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
@@ -26,37 +27,44 @@ class PaperQAIndexBuilder:
         vector_store_service: VectorStoreService,
         generation_service: GenerationService,
         arxiv_service_factory: Optional[Callable[[], Any]] = None,
+        oai_db_service: Optional[ArxivOaiDatabaseService] = None,
         get_embedding_config: Optional[Callable[[], EmbeddingConfig]] = None,
         loading_service_factory: Optional[Callable[[], LoadingService]] = None,
         chunking_service_factory: Optional[Callable[[], ChunkingService]] = None,
     ):
+        """初始化论文问答索引构建器，并注入建索引链路所需依赖。"""
         self.db_service = db_service
         self.embedding_service = embedding_service
         self.vector_store_service = vector_store_service
         self.generation_service = generation_service
         self.arxiv_service_factory = arxiv_service_factory
+        self.oai_db_service = oai_db_service
         self.get_embedding_config = get_embedding_config or self.embedding_service.get_default_embedding_config
         self.loading_service_factory = loading_service_factory
         self.chunking_service_factory = chunking_service_factory
 
     @staticmethod
     def _chunk_type_counts(chunks: List[Dict[str, Any]]) -> Tuple[int, int, int]:
+        """统计 chunk 中的文本、图片和表格数量，便于记录索引摘要。"""
         text_count = sum(1 for chunk in chunks if str((chunk.get("metadata", {}) or {}).get("chunk_type", "text")) == "text")
         figure_count = sum(1 for chunk in chunks if str((chunk.get("metadata", {}) or {}).get("chunk_type", "")) == "figure")
         table_count = sum(1 for chunk in chunks if str((chunk.get("metadata", {}) or {}).get("chunk_type", "")) == "table")
         return text_count, figure_count, table_count
 
     def validate_loading_method(self, loading_method: str) -> str:
+        """校验并规范化 PDF 加载方式，只允许当前支持的方法。"""
         normalized_method = str(loading_method or "pymupdf").strip().lower()
         if normalized_method not in {"pymupdf", "docling"}:
             raise HTTPException(status_code=400, detail="loading_method must be either pymupdf or docling")
         return normalized_method
 
     def mark_index_processing(self, arxiv_id: str) -> None:
+        """把论文索引状态标记为处理中，供外部轮询和后台任务联动使用。"""
         self.db_service.insert_paper_qa_index(arxiv_id, status="processing")
 
     @staticmethod
     def _exception_detail(exc: Exception) -> str:
+        """从异常对象中提取较稳定的错误详情，便于写回任务结果。"""
         detail = getattr(exc, "detail", None)
         if isinstance(detail, dict):
             message = str(detail.get("message") or detail.get("detail") or detail.get("error") or "").strip()
@@ -126,6 +134,7 @@ class PaperQAIndexBuilder:
         progress: int,
         message: str,
     ) -> None:
+        """安全触发进度回调，避免回调异常打断主建索引流程。"""
         if progress_callback is None:
             return
         try:
@@ -143,16 +152,77 @@ class PaperQAIndexBuilder:
             )
 
     def load_paper_metadata(self, arxiv_id: str) -> Dict[str, Any]:
+        """加载论文元数据，优先查本地库，缺失时再逐级回源补齐。"""
         paper = self.db_service.get_paper(arxiv_id)
         if not paper:
-            # 索引链路依赖论文元数据；如果本地库里还没有，就先回源 arXiv 补齐，再继续后续解析。
-            logger.info("Paper metadata missing in database, trying arXiv lookup: %s", arxiv_id)
+            logger.info("Paper metadata missing in primary database, trying local OAI database: %s", arxiv_id)
+            paper = self._fetch_and_store_paper_metadata_from_oai(arxiv_id)
+        if not paper:
+            # 索引链路依赖论文元数据；本地两个库都没有时，才回源 arXiv 补齐。
+            logger.info("Paper metadata missing in local databases, trying arXiv lookup: %s", arxiv_id)
             paper = self._fetch_and_store_paper_metadata(arxiv_id)
         if not paper:
             raise HTTPException(status_code=404, detail="Paper not found in database")
         return paper
 
+    @staticmethod
+    def _normalize_oai_paper(arxiv_id: str, paper: Dict[str, Any]) -> Dict[str, Any]:
+        """把 OAI 数据源的论文结构规范化为系统内部统一字段格式。"""
+        return {
+            "arxiv_id": str(paper.get("arxiv_id") or arxiv_id).strip(),
+            "title": str(paper.get("title") or "").strip(),
+            "authors": paper.get("authors") or [],
+            "abstract": str(paper.get("abstract") or "").strip(),
+            "categories": paper.get("categories") or [],
+            "published_date": str(
+                paper.get("created")
+                or paper.get("updated")
+                or paper.get("oai_datestamp")
+                or ""
+            ).strip(),
+            "url": str(paper.get("abs_url") or f"https://arxiv.org/abs/{arxiv_id}").strip(),
+            "embedding_id": "",
+            "embedding_model": "",
+        }
+
+    def _persist_normalized_paper_metadata(self, arxiv_id: str, paper: Dict[str, Any], source: str) -> Optional[Dict[str, Any]]:
+        """持久化规范化后的论文元数据，并返回数据库中的最终记录。"""
+        if not paper.get("title") or not paper.get("abstract"):
+            logger.warning(
+                "%s lookup returned incomplete metadata for %s: title=%s abstract=%s",
+                source,
+                arxiv_id,
+                bool(paper.get("title")),
+                bool(paper.get("abstract")),
+            )
+            return None
+
+        if not self.db_service.add_paper(paper):
+            logger.error("Failed to persist %s metadata into database: %s", source, arxiv_id)
+            return None
+
+        logger.info("%s metadata stored for: %s", source, arxiv_id)
+        return self.db_service.get_paper(arxiv_id) or paper
+
+    def _fetch_and_store_paper_metadata_from_oai(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
+        """从本地 OAI 数据库获取论文元数据，并在成功时写回主数据库。"""
+        if self.oai_db_service is None:
+            return None
+
+        try:
+            paper = self.oai_db_service.get_paper(arxiv_id)
+            if not isinstance(paper, dict):
+                logger.info("Local OAI database returned no paper metadata: %s", arxiv_id)
+                return None
+
+            normalized_paper = self._normalize_oai_paper(arxiv_id, paper)
+            return self._persist_normalized_paper_metadata(arxiv_id, normalized_paper, source="Local OAI")
+        except Exception as exc:
+            logger.exception("Failed to fetch local OAI metadata for %s: %s", arxiv_id, exc)
+            return None
+
     def _fetch_and_store_paper_metadata(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
+        """从 arXiv 接口回源获取论文元数据，并在成功时写回主数据库。"""
         try:
             search_service = ArxivSearchService()
             search_result = search_service.search(id_list=[arxiv_id], max_results=1)
@@ -174,26 +244,13 @@ class PaperQAIndexBuilder:
                 "embedding_id": "",
                 "embedding_model": "",
             }
-            if not normalized_paper["title"] or not normalized_paper["abstract"]:
-                logger.warning(
-                    "ArXiv lookup returned incomplete metadata for %s: title=%s abstract=%s",
-                    arxiv_id,
-                    bool(normalized_paper["title"]),
-                    bool(normalized_paper["abstract"]),
-                )
-                return None
-
-            if not self.db_service.add_paper(normalized_paper):
-                logger.error("Failed to persist arXiv metadata into database: %s", arxiv_id)
-                return None
-
-            logger.info("ArXiv metadata fetched and stored for: %s", arxiv_id)
-            return self.db_service.get_paper(arxiv_id) or normalized_paper
+            return self._persist_normalized_paper_metadata(arxiv_id, normalized_paper, source="ArXiv")
         except Exception as exc:
             logger.exception("Failed to fetch arXiv metadata for %s: %s", arxiv_id, exc)
             return None
 
     def download_pdf(self, arxiv_id: str) -> str:
+        """下载指定论文的 PDF 文件，并返回本地保存路径。"""
         if self.arxiv_service_factory is None:
             raise RuntimeError("arxiv_service_factory is required")
         arxiv_service = self.arxiv_service_factory()
@@ -204,6 +261,7 @@ class PaperQAIndexBuilder:
         return pdf_path
 
     def load_pdf_document(self, pdf_path: str, loading_method: str) -> Tuple[LoadingService, Dict[str, Any], List[Dict[str, Any]]]:
+        """加载 PDF 文档内容与页码映射，供后续切块与索引构建使用。"""
         if self.loading_service_factory is None:
             raise RuntimeError("loading_service_factory is required")
         loading_service = self.loading_service_factory()
@@ -220,15 +278,18 @@ class PaperQAIndexBuilder:
         document: Dict[str, Any],
         page_map: List[Dict[str, Any]],
     ) -> Tuple[Dict[str, Any], str]:
+        """按指定加载方式对论文内容切块，并返回切块结果与切块策略名。"""
         if self.chunking_service_factory is None:
             raise RuntimeError("chunking_service_factory is required")
         chunking_service = self.chunking_service_factory()
         logger.info("Chunking text...")
         metadata = {"filename": f"{arxiv_id}.pdf", "loading_method": loading_method, "source": f"{arxiv_id}.pdf"}
         if loading_method == "docling":
+            # Docling 结构更强，优先按章节语义切块，保留表格/图片等结构信息。
             chunked_data = chunking_service.chunk_docling(document, metadata=metadata, page_map=page_map)
             chunking_strategy = "docling_sections"
         else:
+            # PyMuPDF 主要依赖标题层级切块，以保证普通 PDF 也能稳定建索引。
             chunked_data = chunking_service.chunk_pymupdf(document, method="by_titles", metadata=metadata, page_map=page_map)
             chunking_strategy = "pymupdf_by_titles"
 

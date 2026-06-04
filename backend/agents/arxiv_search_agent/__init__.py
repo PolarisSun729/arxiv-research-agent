@@ -12,7 +12,7 @@ from __future__ import annotations
 # 这样上层调用方只需要 import 这个包，就能拿到核心公共能力，
 # 而不必分别记住每个对象具体定义在哪个文件中。
 
-from .nodes import (
+from .node import (
     SEARCH_TOOL_NAME,
     apply_preference_action,
     build_search_tool_args,

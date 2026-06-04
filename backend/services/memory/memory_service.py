@@ -17,18 +17,21 @@ logger = logging.getLogger(__name__)
 
 
 class MemoryService:
-    """Facade over existing memory-related storage APIs."""
+    """封装记忆相关存储接口，并提供统一的画像、偏好与会话记忆能力。"""
 
     def __init__(self, db_service: Optional[DatabaseService] = None):
+        """初始化记忆服务，并注入底层数据库访问依赖。"""
         self.db_service = db_service or DatabaseService()
 
     @staticmethod
     def _resolve_user_id(user_id: Optional[str] = None) -> str:
+        """解析并兜底用户 ID，确保所有记忆查询都使用稳定主键。"""
         resolved = str(user_id or get_default_user_id()).strip()
         return resolved or get_default_user_id()
 
     @staticmethod
     def _coerce_limit(limit: int, default: int = 5) -> int:
+        """把外部传入的数量限制规范化为正整数。"""
         try:
             normalized = int(limit)
         except (TypeError, ValueError):
@@ -37,6 +40,7 @@ class MemoryService:
 
     @staticmethod
     def _truncate_text(value: Any, limit: int = 500) -> str:
+        """截断过长文本，避免记忆摘要与调试载荷膨胀。"""
         text = str(value or "").strip()
         if len(text) <= limit:
             return text
@@ -44,6 +48,7 @@ class MemoryService:
 
     @staticmethod
     def _extract_arxiv_id(payload: Any) -> str:
+        """从不同风格的论文载荷中提取 arXiv ID。"""
         if not isinstance(payload, dict):
             return ""
         return str(
@@ -51,23 +56,28 @@ class MemoryService:
         ).strip()
 
     def _build_agent_context_from_session(self, agent_session: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """从 Agent 会话态中提取对话上下文，供后续与后端记忆合并。"""
         session = dict(agent_session or {})
         backend_context: Dict[str, Any] = {}
 
         selected_paper = session.get("selected_paper")
         if isinstance(selected_paper, dict) and selected_paper:
+            # 当前选中文章是最重要的会话锚点，后续检索和问答通常都依赖它。
             backend_context["selected_paper"] = selected_paper
 
         last_papers = session.get("last_papers")
         if isinstance(last_papers, list) and last_papers:
+            # 保留最近论文列表，便于在多论文浏览场景下做上下文衔接。
             backend_context["last_papers"] = last_papers
 
         pending_action = session.get("pending_action")
         if isinstance(pending_action, dict) and pending_action:
+            # 待执行动作可帮助 Agent 恢复中断状态，例如继续问答或继续推荐解释。
             backend_context["pending_action"] = pending_action
 
         paper_qa_result = session.get("paper_qa_result")
         if isinstance(paper_qa_result, dict) and paper_qa_result:
+            # 最近一次论文问答结果可以作为短期显式记忆，方便下轮追问直接复用。
             backend_context["paper_qa_result"] = paper_qa_result
 
         active_arxiv_id = str(session.get("active_arxiv_id") or "").strip()
@@ -90,12 +100,14 @@ class MemoryService:
 
     @staticmethod
     def _merge_agent_context(backend_context: Optional[Dict[str, Any]], frontend_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """合并后端构造的上下文与前端传入的上下文，后者优先覆盖。"""
         merged_context = dict(backend_context or {})
         merged_context.update(dict(frontend_context or {}))
         return merged_context
 
     @staticmethod
     def _normalize_state_payload(final_state: Any) -> Dict[str, Any]:
+        """把不同类型的最终状态对象统一规范化为字典。"""
         if final_state is None:
             return {}
         if isinstance(final_state, dict):
@@ -105,6 +117,7 @@ class MemoryService:
         return dict(final_state)
 
     def _summarize_tool_calls(self, tool_calls: Any, limit: int = 5) -> List[Dict[str, Any]]:
+        """提炼最近工具调用摘要，避免把完整工具载荷直接写入会话记忆。"""
         summarized: List[Dict[str, Any]] = []
         for item in list(tool_calls or [])[-limit:]:
             if hasattr(item, "model_dump"):
@@ -113,6 +126,7 @@ class MemoryService:
                 payload = dict(item)
             else:
                 continue
+            # 这里只保留最小可解释信息，避免把大参数、大结果写进数据库造成噪声。
             summarized.append(
                 {
                     "tool_name": str(payload.get("tool_name") or "").strip(),
@@ -128,6 +142,7 @@ class MemoryService:
         paper_qa_result: Optional[Dict[str, Any]],
         active_arxiv_id: str,
     ) -> Optional[Dict[str, Any]]:
+        """从最终状态中推断当前选中的论文信息，供 Agent 会话记忆复用。"""
         selected_paper = context.get("selected_paper")
         if isinstance(selected_paper, dict) and selected_paper:
             return selected_paper
@@ -143,6 +158,7 @@ class MemoryService:
         return None
 
     def _extract_agent_memory_patch(self, final_state: Any) -> Dict[str, Any]:
+        """从 Agent 最终状态中提取一份可增量写入的会话记忆补丁。"""
         state = self._normalize_state_payload(final_state)
         context = dict(state.get("context") or {})
         pending_action = state.get("pending_action") if "pending_action" in state else context.get("pending_action")
@@ -150,6 +166,7 @@ class MemoryService:
 
         last_papers = context.get("last_papers") if "last_papers" in context else None
         if last_papers is None and isinstance(state.get("papers"), list) and state.get("papers"):
+            # 某些状态对象不会把 last_papers 放在 context 中，这里做一次兼容回退。
             last_papers = list(state.get("papers") or [])
 
         active_arxiv_id = (
@@ -158,6 +175,7 @@ class MemoryService:
             or self._extract_arxiv_id(pending_action)
             or str(context.get("arxiv_id") or "").strip()
         )
+        # active_arxiv_id 会作为当前会话聚焦论文的统一主键，后续恢复状态时优先依赖它。
         selected_paper = self._build_selected_paper_from_state(context, paper_qa_result, active_arxiv_id)
         active_paper_session_id = str(
             context.get("active_paper_session_id")
@@ -185,6 +203,7 @@ class MemoryService:
 
     @staticmethod
     def _normalize_conversation_turn_payload(raw_turn: Any) -> Optional[Dict[str, Any]]:
+        """把单轮对话结构规范化为统一字段格式。"""
         if not isinstance(raw_turn, dict):
             return None
         turn_id = str(raw_turn.get("turn_id", raw_turn.get("turnId", raw_turn.get("id", ""))) or "").strip()
@@ -208,6 +227,7 @@ class MemoryService:
 
     @staticmethod
     def _conversation_turn_dedupe_key(turn: Dict[str, Any]) -> str:
+        """为对话轮次生成去重键，优先使用 turn_id，其次使用问答内容。"""
         turn_id = str(turn.get("turn_id") or "").strip()
         if turn_id:
             return f"turn:{turn_id}"
@@ -216,6 +236,7 @@ class MemoryService:
         return f"qa:{question}|{answer_summary}"
 
     def _messages_to_conversation_context(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把消息级聊天记录重组为按轮次组织的对话上下文。"""
         turns_by_id: Dict[str, Dict[str, Any]] = {}
         ordered_turn_ids: List[str] = []
         derived_turns: List[Dict[str, Any]] = []
@@ -251,6 +272,7 @@ class MemoryService:
 
             if turn_id:
                 if turn_id not in turns_by_id:
+                    # 显式 turn_id 表示上下游已经完成轮次配对，这里优先按 turn_id 聚合。
                     turns_by_id[turn_id] = _new_turn({"turn_id": turn_id, "created_at": created_at})
                     ordered_turn_ids.append(turn_id)
                 current_turn = turns_by_id[turn_id]
@@ -266,12 +288,14 @@ class MemoryService:
                 continue
 
             if role == "user":
+                # 没有 turn_id 时，遇到新的 user 消息就开启一轮临时配对。
                 _append_if_meaningful(current_unpaired_turn)
                 current_unpaired_turn = _new_turn({"created_at": created_at, "question": content})
                 continue
 
             if role == "assistant":
                 if current_unpaired_turn is None:
+                    # 极端情况下先收到 assistant 消息，也要兜底生成一轮，避免信息丢失。
                     current_unpaired_turn = _new_turn({"created_at": created_at})
                 if content and not current_unpaired_turn.get("answer_summary"):
                     current_unpaired_turn["answer_summary"] = content
@@ -347,6 +371,7 @@ class MemoryService:
         payload_context: Any,
         limit: int = 5,
     ) -> List[Dict[str, Any]]:
+        """合并数据库上下文与请求上下文，并按轮次去重后返回最近若干轮。"""
         normalized_limit = self._coerce_limit(limit)
         merged_turns: List[Dict[str, Any]] = []
         seen_keys: set[str] = set()
@@ -364,11 +389,13 @@ class MemoryService:
         return merged_turns[-normalized_limit:]
 
     def load_user_profile(self, user_id: Optional[str]) -> Dict[str, Any]:
+        """读取用户长期研究画像。"""
         resolved_user_id = self._resolve_user_id(user_id)
         return self.db_service.get_user_research_profile(user_id=resolved_user_id)
 
     @staticmethod
     def _normalize_profile_list(values: Any, limit: int = 30) -> List[str]:
+        """把画像词项规范化为去重后的字符串列表。"""
         if values is None:
             return []
         source = values if isinstance(values, list) else [values]
@@ -383,6 +410,7 @@ class MemoryService:
 
     @staticmethod
     def _merge_profile_list(existing: Any, incoming: Any, limit: int = 30, prepend: bool = False) -> List[str]:
+        """合并画像词项列表并去重，支持控制新旧值的优先顺序。"""
         merged: List[str] = []
         ordered_values = [incoming, existing] if prepend else [existing, incoming]
         for bucket in ordered_values:
@@ -395,6 +423,7 @@ class MemoryService:
 
     @staticmethod
     def _normalize_categories(values: Any, limit: int = 12) -> List[str]:
+        """把分类字段规范化为去重后的分类列表。"""
         if isinstance(values, str):
             source = [item.strip() for item in values.split(",")]
         elif isinstance(values, list):
@@ -404,6 +433,7 @@ class MemoryService:
         return [item for item in MemoryService._normalize_profile_list(source, limit=limit) if item]
 
     def _resolve_paper_payload(self, arxiv_id: str, paper_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """优先使用显式传入的论文载荷，缺失时再从数据库读取论文信息。"""
         if isinstance(paper_payload, dict) and paper_payload:
             return dict(paper_payload)
         paper = self.db_service.get_paper(arxiv_id)
@@ -414,6 +444,7 @@ class MemoryService:
         arxiv_id: str,
         paper_payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, List[str]]:
+        """从论文元数据中提取可用于更新用户画像的主题、分类与代表论文信号。"""
         paper = self._resolve_paper_payload(arxiv_id, paper_payload=paper_payload)
         categories = self._normalize_categories(paper.get("categories"), limit=12)
         title = str(paper.get("title") or "").strip()
@@ -433,15 +464,18 @@ class MemoryService:
         patch: Optional[Dict[str, Any]],
         source: str,
     ) -> Dict[str, Any]:
+        """按来源策略更新用户研究画像，区分手动覆盖与系统增量合并。"""
         resolved_user_id = self._resolve_user_id(user_id)
         normalized_source = str(source or "unknown").strip().lower() or "unknown"
         current = self.load_user_profile(resolved_user_id)
         incoming = dict(patch or {})
 
         if normalized_source in {"manual_upsert", "manual_put"}:
+            # 显式全量覆盖类来源直接交给 upsert，允许调用方完整重写画像。
             return self.db_service.upsert_user_research_profile(user_id=resolved_user_id, profile=incoming)
 
         if normalized_source in {"manual", "api", "user"}:
+            # 人工/API 直接 patch 时，默认认为调用方已经自行控制字段粒度。
             return self.db_service.patch_user_research_profile(user_id=resolved_user_id, profile=incoming)
 
         merged_patch: Dict[str, Any] = {}
@@ -455,6 +489,7 @@ class MemoryService:
         }
         for field_name, limit in list_limits.items():
             if field_name in incoming:
+                # 系统自动写入画像时，统一采用列表合并而不是覆盖，避免历史偏好被瞬间抹掉。
                 merged_patch[field_name] = self._merge_profile_list(current.get(field_name), incoming.get(field_name), limit=limit)
 
         if normalized_source in {"manual_answer_style", "manual_style"} and "preferred_answer_style" in incoming:
@@ -465,8 +500,10 @@ class MemoryService:
         return self.db_service.patch_user_research_profile(user_id=resolved_user_id, profile=merged_patch)
 
     def update_profile_from_note(self, user_id: Optional[str], note: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """根据用户保存并允许入画像的笔记内容更新长期研究画像。"""
         normalized_note = dict(note or {})
         if not normalized_note or not normalized_note.get("include_in_profile"):
+            # 只有显式标记 include_in_profile 的笔记，才会参与长期画像学习。
             return self.load_user_profile(user_id)
 
         arxiv_id = str(normalized_note.get("arxiv_id") or "").strip()
@@ -489,12 +526,14 @@ class MemoryService:
         action_type: str,
         paper_payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """根据喜欢/不喜欢等显式偏好动作更新用户长期画像。"""
         normalized_action = str(action_type or "").strip().lower()
         if normalized_action not in {"like", "liked", "dislike", "disliked", "not_interested"}:
             return self.load_user_profile(user_id)
 
         paper_signals = self._extract_paper_profile_signals(arxiv_id, paper_payload=paper_payload)
         if normalized_action in {"like", "liked"}:
+            # 正反馈同时增强主题、近期兴趣、分类偏好与代表论文。
             patch = {
                 "positive_topics": paper_signals.get("positive_topics", []),
                 "recent_topics": paper_signals.get("positive_topics", []),
@@ -503,6 +542,7 @@ class MemoryService:
             }
             return self.patch_user_profile(user_id, patch, source="liked_paper")
 
+        # 负反馈当前主要沉淀为 negative_topics，避免直接过度干预正向画像字段。
         patch = {
             "negative_topics": paper_signals.get("positive_topics", []),
         }
@@ -515,11 +555,13 @@ class MemoryService:
         action_type: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """根据通用论文动作分发到对应画像更新逻辑。"""
         normalized_action = str(action_type or "").strip().lower()
         if normalized_action in {"like", "liked", "dislike", "disliked", "not_interested"}:
             return self.update_profile_from_preference(user_id, arxiv_id, normalized_action)
 
         if normalized_action == "note_saved" and isinstance(metadata, dict) and metadata.get("include_in_profile"):
+            # note_saved 本身不是显式偏好，但如果笔记允许入画像，就按笔记信号处理。
             note_like_payload = {
                 "arxiv_id": arxiv_id,
                 "note_type": metadata.get("note_type"),
@@ -531,6 +573,7 @@ class MemoryService:
         return self.load_user_profile(user_id)
 
     def load_preference_summary(self, user_id: Optional[str]) -> Dict[str, Any]:
+        """加载用户偏好摘要，包括点赞/点踩、动作映射与兴趣向量。"""
         resolved_user_id = self._resolve_user_id(user_id)
         liked_papers = self.db_service.get_liked_papers(user_id=resolved_user_id)
         disliked_papers = self.db_service.get_disliked_papers(user_id=resolved_user_id)
@@ -553,6 +596,7 @@ class MemoryService:
         return summary.to_dict()
 
     def build_user_memory_summary(self, user_id: Optional[str]) -> Dict[str, Any]:
+        """构造面向前端与 Agent 的用户记忆摘要视图。"""
         resolved_user_id = self._resolve_user_id(user_id)
         profile = self.load_user_profile(resolved_user_id)
         preference_summary = self.load_preference_summary(resolved_user_id)
@@ -575,6 +619,7 @@ class MemoryService:
         for cluster in interest_clusters[:3]:
             if not isinstance(cluster, dict):
                 continue
+            # 这里只提炼展示层真正关心的簇摘要，避免把完整向量等重数据暴露出去。
             interest_clusters_summary.append(
                 {
                     "cluster_id": cluster.get("cluster_id"),
@@ -618,6 +663,7 @@ class MemoryService:
         }
 
     def load_paper_notes(self, user_id: Optional[str], arxiv_id: str) -> List[Dict[str, Any]]:
+        """读取指定用户在某篇论文下保存的笔记列表。"""
         resolved_user_id = self._resolve_user_id(user_id)
         return self.db_service.list_paper_notes(arxiv_id=arxiv_id, user_id=resolved_user_id)
 
@@ -628,6 +674,7 @@ class MemoryService:
         session_id: Optional[str] = None,
         limit: int = 5,
     ) -> Dict[str, Any]:
+        """读取单篇论文的对话历史，并选择一个最合适的会话作为当前会话。"""
         resolved_user_id = self._resolve_user_id(user_id)
         message_limit = self._coerce_limit(limit)
         requested_session_id = str(session_id or "").strip() or None
@@ -638,6 +685,7 @@ class MemoryService:
         if requested_session_id:
             candidate_session = self.db_service.get_paper_chat_session(requested_session_id, user_id=resolved_user_id)
             if candidate_session and candidate_session.get("arxiv_id") == arxiv_id:
+                # 调用方显式指定 session_id 时，优先使用该会话，但前提是论文归属匹配。
                 selected_session = candidate_session
                 sessions = [candidate_session]
             else:
@@ -649,6 +697,7 @@ class MemoryService:
                 )
 
         if selected_session is None:
+            # 未指定或指定失败时，退化为按论文读取最近会话，并默认取第一条作为当前会话。
             sessions = self.db_service.list_paper_chat_sessions(
                 arxiv_id=arxiv_id,
                 user_id=resolved_user_id,
@@ -664,6 +713,7 @@ class MemoryService:
                 user_id=resolved_user_id,
             )
             total_messages = len(all_messages)
+            # 返回给调用方的是最近若干条消息，但 total_messages 会保留完整规模信息。
             messages = all_messages[-message_limit:]
 
         history = PaperChatHistory(
@@ -690,6 +740,7 @@ class MemoryService:
         include_chat_history: bool = True,
         chat_limit: int = 5,
     ) -> Dict[str, Any]:
+        """按需聚合用户画像、偏好、笔记与聊天历史，构造统一后端记忆快照。"""
         resolved_user_id = self._resolve_user_id(user_id)
         snapshot = BackendMemorySnapshot(
             user_profile=self.load_user_profile(resolved_user_id) if include_profile else None,
@@ -714,6 +765,7 @@ class MemoryService:
         session_id: Optional[str],
         frontend_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """加载 Agent 会话记忆，并把后端记忆上下文与前端上下文合并。"""
         resolved_user_id = self._resolve_user_id(user_id)
         agent_session = self.db_service.create_or_get_agent_session(
             user_id=resolved_user_id,
@@ -737,6 +789,7 @@ class MemoryService:
         session_id: Optional[str],
         final_state: Any,
     ) -> Optional[Dict[str, Any]]:
+        """把 Agent 最终状态提炼成会话记忆补丁，并写回持久化会话记录。"""
         resolved_user_id = self._resolve_user_id(user_id)
         agent_session = self.db_service.create_or_get_agent_session(
             user_id=resolved_user_id,
@@ -750,6 +803,7 @@ class MemoryService:
             return agent_session
 
         memory_patch = self._extract_agent_memory_patch(final_state)
+        # update_agent_session 采用 patch 语义，避免每轮都覆盖整个已存会话记忆对象。
         self.db_service.update_agent_session(
             session_id=resolved_session_id,
             user_id=resolved_user_id,
@@ -769,6 +823,7 @@ class MemoryService:
         frontend_context: Optional[Dict[str, Any]] = None,
         extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """构造统一的记忆调试结果，供前端观测或问题排查使用。"""
         resolved_user_id = self._resolve_user_id(user_id)
         return build_memory_debug_payload(
             user_id=resolved_user_id,
@@ -786,6 +841,7 @@ class MemoryService:
         frontend_context: Optional[Dict[str, Any]],
         backend_memory: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        """把前端上下文与后端记忆块合并为一个可直接下发的上下文结构。"""
         merged_context = dict(frontend_context or {})
         existing_memory = merged_context.get("backend_memory")
         if isinstance(existing_memory, dict) and isinstance(backend_memory, dict):

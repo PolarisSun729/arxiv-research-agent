@@ -53,6 +53,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         oai_db_service: Optional[ArxivOaiDatabaseService] = None,
         collection_name: str = "arxiv_paper_embeddings",
     ):
+        """组装推荐链路依赖，并初始化推荐与回填流程所需的运行时状态。"""
         self.db_service = db_service
         self.memory_service = memory_service or MemoryService(db_service=self.db_service)
         self.embedding_service = embedding_service
@@ -67,10 +68,12 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         self.memory_runtime_config = get_memory_runtime_config()
 
     def _memory_flag(self, key: str, default: Any = None) -> Any:
+        """读取记忆模块的运行时开关，避免在推荐主流程中散落硬编码配置访问。"""
         return self.memory_runtime_config.get(key, default)
 
     @staticmethod
     def _normalize_text_terms(values: Any) -> List[str]:
+        """把字符串或字符串列表规范化为小写词项列表，便于后续执行包含匹配。"""
         if not values:
             return []
         if isinstance(values, list):
@@ -85,6 +88,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         return normalized
 
     def _build_profile_signal_bundle(self, user_id: str) -> Dict[str, Any]:
+        """收集长期研究画像与行为侧信号，并给出需要排除的论文 ID 集合。"""
         if not bool(self._memory_flag("enable_user_research_profile", False)):
             return {
                 "profile": {},
@@ -117,6 +121,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         profile: Optional[Dict[str, Any]] = None,
         actions: Optional[Dict[str, List[str]]] = None,
     ) -> Dict[str, Any]:
+        """根据长期兴趣主题、偏好分类与行为状态，为候选论文追加画像修正分。"""
         profile = profile or {}
         actions = actions or {}
         arxiv_id = str(candidate.get("arxiv_id", "") or candidate.get("id", "") or "").strip()
@@ -137,6 +142,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         matched_negative = [topic for topic in negative_topics if topic and topic in haystack]
         matched_categories = sorted(categories & preferred_categories)
 
+        # 对 favorite/later/read 这类行为做轻量修正，避免长期画像完全忽略近期显式动作。
         action_boost = 0.0
         if arxiv_id and arxiv_id in self._normalize_text_terms(actions.get("favorite", [])):
             action_boost += 0.08
@@ -168,6 +174,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         }
 
     def _get_or_refresh_interest_vector(self, user_id: str) -> Dict[str, Any]:
+        """读取用户兴趣向量；如果缺失或过期，则自动触发重建。"""
         vector_data = self.db_service.get_user_interest_vector(user_id=user_id)
         latest_preference_ts = self.db_service.get_latest_user_signal_timestamp(user_id=user_id)
 
@@ -192,6 +199,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         top_n: int = RECOMMENDATION_CONFIG["default_top_n"],
         max_age_months: int = RECOMMENDATION_CONFIG["default_max_age_months"],
     ) -> Dict[str, Any]:
+        """执行完整推荐流程，包括画像读取、候选召回、物化、打分与多样性筛选。"""
         user_vector_data = self._get_or_refresh_interest_vector(user_id)
         user_vector = user_vector_data["vector_data"]
         interest_clusters = user_vector_data.get("interest_clusters", []) or []
@@ -213,6 +221,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         candidate_limit = max(top_n * 5, 50)
         cluster_recall_candidates: List[Dict[str, Any]] = []
         if interest_clusters:
+            # 有多兴趣簇时优先走簇召回，以便覆盖用户不同研究子方向。
             cluster_recall_candidates = self._fetch_cluster_recall_candidates(
                 interest_clusters=interest_clusters,
                 excluded_ids=excluded_ids,
@@ -229,6 +238,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             candidates = cluster_recall_candidates
             recall_mode = "cluster_recall"
         else:
+            # 没有可用簇召回结果时，退化到近期论文池，保证推荐链路可用性。
             candidates = self._fetch_recent_db_candidates(
                 liked_category_freq=liked_category_freq,
                 max_age_months=max_age_months,
@@ -267,6 +277,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             if not filtered_candidates:
                 raise HTTPException(status_code=400, detail=f"No papers found for recommendation within the last {max_age_months} months")
 
+        # 统一补齐候选论文的论文表与 embedding 数据，后续排序才有稳定输入。
         materialized_candidates, materialize_stats = self._materialize_candidate_papers_for_recommendation(filtered_candidates)
         logger.info(
             "Materialized candidate papers for user %s: total=%s reused=%s db_only=%s batch_embedded=%s batch_inserted=%s unresolved=%s",
@@ -295,6 +306,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         for candidate in materialized_candidates:
             arxiv_id = str(candidate.get("arxiv_id", "") or "").strip()
             if arxiv_id in candidate_embedding_map:
+                # 先挂载已存向量，排序阶段会优先复用，减少 embedding API 成本。
                 candidate["_stored_vector"] = candidate_embedding_map[arxiv_id]
                 reused_vector_count += 1
 
@@ -304,6 +316,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         recomputed_vector_count = 0
         missing_vector_count = 0
         for candidate in materialized_candidates:
+            # 先做基础相关性打分，再叠加长期画像修正，最后交给多样性选择器。
             scored_candidate = self._build_candidate_score(
                 candidate=candidate,
                 liked_category_freq=liked_category_freq,
@@ -383,12 +396,10 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         top_n: int,
         search_spec: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """
-        Deterministically rerank search results for a specific user.
+        """对已有搜索结果做确定性重排，并在可用时叠加个性化排序能力。
 
-        The method keeps the existing search results intact when personalization
-        cannot be applied, and it reuses the same embedding/vector logic that the
-        recommendation pipeline already uses.
+        该方法不会改变搜索服务召回出的论文集合，只会在原集合内部重新打分。
+        如果用户画像、偏好或候选向量不可用，会自动降级到基于查询匹配的普通重排。
         """
         normalized_papers = [paper for paper in papers if isinstance(paper, dict)]
         limit = max(1, min(int(top_n or len(normalized_papers) or 1), len(normalized_papers) or 1))
@@ -411,6 +422,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         research_profile = profile_bundle.get("profile", {})
         paper_actions = profile_bundle.get("actions", {})
         try:
+            # 个性化能力依赖兴趣向量；读取失败时不报错终止，而是保留普通搜索结果能力。
             user_vector_data = self._get_or_refresh_interest_vector(user_id)
             personalized_available = True
         except Exception as exc:
@@ -480,6 +492,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
 
             if personalized_available and user_vector:
                 try:
+                    # 查询相关性与个性化相关性分别计算，再在后续阶段做融合。
                     ranked_candidate = self._build_candidate_score(
                         candidate=candidate,
                         liked_category_freq=liked_category_freq,

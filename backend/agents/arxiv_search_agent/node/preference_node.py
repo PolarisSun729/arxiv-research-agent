@@ -1,3 +1,12 @@
+"""处理用户对论文的显式偏好动作。
+
+这个节点负责把自然语言里的“喜欢 / 不喜欢 / 取消标记”落到推荐系统：
+1. 解析动作类型与撤销范围；
+2. 结合上下文定位目标论文；
+3. 调用推荐服务写入或删除偏好记录；
+4. 把结果同步回 AgentState，供推荐与最终回复节点使用。
+"""
+
 from __future__ import annotations
 
 import sys
@@ -22,6 +31,15 @@ from ..utils.text_utils import _matches_any, _normalize_text
 
 
 def _parse_preference_action(message: str) -> Optional[Dict[str, str]]:
+    """从用户输入中提取偏好动作及其移除范围。
+    
+    主要步骤：
+    1. 先归一化文本并处理空输入；
+    2. 识别 remove 场景时进一步区分只撤销 liked、只撤销 disliked，还是两边都删；
+    3. 判断顺序固定为 remove -> dislike -> like，避免“取消喜欢”误命中“喜欢”。
+    
+    输出：返回包含 action 和 remove_scope 的字典；无法识别时返回 None。
+    """
     text = _normalize_text(message)
     lowered = text.lower()
     if not text:
@@ -52,12 +70,14 @@ def _parse_preference_action(message: str) -> Optional[Dict[str, str]]:
         r"对.*感兴趣",
     )
 
+    # 移除偏好时需要知道用户想撤销哪一类标记，默认保守地尝试两边都删除。
     remove_scope = "both"
     if _matches_any(text, (r"取消.*喜欢", r"撤销.*喜欢")):
         remove_scope = "liked"
     elif _matches_any(text, (r"取消.*不喜欢", r"撤销.*不喜欢")):
         remove_scope = "disliked"
 
+    # 先判断 remove，再判断 dislike / like，避免“取消喜欢”被误识别成“喜欢”。
     if _matches_any(text, remove_patterns):
         return {"action": "remove", "remove_scope": remove_scope}
     if _matches_any(text, dislike_patterns) or "dislike" in lowered:
@@ -68,6 +88,16 @@ def _parse_preference_action(message: str) -> Optional[Dict[str, str]]:
 
 
 def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    """执行论文偏好更新，并把结果写回 AgentState。
+    
+    主流程分为四步：
+    1. 校验当前 intent 是否为 preference_action；
+    2. 解析动作并定位目标论文；
+    3. 根据 like / dislike / remove 分支调用不同服务逻辑；
+    4. 统一记录 preference_action_result、tool_calls、warnings 和 step trace。
+    
+    输出：无论成功还是失败，都会返回包含可复盘执行痕迹的 AgentState。
+    """
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
 
@@ -81,6 +111,7 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
             outputs={"reason": "当前请求不是 preference_action"},
         )
 
+    # 先把输入和引用论文解析成结构化对象，后续所有分支都复用这些结果。
     message = _normalize_text(next_state.message or "")
     parsed_action = _parse_preference_action(message)
     resolution = _resolve_paper_reference(message, next_state.context or {})
@@ -100,6 +131,7 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
             "更新用户偏好",
         ]
 
+    # 第一类失败：动作本身就无法识别，此时不再继续做论文解析和服务调用。
     if parsed_action is None:
         preference_result = {
             "status": "failed",
@@ -112,6 +144,7 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
             "error": "unsupported preference action",
         }
         next_state.warnings = _dedupe_preserve_order(list(next_state.warnings) + [preference_result["message"]])
+    # 第二类失败：动作明确，但目标论文不明确，避免把偏好写到错误对象上。
     elif resolution.get("status") != "success" or not arxiv_id:
         preference_result = {
             "status": "failed",
@@ -125,7 +158,9 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
         }
         next_state.warnings = _dedupe_preserve_order(list(next_state.warnings) + [preference_result["message"]])
     else:
+        # 只有动作和目标论文都明确时，才真正写入或删除偏好记录。
         try:
+            # like / dislike 都走统一的偏好记录接口，只是 liked 标志不同。
             if parsed_action["action"] in {"like", "dislike"}:
                 tool_name = "record_user_paper_preference"
                 liked = parsed_action["action"] == "like"
@@ -151,6 +186,7 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
                 removed_liked = False
                 removed_disliked = False
                 remove_errors: List[str] = []
+                # 移除逻辑允许分别删除 liked / disliked，兼容“只取消喜欢”这类表达。
                 if remove_scope in {"both", "liked"}:
                     removed_liked = bool(preference_service.db_service.remove_liked_paper(user_id=user_id, arxiv_id=arxiv_id))
                 if remove_scope in {"both", "disliked"}:
@@ -189,6 +225,7 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
             "也可以继续搜索、查看推荐或打开论文详情",
         ]
 
+    # 即使当前动作失败，也保留统一的工具调用记录，方便前端或日志层复盘原因。
     next_state.tool_name = tool_name
     next_state.tool_args = tool_args
     next_state.tool_result = dict(preference_result)

@@ -1,3 +1,14 @@
+"""搜索规格构建、清洗和规则补全过程工具。
+
+这个模块负责把自然语言里的主题、时间范围、数量和排序偏好，
+逐步整理成可执行的 ArxivSearchSpec。
+
+它是 parse_node 背后的“搜索参数工程层”：
+1. 负责把零散文本线索提取成结构化字段；
+2. 负责对 LLM 输出的 spec 做规则化清洗和兜底；
+3. 负责生成适合调试和解释的 reasoning_summary。
+"""
+
 from __future__ import annotations
 
 import re
@@ -88,6 +99,10 @@ GENERIC_STOPWORDS = {
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
+    """安全地把值转换为 int；失败时返回默认值。
+
+    这类函数主要服务于自然语言解析后的弱类型数据，避免单个字段解析失败中断整轮 spec 构建。
+    """
     try:
         return int(str(value).strip())
     except Exception:
@@ -95,6 +110,10 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 
 def _safe_optional_int(value: Any) -> Optional[int]:
+    """把输入安全解析成非负整数；不合法时返回 None。
+
+    与 _safe_int 的区别在于，这里显式保留“缺失值”语义，适合 submitted_days_ago 这类可选字段。
+    """
     if value is None or value == "":
         return None
     if isinstance(value, bool):
@@ -107,10 +126,15 @@ def _safe_optional_int(value: Any) -> Optional[int]:
 
 
 def _clamp(value: int, minimum: int, maximum: int) -> int:
+    """把整数裁剪到指定闭区间内。
+
+    用于限制 max_results、submitted_days_ago 等字段，防止自然语言或模型输出给出异常范围。
+    """
     return max(minimum, min(maximum, int(value)))
 
 
 def _normalize_sort_by(value: Any) -> str:
+    """把排序字段标准化为 arXiv 工具可接受的枚举值。"""
     text = _normalize_text(str(value or ""))
     lowered = text.lower()
     if lowered in {"relevance"}:
@@ -121,21 +145,28 @@ def _normalize_sort_by(value: Any) -> str:
 
 
 def _normalize_sort_order(value: Any) -> str:
+    """把排序方向标准化为 ascending / descending。"""
     text = _normalize_text(str(value or "")).lower()
     return "ascending" if text == "ascending" else "descending"
 
 
 def _normalize_field_operator(value: Any) -> str:
+    """标准化字段组合运算符，限制在允许集合内。"""
     text = _normalize_text(str(value or "")).upper()
     return text if text in {"AND", "OR", "ANDNOT"} else "AND"
 
 
 def _normalize_category_operator(value: Any) -> str:
+    """标准化类别组合运算符，限制在允许集合内。"""
     text = _normalize_text(str(value or "")).upper()
     return text if text in {"AND", "OR"} else "OR"
 
 
 def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
+    """按顺序去重字符串列表。
+
+    这里保留原顺序是因为 query token、warnings 等序列本身就带有用户表达顺序信息。
+    """
     seen = set()
     result: List[str] = []
     for item in items:
@@ -147,6 +178,10 @@ def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
 
 
 def _normalize_and_validate_spec(payload: Mapping[str, Any]) -> Optional[ArxivSearchSpec]:
+    """把原始 payload 规范化并校验为 ArxivSearchSpec。
+
+    该函数主要用于消费 LLM 输出，目标是把宽松 JSON 约束成稳定、可执行的业务对象。
+    """
     intent = str(payload.get("intent", "arxiv_search") or "arxiv_search").strip().lower()
     if intent not in SUPPORTED_INTENTS or intent != "arxiv_search":
         return None
@@ -168,10 +203,12 @@ def _normalize_and_validate_spec(payload: Mapping[str, Any]) -> Optional[ArxivSe
 
 
 def _user_mentioned_abstract(message: str) -> bool:
+    """判断用户是否明确提到了摘要字段搜索。"""
     return bool(re.search(r"(?:摘要|abstract)\s*(?:包含|是|有|为|里|中|搜索|contains|contain)", message, re.IGNORECASE))
 
 
 def _user_mentioned_title(message: str) -> bool:
+    """判断用户是否明确提到了标题字段搜索。"""
     return bool(re.search(r"(?:标题|题目|title)\s*(?:包含|是|有|为|里|中|搜索|contains|contain)", message, re.IGNORECASE))
 
 
@@ -182,6 +219,11 @@ def _post_process_cleaned_spec(
     cleaned_topic_cn: Optional[str] = None,
     cleaned_topic_en: Optional[str] = None,
 ) -> Tuple[ArxivSearchSpec, List[str]]:
+    """对已生成的 search spec 做二次清洗和字段纠偏。
+
+    这一步主要服务于 LLM 输出：优先保留模型识别的主题，但会结合 cleaned_topic_*、
+    原始消息和显式字段提示，把 query/title_query/abstract_query 修正到更可执行的状态。
+    """
     warnings: List[str] = []
 
     normalized_query = _normalize_topic_phrase(cleaned_topic_en or "") if cleaned_topic_en else None
@@ -210,6 +252,10 @@ def _post_process_cleaned_spec(
 
 
 def _build_spec_from_rules(message: str) -> Optional[ArxivSearchSpec]:
+    """仅基于规则从消息中直接构造 search spec。
+
+    当 LLM 不可用、输出不可信或置信度不足时，这个函数提供纯规则兜底能力。
+    """
     query = _extract_query_from_message(message)
     title_query = _extract_marked_query(message, TITLE_HINT_PATTERNS)
     abstract_query = _extract_marked_query(message, ABSTRACT_HINT_PATTERNS)
@@ -238,6 +284,10 @@ def _build_spec_from_rules(message: str) -> Optional[ArxivSearchSpec]:
 
 
 def _apply_rule_enrichment(message: str, spec: ArxivSearchSpec) -> Optional[ArxivSearchSpec]:
+    """在已有 spec 基础上叠加规则补全，生成更可执行的最终版本。
+
+    它不会推翻已有 spec 的核心语义，而是补齐时间范围、排序、默认类别、运算符等隐含字段。
+    """
     query = spec.query or _extract_query_from_message(message)
     title_query = spec.title_query
     abstract_query = spec.abstract_query
@@ -266,6 +316,11 @@ def _apply_rule_enrichment(message: str, spec: ArxivSearchSpec) -> Optional[Arxi
 
 
 def _extract_query_from_message(message: str) -> Optional[str]:
+    """从用户消息中提取最可能的主题 query。
+
+    提取顺序为：显式提示词模式 -> 噪声清理 -> 中英混合 token 过滤，
+    尽量在可解释性和鲁棒性之间取得平衡。
+    """
     for pattern in QUERY_HINT_PATTERNS:
         match = re.search(pattern, message, flags=re.IGNORECASE)
         if match:
@@ -280,6 +335,7 @@ def _extract_query_from_message(message: str) -> Optional[str]:
 
 
 def _extract_marked_query(message: str, patterns: Iterable[str]) -> Optional[str]:
+    """根据给定提示模式提取标题/摘要等字段查询词。"""
     for pattern in patterns:
         match = re.search(pattern, message, flags=re.IGNORECASE)
         if match:
@@ -290,6 +346,7 @@ def _extract_marked_query(message: str, patterns: Iterable[str]) -> Optional[str
 
 
 def _extract_submitted_days_ago(message: str) -> Optional[int]:
+    """从消息中解析“最近多少天/周/月”这类时间范围。"""
     lowered = message.lower()
     for pattern, fixed_value in TIME_PATTERNS:
         match = re.search(pattern, message, flags=re.IGNORECASE)
@@ -308,6 +365,7 @@ def _extract_submitted_days_ago(message: str) -> Optional[int]:
 
 
 def _extract_max_results(message: str) -> int:
+    """从消息中提取期望返回的论文数量，并裁剪到允许范围。"""
     for pattern in COUNT_PATTERNS:
         match = re.search(pattern, message, flags=re.IGNORECASE)
         if match:
@@ -320,6 +378,10 @@ def _extract_max_results(message: str) -> int:
 
 
 def _extract_sorting(message: str) -> Tuple[str, str]:
+    """从消息中推断排序字段与方向。
+
+    当前只做轻量规则判断：偏相关性时走 relevance，提到最新/最近时走 submittedDate。
+    """
     lowered = message.lower()
     if any(keyword in lowered for keyword in ("最相关", "相关度高", "most relevant", "relevant", "relevance")):
         return "relevance", "descending"
@@ -335,6 +397,10 @@ def _build_reasoning_summary(
     max_results: int,
     sort_by: str,
 ) -> str:
+    """把关键搜索参数拼成简洁的中文 reasoning 摘要。
+
+    该摘要主要用于调试和前端解释，让调用方快速看到 spec 的核心组成部分。
+    """
     parts: List[str] = []
     if query:
         parts.append(f"主题={query}")
@@ -348,6 +414,7 @@ def _build_reasoning_summary(
 
 
 def _normalize_topic_phrase(value: Optional[str]) -> Optional[str]:
+    """把候选主题短语清洗成稳定、紧凑的 query 表达。"""
     text = _normalize_text(value or "")
     if not text:
         return None
@@ -363,6 +430,7 @@ def _normalize_topic_phrase(value: Optional[str]) -> Optional[str]:
 
 
 def _remove_noise(text: str) -> str:
+    """移除时间、数量、泛化动词和标点等搜索噪声。"""
     result = text
     result = _remove_patterns(result, TIME_PATTERNS)
     result = _strip_count_phrases(result)
@@ -377,6 +445,7 @@ def _remove_noise(text: str) -> str:
 
 
 def _remove_patterns(text: str, compiled_patterns: Iterable[Tuple[str, int]]) -> str:
+    """按给定正则模式批量删除文本片段。"""
     result = text
     for pattern, _ in compiled_patterns:
         result = re.sub(pattern, " ", result, flags=re.IGNORECASE)
@@ -384,6 +453,7 @@ def _remove_patterns(text: str, compiled_patterns: Iterable[Tuple[str, int]]) ->
 
 
 def _strip_count_phrases(text: str) -> str:
+    """移除“3 篇论文”“十篇 paper”这类数量短语。"""
     result = text
     for pattern in COUNT_PATTERNS:
         result = re.sub(pattern, " ", result, flags=re.IGNORECASE)
@@ -391,11 +461,13 @@ def _strip_count_phrases(text: str) -> str:
 
 
 def _tokenize_mixed(text: str) -> List[str]:
+    """对中英文混合文本做轻量 token 切分。"""
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9+\-_/\.]*|[\u4e00-\u9fff]{2,}", text)
     return [token.strip() for token in tokens if token and token.strip()]
 
 
 def _is_topic_token(token: str) -> bool:
+    """判断一个 token 是否值得保留为主题词。"""
     normalized = token.strip().lower()
     if not normalized:
         return False

@@ -1,3 +1,11 @@
+"""把中间状态整理成最终返回给用户的自然语言答复。
+
+这个节点是工作流的最后一站，不执行搜索或问答本身，而是：
+1. 按优先级检查论文阅读、待确认任务、偏好操作和搜索结果；
+2. 选择对应的话术模板、后续建议和错误提示；
+3. 生成最终 answer，并把 next_actions 保持在可直接展示的结构上。
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Tuple, Union
@@ -8,6 +16,13 @@ from .search_node import _collect_priority_titles, _summarize_search_spec
 
 
 def _build_non_search_answer(intent: str) -> Tuple[str, List[str]]:
+    """为未真正进入搜索执行链路的意图生成兜底回复。
+    
+    主要用途：
+    1. 给 paper_summary / paper_detail / recommendation 等非搜索分支提供解释性文案；
+    2. 在当前轮缺少可执行上下文时，明确告诉用户还缺什么；
+    3. 统一返回 answer 与 next_actions，避免各分支自行拼接不一致的话术。
+    """
     if intent == "paper_summary":
         return (
             "我已经识别到你想总结某篇论文，但当前这次请求还没有拿到可执行的目标论文上下文。你可以直接给我论文标题、arXiv ID，或先搜索后再让我总结。",
@@ -81,6 +96,17 @@ def _build_non_search_answer(intent: str) -> Tuple[str, List[str]]:
 
 
 def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    """根据 AgentState 中的执行结果生成最终用户答复。
+    
+    优先级从高到低依次处理：
+    1. 论文阅读成功或失败；
+    2. 挂起任务的确认、取消与等待提示；
+    3. 偏好动作结果；
+    4. arXiv 搜索结果；
+    5. 非搜索兜底文案。
+    
+    输出：返回 answer、next_actions 已就绪的 AgentState，并追加 final_answer_generation trace。
+    """
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
 
@@ -88,6 +114,7 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
     paper_qa_result = dict(next_state.paper_qa_result or {})
     confirmation_decision = str((next_state.debug or {}).get("pending_action_decision") or "").strip().lower()
 
+    # 已经拿到论文 QA 的最终答案时，直接复用该答案，不再重新包装过多说明。
     if next_state.intent in {"paper_summary", "paper_detail", "paper_qa"} and paper_qa_result.get("status") == "success":
         next_state.answer = str(paper_qa_result.get("answer") or next_state.answer or "").strip()
         if not next_state.next_actions:
@@ -108,6 +135,7 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
             },
         )
 
+    # 只有在用户明确确认过解析后仍失败，才返回明确的失败提示；否则可能还处于等待确认阶段。
     if next_state.intent in {"paper_summary", "paper_detail", "paper_qa"} and paper_qa_result.get("status") == "failed" and confirmation_decision == "confirm":
         error_message = str(paper_qa_result.get("error") or paper_qa_result.get("answer") or "论文解析或问答执行失败").strip()
         next_state.answer = error_message
@@ -125,6 +153,8 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
             error=error_message,
         )
 
+    # 待确认任务的回复要精确区分：取消、无关新请求、仍未说清楚、以及继续执行中的提示。
+    # 待确认任务的回复最容易和普通失败提示混淆，因此这里单独拆成一组细分分支。
     if isinstance(pending_action, dict) and str(pending_action.get("type") or "").strip() == "parse_then_qa":
         title = str(pending_action.get("title") or "").strip()
         arxiv_id = str(pending_action.get("arxiv_id") or "").strip()
@@ -151,6 +181,7 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
         else:
             pending_message = str(paper_qa_result.get("answer") or "").strip()
             if not pending_message:
+                # 当当前轮次没有生成新的 answer 时，需要根据确认状态补一条明确、可执行的提示语。
                 pending_message = (
                     f"{base_prompt} 还没有建立问答索引。是否现在解析 PDF 并创建全文检索索引？"
                     if confirmation_decision != "unrelated"
@@ -180,6 +211,7 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
             outputs={"answer": next_state.answer, "next_actions": list(next_state.next_actions)},
         )
 
+    # 偏好动作以“动作是否成功”为主来组织答复，同时补充标题和 arXiv ID 便于用户确认对象。
     if next_state.intent == "preference_action":
         result = next_state.preference_action_result or {}
         title = str(result.get("title") or "").strip()
@@ -226,6 +258,7 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
             outputs={"answer": next_state.answer, "next_actions": list(next_state.next_actions), "label": label},
         )
 
+    # 搜索回复会结合是否做过个性化重排，给出不同的解释和后续建议。
     if next_state.intent == "arxiv_search":
         spec = next_state.search_spec
         papers = list(next_state.papers or [])

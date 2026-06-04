@@ -1,3 +1,10 @@
+"""arXiv 在线搜索服务模块。
+
+该模块负责与 arXiv 官方 API 交互，提供查询构造、结果解析、限流控制、
+重试请求以及 PDF 下载等能力。它是面向实时在线检索场景的服务实现，与
+本地 OAI 数据库检索服务形成互补。
+"""
+
 from typing import List, Dict, Any, Optional, Union
 import logging
 from datetime import datetime, timedelta, timezone
@@ -33,13 +40,15 @@ logger = logging.getLogger(__name__)
 
 class RateLimitError(Exception):
     """
-    自定义异常：API 请求被限流
+    自定义异常：API 请求被限流。
     """
     pass
 
 class SearchField(str, Enum):
     """
-    arXiv API 搜索字段前缀枚举
+    arXiv API 搜索字段前缀枚举。
+
+    这些前缀用于把用户输入映射到 arXiv 查询语法中的具体字段。
     参考: https://info.arxiv.org/help/api/user-manual.html
     """
     TITLE = "ti"
@@ -54,9 +63,13 @@ class SearchField(str, Enum):
 
 class ArxivSearchService:
     """
-    arXiv论文搜索和获取服务类
-    提供论文搜索、元数据获取和PDF下载功能
-    支持完整的arXiv API查询语法
+    arXiv 在线论文搜索服务。
+
+    该服务面向在线场景，负责：
+    1. 组装 arXiv API 查询 URL；
+    2. 控制请求速率与失败重试；
+    3. 解析 Atom feed 结果；
+    4. 对外返回统一格式的论文元数据。
     """
     
     USER_AGENTS = [
@@ -81,8 +94,13 @@ class ArxivSearchService:
     
     def __init__(self, proxy_url: Optional[str] = None):
         """
-        初始化arXiv搜索服务
-        设置API端点和保存目录
+        初始化 arXiv 搜索服务。
+
+        参数:
+            proxy_url (Optional[str]): 可选代理地址；为空时会继续尝试从环境变量读取。
+
+        返回:
+            None
         """
         self.api_base_url = "https://export.arxiv.org/api/query"
         self.papers_dir = "06-daily-arxiv-paper"
@@ -93,6 +111,14 @@ class ArxivSearchService:
         self._configure_proxy(proxy_url)
 
     def _configure_proxy(self, proxy_url: Optional[str] = None) -> None:
+        """配置 requests 会话代理。
+
+        参数:
+            proxy_url (Optional[str]): 显式传入的代理地址。
+
+        返回:
+            None
+        """
         resolved_proxy = (
             proxy_url
             or os.getenv("ARXIV_PROXY_URL")
@@ -114,14 +140,23 @@ class ArxivSearchService:
     
     def _get_random_user_agent(self) -> str:
         """
-        获取随机的User-Agent
+        获取随机的 User-Agent。
+
+        返回:
+            str: 随机选中的请求头 User-Agent。
         """
         return random.choice(self.USER_AGENTS)
     
     def _wait_for_rate_limit(self):
         """
-        等待速率限制间隔
-        确保两次请求之间至少间隔 RATE_LIMIT_SECONDS 秒
+        等待速率限制间隔。
+
+        返回:
+            None
+
+        说明:
+            通过类级时间戳保证连续两次请求之间至少间隔 ``RATE_LIMIT_SECONDS`` 秒，
+            以降低触发 arXiv 侧限流的概率。
         """
         import time
         current_time = time.time()
@@ -136,28 +171,28 @@ class ArxivSearchService:
     
     def build_field_query(self, field: Union[SearchField, str], query: str) -> str:
         """
-        构建字段限定查询
-        
-        Args:
-            field (Union[SearchField, str]): 搜索字段
-            query (str): 查询词
-            
-        Returns:
-            str: 格式化为 "field:query" 的查询字符串
+        构建字段限定查询。
+
+        参数:
+            field (Union[SearchField, str]): 搜索字段。
+            query (str): 查询词。
+
+        返回:
+            str: 格式化为 ``field:query`` 的查询字符串。
         """
         field_prefix = field.value if isinstance(field, SearchField) else field
         return f"{field_prefix}:{query}"
     
     def combine_queries(self, queries: List[str], operator: str = "AND") -> str:
         """
-        组合多个查询条件
-        
-        Args:
-            queries (List[str]): 查询条件列表
-            operator (str): 逻辑操作符，"AND" 或 "OR"
-            
-        Returns:
-            str: 组合后的查询字符串
+        组合多个查询条件。
+
+        参数:
+            queries (List[str]): 查询条件列表。
+            operator (str): 逻辑操作符，通常为 AND 或 OR。
+
+        返回:
+            str: 组合后的查询字符串。
         """
         if not queries:
             return ""
@@ -173,18 +208,18 @@ class ArxivSearchService:
                        sort_by: str = "relevance",
                        sort_order: str = "descending") -> str:
         """
-        构建arXiv API查询URL
-        
-        Args:
-            search_query (str): 搜索查询字符串，支持字段前缀语法
-            id_list (Optional[List[str]]): arXiv论文ID列表，用于精确匹配
-            max_results (int): 返回结果的最大数量，默认为10
-            start (int): 起始索引，用于分页，默认为0
-            sort_by (str): 排序方式："relevance", "lastUpdatedDate", "submittedDate"
-            sort_order (str): 排序顺序："ascending", "descending"
-            
-        Returns:
-            str: 构建好的查询URL
+        构建 arXiv API 查询 URL。
+
+        参数:
+            search_query (str): 搜索查询字符串，支持字段前缀语法。
+            id_list (Optional[List[str]]): arXiv 论文 ID 列表，用于精确匹配。
+            max_results (int): 返回结果的最大数量。
+            start (int): 起始索引，用于分页。
+            sort_by (str): 排序方式。
+            sort_order (str): 排序顺序。
+
+        返回:
+            str: 构建好的查询 URL。
         """
         params = {
             "start": start,
@@ -204,13 +239,13 @@ class ArxivSearchService:
     
     def parse_arxiv_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         """
-        解析单个arXiv论文条目，提取完整的元数据
-        
-        Args:
-            entry (Dict[str, Any]): feedparser解析的原始条目
-            
-        Returns:
-            Dict[str, Any]: 解析后的论文信息
+        解析单个 arXiv 论文条目，提取完整元数据。
+
+        参数:
+            entry (Dict[str, Any]): ``feedparser`` 解析后的原始条目。
+
+        返回:
+            Dict[str, Any]: 统一格式的论文信息字典。
         """
         paper = {
             "id": entry.get("id", ""),
@@ -245,13 +280,13 @@ class ArxivSearchService:
     
     def build_submitted_date_query(self, days_ago: Optional[int] = 30) -> str:
         """
-        构建提交日期范围查询字符串
-        
-        Args:
-            days_ago (Optional[int]): 多少天前的日期作为起始日期，默认为30天（一个月）
-            
-        Returns:
-            str: 格式化的submittedDate查询字符串，格式为 [YYYYMMDDTTTT+TO+YYYYMMDDTTTT]
+        构建提交日期范围查询字符串。
+
+        参数:
+            days_ago (Optional[int]): 距今天数，用作起始日期。
+
+        返回:
+            str: 格式化后的 submittedDate 查询字符串。
         """
         return build_arxiv_submitted_date_query(days_ago)
 
@@ -264,6 +299,19 @@ class ArxivSearchService:
         sort_by: str = "relevance",
         sort_order: str = "descending",
     ) -> Dict[str, Any]:
+        """执行在线 arXiv 搜索。
+
+        参数:
+            search_query (Optional[str]): 查询字符串。
+            id_list (Optional[List[str]]): 论文 ID 列表。
+            max_results (int): 最大返回条数。
+            start (int): 分页偏移量。
+            sort_by (str): 排序字段。
+            sort_order (str): 排序方向。
+
+        返回:
+            Dict[str, Any]: 标准化后的在线搜索结果。
+        """
         _validate_arxiv_search_request(
             search_query=search_query,
             id_list=id_list,
@@ -310,17 +358,17 @@ class ArxivSearchService:
     
     def _make_request_with_retry(self, url: str) -> requests.Response:
         """
-        带重试机制的HTTP请求方法
-        
-        Args:
-            url (str): 请求的URL
-            
-        Returns:
-            requests.Response: HTTP响应对象
-            
-        Raises:
-            RateLimitError: 超过最大重试次数后仍然被限流
-            requests.exceptions.RequestException: 其他请求错误
+        带重试机制的 HTTP 请求方法。
+
+        参数:
+            url (str): 请求 URL。
+
+        返回:
+            requests.Response: HTTP 响应对象。
+
+        异常:
+            RateLimitError: 超过最大重试次数后仍然被限流时抛出。
+            requests.exceptions.RequestException: 其他网络请求错误。
         """
         self._wait_for_rate_limit()
         logger.debug(

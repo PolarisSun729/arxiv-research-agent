@@ -1,3 +1,10 @@
+"""向量生成服务模块。
+
+该模块统一管理 embedding 的配置构造、provider 分发、结果缓存以及元数据
+透传逻辑。这里不仅负责生成向量，也负责保证每个向量仍然可以追溯到原始
+chunk、来源页码以及图片/表格等多模态资产，方便后续入库、检索与调试。
+"""
+
 import hashlib
 import json
 from datetime import datetime
@@ -37,6 +44,17 @@ class EmbeddingConfig:
         batch_size: Optional[int] = None,
         enable_fusion: bool = False,
     ):
+        """保存一次 embedding 调用所需的配置参数。
+
+        参数:
+            provider (str): 向量服务提供方名称。
+            model_name (str): 具体模型名称。
+            api_key (Optional[str]): 远程 provider 的访问密钥。
+            base_url (Optional[str]): 自定义服务地址。
+            dimension (Optional[int]): 目标向量维度。
+            batch_size (Optional[int]): 批量调用大小。
+            enable_fusion (bool): 是否开启多模态融合能力。
+        """
         self.provider = provider
         self.model_name = model_name
         self.api_key = api_key
@@ -52,6 +70,18 @@ class EmbeddingConfig:
         provider: Optional[str] = None,
         model_name: Optional[str] = None,
     ) -> "EmbeddingConfig":
+        """从运行时配置中构造默认 embedding 配置。
+
+        参数:
+            provider (Optional[str]): 可选 provider 覆盖值。
+            model_name (Optional[str]): 可选模型名覆盖值。
+
+        返回:
+            EmbeddingConfig: 已补齐默认值的配置对象。
+
+        这里会根据 provider 的不同补齐对应的 API key、默认模型、维度和
+        批大小，避免业务层散落 provider-specific 的配置拼装逻辑。
+        """
         normalized_provider = str(provider or EMBEDDING_CONFIG["provider"]).strip().lower()
         normalized_model = str(model_name or EMBEDDING_CONFIG["model_name"]).strip()
 
@@ -94,16 +124,34 @@ class EmbeddingService:
     DEFAULT_DASHSCOPE_DIMENSION = int(EMBEDDING_CONFIG["dimension"])
 
     def __init__(self):
+        """初始化 provider 工厂、本地模型句柄和进程内 embedding 缓存。
+
+        返回:
+            None
+        """
         self.embedding_factory = EmbeddingFactory()
         self._local_embedder = None
         self._embedding_cache: dict[str, list] = {}
         self._embedding_cache_lock = threading.Lock()
 
     def get_default_embedding_config(self) -> EmbeddingConfig:
+        """返回当前环境下的默认 embedding 配置。
+
+        返回:
+            EmbeddingConfig: 当前运行环境对应的默认配置。
+        """
         return EmbeddingConfig.from_env()
 
     @staticmethod
     def _normalize_vector_output(embedding) -> list:
+        """把不同 provider 返回的向量统一转换为 Python float list。
+
+        参数:
+            embedding: 任意 provider 返回的向量对象。
+
+        返回:
+            list: 标准化后的浮点数组。
+        """
         if isinstance(embedding, np.ndarray):
             return embedding.tolist()
         if isinstance(embedding, torch.Tensor):
@@ -114,6 +162,15 @@ class EmbeddingService:
 
     @staticmethod
     def build_paper_embedding_text(title: str, abstract: str) -> str:
+        """把论文标题和摘要拼装成单段 embedding 输入文本。
+
+        参数:
+            title (str): 论文标题。
+            abstract (str): 论文摘要。
+
+        返回:
+            str: 适合直接送入向量模型的拼接文本。
+        """
         title_value = str(title or "").strip()
         abstract_value = str(abstract or "").strip()
         return f"{title_value}\n\nAbstract: {abstract_value}".strip()
@@ -127,6 +184,19 @@ class EmbeddingService:
         base_url: Optional[str],
         dimension: Optional[int],
     ) -> str:
+        """根据文本内容与调用配置生成稳定的缓存键。
+
+        参数:
+            text (str): 原始文本。
+            provider (str): 向量 provider。
+            model (str): 模型名。
+            api_key (Optional[str]): 访问密钥。
+            base_url (Optional[str]): 服务地址。
+            dimension (Optional[int]): 目标维度。
+
+        返回:
+            str: 可用于进程内缓存的稳定键值。
+        """
         text_hash = hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
         return "|".join(
             [
@@ -140,6 +210,14 @@ class EmbeddingService:
         )
 
     def _get_cached_embedding(self, cache_key: str) -> Optional[list]:
+        """线程安全地读取 embedding 缓存。
+
+        参数:
+            cache_key (str): 缓存键。
+
+        返回:
+            Optional[list]: 命中的向量；未命中时返回 None。
+        """
         with self._embedding_cache_lock:
             cached = self._embedding_cache.get(cache_key)
             if cached is None:
@@ -147,10 +225,20 @@ class EmbeddingService:
             return [float(value) for value in cached]
 
     def _set_cached_embedding(self, cache_key: str, embedding: list) -> None:
+        """线程安全地写入 embedding 缓存。
+
+        参数:
+            cache_key (str): 缓存键。
+            embedding (list): 待缓存向量。
+
+        返回:
+            None
+        """
         with self._embedding_cache_lock:
             self._embedding_cache[cache_key] = [float(value) for value in embedding]
 
     def _extract_dashscope_embeddings(self, payload: dict) -> list:
+        """从 DashScope 的多种响应结构中提取并排序向量结果。"""
         output = payload.get("output", {}) if isinstance(payload, dict) else {}
         candidates = []
         for source in (
@@ -182,15 +270,18 @@ class EmbeddingService:
             elif item is not None:
                 vectors.append((len(vectors), self._normalize_vector_output(item)))
 
+        # DashScope 可能返回 index/text_index，这里统一按原始顺序重排。
         vectors.sort(key=lambda item: item[0])
         return [vector for _, vector in vectors]
 
     @staticmethod
     def _extract_dashscope_usage(payload: dict) -> dict:
+        """提取 DashScope 返回的 token 使用量信息。"""
         usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
         return usage if isinstance(usage, dict) else {}
 
     def _create_dashscope_embeddings_from_inputs(self, embedding_inputs: list, config: EmbeddingConfig) -> tuple[list, dict]:
+        """调用 DashScope 批量生成文本或多模态向量。"""
         api_key = config.api_key or EMBEDDING_CONFIG["dashscope_api_key"] or EMBEDDING_CONFIG["api_key"]
         if not api_key:
             raise ValueError("DashScope API key not provided. Set DASHSCOPE_API_KEY.")
@@ -204,6 +295,7 @@ class EmbeddingService:
             if item.get("mode") == "multimodal":
                 if not item.get("image"):
                     raise ValueError("DashScope multimodal embedding input requires image data")
+                # 多模态路径要求文本和图像一起提交，便于模型生成联合表征。
                 contents.append(
                     {
                         "text": item["text"],
@@ -223,6 +315,7 @@ class EmbeddingService:
             },
         }
         if config.enable_fusion:
+            # enable_fusion 交给后端做文本/图像融合，避免调用侧硬编码融合策略。
             payload["parameters"]["enable_fusion"] = True
 
         response = requests.post(
@@ -250,22 +343,27 @@ class EmbeddingService:
             len(vectors),
             len(embedding_inputs),
         )
+        # 个别情况下批量结果数可能异常，这里退化到逐条请求以保证结果完整性。
         fallback_vectors = [self._create_dashscope_embedding_from_input(item, config) for item in embedding_inputs]
         return fallback_vectors, usage
 
     def _create_dashscope_embeddings(self, texts: list, config: EmbeddingConfig) -> list:
+        """DashScope 文本批量 embedding 的轻量封装。"""
         embedding_inputs = [{"mode": "text", "text": text} for text in texts]
         vectors, _ = self._create_dashscope_embeddings_from_inputs(embedding_inputs, config)
         return vectors
 
     def _create_dashscope_embedding(self, text: str, config: EmbeddingConfig) -> list:
+        """生成单条 DashScope 文本 embedding。"""
         return self._create_dashscope_embeddings([text], config)[0]
 
     def _create_dashscope_embedding_from_input(self, embedding_input: dict, config: EmbeddingConfig) -> list:
+        """生成单条 DashScope 输入的 embedding，支持文本或多模态载荷。"""
         vectors, _ = self._create_dashscope_embeddings_from_inputs([embedding_input], config)
         return vectors[0]
 
     def _create_dashscope_embeddings_with_usage(self, texts: list, config: EmbeddingConfig) -> tuple[list, dict]:
+        """生成 DashScope 文本 embedding，并返回 usage 信息。"""
         embedding_inputs = [{"mode": "text", "text": text} for text in texts]
         return self._create_dashscope_embeddings_from_inputs(embedding_inputs, config)
 
@@ -278,6 +376,7 @@ class EmbeddingService:
         base_url: Optional[str] = None,
         dimension: Optional[int] = None,
     ) -> tuple[list, dict]:
+        """生成单条向量并在支持时返回 usage 信息。"""
         config = EmbeddingConfig(
             provider=provider,
             model_name=model,
@@ -299,6 +398,7 @@ class EmbeddingService:
 
         normalized_provider = str(provider).strip().lower()
         if normalized_provider == EmbeddingProvider.DASHSCOPE.value:
+            # DashScope 能返回调用计量信息，因此优先走专门分支。
             embedding, usage = self._create_dashscope_embeddings_with_usage([text], config)
             normalized_embedding = embedding[0]
             self._set_cached_embedding(cache_key, normalized_embedding)
@@ -309,11 +409,13 @@ class EmbeddingService:
 
     @property
     def local_embedder(self):
+        """按需懒加载本地多模态 embedding 模型。"""
         if self._local_embedder is None:
             self._local_embedder = self._load_local_qwen3_embedding_model()
         return self._local_embedder
 
     def _load_local_qwen3_embedding_model(self):
+        """加载本地 Qwen3-VL embedding 模型，失败时返回 None。"""
         try:
             if os.path.exists(self.LOCAL_EMBEDDING_MODEL_PATH):
                 sys.path.append(self.LOCAL_EMBEDDING_MODEL_SCRIPTS_PATH)
@@ -358,6 +460,7 @@ class EmbeddingService:
 
             for prepared in prepared_inputs:
                 chunk = prepared["chunk"]
+                # 本地模型逐条处理，便于同时支持文本和多模态资产输入。
                 embedding_vector = self.create_single_embedding_local_input(prepared["embedding_input"])
                 results.append(
                     {
@@ -376,6 +479,7 @@ class EmbeddingService:
 
         if provider_key == EmbeddingProvider.DASHSCOPE.value:
             if any(item["embedding_input"].get("mode") == "multimodal" for item in prepared_inputs):
+                # DashScope 多模态输入目前按单条调用，避免图像载荷批量拼接复杂化。
                 for prepared in prepared_inputs:
                     chunk = prepared["chunk"]
                     embedding_vector = self._create_dashscope_embedding_from_input(prepared["embedding_input"], config)
@@ -396,6 +500,7 @@ class EmbeddingService:
                 for i in range(0, len(prepared_inputs), batch_size):
                     batch = prepared_inputs[i : i + batch_size]
                     texts = [item["embedding_input"]["text"] for item in batch]
+                    # 纯文本场景优先走批量调用，降低远程 provider 的请求成本。
                     embedding_vectors = self._create_dashscope_embeddings(texts, config)
 
                     for prepared, embedding_vector in zip(batch, embedding_vectors):
@@ -449,6 +554,7 @@ class EmbeddingService:
                 chunk = prepared["chunk"]
                 embedding_input = prepared["embedding_input"]
                 if embedding_input.get("mode") == "multimodal":
+                    # ModelScope 等 provider 在多模态场景直接接收结构化 payload。
                     embedding_vector = embedding_function.embed_query(embedding_input)
                 else:
                     embedding_vector = embedding_function.embed_query(embedding_input["text"])
@@ -469,6 +575,7 @@ class EmbeddingService:
         return results, {}
 
     def build_embedding_input(self, chunk: dict, provider_key: str) -> dict:
+        """把 chunk 转成 provider 可消费的 embedding 输入载荷。"""
         metadata = chunk.get("metadata", {}) or {}
         chunk_type = str(chunk.get("chunk_type") or metadata.get("chunk_type") or "text").strip().lower()
         text = str(
@@ -495,6 +602,7 @@ class EmbeddingService:
                 raise ValueError(f"Figure asset image path does not exist: {image_path}")
             image_input = image_path
             if provider_key == EmbeddingProvider.DASHSCOPE.value:
+                # DashScope 接口需要 data URL，而不是本地磁盘路径。
                 image_input = self._image_path_to_data_url(image_path)
             return {
                 "mode": "multimodal",
@@ -519,6 +627,7 @@ class EmbeddingService:
         model: str,
         filename: str,
     ) -> dict:
+        """构造随向量一起保存的溯源元数据。"""
         chunk_metadata = chunk.get("metadata", {})
         # 这里把 chunk 层的页码和来源字段继续向下传，避免 embedding 阶段把结构压扁。
         page_start = int(chunk_metadata.get("page_start", chunk_metadata.get("page_number", 1)))
@@ -558,6 +667,7 @@ class EmbeddingService:
         }
 
     def save_embeddings(self, doc_name: str, embeddings: list) -> str:
+        """把 embedding 结果保存到磁盘，便于后续入库或调试复用。"""
         os.makedirs("02-embedded-docs", exist_ok=True)
 
         first_embedding = embeddings[0]
@@ -615,6 +725,7 @@ class EmbeddingService:
         return filepath
 
     def create_single_embedding_local_input(self, embedding_input: dict) -> list:
+        """使用本地模型处理单条文本或多模态输入。"""
         if self.local_embedder is None:
             raise ValueError("Local Qwen3-VL-Embedding-2B model not loaded")
 
@@ -640,6 +751,7 @@ class EmbeddingService:
         base_url: Optional[str] = None,
         dimension: Optional[int] = None,
     ) -> list:
+        """生成单条文本 embedding，并优先复用缓存。"""
         config = EmbeddingConfig(
             provider=provider,
             model_name=model,
@@ -669,6 +781,7 @@ class EmbeddingService:
             self._set_cached_embedding(cache_key, embedding)
             return embedding
 
+        # 其余 provider 通过统一工厂创建具体 embedding function。
         embedding_function = self.embedding_factory.create_embedding_function(config)
         embedding = embedding_function.embed_query(text)
         normalized_embedding = self._normalize_vector_output(embedding)
@@ -685,6 +798,7 @@ class EmbeddingService:
         dimension: Optional[int] = None,
         batch_size: Optional[int] = None,
     ) -> List[list]:
+        """批量生成文本 embedding，不关心 usage 统计时使用该封装。"""
         embeddings, _ = self.create_text_embeddings_with_usage(
             texts=texts,
             provider=provider,
@@ -706,6 +820,7 @@ class EmbeddingService:
         dimension: Optional[int] = None,
         batch_size: Optional[int] = None,
     ) -> tuple[List[list], dict]:
+        """批量生成文本 embedding，并在支持时汇总 usage 信息。"""
         normalized_texts = [str(text or "") for text in texts]
         if not normalized_texts:
             return [], {}
@@ -753,6 +868,7 @@ class EmbeddingService:
                             f"DashScope returned {len(batch_embeddings)} embeddings for {len(batch_texts)} texts"
                         )
                     if batch_usage:
+                        # 多批次时把 usage 累加起来，方便上层做总量统计。
                         usage = {
                             "input_tokens": int(usage.get("input_tokens", 0) or 0) + int(batch_usage.get("input_tokens", 0) or 0),
                             "output_tokens": int(usage.get("output_tokens", 0) or 0) + int(batch_usage.get("output_tokens", 0) or 0),
@@ -795,6 +911,7 @@ class EmbeddingService:
                         results[index] = normalized_embedding
             else:
                 for index, text in zip(pending_indexes, pending_texts):
+                    # 不支持稳定批量接口的 provider 退化到逐条生成，保证兼容性。
                     results[index] = self.create_single_embedding(
                         text=text,
                         provider=provider,
@@ -814,6 +931,7 @@ class EmbeddingService:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
     ) -> list:
+        """使用 DashScope 配置生成单条文本 embedding。"""
         config = EmbeddingConfig(
             provider=EmbeddingProvider.DASHSCOPE.value,
             model_name=model or self.DEFAULT_DASHSCOPE_MODEL_NAME,
@@ -824,9 +942,11 @@ class EmbeddingService:
         return self._create_dashscope_embedding(text, config)
 
     def create_single_embedding_local(self, text: str) -> list:
+        """使用本地模型生成单条纯文本 embedding。"""
         return self.create_single_embedding_local_input({"mode": "text", "text": text})
 
     def create_single_embedding_modelscope(self, text: str, model: str = "Qwen/Qwen3-VL-Embedding-2B") -> list:
+        """直接调用 ModelScope pipeline 生成 embedding。"""
         try:
             from modelscope.pipelines import pipeline
             from modelscope.utils.constant import Tasks
@@ -851,6 +971,7 @@ class EmbeddingService:
             raise
 
     def get_document_embedding_config(self, collection_name: str) -> EmbeddingConfig:
+        """根据已保存的 embedding 文件反查某个集合对应的向量配置。"""
         try:
             doc_name = collection_name.split("_")[0]
             embedded_docs_dir = "02-embedded-docs"
@@ -869,6 +990,7 @@ class EmbeddingService:
             raise ValueError(f"Error getting embedding config: {str(e)}")
 
     def _image_path_to_data_url(self, image_path: str) -> str:
+        """把本地图片文件转换为 provider 可直接提交的 data URL。"""
         mime_type = mimetypes.guess_type(image_path)[0] or "image/png"
         with open(image_path, "rb") as image_file:
             encoded = base64.b64encode(image_file.read()).decode("ascii")
@@ -878,6 +1000,7 @@ class EmbeddingService:
 class EmbeddingFactory:
     @staticmethod
     def create_embedding_function(config: EmbeddingConfig):
+        """根据 provider 创建对应的 embedding function 适配器。"""
         if config.provider == EmbeddingProvider.BEDROCK:
             import boto3
             from langchain_community.embeddings import BedrockEmbeddings
@@ -901,12 +1024,14 @@ class EmbeddingFactory:
         if config.provider == EmbeddingProvider.MODELSCOPE:
             class ModelScopeEmbedding:
                 def __init__(self, model_name):
+                    """初始化 ModelScope 多模态 embedding pipeline。"""
                     from modelscope.pipelines import pipeline
                     from modelscope.utils.constant import Tasks
                     self.model_name = model_name
                     self.pipe = pipeline(Tasks.multi_modal_embedding, model=model_name)
 
                 def embed_query(self, text):
+                    """生成单条查询向量，兼容文本和结构化多模态载荷。"""
                     payload = text if isinstance(text, dict) else {"text": text}
                     result = self.pipe(payload)
                     if isinstance(result, dict) and "text_embedding" in result:
@@ -923,6 +1048,7 @@ class EmbeddingFactory:
                     return embedding
 
                 def embed_documents(self, texts):
+                    """逐条生成文档向量，保持与 LangChain 风格接口兼容。"""
                     return [self.embed_query(text) for text in texts]
 
             return ModelScopeEmbedding(config.model_name)

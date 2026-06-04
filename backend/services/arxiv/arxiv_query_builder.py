@@ -1,3 +1,10 @@
+"""arXiv 查询构造工具模块。
+
+该模块把 arXiv 搜索请求中的文本归一化、字段拼装、参数校验以及结构化
+查询组合逻辑集中到一个位置，避免搜索服务和数据库服务各自维护一套查询
+构造细节，从而提升可复用性和一致性。
+"""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -14,14 +21,31 @@ MAX_ALLOWED_RESULTS = ARXIV_SEARCH_CONFIG["max_allowed_results"]
 
 
 class ArxivSearchValidationError(ValueError):
+    """arXiv 搜索请求校验失败异常。"""
     pass
 
 
 def normalize_text_value(value: Optional[str]) -> str:
+    """规范化输入文本，折叠多余空白字符。
+
+    参数:
+        value (Optional[str]): 原始输入值。
+
+    返回:
+        str: 去首尾空白并压缩内部连续空白后的字符串。
+    """
     return " ".join(str(value or "").strip().split())
 
 
 def quote_arxiv_text(value: str) -> str:
+    """按 arXiv 查询语法需要对文本进行转义和包裹。
+
+    参数:
+        value (str): 原始查询文本。
+
+    返回:
+        str: 可安全用于 arXiv 查询语法的文本片段。
+    """
     normalized = normalize_text_value(value)
     if not normalized:
         return ""
@@ -34,6 +58,15 @@ def quote_arxiv_text(value: str) -> str:
 
 
 def build_arxiv_field_clause(prefix: str, value: str) -> str:
+    """构造单个字段查询子句。
+
+    参数:
+        prefix (str): arXiv 字段前缀，例如 ti、au、abs、cat。
+        value (str): 字段对应的查询文本。
+
+    返回:
+        str: 格式化后的字段子句；若 value 为空则返回空字符串。
+    """
     normalized = normalize_text_value(value)
     if not normalized:
         return ""
@@ -43,6 +76,15 @@ def build_arxiv_field_clause(prefix: str, value: str) -> str:
 
 
 def combine_arxiv_clauses(clauses: List[str], operator: str = "AND") -> str:
+    """使用逻辑操作符组合多个 arXiv 查询子句。
+
+    参数:
+        clauses (List[str]): 子句列表。
+        operator (str): 逻辑操作符。
+
+    返回:
+        str: 组合后的查询字符串。
+    """
     filtered = [clause for clause in clauses if clause]
     if not filtered:
         return ""
@@ -52,6 +94,7 @@ def combine_arxiv_clauses(clauses: List[str], operator: str = "AND") -> str:
 
 
 def normalize_id_list(id_list: Optional[List[str]]) -> List[str]:
+    """清洗并规范化 arXiv 论文 ID 列表。"""
     if not id_list:
         return []
     return [str(item).strip() for item in id_list if str(item).strip()]
@@ -67,6 +110,23 @@ def validate_arxiv_search_request(
     sort_order: str,
     require_query: bool = True,
 ) -> None:
+    """校验 arXiv 搜索请求的通用分页、排序和查询参数。
+
+    参数:
+        search_query (Optional[str]): 原始查询字符串。
+        id_list (Optional[List[str]]): 精确匹配 ID 列表。
+        max_results (int): 最大返回条数。
+        start (int): 分页起始偏移量。
+        sort_by (str): 排序字段。
+        sort_order (str): 排序方向。
+        require_query (bool): 是否强制要求 query 或 id_list 至少提供一个。
+
+    返回:
+        None
+
+    异常:
+        ArxivSearchValidationError: 当任一参数不满足约束时抛出。
+    """
     normalized_search_query = normalize_text_value(search_query)
     normalized_id_list = normalize_id_list(id_list)
 
@@ -87,6 +147,7 @@ def validate_arxiv_search_request(
 
 
 def build_arxiv_submitted_date_query(days_ago: Optional[int]) -> str:
+    """构建 arXiv 提交日期范围子句。"""
     end_date = datetime.now(timezone.utc)
     start_days = days_ago if days_ago is not None else 30
     start_date = end_date - timedelta(days=int(start_days))
@@ -101,6 +162,18 @@ def build_arxiv_raw_query(
     append_date_when_query_missing: bool = False,
     strict_submitted_days_ago: bool = False,
 ) -> Dict[str, Any]:
+    """从原始搜索参数构建最终 arXiv 查询表达式。
+
+    参数:
+        search_query (Optional[str]): 原始 search_query 字符串。
+        id_list (Optional[List[str]]): ID 列表。
+        submitted_days_ago (Optional[int]): 最近提交天数限制。
+        append_date_when_query_missing (bool): 无查询词时是否仅使用日期条件。
+        strict_submitted_days_ago (bool): 是否对负数天数严格报错。
+
+    返回:
+        Dict[str, Any]: 包含原始输入、归一化输入和最终查询串的结果字典。
+    """
     normalized_search_query = normalize_text_value(search_query)
     normalized_id_list = normalize_id_list(id_list)
 
@@ -156,6 +229,28 @@ def build_arxiv_query_from_structured_params(
     category_operator: str = "OR",
     submitted_days_ago: Optional[int] = None,
 ) -> Dict[str, Any]:
+    """从结构化字段参数构建 arXiv 查询表达式。
+
+    参数:
+        query (Optional[str]): 全字段查询词。
+        title_query (Optional[str]): 标题查询词。
+        author_query (Optional[str]): 作者查询词。
+        abstract_query (Optional[str]): 摘要查询词。
+        categories (Optional[List[str]]): 分类列表。
+        comment_query (Optional[str]): comment 字段查询词。
+        journal_ref_query (Optional[str]): journal_ref 字段查询词。
+        report_number_query (Optional[str]): report number 查询词。
+        id_list (Optional[List[str]]): 精确匹配 ID 列表。
+        field_operator (str): 多字段之间的逻辑操作符。
+        category_operator (str): 多分类之间的逻辑操作符。
+        submitted_days_ago (Optional[int]): 最近提交天数限制。
+
+    返回:
+        Dict[str, Any]: 包含原始输入、归一化输入和最终查询串的结果字典。
+
+    异常:
+        ArxivSearchValidationError: 当结构化字段组合不合法时抛出。
+    """
     normalized_field_operator = (field_operator or "AND").strip().upper()
     normalized_category_operator = (category_operator or "OR").strip().upper()
     if normalized_field_operator not in VALID_FIELD_OPERATORS:

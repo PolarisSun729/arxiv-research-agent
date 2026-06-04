@@ -16,6 +16,11 @@ class InterestProfileService:
         user_id: str,
         negative_weight: Optional[float] = None,
     ) -> Dict[str, Any]:
+        """根据用户点赞/点踩历史生成兴趣向量，并在条件满足时构建兴趣簇。
+
+        该方法是推荐系统个性化画像的入口，会先尽量复用已有向量，缺失时再补全，
+        最终产出一个全局兴趣向量以及可选的多兴趣簇结构，供召回和排序共同使用。
+        """
         if negative_weight is None:
             negative_weight = self.RECOMMENDATION_CONFIG["negative_weight_default"]
         liked_ids = self.db_service.get_liked_papers(user_id=user_id)
@@ -57,6 +62,7 @@ class InterestProfileService:
         if not liked_records:
             raise HTTPException(status_code=500, detail="No reusable embeddings found for liked papers")
 
+        # 先分别聚合喜欢/不喜欢论文的中心向量，再用负反馈做减权，得到主兴趣方向。
         liked_mean = self._mean_vector([record["vector"] for record in liked_records])
         disliked_mean = self._mean_vector([record["vector"] for record in disliked_records]) if disliked_records else []
         weak_interest_pool: Optional[Dict[str, Any]] = None
@@ -73,6 +79,7 @@ class InterestProfileService:
         profile_mode = "mean"
         if len(liked_records) >= self.MIN_LIKED_PAPERS_FOR_CLUSTERING:
             try:
+                # 当用户正反馈足够多时，进一步拆分成多个兴趣簇，提升召回覆盖面和解释性。
                 interest_clusters, weak_interest_pool = self._cluster_interest_vectors(liked_records)
                 if interest_clusters:
                     profile_mode = "clustered_with_weak_pool" if weak_interest_pool else "clustered"
@@ -161,6 +168,7 @@ class InterestProfileService:
         }
 
     def _is_vector_stale(self, vector_updated_at: Optional[str], latest_preference_ts: Optional[str]) -> bool:
+        """判断已存兴趣向量是否早于最新用户行为，以决定是否需要重建。"""
         if not vector_updated_at or not latest_preference_ts:
             return False
         vector_dt = self._parse_datetime(vector_updated_at)
@@ -170,6 +178,7 @@ class InterestProfileService:
         return vector_dt < preference_dt
 
     def _mean_vector(self, vectors: List[List[float]]) -> List[float]:
+        """计算一组向量的逐维平均值，作为简单且稳定的兴趣中心表示。"""
         if not vectors:
             return []
         dimension = len(vectors[0])
@@ -182,6 +191,11 @@ class InterestProfileService:
         config: Any,
         label: str,
     ) -> List[Dict[str, Any]]:
+        """为论文 ID 补齐可用向量，并标记向量来源。
+
+        该方法会优先使用向量库里的现成数据；缺失时先尝试从 arXiv/OAI 回填并写回向量库，
+        最后再退化为使用数据库中的文本重新生成 embedding。
+        """
         milvus_map = {
             str(item.get("arxiv_id", "")).strip(): item.get("vector", [])
             for item in milvus_embeddings
@@ -202,12 +216,14 @@ class InterestProfileService:
                 ", ".join(sorted(missing_ids)),
             )
 
+        # 第一优先级：尝试把缺失论文从外部源补齐并重新写入向量库。
         recovered_vectors, _, _ = self._backfill_missing_vectors_from_arxiv(missing_ids, label)
         for arxiv_id, vector in recovered_vectors.items():
             vector_records[arxiv_id] = {"arxiv_id": arxiv_id, "vector": vector, "source": "milvus"}
 
         remaining_missing = [arxiv_id for arxiv_id in missing_ids if arxiv_id not in recovered_vectors]
         if remaining_missing:
+            # 第二优先级：如果本地数据库里已有论文文本，就直接临时补 embedding，避免整条链路失败。
             fallback_papers = [paper for paper in (self.db_service.get_paper(arxiv_id) for arxiv_id in remaining_missing) if paper]
             embedded_fallbacks = self._embed_papers(fallback_papers, config)
             fallback_map = {item["arxiv_id"]: item["vector"] for item in embedded_fallbacks if item.get("arxiv_id") and item.get("vector")}
@@ -222,6 +238,7 @@ class InterestProfileService:
         missing_ids: List[str],
         label: str,
     ) -> tuple[Dict[str, List[float]], List[str], List[str]]:
+        """为缺失向量的论文执行回填，并返回恢复成功与失败的 ID 列表。"""
         recovered_vectors: Dict[str, List[float]] = {}
         recovered_ids: List[str] = []
         unresolved_ids: List[str] = []
@@ -231,6 +248,7 @@ class InterestProfileService:
             source_paper = existing_paper
             if source_paper is None:
                 try:
+                    # 本地没有论文详情时，再访问 arXiv，避免不必要的外部请求。
                     source_paper = self._fetch_paper_from_arxiv_with_rate_limit(arxiv_id)
                 except Exception as exc:  # pragma: no cover
                     logger.warning("Failed to fetch arXiv paper %s for %s backfill: %s", arxiv_id, label, exc)
@@ -242,6 +260,7 @@ class InterestProfileService:
 
             try:
                 normalized_paper = self._normalize_paper_record(source_paper, arxiv_id)
+                # 成功回填时同时补写向量库和论文表，保证下次可以直接复用。
                 embedding_id, embedding_vector = self._build_and_insert_paper_embedding(normalized_paper)
                 stored = {
                     "arxiv_id": normalized_paper["arxiv_id"],
