@@ -282,6 +282,43 @@ class AgentToolCall(BaseModel):
     error: Optional[Dict[str, Any]] = None
 
 
+class ToolCallRequest(BaseModel):
+    """定义 Agent 准备发起的一次内部工具调用请求。
+
+    这个模型表达的不是“工具已经执行了什么”，而是“Agent 接下来打算怎么行动”。
+    阶段 2 中它主要作为计划与行动之间的桥梁数据结构存在，便于后续把
+    execution_plan 中的某一步自然映射成标准化工具调用协议。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    tool_name: Optional[str] = None
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    reason: Optional[str] = None
+    expected_result: Optional[str] = None
+    plan_step_id: Optional[str] = None
+    fallback_tools: List[str] = Field(default_factory=list)
+
+
+class ToolObservation(BaseModel):
+    """定义一次工具执行后的标准化观察结果。
+
+    与 `ToolCallRequest` 配对使用：前者描述“准备调用什么”，后者描述
+    “执行之后观察到了什么、是否足够支持下一步决策”。
+    阶段 2 先只引入统一结构，不改变既有真实执行流。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    tool_name: Optional[str] = None
+    ok: Optional[bool] = None
+    status: Optional[str] = None
+    result_summary: Optional[str] = None
+    result_ref: Optional[Dict[str, Any]] = None
+    error: Optional[Dict[str, Any]] = None
+    is_sufficient: Optional[bool] = None
+    next_action_hint: Optional[str] = None
+    raw_trace: Optional[Dict[str, Any]] = None
+
+
 class AgentStep(BaseModel):
     """记录 LangGraph 中某一个节点步骤的执行摘要。
 
@@ -299,6 +336,48 @@ class AgentStep(BaseModel):
     inputs: Dict[str, Any] = Field(default_factory=dict)
     outputs: Dict[str, Any] = Field(default_factory=dict)
     error: Optional[str] = None
+
+
+class Goal(BaseModel):
+    """定义 Agent 对用户本轮目标的结构化理解。
+
+    `intent` 主要回答“这是什么类型的任务”，而 `Goal` 更关注：
+    - 用户真正想达成什么；
+    - 本轮任务范围有多大；
+    - 是否存在约束、成功标准；
+    - 是否需要读取记忆或等待用户确认。
+
+    阶段 1 中它主要作为状态表达、调试和后续规划能力的基础数据结构。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    goal_type: Optional[str] = None
+    user_goal: Optional[str] = None
+    task_scope: Optional[str] = None
+    constraints: List[str] = Field(default_factory=list)
+    success_criteria: List[str] = Field(default_factory=list)
+    requires_memory: bool = False
+    requires_user_confirmation: bool = False
+
+
+class ExecutionPlanStep(BaseModel):
+    """定义执行计划中的单个步骤。
+
+    execution_plan 在阶段 1 先不直接驱动工具执行，而是表达：
+    - 当前任务预计要分几步完成；
+    - 每步输入输出预期是什么；
+    - 步骤之间是否存在依赖；
+    - 当前规划/执行状态如何。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: str
+    step_type: str
+    description: str
+    expected_input: Dict[str, Any] = Field(default_factory=dict)
+    expected_output: Dict[str, Any] = Field(default_factory=dict)
+    status: Literal["pending", "in_progress", "completed", "failed", "skipped"] = "pending"
+    depends_on: List[str] = Field(default_factory=list)
 
 
 class AgentStreamEvent(BaseModel):
@@ -362,6 +441,8 @@ class ArxivSearchResponse(BaseModel):
     llm_confidence: Optional[float] = None
     answer: str
     search_spec: Optional[ArxivSearchSpec] = None
+    goal: Optional[Goal] = None
+    execution_plan: List[ExecutionPlanStep] = Field(default_factory=list)
     pending_action: Optional[Dict[str, Any]] = None
     paper_qa_result: Optional[Dict[str, Any]] = None
     preference_action_result: Optional[Dict[str, Any]] = None

@@ -35,6 +35,15 @@ _PREFERENCE_ORDINAL_MAP = {
     "十八": 18,
     "十九": 19,
     "二十": 20,
+    "两": 2,
+}
+
+_SPECIAL_ORDINAL_MAP = {
+    "最后一": -1,
+    "最后1": -1,
+    "最后": -1,
+    "末一": -1,
+    "末": -1,
 }
 
 
@@ -201,6 +210,20 @@ def _parse_target_reference(message: str) -> Optional[Dict[str, Any]]:
     if not text:
         return None
 
+    # 先处理“最后一篇 / 最后一篇论文”这类相对位置引用。
+    # 这类表达没有显式数字，如果不优先识别，后续往往会回退成 selected_paper，
+    # 从而错误命中当前默认选中的第一篇推荐结果。
+    special_ordinal_match = re.search(r"(最后一|最后1|最后|末一|末)\s*(?:篇|个)?(?:论文|paper)?", text)
+    if special_ordinal_match:
+        raw_value = special_ordinal_match.group(1)
+        ordinal = _SPECIAL_ORDINAL_MAP.get(raw_value)
+        if ordinal is not None:
+            return {
+                "target_type": "ordinal",
+                "target_value": ordinal,
+                "ordinal": ordinal,
+            }
+
     # 先尝试识别最明确的显式 arXiv ID，因为这类引用优先级最高、歧义最小。
     arxiv_match = re.search(r"(?:arxiv\.org/(?:abs|pdf)/)?(\d{4}\.\d{4,5}(?:v\d+)?)", text, flags=re.IGNORECASE)
     if arxiv_match:
@@ -320,6 +343,10 @@ def _resolve_paper_reference(message: str, context: Any) -> Dict[str, Any]:
                 "arxiv_id": None,
                 "title": None,
             }
+        if ordinal < 0:
+            ordinal = len(last_papers) + ordinal + 1
+            reference = dict(reference)
+            reference["resolved_ordinal"] = ordinal
         if ordinal > len(last_papers):
             return {
                 "status": "failed",

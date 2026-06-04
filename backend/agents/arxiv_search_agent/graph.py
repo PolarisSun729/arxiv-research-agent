@@ -7,6 +7,7 @@ from langgraph.graph import END, START, StateGraph
 
 from .node import (
     _coerce_state,
+    adapt_search_tool_result,
     apply_preference_action,
     build_search_tool_args,
     check_search_result,
@@ -15,6 +16,7 @@ from .node import (
     handle_pending_action_confirmation,
     invoke_search_tool,
     parse_search_request,
+    plan_task,
     personalized_rank_and_annotate_papers,
     relax_search_for_retry,
     synthesize_response,
@@ -42,8 +44,10 @@ logger = logging.getLogger(__name__)
 # 3. 避免节点名散落在多个位置，后续增删节点时更容易维护。
 _ARXIV_GRAPH_NODE_NAMES = (
     "parse_search_request",
+    "plan_task",
     "build_search_tool_args",
     "invoke_search_tool",
+    "adapt_search_tool_result",
     "check_search_result",
     "relax_search_for_retry",
     "personalized_rank_and_annotate_papers",
@@ -235,8 +239,10 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
     # 其中有些节点是纯函数节点，有些节点需要额外注入 generation_service，
     # 因此这里通过 lambda 做一层轻量包装。
     graph.add_node("parse_search_request", lambda state: parse_search_request(state, generation_service=generation_service))
+    graph.add_node("plan_task", plan_task)
     graph.add_node("build_search_tool_args", build_search_tool_args)
     graph.add_node("invoke_search_tool", invoke_search_tool)
+    graph.add_node("adapt_search_tool_result", adapt_search_tool_result)
     graph.add_node("check_search_result", check_search_result)
     graph.add_node("relax_search_for_retry", relax_search_for_retry)
     graph.add_node("personalized_rank_and_annotate_papers", personalized_rank_and_annotate_papers)
@@ -255,8 +261,9 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
     # 1. 所有用户请求都先被标准化解析，避免各分支重复做意图识别；
     # 2. 任何新能力只要挂在 parse 之后即可扩展，整体结构更清晰。
     graph.add_edge(START, "parse_search_request")
+    graph.add_edge("parse_search_request", "plan_task")
     graph.add_conditional_edges(
-        "parse_search_request",
+        "plan_task",
         route_after_parse,
         {
             # 标准 arXiv 搜索链路：构造搜索参数 -> 调工具 -> 检查结果 -> 排序标注 -> 生成回复。
@@ -299,7 +306,8 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
     # 2. 调用外部搜索工具；
     # 3. 检查工具返回，决定是否需要放宽条件重试。
     graph.add_edge("build_search_tool_args", "invoke_search_tool")
-    graph.add_edge("invoke_search_tool", "check_search_result")
+    graph.add_edge("invoke_search_tool", "adapt_search_tool_result")
+    graph.add_edge("adapt_search_tool_result", "check_search_result")
     graph.add_conditional_edges(
         "check_search_result",
         route_after_check,
@@ -402,17 +410,18 @@ def _build_fallback_mermaid() -> str:
     return "\n".join(
         [
             # 图整体结构遵循与 build_arxiv_search_graph 相同的主流程顺序：
-            # parse -> 分流 -> 搜索/阅读/偏好处理 -> synthesize -> END。
+            # parse -> plan_task -> 分流 -> 搜索/阅读/偏好处理 -> synthesize -> END。
             "graph TD;",
             "    START([START]) --> parse_search_request;",
-            "    parse_search_request --> build_search_tool_args;",
-            "    parse_search_request --> handle_paper_reading_request;",
-            "    parse_search_request --> apply_preference_action;",
-            "    parse_search_request --> classify_pending_action_confirmation;",
-            "    parse_search_request -->|recommendation| synthesize_response;",
-            "    parse_search_request -->|reading_list_action| synthesize_response;",
-            "    parse_search_request -->|unclear| synthesize_response;",
-            "    parse_search_request -->|unsupported| synthesize_response;",
+            "    parse_search_request --> plan_task;",
+            "    plan_task --> build_search_tool_args;",
+            "    plan_task --> handle_paper_reading_request;",
+            "    plan_task --> apply_preference_action;",
+            "    plan_task --> classify_pending_action_confirmation;",
+            "    plan_task -->|recommendation| synthesize_response;",
+            "    plan_task -->|reading_list_action| synthesize_response;",
+            "    plan_task -->|unclear| synthesize_response;",
+            "    plan_task -->|unsupported| synthesize_response;",
             "    build_search_tool_args --> invoke_search_tool;",
             "    invoke_search_tool --> check_search_result;",
             "    check_search_result --> relax_search_for_retry;",

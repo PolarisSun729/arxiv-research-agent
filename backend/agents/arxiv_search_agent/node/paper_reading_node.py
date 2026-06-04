@@ -47,7 +47,7 @@ def _build_qa_question_for_paper(intent: str, message: str, paper: Mapping[str, 
     # 依次剥离“问一下”“第一篇”“这篇论文”“arXiv ID”这类引用性噪声，只保留真正的问题主体。
     cleaned_question = re.sub(r"^(问一下|请问一下|请问|问|帮我问一下|帮我问|想问一下)\s*", "", cleaned_question).strip()
     cleaned_question = re.sub(
-        r"^(?:第\s*[一二三四五六七八九十两0-9]+\s*篇(?:论文|paper)?|[1-9]|1[0-9]|20)\s*[:：,，]?\s*",
+        r"^(?:(?:最后一|最后1|最后|末一|末)\s*篇(?:论文|paper)?|第\s*[一二三四五六七八九十两0-9]+\s*篇(?:论文|paper)?|[1-9]|1[0-9]|20)\s*[:：,，]?\s*",
         "",
         cleaned_question,
     ).strip()

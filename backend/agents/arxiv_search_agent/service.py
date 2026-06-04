@@ -490,6 +490,8 @@ def _state_to_response(state: Any) -> ArxivSearchResponse:
         llm_confidence=final_state.llm_confidence,
         answer=final_state.answer or "",
         search_spec=final_state.search_spec,
+        goal=final_state.goal,
+        execution_plan=list(final_state.execution_plan or []),
         pending_action=final_state.pending_action,
         paper_qa_result=final_state.paper_qa_result,
         preference_action_result=final_state.preference_action_result,
@@ -524,11 +526,27 @@ def _build_error_response_from_state(
     - 已记录的 steps
     从而让前端和调试方看到更完整的失败上下文。
     """
-    warning = f"{code}: {detail}" if detail else code
     base_state = state.model_copy(deep=True) if isinstance(state, AgentState) else AgentState()
     base_state.intent = base_state.intent or "unsupported"
-    base_state.answer = f"{message}: {detail}".strip()
-    base_state.warnings = list(base_state.warnings or []) + [warning]
+    base_state.answer = message
+    base_state.warnings = list(base_state.warnings or []) + [message]
+    base_state.errors = list(base_state.errors or []) + [
+        {
+            "step": "agent_runtime",
+            "code": code,
+            "message": message,
+            "detail": detail,
+            "recoverable": False,
+        }
+    ]
+    debug = dict(base_state.debug or {})
+    debug["runtime_error"] = {
+        "code": code,
+        "message": message,
+        "detail": detail,
+        "recoverable": False,
+    }
+    base_state.debug = debug
     base_state.next_actions = list(base_state.next_actions or []) or [
         "请修正输入后重试",
         "后续可以接入论文总结或 QA 功能",
@@ -540,7 +558,7 @@ def _build_error_response_from_state(
             action="Agent 在执行过程中发生异常并返回错误响应",
             inputs={"message": message, "code": code},
             outputs={},
-            error=detail or code,
+            error=code,
         )
     ]
     return _state_to_response(base_state)
@@ -556,6 +574,14 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
         "fallback_reason": state.fallback_reason,
         "llm_confidence": state.llm_confidence,
         "search_spec": state.search_spec.model_dump() if state.search_spec is not None else None,
+        "goal": state.goal.model_dump() if state.goal is not None else None,
+        "execution_plan": [_compact_execution_plan_step(step) for step in list(state.execution_plan or [])],
+        "execution_plan_summary": {
+            "step_count": len(state.execution_plan or []),
+            "step_ids": [step.step_id for step in list(state.execution_plan or [])],
+            "step_types": [step.step_type for step in list(state.execution_plan or [])],
+            "statuses": [step.status for step in list(state.execution_plan or [])],
+        },
         "pending_action": state.pending_action,
         "paper_qa_result": state.paper_qa_result,
         "preference_action_result": state.preference_action_result,
@@ -568,6 +594,18 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
         "personalized_rerank_applied": bool(state.personalized_rerank_applied),
         "debug": dict(state.debug or {}),
     }
+
+
+def _compact_execution_plan_step(step: Any) -> Dict[str, Any]:
+    """压缩 execution_plan 单步信息，便于前端展示规划状态。"""
+    payload = {
+        "step_id": getattr(step, "step_id", None),
+        "step_type": getattr(step, "step_type", None),
+        "description": getattr(step, "description", None),
+        "status": getattr(step, "status", None),
+        "depends_on": list(getattr(step, "depends_on", []) or []),
+    }
+    return {key: value for key, value in payload.items() if value not in (None, "", [], {})}
 
 
 def _compact_tool_args(tool_args: Mapping[str, Any]) -> Dict[str, Any]:

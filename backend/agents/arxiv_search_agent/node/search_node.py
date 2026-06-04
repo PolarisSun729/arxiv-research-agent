@@ -9,25 +9,14 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Union
-
-_BACKEND_DIR = str(Path(__file__).resolve().parents[3])
-if _BACKEND_DIR not in sys.path:
-    sys.path.insert(0, _BACKEND_DIR)
-
-try:  # pragma: no cover - import path differs between backend cwd and package import
-    from tools.tool_registry import invoke_tool
-except ModuleNotFoundError:  # pragma: no cover
-    from backend.tools.tool_registry import invoke_tool
 
 try:  # pragma: no cover - import path differs between backend cwd and package import
     from dependencies import get_recommendation_service
 except ModuleNotFoundError:  # pragma: no cover
     from backend.dependencies import get_recommendation_service
 
-from ..schemas import AgentToolCall, ArxivSearchSpec
+from ..schemas import AgentToolCall, ArxivSearchSpec, ToolCallRequest
 from ..state import AgentState
 from ..utils.result_utils import (
     _extract_error_message,
@@ -40,9 +29,42 @@ from ..utils.result_utils import (
 from ..utils.search_spec_builder import _build_reasoning_summary
 from ..utils.state_utils import _append_step, _coerce_state, _compact_paper_summaries, _compact_search_spec, _compact_tool_args
 from ..utils.text_utils import _contains_chinese, _normalize_text
+from .tool_node import execute_tool
 
 SEARCH_TOOL_NAME = "search_arxiv_structured"
 MAX_SEARCH_RETRIES = 3
+
+
+def _append_structured_error(
+    state: AgentState,
+    *,
+    step: str,
+    code: str,
+    message: str,
+    detail: Optional[str] = None,
+    recoverable: bool = True,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """向 errors/debug 追加结构化排查信息，不直接暴露给最终用户。"""
+    error_payload: Dict[str, Any] = {
+        "step": step,
+        "code": code,
+        "message": message,
+        "recoverable": recoverable,
+    }
+    if detail:
+        error_payload["detail"] = detail
+    if extra:
+        error_payload["extra"] = dict(extra)
+
+    state.errors = list(state.errors or []) + [error_payload]
+
+    debug = dict(state.debug or {})
+    recoverable_errors = list(debug.get("recoverable_errors", []))
+    recoverable_errors.append(error_payload)
+    debug["recoverable_errors"] = recoverable_errors
+    debug["last_error"] = error_payload
+    state.debug = debug
 
 
 def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
@@ -141,12 +163,8 @@ def _relax_query_for_fallback(query: Optional[str], retry_count: int) -> Optiona
 def _format_tool_failure_warning(result: Mapping[str, Any]) -> str:
     """把工具失败结果转成更适合给用户/日志看的 warning 文案。
     
-    若工具层已经给出明确错误消息，会拼接到统一中文提示后面；
-    否则返回通用的服务状态或参数异常提示。
+    warnings 只保留用户可理解的降级提示，具体底层异常写入 errors/debug。
     """
-    error_message = _extract_error_message(result)
-    if error_message:
-        return f"工具调用失败，请检查搜索参数或 arXiv 服务状态: {error_message}"
     return "工具调用失败，请检查搜索参数或 arXiv 服务状态"
 
 
@@ -230,13 +248,23 @@ def _collect_priority_titles(papers: List[Dict[str, Any]], limit: int = 3) -> Li
     return titles
 
 
+def _get_search_execution_plan_step_id(state: AgentState) -> Optional[str]:
+    """从 execution_plan 中恢复搜索执行步骤 ID，供 tool_call_request 关联使用。"""
+    for step in list(state.execution_plan or []):
+        if str(getattr(step, "step_type", "") or "").strip() == "search_execution":
+            step_id = str(getattr(step, "step_id", "") or "").strip()
+            return step_id or None
+    return None
+
+
 def build_search_tool_args(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
     """根据 search_spec 构造 arXiv 搜索工具参数。
     
     主要步骤：
     1. 先确认当前 intent 和 search_spec 都合法；
     2. 把业务对象字段显式映射成工具层需要的纯参数；
-    3. 在 skipped 分支下清空 tool_name/tool_args，避免误复用上一轮状态。
+    3. 同步写入阶段 2 的 tool_call_request，作为统一工具协议入口；
+    4. 在 skipped 分支下清空 tool_name/tool_args/tool_call_request，避免误复用上一轮状态。
     """
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
@@ -244,6 +272,7 @@ def build_search_tool_args(state: Union[AgentState, Mapping[str, Any]]) -> Agent
     if next_state.intent != "arxiv_search" or next_state.search_spec is None:
         next_state.tool_name = None
         next_state.tool_args = {}
+        next_state.tool_call_request = None
         return _append_step(
             next_state,
             step="tool_argument_construction",
@@ -269,24 +298,44 @@ def build_search_tool_args(state: Union[AgentState, Mapping[str, Any]]) -> Agent
         "field_operator": spec.field_operator or "AND",
         "category_operator": spec.category_operator or "OR",
     }
+    next_state.tool_call_request = ToolCallRequest(
+        tool_name=SEARCH_TOOL_NAME,
+        arguments=dict(next_state.tool_args),
+        reason="根据用户目标和结构化搜索条件检索 arXiv 论文候选结果",
+        expected_result="返回与当前搜索主题相关的 arXiv 论文候选列表",
+        plan_step_id=_get_search_execution_plan_step_id(next_state),
+        fallback_tools=["search_arxiv_raw"],
+    )
     return _append_step(
         next_state,
         step="tool_argument_construction",
         status="success",
         action="基于搜索条件构造 arXiv 工具参数",
         inputs={"search_spec": _compact_search_spec(spec)},
-        outputs={"tool_name": SEARCH_TOOL_NAME, "tool_args": {key: value for key, value in next_state.tool_args.items() if key != "query" or value}},
+        outputs={
+            "tool_name": SEARCH_TOOL_NAME,
+            "tool_args": {key: value for key, value in next_state.tool_args.items() if key != "query" or value},
+            "tool_call_request": next_state.tool_call_request.model_dump(),
+        },
     )
 
 
 def invoke_search_tool(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
-    """真正调用 arXiv 搜索工具，并把结果和 trace 写回 state。
-    
-    主要分支包括：
-    1. 非搜索 intent 直接跳过；
-    2. 缺少 tool_args 时返回 failed，并补 warning；
-    3. 调用抛异常时写入 failed tool_call；
-    4. 调用成功后提取 papers、tool_result 和统一 trace。
+    """通过通用 execute_tool 执行 arXiv 搜索工具，并保留旧的 step 命名兼容性。"""
+    next_state = execute_tool(state)
+    if next_state.steps and next_state.steps[-1].step == "execute_tool":
+        next_state.steps[-1].step = "search_tool_call"
+        next_state.steps[-1].action = "调用 arXiv 搜索工具"
+    return next_state
+
+
+def adapt_search_tool_result(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    """把通用工具执行结果适配回搜索链路所需的 papers/trace 结构。
+
+    execute_tool 负责统一执行和记录观察；本节点则负责：
+    1. 从通用 tool_result 中提取 arXiv 搜索论文列表；
+    2. 补齐搜索链路历史上依赖的统一 trace 结构；
+    3. 在失败场景下继续生成 warnings/errors，保持 check_search_result 和后续节点兼容。
     """
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
@@ -294,105 +343,93 @@ def invoke_search_tool(state: Union[AgentState, Mapping[str, Any]]) -> AgentStat
     if next_state.intent != "arxiv_search":
         return _append_step(
             next_state,
-            step="search_tool_call",
+            step="search_tool_result_adaptation",
             status="skipped",
-            action="调用 arXiv 搜索工具",
+            action="适配通用工具结果为搜索链路状态",
             inputs={"intent": next_state.intent},
             outputs={"reason": "当前意图不是 arXiv 搜索"},
         )
 
-    if next_state.tool_name != SEARCH_TOOL_NAME or not next_state.tool_args:
-        next_state.warnings = _dedupe_preserve_order(
-            list(next_state.warnings) + ["搜索工具参数未准备好，跳过工具调用"],
-        )
+    tool_result = _to_plain_dict(next_state.tool_result)
+    if not tool_result:
+        next_state.papers = []
+        next_state.warnings = _dedupe_preserve_order(list(next_state.warnings) + ["搜索工具结果不存在，请先执行工具调用"])
         return _append_step(
             next_state,
-            step="search_tool_call",
+            step="search_tool_result_adaptation",
             status="failed",
-            action="调用 arXiv 搜索工具",
+            action="适配通用工具结果为搜索链路状态",
             inputs={"tool_name": next_state.tool_name, "tool_args": dict(next_state.tool_args or {})},
             outputs={"paper_count": 0},
-            error="搜索工具参数未准备好",
+            error="搜索工具结果不存在",
         )
 
-    try:
-        # 工具层异常通常意味着服务不可用或参数不合法，这里统一转成 failed tool_call。
-        raw_result = invoke_tool(SEARCH_TOOL_NAME, **dict(next_state.tool_args))
-    except Exception as exc:
-        next_state.tool_result = {"ok": False, "error": {"message": str(exc)}}
+    extracted_papers = _extract_papers_from_tool_result(tool_result) if _result_ok(tool_result) else []
+    trace_payload = _result_mapping(tool_result, "trace")
+    enriched_trace = _build_tool_call_trace(
+        tool_name=SEARCH_TOOL_NAME,
+        tool_args=next_state.tool_args,
+        result=tool_result,
+        paper_count=len(extracted_papers),
+        source=trace_payload.get("source") if trace_payload else None,
+        normalized_inputs=trace_payload.get("normalized_inputs") if trace_payload else None,
+        final_search_query=trace_payload.get("final_search_query") if trace_payload else None,
+    )
+    tool_result["trace"] = enriched_trace
+    next_state.tool_result = tool_result
+
+    if next_state.tool_calls and str(next_state.tool_calls[-1].tool_name or "") == SEARCH_TOOL_NAME:
+        next_state.tool_calls[-1].trace = enriched_trace
+        next_state.tool_calls[-1].summary = _result_text(tool_result, "summary")
+        next_state.tool_calls[-1].status = "success" if _result_ok(tool_result) else "failed"
+        next_state.tool_calls[-1].error = _result_mapping(tool_result, "error")
+    else:
         next_state.tool_calls = list(next_state.tool_calls) + [
             AgentToolCall(
                 tool_name=SEARCH_TOOL_NAME,
                 arguments=dict(next_state.tool_args),
-                status="failed",
-                summary="工具调用异常",
-                trace=_build_tool_call_trace(
-                    tool_name=SEARCH_TOOL_NAME,
-                    tool_args=next_state.tool_args,
-                    paper_count=0,
-                    source="agent",
-                ),
-                error={"message": str(exc)},
+                status="success" if _result_ok(tool_result) else "failed",
+                summary=_result_text(tool_result, "summary"),
+                trace=enriched_trace,
+                error=_result_mapping(tool_result, "error"),
             )
         ]
-        next_state.warnings = _dedupe_preserve_order(
-            list(next_state.warnings) + ["工具调用失败，请检查搜索参数或 arXiv 服务状态"],
-        )
-        next_state.papers = []
-        return _append_step(
+
+    if next_state.tool_observations and str(next_state.tool_observations[-1].tool_name or "") == SEARCH_TOOL_NAME:
+        next_state.tool_observations[-1].raw_trace = enriched_trace
+        next_state.tool_observations[-1].is_sufficient = bool(_result_ok(tool_result) and extracted_papers)
+        next_state.tool_observations[-1].result_ref = {
+            "paper_count": len(extracted_papers),
+            "top_papers": _compact_paper_summaries(extracted_papers, limit=3),
+        }
+
+    if _result_ok(tool_result):
+        next_state.papers = extracted_papers
+    else:
+        _append_structured_error(
             next_state,
             step="search_tool_call",
-            status="failed",
-            action="调用 arXiv 搜索工具",
-            inputs={"tool_name": SEARCH_TOOL_NAME, "tool_args": dict(next_state.tool_args)},
-            outputs={"paper_count": 0},
-            error=str(exc),
+            code="search_tool_result_failed",
+            message="搜索工具返回失败状态，已按可恢复错误处理",
+            detail=_extract_error_message(tool_result),
+            recoverable=True,
+            extra={"tool_name": SEARCH_TOOL_NAME, "tool_args": dict(next_state.tool_args)},
         )
-
-    result = _to_plain_dict(raw_result)
-    next_state.tool_result = result
-
-    trace_payload = _result_mapping(result, "trace")
-    tool_call = AgentToolCall(
-        tool_name=SEARCH_TOOL_NAME,
-        arguments=dict(next_state.tool_args),
-        status="success" if _result_ok(result) else "failed",
-        summary=_result_text(result, "summary"),
-        trace=_build_tool_call_trace(
-            tool_name=SEARCH_TOOL_NAME,
-            tool_args=next_state.tool_args,
-            result=result,
-            paper_count=len(next_state.papers or []),
-            source=trace_payload.get("source") if trace_payload else None,
-            normalized_inputs=trace_payload.get("normalized_inputs") if trace_payload else None,
-            final_search_query=trace_payload.get("final_search_query") if trace_payload else None,
-        ),
-        error=_result_mapping(result, "error"),
-    )
-    next_state.tool_calls = list(next_state.tool_calls) + [tool_call]
-
-    # 成功时提取论文列表；失败时保留空结果并补 warning，由后续节点决定是否重试。
-    # 成功时提取论文列表；失败时保留空结果并补 warning，由后续节点决定是否重试。
-    if _result_ok(result):
-        next_state.papers = _extract_papers_from_tool_result(result)
-    else:
         next_state.papers = []
-        next_state.warnings = _dedupe_preserve_order(
-            list(next_state.warnings) + [_format_tool_failure_warning(result)],
-        )
+        next_state.warnings = _dedupe_preserve_order(list(next_state.warnings) + [_format_tool_failure_warning(tool_result)])
 
     return _append_step(
         next_state,
-        step="search_tool_call",
-        status="success" if _result_ok(result) else "failed",
-        action="调用 arXiv 搜索工具",
-        inputs={"tool_name": SEARCH_TOOL_NAME, "tool_args": dict(next_state.tool_args)},
+        step="search_tool_result_adaptation",
+        status="success" if _result_ok(tool_result) else "failed",
+        action="适配通用工具结果为搜索链路状态",
+        inputs={"tool_name": SEARCH_TOOL_NAME, "tool_args": dict(next_state.tool_args or {})},
         outputs={
             "paper_count": len(next_state.papers or []),
-            "tool_call_status": tool_call.status,
-            "tool_summary": tool_call.summary,
+            "tool_call_status": "success" if _result_ok(tool_result) else "failed",
+            "tool_summary": _result_text(tool_result, "summary"),
         },
-        error=_extract_error_message(result) if not _result_ok(result) else None,
+        error="搜索工具返回失败状态" if not _result_ok(tool_result) else None,
     )
 
 
@@ -427,9 +464,15 @@ def check_search_result(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
     else:
         if not _result_ok(tool_result):
             warnings.append("工具调用失败，请检查搜索参数或 arXiv 服务状态")
-        error_message = _extract_error_message(tool_result)
-        if error_message:
-            warnings.append(error_message)
+            _append_structured_error(
+                next_state,
+                step="search_result_check",
+                code="search_result_unavailable",
+                message="搜索结果检查发现工具调用失败，后续将按失败结果继续响应",
+                detail=_extract_error_message(tool_result),
+                recoverable=True,
+                extra={"paper_count": len(papers), "requested_max_results": max_results},
+            )
 
     # 只有工具成功时，才基于论文数判断是否需要提示自动放宽或缩窄查询。
     if _result_ok(tool_result):
@@ -457,7 +500,7 @@ def check_search_result(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
             "warning_count": len(next_state.warnings),
             "paper_count": len(papers),
         },
-        error=_extract_error_message(tool_result) if tool_result and not _result_ok(tool_result) else None,
+        error="搜索结果检查发现工具调用失败" if tool_result and not _result_ok(tool_result) else None,
     )
 
 
@@ -517,6 +560,7 @@ def relax_search_for_retry(state: Union[AgentState, Mapping[str, Any]]) -> Agent
     # 重试前清空上一轮工具执行残留，避免错误结果污染后续节点。
     next_state.tool_name = None
     next_state.tool_args = {}
+    next_state.tool_call_request = None
     next_state.tool_result = None
     next_state.papers = []
 
@@ -548,6 +592,50 @@ def personalized_rank_and_annotate_papers(state: Union[AgentState, Mapping[str, 
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
 
+    query_text = next_state.search_spec.query if next_state.search_spec is not None else None
+    search_spec_payload = next_state.search_spec.model_dump() if next_state.search_spec is not None else None
+    compact_search_spec = _compact_search_spec(next_state.search_spec)
+    user_id = str(next_state.user_id) if next_state.user_id is not None else None
+    paper_count = len(next_state.papers or [])
+
+    def _build_failed_rerank_state(exc: Exception, warning_prefix: str) -> AgentState:
+        next_state.personalized_rerank_applied = False
+        _append_structured_error(
+            next_state,
+            step="personalized_rerank",
+            code="personalized_rerank_failed",
+            message=f"{warning_prefix}，已降级为普通搜索排序",
+            detail=str(exc),
+            recoverable=True,
+            extra={
+                "user_id": user_id,
+                "paper_count": paper_count,
+                "query": query_text,
+                "search_spec": compact_search_spec,
+            },
+        )
+        next_state.warnings = _dedupe_preserve_order(
+            list(next_state.warnings) + [f"{warning_prefix}，已保留普通搜索排序"],
+        )
+        return _append_step(
+            next_state,
+            step="personalized_rerank",
+            status="failed",
+            action="基于用户偏好对搜索结果做个性化重排",
+            inputs={
+                "user_id": user_id,
+                "paper_count": paper_count,
+                "query": query_text,
+                "search_spec": compact_search_spec,
+            },
+            outputs={
+                "personalized_rerank_applied": False,
+                "paper_count": len(next_state.papers or []),
+                "papers_preserved": True,
+            },
+            error=warning_prefix,
+        )
+
     # 个性化重排依赖三个前提：搜索意图、已有候选论文、以及有效 user_id。
     if next_state.intent != "arxiv_search" or not next_state.papers or not next_state.user_id:
         next_state.personalized_rerank_applied = False
@@ -567,56 +655,19 @@ def personalized_rank_and_annotate_papers(state: Union[AgentState, Mapping[str, 
     try:
         recommendation_service = get_recommendation_service()
     except Exception as exc:
-        next_state.personalized_rerank_applied = False
-        next_state.warnings = _dedupe_preserve_order(
-            list(next_state.warnings) + [f"无法初始化推荐服务，已保留普通搜索排序: {exc}"],
-        )
-        return _append_step(
-            next_state,
-            step="personalized_rerank",
-            status="failed",
-            action="基于用户偏好对搜索结果做个性化重排",
-            inputs={
-                "user_id": str(next_state.user_id),
-                "paper_count": len(next_state.papers or []),
-                "query": query_text,
-                "search_spec": _compact_search_spec(next_state.search_spec),
-            },
-            outputs={"personalized_rerank_applied": False},
-            error=str(exc),
-        )
-
-    query_text = next_state.search_spec.query if next_state.search_spec is not None else None
-    search_spec_payload = next_state.search_spec.model_dump() if next_state.search_spec is not None else None
+        return _build_failed_rerank_state(exc, "无法初始化推荐服务")
 
     try:
         # 重排服务只调整排序和附加打分，不会改变“本轮搜索主题”的语义边界。
         rerank_result = recommendation_service.rerank_search_results_for_user(
-            user_id=str(next_state.user_id),
+            user_id=user_id,
             papers=list(next_state.papers or []),
             query=query_text,
             top_n=_determine_requested_max_results(next_state),
             search_spec=search_spec_payload,
         )
     except Exception as exc:
-        next_state.personalized_rerank_applied = False
-        next_state.warnings = _dedupe_preserve_order(
-            list(next_state.warnings) + [f"个性化重排失败，已保留普通搜索排序: {exc}"],
-        )
-        return _append_step(
-            next_state,
-            step="personalized_rerank",
-            status="failed",
-            action="基于用户偏好对搜索结果做个性化重排",
-            inputs={
-                "user_id": str(next_state.user_id),
-                "paper_count": len(next_state.papers or []),
-                "query": query_text,
-                "search_spec": _compact_search_spec(next_state.search_spec),
-            },
-            outputs={"personalized_rerank_applied": False},
-            error=str(exc),
-        )
+        return _build_failed_rerank_state(exc, "个性化重排失败")
 
     reranked_papers = rerank_result.get("papers") if isinstance(rerank_result, Mapping) else None
     if isinstance(reranked_papers, list) and reranked_papers:
@@ -639,10 +690,10 @@ def personalized_rank_and_annotate_papers(state: Union[AgentState, Mapping[str, 
         status="success",
         action="基于用户偏好对搜索结果做个性化重排",
         inputs={
-            "user_id": str(next_state.user_id),
+            "user_id": user_id,
             "paper_count": len(current_state.papers or []),
             "query": query_text,
-            "search_spec": _compact_search_spec(next_state.search_spec),
+            "search_spec": compact_search_spec,
         },
         outputs={
             "personalized_rerank_applied": bool(next_state.personalized_rerank_applied),
@@ -655,6 +706,7 @@ def personalized_rank_and_annotate_papers(state: Union[AgentState, Mapping[str, 
 __all__ = [
     "MAX_SEARCH_RETRIES",
     "SEARCH_TOOL_NAME",
+    "adapt_search_tool_result",
     "build_search_tool_args",
     "check_search_result",
     "invoke_search_tool",

@@ -4,7 +4,15 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from .schemas import AgentStep, AgentToolCall, ArxivSearchSpec
+from .schemas import (
+    AgentStep,
+    AgentToolCall,
+    ArxivSearchSpec,
+    ExecutionPlanStep,
+    Goal,
+    ToolCallRequest,
+    ToolObservation,
+)
 
 
 class AgentState(BaseModel):
@@ -24,7 +32,7 @@ class AgentState(BaseModel):
     2. 意图识别结果：intent、intent_source、fallback_reason、llm_confidence、search_spec；
     3. 工具与数据结果：tool_name、tool_args、tool_result、tool_calls、papers；
     4. 阅读/偏好相关中间态：待确认任务（pending_action）、paper_qa_result、preference_action_result；
-    5. 面向用户与调试的信息：plan、warnings、answer、next_actions、steps、debug；
+    5. 面向用户与调试的信息：plan、warnings、answer、next_actions、steps、errors、debug；
     6. 运行时控制字段：personalized_rerank_applied、search_retry_count、fallback_specs。
 
     之所以把这些状态集中到一个模型里，而不是拆成多个零散 dict，主要是为了：
@@ -54,10 +62,15 @@ class AgentState(BaseModel):
     llm_confidence: Optional[float] = None
     search_spec: Optional[ArxivSearchSpec] = None
 
+    # goal 表达用户本轮真实想完成的目标；execution_plan 表达结构化步骤规划。
+    # 阶段 1 中它们主要用于状态表达、调试和后续能力扩展，不直接替代现有 plan。
+    goal: Optional[Goal] = None
+    execution_plan: List[ExecutionPlanStep] = Field(default_factory=list)
+
     # 偏好动作执行后的结果，例如喜欢/不喜欢/取消标记的处理结果。
     preference_action_result: Optional[Dict[str, Any]] = None
 
-    # debug 保存面向开发排查的中间态，不直接面向终端用户。
+    # debug 保存面向开发排查的中间态与详细错误上下文，不直接面向终端用户。
     debug: Dict[str, Any] = Field(default_factory=dict)
 
     # plan 表示系统理解到的处理计划；next_actions 表示建议用户下一步可以做什么。
@@ -65,20 +78,24 @@ class AgentState(BaseModel):
 
     # tool_* 字段记录当前节点最近一次工具调用的名称、参数和原始结果；
     # tool_calls 则保留完整工具调用轨迹列表。
+    # 阶段 2 新增的 tool_call_request / tool_observations 先只作为统一协议字段，
+    # 暂不替代已有工具执行流，避免影响现有搜索链路和调试展示逻辑。
     tool_name: Optional[str] = None
     tool_args: Dict[str, Any] = Field(default_factory=dict)
     tool_result: Optional[Dict[str, Any]] = None
     tool_calls: List[AgentToolCall] = Field(default_factory=list)
+    tool_call_request: Optional[ToolCallRequest] = None
+    tool_observations: List[ToolObservation] = Field(default_factory=list)
 
     # papers 用于保存搜索结果或某些阅读链路回传的论文列表。
     papers: List[Dict[str, Any]] = Field(default_factory=list)
 
-    # warnings / answer / next_actions 是最终给回复节点使用的重要字段。
+    # warnings 只放用户或前端可理解的提示；answer / next_actions 是最终回复层直接消费的字段。
     warnings: List[str] = Field(default_factory=list)
     answer: Optional[str] = None
     next_actions: List[str] = Field(default_factory=list)
 
-    # steps 会把每个节点的执行摘要以结构化形式记录下来，便于回放与调试。
+    # steps 记录节点级执行轨迹；errors 存放结构化错误信息，供后端或调试工具排查。
     steps: List[AgentStep] = Field(default_factory=list)
     errors: List[Dict[str, Any]] = Field(default_factory=list)
 

@@ -12,10 +12,6 @@
 from __future__ import annotations
 
 # 意图识别辅助工具：供 parse 节点和测试直接复用。
-# 意图识别辅助工具：供 parse 节点和测试直接复用。
-# 意图识别辅助工具：供 parse 节点和测试直接复用。
-# 意图识别辅助工具：供 parse 节点和测试直接复用。
-# 意图识别辅助工具：供 parse 节点和测试直接复用。
 from .intent_support import (
     HARD_RULE_PATTERNS,
     LLM_CONFIDENCE_THRESHOLD,
@@ -42,11 +38,8 @@ from ..utils.state_utils import _coerce_state
 # 并根据是否已有索引决定直接回答还是进入待确认解析流程。
 from .paper_reading_node import handle_paper_reading_request
 # parse 节点：负责把自然语言请求收敛成结构化 intent 与 search_spec。
-# parse 节点：负责把自然语言请求收敛成结构化 intent 与 search_spec。
-# parse 节点：负责把自然语言请求收敛成结构化 intent 与 search_spec。
-# parse 节点：负责把自然语言请求收敛成结构化 intent 与 search_spec。
-# parse 节点：负责把自然语言请求收敛成结构化 intent 与 search_spec。
 from .parse_node import parse_search_request
+from .plan_node import plan_task
 from .pending_action_node import (
     classify_pending_action_confirmation,
     handle_pending_action_confirmation,
@@ -59,17 +52,20 @@ from .preference_node import apply_preference_action
 from .response_node import synthesize_response
 from .search_node import (
     SEARCH_TOOL_NAME,
+    adapt_search_tool_result,
     build_search_tool_args,
     check_search_result,
     invoke_search_tool,
     personalized_rank_and_annotate_papers,
     relax_search_for_retry,
 )
+from .tool_node import execute_tool
 
 __all__ = [
     "HARD_RULE_PATTERNS",
     "LLM_CONFIDENCE_THRESHOLD",
     "SEARCH_TOOL_NAME",
+    "adapt_search_tool_result",
     "SEARCH_TRIGGER_PATTERNS",
     "SUPPORTED_INTENTS",
     "_build_intent_guidance",
@@ -92,10 +88,12 @@ __all__ = [
     "build_search_tool_args",
     "check_search_result",
     "classify_pending_action_confirmation",
+    "execute_tool",
     "handle_paper_reading_request",
     "handle_pending_action_confirmation",
     "invoke_search_tool",
     "parse_search_request",
+    "plan_task",
     "personalized_rank_and_annotate_papers",
     "relax_search_for_retry",
     "synthesize_response",
