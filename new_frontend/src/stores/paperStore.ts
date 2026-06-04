@@ -69,18 +69,6 @@ export const usePaperStore = defineStore('paper', () => {
   const paperActionMap = ref<UserPaperActionMap>({})
   const paperNotes = ref<PaperNote[]>([])
 
-  function toStringArray(value: any): string[] {
-    if (Array.isArray(value)) {
-      return value.map((item: any) => String(item).trim()).filter((item: string) => item)
-    }
-    if (!value) return []
-    return String(value)
-      .replace(/[\[\]\(\)]/g, '')
-      .split(/[,;]/)
-      .map((item: string) => item.trim())
-      .filter((item: string) => item)
-  }
-
   function buildRecommendationReason(item: any): string {
     const breakdown = item?.score_breakdown || item?.scoreBreakdown || {}
     const parts: string[] = []
@@ -183,16 +171,8 @@ export const usePaperStore = defineStore('paper', () => {
     try {
       const result = await getRecommendations(params)
       recommendations.value = result.items.map((p: any) => ({
-        id: p.arxiv_id || p.id,
-        arxivId: p.arxiv_id || p.id,
-        title: p.title,
-        authors: Array.isArray(p.authors) ? p.authors : (p.authors ? p.authors.split(',').map((a: string) => a.trim()).filter((a: string) => a) : []),
-        summary: p.abstract || p.summary,
-        publishedAt: p.published_date || p.publishedAt,
-        categories: Array.isArray(p.categories) ? p.categories : (p.categories ? p.categories.split(',').map((c: string) => c.trim()).filter((c: string) => c) : []),
-        pdfUrl: p.url || p.pdfUrl,
-        absUrl: p.url || p.absUrl,
-        similarityScore: typeof p.similarity === 'number' ? p.similarity : (p.similarityScore || 0),
+        ...p,
+        summary: p.summary || '',
         label: p.label || null
       }))
       applyPaperActions(recommendations.value)
@@ -364,38 +344,10 @@ export const usePaperStore = defineStore('paper', () => {
         researchProfile.value = result.research_profile || researchProfile.value
         paperActionMap.value = result.paper_actions || paperActionMap.value
         recommendations.value = result.recommendations.map((p: any) => ({
-          id: p.arxiv_id,
-          arxivId: p.arxiv_id,
-          title: p.title,
-          authors: toStringArray(p.authors),
-          summary: p.abstract,
-          publishedAt: p.published_date,
-          categories: toStringArray(p.categories),
-          pdfUrl: p.url,
-          absUrl: p.url,
-          similarityScore: typeof p.similarity_score === 'number'
-            ? p.similarity_score
-            : (typeof p.similarityScore === 'number' ? p.similarityScore : (typeof p.score === 'number' ? p.score : 0)),
-          finalScore: typeof p.final_score === 'number' ? p.final_score : undefined,
-          reason: buildRecommendationReason(p),
-          scoreBreakdown: p.score_breakdown || p.scoreBreakdown || undefined,
-          recall_source: p.recall_source || p.recallSource || undefined,
-          recall_cluster_id: p.recall_cluster_id || p.recallClusterId || null,
-          recall_cluster_similarity: typeof p.recall_cluster_similarity === 'number'
-            ? p.recall_cluster_similarity
-            : (typeof p.recallClusterSimilarity === 'number' ? p.recallClusterSimilarity : null),
-          recall_cluster_rank: typeof p.recall_cluster_rank === 'number'
-            ? p.recall_cluster_rank
-            : (typeof p.recallClusterRank === 'number' ? p.recallClusterRank : null),
-          recall_cluster_hits: toRecallClusterHits(p.recall_cluster_hits || p.recallClusterHits),
-          best_matched_cluster_id: p.best_matched_cluster_id || p.bestMatchedClusterId || null,
-          best_matched_cluster_similarity: typeof p.best_matched_cluster_similarity === 'number'
-            ? p.best_matched_cluster_similarity
-            : (typeof p.bestMatchedClusterSimilarity === 'number' ? p.bestMatchedClusterSimilarity : null),
-          cluster_similarities: Array.isArray(p.cluster_similarities)
-            ? p.cluster_similarities
-            : (Array.isArray(p.clusterSimilarities) ? p.clusterSimilarities : undefined),
-          diversityDebug: p.diversity_debug || p.diversityDebug || undefined,
+          ...p,
+          summary: p.summary || '',
+          reason: p.reason || buildRecommendationReason(p),
+          recall_cluster_hits: toRecallClusterHits(p.recall_cluster_hits),
           label: null
         }))
         applyPaperActions(recommendations.value)

@@ -86,6 +86,39 @@ function normalizePaper(raw: any): Paper {
   }
 }
 
+function normalizeRecommendedPaper(raw: any): RecommendedPaper {
+  return {
+    ...normalizePaper(raw),
+    similarityScore: typeof raw?.similarity_score === 'number'
+      ? raw.similarity_score
+      : (typeof raw?.similarityScore === 'number' ? raw.similarityScore : (typeof raw?.score === 'number' ? raw.score : 0)),
+    finalScore: typeof raw?.final_score === 'number'
+      ? raw.final_score
+      : (typeof raw?.finalScore === 'number' ? raw.finalScore : undefined),
+    reason: raw?.reason || undefined,
+    scoreBreakdown: raw?.score_breakdown || raw?.scoreBreakdown || undefined,
+    recall_source: raw?.recall_source || raw?.recallSource || undefined,
+    recall_cluster_id: raw?.recall_cluster_id || raw?.recallClusterId || null,
+    recall_cluster_similarity: typeof raw?.recall_cluster_similarity === 'number'
+      ? raw.recall_cluster_similarity
+      : (typeof raw?.recallClusterSimilarity === 'number' ? raw.recallClusterSimilarity : null),
+    recall_cluster_rank: typeof raw?.recall_cluster_rank === 'number'
+      ? raw.recall_cluster_rank
+      : (typeof raw?.recallClusterRank === 'number' ? raw.recallClusterRank : null),
+    recall_cluster_hits: Array.isArray(raw?.recall_cluster_hits)
+      ? raw.recall_cluster_hits
+      : (Array.isArray(raw?.recallClusterHits) ? raw.recallClusterHits : []),
+    best_matched_cluster_id: raw?.best_matched_cluster_id || raw?.bestMatchedClusterId || null,
+    best_matched_cluster_similarity: typeof raw?.best_matched_cluster_similarity === 'number'
+      ? raw.best_matched_cluster_similarity
+      : (typeof raw?.bestMatchedClusterSimilarity === 'number' ? raw.bestMatchedClusterSimilarity : null),
+    cluster_similarities: Array.isArray(raw?.cluster_similarities)
+      ? raw.cluster_similarities
+      : (Array.isArray(raw?.clusterSimilarities) ? raw.clusterSimilarities : undefined),
+    diversityDebug: raw?.diversity_debug || raw?.diversityDebug || undefined
+  }
+}
+
 function emptyResearchProfile(): UserResearchProfile {
   return {
     user_id: DEFAULT_USER_ID,
@@ -346,8 +379,15 @@ export async function getRecommendations(params: { page: number; pageSize: numbe
       items: mockRecommendedPapers.slice(start, end)
     }
   }
-  
-  return request.get('/papers/recommendations', { params })
+
+  const response: any = await request.get('/papers/recommendations', { params })
+  const items = Array.isArray(response?.items)
+    ? response.items.map(normalizeRecommendedPaper)
+    : []
+  return {
+    total: Number(response?.total ?? items.length),
+    items
+  }
 }
 
 export async function labelPaper(id: string, data: LabelParams): Promise<void> {
@@ -463,32 +503,7 @@ export async function recommendPapers(topN: number = 10, maxAgeMonths: number = 
     research_profile: response?.research_profile ? normalizeResearchProfile(response.research_profile) : null,
     paper_actions: normalizePaperActionMap(response?.paper_actions),
     recommendations: Array.isArray(response?.recommendations)
-      ? response.recommendations.map((item: any) => ({
-          ...normalizePaper(item),
-          similarityScore: typeof item.similarity_score === 'number'
-            ? item.similarity_score
-            : (typeof item.similarityScore === 'number' ? item.similarityScore : (typeof item.score === 'number' ? item.score : 0)),
-          finalScore: typeof item.final_score === 'number' ? item.final_score : undefined,
-          reason: item.reason,
-          scoreBreakdown: item.score_breakdown || item.scoreBreakdown || undefined,
-          recall_source: item.recall_source || item.recallSource || undefined,
-          recall_cluster_id: item.recall_cluster_id || item.recallClusterId || null,
-          recall_cluster_similarity: typeof item.recall_cluster_similarity === 'number'
-            ? item.recall_cluster_similarity
-            : (typeof item.recallClusterSimilarity === 'number' ? item.recallClusterSimilarity : null),
-          recall_cluster_rank: typeof item.recall_cluster_rank === 'number'
-            ? item.recall_cluster_rank
-            : (typeof item.recallClusterRank === 'number' ? item.recallClusterRank : null),
-          recall_cluster_hits: Array.isArray(item.recall_cluster_hits) ? item.recall_cluster_hits : [],
-          best_matched_cluster_id: item.best_matched_cluster_id || item.bestMatchedClusterId || null,
-          best_matched_cluster_similarity: typeof item.best_matched_cluster_similarity === 'number'
-            ? item.best_matched_cluster_similarity
-            : (typeof item.bestMatchedClusterSimilarity === 'number' ? item.bestMatchedClusterSimilarity : null),
-          cluster_similarities: Array.isArray(item.cluster_similarities)
-            ? item.cluster_similarities
-            : (Array.isArray(item.clusterSimilarities) ? item.clusterSimilarities : undefined),
-          diversityDebug: item.diversity_debug || item.diversityDebug || undefined
-        }))
+      ? response.recommendations.map(normalizeRecommendedPaper)
       : []
   }
 }

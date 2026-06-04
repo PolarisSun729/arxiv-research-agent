@@ -32,6 +32,10 @@ const recommendationScoreBreakdown = computed(() => {
   return isRecommended(props.paper) ? props.paper.scoreBreakdown || null : null
 })
 
+const showRecommendationMetrics = computed(() => {
+  return Boolean(props.isRecommendation || isRecommended(props.paper))
+})
+
 const diversityDebug = computed(() => {
   return isRecommended(props.paper) ? props.paper.diversityDebug || null : null
 })
@@ -134,7 +138,15 @@ const agentPriority = computed(() => readPaperNumber(['priority']))
 const agentMatchedTerms = computed(() => readPaperStringArray(['matchedTerms', 'matched_terms']))
 const agentMatchReason = computed(() => readPaperString(['matchReason', 'match_reason']))
 const agentPersonalizedReason = computed(() => readPaperString(['personalizedReason', 'personalized_reason']))
-const agentScoreBreakdown = computed(() => (props.paper as any).scoreBreakdown || (props.paper as any).score_breakdown || null)
+const agentScoreBreakdown = computed(() => {
+  const breakdown = (props.paper as any).scoreBreakdown || (props.paper as any).score_breakdown || null
+  if (!breakdown || typeof breakdown !== 'object') return null
+
+  const hasAgentScores = [breakdown.query_match_score, breakdown.personalization_score, breakdown.final_score]
+    .some((value) => typeof value === 'number' && !Number.isNaN(value))
+
+  return hasAgentScores ? breakdown : null
+})
 const similarityDisplayScore = computed(() => {
   if (isRecommended(props.paper)) {
     return (props.paper as any).similarityScore || (props.paper as any).similarity || 0
@@ -152,6 +164,11 @@ const hasAgentRerankData = computed(() => {
     agentMatchReason.value ||
     agentPersonalizedReason.value
   )
+})
+
+const showAgentMetrics = computed(() => {
+  if (props.isRecommendation) return false
+  return Boolean(hasAgentRerankData.value || agentScoreBreakdown.value)
 })
 
 function toPercent(value?: number) {
@@ -247,53 +264,59 @@ const labelOptions = [
         </div>
       </div>
 
-      <div v-if="isRecommendation || isRecommended(paper) || hasAgentRerankData" class="paper-similarity">
+      <div v-if="showRecommendationMetrics || showAgentMetrics" class="paper-similarity">
         <span class="similarity-label">相似度：</span>
         <SimilarityTag :score="similarityDisplayScore" />
         <span v-if="finalScoreText" class="final-score-label">最终 {{ finalScoreText }}</span>
-        <el-tag v-if="agentPriority" size="small" type="success" effect="plain">
-          优先级 #{{ agentPriority }}
-        </el-tag>
-        <el-tag v-if="agentQueryMatchScore" size="small" type="info" effect="plain">
-          查询 {{ toPercent(agentQueryMatchScore) }}%
-        </el-tag>
-        <el-tag v-if="agentPersonalizationScore" size="small" type="warning" effect="plain">
-          兴趣 {{ toPercent(agentPersonalizationScore) }}%
-        </el-tag>
-        <el-tag v-if="agentFinalScore" size="small" type="success" effect="plain">
-          综合 {{ toPercent(agentFinalScore) }}%
-        </el-tag>
-        <el-tag v-if="bestMatchedClusterId" size="small" type="success" effect="plain">
-          命中簇 {{ bestMatchedClusterId }}
-        </el-tag>
-        <el-tag v-if="recallClusterId" size="small" type="warning" effect="plain">
-          召回来源 {{ recallClusterId }}
-        </el-tag>
-        <el-tag v-if="recallClusterId" size="small" type="info" effect="plain">
-          簇召回相似度 {{ toPercent(recallClusterSimilarity) }}%
-        </el-tag>
-        <el-tag v-if="recallClusterHitsCount > 1" size="small" type="info" effect="plain">
-          多簇命中 {{ recallClusterHitsCount }}
-        </el-tag>
-        <el-tag size="small" type="success" effect="plain">
-          多样性得分 {{ toPercent(diversityMatchScore) }}%
-        </el-tag>
-        <el-tag v-if="agentMatchedTerms.length" size="small" type="info" effect="plain">
-          命中词 {{ agentMatchedTerms.slice(0, 3).join(' / ') }}
-        </el-tag>
-        <el-tag v-if="diversityReason" size="small" type="warning" effect="plain">
-          {{ diversityReason }}
-        </el-tag>
-        <p v-if="recommendationReason" class="recommendation-reason">
-          {{ recommendationReason }}
-        </p>
-        <p v-if="agentMatchReason" class="recommendation-reason">
-          {{ agentMatchReason }}
-        </p>
-        <p v-if="agentPersonalizedReason" class="recommendation-reason">
-          {{ agentPersonalizedReason }}
-        </p>
-        <div v-if="recommendationScoreBreakdown" class="score-breakdown">
+        <template v-if="showRecommendationMetrics">
+          <el-tag v-if="bestMatchedClusterId" size="small" type="success" effect="plain">
+            命中簇 {{ bestMatchedClusterId }}
+          </el-tag>
+          <el-tag v-if="recallClusterId" size="small" type="warning" effect="plain">
+            召回来源 {{ recallClusterId }}
+          </el-tag>
+          <el-tag v-if="recallClusterId" size="small" type="info" effect="plain">
+            簇召回相似度 {{ toPercent(recallClusterSimilarity) }}%
+          </el-tag>
+          <el-tag v-if="recallClusterHitsCount > 1" size="small" type="info" effect="plain">
+            多簇命中 {{ recallClusterHitsCount }}
+          </el-tag>
+          <el-tag size="small" type="success" effect="plain">
+            多样性得分 {{ toPercent(diversityMatchScore) }}%
+          </el-tag>
+          <el-tag v-if="diversityReason" size="small" type="warning" effect="plain">
+            {{ diversityReason }}
+          </el-tag>
+          <p v-if="recommendationReason" class="recommendation-reason">
+            {{ recommendationReason }}
+          </p>
+        </template>
+
+        <template v-if="showAgentMetrics">
+          <el-tag v-if="agentPriority" size="small" type="success" effect="plain">
+            优先级 #{{ agentPriority }}
+          </el-tag>
+          <el-tag v-if="agentQueryMatchScore" size="small" type="info" effect="plain">
+            查询 {{ toPercent(agentQueryMatchScore) }}%
+          </el-tag>
+          <el-tag v-if="agentPersonalizationScore" size="small" type="warning" effect="plain">
+            兴趣 {{ toPercent(agentPersonalizationScore) }}%
+          </el-tag>
+          <el-tag v-if="agentFinalScore" size="small" type="success" effect="plain">
+            综合 {{ toPercent(agentFinalScore) }}%
+          </el-tag>
+          <el-tag v-if="agentMatchedTerms.length" size="small" type="info" effect="plain">
+            命中词 {{ agentMatchedTerms.slice(0, 3).join(' / ') }}
+          </el-tag>
+          <p v-if="agentMatchReason" class="recommendation-reason">
+            {{ agentMatchReason }}
+          </p>
+          <p v-if="agentPersonalizedReason" class="recommendation-reason">
+            {{ agentPersonalizedReason }}
+          </p>
+        </template>
+
+        <div v-if="showRecommendationMetrics && recommendationScoreBreakdown" class="score-breakdown">
           <div class="score-breakdown-row">
             <div class="score-breakdown-meta">
               <span class="breakdown-label">语义</span>
@@ -323,7 +346,7 @@ const labelOptions = [
             <el-progress :percentage="toPercent(recommendationScoreBreakdown.diversity_score)" :show-text="false" color="#22c55e" />
           </div>
         </div>
-        <div v-if="agentScoreBreakdown" class="score-breakdown">
+        <div v-if="showAgentMetrics && agentScoreBreakdown" class="score-breakdown">
           <div class="score-breakdown-row">
             <div class="score-breakdown-meta">
               <span class="breakdown-label">查询</span>
@@ -586,5 +609,3 @@ const labelOptions = [
   }
 }
 </style>
-
-
