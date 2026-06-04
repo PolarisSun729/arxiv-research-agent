@@ -127,11 +127,11 @@ async def add_paper(
     从而让这篇论文既能被结构化查询，也能参与向量检索与推荐。
     """
     try:
-        logger.info("Adding paper with embedding: %s", arxiv_id)
+        logger.debug("Adding paper with embedding: %s", arxiv_id)
 
         # 读取当前生效的 embedding 配置，确保向量生成与系统其他模块使用同一套模型参数。
         embedding_config = get_current_embedding_config()
-        logger.info(
+        logger.debug(
             "Creating embedding for abstract using %s / %s",
             embedding_config.provider,
             embedding_config.model_name,
@@ -147,7 +147,7 @@ async def add_paper(
             dimension=embedding_config.dimension,
         )
 
-        logger.info("Embedding created, dimension: %s", len(embedding))
+        logger.debug("Embedding created, dimension: %s", len(embedding))
 
         # 这份 metadata 会作为向量记录的附加信息，便于后续检索结果回显和过滤。
         metadata = {
@@ -161,13 +161,13 @@ async def add_paper(
             "embedding_model": embedding_config.model_name,
         }
 
-        logger.info("Inserting embedding to collection: %s", collection_name)
+        logger.debug("Inserting embedding to collection: %s", collection_name)
         # 这里直接获取向量库服务实例并插入单条 embedding。
         vector_store_service = get_vector_store_service()
         embedding_id = vector_store_service.insert_single_embedding(collection_name, embedding, metadata)
 
-        logger.info("Embedding inserted with ID: %s", embedding_id)
-        logger.info("Adding paper to database: %s, embedding_id: %s", metadata, embedding_id)
+        logger.debug("Embedding inserted with ID: %s", embedding_id)
+        logger.debug("Adding paper to database: %s, embedding_id: %s", metadata, embedding_id)
 
         # 数据库中保留 embedding_id / embedding_model，方便后续追踪向量来源与重建。
         success = db_service.add_paper(

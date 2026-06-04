@@ -686,7 +686,7 @@ async def qa_paper_stream(
 ):
     """执行流式论文问答，并以 SSE 持续向前端推送事件。"""
     question = payload.question.strip()
-    logger.info("QA stream request for paper: %s, question: %s", arxiv_id, question)
+    logger.debug("QA stream request for paper: %s, question: %s", arxiv_id, question)
 
     # 先统一构建问答上下文：包含召回结果、生成上下文、会话信息以及调试快照。
     _, search_results, qa_context, retrieval_debug = paper_qa_service.build_qa_context(arxiv_id, payload)

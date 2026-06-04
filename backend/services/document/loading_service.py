@@ -290,7 +290,7 @@ class LoadingService:
             docling_table_items = docling_assets["table_items"]
             docling_asset_manifest = docling_assets.get("asset_manifest", {})
 
-            logger.info(
+            logger.debug(
                 "Docling asset summary for %s: document_exported=%s, annotated_pdf_enabled=%s, annotated_pdf_exported=%s, picture_raw=%s, picture_extracted=%s, picture_exported=%s, table_raw=%s, table_exported=%s, asset_root=%s",
                 file_path,
                 docling_document_export.get("document_exported", False),
@@ -1106,7 +1106,7 @@ class LoadingService:
                 with open(output_path, "w", encoding="utf-8") as f:
                     json.dump(document_dict, f, ensure_ascii=False, indent=2)
 
-            logger.info("Docling document exported for %s to %s", source_path, output_path)
+            logger.debug("Docling document exported for %s to %s", source_path, output_path)
             return {
                 "document_exported": True,
                 "document_export_path": output_path,
@@ -1166,7 +1166,7 @@ class LoadingService:
             summary_counts = {"title": 0, "body": 0, "picture": 0, "table": 0}
             raw_docling_data = self._load_json_file(document_json_path) if document_json_path else None
             if raw_docling_data:
-                logger.info("Docling annotation export will use raw JSON bbox data from %s", document_json_path)
+                logger.debug("Docling annotation export will use raw JSON bbox data from %s", document_json_path)
                 candidates = self._collect_docling_bbox_candidates_from_raw_json(raw_docling_data)
             else:
                 logger.warning(
@@ -1244,7 +1244,7 @@ class LoadingService:
                     ensure_ascii=False,
                     indent=2,
                 )
-            logger.info(
+            logger.debug(
                 "Docling annotated PDF exported for %s to %s (boxes=%s)",
                 source_path,
                 output_path,

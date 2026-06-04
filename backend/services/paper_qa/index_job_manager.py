@@ -91,7 +91,7 @@ class IndexJobManager:
                 progress=progress,
                 error_message="",
             )
-            logger.info(
+            logger.debug(
                 "QA index job progress: job_id=%s arxiv_id=%s stage=%s progress=%s message=%s",
                 job_id,
                 arxiv_id,

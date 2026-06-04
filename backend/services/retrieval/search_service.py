@@ -106,12 +106,12 @@ class SearchService:
                 "results": results
             }
             
-            logger.info(f"Saving search results to: {filepath}")
+            logger.debug(f"Saving search results to: {filepath}")
             
             with open(filepath, "w", encoding="utf-8") as f:
                 json.dump(search_data, f, ensure_ascii=False, indent=2)
             
-            logger.info(f"Successfully saved search results to: {filepath}")
+            logger.debug(f"Successfully saved search results to: {filepath}")
             return filepath
             
         except Exception as e:
@@ -144,18 +144,18 @@ class SearchService:
         """
         try:
             # 添加参数日志
-            logger.info(f"Search parameters:")
-            logger.info(f"- Query: {query}")
-            logger.info(f"- Collection ID: {collection_id}")
-            logger.info(f"- Top K: {top_k}")
-            logger.info(f"- Threshold: {threshold}")
-            logger.info(f"- Word Count Threshold: {word_count_threshold}")
-            logger.info(f"- Save Results: {save_results} (type: {type(save_results)})")
+            logger.debug(f"Search parameters:")
+            logger.debug(f"- Query: {query}")
+            logger.debug(f"- Collection ID: {collection_id}")
+            logger.debug(f"- Top K: {top_k}")
+            logger.debug(f"- Threshold: {threshold}")
+            logger.debug(f"- Word Count Threshold: {word_count_threshold}")
+            logger.debug(f"- Save Results: {save_results} (type: {type(save_results)})")
 
-            logger.info(f"Starting search with parameters - Collection: {collection_id}, Query: {query}, Top K: {top_k}")
+            logger.debug(f"Starting search with parameters - Collection: {collection_id}, Query: {query}, Top K: {top_k}")
             
             # 连接到 Milvus
-            logger.info(f"Connecting to Milvus at {self.milvus_uri}")
+            logger.debug(f"Connecting to Milvus at {self.milvus_uri}")
             connections.connect(
                 alias="default",
                 uri=self.milvus_uri
@@ -163,15 +163,15 @@ class SearchService:
             
             # 获取collection
             normalized_collection_id = normalize_collection_name(collection_id)
-            logger.info(f"Loading collection: {normalized_collection_id}")
+            logger.debug(f"Loading collection: {normalized_collection_id}")
             collection = Collection(normalized_collection_id)
             collection.load()
             
             # 记录collection的基本信息
-            logger.info(f"Collection info - Entities: {collection.num_entities}")
+            logger.debug(f"Collection info - Entities: {collection.num_entities}")
             
             # 从collection中读取embedding配置
-            logger.info("Querying sample entity for embedding configuration")
+            logger.debug("Querying sample entity for embedding configuration")
             sample_entity = collection.query(
                 expr="id >= 0", 
                 output_fields=["embedding_provider", "embedding_model"],
@@ -181,10 +181,10 @@ class SearchService:
                 logger.error(f"Collection {collection_id} is empty")
                 raise ValueError(f"Collection {collection_id} is empty")
             
-            logger.info(f"Sample entity configuration: {sample_entity[0]}")
+            logger.debug(f"Sample entity configuration: {sample_entity[0]}")
             
             # 使用collection中存储的配置创建查询向量
-            logger.info("Creating query embedding")
+            logger.debug("Creating query embedding")
             vector_field = next((field for field in collection.schema.fields if field.name == "vector"), None)
             embedding_dimension = None
             if vector_field is not None:
@@ -199,15 +199,15 @@ class SearchService:
                 model=sample_entity[0]["embedding_model"],
                 dimension=int(embedding_dimension) if embedding_dimension else None,
             )
-            logger.info(f"Query embedding created with dimension: {len(query_embedding)}")
+            logger.debug(f"Query embedding created with dimension: {len(query_embedding)}")
             
             # 执行搜索
             search_params = {
                 "metric_type": "COSINE",
                 "params": {"nprobe": 10}
             }
-            logger.info(f"Executing search with params: {search_params}")
-            logger.info(f"Word count threshold filter: word_count >= {word_count_threshold}")
+            logger.debug(f"Executing search with params: {search_params}")
+            logger.debug(f"Word count threshold filter: word_count >= {word_count_threshold}")
             
             results = collection.search(
                 data=[query_embedding],
@@ -241,11 +241,11 @@ class SearchService:
             
             # 处理结果
             processed_results = []
-            logger.info(f"Raw search results count: {len(results[0])}")
+            logger.debug(f"Raw search results count: {len(results[0])}")
             
             for hits in results:
                 for hit in hits:
-                    logger.info(f"Processing hit - Score: {hit.score}, Word Count: {hit.get('word_count')}")
+                    logger.debug(f"Processing hit - Score: {hit.score}, Word Count: {hit.get('word_count')}")
                     if hit.score >= threshold:
                         page_start = getattr(hit.entity, "page_start", "")
                         page_end = getattr(hit.entity, "page_end", "")
@@ -279,9 +279,9 @@ class SearchService:
             response_data = {"results": processed_results}
             
             # 添加详细的保存逻辑日志
-            logger.info(f"Preparing to handle save_results (flag: {save_results})")
+            logger.debug(f"Preparing to handle save_results (flag: {save_results})")
             if save_results:
-                logger.info("Save results is True, attempting to save...")
+                logger.debug("Save results is True, attempting to save...")
                 if processed_results:
                     try:
                         filepath = self.save_search_results(query, collection_id, processed_results)

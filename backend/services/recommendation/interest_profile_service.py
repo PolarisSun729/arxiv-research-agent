@@ -91,14 +91,14 @@ class InterestProfileService:
                         }
                         for cluster in interest_clusters
                     ]
-                    logger.info(
+                    logger.debug(
                         "User %s liked papers clustered into %s interest clusters: %s",
                         user_id,
                         len(interest_clusters),
                         cluster_summary,
                     )
                 else:
-                    logger.info(
+                    logger.debug(
                         "User %s did not produce stable interest clusters; using mean fallback",
                         user_id,
                     )
@@ -277,7 +277,7 @@ class InterestProfileService:
                     raise HTTPException(status_code=500, detail=f"Failed to store paper {arxiv_id}")
                 recovered_vectors[arxiv_id] = embedding_vector
                 recovered_ids.append(arxiv_id)
-                logger.info("Backfilled missing paper %s into paper store and vector store", arxiv_id)
+                logger.debug("Backfilled missing paper %s into paper store and vector store", arxiv_id)
             except Exception as exc:  # pragma: no cover
                 logger.warning("Failed to materialize missing paper %s for %s backfill: %s", arxiv_id, label, exc)
                 unresolved_ids.append(arxiv_id)
@@ -317,7 +317,7 @@ class InterestProfileService:
             )
             labels = clusterer.fit_predict(vectors)
         except Exception as exc:  # pragma: no cover
-            logger.info("HDBSCAN interest clustering failed; using mean fallback: %s", exc)
+            logger.debug("HDBSCAN interest clustering failed; using mean fallback: %s", exc)
             return [], None
 
         cluster_members: Dict[int, List[int]] = {}
@@ -342,9 +342,9 @@ class InterestProfileService:
 
         if not cluster_members:
             if weak_interest_pool:
-                logger.info("HDBSCAN produced only weak-interest noise points; keeping weak pool and using mean fallback")
+                logger.debug("HDBSCAN produced only weak-interest noise points; keeping weak pool and using mean fallback")
                 return [], weak_interest_pool
-            logger.info("HDBSCAN produced no stable interest clusters; using mean fallback")
+            logger.debug("HDBSCAN produced no stable interest clusters; using mean fallback")
             return [], None
 
         clusters: List[Dict[str, Any]] = []

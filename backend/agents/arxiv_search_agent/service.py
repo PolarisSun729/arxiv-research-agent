@@ -147,7 +147,7 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
         # 第 2 步：把前端 context 与后端 Agent session memory 合并。
         request_context, _agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(normalized_request)
         # 入口日志只记录状态摘要，便于排查“前端传了但后端没识别到”的问题，不直接打出完整上下文内容。
-        logger.info(
+        logger.debug(
             "arxiv_agent request received: message=%s context_keys=%s pending_action_status=%s paper_qa_status=%s selected_arxiv_id=%s",
             normalized_request.message,
             sorted(request_context.keys()),
@@ -217,7 +217,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
         try:
             # 阶段 B：构造与同步入口一致的初始上下文和状态，保证两条路径行为一致。
             request_context, _agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(normalized_request)
-            logger.info(
+            logger.debug(
                 "arxiv_agent stream start: run_id=%s message=%s context_keys=%s pending_action_status=%s paper_qa_status=%s selected_arxiv_id=%s",
                 run_id,
                 normalized_request.message,

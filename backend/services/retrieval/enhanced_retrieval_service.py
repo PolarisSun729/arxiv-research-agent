@@ -2433,7 +2433,7 @@ class EnhancedRetrievalService:
                 self._chunk_unique_key(chunk),
             )
             if stage_name == "final_context_top15":
-                logger.info(
+                logger.debug(
                     "final_context[%d] chunk_id=%s chunk_type=%s asset_kind=%s rerank_score=%s uses_original_chunk=%s original_chunk_preview=%s asset_summary_preview=%s rerank_preview=%s",
                     idx,
                     chunk.get("chunk_id"),

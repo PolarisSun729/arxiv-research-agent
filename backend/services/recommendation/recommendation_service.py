@@ -227,7 +227,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                 excluded_ids=excluded_ids,
                 top_k=max(top_n * 3, 20),
             )
-            logger.info(
+            logger.debug(
                 "Fetched %s cluster recall candidates for user %s from %s interest clusters",
                 len(cluster_recall_candidates),
                 user_id,
@@ -245,10 +245,10 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                 max_results=max(candidate_limit * 2, candidate_limit),
             )
             recall_mode = "recent_pool"
-            logger.info("Fetched %s recent OAI DB candidates for user %s before deduplication", len(candidates), user_id)
+            logger.debug("Fetched %s recent OAI DB candidates for user %s before deduplication", len(candidates), user_id)
 
         filtered_candidates = self._deduplicate_candidates(candidates, excluded_ids)
-        logger.info(
+        logger.debug(
             "Retained %s candidate papers after deduplication against %s excluded papers for user %s",
             len(filtered_candidates),
             len(excluded_ids),
@@ -261,13 +261,13 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                     max_age_months=max_age_months,
                     max_results=max(candidate_limit * 2, candidate_limit),
                 )
-                logger.info(
+                logger.debug(
                     "Cluster recall returned no candidates for user %s; falling back to recent OAI DB pool with %s papers",
                     user_id,
                     len(candidates),
                 )
                 filtered_candidates = self._deduplicate_candidates(candidates, excluded_ids)
-                logger.info(
+                logger.debug(
                     "Retained %s fallback candidate papers after deduplication against %s excluded papers for user %s",
                     len(filtered_candidates),
                     len(excluded_ids),
@@ -279,7 +279,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
 
         # 统一补齐候选论文的论文表与 embedding 数据，后续排序才有稳定输入。
         materialized_candidates, materialize_stats = self._materialize_candidate_papers_for_recommendation(filtered_candidates)
-        logger.info(
+        logger.debug(
             "Materialized candidate papers for user %s: total=%s reused=%s db_only=%s batch_embedded=%s batch_inserted=%s unresolved=%s",
             user_id,
             materialize_stats.get("total", 0),
@@ -296,7 +296,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             collection_name=self.collection_name,
             arxiv_ids=candidate_ids,
         )
-        logger.info("Loaded %s stored candidate embeddings from Milvus for user %s", len(existing_candidate_embeddings), user_id)
+        logger.debug("Loaded %s stored candidate embeddings from Milvus for user %s", len(existing_candidate_embeddings), user_id)
         candidate_embedding_map = {
             str(item.get("arxiv_id", "") or "").strip(): item.get("vector", [])
             for item in existing_candidate_embeddings

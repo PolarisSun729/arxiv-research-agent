@@ -38,14 +38,14 @@ router = APIRouter(prefix="/agent", tags=["agent"])
 @router.post("/chat", response_model=ArxivSearchResponse)
 async def agent_chat_endpoint(request: ArxivSearchRequest):
     """执行一次完整的 Agent 对话，并在结束后一次性返回结果。"""
-    logger.info("Running agent chat for user_id=%s session_id=%s", request.user_id, request.session_id)
+    logger.debug("Running agent chat for user_id=%s session_id=%s", request.user_id, request.session_id)
     return run_arxiv_search_agent(request)
 
 
 @router.post("/chat/stream")
 async def agent_chat_stream_endpoint(request: ArxivSearchRequest) -> StreamingResponse:
     """以流式响应方式执行 Agent，对适合边生成边展示的前端场景更友好。"""
-    logger.info("Running agent chat stream for user_id=%s session_id=%s", request.user_id, request.session_id)
+    logger.debug("Running agent chat stream for user_id=%s session_id=%s", request.user_id, request.session_id)
     return stream_arxiv_search_agent(request)
 
 

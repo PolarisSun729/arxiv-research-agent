@@ -50,7 +50,7 @@ class CandidateRecallService:
         以保证召回池稳定可控，并避免因用户历史过少导致召回范围过窄。
         """
         categories = self.RECOMMEND_CANDIDATE_CATEGORIES[:]
-        logger.info(
+        logger.debug(
             "Fetching recent OAI DB candidates with categories=%s, max_age_months=%s, max_results=%s",
             categories,
             max_age_months,

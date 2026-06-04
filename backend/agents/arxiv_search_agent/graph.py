@@ -106,7 +106,7 @@ def route_after_parse(state: Any) -> str:
     # 第 4 步：如果没有 pending_action，但有等待确认的 paper_qa_result，
     # 同样进入确认分类节点。日志里额外记录 intent/pending 状态，方便排查路由问题。
     if isinstance(pending_qa_result, dict) and str(pending_qa_result.get("status") or "").strip() == "waiting_confirmation":
-        logger.info(
+        logger.debug(
             "arxiv_agent route_after_parse -> classify_pending_action_confirmation: intent=%s pending_action_status=%s paper_qa_status=%s",
             current_state.intent or "none",
             str((pending_action or {}).get("status") or "none") if isinstance(pending_action, dict) else "none",
@@ -128,7 +128,7 @@ def route_after_parse(state: Any) -> str:
         "unclear",
         "unsupported",
     }:
-        logger.info(
+        logger.debug(
             "arxiv_agent route_after_parse -> %s: intent=%s pending_action_status=%s paper_qa_status=%s",
             intent,
             intent or "none",

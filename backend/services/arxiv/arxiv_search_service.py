@@ -164,7 +164,7 @@ class ArxivSearchService:
         
         if time_since_last_request < self.RATE_LIMIT_SECONDS:
             wait_time = self.RATE_LIMIT_SECONDS - time_since_last_request
-            logger.info(f"Rate limiting: waiting {wait_time:.2f} seconds before next request")
+            logger.debug(f"Rate limiting: waiting {wait_time:.2f} seconds before next request")
             time.sleep(wait_time)
         
         ArxivSearchService._last_request_time = time.time()
@@ -323,7 +323,7 @@ class ArxivSearchService:
 
         normalized_search_query = _normalize_text_value(search_query)
         normalized_id_list = _normalize_id_list(id_list)
-        logger.info(
+        logger.debug(
             "Searching arXiv with query: '%s', id_list: %s, max_results: %s",
             normalized_search_query,
             normalized_id_list,
@@ -353,7 +353,7 @@ class ArxivSearchService:
             "timestamp": datetime.now().isoformat(),
         }
 
-        logger.info("Found %s papers out of %s total results", len(papers), result["total_results"])
+        logger.debug("Found %s papers out of %s total results", len(papers), result["total_results"])
         return result
     
     def _make_request_with_retry(self, url: str) -> requests.Response:
@@ -595,7 +595,7 @@ class ArxivSearchService:
             filepath = os.path.join(self.papers_dir, filename)
             
             if os.path.exists(filepath):
-                logger.info(f"PDF already exists: {filepath}")
+                logger.debug(f"PDF already exists: {filepath}")
                 return filepath
             
             logger.info(f"Downloading PDF from: {pdf_url}")
@@ -633,7 +633,7 @@ class ArxivSearchService:
             with open(filepath, "w", encoding="utf-8") as f:
                 json.dump(search_result, f, ensure_ascii=False, indent=2)
             
-            logger.info(f"Search results saved to: {filepath}")
+            logger.debug(f"Search results saved to: {filepath}")
             return filepath
             
         except Exception as e:

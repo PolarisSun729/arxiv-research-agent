@@ -930,7 +930,7 @@ class PaperQAService:
 
     def answer_question(self, arxiv_id: str, payload: Any) -> Dict[str, Any]:
         question = str(self._payload_get(payload, "question", "") or "").strip()
-        logger.info("QA request for paper: %s, question: %s", arxiv_id, question)
+        logger.debug("QA request for paper: %s, question: %s", arxiv_id, question)
         _, search_results, qa_context, retrieval_debug = self.build_qa_context(arxiv_id, payload)
         source_payload = self.build_source_payload(search_results)
         generation_question = str(qa_context.get("generation_question", question) or question).strip() or question
@@ -941,7 +941,7 @@ class PaperQAService:
         if isinstance(retrieval_debug, dict) and preferred_answer_style:
             retrieval_debug["preferred_answer_style"] = preferred_answer_style
 
-        logger.info("Generating answer...")
+        logger.debug("Generating answer...")
         try:
             qwen_search_results = [
                 {

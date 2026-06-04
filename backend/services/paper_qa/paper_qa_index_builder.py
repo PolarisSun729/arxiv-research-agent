@@ -93,7 +93,7 @@ class PaperQAIndexBuilder:
             if value not in (None, "", [], {})
         )
         if extra_parts:
-            logger.info(
+            logger.debug(
                 "QA index stage=%s arxiv_id=%s loading_method=%s %s | %s",
                 stage,
                 arxiv_id,
@@ -102,7 +102,7 @@ class PaperQAIndexBuilder:
                 extra_parts,
             )
         else:
-            logger.info(
+            logger.debug(
                 "QA index stage=%s arxiv_id=%s loading_method=%s %s",
                 stage,
                 arxiv_id,
@@ -155,11 +155,11 @@ class PaperQAIndexBuilder:
         """加载论文元数据，优先查本地库，缺失时再逐级回源补齐。"""
         paper = self.db_service.get_paper(arxiv_id)
         if not paper:
-            logger.info("Paper metadata missing in primary database, trying local OAI database: %s", arxiv_id)
+            logger.debug("Paper metadata missing in primary database, trying local OAI database: %s", arxiv_id)
             paper = self._fetch_and_store_paper_metadata_from_oai(arxiv_id)
         if not paper:
             # 索引链路依赖论文元数据；本地两个库都没有时，才回源 arXiv 补齐。
-            logger.info("Paper metadata missing in local databases, trying arXiv lookup: %s", arxiv_id)
+            logger.debug("Paper metadata missing in local databases, trying arXiv lookup: %s", arxiv_id)
             paper = self._fetch_and_store_paper_metadata(arxiv_id)
         if not paper:
             raise HTTPException(status_code=404, detail="Paper not found in database")
@@ -201,7 +201,7 @@ class PaperQAIndexBuilder:
             logger.error("Failed to persist %s metadata into database: %s", source, arxiv_id)
             return None
 
-        logger.info("%s metadata stored for: %s", source, arxiv_id)
+        logger.debug("%s metadata stored for: %s", source, arxiv_id)
         return self.db_service.get_paper(arxiv_id) or paper
 
     def _fetch_and_store_paper_metadata_from_oai(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
@@ -212,7 +212,7 @@ class PaperQAIndexBuilder:
         try:
             paper = self.oai_db_service.get_paper(arxiv_id)
             if not isinstance(paper, dict):
-                logger.info("Local OAI database returned no paper metadata: %s", arxiv_id)
+                logger.debug("Local OAI database returned no paper metadata: %s", arxiv_id)
                 return None
 
             normalized_paper = self._normalize_oai_paper(arxiv_id, paper)

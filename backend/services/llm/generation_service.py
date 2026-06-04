@@ -171,7 +171,7 @@ class GenerationService:
         model_name: str = QWEN_RERANK_COMPRESS_MODEL_NAME,
     ) -> List[Dict[str, Any]]:
         compressed_chunks: List[Dict[str, Any]] = []
-        logger.info(
+        logger.debug(
             "Preparing rerank_text for %d chunks with model=%s enable_thinking=%s",
             len(chunks),
             model_name,
@@ -196,7 +196,7 @@ class GenerationService:
             updated_chunk["metadata"] = metadata
             updated_chunk["rerank_text"] = rerank_text
 
-            logger.info(
+            logger.debug(
                 "Prepared rerank_text for chunk_id=%s model=%s enable_thinking=%s raw_preview=%s rerank_preview=%s",
                 chunk_id,
                 model_name,
@@ -1335,4 +1335,3 @@ Answer:"""
         with open(image_path, "rb") as image_file:
             encoded = base64.b64encode(image_file.read()).decode("ascii")
         return f"data:{mime_type};base64,{encoded}"
-

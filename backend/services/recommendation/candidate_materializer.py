@@ -345,7 +345,7 @@ class CandidateMaterializer:
             self._arxiv_backfill_next_allowed_time = max(self._arxiv_backfill_next_allowed_time, now) + self.ARXIV_BACKFILL_REQUEST_INTERVAL_SECONDS
 
         if wait_seconds > 0:
-            logger.info("Waiting %.2f seconds before fetching arXiv paper %s", wait_seconds, arxiv_id)
+            logger.debug("Waiting %.2f seconds before fetching arXiv paper %s", wait_seconds, arxiv_id)
             time.sleep(wait_seconds)
 
         arxiv_service = self.arxiv_service_factory()

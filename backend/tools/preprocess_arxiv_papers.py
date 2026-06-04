@@ -121,7 +121,7 @@ def main():
             
             if success:
                 processed_count += 1
-                logger.info(f"Processed {i}/{len(papers)}: {arxiv_id} - {title[:50]}...")
+                logger.debug(f"Processed {i}/{len(papers)}: {arxiv_id} - {title[:50]}...")
             else:
                 failed_count += 1
                 
@@ -130,7 +130,7 @@ def main():
             failed_count += 1
         
         if i % BATCH_SIZE == 0:
-            logger.info(f"Progress: {i}/{len(papers)} papers processed")
+            logger.debug(f"Progress: {i}/{len(papers)} papers processed")
     
     logger.info(f"Preprocessing complete!")
     logger.info(f"Processed: {processed_count}")
