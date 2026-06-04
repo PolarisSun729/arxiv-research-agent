@@ -110,6 +110,18 @@ class ArxivOaiDatabaseService:
             return text
         return value
 
+    def get_total_paper_count(self) -> int:
+        """返回 OAI 本地镜像库中的论文总数。"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT COUNT(*) FROM arxiv_oai_papers')
+                row = cursor.fetchone()
+                return int(row[0] or 0) if row else 0
+        except Exception as exc:
+            logger.error("Error getting total OAI paper count: %s", exc)
+            return 0
+
     def get_paper(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
         """按 arXiv ID 获取单篇论文元数据。"""
         normalized_arxiv_id = str(arxiv_id or "").strip()

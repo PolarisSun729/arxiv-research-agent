@@ -20,6 +20,7 @@ import {
   getRecommendations,
   getLabeledPapers,
   getStats,
+  type DashboardStats,
   searchArxiv,
   getUserPreferences,
   likePaper,
@@ -49,11 +50,17 @@ export const usePaperStore = defineStore('paper', () => {
   const totalRecommendations = ref(0)
   const labeledPapers = ref<LabeledPaper[]>([])
   const totalLabeledPapers = ref(0)
-  const stats = ref({
+  const stats = ref<DashboardStats>({
     totalPapers: 0,
     labeledPapers: 0,
-    todayNewPapers: 0,
-    recommendedPapers: 0
+    latestSyncNewPapers: 0,
+    lastSyncedDate: null,
+    lastSyncRunAt: null,
+    lastSyncStatus: 'unknown',
+    lastSyncMode: 'sync',
+    latestSyncMatchedPapers: 0,
+    syncErrors: 0,
+    syncErrorMessage: null
   })
   const loading = ref(false)
   const interestVectorGenerating = ref(false)

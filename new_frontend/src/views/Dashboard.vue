@@ -1,21 +1,48 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { usePaperStore } from '@/stores/paperStore'
 
 const store = usePaperStore()
 const loading = ref(true)
+const statsError = ref('')
 type StatKey = keyof typeof store.stats
 
 const statsConfig = [
-  { key: 'totalPapers', label: '已抓取论文', color: '#1890ff' },
-  { key: 'labeledPapers', label: '已标记论文', color: '#52c41a' },
-  { key: 'todayNewPapers', label: '今日新增', color: '#faad14' },
-  { key: 'recommendedPapers', label: '推荐论文', color: '#f5222d' }
+  { key: 'totalPapers', label: '论文库总量', color: '#1890ff' },
+  { key: 'labeledPapers', label: '我的标记论文', color: '#52c41a' },
+  { key: 'latestSyncNewPapers', label: '最近同步新增论文数', color: '#faad14' }
 ] satisfies Array<{ key: StatKey; label: string; color: string }>
+
+const syncStatusText = computed(() => {
+  switch (store.stats.lastSyncStatus) {
+    case 'success':
+      return '同步成功'
+    case 'failed':
+      return '最近同步失败'
+    default:
+      return '暂无同步记录'
+  }
+})
+
+const syncHintText = computed(() => {
+  const parts: string[] = []
+  if (store.stats.lastSyncedDate) {
+    parts.push(`已同步到 ${store.stats.lastSyncedDate}`)
+  }
+  parts.push(syncStatusText.value)
+  return parts.join(' · ')
+})
+
+const syncErrorText = computed(() => {
+  if (store.stats.lastSyncStatus !== 'failed') return ''
+  return store.stats.syncErrorMessage || '最近一次同步失败，请检查同步脚本日志。'
+})
 
 onMounted(async () => {
   try {
     await store.fetchStats()
+  } catch (error) {
+    statsError.value = '统计数据加载失败，请检查后端服务是否正常运行。'
   } finally {
     loading.value = false
   }
@@ -27,7 +54,7 @@ onMounted(async () => {
     <div class="dashboard-header">
       <h1>arXiv 计算机论文推荐系统</h1>
       <p class="description">
-        基于向量相似度的智能论文推荐平台，帮助您发现最新、最相关的计算机领域研究成果。
+        首页展示系统真实统计数据，可快速了解论文库规模、个人标记进度，以及最近一次完整日增量同步的入库结果。
       </p>
     </div>
 
@@ -48,8 +75,8 @@ onMounted(async () => {
         </div>
         <div class="feature-item">
           <div class="feature-content">
-            <h3>智能推荐</h3>
-            <p>基于历史标记论文进行向量相似度匹配</p>
+            <h3>个性化发现</h3>
+            <p>结合您的标记记录，辅助发现更相关的论文内容</p>
           </div>
         </div>
         <div class="feature-item">
@@ -69,8 +96,19 @@ onMounted(async () => {
           <div class="stat-value" :style="{ color: stat.color }">
             {{ store.stats[stat.key] }}
           </div>
+          <div v-if="stat.key === 'latestSyncNewPapers'" class="stat-hint">
+            {{ syncHintText }}
+          </div>
         </div>
       </div>
+    </div>
+
+    <div v-if="syncErrorText" class="sync-warning">
+      {{ syncErrorText }}
+    </div>
+
+    <div v-if="statsError" class="stats-error">
+      {{ statsError }}
     </div>
 
     <div class="guide-card">
@@ -93,14 +131,12 @@ onMounted(async () => {
         <div class="guide-step">
           <div class="step-number">3</div>
           <div class="step-content">
-            <h3>查看推荐</h3>
-            <p>系统会根据您的标记自动推荐相似论文</p>
+            <h3>继续浏览</h3>
+            <p>结合标记结果继续筛选论文，逐步沉淀更清晰的兴趣方向</p>
           </div>
         </div>
       </div>
     </div>
-
-    <div v-if="loading" class="loading">加载中...</div>
   </div>
 </template>
 
@@ -226,7 +262,7 @@ onMounted(async () => {
 
 .stats-row {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: 16px;
   margin-bottom: 24px;
 }
@@ -250,6 +286,12 @@ onMounted(async () => {
   font-weight: 700;
 }
 
+.stat-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #6b7280;
+}
+
 .skeleton {
   height: 60px;
   background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
@@ -258,10 +300,22 @@ onMounted(async () => {
   border-radius: 4px;
 }
 
-.loading {
-  text-align: center;
-  padding: 20px;
-  color: #6b7280;
+.stats-error {
+  margin-bottom: 24px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  color: #b91c1c;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+}
+
+.sync-warning {
+  margin-bottom: 24px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  color: #92400e;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
 }
 
 @keyframes loading {

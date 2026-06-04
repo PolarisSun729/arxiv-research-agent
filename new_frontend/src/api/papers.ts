@@ -24,6 +24,34 @@ import { mockPapers, mockRecommendedPapers, mockLabeledPapers, mockStats } from 
 const isMockMode = false
 const DEFAULT_USER_ID = 'local_user'
 
+export interface DashboardStats {
+  totalPapers: number
+  labeledPapers: number
+  latestSyncNewPapers: number
+  lastSyncedDate: string | null
+  lastSyncRunAt: string | null
+  lastSyncStatus: string
+  lastSyncMode: string
+  latestSyncMatchedPapers: number
+  syncErrors: number
+  syncErrorMessage: string | null
+}
+
+function normalizeDashboardStats(raw: any): DashboardStats {
+  return {
+    totalPapers: Number(raw?.totalPapers || 0),
+    labeledPapers: Number(raw?.labeledPapers || 0),
+    latestSyncNewPapers: Number(raw?.latestSyncNewPapers ?? raw?.todayNewPapers ?? 0),
+    lastSyncedDate: raw?.lastSyncedDate ? String(raw.lastSyncedDate) : null,
+    lastSyncRunAt: raw?.lastSyncRunAt ? String(raw.lastSyncRunAt) : null,
+    lastSyncStatus: String(raw?.lastSyncStatus || 'unknown'),
+    lastSyncMode: String(raw?.lastSyncMode || 'sync'),
+    latestSyncMatchedPapers: Number(raw?.latestSyncMatchedPapers || 0),
+    syncErrors: Number(raw?.syncErrors || 0),
+    syncErrorMessage: raw?.syncErrorMessage ? String(raw.syncErrorMessage) : null
+  }
+}
+
 function getPaperArxivId(paper: Pick<Paper, 'id' | 'arxivId'>) {
   return paper.arxivId || paper.id.split('/').pop() || paper.id
 }
@@ -390,19 +418,18 @@ export async function getLabeledPapers(params: {
   }
 }
 
-export async function getStats(): Promise<typeof mockStats> {
+export async function getStats(): Promise<DashboardStats> {
   if (isMockMode) {
-    return mockStats
+    const { recommendedPapers, ...stats } = mockStats
+    return normalizeDashboardStats(stats)
   }
 
-  // 先关闭对后端 /stats 的真实请求，前端暂时直接走零值兜底。
-  // return request.get('/stats')
-  return {
-    totalPapers: 0,
-    labeledPapers: 0,
-    todayNewPapers: 0,
-    recommendedPapers: 0
-  }
+  const response = await request.get('/stats', {
+    params: {
+      user_id: DEFAULT_USER_ID
+    }
+  })
+  return normalizeDashboardStats(response)
 }
 
 export async function searchArxiv(params: ArxivSearchParams): Promise<PaginatedResponse<Paper>> {

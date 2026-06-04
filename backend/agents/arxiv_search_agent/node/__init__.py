@@ -24,7 +24,6 @@ from .intent_support import (
     _build_intent_guidance,
     _build_llm_prompt_with_profile,
     _contains_any_term,
-    _coerce_state,
     _dedupe_preserve_order,
     _extract_json_block,
     _looks_like_paper_detail_request,
@@ -38,6 +37,7 @@ from .intent_support import (
     _references_specific_paper,
     _validation_error_summary,
 )
+from ..utils.state_utils import _coerce_state
 # 论文阅读类节点：负责把“总结 / 解释 / QA”请求接入论文全文问答链路，
 # 并根据是否已有索引决定直接回答还是进入待确认解析流程。
 from .paper_reading_node import handle_paper_reading_request

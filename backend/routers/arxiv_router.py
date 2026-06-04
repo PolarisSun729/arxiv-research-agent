@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""arXiv 论文检索与下载路由。
+
+该模块负责把用户输入的自然语言检索条件、结构化字段条件、下载请求等，
+转换为服务层可执行的调用，并将 arXiv 查询能力暴露给前端。
+"""
+
 import logging
 from typing import List, Optional
 
@@ -37,7 +43,15 @@ async def arxiv_search(
     submitted_days_ago: Optional[int] = Body(None, description="搜索提交日期在多少天内的文章（本地数据源暂不支持）"),
     arxiv_service=Depends(get_arxiv_service),
 ):
+    """执行 arXiv 检索。
+
+    该接口同时支持两种输入方式：
+    1. 原始 search_query / id_list 形式；
+    2. title、author、category 等结构化字段形式。
+    当结构化字段存在时，优先走结构化查询构建流程，以获得更稳定的查询语义。
+    """
     try:
+        # 只要出现任意结构化字段，就认为调用方希望由后端拼接更规范的 arXiv 查询表达式。
         structured_fields_present = any([title, author, abstract, category, comment, journal_ref, report_number])
         if structured_fields_present:
             structured = build_arxiv_query_from_structured_params(
@@ -54,6 +68,7 @@ async def arxiv_search(
                 category_operator="OR",
                 submitted_days_ago=submitted_days_ago,
             )
+            # 在真正查询前先校验分页、排序、query 组合是否合法，尽量把错误拦在服务边界。
             validate_arxiv_search_request(
                 search_query=structured["final_search_query"],
                 id_list=structured["id_list"],
@@ -62,6 +77,7 @@ async def arxiv_search(
                 sort_by=sort_by,
                 sort_order=sort_order,
             )
+            # 结构化模式下，实际搜索用的是后端整理后的 final_search_query。
             results = arxiv_service.search(
                 search_query=structured["final_search_query"],
                 id_list=structured["id_list"],
@@ -71,6 +87,7 @@ async def arxiv_search(
                 sort_order=sort_order,
             )
         else:
+            # 原始模式更接近“直通式查询”，适合前端已经自行组织 query 的场景。
             raw_query = build_arxiv_raw_query(
                 search_query=search_query,
                 id_list=id_list,
@@ -105,6 +122,7 @@ async def arxiv_search(
 
 @router.get("/fields")
 async def arxiv_get_fields(arxiv_service=Depends(get_arxiv_service)):
+    """返回当前支持的 arXiv 查询字段列表。"""
     try:
         fields = arxiv_service.get_available_fields()
         return {"fields": fields}
@@ -115,6 +133,7 @@ async def arxiv_get_fields(arxiv_service=Depends(get_arxiv_service)):
 
 @router.get("/categories")
 async def arxiv_get_categories(arxiv_service=Depends(get_arxiv_service)):
+    """返回当前支持的 arXiv 学科分类列表。"""
     try:
         categories = arxiv_service.get_subject_categories()
         return {"categories": categories}
@@ -129,6 +148,7 @@ async def arxiv_download(
     pdf_url: str = Body(...),
     arxiv_api_service=Depends(get_arxiv_api_service),
 ):
+    """下载指定 arXiv 论文 PDF 到本地。"""
     try:
         filepath = arxiv_api_service.download_pdf(pdf_url, arxiv_id)
         return {"status": "success", "filepath": filepath}
@@ -146,12 +166,18 @@ async def arxiv_search_and_save(
     arxiv_api_service=Depends(get_arxiv_api_service),
     **kwargs,
 ):
+    """检索论文并按需保存元数据/下载 PDF。
+
+    这是一个更偏“工作流”式的接口：不仅做搜索，
+    还把结果持久化到本地或数据库，适合批量导入场景。
+    """
     try:
         results = await arxiv_api_service.search_and_save(
             search_query=search_query,
             id_list=id_list,
             max_results=max_results,
             download_pdfs=download_pdfs,
+            # 其余扩展参数透传给 service，保持路由层轻量。
             **kwargs,
         )
         return results

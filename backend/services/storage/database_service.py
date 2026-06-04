@@ -1012,6 +1012,54 @@ class DatabaseService:
             logger.error(f"Error getting all papers: {str(e)}")
             return []
 
+    def get_total_paper_count(self) -> int:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT COUNT(*) FROM arxiv_papers')
+                row = cursor.fetchone()
+                return int(row[0] or 0) if row else 0
+        except Exception as e:
+            logger.error(f"Error getting total paper count: {str(e)}")
+            return 0
+
+    def get_today_new_paper_count(self) -> int:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT COUNT(*)
+                    FROM arxiv_papers
+                    WHERE date(created_at, 'localtime') = date('now', 'localtime')
+                    '''
+                )
+                row = cursor.fetchone()
+                return int(row[0] or 0) if row else 0
+        except Exception as e:
+            logger.error(f"Error getting today's new paper count: {str(e)}")
+            return 0
+
+    def get_user_labeled_paper_count(self, user_id: str = DEFAULT_USER_ID) -> int:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT COUNT(DISTINCT arxiv_id) FROM (
+                        SELECT arxiv_id FROM user_liked_papers WHERE user_id = ?
+                        UNION
+                        SELECT arxiv_id FROM user_disliked_papers WHERE user_id = ?
+                    )
+                    ''',
+                    (user_id, user_id),
+                )
+                row = cursor.fetchone()
+                return int(row[0] or 0) if row else 0
+        except Exception as e:
+            logger.error(f"Error getting user labeled paper count: {str(e)}")
+            return 0
+
     def delete_paper(self, arxiv_id: str) -> bool:
         try:
             with self._get_connection() as conn:

@@ -1063,7 +1063,7 @@ watch(activeNoteTypeFilter, async () => {
 
 .paper-detail {
   position: relative;
-  width: min(100%, 1680px);
+  width: min(100%, 1760px);
   max-width: none;
   margin: 0 auto;
   padding: 24px clamp(16px, 3vw, 40px) 36px;
@@ -1267,8 +1267,8 @@ watch(activeNoteTypeFilter, async () => {
 
 .qa-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 300px;
-  gap: 18px;
+  grid-template-columns: minmax(0, 1fr) clamp(360px, 26vw, 420px);
+  gap: 20px;
   margin-top: 18px;
 }
 

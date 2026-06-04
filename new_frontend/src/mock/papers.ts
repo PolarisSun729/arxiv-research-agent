@@ -150,7 +150,14 @@ export const mockLabeledPapers: LabeledPaper[] = mockPapers
 export const mockStats = {
   totalPapers: 1247,
   labeledPapers: 45,
-  todayNewPapers: 23,
+  latestSyncNewPapers: 23,
+  lastSyncedDate: '2026-06-03',
+  lastSyncRunAt: '2026-06-04T09:15:23+08:00',
+  lastSyncStatus: 'success',
+  lastSyncMode: 'sync',
+  latestSyncMatchedPapers: 23,
+  syncErrors: 0,
+  syncErrorMessage: null,
   recommendedPapers: 15
 }
 

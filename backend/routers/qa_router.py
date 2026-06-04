@@ -1,5 +1,18 @@
 from __future__ import annotations
 
+"""论文 QA、会话与笔记相关路由。
+
+该模块是后端中最核心的论文问答入口之一，负责：
+1. QA 索引构建与状态查询；
+2. 检索 trace 导出与诊断；
+3. 论文聊天会话及消息管理；
+4. 论文笔记的创建、编辑、导出；
+5. 同步问答与流式问答。
+
+整体设计上，路由层尽量保持轻量，主要承担参数整理、对象序列化、
+错误码转换和响应结构统一，复杂业务则下沉到 service 层实现。
+"""
+
 import json
 import logging
 from datetime import datetime
@@ -28,6 +41,12 @@ router = APIRouter(prefix="/paper/{arxiv_id}", tags=["paper-qa"])
 
 
 class QaRequest(BaseModel):
+    """论文问答请求体。
+
+    除了问题本身，还允许调用方控制多种检索增强开关，
+    如 query rewrite、HyDE、关键词检索、LLM rerank 等，
+    便于调试不同召回/排序链路的效果。
+    """
     question: str
     user_id: Optional[str] = None
     session_id: Optional[str] = None
@@ -41,11 +60,13 @@ class QaRequest(BaseModel):
 
 
 class CreatePaperChatSessionRequest(BaseModel):
+    """创建论文聊天会话的请求体。"""
     user_id: Optional[str] = None
     title: Optional[str] = None
 
 
 class PaperNoteRequest(BaseModel):
+    """创建论文笔记的请求体。"""
     user_id: Optional[str] = None
     session_id: Optional[str] = None
     source_message_id: Optional[str] = None
@@ -59,6 +80,10 @@ class PaperNoteRequest(BaseModel):
 
 
 class UpdatePaperNoteRequest(BaseModel):
+    """更新论文笔记的请求体。
+
+    与创建不同，这里大部分字段都允许为空，表示按需局部更新。
+    """
     user_id: Optional[str] = None
     title: Optional[str] = None
     content: Optional[str] = None
@@ -69,10 +94,12 @@ class UpdatePaperNoteRequest(BaseModel):
 
 
 def _normalize_user_id(value: Optional[str]) -> str:
+    """标准化 user_id，确保系统内部总能拿到一个非空用户标识。"""
     return str(value or get_default_user_id()).strip() or get_default_user_id()
 
 
 def _serialize_chat_session(chat_session: Optional[dict]) -> Optional[dict]:
+    """把数据库中的 chat session 记录压缩成对外稳定的响应结构。"""
     if not chat_session:
         return None
     return {
@@ -88,6 +115,7 @@ def _serialize_chat_session(chat_session: Optional[dict]) -> Optional[dict]:
 
 
 def _serialize_chat_message(message: dict) -> dict:
+    """把聊天消息记录序列化成前端需要的字段集合。"""
     return {
         "message_id": message.get("message_id"),
         "turn_id": message.get("turn_id", ""),
@@ -104,6 +132,7 @@ def _serialize_chat_message(message: dict) -> dict:
 
 
 def _serialize_qa_index_job(job: Optional[dict]) -> Optional[dict]:
+    """序列化 QA 索引构建任务信息。"""
     if not job:
         return None
     return {
@@ -120,10 +149,13 @@ def _serialize_qa_index_job(job: Optional[dict]) -> Optional[dict]:
 
 
 def _serialize_paper_note(note: Optional[dict], db_service=None) -> Optional[dict]:
+    """序列化论文笔记，并按需补齐其关联的对话来源信息。"""
     if not note:
         return None
     linked_message = None
     if db_service and note.get("source_message_id"):
+        # 如果笔记来源于某条 assistant 回复，这里顺手把原消息取出来，
+        # 用于补齐 turn_id 和 sources，方便前端回溯笔记出处。
         linked_message = db_service.get_paper_chat_message(
             note.get("source_message_id"),
             user_id=note.get("user_id") or _normalize_user_id(None),
@@ -148,6 +180,10 @@ def _serialize_paper_note(note: Optional[dict], db_service=None) -> Optional[dic
 
 
 def _build_notes_markdown(arxiv_id: str, notes: List[dict], paper_title: Optional[str] = None) -> str:
+    """把笔记列表导出为 Markdown 文本。
+
+    导出结果面向用户阅读，因此内容会按“标题 -> 元信息 -> 正文 -> 关联来源”的顺序组织。
+    """
     lines = [f"# {paper_title or arxiv_id} 阅读笔记", "", f"- arXiv ID: {arxiv_id}", f"- 导出时间: {datetime.now().isoformat()}", ""]
     for index, note in enumerate(notes, start=1):
         lines.append(f"## {index}. {note.get('title') or '未命名笔记'}")
@@ -166,6 +202,7 @@ def _build_notes_markdown(arxiv_id: str, notes: List[dict], paper_title: Optiona
             lines.append("### 关联 Sources")
             lines.append("")
             for source in sources:
+                # 这里保留页码、章节路径、父 chunk id，便于把笔记和原文片段重新对应起来。
                 lines.append(
                     f"- page={source.get('page_number') or '-'} | section={source.get('section_path') or '-'} | chunk={source.get('parent_chunk_id') or '-'}"
                 )
@@ -178,6 +215,10 @@ def _build_notes_markdown(arxiv_id: str, notes: List[dict], paper_title: Optiona
 
 @router.get("/qa-status")
 async def get_paper_qa_status(arxiv_id: str, paper_qa_service=Depends(get_paper_qa_service)):
+    """获取指定论文的 QA 能力状态。
+
+    常用于前端判断该论文是否已经完成索引构建、是否可以直接发起问答。
+    """
     try:
         return paper_qa_service.get_qa_status(arxiv_id)
     except Exception as exc:
@@ -192,6 +233,7 @@ async def diagnose_paper_qa(
     db_service=Depends(get_database_service),
     vector_store_service=Depends(get_vector_store_service),
 ):
+    """输出 QA 索引诊断信息，用于排查索引和向量库状态。"""
     try:
         return build_qa_diagnostic(
             db_service=db_service,
@@ -211,16 +253,19 @@ async def download_latest_qa_trace(
     trace_name: Optional[str] = Query(None),
     enhanced_retrieval_service=Depends(get_enhanced_retrieval_service),
 ):
+    """下载最近一次或指定名称的检索 trace 文件。"""
     try:
         normalized_format = str(format or "md").strip().lower()
         if normalized_format not in {"md", "json"}:
             raise HTTPException(status_code=400, detail="format must be md or json")
 
+        # trace 目录按 arxiv_id 的安全 slug 分桶，避免特殊字符污染路径结构。
         trace_root = Path(str(enhanced_retrieval_service.trace_export_dir))
         paper_dir = trace_root / sanitize_trace_slug(arxiv_id)
         trace_file = None
 
         if trace_name:
+            # 只允许文件名本身，拒绝包含目录跳转成分的输入，避免路径穿越风险。
             safe_name = Path(str(trace_name)).name
             if safe_name != trace_name:
                 raise HTTPException(status_code=400, detail="Invalid trace_name")
@@ -228,6 +273,7 @@ async def download_latest_qa_trace(
             if candidate.exists() and candidate.is_file():
                 trace_file = candidate
         else:
+            # 未指定 trace_name 时，默认返回最近一次导出的 trace。
             trace_file = get_latest_retrieval_trace(enhanced_retrieval_service, arxiv_id, normalized_format)
 
         if trace_file is None:
@@ -253,10 +299,18 @@ async def create_paper_qa_index(
     index_job_manager=Depends(get_index_job_manager),
     paper_qa_service=Depends(get_paper_qa_service),
 ):
+    """为指定论文创建 QA 索引。
+
+    支持同步构建和异步提交两种模式：
+    - sync=true 时直接阻塞到构建完成；
+    - 否则提交后台任务并立即返回 job 信息。
+    """
     try:
         if sync:
+            # 同步模式一般用于调试或管理后台主动触发，便于立即拿到构建结果。
             return paper_qa_service.build_qa_index(arxiv_id, loading_method=loading_method)
 
+        # 异步模式更适合生产环境，避免请求长时间阻塞。
         job = index_job_manager.submit_job(arxiv_id, loading_method)
         return {
             "status": "submitted",
@@ -279,6 +333,7 @@ async def get_latest_paper_qa_index_job(
     arxiv_id: str,
     db_service=Depends(get_database_service),
 ):
+    """获取指定论文最近一次 QA 索引任务。"""
     try:
         job = db_service.get_latest_paper_index_job(arxiv_id)
         if not job:
@@ -297,6 +352,7 @@ async def get_paper_qa_index_job(
     job_id: str,
     db_service=Depends(get_database_service),
 ):
+    """按任务 ID 获取某次 QA 索引构建任务详情。"""
     try:
         job = db_service.get_paper_index_job(job_id)
         if not job or job.get("arxiv_id") != arxiv_id:
@@ -316,6 +372,7 @@ async def list_paper_chat_sessions(
     limit: int = Query(20, ge=1, le=100),
     db_service=Depends(get_database_service),
 ):
+    """列出某篇论文下、某个用户的聊天会话列表。"""
     try:
         sessions = db_service.list_paper_chat_sessions(arxiv_id=arxiv_id, user_id=_normalize_user_id(user_id), limit=limit)
         return {"items": [_serialize_chat_session(item) for item in sessions]}
@@ -330,6 +387,7 @@ async def get_recent_paper_chat_session(
     user_id: Optional[str] = Query(None),
     db_service=Depends(get_database_service),
 ):
+    """获取最近一次论文聊天会话，便于前端恢复上下文。"""
     try:
         session = db_service.get_recent_paper_chat_session(arxiv_id=arxiv_id, user_id=_normalize_user_id(user_id))
         return {"item": _serialize_chat_session(session)}
@@ -344,10 +402,12 @@ async def create_paper_chat_session(
     payload: CreatePaperChatSessionRequest = Body(default=CreatePaperChatSessionRequest()),
     db_service=Depends(get_database_service),
 ):
+    """创建一个新的论文聊天会话。"""
     try:
         session = db_service.create_paper_chat_session(
             arxiv_id=arxiv_id,
             user_id=_normalize_user_id(payload.user_id),
+            # 标题允许为空；若前端不传，后续也可以由系统根据首轮问题自动生成。
             title=(payload.title or "").strip() or None,
         )
         if not session:
@@ -367,6 +427,7 @@ async def get_paper_chat_session(
     user_id: Optional[str] = Query(None),
     db_service=Depends(get_database_service),
 ):
+    """获取单个聊天会话详情，并校验该会话确实属于当前论文。"""
     try:
         session = db_service.get_paper_chat_session(session_id, user_id=_normalize_user_id(user_id))
         if not session or session.get("arxiv_id") != arxiv_id:
@@ -386,6 +447,7 @@ async def get_paper_chat_messages(
     user_id: Optional[str] = Query(None),
     db_service=Depends(get_database_service),
 ):
+    """获取某个聊天会话下的全部消息。"""
     try:
         session = db_service.get_paper_chat_session(session_id, user_id=_normalize_user_id(user_id))
         if not session or session.get("arxiv_id") != arxiv_id:
@@ -409,11 +471,13 @@ async def clear_paper_chat_session(
     payload: Optional[dict] = Body(default=None),
     db_service=Depends(get_database_service),
 ):
+    """清空指定聊天会话中的消息，但保留会话本身。"""
     try:
         user_id = _normalize_user_id((payload or {}).get("user_id"))
         session = db_service.get_paper_chat_session(session_id, user_id=user_id)
         if not session or session.get("arxiv_id") != arxiv_id:
             raise HTTPException(status_code=404, detail="Chat session not found")
+        # clear 后再重新读取一次，保证返回给前端的是最新 message_count 等状态。
         db_service.clear_paper_chat_session(session_id, user_id=user_id)
         refreshed = db_service.get_paper_chat_session(session_id, user_id=user_id)
         return {"item": _serialize_chat_session(refreshed)}
@@ -431,6 +495,7 @@ async def delete_paper_chat_session(
     user_id: Optional[str] = Query(None),
     db_service=Depends(get_database_service),
 ):
+    """删除整个聊天会话。"""
     try:
         session = db_service.get_paper_chat_session(session_id, user_id=_normalize_user_id(user_id))
         if not session or session.get("arxiv_id") != arxiv_id:
@@ -451,6 +516,7 @@ async def list_paper_notes(
     note_type: Optional[str] = Query(None),
     db_service=Depends(get_database_service),
 ):
+    """列出某篇论文下的笔记，可按 note_type 过滤。"""
     try:
         notes = db_service.list_paper_notes(
             arxiv_id=arxiv_id,
@@ -470,10 +536,13 @@ async def create_paper_note(
     db_service=Depends(get_database_service),
     memory_service=Depends(get_memory_service),
 ):
+    """创建一条论文笔记，并可选同步更新用户研究画像。"""
     try:
         user_id = _normalize_user_id(payload.user_id)
         source_message_id = (payload.source_message_id or "").strip() or None
         if not source_message_id and payload.session_id and payload.source_turn_id:
+            # 如果前端没有直接传 message_id，但给了 session + turn，
+            # 就回查对应的 assistant 消息，建立笔记与问答来源的关联。
             linked_message = db_service.get_paper_chat_message_by_turn(
                 payload.session_id,
                 payload.source_turn_id,
@@ -498,6 +567,7 @@ async def create_paper_note(
             raise HTTPException(status_code=500, detail="Failed to create paper note")
 
         if payload.include_in_profile:
+            # 某些高价值笔记会进入长期画像，用于改进推荐与后续回答风格。
             memory_service.update_profile_from_note(user_id=user_id, note=note)
 
         return {"item": _serialize_paper_note(note, db_service=db_service)}
@@ -516,6 +586,7 @@ async def update_paper_note(
     db_service=Depends(get_database_service),
     memory_service=Depends(get_memory_service),
 ):
+    """更新指定笔记，并在需要时重新同步用户画像。"""
     try:
         user_id = _normalize_user_id(payload.user_id)
         current = db_service.get_paper_note(note_id, user_id=user_id)
@@ -536,6 +607,7 @@ async def update_paper_note(
             raise HTTPException(status_code=500, detail="Failed to update paper note")
 
         if note.get("include_in_profile"):
+            # 更新后仍被标记为纳入画像时，重新把最新笔记内容投喂给画像系统。
             memory_service.update_profile_from_note(user_id=user_id, note=note)
 
         return {"item": _serialize_paper_note(note, db_service=db_service)}
@@ -553,6 +625,7 @@ async def delete_paper_note(
     user_id: Optional[str] = Query(None),
     db_service=Depends(get_database_service),
 ):
+    """删除指定论文笔记。"""
     try:
         normalized_user_id = _normalize_user_id(user_id)
         current = db_service.get_paper_note(note_id, user_id=normalized_user_id)
@@ -573,6 +646,7 @@ async def export_paper_notes_markdown(
     user_id: Optional[str] = Query(None),
     db_service=Depends(get_database_service),
 ):
+    """把某篇论文的全部笔记导出为 Markdown 文件下载。"""
     try:
         normalized_user_id = _normalize_user_id(user_id)
         notes = db_service.list_paper_notes(arxiv_id=arxiv_id, user_id=normalized_user_id)
@@ -581,6 +655,7 @@ async def export_paper_notes_markdown(
         markdown = _build_notes_markdown(arxiv_id, serialized_notes, paper_title=(paper or {}).get("title"))
         filename = f"{sanitize_trace_slug(arxiv_id)}_notes.md"
         return StreamingResponse(
+            # 这里直接把内存中的 markdown bytes 作为流返回，避免额外生成临时文件。
             iter([markdown.encode("utf-8")]),
             media_type="text/markdown; charset=utf-8",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
@@ -592,6 +667,7 @@ async def export_paper_notes_markdown(
 
 @router.post("/qa")
 async def qa_paper(arxiv_id: str, payload: QaRequest, paper_qa_service=Depends(get_paper_qa_service)):
+    """执行一次非流式论文问答。"""
     try:
         return paper_qa_service.answer_question(arxiv_id, payload)
     except HTTPException:
@@ -608,19 +684,31 @@ async def qa_paper_stream(
     paper_qa_service=Depends(get_paper_qa_service),
     generation_service=Depends(get_generation_service),
 ):
+    """执行流式论文问答，并以 SSE 持续向前端推送事件。"""
     question = payload.question.strip()
     logger.info("QA stream request for paper: %s, question: %s", arxiv_id, question)
 
+    # 先统一构建问答上下文：包含召回结果、生成上下文、会话信息以及调试快照。
     _, search_results, qa_context, retrieval_debug = paper_qa_service.build_qa_context(arxiv_id, payload)
+    # sources 会在首帧 meta 和最后 done 事件中回传给前端，用于引用展示。
     source_payload = paper_qa_service.build_source_payload(search_results)
+    # 若系统做了问题改写，这里优先使用改写后的 generation_question 作为最终生成输入。
     contextualized_question = str(qa_context.get("generation_question", question) or question).strip() or question
     question_contextualization = qa_context.get("question_contextualization", {}) or {}
     chat_session = qa_context.get("chat_session", {}) or {}
 
     def sse_event(event_name: str, data: dict) -> str:
+        """格式化单条 SSE 消息。"""
         return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     def event_stream():
+        """生成 SSE 事件流。
+
+        事件大致分为三类：
+        1. meta：流开始时发送上下文与调试信息；
+        2. delta：模型逐段生成答案；
+        3. done / error：结束态事件。
+        """
         try:
             yield sse_event(
                 "meta",
@@ -647,11 +735,15 @@ async def qa_paper_stream(
                 # 纸面 QA 的最终答案属于高质量生成任务，明确走大模型。
                 task_type="paper_qa_final_answer",
                 image_inputs=qa_context["image_inputs"],
+                # 仅把 figure 类型的资源元信息传给多模态生成层，避免无关资产干扰回答。
                 asset_metadata=[item for item in qa_context["asset_metadata"] if item.get("chunk_type") == "figure"],
             ):
                 if chunk.get("type") == "delta":
+                    # delta 事件只承载增量文本，适合前端逐字/逐段渲染。
                     yield sse_event("delta", {"delta": chunk.get("delta", "")})
                 elif chunk.get("type") == "completed":
+                    # 回答生成结束后，把本轮问答、来源和调试快照统一持久化，
+                    # 这样后续会话恢复、笔记关联、问题追踪都有完整上下文。
                     persisted_turn = paper_qa_service.persist_completed_turn(
                         chat_session=chat_session,
                         question=question,
@@ -682,6 +774,8 @@ async def qa_paper_stream(
                     )
                     return
 
+            # 极端情况下模型流没有显式 completed 事件，仍返回一个空答案的 done，
+            # 保证前端能收到结束信号，不会一直处于 loading 状态。
             yield sse_event(
                 "done",
                 {
@@ -702,12 +796,14 @@ async def qa_paper_stream(
             )
         except Exception as exc:
             logger.error("Error in QA stream: %s", str(exc))
+            # SSE 场景下不能直接抛异常中断连接，因此把错误包装成 error 事件返回。
             yield sse_event("error", {"status": "error", "detail": str(exc)})
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={
+            # SSE 需要禁用缓存和代理缓冲，否则前端可能收不到实时增量。
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
