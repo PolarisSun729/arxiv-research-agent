@@ -44,10 +44,10 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
     def __init__(
         self,
         db_service: DatabaseService,
-        memory_service: Optional[MemoryService],
         embedding_service: EmbeddingService,
         vector_store_service: VectorStoreService,
         get_embedding_config: Callable[[], EmbeddingConfig],
+        memory_service: Optional[MemoryService] = None,
         get_clustering_config: Optional[Callable[[], Dict[str, Any]]] = None,
         arxiv_service_factory: Optional[Callable[[], Any]] = None,
         oai_db_service: Optional[ArxivOaiDatabaseService] = None,

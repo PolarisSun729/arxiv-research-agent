@@ -1,5 +1,4 @@
 ﻿import os
-import warnings
 import ast
 from datetime import datetime
 import json
@@ -8,13 +7,8 @@ from typing import List, Dict, Any, Optional
 import logging
 from pathlib import Path
 from pymilvus import (
-    Collection,
-    CollectionSchema,
     DataType,
-    FieldSchema,
     MilvusClient,
-    connections,
-    utility,
 )
 from utils.config import VectorDBProvider, MILVUS_CONFIG, get_vector_store_runtime_config
 from pypinyin import lazy_pinyin, Style
@@ -22,12 +16,6 @@ from pypinyin import lazy_pinyin, Style
 logger = logging.getLogger(__name__)
 
 VECTOR_STORE_CONFIG = get_vector_store_runtime_config()
-
-warnings.filterwarnings(
-    "ignore",
-    message=r".*ORM-style PyMilvus API.*",
-    category=DeprecationWarning,
-)
 
 CONTENT_MAX_LENGTH = VECTOR_STORE_CONFIG["content_max_length"]
 RERANK_TEXT_MAX_LENGTH = VECTOR_STORE_CONFIG["rerank_text_max_length"]
@@ -244,11 +232,7 @@ class VectorStoreService:
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             collection_name = normalize_collection_name(f"{base_name}_{embedding_provider}_{timestamp}")
             
-            # 连接 Milvus
-            connections.connect(
-                alias="default", 
-                uri=config.milvus_uri
-            )
+            client = self._get_client()
             
             # 从配置中读取向量维度
             vector_dim = int(embeddings_data.get("vector_dimension"))
@@ -370,74 +354,65 @@ class VectorStoreService:
             
             logger.info(f"Creating Milvus collection: {collection_name}")
             
-            # 创建 collection
-            # field_schemas = [
-            #     FieldSchema(name=field["name"], 
-            #                dtype=getattr(DataType, field["dtype"]),
-            #                is_primary="is_primary" in field and field["is_primary"],
-            #                auto_id="auto_id" in field and field["auto_id"],
-            #                max_length=field.get("max_length"),
-            #                dim=field.get("dim"),
-            #                params=field.get("params"))
-            #     for field in fields
-            # ]
-
-            field_schemas = []
+            schema = MilvusClient.create_schema(
+                auto_id=True,
+                enable_dynamic_field=False,
+            )
             for field in fields:
-                extra_params = {}
-                if field.get('max_length') is not None:
-                    extra_params['max_length'] = field['max_length']
-                if field.get('dim') is not None:
-                    extra_params['dim'] = field['dim']
-                if field.get('params') is not None:
-                    extra_params['params'] = field['params']
-                field_schema = FieldSchema(
-                    name=field["name"], 
-                    dtype=getattr(DataType, field["dtype"]),
-                    is_primary=field.get("is_primary", False),
-                    auto_id=field.get("auto_id", False),
-                    **extra_params
-                )
-                field_schemas.append(field_schema)
+                field_kwargs = {}
+                if field.get("is_primary"):
+                    field_kwargs["is_primary"] = True
+                if field.get("auto_id"):
+                    field_kwargs["auto_id"] = True
+                if field.get("max_length") is not None:
+                    field_kwargs["max_length"] = field["max_length"]
+                if field.get("dim") is not None:
+                    field_kwargs["dim"] = field["dim"]
 
-            schema = CollectionSchema(fields=field_schemas, description=f"Collection for {collection_name}")
-            collection = Collection(name=collection_name, schema=schema)
+                schema.add_field(
+                    field_name=field["name"],
+                    datatype=getattr(DataType, field["dtype"]),
+                    **field_kwargs,
+                )
+
+            index_params = None
+            if hasattr(client, "prepare_index_params"):
+                index_params = client.prepare_index_params()
+                index_params.add_index(
+                    field_name="vector",
+                    metric_type="COSINE",
+                    index_type=self._get_milvus_index_type(config),
+                    params=self._get_milvus_index_params(config),
+                )
+
+            client.create_collection(
+                collection_name=collection_name,
+                dimension=vector_dim,
+                schema=schema,
+                index_params=index_params,
+            )
             
             # 插入数据
             logger.info(f"Inserting {len(entities)} vectors")
-            insertable_fields = [field.name for field in collection.schema.fields if not getattr(field, "auto_id", False)]
+            insertable_fields = [field["name"] for field in fields if not field.get("auto_id", False)]
             normalized_entities = [
                 {key: value for key, value in entity.items() if key in insertable_fields}
                 for entity in entities
             ]
-            self._validate_varchar_lengths(normalized_entities, collection.schema.fields)
-            insert_columns = [
-                [entity.get(field_name) for entity in normalized_entities]
-                for field_name in insertable_fields
-            ]
-            insert_result = collection.insert(insert_columns)
-            collection.flush()
-            
-            # 创建索引
-            index_params = {
-                "metric_type": "COSINE",
-                "index_type": self._get_milvus_index_type(config),
-                "params": self._get_milvus_index_params(config)
-            }
-            collection.create_index(field_name="vector", index_params=index_params)
-            collection.load()
+            self._validate_varchar_lengths(normalized_entities, fields)
+            insert_result = client.insert(
+                collection_name=collection_name,
+                data=normalized_entities,
+            )
             
             return {
-                "index_size": len(insert_result.primary_keys),
+                "index_size": int(insert_result.get("insert_count", len(normalized_entities))),
                 "collection_name": collection_name
             }
             
         except Exception as e:
             logger.error(f"Error indexing to Milvus: {str(e)}")
             raise
-        
-        finally:
-            connections.disconnect("default")
 
     def _validate_varchar_lengths(self, entities: List[Dict[str, Any]], fields: List[Any]) -> None:
         varchar_type = getattr(DataType.VARCHAR, "value", DataType.VARCHAR)

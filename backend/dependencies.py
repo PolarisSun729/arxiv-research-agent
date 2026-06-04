@@ -130,6 +130,7 @@ def get_recommendation_service() -> RecommendationService:
 
     return RecommendationService(
         db_service=get_database_service(),
+        memory_service=get_memory_service(),
         embedding_service=get_embedding_service(),
         vector_store_service=get_vector_store_service(),
         get_embedding_config=get_current_embedding_config,
