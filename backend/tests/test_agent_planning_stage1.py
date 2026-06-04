@@ -31,12 +31,16 @@ def _load_stage1_modules():
         module.__path__ = [str(package_path)]
         sys.modules[package_name] = module
 
-    if "dependencies" not in sys.modules:
-        dependencies_module = types.ModuleType("dependencies")
-        dependencies_module.get_generation_service = lambda: None
-        dependencies_module.get_recommendation_service = lambda: object()
-        dependencies_module.get_paper_qa_service = lambda: object()
-        sys.modules["dependencies"] = dependencies_module
+    # 先移除已经导入过的图模块，确保下面加载的是当前测试环境下的新 LangGraph stub。
+    sys.modules.pop("backend.agents.arxiv_search_agent.graph", None)
+    sys.modules.pop("backend.agents.arxiv_search_agent.service", None)
+
+    # 测试进程里如果已经存在 dependencies，就直接补齐缺失的 getter，避免旧 stub 干扰导入。
+    dependencies_module = sys.modules.get("dependencies", types.ModuleType("dependencies"))
+    dependencies_module.get_generation_service = lambda: None
+    dependencies_module.get_recommendation_service = lambda: object()
+    dependencies_module.get_paper_qa_service = lambda: object()
+    sys.modules["dependencies"] = dependencies_module
 
     if "tools.tool_registry" not in sys.modules:
         tool_registry_module = types.ModuleType("tools.tool_registry")
@@ -72,11 +76,86 @@ def _load_stage1_modules():
         database_service_module.DatabaseService = _DatabaseService
         sys.modules["services.storage.database_service"] = database_service_module
 
-    if "utils.config" not in sys.modules:
-        config_module = types.ModuleType("utils.config")
-        config_module.get_memory_runtime_config = lambda: {"enable_user_research_profile": False}
-        config_module.get_arxiv_oai_runtime_config = lambda: {"target_categories": ["cs.CL", "cs.LG", "cs.IR", "cs.AI"]}
-        sys.modules["utils.config"] = config_module
+    config_module = sys.modules.get("utils.config", types.ModuleType("utils.config"))
+    config_module.get_memory_runtime_config = lambda: {"enable_user_research_profile": False}
+    config_module.get_arxiv_oai_runtime_config = lambda: {"target_categories": ["cs.CL", "cs.LG", "cs.IR", "cs.AI"]}
+    sys.modules["utils.config"] = config_module
+
+    langgraph_module = types.ModuleType("langgraph")
+    graph_module = types.ModuleType("langgraph.graph")
+
+    class _GraphView:
+        def __init__(self, nodes, edges):
+            self._nodes = nodes
+            self._edges = edges
+
+        def draw_mermaid(self):
+            lines = ["graph TD"]
+            for start, end in self._edges:
+                lines.append(f"    {start} --> {end}")
+            for name in self._nodes:
+                if not any(name == edge_end for _, edge_end in self._edges):
+                    lines.append(f"    {name}")
+            return "\n".join(lines)
+
+    class _CompiledGraph:
+        def __init__(self, nodes, edges, conditional_edges):
+            self._nodes = nodes
+            self._edges = list(edges)
+            self._conditional_edges = dict(conditional_edges)
+
+        @staticmethod
+        def _finalize_state(value):
+            if hasattr(value, "model_dump"):
+                payload = value.model_dump()
+                for key in ("steps", "execution_plan", "tool_calls", "tool_observations"):
+                    if hasattr(value, key):
+                        payload[key] = getattr(value, key)
+                return payload
+            if isinstance(value, dict):
+                return dict(value)
+            return value
+
+        def invoke(self, state):
+            current_state = state
+            current = next(end for start, end in self._edges if start == "START")
+            while current != "END":
+                node_fn = self._nodes[current]
+                current_state = node_fn(current_state)
+                if current in self._conditional_edges:
+                    route_fn, mapping = self._conditional_edges[current]
+                    route_key = route_fn(current_state)
+                    current = mapping[route_key]
+                    continue
+                current = next(end for start, end in self._edges if start == current)
+            return self._finalize_state(current_state)
+
+        def get_graph(self):
+            return _GraphView(self._nodes, self._edges)
+
+    class _StateGraph:
+        def __init__(self, *_args, **_kwargs):
+            self.nodes = {}
+            self.edges = []
+            self.conditional_edges = {}
+
+        def add_node(self, name, fn):
+            self.nodes[name] = fn
+
+        def add_edge(self, start, end):
+            self.edges.append((start, end))
+
+        def add_conditional_edges(self, source, router, mapping):
+            self.conditional_edges[source] = (router, mapping)
+
+        def compile(self):
+            return _CompiledGraph(self.nodes, self.edges, self.conditional_edges)
+
+    graph_module.END = "END"
+    graph_module.START = "START"
+    graph_module.StateGraph = _StateGraph
+    sys.modules["langgraph"] = langgraph_module
+    sys.modules["langgraph.graph"] = graph_module
 
     def load(module_name: str, file_path: Path):
         if module_name in sys.modules:
@@ -95,10 +174,11 @@ def _load_stage1_modules():
     load("backend.agents.arxiv_search_agent.utils.state_utils", utils_dir / "state_utils.py")
     load("backend.agents.arxiv_search_agent.utils.text_utils", utils_dir / "text_utils.py")
     load("backend.agents.arxiv_search_agent.utils.paper_reference_resolver", utils_dir / "paper_reference_resolver.py")
+    load("backend.agents.arxiv_search_agent.node.tool_node", node_dir / "tool_node.py")
     load("backend.agents.arxiv_search_agent.node.intent_support", node_dir / "intent_support.py")
     load("backend.agents.arxiv_search_agent.node.parse_node", node_dir / "parse_node.py")
     load("backend.agents.arxiv_search_agent.node.plan_node", node_dir / "plan_node.py")
-    load("backend.agents.arxiv_search_agent.node.search_node", node_dir / "search_node.py")
+    search_node_module = load("backend.agents.arxiv_search_agent.node.search_node", node_dir / "search_node.py")
     load("backend.agents.arxiv_search_agent.node.preference_node", node_dir / "preference_node.py")
     load("backend.agents.arxiv_search_agent.node.pending_action_node", node_dir / "pending_action_node.py")
     load("backend.agents.arxiv_search_agent.node.paper_reading_node", node_dir / "paper_reading_node.py")
@@ -106,12 +186,14 @@ def _load_stage1_modules():
 
     node_package = sys.modules["backend.agents.arxiv_search_agent.node"]
     node_package._coerce_state = sys.modules["backend.agents.arxiv_search_agent.utils.state_utils"]._coerce_state
+    node_package.adapt_search_tool_result = search_node_module.adapt_search_tool_result
     node_package.apply_preference_action = sys.modules["backend.agents.arxiv_search_agent.node.preference_node"].apply_preference_action
     node_package.build_search_tool_args = sys.modules["backend.agents.arxiv_search_agent.node.search_node"].build_search_tool_args
     node_package.check_search_result = sys.modules["backend.agents.arxiv_search_agent.node.search_node"].check_search_result
     node_package.classify_pending_action_confirmation = sys.modules[
         "backend.agents.arxiv_search_agent.node.pending_action_node"
     ].classify_pending_action_confirmation
+    node_package.execute_tool = sys.modules["backend.agents.arxiv_search_agent.node.tool_node"].execute_tool
     node_package.handle_paper_reading_request = sys.modules[
         "backend.agents.arxiv_search_agent.node.paper_reading_node"
     ].handle_paper_reading_request

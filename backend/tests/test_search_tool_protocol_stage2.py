@@ -32,12 +32,15 @@ def _load_modules():
         module.__path__ = [str(package_path)]
         sys.modules[package_name] = module
 
-    if "dependencies" not in sys.modules:
-        dependencies_module = types.ModuleType("dependencies")
-        dependencies_module.get_generation_service = lambda: None
-        dependencies_module.get_recommendation_service = lambda: object()
-        dependencies_module.get_paper_qa_service = lambda: object()
-        sys.modules["dependencies"] = dependencies_module
+    # 如果前一个测试已经导入过图模块，这里先清掉再按当前 stub 重新装载，避免复用旧的 LangGraph 适配对象。
+    sys.modules.pop("backend.agents.arxiv_search_agent.graph", None)
+
+    # 这里不假设前一个测试留下的 dependencies 模块一定干净，直接补齐当前阶段要用的接口。
+    dependencies_module = sys.modules.get("dependencies", types.ModuleType("dependencies"))
+    dependencies_module.get_generation_service = lambda: None
+    dependencies_module.get_recommendation_service = lambda: object()
+    dependencies_module.get_paper_qa_service = lambda: object()
+    sys.modules["dependencies"] = dependencies_module
 
     if "tools.tool_registry" not in sys.modules:
         tool_registry_module = types.ModuleType("tools.tool_registry")
@@ -73,41 +76,53 @@ def _load_modules():
         database_service_module.DatabaseService = _DatabaseService
         sys.modules["services.storage.database_service"] = database_service_module
 
-    if "utils.config" not in sys.modules:
-        config_module = types.ModuleType("utils.config")
-        config_module.get_memory_runtime_config = lambda: {"enable_user_research_profile": False}
-        config_module.get_arxiv_oai_runtime_config = lambda: {"target_categories": ["cs.CL", "cs.LG", "cs.IR", "cs.AI"]}
-        sys.modules["utils.config"] = config_module
+    config_module = sys.modules.get("utils.config", types.ModuleType("utils.config"))
+    config_module.get_memory_runtime_config = lambda: {"enable_user_research_profile": False}
+    config_module.get_arxiv_oai_runtime_config = lambda: {"target_categories": ["cs.CL", "cs.LG", "cs.IR", "cs.AI"]}
+    sys.modules["utils.config"] = config_module
 
-    if "langgraph.graph" not in sys.modules:
-        langgraph_module = types.ModuleType("langgraph")
-        graph_module = types.ModuleType("langgraph.graph")
+    langgraph_module = types.ModuleType("langgraph")
+    graph_module = types.ModuleType("langgraph.graph")
 
-        class _CompiledGraph:
-            pass
+    class _CompiledGraph:
+        def __init__(self, nodes=None, edges=None, conditional_edges=None):
+            self._nodes = nodes or {}
+            self._edges = list(edges or [])
+            self._conditional_edges = dict(conditional_edges or {})
 
-        class _StateGraph:
-            def __init__(self, *_args, **_kwargs):
-                self.nodes = {}
-                self.edges = []
+        def get_graph(self):
+            class _GraphView:
+                def draw_mermaid(self_inner):
+                    return "graph TD\n    plan_task"
 
-            def add_node(self, name, fn):
-                self.nodes[name] = fn
+            return _GraphView()
 
-            def add_edge(self, start, end):
-                self.edges.append((start, end))
+        def invoke(self, state):
+            return state
 
-            def add_conditional_edges(self, *_args, **_kwargs):
-                return None
+    class _StateGraph:
+        def __init__(self, *_args, **_kwargs):
+            self.nodes = {}
+            self.edges = []
+            self.conditional_edges = {}
 
-            def compile(self):
-                return _CompiledGraph()
+        def add_node(self, name, fn):
+            self.nodes[name] = fn
 
-        graph_module.END = "END"
-        graph_module.START = "START"
-        graph_module.StateGraph = _StateGraph
-        sys.modules["langgraph"] = langgraph_module
-        sys.modules["langgraph.graph"] = graph_module
+        def add_edge(self, start, end):
+            self.edges.append((start, end))
+
+        def add_conditional_edges(self, source, router, mapping):
+            self.conditional_edges[source] = (router, mapping)
+
+        def compile(self):
+            return _CompiledGraph(self.nodes, self.edges, self.conditional_edges)
+
+    graph_module.END = "END"
+    graph_module.START = "START"
+    graph_module.StateGraph = _StateGraph
+    sys.modules["langgraph"] = langgraph_module
+    sys.modules["langgraph.graph"] = graph_module
 
     def load(module_name: str, file_path: Path):
         if module_name in sys.modules:
