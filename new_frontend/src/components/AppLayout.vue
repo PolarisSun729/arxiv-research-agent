@@ -46,11 +46,6 @@ function handleMenuClick(path: string) {
           <span>Agent 搜索</span>
         </el-menu-item>
 
-        <el-menu-item index="/agent-graph" class="menu-item-agent-graph" @click="handleMenuClick('/agent-graph')">
-          <span class="menu-icon-badge badge-graph">图</span>
-          <span>Agent 图谱</span>
-        </el-menu-item>
-
         <el-menu-item index="/recommendations" class="menu-item-star" @click="handleMenuClick('/recommendations')">
           <span class="menu-icon-badge badge-star">⭐</span>
           <span>推荐论文</span>

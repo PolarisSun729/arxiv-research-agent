@@ -36,7 +36,7 @@ const router = createRouter({
     {
       path: '/agent-graph',
       name: 'AgentGraph',
-      component: () => import('@/views/AgentGraph.vue')
+      redirect: '/'
     },
     {
       path: '/labeled',

@@ -462,6 +462,65 @@ class EnhancedRetrievalService:
         self.route_retriever = RouteRetriever(self)
         self.rerank_service = RerankService(self)
 
+    def _is_dashscope_vl_rerank_model(self) -> bool:
+        model_name = (self.llm_rerank_model_name or "").strip().lower()
+        return model_name in {"qwen3-vl-rerank", "gte-rerank-v2"}
+
+    def _get_dashscope_rerank_request_spec(
+        self,
+        user_query: str,
+        documents: List[str],
+        rerank_limit: int,
+    ) -> Tuple[str, Dict[str, Any]]:
+        top_n = min(len(documents), max(1, rerank_limit))
+        model_name = self.llm_rerank_model_name or "qwen3-rerank"
+
+        if self._is_dashscope_vl_rerank_model():
+            base_url = self.llm_rerank_base_url or ""
+            if not base_url or base_url.endswith("/compatible-api/v1/reranks"):
+                base_url = "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
+
+            payload: Dict[str, Any] = {
+                "model": model_name,
+                "input": {
+                    "query": {"text": user_query},
+                    "documents": [{"text": doc} for doc in documents],
+                },
+                "parameters": {
+                    "return_documents": True,
+                    "top_n": top_n,
+                },
+            }
+            return base_url, payload
+
+        base_url = self.llm_rerank_base_url or "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"
+        payload = {
+            "model": model_name,
+            "query": user_query,
+            "documents": documents,
+            "top_n": top_n,
+        }
+        if self.llm_rerank_prompt:
+            payload["instruct"] = self.llm_rerank_prompt
+        return base_url, payload
+
+    @staticmethod
+    def _extract_dashscope_rerank_results(data: Any) -> Optional[List[Dict[str, Any]]]:
+        if not isinstance(data, dict):
+            return None
+
+        results = data.get("results")
+        if isinstance(results, list):
+            return results
+
+        output = data.get("output")
+        if isinstance(output, dict):
+            output_results = output.get("results")
+            if isinstance(output_results, list):
+                return output_results
+
+        return None
+
     def _memory_flag(self, key: str, default: Any = None) -> Any:
         return self.memory_runtime_config.get(key, default)
 
@@ -937,18 +996,15 @@ class EnhancedRetrievalService:
             return None
 
         documents = [doc[: self.llm_rerank_max_doc_chars] for doc in rerank_documents]
-        payload: Dict[str, Any] = {
-            "model": self.llm_rerank_model_name or "qwen3-rerank",
-            "query": user_query,
-            "documents": documents,
-            "top_n": min(len(documents), max(1, rerank_limit)),
-        }
-        if self.llm_rerank_prompt:
-            payload["instruct"] = self.llm_rerank_prompt
+        request_url, payload = self._get_dashscope_rerank_request_spec(
+            user_query=user_query,
+            documents=documents,
+            rerank_limit=rerank_limit,
+        )
 
         try:
             response = requests.post(
-                self.llm_rerank_base_url,
+                request_url,
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
@@ -960,10 +1016,14 @@ class EnhancedRetrievalService:
             data = response.json()
         except Exception as exc:
             self._llm_reranker_error = f"dashscope_rerank_request_failed: {exc}"
-            logger.warning("DashScope rerank failed, will %s", "fallback to local model" if self.llm_rerank_fallback_local else "stop")
+            logger.warning(
+                "DashScope rerank failed: %s, will %s",
+                exc,
+                "fallback to local model" if self.llm_rerank_fallback_local else "stop",
+            )
             return None
 
-        results = data.get("results") if isinstance(data, dict) else None
+        results = self._extract_dashscope_rerank_results(data)
         if not isinstance(results, list):
             self._llm_reranker_error = f"dashscope_rerank_invalid_response: {data}"
             return None

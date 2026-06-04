@@ -336,16 +336,23 @@ INTENT_ROUTING_CONFIG: Dict[str, Any] = {
     },
 }
 
+_default_rerank_model_name = _env_str("RERANK_MODEL_NAME", "qwen3-vl-rerank")
+_default_rerank_base_url = (
+    "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
+    if _default_rerank_model_name in {"qwen3-vl-rerank", "gte-rerank-v2"}
+    else "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"
+)
+
 RERANK_CONFIG: Dict[str, Any] = {
     "provider": _env_str("RERANK_PROVIDER", "dashscope"),
-    "model_name": _env_str("RERANK_MODEL_NAME", "qwen3-vl-rerank"),
+    "model_name": _default_rerank_model_name,
     "local_model_name_or_path": _env_str(
         "RERANK_LOCAL_MODEL_NAME_OR_PATH",
         str(REPO_ROOT / "00-models" / "Qwen3-VL-Reranker-2B"),
     ),
     "api_key": _env_str("RERANK_API_KEY", ALIYUN_API_KEY),
     "dashscope_api_key": _env_str("RERANK_DASHSCOPE_API_KEY", ALIYUN_API_KEY),
-    "base_url": _env_str("RERANK_BASE_URL", "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"),
+    "base_url": _env_str("RERANK_BASE_URL", _default_rerank_base_url),
     "fallback_local": _env_bool("RERANK_FALLBACK_LOCAL", False),
     "prompt": _env_str("RERANK_PROMPT", "Retrieve text relevant to the user's query."),
     "batch_size": _env_int("RERANK_BATCH_SIZE", 8),
