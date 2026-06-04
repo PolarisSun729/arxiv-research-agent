@@ -162,7 +162,7 @@ export async function getUserPreferences(): Promise<{
   research_profile?: UserResearchProfile | null
 }> {
   try {
-    const response = await request.get(`/user/preferences/${DEFAULT_USER_ID}`)
+    const response: any = await request.get(`/user/preferences/${DEFAULT_USER_ID}`)
     return {
       liked_papers: Array.isArray(response?.liked_papers) ? response.liked_papers : [],
       disliked_papers: Array.isArray(response?.disliked_papers) ? response.disliked_papers : [],
@@ -249,7 +249,7 @@ export async function getUserPaperActions(actionType?: PaperActionType): Promise
   actions: UserPaperAction[]
   action_map: UserPaperActionMap
 }> {
-  const response = await request.get(`/user/paper-actions/${DEFAULT_USER_ID}`, {
+  const response: any = await request.get(`/user/paper-actions/${DEFAULT_USER_ID}`, {
     params: actionType ? { action_type: actionType } : undefined
   })
   return {
@@ -263,7 +263,7 @@ export async function getUserPaperActions(actionType?: PaperActionType): Promise
 
 export async function getUserResearchProfile(): Promise<UserResearchProfile> {
   try {
-    const response = await request.get(`/user/research-profile/${DEFAULT_USER_ID}`)
+    const response: any = await request.get(`/user/research-profile/${DEFAULT_USER_ID}`)
     return normalizeResearchProfile(response)
   } catch (error: any) {
     if (error?.response?.status === 404) {
@@ -274,7 +274,7 @@ export async function getUserResearchProfile(): Promise<UserResearchProfile> {
 }
 
 export async function upsertUserResearchProfile(profile: Partial<UserResearchProfile>): Promise<UserResearchProfile> {
-  const response = await request.put('/user/research-profile', {
+  const response: any = await request.put('/user/research-profile', {
     user_id: DEFAULT_USER_ID,
     ...profile
   })
@@ -282,7 +282,7 @@ export async function upsertUserResearchProfile(profile: Partial<UserResearchPro
 }
 
 export async function patchUserResearchProfile(profile: Partial<UserResearchProfile>): Promise<UserResearchProfile> {
-  const response = await request.patch('/user/research-profile', {
+  const response: any = await request.patch('/user/research-profile', {
     user_id: DEFAULT_USER_ID,
     ...profile
   })
@@ -457,7 +457,7 @@ export async function getInterestVector(): Promise<InterestVector> {
 }
 
 export async function recommendPapers(topN: number = 10, maxAgeMonths: number = 6): Promise<RecommendationResult> {
-  const response = await request.post('/user/recommend-papers', { top_n: topN, max_age_months: maxAgeMonths })
+  const response: any = await request.post('/user/recommend-papers', { top_n: topN, max_age_months: maxAgeMonths })
   return {
     ...response,
     research_profile: response?.research_profile ? normalizeResearchProfile(response.research_profile) : null,
@@ -690,7 +690,7 @@ export async function listPaperNotes(
   arxivId: string,
   params: { user_id?: string; note_type?: PaperNoteType } = {}
 ): Promise<{ items: PaperNote[] }> {
-  const response = await request.get(`/paper/${arxivId}/notes`, { params })
+  const response: any = await request.get(`/paper/${arxivId}/notes`, { params })
   return {
     items: Array.isArray(response?.items) ? response.items.map(normalizePaperNote) : []
   }
@@ -700,7 +700,7 @@ export async function createPaperNote(
   arxivId: string,
   payload: PaperNotePayload
 ): Promise<{ item: PaperNote | null }> {
-  const response = await request.post(`/paper/${arxivId}/notes`, payload)
+  const response: any = await request.post(`/paper/${arxivId}/notes`, payload)
   return {
     item: response?.item ? normalizePaperNote(response.item) : null
   }
@@ -711,7 +711,7 @@ export async function updatePaperNote(
   noteId: string,
   payload: Partial<PaperNotePayload>
 ): Promise<{ item: PaperNote | null }> {
-  const response = await request.patch(`/paper/${arxivId}/notes/${noteId}`, payload)
+  const response: any = await request.patch(`/paper/${arxivId}/notes/${noteId}`, payload)
   return {
     item: response?.item ? normalizePaperNote(response.item) : null
   }

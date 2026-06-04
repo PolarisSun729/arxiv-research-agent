@@ -3,6 +3,7 @@ import { ElMessage } from 'element-plus'
 import { runAgentChat, streamAgentChat } from '@/api/agent'
 import type { AgentPaper, AgentStep, AgentStreamEvent, AgentToolCall, ArxivSearchResponse } from '@/types/agent'
 import type { AgentChatMessage } from '@/types/agentChat'
+import type { UserResearchProfile } from '@/types/paper'
 import { usePaperStore } from '@/stores/paperStore'
 
 function createMessageId(prefix: 'user' | 'assistant') {
@@ -380,7 +381,7 @@ export function useAgentSearchChat() {
       last_papers?: AgentPaper[]
       pending_action?: Record<string, any> | null
       paper_qa_result?: Record<string, any> | null
-      research_profile?: typeof paperStore.researchProfile.value | null
+      research_profile?: UserResearchProfile | null
       arxiv_id?: string | null
       source?: 'button' | 'chat' | 'detail_page'
     } = lastSearchPapers.value.length || selectedPaper.value || paperQaResult.value

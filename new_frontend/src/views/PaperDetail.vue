@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { PaperNote, PaperNoteType } from '@/types/paper'
+import type { PaperNoteType } from '@/types/paper'
 import {
   ArrowLeft,
   ChatDotRound,
@@ -15,7 +15,7 @@ import RagChatPanel from '@/components/rag-chat/RagChatPanel.vue'
 import RagEvidencePanel from '@/components/rag-chat/RagEvidencePanel.vue'
 import { usePaperRagChat } from '@/composables/usePaperRagChat'
 import { usePaperStore } from '@/stores/paperStore'
-import { qaTurnToRagMessages, type RagChatMessage } from '@/types/ragChat'
+import { qaTurnToRagMessages } from '@/types/ragChat'
 import {
   createPaperQaIndex,
   getLatestPaperQaIndexJob,
@@ -112,71 +112,21 @@ const qaStageText = computed(() => {
 })
 const currentPaperActions = computed(() => store.currentPaper?.paperActions || {})
 const preferredAnswerStyle = computed(() => store.researchProfile?.preferred_answer_style || '')
-const paperNotes = computed(() => store.paperNotes)
 const notesLoading = ref(false)
-const noteSaving = ref(false)
-const noteDialogOpen = ref(false)
-const noteEditorMode = ref<'create' | 'edit'>('create')
-const editingNoteId = ref('')
 const activeNoteTypeFilter = ref<PaperNoteType | 'all'>('all')
-const draftSourceTurnId = ref('')
-const draftSourceMessageId = ref('')
-const draftSources = ref<any[]>([])
-const noteForm = ref({
-  title: '',
-  content: '',
-  note_type: 'summary' as PaperNoteType,
-  tagsText: '',
-  include_in_profile: false,
-  keepSources: true,
-  source_chunk_ids: [] as string[]
-})
-
-const noteTypeOptions: Array<{ label: string; value: PaperNoteType }> = [
-  { label: '总结', value: 'summary' },
-  { label: '方法', value: 'method' },
-  { label: '实验', value: 'experiment' },
-  { label: '结果', value: 'result' },
-  { label: '局限性', value: 'limitation' },
-  { label: '想法', value: 'idea' },
-  { label: '待办', value: 'todo' },
-  { label: '自定义', value: 'custom' }
-]
-
-const noteTypeLabelMap: Record<PaperNoteType, string> = {
-  summary: '总结',
-  method: '方法',
-  experiment: '实验',
-  result: '结果',
-  limitation: '局限性',
-  idea: '想法',
-  todo: '待办',
-  custom: '自定义'
-}
 
 const currentSessionId = computed(() => {
   const session = currentSession.value as any
   return String(session?.session_id || session?.sessionId || '').trim()
 })
 
-let qaJobPollTimer: ReturnType<typeof window.setTimeout> | null = null
+let qaJobPollTimer: number | null = null
 
 function formatDate(dateStr: string) {
   return new Date(dateStr).toLocaleDateString('zh-CN', {
     year: 'numeric',
     month: 'long',
     day: 'numeric'
-  })
-}
-
-function formatDateTime(dateStr?: string | null) {
-  if (!dateStr) return '-'
-  return new Date(dateStr).toLocaleString('zh-CN', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit'
   })
 }
 
@@ -188,37 +138,6 @@ function normalizeChunkIds(sources: Array<any> = []) {
         .filter(Boolean)
     )
   )
-}
-
-function buildTagsText(tags: string[] = []) {
-  return tags.filter(Boolean).join(', ')
-}
-
-function parseTagsText(value: string) {
-  return Array.from(
-    new Set(
-      String(value || '')
-        .split(/[，,;；\n]/)
-        .map(item => item.trim())
-        .filter(Boolean)
-    )
-  )
-}
-
-function resetNoteForm() {
-  editingNoteId.value = ''
-  draftSourceTurnId.value = ''
-  draftSourceMessageId.value = ''
-  draftSources.value = []
-  noteForm.value = {
-    title: '',
-    content: '',
-    note_type: 'summary',
-    tagsText: '',
-    include_in_profile: false,
-    keepSources: true,
-    source_chunk_ids: []
-  }
 }
 
 async function fetchPaperNotes() {
@@ -234,126 +153,31 @@ async function fetchPaperNotes() {
   }
 }
 
-function openBlankNoteDialog() {
-  noteEditorMode.value = 'create'
-  resetNoteForm()
-  noteDialogOpen.value = true
-}
-
-function openAssistantNoteDialog(item: RagChatMessage) {
-  noteEditorMode.value = 'create'
-  resetNoteForm()
-  draftSourceTurnId.value = String(item.turnId || '').trim()
-  draftSources.value = Array.isArray(item.sources) ? item.sources : []
-  noteForm.value = {
-    title: '',
-    content: String(item.content || '').trim(),
-    note_type: 'summary',
-    tagsText: '',
-    include_in_profile: false,
-    keepSources: true,
-    source_chunk_ids: normalizeChunkIds(item.sources || [])
-  }
-  noteDialogOpen.value = true
-}
-
-function openEditNoteDialog(note: PaperNote) {
-  noteEditorMode.value = 'edit'
-  editingNoteId.value = note.note_id
-  draftSourceTurnId.value = String(note.source_turn_id || '').trim()
-  draftSourceMessageId.value = String(note.source_message_id || '').trim()
-  draftSources.value = Array.isArray(note.sources) ? note.sources : []
-  noteForm.value = {
-    title: note.title || '',
-    content: note.content || '',
-    note_type: note.note_type || 'custom',
-    tagsText: buildTagsText(note.tags || []),
-    include_in_profile: Boolean(note.include_in_profile),
-    keepSources: (note.source_chunk_ids || []).length > 0,
-    source_chunk_ids: [...(note.source_chunk_ids || [])]
-  }
-  noteDialogOpen.value = true
-}
-
-async function submitNoteForm() {
+async function openAssistantNoteDialog(item: { content?: string; turnId?: string; sources?: Array<any> }) {
   if (!store.currentPaper || !paperId.value) return
-  const content = String(noteForm.value.content || '').trim()
+
+  const content = String(item.content || '').trim()
   if (!content) {
-    ElMessage.warning('请先填写笔记内容')
+    ElMessage.warning('当前回答没有可保存的内容')
     return
   }
 
-  noteSaving.value = true
   try {
-    const payload = {
-      title: String(noteForm.value.title || '').trim() || undefined,
+    await store.savePaperNote(paperId.value, {
+      title: content.slice(0, 24) || '对话笔记',
       content,
-      note_type: noteForm.value.note_type,
-      tags: parseTagsText(noteForm.value.tagsText),
-      include_in_profile: Boolean(noteForm.value.include_in_profile),
-      source_chunk_ids: noteForm.value.keepSources ? [...noteForm.value.source_chunk_ids] : []
+      note_type: 'summary',
+      include_in_profile: false,
+      source_chunk_ids: normalizeChunkIds(item.sources || []),
+      session_id: currentSessionId.value || undefined,
+      source_turn_id: item.turnId || undefined
+    })
+    if (store.currentPaper && !currentPaperActions.value.note_saved) {
+      await store.togglePaperAction(store.currentPaper, 'note_saved', true).catch(() => undefined)
     }
-
-    if (noteEditorMode.value === 'edit' && editingNoteId.value) {
-      await store.editPaperNote(paperId.value, editingNoteId.value, payload)
-      ElMessage.success('笔记已更新')
-    } else {
-      await store.savePaperNote(paperId.value, {
-        ...payload,
-        session_id: currentSessionId.value || undefined,
-        source_message_id: draftSourceMessageId.value || undefined,
-        source_turn_id: draftSourceTurnId.value || undefined
-      })
-      if (store.currentPaper && !currentPaperActions.value.note_saved) {
-        await store.togglePaperAction(store.currentPaper, 'note_saved', true).catch(() => undefined)
-      }
-      ElMessage.success('笔记已保存')
-    }
-
-    noteDialogOpen.value = false
-    await fetchPaperNotes()
+    ElMessage.success('笔记已保存')
   } catch (error: any) {
     ElMessage.error(error?.response?.data?.detail || '保存笔记失败')
-  } finally {
-    noteSaving.value = false
-  }
-}
-
-async function handleDeleteNote(note: PaperNote) {
-  if (!paperId.value) return
-  try {
-    await ElMessageBox.confirm('删除后不会影响原始 QA 记录，是否继续？', '删除笔记', {
-      confirmButtonText: '删除',
-      cancelButtonText: '取消',
-      type: 'warning'
-    })
-  } catch {
-    return
-  }
-
-  try {
-    const deleted = await store.removeExistingPaperNote(paperId.value, note.note_id)
-    if (deleted) {
-      if (store.currentPaper && currentPaperActions.value.note_saved && store.paperNotes.length === 0) {
-        await store.togglePaperAction(store.currentPaper, 'note_saved', false).catch(() => undefined)
-      }
-      ElMessage.success('笔记已删除')
-    }
-  } catch (error: any) {
-    ElMessage.error(error?.response?.data?.detail || '删除笔记失败')
-  }
-}
-
-function handleExportNotes() {
-  if (!paperId.value || typeof window === 'undefined') return
-  window.open(store.getPaperNotesExportLink(paperId.value), '_blank', 'noopener,noreferrer')
-}
-
-async function handleRefreshNotes() {
-  try {
-    await fetchPaperNotes()
-  } catch (error: any) {
-    ElMessage.error(error?.response?.data?.detail || '刷新笔记失败')
   }
 }
 
