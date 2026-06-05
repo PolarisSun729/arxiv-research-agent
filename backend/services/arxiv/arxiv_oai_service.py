@@ -800,11 +800,23 @@ class ArxivOaiSyncService:
             stats.pages_processed += 1
             logger.info("Processing page %s with %s record nodes", stats.pages_processed, len(records))
 
+            # 记录当前页进入持久化前的命中情况，避免“有翻页但没有写库日志”时难以判断是无命中还是写库异常。
+            page_matched_before = stats.records_matched
+            page_filtered_before = stats.skipped_category_filter
             matched_papers: List[Dict[str, Any]] = []
             for record in records:
                 paper = self._process_record(record, stats, dry_run=dry_run, count_only=count_only)
                 if paper is not None:
                     matched_papers.append(paper)
+
+            page_matched = stats.records_matched - page_matched_before
+            page_filtered = stats.skipped_category_filter - page_filtered_before
+            logger.info(
+                "Page %s category summary: matched=%s filtered_by_category=%s",
+                stats.pages_processed,
+                page_matched,
+                page_filtered,
+            )
 
             if matched_papers and not (dry_run or count_only):
                 self._persist_matched_papers(matched_papers, stats)
@@ -1280,7 +1292,9 @@ class ArxivOaiSyncService:
         normalized = [category.strip() for category in categories if str(category).strip()]
         if not normalized:
             return False
-        return all(category in TARGET_CATEGORIES for category in normalized)
+        # OAI 记录经常带 cross-list 分类；这里只要命中任一目标分类就保留，
+        # 避免把主业务相关论文仅因额外挂了非白名单分类而整体过滤掉。
+        return any(category in TARGET_CATEGORIES for category in normalized)
 
     def _split_categories(self, categories_text: str) -> List[str]:
         if not categories_text:
