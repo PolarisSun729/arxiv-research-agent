@@ -56,6 +56,15 @@ def load_retrieval_modules() -> Dict[str, Any]:
     if str(backend_dir) not in sys.path:
         sys.path.insert(0, str(backend_dir))
 
+    # 其他测试可能向 sys.modules 注入过同名轻量 stub；这里先清理，再导入真实模块。
+    for module_name in (
+        "services.retrieval.enhanced_retrieval_service",
+        "services.retrieval.query_planner",
+        "services.retrieval.route_retriever",
+        "services.retrieval.rerank_service",
+    ):
+        sys.modules.pop(module_name, None)
+
     enhanced_module = importlib.import_module("services.retrieval.enhanced_retrieval_service")
     query_planner_module = importlib.import_module("services.retrieval.query_planner")
     route_retriever_module = importlib.import_module("services.retrieval.route_retriever")

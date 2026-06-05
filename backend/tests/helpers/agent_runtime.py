@@ -85,6 +85,21 @@ def _ensure_backend_packages() -> Path:
 
 def _ensure_dependency_stubs() -> None:
     dependencies_module = sys.modules.get("dependencies", types.ModuleType("dependencies"))
+    dependencies_module.get_database_service = getattr(dependencies_module, "get_database_service", lambda: None)
+    dependencies_module.get_oai_database_service = getattr(dependencies_module, "get_oai_database_service", lambda: None)
+    dependencies_module.get_embedding_service = getattr(dependencies_module, "get_embedding_service", lambda: None)
+    dependencies_module.get_vector_store_service = getattr(dependencies_module, "get_vector_store_service", lambda: None)
+    dependencies_module.get_current_embedding_config = getattr(
+        dependencies_module,
+        "get_current_embedding_config",
+        lambda: None,
+    )
+    dependencies_module.get_enhanced_retrieval_service = getattr(
+        dependencies_module,
+        "get_enhanced_retrieval_service",
+        lambda: None,
+    )
+    dependencies_module.get_index_job_manager = getattr(dependencies_module, "get_index_job_manager", lambda: None)
     dependencies_module.get_generation_service = lambda: DEPENDENCY_BAG.generation_service
     dependencies_module.get_recommendation_service = lambda: DEPENDENCY_BAG.recommendation_service
     dependencies_module.get_paper_qa_service = lambda: DEPENDENCY_BAG.paper_qa_service
@@ -339,6 +354,7 @@ def load_agent_test_modules() -> Dict[str, Any]:
         "backend.agents.arxiv_search_agent.node.parse_node",
         "backend.agents.arxiv_search_agent.node.plan_node",
         "backend.agents.arxiv_search_agent.node.search_node",
+        "backend.agents.arxiv_search_agent.node.recommendation_node",
         "backend.agents.arxiv_search_agent.node.preference_node",
         "backend.agents.arxiv_search_agent.node.pending_action_node",
         "backend.agents.arxiv_search_agent.node.paper_reading_node",
@@ -377,6 +393,7 @@ def load_agent_test_modules() -> Dict[str, Any]:
     _load_module("backend.agents.arxiv_search_agent.node.parse_node", node_dir / "parse_node.py")
     _load_module("backend.agents.arxiv_search_agent.node.plan_node", node_dir / "plan_node.py")
     search_node_module = _load_module("backend.agents.arxiv_search_agent.node.search_node", node_dir / "search_node.py")
+    _load_module("backend.agents.arxiv_search_agent.node.recommendation_node", node_dir / "recommendation_node.py")
     _load_module("backend.agents.arxiv_search_agent.node.preference_node", node_dir / "preference_node.py")
     _load_module("backend.agents.arxiv_search_agent.node.pending_action_node", node_dir / "pending_action_node.py")
     _load_module("backend.agents.arxiv_search_agent.node.paper_reading_node", node_dir / "paper_reading_node.py")

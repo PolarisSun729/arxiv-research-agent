@@ -113,6 +113,7 @@ class BuildPaperQAIndexInput(BaseModel):
 class AnswerPaperQuestionInput(BaseModel):
     arxiv_id: str
     question: str
+    stricter_grounding: Optional[bool] = None
     top_k: Optional[int] = None
     enable_query_rewrite: Optional[bool] = None
     enable_hyde: Optional[bool] = None

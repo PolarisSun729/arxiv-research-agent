@@ -22,7 +22,7 @@ from ..schemas import ToolCallRequest
 from ..state import AgentState
 from ..utils.paper_reference_resolver import _resolve_paper_reference
 from ..utils.result_utils import _extract_error_message, _result_mapping, _result_ok
-from ..utils.state_utils import _append_step, _coerce_state
+from ..utils.state_utils import _append_step, _coerce_state, _get_execution_plan_step
 from ..utils.text_utils import _matches_any, _normalize_text
 from .tool_node import execute_tool
 
@@ -85,11 +85,12 @@ def _parse_preference_action(message: str) -> Optional[Dict[str, str]]:
 
 
 def _get_plan_step_id(state: AgentState, step_type: str) -> Optional[str]:
-    accepted_step_types = {str(step_type or "").strip()}
+    accepted_step_types = [str(step_type or "").strip()]
     if step_type == "preference_mutation":
-        accepted_step_types.add("preference_update")
-    for step in list(state.execution_plan or []):
-        if str(getattr(step, "step_type", "") or "").strip() in accepted_step_types:
+        accepted_step_types.append("preference_update")
+    for accepted_step_type in accepted_step_types:
+        step = _get_execution_plan_step(state, step_type=accepted_step_type)
+        if step is not None:
             step_id = str(getattr(step, "step_id", "") or "").strip()
             return step_id or None
     return None

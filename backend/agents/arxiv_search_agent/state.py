@@ -8,8 +8,9 @@ from .schemas import (
     AgentStep,
     AgentToolCall,
     ArxivSearchSpec,
-    ExecutionPlanStep,
+    ExecutablePlan,
     Goal,
+    PlanRuntime,
     ToolCallRequest,
     ToolObservation,
 )
@@ -65,7 +66,8 @@ class AgentState(BaseModel):
     # goal 表达用户本轮真实想完成的目标；execution_plan 表达结构化步骤规划。
     # 阶段 1 中它们主要用于状态表达、调试和后续能力扩展，不直接替代现有 plan。
     goal: Optional[Goal] = None
-    execution_plan: List[ExecutionPlanStep] = Field(default_factory=list)
+    execution_plan: Optional[ExecutablePlan] = None
+    plan_runtime: Optional[PlanRuntime] = None
 
     # 偏好动作执行后的结果，例如喜欢/不喜欢/取消标记的处理结果。
     preference_action_result: Optional[Dict[str, Any]] = None

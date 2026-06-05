@@ -1,0 +1,518 @@
+"""Planner 入口与各类 Goal/Plan builder。
+
+这里把“目标提取”和“计划生成”拆开，避免继续在单个大函数里堆所有 intent 分支。
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence
+
+from .plan_validator import PlanValidator
+from .schemas import ExecutablePlan, Goal, PlanRuntime, PlanStep, StepCondition, StepInputBinding, StepPolicy
+from .state import AgentState
+from .tool_registry import PLANNER_TOOL_REGISTRY, ToolRegistry
+from .utils.state_utils import _compact_search_spec
+
+
+def _normalize_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _normalize_intent(value: Any) -> str:
+    return _normalize_text(value) or "unsupported"
+
+
+def _dedupe_strings(items: Sequence[Any]) -> List[str]:
+    normalized: List[str] = []
+    seen = set()
+    for item in items:
+        text = _normalize_text(item)
+        if text and text not in seen:
+            seen.add(text)
+            normalized.append(text)
+    return normalized
+
+
+def _get_context_mapping(state: AgentState) -> Mapping[str, Any]:
+    return state.context if isinstance(state.context, Mapping) else {}
+
+
+def _get_user_memory_summary(context: Mapping[str, Any]) -> Optional[str]:
+    for key in ("user_memory_summary", "memory_summary"):
+        value = context.get(key)
+        if isinstance(value, Mapping):
+            return key
+        text = _normalize_text(value)
+        if text:
+            return key
+    return None
+
+
+def _get_selected_paper_hint(context: Mapping[str, Any]) -> Optional[str]:
+    selected_paper = context.get("selected_paper")
+    if isinstance(selected_paper, Mapping):
+        for key in ("title", "arxiv_id", "paper_id"):
+            text = _normalize_text(selected_paper.get(key))
+            if text:
+                return text
+    for key in ("selected_paper_title", "selected_paper_id"):
+        text = _normalize_text(context.get(key))
+        if text:
+            return text
+    return None
+
+
+def _build_context_refs(state: AgentState) -> List[str]:
+    context = _get_context_mapping(state)
+    refs: List[str] = []
+    if _get_selected_paper_hint(context):
+        refs.append("selected_paper")
+    if _get_user_memory_summary(context):
+        refs.append("user_memory_summary")
+    if isinstance(state.pending_action, Mapping):
+        refs.append("pending_action")
+    if isinstance(state.paper_qa_result, Mapping):
+        refs.append("paper_qa_result")
+    refs.extend(sorted(str(key) for key in context.keys()))
+    return _dedupe_strings(refs)
+
+
+def _build_search_constraints(state: AgentState) -> List[str]:
+    constraints: List[str] = []
+    spec = state.search_spec
+    if spec is not None:
+        if spec.query:
+            constraints.append(f"query={spec.query}")
+        if spec.title_query:
+            constraints.append(f"title_query={spec.title_query}")
+        if spec.abstract_query:
+            constraints.append(f"abstract_query={spec.abstract_query}")
+        if spec.categories:
+            constraints.append(f"categories={', '.join(spec.categories)}")
+        if spec.submitted_days_ago is not None:
+            constraints.append(f"submitted_days_ago={spec.submitted_days_ago}")
+        constraints.append(f"max_results={spec.max_results}")
+        constraints.append(f"sort_by={spec.sort_by}:{spec.sort_order}")
+    return _dedupe_strings(constraints)
+
+
+def _binding(
+    input_key: str,
+    *,
+    source_type: str,
+    source_key: Optional[str] = None,
+    step_id: Optional[str] = None,
+    value: Any = None,
+    required: bool = True,
+) -> StepInputBinding:
+    return StepInputBinding(
+        input_key=input_key,
+        source_type=source_type,  # type: ignore[arg-type]
+        source_key=source_key,
+        step_id=step_id,
+        value=value,
+        required=required,
+    )
+
+
+def _always_condition() -> StepCondition:
+    return StepCondition(condition_type="always")
+
+
+def _build_plan_step(
+    *,
+    step_id: str,
+    action_type: str,
+    tool_name: str,
+    output_key: Optional[str],
+    tool_registry: ToolRegistry,
+    input_bindings: Optional[List[StepInputBinding]] = None,
+    depends_on: Optional[List[str]] = None,
+    condition: Optional[StepCondition] = None,
+    preconditions: Optional[List[StepCondition]] = None,
+    postconditions: Optional[List[StepCondition]] = None,
+    retry_policy: Optional[StepPolicy] = None,
+    failure_policy: Optional[StepPolicy] = None,
+    confirmation_policy: Optional[StepPolicy] = None,
+    side_effect_level: Optional[str] = None,
+    status: str = "pending",
+) -> PlanStep:
+    normalized_tool_name = tool_registry.validate_tool_name(tool_name)
+    tool = tool_registry.get(normalized_tool_name)
+    if tool is None:
+        raise ValueError(f"Unknown planner tool: {tool_name}")
+    resolved_side_effect_level = side_effect_level or tool.side_effect_level
+    if tool.requires_confirmation and confirmation_policy is None:
+        confirmation_policy = StepPolicy(
+            policy_type="confirmation",
+            mode="explicit_user_confirmation_required",
+            requires_confirmation=True,
+            note=f"{normalized_tool_name} requires confirmation by tool policy",
+        )
+    return PlanStep(
+        step_id=step_id,
+        action_type=action_type,
+        tool_name=normalized_tool_name,
+        tool=tool,
+        input_bindings=input_bindings or [],
+        output_key=output_key,
+        depends_on=depends_on or [],
+        condition=condition or _always_condition(),
+        preconditions=preconditions or [],
+        postconditions=postconditions or [],
+        retry_policy=retry_policy,
+        failure_policy=failure_policy,
+        confirmation_policy=confirmation_policy,
+        side_effect_level=resolved_side_effect_level,  # type: ignore[arg-type]
+        status=status,
+    )
+
+
+def _make_plan(goal: Goal, *, steps: List[PlanStep]) -> ExecutablePlan:
+    step_ids = [step.step_id for step in steps]
+    depended_ids = {dependency for step in steps for dependency in list(step.depends_on or [])}
+    entry_step_ids = [step.step_id for step in steps if not step.depends_on]
+    final_step_ids = [step_id for step_id in step_ids if step_id not in depended_ids]
+    return ExecutablePlan(
+        plan_id=f"{goal.goal_type}:{datetime.utcnow().isoformat(timespec='seconds')}",
+        goal=goal,
+        steps=steps,
+        entry_step_ids=entry_step_ids,
+        final_step_ids=final_step_ids,
+        metadata={
+            "planner_version": "step3-builder-registry-plan",
+            "built_at": datetime.utcnow().isoformat(timespec="seconds"),
+            "goal_type": goal.goal_type,
+            "goal_id": goal.goal_id,
+        },
+    )
+
+
+def build_plan_runtime(state: AgentState, *, goal: Goal, plan: ExecutablePlan, turn_status: str) -> PlanRuntime:
+    return PlanRuntime(
+        state={
+            "intent": state.intent,
+            "message": state.message,
+            "context_keys": sorted(_get_context_mapping(state).keys()),
+            "search_spec": _compact_search_spec(state.search_spec),
+        },
+        goal=goal,
+        plan=plan,
+        outputs={},
+        step_status={step.step_id: step.status for step in list(plan.steps or [])},
+        trace=[],
+        retry_counts={},
+        replan_counts={},
+        pending_confirmation=state.pending_action if isinstance(state.pending_action, Mapping) else None,
+        final_answer=state.answer,
+        turn_status=turn_status,  # type: ignore[arg-type]
+    )
+
+
+class GoalBuilder:
+    """只负责从 state 提取目标，不生成执行步骤。"""
+
+    @classmethod
+    def from_state(cls, state: AgentState) -> Goal:
+        intent = _normalize_intent(state.intent)
+        context = _get_context_mapping(state)
+        message = _normalize_text(state.message) or ""
+        risk_level = "low"
+        if intent in {"preference_action", "reading_list_action"}:
+            risk_level = "high"
+        elif intent in {"paper_summary", "paper_detail", "paper_qa", "recommendation"}:
+            risk_level = "medium"
+
+        constraints = _build_search_constraints(state) if intent == "arxiv_search" else []
+        if intent in {"paper_summary", "paper_detail", "paper_qa"}:
+            constraints = _dedupe_strings([f"target_paper={_get_selected_paper_hint(context)}", "use existing QA index when available"])
+        if intent == "unclear":
+            constraints = ["do not execute business tools before clarification"]
+        if intent == "unsupported":
+            constraints = ["do not invoke unsupported business tools"]
+
+        success_criteria_map = {
+            "arxiv_search": [
+                "Extract a usable search target from the request.",
+                "Return relevant arXiv papers or explain why no suitable results were found.",
+                "Apply personalization when profile or memory context is available.",
+                "Generate a concise response with next actions when helpful.",
+            ],
+            "paper_summary": [
+                "Resolve the requested paper.",
+                "Retrieve relevant paper evidence.",
+                "Produce an answer grounded in retrieved evidence.",
+            ],
+            "paper_detail": [
+                "Resolve the requested paper.",
+                "Retrieve relevant paper evidence.",
+                "Produce an answer grounded in retrieved evidence.",
+            ],
+            "paper_qa": [
+                "Resolve the requested paper.",
+                "Retrieve relevant paper evidence.",
+                "Produce an answer grounded in retrieved evidence.",
+            ],
+            "recommendation": [
+                "Read user profile and candidate paper context.",
+                "Generate relevant recommendations.",
+                "Explain the recommendation rationale.",
+            ],
+            "preference_action": [
+                "Resolve the preference target.",
+                "Persist the preference update.",
+                "Synchronize downstream interest profile.",
+            ],
+            "reading_list_action": [
+                "Resolve the reading-list action.",
+                "Persist the reading-list update.",
+                "Return a clear user-facing outcome.",
+            ],
+            "unclear": [
+                "Identify missing information.",
+                "Ask a focused clarification question.",
+            ],
+            "unsupported": [
+                "Explain why the request is unsupported.",
+                "Return a safe fallback response.",
+            ],
+        }
+        goal_type = "paper_qa" if intent in {"paper_summary", "paper_detail", "paper_qa"} else intent
+        return Goal(
+            goal_id=f"{goal_type}:{datetime.utcnow().isoformat(timespec='seconds')}",
+            goal_type=goal_type,
+            user_request=message,
+            intent=intent,
+            constraints=_dedupe_strings(constraints),
+            success_criteria=_dedupe_strings(success_criteria_map.get(intent, success_criteria_map.get(goal_type, []))),
+            context_refs=_build_context_refs(state),
+            risk_level=risk_level,  # type: ignore[arg-type]
+            # 兼容现有响应读取。
+            user_goal=message,
+            task_scope=goal_type,
+        )
+
+
+class PlanBuilder(Protocol):
+    def can_handle(self, goal: Goal) -> bool:
+        ...
+
+    def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
+        ...
+
+
+class ArxivSearchPlanBuilder:
+    def can_handle(self, goal: Goal) -> bool:
+        return goal.goal_type == "arxiv_search"
+
+    def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
+        steps = [
+            _build_plan_step(
+                step_id="normalize_request",
+                action_type="write_state",
+                tool_name="normalize_request",
+                output_key="normalized_request",
+                tool_registry=tool_registry,
+                input_bindings=[
+                    _binding("intent", source_type="state", source_key="intent"),
+                    _binding("message", source_type="state", source_key="message"),
+                    _binding("search_spec", source_type="search_spec"),
+                ],
+            ),
+            _build_plan_step(
+                step_id="build_arxiv_search_spec",
+                action_type="search",
+                tool_name="build_arxiv_search_spec",
+                output_key="search_spec",
+                tool_registry=tool_registry,
+                input_bindings=[_binding("normalized_request", source_type="step_output", step_id="normalize_request")],
+                depends_on=["normalize_request"],
+            ),
+            _build_plan_step(
+                step_id="search_arxiv",
+                action_type="search",
+                tool_name="search_arxiv",
+                output_key="arxiv_results",
+                tool_registry=tool_registry,
+                input_bindings=[_binding("search_spec", source_type="step_output", step_id="build_arxiv_search_spec")],
+                depends_on=["build_arxiv_search_spec"],
+                retry_policy=StepPolicy(policy_type="retry", mode="allow_search_relaxation", max_attempts=3),
+            ),
+            _build_plan_step(
+                step_id="validate_arxiv_results",
+                action_type="validate",
+                tool_name="validate_arxiv_results",
+                output_key="arxiv_result_quality",
+                tool_registry=tool_registry,
+                input_bindings=[_binding("arxiv_results", source_type="step_output", step_id="search_arxiv")],
+                depends_on=["search_arxiv"],
+            ),
+            _build_plan_step(
+                step_id="personalize_paper_results",
+                action_type="rerank",
+                tool_name="personalize_paper_results",
+                output_key="ranked_papers",
+                tool_registry=tool_registry,
+                input_bindings=[
+                    _binding("arxiv_results", source_type="step_output", step_id="search_arxiv"),
+                    _binding("user_memory_summary", source_type="context", source_key="user_memory_summary", required=False),
+                    _binding("research_profile", source_type="context", source_key="research_profile", required=False),
+                ],
+                depends_on=["search_arxiv"],
+            ),
+            _build_plan_step(
+                step_id="synthesize_arxiv_response",
+                action_type="answer",
+                tool_name="synthesize_arxiv_response",
+                output_key="final_answer",
+                tool_registry=tool_registry,
+                input_bindings=[
+                    _binding("ranked_papers", source_type="step_output", step_id="personalize_paper_results", required=False),
+                    _binding("arxiv_result_quality", source_type="step_output", step_id="validate_arxiv_results"),
+                ],
+                depends_on=["validate_arxiv_results", "personalize_paper_results"],
+            ),
+        ]
+        return _make_plan(goal, steps=steps)
+
+
+class PaperQAPlanBuilder:
+    def can_handle(self, goal: Goal) -> bool:
+        return goal.goal_type == "paper_qa"
+
+    def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
+        steps = [
+            _build_plan_step(step_id="resolve_paper", action_type="retrieve", tool_name="resolve_paper", output_key="paper_ref", tool_registry=tool_registry, input_bindings=[_binding("message", source_type="state", source_key="message"), _binding("selected_paper", source_type="context", source_key="selected_paper", required=False)]),
+            _build_plan_step(step_id="check_paper_index", action_type="validate", tool_name="check_paper_index", output_key="paper_index_status", tool_registry=tool_registry, input_bindings=[_binding("paper_ref", source_type="step_output", step_id="resolve_paper")], depends_on=["resolve_paper"]),
+            _build_plan_step(step_id="retrieve_paper_chunks", action_type="retrieve", tool_name="retrieve_paper_chunks", output_key="retrieved_chunks", tool_registry=tool_registry, input_bindings=[_binding("paper_ref", source_type="step_output", step_id="resolve_paper"), _binding("message", source_type="state", source_key="message")], depends_on=["resolve_paper", "check_paper_index"]),
+            _build_plan_step(step_id="rerank_paper_chunks", action_type="rerank", tool_name="rerank_paper_chunks", output_key="reranked_chunks", tool_registry=tool_registry, input_bindings=[_binding("retrieved_chunks", source_type="step_output", step_id="retrieve_paper_chunks"), _binding("message", source_type="state", source_key="message")], depends_on=["retrieve_paper_chunks"]),
+            _build_plan_step(step_id="validate_qa_evidence", action_type="validate", tool_name="validate_qa_evidence", output_key="evidence_quality", tool_registry=tool_registry, input_bindings=[_binding("reranked_chunks", source_type="step_output", step_id="rerank_paper_chunks")], depends_on=["rerank_paper_chunks"]),
+            _build_plan_step(step_id="generate_paper_answer", action_type="answer", tool_name="generate_paper_answer", output_key="draft_answer", tool_registry=tool_registry, input_bindings=[_binding("reranked_chunks", source_type="step_output", step_id="rerank_paper_chunks"), _binding("message", source_type="state", source_key="message")], depends_on=["rerank_paper_chunks", "validate_qa_evidence"]),
+            _build_plan_step(step_id="verify_answer_grounding", action_type="validate", tool_name="verify_answer_grounding", output_key="final_answer", tool_registry=tool_registry, input_bindings=[_binding("draft_answer", source_type="step_output", step_id="generate_paper_answer"), _binding("reranked_chunks", source_type="step_output", step_id="rerank_paper_chunks")], depends_on=["generate_paper_answer"]),
+        ]
+        return _make_plan(goal, steps=steps)
+
+
+class RecommendationPlanBuilder:
+    def can_handle(self, goal: Goal) -> bool:
+        return goal.goal_type == "recommendation"
+
+    def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
+        steps = [
+            _build_plan_step(step_id="load_user_profile", action_type="retrieve", tool_name="load_user_profile", output_key="recommendation_profile", tool_registry=tool_registry, input_bindings=[_binding("context", source_type="state", source_key="context", required=False)]),
+            _build_plan_step(step_id="load_candidate_papers", action_type="retrieve", tool_name="load_candidate_papers", output_key="candidate_papers", tool_registry=tool_registry, input_bindings=[_binding("recommendation_profile", source_type="step_output", step_id="load_user_profile")], depends_on=["load_user_profile"]),
+            _build_plan_step(step_id="generate_recommendations", action_type="search", tool_name="generate_recommendations", output_key="recommendation_result", tool_registry=tool_registry, input_bindings=[_binding("recommendation_profile", source_type="step_output", step_id="load_user_profile"), _binding("candidate_papers", source_type="step_output", step_id="load_candidate_papers", required=False)], depends_on=["load_user_profile", "load_candidate_papers"]),
+            _build_plan_step(step_id="validate_recommendations", action_type="validate", tool_name="validate_recommendations", output_key="validated_recommendations", tool_registry=tool_registry, input_bindings=[_binding("recommendation_result", source_type="step_output", step_id="generate_recommendations")], depends_on=["generate_recommendations"]),
+            _build_plan_step(step_id="explain_recommendations", action_type="answer", tool_name="explain_recommendations", output_key="final_answer", tool_registry=tool_registry, input_bindings=[_binding("validated_recommendations", source_type="step_output", step_id="validate_recommendations")], depends_on=["validate_recommendations"]),
+        ]
+        return _make_plan(goal, steps=steps)
+
+
+class PreferenceActionPlanBuilder:
+    def can_handle(self, goal: Goal) -> bool:
+        return goal.goal_type == "preference_action"
+
+    def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
+        steps = [
+            _build_plan_step(step_id="resolve_preference_target", action_type="retrieve", tool_name="resolve_preference_target", output_key="paper_reference", tool_registry=tool_registry, input_bindings=[_binding("message", source_type="state", source_key="message")]),
+            _build_plan_step(step_id="update_preference_store", action_type="write_state", tool_name="update_preference_store", output_key="preference_action_result", tool_registry=tool_registry, input_bindings=[_binding("paper_reference", source_type="step_output", step_id="resolve_preference_target"), _binding("message", source_type="state", source_key="message")], depends_on=["resolve_preference_target"], side_effect_level="persistent_write"),
+            _build_plan_step(step_id="update_interest_profile", action_type="write_state", tool_name="update_interest_profile", output_key="interest_profile_update", tool_registry=tool_registry, input_bindings=[_binding("preference_action_result", source_type="step_output", step_id="update_preference_store")], depends_on=["update_preference_store"], side_effect_level="persistent_write"),
+            _build_plan_step(step_id="verify_preference_update", action_type="validate", tool_name="verify_preference_update", output_key="verified_preference_update", tool_registry=tool_registry, input_bindings=[_binding("preference_action_result", source_type="step_output", step_id="update_preference_store")], depends_on=["update_preference_store", "update_interest_profile"]),
+            _build_plan_step(step_id="synthesize_preference_response", action_type="answer", tool_name="synthesize_preference_response", output_key="final_answer", tool_registry=tool_registry, input_bindings=[_binding("verified_preference_update", source_type="step_output", step_id="verify_preference_update")], depends_on=["verify_preference_update"]),
+        ]
+        return _make_plan(goal, steps=steps)
+
+
+class ReadingListPlanBuilder:
+    def can_handle(self, goal: Goal) -> bool:
+        return goal.goal_type == "reading_list_action"
+
+    def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
+        steps = [
+            _build_plan_step(step_id="resolve_reading_list_action", action_type="retrieve", tool_name="resolve_reading_list_action", output_key="reading_list_action", tool_registry=tool_registry, input_bindings=[_binding("message", source_type="state", source_key="message")]),
+            _build_plan_step(step_id="update_reading_list_store", action_type="write_state", tool_name="update_reading_list_store", output_key="reading_list_result", tool_registry=tool_registry, input_bindings=[_binding("reading_list_action", source_type="step_output", step_id="resolve_reading_list_action")], depends_on=["resolve_reading_list_action"], side_effect_level="persistent_write"),
+            _build_plan_step(step_id="verify_reading_list_update", action_type="validate", tool_name="verify_reading_list_update", output_key="verified_reading_list_update", tool_registry=tool_registry, input_bindings=[_binding("reading_list_result", source_type="step_output", step_id="update_reading_list_store")], depends_on=["update_reading_list_store"]),
+            _build_plan_step(step_id="synthesize_reading_list_response", action_type="answer", tool_name="synthesize_reading_list_response", output_key="final_answer", tool_registry=tool_registry, input_bindings=[_binding("verified_reading_list_update", source_type="step_output", step_id="verify_reading_list_update")], depends_on=["verify_reading_list_update"]),
+        ]
+        return _make_plan(goal, steps=steps)
+
+
+class ClarificationPlanBuilder:
+    def can_handle(self, goal: Goal) -> bool:
+        return goal.goal_type == "unclear"
+
+    def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
+        steps = [
+            _build_plan_step(step_id="analyze_ambiguity", action_type="clarify", tool_name="analyze_ambiguity", output_key="missing_information", tool_registry=tool_registry, input_bindings=[_binding("message", source_type="state", source_key="message")]),
+            _build_plan_step(step_id="generate_clarification", action_type="answer", tool_name="generate_clarification", output_key="final_answer", tool_registry=tool_registry, input_bindings=[_binding("missing_information", source_type="step_output", step_id="analyze_ambiguity")], depends_on=["analyze_ambiguity"]),
+        ]
+        return _make_plan(goal, steps=steps)
+
+
+class UnsupportedPlanBuilder:
+    def can_handle(self, goal: Goal) -> bool:
+        return goal.goal_type == "unsupported"
+
+    def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
+        steps = [
+            _build_plan_step(step_id="generate_fallback_response", action_type="answer", tool_name="generate_fallback_response", output_key="final_answer", tool_registry=tool_registry, input_bindings=[_binding("message", source_type="state", source_key="message")]),
+        ]
+        return _make_plan(goal, steps=steps)
+
+
+class PlanBuilderRegistry:
+    """根据 goal_type 分发到对应 PlanBuilder。"""
+
+    def __init__(self) -> None:
+        self._builders: List[PlanBuilder] = []
+
+    def register(self, builder: PlanBuilder) -> None:
+        self._builders.append(builder)
+
+    def get(self, goal_type: str) -> PlanBuilder:
+        normalized_goal_type = _normalize_intent(goal_type)
+        for builder in self._builders:
+            if builder.can_handle(Goal(goal_type=normalized_goal_type)):
+                return builder
+        raise ValueError(f"No plan builder registered for goal_type={goal_type}")
+
+
+PLAN_BUILDER_REGISTRY = PlanBuilderRegistry()
+for builder in [
+    ArxivSearchPlanBuilder(),
+    PaperQAPlanBuilder(),
+    RecommendationPlanBuilder(),
+    PreferenceActionPlanBuilder(),
+    ReadingListPlanBuilder(),
+    ClarificationPlanBuilder(),
+    UnsupportedPlanBuilder(),
+]:
+    PLAN_BUILDER_REGISTRY.register(builder)
+
+
+def build_executable_plan(state: AgentState, tool_registry: ToolRegistry = PLANNER_TOOL_REGISTRY) -> tuple[Goal, ExecutablePlan, Dict[str, Any]]:
+    """统一 planner 入口：GoalBuilder -> PlanBuilderRegistry -> PlanBuilder -> PlanValidator。"""
+    goal = GoalBuilder.from_state(state)
+    builder = PLAN_BUILDER_REGISTRY.get(goal.goal_type or "unsupported")
+    plan = builder.build(goal, state, tool_registry)
+    PlanValidator().validate(plan, tool_registry)
+    debug = {
+        "goal": goal.model_dump(),
+        "plan_builder": builder.__class__.__name__,
+        "execution_plan": plan.model_dump(),
+    }
+    return goal, plan, debug
+
+
+__all__ = [
+    "GoalBuilder",
+    "PlanBuilder",
+    "PlanBuilderRegistry",
+    "PLAN_BUILDER_REGISTRY",
+    "build_executable_plan",
+    "build_plan_runtime",
+]

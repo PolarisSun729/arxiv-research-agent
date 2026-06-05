@@ -418,10 +418,6 @@ def _decide_parse_search_request_intent(
 
     # 完全拿不到可用的 LLM 结果时，直接回落到规则层。
     # 没有 LLM 结果时，整条链路必须完全依赖规则层产出的 fallback 结构。
-    # 没有 LLM 结果时，整条链路必须完全依赖规则层产出的 fallback 结构。
-    # 没有 LLM 结果时，整条链路必须完全依赖规则层产出的 fallback 结构。
-    # 没有 LLM 结果时，整条链路必须完全依赖规则层产出的 fallback 结构。
-    # 没有 LLM 结果时，整条链路必须完全依赖规则层产出的 fallback 结构。
     if llm_result is None:
         fallback = _build_parse_search_request_rule_fallback(
             rule_result=rule_result,
@@ -449,10 +445,6 @@ def _decide_parse_search_request_intent(
         fallback["fallback_reason"] = fallback_reason
         return fallback
 
-    # 搜索 intent 需要比非搜索 intent 更严格的 search_spec 校验与 enrichment。
-    # 搜索 intent 需要比非搜索 intent 更严格的 search_spec 校验与 enrichment。
-    # 搜索 intent 需要比非搜索 intent 更严格的 search_spec 校验与 enrichment。
-    # 搜索 intent 需要比非搜索 intent 更严格的 search_spec 校验与 enrichment。
     # 搜索 intent 需要比非搜索 intent 更严格的 search_spec 校验与 enrichment。
     if llm_intent == "arxiv_search":
         search_spec = llm_result.get("search_spec")
@@ -729,10 +721,6 @@ def parse_search_request(
         fallback_reason=detector_result["fallback_reason"],
         warnings=detector_result["warnings"],
     )
-    # 统一做最终降级和展示字段补齐，避免后续节点拿到半成品决策。
-    # 统一做最终降级和展示字段补齐，避免后续节点拿到半成品决策。
-    # 统一做最终降级和展示字段补齐，避免后续节点拿到半成品决策。
-    # 统一做最终降级和展示字段补齐，避免后续节点拿到半成品决策。
     # 统一做最终降级和展示字段补齐，避免后续节点拿到半成品决策。
     finalized = _finalize_parse_search_request_decision(
         intent=decision["intent"],

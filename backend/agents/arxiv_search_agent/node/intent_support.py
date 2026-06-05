@@ -42,8 +42,54 @@ NON_SEARCH_INTENTS = {
 }
 
 LLM_CONFIDENCE_THRESHOLD = 0.55
-HARD_RULE_PATTERNS: Dict[str, Sequence[str]] = {}
-SEARCH_TRIGGER_PATTERNS: Sequence[str] = ()
+# 这里的 hard rule 只负责“高精度优先”的第一层拦截。
+# 因为 parse_node 会先走 hard rule、再走启发式、最后才 fallback 到 LLM，
+# 所以这些模式必须同时满足“动作/问题词”和“具体论文目标信号”，避免把普通搜索误拉进非搜索链路。
+HARD_RULE_PATTERNS: Dict[str, Sequence[str]] = {
+    "paper_summary": (
+        r"(?:总结|概括|概述|简述|摘要一下|总结一下).{0,12}(?:这篇|本文|该论文|这篇论文|这篇\s*paper)",
+        r"(?:这篇|本文|该论文|这篇论文|这篇\s*paper).{0,18}(?:总结|概括|概述|简述|摘要一下|总结一下)",
+        r"(?:给我|帮我)?(?:这篇|本文|该论文|这篇论文|this paper|the paper).{0,18}(?:summary|summar(?:y|ize)|tl\s*;?\s*dr)",
+        r"(?:summarize|summary|tl\s*;?\s*dr).{0,18}(?:this paper|the paper|paper\s+(?:id|title)|arxiv\s*id|\b\d{4}\.\d{4,5}(?:v\d+)?\b)",
+    ),
+    "paper_detail": (
+        r"(?:讲讲|解释(?:一下)?|介绍(?:一下)?|说说).{0,18}(?:这篇|本文|该论文|这篇论文|this paper|the paper).{0,18}(?:方法|贡献|细节|流程|章节|method|approach|contribution|details?|section)",
+        r"(?:这篇|本文|该论文|这篇论文|this paper|the paper).{0,24}(?:方法|贡献|细节|流程|章节|method|approach|contribution|details?|section).{0,8}(?:是?什么|是什么|有哪些|怎么做|how|what)",
+        r"(?:explain|describe|walk me through).{0,16}(?:the )?(?:method|approach|contribution|details?|section).{0,18}(?:of|for).{0,8}(?:this paper|the paper|\b\d{4}\.\d{4,5}(?:v\d+)?\b|arxiv\s*id)",
+    ),
+    "paper_qa": (
+        r"(?:这篇|本文|该论文|这篇论文|this paper|the paper).{0,28}(?:为什么|为何|怎么|是否|能否|区别|实验设置|数据集|baseline|设计).{0,8}[？?]?",
+        r"(?:为什么|为何|怎么|是否|能否|区别|实验设置|数据集|baseline|设计).{0,20}(?:这篇|本文|该论文|这篇论文|this paper|the paper|\b\d{4}\.\d{4,5}(?:v\d+)?\b|arxiv\s*id)",
+        r"(?:why|how|what|which|does|is).{0,24}(?:this paper|the paper|\b\d{4}\.\d{4,5}(?:v\d+)?\b|arxiv\s*id).{0,28}(?:use|design|different|difference|baseline|dataset|experiment|evaluation)",
+        r"(?:what dataset|what experiments?|why does|how does).{0,24}(?:this paper|the paper|\b\d{4}\.\d{4,5}(?:v\d+)?\b|arxiv\s*id)",
+    ),
+    "preference_action": (
+        r"(?:喜欢|不喜欢|收藏|取消收藏|加入收藏|加入待读|取消喜欢).{0,12}(?:这篇|该论文|这篇论文|第\s*[0-9一二三四五六七八九十两]+\s*篇)",
+        r"(?:第\s*[0-9一二三四五六七八九十两]+\s*篇|这篇|该论文|这篇论文).{0,12}(?:喜欢|不喜欢|收藏|取消收藏|加入收藏|加入待读|取消喜欢)",
+        r"(?:bookmark|save|saved|favorite|favourite|like|dislike|unbookmark|remove from bookmarks).{0,18}(?:this paper|the paper|paper\s*#?\s*\d+|the first paper|the second paper|\bfirst\b|\bsecond\b)",
+        r"(?:this paper|the paper|paper\s*#?\s*\d+|the first paper|the second paper|\bfirst\b|\bsecond\b).{0,18}(?:bookmark|save|favorite|favourite|like|dislike|unbookmark)",
+    ),
+    "reading_list_action": (
+        r"(?:打开|查看|看看|展示|列出).{0,12}(?:我的)?(?:收藏夹|收藏|阅读列表|待读(?:列表)?|已保存论文)",
+        r"(?:我的)?(?:收藏夹|阅读列表|待读(?:列表)?|已保存论文).{0,8}(?:在哪|打开|查看|看看|展示|列出)?",
+        r"(?:show|open|list|view|check).{0,12}(?:my )?(?:bookmarks|favorites|favourites|saved papers|reading list)",
+        r"(?:my )?(?:bookmarks|favorites|favourites|saved papers|reading list)\b",
+    ),
+}
+# 搜索触发词服务于 arXiv 搜索入口，只覆盖“找论文/最新论文/papers about ...”这类搜索语气，
+# 避免把“总结这篇论文”“解释本文方法”等已锁定目标论文的请求重新拉回搜索。
+SEARCH_TRIGGER_PATTERNS: Sequence[str] = (
+    r"(?:帮我|给我)?找.{0,12}(?:论文|paper|papers)",
+    r"(?:搜|搜索|检索|查找|查一下).{0,12}(?:论文|paper|papers)",
+    r".{1,24}相关论文",
+    r"(?:最近|最新).{0,10}(?:论文|paper|papers)",
+    r"arxiv\s*(?:搜索|search)",
+    r"(?:search|find|look\s+for)\s+(?:recent\s+|latest\s+|new\s+)?papers?\b",
+    r"(?:recent|latest)\s+papers?\b",
+    r"new work\b",
+    r"papers?\s+about\b",
+    r"papers?\s+(?:on|related to)\b",
+)
 
 
 def _build_intent_guidance(intent: str) -> Tuple[List[str], List[str], List[str]]:

@@ -26,7 +26,7 @@ except ModuleNotFoundError:  # pragma: no cover
 from ..schemas import ToolCallRequest
 from ..state import AgentState
 from ..utils.result_utils import _extract_exception_detail, _extract_exception_stage
-from ..utils.state_utils import _append_step, _coerce_state
+from ..utils.state_utils import _append_step, _coerce_state, _get_execution_plan_step
 from ..utils.text_utils import _extract_json_object, _matches_any, _normalize_text
 from .tool_node import execute_tool
 
@@ -39,10 +39,10 @@ def _has_ready_qa_index(payload: Mapping[str, Any]) -> bool:
 
 
 def _get_plan_step_id(state: AgentState, step_type: str) -> Optional[str]:
-    for step in list(state.execution_plan or []):
-        if str(getattr(step, "step_type", "") or "").strip() == step_type:
-            step_id = str(getattr(step, "step_id", "") or "").strip()
-            return step_id or None
+    step = _get_execution_plan_step(state, step_type=step_type)
+    if step is not None:
+        step_id = str(getattr(step, "step_id", "") or "").strip()
+        return step_id or None
     return None
 
 

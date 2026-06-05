@@ -373,16 +373,127 @@ class Goal(BaseModel):
     """
     model_config = ConfigDict(extra="forbid")
 
+    goal_id: Optional[str] = None
     goal_type: Optional[str] = None
-    user_goal: Optional[str] = None
-    task_scope: Optional[str] = None
+    user_request: Optional[str] = None
+    intent: Optional[str] = None
     constraints: List[str] = Field(default_factory=list)
     success_criteria: List[str] = Field(default_factory=list)
-    requires_memory: bool = False
-    requires_user_confirmation: bool = False
+    context_refs: List[str] = Field(default_factory=list)
+    risk_level: Literal["low", "medium", "high"] = "low"
+    # 兼容旧响应读取路径，后续新逻辑不再依赖这些字段。
+    user_goal: Optional[str] = None
+    task_scope: Optional[str] = None
 
 
 class ExecutionPlanStep(BaseModel):
+    """兼容旧版节点流使用的轻量计划步骤。
+
+    新执行器使用 PlanStep/ExecutablePlan 承载工具契约；旧 LangGraph 节点和历史测试仍会
+    构造只包含 step_type/description 的步骤，因此这里保留窄模型避免破坏旧入口。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: str
+    step_type: str
+    description: str
+    expected_input: Dict[str, Any] = Field(default_factory=dict)
+    expected_output: Dict[str, Any] = Field(default_factory=dict)
+    status: Literal["pending", "in_progress", "completed", "success", "failed", "skipped", "waiting_confirmation"] = "pending"
+    depends_on: List[str] = Field(default_factory=list)
+
+
+PlanStepStatus = Literal["pending", "running", "success", "failed", "skipped", "waiting_confirmation"]
+AgentTurnStatus = Literal["success", "waiting_confirmation", "need_clarification", "failed", "fallback"]
+SideEffectLevel = Literal["none", "low", "high"]
+
+
+class ToolSpec(BaseModel):
+    """定义计划步骤要调用的真实工具及其静态约束。"""
+    model_config = ConfigDict(extra="forbid")
+
+    tool_name: str
+    capability_tags: List[str] = Field(default_factory=list)
+    input_schema: Dict[str, Any] = Field(default_factory=dict)
+    output_schema: Dict[str, Any] = Field(default_factory=dict)
+    side_effect_level: Literal["none", "session_write", "persistent_write", "external_call"] = "none"
+    requires_confirmation: bool = False
+    can_retry: bool = False
+    failure_modes: List[str] = Field(default_factory=list)
+    implementation: Optional[str] = None
+
+
+class StepInputBinding(BaseModel):
+    """声明步骤输入的绑定来源，避免执行期再猜每个参数从哪里取。"""
+    model_config = ConfigDict(extra="forbid")
+
+    input_key: str
+    source_type: Literal["state", "context", "goal", "search_spec", "step_output", "literal"]
+    source_key: Optional[str] = None
+    step_id: Optional[str] = None
+    required: bool = True
+    value: Any = None
+
+
+class StepCondition(BaseModel):
+    """定义步骤是否应该执行的结构化条件。"""
+    model_config = ConfigDict(extra="forbid")
+
+    condition_type: Literal["always", "field_exists", "field_equals", "step_output_exists", "step_status_is"]
+    field_path: Optional[str] = None
+    expected_value: Any = None
+    step_id: Optional[str] = None
+    negate: bool = False
+
+
+class StepPolicy(BaseModel):
+    """统一表达重试、失败兜底和用户确认策略。"""
+    model_config = ConfigDict(extra="forbid")
+
+    policy_type: Literal["retry", "failure", "confirmation"]
+    mode: str
+    max_attempts: int = 0
+    fallback_step_id: Optional[str] = None
+    requires_confirmation: bool = False
+    note: Optional[str] = None
+
+
+class StepResult(BaseModel):
+    """记录单个计划步骤的结构化执行结果。"""
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: str
+    status: PlanStepStatus
+    output_key: Optional[str] = None
+    output: Any = None
+    error: Optional[str] = None
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _normalize_status(cls, value: Any) -> Any:
+        normalized = str(value or "").strip().lower()
+        alias_map = {"in_progress": "running", "completed": "success"}
+        return alias_map.get(normalized, normalized or "pending")
+
+
+class ExecutionTrace(BaseModel):
+    """保存计划执行轨迹，后续执行器和调试视图都消费这里。"""
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: str
+    event: str
+    status: Optional[PlanStepStatus] = None
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _normalize_status(cls, value: Any) -> Any:
+        if value in (None, ""):
+            return None
+        return StepResult._normalize_status(value)
+
+
+class PlanStep(BaseModel):
     """定义执行计划中的单个步骤。
 
     execution_plan 在阶段 1 先不直接驱动工具执行，而是表达：
@@ -394,12 +505,134 @@ class ExecutionPlanStep(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     step_id: str
-    step_type: str
-    description: str
-    expected_input: Dict[str, Any] = Field(default_factory=dict)
-    expected_output: Dict[str, Any] = Field(default_factory=dict)
-    status: Literal["pending", "in_progress", "completed", "failed", "skipped"] = "pending"
+    action_type: str
+    tool_name: str
+    tool: "ToolSpec"
+    input_bindings: List["StepInputBinding"] = Field(default_factory=list)
+    output_key: Optional[str] = None
     depends_on: List[str] = Field(default_factory=list)
+    condition: Optional["StepCondition"] = None
+    preconditions: List["StepCondition"] = Field(default_factory=list)
+    postconditions: List["StepCondition"] = Field(default_factory=list)
+    retry_policy: Optional["StepPolicy"] = None
+    failure_policy: Optional["StepPolicy"] = None
+    confirmation_policy: Optional["StepPolicy"] = None
+    side_effect_level: Literal["none", "session_write", "persistent_write", "external_call"] = "none"
+    status: Literal["pending", "running", "success", "failed", "skipped", "waiting_confirmation"] = "pending"
+
+    @field_validator("tool", mode="before")
+    @classmethod
+    def _coerce_tool_spec(cls, value: Any) -> Any:
+        # 测试和轻量运行时可能用不同模块名加载同一份 schema，先转成 dict 避免类身份不一致。
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            return model_dump()
+        return value
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _normalize_status(cls, value: Any) -> Any:
+        return StepResult._normalize_status(value)
+
+    @property
+    def step_type(self) -> str:
+        """兼容旧调用方按 step_type 读取动作类型。"""
+        return self.action_type
+
+
+class ExecutablePlan(BaseModel):
+    """承载完整计划拓扑，供规划器、执行器和调试链共享。"""
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: str
+    goal: Goal
+    steps: List[PlanStep] = Field(default_factory=list)
+    entry_step_ids: List[str] = Field(default_factory=list)
+    final_step_ids: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    def __iter__(self):
+        return iter(self.steps or [])
+
+    def __len__(self) -> int:
+        return len(self.steps or [])
+
+    def __getitem__(self, index: int) -> PlanStep:
+        return list(self.steps or [])[index]
+
+
+class PlanRuntime(BaseModel):
+    """保存计划执行过程中的运行态，而不是把状态混进计划定义。"""
+    model_config = ConfigDict(extra="forbid")
+
+    state: Dict[str, Any] = Field(default_factory=dict)
+    goal: Optional[Goal] = None
+    plan: Optional[ExecutablePlan] = None
+    outputs: Dict[str, Any] = Field(default_factory=dict)
+    step_status: Dict[str, PlanStepStatus] = Field(default_factory=dict)
+    trace: List[ExecutionTrace] = Field(default_factory=list)
+    retry_counts: Dict[str, int] = Field(default_factory=dict)
+    replan_counts: Dict[str, int] = Field(default_factory=dict)
+    step_replan_counts: Dict[str, int] = Field(default_factory=dict)
+    pending_confirmation: Optional[Dict[str, Any]] = None
+    final_answer: Optional[str] = None
+    error: Optional[str] = None
+    turn_status: Optional[AgentTurnStatus] = None
+
+
+class AgentTurnResult(BaseModel):
+    """统一承载单轮计划执行结果，避免执行器把结果散落在多个临时结构中。"""
+    model_config = ConfigDict(extra="forbid")
+
+    status: AgentTurnStatus
+    final_answer: Optional[str] = None
+    plan: Optional[ExecutablePlan] = None
+    outputs: Dict[str, Any] = Field(default_factory=dict)
+    trace: List[ExecutionTrace] = Field(default_factory=list)
+    pending_confirmation: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    runtime: Optional[PlanRuntime] = None
+
+    @field_validator("plan", "runtime", mode="before")
+    @classmethod
+    def _coerce_runtime_models(cls, value: Any) -> Any:
+        # 混合测试会重复导入 schema；这里仅把同形 Pydantic 对象转回原始 dict 重新校验。
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            return model_dump()
+        return value
+
+    @field_validator("trace", mode="before")
+    @classmethod
+    def _coerce_trace_models(cls, value: Any) -> Any:
+        # replan 模块可能来自另一份 schema 导入；trace 逐项转 dict 后再按当前模型校验。
+        if isinstance(value, list):
+            normalized = []
+            for item in value:
+                model_dump = getattr(item, "model_dump", None)
+                normalized.append(model_dump() if callable(model_dump) else item)
+            return normalized
+        return value
+
+
+class ObservationResult(BaseModel):
+    """统一承载 Observer 对单步结果质量的判断，避免把质量语义混进工具异常分支。"""
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal[
+        "success",
+        "partial_success",
+        "empty_result",
+        "low_confidence",
+        "invalid_output",
+        "tool_error",
+        "need_confirmation",
+        "need_clarification",
+    ]
+    reason: Optional[str] = None
+    confidence: float = 1.0
+    details: Dict[str, Any] = Field(default_factory=dict)
+    suggested_action: Optional[str] = None
 
 
 class AgentStreamEvent(BaseModel):
@@ -464,7 +697,8 @@ class ArxivSearchResponse(BaseModel):
     answer: str
     search_spec: Optional[ArxivSearchSpec] = None
     goal: Optional[Goal] = None
-    execution_plan: List[ExecutionPlanStep] = Field(default_factory=list)
+    execution_plan: Optional[ExecutablePlan] = None
+    plan_runtime: Optional[PlanRuntime] = None
     pending_action: Optional[Dict[str, Any]] = None
     paper_qa_result: Optional[Dict[str, Any]] = None
     preference_action_result: Optional[Dict[str, Any]] = None

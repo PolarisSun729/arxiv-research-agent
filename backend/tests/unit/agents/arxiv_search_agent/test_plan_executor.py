@@ -1,0 +1,365 @@
+from __future__ import annotations
+
+import importlib
+
+from tests.helpers.agent_runtime import load_agent_test_modules
+
+
+_MODULES = load_agent_test_modules()
+schemas = _MODULES["schemas"]
+state_module = _MODULES["state_module"]
+
+planner_module = importlib.import_module("backend.agents.arxiv_search_agent.planner")
+executor_module = importlib.import_module("backend.agents.arxiv_search_agent.plan_executor")
+planner_registry_module = importlib.import_module("backend.agents.arxiv_search_agent.tool_registry")
+
+AgentState = state_module.AgentState
+ArxivSearchSpec = schemas.ArxivSearchSpec
+ExecutablePlan = schemas.ExecutablePlan
+Goal = schemas.Goal
+PlanStep = schemas.PlanStep
+StepCondition = schemas.StepCondition
+StepInputBinding = schemas.StepInputBinding
+StepPolicy = schemas.StepPolicy
+PlanExecutor = executor_module.PlanExecutor
+PLANNER_TOOL_REGISTRY = planner_registry_module.PLANNER_TOOL_REGISTRY
+
+
+def _tool(tool_name: str):
+    tool = PLANNER_TOOL_REGISTRY.get(tool_name)
+    assert tool is not None
+    return tool
+
+
+def test_plan_executor_executes_linear_arxiv_plan(monkeypatch) -> None:
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        assert tool_name == "search_arxiv_structured"
+        assert kwargs["query"] == "rag"
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": "searched",
+            "data": {
+                "papers": [
+                    {"arxiv_id": "2401.00001", "title": "RAG Foundations"},
+                    {"arxiv_id": "2401.00002", "title": "RAG Systems"},
+                ]
+            },
+            "trace": {"tool_name": tool_name},
+            "error": None,
+        }
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    state = AgentState(
+        intent="arxiv_search",
+        message="rag",
+        search_spec=ArxivSearchSpec(intent="arxiv_search", query="rag", max_results=5),
+        context={"user_memory_summary": {"likes": ["retrieval"]}},
+    )
+
+    goal, plan, _ = planner_module.build_executable_plan(state)
+    result = PlanExecutor().execute(plan, state)
+
+    assert goal.goal_type == "arxiv_search"
+    assert result.status == "success"
+    assert "normalized_request" in result.outputs
+    assert "search_spec" in result.outputs
+    assert "arxiv_results" in result.outputs
+    assert result.final_answer
+    assert result.plan is not None
+    assert [step.status for step in result.plan.steps] == ["success"] * 6
+    assert any(trace.event == "step_succeeded" and trace.step_id == "search_arxiv" for trace in result.trace)
+
+
+def test_plan_executor_skips_false_condition_and_continues_dag() -> None:
+    goal = Goal(goal_id="unsupported:test", goal_type="unsupported", user_request="fallback")
+    plan = ExecutablePlan(
+        plan_id="unsupported:test",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="normalize_request",
+                action_type="write_state",
+                tool_name="normalize_request",
+                tool=_tool("normalize_request"),
+                output_key="normalized_request",
+                input_bindings=[StepInputBinding(input_key="message", source_type="state", source_key="message")],
+            ),
+            PlanStep(
+                step_id="optional_clarify",
+                action_type="clarify",
+                tool_name="analyze_ambiguity",
+                tool=_tool("analyze_ambiguity"),
+                output_key="missing_information",
+                depends_on=["normalize_request"],
+                input_bindings=[StepInputBinding(input_key="message", source_type="state", source_key="message")],
+                condition=StepCondition(condition_type="field_equals", field_path="state.intent", expected_value="unclear"),
+            ),
+            PlanStep(
+                step_id="generate_fallback_response",
+                action_type="answer",
+                tool_name="generate_fallback_response",
+                tool=_tool("generate_fallback_response"),
+                output_key="final_answer",
+                depends_on=["normalize_request", "optional_clarify"],
+                input_bindings=[StepInputBinding(input_key="message", source_type="state", source_key="message")],
+            ),
+        ],
+        entry_step_ids=["normalize_request"],
+        final_step_ids=["generate_fallback_response"],
+    )
+
+    state = AgentState(intent="unsupported", message="do something else")
+    result = PlanExecutor().execute(plan, state)
+
+    assert result.status == "fallback"
+    assert result.plan is not None
+    status_map = {step.step_id: step.status for step in result.plan.steps}
+    assert status_map["normalize_request"] == "success"
+    assert status_map["optional_clarify"] == "skipped"
+    assert status_map["generate_fallback_response"] == "success"
+
+
+def test_plan_executor_returns_waiting_confirmation_before_side_effect(monkeypatch) -> None:
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("parse_and_index_paper should not run before confirmation")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fail_if_called)
+
+    goal = Goal(goal_id="paper_qa:test", goal_type="paper_qa", user_request="index paper")
+    plan = ExecutablePlan(
+        plan_id="paper_qa:test",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="parse_and_index_paper",
+                action_type="index",
+                tool_name="parse_and_index_paper",
+                tool=_tool("parse_and_index_paper"),
+                output_key="index_build_result",
+                input_bindings=[StepInputBinding(input_key="paper_reference", source_type="literal", value={"arxiv_id": "2401.00001"})],
+                confirmation_policy=StepPolicy(
+                    policy_type="confirmation",
+                    mode="explicit_user_confirmation_required",
+                    requires_confirmation=True,
+                ),
+                side_effect_level="external_call",
+            ),
+        ],
+        entry_step_ids=["parse_and_index_paper"],
+        final_step_ids=["parse_and_index_paper"],
+    )
+
+    result = PlanExecutor().execute(plan, AgentState(intent="paper_qa", message="build index"))
+
+    assert result.status == "waiting_confirmation"
+    assert result.pending_confirmation is not None
+    assert result.pending_confirmation["step_id"] == "parse_and_index_paper"
+    assert result.plan is not None
+    assert result.plan.steps[0].status == "waiting_confirmation"
+
+
+def test_plan_executor_marks_missing_input_as_failed() -> None:
+    goal = Goal(goal_id="unsupported:missing", goal_type="unsupported", user_request="missing input")
+    plan = ExecutablePlan(
+        plan_id="unsupported:missing",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="generate_fallback_response",
+                action_type="answer",
+                tool_name="generate_fallback_response",
+                tool=_tool("generate_fallback_response"),
+                output_key="final_answer",
+                input_bindings=[StepInputBinding(input_key="message", source_type="state", source_key="missing_field")],
+            ),
+        ],
+        entry_step_ids=["generate_fallback_response"],
+        final_step_ids=["generate_fallback_response"],
+    )
+
+    result = PlanExecutor().execute(plan, AgentState(intent="unsupported", message="ignored"))
+
+    assert result.status == "failed"
+    assert result.error == "missing_input:generate_fallback_response:message"
+    assert result.plan is not None
+    assert result.plan.steps[0].status == "failed"
+    assert any(trace.detail.get("failure_reason") == "missing_input" for trace in result.trace)
+
+
+def test_plan_executor_replans_empty_arxiv_search_before_fallback(monkeypatch) -> None:
+    calls = {"search": 0}
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        assert tool_name == "search_arxiv_structured"
+        calls["search"] += 1
+        papers = [] if calls["search"] == 1 else [{"arxiv_id": "2401.00001", "title": "RAG retrieval systems"}]
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": "searched",
+            "data": {"papers": papers},
+            "trace": {"tool_name": tool_name, "query": kwargs.get("query")},
+            "error": None,
+        }
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    state = AgentState(
+        intent="arxiv_search",
+        message="rag",
+        search_spec=ArxivSearchSpec(intent="arxiv_search", query="rag", max_results=5),
+    )
+    _, plan, _ = planner_module.build_executable_plan(state)
+    result = PlanExecutor().execute(plan, state)
+
+    assert result.status == "success"
+    assert calls["search"] == 2
+    assert result.runtime is not None
+    assert result.runtime.replan_counts["search_arxiv:empty_result"] == 1
+    assert any(trace.event == "plan_replanned" and trace.detail.get("rule_name") == "rule_arxiv_empty_result" for trace in result.trace)
+    assert any(step.tool_name == "rewrite_arxiv_query" for step in result.plan.steps)
+    assert any(trace.event == "step_succeeded" and trace.step_id == "rewrite_arxiv_query" for trace in result.trace)
+
+
+def test_plan_executor_replans_missing_paper_index_to_confirmation(monkeypatch) -> None:
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        if tool_name == "check_paper_qa_index":
+            return {
+                "ok": True,
+                "tool_name": tool_name,
+                "summary": "missing",
+                "data": {"status": "missing", "has_index": False},
+                "trace": {"tool_name": tool_name},
+                "error": None,
+            }
+        raise AssertionError(f"{tool_name} should not run before user confirmation")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    state = AgentState(intent="paper_qa", message="what is the method?", context={"selected_paper": {"arxiv_id": "2401.00001", "title": "RAG"}})
+    _, plan, _ = planner_module.build_executable_plan(state)
+    result = PlanExecutor().execute(plan, state)
+
+    assert result.status == "waiting_confirmation"
+    assert result.pending_confirmation is not None
+    assert result.pending_confirmation["tool_name"] == "request_confirmation"
+    assert any(step.tool_name == "parse_and_index_paper" for step in result.plan.steps)
+    assert any(trace.event == "plan_replanned" and trace.detail.get("rule_name") == "rule_missing_paper_index" for trace in result.trace)
+
+
+def test_plan_executor_replans_grounding_failure_with_stricter_answer(monkeypatch) -> None:
+    answer_calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        if tool_name == "answer_paper_question":
+            answer_calls.append(dict(kwargs))
+            if len(answer_calls) == 1:
+                return {
+                    "ok": True,
+                    "tool_name": tool_name,
+                    "summary": "answered",
+                    "data": {"answer": "draft without source", "sources": []},
+                    "trace": {"tool_name": tool_name},
+                    "error": None,
+                }
+            return {
+                "ok": True,
+                "tool_name": tool_name,
+                "summary": "answered strictly",
+                "data": {"answer": "grounded answer", "sources": [{"chunk_id": "c1"}]},
+                "trace": {"tool_name": tool_name},
+                "error": None,
+            }
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    goal = Goal(goal_id="paper_qa:grounding", goal_type="paper_qa", user_request="answer")
+    plan = ExecutablePlan(
+        plan_id="paper_qa:grounding",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="resolve_paper",
+                action_type="retrieve",
+                tool_name="resolve_paper",
+                tool=_tool("resolve_paper"),
+                output_key="paper_ref",
+                input_bindings=[StepInputBinding(input_key="message", source_type="state", source_key="message")],
+            ),
+            PlanStep(
+                step_id="rerank_paper_chunks",
+                action_type="rerank",
+                tool_name="rerank_paper_chunks",
+                tool=_tool("rerank_paper_chunks"),
+                output_key="reranked_chunks",
+                input_bindings=[StepInputBinding(input_key="retrieved_chunks", source_type="literal", value=[{"chunk_id": "c1", "text": "method", "score": 1.0}])],
+            ),
+            PlanStep(
+                step_id="generate_paper_answer",
+                action_type="answer",
+                tool_name="generate_paper_answer",
+                tool=_tool("generate_paper_answer"),
+                output_key="draft_answer",
+                depends_on=["resolve_paper", "rerank_paper_chunks"],
+                input_bindings=[
+                    StepInputBinding(input_key="reranked_chunks", source_type="step_output", step_id="rerank_paper_chunks"),
+                    StepInputBinding(input_key="message", source_type="state", source_key="message"),
+                ],
+            ),
+            PlanStep(
+                step_id="verify_answer_grounding",
+                action_type="validate",
+                tool_name="verify_answer_grounding",
+                tool=_tool("verify_answer_grounding"),
+                output_key="final_answer",
+                depends_on=["generate_paper_answer"],
+                input_bindings=[
+                    StepInputBinding(input_key="draft_answer", source_type="step_output", step_id="generate_paper_answer"),
+                    StepInputBinding(input_key="reranked_chunks", source_type="step_output", step_id="rerank_paper_chunks"),
+                ],
+            ),
+        ],
+        entry_step_ids=["resolve_paper", "rerank_paper_chunks"],
+        final_step_ids=["verify_answer_grounding"],
+    )
+
+    state = AgentState(intent="paper_qa", message="what is the method?", context={"selected_paper": {"arxiv_id": "2401.00001"}})
+    result = PlanExecutor().execute(plan, state)
+
+    assert result.status == "success"
+    assert result.final_answer == "grounded answer"
+    assert answer_calls[0]["stricter_grounding"] is False
+    assert answer_calls[1]["stricter_grounding"] is True
+    assert result.runtime is not None
+    assert result.runtime.replan_counts["verify_answer_grounding:low_confidence"] == 1
+
+
+def test_plan_executor_replans_empty_profile_to_message_recommendation(monkeypatch) -> None:
+    recommend_calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        assert tool_name == "recommend_papers"
+        recommend_calls.append(dict(kwargs))
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": "recommended",
+            "data": {"recommendations": [{"arxiv_id": "2401.00001", "title": "RAG recommendations"}]},
+            "trace": {"tool_name": tool_name},
+            "error": None,
+        }
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    state = AgentState(intent="recommendation", message="recommend rag papers", context={})
+    _, plan, _ = planner_module.build_executable_plan(state)
+    result = PlanExecutor().execute(plan, state)
+
+    assert result.status == "success"
+    assert recommend_calls
+    assert recommend_calls[0]["message"] == "recommend rag papers"
+    assert result.runtime is not None
+    assert result.runtime.replan_counts["load_user_profile:empty_result"] == 1

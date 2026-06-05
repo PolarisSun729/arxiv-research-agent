@@ -27,10 +27,35 @@ def _load_search_node_module():
         module.__path__ = [str(package_path)]
         sys.modules[package_name] = module
 
-    if "dependencies" not in sys.modules:
-        dependencies_module = types.ModuleType("dependencies")
-        dependencies_module.get_recommendation_service = lambda: object()
-        sys.modules["dependencies"] = dependencies_module
+    dependencies_module = sys.modules.get("dependencies", types.ModuleType("dependencies"))
+    dependencies_module.get_database_service = getattr(dependencies_module, "get_database_service", lambda: object())
+    dependencies_module.get_oai_database_service = getattr(
+        dependencies_module,
+        "get_oai_database_service",
+        lambda: object(),
+    )
+    dependencies_module.get_embedding_service = getattr(dependencies_module, "get_embedding_service", lambda: object())
+    dependencies_module.get_vector_store_service = getattr(
+        dependencies_module,
+        "get_vector_store_service",
+        lambda: object(),
+    )
+    dependencies_module.get_current_embedding_config = getattr(
+        dependencies_module,
+        "get_current_embedding_config",
+        lambda: object(),
+    )
+    dependencies_module.get_enhanced_retrieval_service = getattr(
+        dependencies_module,
+        "get_enhanced_retrieval_service",
+        lambda: object(),
+    )
+    dependencies_module.get_index_job_manager = getattr(dependencies_module, "get_index_job_manager", lambda: object())
+    dependencies_module.get_memory_service = getattr(dependencies_module, "get_memory_service", lambda: object())
+    dependencies_module.get_generation_service = getattr(dependencies_module, "get_generation_service", lambda: object())
+    dependencies_module.get_paper_qa_service = getattr(dependencies_module, "get_paper_qa_service", lambda: object())
+    dependencies_module.get_recommendation_service = lambda: object()
+    sys.modules["dependencies"] = dependencies_module
 
     if "tools.tool_registry" not in sys.modules:
         tool_registry_module = types.ModuleType("tools.tool_registry")

@@ -61,6 +61,7 @@ def build_paper_qa_index(arxiv_id: str, loading_method: str = "docling") -> Dict
 def answer_paper_question(
     arxiv_id: str,
     question: str,
+    stricter_grounding: Optional[bool] = None,
     top_k: Optional[int] = None,
     enable_query_rewrite: Optional[bool] = None,
     enable_hyde: Optional[bool] = None,
@@ -72,6 +73,7 @@ def answer_paper_question(
     trace_inputs = {
         "arxiv_id": arxiv_id,
         "question": question,
+        "stricter_grounding": stricter_grounding,
         "top_k": top_k,
         "enable_query_rewrite": enable_query_rewrite,
         "enable_hyde": enable_hyde,
@@ -81,6 +83,8 @@ def answer_paper_question(
     }
     payload = {
         "question": question,
+        # Observer 发现 grounding 不足后会打开该开关，提示下游生成阶段收紧证据引用要求。
+        "stricter_grounding": stricter_grounding,
         "top_k": top_k,
         "enable_query_rewrite": enable_query_rewrite,
         "enable_hyde": enable_hyde,

@@ -28,9 +28,11 @@ from .node import (
 )
 from .graph import build_arxiv_search_graph, route_after_parse
 from .graph import export_arxiv_search_graph_mermaid
+from .plan_executor import PlanExecutor, execute_executable_plan, run_agent_turn
 from .schemas import (
     AgentStep,
     AgentStreamEvent,
+    AgentTurnResult,
     AgentToolCall,
     ArxivSearchGraphResponse,
     ArxivSearchRequest,
@@ -49,6 +51,7 @@ __all__ = [
     "AgentState",
     "AgentStep",
     "AgentStreamEvent",
+    "AgentTurnResult",
     "AgentToolCall",
     "ArxivSearchGraphResponse",
     "ArxivSearchRequest",
@@ -56,6 +59,7 @@ __all__ = [
     "ArxivSearchSpec",
     "SEARCH_TOOL_NAME",
     "build_arxiv_search_graph",
+    "PlanExecutor",
     "apply_preference_action",
     "build_search_tool_args",
     "check_search_result",
@@ -69,6 +73,8 @@ __all__ = [
     "export_arxiv_search_graph_mermaid",
     "route_after_parse",
     "run_arxiv_search_agent",
+    "run_agent_turn",
     "stream_arxiv_search_agent",
     "synthesize_response",
+    "execute_executable_plan",
 ]

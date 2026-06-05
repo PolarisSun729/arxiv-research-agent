@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Mapping, Optional, Union
 from ..schemas import ToolCallRequest
 from ..state import AgentState
 from ..utils.result_utils import _extract_error_message, _extract_papers_from_tool_result, _result_mapping, _result_ok, _result_text
-from ..utils.state_utils import _append_step, _coerce_state
+from ..utils.state_utils import _append_step, _coerce_state, _get_execution_plan_step
 from ..utils.text_utils import _normalize_text
 from .tool_node import execute_tool
 
@@ -13,11 +13,11 @@ RECOMMENDATION_TOOL_NAME = "recommend_papers"
 
 
 def _get_recommendation_execution_plan_step_id(state: AgentState) -> Optional[str]:
-    for step in list(state.execution_plan or []):
-        if str(getattr(step, "step_type", "") or "").strip() == "recommendation_generation":
-            step_id = str(getattr(step, "step_id", "") or "").strip()
-            return step_id or None
-    return None
+    step = _get_execution_plan_step(state, step_type="recommendation_generation")
+    if step is None:
+        return None
+    step_id = str(getattr(step, "step_id", "") or "").strip()
+    return step_id or None
 
 
 def _coerce_positive_int(value: Any, default: int) -> int:

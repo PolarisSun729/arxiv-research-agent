@@ -2,7 +2,7 @@
 
 这个模块的职责很克制：
 1. 读取当前 execution_plan 中“下一可执行步骤”；
-2. 根据 step_type + intent + state 中的可靠字段生成标准 ToolCallRequest；
+2. 根据 action_type + intent + state 中的可靠字段生成标准 ToolCallRequest；
 3. 不直接执行工具，也不决定复杂重试策略；
 4. 对暂不支持的步骤安全返回空映射结果。
 
@@ -18,7 +18,7 @@ from ..schemas import ToolCallRequest
 from ..state import AgentState
 from ..utils.state_utils import _coerce_state, _compact_search_spec, _get_next_executable_plan_step
 
-SEARCH_TOOL_NAME = "search_arxiv_structured"
+SEARCH_TOOL_NAME = "search_arxiv"
 
 
 def _build_search_execution_request(state: AgentState, *, step_id: str) -> Optional[ToolCallRequest]:
@@ -41,7 +41,7 @@ def _build_search_execution_request(state: AgentState, *, step_id: str) -> Optio
         "category_operator": spec.category_operator or "OR",
     }
     return ToolCallRequest(
-        tool_name=SEARCH_TOOL_NAME,
+        tool_name="search_arxiv_structured",
         arguments=arguments,
         reason="根据当前计划步骤执行 arXiv 结构化搜索",
         expected_result="返回与当前搜索主题相关的 arXiv 论文候选列表",
@@ -69,10 +69,10 @@ def build_tool_call_request_from_plan_step(
         }
 
     step_id = str(getattr(next_plan_step, "step_id", "") or "").strip()
-    step_type = str(getattr(next_plan_step, "step_type", "") or "").strip()
+    action_type = str(getattr(next_plan_step, "action_type", "") or "").strip()
     intent = str(current_state.intent or "").strip()
 
-    if step_type == "search_execution" and intent == "arxiv_search":
+    if action_type == "search" and str(getattr(next_plan_step, "tool_name", "") or "").strip() == SEARCH_TOOL_NAME and intent == "arxiv_search":
         request = _build_search_execution_request(current_state, step_id=step_id)
         if request is None:
             return None, {
@@ -80,14 +80,14 @@ def build_tool_call_request_from_plan_step(
                 "reason": "missing_search_spec",
                 "intent": intent,
                 "step_id": step_id,
-                "step_type": step_type,
+                "action_type": action_type,
                 "search_spec": _compact_search_spec(current_state.search_spec),
             }
         return request, {
             "status": "mapped",
             "intent": intent,
             "step_id": step_id,
-            "step_type": step_type,
+            "action_type": action_type,
             "tool_name": request.tool_name,
             "search_spec": _compact_search_spec(current_state.search_spec),
         }
@@ -97,7 +97,7 @@ def build_tool_call_request_from_plan_step(
         "reason": "unsupported_plan_step_mapping",
         "intent": intent,
         "step_id": step_id,
-        "step_type": step_type,
+        "action_type": action_type,
     }
 
 

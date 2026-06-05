@@ -26,6 +26,8 @@ load_agent_test_modules = _load_agent_runtime_helper().load_agent_test_modules
 _MODULES = load_agent_test_modules()
 AgentState = _MODULES["state_module"].AgentState
 ArxivSearchSpec = _MODULES["schemas"].ArxivSearchSpec
+AgentTurnResult = _MODULES["schemas"].AgentTurnResult
+ExecutionTrace = _MODULES["schemas"].ExecutionTrace
 build_arxiv_search_graph = _MODULES["graph_module"].build_arxiv_search_graph
 graph_module = _MODULES["graph_module"]
 tool_node_module = sys.modules["backend.agents.arxiv_search_agent.node.tool_node"]
@@ -40,14 +42,8 @@ def _coerce_state(state):
     return AgentState.model_validate(state)
 
 
-def _pass_through_rank(state):
-    current = _coerce_state(state).model_copy(deep=True)
-    current.personalized_rerank_applied = True
-    return current
-
-
 class AgentRegressionStep6Tests(unittest.TestCase):
-    def test_arxiv_search_still_works_with_tool_protocol(self) -> None:
+    def test_arxiv_search_still_works_with_new_turn_runtime(self) -> None:
         def parse(state, generation_service=None):
             del generation_service
             current = _coerce_state(state).model_copy(deep=True)
@@ -55,36 +51,44 @@ class AgentRegressionStep6Tests(unittest.TestCase):
             current.search_spec = ArxivSearchSpec(intent="arxiv_search", query="RAG agent", max_results=5)
             return current
 
-        def plan(state):
-            return _coerce_state(state).model_copy(deep=True)
-
-        with mock.patch.object(graph_module, "parse_search_request", side_effect=parse), mock.patch.object(
-            graph_module, "plan_task", side_effect=plan
-        ), mock.patch.object(graph_module, "personalized_rank_and_annotate_papers", side_effect=_pass_through_rank), mock.patch.object(
-            tool_node_module,
-            "invoke_tool",
-            return_value={
-                "ok": True,
-                "tool_name": "search_arxiv_structured",
-                "summary": "found 2 papers",
-                "data": {
-                    "papers": [
+        def fake_run_agent_turn(state):
+            del state
+            return AgentTurnResult(
+                status="success",
+                final_answer="已找到 2 篇与 RAG agent 相关的论文。",
+                outputs={
+                    "search_spec": {"query": "RAG agent", "max_results": 5},
+                    "arxiv_results": {
+                        "papers": [
+                            {"arxiv_id": "2401.00001", "title": "RAG Agents Survey"},
+                            {"arxiv_id": "2401.00002", "title": "Agentic Retrieval for RAG"},
+                        ]
+                    },
+                    "ranked_papers": [
                         {"arxiv_id": "2401.00001", "title": "RAG Agents Survey"},
                         {"arxiv_id": "2401.00002", "title": "Agentic Retrieval for RAG"},
-                    ]
+                    ],
                 },
-                "trace": {"tool_name": "search_arxiv_structured", "source": "test"},
-                "error": None,
-            },
-        ) as mocked_tool:
+                trace=[
+                    # 这里保留运行时 trace，验证 graph 节点会把执行摘要正确写回调试状态。
+                    ExecutionTrace(step_id="step_search", event="tool_completed", status="success", detail={"tool_name": "search_arxiv"}),
+                    ExecutionTrace(step_id="step_rank", event="tool_completed", status="success", detail={"tool_name": "personalize_paper_results"}),
+                ],
+            )
+
+        with mock.patch.object(graph_module, "parse_search_request", side_effect=parse), mock.patch.object(
+            graph_module, "run_agent_turn", side_effect=fake_run_agent_turn
+        ) as mocked_run_agent_turn:
             graph = build_arxiv_search_graph()
             result = AgentState.model_validate(graph.invoke(AgentState(message="搜索 RAG agent 相关论文").model_dump()))
 
-        mocked_tool.assert_called_once()
+        mocked_run_agent_turn.assert_called_once()
         self.assertEqual(result.intent, "arxiv_search")
-        self.assertTrue(any(call.tool_name == "search_arxiv_structured" for call in result.tool_calls))
-        self.assertTrue(any(obs.tool_name == "search_arxiv_structured" for obs in result.tool_observations))
-        self.assertTrue(bool(result.answer and result.answer.strip()))
+        self.assertEqual(result.steps[-1].step, "run_agent_turn")
+        self.assertEqual(result.answer, "已找到 2 篇与 RAG agent 相关的论文。")
+        self.assertEqual(len(result.papers), 2)
+        self.assertEqual(result.debug["agent_turn"]["status"], "success")
+        self.assertIn("tool_completed", result.debug["agent_turn"]["trace_events"])
 
     def test_paper_qa_with_existing_index_calls_check_then_answer(self) -> None:
         state = AgentState(
@@ -228,36 +232,41 @@ class AgentRegressionStep6Tests(unittest.TestCase):
         self.assertEqual(result.preference_action_result["status"], "success")
         self.assertTrue(any(obs.tool_name == "record_paper_preference" for obs in result.tool_observations))
 
-    def test_recommendation_runs_through_tool_protocol_and_returns_papers(self) -> None:
+    def test_recommendation_runs_through_new_turn_runtime_and_returns_papers(self) -> None:
         def parse(state, generation_service=None):
             del generation_service
             current = _coerce_state(state).model_copy(deep=True)
             current.intent = "recommendation"
             return current
 
-        def plan(state):
-            return _coerce_state(state).model_copy(deep=True)
-
-        with mock.patch.object(graph_module, "parse_search_request", side_effect=parse), mock.patch.object(
-            graph_module, "plan_task", side_effect=plan
-        ), mock.patch.object(
-            tool_node_module,
-            "invoke_tool",
-            return_value={
-                "ok": True,
-                "tool_name": "recommend_papers",
-                "summary": "recommended 2 papers",
-                "data": {
+        def fake_run_agent_turn(state):
+            del state
+            return AgentTurnResult(
+                status="success",
+                final_answer="我根据你最近关注的主题整理了 2 篇推荐论文。",
+                outputs={
                     "recommended_papers": [
                         {"arxiv_id": "2401.10001", "title": "Personalized RAG Recommender"},
                         {"arxiv_id": "2401.10002", "title": "Interest-aware Agent Retrieval"},
                     ],
-                    "personalization_signals": {"has_behavior_history": True},
+                    "ranked_papers": [
+                        {"arxiv_id": "2401.10001", "title": "Personalized RAG Recommender"},
+                        {"arxiv_id": "2401.10002", "title": "Interest-aware Agent Retrieval"},
+                    ],
                 },
-                "trace": {"tool_name": "recommend_papers", "source": "test"},
-                "error": None,
-            },
-        ) as mocked_tool:
+                trace=[
+                    ExecutionTrace(
+                        step_id="step_recommend",
+                        event="tool_completed",
+                        status="success",
+                        detail={"tool_name": "generate_recommendations"},
+                    )
+                ],
+            )
+
+        with mock.patch.object(graph_module, "parse_search_request", side_effect=parse), mock.patch.object(
+            graph_module, "run_agent_turn", side_effect=fake_run_agent_turn
+        ) as mocked_run_agent_turn:
             graph = build_arxiv_search_graph()
             initial_state = AgentState(
                 user_id="u1",
@@ -266,8 +275,10 @@ class AgentRegressionStep6Tests(unittest.TestCase):
             )
             result = AgentState.model_validate(graph.invoke(initial_state.model_dump()))
 
-        self.assertEqual(mocked_tool.call_args_list[0].args[0], "recommend_papers")
-        self.assertTrue(any(obs.tool_name == "recommend_papers" for obs in result.tool_observations))
+        mocked_run_agent_turn.assert_called_once()
+        self.assertEqual(result.steps[-1].step, "run_agent_turn")
+        self.assertEqual(result.debug["agent_turn"]["status"], "success")
+        self.assertEqual(len(result.papers), 2)
         self.assertTrue(bool(result.papers) or bool(result.answer and result.answer.strip()))
 
 
