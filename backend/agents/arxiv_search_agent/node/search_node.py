@@ -16,7 +16,7 @@ try:  # pragma: no cover - import path differs between backend cwd and package i
 except ModuleNotFoundError:  # pragma: no cover
     from backend.dependencies import get_recommendation_service
 
-from ..schemas import AgentToolCall, ArxivSearchSpec, ToolCallRequest
+from ..schemas import AgentToolCall, ArxivSearchSpec
 from ..state import AgentState
 from ..utils.result_utils import (
     _extract_error_message,
@@ -27,9 +27,18 @@ from ..utils.result_utils import (
     _to_plain_dict,
 )
 from ..utils.search_spec_builder import _build_reasoning_summary
-from ..utils.state_utils import _append_step, _coerce_state, _compact_paper_summaries, _compact_search_spec, _compact_tool_args
+from ..utils.state_utils import (
+    _append_step,
+    _coerce_state,
+    _compact_paper_summaries,
+    _compact_search_spec,
+    _compact_tool_args,
+    _get_execution_plan_step,
+    _update_execution_plan_step,
+)
 from ..utils.text_utils import _contains_chinese, _normalize_text
-from .tool_node import execute_tool
+from .plan_step_mapping import build_tool_call_request_from_plan_step
+from .tool_node import execute_planned_tool_step
 
 SEARCH_TOOL_NAME = "search_arxiv_structured"
 MAX_SEARCH_RETRIES = 3
@@ -248,15 +257,6 @@ def _collect_priority_titles(papers: List[Dict[str, Any]], limit: int = 3) -> Li
     return titles
 
 
-def _get_search_execution_plan_step_id(state: AgentState) -> Optional[str]:
-    """从 execution_plan 中恢复搜索执行步骤 ID，供 tool_call_request 关联使用。"""
-    for step in list(state.execution_plan or []):
-        if str(getattr(step, "step_type", "") or "").strip() == "search_execution":
-            step_id = str(getattr(step, "step_id", "") or "").strip()
-            return step_id or None
-    return None
-
-
 def build_search_tool_args(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
     """根据 search_spec 构造 arXiv 搜索工具参数。
     
@@ -268,11 +268,18 @@ def build_search_tool_args(state: Union[AgentState, Mapping[str, Any]]) -> Agent
     """
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
+    debug = dict(next_state.debug or {})
 
-    if next_state.intent != "arxiv_search" or next_state.search_spec is None:
+    if next_state.intent != "arxiv_search":
         next_state.tool_name = None
         next_state.tool_args = {}
         next_state.tool_call_request = None
+        debug["plan_step_mapping"] = {
+            "status": "skipped",
+            "reason": "non_arxiv_search_intent",
+            "intent": next_state.intent,
+        }
+        next_state.debug = debug
         return _append_step(
             next_state,
             step="tool_argument_construction",
@@ -282,38 +289,44 @@ def build_search_tool_args(state: Union[AgentState, Mapping[str, Any]]) -> Agent
             outputs={"reason": "非 arXiv 搜索或搜索条件缺失"},
         )
 
-    # 这里把 schema 字段显式映射成工具调用参数，避免后续工具层感知业务对象。
-    spec = next_state.search_spec
-    next_state.tool_name = SEARCH_TOOL_NAME
-    next_state.tool_args = {
-        "query": spec.query,
-        "title_query": spec.title_query,
-        "abstract_query": spec.abstract_query,
-        "categories": list(spec.categories or []),
-        "submitted_days_ago": spec.submitted_days_ago,
-        "max_results": spec.max_results or 10,
-        "start": 0,
-        "sort_by": spec.sort_by or "submittedDate",
-        "sort_order": spec.sort_order or "descending",
-        "field_operator": spec.field_operator or "AND",
-        "category_operator": spec.category_operator or "OR",
-    }
-    next_state.tool_call_request = ToolCallRequest(
-        tool_name=SEARCH_TOOL_NAME,
-        arguments=dict(next_state.tool_args),
-        reason="根据用户目标和结构化搜索条件检索 arXiv 论文候选结果",
-        expected_result="返回与当前搜索主题相关的 arXiv 论文候选列表",
-        plan_step_id=_get_search_execution_plan_step_id(next_state),
-        fallback_tools=["search_arxiv_raw"],
-    )
+    request, mapping_debug = build_tool_call_request_from_plan_step(next_state)
+    debug["plan_step_mapping"] = dict(mapping_debug)
+    history = list(debug.get("plan_step_mapping_history", []))
+    history.append(dict(mapping_debug))
+    debug["plan_step_mapping_history"] = history
+    next_state.debug = debug
+
+    if request is None:
+        next_state.tool_name = None
+        next_state.tool_args = {}
+        next_state.tool_call_request = None
+        return _append_step(
+            next_state,
+            step="tool_argument_construction",
+            status="skipped",
+            action="基于计划步骤映射 arXiv 工具参数",
+            inputs={
+                "intent": next_state.intent,
+                "search_spec": _compact_search_spec(next_state.search_spec),
+                "mapping_debug": mapping_debug,
+            },
+            outputs={"reason": str(mapping_debug.get("reason") or "当前计划步骤不支持工具映射")},
+        )
+
+    next_state.tool_call_request = request
+    next_state.tool_name = str(request.tool_name or "").strip() or None
+    next_state.tool_args = dict(request.arguments or {})
     return _append_step(
         next_state,
         step="tool_argument_construction",
         status="success",
-        action="基于搜索条件构造 arXiv 工具参数",
-        inputs={"search_spec": _compact_search_spec(spec)},
+        action="基于计划步骤映射 arXiv 工具参数",
+        inputs={
+            "search_spec": _compact_search_spec(next_state.search_spec),
+            "mapping_debug": mapping_debug,
+        },
         outputs={
-            "tool_name": SEARCH_TOOL_NAME,
+            "tool_name": next_state.tool_name,
             "tool_args": {key: value for key, value in next_state.tool_args.items() if key != "query" or value},
             "tool_call_request": next_state.tool_call_request.model_dump(),
         },
@@ -321,9 +334,9 @@ def build_search_tool_args(state: Union[AgentState, Mapping[str, Any]]) -> Agent
 
 
 def invoke_search_tool(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
-    """通过通用 execute_tool 执行 arXiv 搜索工具，并保留旧的 step 命名兼容性。"""
-    next_state = execute_tool(state)
-    if next_state.steps and next_state.steps[-1].step == "execute_tool":
+    """通过统一计划执行器执行 arXiv 搜索工具，并保留旧的 step 命名兼容性。"""
+    next_state = execute_planned_tool_step(state)
+    if next_state.steps and next_state.steps[-1].step == "execute_planned_tool_step":
         next_state.steps[-1].step = "search_tool_call"
         next_state.steps[-1].action = "调用 arXiv 搜索工具"
     return next_state
@@ -445,6 +458,7 @@ def check_search_result(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
     next_state = current_state.model_copy(deep=True)
 
     if next_state.intent != "arxiv_search":
+        next_state = _update_execution_plan_step(next_state, step_type="result_validation", status="skipped")
         return _append_step(
             next_state,
             step="search_result_check",
@@ -486,6 +500,9 @@ def check_search_result(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
             warnings.append("结果数量较少，可能是查询条件过窄")
 
     next_state.warnings = _dedupe_preserve_order(warnings)
+    needs_retry = bool(_result_ok(tool_result) and not papers and int(next_state.search_retry_count or 0) < MAX_SEARCH_RETRIES)
+    validation_status = "failed" if (needs_retry or (tool_result and not _result_ok(tool_result))) else "completed"
+    next_state = _update_execution_plan_step(next_state, step_type="result_validation", status=validation_status)
     return _append_step(
         next_state,
         step="search_result_check",
@@ -563,6 +580,8 @@ def relax_search_for_retry(state: Union[AgentState, Mapping[str, Any]]) -> Agent
     next_state.tool_call_request = None
     next_state.tool_result = None
     next_state.papers = []
+    next_state = _update_execution_plan_step(next_state, step_type="search_execution", status="pending")
+    next_state = _update_execution_plan_step(next_state, step_type="result_validation", status="pending")
 
     return _append_step(
         next_state,
@@ -617,8 +636,9 @@ def personalized_rank_and_annotate_papers(state: Union[AgentState, Mapping[str, 
         next_state.warnings = _dedupe_preserve_order(
             list(next_state.warnings) + [f"{warning_prefix}，已保留普通搜索排序"],
         )
+        updated_state = _update_execution_plan_step(next_state, step_type="personalization", status="failed")
         return _append_step(
-            next_state,
+            updated_state,
             step="personalized_rerank",
             status="failed",
             action="基于用户偏好对搜索结果做个性化重排",
@@ -630,7 +650,7 @@ def personalized_rank_and_annotate_papers(state: Union[AgentState, Mapping[str, 
             },
             outputs={
                 "personalized_rerank_applied": False,
-                "paper_count": len(next_state.papers or []),
+                "paper_count": len(updated_state.papers or []),
                 "papers_preserved": True,
             },
             error=warning_prefix,
@@ -639,6 +659,7 @@ def personalized_rank_and_annotate_papers(state: Union[AgentState, Mapping[str, 
     # 个性化重排依赖三个前提：搜索意图、已有候选论文、以及有效 user_id。
     if next_state.intent != "arxiv_search" or not next_state.papers or not next_state.user_id:
         next_state.personalized_rerank_applied = False
+        next_state = _update_execution_plan_step(next_state, step_type="personalization", status="skipped")
         return _append_step(
             next_state,
             step="personalized_rerank",
@@ -683,6 +704,8 @@ def personalized_rank_and_annotate_papers(state: Union[AgentState, Mapping[str, 
         next_state.warnings = _dedupe_preserve_order(
             list(next_state.warnings) + ["用户兴趣向量不可用或个性化重排未生效，已退化为普通搜索结果"],
         )
+
+    next_state = _update_execution_plan_step(next_state, step_type="personalization", status="completed")
 
     return _append_step(
         next_state,

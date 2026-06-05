@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 from ..state import AgentState
-from ..utils.state_utils import _append_step, _coerce_state
+from ..utils.state_utils import _append_step, _coerce_state, _update_execution_plan_step
 from .search_node import _collect_priority_titles, _summarize_search_spec
 
 
@@ -152,6 +152,9 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
 
+    def _finalize_response_plan(status: str) -> AgentState:
+        return _update_execution_plan_step(next_state, step_type="response_synthesis", status=status)
+
     pending_action = dict(next_state.pending_action or (next_state.context or {}).get("pending_action") or {})
     paper_qa_result = dict(next_state.paper_qa_result or {})
     if next_state.intent in {"paper_summary", "paper_detail", "paper_qa"} and not paper_qa_result:
@@ -169,15 +172,16 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
                 "继续追问这篇论文的其他细节",
                 "切换到其他论文继续阅读",
             ]
+        response_state = _finalize_response_plan("completed")
         return _append_step(
-            next_state,
+            response_state,
             step="final_answer_generation",
             status="success",
             action="生成论文阅读回复",
             inputs={"intent": next_state.intent, "paper_qa_result": dict(paper_qa_result)},
             outputs={
-                "answer": next_state.answer,
-                "next_actions": list(next_state.next_actions),
+                "answer": response_state.answer,
+                "next_actions": list(response_state.next_actions),
                 "qa_index_status": paper_qa_result.get("qa_index_status"),
             },
         )
@@ -190,13 +194,14 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
             "重新确认是否需要解析 PDF",
             "或稍后重试这篇论文",
         ]
+        response_state = _finalize_response_plan("failed")
         return _append_step(
-            next_state,
+            response_state,
             step="final_answer_generation",
             status="failed",
             action="生成论文阅读回复",
             inputs={"intent": next_state.intent, "paper_qa_result": dict(paper_qa_result)},
-            outputs={"answer": next_state.answer, "next_actions": list(next_state.next_actions)},
+            outputs={"answer": response_state.answer, "next_actions": list(response_state.next_actions)},
             error=error_message,
         )
 
@@ -244,8 +249,9 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
                 next_state.answer = pending_message
                 next_state.next_actions = ["解析", "取消"]
 
+        response_state = _finalize_response_plan("completed")
         return _append_step(
-            next_state,
+            response_state,
             step="final_answer_generation",
             status="success",
             action="生成论文阅读回复",
@@ -255,7 +261,7 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
                 "paper_qa_result": dict(paper_qa_result),
                 "confirmation_decision": confirmation_decision,
             },
-            outputs={"answer": next_state.answer, "next_actions": list(next_state.next_actions)},
+            outputs={"answer": response_state.answer, "next_actions": list(response_state.next_actions)},
         )
 
     # 偏好动作以“动作是否成功”为主来组织答复，同时补充标题和 arXiv ID 便于用户确认对象。
@@ -296,13 +302,14 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
                 "也可以直接提供 arXiv ID 后重试",
             ]
 
+        response_state = _finalize_response_plan("completed")
         return _append_step(
-            next_state,
+            response_state,
             step="final_answer_generation",
             status="success",
             action="生成最终答复并给出后续动作",
             inputs={"intent": next_state.intent, "preference_action_result": dict(result)},
-            outputs={"answer": next_state.answer, "next_actions": list(next_state.next_actions), "label": label},
+            outputs={"answer": response_state.answer, "next_actions": list(response_state.next_actions), "label": label},
         )
 
     if next_state.intent == "recommendation":
@@ -331,15 +338,16 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
                 "继续查看其中某篇论文的详情或总结",
                 "也可以继续标记喜欢 / 不喜欢来优化后续推荐",
             ]
+            response_state = _finalize_response_plan("completed")
             return _append_step(
-                next_state,
+                response_state,
                 step="final_answer_generation",
                 status="success",
                 action="生成推荐结果回复",
                 inputs={"intent": next_state.intent, "paper_count": paper_count},
                 outputs={
-                    "answer": next_state.answer,
-                    "next_actions": list(next_state.next_actions),
+                    "answer": response_state.answer,
+                    "next_actions": list(response_state.next_actions),
                     "personalization_signals": personalization_signals,
                 },
             )
@@ -356,15 +364,16 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
                     "补充更明确的研究方向或关键词后重试",
                     "先标记几篇喜欢 / 不喜欢的论文，再让我重新推荐",
                 ]
+                response_state = _finalize_response_plan("completed")
                 return _append_step(
-                    next_state,
+                    response_state,
                     step="final_answer_generation",
                     status="success",
                     action="生成推荐结果回复",
                     inputs={"intent": next_state.intent, "paper_count": paper_count},
                     outputs={
-                        "answer": next_state.answer,
-                        "next_actions": list(next_state.next_actions),
+                        "answer": response_state.answer,
+                        "next_actions": list(response_state.next_actions),
                         "warnings": list(next_state.warnings or []),
                     },
                 )
@@ -375,13 +384,14 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
                 "稍后重试推荐",
                 "也可以先搜索某个明确主题的论文",
             ]
+            response_state = _finalize_response_plan("failed")
             return _append_step(
-                next_state,
+                response_state,
                 step="final_answer_generation",
                 status="failed",
                 action="生成推荐结果回复",
                 inputs={"intent": next_state.intent, "paper_count": paper_count},
-                outputs={"answer": next_state.answer, "next_actions": list(next_state.next_actions)},
+                outputs={"answer": response_state.answer, "next_actions": list(response_state.next_actions)},
                 error=error_message,
             )
 
@@ -420,8 +430,9 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
         if max_results and paper_count < max_results:
             next_state.answer += f" 本次最多期望返回 {max_results} 篇。"
 
+        response_state = _finalize_response_plan("completed")
         return _append_step(
-            next_state,
+            response_state,
             step="final_answer_generation",
             status="success",
             action="生成最终答复并给出后续动作",
@@ -431,8 +442,8 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
                 "personalized_rerank_applied": personalized_applied,
             },
             outputs={
-                "answer": next_state.answer,
-                "next_actions": list(next_state.next_actions),
+                "answer": response_state.answer,
+                "next_actions": list(response_state.next_actions),
                 "top_papers": _collect_priority_titles(papers, limit=3),
             },
         )
@@ -440,13 +451,14 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
     answer, next_actions = _build_non_search_answer(next_state.intent or "unsupported")
     next_state.answer = answer
     next_state.next_actions = next_actions
+    response_state = _finalize_response_plan("completed")
     return _append_step(
-        next_state,
+        response_state,
         step="final_answer_generation",
         status="success",
         action="生成最终答复并给出后续动作",
         inputs={"intent": next_state.intent, "paper_count": len(next_state.papers or [])},
-        outputs={"answer": next_state.answer, "next_actions": list(next_state.next_actions)},
+        outputs={"answer": response_state.answer, "next_actions": list(response_state.next_actions)},
     )
 
 

@@ -44,6 +44,7 @@ from .pending_action_node import (
     classify_pending_action_confirmation,
     handle_pending_action_confirmation,
 )
+from .plan_step_mapping import build_tool_call_request_from_plan_step
 from .recommendation_node import (
     adapt_recommendation_tool_result,
     build_recommendation_tool_args,
@@ -92,6 +93,7 @@ __all__ = [
     "apply_preference_action",
     "adapt_recommendation_tool_result",
     "build_recommendation_tool_args",
+    "build_tool_call_request_from_plan_step",
     "build_search_tool_args",
     "check_search_result",
     "classify_pending_action_confirmation",

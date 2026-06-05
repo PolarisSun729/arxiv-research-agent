@@ -568,6 +568,12 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
     """把当前运行态压缩成适合流式事件携带的状态快照。"""
     if state is None:
         return {}
+    execution_plan_runtime = dict((state.debug or {}).get("execution_plan_runtime") or {})
+    execution_plan_runtime_steps = {
+        str(step.get("step_id") or "").strip(): step
+        for step in list(execution_plan_runtime.get("steps", []) or [])
+        if isinstance(step, Mapping) and str(step.get("step_id") or "").strip()
+    }
     return {
         "intent": state.intent,
         "intent_source": state.intent_source,
@@ -575,12 +581,17 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
         "llm_confidence": state.llm_confidence,
         "search_spec": state.search_spec.model_dump() if state.search_spec is not None else None,
         "goal": state.goal.model_dump() if state.goal is not None else None,
-        "execution_plan": [_compact_execution_plan_step(step) for step in list(state.execution_plan or [])],
+        "execution_plan": [_compact_execution_plan_step(step, runtime_step=execution_plan_runtime_steps.get(step.step_id)) for step in list(state.execution_plan or [])],
         "execution_plan_summary": {
             "step_count": len(state.execution_plan or []),
             "step_ids": [step.step_id for step in list(state.execution_plan or [])],
             "step_types": [step.step_type for step in list(state.execution_plan or [])],
             "statuses": [step.status for step in list(state.execution_plan or [])],
+            "current_step_id": execution_plan_runtime.get("current_step_id"),
+            "current_step_type": execution_plan_runtime.get("current_step_type"),
+            "next_executable_step_id": execution_plan_runtime.get("next_executable_step_id"),
+            "next_executable_step_type": execution_plan_runtime.get("next_executable_step_type"),
+            "status_counts": dict(execution_plan_runtime.get("status_counts") or {}),
         },
         "pending_action": state.pending_action,
         "paper_qa_result": state.paper_qa_result,
@@ -596,7 +607,7 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
     }
 
 
-def _compact_execution_plan_step(step: Any) -> Dict[str, Any]:
+def _compact_execution_plan_step(step: Any, runtime_step: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """压缩 execution_plan 单步信息，便于前端展示规划状态。"""
     payload = {
         "step_id": getattr(step, "step_id", None),
@@ -605,6 +616,11 @@ def _compact_execution_plan_step(step: Any) -> Dict[str, Any]:
         "status": getattr(step, "status", None),
         "depends_on": list(getattr(step, "depends_on", []) or []),
     }
+    if isinstance(runtime_step, Mapping):
+        for key in ("blocked_by", "can_execute", "is_current", "last_tool_observation"):
+            value = runtime_step.get(key)
+            if value not in (None, "", [], {}):
+                payload[key] = value
     return {key: value for key, value in payload.items() if value not in (None, "", [], {})}
 
 

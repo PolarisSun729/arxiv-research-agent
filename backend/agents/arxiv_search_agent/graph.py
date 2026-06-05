@@ -23,6 +23,7 @@ from .node import (
 )
 from .node.recommendation_node import adapt_recommendation_tool_result, build_recommendation_tool_args, invoke_recommendation_tool
 from .state import AgentState
+from .utils.state_utils import _get_execution_plan_step, _get_next_executable_plan_step, _get_next_incomplete_plan_step
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,17 @@ def route_after_parse(state: Any) -> str:
     # 第 5 步：如果不存在待确认任务，则按 parse 节点给出的 intent 做正常分流。
     # 这里列出的 intent 基本覆盖了当前 arXiv Agent 已支持的主要能力。
     intent = str(current_state.intent or "").strip()
+    if intent == "arxiv_search":
+        next_plan_step = _get_next_executable_plan_step(current_state) or _get_next_incomplete_plan_step(current_state)
+        next_step_type = str(getattr(next_plan_step, "step_type", "") or "").strip()
+        if next_step_type == "response_synthesis":
+            logger.debug("arxiv_agent route_after_parse -> synthesize_response via execution_plan")
+            return "synthesize_response"
+        if next_step_type and next_step_type not in {"search_execution", "result_validation", "personalization"}:
+            logger.debug(
+                "arxiv_agent route_after_parse -> arxiv_search fallback: unexpected next_plan_step=%s",
+                next_step_type,
+            )
     if intent in {
         "arxiv_search",
         "paper_detail",
@@ -134,6 +146,7 @@ def route_after_parse(state: Any) -> str:
         "preference_action",
         "reading_list_action",
         "unclear",
+        "synthesize_response",
         "unsupported",
     }:
         logger.debug(
@@ -201,10 +214,18 @@ def route_after_check(state: Any) -> str:
     papers = list(current_state.papers or [])
     retry_count = int(current_state.search_retry_count or 0)
     tool_result = current_state.tool_result
+    validation_step = _get_execution_plan_step(current_state, step_type="result_validation")
+    validation_status = str(getattr(validation_step, "status", "") or "").strip()
 
     # `tool_ok` 表示“工具调用是否成功”，而不是“是否搜到了论文”。
     # 这两个概念需要分开：调用成功但无结果时才适合放宽条件重试。
     tool_ok = bool(tool_result and isinstance(tool_result, dict) and tool_result.get("ok"))
+
+    if validation_status == "failed" and tool_ok and not papers and retry_count < 3:
+        return "relax_search_for_retry"
+
+    if validation_status == "completed":
+        return "personalized_rank_and_annotate_papers"
 
     # 只有搜索成功但结果为空，且未超过最大重试次数时才触发 fallback
     if tool_ok and not papers and retry_count < 3:
@@ -215,6 +236,19 @@ def route_after_check(state: Any) -> str:
     # - 工具失败：交给后续汇总节点基于错误态构造回复；
     # - 重试已达上限：避免死循环，直接结束检索阶段。
     return "personalized_rank_and_annotate_papers"
+
+
+def route_after_search_tool_call(state: Any) -> str:
+    """根据统一执行器产出的 observation / result 决定后续走向。
+
+    这里优先确保“执行 -> 观察 -> 状态更新”的闭环有明确出口：
+    - 若没有产出 tool_result，通常表示计划步骤未能映射成实际工具调用，直接进入回复收敛；
+    - 若已产出 tool_result，则继续进入结果适配与检查节点，保持现有 fallback 逻辑。
+    """
+    current_state = _coerce_state(state)
+    if current_state.tool_result is None:
+        return "synthesize_response"
+    return "adapt_search_tool_result"
 
 
 def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
@@ -286,6 +320,7 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
             "classify_pending_action_confirmation": "classify_pending_action_confirmation",
             "reading_list_action": "synthesize_response",
             "unclear": "synthesize_response",
+            "synthesize_response": "synthesize_response",
             "unsupported": "synthesize_response",
         },
     )
@@ -316,7 +351,14 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
     # 2. 调用外部搜索工具；
     # 3. 检查工具返回，决定是否需要放宽条件重试。
     graph.add_edge("build_search_tool_args", "invoke_search_tool")
-    graph.add_edge("invoke_search_tool", "adapt_search_tool_result")
+    graph.add_conditional_edges(
+        "invoke_search_tool",
+        route_after_search_tool_call,
+        {
+            "adapt_search_tool_result": "adapt_search_tool_result",
+            "synthesize_response": "synthesize_response",
+        },
+    )
     graph.add_edge("adapt_search_tool_result", "check_search_result")
     graph.add_conditional_edges(
         "check_search_result",

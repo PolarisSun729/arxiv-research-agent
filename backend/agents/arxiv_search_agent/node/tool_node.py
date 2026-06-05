@@ -31,7 +31,8 @@ except ModuleNotFoundError:  # pragma: no cover
 from ..schemas import AgentToolCall, ToolObservation
 from ..state import AgentState
 from ..utils.result_utils import _extract_error_message, _result_mapping, _result_ok, _result_text, _to_plain_dict
-from ..utils.state_utils import _append_step, _coerce_state
+from ..utils.state_utils import _append_step, _coerce_state, _get_next_executable_plan_step, _update_execution_plan_step
+from .plan_step_mapping import build_tool_call_request_from_plan_step
 
 
 def _build_result_ref(result: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
@@ -173,6 +174,114 @@ def _append_tool_call(state: AgentState, *, tool_name: Optional[str], arguments:
     ]
 
 
+def _record_plan_step_observation(
+    state: AgentState,
+    *,
+    plan_step_id: Optional[str],
+    tool_name: Optional[str],
+    observation: ToolObservation,
+) -> None:
+    """把计划步骤与最近一次 observation 的轻量关联写入 debug。"""
+    if not plan_step_id:
+        return
+
+    debug = dict(state.debug or {})
+    plan_step_observations = dict(debug.get("plan_step_observations", {}))
+    plan_step_observations[plan_step_id] = {
+        "tool_name": tool_name,
+        "status": observation.status,
+        "ok": observation.ok,
+        "result_summary": observation.result_summary,
+        "next_action_hint": observation.next_action_hint,
+        "error": observation.error,
+    }
+    debug["plan_step_observations"] = plan_step_observations
+    state.debug = debug
+
+
+def execute_planned_tool_step(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
+    """统一执行“计划步骤 -> 工具请求 -> 工具执行 -> observation 回写”闭环。
+
+    当前实现先覆盖白名单式的计划步骤映射：
+    - 如果上游已经准备好了 tool_call_request，则直接走 execute_tool；
+    - 否则根据当前可执行计划步骤动态构造请求；
+    - 若当前步骤无法映射为工具请求，则安全产出 skipped observation，并把步骤标记为 skipped。
+    """
+    current_state = _coerce_state(state)
+    next_state = current_state.model_copy(deep=True)
+
+    if next_state.tool_call_request is None:
+        request, mapping_debug = build_tool_call_request_from_plan_step(next_state)
+        debug = dict(next_state.debug or {})
+        debug["plan_step_mapping"] = dict(mapping_debug)
+        history = list(debug.get("plan_step_mapping_history", []))
+        history.append(dict(mapping_debug))
+        debug["plan_step_mapping_history"] = history
+        next_state.debug = debug
+
+        if request is None:
+            next_plan_step = _get_next_executable_plan_step(next_state)
+            plan_step_id = str(getattr(next_plan_step, "step_id", "") or "").strip() or None
+            reason = str(mapping_debug.get("reason") or "当前计划步骤未生成可执行工具请求").strip()
+            next_state.warnings = list(next_state.warnings or []) + [f"工具执行已跳过：{reason}"]
+            observation = ToolObservation(
+                tool_name=None,
+                ok=False,
+                status="skipped",
+                result_summary=reason,
+                result_ref={
+                    "plan_step_id": plan_step_id,
+                    "step_type": mapping_debug.get("step_type"),
+                    "intent": mapping_debug.get("intent"),
+                },
+                error={"code": "plan_step_mapping_skipped", "message": reason},
+                is_sufficient=False,
+                next_action_hint="inspect_tool_request_or_choose_alternative",
+                raw_trace={"mapping_debug": dict(mapping_debug)},
+            )
+            _append_observation(next_state, observation)
+            _record_plan_step_observation(next_state, plan_step_id=plan_step_id, tool_name=None, observation=observation)
+            if plan_step_id:
+                next_state = _update_execution_plan_step(next_state, step_id=plan_step_id, status="skipped")
+
+            debug = dict(next_state.debug or {})
+            debug["last_tool_execution"] = {
+                "status": "skipped",
+                "reason": reason,
+                "mapping_debug": dict(mapping_debug),
+                "observation": observation.model_dump(),
+            }
+            history = list(debug.get("tool_execution_history", []))
+            history.append(
+                {
+                    "tool_name": None,
+                    "status": observation.status,
+                    "ok": observation.ok,
+                    "plan_step_id": plan_step_id,
+                }
+            )
+            debug["tool_execution_history"] = history
+            next_state.debug = debug
+            return _append_step(
+                next_state,
+                step="execute_planned_tool_step",
+                status="skipped",
+                action="根据计划步骤执行统一工具调用",
+                inputs={"mapping_debug": dict(mapping_debug)},
+                outputs={"reason": reason, "plan_step_id": plan_step_id},
+            )
+
+        next_state.tool_call_request = request
+        next_state.tool_name = str(request.tool_name or "").strip() or None
+        next_state.tool_args = dict(request.arguments or {})
+
+    executed_state = execute_tool(next_state)
+    if executed_state.steps and executed_state.steps[-1].step == "execute_tool":
+        executed_state.steps[-1].step = "execute_planned_tool_step"
+        executed_state.steps[-1].action = "根据计划步骤执行统一工具调用"
+    return executed_state
+
+
 def execute_tool(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
     """执行 `tool_call_request` 指定的工具，并把结果写回状态。"""
     current_state = _coerce_state(state)
@@ -210,8 +319,11 @@ def execute_tool(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
 
     tool_name = str(request.tool_name or "").strip() or None
     arguments = dict(request.arguments or {})
+    plan_step_id = str(request.plan_step_id or "").strip() or None
     next_state.tool_name = tool_name
     next_state.tool_args = arguments
+    if plan_step_id:
+        next_state = _update_execution_plan_step(next_state, step_id=plan_step_id, status="in_progress")
 
     if tool_name is None:
         result = _make_failed_result(None, "Tool name is missing", code="tool_name_missing")
@@ -247,6 +359,8 @@ def execute_tool(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
     _append_tool_call(next_state, tool_name=tool_name, arguments=arguments, result=result)
 
     debug = dict(next_state.debug or {})
+    _record_plan_step_observation(next_state, plan_step_id=plan_step_id, tool_name=tool_name, observation=observation)
+    debug = dict(next_state.debug or {})
     debug["last_tool_execution"] = {
         "request": request.model_dump(),
         "result": dict(result),
@@ -264,6 +378,13 @@ def execute_tool(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
     debug["tool_execution_history"] = history
     next_state.debug = debug
 
+    if plan_step_id:
+        next_state = _update_execution_plan_step(
+            next_state,
+            step_id=plan_step_id,
+            status="completed" if observation.ok else "failed",
+        )
+
     error_message = _extract_error_message(result)
     return _append_step(
         next_state,
@@ -273,7 +394,7 @@ def execute_tool(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
         inputs={
             "tool_name": tool_name,
             "arguments": arguments,
-            "plan_step_id": request.plan_step_id,
+            "plan_step_id": plan_step_id,
         },
         outputs={
             "tool_status": observation.status,

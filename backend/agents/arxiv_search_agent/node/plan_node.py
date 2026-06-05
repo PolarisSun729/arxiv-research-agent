@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from ..schemas import ExecutionPlanStep, Goal
 from ..state import AgentState
-from ..utils.state_utils import _append_step, _coerce_state, _compact_search_spec
+from ..utils.state_utils import _append_step, _coerce_state, _compact_search_spec, _refresh_execution_plan_runtime, _update_execution_plan_step
 
 
 def _normalize_intent(value: Any) -> str:
@@ -470,11 +470,14 @@ def plan_task(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
         next_state = current_state.model_copy(deep=True)
         next_state.goal = goal
         next_state.execution_plan = execution_plan
+        next_state = _refresh_execution_plan_runtime(next_state)
+        if goal.goal_type == "arxiv_search":
+            next_state = _update_execution_plan_step(next_state, step_type="goal_interpretation", status="completed")
         next_state.debug = dict(next_state.debug or {})
         next_state.debug["plan_task"] = {
             **planning_debug,
             "goal": goal.model_dump(),
-            "execution_plan": [step.model_dump() for step in execution_plan],
+            "execution_plan": [step.model_dump() for step in list(next_state.execution_plan or [])],
         }
         return _append_step(
             next_state,

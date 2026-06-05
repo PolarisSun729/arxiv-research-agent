@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import unittest
 from unittest import mock
 
@@ -8,7 +9,9 @@ from tests.helpers.agent_runtime import load_agent_test_modules
 
 _MODULES = load_agent_test_modules()
 AgentState = _MODULES["state_module"].AgentState
+ArxivSearchSpec = _MODULES["schemas"].ArxivSearchSpec
 build_arxiv_search_graph = _MODULES["graph_module"].build_arxiv_search_graph
+tool_module = sys.modules["backend.agents.arxiv_search_agent.node.tool_node"]
 
 
 def _coerce_agent_state(state):
@@ -285,6 +288,92 @@ class AgentGraphFlowTests(unittest.TestCase):
             result["debug"]["visited"],
             ["parse_search_request", "plan_task", "handle_paper_reading_request", "synthesize_response"],
         )
+
+    def test_plan_driven_search_real_nodes_return_papers(self) -> None:
+        def parse(state, generation_service=None):
+            del generation_service
+            current = _coerce_agent_state(state)
+            current.intent = "arxiv_search"
+            current.search_spec = ArxivSearchSpec(intent="arxiv_search", query="rag", categories=["cs.CL"], max_results=5)
+            return current.model_dump()
+
+        self._patch_graph("parse_search_request", parse)
+
+        with mock.patch.object(
+            tool_module,
+            "invoke_tool",
+            return_value={
+                "ok": True,
+                "tool_name": "search_arxiv_structured",
+                "summary": "searched",
+                "data": {"papers": [{"arxiv_id": "2401.00001", "title": "RAG Paper"}]},
+                "trace": {"tool_name": "search_arxiv_structured"},
+                "error": None,
+            },
+        ):
+            graph = build_arxiv_search_graph()
+            result = graph.invoke(AgentState(message="search rag papers").model_dump())
+
+        self.assertEqual(result["papers"][0]["arxiv_id"], "2401.00001")
+        self.assertEqual(result["tool_observations"][-1].tool_name, "search_arxiv_structured")
+        self.assertTrue(result["tool_observations"][-1].ok)
+        self.assertEqual(result["execution_plan"][1].status, "completed")
+        self.assertEqual(result["execution_plan"][2].status, "completed")
+        self.assertEqual(result["execution_plan"][4].status, "completed")
+        self.assertEqual(result["debug"]["plan_step_mapping"]["status"], "mapped")
+
+    def test_plan_driven_search_empty_result_retries_then_succeeds(self) -> None:
+        def parse(state, generation_service=None):
+            del generation_service
+            current = _coerce_agent_state(state)
+            current.intent = "arxiv_search"
+            current.search_spec = ArxivSearchSpec(intent="arxiv_search", query="rag agents", categories=["cs.CL"], max_results=5)
+            return current.model_dump()
+
+        self._patch_graph("parse_search_request", parse)
+
+        def fake_invoke_tool(_tool_name, **kwargs):
+            query = kwargs.get("query")
+            papers = [] if query == "rag agents" else [{"arxiv_id": "2401.00002", "title": "Retry Paper"}]
+            return {
+                "ok": True,
+                "tool_name": "search_arxiv_structured",
+                "summary": f"searched {query}",
+                "data": {"papers": papers},
+                "trace": {"tool_name": "search_arxiv_structured", "final_search_query": query},
+                "error": None,
+            }
+
+        with mock.patch.object(tool_module, "invoke_tool", side_effect=fake_invoke_tool):
+            graph = build_arxiv_search_graph()
+            result = graph.invoke(AgentState(message="search rag agents papers").model_dump())
+
+        self.assertEqual(result["search_retry_count"], 1)
+        self.assertEqual(result["papers"][0]["arxiv_id"], "2401.00002")
+        self.assertIn("relaxed_query", result["fallback_specs"][0])
+        self.assertEqual(result["execution_plan"][1].status, "completed")
+        self.assertEqual(result["execution_plan"][2].status, "completed")
+        self.assertTrue(any("自动放宽关键词" in warning for warning in result["warnings"]))
+
+    def test_plan_driven_search_tool_failure_degrades_to_response(self) -> None:
+        def parse(state, generation_service=None):
+            del generation_service
+            current = _coerce_agent_state(state)
+            current.intent = "arxiv_search"
+            current.search_spec = ArxivSearchSpec(intent="arxiv_search", query="rag", categories=["cs.CL"], max_results=5)
+            return current.model_dump()
+
+        self._patch_graph("parse_search_request", parse)
+
+        with mock.patch.object(tool_module, "invoke_tool", side_effect=RuntimeError("boom")):
+            graph = build_arxiv_search_graph()
+            result = graph.invoke(AgentState(message="search rag papers").model_dump())
+
+        self.assertTrue(result["answer"])
+        self.assertEqual(result["tool_observations"][-1].status, "failed")
+        self.assertEqual(result["execution_plan"][1].status, "failed")
+        self.assertEqual(result["execution_plan"][2].status, "failed")
+        self.assertTrue(any("工具调用失败" in warning for warning in result["warnings"]))
 
 
 if __name__ == "__main__":
