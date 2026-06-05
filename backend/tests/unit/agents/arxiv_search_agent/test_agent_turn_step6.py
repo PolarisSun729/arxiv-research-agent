@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 
 from tests.helpers.agent_runtime import load_agent_test_modules
 
@@ -15,6 +16,7 @@ planner_registry_module = importlib.import_module("backend.agents.arxiv_search_a
 AgentState = state_module.AgentState
 ArxivSearchSpec = schemas.ArxivSearchSpec
 run_agent_turn = executor_module.run_agent_turn
+run_agent_turn_in_graph = executor_module.run_agent_turn_in_graph
 PLANNER_TOOL_REGISTRY = planner_registry_module.PLANNER_TOOL_REGISTRY
 
 
@@ -132,8 +134,33 @@ def test_run_agent_turn_paper_qa_missing_index_waits_for_confirmation(monkeypatc
 
     assert result.status == "waiting_confirmation"
     assert result.pending_confirmation
-    assert any(trace.step_id == "request_confirmation" for trace in result.trace)
+    assert result.pending_confirmation.step_id == "parse_and_index_paper"
+    assert [item.code for item in result.pending_confirmation.allowed_decisions] == ["approve", "reject"]
+    json.dumps(result.pending_confirmation.model_dump(), ensure_ascii=False)
+    assert any(trace.step_id == "parse_and_index_paper" and trace.event == "confirmation_requested" for trace in result.trace)
     assert "build_paper_qa_index" not in called_tools
+
+
+def test_run_agent_turn_in_graph_reject_skips_index_build(monkeypatch) -> None:
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        if tool_name == "check_paper_qa_index":
+            return {"ok": True, "tool_name": tool_name, "summary": "missing", "data": {"status": "missing", "has_index": False}, "trace": {}, "error": None}
+        raise AssertionError(f"{tool_name} should not run before confirmation")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+    monkeypatch.setattr(executor_module, "interrupt", lambda payload: {"decision": "reject"})
+
+    result = run_agent_turn_in_graph(
+        AgentState(
+            intent="paper_qa",
+            message="杩欑瘒璁烘枃鐨勬柟娉曟槸浠€涔堬紵",
+            context={"selected_paper": {"arxiv_id": "2401.00001", "title": "RAG Method"}},
+        )
+    )
+
+    assert result.final_answer == "已取消解析 RAG Method，因此无法继续基于全文回答。"
+    assert any(trace.event == "confirmation_requested" for trace in result.trace)
+    assert any(trace.event == "confirmation_rejected" for trace in result.trace)
 
 
 def test_run_agent_turn_paper_qa_low_evidence_replans(monkeypatch) -> None:

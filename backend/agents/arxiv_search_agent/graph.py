@@ -3,14 +3,20 @@ from __future__ import annotations
 import logging
 from typing import Any, Mapping, Optional
 
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from .node import parse_search_request
-from .plan_executor import run_agent_turn
+from .plan_executor import run_agent_turn, run_agent_turn_in_graph
 from .schemas import AgentStep, AgentTurnResult
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
+
+# 默认内存 checkpointer 只创建一次，保证同一进程内同一个 thread_id 的中断状态可恢复。
+# 这里故意把“默认实例”提升到模块级，避免每次请求临时 new 一个内存存储导致 session 无法续跑。
+# 后续生产环境如果要接 Redis/数据库等持久化实现，只需要从 service 或依赖注入层传入新的 checkpointer。
+DEFAULT_GRAPH_CHECKPOINTER = InMemorySaver()
 
 _ARXIV_GRAPH_NODE_NAMES = (
     "parse_search_request",
@@ -34,7 +40,8 @@ def _state_from_turn_result(source_state: AgentState, result: AgentTurnResult) -
     next_state.execution_plan = result.plan
     next_state.plan_runtime = result.runtime
     next_state.answer = result.final_answer
-    next_state.pending_action = result.pending_confirmation
+    confirmation_payload = result.pending_confirmation.model_dump() if result.pending_confirmation is not None else None
+    next_state.pending_action = _build_legacy_pending_action(result)
 
     next_state.debug = dict(next_state.debug or {})
     next_state.debug["agent_turn"] = {
@@ -43,11 +50,13 @@ def _state_from_turn_result(source_state: AgentState, result: AgentTurnResult) -
         "output_keys": sorted(result.outputs.keys()),
         "trace_events": [trace.event for trace in list(result.trace or [])],
     }
+    if confirmation_payload is not None:
+        next_state.debug["pending_confirmation"] = confirmation_payload
 
     if result.status == "waiting_confirmation":
         next_state.paper_qa_result = {
             "status": "waiting_confirmation",
-            "pending_confirmation": result.pending_confirmation,
+            "pending_confirmation": confirmation_payload,
         }
 
     if "preference_action_result" in result.outputs:
@@ -71,10 +80,51 @@ def _state_from_turn_result(source_state: AgentState, result: AgentTurnResult) -
     return next_state
 
 
+def _build_legacy_pending_action(result: AgentTurnResult) -> Optional[dict[str, Any]]:
+    """把新的确认请求结构映射回旧的 pending_action 外显字段。
+
+    第一轮改造仍需兼容旧前端，所以这里继续提供一个轻量 dict，
+    但恢复执行的真源不再依赖它，而是依赖标准化 confirmation request。
+    """
+    confirmation = result.pending_confirmation
+    if confirmation is None:
+        return None
+    payload = confirmation.model_dump()
+    target_paper = dict(confirmation.target_paper or {})
+    arguments_summary = dict(confirmation.arguments_summary or {})
+    return {
+        "type": "tool_approval",
+        "status": "waiting_confirmation",
+        "decision": None,
+        "step_id": confirmation.step_id,
+        "tool_name": confirmation.tool_name,
+        "action_type": confirmation.action_type,
+        "side_effect_level": confirmation.side_effect_level,
+        "reason": confirmation.reason,
+        "title": target_paper.get("title") or confirmation.title,
+        "title_text": confirmation.title,
+        "description": confirmation.description,
+        "arxiv_id": target_paper.get("arxiv_id"),
+        "original_question": confirmation.original_question,
+        "target_paper": target_paper or None,
+        "allowed_decisions": [item.code for item in list(confirmation.allowed_decisions or [])],
+        "allow_argument_edit": confirmation.allow_argument_edit,
+        "allow_reject": confirmation.allow_reject,
+        "allow_note": confirmation.allow_note,
+        "arguments_summary": arguments_summary,
+        "confirmation_request": payload,
+        "thread_id": confirmation.thread_id,
+        "session_id": confirmation.session_id,
+        "plan_id": confirmation.plan_id,
+        "trace_id": confirmation.trace_id,
+        "qa_question": arguments_summary.get("qa_question") or arguments_summary.get("question"),
+    }
+
+
 def run_agent_turn_node(state: Any) -> AgentState:
     """LangGraph 主流程节点：直接执行新的 plan runtime。"""
     current_state = _coerce_state(state)
-    result = run_agent_turn(current_state)
+    result = run_agent_turn_in_graph(current_state)
     return _state_from_turn_result(current_state, result)
 
 
@@ -84,8 +134,16 @@ def route_after_parse(state: Any) -> str:
     return "run_agent_turn"
 
 
-def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
-    """构建 Step 6 主图：parse_search_request -> run_agent_turn -> END。"""
+def build_arxiv_search_graph(
+    generation_service: Optional[Any] = None,
+    *,
+    checkpointer: Optional[Any] = None,
+) -> Any:
+    """构建 Step 6 主图：parse_search_request -> run_agent_turn -> END。
+
+    默认使用进程级共享的内存 checkpointer，先满足本地开发和测试场景下的 interrupt/resume。
+    外部显式传入 checkpointer 时，以外部实现为准，给后续替换成持久化 checkpoint 预留入口。
+    """
     graph = StateGraph(AgentState)
 
     graph.add_node("parse_search_request", lambda state: parse_search_request(state, generation_service=generation_service))
@@ -95,12 +153,20 @@ def build_arxiv_search_graph(generation_service: Optional[Any] = None) -> Any:
     graph.add_edge("parse_search_request", "run_agent_turn")
     graph.add_edge("run_agent_turn", END)
 
-    return graph.compile()
+    compiled_checkpointer = checkpointer if checkpointer is not None else DEFAULT_GRAPH_CHECKPOINTER
+    return graph.compile(checkpointer=compiled_checkpointer)
 
 
-def export_arxiv_search_graph_mermaid(generation_service: Optional[Any] = None) -> dict[str, Any]:
+def export_arxiv_search_graph_mermaid(
+    generation_service: Optional[Any] = None,
+    *,
+    checkpointer: Optional[Any] = None,
+) -> dict[str, Any]:
     """导出当前主流程图结构，优先使用 LangGraph 原生 Mermaid。"""
-    compiled_graph = build_arxiv_search_graph(generation_service=generation_service)
+    compiled_graph = build_arxiv_search_graph(
+        generation_service=generation_service,
+        checkpointer=checkpointer,
+    )
     drawable_graph = None
     mermaid = ""
     render_source = "langgraph"
@@ -135,6 +201,7 @@ def _build_fallback_mermaid() -> str:
 
 
 __all__ = [
+    "DEFAULT_GRAPH_CHECKPOINTER",
     "build_arxiv_search_graph",
     "export_arxiv_search_graph_mermaid",
     "route_after_parse",

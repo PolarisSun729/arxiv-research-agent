@@ -72,7 +72,11 @@ def _ensure_plan_runtime(state: AgentState) -> PlanRuntime:
         state={},
         goal=state.goal,
         plan=state.execution_plan,
-        pending_confirmation=state.pending_action if isinstance(state.pending_action, Mapping) else None,
+        pending_confirmation=(
+            (state.pending_action or {}).get("confirmation_request")
+            if isinstance(state.pending_action, Mapping) and isinstance((state.pending_action or {}).get("confirmation_request"), Mapping)
+            else None
+        ),
     )
 
 
@@ -240,7 +244,11 @@ def _refresh_execution_plan_runtime(state: AgentState) -> AgentState:
         update={
             "goal": next_state.goal,
             "plan": next_state.execution_plan,
-            "pending_confirmation": next_state.pending_action if isinstance(next_state.pending_action, Mapping) else runtime.pending_confirmation,
+            "pending_confirmation": (
+                (next_state.pending_action or {}).get("confirmation_request")
+                if isinstance(next_state.pending_action, Mapping) and isinstance((next_state.pending_action or {}).get("confirmation_request"), Mapping)
+                else runtime.pending_confirmation
+            ),
             "final_answer": next_state.answer,
         }
     )

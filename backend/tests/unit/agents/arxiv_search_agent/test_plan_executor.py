@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 
 from tests.helpers.agent_runtime import load_agent_test_modules
 
@@ -155,9 +156,104 @@ def test_plan_executor_returns_waiting_confirmation_before_side_effect(monkeypat
 
     assert result.status == "waiting_confirmation"
     assert result.pending_confirmation is not None
-    assert result.pending_confirmation["step_id"] == "parse_and_index_paper"
+    assert result.pending_confirmation.step_id == "parse_and_index_paper"
+    assert result.pending_confirmation.tool_name == "parse_and_index_paper"
+    assert result.pending_confirmation.side_effect_level == "external_call"
+    assert [item.code for item in result.pending_confirmation.allowed_decisions] == ["approve", "reject"]
+    json.dumps(result.pending_confirmation.model_dump(), ensure_ascii=False)
+    assert result.pending_confirmation.arguments_summary["paper_reference"]["arxiv_id"] == "2401.00001"
     assert result.plan is not None
     assert result.plan.steps[0].status == "waiting_confirmation"
+
+
+def test_plan_executor_interrupt_approve_executes_side_effect_tool(monkeypatch) -> None:
+    calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        calls.append((tool_name, dict(kwargs)))
+        if tool_name == "build_paper_qa_index":
+            return {"ok": True, "tool_name": tool_name, "summary": "indexed", "data": {"status": "indexed", "has_index": True}, "trace": {}, "error": None}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+    monkeypatch.setattr(executor_module, "interrupt", lambda payload: {"decision": "approve", "note": "go"})
+
+    goal = Goal(goal_id="paper_qa:test", goal_type="paper_qa", user_request="index paper")
+    plan = ExecutablePlan(
+        plan_id="paper_qa:test",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="parse_and_index_paper",
+                action_type="index",
+                tool_name="parse_and_index_paper",
+                tool=_tool("parse_and_index_paper"),
+                output_key="index_build_result",
+                input_bindings=[StepInputBinding(input_key="paper_reference", source_type="literal", value={"arxiv_id": "2401.00001"})],
+                confirmation_policy=StepPolicy(
+                    policy_type="confirmation",
+                    mode="explicit_user_confirmation_required",
+                    requires_confirmation=True,
+                ),
+                side_effect_level="external_call",
+            ),
+        ],
+        entry_step_ids=["parse_and_index_paper"],
+        final_step_ids=["parse_and_index_paper"],
+    )
+
+    runtime = planner_module.build_plan_runtime(AgentState(intent="paper_qa", message="build index"), goal=goal, plan=plan, turn_status="success")
+    runtime.step_status = {step.step_id: "pending" for step in list(plan.steps or [])}
+    result = PlanExecutor()._execute_runtime(runtime, AgentState(intent="paper_qa", message="build index"), allow_interrupt=True)
+
+    assert result.status == "success"
+    assert calls and calls[0][0] == "build_paper_qa_index"
+    assert len(calls) == 1
+    assert any(trace.event == "confirmation_requested" for trace in result.trace)
+    assert any(trace.event == "confirmation_approved" for trace in result.trace)
+
+
+def test_plan_executor_interrupt_reject_skips_side_effect_tool(monkeypatch) -> None:
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("side effect tool must not run after reject")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fail_if_called)
+    monkeypatch.setattr(executor_module, "interrupt", lambda payload: {"decision": "reject", "note": "cancel"})
+
+    goal = Goal(goal_id="paper_qa:test", goal_type="paper_qa", user_request="index paper")
+    plan = ExecutablePlan(
+        plan_id="paper_qa:test",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="parse_and_index_paper",
+                action_type="index",
+                tool_name="parse_and_index_paper",
+                tool=_tool("parse_and_index_paper"),
+                output_key="index_build_result",
+                input_bindings=[StepInputBinding(input_key="paper_reference", source_type="literal", value={"arxiv_id": "2401.00001", "title": "RAG Paper"})],
+                confirmation_policy=StepPolicy(
+                    policy_type="confirmation",
+                    mode="explicit_user_confirmation_required",
+                    requires_confirmation=True,
+                ),
+                side_effect_level="external_call",
+            ),
+        ],
+        entry_step_ids=["parse_and_index_paper"],
+        final_step_ids=["parse_and_index_paper"],
+    )
+
+    runtime = planner_module.build_plan_runtime(AgentState(intent="paper_qa", message="build index"), goal=goal, plan=plan, turn_status="success")
+    runtime.step_status = {step.step_id: "pending" for step in list(plan.steps or [])}
+    result = PlanExecutor()._execute_runtime(runtime, AgentState(intent="paper_qa", message="build index"), allow_interrupt=True)
+
+    assert result.status in {"success", "waiting_confirmation", "fallback"}
+    assert result.final_answer == "已取消解析 RAG Paper，因此无法继续基于全文回答。"
+    assert any(trace.event == "confirmation_requested" for trace in result.trace)
+    assert any(trace.event == "confirmation_rejected" for trace in result.trace)
+    assert result.plan is not None
+    assert result.plan.steps[0].status == "skipped"
 
 
 def test_plan_executor_marks_missing_input_as_failed() -> None:
@@ -183,6 +279,46 @@ def test_plan_executor_marks_missing_input_as_failed() -> None:
 
     assert result.status == "failed"
     assert result.error == "missing_input:generate_fallback_response:message"
+    assert result.plan is not None
+    assert result.plan.steps[0].status == "failed"
+    assert any(trace.detail.get("failure_reason") == "missing_input" for trace in result.trace)
+    assert result.pending_confirmation is None
+
+
+def test_plan_executor_missing_input_does_not_trigger_confirmation(monkeypatch) -> None:
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("tool must not run when required input is missing")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fail_if_called)
+
+    goal = Goal(goal_id="paper_qa:missing", goal_type="paper_qa", user_request="index paper")
+    plan = ExecutablePlan(
+        plan_id="paper_qa:missing",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="parse_and_index_paper",
+                action_type="index",
+                tool_name="parse_and_index_paper",
+                tool=_tool("parse_and_index_paper"),
+                output_key="index_build_result",
+                input_bindings=[StepInputBinding(input_key="paper_reference", source_type="state", source_key="missing_paper")],
+                confirmation_policy=StepPolicy(
+                    policy_type="confirmation",
+                    mode="explicit_user_confirmation_required",
+                    requires_confirmation=True,
+                ),
+                side_effect_level="external_call",
+            ),
+        ],
+        entry_step_ids=["parse_and_index_paper"],
+        final_step_ids=["parse_and_index_paper"],
+    )
+
+    result = PlanExecutor().execute(plan, AgentState(intent="paper_qa", message="build index"))
+
+    assert result.status == "failed"
+    assert result.pending_confirmation is None
     assert result.plan is not None
     assert result.plan.steps[0].status == "failed"
     assert any(trace.detail.get("failure_reason") == "missing_input" for trace in result.trace)
@@ -244,7 +380,10 @@ def test_plan_executor_replans_missing_paper_index_to_confirmation(monkeypatch) 
 
     assert result.status == "waiting_confirmation"
     assert result.pending_confirmation is not None
-    assert result.pending_confirmation["tool_name"] == "request_confirmation"
+    assert result.pending_confirmation.tool_name == "parse_and_index_paper"
+    assert result.pending_confirmation.target_paper is not None
+    assert result.pending_confirmation.target_paper["arxiv_id"] == "2401.00001"
+    assert [item.code for item in result.pending_confirmation.allowed_decisions] == ["approve", "reject"]
     assert any(step.tool_name == "parse_and_index_paper" for step in result.plan.steps)
     assert any(trace.event == "plan_replanned" and trace.detail.get("rule_name") == "rule_missing_paper_index" for trace in result.trace)
 

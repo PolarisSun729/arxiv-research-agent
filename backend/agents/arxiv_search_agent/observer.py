@@ -100,11 +100,9 @@ class Observer:
         return ObservationResult(status="partial_success", reason="paper_index_status_unknown", confidence=0.5)
 
     def _observe_request_confirmation(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
-        del resolved_input, runtime, state
-        payload = normalized_output if isinstance(normalized_output, Mapping) else raw_output if isinstance(raw_output, Mapping) else {}
-        status = str(payload.get("status") or "").lower()
-        if status in {"waiting_confirmation", "waiting", "pending"}:
-            return ObservationResult(status="need_confirmation", reason="waiting_for_user_confirmation", confidence=1.0, details={"pending_action": payload.get("pending_action")}, suggested_action="await_user_confirmation")
+        del resolved_input, raw_output, normalized_output, runtime, state
+        # request_confirmation 在新的执行模型里只负责准备确认上下文；
+        # 真正的暂停点统一放在有副作用 step 的工具调用前，避免提前在“准备步骤”上打断并劫持恢复顺序。
         return ObservationResult(status="success", reason="confirmation_already_available", confidence=1.0)
 
     def _observe_retrieve_paper_chunks(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:

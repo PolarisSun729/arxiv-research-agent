@@ -132,6 +132,10 @@ function getPreferenceActionLabel(result: AgentPreferenceActionResult | null) {
           <strong>{{ responseData.intent || '-' }}</strong>
         </div>
         <div class="summary-chip">
+          <span class="summary-chip__label">session</span>
+          <strong>{{ responseData.session_id || '-' }}</strong>
+        </div>
+        <div class="summary-chip">
           <span class="summary-chip__label">steps</span>
           <strong>{{ steps.length }}</strong>
         </div>
@@ -236,7 +240,18 @@ function getPreferenceActionLabel(result: AgentPreferenceActionResult | null) {
         <span class="agent-collapse__count">{{ pendingAction ? 1 : 0 }}</span>
       </summary>
       <div v-if="!pendingAction" class="empty-state">鏆傛棤寰呯‘璁や换鍔?</div>
-      <pre v-else class="json-block">{{ formatJson(pendingAction) }}</pre>
+      <div v-else class="pending-action-detail">
+        <div class="pending-action-detail__grid">
+          <div><strong>tool</strong>: {{ pendingAction.tool_name || '-' }}</div>
+          <div><strong>step</strong>: {{ pendingAction.step_id || '-' }}</div>
+          <div><strong>session</strong>: {{ pendingAction.session_id || responseData.session_id || '-' }}</div>
+          <div><strong>thread</strong>: {{ pendingAction.thread_id || '-' }}</div>
+        </div>
+        <div class="pending-action-detail__text">
+          {{ pendingAction.description || pendingAction.reason || '等待用户确认后继续执行。' }}
+        </div>
+        <pre class="json-block">{{ formatJson(pendingAction) }}</pre>
+      </div>
     </details>
 
     <details class="agent-collapse">
@@ -449,6 +464,24 @@ function getPreferenceActionLabel(result: AgentPreferenceActionResult | null) {
   padding-left: 34px;
 }
 
+.pending-action-detail {
+  padding: 0 16px 16px;
+}
+
+.pending-action-detail__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+  color: #334155;
+  font-size: 13px;
+}
+
+.pending-action-detail__text {
+  margin-top: 10px;
+  color: #475569;
+  line-height: 1.6;
+}
+
 .agent-response-panel__papers {
   padding: 16px;
 }
@@ -472,6 +505,10 @@ function getPreferenceActionLabel(result: AgentPreferenceActionResult | null) {
 
 @media (max-width: 640px) {
   .agent-response-panel__meta {
+    grid-template-columns: 1fr;
+  }
+
+  .pending-action-detail__grid {
     grid-template-columns: 1fr;
   }
 }

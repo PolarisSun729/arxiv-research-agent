@@ -14,6 +14,7 @@ if _BACKEND_DIR not in sys.path:
 
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
+from langgraph.types import Command
 
 from services.memory import MemoryService
 from services.storage.database_service import DatabaseService
@@ -25,7 +26,7 @@ except Exception:  # pragma: no cover
     _get_generation_service = None
 
 from .graph import build_arxiv_search_graph
-from .schemas import AgentStep, AgentStreamEvent, ArxivSearchRequest, ArxivSearchResponse
+from .schemas import AgentStep, AgentStreamEvent, ArxivSearchRequest, ArxivSearchResponse, ResumeRequest
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,61 @@ logger = logging.getLogger(__name__)
 # 3. 构造初始 AgentState 并执行 LangGraph；
 # 4. 把最终状态转换成同步响应或流式 SSE 事件。
 MEMORY_RUNTIME_CONFIG = get_memory_runtime_config()
+
+
+def _ensure_session_id(session_id: Optional[str]) -> str:
+    """统一补全可复用的 session_id。
+
+    LangGraph 的 thread_id 需要稳定，当前阶段直接让业务 session_id 与 thread_id 对齐，
+    这样既能继续满足前端对 session_id 的依赖，也能避免“同一次会话每轮都新开执行线程”。
+    """
+    normalized = str(session_id or "").strip()
+    return normalized or str(uuid4())
+
+
+def _build_langgraph_config(thread_id: str) -> Dict[str, Any]:
+    """构建 LangGraph 运行配置。
+
+    这里只放稳定、轻量的恢复标识，避免把大对象直接塞进 checkpoint config。
+    """
+    return {"configurable": {"thread_id": thread_id}}
+
+
+def _is_resume_request(request: ArxivSearchRequest) -> bool:
+    """统一判断当前请求是否走 interrupt 恢复主路径。"""
+    return request.resume is not None
+
+
+def _build_resume_payload(resume: ResumeRequest) -> Dict[str, Any]:
+    """把前端 resume 请求裁剪成传给 Command(resume=...) 的轻量 payload。
+
+    这里只保留执行恢复真正需要的字段，避免把完整请求上下文重复写入 checkpoint 恢复链路。
+    """
+    payload: Dict[str, Any] = {"decision": resume.decision}
+    if resume.note:
+        payload["note"] = resume.note
+    if resume.step_id:
+        payload["step_id"] = resume.step_id
+    if resume.interrupt_id:
+        payload["interrupt_id"] = resume.interrupt_id
+    if resume.edited_arguments:
+        payload["edited_arguments"] = dict(resume.edited_arguments)
+    return payload
+
+
+def _ensure_resume_checkpoint(graph: Any, thread_id: str) -> None:
+    """在恢复前先校验 checkpoint 是否存在，避免把错误 session 当成新请求执行。
+
+    真实 LangGraph 环境可以通过 get_state 检查线程是否已有执行现场；
+    测试桩没有实现时则跳过这层校验，由集成测试里的 fake graph 显式模拟。
+    """
+    get_state = getattr(graph, "get_state", None)
+    if not callable(get_state):
+        return
+
+    graph_state = get_state(config=_build_langgraph_config(thread_id))
+    if graph_state is None:
+        raise ValueError(f"未找到可恢复的执行现场，请确认 session_id={thread_id} 是否正确。")
 
 
 def _inject_user_memory_context(request_context: Dict[str, Any], user_id: Optional[str]) -> tuple[Dict[str, Any], Dict[str, Any]]:
@@ -127,6 +183,26 @@ def _persist_agent_session_memory(final_state: Any) -> None:
         )
 
 
+def _build_initial_agent_state(
+    normalized_request: ArxivSearchRequest,
+    *,
+    resolved_session_id: str,
+    request_context: Dict[str, Any],
+    user_memory_debug: Dict[str, Any],
+) -> AgentState:
+    """统一构造同步与流式入口共享的初始 AgentState。"""
+    return AgentState(
+        user_id=normalized_request.user_id,
+        session_id=resolved_session_id,
+        message=normalized_request.message,
+        # 保留业务 memory 的上下文增强职责，但执行现场恢复改由 LangGraph checkpoint 承担。
+        context=request_context,
+        pending_action=request_context.get("pending_action"),
+        paper_qa_result=request_context.get("paper_qa_result"),
+        debug=dict(user_memory_debug or {}),
+    )
+
+
 def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
     """同步执行一次 arXiv Agent，并返回最终聚合响应。
 
@@ -146,31 +222,38 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
 
         # 第 2 步：把前端 context 与后端 Agent session memory 合并。
         request_context, _agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(normalized_request)
+        resolved_session_id = _ensure_session_id(resolved_session_id)
+        graph_config = _build_langgraph_config(resolved_session_id)
         # 入口日志只记录状态摘要，便于排查“前端传了但后端没识别到”的问题，不直接打出完整上下文内容。
         logger.debug(
-            "arxiv_agent request received: message=%s context_keys=%s pending_action_status=%s paper_qa_status=%s selected_arxiv_id=%s",
+            "arxiv_agent request received: session_id=%s thread_id=%s message=%s context_keys=%s pending_action_status=%s paper_qa_status=%s selected_arxiv_id=%s",
+            resolved_session_id,
+            resolved_session_id,
             normalized_request.message,
             sorted(request_context.keys()),
             _safe_status(request_context.get("pending_action")),
             _safe_status(request_context.get("paper_qa_result")),
             _safe_selected_arxiv_id(request_context),
         )
-        # 第 3 步：解析生成服务，并构造图执行所需的初始状态。
+        # 第 3 步：解析生成服务，并统一构造图对象。
         generation_service = _resolve_generation_service()
-        initial_state = AgentState(
-            user_id=normalized_request.user_id,
-            session_id=resolved_session_id,
-            message=normalized_request.message,
-            # 把前端回传的待确认状态提升到顶层，避免后续路由只看 context 时漏掉当前待办。
-            context=request_context,
-            pending_action=request_context.get("pending_action"),
-            paper_qa_result=request_context.get("paper_qa_result"),
-            debug=dict(user_memory_debug or {}),
-        )
-
-        # 第 4 步：构建图并同步执行，拿到最终状态。
         graph = build_arxiv_search_graph(generation_service=generation_service)
-        final_state = _coerce_state(graph.invoke(initial_state.model_dump()))
+
+        if _is_resume_request(normalized_request):
+            # resume 路径必须复用同一个 thread_id，并直接从 interrupt 位置恢复，
+            # 不能重新构造一轮完整业务初始状态，否则会把确认恢复退化回“伪恢复”。
+            _ensure_resume_checkpoint(graph, resolved_session_id)
+            resume_payload = _build_resume_payload(normalized_request.resume)
+            final_state = _coerce_state(graph.invoke(Command(resume=resume_payload), config=graph_config))
+        else:
+            initial_state = _build_initial_agent_state(
+                normalized_request,
+                resolved_session_id=resolved_session_id,
+                request_context=request_context,
+                user_memory_debug=user_memory_debug,
+            )
+            # 普通请求仍从完整初始状态进入主图，保持搜索/推荐/QA 等非确认链路行为不变。
+            final_state = _coerce_state(graph.invoke(initial_state.model_dump(), config=graph_config))
 
         # 第 5 步：把跨轮 Agent memory 回写到后端 session。
         _persist_agent_session_memory(final_state)
@@ -217,26 +300,33 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
         try:
             # 阶段 B：构造与同步入口一致的初始上下文和状态，保证两条路径行为一致。
             request_context, _agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(normalized_request)
+            resolved_session_id = _ensure_session_id(resolved_session_id)
+            graph_config = _build_langgraph_config(resolved_session_id)
             logger.debug(
-                "arxiv_agent stream start: run_id=%s message=%s context_keys=%s pending_action_status=%s paper_qa_status=%s selected_arxiv_id=%s",
+                "arxiv_agent stream start: run_id=%s session_id=%s thread_id=%s message=%s context_keys=%s pending_action_status=%s paper_qa_status=%s selected_arxiv_id=%s",
                 run_id,
+                resolved_session_id,
+                resolved_session_id,
                 normalized_request.message,
                 sorted(request_context.keys()),
                 _safe_status(request_context.get("pending_action")),
                 _safe_status(request_context.get("paper_qa_result")),
                 _safe_selected_arxiv_id(request_context),
             )
-            current_state = AgentState(
-                user_id=normalized_request.user_id,
-                session_id=resolved_session_id,
-                message=normalized_request.message,
-                # 流式路径和同步路径必须使用同一份状态提升规则，确保确认/解析流程一致。
-                context=request_context,
-                pending_action=request_context.get("pending_action"),
-                paper_qa_result=request_context.get("paper_qa_result"),
-                debug=dict(user_memory_debug or {}),
-            )
             graph = build_arxiv_search_graph(generation_service=generation_service)
+            graph_input: Any
+
+            if _is_resume_request(normalized_request):
+                _ensure_resume_checkpoint(graph, resolved_session_id)
+                graph_input = Command(resume=_build_resume_payload(normalized_request.resume))
+            else:
+                current_state = _build_initial_agent_state(
+                    normalized_request,
+                    resolved_session_id=resolved_session_id,
+                    request_context=request_context,
+                    user_memory_debug=user_memory_debug,
+                )
+                graph_input = current_state.model_dump()
 
             # 阶段 C：先发出 run_start 事件，让前端知道一次新的执行已经开始。
             yield _sse_event(
@@ -257,7 +347,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
             sequence += 1
 
             # 阶段 D：逐步消费 LangGraph 的 updates 流，并把节点生命周期翻译成 SSE 事件。
-            for update in graph.stream(current_state.model_dump(), stream_mode="updates"):
+            for update in graph.stream(graph_input, config=graph_config, stream_mode="updates"):
                 if not update:
                     continue
 

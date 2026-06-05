@@ -20,6 +20,7 @@ const {
   messages,
   latestResponse,
   pendingAction,
+  activeSessionId,
   setInputMessage,
   submitMessage,
   clearConversation
@@ -44,11 +45,21 @@ function handleClear() {
 }
 
 function handleConfirmPendingAction() {
-  submitMessage('解析')
+  submitMessage('批准当前确认请求', {
+    resume: {
+      decision: 'approve',
+      step_id: pendingAction.value?.step_id || null
+    }
+  })
 }
 
 function handleCancelPendingAction() {
-  submitMessage('取消')
+  submitMessage('拒绝当前确认请求', {
+    resume: {
+      decision: 'reject',
+      step_id: pendingAction.value?.step_id || null
+    }
+  })
 }
 
 function handleViewDetail(id: string) {
@@ -171,6 +182,11 @@ watch(latestResponse, () => {
           </div>
           <div class="pending-action-banner__desc">
             {{ pendingAction.qa_question || pendingAction.original_question || '需要先确认是否解析 PDF 并建立全文索引。' }}
+          </div>
+          <div class="pending-action-banner__meta">
+            <span>tool: {{ pendingAction.tool_name || '-' }}</span>
+            <span>step: {{ pendingAction.step_id || '-' }}</span>
+            <span>session: {{ activeSessionId || pendingAction.session_id || '-' }}</span>
           </div>
         </div>
         <div class="pending-action-banner__actions">
@@ -324,6 +340,15 @@ watch(latestResponse, () => {
   margin-top: 4px;
   color: #475569;
   line-height: 1.6;
+}
+
+.pending-action-banner__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 8px;
+  color: #64748b;
+  font-size: 12px;
 }
 
 .pending-action-banner__actions {

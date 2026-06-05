@@ -118,3 +118,33 @@ Stage 2 tests should stay local, deterministic, and fully isolated from external
 - do not depend on real arXiv network requests
 - do not depend on real recommendation services
 - do not depend on real database state
+
+## Confirmation Runtime Migration Notes
+
+当前确认机制已经从“手动 waiting_confirmation + 下一轮自然语言继续”迁移为“LangGraph checkpoint + interrupt/resume”。
+
+- `ToolSpec.requires_confirmation` 仍然是是否需要确认的治理入口
+- `PlanExecutor` 会在真正执行副作用工具前完成 input binding，并在工具调用前触发确认
+- 图内执行使用 `interrupt()` 暂停，等待用户决策
+- LangGraph 主图通过 checkpointer 保存执行现场
+- `service.py` 使用稳定的 `thread_id` 恢复同一条执行线程；当前规则是 `thread_id == session_id`
+- 用户确认后由 `Command(resume=...)` 恢复，不再重新解析“确认/取消”自然语言，也不重新创建新任务
+- `pending_action`、`paper_qa_result`、`plan_runtime`、`execution_plan` 继续保留给前端展示和兼容，但它们不再是恢复执行现场的主依据
+- `pending_action_node.py` 目前仅作为旧前端/旧测试兼容层保留，不再承担新的主恢复链路
+
+### 当前前端约定
+
+- 当响应进入等待确认状态时，前端继续读取 `pending_action` 展示标题、原因、目标论文、session 信息
+- 点击 approve / reject 时，前端应发送结构化 `resume` 请求，而不是仅发送普通聊天文本
+- 结构化恢复请求至少包含：
+  - `session_id`
+  - `message`
+  - `resume.decision`
+  - `resume.step_id`
+
+### 回归关注点
+
+- 普通搜索、推荐、偏好更新等非确认链路不应受影响
+- approve 后副作用工具只能执行一次，不能重复 interrupt 或重复调用
+- reject 后副作用工具不能执行
+- 不同 `session_id` 之间不能串用 checkpoint 状态

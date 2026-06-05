@@ -25,6 +25,7 @@ function getErrorMessage(error: unknown, fallback: string) {
 
 function createDraftResponse(): ArxivSearchResponse {
   return {
+    session_id: null,
     intent: 'loading',
     answer: '',
     search_spec: null,
@@ -273,6 +274,7 @@ export function useAgentSearchChat() {
   const pendingAction = ref<Record<string, any> | null>(null)
   const selectedPaper = ref<AgentPaper | null>(null)
   const paperQaResult = ref<Record<string, any> | null>(null)
+  const activeSessionId = ref<string | null>(null)
 
   function setInputMessage(value: string) {
     inputMessage.value = value
@@ -285,6 +287,7 @@ export function useAgentSearchChat() {
     pendingAction.value = null
     selectedPaper.value = null
     paperQaResult.value = null
+    activeSessionId.value = null
     inputMessage.value = ''
   }
 
@@ -337,7 +340,23 @@ export function useAgentSearchChat() {
     }
   }
 
-  async function submitMessage(rawMessage?: string) {
+  function rememberSessionId(response: ArxivSearchResponse | null | undefined) {
+    const sessionId = typeof response?.session_id === 'string' ? response.session_id.trim() : ''
+    if (sessionId) {
+      activeSessionId.value = sessionId
+    }
+  }
+
+  async function submitMessage(
+    rawMessage?: string,
+    options?: {
+      resume?: {
+        decision: 'approve' | 'reject'
+        note?: string
+        step_id?: string | null
+      }
+    }
+  ) {
     const message = (rawMessage ?? inputMessage.value).trim()
     if (!message || loading.value) return
 
@@ -415,6 +434,8 @@ export function useAgentSearchChat() {
         {
           message,
           user_id: 'local_user',
+          session_id: activeSessionId.value,
+          ...(options?.resume ? { resume: options.resume } : {}),
           context: Object.keys(requestContext).length ? requestContext : undefined
         },
         {
@@ -428,6 +449,7 @@ export function useAgentSearchChat() {
       )
 
       latestResponse.value = response
+      rememberSessionId(response)
       rememberSearchPapers(response)
       rememberSelectedPaper(response)
       rememberPaperQaResult(response)
@@ -446,9 +468,12 @@ export function useAgentSearchChat() {
         const fallbackResponse = await runAgentChat({
           message,
           user_id: 'local_user',
+          session_id: activeSessionId.value,
+          ...(options?.resume ? { resume: options.resume } : {}),
           context: Object.keys(requestContext).length ? requestContext : undefined
         })
         latestResponse.value = fallbackResponse
+        rememberSessionId(fallbackResponse)
         rememberSearchPapers(fallbackResponse)
         rememberSelectedPaper(fallbackResponse)
         rememberPaperQaResult(fallbackResponse)
@@ -489,6 +514,7 @@ export function useAgentSearchChat() {
     pendingAction,
     selectedPaper,
     paperQaResult,
+    activeSessionId,
     setInputMessage,
     submitMessage,
     clearConversation

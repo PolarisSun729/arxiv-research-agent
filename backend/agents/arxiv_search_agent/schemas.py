@@ -96,6 +96,7 @@ class ArxivSearchRequest(BaseModel):
     session_id: Optional[str] = None
     message: str
     context: Dict[str, Any] = Field(default_factory=dict)
+    resume: Optional["ResumeRequest"] = None
 
     @field_validator("user_id", "session_id", "message", mode="before")
     @classmethod
@@ -105,6 +106,16 @@ class ArxivSearchRequest(BaseModel):
             return None
         text = str(value).strip()
         return text
+
+    @field_validator("resume", mode="before")
+    @classmethod
+    def _coerce_resume(cls, value: Any) -> Any:
+        # 新前端应直接传结构化 resume；这里顺手兼容对象/字典两种输入形态，
+        # 避免 service 层还要到处判断具体载荷类型。
+        if value in (None, "", {}):
+            return None
+        model_dump = getattr(value, "model_dump", None)
+        return model_dump() if callable(model_dump) else value
 
     @model_validator(mode="after")
     def _validate_message(self) -> "ArxivSearchRequest":
@@ -406,6 +417,8 @@ class ExecutionPlanStep(BaseModel):
 PlanStepStatus = Literal["pending", "running", "success", "failed", "skipped", "waiting_confirmation"]
 AgentTurnStatus = Literal["success", "waiting_confirmation", "need_clarification", "failed", "fallback"]
 SideEffectLevel = Literal["none", "low", "high"]
+ConfirmationRequestType = Literal["tool_approval"]
+ConfirmationDecision = Literal["approve", "reject"]
 
 
 class ToolSpec(BaseModel):
@@ -493,6 +506,76 @@ class ExecutionTrace(BaseModel):
         return StepResult._normalize_status(value)
 
 
+class ConfirmationDecisionOption(BaseModel):
+    """定义一次确认请求允许的稳定决策枚举。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: ConfirmationDecision
+    label: Optional[str] = None
+    description: Optional[str] = None
+
+
+class ConfirmationDecisionPayload(BaseModel):
+    """定义用户恢复执行时提交的标准化决策。
+
+    第一版只支持 approve / reject。
+    edited_arguments 仅作为未来扩展预留字段，当前版本不启用参数修改能力。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: ConfirmationDecision
+    note: Optional[str] = None
+    edited_arguments: Optional[Dict[str, Any]] = None
+
+
+class ResumeRequest(BaseModel):
+    """定义前端发起 interrupt 恢复时使用的结构化请求。
+
+    第一版只把 approve / reject 做成稳定契约。
+    step_id / interrupt_id 先作为幂等校验与后续扩展预留字段，不在当前版本里驱动参数编辑。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: ConfirmationDecision
+    note: Optional[str] = None
+    step_id: Optional[str] = None
+    interrupt_id: Optional[str] = None
+    edited_arguments: Optional[Dict[str, Any]] = None
+
+
+class ConfirmationRequest(BaseModel):
+    """定义一次标准化的确认请求 payload。
+
+    这个结构会被用于 interrupt payload 和前后端交互，因此只保留可序列化、可展示的轻量字段，
+    不应塞入完整 runtime/state、原始 PDF、论文 chunk 或工具返回大对象。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_type: ConfirmationRequestType = "tool_approval"
+    step_id: str
+    tool_name: str
+    action_type: str
+    side_effect_level: str
+    reason: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    arguments_summary: Dict[str, Any] = Field(default_factory=dict)
+    original_question: Optional[str] = None
+    target_paper: Optional[Dict[str, Any]] = None
+    allowed_decisions: List[ConfirmationDecisionOption] = Field(default_factory=list)
+    allow_argument_edit: bool = False
+    allow_reject: bool = True
+    allow_note: bool = True
+    trace_id: Optional[str] = None
+    plan_id: Optional[str] = None
+    session_id: Optional[str] = None
+    thread_id: Optional[str] = None
+
+
 class PlanStep(BaseModel):
     """定义执行计划中的单个步骤。
 
@@ -574,7 +657,7 @@ class PlanRuntime(BaseModel):
     retry_counts: Dict[str, int] = Field(default_factory=dict)
     replan_counts: Dict[str, int] = Field(default_factory=dict)
     step_replan_counts: Dict[str, int] = Field(default_factory=dict)
-    pending_confirmation: Optional[Dict[str, Any]] = None
+    pending_confirmation: Optional[ConfirmationRequest] = None
     final_answer: Optional[str] = None
     error: Optional[str] = None
     turn_status: Optional[AgentTurnStatus] = None
@@ -589,11 +672,11 @@ class AgentTurnResult(BaseModel):
     plan: Optional[ExecutablePlan] = None
     outputs: Dict[str, Any] = Field(default_factory=dict)
     trace: List[ExecutionTrace] = Field(default_factory=list)
-    pending_confirmation: Optional[Dict[str, Any]] = None
+    pending_confirmation: Optional[ConfirmationRequest] = None
     error: Optional[str] = None
     runtime: Optional[PlanRuntime] = None
 
-    @field_validator("plan", "runtime", mode="before")
+    @field_validator("plan", "runtime", "pending_confirmation", mode="before")
     @classmethod
     def _coerce_runtime_models(cls, value: Any) -> Any:
         # 混合测试会重复导入 schema；这里仅把同形 Pydantic 对象转回原始 dict 重新校验。

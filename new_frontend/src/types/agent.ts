@@ -4,6 +4,13 @@ export interface ArxivSearchRequest {
   user_id?: string | null
   session_id?: string | null
   message: string
+  resume?: {
+    decision: 'approve' | 'reject'
+    note?: string | null
+    step_id?: string | null
+    interrupt_id?: string | null
+    edited_arguments?: Record<string, any> | null
+  } | null
   context?: {
     selected_paper?: AgentPaper | null
     last_papers?: AgentPaper[]
@@ -116,6 +123,7 @@ export interface AgentPreferenceActionResult {
 }
 
 export interface ArxivSearchResponse {
+  session_id?: string | null
   intent: string
   answer: string
   search_spec?: ArxivSearchSpec | null

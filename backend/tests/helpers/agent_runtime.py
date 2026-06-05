@@ -232,6 +232,26 @@ def _ensure_tool_stubs() -> None:
 def _ensure_langgraph_stub() -> None:
     langgraph_module = types.ModuleType("langgraph")
     graph_module = types.ModuleType("langgraph.graph")
+    types_module = types.ModuleType("langgraph.types")
+    checkpoint_module = types.ModuleType("langgraph.checkpoint")
+    checkpoint_memory_module = types.ModuleType("langgraph.checkpoint.memory")
+
+    class _MemorySaver:
+        """测试桩里的内存 checkpoint。
+
+        这里只需要保留“存在一个可共享的 checkpointer 实例”这一契约，
+        让图编译和 config 透传逻辑可以在单测里被验证，而不引入真实持久化行为。
+        """
+
+        def __init__(self):
+            self.snapshots = {}
+
+    class _Command:
+        def __init__(self, *, resume=None):
+            self.resume = resume
+
+    def _interrupt(payload):
+        return None
 
     class _GraphView:
         def __init__(self, nodes, edges):
@@ -245,10 +265,15 @@ def _ensure_langgraph_stub() -> None:
             return "\n".join(lines)
 
     class _CompiledGraph:
-        def __init__(self, nodes, edges, conditional_edges):
+        def __init__(self, nodes, edges, conditional_edges, checkpointer=None):
             self._nodes = nodes
             self._edges = list(edges)
             self._conditional_edges = dict(conditional_edges)
+            self._checkpointer = checkpointer
+            self.last_invoke_config = None
+            self.last_stream_config = None
+            self.last_invoke_input = None
+            self.last_stream_input = None
 
         @staticmethod
         def _finalize_state(value):
@@ -269,7 +294,9 @@ def _ensure_langgraph_stub() -> None:
                 return mapping[route_key]
             return next(end for start, end in self._edges if start == current)
 
-        def invoke(self, state):
+        def invoke(self, state, config=None):
+            self.last_invoke_config = config
+            self.last_invoke_input = state
             current_state = state
             current = next(end for start, end in self._edges if start == "START")
             while current != "END":
@@ -278,7 +305,9 @@ def _ensure_langgraph_stub() -> None:
                 current = self._next_node(current, current_state)
             return self._finalize_state(current_state)
 
-        def stream(self, state, stream_mode: str = "updates"):
+        def stream(self, state, config=None, stream_mode: str = "updates"):
+            self.last_stream_config = config
+            self.last_stream_input = state
             del stream_mode
             current_state = state
             current = next(end for start, end in self._edges if start == "START")
@@ -290,6 +319,14 @@ def _ensure_langgraph_stub() -> None:
 
         def get_graph(self):
             return _GraphView(self._nodes, self._edges)
+
+        def get_state(self, config=None):
+            if not self._checkpointer:
+                return None
+            thread_id = str((((config or {}).get("configurable") or {}).get("thread_id")) or "").strip()
+            if not thread_id:
+                return None
+            return self._checkpointer.snapshots.get(thread_id)
 
     class _StateGraph:
         def __init__(self, *_args, **_kwargs):
@@ -306,14 +343,21 @@ def _ensure_langgraph_stub() -> None:
         def add_conditional_edges(self, source, router, mapping):
             self.conditional_edges[source] = (router, mapping)
 
-        def compile(self):
-            return _CompiledGraph(self.nodes, self.edges, self.conditional_edges)
+        def compile(self, checkpointer=None):
+            return _CompiledGraph(self.nodes, self.edges, self.conditional_edges, checkpointer=checkpointer)
 
     graph_module.END = "END"
     graph_module.START = "START"
     graph_module.StateGraph = _StateGraph
+    types_module.Command = _Command
+    types_module.interrupt = _interrupt
+    checkpoint_memory_module.MemorySaver = _MemorySaver
+    checkpoint_memory_module.InMemorySaver = _MemorySaver
     sys.modules["langgraph"] = langgraph_module
     sys.modules["langgraph.graph"] = graph_module
+    sys.modules["langgraph.types"] = types_module
+    sys.modules["langgraph.checkpoint"] = checkpoint_module
+    sys.modules["langgraph.checkpoint.memory"] = checkpoint_memory_module
 
 
 def _load_module(module_name: str, file_path: Path):
@@ -349,6 +393,12 @@ def load_agent_test_modules() -> Dict[str, Any]:
         "backend.agents.arxiv_search_agent.utils.state_utils",
         "backend.agents.arxiv_search_agent.utils.text_utils",
         "backend.agents.arxiv_search_agent.utils.paper_reference_resolver",
+        "backend.agents.arxiv_search_agent.observer",
+        "backend.agents.arxiv_search_agent.planner",
+        "backend.agents.arxiv_search_agent.plan_validator",
+        "backend.agents.arxiv_search_agent.replanner",
+        "backend.agents.arxiv_search_agent.plan_executor",
+        "backend.agents.arxiv_search_agent.tool_registry",
         "backend.agents.arxiv_search_agent.node.tool_node",
         "backend.agents.arxiv_search_agent.node.intent_support",
         "backend.agents.arxiv_search_agent.node.parse_node",

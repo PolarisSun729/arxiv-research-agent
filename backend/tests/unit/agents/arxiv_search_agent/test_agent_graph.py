@@ -11,6 +11,7 @@ _MODULES = load_agent_test_modules()
 AgentState = _MODULES["state_module"].AgentState
 ArxivSearchSpec = _MODULES["schemas"].ArxivSearchSpec
 build_arxiv_search_graph = _MODULES["graph_module"].build_arxiv_search_graph
+DEFAULT_GRAPH_CHECKPOINTER = _MODULES["graph_module"].DEFAULT_GRAPH_CHECKPOINTER
 tool_module = sys.modules["backend.agents.arxiv_search_agent.node.tool_node"]
 
 
@@ -45,6 +46,18 @@ class AgentGraphFlowTests(unittest.TestCase):
         patcher = mock.patch.object(self.graph_module, name, value)
         self.patches.append(patcher)
         patcher.start()
+
+    def test_build_arxiv_search_graph_uses_default_checkpointer(self) -> None:
+        graph = build_arxiv_search_graph()
+
+        self.assertIs(getattr(graph, "_checkpointer", None), DEFAULT_GRAPH_CHECKPOINTER)
+
+    def test_build_arxiv_search_graph_accepts_explicit_checkpointer(self) -> None:
+        explicit_checkpointer = object()
+
+        graph = build_arxiv_search_graph(checkpointer=explicit_checkpointer)
+
+        self.assertIs(getattr(graph, "_checkpointer", None), explicit_checkpointer)
 
     def test_search_path_runs_parse_plan_tool_check_and_synthesize(self) -> None:
         def parse(state, generation_service=None):
