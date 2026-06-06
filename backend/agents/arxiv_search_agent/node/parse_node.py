@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from pydantic import ValidationError
@@ -45,6 +46,8 @@ from ..utils.search_spec_builder import (
 )
 from ..utils.state_utils import _append_step, _coerce_state, _compact_search_spec
 from ..utils.text_utils import _extract_json_block, _matches_any, _normalize_optional_str, _normalize_text
+
+logger = logging.getLogger(__name__)
 
 
 def _prepare_parse_search_request_input(state: Union[AgentState, Mapping[str, Any]]) -> Dict[str, Any]:
@@ -400,10 +403,10 @@ def _decide_parse_search_request_intent(
 ) -> Dict[str, Any]:
     """在 LLM 结果和规则结果之间做最终意图决策。
     
-    核心原则：
-    1. 高置信度、结构合法的 LLM 结果优先；
-    2. confidence 缺失、search_spec 非法、规则冲突严重或置信度过低时回退到规则层；
-    3. recommendation 等特殊 intent 还会做额外启发式校验，防止模型泛化误判。
+    当前策略刻意收紧为“LLM 主判，规则只在 LLM 不可用时兜底”：
+    1. 只要 LLM 成功返回可解析结果，就直接沿用 LLM intent；
+    2. 规则层结果仅保留给日志、debug 和 LLM 失败时的 fallback；
+    3. 对 arxiv_search 仍保留本地 spec 清洗，避免把脏 query 直接带入工具层。
     
     输出：返回最终 intent、intent_source、search_spec、warnings、fallback_reason 等决策字段。
     """
@@ -431,34 +434,31 @@ def _decide_parse_search_request_intent(
 
     llm_intent = str(llm_result.get("intent") or "unsupported")
     llm_confidence = llm_result.get("confidence")
-    confidence_value = float(llm_confidence) if isinstance(llm_confidence, (int, float)) else None
 
-    # 没有 confidence 的模型输出不可直接信任，因为后续无法判断是否该触发兜底。
-    if confidence_value is None:
-        fallback_reason = "llm confidence missing"
-        decision_warnings.append(fallback_reason)
-        fallback = _build_parse_search_request_rule_fallback(
-            rule_result=rule_result,
-            warnings=decision_warnings,
-            default_intent=llm_intent,
-        )
-        fallback["fallback_reason"] = fallback_reason
-        return fallback
+    if llm_confidence is None:
+        decision_warnings.append("llm confidence missing")
 
-    # 搜索 intent 需要比非搜索 intent 更严格的 search_spec 校验与 enrichment。
     if llm_intent == "arxiv_search":
         search_spec = llm_result.get("search_spec")
         search_spec_before_enrichment = llm_result.get("search_spec_payload")
         if search_spec is None:
+            intent = "unclear"
+            intent_source = "llm"
             fallback_reason = "llm search intent is missing a valid search spec"
             decision_warnings.append(fallback_reason)
-            fallback = _build_parse_search_request_rule_fallback(
-                rule_result=rule_result,
-                warnings=decision_warnings,
-                default_intent="unclear",
-            )
-            fallback["fallback_reason"] = fallback_reason
-            return fallback
+            plan, next_actions, intent_warnings = _build_intent_guidance(intent)
+            decision_warnings.extend(intent_warnings)
+            return {
+                "intent": intent,
+                "intent_source": intent_source,
+                "search_spec": None,
+                "fallback_reason": fallback_reason,
+                "warnings": decision_warnings,
+                "plan": plan,
+                "next_actions": next_actions,
+                "search_spec_before_enrichment": search_spec_before_enrichment,
+                "search_spec_after_enrichment": None,
+            }
 
         # 先利用 cleaned_topic_* 做一次语义清洗，再叠加规则 enrichment，双重提高可执行性。
         search_spec, post_warnings = _post_process_cleaned_spec(
@@ -469,29 +469,25 @@ def _decide_parse_search_request_intent(
         )
         decision_warnings.extend(post_warnings)
         search_spec_after_enrichment = _compact_search_spec(search_spec)
-        # LLM 给出的 search spec 往往缺少隐含类别、时间或语义修正，因此再叠加一次规则 enrichment。
         enriched_spec = _apply_rule_enrichment(message, search_spec)
         if enriched_spec is None:
+            intent = "unclear"
+            intent_source = "llm"
             fallback_reason = "rule enrichment failed after llm search parse"
             decision_warnings.append(fallback_reason)
-            fallback = _build_parse_search_request_rule_fallback(
-                rule_result=rule_result,
-                warnings=decision_warnings,
-                default_intent="unclear",
-            )
-            fallback["fallback_reason"] = fallback_reason
-            return fallback
-
-        if confidence_value < LLM_CONFIDENCE_THRESHOLD:
-            fallback_reason = f"llm confidence {confidence_value:.2f} below threshold {LLM_CONFIDENCE_THRESHOLD:.2f}"
-            decision_warnings.append(fallback_reason)
-            fallback = _build_parse_search_request_rule_fallback(
-                rule_result=rule_result,
-                warnings=decision_warnings,
-                default_intent="arxiv_search",
-            )
-            fallback["fallback_reason"] = fallback_reason
-            return fallback
+            plan, next_actions, intent_warnings = _build_intent_guidance(intent)
+            decision_warnings.extend(intent_warnings)
+            return {
+                "intent": intent,
+                "intent_source": intent_source,
+                "search_spec": None,
+                "fallback_reason": fallback_reason,
+                "warnings": decision_warnings,
+                "plan": plan,
+                "next_actions": next_actions,
+                "search_spec_before_enrichment": search_spec_before_enrichment,
+                "search_spec_after_enrichment": search_spec_after_enrichment,
+            }
 
         intent = "arxiv_search"
         intent_source = "llm"
@@ -499,39 +495,11 @@ def _decide_parse_search_request_intent(
         search_spec_after_enrichment = _compact_search_spec(enriched_spec)
         plan, next_actions, intent_warnings = _build_intent_guidance(intent)
         decision_warnings.extend(intent_warnings)
-        # LLM 和规则结论不一致时不立即推翻 LLM，但会把冲突写进 warnings 供后续排查。
-        if rule_result and str(rule_result.get("intent") or "") != "arxiv_search":
-            decision_warnings.append(f"llm/rule intent conflict: llm={llm_intent}, rule={rule_result.get('intent')}")
     else:
-        # recommendation 等非搜索意图会再过一层启发式检查，防止泛化误判。
-        if llm_intent == "recommendation" and not _looks_like_recommendation_request(message):
-            fallback_reason = "recommendation intent downgraded because request does not look personalized"
-            decision_warnings.append(fallback_reason)
-            fallback = _build_parse_search_request_rule_fallback(
-                rule_result=rule_result,
-                warnings=decision_warnings,
-                default_intent="arxiv_search",
-            )
-            fallback["fallback_reason"] = fallback_reason
-            return fallback
-
-        if confidence_value < LLM_CONFIDENCE_THRESHOLD:
-            fallback_reason = f"llm confidence {confidence_value:.2f} below threshold {LLM_CONFIDENCE_THRESHOLD:.2f}"
-            decision_warnings.append(fallback_reason)
-            fallback = _build_parse_search_request_rule_fallback(
-                rule_result=rule_result,
-                warnings=decision_warnings,
-                default_intent=llm_intent,
-            )
-            fallback["fallback_reason"] = fallback_reason
-            return fallback
-
         intent = llm_intent
         intent_source = "llm"
         plan, next_actions, intent_warnings = _build_intent_guidance(llm_intent)
         decision_warnings.extend(intent_warnings)
-        if rule_result and str(rule_result.get("intent") or "") != llm_intent:
-            decision_warnings.append(f"llm/rule intent conflict: llm={llm_intent}, rule={rule_result.get('intent')}")
 
     return {
         "intent": intent,
@@ -730,6 +698,20 @@ def parse_search_request(
         warnings=decision["warnings"],
         fallback_reason=decision["fallback_reason"],
         cleaning_debug=detector_result["cleaning_debug"],
+    )
+
+    # 解析阶段单独输出一条轻量日志，方便直接判断是规则命中、LLM 覆盖，还是最终又被兜底降级。
+    # 这里只记录意图决策链路和精简后的 search spec，避免把整份 debug 上下文打进日志导致排查噪声过大。
+    logger.info(
+        "arxiv_agent parse decision: message=%s llm_intent=%s llm_confidence=%s rule_intent=%s final_intent=%s intent_source=%s fallback_reason=%s final_search_spec=%s",
+        message,
+        (llm_result or {}).get("intent"),
+        (llm_result or {}).get("confidence"),
+        (rule_result or {}).get("intent"),
+        finalized["intent"],
+        decision["intent_source"],
+        finalized["fallback_reason"],
+        _compact_search_spec(finalized["search_spec"]),
     )
 
     return _write_parse_search_request_state(

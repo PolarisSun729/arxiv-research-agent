@@ -261,12 +261,14 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
         # 第 6 步：把内部状态转换成对外响应模型。
         return _state_to_response(final_state)
     except ValidationError as exc:
+        logger.exception("arxiv_agent request validation failed: message=%s", normalized_request.message)
         return _build_error_response(
             message="请求参数校验失败",
             detail=str(exc),
             code="request_validation_error",
         )
     except Exception as exc:
+        logger.exception("arxiv_agent runtime failed: session_id=%s message=%s", resolved_session_id if 'resolved_session_id' in locals() else None, normalized_request.message)
         return _build_error_response(
             message="arXiv 搜索 Agent 运行失败",
             detail=str(exc),
@@ -389,7 +391,15 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     )
                     sequence += 1
 
-                current_state = _coerce_state(step_payload)
+                # __interrupt__ 是正常的确认暂停信号，不是 AgentState。
+                # 流式模式下要把它还原成 waiting_confirmation 状态返回给前端，避免误报成运行时异常。
+                if step_name == "__interrupt__":
+                    confirmation_payload = _extract_interrupt_payload(step_payload)
+                    if not confirmation_payload:
+                        raise ValueError("interrupt payload missing confirmation request")
+                    current_state = _apply_stream_interrupt_state(previous_state, confirmation_payload)
+                else:
+                    current_state = _coerce_state(step_payload)
                 latest_step = current_state.steps[-1].model_dump() if current_state.steps else None
 
                 # 子阶段 D-3：节点执行结束后，把最新 step 摘要和当前状态回传给前端。
@@ -562,6 +572,86 @@ def _coerce_state(state: Any) -> AgentState:
     if isinstance(state, Mapping):
         return AgentState.model_validate(dict(state))
     return AgentState.model_validate(state)
+
+
+def _extract_interrupt_payload(step_payload: Any) -> Optional[Dict[str, Any]]:
+    """从 LangGraph interrupt 更新中提取确认请求载荷。"""
+    if isinstance(step_payload, tuple):
+        for item in step_payload:
+            value = getattr(item, "value", None)
+            if isinstance(value, Mapping):
+                return dict(value)
+    value = getattr(step_payload, "value", None)
+    if isinstance(value, Mapping):
+        return dict(value)
+    return None
+
+
+def _build_pending_action_from_confirmation(confirmation_payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """把确认请求载荷映射成前端沿用的 pending_action 结构。"""
+    target_paper = dict(confirmation_payload.get("target_paper") or {}) if isinstance(confirmation_payload.get("target_paper"), Mapping) else {}
+    arguments_summary = dict(confirmation_payload.get("arguments_summary") or {}) if isinstance(confirmation_payload.get("arguments_summary"), Mapping) else {}
+    return {
+        "type": "tool_approval",
+        "status": "waiting_confirmation",
+        "decision": None,
+        "step_id": confirmation_payload.get("step_id"),
+        "tool_name": confirmation_payload.get("tool_name"),
+        "action_type": confirmation_payload.get("action_type"),
+        "side_effect_level": confirmation_payload.get("side_effect_level"),
+        "reason": confirmation_payload.get("reason"),
+        "title": target_paper.get("title") or confirmation_payload.get("title"),
+        "title_text": confirmation_payload.get("title"),
+        "description": confirmation_payload.get("description"),
+        "arxiv_id": target_paper.get("arxiv_id"),
+        "original_question": confirmation_payload.get("original_question"),
+        "target_paper": target_paper or None,
+        "allowed_decisions": [item.get("code") for item in list(confirmation_payload.get("allowed_decisions") or []) if isinstance(item, Mapping) and item.get("code")],
+        "allow_argument_edit": bool(confirmation_payload.get("allow_argument_edit")),
+        "allow_reject": bool(confirmation_payload.get("allow_reject", True)),
+        "allow_note": bool(confirmation_payload.get("allow_note", True)),
+        "arguments_summary": arguments_summary,
+        "confirmation_request": dict(confirmation_payload),
+        "thread_id": confirmation_payload.get("thread_id"),
+        "session_id": confirmation_payload.get("session_id"),
+        "plan_id": confirmation_payload.get("plan_id"),
+        "trace_id": confirmation_payload.get("trace_id"),
+        "qa_question": arguments_summary.get("qa_question") or arguments_summary.get("question"),
+    }
+
+
+def _apply_stream_interrupt_state(previous_state: Optional[AgentState], confirmation_payload: Mapping[str, Any]) -> AgentState:
+    """把 interrupt 载荷还原成可对外返回的待确认 AgentState。"""
+    next_state = previous_state.model_copy(deep=True) if isinstance(previous_state, AgentState) else AgentState()
+    pending_action = _build_pending_action_from_confirmation(confirmation_payload)
+    next_state.pending_action = pending_action
+    next_state.paper_qa_result = {
+        "status": "waiting_confirmation",
+        "pending_confirmation": dict(confirmation_payload),
+        "arxiv_id": pending_action.get("arxiv_id"),
+        "title": pending_action.get("title"),
+        "original_question": pending_action.get("original_question"),
+        "qa_question": pending_action.get("qa_question"),
+        "question": pending_action.get("qa_question"),
+    }
+    debug = dict(next_state.debug or {})
+    debug["pending_confirmation"] = dict(confirmation_payload)
+    debug["agent_turn"] = {
+        **dict(debug.get("agent_turn") or {}),
+        "status": "waiting_confirmation",
+    }
+    next_state.debug = debug
+    next_state.steps = list(next_state.steps or []) + [
+        AgentStep(
+            step="run_agent_turn",
+            status="success",
+            action="等待用户确认是否继续执行论文解析与索引构建",
+            inputs={"step_id": confirmation_payload.get("step_id"), "tool_name": confirmation_payload.get("tool_name")},
+            outputs={"status": "waiting_confirmation", "pending_action": pending_action},
+            error=None,
+        )
+    ]
+    return next_state
 
 
 def _state_to_response(state: Any) -> ArxivSearchResponse:

@@ -1016,23 +1016,60 @@ class PlanExecutor:
         del runtime, step
         message = str(resolved_input.get("message") or state.message or "").strip()
         context = state.context if isinstance(state.context, Mapping) else {}
+        selected_paper = resolved_input.get("selected_paper")
+        logger.info(
+            "arxiv_agent resolve_paper: message=%s selected_paper_title=%s selected_paper_arxiv_id=%s context_keys=%s recent_paper_count=%s",
+            message,
+            str((selected_paper or {}).get("title") or "").strip() if isinstance(selected_paper, Mapping) else "",
+            str((selected_paper or {}).get("arxiv_id") or "").strip() if isinstance(selected_paper, Mapping) else "",
+            sorted(context.keys()),
+            len(context.get("last_papers") or []) if isinstance(context.get("last_papers"), list) else 0,
+        )
         if callable(_resolve_paper_reference):
             resolution = _resolve_paper_reference(message, context)
             if isinstance(resolution, Mapping):
+                logger.info(
+                    "arxiv_agent resolve_paper result: source=resolver arxiv_id=%s title=%s matched_by=%s",
+                    str(resolution.get("arxiv_id") or "").strip(),
+                    str(resolution.get("title") or "").strip(),
+                    str(resolution.get("matched_by") or resolution.get("source") or "").strip(),
+                )
                 return dict(resolution)
-        selected_paper = resolved_input.get("selected_paper")
         if isinstance(selected_paper, Mapping):
+            logger.info(
+                "arxiv_agent resolve_paper result: source=selected_paper arxiv_id=%s title=%s",
+                str(selected_paper.get("arxiv_id") or "").strip(),
+                str(selected_paper.get("title") or "").strip(),
+            )
             return dict(selected_paper)
-        return _resolve_paper_reference_fallback(message, context)
+        fallback_resolution = _resolve_paper_reference_fallback(message, context)
+        logger.info(
+            "arxiv_agent resolve_paper result: source=fallback arxiv_id=%s title=%s matched_by=%s",
+            str(fallback_resolution.get("arxiv_id") or "").strip(),
+            str(fallback_resolution.get("title") or "").strip(),
+            str(fallback_resolution.get("matched_by") or fallback_resolution.get("source") or "").strip(),
+        )
+        return fallback_resolution
 
     def _check_paper_index(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
         del state, runtime, step
         paper_ref = resolved_input.get("paper_ref")
         arxiv_id = str((paper_ref or {}).get("arxiv_id") or "").strip() if isinstance(paper_ref, Mapping) else ""
+        logger.info(
+            "arxiv_agent check_paper_index: arxiv_id=%s title=%s",
+            arxiv_id,
+            str((paper_ref or {}).get("title") or "").strip() if isinstance(paper_ref, Mapping) else "",
+        )
         if not arxiv_id:
             return {"status": "missing", "has_index": False}
         tool_result = invoke_backend_tool("check_paper_qa_index", arxiv_id=arxiv_id)
         data = (tool_result or {}).get("data") if isinstance(tool_result, Mapping) else {}
+        logger.info(
+            "arxiv_agent check_paper_index result: arxiv_id=%s status=%s has_index=%s",
+            arxiv_id,
+            str((data or {}).get("status") or "").strip(),
+            (data or {}).get("has_index"),
+        )
         return dict(data or {"status": "unknown", "has_index": False, "tool_result": tool_result})
 
     def _request_confirmation(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
