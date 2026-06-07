@@ -32,8 +32,8 @@ from .intent_support import (
     _looks_like_paper_qa_request,
     _looks_like_paper_summary_request,
     _looks_like_preference_action_request,
-    _looks_like_reading_list_action_request,
     _looks_like_recommendation_request,
+    _looks_like_saved_paper_container_request,
     _validation_error_summary,
 )
 from ..schemas import ArxivSearchSpec
@@ -167,8 +167,10 @@ def _normalize_llm_intent_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
 def _detect_non_search_rule_intent(message: str) -> Optional[str]:
     """用规则快速识别非搜索类意图，避免被误送进 arXiv 搜索链路。
     
-    判断顺序按照“论文总结 -> 论文详情 -> 论文 QA -> 推荐 -> 偏好 -> 阅读列表”依次进行，
+    判断顺序按照“论文总结 -> 论文详情 -> 论文 QA -> 推荐 -> 偏好”依次进行，
     只要命中某一类规则或启发式函数就立即返回对应 intent；若都不命中则返回 None。
+    阅读列表、稍后读、保存论文这类没有真实 Agent 执行链路的请求不再单独识别，
+    后续会自然落到 unsupported / fallback，避免产生假成功。
     """
     if _matches_any(message, HARD_RULE_PATTERNS.get("paper_summary", [])):
         return "paper_summary"
@@ -188,10 +190,6 @@ def _detect_non_search_rule_intent(message: str) -> Optional[str]:
         return "preference_action"
     if _looks_like_preference_action_request(message):
         return "preference_action"
-    if _matches_any(message, HARD_RULE_PATTERNS.get("reading_list_action", [])):
-        return "reading_list_action"
-    if _looks_like_reading_list_action_request(message):
-        return "reading_list_action"
     return None
 
 
@@ -205,6 +203,20 @@ def _build_rule_decision(message: str) -> Dict[str, Any]:
     
     输出：返回统一的 rule_result 字典，供 fallback 和调试层复用。
     """
+    if _looks_like_saved_paper_container_request(message):
+        plan, next_actions, warnings = _build_intent_guidance("unsupported")
+        return {
+            "intent": "unsupported",
+            "confidence": 0.9,
+            "reason": "removed saved-paper container request",
+            "source": "rule",
+            "search_spec_before_enrichment": None,
+            "search_spec_after_enrichment": None,
+            "warnings": warnings,
+            "next_actions": next_actions,
+            "plan": plan,
+        }
+
     non_search_intent = _detect_non_search_rule_intent(message)
     if non_search_intent is not None:
         plan, next_actions, warnings = _build_intent_guidance(non_search_intent)
@@ -418,6 +430,21 @@ def _decide_parse_search_request_intent(
     next_actions: List[str] = []
     search_spec_before_enrichment: Optional[Dict[str, Any]] = None
     search_spec_after_enrichment: Optional[Dict[str, Any]] = None
+
+    if _looks_like_saved_paper_container_request(message):
+        plan, next_actions, intent_warnings = _build_intent_guidance("unsupported")
+        decision_warnings.extend(intent_warnings)
+        return {
+            "intent": "unsupported",
+            "intent_source": "rule",
+            "search_spec": None,
+            "fallback_reason": fallback_reason or "saved-paper container requests are unsupported",
+            "warnings": decision_warnings,
+            "plan": plan,
+            "next_actions": next_actions,
+            "search_spec_before_enrichment": None,
+            "search_spec_after_enrichment": None,
+        }
 
     # 完全拿不到可用的 LLM 结果时，直接回落到规则层。
     # 没有 LLM 结果时，整条链路必须完全依赖规则层产出的 fallback 结构。

@@ -107,6 +107,20 @@ def _load_modules():
 
     langgraph_module = types.ModuleType("langgraph")
     graph_module = types.ModuleType("langgraph.graph")
+    types_module = types.ModuleType("langgraph.types")
+    checkpoint_module = types.ModuleType("langgraph.checkpoint")
+    checkpoint_memory_module = types.ModuleType("langgraph.checkpoint.memory")
+
+    class _MemorySaver:
+        def __init__(self):
+            self.snapshots = {}
+
+    class _Command:
+        def __init__(self, *, resume=None):
+            self.resume = resume
+
+    def _interrupt(payload):
+        return None
 
     class _CompiledGraph:
         def __init__(self, nodes=None, edges=None, conditional_edges=None):
@@ -139,14 +153,22 @@ def _load_modules():
         def add_conditional_edges(self, source, router, mapping):
             self.conditional_edges[source] = (router, mapping)
 
-        def compile(self):
+        def compile(self, checkpointer=None):
+            del checkpointer
             return _CompiledGraph(self.nodes, self.edges, self.conditional_edges)
 
     graph_module.END = "END"
     graph_module.START = "START"
     graph_module.StateGraph = _StateGraph
+    types_module.Command = _Command
+    types_module.interrupt = _interrupt
+    checkpoint_memory_module.MemorySaver = _MemorySaver
+    checkpoint_memory_module.InMemorySaver = _MemorySaver
     sys.modules["langgraph"] = langgraph_module
     sys.modules["langgraph.graph"] = graph_module
+    sys.modules["langgraph.types"] = types_module
+    sys.modules["langgraph.checkpoint"] = checkpoint_module
+    sys.modules["langgraph.checkpoint.memory"] = checkpoint_memory_module
 
     def load(module_name: str, file_path: Path):
         if module_name in sys.modules:
@@ -171,7 +193,6 @@ def _load_modules():
     load("backend.agents.arxiv_search_agent.node.parse_node", node_dir / "parse_node.py")
     load("backend.agents.arxiv_search_agent.node.plan_node", node_dir / "plan_node.py")
     load("backend.agents.arxiv_search_agent.node.preference_node", node_dir / "preference_node.py")
-    load("backend.agents.arxiv_search_agent.node.pending_action_node", node_dir / "pending_action_node.py")
     load("backend.agents.arxiv_search_agent.node.paper_reading_node", node_dir / "paper_reading_node.py")
     load("backend.agents.arxiv_search_agent.node.response_node", node_dir / "response_node.py")
 
@@ -181,16 +202,10 @@ def _load_modules():
     node_package.apply_preference_action = sys.modules["backend.agents.arxiv_search_agent.node.preference_node"].apply_preference_action
     node_package.build_search_tool_args = search_node_module.build_search_tool_args
     node_package.check_search_result = search_node_module.check_search_result
-    node_package.classify_pending_action_confirmation = sys.modules[
-        "backend.agents.arxiv_search_agent.node.pending_action_node"
-    ].classify_pending_action_confirmation
     node_package.execute_tool = sys.modules["backend.agents.arxiv_search_agent.node.tool_node"].execute_tool
     node_package.handle_paper_reading_request = sys.modules[
         "backend.agents.arxiv_search_agent.node.paper_reading_node"
     ].handle_paper_reading_request
-    node_package.handle_pending_action_confirmation = sys.modules[
-        "backend.agents.arxiv_search_agent.node.pending_action_node"
-    ].handle_pending_action_confirmation
     node_package.invoke_search_tool = search_node_module.invoke_search_tool
     node_package.parse_search_request = sys.modules["backend.agents.arxiv_search_agent.node.parse_node"].parse_search_request
     node_package.plan_task = sys.modules["backend.agents.arxiv_search_agent.node.plan_node"].plan_task

@@ -7,11 +7,14 @@ from fastapi.testclient import TestClient
 
 import dependencies
 from routers import qa_router
+from core.errors import AppError, ErrorCode
 
 
 class _FakePaperQAService:
     def __init__(self) -> None:
         self.raise_error = False
+        self.answer_error_code = None
+        self.context_error_code = None
 
     def get_qa_status(self, arxiv_id: str):
         if self.raise_error:
@@ -22,15 +25,45 @@ class _FakePaperQAService:
         return {"status": "indexed", "arxiv_id": arxiv_id, "loading_method": loading_method}
 
     def answer_question(self, arxiv_id: str, payload):
+        if self.answer_error_code:
+            raise AppError(self.answer_error_code, detail="answer failed in fake service")
         return {
             "arxiv_id": arxiv_id,
             "answer": f"answer:{payload.question}",
             "sources": [{"source_id": "s1"}],
         }
 
+    def build_qa_context(self, arxiv_id: str, payload):
+        if self.context_error_code:
+            raise AppError(self.context_error_code, detail="context failed in fake service")
+        return (
+            {"status": "indexed", "collection_name": "paper_2401"},
+            [{"content": "chunk", "page_number": "1", "source": "paper.pdf"}],
+            {
+                "text_context": "chunk",
+                "image_inputs": [],
+                "asset_metadata": [],
+                "generation_question": payload.question,
+                "question_contextualization": {},
+                "chat_session": {"session_id": "session-1", "user_id": "u1", "arxiv_id": arxiv_id},
+            },
+            {"trace": "ok"},
+        )
+
+    def build_source_payload(self, search_results):
+        return search_results
+
+    def persist_completed_turn(self, **kwargs):
+        return {"turn_id": "turn-1", "chat_session": kwargs.get("chat_session")}
+
 
 class _FakeIndexJobManager:
+    def __init__(self) -> None:
+        self.raise_database_error = False
+
     def submit_job(self, arxiv_id: str, loading_method: str):
+        if self.raise_database_error:
+            raise AppError(ErrorCode.DATABASE_WRITE_FAILED, detail="job write failed")
         return {
             "job_id": "job-1",
             "arxiv_id": arxiv_id,
@@ -65,6 +98,17 @@ class _FakeVectorStoreService:
 
     def get_all_chunks(self, collection_name: str, limit: int = 1):
         return [{"chunk_id": "c1", "content": "chunk"}][:limit]
+
+
+class _FakeGenerationService:
+    def __init__(self) -> None:
+        self.raise_error = False
+
+    def stream_qwen_responses(self, **kwargs):
+        if self.raise_error:
+            raise RuntimeError("llm stream failed")
+        yield {"type": "delta", "delta": "hello"}
+        yield {"type": "completed", "answer": "hello", "usage": None}
 
 
 class _FakeDatabaseService:
@@ -170,6 +214,7 @@ class QaRouterApiTests(unittest.TestCase):
         self.vector_store_service = _FakeVectorStoreService()
         self.memory_service = _FakeMemoryService()
         self.index_job_manager = _FakeIndexJobManager()
+        self.generation_service = _FakeGenerationService()
         self.enhanced_retrieval_service = _FakeEnhancedRetrievalService(self.temp_dir.name)
 
         app = FastAPI()
@@ -180,6 +225,7 @@ class QaRouterApiTests(unittest.TestCase):
         app.dependency_overrides[dependencies.get_memory_service] = lambda: self.memory_service
         app.dependency_overrides[dependencies.get_index_job_manager] = lambda: self.index_job_manager
         app.dependency_overrides[dependencies.get_enhanced_retrieval_service] = lambda: self.enhanced_retrieval_service
+        app.dependency_overrides[dependencies.get_generation_service] = lambda: self.generation_service
         self.client = TestClient(app)
         self.addCleanup(self.temp_dir.cleanup)
 
@@ -273,6 +319,74 @@ class QaRouterApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("answer", response.json())
         self.assertEqual(response.json()["arxiv_id"], "2401.00001")
+
+    def test_qa_returns_qa_index_not_found_code(self) -> None:
+        self.paper_qa_service.answer_error_code = ErrorCode.QA_INDEX_NOT_FOUND
+
+        response = self.client.post(
+            "/api/paper/2401.00001/qa",
+            json={"question": "What is the contribution?", "user_id": "u1"},
+        )
+
+        self.assertEqual(response.status_code, 404)
+        payload = response.json()
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["code"], ErrorCode.QA_INDEX_NOT_FOUND)
+        self.assertTrue(payload["recoverable"])
+
+    def test_qa_returns_vector_store_error_code(self) -> None:
+        self.paper_qa_service.answer_error_code = ErrorCode.VECTOR_STORE_ERROR
+
+        response = self.client.post(
+            "/api/paper/2401.00001/qa",
+            json={"question": "What is the contribution?", "user_id": "u1"},
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["code"], ErrorCode.VECTOR_STORE_ERROR)
+
+    def test_qa_returns_llm_generation_failed_code(self) -> None:
+        self.paper_qa_service.answer_error_code = ErrorCode.LLM_GENERATION_FAILED
+
+        response = self.client.post(
+            "/api/paper/2401.00001/qa",
+            json={"question": "What is the contribution?", "user_id": "u1"},
+        )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["code"], ErrorCode.LLM_GENERATION_FAILED)
+
+    def test_create_qa_index_database_write_failure_returns_code(self) -> None:
+        self.index_job_manager.raise_database_error = True
+
+        response = self.client.post("/api/paper/2401.00001/create-qa-index")
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["code"], ErrorCode.DATABASE_WRITE_FAILED)
+
+    def test_qa_stream_error_event_contains_code(self) -> None:
+        self.paper_qa_service.context_error_code = ErrorCode.QA_INDEX_NOT_FOUND
+
+        response = self.client.post(
+            "/api/paper/2401.00001/qa/stream",
+            json={"question": "What is the contribution?", "user_id": "u1"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("event: error", response.text)
+        self.assertIn(f'"code": "{ErrorCode.QA_INDEX_NOT_FOUND}"', response.text)
+
+    def test_qa_stream_llm_exception_maps_to_generation_code(self) -> None:
+        self.generation_service.raise_error = True
+
+        response = self.client.post(
+            "/api/paper/2401.00001/qa/stream",
+            json={"question": "What is the contribution?", "user_id": "u1"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("event: error", response.text)
+        self.assertIn(f'"code": "{ErrorCode.LLM_GENERATION_FAILED}"', response.text)
 
 
 if __name__ == "__main__":

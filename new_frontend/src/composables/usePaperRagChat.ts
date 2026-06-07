@@ -8,6 +8,7 @@ import {
   listPaperChatSessions,
   qaPaperStream
 } from '@/api/papers'
+import { getErrorMessage } from '@/api/errors'
 import type {
   PaperChatMessage,
   PaperChatSession,
@@ -48,13 +49,6 @@ interface UsePaperRagChatOptions {
   onEnterQaMode?: () => void
   onScrollToBottom?: () => void
   userId?: MaybeRefOrGetter<string>
-}
-
-function getErrorMessage(error: unknown, fallback: string) {
-  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string' && error.message) {
-    return error.message
-  }
-  return fallback
 }
 
 function truncateText(value: string | undefined, maxLength: number) {

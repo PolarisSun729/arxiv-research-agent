@@ -220,7 +220,7 @@ class AgentChatFlowIntegrationTests(unittest.TestCase):
                     "tool_name": "request_confirmation",
                     "action_type": "clarify",
                     "side_effect_level": "session_write",
-                    "reason": "waiting_for_user_confirmation",
+                    "reason": "waiting_confirmation",
                     "title": "确认是否解析论文",
                     "description": "需要先确认是否创建 QA 索引。",
                     "arguments_summary": {"arxiv_id": "2401.00001", "qa_question": "what is the method?"},
@@ -315,7 +315,7 @@ class AgentChatFlowIntegrationTests(unittest.TestCase):
         self.assertEqual(fake_graph.last_invoke_input.resume, {"decision": "reject", "step_id": "parse_and_index_paper"})
         self.assertEqual(fake_graph.last_invoke_config, {"configurable": {"thread_id": "s1"}})
 
-    def test_run_arxiv_search_agent_resume_with_missing_checkpoint_returns_error(self) -> None:
+    def test_run_arxiv_search_agent_resume_with_missing_checkpoint_returns_explicit_error(self) -> None:
         fake_graph = _FakeCompiledGraph(final_state=None, checkpoint_exists=False)
 
         with mock.patch.object(service_module, "build_arxiv_search_graph", return_value=fake_graph), mock.patch.object(
@@ -332,8 +332,13 @@ class AgentChatFlowIntegrationTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(response.answer, "arXiv 搜索 Agent 运行失败")
-        self.assertIn("未找到可恢复的执行现场", response.debug["runtime_error"]["detail"])
+        self.assertEqual(response.answer, "原执行现场已失效，请重新发起论文解析或问答请求。")
+        self.assertIsNone(response.pending_action)
+        self.assertEqual(response.paper_qa_result["status"], "failed")
+        self.assertEqual(response.paper_qa_result["error_code"], "resume_checkpoint_not_found")
+        self.assertEqual(response.debug["runtime_error"]["code"], "resume_checkpoint_not_found")
+        self.assertEqual(response.steps[-1].error, "resume_checkpoint_not_found")
+        self.assertIsNone(fake_graph.last_invoke_input)
 
     def test_stream_arxiv_search_agent_resume_uses_command_with_same_thread_id(self) -> None:
         resumed_state = AgentState(
@@ -376,6 +381,47 @@ class AgentChatFlowIntegrationTests(unittest.TestCase):
         self.assertIsInstance(fake_graph.last_stream_input, Command)
         self.assertEqual(fake_graph.last_stream_input.resume, {"decision": "approve", "step_id": "parse_and_index_paper"})
         self.assertEqual(fake_graph.last_stream_config, {"configurable": {"thread_id": "s1"}})
+
+    def test_stream_arxiv_search_agent_resume_with_missing_checkpoint_returns_explicit_error(self) -> None:
+        fake_graph = _FakeCompiledGraph(updates=[], checkpoint_exists=False)
+
+        app = FastAPI()
+
+        @app.post("/stream")
+        async def _stream_endpoint(request: ArxivSearchRequest):
+            return service_module.stream_arxiv_search_agent(request)
+
+        client = TestClient(app)
+
+        with mock.patch.object(service_module, "build_arxiv_search_graph", return_value=fake_graph), mock.patch.object(
+            service_module,
+            "_persist_agent_session_memory",
+            return_value=None,
+        ):
+            response = client.post(
+                "/stream",
+                json={
+                    "user_id": "u1",
+                    "session_id": "missing-session",
+                    "message": "approve",
+                    "resume": {"decision": "approve", "step_id": "parse_and_index_paper"},
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload_lines = [line[6:] for line in response.text.splitlines() if line.startswith("data: ")]
+        events = [json.loads(line) for line in payload_lines]
+        event_types = [event["event_type"] for event in events]
+        self.assertEqual(event_types, ["exception", "final_response", "stream_end"])
+
+        exception_response = events[0]["data"]["response"]
+        final_response = events[1]["data"]["response"]
+        self.assertEqual(events[0]["data"]["code"], "resume_checkpoint_not_found")
+        self.assertEqual(exception_response["debug"]["runtime_error"]["code"], "resume_checkpoint_not_found")
+        self.assertEqual(final_response["paper_qa_result"]["status"], "failed")
+        self.assertIsNone(final_response["pending_action"])
+        self.assertEqual(events[2]["data"]["code"], "resume_checkpoint_not_found")
+        self.assertIsNone(fake_graph.last_stream_input)
 
 
 if __name__ == "__main__":

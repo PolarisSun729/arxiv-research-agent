@@ -1,4 +1,5 @@
 import request from './request'
+import { ApiError, normalizeApiError, parseFetchErrorResponse } from './errors'
 import type {
   Paper,
   RecommendedPaper,
@@ -1058,8 +1059,7 @@ export async function qaPaperStream(
   })
 
   if (!response.ok) {
-    const detail = await response.text()
-    throw new Error(detail || `Request failed with status ${response.status}`)
+    throw await parseFetchErrorResponse(response, '问答失败')
   }
 
   if (!response.body) {
@@ -1127,6 +1127,11 @@ export async function qaPaperStream(
         if (parsed.data.question_contextualization) {
           finalQuestionContextualization = parsed.data.question_contextualization
         }
+      } else if (parsed.event === 'error' && parsed.data) {
+        const apiError = normalizeApiError(parsed.data, '问答失败')
+        handlers.onError?.(apiError.message)
+        // stream 错误事件与普通接口使用同一错误结构，方便上层按 code 做精确提示。
+        throw new ApiError(apiError)
       } else if (parsed.event === 'delta' && parsed.data?.delta) {
         finalAnswer += parsed.data.delta
         handlers.onDelta?.(parsed.data.delta)

@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import HTTPException
 
+from core.errors import AppError, ErrorCode
 from services.paper_qa.paper_qa_index_builder import PaperQAIndexBuilder
 from services.storage.database_service import DatabaseService
 
@@ -58,7 +59,11 @@ class IndexJobManager:
 
             job = self.db_service.create_paper_index_job(arxiv_id, normalized_loading_method)
             if not job:
-                raise RuntimeError("Failed to create QA index job")
+                raise AppError(
+                    ErrorCode.DATABASE_WRITE_FAILED,
+                    detail="create_paper_index_job returned empty result",
+                    context={"arxiv_id": arxiv_id, "stage": "submit_qa_index_job"},
+                )
 
             # 后台线程负责真正的建索引执行，请求线程只负责创建并返回任务信息。
             worker = threading.Thread(
@@ -115,6 +120,25 @@ class IndexJobManager:
                 error_message="",
             )
             logger.info("QA index job completed: job_id=%s arxiv_id=%s", job_id, arxiv_id)
+        except AppError as exc:
+            error_message = self._exception_message(exc)
+            failed_stage = str(exc.context.get("stage") or getattr(exc, "error_stage", "failed") or "failed")
+            # 后台任务失败时同时写入 code 和阶段，前端轮询 job 时能稳定识别失败类型。
+            self.db_service.update_paper_index_job(
+                job_id,
+                status="failed",
+                current_stage=failed_stage,
+                error_message=f"{exc.code}: {error_message}",
+            )
+            logger.warning(
+                "QA index job failed: code=%s job_id=%s arxiv_id=%s stage=%s recoverable=%s error=%s",
+                exc.code,
+                job_id,
+                arxiv_id,
+                failed_stage,
+                exc.recoverable,
+                error_message,
+            )
         except HTTPException as exc:
             # 业务性失败通常已经带有明确阶段和错误描述，直接写回任务记录即可。
             error_message = self._exception_message(exc)

@@ -32,7 +32,6 @@ build_arxiv_search_graph = _MODULES["graph_module"].build_arxiv_search_graph
 graph_module = _MODULES["graph_module"]
 tool_node_module = sys.modules["backend.agents.arxiv_search_agent.node.tool_node"]
 paper_reading_module = sys.modules["backend.agents.arxiv_search_agent.node.paper_reading_node"]
-pending_action_module = sys.modules["backend.agents.arxiv_search_agent.node.pending_action_node"]
 preference_module = sys.modules["backend.agents.arxiv_search_agent.node.preference_node"]
 
 
@@ -77,7 +76,7 @@ class AgentRegressionStep6Tests(unittest.TestCase):
             )
 
         with mock.patch.object(graph_module, "parse_search_request", side_effect=parse), mock.patch.object(
-            graph_module, "run_agent_turn", side_effect=fake_run_agent_turn
+            graph_module, "run_agent_turn_in_graph", side_effect=fake_run_agent_turn
         ) as mocked_run_agent_turn:
             graph = build_arxiv_search_graph()
             result = AgentState.model_validate(graph.invoke(AgentState(message="搜索 RAG agent 相关论文").model_dump()))
@@ -128,7 +127,7 @@ class AgentRegressionStep6Tests(unittest.TestCase):
         self.assertEqual(result.paper_qa_result["status"], "success")
         self.assertEqual([obs.tool_name for obs in result.tool_observations], ["check_paper_qa_index", "answer_paper_question"])
 
-    def test_paper_qa_without_index_creates_pending_action_instead_of_building_index(self) -> None:
+    def test_paper_qa_without_index_delegates_confirmation_to_plan_executor(self) -> None:
         state = AgentState(
             intent="paper_summary",
             message="总结当前论文",
@@ -153,52 +152,10 @@ class AgentRegressionStep6Tests(unittest.TestCase):
             result = paper_reading_module.handle_paper_reading_request(state)
 
         self.assertEqual([call.args[0] for call in mocked_tool.call_args_list], ["check_paper_qa_index"])
-        self.assertEqual(result.pending_action["type"], "parse_then_qa")
-        self.assertIn("解析", result.next_actions)
-        self.assertIn("取消", result.next_actions)
-
-    def test_user_confirm_parse_builds_index_then_answers(self) -> None:
-        state = AgentState(
-            intent="paper_qa",
-            message="解析",
-            pending_action={
-                "type": "parse_then_qa",
-                "status": "waiting_confirmation",
-                "arxiv_id": "2401.00001",
-                "title": "RAG Paper",
-                "original_question": "问当前论文的方法流程",
-                "qa_question": "请解释这篇论文的方法流程",
-                "loading_method": "docling",
-            },
-        )
-
-        def fake_invoke_tool(tool_name, **kwargs):
-            if tool_name == "build_paper_qa_index":
-                return {
-                    "ok": True,
-                    "tool_name": tool_name,
-                    "summary": "built index",
-                    "data": {"status": "indexed", "has_index": True},
-                    "trace": {"tool_name": tool_name, "kwargs": kwargs},
-                    "error": None,
-                }
-            if tool_name == "answer_paper_question":
-                return {
-                    "ok": True,
-                    "tool_name": tool_name,
-                    "summary": "answered after build",
-                    "data": {"answer": "已在解析后完成回答。", "sources": []},
-                    "trace": {"tool_name": tool_name, "kwargs": kwargs},
-                    "error": None,
-                }
-            raise AssertionError(f"unexpected tool: {tool_name}")
-
-        with mock.patch.object(tool_node_module, "invoke_tool", side_effect=fake_invoke_tool) as mocked_tool:
-            result = pending_action_module.handle_pending_action_confirmation(state)
-
-        self.assertEqual([call.args[0] for call in mocked_tool.call_args_list], ["build_paper_qa_index", "answer_paper_question"])
-        self.assertEqual(result.paper_qa_result["status"], "success")
         self.assertIsNone(result.pending_action)
+        self.assertEqual(result.paper_qa_result["status"], "failed")
+        self.assertEqual(result.paper_qa_result["error"], "paper_index_missing_requires_plan_executor_confirmation")
+        self.assertTrue(any("Agent 主流程" in action for action in result.next_actions))
 
     def test_preference_action_writes_via_tool_protocol(self) -> None:
         state = AgentState(
@@ -265,7 +222,7 @@ class AgentRegressionStep6Tests(unittest.TestCase):
             )
 
         with mock.patch.object(graph_module, "parse_search_request", side_effect=parse), mock.patch.object(
-            graph_module, "run_agent_turn", side_effect=fake_run_agent_turn
+            graph_module, "run_agent_turn_in_graph", side_effect=fake_run_agent_turn
         ) as mocked_run_agent_turn:
             graph = build_arxiv_search_graph()
             initial_state = AgentState(

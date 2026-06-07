@@ -30,8 +30,16 @@ def test_detect_non_search_rule_intent_hits_hard_rules() -> None:
     assert parse_module._detect_non_search_rule_intent("总结这篇论文") == "paper_summary"
     assert parse_module._detect_non_search_rule_intent("讲讲这篇论文的方法") == "paper_detail"
     assert parse_module._detect_non_search_rule_intent("这篇论文为什么这么设计？") == "paper_qa"
-    assert parse_module._detect_non_search_rule_intent("收藏第 2 篇") == "preference_action"
-    assert parse_module._detect_non_search_rule_intent("打开我的收藏夹") == "reading_list_action"
+    assert parse_module._detect_non_search_rule_intent("喜欢第 2 篇") == "preference_action"
+    assert parse_module._detect_non_search_rule_intent("打开我的收藏夹") is None
+
+
+def test_save_for_later_requests_fall_back_to_unsupported_without_success_plan() -> None:
+    state = parse_module.parse_search_request({"message": "把这篇论文加入阅读列表"}, generation_service=None)
+
+    assert state.intent == "unsupported"
+    assert not any("阅读列表" in item or "已加入" in item for item in state.plan)
+    assert not any("阅读列表" in item or "已加入" in item for item in state.next_actions)
 
 
 def test_search_trigger_patterns_mark_search_requests() -> None:

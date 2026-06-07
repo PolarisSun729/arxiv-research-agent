@@ -308,24 +308,18 @@
    - `stream_arxiv_search_agent`
  - `graph.py`
    - `route_after_parse`
-   - `route_after_pending_confirmation`
-   - `route_after_check`
    - `build_arxiv_search_graph`
    - `export_arxiv_search_graph_mermaid`
  - `node/*.py`
    - `parse_search_request`
-   - `plan_task`
-   - `build_search_tool_args`
-   - `invoke_search_tool`
-   - `check_search_result`
-   - `relax_search_for_retry`
-   - `personalized_rank_and_annotate_papers`
-   - `apply_preference_action`
-   - `classify_pending_action_confirmation`
-   - `handle_pending_action_confirmation`
+   - `run_agent_turn`
    - `handle_paper_reading_request`
-   - `synthesize_response`
    - `execute_tool`
+ - `plan_executor.py`
+   - `PlanExecutor`
+   - `run_agent_turn`
+   - `run_agent_turn_in_graph`
+   - `Command(resume=...)`
  - `utils/*.py`
    - `paper_reference_resolver`
    - `search_spec_builder`

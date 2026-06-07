@@ -130,7 +130,13 @@ Stage 2 tests should stay local, deterministic, and fully isolated from external
 - `service.py` 使用稳定的 `thread_id` 恢复同一条执行线程；当前规则是 `thread_id == session_id`
 - 用户确认后由 `Command(resume=...)` 恢复，不再重新解析“确认/取消”自然语言，也不重新创建新任务
 - `pending_action`、`paper_qa_result`、`plan_runtime`、`execution_plan` 继续保留给前端展示和兼容，但它们不再是恢复执行现场的主依据
-- `pending_action_node.py` 目前仅作为旧前端/旧测试兼容层保留，不再承担新的主恢复链路
+- 旧的自然语言确认节点已经移除；`pending_action` 仅作为 `ConfirmationRequest` 的前端展示镜像保留
+
+### 当前恢复限制
+
+当前 Agent 确认 / 恢复现场依赖进程内 LangGraph checkpoint。这个机制只在后端进程没有重启、请求仍然命中同一个进程、checkpoint 仍然存在、且 `session_id` / `thread_id` 没有丢失时可靠。
+
+当前版本不保证服务重启、多 worker、多副本部署、进程崩溃或 checkpoint 被清理后的恢复能力。当用户发起 `resume` 但后端找不到可恢复现场时，系统会返回错误码 `resume_checkpoint_not_found`，并清空 `pending_action`。前端收到该错误后应清空确认状态，停止展示确认卡片，并提示用户：“原执行现场已失效，请重新发起论文解析或问答请求。”
 
 ### 当前前端约定
 

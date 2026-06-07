@@ -14,11 +14,13 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
+from core.errors import AppError, ErrorCode, error_response
 from dependencies import (
     get_database_service,
     get_embedding_service,
     get_current_embedding_config,
     get_oai_database_service,
+    get_paper_qa_service,
     get_recommendation_service,
     get_vector_store_service,
 )
@@ -162,9 +164,25 @@ async def add_paper(
         }
 
         logger.debug("Inserting embedding to collection: %s", collection_name)
-        # 这里直接获取向量库服务实例并插入单条 embedding。
+        # 向量写入是论文可检索化的关键步骤，失败时要暴露 vector_store_error 而不是泛化成入库失败。
         vector_store_service = get_vector_store_service()
-        embedding_id = vector_store_service.insert_single_embedding(collection_name, embedding, metadata)
+        try:
+            embedding_id = vector_store_service.insert_single_embedding(collection_name, embedding, metadata)
+        except Exception as exc:
+            logger.exception(
+                "Paper vector write failed: code=%s arxiv_id=%s collection_name=%s stage=%s",
+                ErrorCode.VECTOR_STORE_ERROR,
+                arxiv_id,
+                collection_name,
+                "insert_single_embedding",
+            )
+            return error_response(
+                AppError(
+                    ErrorCode.VECTOR_STORE_ERROR,
+                    detail=exc,
+                    context={"arxiv_id": arxiv_id, "stage": "insert_single_embedding", "collection_name": collection_name},
+                )
+            )
 
         logger.debug("Embedding inserted with ID: %s", embedding_id)
         logger.debug("Adding paper to database: %s, embedding_id: %s", metadata, embedding_id)
@@ -195,10 +213,22 @@ async def add_paper(
                 "vector_dimension": len(embedding),
                 "collection_name": collection_name,
             }
-        raise HTTPException(status_code=500, detail="Failed to add paper")
+        logger.error(
+            "Paper database write failed: code=%s arxiv_id=%s stage=%s",
+            ErrorCode.DATABASE_WRITE_FAILED,
+            arxiv_id,
+            "add_paper",
+        )
+        return error_response(
+            AppError(
+                ErrorCode.DATABASE_WRITE_FAILED,
+                detail="db_service.add_paper returned False",
+                context={"arxiv_id": arxiv_id, "stage": "add_paper"},
+            )
+        )
     except Exception as exc:
-        logger.error("Error adding paper: %s", str(exc))
-        raise HTTPException(status_code=500, detail=str(exc))
+        logger.exception("Error adding paper: arxiv_id=%s code=%s", arxiv_id, ErrorCode.UNKNOWN_ERROR)
+        return error_response(AppError(ErrorCode.UNKNOWN_ERROR, detail=exc, context={"arxiv_id": arxiv_id, "stage": "add_paper"}))
 
 
 @router.get("/paper/{arxiv_id}")
@@ -230,13 +260,21 @@ async def get_paper(
 
 
 @router.delete("/paper/{arxiv_id}")
-async def delete_paper(arxiv_id: str, db_service=Depends(get_database_service)):
-    """删除指定论文的数据库记录。"""
+async def delete_paper(
+    arxiv_id: str,
+    db_service=Depends(get_database_service),
+    paper_qa_service=Depends(get_paper_qa_service),
+):
+    """删除指定论文，并同步清理该论文的 QA 索引 artifact。"""
     try:
+        # 论文删除前先让 QA 索引不可检索，避免 SQLite 元数据消失后 Milvus 仍留下可命中的旧 chunk。
+        qa_cleanup = paper_qa_service.delete_qa_index(arxiv_id)
         success = db_service.delete_paper(arxiv_id)
         if success:
-            return {"status": "success", "message": "Paper deleted"}
+            return {"status": "success", "message": "Paper deleted", "qa_cleanup": qa_cleanup}
         raise HTTPException(status_code=404, detail="Paper not found")
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("Error deleting paper: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))

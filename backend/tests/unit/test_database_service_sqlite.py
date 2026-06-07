@@ -126,15 +126,36 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
                 chunk_count=2,
                 embedding_model="fake-model",
                 pdf_path="/tmp/paper.pdf",
+                chunk_file="/tmp/chunks.json",
+                embedding_file="/tmp/embeddings.json",
+                loading_method="docling",
+                chunking_strategy="docling_sections",
+                current_stage="save_embeddings",
+                failed_stage="",
+                error_message="",
             )
         )
-        self.assertTrue(self.service.update_paper_qa_index(arxiv_id, status="indexed", chunk_count=3))
+        self.assertTrue(
+            self.service.update_paper_qa_index(
+                arxiv_id,
+                status="indexed",
+                chunk_count=3,
+                collection_name="paper_2401_00004_v2",
+                indexed_at="2024-01-01T00:00:00",
+            )
+        )
 
         qa_index = self.service.get_paper_qa_index(arxiv_id)
 
-        self.assertEqual(qa_index["collection_name"], "paper_2401_00004")
+        self.assertEqual(qa_index["collection_name"], "paper_2401_00004_v2")
         self.assertEqual(qa_index["status"], "indexed")
         self.assertEqual(qa_index["chunk_count"], 3)
+        self.assertEqual(qa_index["chunk_file"], "/tmp/chunks.json")
+        self.assertEqual(qa_index["embedding_file"], "/tmp/embeddings.json")
+        self.assertEqual(qa_index["loading_method"], "docling")
+        self.assertEqual(qa_index["chunking_strategy"], "docling_sections")
+        self.assertEqual(qa_index["current_stage"], "save_embeddings")
+        self.assertEqual(qa_index["indexed_at"], "2024-01-01T00:00:00")
 
     def test_paper_index_jobs_support_create_update_and_latest_query(self) -> None:
         job = self.service.create_paper_index_job("2401.00005", loading_method="docling")

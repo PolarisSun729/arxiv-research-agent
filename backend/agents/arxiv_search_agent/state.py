@@ -2,18 +2,80 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .schemas import (
     AgentStep,
     AgentToolCall,
     ArxivSearchSpec,
+    ExecutionPlanStep,
     ExecutablePlan,
     Goal,
+    PlanStep,
     PlanRuntime,
     ToolCallRequest,
     ToolObservation,
+    ToolSpec,
 )
+
+
+_LEGACY_STEP_TOOL_NAMES = {
+    "goal_interpretation": "normalize_request",
+    "search_execution": "search_arxiv",
+    "result_validation": "validate_arxiv_results",
+    "personalization": "personalize_paper_results",
+    "response_synthesis": "synthesize_arxiv_response",
+    "paper_resolution": "resolve_paper",
+    "qa_index_check": "check_paper_index",
+    "confirmation_gate": "request_confirmation",
+    "paper_response": "answer_paper_question",
+    "preference_update": "update_preference_store",
+    "profile_loading": "load_user_profile",
+    "recommendation_generation": "generate_recommendations",
+    "recommendation_explanation": "explain_recommendations",
+    "ambiguity_analysis": "analyze_ambiguity",
+    "clarification_response": "generate_clarification",
+    "capability_check": "generate_fallback_response",
+    "fallback_response": "generate_fallback_response",
+}
+
+
+def _coerce_legacy_execution_plan(value: Any) -> Any:
+    """把历史 ExecutionPlanStep 列表规范化成当前 ExecutablePlan。
+
+    项目里仍有少量兼容节点和旧测试会传入轻量 step 列表；这里在状态边界统一转换，
+    避免业务节点继续同时处理两套计划容器。
+    """
+    if not isinstance(value, list):
+        return value
+    steps: List[PlanStep] = []
+    for index, item in enumerate(value):
+        payload = item.model_dump() if hasattr(item, "model_dump") else dict(item or {})
+        if "action_type" in payload and "tool_name" in payload and "tool" in payload:
+            steps.append(PlanStep.model_validate(payload))
+            continue
+        legacy_step = ExecutionPlanStep.model_validate(payload)
+        action_type = str(legacy_step.step_type or "").strip()
+        tool_name = _LEGACY_STEP_TOOL_NAMES.get(action_type, action_type or f"legacy_step_{index}")
+        steps.append(
+            PlanStep(
+                step_id=legacy_step.step_id,
+                action_type=action_type,
+                tool_name=tool_name,
+                tool=ToolSpec(tool_name=tool_name),
+                depends_on=list(legacy_step.depends_on or []),
+                status=legacy_step.status,
+            )
+        )
+    depended_ids = {dependency for step in steps for dependency in list(step.depends_on or [])}
+    return ExecutablePlan(
+        plan_id="legacy_execution_plan",
+        goal=Goal(goal_type="legacy_execution_plan"),
+        steps=steps,
+        entry_step_ids=[step.step_id for step in steps if not step.depends_on],
+        final_step_ids=[step.step_id for step in steps if step.step_id not in depended_ids],
+        metadata={"source": "legacy_execution_plan"},
+    )
 
 
 class AgentState(BaseModel):
@@ -48,8 +110,8 @@ class AgentState(BaseModel):
     # 例如 selected_paper、last_papers、research_profile、loading_method 等。
     context: Dict[str, Any] = Field(default_factory=dict)
 
-    # pending_action 用来表示“还不能立刻执行，需要先征求用户确认”的待确认任务，
-    # 典型场景是论文尚未建立 QA 索引，需要先问用户是否解析 PDF。
+    # pending_action 是对外兼容字段：新确认链路里它主要镜像 ConfirmationRequest 供前端展示。
+    # 真正的 interrupt/resume 执行现场依赖 LangGraph checkpointer，不能只靠这个业务摘要恢复。
     pending_action: Optional[Dict[str, Any]] = None
 
     # paper_qa_result 保存论文阅读链路的结构化结果：可能是成功答案、失败信息，
@@ -68,6 +130,11 @@ class AgentState(BaseModel):
     goal: Optional[Goal] = None
     execution_plan: Optional[ExecutablePlan] = None
     plan_runtime: Optional[PlanRuntime] = None
+
+    @field_validator("execution_plan", mode="before")
+    @classmethod
+    def _normalize_execution_plan(cls, value: Any) -> Any:
+        return _coerce_legacy_execution_plan(value)
 
     # 偏好动作执行后的结果，例如喜欢/不喜欢/取消标记的处理结果。
     preference_action_result: Optional[Dict[str, Any]] = None

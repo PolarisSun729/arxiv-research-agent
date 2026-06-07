@@ -1,6 +1,6 @@
 """处理用户对论文的显式偏好动作。
 
-这个节点负责把自然语言里的“喜欢 / 不喜欢 / 取消标记”落到推荐系统：
+这个节点负责把自然语言里的“喜欢 / 不喜欢 / 取消偏好”落到推荐系统：
 1. 解析动作类型与撤销范围；
 2. 结合上下文定位目标论文；
 3. 调用推荐服务写入或删除偏好记录；
@@ -50,6 +50,9 @@ def _parse_preference_action(message: str) -> Optional[Dict[str, str]]:
         r"撤销.*喜欢",
         r"撤销.*不喜欢",
         r"撤销.*标记",
+        r"\bunlike\b",
+        r"remove\s+like",
+        r"remove\s+dislike",
     )
     dislike_patterns = (
         r"不喜欢",
@@ -61,7 +64,6 @@ def _parse_preference_action(message: str) -> Optional[Dict[str, str]]:
     like_patterns = (
         r"喜欢",
         r"感兴趣",
-        r"收藏",
         r"标记.*喜欢",
         r"标记.*感兴趣",
         r"对.*感兴趣",
@@ -257,7 +259,7 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
     }
     if not next_state.next_actions:
         next_state.next_actions = [
-            "继续对其他论文执行喜欢、不喜欢或收藏动作",
+            "继续对其他论文执行喜欢、不喜欢或取消偏好动作",
             "也可以继续搜索、查看推荐或打开论文详情",
         ]
 

@@ -89,9 +89,8 @@ class PlanValidator:
             forbidden_tools = {
                 "search_arxiv",
                 "generate_recommendations",
-                "retrieve_paper_chunks",
+                "answer_paper_question",
                 "update_preference_store",
-                "update_reading_list_store",
                 "parse_and_index_paper",
             }
             used_forbidden_tools = [step.tool_name for step in steps if step.tool_name in forbidden_tools]

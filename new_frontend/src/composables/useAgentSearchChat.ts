@@ -1,26 +1,26 @@
 import { ref, type Ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { runAgentChat, streamAgentChat } from '@/api/agent'
+import { getErrorMessage } from '@/api/errors'
 import type { AgentPaper, AgentStep, AgentStreamEvent, AgentToolCall, ArxivSearchResponse } from '@/types/agent'
 import type { AgentChatMessage } from '@/types/agentChat'
 import type { UserResearchProfile } from '@/types/paper'
 import { usePaperStore } from '@/stores/paperStore'
 
-function createMessageId(prefix: 'user' | 'assistant') {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+type ResumeDecision = 'approve' | 'reject'
+const RESUME_CHECKPOINT_NOT_FOUND_CODE = 'resume_checkpoint_not_found'
+const RESUME_CHECKPOINT_NOT_FOUND_MESSAGE = '原执行现场已失效，请重新发起论文解析或问答请求。'
+
+interface AgentResumePayload {
+  decision: ResumeDecision
+  note?: string | null
+  step_id?: string | null
+  interrupt_id?: string | null
+  edited_arguments?: Record<string, any> | null
 }
 
-function getErrorMessage(error: unknown, fallback: string) {
-  if (
-    error &&
-    typeof error === 'object' &&
-    'message' in error &&
-    typeof (error as { message?: unknown }).message === 'string' &&
-    (error as { message?: string }).message
-  ) {
-    return (error as { message: string }).message
-  }
-  return fallback
+function createMessageId(prefix: 'user' | 'assistant') {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 }
 
 function createDraftResponse(): ArxivSearchResponse {
@@ -38,8 +38,40 @@ function createDraftResponse(): ArxivSearchResponse {
     warnings: [],
     next_actions: [],
     steps: [],
+    debug: {},
     streaming_state: null
   }
+}
+
+function getAgentErrorCode(response: ArxivSearchResponse | null | undefined) {
+  const runtimeCode = response?.debug?.runtime_error?.code
+  if (typeof runtimeCode === 'string' && runtimeCode) return runtimeCode
+
+  const paperQaCode = response?.paper_qa_result?.error_code
+  if (typeof paperQaCode === 'string' && paperQaCode) return paperQaCode
+
+  const stepError = response?.steps?.find(step => step.error)?.error
+  return typeof stepError === 'string' ? stepError : null
+}
+
+function isResumeCheckpointNotFound(response: ArxivSearchResponse | null | undefined) {
+  return getAgentErrorCode(response) === RESUME_CHECKPOINT_NOT_FOUND_CODE
+}
+
+function normalizeResumeCheckpointFailure(response: ArxivSearchResponse) {
+  // checkpoint 已失效时，pending_action 只是旧展示镜像；必须清掉，避免用户反复点同一个 resume。
+  response.pending_action = null
+  response.paper_qa_result = {
+    ...(response.paper_qa_result || {}),
+    status: 'failed',
+    error_code: RESUME_CHECKPOINT_NOT_FOUND_CODE,
+    message: RESUME_CHECKPOINT_NOT_FOUND_MESSAGE
+  }
+  response.answer = response.answer || RESUME_CHECKPOINT_NOT_FOUND_MESSAGE
+  response.next_actions = response.next_actions?.length
+    ? response.next_actions
+    : ['请重新发起论文解析或问答请求']
+  return response
 }
 
 function ensureAssistantResponse(target: AgentChatMessage<ArxivSearchResponse>) {
@@ -260,6 +292,7 @@ function buildFallbackErrorResponse(message: string, detail: string) {
         error: detail
       }
     ],
+    debug: {},
     streaming_state: null
   } as ArxivSearchResponse
 }
@@ -324,6 +357,11 @@ export function useAgentSearchChat() {
   }
 
   function rememberPendingAction(response: ArxivSearchResponse | null | undefined) {
+    if (isResumeCheckpointNotFound(response)) {
+      pendingAction.value = null
+      return
+    }
+
     const resultStatus = response?.paper_qa_result?.status
     if (response?.pending_action && resultStatus === 'waiting_confirmation') {
       pendingAction.value = { ...response.pending_action }
@@ -350,11 +388,7 @@ export function useAgentSearchChat() {
   async function submitMessage(
     rawMessage?: string,
     options?: {
-      resume?: {
-        decision: 'approve' | 'reject'
-        note?: string
-        step_id?: string | null
-      }
+      resume?: AgentResumePayload
     }
   ) {
     const message = (rawMessage ?? inputMessage.value).trim()
@@ -448,6 +482,10 @@ export function useAgentSearchChat() {
         }
       )
 
+      if (isResumeCheckpointNotFound(response)) {
+        normalizeResumeCheckpointFailure(response)
+        ElMessage.warning(RESUME_CHECKPOINT_NOT_FOUND_MESSAGE)
+      }
       latestResponse.value = response
       rememberSessionId(response)
       rememberSearchPapers(response)
@@ -464,6 +502,17 @@ export function useAgentSearchChat() {
       }
       setAssistantResponse(target, response)
     } catch (streamError) {
+      // stream 已经返回明确 resume 失效语义时，不再把同一份 resume 请求 fallback 到普通接口重复尝试。
+      if (options?.resume && target.response && isResumeCheckpointNotFound(target.response)) {
+        const failedResponse = normalizeResumeCheckpointFailure(target.response)
+        latestResponse.value = failedResponse
+        rememberPaperQaResult(failedResponse)
+        rememberPendingAction(failedResponse)
+        setAssistantResponse(target, failedResponse)
+        ElMessage.warning(RESUME_CHECKPOINT_NOT_FOUND_MESSAGE)
+        return
+      }
+
       try {
         const fallbackResponse = await runAgentChat({
           message,
@@ -472,6 +521,10 @@ export function useAgentSearchChat() {
           ...(options?.resume ? { resume: options.resume } : {}),
           context: Object.keys(requestContext).length ? requestContext : undefined
         })
+        if (isResumeCheckpointNotFound(fallbackResponse)) {
+          normalizeResumeCheckpointFailure(fallbackResponse)
+          ElMessage.warning(RESUME_CHECKPOINT_NOT_FOUND_MESSAGE)
+        }
         latestResponse.value = fallbackResponse
         rememberSessionId(fallbackResponse)
         rememberSearchPapers(fallbackResponse)
@@ -505,6 +558,25 @@ export function useAgentSearchChat() {
     }
   }
 
+  async function submitResume(decision: ResumeDecision, note?: string) {
+    if (!pendingAction.value || loading.value) return
+    const confirmationRequest = pendingAction.value.confirmation_request || {}
+    const resumePayload: AgentResumePayload = {
+      decision,
+      note: note || null,
+      step_id: pendingAction.value.step_id || confirmationRequest.step_id || null,
+      interrupt_id: pendingAction.value.interrupt_id || confirmationRequest.interrupt_id || null
+    }
+    if (pendingAction.value.edited_arguments) {
+      resumePayload.edited_arguments = { ...pendingAction.value.edited_arguments }
+    }
+
+    await submitMessage(decision === 'approve' ? '确认执行当前工具操作' : '拒绝执行当前工具操作', {
+      // 确认按钮必须走结构化 resume；message 只是满足后端请求模型的可读占位文本。
+      resume: resumePayload
+    })
+  }
+
   return {
     inputMessage,
     loading,
@@ -517,6 +589,7 @@ export function useAgentSearchChat() {
     activeSessionId,
     setInputMessage,
     submitMessage,
+    submitResume,
     clearConversation
   }
 }

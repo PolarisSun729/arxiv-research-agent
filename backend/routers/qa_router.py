@@ -32,6 +32,7 @@ from dependencies import (
     get_paper_qa_service,
     get_vector_store_service,
 )
+from core.errors import AppError, ErrorCode, error_response
 from routers.qa_utils import build_qa_diagnostic, get_latest_retrieval_trace, sanitize_trace_slug
 from utils.config import get_default_user_id
 
@@ -321,11 +322,27 @@ async def create_paper_qa_index(
             "progress": job.get("progress") if job.get("progress") is not None else 0,
             "message": "QA index job submitted",
         }
+    except AppError as exc:
+        logger.warning(
+            "QA index creation failed: code=%s arxiv_id=%s stage=%s recoverable=%s detail=%s",
+            exc.code,
+            arxiv_id,
+            exc.context.get("stage"),
+            exc.recoverable,
+            exc.detail,
+        )
+        return error_response(exc)
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Error creating QA index: %s", str(exc))
-        raise HTTPException(status_code=500, detail=str(exc))
+        logger.exception("Error creating QA index: arxiv_id=%s code=%s", arxiv_id, ErrorCode.QA_INDEX_BUILD_FAILED)
+        return error_response(
+            AppError(
+                ErrorCode.QA_INDEX_BUILD_FAILED,
+                detail=exc,
+                context={"arxiv_id": arxiv_id, "stage": "create_paper_qa_index"},
+            )
+        )
 
 
 @router.get("/qa-index-jobs/latest")
@@ -670,11 +687,29 @@ async def qa_paper(arxiv_id: str, payload: QaRequest, paper_qa_service=Depends(g
     """执行一次非流式论文问答。"""
     try:
         return paper_qa_service.answer_question(arxiv_id, payload)
+    except AppError as exc:
+        logger.warning(
+            "Paper QA failed: code=%s arxiv_id=%s user_id=%s session_id=%s stage=%s recoverable=%s detail=%s",
+            exc.code,
+            arxiv_id,
+            payload.user_id,
+            payload.session_id,
+            exc.context.get("stage"),
+            exc.recoverable,
+            exc.detail,
+        )
+        return error_response(exc)
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("Error in QA: %s", str(exc))
-        raise HTTPException(status_code=500, detail=str(exc))
+        logger.exception("Error in QA: arxiv_id=%s code=%s", arxiv_id, ErrorCode.UNKNOWN_ERROR)
+        return error_response(
+            AppError(
+                ErrorCode.UNKNOWN_ERROR,
+                detail=exc,
+                context={"arxiv_id": arxiv_id, "user_id": payload.user_id, "session_id": payload.session_id, "stage": "qa_paper"},
+            )
+        )
 
 
 @router.post("/qa/stream")
@@ -687,15 +722,6 @@ async def qa_paper_stream(
     """执行流式论文问答，并以 SSE 持续向前端推送事件。"""
     question = payload.question.strip()
     logger.debug("QA stream request for paper: %s, question: %s", arxiv_id, question)
-
-    # 先统一构建问答上下文：包含召回结果、生成上下文、会话信息以及调试快照。
-    _, search_results, qa_context, retrieval_debug = paper_qa_service.build_qa_context(arxiv_id, payload)
-    # sources 会在首帧 meta 和最后 done 事件中回传给前端，用于引用展示。
-    source_payload = paper_qa_service.build_source_payload(search_results)
-    # 若系统做了问题改写，这里优先使用改写后的 generation_question 作为最终生成输入。
-    contextualized_question = str(qa_context.get("generation_question", question) or question).strip() or question
-    question_contextualization = qa_context.get("question_contextualization", {}) or {}
-    chat_session = qa_context.get("chat_session", {}) or {}
 
     def sse_event(event_name: str, data: dict) -> str:
         """格式化单条 SSE 消息。"""
@@ -710,6 +736,13 @@ async def qa_paper_stream(
         3. done / error：结束态事件。
         """
         try:
+            # 上下文构建也放在 SSE 生成器内，确保未建索引、检索异常等前置失败能返回统一 error 事件。
+            _, search_results, qa_context, retrieval_debug = paper_qa_service.build_qa_context(arxiv_id, payload)
+            source_payload = paper_qa_service.build_source_payload(search_results)
+            contextualized_question = str(qa_context.get("generation_question", question) or question).strip() or question
+            question_contextualization = qa_context.get("question_contextualization", {}) or {}
+            chat_session = qa_context.get("chat_session", {}) or {}
+
             yield sse_event(
                 "meta",
                 {
@@ -794,10 +827,27 @@ async def qa_paper_stream(
                     "usage": None,
                 },
             )
+        except AppError as exc:
+            logger.warning(
+                "Paper QA stream failed: code=%s arxiv_id=%s user_id=%s session_id=%s stage=%s recoverable=%s detail=%s",
+                exc.code,
+                arxiv_id,
+                payload.user_id,
+                payload.session_id,
+                exc.context.get("stage"),
+                exc.recoverable,
+                exc.detail,
+            )
+            yield sse_event("error", exc.to_payload())
         except Exception as exc:
-            logger.error("Error in QA stream: %s", str(exc))
-            # SSE 场景下不能直接抛异常中断连接，因此把错误包装成 error 事件返回。
-            yield sse_event("error", {"status": "error", "detail": str(exc)})
+            logger.exception("Error in QA stream: arxiv_id=%s code=%s", arxiv_id, ErrorCode.LLM_GENERATION_FAILED)
+            # SSE 场景下不能直接抛异常中断连接，因此把错误包装成统一 error 事件返回。
+            stream_error = AppError(
+                ErrorCode.LLM_GENERATION_FAILED,
+                detail=exc,
+                context={"arxiv_id": arxiv_id, "user_id": payload.user_id, "session_id": payload.session_id, "stage": "qa_stream"},
+            )
+            yield sse_event("error", stream_error.to_payload())
 
     return StreamingResponse(
         event_stream(),

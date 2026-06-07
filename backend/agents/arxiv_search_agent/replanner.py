@@ -125,15 +125,6 @@ class Replanner:
         if step.tool_name == "check_paper_index" and observation.status == "need_confirmation":
             self._inject_index_confirmation_chain(plan, runtime, trigger_step_id=step.step_id)
             return {"rule_name": "rule_missing_paper_index"}
-        if step.tool_name == "validate_qa_evidence" and observation.status == "low_confidence":
-            self._rewrite_paper_qa_chain(plan, runtime, trigger_step_id=step.step_id)
-            return {"rule_name": "rule_qa_evidence_low_confidence"}
-        if step.tool_name == "rerank_paper_chunks" and observation.status == "low_confidence":
-            self._rewrite_paper_qa_chain(plan, runtime, trigger_step_id=step.step_id)
-            return {"rule_name": "rule_rerank_low_confidence"}
-        if step.tool_name == "verify_answer_grounding" and observation.status == "low_confidence":
-            self._regenerate_grounded_answer(plan, runtime, trigger_step_id=step.step_id)
-            return {"rule_name": "rule_grounding_low_confidence"}
         if step.tool_name == "load_user_profile" and observation.status == "empty_result":
             self._downgrade_recommendation_chain(plan, runtime, trigger_step_id=step.step_id)
             return {"rule_name": "rule_empty_user_profile"}
@@ -282,7 +273,18 @@ class Replanner:
             output_key=request_output_key,
             depends_on=[trigger_step_id],
             input_bindings=[
-                _binding("pending_action", source_type="literal", value={"step_id": parse_step_id, "tool_name": "parse_and_index_paper"}),
+                _binding(
+                    "pending_action",
+                    source_type="literal",
+                    value={
+                        "type": "tool_approval",
+                        "status": "waiting_confirmation",
+                        "step_id": parse_step_id,
+                        "tool_name": "parse_and_index_paper",
+                        "action_label": "解析并索引论文",
+                        "description": "目标论文还没有 QA 索引，需要先确认是否解析 PDF 并创建全文检索索引。",
+                    },
+                ),
             ],
         )
         parse_step = self._build_step(
@@ -309,91 +311,6 @@ class Replanner:
                     else:
                         updated_depends_on.append(dependency)
                 plan_step.depends_on = list(dict.fromkeys(updated_depends_on))
-
-    def _rewrite_paper_qa_chain(self, plan: ExecutablePlan, runtime: PlanRuntime, *, trigger_step_id: str) -> None:
-        rewrite_step_id = self._make_unique_step_id(plan, "rewrite_paper_query")
-        retrieve_step_id = self._make_unique_step_id(plan, "retrieve_paper_chunks")
-        rerank_step_id = self._make_unique_step_id(plan, "rerank_paper_chunks")
-        validate_step_id = self._make_unique_step_id(plan, "validate_qa_evidence")
-        rewrite_output_key = self._make_unique_output_key(plan, "rewritten_query")
-        retrieve_output_key = self._make_unique_output_key(plan, "retrieved_chunks_retry")
-        rerank_output_key = self._make_unique_output_key(plan, "reranked_chunks_retry")
-        validate_output_key = self._make_unique_output_key(plan, "evidence_quality_retry")
-
-        rewrite_step = self._build_step(
-            step_id=rewrite_step_id,
-            action_type="rewrite",
-            tool_name="rewrite_paper_query",
-            output_key=rewrite_output_key,
-            depends_on=[trigger_step_id],
-            input_bindings=[_binding("message", source_type="state", source_key="message")],
-        )
-        retrieve_step = self._build_step(
-            step_id=retrieve_step_id,
-            action_type="retrieve",
-            tool_name="retrieve_paper_chunks",
-            output_key=retrieve_output_key,
-            depends_on=[rewrite_step_id, "resolve_paper"],
-            input_bindings=[
-                _binding("paper_ref", source_type="step_output", step_id="resolve_paper"),
-                _binding("message", source_type="step_output", step_id=rewrite_step_id),
-            ],
-        )
-        rerank_step = self._build_step(
-            step_id=rerank_step_id,
-            action_type="rerank",
-            tool_name="rerank_paper_chunks",
-            output_key=rerank_output_key,
-            depends_on=[retrieve_step_id],
-            input_bindings=[
-                _binding("retrieved_chunks", source_type="step_output", step_id=retrieve_step_id),
-                _binding("message", source_type="step_output", step_id=rewrite_step_id),
-            ],
-        )
-        validate_step = self._build_step(
-            step_id=validate_step_id,
-            action_type="validate",
-            tool_name="validate_qa_evidence",
-            output_key=validate_output_key,
-            depends_on=[rerank_step_id],
-            input_bindings=[_binding("reranked_chunks", source_type="step_output", step_id=rerank_step_id)],
-        )
-        self._insert_steps_after(plan, trigger_step_id, [rewrite_step, retrieve_step, rerank_step, validate_step])
-        inserted_step_ids = [rewrite_step_id, retrieve_step_id, rerank_step_id, validate_step_id]
-        self._repoint_pending_bindings(plan, runtime, old_step_ids=["rerank_paper_chunks"], new_step_id=rerank_step_id, input_keys=["reranked_chunks"], exclude_step_ids=inserted_step_ids)
-        self._repoint_pending_bindings(plan, runtime, old_step_ids=["validate_qa_evidence"], new_step_id=validate_step_id, input_keys=["evidence_quality"], exclude_step_ids=inserted_step_ids)
-
-    def _regenerate_grounded_answer(self, plan: ExecutablePlan, runtime: PlanRuntime, *, trigger_step_id: str) -> None:
-        answer_step_id = self._make_unique_step_id(plan, "generate_paper_answer")
-        verify_step_id = self._make_unique_step_id(plan, "verify_answer_grounding")
-        answer_output_key = self._make_unique_output_key(plan, "draft_answer_retry")
-        verify_output_key = self._make_unique_output_key(plan, "final_answer_retry")
-
-        answer_step = self._build_step(
-            step_id=answer_step_id,
-            action_type="answer",
-            tool_name="generate_paper_answer",
-            output_key=answer_output_key,
-            depends_on=[trigger_step_id],
-            input_bindings=[
-                _binding("reranked_chunks", source_type="step_output", step_id="rerank_paper_chunks"),
-                _binding("message", source_type="state", source_key="message"),
-                _binding("stricter_grounding", source_type="literal", value=True),
-            ],
-        )
-        verify_step = self._build_step(
-            step_id=verify_step_id,
-            action_type="validate",
-            tool_name="verify_answer_grounding",
-            output_key=verify_output_key,
-            depends_on=[answer_step_id],
-            input_bindings=[
-                _binding("draft_answer", source_type="step_output", step_id=answer_step_id),
-                _binding("reranked_chunks", source_type="step_output", step_id="rerank_paper_chunks"),
-            ],
-        )
-        self._insert_steps_after(plan, trigger_step_id, [answer_step, verify_step])
-        self._repoint_pending_bindings(plan, runtime, old_step_ids=["verify_answer_grounding"], new_step_id=verify_step_id, input_keys=["final_answer"], exclude_step_ids=[answer_step_id, verify_step_id])
 
     def _downgrade_recommendation_chain(self, plan: ExecutablePlan, runtime: PlanRuntime, *, trigger_step_id: str) -> None:
         candidate_step = next((step for step in list(plan.steps or []) if step.tool_name == "load_candidate_papers"), None)

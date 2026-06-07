@@ -15,6 +15,18 @@ from .tool_registry import PLANNER_TOOL_REGISTRY, ToolRegistry
 from .utils.state_utils import _compact_search_spec
 
 
+SUPPORTED_GOAL_TYPES = {
+    "arxiv_search",
+    "paper_detail",
+    "paper_summary",
+    "paper_qa",
+    "recommendation",
+    "preference_action",
+    "unclear",
+    "unsupported",
+}
+
+
 def _normalize_text(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -23,7 +35,11 @@ def _normalize_text(value: Any) -> Optional[str]:
 
 
 def _normalize_intent(value: Any) -> str:
-    return _normalize_text(value) or "unsupported"
+    normalized = _normalize_text(value) or "unsupported"
+    # 未注册目标统一降级为 unsupported，避免历史调用方传入旧 intent 时触发规划异常。
+    if normalized not in SUPPORTED_GOAL_TYPES:
+        return "unsupported"
+    return normalized
 
 
 def _dedupe_strings(items: Sequence[Any]) -> List[str]:
@@ -207,7 +223,9 @@ def build_plan_runtime(state: AgentState, *, goal: Goal, plan: ExecutablePlan, t
         trace=[],
         retry_counts={},
         replan_counts={},
-        pending_confirmation=state.pending_action if isinstance(state.pending_action, Mapping) else None,
+        # PlanRuntime.pending_confirmation 只保存标准 ConfirmationRequest。
+        # state.pending_action 是前端兼容展示镜像，不能反向当成可恢复的执行现场。
+        pending_confirmation=None,
         final_answer=state.answer,
         turn_status=turn_status,  # type: ignore[arg-type]
     )
@@ -222,7 +240,7 @@ class GoalBuilder:
         context = _get_context_mapping(state)
         message = _normalize_text(state.message) or ""
         risk_level = "low"
-        if intent in {"preference_action", "reading_list_action"}:
+        if intent == "preference_action":
             risk_level = "high"
         elif intent in {"paper_summary", "paper_detail", "paper_qa", "recommendation"}:
             risk_level = "medium"
@@ -265,11 +283,6 @@ class GoalBuilder:
             "preference_action": [
                 "Resolve the preference target.",
                 "Persist the preference update.",
-                "Synchronize downstream interest profile.",
-            ],
-            "reading_list_action": [
-                "Resolve the reading-list action.",
-                "Persist the reading-list update.",
                 "Return a clear user-facing outcome.",
             ],
             "unclear": [
@@ -388,11 +401,8 @@ class PaperQAPlanBuilder:
         steps = [
             _build_plan_step(step_id="resolve_paper", action_type="retrieve", tool_name="resolve_paper", output_key="paper_ref", tool_registry=tool_registry, input_bindings=[_binding("message", source_type="state", source_key="message"), _binding("selected_paper", source_type="context", source_key="selected_paper", required=False)]),
             _build_plan_step(step_id="check_paper_index", action_type="validate", tool_name="check_paper_index", output_key="paper_index_status", tool_registry=tool_registry, input_bindings=[_binding("paper_ref", source_type="step_output", step_id="resolve_paper")], depends_on=["resolve_paper"]),
-            _build_plan_step(step_id="retrieve_paper_chunks", action_type="retrieve", tool_name="retrieve_paper_chunks", output_key="retrieved_chunks", tool_registry=tool_registry, input_bindings=[_binding("paper_ref", source_type="step_output", step_id="resolve_paper"), _binding("message", source_type="state", source_key="message")], depends_on=["resolve_paper", "check_paper_index"]),
-            _build_plan_step(step_id="rerank_paper_chunks", action_type="rerank", tool_name="rerank_paper_chunks", output_key="reranked_chunks", tool_registry=tool_registry, input_bindings=[_binding("retrieved_chunks", source_type="step_output", step_id="retrieve_paper_chunks"), _binding("message", source_type="state", source_key="message")], depends_on=["retrieve_paper_chunks"]),
-            _build_plan_step(step_id="validate_qa_evidence", action_type="validate", tool_name="validate_qa_evidence", output_key="evidence_quality", tool_registry=tool_registry, input_bindings=[_binding("reranked_chunks", source_type="step_output", step_id="rerank_paper_chunks")], depends_on=["rerank_paper_chunks"]),
-            _build_plan_step(step_id="generate_paper_answer", action_type="answer", tool_name="generate_paper_answer", output_key="draft_answer", tool_registry=tool_registry, input_bindings=[_binding("reranked_chunks", source_type="step_output", step_id="rerank_paper_chunks"), _binding("message", source_type="state", source_key="message")], depends_on=["rerank_paper_chunks", "validate_qa_evidence"]),
-            _build_plan_step(step_id="verify_answer_grounding", action_type="validate", tool_name="verify_answer_grounding", output_key="final_answer", tool_registry=tool_registry, input_bindings=[_binding("draft_answer", source_type="step_output", step_id="generate_paper_answer"), _binding("reranked_chunks", source_type="step_output", step_id="rerank_paper_chunks")], depends_on=["generate_paper_answer"]),
+            # Agent 只负责调度真实 PaperQA 工具；检索、重写、rerank 和 grounding 校验均由 PaperQAService 内部完成。
+            _build_plan_step(step_id="answer_paper_question", action_type="answer", tool_name="answer_paper_question", output_key="paper_qa_result", tool_registry=tool_registry, input_bindings=[_binding("paper_ref", source_type="step_output", step_id="resolve_paper"), _binding("message", source_type="state", source_key="message")], depends_on=["resolve_paper", "check_paper_index"]),
         ]
         return _make_plan(goal, steps=steps)
 
@@ -417,26 +427,13 @@ class PreferenceActionPlanBuilder:
         return goal.goal_type == "preference_action"
 
     def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
+        # 偏好计划只声明真实发生的持久化写入；兴趣画像/向量重建应走显式推荐接口，
+        # 不能在 Agent 里追加没有实际同步实现的“成功步骤”。
         steps = [
             _build_plan_step(step_id="resolve_preference_target", action_type="retrieve", tool_name="resolve_preference_target", output_key="paper_reference", tool_registry=tool_registry, input_bindings=[_binding("message", source_type="state", source_key="message")]),
             _build_plan_step(step_id="update_preference_store", action_type="write_state", tool_name="update_preference_store", output_key="preference_action_result", tool_registry=tool_registry, input_bindings=[_binding("paper_reference", source_type="step_output", step_id="resolve_preference_target"), _binding("message", source_type="state", source_key="message")], depends_on=["resolve_preference_target"], side_effect_level="persistent_write"),
-            _build_plan_step(step_id="update_interest_profile", action_type="write_state", tool_name="update_interest_profile", output_key="interest_profile_update", tool_registry=tool_registry, input_bindings=[_binding("preference_action_result", source_type="step_output", step_id="update_preference_store")], depends_on=["update_preference_store"], side_effect_level="persistent_write"),
-            _build_plan_step(step_id="verify_preference_update", action_type="validate", tool_name="verify_preference_update", output_key="verified_preference_update", tool_registry=tool_registry, input_bindings=[_binding("preference_action_result", source_type="step_output", step_id="update_preference_store")], depends_on=["update_preference_store", "update_interest_profile"]),
+            _build_plan_step(step_id="verify_preference_update", action_type="validate", tool_name="verify_preference_update", output_key="verified_preference_update", tool_registry=tool_registry, input_bindings=[_binding("preference_action_result", source_type="step_output", step_id="update_preference_store")], depends_on=["update_preference_store"]),
             _build_plan_step(step_id="synthesize_preference_response", action_type="answer", tool_name="synthesize_preference_response", output_key="final_answer", tool_registry=tool_registry, input_bindings=[_binding("verified_preference_update", source_type="step_output", step_id="verify_preference_update")], depends_on=["verify_preference_update"]),
-        ]
-        return _make_plan(goal, steps=steps)
-
-
-class ReadingListPlanBuilder:
-    def can_handle(self, goal: Goal) -> bool:
-        return goal.goal_type == "reading_list_action"
-
-    def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
-        steps = [
-            _build_plan_step(step_id="resolve_reading_list_action", action_type="retrieve", tool_name="resolve_reading_list_action", output_key="reading_list_action", tool_registry=tool_registry, input_bindings=[_binding("message", source_type="state", source_key="message")]),
-            _build_plan_step(step_id="update_reading_list_store", action_type="write_state", tool_name="update_reading_list_store", output_key="reading_list_result", tool_registry=tool_registry, input_bindings=[_binding("reading_list_action", source_type="step_output", step_id="resolve_reading_list_action")], depends_on=["resolve_reading_list_action"], side_effect_level="persistent_write"),
-            _build_plan_step(step_id="verify_reading_list_update", action_type="validate", tool_name="verify_reading_list_update", output_key="verified_reading_list_update", tool_registry=tool_registry, input_bindings=[_binding("reading_list_result", source_type="step_output", step_id="update_reading_list_store")], depends_on=["update_reading_list_store"]),
-            _build_plan_step(step_id="synthesize_reading_list_response", action_type="answer", tool_name="synthesize_reading_list_response", output_key="final_answer", tool_registry=tool_registry, input_bindings=[_binding("verified_reading_list_update", source_type="step_output", step_id="verify_reading_list_update")], depends_on=["verify_reading_list_update"]),
         ]
         return _make_plan(goal, steps=steps)
 
@@ -487,7 +484,6 @@ for builder in [
     PaperQAPlanBuilder(),
     RecommendationPlanBuilder(),
     PreferenceActionPlanBuilder(),
-    ReadingListPlanBuilder(),
     ClarificationPlanBuilder(),
     UnsupportedPlanBuilder(),
 ]:

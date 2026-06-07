@@ -24,7 +24,6 @@ SUPPORTED_INTENTS = {
     "paper_qa",
     "recommendation",
     "preference_action",
-    "reading_list_action",
     "unclear",
     "unsupported",
 }

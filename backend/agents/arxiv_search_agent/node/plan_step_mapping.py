@@ -72,7 +72,9 @@ def build_tool_call_request_from_plan_step(
     action_type = str(getattr(next_plan_step, "action_type", "") or "").strip()
     intent = str(current_state.intent or "").strip()
 
-    if action_type == "search" and str(getattr(next_plan_step, "tool_name", "") or "").strip() == SEARCH_TOOL_NAME and intent == "arxiv_search":
+    # 历史 ExecutionPlanStep 会把搜索动作写成 search_execution；当前 ExecutablePlan 使用 search。
+    # 这里统一兼容两种动作名，避免兼容节点为了旧名称绕过标准 ToolCallRequest。
+    if action_type in {"search", "search_execution"} and str(getattr(next_plan_step, "tool_name", "") or "").strip() == SEARCH_TOOL_NAME and intent == "arxiv_search":
         request = _build_search_execution_request(current_state, step_id=step_id)
         if request is None:
             return None, {

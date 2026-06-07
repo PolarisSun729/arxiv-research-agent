@@ -27,36 +27,12 @@ const fallbackGraph: AgentGraphResponse = {
   render_source: 'fallback',
   node_names: [
     'parse_search_request',
-    'build_search_tool_args',
-    'invoke_search_tool',
-    'check_search_result',
-    'relax_search_for_retry',
-    'personalized_rank_and_annotate_papers',
-    'apply_preference_action',
-    'classify_pending_action_confirmation',
-    'handle_pending_action_confirmation',
-    'handle_paper_reading_request',
-    'synthesize_response'
+    'run_agent_turn'
   ],
   mermaid: `graph TD;
     START([START]) --> parse_search_request;
-    parse_search_request --> build_search_tool_args;
-    parse_search_request --> handle_paper_reading_request;
-    parse_search_request --> apply_preference_action;
-    parse_search_request --> classify_pending_action_confirmation;
-    parse_search_request -->|recommendation / reading_list_action / unclear / unsupported| synthesize_response;
-    build_search_tool_args --> invoke_search_tool;
-    invoke_search_tool --> check_search_result;
-    check_search_result --> relax_search_for_retry;
-    check_search_result --> personalized_rank_and_annotate_papers;
-    relax_search_for_retry --> build_search_tool_args;
-    personalized_rank_and_annotate_papers --> synthesize_response;
-    apply_preference_action --> synthesize_response;
-    classify_pending_action_confirmation --> handle_pending_action_confirmation;
-    classify_pending_action_confirmation --> synthesize_response;
-    handle_pending_action_confirmation --> synthesize_response;
-    handle_paper_reading_request --> synthesize_response;
-    synthesize_response --> END([END]);`,
+    parse_search_request --> run_agent_turn;
+    run_agent_turn --> END([END]);`,
   supports_png: false
 }
 
@@ -66,16 +42,7 @@ const errorMessage = ref('')
 
 const nodeMeta: Record<string, { label: string; subtitle: string; tone: string }> = {
   parse_search_request: { label: 'Parse', subtitle: 'Intent and context', tone: 'tone-parse' },
-  build_search_tool_args: { label: 'Build Args', subtitle: 'Create arXiv query params', tone: 'tone-build' },
-  invoke_search_tool: { label: 'Invoke Tool', subtitle: 'Run structured search', tone: 'tone-tool' },
-  check_search_result: { label: 'Check Result', subtitle: 'Decide whether to retry', tone: 'tone-check' },
-  relax_search_for_retry: { label: 'Relax Retry', subtitle: 'Broaden the search', tone: 'tone-retry' },
-  personalized_rank_and_annotate_papers: { label: 'Rerank', subtitle: 'Apply preference signals', tone: 'tone-rank' },
-  apply_preference_action: { label: 'Preference', subtitle: 'Like / dislike / remove', tone: 'tone-pref' },
-  classify_pending_action_confirmation: { label: 'Confirm Classify', subtitle: 'Detect confirmation flow', tone: 'tone-confirm' },
-  handle_pending_action_confirmation: { label: 'Handle Confirm', subtitle: 'Apply confirm or cancel', tone: 'tone-handle' },
-  handle_paper_reading_request: { label: 'Paper Reading', subtitle: 'Summary / QA path', tone: 'tone-read' },
-  synthesize_response: { label: 'Synthesize', subtitle: 'Compose the final answer', tone: 'tone-final' }
+  run_agent_turn: { label: 'Run Turn', subtitle: 'Plan, observe, interrupt or answer', tone: 'tone-final' }
 }
 
 const nodes = computed<GraphNode[]>(() => {
@@ -83,39 +50,15 @@ const nodes = computed<GraphNode[]>(() => {
   const height = 68
   return [
     { key: 'parse_search_request', x: 70, y: 150, width, height, ...nodeMeta.parse_search_request },
-    { key: 'build_search_tool_args', x: 360, y: 70, width, height, ...nodeMeta.build_search_tool_args },
-    { key: 'invoke_search_tool', x: 640, y: 70, width, height, ...nodeMeta.invoke_search_tool },
-    { key: 'check_search_result', x: 920, y: 70, width, height, ...nodeMeta.check_search_result },
-    { key: 'relax_search_for_retry', x: 1180, y: 24, width, height, ...nodeMeta.relax_search_for_retry },
-    { key: 'personalized_rank_and_annotate_papers', x: 1180, y: 146, width, height, ...nodeMeta.personalized_rank_and_annotate_papers },
-    { key: 'apply_preference_action', x: 360, y: 258, width, height, ...nodeMeta.apply_preference_action },
-    { key: 'classify_pending_action_confirmation', x: 360, y: 368, width, height, ...nodeMeta.classify_pending_action_confirmation },
-    { key: 'handle_pending_action_confirmation', x: 640, y: 368, width, height, ...nodeMeta.handle_pending_action_confirmation },
-    { key: 'handle_paper_reading_request', x: 360, y: 478, width, height, ...nodeMeta.handle_paper_reading_request },
-    { key: 'synthesize_response', x: 920, y: 262, width, height, ...nodeMeta.synthesize_response }
+    { key: 'run_agent_turn', x: 420, y: 150, width, height, ...nodeMeta.run_agent_turn }
   ]
 })
 
 // 这里直接按照后端图的边来画，避免额外引入 Mermaid 运行时。
 const edges: GraphEdge[] = [
   { from: 'START', to: 'parse_search_request' },
-  { from: 'parse_search_request', to: 'build_search_tool_args', label: 'arxiv_search' },
-  { from: 'parse_search_request', to: 'handle_paper_reading_request', label: 'paper_detail / summary / qa' },
-  { from: 'parse_search_request', to: 'apply_preference_action', label: 'preference_action' },
-  { from: 'parse_search_request', to: 'classify_pending_action_confirmation', label: 'pending confirmation' },
-  { from: 'parse_search_request', to: 'synthesize_response', label: 'recommendation / reading_list / unclear / unsupported' },
-  { from: 'build_search_tool_args', to: 'invoke_search_tool' },
-  { from: 'invoke_search_tool', to: 'check_search_result' },
-  { from: 'check_search_result', to: 'relax_search_for_retry', label: 'empty result' },
-  { from: 'check_search_result', to: 'personalized_rank_and_annotate_papers', label: 'normal flow' },
-  { from: 'relax_search_for_retry', to: 'build_search_tool_args', label: 'loop' },
-  { from: 'personalized_rank_and_annotate_papers', to: 'synthesize_response' },
-  { from: 'apply_preference_action', to: 'synthesize_response' },
-  { from: 'classify_pending_action_confirmation', to: 'handle_pending_action_confirmation', label: 'confirm' },
-  { from: 'classify_pending_action_confirmation', to: 'synthesize_response', label: 'skip' },
-  { from: 'handle_pending_action_confirmation', to: 'synthesize_response' },
-  { from: 'handle_paper_reading_request', to: 'synthesize_response' },
-  { from: 'synthesize_response', to: 'END' }
+  { from: 'parse_search_request', to: 'run_agent_turn', label: 'parsed state' },
+  { from: 'run_agent_turn', to: 'END' }
 ]
 
 const nodeByKey = computed(() => {
@@ -125,8 +68,8 @@ const nodeByKey = computed(() => {
   }, {})
 })
 
-const diagramWidth = 1470
-const diagramHeight = 620
+const diagramWidth = 720
+const diagramHeight = 360
 
 const nodeCount = computed(() => graph.value.node_names.length)
 const mermaidSource = computed(() => graph.value.mermaid || fallbackGraph.mermaid)

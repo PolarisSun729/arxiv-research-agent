@@ -41,7 +41,7 @@ def _state_from_turn_result(source_state: AgentState, result: AgentTurnResult) -
     next_state.plan_runtime = result.runtime
     next_state.answer = result.final_answer
     confirmation_payload = result.pending_confirmation.model_dump() if result.pending_confirmation is not None else None
-    next_state.pending_action = _build_legacy_pending_action(result)
+    next_state.pending_action = _build_compatible_pending_action(result)
 
     next_state.debug = dict(next_state.debug or {})
     next_state.debug["agent_turn"] = {
@@ -63,6 +63,13 @@ def _state_from_turn_result(source_state: AgentState, result: AgentTurnResult) -
         preference_result = result.outputs.get("preference_action_result")
         next_state.preference_action_result = dict(preference_result) if isinstance(preference_result, Mapping) else {"value": preference_result}
 
+    if "paper_qa_result" in result.outputs:
+        # answer_paper_question 的输出来自 PaperQAService 真实 RAG 链路，sources/retrieval_debug 必须原样带给前端。
+        paper_qa_result = result.outputs.get("paper_qa_result")
+        next_state.paper_qa_result = _build_paper_qa_result(next_state, paper_qa_result)
+        if next_state.paper_qa_result.get("answer"):
+            next_state.answer = str(next_state.paper_qa_result.get("answer") or "")
+
     if "ranked_papers" in result.outputs and isinstance(result.outputs.get("ranked_papers"), list):
         next_state.papers = [dict(item) for item in result.outputs["ranked_papers"] if isinstance(item, Mapping)]
 
@@ -80,11 +87,34 @@ def _state_from_turn_result(source_state: AgentState, result: AgentTurnResult) -
     return next_state
 
 
-def _build_legacy_pending_action(result: AgentTurnResult) -> Optional[dict[str, Any]]:
-    """把新的确认请求结构映射回旧的 pending_action 外显字段。
+def _build_paper_qa_result(state: AgentState, payload: Any) -> dict[str, Any]:
+    """把真实 PaperQA 工具输出整理成前端沿用的 paper_qa_result。
 
-    第一轮改造仍需兼容旧前端，所以这里继续提供一个轻量 dict，
-    但恢复执行的真源不再依赖它，而是依赖标准化 confirmation request。
+    这里只做字段适配，不补造 chunk 或证据；retrieval_debug/sources 均以 PaperQAService 返回为准。
+    """
+    data = dict(payload) if isinstance(payload, Mapping) else {"value": payload}
+    context = state.context if isinstance(state.context, Mapping) else {}
+    selected_paper = context.get("selected_paper") if isinstance(context.get("selected_paper"), Mapping) else {}
+    answer = str(data.get("answer") or "").strip()
+    status = str(data.get("status") or ("success" if answer else "failed")).strip() or "failed"
+    return {
+        "status": status,
+        "arxiv_id": data.get("arxiv_id") or context.get("arxiv_id") or selected_paper.get("arxiv_id"),
+        "title": data.get("title") or selected_paper.get("title"),
+        "question": data.get("question") or state.message,
+        "answer": answer,
+        "sources": data.get("sources", []),
+        "retrieval_debug": data.get("retrieval_debug"),
+        "error": data.get("error"),
+        "tool_result": data.get("tool_result"),
+    }
+
+
+def _build_compatible_pending_action(result: AgentTurnResult) -> Optional[dict[str, Any]]:
+    """把新的确认请求结构映射成前端沿用的 pending_action 外显字段。
+
+    这里继续提供一个轻量 dict 作为确认卡片的数据源；
+    恢复执行的真源是 LangGraph checkpointer 中的 interrupt 现场，而不是这个展示镜像。
     """
     confirmation = result.pending_confirmation
     if confirmation is None:

@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc && vite build",
+    "test:errors": "node tests/errorParser.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

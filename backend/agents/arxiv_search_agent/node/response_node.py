@@ -110,15 +110,6 @@ def _build_non_search_answer(intent: str) -> Tuple[str, List[str]]:
             ],
         )
 
-    if intent == "reading_list_action":
-        return (
-            "我已经识别到你想查看阅读列表或收藏列表，但当前这一轮还没有可用的列表查询结果返回。",
-            [
-                "如果你要的是搜索，请直接描述论文主题或关键词",
-                "如果你要查看收藏，请切换到收藏页或列表页",
-            ],
-        )
-
     if intent == "unclear":
         return (
             "我能确定你是在找论文，但主题还不够明确。",
@@ -162,7 +153,6 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
         if inferred_paper_qa_result:
             paper_qa_result = inferred_paper_qa_result
             next_state.paper_qa_result = inferred_paper_qa_result
-    confirmation_decision = str((next_state.debug or {}).get("pending_action_decision") or "").strip().lower()
 
     # 已经拿到论文 QA 的最终答案时，直接复用该答案，不再重新包装过多说明。
     if next_state.intent in {"paper_summary", "paper_detail", "paper_qa"} and paper_qa_result.get("status") == "success":
@@ -186,12 +176,12 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
             },
         )
 
-    # 只有在用户明确确认过解析后仍失败，才返回明确的失败提示；否则可能还处于等待确认阶段。
-    if next_state.intent in {"paper_summary", "paper_detail", "paper_qa"} and paper_qa_result.get("status") == "failed" and confirmation_decision == "confirm":
+    # 失败状态来自实际工具执行或兼容节点的安全停止，直接返回可读错误，避免再依赖旧的自然语言确认分类结果。
+    if next_state.intent in {"paper_summary", "paper_detail", "paper_qa"} and paper_qa_result.get("status") == "failed":
         error_message = str(paper_qa_result.get("error") or paper_qa_result.get("answer") or "论文解析或问答执行失败").strip()
         next_state.answer = error_message
         next_state.next_actions = [
-            "重新确认是否需要解析 PDF",
+            "通过 Agent 主流程重新发起论文问答",
             "或稍后重试这篇论文",
         ]
         response_state = _finalize_response_plan("failed")
@@ -205,14 +195,15 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
             error=error_message,
         )
 
-    # 待确认任务的回复要精确区分：取消、无关新请求、仍未说清楚、以及继续执行中的提示。
-    # 待确认任务的回复最容易和普通失败提示混淆，因此这里单独拆成一组细分分支。
-    if isinstance(pending_action, dict) and str(pending_action.get("type") or "").strip() == "parse_then_qa":
+    # 新确认链路中的 pending_action 只是 ConfirmationRequest 的展示镜像；
+    # 用户操作必须走结构化 resume，不能再通过“解析/取消”这类普通聊天消息驱动状态机。
+    if isinstance(pending_action, dict) and str(pending_action.get("type") or "").strip() == "tool_approval":
         title = str(pending_action.get("title") or "").strip()
         arxiv_id = str(pending_action.get("arxiv_id") or "").strip()
         qa_question = str(pending_action.get("qa_question") or "").strip()
         base_prompt = f"《{title}》" if title else "这篇论文"
-        if confirmation_decision == "reject":
+        pending_status = str(pending_action.get("status") or "").strip().lower()
+        if pending_status == "cancelled" or str(pending_action.get("decision") or "").strip().lower() == "reject":
             next_state.answer = f"已取消解析{base_prompt}。暂时无法基于全文回答。"
             next_state.paper_qa_result = {
                 **paper_qa_result,
@@ -233,21 +224,9 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
         else:
             pending_message = str(paper_qa_result.get("answer") or "").strip()
             if not pending_message:
-                # 当当前轮次没有生成新的 answer 时，需要根据确认状态补一条明确、可执行的提示语。
-                pending_message = (
-                    f"{base_prompt} 还没有建立问答索引。是否现在解析 PDF 并创建全文检索索引？"
-                    if confirmation_decision != "unrelated"
-                    else f"当前还有一个待确认的论文解析任务：{base_prompt}。请先回复“解析”或“取消”。"
-                )
-            if confirmation_decision == "unrelated":
-                next_state.answer = f"当前还有一个待确认的论文解析任务：{base_prompt}。请先回复“解析”或“取消”。"
-                next_state.next_actions = ["解析", "取消"]
-            elif confirmation_decision == "unclear" or not confirmation_decision:
-                next_state.answer = f"{base_prompt} 还没有建立问答索引。请回复“解析”继续，或回复“取消”放弃。"
-                next_state.next_actions = ["解析", "取消"]
-            else:
-                next_state.answer = pending_message
-                next_state.next_actions = ["解析", "取消"]
+                pending_message = f"{base_prompt} 还没有建立问答索引，需要先确认是否执行 {pending_action.get('tool_name') or '解析索引'}。"
+            next_state.answer = pending_message
+            next_state.next_actions = ["使用确认卡片继续", "拒绝后重新选择论文"]
 
         response_state = _finalize_response_plan("completed")
         return _append_step(
@@ -259,7 +238,6 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
                 "intent": next_state.intent,
                 "pending_action": pending_action,
                 "paper_qa_result": dict(paper_qa_result),
-                "confirmation_decision": confirmation_decision,
             },
             outputs={"answer": response_state.answer, "next_actions": list(response_state.next_actions)},
         )
@@ -292,7 +270,7 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
             else:
                 next_state.answer += "\n\n后续推荐会恢复对这篇论文的中性处理。"
             next_state.next_actions = [
-                "继续对其他论文执行喜欢、不喜欢或收藏动作",
+                "继续对其他论文执行喜欢、不喜欢或取消偏好动作",
                 "也可以继续搜索、查看推荐或打开论文详情",
             ]
         else:

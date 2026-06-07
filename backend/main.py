@@ -5,9 +5,12 @@ import logging
 import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
+from core.errors import AppError, ErrorCode, http_exception_to_app_error, make_error_payload
 from dependencies import SERVICE_LOAD_MODE, normalize_service_load_mode, warm_up_services
 from routers.agent_router import router as agent_router
 from routers.arxiv_router import router as arxiv_router
@@ -40,6 +43,46 @@ def create_app(load_mode: str | None = None) -> FastAPI:
         yield
 
     app = FastAPI(lifespan=lifespan)
+
+    @app.exception_handler(AppError)
+    async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
+        # 全局出口只返回稳定错误契约；完整异常上下文留在日志里，避免前端收到底层堆栈。
+        logging.getLogger(__name__).warning(
+            "api_error code=%s recoverable=%s path=%s context=%s detail=%s",
+            exc.code,
+            exc.recoverable,
+            request.url.path,
+            exc.context,
+            exc.detail,
+        )
+        return exc.to_response()
+
+    @app.exception_handler(HTTPException)
+    async def http_error_handler(request: Request, exc: HTTPException) -> JSONResponse:
+        app_error = http_exception_to_app_error(exc)
+        logging.getLogger(__name__).warning(
+            "http_error mapped code=%s status=%s path=%s detail=%s",
+            app_error.code,
+            exc.status_code,
+            request.url.path,
+            app_error.detail,
+        )
+        return app_error.to_response()
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # 请求体验上只提示参数错误，细节中保留字段级摘要，便于开发调试但不暴露内部实现。
+        payload = make_error_payload(
+            code=ErrorCode.REQUEST_VALIDATION_ERROR,
+            detail=str(exc.errors()),
+            recoverable=True,
+        )
+        logging.getLogger(__name__).warning(
+            "request_validation_error path=%s detail=%s",
+            request.url.path,
+            payload.get("detail"),
+        )
+        return JSONResponse(status_code=422, content=payload)
 
     app.add_middleware(
         CORSMiddleware,

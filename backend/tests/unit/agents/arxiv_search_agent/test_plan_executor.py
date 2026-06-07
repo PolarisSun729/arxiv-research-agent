@@ -388,26 +388,26 @@ def test_plan_executor_replans_missing_paper_index_to_confirmation(monkeypatch) 
     assert any(trace.event == "plan_replanned" and trace.detail.get("rule_name") == "rule_missing_paper_index" for trace in result.trace)
 
 
-def test_plan_executor_replans_grounding_failure_with_stricter_answer(monkeypatch) -> None:
+def test_plan_executor_paper_qa_calls_real_answer_tool_once_and_preserves_debug(monkeypatch) -> None:
     answer_calls = []
 
     def fake_invoke_tool(tool_name: str, **kwargs):
-        if tool_name == "answer_paper_question":
-            answer_calls.append(dict(kwargs))
-            if len(answer_calls) == 1:
-                return {
-                    "ok": True,
-                    "tool_name": tool_name,
-                    "summary": "answered",
-                    "data": {"answer": "draft without source", "sources": []},
-                    "trace": {"tool_name": tool_name},
-                    "error": None,
-                }
+        if tool_name == "check_paper_qa_index":
             return {
                 "ok": True,
                 "tool_name": tool_name,
-                "summary": "answered strictly",
-                "data": {"answer": "grounded answer", "sources": [{"chunk_id": "c1"}]},
+                "summary": "available",
+                "data": {"status": "available", "has_index": True},
+                "trace": {"tool_name": tool_name},
+                "error": None,
+            }
+        if tool_name == "answer_paper_question":
+            answer_calls.append(dict(kwargs))
+            return {
+                "ok": True,
+                "tool_name": tool_name,
+                "summary": "answered",
+                "data": {"answer": "grounded answer", "sources": [{"chunk_id": "c1"}], "retrieval_debug": {"stages": {"rerank": {"count": 1}}}},
                 "trace": {"tool_name": tool_name},
                 "error": None,
             }
@@ -415,65 +415,18 @@ def test_plan_executor_replans_grounding_failure_with_stricter_answer(monkeypatc
 
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
 
-    goal = Goal(goal_id="paper_qa:grounding", goal_type="paper_qa", user_request="answer")
-    plan = ExecutablePlan(
-        plan_id="paper_qa:grounding",
-        goal=goal,
-        steps=[
-            PlanStep(
-                step_id="resolve_paper",
-                action_type="retrieve",
-                tool_name="resolve_paper",
-                tool=_tool("resolve_paper"),
-                output_key="paper_ref",
-                input_bindings=[StepInputBinding(input_key="message", source_type="state", source_key="message")],
-            ),
-            PlanStep(
-                step_id="rerank_paper_chunks",
-                action_type="rerank",
-                tool_name="rerank_paper_chunks",
-                tool=_tool("rerank_paper_chunks"),
-                output_key="reranked_chunks",
-                input_bindings=[StepInputBinding(input_key="retrieved_chunks", source_type="literal", value=[{"chunk_id": "c1", "text": "method", "score": 1.0}])],
-            ),
-            PlanStep(
-                step_id="generate_paper_answer",
-                action_type="answer",
-                tool_name="generate_paper_answer",
-                tool=_tool("generate_paper_answer"),
-                output_key="draft_answer",
-                depends_on=["resolve_paper", "rerank_paper_chunks"],
-                input_bindings=[
-                    StepInputBinding(input_key="reranked_chunks", source_type="step_output", step_id="rerank_paper_chunks"),
-                    StepInputBinding(input_key="message", source_type="state", source_key="message"),
-                ],
-            ),
-            PlanStep(
-                step_id="verify_answer_grounding",
-                action_type="validate",
-                tool_name="verify_answer_grounding",
-                tool=_tool("verify_answer_grounding"),
-                output_key="final_answer",
-                depends_on=["generate_paper_answer"],
-                input_bindings=[
-                    StepInputBinding(input_key="draft_answer", source_type="step_output", step_id="generate_paper_answer"),
-                    StepInputBinding(input_key="reranked_chunks", source_type="step_output", step_id="rerank_paper_chunks"),
-                ],
-            ),
-        ],
-        entry_step_ids=["resolve_paper", "rerank_paper_chunks"],
-        final_step_ids=["verify_answer_grounding"],
-    )
-
     state = AgentState(intent="paper_qa", message="what is the method?", context={"selected_paper": {"arxiv_id": "2401.00001"}})
+    _, plan, _ = planner_module.build_executable_plan(state)
     result = PlanExecutor().execute(plan, state)
 
     assert result.status == "success"
     assert result.final_answer == "grounded answer"
-    assert answer_calls[0]["stricter_grounding"] is False
-    assert answer_calls[1]["stricter_grounding"] is True
-    assert result.runtime is not None
-    assert result.runtime.replan_counts["verify_answer_grounding:low_confidence"] == 1
+    assert answer_calls == [{"arxiv_id": "2401.00001", "question": "what is the method?"}]
+    assert result.outputs["paper_qa_result"]["sources"] == [{"chunk_id": "c1"}]
+    assert result.outputs["paper_qa_result"]["retrieval_debug"] == {"stages": {"rerank": {"count": 1}}}
+    pseudo_steps = {"retrieve_paper_chunks", "rewrite_paper_query", "rerank_paper_chunks", "validate_qa_evidence", "generate_paper_answer", "verify_answer_grounding"}
+    assert not pseudo_steps.intersection({step.tool_name for step in result.plan.steps})
+    assert not pseudo_steps.intersection({trace.step_id for trace in result.trace})
 
 
 def test_plan_executor_replans_empty_profile_to_message_recommendation(monkeypatch) -> None:

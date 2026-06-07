@@ -140,6 +140,8 @@ def _load_builder_and_manager():
 builder_module, manager_module = _load_builder_and_manager()
 PaperQAIndexBuilder = builder_module.PaperQAIndexBuilder
 IndexJobManager = manager_module.IndexJobManager
+AppError = builder_module.AppError
+ErrorCode = builder_module.ErrorCode
 
 
 class _FakeOaiDbService:
@@ -277,6 +279,10 @@ class _FakeVectorStoreService:
             "index_mode": getattr(config, "index_mode", "default"),
             "total_vectors": len(payload.get("embeddings") or []),
         }
+
+    def delete_collection(self, provider: str, collection_name: str) -> bool:
+        self.calls.append({"method": "delete_collection", "provider": provider, "collection_name": collection_name})
+        return bool(collection_name)
 
 
 class _InlineThread:
@@ -445,11 +451,36 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
         self.assertEqual(record["chunk_count"], 2)
         self.assertEqual(record["embedding_model"], "fake-embedding-model")
         self.assertEqual(record["pdf_path"], "tmp/fake-paper.pdf")
+        self.assertEqual(record["chunk_file"], "chunk-output.json")
+        self.assertIn('"filename": "2401.00001.pdf"', record["embedding_file"])
         self.assertEqual(record["collection_name"], "qa_2401_00001_pdf")
+        self.assertEqual(record["loading_method"], "docling")
+        self.assertEqual(record["chunking_strategy"], "docling_sections")
+        self.assertEqual(record["current_stage"], "mark_index_success")
+        self.assertEqual(record["failed_stage"], "")
+        self.assertEqual(record["error_message"], "")
+        self.assertIsNotNone(record["indexed_at"])
         self.assertEqual(loading_service.calls[0]["method"], "load_pdf")
         self.assertEqual(chunking_service.calls[0]["method"], "chunk_docling")
         self.assertEqual(embedding_service.calls[0]["method"], "create_embeddings")
         self.assertEqual(vector_store_service.calls[0]["method"], "index_embeddings")
+
+    def test_rebuild_cleans_old_collection_before_creating_new_index(self) -> None:
+        self.db_service.add_paper(self._paper_payload())
+        self.db_service.insert_paper_qa_index(
+            self.arxiv_id,
+            collection_name="qa_old_collection",
+            status="indexed",
+            pdf_path="",
+            chunk_file="",
+            embedding_file="",
+        )
+        builder, *_services, vector_store_service = self._make_builder()
+
+        builder.build_qa_index(self.arxiv_id, loading_method="docling")
+
+        self.assertEqual(vector_store_service.calls[0]["method"], "delete_collection")
+        self.assertEqual(vector_store_service.calls[0]["collection_name"], "qa_old_collection")
 
     def test_collection_name_generation_is_stable(self) -> None:
         vector_store_service = _FakeVectorStoreService()
@@ -464,49 +495,65 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
         self.db_service.add_paper(self._paper_payload())
         builder, *_ = self._make_builder(loading_service=_FakeLoadingService(fail_stage="load_pdf_document"))
 
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(AppError) as ctx:
             builder.build_qa_index(self.arxiv_id)
 
         record = self.db_service.get_paper_qa_index(self.arxiv_id)
-        self.assertEqual(str(ctx.exception), "loading failed")
+        self.assertEqual(ctx.exception.code, ErrorCode.QA_INDEX_BUILD_FAILED)
+        self.assertIn("loading failed", str(ctx.exception.__cause__))
         self.assertEqual(record["status"], "failed")
-        self.assertEqual(getattr(ctx.exception, "error_stage", ""), "load_pdf_document")
+        self.assertEqual(record["failed_stage"], "load_pdf_document")
+        self.assertEqual(record["error_message"], "loading failed")
+        self.assertEqual(record["pdf_path"], "tmp/fake-paper.pdf")
+        self.assertEqual(ctx.exception.context.get("stage"), "load_pdf_document")
 
     def test_build_qa_index_records_failure_when_chunking_fails(self) -> None:
         self.db_service.add_paper(self._paper_payload())
         builder, *_ = self._make_builder(chunking_service=_FakeChunkingService(fail_stage="chunk_document"))
 
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(AppError) as ctx:
             builder.build_qa_index(self.arxiv_id)
 
         record = self.db_service.get_paper_qa_index(self.arxiv_id)
-        self.assertEqual(str(ctx.exception), "chunking failed")
+        self.assertEqual(ctx.exception.code, ErrorCode.QA_INDEX_BUILD_FAILED)
+        self.assertIn("chunking failed", str(ctx.exception.__cause__))
         self.assertEqual(record["status"], "failed")
-        self.assertEqual(getattr(ctx.exception, "error_stage", ""), "chunk_document")
+        self.assertEqual(record["failed_stage"], "chunk_document")
+        self.assertEqual(record["error_message"], "chunking failed")
+        self.assertEqual(record["pdf_path"], "tmp/fake-paper.pdf")
+        self.assertEqual(ctx.exception.context.get("stage"), "chunk_document")
 
     def test_build_qa_index_records_failure_when_embedding_fails(self) -> None:
         self.db_service.add_paper(self._paper_payload())
         builder, *_ = self._make_builder(embedding_service=_FakeEmbeddingService(fail_stage="create_chunk_embeddings"))
 
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(AppError) as ctx:
             builder.build_qa_index(self.arxiv_id)
 
         record = self.db_service.get_paper_qa_index(self.arxiv_id)
-        self.assertEqual(str(ctx.exception), "embedding failed")
+        self.assertEqual(ctx.exception.code, ErrorCode.QA_INDEX_BUILD_FAILED)
+        self.assertIn("embedding failed", str(ctx.exception.__cause__))
         self.assertEqual(record["status"], "failed")
-        self.assertEqual(getattr(ctx.exception, "error_stage", ""), "create_chunk_embeddings")
+        self.assertEqual(record["failed_stage"], "create_chunk_embeddings")
+        self.assertEqual(record["error_message"], "embedding failed")
+        self.assertEqual(record["chunk_file"], "chunk-output.json")
+        self.assertEqual(ctx.exception.context.get("stage"), "create_chunk_embeddings")
 
     def test_build_qa_index_records_failure_when_vector_write_fails(self) -> None:
         self.db_service.add_paper(self._paper_payload())
         builder, *_ = self._make_builder(vector_store_service=_FakeVectorStoreService(fail_stage="index_embeddings_to_vector_store"))
 
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(AppError) as ctx:
             builder.build_qa_index(self.arxiv_id)
 
         record = self.db_service.get_paper_qa_index(self.arxiv_id)
-        self.assertEqual(str(ctx.exception), "vector write failed")
+        self.assertEqual(ctx.exception.code, ErrorCode.VECTOR_STORE_ERROR)
+        self.assertIn("vector write failed", str(ctx.exception.__cause__))
         self.assertEqual(record["status"], "failed")
-        self.assertEqual(getattr(ctx.exception, "error_stage", ""), "index_embeddings_to_vector_store")
+        self.assertEqual(record["failed_stage"], "index_embeddings_to_vector_store")
+        self.assertEqual(record["error_message"], "vector write failed")
+        self.assertIn('"filename": "2401.00001.pdf"', record["embedding_file"])
+        self.assertEqual(ctx.exception.context.get("stage"), "index_embeddings_to_vector_store")
 
 
 class IndexJobManagerFlowTests(_BaseIndexTestCase):

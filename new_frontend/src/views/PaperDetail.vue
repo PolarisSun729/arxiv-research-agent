@@ -221,15 +221,13 @@ function handlePanelOpenEvidence(turnId: string) {
   evidenceDrawerOpen.value = isNarrowScreen.value
 }
 
-async function handleTogglePaperAction(actionType: 'favorite' | 'read' | 'later' | 'not_interested' | 'note_saved') {
+async function handleTogglePaperAction(actionType: 'read' | 'not_interested' | 'note_saved') {
   if (!store.currentPaper) return
   try {
     const enabled = !currentPaperActions.value[actionType]
     await store.togglePaperAction(store.currentPaper, actionType, enabled)
     const actionLabels: Record<string, string> = {
-      favorite: '收藏',
       read: '已读',
-      later: '稍后读',
       not_interested: '不感兴趣',
       note_saved: '已记笔记'
     }
@@ -519,14 +517,8 @@ watch(activeNoteTypeFilter, async () => {
                 </el-button>
               </a>
               <div class="paper-action-strip">
-                <el-button size="small" plain :type="currentPaperActions.favorite ? 'warning' : 'default'" @click="handleTogglePaperAction('favorite')">
-                  {{ currentPaperActions.favorite ? '已收藏' : '收藏' }}
-                </el-button>
                 <el-button size="small" plain :type="currentPaperActions.read ? 'success' : 'default'" @click="handleTogglePaperAction('read')">
                   {{ currentPaperActions.read ? '已读' : '标记已读' }}
-                </el-button>
-                <el-button size="small" plain :type="currentPaperActions.later ? 'primary' : 'default'" @click="handleTogglePaperAction('later')">
-                  {{ currentPaperActions.later ? '已加入稍后读' : '稍后读' }}
                 </el-button>
                 <el-button size="small" plain :type="currentPaperActions.note_saved ? 'info' : 'default'" @click="handleTogglePaperAction('note_saved')">
                   {{ currentPaperActions.note_saved ? '已记笔记' : '记录笔记' }}

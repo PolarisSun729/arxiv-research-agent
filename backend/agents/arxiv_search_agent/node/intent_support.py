@@ -27,7 +27,6 @@ SUPPORTED_INTENTS = {
     "paper_qa",
     "recommendation",
     "preference_action",
-    "reading_list_action",
     "unclear",
     "unsupported",
 }
@@ -38,7 +37,6 @@ NON_SEARCH_INTENTS = {
     "paper_qa",
     "recommendation",
     "preference_action",
-    "reading_list_action",
 }
 
 LLM_CONFIDENCE_THRESHOLD = 0.55
@@ -64,16 +62,10 @@ HARD_RULE_PATTERNS: Dict[str, Sequence[str]] = {
         r"(?:what dataset|what experiments?|why does|how does).{0,24}(?:this paper|the paper|\b\d{4}\.\d{4,5}(?:v\d+)?\b|arxiv\s*id)",
     ),
     "preference_action": (
-        r"(?:喜欢|不喜欢|收藏|取消收藏|加入收藏|加入待读|取消喜欢).{0,12}(?:这篇|该论文|这篇论文|第\s*[0-9一二三四五六七八九十两]+\s*篇)",
-        r"(?:第\s*[0-9一二三四五六七八九十两]+\s*篇|这篇|该论文|这篇论文).{0,12}(?:喜欢|不喜欢|收藏|取消收藏|加入收藏|加入待读|取消喜欢)",
-        r"(?:bookmark|save|saved|favorite|favourite|like|dislike|unbookmark|remove from bookmarks).{0,18}(?:this paper|the paper|paper\s*#?\s*\d+|the first paper|the second paper|\bfirst\b|\bsecond\b)",
-        r"(?:this paper|the paper|paper\s*#?\s*\d+|the first paper|the second paper|\bfirst\b|\bsecond\b).{0,18}(?:bookmark|save|favorite|favourite|like|dislike|unbookmark)",
-    ),
-    "reading_list_action": (
-        r"(?:打开|查看|看看|展示|列出).{0,12}(?:我的)?(?:收藏夹|收藏|阅读列表|待读(?:列表)?|已保存论文)",
-        r"(?:我的)?(?:收藏夹|阅读列表|待读(?:列表)?|已保存论文).{0,8}(?:在哪|打开|查看|看看|展示|列出)?",
-        r"(?:show|open|list|view|check).{0,12}(?:my )?(?:bookmarks|favorites|favourites|saved papers|reading list)",
-        r"(?:my )?(?:bookmarks|favorites|favourites|saved papers|reading list)\b",
+        r"(?:喜欢|不喜欢|取消喜欢|取消不喜欢).{0,12}(?:这篇|该论文|这篇论文|第\s*[0-9一二三四五六七八九十两]+\s*篇)",
+        r"(?:第\s*[0-9一二三四五六七八九十两]+\s*篇|这篇|该论文|这篇论文).{0,12}(?:喜欢|不喜欢|取消喜欢|取消不喜欢)",
+        r"(?:like|dislike|unlike|remove\s+like|remove\s+dislike).{0,18}(?:this paper|the paper|paper\s*#?\s*\d+|the first paper|the second paper|\bfirst\b|\bsecond\b)",
+        r"(?:this paper|the paper|paper\s*#?\s*\d+|the first paper|the second paper|\bfirst\b|\bsecond\b).{0,18}(?:like|dislike|unlike|remove\s+like|remove\s+dislike)",
     ),
 }
 # 搜索触发词服务于 arXiv 搜索入口，只覆盖“找论文/最新论文/papers about ...”这类搜索语气，
@@ -127,20 +119,8 @@ def _build_intent_guidance(intent: str) -> Tuple[List[str], List[str], List[str]
                     "保留 intent，等待后续偏好更新节点执行",
                 ],
                 [
-                    "继续对其他论文执行喜欢、不喜欢或收藏动作",
+                    "继续对其他论文执行喜欢、不喜欢或取消偏好动作",
                     "后续也可以继续搜索、查看推荐或打开论文详情",
-                ],
-                [f"identified non-search intent: {intent}"],
-            )
-        if intent == "reading_list_action":
-            return (
-                [
-                    "识别到用户在查询阅读列表或收藏列表",
-                    "当前入口先保留 intent，等待后续列表查询节点接入",
-                ],
-                [
-                    "如果你想找论文，请改成明确的 arXiv 搜索需求",
-                    "如果你想看收藏内容，可以后续直接进入阅读列表页面",
                 ],
                 [f"identified non-search intent: {intent}"],
             )
@@ -263,18 +243,18 @@ def _references_specific_paper(message: str) -> bool:
 
 
 def _looks_like_preference_action_request(message: str) -> bool:
-    """启发式识别“喜欢 / 不喜欢 / 收藏 / 取消标记”类请求。
+    """启发式识别“喜欢 / 不喜欢 / 取消偏好”类请求。
     
     主要步骤：
-    1. 先排除“阅读列表 / 收藏夹”这类列表查询，避免和偏好动作混淆；
-    2. 再检查是否出现 like / dislike / 收藏 等动作词；
+    1. 先排除“阅读列表 / 收藏夹 / 保存”这类没有真实 Agent 落库链路的请求；
+    2. 再检查是否出现 like / dislike / 取消喜欢等真实偏好动作词；
     3. 最后要求消息中能定位到具体论文或结果序号，降低误标风险。
     
     输出说明：
     - True 表示请求更像对某篇论文做显式偏好操作；
     - False 表示应交给其他 intent 分支继续判断。
     """
-    if _contains_any_term(message, ("阅读列表", "收藏夹", "reading list", "favorites", "bookmarks")):
+    if _contains_any_term(message, ("阅读列表", "待读", "稍后读", "收藏夹", "保存", "reading list", "favorites", "bookmarks", "save", "saved papers")):
         return False
     # 先判断是否出现了明确动作词；没有动作词时直接排除，不继续做更昂贵的论文引用判断。
     action_hit = _contains_any_term(
@@ -282,14 +262,10 @@ def _looks_like_preference_action_request(message: str) -> bool:
         (
             "喜欢",
             "不喜欢",
-            "收藏",
-            "取消收藏",
-            "加入收藏",
-            "加入待读",
             "取消喜欢",
-            "bookmark",
-            "favorite",
-            "favourite",
+            "取消不喜欢",
+            "like",
+            "unlike",
             "dislike",
             "thumbs up",
             "thumbs down",
@@ -301,26 +277,31 @@ def _looks_like_preference_action_request(message: str) -> bool:
     return _references_specific_paper(message) or _contains_any_term(message, ("第一篇", "第二篇", "第1篇", "第2篇", "这篇"))
 
 
-def _looks_like_reading_list_action_request(message: str) -> bool:
-    """启发式识别阅读列表或收藏列表查询请求。
-    
-    这个函数只负责做轻量词面判断，不解析列表过滤条件。
-    当命中“阅读列表”“我的收藏”“saved papers”等表达时，后续流程可直接走列表类 intent。
+def _looks_like_saved_paper_container_request(message: str) -> bool:
+    """识别已下线的论文保存/列表容器请求，供 parse 层提前降级。
+
+    这些表达过去容易被误当成可执行操作；现在没有真实 Agent 落库链路，
+    因此只作为 unsupported 边界信号使用，不能再生成工具计划。
     """
+    lowered = message.lower()
     return _contains_any_term(
         message,
         (
             "阅读列表",
             "待读",
-            "待读列表",
+            "稍后读",
             "收藏夹",
             "我的收藏",
-            "favorites",
-            "bookmarks",
+            "已保存论文",
+            "加入阅读",
+            "保存这篇",
+            "保存该论文",
             "reading list",
+            "read later",
             "saved papers",
+            "bookmarks",
         ),
-    )
+    ) or bool(any(token in lowered for token in ("bookmark", "save this paper", "save the paper", "add to saved")))
 
 
 def _looks_like_paper_summary_request(message: str) -> bool:
@@ -478,11 +459,11 @@ def _build_llm_prompt_with_profile(message: str, research_profile: Optional[Mapp
     return (
         "You are an intent parser for a natural-language arXiv paper agent.\n"
         "Return JSON only.\n"
-        "Classify the message into one of: arxiv_search, paper_detail, paper_summary, paper_qa, recommendation, preference_action, reading_list_action, unclear, unsupported.\n"
+        "Classify the message into one of: arxiv_search, paper_detail, paper_summary, paper_qa, recommendation, preference_action, unclear, unsupported.\n"
         "If it is a search request, extract a structured search spec.\n"
         "Schema:\n"
         "{"
-        '\"intent\":\"arxiv_search|paper_detail|paper_summary|paper_qa|recommendation|preference_action|reading_list_action|unclear|unsupported\",'
+        '\"intent\":\"arxiv_search|paper_detail|paper_summary|paper_qa|recommendation|preference_action|unclear|unsupported\",'
         '\"confidence\":0.0,'
         '\"query\":null|string,'
         '\"title_query\":null|string,'
@@ -502,7 +483,8 @@ def _build_llm_prompt_with_profile(message: str, research_profile: Optional[Mapp
         "}\n"
         "Guidance:\n"
         "- If the user is asking to summarize/explain/QA a specific paper, do not classify as arxiv_search.\n"
-        "- If the user is expressing like/dislike/favorite about a specific paper, classify as preference_action.\n"
+        "- If the user is expressing like/dislike or cancelling like/dislike about a specific paper, classify as preference_action.\n"
+        "- If the user asks to save/bookmark/add to a reading list/read later/list saved papers, classify as unsupported.\n"
         "- If the user is asking for personalized recommendations, classify as recommendation.\n"
         "- If the topic is too vague, classify as unclear.\n"
         f"Research profile hint: {profile_hint}\n"
@@ -579,7 +561,7 @@ __all__ = [
     "_looks_like_paper_qa_request",
     "_looks_like_paper_summary_request",
     "_looks_like_preference_action_request",
-    "_looks_like_reading_list_action_request",
+    "_looks_like_saved_paper_container_request",
     "_looks_like_recommendation_request",
     "_looks_search_like",
     "_matches_any",

@@ -271,12 +271,7 @@ class PlanExecutor:
             "check_paper_index": self._check_paper_index,
             "request_confirmation": self._request_confirmation,
             "parse_and_index_paper": self._parse_and_index_paper,
-            "retrieve_paper_chunks": self._retrieve_paper_chunks,
-            "rewrite_paper_query": self._rewrite_paper_query,
-            "rerank_paper_chunks": self._rerank_paper_chunks,
-            "validate_qa_evidence": self._validate_qa_evidence,
-            "generate_paper_answer": self._generate_paper_answer,
-            "verify_answer_grounding": self._verify_answer_grounding,
+            "answer_paper_question": self._answer_paper_question,
             "load_user_profile": self._load_user_profile,
             "load_candidate_papers": self._load_candidate_papers,
             "generate_recommendations": self._generate_recommendations,
@@ -284,13 +279,8 @@ class PlanExecutor:
             "explain_recommendations": self._explain_recommendations,
             "resolve_preference_target": self._resolve_preference_target,
             "update_preference_store": self._update_preference_store,
-            "update_interest_profile": self._update_interest_profile,
             "verify_preference_update": self._verify_preference_update,
             "synthesize_preference_response": self._synthesize_preference_response,
-            "resolve_reading_list_action": self._resolve_reading_list_action,
-            "update_reading_list_store": self._update_reading_list_store,
-            "verify_reading_list_update": self._verify_reading_list_update,
-            "synthesize_reading_list_response": self._synthesize_reading_list_response,
             "analyze_ambiguity": self._analyze_ambiguity,
             "generate_clarification": self._generate_clarification,
             "generate_fallback_response": self._generate_fallback_response,
@@ -497,8 +487,11 @@ class PlanExecutor:
 
             if step.output_key:
                 runtime.outputs[step.output_key] = normalized_output
-                if (step.output_key == "final_answer" or step.tool_name == "verify_answer_grounding") and normalized_output is not None:
+                if step.output_key == "final_answer" and normalized_output is not None:
                     runtime.final_answer = str(normalized_output)
+                if step.tool_name == "answer_paper_question" and isinstance(normalized_output, Mapping):
+                    # PaperQAService 才是真实 RAG 真源；Agent 只读取它返回的答案，不再自行拼接伪证据链。
+                    runtime.final_answer = str(normalized_output.get("answer") or "").strip() or runtime.final_answer
 
             runtime.step_status[step.step_id] = "success"
             self._append_trace(
@@ -688,14 +681,14 @@ class PlanExecutor:
         if not policy or not policy.requires_confirmation:
             return False
         context = state.context if isinstance(state.context, Mapping) else {}
-        confirmed_step_ids = context.get("confirmed_step_ids")
-        if isinstance(confirmed_step_ids, list) and step.step_id in confirmed_step_ids:
+        approved_step_ids = context.get("approved_step_ids")
+        if isinstance(approved_step_ids, list) and step.step_id in approved_step_ids:
             return False
         pending_action = state.pending_action if isinstance(state.pending_action, Mapping) else {}
-        confirmation_decision = str(pending_action.get("decision") or "").strip().lower()
-        if confirmation_decision == "approve" and pending_action.get("step_id") == step.step_id:
+        approval_decision = str(pending_action.get("decision") or "").strip().lower()
+        if approval_decision == "approve" and pending_action.get("step_id") == step.step_id:
             return False
-        if pending_action.get("status") in {"confirmed", "approved"} and pending_action.get("step_id") == step.step_id:
+        if pending_action.get("status") == "approved" and pending_action.get("step_id") == step.step_id:
             return False
         return True
 
@@ -761,7 +754,7 @@ class PlanExecutor:
             tool_name=step.tool_name,
             action_type=step.action_type,
             side_effect_level=str(step.side_effect_level or ""),
-            reason=str(reason or pending_action_payload.get("reason") or "waiting_for_user_confirmation").strip() or None,
+            reason=str(reason or pending_action_payload.get("reason") or "waiting_confirmation").strip() or None,
             title=title or None,
             description=description or None,
             arguments_summary=_compact_confirmation_arguments(arguments_source),
@@ -826,10 +819,11 @@ class PlanExecutor:
         decision = self._normalize_confirmation_resume_payload(resume_payload)
         if decision == "approve":
             state.context = dict(state.context or {})
-            confirmed_step_ids = list(state.context.get("confirmed_step_ids") or [])
-            if step.step_id not in confirmed_step_ids:
-                confirmed_step_ids.append(step.step_id)
-            state.context["confirmed_step_ids"] = confirmed_step_ids
+            # 恢复后把当前步骤标为已批准，避免同一工具在续跑时再次触发 interrupt。
+            approved_step_ids = list(state.context.get("approved_step_ids") or [])
+            if step.step_id not in approved_step_ids:
+                approved_step_ids.append(step.step_id)
+            state.context["approved_step_ids"] = approved_step_ids
             state.pending_action = {
                 "type": "tool_approval",
                 "status": "approved",
@@ -1076,7 +1070,7 @@ class PlanExecutor:
         del runtime, step
         pending_action = resolved_input.get("pending_action")
         pending_state = state.pending_action if isinstance(state.pending_action, Mapping) else {}
-        status = "confirmed" if pending_state.get("status") in {"confirmed", "approved"} else "waiting_confirmation"
+        status = "approved" if pending_state.get("status") == "approved" else "waiting_confirmation"
         return {"status": status, "pending_action": pending_action}
 
     def _parse_and_index_paper(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
@@ -1088,61 +1082,34 @@ class PlanExecutor:
         tool_result = invoke_backend_tool("build_paper_qa_index", arxiv_id=arxiv_id)
         return dict((tool_result or {}).get("data") or {"tool_result": tool_result})
 
-    def _retrieve_paper_chunks(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> List[Dict[str, Any]]:
-        del runtime, step
-        context = state.context if isinstance(state.context, Mapping) else {}
-        cached_chunks = context.get("paper_chunks")
-        if isinstance(cached_chunks, list):
-            return [dict(item) for item in cached_chunks if isinstance(item, Mapping)]
-        paper_ref = resolved_input.get("paper_ref")
-        title = str((paper_ref or {}).get("title") or "").strip() if isinstance(paper_ref, Mapping) else ""
-        message = str(resolved_input.get("message") or state.message or "").strip()
-        return [{"chunk_id": "synthetic-1", "text": title or message, "score": 1.0}]
-
-    def _rewrite_paper_query(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> str:
-        del runtime, step
-        return str(resolved_input.get("message") or state.message or "").strip()
-
-    def _rerank_paper_chunks(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> List[Dict[str, Any]]:
-        del state, runtime, step
-        chunks = resolved_input.get("retrieved_chunks")
-        if not isinstance(chunks, list):
-            return []
-        normalized_chunks = [dict(item) for item in chunks if isinstance(item, Mapping)]
-        normalized_chunks.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-        return normalized_chunks
-
-    def _validate_qa_evidence(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del state, runtime, step
-        reranked_chunks = resolved_input.get("reranked_chunks")
-        count = len(reranked_chunks) if isinstance(reranked_chunks, list) else 0
-        return {"ok": count > 0, "chunk_count": count}
-
-    def _generate_paper_answer(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
+    def _answer_paper_question(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
         del step
-        paper_ref = runtime.outputs.get("paper_ref")
+        paper_ref = resolved_input.get("paper_ref") or resolved_input.get("paper_reference") or runtime.outputs.get("paper_ref")
         arxiv_id = str((paper_ref or {}).get("arxiv_id") or "").strip() if isinstance(paper_ref, Mapping) else ""
         question = str(resolved_input.get("message") or state.message or "").strip()
         if not arxiv_id:
-            return {"answer": "", "sources": [], "tool_result": None, "error": "missing_arxiv_id"}
+            return {"status": "failed", "answer": "", "sources": [], "retrieval_debug": None, "tool_result": None, "error": "missing_arxiv_id"}
+        logger.info("arxiv_agent answer_paper_question: arxiv_id=%s question=%s", arxiv_id, question)
         tool_result = invoke_backend_tool(
             "answer_paper_question",
             arxiv_id=arxiv_id,
             question=question,
-            stricter_grounding=bool(resolved_input.get("stricter_grounding") or False),
         )
         tool_data = dict((tool_result or {}).get("data") or {})
+        # 真实 PaperQAService 会在 data 中返回 answer/sources/retrieval_debug；这里只补充状态和原始工具结果，
+        # 不生成 synthetic chunk，也不覆盖 retrieval_debug，确保 trace 与实际执行链路一致。
+        tool_data.setdefault("status", "success" if bool((tool_result or {}).get("ok", False)) and str(tool_data.get("answer") or "").strip() else "failed")
+        tool_data.setdefault("sources", [])
+        tool_data.setdefault("retrieval_debug", None)
+        if not bool((tool_result or {}).get("ok", False)):
+            error_payload = (tool_result or {}).get("error") if isinstance((tool_result or {}).get("error"), Mapping) else {}
+            tool_data.setdefault("error", error_payload.get("message") or (tool_result or {}).get("summary") or "answer_paper_question failed")
+        else:
+            tool_data.setdefault("error", None)
+        tool_data.setdefault("arxiv_id", arxiv_id)
+        tool_data.setdefault("question", question)
         tool_data["tool_result"] = tool_result
         return tool_data
-
-    def _verify_answer_grounding(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> str:
-        del state, runtime, step
-        draft_answer = resolved_input.get("draft_answer")
-        if isinstance(draft_answer, Mapping):
-            answer = str(draft_answer.get("answer") or "").strip()
-            if answer:
-                return answer
-        return str(draft_answer or "").strip()
 
     def _load_user_profile(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
         del runtime, step
@@ -1211,7 +1178,32 @@ class PlanExecutor:
         arxiv_id = str((paper_reference or {}).get("arxiv_id") or "").strip() if isinstance(paper_reference, Mapping) else ""
         message = str(resolved_input.get("message") or state.message or "")
         lowered = message.lower()
-        liked = not any(token in lowered for token in ("不喜欢", "取消喜欢", "dislike", "remove like", "unlike"))
+        remove_scope = None
+        if any(token in lowered for token in ("取消喜欢", "取消不喜欢", "撤销喜欢", "撤销不喜欢", "unlike", "remove like", "remove dislike")):
+            remove_scope = "disliked" if any(token in lowered for token in ("取消不喜欢", "撤销不喜欢", "remove dislike")) else "liked"
+
+        # 只把真实偏好写入或删除委托给后端工具；兴趣画像/向量重建不在这里伪装同步。
+        if remove_scope:
+            tool_result = invoke_backend_tool(
+                "remove_paper_preference",
+                user_id=state.user_id or "",
+                arxiv_id=arxiv_id,
+                remove_scope=remove_scope,
+            )
+            tool_data = (tool_result or {}).get("data") if isinstance(tool_result, Mapping) else {}
+            return {
+                "status": "success" if bool((tool_result or {}).get("ok")) else "failed",
+                "action": "remove",
+                "label": "none",
+                "arxiv_id": arxiv_id,
+                "title": str((paper_reference or {}).get("title") or "").strip() if isinstance(paper_reference, Mapping) else "",
+                "message": str((tool_data or {}).get("message") or (tool_result or {}).get("summary") or "已取消偏好标记"),
+                "paper": dict(paper_reference) if isinstance(paper_reference, Mapping) else None,
+                "error": None if bool((tool_result or {}).get("ok")) else ((tool_result or {}).get("error") or {}).get("message") if isinstance((tool_result or {}).get("error"), Mapping) else None,
+                "tool_result": tool_result,
+            }
+
+        liked = not any(token in lowered for token in ("不喜欢", "dislike", "thumbs down"))
         tool_result = invoke_backend_tool(
             "record_paper_preference",
             user_id=state.user_id or "",
@@ -1219,21 +1211,29 @@ class PlanExecutor:
             liked=liked,
             paper=dict(paper_reference) if isinstance(paper_reference, Mapping) else None,
         )
+        tool_data = (tool_result or {}).get("data") if isinstance(tool_result, Mapping) else {}
         return {
+            "status": "success" if bool((tool_result or {}).get("ok")) else "failed",
+            "action": "like" if liked else "dislike",
+            "label": "liked" if liked else "disliked",
             "arxiv_id": arxiv_id,
             "liked": liked,
+            "title": str((paper_reference or {}).get("title") or "").strip() if isinstance(paper_reference, Mapping) else "",
+            "message": str((tool_data or {}).get("message") or (tool_result or {}).get("summary") or "偏好已更新"),
+            "paper": (tool_data or {}).get("paper") or (dict(paper_reference) if isinstance(paper_reference, Mapping) else None),
+            "error": None if bool((tool_result or {}).get("ok")) else ((tool_result or {}).get("error") or {}).get("message") if isinstance((tool_result or {}).get("error"), Mapping) else None,
             "tool_result": tool_result,
         }
-
-    def _update_interest_profile(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del state, runtime, step
-        preference_action_result = resolved_input.get("preference_action_result")
-        return {"synced": True, "preference_action_result": preference_action_result}
 
     def _verify_preference_update(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
         del state, runtime, step
         action_result = resolved_input.get("preference_action_result")
-        return {"ok": isinstance(action_result, Mapping) and bool(action_result.get("arxiv_id")), "detail": action_result}
+        return {
+            "ok": isinstance(action_result, Mapping)
+            and bool(action_result.get("arxiv_id"))
+            and str(action_result.get("status") or "success") == "success",
+            "detail": action_result,
+        }
 
     def _synthesize_preference_response(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> str:
         del state, runtime, step
@@ -1241,37 +1241,10 @@ class PlanExecutor:
         detail = verified.get("detail") if isinstance(verified.get("detail"), Mapping) else {}
         if not verified.get("ok"):
             return "偏好更新未成功，请确认目标论文后重试。"
+        action = str(detail.get("action") or "").strip()
+        if action == "remove":
+            return f"已取消论文偏好：{detail.get('arxiv_id') or '目标论文'}。"
         return f"已更新论文偏好：{detail.get('arxiv_id') or '目标论文'}。"
-
-    def _resolve_reading_list_action(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del runtime, step
-        message = str(resolved_input.get("message") or state.message or "").strip()
-        action = "add"
-        if any(token in message.lower() for token in ("移除", "删除", "remove", "delete")):
-            action = "remove"
-        paper_reference = _resolve_paper_reference_fallback(message, state.context if isinstance(state.context, Mapping) else {})
-        return {"action": action, "paper_reference": paper_reference}
-
-    def _update_reading_list_store(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del state, runtime, step
-        reading_list_action = resolved_input.get("reading_list_action") if isinstance(resolved_input.get("reading_list_action"), Mapping) else {}
-        return {"ok": True, **reading_list_action}
-
-    def _verify_reading_list_update(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del state, runtime, step
-        result = resolved_input.get("reading_list_result") if isinstance(resolved_input.get("reading_list_result"), Mapping) else {}
-        return {"ok": bool(result.get("ok")), "detail": result}
-
-    def _synthesize_reading_list_response(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> str:
-        del state, runtime, step
-        verified = resolved_input.get("verified_reading_list_update") if isinstance(resolved_input.get("verified_reading_list_update"), Mapping) else {}
-        detail = verified.get("detail") if isinstance(verified.get("detail"), Mapping) else {}
-        if not verified.get("ok"):
-            return "阅读列表更新未成功，请确认操作对象后重试。"
-        action = detail.get("action") or "update"
-        paper_reference = detail.get("paper_reference") if isinstance(detail.get("paper_reference"), Mapping) else {}
-        label = paper_reference.get("title") or paper_reference.get("arxiv_id") or "目标论文"
-        return f"已完成阅读列表操作：{action} {label}。"
 
     def _analyze_ambiguity(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
         del runtime, step

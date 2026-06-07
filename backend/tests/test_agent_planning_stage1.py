@@ -107,6 +107,20 @@ def _load_stage1_modules():
 
     langgraph_module = types.ModuleType("langgraph")
     graph_module = types.ModuleType("langgraph.graph")
+    types_module = types.ModuleType("langgraph.types")
+    checkpoint_module = types.ModuleType("langgraph.checkpoint")
+    checkpoint_memory_module = types.ModuleType("langgraph.checkpoint.memory")
+
+    class _MemorySaver:
+        def __init__(self):
+            self.snapshots = {}
+
+    class _Command:
+        def __init__(self, *, resume=None):
+            self.resume = resume
+
+    def _interrupt(payload):
+        return None
 
     class _GraphView:
         def __init__(self, nodes, edges):
@@ -172,14 +186,22 @@ def _load_stage1_modules():
         def add_conditional_edges(self, source, router, mapping):
             self.conditional_edges[source] = (router, mapping)
 
-        def compile(self):
+        def compile(self, checkpointer=None):
+            del checkpointer
             return _CompiledGraph(self.nodes, self.edges, self.conditional_edges)
 
     graph_module.END = "END"
     graph_module.START = "START"
     graph_module.StateGraph = _StateGraph
+    types_module.Command = _Command
+    types_module.interrupt = _interrupt
+    checkpoint_memory_module.MemorySaver = _MemorySaver
+    checkpoint_memory_module.InMemorySaver = _MemorySaver
     sys.modules["langgraph"] = langgraph_module
     sys.modules["langgraph.graph"] = graph_module
+    sys.modules["langgraph.types"] = types_module
+    sys.modules["langgraph.checkpoint"] = checkpoint_module
+    sys.modules["langgraph.checkpoint.memory"] = checkpoint_memory_module
 
     def load(module_name: str, file_path: Path):
         if module_name in sys.modules:
@@ -204,7 +226,6 @@ def _load_stage1_modules():
     load("backend.agents.arxiv_search_agent.node.plan_node", node_dir / "plan_node.py")
     search_node_module = load("backend.agents.arxiv_search_agent.node.search_node", node_dir / "search_node.py")
     load("backend.agents.arxiv_search_agent.node.preference_node", node_dir / "preference_node.py")
-    load("backend.agents.arxiv_search_agent.node.pending_action_node", node_dir / "pending_action_node.py")
     load("backend.agents.arxiv_search_agent.node.paper_reading_node", node_dir / "paper_reading_node.py")
     load("backend.agents.arxiv_search_agent.node.response_node", node_dir / "response_node.py")
 
@@ -214,16 +235,10 @@ def _load_stage1_modules():
     node_package.apply_preference_action = sys.modules["backend.agents.arxiv_search_agent.node.preference_node"].apply_preference_action
     node_package.build_search_tool_args = sys.modules["backend.agents.arxiv_search_agent.node.search_node"].build_search_tool_args
     node_package.check_search_result = sys.modules["backend.agents.arxiv_search_agent.node.search_node"].check_search_result
-    node_package.classify_pending_action_confirmation = sys.modules[
-        "backend.agents.arxiv_search_agent.node.pending_action_node"
-    ].classify_pending_action_confirmation
     node_package.execute_tool = sys.modules["backend.agents.arxiv_search_agent.node.tool_node"].execute_tool
     node_package.handle_paper_reading_request = sys.modules[
         "backend.agents.arxiv_search_agent.node.paper_reading_node"
     ].handle_paper_reading_request
-    node_package.handle_pending_action_confirmation = sys.modules[
-        "backend.agents.arxiv_search_agent.node.pending_action_node"
-    ].handle_pending_action_confirmation
     node_package.invoke_search_tool = sys.modules["backend.agents.arxiv_search_agent.node.search_node"].invoke_search_tool
     node_package.parse_search_request = sys.modules["backend.agents.arxiv_search_agent.node.parse_node"].parse_search_request
     node_package.plan_task = sys.modules["backend.agents.arxiv_search_agent.node.plan_node"].plan_task
@@ -270,8 +285,8 @@ class Stage1PlanningTests(unittest.TestCase):
 
         self.assertIsNotNone(result.goal)
         self.assertEqual(result.goal.goal_type, "arxiv_search")
-        self.assertTrue(any(step.step_type == "search_execution" for step in result.execution_plan))
-        self.assertTrue(any(step.step_type == "personalization" for step in result.execution_plan))
+        self.assertTrue(any(step.tool_name == "search_arxiv" for step in result.execution_plan))
+        self.assertTrue(any(step.tool_name == "personalize_paper_results" for step in result.execution_plan))
         self.assertEqual(result.steps[-1].step, "plan_task")
         self.assertEqual(result.steps[-1].status, "success")
 
@@ -280,15 +295,19 @@ class Stage1PlanningTests(unittest.TestCase):
             intent="paper_qa",
             message="这篇论文的核心方法是什么？",
             context={"selected_paper": {"title": "Attention Is All You Need"}},
-            pending_action={"type": "parse_then_qa", "status": "waiting_confirmation"},
+            pending_action={"type": "tool_approval", "status": "waiting_confirmation"},
         )
 
         result = plan_task(state)
 
         self.assertEqual(result.goal.goal_type, "paper_qa")
-        self.assertTrue(result.goal.requires_user_confirmation)
-        self.assertTrue(any(step.step_type == "qa_index_check" for step in result.execution_plan))
-        self.assertTrue(any(step.step_type == "paper_response" for step in result.execution_plan))
+        self.assertIn("pending_action", result.goal.context_refs)
+        self.assertTrue(any(step.tool_name == "check_paper_index" for step in result.execution_plan))
+        tool_names = [step.tool_name for step in result.execution_plan]
+        self.assertIn("answer_paper_question", tool_names)
+        self.assertNotIn("retrieve_paper_chunks", tool_names)
+        self.assertNotIn("rerank_paper_chunks", tool_names)
+        self.assertNotIn("validate_qa_evidence", tool_names)
 
     def test_preference_action_generates_preference_plan(self) -> None:
         state = AgentState(
@@ -300,9 +319,10 @@ class Stage1PlanningTests(unittest.TestCase):
         result = plan_task(state)
 
         self.assertEqual(result.goal.goal_type, "preference_action")
-        self.assertTrue(result.goal.requires_memory)
-        self.assertTrue(any(step.step_type == "paper_resolution" for step in result.execution_plan))
-        self.assertTrue(any(step.step_type == "preference_update" for step in result.execution_plan))
+        self.assertEqual(result.goal.risk_level, "high")
+        self.assertTrue(any(step.tool_name == "resolve_preference_target" for step in result.execution_plan))
+        self.assertTrue(any(step.tool_name == "update_preference_store" for step in result.execution_plan))
+        self.assertFalse(any("interest" in step.tool_name or "profile" in step.tool_name for step in result.execution_plan))
 
     def test_recommendation_generates_profile_aware_plan(self) -> None:
         state = AgentState(
@@ -314,9 +334,9 @@ class Stage1PlanningTests(unittest.TestCase):
         result = plan_task(state)
 
         self.assertEqual(result.goal.goal_type, "recommendation")
-        self.assertTrue(result.goal.requires_memory)
-        self.assertTrue(any(step.step_type == "profile_loading" for step in result.execution_plan))
-        self.assertTrue(any(step.step_type == "recommendation_generation" for step in result.execution_plan))
+        self.assertIn("user_memory_summary", result.goal.context_refs)
+        self.assertTrue(any(step.tool_name == "load_user_profile" for step in result.execution_plan))
+        self.assertTrue(any(step.tool_name == "generate_recommendations" for step in result.execution_plan))
 
     def test_unclear_and_unsupported_generate_safe_non_tool_plans(self) -> None:
         unclear_result = plan_task(AgentState(intent="unclear", message="帮我找那个东西"))
@@ -324,30 +344,21 @@ class Stage1PlanningTests(unittest.TestCase):
 
         self.assertEqual(unclear_result.goal.goal_type, "unclear")
         self.assertEqual(unsupported_result.goal.goal_type, "unsupported")
-        self.assertFalse(any(step.step_type == "search_execution" for step in unclear_result.execution_plan))
-        self.assertFalse(any(step.step_type == "search_execution" for step in unsupported_result.execution_plan))
-        self.assertFalse(any(step.step_type == "recommendation_generation" for step in unsupported_result.execution_plan))
+        self.assertFalse(any(step.tool_name == "search_arxiv" for step in unclear_result.execution_plan))
+        self.assertFalse(any(step.tool_name == "search_arxiv" for step in unsupported_result.execution_plan))
+        self.assertFalse(any(step.tool_name == "generate_recommendations" for step in unsupported_result.execution_plan))
 
-    def test_pending_confirmation_route_is_preserved_after_plan_task(self) -> None:
-        graph = build_arxiv_search_graph(generation_service=None)
-        result = graph.invoke(
-            AgentState(
-                message="确认，继续处理",
-                context={"pending_action": {"type": "parse_then_qa", "status": "waiting_confirmation"}},
-                pending_action={"type": "parse_then_qa", "status": "waiting_confirmation"},
-            ).model_dump()
-        )
-
-        steps = [item.step for item in result["steps"]]
-        self.assertIn("intent_recognition", steps)
-        self.assertIn("plan_task", steps)
-        self.assertIn("classify_pending_action_confirmation", steps)
-
-    def test_graph_mermaid_contains_plan_task(self) -> None:
+    def test_graph_uses_current_step6_main_nodes(self) -> None:
         payload = export_arxiv_search_graph_mermaid(generation_service=None)
 
-        self.assertIn("plan_task", payload["node_names"])
-        self.assertIn("plan_task", payload["mermaid"])
+        self.assertEqual(payload["node_names"], ["parse_search_request", "run_agent_turn"])
+        self.assertIn("parse_search_request --> run_agent_turn", payload["mermaid"])
+
+    def test_graph_mermaid_contains_run_agent_turn(self) -> None:
+        payload = export_arxiv_search_graph_mermaid(generation_service=None)
+
+        self.assertIn("run_agent_turn", payload["node_names"])
+        self.assertIn("run_agent_turn", payload["mermaid"])
 
     def test_response_and_compact_state_include_goal_and_execution_plan(self) -> None:
         state = AgentState(
@@ -377,7 +388,7 @@ class Stage1PlanningTests(unittest.TestCase):
         response = _state_to_response(AgentState(intent="unsupported", answer="not supported"))
 
         self.assertIsNone(response.goal)
-        self.assertEqual(response.execution_plan, [])
+        self.assertIsNone(response.execution_plan)
 
 
 if __name__ == "__main__":

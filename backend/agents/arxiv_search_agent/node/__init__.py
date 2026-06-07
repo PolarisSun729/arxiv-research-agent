@@ -26,7 +26,7 @@ from .intent_support import (
     _looks_like_paper_qa_request,
     _looks_like_paper_summary_request,
     _looks_like_preference_action_request,
-    _looks_like_reading_list_action_request,
+    _looks_like_saved_paper_container_request,
     _looks_like_recommendation_request,
     _looks_search_like,
     _matches_any,
@@ -34,16 +34,11 @@ from .intent_support import (
     _validation_error_summary,
 )
 from ..utils.state_utils import _coerce_state
-# 论文阅读类节点：负责把“总结 / 解释 / QA”请求接入论文全文问答链路，
-# 并根据是否已有索引决定直接回答还是进入待确认解析流程。
+# 论文阅读类节点只保留兼容调用能力；主流程中的缺索引确认由 PlanExecutor + LangGraph interrupt 统一处理。
 from .paper_reading_node import handle_paper_reading_request
 # parse 节点：负责把自然语言请求收敛成结构化 intent 与 search_spec。
 from .parse_node import parse_search_request
 from .plan_node import plan_task
-from .pending_action_node import (
-    classify_pending_action_confirmation,
-    handle_pending_action_confirmation,
-)
 from .plan_step_mapping import build_tool_call_request_from_plan_step
 from .recommendation_node import (
     adapt_recommendation_tool_result,
@@ -84,7 +79,7 @@ __all__ = [
     "_looks_like_paper_qa_request",
     "_looks_like_paper_summary_request",
     "_looks_like_preference_action_request",
-    "_looks_like_reading_list_action_request",
+    "_looks_like_saved_paper_container_request",
     "_looks_like_recommendation_request",
     "_looks_search_like",
     "_matches_any",
@@ -96,10 +91,8 @@ __all__ = [
     "build_tool_call_request_from_plan_step",
     "build_search_tool_args",
     "check_search_result",
-    "classify_pending_action_confirmation",
     "execute_tool",
     "handle_paper_reading_request",
-    "handle_pending_action_confirmation",
     "invoke_search_tool",
     "invoke_recommendation_tool",
     "parse_search_request",

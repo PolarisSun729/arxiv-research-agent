@@ -16,6 +16,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 from langgraph.types import Command
 
+from core.errors import ErrorCode, make_error_payload
 from services.memory import MemoryService
 from services.storage.database_service import DatabaseService
 from utils.config import get_memory_runtime_config
@@ -30,6 +31,8 @@ from .schemas import AgentStep, AgentStreamEvent, ArxivSearchRequest, ArxivSearc
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
+RESUME_CHECKPOINT_NOT_FOUND_CODE = ErrorCode.RESUME_CHECKPOINT_NOT_FOUND
+RESUME_CHECKPOINT_NOT_FOUND_MESSAGE = "原执行现场已失效，请重新发起论文解析或问答请求。"
 
 # 这个文件是 arXiv Agent 的“运行入口层”。
 #
@@ -44,6 +47,17 @@ logger = logging.getLogger(__name__)
 # 3. 构造初始 AgentState 并执行 LangGraph；
 # 4. 把最终状态转换成同步响应或流式 SSE 事件。
 MEMORY_RUNTIME_CONFIG = get_memory_runtime_config()
+
+
+class ResumeCheckpointNotFoundError(RuntimeError):
+    """表示用户发起 resume 时，后端已没有可恢复的 LangGraph 执行现场。"""
+
+    code = RESUME_CHECKPOINT_NOT_FOUND_CODE
+
+    def __init__(self, *, thread_id: str, reason: str = "checkpoint_missing") -> None:
+        self.thread_id = thread_id
+        self.reason = reason
+        super().__init__(f"未找到可恢复的执行现场，thread_id={thread_id}，reason={reason}")
 
 
 def _ensure_session_id(session_id: Optional[str]) -> str:
@@ -97,8 +111,29 @@ def _ensure_resume_checkpoint(graph: Any, thread_id: str) -> None:
         return
 
     graph_state = get_state(config=_build_langgraph_config(thread_id))
+    if not _has_resume_checkpoint(graph_state):
+        # checkpoint 缺失是可预期的恢复失败，不应进入通用 Agent runtime error 分支。
+        raise ResumeCheckpointNotFoundError(thread_id=thread_id)
+
+
+def _has_resume_checkpoint(graph_state: Any) -> bool:
+    """判断 LangGraph 返回的线程状态是否代表存在可恢复现场。
+
+    真实 LangGraph 在未命中 checkpoint 时可能返回 None，也可能返回空的 StateSnapshot；
+    这里统一收敛判断，避免把空快照误当作可 resume 的执行线程。
+    """
     if graph_state is None:
-        raise ValueError(f"未找到可恢复的执行现场，请确认 session_id={thread_id} 是否正确。")
+        return False
+    if isinstance(graph_state, Mapping):
+        return bool(graph_state)
+
+    values = getattr(graph_state, "values", None)
+    next_steps = getattr(graph_state, "next", None)
+    if values is not None or next_steps is not None:
+        return bool(values) or bool(next_steps)
+
+    # 未知状态对象保持向后兼容：只要不是明确的空快照，就交给 LangGraph 自身恢复逻辑处理。
+    return True
 
 
 def _inject_user_memory_context(request_context: Dict[str, Any], user_id: Optional[str]) -> tuple[Dict[str, Any], Dict[str, Any]]:
@@ -265,14 +300,25 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
         return _build_error_response(
             message="请求参数校验失败",
             detail=str(exc),
-            code="request_validation_error",
+            code=ErrorCode.REQUEST_VALIDATION_ERROR,
+        )
+    except ResumeCheckpointNotFoundError as exc:
+        _log_resume_checkpoint_not_found(
+            session_id=resolved_session_id if "resolved_session_id" in locals() else None,
+            thread_id=exc.thread_id,
+            is_resume=_is_resume_request(normalized_request) if "normalized_request" in locals() else True,
+            reason=exc.reason,
+        )
+        return _build_resume_checkpoint_not_found_response(
+            session_id=resolved_session_id if "resolved_session_id" in locals() else None,
+            detail=str(exc),
         )
     except Exception as exc:
         logger.exception("arxiv_agent runtime failed: session_id=%s message=%s", resolved_session_id if 'resolved_session_id' in locals() else None, normalized_request.message)
         return _build_error_response(
             message="arXiv 搜索 Agent 运行失败",
             detail=str(exc),
-            code="agent_runtime_error",
+            code=ErrorCode.AGENT_RUNTIME_ERROR,
         )
 
 
@@ -469,13 +515,68 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     },
                 )
             )
+        except ResumeCheckpointNotFoundError as exc:
+            # resume checkpoint 缺失要作为明确业务失败返回，避免前端继续保留失效确认卡片。
+            _log_resume_checkpoint_not_found(
+                session_id=resolved_session_id if "resolved_session_id" in locals() else None,
+                thread_id=exc.thread_id,
+                is_resume=_is_resume_request(normalized_request),
+                reason=exc.reason,
+            )
+            error_response = _build_resume_checkpoint_not_found_response(
+                session_id=resolved_session_id if "resolved_session_id" in locals() else None,
+                detail=str(exc),
+            )
+            yield _sse_event(
+                _make_stream_event(
+                    event_type="exception",
+                    sequence=_next_sequence(sequence),
+                    run_id=run_id,
+                    data={
+                        "message": RESUME_CHECKPOINT_NOT_FOUND_MESSAGE,
+                        "detail": str(exc),
+                        "code": RESUME_CHECKPOINT_NOT_FOUND_CODE,
+                        "error": make_error_payload(
+                            code=RESUME_CHECKPOINT_NOT_FOUND_CODE,
+                            message=RESUME_CHECKPOINT_NOT_FOUND_MESSAGE,
+                            detail=str(exc),
+                            recoverable=False,
+                        ),
+                        "response": error_response.model_dump(),
+                    },
+                )
+            )
+            sequence += 1
+            yield _sse_event(
+                _make_stream_event(
+                    event_type="final_response",
+                    sequence=_next_sequence(sequence),
+                    run_id=run_id,
+                    data={
+                        "response": error_response.model_dump(),
+                    },
+                )
+            )
+            sequence += 1
+            yield _sse_event(
+                _make_stream_event(
+                    event_type="stream_end",
+                    sequence=_next_sequence(sequence),
+                    run_id=run_id,
+                    data={
+                        "status": "error",
+                        "code": RESUME_CHECKPOINT_NOT_FOUND_CODE,
+                        "final_sequence": sequence,
+                    },
+                )
+            )
         except Exception as exc:
             # 阶段 F：流式过程中任何异常都转成结构化事件，而不是让连接直接中断。
             error_response = _build_error_response_from_state(
                 current_state,
                 message="arXiv 搜索 Agent 运行失败",
                 detail=str(exc),
-                code="agent_runtime_error",
+                code=ErrorCode.AGENT_RUNTIME_ERROR,
             )
             yield _sse_event(
                 _make_stream_event(
@@ -485,6 +586,13 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     data={
                         "message": "Agent 流式执行异常",
                         "detail": str(exc),
+                        "code": ErrorCode.AGENT_RUNTIME_ERROR,
+                        "error": make_error_payload(
+                            code=ErrorCode.AGENT_RUNTIME_ERROR,
+                            message="Agent 流式执行异常",
+                            detail=str(exc),
+                            recoverable=True,
+                        ),
                         "response": error_response.model_dump(),
                     },
                 )
@@ -588,7 +696,11 @@ def _extract_interrupt_payload(step_payload: Any) -> Optional[Dict[str, Any]]:
 
 
 def _build_pending_action_from_confirmation(confirmation_payload: Mapping[str, Any]) -> Dict[str, Any]:
-    """把确认请求载荷映射成前端沿用的 pending_action 结构。"""
+    """把确认请求载荷映射成前端沿用的 pending_action 展示结构。
+
+    这个结构只负责让前端继续显示确认卡片；实际恢复现场仍由 LangGraph checkpointer
+    和后续 Command(resume=...) 承担，避免把业务摘要误用成执行栈。
+    """
     target_paper = dict(confirmation_payload.get("target_paper") or {}) if isinstance(confirmation_payload.get("target_paper"), Mapping) else {}
     arguments_summary = dict(confirmation_payload.get("arguments_summary") or {}) if isinstance(confirmation_payload.get("arguments_summary"), Mapping) else {}
     return {
@@ -691,6 +803,56 @@ def _build_error_response(*, message: str, detail: str, code: str) -> ArxivSearc
     return _build_error_response_from_state(None, message=message, detail=detail, code=code)
 
 
+def _build_resume_checkpoint_not_found_response(*, session_id: Optional[str], detail: str) -> ArxivSearchResponse:
+    """构造 resume 现场失效的专用响应。
+
+    该场景不是 Agent 执行崩溃，而是内存 checkpoint 已无法命中；响应里必须主动清空确认态，
+    让前端停止展示旧按钮，并提示用户重新发起论文解析或问答。
+    """
+    base_state = AgentState(
+        session_id=session_id,
+        intent="unsupported",
+        answer=RESUME_CHECKPOINT_NOT_FOUND_MESSAGE,
+        pending_action=None,
+        paper_qa_result={
+            "status": "failed",
+            "error_code": RESUME_CHECKPOINT_NOT_FOUND_CODE,
+            "message": RESUME_CHECKPOINT_NOT_FOUND_MESSAGE,
+        },
+        warnings=[RESUME_CHECKPOINT_NOT_FOUND_MESSAGE],
+        next_actions=["请重新发起论文解析或问答请求"],
+    )
+    base_state.errors = [
+        {
+            "step": "resume_checkpoint",
+            "code": RESUME_CHECKPOINT_NOT_FOUND_CODE,
+            "message": RESUME_CHECKPOINT_NOT_FOUND_MESSAGE,
+            "detail": detail,
+            "recoverable": False,
+        }
+    ]
+    base_state.debug = {
+        "runtime_error": {
+            "code": RESUME_CHECKPOINT_NOT_FOUND_CODE,
+            "message": RESUME_CHECKPOINT_NOT_FOUND_MESSAGE,
+            "detail": detail,
+            "recoverable": False,
+        },
+        "confirmation_state": "failed",
+    }
+    base_state.steps = [
+        AgentStep(
+            step="resume_checkpoint",
+            status="failed",
+            action="恢复执行现场失败，已清空待确认状态",
+            inputs={"session_id": session_id, "code": RESUME_CHECKPOINT_NOT_FOUND_CODE},
+            outputs={"pending_action": None, "paper_qa_status": "failed"},
+            error=RESUME_CHECKPOINT_NOT_FOUND_CODE,
+        )
+    ]
+    return _state_to_response(base_state)
+
+
 def _build_error_response_from_state(
     state: Optional[AgentState],
     *,
@@ -743,6 +905,24 @@ def _build_error_response_from_state(
         )
     ]
     return _state_to_response(base_state)
+
+
+def _log_resume_checkpoint_not_found(
+    *,
+    session_id: Optional[str],
+    thread_id: Optional[str],
+    is_resume: bool,
+    reason: str,
+) -> None:
+    """记录 resume 失败的关键定位字段，便于区分重启、多 worker 或 checkpoint 清理导致的问题。"""
+    logger.warning(
+        "arxiv_agent resume failed: session_id=%s thread_id=%s is_resume=%s reason=%s code=%s",
+        session_id,
+        thread_id,
+        is_resume,
+        reason,
+        RESUME_CHECKPOINT_NOT_FOUND_CODE,
+    )
 
 
 def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:

@@ -21,17 +21,6 @@ def _extract_papers(value: Any) -> List[Dict[str, Any]]:
     return []
 
 
-def _extract_chunks(value: Any) -> List[Dict[str, Any]]:
-    if isinstance(value, list):
-        return [dict(item) for item in value if isinstance(item, Mapping)]
-    if isinstance(value, Mapping):
-        for key in ("chunks", "paper_chunks", "reranked_chunks", "retrieved_chunks"):
-            chunks = value.get(key)
-            if isinstance(chunks, list):
-                return [dict(item) for item in chunks if isinstance(item, Mapping)]
-    return []
-
-
 class Observer:
     """区分“工具执行成功”和“结果质量达标”，为后续重规划提供统一语义。"""
 
@@ -105,53 +94,16 @@ class Observer:
         # 真正的暂停点统一放在有副作用 step 的工具调用前，避免提前在“准备步骤”上打断并劫持恢复顺序。
         return ObservationResult(status="success", reason="confirmation_already_available", confidence=1.0)
 
-    def _observe_retrieve_paper_chunks(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
-        del raw_output, runtime
-        chunks = _extract_chunks(normalized_output)
-        if not chunks:
-            return ObservationResult(status="empty_result", reason="paper_chunk_recall_empty", confidence=0.1, suggested_action="rewrite_paper_query")
-        if len(chunks) < 2:
-            return ObservationResult(status="partial_success", reason="paper_chunk_recall_too_small", confidence=0.45, details={"chunk_count": len(chunks)})
-        query_tokens = _tokenize(resolved_input.get("message") or state.message)
-        if query_tokens:
-            matched = 0
-            for chunk in chunks[:3]:
-                text = str(chunk.get("text") or chunk.get("content") or "")
-                if any(token in text.lower() for token in query_tokens):
-                    matched += 1
-            if matched == 0:
-                return ObservationResult(status="low_confidence", reason="paper_chunk_recall_not_relevant", confidence=0.25, details={"chunk_count": len(chunks)}, suggested_action="rewrite_paper_query")
-        return ObservationResult(status="success", reason="paper_chunk_recall_ok", confidence=0.8, details={"chunk_count": len(chunks)})
-
-    def _observe_rerank_paper_chunks(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
-        del resolved_input, raw_output, runtime, state
-        chunks = _extract_chunks(normalized_output)
-        if not chunks:
-            return ObservationResult(status="empty_result", reason="reranked_chunks_empty", confidence=0.1, suggested_action="rewrite_paper_query")
-        top_score = float((chunks[0].get("score") or chunks[0].get("rerank_score") or 0.0)) if chunks else 0.0
-        if top_score < 0.15:
-            return ObservationResult(status="low_confidence", reason="reranked_chunk_score_too_low", confidence=0.2, details={"top_score": top_score}, suggested_action="rewrite_paper_query")
-        return ObservationResult(status="success", reason="reranked_chunks_usable", confidence=0.8, details={"top_score": top_score})
-
-    def _observe_validate_qa_evidence(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
+    def _observe_answer_paper_question(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
         del resolved_input, raw_output, runtime, state
         payload = normalized_output if isinstance(normalized_output, Mapping) else {}
-        if not bool(payload.get("ok")):
-            return ObservationResult(status="low_confidence", reason="qa_evidence_insufficient", confidence=0.2, details=dict(payload), suggested_action="rewrite_paper_query")
-        if int(payload.get("chunk_count") or 0) < 1:
-            return ObservationResult(status="low_confidence", reason="qa_evidence_missing_chunks", confidence=0.2, details=dict(payload), suggested_action="rewrite_paper_query")
-        return ObservationResult(status="success", reason="qa_evidence_ok", confidence=0.85, details=dict(payload))
-
-    def _observe_verify_answer_grounding(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
-        del runtime, state
-        answer = str(normalized_output or raw_output or "").strip()
-        draft_answer = resolved_input.get("draft_answer") if isinstance(resolved_input.get("draft_answer"), Mapping) else {}
-        sources = draft_answer.get("sources") if isinstance(draft_answer, Mapping) else None
+        answer = str(payload.get("answer") or "").strip()
+        sources = payload.get("sources")
         if not answer:
-            return ObservationResult(status="low_confidence", reason="grounded_answer_empty", confidence=0.1, suggested_action="regenerate_with_stricter_grounding")
+            return ObservationResult(status="low_confidence", reason="paper_qa_answer_empty", confidence=0.2, details={"status": payload.get("status"), "error": payload.get("error")}, suggested_action="answer_with_available_context")
         if not sources:
-            return ObservationResult(status="low_confidence", reason="grounded_answer_without_sources", confidence=0.3, details={"answer_preview": answer[:120]}, suggested_action="regenerate_with_stricter_grounding")
-        return ObservationResult(status="success", reason="grounded_answer_ok", confidence=0.8)
+            return ObservationResult(status="partial_success", reason="paper_qa_answer_without_sources", confidence=0.55, details={"answer_preview": answer[:120]})
+        return ObservationResult(status="success", reason="paper_qa_answer_available", confidence=0.85, details={"source_count": len(sources) if isinstance(sources, list) else 0})
 
     def _observe_load_user_profile(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
         del resolved_input, raw_output, runtime, state
@@ -184,13 +136,6 @@ class Observer:
         if tool_result and not bool(tool_result.get("ok", False)):
             return ObservationResult(status="tool_error", reason="preference_store_write_failed", confidence=0.1, details={"tool_error": tool_result.get("error")}, suggested_action="fallback")
         return ObservationResult(status="success", reason="preference_store_updated", confidence=0.9)
-
-    def _observe_update_reading_list_store(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
-        del resolved_input, raw_output, runtime, state
-        payload = normalized_output if isinstance(normalized_output, Mapping) else {}
-        if not bool(payload.get("ok")):
-            return ObservationResult(status="need_clarification", reason="reading_list_action_invalid", confidence=0.2, suggested_action="clarify_target")
-        return ObservationResult(status="success", reason="reading_list_updated", confidence=0.9)
 
 
 __all__ = ["Observer"]

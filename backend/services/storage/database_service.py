@@ -128,6 +128,15 @@ class DatabaseService:
                     chunk_count INTEGER DEFAULT 0,
                     embedding_model TEXT,
                     pdf_path TEXT,
+                    chunk_file TEXT,
+                    embedding_file TEXT,
+                    loading_method TEXT,
+                    chunking_strategy TEXT,
+                    current_stage TEXT,
+                    failed_stage TEXT,
+                    error_message TEXT,
+                    artifact_status TEXT DEFAULT 'active',
+                    indexed_at TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -294,6 +303,7 @@ class DatabaseService:
             conn.commit()
             logger.info("Database tables initialized successfully")
             self._ensure_user_interest_vector_columns(conn)
+            self._ensure_paper_qa_index_columns(conn)
 
     def _ensure_user_interest_vector_columns(self, conn):
         required_columns = {
@@ -310,6 +320,29 @@ class DatabaseService:
             if column_name not in existing_columns:
                 cursor.execute(
                     f"ALTER TABLE user_interest_vectors ADD COLUMN {column_name} {column_definition}"
+                )
+        conn.commit()
+
+    def _ensure_paper_qa_index_columns(self, conn):
+        # 旧环境可能已经创建过 paper_qa_index；这里补齐 artifact 字段，确保失败后仍可追踪残留文件和 collection。
+        required_columns = {
+            "chunk_file": "TEXT",
+            "embedding_file": "TEXT",
+            "loading_method": "TEXT",
+            "chunking_strategy": "TEXT",
+            "current_stage": "TEXT",
+            "failed_stage": "TEXT",
+            "error_message": "TEXT",
+            "artifact_status": "TEXT DEFAULT 'active'",
+            "indexed_at": "TIMESTAMP",
+        }
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(paper_qa_index)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        for column_name, column_definition in required_columns.items():
+            if column_name not in existing_columns:
+                cursor.execute(
+                    f"ALTER TABLE paper_qa_index ADD COLUMN {column_name} {column_definition}"
                 )
         conn.commit()
 
@@ -1229,7 +1262,9 @@ class DatabaseService:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    SELECT arxiv_id, collection_name, status, chunk_count, embedding_model, pdf_path, created_at, updated_at
+                    SELECT arxiv_id, collection_name, status, chunk_count, embedding_model, pdf_path,
+                           chunk_file, embedding_file, loading_method, chunking_strategy, current_stage,
+                           failed_stage, error_message, artifact_status, indexed_at, created_at, updated_at
                     FROM paper_qa_index WHERE arxiv_id = ?
                 ''', (arxiv_id,))
                 
@@ -1242,8 +1277,17 @@ class DatabaseService:
                         'chunk_count': row[3],
                         'embedding_model': row[4],
                         'pdf_path': row[5],
-                        'created_at': row[6],
-                        'updated_at': row[7]
+                        'chunk_file': row[6],
+                        'embedding_file': row[7],
+                        'loading_method': row[8],
+                        'chunking_strategy': row[9],
+                        'current_stage': row[10],
+                        'failed_stage': row[11],
+                        'error_message': row[12],
+                        'artifact_status': row[13],
+                        'indexed_at': row[14],
+                        'created_at': row[15],
+                        'updated_at': row[16],
                     }
                 return None
         except Exception as e:
@@ -1404,32 +1448,39 @@ class DatabaseService:
                 
                 update_fields = []
                 update_values = []
-                
-                if 'collection_name' in kwargs:
-                    update_fields.append('collection_name = ?')
-                    update_values.append(kwargs['collection_name'])
-                if 'status' in kwargs:
-                    update_fields.append('status = ?')
-                    update_values.append(kwargs['status'])
-                if 'chunk_count' in kwargs:
-                    update_fields.append('chunk_count = ?')
-                    update_values.append(kwargs['chunk_count'])
-                if 'embedding_model' in kwargs:
-                    update_fields.append('embedding_model = ?')
-                    update_values.append(kwargs['embedding_model'])
-                if 'pdf_path' in kwargs:
-                    update_fields.append('pdf_path = ?')
-                    update_values.append(kwargs['pdf_path'])
-                
+
+                allowed_fields = [
+                    'collection_name',
+                    'status',
+                    'chunk_count',
+                    'embedding_model',
+                    'pdf_path',
+                    'chunk_file',
+                    'embedding_file',
+                    'loading_method',
+                    'chunking_strategy',
+                    'current_stage',
+                    'failed_stage',
+                    'error_message',
+                    'artifact_status',
+                    'indexed_at',
+                ]
+                for field_name in allowed_fields:
+                    if field_name in kwargs:
+                        update_fields.append(f'{field_name} = ?')
+                        update_values.append(kwargs[field_name])
+
+                if not update_fields:
+                    return False
+
                 update_fields.append('updated_at = CURRENT_TIMESTAMP')
                 update_values.append(arxiv_id)
-                
-                if update_fields:
-                    cursor.execute(f'''
-                        UPDATE paper_qa_index 
-                        SET {", ".join(update_fields)}
-                        WHERE arxiv_id = ?
-                    ''', update_values)
+
+                cursor.execute(f'''
+                    UPDATE paper_qa_index
+                    SET {", ".join(update_fields)}
+                    WHERE arxiv_id = ?
+                ''', update_values)
                 
                 conn.commit()
                 logger.info(f"Paper QA index updated for: {arxiv_id}")
@@ -1446,7 +1497,23 @@ class DatabaseService:
                 values = [arxiv_id]
                 update_fields = []
 
-                for field_name in ['collection_name', 'status', 'chunk_count', 'embedding_model', 'pdf_path']:
+                allowed_fields = [
+                    'collection_name',
+                    'status',
+                    'chunk_count',
+                    'embedding_model',
+                    'pdf_path',
+                    'chunk_file',
+                    'embedding_file',
+                    'loading_method',
+                    'chunking_strategy',
+                    'current_stage',
+                    'failed_stage',
+                    'error_message',
+                    'artifact_status',
+                    'indexed_at',
+                ]
+                for field_name in allowed_fields:
                     if field_name in kwargs:
                         fields.append(field_name)
                         values.append(kwargs[field_name])

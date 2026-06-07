@@ -15,7 +15,6 @@ ToolCallRequest = _MODULES["schemas"].ToolCallRequest
 build_arxiv_search_graph = _MODULES["graph_module"].build_arxiv_search_graph
 graph_module = _MODULES["graph_module"]
 paper_reading_module = sys.modules["backend.agents.arxiv_search_agent.node.paper_reading_node"]
-pending_action_module = sys.modules["backend.agents.arxiv_search_agent.node.pending_action_node"]
 preference_module = sys.modules["backend.agents.arxiv_search_agent.node.preference_node"]
 response_module = sys.modules["backend.agents.arxiv_search_agent.node.response_node"]
 plan_step_mapping_module = sys.modules["backend.agents.arxiv_search_agent.node.plan_step_mapping"]
@@ -89,7 +88,7 @@ class AgentToolProtocolStage3Tests(unittest.TestCase):
         self.assertEqual(result.tool_observations[-1].tool_name, "search_arxiv_structured")
         self.assertTrue(result.tool_observations[-1].ok)
         plan_status = {step.step_id: step.status for step in result.execution_plan}
-        self.assertEqual(plan_status["step_2"], "completed")
+        self.assertEqual(plan_status["step_2"], "success")
 
     def test_search_tool_request_is_built_via_plan_step_mapping(self) -> None:
         state = AgentState(
@@ -150,7 +149,7 @@ class AgentToolProtocolStage3Tests(unittest.TestCase):
         self.assertIsNone(request)
         self.assertEqual(debug_payload["status"], "skipped")
         self.assertEqual(debug_payload["reason"], "unsupported_plan_step_mapping")
-        self.assertEqual(debug_payload["step_type"], "result_validation")
+        self.assertEqual(debug_payload["action_type"], "result_validation")
 
     def test_invoke_search_tool_skips_unmappable_step_and_routes_to_response(self) -> None:
         state = AgentState(
@@ -167,7 +166,6 @@ class AgentToolProtocolStage3Tests(unittest.TestCase):
         self.assertEqual(result.tool_observations[-1].status, "skipped")
         self.assertEqual(result.execution_plan[1].status, "skipped")
         self.assertIn("工具执行已跳过", result.warnings[-1])
-        self.assertEqual(graph_module.route_after_search_tool_call(result), "synthesize_response")
 
     def test_search_tool_execution_updates_execution_plan_status(self) -> None:
         state = AgentState(
@@ -199,7 +197,7 @@ class AgentToolProtocolStage3Tests(unittest.TestCase):
             result = tool_module.execute_tool(state)
 
         plan_status = {step.step_id: step.status for step in result.execution_plan}
-        self.assertEqual(plan_status["step_2"], "completed")
+        self.assertEqual(plan_status["step_2"], "success")
         self.assertEqual(result.tool_observations[-1].tool_name, "search_arxiv_structured")
         self.assertTrue(result.tool_observations[-1].ok)
 
@@ -227,7 +225,7 @@ class AgentToolProtocolStage3Tests(unittest.TestCase):
         checked = search_module.check_search_result(state)
         plan_status = {step.step_type: step.status for step in checked.execution_plan}
         self.assertEqual(plan_status["result_validation"], "failed")
-        self.assertEqual(graph_module.route_after_check(checked), "relax_search_for_retry")
+        self.assertEqual(checked.steps[-1].step, "search_result_check")
 
     def test_failed_tool_execution_links_plan_step_to_observation(self) -> None:
         state = AgentState(
@@ -309,7 +307,7 @@ class AgentToolProtocolStage3Tests(unittest.TestCase):
         result = response_module.synthesize_response(state)
 
         plan_status = {step.step_type: step.status for step in result.execution_plan}
-        self.assertEqual(plan_status["response_synthesis"], "completed")
+        self.assertEqual(plan_status["response_synthesis"], "success")
         self.assertEqual(result.steps[-1].step, "final_answer_generation")
 
     def test_paper_reading_uses_check_then_answer_tool_protocol(self) -> None:
@@ -355,55 +353,6 @@ class AgentToolProtocolStage3Tests(unittest.TestCase):
         self.assertEqual(result.paper_qa_result["answer"], "这是论文答案")
         self.assertEqual([obs.tool_name for obs in result.tool_observations], ["check_paper_qa_index", "answer_paper_question"])
 
-    def test_pending_confirmation_uses_build_then_answer_tool_protocol(self) -> None:
-        state = AgentState(
-            intent="paper_qa",
-            message="解析",
-            pending_action={
-                "type": "parse_then_qa",
-                "status": "waiting_confirmation",
-                "arxiv_id": "2401.00001",
-                "title": "RAG Paper",
-                "original_question": "这篇论文讲了什么？",
-                "qa_question": "请总结这篇论文",
-                "loading_method": "docling",
-            },
-        )
-
-        def fake_execute_tool(current_state):
-            current = _coerce_agent_state(current_state).model_copy(deep=True)
-            request = current.tool_call_request
-            self.assertIsInstance(request, ToolCallRequest)
-            if request.tool_name == "build_paper_qa_index":
-                current.tool_result = {
-                    "ok": True,
-                    "tool_name": request.tool_name,
-                    "summary": "built index",
-                    "data": {"status": "indexed", "has_index": True},
-                    "trace": {"tool_name": request.tool_name},
-                    "error": None,
-                }
-                return _append_mock_observation(current, request.tool_name, True, "built index")
-            self.assertEqual(request.tool_name, "answer_paper_question")
-            current.tool_result = {
-                "ok": True,
-                "tool_name": request.tool_name,
-                "summary": "answered question",
-                "data": {"answer": "确认后已回答", "sources": []},
-                "trace": {"tool_name": request.tool_name},
-                "error": None,
-            }
-            return _append_mock_observation(current, request.tool_name, True, "answered question")
-
-        with mock.patch.object(pending_action_module, "execute_tool", side_effect=fake_execute_tool) as patched:
-            result = pending_action_module.handle_pending_action_confirmation(state)
-
-        self.assertEqual(patched.call_count, 2)
-        self.assertEqual(result.paper_qa_result["status"], "success")
-        self.assertEqual(result.paper_qa_result["answer"], "确认后已回答")
-        self.assertIsNone(result.pending_action)
-        self.assertEqual([obs.tool_name for obs in result.tool_observations], ["build_paper_qa_index", "answer_paper_question"])
-
     def test_preference_action_uses_tool_protocol(self) -> None:
         state = AgentState(
             intent="preference_action",
@@ -437,62 +386,31 @@ class AgentToolProtocolStage3Tests(unittest.TestCase):
         self.assertEqual(result.preference_action_result["label"], "liked")
         self.assertEqual(result.tool_observations[-1].tool_name, "record_paper_preference")
 
-    def test_recommendation_branch_routes_through_tool_nodes(self) -> None:
-        patches: list[mock._patch] = []
-
-        def patch_graph(name: str, value) -> None:
-            patcher = mock.patch.object(graph_module, name, value)
-            patches.append(patcher)
-            patcher.start()
-
+    def test_recommendation_intent_runs_unified_turn_runtime(self) -> None:
         def parse(state, generation_service=None):
             del generation_service
             return _visit(state, "parse_search_request", intent="recommendation")
 
-        def plan(state):
-            return _visit(state, "plan_task")
+        def fake_run_agent_turn(state):
+            self.assertEqual(_coerce_agent_state(state).intent, "recommendation")
+            return _MODULES["schemas"].AgentTurnResult(
+                status="success",
+                final_answer="recommended papers",
+                outputs={"ranked_papers": [{"arxiv_id": "2401.00001", "title": "RAG Paper"}]},
+                trace=[],
+            )
 
-        def build_args(state):
-            return _visit(state, "build_recommendation_tool_args")
-
-        def invoke(state):
-            return _visit(state, "invoke_recommendation_tool", tool_result={"ok": True})
-
-        def adapt(state):
-            return _visit(state, "adapt_recommendation_tool_result", papers=[{"arxiv_id": "2401.00001", "title": "RAG Paper"}])
-
-        def synthesize(state):
-            return _visit(state, "synthesize_response", answer="recommended papers")
-
-        try:
-            for name, fn in {
-                "parse_search_request": parse,
-                "plan_task": plan,
-                "build_recommendation_tool_args": build_args,
-                "invoke_recommendation_tool": invoke,
-                "adapt_recommendation_tool_result": adapt,
-                "synthesize_response": synthesize,
-            }.items():
-                patch_graph(name, fn)
-
+        with mock.patch.object(graph_module, "parse_search_request", side_effect=parse), mock.patch.object(
+            graph_module,
+            "run_agent_turn_in_graph",
+            side_effect=fake_run_agent_turn,
+        ):
             graph = build_arxiv_search_graph()
             result = graph.invoke(AgentState(message="给我推荐一些论文").model_dump())
-        finally:
-            for patcher in reversed(patches):
-                patcher.stop()
 
         self.assertEqual(result["answer"], "recommended papers")
-        self.assertEqual(
-            result["debug"]["visited"],
-            [
-                "parse_search_request",
-                "plan_task",
-                "build_recommendation_tool_args",
-                "invoke_recommendation_tool",
-                "adapt_recommendation_tool_result",
-                "synthesize_response",
-            ],
-        )
+        self.assertEqual(result["debug"]["visited"], ["parse_search_request"])
+        self.assertEqual(result["steps"][-1].step, "run_agent_turn")
 
 
 if __name__ == "__main__":

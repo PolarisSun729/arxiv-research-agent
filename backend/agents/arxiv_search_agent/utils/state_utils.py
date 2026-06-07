@@ -25,12 +25,9 @@ _LEGACY_STEP_ID_ALIAS = {
     "confirmation_gate": "confirm_parse_if_needed",
     "paper_response": "answer_paper_request",
     "preference_update": "mutate_preference",
-    "memory_sync": "sync_memory",
     "profile_loading": "load_profile",
     "recommendation_generation": "recommend_papers",
     "recommendation_explanation": "answer_recommendation",
-    "action_resolution": "resolve_reading_list_action",
-    "state_update": "apply_reading_list_action",
     "ambiguity_analysis": "identify_missing_information",
     "clarification_response": "ask_for_clarification",
     "capability_check": "check_capability_boundary",
@@ -157,11 +154,14 @@ def _update_execution_plan_step(
     next_state = state.model_copy(deep=True)
     updated_steps: List[PlanStep] = []
     matched = False
+    raw_step_selector = str(step_type or "").strip()
     resolved_step_selector = _resolve_step_selector(step_type)
     for plan_step in _get_plan_steps(next_state):
         current_step_id = str(plan_step.step_id or "").strip()
         current_action_type = str(plan_step.action_type or "").strip()
         is_target = bool(step_id and current_step_id == str(step_id).strip())
+        if not is_target and raw_step_selector:
+            is_target = current_action_type == raw_step_selector or current_step_id == raw_step_selector
         if not is_target and resolved_step_selector:
             is_target = current_action_type == resolved_step_selector or current_step_id == resolved_step_selector
         if is_target:
@@ -182,11 +182,14 @@ def _get_execution_plan_step(
     step_type: Optional[str] = None,
 ) -> Optional[PlanStep]:
     """按 step_id 或 action_type 获取计划中的某一步。"""
+    raw_step_selector = str(step_type or "").strip()
     resolved_step_selector = _resolve_step_selector(step_type)
     for plan_step in _get_plan_steps(state):
         current_step_id = str(plan_step.step_id or "").strip()
         current_action_type = str(plan_step.action_type or "").strip()
         if step_id and current_step_id == str(step_id).strip():
+            return plan_step
+        if raw_step_selector and (current_action_type == raw_step_selector or current_step_id == raw_step_selector):
             return plan_step
         if resolved_step_selector and (current_action_type == resolved_step_selector or current_step_id == resolved_step_selector):
             return plan_step

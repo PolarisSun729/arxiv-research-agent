@@ -136,6 +136,7 @@ export interface ArxivSearchResponse {
   warnings: string[]
   next_actions: string[]
   steps: AgentStep[]
+  debug?: Record<string, any>
   streaming_state?: AgentStreamingState | null
 }
 

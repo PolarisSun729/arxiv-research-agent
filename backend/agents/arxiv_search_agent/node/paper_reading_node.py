@@ -4,14 +4,13 @@
 1. 解析用户引用的目标论文；
 2. 把原始表达改写成更适合全文 QA 的标准问题；
 3. 判断论文是否已有问答索引；
-4. 决定直接回答，还是进入等待解析确认的挂起状态。
+4. 已有索引时直接回答，缺索引时提示调用方改走 PlanExecutor 的统一确认链路。
 """
 
 from __future__ import annotations
 
 import re
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Union
 
@@ -74,31 +73,6 @@ def _build_qa_question_for_paper(intent: str, message: str, paper: Mapping[str, 
     return cleaned_question
 
 
-def _make_pending_action_payload(
-    *,
-    arxiv_id: str,
-    title: str,
-    original_question: str,
-    qa_question: str,
-    loading_method: str = "docling",
-) -> Dict[str, Any]:
-    """构造等待用户确认的挂起任务载荷。
-    
-    这个载荷会保存继续执行所需的最小上下文，包括 arxiv_id、title、原始问题、标准化 qa_question、
-    loading_method 和 waiting_confirmation 状态，供后续确认节点无损恢复。
-    """
-    return {
-        "type": "parse_then_qa",
-        "arxiv_id": arxiv_id,
-        "title": title,
-        "original_question": original_question,
-        "qa_question": qa_question,
-        "loading_method": loading_method,
-        "status": "waiting_confirmation",
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-    }
-
-
 def _get_plan_step_id(state: AgentState, step_type: str) -> Optional[str]:
     step = _get_execution_plan_step(state, step_type=step_type)
     if step is not None:
@@ -113,13 +87,13 @@ def _has_ready_qa_index(qa_status: Mapping[str, Any]) -> bool:
 
 
 def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
-    """处理论文阅读类请求，并决定直接回答还是转入待确认流程。
+    """处理论文阅读类请求，并在兼容调用场景下尽量直接回答。
     
     主要分支包括：
     1. 不是论文阅读 intent，直接跳过；
     2. 无法解析目标论文，返回失败提示；
     3. 已有 QA 索引，直接调用问答服务并返回答案；
-    4. 尚无 QA 索引，创建 pending_action，等待用户确认是否解析 PDF。
+    4. 尚无 QA 索引，停止在本节点内处理，提示调用方改走 PlanExecutor 的 interrupt/resume 确认机制。
     
     输出：返回更新后的 AgentState，包含 paper_qa_result、answer、next_actions、debug 和上下文中的 selected_paper。
     """
@@ -185,7 +159,7 @@ def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) ->
     debug["paper_resolution"] = resolution
     debug["paper_reading_intent"] = intent
     debug["paper_qa_target"] = {"arxiv_id": arxiv_id, "title": title}
-    debug["waiting_user_confirmation"] = False
+    debug["confirmation_state"] = "none"
     debug["paper_qa_answer_status"] = "pending"
     next_state.debug = debug
     next_state.context = dict(next_state.context or {})
@@ -289,7 +263,7 @@ def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) ->
             ]
             next_state.pending_action = None
             next_state.context.pop("pending_action", None)
-            next_state.debug["waiting_user_confirmation"] = False
+            next_state.debug["confirmation_state"] = "none"
             next_state.debug["paper_qa_answer_status"] = "answered"
             return _append_step(
                 next_state,
@@ -332,54 +306,49 @@ def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) ->
                 error=str(exc),
             )
 
-    # 尚未建立索引时不直接执行重活，而是先挂起任务，等待用户确认是否解析 PDF。
-    # 没有现成索引时先挂起任务，不直接触发重解析，给用户一次明确确认机会。
-    pending_action = _make_pending_action_payload(
-        arxiv_id=arxiv_id,
-        title=title,
-        original_question=message,
-        qa_question=qa_question,
-        loading_method=loading_method,
-    )
-    next_state.pending_action = pending_action
+    # 兼容节点已经不再自建确认状态机，否则会生成没有 LangGraph checkpoint 的“假确认”。
+    # 缺索引场景应交给 PlanExecutor 重规划出 parse_and_index_paper，并在副作用工具前触发 interrupt。
+    next_state.pending_action = None
     next_state.context = dict(next_state.context or {})
-    next_state.context["pending_action"] = pending_action
+    next_state.context.pop("pending_action", None)
+    message_for_user = (
+        "这篇论文还没有建立问答索引。请通过 Agent 主流程重新发起论文问答，"
+        "系统会展示结构化确认卡片，并通过 resume 恢复解析与回答。"
+    )
     result = {
-        "status": "waiting_confirmation",
+        "status": "failed",
         "arxiv_id": arxiv_id,
         "title": title,
         "original_question": message,
         "qa_question": qa_question,
         "question": qa_question,
-        "answer": "",
+        "answer": message_for_user,
         "sources": [],
         "retrieval_debug": None,
         "qa_index_status": qa_status,
         "index_created": False,
-        "error": None,
+        "error": "paper_index_missing_requires_plan_executor_confirmation",
     }
     next_state.paper_qa_result = result
-    next_state.answer = (
-        f"这篇论文还没有建立问答索引。"
-        f"{f'《{title}》' if title else ''}"
-        f"{f' arXiv ID: {arxiv_id}' if arxiv_id else ''}"
-        " 是否现在解析 PDF 并创建全文检索索引？"
-    )
-    next_state.next_actions = ["解析", "取消"]
-    next_state.debug["waiting_user_confirmation"] = True
-    next_state.debug["paper_qa_answer_status"] = "waiting_confirmation"
+    next_state.answer = message_for_user
+    next_state.next_actions = [
+        "重新通过 Agent 主流程发起论文问答",
+        "也可以直接提供 arXiv ID 后重试",
+    ]
+    next_state.debug["confirmation_state"] = "delegated_to_plan_executor"
+    next_state.debug["paper_qa_answer_status"] = "index_missing"
     return _append_step(
         next_state,
         step="handle_paper_reading_request",
-        status="success",
+        status="failed",
         action="处理论文阅读请求",
         inputs={"message": message, "intent": intent, "context": context},
         outputs={
             "paper_qa_result": result,
-            "pending_action": pending_action,
             "qa_index_status": qa_status,
             "qa_question": qa_question,
         },
+        error=result["error"],
     )
 
 

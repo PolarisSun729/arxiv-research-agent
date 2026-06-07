@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 
+from core.errors import AppError, ErrorCode
 from services.arxiv.arxiv_search_service import ArxivSearchService
 from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
 from services.document.chunking_service import ChunkingService
@@ -232,6 +233,12 @@ class PaperQAService:
                 contextualized_question=contextualized_question,
                 question_contextualization=question_contextualization,
             )
+            if not user_message or not assistant_message:
+                raise AppError(
+                    ErrorCode.DATABASE_WRITE_FAILED,
+                    detail="paper_chat_messages append returned empty result",
+                    context={"session_id": session_id, "user_id": user_id, "stage": "persist_completed_turn"},
+                )
             refreshed_session = self.db_service.get_paper_chat_session(session_id, user_id=user_id) or chat_session
             return {
                 "turn_id": turn_id,
@@ -239,14 +246,22 @@ class PaperQAService:
                 "assistant_message": assistant_message,
                 "chat_session": refreshed_session,
             }
+        except AppError:
+            raise
         except Exception as exc:
-            logger.warning("Persisting QA turn failed, returning response without session write: %s", exc)
-            return {
-                "turn_id": turn_id,
-                "user_message": None,
-                "assistant_message": None,
-                "chat_session": chat_session,
-            }
+            # QA 已经生成成功但会话写入失败时，必须把失败语义抛给上层，避免前端误以为历史记录可恢复。
+            logger.exception(
+                "QA turn persistence failed: code=%s session_id=%s user_id=%s stage=%s",
+                ErrorCode.DATABASE_WRITE_FAILED,
+                session_id,
+                user_id,
+                "persist_completed_turn",
+            )
+            raise AppError(
+                ErrorCode.DATABASE_WRITE_FAILED,
+                detail=exc,
+                context={"session_id": session_id, "user_id": user_id, "stage": "persist_completed_turn"},
+            ) from exc
 
     def get_qa_status(self, arxiv_id: str) -> Dict[str, Any]:
         """查询指定论文当前是否已完成 QA 索引构建，以及索引摘要信息。"""
@@ -259,6 +274,16 @@ class PaperQAService:
                 "collection_name": qa_index["collection_name"],
                 "chunk_count": qa_index["chunk_count"],
                 "embedding_model": qa_index["embedding_model"],
+                "pdf_path": qa_index.get("pdf_path"),
+                "chunk_file": qa_index.get("chunk_file"),
+                "embedding_file": qa_index.get("embedding_file"),
+                "loading_method": qa_index.get("loading_method"),
+                "chunking_strategy": qa_index.get("chunking_strategy"),
+                "current_stage": qa_index.get("current_stage"),
+                "failed_stage": qa_index.get("failed_stage"),
+                "error_message": qa_index.get("error_message"),
+                "artifact_status": qa_index.get("artifact_status"),
+                "indexed_at": qa_index.get("indexed_at"),
             }
         return {
             "arxiv_id": arxiv_id,
@@ -268,6 +293,29 @@ class PaperQAService:
 
     def build_qa_index(self, arxiv_id: str, loading_method: str = "docling") -> Dict[str, Any]:
         return self.qa_index_builder.build_qa_index(arxiv_id, loading_method=loading_method)
+
+    def delete_qa_index(self, arxiv_id: str) -> Dict[str, Any]:
+        """删除论文 QA 索引时先清理外部 artifact，再把数据库记录标记为不可检索。"""
+        qa_index = self.db_service.get_paper_qa_index(arxiv_id)
+        if not qa_index:
+            return {"status": "not_found", "arxiv_id": arxiv_id}
+
+        cleanup_result = self.qa_index_builder.cleanup_qa_index_artifacts(arxiv_id, qa_index)
+        updated = self.db_service.update_paper_qa_index(
+            arxiv_id,
+            status="deleted",
+            current_stage="delete_qa_index",
+            artifact_status="deleted",
+            error_message="",
+            failed_stage="",
+        )
+        if not updated:
+            raise RuntimeError("QA index artifacts were cleaned, but SQLite failed to mark the index as deleted")
+        return {
+            "status": "deleted",
+            "arxiv_id": arxiv_id,
+            "cleanup": cleanup_result,
+        }
 
     def build_generation_context(self, search_results: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
         text_parts: List[str] = []
@@ -751,7 +799,16 @@ class PaperQAService:
     def build_qa_context(self, arxiv_id: str, payload: Any):
         qa_index = self.db_service.get_paper_qa_index(arxiv_id)
         if not qa_index or qa_index["status"] != "indexed":
-            raise HTTPException(status_code=400, detail="Paper does not have QA index. Please create index first.")
+            # 未建索引是可预期的业务状态，前端需要用稳定 code 引导用户先构建索引。
+            raise AppError(
+                ErrorCode.QA_INDEX_NOT_FOUND,
+                detail={
+                    "arxiv_id": arxiv_id,
+                    "stage": "build_qa_context",
+                    "index_status": (qa_index or {}).get("status", "missing"),
+                },
+                context={"arxiv_id": arxiv_id, "stage": "build_qa_context"},
+            )
 
         question = str(self._payload_get(payload, "question", "") or "").strip()
         user_id = self._resolve_user_id(self._payload_get(payload, "user_id"))
@@ -867,25 +924,53 @@ class PaperQAService:
             "fallback_reason": None if chat_session.get("session_id") else "session unavailable or disabled",
             "session_id": chat_session.get("session_id"),
         }
-        retrieval_result = self.enhanced_retrieval_service.enhanced_retrieve(
-            collection_name=collection_name,
-            user_query=retrieval_question,
-            paper_context=paper_context,
-            options=RetrievalOptions(
-                top_k=self._payload_get(payload, "top_k", None) or 15,
-                enable_query_rewrite=self._payload_get(payload, "enable_query_rewrite", None),
-                enable_hyde=self._payload_get(payload, "enable_hyde", None),
-                enable_keyword_search=self._payload_get(payload, "enable_keyword_search", None),
-                enable_llm_rerank=self._payload_get(payload, "enable_llm_rerank", None),
-                debug=self._payload_get(payload, "debug", None),
-                memory_context=memory_context,
-            ),
-        )
+        try:
+            retrieval_result = self.enhanced_retrieval_service.enhanced_retrieve(
+                collection_name=collection_name,
+                user_query=retrieval_question,
+                paper_context=paper_context,
+                options=RetrievalOptions(
+                    top_k=self._payload_get(payload, "top_k", None) or 15,
+                    enable_query_rewrite=self._payload_get(payload, "enable_query_rewrite", None),
+                    enable_hyde=self._payload_get(payload, "enable_hyde", None),
+                    enable_keyword_search=self._payload_get(payload, "enable_keyword_search", None),
+                    enable_llm_rerank=self._payload_get(payload, "enable_llm_rerank", None),
+                    debug=self._payload_get(payload, "debug", None),
+                    memory_context=memory_context,
+                ),
+            )
+        except AppError:
+            raise
+        except Exception as exc:
+            # 检索链路异常不能降级成“没有相关 chunk”，否则前端无法区分数据为空和服务故障。
+            logger.exception(
+                "QA retrieval failed: code=%s arxiv_id=%s collection_name=%s user_id=%s stage=%s",
+                ErrorCode.VECTOR_STORE_ERROR,
+                arxiv_id,
+                collection_name,
+                user_id,
+                "enhanced_retrieve",
+            )
+            raise AppError(
+                ErrorCode.VECTOR_STORE_ERROR,
+                detail=exc,
+                context={
+                    "arxiv_id": arxiv_id,
+                    "user_id": user_id,
+                    "stage": "enhanced_retrieve",
+                    "collection_name": collection_name,
+                },
+            ) from exc
 
         final_context_results = retrieval_result["chunks"]
         search_results = final_context_results
         if not search_results:
-            raise HTTPException(status_code=400, detail="No relevant chunks found")
+            raise AppError(
+                ErrorCode.VECTOR_STORE_ERROR,
+                message="检索服务没有返回可用的论文片段，请检查索引后重试。",
+                detail={"arxiv_id": arxiv_id, "stage": "enhanced_retrieve", "collection_name": collection_name},
+                context={"arxiv_id": arxiv_id, "user_id": user_id, "stage": "enhanced_retrieve"},
+            )
 
         text_context, image_inputs, asset_metadata = self.build_generation_context(search_results)
         retrieval_debug = retrieval_result.get("debug")
@@ -969,8 +1054,23 @@ class PaperQAService:
             )
             answer = generation_result["response"]
         except Exception as exc:
-            logger.warning("Qwen generation failed, using fallback: %s", exc)
-            answer = f'根据论文内容，关于您的问题 "{question}" 的相关信息如下：\n\n{qa_context["text_context"][:1000]}...'
+            # LLM 失败时保留明确错误码，避免把检索结果拼成成功答案误导用户。
+            logger.exception(
+                "QA generation failed: code=%s arxiv_id=%s session_id=%s stage=%s",
+                ErrorCode.LLM_GENERATION_FAILED,
+                arxiv_id,
+                chat_session.get("session_id"),
+                "paper_qa_final_answer",
+            )
+            raise AppError(
+                ErrorCode.LLM_GENERATION_FAILED,
+                detail=exc,
+                context={
+                    "arxiv_id": arxiv_id,
+                    "session_id": chat_session.get("session_id"),
+                    "stage": "paper_qa_final_answer",
+                },
+            ) from exc
 
         persisted_turn = self.persist_completed_turn(
             chat_session=chat_session,

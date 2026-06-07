@@ -72,7 +72,8 @@ class MemoryService:
 
         pending_action = session.get("pending_action")
         if isinstance(pending_action, dict) and pending_action:
-            # 待执行动作可帮助 Agent 恢复中断状态，例如继续问答或继续推荐解释。
+            # 这里只保存最近一次确认动作的业务摘要，方便前端展示、诊断和兼容旧会话。
+            # 真正的 LangGraph interrupt 执行现场依赖 checkpointer，不能只靠数据库里的摘要恢复。
             backend_context["pending_action"] = pending_action
 
         paper_qa_result = session.get("paper_qa_result")
@@ -163,6 +164,8 @@ class MemoryService:
         context = dict(state.get("context") or {})
         pending_action = state.get("pending_action") if "pending_action" in state else context.get("pending_action")
         paper_qa_result = state.get("paper_qa_result") if "paper_qa_result" in state else context.get("paper_qa_result")
+        # pending_action 会随会话记忆保存，但它只是确认卡片的业务镜像；
+        # resume 能否继续执行仍以 LangGraph checkpointer 中的现场为准。
 
         last_papers = context.get("last_papers") if "last_papers" in context else None
         if last_papers is None and isinstance(state.get("papers"), list) and state.get("papers"):

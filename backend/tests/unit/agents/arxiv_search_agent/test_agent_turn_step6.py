@@ -91,7 +91,7 @@ def test_run_agent_turn_paper_qa_available_index(monkeypatch) -> None:
         if tool_name == "check_paper_qa_index":
             return {"ok": True, "tool_name": tool_name, "summary": "available", "data": {"status": "available", "has_index": True}, "trace": {}, "error": None}
         if tool_name == "answer_paper_question":
-            return {"ok": True, "tool_name": tool_name, "summary": "answered", "data": {"answer": "grounded answer", "sources": [{"chunk_id": "c1"}]}, "trace": {}, "error": None}
+            return {"ok": True, "tool_name": tool_name, "summary": "answered", "data": {"answer": "grounded answer", "sources": [{"chunk_id": "c1"}], "retrieval_debug": {"route": "hybrid"}} , "trace": {}, "error": None}
         raise AssertionError(f"unexpected tool: {tool_name}")
 
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
@@ -109,7 +109,9 @@ def test_run_agent_turn_paper_qa_available_index(monkeypatch) -> None:
 
     assert result.status == "success"
     assert result.final_answer == "grounded answer"
-    assert {"paper_ref", "retrieved_chunks", "reranked_chunks", "draft_answer"}.issubset(result.outputs.keys())
+    assert {"paper_ref", "paper_qa_result"}.issubset(result.outputs.keys())
+    assert result.outputs["paper_qa_result"]["retrieval_debug"] == {"route": "hybrid"}
+    assert not {"retrieved_chunks", "reranked_chunks", "draft_answer"}.intersection(result.outputs.keys())
     assert not any(trace.step_id == "request_confirmation" for trace in result.trace)
 
 
@@ -163,24 +165,15 @@ def test_run_agent_turn_in_graph_reject_skips_index_build(monkeypatch) -> None:
     assert any(trace.event == "confirmation_rejected" for trace in result.trace)
 
 
-def test_run_agent_turn_paper_qa_low_evidence_replans(monkeypatch) -> None:
-    retrieve_calls = {"count": 0}
-
-    def fake_retrieve(self, resolved_input, state, runtime, step):
-        retrieve_calls["count"] += 1
-        if retrieve_calls["count"] == 1:
-            return [{"chunk_id": "c1", "text": "irrelevant", "score": 0.05}]
-        return [{"chunk_id": "c2", "text": "method question evidence", "score": 1.0}]
-
+def test_run_agent_turn_paper_qa_trace_only_real_answer_tool(monkeypatch) -> None:
     def fake_invoke_tool(tool_name: str, **kwargs):
         if tool_name == "check_paper_qa_index":
             return {"ok": True, "tool_name": tool_name, "summary": "available", "data": {"status": "available", "has_index": True}, "trace": {}, "error": None}
         if tool_name == "answer_paper_question":
-            return {"ok": True, "tool_name": tool_name, "summary": "answered", "data": {"answer": "grounded answer", "sources": [{"chunk_id": "c2"}]}, "trace": {}, "error": None}
+            return {"ok": True, "tool_name": tool_name, "summary": "answered", "data": {"answer": "grounded answer", "sources": [{"chunk_id": "c2"}], "retrieval_debug": {"stages": ["real_rag"]}}, "trace": {}, "error": None}
         raise AssertionError(f"unexpected tool: {tool_name}")
 
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
-    monkeypatch.setattr(executor_module.PlanExecutor, "_retrieve_paper_chunks", fake_retrieve)
 
     result = run_agent_turn(
         AgentState(
@@ -191,10 +184,10 @@ def test_run_agent_turn_paper_qa_low_evidence_replans(monkeypatch) -> None:
     )
 
     assert result.status == "success"
-    assert any(trace.step_id == "rewrite_paper_query" for trace in result.trace)
-    assert retrieve_calls["count"] >= 2
-    assert result.runtime is not None
-    assert sum(result.runtime.replan_counts.values()) <= 5
+    assert result.outputs["paper_qa_result"]["retrieval_debug"] == {"stages": ["real_rag"]}
+    pseudo_steps = {"retrieve_paper_chunks", "rewrite_paper_query", "rerank_paper_chunks", "validate_qa_evidence", "generate_paper_answer", "verify_answer_grounding"}
+    assert not pseudo_steps.intersection({trace.step_id for trace in result.trace})
+    assert [step.tool_name for step in result.plan.steps] == ["resolve_paper", "check_paper_index", "answer_paper_question"]
 
 
 def test_run_agent_turn_preference_action_persistent_write(monkeypatch) -> None:
@@ -214,10 +207,11 @@ def test_run_agent_turn_preference_action_persistent_write(monkeypatch) -> None:
 
     side_effects = {step.tool_name: step.side_effect_level for step in result.plan.steps}
     assert side_effects["update_preference_store"] == "persistent_write"
-    assert side_effects["update_interest_profile"] == "persistent_write"
+    assert not any("interest" in tool_name or "profile" in tool_name for tool_name in side_effects)
     assert result.status == "success"
     assert result.final_answer
     assert any(trace.step_id == "update_preference_store" and trace.event == "step_succeeded" for trace in result.trace)
+    assert not any("interest" in output_key or "profile" in output_key for output_key in result.outputs)
 
 
 def test_run_agent_turn_unclear_only_clarifies(monkeypatch) -> None:
@@ -231,7 +225,7 @@ def test_run_agent_turn_unclear_only_clarifies(monkeypatch) -> None:
     assert result.status == "need_clarification"
     assert result.final_answer
     assert _step_ids(result) == ["analyze_ambiguity", "generate_clarification"]
-    forbidden = {"search_arxiv", "retrieve_paper_chunks", "generate_recommendations", "update_preference_store"}
+    forbidden = {"search_arxiv", "answer_paper_question", "generate_recommendations", "update_preference_store"}
     assert not forbidden.intersection({step.tool_name for step in result.plan.steps})
 
 

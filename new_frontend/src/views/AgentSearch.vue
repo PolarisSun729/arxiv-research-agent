@@ -23,6 +23,7 @@ const {
   activeSessionId,
   setInputMessage,
   submitMessage,
+  submitResume,
   clearConversation
 } = useAgentSearchChat()
 
@@ -45,21 +46,11 @@ function handleClear() {
 }
 
 function handleConfirmPendingAction() {
-  submitMessage('批准当前确认请求', {
-    resume: {
-      decision: 'approve',
-      step_id: pendingAction.value?.step_id || null
-    }
-  })
+  submitResume('approve', '用户在确认卡片中批准执行')
 }
 
 function handleCancelPendingAction() {
-  submitMessage('拒绝当前确认请求', {
-    resume: {
-      decision: 'reject',
-      step_id: pendingAction.value?.step_id || null
-    }
-  })
+  submitResume('reject', '用户在确认卡片中拒绝执行')
 }
 
 function handleViewDetail(id: string) {

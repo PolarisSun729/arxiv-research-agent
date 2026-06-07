@@ -404,56 +404,27 @@
 
  Agent 工作流定义在 `backend/agents/arxiv_search_agent/graph.py` 中。
 
- 从图结构可以看出，Agent 主要由以下节点组成：
+ 当前主图已经收敛为两个 LangGraph 节点，具体业务步骤由 `run_agent_turn` 内的 PlanExecutor 负责：
 
  - `parse_search_request`
- - `build_search_tool_args`
- - `invoke_search_tool`
- - `check_search_result`
- - `relax_search_for_retry`
- - `personalized_rank_and_annotate_papers`
- - `apply_preference_action`
- - `classify_pending_action_confirmation`
- - `handle_pending_action_confirmation`
- - `handle_paper_reading_request`
- - `synthesize_response`
+ - `run_agent_turn`
 
  ### 8.1 Agent 流程图
 
  ```mermaid
  flowchart TD
      A[parse_search_request]
-     B[build_search_tool_args]
-     C[invoke_search_tool]
-     D[check_search_result]
-     E[relax_search_for_retry]
-     F[personalized_rank_and_annotate_papers]
-     G[apply_preference_action]
-     H[classify_pending_action_confirmation]
-     I[handle_pending_action_confirmation]
-     J[handle_paper_reading_request]
-     K[synthesize_response]
+     B[run_agent_turn]
+     C[PlanExecutor: plan / tool / observe / replan]
+     D[LangGraph interrupt]
+     E[Command resume]
+     F[END]
 
-     A -->|arxiv_search| B
+     A --> B
      B --> C
-     C --> D
-     D -->|empty but retryable| E
-     E --> B
-     D -->|ok or exhausted| F
-     F --> K
-
-     A -->|paper_detail / paper_summary / paper_qa| J
-     J --> K
-
-     A -->|preference_action| G
-     G --> K
-
-     A -->|pending confirmation| H
-     H -->|confirm| I
-     H -->|other| K
-     I --> K
-
-     A -->|recommendation / unclear / unsupported| K
+     C -->|needs tool approval| D
+     E --> C
+     C -->|answered / failed / fallback| F
  ```
 
  ### 8.2 Agent 与普通检索接口的区别
@@ -464,7 +435,7 @@
  因此 Agent 的价值主要体现在：
 
  - 支持更自然的输入方式
- - 支持待确认任务续接
+ - 支持基于 LangGraph interrupt/resume 的工具确认续接
  - 支持搜索失败后的放宽检索重试
  - 支持个性化排序与注释增强
  - 支持将搜索、论文阅读、偏好更新统一进一张图里

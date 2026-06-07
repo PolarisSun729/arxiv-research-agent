@@ -1,4 +1,5 @@
 import request from './request'
+import { ApiError, normalizeApiError, parseFetchErrorResponse } from './errors'
 import type { AgentGraphResponse, AgentStreamEvent, ArxivSearchRequest, ArxivSearchResponse } from '@/types/agent'
 
 export interface AgentStreamHandlers {
@@ -58,8 +59,7 @@ export async function streamAgentChat(
   })
 
   if (!response.ok) {
-    const detail = await response.text()
-    throw new Error(detail || `Request failed with status ${response.status}`)
+    throw await parseFetchErrorResponse(response, 'Agent 调用失败')
   }
 
   if (!response.body) {
@@ -95,6 +95,10 @@ export async function streamAgentChat(
         const responsePayload = parsed.data.data?.response
         if (responsePayload) {
           finalResponse = responsePayload as ArxivSearchResponse
+        }
+        if (parsed.data.data?.code || parsed.data.data?.error?.code) {
+          // Agent stream 的异常事件也遵守统一错误契约，调用方可以直接读取 payload.code。
+          throw new ApiError(normalizeApiError(parsed.data.data?.error || parsed.data.data, 'Agent 调用失败'))
         }
       } else if (parsed.data.event_type === 'stream_end') {
         const responsePayload = parsed.data.data?.response
