@@ -1,7 +1,8 @@
 import gc
 import unittest
+from unittest import mock
 
-from services.storage.database_service import DatabaseService
+from services.storage.database_service import DatabaseService, PaperQATurnPersistenceError
 from tests.helpers import build_database_service
 
 
@@ -157,6 +158,58 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
         self.assertEqual(qa_index["current_stage"], "save_embeddings")
         self.assertEqual(qa_index["indexed_at"], "2024-01-01T00:00:00")
 
+    def test_paper_qa_index_build_activation_keeps_single_active_version(self) -> None:
+        arxiv_id = "2401.01000"
+        self.assertTrue(
+            self.service.insert_paper_qa_index(
+                arxiv_id,
+                collection_name="qa_old",
+                status="indexed",
+                chunk_count=1,
+                embedding_model="old-model",
+            )
+        )
+        old_active = self.service.get_active_paper_qa_index_build(arxiv_id)
+        build = self.service.create_paper_qa_index_build(arxiv_id, "docling")
+        self.assertTrue(
+            self.service.update_paper_qa_index_build(
+                build["build_id"],
+                status="build_success",
+                collection_name="qa_new",
+                chunk_count=2,
+                embedding_model="new-model",
+                current_stage="activate_index",
+            )
+        )
+
+        self.assertTrue(self.service.activate_paper_qa_index_build(build["build_id"]))
+
+        active = self.service.get_paper_qa_index(arxiv_id)
+        active_versions = self.service.list_paper_qa_index_builds(arxiv_id, statuses=["active"], limit=10)
+        cleanup_versions = self.service.list_paper_qa_index_builds(arxiv_id, statuses=["cleanup_pending"], limit=10)
+        self.assertEqual(active["collection_name"], "qa_new")
+        self.assertEqual(active["active_build_id"], build["build_id"])
+        self.assertEqual(len(active_versions), 1)
+        self.assertEqual(cleanup_versions[0]["build_id"], old_active["build_id"])
+
+    def test_legacy_qa_index_row_is_recognized_as_active_version(self) -> None:
+        arxiv_id = "2401.01001"
+        self.assertTrue(
+            self.service.insert_paper_qa_index(
+                arxiv_id,
+                collection_name="qa_legacy",
+                status="indexed",
+                chunk_count=1,
+                embedding_model="legacy-model",
+            )
+        )
+
+        active = self.service.get_active_paper_qa_index_build(arxiv_id)
+
+        self.assertIsNotNone(active)
+        self.assertTrue(active["is_active"])
+        self.assertEqual(active["collection_name"], "qa_legacy")
+
     def test_paper_index_jobs_support_create_update_and_latest_query(self) -> None:
         job = self.service.create_paper_index_job("2401.00005", loading_method="docling")
 
@@ -177,6 +230,8 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
         self.assertEqual(stored["status"], "completed")
         self.assertEqual(stored["current_stage"], "finished")
         self.assertEqual(stored["progress"], 100)
+        self.assertEqual(stored["idempotency_key"], "2401.00005:docling")
+        self.assertIsNotNone(stored["heartbeat_at"])
         self.assertEqual(latest["job_id"], job["job_id"])
 
     def test_paper_chat_sessions_support_create_list_clear_and_delete(self) -> None:
@@ -227,6 +282,74 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
         self.assertEqual(assistant_message["sources"], [{"chunk_id": "c1"}])
         self.assertEqual(assistant_message["retrieval_debug_snapshot"], {"score": 0.8})
         self.assertEqual(by_turn["message_id"], assistant_message["message_id"])
+
+    def test_append_paper_qa_turn_writes_complete_turn_atomically(self) -> None:
+        session = self._create_session(arxiv_id="2401.00017", session_id="session-atomic-turn")
+
+        result = self.service.append_paper_qa_turn(
+            session_id=session["session_id"],
+            user_id=self.user_id,
+            question="What is the method?",
+            answer="It uses retrieval.",
+            sources=[{"chunk_id": "c1"}],
+            retrieval_debug_snapshot={"score": 0.8},
+            contextualized_question="What is the method?",
+            question_contextualization={"used_short_term_memory": False},
+        )
+        messages = self.service.list_paper_chat_messages(session["session_id"], user_id=self.user_id)
+
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(result["turn_id"], messages[0]["turn_id"])
+        self.assertEqual(messages[0]["turn_id"], messages[1]["turn_id"])
+        self.assertEqual(messages[0]["role"], "user")
+        self.assertEqual(messages[1]["role"], "assistant")
+        self.assertEqual(messages[1]["sources"], [{"chunk_id": "c1"}])
+        self.assertEqual(result["refreshed_session"]["message_count"], 2)
+
+    def test_append_paper_qa_turn_rolls_back_when_assistant_payload_fails(self) -> None:
+        session = self._create_session(arxiv_id="2401.00018", session_id="session-assistant-rollback")
+        circular_sources = []
+        circular_sources.append(circular_sources)
+
+        with self.assertRaises(PaperQATurnPersistenceError):
+            self.service.append_paper_qa_turn(
+                session_id=session["session_id"],
+                user_id=self.user_id,
+                question="Q",
+                answer="A",
+                sources=circular_sources,
+            )
+
+        messages = self.service.list_paper_chat_messages(session["session_id"], user_id=self.user_id)
+        refreshed_session = self.service.get_paper_chat_session(session["session_id"], user_id=self.user_id)
+        self.assertEqual(messages, [])
+        self.assertEqual(refreshed_session["message_count"], 0)
+
+    def test_append_paper_qa_turn_rolls_back_when_session_stats_fail(self) -> None:
+        session = self._create_session(arxiv_id="2401.00019", session_id="session-stats-rollback")
+
+        with mock.patch.object(self.service, "_refresh_paper_chat_session_stats", side_effect=RuntimeError("stats failed")):
+            with self.assertRaises(PaperQATurnPersistenceError):
+                self.service.append_paper_qa_turn(
+                    session_id=session["session_id"],
+                    user_id=self.user_id,
+                    question="Q",
+                    answer="A",
+                )
+
+        messages = self.service.list_paper_chat_messages(session["session_id"], user_id=self.user_id)
+        refreshed_session = self.service.get_paper_chat_session(session["session_id"], user_id=self.user_id)
+        self.assertEqual(messages, [])
+        self.assertEqual(refreshed_session["message_count"], 0)
+
+    def test_append_paper_qa_turn_raises_for_missing_session(self) -> None:
+        with self.assertRaises(PaperQATurnPersistenceError):
+            self.service.append_paper_qa_turn(
+                session_id="missing-session",
+                user_id=self.user_id,
+                question="Q",
+                answer="A",
+            )
 
     def test_paper_notes_support_create_update_list_and_delete(self) -> None:
         session = self._create_session(arxiv_id="2401.00008", session_id="session-note")

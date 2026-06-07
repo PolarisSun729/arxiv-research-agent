@@ -10,7 +10,8 @@ from unittest import mock
 
 from fastapi import HTTPException
 
-from services.storage.database_service import DatabaseService
+from core.errors import AppError, ErrorCode
+from services.storage.database_service import DatabaseService, PaperQATurnPersistenceError
 from tests.helpers import FakeEmbeddingService, FakeGenerationService, FakeVectorStoreService, build_database_service
 
 
@@ -114,6 +115,8 @@ def _load_paper_qa_service_class():
             pass
 
         module.GenerationService = _GenerationService
+        # PaperQAService 测试桩只隔离生成服务本体，但仍需保留真实模块的常量导出形状。
+        module.QWEN_RERANK_COMPRESS_MODEL_NAME = "fake-rerank-compress"
         sys.modules[module.__name__] = module
 
     if "services.paper_qa.paper_qa_index_builder" not in sys.modules:
@@ -129,9 +132,16 @@ def _load_paper_qa_service_class():
     if "services.storage.vector_store_service" not in sys.modules:
         module = types.ModuleType("services.storage.vector_store_service")
 
+        class _VectorDBConfig:
+            def __init__(self, provider="milvus", index_mode="default"):
+                self.provider = provider
+                self.index_mode = index_mode
+
         class _VectorStoreService:
             pass
 
+        # 真实建索引模块会导入 VectorDBConfig；测试桩保留该导出，避免污染其他集成测试。
+        module.VectorDBConfig = _VectorDBConfig
         module.VectorStoreService = _VectorStoreService
         sys.modules[module.__name__] = module
 
@@ -277,6 +287,32 @@ class PaperQAServiceComponentTests(unittest.TestCase):
         self.assertEqual(failed["status"], "failed")
         self.assertFalse(failed["has_index"])
 
+    def test_get_qa_status_reports_active_index_while_rebuild_is_building(self) -> None:
+        self._insert_index(status="indexed")
+        building = self.db_service.create_paper_qa_index_build(self.arxiv_id, "docling")
+        self.db_service.update_paper_qa_index_build(
+            building["build_id"],
+            status="building",
+            current_stage="create_chunk_embeddings",
+        )
+        failed = self.db_service.create_paper_qa_index_build(self.arxiv_id, "docling")
+        self.db_service.update_paper_qa_index_build(
+            failed["build_id"],
+            status="build_failed",
+            current_stage="chunk_document",
+            failed_stage="chunk_document",
+            error_message="chunking failed",
+            artifact_status="cleanup_pending",
+        )
+
+        status = self.service.get_qa_status(self.arxiv_id)
+
+        self.assertTrue(status["has_index"])
+        self.assertEqual(status["active_collection_name"], "paper_2401")
+        self.assertEqual(status["building_status"], "building")
+        self.assertEqual(status["last_failed_build"]["failed_stage"], "chunk_document")
+        self.assertGreaterEqual(status["cleanup_pending_count"], 1)
+
     def test_resolve_chat_session_creates_or_reuses_sessions(self) -> None:
         created = self.service._resolve_chat_session(self.arxiv_id, {"user_id": self.user_id, "question": "What is this paper about?"})
         self.assertTrue(created["session_id"])
@@ -325,23 +361,28 @@ class PaperQAServiceComponentTests(unittest.TestCase):
         self.assertEqual(messages[1]["sources"], [{"source_id": "s1", "content": "source text"}])
         self.assertEqual(messages[1]["retrieval_debug_snapshot"], {"score": 0.8})
 
-    def test_persist_completed_turn_swallows_db_failures(self) -> None:
+    def test_persist_completed_turn_raises_db_error_without_half_turn(self) -> None:
         session = self._create_session(session_id="failing-session")
 
-        with mock.patch.object(self.db_service, "append_paper_chat_message", side_effect=RuntimeError("write failed")):
-            result = self.service.persist_completed_turn(
-                chat_session=session,
-                question="Q",
-                answer="A",
-                source_payload=[],
-                retrieval_debug=None,
-                contextualized_question="Q",
-                question_contextualization={},
-            )
+        with mock.patch.object(
+            self.db_service,
+            "append_paper_qa_turn",
+            side_effect=PaperQATurnPersistenceError("write failed"),
+        ):
+            with self.assertRaises(AppError) as ctx:
+                self.service.persist_completed_turn(
+                    chat_session=session,
+                    question="Q",
+                    answer="A",
+                    source_payload=[],
+                    retrieval_debug=None,
+                    contextualized_question="Q",
+                    question_contextualization={},
+                )
 
-        self.assertTrue(result["turn_id"])
-        self.assertIsNone(result["user_message"])
-        self.assertIsNone(result["assistant_message"])
+        messages = self.db_service.list_paper_chat_messages(session["session_id"], user_id=self.user_id)
+        self.assertEqual(ctx.exception.code, ErrorCode.DATABASE_WRITE_FAILED)
+        self.assertEqual(messages, [])
 
     def test_build_generation_context_and_source_payload_cover_text_assets_and_fields(self) -> None:
         long_content = "x" * 400
@@ -419,19 +460,52 @@ class PaperQAServiceComponentTests(unittest.TestCase):
         self.assertEqual(len(messages), 2)
         self.assertEqual(messages[1]["content"], "generated answer")
 
-    def test_answer_question_raises_400_when_retrieval_returns_no_chunks(self) -> None:
+    def test_answer_question_reports_persistence_failure_without_half_turn(self) -> None:
+        self._insert_index(status="indexed")
+        session = self._create_session(session_id="qa-persistence-fail")
+        retrieval_service = _FakeRetrievalService(
+            chunks=[
+                {
+                    "content": "Relevant chunk content",
+                    "chunk_type": "text",
+                    "page_number": 1,
+                    "source": "body",
+                }
+            ],
+            debug={"provider": "fake-retrieval", "score": 0.9},
+        )
+        generation_service = _FakeGenerationWithResponse(response_text="generated answer")
+        service = self._make_service(retrieval_service=retrieval_service, generation_service=generation_service)
+
+        with mock.patch.object(
+            self.db_service,
+            "append_paper_qa_turn",
+            side_effect=PaperQATurnPersistenceError("write failed"),
+        ):
+            with self.assertRaises(AppError) as ctx:
+                service.answer_question(
+                    self.arxiv_id,
+                    {"question": "What is the contribution?", "user_id": self.user_id, "session_id": session["session_id"]},
+                )
+
+        messages = self.db_service.list_paper_chat_messages(session["session_id"], user_id=self.user_id)
+        retrieval_service.cleanup()
+        self.assertEqual(ctx.exception.code, ErrorCode.DATABASE_WRITE_FAILED)
+        self.assertEqual(messages, [])
+
+    def test_answer_question_raises_vector_error_when_retrieval_returns_no_chunks(self) -> None:
         self._insert_index(status="indexed")
         retrieval_service = _FakeRetrievalService(chunks=[])
         service = self._make_service(retrieval_service=retrieval_service)
 
-        with self.assertRaises(HTTPException) as ctx:
+        with self.assertRaises(AppError) as ctx:
             service.answer_question(self.arxiv_id, {"question": "Empty?", "user_id": self.user_id})
 
         retrieval_service.cleanup()
-        self.assertEqual(ctx.exception.status_code, 400)
-        self.assertIn("No relevant chunks found", ctx.exception.detail)
+        self.assertEqual(ctx.exception.code, ErrorCode.VECTOR_STORE_ERROR)
+        self.assertIn("检索服务没有返回可用的论文片段", str(ctx.exception))
 
-    def test_answer_question_uses_fallback_answer_when_generation_fails(self) -> None:
+    def test_answer_question_reports_generation_failure_without_fallback_answer(self) -> None:
         self._insert_index(status="indexed")
         session = self._create_session(session_id="qa-fallback")
         retrieval_service = _FakeRetrievalService(
@@ -447,18 +521,17 @@ class PaperQAServiceComponentTests(unittest.TestCase):
         generation_service = _FakeGenerationWithResponse(raise_error=RuntimeError("llm boom"))
         service = self._make_service(retrieval_service=retrieval_service, generation_service=generation_service)
 
-        result = service.answer_question(
-            self.arxiv_id,
-            {"question": "Why does it work?", "user_id": self.user_id, "session_id": session["session_id"]},
-        )
+        with self.assertRaises(AppError) as ctx:
+            service.answer_question(
+                self.arxiv_id,
+                {"question": "Why does it work?", "user_id": self.user_id, "session_id": session["session_id"]},
+            )
 
         messages = self.db_service.list_paper_chat_messages(session["session_id"], user_id=self.user_id)
         retrieval_service.cleanup()
 
-        self.assertEqual(result["status"], "success")
-        self.assertIn("根据论文内容", result["answer"])
-        self.assertEqual(len(messages), 2)
-        self.assertEqual(messages[1]["content"], result["answer"])
+        self.assertEqual(ctx.exception.code, ErrorCode.LLM_GENERATION_FAILED)
+        self.assertEqual(messages, [])
 
 
 if __name__ == "__main__":

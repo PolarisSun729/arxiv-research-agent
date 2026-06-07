@@ -1,6 +1,7 @@
 import request from './request'
 import { ApiError, normalizeApiError, parseFetchErrorResponse } from './errors'
 import type { AgentGraphResponse, AgentStreamEvent, ArxivSearchRequest, ArxivSearchResponse } from '@/types/agent'
+import { getCurrentUserId } from '@/composables/useUserContext'
 
 export interface AgentStreamHandlers {
   onEvent?: (event: AgentStreamEvent) => void
@@ -36,8 +37,17 @@ function ensureErrorMessage(error: unknown, fallback: string) {
   return new Error(fallback)
 }
 
+function withResolvedUserId(payload: ArxivSearchRequest): ArxivSearchRequest {
+  const normalizedUserId = String(payload.user_id || '').trim()
+  return {
+    ...payload,
+    // Agent API 保留兜底入口，但默认值只来自统一用户上下文，避免 resume 与 chat 用户不一致。
+    user_id: normalizedUserId || getCurrentUserId()
+  }
+}
+
 export async function runAgentChat(payload: ArxivSearchRequest): Promise<ArxivSearchResponse> {
-  return request.post('/agent/chat', payload)
+  return request.post('/agent/chat', withResolvedUserId(payload))
 }
 
 export async function fetchAgentGraph(): Promise<AgentGraphResponse> {
@@ -48,13 +58,14 @@ export async function streamAgentChat(
   payload: ArxivSearchRequest,
   handlers: AgentStreamHandlers = {}
 ): Promise<ArxivSearchResponse> {
+  const requestPayload = withResolvedUserId(payload)
   const response = await fetch('/api/agent/chat/stream', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Accept: 'text/event-stream'
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(requestPayload),
     signal: handlers.signal
   })
 

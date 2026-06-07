@@ -5,6 +5,9 @@ export type ApiErrorCode =
   | 'qa_index_build_failed'
   | 'vector_store_error'
   | 'llm_generation_failed'
+  | 'aborted'
+  | 'stream_incomplete'
+  | 'stream_interrupted'
   | 'resume_checkpoint_not_found'
   | 'agent_runtime_error'
   | 'database_write_failed'
@@ -17,4 +20,3 @@ export interface ApiErrorPayload {
   detail?: string | null
   recoverable: boolean
 }
-

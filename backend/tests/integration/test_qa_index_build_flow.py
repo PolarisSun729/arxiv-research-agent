@@ -6,6 +6,7 @@ import sys
 import threading
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -13,6 +14,14 @@ from fastapi import HTTPException
 
 from services.storage.database_service import DatabaseService
 from tests.helpers import FakeGenerationService, build_database_service
+
+
+def _needs_reload(module_name: str, required_attrs: tuple[str, ...]) -> bool:
+    module = sys.modules.get(module_name)
+    if module is None:
+        return True
+    # 其他集成测试会注册轻量 stub 隔离重依赖；这里必须重新加载真实源码，才能验证建索引链路本身。
+    return not getattr(module, "__file__", None) or any(not hasattr(module, attr) for attr in required_attrs)
 
 
 def _load_builder_and_manager():
@@ -96,6 +105,9 @@ def _load_builder_and_manager():
         module.GenerationService = _GenerationService
         module.QWEN_RERANK_COMPRESS_MODEL_NAME = "fake-rerank-compress"
         sys.modules[module.__name__] = module
+    elif not hasattr(sys.modules["services.llm.generation_service"], "QWEN_RERANK_COMPRESS_MODEL_NAME"):
+        # 混跑时可能复用其他测试留下的生成服务 stub；补齐常量即可保持 builder 导入契约。
+        sys.modules["services.llm.generation_service"].QWEN_RERANK_COMPRESS_MODEL_NAME = "fake-rerank-compress"
 
     if "services.storage.vector_store_service" not in sys.modules:
         module = types.ModuleType("services.storage.vector_store_service")
@@ -111,9 +123,18 @@ def _load_builder_and_manager():
         module.VectorDBConfig = _VectorDBConfig
         module.VectorStoreService = _VectorStoreService
         sys.modules[module.__name__] = module
+    elif not hasattr(sys.modules["services.storage.vector_store_service"], "VectorDBConfig"):
+        class _VectorDBConfig:
+            def __init__(self, provider="milvus", index_mode="default"):
+                self.provider = provider
+                self.index_mode = index_mode
+
+        # 混跑时可能复用其他测试留下的向量库 stub；补齐配置类型即可保持 builder 导入契约。
+        sys.modules["services.storage.vector_store_service"].VectorDBConfig = _VectorDBConfig
 
     builder_module_name = "services.paper_qa.paper_qa_index_builder"
-    if builder_module_name not in sys.modules:
+    if _needs_reload(builder_module_name, ("PaperQAIndexBuilder", "AppError", "ErrorCode")):
+        sys.modules.pop(builder_module_name, None)
         spec = importlib.util.spec_from_file_location(
             builder_module_name,
             backend_dir / "services" / "paper_qa" / "paper_qa_index_builder.py",
@@ -124,7 +145,8 @@ def _load_builder_and_manager():
         spec.loader.exec_module(module)
 
     manager_module_name = "services.paper_qa.index_job_manager"
-    if manager_module_name not in sys.modules:
+    if _needs_reload(manager_module_name, ("IndexJobManager",)):
+        sys.modules.pop(manager_module_name, None)
         spec = importlib.util.spec_from_file_location(
             manager_module_name,
             backend_dir / "services" / "paper_qa" / "index_job_manager.py",
@@ -452,20 +474,22 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
         self.assertEqual(record["embedding_model"], "fake-embedding-model")
         self.assertEqual(record["pdf_path"], "tmp/fake-paper.pdf")
         self.assertEqual(record["chunk_file"], "chunk-output.json")
-        self.assertIn('"filename": "2401.00001.pdf"', record["embedding_file"])
-        self.assertEqual(record["collection_name"], "qa_2401_00001_pdf")
+        self.assertIn('"filename": "2401.00001_', record["embedding_file"])
+        self.assertIn("_pdf", record["collection_name"])
         self.assertEqual(record["loading_method"], "docling")
         self.assertEqual(record["chunking_strategy"], "docling_sections")
-        self.assertEqual(record["current_stage"], "mark_index_success")
+        self.assertEqual(record["current_stage"], "activate_index")
         self.assertEqual(record["failed_stage"], "")
         self.assertEqual(record["error_message"], "")
         self.assertIsNotNone(record["indexed_at"])
+        self.assertIsNotNone(record["active_build_id"])
+        self.assertNotEqual(record["active_index_version"], "legacy")
         self.assertEqual(loading_service.calls[0]["method"], "load_pdf")
         self.assertEqual(chunking_service.calls[0]["method"], "chunk_docling")
         self.assertEqual(embedding_service.calls[0]["method"], "create_embeddings")
         self.assertEqual(vector_store_service.calls[0]["method"], "index_embeddings")
 
-    def test_rebuild_cleans_old_collection_before_creating_new_index(self) -> None:
+    def test_rebuild_keeps_old_collection_until_new_index_activates(self) -> None:
         self.db_service.add_paper(self._paper_payload())
         self.db_service.insert_paper_qa_index(
             self.arxiv_id,
@@ -479,8 +503,11 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
 
         builder.build_qa_index(self.arxiv_id, loading_method="docling")
 
-        self.assertEqual(vector_store_service.calls[0]["method"], "delete_collection")
-        self.assertEqual(vector_store_service.calls[0]["collection_name"], "qa_old_collection")
+        self.assertEqual(vector_store_service.calls[0]["method"], "index_embeddings")
+        self.assertFalse(any(call["method"] == "delete_collection" for call in vector_store_service.calls))
+        builds = self.db_service.list_paper_qa_index_builds(self.arxiv_id, statuses=["cleanup_pending"], limit=5)
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(builds[0]["collection_name"], "qa_old_collection")
 
     def test_collection_name_generation_is_stable(self) -> None:
         vector_store_service = _FakeVectorStoreService()
@@ -499,12 +526,14 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
             builder.build_qa_index(self.arxiv_id)
 
         record = self.db_service.get_paper_qa_index(self.arxiv_id)
+        failed_build = self.db_service.get_latest_paper_qa_index_build(self.arxiv_id, statuses=["build_failed"])
         self.assertEqual(ctx.exception.code, ErrorCode.QA_INDEX_BUILD_FAILED)
         self.assertIn("loading failed", str(ctx.exception.__cause__))
-        self.assertEqual(record["status"], "failed")
-        self.assertEqual(record["failed_stage"], "load_pdf_document")
-        self.assertEqual(record["error_message"], "loading failed")
-        self.assertEqual(record["pdf_path"], "tmp/fake-paper.pdf")
+        self.assertEqual(record["status"], "not_indexed")
+        self.assertEqual(failed_build["status"], "build_failed")
+        self.assertEqual(failed_build["failed_stage"], "load_pdf_document")
+        self.assertEqual(failed_build["error_message"], "loading failed")
+        self.assertEqual(failed_build["pdf_path"], "tmp/fake-paper.pdf")
         self.assertEqual(ctx.exception.context.get("stage"), "load_pdf_document")
 
     def test_build_qa_index_records_failure_when_chunking_fails(self) -> None:
@@ -515,12 +544,14 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
             builder.build_qa_index(self.arxiv_id)
 
         record = self.db_service.get_paper_qa_index(self.arxiv_id)
+        failed_build = self.db_service.get_latest_paper_qa_index_build(self.arxiv_id, statuses=["build_failed"])
         self.assertEqual(ctx.exception.code, ErrorCode.QA_INDEX_BUILD_FAILED)
         self.assertIn("chunking failed", str(ctx.exception.__cause__))
-        self.assertEqual(record["status"], "failed")
-        self.assertEqual(record["failed_stage"], "chunk_document")
-        self.assertEqual(record["error_message"], "chunking failed")
-        self.assertEqual(record["pdf_path"], "tmp/fake-paper.pdf")
+        self.assertEqual(record["status"], "not_indexed")
+        self.assertEqual(failed_build["status"], "build_failed")
+        self.assertEqual(failed_build["failed_stage"], "chunk_document")
+        self.assertEqual(failed_build["error_message"], "chunking failed")
+        self.assertEqual(failed_build["pdf_path"], "tmp/fake-paper.pdf")
         self.assertEqual(ctx.exception.context.get("stage"), "chunk_document")
 
     def test_build_qa_index_records_failure_when_embedding_fails(self) -> None:
@@ -531,12 +562,14 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
             builder.build_qa_index(self.arxiv_id)
 
         record = self.db_service.get_paper_qa_index(self.arxiv_id)
+        failed_build = self.db_service.get_latest_paper_qa_index_build(self.arxiv_id, statuses=["build_failed"])
         self.assertEqual(ctx.exception.code, ErrorCode.QA_INDEX_BUILD_FAILED)
         self.assertIn("embedding failed", str(ctx.exception.__cause__))
-        self.assertEqual(record["status"], "failed")
-        self.assertEqual(record["failed_stage"], "create_chunk_embeddings")
-        self.assertEqual(record["error_message"], "embedding failed")
-        self.assertEqual(record["chunk_file"], "chunk-output.json")
+        self.assertEqual(record["status"], "not_indexed")
+        self.assertEqual(failed_build["status"], "build_failed")
+        self.assertEqual(failed_build["failed_stage"], "create_chunk_embeddings")
+        self.assertEqual(failed_build["error_message"], "embedding failed")
+        self.assertEqual(failed_build["chunk_file"], "chunk-output.json")
         self.assertEqual(ctx.exception.context.get("stage"), "create_chunk_embeddings")
 
     def test_build_qa_index_records_failure_when_vector_write_fails(self) -> None:
@@ -547,13 +580,62 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
             builder.build_qa_index(self.arxiv_id)
 
         record = self.db_service.get_paper_qa_index(self.arxiv_id)
+        failed_build = self.db_service.get_latest_paper_qa_index_build(self.arxiv_id, statuses=["build_failed"])
         self.assertEqual(ctx.exception.code, ErrorCode.VECTOR_STORE_ERROR)
         self.assertIn("vector write failed", str(ctx.exception.__cause__))
-        self.assertEqual(record["status"], "failed")
-        self.assertEqual(record["failed_stage"], "index_embeddings_to_vector_store")
-        self.assertEqual(record["error_message"], "vector write failed")
-        self.assertIn('"filename": "2401.00001.pdf"', record["embedding_file"])
+        self.assertEqual(record["status"], "not_indexed")
+        self.assertEqual(failed_build["status"], "build_failed")
+        self.assertEqual(failed_build["failed_stage"], "index_embeddings_to_vector_store")
+        self.assertEqual(failed_build["error_message"], "vector write failed")
+        self.assertIn('"filename": "2401.00001_', failed_build["embedding_file"])
         self.assertEqual(ctx.exception.context.get("stage"), "index_embeddings_to_vector_store")
+
+    def test_rebuild_failure_keeps_previous_active_index(self) -> None:
+        self.db_service.add_paper(self._paper_payload())
+        self.db_service.insert_paper_qa_index(
+            self.arxiv_id,
+            collection_name="qa_old_collection",
+            status="indexed",
+            chunk_count=2,
+            embedding_model="old-model",
+            pdf_path="old.pdf",
+            chunk_file="old-chunks.json",
+            embedding_file="old-embeddings.json",
+        )
+        builder, *_ = self._make_builder(embedding_service=_FakeEmbeddingService(fail_stage="create_chunk_embeddings"))
+
+        with self.assertRaises(AppError):
+            builder.build_qa_index(self.arxiv_id)
+
+        active = self.db_service.get_paper_qa_index(self.arxiv_id)
+        failed_build = self.db_service.get_latest_paper_qa_index_build(self.arxiv_id, statuses=["build_failed"])
+        self.assertEqual(active["status"], "indexed")
+        self.assertEqual(active["collection_name"], "qa_old_collection")
+        self.assertEqual(failed_build["failed_stage"], "create_chunk_embeddings")
+
+    def test_cleanup_pending_builds_does_not_delete_active_collection(self) -> None:
+        self.db_service.add_paper(self._paper_payload())
+        self.db_service.insert_paper_qa_index(
+            self.arxiv_id,
+            collection_name="qa_old_collection",
+            status="indexed",
+            chunk_count=2,
+            embedding_model="old-model",
+        )
+        builder, *_services, vector_store_service = self._make_builder()
+        builder.build_qa_index(self.arxiv_id, loading_method="docling")
+        active = self.db_service.get_paper_qa_index(self.arxiv_id)
+
+        cleanup_result = builder.cleanup_pending_index_builds(self.arxiv_id)
+
+        deleted_collections = [
+            call["collection_name"]
+            for call in vector_store_service.calls
+            if call["method"] == "delete_collection"
+        ]
+        self.assertIn("qa_old_collection", deleted_collections)
+        self.assertNotIn(active["collection_name"], deleted_collections)
+        self.assertEqual(len(cleanup_result["failed"]), 0)
 
 
 class IndexJobManagerFlowTests(_BaseIndexTestCase):
@@ -573,6 +655,95 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
         self.assertEqual(latest["job_id"], first_job["job_id"])
         self.assertEqual(len(_NoopThread.instances), 1)
         self.assertTrue(_NoopThread.instances[0].started)
+
+    def test_submit_job_marks_stale_running_job_and_creates_new_job(self) -> None:
+        _NoopThread.instances = []
+        builder = _FakeJobBuilder()
+        manager = IndexJobManager(db_service=self.db_service, qa_index_builder=builder, timeout_seconds=10)
+        old_job = self.db_service.create_paper_index_job(self.arxiv_id, "docling")
+        old_heartbeat = (datetime.now(timezone.utc) - timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S")
+        self.db_service.update_paper_index_job(
+            old_job["job_id"],
+            status="running",
+            current_stage="build",
+            progress=40,
+            heartbeat_at=old_heartbeat,
+        )
+
+        with mock.patch.object(manager_module.threading, "Thread", _NoopThread):
+            new_job = manager.submit_job(self.arxiv_id, "docling")
+
+        stored_old = self.db_service.get_paper_index_job(old_job["job_id"])
+        self.assertEqual(stored_old["status"], "stale")
+        self.assertNotEqual(new_job["job_id"], old_job["job_id"])
+        self.assertEqual(new_job["previous_job_id"], old_job["job_id"])
+        self.assertEqual(new_job["recovery_action"], "marked_stale_and_created")
+        self.assertEqual(len(_NoopThread.instances), 1)
+
+    def test_submit_job_reuses_unexpired_running_job(self) -> None:
+        _NoopThread.instances = []
+        builder = _FakeJobBuilder()
+        manager = IndexJobManager(db_service=self.db_service, qa_index_builder=builder, timeout_seconds=300)
+        old_job = self.db_service.create_paper_index_job(self.arxiv_id, "docling")
+        self.db_service.update_paper_index_job(
+            old_job["job_id"],
+            status="running",
+            current_stage="build",
+            progress=40,
+        )
+
+        with mock.patch.object(manager_module.threading, "Thread", _NoopThread):
+            reused_job = manager.submit_job(self.arxiv_id, "docling")
+
+        self.assertEqual(reused_job["job_id"], old_job["job_id"])
+        self.assertEqual(reused_job["recovery_action"], "reused_active")
+        self.assertEqual(len(_NoopThread.instances), 0)
+
+    def test_submit_job_marks_stale_pending_job_and_creates_new_job(self) -> None:
+        _NoopThread.instances = []
+        builder = _FakeJobBuilder()
+        manager = IndexJobManager(db_service=self.db_service, qa_index_builder=builder, timeout_seconds=5)
+        old_job = self.db_service.create_paper_index_job(self.arxiv_id, "docling")
+        old_heartbeat = (datetime.now(timezone.utc) - timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S")
+        self.db_service.update_paper_index_job(old_job["job_id"], heartbeat_at=old_heartbeat)
+
+        with mock.patch.object(manager_module.threading, "Thread", _NoopThread):
+            new_job = manager.submit_job(self.arxiv_id, "docling")
+
+        stored_old = self.db_service.get_paper_index_job(old_job["job_id"])
+        self.assertEqual(stored_old["status"], "stale")
+        self.assertNotEqual(new_job["job_id"], old_job["job_id"])
+
+    def test_update_job_refreshes_heartbeat(self) -> None:
+        job = self.db_service.create_paper_index_job(self.arxiv_id, "docling")
+        old_heartbeat = (datetime.now(timezone.utc) - timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S")
+        self.db_service.update_paper_index_job(job["job_id"], heartbeat_at=old_heartbeat)
+
+        self.assertTrue(self.db_service.update_paper_index_job(job["job_id"], current_stage="build", progress=30))
+
+        stored = self.db_service.get_paper_index_job(job["job_id"])
+        self.assertNotEqual(stored["heartbeat_at"], old_heartbeat)
+
+    def test_polling_recovery_marks_stale_job_retryable(self) -> None:
+        job = self.db_service.create_paper_index_job(self.arxiv_id, "docling")
+        old_heartbeat = (datetime.now(timezone.utc) - timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S")
+        self.db_service.update_paper_index_job(
+            job["job_id"],
+            status="running",
+            current_stage="build",
+            heartbeat_at=old_heartbeat,
+        )
+
+        marked_count = self.db_service.mark_stale_paper_index_jobs(
+            arxiv_id=self.arxiv_id,
+            job_id=job["job_id"],
+            timeout_seconds=10,
+        )
+
+        stored = self.db_service.get_paper_index_job(job["job_id"])
+        self.assertEqual(marked_count, 1)
+        self.assertEqual(stored["status"], "stale")
+        self.assertIn("heartbeat timed out", stored["error_message"])
 
     def test_run_job_success_updates_job_status_and_latest_job(self) -> None:
         builder = _FakeJobBuilder(result={"status": "success"})
@@ -601,6 +772,31 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
         self.assertEqual(stored["status"], "failed")
         self.assertEqual(stored["current_stage"], "chunk_document")
         self.assertEqual(stored["error_message"], "builder failed")
+
+    def test_concurrent_submit_reuses_single_active_job(self) -> None:
+        _NoopThread.instances = []
+        builder = _FakeJobBuilder()
+        manager = IndexJobManager(db_service=self.db_service, qa_index_builder=builder, timeout_seconds=300)
+        results = []
+
+        def _submit_once() -> None:
+            results.append(manager.submit_job(self.arxiv_id, "docling"))
+
+        with mock.patch.object(manager, "run_job", lambda *_args, **_kwargs: None):
+            threads = [threading.Thread(target=_submit_once) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        job_ids = {item["job_id"] for item in results}
+        active_jobs = [
+            job
+            for job in self.db_service.list_paper_index_jobs(arxiv_id=self.arxiv_id, limit=10)
+            if job["status"] in {"pending", "running", "retrying"}
+        ]
+        self.assertEqual(len(job_ids), 1)
+        self.assertEqual(len(active_jobs), 1)
 
     def test_submit_job_with_inline_thread_reaches_terminal_state(self) -> None:
         builder = _FakeJobBuilder(result={"status": "success"})

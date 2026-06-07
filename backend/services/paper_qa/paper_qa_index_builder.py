@@ -20,11 +20,12 @@ from services.storage.vector_store_service import VectorDBConfig, VectorStoreSer
 
 logger = logging.getLogger(__name__)
 
-VECTOR_STORE_STAGES = {"index_embeddings_to_vector_store", "cleanup_old_artifacts"}
+VECTOR_STORE_STAGES = {"index_embeddings_to_vector_store", "validate_new_collection", "cleanup_old_artifacts"}
 DATABASE_WRITE_STAGES = {
+    "create_build_version",
     "mark_index_processing",
     "record_index_stage",
-    "mark_index_success",
+    "activate_index",
 }
 
 QA_INDEX_ARTIFACT_FIELDS = {
@@ -101,6 +102,20 @@ class PaperQAIndexBuilder:
         if not created:
             raise RuntimeError("Failed to mark QA index as processing")
 
+    def mark_build_processing(self, build_id: str, *, loading_method: str) -> None:
+        """把本次版本化构建标记为 building；active 指针保持不变，旧索引仍可服务问答。"""
+        updated = self.db_service.update_paper_qa_index_build(
+            build_id,
+            status="building",
+            loading_method=loading_method,
+            current_stage="mark_index_processing",
+            failed_stage="",
+            error_message="",
+            artifact_status="active",
+        )
+        if not updated:
+            raise RuntimeError("Failed to mark QA index build as processing")
+
     def _workspace_root(self) -> Path:
         return Path(__file__).resolve().parents[3]
 
@@ -129,7 +144,10 @@ class PaperQAIndexBuilder:
             raise
 
     def cleanup_qa_index_artifacts(self, arxiv_id: str, qa_index: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """清理指定论文上一轮 QA 索引留下的文件和 Milvus collection，用于重建或删除前的补偿。"""
+        """清理指定 QA 索引版本留下的文件和 Milvus collection。
+
+        该方法不再由重建主流程调用；调用方必须确保传入的不是当前 active 版本。
+        """
         existing = qa_index if qa_index is not None else self.db_service.get_paper_qa_index(arxiv_id)
         result = {"collection_deleted": False, "files_deleted": [], "files_missing": []}
         if not existing:
@@ -151,28 +169,51 @@ class PaperQAIndexBuilder:
                 result["files_missing"].append({"field": field_name, "path": artifact_path})
         return result
 
+    def cleanup_pending_index_builds(self, arxiv_id: str, *, limit: int = 5) -> Dict[str, Any]:
+        """延迟清理 cleanup_pending 版本；清理失败只进入结果，不影响 active 索引问答。"""
+        active = self.db_service.get_active_paper_qa_index_build(arxiv_id)
+        active_build_id = active.get("build_id") if active else None
+        candidates = self.db_service.list_paper_qa_index_builds(
+            arxiv_id,
+            statuses=["cleanup_pending", "orphaned", "build_failed"],
+            limit=limit,
+        )
+        result = {"cleaned": [], "failed": [], "skipped_active": []}
+        for build in candidates:
+            build_id = build.get("build_id")
+            if build_id == active_build_id:
+                # 防御性跳过：清理流程绝不能误删当前线上 collection。
+                result["skipped_active"].append(build_id)
+                continue
+            try:
+                cleanup_result = self.cleanup_qa_index_artifacts(arxiv_id, build)
+                marked = self.db_service.mark_paper_qa_index_build_deleted(build_id)
+                result["cleaned"].append({"build_id": build_id, "cleanup": cleanup_result, "marked_deleted": marked})
+            except Exception as exc:
+                logger.exception("Failed to cleanup QA index build: arxiv_id=%s build_id=%s", arxiv_id, build_id)
+                result["failed"].append({"build_id": build_id, "error": str(exc)})
+        return result
+
     def prepare_rebuild(self, arxiv_id: str, *, loading_method: str) -> None:
-        """重建前清理旧 artifact，避免本轮构建和上一轮残留数据混用。"""
+        """兼容旧调用的重建准备步骤。
+
+        主构建链路不再在这里删除旧索引；旧 active 必须保留到新版本激活成功之后，后续由清理流程处理。
+        """
         existing = self.db_service.get_paper_qa_index(arxiv_id)
         if existing:
             self.db_service.update_paper_qa_index(
                 arxiv_id,
-                status="processing",
                 loading_method=loading_method,
-                current_stage="cleanup_old_artifacts",
-                artifact_status="cleanup_in_progress",
+                current_stage="prepare_versioned_rebuild",
                 error_message="",
                 failed_stage="",
             )
-            cleanup_result = self.cleanup_qa_index_artifacts(arxiv_id, existing)
             self._log_stage(
-                "cleanup_old_artifacts",
+                "prepare_versioned_rebuild",
                 arxiv_id,
                 loading_method,
-                "old QA artifacts cleaned before rebuild",
-                collection_deleted=cleanup_result.get("collection_deleted"),
-                files_deleted=len(cleanup_result.get("files_deleted") or []),
-                files_missing=len(cleanup_result.get("files_missing") or []),
+                "old QA artifacts kept until new version is activated",
+                active_collection=existing.get("collection_name"),
             )
 
     def record_index_stage(
@@ -182,16 +223,26 @@ class PaperQAIndexBuilder:
         current_stage: str,
         loading_method: str,
         status: str = "processing",
+        build_id: Optional[str] = None,
         **artifacts: Any,
     ) -> None:
         # 每个关键阶段都同步数据库状态，避免进程在文件/向量库写入后崩溃却没有可追踪记录。
         payload = {
-            "status": status,
+            "status": "building" if status == "processing" else status,
             "current_stage": current_stage,
             "loading_method": loading_method,
             "artifact_status": "active",
         }
         payload.update({key: value for key, value in artifacts.items() if key in QA_INDEX_ARTIFACT_FIELDS})
+        if build_id:
+            updated = self.db_service.update_paper_qa_index_build(build_id, **payload)
+            if not updated:
+                raise AppError(
+                    ErrorCode.DATABASE_WRITE_FAILED,
+                    detail=f"Failed to record QA index build stage: {current_stage}",
+                    context={"arxiv_id": arxiv_id, "stage": current_stage, "build_id": build_id},
+                )
+            return
         updated = self.db_service.update_paper_qa_index(arxiv_id, **payload)
         if not updated:
             inserted = self.db_service.insert_paper_qa_index(arxiv_id, **payload)
@@ -462,9 +513,11 @@ class PaperQAIndexBuilder:
         page_map: List[Dict[str, Any]],
         document: Dict[str, Any],
         chunking_strategy: str,
+        index_version: Optional[str] = None,
     ) -> str:
+        filename = f"{arxiv_id}_{index_version}.pdf" if index_version else f"{arxiv_id}.pdf"
         chunk_file = loading_service.save_document(
-            filename=f"{arxiv_id}.pdf",
+            filename=filename,
             chunks=chunks,
             metadata={"total_pages": len(page_map)},
             loading_method=loading_method,
@@ -487,6 +540,7 @@ class PaperQAIndexBuilder:
         self,
         arxiv_id: str,
         chunks: List[Dict[str, Any]],
+        index_version: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], EmbeddingConfig]:
         embedding_config = self.get_embedding_config()
         logger.info(
@@ -495,9 +549,10 @@ class PaperQAIndexBuilder:
             embedding_config.model_name,
         )
 
+        filename = f"{arxiv_id}_{index_version}.pdf" if index_version else f"{arxiv_id}.pdf"
         input_data = {
             "chunks": chunks,
-            "metadata": {"filename": f"{arxiv_id}.pdf"},
+            "metadata": {"filename": filename},
         }
         embeddings, _ = self.embedding_service.create_embeddings(input_data, embedding_config)
 
@@ -511,8 +566,9 @@ class PaperQAIndexBuilder:
         )
         return embeddings, embedding_config
 
-    def save_embeddings(self, arxiv_id: str, embeddings: List[Dict[str, Any]]) -> str:
-        embedding_file = self.embedding_service.save_embeddings(f"{arxiv_id}.pdf", embeddings)
+    def save_embeddings(self, arxiv_id: str, embeddings: List[Dict[str, Any]], index_version: Optional[str] = None) -> str:
+        filename = f"{arxiv_id}_{index_version}.pdf" if index_version else f"{arxiv_id}.pdf"
+        embedding_file = self.embedding_service.save_embeddings(filename, embeddings)
         logger.info("Embeddings saved to: %s", embedding_file)
         return embedding_file
 
@@ -523,10 +579,22 @@ class PaperQAIndexBuilder:
         logger.info("Index created in collection: %s", collection_name)
         return index_result
 
+    def validate_new_collection(self, collection_name: str, expected_count: int) -> None:
+        """激活前校验新 collection 至少存在；校验失败时旧 active 仍不会被切走。"""
+        normalized_collection = str(collection_name or "").strip()
+        if not normalized_collection:
+            raise RuntimeError("Vector store returned empty collection_name")
+        checker = getattr(self.vector_store_service, "collection_exists", None)
+        if callable(checker) and not checker("milvus", normalized_collection):
+            raise RuntimeError(f"New QA index collection does not exist: {normalized_collection}")
+        if expected_count <= 0:
+            raise RuntimeError("New QA index has no chunks to activate")
+
     def mark_index_success(
         self,
         arxiv_id: str,
         *,
+        build_id: Optional[str] = None,
         collection_name: str,
         chunk_count: int,
         embedding_model: str,
@@ -536,6 +604,28 @@ class PaperQAIndexBuilder:
         loading_method: str,
         chunking_strategy: str,
     ) -> bool:
+        if build_id:
+            indexed_at = datetime.now().isoformat(timespec="seconds")
+            updated = self.db_service.update_paper_qa_index_build(
+                build_id,
+                collection_name=collection_name,
+                status="build_success",
+                chunk_count=chunk_count,
+                embedding_model=embedding_model,
+                pdf_path=pdf_path,
+                chunk_file=chunk_file,
+                embedding_file=embedding_file,
+                loading_method=loading_method,
+                chunking_strategy=chunking_strategy,
+                current_stage="activate_index",
+                failed_stage="",
+                error_message="",
+                artifact_status="active",
+                indexed_at=indexed_at,
+            )
+            if not updated:
+                return False
+            return self.db_service.activate_paper_qa_index_build(build_id)
         return self.db_service.update_paper_qa_index(
             arxiv_id,
             collection_name=collection_name,
@@ -561,18 +651,31 @@ class PaperQAIndexBuilder:
         failed_stage: str,
         error_message: str,
         loading_method: str,
+        build_id: Optional[str] = None,
         **artifacts: Any,
     ) -> bool:
         # 失败记录承担补偿线索职责：即使流程没完成，也要知道哪些文件或 collection 已经生成。
         payload = {
-            "status": "failed",
+            "status": "build_failed" if build_id else "failed",
             "current_stage": failed_stage,
             "failed_stage": failed_stage,
             "error_message": str(error_message or "")[:2000],
             "loading_method": loading_method,
-            "artifact_status": "active",
+            # 构建失败产生的新 artifact 不能成为 active，只能等待后续清理。
+            "artifact_status": "cleanup_pending" if artifacts.get("collection_name") or artifacts.get("embedding_file") else "active",
         }
         payload.update({key: value for key, value in artifacts.items() if key in QA_INDEX_ARTIFACT_FIELDS})
+        if build_id:
+            updated = self.db_service.update_paper_qa_index_build(build_id, **payload)
+            if not updated:
+                logger.error(
+                    "Failed to persist QA index build failure record: arxiv_id=%s build_id=%s stage=%s collection_name=%s",
+                    arxiv_id,
+                    build_id,
+                    failed_stage,
+                    artifacts.get("collection_name"),
+                )
+            return updated
         updated = self.db_service.update_paper_qa_index(arxiv_id, **payload)
         if not updated:
             updated = self.db_service.insert_paper_qa_index(arxiv_id, **payload)
@@ -596,6 +699,8 @@ class PaperQAIndexBuilder:
         current_stage = "validate_loading_method"
         artifact_state: Dict[str, Any] = {}
         effective_loading_method = requested_loading_method
+        build_id: Optional[str] = None
+        index_version: Optional[str] = None
         try:
             self._notify_progress(
                 progress_callback,
@@ -607,14 +712,26 @@ class PaperQAIndexBuilder:
             effective_loading_method = loading_method
             self._log_stage("validate_loading_method", arxiv_id, loading_method, "loading method validated")
 
-            current_stage = "cleanup_old_artifacts"
+            current_stage = "create_build_version"
             self._notify_progress(
                 progress_callback,
-                current_stage="cleanup_old_artifacts",
+                current_stage="create_build_version",
                 progress=8,
-                message="Cleaning old QA index artifacts",
+                message="Creating QA index build version",
             )
-            self.prepare_rebuild(arxiv_id, loading_method=loading_method)
+            build = self.db_service.create_paper_qa_index_build(arxiv_id, loading_method)
+            if not build:
+                raise RuntimeError("Failed to create QA index build version")
+            build_id = str(build.get("build_id") or "")
+            index_version = str(build.get("index_version") or "")
+            self._log_stage(
+                "create_build_version",
+                arxiv_id,
+                loading_method,
+                "new QA index build version created",
+                build_id=build_id,
+                index_version=index_version,
+            )
 
             current_stage = "mark_index_processing"
             self._notify_progress(
@@ -623,8 +740,8 @@ class PaperQAIndexBuilder:
                 progress=10,
                 message="Marking QA index as processing",
             )
-            self.mark_index_processing(arxiv_id, loading_method=loading_method)
-            self._log_stage("mark_index_processing", arxiv_id, loading_method, "paper QA index marked as processing")
+            self.mark_build_processing(build_id, loading_method=loading_method)
+            self._log_stage("mark_index_processing", arxiv_id, loading_method, "paper QA index build marked as processing")
 
             current_stage = "load_paper_metadata"
             self._notify_progress(
@@ -633,7 +750,7 @@ class PaperQAIndexBuilder:
                 progress=15,
                 message="Loading paper metadata",
             )
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, **artifact_state)
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
             paper = self.load_paper_metadata(arxiv_id)
             self._log_stage(
                 "load_paper_metadata",
@@ -652,10 +769,10 @@ class PaperQAIndexBuilder:
                 progress=25,
                 message="Downloading PDF",
             )
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, **artifact_state)
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
             pdf_path = self.download_pdf(arxiv_id)
             artifact_state["pdf_path"] = pdf_path
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, **artifact_state)
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
             self._log_stage("download_pdf", arxiv_id, loading_method, "pdf downloaded", pdf_path=pdf_path)
 
             current_stage = "load_pdf_document"
@@ -665,7 +782,7 @@ class PaperQAIndexBuilder:
                 progress=35,
                 message="Loading PDF document",
             )
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, **artifact_state)
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
             loading_service, document, page_map = self.load_pdf_document(pdf_path, loading_method)
             self._log_stage(
                 "load_pdf_document",
@@ -682,12 +799,12 @@ class PaperQAIndexBuilder:
                 progress=45,
                 message="Chunking document",
             )
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, **artifact_state)
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
             chunked_data, chunking_strategy = self.chunk_document(arxiv_id, loading_method, document, page_map)
             chunks = chunked_data["chunks"]
             artifact_state["chunking_strategy"] = chunking_strategy
             artifact_state["chunk_count"] = len(chunks)
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, **artifact_state)
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
             self._log_stage(
                 "chunk_document",
                 arxiv_id,
@@ -704,7 +821,7 @@ class PaperQAIndexBuilder:
                 progress=55,
                 message="Saving chunk file",
             )
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, **artifact_state)
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
             chunk_file = self.save_chunk_file(
                 loading_service=loading_service,
                 arxiv_id=arxiv_id,
@@ -713,9 +830,10 @@ class PaperQAIndexBuilder:
                 page_map=page_map,
                 document=document,
                 chunking_strategy=chunking_strategy,
+                index_version=index_version,
             )
             artifact_state["chunk_file"] = chunk_file
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, **artifact_state)
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
             self._log_stage("save_chunk_file", arxiv_id, loading_method, "chunk file saved", chunk_file=chunk_file)
 
             current_stage = "compress_chunks_for_rerank"
@@ -725,7 +843,7 @@ class PaperQAIndexBuilder:
                 progress=65,
                 message="Compressing chunk text for rerank",
             )
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, **artifact_state)
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
             chunks = self.compress_chunks_for_rerank(chunks)
             self._log_stage("compress_chunks_for_rerank", arxiv_id, loading_method, "chunk text compressed", chunk_count=len(chunks))
 
@@ -736,10 +854,10 @@ class PaperQAIndexBuilder:
                 progress=78,
                 message="Creating chunk embeddings",
             )
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, **artifact_state)
-            embeddings, embedding_config = self.create_chunk_embeddings(arxiv_id, chunks)
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
+            embeddings, embedding_config = self.create_chunk_embeddings(arxiv_id, chunks, index_version=index_version)
             artifact_state["embedding_model"] = embedding_config.model_name
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, **artifact_state)
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
             self._log_stage(
                 "create_chunk_embeddings",
                 arxiv_id,
@@ -757,10 +875,10 @@ class PaperQAIndexBuilder:
                 progress=88,
                 message="Saving embeddings",
             )
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, **artifact_state)
-            embedding_file = self.save_embeddings(arxiv_id, embeddings)
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
+            embedding_file = self.save_embeddings(arxiv_id, embeddings, index_version=index_version)
             artifact_state["embedding_file"] = embedding_file
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, **artifact_state)
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
             self._log_stage("save_embeddings", arxiv_id, loading_method, "embedding file saved", embedding_file=embedding_file)
 
             current_stage = "index_embeddings_to_vector_store"
@@ -770,11 +888,11 @@ class PaperQAIndexBuilder:
                 progress=95,
                 message="Indexing embeddings to vector store",
             )
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, **artifact_state)
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
             index_result = self.index_embeddings_to_vector_store(embedding_file)
             collection_name = index_result.get("collection_name", "")
             artifact_state["collection_name"] = collection_name
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, **artifact_state)
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
             self._log_stage(
                 "index_embeddings_to_vector_store",
                 arxiv_id,
@@ -783,16 +901,27 @@ class PaperQAIndexBuilder:
                 collection_name=collection_name,
             )
 
-            current_stage = "mark_index_success"
+            current_stage = "validate_new_collection"
             self._notify_progress(
                 progress_callback,
-                current_stage="mark_index_success",
-                progress=100,
-                message="Marking QA index as success",
+                current_stage="validate_new_collection",
+                progress=98,
+                message="Validating new QA index collection",
             )
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, **artifact_state)
+            self.validate_new_collection(collection_name, len(chunks))
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
+
+            current_stage = "activate_index"
+            self._notify_progress(
+                progress_callback,
+                current_stage="activate_index",
+                progress=100,
+                message="Activating QA index version",
+            )
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
             success_marked = self.mark_index_success(
                 arxiv_id,
+                build_id=build_id,
                 collection_name=collection_name,
                 chunk_count=len(chunks),
                 embedding_model=embedding_config.model_name,
@@ -803,8 +932,16 @@ class PaperQAIndexBuilder:
                 chunking_strategy=chunking_strategy,
             )
             if not success_marked:
-                # Milvus 已经写入时，最终成功状态必须落库；否则下一次重试需要依赖 collection_name 做补偿清理。
-                raise RuntimeError("Milvus collection was created, but SQLite failed to mark QA index as indexed")
+                # 新 collection 已经生成但未能激活时，不能覆盖旧 active，只把新版本留给后续清理。
+                self.db_service.update_paper_qa_index_build(
+                    build_id,
+                    status="orphaned",
+                    current_stage="activate_index",
+                    failed_stage="activate_index",
+                    error_message="SQLite failed to atomically activate QA index build",
+                    artifact_status="cleanup_pending",
+                )
+                raise RuntimeError("Milvus collection was created, but SQLite failed to activate QA index build")
             self._log_stage(
                 "mark_index_success",
                 arxiv_id,
@@ -824,6 +961,8 @@ class PaperQAIndexBuilder:
                 "collection_name": collection_name,
                 "chunk_count": len(chunks),
                 "embedding_model": embedding_config.model_name,
+                "index_version": index_version,
+                "build_id": build_id,
                 "chunk_file": chunk_file,
             }
         except AppError as exc:
@@ -846,6 +985,7 @@ class PaperQAIndexBuilder:
                 failed_stage=str(exc.context.get("stage") or current_stage),
                 error_message=f"{exc.code}: {exc.detail or exc.message}",
                 loading_method=effective_loading_method,
+                build_id=build_id,
                 **artifact_state,
             )
             raise
@@ -869,6 +1009,7 @@ class PaperQAIndexBuilder:
                 failed_stage=current_stage,
                 error_message=detail,
                 loading_method=effective_loading_method,
+                build_id=build_id,
                 **artifact_state,
             )
             error_code = self._error_code_for_stage(current_stage)
@@ -897,6 +1038,7 @@ class PaperQAIndexBuilder:
                 failed_stage=current_stage,
                 error_message=detail,
                 loading_method=effective_loading_method,
+                build_id=build_id,
                 **artifact_state,
             )
             error_code = self._error_code_for_stage(current_stage)

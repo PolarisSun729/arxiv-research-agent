@@ -93,11 +93,16 @@ def _load_stage1_modules():
     if "services.storage.database_service" not in sys.modules:
         database_service_module = types.ModuleType("services.storage.database_service")
 
+        class _PaperQATurnPersistenceError(RuntimeError):
+            pass
+
         class _DatabaseService:
             def get_user_research_profile(self, **_kwargs):
                 return {}
 
         database_service_module.DatabaseService = _DatabaseService
+        # 测试桩需要保留真实模块的异常导出，避免污染后续 pytest 收集到的数据库服务接口。
+        database_service_module.PaperQATurnPersistenceError = _PaperQATurnPersistenceError
         sys.modules["services.storage.database_service"] = database_service_module
 
     config_module = sys.modules.get("utils.config", types.ModuleType("utils.config"))

@@ -34,11 +34,12 @@ from dependencies import (
 )
 from core.errors import AppError, ErrorCode, error_response
 from routers.qa_utils import build_qa_diagnostic, get_latest_retrieval_trace, sanitize_trace_slug
-from utils.config import get_default_user_id
+from utils.config import get_default_user_id, get_qa_index_job_runtime_config
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/paper/{arxiv_id}", tags=["paper-qa"])
+QA_INDEX_JOB_RETRYABLE_STATUSES = {"failed", "stale", "cancelled"}
 
 
 class QaRequest(BaseModel):
@@ -136,6 +137,8 @@ def _serialize_qa_index_job(job: Optional[dict]) -> Optional[dict]:
     """序列化 QA 索引构建任务信息。"""
     if not job:
         return None
+    normalized_status = str(job.get("status") or "").strip().lower()
+    timeout_seconds = int(get_qa_index_job_runtime_config().get("timeout_seconds") or 0)
     return {
         "job_id": job.get("job_id"),
         "arxiv_id": job.get("arxiv_id"),
@@ -144,9 +147,24 @@ def _serialize_qa_index_job(job: Optional[dict]) -> Optional[dict]:
         "progress": job.get("progress"),
         "error_message": job.get("error_message"),
         "loading_method": job.get("loading_method"),
+        "retryable": normalized_status in QA_INDEX_JOB_RETRYABLE_STATUSES,
+        "stale": normalized_status == "stale",
+        "heartbeat_at": job.get("heartbeat_at"),
+        "timeout_seconds": timeout_seconds,
+        "previous_job_id": job.get("previous_job_id"),
+        "recovery_action": job.get("recovery_action"),
         "created_at": job.get("created_at"),
         "updated_at": job.get("updated_at"),
     }
+
+
+def _recover_stale_qa_index_jobs(db_service: Any, *, arxiv_id: str, job_id: Optional[str] = None) -> None:
+    """查询前轻量执行 stale 自愈，避免前端轮询时长期看到不可恢复的 pending/running。"""
+    marker = getattr(db_service, "mark_stale_paper_index_jobs", None)
+    if not callable(marker):
+        return
+    timeout_seconds = int(get_qa_index_job_runtime_config().get("timeout_seconds") or 1800)
+    marker(arxiv_id=arxiv_id, job_id=job_id, timeout_seconds=timeout_seconds)
 
 
 def _serialize_paper_note(note: Optional[dict], db_service=None) -> Optional[dict]:
@@ -313,14 +331,23 @@ async def create_paper_qa_index(
 
         # 异步模式更适合生产环境，避免请求长时间阻塞。
         job = index_job_manager.submit_job(arxiv_id, loading_method)
+        normalized_job_status = str(job.get("status") or "pending").strip().lower()
+        timeout_seconds = getattr(index_job_manager, "timeout_seconds", None)
+        # 兼容旧响应字段，同时附加可重试和恢复信息，前端无需改变轮询方式即可展示失败原因。
         return {
             "status": "submitted",
             "job_id": job.get("job_id"),
             "arxiv_id": job.get("arxiv_id") or arxiv_id,
-            "job_status": job.get("status") or "pending",
+            "job_status": normalized_job_status or "pending",
             "current_stage": job.get("current_stage") or "pending",
             "progress": job.get("progress") if job.get("progress") is not None else 0,
             "message": "QA index job submitted",
+            "retryable": normalized_job_status in QA_INDEX_JOB_RETRYABLE_STATUSES,
+            "stale": normalized_job_status == "stale",
+            "heartbeat_at": job.get("heartbeat_at"),
+            "timeout_seconds": timeout_seconds,
+            "previous_job_id": job.get("previous_job_id"),
+            "recovery_action": job.get("recovery_action"),
         }
     except AppError as exc:
         logger.warning(
@@ -352,6 +379,7 @@ async def get_latest_paper_qa_index_job(
 ):
     """获取指定论文最近一次 QA 索引任务。"""
     try:
+        _recover_stale_qa_index_jobs(db_service, arxiv_id=arxiv_id)
         job = db_service.get_latest_paper_index_job(arxiv_id)
         if not job:
             raise HTTPException(status_code=404, detail="QA index job not found")
@@ -371,6 +399,7 @@ async def get_paper_qa_index_job(
 ):
     """按任务 ID 获取某次 QA 索引构建任务详情。"""
     try:
+        _recover_stale_qa_index_jobs(db_service, arxiv_id=arxiv_id, job_id=job_id)
         job = db_service.get_paper_index_job(job_id)
         if not job or job.get("arxiv_id") != arxiv_id:
             raise HTTPException(status_code=404, detail="QA index job not found")

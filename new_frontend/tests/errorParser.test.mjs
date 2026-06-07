@@ -41,7 +41,7 @@ const axiosLike = normalizeApiError({
 })
 
 assert.equal(axiosLike.code, 'database_write_failed')
-assert.equal(axiosLike.message, '保存失败，请稍后重试。')
+assert.equal(axiosLike.message, '答案保存失败。')
 
 const detailWrapped = normalizeApiError({
   detail: {

@@ -1,4 +1,4 @@
-import { ref, type Ref } from 'vue'
+import { ref, watch, type Ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { runAgentChat, streamAgentChat } from '@/api/agent'
 import { getErrorMessage } from '@/api/errors'
@@ -6,6 +6,7 @@ import type { AgentPaper, AgentStep, AgentStreamEvent, AgentToolCall, ArxivSearc
 import type { AgentChatMessage } from '@/types/agentChat'
 import type { UserResearchProfile } from '@/types/paper'
 import { usePaperStore } from '@/stores/paperStore'
+import { useUserContext } from '@/composables/useUserContext'
 
 type ResumeDecision = 'approve' | 'reject'
 const RESUME_CHECKPOINT_NOT_FOUND_CODE = 'resume_checkpoint_not_found'
@@ -299,6 +300,7 @@ function buildFallbackErrorResponse(message: string, detail: string) {
 
 export function useAgentSearchChat() {
   const paperStore = usePaperStore()
+  const userContext = useUserContext()
   const inputMessage = ref('')
   const loading = ref(false)
   const messages: Ref<AgentChatMessage<ArxivSearchResponse>[]> = ref([])
@@ -308,6 +310,15 @@ export function useAgentSearchChat() {
   const selectedPaper = ref<AgentPaper | null>(null)
   const paperQaResult = ref<Record<string, any> | null>(null)
   const activeSessionId = ref<string | null>(null)
+  const activeSessionUserId = ref<string | null>(null)
+
+  function getUserId() {
+    return userContext.getUserId()
+  }
+
+  function getActiveSessionId(userId: string) {
+    return activeSessionUserId.value === userId ? activeSessionId.value : null
+  }
 
   function setInputMessage(value: string) {
     inputMessage.value = value
@@ -321,6 +332,7 @@ export function useAgentSearchChat() {
     selectedPaper.value = null
     paperQaResult.value = null
     activeSessionId.value = null
+    activeSessionUserId.value = null
     inputMessage.value = ''
   }
 
@@ -382,8 +394,14 @@ export function useAgentSearchChat() {
     const sessionId = typeof response?.session_id === 'string' ? response.session_id.trim() : ''
     if (sessionId) {
       activeSessionId.value = sessionId
+      activeSessionUserId.value = getUserId()
     }
   }
+
+  watch(() => getUserId(), () => {
+    // Agent 的 pending_action/resume 与后端 checkpoint 绑定用户，切换用户时必须清空现场。
+    clearConversation()
+  })
 
   async function submitMessage(
     rawMessage?: string,
@@ -394,12 +412,13 @@ export function useAgentSearchChat() {
     const message = (rawMessage ?? inputMessage.value).trim()
     if (!message || loading.value) return
 
-    const userId = createMessageId('user')
+    const effectiveUserId = getUserId()
+    const userMessageId = createMessageId('user')
     const assistantId = createMessageId('assistant')
     const createdAt = new Date().toISOString()
 
     const userMessage: AgentChatMessage<ArxivSearchResponse> = {
-      id: userId,
+      id: userMessageId,
       role: 'user',
       content: message,
       loading: false,
@@ -467,8 +486,8 @@ export function useAgentSearchChat() {
       const response = await streamAgentChat(
         {
           message,
-          user_id: 'local_user',
-          session_id: activeSessionId.value,
+          user_id: effectiveUserId,
+          session_id: getActiveSessionId(effectiveUserId),
           ...(options?.resume ? { resume: options.resume } : {}),
           context: Object.keys(requestContext).length ? requestContext : undefined
         },
@@ -516,8 +535,8 @@ export function useAgentSearchChat() {
       try {
         const fallbackResponse = await runAgentChat({
           message,
-          user_id: 'local_user',
-          session_id: activeSessionId.value,
+          user_id: effectiveUserId,
+          session_id: getActiveSessionId(effectiveUserId),
           ...(options?.resume ? { resume: options.resume } : {}),
           context: Object.keys(requestContext).length ? requestContext : undefined
         })

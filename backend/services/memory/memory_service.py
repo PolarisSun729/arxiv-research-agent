@@ -238,12 +238,21 @@ class MemoryService:
         answer_summary = str(turn.get("answer_summary") or "").strip().lower()
         return f"qa:{question}|{answer_summary}"
 
-    def _messages_to_conversation_context(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """把消息级聊天记录重组为按轮次组织的对话上下文。"""
+    def _messages_to_conversation_context_with_debug(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+        """把消息级聊天记录重组为完整对话轮次，并统计被过滤的异常旧数据。"""
         turns_by_id: Dict[str, Dict[str, Any]] = {}
+        turn_role_counts: Dict[str, Dict[str, int]] = {}
         ordered_turn_ids: List[str] = []
         derived_turns: List[Dict[str, Any]] = []
         current_unpaired_turn: Optional[Dict[str, Any]] = None
+        debug = {
+            "filtered_incomplete_turn_count": 0,
+            "invalid_turn_count": 0,
+            "filtered_turn_count": 0,
+        }
 
         def _new_turn(seed: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             base = {
@@ -257,10 +266,15 @@ class MemoryService:
                 base.update(seed)
             return base
 
-        def _append_if_meaningful(candidate: Optional[Dict[str, Any]]) -> None:
+        def _append_if_complete(candidate: Optional[Dict[str, Any]]) -> None:
             normalized_candidate = self._normalize_conversation_turn_payload(candidate)
-            if normalized_candidate:
+            if normalized_candidate and normalized_candidate.get("question") and normalized_candidate.get("answer_summary"):
                 derived_turns.append(normalized_candidate)
+                return
+            if normalized_candidate:
+                # 没有 turn_id 的旧消息只能按相邻 user/assistant 配对；缺任一侧时不能进入问题改写上下文。
+                debug["filtered_incomplete_turn_count"] += 1
+                debug["filtered_turn_count"] += 1
 
         for message in messages:
             if not isinstance(message, dict):
@@ -275,47 +289,72 @@ class MemoryService:
 
             if turn_id:
                 if turn_id not in turns_by_id:
-                    # 显式 turn_id 表示上下游已经完成轮次配对，这里优先按 turn_id 聚合。
+                    # 显式 turn_id 是完整轮次的边界，聚合后再校验角色数量，兼容历史半轮脏数据。
                     turns_by_id[turn_id] = _new_turn({"turn_id": turn_id, "created_at": created_at})
+                    turn_role_counts[turn_id] = {"user": 0, "assistant": 0}
                     ordered_turn_ids.append(turn_id)
                 current_turn = turns_by_id[turn_id]
                 if created_at and not current_turn.get("created_at"):
                     current_turn["created_at"] = created_at
-                if role == "user" and content and not current_turn.get("question"):
-                    current_turn["question"] = content
+                if role == "user":
+                    turn_role_counts[turn_id]["user"] += 1
+                    if content and not current_turn.get("question"):
+                        current_turn["question"] = content
                 elif role == "assistant":
+                    turn_role_counts[turn_id]["assistant"] += 1
                     if content and not current_turn.get("answer_summary"):
                         current_turn["answer_summary"] = content
-                    if sources:
+                    if sources and not current_turn.get("sources"):
                         current_turn["sources"] = sources
                 continue
 
             if role == "user":
-                # 没有 turn_id 时，遇到新的 user 消息就开启一轮临时配对。
-                _append_if_meaningful(current_unpaired_turn)
+                # 没有 turn_id 时只能做相邻配对；前一轮没等到 assistant 就必须过滤，避免半轮污染追问。
+                _append_if_complete(current_unpaired_turn)
                 current_unpaired_turn = _new_turn({"created_at": created_at, "question": content})
                 continue
 
             if role == "assistant":
                 if current_unpaired_turn is None:
-                    # 极端情况下先收到 assistant 消息，也要兜底生成一轮，避免信息丢失。
-                    current_unpaired_turn = _new_turn({"created_at": created_at})
+                    debug["filtered_incomplete_turn_count"] += 1
+                    debug["filtered_turn_count"] += 1
+                    continue
                 if content and not current_unpaired_turn.get("answer_summary"):
                     current_unpaired_turn["answer_summary"] = content
                 if sources:
                     current_unpaired_turn["sources"] = sources
-                _append_if_meaningful(current_unpaired_turn)
+                _append_if_complete(current_unpaired_turn)
                 current_unpaired_turn = None
 
-        _append_if_meaningful(current_unpaired_turn)
+        _append_if_complete(current_unpaired_turn)
 
-        ordered_turns = [turns_by_id[item] for item in ordered_turn_ids]
+        ordered_turns: List[Dict[str, Any]] = []
+        for item in ordered_turn_ids:
+            role_counts = turn_role_counts.get(item, {})
+            turn = turns_by_id[item]
+            if role_counts.get("user", 0) != 1 or role_counts.get("assistant", 0) != 1:
+                if role_counts.get("user", 0) > 1 or role_counts.get("assistant", 0) > 1:
+                    debug["invalid_turn_count"] += 1
+                else:
+                    debug["filtered_incomplete_turn_count"] += 1
+                debug["filtered_turn_count"] += 1
+                continue
+            if not turn.get("question") or not turn.get("answer_summary"):
+                debug["filtered_incomplete_turn_count"] += 1
+                debug["filtered_turn_count"] += 1
+                continue
+            ordered_turns.append(turn)
         normalized_turns = [
             normalized_turn
             for normalized_turn in (self._normalize_conversation_turn_payload(turn) for turn in ordered_turns + derived_turns)
             if normalized_turn
         ]
-        return normalized_turns
+        return normalized_turns, debug
+
+    def _messages_to_conversation_context(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把消息级聊天记录重组为按轮次组织的对话上下文。"""
+        turns, _debug = self._messages_to_conversation_context_with_debug(messages)
+        return turns
 
     def load_paper_conversation_context(
         self,
@@ -350,12 +389,18 @@ class MemoryService:
 
         messages: List[Dict[str, Any]] = []
         turns: List[Dict[str, Any]] = []
+        filter_debug = {
+            "filtered_incomplete_turn_count": 0,
+            "invalid_turn_count": 0,
+            "filtered_turn_count": 0,
+        }
         if selected_session:
             messages = self.db_service.list_paper_chat_messages(
                 selected_session["session_id"],
                 user_id=resolved_user_id,
             )
-            turns = self._messages_to_conversation_context(messages)[-message_limit:]
+            all_turns, filter_debug = self._messages_to_conversation_context_with_debug(messages)
+            turns = all_turns[-message_limit:]
 
         return {
             "user_id": resolved_user_id,
@@ -366,6 +411,10 @@ class MemoryService:
             "turns": turns,
             "turn_count": len(turns),
             "message_count": len(messages),
+            "filtered_incomplete_turn_count": filter_debug["filtered_incomplete_turn_count"],
+            "invalid_turn_count": filter_debug["invalid_turn_count"],
+            "filtered_turn_count": filter_debug["filtered_turn_count"],
+            "memory_filter_debug": filter_debug,
         }
 
     def merge_conversation_context(

@@ -2,6 +2,18 @@ import type { RetrievalDebug } from '@/api/papers'
 import type { AgentChatMessage } from '@/types/agentChat'
 
 export type RagChatRole = 'user' | 'assistant'
+export type QaTurnStatus =
+  | 'idle'
+  | 'preparing'
+  | 'streaming'
+  | 'completed'
+  | 'interrupted'
+  | 'aborted'
+  | 'partial'
+  | 'failed'
+  | 'persistence_failed'
+
+export type QaPersistenceStatus = 'unknown' | 'saved' | 'failed' | 'not_saved'
 
 export interface RagChatSource {
   content: string
@@ -24,6 +36,12 @@ export interface QaTurnForRagChat {
   retrievalDebug?: RetrievalDebug | null
   createdAt: string
   streaming?: boolean
+  status?: QaTurnStatus
+  error?: string | null
+  partial?: boolean
+  completedAt?: string | null
+  interruptedReason?: string | null
+  persistenceStatus?: QaPersistenceStatus
   originalQuestion?: string
   contextualizedQuestion?: string
   usedShortTermMemory?: boolean
@@ -60,7 +78,7 @@ export function qaTurnToRagMessages(turn: QaTurnForRagChat): RagChatMessage[] {
     loading: Boolean(turn.streaming),
     createdAt: turn.createdAt,
     response: turn,
-    error: null,
+    error: turn.error ?? null,
     sources: turn.sources,
     retrievalDebug: turn.retrievalDebug ?? null
   }

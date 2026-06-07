@@ -134,6 +134,53 @@ Vite dev server 会将 `/api` 请求代理到 `http://127.0.0.1:8001`。
 - `/api` 请求能够转发到 FastAPI 后端
 - 搜索页面能够发起后端请求
 
+### 4.7 一键质量检查
+
+修改代码后，推荐在仓库根目录运行统一质量门禁：
+
+```bash
+python scripts/check_quality.py
+```
+
+默认会按顺序执行 basic doctor、后端静态检查、后端测试、后端启动烟测、前端测试和前端构建，并在最后汇总每个阶段的 `PASS` / `FAIL`、耗时和失败复现命令。basic doctor 只检查本地环境，不访问真实外部服务；后端静态检查会覆盖 Python 编译、关键模块 import smoke 和可选低误伤 ruff 规则。默认检查只编排离线安全命令，不主动执行 arXiv 同步、真实 PDF 下载、真实 LLM / Embedding / rerank 调用或 Milvus 写入。
+
+常用分阶段入口：
+
+```bash
+python scripts/check_quality.py backend
+python scripts/check_quality.py frontend
+python scripts/check_quality.py static
+python scripts/check_quality.py smoke
+```
+
+更多说明见 [`docs/quality_gate.md`](docs/quality_gate.md)。
+
+CI 使用同一个入口的 `ci` 目标：
+
+```bash
+python scripts/check_quality.py ci
+```
+
+该目标与默认入口一样会运行 basic doctor 和后端 lazy 启动烟测。GitHub Actions 配置见 `.github/workflows/quality-gate.yml`，说明见 [`docs/ci_quality_gate.md`](docs/ci_quality_gate.md)。
+
+Codex 修改代码后的验收口径见 [`docs/codex_acceptance.md`](docs/codex_acceptance.md)：每次完成修改后需要说明实际运行的检查、通过/失败结果、失败是否与本次修改相关；无法运行完整门禁时必须说明原因。
+
+### 4.8 环境体检
+
+如果要检查当前机器是否具备真实运行条件，使用 doctor：
+
+```bash
+python scripts/doctor.py
+```
+
+默认 `basic` 模式只检查本地环境、本地依赖、配置加载、目录和 SQLite 临时写入，不真实调用外部服务。真实连接检查需要显式运行：
+
+```bash
+python scripts/doctor.py full
+```
+
+涉及可能计费的 Embedding / LLM / rerank 最小请求默认跳过；确认允许真实调用时再加 `--check-paid`。更多说明见 [`docs/doctor.md`](docs/doctor.md)。
+
 ---
 
 ## 5. 后端加载模式

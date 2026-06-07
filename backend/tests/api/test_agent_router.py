@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from fastapi import FastAPI
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from fastapi.responses import StreamingResponse
 from pydantic_core import PydanticUndefined
@@ -102,6 +103,18 @@ class AgentRouterApiTests(unittest.TestCase):
         self.assertIn("mermaid", payload)
         self.assertIn("node_names", payload)
         mocked.assert_called_once()
+
+    def test_chat_endpoint_maps_service_http_exception(self) -> None:
+        with mock.patch.object(agent_router, "run_arxiv_search_agent", side_effect=HTTPException(status_code=409, detail="confirmation required")):
+            response = self.client.post("/api/agent/chat", json={"user_id": "u1", "message": "approve this"})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"], "confirmation required")
+
+    def test_chat_endpoint_rejects_missing_message(self) -> None:
+        response = self.client.post("/api/agent/chat", json={"user_id": "u1"})
+
+        self.assertEqual(response.status_code, 422)
 
 
 if __name__ == "__main__":

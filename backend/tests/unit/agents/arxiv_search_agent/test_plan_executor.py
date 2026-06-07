@@ -354,9 +354,60 @@ def test_plan_executor_replans_empty_arxiv_search_before_fallback(monkeypatch) -
     assert calls["search"] == 2
     assert result.runtime is not None
     assert result.runtime.replan_counts["search_arxiv:empty_result"] == 1
-    assert any(trace.event == "plan_replanned" and trace.detail.get("rule_name") == "rule_arxiv_empty_result" for trace in result.trace)
+    replan_traces = [trace for trace in result.trace if trace.event == "plan_replanned" and trace.detail.get("rule_name") == "rule_arxiv_empty_result"]
+    assert replan_traces
+    assert replan_traces[0].detail.get("failure_category") == "search_empty"
+    assert replan_traces[0].detail.get("recovery_candidates")
     assert any(step.tool_name == "rewrite_arxiv_query" for step in result.plan.steps)
     assert any(trace.event == "step_succeeded" and trace.step_id == "rewrite_arxiv_query" for trace in result.trace)
+
+
+def test_plan_executor_replans_low_confidence_arxiv_validation(monkeypatch) -> None:
+    calls = {"search": 0}
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        assert tool_name == "search_arxiv_structured"
+        calls["search"] += 1
+        papers = (
+            [
+                {"arxiv_id": "2401.00001", "title": "RAG duplicate"},
+                {"arxiv_id": "2401.00002", "title": "RAG duplicate"},
+                {"arxiv_id": "2401.00003", "title": "RAG duplicate"},
+                {"arxiv_id": "2401.00004", "title": "RAG duplicate"},
+            ]
+            if calls["search"] == 1
+            else [
+                {"arxiv_id": "2401.00005", "title": "RAG retrieval"},
+                {"arxiv_id": "2401.00006", "title": "RAG agent"},
+            ]
+        )
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": "searched",
+            "data": {"papers": papers},
+            "trace": {"tool_name": tool_name, "query": kwargs.get("query")},
+            "error": None,
+        }
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    state = AgentState(
+        intent="arxiv_search",
+        message="rag",
+        search_spec=ArxivSearchSpec(intent="arxiv_search", query="rag", max_results=5),
+    )
+    _, plan, _ = planner_module.build_executable_plan(state)
+    result = PlanExecutor().execute(plan, state)
+
+    assert result.status == "success"
+    assert calls["search"] == 2
+    assert result.runtime is not None
+    assert result.runtime.replan_counts["validate_arxiv_results:low_confidence"] == 1
+    replan_traces = [trace for trace in result.trace if trace.event == "plan_replanned" and trace.detail.get("rule_name") == "rule_arxiv_low_confidence"]
+    assert replan_traces
+    assert replan_traces[0].detail.get("failure_category") == "search_low_confidence"
+    assert replan_traces[0].detail.get("recovery_candidates")
 
 
 def test_plan_executor_replans_missing_paper_index_to_confirmation(monkeypatch) -> None:
@@ -385,7 +436,10 @@ def test_plan_executor_replans_missing_paper_index_to_confirmation(monkeypatch) 
     assert result.pending_confirmation.target_paper["arxiv_id"] == "2401.00001"
     assert [item.code for item in result.pending_confirmation.allowed_decisions] == ["approve", "reject"]
     assert any(step.tool_name == "parse_and_index_paper" for step in result.plan.steps)
-    assert any(trace.event == "plan_replanned" and trace.detail.get("rule_name") == "rule_missing_paper_index" for trace in result.trace)
+    replan_traces = [trace for trace in result.trace if trace.event == "plan_replanned" and trace.detail.get("rule_name") == "rule_missing_paper_index"]
+    assert replan_traces
+    assert replan_traces[0].detail.get("failure_category") == "paper_index_missing"
+    assert replan_traces[0].detail.get("recovery_candidates")[0]["requires_confirmation"] is True
 
 
 def test_plan_executor_paper_qa_calls_real_answer_tool_once_and_preserves_debug(monkeypatch) -> None:
@@ -455,3 +509,7 @@ def test_plan_executor_replans_empty_profile_to_message_recommendation(monkeypat
     assert recommend_calls[0]["message"] == "recommend rag papers"
     assert result.runtime is not None
     assert result.runtime.replan_counts["load_user_profile:empty_result"] == 1
+    replan_traces = [trace for trace in result.trace if trace.event == "plan_replanned" and trace.detail.get("rule_name") == "rule_empty_user_profile"]
+    assert replan_traces
+    assert replan_traces[0].detail.get("failure_category") == "empty_user_profile"
+    assert replan_traces[0].detail.get("recovery_candidates")

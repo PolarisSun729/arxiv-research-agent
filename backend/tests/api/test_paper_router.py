@@ -64,6 +64,12 @@ class _FakeRecommendationService:
         return payload
 
 
+class _FakePaperQAService:
+    def delete_qa_index(self, arxiv_id: str):
+        # 删除论文时路由会先清理 QA 索引；测试只关心该依赖存在且不触达真实向量库。
+        return {"status": "success", "arxiv_id": arxiv_id}
+
+
 class PaperRouterApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.db_service = _FakeDatabaseService()
@@ -71,6 +77,7 @@ class PaperRouterApiTests(unittest.TestCase):
         self.embedding_service = _FakeEmbeddingService()
         self.vector_store_service = _FakeVectorStoreService()
         self.recommendation_service = _FakeRecommendationService()
+        self.paper_qa_service = _FakePaperQAService()
 
         app = FastAPI()
         app.include_router(paper_router.router, prefix="/api")
@@ -78,6 +85,7 @@ class PaperRouterApiTests(unittest.TestCase):
         app.dependency_overrides[dependencies.get_oai_database_service] = lambda: self.oai_db_service
         app.dependency_overrides[dependencies.get_embedding_service] = lambda: self.embedding_service
         app.dependency_overrides[dependencies.get_recommendation_service] = lambda: self.recommendation_service
+        app.dependency_overrides[dependencies.get_paper_qa_service] = lambda: self.paper_qa_service
 
         self.sync_patch = mock.patch.object(
             paper_router,
@@ -187,7 +195,7 @@ class PaperRouterApiTests(unittest.TestCase):
 
         self.assertEqual(success.status_code, 200)
         self.assertEqual(success.json()["status"], "success")
-        self.assertEqual(missing.status_code, 500)
+        self.assertEqual(missing.status_code, 404)
 
     def test_get_all_papers_and_category_filter_return_stable_shape(self) -> None:
         self.db_service.add_paper({"arxiv_id": "2401.00004", "title": "CL Paper", "categories": "cs.CL"})

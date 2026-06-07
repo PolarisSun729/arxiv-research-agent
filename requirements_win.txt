@@ -86,6 +86,7 @@ langchain-huggingface
 langchain-milvus
 langchain-openai
 langchain-text-splitters
+langgraph
 langdetect
 langsmith
 layoutparser

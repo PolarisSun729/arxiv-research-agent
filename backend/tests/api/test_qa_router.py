@@ -70,6 +70,9 @@ class _FakeIndexJobManager:
             "status": "pending",
             "current_stage": "pending",
             "progress": 0,
+            "heartbeat_at": "2026-06-04T10:00:00",
+            "previous_job_id": None,
+            "recovery_action": "created",
         }
 
 
@@ -268,6 +271,10 @@ class QaRouterApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["status"], "submitted")
         self.assertEqual(payload["job_id"], "job-1")
+        self.assertFalse(payload["retryable"])
+        self.assertFalse(payload["stale"])
+        self.assertEqual(payload["heartbeat_at"], "2026-06-04T10:00:00")
+        self.assertEqual(payload["recovery_action"], "created")
 
     def test_get_latest_qa_index_job_returns_404_when_missing(self) -> None:
         response = self.client.get("/api/paper/missing/qa-index-jobs/latest")

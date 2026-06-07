@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import type {
   Paper,
   RecommendedPaper,
@@ -40,8 +40,10 @@ import {
   deletePaperNote,
   getPaperNotesExportUrl
 } from '@/api/papers'
+import { useUserContext } from '@/composables/useUserContext'
 
 export const usePaperStore = defineStore('paper', () => {
+  const userContext = useUserContext()
   const papers = ref<Paper[]>([])
   const allPapers = ref<Paper[]>([])
   const totalPapers = ref(0)
@@ -68,6 +70,25 @@ export const usePaperStore = defineStore('paper', () => {
   const researchProfile = ref<UserResearchProfile | null>(null)
   const paperActionMap = ref<UserPaperActionMap>({})
   const paperNotes = ref<PaperNote[]>([])
+
+  function resetUserScopedState() {
+    // userId 切换后清理本地用户态缓存，避免偏好、画像、笔记和推荐结果短暂串到新用户视图。
+    recommendations.value = []
+    totalRecommendations.value = 0
+    labeledPapers.value = []
+    totalLabeledPapers.value = 0
+    researchProfile.value = null
+    paperActionMap.value = {}
+    paperNotes.value = []
+    lastInterestVector.value = null
+    if (currentPaper.value) {
+      currentPaper.value.label = null
+      currentPaper.value.paperActions = {}
+    }
+    syncPaperCollections()
+  }
+
+  watch(() => userContext.userId.value, resetUserScopedState)
 
   function buildRecommendationReason(item: any): string {
     const breakdown = item?.score_breakdown || item?.scoreBreakdown || {}

@@ -88,6 +88,25 @@ USER_CONFIG: Dict[str, Any] = {
     "default_user_id": _env_str("DEFAULT_USER_ID", "local_user"),
 }
 
+QA_INDEX_JOB_CONFIG: Dict[str, Any] = {
+    # 后台线程在进程重启后会丢失，心跳超时用于把旧 pending/running 任务恢复成可重试状态。
+    "timeout_seconds": _env_int("QA_INDEX_JOB_TIMEOUT_SECONDS", 30 * 60),
+}
+
+AGENT_PLANNER_CONFIG: Dict[str, Any] = {
+    # 默认启用规则型 Tool-Aware planner；LLM draft 仍需显式开启，避免规划链路直接依赖外部模型。
+    "enable_tool_aware_planner": _env_bool("ENABLE_TOOL_AWARE_PLANNER", True),
+    "enable_llm_plan_draft": _env_bool("ENABLE_LLM_PLAN_DRAFT", False),
+    # Recovery 诊断默认关闭；即使开启也只提供语义诊断/排序建议，不能直接改写计划或执行工具。
+    "enable_llm_recovery_diagnosis": _env_bool("ENABLE_LLM_RECOVERY_DIAGNOSIS", False),
+    "llm_recovery_timeout": _env_int("LLM_RECOVERY_TIMEOUT_SECONDS", 6),
+    "llm_plan_timeout": _env_int("LLM_PLAN_TIMEOUT_SECONDS", 8),
+    "llm_plan_max_steps": _env_int("LLM_PLAN_MAX_STEPS", 8),
+    "llm_plan_fallback_to_rule": _env_bool("LLM_PLAN_FALLBACK_TO_RULE", True),
+    "llm_plan_fallback_to_template": _env_bool("LLM_PLAN_FALLBACK_TO_TEMPLATE", True),
+    "expose_planner_debug": _env_bool("EXPOSE_PLANNER_DEBUG", True),
+}
+
 OAI_SQLITE_CONFIG: Dict[str, Any] = {
     # Keep the OAI database under backend/06-database so backend launches and tools share the same store.
     "database_path": _env_str("OAI_SQLITE_DATABASE_PATH", str(BASE_DIR.parent / "06-database" / "arxiv_oai.db")),
@@ -480,6 +499,14 @@ def get_default_user_id() -> str:
 
 def get_user_runtime_config() -> Dict[str, Any]:
     return dict(USER_CONFIG)
+
+
+def get_qa_index_job_runtime_config() -> Dict[str, Any]:
+    return dict(QA_INDEX_JOB_CONFIG)
+
+
+def get_agent_planner_runtime_config() -> Dict[str, Any]:
+    return dict(AGENT_PLANNER_CONFIG)
 
 
 def get_enhanced_retrieval_runtime_config() -> Dict[str, Any]:

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -14,7 +13,7 @@ from services.arxiv.arxiv_search_service import ArxivSearchService
 from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
 from services.document.chunking_service import ChunkingService
 from services.memory import MemoryService
-from services.storage.database_service import DatabaseService
+from services.storage.database_service import DatabaseService, PaperQATurnPersistenceError
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
 from services.retrieval.enhanced_retrieval_service import EnhancedRetrievalService, RetrievalOptions
 from services.llm.generation_service import GenerationService
@@ -200,7 +199,7 @@ class PaperQAService:
         contextualized_question: str,
         question_contextualization: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """把一次完整问答轮次写入会话消息表，并返回最新会话状态。"""
+        """把一次完整问答轮次作为原子业务单元写入会话消息表。"""
         session_id = str(chat_session.get("session_id", "") or "").strip()
         user_id = self._resolve_user_id(chat_session.get("user_id"))
         if not bool(self._memory_flag("enable_paper_chat_session", True)) or not session_id:
@@ -210,48 +209,49 @@ class PaperQAService:
                 "assistant_message": None,
                 "chat_session": chat_session,
             }
-        turn_id = str(uuid.uuid4())
         try:
-            # 用户问题和助手回答共享同一个 turn_id，便于后续追踪一整轮对话。
-            user_message = self.db_service.append_paper_chat_message(
+            # 由数据库层一次性写入完整 turn，避免用户消息成功、助手消息失败后污染短期记忆。
+            persisted_turn = self.db_service.append_paper_qa_turn(
                 session_id=session_id,
                 user_id=user_id,
-                turn_id=turn_id,
-                role="user",
-                content=question,
-                contextualized_question=contextualized_question,
-                question_contextualization=question_contextualization,
-            )
-            assistant_message = self.db_service.append_paper_chat_message(
-                session_id=session_id,
-                user_id=user_id,
-                turn_id=turn_id,
-                role="assistant",
-                content=answer,
+                question=question,
+                answer=answer,
                 sources=source_payload,
                 retrieval_debug_snapshot=retrieval_debug,
                 contextualized_question=contextualized_question,
                 question_contextualization=question_contextualization,
             )
-            if not user_message or not assistant_message:
+            if not persisted_turn.get("user_message") or not persisted_turn.get("assistant_message"):
                 raise AppError(
                     ErrorCode.DATABASE_WRITE_FAILED,
-                    detail="paper_chat_messages append returned empty result",
+                    detail="paper qa turn append returned empty result",
                     context={"session_id": session_id, "user_id": user_id, "stage": "persist_completed_turn"},
                 )
-            refreshed_session = self.db_service.get_paper_chat_session(session_id, user_id=user_id) or chat_session
             return {
-                "turn_id": turn_id,
-                "user_message": user_message,
-                "assistant_message": assistant_message,
-                "chat_session": refreshed_session,
+                "turn_id": persisted_turn.get("turn_id", ""),
+                "user_message": persisted_turn.get("user_message"),
+                "assistant_message": persisted_turn.get("assistant_message"),
+                "chat_session": persisted_turn.get("refreshed_session") or persisted_turn.get("chat_session") or chat_session,
             }
         except AppError:
             raise
-        except Exception as exc:
-            # QA 已经生成成功但会话写入失败时，必须把失败语义抛给上层，避免前端误以为历史记录可恢复。
+        except PaperQATurnPersistenceError as exc:
+            # 答案已经生成但持久化失败时，本轮不会出现在历史里，必须用明确错误码反馈给前端。
             logger.exception(
                 "QA turn persistence failed: code=%s session_id=%s user_id=%s stage=%s",
+                ErrorCode.DATABASE_WRITE_FAILED,
+                session_id,
+                user_id,
+                "persist_completed_turn",
+            )
+            raise AppError(
+                ErrorCode.DATABASE_WRITE_FAILED,
+                detail=exc,
+                context={"session_id": session_id, "user_id": user_id, "stage": "persist_completed_turn"},
+            ) from exc
+        except Exception as exc:
+            logger.exception(
+                "Unexpected QA turn persistence failure: code=%s session_id=%s user_id=%s stage=%s",
                 ErrorCode.DATABASE_WRITE_FAILED,
                 session_id,
                 user_id,
@@ -266,14 +266,36 @@ class PaperQAService:
     def get_qa_status(self, arxiv_id: str) -> Dict[str, Any]:
         """查询指定论文当前是否已完成 QA 索引构建，以及索引摘要信息。"""
         qa_index = self.db_service.get_paper_qa_index(arxiv_id)
+        latest_build = None
+        building_build = None
+        last_failed_build = None
+        cleanup_pending_count = 0
+        latest_getter = getattr(self.db_service, "get_latest_paper_qa_index_build", None)
+        counter = getattr(self.db_service, "count_paper_qa_index_builds", None)
+        if callable(latest_getter):
+            latest_build = latest_getter(arxiv_id)
+            building_build = latest_getter(arxiv_id, statuses=["building"])
+            last_failed_build = latest_getter(arxiv_id, statuses=["build_failed", "orphaned"])
+        if callable(counter):
+            cleanup_pending_count = counter(arxiv_id, statuses=["cleanup_pending", "orphaned", "build_failed"])
         if qa_index:
+            has_active_index = qa_index["status"] == "indexed" and bool(qa_index.get("collection_name"))
             return {
                 "arxiv_id": arxiv_id,
-                "has_index": qa_index["status"] == "indexed",
+                "has_index": has_active_index,
                 "status": qa_index["status"],
                 "collection_name": qa_index["collection_name"],
                 "chunk_count": qa_index["chunk_count"],
                 "embedding_model": qa_index["embedding_model"],
+                "active_collection_name": qa_index.get("collection_name") if has_active_index else "",
+                "active_index_version": qa_index.get("active_index_version"),
+                "active_build_id": qa_index.get("active_build_id"),
+                "active_chunk_count": qa_index.get("chunk_count") if has_active_index else 0,
+                "active_embedding_model": qa_index.get("embedding_model") if has_active_index else "",
+                "building_status": building_build.get("status") if building_build else None,
+                "latest_build_job": latest_build,
+                "last_failed_build": last_failed_build,
+                "cleanup_pending_count": cleanup_pending_count,
                 "pdf_path": qa_index.get("pdf_path"),
                 "chunk_file": qa_index.get("chunk_file"),
                 "embedding_file": qa_index.get("embedding_file"),
@@ -289,6 +311,14 @@ class PaperQAService:
             "arxiv_id": arxiv_id,
             "has_index": False,
             "status": "not_indexed",
+            "active_collection_name": "",
+            "active_index_version": None,
+            "active_chunk_count": 0,
+            "active_embedding_model": "",
+            "building_status": building_build.get("status") if building_build else None,
+            "latest_build_job": latest_build,
+            "last_failed_build": last_failed_build,
+            "cleanup_pending_count": cleanup_pending_count,
         }
 
     def build_qa_index(self, arxiv_id: str, loading_method: str = "docling") -> Dict[str, Any]:
@@ -311,6 +341,10 @@ class PaperQAService:
         )
         if not updated:
             raise RuntimeError("QA index artifacts were cleaned, but SQLite failed to mark the index as deleted")
+        active_build_id = qa_index.get("active_build_id")
+        marker = getattr(self.db_service, "mark_paper_qa_index_build_deleted", None)
+        if active_build_id and callable(marker):
+            marker(active_build_id)
         return {
             "status": "deleted",
             "arxiv_id": arxiv_id,

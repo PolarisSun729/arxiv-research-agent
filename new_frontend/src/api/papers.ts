@@ -21,9 +21,15 @@ import type {
   UserResearchProfile
 } from '@/types/paper'
 import { mockPapers, mockRecommendedPapers, mockLabeledPapers, mockStats } from '@/mock/papers'
+import { getCurrentUserId } from '@/composables/useUserContext'
 
 const isMockMode = false
-const DEFAULT_USER_ID = 'local_user'
+
+function resolveUserId(userId?: string | null): string {
+  const normalized = String(userId || '').trim()
+  // API 层只负责解析当前身份，避免后续认证接入时出现多处默认用户兜底。
+  return normalized || getCurrentUserId()
+}
 
 export interface DashboardStats {
   totalPapers: number
@@ -120,9 +126,9 @@ function normalizeRecommendedPaper(raw: any): RecommendedPaper {
   }
 }
 
-function emptyResearchProfile(): UserResearchProfile {
+function emptyResearchProfile(userId?: string): UserResearchProfile {
   return {
-    user_id: DEFAULT_USER_ID,
+    user_id: resolveUserId(userId),
     positive_topics: [],
     negative_topics: [],
     recent_topics: [],
@@ -133,9 +139,9 @@ function emptyResearchProfile(): UserResearchProfile {
   }
 }
 
-function normalizeResearchProfile(raw: any): UserResearchProfile {
+function normalizeResearchProfile(raw: any, fallbackUserId?: string): UserResearchProfile {
   return {
-    user_id: raw?.user_id || DEFAULT_USER_ID,
+    user_id: raw?.user_id || resolveUserId(fallbackUserId),
     positive_topics: Array.isArray(raw?.positive_topics) ? raw.positive_topics : [],
     negative_topics: Array.isArray(raw?.negative_topics) ? raw.negative_topics : [],
     recent_topics: Array.isArray(raw?.recent_topics) ? raw.recent_topics : [],
@@ -157,10 +163,10 @@ function normalizePaperActionMap(raw: any): UserPaperActionMap {
   ) as UserPaperActionMap
 }
 
-function normalizeUserPaperAction(raw: any): UserPaperAction {
+function normalizeUserPaperAction(raw: any, fallbackUserId?: string): UserPaperAction {
   return {
     id: raw?.id,
-    user_id: raw?.user_id || DEFAULT_USER_ID,
+    user_id: raw?.user_id || resolveUserId(fallbackUserId),
     arxiv_id: String(raw?.arxiv_id || ''),
     action_type: raw?.action_type,
     metadata: raw?.metadata || raw?.metadata_json || {},
@@ -169,10 +175,10 @@ function normalizeUserPaperAction(raw: any): UserPaperAction {
   }
 }
 
-function normalizePaperNote(raw: any): PaperNote {
+function normalizePaperNote(raw: any, fallbackUserId?: string): PaperNote {
   return {
     note_id: String(raw?.note_id || ''),
-    user_id: raw?.user_id || DEFAULT_USER_ID,
+    user_id: raw?.user_id || resolveUserId(fallbackUserId),
     arxiv_id: String(raw?.arxiv_id || ''),
     session_id: raw?.session_id || null,
     source_message_id: raw?.source_message_id || null,
@@ -189,23 +195,24 @@ function normalizePaperNote(raw: any): PaperNote {
   }
 }
 
-export async function getUserPreferences(): Promise<{
+export async function getUserPreferences(userId?: string): Promise<{
   liked_papers: string[]
   disliked_papers: string[]
   paper_actions?: UserPaperActionMap
   research_profile?: UserResearchProfile | null
 }> {
+  const effectiveUserId = resolveUserId(userId)
   try {
-    const response: any = await request.get(`/user/preferences/${DEFAULT_USER_ID}`)
+    const response: any = await request.get(`/user/preferences/${effectiveUserId}`)
     return {
       liked_papers: Array.isArray(response?.liked_papers) ? response.liked_papers : [],
       disliked_papers: Array.isArray(response?.disliked_papers) ? response.disliked_papers : [],
       paper_actions: normalizePaperActionMap(response?.paper_actions),
-      research_profile: response?.research_profile ? normalizeResearchProfile(response.research_profile) : null
+      research_profile: response?.research_profile ? normalizeResearchProfile(response.research_profile, effectiveUserId) : null
     }
   } catch (error: any) {
     if (error?.response?.status === 404) {
-      return { liked_papers: [], disliked_papers: [], paper_actions: {}, research_profile: emptyResearchProfile() }
+      return { liked_papers: [], disliked_papers: [], paper_actions: {}, research_profile: emptyResearchProfile(effectiveUserId) }
     }
     throw error
   }
@@ -227,38 +234,45 @@ function buildPaperMaterializationPayload(paper: Paper): PaperMaterializationPay
   }
 }
 
-export async function likePaper(paper: Paper): Promise<void> {
+export async function likePaper(paper: Paper, userId?: string): Promise<void> {
+  const effectiveUserId = resolveUserId(userId)
   const arxivId = getPaperArxivId(paper)
   const payload: PaperPreferenceRequest = {
+    user_id: effectiveUserId,
     arxiv_id: arxivId,
     paper: buildPaperMaterializationPayload(paper)
   }
   await request.post('/user/like-paper', payload)
 }
 
-export async function dislikePaper(paper: Paper): Promise<void> {
+export async function dislikePaper(paper: Paper, userId?: string): Promise<void> {
+  const effectiveUserId = resolveUserId(userId)
   const arxivId = getPaperArxivId(paper)
   const payload: PaperPreferenceRequest = {
+    user_id: effectiveUserId,
     arxiv_id: arxivId,
     paper: buildPaperMaterializationPayload(paper)
   }
   await request.post('/user/dislike-paper', payload)
 }
 
-export async function removePaperPreference(paper: Paper, label: LabelParams['label']): Promise<void> {
+export async function removePaperPreference(paper: Paper, label: LabelParams['label'], userId?: string): Promise<void> {
+  const effectiveUserId = resolveUserId(userId)
   const endpoint = label === 'liked' ? '/user/like-paper' : '/user/dislike-paper'
   await request.delete(endpoint, {
-    data: { arxiv_id: getPaperArxivId(paper) }
+    data: { user_id: effectiveUserId, arxiv_id: getPaperArxivId(paper) }
   })
 }
 
 export async function recordPaperAction(
   paper: Paper,
   actionType: PaperActionType,
-  metadata?: Record<string, any>
+  metadata?: Record<string, any>,
+  userId?: string
 ): Promise<void> {
+  const effectiveUserId = resolveUserId(userId)
   await request.post('/user/paper-action', {
-    user_id: DEFAULT_USER_ID,
+    user_id: effectiveUserId,
     arxiv_id: getPaperArxivId(paper),
     action_type: actionType,
     paper: buildPaperMaterializationPayload(paper),
@@ -266,61 +280,66 @@ export async function recordPaperAction(
   })
 }
 
-export async function removePaperAction(paper: Paper, actionType: PaperActionType): Promise<void> {
+export async function removePaperAction(paper: Paper, actionType: PaperActionType, userId?: string): Promise<void> {
+  const effectiveUserId = resolveUserId(userId)
   await request.delete('/user/paper-action', {
     data: {
-      user_id: DEFAULT_USER_ID,
+      user_id: effectiveUserId,
       arxiv_id: getPaperArxivId(paper),
       action_type: actionType
     }
   })
 }
 
-export async function getUserPaperActions(actionType?: PaperActionType): Promise<{
+export async function getUserPaperActions(actionType?: PaperActionType, userId?: string): Promise<{
   status: string
   user_id: string
   action_type?: PaperActionType
   actions: UserPaperAction[]
   action_map: UserPaperActionMap
 }> {
-  const response: any = await request.get(`/user/paper-actions/${DEFAULT_USER_ID}`, {
+  const effectiveUserId = resolveUserId(userId)
+  const response: any = await request.get(`/user/paper-actions/${effectiveUserId}`, {
     params: actionType ? { action_type: actionType } : undefined
   })
   return {
     status: response?.status || 'success',
-    user_id: response?.user_id || DEFAULT_USER_ID,
+    user_id: response?.user_id || effectiveUserId,
     action_type: response?.action_type,
-    actions: Array.isArray(response?.actions) ? response.actions.map(normalizeUserPaperAction) : [],
+    actions: Array.isArray(response?.actions) ? response.actions.map((item: any) => normalizeUserPaperAction(item, effectiveUserId)) : [],
     action_map: normalizePaperActionMap(response?.action_map)
   }
 }
 
-export async function getUserResearchProfile(): Promise<UserResearchProfile> {
+export async function getUserResearchProfile(userId?: string): Promise<UserResearchProfile> {
+  const effectiveUserId = resolveUserId(userId)
   try {
-    const response: any = await request.get(`/user/research-profile/${DEFAULT_USER_ID}`)
-    return normalizeResearchProfile(response)
+    const response: any = await request.get(`/user/research-profile/${effectiveUserId}`)
+    return normalizeResearchProfile(response, effectiveUserId)
   } catch (error: any) {
     if (error?.response?.status === 404) {
-      return emptyResearchProfile()
+      return emptyResearchProfile(effectiveUserId)
     }
     throw error
   }
 }
 
-export async function upsertUserResearchProfile(profile: Partial<UserResearchProfile>): Promise<UserResearchProfile> {
+export async function upsertUserResearchProfile(profile: Partial<UserResearchProfile>, userId?: string): Promise<UserResearchProfile> {
+  const effectiveUserId = resolveUserId(userId || profile.user_id)
   const response: any = await request.put('/user/research-profile', {
-    user_id: DEFAULT_USER_ID,
-    ...profile
+    ...profile,
+    user_id: effectiveUserId
   })
-  return normalizeResearchProfile(response?.profile || response)
+  return normalizeResearchProfile(response?.profile || response, effectiveUserId)
 }
 
-export async function patchUserResearchProfile(profile: Partial<UserResearchProfile>): Promise<UserResearchProfile> {
+export async function patchUserResearchProfile(profile: Partial<UserResearchProfile>, userId?: string): Promise<UserResearchProfile> {
+  const effectiveUserId = resolveUserId(userId || profile.user_id)
   const response: any = await request.patch('/user/research-profile', {
-    user_id: DEFAULT_USER_ID,
-    ...profile
+    ...profile,
+    user_id: effectiveUserId
   })
-  return normalizeResearchProfile(response?.profile || response)
+  return normalizeResearchProfile(response?.profile || response, effectiveUserId)
 }
 
 export async function searchPapers(params: SearchParams): Promise<PaginatedResponse<Paper>> {
@@ -459,15 +478,16 @@ export async function getLabeledPapers(params: {
   }
 }
 
-export async function getStats(): Promise<DashboardStats> {
+export async function getStats(userId?: string): Promise<DashboardStats> {
   if (isMockMode) {
     const { recommendedPapers, ...stats } = mockStats
     return normalizeDashboardStats(stats)
   }
 
+  const effectiveUserId = resolveUserId(userId)
   const response = await request.get('/stats', {
     params: {
-      user_id: DEFAULT_USER_ID
+      user_id: effectiveUserId
     }
   })
   return normalizeDashboardStats(response)
@@ -489,19 +509,26 @@ export async function searchArxiv(params: ArxivSearchParams): Promise<PaginatedR
   }
 }
 
-export async function generateInterestVector(): Promise<InterestVectorResult> {
-  return request.post('/user/generate-interest-vector')
+export async function generateInterestVector(userId?: string): Promise<InterestVectorResult> {
+  return request.post('/user/generate-interest-vector', { user_id: resolveUserId(userId) })
 }
 
-export async function getInterestVector(): Promise<InterestVector> {
-  return request.get('/user/interest-vector')
+export async function getInterestVector(userId?: string): Promise<InterestVector> {
+  return request.get('/user/interest-vector', {
+    params: { user_id: resolveUserId(userId) }
+  })
 }
 
-export async function recommendPapers(topN: number = 10, maxAgeMonths: number = 6): Promise<RecommendationResult> {
-  const response: any = await request.post('/user/recommend-papers', { top_n: topN, max_age_months: maxAgeMonths })
+export async function recommendPapers(topN: number = 10, maxAgeMonths: number = 6, userId?: string): Promise<RecommendationResult> {
+  const effectiveUserId = resolveUserId(userId)
+  const response: any = await request.post('/user/recommend-papers', {
+    user_id: effectiveUserId,
+    top_n: topN,
+    max_age_months: maxAgeMonths
+  })
   return {
     ...response,
-    research_profile: response?.research_profile ? normalizeResearchProfile(response.research_profile) : null,
+    research_profile: response?.research_profile ? normalizeResearchProfile(response.research_profile, effectiveUserId) : null,
     paper_actions: normalizePaperActionMap(response?.paper_actions),
     recommendations: Array.isArray(response?.recommendations)
       ? response.recommendations.map(normalizeRecommendedPaper)
@@ -629,6 +656,16 @@ export async function getPaperQaIndexJob(arxivId: string, jobId: string): Promis
   return request.get(`/paper/${arxivId}/qa-index-jobs/${jobId}`)
 }
 
+export type QaStreamPersistenceStatus = 'unknown' | 'saved' | 'failed' | 'not_saved'
+export type QaStreamClientStatus =
+  | 'completed'
+  | 'partial'
+  | 'failed'
+  | 'aborted'
+  | 'interrupted'
+  | 'persistence_failed'
+  | string
+
 export interface QaResult {
   status: string
   arxiv_id: string
@@ -641,6 +678,10 @@ export interface QaResult {
   used_short_term_memory?: boolean
   question_contextualization?: Record<string, any> | null
   answer: string
+  partial?: boolean
+  completed_at?: string | null
+  interrupted_reason?: string | null
+  persistence_status?: QaStreamPersistenceStatus
   retrieval_debug?: RetrievalDebug | null
   sources: Array<{
     content: string
@@ -706,9 +747,15 @@ export async function listPaperNotes(
   arxivId: string,
   params: { user_id?: string; note_type?: PaperNoteType } = {}
 ): Promise<{ items: PaperNote[] }> {
-  const response: any = await request.get(`/paper/${arxivId}/notes`, { params })
+  const effectiveUserId = resolveUserId(params.user_id)
+  const response: any = await request.get(`/paper/${arxivId}/notes`, {
+    params: {
+      ...params,
+      user_id: effectiveUserId
+    }
+  })
   return {
-    items: Array.isArray(response?.items) ? response.items.map(normalizePaperNote) : []
+    items: Array.isArray(response?.items) ? response.items.map((item: any) => normalizePaperNote(item, effectiveUserId)) : []
   }
 }
 
@@ -716,9 +763,13 @@ export async function createPaperNote(
   arxivId: string,
   payload: PaperNotePayload
 ): Promise<{ item: PaperNote | null }> {
-  const response: any = await request.post(`/paper/${arxivId}/notes`, payload)
+  const effectiveUserId = resolveUserId(payload.user_id)
+  const response: any = await request.post(`/paper/${arxivId}/notes`, {
+    ...payload,
+    user_id: effectiveUserId
+  })
   return {
-    item: response?.item ? normalizePaperNote(response.item) : null
+    item: response?.item ? normalizePaperNote(response.item, effectiveUserId) : null
   }
 }
 
@@ -727,9 +778,13 @@ export async function updatePaperNote(
   noteId: string,
   payload: Partial<PaperNotePayload>
 ): Promise<{ item: PaperNote | null }> {
-  const response: any = await request.patch(`/paper/${arxivId}/notes/${noteId}`, payload)
+  const effectiveUserId = resolveUserId(payload.user_id)
+  const response: any = await request.patch(`/paper/${arxivId}/notes/${noteId}`, {
+    ...payload,
+    user_id: effectiveUserId
+  })
   return {
-    item: response?.item ? normalizePaperNote(response.item) : null
+    item: response?.item ? normalizePaperNote(response.item, effectiveUserId) : null
   }
 }
 
@@ -739,13 +794,13 @@ export async function deletePaperNote(
   userId?: string
 ): Promise<{ status: string; deleted: boolean }> {
   return request.delete(`/paper/${arxivId}/notes/${noteId}`, {
-    params: { user_id: userId }
+    params: { user_id: resolveUserId(userId) }
   })
 }
 
 export function getPaperNotesExportUrl(arxivId: string, userId?: string): string {
   const params = new URLSearchParams()
-  if (userId) params.set('user_id', userId)
+  params.set('user_id', resolveUserId(userId))
   const query = params.toString()
   return `/api/paper/${arxivId}/notes/export${query ? `?${query}` : ''}`
 }
@@ -893,14 +948,23 @@ export interface RetrievalDebug {
 }
 
 export async function qaPaper(arxivId: string, question: string, options: QaRequestOptions = {}): Promise<QaResult> {
-  return request.post(`/paper/${arxivId}/qa`, { question, ...options })
+  return request.post(`/paper/${arxivId}/qa`, {
+    question,
+    ...options,
+    user_id: resolveUserId(options.user_id)
+  })
 }
 
 export async function listPaperChatSessions(
   arxivId: string,
   params: { user_id?: string; limit?: number } = {}
 ): Promise<{ items: PaperChatSession[] }> {
-  return request.get(`/paper/${arxivId}/chat-sessions`, { params })
+  return request.get(`/paper/${arxivId}/chat-sessions`, {
+    params: {
+      ...params,
+      user_id: resolveUserId(params.user_id)
+    }
+  })
 }
 
 export async function getRecentPaperChatSession(
@@ -908,7 +972,7 @@ export async function getRecentPaperChatSession(
   userId?: string
 ): Promise<{ item: PaperChatSession | null }> {
   return request.get(`/paper/${arxivId}/chat-sessions/recent`, {
-    params: { user_id: userId }
+    params: { user_id: resolveUserId(userId) }
   })
 }
 
@@ -916,7 +980,10 @@ export async function createPaperChatSession(
   arxivId: string,
   payload: { user_id?: string; title?: string } = {}
 ): Promise<{ item: PaperChatSession | null }> {
-  return request.post(`/paper/${arxivId}/chat-sessions`, payload)
+  return request.post(`/paper/${arxivId}/chat-sessions`, {
+    ...payload,
+    user_id: resolveUserId(payload.user_id)
+  })
 }
 
 export async function getPaperChatSession(
@@ -925,7 +992,7 @@ export async function getPaperChatSession(
   userId?: string
 ): Promise<{ item: PaperChatSession | null }> {
   return request.get(`/paper/${arxivId}/chat-sessions/${sessionId}`, {
-    params: { user_id: userId }
+    params: { user_id: resolveUserId(userId) }
   })
 }
 
@@ -935,7 +1002,7 @@ export async function getPaperChatMessages(
   userId?: string
 ): Promise<{ session: PaperChatSession | null; items: PaperChatMessage[] }> {
   return request.get(`/paper/${arxivId}/chat-sessions/${sessionId}/messages`, {
-    params: { user_id: userId }
+    params: { user_id: resolveUserId(userId) }
   })
 }
 
@@ -945,7 +1012,7 @@ export async function clearPaperChatSession(
   userId?: string
 ): Promise<{ item: PaperChatSession | null }> {
   return request.post(`/paper/${arxivId}/chat-sessions/${sessionId}/clear`, {
-    user_id: userId
+    user_id: resolveUserId(userId)
   })
 }
 
@@ -955,63 +1022,146 @@ export async function deletePaperChatSession(
   userId?: string
 ): Promise<{ status: string; deleted: boolean }> {
   return request.delete(`/paper/${arxivId}/chat-sessions/${sessionId}`, {
-    params: { user_id: userId }
+    params: { user_id: resolveUserId(userId) }
   })
 }
 
+type QaStreamSource = {
+  content: string
+  page_number: string
+  source?: string
+  section_path?: string
+  parent_chunk_id?: string | number
+  chunk_type?: string
+  asset_summary?: string
+  asset_preview_text?: string
+}
+
+type QaStreamMetaPayload = {
+  status: string
+  arxiv_id: string
+  question: string
+  session_id?: string
+  chat_session?: PaperChatSession | null
+  original_question?: string
+  contextualized_question?: string
+  used_short_term_memory?: boolean
+  question_contextualization?: Record<string, any> | null
+  sources: QaStreamSource[]
+  retrieval_debug?: RetrievalDebug | null
+}
+
+type QaStreamDonePayload = QaStreamMetaPayload & {
+  answer: string
+  turn_id?: string
+  completed_at?: string | null
+  completedAt?: string | null
+  interrupted_reason?: string | null
+  interruptedReason?: string | null
+  persistence_status?: QaStreamPersistenceStatus
+  persistenceStatus?: QaStreamPersistenceStatus
+  usage?: {
+    input_tokens?: number | null
+    output_tokens?: number | null
+    total_tokens?: number | null
+  } | null
+}
+
 export interface QaStreamHandlers {
-  onMeta?: (meta: {
-    status: string
-    arxiv_id: string
-    question: string
-    session_id?: string
-    chat_session?: PaperChatSession | null
-    original_question?: string
-    contextualized_question?: string
-    used_short_term_memory?: boolean
-    question_contextualization?: Record<string, any> | null
-    sources: Array<{
-      content: string
-      page_number: string
-      source?: string
-      section_path?: string
-      parent_chunk_id?: string | number
-      chunk_type?: string
-      asset_summary?: string
-      asset_preview_text?: string
-    }>
-    retrieval_debug?: RetrievalDebug | null
-  }) => void
+  onMeta?: (meta: QaStreamMetaPayload) => void
   onDelta?: (delta: string) => void
-  onDone?: (payload: {
-    status: string
-    answer: string
-    session_id?: string
-    chat_session?: PaperChatSession | null
-    turn_id?: string
-    original_question?: string
-    contextualized_question?: string
-    used_short_term_memory?: boolean
-    question_contextualization?: Record<string, any> | null
-    sources: Array<{
-      content: string
-      page_number: string
-      source?: string
-      section_path?: string
-      parent_chunk_id?: string | number
-      chunk_type?: string
-      asset_summary?: string
-      asset_preview_text?: string
-    }>
-    retrieval_debug?: RetrievalDebug | null
-    usage?: {
-      input_tokens?: number | null
-      output_tokens?: number | null
-      total_tokens?: number | null
-    } | null
-  }) => void
+  onDone?: (payload: QaStreamDonePayload) => void
   onError?: (detail: string) => void
   signal?: AbortSignal
+}
+
+function normalizeStreamPersistenceStatus(payload: Record<string, any> | null | undefined): QaStreamPersistenceStatus {
+  const rawStatus = String(payload?.persistence_status || payload?.persistenceStatus || '').trim().toLowerCase()
+  const doneStatus = String(payload?.status || '').trim().toLowerCase()
+
+  if (rawStatus === 'failed' || rawStatus === 'not_saved' || rawStatus === 'saved' || rawStatus === 'unknown') {
+    return rawStatus as QaStreamPersistenceStatus
+  }
+  if (['partial_success', 'persistence_failed', 'database_write_failed'].includes(doneStatus)) {
+    return 'failed'
+  }
+  if (doneStatus === 'stream_interrupted') {
+    return 'not_saved'
+  }
+  if (doneStatus === 'success' || doneStatus === 'completed') {
+    return 'saved'
+  }
+  return 'unknown'
+}
+
+function normalizeStreamDoneStatus(payload: Record<string, any> | null | undefined): QaStreamClientStatus {
+  const status = String(payload?.status || 'success').trim().toLowerCase()
+  const persistenceStatus = normalizeStreamPersistenceStatus(payload)
+
+  if (['partial_success', 'persistence_failed', 'database_write_failed'].includes(status) || persistenceStatus === 'failed') {
+    return 'persistence_failed'
+  }
+  if (status === 'stream_interrupted') return 'partial'
+  if (status === 'aborted') return 'aborted'
+  if (status === 'failed') return 'failed'
+  return 'completed'
+}
+
+function isAbortError(error: unknown, signal?: AbortSignal) {
+  return Boolean(
+    signal?.aborted ||
+      (error instanceof DOMException && error.name === 'AbortError') ||
+      (error && typeof error === 'object' && (error as { name?: unknown }).name === 'AbortError')
+  )
+}
+
+function createQaStreamError(code: string, message: string, detail: string | null = null, recoverable = true) {
+  return new ApiError({
+    status: 'failed',
+    code,
+    message,
+    detail,
+    recoverable
+  })
+}
+
+function applyQaStreamPayload(
+  payload: Partial<QaStreamMetaPayload> & Record<string, any>,
+  target: {
+    sources: QaStreamSource[]
+    retrievalDebug: RetrievalDebug | null
+    sessionId: string
+    chatSession: PaperChatSession | null
+    originalQuestion: string
+    contextualizedQuestion: string
+    usedShortTermMemory: boolean
+    questionContextualization: Record<string, any> | null
+  }
+) {
+  if (Array.isArray(payload.sources)) {
+    target.sources = payload.sources
+  }
+  if (payload.retrieval_debug) {
+    target.retrievalDebug = payload.retrieval_debug
+  }
+  if (typeof payload.session_id === 'string' && payload.session_id) {
+    target.sessionId = payload.session_id
+  }
+  if (payload.chat_session) {
+    target.chatSession = payload.chat_session
+  }
+  if (typeof payload.original_question === 'string' && payload.original_question) {
+    target.originalQuestion = payload.original_question
+  }
+  if (typeof payload.contextualized_question === 'string' && payload.contextualized_question) {
+    target.contextualizedQuestion = payload.contextualized_question
+  }
+  if (typeof payload.used_short_term_memory === 'boolean') {
+    target.usedShortTermMemory = payload.used_short_term_memory
+  }
+  if (payload.question_contextualization) {
+    target.questionContextualization = payload.question_contextualization
+  }
 }
 
 function parseSseEvent(rawEvent: string): { event: string; data: any } | null {
@@ -1048,156 +1198,153 @@ export async function qaPaperStream(
   handlers: QaStreamHandlers = {},
   options: QaRequestOptions = {}
 ): Promise<QaResult> {
-  const response = await fetch(`/api/paper/${arxivId}/qa/stream`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'text/event-stream'
-    },
-    body: JSON.stringify({ question, ...options }),
-    signal: handlers.signal
-  })
-
-  if (!response.ok) {
-    throw await parseFetchErrorResponse(response, '问答失败')
-  }
-
-  if (!response.body) {
-    throw new Error('Streaming response body is empty')
-  }
-
-  const reader = response.body.getReader()
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
   const decoder = new TextDecoder('utf-8')
   let buffer = ''
   let finalAnswer = ''
-  let finalSources: Array<{
-    content: string
-    page_number: string
-    source?: string
-    section_path?: string
-    parent_chunk_id?: string | number
-    chunk_type?: string
-    asset_summary?: string
-    asset_preview_text?: string
-  }> = []
-  let finalRetrievalDebug: RetrievalDebug | null = null
-  let finalSessionId = options.session_id || ''
-  let finalChatSession: PaperChatSession | null = null
-  let finalOriginalQuestion = question
-  let finalContextualizedQuestion = question
-  let finalUsedShortTermMemory = false
-  let finalQuestionContextualization: Record<string, any> | null = null
+  let hasDone = false
+  const finalState = {
+    sources: [] as QaStreamSource[],
+    retrievalDebug: null as RetrievalDebug | null,
+    sessionId: options.session_id || '',
+    chatSession: null as PaperChatSession | null,
+    originalQuestion: question,
+    contextualizedQuestion: question,
+    usedShortTermMemory: false,
+    questionContextualization: null as Record<string, any> | null
+  }
 
-  while (true) {
-    const { value, done } = await reader.read()
-    if (done) break
+  const buildResult = (payload: QaStreamDonePayload): QaResult => {
+    const status = normalizeStreamDoneStatus(payload)
+    const persistenceStatus = normalizeStreamPersistenceStatus(payload)
+    const interruptedReason = payload.interrupted_reason || payload.interruptedReason || null
+    const completedAt = payload.completed_at || payload.completedAt || new Date().toISOString()
 
-    buffer += decoder.decode(value, { stream: true })
-
-    const parts = buffer.split(/\r?\n\r?\n/)
-    buffer = parts.pop() || ''
-
-    for (const part of parts) {
-      const parsed = parseSseEvent(part)
-      if (!parsed) continue
-
-      if (parsed.event === 'meta' && parsed.data) {
-        handlers.onMeta?.(parsed.data)
-        if (Array.isArray(parsed.data.sources)) {
-          finalSources = parsed.data.sources
-        }
-        if (parsed.data.retrieval_debug) {
-          finalRetrievalDebug = parsed.data.retrieval_debug
-        }
-        if (typeof parsed.data.session_id === 'string' && parsed.data.session_id) {
-          finalSessionId = parsed.data.session_id
-        }
-        if (parsed.data.chat_session) {
-          finalChatSession = parsed.data.chat_session
-        }
-        if (typeof parsed.data.original_question === 'string' && parsed.data.original_question) {
-          finalOriginalQuestion = parsed.data.original_question
-        }
-        if (typeof parsed.data.contextualized_question === 'string' && parsed.data.contextualized_question) {
-          finalContextualizedQuestion = parsed.data.contextualized_question
-        }
-        if (typeof parsed.data.used_short_term_memory === 'boolean') {
-          finalUsedShortTermMemory = parsed.data.used_short_term_memory
-        }
-        if (parsed.data.question_contextualization) {
-          finalQuestionContextualization = parsed.data.question_contextualization
-        }
-      } else if (parsed.event === 'error' && parsed.data) {
-        const apiError = normalizeApiError(parsed.data, '问答失败')
-        handlers.onError?.(apiError.message)
-        // stream 错误事件与普通接口使用同一错误结构，方便上层按 code 做精确提示。
-        throw new ApiError(apiError)
-      } else if (parsed.event === 'delta' && parsed.data?.delta) {
-        finalAnswer += parsed.data.delta
-        handlers.onDelta?.(parsed.data.delta)
-      } else if (parsed.event === 'done' && parsed.data) {
-        if (typeof parsed.data.answer === 'string') {
-          finalAnswer = parsed.data.answer
-        }
-        if (Array.isArray(parsed.data.sources)) {
-          finalSources = parsed.data.sources
-        }
-        if (parsed.data.retrieval_debug) {
-          finalRetrievalDebug = parsed.data.retrieval_debug
-        }
-        if (typeof parsed.data.session_id === 'string' && parsed.data.session_id) {
-          finalSessionId = parsed.data.session_id
-        }
-        if (parsed.data.chat_session) {
-          finalChatSession = parsed.data.chat_session
-        }
-        if (typeof parsed.data.original_question === 'string' && parsed.data.original_question) {
-          finalOriginalQuestion = parsed.data.original_question
-        }
-        if (typeof parsed.data.contextualized_question === 'string' && parsed.data.contextualized_question) {
-          finalContextualizedQuestion = parsed.data.contextualized_question
-        }
-        if (typeof parsed.data.used_short_term_memory === 'boolean') {
-          finalUsedShortTermMemory = parsed.data.used_short_term_memory
-        }
-        if (parsed.data.question_contextualization) {
-          finalQuestionContextualization = parsed.data.question_contextualization
-        }
-        handlers.onDone?.(parsed.data)
-        return {
-          status: parsed.data.status || 'success',
-          arxiv_id: arxivId,
-          question,
-          session_id: finalSessionId || undefined,
-          chat_session: finalChatSession,
-          original_question: finalOriginalQuestion,
-          contextualized_question: finalContextualizedQuestion,
-          used_short_term_memory: finalUsedShortTermMemory,
-          question_contextualization: finalQuestionContextualization,
-          answer: finalAnswer,
-          sources: finalSources,
-          retrieval_debug: finalRetrievalDebug
-        }
-      } else if (parsed.event === 'error' && parsed.data) {
-        const detail = parsed.data.detail || 'Streaming request failed'
-        handlers.onError?.(detail)
-        throw new Error(detail)
-      }
+    return {
+      status,
+      arxiv_id: arxivId,
+      question,
+      session_id: finalState.sessionId || undefined,
+      chat_session: finalState.chatSession,
+      turn_id: payload.turn_id,
+      original_question: finalState.originalQuestion,
+      contextualized_question: finalState.contextualizedQuestion,
+      used_short_term_memory: finalState.usedShortTermMemory,
+      question_contextualization: finalState.questionContextualization,
+      answer: finalAnswer,
+      partial: status !== 'completed',
+      completed_at: status === 'completed' ? completedAt : null,
+      interrupted_reason: interruptedReason,
+      persistence_status: persistenceStatus,
+      sources: finalState.sources,
+      retrieval_debug: finalState.retrievalDebug
     }
   }
 
-  return {
-    status: 'success',
-    arxiv_id: arxivId,
-    question,
-    session_id: finalSessionId || undefined,
-    chat_session: finalChatSession,
-    original_question: finalOriginalQuestion,
-    contextualized_question: finalContextualizedQuestion,
-    used_short_term_memory: finalUsedShortTermMemory,
-    question_contextualization: finalQuestionContextualization,
-    answer: finalAnswer,
-    sources: finalSources,
-    retrieval_debug: finalRetrievalDebug
+  const processEvent = (part: string): QaResult | null => {
+    const parsed = parseSseEvent(part)
+    if (!parsed) return null
+
+    if (parsed.event === 'meta' && parsed.data && typeof parsed.data === 'object') {
+      handlers.onMeta?.(parsed.data)
+      applyQaStreamPayload(parsed.data, finalState)
+      return null
+    }
+
+    if (parsed.event === 'delta') {
+      const delta = typeof parsed.data?.delta === 'string' ? parsed.data.delta : ''
+      if (!delta) return null
+      finalAnswer += delta
+      handlers.onDelta?.(delta)
+      return null
+    }
+
+    if (parsed.event === 'error' && parsed.data) {
+      const apiError = normalizeApiError(parsed.data, '问答失败，请稍后重试。')
+      handlers.onError?.(apiError.message)
+      // 后端 error event 是业务失败终态，必须立即抛出，避免 reader 结束被误判成 partial。
+      throw new ApiError(apiError)
+    }
+
+    if (parsed.event === 'done' && parsed.data && typeof parsed.data === 'object') {
+      hasDone = true
+      const payload = parsed.data as QaStreamDonePayload
+      if (typeof payload.answer === 'string') {
+        finalAnswer = payload.answer
+      }
+      applyQaStreamPayload(payload, finalState)
+      handlers.onDone?.(payload)
+      return buildResult(payload)
+    }
+
+    // malformed 或未知 SSE 事件只跳过，避免调试噪声打断页面；关键 error/done 分支仍会被严格处理。
+    return null
   }
+
+  try {
+    const response = await fetch(`/api/paper/${arxivId}/qa/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream'
+      },
+      body: JSON.stringify({
+        question,
+        ...options,
+        user_id: resolveUserId(options.user_id)
+      }),
+      signal: handlers.signal
+    })
+
+    if (!response.ok) {
+      throw await parseFetchErrorResponse(response, '问答失败，请稍后重试。')
+    }
+
+    if (!response.body) {
+      throw createQaStreamError('stream_incomplete', '回答中断，请重试。', 'Streaming response body is empty')
+    }
+
+    reader = response.body.getReader()
+
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+
+      const parts = buffer.split(/\r?\n\r?\n/)
+      buffer = parts.pop() || ''
+
+      for (const part of parts) {
+        const result = processEvent(part)
+        if (result) return result
+      }
+    }
+
+    const tail = `${buffer}${decoder.decode()}`
+    if (tail.trim()) {
+      const result = processEvent(tail)
+      if (result) return result
+    }
+
+    // 自然结束但没有 done 只能说明流不完整，不能构造 success/completed。
+    if (!hasDone) {
+      throw createQaStreamError(
+        'stream_incomplete',
+        '回答中断，请重试。',
+        finalAnswer ? 'Stream ended before done event after partial answer.' : 'Stream ended before done event.'
+      )
+    }
+  } catch (error) {
+    if (isAbortError(error, handlers.signal)) {
+      const abortedError = createQaStreamError('aborted', '已取消生成', 'AbortController aborted the QA stream.', true)
+      handlers.onError?.(abortedError.message)
+      throw abortedError
+    }
+    throw error
+  } finally {
+    reader?.releaseLock()
+  }
+
+  throw createQaStreamError('stream_incomplete', '回答中断，请重试。', 'Stream finished without a completed result.')
 }

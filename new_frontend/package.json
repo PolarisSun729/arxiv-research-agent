@@ -6,6 +6,9 @@
     "dev": "vite",
     "build": "vue-tsc && vite build",
     "test:errors": "node tests/errorParser.test.mjs",
+    "test:qa-stream": "node tests/qaPaperStream.test.mjs",
+    "test:user-context": "node tests/userContext.test.mjs",
+    "test": "npm run test:errors && npm run test:user-context && npm run test:qa-stream",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -4,7 +4,7 @@ import { BubbleList, Prompts, Thinking, Welcome, XSender } from 'vue-element-plu
 import type { PromptsItemsProps } from 'vue-element-plus-x/types/Prompts'
 import type { RetrievalDebug } from '@/api/papers'
 import type { AgentChatMessage } from '@/types/agentChat'
-import type { RagChatSource } from '@/types/ragChat'
+import type { QaTurnForRagChat, RagChatSource } from '@/types/ragChat'
 import { renderMarkdownWithLatex } from '@/utils/markdown'
 
 type RagChatPanelMessage = AgentChatMessage & {
@@ -15,6 +15,7 @@ type RagChatPanelMessage = AgentChatMessage & {
   turnId?: string
   sources?: RagChatSource[]
   retrievalDebug?: RetrievalDebug | null
+  response?: QaTurnForRagChat | unknown | null
 }
 
 interface SenderModelValue {
@@ -38,12 +39,14 @@ const props = defineProps<{
   assistantLabel?: string
   senderPlaceholder?: string
   senderText?: string
+  canStop?: boolean
 }>()
 
 const emit = defineEmits<{
   (event: 'submit-question', question: string): void
   (event: 'select-prompt', prompt: string): void
   (event: 'update:senderText', value: string): void
+  (event: 'stop-generation'): void
 }>()
 
 defineSlots<{
@@ -51,6 +54,12 @@ defineSlots<{
 }>()
 
 const senderRef = ref<SenderExpose | null>(null)
+
+function asQaTurnResponse(response: unknown): QaTurnForRagChat | null {
+  // 同一个聊天面板也承载 Agent 响应，状态标签只读取 QA turn 的结构化字段。
+  if (!response || typeof response !== 'object') return null
+  return response as QaTurnForRagChat
+}
 
 const promptItems = computed<PromptsItemsProps[]>(() =>
   props.quickPrompts.map((prompt, index) => ({
@@ -118,6 +127,29 @@ function handlePromptSelect(item: PromptsItemsProps) {
   emit('update:senderText', prompt)
   emit('select-prompt', prompt)
 }
+
+function getAssistantStatusLabel(item: RagChatPanelMessage) {
+  const response = asQaTurnResponse(item.response)
+  const status = response?.status
+  const persistenceStatus = response?.persistenceStatus
+  if (item.loading) return '正在生成'
+  if (status === 'completed') return persistenceStatus === 'saved' ? '已保存' : '已完成'
+  if (status === 'aborted') return '已取消'
+  if (status === 'partial' || status === 'interrupted') return '未完成'
+  if (status === 'persistence_failed') return '未保存'
+  if (status === 'failed') return '失败'
+  return ''
+}
+
+function getAssistantStatusType(item: RagChatPanelMessage) {
+  const status = asQaTurnResponse(item.response)?.status
+  if (item.loading) return 'primary'
+  if (status === 'completed') return 'success'
+  if (status === 'aborted') return 'info'
+  if (status === 'partial' || status === 'interrupted' || status === 'persistence_failed') return 'warning'
+  if (status === 'failed') return 'danger'
+  return 'info'
+}
 </script>
 
 <template>
@@ -157,7 +189,7 @@ function handlePromptSelect(item: PromptsItemsProps) {
 
         <template #content="{ item }">
           <Thinking
-            v-if="item.role === 'assistant' && item.loading"
+            v-if="item.role === 'assistant' && item.loading && !item.content"
             class="rag-chat-panel__thinking"
             :model-value="true"
             status="thinking"
@@ -180,6 +212,16 @@ function handlePromptSelect(item: PromptsItemsProps) {
               <span class="rag-chat-panel__stream-dot" />
               <span>正在生成中...</span>
             </div>
+
+            <el-tag
+              v-if="item.role === 'assistant' && getAssistantStatusLabel(item)"
+              class="answer-state-tag"
+              size="small"
+              effect="plain"
+              :type="getAssistantStatusType(item)"
+            >
+              {{ getAssistantStatusLabel(item) }}
+            </el-tag>
 
             <slot name="message-footer" :item="item" />
 
@@ -205,6 +247,17 @@ function handlePromptSelect(item: PromptsItemsProps) {
       >
         <template #footer>
           <div class="rag-chat-panel__sender-tip">
+            <el-button
+              v-if="canStop && loading"
+              class="rag-chat-panel__stop-button"
+              size="small"
+              text
+              type="danger"
+              @click="emit('stop-generation')"
+            >
+              <el-icon><VideoPause /></el-icon>
+              停止生成
+            </el-button>
             先做语义解析，再生成结构化结果，适合 Agent 搜索场景
           </div>
         </template>
@@ -478,14 +531,25 @@ function handlePromptSelect(item: PromptsItemsProps) {
   color: #dc2626;
 }
 
+.answer-state-tag {
+  width: fit-content;
+}
+
 .rag-chat-panel__sender {
   flex: none;
 }
 
 .rag-chat-panel__sender-tip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   padding-top: 6px;
   font-size: 12px;
   color: #64748b;
+}
+
+.rag-chat-panel__stop-button {
+  flex: none;
 }
 
 @keyframes rag-chat-panel-pulse {

@@ -7,9 +7,12 @@ const ERROR_MESSAGES: Record<string, string> = {
   qa_index_build_failed: '论文 QA 索引构建失败，可以重新构建。',
   vector_store_error: '检索服务异常，请稍后重试。',
   llm_generation_failed: '答案生成失败，请稍后重试。',
+  aborted: '已取消生成',
+  stream_incomplete: '回答中断，请重试。',
+  stream_interrupted: '回答中断，请重试。',
   resume_checkpoint_not_found: '原执行现场已失效，请重新发起请求。',
   agent_runtime_error: 'Agent 运行失败，请稍后重试。',
-  database_write_failed: '保存失败，请稍后重试。',
+  database_write_failed: '答案保存失败。',
   unknown_error: '请求失败，请稍后重试。'
 }
 

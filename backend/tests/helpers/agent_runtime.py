@@ -17,6 +17,15 @@ class _DependencyBag:
 
 DEPENDENCY_BAG = _DependencyBag()
 
+PUBLIC_STUB_MODULES = [
+    "dependencies",
+    "services.memory",
+    "services.storage.database_service",
+    "tools.arxiv_tools",
+    "tools.paper_qa_tools",
+    "tools.recommendation_tools",
+]
+
 
 class FakeMemoryService:
     def __init__(self) -> None:
@@ -115,6 +124,12 @@ def _ensure_dependency_stubs() -> None:
 
     if "services.storage.database_service" not in sys.modules:
         database_service_module = types.ModuleType("services.storage.database_service")
+
+        class _PaperQATurnPersistenceError(RuntimeError):
+            pass
+
+        # Agent 测试只需要轻量数据库桩，但导出形状必须跟真实模块一致，避免影响同进程里的 QA 测试收集。
+        database_service_module.PaperQATurnPersistenceError = _PaperQATurnPersistenceError
         database_service_module.DatabaseService = FakeDatabaseService
         sys.modules["services.storage.database_service"] = database_service_module
 
@@ -207,6 +222,18 @@ def _ensure_dependency_stubs() -> None:
                 "figure_table": {"keyword": 1.08, "vector_rewrite": 1.02},
                 "other": {"vector_original": 0.95, "vector_rewrite": 0.95, "keyword": 0.95},
             }
+        }
+    if not hasattr(config_module, "get_agent_planner_runtime_config"):
+        config_module.get_agent_planner_runtime_config = lambda: {
+            "enable_tool_aware_planner": False,
+            "enable_llm_plan_draft": False,
+            "enable_llm_recovery_diagnosis": False,
+            "llm_recovery_timeout": 6,
+            "llm_plan_timeout": 8,
+            "llm_plan_max_steps": 8,
+            "llm_plan_fallback_to_rule": True,
+            "llm_plan_fallback_to_template": True,
+            "expose_planner_debug": True,
         }
     sys.modules["utils.config"] = config_module
 
@@ -371,7 +398,18 @@ def _load_module(module_name: str, file_path: Path):
     return module
 
 
+def _restore_public_stub_modules(saved_modules: Dict[str, Any]) -> None:
+    # Agent 测试桩只服务当前加载过程；恢复公共模块可避免 pytest 混跑时污染后续 service/router 测试。
+    for module_name in PUBLIC_STUB_MODULES:
+        original = saved_modules.get(module_name)
+        if original is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = original
+
+
 def load_agent_test_modules() -> Dict[str, Any]:
+    saved_public_modules = {module_name: sys.modules.get(module_name) for module_name in PUBLIC_STUB_MODULES}
     # 测试进程里可能已经残留过上一轮导入的同名模块；先清理再按当前源码重建，
     # 可以避免拿到旧版对象而出现“属性存在但实际实现已变”的隐蔽问题。
     for module_name in [
@@ -394,6 +432,13 @@ def load_agent_test_modules() -> Dict[str, Any]:
         "backend.agents.arxiv_search_agent.utils.text_utils",
         "backend.agents.arxiv_search_agent.utils.paper_reference_resolver",
         "backend.agents.arxiv_search_agent.observer",
+        "backend.agents.arxiv_search_agent.failure_classifier",
+        "backend.agents.arxiv_search_agent.recovery_policy",
+        "backend.agents.arxiv_search_agent.recovery_diagnosis",
+        "backend.agents.arxiv_search_agent.recovery_chooser",
+        "backend.agents.arxiv_search_agent.recovery_safety",
+        "backend.agents.arxiv_search_agent.plan_patcher",
+        "backend.agents.arxiv_search_agent.tool_aware_planner",
         "backend.agents.arxiv_search_agent.planner",
         "backend.agents.arxiv_search_agent.plan_validator",
         "backend.agents.arxiv_search_agent.replanner",
@@ -476,7 +521,7 @@ def load_agent_test_modules() -> Dict[str, Any]:
     package_module.run_arxiv_search_agent = service_module.run_arxiv_search_agent
     package_module.stream_arxiv_search_agent = service_module.stream_arxiv_search_agent
 
-    return {
+    modules = {
         "schemas": schemas,
         "state_module": state_module,
         "graph_module": graph_module,
@@ -485,6 +530,8 @@ def load_agent_test_modules() -> Dict[str, Any]:
         "tool_node_module": sys.modules["backend.agents.arxiv_search_agent.node.tool_node"],
         "tool_registry_module": sys.modules["tools.tool_registry"],
     }
+    _restore_public_stub_modules(saved_public_modules)
+    return modules
 
 
 __all__ = [

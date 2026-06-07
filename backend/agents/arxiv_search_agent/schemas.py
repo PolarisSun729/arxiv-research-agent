@@ -397,6 +397,76 @@ class Goal(BaseModel):
     task_scope: Optional[str] = None
 
 
+class PlanDraftStep(BaseModel):
+    """表示尚未被信任的单个规划草稿步骤。
+
+    PlanDraft 只描述 planner 的意图和工具选择，不能直接交给 Executor；
+    后续必须经过 ToolRegistry 解析、依赖校验和 PlanValidator 才能成为 ExecutablePlan。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: str
+    action_type: str
+    tool_name: str
+    step_reason: Optional[str] = None
+    input_bindings: List["StepInputBinding"] = Field(default_factory=list)
+    depends_on: List[str] = Field(default_factory=list)
+    expected_output_key: Optional[str] = None
+    retry_policy: Optional["StepPolicy"] = None
+    risk_level: Literal["low", "medium", "high"] = "low"
+    requires_confirmation: bool = False
+    fallback_reason: Optional[str] = None
+
+
+class PlanDraft(BaseModel):
+    """Tool-Aware Planner 产出的不可信计划草稿。
+
+    草稿中的 tool_name、依赖和输出键都只是候选声明；只有转换器校验通过并生成
+    ExecutablePlan 后，执行器才允许消费对应计划。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    draft_id: str
+    plan_intent: Optional[str] = None
+    selected_tools: List[str] = Field(default_factory=list)
+    steps: List[PlanDraftStep] = Field(default_factory=list)
+    fallback_reason: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolCandidate(BaseModel):
+    """候选工具筛选结果中的单个工具说明。"""
+    model_config = ConfigDict(extra="forbid")
+
+    tool_name: str
+    capability_tags: List[str] = Field(default_factory=list)
+    side_effect_level: str = "none"
+    requires_confirmation: bool = False
+    selection_reason: Optional[str] = None
+
+
+class ExcludedToolCandidate(BaseModel):
+    """记录被排除的工具及原因，便于 planner debug 判断候选边界是否过宽。"""
+    model_config = ConfigDict(extra="forbid")
+
+    tool_name: str
+    capability_tags: List[str] = Field(default_factory=list)
+    side_effect_level: str = "none"
+    requires_confirmation: bool = False
+    exclusion_reason: Optional[str] = None
+
+
+class ToolCandidateSelection(BaseModel):
+    """Tool Candidate Selector 的结构化输出。"""
+    model_config = ConfigDict(extra="forbid")
+
+    goal_type: Optional[str] = None
+    candidate_tools: List[ToolCandidate] = Field(default_factory=list)
+    excluded_tools: List[ExcludedToolCandidate] = Field(default_factory=list)
+    selection_reason: Optional[str] = None
+    risk_summary: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ExecutionPlanStep(BaseModel):
     """兼容旧版节点流使用的轻量计划步骤。
 
@@ -698,6 +768,101 @@ class AgentTurnResult(BaseModel):
         return value
 
 
+FailureCategory = Literal[
+    "search_empty",
+    "search_low_confidence",
+    "search_too_broad",
+    "search_too_narrow",
+    "paper_index_missing",
+    "paper_index_stale",
+    "paper_index_corrupted",
+    "qa_no_answer",
+    "qa_no_sources",
+    "qa_low_grounding",
+    "preference_target_missing",
+    "preference_write_failed",
+    "tool_timeout",
+    "tool_invalid_output",
+    "tool_runtime_error",
+    "insufficient_context",
+    "ambiguous_user_request",
+    "empty_user_profile",
+]
+
+RecoveryActionType = Literal[
+    "patch_plan",
+    "retry_step",
+    "ask_clarification",
+    "request_confirmation",
+    "skip_step",
+    "fallback_answer",
+    "abort_with_error",
+]
+
+RecoverySeverity = Literal["info", "warning", "error", "critical"]
+RecoveryRiskLevel = Literal["low", "medium", "high"]
+
+
+class RecoveryCandidate(BaseModel):
+    """描述一个可选恢复动作，供后续 chooser/patcher 使用，本身不直接改写执行计划。"""
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str
+    action_type: RecoveryActionType
+    failure_category: FailureCategory
+    priority: int = 100
+    confidence: float = 1.0
+    reason: str
+    target_step_id: str
+    required_tools: List[str] = Field(default_factory=list)
+    patch_strategy: Optional[str] = None
+    strategy_payload: Dict[str, Any] = Field(default_factory=dict)
+    risk_level: RecoveryRiskLevel = "low"
+    requires_confirmation: bool = False
+    max_attempts: Optional[int] = None
+    expected_effect: Optional[str] = None
+    fallback_if_failed: Optional[str] = None
+
+
+class RecoveryAction(BaseModel):
+    """RecoveryChooser 选出的最终恢复动作，是 Replanner 与 PlanPatcher 之间的稳定接口。"""
+    model_config = ConfigDict(extra="forbid")
+
+    action_type: RecoveryActionType
+    target_step_id: str
+    selected_candidate_id: Optional[str] = None
+    patch_strategy: Optional[str] = None
+    patch_payload: Dict[str, Any] = Field(default_factory=dict)
+    requires_confirmation: bool = False
+    user_message: Optional[str] = None
+    fallback_reason: Optional[str] = None
+    debug_reason: Optional[str] = None
+
+
+class LLMRecoveryDiagnosis(BaseModel):
+    """LLM 仅提供恢复诊断和候选排序建议，不能创建动作或直接修改计划。"""
+    model_config = ConfigDict(extra="forbid")
+
+    diagnosis: Optional[str] = None
+    recommended_recovery_type: Optional[RecoveryActionType] = None
+    ranked_candidate_ids: List[str] = Field(default_factory=list)
+    clarification_question: Optional[str] = None
+    user_facing_reason: Optional[str] = None
+    confidence: float = 0.0
+    ignored_candidate_ids: List[str] = Field(default_factory=list)
+    error: Optional[str] = None
+
+
+class RecoverySafetyCheckResult(BaseModel):
+    """SafetyGuard 的结构化结果，确保 LLM 和 policy 都不能绕过副作用边界。"""
+    model_config = ConfigDict(extra="forbid")
+
+    allowed: bool
+    reasons: List[str] = Field(default_factory=list)
+    fallback_action: Optional[RecoveryAction] = None
+    checked_action: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ObservationResult(BaseModel):
     """统一承载 Observer 对单步结果质量的判断，避免把质量语义混进工具异常分支。"""
     model_config = ConfigDict(extra="forbid")
@@ -716,6 +881,13 @@ class ObservationResult(BaseModel):
     confidence: float = 1.0
     details: Dict[str, Any] = Field(default_factory=dict)
     suggested_action: Optional[str] = None
+    failure_category: Optional[FailureCategory] = None
+    severity: Optional[RecoverySeverity] = None
+    recoverable: Optional[bool] = None
+    suggested_recovery_types: List[RecoveryActionType] = Field(default_factory=list)
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+    retryable: Optional[bool] = None
+    requires_user_input: Optional[bool] = None
 
 
 class AgentStreamEvent(BaseModel):

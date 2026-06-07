@@ -158,6 +158,7 @@ export interface PaperMaterializationPayload {
 }
 
 export interface PaperPreferenceRequest {
+  user_id?: string
   arxiv_id: string
   paper: PaperMaterializationPayload
 }

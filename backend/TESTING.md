@@ -57,7 +57,34 @@ Manual-only external integration checks are not part of automated tests and shou
 
 ## 3. How to run tests
 
-All commands below assume:
+Recommended repository-level quality gate:
+
+```bash
+python scripts/check_quality.py
+```
+
+The default gate runs basic doctor, backend static checks, backend automated tests, backend startup smoke tests, frontend tests, and frontend build checks, then prints a final summary. It is the preferred command before submitting code because it keeps the offline-safe backend and frontend checks in one place.
+
+CI uses the same staged gate through `python scripts/check_quality.py ci`. Codex changes should report the exact checks that were run, their pass/fail status, and any environment-related blockers; see `docs/codex_acceptance.md` from the repository root.
+
+Backend static checks are not ordinary unit tests. They run `compileall`, import smoke checks for key app/router/service/agent/tool/config modules, and optional low-noise `ruff` rules before the heavier test suite starts.
+
+Backend startup smoke tests are also separate from full integration tests. They create the FastAPI app in lazy mode, enter the lifespan through `TestClient`, assert core routers and stable error payloads, and use fake services so no real LLM, Embedding, Milvus, arXiv, rerank, or PDF parsing backend is contacted.
+
+Useful staged entrypoints from the repository root:
+
+```bash
+python scripts/check_quality.py backend
+python scripts/check_quality.py frontend
+python scripts/check_quality.py smoke
+python scripts/check_quality.py static
+python scripts/check_quality.py compile
+python scripts/check_quality.py backend-startup-smoke
+```
+
+`static` is the recommended backend static layer. `compile` only runs the narrower Python compilation check.
+
+Backend-only commands below assume:
 
 ```bash
 conda activate new_rag
@@ -94,7 +121,15 @@ python -m unittest discover -s tests/integration -p "test_*.py"
 python -m unittest tests.golden.test_rag_golden_smoke
 ```
 
-### 3.6 Run full automated test suite
+### 3.6 Run RAG golden pipeline tests
+
+```bash
+python -m pytest tests/golden/test_rag_golden_pipeline.py
+```
+
+This suite exercises the real `EnhancedRetrievalService` orchestration with fake embeddings, an in-memory vector store, fixed chunks, and temporary trace output. It validates evidence hit-at-k, key retrieval debug stages, trace export, and figure/table evidence flow without calling a real model or Milvus.
+
+### 3.7 Run full automated test suite
 
 ```bash
 python -m unittest discover -s tests -p "test_*.py"
@@ -110,6 +145,7 @@ This includes unit, api, integration, helper/infrastructure, and golden smoke te
 python -m unittest discover -s tests -p "test_agent*.py"
 python -m unittest tests.api.test_agent_router
 python -m unittest tests.integration.test_agent_chat_flow
+python -m pytest tests/api/test_agent_router.py
 ```
 
 ### Retrieval / RAG tests
@@ -117,6 +153,7 @@ python -m unittest tests.integration.test_agent_chat_flow
 ```bash
 python -m unittest discover -s tests/unit/services/retrieval -p "test_*.py"
 python -m unittest tests.integration.test_enhanced_retrieval_service
+python -m pytest tests/golden/test_rag_golden_pipeline.py
 ```
 
 ### Paper QA tests
@@ -133,6 +170,8 @@ python -m unittest tests.unit.services.intent.test_intent_service
 python -m unittest tests.integration.test_memory_service
 python -m unittest tests.integration.test_recommendation_flow
 ```
+
+The memory integration suite also covers the Agent session-memory read/write loop: final Agent state is reduced to a small persisted memory patch, then reloaded and merged with frontend context. This catches regressions where Agent state, selected paper context, or tool-call summaries stop surviving across turns.
 
 ### Database service tests
 

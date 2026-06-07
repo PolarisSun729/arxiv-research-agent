@@ -77,6 +77,48 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(context["turn_count"], 1)
         self.assertEqual(context["turns"][0]["turn_id"], "turn-1")
 
+    def test_conversation_context_filters_incomplete_and_invalid_turns(self) -> None:
+        session = self.db_service.create_paper_chat_session(arxiv_id=self.arxiv_id, user_id=self.user_id, title="QA")
+        self.db_service.append_paper_chat_message(session["session_id"], "user", "Valid question?", user_id=self.user_id, turn_id="valid-turn")
+        self.db_service.append_paper_chat_message(
+            session["session_id"],
+            "assistant",
+            "Valid answer.",
+            user_id=self.user_id,
+            turn_id="valid-turn",
+            sources=[{"source_id": "s1"}],
+        )
+        self.db_service.append_paper_chat_message(session["session_id"], "user", "Only user", user_id=self.user_id, turn_id="user-only")
+        self.db_service.append_paper_chat_message(
+            session["session_id"],
+            "assistant",
+            "Only assistant",
+            user_id=self.user_id,
+            turn_id="assistant-only",
+        )
+        self.db_service.append_paper_chat_message(session["session_id"], "user", "Duplicate one", user_id=self.user_id, turn_id="duplicate-role")
+        self.db_service.append_paper_chat_message(session["session_id"], "user", "Duplicate two", user_id=self.user_id, turn_id="duplicate-role")
+        self.db_service.append_paper_chat_message(
+            session["session_id"],
+            "assistant",
+            "Duplicate answer",
+            user_id=self.user_id,
+            turn_id="duplicate-role",
+        )
+
+        context = self.memory_service.load_paper_conversation_context(
+            self.user_id,
+            self.arxiv_id,
+            session_id=session["session_id"],
+            limit=5,
+        )
+
+        self.assertEqual(context["turn_count"], 1)
+        self.assertEqual(context["turns"][0]["turn_id"], "valid-turn")
+        self.assertEqual(context["filtered_incomplete_turn_count"], 2)
+        self.assertEqual(context["invalid_turn_count"], 1)
+        self.assertEqual(context["filtered_turn_count"], 3)
+
     def test_update_profile_from_note_merges_note_and_paper_signals(self) -> None:
         note = self.db_service.create_paper_note(
             user_id=self.user_id,
@@ -123,6 +165,43 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(summary["disliked_papers"], [])
         self.assertEqual(summary["paper_actions"], {})
         self.assertIsNone(summary["interest_vector"])
+
+    def test_agent_memory_save_and_load_merges_backend_and_frontend_context(self) -> None:
+        final_state = {
+            "intent": "paper_qa",
+            "answer": "The paper uses a retrieval pipeline.",
+            "context": {
+                "selected_paper": {"arxiv_id": self.arxiv_id, "title": "Test Paper"},
+                "active_paper_session_id": "paper-session-1",
+            },
+            "paper_qa_result": {
+                "arxiv_id": self.arxiv_id,
+                "session_id": "paper-session-1",
+                "answer": "retrieval pipeline",
+            },
+            "tool_calls": [
+                {"tool_name": "check_paper_qa_index", "status": "success", "summary": "index ready"},
+                {"tool_name": "answer_paper_question", "status": "success", "summary": "grounded answer"},
+            ],
+        }
+
+        saved = self.memory_service.save_agent_memory(self.user_id, "agent-session-1", final_state)
+        loaded = self.memory_service.load_agent_memory(
+            self.user_id,
+            "agent-session-1",
+            frontend_context={"selected_paper": {"arxiv_id": "frontend-paper"}, "ui_state": "detail"},
+        )
+
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved["active_arxiv_id"], self.arxiv_id)
+        self.assertEqual(saved["active_paper_session_id"], "paper-session-1")
+        self.assertEqual(saved["last_intent"], "paper_qa")
+        self.assertEqual(saved["last_tool_calls_summary"][0]["tool_name"], "check_paper_qa_index")
+        self.assertEqual(loaded["session_id"], "agent-session-1")
+        self.assertEqual(loaded["backend_memory"]["selected_paper"]["arxiv_id"], self.arxiv_id)
+        # 前端上下文代表当前 UI 现场，应覆盖同名后端记忆字段，但后端记忆仍单独保留。
+        self.assertEqual(loaded["merged_context"]["selected_paper"]["arxiv_id"], "frontend-paper")
+        self.assertEqual(loaded["merged_context"]["ui_state"], "detail")
 
 
 if __name__ == "__main__":

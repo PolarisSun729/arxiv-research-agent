@@ -4,7 +4,7 @@ import json
 import uuid
 from typing import Dict, Any, List, Optional
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from utils.config import SQLITE_CONFIG, get_default_user_id
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,12 @@ PAPER_NOTE_TYPES = {
     "todo",
     "custom",
 }
+PAPER_INDEX_ACTIVE_JOB_STATUSES = ("pending", "running", "retrying")
+
+
+class PaperQATurnPersistenceError(RuntimeError):
+    """QA 单轮对话写入失败时抛出的强语义异常，避免关键写路径静默丢失。"""
+
 
 class DatabaseService:
     def __init__(self):
@@ -143,6 +149,33 @@ class DatabaseService:
             ''')
 
             cursor.execute('''
+                CREATE TABLE IF NOT EXISTS paper_qa_index_versions (
+                    build_id TEXT PRIMARY KEY,
+                    arxiv_id TEXT NOT NULL,
+                    index_version TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'building',
+                    is_active INTEGER NOT NULL DEFAULT 0,
+                    collection_name TEXT,
+                    chunk_count INTEGER DEFAULT 0,
+                    embedding_model TEXT,
+                    pdf_path TEXT,
+                    chunk_file TEXT,
+                    embedding_file TEXT,
+                    loading_method TEXT,
+                    chunking_strategy TEXT,
+                    current_stage TEXT,
+                    failed_stage TEXT,
+                    error_message TEXT,
+                    artifact_status TEXT DEFAULT 'active',
+                    indexed_at TIMESTAMP,
+                    activated_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(arxiv_id, index_version)
+                )
+            ''')
+
+            cursor.execute('''
                 CREATE TABLE IF NOT EXISTS paper_index_jobs (
                     job_id TEXT PRIMARY KEY,
                     arxiv_id TEXT NOT NULL,
@@ -151,6 +184,8 @@ class DatabaseService:
                     progress INTEGER NOT NULL DEFAULT 0,
                     error_message TEXT,
                     loading_method TEXT,
+                    idempotency_key TEXT,
+                    heartbeat_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -271,6 +306,17 @@ class DatabaseService:
             ''')
 
             cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_paper_qa_index_versions_arxiv_updated
+                ON paper_qa_index_versions(arxiv_id, updated_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_qa_index_versions_one_active
+                ON paper_qa_index_versions(arxiv_id)
+                WHERE is_active = 1
+            ''')
+
+            cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_paper_chat_messages_session_created
                 ON paper_chat_messages(session_id, created_at ASC)
             ''')
@@ -304,6 +350,8 @@ class DatabaseService:
             logger.info("Database tables initialized successfully")
             self._ensure_user_interest_vector_columns(conn)
             self._ensure_paper_qa_index_columns(conn)
+            self._ensure_paper_qa_index_version_rows(conn)
+            self._ensure_paper_index_job_columns(conn)
 
     def _ensure_user_interest_vector_columns(self, conn):
         required_columns = {
@@ -335,6 +383,9 @@ class DatabaseService:
             "error_message": "TEXT",
             "artifact_status": "TEXT DEFAULT 'active'",
             "indexed_at": "TIMESTAMP",
+            "active_index_version": "TEXT",
+            "active_build_id": "TEXT",
+            "previous_build_id": "TEXT",
         }
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(paper_qa_index)")
@@ -344,6 +395,93 @@ class DatabaseService:
                 cursor.execute(
                     f"ALTER TABLE paper_qa_index ADD COLUMN {column_name} {column_definition}"
                 )
+        conn.commit()
+
+    def _ensure_paper_qa_index_version_rows(self, conn):
+        # 旧库只有 paper_qa_index 单行记录；这里把已可用索引补成 active version，避免升级后丢失可问答状态。
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO paper_qa_index_versions (
+                build_id, arxiv_id, index_version, status, is_active, collection_name,
+                chunk_count, embedding_model, pdf_path, chunk_file, embedding_file,
+                loading_method, chunking_strategy, current_stage, failed_stage,
+                error_message, artifact_status, indexed_at, activated_at, created_at, updated_at
+            )
+            SELECT
+                'legacy-' || replace(replace(arxiv_id, '.', '_'), '/', '_'),
+                arxiv_id,
+                'legacy',
+                CASE WHEN status = 'indexed' THEN 'active' ELSE status END,
+                CASE WHEN status = 'indexed' THEN 1 ELSE 0 END,
+                collection_name,
+                chunk_count,
+                embedding_model,
+                pdf_path,
+                chunk_file,
+                embedding_file,
+                loading_method,
+                chunking_strategy,
+                current_stage,
+                failed_stage,
+                error_message,
+                artifact_status,
+                indexed_at,
+                CASE WHEN status = 'indexed' THEN COALESCE(indexed_at, updated_at, created_at, CURRENT_TIMESTAMP) ELSE NULL END,
+                created_at,
+                updated_at
+            FROM paper_qa_index
+            WHERE collection_name IS NOT NULL
+              AND collection_name != ''
+            """
+        )
+        cursor.execute(
+            """
+            UPDATE paper_qa_index
+            SET active_index_version = COALESCE(active_index_version, 'legacy'),
+                active_build_id = COALESCE(active_build_id, 'legacy-' || replace(replace(arxiv_id, '.', '_'), '/', '_'))
+            WHERE status = 'indexed'
+              AND collection_name IS NOT NULL
+              AND collection_name != ''
+            """
+        )
+        conn.commit()
+
+    def _ensure_paper_index_job_columns(self, conn):
+        # 旧库可能缺少心跳和幂等键；启动时补齐，避免用户为了恢复僵尸任务而手工删库。
+        required_columns = {
+            "idempotency_key": "TEXT",
+            "heartbeat_at": "TIMESTAMP",
+        }
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(paper_index_jobs)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        for column_name, column_definition in required_columns.items():
+            if column_name not in existing_columns:
+                cursor.execute(
+                    f"ALTER TABLE paper_index_jobs ADD COLUMN {column_name} {column_definition}"
+                )
+
+        cursor.execute(
+            """
+            UPDATE paper_index_jobs
+            SET idempotency_key = arxiv_id || ':' || COALESCE(NULLIF(loading_method, ''), 'docling')
+            WHERE idempotency_key IS NULL OR idempotency_key = ''
+            """
+        )
+        cursor.execute(
+            """
+            UPDATE paper_index_jobs
+            SET heartbeat_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
+            WHERE heartbeat_at IS NULL OR heartbeat_at = ''
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_paper_index_jobs_idempotency_status
+            ON paper_index_jobs(idempotency_key, status, heartbeat_at)
+            """
+        )
         conn.commit()
 
     @staticmethod
@@ -1264,7 +1402,8 @@ class DatabaseService:
                 cursor.execute('''
                     SELECT arxiv_id, collection_name, status, chunk_count, embedding_model, pdf_path,
                            chunk_file, embedding_file, loading_method, chunking_strategy, current_stage,
-                           failed_stage, error_message, artifact_status, indexed_at, created_at, updated_at
+                           failed_stage, error_message, artifact_status, indexed_at, created_at, updated_at,
+                           active_index_version, active_build_id, previous_build_id
                     FROM paper_qa_index WHERE arxiv_id = ?
                 ''', (arxiv_id,))
                 
@@ -1288,11 +1427,390 @@ class DatabaseService:
                         'indexed_at': row[14],
                         'created_at': row[15],
                         'updated_at': row[16],
+                        'active_index_version': row[17],
+                        'active_build_id': row[18],
+                        'previous_build_id': row[19],
                     }
                 return None
         except Exception as e:
             logger.error(f"Error getting paper QA index: {str(e)}")
             return None
+
+    @staticmethod
+    def _row_to_paper_qa_index_version(row: Any) -> Dict[str, Any]:
+        return {
+            "build_id": row[0],
+            "arxiv_id": row[1],
+            "index_version": row[2],
+            "status": row[3],
+            "is_active": bool(row[4]),
+            "collection_name": row[5],
+            "chunk_count": row[6],
+            "embedding_model": row[7],
+            "pdf_path": row[8],
+            "chunk_file": row[9],
+            "embedding_file": row[10],
+            "loading_method": row[11],
+            "chunking_strategy": row[12],
+            "current_stage": row[13],
+            "failed_stage": row[14],
+            "error_message": row[15],
+            "artifact_status": row[16],
+            "indexed_at": row[17],
+            "activated_at": row[18],
+            "created_at": row[19],
+            "updated_at": row[20],
+        }
+
+    @staticmethod
+    def _paper_qa_index_version_select_sql() -> str:
+        return """
+            SELECT build_id, arxiv_id, index_version, status, is_active, collection_name,
+                   chunk_count, embedding_model, pdf_path, chunk_file, embedding_file,
+                   loading_method, chunking_strategy, current_stage, failed_stage,
+                   error_message, artifact_status, indexed_at, activated_at, created_at, updated_at
+            FROM paper_qa_index_versions
+        """
+
+    @staticmethod
+    def _build_paper_qa_index_version_id(arxiv_id: str) -> str:
+        safe_arxiv_id = "".join(ch if ch.isalnum() else "_" for ch in str(arxiv_id or "").strip()).strip("_") or "paper"
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+        suffix = uuid.uuid4().hex[:8]
+        return f"{safe_arxiv_id}_{timestamp}_{suffix}"
+
+    def create_paper_qa_index_build(self, arxiv_id: str, loading_method: str) -> Optional[Dict[str, Any]]:
+        try:
+            index_version = self._build_paper_qa_index_version_id(arxiv_id)
+            build_id = str(uuid.uuid4())
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                # building version 只记录新构建的临时状态，不覆盖 paper_qa_index 中仍在线的 active 指针。
+                cursor.execute(
+                    """
+                    INSERT INTO paper_qa_index_versions (
+                        build_id, arxiv_id, index_version, status, is_active,
+                        loading_method, current_stage, artifact_status
+                    )
+                    VALUES (?, ?, ?, 'building', 0, ?, 'create_build_version', 'active')
+                    """,
+                    (build_id, arxiv_id, index_version, loading_method),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO paper_qa_index (
+                        arxiv_id, status, current_stage, loading_method, artifact_status
+                    )
+                    VALUES (?, 'not_indexed', 'create_build_version', ?, 'active')
+                    ON CONFLICT(arxiv_id) DO UPDATE SET
+                        current_stage = excluded.current_stage,
+                        loading_method = excluded.loading_method,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (arxiv_id, loading_method),
+                )
+                conn.commit()
+            return self.get_paper_qa_index_build(build_id)
+        except Exception as e:
+            logger.error(f"Error creating paper QA index build: {str(e)}")
+            return None
+
+    def get_paper_qa_index_build(self, build_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    self._paper_qa_index_version_select_sql() + " WHERE build_id = ?",
+                    (build_id,),
+                )
+                row = cursor.fetchone()
+                return self._row_to_paper_qa_index_version(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting paper QA index build: {str(e)}")
+            return None
+
+    def get_active_paper_qa_index_build(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    self._paper_qa_index_version_select_sql() + """
+                    WHERE arxiv_id = ? AND is_active = 1
+                    ORDER BY activated_at DESC, updated_at DESC
+                    LIMIT 1
+                    """,
+                    (arxiv_id,),
+                )
+                row = cursor.fetchone()
+                return self._row_to_paper_qa_index_version(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting active paper QA index build: {str(e)}")
+            return None
+
+    def get_latest_paper_qa_index_build(
+        self,
+        arxiv_id: str,
+        *,
+        statuses: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            status_values = [str(item) for item in (statuses or []) if str(item).strip()]
+            where_parts = ["arxiv_id = ?"]
+            values: List[Any] = [arxiv_id]
+            if status_values:
+                where_parts.append(f"status IN ({','.join('?' for _ in status_values)})")
+                values.extend(status_values)
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    self._paper_qa_index_version_select_sql()
+                    + f"""
+                    WHERE {" AND ".join(where_parts)}
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT 1
+                    """,
+                    values,
+                )
+                row = cursor.fetchone()
+                return self._row_to_paper_qa_index_version(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting latest paper QA index build: {str(e)}")
+            return None
+
+    def list_paper_qa_index_builds(
+        self,
+        arxiv_id: str,
+        *,
+        statuses: Optional[List[str]] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        try:
+            normalized_limit = max(1, int(limit))
+            status_values = [str(item) for item in (statuses or []) if str(item).strip()]
+            where_parts = ["arxiv_id = ?"]
+            values: List[Any] = [arxiv_id]
+            if status_values:
+                where_parts.append(f"status IN ({','.join('?' for _ in status_values)})")
+                values.extend(status_values)
+            values.append(normalized_limit)
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    self._paper_qa_index_version_select_sql()
+                    + f"""
+                    WHERE {" AND ".join(where_parts)}
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT ?
+                    """,
+                    values,
+                )
+                return [self._row_to_paper_qa_index_version(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error listing paper QA index builds: {str(e)}")
+            return []
+
+    def update_paper_qa_index_build(self, build_id: str, **kwargs) -> bool:
+        try:
+            allowed_fields = [
+                "status",
+                "collection_name",
+                "chunk_count",
+                "embedding_model",
+                "pdf_path",
+                "chunk_file",
+                "embedding_file",
+                "loading_method",
+                "chunking_strategy",
+                "current_stage",
+                "failed_stage",
+                "error_message",
+                "artifact_status",
+                "indexed_at",
+            ]
+            update_fields = []
+            update_values = []
+            for field_name in allowed_fields:
+                if field_name in kwargs:
+                    update_fields.append(f"{field_name} = ?")
+                    update_values.append(kwargs[field_name])
+            if not update_fields:
+                return False
+            update_fields.append("updated_at = CURRENT_TIMESTAMP")
+            update_values.append(build_id)
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    f"""
+                    UPDATE paper_qa_index_versions
+                    SET {", ".join(update_fields)}
+                    WHERE build_id = ?
+                    """,
+                    update_values,
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error updating paper QA index build: {str(e)}")
+            return False
+
+    def activate_paper_qa_index_build(self, build_id: str) -> bool:
+        try:
+            with self._get_connection() as conn:
+                conn.isolation_level = None
+                cursor = conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+                try:
+                    cursor.execute(
+                        self._paper_qa_index_version_select_sql() + " WHERE build_id = ?",
+                        (build_id,),
+                    )
+                    row = cursor.fetchone()
+                    if not row:
+                        conn.rollback()
+                        return False
+                    build = self._row_to_paper_qa_index_version(row)
+                    if build.get("status") not in {"build_success", "ready"}:
+                        # 只有已经完成向量写入并校验过的新版本才能切 active，避免半成品被问答链路读到。
+                        conn.rollback()
+                        return False
+
+                    arxiv_id = build["arxiv_id"]
+                    cursor.execute(
+                        """
+                        SELECT build_id
+                        FROM paper_qa_index_versions
+                        WHERE arxiv_id = ? AND is_active = 1
+                        LIMIT 1
+                        """,
+                        (arxiv_id,),
+                    )
+                    old_active_row = cursor.fetchone()
+                    old_build_id = old_active_row[0] if old_active_row else None
+                    if old_build_id and old_build_id != build_id:
+                        # 旧 active 不在激活事务里删除，只标记为 cleanup_pending，给回滚和延迟清理留出空间。
+                        cursor.execute(
+                            """
+                            UPDATE paper_qa_index_versions
+                            SET is_active = 0,
+                                status = 'cleanup_pending',
+                                artifact_status = 'cleanup_pending',
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE build_id = ?
+                            """,
+                            (old_build_id,),
+                        )
+
+                    cursor.execute(
+                        """
+                        UPDATE paper_qa_index_versions
+                        SET is_active = 1,
+                            status = 'active',
+                            artifact_status = 'active',
+                            activated_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE build_id = ?
+                        """,
+                        (build_id,),
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO paper_qa_index (
+                            arxiv_id, collection_name, status, chunk_count, embedding_model,
+                            pdf_path, chunk_file, embedding_file, loading_method, chunking_strategy,
+                            current_stage, failed_stage, error_message, artifact_status, indexed_at,
+                            active_index_version, active_build_id, previous_build_id
+                        )
+                        VALUES (?, ?, 'indexed', ?, ?, ?, ?, ?, ?, ?, 'activate_index', '', '', 'active', ?, ?, ?, ?)
+                        ON CONFLICT(arxiv_id) DO UPDATE SET
+                            collection_name = excluded.collection_name,
+                            status = excluded.status,
+                            chunk_count = excluded.chunk_count,
+                            embedding_model = excluded.embedding_model,
+                            pdf_path = excluded.pdf_path,
+                            chunk_file = excluded.chunk_file,
+                            embedding_file = excluded.embedding_file,
+                            loading_method = excluded.loading_method,
+                            chunking_strategy = excluded.chunking_strategy,
+                            current_stage = excluded.current_stage,
+                            failed_stage = excluded.failed_stage,
+                            error_message = excluded.error_message,
+                            artifact_status = excluded.artifact_status,
+                            indexed_at = excluded.indexed_at,
+                            active_index_version = excluded.active_index_version,
+                            active_build_id = excluded.active_build_id,
+                            previous_build_id = excluded.previous_build_id,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (
+                            arxiv_id,
+                            build.get("collection_name"),
+                            build.get("chunk_count") or 0,
+                            build.get("embedding_model"),
+                            build.get("pdf_path"),
+                            build.get("chunk_file"),
+                            build.get("embedding_file"),
+                            build.get("loading_method"),
+                            build.get("chunking_strategy"),
+                            build.get("indexed_at") or datetime.now().isoformat(timespec="seconds"),
+                            build.get("index_version"),
+                            build_id,
+                            old_build_id,
+                        ),
+                    )
+                    conn.commit()
+                    return True
+                except Exception:
+                    conn.rollback()
+                    raise
+        except Exception as e:
+            logger.error(f"Error activating paper QA index build: {str(e)}")
+            return False
+
+    def count_paper_qa_index_builds(self, arxiv_id: str, *, statuses: Optional[List[str]] = None) -> int:
+        try:
+            status_values = [str(item) for item in (statuses or []) if str(item).strip()]
+            where_parts = ["arxiv_id = ?"]
+            values: List[Any] = [arxiv_id]
+            if status_values:
+                where_parts.append(f"status IN ({','.join('?' for _ in status_values)})")
+                values.extend(status_values)
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM paper_qa_index_versions
+                    WHERE {" AND ".join(where_parts)}
+                    """,
+                    values,
+                )
+                row = cursor.fetchone()
+                return int(row[0] or 0) if row else 0
+        except Exception as e:
+            logger.error(f"Error counting paper QA index builds: {str(e)}")
+            return 0
+
+    def mark_paper_qa_index_build_deleted(self, build_id: str) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE paper_qa_index_versions
+                    SET is_active = 0,
+                        status = 'deleted',
+                        artifact_status = 'deleted',
+                        current_stage = 'cleanup_old_artifacts',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE build_id = ?
+                    """,
+                    (build_id,),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error marking paper QA index build deleted: {str(e)}")
+            return False
 
     @staticmethod
     def _row_to_paper_index_job(row: Any) -> Dict[str, Any]:
@@ -1306,19 +1824,27 @@ class DatabaseService:
             'loading_method': row[6],
             'created_at': row[7],
             'updated_at': row[8],
+            'heartbeat_at': row[9] if len(row) > 9 else None,
+            'idempotency_key': row[10] if len(row) > 10 else None,
         }
+
+    @staticmethod
+    def _build_paper_index_job_idempotency_key(arxiv_id: str, loading_method: str) -> str:
+        normalized_method = str(loading_method or "docling").strip().lower() or "docling"
+        return f"{str(arxiv_id or '').strip()}:{normalized_method}"
 
     def create_paper_index_job(self, arxiv_id: str, loading_method: str) -> Optional[Dict[str, Any]]:
         try:
             job_id = str(uuid.uuid4())
+            idempotency_key = self._build_paper_index_job_idempotency_key(arxiv_id, loading_method)
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     INSERT INTO paper_index_jobs (
-                        job_id, arxiv_id, status, current_stage, progress, error_message, loading_method
+                        job_id, arxiv_id, status, current_stage, progress, error_message, loading_method, idempotency_key, heartbeat_at
                     )
-                    VALUES (?, ?, 'pending', 'pending', 0, NULL, ?)
-                ''', (job_id, arxiv_id, loading_method))
+                    VALUES (?, ?, 'pending', 'pending', 0, NULL, ?, ?, CURRENT_TIMESTAMP)
+                ''', (job_id, arxiv_id, loading_method, idempotency_key))
 
                 conn.commit()
                 logger.info(f"Paper index job created: {job_id} for {arxiv_id}")
@@ -1328,6 +1854,175 @@ class DatabaseService:
             logger.error(f"Error creating paper index job: {str(e)}")
             return None
 
+    def acquire_paper_index_job(
+        self,
+        arxiv_id: str,
+        loading_method: str,
+        *,
+        timeout_seconds: int,
+    ) -> Optional[Dict[str, Any]]:
+        """在数据库写事务内领取 QA 索引任务，保证多进程下同一论文只产生一个 active job。"""
+        job_id = str(uuid.uuid4())
+        normalized_timeout = max(1, int(timeout_seconds or 1))
+        idempotency_key = self._build_paper_index_job_idempotency_key(arxiv_id, loading_method)
+        active_statuses = tuple(PAPER_INDEX_ACTIVE_JOB_STATUSES)
+        placeholders = ",".join("?" for _ in active_statuses)
+        stale_modifier = f"-{normalized_timeout} seconds"
+        try:
+            with self._get_connection() as conn:
+                # BEGIN IMMEDIATE 会提前获取写锁；并发提交会排队，后来的请求能复用先提交的 active job。
+                conn.isolation_level = None
+                cursor = conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+                try:
+                    cursor.execute(
+                        f"""
+                        SELECT job_id
+                        FROM paper_index_jobs
+                        WHERE arxiv_id = ?
+                          AND status IN ({placeholders})
+                          AND datetime(COALESCE(heartbeat_at, updated_at, created_at)) <= datetime('now', ?)
+                        ORDER BY updated_at DESC, created_at DESC
+                        """,
+                        (arxiv_id, *active_statuses, stale_modifier),
+                    )
+                    stale_job_ids = [row[0] for row in cursor.fetchall()]
+                    previous_job_id = stale_job_ids[0] if stale_job_ids else None
+                    if stale_job_ids:
+                        stale_placeholders = ",".join("?" for _ in stale_job_ids)
+                        # stale 是可重试终态；这里明确写入原因，前端轮询旧 job 时不会再看到无解释的 running。
+                        cursor.execute(
+                            f"""
+                            UPDATE paper_index_jobs
+                            SET status = 'stale',
+                                current_stage = 'stale',
+                                error_message = CASE
+                                    WHEN error_message IS NULL OR error_message = ''
+                                    THEN ?
+                                    ELSE error_message
+                                END,
+                                heartbeat_at = CURRENT_TIMESTAMP,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE job_id IN ({stale_placeholders})
+                            """,
+                            (
+                                f"QA index job heartbeat timed out after {normalized_timeout} seconds; submit again to retry.",
+                                *stale_job_ids,
+                            ),
+                        )
+
+                    cursor.execute(
+                        f"""
+                        SELECT job_id, arxiv_id, status, current_stage, progress, error_message,
+                               loading_method, created_at, updated_at, heartbeat_at, idempotency_key
+                        FROM paper_index_jobs
+                        WHERE arxiv_id = ?
+                          AND status IN ({placeholders})
+                        ORDER BY updated_at DESC, created_at DESC
+                        LIMIT 1
+                        """,
+                        (arxiv_id, *active_statuses),
+                    )
+                    existing_row = cursor.fetchone()
+                    if existing_row:
+                        conn.commit()
+                        job = self._row_to_paper_index_job(existing_row)
+                        job.update(
+                            {
+                                "created": False,
+                                "previous_job_id": previous_job_id,
+                                "recovery_action": "marked_stale_and_reused_active" if previous_job_id else "reused_active",
+                            }
+                        )
+                        return job
+
+                    cursor.execute(
+                        """
+                        INSERT INTO paper_index_jobs (
+                            job_id, arxiv_id, status, current_stage, progress,
+                            error_message, loading_method, idempotency_key, heartbeat_at
+                        )
+                        VALUES (?, ?, 'pending', 'pending', 0, NULL, ?, ?, CURRENT_TIMESTAMP)
+                        """,
+                        (job_id, arxiv_id, loading_method, idempotency_key),
+                    )
+                    cursor.execute(
+                        """
+                        SELECT job_id, arxiv_id, status, current_stage, progress, error_message,
+                               loading_method, created_at, updated_at, heartbeat_at, idempotency_key
+                        FROM paper_index_jobs
+                        WHERE job_id = ?
+                        """,
+                        (job_id,),
+                    )
+                    created_row = cursor.fetchone()
+                    conn.commit()
+                    job = self._row_to_paper_index_job(created_row)
+                    job.update(
+                        {
+                            "created": True,
+                            "previous_job_id": previous_job_id,
+                            "recovery_action": "marked_stale_and_created" if previous_job_id else "created",
+                        }
+                    )
+                    logger.info(f"Paper index job acquired: {job_id} for {arxiv_id}")
+                    return job
+                except Exception:
+                    conn.rollback()
+                    raise
+        except Exception as e:
+            logger.error(f"Error acquiring paper index job: {str(e)}")
+            return None
+
+    def mark_stale_paper_index_jobs(
+        self,
+        *,
+        arxiv_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        timeout_seconds: int,
+    ) -> int:
+        """把超过心跳阈值的 pending/running 任务标记为 stale，供提交和轮询前自愈使用。"""
+        normalized_timeout = max(1, int(timeout_seconds or 1))
+        stale_modifier = f"-{normalized_timeout} seconds"
+        active_statuses = tuple(PAPER_INDEX_ACTIVE_JOB_STATUSES)
+        placeholders = ",".join("?" for _ in active_statuses)
+        filters = [f"status IN ({placeholders})", "datetime(COALESCE(heartbeat_at, updated_at, created_at)) <= datetime('now', ?)"]
+        values: List[Any] = [*active_statuses, stale_modifier]
+        if arxiv_id:
+            filters.append("arxiv_id = ?")
+            values.append(arxiv_id)
+        if job_id:
+            filters.append("job_id = ?")
+            values.append(job_id)
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                # 查询接口也会调用本方法，因此错误信息要足够明确，方便前端展示旧任务已可重试。
+                cursor.execute(
+                    f"""
+                    UPDATE paper_index_jobs
+                    SET status = 'stale',
+                        current_stage = 'stale',
+                        error_message = CASE
+                            WHEN error_message IS NULL OR error_message = ''
+                            THEN ?
+                            ELSE error_message
+                        END,
+                        heartbeat_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE {" AND ".join(filters)}
+                    """,
+                    [
+                        f"QA index job heartbeat timed out after {normalized_timeout} seconds; submit again to retry.",
+                        *values,
+                    ],
+                )
+                conn.commit()
+                return cursor.rowcount
+        except Exception as e:
+            logger.error(f"Error marking stale paper index jobs: {str(e)}")
+            return 0
+
     def update_paper_index_job(
         self,
         job_id: str,
@@ -1335,6 +2030,9 @@ class DatabaseService:
         current_stage: Optional[str] = None,
         progress: Optional[int] = None,
         error_message: Optional[str] = None,
+        heartbeat_at: Optional[str] = None,
+        refresh_heartbeat: bool = True,
+        expected_statuses: Optional[List[str]] = None,
     ) -> bool:
         try:
             with self._get_connection() as conn:
@@ -1356,17 +2054,29 @@ class DatabaseService:
                 if error_message is not None:
                     update_fields.append('error_message = ?')
                     update_values.append(error_message)
+                if heartbeat_at is not None:
+                    update_fields.append('heartbeat_at = ?')
+                    update_values.append(heartbeat_at)
 
                 if not update_fields:
                     return False
 
+                if refresh_heartbeat and heartbeat_at is None:
+                    # 任何状态推进都代表后台线程仍活跃，同步刷新心跳用于后续 stale 判定。
+                    update_fields.append('heartbeat_at = CURRENT_TIMESTAMP')
                 update_fields.append('updated_at = CURRENT_TIMESTAMP')
                 update_values.append(job_id)
+                expected_status_values = [str(item) for item in (expected_statuses or []) if str(item).strip()]
+                expected_clause = ""
+                if expected_status_values:
+                    # 后台线程可能在 stale 恢复后才继续回写；条件更新能阻止旧线程复活不可恢复任务。
+                    expected_clause = f" AND status IN ({','.join('?' for _ in expected_status_values)})"
+                    update_values.extend(expected_status_values)
 
                 cursor.execute(f'''
                     UPDATE paper_index_jobs
                     SET {", ".join(update_fields)}
-                    WHERE job_id = ?
+                    WHERE job_id = ?{expected_clause}
                 ''', update_values)
 
                 conn.commit()
@@ -1382,7 +2092,8 @@ class DatabaseService:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    SELECT job_id, arxiv_id, status, current_stage, progress, error_message, loading_method, created_at, updated_at
+                    SELECT job_id, arxiv_id, status, current_stage, progress, error_message,
+                           loading_method, created_at, updated_at, heartbeat_at, idempotency_key
                     FROM paper_index_jobs
                     WHERE job_id = ?
                 ''', (job_id,))
@@ -1400,7 +2111,8 @@ class DatabaseService:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    SELECT job_id, arxiv_id, status, current_stage, progress, error_message, loading_method, created_at, updated_at
+                    SELECT job_id, arxiv_id, status, current_stage, progress, error_message,
+                           loading_method, created_at, updated_at, heartbeat_at, idempotency_key
                     FROM paper_index_jobs
                     WHERE arxiv_id = ?
                     ORDER BY updated_at DESC, created_at DESC
@@ -1422,7 +2134,8 @@ class DatabaseService:
                 cursor = conn.cursor()
                 if arxiv_id:
                     cursor.execute('''
-                        SELECT job_id, arxiv_id, status, current_stage, progress, error_message, loading_method, created_at, updated_at
+                        SELECT job_id, arxiv_id, status, current_stage, progress, error_message,
+                               loading_method, created_at, updated_at, heartbeat_at, idempotency_key
                         FROM paper_index_jobs
                         WHERE arxiv_id = ?
                         ORDER BY updated_at DESC, created_at DESC
@@ -1430,7 +2143,8 @@ class DatabaseService:
                     ''', (arxiv_id, normalized_limit))
                 else:
                     cursor.execute('''
-                        SELECT job_id, arxiv_id, status, current_stage, progress, error_message, loading_method, created_at, updated_at
+                        SELECT job_id, arxiv_id, status, current_stage, progress, error_message,
+                               loading_method, created_at, updated_at, heartbeat_at, idempotency_key
                         FROM paper_index_jobs
                         ORDER BY updated_at DESC, created_at DESC
                         LIMIT ?
@@ -1464,6 +2178,9 @@ class DatabaseService:
                     'error_message',
                     'artifact_status',
                     'indexed_at',
+                    'active_index_version',
+                    'active_build_id',
+                    'previous_build_id',
                 ]
                 for field_name in allowed_fields:
                     if field_name in kwargs:
@@ -1481,6 +2198,60 @@ class DatabaseService:
                     SET {", ".join(update_fields)}
                     WHERE arxiv_id = ?
                 ''', update_values)
+
+                if kwargs.get("status") == "indexed":
+                    cursor.execute(
+                        """
+                        SELECT arxiv_id, collection_name, status, chunk_count, embedding_model, pdf_path,
+                               chunk_file, embedding_file, loading_method, chunking_strategy, current_stage,
+                               failed_stage, error_message, artifact_status, indexed_at,
+                               active_index_version, active_build_id
+                        FROM paper_qa_index
+                        WHERE arxiv_id = ?
+                        """,
+                        (arxiv_id,),
+                    )
+                    active_row = cursor.fetchone()
+                    if active_row and str(active_row[1] or "").strip():
+                        legacy_version = active_row[15] or "legacy"
+                        legacy_build_id = active_row[16] or f"legacy-{str(arxiv_id).replace('.', '_').replace('/', '_')}"
+                        # 旧式 update 成功后也补 active version，保证版本化读取和回滚信息完整。
+                        cursor.execute(
+                            """
+                            INSERT OR IGNORE INTO paper_qa_index_versions (
+                                build_id, arxiv_id, index_version, status, is_active, collection_name,
+                                chunk_count, embedding_model, pdf_path, chunk_file, embedding_file,
+                                loading_method, chunking_strategy, current_stage, failed_stage,
+                                error_message, artifact_status, indexed_at, activated_at
+                            )
+                            VALUES (?, ?, ?, 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, CURRENT_TIMESTAMP)
+                            """,
+                            (
+                                legacy_build_id,
+                                arxiv_id,
+                                legacy_version,
+                                active_row[1],
+                                active_row[3] or 0,
+                                active_row[4],
+                                active_row[5],
+                                active_row[6],
+                                active_row[7],
+                                active_row[8],
+                                active_row[9],
+                                active_row[10] or "legacy_active",
+                                active_row[13] or "active",
+                                active_row[14],
+                            ),
+                        )
+                        cursor.execute(
+                            """
+                            UPDATE paper_qa_index
+                            SET active_index_version = COALESCE(active_index_version, ?),
+                                active_build_id = COALESCE(active_build_id, ?)
+                            WHERE arxiv_id = ?
+                            """,
+                            (legacy_version, legacy_build_id, arxiv_id),
+                        )
                 
                 conn.commit()
                 logger.info(f"Paper QA index updated for: {arxiv_id}")
@@ -1512,6 +2283,9 @@ class DatabaseService:
                     'error_message',
                     'artifact_status',
                     'indexed_at',
+                    'active_index_version',
+                    'active_build_id',
+                    'previous_build_id',
                 ]
                 for field_name in allowed_fields:
                     if field_name in kwargs:
@@ -1531,6 +2305,47 @@ class DatabaseService:
                     ON CONFLICT(arxiv_id) DO UPDATE SET
                         {", ".join(update_fields)}
                 ''', values)
+
+                if kwargs.get("status") == "indexed" and str(kwargs.get("collection_name") or "").strip():
+                    legacy_build_id = kwargs.get("active_build_id") or f"legacy-{str(arxiv_id).replace('.', '_').replace('/', '_')}"
+                    legacy_version = kwargs.get("active_index_version") or "legacy"
+                    # 兼容测试和旧调用：直接写入 paper_qa_index 的可用记录也补成 active version。
+                    cursor.execute(
+                        """
+                        INSERT OR IGNORE INTO paper_qa_index_versions (
+                            build_id, arxiv_id, index_version, status, is_active, collection_name,
+                            chunk_count, embedding_model, pdf_path, chunk_file, embedding_file,
+                            loading_method, chunking_strategy, current_stage, failed_stage,
+                            error_message, artifact_status, indexed_at, activated_at
+                        )
+                        VALUES (?, ?, ?, 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, CURRENT_TIMESTAMP)
+                        """,
+                        (
+                            legacy_build_id,
+                            arxiv_id,
+                            legacy_version,
+                            kwargs.get("collection_name"),
+                            kwargs.get("chunk_count") or 0,
+                            kwargs.get("embedding_model"),
+                            kwargs.get("pdf_path"),
+                            kwargs.get("chunk_file"),
+                            kwargs.get("embedding_file"),
+                            kwargs.get("loading_method"),
+                            kwargs.get("chunking_strategy"),
+                            kwargs.get("current_stage") or "legacy_active",
+                            kwargs.get("artifact_status") or "active",
+                            kwargs.get("indexed_at"),
+                        ),
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE paper_qa_index
+                        SET active_index_version = COALESCE(active_index_version, ?),
+                            active_build_id = COALESCE(active_build_id, ?)
+                        WHERE arxiv_id = ?
+                        """,
+                        (legacy_version, legacy_build_id, arxiv_id),
+                    )
                 
                 conn.commit()
                 logger.info(f"Paper QA index inserted for: {arxiv_id}")
@@ -1584,6 +2399,32 @@ class DatabaseService:
             'status': row[9] or 'completed',
             'created_at': row[10],
         }
+
+    def _get_paper_chat_message_in_transaction(self, cursor: sqlite3.Cursor, message_id: str) -> Optional[Dict[str, Any]]:
+        cursor.execute(
+            '''
+            SELECT message_id, turn_id, session_id, role, content, sources,
+                   retrieval_debug_snapshot, contextualized_question, question_contextualization,
+                   status, created_at
+            FROM paper_chat_messages
+            WHERE message_id = ?
+            ''',
+            (message_id,),
+        )
+        row = cursor.fetchone()
+        return self._row_to_paper_chat_message(row) if row else None
+
+    def _get_paper_chat_session_in_transaction(self, cursor: sqlite3.Cursor, session_id: str) -> Optional[Dict[str, Any]]:
+        cursor.execute(
+            '''
+            SELECT session_id, user_id, arxiv_id, title, created_at, updated_at, message_count, status
+            FROM paper_chat_sessions
+            WHERE session_id = ?
+            ''',
+            (session_id,),
+        )
+        row = cursor.fetchone()
+        return self._row_to_paper_chat_session(row) if row else None
 
     def _row_to_paper_note(self, row: Any) -> Dict[str, Any]:
         return {
@@ -1940,6 +2781,143 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"Error getting paper chat message by turn: {str(e)}")
             return None
+
+    def append_paper_qa_turn(
+        self,
+        *,
+        session_id: str,
+        user_id: str = DEFAULT_USER_ID,
+        question: str,
+        answer: str,
+        sources: Optional[Any] = None,
+        retrieval_debug_snapshot: Optional[Any] = None,
+        contextualized_question: Optional[str] = None,
+        question_contextualization: Optional[Any] = None,
+        turn_id: Optional[str] = None,
+        user_status: str = 'completed',
+        assistant_status: str = 'completed',
+    ) -> Dict[str, Any]:
+        normalized_session_id = str(session_id or '').strip()
+        normalized_user_id = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+        normalized_turn_id = str(turn_id or uuid.uuid4()).strip()
+        user_message_id = str(uuid.uuid4())
+        assistant_message_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        user_created_at = now.strftime("%Y-%m-%d %H:%M:%S.%f")
+        assistant_created_at = (now + timedelta(microseconds=1)).strftime("%Y-%m-%d %H:%M:%S.%f")
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            # 一轮 QA 是业务上的最小一致性单元，显式开启事务以保证 user/assistant/session 统计同进同退。
+            cursor.execute('BEGIN IMMEDIATE')
+            cursor.execute(
+                '''
+                SELECT session_id, title FROM paper_chat_sessions
+                WHERE session_id = ? AND user_id = ?
+                ''',
+                (normalized_session_id, normalized_user_id),
+            )
+            session_row = cursor.fetchone()
+            if not session_row:
+                raise PaperQATurnPersistenceError(
+                    f"paper chat session not found: session_id={normalized_session_id} user_id={normalized_user_id}"
+                )
+
+            cursor.execute(
+                '''
+                INSERT INTO paper_chat_messages (
+                    message_id, turn_id, session_id, role, content, sources,
+                    retrieval_debug_snapshot, contextualized_question, question_contextualization,
+                    status, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    user_message_id,
+                    normalized_turn_id,
+                    normalized_session_id,
+                    'user',
+                    str(question or ''),
+                    '',
+                    '',
+                    str(contextualized_question or ''),
+                    self._serialize_json_field(question_contextualization),
+                    user_status,
+                    user_created_at,
+                ),
+            )
+
+            cursor.execute(
+                '''
+                INSERT INTO paper_chat_messages (
+                    message_id, turn_id, session_id, role, content, sources,
+                    retrieval_debug_snapshot, contextualized_question, question_contextualization,
+                    status, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    assistant_message_id,
+                    normalized_turn_id,
+                    normalized_session_id,
+                    'assistant',
+                    str(answer or ''),
+                    self._serialize_json_field(sources),
+                    self._serialize_json_field(retrieval_debug_snapshot),
+                    str(contextualized_question or ''),
+                    self._serialize_json_field(question_contextualization),
+                    assistant_status,
+                    assistant_created_at,
+                ),
+            )
+
+            if not str(session_row[1] or '').strip() and question:
+                # 首轮问题可作为会话标题，但必须和消息写入在同一事务内更新，避免标题和消息状态脱节。
+                cursor.execute(
+                    '''
+                    UPDATE paper_chat_sessions
+                    SET title = ?, updated_at = ?
+                    WHERE session_id = ?
+                    ''',
+                    (str(question).strip()[:80], assistant_created_at, normalized_session_id),
+                )
+
+            self._refresh_paper_chat_session_stats(conn, normalized_session_id)
+            user_message = self._get_paper_chat_message_in_transaction(cursor, user_message_id)
+            assistant_message = self._get_paper_chat_message_in_transaction(cursor, assistant_message_id)
+            refreshed_session = self._get_paper_chat_session_in_transaction(cursor, normalized_session_id)
+            if not user_message or not assistant_message or not refreshed_session:
+                raise PaperQATurnPersistenceError(
+                    f"paper qa turn write verification failed: session_id={normalized_session_id} turn_id={normalized_turn_id}"
+                )
+            conn.commit()
+            return {
+                'turn_id': normalized_turn_id,
+                'user_message': user_message,
+                'assistant_message': assistant_message,
+                'chat_session': refreshed_session,
+                'refreshed_session': refreshed_session,
+            }
+        except Exception as exc:
+            if conn is not None:
+                # 回滚发生在数据库访问层，调用方只需要处理明确的写入失败语义。
+                conn.rollback()
+            logger.exception(
+                "Error appending paper QA turn: session_id=%s user_id=%s turn_id=%s",
+                normalized_session_id,
+                normalized_user_id,
+                normalized_turn_id,
+            )
+            if isinstance(exc, PaperQATurnPersistenceError):
+                raise
+            raise PaperQATurnPersistenceError(
+                f"paper qa turn persistence failed: session_id={normalized_session_id} "
+                f"user_id={normalized_user_id} turn_id={normalized_turn_id}: {exc}"
+            ) from exc
+        finally:
+            if conn is not None:
+                conn.close()
 
     def append_paper_chat_message(
         self,

@@ -56,6 +56,8 @@ const {
   availableSessions,
   retrievalOptions,
   submitQuestion,
+  resubmitTurn,
+  cancelCurrentStream,
   applyPrompt,
   closeEvidence,
   resetChat,
@@ -398,6 +400,41 @@ async function handleClearSession() {
   await clearCurrentSession()
 }
 
+function handleStopGeneration() {
+  cancelCurrentStream('user')
+}
+
+function getTurnStatusHint(item: { response?: any }) {
+  const turn = item.response
+  if (!turn) return ''
+  if (turn.status === 'aborted') return '已取消生成，当前内容未完整保存。'
+  if (turn.status === 'partial' || turn.status === 'interrupted') return '回答中断，已保留当前部分内容。'
+  if (turn.status === 'persistence_failed' || turn.persistenceStatus === 'failed') {
+    return '答案已生成，但未保存到历史记录。'
+  }
+  if (turn.status === 'failed') return turn.error || '问答失败，请稍后重试。'
+  return ''
+}
+
+function canResubmitTurn(item: { response?: any }) {
+  // 面板消息同时兼容 Agent/QA 响应，只有 QA turn 的终态非 completed 时才展示重试入口。
+  return Boolean(item.response && item.response.status !== 'completed')
+}
+
+async function copyAssistantAnswer(item: { content?: string }) {
+  const content = String(item.content || '').trim()
+  if (!content) {
+    ElMessage.warning('当前回答没有可复制的内容')
+    return
+  }
+  try {
+    await navigator.clipboard.writeText(content)
+    ElMessage.success('回答已复制')
+  } catch {
+    ElMessage.error('复制失败，请手动选择文本复制')
+  }
+}
+
 async function handleResumeSession(sessionId: string) {
   qaMode.value = true
   await loadSession(sessionId)
@@ -421,6 +458,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  cancelCurrentStream('cleanup')
   stopQaJobPolling()
   if (typeof window === 'undefined') return
   window.removeEventListener('resize', syncViewport)
@@ -624,10 +662,24 @@ watch(activeNoteTypeFilter, async () => {
               prompt-title="快捷问题"
               assistant-label="Qwen"
               sender-placeholder="输入你想问论文的问题，Enter 发送，Shift+Enter 换行"
+              :can-stop="qaLoading"
               @submit-question="submitQuestion"
               @select-prompt="applyPrompt"
+              @stop-generation="handleStopGeneration"
             >
               <template #message-footer="{ item }">
+                <div v-if="item.role === 'assistant' && getTurnStatusHint(item)" class="turn-status-hint">
+                  {{ getTurnStatusHint(item) }}
+                  <el-button
+                    v-if="canResubmitTurn(item)"
+                    size="small"
+                    text
+                    type="primary"
+                    @click="resubmitTurn(item.turnId || '')"
+                  >
+                    重新生成
+                  </el-button>
+                </div>
                 <div
                   v-if="item.role === 'assistant' && ((item.sources?.length || 0) > 0 || item.retrievalDebug)"
                   class="assistant-actions"
@@ -648,6 +700,14 @@ watch(activeNoteTypeFilter, async () => {
                     @click="handlePanelOpenEvidence(item.turnId || '')"
                   >
                     查看来源与调试
+                  </el-button>
+                  <el-button
+                    size="small"
+                    text
+                    type="primary"
+                    @click="copyAssistantAnswer(item)"
+                  >
+                    复制回答
                   </el-button>
                   <el-button
                     size="small"
@@ -1403,6 +1463,19 @@ watch(activeNoteTypeFilter, async () => {
   border-radius: 16px;
   background: linear-gradient(180deg, rgba(248, 250, 252, 0.96), rgba(241, 245, 249, 0.96));
   border: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.turn-status-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(251, 191, 36, 0.1);
+  color: #92400e;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .assistant-badges {

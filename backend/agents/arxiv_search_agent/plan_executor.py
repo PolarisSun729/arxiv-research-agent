@@ -9,8 +9,7 @@ from langgraph.types import interrupt
 from tools.tool_registry import invoke_tool as invoke_backend_tool
 
 from .observer import Observer
-from .planner import PLAN_BUILDER_REGISTRY, GoalBuilder, build_plan_runtime
-from .plan_validator import PlanValidator
+from .planner import build_executable_plan, build_plan_runtime
 from .replanner import Replanner
 from .schemas import (
     AgentTurnResult,
@@ -446,6 +445,13 @@ class PlanExecutor:
                 detail={
                     "observation_status": observation.status,
                     "observation_reason": observation.reason,
+                    "failure_category": observation.failure_category,
+                    "severity": observation.severity,
+                    "recoverable": observation.recoverable,
+                    "retryable": observation.retryable,
+                    "requires_user_input": observation.requires_user_input,
+                    "suggested_recovery_types": list(observation.suggested_recovery_types or []),
+                    "evidence": _safe_compact(observation.evidence),
                     "suggested_action": observation.suggested_action,
                     "confidence": observation.confidence,
                 },
@@ -567,6 +573,7 @@ class PlanExecutor:
             runtime=runtime,
             failed_or_low_quality_step=step,
             observation_result=observation,
+            state=state,
         )
         if replan_decision.updated_plan is not None and replan_decision.updated_runtime is not None:
             runtime.plan = replan_decision.updated_plan
@@ -587,11 +594,16 @@ class PlanExecutor:
                 detail={
                     "observation_status": observation.status,
                     "observation_reason": observation.reason,
+                    "failure_category": observation.failure_category,
                     "raw_output": _safe_compact(raw_output),
                 },
             )
             return None
 
+        if replan_decision.updated_runtime is not None:
+            runtime.trace = list(replan_decision.updated_runtime.trace or runtime.trace)
+            runtime.replan_counts = dict(replan_decision.updated_runtime.replan_counts or runtime.replan_counts)
+            runtime.step_replan_counts = dict(replan_decision.updated_runtime.step_replan_counts or runtime.step_replan_counts)
         runtime.step_status[step.step_id] = "failed"
         fallback_reason = str(replan_decision.fallback_reason or observation.reason or observation.status)
         runtime.error = f"fallback:{step.step_id}:{fallback_reason}"
@@ -606,6 +618,7 @@ class PlanExecutor:
             detail={
                 "observation_status": observation.status,
                 "observation_reason": observation.reason,
+                "failure_category": observation.failure_category,
                 "fallback_reason": fallback_reason,
             },
         )
@@ -992,9 +1005,10 @@ class PlanExecutor:
         return ranked
 
     def _synthesize_arxiv_response(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> str:
-        del runtime, step
+        del step
         ranked_papers = resolved_input.get("ranked_papers")
         if not isinstance(ranked_papers, list) or not ranked_papers:
+            # 个性化 rerank 是可选步骤；缺少 ranked_papers 时回退到搜索输出，保证规则型 planner 可跳过可选工具。
             ranked_papers = _extract_papers(runtime.outputs.get("arxiv_results"))
         quality = resolved_input.get("arxiv_result_quality") if isinstance(resolved_input.get("arxiv_result_quality"), Mapping) else {}
         result_count = int(quality.get("result_count") or len(ranked_papers or []))
@@ -1090,10 +1104,20 @@ class PlanExecutor:
         if not arxiv_id:
             return {"status": "failed", "answer": "", "sources": [], "retrieval_debug": None, "tool_result": None, "error": "missing_arxiv_id"}
         logger.info("arxiv_agent answer_paper_question: arxiv_id=%s question=%s", arxiv_id, question)
+        qa_recovery_strategy = resolved_input.get("qa_recovery_strategy") if isinstance(resolved_input.get("qa_recovery_strategy"), Mapping) else None
+        index_strategy = resolved_input.get("index_strategy") if isinstance(resolved_input.get("index_strategy"), Mapping) else None
+        tool_kwargs = {
+            "arxiv_id": arxiv_id,
+            "question": question,
+        }
+        # recovery 策略只以结构化 payload 传递给 PaperQAService，避免在执行器里散落临时参数。
+        if qa_recovery_strategy:
+            tool_kwargs["qa_recovery_strategy"] = dict(qa_recovery_strategy)
+        if index_strategy:
+            tool_kwargs["index_strategy"] = dict(index_strategy)
         tool_result = invoke_backend_tool(
             "answer_paper_question",
-            arxiv_id=arxiv_id,
-            question=question,
+            **tool_kwargs,
         )
         tool_data = dict((tool_result or {}).get("data") or {})
         # 真实 PaperQAService 会在 data 中返回 answer/sources/retrieval_debug；这里只补充状态和原始工具结果，
@@ -1266,29 +1290,26 @@ class PlanExecutor:
             return f"当前请求暂不在该 agent 的支持范围内：{message}。建议改成 arXiv 搜索、论文问答、推荐或偏好更新。"
         return "当前请求暂不在该 agent 的支持范围内。"
 def run_agent_turn(state: AgentState, tool_registry: ToolRegistry = PLANNER_TOOL_REGISTRY) -> AgentTurnResult:
-    """统一 Agent 单轮入口：构造目标、生成计划、校验计划并执行。
+    """统一 Agent 单轮入口：通过 planner 门面拿到已校验计划后执行。
 
-    主流程从这里进入后，PlanExecutor 会在同一份 runtime 中完成工具执行、质量观察和
-    rule-based 重规划，避免旧节点链把计划、工具输出和 trace 分散到多套状态里。
+    planner 门面负责固定模板和 Tool-Aware 草稿路径的切换、校验与回退；
+    执行器这里只消费可信 ExecutablePlan，避免运行期再关心草稿来源。
     """
-    goal = GoalBuilder.from_state(state)
-    builder = PLAN_BUILDER_REGISTRY.get(goal.goal_type or "unsupported")
-    plan = builder.build(goal, state, tool_registry)
-    # 所有进入执行器的 plan 都先过统一校验，确保工具名、依赖拓扑和副作用声明一致。
-    PlanValidator().validate(plan, tool_registry)
+    goal, plan, planning_debug = build_executable_plan(state, tool_registry=tool_registry)
     state.goal = goal
     state.execution_plan = plan
+    state.debug = dict(state.debug or {})
+    state.debug["planner"] = planning_debug
     return PlanExecutor(tool_registry=tool_registry).execute(plan, state)
 
 
 def run_agent_turn_in_graph(state: AgentState, tool_registry: ToolRegistry = PLANNER_TOOL_REGISTRY) -> AgentTurnResult:
-    """图内执行入口：允许确认链路通过 LangGraph interrupt/resume 恢复。"""
-    goal = GoalBuilder.from_state(state)
-    builder = PLAN_BUILDER_REGISTRY.get(goal.goal_type or "unsupported")
-    plan = builder.build(goal, state, tool_registry)
-    PlanValidator().validate(plan, tool_registry)
+    """图内执行入口：和普通入口共享 planner 门面，但允许 interrupt/resume 确认链路。"""
+    goal, plan, planning_debug = build_executable_plan(state, tool_registry=tool_registry)
     state.goal = goal
     state.execution_plan = plan
+    state.debug = dict(state.debug or {})
+    state.debug["planner"] = planning_debug
     runtime = build_plan_runtime(state, goal=plan.goal, plan=plan, turn_status="success")
     runtime.step_status = {step.step_id: "pending" for step in list(plan.steps or [])}
     runtime.outputs = {}

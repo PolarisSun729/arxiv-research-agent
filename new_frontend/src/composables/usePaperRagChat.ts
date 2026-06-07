@@ -1,5 +1,5 @@
 import { ElMessage } from 'element-plus'
-import { reactive, ref, toValue, type MaybeRefOrGetter } from 'vue'
+import { reactive, ref, toValue, watch, type MaybeRefOrGetter } from 'vue'
 import {
   clearPaperChatSession,
   createPaperChatSession,
@@ -9,19 +9,24 @@ import {
   qaPaperStream
 } from '@/api/papers'
 import { getErrorMessage } from '@/api/errors'
+import { ApiError } from '@/api/errors'
 import type {
   PaperChatMessage,
   PaperChatSession,
   QaConversationContextTurn,
   QaRequestOptions
 } from '@/api/papers'
-import type { QaTurnForRagChat as QaTurn } from '@/types/ragChat'
+import type {
+  QaPersistenceStatus,
+  QaTurnForRagChat as QaTurn,
+  QaTurnStatus
+} from '@/types/ragChat'
+import { useUserContext } from '@/composables/useUserContext'
 
 const MAX_CONVERSATION_TURNS = 5
 const MAX_ANSWER_SUMMARY_LENGTH = 280
 const MAX_SOURCE_CONTENT_LENGTH = 180
 const MAX_SOURCES_PER_TURN = 3
-const DEFAULT_USER_ID = 'local_user'
 
 function getMemoryConfig() {
   return {
@@ -66,6 +71,7 @@ function buildConversationContext(qaResults: QaTurn[], pendingTurnId?: string): 
   }
   return qaResults
     .filter(turn => turn.id !== pendingTurnId && !turn.streaming)
+    .filter(turn => !turn.status || turn.status === 'completed')
     .slice(-memoryConfig.shortTermMemoryMaxTurns)
     .map(turn => ({
       turn_id: turn.id,
@@ -99,6 +105,12 @@ function groupMessagesToTurns(messages: PaperChatMessage[]): QaTurn[] {
       retrievalDebug: null,
       createdAt: message.created_at,
       streaming: false,
+      status: 'completed',
+      error: null,
+      partial: false,
+      completedAt: message.created_at,
+      interruptedReason: null,
+      persistenceStatus: 'saved',
       originalQuestion: '',
       contextualizedQuestion: message.contextualized_question || '',
       usedShortTermMemory: Boolean(message.question_contextualization?.used_short_term_memory),
@@ -135,7 +147,54 @@ function groupMessagesToTurns(messages: PaperChatMessage[]): QaTurn[] {
   return Array.from(turnsById.values()).sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
 }
 
+function getApiErrorCode(error: unknown) {
+  if (error instanceof ApiError) {
+    return String(error.payload.code || 'unknown_error')
+  }
+  if (error && typeof error === 'object' && 'payload' in error) {
+    const payload = (error as { payload?: { code?: unknown } }).payload
+    if (payload?.code) return String(payload.code)
+  }
+  return 'unknown_error'
+}
+
+function mapResultToTurnStatus(resultStatus?: string, persistenceStatus?: QaPersistenceStatus): QaTurnStatus {
+  const status = String(resultStatus || '').trim().toLowerCase()
+  if (persistenceStatus === 'failed' || ['persistence_failed', 'partial_success', 'database_write_failed'].includes(status)) {
+    return 'persistence_failed'
+  }
+  if (status === 'aborted') return 'aborted'
+  if (status === 'failed') return 'failed'
+  if (status === 'partial' || status === 'stream_interrupted') return 'partial'
+  return 'completed'
+}
+
+function hasEffectiveTurnOutput(turn: QaTurn) {
+  return Boolean(turn.answer.trim() || turn.sources.length || turn.retrievalDebug)
+}
+
+function applyTurnTerminalState(
+  turn: QaTurn,
+  status: QaTurnStatus,
+  options: {
+    error?: string | null
+    partial?: boolean
+    interruptedReason?: string | null
+    persistenceStatus?: QaPersistenceStatus
+    completedAt?: string | null
+  } = {}
+) {
+  turn.streaming = false
+  turn.status = status
+  turn.error = options.error ?? null
+  turn.partial = options.partial ?? status !== 'completed'
+  turn.interruptedReason = options.interruptedReason ?? null
+  turn.persistenceStatus = options.persistenceStatus ?? (status === 'completed' ? 'saved' : 'not_saved')
+  turn.completedAt = options.completedAt ?? (status === 'completed' ? new Date().toISOString() : null)
+}
+
 export function usePaperRagChat(options: UsePaperRagChatOptions) {
+  const userContext = useUserContext()
   const memoryConfig = getMemoryConfig()
   const qaResults = ref<QaTurn[]>([])
   const question = ref('')
@@ -145,6 +204,8 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
   const activeEvidenceTurn = ref<QaTurn | null>(null)
   const currentSession = ref<PaperChatSession | null>(null)
   const availableSessions = ref<PaperChatSession[]>([])
+  const activeStreamController = ref<AbortController | null>(null)
+  const activeAbortIntent = ref<'user' | 'cleanup' | null>(null)
   const retrievalOptions = reactive<PaperRagRetrievalOptions>({
     enableQueryRewrite: true,
     enableHyde: false,
@@ -159,8 +220,8 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
   }
 
   function getUserId() {
-    const resolved = options.userId ? toValue(options.userId) : DEFAULT_USER_ID
-    return String(resolved || DEFAULT_USER_ID).trim() || DEFAULT_USER_ID
+    const resolved = options.userId ? toValue(options.userId) : userContext.userId.value
+    return String(resolved || userContext.defaultUserId).trim() || userContext.defaultUserId
   }
 
   function openEvidence(turn: QaTurn) {
@@ -177,7 +238,16 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
     options.onEnterQaMode?.()
   }
 
+  function cancelCurrentStream(intent: 'user' | 'cleanup' = 'user') {
+    const controller = activeStreamController.value
+    if (!controller || controller.signal.aborted) return
+    // 用户停止和页面清理都走 AbortController，但后续错误处理需要知道是否恢复输入框。
+    activeAbortIntent.value = intent
+    controller.abort()
+  }
+
   function resetChat() {
+    cancelCurrentStream('cleanup')
     qaResults.value = []
     question.value = ''
     currentSession.value = null
@@ -185,6 +255,11 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
     closeEvidence()
     activeEvidenceTurn.value = null
   }
+
+  watch(() => getUserId(), () => {
+    // 用户切换后必须丢弃当前 QA 现场，避免用旧用户的 session 和短期记忆继续发问。
+    resetChat()
+  })
 
   async function refreshSessions() {
     if (!memoryConfig.enablePaperChatSession) {
@@ -208,6 +283,7 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
     const currentPaperId = toValue(options.paperId)
     if (!currentPaperId || !sessionId) return
 
+    cancelCurrentStream('cleanup')
     sessionLoading.value = true
     try {
       const response = await getPaperChatMessages(currentPaperId, sessionId, getUserId())
@@ -252,6 +328,7 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
     const currentPaperId = toValue(options.paperId)
     if (!currentPaperId) return null
 
+    cancelCurrentStream('cleanup')
     sessionLoading.value = true
     try {
       const response = await createPaperChatSession(currentPaperId, { user_id: getUserId() })
@@ -269,6 +346,7 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
   }
 
   async function clearCurrentSession() {
+    cancelCurrentStream('cleanup')
     if (!memoryConfig.enablePaperChatSession) {
       qaResults.value = []
       return
@@ -311,6 +389,12 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
       retrievalDebug: null,
       createdAt: new Date().toISOString(),
       streaming: true,
+      status: 'preparing',
+      error: null,
+      partial: false,
+      completedAt: null,
+      interruptedReason: null,
+      persistenceStatus: 'unknown',
       originalQuestion: rawQuestion,
       contextualizedQuestion: rawQuestion,
       usedShortTermMemory: false,
@@ -319,6 +403,9 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
     qaResults.value.push(turn)
     question.value = ''
     scrollToBottom()
+    const streamController = new AbortController()
+    activeStreamController.value = streamController
+    activeAbortIntent.value = null
 
     try {
       const conversationContext = buildConversationContext(qaResults.value, turn.id)
@@ -338,7 +425,10 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
         currentPaperId,
         rawQuestion,
         {
+          signal: streamController.signal,
           onMeta: meta => {
+            // meta 到达表示后端已完成检索准备，后续 turn 可以展示来源和调试信息。
+            turn.status = 'streaming'
             if (Array.isArray(meta.sources)) {
               turn.sources = meta.sources
             }
@@ -363,6 +453,7 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
             scrollToBottom()
           },
           onDelta: delta => {
+            turn.status = 'streaming'
             turn.answer += delta
             scrollToBottom()
           },
@@ -391,7 +482,15 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
             if (payload.question_contextualization) {
               turn.questionContextualization = payload.question_contextualization
             }
-            turn.streaming = false
+            const persistenceStatus = (payload.persistence_status || payload.persistenceStatus || 'unknown') as QaPersistenceStatus
+            const terminalStatus = mapResultToTurnStatus(payload.status, persistenceStatus)
+            applyTurnTerminalState(turn, terminalStatus, {
+              partial: terminalStatus !== 'completed',
+              interruptedReason: payload.interrupted_reason || payload.interruptedReason || null,
+              persistenceStatus,
+              completedAt: payload.completed_at || payload.completedAt || null,
+              error: terminalStatus === 'persistence_failed' ? '答案已生成，但未保存到历史记录。' : null
+            })
             scrollToBottom()
           },
           onError: () => {
@@ -425,15 +524,66 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
       if (result.question_contextualization) {
         turn.questionContextualization = result.question_contextualization
       }
-      turn.streaming = false
+      const persistenceStatus = result.persistence_status || 'unknown'
+      const terminalStatus = mapResultToTurnStatus(result.status, persistenceStatus)
+      applyTurnTerminalState(turn, terminalStatus, {
+        partial: Boolean(result.partial) || terminalStatus !== 'completed',
+        interruptedReason: result.interrupted_reason || null,
+        persistenceStatus,
+        completedAt: result.completed_at || null,
+        error: terminalStatus === 'persistence_failed' ? '答案已生成，但未保存到历史记录。' : null
+      })
       await refreshSessions()
+      if (terminalStatus === 'persistence_failed') {
+        ElMessage.warning('答案已生成，但未保存到历史记录。')
+      }
     } catch (error) {
-      ElMessage.error(getErrorMessage(error, '\u95ee\u7b54\u5931\u8d25'))
-      qaResults.value = qaResults.value.filter(item => item.id !== turn.id)
-      question.value = rawQuestion
+      const errorCode = getApiErrorCode(error)
+      const message = getErrorMessage(error, '问答失败，请稍后重试。')
+      const hasOutput = hasEffectiveTurnOutput(turn)
+
+      if (!hasOutput) {
+        qaResults.value = qaResults.value.filter(item => item.id !== turn.id)
+        if (errorCode !== 'aborted' || activeAbortIntent.value === 'user') {
+          question.value = rawQuestion
+        }
+      } else if (errorCode === 'aborted') {
+        applyTurnTerminalState(turn, 'aborted', {
+          error: '已取消生成',
+          partial: true,
+          interruptedReason: activeAbortIntent.value === 'cleanup' ? 'cleanup' : 'user_abort',
+          persistenceStatus: 'not_saved'
+        })
+      } else {
+        // 已有 answer/sources 时保留临时 turn，避免把用户可复制的半截回答直接丢掉。
+        applyTurnTerminalState(turn, errorCode === 'stream_incomplete' ? 'partial' : 'failed', {
+          error: message,
+          partial: true,
+          interruptedReason: errorCode,
+          persistenceStatus: errorCode === 'database_write_failed' ? 'failed' : 'not_saved'
+        })
+      }
+
+      if (activeAbortIntent.value !== 'cleanup') {
+        if (errorCode === 'aborted') {
+          ElMessage.info(message)
+        } else {
+          ElMessage.error(message)
+        }
+      }
     } finally {
+      if (activeStreamController.value === streamController) {
+        activeStreamController.value = null
+      }
+      activeAbortIntent.value = null
       qaLoading.value = false
     }
+  }
+
+  function resubmitTurn(turnId: string) {
+    const target = qaResults.value.find(turn => turn.id === turnId)
+    if (!target?.question || qaLoading.value) return
+    void submitQuestion(target.question)
   }
 
   return {
@@ -447,6 +597,8 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
     availableSessions,
     retrievalOptions,
     submitQuestion,
+    resubmitTurn,
+    cancelCurrentStream,
     applyPrompt,
     openEvidence,
     closeEvidence,
