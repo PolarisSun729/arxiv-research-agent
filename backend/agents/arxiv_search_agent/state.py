@@ -8,6 +8,7 @@ from .schemas import (
     AgentStep,
     AgentToolCall,
     ArxivSearchSpec,
+    AgentRuntimeState,
     ExecutionPlanStep,
     ExecutablePlan,
     Goal,
@@ -126,10 +127,11 @@ class AgentState(BaseModel):
     search_spec: Optional[ArxivSearchSpec] = None
 
     # goal 表达用户本轮真实想完成的目标；execution_plan 表达结构化步骤规划。
-    # 阶段 1 中它们主要用于状态表达、调试和后续能力扩展，不直接替代现有 plan。
+    # runtime_state 是一等执行现场，负责跨节点/跨请求承载当前 step、工具输出、观察和确认状态。
     goal: Optional[Goal] = None
     execution_plan: Optional[ExecutablePlan] = None
     plan_runtime: Optional[PlanRuntime] = None
+    runtime_state: Optional[AgentRuntimeState] = None
 
     @field_validator("execution_plan", mode="before")
     @classmethod

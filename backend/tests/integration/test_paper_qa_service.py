@@ -81,18 +81,21 @@ def _load_paper_qa_service_class():
         module.MemoryService = _MemoryService
         sys.modules[module.__name__] = module
 
-    if "services.embedding.embedding_service" not in sys.modules:
+    module = sys.modules.get("services.embedding.embedding_service")
+    if module is None:
         module = types.ModuleType("services.embedding.embedding_service")
-
+        sys.modules[module.__name__] = module
+    if not hasattr(module, "EmbeddingConfig"):
+        # 同一 pytest 进程里其它测试可能已注入轻量 stub；这里补齐 PaperQAService 真实导入契约。
         class _EmbeddingConfig:
             pass
 
+        module.EmbeddingConfig = _EmbeddingConfig
+    if not hasattr(module, "EmbeddingService"):
         class _EmbeddingService:
             pass
 
-        module.EmbeddingConfig = _EmbeddingConfig
         module.EmbeddingService = _EmbeddingService
-        sys.modules[module.__name__] = module
 
     if "services.retrieval.enhanced_retrieval_service" not in sys.modules:
         module = types.ModuleType("services.retrieval.enhanced_retrieval_service")
@@ -425,6 +428,8 @@ class PaperQAServiceComponentTests(unittest.TestCase):
         self.assertIn("[Table 3]", text_context)
         self.assertEqual(image_inputs[0]["image_path"], "/tmp/figure.png")
         self.assertEqual(len(asset_metadata), 2)
+        self.assertEqual(source_payload[0]["source_id"], "p1")
+        self.assertEqual(image_inputs[0]["source_id"], source_payload[1]["source_id"])
         self.assertEqual(source_payload[0]["parent_chunk_id"], "p1")
         self.assertEqual(source_payload[1]["asset_summary"], "Figure summary")
         self.assertIn("chunk_type", source_payload[2])
@@ -457,8 +462,43 @@ class PaperQAServiceComponentTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["answer"], "generated answer")
+        self.assertEqual(result["verification_debug"]["status"], "passed")
+        self.assertIn("generation", result["retrieval_debug"])
+        self.assertIn("verification", result["retrieval_debug"])
+        self.assertIn("context_pack", result["retrieval_debug"])
+        self.assertEqual(result["sources"][0]["source_id"], "source-1-text-p1")
         self.assertEqual(len(messages), 2)
         self.assertEqual(messages[1]["content"], "generated answer")
+        self.assertEqual(messages[1]["retrieval_debug_snapshot"]["verification"]["status"], "passed")
+
+    def test_answer_question_marks_empty_answer_as_insufficient_evidence(self) -> None:
+        self._insert_index(status="indexed")
+        session = self._create_session(session_id="qa-empty-answer")
+        retrieval_service = _FakeRetrievalService(
+            chunks=[
+                {
+                    "content": "Relevant chunk content",
+                    "chunk_type": "text",
+                    "page_number": 1,
+                    "source": "body",
+                }
+            ],
+            debug={"provider": "fake-retrieval"},
+        )
+        generation_service = _FakeGenerationWithResponse(response_text="")
+        service = self._make_service(retrieval_service=retrieval_service, generation_service=generation_service)
+
+        result = service.answer_question(
+            self.arxiv_id,
+            {"question": "What is the contribution?", "user_id": self.user_id, "session_id": session["session_id"]},
+        )
+
+        messages = self.db_service.list_paper_chat_messages(session["session_id"], user_id=self.user_id)
+        retrieval_service.cleanup()
+
+        self.assertIn("当前检索证据不足", result["answer"])
+        self.assertEqual(result["verification_debug"]["status"], "insufficient_evidence")
+        self.assertEqual(messages[1]["content"], result["answer"])
 
     def test_answer_question_reports_persistence_failure_without_half_turn(self) -> None:
         self._insert_index(status="indexed")

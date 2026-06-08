@@ -58,10 +58,16 @@ def load_retrieval_modules() -> Dict[str, Any]:
 
     # 其他测试可能向 sys.modules 注入过同名轻量 stub；这里先清理，再导入真实模块。
     for module_name in (
+        "services.retrieval.collection_profile",
+        "services.retrieval.contracts",
         "services.retrieval.enhanced_retrieval_service",
         "services.retrieval.query_planner",
         "services.retrieval.route_retriever",
         "services.retrieval.rerank_service",
+        "services.retrieval.result_fusion_service",
+        "services.retrieval.retrieval_pipeline",
+        "services.retrieval.retrieval_index",
+        "services.retrieval.trace_builder",
     ):
         sys.modules.pop(module_name, None)
 

@@ -233,6 +233,26 @@ def _parse_target_reference(message: str) -> Optional[Dict[str, Any]]:
             "arxiv_id": arxiv_match.group(1),
         }
 
+    # 再尝试解析“第几篇”形式的序号引用，用于指向上一轮搜索结果中的论文。
+    # 这里必须要求“第/篇/论文”等目标锚点，避免“讲一下第二篇”先把“一下”误判成第一篇。
+    ordinal_match = re.search(
+        r"(?:第\s*([一二三四五六七八九十两]{1,3}|[1-9]|1[0-9]|20)\s*(?:篇|个)?(?:论文|paper)?|([一二三四五六七八九十两]{1,3}|[1-9]|1[0-9]|20)\s*(?:篇|个)(?:论文|paper)?)",
+        text,
+    )
+    if ordinal_match:
+        raw_value = ordinal_match.group(1) or ordinal_match.group(2)
+        ordinal = _PREFERENCE_ORDINAL_MAP.get(raw_value)
+        if ordinal is None:
+            ordinal = _safe_int(raw_value, default=0)
+        if 1 <= ordinal <= 20:
+            return {
+                "target_type": "ordinal",
+                "target_value": ordinal,
+                "ordinal": ordinal,
+            }
+
+    # 上下文指代必须放在序号引用之后；真实提问里常见“这第二篇论文/该第 2 篇论文”，
+    # 如果先命中“这篇/该论文”，就会错误回退到默认 selected_paper。
     if _matches_any(
         text,
         (
@@ -249,20 +269,6 @@ def _parse_target_reference(message: str) -> Optional[Dict[str, Any]]:
             "target_type": "context_paper",
             "target_value": "selected_or_recent",
         }
-
-    # 再尝试解析“第几篇”形式的序号引用，用于指向上一轮搜索结果中的论文。
-    ordinal_match = re.search(r"(?:第\s*)?([一二三四五六七八九十两]{1,3}|[1-9]|1[0-9]|20)\s*(?:篇|个)?(?:论文|paper)?", text)
-    if ordinal_match:
-        raw_value = ordinal_match.group(1)
-        ordinal = _PREFERENCE_ORDINAL_MAP.get(raw_value)
-        if ordinal is None:
-            ordinal = _safe_int(raw_value, default=0)
-        if 1 <= ordinal <= 20:
-            return {
-                "target_type": "ordinal",
-                "target_value": ordinal,
-                "ordinal": ordinal,
-            }
 
     bare_match = re.search(r"(?<!\d)([1-9]|1[0-9]|20)(?!\d)", text)
     if bare_match and (text.strip() in {bare_match.group(1), f"第{bare_match.group(1)}", f"第{bare_match.group(1)}篇"} or any(token in text for token in ("喜欢", "不喜欢", "收藏", "标记", "取消", "撤销"))):

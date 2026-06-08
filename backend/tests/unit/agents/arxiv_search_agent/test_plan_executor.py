@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from dataclasses import replace
 
 from tests.helpers.agent_runtime import load_agent_test_modules
 
@@ -211,6 +212,114 @@ def test_plan_executor_interrupt_approve_executes_side_effect_tool(monkeypatch) 
     assert len(calls) == 1
     assert any(trace.event == "confirmation_requested" for trace in result.trace)
     assert any(trace.event == "confirmation_approved" for trace in result.trace)
+
+
+def test_plan_executor_runtime_approved_step_does_not_request_confirmation_again(monkeypatch) -> None:
+    calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        calls.append((tool_name, dict(kwargs)))
+        if tool_name == "build_paper_qa_index":
+            return {"ok": True, "tool_name": tool_name, "summary": "indexed", "data": {"status": "indexed", "has_index": True}, "trace": {}, "error": None}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    def fail_if_interrupted(*args, **kwargs):
+        raise AssertionError("approved runtime step must not request confirmation again")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+    monkeypatch.setattr(executor_module, "interrupt", fail_if_interrupted)
+
+    goal = Goal(goal_id="paper_qa:test", goal_type="paper_qa", user_request="index paper")
+    plan = ExecutablePlan(
+        plan_id="paper_qa:test",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="parse_and_index_paper",
+                action_type="index",
+                tool_name="parse_and_index_paper",
+                tool=_tool("parse_and_index_paper"),
+                output_key="index_build_result",
+                input_bindings=[StepInputBinding(input_key="paper_reference", source_type="literal", value={"arxiv_id": "2401.00001"})],
+                confirmation_policy=StepPolicy(
+                    policy_type="confirmation",
+                    mode="explicit_user_confirmation_required",
+                    requires_confirmation=True,
+                ),
+                side_effect_level="external_call",
+            ),
+        ],
+        entry_step_ids=["parse_and_index_paper"],
+        final_step_ids=["parse_and_index_paper"],
+    )
+    state = AgentState(intent="paper_qa", message="build index")
+    runtime = planner_module.build_plan_runtime(state, goal=goal, plan=plan, turn_status="success")
+    runtime.step_status = {step.step_id: "pending" for step in list(plan.steps or [])}
+    # resume approve 后批准状态必须跟随 runtime 进入下一次 execute_step，避免同一副作用工具二次确认。
+    runtime.approved_step_ids = ["parse_and_index_paper"]
+
+    result = PlanExecutor()._execute_runtime(runtime, state, allow_interrupt=True)
+
+    assert result.status == "success"
+    assert calls and calls[0][0] == "build_paper_qa_index"
+    assert not any(trace.event == "confirmation_requested" for trace in result.trace)
+
+
+def test_plan_executor_resume_reentry_consumes_pending_confirmation(monkeypatch) -> None:
+    calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        calls.append((tool_name, dict(kwargs)))
+        if tool_name == "build_paper_qa_index":
+            return {"ok": True, "tool_name": tool_name, "summary": "indexed", "data": {"status": "indexed", "has_index": True}, "trace": {}, "error": None}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+    monkeypatch.setattr(executor_module, "interrupt", lambda payload: {"decision": "approve", "step_id": "parse_and_index_paper"})
+
+    goal = Goal(goal_id="paper_qa:test", goal_type="paper_qa", user_request="index paper")
+    plan = ExecutablePlan(
+        plan_id="paper_qa:test",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="parse_and_index_paper",
+                action_type="index",
+                tool_name="parse_and_index_paper",
+                tool=_tool("parse_and_index_paper"),
+                output_key="index_build_result",
+                input_bindings=[StepInputBinding(input_key="paper_reference", source_type="literal", value={"arxiv_id": "2401.00001"})],
+                confirmation_policy=StepPolicy(
+                    policy_type="confirmation",
+                    mode="explicit_user_confirmation_required",
+                    requires_confirmation=True,
+                ),
+                side_effect_level="external_call",
+            ),
+        ],
+        entry_step_ids=["parse_and_index_paper"],
+        final_step_ids=["parse_and_index_paper"],
+    )
+    state = AgentState(intent="paper_qa", message="build index")
+    runtime = planner_module.build_plan_runtime(state, goal=goal, plan=plan, turn_status="success")
+    runtime.step_status = {"parse_and_index_paper": "waiting_confirmation"}
+    runtime.current_step_id = "parse_and_index_paper"
+    runtime.pending_confirmation = executor_module.ConfirmationRequest(
+        step_id="parse_and_index_paper",
+        tool_name="parse_and_index_paper",
+        action_type="index",
+        side_effect_level="external_call",
+        reason="explicit_user_confirmation_required",
+    )
+
+    result = PlanExecutor().execute_current_step_tool(runtime, state, allow_interrupt=True)
+
+    assert result.next_action in {"observe", "continue"}
+    assert calls and calls[0][0] == "build_paper_qa_index"
+    assert runtime.approved_step_ids == ["parse_and_index_paper"]
+    assert state.context["approved_step_ids"] == ["parse_and_index_paper"]
+    assert runtime.pending_confirmation is None
+    assert any(trace.event == "confirmation_approved" for trace in runtime.trace)
 
 
 def test_plan_executor_interrupt_reject_skips_side_effect_tool(monkeypatch) -> None:
@@ -513,3 +622,160 @@ def test_plan_executor_replans_empty_profile_to_message_recommendation(monkeypat
     assert replan_traces
     assert replan_traces[0].detail.get("failure_category") == "empty_user_profile"
     assert replan_traces[0].detail.get("recovery_candidates")
+
+
+def test_plan_executor_search_missing_search_spec_returns_structured_input_error() -> None:
+    goal = Goal(goal_id="arxiv_search:validation", goal_type="arxiv_search", user_request="search")
+    plan = ExecutablePlan(
+        plan_id="arxiv_search:validation",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="search_arxiv",
+                action_type="search",
+                tool_name="search_arxiv",
+                tool=_tool("search_arxiv"),
+                output_key="arxiv_results",
+            ),
+        ],
+        entry_step_ids=["search_arxiv"],
+        final_step_ids=["search_arxiv"],
+    )
+
+    result = PlanExecutor().execute(plan, AgentState(intent="arxiv_search", message="rag"))
+
+    assert result.status == "fallback"
+    assert result.error.startswith("fallback:search_arxiv:")
+    assert result.runtime is not None
+    assert result.runtime.recovery_strategy["type"] == "fallback_answer"
+    observation_trace = next(trace for trace in result.trace if trace.event == "step_observed" and trace.step_id == "search_arxiv")
+    assert observation_trace.detail["observation_status"] == "tool_error"
+    assert observation_trace.detail["failure_category"] == "ambiguous_user_request"
+    tool_error = observation_trace.detail["evidence"]["tool_error"]
+    assert tool_error["error_code"] == "input_validation_error"
+    assert tool_error["failed_stage"] == "input_validation"
+    assert tool_error["suggested_recovery"] == "ask_clarification"
+    assert any(trace.event == "plan_replanned" and trace.detail.get("failure_category") == "ambiguous_user_request" for trace in result.trace)
+
+
+def test_plan_executor_paper_qa_missing_arxiv_id_returns_structured_tool_error() -> None:
+    goal = Goal(goal_id="paper_qa:missing_arxiv_id", goal_type="paper_qa", user_request="what is the method?")
+    plan = ExecutablePlan(
+        plan_id="paper_qa:missing_arxiv_id",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="answer_paper_question",
+                action_type="answer",
+                tool_name="answer_paper_question",
+                tool=_tool("answer_paper_question"),
+                output_key="paper_qa_result",
+            ),
+        ],
+        entry_step_ids=["answer_paper_question"],
+        final_step_ids=["answer_paper_question"],
+    )
+
+    result = PlanExecutor().execute(plan, AgentState(intent="paper_qa", message="what is the method?"))
+
+    assert result.status == "fallback"
+    assert result.error.startswith("fallback:answer_paper_question:")
+    assert result.runtime is not None
+    observation_trace = next(trace for trace in result.trace if trace.event == "step_observed" and trace.step_id == "answer_paper_question")
+    assert observation_trace.detail["observation_status"] == "tool_error"
+    assert observation_trace.detail["failure_category"] == "ambiguous_user_request"
+    tool_error = observation_trace.detail["evidence"]["tool_error"]
+    assert tool_error["error_code"] == "missing_arxiv_id"
+    assert tool_error["failed_stage"] == "input_validation"
+    assert tool_error["suggested_recovery"] == "ask_clarification"
+
+
+def test_plan_executor_backend_exception_is_structured_tool_error(monkeypatch) -> None:
+    def failing_backend_tool(tool_name: str, **kwargs):
+        raise RuntimeError(f"{tool_name} unavailable")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", failing_backend_tool)
+    goal = Goal(goal_id="arxiv_search:backend_exception", goal_type="arxiv_search", user_request="search")
+    plan = ExecutablePlan(
+        plan_id="arxiv_search:backend_exception",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="search_arxiv",
+                action_type="search",
+                tool_name="search_arxiv",
+                tool=_tool("search_arxiv"),
+                output_key="arxiv_results",
+                input_bindings=[
+                    StepInputBinding(
+                        input_key="search_spec",
+                        source_type="literal",
+                        value={"intent": "arxiv_search", "query": "rag", "max_results": 3},
+                    )
+                ],
+            ),
+        ],
+        entry_step_ids=["search_arxiv"],
+        final_step_ids=["search_arxiv"],
+    )
+
+    result = PlanExecutor().execute(plan, AgentState(intent="arxiv_search", message="rag"))
+
+    assert result.status == "fallback"
+    assert result.error.startswith("fallback:search_arxiv:")
+    assert result.runtime is not None
+    observation_trace = next(trace for trace in result.trace if trace.event == "step_observed" and trace.step_id == "search_arxiv")
+    assert observation_trace.detail["observation_status"] == "tool_error"
+    assert observation_trace.detail["failure_category"] == "tool_runtime_error"
+    tool_error = observation_trace.detail["evidence"]["tool_error"]
+    assert tool_error["error_code"] == "tool_runtime_error"
+    assert tool_error["failed_stage"] == "adapter_execution"
+    assert tool_error["raw_exception_type"] == "RuntimeError"
+
+
+def test_plan_executor_rejects_adapter_output_that_violates_contract(monkeypatch) -> None:
+    class BadFallbackAdapter:
+        def execute(self, tool_input):
+            return executor_module.ToolExecutionResult(
+                ok=True,
+                data={"final_answer": 123},
+                adapter_name="BadFallbackAdapter",
+                tool_name="generate_fallback_response",
+            )
+
+    original_contract = PLANNER_TOOL_REGISTRY.get_contract("generate_fallback_response")
+    assert original_contract is not None
+    monkeypatch.setitem(
+        PLANNER_TOOL_REGISTRY._contracts,
+        "generate_fallback_response",
+        replace(original_contract, adapter=BadFallbackAdapter(), implementation="tests.BadFallbackAdapter"),
+    )
+
+    goal = Goal(goal_id="unsupported:bad_output", goal_type="unsupported", user_request="fallback")
+    plan = ExecutablePlan(
+        plan_id="unsupported:bad_output",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="generate_fallback_response",
+                action_type="answer",
+                tool_name="generate_fallback_response",
+                tool=_tool("generate_fallback_response"),
+                output_key="final_answer",
+                input_bindings=[StepInputBinding(input_key="message", source_type="literal", value="unsupported")],
+            ),
+        ],
+        entry_step_ids=["generate_fallback_response"],
+        final_step_ids=["generate_fallback_response"],
+    )
+
+    result = PlanExecutor().execute(plan, AgentState(intent="unsupported", message="unsupported"))
+
+    assert result.status == "fallback"
+    assert result.error.startswith("fallback:generate_fallback_response:")
+    assert result.runtime is not None
+    observation_trace = next(trace for trace in result.trace if trace.event == "step_observed" and trace.step_id == "generate_fallback_response")
+    assert observation_trace.detail["observation_status"] == "tool_error"
+    assert observation_trace.detail["failure_category"] == "tool_invalid_output"
+    tool_error = observation_trace.detail["evidence"]["tool_error"]
+    assert tool_error["error_code"] == "output_validation_error"

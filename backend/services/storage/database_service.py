@@ -290,6 +290,55 @@ class DatabaseService:
                 )
             ''')
 
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS agent_runtime_checkpoints (
+                    checkpoint_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL DEFAULT '{default_user_id_sql}',
+                    session_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    runtime_state_json TEXT,
+                    graph_state_json TEXT,
+                    pending_confirmation_json TEXT,
+                    current_node TEXT,
+                    next_route TEXT,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    error_summary TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP,
+                    UNIQUE(user_id, session_id, thread_id)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS langgraph_checkpoints (
+                    thread_id TEXT NOT NULL,
+                    checkpoint_ns TEXT NOT NULL DEFAULT '',
+                    checkpoint_id TEXT NOT NULL,
+                    parent_checkpoint_id TEXT,
+                    checkpoint_json TEXT NOT NULL,
+                    metadata_json TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(thread_id, checkpoint_ns, checkpoint_id)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS langgraph_checkpoint_writes (
+                    thread_id TEXT NOT NULL,
+                    checkpoint_ns TEXT NOT NULL DEFAULT '',
+                    checkpoint_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    idx INTEGER NOT NULL,
+                    channel TEXT NOT NULL,
+                    value_json TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(thread_id, checkpoint_ns, checkpoint_id, task_id, idx)
+                )
+            ''')
+
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_paper_chat_sessions_user_paper_updated
                 ON paper_chat_sessions(user_id, arxiv_id, updated_at DESC)
@@ -344,6 +393,21 @@ class DatabaseService:
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_agent_sessions_user_updated
                 ON agent_sessions(user_id, updated_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_agent_runtime_checkpoints_session
+                ON agent_runtime_checkpoints(user_id, session_id, status, updated_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_agent_runtime_checkpoints_expiry
+                ON agent_runtime_checkpoints(status, expires_at)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_langgraph_checkpoints_thread_updated
+                ON langgraph_checkpoints(thread_id, checkpoint_ns, updated_at DESC)
             ''')
 
             conn.commit()
@@ -2385,6 +2449,24 @@ class DatabaseService:
             'updated_at': row[13],
         }
 
+    def _row_to_agent_runtime_checkpoint(self, row: Any) -> Dict[str, Any]:
+        return {
+            'checkpoint_id': row[0],
+            'user_id': row[1],
+            'session_id': row[2],
+            'thread_id': row[3],
+            'runtime_state': self._deserialize_json_field(row[4]) or None,
+            'graph_state': self._deserialize_json_field(row[5]) or None,
+            'pending_confirmation': self._deserialize_json_field(row[6]) or None,
+            'current_node': row[7] or '',
+            'next_route': row[8] or '',
+            'status': row[9] or 'running',
+            'error_summary': row[10] or '',
+            'created_at': row[11],
+            'updated_at': row[12],
+            'expires_at': row[13],
+        }
+
     def _row_to_paper_chat_message(self, row: Any) -> Dict[str, Any]:
         return {
             'message_id': row[0],
@@ -2620,6 +2702,432 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"Error getting agent session: {str(e)}")
             return None
+
+    def upsert_agent_runtime_checkpoint(
+        self,
+        *,
+        user_id: str = DEFAULT_USER_ID,
+        session_id: str,
+        thread_id: str,
+        runtime_state: Optional[Dict[str, Any]] = None,
+        graph_state: Optional[Dict[str, Any]] = None,
+        pending_confirmation: Optional[Dict[str, Any]] = None,
+        current_node: Optional[str] = None,
+        next_route: Optional[str] = None,
+        status: str = 'running',
+        error_summary: Optional[str] = None,
+        expires_at: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """写入 Agent 执行现场 checkpoint。
+
+        这张表记录的是可恢复执行现场，不是前端展示镜像；pending_action 仍由 agent_sessions 保存，
+        但 resume 校验必须以这里的 pending_confirmation/status 为准。
+        """
+        try:
+            normalized_user_id = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+            normalized_session_id = str(session_id or '').strip()
+            normalized_thread_id = str(thread_id or normalized_session_id).strip()
+            if not normalized_session_id or not normalized_thread_id:
+                return None
+
+            checkpoint_id = f"{normalized_user_id}:{normalized_session_id}:{normalized_thread_id}"
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    INSERT INTO agent_runtime_checkpoints (
+                        checkpoint_id, user_id, session_id, thread_id, runtime_state_json,
+                        graph_state_json, pending_confirmation_json, current_node, next_route,
+                        status, error_summary, expires_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, session_id, thread_id) DO UPDATE SET
+                        runtime_state_json = excluded.runtime_state_json,
+                        graph_state_json = excluded.graph_state_json,
+                        pending_confirmation_json = excluded.pending_confirmation_json,
+                        current_node = excluded.current_node,
+                        next_route = excluded.next_route,
+                        status = excluded.status,
+                        error_summary = excluded.error_summary,
+                        expires_at = excluded.expires_at,
+                        updated_at = CURRENT_TIMESTAMP
+                    ''',
+                    (
+                        checkpoint_id,
+                        normalized_user_id,
+                        normalized_session_id,
+                        normalized_thread_id,
+                        self._serialize_json_field(runtime_state),
+                        self._serialize_json_field(graph_state),
+                        self._serialize_json_field(pending_confirmation),
+                        str(current_node or '').strip(),
+                        str(next_route or '').strip(),
+                        str(status or 'running').strip() or 'running',
+                        str(error_summary or '').strip(),
+                        expires_at,
+                    ),
+                )
+                conn.commit()
+            return self.get_agent_runtime_checkpoint(
+                user_id=normalized_user_id,
+                session_id=normalized_session_id,
+                thread_id=normalized_thread_id,
+            )
+        except Exception as e:
+            logger.error(f"Error upserting agent runtime checkpoint: {str(e)}")
+            return None
+
+    def get_agent_runtime_checkpoint(
+        self,
+        *,
+        user_id: str = DEFAULT_USER_ID,
+        session_id: str,
+        thread_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            normalized_user_id = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+            normalized_session_id = str(session_id or '').strip()
+            normalized_thread_id = str(thread_id or normalized_session_id).strip()
+            if not normalized_session_id or not normalized_thread_id:
+                return None
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT checkpoint_id, user_id, session_id, thread_id, runtime_state_json,
+                           graph_state_json, pending_confirmation_json, current_node, next_route,
+                           status, error_summary, created_at, updated_at, expires_at
+                    FROM agent_runtime_checkpoints
+                    WHERE user_id = ? AND session_id = ? AND thread_id = ?
+                    ''',
+                    (normalized_user_id, normalized_session_id, normalized_thread_id),
+                )
+                row = cursor.fetchone()
+                return self._row_to_agent_runtime_checkpoint(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting agent runtime checkpoint: {str(e)}")
+            return None
+
+    def mark_agent_runtime_checkpoint_status(
+        self,
+        *,
+        user_id: str = DEFAULT_USER_ID,
+        session_id: str,
+        thread_id: Optional[str] = None,
+        status: str,
+        error_summary: Optional[str] = None,
+        clear_pending_confirmation: bool = False,
+    ) -> bool:
+        """更新执行现场终态或过期态，避免旧 confirmation 被重复 resume。"""
+        try:
+            normalized_user_id = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+            normalized_session_id = str(session_id or '').strip()
+            normalized_thread_id = str(thread_id or normalized_session_id).strip()
+            if not normalized_session_id or not normalized_thread_id:
+                return False
+            assignments = ['status = ?', 'error_summary = ?', 'updated_at = CURRENT_TIMESTAMP']
+            values: List[Any] = [str(status or '').strip(), str(error_summary or '').strip()]
+            if clear_pending_confirmation:
+                assignments.append("pending_confirmation_json = ''")
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    f'''
+                    UPDATE agent_runtime_checkpoints
+                    SET {", ".join(assignments)}
+                    WHERE user_id = ? AND session_id = ? AND thread_id = ?
+                    ''',
+                    values + [normalized_user_id, normalized_session_id, normalized_thread_id],
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error marking agent runtime checkpoint status: {str(e)}")
+            return False
+
+    def expire_agent_runtime_checkpoints(self, *, now: Optional[str] = None) -> int:
+        """把超过 expires_at 的等待现场标记为 expired。
+
+        清理先改状态而不是直接删除，是为了让前端/日志能得到明确“过期”语义。
+        """
+        try:
+            now_text = now or datetime.now(timezone.utc).isoformat()
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    UPDATE agent_runtime_checkpoints
+                    SET status = 'expired',
+                        error_summary = COALESCE(NULLIF(error_summary, ''), 'checkpoint_expired'),
+                        pending_confirmation_json = '',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE status = 'waiting_confirmation'
+                      AND expires_at IS NOT NULL
+                      AND expires_at <= ?
+                    ''',
+                    (now_text,),
+                )
+                conn.commit()
+                return int(cursor.rowcount or 0)
+        except Exception as e:
+            logger.error(f"Error expiring agent runtime checkpoints: {str(e)}")
+            return 0
+
+    def cleanup_agent_runtime_checkpoints(self, *, retention_days: int = 7) -> int:
+        """删除已终止且超过保留期的 runtime checkpoint，避免持久化表无限增长。"""
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=max(int(retention_days or 0), 1))
+            cutoff_text = cutoff.isoformat()
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    DELETE FROM agent_runtime_checkpoints
+                    WHERE status IN ('completed', 'cancelled', 'failed', 'expired')
+                      AND updated_at <= ?
+                    ''',
+                    (cutoff_text,),
+                )
+                conn.commit()
+                return int(cursor.rowcount or 0)
+        except Exception as e:
+            logger.error(f"Error cleaning agent runtime checkpoints: {str(e)}")
+            return 0
+
+    def put_langgraph_checkpoint(
+        self,
+        *,
+        thread_id: str,
+        checkpoint_ns: str,
+        checkpoint_id: str,
+        checkpoint: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+        parent_checkpoint_id: Optional[str] = None,
+    ) -> bool:
+        """保存 LangGraph 原始 checkpoint。
+
+        这里不解释业务语义，只负责把 LangGraph 恢复所需的快照落到 SQLite。
+        """
+        try:
+            normalized_thread_id = str(thread_id or '').strip()
+            normalized_checkpoint_id = str(checkpoint_id or '').strip()
+            if not normalized_thread_id or not normalized_checkpoint_id:
+                return False
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    INSERT INTO langgraph_checkpoints (
+                        thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id,
+                        checkpoint_json, metadata_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(thread_id, checkpoint_ns, checkpoint_id) DO UPDATE SET
+                        parent_checkpoint_id = excluded.parent_checkpoint_id,
+                        checkpoint_json = excluded.checkpoint_json,
+                        metadata_json = excluded.metadata_json,
+                        updated_at = CURRENT_TIMESTAMP
+                    ''',
+                    (
+                        normalized_thread_id,
+                        str(checkpoint_ns or ''),
+                        normalized_checkpoint_id,
+                        parent_checkpoint_id,
+                        self._serialize_json_field(checkpoint),
+                        self._serialize_json_field(metadata),
+                    ),
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error putting langgraph checkpoint: {str(e)}")
+            return False
+
+    def get_langgraph_checkpoint(
+        self,
+        *,
+        thread_id: str,
+        checkpoint_ns: str = '',
+        checkpoint_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            normalized_thread_id = str(thread_id or '').strip()
+            if not normalized_thread_id:
+                return None
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                if checkpoint_id:
+                    cursor.execute(
+                        '''
+                        SELECT checkpoint_id, parent_checkpoint_id, checkpoint_json, metadata_json, created_at, updated_at
+                        FROM langgraph_checkpoints
+                        WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?
+                        ''',
+                        (normalized_thread_id, str(checkpoint_ns or ''), str(checkpoint_id)),
+                    )
+                else:
+                    cursor.execute(
+                        '''
+                        SELECT checkpoint_id, parent_checkpoint_id, checkpoint_json, metadata_json, created_at, updated_at
+                        FROM langgraph_checkpoints
+                        WHERE thread_id = ? AND checkpoint_ns = ?
+                        ORDER BY updated_at DESC, created_at DESC
+                        LIMIT 1
+                        ''',
+                        (normalized_thread_id, str(checkpoint_ns or '')),
+                    )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                pending_writes = self.get_langgraph_checkpoint_writes(
+                    thread_id=normalized_thread_id,
+                    checkpoint_ns=str(checkpoint_ns or ''),
+                    checkpoint_id=row[0],
+                )
+                return {
+                    'thread_id': normalized_thread_id,
+                    'checkpoint_ns': str(checkpoint_ns or ''),
+                    'checkpoint_id': row[0],
+                    'parent_checkpoint_id': row[1],
+                    'checkpoint': self._deserialize_json_field(row[2]) or {},
+                    'metadata': self._deserialize_json_field(row[3]) or {},
+                    'pending_writes': pending_writes,
+                    'created_at': row[4],
+                    'updated_at': row[5],
+                }
+        except Exception as e:
+            logger.error(f"Error getting langgraph checkpoint: {str(e)}")
+            return None
+
+    def list_langgraph_checkpoints(
+        self,
+        *,
+        thread_id: str,
+        checkpoint_ns: str = '',
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        try:
+            normalized_thread_id = str(thread_id or '').strip()
+            if not normalized_thread_id:
+                return []
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT checkpoint_id, parent_checkpoint_id, checkpoint_json, metadata_json, created_at, updated_at
+                    FROM langgraph_checkpoints
+                    WHERE thread_id = ? AND checkpoint_ns = ?
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT ?
+                    ''',
+                    (normalized_thread_id, str(checkpoint_ns or ''), max(int(limit or 1), 1)),
+                )
+                rows = cursor.fetchall()
+                checkpoints: List[Dict[str, Any]] = []
+                for row in rows:
+                    checkpoints.append(
+                        {
+                            'thread_id': normalized_thread_id,
+                            'checkpoint_ns': str(checkpoint_ns or ''),
+                            'checkpoint_id': row[0],
+                            'parent_checkpoint_id': row[1],
+                            'checkpoint': self._deserialize_json_field(row[2]) or {},
+                            'metadata': self._deserialize_json_field(row[3]) or {},
+                            'pending_writes': self.get_langgraph_checkpoint_writes(
+                                thread_id=normalized_thread_id,
+                                checkpoint_ns=str(checkpoint_ns or ''),
+                                checkpoint_id=row[0],
+                            ),
+                            'created_at': row[4],
+                            'updated_at': row[5],
+                        }
+                    )
+                return checkpoints
+        except Exception as e:
+            logger.error(f"Error listing langgraph checkpoints: {str(e)}")
+            return []
+
+    def get_langgraph_checkpoint_writes(
+        self,
+        *,
+        thread_id: str,
+        checkpoint_ns: str,
+        checkpoint_id: str,
+    ) -> List[Dict[str, Any]]:
+        try:
+            normalized_thread_id = str(thread_id or '').strip()
+            normalized_checkpoint_id = str(checkpoint_id or '').strip()
+            if not normalized_thread_id or not normalized_checkpoint_id:
+                return []
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT task_id, idx, channel, value_json
+                    FROM langgraph_checkpoint_writes
+                    WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?
+                    ORDER BY task_id ASC, idx ASC
+                    ''',
+                    (normalized_thread_id, str(checkpoint_ns or ''), normalized_checkpoint_id),
+                )
+                return [
+                    {
+                        'task_id': row[0],
+                        'idx': row[1],
+                        'channel': row[2],
+                        'value': self._deserialize_json_field(row[3]),
+                    }
+                    for row in cursor.fetchall()
+                ]
+        except Exception as e:
+            logger.error(f"Error getting langgraph checkpoint writes: {str(e)}")
+            return []
+
+    def put_langgraph_checkpoint_writes(
+        self,
+        *,
+        thread_id: str,
+        checkpoint_ns: str,
+        checkpoint_id: str,
+        task_id: str,
+        writes: List[Dict[str, Any]],
+    ) -> bool:
+        try:
+            normalized_thread_id = str(thread_id or '').strip()
+            normalized_checkpoint_id = str(checkpoint_id or '').strip()
+            normalized_task_id = str(task_id or '').strip()
+            if not normalized_thread_id or not normalized_checkpoint_id or not normalized_task_id:
+                return False
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                for index, write in enumerate(list(writes or [])):
+                    channel = str((write or {}).get('channel') or '').strip()
+                    cursor.execute(
+                        '''
+                        INSERT INTO langgraph_checkpoint_writes (
+                            thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, value_json
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(thread_id, checkpoint_ns, checkpoint_id, task_id, idx) DO UPDATE SET
+                            channel = excluded.channel,
+                            value_json = excluded.value_json,
+                            updated_at = CURRENT_TIMESTAMP
+                        ''',
+                        (
+                            normalized_thread_id,
+                            str(checkpoint_ns or ''),
+                            normalized_checkpoint_id,
+                            normalized_task_id,
+                            index,
+                            channel,
+                            self._serialize_json_field((write or {}).get('value')),
+                        ),
+                    )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error putting langgraph checkpoint writes: {str(e)}")
+            return False
 
     def update_agent_session(
         self,

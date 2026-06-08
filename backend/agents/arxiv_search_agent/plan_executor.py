@@ -1,19 +1,21 @@
 from __future__ import annotations
 
-import re
 import logging
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from time import perf_counter
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from langgraph.types import interrupt
-from tools.tool_registry import invoke_tool as invoke_backend_tool
+from pydantic import ValidationError
 
+from . import tool_registry as agent_tool_registry
 from .observer import Observer
 from .planner import build_executable_plan, build_plan_runtime
 from .replanner import Replanner
+from .response_assembler import assemble_final_answer, record_confirmation_rejection, record_recovery_fallback
 from .schemas import (
     AgentTurnResult,
-    ArxivSearchSpec,
+    AgentRuntimeState,
     ConfirmationDecisionOption,
     ConfirmationRequest,
     ExecutablePlan,
@@ -22,19 +24,16 @@ from .schemas import (
     ObservationResult,
     PlanRuntime,
     PlanStep,
+    StepExecutionResult,
     StepCondition,
 )
 from .state import AgentState
+from .tool_adapters.models import ToolError, ToolExecutionResult
+from .tool_result_projector import project_tool_result
 from .tool_registry import PLANNER_TOOL_REGISTRY, ToolRegistry
 
-try:
-    from .utils.paper_reference_resolver import _resolve_paper_reference
-except Exception:  # pragma: no cover - 测试轻量导入场景下允许缺失
-    _resolve_paper_reference = None
-
-
-PlannerToolImplementation = Callable[[Dict[str, Any], AgentState, PlanRuntime, PlanStep], Any]
 logger = logging.getLogger(__name__)
+invoke_backend_tool = agent_tool_registry.invoke_backend_tool
 
 
 def _utcnow() -> str:
@@ -61,6 +60,27 @@ def _safe_compact(value: Any, *, limit: int = 1200) -> Any:
         return compact_items
     text = repr(value)
     return text if len(text) <= limit else f"{text[:limit]}..."
+
+
+def _json_safe(value: Any) -> Any:
+    """把跨节点运行现场裁剪成 JSON 友好的数据。
+
+    PlanRuntime 内部仍可能短暂持有 Pydantic 对象或工具返回的复杂对象；写入 runtime_state /
+    runtime_patch 时必须先降级成普通 dict/list/标量，避免 checkpoint 依赖不可序列化实例。
+    """
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return model_dump(mode="json")
+        except TypeError:
+            return model_dump()
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in dict(value or {}).items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_json_safe(item) for item in list(value or [])]
+    return repr(value)
 
 
 def _get_path_value(value: Any, path: Optional[str]) -> Any:
@@ -144,87 +164,40 @@ def _evaluate_condition(condition: Optional[StepCondition], state: AgentState, r
     return not result if condition.negate else result
 
 
-def _normalize_step_output(step: PlanStep, tool_output: Any) -> Any:
-    """优先把工具结果归一到 step.output_key 对应的数据，减少下游 binding 解析负担。"""
-    if step.output_key is None:
-        return tool_output
-    if isinstance(tool_output, Mapping):
-        if step.output_key in tool_output:
-            return tool_output.get(step.output_key)
-        if len(step.tool.output_schema or {}) == 1:
-            only_key = next(iter(step.tool.output_schema.keys()))
-            if only_key in tool_output:
-                return tool_output.get(only_key)
-    return tool_output
+def _make_tool_error(
+    *,
+    error_code: str,
+    message: str,
+    detail: Optional[Mapping[str, Any]] = None,
+    recoverable: bool = True,
+    retryable: bool = False,
+    suggested_recovery: Optional[str] = None,
+    failed_stage: Optional[str] = None,
+    raw_exception_type: Optional[str] = None,
+    safe_debug: Optional[Mapping[str, Any]] = None,
+) -> ToolError:
+    return ToolError(
+        error_code=error_code,
+        message=message,
+        detail=dict(detail or {}),
+        recoverable=recoverable,
+        retryable=retryable,
+        suggested_recovery=suggested_recovery,
+        failed_stage=failed_stage,
+        raw_exception_type=raw_exception_type,
+        safe_debug=dict(safe_debug or {}),
+    )
 
 
-def _matches_declared_type(value: Any, declared_type: Any) -> bool:
-    normalized_type = str(declared_type or "").strip().lower()
-    if not normalized_type:
-        return True
-    if normalized_type == "dict":
-        return isinstance(value, Mapping)
-    if normalized_type == "list":
-        return isinstance(value, list)
-    if normalized_type == "str":
-        return isinstance(value, str)
-    if normalized_type == "bool":
-        return isinstance(value, bool)
-    if normalized_type == "int":
-        return isinstance(value, int) and not isinstance(value, bool)
-    return True
+def _tool_error_to_text(error: ToolError) -> str:
+    return f"{error.error_code}:{error.message}"
 
 
-def _validate_output_schema(step: PlanStep, raw_output: Any, normalized_output: Any) -> Optional[str]:
-    schema = dict(step.tool.output_schema or {})
-    if not schema:
-        return None
-    if len(schema) == 1:
-        only_key, only_type = next(iter(schema.items()))
-        if isinstance(raw_output, Mapping) and only_key in raw_output:
-            if _matches_declared_type(raw_output.get(only_key), only_type):
-                return None
-            return f"output_schema_type_mismatch:{only_key}"
-        # 这类 step 往往直接把“唯一产物本体”作为返回值，不再额外包一层同名字段。
-        if step.output_key == only_key and _matches_declared_type(normalized_output, only_type):
-            return None
-        if not isinstance(raw_output, Mapping) and _matches_declared_type(normalized_output, only_type):
-            return None
-        if isinstance(raw_output, Mapping) and _matches_declared_type(raw_output, only_type):
-            return None
-        return "output_schema_invalid"
-    if isinstance(raw_output, Mapping):
-        for key, declared_type in schema.items():
-            if key not in raw_output:
-                return f"output_schema_missing_field:{key}"
-            if not _matches_declared_type(raw_output.get(key), declared_type):
-                return f"output_schema_type_mismatch:{key}"
-        return None
-    return "output_schema_invalid"
-
-
-def _extract_papers(search_result: Any) -> List[Dict[str, Any]]:
-    if isinstance(search_result, Mapping):
-        papers = search_result.get("papers")
-        if isinstance(papers, list):
-            return [dict(item) for item in papers if isinstance(item, Mapping)]
-    if isinstance(search_result, list):
-        return [dict(item) for item in search_result if isinstance(item, Mapping)]
-    return []
-
-
-def _resolve_paper_reference_fallback(message: str, context: Mapping[str, Any]) -> Dict[str, Any]:
-    selected_paper = context.get("selected_paper")
-    if isinstance(selected_paper, Mapping):
-        return dict(selected_paper)
-    for key in ("papers", "last_papers"):
-        papers = context.get(key)
-        if isinstance(papers, list) and papers and isinstance(papers[0], Mapping):
-            return dict(papers[0])
-    arxiv_id_match = re.search(r"\b\d{4}\.\d{4,5}(?:v\d+)?\b", message or "")
-    if arxiv_id_match:
-        return {"arxiv_id": arxiv_id_match.group(0), "query": message}
-    return {"query": message}
+def _model_to_plain(value: Any) -> Any:
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return model_dump()
+    return value
 
 
 def _compact_confirmation_arguments(arguments: Mapping[str, Any]) -> Dict[str, Any]:
@@ -258,32 +231,6 @@ class PlanExecutor:
         self.tool_registry = tool_registry
         self.observer = Observer()
         self.replanner = Replanner(tool_registry=tool_registry)
-        self._planner_tool_impls: Dict[str, PlannerToolImplementation] = {
-            "normalize_request": self._normalize_request,
-            "build_arxiv_search_spec": self._build_arxiv_search_spec,
-            "search_arxiv": self._search_arxiv,
-            "validate_arxiv_results": self._validate_arxiv_results,
-            "rewrite_arxiv_query": self._rewrite_arxiv_query,
-            "personalize_paper_results": self._personalize_paper_results,
-            "synthesize_arxiv_response": self._synthesize_arxiv_response,
-            "resolve_paper": self._resolve_paper,
-            "check_paper_index": self._check_paper_index,
-            "request_confirmation": self._request_confirmation,
-            "parse_and_index_paper": self._parse_and_index_paper,
-            "answer_paper_question": self._answer_paper_question,
-            "load_user_profile": self._load_user_profile,
-            "load_candidate_papers": self._load_candidate_papers,
-            "generate_recommendations": self._generate_recommendations,
-            "validate_recommendations": self._validate_recommendations,
-            "explain_recommendations": self._explain_recommendations,
-            "resolve_preference_target": self._resolve_preference_target,
-            "update_preference_store": self._update_preference_store,
-            "verify_preference_update": self._verify_preference_update,
-            "synthesize_preference_response": self._synthesize_preference_response,
-            "analyze_ambiguity": self._analyze_ambiguity,
-            "generate_clarification": self._generate_clarification,
-            "generate_fallback_response": self._generate_fallback_response,
-        }
 
     def execute(self, plan: ExecutablePlan, state: AgentState) -> AgentTurnResult:
         runtime = build_plan_runtime(state, goal=plan.goal, plan=plan, turn_status="success")
@@ -296,8 +243,331 @@ class PlanExecutor:
         return self._execute_runtime(runtime, state, allow_interrupt=False)
 
     def execute_runtime(self, runtime: PlanRuntime, state: AgentState) -> AgentTurnResult:
-        """允许上层在已有 runtime 基础上续跑，便于后续接确认/重规划。"""
+        """兼容旧入口：在已有 runtime 基础上连续执行到终态或确认暂停。"""
         return self._execute_runtime(runtime, state, allow_interrupt=False)
+
+    def finalize_runtime(self, runtime: PlanRuntime) -> AgentTurnResult:
+        """把当前 runtime 收束成 AgentTurnResult，供图上的 finalize 节点调用。"""
+        self._finalize_blocked_pending_steps(runtime)
+        return self._build_turn_result(runtime)
+
+    def select_next_step(self, runtime: PlanRuntime, state: AgentState) -> Optional[PlanStep]:
+        """选择下一个可执行 step。
+
+        这个方法是给 LangGraph 节点准备的显式边界：选择逻辑只判断依赖、条件和前置约束，
+        不触发任何工具调用，便于上层把“路由到哪个节点”与“真正执行工具”分开。
+        """
+        step = self._find_executable_step(runtime, state)
+        self._sync_runtime_state(state, runtime, current_step=step)
+        return step
+
+    def execute_next_step(
+        self,
+        runtime: PlanRuntime,
+        state: AgentState,
+        *,
+        allow_interrupt: bool = False,
+        auto_replan: bool = True,
+    ) -> StepExecutionResult:
+        """只执行一个待执行 step，并返回结构化结果。
+
+        旧执行器的大循环会继续调用这个方法完成兼容路径；未来 LangGraph 节点可以直接消费
+        StepExecutionResult.runtime_patch，把单步输出、observation、确认态和恢复建议写入 checkpoint。
+        """
+        step = self.select_next_step(runtime, state)
+        if step is None:
+            self._finalize_blocked_pending_steps(runtime)
+            turn_result = self._build_turn_result(runtime)
+            self._sync_runtime_state(state, runtime, current_step=None)
+            return StepExecutionResult(
+                step_id=None,
+                step_status=None,
+                next_action="finish" if turn_result.status not in {"failed", "fallback"} else "fail",
+                error=turn_result.error,
+                pending_confirmation=turn_result.pending_confirmation,
+                runtime_patch=self._build_runtime_patch(runtime, current_step=None),
+                turn_result=turn_result,
+            )
+
+        previous_outputs = dict(runtime.outputs or {})
+        previous_trace_len = len(runtime.trace or [])
+        previous_error = runtime.error
+        previous_pending = runtime.pending_confirmation
+        turn_result = self._execute_step(step, runtime, state, allow_interrupt=allow_interrupt, auto_replan=auto_replan)
+        step_result = self._build_step_execution_result(
+            step=step,
+            runtime=runtime,
+            previous_outputs=previous_outputs,
+            previous_trace_len=previous_trace_len,
+            previous_error=previous_error,
+            previous_pending=previous_pending,
+            turn_result=turn_result,
+        )
+        self._sync_runtime_state(state, runtime, current_step=step)
+        return step_result
+
+    def execute_current_step_tool(self, runtime: PlanRuntime, state: AgentState, *, allow_interrupt: bool = False) -> StepExecutionResult:
+        """只执行当前 step 的工具调用，不做 observation / replan。
+
+        这是显式 LangGraph `execute_step` 节点的入口。工具输出会写入 runtime.last_step_output，
+        后续 `observe_step` 节点再独立判断结果质量，避免观察和重规划继续藏在执行节点里。
+        """
+        step = self._get_current_step(runtime)
+        if step is None:
+            return self.execute_next_step(runtime, state, allow_interrupt=allow_interrupt, auto_replan=False)
+
+        if (
+            allow_interrupt
+            and runtime.step_status.get(step.step_id) == "waiting_confirmation"
+            and runtime.pending_confirmation is not None
+            and runtime.pending_confirmation.step_id == step.step_id
+        ):
+            # LangGraph resume 会从节点函数开头重入，而不是直接跳到上一轮 interrupt 的下一行。
+            # 先消费同一确认请求的 resume payload，并写入 runtime/context 批准态，避免重新经过确认判断时二次弹窗。
+            decision = self._resume_pending_confirmation(step=step, runtime=runtime, state=state)
+            if decision != "approve":
+                turn_result = self._handle_confirmation_rejection(
+                    step=step,
+                    runtime=runtime,
+                    state=state,
+                    confirmation_request=runtime.pending_confirmation,
+                )
+                self._sync_runtime_state(state, runtime, current_step=step)
+                return self._step_result_from_runtime(
+                    step=step,
+                    runtime=runtime,
+                    next_action="fail",
+                    pending_confirmation=runtime.pending_confirmation,
+                    turn_result=turn_result,
+                )
+
+        runtime.step_status[step.step_id] = "running"
+        runtime.last_step_output = None
+        started_at = _utcnow()
+        resolved_input, missing_input = self._resolve_input_bindings(step, runtime, state)
+        if missing_input:
+            runtime.step_status[step.step_id] = "failed"
+            runtime.error = f"missing_input:{step.step_id}:{missing_input}"
+            runtime.recovery_strategy = {"type": "ask_clarification", "reason": "missing_required_input", "input_key": missing_input}
+            self._append_trace(
+                runtime,
+                step,
+                event="step_failed",
+                status="failed",
+                detail={"failure_reason": "missing_input", "missing_input": missing_input, "resolved_input": _safe_compact(resolved_input), "started_at": started_at, "finished_at": _utcnow()},
+            )
+            self._sync_runtime_state(state, runtime, current_step=step)
+            return self._step_result_from_runtime(step=step, runtime=runtime, next_action="fail", error=runtime.error)
+
+        if self._needs_confirmation(step, state):
+            confirmation_request = self._build_confirmation_request(
+                step=step,
+                runtime=runtime,
+                state=state,
+                resolved_input=resolved_input,
+                reason="explicit_user_confirmation_required",
+                pending_action=resolved_input.get("pending_action") if isinstance(resolved_input.get("pending_action"), Mapping) else None,
+            )
+            turn_result = self._handle_confirmation_gate(
+                step=step,
+                runtime=runtime,
+                state=state,
+                confirmation_request=confirmation_request,
+                resolved_input=resolved_input,
+                started_at=started_at,
+                allow_interrupt=allow_interrupt,
+            )
+            self._sync_runtime_state(state, runtime, current_step=step)
+            return self._step_result_from_runtime(
+                step=step,
+                runtime=runtime,
+                next_action="wait_for_confirmation" if runtime.pending_confirmation else "continue",
+                pending_confirmation=runtime.pending_confirmation,
+                turn_result=turn_result,
+            )
+
+        self._append_trace(
+            runtime,
+            step,
+            event="step_started",
+            status="running",
+            detail={
+                "tool_name": step.tool_name,
+                "tool_contract": self.tool_registry.describe_contract(step.tool_name),
+                "resolved_input": _safe_compact(resolved_input),
+                "started_at": started_at,
+            },
+        )
+        raw_output: Any = None
+        normalized_output: Any = None
+        attempts = 0
+        last_error: Optional[str] = None
+        max_attempts = max(int(getattr(step.retry_policy, "max_attempts", 0) or 0), 1)
+        while attempts < max_attempts:
+            attempts += 1
+            runtime.retry_counts[step.step_id] = attempts - 1
+            try:
+                raw_output = self._invoke_step_tool(step, resolved_input, state, runtime)
+            except Exception as exc:  # pragma: no cover - 这里兜住未知工具实现异常
+                last_error = str(exc)
+                if attempts < max_attempts and bool(step.tool.can_retry or step.retry_policy):
+                    continue
+                runtime.step_status[step.step_id] = "failed"
+                runtime.error = f"tool_execution_failed:{step.step_id}:{last_error}"
+                runtime.recovery_strategy = {"type": "retry_or_abort", "reason": "tool_execution_failed", "error": last_error}
+                self._append_trace(
+                    runtime,
+                    step,
+                    event="step_failed",
+                    status="failed",
+                    detail={"failure_reason": "tool_execution_failed", "error": last_error, "resolved_input": _safe_compact(resolved_input), "started_at": started_at, "finished_at": _utcnow()},
+                )
+                self._sync_runtime_state(state, runtime, current_step=step)
+                return self._step_result_from_runtime(step=step, runtime=runtime, next_action="fail", error=runtime.error)
+            if isinstance(raw_output, ToolExecutionResult) and not raw_output.ok:
+                tool_error = raw_output.error or _make_tool_error(error_code="tool_failed", message="工具执行失败")
+                last_error = _tool_error_to_text(tool_error)
+                if attempts < max_attempts and (tool_error.retryable or bool(step.tool.can_retry or step.retry_policy)):
+                    continue
+                # 结构化工具错误仍交给 Observer/Replanner 判断，执行器只保存 envelope 和调度下一节点。
+                normalized_output = None
+                break
+            normalized_output = project_tool_result(step, raw_output) if isinstance(raw_output, ToolExecutionResult) else raw_output
+            break
+
+        if step.output_key and step.output_key in runtime.outputs:
+            runtime.step_status[step.step_id] = "failed"
+            runtime.error = f"duplicate_output_key:{step.output_key}"
+            runtime.recovery_strategy = {"type": "abort_with_error", "reason": "duplicate_output_key", "output_key": step.output_key}
+            self._append_trace(runtime, step, event="step_failed", status="failed", detail={"failure_reason": "duplicate_output_key", "output_key": step.output_key})
+            self._sync_runtime_state(state, runtime, current_step=step)
+            return self._step_result_from_runtime(step=step, runtime=runtime, next_action="fail", error=runtime.error)
+
+        tool_failed = isinstance(raw_output, ToolExecutionResult) and not raw_output.ok
+        candidate_outputs = dict(runtime.outputs, **({step.output_key: normalized_output} if step.output_key and not tool_failed else {}))
+        if not tool_failed and any(not _evaluate_condition(condition, state, runtime.model_copy(update={"outputs": candidate_outputs})) for condition in list(step.postconditions or [])):
+            runtime.step_status[step.step_id] = "failed"
+            runtime.error = f"postcondition_failed:{step.step_id}"
+            runtime.recovery_strategy = {"type": "abort_with_error", "reason": "postcondition_failed"}
+            self._append_trace(runtime, step, event="step_failed", status="failed", detail={"failure_reason": "postcondition_failed", "raw_output": _safe_compact(raw_output)})
+            self._sync_runtime_state(state, runtime, current_step=step)
+            return self._step_result_from_runtime(step=step, runtime=runtime, next_action="fail", error=runtime.error)
+
+        runtime.last_step_output = {
+            "step_id": step.step_id,
+            "tool_contract": _json_safe(self.tool_registry.describe_contract(step.tool_name)),
+            "tool_execution": _json_safe(raw_output) if isinstance(raw_output, ToolExecutionResult) else None,
+            "resolved_input": _json_safe(resolved_input),
+            "raw_output": _json_safe(_model_to_plain(raw_output.data) if isinstance(raw_output, ToolExecutionResult) else raw_output),
+            "normalized_output": _json_safe(normalized_output),
+            "started_at": started_at,
+            "finished_at": _utcnow(),
+        }
+        self._sync_runtime_state(state, runtime, current_step=step)
+        return self._step_result_from_runtime(step=step, runtime=runtime, next_action="continue", output=normalized_output)
+
+    def observe_current_step(self, runtime: PlanRuntime, state: AgentState) -> StepExecutionResult:
+        """只观察当前 step 的工具输出质量，不执行工具、不重规划。"""
+        step = self._get_current_step(runtime)
+        output_payload = runtime.last_step_output if isinstance(runtime.last_step_output, Mapping) else None
+        if step is None or not output_payload:
+            runtime.step_status[str(runtime.current_step_id or "unknown")] = "failed"
+            runtime.error = runtime.error or "observation_missing_step_output"
+            runtime.recovery_strategy = {"type": "abort_with_error", "reason": "observation_missing_step_output"}
+            self._sync_runtime_state(state, runtime, current_step=step)
+            return self._step_result_from_runtime(step=step, runtime=runtime, next_action="fail", error=runtime.error)
+
+        raw_output = output_payload.get("tool_execution") or output_payload.get("raw_output")
+        normalized_output = output_payload.get("normalized_output")
+        resolved_input = output_payload.get("resolved_input") if isinstance(output_payload.get("resolved_input"), Mapping) else {}
+        observation = self.observer.observe(
+            step=step,
+            resolved_input=resolved_input,
+            raw_output=raw_output,
+            normalized_output=normalized_output,
+            runtime=runtime,
+            state=state,
+        )
+        runtime.last_observation = observation.model_dump()
+        self._append_trace(
+            runtime,
+            step,
+            event="step_observed",
+            status="running",
+            detail={
+                "observation_status": observation.status,
+                "observation_reason": observation.reason,
+                "failure_category": observation.failure_category,
+                "severity": observation.severity,
+                "recoverable": observation.recoverable,
+                "retryable": observation.retryable,
+                "requires_user_input": observation.requires_user_input,
+                "suggested_recovery_types": list(observation.suggested_recovery_types or []),
+                "evidence": _safe_compact(observation.evidence),
+                "suggested_action": observation.suggested_action,
+                "confidence": observation.confidence,
+            },
+        )
+
+        if observation.status == "need_confirmation" and step.tool_name == "request_confirmation":
+            pending_action = raw_output.get("pending_action") if isinstance(raw_output, Mapping) else None
+            confirmation_request = self._build_confirmation_request(
+                step=step,
+                runtime=runtime,
+                state=state,
+                resolved_input=resolved_input,
+                reason=observation.reason,
+                pending_action=pending_action if isinstance(pending_action, Mapping) else None,
+            )
+            # 观察节点发现确认需求后也走正式 interrupt/resume，避免只生成展示态而没有可恢复现场。
+            turn_result = self._handle_confirmation_gate(
+                step=step,
+                runtime=runtime,
+                state=state,
+                confirmation_request=confirmation_request,
+                resolved_input=resolved_input,
+                started_at=str(output_payload.get("started_at") or _utcnow()),
+                allow_interrupt=True,
+            )
+            self._sync_runtime_state(state, runtime, current_step=step)
+            return self._step_result_from_runtime(
+                step=step,
+                runtime=runtime,
+                next_action="wait_for_confirmation" if runtime.pending_confirmation else "continue",
+                observation=runtime.last_observation,
+                pending_confirmation=runtime.pending_confirmation,
+                turn_result=turn_result,
+            )
+
+        if observation.status not in {"success", "partial_success"}:
+            runtime.needs_replan = True
+            self._sync_runtime_state(state, runtime, current_step=step)
+            return self._step_result_from_runtime(step=step, runtime=runtime, next_action="replan", observation=runtime.last_observation)
+
+        if step.output_key:
+            runtime.outputs[step.output_key] = normalized_output
+            runtime.final_answer = assemble_final_answer(runtime)
+
+        runtime.step_status[step.step_id] = "success"
+        runtime.needs_replan = False
+        self._append_trace(
+            runtime,
+            step,
+            event="step_succeeded",
+            status="success",
+            detail={
+                "tool_name": step.tool_name,
+                "tool_contract": self.tool_registry.describe_contract(step.tool_name),
+                "tool_execution": _safe_compact(raw_output.model_dump()) if isinstance(raw_output, ToolExecutionResult) else None,
+                "resolved_input": _safe_compact(resolved_input),
+                "raw_output": _safe_compact(_model_to_plain(raw_output.data) if isinstance(raw_output, ToolExecutionResult) else raw_output),
+                "normalized_output": _safe_compact(normalized_output),
+                "started_at": output_payload.get("started_at"),
+                "finished_at": output_payload.get("finished_at") or _utcnow(),
+            },
+        )
+        self._sync_runtime_state(state, runtime, current_step=step)
+        return self._step_result_from_runtime(step=step, runtime=runtime, next_action="continue", output=normalized_output, observation=runtime.last_observation)
 
     def _execute_runtime(self, runtime: PlanRuntime, state: AgentState, *, allow_interrupt: bool) -> AgentTurnResult:
         plan = runtime.plan
@@ -307,14 +577,12 @@ class PlanExecutor:
             return AgentTurnResult(status="failed", error=runtime.error, plan=plan, outputs=dict(runtime.outputs), trace=list(runtime.trace), runtime=runtime)
 
         while True:
-            executable = self._find_executable_step(runtime, state)
-            if executable is None:
+            step_result = self.execute_next_step(runtime, state, allow_interrupt=allow_interrupt, auto_replan=True)
+            if step_result.turn_result is not None:
+                return step_result.turn_result
+            if step_result.next_action not in {"continue", "replan"}:
                 break
-            next_action = self._execute_step(executable, runtime, state, allow_interrupt=allow_interrupt)
-            if next_action is not None:
-                return next_action
 
-        self._finalize_blocked_pending_steps(runtime)
         return self._build_turn_result(runtime)
 
     def _find_executable_step(self, runtime: PlanRuntime, state: AgentState) -> Optional[PlanStep]:
@@ -340,13 +608,14 @@ class PlanExecutor:
             return step
         return None
 
-    def _execute_step(self, step: PlanStep, runtime: PlanRuntime, state: AgentState, *, allow_interrupt: bool) -> Optional[AgentTurnResult]:
+    def _execute_step(self, step: PlanStep, runtime: PlanRuntime, state: AgentState, *, allow_interrupt: bool, auto_replan: bool = True) -> Optional[AgentTurnResult]:
         runtime.step_status[step.step_id] = "running"
         started_at = _utcnow()
         resolved_input, missing_input = self._resolve_input_bindings(step, runtime, state)
         if missing_input:
             runtime.step_status[step.step_id] = "failed"
             runtime.error = f"missing_input:{step.step_id}:{missing_input}"
+            runtime.recovery_strategy = {"type": "ask_clarification", "reason": "missing_required_input", "input_key": missing_input}
             self._append_trace(
                 runtime,
                 step,
@@ -375,7 +644,18 @@ class PlanExecutor:
                 allow_interrupt=allow_interrupt,
             )
 
-        self._append_trace(runtime, step, event="step_started", status="running", detail={"tool_name": step.tool_name, "resolved_input": _safe_compact(resolved_input), "started_at": started_at})
+        self._append_trace(
+            runtime,
+            step,
+            event="step_started",
+            status="running",
+            detail={
+                "tool_name": step.tool_name,
+                "tool_contract": self.tool_registry.describe_contract(step.tool_name),
+                "resolved_input": _safe_compact(resolved_input),
+                "started_at": started_at,
+            },
+        )
 
         attempts = 0
         last_error: Optional[str] = None
@@ -391,6 +671,7 @@ class PlanExecutor:
                     continue
                 runtime.step_status[step.step_id] = "failed"
                 runtime.error = f"tool_execution_failed:{step.step_id}:{last_error}"
+                runtime.recovery_strategy = {"type": "retry_or_abort", "reason": "tool_execution_failed", "error": last_error}
                 self._append_trace(
                     runtime,
                     step,
@@ -400,32 +681,28 @@ class PlanExecutor:
                 )
                 return None
 
-            normalized_output = _normalize_step_output(step, raw_output)
-            schema_error = _validate_output_schema(step, raw_output, normalized_output)
-            if schema_error:
-                last_error = schema_error
-                if attempts < max_attempts and bool(step.tool.can_retry or step.retry_policy):
+            if isinstance(raw_output, ToolExecutionResult) and not raw_output.ok:
+                tool_error = raw_output.error or _make_tool_error(error_code="tool_failed", message="工具执行失败")
+                last_error = _tool_error_to_text(tool_error)
+                if attempts < max_attempts and (tool_error.retryable or bool(step.tool.can_retry or step.retry_policy)):
                     continue
-                runtime.step_status[step.step_id] = "failed"
-                runtime.error = f"{schema_error}:{step.step_id}"
-                self._append_trace(
-                    runtime,
-                    step,
-                    event="step_failed",
-                    status="failed",
-                    detail={"failure_reason": "invalid_output", "error": schema_error, "raw_output": _safe_compact(raw_output), "started_at": started_at, "finished_at": _utcnow()},
-                )
-                return None
+                # 结构化工具错误仍交给 Observer/Replanner 判断，执行器只保存 envelope 和调度下一节点。
+                normalized_output = None
+            else:
+                normalized_output = project_tool_result(step, raw_output) if isinstance(raw_output, ToolExecutionResult) else raw_output
 
             if step.output_key and step.output_key in runtime.outputs:
                 runtime.step_status[step.step_id] = "failed"
                 runtime.error = f"duplicate_output_key:{step.output_key}"
+                runtime.recovery_strategy = {"type": "abort_with_error", "reason": "duplicate_output_key", "output_key": step.output_key}
                 self._append_trace(runtime, step, event="step_failed", status="failed", detail={"failure_reason": "duplicate_output_key", "output_key": step.output_key})
                 return None
 
-            if any(not _evaluate_condition(condition, state, runtime.model_copy(update={"outputs": dict(runtime.outputs, **({step.output_key: normalized_output} if step.output_key else {}))})) for condition in list(step.postconditions or [])):
+            tool_failed = isinstance(raw_output, ToolExecutionResult) and not raw_output.ok
+            if not tool_failed and any(not _evaluate_condition(condition, state, runtime.model_copy(update={"outputs": dict(runtime.outputs, **({step.output_key: normalized_output} if step.output_key else {}))})) for condition in list(step.postconditions or [])):
                 runtime.step_status[step.step_id] = "failed"
                 runtime.error = f"postcondition_failed:{step.step_id}"
+                runtime.recovery_strategy = {"type": "abort_with_error", "reason": "postcondition_failed"}
                 self._append_trace(runtime, step, event="step_failed", status="failed", detail={"failure_reason": "postcondition_failed", "raw_output": _safe_compact(raw_output)})
                 return None
 
@@ -437,6 +714,7 @@ class PlanExecutor:
                 runtime=runtime,
                 state=state,
             )
+            runtime.last_observation = observation.model_dump()
             self._append_trace(
                 runtime,
                 step,
@@ -479,6 +757,21 @@ class PlanExecutor:
                 return self._build_turn_result(runtime)
 
             if observation.status not in {"success", "partial_success"}:
+                # observation 代表“工具执行后质量不足”，先写入 runtime，方便重规划节点或调试视图复盘触发原因。
+                runtime.needs_replan = True
+                runtime.last_step_output = {
+                    "step_id": step.step_id,
+                    "tool_contract": _json_safe(self.tool_registry.describe_contract(step.tool_name)),
+                    "tool_execution": _json_safe(raw_output) if isinstance(raw_output, ToolExecutionResult) else None,
+                    "resolved_input": _json_safe(resolved_input),
+                    "raw_output": _json_safe(_model_to_plain(raw_output.data) if isinstance(raw_output, ToolExecutionResult) else raw_output),
+                    "normalized_output": _json_safe(normalized_output),
+                    "started_at": started_at,
+                    "finished_at": _utcnow(),
+                }
+                if not auto_replan:
+                    # 新 LangGraph 执行环需要把重规划显式暴露成图节点，这里只记录观察结果并暂停本步。
+                    return None
                 replan_result = self._handle_observation_replan(
                     step=step,
                     runtime=runtime,
@@ -493,13 +786,10 @@ class PlanExecutor:
 
             if step.output_key:
                 runtime.outputs[step.output_key] = normalized_output
-                if step.output_key == "final_answer" and normalized_output is not None:
-                    runtime.final_answer = str(normalized_output)
-                if step.tool_name == "answer_paper_question" and isinstance(normalized_output, Mapping):
-                    # PaperQAService 才是真实 RAG 真源；Agent 只读取它返回的答案，不再自行拼接伪证据链。
-                    runtime.final_answer = str(normalized_output.get("answer") or "").strip() or runtime.final_answer
+                runtime.final_answer = assemble_final_answer(runtime)
 
             runtime.step_status[step.step_id] = "success"
+            runtime.needs_replan = False
             self._append_trace(
                 runtime,
                 step,
@@ -507,8 +797,10 @@ class PlanExecutor:
                 status="success",
                 detail={
                     "tool_name": step.tool_name,
+                    "tool_contract": self.tool_registry.describe_contract(step.tool_name),
+                    "tool_execution": _safe_compact(raw_output.model_dump()) if isinstance(raw_output, ToolExecutionResult) else None,
                     "resolved_input": _safe_compact(resolved_input),
-                    "raw_output": _safe_compact(raw_output),
+                    "raw_output": _safe_compact(_model_to_plain(raw_output.data) if isinstance(raw_output, ToolExecutionResult) else raw_output),
                     "normalized_output": _safe_compact(normalized_output),
                     "started_at": started_at,
                     "finished_at": _utcnow(),
@@ -518,7 +810,40 @@ class PlanExecutor:
 
         runtime.step_status[step.step_id] = "failed"
         runtime.error = f"tool_execution_failed:{step.step_id}:{last_error or 'unknown_error'}"
+        runtime.recovery_strategy = {"type": "abort_with_error", "reason": "tool_execution_failed", "error": last_error or "unknown_error"}
         return None
+
+    def replan_after_observation(self, runtime: PlanRuntime, state: AgentState) -> Optional[AgentTurnResult]:
+        """根据 runtime 中最近一次 observation 显式执行重规划。
+
+        这是 LangGraph `replan` 节点使用的入口：execute_step 只负责运行工具并留下观察结果，
+        是否 patch plan、fallback 或失败由这个节点单独决定，避免重规划继续藏在执行黑盒里。
+        """
+        step = self._get_current_step(runtime)
+        observation_payload = runtime.last_observation if isinstance(runtime.last_observation, Mapping) else None
+        if step is None or not observation_payload:
+            runtime.error = runtime.error or "replan_missing_observation"
+            runtime.needs_replan = False
+            runtime.recovery_strategy = {"type": "abort_with_error", "reason": "replan_missing_observation"}
+            return self._build_turn_result(runtime)
+
+        observation = ObservationResult.model_validate(dict(observation_payload))
+        step_output = runtime.last_step_output if isinstance(runtime.last_step_output, Mapping) else {}
+        # 低质量 observation 不会写入 step_succeeded trace，replan 必须优先消费 execute_step 留下的真实工具输出。
+        raw_output = step_output.get("tool_execution") or step_output.get("raw_output")
+        normalized_output = step_output.get("normalized_output")
+        if raw_output is None:
+            raw_output = self._extract_trace_value(runtime, step.step_id, "step_succeeded", "raw_output")
+        if normalized_output is None:
+            normalized_output = self._extract_trace_value(runtime, step.step_id, "step_succeeded", "normalized_output")
+        return self._handle_observation_replan(
+            step=step,
+            runtime=runtime,
+            state=state,
+            observation=observation,
+            raw_output=raw_output,
+            normalized_output=normalized_output,
+        )
 
     def _resolve_input_bindings(self, step: PlanStep, runtime: PlanRuntime, state: AgentState) -> Tuple[Dict[str, Any], Optional[str]]:
         resolved: Dict[str, Any] = {}
@@ -544,10 +869,152 @@ class PlanExecutor:
         return resolved, None
 
     def _invoke_step_tool(self, step: PlanStep, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime) -> Any:
-        tool_impl = self._planner_tool_impls.get(step.tool_name)
-        if tool_impl is None:
-            raise ValueError(f"Unsupported planner tool implementation: {step.tool_name}")
-        return tool_impl(resolved_input, state, runtime, step)
+        return self._invoke_named_tool(step.tool_name, resolved_input, state, runtime, step)
+
+    def _invoke_named_tool(self, tool_name: str, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Any:
+        contract = self.tool_registry.get_contract(tool_name)
+        if contract is None or contract.adapter is None:
+            raise ValueError(f"Unsupported tool contract adapter: {tool_name}")
+        # 测试和兼容调用会 monkeypatch plan_executor.invoke_backend_tool；同步给 contract 层后，
+        # adapter 与 executor 仍共用同一个后端工具入口，不需要恢复旧的函数映射表。
+        agent_tool_registry.invoke_backend_tool = invoke_backend_tool
+        if hasattr(contract.adapter, "invoke_backend_tool"):
+            contract.adapter.invoke_backend_tool = invoke_backend_tool
+        tool_input = self._validate_tool_input(contract, resolved_input, state)
+        if isinstance(tool_input, ToolExecutionResult):
+            logger.info(
+                "arxiv_agent tool input validation failed: step_id=%s tool_name=%s error_code=%s",
+                step.step_id,
+                tool_name,
+                tool_input.error.error_code if tool_input.error else None,
+            )
+            return tool_input
+        started = perf_counter()
+        logger.info(
+            "arxiv_agent tool execution started: step_id=%s tool_name=%s backend_tool=%s adapter=%s input=%s",
+            step.step_id,
+            tool_name,
+            getattr(contract, "backend_tool_name", None),
+            contract.adapter.__class__.__name__,
+            _safe_compact(tool_input.model_dump() if hasattr(tool_input, "model_dump") else tool_input),
+        )
+        try:
+            result = contract.adapter.execute(tool_input)
+        except Exception:
+            logger.exception(
+                "arxiv_agent tool execution raised: step_id=%s tool_name=%s backend_tool=%s elapsed_ms=%.1f",
+                step.step_id,
+                tool_name,
+                getattr(contract, "backend_tool_name", None),
+                (perf_counter() - started) * 1000,
+            )
+            raise
+        if not isinstance(result, ToolExecutionResult):
+            logger.error(
+                "arxiv_agent tool adapter contract violation: step_id=%s tool_name=%s returned_type=%s elapsed_ms=%.1f",
+                step.step_id,
+                tool_name,
+                type(result).__name__,
+                (perf_counter() - started) * 1000,
+            )
+            return ToolExecutionResult(
+                ok=False,
+                data=None,
+                error=_make_tool_error(
+                    error_code="adapter_contract_violation",
+                    message="ToolAdapter 未返回 ToolExecutionResult",
+                    detail={"returned_type": type(result).__name__},
+                    recoverable=False,
+                    failed_stage="adapter_return",
+                ),
+                adapter_name=contract.adapter.__class__.__name__,
+                tool_name=tool_name,
+            )
+        if not result.ok:
+            logger.info(
+                "arxiv_agent tool execution failed: step_id=%s tool_name=%s backend_tool=%s error_code=%s message=%s elapsed_ms=%.1f",
+                step.step_id,
+                tool_name,
+                getattr(contract, "backend_tool_name", None),
+                result.error.error_code if result.error else None,
+                result.error.message if result.error else None,
+                (perf_counter() - started) * 1000,
+            )
+            return result
+        validated_result = self._validate_tool_output(contract, result)
+        logger.info(
+            "arxiv_agent tool execution finished: step_id=%s tool_name=%s backend_tool=%s ok=%s elapsed_ms=%.1f",
+            step.step_id,
+            tool_name,
+            getattr(contract, "backend_tool_name", None),
+            getattr(validated_result, "ok", None),
+            (perf_counter() - started) * 1000,
+        )
+        return validated_result
+
+    def _validate_tool_input(self, contract: Any, resolved_input: Dict[str, Any], state: AgentState) -> Any:
+        raw_input = self._augment_tool_input(contract.tool_name, resolved_input, state)
+        input_model = contract.input_model
+        if input_model is None:
+            return raw_input
+        try:
+            return input_model.model_validate(raw_input)
+        except ValidationError as exc:
+            return ToolExecutionResult(
+                ok=False,
+                data=None,
+                error=_make_tool_error(
+                    error_code="input_validation_error",
+                    message="工具输入未通过 Pydantic 模型校验",
+                    detail={"errors": exc.errors(), "input_keys": sorted(raw_input.keys())},
+                    recoverable=True,
+                    retryable=False,
+                    suggested_recovery="ask_clarification",
+                    failed_stage="input_validation",
+                    raw_exception_type=exc.__class__.__name__,
+                ),
+                adapter_name=contract.adapter.__class__.__name__ if contract.adapter is not None else "",
+                tool_name=contract.tool_name,
+            )
+
+    def _validate_tool_output(self, contract: Any, result: ToolExecutionResult) -> ToolExecutionResult:
+        output_model = contract.output_model
+        if output_model is None or result.data is None:
+            return result
+        try:
+            output = result.data if isinstance(result.data, output_model) else output_model.model_validate(_model_to_plain(result.data))
+            return result.model_copy(update={"data": output})
+        except ValidationError as exc:
+            return result.model_copy(
+                update={
+                    "ok": False,
+                    "data": None,
+                    "error": _make_tool_error(
+                        error_code="output_validation_error",
+                        message="工具输出未通过 Pydantic 模型校验",
+                        detail={"errors": exc.errors()},
+                        recoverable=False,
+                        retryable=False,
+                        failed_stage="output_validation",
+                        raw_exception_type=exc.__class__.__name__,
+                    ),
+                }
+            )
+
+    def _augment_tool_input(self, tool_name: str, resolved_input: Dict[str, Any], state: AgentState) -> Dict[str, Any]:
+        payload = dict(resolved_input or {})
+        # adapter 不直接读 state；这些上下文由 executor 在模型校验前显式注入。
+        if tool_name in {"resolve_paper", "resolve_preference_target"}:
+            payload.setdefault("context", dict(state.context or {}) if isinstance(state.context, Mapping) else {})
+        if tool_name in {"load_user_profile", "load_candidate_papers"}:
+            payload.setdefault("context", dict(state.context or {}) if isinstance(state.context, Mapping) else {})
+        if tool_name in {"load_user_profile", "generate_recommendations", "update_preference_store"}:
+            payload.setdefault("user_id", state.user_id)
+        if tool_name in {"load_user_profile", "generate_recommendations", "answer_paper_question"}:
+            payload.setdefault("message", state.message)
+        if tool_name == "request_confirmation":
+            payload.setdefault("pending_state", dict(state.pending_action or {}) if isinstance(state.pending_action, Mapping) else {})
+        return payload
 
     def _handle_observation_replan(
         self,
@@ -582,6 +1049,8 @@ class PlanExecutor:
             runtime.trace = list(replan_decision.updated_runtime.trace or [])
             runtime.step_status = dict(replan_decision.updated_runtime.step_status or runtime.step_status)
             runtime.pending_confirmation = replan_decision.updated_runtime.pending_confirmation
+            runtime.needs_replan = False
+            runtime.recovery_strategy = {"type": "patch_plan", "reason": observation.reason or observation.status}
             # 低质量 final_answer 只作为触发重规划的观察对象，不能提前污染最终答案。
             if step.output_key and step.output_key not in runtime.outputs and step.output_key != "final_answer":
                 runtime.outputs[step.output_key] = normalized_output
@@ -607,9 +1076,9 @@ class PlanExecutor:
         runtime.step_status[step.step_id] = "failed"
         fallback_reason = str(replan_decision.fallback_reason or observation.reason or observation.status)
         runtime.error = f"fallback:{step.step_id}:{fallback_reason}"
-        fallback_answer = self._generate_fallback_response({"message": state.message or "", "fallback_reason": fallback_reason}, state, runtime, step)
-        runtime.final_answer = fallback_answer
-        runtime.outputs["final_answer"] = fallback_answer
+        runtime.needs_replan = False
+        runtime.recovery_strategy = {"type": "fallback_answer", "reason": fallback_reason}
+        record_recovery_fallback(runtime, fallback_reason=fallback_reason)
         self._append_trace(
             runtime,
             step,
@@ -625,7 +1094,7 @@ class PlanExecutor:
         runtime.turn_status = "fallback"
         return AgentTurnResult(
             status="fallback",
-            final_answer=fallback_answer,
+            final_answer=runtime.final_answer,
             plan=runtime.plan,
             outputs=dict(runtime.outputs),
             trace=list(runtime.trace),
@@ -642,6 +1111,206 @@ class PlanExecutor:
                 detail=detail or {},
             )
         )
+
+    def _build_step_execution_result(
+        self,
+        *,
+        step: PlanStep,
+        runtime: PlanRuntime,
+        previous_outputs: Mapping[str, Any],
+        previous_trace_len: int,
+        previous_error: Optional[str],
+        previous_pending: Optional[ConfirmationRequest],
+        turn_result: Optional[AgentTurnResult],
+    ) -> StepExecutionResult:
+        """把一次 step 执行后的 runtime 变化归一成单步结果。
+
+        执行器内部仍会维护 runtime，但 LangGraph 节点不应该反向解析 runtime diff；
+        这里把本步 output、observation、确认态和下一步动作显式算出来，作为后续节点边界。
+        """
+        status = runtime.step_status.get(step.step_id)
+        output = runtime.outputs.get(step.output_key) if step.output_key else None
+        if step.output_key and step.output_key not in runtime.outputs and step.output_key in previous_outputs:
+            output = previous_outputs.get(step.output_key)
+        new_traces = list(runtime.trace or [])[previous_trace_len:]
+        observation = self._extract_observation_from_traces(new_traces) or runtime.last_observation
+        next_action = self._infer_next_action(
+            runtime=runtime,
+            status=status,
+            observation=observation,
+            previous_error=previous_error,
+            previous_pending=previous_pending,
+            turn_result=turn_result,
+        )
+        return StepExecutionResult(
+            step_id=step.step_id,
+            step_status=status,
+            output_key=step.output_key,
+            output=output,
+            error=runtime.error if runtime.error != previous_error else None,
+            observation=observation,
+            next_action=next_action,
+            pending_confirmation=runtime.pending_confirmation,
+            runtime_patch=self._build_runtime_patch(runtime, current_step=step),
+            turn_result=turn_result,
+        )
+
+    def _step_result_from_runtime(
+        self,
+        *,
+        step: Optional[PlanStep],
+        runtime: PlanRuntime,
+        next_action: str,
+        output: Any = None,
+        observation: Optional[Mapping[str, Any]] = None,
+        pending_confirmation: Optional[ConfirmationRequest] = None,
+        error: Optional[str] = None,
+        turn_result: Optional[AgentTurnResult] = None,
+    ) -> StepExecutionResult:
+        """把显式图节点中的 runtime 当前状态包装成 StepExecutionResult。"""
+        return StepExecutionResult(
+            step_id=step.step_id if step else runtime.current_step_id,
+            step_status=runtime.step_status.get(step.step_id) if step else None,
+            output_key=step.output_key if step else None,
+            output=output,
+            error=error,
+            observation=dict(observation or {}) if observation else None,
+            next_action=next_action,  # type: ignore[arg-type]
+            pending_confirmation=pending_confirmation,
+            runtime_patch=self._build_runtime_patch(runtime, current_step=step),
+            turn_result=turn_result,
+        )
+
+    def _extract_observation_from_traces(self, traces: Sequence[ExecutionTrace]) -> Optional[Dict[str, Any]]:
+        """从本步新增 trace 中提取最近 observation 摘要，避免调用方扫描完整 trace。"""
+        for trace in reversed(list(traces or [])):
+            if trace.event != "step_observed":
+                continue
+            detail = dict(trace.detail or {})
+            return {
+                "status": detail.get("observation_status"),
+                "reason": detail.get("observation_reason"),
+                "confidence": detail.get("confidence"),
+                "failure_category": detail.get("failure_category"),
+                "severity": detail.get("severity"),
+                "recoverable": detail.get("recoverable"),
+                "retryable": detail.get("retryable"),
+                "requires_user_input": detail.get("requires_user_input"),
+                "suggested_recovery_types": list(detail.get("suggested_recovery_types") or []),
+                "suggested_action": detail.get("suggested_action"),
+                "evidence": dict(detail.get("evidence") or {}),
+            }
+        return None
+
+    def _get_current_step(self, runtime: PlanRuntime) -> Optional[PlanStep]:
+        """从 runtime.current_step_id 找回当前 step，供显式 observe/replan/finalize 节点使用。"""
+        current_step_id = str(runtime.current_step_id or "").strip()
+        if not current_step_id or runtime.plan is None:
+            return None
+        for step in list(runtime.plan.steps or []):
+            if step.step_id == current_step_id:
+                return step
+        return None
+
+    def _extract_trace_value(self, runtime: PlanRuntime, step_id: str, event: str, detail_key: str) -> Any:
+        """从 trace 中提取本步最近一次紧凑记录，仅作为 replan debug 输入。"""
+        for trace in reversed(list(runtime.trace or [])):
+            if trace.step_id == step_id and trace.event == event:
+                return dict(trace.detail or {}).get(detail_key)
+        return None
+
+    def _infer_next_action(
+        self,
+        *,
+        runtime: PlanRuntime,
+        status: Optional[str],
+        observation: Optional[Mapping[str, Any]],
+        previous_error: Optional[str],
+        previous_pending: Optional[ConfirmationRequest],
+        turn_result: Optional[AgentTurnResult],
+    ) -> str:
+        """把 runtime 状态归一成上层可路由的下一步动作。"""
+        if turn_result is not None:
+            if turn_result.status == "waiting_confirmation":
+                return "wait_for_confirmation"
+            if turn_result.status in {"failed", "fallback"}:
+                return "fail"
+            return "finish"
+        if runtime.pending_confirmation and runtime.pending_confirmation != previous_pending:
+            return "wait_for_confirmation"
+        if status == "failed" or (runtime.error and runtime.error != previous_error):
+            return "fail"
+        if runtime.needs_replan or (observation and observation.get("status") not in {None, "success", "partial_success"}):
+            return "replan"
+        return "continue"
+
+    def _build_runtime_patch(self, runtime: PlanRuntime, *, current_step: Optional[PlanStep]) -> Dict[str, Any]:
+        """生成可序列化 runtime patch，供图节点写回 AgentState 或 checkpoint。"""
+        runtime_state = self._build_agent_runtime_state(runtime, current_step=current_step)
+        return {
+            "runtime_state": _json_safe(runtime_state),
+            "plan_runtime": _json_safe(runtime),
+            "current_step_id": runtime_state.current_step_id,
+            "step_status": dict(runtime.step_status or {}),
+            "outputs": _json_safe(runtime.outputs or {}),
+            "last_observation": _json_safe(runtime.last_observation),
+            "last_step_output": _json_safe(runtime.last_step_output),
+            "pending_confirmation": _json_safe(runtime.pending_confirmation) if runtime.pending_confirmation else None,
+            "needs_replan": bool(runtime.needs_replan),
+            "is_finished": bool(runtime_state.is_finished),
+            "failure_reason": runtime.error,
+            "recovery_strategy": _json_safe(runtime.recovery_strategy or {}),
+        }
+
+    def _build_agent_runtime_state(self, runtime: PlanRuntime, *, current_step: Optional[PlanStep]) -> AgentRuntimeState:
+        """从内部 PlanRuntime 投影出跨节点可恢复的一等执行现场。"""
+        step_index: Optional[int] = None
+        if current_step is not None and runtime.plan is not None:
+            for index, step in enumerate(list(runtime.plan.steps or [])):
+                if step.step_id == current_step.step_id:
+                    step_index = index
+                    break
+        status_values = list((runtime.step_status or {}).values())
+        is_finished = bool(runtime.turn_status) or bool(status_values and all(status in {"success", "failed", "skipped", "waiting_confirmation"} for status in status_values))
+        return AgentRuntimeState(
+            request_state=_json_safe(runtime.state or {}),
+            goal=runtime.goal,
+            plan=runtime.plan,
+            current_step_id=current_step.step_id if current_step else None,
+            current_step_index=step_index,
+            step_status=dict(runtime.step_status or {}),
+            outputs=_json_safe(runtime.outputs or {}),
+            last_observation=_json_safe(runtime.last_observation) if runtime.last_observation else None,
+            last_step_output=_json_safe(runtime.last_step_output) if runtime.last_step_output else None,
+            trace=list(runtime.trace or []),
+            retry_counts=dict(runtime.retry_counts or {}),
+            replan_counts=dict(runtime.replan_counts or {}),
+            step_replan_counts=dict(runtime.step_replan_counts or {}),
+            approved_step_ids=list(runtime.approved_step_ids or []),
+            pending_confirmation=runtime.pending_confirmation,
+            needs_replan=bool(runtime.needs_replan),
+            is_finished=is_finished,
+            failure_reason=runtime.error,
+            recovery_strategy=_json_safe(runtime.recovery_strategy) if runtime.recovery_strategy else None,
+            turn_status=runtime.turn_status,
+            final_answer=runtime.final_answer,
+        )
+
+    def _sync_runtime_state(self, state: AgentState, runtime: PlanRuntime, *, current_step: Optional[PlanStep]) -> None:
+        """把一等执行现场同步回 AgentState。
+
+        AgentState 仍是图里流转的总状态；runtime_state 是其中专门描述执行现场的边界，
+        这样调试视图和后续 LangGraph 节点不用再从 debug/pending_action/tool_outputs 里拼现场。
+        """
+        runtime.current_step_id = current_step.step_id if current_step else None
+        runtime.current_step_index = None
+        if current_step is not None and runtime.plan is not None:
+            for index, step in enumerate(list(runtime.plan.steps or [])):
+                if step.step_id == current_step.step_id:
+                    runtime.current_step_index = index
+                    break
+        state.plan_runtime = runtime
+        state.runtime_state = self._build_agent_runtime_state(runtime, current_step=current_step)
 
     def _finalize_blocked_pending_steps(self, runtime: PlanRuntime) -> None:
         plan = runtime.plan
@@ -694,15 +1363,50 @@ class PlanExecutor:
         if not policy or not policy.requires_confirmation:
             return False
         context = state.context if isinstance(state.context, Mapping) else {}
+        runtime_approved_step_ids = []
+        if state.plan_runtime is not None:
+            runtime_approved_step_ids.extend(list(state.plan_runtime.approved_step_ids or []))
+        if state.runtime_state is not None:
+            runtime_approved_step_ids.extend(list(state.runtime_state.approved_step_ids or []))
+        if step.step_id in runtime_approved_step_ids:
+            logger.info(
+                "arxiv_agent confirmation bypassed: step_id=%s tool_name=%s source=runtime_approved_step_ids",
+                step.step_id,
+                step.tool_name,
+            )
+            return False
         approved_step_ids = context.get("approved_step_ids")
         if isinstance(approved_step_ids, list) and step.step_id in approved_step_ids:
+            logger.info(
+                "arxiv_agent confirmation bypassed: step_id=%s tool_name=%s source=context_approved_step_ids",
+                step.step_id,
+                step.tool_name,
+            )
             return False
         pending_action = state.pending_action if isinstance(state.pending_action, Mapping) else {}
         approval_decision = str(pending_action.get("decision") or "").strip().lower()
         if approval_decision == "approve" and pending_action.get("step_id") == step.step_id:
+            logger.info(
+                "arxiv_agent confirmation bypassed: step_id=%s tool_name=%s source=pending_action_decision",
+                step.step_id,
+                step.tool_name,
+            )
             return False
         if pending_action.get("status") == "approved" and pending_action.get("step_id") == step.step_id:
+            logger.info(
+                "arxiv_agent confirmation bypassed: step_id=%s tool_name=%s source=pending_action_status",
+                step.step_id,
+                step.tool_name,
+            )
             return False
+        logger.info(
+            "arxiv_agent confirmation required: step_id=%s tool_name=%s runtime_approved=%s context_approved=%s pending_status=%s",
+            step.step_id,
+            step.tool_name,
+            runtime_approved_step_ids,
+            approved_step_ids if isinstance(approved_step_ids, list) else [],
+            pending_action.get("status"),
+        )
         return True
 
     def _build_confirmation_request(
@@ -805,6 +1509,7 @@ class PlanExecutor:
         """
         runtime.step_status[step.step_id] = "waiting_confirmation"
         runtime.pending_confirmation = confirmation_request
+        runtime.recovery_strategy = {"type": "request_confirmation", "reason": confirmation_request.reason or "waiting_confirmation"}
         self._append_trace(
             runtime,
             step,
@@ -830,6 +1535,13 @@ class PlanExecutor:
 
         resume_payload = interrupt(confirmation_request.model_dump())
         decision = self._normalize_confirmation_resume_payload(resume_payload)
+        logger.info(
+            "arxiv_agent confirmation resume received: step_id=%s tool_name=%s decision=%s raw_type=%s",
+            step.step_id,
+            step.tool_name,
+            decision,
+            type(resume_payload).__name__,
+        )
         if decision == "approve":
             state.context = dict(state.context or {})
             # 恢复后把当前步骤标为已批准，避免同一工具在续跑时再次触发 interrupt。
@@ -837,6 +1549,12 @@ class PlanExecutor:
             if step.step_id not in approved_step_ids:
                 approved_step_ids.append(step.step_id)
             state.context["approved_step_ids"] = approved_step_ids
+            # 批准状态属于执行现场，必须和 step_status 一起进入 PlanRuntime；
+            # 只写 context/pending_action 容易在图恢复后的下一节点合并中丢失，导致同一工具二次确认。
+            runtime_approved_step_ids = list(runtime.approved_step_ids or [])
+            if step.step_id not in runtime_approved_step_ids:
+                runtime_approved_step_ids.append(step.step_id)
+            runtime.approved_step_ids = runtime_approved_step_ids
             state.pending_action = {
                 "type": "tool_approval",
                 "status": "approved",
@@ -846,6 +1564,7 @@ class PlanExecutor:
             }
             runtime.step_status[step.step_id] = "pending"
             runtime.pending_confirmation = None
+            runtime.recovery_strategy = None
             self._append_trace(
                 runtime,
                 step,
@@ -862,6 +1581,63 @@ class PlanExecutor:
             state=state,
             confirmation_request=confirmation_request,
         )
+
+    def _resume_pending_confirmation(self, *, step: PlanStep, runtime: PlanRuntime, state: AgentState) -> str:
+        """消费已暂停确认请求的 resume payload，并同步写入执行现场。
+
+        这个方法服务于显式 LangGraph 多节点执行：确认暂停后再次进入 execute_step 时，
+        节点会从函数开头重跑，所以必须在 `_needs_confirmation()` 之前把批准态落到
+        PlanRuntime / AgentRuntimeState / context 三处真源和兼容镜像。
+        """
+        confirmation_request = runtime.pending_confirmation
+        resume_payload = interrupt(confirmation_request.model_dump() if confirmation_request is not None else {})
+        decision = self._normalize_confirmation_resume_payload(resume_payload)
+        logger.info(
+            "arxiv_agent confirmation resume received: step_id=%s tool_name=%s decision=%s raw_type=%s source=pending_confirmation",
+            step.step_id,
+            step.tool_name,
+            decision,
+            type(resume_payload).__name__,
+        )
+        if decision != "approve":
+            return decision
+
+        state.context = dict(state.context or {})
+        approved_step_ids = list(state.context.get("approved_step_ids") or [])
+        if step.step_id not in approved_step_ids:
+            approved_step_ids.append(step.step_id)
+        state.context["approved_step_ids"] = approved_step_ids
+
+        runtime_approved_step_ids = list(runtime.approved_step_ids or [])
+        if step.step_id not in runtime_approved_step_ids:
+            runtime_approved_step_ids.append(step.step_id)
+        runtime.approved_step_ids = runtime_approved_step_ids
+        if state.runtime_state is not None:
+            runtime_state_approved = list(state.runtime_state.approved_step_ids or [])
+            if step.step_id not in runtime_state_approved:
+                runtime_state_approved.append(step.step_id)
+            state.runtime_state.approved_step_ids = runtime_state_approved
+            state.runtime_state.pending_confirmation = None
+
+        state.pending_action = {
+            "type": "tool_approval",
+            "status": "approved",
+            "decision": "approve",
+            "step_id": step.step_id,
+            "tool_name": step.tool_name,
+        }
+        runtime.step_status[step.step_id] = "pending"
+        runtime.pending_confirmation = None
+        runtime.recovery_strategy = None
+        self._append_trace(
+            runtime,
+            step,
+            event="confirmation_approved",
+            status="pending",
+            detail={"tool_name": step.tool_name, "resumed_at": _utcnow(), "source": "pending_confirmation_resume"},
+        )
+        logger.info("arxiv_agent confirmation approved: step_id=%s tool_name=%s source=pending_confirmation", step.step_id, step.tool_name)
+        return decision
 
     def _normalize_confirmation_resume_payload(self, payload: Any) -> str:
         """把 resume 输入归一成 approve / reject。
@@ -887,6 +1663,7 @@ class PlanExecutor:
         """处理用户拒绝确认后的取消语义。"""
         runtime.pending_confirmation = None
         runtime.step_status[step.step_id] = "skipped"
+        runtime.recovery_strategy = {"type": "skip_step", "reason": "confirmation_rejected"}
         state.pending_action = {
             "type": "tool_approval",
             "status": "cancelled",
@@ -903,392 +1680,9 @@ class PlanExecutor:
         )
         logger.info("arxiv_agent confirmation rejected: step_id=%s tool_name=%s", step.step_id, step.tool_name)
 
-        if step.tool_name == "parse_and_index_paper":
-            target_paper = dict(confirmation_request.target_paper or {})
-            paper_label = str(target_paper.get("title") or target_paper.get("arxiv_id") or "该论文").strip()
-            runtime.final_answer = f"已取消解析 {paper_label}，因此无法继续基于全文回答。"
-            runtime.outputs["final_answer"] = runtime.final_answer
-            return self._build_turn_result(runtime)
-
+        record_confirmation_rejection(runtime, confirmation_request=confirmation_request)
         return self._build_turn_result(runtime)
 
-    def _normalize_request(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del runtime, step
-        search_spec = resolved_input.get("search_spec")
-        if isinstance(search_spec, ArxivSearchSpec):
-            search_spec_payload = search_spec.model_dump()
-        elif isinstance(search_spec, Mapping):
-            search_spec_payload = dict(search_spec)
-        else:
-            search_spec_payload = state.search_spec.model_dump() if state.search_spec is not None else None
-        return {
-            "intent": str(resolved_input.get("intent") or state.intent or "").strip() or "unsupported",
-            "message": str(resolved_input.get("message") or state.message or "").strip(),
-            "search_spec": search_spec_payload,
-        }
-
-    def _build_arxiv_search_spec(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del runtime, step
-        normalized_request = resolved_input.get("normalized_request") if isinstance(resolved_input.get("normalized_request"), Mapping) else resolved_input
-        existing_spec = normalized_request.get("search_spec") if isinstance(normalized_request, Mapping) else None
-        if isinstance(existing_spec, ArxivSearchSpec):
-            spec = existing_spec
-        elif isinstance(existing_spec, Mapping) and existing_spec:
-            spec = ArxivSearchSpec.model_validate(existing_spec)
-        elif state.search_spec is not None:
-            spec = state.search_spec
-        else:
-            message = str((normalized_request or {}).get("message") or state.message or "").strip()
-            spec = ArxivSearchSpec(intent="arxiv_search", query=message, max_results=10)
-        return spec.model_dump()
-
-    def _search_arxiv(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del state, runtime, step
-        search_spec = resolved_input.get("search_spec")
-        if isinstance(search_spec, ArxivSearchSpec):
-            tool_args = search_spec.model_dump(exclude_none=True)
-        elif isinstance(search_spec, Mapping):
-            tool_args = {key: value for key, value in dict(search_spec).items() if value is not None}
-        else:
-            raise ValueError("search_arxiv requires search_spec")
-        tool_result = invoke_backend_tool("search_arxiv_structured", **tool_args)
-        papers = _extract_papers((tool_result or {}).get("data") or {})
-        return {
-            "papers": papers,
-            "tool_result": tool_result,
-            "search_spec": tool_args,
-        }
-
-    def _validate_arxiv_results(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del state, runtime, step
-        arxiv_results = resolved_input.get("arxiv_results")
-        papers = _extract_papers(arxiv_results)
-        tool_result = arxiv_results.get("tool_result") if isinstance(arxiv_results, Mapping) else None
-        warnings: List[str] = []
-        if not papers:
-            warnings.append("no_results")
-        if isinstance(tool_result, Mapping) and not bool(tool_result.get("ok", False)):
-            warnings.append("tool_failed")
-        return {
-            "ok": bool(papers) and "tool_failed" not in warnings,
-            "result_count": len(papers),
-            "warnings": warnings,
-        }
-
-    def _rewrite_arxiv_query(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del runtime, step
-        search_spec = resolved_input.get("search_spec")
-        if isinstance(search_spec, Mapping):
-            payload = dict(search_spec)
-        elif state.search_spec is not None:
-            payload = state.search_spec.model_dump()
-        else:
-            payload = {"intent": "arxiv_search", "query": state.message or "", "max_results": 10}
-        if not payload.get("query") and state.message:
-            payload["query"] = state.message
-        payload["title_query"] = None
-        payload["abstract_query"] = None
-        return payload
-
-    def _personalize_paper_results(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> List[Dict[str, Any]]:
-        del runtime, step
-        papers = _extract_papers(resolved_input.get("arxiv_results"))
-        personalized = bool(resolved_input.get("user_memory_summary") or resolved_input.get("research_profile"))
-        ranked: List[Dict[str, Any]] = []
-        for index, paper in enumerate(papers, start=1):
-            next_paper = dict(paper)
-            next_paper["rank"] = index
-            if personalized:
-                next_paper.setdefault("reason", "matched_profile_context")
-            ranked.append(next_paper)
-        state.personalized_rerank_applied = personalized
-        return ranked
-
-    def _synthesize_arxiv_response(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> str:
-        del step
-        ranked_papers = resolved_input.get("ranked_papers")
-        if not isinstance(ranked_papers, list) or not ranked_papers:
-            # 个性化 rerank 是可选步骤；缺少 ranked_papers 时回退到搜索输出，保证规则型 planner 可跳过可选工具。
-            ranked_papers = _extract_papers(runtime.outputs.get("arxiv_results"))
-        quality = resolved_input.get("arxiv_result_quality") if isinstance(resolved_input.get("arxiv_result_quality"), Mapping) else {}
-        result_count = int(quality.get("result_count") or len(ranked_papers or []))
-        if result_count <= 0:
-            return "当前没有检索到合适的 arXiv 结果，建议收窄或改写查询后重试。"
-        titles = [str((paper or {}).get("title") or "").strip() for paper in list(ranked_papers or [])[:3] if str((paper or {}).get("title") or "").strip()]
-        title_summary = "；".join(titles) if titles else "已返回相关论文"
-        if state.personalized_rerank_applied:
-            return f"已检索到 {result_count} 篇相关 arXiv 论文，并结合用户上下文完成排序。优先关注：{title_summary}。"
-        return f"已检索到 {result_count} 篇相关 arXiv 论文。优先关注：{title_summary}。"
-
-    def _resolve_paper(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del runtime, step
-        message = str(resolved_input.get("message") or state.message or "").strip()
-        context = state.context if isinstance(state.context, Mapping) else {}
-        selected_paper = resolved_input.get("selected_paper")
-        logger.info(
-            "arxiv_agent resolve_paper: message=%s selected_paper_title=%s selected_paper_arxiv_id=%s context_keys=%s recent_paper_count=%s",
-            message,
-            str((selected_paper or {}).get("title") or "").strip() if isinstance(selected_paper, Mapping) else "",
-            str((selected_paper or {}).get("arxiv_id") or "").strip() if isinstance(selected_paper, Mapping) else "",
-            sorted(context.keys()),
-            len(context.get("last_papers") or []) if isinstance(context.get("last_papers"), list) else 0,
-        )
-        if callable(_resolve_paper_reference):
-            resolution = _resolve_paper_reference(message, context)
-            if isinstance(resolution, Mapping):
-                logger.info(
-                    "arxiv_agent resolve_paper result: source=resolver arxiv_id=%s title=%s matched_by=%s",
-                    str(resolution.get("arxiv_id") or "").strip(),
-                    str(resolution.get("title") or "").strip(),
-                    str(resolution.get("matched_by") or resolution.get("source") or "").strip(),
-                )
-                return dict(resolution)
-        if isinstance(selected_paper, Mapping):
-            logger.info(
-                "arxiv_agent resolve_paper result: source=selected_paper arxiv_id=%s title=%s",
-                str(selected_paper.get("arxiv_id") or "").strip(),
-                str(selected_paper.get("title") or "").strip(),
-            )
-            return dict(selected_paper)
-        fallback_resolution = _resolve_paper_reference_fallback(message, context)
-        logger.info(
-            "arxiv_agent resolve_paper result: source=fallback arxiv_id=%s title=%s matched_by=%s",
-            str(fallback_resolution.get("arxiv_id") or "").strip(),
-            str(fallback_resolution.get("title") or "").strip(),
-            str(fallback_resolution.get("matched_by") or fallback_resolution.get("source") or "").strip(),
-        )
-        return fallback_resolution
-
-    def _check_paper_index(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del state, runtime, step
-        paper_ref = resolved_input.get("paper_ref")
-        arxiv_id = str((paper_ref or {}).get("arxiv_id") or "").strip() if isinstance(paper_ref, Mapping) else ""
-        logger.info(
-            "arxiv_agent check_paper_index: arxiv_id=%s title=%s",
-            arxiv_id,
-            str((paper_ref or {}).get("title") or "").strip() if isinstance(paper_ref, Mapping) else "",
-        )
-        if not arxiv_id:
-            return {"status": "missing", "has_index": False}
-        tool_result = invoke_backend_tool("check_paper_qa_index", arxiv_id=arxiv_id)
-        data = (tool_result or {}).get("data") if isinstance(tool_result, Mapping) else {}
-        logger.info(
-            "arxiv_agent check_paper_index result: arxiv_id=%s status=%s has_index=%s",
-            arxiv_id,
-            str((data or {}).get("status") or "").strip(),
-            (data or {}).get("has_index"),
-        )
-        return dict(data or {"status": "unknown", "has_index": False, "tool_result": tool_result})
-
-    def _request_confirmation(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del runtime, step
-        pending_action = resolved_input.get("pending_action")
-        pending_state = state.pending_action if isinstance(state.pending_action, Mapping) else {}
-        status = "approved" if pending_state.get("status") == "approved" else "waiting_confirmation"
-        return {"status": status, "pending_action": pending_action}
-
-    def _parse_and_index_paper(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del state, runtime, step
-        paper_ref = resolved_input.get("paper_reference") or resolved_input.get("paper_ref")
-        arxiv_id = str((paper_ref or {}).get("arxiv_id") or "").strip() if isinstance(paper_ref, Mapping) else ""
-        if not arxiv_id:
-            raise ValueError("parse_and_index_paper requires arxiv_id")
-        tool_result = invoke_backend_tool("build_paper_qa_index", arxiv_id=arxiv_id)
-        return dict((tool_result or {}).get("data") or {"tool_result": tool_result})
-
-    def _answer_paper_question(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del step
-        paper_ref = resolved_input.get("paper_ref") or resolved_input.get("paper_reference") or runtime.outputs.get("paper_ref")
-        arxiv_id = str((paper_ref or {}).get("arxiv_id") or "").strip() if isinstance(paper_ref, Mapping) else ""
-        question = str(resolved_input.get("message") or state.message or "").strip()
-        if not arxiv_id:
-            return {"status": "failed", "answer": "", "sources": [], "retrieval_debug": None, "tool_result": None, "error": "missing_arxiv_id"}
-        logger.info("arxiv_agent answer_paper_question: arxiv_id=%s question=%s", arxiv_id, question)
-        qa_recovery_strategy = resolved_input.get("qa_recovery_strategy") if isinstance(resolved_input.get("qa_recovery_strategy"), Mapping) else None
-        index_strategy = resolved_input.get("index_strategy") if isinstance(resolved_input.get("index_strategy"), Mapping) else None
-        tool_kwargs = {
-            "arxiv_id": arxiv_id,
-            "question": question,
-        }
-        # recovery 策略只以结构化 payload 传递给 PaperQAService，避免在执行器里散落临时参数。
-        if qa_recovery_strategy:
-            tool_kwargs["qa_recovery_strategy"] = dict(qa_recovery_strategy)
-        if index_strategy:
-            tool_kwargs["index_strategy"] = dict(index_strategy)
-        tool_result = invoke_backend_tool(
-            "answer_paper_question",
-            **tool_kwargs,
-        )
-        tool_data = dict((tool_result or {}).get("data") or {})
-        # 真实 PaperQAService 会在 data 中返回 answer/sources/retrieval_debug；这里只补充状态和原始工具结果，
-        # 不生成 synthetic chunk，也不覆盖 retrieval_debug，确保 trace 与实际执行链路一致。
-        tool_data.setdefault("status", "success" if bool((tool_result or {}).get("ok", False)) and str(tool_data.get("answer") or "").strip() else "failed")
-        tool_data.setdefault("sources", [])
-        tool_data.setdefault("retrieval_debug", None)
-        if not bool((tool_result or {}).get("ok", False)):
-            error_payload = (tool_result or {}).get("error") if isinstance((tool_result or {}).get("error"), Mapping) else {}
-            tool_data.setdefault("error", error_payload.get("message") or (tool_result or {}).get("summary") or "answer_paper_question failed")
-        else:
-            tool_data.setdefault("error", None)
-        tool_data.setdefault("arxiv_id", arxiv_id)
-        tool_data.setdefault("question", question)
-        tool_data["tool_result"] = tool_result
-        return tool_data
-
-    def _load_user_profile(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del runtime, step
-        context = resolved_input.get("context") if isinstance(resolved_input.get("context"), Mapping) else {}
-        profile = context.get("research_profile") if isinstance(context.get("research_profile"), Mapping) else {}
-        return {
-            "user_id": state.user_id,
-            "research_profile": dict(profile),
-            "user_memory_summary": context.get("user_memory_summary"),
-            "message": state.message,
-            "request_context": dict(context),
-        }
-
-    def _load_candidate_papers(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> List[Dict[str, Any]]:
-        del runtime, step
-        context = state.context if isinstance(state.context, Mapping) else {}
-        for key in ("papers", "last_papers", "candidate_papers"):
-            papers = context.get(key)
-            if isinstance(papers, list):
-                return [dict(item) for item in papers if isinstance(item, Mapping)]
-        return []
-
-    def _generate_recommendations(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del runtime, step
-        profile = resolved_input.get("recommendation_profile") if isinstance(resolved_input.get("recommendation_profile"), Mapping) else {}
-        # 画像为空时 Replanner 会降级为“当前消息驱动”的推荐，避免把空画像继续传给推荐工具。
-        message = profile.get("message") or state.message
-        tool_result = invoke_backend_tool(
-            "recommend_papers",
-            user_id=state.user_id or "",
-            message=message,
-            user_memory_summary=profile.get("user_memory_summary"),
-            research_profile=profile.get("research_profile"),
-            request_context=profile.get("request_context"),
-        )
-        return {
-            "recommendations": list((((tool_result or {}).get("data") or {}).get("recommendations") or [])),
-            "tool_result": tool_result,
-            "candidate_papers": resolved_input.get("candidate_papers"),
-        }
-
-    def _validate_recommendations(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del state, runtime, step
-        result = resolved_input.get("recommendation_result") if isinstance(resolved_input.get("recommendation_result"), Mapping) else {}
-        recommendations = result.get("recommendations")
-        return {
-            "ok": isinstance(recommendations, list) and len(recommendations) > 0,
-            "recommendations": list(recommendations or []),
-        }
-
-    def _explain_recommendations(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> str:
-        del state, runtime, step
-        validated = resolved_input.get("validated_recommendations") if isinstance(resolved_input.get("validated_recommendations"), Mapping) else {}
-        recommendations = list(validated.get("recommendations") or [])
-        if not recommendations:
-            return "当前没有生成可用的推荐结果，建议先补充偏好或改成明确主题搜索。"
-        titles = [str((item or {}).get("title") or "").strip() for item in recommendations[:3] if isinstance(item, Mapping)]
-        return f"已生成推荐结果，可优先阅读：{'；'.join([title for title in titles if title]) or '候选论文列表'}。"
-
-    def _resolve_preference_target(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        return self._resolve_paper(resolved_input, state, runtime, step)
-
-    def _update_preference_store(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del runtime, step
-        paper_reference = resolved_input.get("paper_reference")
-        arxiv_id = str((paper_reference or {}).get("arxiv_id") or "").strip() if isinstance(paper_reference, Mapping) else ""
-        message = str(resolved_input.get("message") or state.message or "")
-        lowered = message.lower()
-        remove_scope = None
-        if any(token in lowered for token in ("取消喜欢", "取消不喜欢", "撤销喜欢", "撤销不喜欢", "unlike", "remove like", "remove dislike")):
-            remove_scope = "disliked" if any(token in lowered for token in ("取消不喜欢", "撤销不喜欢", "remove dislike")) else "liked"
-
-        # 只把真实偏好写入或删除委托给后端工具；兴趣画像/向量重建不在这里伪装同步。
-        if remove_scope:
-            tool_result = invoke_backend_tool(
-                "remove_paper_preference",
-                user_id=state.user_id or "",
-                arxiv_id=arxiv_id,
-                remove_scope=remove_scope,
-            )
-            tool_data = (tool_result or {}).get("data") if isinstance(tool_result, Mapping) else {}
-            return {
-                "status": "success" if bool((tool_result or {}).get("ok")) else "failed",
-                "action": "remove",
-                "label": "none",
-                "arxiv_id": arxiv_id,
-                "title": str((paper_reference or {}).get("title") or "").strip() if isinstance(paper_reference, Mapping) else "",
-                "message": str((tool_data or {}).get("message") or (tool_result or {}).get("summary") or "已取消偏好标记"),
-                "paper": dict(paper_reference) if isinstance(paper_reference, Mapping) else None,
-                "error": None if bool((tool_result or {}).get("ok")) else ((tool_result or {}).get("error") or {}).get("message") if isinstance((tool_result or {}).get("error"), Mapping) else None,
-                "tool_result": tool_result,
-            }
-
-        liked = not any(token in lowered for token in ("不喜欢", "dislike", "thumbs down"))
-        tool_result = invoke_backend_tool(
-            "record_paper_preference",
-            user_id=state.user_id or "",
-            arxiv_id=arxiv_id,
-            liked=liked,
-            paper=dict(paper_reference) if isinstance(paper_reference, Mapping) else None,
-        )
-        tool_data = (tool_result or {}).get("data") if isinstance(tool_result, Mapping) else {}
-        return {
-            "status": "success" if bool((tool_result or {}).get("ok")) else "failed",
-            "action": "like" if liked else "dislike",
-            "label": "liked" if liked else "disliked",
-            "arxiv_id": arxiv_id,
-            "liked": liked,
-            "title": str((paper_reference or {}).get("title") or "").strip() if isinstance(paper_reference, Mapping) else "",
-            "message": str((tool_data or {}).get("message") or (tool_result or {}).get("summary") or "偏好已更新"),
-            "paper": (tool_data or {}).get("paper") or (dict(paper_reference) if isinstance(paper_reference, Mapping) else None),
-            "error": None if bool((tool_result or {}).get("ok")) else ((tool_result or {}).get("error") or {}).get("message") if isinstance((tool_result or {}).get("error"), Mapping) else None,
-            "tool_result": tool_result,
-        }
-
-    def _verify_preference_update(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del state, runtime, step
-        action_result = resolved_input.get("preference_action_result")
-        return {
-            "ok": isinstance(action_result, Mapping)
-            and bool(action_result.get("arxiv_id"))
-            and str(action_result.get("status") or "success") == "success",
-            "detail": action_result,
-        }
-
-    def _synthesize_preference_response(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> str:
-        del state, runtime, step
-        verified = resolved_input.get("verified_preference_update") if isinstance(resolved_input.get("verified_preference_update"), Mapping) else {}
-        detail = verified.get("detail") if isinstance(verified.get("detail"), Mapping) else {}
-        if not verified.get("ok"):
-            return "偏好更新未成功，请确认目标论文后重试。"
-        action = str(detail.get("action") or "").strip()
-        if action == "remove":
-            return f"已取消论文偏好：{detail.get('arxiv_id') or '目标论文'}。"
-        return f"已更新论文偏好：{detail.get('arxiv_id') or '目标论文'}。"
-
-    def _analyze_ambiguity(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
-        del runtime, step
-        message = str(resolved_input.get("message") or state.message or "").strip()
-        return {"message": message, "missing_fields": ["topic"], "reason": "request_is_ambiguous"}
-
-    def _generate_clarification(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> str:
-        del state, runtime, step
-        missing_information = resolved_input.get("missing_information") if isinstance(resolved_input.get("missing_information"), Mapping) else {}
-        missing_fields = list(missing_information.get("missing_fields") or [])
-        if missing_fields:
-            return f"我还缺少关键信息：{', '.join(str(item) for item in missing_fields)}。请补充后我再继续。"
-        return "当前请求还不够明确，请补充目标主题、论文或操作对象。"
-
-    def _generate_fallback_response(self, resolved_input: Dict[str, Any], state: AgentState, runtime: PlanRuntime, step: PlanStep) -> str:
-        del state, runtime, step
-        message = str(resolved_input.get("message") or "").strip()
-        if message:
-            return f"当前请求暂不在该 agent 的支持范围内：{message}。建议改成 arXiv 搜索、论文问答、推荐或偏好更新。"
-        return "当前请求暂不在该 agent 的支持范围内。"
 def run_agent_turn(state: AgentState, tool_registry: ToolRegistry = PLANNER_TOOL_REGISTRY) -> AgentTurnResult:
     """统一 Agent 单轮入口：通过 planner 门面拿到已校验计划后执行。
 
@@ -1300,7 +1694,10 @@ def run_agent_turn(state: AgentState, tool_registry: ToolRegistry = PLANNER_TOOL
     state.execution_plan = plan
     state.debug = dict(state.debug or {})
     state.debug["planner"] = planning_debug
-    return PlanExecutor(tool_registry=tool_registry).execute(plan, state)
+    result = PlanExecutor(tool_registry=tool_registry).execute(plan, state)
+    if result.runtime is not None:
+        state.plan_runtime = result.runtime
+    return result
 
 
 def run_agent_turn_in_graph(state: AgentState, tool_registry: ToolRegistry = PLANNER_TOOL_REGISTRY) -> AgentTurnResult:
@@ -1317,7 +1714,10 @@ def run_agent_turn_in_graph(state: AgentState, tool_registry: ToolRegistry = PLA
     runtime.retry_counts = {}
     runtime.replan_counts = {}
     runtime.step_replan_counts = {}
-    return PlanExecutor(tool_registry=tool_registry)._execute_runtime(runtime, state, allow_interrupt=True)
+    result = PlanExecutor(tool_registry=tool_registry)._execute_runtime(runtime, state, allow_interrupt=True)
+    if result.runtime is not None:
+        state.plan_runtime = result.runtime
+    return result
 
 
 def execute_executable_plan(state: AgentState, tool_registry: ToolRegistry = PLANNER_TOOL_REGISTRY) -> AgentTurnResult:

@@ -30,12 +30,14 @@ from .plan_executor import PlanExecutor, execute_executable_plan, run_agent_turn
 from .schemas import (
     AgentStep,
     AgentStreamEvent,
+    AgentRuntimeState,
     AgentTurnResult,
     AgentToolCall,
     ArxivSearchGraphResponse,
     ArxivSearchRequest,
     ArxivSearchResponse,
     ArxivSearchSpec,
+    StepExecutionResult,
 )
 from .service import run_arxiv_search_agent, stream_arxiv_search_agent
 from .state import AgentState
@@ -49,12 +51,14 @@ __all__ = [
     "AgentState",
     "AgentStep",
     "AgentStreamEvent",
+    "AgentRuntimeState",
     "AgentTurnResult",
     "AgentToolCall",
     "ArxivSearchGraphResponse",
     "ArxivSearchRequest",
     "ArxivSearchResponse",
     "ArxivSearchSpec",
+    "StepExecutionResult",
     "SEARCH_TOOL_NAME",
     "build_arxiv_search_graph",
     "PlanExecutor",

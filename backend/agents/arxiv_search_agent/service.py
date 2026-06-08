@@ -27,6 +27,14 @@ except Exception:  # pragma: no cover
     _get_generation_service = None
 
 from .graph import build_arxiv_search_graph
+from .runtime_checkpoint import (
+    CHECKPOINT_STATUS_CANCELLED,
+    CHECKPOINT_STATUS_COMPLETED,
+    CHECKPOINT_STATUS_FAILED,
+    AgentRuntimeCheckpointError,
+    AgentRuntimeCheckpointManager,
+    build_agent_checkpointer,
+)
 from .schemas import AgentStep, AgentStreamEvent, ArxivSearchRequest, ArxivSearchResponse, ResumeRequest
 from .state import AgentState
 
@@ -100,17 +108,57 @@ def _build_resume_payload(resume: ResumeRequest) -> Dict[str, Any]:
     return payload
 
 
-def _ensure_resume_checkpoint(graph: Any, thread_id: str) -> None:
-    """在恢复前先校验 checkpoint 是否存在，避免把错误 session 当成新请求执行。
+def _build_runtime_checkpoint_manager(database_service: Optional[DatabaseService] = None) -> AgentRuntimeCheckpointManager:
+    """创建业务 runtime checkpoint 管理器。
 
-    真实 LangGraph 环境可以通过 get_state 检查线程是否已有执行现场；
-    测试桩没有实现时则跳过这层校验，由集成测试里的 fake graph 显式模拟。
+    管理器只负责可恢复现场的持久化和校验，不读取 agent_sessions.pending_action，
+    避免前端展示镜像反向驱动真实恢复。
     """
+    return AgentRuntimeCheckpointManager(database_service=database_service or DatabaseService())
+
+
+def _build_agent_graph(generation_service: Optional[Any] = None, database_service: Optional[DatabaseService] = None) -> Any:
+    """构建带持久化 checkpointer 的 Agent 图。"""
+    checkpointer = build_agent_checkpointer(database_service=database_service or DatabaseService())
+    return build_arxiv_search_graph(generation_service=generation_service, checkpointer=checkpointer)
+
+
+def _ensure_resume_checkpoint(
+    graph: Any,
+    thread_id: str,
+    *,
+    checkpoint_manager: Optional[AgentRuntimeCheckpointManager] = None,
+    user_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    resume_payload: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """在恢复前同时校验业务 checkpoint 和 LangGraph checkpoint。
+
+    业务 checkpoint 负责 user/session/thread/pending_confirmation/status 校验；
+    LangGraph checkpoint 负责确认图本身有可 resume 的原始现场。两者都通过后才允许 Command(resume)。
+    """
+    if checkpoint_manager is not None:
+        try:
+            checkpoint_manager.validate_resume(
+                user_id=user_id,
+                session_id=session_id or thread_id,
+                thread_id=thread_id,
+                resume_payload=dict(resume_payload or {}),
+            )
+        except AgentRuntimeCheckpointError as exc:
+            raise ResumeCheckpointNotFoundError(thread_id=exc.thread_id, reason=exc.reason) from exc
+
     get_state = getattr(graph, "get_state", None)
     if not callable(get_state):
         return
 
-    graph_state = get_state(config=_build_langgraph_config(thread_id))
+    try:
+        graph_state = get_state(config=_build_langgraph_config(thread_id))
+    except AttributeError:
+        # 轻量测试桩可能没有完整 checkpointer 接口；业务 checkpoint 已校验通过时不因测试桩形状阻断。
+        if checkpoint_manager is not None:
+            return
+        raise
     if not _has_resume_checkpoint(graph_state):
         # checkpoint 缺失是可预期的恢复失败，不应进入通用 Agent runtime error 分支。
         raise ResumeCheckpointNotFoundError(thread_id=thread_id)
@@ -134,6 +182,37 @@ def _has_resume_checkpoint(graph_state: Any) -> bool:
 
     # 未知状态对象保持向后兼容：只要不是明确的空快照，就交给 LangGraph 自身恢复逻辑处理。
     return True
+
+
+def _state_from_graph_snapshot(graph_state: Any) -> Optional[AgentState]:
+    """从 LangGraph 快照中提取待恢复状态，用于在 resume 后预告即将执行的工具。
+
+    SSE 的 updates 模式只有节点结束后才产出事件；确认恢复后如果马上进入耗时索引构建，
+    必须先从 checkpoint 快照推断当前 step，才能在真正阻塞前让前端看到“工具执行中”。
+    """
+    if graph_state is None:
+        return None
+    values = graph_state.get("values") if isinstance(graph_state, Mapping) else getattr(graph_state, "values", None)
+    if values is None and isinstance(graph_state, Mapping):
+        values = graph_state
+    if not values:
+        return None
+    try:
+        return _coerce_state(values)
+    except Exception:
+        return None
+
+
+def _load_graph_snapshot_state(graph: Any, thread_id: str) -> Optional[AgentState]:
+    """读取当前 thread 的 checkpoint 状态；读取失败只影响进度提示，不影响 resume 主流程。"""
+    get_state = getattr(graph, "get_state", None)
+    if not callable(get_state):
+        return None
+    try:
+        return _state_from_graph_snapshot(get_state(config=_build_langgraph_config(thread_id)))
+    except Exception as exc:
+        logger.debug("arxiv_agent load graph snapshot for progress failed: thread_id=%s error=%s", thread_id, exc)
+        return None
 
 
 def _inject_user_memory_context(request_context: Dict[str, Any], user_id: Optional[str]) -> tuple[Dict[str, Any], Dict[str, Any]]:
@@ -218,6 +297,125 @@ def _persist_agent_session_memory(final_state: Any) -> None:
         )
 
 
+def _persist_runtime_checkpoint_node(
+    checkpoint_manager: AgentRuntimeCheckpointManager,
+    state: Any,
+    *,
+    current_node: str,
+) -> None:
+    """把图节点执行后的现场落库。
+
+    这里保存的是 resume 真源；pending_action 仍只是展示镜像，因此不从它反推出可恢复状态。
+    """
+    if state is None:
+        return
+    try:
+        checkpoint_manager.persist_state(state, current_node=current_node)
+    except Exception as exc:
+        logger.warning(
+            "Failed to persist agent runtime checkpoint node: node=%s error=%s",
+            current_node,
+            exc,
+        )
+
+
+def _persist_runtime_checkpoint_after_turn(
+    checkpoint_manager: AgentRuntimeCheckpointManager,
+    final_state: Any,
+    *,
+    is_resume: bool,
+) -> None:
+    """在一次同步/流式执行结束后更新 runtime checkpoint 状态。
+
+    waiting_confirmation 会继续保留 pending_confirmation；completed/cancelled/failed 会清空确认真源，
+    避免同一确认被二次 approve 后重复执行副作用步骤。
+    """
+    if final_state is None:
+        return
+    try:
+        state = _coerce_state(final_state)
+        pending_confirmation = _extract_state_pending_confirmation(state)
+        if pending_confirmation:
+            checkpoint_manager.persist_state(state, current_node="finalize", next_route="waiting_confirmation")
+            return
+        terminal_status = _terminal_checkpoint_status(state, is_resume=is_resume)
+        if terminal_status:
+            checkpoint_manager.mark_terminal(
+                state,
+                status=terminal_status,
+                error_summary=_state_error_summary(state),
+            )
+        else:
+            checkpoint_manager.persist_state(state, current_node="finalize")
+    except Exception as exc:
+        logger.warning("Failed to persist agent runtime checkpoint after turn: error=%s", exc)
+
+
+def _extract_state_pending_confirmation(state: AgentState) -> Optional[Dict[str, Any]]:
+    """读取结构化 pending_confirmation，不使用 pending_action 作为恢复真源。"""
+    if state.runtime_state is not None and state.runtime_state.pending_confirmation is not None:
+        return state.runtime_state.pending_confirmation.model_dump(mode="json")
+    if state.plan_runtime is not None and state.plan_runtime.pending_confirmation is not None:
+        return state.plan_runtime.pending_confirmation.model_dump(mode="json")
+    debug_pending = (state.debug or {}).get("pending_confirmation")
+    return dict(debug_pending) if isinstance(debug_pending, Mapping) else None
+
+
+def _terminal_checkpoint_status(state: AgentState, *, is_resume: bool) -> Optional[str]:
+    """把 Agent 最终状态映射成 checkpoint 生命周期状态。"""
+    pending_action = state.pending_action if isinstance(state.pending_action, Mapping) else {}
+    if str(pending_action.get("status") or "").strip() == "cancelled":
+        return CHECKPOINT_STATUS_CANCELLED
+    runtime_status = ""
+    if state.runtime_state is not None:
+        runtime_status = str(state.runtime_state.turn_status or "").strip()
+    if not runtime_status and state.plan_runtime is not None:
+        runtime_status = str(state.plan_runtime.turn_status or "").strip()
+    if runtime_status == "failed" or _state_error_summary(state):
+        return CHECKPOINT_STATUS_FAILED
+    if runtime_status:
+        return CHECKPOINT_STATUS_COMPLETED
+    # resume 后即使 runtime_status 被旧路径漏写，也不能继续保留 waiting_confirmation 真源。
+    if is_resume:
+        return CHECKPOINT_STATUS_COMPLETED
+    return None
+
+
+def _state_error_summary(state: AgentState) -> str:
+    if state.runtime_state is not None and state.runtime_state.failure_reason:
+        return str(state.runtime_state.failure_reason)
+    if state.plan_runtime is not None and state.plan_runtime.error:
+        return str(state.plan_runtime.error)
+    if state.errors:
+        latest_error = state.errors[-1] if isinstance(state.errors[-1], Mapping) else {}
+        return str(latest_error.get("code") or latest_error.get("message") or "")
+    return ""
+
+
+def _mark_runtime_checkpoint_failed(
+    checkpoint_manager: AgentRuntimeCheckpointManager,
+    *,
+    user_id: Optional[str],
+    session_id: Optional[str],
+    detail: str,
+) -> None:
+    """异常终止时尽量把 runtime checkpoint 标记为 failed，避免旧确认现场继续可 resume。"""
+    normalized_session_id = str(session_id or "").strip()
+    if not normalized_session_id:
+        return
+    try:
+        checkpoint_manager.database_service.mark_agent_runtime_checkpoint_status(
+            user_id=str(user_id or "").strip(),
+            session_id=normalized_session_id,
+            thread_id=normalized_session_id,
+            status=CHECKPOINT_STATUS_FAILED,
+            error_summary=detail,
+            clear_pending_confirmation=True,
+        )
+    except Exception as exc:
+        logger.warning("Failed to mark agent runtime checkpoint failed: session_id=%s error=%s", normalized_session_id, exc)
+
+
 def _build_initial_agent_state(
     normalized_request: ArxivSearchRequest,
     *,
@@ -271,14 +469,37 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
             _safe_selected_arxiv_id(request_context),
         )
         # 第 3 步：解析生成服务，并统一构造图对象。
+        database_service = DatabaseService()
+        checkpoint_manager = _build_runtime_checkpoint_manager(database_service)
+        checkpoint_manager.expire_and_cleanup()
         generation_service = _resolve_generation_service()
-        graph = build_arxiv_search_graph(generation_service=generation_service)
+        graph = _build_agent_graph(generation_service=generation_service, database_service=database_service)
 
         if _is_resume_request(normalized_request):
             # resume 路径必须复用同一个 thread_id，并直接从 interrupt 位置恢复，
             # 不能重新构造一轮完整业务初始状态，否则会把确认恢复退化回“伪恢复”。
-            _ensure_resume_checkpoint(graph, resolved_session_id)
             resume_payload = _build_resume_payload(normalized_request.resume)
+            logger.info(
+                "arxiv_agent resume received: session_id=%s thread_id=%s decision=%s step_id=%s interrupt_id=%s",
+                resolved_session_id,
+                resolved_session_id,
+                resume_payload.get("decision"),
+                resume_payload.get("step_id"),
+                resume_payload.get("interrupt_id"),
+            )
+            _ensure_resume_checkpoint(
+                graph,
+                resolved_session_id,
+                checkpoint_manager=checkpoint_manager,
+                user_id=normalized_request.user_id,
+                session_id=resolved_session_id,
+                resume_payload=resume_payload,
+            )
+            logger.info(
+                "arxiv_agent resume checkpoint validated: session_id=%s step_id=%s",
+                resolved_session_id,
+                resume_payload.get("step_id"),
+            )
             final_state = _coerce_state(graph.invoke(Command(resume=resume_payload), config=graph_config))
         else:
             initial_state = _build_initial_agent_state(
@@ -290,6 +511,7 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
             # 普通请求仍从完整初始状态进入主图，保持搜索/推荐/QA 等非确认链路行为不变。
             final_state = _coerce_state(graph.invoke(initial_state.model_dump(), config=graph_config))
 
+        _persist_runtime_checkpoint_after_turn(checkpoint_manager, final_state, is_resume=_is_resume_request(normalized_request))
         # 第 5 步：把跨轮 Agent memory 回写到后端 session。
         _persist_agent_session_memory(final_state)
 
@@ -315,6 +537,13 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
         )
     except Exception as exc:
         logger.exception("arxiv_agent runtime failed: session_id=%s message=%s", resolved_session_id if 'resolved_session_id' in locals() else None, normalized_request.message)
+        if "checkpoint_manager" in locals():
+            _mark_runtime_checkpoint_failed(
+                checkpoint_manager,
+                user_id=normalized_request.user_id if "normalized_request" in locals() else None,
+                session_id=resolved_session_id if "resolved_session_id" in locals() else None,
+                detail=str(exc),
+            )
         return _build_error_response(
             message="arXiv 搜索 Agent 运行失败",
             detail=str(exc),
@@ -342,7 +571,6 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
         # run_id 和 sequence 一起构成了一次流式执行的事件主线。
         run_id = str(uuid4())
         sequence = 1
-        generation_service = _resolve_generation_service()
         current_state: Optional[AgentState] = None
 
         try:
@@ -350,7 +578,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
             request_context, _agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(normalized_request)
             resolved_session_id = _ensure_session_id(resolved_session_id)
             graph_config = _build_langgraph_config(resolved_session_id)
-            logger.debug(
+            logger.info(
                 "arxiv_agent stream start: run_id=%s session_id=%s thread_id=%s message=%s context_keys=%s pending_action_status=%s paper_qa_status=%s selected_arxiv_id=%s",
                 run_id,
                 resolved_session_id,
@@ -361,12 +589,44 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 _safe_status(request_context.get("paper_qa_result")),
                 _safe_selected_arxiv_id(request_context),
             )
-            graph = build_arxiv_search_graph(generation_service=generation_service)
+            database_service = DatabaseService()
+            checkpoint_manager = _build_runtime_checkpoint_manager(database_service)
+            checkpoint_manager.expire_and_cleanup()
+            generation_service = _resolve_generation_service()
+            graph = _build_agent_graph(generation_service=generation_service, database_service=database_service)
             graph_input: Any
 
+            resume_payload: Optional[Dict[str, Any]] = None
+            resume_approved_step_id: Optional[str] = None
             if _is_resume_request(normalized_request):
-                _ensure_resume_checkpoint(graph, resolved_session_id)
-                graph_input = Command(resume=_build_resume_payload(normalized_request.resume))
+                resume_payload = _build_resume_payload(normalized_request.resume)
+                logger.info(
+                    "arxiv_agent stream resume received: run_id=%s session_id=%s thread_id=%s decision=%s step_id=%s interrupt_id=%s",
+                    run_id,
+                    resolved_session_id,
+                    resolved_session_id,
+                    resume_payload.get("decision"),
+                    resume_payload.get("step_id"),
+                    resume_payload.get("interrupt_id"),
+                )
+                _ensure_resume_checkpoint(
+                    graph,
+                    resolved_session_id,
+                    checkpoint_manager=checkpoint_manager,
+                    user_id=normalized_request.user_id,
+                    session_id=resolved_session_id,
+                    resume_payload=resume_payload,
+                )
+                logger.info(
+                    "arxiv_agent stream resume checkpoint validated: run_id=%s session_id=%s step_id=%s",
+                    run_id,
+                    resolved_session_id,
+                    resume_payload.get("step_id"),
+                )
+                if str(resume_payload.get("decision") or "").strip().lower() == "approve":
+                    resume_approved_step_id = str(resume_payload.get("step_id") or "").strip() or None
+                current_state = _load_graph_snapshot_state(graph, resolved_session_id)
+                graph_input = Command(resume=resume_payload)
             else:
                 current_state = _build_initial_agent_state(
                     normalized_request,
@@ -416,8 +676,9 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 )
                 sequence += 1
 
+                active_tool_call = _active_runtime_tool_call(previous_state, approved_step_id=resume_approved_step_id)
                 tool_call_started = False
-                if step_name == "invoke_search_tool" and _should_emit_tool_call(previous_state):
+                if step_name == "execute_step" and active_tool_call is not None:
                     tool_call_started = True
                     # 子阶段 D-2：如果当前节点会触发工具调用，则补发工具开始事件。
                     yield _sse_event(
@@ -427,10 +688,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                             run_id=run_id,
                             data={
                                 "step": step_name,
-                                "tool_call": {
-                                    "tool_name": previous_state.tool_name,
-                                    "arguments": _compact_tool_args(previous_state.tool_args),
-                                },
+                                "tool_call": active_tool_call,
                                 "state": _compact_state(previous_state),
                             },
                         )
@@ -446,6 +704,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     current_state = _apply_stream_interrupt_state(previous_state, confirmation_payload)
                 else:
                     current_state = _coerce_state(step_payload)
+                _persist_runtime_checkpoint_node(checkpoint_manager, current_state, current_node=step_name)
                 latest_step = current_state.steps[-1].model_dump() if current_state.steps else None
 
                 # 子阶段 D-3：节点执行结束后，把最新 step 摘要和当前状态回传给前端。
@@ -466,14 +725,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
 
                 if tool_call_started:
                     # 子阶段 D-4：若本节点触发了工具调用，则在节点结束后补发 tool_call_end。
-                    latest_tool_call = current_state.tool_calls[-1].model_dump() if current_state.tool_calls else {
-                        "tool_name": current_state.tool_name,
-                        "arguments": _compact_tool_args(current_state.tool_args),
-                        "status": "failed",
-                        "summary": "工具调用未产生结果",
-                        "trace": {},
-                        "error": None,
-                    }
+                    latest_tool_call = _merge_tool_call_end(active_tool_call, _latest_runtime_tool_call(current_state))
                     yield _sse_event(
                         _make_stream_event(
                             event_type="tool_call_end",
@@ -490,6 +742,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
 
             # 阶段 E：整张图执行完成后，输出最终聚合响应和结束事件。
             if current_state is not None:
+                _persist_runtime_checkpoint_after_turn(checkpoint_manager, current_state, is_resume=_is_resume_request(normalized_request))
                 _persist_agent_session_memory(current_state)
             final_response = _state_to_response(current_state)
             yield _sse_event(
@@ -572,6 +825,13 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
             )
         except Exception as exc:
             # 阶段 F：流式过程中任何异常都转成结构化事件，而不是让连接直接中断。
+            if "checkpoint_manager" in locals():
+                _mark_runtime_checkpoint_failed(
+                    checkpoint_manager,
+                    user_id=normalized_request.user_id,
+                    session_id=resolved_session_id if "resolved_session_id" in locals() else None,
+                    detail=str(exc),
+                )
             error_response = _build_error_response_from_state(
                 current_state,
                 message="arXiv 搜索 Agent 运行失败",
@@ -774,6 +1034,12 @@ def _state_to_response(state: Any) -> ArxivSearchResponse:
     这里统一完成字段映射，避免响应构造逻辑分散在多个入口里。
     """
     final_state = state if isinstance(state, AgentState) else AgentState.model_validate(state)
+    tool_calls = list(final_state.tool_calls or [])
+    if not tool_calls:
+        # 显式执行环的工具结果主要记录在 runtime trace 中；这里补齐旧响应字段，
+        # 让前端调试面板不再误判为“没有发生工具调用”。
+        tool_calls = _tool_calls_from_runtime(final_state)
+
     return ArxivSearchResponse(
         session_id=final_state.session_id,
         intent=final_state.intent or "unsupported",
@@ -785,17 +1051,65 @@ def _state_to_response(state: Any) -> ArxivSearchResponse:
         goal=final_state.goal,
         execution_plan=final_state.execution_plan,
         plan_runtime=final_state.plan_runtime,
+        runtime_state=final_state.runtime_state,
         pending_action=final_state.pending_action,
         paper_qa_result=final_state.paper_qa_result,
         preference_action_result=final_state.preference_action_result,
         plan=list(final_state.plan or []),
-        tool_calls=list(final_state.tool_calls or []),
+        tool_calls=tool_calls,
         papers=list(final_state.papers or []),
         warnings=list(final_state.warnings or []),
         next_actions=list(final_state.next_actions or []),
         steps=list(final_state.steps or []),
         debug=dict(final_state.debug or {}),
     )
+
+
+def _tool_calls_from_runtime(state: AgentState) -> list[Dict[str, Any]]:
+    """把 PlanRuntime trace 投影成前端沿用的 tool_calls 摘要。
+
+    trace 是当前执行环的真实记录，但包含大量内部细节；前端只需要工具名、状态、
+    参数摘要和错误信息来展示进度与排错，所以这里做一次轻量转换。
+    """
+    runtime = state.plan_runtime
+    if runtime is None and state.runtime_state is not None:
+        runtime = getattr(state.runtime_state, "runtime", None)
+    plan_steps = {
+        step.step_id: step
+        for step in list((runtime.plan.steps if runtime and runtime.plan else state.execution_plan.steps if state.execution_plan else []) or [])
+    }
+    calls: list[Dict[str, Any]] = []
+    for trace in list((runtime.trace if runtime else []) or []):
+        if trace.event not in {"step_succeeded", "step_failed", "confirmation_requested", "confirmation_approved"}:
+            continue
+        step = plan_steps.get(trace.step_id)
+        detail = dict(trace.detail or {})
+        tool_name = str(detail.get("tool_name") or getattr(step, "tool_name", None) or trace.step_id or "unknown")
+        status = str(trace.status or "").strip() or "success"
+        if trace.event == "confirmation_requested":
+            summary = "等待用户确认后执行工具"
+        elif trace.event == "confirmation_approved":
+            summary = "用户已确认，准备执行工具"
+        elif status == "failed":
+            summary = str(detail.get("failure_reason") or "工具执行失败")
+        else:
+            summary = "工具执行完成"
+        calls.append(
+            {
+                "tool_name": tool_name,
+                "arguments": dict(detail.get("resolved_input") or {}),
+                "status": status,
+                "summary": summary,
+                "trace": {
+                    "step_id": trace.step_id,
+                    "event": trace.event,
+                    "started_at": detail.get("started_at"),
+                    "finished_at": detail.get("finished_at"),
+                },
+                "error": {"message": detail.get("error") or detail.get("failure_reason")} if status == "failed" else None,
+            }
+        )
+    return calls
 
 
 def _build_error_response(*, message: str, detail: str, code: str) -> ArxivSearchResponse:
@@ -958,6 +1272,8 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
             "next_executable_action_type": execution_plan_runtime.get("next_executable_action_type"),
             "status_counts": dict(execution_plan_runtime.get("status_counts") or {}),
         },
+        # runtime_state 是新的执行现场真源；这里仅输出摘要，避免 SSE 事件携带完整工具输出和 trace。
+        "runtime_state": _compact_runtime_state(state.runtime_state),
         "pending_action": state.pending_action,
         "paper_qa_result": state.paper_qa_result,
         "preference_action_result": state.preference_action_result,
@@ -972,6 +1288,28 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
     }
 
 
+def _compact_runtime_state(runtime_state: Any) -> Optional[Dict[str, Any]]:
+    """压缩新的 AgentRuntimeState，供流式事件展示当前执行现场边界。"""
+    if runtime_state is None:
+        return None
+    payload = runtime_state.model_dump() if hasattr(runtime_state, "model_dump") else dict(runtime_state or {})
+    return {
+        "current_step_id": payload.get("current_step_id"),
+        "current_step_index": payload.get("current_step_index"),
+        "step_status": dict(payload.get("step_status") or {}),
+        "output_keys": sorted((payload.get("outputs") or {}).keys()),
+        "last_observation": payload.get("last_observation"),
+        "last_step_output_keys": sorted((payload.get("last_step_output") or {}).keys()) if isinstance(payload.get("last_step_output"), Mapping) else [],
+        "approved_step_ids": list(payload.get("approved_step_ids") or []),
+        "needs_replan": bool(payload.get("needs_replan")),
+        "pending_confirmation": payload.get("pending_confirmation"),
+        "is_finished": bool(payload.get("is_finished")),
+        "failure_reason": payload.get("failure_reason"),
+        "recovery_strategy": payload.get("recovery_strategy"),
+        "turn_status": payload.get("turn_status"),
+    }
+
+
 def _compact_execution_plan_step(step: Any, runtime_step: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """压缩 execution_plan 单步信息，便于前端展示规划状态。"""
     payload = {
@@ -982,6 +1320,16 @@ def _compact_execution_plan_step(step: Any, runtime_step: Optional[Mapping[str, 
         "status": getattr(step, "status", None),
         "depends_on": list(getattr(step, "depends_on", []) or []),
     }
+    tool_spec = getattr(step, "tool", None)
+    if tool_spec is not None:
+        # debug 中只暴露 contract 摘要，避免把 adapter 实例等不可序列化对象塞给前端。
+        payload["tool_contract"] = {
+            "contract_source": getattr(tool_spec, "contract_source", None),
+            "adapter": getattr(tool_spec, "adapter", None),
+            "backend_tool_name": getattr(tool_spec, "backend_tool_name", None),
+            "side_effect_level": getattr(tool_spec, "side_effect_level", None),
+            "requires_confirmation": getattr(tool_spec, "requires_confirmation", None),
+        }
     if isinstance(runtime_step, Mapping):
         for key in ("blocked_by", "can_execute", "is_current", "last_tool_observation"):
             value = runtime_step.get(key)
@@ -997,6 +1345,83 @@ def _compact_tool_args(tool_args: Mapping[str, Any]) -> Dict[str, Any]:
         for key, value in dict(tool_args or {}).items()
         if value not in (None, "", [], {})
     }
+
+
+def _active_runtime_tool_call(state: Optional[AgentState], *, approved_step_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """从显式 runtime_state 里推断 execute_step 即将调用的工具。
+
+    需要用户确认的副作用 step 在批准前只应展示 pending_action，不能提前显示成
+    running tool；批准恢复后再用 approved_step_id 放行，避免进度 UI 误导用户。
+    """
+    if state is None or state.runtime_state is None or state.execution_plan is None:
+        return None
+    current_step_id = str(state.runtime_state.current_step_id or "").strip()
+    if not current_step_id:
+        return None
+    for step in list(state.execution_plan.steps or []):
+        if step.step_id == current_step_id:
+            requires_confirmation = bool(
+                step.confirmation_policy and step.confirmation_policy.requires_confirmation
+            )
+            if requires_confirmation and current_step_id != str(approved_step_id or "").strip():
+                return None
+            return {
+                "tool_name": step.tool_name,
+                "arguments": {},
+                "step_id": step.step_id,
+                "action_type": step.action_type,
+                "status": "running",
+                "summary": f"正在执行 {step.tool_name}",
+                "trace": {
+                    "step_id": step.step_id,
+                    "action_type": step.action_type,
+                    "plan_status": state.runtime_state.step_status.get(step.step_id),
+                },
+            }
+    return None
+
+
+def _latest_runtime_tool_call(state: Optional[AgentState]) -> Optional[Dict[str, Any]]:
+    """从显式执行环的单步结果中整理 tool_call_end 事件。"""
+    if state is None:
+        return None
+    if state.tool_calls:
+        return state.tool_calls[-1].model_dump()
+    last_step_result = dict((state.debug or {}).get("last_step_result") or {})
+    if not last_step_result:
+        return None
+    active_tool = _active_runtime_tool_call(state) or {}
+    return {
+        "tool_name": active_tool.get("tool_name"),
+        "step_id": last_step_result.get("step_id"),
+        "status": last_step_result.get("step_status"),
+        "summary": last_step_result.get("next_action"),
+        "trace": {
+            "output_key": last_step_result.get("output_key"),
+            "has_observation": bool(last_step_result.get("observation")),
+        },
+        "error": last_step_result.get("error"),
+    }
+
+
+def _merge_tool_call_end(active_tool_call: Mapping[str, Any], latest_tool_call: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """合并工具开始与结束摘要，确保前端能把 running 卡片正确更新为终态。"""
+    latest = dict(latest_tool_call or {})
+    merged = {
+        **dict(active_tool_call or {}),
+        **latest,
+    }
+    merged["tool_name"] = merged.get("tool_name") or active_tool_call.get("tool_name") or "unknown"
+    status = str(merged.get("status") or "").strip()
+    if status in {"running", "pending", "waiting_confirmation"}:
+        status = "success"
+    merged["status"] = status or "success"
+    merged["arguments"] = dict(merged.get("arguments") or active_tool_call.get("arguments") or {})
+    merged["trace"] = {
+        **dict(active_tool_call.get("trace") or {}),
+        **dict(merged.get("trace") or {}),
+    }
+    return merged
 
 
 def _should_emit_tool_call(state: Optional[AgentState]) -> bool:

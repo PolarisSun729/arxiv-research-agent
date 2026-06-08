@@ -239,7 +239,7 @@ function getPreferenceActionLabel(result: AgentPreferenceActionResult | null) {
         <span>Pending Action</span>
         <span class="agent-collapse__count">{{ pendingAction ? 1 : 0 }}</span>
       </summary>
-      <div v-if="!pendingAction" class="empty-state">鏆傛棤寰呯‘璁や换鍔?</div>
+      <div v-if="!pendingAction" class="empty-state">暂无待确认任务</div>
       <div v-else class="pending-action-detail">
         <div class="pending-action-detail__grid">
           <div><strong>tool</strong>: {{ pendingAction.tool_name || '-' }}</div>
@@ -259,7 +259,7 @@ function getPreferenceActionLabel(result: AgentPreferenceActionResult | null) {
         <span>Paper QA Result</span>
         <span class="agent-collapse__count">{{ paperQaResult ? 1 : 0 }}</span>
       </summary>
-      <div v-if="!paperQaResult" class="empty-state">鏆傛棤 paper qa 缁撴灉</div>
+      <div v-if="!paperQaResult" class="empty-state">暂无 paper qa 结果</div>
       <pre v-else class="json-block">{{ formatJson(paperQaResult) }}</pre>
     </details>
 

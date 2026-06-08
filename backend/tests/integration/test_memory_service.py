@@ -203,6 +203,31 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(loaded["merged_context"]["selected_paper"]["arxiv_id"], "frontend-paper")
         self.assertEqual(loaded["merged_context"]["ui_state"], "detail")
 
+    def test_agent_memory_prefers_current_paper_qa_target_over_stale_selected_paper(self) -> None:
+        final_state = {
+            "intent": "paper_qa",
+            "answer": "Second paper answer.",
+            "context": {
+                # 前端默认 selected_paper 可能仍是搜索列表第一篇；会话焦点应以本轮 QA 目标为准。
+                "selected_paper": {"arxiv_id": "2401.00001", "title": "First Paper"},
+                "last_papers": [
+                    {"arxiv_id": "2401.00001", "title": "First Paper"},
+                    {"arxiv_id": "2401.00002", "title": "Second Paper"},
+                ],
+            },
+            "paper_qa_result": {
+                "arxiv_id": "2401.00002",
+                "title": "Second Paper",
+                "answer": "grounded answer",
+            },
+        }
+
+        saved = self.memory_service.save_agent_memory(self.user_id, "agent-session-ordinal", final_state)
+
+        self.assertEqual(saved["active_arxiv_id"], "2401.00002")
+        self.assertEqual(saved["selected_paper"]["arxiv_id"], "2401.00002")
+        self.assertEqual(saved["selected_paper"]["title"], "Second Paper")
+
 
 if __name__ == "__main__":
     unittest.main()

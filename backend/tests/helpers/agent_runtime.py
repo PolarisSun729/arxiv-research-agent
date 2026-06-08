@@ -63,6 +63,36 @@ class FakeDatabaseService:
     def get_user_research_profile(self, **_kwargs: Any) -> Dict[str, Any]:
         return {}
 
+    def get_langgraph_checkpoint(self, **_kwargs: Any) -> Optional[Dict[str, Any]]:
+        return None
+
+    def list_langgraph_checkpoints(self, **_kwargs: Any) -> list:
+        return []
+
+    def put_langgraph_checkpoint(self, **_kwargs: Any) -> bool:
+        return True
+
+    def put_langgraph_checkpoint_writes(self, **_kwargs: Any) -> bool:
+        return True
+
+    def get_langgraph_checkpoint_writes(self, **_kwargs: Any) -> list:
+        return []
+
+    def upsert_agent_runtime_checkpoint(self, **kwargs: Any) -> Dict[str, Any]:
+        return dict(kwargs)
+
+    def get_agent_runtime_checkpoint(self, **_kwargs: Any) -> Optional[Dict[str, Any]]:
+        return None
+
+    def mark_agent_runtime_checkpoint_status(self, **_kwargs: Any) -> bool:
+        return True
+
+    def expire_agent_runtime_checkpoints(self, **_kwargs: Any) -> int:
+        return 0
+
+    def cleanup_agent_runtime_checkpoints(self, **_kwargs: Any) -> int:
+        return 0
+
 
 def _ensure_backend_packages() -> Path:
     repo_root = Path(__file__).resolve().parents[2]
@@ -234,6 +264,12 @@ def _ensure_dependency_stubs() -> None:
             "llm_plan_fallback_to_rule": True,
             "llm_plan_fallback_to_template": True,
             "expose_planner_debug": True,
+        }
+    if not hasattr(config_module, "get_agent_runtime_checkpoint_config"):
+        config_module.get_agent_runtime_checkpoint_config = lambda: {
+            "backend": "sqlite",
+            "ttl_seconds": 24 * 60 * 60,
+            "cleanup_retention_days": 7,
         }
     sys.modules["utils.config"] = config_module
 
@@ -442,6 +478,7 @@ def load_agent_test_modules() -> Dict[str, Any]:
         "backend.agents.arxiv_search_agent.planner",
         "backend.agents.arxiv_search_agent.plan_validator",
         "backend.agents.arxiv_search_agent.replanner",
+        "backend.agents.arxiv_search_agent.runtime_checkpoint",
         "backend.agents.arxiv_search_agent.plan_executor",
         "backend.agents.arxiv_search_agent.tool_registry",
         "backend.agents.arxiv_search_agent.node.tool_node",
@@ -491,6 +528,7 @@ def load_agent_test_modules() -> Dict[str, Any]:
     _load_module("backend.agents.arxiv_search_agent.node.preference_node", node_dir / "preference_node.py")
     _load_module("backend.agents.arxiv_search_agent.node.paper_reading_node", node_dir / "paper_reading_node.py")
     _load_module("backend.agents.arxiv_search_agent.node.response_node", node_dir / "response_node.py")
+    _load_module("backend.agents.arxiv_search_agent.runtime_checkpoint", agent_dir / "runtime_checkpoint.py")
 
     node_package = sys.modules["backend.agents.arxiv_search_agent.node"]
     node_package._coerce_state = sys.modules["backend.agents.arxiv_search_agent.utils.state_utils"]._coerce_state
@@ -526,6 +564,7 @@ def load_agent_test_modules() -> Dict[str, Any]:
         "state_module": state_module,
         "graph_module": graph_module,
         "service_module": service_module,
+        "runtime_checkpoint_module": sys.modules["backend.agents.arxiv_search_agent.runtime_checkpoint"],
         "router_module": router_module,
         "tool_node_module": sys.modules["backend.agents.arxiv_search_agent.node.tool_node"],
         "tool_registry_module": sys.modules["tools.tool_registry"],

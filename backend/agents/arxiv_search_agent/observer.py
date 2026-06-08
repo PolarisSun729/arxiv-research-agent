@@ -5,13 +5,35 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .schemas import FailureCategory, ObservationResult, PlanRuntime, PlanStep, RecoveryActionType, RecoverySeverity
 from .state import AgentState
+from .tool_adapters.models import ToolExecutionResult
 
 
 def _tokenize(text: Any) -> List[str]:
     return [token for token in re.findall(r"[a-zA-Z0-9\u4e00-\u9fff]+", str(text or "").lower()) if len(token) >= 2]
 
 
+def _tool_result_payload(value: Any) -> Any:
+    """兼容 ToolExecutionResult 实例和 checkpoint 后的 dict envelope。"""
+    if isinstance(value, ToolExecutionResult):
+        return value.model_dump()
+    if isinstance(value, Mapping) and {"ok", "tool_name", "adapter_name"}.issubset(set(value.keys())):
+        return dict(value)
+    return None
+
+
+def _unwrap_payload(value: Any) -> Any:
+    """业务观察只读取工具 data，避免被统一 envelope 外层字段干扰。"""
+    tool_payload = _tool_result_payload(value)
+    if isinstance(tool_payload, Mapping):
+        return tool_payload.get("data")
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return model_dump()
+    return value
+
+
 def _extract_papers(value: Any) -> List[Dict[str, Any]]:
+    value = _unwrap_payload(value)
     if isinstance(value, Mapping):
         papers = value.get("papers")
         if isinstance(papers, list):
@@ -43,6 +65,29 @@ def _recovery_semantics(
     }
 
 
+def _tool_recovery_types(suggested_recovery: Any, *, retryable: bool) -> List[RecoveryActionType]:
+    """把 ToolError.suggested_recovery 映射到 Replanner 可识别的恢复动作。"""
+    normalized = str(suggested_recovery or "").strip()
+    if normalized in {"ask_clarification", "request_confirmation", "fallback_answer", "abort_with_error", "retry_step"}:
+        return [normalized]  # type: ignore[list-item]
+    if retryable:
+        return ["retry_step"]
+    return ["fallback_answer"]
+
+
+def _tool_failure_category(error_code: str, suggested_recovery: Any) -> FailureCategory:
+    """根据结构化 ToolError 选择恢复分类，避免 Replanner 继续解析错误字符串。"""
+    if error_code == "output_validation_error":
+        return "tool_invalid_output"
+    if error_code in {"input_validation_error", "missing_arxiv_id"}:
+        return "ambiguous_user_request"
+    if error_code == "preference_target_missing":
+        return "preference_target_missing"
+    if str(suggested_recovery or "").strip() == "ask_clarification":
+        return "ambiguous_user_request"
+    return "tool_runtime_error"
+
+
 class Observer:
     """区分“工具执行成功”和“结果质量达标”，为后续重规划提供统一语义。"""
 
@@ -57,6 +102,27 @@ class Observer:
         state: AgentState,
         error: Optional[str] = None,
     ) -> ObservationResult:
+        tool_payload = _tool_result_payload(raw_output)
+        if isinstance(tool_payload, Mapping) and not bool(tool_payload.get("ok", True)):
+            tool_error = tool_payload.get("error") if isinstance(tool_payload.get("error"), Mapping) else None
+            error_code = str((tool_error or {}).get("error_code") or "tool_failed")
+            suggested_recovery = (tool_error or {}).get("suggested_recovery")
+            retryable = bool((tool_error or {}).get("retryable"))
+            recoverable = bool((tool_error or {}).get("recoverable", True))
+            return ObservationResult(
+                status="tool_error",
+                reason=error_code,
+                confidence=0.0,
+                suggested_action=suggested_recovery or "fallback",
+                **_recovery_semantics(
+                    failure_category=_tool_failure_category(error_code, suggested_recovery),
+                    severity="error",
+                    suggested_recovery_types=_tool_recovery_types(suggested_recovery, retryable=retryable),
+                    evidence={"tool_error": tool_error},
+                    retryable=retryable,
+                    recoverable=recoverable,
+                ),
+            )
         if error:
             error_text = str(error or "")
             timeout_like = "timeout" in error_text.lower() or "timed out" in error_text.lower() or "超时" in error_text
@@ -173,6 +239,7 @@ class Observer:
 
     def _observe_check_paper_index(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
         del resolved_input, raw_output, runtime, state
+        normalized_output = _unwrap_payload(normalized_output)
         payload = normalized_output if isinstance(normalized_output, Mapping) else {}
         status = str(payload.get("status") or "").lower()
         has_index = bool(payload.get("has_index"))
@@ -235,6 +302,7 @@ class Observer:
 
     def _observe_answer_paper_question(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
         del resolved_input, raw_output, runtime, state
+        normalized_output = _unwrap_payload(normalized_output)
         payload = normalized_output if isinstance(normalized_output, Mapping) else {}
         answer = str(payload.get("answer") or "").strip()
         sources = payload.get("sources")
@@ -271,6 +339,7 @@ class Observer:
 
     def _observe_load_user_profile(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
         del resolved_input, raw_output, runtime, state
+        normalized_output = _unwrap_payload(normalized_output)
         payload = normalized_output if isinstance(normalized_output, Mapping) else {}
         profile = payload.get("research_profile") if isinstance(payload.get("research_profile"), Mapping) else {}
         summary = payload.get("user_memory_summary")
@@ -293,6 +362,7 @@ class Observer:
 
     def _observe_generate_recommendations(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
         del resolved_input, raw_output, runtime, state
+        normalized_output = _unwrap_payload(normalized_output)
         payload = normalized_output if isinstance(normalized_output, Mapping) else {}
         recommendations = list(payload.get("recommendations") or [])
         if not recommendations:
@@ -327,6 +397,7 @@ class Observer:
 
     def _observe_update_preference_store(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
         del raw_output, runtime, state
+        normalized_output = _unwrap_payload(normalized_output)
         payload = normalized_output if isinstance(normalized_output, Mapping) else {}
         if not str(payload.get("arxiv_id") or "").strip():
             return ObservationResult(

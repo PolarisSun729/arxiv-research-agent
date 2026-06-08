@@ -48,15 +48,11 @@ def test_run_agent_turn_arxiv_search_success(monkeypatch) -> None:
 
     assert result.status == "success"
     assert result.final_answer
-    assert _step_ids(result) == [
-        "normalize_request",
-        "build_arxiv_search_spec",
-        "search_arxiv",
-        "validate_arxiv_results",
-        "personalize_paper_results",
-        "synthesize_arxiv_response",
-    ]
-    assert {"search_spec", "arxiv_results", "ranked_papers"}.issubset(result.outputs.keys())
+    step_ids = _step_ids(result)
+    assert step_ids[:4] == ["normalize_request", "build_arxiv_search_spec", "search_arxiv", "validate_arxiv_results"]
+    assert step_ids[-1] == "synthesize_arxiv_response"
+    assert "personalize_paper_results" not in step_ids or step_ids.index("personalize_paper_results") < step_ids.index("synthesize_arxiv_response")
+    assert {"search_spec", "arxiv_results", "final_answer"}.issubset(result.outputs.keys())
 
 
 def test_run_agent_turn_arxiv_empty_result_replans(monkeypatch) -> None:
@@ -113,6 +109,86 @@ def test_run_agent_turn_paper_qa_available_index(monkeypatch) -> None:
     assert result.outputs["paper_qa_result"]["retrieval_debug"] == {"route": "hybrid"}
     assert not {"retrieved_chunks", "reranked_chunks", "draft_answer"}.intersection(result.outputs.keys())
     assert not any(trace.step_id == "request_confirmation" for trace in result.trace)
+
+
+def test_run_agent_turn_paper_qa_ordinal_uses_last_papers_over_selected(monkeypatch) -> None:
+    answer_calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        if tool_name == "check_paper_qa_index":
+            assert kwargs["arxiv_id"] == "2401.00002"
+            return {"ok": True, "tool_name": tool_name, "summary": "available", "data": {"status": "available", "has_index": True}, "trace": {}, "error": None}
+        if tool_name == "answer_paper_question":
+            answer_calls.append(dict(kwargs))
+            return {
+                "ok": True,
+                "tool_name": tool_name,
+                "summary": "answered",
+                "data": {"answer": "second paper answer", "sources": [{"chunk_id": "c2"}], "retrieval_debug": {}},
+                "trace": {},
+                "error": None,
+            }
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    result = run_agent_turn(
+        AgentState(
+            intent="paper_qa",
+            message="这第2篇论文的方法是什么？",
+            context={
+                # 前端会默认把第一篇作为 selected_paper；序号引用必须以 last_papers 为准。
+                "selected_paper": {"arxiv_id": "2401.00001", "title": "First Paper"},
+                "last_papers": [
+                    {"arxiv_id": "2401.00001", "title": "First Paper"},
+                    {"arxiv_id": "2401.00002", "title": "Second Paper"},
+                ],
+            },
+        )
+    )
+
+    assert result.status == "success"
+    assert result.outputs["paper_ref"]["arxiv_id"] == "2401.00002"
+    assert result.outputs["paper_ref"]["title"] == "Second Paper"
+    assert answer_calls == [{"arxiv_id": "2401.00002", "question": "这第2篇论文的方法是什么？"}]
+
+
+def test_run_agent_turn_preference_action_ordinal_uses_last_papers_over_selected(monkeypatch) -> None:
+    preference_calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        if tool_name == "record_paper_preference":
+            preference_calls.append(dict(kwargs))
+            return {"ok": True, "tool_name": tool_name, "summary": "recorded", "data": {"ok": True}, "trace": {}, "error": None}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    result = run_agent_turn(
+        AgentState(
+            intent="preference_action",
+            message="喜欢这第2篇论文",
+            context={
+                # 偏好写入是持久化动作，序号解析必须使用最近列表而不是默认选中第一篇。
+                "selected_paper": {"arxiv_id": "2401.00001", "title": "First Paper"},
+                "last_papers": [
+                    {"arxiv_id": "2401.00001", "title": "First Paper"},
+                    {"arxiv_id": "2401.00002", "title": "Second Paper"},
+                ],
+            },
+        )
+    )
+
+    assert result.status == "success"
+    assert result.outputs["paper_reference"]["arxiv_id"] == "2401.00002"
+    assert preference_calls == [
+        {
+            "user_id": "",
+            "arxiv_id": "2401.00002",
+            "liked": True,
+            "paper": {"arxiv_id": "2401.00002", "title": "Second Paper", "query": None, "matched_by": None, "source": None},
+        }
+    ]
 
 
 def test_run_agent_turn_paper_qa_missing_index_waits_for_confirmation(monkeypatch) -> None:

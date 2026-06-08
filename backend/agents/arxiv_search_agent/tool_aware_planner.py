@@ -592,6 +592,8 @@ class RuleBasedToolAwarePlanBuilder:
                 input_bindings=[
                     _binding_dict("message", source_type="state", source_key="message"),
                     _binding_dict("selected_paper", source_type="context", source_key="selected_paper", required=False),
+                    # resolve_paper 需要完整上下文里的 last_papers，才能稳定处理“第二篇”等序号引用。
+                    _binding_dict("context", source_type="state", source_key="context", required=False),
                 ],
             ),
             self._draft_step(
@@ -724,7 +726,12 @@ class RuleBasedToolAwarePlanBuilder:
                 action_type="retrieve",
                 output_key="paper_reference",
                 reason="写入偏好前必须先解析目标论文，避免无目标持久化写入。",
-                input_bindings=[_binding_dict("message", source_type="state", source_key="message")],
+                input_bindings=[
+                    _binding_dict("message", source_type="state", source_key="message"),
+                    _binding_dict("selected_paper", source_type="context", source_key="selected_paper", required=False),
+                    # 偏好动作也会用“喜欢第二篇”这种说法，必须把最近搜索列表传给解析器。
+                    _binding_dict("context", source_type="state", source_key="context", required=False),
+                ],
             ),
             self._draft_step(
                 "update_preference_store",

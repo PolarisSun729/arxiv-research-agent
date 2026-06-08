@@ -379,14 +379,15 @@ def _extract_max_results(message: str) -> int:
 def _extract_sorting(message: str) -> Tuple[str, str]:
     """从消息中推断排序字段与方向。
 
-    当前只做轻量规则判断：偏相关性时走 relevance，提到最新/最近时走 submittedDate。
+    “最近/近 N 天”通常是时间过滤条件，不应自动压过主题相关性；只有用户明确
+    表达“按最新/最新论文”时才切到 submittedDate。
     """
     lowered = message.lower()
     if any(keyword in lowered for keyword in ("最相关", "相关度高", "most relevant", "relevant", "relevance")):
         return "relevance", "descending"
-    if any(keyword in lowered for keyword in ("最新", "最近", "latest", "newest", "recent")):
+    if any(keyword in lowered for keyword in ("最新", "latest", "newest")):
         return "submittedDate", "descending"
-    return "submittedDate", "descending"
+    return "relevance", "descending"
 
 
 def _build_reasoning_summary(

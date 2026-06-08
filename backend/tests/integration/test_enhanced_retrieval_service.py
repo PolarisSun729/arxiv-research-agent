@@ -35,6 +35,14 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
         self.assertIn("fused_top30", debug["stages"])
         self.assertIn("final_context_top15", debug["stages"])
         self.assertIn("query_profile", debug)
+        self.assertIn("collection_profile", debug)
+        self.assertIn("profile_cache_hit", debug["collection_profile"])
+        self.assertEqual(debug["collection_profile"]["vector_dimension"], 3)
+        self.assertIn("embedding_batch", debug)
+        self.assertEqual(debug["embedding_batch"]["status"], "ok")
+        self.assertIn("route_metrics", debug)
+        self.assertEqual(debug["route_metrics"]["vector_original"]["status"], "ok")
+        self.assertIn("latency_ms", debug["route_metrics"]["keyword"])
 
     def test_enhanced_retrieve_fuses_routes_dedupes_and_preserves_source_fields(self) -> None:
         result = self.service.enhanced_retrieve(
@@ -86,6 +94,7 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
         self.assertIn("fused_top30", debug["stages"])
         self.assertIn("final_context_top15", debug["stages"])
         self.assertIn("routes", debug)
+        self.assertIn("collection_profile", debug)
 
 
 if __name__ == "__main__":

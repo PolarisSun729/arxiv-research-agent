@@ -110,6 +110,22 @@ function upsertToolCall(response: ArxivSearchResponse, toolCall: AgentToolCall) 
   response.tool_calls.push(toolCall)
 }
 
+function normalizePendingActionForDisplay(action: Record<string, any> | null | undefined) {
+  // pending_action 只是后端确认请求的展示镜像；批准后的 approved/cancelled 中间态不能继续当待确认卡片展示。
+  if (!action || typeof action !== 'object') return null
+  return action.status === 'waiting_confirmation' ? action : null
+}
+
+function applyFinalResponse(response: ArxivSearchResponse, finalResponse: Record<string, any>) {
+  const existingToolCalls = Array.isArray(response.tool_calls) ? [...response.tool_calls] : []
+  Object.assign(response, finalResponse)
+  if ((!Array.isArray(response.tool_calls) || response.tool_calls.length === 0) && existingToolCalls.length) {
+    // 兼容旧后端或异常路径：最终响应缺少 tool_calls 时，保留流式阶段已经展示的工具进度。
+    response.tool_calls = existingToolCalls
+  }
+  response.pending_action = normalizePendingActionForDisplay(response.pending_action)
+}
+
 function applyStreamEvent(
   target: AgentChatMessage<ArxivSearchResponse>,
   event: AgentStreamEvent
@@ -165,7 +181,7 @@ function applyStreamEvent(
         response.search_spec = event.data.state.search_spec
       }
       if (Object.prototype.hasOwnProperty.call(event.data.state, 'pending_action')) {
-        response.pending_action = event.data.state.pending_action || null
+        response.pending_action = normalizePendingActionForDisplay(event.data.state.pending_action)
       }
       if (Object.prototype.hasOwnProperty.call(event.data.state, 'paper_qa_result')) {
         response.paper_qa_result = event.data.state.paper_qa_result || null
@@ -221,7 +237,7 @@ function applyStreamEvent(
   if (event.event_type === 'final_response') {
     const finalResponse = event.data?.response
     if (finalResponse && typeof finalResponse === 'object') {
-      Object.assign(response, finalResponse)
+      applyFinalResponse(response, finalResponse)
       response.streaming_state = {
         run_id: event.run_id,
         sequence: event.sequence,
@@ -237,7 +253,7 @@ function applyStreamEvent(
   if (event.event_type === 'exception') {
     const exceptionResponse = event.data?.response
     if (exceptionResponse && typeof exceptionResponse === 'object') {
-      Object.assign(response, exceptionResponse)
+      applyFinalResponse(response, exceptionResponse)
       target.content = response.answer || String(event.data?.detail || 'Agent 流式请求失败')
     }
     target.error = String(event.data?.detail || 'Agent 流式请求失败')
@@ -247,7 +263,7 @@ function applyStreamEvent(
   if (event.event_type === 'stream_end') {
     const finalResponse = event.data?.response
     if (finalResponse && typeof finalResponse === 'object') {
-      Object.assign(response, finalResponse)
+      applyFinalResponse(response, finalResponse)
       target.content = response.answer || target.content
     }
     target.loading = false
@@ -375,8 +391,9 @@ export function useAgentSearchChat() {
     }
 
     const resultStatus = response?.paper_qa_result?.status
-    if (response?.pending_action && resultStatus === 'waiting_confirmation') {
-      pendingAction.value = { ...response.pending_action }
+    const displayPendingAction = normalizePendingActionForDisplay(response?.pending_action)
+    if (displayPendingAction && resultStatus === 'waiting_confirmation') {
+      pendingAction.value = { ...displayPendingAction }
       return
     }
 
@@ -407,6 +424,7 @@ export function useAgentSearchChat() {
     rawMessage?: string,
     options?: {
       resume?: AgentResumePayload
+      optimisticToolCall?: AgentToolCall
     }
   ) {
     const message = (rawMessage ?? inputMessage.value).trim()
@@ -435,6 +453,17 @@ export function useAgentSearchChat() {
       createdAt,
       response: createDraftResponse(),
       error: null
+    }
+    if (options?.optimisticToolCall) {
+      // resume approve 后后端会立刻进入耗时工具，先放一张 running 卡片，避免用户误以为点击没有生效。
+      assistantMessage.response?.tool_calls.push(options.optimisticToolCall)
+      assistantMessage.response!.streaming_state = {
+        run_id: assistantId,
+        sequence: 0,
+        event_type: 'optimistic_tool_call',
+        active_step: options.optimisticToolCall.trace?.step_id || null,
+        active_tool_call: options.optimisticToolCall
+      }
     }
 
     messages.value.push(userMessage, assistantMessage)
@@ -580,19 +609,34 @@ export function useAgentSearchChat() {
   async function submitResume(decision: ResumeDecision, note?: string) {
     if (!pendingAction.value || loading.value) return
     const confirmationRequest = pendingAction.value.confirmation_request || {}
+    const currentPendingAction = { ...pendingAction.value }
     const resumePayload: AgentResumePayload = {
       decision,
       note: note || null,
-      step_id: pendingAction.value.step_id || confirmationRequest.step_id || null,
-      interrupt_id: pendingAction.value.interrupt_id || confirmationRequest.interrupt_id || null
+      step_id: currentPendingAction.step_id || confirmationRequest.step_id || null,
+      interrupt_id: currentPendingAction.interrupt_id || confirmationRequest.interrupt_id || null
     }
-    if (pendingAction.value.edited_arguments) {
-      resumePayload.edited_arguments = { ...pendingAction.value.edited_arguments }
+    if (currentPendingAction.edited_arguments) {
+      resumePayload.edited_arguments = { ...currentPendingAction.edited_arguments }
     }
+    pendingAction.value = null
 
     await submitMessage(decision === 'approve' ? '确认执行当前工具操作' : '拒绝执行当前工具操作', {
       // 确认按钮必须走结构化 resume；message 只是满足后端请求模型的可读占位文本。
-      resume: resumePayload
+      resume: resumePayload,
+      optimisticToolCall: decision === 'approve'
+        ? {
+            tool_name: String(currentPendingAction.tool_name || 'parse_and_index_paper'),
+            arguments: currentPendingAction.arguments_summary || {},
+            status: 'running',
+            summary: '用户已确认，正在执行索引构建工具',
+            trace: {
+              step_id: resumePayload.step_id,
+              source: 'resume_approve'
+            },
+            error: null
+          }
+        : undefined
     })
   }
 

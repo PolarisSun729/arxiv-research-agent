@@ -231,6 +231,8 @@ def _make_plan(goal: Goal, *, steps: List[PlanStep]) -> ExecutablePlan:
             "built_at": datetime.utcnow().isoformat(timespec="seconds"),
             "goal_type": goal.goal_type,
             "goal_id": goal.goal_id,
+            # 计划只记录 contract 来源摘要；具体 adapter 函数不进入可序列化 plan。
+            "tool_contract_source": _tool_contract_source_summary(steps),
         },
     )
 
@@ -426,7 +428,20 @@ class PaperQAPlanBuilder:
 
     def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
         steps = [
-            _build_plan_step(step_id="resolve_paper", action_type="retrieve", tool_name="resolve_paper", output_key="paper_ref", tool_registry=tool_registry, input_bindings=[_binding("message", source_type="state", source_key="message"), _binding("selected_paper", source_type="context", source_key="selected_paper", required=False)]),
+            _build_plan_step(
+                step_id="resolve_paper",
+                action_type="retrieve",
+                tool_name="resolve_paper",
+                output_key="paper_ref",
+                tool_registry=tool_registry,
+                # 目标论文解析既要看当前选中论文，也要看 last_papers；
+                # 显式绑定完整 context，避免“第二篇”这类序号引用退回到默认 selected_paper。
+                input_bindings=[
+                    _binding("message", source_type="state", source_key="message"),
+                    _binding("selected_paper", source_type="context", source_key="selected_paper", required=False),
+                    _binding("context", source_type="state", source_key="context", required=False),
+                ],
+            ),
             _build_plan_step(step_id="check_paper_index", action_type="validate", tool_name="check_paper_index", output_key="paper_index_status", tool_registry=tool_registry, input_bindings=[_binding("paper_ref", source_type="step_output", step_id="resolve_paper")], depends_on=["resolve_paper"]),
             # Agent 只负责调度真实 PaperQA 工具；检索、重写、rerank 和 grounding 校验均由 PaperQAService 内部完成。
             _build_plan_step(step_id="answer_paper_question", action_type="answer", tool_name="answer_paper_question", output_key="paper_qa_result", tool_registry=tool_registry, input_bindings=[_binding("paper_ref", source_type="step_output", step_id="resolve_paper"), _binding("message", source_type="state", source_key="message")], depends_on=["resolve_paper", "check_paper_index"]),
@@ -457,7 +472,19 @@ class PreferenceActionPlanBuilder:
         # 偏好计划只声明真实发生的持久化写入；兴趣画像/向量重建应走显式推荐接口，
         # 不能在 Agent 里追加没有实际同步实现的“成功步骤”。
         steps = [
-            _build_plan_step(step_id="resolve_preference_target", action_type="retrieve", tool_name="resolve_preference_target", output_key="paper_reference", tool_registry=tool_registry, input_bindings=[_binding("message", source_type="state", source_key="message")]),
+            _build_plan_step(
+                step_id="resolve_preference_target",
+                action_type="retrieve",
+                tool_name="resolve_preference_target",
+                output_key="paper_reference",
+                tool_registry=tool_registry,
+                # 偏好写入同样支持“第一篇/第二篇”，必须让解析器拿到最近论文列表。
+                input_bindings=[
+                    _binding("message", source_type="state", source_key="message"),
+                    _binding("selected_paper", source_type="context", source_key="selected_paper", required=False),
+                    _binding("context", source_type="state", source_key="context", required=False),
+                ],
+            ),
             _build_plan_step(step_id="update_preference_store", action_type="write_state", tool_name="update_preference_store", output_key="preference_action_result", tool_registry=tool_registry, input_bindings=[_binding("paper_reference", source_type="step_output", step_id="resolve_preference_target"), _binding("message", source_type="state", source_key="message")], depends_on=["resolve_preference_target"], side_effect_level="persistent_write"),
             _build_plan_step(step_id="verify_preference_update", action_type="validate", tool_name="verify_preference_update", output_key="verified_preference_update", tool_registry=tool_registry, input_bindings=[_binding("preference_action_result", source_type="step_output", step_id="update_preference_store")], depends_on=["update_preference_store"]),
             _build_plan_step(step_id="synthesize_preference_response", action_type="answer", tool_name="synthesize_preference_response", output_key="final_answer", tool_registry=tool_registry, input_bindings=[_binding("verified_preference_update", source_type="step_output", step_id="verify_preference_update")], depends_on=["verify_preference_update"]),
@@ -523,7 +550,7 @@ def _build_fixed_template_plan(goal: Goal, state: AgentState, tool_registry: Too
     return plan, builder
 
 
-def _fixed_template_debug(goal: Goal, plan: ExecutablePlan, builder: PlanBuilder, *, planner_mode: str) -> Dict[str, Any]:
+def _fixed_template_debug(goal: Goal, plan: ExecutablePlan, builder: PlanBuilder, *, planner_mode: str, tool_registry: ToolRegistry) -> Dict[str, Any]:
     return {
         "planner_mode": planner_mode,
         "goal": goal.model_dump(),
@@ -544,6 +571,8 @@ def _fixed_template_debug(goal: Goal, plan: ExecutablePlan, builder: PlanBuilder
         "final_plan_source": "fixed_template",
         "selected_plan_source": "fixed_template",
         "tool_risk_summary": {},
+        "tool_contract_source": _tool_contract_source_summary(plan.steps),
+        "tool_contract_matrix": tool_registry.tool_contract_matrix(),
         "confirmation_required_steps": _confirmation_required_step_ids(plan),
         "plan_builder": builder.__class__.__name__,
         "execution_plan": plan.model_dump(),
@@ -561,11 +590,26 @@ def _debug_steps_from_plan(plan: ExecutablePlan) -> List[Dict[str, Any]]:
         {
             "step_id": step.step_id,
             "tool_name": step.tool_name,
+            "contract_source": step.tool.contract_source,
+            "adapter": step.tool.adapter,
+            "backend_tool_name": step.tool.backend_tool_name,
             "side_effect_level": step.side_effect_level,
             "requires_confirmation": bool(step.confirmation_policy and step.confirmation_policy.requires_confirmation),
         }
         for step in list(plan.steps or [])
     ]
+
+
+def _tool_contract_source_summary(steps: Sequence[PlanStep]) -> Dict[str, Any]:
+    """在 planner debug 中显式暴露工具来源，确认计划与执行读取同一份 contract。"""
+    return {
+        step.tool_name: {
+            "contract_source": step.tool.contract_source,
+            "adapter": step.tool.adapter,
+            "backend_tool_name": step.tool.backend_tool_name,
+        }
+        for step in list(steps or [])
+    }
 
 
 def _confirmation_required_step_ids(plan: ExecutablePlan) -> List[str]:
@@ -599,6 +643,8 @@ def _fallback_to_template_or_unsupported(
                     "final_plan_source": "fixed_template_fallback",
                     "selected_plan_source": "fixed_template_fallback",
                     "plan_builder": builder.__class__.__name__,
+                    "tool_contract_source": _tool_contract_source_summary(plan.steps),
+                    "tool_contract_matrix": tool_registry.tool_contract_matrix(),
                     "confirmation_required_steps": _confirmation_required_step_ids(plan),
                     "execution_plan": plan.model_dump(),
                 }
@@ -619,6 +665,8 @@ def _fallback_to_template_or_unsupported(
             "final_plan_source": "unsupported_fallback",
             "selected_plan_source": "unsupported_fallback",
             "plan_builder": builder.__class__.__name__,
+            "tool_contract_source": _tool_contract_source_summary(plan.steps),
+            "tool_contract_matrix": tool_registry.tool_contract_matrix(),
             "confirmation_required_steps": _confirmation_required_step_ids(plan),
             "execution_plan": plan.model_dump(),
         }
@@ -636,12 +684,36 @@ def build_executable_plan(
 ) -> tuple[Goal, ExecutablePlan, Dict[str, Any]]:
     """统一 planner 入口：可选启用 Tool-Aware 草稿层，最终始终产出已校验 ExecutablePlan。"""
     goal = GoalBuilder.from_state(state)
+    return build_executable_plan_for_goal(
+        goal,
+        state,
+        tool_registry=tool_registry,
+        enable_tool_aware_planner=enable_tool_aware_planner,
+        enable_llm_plan_draft=enable_llm_plan_draft,
+        llm_generation_service=llm_generation_service,
+    )
+
+
+def build_executable_plan_for_goal(
+    goal: Goal,
+    state: AgentState,
+    tool_registry: ToolRegistry = PLANNER_TOOL_REGISTRY,
+    *,
+    enable_tool_aware_planner: Optional[bool] = None,
+    enable_llm_plan_draft: Optional[bool] = None,
+    llm_generation_service: Any = None,
+) -> tuple[Goal, ExecutablePlan, Dict[str, Any]]:
+    """基于已构建 Goal 生成计划，供显式 LangGraph planning 节点复用。
+
+    build_goal 节点已经把目标作为一等状态写入 AgentState；planning 节点应消费该目标，
+    而不是再次从 state 推断，避免图上 goal 节点变成只做展示的空节点。
+    """
 
     if not _is_tool_aware_planner_enabled(enable_tool_aware_planner):
         plan, builder = _build_fixed_template_plan(goal, state, tool_registry)
         # 固定模板路径保持原行为，但仍通过统一校验器守住 Executor 入口边界。
         PlanValidator().validate(plan, tool_registry)
-        return goal, plan, _fixed_template_debug(goal, plan, builder, planner_mode="fixed_template")
+        return goal, plan, _fixed_template_debug(goal, plan, builder, planner_mode="fixed_template", tool_registry=tool_registry)
 
     planner_config = _get_agent_planner_runtime_config()
     llm_enabled = bool(planner_config.get("enable_llm_plan_draft", False)) if enable_llm_plan_draft is None else bool(enable_llm_plan_draft)
@@ -673,6 +745,8 @@ def build_executable_plan(
         "selected_plan_source": None,
         "tool_selection": selection.model_dump(),
         "tool_risk_summary": dict(selection.risk_summary or {}),
+        "tool_contract_source": {},
+        "tool_contract_matrix": tool_registry.tool_contract_matrix(),
         "confirmation_required_steps": [],
     }
 
@@ -697,6 +771,7 @@ def build_executable_plan(
                     "final_plan_source": "llm_tool_aware",
                     "selected_plan_source": "llm_tool_aware",
                     "selected_steps": _debug_steps_from_plan(plan),
+                    "tool_contract_source": _tool_contract_source_summary(plan.steps),
                     "confirmation_required_steps": _confirmation_required_step_ids(plan),
                     "execution_plan": plan.model_dump(),
                 }
@@ -740,6 +815,8 @@ def build_executable_plan(
                 "validation_status": "passed",
                 "final_plan_source": "tool_aware_rule_based",
                 "selected_plan_source": "tool_aware_rule_based",
+                "selected_steps": _debug_steps_from_plan(plan),
+                "tool_contract_source": _tool_contract_source_summary(plan.steps),
                 "confirmation_required_steps": _confirmation_required_step_ids(plan),
                 "execution_plan": plan.model_dump(),
             }
@@ -763,5 +840,6 @@ __all__ = [
     "PlanBuilderRegistry",
     "PLAN_BUILDER_REGISTRY",
     "build_executable_plan",
+    "build_executable_plan_for_goal",
     "build_plan_runtime",
 ]

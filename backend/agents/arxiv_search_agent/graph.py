@@ -1,26 +1,35 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
-from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from .node import parse_search_request
-from .plan_executor import run_agent_turn, run_agent_turn_in_graph
-from .schemas import AgentStep, AgentTurnResult
+from .planner import GoalBuilder, build_executable_plan_for_goal, build_plan_runtime
+from .plan_executor import PlanExecutor, run_agent_turn_in_graph
+from .runtime_checkpoint import build_agent_checkpointer
+from .schemas import AgentRuntimeState, AgentStep, AgentTurnResult, PlanRuntime, StepExecutionResult
 from .state import AgentState
+from .tool_registry import PLANNER_TOOL_REGISTRY
 
 logger = logging.getLogger(__name__)
 
-# 默认内存 checkpointer 只创建一次，保证同一进程内同一个 thread_id 的中断状态可恢复。
-# 这里故意把“默认实例”提升到模块级，避免每次请求临时 new 一个内存存储导致 session 无法续跑。
-# 后续生产环境如果要接 Redis/数据库等持久化实现，只需要从 service 或依赖注入层传入新的 checkpointer。
-DEFAULT_GRAPH_CHECKPOINTER = InMemorySaver()
+# 默认 checkpointer 走项目数据库持久化；只有通过 AGENT_RUNTIME_CHECKPOINT_BACKEND=memory 显式切换时，
+# 才会退回进程内开发模式，避免生产路径把 resume 真源绑死在单进程内存里。
+DEFAULT_GRAPH_CHECKPOINTER = build_agent_checkpointer()
 
 _ARXIV_GRAPH_NODE_NAMES = (
     "parse_search_request",
-    "run_agent_turn",
+    "build_goal",
+    "build_plan",
+    "select_next_step",
+    "execute_step",
+    "observe_step",
+    "route_after_observation",
+    "replan",
+    "finalize",
+    "error_finalize",
 )
 
 
@@ -33,135 +42,312 @@ def _coerce_state(state: Any) -> AgentState:
     return AgentState.model_validate(state)
 
 
-def _state_from_turn_result(source_state: AgentState, result: AgentTurnResult) -> AgentState:
-    """把统一执行入口的结果回写到 AgentState，供 service/stream 复用响应适配器。"""
-    next_state = source_state.model_copy(deep=True)
-    next_state.goal = result.plan.goal if result.plan is not None else source_state.goal
-    next_state.execution_plan = result.plan
-    next_state.plan_runtime = result.runtime
-    next_state.answer = result.final_answer
-    confirmation_payload = result.pending_confirmation.model_dump() if result.pending_confirmation is not None else None
-    next_state.pending_action = _build_compatible_pending_action(result)
+def _executor() -> PlanExecutor:
+    """统一创建执行器，图节点只关心编排，不直接触碰工具注册细节。"""
+    return PlanExecutor(tool_registry=PLANNER_TOOL_REGISTRY)
 
+
+def build_goal_node(state: Any) -> AgentState:
+    """只负责把 parse 后的 intent/context 转成结构化 Goal。"""
+    current_state = _coerce_state(state)
+    next_state = current_state.model_copy(deep=True)
+    goal = GoalBuilder.from_state(next_state)
+    next_state.goal = goal
     next_state.debug = dict(next_state.debug or {})
-    next_state.debug["agent_turn"] = {
-        "status": result.status,
-        "error": result.error,
-        "output_keys": sorted(result.outputs.keys()),
-        "trace_events": [trace.event for trace in list(result.trace or [])],
-    }
-    if confirmation_payload is not None:
-        next_state.debug["pending_confirmation"] = confirmation_payload
-
-    if result.status == "waiting_confirmation":
-        next_state.paper_qa_result = {
-            "status": "waiting_confirmation",
-            "pending_confirmation": confirmation_payload,
-        }
-
-    if "preference_action_result" in result.outputs:
-        preference_result = result.outputs.get("preference_action_result")
-        next_state.preference_action_result = dict(preference_result) if isinstance(preference_result, Mapping) else {"value": preference_result}
-
-    if "paper_qa_result" in result.outputs:
-        # answer_paper_question 的输出来自 PaperQAService 真实 RAG 链路，sources/retrieval_debug 必须原样带给前端。
-        paper_qa_result = result.outputs.get("paper_qa_result")
-        next_state.paper_qa_result = _build_paper_qa_result(next_state, paper_qa_result)
-        if next_state.paper_qa_result.get("answer"):
-            next_state.answer = str(next_state.paper_qa_result.get("answer") or "")
-
-    if "ranked_papers" in result.outputs and isinstance(result.outputs.get("ranked_papers"), list):
-        next_state.papers = [dict(item) for item in result.outputs["ranked_papers"] if isinstance(item, Mapping)]
-
-    # 这里记录的是新 runtime 的单节点摘要；详细步骤以 result.trace / plan_runtime 为准。
+    next_state.debug["goal"] = goal.model_dump()
     next_state.steps = list(next_state.steps or []) + [
         AgentStep(
-            step="run_agent_turn",
-            status="success" if result.status in {"success", "waiting_confirmation", "need_clarification", "fallback"} else "failed",
-            action="execute_executable_plan",
+            step="build_goal",
+            status="success",
+            action="根据解析结果构建本轮目标",
             inputs={"intent": next_state.intent, "message": next_state.message},
-            outputs={"status": result.status, "output_keys": sorted(result.outputs.keys())},
-            error=result.error,
+            outputs={"goal_type": goal.goal_type, "risk_level": goal.risk_level},
+            error=None,
         )
     ]
     return next_state
 
 
-def _build_paper_qa_result(state: AgentState, payload: Any) -> dict[str, Any]:
-    """把真实 PaperQA 工具输出整理成前端沿用的 paper_qa_result。
-
-    这里只做字段适配，不补造 chunk 或证据；retrieval_debug/sources 均以 PaperQAService 返回为准。
-    """
-    data = dict(payload) if isinstance(payload, Mapping) else {"value": payload}
-    context = state.context if isinstance(state.context, Mapping) else {}
-    selected_paper = context.get("selected_paper") if isinstance(context.get("selected_paper"), Mapping) else {}
-    answer = str(data.get("answer") or "").strip()
-    status = str(data.get("status") or ("success" if answer else "failed")).strip() or "failed"
-    return {
-        "status": status,
-        "arxiv_id": data.get("arxiv_id") or context.get("arxiv_id") or selected_paper.get("arxiv_id"),
-        "title": data.get("title") or selected_paper.get("title"),
-        "question": data.get("question") or state.message,
-        "answer": answer,
-        "sources": data.get("sources", []),
-        "retrieval_debug": data.get("retrieval_debug"),
-        "error": data.get("error"),
-        "tool_result": data.get("tool_result"),
-    }
-
-
-def _build_compatible_pending_action(result: AgentTurnResult) -> Optional[dict[str, Any]]:
-    """把新的确认请求结构映射成前端沿用的 pending_action 外显字段。
-
-    这里继续提供一个轻量 dict 作为确认卡片的数据源；
-    恢复执行的真源是 LangGraph checkpointer 中的 interrupt 现场，而不是这个展示镜像。
-    """
-    confirmation = result.pending_confirmation
-    if confirmation is None:
-        return None
-    payload = confirmation.model_dump()
-    target_paper = dict(confirmation.target_paper or {})
-    arguments_summary = dict(confirmation.arguments_summary or {})
-    return {
-        "type": "tool_approval",
-        "status": "waiting_confirmation",
-        "decision": None,
-        "step_id": confirmation.step_id,
-        "tool_name": confirmation.tool_name,
-        "action_type": confirmation.action_type,
-        "side_effect_level": confirmation.side_effect_level,
-        "reason": confirmation.reason,
-        "title": target_paper.get("title") or confirmation.title,
-        "title_text": confirmation.title,
-        "description": confirmation.description,
-        "arxiv_id": target_paper.get("arxiv_id"),
-        "original_question": confirmation.original_question,
-        "target_paper": target_paper or None,
-        "allowed_decisions": [item.code for item in list(confirmation.allowed_decisions or [])],
-        "allow_argument_edit": confirmation.allow_argument_edit,
-        "allow_reject": confirmation.allow_reject,
-        "allow_note": confirmation.allow_note,
-        "arguments_summary": arguments_summary,
-        "confirmation_request": payload,
-        "thread_id": confirmation.thread_id,
-        "session_id": confirmation.session_id,
-        "plan_id": confirmation.plan_id,
-        "trace_id": confirmation.trace_id,
-        "qa_question": arguments_summary.get("qa_question") or arguments_summary.get("question"),
-    }
-
-
-def run_agent_turn_node(state: Any) -> AgentState:
-    """LangGraph 主流程节点：直接执行新的 plan runtime。"""
+def build_plan_node(state: Any) -> AgentState:
+    """只负责生成和校验 ExecutablePlan，并初始化 PlanRuntime。"""
     current_state = _coerce_state(state)
-    result = run_agent_turn_in_graph(current_state)
-    return _state_from_turn_result(current_state, result)
+    next_state = current_state.model_copy(deep=True)
+    goal = next_state.goal or GoalBuilder.from_state(next_state)
+    # 规划策略仍复用现有 rule/template/tool-aware 能力，但调用位置已经变成图上的 planning 节点。
+    goal, plan, planning_debug = build_executable_plan_for_goal(goal, next_state, tool_registry=PLANNER_TOOL_REGISTRY)
+    runtime = build_plan_runtime(next_state, goal=goal, plan=plan, turn_status="success")
+    runtime.step_status = {step.step_id: "pending" for step in list(plan.steps or [])}
+    runtime.outputs = {}
+    runtime.trace = []
+    runtime.retry_counts = {}
+    runtime.replan_counts = {}
+    runtime.step_replan_counts = {}
+
+    next_state.goal = goal
+    next_state.execution_plan = plan
+    next_state.plan_runtime = runtime
+    next_state.debug = dict(next_state.debug or {})
+    next_state.debug["planner"] = planning_debug
+    # 计划节点只建立现场，不执行任何工具；后续节点通过 runtime_state 继续推进。
+    next_state.runtime_state = _runtime_state_from_runtime(next_state, runtime)
+    next_state.steps = list(next_state.steps or []) + [
+        AgentStep(
+            step="build_plan",
+            status="success",
+            action="生成并校验可执行计划",
+            inputs={"goal_type": goal.goal_type},
+            outputs={"plan_id": plan.plan_id, "step_count": len(plan.steps or [])},
+            error=None,
+        )
+    ]
+    return next_state
+
+
+def select_next_step_node(state: Any) -> AgentState:
+    """只负责选择下一可执行 step，不调用工具。"""
+    current_state = _coerce_state(state)
+    next_state = current_state.model_copy(deep=True)
+    runtime = _ensure_runtime(next_state)
+    step = _executor().select_next_step(runtime, next_state)
+    next_state.plan_runtime = runtime
+    next_state.runtime_state = _runtime_state_from_runtime(next_state, runtime)
+    next_state.debug = dict(next_state.debug or {})
+    next_state.debug["agent_route"] = {
+        "phase": "select_next_step",
+        "current_step_id": step.step_id if step else None,
+        "current_tool_name": step.tool_name if step else None,
+    }
+    next_state.steps = list(next_state.steps or []) + [
+        AgentStep(
+            step="select_next_step",
+            status="success",
+            action="选择下一可执行计划步骤",
+            inputs={"pending_statuses": dict(runtime.step_status or {})},
+            outputs={"step_id": step.step_id if step else None, "tool_name": step.tool_name if step else None},
+            error=None,
+        )
+    ]
+    return next_state
+
+
+def execute_step_node(state: Any) -> AgentState:
+    """只负责执行当前 step 对应工具。
+
+    这里关闭 executor 的 auto_replan，让低质量结果留给图上的 replan 节点处理；
+    这样 Mermaid 和流式事件都能看到 execute -> observe -> replan 的真实路径。
+    """
+    current_state = _coerce_state(state)
+    next_state = current_state.model_copy(deep=True)
+    runtime = _ensure_runtime(next_state)
+    result = _executor().execute_current_step_tool(runtime, next_state, allow_interrupt=True)
+    next_state.plan_runtime = runtime
+    next_state.runtime_state = _runtime_state_from_runtime(next_state, runtime)
+    _apply_step_result(next_state, result)
+    return next_state
+
+
+def observe_step_node(state: Any) -> AgentState:
+    """只负责把最近 observation 投影到结构化 runtime/debug，供条件边路由。"""
+    current_state = _coerce_state(state)
+    next_state = current_state.model_copy(deep=True)
+    runtime = _ensure_runtime(next_state)
+    result = _executor().observe_current_step(runtime, next_state)
+    observation = dict(runtime.last_observation or {}) if isinstance(runtime.last_observation, Mapping) else None
+    next_state.debug = dict(next_state.debug or {})
+    next_state.debug["last_observation"] = observation
+    next_state.runtime_state = _runtime_state_from_runtime(next_state, runtime)
+    _apply_step_result(next_state, result)
+    next_state.steps = list(next_state.steps or []) + [
+        AgentStep(
+            step="observe_step",
+            status="success" if observation else "skipped",
+            action="整理最近一次工具结果观察",
+            inputs={"current_step_id": runtime.current_step_id},
+            outputs={"observation_status": observation.get("status") if observation else None, "needs_replan": bool(runtime.needs_replan)},
+            error=None,
+        )
+    ]
+    return next_state
+
+
+def route_after_observation_node(state: Any) -> AgentState:
+    """只负责记录 observation 后的路由决策，不执行工具或改写计划。"""
+    current_state = _coerce_state(state)
+    next_state = current_state.model_copy(deep=True)
+    decision = route_after_observation(next_state)
+    runtime = _ensure_runtime(next_state, allow_missing=True)
+    next_state.debug = dict(next_state.debug or {})
+    # 将条件边决策写入状态，方便流式事件和调试面板看到图层为什么继续、重规划或收束。
+    next_state.debug["agent_route"] = {
+        "phase": "route_after_observation",
+        "decision": decision,
+        "current_step_id": runtime.current_step_id if runtime else None,
+        "needs_replan": bool(runtime.needs_replan) if runtime else False,
+        "pending_confirmation": bool(runtime.pending_confirmation) if runtime else False,
+        "turn_status": runtime.turn_status if runtime else None,
+        "error": runtime.error if runtime else "missing_runtime",
+    }
+    next_state.steps = list(next_state.steps or []) + [
+        AgentStep(
+            step="route_after_observation",
+            status="success" if decision != "error" else "failed",
+            action="根据 observation 决定下一条图路径",
+            inputs={
+                "current_step_id": runtime.current_step_id if runtime else None,
+                "last_observation": runtime.last_observation if runtime else None,
+            },
+            outputs={"decision": decision},
+            error=runtime.error if runtime and decision == "error" else None,
+        )
+    ]
+    return next_state
+
+
+def replan_node(state: Any) -> AgentState:
+    """只负责根据 observation 执行重规划或兜底。"""
+    current_state = _coerce_state(state)
+    next_state = current_state.model_copy(deep=True)
+    runtime = _ensure_runtime(next_state)
+    turn_result = _executor().replan_after_observation(runtime, next_state)
+    next_state.plan_runtime = runtime
+    next_state.execution_plan = runtime.plan
+    next_state.runtime_state = _runtime_state_from_runtime(next_state, runtime)
+    if turn_result is not None:
+        _apply_turn_result(next_state, turn_result)
+    next_state.steps = list(next_state.steps or []) + [
+        AgentStep(
+            step="replan",
+            status="success" if not runtime.error else "failed",
+            action="根据 observation 更新计划或生成兜底结果",
+            inputs={"current_step_id": runtime.current_step_id, "last_observation": runtime.last_observation},
+            outputs={"needs_replan": bool(runtime.needs_replan), "turn_status": runtime.turn_status, "error": runtime.error},
+            error=runtime.error,
+        )
+    ]
+    return next_state
+
+
+def finalize_node(state: Any) -> AgentState:
+    """只负责把 runtime 汇总成对外响应所需的 AgentState 字段。"""
+    current_state = _coerce_state(state)
+    next_state = current_state.model_copy(deep=True)
+    runtime = _ensure_runtime(next_state)
+    turn_result = _executor().finalize_runtime(runtime)
+    _apply_turn_result(next_state, turn_result)
+    next_state.runtime_state = _runtime_state_from_runtime(next_state, runtime)
+    next_state.steps = list(next_state.steps or []) + [
+        AgentStep(
+            step="finalize",
+            status="success" if turn_result.status in {"success", "waiting_confirmation", "need_clarification", "fallback"} else "failed",
+            action="汇总 runtime 并生成最终响应状态",
+            inputs={"turn_status": turn_result.status},
+            outputs={"output_keys": sorted(turn_result.outputs.keys()), "pending_confirmation": bool(turn_result.pending_confirmation)},
+            error=turn_result.error,
+        )
+    ]
+    return next_state
+
+
+def error_finalize_node(state: Any) -> AgentState:
+    """只负责异常终态归一，避免执行错误继续落到普通 finalize 路径。"""
+    current_state = _coerce_state(state)
+    next_state = current_state.model_copy(deep=True)
+    runtime = _ensure_runtime(next_state, allow_missing=True)
+    if runtime is not None:
+        runtime.turn_status = "failed"
+        runtime.error = runtime.error or "agent_graph_error"
+        next_state.plan_runtime = runtime
+        next_state.runtime_state = _runtime_state_from_runtime(next_state, runtime)
+    next_state.intent = next_state.intent or "unsupported"
+    next_state.answer = next_state.answer or "Agent 执行过程中发生错误，请稍后重试。"
+    next_state.steps = list(next_state.steps or []) + [
+        AgentStep(
+            step="error_finalize",
+            status="failed",
+            action="归一化 Agent 图执行错误",
+            inputs={},
+            outputs={"error": runtime.error if runtime else "missing_runtime"},
+            error=runtime.error if runtime else "missing_runtime",
+        )
+    ]
+    return next_state
+
+
+def route_after_selection(state: Any) -> str:
+    """根据选步结果决定执行 step 还是直接 finalize。"""
+    current_state = _coerce_state(state)
+    runtime = current_state.plan_runtime
+    if runtime is None:
+        return "error"
+    if runtime.error:
+        return "error"
+    if not runtime.current_step_id:
+        return "finalize"
+    return "execute"
+
+
+def route_after_execution(state: Any) -> str:
+    """执行节点后决定进入观察、重新选步、确认收束或错误收束。"""
+    current_state = _coerce_state(state)
+    runtime = current_state.plan_runtime
+    last_step_result = dict((current_state.debug or {}).get("last_step_result") or {})
+    if runtime is None:
+        return "error"
+    if runtime.pending_confirmation:
+        return "finalize"
+    if runtime.error:
+        return "error"
+    if last_step_result.get("next_action") == "continue" and not runtime.last_step_output:
+        # approve resume 后当前 step 会回到 pending，需要重新走选步再执行，不能进入 observe。
+        return "select_next_step"
+    return "observe"
+
+
+def route_after_observation(state: Any) -> str:
+    """根据结构化 runtime 决定继续、重规划、等待确认、失败或结束。"""
+    current_state = _coerce_state(state)
+    runtime = current_state.plan_runtime
+    if runtime is None:
+        return "error"
+    if runtime.pending_confirmation:
+        return "finalize"
+    if runtime.error and not runtime.final_answer:
+        return "error"
+    if runtime.needs_replan:
+        return "replan"
+    if runtime.turn_status in {"failed", "fallback", "need_clarification", "waiting_confirmation"}:
+        return "finalize"
+    return "select_next_step"
+
+
+def route_after_replan(state: Any) -> str:
+    """重规划后根据 runtime 状态继续执行或收束。"""
+    current_state = _coerce_state(state)
+    runtime = current_state.plan_runtime
+    if runtime is None:
+        return "error"
+    if runtime.pending_confirmation:
+        return "finalize"
+    if runtime.error and runtime.turn_status not in {"fallback", "success"}:
+        return "error"
+    if runtime.turn_status in {"fallback", "failed", "need_clarification", "waiting_confirmation"}:
+        return "finalize"
+    return "select_next_step"
 
 
 def route_after_parse(state: Any) -> str:
-    """兼容旧导出名；Step 6 主图不再使用条件路由。"""
+    """兼容旧导出名；当前主图 parse 后固定进入 build_goal。"""
     del state
-    return "run_agent_turn"
+    return "build_goal"
+
+
+def run_agent_turn_node(state: Any) -> AgentState:
+    """兼容旧测试/导入名：实际仍走旧 executor 图内入口。"""
+    current_state = _coerce_state(state)
+    result = run_agent_turn_in_graph(current_state)
+    next_state = current_state.model_copy(deep=True)
+    _apply_turn_result(next_state, result)
+    return next_state
 
 
 def build_arxiv_search_graph(
@@ -169,19 +355,69 @@ def build_arxiv_search_graph(
     *,
     checkpointer: Optional[Any] = None,
 ) -> Any:
-    """构建 Step 6 主图：parse_search_request -> run_agent_turn -> END。
+    """构建显式 Agent 执行环。
 
-    默认使用进程级共享的内存 checkpointer，先满足本地开发和测试场景下的 interrupt/resume。
-    外部显式传入 checkpointer 时，以外部实现为准，给后续替换成持久化 checkpoint 预留入口。
+    主图不再把 planner/executor/observer/replanner 全部藏进 run_agent_turn；
+    每个节点只承担一个职责，循环由条件边表达，便于中断、恢复和可观测调试。
     """
     graph = StateGraph(AgentState)
 
     graph.add_node("parse_search_request", lambda state: parse_search_request(state, generation_service=generation_service))
-    graph.add_node("run_agent_turn", run_agent_turn_node)
+    graph.add_node("build_goal", build_goal_node)
+    graph.add_node("build_plan", build_plan_node)
+    graph.add_node("select_next_step", select_next_step_node)
+    graph.add_node("execute_step", execute_step_node)
+    graph.add_node("observe_step", observe_step_node)
+    graph.add_node("route_after_observation", route_after_observation_node)
+    graph.add_node("replan", replan_node)
+    graph.add_node("finalize", finalize_node)
+    graph.add_node("error_finalize", error_finalize_node)
 
     graph.add_edge(START, "parse_search_request")
-    graph.add_edge("parse_search_request", "run_agent_turn")
-    graph.add_edge("run_agent_turn", END)
+    graph.add_edge("parse_search_request", "build_goal")
+    graph.add_edge("build_goal", "build_plan")
+    graph.add_edge("build_plan", "select_next_step")
+    graph.add_conditional_edges(
+        "select_next_step",
+        route_after_selection,
+        {
+            "execute": "execute_step",
+            "finalize": "finalize",
+            "error": "error_finalize",
+        },
+    )
+    graph.add_conditional_edges(
+        "execute_step",
+        route_after_execution,
+        {
+            "observe": "observe_step",
+            "select_next_step": "select_next_step",
+            "finalize": "finalize",
+            "error": "error_finalize",
+        },
+    )
+    graph.add_edge("observe_step", "route_after_observation")
+    graph.add_conditional_edges(
+        "route_after_observation",
+        route_after_observation,
+        {
+            "select_next_step": "select_next_step",
+            "replan": "replan",
+            "finalize": "finalize",
+            "error": "error_finalize",
+        },
+    )
+    graph.add_conditional_edges(
+        "replan",
+        route_after_replan,
+        {
+            "select_next_step": "select_next_step",
+            "finalize": "finalize",
+            "error": "error_finalize",
+        },
+    )
+    graph.add_edge("finalize", END)
+    graph.add_edge("error_finalize", END)
 
     compiled_checkpointer = checkpointer if checkpointer is not None else DEFAULT_GRAPH_CHECKPOINTER
     return graph.compile(checkpointer=compiled_checkpointer)
@@ -218,14 +454,228 @@ def export_arxiv_search_graph_mermaid(
     }
 
 
+def _ensure_runtime(state: AgentState, *, allow_missing: bool = False) -> Optional[PlanRuntime] | PlanRuntime:
+    """读取当前 PlanRuntime；缺失时只在错误归一节点允许返回 None。"""
+    if state.plan_runtime is not None:
+        return state.plan_runtime
+    if allow_missing:
+        return None
+    raise ValueError("missing_plan_runtime")
+
+
+def _apply_step_result(state: AgentState, result: StepExecutionResult) -> None:
+    """把单步执行结果写回 AgentState，供流式事件和调试面板消费。"""
+    state.debug = dict(state.debug or {})
+    state.debug["last_step_result"] = result.model_dump(mode="json")
+    display_status = _display_step_status_from_plan_status(result.step_status, next_action=result.next_action)
+    state.steps = list(state.steps or []) + [
+        AgentStep(
+            step="execute_step",
+            status=display_status,
+            action="执行当前计划步骤",
+            inputs={"step_id": result.step_id},
+            outputs={
+                "next_action": result.next_action,
+                "plan_step_status": result.step_status,
+                "output_key": result.output_key,
+                "has_observation": bool(result.observation),
+                "pending_confirmation": bool(result.pending_confirmation),
+            },
+            error=result.error,
+        )
+    ]
+    if result.turn_result is not None and isinstance(result.turn_result, AgentTurnResult):
+        _apply_turn_result(state, result.turn_result)
+
+
+def _display_step_status_from_plan_status(status: Optional[str], *, next_action: Optional[str]) -> str:
+    """把执行计划内部状态转换成 AgentStep 展示状态。
+
+    PlanRuntime 需要保留 running / waiting_confirmation 这类中间态，供 observe/replan
+    继续接管；AgentStep 只描述图节点本身是否完成，不能直接写入这些内部状态。
+    """
+    if status == "failed" or next_action == "fail":
+        return "failed"
+    if status == "skipped" or next_action == "skip":
+        return "skipped"
+    return "success"
+
+
+def _apply_turn_result(state: AgentState, result: AgentTurnResult) -> None:
+    """把统一执行结果回写到 AgentState，供 service/stream 复用响应适配器。"""
+    state.goal = result.plan.goal if result.plan is not None else state.goal
+    state.execution_plan = result.plan
+    state.plan_runtime = result.runtime
+    state.answer = result.final_answer or state.answer
+    confirmation_payload = result.pending_confirmation.model_dump() if result.pending_confirmation is not None else None
+    state.pending_action = _build_compatible_pending_action(result)
+    state.debug = dict(state.debug or {})
+    state.debug["agent_turn"] = {
+        "status": result.status,
+        "error": result.error,
+        "output_keys": sorted(result.outputs.keys()),
+        "trace_events": [trace.event for trace in list(result.trace or [])],
+    }
+    if confirmation_payload is not None:
+        state.debug["pending_confirmation"] = confirmation_payload
+    if result.status == "waiting_confirmation":
+        state.paper_qa_result = {"status": "waiting_confirmation", "pending_confirmation": confirmation_payload}
+    if "preference_action_result" in result.outputs:
+        preference_result = result.outputs.get("preference_action_result")
+        state.preference_action_result = dict(preference_result) if isinstance(preference_result, Mapping) else {"value": preference_result}
+    if "paper_qa_result" in result.outputs:
+        # answer_paper_question 的输出来自 PaperQAService 真实 RAG 链路，sources/retrieval_debug 必须原样带给前端。
+        paper_qa_result = result.outputs.get("paper_qa_result")
+        state.paper_qa_result = _build_paper_qa_result(state, paper_qa_result)
+        if state.paper_qa_result.get("answer"):
+            state.answer = str(state.paper_qa_result.get("answer") or "")
+    if "ranked_papers" in result.outputs and isinstance(result.outputs.get("ranked_papers"), list):
+        state.papers = [dict(item) for item in result.outputs["ranked_papers"] if isinstance(item, Mapping)]
+    runtime = state.plan_runtime
+    state.runtime_state = _runtime_state_from_runtime(state, runtime) if runtime is not None else state.runtime_state
+
+
+def _extract_resolved_paper_from_runtime(state: AgentState) -> Dict[str, Any]:
+    """从执行现场取出 resolve_paper 的结果，作为本轮 QA 真实目标论文。"""
+    runtime = state.plan_runtime
+    outputs = runtime.outputs if runtime is not None and isinstance(runtime.outputs, Mapping) else {}
+    paper_ref = outputs.get("paper_ref") if isinstance(outputs, Mapping) else None
+    if not isinstance(paper_ref, Mapping):
+        return {}
+    nested_paper = paper_ref.get("paper")
+    if isinstance(nested_paper, Mapping):
+        # resolve_paper 会同时返回顶层 arxiv_id/title 和完整 paper；
+        # 嵌套 paper 字段通常更完整，但顶层字段是最终解析结果，保留其优先级。
+        return {
+            **dict(nested_paper),
+            **{key: value for key, value in dict(paper_ref).items() if key in {"arxiv_id", "title"} and value not in (None, "", [], {})},
+        }
+    return dict(paper_ref)
+
+
+def _build_paper_qa_result(state: AgentState, payload: Any) -> Dict[str, Any]:
+    """把真实 PaperQA 工具输出整理成前端沿用的 paper_qa_result。"""
+    data = dict(payload) if isinstance(payload, Mapping) else {"value": payload}
+    context = state.context if isinstance(state.context, Mapping) else {}
+    selected_paper = context.get("selected_paper") if isinstance(context.get("selected_paper"), Mapping) else {}
+    resolved_paper = _extract_resolved_paper_from_runtime(state)
+    answer = str(data.get("answer") or "").strip()
+    status = str(data.get("status") or ("success" if answer else "failed")).strip() or "failed"
+    return {
+        "status": status,
+        # arxiv_id/title 优先取本轮 resolve_paper 的结果，避免“第二篇”被旧 selected_paper 覆盖。
+        "arxiv_id": data.get("arxiv_id") or resolved_paper.get("arxiv_id") or context.get("arxiv_id") or selected_paper.get("arxiv_id"),
+        "title": data.get("title") or resolved_paper.get("title") or selected_paper.get("title"),
+        "question": data.get("question") or state.message,
+        "answer": answer,
+        "sources": data.get("sources", []),
+        "retrieval_debug": data.get("retrieval_debug"),
+        "error": data.get("error"),
+        "tool_result": data.get("tool_result"),
+    }
+
+
+def _build_compatible_pending_action(result: AgentTurnResult) -> Optional[Dict[str, Any]]:
+    """把新的确认请求结构映射成前端沿用的 pending_action 外显字段。"""
+    confirmation = result.pending_confirmation
+    if confirmation is None:
+        return None
+    payload = confirmation.model_dump()
+    target_paper = dict(confirmation.target_paper or {})
+    arguments_summary = dict(confirmation.arguments_summary or {})
+    return {
+        "type": "tool_approval",
+        "status": "waiting_confirmation",
+        "decision": None,
+        "step_id": confirmation.step_id,
+        "tool_name": confirmation.tool_name,
+        "action_type": confirmation.action_type,
+        "side_effect_level": confirmation.side_effect_level,
+        "reason": confirmation.reason,
+        "title": target_paper.get("title") or confirmation.title,
+        "title_text": confirmation.title,
+        "description": confirmation.description,
+        "arxiv_id": target_paper.get("arxiv_id"),
+        "original_question": confirmation.original_question,
+        "target_paper": target_paper or None,
+        "allowed_decisions": [item.code for item in list(confirmation.allowed_decisions or [])],
+        "allow_argument_edit": confirmation.allow_argument_edit,
+        "allow_reject": confirmation.allow_reject,
+        "allow_note": confirmation.allow_note,
+        "arguments_summary": arguments_summary,
+        "confirmation_request": payload,
+        "thread_id": confirmation.thread_id,
+        "session_id": confirmation.session_id,
+        "plan_id": confirmation.plan_id,
+        "trace_id": confirmation.trace_id,
+        "qa_question": arguments_summary.get("qa_question") or arguments_summary.get("question"),
+    }
+
+
+def _runtime_state_from_runtime(state: AgentState, runtime: PlanRuntime) -> AgentRuntimeState:
+    """从 PlanRuntime 投影出可序列化执行现场。"""
+    return AgentRuntimeState(
+        request_state=_json_safe(runtime.state or {}),
+        goal=runtime.goal,
+        plan=runtime.plan,
+        current_step_id=runtime.current_step_id,
+        current_step_index=runtime.current_step_index,
+        step_status=dict(runtime.step_status or {}),
+        outputs=_json_safe(runtime.outputs or {}),
+        last_observation=_json_safe(runtime.last_observation) if runtime.last_observation else None,
+        last_step_output=_json_safe(runtime.last_step_output) if runtime.last_step_output else None,
+        trace=list(runtime.trace or []),
+        retry_counts=dict(runtime.retry_counts or {}),
+        replan_counts=dict(runtime.replan_counts or {}),
+        step_replan_counts=dict(runtime.step_replan_counts or {}),
+        approved_step_ids=list(runtime.approved_step_ids or []),
+        pending_confirmation=runtime.pending_confirmation,
+        needs_replan=bool(runtime.needs_replan),
+        is_finished=bool(runtime.turn_status),
+        failure_reason=runtime.error,
+        recovery_strategy=_json_safe(runtime.recovery_strategy) if runtime.recovery_strategy else None,
+        turn_status=runtime.turn_status,
+        final_answer=runtime.final_answer or state.answer,
+    )
+
+
+def _json_safe(value: Any) -> Any:
+    """把 runtime_state 投影限制在 JSON 友好数据内，避免 checkpoint 写入复杂实例。"""
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return model_dump(mode="json")
+        except TypeError:
+            return model_dump()
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in dict(value or {}).items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    return repr(value)
+
+
 def _build_fallback_mermaid() -> str:
-    """生成与 Step 6 主流程一致的最小 Mermaid 兜底图。"""
+    """生成与显式执行环一致的最小 Mermaid 兜底图。"""
     return "\n".join(
         [
             "graph TD;",
             "    START([START]) --> parse_search_request;",
-            "    parse_search_request --> run_agent_turn;",
-            "    run_agent_turn --> END([END]);",
+            "    parse_search_request --> build_goal;",
+            "    build_goal --> build_plan;",
+            "    build_plan --> select_next_step;",
+            "    select_next_step --> execute_step;",
+            "    execute_step --> observe_step;",
+            "    execute_step --> select_next_step;",
+            "    execute_step --> finalize;",
+            "    execute_step --> error_finalize;",
+            "    observe_step --> select_next_step;",
+            "    observe_step --> replan;",
+            "    replan --> select_next_step;",
+            "    observe_step --> finalize;",
+            "    finalize --> END([END]);",
+            "    error_finalize --> END;",
         ]
     )
 
@@ -234,7 +684,11 @@ __all__ = [
     "DEFAULT_GRAPH_CHECKPOINTER",
     "build_arxiv_search_graph",
     "export_arxiv_search_graph_mermaid",
+    "route_after_observation",
     "route_after_parse",
+    "route_after_replan",
+    "route_after_execution",
+    "route_after_selection",
     "START",
     "END",
 ]

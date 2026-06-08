@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import unittest
-from unittest import mock
-
 from tests.helpers.agent_runtime import load_agent_test_modules
 
 
 _MODULES = load_agent_test_modules()
 AgentState = _MODULES["state_module"].AgentState
 schemas = _MODULES["schemas"]
-AgentTurnResult = schemas.AgentTurnResult
 ConfirmationDecisionOption = schemas.ConfirmationDecisionOption
 ConfirmationRequest = schemas.ConfirmationRequest
+ExecutionTrace = schemas.ExecutionTrace
+ExecutablePlan = schemas.ExecutablePlan
+Goal = schemas.Goal
+PlanRuntime = schemas.PlanRuntime
 build_arxiv_search_graph = _MODULES["graph_module"].build_arxiv_search_graph
 DEFAULT_GRAPH_CHECKPOINTER = _MODULES["graph_module"].DEFAULT_GRAPH_CHECKPOINTER
 graph_module = _MODULES["graph_module"]
@@ -30,33 +31,20 @@ class AgentGraphFlowTests(unittest.TestCase):
 
         self.assertIs(getattr(graph, "_checkpointer", None), explicit_checkpointer)
 
-    def test_graph_runs_parse_then_unified_turn_runtime(self) -> None:
-        def parse(state, generation_service=None):
-            del generation_service
-            current = AgentState.model_validate(state).model_copy(deep=True)
-            current.intent = "arxiv_search"
-            return current
+    def test_graph_exposes_explicit_agent_execution_loop(self) -> None:
+        graph = build_arxiv_search_graph()
 
-        def fake_run_agent_turn(state):
-            self.assertEqual(state.intent, "arxiv_search")
-            return AgentTurnResult(
-                status="success",
-                final_answer="found papers",
-                outputs={"ranked_papers": [{"arxiv_id": "2401.00001", "title": "RAG paper"}]},
-                trace=[],
-            )
-
-        with mock.patch.object(graph_module, "parse_search_request", side_effect=parse), mock.patch.object(
-            graph_module,
-            "run_agent_turn_in_graph",
-            side_effect=fake_run_agent_turn,
-        ):
-            graph = build_arxiv_search_graph()
-            result = AgentState.model_validate(graph.invoke(AgentState(message="search rag").model_dump()))
-
-        self.assertEqual(result.answer, "found papers")
-        self.assertEqual(result.steps[-1].step, "run_agent_turn")
-        self.assertEqual(result.papers[0]["arxiv_id"], "2401.00001")
+        self.assertIn("parse_search_request", graph._nodes)
+        self.assertIn("build_goal", graph._nodes)
+        self.assertIn("build_plan", graph._nodes)
+        self.assertIn("select_next_step", graph._nodes)
+        self.assertIn("execute_step", graph._nodes)
+        self.assertIn("observe_step", graph._nodes)
+        self.assertIn("route_after_observation", graph._nodes)
+        self.assertIn("replan", graph._nodes)
+        self.assertIn("finalize", graph._nodes)
+        self.assertNotIn("run_agent_turn", graph._nodes)
+        self.assertEqual(graph._conditional_edges["route_after_observation"][1]["replan"], "replan")
 
     def test_confirmation_request_maps_to_tool_approval_pending_action(self) -> None:
         confirmation = ConfirmationRequest(
@@ -79,20 +67,74 @@ class AgentGraphFlowTests(unittest.TestCase):
             plan_id="plan-1",
             trace_id="goal-1",
         )
-        result = AgentTurnResult(
-            status="waiting_confirmation",
-            pending_confirmation=confirmation,
-            outputs={},
-            trace=[],
+        pending_action = graph_module._build_compatible_pending_action(
+            schemas.AgentTurnResult(
+                status="waiting_confirmation",
+                pending_confirmation=confirmation,
+                outputs={},
+                trace=[],
+            )
         )
 
-        state = graph_module._state_from_turn_result(AgentState(session_id="s1", intent="paper_qa"), result)
+        self.assertIsNotNone(pending_action)
+        self.assertEqual(pending_action["type"], "tool_approval")
+        self.assertEqual(pending_action["status"], "waiting_confirmation")
+        self.assertEqual(pending_action["allowed_decisions"], ["approve", "reject"])
 
-        self.assertIsNotNone(state.pending_action)
-        self.assertEqual(state.pending_action["type"], "tool_approval")
-        self.assertEqual(state.pending_action["status"], "waiting_confirmation")
-        self.assertEqual(state.pending_action["allowed_decisions"], ["approve", "reject"])
-        self.assertEqual(state.paper_qa_result["status"], "waiting_confirmation")
+    def test_running_plan_status_is_not_written_to_agent_step_status(self) -> None:
+        state = AgentState(message="帮我找最近 7 天关于 RAG 的 5 篇论文")
+        result = schemas.StepExecutionResult(
+            step_id="search_arxiv",
+            step_status="running",
+            output_key="ranked_papers",
+            next_action="continue",
+        )
+
+        graph_module._apply_step_result(state, result)
+
+        # AgentStep 是前端/流式事件的节点展示摘要，只允许终态；
+        # PlanRuntime 的 running 中间态保留在 outputs/debug 中，避免打断后续 observe/replan。
+        self.assertEqual(state.steps[-1].status, "success")
+        self.assertEqual(state.steps[-1].outputs["plan_step_status"], "running")
+
+    def test_apply_turn_result_uses_resolved_paper_for_paper_qa_metadata(self) -> None:
+        state = AgentState(
+            intent="paper_qa",
+            message="第二篇论文的方法是什么？",
+            context={
+                "selected_paper": {"arxiv_id": "2401.00001", "title": "First Paper"},
+                "last_papers": [
+                    {"arxiv_id": "2401.00001", "title": "First Paper"},
+                    {"arxiv_id": "2401.00002", "title": "Second Paper"},
+                ],
+            },
+        )
+        runtime = PlanRuntime(
+            goal=Goal(goal_type="paper_qa"),
+            plan=ExecutablePlan(plan_id="paper_qa:test", goal=Goal(goal_type="paper_qa")),
+            outputs={
+                "paper_ref": {
+                    "status": "success",
+                    "arxiv_id": "2401.00002",
+                    "title": "Second Paper",
+                    "paper": {"arxiv_id": "2401.00002", "title": "Second Paper"},
+                },
+                "paper_qa_result": {"answer": "grounded answer", "sources": [], "retrieval_debug": {}},
+            },
+            trace=[ExecutionTrace(step_id="answer_paper_question", event="step_succeeded", status="success")],
+        )
+        result = schemas.AgentTurnResult(
+            status="success",
+            final_answer="grounded answer",
+            outputs=dict(runtime.outputs),
+            trace=list(runtime.trace),
+            runtime=runtime,
+        )
+
+        graph_module._apply_turn_result(state, result)
+
+        self.assertEqual(state.paper_qa_result["arxiv_id"], "2401.00002")
+        self.assertEqual(state.paper_qa_result["title"], "Second Paper")
 
 
 if __name__ == "__main__":

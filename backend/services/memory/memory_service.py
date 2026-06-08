@@ -144,11 +144,9 @@ class MemoryService:
         active_arxiv_id: str,
     ) -> Optional[Dict[str, Any]]:
         """从最终状态中推断当前选中的论文信息，供 Agent 会话记忆复用。"""
-        selected_paper = context.get("selected_paper")
-        if isinstance(selected_paper, dict) and selected_paper:
-            return selected_paper
-
         if isinstance(paper_qa_result, dict):
+            # 本轮 QA 的真实目标优先级高于旧 selected_paper；
+            # 否则用户问“第二篇”后，会话记忆仍可能停留在前端默认选中的第一篇。
             inferred_id = self._extract_arxiv_id(paper_qa_result) or active_arxiv_id
             inferred_title = str(paper_qa_result.get("title") or "").strip()
             if inferred_id or inferred_title:
@@ -156,6 +154,10 @@ class MemoryService:
                     "arxiv_id": inferred_id,
                     "title": inferred_title,
                 }
+
+        selected_paper = context.get("selected_paper")
+        if isinstance(selected_paper, dict) and selected_paper:
+            return selected_paper
         return None
 
     def _extract_agent_memory_patch(self, final_state: Any) -> Dict[str, Any]:
@@ -173,9 +175,10 @@ class MemoryService:
             last_papers = list(state.get("papers") or [])
 
         active_arxiv_id = (
-            self._extract_arxiv_id(context.get("selected_paper"))
-            or self._extract_arxiv_id(paper_qa_result)
+            # 当前轮次真实产物优先于旧 UI 选中态，防止“第 N 篇”解析成功后又被历史焦点覆盖。
+            self._extract_arxiv_id(paper_qa_result)
             or self._extract_arxiv_id(pending_action)
+            or self._extract_arxiv_id(context.get("selected_paper"))
             or str(context.get("arxiv_id") or "").strip()
         )
         # active_arxiv_id 会作为当前会话聚焦论文的统一主键，后续恢复状态时优先依赖它。

@@ -6,7 +6,6 @@ import threading
 import uuid
 from datetime import datetime
 from collections import Counter, defaultdict
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
@@ -14,9 +13,15 @@ import torch
 import requests
 
 from services.embedding.embedding_service import EmbeddingService
-from services.retrieval.query_planner import QueryPlanner
+from services.retrieval.collection_profile import CollectionRetrievalProfileProvider
+from services.retrieval.contracts import QueryProfile, RetrievalOptions
+from services.retrieval.retrieval_index import CollectionRetrievalIndexProvider
 from services.retrieval.rerank_service import RerankService
+from services.retrieval.result_fusion_service import ResultFusionService
+from services.retrieval.retrieval_pipeline import RetrievalPipeline
+from services.retrieval.query_planner import QueryPlanner
 from services.retrieval.route_retriever import RouteRetriever
+from services.retrieval.trace_builder import RetrievalTraceBuilder
 from services.storage.vector_store_service import VectorStoreService
 from utils.config import RETRIEVAL_CONFIG, get_enhanced_retrieval_runtime_config, get_memory_runtime_config
 from utils.model_utils import get_huggingface_model_path
@@ -380,38 +385,6 @@ QUESTION_TYPE_RULES = {
     },
 }
 
-
-@dataclass
-class RetrievalOptions:
-    top_k: Optional[int] = None
-    enable_query_rewrite: Optional[bool] = None
-    enable_hyde: Optional[bool] = None
-    enable_keyword_search: Optional[bool] = None
-    enable_llm_rerank: Optional[bool] = None
-    debug: Optional[bool] = None
-    memory_context: Optional[Dict[str, Any]] = None
-
-
-@dataclass
-class QueryProfile:
-    original_query: str
-    normalized_query: str
-    language: str
-    intent_profile: IntentProfile
-    tokens: List[str]
-    keywords: List[str]
-    intent_tags: List[str]
-    question_type: str
-    intent_summary: str
-    paper_terms: List[str]
-    ambiguity_score: float
-    semantic_query: str
-    evidence_query: str
-    keyword_query: str
-    section_preferences: List[str]
-    query_plan: Dict[str, Any]
-
-
 class EnhancedRetrievalService:
     def __init__(
         self,
@@ -458,9 +431,73 @@ class EnhancedRetrievalService:
         self._llm_reranker_device: Optional[str] = None
         self._llm_reranker_error: Optional[str] = None
         self.memory_runtime_config = get_memory_runtime_config()
-        self.query_planner = QueryPlanner(self)
-        self.route_retriever = RouteRetriever(self)
-        self.rerank_service = RerankService(self)
+        self.collection_profile_provider = CollectionRetrievalProfileProvider(
+            vector_store_service=self.vector_store_service,
+            embedding_service=self.embedding_service,
+        )
+        self.collection_retrieval_index_provider = CollectionRetrievalIndexProvider(
+            vector_store_service=self.vector_store_service,
+            chunk_normalizer=self._normalize_chunk,
+            tokenizer=self._tokenize_for_keyword_search,
+        )
+        self.fusion_service = ResultFusionService(
+            rrf_k=self.rrf_k,
+            route_weights=self.route_weights,
+        )
+        self.trace_builder = RetrievalTraceBuilder(
+            trace_export_enabled=self.trace_export_enabled,
+            trace_export_dir=self.trace_export_dir,
+            rrf_k=self.rrf_k,
+            route_weights=self.route_weights,
+            route_confidence_builder=self._route_confidence,
+            route_weights_builder=self._route_weights_for_intent,
+        )
+        self.rerank_service = RerankService(
+            generation_service=self.generation_service,
+            config_owner=self,
+            reranker_loader=lambda: self._load_llm_reranker(),
+            dashscope_request_spec_builder=lambda **kwargs: self._get_dashscope_rerank_request_spec(**kwargs),
+            dashscope_result_extractor=lambda data: self._extract_dashscope_rerank_results(data),
+            query_normalizer=self._normalize_query_text,
+            intent_bucket=self._legacy_intent_bucket,
+            query_profile_debugger=self._debug_query_profile,
+            trace_builder=self.trace_builder,
+        )
+        self.query_planner = QueryPlanner(
+            vector_store_service=self.vector_store_service,
+            generation_service=self.generation_service,
+            intent_service=self.intent_service,
+            rerank_service=self.rerank_service,
+            route_weights=self.route_weights,
+            enhanced_config=ENHANCED_RETRIEVAL_CONFIG,
+        )
+        self.route_retriever = RouteRetriever(
+            embedding_service=self.embedding_service,
+            vector_store_service=self.vector_store_service,
+            generation_service=self.generation_service,
+            query_tools=self.query_planner,
+            fusion_service=self.fusion_service,
+            route_confidence_builder=self._route_confidence,
+            structural_bonus_builder=self._compute_structural_bonus,
+            chunk_normalizer=self._normalize_chunk,
+            memory_flag_reader=self._memory_flag,
+            collection_profile_provider=self.collection_profile_provider,
+            collection_retrieval_index_provider=self.collection_retrieval_index_provider,
+        )
+        self.retrieval_pipeline = RetrievalPipeline(
+            query_planner=self.query_planner,
+            route_retriever=self.route_retriever,
+            fusion_service=self.fusion_service,
+            rerank_service=self.rerank_service,
+            trace_builder=self.trace_builder,
+            collection_resolver=self._resolve_collection_name,
+            collection_profile_provider=self.collection_profile_provider,
+            collection_retrieval_index_provider=self.collection_retrieval_index_provider,
+            option_resolver=self._resolve_option,
+            memory_flag_reader=self._memory_flag,
+            retrieval_config=RETRIEVAL_CONFIG,
+            enhanced_config=ENHANCED_RETRIEVAL_CONFIG,
+        )
 
     def _is_dashscope_vl_rerank_model(self) -> bool:
         model_name = (self.llm_rerank_model_name or "").strip().lower()
@@ -531,229 +568,13 @@ class EnhancedRetrievalService:
         paper_context: Optional[Dict[str, Any]] = None,
         options: Optional[RetrievalOptions] = None,
     ) -> Dict[str, Any]:
-        options = options or RetrievalOptions()
-        default_final_context_top_k = max(1, int(ENHANCED_RETRIEVAL_CONFIG["final_context_top_k"]))
-        max_final_context_top_k = max(
-            1,
-            int(ENHANCED_RETRIEVAL_CONFIG.get("max_final_context_top_k", default_final_context_top_k)),
-        )
-        requested_top_k = options.top_k
-        effective_top_k = requested_top_k if requested_top_k is not None else default_final_context_top_k
-        effective_top_k = min(max_final_context_top_k, max(1, int(effective_top_k)))
-        enable_query_rewrite = self._resolve_option(
-            options.enable_query_rewrite, RETRIEVAL_CONFIG["enable_query_rewrite"]
-        )
-        enable_hyde = self._resolve_option(options.enable_hyde, RETRIEVAL_CONFIG["enable_hyde"])
-        enable_keyword_search = self._resolve_option(
-            options.enable_keyword_search, RETRIEVAL_CONFIG["enable_keyword_search"]
-        )
-        enable_llm_rerank = self._resolve_option(
-            options.enable_llm_rerank, RETRIEVAL_CONFIG.get("enable_llm_rerank", False)
-        )
-        debug_enabled = self._resolve_option(options.debug, RETRIEVAL_CONFIG["debug"])
-        recall_candidate_limit = ENHANCED_RETRIEVAL_CONFIG["recall_candidate_limit"]
-        rrf_candidate_limit = ENHANCED_RETRIEVAL_CONFIG["rrf_candidate_limit"]
-        rerank_candidate_limit = ENHANCED_RETRIEVAL_CONFIG["rerank_candidate_limit"]
-        final_context_top_k = default_final_context_top_k
-
-        normalized_collection_name = self._resolve_collection_name(collection_name)
-        query_bundle = self.query_planner.build_query_bundle(
+        # 兼容入口只负责委托，完整链路由 RetrievalPipeline 串联各独立阶段。
+        return self.retrieval_pipeline.retrieve(
             user_query=user_query,
-            collection_name=normalized_collection_name,
+            collection_name=collection_name,
             paper_context=paper_context,
-            enable_query_rewrite=enable_query_rewrite,
-        )
-        intent_profile = query_bundle["intent_profile"]
-        query_profile = query_bundle["query_profile"]
-        query_views = query_bundle["query_views"]
-        planned_rerank_query = query_bundle["rerank_query"]
-
-        route_bundle = self.route_retriever.build_route_bundle(
-            collection_name=normalized_collection_name,
-            user_query=user_query,
-            query_profile=query_profile,
-            query_views=query_views,
             options=options,
-            enable_hyde=enable_hyde,
-            enable_keyword_search=enable_keyword_search,
-            recall_candidate_limit=recall_candidate_limit,
         )
-        routes = route_bundle["routes"]
-        hyde_text = route_bundle["hyde_text"]
-        hyde_debug = route_bundle["hyde_debug"]
-        keyword_debug = route_bundle["keyword_debug"]
-        memory_debug = route_bundle["memory_debug"]
-        memory_retrieval_enabled = bool(memory_debug.get("enabled", False))
-
-        fused_limit = rrf_candidate_limit if enable_llm_rerank else effective_top_k
-        deduped_routes = {
-            route_name: self._dedupe_route_results(route_results)
-            for route_name, route_results in routes.items()
-        }
-        raw_retrieval_top30 = self._build_raw_retrieval_top_n(deduped_routes, limit=recall_candidate_limit)
-        self._log_retrieval_stage("raw_retrieval_top30", raw_retrieval_top30)
-
-        fused_results = self._fuse_routes(deduped_routes, fused_limit, query_profile)
-        fused_top30 = fused_results[:rrf_candidate_limit]
-        self._log_retrieval_stage("fused_top30", fused_top30)
-
-        reranked_results = fused_results
-        final_results = fused_results
-        rerank_query = planned_rerank_query
-        rerank_debug: Dict[str, Any] = {
-            "enabled": enable_llm_rerank,
-            "applied": False,
-            "mode": "passthrough",
-            "reason": "disabled",
-            "input_chunks": len(fused_results),
-            "output_chunks": len(fused_results),
-        }
-        if enable_llm_rerank:
-            # 打印log信息，说明进入了rerank模块
-            logger.debug("*" * 50)
-            logger.debug("Entering LLM rerank module with %d candidate chunks", len(fused_results))
-            logger.debug("LLM rerank configuration: model=%s, provider=%s, batch_size=%d, candidate_limit=%d, fallback_local=%s",
-                self.llm_rerank_model_name_or_path,
-                self.llm_rerank_provider,
-                self.llm_rerank_batch_size,
-                rerank_candidate_limit,
-                self.llm_rerank_fallback_local,
-            )
-            logger.debug("*" * 50)
-            rerank_result = self.rerank_service.llm_rerank(
-                rerank_query,
-                fused_results,
-                effective_top_k,
-                query_profile=query_profile,
-                original_question=user_query,
-                candidate_limit=rerank_candidate_limit,
-            )
-            reranked_results = rerank_result.get("reranked_chunks", rerank_result["chunks"])
-            final_results = self._mark_final_context_chunks(rerank_result["chunks"])
-            self._log_retrieval_stage("reranked_top30", reranked_results[:rrf_candidate_limit])
-            self._log_retrieval_stage("final_context_top15", final_results[:effective_top_k])
-            rerank_debug = rerank_result["debug"]
-        else:
-            self._log_retrieval_stage("reranked_top30", reranked_results[:rrf_candidate_limit])
-            final_results = self._mark_final_context_chunks(fused_results[:effective_top_k])
-            self._log_retrieval_stage("final_context_top15", final_results[:effective_top_k])
-
-        asset_type_counts = {
-            "raw_retrieval_top30": self._count_chunk_types(raw_retrieval_top30),
-            "fused_top30": self._count_chunk_types(fused_top30),
-            "reranked_top30": self._count_chunk_types(reranked_results[:rrf_candidate_limit]),
-            "final_context_top15": self._count_chunk_types(final_results[:effective_top_k]),
-        }
-
-        result: Dict[str, Any] = {"chunks": final_results}
-
-        if debug_enabled:
-            result["debug"] = {
-                "original_query": user_query,
-                "original_question": user_query,
-                "intent_profile": self._debug_intent_profile(intent_profile),
-                "query_profile": self._debug_query_profile(query_profile),
-                "query_plan": query_profile.query_plan,
-                "query_views": query_views,
-                "rewritten_queries": query_views["selected_queries"],
-                "rerank_query": rerank_query,
-                "hyde_text": hyde_text,
-                "query_rewrite": query_views["rewrite_debug"],
-                "hyde": hyde_debug,
-                "keyword_search": keyword_debug,
-                "memory": {
-                    **memory_debug,
-                    "final_context_hits": [
-                        self._debug_chunk_item(item)
-                        for item in final_results[:effective_top_k]
-                        if "memory_context" in (item.get("matched_routes", []) or [item.get("retrieval_route")])
-                    ],
-                },
-                "routes": {
-                    route_name: [self._debug_chunk_item(item) for item in route_results]
-                    for route_name, route_results in deduped_routes.items()
-                },
-                "stages": {
-                    "raw_retrieval_top30": [self._debug_chunk_item(item) for item in raw_retrieval_top30],
-                    "fused_top30": [self._debug_chunk_item(item) for item in fused_top30],
-                    "reranked_top30": [self._debug_chunk_item(item) for item in reranked_results[:rrf_candidate_limit]],
-                    "final_context_top15": [self._debug_chunk_item(item) for item in final_results[:effective_top_k]],
-                },
-                "final_chunks": [self._debug_chunk_item(item) for item in final_results],
-                "config": {
-                    "requested_top_k": requested_top_k,
-                    "effective_top_k": effective_top_k,
-                    "top_k": effective_top_k,
-                    "candidate_k": recall_candidate_limit,
-                    "rrf_candidate_limit": rrf_candidate_limit,
-                    "rerank_candidate_limit": rerank_candidate_limit,
-                    "final_context_top_k": effective_top_k,
-                    "default_final_context_top_k": default_final_context_top_k,
-                    "max_final_context_top_k": max_final_context_top_k,
-                    "enable_query_rewrite": enable_query_rewrite,
-                    "enable_hyde": enable_hyde,
-                    "enable_keyword_search": enable_keyword_search,
-                    "enable_llm_rerank": enable_llm_rerank,
-                    "enable_memory_aware_retrieval": memory_retrieval_enabled,
-                    "memory_source_boost_weight": float(self._memory_flag("memory_source_boost_weight", ENHANCED_RETRIEVAL_CONFIG.get("memory_source_boost_weight", 0.12))),
-                },
-                "asset_type_counts": asset_type_counts,
-                "fusion": {
-                    "algorithm": "pure_rrf",
-                    "rrf_k": self.rrf_k,
-                    "route_weights": self._route_weights_for_intent(intent_profile),
-                    "dedupe_per_route": True,
-                    "route_confidence": {
-                        route_name: self._route_confidence(
-                            route_name,
-                            query_profile,
-                            (route_results[0]["source_query"] if route_results else user_query),
-                            route_queries=self._collect_route_queries(route_results, query_views["selected_queries"], user_query),
-                            intent_profile=intent_profile,
-                        )
-                        for route_name, route_results in routes.items()
-                    },
-                },
-                "llm_rerank": rerank_debug,
-                "intent": self._debug_intent_profile(intent_profile),
-            }
-
-        trace_export = self._export_retrieval_trace(
-            original_question=user_query,
-            user_query=user_query,
-            collection_name=normalized_collection_name,
-            paper_context=paper_context or {},
-            options={
-                "top_k": effective_top_k,
-                "requested_top_k": requested_top_k,
-                "default_final_context_top_k": default_final_context_top_k,
-                "max_final_context_top_k": max_final_context_top_k,
-                "candidate_k": recall_candidate_limit,
-                "enable_query_rewrite": enable_query_rewrite,
-                "enable_hyde": enable_hyde,
-                "enable_keyword_search": enable_keyword_search,
-                "enable_llm_rerank": enable_llm_rerank,
-                "debug": debug_enabled,
-            },
-            query_profile=query_profile,
-            intent_profile=intent_profile,
-            rerank_query=rerank_query,
-            query_views=query_views,
-            hyde_debug=hyde_debug,
-            routes=deduped_routes,
-            raw_retrieval_top30=raw_retrieval_top30,
-            fused_results=fused_results,
-            reranked_results=reranked_results,
-            final_results=final_results,
-            rerank_debug=rerank_debug,
-            final_context_top_k=effective_top_k,
-        )
-        if trace_export:
-            result["trace_export"] = trace_export
-        if trace_export and debug_enabled and "debug" in result:
-            result["debug"]["trace_export"] = trace_export
-
-        return result
 
     def _llm_rerank_impl(
         self,
@@ -1259,6 +1080,14 @@ class EnhancedRetrievalService:
         paper_context: Optional[Dict[str, Any]] = None,
         sample_limit: int = ENHANCED_RETRIEVAL_CONFIG["sample_limit"],
     ) -> Dict[str, Any]:
+        return self.query_planner.build_paper_context(collection_name, paper_context=paper_context, sample_limit=sample_limit)
+
+    def _legacy_build_paper_context(
+        self,
+        collection_name: str,
+        paper_context: Optional[Dict[str, Any]] = None,
+        sample_limit: int = ENHANCED_RETRIEVAL_CONFIG["sample_limit"],
+    ) -> Dict[str, Any]:
         merged: Dict[str, Any] = {
             "title": "",
             "abstract": "",
@@ -1329,6 +1158,9 @@ class EnhancedRetrievalService:
         return merged
 
     def _merge_candidate_terms(self, existing_terms: List[str], texts: List[str], limit: int = ENHANCED_RETRIEVAL_CONFIG["merge_candidate_terms_limit"]) -> List[str]:
+        return self.query_planner.merge_candidate_terms(existing_terms, texts, limit=limit)
+
+    def _legacy_merge_candidate_terms(self, existing_terms: List[str], texts: List[str], limit: int = ENHANCED_RETRIEVAL_CONFIG["merge_candidate_terms_limit"]) -> List[str]:
         terms: List[str] = []
         for item in existing_terms:
             if str(item).strip():
@@ -1344,6 +1176,9 @@ class EnhancedRetrievalService:
         return terms[:limit]
 
     def _extract_paper_terms_from_text(self, text: str, limit: int = ENHANCED_RETRIEVAL_CONFIG["extract_paper_terms_limit"]) -> List[str]:
+        return self.query_planner.extract_paper_terms_from_text(text, limit=limit)
+
+    def _legacy_extract_paper_terms_from_text(self, text: str, limit: int = ENHANCED_RETRIEVAL_CONFIG["extract_paper_terms_limit"]) -> List[str]:
         tokens = self._tokenize_for_keyword_search(text)
         filtered = [token for token in tokens if token not in EN_STOPWORDS and token not in ZH_STOPWORDS]
         seen: List[str] = []
@@ -1353,6 +1188,14 @@ class EnhancedRetrievalService:
         return seen[:limit]
 
     def _build_query_plan(
+        self,
+        user_query: str,
+        paper_context: Dict[str, Any],
+        intent_profile: Optional[IntentProfile] = None,
+    ) -> Dict[str, Any]:
+        return self.query_planner.build_query_plan(user_query, paper_context, intent_profile=intent_profile)
+
+    def _legacy_build_query_plan(
         self,
         user_query: str,
         paper_context: Dict[str, Any],
@@ -1758,9 +1601,23 @@ class EnhancedRetrievalService:
         user_query: str,
         paper_context: Optional[Dict[str, Any]] = None,
     ) -> IntentProfile:
-        return self.intent_service.build_intent_profile(user_query, paper_context=paper_context or {})
+        return self.query_planner.build_intent_profile(user_query, paper_context=paper_context)
 
     def _build_query_profile(
+        self,
+        user_query: str,
+        collection_name: str,
+        paper_context: Optional[Dict[str, Any]] = None,
+        intent_profile: Optional[IntentProfile] = None,
+    ) -> QueryProfile:
+        return self.query_planner.build_query_profile(
+            user_query,
+            collection_name,
+            paper_context=paper_context,
+            intent_profile=intent_profile,
+        )
+
+    def _legacy_build_query_profile(
         self,
         user_query: str,
         collection_name: str,
@@ -1811,6 +1668,14 @@ class EnhancedRetrievalService:
         )
 
     def _build_query_views(
+        self,
+        user_query: str,
+        query_profile: QueryProfile,
+        enable_query_rewrite: bool,
+    ) -> Dict[str, Any]:
+        return self.query_planner.build_query_views(user_query, query_profile, enable_query_rewrite)
+
+    def _legacy_build_query_views(
         self,
         user_query: str,
         query_profile: QueryProfile,
@@ -1936,6 +1801,16 @@ class EnhancedRetrievalService:
         route_confidence: float,
         query_profile: QueryProfile,
     ) -> List[Dict[str, Any]]:
+        return self.route_retriever.normalize_route_results(results, route_name, source_query, route_confidence, query_profile)
+
+    def _legacy_normalize_route_results(
+        self,
+        results: List[Dict[str, Any]],
+        route_name: str,
+        source_query: str,
+        route_confidence: float,
+        query_profile: QueryProfile,
+    ) -> List[Dict[str, Any]]:
         if not results:
             return []
 
@@ -1955,6 +1830,14 @@ class EnhancedRetrievalService:
         return normalized
 
     def _fuse_routes(
+        self,
+        routes: Dict[str, List[Dict[str, Any]]],
+        top_k: int,
+        query_profile: QueryProfile,
+    ) -> List[Dict[str, Any]]:
+        return self.fusion_service.fuse_routes(routes, top_k, query_profile)
+
+    def _legacy_fuse_routes(
         self,
         routes: Dict[str, List[Dict[str, Any]]],
         top_k: int,
@@ -2316,12 +2199,7 @@ class EnhancedRetrievalService:
         return [(score - min_score) / scale for score in scores]
 
     def _route_weights_for_intent(self, intent_profile: Optional[IntentProfile]) -> Dict[str, float]:
-        if intent_profile is None:
-            weights = dict(self.route_weights)
-        else:
-            weights = dict(intent_profile.route_weights or self.route_weights)
-        weights.setdefault("memory_context", 0.42)
-        return weights
+        return self.fusion_service.route_weights_for_intent(intent_profile)
 
     def _route_confidence(
         self,
@@ -2440,39 +2318,17 @@ class EnhancedRetrievalService:
         return score
 
     def _dedupe_preserve_order(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        deduped = []
-        seen = set()
-        for item in items:
-            key = self._chunk_unique_key(item)
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(item)
-        return deduped
+        return self.fusion_service.dedupe_preserve_order(items)
 
     def _dedupe_route_results(self, route_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        deduped: List[Dict[str, Any]] = []
-        seen: set[str] = set()
-        for item in route_results:
-            key = self._chunk_unique_key(item)
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(dict(item))
-        return deduped
+        return self.fusion_service.dedupe_route_results(route_results)
 
     def _build_raw_retrieval_top_n(
         self,
         routes: Dict[str, List[Dict[str, Any]]],
         limit: int = 10,
     ) -> List[Dict[str, Any]]:
-        raw_results: List[Dict[str, Any]] = []
-        for route_results in routes.values():
-            for item in route_results:
-                raw_results.append(dict(item))
-                if len(raw_results) >= limit:
-                    return raw_results[:limit]
-        return raw_results[:limit]
+        return self.fusion_service.build_raw_retrieval_top_n(routes, limit=limit)
 
     def _log_retrieval_stage(self, stage_name: str, chunks: List[Dict[str, Any]]) -> None:
         logger.debug("%s count=%d", stage_name, len(chunks))
@@ -2507,10 +2363,7 @@ class EnhancedRetrievalService:
                 )
 
     def _short_text_preview(self, text: Any, limit: int = ENHANCED_RETRIEVAL_CONFIG["short_text_preview_limit"]) -> str:
-        normalized = re.sub(r"\s+", " ", str(text or "")).strip()
-        if len(normalized) <= limit:
-            return normalized
-        return normalized[:limit]
+        return self.trace_builder.short_text_preview(text, limit=limit)
 
     def _log_rerank_inputs(
         self,
@@ -2579,123 +2432,25 @@ class EnhancedRetrievalService:
         fallback_queries: List[str],
         user_query: str,
     ) -> List[str]:
-        queries = [item.get("source_query", "") for item in route_results if item.get("source_query")]
-        if queries:
-            return queries
-        return fallback_queries or [user_query]
+        return self.trace_builder.collect_route_queries(route_results, fallback_queries, user_query)
 
     def _chunk_unique_key(self, item: Dict[str, Any]) -> str:
-        return "|".join(
-            [
-                str(item.get("chunk_type", "text")),
-                str(item.get("asset_kind", "")),
-                str(item.get("asset_path", "")),
-                str(item.get("source", "")),
-                str(item.get("original_chunk_id", item.get("parent_chunk_id", item.get("chunk_id", 0)))),
-                str(item.get("content_part_label", "")),
-                str(item.get("page_range", "")),
-                str(item.get("order_index", "")),
-            ]
-        )
+        return self.fusion_service.chunk_unique_key(item)
 
     def _debug_query_profile(self, query_profile: Optional[QueryProfile]) -> Optional[Dict[str, Any]]:
-        if query_profile is None:
-            return None
-        return {
-            "original_query": query_profile.original_query,
-            "normalized_query": query_profile.normalized_query,
-            "language": query_profile.language,
-            "intent_profile": self._debug_intent_profile(query_profile.intent_profile),
-            "tokens": query_profile.tokens,
-            "keywords": query_profile.keywords,
-            "intent_tags": query_profile.intent_tags,
-            "question_type": query_profile.question_type,
-            "intent_summary": query_profile.intent_summary,
-            "paper_terms": query_profile.paper_terms,
-            "ambiguity_score": query_profile.ambiguity_score,
-            "semantic_query": query_profile.semantic_query,
-            "evidence_query": query_profile.evidence_query,
-            "keyword_query": query_profile.keyword_query,
-            "section_preferences": query_profile.section_preferences,
-            "query_plan": query_profile.query_plan,
-        }
+        return self.trace_builder.debug_query_profile(query_profile)
 
     def _debug_intent_profile(self, intent_profile: Optional[IntentProfile]) -> Optional[Dict[str, Any]]:
-        if intent_profile is None:
-            return None
-        return {
-            "original_query": intent_profile.original_query,
-            "normalized_query": intent_profile.normalized_query,
-            "language": intent_profile.language,
-            "main_intent": intent_profile.main_intent,
-            "sub_intents": intent_profile.sub_intents,
-            "confidence": intent_profile.confidence,
-            "ambiguity_score": intent_profile.ambiguity_score,
-            "intent_summary": intent_profile.intent_summary,
-            "preferred_sections": intent_profile.preferred_sections,
-            "route_weights": intent_profile.route_weights,
-            "rewrite_count": intent_profile.rewrite_count,
-            "use_keyword_search": intent_profile.use_keyword_search,
-            "use_hyde": intent_profile.use_hyde,
-            "rewrite_focus": intent_profile.rewrite_focus,
-            "rerank_focus": intent_profile.rerank_focus,
-            "fallback_reason": intent_profile.fallback_reason,
-            "source": intent_profile.source,
-        }
+        return self.trace_builder.debug_intent_profile(intent_profile)
 
     def _debug_chunk_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        preview = item.get("content", "")[: ENHANCED_RETRIEVAL_CONFIG["rerank_document_preview_limit"]].replace("\n", " ").strip()
-        return {
-            "chunk_id": item.get("chunk_id"),
-            "original_chunk_id": item.get("original_chunk_id"),
-            "chunk_type": item.get("chunk_type", "text"),
-            "asset_kind": item.get("asset_kind", ""),
-            "asset_path": item.get("asset_path", ""),
-            "asset_summary": item.get("asset_summary", ""),
-            "asset_summary_preview": self._short_text_preview(item.get("asset_summary", ""), 160),
-            "asset_preview_text": item.get("asset_preview_text", ""),
-            "page_number": item.get("page_number"),
-            "page_range": item.get("page_range"),
-            "score": item.get("score"),
-            "route_score": item.get("route_score"),
-            "normalized_route_score": item.get("normalized_route_score"),
-            "route_confidence": item.get("route_confidence"),
-            "structural_bonus": item.get("structural_bonus"),
-            "retrieval_route": item.get("retrieval_route"),
-            "route_rank": item.get("route_rank"),
-            "matched_routes": item.get("matched_routes", []),
-            "route_scores": item.get("route_scores", {}),
-            "source_query": item.get("source_query"),
-            "source_queries": item.get("source_queries", []),
-            "memory_score": item.get("memory_score"),
-            "memory_reason": item.get("memory_reason"),
-            "source_turn_id": item.get("source_turn_id"),
-            "is_recent_turn": item.get("is_recent_turn"),
-            "memory_match_type": item.get("memory_match_type"),
-            "memory_reference_strength": item.get("memory_reference_strength"),
-            "rerank_text": item.get("rerank_text", ""),
-            "rerank_text_preview": self._short_text_preview(item.get("rerank_text", ""), 160),
-            "final_context_uses_original_chunk": item.get("final_context_uses_original_chunk"),
-            "subchunk_label": item.get("subchunk_label"),
-            "section_tags": item.get("section_tags", []),
-            "content": item.get("content", ""),
-            "preview": preview,
-        }
+        return self.trace_builder.debug_chunk_item(item)
 
     def _count_chunk_types(self, chunks: List[Dict[str, Any]]) -> Dict[str, int]:
-        counts: Dict[str, int] = {"text": 0, "figure": 0, "table": 0}
-        for chunk in chunks:
-            chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
-            counts[chunk_type] = counts.get(chunk_type, 0) + 1
-        return counts
+        return self.trace_builder.count_chunk_types(chunks)
 
     def _mark_final_context_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        marked_chunks: List[Dict[str, Any]] = []
-        for chunk in chunks:
-            marked = dict(chunk)
-            marked["final_context_uses_original_chunk"] = True
-            marked_chunks.append(marked)
-        return marked_chunks
+        return self.trace_builder.mark_final_context_chunks(chunks)
 
     def _export_retrieval_trace(
         self,
@@ -2806,89 +2561,23 @@ class EnhancedRetrievalService:
             return None
 
     def _render_retrieval_trace_text(self, payload: Dict[str, Any]) -> str:
-        lines: List[str] = []
-        lines.append("# Retrieval Trace")
-        lines.append("")
-        lines.append(f"- exported_at: {payload.get('exported_at', '')}")
-        lines.append(f"- collection_name: {payload.get('collection_name', '')}")
-        lines.append("")
-        lines.append("## User Query")
-        lines.append("")
-        lines.append("```text")
-        lines.append(self._normalize_trace_newlines(str(payload.get("user_query", ""))))
-        lines.append("```")
-        lines.append("")
-        lines.append("## Options")
-        for key, value in (payload.get("options") or {}).items():
-            lines.append(f"- {key}: {value}")
-
-        for step in payload.get("steps", []):
-            lines.append("")
-            lines.append(f"## {step.get('step', '')}")
-            lines.append("")
-            lines.append("```text")
-            lines.append(self._format_trace_block(step.get("result")))
-            lines.append("```")
-
-        return "\n".join(lines).rstrip() + "\n"
+        return self.trace_builder.render_retrieval_trace_text(payload)
 
     def _format_trace_block(self, value: Any, indent: int = 0) -> str:
-        pad = "  " * indent
-        if isinstance(value, dict):
-            if not value:
-                return f"{pad}{{}}"
-            lines: List[str] = []
-            for key, item in value.items():
-                if isinstance(item, (dict, list)):
-                    lines.append(f"{pad}{key}:")
-                    lines.append(self._format_trace_block(item, indent + 1))
-                else:
-                    lines.append(f"{pad}{key}: {self._normalize_trace_newlines(str(item))}")
-            return "\n".join(lines)
-        if isinstance(value, list):
-            if not value:
-                return f"{pad}[]"
-            lines = []
-            for item in value:
-                if isinstance(item, (dict, list)):
-                    lines.append(f"{pad}-")
-                    lines.append(self._format_trace_block(item, indent + 1))
-                else:
-                    lines.append(f"{pad}- {self._normalize_trace_newlines(str(item))}")
-            return "\n".join(lines)
-        return f"{pad}{self._normalize_trace_newlines(str(value))}"
+        return self.trace_builder.format_trace_block(value, indent=indent)
 
     def _build_fusion_trace(
         self,
         routes: Dict[str, List[Dict[str, Any]]],
         fused_results: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        return {
-            "algorithm": "pure_rrf",
-            "rrf_k": self.rrf_k,
-            "route_weights": self.route_weights,
-            "route_counts": {route_name: len(route_results) for route_name, route_results in routes.items()},
-            "final_count": len(fused_results),
-            "dedupe_per_route": True,
-        }
+        return self.trace_builder.build_fusion_trace(routes, fused_results)
 
     def _normalize_trace_value(self, value: Any) -> Any:
-        if isinstance(value, str):
-            return self._normalize_trace_newlines(value)
-        if isinstance(value, dict):
-            return {key: self._normalize_trace_value(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [self._normalize_trace_value(item) for item in value]
-        return value
+        return self.trace_builder.normalize_trace_value(value)
 
     def _normalize_trace_newlines(self, text: str) -> str:
-        if not text:
-            return text
-        return text.replace("\r\n", "\n").replace("\\r\\n", "\n").replace("\\n", "\n")
+        return self.trace_builder.normalize_trace_newlines(text)
 
     def _sanitize_trace_slug(self, text: str, max_length: int = ENHANCED_RETRIEVAL_CONFIG["sanitize_trace_slug_max_length"]) -> str:
-        slug = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "_", (text or "").strip())
-        slug = re.sub(r"_+", "_", slug).strip("_")
-        if not slug:
-            slug = "query"
-        return slug[:max_length]
+        return self.trace_builder.sanitize_trace_slug(text, max_length=max_length)

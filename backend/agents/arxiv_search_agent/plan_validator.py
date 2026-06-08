@@ -44,6 +44,20 @@ class PlanValidator:
             tool_spec = registry.get(step.tool_name)
             if tool_spec is None:
                 raise PlanValidationError(f"Unknown tool: {step.tool_name}")
+            contract = registry.get_contract(step.tool_name)
+            if contract is None:
+                raise PlanValidationError(f"Unknown tool contract: {step.tool_name}")
+
+            # step.tool 只是 planner/debug 的 contract 投影；校验阶段必须确认它仍来自当前 registry，
+            # 避免恢复旧 checkpoint 或手写 plan 时把过期工具契约带进 executor。
+            if getattr(step.tool, "contract_source", None) != contract.contract_source:
+                raise PlanValidationError(
+                    f"Step {step.step_id} tool contract source does not match registry contract source"
+                )
+            if getattr(step.tool, "adapter", None) != contract.to_tool_spec().adapter:
+                raise PlanValidationError(
+                    f"Step {step.step_id} tool adapter does not match registry contract adapter"
+                )
 
             if step.side_effect_level != tool_spec.side_effect_level:
                 raise PlanValidationError(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import sys
 
 import pytest
 
@@ -33,6 +34,14 @@ RuleBasedToolAwarePlanBuilder = tool_aware_module.RuleBasedToolAwarePlanBuilder
 ToolCandidateSelector = tool_aware_module.ToolCandidateSelector
 
 
+def _current_modules():
+    """测试 helper 会重载 Agent 模块；这里每次取当前模块，避免 monkeypatch 打到旧类实例。"""
+    current_planner = sys.modules.get("backend.agents.arxiv_search_agent.planner") or planner_module
+    current_tool_aware = sys.modules.get("backend.agents.arxiv_search_agent.tool_aware_planner") or tool_aware_module
+    current_registry = sys.modules.get("backend.agents.arxiv_search_agent.tool_registry") or planner_registry_module
+    return current_planner, current_tool_aware, current_registry
+
+
 class _FakeLLMPlanService:
     def __init__(self, payload: str) -> None:
         self.payload = payload
@@ -44,7 +53,8 @@ class _FakeLLMPlanService:
 
 
 def _candidate_tool_names(goal_type: str) -> set[str]:
-    selection = ToolCandidateSelector(PLANNER_TOOL_REGISTRY).select(
+    _, current_tool_aware, current_registry = _current_modules()
+    selection = current_tool_aware.ToolCandidateSelector(current_registry.PLANNER_TOOL_REGISTRY).select(
         Goal(goal_type=goal_type, intent=goal_type),
         AgentState(intent=goal_type, message="test"),
     )
@@ -165,7 +175,8 @@ def test_plan_draft_missing_input_bindings_conversion_fails() -> None:
 
 
 def _build_tool_aware_plan(intent: str, *, state: AgentState | None = None):
-    return planner_module.build_executable_plan(
+    current_planner, _, _ = _current_modules()
+    return current_planner.build_executable_plan(
         state or AgentState(intent=intent, message="test"),
         enable_tool_aware_planner=True,
     )
@@ -272,7 +283,7 @@ def test_llm_valid_plan_draft_converts_to_executable_plan() -> None:
         search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG"),
     )
 
-    _, plan, debug = planner_module.build_executable_plan(
+    _, plan, debug = _current_modules()[0].build_executable_plan(
         state,
         enable_tool_aware_planner=True,
         enable_llm_plan_draft=True,
@@ -298,7 +309,7 @@ def test_llm_unknown_tool_falls_back_to_rule_based_planner() -> None:
     invalid["steps"][2]["tool_name"] = "missing_tool"
     invalid["selected_tools"][2] = "missing_tool"
 
-    _, plan, debug = planner_module.build_executable_plan(
+    _, plan, debug = _current_modules()[0].build_executable_plan(
         AgentState(intent="arxiv_search", message="search rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG")),
         enable_tool_aware_planner=True,
         enable_llm_plan_draft=True,
@@ -317,7 +328,7 @@ def test_llm_candidate_outside_tool_falls_back() -> None:
     invalid["steps"][2]["tool_name"] = "update_preference_store"
     invalid["selected_tools"][2] = "update_preference_store"
 
-    _, _, debug = planner_module.build_executable_plan(
+    _, _, debug = _current_modules()[0].build_executable_plan(
         AgentState(intent="arxiv_search", message="search rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG")),
         enable_tool_aware_planner=True,
         enable_llm_plan_draft=True,
@@ -333,7 +344,7 @@ def test_llm_duplicate_step_id_falls_back() -> None:
     invalid = json.loads(_llm_arxiv_plan_json())
     invalid["steps"][1]["step_id"] = "normalize_request"
 
-    _, _, debug = planner_module.build_executable_plan(
+    _, _, debug = _current_modules()[0].build_executable_plan(
         AgentState(intent="arxiv_search", message="search rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG")),
         enable_tool_aware_planner=True,
         enable_llm_plan_draft=True,
@@ -348,7 +359,7 @@ def test_llm_invalid_depends_on_falls_back() -> None:
     invalid = json.loads(_llm_arxiv_plan_json())
     invalid["steps"][2]["depends_on"] = ["missing_step"]
 
-    _, _, debug = planner_module.build_executable_plan(
+    _, _, debug = _current_modules()[0].build_executable_plan(
         AgentState(intent="arxiv_search", message="search rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG")),
         enable_tool_aware_planner=True,
         enable_llm_plan_draft=True,
@@ -360,7 +371,7 @@ def test_llm_invalid_depends_on_falls_back() -> None:
 
 
 def test_llm_non_json_falls_back() -> None:
-    _, _, debug = planner_module.build_executable_plan(
+    _, _, debug = _current_modules()[0].build_executable_plan(
         AgentState(intent="arxiv_search", message="search rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG")),
         enable_tool_aware_planner=True,
         enable_llm_plan_draft=True,
@@ -428,7 +439,7 @@ def test_llm_persistent_write_without_target_falls_back_to_clarification() -> No
         ],
     }
 
-    _, plan, debug = planner_module.build_executable_plan(
+    _, plan, debug = _current_modules()[0].build_executable_plan(
         AgentState(intent="preference_action", message="我喜欢这篇论文"),
         enable_tool_aware_planner=True,
         enable_llm_plan_draft=True,
@@ -493,7 +504,7 @@ def test_llm_high_risk_tool_missing_confirmation_is_auto_completed() -> None:
         },
     ]
 
-    _, plan, debug = planner_module.build_executable_plan(
+    _, plan, debug = _current_modules()[0].build_executable_plan(
         AgentState(
             intent="preference_action",
             message="喜欢这篇论文",
@@ -511,12 +522,14 @@ def test_llm_high_risk_tool_missing_confirmation_is_auto_completed() -> None:
 
 
 def test_rule_based_failure_after_llm_failure_falls_back_to_fixed_template(monkeypatch) -> None:
+    current_planner, current_tool_aware, _ = _current_modules()
+
     def fail_rule_builder(self, *_args, **_kwargs):
         raise RuntimeError("rule builder failed")
 
-    monkeypatch.setattr(RuleBasedToolAwarePlanBuilder, "build", fail_rule_builder)
+    monkeypatch.setattr(current_tool_aware.RuleBasedToolAwarePlanBuilder, "build", fail_rule_builder)
 
-    _, plan, debug = planner_module.build_executable_plan(
+    _, plan, debug = current_planner.build_executable_plan(
         AgentState(intent="arxiv_search", message="search rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG")),
         enable_tool_aware_planner=True,
         enable_llm_plan_draft=True,
@@ -560,7 +573,7 @@ def test_tool_aware_planner_disabled_uses_fixed_template_plan() -> None:
         search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG evaluation"),
     )
 
-    _, plan, debug = planner_module.build_executable_plan(
+    _, plan, debug = _current_modules()[0].build_executable_plan(
         state,
         enable_tool_aware_planner=False,
     )
@@ -655,7 +668,8 @@ def test_rule_based_unsupported_only_generates_fallback_plan() -> None:
 
 
 def test_rule_based_optional_personalize_missing_does_not_fail(monkeypatch) -> None:
-    original_select = ToolCandidateSelector.select
+    _, current_tool_aware, _ = _current_modules()
+    original_select = current_tool_aware.ToolCandidateSelector.select
 
     def fake_select(self, goal, state):
         selection = original_select(self, goal, state)
@@ -667,7 +681,7 @@ def test_rule_based_optional_personalize_missing_does_not_fail(monkeypatch) -> N
             }
         )
 
-    monkeypatch.setattr(ToolCandidateSelector, "select", fake_select)
+    monkeypatch.setattr(current_tool_aware.ToolCandidateSelector, "select", fake_select)
 
     _, plan, debug = _build_tool_aware_plan(
         "arxiv_search",
@@ -685,11 +699,13 @@ def test_rule_based_optional_personalize_missing_does_not_fail(monkeypatch) -> N
 
 
 def test_tool_aware_planning_falls_back_to_fixed_template_when_required_tool_missing(monkeypatch) -> None:
-    original_select = ToolCandidateSelector.select
+    current_planner, current_tool_aware, _ = _current_modules()
+    current_schemas = sys.modules.get("backend.agents.arxiv_search_agent.schemas") or schemas
+    original_select = current_tool_aware.ToolCandidateSelector.select
 
     def fake_select(self, goal, state):
         selection = original_select(self, goal, state)
-        return ToolCandidateSelection(
+        return current_schemas.ToolCandidateSelection(
             goal_type=selection.goal_type,
             candidate_tools=[tool for tool in selection.candidate_tools if tool.tool_name != "search_arxiv"],
             excluded_tools=selection.excluded_tools,
@@ -697,9 +713,9 @@ def test_tool_aware_planning_falls_back_to_fixed_template_when_required_tool_mis
             risk_summary=selection.risk_summary,
         )
 
-    monkeypatch.setattr(ToolCandidateSelector, "select", fake_select)
+    monkeypatch.setattr(current_tool_aware.ToolCandidateSelector, "select", fake_select)
 
-    _, plan, debug = planner_module.build_executable_plan(
+    _, plan, debug = current_planner.build_executable_plan(
         AgentState(intent="arxiv_search", message="search rag"),
         enable_tool_aware_planner=True,
     )
@@ -713,6 +729,10 @@ def test_tool_aware_planning_falls_back_to_fixed_template_when_required_tool_mis
 
 
 def test_rule_based_plan_can_be_executed_by_existing_plan_executor(monkeypatch) -> None:
+    current_executor = sys.modules.get("backend.agents.arxiv_search_agent.plan_executor") or executor_module
+    current_schemas = sys.modules.get("backend.agents.arxiv_search_agent.schemas") or schemas
+    current_state_module = sys.modules.get("backend.agents.arxiv_search_agent.state") or state_module
+
     def fake_invoke_tool(tool_name: str, **kwargs):
         assert tool_name == "search_arxiv_structured"
         return {
@@ -724,15 +744,15 @@ def test_rule_based_plan_can_be_executed_by_existing_plan_executor(monkeypatch) 
             "error": None,
         }
 
-    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
-    state = AgentState(
+    monkeypatch.setattr(current_executor, "invoke_backend_tool", fake_invoke_tool)
+    state = current_state_module.AgentState(
         intent="arxiv_search",
         message="search rag",
-        search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG"),
+        search_spec=current_schemas.ArxivSearchSpec(intent="arxiv_search", query="RAG"),
     )
     _, plan, _ = _build_tool_aware_plan("arxiv_search", state=state)
 
-    result = PlanExecutor().execute(plan, state)
+    result = current_executor.PlanExecutor().execute(plan, state)
 
     assert result.status == "success"
     assert result.final_answer

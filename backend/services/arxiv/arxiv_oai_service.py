@@ -392,6 +392,80 @@ class ArxivOaiDatabaseService:
         except Exception:
             return True
 
+    def _matches_text_query(self, haystack: str, query_text: str) -> bool:
+        """判断字段文本是否命中查询词，避免短英文主题被当成任意子串。
+
+        本地 OAI 搜索没有 arXiv API 的分词检索能力，因此需要在这里补一层
+        轻量匹配语义：像 RAG 这类短英文主题词必须按完整 token 命中，防止
+        误匹配到 Dragoi、Dragomir、granularity 这类作者名或普通单词片段。
+        """
+        normalized_query = str(query_text or "").strip().lower()
+        if not normalized_query:
+            return True
+        normalized_haystack = str(haystack or "").lower()
+        if not normalized_haystack:
+            return False
+
+        if re.fullmatch(r"[a-z0-9]+", normalized_query):
+            return re.search(rf"(?<![a-z0-9]){re.escape(normalized_query)}(?![a-z0-9])", normalized_haystack) is not None
+        return normalized_query in normalized_haystack
+
+    def _score_text_query(self, paper: Dict[str, Any], query_text: str) -> int:
+        """计算本地检索的轻量相关性分数，用于 relevance 排序。
+
+        这里不做复杂 IR，只区分标题、摘要、分类、作者等字段的命中位置：
+        标题和摘要更能代表论文主题，权重高于作者名，避免“作者名偶然包含关键词”
+        的论文排在真正讨论该主题的论文前面。
+        """
+        normalized_query = str(query_text or "").strip().lower()
+        if not normalized_query:
+            return 0
+
+        fields = self._paper_to_search_fields(paper)
+        score = 0
+        weighted_fields = (
+            ("title", 8),
+            ("abstract", 5),
+            ("category", 3),
+            ("author", 1),
+        )
+        for field, weight in weighted_fields:
+            haystack = fields.get(field, "")
+            if self._matches_text_query(haystack, normalized_query):
+                score += weight
+        return score
+
+    def _score_relevance_query(self, paper: Dict[str, Any], query: str) -> int:
+        """按当前支持的 arXiv 查询子集计算相关性分数。
+
+        日期和分类约束主要承担过滤职责，不应把分数抬高；AND/OR 查询则递归
+        汇总文本子句分数，保证本地 relevance 排序和过滤逻辑使用同一套解析路径。
+        """
+        text = self._strip_outer_parentheses(query.strip())
+        if not text or text.startswith("submittedDate:["):
+            return 0
+        if " ANDNOT " in text:
+            parts = self._split_top_level(text, " ANDNOT ")
+            return self._score_relevance_query(paper, parts[0]) if parts else 0
+        if " AND " in text:
+            return sum(self._score_relevance_query(paper, part) for part in self._split_top_level(text, " AND "))
+        if " OR " in text:
+            return max((self._score_relevance_query(paper, part) for part in self._split_top_level(text, " OR ")), default=0)
+        if ":" in text:
+            field, raw_query = text.split(":", 1)
+            field = field.strip().lower()
+            if field in {"cat", "category"}:
+                return 0
+            query_text = self._strip_outer_parentheses(raw_query.strip())
+            if query_text.startswith('"') and query_text.endswith('"'):
+                query_text = query_text[1:-1]
+            query_text = query_text.replace('\\"', '"').replace("\\\\", "\\")
+            fields = self._paper_to_search_fields(paper)
+            if field == "all":
+                return self._score_text_query(paper, query_text)
+            return 10 if self._matches_text_query(fields.get(field, fields["all"]), query_text) else 0
+        return self._score_text_query(paper, text.replace('"', ""))
+
     def _matches_atomic_clause(self, paper: Dict[str, Any], clause: str) -> bool:
         text = self._strip_outer_parentheses(clause.strip())
         if not text:
@@ -406,9 +480,9 @@ class ArxivOaiDatabaseService:
                 query_text = query_text[1:-1]
             query_text = query_text.replace('\\"', '"').replace("\\\\", "\\").lower()
             haystack = self._paper_to_search_fields(paper).get(field, self._paper_to_search_fields(paper)["all"])
-            return query_text in haystack
+            return self._matches_text_query(haystack, query_text)
         query_text = text.replace('"', "").lower()
-        return query_text in self._paper_to_search_fields(paper)["all"]
+        return self._matches_text_query(self._paper_to_search_fields(paper)["all"], query_text)
 
     def _matches_query(self, paper: Dict[str, Any], query: str) -> bool:
         text = self._strip_outer_parentheses(query.strip())
@@ -499,7 +573,10 @@ class ArxivOaiDatabaseService:
             rows = [paper for paper in rows if self._matches_query(paper, normalized_query)]
 
         reverse = sort_order == "descending"
-        if sort_by in {"submittedDate", "lastUpdatedDate"}:
+        if sort_by == "relevance" and normalized_query:
+            # 本地数据源没有 arXiv API 的相关性排序，这里用轻量字段权重把主题命中更强的论文排到前面。
+            rows.sort(key=lambda p: (self._score_relevance_query(p, normalized_query), p.get("updated") or p.get("created") or ""), reverse=reverse)
+        elif sort_by in {"submittedDate", "lastUpdatedDate"}:
             rows.sort(key=lambda p: p.get("updated") or p.get("created") or "", reverse=reverse)
 
         paginated_rows = rows[start:start + max_results]

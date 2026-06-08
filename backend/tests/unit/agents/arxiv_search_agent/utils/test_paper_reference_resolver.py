@@ -73,6 +73,34 @@ def test_context_reference_prefers_selected_paper() -> None:
     assert result["arxiv_id"] == "2401.00002"
 
 
+def test_ordinal_reference_wins_when_message_also_has_context_cue() -> None:
+    context = {
+        "selected_paper": _paper("2401.00001", "First Paper"),
+        "last_papers": [_paper("2401.00001", "First Paper"), _paper("2401.00002", "Second Paper")],
+    }
+
+    result = resolver._resolve_paper_reference("这第2篇论文的方法是什么？", context)
+
+    assert result["status"] == "success"
+    assert result["matched_from"] == "last_papers"
+    assert result["target"]["target_type"] == "ordinal"
+    assert result["arxiv_id"] == "2401.00002"
+
+
+def test_ordinal_reference_ignores_non_target_number_words() -> None:
+    context = {
+        "selected_paper": _paper("2401.00001", "First Paper"),
+        "last_papers": [_paper("2401.00001", "First Paper"), _paper("2401.00002", "Second Paper")],
+    }
+
+    result = resolver._resolve_paper_reference("给我讲一下第二篇论文的方法部分", context)
+
+    assert result["status"] == "success"
+    assert result["matched_from"] == "last_papers"
+    assert result["target"]["target_type"] == "ordinal"
+    assert result["arxiv_id"] == "2401.00002"
+
+
 def test_no_reference_falls_back_to_selected_paper() -> None:
     context = {"selected_paper": _paper("2401.00009", "Selected Paper")}
 

@@ -767,7 +767,8 @@ async def qa_paper_stream(
         try:
             # 上下文构建也放在 SSE 生成器内，确保未建索引、检索异常等前置失败能返回统一 error 事件。
             _, search_results, qa_context, retrieval_debug = paper_qa_service.build_qa_context(arxiv_id, payload)
-            source_payload = paper_qa_service.build_source_payload(search_results)
+            # 优先复用 ContextPackBuilder 产出的 source_payload，旧服务或测试替身没有该字段时再走兼容包装。
+            source_payload = qa_context.get("source_payload") or paper_qa_service.build_source_payload(search_results)
             contextualized_question = str(qa_context.get("generation_question", question) or question).strip() or question
             question_contextualization = qa_context.get("question_contextualization", {}) or {}
             chat_session = qa_context.get("chat_session", {}) or {}
@@ -804,12 +805,27 @@ async def qa_paper_stream(
                     # delta 事件只承载增量文本，适合前端逐字/逐段渲染。
                     yield sse_event("delta", {"delta": chunk.get("delta", "")})
                 elif chunk.get("type") == "completed":
+                    final_answer = chunk.get("answer", "") or ""
+                    verification_debug = {}
+                    verifier = getattr(paper_qa_service, "evidence_verifier", None)
+                    if verifier is not None:
+                        # 流式生成结束后做同一套轻量校验，避免 SSE 路径绕过证据闭环。
+                        verification_debug = verifier.verify(
+                            answer=final_answer,
+                            sources=source_payload,
+                            cited_source_ids=[],
+                            claims=[],
+                            generation_insufficient_evidence=False,
+                        )
+                        final_answer = verifier.apply_answer_guardrail(final_answer, verification_debug)
+                    if isinstance(retrieval_debug, dict):
+                        retrieval_debug["verification"] = verification_debug
                     # 回答生成结束后，把本轮问答、来源和调试快照统一持久化，
                     # 这样后续会话恢复、笔记关联、问题追踪都有完整上下文。
                     persisted_turn = paper_qa_service.persist_completed_turn(
                         chat_session=chat_session,
                         question=question,
-                        answer=chunk.get("answer", "") or "",
+                        answer=final_answer,
                         source_payload=source_payload,
                         retrieval_debug=retrieval_debug if isinstance(retrieval_debug, dict) else None,
                         contextualized_question=contextualized_question,
@@ -819,7 +835,7 @@ async def qa_paper_stream(
                         "done",
                         {
                             "status": "success",
-                            "answer": chunk.get("answer", ""),
+                            "answer": final_answer,
                             "session_id": chat_session.get("session_id"),
                             "chat_session": _serialize_chat_session(persisted_turn.get("chat_session", chat_session)),
                             "turn_id": persisted_turn.get("turn_id"),
@@ -830,6 +846,7 @@ async def qa_paper_stream(
                             "sources": source_payload,
                             "image_inputs": qa_context["image_inputs"],
                             "asset_metadata": qa_context["asset_metadata"],
+                            "verification_debug": verification_debug,
                             "retrieval_debug": retrieval_debug,
                             "usage": chunk.get("usage"),
                         },
@@ -838,11 +855,20 @@ async def qa_paper_stream(
 
             # 极端情况下模型流没有显式 completed 事件，仍返回一个空答案的 done，
             # 保证前端能收到结束信号，不会一直处于 loading 状态。
+            verification_debug = {}
+            verifier = getattr(paper_qa_service, "evidence_verifier", None)
+            fallback_answer = ""
+            if verifier is not None:
+                # 没有 completed 事件意味着答案为空，仍记录校验结果，便于前端区分生成失败和证据不足。
+                verification_debug = verifier.verify(answer="", sources=source_payload, cited_source_ids=[], claims=[])
+                fallback_answer = verifier.apply_answer_guardrail("", verification_debug)
+                if isinstance(retrieval_debug, dict):
+                    retrieval_debug["verification"] = verification_debug
             yield sse_event(
                 "done",
                 {
                     "status": "success",
-                    "answer": "",
+                    "answer": fallback_answer,
                     "session_id": chat_session.get("session_id"),
                     "chat_session": _serialize_chat_session(chat_session),
                     "original_question": question,
@@ -852,6 +878,7 @@ async def qa_paper_stream(
                     "sources": source_payload,
                     "image_inputs": qa_context["image_inputs"],
                     "asset_metadata": qa_context["asset_metadata"],
+                    "verification_debug": verification_debug,
                     "retrieval_debug": retrieval_debug,
                     "usage": None,
                 },

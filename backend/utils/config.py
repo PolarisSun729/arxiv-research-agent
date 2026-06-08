@@ -107,6 +107,14 @@ AGENT_PLANNER_CONFIG: Dict[str, Any] = {
     "expose_planner_debug": _env_bool("EXPOSE_PLANNER_DEBUG", True),
 }
 
+AGENT_RUNTIME_CHECKPOINT_CONFIG: Dict[str, Any] = {
+    # 生产路径默认使用 SQLite 持久化 checkpoint；只有显式设置为 memory 时才退回进程内开发模式。
+    "backend": _env_str("AGENT_RUNTIME_CHECKPOINT_BACKEND", "sqlite").lower() or "sqlite",
+    # confirmation 等待现场需要有明确生命周期，避免用户长期不处理导致数据库无限增长。
+    "ttl_seconds": _env_int("AGENT_RUNTIME_CHECKPOINT_TTL_SECONDS", 24 * 60 * 60),
+    "cleanup_retention_days": _env_int("AGENT_RUNTIME_CHECKPOINT_CLEANUP_RETENTION_DAYS", 7),
+}
+
 OAI_SQLITE_CONFIG: Dict[str, Any] = {
     # Keep the OAI database under backend/06-database so backend launches and tools share the same store.
     "database_path": _env_str("OAI_SQLITE_DATABASE_PATH", str(BASE_DIR.parent / "06-database" / "arxiv_oai.db")),
@@ -270,6 +278,15 @@ ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     "route_default_floor": float(_env_str("ENHANCED_RETRIEVAL_ROUTE_DEFAULT_FLOOR", "0.2")),
     "route_confidence_multiplier": float(_env_str("ENHANCED_RETRIEVAL_ROUTE_CONFIDENCE_MULTIPLIER", "0.65")),
     "route_confidence_similarity_weight": float(_env_str("ENHANCED_RETRIEVAL_ROUTE_CONFIDENCE_SIMILARITY_WEIGHT", "0.35")),
+    "route_timeout_default_seconds": float(_env_str("RETRIEVAL_ROUTE_TIMEOUT_DEFAULT_SECONDS", "8")),
+    "route_timeout_vector_original_seconds": float(_env_str("RETRIEVAL_ROUTE_TIMEOUT_VECTOR_ORIGINAL_SECONDS", "8")),
+    "route_timeout_vector_rewrite_seconds": float(_env_str("RETRIEVAL_ROUTE_TIMEOUT_VECTOR_REWRITE_SECONDS", "8")),
+    "route_timeout_vector_hyde_seconds": float(_env_str("RETRIEVAL_ROUTE_TIMEOUT_VECTOR_HYDE_SECONDS", "8")),
+    "route_timeout_keyword_seconds": float(_env_str("RETRIEVAL_ROUTE_TIMEOUT_KEYWORD_SECONDS", "4")),
+    "route_timeout_memory_context_seconds": float(_env_str("RETRIEVAL_ROUTE_TIMEOUT_MEMORY_CONTEXT_SECONDS", "3")),
+    "route_timeout_rerank_seconds": float(_env_str("RETRIEVAL_ROUTE_TIMEOUT_RERANK_SECONDS", "12")),
+    "route_max_workers": _env_int("RETRIEVAL_ROUTE_MAX_WORKERS", 4),
+    "query_embedding_batch_size": _env_int("RETRIEVAL_QUERY_EMBEDDING_BATCH_SIZE", 20),
 }
 
 INTENT_ROUTING_CONFIG: Dict[str, Any] = {
@@ -507,6 +524,10 @@ def get_qa_index_job_runtime_config() -> Dict[str, Any]:
 
 def get_agent_planner_runtime_config() -> Dict[str, Any]:
     return dict(AGENT_PLANNER_CONFIG)
+
+
+def get_agent_runtime_checkpoint_config() -> Dict[str, Any]:
+    return dict(AGENT_RUNTIME_CHECKPOINT_CONFIG)
 
 
 def get_enhanced_retrieval_runtime_config() -> Dict[str, Any]:

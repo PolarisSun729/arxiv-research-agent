@@ -492,18 +492,32 @@ ConfirmationDecision = Literal["approve", "reject"]
 
 
 class ToolSpec(BaseModel):
-    """定义计划步骤要调用的真实工具及其静态约束。"""
+    """定义计划步骤要调用的真实工具及其静态约束。
+
+    这是统一 ToolContract 投影给 planner/debug 的只读视图；真正的执行入口、
+    输入输出模型和恢复/确认策略都来自同一份 contract，避免 planner 与 executor
+    各自维护一套看似相同但可能漂移的工具描述。
+    """
     model_config = ConfigDict(extra="forbid")
 
     tool_name: str
+    description: Optional[str] = None
     capability_tags: List[str] = Field(default_factory=list)
     input_schema: Dict[str, Any] = Field(default_factory=dict)
     output_schema: Dict[str, Any] = Field(default_factory=dict)
+    input_model: Optional[str] = None
+    output_model: Optional[str] = None
+    error_model: Optional[str] = None
     side_effect_level: Literal["none", "session_write", "persistent_write", "external_call"] = "none"
     requires_confirmation: bool = False
     can_retry: bool = False
     failure_modes: List[str] = Field(default_factory=list)
     implementation: Optional[str] = None
+    backend_tool_name: Optional[str] = None
+    adapter: Optional[str] = None
+    recovery_policy: Dict[str, Any] = Field(default_factory=dict)
+    confirmation_policy: Dict[str, Any] = Field(default_factory=dict)
+    contract_source: Optional[str] = None
 
 
 class StepInputBinding(BaseModel):
@@ -715,7 +729,11 @@ class ExecutablePlan(BaseModel):
 
 
 class PlanRuntime(BaseModel):
-    """保存计划执行过程中的运行态，而不是把状态混进计划定义。"""
+    """保存计划执行过程中的运行态，而不是把状态混进计划定义。
+
+    这是执行器内部继续使用的可变运行容器；对 LangGraph 节点和跨请求恢复更友好的
+    一等执行现场由 AgentRuntimeState 表达，避免上层只能理解 executor 内部循环变量。
+    """
     model_config = ConfigDict(extra="forbid")
 
     state: Dict[str, Any] = Field(default_factory=dict)
@@ -727,10 +745,102 @@ class PlanRuntime(BaseModel):
     retry_counts: Dict[str, int] = Field(default_factory=dict)
     replan_counts: Dict[str, int] = Field(default_factory=dict)
     step_replan_counts: Dict[str, int] = Field(default_factory=dict)
+    approved_step_ids: List[str] = Field(default_factory=list)
+    current_step_id: Optional[str] = None
+    current_step_index: Optional[int] = None
+    last_observation: Optional[Dict[str, Any]] = None
+    last_step_output: Optional[Dict[str, Any]] = None
+    needs_replan: bool = False
+    is_finished: bool = False
+    recovery_strategy: Optional[Dict[str, Any]] = None
     pending_confirmation: Optional[ConfirmationRequest] = None
     final_answer: Optional[str] = None
     error: Optional[str] = None
     turn_status: Optional[AgentTurnStatus] = None
+
+
+class AgentRuntimeState(BaseModel):
+    """统一表达一次 Agent 计划执行现场。
+
+    这个结构是后续拆 LangGraph 节点时跨节点传递的稳定契约，字段只保留可序列化数据：
+    计划、当前 step、step 状态、工具输出、最近 observation、确认态、重规划计数和失败恢复建议。
+    它不持有函数、工具实例或闭包，避免 checkpoint 恢复时依赖内存对象。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    request_state: Dict[str, Any] = Field(default_factory=dict)
+    goal: Optional[Goal] = None
+    plan: Optional[ExecutablePlan] = None
+    current_step_id: Optional[str] = None
+    current_step_index: Optional[int] = None
+    step_status: Dict[str, PlanStepStatus] = Field(default_factory=dict)
+    outputs: Dict[str, Any] = Field(default_factory=dict)
+    last_observation: Optional[Dict[str, Any]] = None
+    last_step_output: Optional[Dict[str, Any]] = None
+    trace: List[ExecutionTrace] = Field(default_factory=list)
+    retry_counts: Dict[str, int] = Field(default_factory=dict)
+    replan_counts: Dict[str, int] = Field(default_factory=dict)
+    step_replan_counts: Dict[str, int] = Field(default_factory=dict)
+    approved_step_ids: List[str] = Field(default_factory=list)
+    pending_confirmation: Optional[ConfirmationRequest] = None
+    needs_replan: bool = False
+    is_finished: bool = False
+    failure_reason: Optional[str] = None
+    recovery_strategy: Optional[Dict[str, Any]] = None
+    turn_status: Optional[AgentTurnStatus] = None
+    final_answer: Optional[str] = None
+
+    @field_validator("plan", "goal", "pending_confirmation", mode="before")
+    @classmethod
+    def _coerce_nested_models(cls, value: Any) -> Any:
+        # 不同测试加载路径可能产生同形不同类的 Pydantic 对象，统一转 dict 再按当前 schema 校验。
+        model_dump = getattr(value, "model_dump", None)
+        return model_dump() if callable(model_dump) else value
+
+    @field_validator("trace", mode="before")
+    @classmethod
+    def _coerce_trace_models(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            normalized = []
+            for item in value:
+                model_dump = getattr(item, "model_dump", None)
+                normalized.append(model_dump() if callable(model_dump) else item)
+            return normalized
+        return value
+
+
+class StepExecutionResult(BaseModel):
+    """单步执行器返回给上层节点的结构化结果。
+
+    Executor 的新边界只负责“执行一个待执行 step”，因此必须把本步状态、输出、错误、
+    observation、下一步动作和 runtime_patch 一次性说清楚，不能再让调用方去解析内部 trace。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: Optional[str] = None
+    step_status: Optional[PlanStepStatus] = None
+    output_key: Optional[str] = None
+    output: Any = None
+    error: Optional[str] = None
+    observation: Optional[Dict[str, Any]] = None
+    next_action: Literal[
+        "continue",
+        "wait_for_confirmation",
+        "replan",
+        "finish",
+        "fail",
+        "noop",
+    ] = "continue"
+    pending_confirmation: Optional[ConfirmationRequest] = None
+    runtime_patch: Dict[str, Any] = Field(default_factory=dict)
+    turn_result: Optional[Any] = None
+
+    @field_validator("pending_confirmation", mode="before")
+    @classmethod
+    def _coerce_result_models(cls, value: Any) -> Any:
+        # 确认请求需要进入 checkpoint；单轮结果保留模型实例，避免兼容执行入口丢失属性访问语义。
+        model_dump = getattr(value, "model_dump", None)
+        return model_dump() if callable(model_dump) else value
 
 
 class AgentTurnResult(BaseModel):
@@ -953,6 +1063,7 @@ class ArxivSearchResponse(BaseModel):
     goal: Optional[Goal] = None
     execution_plan: Optional[ExecutablePlan] = None
     plan_runtime: Optional[PlanRuntime] = None
+    runtime_state: Optional[AgentRuntimeState] = None
     pending_action: Optional[Dict[str, Any]] = None
     paper_qa_result: Optional[Dict[str, Any]] = None
     preference_action_result: Optional[Dict[str, Any]] = None
