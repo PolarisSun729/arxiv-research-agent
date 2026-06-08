@@ -45,6 +45,10 @@ class CollectionRetrievalIndex:
     by_page_section: Dict[Tuple[str, str], List[int]] = field(default_factory=dict)
     by_page_number: Dict[str, List[int]] = field(default_factory=dict)
     by_section_path: Dict[str, List[int]] = field(default_factory=dict)
+    by_section_title: Dict[str, List[int]] = field(default_factory=dict)
+    by_chunk_type: Dict[str, List[int]] = field(default_factory=dict)
+    by_subchunk_index: Dict[str, List[int]] = field(default_factory=dict)
+    by_parent_subchunk: Dict[Tuple[str, str], List[int]] = field(default_factory=dict)
     cache_hit: bool = False
     build_time: float = 0.0
     fallback_reason: str = ""
@@ -168,6 +172,10 @@ class CollectionRetrievalIndexProvider:
         by_page_section: Dict[Tuple[str, str], List[int]] = defaultdict(list)
         by_page_number: Dict[str, List[int]] = defaultdict(list)
         by_section_path: Dict[str, List[int]] = defaultdict(list)
+        by_section_title: Dict[str, List[int]] = defaultdict(list)
+        by_chunk_type: Dict[str, List[int]] = defaultdict(list)
+        by_subchunk_index: Dict[str, List[int]] = defaultdict(list)
+        by_parent_subchunk: Dict[Tuple[str, str], List[int]] = defaultdict(list)
 
         for doc_id, chunk in enumerate(normalized_chunks):
             text_parts = [
@@ -203,6 +211,10 @@ class CollectionRetrievalIndexProvider:
                 by_page_section=by_page_section,
                 by_page_number=by_page_number,
                 by_section_path=by_section_path,
+                by_section_title=by_section_title,
+                by_chunk_type=by_chunk_type,
+                by_subchunk_index=by_subchunk_index,
+                by_parent_subchunk=by_parent_subchunk,
             )
 
         chunk_count = self._resolve_chunk_count(collection_profile, index_record, len(normalized_chunks))
@@ -224,6 +236,10 @@ class CollectionRetrievalIndexProvider:
             by_page_section={key: list(value) for key, value in by_page_section.items()},
             by_page_number={key: list(value) for key, value in by_page_number.items()},
             by_section_path={key: list(value) for key, value in by_section_path.items()},
+            by_section_title={key: list(value) for key, value in by_section_title.items()},
+            by_chunk_type={key: list(value) for key, value in by_chunk_type.items()},
+            by_subchunk_index={key: list(value) for key, value in by_subchunk_index.items()},
+            by_parent_subchunk={key: list(value) for key, value in by_parent_subchunk.items()},
             cache_hit=False,
             build_time=perf_counter() - started,
             fallback_reason="; ".join(fallback_reasons),
@@ -295,6 +311,10 @@ class CollectionRetrievalIndexProvider:
         by_page_section: Dict[Tuple[str, str], List[int]],
         by_page_number: Dict[str, List[int]],
         by_section_path: Dict[str, List[int]],
+        by_section_title: Dict[str, List[int]],
+        by_chunk_type: Dict[str, List[int]],
+        by_subchunk_index: Dict[str, List[int]],
+        by_parent_subchunk: Dict[Tuple[str, str], List[int]],
     ) -> None:
         def add(mapping: Dict[Any, List[int]], key: Any) -> None:
             normalized = str(key or "").strip()
@@ -307,10 +327,19 @@ class CollectionRetrievalIndexProvider:
 
         page_number = str(chunk.get("page_number", "") or "").strip()
         section_path = str(chunk.get("section_path", "") or "").strip()
+        section_title = str(chunk.get("section_title", "") or "").strip()
+        chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
+        subchunk_index = str(chunk.get("subchunk_index", "") or "").strip()
         add(by_page_number, page_number)
         add(by_section_path, section_path)
+        add(by_section_title, section_title)
+        add(by_chunk_type, chunk_type)
+        add(by_subchunk_index, subchunk_index)
         if page_number and section_path:
             by_page_section[(page_number, section_path.lower())].append(doc_id)
+        if chunk.get("parent_chunk_id") not in (None, "") and subchunk_index:
+            # parent+subchunk 组合索引用于上下文扩展阶段快速定位 sibling，避免每个 anchor 再全量扫描。
+            by_parent_subchunk[(str(chunk.get("parent_chunk_id")).strip(), subchunk_index)].append(doc_id)
 
     @staticmethod
     def _clone_index(index: CollectionRetrievalIndex) -> CollectionRetrievalIndex:
@@ -332,6 +361,10 @@ class CollectionRetrievalIndexProvider:
             by_page_section={key: list(value) for key, value in index.by_page_section.items()},
             by_page_number={key: list(value) for key, value in index.by_page_number.items()},
             by_section_path={key: list(value) for key, value in index.by_section_path.items()},
+            by_section_title={key: list(value) for key, value in index.by_section_title.items()},
+            by_chunk_type={key: list(value) for key, value in index.by_chunk_type.items()},
+            by_subchunk_index={key: list(value) for key, value in index.by_subchunk_index.items()},
+            by_parent_subchunk={key: list(value) for key, value in index.by_parent_subchunk.items()},
             cache_hit=index.cache_hit,
             build_time=index.build_time,
             fallback_reason=index.fallback_reason,

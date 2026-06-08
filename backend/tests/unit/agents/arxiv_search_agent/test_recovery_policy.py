@@ -49,6 +49,7 @@ def test_observer_classifies_empty_search_result() -> None:
     )
 
     assert observation.status == "empty_result"
+    assert observation.observation_signal == "success_but_empty_result"
     assert observation.failure_category == "search_empty"
     assert observation.recoverable is True
     assert "patch_plan" in observation.suggested_recovery_types
@@ -120,6 +121,8 @@ def test_recovery_policies_generate_explainable_candidates() -> None:
 
         assert candidates
         assert all(candidate.action_type and candidate.reason and candidate.target_step_id for candidate in candidates)
+        assert all(candidate.policy_source for candidate in candidates)
+        assert all(isinstance(candidate.tool_recovery_policy, dict) for candidate in candidates)
 
 
 def test_recovery_policies_ignore_success_and_unsupported_observations() -> None:
@@ -170,6 +173,7 @@ def test_qa_no_answer_generates_retry_candidates() -> None:
 
     assert any(candidate.candidate_id.endswith("retry_qa_with_more_top_k") for candidate in candidates)
     assert candidates[0].strategy_payload["strategy_name"] == "retry_qa_with_more_top_k"
+    assert "retry_step" in candidates[0].tool_recovery_policy["modes"]
 
 
 def test_qa_no_sources_generates_source_grounded_candidates() -> None:

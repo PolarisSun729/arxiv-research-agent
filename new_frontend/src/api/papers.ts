@@ -691,6 +691,13 @@ export interface QaResult {
     section_path?: string
     parent_chunk_id?: string | number
     chunk_type?: string
+    context_role?: string
+    context_budget_score?: number
+    context_budget_reason?: string
+    expansion_source_anchor_ids?: Array<string | number>
+    relationship_types?: string[]
+    expansion_reasons?: string[]
+    final_context_reason?: string
     asset_summary?: string
     asset_preview_text?: string
   }>
@@ -720,6 +727,13 @@ export interface PaperChatMessage {
     section_path?: string
     parent_chunk_id?: string | number
     chunk_type?: string
+    context_role?: string
+    context_budget_score?: number
+    context_budget_reason?: string
+    expansion_source_anchor_ids?: Array<string | number>
+    relationship_types?: string[]
+    expansion_reasons?: string[]
+    final_context_reason?: string
     asset_summary?: string
     asset_preview_text?: string
   }>
@@ -817,6 +831,13 @@ export interface QaConversationContextTurn {
     source?: string
     section_path?: string
     chunk_type?: string
+    context_role?: string
+    context_budget_score?: number
+    context_budget_reason?: string
+    expansion_source_anchor_ids?: Array<string | number>
+    relationship_types?: string[]
+    expansion_reasons?: string[]
+    final_context_reason?: string
     asset_summary?: string
     asset_preview_text?: string
   }>
@@ -830,6 +851,7 @@ export interface QaRequestOptions {
   enable_hyde?: boolean
   enable_keyword_search?: boolean
   enable_llm_rerank?: boolean
+  enable_context_expansion?: boolean
   debug?: boolean
   conversation_context?: QaConversationContextTurn[]
 }

@@ -20,6 +20,7 @@ ArxivSearchSpec = schemas.ArxivSearchSpec
 ExecutablePlan = schemas.ExecutablePlan
 Goal = schemas.Goal
 PlanStep = schemas.PlanStep
+PlanRuntime = schemas.PlanRuntime
 StepCondition = schemas.StepCondition
 StepInputBinding = schemas.StepInputBinding
 StepPolicy = schemas.StepPolicy
@@ -466,9 +467,55 @@ def test_plan_executor_replans_empty_arxiv_search_before_fallback(monkeypatch) -
     replan_traces = [trace for trace in result.trace if trace.event == "plan_replanned" and trace.detail.get("rule_name") == "rule_arxiv_empty_result"]
     assert replan_traces
     assert replan_traces[0].detail.get("failure_category") == "search_empty"
+    assert replan_traces[0].detail.get("observation_signal") == "success_but_empty_result"
+    assert replan_traces[0].detail.get("selected_recovery_action_semantic") == "append_step_after_current"
+    assert replan_traces[0].detail.get("policy_source") == "search_empty_recovery_policy"
+    assert replan_traces[0].detail.get("tool_recovery_policy")["modes"] == ["retry_step", "patch_plan"]
     assert replan_traces[0].detail.get("recovery_candidates")
     assert any(step.tool_name == "rewrite_arxiv_query" for step in result.plan.steps)
     assert any(trace.event == "step_succeeded" and trace.step_id == "rewrite_arxiv_query" for trace in result.trace)
+
+
+def test_plan_executor_reuses_persistent_write_output_without_duplicate_call(monkeypatch) -> None:
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("persistent_write tool must not run when output already exists")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fail_if_called)
+
+    goal = Goal(goal_id="preference_action:idempotent", goal_type="preference_action", user_request="喜欢这篇")
+    plan = ExecutablePlan(
+        plan_id="preference_action:idempotent",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="update_preference_store",
+                action_type="write_state",
+                tool_name="update_preference_store",
+                tool=_tool("update_preference_store"),
+                output_key="preference_action_result",
+                input_bindings=[
+                    StepInputBinding(input_key="paper_reference", source_type="literal", value={"arxiv_id": "2401.00001", "title": "RAG"}),
+                    StepInputBinding(input_key="message", source_type="state", source_key="message"),
+                ],
+                side_effect_level="persistent_write",
+                confirmation_policy=StepPolicy(policy_type="confirmation", mode="explicit_user_confirmation_required", requires_confirmation=True),
+            )
+        ],
+        entry_step_ids=["update_preference_store"],
+        final_step_ids=["update_preference_store"],
+    )
+    runtime = PlanRuntime(
+        goal=goal,
+        plan=plan,
+        outputs={"preference_action_result": {"ok": True, "arxiv_id": "2401.00001"}},
+        step_status={"update_preference_store": "pending"},
+    )
+
+    result = PlanExecutor().execute_runtime(runtime, AgentState(intent="preference_action", message="喜欢这篇"))
+
+    assert result.status == "success"
+    assert result.outputs["preference_action_result"]["arxiv_id"] == "2401.00001"
+    assert any(trace.event == "step_reused_output" and trace.step_id == "update_preference_store" for trace in result.trace)
 
 
 def test_plan_executor_replans_low_confidence_arxiv_validation(monkeypatch) -> None:

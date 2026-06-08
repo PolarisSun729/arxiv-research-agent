@@ -29,6 +29,7 @@ PLANNER_TOOL_REGISTRY = planner_registry_module.PLANNER_TOOL_REGISTRY
 PlanDraftConverter = tool_aware_module.PlanDraftConverter
 PlanDraftConversionError = tool_aware_module.PlanDraftConversionError
 PlanValidator = validator_module.PlanValidator
+PlanValidationError = validator_module.PlanValidationError
 PlanExecutor = executor_module.PlanExecutor
 RuleBasedToolAwarePlanBuilder = tool_aware_module.RuleBasedToolAwarePlanBuilder
 ToolCandidateSelector = tool_aware_module.ToolCandidateSelector
@@ -68,9 +69,42 @@ def test_arxiv_search_goal_selects_search_related_candidate_tools() -> None:
 
 
 def test_paper_qa_goal_selects_index_check_and_answer_tools() -> None:
-    tool_names = _candidate_tool_names("paper_qa")
+    _, current_tool_aware, current_registry = _current_modules()
+    selection = current_tool_aware.ToolCandidateSelector(current_registry.PLANNER_TOOL_REGISTRY).select(
+        Goal(goal_type="paper_qa", intent="paper_qa"),
+        AgentState(
+            intent="paper_qa",
+            message="method?",
+            context={"selected_paper": {"arxiv_id": "2401.00001", "title": "RAG"}},
+        ),
+    )
+    tool_names = {tool.tool_name for tool in selection.candidate_tools}
 
     assert {"resolve_paper", "check_paper_index", "parse_and_index_paper", "answer_paper_question"}.issubset(tool_names)
+
+
+def test_paper_qa_goal_without_target_prefers_resolve_or_clarification_tools() -> None:
+    tool_names = _candidate_tool_names("paper_qa")
+
+    assert {"resolve_paper", "analyze_ambiguity", "generate_clarification"}.issubset(tool_names)
+    assert not {"check_paper_index", "answer_paper_question"}.intersection(tool_names)
+
+
+def test_paper_qa_missing_index_context_exposes_confirmation_and_index_candidates() -> None:
+    _, current_tool_aware, current_registry = _current_modules()
+    selection = current_tool_aware.ToolCandidateSelector(current_registry.PLANNER_TOOL_REGISTRY).select(
+        Goal(goal_type="paper_qa", intent="paper_qa"),
+        AgentState(
+            intent="paper_qa",
+            message="method?",
+            context={"selected_paper": {"arxiv_id": "2401.00001", "title": "RAG"}},
+            paper_qa_result={"status": "failed", "qa_index_status": "missing"},
+        ),
+    )
+    tool_names = {tool.tool_name for tool in selection.candidate_tools}
+
+    assert {"request_confirmation", "parse_and_index_paper"}.issubset(tool_names)
+    assert "qa_index_missing_include_index_candidates" in selection.risk_summary["selection_notes"]
 
 
 def test_unsupported_goal_excludes_search_and_write_business_tools() -> None:
@@ -172,6 +206,55 @@ def test_plan_draft_missing_input_bindings_conversion_fails() -> None:
 
     with pytest.raises(PlanDraftConversionError, match="missing required input bindings"):
         PlanDraftConverter(PLANNER_TOOL_REGISTRY).convert(draft, Goal(goal_type="arxiv_search"))
+
+
+def test_plan_draft_missing_required_source_key_conversion_fails() -> None:
+    draft = PlanDraft(
+        draft_id="draft:test",
+        plan_intent="arxiv_search",
+        selected_tools=["normalize_request"],
+        steps=[
+            PlanDraftStep(
+                step_id="normalize_request",
+                action_type="write_state",
+                tool_name="normalize_request",
+                input_bindings=[{"input_key": "message", "source_type": "state"}],
+                expected_output_key="normalized_request",
+            )
+        ],
+    )
+
+    with pytest.raises(PlanDraftConversionError, match="missing source_key"):
+        PlanDraftConverter(PLANNER_TOOL_REGISTRY).convert(draft, Goal(goal_type="arxiv_search"))
+
+
+def test_plan_draft_cycle_conversion_fails() -> None:
+    draft = PlanDraft(
+        draft_id="draft:cycle",
+        plan_intent="unclear",
+        selected_tools=["analyze_ambiguity", "generate_clarification"],
+        steps=[
+            PlanDraftStep(
+                step_id="analyze_ambiguity",
+                action_type="clarify",
+                tool_name="analyze_ambiguity",
+                input_bindings=[{"input_key": "message", "source_type": "state", "source_key": "message"}],
+                depends_on=["generate_clarification"],
+                expected_output_key="missing_information",
+            ),
+            PlanDraftStep(
+                step_id="generate_clarification",
+                action_type="answer",
+                tool_name="generate_clarification",
+                input_bindings=[{"input_key": "missing_information", "source_type": "step_output", "step_id": "analyze_ambiguity"}],
+                depends_on=["analyze_ambiguity"],
+                expected_output_key="final_answer",
+            ),
+        ],
+    )
+
+    with pytest.raises(PlanDraftConversionError, match="circular dependencies"):
+        PlanDraftConverter(PLANNER_TOOL_REGISTRY).convert(draft, Goal(goal_type="unclear"))
 
 
 def _build_tool_aware_plan(intent: str, *, state: AgentState | None = None):
@@ -304,6 +387,26 @@ def test_llm_valid_plan_draft_converts_to_executable_plan() -> None:
     PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
 
 
+def test_llm_new_output_protocol_fields_are_accepted() -> None:
+    payload = json.loads(_llm_arxiv_plan_json())
+    for step in payload["steps"]:
+        step["why_this_step"] = step.pop("step_reason")
+        step["expected_output"] = {"output_key": step.pop("expected_output_key"), "fields": ["result"]}
+        step["risk_notes"] = "risk is controlled by candidate ToolContract"
+        step["failure_recovery_hint"] = "fallback to rule-based planner if invalid"
+
+    _, plan, debug = _current_modules()[0].build_executable_plan(
+        AgentState(intent="arxiv_search", message="search rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG")),
+        enable_tool_aware_planner=True,
+        enable_llm_plan_draft=True,
+        llm_generation_service=_FakeLLMPlanService(json.dumps(payload, ensure_ascii=False)),
+    )
+
+    assert debug["llm_plan_valid"] is True
+    assert debug["selected_plan_source"] == "llm_tool_aware"
+    assert _step_ids(plan)[-1] == "synthesize_arxiv_response"
+
+
 def test_llm_unknown_tool_falls_back_to_rule_based_planner() -> None:
     invalid = json.loads(_llm_arxiv_plan_json())
     invalid["steps"][2]["tool_name"] = "missing_tool"
@@ -381,6 +484,47 @@ def test_llm_non_json_falls_back() -> None:
     assert debug["llm_plan_valid"] is False
     assert debug["selected_plan_source"] == "tool_aware_rule_based"
     assert "JSON-only" in debug["llm_plan_invalid_reasons"][0]
+
+
+def test_llm_paper_qa_missing_resolve_or_validate_falls_back() -> None:
+    paper_qa_plan = {
+        "draft_id": "llm:paper_qa:missing-precondition",
+        "plan_intent": "paper_qa",
+        "selected_tools": ["answer_paper_question"],
+        "steps": [
+            {
+                "step_id": "answer_paper_question",
+                "action_type": "answer",
+                "tool_name": "answer_paper_question",
+                "why_this_step": "answer directly without required target resolution",
+                "input_bindings": [
+                    {"input_key": "paper_ref", "source_type": "literal", "value": {"arxiv_id": "2401.00001"}},
+                    {"input_key": "message", "source_type": "state", "source_key": "message"},
+                ],
+                "depends_on": [],
+                "expected_output": {"output_key": "paper_qa_result"},
+                "risk_level": "medium",
+                "risk_notes": "external call uses ToolContract recovery",
+                "requires_confirmation": False,
+            }
+        ],
+    }
+
+    _, plan, debug = _current_modules()[0].build_executable_plan(
+        AgentState(
+            intent="paper_qa",
+            message="method?",
+            context={"selected_paper": {"arxiv_id": "2401.00001", "title": "RAG"}},
+        ),
+        enable_tool_aware_planner=True,
+        enable_llm_plan_draft=True,
+        llm_generation_service=_FakeLLMPlanService(json.dumps(paper_qa_plan, ensure_ascii=False)),
+    )
+
+    assert debug["llm_plan_valid"] is False
+    assert "missing required tool resolve_paper" in debug["llm_plan_invalid_reasons"][0]
+    assert debug["selected_plan_source"] == "tool_aware_rule_based"
+    assert "resolve_paper" in _tool_names(plan)
 
 
 def test_llm_persistent_write_without_target_falls_back_to_clarification() -> None:
@@ -521,6 +665,67 @@ def test_llm_high_risk_tool_missing_confirmation_is_auto_completed() -> None:
     assert "update_preference_store" in debug["confirmation_required_steps"]
 
 
+def test_validator_rejects_paper_qa_without_resolve_and_index_check() -> None:
+    draft = PlanDraft(
+        draft_id="draft:invalid-paper-qa",
+        plan_intent="paper_qa",
+        selected_tools=["answer_paper_question"],
+        steps=[
+            PlanDraftStep(
+                step_id="answer_paper_question",
+                action_type="answer",
+                tool_name="answer_paper_question",
+                input_bindings=[
+                    {"input_key": "paper_ref", "source_type": "literal", "value": {"arxiv_id": "2401.00001"}},
+                    {"input_key": "message", "source_type": "state", "source_key": "message"},
+                ],
+                expected_output_key="paper_qa_result",
+                risk_notes="external call uses ToolContract recovery",
+            )
+        ],
+    )
+    plan = PlanDraftConverter(PLANNER_TOOL_REGISTRY).convert(draft, Goal(goal_type="unclear"))
+    plan = plan.model_copy(update={"goal": Goal(goal_type="paper_qa")})
+
+    with pytest.raises(PlanValidationError, match="paper_qa plan missing required tool resolve_paper"):
+        PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
+
+
+def test_validator_rejects_preference_write_without_target_resolution() -> None:
+    draft = PlanDraft(
+        draft_id="draft:invalid-preference",
+        plan_intent="preference_action",
+        selected_tools=["update_preference_store", "synthesize_preference_response"],
+        steps=[
+            PlanDraftStep(
+                step_id="update_preference_store",
+                action_type="write_state",
+                tool_name="update_preference_store",
+                input_bindings=[
+                    {"input_key": "paper_reference", "source_type": "literal", "value": {"query": "missing concrete target"}},
+                    {"input_key": "message", "source_type": "state", "source_key": "message"},
+                ],
+                expected_output_key="preference_action_result",
+                risk_notes="persistent write requires target and confirmation",
+                requires_confirmation=True,
+            ),
+            PlanDraftStep(
+                step_id="synthesize_preference_response",
+                action_type="answer",
+                tool_name="synthesize_preference_response",
+                input_bindings=[{"input_key": "verified_preference_update", "source_type": "literal", "value": {"ok": True}}],
+                depends_on=["update_preference_store"],
+                expected_output_key="final_answer",
+            ),
+        ],
+    )
+    plan = PlanDraftConverter(PLANNER_TOOL_REGISTRY).convert(draft, Goal(goal_type="unclear"))
+    plan = plan.model_copy(update={"goal": Goal(goal_type="preference_action")})
+
+    with pytest.raises(PlanValidationError, match="preference_action plan missing required tool resolve_preference_target"):
+        PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
+
+
 def test_rule_based_failure_after_llm_failure_falls_back_to_fixed_template(monkeypatch) -> None:
     current_planner, current_tool_aware, _ = _current_modules()
 
@@ -602,8 +807,35 @@ def test_rule_based_paper_qa_generates_resolve_check_answer_plan() -> None:
 
     assert _step_ids(plan) == ["resolve_paper", "check_paper_index", "answer_paper_question"]
     assert _tool_names(plan) == ["resolve_paper", "check_paper_index", "answer_paper_question"]
+    assert debug["planner_context"]["goal_type"] == "paper_qa"
+    assert "selected_paper" in debug["planner_context"]["used_context_fields"]
+    assert "parse_and_index_paper" in debug["planner_context"]["high_risk_tools"]
     assert any(item["step_id"] == "parse_and_index_paper" for item in debug["skipped_steps"])
     PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
+
+
+def test_paper_summary_detail_and_qa_keep_distinct_plan_shapes() -> None:
+    base_context = {"selected_paper": {"arxiv_id": "2401.00001", "title": "RAG"}}
+    _, summary_plan, _ = _build_tool_aware_plan(
+        "paper_summary",
+        state=AgentState(intent="paper_summary", message="总结这篇论文", context=base_context),
+    )
+    _, detail_plan, _ = _build_tool_aware_plan(
+        "paper_detail",
+        state=AgentState(intent="paper_detail", message="这篇论文有哪些结构信息？", context=base_context),
+    )
+    _, qa_plan, _ = _build_tool_aware_plan(
+        "paper_qa",
+        state=AgentState(intent="paper_qa", message="method?", context=base_context),
+    )
+
+    assert _step_ids(summary_plan)[-1] == "summarize_paper"
+    assert _step_ids(detail_plan)[-1] == "inspect_paper_detail"
+    assert _step_ids(qa_plan)[-1] == "answer_paper_question"
+    assert summary_plan.steps[-1].action_type == "summarize"
+    assert detail_plan.steps[-1].action_type == "inspect_detail"
+    assert qa_plan.steps[-1].action_type == "answer"
+    assert summary_plan.steps[-1].tool_name == detail_plan.steps[-1].tool_name == qa_plan.steps[-1].tool_name == "answer_paper_question"
 
 
 def test_rule_based_recommendation_generates_full_plan() -> None:

@@ -182,6 +182,8 @@ ENHANCED_RETRIEVAL_CONFIG = {
     "rerank_candidate_limit": 30,
     "final_context_top_k": 15,
     "max_final_context_top_k": 30,
+    "enable_context_expansion": True,
+    "context_budget_max_chars": 24000,
     "sample_limit": 24,
     "merge_candidate_terms_limit": 24,
     "extract_paper_terms_limit": 10,

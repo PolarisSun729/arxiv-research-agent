@@ -2,6 +2,96 @@ import unittest
 from unittest import mock
 
 from tests.helpers import build_retrieval_service, build_sample_chunks
+from services.paper_qa.context_pack_builder import ContextPackBuilder
+
+
+def build_context_expansion_chunks():
+    return [
+        {
+            "content": "Method opening: the approach has three stages and this paragraph introduces the pipeline.",
+            "metadata": {
+                "chunk_id": "method-parent-1",
+                "parent_chunk_id": "method-parent",
+                "subchunk_index": 1,
+                "subchunk_count": 3,
+                "page_number": 2,
+                "page_range": "2",
+                "section_title": "Method",
+                "section_path": "2 Method",
+                "source": "paper.pdf",
+                "chunk_type": "text",
+                "order_index": 1,
+            },
+        },
+        {
+            "content": "Method anchor: the retrieval pipeline first builds query views and then runs route fusion.",
+            "metadata": {
+                "chunk_id": "method-parent-2",
+                "parent_chunk_id": "method-parent",
+                "subchunk_index": 2,
+                "subchunk_count": 3,
+                "page_number": 2,
+                "page_range": "2",
+                "section_title": "Method",
+                "section_path": "2 Method",
+                "source": "paper.pdf",
+                "chunk_type": "text",
+                "order_index": 2,
+            },
+        },
+        {
+            "content": "Method continuation: the final stage reranks candidates and prepares answer context.",
+            "metadata": {
+                "chunk_id": "method-parent-3",
+                "parent_chunk_id": "method-parent",
+                "subchunk_index": 3,
+                "subchunk_count": 3,
+                "page_number": 3,
+                "page_range": "3",
+                "section_title": "Method",
+                "section_path": "2 Method",
+                "source": "paper.pdf",
+                "chunk_type": "text",
+                "order_index": 3,
+            },
+        },
+        {
+            "content": "Figure 1 describes the method pipeline with query rewrite, fusion, rerank, and context expansion.",
+            "metadata": {
+                "chunk_id": "method-figure",
+                "parent_chunk_id": "method-figure",
+                "subchunk_index": 1,
+                "subchunk_count": 1,
+                "page_number": 3,
+                "page_range": "3",
+                "section_title": "Method",
+                "section_path": "2 Method",
+                "source": "paper.pdf",
+                "chunk_type": "figure",
+                "asset_kind": "image",
+                "asset_path": "figure-method.png",
+                "asset_summary": "Pipeline figure showing query rewrite, route fusion, rerank, and context expansion.",
+                "asset_preview_text": "rewrite -> fusion -> rerank -> expansion",
+                "order_index": 4,
+            },
+        },
+        {
+            "content": "Experiment setup: evaluation uses a held-out benchmark and ablation metrics.",
+            "metadata": {
+                "chunk_id": "experiment-setup",
+                "parent_chunk_id": "experiment-setup",
+                "subchunk_index": 1,
+                "subchunk_count": 1,
+                "page_number": 5,
+                "page_range": "5",
+                "section_title": "Experiments",
+                "section_path": "5 Experiments",
+                "source": "paper.pdf",
+                "chunk_type": "text",
+                "order_index": 5,
+            },
+        },
+    ]
 
 
 class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
@@ -95,6 +185,160 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
         self.assertIn("final_context_top15", debug["stages"])
         self.assertIn("routes", debug)
         self.assertIn("collection_profile", debug)
+
+    def test_context_expansion_debug_links_subchunks_sections_and_assets(self) -> None:
+        service, collection_name, *_ = build_retrieval_service(chunks=build_context_expansion_chunks())
+        options_cls = type(service).enhanced_retrieve.__globals__["RetrievalOptions"]
+
+        result = service.enhanced_retrieve(
+            "How does the method pipeline work step by step?",
+            collection_name,
+            options=options_cls(top_k=1, debug=True, enable_llm_rerank=False),
+        )
+
+        debug = result["debug"]
+        expansion = debug["context_expansion"]
+        relations = expansion["relations"]
+        anchor_ids = [relation["anchor"]["chunk_id"] for relation in relations]
+        candidate_pairs = [
+            (relation["anchor"]["chunk_id"], candidate["candidate_chunk_id"], candidate["expansion_type"])
+            for relation in relations
+            for candidate in relation["candidates"]
+        ]
+
+        self.assertEqual(len(result["chunks"]), 1)
+        self.assertGreater(expansion["anchor_count"], len(result["chunks"]))
+        self.assertIn("method-parent-2", anchor_ids)
+        self.assertEqual(expansion["policy"]["name"], "method_flow")
+        self.assertIn(("method-parent-2", "method-parent-1", "sibling"), candidate_pairs)
+        self.assertIn(("method-parent-2", "method-parent-3", "sibling"), candidate_pairs)
+        self.assertTrue(
+            any(
+                anchor == "method-parent-2"
+                and candidate == "method-figure"
+                and expansion_type in {"asset_related", "section_neighbors"}
+                for anchor, candidate, expansion_type in candidate_pairs
+            )
+        )
+        self.assertTrue(
+            any(
+                relation["anchor"]["chunk_id"] == "method-parent-2"
+                and any(candidate["expansion_type"] == "section_header" for candidate in relation["candidates"])
+                for relation in relations
+            )
+        )
+        merged = next(item for item in expansion["candidate_pool"] if item["candidate_chunk_id"] == "method-parent-1")
+        self.assertIn("method-parent-2", merged["expansion_source_anchor_ids"])
+        self.assertIn("sibling", merged["relationship_types"])
+        self.assertIn("section_header", merged["relationship_types"])
+        self.assertGreater(merged["expansion_score"], 0)
+
+    def test_context_expansion_uses_question_type_specific_policies(self) -> None:
+        service, collection_name, *_ = build_retrieval_service(chunks=build_context_expansion_chunks())
+        options_cls = type(service).enhanced_retrieve.__globals__["RetrievalOptions"]
+
+        figure_result = service.enhanced_retrieve(
+            "What does Figure 1 show in the method pipeline?",
+            collection_name,
+            options=options_cls(top_k=1, debug=True, enable_llm_rerank=False),
+        )
+        figure_expansion = figure_result["debug"]["context_expansion"]
+        self.assertEqual(figure_expansion["policy"]["name"], "figure_table")
+        figure_candidate = next(item for item in figure_expansion["candidate_pool"] if item["candidate_chunk_id"] == "method-figure")
+        self.assertTrue({"asset_related", "cited_asset_context"} & set(figure_candidate["relationship_types"]))
+
+        experiment_result = service.enhanced_retrieve(
+            "Which dataset baseline metric and implementation details are used in the experiments?",
+            collection_name,
+            options=options_cls(top_k=1, debug=True, enable_llm_rerank=False),
+        )
+        experiment_expansion = experiment_result["debug"]["context_expansion"]
+        self.assertEqual(experiment_expansion["policy"]["name"], "experiment_setup")
+        self.assertIn("page_neighbors", experiment_expansion["policy"]["actions"])
+        experiment_candidate = next(item for item in experiment_expansion["candidate_pool"] if item["candidate_chunk_id"] == "experiment-setup")
+        self.assertTrue({"self", "section_neighbors", "page_neighbors"} & set(experiment_candidate["relationship_types"]))
+
+        result_result = service.enhanced_retrieve(
+            "What results ablation and performance comparison are reported?",
+            collection_name,
+            options=options_cls(top_k=1, debug=True, enable_llm_rerank=False),
+        )
+        result_expansion = result_result["debug"]["context_expansion"]
+        self.assertEqual(result_expansion["policy"]["name"], "result_analysis")
+        result_asset = next(item for item in result_expansion["candidate_pool"] if item["candidate_chunk_id"] == "method-figure")
+        self.assertEqual(result_asset["chunk_type"], "figure")
+        self.assertIn("asset_related", result_asset["relationship_types"])
+        self.assertGreaterEqual(result_asset["expansion_score"], result_expansion["candidate_pool"][0]["expansion_score"])
+
+    def test_context_expansion_degrades_when_structure_fields_are_missing(self) -> None:
+        service, collection_name, *_ = build_retrieval_service(
+            chunks=[
+                {
+                    "content": "A relevant method chunk without parent or section metadata.",
+                    "metadata": {"chunk_id": "loose-method", "chunk_type": "text", "source": "paper.pdf"},
+                }
+            ]
+        )
+        options_cls = type(service).enhanced_retrieve.__globals__["RetrievalOptions"]
+
+        result = service.enhanced_retrieve(
+            "What is the method?",
+            collection_name,
+            options=options_cls(top_k=1, debug=True, enable_llm_rerank=False),
+        )
+
+        relation = result["debug"]["context_expansion"]["relations"][0]
+        self.assertEqual(relation["anchor"]["chunk_id"], "loose-method")
+        self.assertTrue(any(candidate["expansion_type"] == "self" for candidate in relation["candidates"]))
+
+    def test_context_budget_selects_expanded_final_context_and_can_be_disabled(self) -> None:
+        service, collection_name, *_ = build_retrieval_service(chunks=build_context_expansion_chunks())
+        options_cls = type(service).enhanced_retrieve.__globals__["RetrievalOptions"]
+
+        expanded = service.enhanced_retrieve(
+            "How does the method pipeline work step by step?",
+            collection_name,
+            options=options_cls(top_k=4, debug=True, enable_llm_rerank=False),
+        )
+        disabled = service.enhanced_retrieve(
+            "How does the method pipeline work step by step?",
+            collection_name,
+            options=options_cls(top_k=4, debug=True, enable_llm_rerank=False, enable_context_expansion=False),
+        )
+
+        expanded_ids = [chunk["chunk_id"] for chunk in expanded["chunks"]]
+        disabled_ids = [chunk["chunk_id"] for chunk in disabled["chunks"]]
+        reranked_ids = [chunk["chunk_id"] for chunk in expanded["debug"]["stages"]["reranked_top30"][:4]]
+
+        self.assertEqual(disabled_ids, reranked_ids)
+        self.assertTrue(expanded["debug"]["context_budget"]["applied"])
+        self.assertFalse(disabled["debug"]["context_budget"]["applied"])
+        self.assertEqual(set(expanded_ids), set(expanded["debug"]["context_budget"]["included_chunk_ids"]))
+        self.assertIn("sibling_context", expanded["debug"]["context_budget"]["role_counts"])
+        self.assertIn("figure_evidence", expanded["debug"]["context_budget"]["role_counts"])
+        self.assertIn("method-parent-3", expanded["debug"]["context_budget"]["included_chunk_ids"])
+        self.assertTrue(any(chunk.get("context_role") for chunk in expanded["chunks"]))
+        self.assertFalse(any(chunk.get("context_role") for chunk in disabled["chunks"]))
+
+    def test_context_pack_sources_preserve_context_budget_metadata(self) -> None:
+        service, collection_name, *_ = build_retrieval_service(chunks=build_context_expansion_chunks())
+        options_cls = type(service).enhanced_retrieve.__globals__["RetrievalOptions"]
+
+        result = service.enhanced_retrieve(
+            "How does the method pipeline work step by step?",
+            collection_name,
+            options=options_cls(top_k=4, debug=True, enable_llm_rerank=False),
+        )
+        context_pack = ContextPackBuilder().build(result["chunks"])
+        sources = context_pack["source_payload"]
+
+        sibling_source = next(source for source in sources if source["chunk_id"] == "method-parent-3")
+        figure_source = next(source for source in sources if source["chunk_id"] == "method-figure")
+        self.assertEqual(sibling_source["context_role"], "sibling_context")
+        self.assertIn("sibling", sibling_source["relationship_types"])
+        self.assertEqual(figure_source["context_role"], "figure_evidence")
+        self.assertIn("context_budget_score", figure_source)
+        self.assertIn("role: sibling_context", context_pack["text_context"])
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ class RetrievalOptions:
     enable_hyde: Optional[bool] = None
     enable_keyword_search: Optional[bool] = None
     enable_llm_rerank: Optional[bool] = None
+    enable_context_expansion: Optional[bool] = None
     debug: Optional[bool] = None
     memory_context: Optional[Dict[str, Any]] = None
 

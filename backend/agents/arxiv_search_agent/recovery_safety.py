@@ -47,6 +47,7 @@ class RecoverySafetyGuard:
                 continue
             side_effects.add(str(tool.side_effect_level or "none"))
             confirmation_capable = confirmation_capable or bool(getattr(tool, "requires_confirmation", False))
+        side_effects.add(str(failed_step.side_effect_level or "none"))
 
         if action.action_type == "retry_step" and "persistent_write" in side_effects:
             reasons.append("persistent_write_retry_blocked")
@@ -58,6 +59,7 @@ class RecoverySafetyGuard:
         if reasons:
             fallback_action = RecoveryAction(
                 action_type="fallback_answer",
+                action_semantic="fallback_answer",
                 target_step_id=failed_step.step_id,
                 selected_candidate_id=action.selected_candidate_id,
                 patch_strategy="fallback_answer",

@@ -409,13 +409,41 @@ class PlanDraftStep(BaseModel):
     action_type: str
     tool_name: str
     step_reason: Optional[str] = None
+    why_this_step: Optional[str] = None
     input_bindings: List["StepInputBinding"] = Field(default_factory=list)
     depends_on: List[str] = Field(default_factory=list)
     expected_output_key: Optional[str] = None
+    expected_output: Dict[str, Any] = Field(default_factory=dict)
     retry_policy: Optional["StepPolicy"] = None
     risk_level: Literal["low", "medium", "high"] = "low"
+    risk_notes: Optional[str] = None
     requires_confirmation: bool = False
+    failure_recovery_hint: Optional[str] = None
     fallback_reason: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_llm_protocol_aliases(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        # LLM 协议使用更面向解释的字段名；这里统一映射到既有内部字段，避免破坏旧 planner。
+        if not normalized.get("step_reason") and normalized.get("why_this_step"):
+            normalized["step_reason"] = normalized.get("why_this_step")
+        expected_output = normalized.get("expected_output")
+        if not normalized.get("expected_output_key") and expected_output is not None:
+            if isinstance(expected_output, str):
+                normalized["expected_output_key"] = expected_output
+                normalized["expected_output"] = {"output_key": expected_output}
+            elif isinstance(expected_output, dict):
+                for key in ("output_key", "key", "name", "field"):
+                    output_key = str(expected_output.get(key) or "").strip()
+                    if output_key:
+                        normalized["expected_output_key"] = output_key
+                        break
+        if not normalized.get("fallback_reason") and normalized.get("failure_recovery_hint"):
+            normalized["fallback_reason"] = normalized.get("failure_recovery_hint")
+        return normalized
 
 
 class PlanDraft(BaseModel):
@@ -434,6 +462,63 @@ class PlanDraft(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class PlannerToolContext(BaseModel):
+    """Planner 输入层看到的工具能力快照。
+
+    它只保留规划所需的静态 contract 信息，不携带 adapter 实例，避免 planner 输入
+    与 executor 运行对象耦合。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    tool_name: str
+    description: Optional[str] = None
+    capability_tags: List[str] = Field(default_factory=list)
+    side_effect_level: Literal["none", "session_write", "persistent_write", "external_call"] = "none"
+    requires_confirmation: bool = False
+    can_retry: bool = False
+    failure_modes: List[str] = Field(default_factory=list)
+    recovery_policy: Dict[str, Any] = Field(default_factory=dict)
+    confirmation_policy: Dict[str, Any] = Field(default_factory=dict)
+    input_schema: Dict[str, Any] = Field(default_factory=dict)
+    output_schema: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PlannerContext(BaseModel):
+    """Planner 本轮决策使用的统一上下文。
+
+    后续 planner 只应消费这个稳定对象里的摘要和引用，避免继续从 AgentState、
+    context、ToolRegistry 等位置临时拼装判断条件。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    raw_user_request: Optional[str] = None
+    normalized_goal: Optional[Goal] = None
+    goal_type: Optional[str] = None
+    intent: Optional[str] = None
+    intent_confidence: Optional[float] = None
+    selected_paper: Optional[Dict[str, Any]] = None
+    last_papers: List[Dict[str, Any]] = Field(default_factory=list)
+    paper_qa_result: Optional[Dict[str, Any]] = None
+    pending_action: Optional[Dict[str, Any]] = None
+    user_memory_summary: Any = None
+    research_profile: Any = None
+    available_tools: List[PlannerToolContext] = Field(default_factory=list)
+    available_tool_names: List[str] = Field(default_factory=list)
+    context_refs: List[str] = Field(default_factory=list)
+    context_field_summary: Dict[str, Any] = Field(default_factory=dict)
+    session_state: Dict[str, Any] = Field(default_factory=dict)
+    intermediate_results: Dict[str, Any] = Field(default_factory=dict)
+    reusable_outputs: Dict[str, Any] = Field(default_factory=dict)
+    high_risk_tools: List[str] = Field(default_factory=list)
+
+    @field_validator("normalized_goal", mode="before")
+    @classmethod
+    def _coerce_goal_model(cls, value: Any) -> Any:
+        # 单测和运行时可能通过不同包路径加载 schema；同形 Goal 先转 dict，避免 planner context 构造失败。
+        model_dump = getattr(value, "model_dump", None)
+        return model_dump() if callable(model_dump) else value
+
+
 class ToolCandidate(BaseModel):
     """候选工具筛选结果中的单个工具说明。"""
     model_config = ConfigDict(extra="forbid")
@@ -442,6 +527,9 @@ class ToolCandidate(BaseModel):
     capability_tags: List[str] = Field(default_factory=list)
     side_effect_level: str = "none"
     requires_confirmation: bool = False
+    failure_modes: List[str] = Field(default_factory=list)
+    recovery_policy: Dict[str, Any] = Field(default_factory=dict)
+    confirmation_policy: Dict[str, Any] = Field(default_factory=dict)
     selection_reason: Optional[str] = None
 
 
@@ -453,6 +541,9 @@ class ExcludedToolCandidate(BaseModel):
     capability_tags: List[str] = Field(default_factory=list)
     side_effect_level: str = "none"
     requires_confirmation: bool = False
+    failure_modes: List[str] = Field(default_factory=list)
+    recovery_policy: Dict[str, Any] = Field(default_factory=dict)
+    confirmation_policy: Dict[str, Any] = Field(default_factory=dict)
     exclusion_reason: Optional[str] = None
 
 
@@ -911,6 +1002,34 @@ RecoveryActionType = Literal[
 
 RecoverySeverity = Literal["info", "warning", "error", "critical"]
 RecoveryRiskLevel = Literal["low", "medium", "high"]
+ObservationSignal = Literal[
+    "success_with_sufficient_result",
+    "success_but_empty_result",
+    "success_but_low_quality",
+    "missing_required_context",
+    "target_not_resolved",
+    "index_not_found",
+    "confirmation_required",
+    "user_rejected",
+    "external_tool_failed",
+    "validation_failed",
+    "persistent_write_succeeded",
+    "persistent_write_uncertain",
+    "unrecoverable_error",
+]
+RecoveryActionSemantic = Literal[
+    "retry_same_step",
+    "patch_current_step_inputs",
+    "insert_step_before_current",
+    "append_step_after_current",
+    "replace_remaining_plan",
+    "ask_clarification",
+    "request_confirmation",
+    "fallback_answer",
+    "terminate_success",
+    "terminate_failed",
+    "skip_step",
+]
 
 
 class RecoveryCandidate(BaseModel):
@@ -919,12 +1038,15 @@ class RecoveryCandidate(BaseModel):
 
     candidate_id: str
     action_type: RecoveryActionType
+    action_semantic: Optional[RecoveryActionSemantic] = None
     failure_category: FailureCategory
     priority: int = 100
     confidence: float = 1.0
     reason: str
     target_step_id: str
     required_tools: List[str] = Field(default_factory=list)
+    policy_source: Optional[str] = None
+    tool_recovery_policy: Dict[str, Any] = Field(default_factory=dict)
     patch_strategy: Optional[str] = None
     strategy_payload: Dict[str, Any] = Field(default_factory=dict)
     risk_level: RecoveryRiskLevel = "low"
@@ -939,6 +1061,7 @@ class RecoveryAction(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action_type: RecoveryActionType
+    action_semantic: Optional[RecoveryActionSemantic] = None
     target_step_id: str
     selected_candidate_id: Optional[str] = None
     patch_strategy: Optional[str] = None
@@ -987,6 +1110,7 @@ class ObservationResult(BaseModel):
         "need_confirmation",
         "need_clarification",
     ]
+    observation_signal: Optional[ObservationSignal] = None
     reason: Optional[str] = None
     confidence: float = 1.0
     details: Dict[str, Any] = Field(default_factory=dict)

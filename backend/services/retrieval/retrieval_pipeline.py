@@ -4,6 +4,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from services.retrieval.contracts import RetrievalOptions, RetrievalPipelineResult, RerankResult
+from services.retrieval.context_expansion import ContextBudgetSelector, ContextExpansionPreparer
 from services.retrieval.execution import RouteExecutionSupport
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,8 @@ class RetrievalPipeline:
         self.memory_flag_reader = memory_flag_reader
         self.retrieval_config = retrieval_config
         self.enhanced_config = enhanced_config
+        self.context_expansion_preparer = ContextExpansionPreparer(trace_builder=trace_builder)
+        self.context_budget_selector = ContextBudgetSelector(trace_builder=trace_builder)
         self.rerank_executor = RouteExecutionSupport(
             timeouts={
                 "rerank": self.enhanced_config.get("route_timeout_rerank_seconds", 12),
@@ -97,7 +100,8 @@ class RetrievalPipeline:
         route_metrics = dict(route_bundle.get("route_metrics") or {})
         embedding_batch_debug = route_bundle.get("embedding_batch") or {}
 
-        fused_limit = runtime["rrf_candidate_limit"] if runtime["enable_llm_rerank"] else runtime["effective_top_k"]
+        # 即使关闭 LLM rerank，也保留 rerank/fused top_n 作为扩展锚点池；最终返回仍由 effective_top_k 控制。
+        fused_limit = max(runtime["rrf_candidate_limit"], runtime["effective_top_k"])
         fusion_result = self.fusion_service.fuse(
             routes,
             fused_limit=fused_limit,
@@ -119,7 +123,23 @@ class RetrievalPipeline:
             original_question=user_query,
         )
 
-        final_context_top15 = rerank_result.final_results[: runtime["effective_top_k"]]
+        # 先取原始 rerank top_k 作为 fallback 和 anchor 标记基线；真正返回上下文由预算层统一决定。
+        original_final_context_top15 = rerank_result.final_results[: runtime["effective_top_k"]]
+        context_expansion = self.context_expansion_preparer.prepare(
+            reranked_chunks=rerank_result.reranked_results,
+            final_context_chunks=original_final_context_top15,
+            retrieval_index=collection_retrieval_index,
+            query_profile=query_profile,
+            anchor_limit=runtime["rrf_candidate_limit"],
+        )
+        final_context_top15, context_budget = self.context_budget_selector.select(
+            reranked_chunks=rerank_result.reranked_results,
+            context_expansion=context_expansion,
+            retrieval_index=collection_retrieval_index,
+            final_context_top_k=runtime["effective_top_k"],
+            max_context_chars=runtime["context_budget_max_chars"],
+            enabled=runtime["enable_context_expansion"],
+        )
         route_metrics["rerank"] = rerank_result.route_metric or {}
         debug = None
         if runtime["debug_enabled"]:
@@ -142,8 +162,10 @@ class RetrievalPipeline:
                 fused_top30=fusion_result.fused_top_n,
                 reranked_top30=rerank_result.reranked_results[: runtime["rrf_candidate_limit"]],
                 final_context_top15=final_context_top15,
-                final_results=rerank_result.final_results,
+                final_results=final_context_top15,
                 rerank_debug=rerank_result.rerank_debug,
+                context_expansion=context_expansion,
+                context_budget=context_budget,
                 config={
                     "requested_top_k": runtime["requested_top_k"],
                     "effective_top_k": runtime["effective_top_k"],
@@ -156,6 +178,8 @@ class RetrievalPipeline:
                     "enable_hyde": runtime["enable_hyde"],
                     "enable_keyword_search": runtime["enable_keyword_search"],
                     "enable_llm_rerank": runtime["enable_llm_rerank"],
+                    "enable_context_expansion": runtime["enable_context_expansion"],
+                    "context_budget_max_chars": runtime["context_budget_max_chars"],
                     "memory_source_boost_weight": float(
                         self.memory_flag_reader(
                             "memory_source_boost_weight",
@@ -180,6 +204,7 @@ class RetrievalPipeline:
                 "enable_hyde": runtime["enable_hyde"],
                 "enable_keyword_search": runtime["enable_keyword_search"],
                 "enable_llm_rerank": runtime["enable_llm_rerank"],
+                "enable_context_expansion": runtime["enable_context_expansion"],
                 "debug": runtime["debug_enabled"],
             },
             query_profile=query_profile,
@@ -194,11 +219,13 @@ class RetrievalPipeline:
             raw_retrieval_top30=fusion_result.raw_retrieval_top_n,
             fused_results=fusion_result.fused_results,
             reranked_results=rerank_result.reranked_results,
-            final_results=rerank_result.final_results,
+            final_results=final_context_top15,
+            context_expansion=context_expansion,
+            context_budget=context_budget,
         )
 
         return RetrievalPipelineResult(
-            chunks=rerank_result.final_results,
+            chunks=final_context_top15,
             debug=debug,
             trace_export=trace_export,
         ).to_response()
@@ -307,8 +334,10 @@ class RetrievalPipeline:
             "enable_hyde": self.option_resolver(options.enable_hyde, self.retrieval_config["enable_hyde"]),
             "enable_keyword_search": self.option_resolver(options.enable_keyword_search, self.retrieval_config["enable_keyword_search"]),
             "enable_llm_rerank": self.option_resolver(options.enable_llm_rerank, self.retrieval_config.get("enable_llm_rerank", False)),
+            "enable_context_expansion": self.option_resolver(options.enable_context_expansion, self.enhanced_config.get("enable_context_expansion", True)),
             "debug_enabled": self.option_resolver(options.debug, self.retrieval_config["debug"]),
             "recall_candidate_limit": self.enhanced_config["recall_candidate_limit"],
             "rrf_candidate_limit": self.enhanced_config["rrf_candidate_limit"],
             "rerank_candidate_limit": self.enhanced_config["rerank_candidate_limit"],
+            "context_budget_max_chars": max(1, int(self.enhanced_config.get("context_budget_max_chars", 24000))),
         }

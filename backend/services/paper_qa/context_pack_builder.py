@@ -58,6 +58,13 @@ class ContextPackBuilder:
                     "parent_chunk_id": result.get("parent_chunk_id", result.get("chunk_id", "")),
                     "original_chunk_id": result.get("original_chunk_id", ""),
                     "chunk_type": chunk_type,
+                    "context_role": result.get("context_role", ""),
+                    "context_budget_score": result.get("context_budget_score"),
+                    "context_budget_reason": result.get("context_budget_reason", ""),
+                    "expansion_source_anchor_ids": result.get("expansion_source_anchor_ids", []),
+                    "relationship_types": result.get("relationship_types", []),
+                    "expansion_reasons": result.get("expansion_reasons", []),
+                    "final_context_reason": result.get("final_context_reason", ""),
                     "asset_kind": result.get("asset_kind", ""),
                     "asset_summary": result.get("asset_summary", ""),
                     "asset_preview_text": result.get("asset_preview_text", ""),
@@ -145,6 +152,13 @@ class ContextPackBuilder:
             "parent_chunk_id": result.get("parent_chunk_id", result.get("chunk_id", 0)),
             "original_chunk_id": result.get("original_chunk_id", ""),
             "chunk_type": chunk_type,
+            "context_role": result.get("context_role", ""),
+            "context_budget_score": result.get("context_budget_score"),
+            "context_budget_reason": result.get("context_budget_reason", ""),
+            "expansion_source_anchor_ids": result.get("expansion_source_anchor_ids", []),
+            "relationship_types": result.get("relationship_types", []),
+            "expansion_reasons": result.get("expansion_reasons", []),
+            "final_context_reason": result.get("final_context_reason", ""),
             "asset_kind": result.get("asset_kind", ""),
             "asset_path": result.get("asset_path", ""),
             "asset_summary": result.get("asset_summary", ""),
@@ -191,4 +205,7 @@ class ContextPackBuilder:
             header_parts.append(f"page: {page_number}")
         if section_path:
             header_parts.append(f"section: {section_path}")
+        context_role = str(result.get("context_role", "") or "").strip()
+        if context_role:
+            header_parts.append(f"role: {context_role}")
         return "\n".join(header_parts + [content]).strip()

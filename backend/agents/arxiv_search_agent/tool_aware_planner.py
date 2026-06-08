@@ -14,6 +14,8 @@ from .schemas import (
     PlanDraft,
     PlanDraftStep,
     PlanStep,
+    PlannerContext,
+    PlannerToolContext,
     StepCondition,
     StepInputBinding,
     StepPolicy,
@@ -23,6 +25,7 @@ from .schemas import (
 )
 from .state import AgentState
 from .tool_registry import PLANNER_TOOL_REGISTRY, ToolRegistry
+from .planner_context import build_planner_context
 
 
 class PlanDraftConversionError(ValueError):
@@ -96,17 +99,17 @@ class ToolCandidateSelector:
     def __init__(self, tool_registry: ToolRegistry = PLANNER_TOOL_REGISTRY) -> None:
         self.tool_registry = tool_registry
 
-    def select(self, goal: Goal, state: AgentState) -> ToolCandidateSelection:
-        del state
+    def select(self, goal: Goal, state: AgentState, planner_context: Optional[PlannerContext] = None) -> ToolCandidateSelection:
+        planner_context = planner_context or _minimal_planner_context(goal, state, self.tool_registry)
         goal_type = str(goal.goal_type or "unsupported").strip() or "unsupported"
         allowed_tags = set(self._GOAL_TAG_RULES.get(goal_type, {"fallback"}))
-        allowed_tool_names = set(self._GOAL_TOOL_RULES.get(goal_type, set()))
+        allowed_tool_names, selection_notes = self._allowed_tools_for_context(goal_type, state, planner_context)
         candidate_tools: List[ToolCandidate] = []
         excluded_tools: List[ExcludedToolCandidate] = []
 
-        for tool in self.tool_registry.list_tools():
+        for tool in list(planner_context.available_tools or []):
             tags = set(tool.capability_tags or [])
-            # 已知业务目标优先走显式白名单，避免仅凭 retrieve/answer 这类通用标签串到其他业务链路。
+            # 已知业务目标优先走显式白名单；白名单已经融合上下文，避免通用标签串到其他业务链路。
             selected = bool(tool.tool_name in allowed_tool_names) if allowed_tool_names else bool(tags.intersection(allowed_tags))
             if goal_type in {"unclear", "unsupported"} and tags.intersection(self._BUSINESS_TAGS):
                 selected = False
@@ -118,7 +121,10 @@ class ToolCandidateSelector:
                         capability_tags=list(tool.capability_tags or []),
                         side_effect_level=tool.side_effect_level,
                         requires_confirmation=tool.requires_confirmation,
-                        selection_reason=self._selection_reason(goal_type, tool.tool_name, tags, allowed_tags),
+                        failure_modes=list(tool.failure_modes or []),
+                        recovery_policy=dict(tool.recovery_policy or {}),
+                        confirmation_policy=dict(tool.confirmation_policy or {}),
+                        selection_reason=self._selection_reason(goal_type, tool.tool_name, tags, allowed_tags, selection_notes),
                     )
                 )
                 continue
@@ -129,7 +135,10 @@ class ToolCandidateSelector:
                     capability_tags=list(tool.capability_tags or []),
                     side_effect_level=tool.side_effect_level,
                     requires_confirmation=tool.requires_confirmation,
-                    exclusion_reason=self._exclusion_reason(goal_type, tags),
+                    failure_modes=list(tool.failure_modes or []),
+                    recovery_policy=dict(tool.recovery_policy or {}),
+                    confirmation_policy=dict(tool.confirmation_policy or {}),
+                    exclusion_reason=self._exclusion_reason(goal_type, tool.tool_name, tags, allowed_tool_names, selection_notes),
                 )
             )
 
@@ -142,7 +151,7 @@ class ToolCandidateSelector:
             goal_type=goal_type,
             candidate_tools=candidate_tools,
             excluded_tools=excluded_tools,
-            selection_reason=f"goal_type={goal_type} matched capability tags: {sorted(allowed_tags)}",
+            selection_reason=f"goal_type={goal_type} matched context-aware tools; notes={selection_notes}",
             risk_summary={
                 "candidate_count": len(candidate_tools),
                 "excluded_count": len(excluded_tools),
@@ -155,19 +164,70 @@ class ToolCandidateSelector:
                 "confirmation_required_tools": [
                     tool.tool_name for tool in candidate_tools if tool.requires_confirmation
                 ],
+                "high_risk_tools": list(planner_context.high_risk_tools or []),
+                "selection_notes": selection_notes,
                 "risk_level": "high" if any(tool.side_effect_level == "persistent_write" for tool in risky_tools) else ("medium" if risky_tools else "low"),
             },
         )
 
-    def _selection_reason(self, goal_type: str, tool_name: str, tags: Set[str], allowed_tags: Set[str]) -> str:
+    def _allowed_tools_for_context(
+        self,
+        goal_type: str,
+        state: AgentState,
+        planner_context: PlannerContext,
+    ) -> tuple[Set[str], List[str]]:
+        allowed_tool_names = set(self._GOAL_TOOL_RULES.get(goal_type, set()))
+        notes: List[str] = [f"goal_type={goal_type}"]
+
+        if goal_type == "arxiv_search":
+            if _planner_has_profile_context(planner_context):
+                notes.append("user_memory_or_profile_available")
+            else:
+                # personalize 是可选步骤，候选层保留工具能力，真正是否执行由 rule builder 基于画像上下文决定。
+                notes.append("personalize_candidate_available_but_requires_memory")
+
+        if goal_type == "paper_qa":
+            has_target = _planner_has_paper_target(planner_context, state)
+            qa_index_state = _planner_qa_index_state(planner_context)
+            if has_target:
+                notes.append("paper_target_available")
+            else:
+                # 没有目标论文时只开放解析/澄清工具，防止 answer 工具在缺少 paper_ref 时被规划。
+                allowed_tool_names = {"resolve_paper", "analyze_ambiguity", "generate_clarification"}
+                notes.append("paper_target_missing_prefer_resolve_or_clarification")
+            if qa_index_state in {"missing", "stale", "failed"}:
+                allowed_tool_names.update({"request_confirmation", "parse_and_index_paper"})
+                notes.append(f"qa_index_{qa_index_state}_include_index_candidates")
+            elif not _planner_has_qa_result(planner_context):
+                notes.append("qa_index_unknown_check_before_answer")
+
+        if goal_type == "recommendation":
+            if _planner_has_candidate_papers(planner_context):
+                notes.append("candidate_papers_available")
+            else:
+                # 推荐旧流程允许候选论文为空时在 adapter 内降级，因此这里只记录上下文缺口，不收窄工具。
+                notes.append("candidate_papers_absent_but_loader_can_degrade")
+
+        if goal_type == "preference_action":
+            if _planner_has_paper_target(planner_context, state):
+                notes.append("persistent_write_target_available")
+            else:
+                allowed_tool_names = {"resolve_preference_target", "analyze_ambiguity", "generate_clarification"}
+                notes.append("persistent_write_target_missing_exclude_write")
+
+        return allowed_tool_names, notes
+
+    def _selection_reason(self, goal_type: str, tool_name: str, tags: Set[str], allowed_tags: Set[str], selection_notes: Sequence[str]) -> str:
         matched_tags = sorted(tags.intersection(allowed_tags))
         if matched_tags:
-            return f"{goal_type} allows tags {matched_tags}"
-        return f"{goal_type} explicitly allows tool {tool_name}"
+            return f"{goal_type} allows tags {matched_tags}; context={list(selection_notes)}"
+        return f"{goal_type} explicitly allows tool {tool_name}; context={list(selection_notes)}"
 
-    def _exclusion_reason(self, goal_type: str, tags: Set[str]) -> str:
+    def _exclusion_reason(self, goal_type: str, tool_name: str, tags: Set[str], allowed_tool_names: Set[str], selection_notes: Sequence[str]) -> str:
         if goal_type in {"unclear", "unsupported"} and tags.intersection(self._BUSINESS_TAGS):
             return "unclear/unsupported goals cannot expose business or write tools"
+        if allowed_tool_names and tool_name not in allowed_tool_names:
+            return f"tool not selected by planner context; context={list(selection_notes)}"
         return f"tool capabilities {sorted(tags)} do not match goal_type={goal_type}"
 
 
@@ -194,10 +254,12 @@ class LLMPlanDraftGenerator:
         state: AgentState,
         candidate_tools: Sequence[ToolCandidate],
         tool_registry: ToolRegistry,
+        planner_context: Optional[PlannerContext] = None,
     ) -> PlanDraft:
         if self.generation_service is None:
             raise LLMPlanDraftError("generation service unavailable")
-        prompt = self._build_prompt(goal, state, candidate_tools, tool_registry)
+        planner_context = planner_context or _minimal_planner_context(goal, state, tool_registry)
+        prompt = self._build_prompt(goal, state, candidate_tools, tool_registry, planner_context)
         raw_text = self._invoke_generation_service(prompt)
         self.last_debug["raw_llm_plan"] = _safe_debug_text(raw_text)
         payload = self._parse_json_only(raw_text)
@@ -212,6 +274,7 @@ class LLMPlanDraftGenerator:
         state: AgentState,
         candidate_tools: Sequence[ToolCandidate],
         tool_registry: ToolRegistry,
+        planner_context: PlannerContext,
     ) -> str:
         tool_payload = []
         for candidate in list(candidate_tools or []):
@@ -227,18 +290,34 @@ class LLMPlanDraftGenerator:
                     "side_effect_level": tool.side_effect_level,
                     "requires_confirmation": tool.requires_confirmation,
                     "can_retry": tool.can_retry,
+                    "failure_modes": list(tool.failure_modes or []),
+                    "recovery_policy": dict(tool.recovery_policy or {}),
+                    "confirmation_policy": dict(tool.confirmation_policy or {}),
                 }
             )
         prompt_payload = {
-            "user_request": state.message,
+            "user_request": planner_context.raw_user_request or state.message,
             "goal": goal.model_dump(),
             "candidate_tools": tool_payload,
-            "context_summary": _compact_mapping(state.context if isinstance(state.context, Mapping) else {}),
+            "planner_context": {
+                "intent": planner_context.intent,
+                "intent_confidence": planner_context.intent_confidence,
+                "context_refs": list(planner_context.context_refs or []),
+                "context_field_summary": dict(planner_context.context_field_summary or {}),
+                "session_state": dict(planner_context.session_state or {}),
+                "intermediate_result_keys": sorted((planner_context.intermediate_results or {}).keys()),
+                "reusable_output_keys": sorted((planner_context.reusable_outputs or {}).keys()),
+                "high_risk_tools": list(planner_context.high_risk_tools or []),
+                "has_selected_paper": bool(planner_context.selected_paper),
+                "last_papers_count": len(list(planner_context.last_papers or [])),
+                "paper_qa_result_status": (planner_context.paper_qa_result or {}).get("status") if isinstance(planner_context.paper_qa_result, Mapping) else None,
+                "pending_action_type": (planner_context.pending_action or {}).get("type") if isinstance(planner_context.pending_action, Mapping) else None,
+            },
             "current_state_summary": {
                 "intent": state.intent,
                 "has_search_spec": state.search_spec is not None,
                 "context_keys": sorted((state.context or {}).keys()) if isinstance(state.context, Mapping) else [],
-                "has_selected_paper": bool(_get_selected_paper_hint(state.context if isinstance(state.context, Mapping) else {})),
+                "has_selected_paper": bool(planner_context.selected_paper),
             },
             "risk_policy": {
                 "only_candidate_tools": True,
@@ -256,7 +335,7 @@ class LLMPlanDraftGenerator:
                         "step_id": "string",
                         "action_type": "string",
                         "tool_name": "candidate tool only",
-                        "step_reason": "why this step is needed",
+                        "why_this_step": "why this step is needed",
                         "input_bindings": [
                             {
                                 "input_key": "string",
@@ -268,10 +347,11 @@ class LLMPlanDraftGenerator:
                             }
                         ],
                         "depends_on": ["previous step_id"],
-                        "expected_output_key": "unique output key",
+                        "expected_output": {"output_key": "unique output key", "fields": ["expected fields"]},
                         "risk_level": "low|medium|high",
+                        "risk_notes": "risk and confirmation notes",
                         "requires_confirmation": False,
-                        "fallback_reason": "optional string",
+                        "failure_recovery_hint": "optional recovery hint",
                     }
                 ],
                 "fallback_reason": "optional string",
@@ -282,9 +362,11 @@ class LLMPlanDraftGenerator:
             "你是受控 Tool-Aware Planner，只能输出 JSON-only PlanDraft。\n"
             "禁止输出自然语言解释、Markdown、代码块或工具执行结果。\n"
             "只能选择 candidate_tools 中存在的工具，不要创造新工具。\n"
-            "每个 step 必须有 step_reason、合法 depends_on、input_bindings 和 expected_output_key。\n"
+            "每个 step 必须有 why_this_step、合法 depends_on、input_bindings 和 expected_output。\n"
             "高风险或 requires_confirmation 工具必须标记 requires_confirmation=true。\n"
             "persistent_write 工具只能在目标明确时使用；不确定时选择 clarification 工具。\n"
+            "paper_qa 必须先 resolve_paper，再 check_paper_index，再 answer_paper_question。\n"
+            "preference_action 写入必须先 resolve_preference_target，再 update_preference_store，再 verify，再 answer。\n"
             "unsupported 请求只能选择 fallback 工具。\n"
             "输出 JSON 必须符合 allowed_output_schema。\n"
             f"{json.dumps(prompt_payload, ensure_ascii=False)}"
@@ -362,8 +444,8 @@ class LLMPlanDraftGenerator:
             if tool is None:
                 invalid_reasons.append(f"tool {tool_name} is not registered")
                 continue
-            if not str(step.step_reason or "").strip():
-                invalid_reasons.append(f"step {step_id} missing step_reason")
+            if not str(step.step_reason or step.why_this_step or "").strip():
+                invalid_reasons.append(f"step {step_id} missing why_this_step")
             output_key = str(step.expected_output_key or "").strip()
             if not output_key:
                 invalid_reasons.append(f"step {step_id} missing expected_output_key")
@@ -381,6 +463,10 @@ class LLMPlanDraftGenerator:
             for binding in list(step.input_bindings or []):
                 if binding.source_type == "step_output" and str(binding.step_id or "").strip() not in seen_step_ids:
                     invalid_reasons.append(f"step {step_id} input {binding.input_key} references missing step {binding.step_id}")
+                if binding.source_type in {"state", "context", "goal"} and binding.required and not str(binding.source_key or "").strip():
+                    invalid_reasons.append(f"step {step_id} input {binding.input_key} missing source_key for {binding.source_type}")
+                if binding.source_type == "search_spec" and binding.required and state.search_spec is None:
+                    invalid_reasons.append(f"step {step_id} input {binding.input_key} requires missing search_spec")
 
             tags = set(tool.capability_tags or [])
             if "answer" in tags or "fallback" in tags or tool_name in {"generate_clarification", "answer_paper_question"}:
@@ -398,6 +484,7 @@ class LLMPlanDraftGenerator:
             invalid_reasons.append("final answer step is missing")
         if has_preference_write and not _preference_target_is_clear(state):
             invalid_reasons.append("persistent_write preference plan requires a clear target")
+        invalid_reasons.extend(_validate_required_llm_sequence(goal, normalized_steps))
 
         self.last_debug["invalid_reasons"] = invalid_reasons
         if invalid_reasons:
@@ -427,9 +514,11 @@ class RuleBasedToolAwarePlanBuilder:
         state: AgentState,
         candidate_tools: Sequence[ToolCandidate],
         tool_registry: ToolRegistry,
+        planner_context: Optional[PlannerContext] = None,
     ) -> PlanDraft:
         goal_type = str(goal.goal_type or "unsupported").strip() or "unsupported"
-        context = state.context if isinstance(state.context, Mapping) else {}
+        planner_context = planner_context or _minimal_planner_context(goal, state, tool_registry)
+        context = _context_mapping_from_planner_context(planner_context, state)
         candidate_names = _dedupe_tool_names([tool.tool_name for tool in list(candidate_tools or [])])
         tools_by_name = {
             tool_name: tool_registry.get(tool_name)
@@ -442,6 +531,8 @@ class RuleBasedToolAwarePlanBuilder:
             "skipped_tools": [],
             "fallback_reason": None,
             "candidate_tool_names": candidate_names,
+            "planner_context_refs": list(planner_context.context_refs or []),
+            "planner_context_used_fields": _planner_context_used_fields(planner_context),
         }
 
         builders = {
@@ -575,9 +666,14 @@ class RuleBasedToolAwarePlanBuilder:
         tools_by_name: Mapping[str, ToolSpec],
     ) -> PlanDraft:
         resolve = self._require_tool(tools_by_name, "resolve_paper", required_tags={"retrieve"})
+        has_target = bool(_get_selected_paper_hint(context) or _has_candidate_paper_context(context) or _message_has_paper_hint(state.message))
+        if not has_target:
+            self._skip_step("answer_paper_question", "目标论文不明确，先澄清目标，避免 QA 工具在缺少 paper_ref 时误执行。")
+            return self._build_unclear(goal, state, context, tools_by_name)
         check_index = self._require_tool(tools_by_name, "check_paper_index", required_tags={"validate", "retrieve"})
         answer = self._require_tool(tools_by_name, "answer_paper_question", required_tags={"answer"})
         has_selected_paper = bool(_get_selected_paper_hint(context))
+        answer_shape = _paper_qa_draft_answer_shape(goal.intent or state.intent)
         steps = [
             self._draft_step(
                 "resolve_paper",
@@ -606,15 +702,16 @@ class RuleBasedToolAwarePlanBuilder:
                 input_bindings=[_binding_dict("paper_ref", source_type="step_output", step_id="resolve_paper")],
             ),
             self._draft_step(
-                "answer_paper_question",
+                answer_shape["step_id"],
                 answer,
-                action_type="answer",
+                action_type=answer_shape["action_type"],
                 output_key="paper_qa_result",
-                reason="只调用真实 PaperQA answer 工具，检索、rerank 和 grounding 由服务内部处理。",
+                reason=answer_shape["reason"],
                 depends_on=["resolve_paper", "check_paper_index"],
                 input_bindings=[
                     _binding_dict("paper_ref", source_type="step_output", step_id="resolve_paper"),
                     _binding_dict("message", source_type="state", source_key="message"),
+                    _binding_dict("qa_mode", source_type="literal", value=answer_shape["qa_mode"], required=False),
                 ],
             ),
         ]
@@ -708,16 +805,15 @@ class RuleBasedToolAwarePlanBuilder:
         tools_by_name: Mapping[str, ToolSpec],
     ) -> PlanDraft:
         resolve = self._require_tool(tools_by_name, "resolve_preference_target", required_tags={"preference", "retrieve"})
+        has_target = bool(_get_selected_paper_hint(context) or _has_candidate_paper_context(context) or _message_has_paper_hint(state.message))
+        if not has_target:
+            self._skip_step("update_preference_store", "目标论文不明确，拒绝生成 persistent_write 步骤。")
+            return self._build_unclear(goal, state, context, tools_by_name)
         update = self._require_tool(tools_by_name, "update_preference_store", required_tags={"memory_write", "preference"})
         verify = self._require_tool(tools_by_name, "verify_preference_update", required_tags={"validate", "preference"})
         synthesize = self._require_tool(tools_by_name, "synthesize_preference_response", required_tags={"answer", "preference"})
         if update.side_effect_level != "persistent_write":
             return self._fallback_draft(goal, "preference_action", f"update tool side_effect_level must be persistent_write, got {update.side_effect_level}")
-
-        has_target = bool(_get_selected_paper_hint(context) or _has_candidate_paper_context(context) or _message_has_paper_hint(state.message))
-        if not has_target:
-            self._skip_step("update_preference_store", "目标论文不明确，拒绝生成 persistent_write 步骤。")
-            return self._build_unclear(goal, state, context, tools_by_name)
 
         steps = [
             self._draft_step(
@@ -867,12 +963,20 @@ class RuleBasedToolAwarePlanBuilder:
             action_type=action_type,
             tool_name=tool.tool_name,
             step_reason=reason,
+            why_this_step=reason,
             input_bindings=list(input_bindings or []),
             depends_on=list(depends_on or []),
             expected_output_key=output_key,
+            expected_output={"output_key": output_key},
             retry_policy=retry_policy,
             risk_level=_risk_level_for_tool(tool),
+            risk_notes=(
+                f"{tool.side_effect_level} tool follows ToolContract recovery/confirmation policy"
+                if tool.side_effect_level in {"persistent_write", "external_call"} or tool.requires_confirmation
+                else None
+            ),
             requires_confirmation=tool.requires_confirmation,
+            failure_recovery_hint=";".join(list((tool.recovery_policy or {}).get("modes") or [])) or None,
             fallback_reason=fallback_reason,
         )
 
@@ -949,9 +1053,15 @@ class PlanDraftConverter:
                     raise PlanDraftConversionError(
                         f"Draft step {draft_step.step_id} depends on missing step {dependency_step_id}"
                     )
+        if _has_draft_cycle({step.step_id: list(step.depends_on or []) for step in list(draft.steps or [])}):
+            raise PlanDraftConversionError("Draft plan contains circular dependencies")
 
         for draft_step in list(draft.steps or []):
             steps.append(self._convert_step(draft_step, known_step_ids=seen_step_ids, allowed_tool_names=allowed_tools))
+
+        semantic_errors = _validate_required_executable_sequence(goal, steps)
+        if semantic_errors:
+            raise PlanDraftConversionError("; ".join(semantic_errors))
 
         depended_ids = {dependency for step in steps for dependency in list(step.depends_on or [])}
         step_ids = [step.step_id for step in steps]
@@ -995,9 +1105,11 @@ class PlanDraftConverter:
         if tool is None:
             raise PlanDraftConversionError(f"Unknown planner tool: {tool_name}")
         input_bindings = self._validate_input_bindings(draft_step, tool=tool, known_step_ids=known_step_ids)
+        if tool.side_effect_level in {"persistent_write", "external_call"} and not _draft_step_has_risk_strategy(draft_step, tool):
+            raise PlanDraftConversionError(f"Draft step {draft_step.step_id} uses risky tool {tool_name} without risk strategy")
 
         confirmation_policy = None
-        if tool.requires_confirmation or draft_step.requires_confirmation:
+        if tool.requires_confirmation or draft_step.requires_confirmation or tool.side_effect_level == "persistent_write":
             # 草稿只声明“需要确认”，真正的确认策略在转换时统一补齐，避免未校验草稿绕过确认门。
             confirmation_policy = StepPolicy(
                 policy_type="confirmation",
@@ -1033,6 +1145,10 @@ class PlanDraftConverter:
                 raise PlanDraftConversionError(
                     f"Draft step {draft_step.step_id} input {binding.input_key} references missing step {binding.step_id}"
                 )
+            if binding.source_type in {"state", "context", "goal"} and binding.required and not str(binding.source_key or "").strip():
+                raise PlanDraftConversionError(
+                    f"Draft step {draft_step.step_id} input {binding.input_key} missing source_key for {binding.source_type}"
+                )
             if binding.source_type == "literal" and binding.value is None and binding.required:
                 raise PlanDraftConversionError(
                     f"Draft step {draft_step.step_id} input {binding.input_key} uses empty required literal"
@@ -1066,8 +1182,15 @@ def plan_to_draft(plan: ExecutablePlan, *, selected_tools: Sequence[str], fallba
                 input_bindings=list(step.input_bindings or []),
                 depends_on=list(step.depends_on or []),
                 expected_output_key=step.output_key,
+                expected_output={"output_key": step.output_key} if step.output_key else {},
                 risk_level="high" if step.side_effect_level == "persistent_write" else ("medium" if step.side_effect_level == "external_call" else "low"),
+                risk_notes=(
+                    f"{step.side_effect_level} step projected from validated fixed template"
+                    if step.side_effect_level in {"persistent_write", "external_call"} or bool(step.confirmation_policy and step.confirmation_policy.requires_confirmation)
+                    else None
+                ),
                 requires_confirmation=bool(step.confirmation_policy and step.confirmation_policy.requires_confirmation),
+                failure_recovery_hint=step.failure_policy.mode if step.failure_policy is not None else None,
                 fallback_reason=fallback_reason,
             )
             for step in list(plan.steps or [])
@@ -1111,6 +1234,153 @@ def _binding_dict(
     }
 
 
+def _validate_required_llm_sequence(goal: Goal, steps: Sequence[PlanDraftStep]) -> List[str]:
+    """校验 LLM 草稿是否保留关键业务前置步骤。
+
+    这层只处理“草稿语义”，不替代 PlanValidator；目的是在转换成 ExecutablePlan 前
+    尽早拒绝跳过 resolve/validate 的模型输出。
+    """
+
+    goal_type = str(goal.goal_type or "").strip()
+    step_ids = [str(step.step_id or "").strip() for step in list(steps or [])]
+    tool_names = [str(step.tool_name or "").strip() for step in list(steps or [])]
+    reasons: List[str] = []
+
+    if goal_type == "paper_qa":
+        required_tools = ["resolve_paper", "check_paper_index", "answer_paper_question"]
+        for tool_name in required_tools:
+            if tool_name not in tool_names:
+                reasons.append(f"paper_qa plan missing required tool {tool_name}")
+        reasons.extend(_validate_order(tool_names, required_tools, "paper_qa"))
+        answer_step = _find_step_by_tool(steps, "answer_paper_question")
+        if answer_step and not _depends_on_tool(answer_step, steps, "resolve_paper"):
+            reasons.append("paper_qa answer_paper_question must depend on resolve_paper")
+        if answer_step and not _depends_on_tool(answer_step, steps, "check_paper_index"):
+            reasons.append("paper_qa answer_paper_question must depend on check_paper_index")
+
+    if goal_type == "preference_action":
+        if "update_preference_store" in tool_names:
+            required_tools = [
+                "resolve_preference_target",
+                "update_preference_store",
+                "verify_preference_update",
+                "synthesize_preference_response",
+            ]
+            for tool_name in required_tools:
+                if tool_name not in tool_names:
+                    reasons.append(f"preference_action plan missing required tool {tool_name}")
+            reasons.extend(_validate_order(tool_names, required_tools, "preference_action"))
+
+    if len(step_ids) != len(set(step_ids)):
+        reasons.append("LLM draft has duplicate step ids after normalization")
+    return reasons
+
+
+def _validate_order(tool_names: Sequence[str], required_tools: Sequence[str], label: str) -> List[str]:
+    positions = {tool_name: index for index, tool_name in enumerate(tool_names)}
+    reasons: List[str] = []
+    for previous, current in zip(required_tools, required_tools[1:]):
+        if previous in positions and current in positions and positions[previous] > positions[current]:
+            reasons.append(f"{label} tool order invalid: {previous} must precede {current}")
+    return reasons
+
+
+def _find_step_by_tool(steps: Sequence[PlanDraftStep], tool_name: str) -> Optional[PlanDraftStep]:
+    for step in list(steps or []):
+        if step.tool_name == tool_name:
+            return step
+    return None
+
+
+def _depends_on_tool(step: PlanDraftStep, steps: Sequence[PlanDraftStep], tool_name: str) -> bool:
+    steps_by_id = {item.step_id: item for item in list(steps or [])}
+    for dependency in list(step.depends_on or []):
+        dependency_step = steps_by_id.get(dependency)
+        if dependency_step and dependency_step.tool_name == tool_name:
+            return True
+    return False
+
+
+def _paper_qa_draft_answer_shape(intent: Optional[str]) -> Dict[str, str]:
+    normalized_intent = str(intent or "").strip()
+    if normalized_intent == "paper_summary":
+        return {
+            "step_id": "summarize_paper",
+            "action_type": "summarize",
+            "qa_mode": "summary",
+            "reason": "摘要请求强调整体贡献、方法和结论，因此以 summary 模式调用真实 PaperQA answer 工具。",
+        }
+    if normalized_intent == "paper_detail":
+        return {
+            "step_id": "inspect_paper_detail",
+            "action_type": "inspect_detail",
+            "qa_mode": "detail",
+            "reason": "详情请求强调元数据和结构信息，因此以 detail 模式调用真实 PaperQA answer 工具。",
+        }
+    return {
+        "step_id": "answer_paper_question",
+        "action_type": "answer",
+        "qa_mode": "qa",
+        "reason": "具体问答请求强调检索证据并回答用户问题，因此以 qa 模式调用真实 PaperQA answer 工具。",
+    }
+
+
+def _validate_required_executable_sequence(goal: Goal, steps: Sequence[PlanStep]) -> List[str]:
+    """转换层的业务语义校验。
+
+    Validator 会做最终兜底；这里提前拦截 LLM 草稿最常见的“直接调用答案/写入工具”
+    情况，避免未完成前置步骤的草稿进入 ExecutablePlan。
+    """
+
+    goal_type = str(goal.goal_type or "").strip()
+    tool_names = [str(step.tool_name or "").strip() for step in list(steps or [])]
+    reasons: List[str] = []
+    if goal_type == "paper_qa" and "answer_paper_question" in tool_names:
+        for tool_name in ("resolve_paper", "check_paper_index"):
+            if tool_name not in tool_names:
+                reasons.append(f"paper_qa plan missing required tool {tool_name}")
+    if goal_type == "preference_action" and "update_preference_store" in tool_names:
+        for tool_name in ("resolve_preference_target", "verify_preference_update", "synthesize_preference_response"):
+            if tool_name not in tool_names:
+                reasons.append(f"preference_action plan missing required tool {tool_name}")
+    return reasons
+
+
+def _has_draft_cycle(dependencies_by_step: Mapping[str, Sequence[str]]) -> bool:
+    adjacency: Dict[str, List[str]] = {step_id: [] for step_id in dependencies_by_step.keys()}
+    for step_id, dependencies in dependencies_by_step.items():
+        for dependency in list(dependencies or []):
+            adjacency.setdefault(str(dependency), []).append(str(step_id))
+
+    visited: Set[str] = set()
+    stack: Set[str] = set()
+
+    def dfs(node: str) -> bool:
+        if node in stack:
+            return True
+        if node in visited:
+            return False
+        visited.add(node)
+        stack.add(node)
+        for child in adjacency.get(node, []):
+            if dfs(child):
+                return True
+        stack.remove(node)
+        return False
+
+    return any(dfs(node) for node in adjacency.keys() if node not in visited)
+
+
+def _draft_step_has_risk_strategy(draft_step: PlanDraftStep, tool: ToolSpec) -> bool:
+    if draft_step.requires_confirmation or str(draft_step.risk_notes or "").strip():
+        return True
+    if str(draft_step.failure_recovery_hint or draft_step.fallback_reason or "").strip():
+        return True
+    if tool.requires_confirmation or bool(tool.recovery_policy or {}) or bool(tool.confirmation_policy or {}):
+        return True
+    return False
+
+
 def _has_any_context_key(state: AgentState, keys: Set[str]) -> bool:
     context = state.context if isinstance(state.context, Mapping) else {}
     for key in keys:
@@ -1120,6 +1390,126 @@ def _has_any_context_key(state: AgentState, keys: Set[str]) -> bool:
         if value not in (None, "", [], {}):
             return True
     return False
+
+
+def _minimal_planner_context(goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> PlannerContext:
+    try:
+        return build_planner_context(goal=goal, state=state, tool_registry=tool_registry)
+    except Exception:
+        # 兼容历史调用点：selector 单独使用时仍应能退回最小输入，不把构造异常扩散到旧测试/旧入口。
+        return PlannerContext(
+            raw_user_request=str(state.message or "").strip() or None,
+            normalized_goal=goal,
+            goal_type=str(goal.goal_type or state.intent or "unsupported").strip() or "unsupported",
+            intent=str(goal.intent or state.intent or "unsupported").strip() or "unsupported",
+            available_tools=[
+                PlannerToolContext(
+                    tool_name=tool.tool_name,
+                    description=tool.description,
+                    capability_tags=list(tool.capability_tags or []),
+                    side_effect_level=tool.side_effect_level,
+                    requires_confirmation=bool(tool.requires_confirmation),
+                    can_retry=bool(tool.can_retry),
+                    failure_modes=list(tool.failure_modes or []),
+                    recovery_policy=dict(tool.recovery_policy or {}),
+                    confirmation_policy=dict(tool.confirmation_policy or {}),
+                    input_schema=dict(tool.input_schema or {}),
+                    output_schema=dict(tool.output_schema or {}),
+                )
+                for tool in tool_registry.list_tools()
+            ],
+            available_tool_names=[tool.tool_name for tool in tool_registry.list_tools()],
+        )
+
+
+def _context_mapping_from_planner_context(planner_context: PlannerContext, state: AgentState) -> Mapping[str, Any]:
+    context = state.context if isinstance(state.context, Mapping) else {}
+    merged = dict(context)
+    # builder 仍消费 context 形态；这里把 PlannerContext 中的权威引用补回去，避免继续各处猜字段来源。
+    if planner_context.selected_paper:
+        merged["selected_paper"] = planner_context.selected_paper
+    if planner_context.last_papers:
+        merged["last_papers"] = planner_context.last_papers
+    if planner_context.paper_qa_result:
+        merged["paper_qa_result"] = planner_context.paper_qa_result
+    if planner_context.pending_action:
+        merged["pending_action"] = planner_context.pending_action
+    if planner_context.user_memory_summary not in (None, "", [], {}):
+        merged.setdefault("user_memory_summary", planner_context.user_memory_summary)
+    if planner_context.research_profile not in (None, "", [], {}):
+        merged.setdefault("research_profile", planner_context.research_profile)
+    return merged
+
+
+def _planner_context_used_fields(planner_context: PlannerContext) -> List[str]:
+    fields: List[str] = []
+    if planner_context.selected_paper:
+        fields.append("selected_paper")
+    if planner_context.last_papers:
+        fields.append("last_papers")
+    if planner_context.paper_qa_result:
+        fields.append("paper_qa_result")
+    if planner_context.pending_action:
+        fields.append("pending_action")
+    if planner_context.user_memory_summary not in (None, "", [], {}):
+        fields.append("user_memory_summary")
+    if planner_context.research_profile not in (None, "", [], {}):
+        fields.append("research_profile")
+    if planner_context.intermediate_results:
+        fields.append("intermediate_results")
+    return fields
+
+
+def _planner_has_profile_context(planner_context: PlannerContext) -> bool:
+    return bool(
+        planner_context.user_memory_summary not in (None, "", [], {})
+        or planner_context.research_profile not in (None, "", [], {})
+    )
+
+
+def _planner_has_candidate_papers(planner_context: PlannerContext) -> bool:
+    return bool(
+        planner_context.last_papers
+        or planner_context.intermediate_results.get("papers")
+        or planner_context.intermediate_results.get("last_papers")
+    )
+
+
+def _planner_has_paper_target(planner_context: PlannerContext, state: AgentState) -> bool:
+    return bool(
+        planner_context.selected_paper
+        or planner_context.last_papers
+        or planner_context.reusable_outputs.get("paper_ref")
+        or _message_has_paper_hint(state.message)
+    )
+
+
+def _planner_has_qa_result(planner_context: PlannerContext) -> bool:
+    result = planner_context.paper_qa_result
+    return isinstance(result, Mapping) and bool(result)
+
+
+def _planner_qa_index_state(planner_context: PlannerContext) -> Optional[str]:
+    result = planner_context.paper_qa_result if isinstance(planner_context.paper_qa_result, Mapping) else {}
+    candidates = [
+        result.get("qa_index_status"),
+        result.get("index_status"),
+        result.get("error"),
+        (planner_context.pending_action or {}).get("status") if isinstance(planner_context.pending_action, Mapping) else None,
+    ]
+    for item in candidates:
+        text = str(item or "").strip().lower()
+        if not text:
+            continue
+        if "missing" in text or "not_found" in text or "no_index" in text:
+            return "missing"
+        if "stale" in text:
+            return "stale"
+        if "failed" in text or "error" in text:
+            return "failed"
+        if text in {"ready", "exists", "success", "built"}:
+            return "ready"
+    return None
 
 
 def _get_selected_paper_hint(context: Mapping[str, Any]) -> Optional[str]:

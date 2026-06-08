@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional, Protocol, Sequence
+from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 from .schemas import FailureCategory, ObservationResult, PlanRuntime, PlanStep, RecoveryCandidate
 from .state import AgentState
@@ -459,8 +459,30 @@ class RecoveryPolicyRegistry:
         candidates: List[RecoveryCandidate] = []
         for policy in self._policies:
             if policy.applies_to(step=step, observation=observation, runtime=runtime, state=state):
-                candidates.extend(policy.build_candidates(step=step, observation=observation, runtime=runtime, state=state))
+                for candidate in policy.build_candidates(step=step, observation=observation, runtime=runtime, state=state):
+                    enriched = self._attach_policy_context(candidate=candidate, step=step, policy=policy)
+                    if enriched is not None:
+                        candidates.append(enriched)
         return sorted(candidates, key=lambda item: (-item.priority, -item.confidence, item.candidate_id))
+
+    def _attach_policy_context(self, *, candidate: RecoveryCandidate, step: PlanStep, policy: RecoveryPolicy) -> Optional[RecoveryCandidate]:
+        tool_recovery_policy = self._step_tool_recovery_policy(step)
+        allowed_modes = {str(item) for item in list(tool_recovery_policy.get("modes") or []) if str(item or "").strip()}
+        # ToolContract 的 recovery_policy 是工具级安全边界；显式 fallback/clarification 仍保留，
+        # 但会静默过滤掉 contract 没声明过的主动 retry/patch/request_confirmation 候选。
+        if allowed_modes and candidate.action_type not in allowed_modes and candidate.action_type not in {"fallback_answer", "ask_clarification"}:
+            return None
+        return candidate.model_copy(
+            update={
+                "policy_source": getattr(policy, "policy_name", policy.__class__.__name__),
+                "tool_recovery_policy": dict(tool_recovery_policy or {}),
+            }
+        )
+
+    def _step_tool_recovery_policy(self, step: PlanStep) -> Dict[str, Any]:
+        tool = getattr(step, "tool", None)
+        recovery_policy = getattr(tool, "recovery_policy", None)
+        return dict(recovery_policy or {}) if isinstance(recovery_policy, dict) else {}
 
 
 DEFAULT_RECOVERY_POLICY_REGISTRY = RecoveryPolicyRegistry(

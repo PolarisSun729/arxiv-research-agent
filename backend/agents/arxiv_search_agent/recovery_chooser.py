@@ -156,6 +156,7 @@ class RecoveryChooser:
     def _action_from_candidate(self, candidate: RecoveryCandidate, *, debug_reason: str) -> RecoveryAction:
         return RecoveryAction(
             action_type=candidate.action_type,
+            action_semantic=candidate.action_semantic or self._semantic_for_candidate(candidate),
             target_step_id=candidate.target_step_id,
             selected_candidate_id=candidate.candidate_id,
             patch_strategy=candidate.patch_strategy,
@@ -166,11 +167,38 @@ class RecoveryChooser:
                 "expected_effect": candidate.expected_effect,
                 "max_attempts": candidate.max_attempts,
                 "retry_strategy": dict(candidate.strategy_payload or {}),
+                "policy_source": candidate.policy_source,
+                "tool_recovery_policy": dict(candidate.tool_recovery_policy or {}),
             },
             requires_confirmation=candidate.requires_confirmation,
             fallback_reason=candidate.fallback_if_failed,
             debug_reason=debug_reason or candidate.reason,
         )
+
+    def _semantic_for_candidate(self, candidate: RecoveryCandidate) -> str:
+        # 对外暴露更细的恢复动作语义；旧 action_type 继续作为执行兼容字段。
+        if candidate.action_type == "retry_step":
+            return "retry_same_step" if not candidate.patch_strategy else "patch_current_step_inputs"
+        if candidate.action_type == "ask_clarification":
+            return "ask_clarification"
+        if candidate.action_type == "request_confirmation":
+            return "request_confirmation"
+        if candidate.action_type == "fallback_answer":
+            return "fallback_answer"
+        if candidate.action_type == "abort_with_error":
+            return "terminate_failed"
+        if candidate.action_type == "skip_step":
+            return "skip_step"
+        strategy = str(candidate.patch_strategy or "")
+        if strategy in {"rewrite_search_chain", "inject_index_confirmation_chain"}:
+            return "append_step_after_current"
+        if strategy == "retry_step_with_adjusted_arguments":
+            return "patch_current_step_inputs"
+        if strategy in {"downgrade_recommendation_chain", "use_last_good_index"}:
+            return "replace_remaining_plan"
+        if strategy == "clarification_chain":
+            return "ask_clarification"
+        return "patch_current_step_inputs"
 
     def _serializable_score(self, item: Dict[str, Any]) -> Dict[str, Any]:
         candidate = item["candidate"]

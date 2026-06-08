@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from .schemas import FailureCategory, ObservationResult, PlanRuntime, PlanStep, RecoveryActionType, RecoverySeverity
+from .schemas import FailureCategory, ObservationResult, ObservationSignal, PlanRuntime, PlanStep, RecoveryActionType, RecoverySeverity
 from .state import AgentState
 from .tool_adapters.models import ToolExecutionResult
 
@@ -88,6 +88,40 @@ def _tool_failure_category(error_code: str, suggested_recovery: Any) -> FailureC
     return "tool_runtime_error"
 
 
+def _observation_signal_for(*, step: PlanStep, observation: ObservationResult) -> ObservationSignal:
+    """把旧 status/failure_category 归一成规划信号，供 debug 和 Replanner 稳定消费。"""
+    if observation.observation_signal:
+        return observation.observation_signal
+    status = str(observation.status or "").strip()
+    category = str(observation.failure_category or "").strip()
+    if status in {"success", "partial_success"}:
+        if step.side_effect_level == "persistent_write":
+            return "persistent_write_succeeded"
+        return "success_with_sufficient_result"
+    if status == "empty_result":
+        return "success_but_empty_result"
+    if status == "low_confidence":
+        if category in {"paper_index_missing", "paper_index_stale", "paper_index_corrupted"}:
+            return "index_not_found"
+        return "success_but_low_quality"
+    if status == "need_confirmation" or category == "paper_index_missing":
+        return "confirmation_required" if category != "paper_index_missing" else "index_not_found"
+    if status == "need_clarification":
+        return "target_not_resolved" if "target" in category or step.tool_name in {"resolve_paper", "resolve_preference_target"} else "missing_required_context"
+    if status == "invalid_output" or category == "tool_invalid_output":
+        return "validation_failed"
+    if status == "tool_error":
+        if step.side_effect_level == "persistent_write":
+            return "persistent_write_uncertain" if observation.retryable is not False else "unrecoverable_error"
+        return "external_tool_failed" if step.side_effect_level == "external_call" else "unrecoverable_error"
+    return "unrecoverable_error"
+
+
+def _finalize_observation(*, step: PlanStep, observation: ObservationResult) -> ObservationResult:
+    """Observer 统一出口：保留旧字段，同时补齐结果驱动重规划所需的稳定 signal。"""
+    return observation.model_copy(update={"observation_signal": _observation_signal_for(step=step, observation=observation)})
+
+
 class Observer:
     """区分“工具执行成功”和“结果质量达标”，为后续重规划提供统一语义。"""
 
@@ -109,7 +143,7 @@ class Observer:
             suggested_recovery = (tool_error or {}).get("suggested_recovery")
             retryable = bool((tool_error or {}).get("retryable"))
             recoverable = bool((tool_error or {}).get("recoverable", True))
-            return ObservationResult(
+            return _finalize_observation(step=step, observation=ObservationResult(
                 status="tool_error",
                 reason=error_code,
                 confidence=0.0,
@@ -122,11 +156,11 @@ class Observer:
                     retryable=retryable,
                     recoverable=recoverable,
                 ),
-            )
+            ))
         if error:
             error_text = str(error or "")
             timeout_like = "timeout" in error_text.lower() or "timed out" in error_text.lower() or "超时" in error_text
-            return ObservationResult(
+            return _finalize_observation(step=step, observation=ObservationResult(
                 status="tool_error",
                 reason=error,
                 confidence=0.0,
@@ -138,12 +172,13 @@ class Observer:
                     evidence={"error": error},
                     retryable=timeout_like,
                 ),
-            )
+            ))
 
         handler = getattr(self, f"_observe_{step.tool_name}", None)
         if callable(handler):
-            return handler(resolved_input=resolved_input, raw_output=raw_output, normalized_output=normalized_output, runtime=runtime, state=state)
-        return ObservationResult(status="success", reason="no_special_rule", confidence=1.0)
+            observation = handler(resolved_input=resolved_input, raw_output=raw_output, normalized_output=normalized_output, runtime=runtime, state=state)
+            return _finalize_observation(step=step, observation=observation)
+        return _finalize_observation(step=step, observation=ObservationResult(status="success", reason="no_special_rule", confidence=1.0))
 
     def _observe_search_arxiv(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
         del normalized_output, runtime, state

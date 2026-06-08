@@ -60,6 +60,7 @@ def load_retrieval_modules() -> Dict[str, Any]:
     for module_name in (
         "services.retrieval.collection_profile",
         "services.retrieval.contracts",
+        "services.retrieval.context_expansion",
         "services.retrieval.enhanced_retrieval_service",
         "services.retrieval.query_planner",
         "services.retrieval.route_retriever",

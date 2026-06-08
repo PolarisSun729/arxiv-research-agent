@@ -131,6 +131,24 @@ def _extract_step_output(runtime: PlanRuntime, plan: ExecutablePlan, step_id: Op
     return None
 
 
+def _existing_step_output(runtime: PlanRuntime, step: PlanStep) -> Any:
+    if not step.output_key:
+        return None
+    return runtime.outputs.get(step.output_key)
+
+
+def _can_reuse_side_effect_output(runtime: PlanRuntime, step: PlanStep) -> bool:
+    """副作用工具不能因为 resume/retry 被重复执行；已有输出优先视为本轮可复用结果。"""
+    if step.side_effect_level not in {"persistent_write", "external_call"}:
+        return False
+    if not step.output_key or step.output_key not in runtime.outputs:
+        return False
+    existing_output = runtime.outputs.get(step.output_key)
+    if existing_output in (None, "", [], {}):
+        return False
+    return True
+
+
 def _condition_value(condition: StepCondition, state: AgentState, runtime: PlanRuntime) -> Any:
     if condition.condition_type in {"field_exists", "field_equals"}:
         field_path = condition.field_path or ""
@@ -358,6 +376,35 @@ class PlanExecutor:
             )
             self._sync_runtime_state(state, runtime, current_step=step)
             return self._step_result_from_runtime(step=step, runtime=runtime, next_action="fail", error=runtime.error)
+
+        if _can_reuse_side_effect_output(runtime, step):
+            # resume 或局部 replan 可能重新走到同一副作用 step；已有输出时复用结果，避免重复外部调用/持久写入。
+            reused_output = _existing_step_output(runtime, step)
+            runtime.step_status[step.step_id] = "success"
+            runtime.needs_replan = False
+            runtime.last_step_output = {
+                "step_id": step.step_id,
+                "reused_output": True,
+                "tool_contract": _json_safe(self.tool_registry.describe_contract(step.tool_name)),
+                "resolved_input": _json_safe(resolved_input),
+                "normalized_output": _json_safe(reused_output),
+                "started_at": started_at,
+                "finished_at": _utcnow(),
+            }
+            self._append_trace(
+                runtime,
+                step,
+                event="step_reused_output",
+                status="success",
+                detail={
+                    "tool_name": step.tool_name,
+                    "side_effect_level": step.side_effect_level,
+                    "output_key": step.output_key,
+                    "reason": "side_effect_output_already_available",
+                },
+            )
+            self._sync_runtime_state(state, runtime, current_step=step)
+            return self._step_result_from_runtime(step=step, runtime=runtime, next_action="continue", output=reused_output)
 
         if self._needs_confirmation(step, state):
             confirmation_request = self._build_confirmation_request(
@@ -625,6 +672,34 @@ class PlanExecutor:
             )
             return None
 
+        if _can_reuse_side_effect_output(runtime, step):
+            # 兼容执行循环同样必须遵守副作用幂等边界，避免旧入口绕过显式节点的复用保护。
+            reused_output = _existing_step_output(runtime, step)
+            runtime.step_status[step.step_id] = "success"
+            runtime.needs_replan = False
+            runtime.last_step_output = {
+                "step_id": step.step_id,
+                "reused_output": True,
+                "tool_contract": _json_safe(self.tool_registry.describe_contract(step.tool_name)),
+                "resolved_input": _json_safe(resolved_input),
+                "normalized_output": _json_safe(reused_output),
+                "started_at": started_at,
+                "finished_at": _utcnow(),
+            }
+            self._append_trace(
+                runtime,
+                step,
+                event="step_reused_output",
+                status="success",
+                detail={
+                    "tool_name": step.tool_name,
+                    "side_effect_level": step.side_effect_level,
+                    "output_key": step.output_key,
+                    "reason": "side_effect_output_already_available",
+                },
+            )
+            return None
+
         if self._needs_confirmation(step, state):
             confirmation_request = self._build_confirmation_request(
                 step=step,
@@ -722,6 +797,7 @@ class PlanExecutor:
                 status="running",
                 detail={
                     "observation_status": observation.status,
+                    "observation_signal": observation.observation_signal,
                     "observation_reason": observation.reason,
                     "failure_category": observation.failure_category,
                     "severity": observation.severity,
@@ -1062,6 +1138,7 @@ class PlanExecutor:
                 status="success",
                 detail={
                     "observation_status": observation.status,
+                    "observation_signal": observation.observation_signal,
                     "observation_reason": observation.reason,
                     "failure_category": observation.failure_category,
                     "raw_output": _safe_compact(raw_output),
@@ -1189,6 +1266,7 @@ class PlanExecutor:
             detail = dict(trace.detail or {})
             return {
                 "status": detail.get("observation_status"),
+                "observation_signal": detail.get("observation_signal"),
                 "reason": detail.get("observation_reason"),
                 "confidence": detail.get("confidence"),
                 "failure_category": detail.get("failure_category"),

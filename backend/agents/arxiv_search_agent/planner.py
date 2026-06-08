@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+from inspect import signature
 from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence
 
 from .plan_validator import PlanValidator
+from .planner_context import build_planner_context, planner_context_debug
 from .schemas import ExecutablePlan, Goal, PlanRuntime, PlanStep, StepCondition, StepInputBinding, StepPolicy
 from .state import AgentState
 from .tool_aware_planner import LLMPlanDraftGenerator, PlanDraftConverter, PlanDraftPlanningError, RuleBasedToolAwarePlanBuilder, ToolCandidateSelector
@@ -189,12 +191,12 @@ def _build_plan_step(
     if tool is None:
         raise ValueError(f"Unknown planner tool: {tool_name}")
     resolved_side_effect_level = side_effect_level or tool.side_effect_level
-    if tool.requires_confirmation and confirmation_policy is None:
+    if (tool.requires_confirmation or resolved_side_effect_level == "persistent_write") and confirmation_policy is None:
         confirmation_policy = StepPolicy(
             policy_type="confirmation",
             mode="explicit_user_confirmation_required",
             requires_confirmation=True,
-            note=f"{normalized_tool_name} requires confirmation by tool policy",
+            note=f"{normalized_tool_name} requires confirmation by tool policy or persistent write risk",
         )
     return PlanStep(
         step_id=step_id,
@@ -427,6 +429,7 @@ class PaperQAPlanBuilder:
         return goal.goal_type == "paper_qa"
 
     def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
+        answer_shape = _paper_qa_answer_shape(goal.intent or state.intent)
         steps = [
             _build_plan_step(
                 step_id="resolve_paper",
@@ -444,7 +447,7 @@ class PaperQAPlanBuilder:
             ),
             _build_plan_step(step_id="check_paper_index", action_type="validate", tool_name="check_paper_index", output_key="paper_index_status", tool_registry=tool_registry, input_bindings=[_binding("paper_ref", source_type="step_output", step_id="resolve_paper")], depends_on=["resolve_paper"]),
             # Agent 只负责调度真实 PaperQA 工具；检索、重写、rerank 和 grounding 校验均由 PaperQAService 内部完成。
-            _build_plan_step(step_id="answer_paper_question", action_type="answer", tool_name="answer_paper_question", output_key="paper_qa_result", tool_registry=tool_registry, input_bindings=[_binding("paper_ref", source_type="step_output", step_id="resolve_paper"), _binding("message", source_type="state", source_key="message")], depends_on=["resolve_paper", "check_paper_index"]),
+            _build_plan_step(step_id=answer_shape["step_id"], action_type=answer_shape["action_type"], tool_name="answer_paper_question", output_key="paper_qa_result", tool_registry=tool_registry, input_bindings=[_binding("paper_ref", source_type="step_output", step_id="resolve_paper"), _binding("message", source_type="state", source_key="message"), _binding("qa_mode", source_type="literal", value=answer_shape["qa_mode"], required=False)], depends_on=["resolve_paper", "check_paper_index"]),
         ]
         return _make_plan(goal, steps=steps)
 
@@ -620,6 +623,23 @@ def _confirmation_required_step_ids(plan: ExecutablePlan) -> List[str]:
     ]
 
 
+def _paper_qa_answer_shape(intent: Optional[str]) -> Dict[str, str]:
+    normalized_intent = str(intent or "").strip()
+    if normalized_intent == "paper_summary":
+        return {"step_id": "summarize_paper", "action_type": "summarize", "qa_mode": "summary"}
+    if normalized_intent == "paper_detail":
+        return {"step_id": "inspect_paper_detail", "action_type": "inspect_detail", "qa_mode": "detail"}
+    return {"step_id": "answer_paper_question", "action_type": "answer", "qa_mode": "qa"}
+
+
+def _select_candidate_tools(selector: ToolCandidateSelector, goal: Goal, state: AgentState, planner_context: Any) -> Any:
+    select_signature = signature(selector.select)
+    if "planner_context" in select_signature.parameters:
+        return selector.select(goal, state, planner_context)
+    # 历史测试和少量外部调用会 monkeypatch 旧签名；这里兼容它们，但真实入口仍优先传入 PlannerContext。
+    return selector.select(goal, state)
+
+
 def _fallback_to_template_or_unsupported(
     goal: Goal,
     state: AgentState,
@@ -722,11 +742,52 @@ def build_executable_plan_for_goal(
     expose_planner_debug = bool(planner_config.get("expose_planner_debug", True))
 
     selector = ToolCandidateSelector(tool_registry)
-    selection = selector.select(goal, state)
+    try:
+        planner_context = build_planner_context(goal=goal, state=state, tool_registry=tool_registry)
+        planner_context_payload = planner_context_debug(planner_context)
+    except Exception as exc:
+        # Planner 输入层是动态规划的前置增强；构造失败时必须回到旧模板链路，不能影响现有 Agent 可用性。
+        planning_debug = {
+            "planner_mode": "tool_aware_llm" if llm_enabled else "tool_aware_rule_based",
+            "goal": goal.model_dump(),
+            "candidate_tools": [],
+            "excluded_tools": [],
+            "draft_steps": [],
+            "selected_steps": [],
+            "skipped_steps": [],
+            "skipped_tools": [],
+            "llm_plan_attempted": False,
+            "llm_plan_valid": False,
+            "llm_plan_invalid_reasons": [],
+            "rule_based_fallback_used": False,
+            "template_fallback_used": False,
+            "validation_status": "not_started",
+            "fallback_used": False,
+            "fallback_reason": None,
+            "final_plan_source": None,
+            "selected_plan_source": None,
+            "planner_context": {"build_error": str(exc)},
+            "tool_selection": {},
+            "tool_risk_summary": {},
+            "tool_contract_source": {},
+            "tool_contract_matrix": tool_registry.tool_contract_matrix(),
+            "confirmation_required_steps": [],
+        }
+        return _fallback_to_template_or_unsupported(
+            goal,
+            state,
+            tool_registry,
+            planning_debug,
+            reason=f"planner_context_build_failed: {exc}",
+            allow_template=llm_fallback_to_template,
+        )
+
+    selection = _select_candidate_tools(selector, goal, state, planner_context)
     candidate_tool_names = [tool.tool_name for tool in list(selection.candidate_tools or [])]
     planning_debug: Dict[str, Any] = {
         "planner_mode": "tool_aware_llm" if llm_enabled else "tool_aware_rule_based",
         "goal": goal.model_dump(),
+        "planner_context": planner_context_payload,
         "candidate_tools": [tool.model_dump() for tool in list(selection.candidate_tools or [])],
         "excluded_tools": [tool.model_dump() for tool in list(selection.excluded_tools or [])],
         "draft_steps": [],
@@ -750,6 +811,17 @@ def build_executable_plan_for_goal(
         "confirmation_required_steps": [],
     }
 
+    if not candidate_tool_names:
+        # 候选为空说明动态筛选边界过窄或上下文不足；此时保留 debug，再交给固定模板兜底。
+        return _fallback_to_template_or_unsupported(
+            goal,
+            state,
+            tool_registry,
+            planning_debug,
+            reason="planner_context_candidate_tools_empty",
+            allow_template=llm_fallback_to_template,
+        )
+
     if llm_enabled:
         planning_debug["llm_plan_attempted"] = True
         try:
@@ -758,7 +830,7 @@ def build_executable_plan_for_goal(
                 max_steps=int(planner_config.get("llm_plan_max_steps", 8) or 8),
                 timeout_seconds=int(planner_config.get("llm_plan_timeout", 8) or 8),
             )
-            draft = llm_generator.generate(goal, state, selection.candidate_tools, tool_registry)
+            draft = llm_generator.generate(goal, state, selection.candidate_tools, tool_registry, planner_context)
             if expose_planner_debug:
                 planning_debug["raw_llm_plan"] = llm_generator.last_debug.get("raw_llm_plan")
             planning_debug["draft_steps"] = [step.model_dump() for step in list(draft.steps or [])]
@@ -794,7 +866,7 @@ def build_executable_plan_for_goal(
 
     try:
         rule_builder = RuleBasedToolAwarePlanBuilder()
-        draft = rule_builder.build(goal, state, selection.candidate_tools, tool_registry)
+        draft = rule_builder.build(goal, state, selection.candidate_tools, tool_registry, planner_context)
         planning_debug.update(
             {
                 "selected_steps": list(rule_builder.last_debug.get("selected_steps") or []),

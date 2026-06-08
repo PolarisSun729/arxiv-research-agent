@@ -179,16 +179,13 @@ def test_run_agent_turn_preference_action_ordinal_uses_last_papers_over_selected
         )
     )
 
-    assert result.status == "success"
+    assert result.status == "waiting_confirmation"
+    assert result.pending_confirmation is not None
+    assert result.pending_confirmation.tool_name == "update_preference_store"
+    assert result.pending_confirmation.target_paper is not None
+    assert result.pending_confirmation.target_paper["arxiv_id"] == "2401.00002"
     assert result.outputs["paper_reference"]["arxiv_id"] == "2401.00002"
-    assert preference_calls == [
-        {
-            "user_id": "",
-            "arxiv_id": "2401.00002",
-            "liked": True,
-            "paper": {"arxiv_id": "2401.00002", "title": "Second Paper", "query": None, "matched_by": None, "source": None},
-        }
-    ]
+    assert preference_calls == []
 
 
 def test_run_agent_turn_paper_qa_missing_index_waits_for_confirmation(monkeypatch) -> None:
@@ -267,13 +264,17 @@ def test_run_agent_turn_paper_qa_trace_only_real_answer_tool(monkeypatch) -> Non
 
 
 def test_run_agent_turn_preference_action_persistent_write(monkeypatch) -> None:
+    preference_calls = []
+
     def fake_invoke_tool(tool_name: str, **kwargs):
         assert tool_name == "record_paper_preference"
+        preference_calls.append(dict(kwargs))
         return {"ok": True, "tool_name": tool_name, "summary": "recorded", "data": {"ok": True}, "trace": {}, "error": None}
 
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+    monkeypatch.setattr(executor_module, "interrupt", lambda payload: {"decision": "approve"})
 
-    result = run_agent_turn(
+    result = run_agent_turn_in_graph(
         AgentState(
             intent="preference_action",
             message="喜欢这篇论文",
@@ -286,6 +287,15 @@ def test_run_agent_turn_preference_action_persistent_write(monkeypatch) -> None:
     assert not any("interest" in tool_name or "profile" in tool_name for tool_name in side_effects)
     assert result.status == "success"
     assert result.final_answer
+    assert preference_calls == [
+        {
+            "user_id": "",
+            "arxiv_id": "2401.00001",
+            "liked": True,
+            "paper": {"arxiv_id": "2401.00001", "title": "RAG", "query": None, "matched_by": None, "source": None},
+        }
+    ]
+    assert any(trace.event == "confirmation_approved" and trace.step_id == "update_preference_store" for trace in result.trace)
     assert any(trace.step_id == "update_preference_store" and trace.event == "step_succeeded" for trace in result.trace)
     assert not any("interest" in output_key or "profile" in output_key for output_key in result.outputs)
 

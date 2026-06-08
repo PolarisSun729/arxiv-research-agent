@@ -441,3 +441,32 @@ def test_recovery_trace_records_llm_safety_and_final_status() -> None:
     assert detail["llm_diagnosis"]["diagnosis"] == "empty"
     assert detail["safety_check_result"]["allowed"] is True
     assert detail["final_recovery_status"] == "patched"
+
+
+def test_replanner_records_trace_when_replan_limit_is_exceeded() -> None:
+    goal, plan, runtime, step = _build_runtime_and_step(
+        AgentState(intent="arxiv_search", message="rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="rag")),
+        "search_arxiv",
+    )
+    runtime.replan_counts["search_arxiv:empty_result"] = Replanner.MAX_REASON_REPLANS
+
+    decision = Replanner().replan(
+        goal=goal,
+        current_plan=plan,
+        runtime=runtime,
+        failed_or_low_quality_step=step,
+        observation_result=ObservationResult(
+            status="empty_result",
+            observation_signal="success_but_empty_result",
+            failure_category="search_empty",
+            reason="empty",
+        ),
+    )
+
+    assert decision.fallback is True
+    assert decision.updated_runtime is not None
+    trace = decision.updated_runtime.trace[-1]
+    assert trace.event == "replan_limit_exceeded"
+    assert trace.detail["fallback_used"] is True
+    assert trace.detail["observation_signal"] == "success_but_empty_result"
+    assert trace.detail["reason_replan_count"] == Replanner.MAX_REASON_REPLANS

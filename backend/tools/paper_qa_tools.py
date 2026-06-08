@@ -67,6 +67,7 @@ def answer_paper_question(
     enable_hyde: Optional[bool] = None,
     enable_keyword_search: Optional[bool] = None,
     enable_llm_rerank: Optional[bool] = None,
+    enable_context_expansion: Optional[bool] = None,
     debug: Optional[bool] = None,
 ) -> Dict[str, Any]:
     tool_name = "answer_paper_question"
@@ -79,6 +80,7 @@ def answer_paper_question(
         "enable_hyde": enable_hyde,
         "enable_keyword_search": enable_keyword_search,
         "enable_llm_rerank": enable_llm_rerank,
+        "enable_context_expansion": enable_context_expansion,
         "debug": debug,
     }
     payload = {
@@ -90,6 +92,7 @@ def answer_paper_question(
         "enable_hyde": enable_hyde,
         "enable_keyword_search": enable_keyword_search,
         "enable_llm_rerank": enable_llm_rerank,
+        "enable_context_expansion": enable_context_expansion,
         "debug": debug,
     }
     try:

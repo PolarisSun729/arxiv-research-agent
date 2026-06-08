@@ -60,6 +60,8 @@ class RetrievalTraceBuilder:
         final_context_top15: List[Dict[str, Any]],
         final_results: List[Dict[str, Any]],
         rerank_debug: Dict[str, Any],
+        context_expansion: Dict[str, Any],
+        context_budget: Dict[str, Any],
         config: Dict[str, Any],
     ) -> Dict[str, Any]:
         """构造保持旧字段兼容的 retrieval_debug，并按阶段组织 stages。"""
@@ -131,6 +133,8 @@ class RetrievalTraceBuilder:
                 },
             },
             "llm_rerank": rerank_debug,
+            "context_expansion": context_expansion,
+            "context_budget": context_budget,
             "intent": self.debug_intent_profile(intent_profile),
         }
 
@@ -155,6 +159,8 @@ class RetrievalTraceBuilder:
         fused_results: List[Dict[str, Any]],
         reranked_results: List[Dict[str, Any]],
         final_results: List[Dict[str, Any]],
+        context_expansion: Dict[str, Any],
+        context_budget: Dict[str, Any],
     ) -> Optional[Dict[str, str]]:
         """导出 JSON/Markdown trace；失败不能影响检索主流程。"""
         if not self.trace_export_enabled:
@@ -186,6 +192,8 @@ class RetrievalTraceBuilder:
                 "collection_profile": self.normalize_trace_value(collection_profile),
                 "embedding_batch": self.normalize_trace_value(embedding_batch),
                 "route_metrics": self.normalize_trace_value(route_metrics),
+                "context_expansion": self.normalize_trace_value(context_expansion),
+                "context_budget": self.normalize_trace_value(context_budget),
                 "steps": [
                     {"step": "query_profile", "result": self.normalize_trace_value(self.debug_query_profile(query_profile))},
                     {"step": "intent_profile", "result": self.normalize_trace_value(self.debug_intent_profile(intent_profile))},
@@ -214,6 +222,14 @@ class RetrievalTraceBuilder:
                     {
                         "step": "reranked_top30",
                         "result": [self.normalize_trace_value(self.debug_chunk_item(item)) for item in reranked_results[:30]],
+                    },
+                    {
+                        "step": "context_expansion",
+                        "result": self.normalize_trace_value(context_expansion),
+                    },
+                    {
+                        "step": "context_budget",
+                        "result": self.normalize_trace_value(context_budget),
                     },
                     {
                         "step": "final_context_top15",
@@ -309,6 +325,14 @@ class RetrievalTraceBuilder:
             "rerank_text": item.get("rerank_text", ""),
             "rerank_text_preview": self.short_text_preview(item.get("rerank_text", ""), 160),
             "final_context_uses_original_chunk": item.get("final_context_uses_original_chunk"),
+            "context_role": item.get("context_role"),
+            "context_budget_score": item.get("context_budget_score"),
+            "context_budget_reason": item.get("context_budget_reason"),
+            "expansion_score": item.get("expansion_score"),
+            "expansion_source_anchor_ids": item.get("expansion_source_anchor_ids", []),
+            "relationship_types": item.get("relationship_types", []),
+            "expansion_reasons": item.get("expansion_reasons", []),
+            "final_context_reason": item.get("final_context_reason"),
             "subchunk_label": item.get("subchunk_label"),
             "section_tags": item.get("section_tags", []),
             "content": item.get("content", ""),

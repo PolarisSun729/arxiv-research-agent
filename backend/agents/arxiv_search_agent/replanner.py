@@ -9,7 +9,7 @@ from .recovery_chooser import RecoveryChooser
 from .recovery_diagnosis import LLMRecoveryDiagnoser
 from .recovery_policy import DEFAULT_RECOVERY_POLICY_REGISTRY, RecoveryPolicyRegistry
 from .recovery_safety import RecoverySafetyGuard
-from .schemas import ExecutablePlan, Goal, ObservationResult, PlanRuntime, PlanStep
+from .schemas import ExecutablePlan, ExecutionTrace, Goal, ObservationResult, PlanRuntime, PlanStep
 from .state import AgentState
 from .tool_registry import PLANNER_TOOL_REGISTRY, ToolRegistry
 
@@ -75,7 +75,43 @@ class Replanner:
         total_replans = sum(int(value or 0) for value in runtime.replan_counts.values())
         # 重规划是质量补救，不是无限重试机制；先做全局限流，再进入策略选择。
         if current_reason_count >= self.MAX_REASON_REPLANS or current_step_count >= self.MAX_STEP_REPLANS or total_replans >= self.MAX_PLAN_REPLANS:
-            return ReplanDecision(fallback=True, fallback_reason=f"replan_limit_exceeded:{reason_key}")
+            limit_reason = f"replan_limit_exceeded:{reason_key}"
+            runtime_copy = runtime.model_copy(deep=True)
+            runtime_copy.trace.append(
+                ExecutionTrace(
+                    step_id=failed_or_low_quality_step.step_id,
+                    event="replan_limit_exceeded",
+                    status="failed",
+                    detail={
+                        "observation_status": classified_observation.status,
+                        "observation_signal": classified_observation.observation_signal,
+                        "observation_reason": classified_observation.reason,
+                        "failure_category": classified_observation.failure_category,
+                        "reason_key": reason_key,
+                        "reason_replan_count": current_reason_count,
+                        "step_replan_count": current_step_count,
+                        "turn_replan_count": total_replans,
+                        "max_reason_replans": self.MAX_REASON_REPLANS,
+                        "max_step_replans": self.MAX_STEP_REPLANS,
+                        "max_turn_replans": self.MAX_PLAN_REPLANS,
+                        "fallback_used": True,
+                        "fallback_reason": limit_reason,
+                    },
+                )
+            )
+            return ReplanDecision(
+                fallback=True,
+                fallback_reason=limit_reason,
+                updated_runtime=runtime_copy,
+                recovery_debug={
+                    "fallback_used": True,
+                    "fallback_reason": limit_reason,
+                    "observation_signal": classified_observation.observation_signal,
+                    "reason_replan_count": current_reason_count,
+                    "step_replan_count": current_step_count,
+                    "turn_replan_count": total_replans,
+                },
+            )
 
         recovery_candidates = self.recovery_policy_registry.get_candidates(
             step=failed_or_low_quality_step,
@@ -122,9 +158,12 @@ class Replanner:
         )
         recovery_debug = {
             "failure_category": classified_observation.failure_category,
+            "observation_signal": classified_observation.observation_signal,
             "generated_candidate_count": len(recovery_candidates),
+            "recovery_policy_sources": sorted({candidate.policy_source for candidate in recovery_candidates if candidate.policy_source}),
             "llm_diagnosis": llm_diagnosis.model_dump() if llm_diagnosis is not None else None,
             "selected_recovery_action": selected_action.model_dump(),
+            "selected_recovery_action_semantic": selected_action.action_semantic,
             "safety_check_result": safety_check.model_dump(),
             "selection_reason": recovery_choice.selection_reason,
             "rejected_candidates": list(recovery_choice.rejected_candidates or []),
