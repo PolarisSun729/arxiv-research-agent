@@ -53,6 +53,18 @@ class _FakeMemoryService:
         payload["source"] = source
         return payload
 
+    def rebuild_user_research_profile(self, user_id: str):
+        return {
+            "user_id": user_id,
+            "positive_topics": ["RAG retrieval optimization"],
+            "negative_topics": [],
+            "recent_topics": ["agent memory"],
+            "preferred_categories": ["cs.CL"],
+            "preferred_answer_style": "concise",
+            "common_question_types": ["method"],
+            "representative_papers": ["2401.00001"],
+        }
+
 
 class _FakeRecommendationService:
     def __init__(self) -> None:
@@ -158,6 +170,15 @@ class UserRouterApiTests(unittest.TestCase):
         self.assertEqual(payload["status"], "success")
         self.assertEqual(len(payload["actions"]), 1)
         self.assertIn("action_map", payload)
+
+    def test_rebuild_research_profile_returns_regenerated_profile(self) -> None:
+        response = self.client.post("/api/user/research-profile/rebuild", json={"user_id": "u1"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "success")
+        self.assertEqual(payload["profile"]["positive_topics"], ["RAG retrieval optimization"])
+        self.assertEqual(payload["profile"]["preferred_answer_style"], "concise")
 
     def test_recommend_papers_returns_payload_and_500_mapping(self) -> None:
         success = self.client.post("/api/user/recommend-papers", json={"user_id": "u1", "top_n": 3, "max_age_months": 6})

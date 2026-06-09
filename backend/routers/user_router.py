@@ -49,6 +49,11 @@ class ResearchProfileRequest(BaseModel):
     representative_papers: Optional[list[str]] = None
 
 
+class RebuildResearchProfileRequest(BaseModel):
+    """研究画像重建请求，只需要指定目标用户。"""
+    user_id: str = Field(default_factory=get_default_user_id)
+
+
 @router.post("/preferences")
 async def upsert_user_preferences(
     user_id: str = Body(default_factory=get_default_user_id),
@@ -224,6 +229,21 @@ async def patch_user_research_profile(
         return {"status": "success", "profile": profile}
     except Exception as exc:
         logger.error("Error patching research profile: %s", str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/research-profile/rebuild")
+async def rebuild_user_research_profile(
+    payload: RebuildResearchProfileRequest,
+    memory_service=Depends(get_memory_service),
+):
+    """根据当前用户行为记录重建研究画像，用于清理历史自动画像脏数据。"""
+    try:
+        # 重建语义是“从行为证据重新计算并覆盖”，避免旧标题/分类继续通过增量合并残留。
+        profile = memory_service.rebuild_user_research_profile(user_id=payload.user_id)
+        return {"status": "success", "profile": profile}
+    except Exception as exc:
+        logger.error("Error rebuilding research profile: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
 
 

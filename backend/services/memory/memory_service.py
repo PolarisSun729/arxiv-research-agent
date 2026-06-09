@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import json
+import re
 from typing import Any, Dict, List, Optional
 
 from services.memory.memory_debug import build_memory_debug_payload
@@ -10,10 +12,28 @@ from services.memory.memory_models import (
     PaperChatHistory,
     PreferenceSummary,
 )
+from services.memory.research_profile_generator import ResearchProfileGenerator
 from services.storage.database_service import DatabaseService
 from utils.config import get_default_user_id
 
 logger = logging.getLogger(__name__)
+
+ARXIV_ID_PATTERN = re.compile(r"^(?:\d{4}\.\d{4,5}(?:v\d+)?|[a-z-]+(?:\.[A-Z]{2})?/\d{7}(?:v\d+)?)$")
+ARXIV_CATEGORY_PATTERN = re.compile(r"^[a-z-]+(?:\.[A-Z]{2})?$")
+URL_PATTERN = re.compile(r"https?://|www\.", re.IGNORECASE)
+LOW_INFORMATION_TOPIC_TERMS = {
+    "analysis",
+    "approach",
+    "framework",
+    "method",
+    "methods",
+    "model",
+    "models",
+    "paper",
+    "papers",
+    "system",
+    "systems",
+}
 
 
 class MemoryService:
@@ -22,6 +42,7 @@ class MemoryService:
     def __init__(self, db_service: Optional[DatabaseService] = None):
         """初始化记忆服务，并注入底层数据库访问依赖。"""
         self.db_service = db_service or DatabaseService()
+        self.profile_generator = ResearchProfileGenerator()
 
     @staticmethod
     def _resolve_user_id(user_id: Optional[str] = None) -> str:
@@ -480,33 +501,238 @@ class MemoryService:
     def _normalize_categories(values: Any, limit: int = 12) -> List[str]:
         """把分类字段规范化为去重后的分类列表。"""
         if isinstance(values, str):
-            source = [item.strip() for item in values.split(",")]
+            # arXiv 分类在不同入口可能是逗号分隔或空格分隔字符串，入库前统一拆成独立分类。
+            stripped = values.strip()
+            if stripped.startswith("["):
+                try:
+                    parsed = json.loads(stripped)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return MemoryService._normalize_categories(parsed, limit=limit)
+            source = [item.strip() for item in re.split(r"[,\s]+", values) if item.strip()]
         elif isinstance(values, list):
             source = [str(item or "").strip() for item in values]
         else:
             source = [str(values or "").strip()] if values is not None else []
         return [item for item in MemoryService._normalize_profile_list(source, limit=limit) if item]
 
+    @staticmethod
+    def _looks_like_arxiv_category(value: str) -> bool:
+        """判断字符串是否是 arXiv 分类；分类只能进入 preferred_categories。"""
+        text = str(value or "").strip()
+        return bool(text and ARXIV_CATEGORY_PATTERN.match(text) and ("." in text or text.startswith("cs.")))
+
+    @staticmethod
+    def _normalize_preferred_categories(values: Any, limit: int = 20) -> List[str]:
+        """清洗系统自动写入的分类偏好，只保留真正的 arXiv 分类值。"""
+        categories: List[str] = []
+        for item in MemoryService._normalize_categories(values, limit=limit * 2):
+            if not MemoryService._looks_like_arxiv_category(item):
+                continue
+            if item not in categories:
+                categories.append(item)
+            if len(categories) >= limit:
+                break
+        return categories
+
+    @staticmethod
+    def _looks_like_arxiv_id(value: str) -> bool:
+        """判断字符串是否是 arXiv ID，避免代表论文标识污染主题字段。"""
+        text = str(value or "").strip()
+        if not text:
+            return False
+        if text.startswith(("http://", "https://")):
+            text = text.rstrip("/").rsplit("/", 1)[-1]
+        return bool(ARXIV_ID_PATTERN.match(text))
+
+    @staticmethod
+    def _normalize_representative_papers(values: Any, limit: int = 20) -> List[str]:
+        """规范化代表论文字段，自动写入时只保留可追溯的论文 ID 或短引用。"""
+        normalized: List[str] = []
+        for item in MemoryService._normalize_profile_list(values, limit=limit * 2):
+            text = item.rstrip("/").rsplit("/", 1)[-1] if item.startswith(("http://", "https://")) else item
+            if not (MemoryService._looks_like_arxiv_id(text) or (len(text) <= 80 and not URL_PATTERN.search(text))):
+                continue
+            if text not in normalized:
+                normalized.append(text)
+            if len(normalized) >= limit:
+                break
+        return normalized
+
+    @staticmethod
+    def _looks_like_full_paper_title(value: str) -> bool:
+        """用保守启发式识别完整论文标题，避免自动画像退化成标题列表。"""
+        text = str(value or "").strip()
+        words = [part for part in re.split(r"\s+", text) if part]
+        if len(text) > 60 or len(words) > 6:
+            return True
+        lower_words = {word.strip(".,:;!?()[]{}").lower() for word in words}
+        title_joiners = {"for", "with", "of", "using", "via", "towards", "toward", "based"}
+        if len(words) >= 4 and lower_words & title_joiners:
+            return True
+        # 标题常见副标题和句式标点通常比短研究主题更复杂，自动写入时直接拦截。
+        return any(marker in text for marker in (":", "?", "!", " -- ", " - "))
+
+    @staticmethod
+    def _is_low_information_topic(value: str) -> bool:
+        """过滤单独出现时没有区分度的泛词，保留真正能表达兴趣边界的短语。"""
+        text = str(value or "").strip().lower()
+        return text in LOW_INFORMATION_TOPIC_TERMS
+
+    @staticmethod
+    def _normalize_system_topics(values: Any, limit: int = 30) -> List[str]:
+        """清洗系统自动生成的主题信号，只留下短、可区分的研究兴趣短语。"""
+        normalized: List[str] = []
+        for item in MemoryService._normalize_profile_list(values, limit=limit * 3):
+            text = str(item or "").strip()
+            if not text:
+                continue
+            if URL_PATTERN.search(text) or MemoryService._looks_like_arxiv_id(text):
+                continue
+            if MemoryService._looks_like_arxiv_category(text) or text.lower().startswith("cs."):
+                continue
+            if MemoryService._looks_like_full_paper_title(text) or MemoryService._is_low_information_topic(text):
+                continue
+            if text not in normalized:
+                normalized.append(text)
+            if len(normalized) >= limit:
+                break
+        return normalized
+
+    @staticmethod
+    def _extract_candidate_topic_values(payload: Dict[str, Any]) -> List[str]:
+        """只从显式主题类字段抽取候选 topic，不从标题、摘要这类原始论文文本推断。"""
+        topic_values: List[str] = []
+        for field_name in ("topics", "topic", "keywords", "keyword", "tags", "labels"):
+            if field_name not in payload:
+                continue
+            topic_values.extend(MemoryService._normalize_profile_list(payload.get(field_name), limit=20))
+        return topic_values
+
     def _resolve_paper_payload(self, arxiv_id: str, paper_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """优先使用显式传入的论文载荷，缺失时再从数据库读取论文信息。"""
         if isinstance(paper_payload, dict) and paper_payload:
-            return dict(paper_payload)
+            paper = dict(paper_payload)
+            paper.setdefault("arxiv_id", arxiv_id)
+            return paper
         paper = self.db_service.get_paper(arxiv_id)
-        return dict(paper or {})
+        resolved = dict(paper or {})
+        if arxiv_id and resolved:
+            resolved.setdefault("arxiv_id", arxiv_id)
+        return resolved
+
+    @staticmethod
+    def _dedupe_papers(papers: Any) -> List[Dict[str, Any]]:
+        """按 arXiv ID 去重论文证据，避免同一动作重复放大主题权重。"""
+        deduped: List[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for item in papers or []:
+            if not isinstance(item, dict):
+                continue
+            arxiv_id = str(item.get("arxiv_id") or item.get("id") or "").strip()
+            dedupe_key = arxiv_id or f"paper-{len(deduped)}"
+            if dedupe_key in seen_ids:
+                continue
+            seen_ids.add(dedupe_key)
+            deduped.append(item)
+        return deduped
+
+    def _load_paper_details_for_ids(self, arxiv_ids: Any) -> List[Dict[str, Any]]:
+        """把行为表里的论文 ID 扩展为带 title/abstract/categories 的画像证据。"""
+        papers: List[Dict[str, Any]] = []
+        for arxiv_id in self._normalize_profile_list(arxiv_ids, limit=50):
+            paper = self._resolve_paper_payload(arxiv_id)
+            if paper:
+                papers.append(paper)
+        return self._dedupe_papers(papers)
+
+    def _collect_research_profile_evidence(
+        self,
+        user_id: str,
+        *,
+        extra_liked_papers: Optional[List[Dict[str, Any]]] = None,
+        extra_disliked_papers: Optional[List[Dict[str, Any]]] = None,
+        extra_recent_actions: Optional[List[Dict[str, Any]]] = None,
+        extra_notes: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """集中收集画像生成证据，生成器只负责归纳，不直接碰数据库。"""
+        liked_papers = self._dedupe_papers([*self.db_service.get_liked_papers_with_details(user_id=user_id), *(extra_liked_papers or [])])
+        disliked_papers = self._dedupe_papers([*self._load_paper_details_for_ids(self.db_service.get_disliked_papers(user_id=user_id)), *(extra_disliked_papers or [])])
+
+        recent_actions: List[Dict[str, Any]] = []
+        for action in self.db_service.get_user_paper_actions(user_id=user_id):
+            if not isinstance(action, dict):
+                continue
+            arxiv_id = str(action.get("arxiv_id") or "").strip()
+            paper = self._resolve_paper_payload(arxiv_id) if arxiv_id else {}
+            if not paper:
+                continue
+            recent_actions.append({**action, "paper": paper})
+        recent_actions.extend(extra_recent_actions or [])
+
+        notes: List[Dict[str, Any]] = []
+        if hasattr(self.db_service, "list_user_profile_notes"):
+            notes.extend(self.db_service.list_user_profile_notes(user_id=user_id))
+        notes.extend(extra_notes or [])
+
+        return {
+            "liked_papers": liked_papers,
+            "disliked_papers": disliked_papers,
+            "recent_actions": recent_actions,
+            "notes": notes,
+        }
+
+    def generate_user_research_profile(
+        self,
+        user_id: Optional[str],
+        *,
+        extra_liked_papers: Optional[List[Dict[str, Any]]] = None,
+        extra_disliked_papers: Optional[List[Dict[str, Any]]] = None,
+        extra_recent_actions: Optional[List[Dict[str, Any]]] = None,
+        extra_notes: Optional[List[Dict[str, Any]]] = None,
+        preserve_existing_topics: bool = True,
+        preserve_existing_representative_papers: bool = True,
+    ) -> Dict[str, Any]:
+        """从用户行为证据重新归纳研究画像，并以受限字段覆盖写回。"""
+        resolved_user_id = self._resolve_user_id(user_id)
+        current = self.load_user_profile(resolved_user_id)
+        evidence = self._collect_research_profile_evidence(
+            resolved_user_id,
+            extra_liked_papers=extra_liked_papers,
+            extra_disliked_papers=extra_disliked_papers,
+            extra_recent_actions=extra_recent_actions,
+            extra_notes=extra_notes,
+        )
+        generated = self.profile_generator.generate(
+            evidence=evidence,
+            current_profile=current,
+            preserve_existing_topics=preserve_existing_topics,
+            preserve_existing_representative_papers=preserve_existing_representative_papers,
+        )
+        return self.db_service.upsert_user_research_profile(user_id=resolved_user_id, profile=generated)
+
+    def rebuild_user_research_profile(self, user_id: Optional[str]) -> Dict[str, Any]:
+        """用现有行为记录重建研究画像，覆盖旧的自动画像字段并清理历史脏值。"""
+        # 当前数据库没有字段来源标记，因此重建时仍保留“可能是手动维护”的短主题，
+        # 但必须先经过生成器清洗；分类、标题、URL、arXiv ID 等脏值不会被带回 topic 字段。
+        return self.generate_user_research_profile(
+            user_id,
+            preserve_existing_topics=True,
+            preserve_existing_representative_papers=False,
+        )
 
     def _extract_paper_profile_signals(
         self,
         arxiv_id: str,
         paper_payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, List[str]]:
-        """从论文元数据中提取可用于更新用户画像的主题、分类与代表论文信号。"""
+        """从论文元数据中提取分类、代表论文和可清洗的显式主题信号。"""
         paper = self._resolve_paper_payload(arxiv_id, paper_payload=paper_payload)
-        categories = self._normalize_categories(paper.get("categories"), limit=12)
-        title = str(paper.get("title") or "").strip()
-        positive_topics = categories[:]
-        representative_papers = [str(arxiv_id or "").strip()] if str(arxiv_id or "").strip() else []
-        if title:
-            positive_topics = self._merge_profile_list(positive_topics, [title], limit=12)
+        categories = self._normalize_preferred_categories(paper.get("categories"), limit=12)
+        # 论文标题和 arXiv 分类都不是抽象研究主题：分类进入专属字段，标题只作为论文元数据保留。
+        positive_topics = self._normalize_system_topics(self._extract_candidate_topic_values(paper), limit=12)
+        representative_papers = self._normalize_representative_papers([arxiv_id], limit=1)
         return {
             "categories": categories,
             "positive_topics": positive_topics,
@@ -545,7 +771,15 @@ class MemoryService:
         for field_name, limit in list_limits.items():
             if field_name in incoming:
                 # 系统自动写入画像时，统一采用列表合并而不是覆盖，避免历史偏好被瞬间抹掉。
-                merged_patch[field_name] = self._merge_profile_list(current.get(field_name), incoming.get(field_name), limit=limit)
+                incoming_values = incoming.get(field_name)
+                if field_name in {"positive_topics", "negative_topics", "recent_topics"}:
+                    # topic 字段只接收抽象短主题；分类、论文 ID、标题和 URL 在这里统一止血。
+                    incoming_values = self._normalize_system_topics(incoming_values, limit=limit)
+                elif field_name == "preferred_categories":
+                    incoming_values = self._normalize_preferred_categories(incoming_values, limit=limit)
+                elif field_name == "representative_papers":
+                    incoming_values = self._normalize_representative_papers(incoming_values, limit=limit)
+                merged_patch[field_name] = self._merge_profile_list(current.get(field_name), incoming_values, limit=limit)
 
         if normalized_source in {"manual_answer_style", "manual_style"} and "preferred_answer_style" in incoming:
             merged_patch["preferred_answer_style"] = str(incoming.get("preferred_answer_style") or "").strip()
@@ -562,17 +796,10 @@ class MemoryService:
             return self.load_user_profile(user_id)
 
         arxiv_id = str(normalized_note.get("arxiv_id") or "").strip()
-        tags = self._normalize_profile_list(normalized_note.get("tags"), limit=20)
-        note_title = str(normalized_note.get("title") or "").strip()
-        note_topics = self._merge_profile_list(tags, [note_title] if note_title else [], limit=20)
-        note_type = str(normalized_note.get("note_type") or "").strip()
-        patch = {
-            "positive_topics": note_topics,
-            "recent_topics": note_topics,
-            "common_question_types": [note_type] if note_type else [],
-            "representative_papers": [arxiv_id] if arxiv_id else [],
-        }
-        return self.patch_user_profile(user_id, patch, source="note_include_in_profile")
+        if arxiv_id and "arxiv_id" not in normalized_note:
+            normalized_note["arxiv_id"] = arxiv_id
+        # 笔记入画像触发完整生成流程：tags 是高置信度主题，title/content 只作为辅助证据参与归纳。
+        return self.generate_user_research_profile(user_id, extra_notes=[normalized_note])
 
     def update_profile_from_preference(
         self,
@@ -586,22 +813,23 @@ class MemoryService:
         if normalized_action not in {"like", "liked", "dislike", "disliked", "not_interested"}:
             return self.load_user_profile(user_id)
 
-        paper_signals = self._extract_paper_profile_signals(arxiv_id, paper_payload=paper_payload)
+        paper = self._resolve_paper_payload(arxiv_id, paper_payload=paper_payload)
         if normalized_action in {"like", "liked"}:
-            # 正反馈同时增强主题、近期兴趣、分类偏好与代表论文。
-            patch = {
-                "positive_topics": paper_signals.get("positive_topics", []),
-                "recent_topics": paper_signals.get("positive_topics", []),
-                "preferred_categories": paper_signals.get("categories", []),
-                "representative_papers": paper_signals.get("representative_papers", []),
-            }
-            return self.patch_user_profile(user_id, patch, source="liked_paper")
+            # 正反馈触发画像重生成，由生成器从题名/摘要/分类等证据归纳短主题。
+            recent_action = {"arxiv_id": arxiv_id, "action_type": "like", "paper": paper} if paper else None
+            return self.generate_user_research_profile(
+                user_id,
+                extra_liked_papers=[paper] if paper else None,
+                extra_recent_actions=[recent_action] if recent_action else None,
+            )
 
-        # 负反馈当前主要沉淀为 negative_topics，避免直接过度干预正向画像字段。
-        patch = {
-            "negative_topics": paper_signals.get("positive_topics", []),
-        }
-        return self.patch_user_profile(user_id, patch, source="disliked_paper")
+        # 负反馈同样走生成器，但不会把 arXiv 分类直接沉淀为 negative_topics。
+        recent_action = {"arxiv_id": arxiv_id, "action_type": normalized_action, "paper": paper} if paper else None
+        return self.generate_user_research_profile(
+            user_id,
+            extra_disliked_papers=[paper] if paper else None,
+            extra_recent_actions=[recent_action] if recent_action else None,
+        )
 
     def update_profile_from_paper_action(
         self,
@@ -616,14 +844,26 @@ class MemoryService:
             return self.update_profile_from_preference(user_id, arxiv_id, normalized_action)
 
         if normalized_action == "note_saved" and isinstance(metadata, dict) and metadata.get("include_in_profile"):
-            # note_saved 本身不是显式偏好，但如果笔记允许入画像，就按笔记信号处理。
+            # note_saved 本身不是显式偏好，但如果笔记允许入画像，就作为笔记证据参与重生成。
             note_like_payload = {
                 "arxiv_id": arxiv_id,
                 "note_type": metadata.get("note_type"),
+                "title": metadata.get("title"),
+                "content": metadata.get("content"),
                 "tags": metadata.get("tags") or [],
                 "include_in_profile": True,
             }
             return self.update_profile_from_note(user_id, note_like_payload)
+
+        if normalized_action in {"favorite", "later", "read"}:
+            paper = self._resolve_paper_payload(arxiv_id)
+            recent_action = {
+                "arxiv_id": arxiv_id,
+                "action_type": normalized_action,
+                "metadata": metadata or {},
+                "paper": paper,
+            }
+            return self.generate_user_research_profile(user_id, extra_recent_actions=[recent_action])
 
         return self.load_user_profile(user_id)
 

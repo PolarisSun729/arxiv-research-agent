@@ -376,6 +376,7 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
             include_in_profile=False,
         )
         notes = self.service.list_paper_notes(arxiv_id="2401.00008", user_id=self.user_id)
+        profile_notes = self.service.list_user_profile_notes(user_id=self.user_id)
 
         self.assertEqual(note["source_chunk_ids"], ["1", "2"])
         self.assertEqual(updated["title"], "Updated title")
@@ -383,8 +384,35 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
         self.assertEqual(updated["tags"], ["updated"])
         self.assertFalse(updated["include_in_profile"])
         self.assertEqual(len(notes), 1)
+        self.assertEqual(profile_notes, [])
         self.assertTrue(self.service.delete_paper_note(note["note_id"], user_id=self.user_id))
         self.assertIsNone(self.service.get_paper_note(note["note_id"], user_id=self.user_id))
+
+    def test_list_user_profile_notes_returns_only_included_notes(self) -> None:
+        self.service.create_paper_note(
+            user_id=self.user_id,
+            arxiv_id="2401.00008",
+            title="Profile note",
+            content="Important profile signal",
+            note_type="method",
+            tags=["rag"],
+            include_in_profile=True,
+        )
+        self.service.create_paper_note(
+            user_id=self.user_id,
+            arxiv_id="2401.00009",
+            title="Private note",
+            content="Do not include",
+            note_type="summary",
+            tags=["private"],
+            include_in_profile=False,
+        )
+
+        notes = self.service.list_user_profile_notes(user_id=self.user_id)
+
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0]["title"], "Profile note")
+        self.assertTrue(notes[0]["include_in_profile"])
 
     def test_user_research_profiles_support_upsert_patch_and_get(self) -> None:
         profile = self.service.upsert_user_research_profile(

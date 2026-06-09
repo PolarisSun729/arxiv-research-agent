@@ -31,6 +31,7 @@ import {
   recommendPapers,
   getUserResearchProfile,
   patchUserResearchProfile,
+  rebuildUserResearchProfile,
   getUserPaperActions,
   recordPaperAction,
   removePaperAction,
@@ -336,6 +337,11 @@ export const usePaperStore = defineStore('paper', () => {
     return researchProfile.value
   }
 
+  async function rebuildResearchProfile() {
+    researchProfile.value = await rebuildUserResearchProfile()
+    return researchProfile.value
+  }
+
   async function fetchPaperActions() {
     const result = await getUserPaperActions()
     paperActionMap.value = result.action_map || {}
@@ -468,6 +474,7 @@ export const usePaperStore = defineStore('paper', () => {
     fetchUserInterestVector,
     fetchResearchProfile,
     saveResearchProfile,
+    rebuildResearchProfile,
     fetchPaperActions,
     togglePaperAction,
     fetchPaperNotes,

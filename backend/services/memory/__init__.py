@@ -4,6 +4,7 @@
 - 用户长期研究画像与偏好摘要读取
 - Agent 会话态记忆提取与上下文合并
 - 论文对话历史、笔记与偏好数据的整理
+- 从行为证据归纳长期研究画像
 - 面向调试与观测的记忆快照和调试载荷构造
 """
 
@@ -14,6 +15,7 @@ from services.memory.memory_models import (
     PaperChatHistory,
     PreferenceSummary,
 )
+from services.memory.research_profile_generator import ResearchProfileGenerator
 from services.memory.memory_service import MemoryService
 
 __all__ = [
@@ -23,4 +25,5 @@ __all__ = [
     "MemoryService",
     "PaperChatHistory",
     "PreferenceSummary",
+    "ResearchProfileGenerator",
 ]

@@ -656,8 +656,8 @@ class DatabaseService:
                         'arxiv_id': row[0],
                         'title': row[1],
                         'abstract': row[2],
-                        'authors': row[3],
-                        'categories': row[4],
+                        'authors': self._deserialize_paper_db_value(row[3]),
+                        'categories': self._deserialize_paper_db_value(row[4]),
                         'published_date': row[5]
                     })
                 return results
@@ -3654,6 +3654,26 @@ class DatabaseService:
                 return [self._row_to_paper_note(row) for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"Error listing paper notes: {str(e)}")
+            return []
+
+    def list_user_profile_notes(self, user_id: str = DEFAULT_USER_ID) -> List[Dict[str, Any]]:
+        """列出某个用户明确允许进入研究画像的笔记，供画像生成器聚合长期证据。"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT note_id, user_id, arxiv_id, session_id, source_message_id, title, content,
+                           note_type, source_chunk_ids, tags, include_in_profile, created_at, updated_at
+                    FROM paper_notes
+                    WHERE user_id = ? AND include_in_profile = 1
+                    ORDER BY updated_at DESC, created_at DESC
+                    ''',
+                    (user_id,),
+                )
+                return [self._row_to_paper_note(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error listing user profile notes: {str(e)}")
             return []
 
     def update_paper_note(

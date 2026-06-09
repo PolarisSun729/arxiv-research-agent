@@ -342,6 +342,14 @@ export async function patchUserResearchProfile(profile: Partial<UserResearchProf
   return normalizeResearchProfile(response?.profile || response, effectiveUserId)
 }
 
+export async function rebuildUserResearchProfile(userId?: string): Promise<UserResearchProfile> {
+  const effectiveUserId = resolveUserId(userId)
+  const response: any = await request.post('/user/research-profile/rebuild', {
+    user_id: effectiveUserId
+  })
+  return normalizeResearchProfile(response?.profile || response, effectiveUserId)
+}
+
 export async function searchPapers(params: SearchParams): Promise<PaginatedResponse<Paper>> {
   if (isMockMode) {
     let filtered = [...mockPapers]

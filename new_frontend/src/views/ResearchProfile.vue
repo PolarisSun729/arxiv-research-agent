@@ -5,6 +5,7 @@ import { usePaperStore } from '@/stores/paperStore'
 
 const store = usePaperStore()
 const saving = ref(false)
+const rebuilding = ref(false)
 
 const form = reactive({
   positive_topics: '',
@@ -63,6 +64,19 @@ async function handleSave() {
     ElMessage.error('保存研究画像失败')
   } finally {
     saving.value = false
+  }
+}
+
+async function handleRebuild() {
+  rebuilding.value = true
+  try {
+    await store.rebuildResearchProfile()
+    syncForm()
+    ElMessage.success('研究画像已重新生成')
+  } catch (error) {
+    ElMessage.error('重新生成研究画像失败')
+  } finally {
+    rebuilding.value = false
   }
 }
 
@@ -125,6 +139,7 @@ onMounted(loadProfile)
 
         <div class="profile-actions">
           <el-button @click="loadProfile">重新加载</el-button>
+          <el-button :loading="rebuilding" @click="handleRebuild">重新生成画像</el-button>
           <el-button type="primary" :loading="saving" @click="handleSave">保存画像</el-button>
         </div>
       </el-form>
