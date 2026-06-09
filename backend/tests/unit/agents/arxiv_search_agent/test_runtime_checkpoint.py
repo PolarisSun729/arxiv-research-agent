@@ -43,6 +43,10 @@ class _InMemoryCheckpointDatabase:
     def cleanup_agent_runtime_checkpoints(self, **_kwargs):
         return 0
 
+    def cleanup_langgraph_checkpoints_for_terminal_runtime(self, **_kwargs):
+        self.langgraph_cleanup_called = True
+        return {"threads": 0, "checkpoints": 0, "writes": 0}
+
 
 def test_runtime_checkpoint_persists_pending_confirmation_as_resume_truth() -> None:
     database = _InMemoryCheckpointDatabase()
@@ -142,3 +146,13 @@ def test_runtime_checkpoint_mark_terminal_creates_record_for_normal_turn() -> No
 
     assert database.record["status"] == runtime_checkpoint.CHECKPOINT_STATUS_COMPLETED
     assert database.record["pending_confirmation"] is None
+
+
+def test_runtime_checkpoint_cleanup_aligns_langgraph_lifecycle() -> None:
+    database = _InMemoryCheckpointDatabase()
+    database.langgraph_cleanup_called = False
+    manager = runtime_checkpoint.AgentRuntimeCheckpointManager(database_service=database)
+
+    manager.expire_and_cleanup()
+
+    assert database.langgraph_cleanup_called is True

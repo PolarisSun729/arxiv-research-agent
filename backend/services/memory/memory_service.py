@@ -5,6 +5,7 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
+from services.context_merge import merge_backend_authoritative_context
 from services.memory.memory_debug import build_memory_debug_payload
 from services.memory.memory_models import (
     AgentSessionMemory,
@@ -113,6 +114,7 @@ class MemoryService:
 
         active_arxiv_id = str(session.get("active_arxiv_id") or "").strip()
         if active_arxiv_id:
+            backend_context["active_arxiv_id"] = active_arxiv_id
             backend_context["arxiv_id"] = active_arxiv_id
 
         active_paper_session_id = str(session.get("active_paper_session_id") or "").strip()
@@ -131,10 +133,11 @@ class MemoryService:
 
     @staticmethod
     def _merge_agent_context(backend_context: Optional[Dict[str, Any]], frontend_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        """合并后端构造的上下文与前端传入的上下文，后者优先覆盖。"""
-        merged_context = dict(backend_context or {})
-        merged_context.update(dict(frontend_context or {}))
-        return merged_context
+        """兼容旧调用点：后端会话状态为权威，前端 context 只补充白名单字段。"""
+        return merge_backend_authoritative_context(
+            backend_context=backend_context,
+            frontend_context=frontend_context,
+        ).merged_context
 
     @staticmethod
     def _normalize_state_payload(final_state: Any) -> Dict[str, Any]:
@@ -422,14 +425,22 @@ class MemoryService:
 
         messages: List[Dict[str, Any]] = []
         turns: List[Dict[str, Any]] = []
+        total_message_count = 0
+        db_message_read_limit = message_limit * 4 + 4
         filter_debug = {
             "filtered_incomplete_turn_count": 0,
             "invalid_turn_count": 0,
             "filtered_turn_count": 0,
         }
         if selected_session:
-            messages = self.db_service.list_paper_chat_messages(
-                selected_session["session_id"],
+            # 模型上下文只需要最近 N 轮；这里从数据库层限制消息窗口，避免长会话全量加载后再裁剪。
+            messages = self.db_service.list_recent_paper_chat_messages(
+                session_id=selected_session["session_id"],
+                user_id=resolved_user_id,
+                limit=db_message_read_limit,
+            )
+            total_message_count = self.db_service.count_paper_chat_messages(
+                session_id=selected_session["session_id"],
                 user_id=resolved_user_id,
             )
             all_turns, filter_debug = self._messages_to_conversation_context_with_debug(messages)
@@ -444,6 +455,9 @@ class MemoryService:
             "turns": turns,
             "turn_count": len(turns),
             "message_count": len(messages),
+            "db_message_read_count": len(messages),
+            "db_message_read_limit": db_message_read_limit if selected_session else 0,
+            "total_message_count": total_message_count,
             "filtered_incomplete_turn_count": filter_debug["filtered_incomplete_turn_count"],
             "invalid_turn_count": filter_debug["invalid_turn_count"],
             "filtered_turn_count": filter_debug["filtered_turn_count"],
@@ -1360,13 +1374,19 @@ class MemoryService:
         )
         resolved_session_id = str((agent_session or {}).get("session_id") or session_id or "").strip() or None
         backend_memory = self._build_agent_context_from_session(agent_session)
-        merged_context = self._merge_agent_context(backend_memory, frontend_context)
+        # Agent 会话恢复必须以后端持久化状态为准；前端 context 只作为 UI/本轮参数补充，并把拒绝覆盖的字段写入 debug。
+        merge_result = merge_backend_authoritative_context(
+            backend_context=backend_memory,
+            frontend_context=frontend_context,
+        )
+        merged_context = merge_result.merged_context
 
         payload = AgentSessionMemory(
             session_id=resolved_session_id,
             agent_session=agent_session,
             backend_memory=backend_memory,
             merged_context=merged_context,
+            context_merge_debug=merge_result.debug,
         )
         return payload.to_dict()
 

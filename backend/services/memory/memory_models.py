@@ -56,6 +56,7 @@ class AgentSessionMemory:
     agent_session: Optional[Dict[str, Any]] = None
     backend_memory: Dict[str, Any] = field(default_factory=dict)
     merged_context: Dict[str, Any] = field(default_factory=dict)
+    context_merge_debug: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """把 Agent 会话记忆结构转换为普通字典。"""

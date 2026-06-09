@@ -27,9 +27,20 @@ def create_app(load_mode: str | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Use lifespan instead of on_event to avoid the FastAPI deprecation warning.
-        # This keeps the preload behavior unchanged.
+        # 使用 lifespan 替代 on_event，避免 FastAPI 的弃用警告。
+        # 同时保持预加载行为不变。
         logging.getLogger(__name__).info("Backend service load mode: %s", resolved_load_mode)
+        try:
+            # 上下文生命周期清理只处理 checkpoint/debug/trace 边界，不触碰原始聊天历史和 session summary。
+            from services.context_lifecycle import ContextLifecycleService
+            from utils.config import get_enhanced_retrieval_runtime_config
+
+            cleanup_result = ContextLifecycleService().run_startup_cleanup(
+                trace_export_dir=get_enhanced_retrieval_runtime_config().get("trace_export_dir"),
+            )
+            logging.getLogger(__name__).info("Context lifecycle startup cleanup: %s", cleanup_result)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Context lifecycle startup cleanup skipped: %s", exc)
         if resolved_load_mode == "preload":
             warm_up_services(resolved_load_mode)
 
@@ -92,7 +103,7 @@ def create_app(load_mode: str | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Keep the existing route registration order unchanged.
+    # 保持现有的路由注册顺序不变。
     app.include_router(arxiv_router, prefix="/api")
     app.include_router(agent_router, prefix="/api")
     app.include_router(user_router, prefix="/api")
@@ -112,7 +123,7 @@ if __name__ == "__main__":
         "--load-mode",
         choices=["lazy", "preload"],
         default=SERVICE_LOAD_MODE,
-        help="Backend startup load mode: lazy or preload",
+        help="后端启动加载模式：lazy 或 preload",
     )
     args, _ = parser.parse_known_args(sys.argv[1:])
 

@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import HTTPException
 
 from core.errors import AppError, ErrorCode
+from services.context_lifecycle import ContextLifecycleService
 from services.memory import MemoryService
 from services.storage.database_service import DatabaseService, PaperQATurnPersistenceError
 from utils.config import get_default_user_id
@@ -18,6 +19,8 @@ MAX_CONTEXT_ANSWER_CHARS = 280
 MAX_CONTEXT_SOURCE_CHARS = 180
 MAX_CONTEXT_SOURCES_PER_TURN = 3
 MAX_REFERENCED_SOURCE_IDS = 8
+MAX_SESSION_SUMMARY_CHARS = 1600
+MAX_SUMMARY_ITEMS = 8
 
 
 class PaperQASessionService:
@@ -33,6 +36,7 @@ class PaperQASessionService:
         self.db_service = db_service
         self.memory_service = memory_service
         self.memory_runtime_config = memory_runtime_config
+        self.context_lifecycle_service = ContextLifecycleService(db_service=self.db_service)
 
     def memory_flag(self, key: str, default: Any = None) -> Any:
         """读取记忆相关运行时开关，统一约束 session 与短期记忆模块的行为。"""
@@ -142,20 +146,28 @@ class PaperQASessionService:
         requested_session_id = str(self.payload_get(payload, "session_id", "") or "").strip() or None
         max_turns = max(1, int(self.memory_flag("short_term_memory_max_turns", MAX_CONVERSATION_TURNS)))
         conversation_context: List[Dict[str, Any]] = []
+        raw_context = self.payload_get(payload, "conversation_context", None)
         short_term_debug = {
             "enabled": bool(self.memory_flag("enable_short_term_memory", True)),
             "applied": False,
             "reason": "",
             "fallback_reason": None,
+            "merge_policy": "db_authoritative_payload_compat_supplement",
+            "backend_loaded_fields": [],
+            "payload_received_fields": ["conversation_context"] if isinstance(raw_context, list) else [],
+            "payload_accepted_fields": [],
+            "payload_ignored_fields": {},
             "provided_turn_count": 0,
             "db_turn_count": 0,
             "payload_turn_count": 0,
             "merged_turn_count": 0,
+            "db_message_read_count": 0,
+            "db_message_read_limit": 0,
+            "total_message_count": 0,
             "selected_session_id": str(chat_session.get("session_id") or "").strip() or None,
             "source": "none",
             "used_turn_count": 0,
         }
-        raw_context = self.payload_get(payload, "conversation_context", None)
         if short_term_debug["enabled"]:
             try:
                 db_context_payload = self.memory_service.load_paper_conversation_context(
@@ -171,12 +183,23 @@ class PaperQASessionService:
                     payload_turns,
                     limit=max_turns,
                 )
+                # 论文 QA 的短期记忆以数据库会话为主；payload 只补齐旧客户端尚未持久化的本轮可见上下文。
+                if db_turns:
+                    short_term_debug["backend_loaded_fields"] = ["conversation_context"]
+                if payload_turns:
+                    short_term_debug["payload_accepted_fields"] = ["conversation_context"]
                 short_term_debug["selected_session_id"] = (
                     str(db_context_payload.get("selected_session_id") or chat_session.get("session_id") or "").strip() or None
                 )
                 short_term_debug["db_turn_count"] = len(db_turns)
                 short_term_debug["payload_turn_count"] = len(self.normalize_conversation_context(payload_turns))
                 short_term_debug["provided_turn_count"] = short_term_debug["payload_turn_count"]
+                short_term_debug["db_message_read_count"] = int(db_context_payload.get("db_message_read_count") or db_context_payload.get("message_count") or 0)
+                short_term_debug["db_message_read_limit"] = int(db_context_payload.get("db_message_read_limit") or 0)
+                short_term_debug["total_message_count"] = int(db_context_payload.get("total_message_count") or 0)
+                short_term_debug["filtered_incomplete_turn_count"] = int(db_context_payload.get("filtered_incomplete_turn_count") or 0)
+                short_term_debug["invalid_turn_count"] = int(db_context_payload.get("invalid_turn_count") or 0)
+                short_term_debug["filtered_turn_count"] = int(db_context_payload.get("filtered_turn_count") or 0)
                 conversation_context = self.normalize_conversation_context(merged_raw_context)
                 if short_term_debug["db_turn_count"] and short_term_debug["payload_turn_count"]:
                     short_term_debug["source"] = "db_plus_payload"
@@ -194,8 +217,15 @@ class PaperQASessionService:
         else:
             short_term_debug["reason"] = "disabled by runtime config"
 
+        summary_state = self.build_session_summary_state(chat_session, recent_turns=conversation_context)
+        combined_context = self.combine_summary_and_recent_turns(summary_state, conversation_context)
+        short_term_debug["summary"] = summary_state["debug"]
+        short_term_debug["used_turn_count"] = len(combined_context)
+
         return {
-            "conversation_context": conversation_context,
+            "conversation_context": combined_context,
+            "recent_conversation_context": conversation_context,
+            "session_summary": summary_state["summary"],
             "short_term_debug": short_term_debug,
             "user_id": user_id,
         }
@@ -212,6 +242,96 @@ class PaperQASessionService:
         if not debug.get("fallback_reason") and question_contextualization.get("error"):
             debug["fallback_reason"] = str(question_contextualization.get("error"))
         return debug
+
+    def build_session_summary_state(self, chat_session: Dict[str, Any], *, recent_turns: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """读取会话摘要并生成运行时 debug，不读取完整历史。
+
+        summary 是较早历史的压缩视图，只帮助问题改写和检索线索扩展；
+        它不能替代当前轮 RAG 检索出来的证据。
+        """
+        summary = chat_session.get("summary") if isinstance(chat_session.get("summary"), dict) else None
+        summary_turn_count = int(chat_session.get("summary_turn_count") or 0)
+        recent_turn_ids = {str(turn.get("turn_id") or "").strip() for turn in recent_turns if str(turn.get("turn_id") or "").strip()}
+        summary_last_turn_id = str(chat_session.get("summary_last_turn_id") or "").strip()
+        overlaps_recent = bool(summary_last_turn_id and summary_last_turn_id in recent_turn_ids)
+        applied = bool(summary and summary_turn_count > 0)
+        return {
+            "summary": summary if applied else None,
+            "debug": {
+                "enabled": True,
+                "loaded": applied,
+                "applied": applied,
+                "summary_updated_at": chat_session.get("summary_updated_at"),
+                "summary_turn_count": summary_turn_count,
+                "summary_last_turn_id": summary_last_turn_id or None,
+                "recent_turn_count": len(recent_turns),
+                "overlaps_recent_turns": overlaps_recent,
+                "fallback_reason": None if applied else "summary_not_available",
+            },
+        }
+
+    def combine_summary_and_recent_turns(
+        self,
+        summary_state: Dict[str, Any],
+        recent_turns: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """把 session summary 放在最近 turn 前面，形成运行时短期上下文。"""
+        summary = summary_state.get("summary") if isinstance(summary_state, dict) else None
+        if not isinstance(summary, dict):
+            return list(recent_turns or [])
+        summary_text = self.session_summary_to_text(summary)
+        if not summary_text:
+            return list(recent_turns or [])
+        summary_turn = {
+            "turn_id": "__session_summary__",
+            "created_at": str(summary_state.get("debug", {}).get("summary_updated_at") or ""),
+            "question": "Session summary",
+            "answer_summary": summary_text,
+            "sources": self.summary_sources(summary),
+            "context_type": "session_summary",
+            "is_summary": True,
+        }
+        return [summary_turn] + list(recent_turns or [])
+
+    def session_summary_to_text(self, summary: Dict[str, Any]) -> str:
+        """把结构化摘要压缩成 prompt 可读文本，并限制总长度防止无限增长。"""
+        sections = []
+        field_labels = [
+            ("topic", "会话主题"),
+            ("confirmed_facts", "已确认事实"),
+            ("user_preferences", "用户偏好"),
+            ("task_progress", "当前进展"),
+            ("source_clues", "来源线索"),
+        ]
+        for key, label in field_labels:
+            value = summary.get(key)
+            if isinstance(value, list):
+                text = "; ".join(str(item).strip() for item in value if str(item).strip())
+            elif isinstance(value, dict):
+                text = "; ".join(f"{k}: {v}" for k, v in value.items() if str(v).strip())
+            else:
+                text = str(value or "").strip()
+            if text:
+                sections.append(f"{label}: {text}")
+        return self.truncate_text("\n".join(sections), MAX_SESSION_SUMMARY_CHARS)
+
+    def summary_sources(self, summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """摘要中的来源线索只作为检索提示，不冒充最终回答证据。"""
+        sources = []
+        for clue in list(summary.get("source_clues") or [])[:MAX_REFERENCED_SOURCE_IDS]:
+            if not isinstance(clue, dict):
+                continue
+            sources.append(
+                {
+                    "source_id": str(clue.get("source_id") or "").strip(),
+                    "section_path": str(clue.get("section_path") or "").strip(),
+                    "page_number": str(clue.get("page_number") or "").strip(),
+                    "chunk_type": str(clue.get("chunk_type") or "summary_clue").strip(),
+                    "content": self.truncate_text(clue.get("content") or clue.get("summary") or "", MAX_CONTEXT_SOURCE_CHARS),
+                    "from_session_summary": True,
+                }
+            )
+        return [item for item in sources if item.get("source_id") or item.get("section_path") or item.get("content")]
 
     def build_session_debug(self, chat_session: Dict[str, Any]) -> Dict[str, Any]:
         """构造会话解析 debug，用于区分有状态会话与无状态兜底。"""
@@ -389,6 +509,8 @@ class PaperQASessionService:
                 "chat_session": chat_session,
             }
         try:
+            # 原始答案和 sources 长期保留；debug 快照只保存压缩视图，避免开发 trace/候选列表写入消息表后无限增长。
+            debug_snapshot = self.context_lifecycle_service.prepare_debug_snapshot(retrieval_debug)
             # 数据库层一次性写入完整 turn，避免用户消息成功、助手消息失败后污染短期记忆。
             persisted_turn = self.db_service.append_paper_qa_turn(
                 session_id=session_id,
@@ -396,7 +518,7 @@ class PaperQASessionService:
                 question=question,
                 answer=answer,
                 sources=source_payload,
-                retrieval_debug_snapshot=retrieval_debug,
+                retrieval_debug_snapshot=debug_snapshot,
                 contextualized_question=contextualized_question,
                 question_contextualization=question_contextualization,
             )
@@ -406,11 +528,19 @@ class PaperQASessionService:
                     detail="paper qa turn append returned empty result",
                     context={"session_id": session_id, "user_id": user_id, "stage": "persist_completed_turn"},
                 )
+            summary_update = self.update_session_summary_after_turn(
+                chat_session=persisted_turn.get("refreshed_session") or persisted_turn.get("chat_session") or chat_session,
+                turn_id=str(persisted_turn.get("turn_id") or ""),
+                question=question,
+                answer=answer,
+                source_payload=source_payload,
+            )
             return {
                 "turn_id": persisted_turn.get("turn_id", ""),
                 "user_message": persisted_turn.get("user_message"),
                 "assistant_message": persisted_turn.get("assistant_message"),
                 "chat_session": persisted_turn.get("refreshed_session") or persisted_turn.get("chat_session") or chat_session,
+                "session_summary_update": summary_update,
             }
         except AppError:
             raise
@@ -441,6 +571,140 @@ class PaperQASessionService:
                 detail=exc,
                 context={"session_id": session_id, "user_id": user_id, "stage": "persist_completed_turn"},
             ) from exc
+
+    def update_session_summary_after_turn(
+        self,
+        *,
+        chat_session: Dict[str, Any],
+        turn_id: str,
+        question: str,
+        answer: str,
+        source_payload: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """用旧 summary + 新 turn 增量更新会话摘要，失败时不影响 QA 主链路。"""
+        session_id = str(chat_session.get("session_id") or "").strip()
+        user_id = self.resolve_user_id(chat_session.get("user_id"))
+        if not session_id:
+            return {"updated": False, "fallback_reason": "session_unavailable"}
+        try:
+            previous_summary = chat_session.get("summary") if isinstance(chat_session.get("summary"), dict) else {}
+            previous_count = int(chat_session.get("summary_turn_count") or 0)
+            merged_summary = self.build_incremental_session_summary(
+                previous_summary,
+                chat_session=chat_session,
+                turn_id=turn_id,
+                question=question,
+                answer=answer,
+                source_payload=source_payload,
+            )
+            updated = self.db_service.update_paper_chat_session_summary(
+                session_id,
+                user_id=user_id,
+                summary=merged_summary,
+                summary_turn_count=previous_count + 1,
+                summary_last_turn_id=turn_id,
+            )
+            return {
+                "updated": bool(updated),
+                "summary_turn_count": previous_count + 1 if updated else previous_count,
+                "summary_last_turn_id": turn_id if updated else chat_session.get("summary_last_turn_id"),
+                "fallback_reason": None if updated else "database_update_failed",
+            }
+        except Exception as exc:
+            logger.warning("Session summary update failed, keep QA turn result: session_id=%s error=%s", session_id, exc)
+            return {"updated": False, "fallback_reason": str(exc)}
+
+    def build_incremental_session_summary(
+        self,
+        previous_summary: Dict[str, Any],
+        *,
+        chat_session: Dict[str, Any],
+        turn_id: str,
+        question: str,
+        answer: str,
+        source_payload: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """确定性合并旧摘要与新增 turn，避免摘要更新读取完整历史或额外阻塞 LLM。"""
+        summary = dict(previous_summary or {})
+        title = str(chat_session.get("title") or "").strip()
+        arxiv_id = str(chat_session.get("arxiv_id") or "").strip()
+        topic = str(summary.get("topic") or "").strip()
+        if not topic:
+            topic = f"围绕论文 {arxiv_id} 的问答" if arxiv_id else "论文问答会话"
+        if title and title not in topic:
+            topic = self.truncate_text(f"{topic}；当前主题：{title}", 240)
+        summary["topic"] = topic
+
+        fact = self.truncate_text(f"Q: {question} | A: {answer}", 360)
+        summary["confirmed_facts"] = self._append_unique_summary_item(summary.get("confirmed_facts"), fact)
+        preferences = self.extract_user_preferences(question)
+        summary["user_preferences"] = self._merge_unique_summary_items(summary.get("user_preferences"), preferences)
+        progress = self.truncate_text(f"已完成 turn {turn_id or 'unknown'}：{question}", 260)
+        summary["task_progress"] = self._append_unique_summary_item(summary.get("task_progress"), progress)
+        summary["source_clues"] = self.merge_summary_source_clues(summary.get("source_clues"), source_payload, turn_id=turn_id)
+        return self.compact_session_summary(summary)
+
+    def extract_user_preferences(self, question: str) -> List[str]:
+        text = str(question or "").strip()
+        lowered = text.lower()
+        preferences: List[str] = []
+        if any(token in text for token in ("不要", "不用", "不想看", "跳过")) or "skip" in lowered:
+            preferences.append(self.truncate_text(f"用户提出排除或跳过要求：{text}", 220))
+        if any(token in text for token in ("只看", "重点", "关注", "详细", "细节")) or any(token in lowered for token in ("focus", "detail", "only")):
+            preferences.append(self.truncate_text(f"用户关注偏好：{text}", 220))
+        if any(token in text for token in ("风格", "简洁", "先结论", "用中文")) or any(token in lowered for token in ("style", "concise")):
+            preferences.append(self.truncate_text(f"回答风格偏好：{text}", 220))
+        return preferences
+
+    def merge_summary_source_clues(self, existing: Any, source_payload: List[Dict[str, Any]], *, turn_id: str) -> List[Dict[str, Any]]:
+        clues: List[Dict[str, Any]] = [dict(item) for item in list(existing or []) if isinstance(item, dict)]
+        seen = {str(item.get("source_id") or item.get("chunk_id") or "").strip() for item in clues}
+        for source in list(source_payload or [])[:MAX_CONTEXT_SOURCES_PER_TURN]:
+            if not isinstance(source, dict):
+                continue
+            source_id = str(source.get("source_id") or source.get("parent_chunk_id") or source.get("chunk_id") or "").strip()
+            if source_id and source_id in seen:
+                continue
+            seen.add(source_id)
+            clues.append(
+                {
+                    "turn_id": turn_id,
+                    "source_id": source_id,
+                    "section_path": str(source.get("section_path") or "").strip(),
+                    "page_number": str(source.get("page_number") or "").strip(),
+                    "chunk_type": str(source.get("chunk_type") or "text").strip(),
+                    "content": self.truncate_text(source.get("content") or source.get("asset_summary") or "", MAX_CONTEXT_SOURCE_CHARS),
+                }
+            )
+        return clues[-MAX_SUMMARY_ITEMS:]
+
+    def compact_session_summary(self, summary: Dict[str, Any]) -> Dict[str, Any]:
+        compacted = {
+            "topic": self.truncate_text(summary.get("topic"), 240),
+            "confirmed_facts": self._trim_summary_list(summary.get("confirmed_facts"), 360),
+            "user_preferences": self._trim_summary_list(summary.get("user_preferences"), 220),
+            "task_progress": self._trim_summary_list(summary.get("task_progress"), 260),
+            "source_clues": list(summary.get("source_clues") or [])[-MAX_SUMMARY_ITEMS:],
+        }
+        # 最终再压一次整体文本规模，防止结构化字段组合后无限增长。
+        if len(self.session_summary_to_text(compacted)) > MAX_SESSION_SUMMARY_CHARS:
+            compacted["confirmed_facts"] = compacted["confirmed_facts"][-max(2, MAX_SUMMARY_ITEMS // 2):]
+            compacted["task_progress"] = compacted["task_progress"][-max(2, MAX_SUMMARY_ITEMS // 2):]
+        return compacted
+
+    def _append_unique_summary_item(self, existing: Any, item: str) -> List[str]:
+        return self._merge_unique_summary_items(existing, [item])
+
+    def _merge_unique_summary_items(self, existing: Any, new_items: List[str]) -> List[str]:
+        merged = [str(item).strip() for item in list(existing or []) if str(item).strip()]
+        for item in new_items:
+            normalized = str(item or "").strip()
+            if normalized and normalized not in merged:
+                merged.append(normalized)
+        return merged[-MAX_SUMMARY_ITEMS:]
+
+    def _trim_summary_list(self, value: Any, max_chars: int) -> List[str]:
+        return [self.truncate_text(item, max_chars) for item in list(value or []) if str(item).strip()][-MAX_SUMMARY_ITEMS:]
 
     def normalize_conversation_context(self, raw_context: Any) -> List[Dict[str, Any]]:
         """规范化历史对话上下文，裁剪轮次数量与文本长度以控制提示规模。"""

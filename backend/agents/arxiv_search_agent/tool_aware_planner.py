@@ -26,6 +26,7 @@ from .schemas import (
 from .state import AgentState
 from .tool_registry import PLANNER_TOOL_REGISTRY, ToolRegistry
 from .planner_context import build_planner_context
+from services.prompt_context import PromptContextBuilder
 
 
 class PlanDraftConversionError(ValueError):
@@ -242,6 +243,7 @@ class LLMPlanDraftGenerator:
         self.generation_service = generation_service
         self.max_steps = max(1, int(max_steps or 8))
         self.timeout_seconds = max(1, int(timeout_seconds or 8))
+        self.prompt_context_builder = PromptContextBuilder()
         self.last_debug: Dict[str, Any] = {
             "raw_llm_plan": None,
             "invalid_reasons": [],
@@ -295,10 +297,24 @@ class LLMPlanDraftGenerator:
                     "confirmation_policy": dict(tool.confirmation_policy or {}),
                 }
             )
+        prompt_context = self.prompt_context_builder.build_agent_planner_context(
+            user_request=planner_context.raw_user_request or state.message,
+            user_memory_summary=planner_context.user_memory_summary,
+            research_profile=planner_context.research_profile,
+            agent_state={
+                "intent": planner_context.intent,
+                "selected_paper": planner_context.selected_paper,
+                "paper_qa_result": planner_context.paper_qa_result,
+                "pending_action": planner_context.pending_action,
+                "session_state": dict(planner_context.session_state or {}),
+            },
+        )
         prompt_payload = {
             "user_request": planner_context.raw_user_request or state.message,
             "goal": goal.model_dump(),
             "candidate_tools": tool_payload,
+            "agent_prompt_context": prompt_context.get("text", ""),
+            "prompt_context_debug": prompt_context.get("debug", {}),
             "planner_context": {
                 "intent": planner_context.intent,
                 "intent_confidence": planner_context.intent_confidence,

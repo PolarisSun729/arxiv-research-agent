@@ -726,6 +726,42 @@ def test_validator_rejects_preference_write_without_target_resolution() -> None:
         PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
 
 
+def test_llm_plan_draft_prompt_includes_unified_prompt_context() -> None:
+    _, current_tool_aware, current_registry = _current_modules()
+    goal = Goal(goal_type="paper_qa", intent="paper_qa")
+    state = AgentState(
+        intent="paper_qa",
+        message="Explain the method.",
+        context={
+            "selected_paper": {"arxiv_id": "2401.00001", "title": "RAG Paper"},
+            "user_memory_summary": {"profile": {"positive_topics": ["retrieval"]}},
+            "pending_action": {"type": "confirm_index"},
+        },
+        paper_qa_result={"status": "ready"},
+    )
+    planner_context = current_tool_aware._minimal_planner_context(goal, state, current_registry.PLANNER_TOOL_REGISTRY)
+    selection = current_tool_aware.ToolCandidateSelector(current_registry.PLANNER_TOOL_REGISTRY).select(
+        goal,
+        state,
+        planner_context,
+    )
+    generator = current_tool_aware.LLMPlanDraftGenerator(generation_service=_FakeLLMPlanService("{}"))
+
+    prompt = generator._build_prompt(
+        goal,
+        state,
+        selection.candidate_tools,
+        current_registry.PLANNER_TOOL_REGISTRY,
+        planner_context,
+    )
+
+    assert '"agent_prompt_context"' in prompt
+    assert '"prompt_context_debug"' in prompt
+    assert "## user_memory" in prompt
+    assert "## agent_state" in prompt
+    assert "confirm_index" in prompt
+
+
 def test_rule_based_failure_after_llm_failure_falls_back_to_fixed_template(monkeypatch) -> None:
     current_planner, current_tool_aware, _ = _current_modules()
 

@@ -81,8 +81,17 @@ class FakeDatabaseService:
     def upsert_agent_runtime_checkpoint(self, **kwargs: Any) -> Dict[str, Any]:
         return dict(kwargs)
 
-    def get_agent_runtime_checkpoint(self, **_kwargs: Any) -> Optional[Dict[str, Any]]:
-        return None
+    def get_agent_runtime_checkpoint(self, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        session_id = str(kwargs.get("session_id") or "").strip()
+        if session_id.startswith("missing"):
+            return None
+        return {
+            "user_id": kwargs.get("user_id"),
+            "session_id": session_id,
+            "thread_id": kwargs.get("thread_id") or session_id,
+            "status": "waiting_confirmation",
+            "pending_confirmation": {"step_id": "parse_and_index_paper"},
+        }
 
     def mark_agent_runtime_checkpoint_status(self, **_kwargs: Any) -> bool:
         return True
@@ -92,6 +101,16 @@ class FakeDatabaseService:
 
     def cleanup_agent_runtime_checkpoints(self, **_kwargs: Any) -> int:
         return 0
+
+    def cleanup_langgraph_checkpoints_for_terminal_runtime(self, **_kwargs: Any) -> Dict[str, int]:
+        return {"threads": 0, "checkpoints": 0, "writes": 0}
+
+    def get_context_lifecycle_stats(self, **_kwargs: Any) -> Dict[str, Any]:
+        return {
+            "paper_chat": {},
+            "agent_runtime_checkpoint": {"exists": False},
+            "langgraph_checkpoint": {"checkpoint_count": 0, "write_count": 0},
+        }
 
 
 def _ensure_backend_packages() -> Path:

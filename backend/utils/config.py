@@ -115,6 +115,15 @@ AGENT_RUNTIME_CHECKPOINT_CONFIG: Dict[str, Any] = {
     "cleanup_retention_days": _env_int("AGENT_RUNTIME_CHECKPOINT_CLEANUP_RETENTION_DAYS", 7),
 }
 
+CONTEXT_LIFECYCLE_CONFIG: Dict[str, Any] = {
+    # 原始聊天消息长期保留；这里的限制只作用于 debug/trace 快照，避免诊断字段随会话无限膨胀。
+    "debug_snapshot_mode": _env_str("CONTEXT_DEBUG_SNAPSHOT_MODE", "summary").lower() or "summary",
+    "max_debug_string_chars": _env_int("CONTEXT_MAX_DEBUG_STRING_CHARS", 1200),
+    "max_debug_list_items": _env_int("CONTEXT_MAX_DEBUG_LIST_ITEMS", 8),
+    "max_debug_depth": _env_int("CONTEXT_MAX_DEBUG_DEPTH", 5),
+    "max_trace_files_per_paper": _env_int("CONTEXT_TRACE_FILES_PER_PAPER", 20),
+}
+
 OAI_SQLITE_CONFIG: Dict[str, Any] = {
     # Keep the OAI database under backend/06-database so backend launches and tools share the same store.
     "database_path": _env_str("OAI_SQLITE_DATABASE_PATH", str(BASE_DIR.parent / "06-database" / "arxiv_oai.db")),
@@ -530,6 +539,10 @@ def get_agent_planner_runtime_config() -> Dict[str, Any]:
 
 def get_agent_runtime_checkpoint_config() -> Dict[str, Any]:
     return dict(AGENT_RUNTIME_CHECKPOINT_CONFIG)
+
+
+def get_context_lifecycle_config() -> Dict[str, Any]:
+    return dict(CONTEXT_LIFECYCLE_CONFIG)
 
 
 def get_enhanced_retrieval_runtime_config() -> Dict[str, Any]:

@@ -3,12 +3,15 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List
 
+from services.prompt_context import PromptContextBuilder
+
 
 class AnswerGenerator:
     """封装论文 QA 的最终答案生成调用。"""
 
     def __init__(self, *, generation_service: Any) -> None:
         self.generation_service = generation_service
+        self.prompt_context_builder = PromptContextBuilder()
 
     def generate(
         self,
@@ -17,8 +20,24 @@ class AnswerGenerator:
         context_pack: Dict[str, Any],
         preferred_answer_style: str = "",
         style_already_applied: bool = False,
+        original_question: str = "",
+        session_summary: Dict[str, Any] | None = None,
+        recent_turns: List[Dict[str, Any]] | None = None,
+        user_memory_summary: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
-        generation_search_results = list(context_pack.get("generation_search_results") or [])
+        prompt_assembly = self.prompt_context_builder.build_paper_qa_final_answer_context(
+            question=original_question or generation_question,
+            contextualized_question=generation_question,
+            context_pack=context_pack,
+            session_summary=session_summary,
+            recent_turns=recent_turns,
+            user_memory_summary=user_memory_summary,
+            preferred_answer_style=preferred_answer_style,
+        )
+        generation_search_results = self.prompt_context_builder.generation_search_results_from_assembly(
+            prompt_assembly,
+            context_pack,
+        )
         figure_metadata = [
             item for item in (context_pack.get("asset_metadata") or [])
             if str(item.get("chunk_type", "") or "").lower() == "figure"
@@ -60,6 +79,7 @@ class AnswerGenerator:
                 "answer_chars": len(answer),
                 "cited_source_ids": cited_source_ids,
                 "claim_count": len(claims),
+                "prompt_context": prompt_assembly.get("debug", {}),
                 "model": generation_result.get("model") if isinstance(generation_result, dict) else None,
                 "saved_filepath": generation_result.get("saved_filepath") if isinstance(generation_result, dict) else None,
             },

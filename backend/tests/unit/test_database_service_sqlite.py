@@ -1,5 +1,6 @@
 import gc
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from services.storage.database_service import DatabaseService, PaperQATurnPersistenceError
@@ -306,6 +307,64 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
         self.assertEqual(assistant_message["retrieval_debug_snapshot"], {"score": 0.8})
         self.assertEqual(by_turn["message_id"], assistant_message["message_id"])
 
+    def test_paper_chat_session_summary_round_trips_on_session_only(self) -> None:
+        session = self._create_session(arxiv_id="2401.00015", session_id="session-summary")
+        other = self._create_session(arxiv_id="2401.00015", session_id="session-summary-other")
+        summary = {
+            "topic": "method details",
+            "confirmed_facts": ["fact 1"],
+            "user_preferences": ["focus on experiments"],
+            "task_progress": ["compared baselines"],
+            "source_clues": [{"source_id": "s1", "section_path": "Experiments"}],
+        }
+
+        updated = self.service.update_paper_chat_session_summary(
+            session["session_id"],
+            user_id=self.user_id,
+            summary=summary,
+            summary_turn_count=3,
+            summary_last_turn_id="turn-3",
+            summary_updated_at="2026-06-09T00:00:00+00:00",
+        )
+        refreshed = self.service.get_paper_chat_session(session["session_id"], user_id=self.user_id)
+        other_refreshed = self.service.get_paper_chat_session(other["session_id"], user_id=self.user_id)
+
+        self.assertTrue(updated)
+        self.assertEqual(refreshed["summary"]["topic"], "method details")
+        self.assertEqual(refreshed["summary_turn_count"], 3)
+        self.assertEqual(refreshed["summary_last_turn_id"], "turn-3")
+        self.assertEqual(refreshed["summary_updated_at"], "2026-06-09T00:00:00+00:00")
+        self.assertIsNone(other_refreshed["summary"])
+
+    def test_recent_paper_chat_messages_limit_at_database_layer_and_restore_order(self) -> None:
+        session = self._create_session(arxiv_id="2401.00016", session_id="session-recent-window")
+        for index in range(6):
+            self.service.append_paper_chat_message(
+                session["session_id"],
+                "user",
+                f"question {index}",
+                user_id=self.user_id,
+                turn_id=f"turn-{index}",
+            )
+            self.service.append_paper_chat_message(
+                session["session_id"],
+                "assistant",
+                f"answer {index}",
+                user_id=self.user_id,
+                turn_id=f"turn-{index}",
+            )
+
+        recent_messages = self.service.list_recent_paper_chat_messages(
+            session["session_id"],
+            user_id=self.user_id,
+            limit=4,
+        )
+
+        self.assertEqual(self.service.count_paper_chat_messages(session["session_id"], user_id=self.user_id), 12)
+        self.assertEqual(len(recent_messages), 4)
+        self.assertEqual([item["turn_id"] for item in recent_messages], ["turn-4", "turn-4", "turn-5", "turn-5"])
+        self.assertEqual([item["role"] for item in recent_messages], ["user", "assistant", "user", "assistant"])
+
     def test_append_paper_qa_turn_writes_complete_turn_atomically(self) -> None:
         session = self._create_session(arxiv_id="2401.00017", session_id="session-atomic-turn")
 
@@ -373,6 +432,70 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
                 question="Q",
                 answer="A",
             )
+
+    def test_cleanup_langgraph_checkpoints_follows_terminal_runtime_retention(self) -> None:
+        old_time = (datetime.now(timezone.utc) - timedelta(days=9)).isoformat()
+        self.service.upsert_agent_runtime_checkpoint(
+            user_id=self.user_id,
+            session_id="agent-session-old",
+            thread_id="agent-session-old",
+            runtime_state={"step": "done"},
+            status="completed",
+        )
+        self.service.upsert_agent_runtime_checkpoint(
+            user_id=self.user_id,
+            session_id="agent-session-waiting",
+            thread_id="agent-session-waiting",
+            runtime_state={"step": "wait"},
+            pending_confirmation={"step_id": "confirm"},
+            status="waiting_confirmation",
+        )
+        with self.service._get_connection() as conn:
+            conn.execute(
+                "UPDATE agent_runtime_checkpoints SET updated_at = ? WHERE session_id = ?",
+                (old_time, "agent-session-old"),
+            )
+            conn.commit()
+        self.assertTrue(
+            self.service.put_langgraph_checkpoint(
+                thread_id="agent-session-old",
+                checkpoint_ns="",
+                checkpoint_id="cp-old",
+                checkpoint={"id": "cp-old"},
+            )
+        )
+        self.assertTrue(
+            self.service.put_langgraph_checkpoint_writes(
+                thread_id="agent-session-old",
+                checkpoint_ns="",
+                checkpoint_id="cp-old",
+                task_id="task-1",
+                writes=[{"channel": "state", "value": {"ok": True}}],
+            )
+        )
+        self.assertTrue(
+            self.service.put_langgraph_checkpoint(
+                thread_id="agent-session-waiting",
+                checkpoint_ns="",
+                checkpoint_id="cp-waiting",
+                checkpoint={"id": "cp-waiting"},
+            )
+        )
+
+        cleanup_result = self.service.cleanup_langgraph_checkpoints_for_terminal_runtime(retention_days=7)
+        runtime_deleted = self.service.cleanup_agent_runtime_checkpoints(retention_days=7)
+
+        self.assertEqual(cleanup_result, {"threads": 1, "checkpoints": 1, "writes": 1})
+        self.assertEqual(runtime_deleted, 1)
+        self.assertIsNone(self.service.get_langgraph_checkpoint(thread_id="agent-session-old"))
+        self.assertIsNotNone(self.service.get_langgraph_checkpoint(thread_id="agent-session-waiting"))
+        self.assertIsNone(
+            self.service.get_agent_runtime_checkpoint(
+                user_id=self.user_id,
+                session_id="agent-session-old",
+                thread_id="agent-session-old",
+            )
+        )
 
     def test_paper_notes_support_create_update_list_and_delete(self) -> None:
         session = self._create_session(arxiv_id="2401.00008", session_id="session-note")

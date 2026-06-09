@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from langgraph.types import Command
 
 from core.errors import ErrorCode, make_error_payload
+from services.context_lifecycle import ContextLifecycleService
 from services.memory import MemoryService
 from services.storage.database_service import DatabaseService
 from utils.config import get_memory_runtime_config
@@ -115,6 +116,26 @@ def _build_runtime_checkpoint_manager(database_service: Optional[DatabaseService
     避免前端展示镜像反向驱动真实恢复。
     """
     return AgentRuntimeCheckpointManager(database_service=database_service or DatabaseService())
+
+
+def _build_agent_context_lifecycle_debug(
+    *,
+    database_service: DatabaseService,
+    user_id: Optional[str],
+    session_id: str,
+    user_memory_debug: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """构造 Agent 本轮上下文健康度，不读取完整 checkpoint 或消息正文。"""
+    context_merge_debug = dict((user_memory_debug or {}).get("context_merge") or {})
+    return ContextLifecycleService(db_service=database_service).build_agent_health_debug(
+        user_id=str(user_id or "").strip(),
+        session_id=session_id,
+        context_merge_debug=context_merge_debug,
+        degraded={
+            "memory_load_failed": not bool((user_memory_debug or {}).get("context_merge")),
+            "frontend_rejected_fields": context_merge_debug.get("rejected_frontend_fields"),
+        },
+    )
 
 
 def _build_agent_graph(generation_service: Optional[Any] = None, database_service: Optional[DatabaseService] = None) -> Any:
@@ -277,7 +298,18 @@ def _load_agent_request_context(
 
     merged_context = dict(memory_payload.get("merged_context") or frontend_context)
     resolved_session_id = str(memory_payload.get("session_id") or normalized_request.session_id or "").strip() or None
-    return merged_context, memory_payload, resolved_session_id, user_memory_debug
+    context_merge_debug = dict(memory_payload.get("context_merge_debug") or {})
+    debug_payload = {
+        **dict(user_memory_debug or {}),
+        "context_merge": context_merge_debug,
+    }
+    return merged_context, memory_payload, resolved_session_id, debug_payload
+
+
+def _backend_context_value(memory_payload: Optional[Mapping[str, Any]], key: str) -> Any:
+    """只从后端会话记忆读取权威字段，避免前端 context 旧缓存反向驱动 Agent 初始状态。"""
+    backend_memory = dict((memory_payload or {}).get("backend_memory") or {})
+    return backend_memory.get(key)
 
 
 def _persist_agent_session_memory(final_state: Any) -> None:
@@ -421,6 +453,7 @@ def _build_initial_agent_state(
     *,
     resolved_session_id: str,
     request_context: Dict[str, Any],
+    agent_memory_payload: Optional[Dict[str, Any]],
     user_memory_debug: Dict[str, Any],
 ) -> AgentState:
     """统一构造同步与流式入口共享的初始 AgentState。"""
@@ -430,8 +463,8 @@ def _build_initial_agent_state(
         message=normalized_request.message,
         # 保留业务 memory 的上下文增强职责，但执行现场恢复改由 LangGraph checkpoint 承担。
         context=request_context,
-        pending_action=request_context.get("pending_action"),
-        paper_qa_result=request_context.get("paper_qa_result"),
+        pending_action=_backend_context_value(agent_memory_payload, "pending_action"),
+        paper_qa_result=_backend_context_value(agent_memory_payload, "paper_qa_result"),
         debug=dict(user_memory_debug or {}),
     )
 
@@ -454,7 +487,7 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
         normalized_request = _coerce_request(request)
 
         # 第 2 步：把前端 context 与后端 Agent session memory 合并。
-        request_context, _agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(normalized_request)
+        request_context, agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(normalized_request)
         resolved_session_id = _ensure_session_id(resolved_session_id)
         graph_config = _build_langgraph_config(resolved_session_id)
         # 入口日志只记录状态摘要，便于排查“前端传了但后端没识别到”的问题，不直接打出完整上下文内容。
@@ -472,6 +505,12 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
         database_service = DatabaseService()
         checkpoint_manager = _build_runtime_checkpoint_manager(database_service)
         checkpoint_manager.expire_and_cleanup()
+        user_memory_debug["context_lifecycle"] = _build_agent_context_lifecycle_debug(
+            database_service=database_service,
+            user_id=normalized_request.user_id,
+            session_id=resolved_session_id,
+            user_memory_debug=user_memory_debug,
+        )
         generation_service = _resolve_generation_service()
         graph = _build_agent_graph(generation_service=generation_service, database_service=database_service)
 
@@ -506,6 +545,7 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
                 normalized_request,
                 resolved_session_id=resolved_session_id,
                 request_context=request_context,
+                agent_memory_payload=agent_memory_payload,
                 user_memory_debug=user_memory_debug,
             )
             # 普通请求仍从完整初始状态进入主图，保持搜索/推荐/QA 等非确认链路行为不变。
@@ -575,7 +615,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
 
         try:
             # 阶段 B：构造与同步入口一致的初始上下文和状态，保证两条路径行为一致。
-            request_context, _agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(normalized_request)
+            request_context, agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(normalized_request)
             resolved_session_id = _ensure_session_id(resolved_session_id)
             graph_config = _build_langgraph_config(resolved_session_id)
             logger.info(
@@ -592,6 +632,12 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
             database_service = DatabaseService()
             checkpoint_manager = _build_runtime_checkpoint_manager(database_service)
             checkpoint_manager.expire_and_cleanup()
+            user_memory_debug["context_lifecycle"] = _build_agent_context_lifecycle_debug(
+                database_service=database_service,
+                user_id=normalized_request.user_id,
+                session_id=resolved_session_id,
+                user_memory_debug=user_memory_debug,
+            )
             generation_service = _resolve_generation_service()
             graph = _build_agent_graph(generation_service=generation_service, database_service=database_service)
             graph_input: Any
@@ -632,6 +678,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     normalized_request,
                     resolved_session_id=resolved_session_id,
                     request_context=request_context,
+                    agent_memory_payload=agent_memory_payload,
                     user_memory_debug=user_memory_debug,
                 )
                 graph_input = current_state.model_dump()
@@ -678,7 +725,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
 
                 active_tool_call = _active_runtime_tool_call(previous_state, approved_step_id=resume_approved_step_id)
                 tool_call_started = False
-                if step_name == "execute_step" and active_tool_call is not None:
+                if active_tool_call is not None and (step_name == "execute_step" or _should_emit_tool_call(previous_state)):
                     tool_call_started = True
                     # 子阶段 D-2：如果当前节点会触发工具调用，则补发工具开始事件。
                     yield _sse_event(
@@ -1353,7 +1400,19 @@ def _active_runtime_tool_call(state: Optional[AgentState], *, approved_step_id: 
     需要用户确认的副作用 step 在批准前只应展示 pending_action，不能提前显示成
     running tool；批准恢复后再用 approved_step_id 放行，避免进度 UI 误导用户。
     """
-    if state is None or state.runtime_state is None or state.execution_plan is None:
+    if state is None:
+        return None
+    if state.runtime_state is None or state.execution_plan is None:
+        if state.tool_name and not state.tool_calls:
+            # 兼容旧节点流式状态：没有显式 runtime_state 时，只把当前轻量 tool_name/tool_args 当作进度展示，
+            # 不把它写回 checkpoint，也不参与真实恢复判断。
+            return {
+                "tool_name": state.tool_name,
+                "arguments": _compact_tool_args(state.tool_args or {}),
+                "status": "running",
+                "summary": f"正在执行 {state.tool_name}",
+                "trace": {"source": "legacy_stream_state"},
+            }
         return None
     current_step_id = str(state.runtime_state.current_step_id or "").strip()
     if not current_step_id:

@@ -315,6 +315,9 @@ class AgentRuntimeCheckpointManager:
 
     def expire_and_cleanup(self) -> None:
         self.database_service.expire_agent_runtime_checkpoints(now=_iso(_utcnow()))
+        # LangGraph 原始 checkpoint 跟随业务 runtime checkpoint 生命周期清理；
+        # 先删 graph 记录，再删 runtime 记录，避免丢失 thread_id 对齐依据。
+        self.database_service.cleanup_langgraph_checkpoints_for_terminal_runtime(retention_days=self.cleanup_retention_days)
         self.database_service.cleanup_agent_runtime_checkpoints(retention_days=self.cleanup_retention_days)
 
     def persist_state(self, state: Any, *, current_node: Optional[str] = None, next_route: Optional[str] = None) -> None:

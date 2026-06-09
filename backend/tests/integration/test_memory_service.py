@@ -170,6 +170,37 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(context["invalid_turn_count"], 1)
         self.assertEqual(context["filtered_turn_count"], 3)
 
+    def test_conversation_context_reads_recent_message_window_instead_of_full_history(self) -> None:
+        session = self.db_service.create_paper_chat_session(arxiv_id=self.arxiv_id, user_id=self.user_id, title="Long QA")
+        for index in range(12):
+            self.db_service.append_paper_chat_message(
+                session["session_id"],
+                "user",
+                f"Question {index}",
+                user_id=self.user_id,
+                turn_id=f"turn-{index}",
+            )
+            self.db_service.append_paper_chat_message(
+                session["session_id"],
+                "assistant",
+                f"Answer {index}",
+                user_id=self.user_id,
+                turn_id=f"turn-{index}",
+            )
+
+        context = self.memory_service.load_paper_conversation_context(
+            self.user_id,
+            self.arxiv_id,
+            session_id=session["session_id"],
+            limit=3,
+        )
+
+        self.assertEqual(context["total_message_count"], 24)
+        self.assertEqual(context["db_message_read_limit"], 16)
+        self.assertEqual(context["db_message_read_count"], 16)
+        self.assertEqual(context["turn_count"], 3)
+        self.assertEqual([turn["turn_id"] for turn in context["turns"]], ["turn-9", "turn-10", "turn-11"])
+
     def test_update_profile_from_note_merges_clean_note_tags_only(self) -> None:
         note = self.db_service.create_paper_note(
             user_id=self.user_id,
@@ -770,7 +801,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(summary["paper_actions"], {})
         self.assertIsNone(summary["interest_vector"])
 
-    def test_agent_memory_save_and_load_merges_backend_and_frontend_context(self) -> None:
+    def test_agent_memory_save_and_load_keeps_backend_context_authoritative(self) -> None:
         final_state = {
             "intent": "paper_qa",
             "answer": "The paper uses a retrieval pipeline.",
@@ -783,6 +814,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "session_id": "paper-session-1",
                 "answer": "retrieval pipeline",
             },
+            "pending_action": {"status": "waiting_confirmation", "step_id": "backend-step"},
             "tool_calls": [
                 {"tool_name": "check_paper_qa_index", "status": "success", "summary": "index ready"},
                 {"tool_name": "answer_paper_question", "status": "success", "summary": "grounded answer"},
@@ -793,7 +825,13 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         loaded = self.memory_service.load_agent_memory(
             self.user_id,
             "agent-session-1",
-            frontend_context={"selected_paper": {"arxiv_id": "frontend-paper"}, "ui_state": "detail"},
+            frontend_context={
+                "selected_paper": {"arxiv_id": "frontend-paper"},
+                "pending_action": {"status": "waiting_confirmation", "step_id": "stale"},
+                "research_profile": {"positive_topics": ["stale"]},
+                "ui_tab": "detail",
+                "unknown_cache": "old",
+            },
         )
 
         self.assertIsNotNone(saved)
@@ -803,9 +841,17 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(saved["last_tool_calls_summary"][0]["tool_name"], "check_paper_qa_index")
         self.assertEqual(loaded["session_id"], "agent-session-1")
         self.assertEqual(loaded["backend_memory"]["selected_paper"]["arxiv_id"], self.arxiv_id)
-        # 前端上下文代表当前 UI 现场，应覆盖同名后端记忆字段，但后端记忆仍单独保留。
-        self.assertEqual(loaded["merged_context"]["selected_paper"]["arxiv_id"], "frontend-paper")
-        self.assertEqual(loaded["merged_context"]["ui_state"], "detail")
+        # 前端选中论文只能作为候选输入，不能覆盖后端持久化的会话焦点和待确认状态。
+        self.assertEqual(loaded["merged_context"]["selected_paper"]["arxiv_id"], self.arxiv_id)
+        self.assertEqual(loaded["merged_context"]["pending_action"], loaded["backend_memory"]["pending_action"])
+        self.assertEqual(loaded["merged_context"]["frontend_visible_paper"]["arxiv_id"], "frontend-paper")
+        self.assertEqual(loaded["merged_context"]["ui_tab"], "detail")
+        self.assertNotIn("unknown_cache", loaded["merged_context"])
+        merge_debug = loaded["context_merge_debug"]
+        self.assertEqual(merge_debug["frontend_accepted_fields"]["selected_paper"], "frontend_visible_paper")
+        self.assertEqual(merge_debug["frontend_ignored_fields"]["pending_action"], "backend_authoritative")
+        self.assertEqual(merge_debug["frontend_ignored_fields"]["research_profile"], "backend_authoritative")
+        self.assertEqual(merge_debug["frontend_ignored_fields"]["unknown_cache"], "not_allowlisted")
 
     def test_agent_memory_prefers_current_paper_qa_target_over_stale_selected_paper(self) -> None:
         final_state = {

@@ -253,6 +253,10 @@ class DatabaseService:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     message_count INTEGER DEFAULT 0,
                     status TEXT DEFAULT 'active',
+                    summary_json TEXT,
+                    summary_updated_at TIMESTAMP,
+                    summary_turn_count INTEGER DEFAULT 0,
+                    summary_last_turn_id TEXT,
                     FOREIGN KEY(arxiv_id) REFERENCES arxiv_papers(arxiv_id)
                 )
             ''')
@@ -543,6 +547,11 @@ class DatabaseService:
             ''')
 
             cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_paper_chat_messages_session_created_desc
+                ON paper_chat_messages(session_id, created_at DESC)
+            ''')
+
+            cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_user_paper_actions_user_action_updated
                 ON user_paper_actions(user_id, action_type, updated_at DESC)
             ''')
@@ -620,6 +629,7 @@ class DatabaseService:
             self._ensure_paper_qa_index_columns(conn)
             self._ensure_paper_qa_index_version_rows(conn)
             self._ensure_paper_index_job_columns(conn)
+            self._ensure_paper_chat_session_summary_columns(conn)
             self._migrate_legacy_research_profiles(conn)
 
     def _ensure_user_interest_vector_columns(self, conn):
@@ -787,6 +797,24 @@ class DatabaseService:
             ON paper_index_jobs(idempotency_key, status, heartbeat_at)
             """
         )
+        conn.commit()
+
+    def _ensure_paper_chat_session_summary_columns(self, conn):
+        # 会话摘要是运行时压缩视图，旧库启动时补列；完整消息仍保留在 paper_chat_messages。
+        required_columns = {
+            "summary_json": "TEXT",
+            "summary_updated_at": "TIMESTAMP",
+            "summary_turn_count": "INTEGER DEFAULT 0",
+            "summary_last_turn_id": "TEXT",
+        }
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(paper_chat_sessions)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        for column_name, column_definition in required_columns.items():
+            if column_name not in existing_columns:
+                cursor.execute(
+                    f"ALTER TABLE paper_chat_sessions ADD COLUMN {column_name} {column_definition}"
+                )
         conn.commit()
 
     @staticmethod
@@ -3951,8 +3979,7 @@ class DatabaseService:
             logger.error(f"Error inserting paper QA index: {str(e)}")
             return False
 
-    @staticmethod
-    def _row_to_paper_chat_session(row: Any) -> Dict[str, Any]:
+    def _row_to_paper_chat_session(self, row: Any) -> Dict[str, Any]:
         return {
             'session_id': row[0],
             'user_id': row[1],
@@ -3962,6 +3989,10 @@ class DatabaseService:
             'updated_at': row[5],
             'message_count': row[6] or 0,
             'status': row[7] or 'active',
+            'summary': (self._deserialize_json_field(row[8]) or None) if len(row) > 8 else None,
+            'summary_updated_at': row[9] if len(row) > 9 else None,
+            'summary_turn_count': (row[10] or 0) if len(row) > 10 else 0,
+            'summary_last_turn_id': (row[11] or '') if len(row) > 11 else '',
         }
 
     def _row_to_agent_session(self, row: Any) -> Dict[str, Any]:
@@ -4032,7 +4063,8 @@ class DatabaseService:
     def _get_paper_chat_session_in_transaction(self, cursor: sqlite3.Cursor, session_id: str) -> Optional[Dict[str, Any]]:
         cursor.execute(
             '''
-            SELECT session_id, user_id, arxiv_id, title, created_at, updated_at, message_count, status
+            SELECT session_id, user_id, arxiv_id, title, created_at, updated_at, message_count, status,
+                   summary_json, summary_updated_at, summary_turn_count, summary_last_turn_id
             FROM paper_chat_sessions
             WHERE session_id = ?
             ''',
@@ -4122,7 +4154,8 @@ class DatabaseService:
                 cursor = conn.cursor()
                 cursor.execute(
                     '''
-                    SELECT session_id, user_id, arxiv_id, title, created_at, updated_at, message_count, status
+                    SELECT session_id, user_id, arxiv_id, title, created_at, updated_at, message_count, status,
+                           summary_json, summary_updated_at, summary_turn_count, summary_last_turn_id
                     FROM paper_chat_sessions
                     WHERE session_id = ? AND user_id = ?
                     ''',
@@ -4145,7 +4178,8 @@ class DatabaseService:
                 cursor = conn.cursor()
                 cursor.execute(
                     '''
-                    SELECT session_id, user_id, arxiv_id, title, created_at, updated_at, message_count, status
+                    SELECT session_id, user_id, arxiv_id, title, created_at, updated_at, message_count, status,
+                           summary_json, summary_updated_at, summary_turn_count, summary_last_turn_id
                     FROM paper_chat_sessions
                     WHERE arxiv_id = ? AND user_id = ?
                     ORDER BY updated_at DESC, created_at DESC
@@ -4168,10 +4202,13 @@ class DatabaseService:
                 cursor = conn.cursor()
                 update_fields = []
                 update_values = []
-                for field_name in ('title', 'status'):
+                for field_name in ('title', 'status', 'summary_updated_at', 'summary_turn_count', 'summary_last_turn_id'):
                     if field_name in kwargs:
                         update_fields.append(f'{field_name} = ?')
                         update_values.append(kwargs[field_name])
+                if 'summary' in kwargs:
+                    update_fields.append('summary_json = ?')
+                    update_values.append(self._serialize_json_field(kwargs.get('summary')))
                 update_fields.append('updated_at = CURRENT_TIMESTAMP')
                 update_values.extend([session_id, user_id])
                 cursor.execute(
@@ -4187,6 +4224,26 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"Error updating paper chat session: {str(e)}")
             return False
+
+    def update_paper_chat_session_summary(
+        self,
+        session_id: str,
+        user_id: str = DEFAULT_USER_ID,
+        *,
+        summary: Optional[Dict[str, Any]],
+        summary_turn_count: int,
+        summary_last_turn_id: Optional[str],
+        summary_updated_at: Optional[str] = None,
+    ) -> bool:
+        """更新会话摘要压缩视图；完整消息历史不受影响。"""
+        return self.update_paper_chat_session(
+            session_id,
+            user_id=user_id,
+            summary=dict(summary or {}),
+            summary_turn_count=max(0, int(summary_turn_count or 0)),
+            summary_last_turn_id=str(summary_last_turn_id or "").strip() or None,
+            summary_updated_at=summary_updated_at or datetime.now(timezone.utc).isoformat(),
+        )
 
     def create_or_get_agent_session(
         self,
@@ -4420,6 +4477,122 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"Error cleaning agent runtime checkpoints: {str(e)}")
             return 0
+
+    def cleanup_langgraph_checkpoints_for_terminal_runtime(self, *, retention_days: int = 7) -> Dict[str, int]:
+        """按业务 runtime checkpoint 生命周期同步清理 LangGraph 原始 checkpoint。
+
+        runtime checkpoint 是恢复语义的权威记录；只有它进入 completed/failed/expired 等终态并超过保留期后，
+        才删除同 thread_id 下的原始 graph checkpoint 与 writes，避免误删仍可恢复的确认现场。
+        """
+        result = {"threads": 0, "checkpoints": 0, "writes": 0}
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=max(int(retention_days or 0), 1))
+            cutoff_text = cutoff.isoformat()
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT DISTINCT thread_id
+                    FROM agent_runtime_checkpoints
+                    WHERE status IN ('completed', 'cancelled', 'failed', 'expired')
+                      AND updated_at <= ?
+                    ''',
+                    (cutoff_text,),
+                )
+                thread_ids = [str(row[0] or '').strip() for row in cursor.fetchall() if str(row[0] or '').strip()]
+                for thread_id in thread_ids:
+                    cursor.execute("DELETE FROM langgraph_checkpoint_writes WHERE thread_id = ?", (thread_id,))
+                    result["writes"] += int(cursor.rowcount or 0)
+                    cursor.execute("DELETE FROM langgraph_checkpoints WHERE thread_id = ?", (thread_id,))
+                    result["checkpoints"] += int(cursor.rowcount or 0)
+                conn.commit()
+                result["threads"] = len(thread_ids)
+            return result
+        except Exception as e:
+            logger.error(f"Error cleaning langgraph checkpoints: {str(e)}")
+            return result
+
+    def get_context_lifecycle_stats(
+        self,
+        *,
+        user_id: str = DEFAULT_USER_ID,
+        paper_session_id: Optional[str] = None,
+        agent_session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """汇总上下文相关表的轻量健康度，不读取大字段正文。"""
+        normalized_user_id = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+        stats: Dict[str, Any] = {
+            "user_id": normalized_user_id,
+            "paper_chat": {},
+            "agent_runtime_checkpoint": {},
+            "langgraph_checkpoint": {},
+        }
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                if paper_session_id:
+                    cursor.execute(
+                        '''
+                        SELECT s.message_count, COUNT(m.message_id), s.summary_updated_at,
+                               s.summary_turn_count, s.summary_last_turn_id,
+                               LENGTH(COALESCE(s.summary_json, ''))
+                        FROM paper_chat_sessions s
+                        LEFT JOIN paper_chat_messages m ON m.session_id = s.session_id
+                        WHERE s.session_id = ? AND s.user_id = ?
+                        GROUP BY s.session_id
+                        ''',
+                        (paper_session_id, normalized_user_id),
+                    )
+                    row = cursor.fetchone()
+                    stats["paper_chat"] = {
+                        "session_id": paper_session_id,
+                        "message_count": int((row or [0])[0] or 0) if row else 0,
+                        "stored_message_count": int((row or [0, 0])[1] or 0) if row else 0,
+                        "summary_loaded": bool(row and row[2]),
+                        "summary_updated_at": row[2] if row else None,
+                        "summary_turn_count": int(row[3] or 0) if row else 0,
+                        "summary_last_turn_id": row[4] if row else "",
+                        "summary_chars": int(row[5] or 0) if row else 0,
+                    }
+                if agent_session_id:
+                    cursor.execute(
+                        '''
+                        SELECT status, current_node, next_route, expires_at, updated_at,
+                               LENGTH(COALESCE(runtime_state_json, '')),
+                               LENGTH(COALESCE(graph_state_json, '')),
+                               LENGTH(COALESCE(pending_confirmation_json, ''))
+                        FROM agent_runtime_checkpoints
+                        WHERE user_id = ? AND session_id = ? AND thread_id = ?
+                        ''',
+                        (normalized_user_id, agent_session_id, agent_session_id),
+                    )
+                    row = cursor.fetchone()
+                    stats["agent_runtime_checkpoint"] = {
+                        "session_id": agent_session_id,
+                        "exists": bool(row),
+                        "status": row[0] if row else None,
+                        "current_node": row[1] if row else "",
+                        "next_route": row[2] if row else "",
+                        "expires_at": row[3] if row else None,
+                        "updated_at": row[4] if row else None,
+                        "runtime_state_chars": int(row[5] or 0) if row else 0,
+                        "graph_state_chars": int(row[6] or 0) if row else 0,
+                        "pending_confirmation_chars": int(row[7] or 0) if row else 0,
+                    }
+                    cursor.execute("SELECT COUNT(*) FROM langgraph_checkpoints WHERE thread_id = ?", (agent_session_id,))
+                    checkpoint_count = int((cursor.fetchone() or [0])[0] or 0)
+                    cursor.execute("SELECT COUNT(*) FROM langgraph_checkpoint_writes WHERE thread_id = ?", (agent_session_id,))
+                    write_count = int((cursor.fetchone() or [0])[0] or 0)
+                    stats["langgraph_checkpoint"] = {
+                        "thread_id": agent_session_id,
+                        "checkpoint_count": checkpoint_count,
+                        "write_count": write_count,
+                    }
+            return stats
+        except Exception as e:
+            logger.error(f"Error getting context lifecycle stats: {str(e)}")
+            stats["error"] = str(e)
+            return stats
 
     def put_langgraph_checkpoint(
         self,
@@ -4761,6 +4934,67 @@ class DatabaseService:
                 return [self._row_to_paper_chat_message(row) for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"Error listing paper chat messages: {str(e)}")
+            return []
+
+    def count_paper_chat_messages(self, session_id: str, user_id: str = DEFAULT_USER_ID) -> int:
+        """统计会话消息总数，供上下文 debug 区分历史规模和本次实际读取规模。"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT COUNT(*)
+                    FROM paper_chat_messages m
+                    JOIN paper_chat_sessions s ON s.session_id = m.session_id
+                    WHERE m.session_id = ? AND s.user_id = ?
+                    ''',
+                    (session_id, user_id),
+                )
+                row = cursor.fetchone()
+                return int((row or [0])[0] or 0)
+        except Exception as e:
+            logger.error(f"Error counting paper chat messages: {str(e)}")
+            return 0
+
+    def list_recent_paper_chat_messages(
+        self,
+        session_id: str,
+        user_id: str = DEFAULT_USER_ID,
+        *,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """只读取最近若干条消息并恢复正序，专供模型上下文构造使用。
+
+        前端历史展示仍使用 list_paper_chat_messages；这里刻意限制读取窗口，
+        避免长会话在构造 prompt 时先把完整历史加载到 Python 内存。
+        """
+        normalized_limit = max(1, int(limit or 1))
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT message_id, turn_id, session_id, role, content, sources,
+                           retrieval_debug_snapshot, contextualized_question, question_contextualization,
+                           status, created_at
+                    FROM (
+                        SELECT m.rowid AS message_rowid,
+                               m.message_id, m.turn_id, m.session_id, m.role, m.content, m.sources,
+                               m.retrieval_debug_snapshot, m.contextualized_question, m.question_contextualization,
+                               m.status, m.created_at
+                        FROM paper_chat_messages m
+                        JOIN paper_chat_sessions s ON s.session_id = m.session_id
+                        WHERE m.session_id = ? AND s.user_id = ?
+                        ORDER BY m.created_at DESC, m.rowid DESC
+                        LIMIT ?
+                    ) recent_messages
+                    ORDER BY created_at ASC, message_rowid ASC
+                    ''',
+                    (session_id, user_id, normalized_limit),
+                )
+                return [self._row_to_paper_chat_message(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error listing recent paper chat messages: {str(e)}")
             return []
 
     def get_paper_chat_message(self, message_id: str, user_id: str = DEFAULT_USER_ID) -> Optional[Dict[str, Any]]:

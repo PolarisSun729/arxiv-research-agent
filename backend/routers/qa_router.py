@@ -114,6 +114,9 @@ def _serialize_chat_session(chat_session: Optional[dict]) -> Optional[dict]:
         "updated_at": chat_session.get("updated_at"),
         "message_count": chat_session.get("message_count", 0),
         "status": chat_session.get("status", "active"),
+        "summary_updated_at": chat_session.get("summary_updated_at"),
+        "summary_turn_count": chat_session.get("summary_turn_count", 0),
+        "summary_last_turn_id": chat_session.get("summary_last_turn_id", ""),
     }
 
 

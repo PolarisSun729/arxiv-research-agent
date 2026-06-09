@@ -166,9 +166,20 @@ PaperQAService = _load_paper_qa_service_class()
 class _FakeMemoryService:
     def __init__(self) -> None:
         self.updated_notes = []
+        self.paper_conversation_turns = []
 
     def load_paper_conversation_context(self, *, user_id: str, arxiv_id: str, session_id=None, limit: int = 5):
-        return {"turns": [], "selected_session_id": session_id}
+        turns = deepcopy(self.paper_conversation_turns[-limit:])
+        return {
+            "turns": turns,
+            "selected_session_id": session_id,
+            "db_message_read_count": len(turns) * 2,
+            "db_message_read_limit": limit * 4 + 4,
+            "total_message_count": len(self.paper_conversation_turns) * 2,
+            "filtered_incomplete_turn_count": 0,
+            "invalid_turn_count": 0,
+            "filtered_turn_count": 0,
+        }
 
     def merge_conversation_context(self, db_turns, payload_turns, limit: int = 5):
         merged = list(db_turns or []) + list(payload_turns or [])
@@ -343,6 +354,81 @@ class PaperQAServiceComponentTests(unittest.TestCase):
 
         self.assertEqual(session, {})
 
+    def test_build_qa_context_debugs_db_first_conversation_context_merge(self) -> None:
+        self._insert_index(status="indexed")
+        self.retrieval_service.chunks = [
+            {
+                "content": "retrieval evidence",
+                "metadata": {"chunk_id": "chunk-1", "page_number": "1", "section_path": "Intro"},
+            }
+        ]
+        self.memory_service.paper_conversation_turns = [
+            {
+                "turn_id": "db-turn",
+                "question": "What was the previous answer?",
+                "answer_summary": "It discussed retrieval.",
+                "sources": [{"source_id": "db-source", "content": "db evidence"}],
+            }
+        ]
+        payload = {
+            "user_id": self.user_id,
+            "question": "What about the method?",
+            "conversation_context": [
+                {
+                    "turn_id": "payload-turn",
+                    "question": "Payload question",
+                    "answer_summary": "Payload answer",
+                }
+            ],
+        }
+
+        _qa_index, _search_results, qa_context, retrieval_debug = self.service.build_qa_context(self.arxiv_id, payload)
+
+        short_term_debug = retrieval_debug["memory_modules"]["short_term_memory"]
+        self.assertEqual(short_term_debug["merge_policy"], "db_authoritative_payload_compat_supplement")
+        self.assertEqual(short_term_debug["backend_loaded_fields"], ["conversation_context"])
+        self.assertEqual(short_term_debug["payload_received_fields"], ["conversation_context"])
+        self.assertEqual(short_term_debug["payload_accepted_fields"], ["conversation_context"])
+        self.assertEqual(short_term_debug["db_turn_count"], 1)
+        self.assertEqual(short_term_debug["payload_turn_count"], 1)
+        self.assertEqual(short_term_debug["merged_turn_count"], 2)
+        self.assertEqual([turn["turn_id"] for turn in qa_context["conversation_context"]], ["db-turn", "payload-turn"])
+
+    def test_build_qa_context_includes_session_summary_before_recent_turns(self) -> None:
+        self._insert_index(status="indexed")
+        session = self._create_session(session_id="summary-context-session")
+        self.db_service.update_paper_chat_session_summary(
+            session["session_id"],
+            user_id=self.user_id,
+            summary={
+                "topic": "focus on experiments",
+                "confirmed_facts": ["baseline A was already compared"],
+                "user_preferences": ["skip background"],
+                "task_progress": ["now asking about methods"],
+                "source_clues": [{"source_id": "summary-source", "section_path": "Experiments"}],
+            },
+            summary_turn_count=4,
+            summary_last_turn_id="turn-4",
+            summary_updated_at="2026-06-09T00:00:00+00:00",
+        )
+        self.memory_service.paper_conversation_turns = [
+            {"turn_id": "turn-5", "question": "Recent?", "answer_summary": "Recent answer."}
+        ]
+        self.retrieval_service.chunks = [{"content": "retrieval evidence", "metadata": {"chunk_id": "chunk-1"}}]
+
+        _qa_index, _search_results, qa_context, retrieval_debug = self.service.build_qa_context(
+            self.arxiv_id,
+            {"user_id": self.user_id, "session_id": session["session_id"], "question": "continue"},
+        )
+
+        context_turn_ids = [turn["turn_id"] for turn in qa_context["conversation_context"]]
+        summary_debug = retrieval_debug["memory_modules"]["short_term_memory"]["summary"]
+        self.assertEqual(context_turn_ids, ["__session_summary__", "turn-5"])
+        self.assertEqual(qa_context["conversation_context"][0]["context_type"], "session_summary")
+        self.assertTrue(summary_debug["loaded"])
+        self.assertEqual(summary_debug["summary_turn_count"], 4)
+        self.assertEqual(summary_debug["summary_updated_at"], "2026-06-09T00:00:00+00:00")
+
     def test_persist_completed_turn_writes_two_messages_with_shared_turn_id(self) -> None:
         session = self._create_session(session_id="persist-session")
 
@@ -363,6 +449,10 @@ class PaperQAServiceComponentTests(unittest.TestCase):
         self.assertEqual(result["turn_id"], messages[0]["turn_id"])
         self.assertEqual(messages[1]["sources"], [{"source_id": "s1", "content": "source text"}])
         self.assertEqual(messages[1]["retrieval_debug_snapshot"], {"score": 0.8})
+        refreshed_session = self.db_service.get_paper_chat_session(session["session_id"], user_id=self.user_id)
+        self.assertTrue(result["session_summary_update"]["updated"])
+        self.assertEqual(refreshed_session["summary_turn_count"], 1)
+        self.assertIn("What is the method?", refreshed_session["summary"]["confirmed_facts"][0])
 
     def test_persist_completed_turn_raises_db_error_without_half_turn(self) -> None:
         session = self._create_session(session_id="failing-session")
@@ -466,10 +556,59 @@ class PaperQAServiceComponentTests(unittest.TestCase):
         self.assertIn("generation", result["retrieval_debug"])
         self.assertIn("verification", result["retrieval_debug"])
         self.assertIn("context_pack", result["retrieval_debug"])
+        prompt_context_debug = result["retrieval_debug"]["generation"]["prompt_context"]
+        self.assertEqual(
+            prompt_context_debug["section_order"],
+            ["system_instruction", "rag_evidence", "current_question"],
+        )
+        generate_call = next(call for call in generation_service.calls if call["method"] == "generate")
+        generation_search_results = generate_call["kwargs"]["search_results"]
+        self.assertEqual(len(generation_search_results), 1)
+        self.assertEqual(generation_search_results[0]["chunk_type"], "prompt_context")
+        self.assertEqual(generation_search_results[0]["text"].count("Relevant chunk content"), 1)
         self.assertEqual(result["sources"][0]["source_id"], "source-1-text-p1")
         self.assertEqual(len(messages), 2)
         self.assertEqual(messages[1]["content"], "generated answer")
         self.assertEqual(messages[1]["retrieval_debug_snapshot"]["verification"]["status"], "passed")
+
+    def test_build_qa_context_records_prompt_context_debug_for_question_rewrite(self) -> None:
+        self._insert_index(status="indexed")
+        session = self._create_session(session_id="qa-contextualization-debug")
+        self.memory_service.paper_conversation_turns = [
+            {
+                "turn_id": "turn-1",
+                "question": "What baseline did the paper compare?",
+                "answer_summary": "It compared baseline A.",
+                "sources": [{"source_id": "source-1", "content": "baseline evidence"}],
+            }
+        ]
+        self.retrieval_service.chunks = [{"content": "retrieval evidence", "metadata": {"chunk_id": "chunk-1"}}]
+        generation_service = _FakeGenerationWithResponse(
+            response_text=(
+                '{"contextualized_question":"What result follows from baseline A?",'
+                '"is_follow_up":true,'
+                '"referenced_turn_ids":["turn-1"],'
+                '"referenced_source_ids":["source-1"],'
+                '"memory_reason":"Resolved the follow-up from the previous turn."}'
+            )
+        )
+        service = self._make_service(generation_service=generation_service)
+
+        _qa_index, _search_results, _qa_context, retrieval_debug = service.build_qa_context(
+            self.arxiv_id,
+            {"user_id": self.user_id, "session_id": session["session_id"], "question": "那结果呢？"},
+        )
+
+        contextualization_debug = retrieval_debug["question_contextualization"]["prompt_context"]
+        complete_call = next(call for call in generation_service.calls if call["method"] == "complete_with_qwen")
+        prompt = complete_call["prompt"]
+        self.assertEqual(
+            contextualization_debug["section_order"],
+            ["system_instruction", "recent_turns", "agent_state", "current_question"],
+        )
+        self.assertIn("Prompt context sections:", prompt)
+        self.assertIn("Allowed recent source references", prompt)
+        self.assertNotIn("Recent QA turns:", prompt)
 
     def test_answer_question_marks_empty_answer_as_insufficient_evidence(self) -> None:
         self._insert_index(status="indexed")

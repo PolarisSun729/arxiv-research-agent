@@ -11,6 +11,7 @@ from services.paper_qa.session_service import (
     MAX_REFERENCED_SOURCE_IDS,
     PaperQASessionService,
 )
+from services.prompt_context import PromptContextBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class QuestionContextualizer:
     ) -> None:
         self.generation_service = generation_service
         self.session_service = session_service
+        self.prompt_context_builder = PromptContextBuilder()
 
     def contextualize(
         self,
@@ -64,7 +66,7 @@ class QuestionContextualizer:
                 "error": None,
             }
 
-        referenced_source_ids, referenced_turn_ids, prompt = self._build_contextualization_prompt(
+        referenced_source_ids, referenced_turn_ids, prompt, prompt_context_debug = self._build_contextualization_prompt(
             question,
             paper_context,
             conversation_context,
@@ -101,12 +103,14 @@ class QuestionContextualizer:
                 "used_short_term_memory": is_follow_up and contextualized_question != question,
                 "status": "contextualized" if contextualized_question != question else "kept_original",
                 "error": None,
+                "prompt_context": prompt_context_debug,
             }
         except Exception as exc:
             logger.warning("Question contextualization failed, falling back: %s", exc)
             if heuristic_follow_up:
                 fallback = self.build_contextualization_fallback(question, conversation_context, referenced_source_ids)
                 fallback["error"] = str(exc)
+                fallback["prompt_context"] = prompt_context_debug
                 return fallback
             return {
                 "original_question": question,
@@ -118,6 +122,7 @@ class QuestionContextualizer:
                 "used_short_term_memory": False,
                 "status": "fallback_original",
                 "error": str(exc),
+                "prompt_context": prompt_context_debug if "prompt_context_debug" in locals() else {},
             }
 
     @staticmethod
@@ -186,22 +191,16 @@ class QuestionContextualizer:
         question: str,
         paper_context: Dict[str, Any],
         conversation_context: List[Dict[str, Any]],
-    ) -> tuple[List[str], List[str], str]:
+    ) -> tuple[List[str], List[str], str, Dict[str, Any]]:
         referenced_source_ids: List[str] = []
         referenced_turn_ids: List[str] = []
         source_lines: List[str] = []
-        turn_lines: List[str] = []
         for index, turn in enumerate(conversation_context, start=1):
             # 把历史轮次摘要化展开，交给模型判断当前问题是否需要借助上下文改写。
             turn_id = str(turn.get("turn_id", "") or "").strip()
-            if turn_id:
+            is_summary = bool(turn.get("is_summary") or turn.get("context_type") == "session_summary")
+            if turn_id and not is_summary:
                 referenced_turn_ids.append(turn_id)
-            question_text = str(turn.get("question", "") or "").strip()
-            answer_summary = str(turn.get("answer_summary", "") or "").strip()
-            turn_lines.append(
-                f"Turn {index} (id={turn_id or f't{index}'}, created_at={turn.get('created_at', '') or 'unknown'}): "
-                f"Q={question_text or 'N/A'} | A={answer_summary or 'N/A'}"
-            )
             for source in turn.get("sources", []):
                 source_id = str(source.get("source_id", "") or "").strip()
                 if source_id and source_id not in referenced_source_ids:
@@ -212,9 +211,23 @@ class QuestionContextualizer:
                     f"section={source.get('section_path', '') or 'N/A'}, "
                     f"page={source.get('page_number', '') or 'N/A'}, "
                     f"chunk_type={source.get('chunk_type', '') or 'text'}, "
+                    f"from_summary={bool(source.get('from_session_summary'))}, "
                     f"summary={source.get('content', '') or 'N/A'}"
                 )
 
+        session_summary = None
+        recent_turns: List[Dict[str, Any]] = []
+        for turn in conversation_context:
+            if turn.get("is_summary") or turn.get("context_type") == "session_summary":
+                session_summary = {"summary": turn.get("answer_summary", "")}
+            else:
+                recent_turns.append(turn)
+        assembly = self.prompt_context_builder.build_question_contextualization_context(
+            question=question,
+            paper_context=paper_context,
+            session_summary=session_summary,
+            recent_turns=recent_turns,
+        )
         prompt = (
             "You are contextualizing a follow-up question for retrieval over a single academic paper.\n"
             "Rewrite the current user question into a fully self-contained retrieval question when the history indicates a follow-up.\n"
@@ -222,17 +235,17 @@ class QuestionContextualizer:
             "1. Return JSON only.\n"
             "2. Do not invent paper facts, method names, datasets, steps, or results not stated in the conversation context.\n"
             "3. Use short-term memory only to resolve references like it/this method/second step/above.\n"
-            "4. If the reference is unclear, keep the original question and explain the uncertainty in memory_reason.\n"
-            "5. referenced_turn_ids must only contain ids from the provided turns.\n"
-            "6. referenced_source_ids must only contain ids from the provided sources.\n"
-            "7. The JSON schema is exactly: "
+            "4. Session summary is compressed memory, not retrieval evidence; use it only to preserve earlier preferences and task focus.\n"
+            "5. If the reference is unclear, keep the original question and explain the uncertainty in memory_reason.\n"
+            "6. referenced_turn_ids must only contain ids from the provided non-summary turns.\n"
+            "7. referenced_source_ids must only contain ids from the provided sources.\n"
+            "8. The JSON schema is exactly: "
             '{"contextualized_question":"...","is_follow_up":true,"referenced_turn_ids":["..."],"referenced_source_ids":["..."],"memory_reason":"..."}.\n\n'
-            f"Current user question: {question}\n\n"
-            f"Paper title: {paper_context.get('title', '') or 'N/A'}\n"
-            f"Paper abstract: {self.session_service.truncate_text(paper_context.get('abstract', ''), 1200) or 'N/A'}\n\n"
-            "Recent QA turns:\n"
-            f"{chr(10).join(turn_lines) or 'N/A'}\n\n"
-            "Recent source snippets used by those turns:\n"
-            f"{chr(10).join(source_lines[:12]) or 'N/A'}"
+            "Prompt context sections:\n"
+            f"{assembly.get('text') or 'N/A'}\n\n"
+            # source id 白名单是输出约束，不作为事实证据；事实仍由后续 RAG 检索决定。
+            "Allowed recent source references for referenced_source_ids:\n"
+            f"{chr(10).join(source_lines[:12]) or 'N/A'}\n\n"
+            "Return JSON only."
         )
-        return referenced_source_ids, referenced_turn_ids, prompt
+        return referenced_source_ids, referenced_turn_ids, prompt, dict(assembly.get("debug") or {})

@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from core.errors import AppError, ErrorCode
 from services.arxiv.arxiv_search_service import ArxivSearchService
 from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
+from services.context_lifecycle import ContextLifecycleService
 from services.document.chunking_service import ChunkingService
 from services.memory import MemoryService
 from services.storage.database_service import DatabaseService
@@ -82,6 +83,7 @@ class PaperQAService:
         self.context_pack_builder = ContextPackBuilder()
         self.answer_generator = AnswerGenerator(generation_service=self.generation_service)
         self.evidence_verifier = EvidenceVerifier()
+        self.context_lifecycle_service = ContextLifecycleService(db_service=self.db_service)
 
     def _memory_flag(self, key: str, default: Any = None) -> Any:
         """兼容旧调用点：记忆开关实际由 session_service 统一读取。"""
@@ -278,6 +280,8 @@ class PaperQAService:
             chat_session=chat_session,
         )
         conversation_context = session_state["conversation_context"]
+        recent_conversation_context = session_state.get("recent_conversation_context", conversation_context)
+        session_summary = session_state.get("session_summary")
         short_term_debug = session_state["short_term_debug"]
 
         try:
@@ -390,6 +394,16 @@ class PaperQAService:
         retrieval_debug["context_pack"] = {
             "context_budget_debug": context_pack.get("context_budget_debug", {}),
         }
+        retrieval_debug["context_lifecycle"] = self.context_lifecycle_service.build_paper_qa_health_debug(
+            user_id=user_id,
+            session_id=str(chat_session.get("session_id") or ""),
+            short_term_debug=short_term_debug,
+            session_summary=session_summary,
+            degraded={
+                "memory_context_fallback": bool(memory_context.get("fallback_reason")) if isinstance(memory_context, dict) else False,
+                "question_contextualization_status": question_contextualization.get("status") if isinstance(question_contextualization, dict) else None,
+            },
+        )
 
         return qa_index, search_results, {
             "text_context": context_pack["text_context"],
@@ -402,10 +416,22 @@ class PaperQAService:
             "original_question": question,
             "question_contextualization": question_contextualization,
             "conversation_context": conversation_context,
+            "recent_conversation_context": recent_conversation_context,
+            "session_summary": session_summary,
             "memory_context": memory_context,
             "chat_session": chat_session,
             "memory_runtime": memory_runtime,
         }, retrieval_debug
+
+    def _load_user_memory_summary_for_prompt(self, payload: Any) -> Dict[str, Any]:
+        """为 PromptContextBuilder 加载用户长期记忆；失败不影响本轮 QA。"""
+        user_id = self._resolve_user_id(self._payload_get(payload, "user_id"))
+        try:
+            summary = self.memory_service.build_user_memory_summary(user_id)
+            return summary if isinstance(summary, dict) else {}
+        except Exception as exc:
+            logger.warning("Failed to load user memory summary for prompt context: user_id=%s error=%s", user_id, exc)
+            return {}
 
     def answer_question(self, arxiv_id: str, payload: Any) -> Dict[str, Any]:
         question = str(self._payload_get(payload, "question", "") or "").strip()
@@ -417,6 +443,7 @@ class PaperQAService:
         question_contextualization = qa_context.get("question_contextualization", {}) or {}
         chat_session = qa_context.get("chat_session", {}) or {}
         preferred_answer_style = self._get_preferred_answer_style(payload)
+        user_memory_summary = self._load_user_memory_summary_for_prompt(payload)
         styled_generation_question = self._apply_answer_style_to_question(generation_question, preferred_answer_style)
         if isinstance(retrieval_debug, dict) and preferred_answer_style:
             retrieval_debug["preferred_answer_style"] = preferred_answer_style
@@ -428,6 +455,10 @@ class PaperQAService:
                 context_pack=context_pack,
                 preferred_answer_style=preferred_answer_style,
                 style_already_applied=bool(preferred_answer_style),
+                original_question=question,
+                session_summary=qa_context.get("session_summary"),
+                recent_turns=qa_context.get("recent_conversation_context") or qa_context.get("conversation_context") or [],
+                user_memory_summary=user_memory_summary,
             )
             answer = generation_result["answer"]
         except Exception as exc:
@@ -461,13 +492,24 @@ class PaperQAService:
             # debug 按模块分组，方便回放：检索 -> 上下文打包 -> 生成 -> 证据校验。
             retrieval_debug["generation"] = generation_result.get("generation_debug", {})
             retrieval_debug["verification"] = verification_result
+            retrieval_debug["context_lifecycle"] = self.context_lifecycle_service.build_paper_qa_health_debug(
+                user_id=self._resolve_user_id(self._payload_get(payload, "user_id")),
+                session_id=str(chat_session.get("session_id") or ""),
+                short_term_debug=((retrieval_debug.get("memory_modules") or {}).get("short_term_memory") or {}),
+                session_summary=qa_context.get("session_summary"),
+                prompt_context_debug=(generation_result.get("generation_debug", {}) or {}).get("prompt_context"),
+                degraded={
+                    "verification_status": verification_result.get("status") if isinstance(verification_result, dict) else None,
+                    "generation_insufficient_evidence": bool(generation_result.get("insufficient_evidence", False)),
+                },
+            )
 
         persisted_turn = self.persist_completed_turn(
             chat_session=chat_session,
             question=question,
             answer=verified_answer,
             source_payload=source_payload,
-            retrieval_debug=retrieval_debug if isinstance(retrieval_debug, dict) else None,
+            retrieval_debug=self.context_lifecycle_service.prepare_debug_snapshot(retrieval_debug) if isinstance(retrieval_debug, dict) else None,
             contextualized_question=generation_question,
             question_contextualization=question_contextualization,
         )
