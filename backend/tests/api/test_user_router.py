@@ -65,11 +65,11 @@ class _FakeMemoryService:
     def get_profile_topic_evidence(self, user_id: str, topic: str):
         return {"user_id": user_id, "topic": topic, "found": True, "evidence": {"source_papers": ["2401.00001"]}}
 
-    def create_profile_rebuild_job(self, user_id: str):
-        return {"job_id": "job-1", "user_id": user_id, "status": "running", "progress": 0}
+    def create_profile_rebuild_job(self, user_id: str, build_config=None):
+        return {"job_id": "job-1", "user_id": user_id, "status": "running", "progress": 0, "build_config": build_config or {}}
 
-    def run_profile_rebuild_job(self, user_id: str, job_id: str):
-        return self.rebuild_user_research_profile(user_id)
+    def run_profile_rebuild_job(self, user_id: str, job_id: str, build_mode: str = "incremental", max_papers=None):
+        return self.rebuild_user_research_profile(user_id, build_mode=build_mode, max_papers=max_papers)
 
     def get_profile_build_job(self, job_id: str):
         if job_id == "missing":
@@ -90,7 +90,7 @@ class _FakeMemoryService:
         payload["source"] = source
         return payload
 
-    def rebuild_user_research_profile(self, user_id: str):
+    def rebuild_user_research_profile(self, user_id: str, build_mode: str = "incremental", max_papers=None):
         return {
             "user_id": user_id,
             "positive_topics": ["RAG retrieval optimization"],

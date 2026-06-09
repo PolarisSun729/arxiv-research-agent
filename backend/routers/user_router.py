@@ -52,9 +52,11 @@ class ResearchProfileRequest(BaseModel):
 
 
 class RebuildResearchProfileRequest(BaseModel):
-    """研究画像重建请求，只需要指定目标用户。"""
+    """研究画像重建请求；前端默认使用快速增量模式，全量/修复模式留给显式维护入口。"""
     user_id: str = Field(default_factory=get_default_user_id)
     async_build: bool = True
+    build_mode: str = "incremental"
+    max_papers: Optional[int] = None
 
 
 class ActivateProfileSnapshotRequest(BaseModel):
@@ -322,10 +324,23 @@ async def rebuild_user_research_profile(
     try:
         if not payload.async_build:
             # 同步模式仅保留给测试和本地维护；前端默认使用异步 job，避免慢速 LLM 构建阻塞请求。
-            profile = memory_service.rebuild_user_research_profile(user_id=payload.user_id)
+            profile = memory_service.rebuild_user_research_profile(
+                user_id=payload.user_id,
+                build_mode=payload.build_mode,
+                max_papers=payload.max_papers,
+            )
             return {"status": "success", "profile": profile}
-        job = memory_service.create_profile_rebuild_job(user_id=payload.user_id)
-        background_tasks.add_task(memory_service.run_profile_rebuild_job, payload.user_id, job.get("job_id"))
+        job = memory_service.create_profile_rebuild_job(
+            user_id=payload.user_id,
+            build_config={"build_mode": payload.build_mode, "max_papers": payload.max_papers},
+        )
+        background_tasks.add_task(
+            memory_service.run_profile_rebuild_job,
+            payload.user_id,
+            job.get("job_id"),
+            payload.build_mode,
+            payload.max_papers,
+        )
         return {
             "status": "accepted",
             "job": job,

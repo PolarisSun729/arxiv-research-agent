@@ -180,6 +180,11 @@ function normalizeResearchProfile(raw: any, fallbackUserId?: string): UserResear
 }
 
 function normalizeProfileBuildJob(raw: any): UserProfileBuildJob {
+  const metrics = raw?.metrics && typeof raw.metrics === 'object' ? raw.metrics : {}
+  const numericMetric = (key: string) => {
+    const value = raw?.[key] ?? metrics?.[key]
+    return typeof value === 'number' ? value : Number(value || 0)
+  }
   return {
     job_id: String(raw?.job_id || ''),
     user_id: raw?.user_id,
@@ -188,6 +193,36 @@ function normalizeProfileBuildJob(raw: any): UserProfileBuildJob {
     current_stage: raw?.current_stage || null,
     progress: typeof raw?.progress === 'number' ? raw.progress : Number(raw?.progress || 0),
     error_message: raw?.error_message || null,
+    metrics,
+    build_mode: raw?.build_mode ?? metrics?.build_mode ?? null,
+    paper_limit: numericMetric('paper_limit'),
+    candidate_papers: numericMetric('candidate_papers'),
+    total_papers: numericMetric('total_papers'),
+    cached_papers: numericMetric('cached_papers'),
+    uncached_papers: numericMetric('uncached_papers'),
+    processed_papers: numericMetric('processed_papers'),
+    failed_papers: numericMetric('failed_papers'),
+    successful_papers: numericMetric('successful_papers'),
+    cache_hit_count: numericMetric('cache_hit_count'),
+    generated_count: numericMetric('generated_count'),
+    failed_count: numericMetric('failed_count'),
+    skipped_count: numericMetric('skipped_count'),
+    average_seconds_per_paper: numericMetric('average_seconds_per_paper'),
+    total_evidence_extraction_seconds: numericMetric('total_evidence_extraction_seconds'),
+    evidence_concurrency: numericMetric('evidence_concurrency'),
+    rate_limit_backoff_count: numericMetric('rate_limit_backoff_count'),
+    skipped_paper_count: numericMetric('skipped_paper_count'),
+    skipped_read_only_papers: numericMetric('skipped_read_only_papers'),
+    skipped_failed_cache_papers: numericMetric('skipped_failed_cache_papers'),
+    skipped_limit_papers: numericMetric('skipped_limit_papers'),
+    repair_candidate_papers: numericMetric('repair_candidate_papers'),
+    paper_evidence_failure_details: Array.isArray(raw?.paper_evidence_failure_details)
+      ? raw.paper_evidence_failure_details
+      : Array.isArray(metrics?.paper_evidence_failure_details) ? metrics.paper_evidence_failure_details : [],
+    evidence_counts: raw?.evidence_counts && typeof raw.evidence_counts === 'object' ? raw.evidence_counts : metrics?.evidence_counts || {},
+    current_arxiv_id: raw?.current_arxiv_id ?? metrics?.current_arxiv_id ?? null,
+    stage_message: raw?.stage_message ?? metrics?.stage_message ?? null,
+    recent_logs: Array.isArray(raw?.recent_logs) ? raw.recent_logs : Array.isArray(metrics?.recent_logs) ? metrics.recent_logs : [],
     created_at: raw?.created_at || null,
     updated_at: raw?.updated_at || null
   }
@@ -402,11 +437,18 @@ export async function patchUserResearchProfile(profile: Partial<UserResearchProf
   return normalizeResearchProfile(response?.profile || response, effectiveUserId)
 }
 
-export async function rebuildUserResearchProfile(userId?: string, asyncBuild: boolean = true): Promise<{ profile: UserResearchProfile; job?: UserProfileBuildJob | null; status: string }> {
+export async function rebuildUserResearchProfile(
+  userId?: string,
+  asyncBuild: boolean = true,
+  buildMode: 'incremental' | 'full' | 'repair' = 'incremental',
+  maxPapers?: number
+): Promise<{ profile: UserResearchProfile; job?: UserProfileBuildJob | null; status: string }> {
   const effectiveUserId = resolveUserId(userId)
   const response: any = await request.post('/user/research-profile/rebuild', {
     user_id: effectiveUserId,
-    async_build: asyncBuild
+    async_build: asyncBuild,
+    build_mode: buildMode,
+    max_papers: maxPapers
   })
   return {
     status: response?.status || 'success',

@@ -93,6 +93,13 @@ QA_INDEX_JOB_CONFIG: Dict[str, Any] = {
     "timeout_seconds": _env_int("QA_INDEX_JOB_TIMEOUT_SECONDS", 30 * 60),
 }
 
+PROFILE_EVIDENCE_CONFIG: Dict[str, Any] = {
+    # evidence card 会调用外部 LLM；默认只开小并发，避免把限流和 SQLite 写入压力放大。
+    "max_workers": _env_int("PROFILE_EVIDENCE_MAX_WORKERS", 2),
+    # 命中限流/服务繁忙时放慢补充新任务的速度，让当前构建可以降速而不是持续压请求。
+    "rate_limit_backoff_seconds": _env_int("PROFILE_EVIDENCE_RATE_LIMIT_BACKOFF_SECONDS", 3),
+}
+
 AGENT_PLANNER_CONFIG: Dict[str, Any] = {
     # 默认启用规则型 Tool-Aware planner；LLM draft 仍需显式开启，避免规划链路直接依赖外部模型。
     "enable_tool_aware_planner": _env_bool("ENABLE_TOOL_AWARE_PLANNER", True),

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +13,9 @@ logger = logging.getLogger(__name__)
 
 PAPER_EVIDENCE_EXTRACTOR_VERSION = "llm_paper_evidence_v1"
 PAPER_EVIDENCE_SCHEMA_VERSION = "paper_evidence_card_v1"
+PAPER_EVIDENCE_TIMEOUT_SECONDS = 45
+PAPER_EVIDENCE_MAX_ATTEMPTS = 2
+PAPER_EVIDENCE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="paper-evidence")
 
 CONCEPT_TYPES = {
     "main_research_area",
@@ -50,46 +54,79 @@ class PaperEvidenceExtractor:
     def extract(self, paper: Dict[str, Any]) -> Dict[str, Any]:
         normalized = self.normalize_paper(paper)
         if not normalized.get("arxiv_id"):
-            return self._error_card(normalized, "missing_arxiv_id", extraction_confidence=0.0)
+            return self._error_card(normalized, "missing_arxiv_id", error_type="permanent", extraction_confidence=0.0)
         if not normalized.get("abstract"):
             # 缺少摘要时不调用 LLM 编造概念，只保留低置信度基础卡供回溯。
-            return self._error_card(normalized, "missing_abstract", extraction_confidence=0.15)
+            return self._error_card(normalized, "missing_abstract", error_type="permanent", extraction_confidence=0.15)
 
         prompt = self._build_prompt(normalized)
-        for attempt in range(2):
+        last_error = "llm_extraction_failed"
+        last_error_type = "transient"
+        for attempt in range(PAPER_EVIDENCE_MAX_ATTEMPTS):
             try:
                 payload = self._call_llm(prompt)
                 parsed = self._parse_json_object(payload)
                 card = self._validate_and_normalize(parsed, normalized)
                 if card.get("schema_valid"):
+                    card["retry_count"] = attempt
                     return card
             except Exception as exc:
+                last_error_type = self._classify_error(exc)
+                last_error = str(exc)
                 logger.warning(
-                    "Paper evidence extraction failed arxiv_id=%s attempt=%s error=%s",
+                    "Paper evidence extraction failed arxiv_id=%s attempt=%s error_type=%s error=%s",
                     normalized.get("arxiv_id"),
                     attempt + 1,
+                    last_error_type,
                     exc,
                 )
-                last_error = str(exc)
-        return self._error_card(normalized, last_error if "last_error" in locals() else "llm_extraction_failed")
+                if last_error_type in {"permanent", "service_unavailable"}:
+                    break
+        return self._error_card(normalized, last_error, error_type=last_error_type, retry_count=max(0, attempt))
 
     def _call_llm(self, prompt: str) -> str:
         if self.generation_service is None:
             raise RuntimeError("generation_service_unavailable")
         complete = getattr(self.generation_service, "complete_with_qwen", None)
         if callable(complete):
-            return str(
-                complete(
-                    prompt,
-                    task_type="paper_profile_evidence",
-                    enable_thinking=False,
-                )
-                or ""
+            # LLM 供应商请求可能卡住；超时只隔离单篇论文，不能让整个画像构建长期 running。
+            return self._call_with_timeout(
+                complete,
+                prompt,
+                task_type="paper_profile_evidence",
+                enable_thinking=False,
             )
         generate = getattr(self.generation_service, "generate", None)
         if callable(generate):
-            return str(generate(provider="qwen", query=prompt, search_results=[], task_type="paper_profile_evidence") or "")
+            return self._call_with_timeout(
+                generate,
+                provider="qwen",
+                query=prompt,
+                search_results=[],
+                task_type="paper_profile_evidence",
+            )
         raise RuntimeError("generation_service_has_no_supported_method")
+
+    def _call_with_timeout(self, func, *args, **kwargs) -> str:
+        future = PAPER_EVIDENCE_EXECUTOR.submit(func, *args, **kwargs)
+        try:
+            return str(future.result(timeout=PAPER_EVIDENCE_TIMEOUT_SECONDS) or "")
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise TimeoutError(f"paper_evidence_timeout_after_{PAPER_EVIDENCE_TIMEOUT_SECONDS}s") from exc
+
+    @staticmethod
+    def _classify_error(exc: Exception) -> str:
+        text = str(exc or "").lower()
+        if isinstance(exc, TimeoutError) or "timeout" in text or "timed out" in text:
+            return "transient"
+        if "429" in text or "rate limit" in text or "temporarily" in text or "connection" in text:
+            return "transient"
+        if "generation_service_unavailable" in text or "generation_service_has_no_supported_method" in text:
+            return "service_unavailable"
+        if isinstance(exc, (json.JSONDecodeError, ValueError)) or "json" in text or "schema" in text:
+            return "format_error"
+        return "transient"
 
     def _build_prompt(self, paper: Dict[str, Any]) -> str:
         categories = ", ".join(paper.get("categories") or [])
@@ -163,6 +200,7 @@ class PaperEvidenceExtractor:
             "extraction_confidence": self._coerce_confidence(payload.get("extraction_confidence"), default=0.65),
             "schema_valid": True,
             "error_message": "",
+            "retry_count": 0,
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
 
@@ -252,7 +290,16 @@ class PaperEvidenceExtractor:
             deduped.append(concept)
         return deduped[:20]
 
-    def _error_card(self, paper: Dict[str, Any], error_message: str, extraction_confidence: float = 0.2) -> Dict[str, Any]:
+    def _error_card(
+        self,
+        paper: Dict[str, Any],
+        error_message: str,
+        *,
+        error_type: str = "transient",
+        retry_count: int = 0,
+        extraction_confidence: float = 0.2,
+    ) -> Dict[str, Any]:
+        failed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         return {
             "schema_version": PAPER_EVIDENCE_SCHEMA_VERSION,
             "arxiv_id": paper.get("arxiv_id", ""),
@@ -273,6 +320,9 @@ class PaperEvidenceExtractor:
             "extractor_version": PAPER_EVIDENCE_EXTRACTOR_VERSION,
             "extraction_confidence": extraction_confidence,
             "schema_valid": False,
+            "error_type": str(error_type or "transient"),
             "error_message": str(error_message or "unknown_error")[:500],
-            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "failed_at": failed_at,
+            "retry_count": max(0, int(retry_count or 0)),
+            "created_at": failed_at,
         }

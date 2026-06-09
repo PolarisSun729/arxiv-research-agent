@@ -418,6 +418,7 @@ class DatabaseService:
                     current_stage TEXT,
                     progress INTEGER NOT NULL DEFAULT 0,
                     error_message TEXT,
+                    metrics_json TEXT,
                     build_config_json TEXT,
                     extractor_version TEXT,
                     normalizer_version TEXT,
@@ -626,6 +627,7 @@ class DatabaseService:
             logger.info("Database tables initialized successfully")
             self._ensure_user_interest_vector_columns(conn)
             self._ensure_user_profile_event_columns(conn)
+            self._ensure_user_profile_build_job_columns(conn)
             self._ensure_paper_qa_index_columns(conn)
             self._ensure_paper_qa_index_version_rows(conn)
             self._ensure_paper_index_job_columns(conn)
@@ -797,6 +799,21 @@ class DatabaseService:
             ON paper_index_jobs(idempotency_key, status, heartbeat_at)
             """
         )
+        conn.commit()
+
+    def _ensure_user_profile_build_job_columns(self, conn):
+        # build job 是前端轮询的状态源；旧库补齐 metrics_json 后即可承载细粒度进度，不需要破坏现有列结构。
+        required_columns = {
+            "metrics_json": "TEXT",
+        }
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(user_profile_build_jobs)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        for column_name, column_definition in required_columns.items():
+            if column_name not in existing_columns:
+                cursor.execute(
+                    f"ALTER TABLE user_profile_build_jobs ADD COLUMN {column_name} {column_definition}"
+                )
         conn.commit()
 
     def _ensure_paper_chat_session_summary_columns(self, conn):
@@ -1745,7 +1762,7 @@ class DatabaseService:
                 rows = conn.execute(
                     '''
                     SELECT job_id, user_id, status, snapshot_id, current_stage, progress, error_message,
-                           build_config_json, extractor_version, normalizer_version, profile_build_version,
+                           metrics_json, build_config_json, extractor_version, normalizer_version, profile_build_version,
                            created_at, updated_at
                     FROM user_profile_build_jobs
                     WHERE user_id = ?
@@ -1754,24 +1771,7 @@ class DatabaseService:
                     ''',
                     (user_id, max(1, int(limit or 20))),
                 ).fetchall()
-            return [
-                {
-                    "job_id": row[0],
-                    "user_id": row[1],
-                    "status": row[2],
-                    "snapshot_id": row[3],
-                    "current_stage": row[4],
-                    "progress": int(row[5] or 0),
-                    "error_message": row[6],
-                    "build_config": self._deserialize_json_field(row[7]) or {},
-                    "extractor_version": row[8],
-                    "normalizer_version": row[9],
-                    "profile_build_version": row[10],
-                    "created_at": row[11],
-                    "updated_at": row[12],
-                }
-                for row in rows
-            ]
+            return [self._profile_build_job_row_to_dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error listing profile build jobs: {str(e)}")
             return []
@@ -1783,7 +1783,7 @@ class DatabaseService:
                 row = conn.execute(
                     '''
                     SELECT job_id, user_id, status, snapshot_id, current_stage, progress, error_message,
-                           build_config_json, extractor_version, normalizer_version, profile_build_version,
+                           metrics_json, build_config_json, extractor_version, normalizer_version, profile_build_version,
                            created_at, updated_at
                     FROM user_profile_build_jobs
                     WHERE job_id = ?
@@ -1792,24 +1792,62 @@ class DatabaseService:
                 ).fetchone()
             if not row:
                 return None
-            return {
-                "job_id": row[0],
-                "user_id": row[1],
-                "status": row[2],
-                "snapshot_id": row[3],
-                "current_stage": row[4],
-                "progress": int(row[5] or 0),
-                "error_message": row[6],
-                "build_config": self._deserialize_json_field(row[7]) or {},
-                "extractor_version": row[8],
-                "normalizer_version": row[9],
-                "profile_build_version": row[10],
-                "created_at": row[11],
-                "updated_at": row[12],
-            }
+            return self._profile_build_job_row_to_dict(row)
         except Exception as e:
             logger.error(f"Error getting profile build job: {str(e)}")
             return None
+
+    def _profile_build_job_row_to_dict(self, row) -> Dict[str, Any]:
+        """把 job 行统一展开为前端轮询结构，metrics 同时保留原始对象和常用顶层字段。"""
+        metrics = self._deserialize_json_field(row[7]) or {}
+        payload = {
+            "job_id": row[0],
+            "user_id": row[1],
+            "status": row[2],
+            "snapshot_id": row[3],
+            "current_stage": row[4],
+            "progress": int(row[5] or 0),
+            "error_message": row[6],
+            "metrics": metrics,
+            "build_config": self._deserialize_json_field(row[8]) or {},
+            "extractor_version": row[9],
+            "normalizer_version": row[10],
+            "profile_build_version": row[11],
+            "created_at": row[12],
+            "updated_at": row[13],
+        }
+        for field_name in (
+            "total_papers",
+            "candidate_papers",
+            "cached_papers",
+            "uncached_papers",
+            "processed_papers",
+            "failed_papers",
+            "skipped_paper_count",
+            "skipped_read_only_papers",
+            "skipped_failed_cache_papers",
+            "skipped_limit_papers",
+            "repair_candidate_papers",
+            "successful_papers",
+            "cache_hit_count",
+            "generated_count",
+            "failed_count",
+            "skipped_count",
+            "average_seconds_per_paper",
+            "total_evidence_extraction_seconds",
+            "evidence_concurrency",
+            "rate_limit_backoff_count",
+            "paper_evidence_failure_details",
+            "build_mode",
+            "paper_limit",
+            "evidence_counts",
+            "current_arxiv_id",
+            "stage_message",
+            "recent_logs",
+        ):
+            if field_name in metrics:
+                payload[field_name] = metrics.get(field_name)
+        return payload
 
     def list_user_profile_snapshots(self, user_id: str = DEFAULT_USER_ID, limit: int = 20) -> List[Dict[str, Any]]:
         """列出画像快照摘要，避免前端列表一次性拉取完整 profile payload。"""
@@ -2084,15 +2122,16 @@ class DatabaseService:
         status: str = "running",
     ) -> str:
         job_id = str(uuid.uuid4())
+        config = dict(build_config or {})
         try:
             with self._get_connection() as conn:
                 conn.execute(
                     '''
                     INSERT INTO user_profile_build_jobs (
-                        job_id, user_id, status, current_stage, progress, build_config_json,
+                        job_id, user_id, status, current_stage, progress, metrics_json, build_config_json,
                         extractor_version, normalizer_version, profile_build_version
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''',
                     (
                         job_id,
@@ -2100,7 +2139,14 @@ class DatabaseService:
                         status,
                         "collect_evidence",
                         0,
-                        self._serialize_json_field(build_config or {}),
+                        self._serialize_json_field({
+                            "current_stage": "collect_evidence",
+                            "progress": 0,
+                            "build_mode": config.get("build_mode") or "incremental",
+                            "paper_limit": config.get("max_papers"),
+                            "stage_message": "等待开始收集画像证据",
+                        }),
+                        self._serialize_json_field(config),
                         PROFILE_EXTRACTOR_VERSION,
                         PROFILE_NORMALIZER_VERSION,
                         PROFILE_BUILD_VERSION,
@@ -2120,6 +2166,7 @@ class DatabaseService:
         current_stage: Optional[str] = None,
         progress: Optional[int] = None,
         error_message: Optional[str] = None,
+        metrics: Optional[Dict[str, Any]] = None,
     ) -> None:
         updates: List[str] = []
         values: List[Any] = []
@@ -2129,6 +2176,7 @@ class DatabaseService:
             "current_stage": current_stage,
             "progress": progress,
             "error_message": error_message,
+            "metrics_json": self._serialize_json_field(metrics) if metrics is not None else None,
         }.items():
             if value is None:
                 continue
@@ -2342,7 +2390,7 @@ class DatabaseService:
                     effective = effective_for_snapshot
                 if job_id:
                     next_status = "completed" if activate else "needs_review"
-                    next_stage = "completed" if activate else "quality_review"
+                    next_stage = "completed" if activate else "needs_review"
                     cursor.execute(
                         '''
                         UPDATE user_profile_build_jobs
@@ -2501,6 +2549,7 @@ class DatabaseService:
         event_types: Optional[List[str]] = None,
         include_consumed: bool = True,
         include_in_profile_only: bool = True,
+        dirty_only: bool = False,
         since: Optional[str] = None,
         until: Optional[str] = None,
         limit: int = 500,
@@ -2516,6 +2565,8 @@ class DatabaseService:
             filters.append("consumed_by_job_id IS NULL")
         if include_in_profile_only:
             filters.append("include_in_profile = 1")
+        if dirty_only:
+            filters.append("profile_dirty = 1")
         if since:
             filters.append("created_at >= ?")
             values.append(since)

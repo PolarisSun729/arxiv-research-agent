@@ -53,6 +53,34 @@ export interface UserProfileBuildJob {
   current_stage?: string | null
   progress?: number
   error_message?: string | null
+  metrics?: Record<string, any>
+  build_mode?: string | null
+  paper_limit?: number
+  candidate_papers?: number
+  total_papers?: number
+  cached_papers?: number
+  uncached_papers?: number
+  processed_papers?: number
+  failed_papers?: number
+  successful_papers?: number
+  cache_hit_count?: number
+  generated_count?: number
+  failed_count?: number
+  skipped_count?: number
+  average_seconds_per_paper?: number
+  total_evidence_extraction_seconds?: number
+  evidence_concurrency?: number
+  rate_limit_backoff_count?: number
+  skipped_paper_count?: number
+  skipped_read_only_papers?: number
+  skipped_failed_cache_papers?: number
+  skipped_limit_papers?: number
+  repair_candidate_papers?: number
+  paper_evidence_failure_details?: Array<Record<string, any>>
+  evidence_counts?: Record<string, any>
+  current_arxiv_id?: string | null
+  stage_message?: string | null
+  recent_logs?: Array<Record<string, any>>
   created_at?: string | null
   updated_at?: string | null
 }

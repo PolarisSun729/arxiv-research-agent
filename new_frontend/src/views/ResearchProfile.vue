@@ -26,6 +26,42 @@ const effectiveProfile = computed(() => detail.value?.effective_profile || store
 const generatedProfile = computed(() => detail.value?.generated_profile || null)
 const manualProfile = computed(() => detail.value?.manual_profile || null)
 const latestJob = computed(() => store.latestProfileBuildJob || detail.value?.latest_build_job || null)
+const latestJobLogs = computed(() => (latestJob.value?.recent_logs || []).slice(-4).reverse())
+const latestJobStageMessage = computed(() => latestJob.value?.stage_message || latestJob.value?.metrics?.stage_message || '')
+const latestJobPaperProgress = computed(() => {
+  const total = Number(latestJob.value?.total_papers || 0)
+  if (!total) return ''
+  const processed = Number(latestJob.value?.processed_papers || 0)
+  return `论文证据卡：${processed} / ${total}`
+})
+const latestJobEventProgress = computed(() => {
+  const counts = latestJob.value?.evidence_counts || latestJob.value?.metrics?.evidence_counts || {}
+  const used = Number(counts.used_events || counts.profile_events || 0)
+  const total = Number(counts.total_events || used || 0)
+  if (!used && !total) return ''
+  const skipped = Number(counts.skipped_events || 0)
+  return skipped ? `事件：${used} / ${total}，跳过 ${skipped}` : `事件：${used} / ${total}`
+})
+const latestJobEvidenceRuntime = computed(() => {
+  const job = latestJob.value
+  if (!job) return ''
+  const parts: string[] = []
+  const concurrency = Number(job.evidence_concurrency || job.metrics?.evidence_concurrency || 0)
+  const averageSeconds = Number(job.average_seconds_per_paper || job.metrics?.average_seconds_per_paper || 0)
+  const totalSeconds = Number(job.total_evidence_extraction_seconds || job.metrics?.total_evidence_extraction_seconds || 0)
+  const backoffCount = Number(job.rate_limit_backoff_count || job.metrics?.rate_limit_backoff_count || 0)
+  if (concurrency) parts.push(`并发：${concurrency}`)
+  if (averageSeconds) parts.push(`单篇均耗时：${averageSeconds.toFixed(1)} 秒`)
+  if (totalSeconds) parts.push(`生成耗时：${totalSeconds.toFixed(1)} 秒`)
+  if (backoffCount) parts.push(`限流退避：${backoffCount} 次`)
+  return parts.join('，')
+})
+const latestJobFailureSummary = computed(() => {
+  const failures = latestJob.value?.paper_evidence_failure_details || latestJob.value?.metrics?.paper_evidence_failure_details || []
+  return Array.isArray(failures)
+    ? failures.slice(-3).map(item => `${item.arxiv_id || 'unknown'}：${item.error_type || 'failed'}`).join('；')
+    : ''
+})
 const selectedEvidence = computed(() => {
   const topic = selectedTopic.value
   return topic ? effectiveProfile.value?.topic_evidence?.[topic] || generatedProfile.value?.topic_evidence?.[topic] || null : null
@@ -137,9 +173,30 @@ onUnmounted(() => {
     </section>
 
     <section v-if="latestJob" class="status-strip">
-      <span>构建状态：{{ latestJob.status }}</span>
+      <div class="status-strip__main">
+        <span>构建状态：{{ latestJob.status }}</span>
+        <span v-if="latestJob.current_stage">阶段：{{ latestJob.current_stage }}</span>
+        <span v-if="latestJobStageMessage">{{ latestJobStageMessage }}</span>
+      </div>
       <el-progress :percentage="latestJob.progress || 0" :stroke-width="8" />
-      <span v-if="latestJob.current_stage">阶段：{{ latestJob.current_stage }}</span>
+      <div class="status-strip__metrics">
+        <span v-if="latestJob.build_mode">模式：{{ latestJob.build_mode }}</span>
+        <span v-if="latestJobEventProgress">{{ latestJobEventProgress }}</span>
+        <span v-if="latestJob.candidate_papers !== undefined">候选论文：{{ latestJob.candidate_papers }}</span>
+        <span v-if="latestJobPaperProgress">{{ latestJobPaperProgress }}</span>
+        <span v-if="latestJob.cached_papers !== undefined">缓存：{{ latestJob.cached_papers }}</span>
+        <span v-if="latestJob.cache_hit_count !== undefined">缓存命中：{{ latestJob.cache_hit_count }}</span>
+        <span v-if="latestJob.uncached_papers !== undefined">待生成：{{ latestJob.uncached_papers }}</span>
+        <span v-if="latestJob.generated_count !== undefined">已生成：{{ latestJob.generated_count }}</span>
+        <span v-if="latestJob.skipped_paper_count !== undefined">跳过：{{ latestJob.skipped_paper_count }}</span>
+        <span v-if="latestJob.failed_papers !== undefined">失败：{{ latestJob.failed_papers }}</span>
+        <span v-if="latestJobEvidenceRuntime">{{ latestJobEvidenceRuntime }}</span>
+        <span v-if="latestJob.current_arxiv_id">当前：{{ latestJob.current_arxiv_id }}</span>
+      </div>
+      <div v-if="latestJobLogs.length" class="status-strip__logs">
+        <span v-for="log in latestJobLogs" :key="`${log.ts || ''}-${log.message || ''}`">{{ log.message || log }}</span>
+      </div>
+      <span v-if="latestJobFailureSummary" class="status-strip__error">失败摘要：{{ latestJobFailureSummary }}</span>
       <span v-if="latestJob.error_message" class="status-strip__error">{{ latestJob.error_message }}</span>
     </section>
 
@@ -244,7 +301,11 @@ onUnmounted(() => {
 .profile-toolbar h1 { margin: 0 0 6px; font-size: 24px; color: #111827; }
 .profile-toolbar p { margin: 0; color: #64748b; }
 .profile-toolbar__actions { display: flex; gap: 8px; }
-.status-strip { display: grid; grid-template-columns: auto minmax(160px, 1fr) auto auto; gap: 12px; align-items: center; }
+.status-strip { display: flex; flex-direction: column; gap: 10px; }
+.status-strip__main, .status-strip__metrics { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+.status-strip__main span:first-child { font-weight: 600; color: #111827; }
+.status-strip__metrics { color: #475569; font-size: 13px; }
+.status-strip__logs { display: grid; gap: 4px; color: #64748b; font-size: 12px; }
 .status-strip__error { color: #dc2626; }
 .profile-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
 .profile-grid--bottom { grid-template-columns: 1fr 1fr; }

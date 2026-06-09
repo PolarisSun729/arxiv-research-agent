@@ -3,7 +3,10 @@ from __future__ import annotations
 import logging
 import json
 import re
-from typing import Any, Dict, List, Optional
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 from services.context_merge import merge_backend_authoritative_context
 from services.memory.memory_debug import build_memory_debug_payload
@@ -19,7 +22,7 @@ from services.memory.profile_aggregator import ProfileAggregator
 from services.memory.profile_reviewer import ProfileReviewer
 from services.memory.research_profile_generator import ResearchProfileGenerator
 from services.storage.database_service import DatabaseService
-from utils.config import get_default_user_id
+from utils.config import PROFILE_EVIDENCE_CONFIG, get_default_user_id
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,14 @@ LOW_INFORMATION_TOPIC_TERMS = {
     "system",
     "systems",
 }
+PROFILE_BUILD_MODES = {"incremental", "full", "repair"}
+PROFILE_BUILD_DEFAULT_PAPER_LIMITS = {
+    "incremental": 40,
+    "full": 1000,
+    "repair": 80,
+}
+PROFILE_STRONG_EVENT_TYPES = {"liked", "disliked", "favorite", "later", "note_saved", "qa_asked", "not_interested"}
+PROFILE_RECENT_CONTEXT_EVENT_TYPES = {"liked", "favorite", "later", "note_saved", "qa_asked"}
 
 
 class MemoryService:
@@ -536,14 +547,34 @@ class MemoryService:
     def create_profile_rebuild_job(self, user_id: Optional[str], build_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """创建画像重建任务记录；实际重建由 API 后台任务或调度器执行。"""
         resolved_user_id = self._resolve_user_id(user_id)
-        config = {"legacy_output_projection": True, "async_requested": True, **dict(build_config or {})}
+        incoming_config = dict(build_config or {})
+        build_mode = self._normalize_profile_build_mode(incoming_config.get("build_mode"))
+        paper_limit = self._resolve_profile_paper_limit(build_mode, incoming_config.get("max_papers"))
+        config = {
+            "legacy_output_projection": True,
+            "async_requested": True,
+            **incoming_config,
+            "build_mode": build_mode,
+            "max_papers": paper_limit,
+        }
         job_id = self.db_service.create_user_profile_build_job(user_id=resolved_user_id, build_config=config) if hasattr(self.db_service, "create_user_profile_build_job") else None
         job = self.db_service.get_user_profile_build_job(job_id) if job_id and hasattr(self.db_service, "get_user_profile_build_job") else None
         return job or {"job_id": job_id, "user_id": resolved_user_id, "status": "running", "current_stage": "collect_evidence", "progress": 0}
 
-    def run_profile_rebuild_job(self, user_id: Optional[str], job_id: Optional[str] = None) -> Dict[str, Any]:
+    def run_profile_rebuild_job(
+        self,
+        user_id: Optional[str],
+        job_id: Optional[str] = None,
+        build_mode: Optional[str] = "incremental",
+        max_papers: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """执行画像重建任务；传入 job_id 时复用已创建任务，避免前端轮询丢失任务标识。"""
-        return self.generate_user_research_profile(user_id=user_id, existing_job_id=job_id)
+        return self.generate_user_research_profile(
+            user_id=user_id,
+            existing_job_id=job_id,
+            build_mode=build_mode,
+            max_papers=max_papers,
+        )
 
     def get_profile_build_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         return self.db_service.get_user_profile_build_job(job_id) if hasattr(self.db_service, "get_user_profile_build_job") else None
@@ -734,24 +765,134 @@ class MemoryService:
                 papers.append(paper)
         return self._dedupe_papers(papers)
 
+    @staticmethod
+    def _normalize_profile_build_mode(build_mode: Optional[str]) -> str:
+        """统一画像构建模式，避免 API、调度器和测试传入大小写或未知值后分叉。"""
+        mode = str(build_mode or "incremental").strip().lower()
+        return mode if mode in PROFILE_BUILD_MODES else "incremental"
+
+    @staticmethod
+    def _resolve_profile_paper_limit(build_mode: str, max_papers: Optional[int] = None) -> int:
+        """不同模式使用不同论文上限；普通增量构建必须有硬上限，避免一次点击触发超长任务。"""
+        default_limit = PROFILE_BUILD_DEFAULT_PAPER_LIMITS.get(build_mode, PROFILE_BUILD_DEFAULT_PAPER_LIMITS["incremental"])
+        try:
+            limit = int(max_papers) if max_papers is not None else default_limit
+        except (TypeError, ValueError):
+            limit = default_limit
+        return max(1, min(limit, 1000))
+
+    @staticmethod
+    def _is_strong_profile_event(event_type: str) -> bool:
+        """强行为可以触发证据卡生成；read 只作为弱上下文，不单独拉起大量 LLM 调用。"""
+        return str(event_type or "").strip().lower() in PROFILE_STRONG_EVENT_TYPES
+
+    def _select_profile_build_events(
+        self,
+        user_id: str,
+        *,
+        build_mode: str,
+        event_limit: int,
+    ) -> Dict[str, Any]:
+        """按构建模式选择事件范围，并返回跳过统计供 job metrics 和 snapshot 回看。"""
+        if not hasattr(self.db_service, "list_user_profile_events"):
+            return {"events": [], "total_events": 0, "used_events": 0, "skipped_events": 0, "dirty_event_count": 0}
+
+        if build_mode == "full":
+            fetched_events = self.db_service.list_user_profile_events(
+                user_id=user_id,
+                include_consumed=True,
+                include_in_profile_only=True,
+                limit=event_limit + 1,
+            )
+            events = fetched_events[:event_limit]
+            return {
+                "events": events,
+                "total_events": len(fetched_events),
+                "used_events": len(events),
+                "skipped_events": max(0, len(fetched_events) - len(events)),
+                "dirty_event_count": 0,
+            }
+
+        if build_mode == "repair":
+            # 修复模式扫描有限历史事件来发现缺失/失败卡，但真正调用 LLM 的范围仍由 paper_limit 控制。
+            fetched_events = self.db_service.list_user_profile_events(
+                user_id=user_id,
+                include_consumed=True,
+                include_in_profile_only=True,
+                limit=event_limit + 1,
+            )
+            events = fetched_events[:event_limit]
+            return {
+                "events": events,
+                "total_events": len(fetched_events),
+                "used_events": len(events),
+                "skipped_events": max(0, len(fetched_events) - len(events)),
+                "dirty_event_count": len([event for event in events if event.get("profile_dirty")]),
+            }
+
+        dirty_events = self.db_service.list_user_profile_events(
+            user_id=user_id,
+            include_consumed=True,
+            include_in_profile_only=True,
+            dirty_only=True,
+            limit=event_limit,
+        )
+        # 增量模式优先 dirty 事件，并用少量最近强信号补上下文；不把大量历史 read 拉进本次构建。
+        recent_context = self.db_service.list_user_profile_events(
+            user_id=user_id,
+            event_types=sorted(PROFILE_RECENT_CONTEXT_EVENT_TYPES),
+            include_consumed=True,
+            include_in_profile_only=True,
+            limit=max(10, event_limit // 3),
+        )
+        selected: List[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for event in [*dirty_events, *recent_context]:
+            if not isinstance(event, dict):
+                continue
+            event_id = str(event.get("event_id") or "")
+            if event_id and event_id in seen_ids:
+                continue
+            if event_id:
+                seen_ids.add(event_id)
+            selected.append(event)
+            if len(selected) >= event_limit:
+                break
+        skipped_events = max(0, len(dirty_events) + len(recent_context) - len(selected))
+        return {
+            "events": selected,
+            "total_events": len(dirty_events) + len(recent_context),
+            "used_events": len(selected),
+            "skipped_events": skipped_events,
+            "dirty_event_count": len(dirty_events),
+        }
+
     def _collect_research_profile_evidence(
         self,
         user_id: str,
         *,
+        build_mode: str = "incremental",
+        max_papers: Optional[int] = None,
         extra_liked_papers: Optional[List[Dict[str, Any]]] = None,
         extra_disliked_papers: Optional[List[Dict[str, Any]]] = None,
         extra_recent_actions: Optional[List[Dict[str, Any]]] = None,
         extra_notes: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """从 append-only 画像事件流收集构建证据，业务状态表不再作为画像主证据。"""
-        events = []
-        if hasattr(self.db_service, "list_user_profile_events"):
-            events = self.db_service.list_user_profile_events(
-                user_id=user_id,
-                include_consumed=True,
-                include_in_profile_only=True,
-                limit=1000,
-            )
+        build_mode = self._normalize_profile_build_mode(build_mode)
+        paper_limit = self._resolve_profile_paper_limit(build_mode, max_papers)
+        if build_mode == "full":
+            event_limit = 10000
+        elif build_mode == "repair":
+            event_limit = max(400, paper_limit * 5)
+        else:
+            event_limit = max(80, paper_limit * 4)
+        event_selection = self._select_profile_build_events(
+            user_id,
+            build_mode=build_mode,
+            event_limit=event_limit,
+        )
+        events = event_selection["events"]
 
         liked_papers: List[Dict[str, Any]] = []
         disliked_papers: List[Dict[str, Any]] = []
@@ -768,18 +909,24 @@ class MemoryService:
             metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
             paper_from_event = metadata.get("paper") if isinstance(metadata.get("paper"), dict) else {}
             paper = self._resolve_paper_payload(arxiv_id, paper_payload=paper_from_event) if arxiv_id else {}
+            enriched_paper = {
+                **paper,
+                "_profile_event": event,
+                "_profile_action_types": [event_type],
+                "_profile_dirty": bool(event.get("profile_dirty")),
+            } if paper else {}
             if event_type == "liked" and paper:
-                liked_papers.append({**paper, "_profile_event": event})
-                recent_actions.append({"arxiv_id": arxiv_id, "action_type": "liked", "paper": paper, "_profile_event": event})
+                liked_papers.append(enriched_paper)
+                recent_actions.append({"arxiv_id": arxiv_id, "action_type": "liked", "paper": enriched_paper, "_profile_event": event})
                 continue
             if event_type == "disliked" and paper:
                 # 负向事件只作为负向画像候选，聚合器会保持谨慎权重，避免一次点踩否定整个大方向。
-                disliked_papers.append({**paper, "_profile_event": event})
-                recent_actions.append({"arxiv_id": arxiv_id, "action_type": "disliked", "paper": paper, "_profile_event": event})
+                disliked_papers.append(enriched_paper)
+                recent_actions.append({"arxiv_id": arxiv_id, "action_type": "disliked", "paper": enriched_paper, "_profile_event": event})
                 continue
             if event_type in {"favorite", "later", "read", "not_interested", "qa_asked"}:
                 if paper:
-                    recent_actions.append({"arxiv_id": arxiv_id, "action_type": event_type, "paper": paper, "_profile_event": event})
+                    recent_actions.append({"arxiv_id": arxiv_id, "action_type": event_type, "paper": enriched_paper, "_profile_event": event})
                 continue
             if event_type == "note_saved":
                 note_id = str(event.get("note_id") or event.get("source_id") or "").strip()
@@ -787,7 +934,7 @@ class MemoryService:
                 if note:
                     notes.append({**note, "_profile_event": event})
                 elif paper:
-                    recent_actions.append({"arxiv_id": arxiv_id, "action_type": "note_saved", "paper": paper, "_profile_event": event})
+                    recent_actions.append({"arxiv_id": arxiv_id, "action_type": "note_saved", "paper": enriched_paper, "_profile_event": event})
 
         # 兼容单元测试或显式调用传入的即时证据，但正式重建仍以事件流为主证据。
         liked_papers = self._dedupe_papers([*liked_papers, *(extra_liked_papers or [])])
@@ -808,7 +955,8 @@ class MemoryService:
                 paper = self._resolve_paper_payload(arxiv_id) if arxiv_id else {}
                 if not paper:
                     continue
-                recent_actions.append({**action, "paper": paper})
+                action_type = str(action.get("action_type") or "").strip().lower()
+                recent_actions.append({**action, "paper": {**paper, "_profile_action_types": [action_type]}})
         return {
             "liked_papers": liked_papers,
             "disliked_papers": disliked_papers,
@@ -816,6 +964,9 @@ class MemoryService:
             "notes": notes,
             "profile_events": events,
             "profile_event_ids": [event_id for event_id in event_ids if event_id],
+            "build_mode": build_mode,
+            "paper_limit": paper_limit,
+            "event_selection": event_selection,
         }
 
     def _summarize_profile_evidence(self, evidence: Dict[str, Any]) -> Dict[str, Any]:
@@ -877,11 +1028,88 @@ class MemoryService:
             ),
         }
 
-    def _upsert_paper_evidence_cards(self, evidence: Dict[str, Any]) -> None:
-        """为参与画像的论文维护 LLM evidence card，并优先复用同版本缓存。"""
-        seen: set[str] = set()
-        cards_by_id: Dict[str, Dict[str, Any]] = {}
-        buckets = [
+    @staticmethod
+    def _profile_build_progress(stage: str, processed_papers: int = 0, total_papers: int = 0) -> int:
+        """按阶段映射粗粒度百分比，避免长时间停在 collect_evidence 造成前端误判卡死。"""
+        stage_ranges = {
+            "collect_evidence": (0, 10),
+            "prepare_papers": (10, 15),
+            "extract_paper_evidence": (15, 75),
+            "aggregate_profile": (75, 85),
+            "normalize_topics": (85, 88),
+            "review_profile": (88, 92),
+            "save_snapshot": (92, 99),
+            "completed": (100, 100),
+            "needs_review": (100, 100),
+            "failed": (0, 100),
+        }
+        start, end = stage_ranges.get(stage, (0, 100))
+        if stage != "extract_paper_evidence" or total_papers <= 0:
+            return end
+        ratio = max(0.0, min(1.0, processed_papers / max(total_papers, 1)))
+        return int(start + (end - start) * ratio)
+
+    @staticmethod
+    def _append_profile_job_log(metrics: Dict[str, Any], message: str) -> None:
+        """recent_logs 只保留最近节点，防止长任务把 job 行写成过大的诊断载荷。"""
+        logs = metrics.get("recent_logs") if isinstance(metrics.get("recent_logs"), list) else []
+        logs.append({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "message": message})
+        metrics["recent_logs"] = logs[-12:]
+
+    def _update_profile_build_job(
+        self,
+        job_id: Optional[str],
+        metrics: Dict[str, Any],
+        *,
+        status: Optional[str] = "running",
+        stage: Optional[str] = None,
+        progress: Optional[int] = None,
+        error_message: Optional[str] = None,
+        stage_message: Optional[str] = None,
+    ) -> None:
+        """统一写入 job 阶段和 metrics，保证数据库轮询字段与调试统计同步更新。"""
+        if not job_id or not hasattr(self.db_service, "update_user_profile_build_job"):
+            return
+        if stage:
+            metrics["current_stage"] = stage
+        if progress is not None:
+            metrics["progress"] = max(0, min(100, int(progress)))
+        if stage_message:
+            metrics["stage_message"] = stage_message
+            self._append_profile_job_log(metrics, stage_message)
+        if error_message:
+            metrics["error_message"] = str(error_message)[:500]
+        self.db_service.update_user_profile_build_job(
+            job_id,
+            status=status,
+            current_stage=metrics.get("current_stage"),
+            progress=metrics.get("progress"),
+            error_message=error_message,
+            metrics=metrics,
+        )
+
+    @staticmethod
+    def _is_systemic_evidence_error(error_message: Any) -> bool:
+        """识别更像服务整体不可用的错误；缺摘要等单篇数据问题只计入 failed_papers。"""
+        text = str(error_message or "").lower()
+        systemic_markers = (
+            "generation_service_unavailable",
+            "generation_service_has_no_supported_method",
+            "dashscope",
+            "timeout",
+            "connection",
+            "rate limit",
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+        )
+        return any(marker in text for marker in systemic_markers)
+
+    def _iter_profile_evidence_paper_refs(self, evidence: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """展开所有论文证据引用，便于把缓存或新生成的 card 回填到每个消费者会读取的位置。"""
+        return [
             *(evidence.get("liked_papers") or []),
             *(evidence.get("disliked_papers") or []),
             *[
@@ -895,32 +1123,402 @@ class MemoryService:
                 if isinstance(note, dict) and str(note.get("arxiv_id") or "").strip()
             ],
         ]
+
+    def _collect_profile_evidence_papers(self, evidence: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """收集本次构建实际涉及的唯一论文，后续缓存统计和逐篇进度都基于这个边界。"""
+        buckets = self._iter_profile_evidence_paper_refs(evidence)
+        unique_papers: List[Dict[str, Any]] = []
+        index_by_id: Dict[str, int] = {}
         for paper in buckets:
             if not isinstance(paper, dict):
                 continue
             arxiv_id = str(paper.get("arxiv_id") or paper.get("id") or "").strip()
-            if not arxiv_id or not hasattr(self.db_service, "upsert_paper_profile_evidence"):
+            if not arxiv_id:
                 continue
+            action_types = [
+                str(item or "").strip().lower()
+                for item in paper.get("_profile_action_types", [])
+                if str(item or "").strip()
+            ]
+            if arxiv_id in index_by_id:
+                # 同一论文可能同时出现在 liked/recent/note 引用中，合并行为类型后再判断是否允许触发 LLM。
+                existing = unique_papers[index_by_id[arxiv_id]]
+                merged_actions = set(existing.get("_profile_action_types") or [])
+                merged_actions.update(action_types)
+                existing["_profile_action_types"] = sorted(merged_actions)
+                existing["_profile_dirty"] = bool(existing.get("_profile_dirty") or paper.get("_profile_dirty"))
+                continue
+            index_by_id[arxiv_id] = len(unique_papers)
+            if action_types:
+                paper["_profile_action_types"] = sorted(set(action_types))
+            unique_papers.append(paper)
+        return unique_papers
+
+    def _paper_has_strong_profile_signal(self, paper: Dict[str, Any]) -> bool:
+        """判断论文是否来自显式强行为；read-only 论文默认不触发未缓存 evidence card 生成。"""
+        for action_type in paper.get("_profile_action_types") or []:
+            if self._is_strong_profile_event(str(action_type)):
+                return True
+        event = paper.get("_profile_event") if isinstance(paper.get("_profile_event"), dict) else {}
+        return self._is_strong_profile_event(str(event.get("event_type") or event.get("action_type") or ""))
+
+    def _assign_profile_evidence_cards(self, evidence: Dict[str, Any], cards_by_id: Dict[str, Dict[str, Any]]) -> None:
+        """把唯一论文生成出的 card 回填到所有证据引用，保证聚合器读取到一致的论文语义证据。"""
+        for paper in self._iter_profile_evidence_paper_refs(evidence):
+            if not isinstance(paper, dict):
+                continue
+            arxiv_id = str(paper.get("arxiv_id") or paper.get("id") or "").strip()
             if arxiv_id in cards_by_id:
                 paper["evidence_card"] = cards_by_id[arxiv_id]
-                continue
-            if arxiv_id in seen:
-                continue
-            seen.add(arxiv_id)
+
+    @staticmethod
+    def _resolve_profile_evidence_concurrency() -> int:
+        """解析 evidence 生成并发度；这里硬性封顶，避免误配置把外部 LLM 和本地 SQLite 同时打满。"""
+        try:
+            configured = int(PROFILE_EVIDENCE_CONFIG.get("max_workers") or 2)
+        except (TypeError, ValueError):
+            configured = 2
+        return max(1, min(configured, 4))
+
+    @staticmethod
+    def _profile_evidence_backoff_seconds() -> int:
+        """解析限流退避时间；负值或异常配置都回到保守默认值。"""
+        try:
+            configured = int(PROFILE_EVIDENCE_CONFIG.get("rate_limit_backoff_seconds") or 3)
+        except (TypeError, ValueError):
+            configured = 3
+        return max(0, configured)
+
+    @staticmethod
+    def _is_rate_limited_evidence_card(card: Dict[str, Any]) -> bool:
+        """识别供应商限流/繁忙类失败，用于降低后续补充任务速度而不是继续压请求。"""
+        if card.get("schema_valid"):
+            return False
+        if str(card.get("error_type") or "").lower() != "transient":
+            return False
+        text = str(card.get("error_message") or "").lower()
+        return any(marker in text for marker in ("429", "rate limit", "too many", "throttle", "busy", "temporarily"))
+
+    def _extract_and_store_profile_evidence_card(
+        self,
+        paper: Dict[str, Any],
+        *,
+        can_persist: bool,
+    ) -> Dict[str, Any]:
+        """单篇 evidence card 的并发工作单元：抽取、失败降级、立即落库，避免批量结束后才保存。"""
+        arxiv_id = str(paper.get("arxiv_id") or paper.get("id") or "").strip()
+        started_at = time.perf_counter()
+        try:
+            # evidence card 是画像概念的唯一默认入口；单篇失败会落错误卡并继续，避免一篇论文拖垮整次构建。
+            card = self.paper_evidence_extractor.extract(paper)
+        except Exception as exc:
+            # 防御 extractor 外层异常：转换成错误卡后继续处理，系统性失败在所有 worker 完成后统一判定。
+            logger.exception("Profile rebuild paper evidence crashed arxiv_id=%s", arxiv_id)
+            card = self.paper_evidence_extractor._error_card(
+                self.paper_evidence_extractor.normalize_paper(paper),
+                str(exc),
+                extraction_confidence=0.0,
+            )
+        if can_persist:
+            # DatabaseService 每次 upsert 自行取连接；worker 不共享 sqlite connection，降低并发写冲突风险。
+            self.db_service.upsert_paper_profile_evidence(arxiv_id, card)
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        return {
+            "arxiv_id": arxiv_id,
+            "paper": paper,
+            "card": card,
+            "elapsed_ms": elapsed_ms,
+        }
+
+    def _upsert_paper_evidence_cards(
+        self,
+        evidence: Dict[str, Any],
+        *,
+        job_id: Optional[str] = None,
+        metrics: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """为参与画像的论文维护 LLM evidence card，并把缓存命中和逐篇生成进度写入 job。"""
+        metrics = metrics if metrics is not None else {}
+        build_mode = self._normalize_profile_build_mode(evidence.get("build_mode") or metrics.get("build_mode"))
+        paper_limit = self._resolve_profile_paper_limit(build_mode, evidence.get("paper_limit") or metrics.get("paper_limit"))
+        unique_papers = self._collect_profile_evidence_papers(evidence)
+        cards_by_id: Dict[str, Dict[str, Any]] = {}
+        generation_candidates: List[Dict[str, Any]] = []
+        can_persist = hasattr(self.db_service, "upsert_paper_profile_evidence")
+        skipped_weak_papers = 0
+        skipped_failed_cache_papers = 0
+        repair_candidate_count = 0
+
+        for paper in unique_papers:
+            arxiv_id = str(paper.get("arxiv_id") or paper.get("id") or "").strip()
             cached = (
                 self.db_service.get_paper_profile_evidence(arxiv_id, extractor_version=PAPER_EVIDENCE_EXTRACTOR_VERSION)
-                if hasattr(self.db_service, "get_paper_profile_evidence")
+                if can_persist and hasattr(self.db_service, "get_paper_profile_evidence")
                 else None
             )
-            if cached:
+            cached_is_valid = bool(cached and cached.get("schema_valid"))
+            if cached_is_valid:
                 cards_by_id[arxiv_id] = cached
                 paper["evidence_card"] = cached
                 continue
-            # evidence card 是画像概念的唯一默认入口；LLM 失败时也会写入低置信度错误卡供调试。
-            card = self.paper_evidence_extractor.extract(paper)
-            self.db_service.upsert_paper_profile_evidence(arxiv_id, card)
-            cards_by_id[arxiv_id] = card
-            paper["evidence_card"] = card
+            needs_repair = bool(cached and not cached.get("schema_valid"))
+            if needs_repair:
+                repair_candidate_count += 1
+            if build_mode == "incremental" and needs_repair and not paper.get("_profile_dirty"):
+                # 失败卡本身就是缓存；普通增量构建不反复重试历史失败，repair/full 才负责集中修复。
+                cards_by_id[arxiv_id] = cached
+                paper["evidence_card"] = cached
+                skipped_failed_cache_papers += 1
+                continue
+            if build_mode == "incremental" and not self._paper_has_strong_profile_signal(paper):
+                if cached:
+                    cards_by_id[arxiv_id] = cached
+                    paper["evidence_card"] = cached
+                skipped_weak_papers += 1
+                continue
+            if build_mode == "repair" and not (not cached or needs_repair):
+                continue
+            generation_candidates.append(paper)
+
+        uncached_papers = generation_candidates[:paper_limit]
+        skipped_limit_papers = max(0, len(generation_candidates) - len(uncached_papers))
+        total_papers = len(cards_by_id) + len(uncached_papers)
+        cached_papers = len(cards_by_id)
+        uncached_count = len(uncached_papers)
+        evidence_concurrency = min(self._resolve_profile_evidence_concurrency(), max(uncached_count, 1))
+        metrics.update(
+            {
+                "build_mode": build_mode,
+                "paper_limit": paper_limit,
+                "candidate_papers": len(unique_papers),
+                "total_papers": total_papers,
+                "cached_papers": cached_papers,
+                "uncached_papers": uncached_count,
+                "processed_papers": cached_papers,
+                "failed_papers": 0,
+                "successful_papers": cached_papers,
+                "repair_candidate_papers": repair_candidate_count,
+                "skipped_paper_count": skipped_weak_papers + skipped_limit_papers + skipped_failed_cache_papers,
+                "skipped_read_only_papers": skipped_weak_papers,
+                "skipped_failed_cache_papers": skipped_failed_cache_papers,
+                "skipped_limit_papers": skipped_limit_papers,
+                "cache_hit_count": cached_papers,
+                "generated_count": 0,
+                "failed_count": 0,
+                "skipped_count": skipped_weak_papers + skipped_limit_papers + skipped_failed_cache_papers,
+                "evidence_concurrency": evidence_concurrency if uncached_count else 0,
+                "rate_limit_backoff_count": 0,
+                "total_evidence_extraction_seconds": 0,
+                "average_seconds_per_paper": 0,
+                "current_arxiv_id": "",
+            }
+        )
+        logger.info(
+            "Profile rebuild prepared papers mode=%s candidate=%s cached=%s uncached=%s skipped=%s concurrency=%s job_id=%s",
+            build_mode,
+            len(unique_papers),
+            cached_papers,
+            uncached_count,
+            metrics["skipped_paper_count"],
+            evidence_concurrency if uncached_count else 0,
+            job_id,
+        )
+        logger.info(
+            "Profile rebuild paper limit mode=%s limit=%s skipped_read_only=%s skipped_limit=%s repair_candidates=%s",
+            build_mode,
+            paper_limit,
+            skipped_weak_papers,
+            skipped_limit_papers,
+            repair_candidate_count,
+        )
+        self._update_profile_build_job(
+            job_id,
+            metrics,
+            stage="prepare_papers",
+            progress=15,
+            stage_message=(
+                f"准备论文证据：模式 {build_mode}，候选 {len(unique_papers)} 篇，"
+                f"缓存 {cached_papers} 篇，待生成 {uncached_count} 篇，并发 {evidence_concurrency if uncached_count else 0}，"
+                f"跳过 {metrics['skipped_paper_count']} 篇"
+            ),
+        )
+
+        if total_papers == 0 or uncached_count == 0:
+            metrics["processed_papers"] = total_papers
+            self._assign_profile_evidence_cards(evidence, cards_by_id)
+            self._update_profile_build_job(
+                job_id,
+                metrics,
+                stage="extract_paper_evidence",
+                progress=75,
+                stage_message="论文证据卡已全部命中缓存或被限流跳过" if total_papers else "本次构建没有需要处理的论文证据",
+            )
+            return metrics
+
+        failed_errors: List[str] = []
+        elapsed_values_ms: List[int] = []
+        generated_count = 0
+        next_submit_index = 0
+        completed_generated = 0
+        backoff_seconds = self._profile_evidence_backoff_seconds()
+        inflight: Dict[Any, Tuple[int, Dict[str, Any]]] = {}
+        extraction_wall_started_at = time.perf_counter()
+
+        def submit_next(executor: ThreadPoolExecutor) -> bool:
+            nonlocal next_submit_index
+            if next_submit_index >= uncached_count:
+                return False
+            paper = uncached_papers[next_submit_index]
+            paper_index = next_submit_index + 1
+            arxiv_id = str(paper.get("arxiv_id") or paper.get("id") or "").strip()
+            metrics["current_arxiv_id"] = arxiv_id
+            self._update_profile_build_job(
+                job_id,
+                metrics,
+                stage="extract_paper_evidence",
+                progress=self._profile_build_progress("extract_paper_evidence", metrics["processed_papers"], total_papers),
+                stage_message=(
+                    f"正在生成论文证据卡：{metrics['processed_papers']} / {total_papers}，"
+                    f"提交 {paper_index} / {uncached_count}，当前 {arxiv_id}"
+                ),
+            )
+            logger.info(
+                "Profile rebuild extracting paper evidence submit=%s/%s arxiv_id=%s mode=%s concurrency=%s job_id=%s",
+                paper_index,
+                uncached_count,
+                arxiv_id,
+                build_mode,
+                evidence_concurrency,
+                job_id,
+            )
+            future = executor.submit(self._extract_and_store_profile_evidence_card, paper, can_persist=can_persist)
+            inflight[future] = (paper_index, paper)
+            next_submit_index += 1
+            return True
+
+        with ThreadPoolExecutor(max_workers=evidence_concurrency, thread_name_prefix="profile-evidence") as executor:
+            for _ in range(evidence_concurrency):
+                submit_next(executor)
+
+            while inflight:
+                done, _ = wait(inflight.keys(), return_when=FIRST_COMPLETED)
+                for future in done:
+                    paper_index, original_paper = inflight.pop(future)
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        # worker 内部已尽量降级为错误卡；这里再兜底，保证 future 异常不会中断整批并发队列。
+                        logger.exception("Profile rebuild paper evidence worker failed job_id=%s", job_id)
+                        arxiv_id = str(original_paper.get("arxiv_id") or original_paper.get("id") or "").strip()
+                        result = {
+                            "arxiv_id": arxiv_id,
+                            "paper": original_paper,
+                            "card": self.paper_evidence_extractor._error_card(
+                                self.paper_evidence_extractor.normalize_paper(original_paper),
+                                str(exc),
+                                extraction_confidence=0.0,
+                            ),
+                            "elapsed_ms": 0,
+                        }
+
+                    arxiv_id = str(result.get("arxiv_id") or "").strip()
+                    paper = result.get("paper") if isinstance(result.get("paper"), dict) else original_paper
+                    card = result.get("card") if isinstance(result.get("card"), dict) else {}
+                    elapsed_ms = int(result.get("elapsed_ms") or 0)
+                    elapsed_values_ms.append(elapsed_ms)
+                    completed_generated += 1
+                    metrics["current_arxiv_id"] = arxiv_id
+                    logger.info(
+                        "Profile rebuild paper evidence finished %s/%s arxiv_id=%s elapsed_ms=%s job_id=%s",
+                        paper_index,
+                        uncached_count,
+                        arxiv_id,
+                        elapsed_ms,
+                        job_id,
+                    )
+                    cards_by_id[arxiv_id] = card
+                    paper["evidence_card"] = card
+                    if not card.get("schema_valid"):
+                        error_text = str(card.get("error_message") or "paper_evidence_failed")
+                        failed_errors.append(error_text)
+                        logger.warning(
+                            "Profile rebuild paper evidence failed arxiv_id=%s elapsed_ms=%s error=%s",
+                            arxiv_id,
+                            elapsed_ms,
+                            error_text,
+                        )
+                    else:
+                        logger.info(
+                            "Profile rebuild paper evidence completed arxiv_id=%s elapsed_ms=%s",
+                            arxiv_id,
+                            elapsed_ms,
+                        )
+                        generated_count += 1
+                    metrics["processed_papers"] = cached_papers + completed_generated
+                    metrics["failed_papers"] = len(failed_errors)
+                    metrics["successful_papers"] = cached_papers + generated_count
+                    metrics["generated_count"] = generated_count
+                    metrics["failed_count"] = len(failed_errors)
+                    metrics["paper_evidence_failures"] = failed_errors[-10:]
+                    metrics["paper_evidence_failure_details"] = (
+                        metrics.get("paper_evidence_failure_details", [])
+                        + [
+                            {
+                                "arxiv_id": arxiv_id,
+                                "error_type": card.get("error_type") or "unknown",
+                                "error_message": card.get("error_message") or "paper_evidence_failed",
+                            }
+                        ]
+                    )[-10:] if not card.get("schema_valid") else metrics.get("paper_evidence_failure_details", [])
+                    total_worker_seconds = round(sum(elapsed_values_ms) / 1000, 3)
+                    metrics["total_evidence_extraction_seconds"] = round(time.perf_counter() - extraction_wall_started_at, 3)
+                    metrics["average_seconds_per_paper"] = round(
+                        total_worker_seconds / max(completed_generated, 1),
+                        3,
+                    )
+                    self._update_profile_build_job(
+                        job_id,
+                        metrics,
+                        stage="extract_paper_evidence",
+                        progress=self._profile_build_progress(
+                            "extract_paper_evidence",
+                            metrics["processed_papers"],
+                            total_papers,
+                        ),
+                        stage_message=(
+                            f"已完成论文证据卡：{metrics['processed_papers']} / {total_papers}，"
+                            f"缓存 {cached_papers}，生成 {generated_count}，失败 {metrics['failed_papers']} 篇"
+                        ),
+                    )
+                    if self._is_rate_limited_evidence_card(card) and backoff_seconds > 0 and next_submit_index < uncached_count:
+                        metrics["rate_limit_backoff_count"] = int(metrics.get("rate_limit_backoff_count") or 0) + 1
+                        logger.warning(
+                            "Profile rebuild evidence rate limited arxiv_id=%s backoff_seconds=%s job_id=%s",
+                            arxiv_id,
+                            backoff_seconds,
+                            job_id,
+                        )
+                        time.sleep(backoff_seconds)
+                    submit_next(executor)
+
+        self._assign_profile_evidence_cards(evidence, cards_by_id)
+        metrics["current_arxiv_id"] = ""
+        logger.info(
+            "Profile rebuild evidence summary cache_hit=%s generated=%s failed=%s skipped=%s avg_seconds=%s total_seconds=%s job_id=%s",
+            metrics.get("cache_hit_count"),
+            metrics.get("generated_count"),
+            metrics.get("failed_count"),
+            metrics.get("skipped_count"),
+            metrics.get("average_seconds_per_paper"),
+            metrics.get("total_evidence_extraction_seconds"),
+            job_id,
+        )
+        metrics["systemic_evidence_failure"] = bool(
+            uncached_count > 0
+            and len(failed_errors) == uncached_count
+            and any(self._is_systemic_evidence_error(error) for error in failed_errors)
+        )
+        return metrics
 
     def generate_user_research_profile(
         self,
@@ -933,78 +1531,265 @@ class MemoryService:
         preserve_existing_topics: bool = True,
         preserve_existing_representative_papers: bool = True,
         existing_job_id: Optional[str] = None,
+        build_mode: Optional[str] = "incremental",
+        max_papers: Optional[int] = None,
     ) -> Dict[str, Any]:
         """从用户行为证据重新归纳系统画像，并生成快照后返回 effective 兼容结构。"""
         resolved_user_id = self._resolve_user_id(user_id)
+        resolved_build_mode = self._normalize_profile_build_mode(build_mode)
+        resolved_paper_limit = self._resolve_profile_paper_limit(resolved_build_mode, max_papers)
         build_config = {
             "preserve_existing_topics": False,
             "preserve_existing_representative_papers": False,
             "legacy_output_projection": True,
+            "build_mode": resolved_build_mode,
+            "max_papers": resolved_paper_limit,
+        }
+        metrics: Dict[str, Any] = {
+            "build_mode": resolved_build_mode,
+            "paper_limit": resolved_paper_limit,
+            "total_papers": 0,
+            "cached_papers": 0,
+            "uncached_papers": 0,
+            "processed_papers": 0,
+            "failed_papers": 0,
+            "current_arxiv_id": "",
+            "current_stage": "collect_evidence",
+            "progress": 0,
+            "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "recent_logs": [],
         }
         job_id = existing_job_id
         if hasattr(self.db_service, "create_user_profile_build_job"):
             if job_id:
                 # 异步 API 先创建 job 再后台执行，这里复用同一个 job_id，避免前端轮询看到两个任务。
-                self.db_service.update_user_profile_build_job(job_id, status="running", current_stage="collect_evidence", progress=5)
+                self._update_profile_build_job(
+                    job_id,
+                    metrics,
+                    stage="collect_evidence",
+                    progress=5,
+                    stage_message="开始收集画像事件、偏好动作和笔记证据",
+                )
             else:
                 job_id = self.db_service.create_user_profile_build_job(user_id=resolved_user_id, build_config=build_config)
-        evidence = self._collect_research_profile_evidence(
-            resolved_user_id,
-            extra_liked_papers=extra_liked_papers,
-            extra_disliked_papers=extra_disliked_papers,
-            extra_recent_actions=extra_recent_actions,
-            extra_notes=extra_notes,
-        )
-        self._upsert_paper_evidence_cards(evidence)
-        generated_draft = self.profile_aggregator.aggregate(
-            evidence=evidence,
-            current_profile={},
-            # 自动画像只从事件和 evidence card 重建；旧画像不再作为系统层证据，避免脏 topic 被反复带回。
-            preserve_existing_topics=False,
-            preserve_existing_representative_papers=False,
-        )
-        review_result = self.profile_reviewer.review(generated_draft)
-        generated = review_result["revised_profile"]
-        evidence_summary = self._summarize_profile_evidence(evidence)
-        quality_report = {
-            **self._build_profile_quality_report(generated, evidence_summary),
-            **(review_result.get("quality_report") or {}),
-        }
-        activate_snapshot = bool(review_result.get("approved", True))
-        if hasattr(self.db_service, "save_generated_profile_snapshot"):
-            snapshot = self.db_service.save_generated_profile_snapshot(
-                user_id=resolved_user_id,
-                generated_profile=generated,
-                evidence_summary=evidence_summary,
-                quality_report=quality_report,
-                build_config=build_config,
-                job_id=job_id,
-                activate=activate_snapshot,
+                self._update_profile_build_job(
+                    job_id,
+                    metrics,
+                    stage="collect_evidence",
+                    progress=5,
+                    stage_message="开始收集画像事件、偏好动作和笔记证据",
+                )
+        try:
+            logger.info("Profile rebuild started user_id=%s job_id=%s", resolved_user_id, job_id)
+            evidence = self._collect_research_profile_evidence(
+                resolved_user_id,
+                build_mode=resolved_build_mode,
+                max_papers=resolved_paper_limit,
+                extra_liked_papers=extra_liked_papers,
+                extra_disliked_papers=extra_disliked_papers,
+                extra_recent_actions=extra_recent_actions,
+                extra_notes=extra_notes,
             )
-            if job_id and hasattr(self.db_service, "mark_user_profile_events_consumed"):
-                # 事件消费标记只在 snapshot 成功落库后更新，避免失败构建把证据错误标成已处理。
-                self.db_service.mark_user_profile_events_consumed(
+            metrics["evidence_counts"] = {
+                "total_events": int((evidence.get("event_selection") or {}).get("total_events") or 0),
+                "used_events": int((evidence.get("event_selection") or {}).get("used_events") or 0),
+                "skipped_events": int((evidence.get("event_selection") or {}).get("skipped_events") or 0),
+                "dirty_events": int((evidence.get("event_selection") or {}).get("dirty_event_count") or 0),
+                "liked_papers": len(evidence.get("liked_papers") or []),
+                "disliked_papers": len(evidence.get("disliked_papers") or []),
+                "recent_actions": len(evidence.get("recent_actions") or []),
+                "notes": len(evidence.get("notes") or []),
+                "profile_events": len(evidence.get("profile_events") or []),
+            }
+            self._update_profile_build_job(
+                job_id,
+                metrics,
+                stage="collect_evidence",
+                progress=10,
+                stage_message=(
+                    f"已收集画像证据：模式 {resolved_build_mode}，使用事件 {metrics['evidence_counts']['used_events']} 条，"
+                    f"跳过 {metrics['evidence_counts']['skipped_events']} 条，行为 {metrics['evidence_counts']['recent_actions']} 条"
+                ),
+            )
+            metrics = self._upsert_paper_evidence_cards(evidence, job_id=job_id, metrics=metrics)
+            if metrics.get("systemic_evidence_failure"):
+                error_message = "paper_evidence_systemic_failure: LLM 证据卡生成疑似整体不可用"
+                self._update_profile_build_job(
+                    job_id,
+                    metrics,
+                    status="failed",
+                    stage="failed",
+                    progress=metrics.get("progress", 75),
+                    error_message=error_message,
+                    stage_message=error_message,
+                )
+                raise RuntimeError(error_message)
+
+            self._update_profile_build_job(
+                job_id,
+                metrics,
+                stage="aggregate_profile",
+                progress=75,
+                stage_message="开始聚合正向、负向和近期画像候选",
+            )
+            generated_draft = self.profile_aggregator.aggregate(
+                evidence=evidence,
+                current_profile={},
+                # 自动画像只从事件和 evidence card 重建；旧画像不再作为系统层证据，避免脏 topic 被反复带回。
+                preserve_existing_topics=False,
+                preserve_existing_representative_papers=False,
+            )
+            self._update_profile_build_job(
+                job_id,
+                metrics,
+                stage="normalize_topics",
+                progress=88,
+                stage_message="已完成 canonical topics 归一化和画像字段清洗",
+            )
+            self._update_profile_build_job(
+                job_id,
+                metrics,
+                stage="review_profile",
+                progress=90,
+                stage_message="开始执行画像质量审查",
+            )
+            review_result = self.profile_reviewer.review(generated_draft)
+            generated = review_result["revised_profile"]
+            evidence_summary = self._summarize_profile_evidence(evidence)
+            # snapshot 中保留最终统计，便于构建完成后回看缓存命中、失败论文和阶段日志。
+            evidence_summary["build_metrics"] = {
+                key: value
+                for key, value in metrics.items()
+                if key
+                in {
+                    "total_papers",
+                    "candidate_papers",
+                    "cached_papers",
+                    "uncached_papers",
+                    "processed_papers",
+                    "failed_papers",
+                    "successful_papers",
+                    "skipped_paper_count",
+                    "skipped_read_only_papers",
+                    "skipped_failed_cache_papers",
+                    "skipped_limit_papers",
+                    "repair_candidate_papers",
+                    "cache_hit_count",
+                    "generated_count",
+                    "failed_count",
+                    "skipped_count",
+                    "average_seconds_per_paper",
+                    "total_evidence_extraction_seconds",
+                    "evidence_concurrency",
+                    "rate_limit_backoff_count",
+                    "build_mode",
+                    "paper_limit",
+                    "paper_evidence_failures",
+                    "paper_evidence_failure_details",
+                    "evidence_counts",
+                    "recent_logs",
+                }
+            }
+            quality_report = {
+                **self._build_profile_quality_report(generated, evidence_summary),
+                **(review_result.get("quality_report") or {}),
+            }
+            attempted_papers = int(metrics.get("uncached_papers") or 0)
+            failed_papers = int(metrics.get("failed_papers") or 0)
+            successful_papers = int(metrics.get("successful_papers") or 0)
+            failure_ratio = round(failed_papers / max(attempted_papers, 1), 4) if attempted_papers else 0.0
+            if failed_papers:
+                quality_report["evidence_failure_ratio"] = failure_ratio
+                quality_report["evidence_warning"] = "paper_evidence_partial_failure"
+            if attempted_papers and failure_ratio > 0.5:
+                quality_report["evidence_warning"] = "paper_evidence_high_failure_ratio"
+            no_reliable_generated_signal = successful_papers <= 0 and not (evidence.get("notes") or [])
+            if no_reliable_generated_signal:
+                # 没有任何有效 evidence card 或笔记信号时只保留 snapshot 供排查，不移动 active profile。
+                quality_report["evidence_warning"] = "no_valid_paper_evidence"
+                quality_report["approved"] = False
+            activate_snapshot = bool(review_result.get("approved", True)) and not no_reliable_generated_signal
+            self._update_profile_build_job(
+                job_id,
+                metrics,
+                stage="save_snapshot",
+                progress=92,
+                stage_message="正在保存画像 snapshot 并刷新 effective profile",
+            )
+            if hasattr(self.db_service, "save_generated_profile_snapshot"):
+                snapshot = self.db_service.save_generated_profile_snapshot(
+                    resolved_user_id,
+                    generated_profile=generated,
+                    evidence_summary=evidence_summary,
+                    quality_report=quality_report,
+                    build_config=build_config,
+                    job_id=job_id,
+                    activate=activate_snapshot,
+                )
+                if job_id and hasattr(self.db_service, "mark_user_profile_events_consumed"):
+                    # 事件消费标记只在 snapshot 成功落库后更新，避免失败构建把证据错误标成已处理。
+                    self.db_service.mark_user_profile_events_consumed(
+                        resolved_user_id,
+                        job_id,
+                        evidence.get("profile_event_ids") or [],
+                    )
+                final_status = "completed" if activate_snapshot else "needs_review"
+                metrics["snapshot_id"] = snapshot.get("snapshot_id")
+                metrics["completed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                self._update_profile_build_job(
+                    job_id,
+                    metrics,
+                    status=final_status,
+                    stage=final_status,
+                    progress=100,
+                    stage_message=f"画像构建完成：{final_status}",
+                )
+                logger.info(
+                    "Profile rebuild finished user_id=%s job_id=%s status=%s total=%s cached=%s failed=%s",
                     resolved_user_id,
                     job_id,
-                    evidence.get("profile_event_ids") or [],
+                    final_status,
+                    metrics.get("total_papers"),
+                    metrics.get("cached_papers"),
+                    metrics.get("failed_papers"),
                 )
-            effective_profile = dict(snapshot.get("effective_profile") or {})
-            effective_profile["snapshot_id"] = snapshot.get("snapshot_id")
-            effective_profile["profile_layers"] = {
-                "generated_snapshot_id": snapshot.get("snapshot_id"),
-                "manual_profile_available": bool((snapshot.get("manual_profile") or {}).get("updated_at")),
-                "generated_profile_available": True,
-            }
-            return effective_profile
-        return self.db_service.upsert_user_research_profile(user_id=resolved_user_id, profile=generated)
+                effective_profile = dict(snapshot.get("effective_profile") or {})
+                effective_profile["snapshot_id"] = snapshot.get("snapshot_id")
+                effective_profile["profile_layers"] = {
+                    "generated_snapshot_id": snapshot.get("snapshot_id"),
+                    "manual_profile_available": bool((snapshot.get("manual_profile") or {}).get("updated_at")),
+                    "generated_profile_available": True,
+                }
+                return effective_profile
+            return self.db_service.upsert_user_research_profile(user_id=resolved_user_id, profile=generated)
+        except Exception as exc:
+            logger.exception("Profile rebuild failed user_id=%s job_id=%s", resolved_user_id, job_id)
+            self._update_profile_build_job(
+                job_id,
+                metrics,
+                status="failed",
+                stage="failed",
+                progress=metrics.get("progress", 0),
+                error_message=str(exc),
+                stage_message=f"画像构建失败：{str(exc)[:200]}",
+            )
+            raise
 
-    def rebuild_user_research_profile(self, user_id: Optional[str]) -> Dict[str, Any]:
+    def rebuild_user_research_profile(
+        self,
+        user_id: Optional[str],
+        *,
+        build_mode: Optional[str] = "incremental",
+        max_papers: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """用现有行为记录重建系统画像；manual profile 保留，effective 通过快照重新合并。"""
         # 新模型下重建只更新 generated/snapshot，不再读取旧 positive_topics 作为主证据。
         return self.generate_user_research_profile(
             user_id,
             preserve_existing_topics=False,
             preserve_existing_representative_papers=False,
+            build_mode=build_mode,
+            max_papers=max_papers,
         )
 
     def _extract_paper_profile_signals(
