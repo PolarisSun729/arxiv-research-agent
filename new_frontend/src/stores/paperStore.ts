@@ -12,7 +12,9 @@ import type {
   PaperNote,
   PaperNoteType,
   UserPaperActionMap,
-  UserResearchProfile
+  UserResearchProfile,
+  UserResearchProfileDetail,
+  UserProfileBuildJob
 } from '@/types/paper'
 import {
   searchPapers,
@@ -30,8 +32,11 @@ import {
   getInterestVector,
   recommendPapers,
   getUserResearchProfile,
+  getUserResearchProfileDetail,
   patchUserResearchProfile,
   rebuildUserResearchProfile,
+  getUserResearchProfileBuildJob,
+  activateUserResearchProfileSnapshot,
   getUserPaperActions,
   recordPaperAction,
   removePaperAction,
@@ -68,6 +73,8 @@ export const usePaperStore = defineStore('paper', () => {
   const loading = ref(false)
   const interestVectorGenerating = ref(false)
   const lastInterestVector = ref<InterestVector | null>(null)
+  const researchProfileDetail = ref<UserResearchProfileDetail | null>(null)
+  const latestProfileBuildJob = ref<UserProfileBuildJob | null>(null)
   const researchProfile = ref<UserResearchProfile | null>(null)
   const paperActionMap = ref<UserPaperActionMap>({})
   const paperNotes = ref<PaperNote[]>([])
@@ -79,6 +86,8 @@ export const usePaperStore = defineStore('paper', () => {
     labeledPapers.value = []
     totalLabeledPapers.value = 0
     researchProfile.value = null
+    researchProfileDetail.value = null
+    latestProfileBuildJob.value = null
     paperActionMap.value = {}
     paperNotes.value = []
     lastInterestVector.value = null
@@ -93,6 +102,9 @@ export const usePaperStore = defineStore('paper', () => {
 
   function buildRecommendationReason(item: any): string {
     const breakdown = item?.score_breakdown || item?.scoreBreakdown || {}
+    if (Array.isArray(item?.profile_reasons) && item.profile_reasons.length > 0) {
+      return item.profile_reasons.slice(0, 2).join(' · ')
+    }
     const parts: string[] = []
     if (typeof breakdown.semantic_score === 'number' && breakdown.semantic_score > 0) {
       parts.push(`语义相似 ${Math.round(breakdown.semantic_score * 100)}%`)
@@ -332,13 +344,37 @@ export const usePaperStore = defineStore('paper', () => {
     return researchProfile.value
   }
 
+  async function fetchResearchProfileDetail() {
+    researchProfileDetail.value = await getUserResearchProfileDetail()
+    researchProfile.value = researchProfileDetail.value.effective_profile || researchProfile.value
+    latestProfileBuildJob.value = researchProfileDetail.value.latest_build_job || null
+    return researchProfileDetail.value
+  }
+
   async function saveResearchProfile(profile: Partial<UserResearchProfile>) {
     researchProfile.value = await patchUserResearchProfile(profile)
+    await fetchResearchProfileDetail()
     return researchProfile.value
   }
 
   async function rebuildResearchProfile() {
-    researchProfile.value = await rebuildUserResearchProfile()
+    const result = await rebuildUserResearchProfile(undefined, true)
+    researchProfile.value = result.profile || researchProfile.value
+    latestProfileBuildJob.value = result.job || null
+    return result
+  }
+
+  async function pollProfileBuildJob(jobId: string) {
+    latestProfileBuildJob.value = await getUserResearchProfileBuildJob(jobId)
+    if (['completed', 'needs_review', 'failed'].includes(latestProfileBuildJob.value.status)) {
+      await fetchResearchProfileDetail()
+    }
+    return latestProfileBuildJob.value
+  }
+
+  async function activateProfileSnapshot(snapshotId: string) {
+    researchProfile.value = await activateUserResearchProfileSnapshot(snapshotId)
+    await fetchResearchProfileDetail()
     return researchProfile.value
   }
 
@@ -459,6 +495,8 @@ export const usePaperStore = defineStore('paper', () => {
     interestVectorGenerating,
     lastInterestVector,
     researchProfile,
+    researchProfileDetail,
+    latestProfileBuildJob,
     paperActionMap,
     paperNotes,
     recommendationsGenerating,
@@ -473,8 +511,11 @@ export const usePaperStore = defineStore('paper', () => {
     generateUserInterestVector,
     fetchUserInterestVector,
     fetchResearchProfile,
+    fetchResearchProfileDetail,
     saveResearchProfile,
     rebuildResearchProfile,
+    pollProfileBuildJob,
+    activateProfileSnapshot,
     fetchPaperActions,
     togglePaperAction,
     fetchPaperNotes,

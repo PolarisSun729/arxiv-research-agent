@@ -53,7 +53,7 @@ def get_generation_service() -> GenerationService:
 def get_memory_service() -> MemoryService:
     from services.memory import MemoryService
 
-    return MemoryService(db_service=get_database_service())
+    return MemoryService(db_service=get_database_service(), generation_service=get_generation_service())
 
 
 @lru_cache(maxsize=1)

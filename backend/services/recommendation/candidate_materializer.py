@@ -44,17 +44,6 @@ class CandidateMaterializer:
         if not success:
             raise HTTPException(status_code=500, detail=f"Failed to record paper action {normalized_action}")
 
-        try:
-            # 行为记录成功后再异步风格地更新长期画像；画像失败不应影响主流程成功。
-            self.memory_service.update_profile_from_paper_action(
-                user_id=user_id,
-                arxiv_id=normalized_arxiv_id,
-                action_type=normalized_action,
-                metadata=metadata,
-            )
-        except Exception as exc:
-            logger.warning("Failed to update profile from paper action: user_id=%s arxiv_id=%s action=%s error=%s", user_id, normalized_arxiv_id, normalized_action, exc)
-
         return {
             "status": "success",
             "message": f"Paper action '{normalized_action}' saved successfully",
@@ -90,19 +79,9 @@ class CandidateMaterializer:
         if not success:
             raise HTTPException(status_code=500, detail=f"Failed to add paper to {action} list")
 
-        try:
-            # 偏好属于强信号，会直接反馈到用户研究画像，但这里仍保持失败降级。
-            self.memory_service.update_profile_from_preference(
-                user_id=user_id,
-                arxiv_id=normalized_arxiv_id,
-                action_type="like" if liked else "dislike",
-                paper_payload=paper,
-            )
-        except Exception as exc:
-            logger.warning("Failed to update profile from preference: user_id=%s arxiv_id=%s liked=%s error=%s", user_id, normalized_arxiv_id, liked, exc)
-
         return {
             "status": "success",
+            # 画像重建改为事件驱动，点击链路只保证业务状态和事件流落库，避免慢速画像生成阻塞主流程。
             "message": f"Paper added to {action} list and materialized into paper store",
             "arxiv_id": normalized_arxiv_id,
             "paper": paper,

@@ -613,10 +613,6 @@ async def create_paper_note(
         if not note:
             raise HTTPException(status_code=500, detail="Failed to create paper note")
 
-        if payload.include_in_profile:
-            # 某些高价值笔记会进入长期画像，用于改进推荐与后续回答风格。
-            memory_service.update_profile_from_note(user_id=user_id, note=note)
-
         return {"item": _serialize_paper_note(note, db_service=db_service)}
     except HTTPException:
         raise
@@ -652,10 +648,6 @@ async def update_paper_note(
         )
         if not note:
             raise HTTPException(status_code=500, detail="Failed to update paper note")
-
-        if note.get("include_in_profile"):
-            # 更新后仍被标记为纳入画像时，重新把最新笔记内容投喂给画像系统。
-            memory_service.update_profile_from_note(user_id=user_id, note=note)
 
         return {"item": _serialize_paper_note(note, db_service=db_service)}
     except HTTPException:

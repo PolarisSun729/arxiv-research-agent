@@ -10,6 +10,8 @@ from fastapi import HTTPException
 from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
 from services.arxiv.arxiv_search_service import ArxivSearchService
 from services.memory import MemoryService
+from services.memory.concept_normalizer import ConceptNormalizer
+from services.memory.paper_evidence_extractor import PAPER_EVIDENCE_EXTRACTOR_VERSION
 from services.storage.database_service import DatabaseService
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
 from services.storage.vector_store_service import VectorStoreService
@@ -121,28 +123,25 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         profile: Optional[Dict[str, Any]] = None,
         actions: Optional[Dict[str, List[str]]] = None,
     ) -> Dict[str, Any]:
-        """根据长期兴趣主题、偏好分类与行为状态，为候选论文追加画像修正分。"""
+        """根据 effective profile 的 canonical topic 与候选论文 evidence card 做语义匹配。"""
         profile = profile or {}
         actions = actions or {}
         arxiv_id = str(candidate.get("arxiv_id", "") or candidate.get("id", "") or "").strip()
-        title = str(candidate.get("title", "") or "").lower()
-        abstract = str(candidate.get("abstract", "") or candidate.get("summary", "") or "").lower()
-        haystack = f"{title}\n{abstract}"
         categories = {
             str(item).strip().lower()
             for item in (candidate.get("categories") if isinstance(candidate.get("categories"), list) else str(candidate.get("categories") or "").split(","))
             if str(item).strip()
         }
 
-        positive_topics = self._normalize_text_terms(profile.get("positive_topics"))
-        negative_topics = self._normalize_text_terms(profile.get("negative_topics"))
+        positive_topics = self._profile_topic_objects(profile, positive=True)
+        negative_topics = self._profile_topic_objects(profile, positive=False)
         preferred_categories = {item.lower() for item in self._normalize_text_terms(profile.get("preferred_categories"))}
+        candidate_concepts = self._candidate_profile_concepts(candidate)
 
-        matched_positive = [topic for topic in positive_topics if topic and topic in haystack]
-        matched_negative = [topic for topic in negative_topics if topic and topic in haystack]
+        matched_positive = self._match_profile_topics_to_candidate(positive_topics, candidate_concepts)
+        matched_negative = self._match_profile_topics_to_candidate(negative_topics, candidate_concepts)
         matched_categories = sorted(categories & preferred_categories)
 
-        # 对 favorite/later/read 这类行为做轻量修正，避免长期画像完全忽略近期显式动作。
         action_boost = 0.0
         if arxiv_id and arxiv_id in self._normalize_text_terms(actions.get("favorite", [])):
             action_boost += 0.08
@@ -151,27 +150,126 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         if arxiv_id and arxiv_id in self._normalize_text_terms(actions.get("read", [])):
             action_boost -= 0.03
 
-        profile_score = min(0.24, len(matched_positive) * 0.04 + len(matched_categories) * 0.03 + action_boost)
-        profile_penalty = min(0.24, len(matched_negative) * 0.06)
+        profile_score = min(0.24, sum(float(item.get("match_score") or 0.0) for item in matched_positive) * 0.05 + len(matched_categories) * 0.03 + action_boost)
+        profile_penalty = min(0.24, sum(float(item.get("match_score") or 0.0) for item in matched_negative) * 0.07)
         net_adjustment = profile_score - profile_penalty
 
         reasons: List[str] = []
         if matched_positive:
-            reasons.append(f"匹配长期主题: {', '.join(matched_positive[:3])}")
+            reasons.append(self._build_profile_match_reason(matched_positive[:3], profile))
         if matched_categories:
             reasons.append(f"匹配偏好分类: {', '.join(matched_categories[:3])}")
         if matched_negative:
-            reasons.append(f"命中负向主题: {', '.join(matched_negative[:3])}")
+            reasons.append(f"避开负向主题: {', '.join(item['topic'] for item in matched_negative[:3])}")
 
         return {
             "profile_score": profile_score,
             "profile_penalty": profile_penalty,
             "profile_adjustment": net_adjustment,
-            "matched_positive_topics": matched_positive,
-            "matched_negative_topics": matched_negative,
+            "matched_positive_topics": [item["topic"] for item in matched_positive],
+            "matched_negative_topics": [item["topic"] for item in matched_negative],
             "matched_preferred_categories": matched_categories,
+            "profile_match_details": matched_positive,
+            "profile_negative_match_details": matched_negative,
+            "profile_match_score": profile_score,
             "profile_reasons": reasons,
         }
+
+    def _profile_topic_objects(self, profile: Dict[str, Any], *, positive: bool) -> List[Dict[str, Any]]:
+        canonical_key = "canonical_topics" if positive else "canonical_negative_topics"
+        fallback_key = "positive_topics" if positive else "negative_topics"
+        topics: List[Dict[str, Any]] = []
+        for item in profile.get(canonical_key) or []:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "").strip()
+            if label:
+                topics.append({"label": label, "aliases": item.get("aliases") or [], "source": "canonical"})
+        known = {item["label"].lower() for item in topics}
+        for label in profile.get(fallback_key) or []:
+            text = str(label or "").strip()
+            if text and text.lower() not in known:
+                topics.append({"label": text, "aliases": [], "source": "legacy_projection"})
+        return topics
+
+    def _candidate_profile_concepts(self, candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
+        arxiv_id = str(candidate.get("arxiv_id", "") or candidate.get("id", "") or "").strip()
+        card = None
+        if arxiv_id and hasattr(self.db_service, "get_paper_profile_evidence"):
+            card = self.db_service.get_paper_profile_evidence(arxiv_id, extractor_version=PAPER_EVIDENCE_EXTRACTOR_VERSION)
+        if not isinstance(card, dict):
+            card = candidate.get("evidence_card") if isinstance(candidate.get("evidence_card"), dict) else None
+        concepts: List[Dict[str, Any]] = []
+        for item in (card or {}).get("candidate_concepts") or []:
+            if not isinstance(item, dict) or not item.get("whether_generalizable", True):
+                continue
+            label = ConceptNormalizer.clean_label(item.get("label"))
+            if label:
+                concepts.append({"label": label, "confidence": float(item.get("confidence") or 0.6), "source": "paper_evidence_card"})
+        for label in candidate.get("technical_concepts") or candidate.get("concepts") or []:
+            clean = ConceptNormalizer.clean_label(label)
+            if clean:
+                concepts.append({"label": clean, "confidence": 0.55, "source": "candidate_payload"})
+        if not concepts:
+            # 只有 evidence card 缺失时才启用低置信度文本 fallback，避免推荐主路径退回字符串包含匹配。
+            text = f"{candidate.get('title', '')} {candidate.get('abstract', '') or candidate.get('summary', '')}"
+            for topic in self.memory_service.profile_generator.extract_topics(text):
+                concepts.append({"label": topic, "confidence": 0.35, "source": "low_confidence_text_fallback"})
+        return concepts
+
+    def _match_profile_topics_to_candidate(self, profile_topics: List[Dict[str, Any]], candidate_concepts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        matches: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for topic in profile_topics:
+            labels = [str(topic.get("label") or "").strip(), *[str(item or "").strip() for item in topic.get("aliases") or []]]
+            best: Optional[Dict[str, Any]] = None
+            for concept in candidate_concepts:
+                concept_label = str(concept.get("label") or "").strip()
+                scores = [self._topic_similarity(label, concept_label) for label in labels if label]
+                score = max(scores) if scores else 0.0
+                if score < 0.55:
+                    continue
+                candidate_match = {
+                    "topic": str(topic.get("label") or "").strip(),
+                    "candidate_concept": concept_label,
+                    "match_score": round(score * float(concept.get("confidence") or 0.6), 4),
+                    "source": concept.get("source") or "paper_evidence_card",
+                }
+                if best is None or candidate_match["match_score"] > best["match_score"]:
+                    best = candidate_match
+            if best and best["topic"].lower() not in seen:
+                seen.add(best["topic"].lower())
+                matches.append(best)
+        matches.sort(key=lambda item: (-float(item.get("match_score") or 0.0), item["topic"].lower()))
+        return matches
+
+    @staticmethod
+    def _topic_similarity(left: str, right: str) -> float:
+        left_key = ConceptNormalizer._topic_key(left)
+        right_key = ConceptNormalizer._topic_key(right)
+        if not left_key or not right_key:
+            return 0.0
+        if left_key == right_key or left_key in right_key or right_key in left_key:
+            return 1.0
+        left_tokens = set(left_key.split())
+        right_tokens = set(right_key.split())
+        if not left_tokens or not right_tokens:
+            return 0.0
+        return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+    def _build_profile_match_reason(self, matches: List[Dict[str, Any]], profile: Dict[str, Any]) -> str:
+        topics = [item["topic"] for item in matches if item.get("topic")]
+        evidence = profile.get("topic_evidence") if isinstance(profile.get("topic_evidence"), dict) else {}
+        evidence_parts: List[str] = []
+        for topic in topics[:2]:
+            item = evidence.get(topic) or {}
+            paper_count = len(item.get("source_papers") or [])
+            note_count = len(item.get("source_notes") or [])
+            if paper_count or note_count:
+                evidence_parts.append(f"{topic}（{paper_count} 篇论文，{note_count} 条笔记）")
+        if evidence_parts:
+            return f"匹配你的长期兴趣：{', '.join(evidence_parts)}"
+        return f"匹配你的长期兴趣：{', '.join(topics[:3])}"
 
     def _get_or_refresh_interest_vector(self, user_id: str) -> Dict[str, Any]:
         """读取用户兴趣向量；如果缺失或过期，则自动触发重建。"""
@@ -336,6 +434,8 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             scored_candidate["matched_positive_topics"] = profile_adjustment["matched_positive_topics"]
             scored_candidate["matched_negative_topics"] = profile_adjustment["matched_negative_topics"]
             scored_candidate["matched_preferred_categories"] = profile_adjustment["matched_preferred_categories"]
+            scored_candidate["profile_match_details"] = profile_adjustment.get("profile_match_details", [])
+            scored_candidate["profile_match_score"] = profile_adjustment.get("profile_match_score", profile_adjustment["profile_score"])
             scored_candidate["relevance_score"] = float(scored_candidate.get("relevance_score", 0.0) or 0.0) + profile_adjustment["profile_adjustment"]
             scored_candidate["final_score"] = float(scored_candidate.get("final_score", 0.0) or 0.0) + profile_adjustment["profile_adjustment"]
             score_breakdown = dict(scored_candidate.get("score_breakdown", {}))
@@ -545,6 +645,8 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             ranked_candidate["matched_positive_topics"] = profile_adjustment["matched_positive_topics"]
             ranked_candidate["matched_negative_topics"] = profile_adjustment["matched_negative_topics"]
             ranked_candidate["matched_preferred_categories"] = profile_adjustment["matched_preferred_categories"]
+            ranked_candidate["profile_match_details"] = profile_adjustment.get("profile_match_details", [])
+            ranked_candidate["profile_match_score"] = profile_adjustment.get("profile_match_score", profile_adjustment["profile_score"])
             ranked_candidate["final_score"] = final_score
             ranked_candidate["score_breakdown"] = {
                 **score_breakdown,

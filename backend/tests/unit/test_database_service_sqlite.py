@@ -56,6 +56,13 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
         self.assertIn("paper_chat_messages", table_names)
         self.assertIn("paper_notes", table_names)
         self.assertIn("user_research_profiles", table_names)
+        self.assertIn("user_profile_events", table_names)
+        self.assertIn("paper_profile_evidence", table_names)
+        self.assertIn("user_manual_profiles", table_names)
+        self.assertIn("user_generated_profiles", table_names)
+        self.assertIn("user_effective_profiles", table_names)
+        self.assertIn("user_profile_snapshots", table_names)
+        self.assertIn("user_profile_build_jobs", table_names)
 
     def test_arxiv_papers_support_add_get_and_delete(self) -> None:
         paper = self._add_sample_paper()
@@ -100,6 +107,22 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
         self.assertIn("favorite", action_types)
         self.assertIn("later", action_types)
         self.assertNotIn("like", action_types)
+
+    def test_profile_events_are_append_only_and_deduped_by_semantic_target(self) -> None:
+        paper = self._add_sample_paper("2401.00999")
+
+        self.assertTrue(self.service.record_user_paper_action(self.user_id, paper["arxiv_id"], "liked"))
+        self.assertTrue(self.service.record_user_paper_action(self.user_id, paper["arxiv_id"], "liked"))
+        self.assertTrue(self.service.record_user_paper_action(self.user_id, paper["arxiv_id"], "read"))
+        events = self.service.list_user_profile_events(self.user_id)
+        liked_events = [event for event in events if event["event_type"] == "liked"]
+        read_events = [event for event in events if event["event_type"] == "read"]
+
+        self.assertEqual(len(liked_events), 1)
+        self.assertEqual(len(read_events), 1)
+        self.assertEqual(liked_events[0]["arxiv_id"], paper["arxiv_id"])
+        self.assertGreater(liked_events[0]["action_strength"], read_events[0]["action_strength"])
+        self.assertTrue(liked_events[0]["include_in_profile"])
 
     def test_get_user_preferences_returns_stable_structure(self) -> None:
         paper = self._add_sample_paper("2401.00003")
@@ -434,6 +457,68 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
         self.assertEqual(profile["negative_topics"], ["vision"])
         self.assertEqual(patched["recent_topics"], ["memory"])
         self.assertEqual(loaded["preferred_answer_style"], "detailed")
+
+    def test_profile_layers_keep_manual_generated_and_effective_separate(self) -> None:
+        manual = self.service.upsert_user_manual_profile(
+            user_id=self.user_id,
+            profile={"positive_topics": ["manual retrieval topic"], "preferred_categories": ["cs.SE"]},
+        )
+        job_id = self.service.create_user_profile_build_job(self.user_id)
+        snapshot = self.service.save_generated_profile_snapshot(
+            user_id=self.user_id,
+            generated_profile={
+                "positive_topics": ["RAG retrieval optimization"],
+                "negative_topics": ["diffusion models"],
+                "preferred_categories": ["cs.CL"],
+                "representative_papers": ["2401.00001"],
+            },
+            evidence_summary={"liked_paper_count": 1},
+            quality_report={"positive_topic_count": 1},
+            build_config={"reason": "unit-test"},
+            job_id=job_id,
+        )
+        layers = self.service.get_user_profile_layers(self.user_id)
+        effective = self.service.get_user_research_profile(self.user_id)
+
+        self.assertEqual(manual["positive_topics"], ["manual retrieval topic"])
+        self.assertIn("manual retrieval topic", effective["positive_topics"])
+        self.assertIn("RAG retrieval optimization", effective["positive_topics"])
+        self.assertEqual(layers["manual_profile"]["positive_topics"], ["manual retrieval topic"])
+        self.assertEqual(layers["generated_profile"]["positive_topics"], ["RAG retrieval optimization"])
+        self.assertEqual(layers["generated_profile"]["snapshot_id"], snapshot["snapshot_id"])
+        self.assertIn("diffusion models", layers["effective_profile"]["negative_topics"])
+
+    def test_low_quality_snapshot_does_not_activate_generated_profile(self) -> None:
+        active_snapshot = self.service.save_generated_profile_snapshot(
+            user_id=self.user_id,
+            generated_profile={
+                "positive_topics": ["RAG retrieval optimization"],
+                "preferred_categories": ["cs.CL"],
+                "representative_papers": ["2401.00001"],
+            },
+            evidence_summary={"liked_paper_count": 1},
+            quality_report={"approved": True, "quality_score": 0.9},
+            build_config={"reason": "active"},
+        )
+        job_id = self.service.create_user_profile_build_job(self.user_id)
+        inactive_snapshot = self.service.save_generated_profile_snapshot(
+            user_id=self.user_id,
+            generated_profile={"positive_topics": ["paper"], "representative_papers": []},
+            evidence_summary={"liked_paper_count": 1},
+            quality_report={"approved": False, "quality_score": 0.2},
+            build_config={"reason": "low-quality"},
+            job_id=job_id,
+            activate=False,
+        )
+        layers = self.service.get_user_profile_layers(self.user_id)
+
+        self.assertNotEqual(active_snapshot["snapshot_id"], inactive_snapshot["snapshot_id"])
+        self.assertEqual(layers["generated_profile"]["snapshot_id"], active_snapshot["snapshot_id"])
+        self.assertEqual(layers["generated_profile"]["positive_topics"], ["RAG retrieval optimization"])
+        with self.service._get_connection() as conn:
+            row = conn.execute("SELECT status, snapshot_id FROM user_profile_build_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        self.assertEqual(row[0], "needs_review")
+        self.assertEqual(row[1], inactive_snapshot["snapshot_id"])
 
     def test_json_serialization_helpers_handle_boundary_values(self) -> None:
         self.assertEqual(self.service._serialize_json_field(None), "")

@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from dependencies import get_database_service, get_memory_service, get_recommendation_service
@@ -43,6 +43,8 @@ class ResearchProfileRequest(BaseModel):
     positive_topics: Optional[list[str]] = None
     negative_topics: Optional[list[str]] = None
     recent_topics: Optional[list[str]] = None
+    pinned_topics: Optional[list[str]] = None
+    hidden_topics: Optional[list[str]] = None
     preferred_categories: Optional[list[str]] = None
     preferred_answer_style: Optional[str] = None
     common_question_types: Optional[list[str]] = None
@@ -52,6 +54,13 @@ class ResearchProfileRequest(BaseModel):
 class RebuildResearchProfileRequest(BaseModel):
     """研究画像重建请求，只需要指定目标用户。"""
     user_id: str = Field(default_factory=get_default_user_id)
+    async_build: bool = True
+
+
+class ActivateProfileSnapshotRequest(BaseModel):
+    """切换 active snapshot 的请求。"""
+    user_id: str = Field(default_factory=get_default_user_id)
+    snapshot_id: str
 
 
 @router.post("/preferences")
@@ -201,6 +210,77 @@ async def get_user_research_profile(user_id: str, memory_service=Depends(get_mem
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@router.get("/research-profile/{user_id}/detail")
+async def get_user_research_profile_detail(user_id: str, memory_service=Depends(get_memory_service)):
+    """读取画像详情：manual/generated/effective、质量报告、构建任务和快照摘要。"""
+    try:
+        return {"status": "success", "detail": memory_service.load_user_profile_detail(user_id=user_id)}
+    except Exception as exc:
+        logger.error("Error getting research profile detail: %s", str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/research-profile/{user_id}/topic-evidence")
+async def get_user_research_profile_topic_evidence(
+    user_id: str,
+    topic: str = Query(...),
+    memory_service=Depends(get_memory_service),
+):
+    """读取单个 topic 的来源证据，供前端解释画像项。"""
+    try:
+        return {"status": "success", **memory_service.get_profile_topic_evidence(user_id=user_id, topic=topic)}
+    except Exception as exc:
+        logger.error("Error getting profile topic evidence: %s", str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/research-profile/build-jobs/{job_id}")
+async def get_user_research_profile_build_job(job_id: str, memory_service=Depends(get_memory_service)):
+    """查询画像构建任务状态，前端可据此轮询。"""
+    try:
+        job = memory_service.get_profile_build_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="profile build job not found")
+        return {"status": "success", "job": job}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Error getting profile build job: %s", str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/research-profile/{user_id}/build-jobs")
+async def list_user_research_profile_build_jobs(
+    user_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    memory_service=Depends(get_memory_service),
+):
+    """列出用户画像构建任务历史。"""
+    try:
+        return {"status": "success", "items": memory_service.list_profile_build_jobs(user_id=user_id, limit=limit)}
+    except Exception as exc:
+        logger.error("Error listing profile build jobs: %s", str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/research-profile/snapshots/activate")
+async def activate_user_research_profile_snapshot(
+    payload: ActivateProfileSnapshotRequest,
+    memory_service=Depends(get_memory_service),
+):
+    """切换 active snapshot，用于低质量构建后的人工回滚或确认。"""
+    try:
+        profile = memory_service.activate_profile_snapshot(user_id=payload.user_id, snapshot_id=payload.snapshot_id)
+        return {"status": "success", "profile": profile}
+    except ValueError as exc:
+        if str(exc) == "profile_snapshot_not_found":
+            raise HTTPException(status_code=404, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error("Error activating profile snapshot: %s", str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @router.put("/research-profile")
 async def upsert_user_research_profile(
     payload: ResearchProfileRequest,
@@ -235,13 +315,22 @@ async def patch_user_research_profile(
 @router.post("/research-profile/rebuild")
 async def rebuild_user_research_profile(
     payload: RebuildResearchProfileRequest,
+    background_tasks: BackgroundTasks,
     memory_service=Depends(get_memory_service),
 ):
-    """根据当前用户行为记录重建研究画像，用于清理历史自动画像脏数据。"""
+    """根据用户行为证据重建画像；默认返回 build job，避免慢速构建阻塞前端。"""
     try:
-        # 重建语义是“从行为证据重新计算并覆盖”，避免旧标题/分类继续通过增量合并残留。
-        profile = memory_service.rebuild_user_research_profile(user_id=payload.user_id)
-        return {"status": "success", "profile": profile}
+        if not payload.async_build:
+            # 同步模式仅保留给测试和本地维护；前端默认使用异步 job，避免慢速 LLM 构建阻塞请求。
+            profile = memory_service.rebuild_user_research_profile(user_id=payload.user_id)
+            return {"status": "success", "profile": profile}
+        job = memory_service.create_profile_rebuild_job(user_id=payload.user_id)
+        background_tasks.add_task(memory_service.run_profile_rebuild_job, payload.user_id, job.get("job_id"))
+        return {
+            "status": "accepted",
+            "job": job,
+            "profile": memory_service.load_user_profile(payload.user_id),
+        }
     except Exception as exc:
         logger.error("Error rebuilding research profile: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))

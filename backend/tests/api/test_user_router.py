@@ -45,7 +45,44 @@ class _FakeDatabaseService:
 
 class _FakeMemoryService:
     def load_user_profile(self, user_id: str):
-        return {"user_id": user_id, "preferred_answer_style": "concise"}
+        return {
+            "user_id": user_id,
+            "positive_topics": ["RAG retrieval optimization"],
+            "topic_evidence": {"RAG retrieval optimization": {"source_papers": ["2401.00001"]}},
+            "preferred_answer_style": "concise",
+        }
+
+    def load_user_profile_detail(self, user_id: str):
+        return {
+            "user_id": user_id,
+            "manual_profile": {"positive_topics": ["manual topic"]},
+            "generated_profile": {"positive_topics": ["RAG retrieval optimization"]},
+            "effective_profile": self.load_user_profile(user_id),
+            "build_jobs": [{"job_id": "job-1", "status": "completed"}],
+            "snapshots": [{"snapshot_id": "snap-1", "active": True}],
+        }
+
+    def get_profile_topic_evidence(self, user_id: str, topic: str):
+        return {"user_id": user_id, "topic": topic, "found": True, "evidence": {"source_papers": ["2401.00001"]}}
+
+    def create_profile_rebuild_job(self, user_id: str):
+        return {"job_id": "job-1", "user_id": user_id, "status": "running", "progress": 0}
+
+    def run_profile_rebuild_job(self, user_id: str, job_id: str):
+        return self.rebuild_user_research_profile(user_id)
+
+    def get_profile_build_job(self, job_id: str):
+        if job_id == "missing":
+            return None
+        return {"job_id": job_id, "status": "completed", "snapshot_id": "snap-1"}
+
+    def list_profile_build_jobs(self, user_id: str, limit: int = 20):
+        return [{"job_id": "job-1", "user_id": user_id, "status": "completed"}]
+
+    def activate_profile_snapshot(self, user_id: str, snapshot_id: str):
+        if snapshot_id == "missing":
+            raise ValueError("profile_snapshot_not_found")
+        return {"user_id": user_id, "positive_topics": ["RAG retrieval optimization"], "snapshot_id": snapshot_id}
 
     def patch_user_profile(self, user_id: str, patch, source: str):
         payload = dict(patch)
@@ -172,13 +209,29 @@ class UserRouterApiTests(unittest.TestCase):
         self.assertIn("action_map", payload)
 
     def test_rebuild_research_profile_returns_regenerated_profile(self) -> None:
-        response = self.client.post("/api/user/research-profile/rebuild", json={"user_id": "u1"})
+        response = self.client.post("/api/user/research-profile/rebuild", json={"user_id": "u1", "async_build": False})
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["status"], "success")
         self.assertEqual(payload["profile"]["positive_topics"], ["RAG retrieval optimization"])
         self.assertEqual(payload["profile"]["preferred_answer_style"], "concise")
+
+    def test_research_profile_detail_job_evidence_and_snapshot_routes(self) -> None:
+        detail = self.client.get("/api/user/research-profile/u1/detail")
+        evidence = self.client.get("/api/user/research-profile/u1/topic-evidence", params={"topic": "RAG retrieval optimization"})
+        rebuild = self.client.post("/api/user/research-profile/rebuild", json={"user_id": "u1"})
+        job = self.client.get("/api/user/research-profile/build-jobs/job-1")
+        jobs = self.client.get("/api/user/research-profile/u1/build-jobs")
+        activate = self.client.post("/api/user/research-profile/snapshots/activate", json={"user_id": "u1", "snapshot_id": "snap-1"})
+
+        self.assertEqual(detail.status_code, 200)
+        self.assertIn("manual_profile", detail.json()["detail"])
+        self.assertEqual(evidence.json()["evidence"]["source_papers"], ["2401.00001"])
+        self.assertEqual(rebuild.json()["status"], "accepted")
+        self.assertEqual(job.json()["job"]["status"], "completed")
+        self.assertEqual(len(jobs.json()["items"]), 1)
+        self.assertEqual(activate.json()["profile"]["snapshot_id"], "snap-1")
 
     def test_recommend_papers_returns_payload_and_500_mapping(self) -> None:
         success = self.client.post("/api/user/recommend-papers", json={"user_id": "u1", "top_n": 3, "max_age_months": 6})

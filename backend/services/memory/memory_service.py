@@ -12,6 +12,10 @@ from services.memory.memory_models import (
     PaperChatHistory,
     PreferenceSummary,
 )
+from services.memory.concept_normalizer import ConceptNormalizer
+from services.memory.paper_evidence_extractor import PAPER_EVIDENCE_EXTRACTOR_VERSION, PaperEvidenceExtractor
+from services.memory.profile_aggregator import ProfileAggregator
+from services.memory.profile_reviewer import ProfileReviewer
 from services.memory.research_profile_generator import ResearchProfileGenerator
 from services.storage.database_service import DatabaseService
 from utils.config import get_default_user_id
@@ -39,10 +43,15 @@ LOW_INFORMATION_TOPIC_TERMS = {
 class MemoryService:
     """封装记忆相关存储接口，并提供统一的画像、偏好与会话记忆能力。"""
 
-    def __init__(self, db_service: Optional[DatabaseService] = None):
+    def __init__(self, db_service: Optional[DatabaseService] = None, generation_service: Optional[Any] = None):
         """初始化记忆服务，并注入底层数据库访问依赖。"""
         self.db_service = db_service or DatabaseService()
-        self.profile_generator = ResearchProfileGenerator()
+        self.profile_generator = ResearchProfileGenerator(
+            concept_normalizer=ConceptNormalizer(generation_service=generation_service, enable_llm_naming=False)
+        )
+        self.profile_aggregator = ProfileAggregator(concept_normalizer=self.profile_generator.concept_normalizer)
+        self.profile_reviewer = ProfileReviewer()
+        self.paper_evidence_extractor = PaperEvidenceExtractor(generation_service=generation_service)
 
     @staticmethod
     def _resolve_user_id(user_id: Optional[str] = None) -> str:
@@ -469,6 +478,70 @@ class MemoryService:
         resolved_user_id = self._resolve_user_id(user_id)
         return self.db_service.get_user_research_profile(user_id=resolved_user_id)
 
+    def load_user_profile_layers(self, user_id: Optional[str]) -> Dict[str, Any]:
+        """读取画像分层视图，便于调试 manual/generated/effective 的真实边界。"""
+        resolved_user_id = self._resolve_user_id(user_id)
+        if hasattr(self.db_service, "get_user_profile_layers"):
+            return self.db_service.get_user_profile_layers(user_id=resolved_user_id)
+        return {
+            "manual_profile": {},
+            "generated_profile": {},
+            "effective_profile": self.load_user_profile(resolved_user_id),
+        }
+
+    def load_user_profile_detail(self, user_id: Optional[str]) -> Dict[str, Any]:
+        """返回画像详情页需要的三层画像、构建记录和快照摘要。"""
+        resolved_user_id = self._resolve_user_id(user_id)
+        layers = self.load_user_profile_layers(resolved_user_id)
+        jobs = self.db_service.list_user_profile_build_jobs(resolved_user_id, limit=10) if hasattr(self.db_service, "list_user_profile_build_jobs") else []
+        snapshots = self.db_service.list_user_profile_snapshots(resolved_user_id, limit=10) if hasattr(self.db_service, "list_user_profile_snapshots") else []
+        generated = layers.get("generated_profile") if isinstance(layers.get("generated_profile"), dict) else {}
+        effective = layers.get("effective_profile") if isinstance(layers.get("effective_profile"), dict) else {}
+        return {
+            "user_id": resolved_user_id,
+            **layers,
+            "evidence_summary": generated.get("evidence_summary") or {},
+            "quality_report": generated.get("quality_report") or effective.get("quality_report") or {},
+            "build_jobs": jobs,
+            "snapshots": snapshots,
+            "latest_build_job": jobs[0] if jobs else None,
+        }
+
+    def get_profile_topic_evidence(self, user_id: Optional[str], topic: str) -> Dict[str, Any]:
+        """按 effective profile 查询单个 topic 的证据解释。"""
+        resolved_user_id = self._resolve_user_id(user_id)
+        profile = self.load_user_profile(resolved_user_id)
+        topic_evidence = profile.get("topic_evidence") if isinstance(profile.get("topic_evidence"), dict) else {}
+        normalized_topic = str(topic or "").strip()
+        evidence = topic_evidence.get(normalized_topic)
+        if evidence is None:
+            topic_key = normalized_topic.lower()
+            evidence = next((value for key, value in topic_evidence.items() if str(key).lower() == topic_key), None)
+        return {"user_id": resolved_user_id, "topic": normalized_topic, "evidence": evidence or {}, "found": bool(evidence)}
+
+    def create_profile_rebuild_job(self, user_id: Optional[str], build_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """创建画像重建任务记录；实际重建由 API 后台任务或调度器执行。"""
+        resolved_user_id = self._resolve_user_id(user_id)
+        config = {"legacy_output_projection": True, "async_requested": True, **dict(build_config or {})}
+        job_id = self.db_service.create_user_profile_build_job(user_id=resolved_user_id, build_config=config) if hasattr(self.db_service, "create_user_profile_build_job") else None
+        job = self.db_service.get_user_profile_build_job(job_id) if job_id and hasattr(self.db_service, "get_user_profile_build_job") else None
+        return job or {"job_id": job_id, "user_id": resolved_user_id, "status": "running", "current_stage": "collect_evidence", "progress": 0}
+
+    def run_profile_rebuild_job(self, user_id: Optional[str], job_id: Optional[str] = None) -> Dict[str, Any]:
+        """执行画像重建任务；传入 job_id 时复用已创建任务，避免前端轮询丢失任务标识。"""
+        return self.generate_user_research_profile(user_id=user_id, existing_job_id=job_id)
+
+    def get_profile_build_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        return self.db_service.get_user_profile_build_job(job_id) if hasattr(self.db_service, "get_user_profile_build_job") else None
+
+    def list_profile_build_jobs(self, user_id: Optional[str], limit: int = 20) -> List[Dict[str, Any]]:
+        resolved_user_id = self._resolve_user_id(user_id)
+        return self.db_service.list_user_profile_build_jobs(resolved_user_id, limit=limit) if hasattr(self.db_service, "list_user_profile_build_jobs") else []
+
+    def activate_profile_snapshot(self, user_id: Optional[str], snapshot_id: str) -> Dict[str, Any]:
+        resolved_user_id = self._resolve_user_id(user_id)
+        return self.db_service.activate_user_profile_snapshot(resolved_user_id, snapshot_id)
+
     @staticmethod
     def _normalize_profile_list(values: Any, limit: int = 30) -> List[str]:
         """把画像词项规范化为去重后的字符串列表。"""
@@ -656,32 +729,184 @@ class MemoryService:
         extra_recent_actions: Optional[List[Dict[str, Any]]] = None,
         extra_notes: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """集中收集画像生成证据，生成器只负责归纳，不直接碰数据库。"""
-        liked_papers = self._dedupe_papers([*self.db_service.get_liked_papers_with_details(user_id=user_id), *(extra_liked_papers or [])])
-        disliked_papers = self._dedupe_papers([*self._load_paper_details_for_ids(self.db_service.get_disliked_papers(user_id=user_id)), *(extra_disliked_papers or [])])
+        """从 append-only 画像事件流收集构建证据，业务状态表不再作为画像主证据。"""
+        events = []
+        if hasattr(self.db_service, "list_user_profile_events"):
+            events = self.db_service.list_user_profile_events(
+                user_id=user_id,
+                include_consumed=True,
+                include_in_profile_only=True,
+                limit=1000,
+            )
 
+        liked_papers: List[Dict[str, Any]] = []
+        disliked_papers: List[Dict[str, Any]] = []
         recent_actions: List[Dict[str, Any]] = []
-        for action in self.db_service.get_user_paper_actions(user_id=user_id):
-            if not isinstance(action, dict):
-                continue
-            arxiv_id = str(action.get("arxiv_id") or "").strip()
-            paper = self._resolve_paper_payload(arxiv_id) if arxiv_id else {}
-            if not paper:
-                continue
-            recent_actions.append({**action, "paper": paper})
-        recent_actions.extend(extra_recent_actions or [])
-
         notes: List[Dict[str, Any]] = []
-        if hasattr(self.db_service, "list_user_profile_notes"):
-            notes.extend(self.db_service.list_user_profile_notes(user_id=user_id))
+        event_ids: List[str] = []
+
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_ids.append(str(event.get("event_id") or ""))
+            event_type = str(event.get("event_type") or event.get("action_type") or "").strip().lower()
+            arxiv_id = str(event.get("arxiv_id") or "").strip()
+            metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+            paper_from_event = metadata.get("paper") if isinstance(metadata.get("paper"), dict) else {}
+            paper = self._resolve_paper_payload(arxiv_id, paper_payload=paper_from_event) if arxiv_id else {}
+            if event_type == "liked" and paper:
+                liked_papers.append({**paper, "_profile_event": event})
+                recent_actions.append({"arxiv_id": arxiv_id, "action_type": "liked", "paper": paper, "_profile_event": event})
+                continue
+            if event_type == "disliked" and paper:
+                # 负向事件只作为负向画像候选，聚合器会保持谨慎权重，避免一次点踩否定整个大方向。
+                disliked_papers.append({**paper, "_profile_event": event})
+                recent_actions.append({"arxiv_id": arxiv_id, "action_type": "disliked", "paper": paper, "_profile_event": event})
+                continue
+            if event_type in {"favorite", "later", "read", "not_interested", "qa_asked"}:
+                if paper:
+                    recent_actions.append({"arxiv_id": arxiv_id, "action_type": event_type, "paper": paper, "_profile_event": event})
+                continue
+            if event_type == "note_saved":
+                note_id = str(event.get("note_id") or event.get("source_id") or "").strip()
+                note = self.db_service.get_paper_note(note_id, user_id=user_id) if note_id and hasattr(self.db_service, "get_paper_note") else None
+                if note:
+                    notes.append({**note, "_profile_event": event})
+                elif paper:
+                    recent_actions.append({"arxiv_id": arxiv_id, "action_type": "note_saved", "paper": paper, "_profile_event": event})
+
+        # 兼容单元测试或显式调用传入的即时证据，但正式重建仍以事件流为主证据。
+        liked_papers = self._dedupe_papers([*liked_papers, *(extra_liked_papers or [])])
+        disliked_papers = self._dedupe_papers([*disliked_papers, *(extra_disliked_papers or [])])
+        recent_actions.extend(extra_recent_actions or [])
         notes.extend(extra_notes or [])
 
+        if not events:
+            # 仅作为旧库兜底：没有任何事件时回退散表，避免升级后空库导致画像突然清零。
+            liked_papers = self._dedupe_papers([*self.db_service.get_liked_papers_with_details(user_id=user_id), *liked_papers])
+            disliked_papers = self._dedupe_papers([*self._load_paper_details_for_ids(self.db_service.get_disliked_papers(user_id=user_id)), *disliked_papers])
+            if hasattr(self.db_service, "list_user_profile_notes"):
+                notes.extend(self.db_service.list_user_profile_notes(user_id=user_id))
+            for action in self.db_service.get_user_paper_actions(user_id=user_id):
+                if not isinstance(action, dict):
+                    continue
+                arxiv_id = str(action.get("arxiv_id") or "").strip()
+                paper = self._resolve_paper_payload(arxiv_id) if arxiv_id else {}
+                if not paper:
+                    continue
+                recent_actions.append({**action, "paper": paper})
         return {
             "liked_papers": liked_papers,
             "disliked_papers": disliked_papers,
             "recent_actions": recent_actions,
             "notes": notes,
+            "profile_events": events,
+            "profile_event_ids": [event_id for event_id in event_ids if event_id],
         }
+
+    def _summarize_profile_evidence(self, evidence: Dict[str, Any]) -> Dict[str, Any]:
+        """压缩画像证据摘要，snapshot 只保存可解释统计和代表 ID，避免写入过大的原始载荷。"""
+        def _paper_ids(items: Any, limit: int = 10) -> List[str]:
+            ids: List[str] = []
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                arxiv_id = str(item.get("arxiv_id") or item.get("id") or "").strip()
+                if arxiv_id and arxiv_id not in ids:
+                    ids.append(arxiv_id)
+                if len(ids) >= limit:
+                    break
+            return ids
+
+        action_counts: Dict[str, int] = {}
+        for action in evidence.get("recent_actions") or []:
+            if not isinstance(action, dict):
+                continue
+            action_type = str(action.get("action_type") or "").strip().lower() or "unknown"
+            action_counts[action_type] = action_counts.get(action_type, 0) + 1
+        event_counts: Dict[str, int] = {}
+        unconsumed_event_count = 0
+        for event in evidence.get("profile_events") or []:
+            if not isinstance(event, dict):
+                continue
+            event_type = str(event.get("event_type") or "unknown").strip().lower() or "unknown"
+            event_counts[event_type] = event_counts.get(event_type, 0) + 1
+            if not event.get("consumed_by_job_id"):
+                unconsumed_event_count += 1
+
+        return {
+            "liked_paper_count": len(evidence.get("liked_papers") or []),
+            "disliked_paper_count": len(evidence.get("disliked_papers") or []),
+            "recent_action_count": len(evidence.get("recent_actions") or []),
+            "profile_note_count": len(evidence.get("notes") or []),
+            "liked_paper_ids": _paper_ids(evidence.get("liked_papers")),
+            "disliked_paper_ids": _paper_ids(evidence.get("disliked_papers")),
+            "action_counts": action_counts,
+            "profile_event_count": len(evidence.get("profile_events") or []),
+            "unconsumed_profile_event_count": unconsumed_event_count,
+            "profile_event_counts": event_counts,
+        }
+
+    def _build_profile_quality_report(self, profile: Dict[str, Any], evidence_summary: Dict[str, Any]) -> Dict[str, Any]:
+        """记录重建质量的轻量报告，后续排查空画像或脏值过滤时能看到原因边界。"""
+        return {
+            "positive_topic_count": len(profile.get("positive_topics") or []),
+            "negative_topic_count": len(profile.get("negative_topics") or []),
+            "recent_topic_count": len(profile.get("recent_topics") or []),
+            "preferred_category_count": len(profile.get("preferred_categories") or []),
+            "representative_paper_count": len(profile.get("representative_papers") or []),
+            "has_behavior_evidence": bool(
+                evidence_summary.get("liked_paper_count")
+                or evidence_summary.get("disliked_paper_count")
+                or evidence_summary.get("recent_action_count")
+                or evidence_summary.get("profile_note_count")
+            ),
+        }
+
+    def _upsert_paper_evidence_cards(self, evidence: Dict[str, Any]) -> None:
+        """为参与画像的论文维护 LLM evidence card，并优先复用同版本缓存。"""
+        seen: set[str] = set()
+        cards_by_id: Dict[str, Dict[str, Any]] = {}
+        buckets = [
+            *(evidence.get("liked_papers") or []),
+            *(evidence.get("disliked_papers") or []),
+            *[
+                action.get("paper")
+                for action in evidence.get("recent_actions") or []
+                if isinstance(action, dict) and isinstance(action.get("paper"), dict)
+            ],
+            *[
+                self._resolve_paper_payload(str(note.get("arxiv_id") or "").strip())
+                for note in evidence.get("notes") or []
+                if isinstance(note, dict) and str(note.get("arxiv_id") or "").strip()
+            ],
+        ]
+        for paper in buckets:
+            if not isinstance(paper, dict):
+                continue
+            arxiv_id = str(paper.get("arxiv_id") or paper.get("id") or "").strip()
+            if not arxiv_id or not hasattr(self.db_service, "upsert_paper_profile_evidence"):
+                continue
+            if arxiv_id in cards_by_id:
+                paper["evidence_card"] = cards_by_id[arxiv_id]
+                continue
+            if arxiv_id in seen:
+                continue
+            seen.add(arxiv_id)
+            cached = (
+                self.db_service.get_paper_profile_evidence(arxiv_id, extractor_version=PAPER_EVIDENCE_EXTRACTOR_VERSION)
+                if hasattr(self.db_service, "get_paper_profile_evidence")
+                else None
+            )
+            if cached:
+                cards_by_id[arxiv_id] = cached
+                paper["evidence_card"] = cached
+                continue
+            # evidence card 是画像概念的唯一默认入口；LLM 失败时也会写入低置信度错误卡供调试。
+            card = self.paper_evidence_extractor.extract(paper)
+            self.db_service.upsert_paper_profile_evidence(arxiv_id, card)
+            cards_by_id[arxiv_id] = card
+            paper["evidence_card"] = card
 
     def generate_user_research_profile(
         self,
@@ -693,10 +918,22 @@ class MemoryService:
         extra_notes: Optional[List[Dict[str, Any]]] = None,
         preserve_existing_topics: bool = True,
         preserve_existing_representative_papers: bool = True,
+        existing_job_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """从用户行为证据重新归纳研究画像，并以受限字段覆盖写回。"""
+        """从用户行为证据重新归纳系统画像，并生成快照后返回 effective 兼容结构。"""
         resolved_user_id = self._resolve_user_id(user_id)
-        current = self.load_user_profile(resolved_user_id)
+        build_config = {
+            "preserve_existing_topics": False,
+            "preserve_existing_representative_papers": False,
+            "legacy_output_projection": True,
+        }
+        job_id = existing_job_id
+        if hasattr(self.db_service, "create_user_profile_build_job"):
+            if job_id:
+                # 异步 API 先创建 job 再后台执行，这里复用同一个 job_id，避免前端轮询看到两个任务。
+                self.db_service.update_user_profile_build_job(job_id, status="running", current_stage="collect_evidence", progress=5)
+            else:
+                job_id = self.db_service.create_user_profile_build_job(user_id=resolved_user_id, build_config=build_config)
         evidence = self._collect_research_profile_evidence(
             resolved_user_id,
             extra_liked_papers=extra_liked_papers,
@@ -704,21 +941,55 @@ class MemoryService:
             extra_recent_actions=extra_recent_actions,
             extra_notes=extra_notes,
         )
-        generated = self.profile_generator.generate(
+        self._upsert_paper_evidence_cards(evidence)
+        generated_draft = self.profile_aggregator.aggregate(
             evidence=evidence,
-            current_profile=current,
-            preserve_existing_topics=preserve_existing_topics,
-            preserve_existing_representative_papers=preserve_existing_representative_papers,
+            current_profile={},
+            # 自动画像只从事件和 evidence card 重建；旧画像不再作为系统层证据，避免脏 topic 被反复带回。
+            preserve_existing_topics=False,
+            preserve_existing_representative_papers=False,
         )
+        review_result = self.profile_reviewer.review(generated_draft)
+        generated = review_result["revised_profile"]
+        evidence_summary = self._summarize_profile_evidence(evidence)
+        quality_report = {
+            **self._build_profile_quality_report(generated, evidence_summary),
+            **(review_result.get("quality_report") or {}),
+        }
+        activate_snapshot = bool(review_result.get("approved", True))
+        if hasattr(self.db_service, "save_generated_profile_snapshot"):
+            snapshot = self.db_service.save_generated_profile_snapshot(
+                user_id=resolved_user_id,
+                generated_profile=generated,
+                evidence_summary=evidence_summary,
+                quality_report=quality_report,
+                build_config=build_config,
+                job_id=job_id,
+                activate=activate_snapshot,
+            )
+            if job_id and hasattr(self.db_service, "mark_user_profile_events_consumed"):
+                # 事件消费标记只在 snapshot 成功落库后更新，避免失败构建把证据错误标成已处理。
+                self.db_service.mark_user_profile_events_consumed(
+                    resolved_user_id,
+                    job_id,
+                    evidence.get("profile_event_ids") or [],
+                )
+            effective_profile = dict(snapshot.get("effective_profile") or {})
+            effective_profile["snapshot_id"] = snapshot.get("snapshot_id")
+            effective_profile["profile_layers"] = {
+                "generated_snapshot_id": snapshot.get("snapshot_id"),
+                "manual_profile_available": bool((snapshot.get("manual_profile") or {}).get("updated_at")),
+                "generated_profile_available": True,
+            }
+            return effective_profile
         return self.db_service.upsert_user_research_profile(user_id=resolved_user_id, profile=generated)
 
     def rebuild_user_research_profile(self, user_id: Optional[str]) -> Dict[str, Any]:
-        """用现有行为记录重建研究画像，覆盖旧的自动画像字段并清理历史脏值。"""
-        # 当前数据库没有字段来源标记，因此重建时仍保留“可能是手动维护”的短主题，
-        # 但必须先经过生成器清洗；分类、标题、URL、arXiv ID 等脏值不会被带回 topic 字段。
+        """用现有行为记录重建系统画像；manual profile 保留，effective 通过快照重新合并。"""
+        # 新模型下重建只更新 generated/snapshot，不再读取旧 positive_topics 作为主证据。
         return self.generate_user_research_profile(
             user_id,
-            preserve_existing_topics=True,
+            preserve_existing_topics=False,
             preserve_existing_representative_papers=False,
         )
 
@@ -745,18 +1016,22 @@ class MemoryService:
         patch: Optional[Dict[str, Any]],
         source: str,
     ) -> Dict[str, Any]:
-        """按来源策略更新用户研究画像，区分手动覆盖与系统增量合并。"""
+        """按来源策略更新用户研究画像；手动来源只写 manual，系统来源触发 generated 重建。"""
         resolved_user_id = self._resolve_user_id(user_id)
         normalized_source = str(source or "unknown").strip().lower() or "unknown"
-        current = self.load_user_profile(resolved_user_id)
+        current_manual = self.db_service.get_user_manual_profile(resolved_user_id) if hasattr(self.db_service, "get_user_manual_profile") else self.load_user_profile(resolved_user_id)
         incoming = dict(patch or {})
 
         if normalized_source in {"manual_upsert", "manual_put"}:
-            # 显式全量覆盖类来源直接交给 upsert，允许调用方完整重写画像。
+            # 显式全量覆盖只代表用户手动画像的新状态，不能覆盖系统生成层。
+            if hasattr(self.db_service, "upsert_user_manual_profile"):
+                return self.db_service.upsert_user_manual_profile(user_id=resolved_user_id, profile=incoming, source=normalized_source)
             return self.db_service.upsert_user_research_profile(user_id=resolved_user_id, profile=incoming)
 
         if normalized_source in {"manual", "api", "user"}:
-            # 人工/API 直接 patch 时，默认认为调用方已经自行控制字段粒度。
+            # PATCH 语义只修改 manual profile；effective profile 会在数据库层重新合并。
+            if hasattr(self.db_service, "patch_user_manual_profile"):
+                return self.db_service.patch_user_manual_profile(user_id=resolved_user_id, profile=incoming, source=normalized_source)
             return self.db_service.patch_user_research_profile(user_id=resolved_user_id, profile=incoming)
 
         merged_patch: Dict[str, Any] = {}
@@ -779,13 +1054,15 @@ class MemoryService:
                     incoming_values = self._normalize_preferred_categories(incoming_values, limit=limit)
                 elif field_name == "representative_papers":
                     incoming_values = self._normalize_representative_papers(incoming_values, limit=limit)
-                merged_patch[field_name] = self._merge_profile_list(current.get(field_name), incoming_values, limit=limit)
+                merged_patch[field_name] = self._merge_profile_list(current_manual.get(field_name), incoming_values, limit=limit)
 
         if normalized_source in {"manual_answer_style", "manual_style"} and "preferred_answer_style" in incoming:
             merged_patch["preferred_answer_style"] = str(incoming.get("preferred_answer_style") or "").strip()
 
         if not merged_patch:
-            return current
+            return self.load_user_profile(resolved_user_id)
+        if hasattr(self.db_service, "patch_user_manual_profile"):
+            return self.db_service.patch_user_manual_profile(user_id=resolved_user_id, profile=merged_patch, source=normalized_source)
         return self.db_service.patch_user_research_profile(user_id=resolved_user_id, profile=merged_patch)
 
     def update_profile_from_note(self, user_id: Optional[str], note: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -795,11 +1072,23 @@ class MemoryService:
             # 只有显式标记 include_in_profile 的笔记，才会参与长期画像学习。
             return self.load_user_profile(user_id)
 
+        resolved_user_id = self._resolve_user_id(user_id)
+        note_id = str(normalized_note.get("note_id") or normalized_note.get("id") or "").strip()
         arxiv_id = str(normalized_note.get("arxiv_id") or "").strip()
-        if arxiv_id and "arxiv_id" not in normalized_note:
-            normalized_note["arxiv_id"] = arxiv_id
-        # 笔记入画像触发完整生成流程：tags 是高置信度主题，title/content 只作为辅助证据参与归纳。
-        return self.generate_user_research_profile(user_id, extra_notes=[normalized_note])
+        if hasattr(self.db_service, "record_user_profile_event"):
+            # 兼容旧调用方：方法名保留，但只追加事件，不在请求链路同步跑完整画像生成。
+            self.db_service.record_user_profile_event(
+                user_id=resolved_user_id,
+                event_type="note_saved",
+                source_type="paper_note",
+                source_id=note_id or arxiv_id,
+                action_type="note_saved",
+                arxiv_id=arxiv_id,
+                note_id=note_id or None,
+                metadata=normalized_note,
+                include_in_profile=True,
+            )
+        return self.load_user_profile(resolved_user_id)
 
     def update_profile_from_preference(
         self,
@@ -814,22 +1103,20 @@ class MemoryService:
             return self.load_user_profile(user_id)
 
         paper = self._resolve_paper_payload(arxiv_id, paper_payload=paper_payload)
-        if normalized_action in {"like", "liked"}:
-            # 正反馈触发画像重生成，由生成器从题名/摘要/分类等证据归纳短主题。
-            recent_action = {"arxiv_id": arxiv_id, "action_type": "like", "paper": paper} if paper else None
-            return self.generate_user_research_profile(
-                user_id,
-                extra_liked_papers=[paper] if paper else None,
-                extra_recent_actions=[recent_action] if recent_action else None,
+        resolved_user_id = self._resolve_user_id(user_id)
+        if hasattr(self.db_service, "record_user_profile_event"):
+            # 偏好动作只落事件流；生成器在构建任务中统一决定权重和正负向归因。
+            self.db_service.record_user_profile_event(
+                user_id=resolved_user_id,
+                event_type="liked" if normalized_action in {"like", "liked"} else "disliked",
+                source_type="paper_action",
+                source_id=arxiv_id,
+                action_type=normalized_action,
+                arxiv_id=arxiv_id,
+                metadata={"paper": paper},
+                include_in_profile=True,
             )
-
-        # 负反馈同样走生成器，但不会把 arXiv 分类直接沉淀为 negative_topics。
-        recent_action = {"arxiv_id": arxiv_id, "action_type": normalized_action, "paper": paper} if paper else None
-        return self.generate_user_research_profile(
-            user_id,
-            extra_disliked_papers=[paper] if paper else None,
-            extra_recent_actions=[recent_action] if recent_action else None,
-        )
+        return self.load_user_profile(resolved_user_id)
 
     def update_profile_from_paper_action(
         self,
@@ -856,14 +1143,19 @@ class MemoryService:
             return self.update_profile_from_note(user_id, note_like_payload)
 
         if normalized_action in {"favorite", "later", "read"}:
-            paper = self._resolve_paper_payload(arxiv_id)
-            recent_action = {
-                "arxiv_id": arxiv_id,
-                "action_type": normalized_action,
-                "metadata": metadata or {},
-                "paper": paper,
-            }
-            return self.generate_user_research_profile(user_id, extra_recent_actions=[recent_action])
+            resolved_user_id = self._resolve_user_id(user_id)
+            if hasattr(self.db_service, "record_user_profile_event"):
+                self.db_service.record_user_profile_event(
+                    user_id=resolved_user_id,
+                    event_type=normalized_action,
+                    source_type="paper_action",
+                    source_id=arxiv_id,
+                    action_type=normalized_action,
+                    arxiv_id=arxiv_id,
+                    metadata=metadata or {},
+                    include_in_profile=True,
+                )
+            return self.load_user_profile(resolved_user_id)
 
         return self.load_user_profile(user_id)
 

@@ -1,4 +1,5 @@
 import gc
+import json
 import unittest
 from unittest import mock
 
@@ -8,10 +9,60 @@ from services.storage.database_service import DatabaseService
 from tests.helpers import build_database_service
 
 
+class FakeEvidenceGenerationService:
+    def __init__(self, payload: str = ""):
+        self.payload = payload
+        self.call_count = 0
+
+    def complete_with_qwen(self, prompt, *args, **kwargs):
+        self.call_count += 1
+        if self.payload:
+            return self.payload
+        text = str(prompt or "").lower()
+        concepts = []
+        if "diffusion" in text:
+            concepts.append("diffusion models")
+        if "knowledge graph" in text:
+            concepts.append("knowledge graph construction")
+        if "agent memory" in text or "memory-augmented" in text:
+            concepts.append("agent memory")
+        if "long context" in text or "long-context" in text:
+            concepts.append("long-context reasoning")
+        if "retrieval-augmented generation" in text or "retrieval augmented generation" in text or "hybrid retrieval" in text or "reranking" in text:
+            concepts.append("RAG retrieval optimization")
+        if "vision-only generation" in text:
+            concepts.append("vision-only generation")
+        if not concepts:
+            concepts.append("question answering")
+        return json.dumps({
+            "main_research_area": concepts[0],
+            "research_objects": ["LLM agents"] if "agent" in text else [],
+            "methods": [item for item in concepts if item in {"RAG retrieval optimization", "diffusion models"}],
+            "tasks": ["question answering"] if "question answering" in text or "qa" in text else [],
+            "application_domains": ["scientific literature search"] if "scientific" in text else [],
+            "technical_concepts": concepts,
+            "evaluation_focus": ["retrieval quality"] if "retrieval" in text else [],
+            "system_type": "agentic RAG system" if "agent" in text else "",
+            "candidate_concepts": [
+                {
+                    "label": concept,
+                    "type": "technical_concept",
+                    "confidence": 0.9,
+                    "evidence_text": "fake evidence",
+                    "source": "llm",
+                    "whether_generalizable": True,
+                }
+                for concept in concepts
+            ],
+            "excluded_concepts": [],
+            "extraction_confidence": 0.9,
+        }, ensure_ascii=False)
+
+
 class MemoryServiceIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.db_service = build_database_service(DatabaseService)
-        self.memory_service = MemoryService(db_service=self.db_service)
+        self.memory_service = MemoryService(db_service=self.db_service, generation_service=FakeEvidenceGenerationService())
         self.user_id = "user-1"
         self.arxiv_id = "2401.00001"
         self._add_paper(self.arxiv_id)
@@ -130,29 +181,62 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
             include_in_profile=True,
         )
 
-        profile = self.memory_service.update_profile_from_note(self.user_id, note)
+        immediate_profile = self.memory_service.update_profile_from_note(self.user_id, note)
+        events = self.db_service.list_user_profile_events(self.user_id, event_types=["note_saved"])
+        profile = self.memory_service.rebuild_user_research_profile(self.user_id)
 
-        self.assertIn("rag", profile["positive_topics"])
+        self.assertEqual(immediate_profile["positive_topics"], [])
+        self.assertEqual(len(events), 1)
+        self.assertIn("RAG retrieval optimization", profile["positive_topics"])
+        self.assertEqual(profile["canonical_topics"][0]["label"], "RAG retrieval optimization")
         self.assertIn("retrieval", profile["recent_topics"])
         self.assertNotIn("Important finding about a single paper", profile["positive_topics"])
         self.assertNotIn("cs.CL", profile["positive_topics"])
         self.assertNotIn("paper", profile["positive_topics"])
         self.assertIn(self.arxiv_id, profile["representative_papers"])
 
+    def test_note_and_qa_write_profile_events_without_sync_generation(self) -> None:
+        note = self.db_service.create_paper_note(
+            user_id=self.user_id,
+            arxiv_id=self.arxiv_id,
+            title="Profile note",
+            content="Use retrieval signals",
+            note_type="summary",
+            tags=["rag"],
+            include_in_profile=True,
+        )
+        session = self.db_service.create_paper_chat_session(arxiv_id=self.arxiv_id, user_id=self.user_id, title="QA")
+        self.db_service.append_paper_chat_message(session["session_id"], "user", "How does retrieval work?", user_id=self.user_id)
+
+        events = self.db_service.list_user_profile_events(self.user_id)
+        event_types = {event["event_type"] for event in events}
+
+        self.assertIsNotNone(note)
+        self.assertIn("note_saved", event_types)
+        self.assertIn("qa_asked", event_types)
+        self.assertEqual(self.db_service.get_user_generated_profile(self.user_id)["positive_topics"], [])
+        self.memory_service.rebuild_user_research_profile(self.user_id)
+        self.assertIsNotNone(self.db_service.get_paper_profile_evidence(self.arxiv_id))
+
     def test_like_paper_keeps_categories_and_titles_out_of_topics(self) -> None:
-        profile = self.memory_service.update_profile_from_preference(
+        immediate_profile = self.memory_service.update_profile_from_preference(
             self.user_id,
             self.arxiv_id,
             "like",
             paper_payload={
                 "arxiv_id": self.arxiv_id,
                 "title": "A Complete Paper Title That Should Not Become A Topic",
+                "abstract": "Retrieval-augmented generation uses hybrid retrieval, reranking, and agent memory for research workflows.",
                 "categories": ["cs.CL", "cs.AI"],
                 "topics": ["RAG", "agent memory", "method", self.arxiv_id],
             },
         )
+        events = self.db_service.list_user_profile_events(self.user_id, event_types=["liked"])
+        profile = self.memory_service.rebuild_user_research_profile(self.user_id)
 
-        self.assertIn("RAG", profile["positive_topics"])
+        self.assertEqual(immediate_profile["positive_topics"], [])
+        self.assertEqual(len(events), 1)
+        self.assertIn("RAG retrieval optimization", profile["positive_topics"])
         self.assertIn("agent memory", profile["recent_topics"])
         self.assertNotIn("cs.CL", profile["positive_topics"])
         self.assertNotIn("cs.AI", profile["recent_topics"])
@@ -163,7 +247,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIn(self.arxiv_id, profile["representative_papers"])
 
     def test_like_paper_without_explicit_topics_only_updates_category_and_representative_paper(self) -> None:
-        profile = self.memory_service.update_profile_from_preference(
+        self.memory_service.update_profile_from_preference(
             self.user_id,
             "2401.00002",
             "like",
@@ -173,6 +257,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "categories": "cs.CL cs.LG",
             },
         )
+        profile = self.memory_service.rebuild_user_research_profile(self.user_id)
 
         self.assertEqual(profile["positive_topics"], [])
         self.assertEqual(profile["recent_topics"], [])
@@ -181,17 +266,19 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIn("2401.00002", profile["representative_papers"])
 
     def test_dislike_paper_does_not_store_categories_or_titles_as_negative_topics(self) -> None:
-        profile = self.memory_service.update_profile_from_preference(
+        self.memory_service.update_profile_from_preference(
             self.user_id,
             self.arxiv_id,
             "dislike",
             paper_payload={
                 "arxiv_id": self.arxiv_id,
                 "title": "Another Full Paper Title That Should Stay Out",
+                "abstract": "The paper studies vision-only generation systems and their limitations.",
                 "categories": ["cs.CL"],
                 "topics": ["vision-only generation", "framework"],
             },
         )
+        profile = self.memory_service.rebuild_user_research_profile(self.user_id)
 
         self.assertIn("vision-only generation", profile["negative_topics"])
         self.assertNotIn("cs.CL", profile["negative_topics"])
@@ -311,6 +398,37 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(profile["preferred_answer_style"], "concise")
         self.assertEqual(profile["positive_topics"], repeated["positive_topics"])
         self.assertEqual(profile["negative_topics"], repeated["negative_topics"])
+        rag_evidence = profile["topic_evidence"]["RAG retrieval optimization"]
+        self.assertGreater(rag_evidence["positive_score"], rag_evidence["negative_score"])
+        self.assertIn("2401.00010", rag_evidence["source_papers"])
+        self.assertIn("liked", rag_evidence["source_actions"])
+        self.assertEqual(profile["aggregation_report"]["aggregator_version"], "profile_aggregator_v1")
+        self.assertTrue(profile["review_status"]["approved"])
+        self.assertTrue(profile["quality_report"]["approved"])
+        self.assertIsNotNone(profile.get("snapshot_id"))
+        layers = self.memory_service.load_user_profile_layers(self.user_id)
+        self.assertIn("RAG retrieval optimization", layers["generated_profile"]["positive_topics"])
+        self.assertIn("RAG retrieval optimization", layers["effective_profile"]["positive_topics"])
+
+    def test_read_only_recent_actions_do_not_pollute_recent_topics(self) -> None:
+        self.db_service.add_paper(
+            {
+                "arxiv_id": "2401.00021",
+                "title": "RAG Systems",
+                "authors": ["Alice"],
+                "abstract": "Retrieval-augmented generation improves hybrid retrieval and reranking.",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.00021",
+            }
+        )
+        self.db_service.record_user_paper_action(self.user_id, "2401.00021", "read")
+
+        profile = self.memory_service.rebuild_user_research_profile(self.user_id)
+
+        self.assertEqual(profile["recent_topics"], [])
+        self.assertEqual(profile["positive_topics"], [])
+        self.assertIn("recent_topic_pollution", {issue["code"] for issue in profile["quality_report"]["issues"]})
 
     def test_rebuild_user_research_profile_cleans_existing_dirty_profile(self) -> None:
         self.db_service.add_paper(
@@ -367,6 +485,260 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(profile["preferred_answer_style"], "先结论后细节")
         self.assertEqual(profile["positive_topics"], repeated["positive_topics"])
         self.assertEqual(profile["representative_papers"], repeated["representative_papers"])
+        layers = self.memory_service.load_user_profile_layers(self.user_id)
+        self.assertIn("manual retrieval topic", layers["manual_profile"]["positive_topics"])
+        self.assertNotIn("manual retrieval topic", layers["generated_profile"]["positive_topics"])
+        self.assertIn("manual retrieval topic", layers["effective_profile"]["positive_topics"])
+        self.assertIsNotNone(layers["generated_profile"]["snapshot_id"])
+
+    def test_manual_profile_is_not_overwritten_by_generated_rebuild(self) -> None:
+        self.db_service.upsert_user_manual_profile(
+            self.user_id,
+            {"positive_topics": ["manual retrieval topic"], "preferred_categories": ["cs.SE"]},
+        )
+        self.db_service.add_paper(
+            {
+                "arxiv_id": "2401.00210",
+                "title": "RAG Retrieval Optimization for Long-Context Reasoning Agents",
+                "authors": ["Alice"],
+                "abstract": "Retrieval-augmented generation improves hybrid retrieval and reranking.",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.00210",
+            }
+        )
+        self.db_service.add_liked_paper(self.user_id, "2401.00210")
+
+        profile = self.memory_service.rebuild_user_research_profile(self.user_id)
+        layers = self.memory_service.load_user_profile_layers(self.user_id)
+
+        self.assertIn("manual retrieval topic", layers["manual_profile"]["positive_topics"])
+        self.assertNotIn("manual retrieval topic", layers["generated_profile"]["positive_topics"])
+        self.assertIn("manual retrieval topic", profile["positive_topics"])
+        self.assertIn("RAG retrieval optimization", profile["positive_topics"])
+
+    def test_rebuild_consumes_profile_events_and_uses_event_stream(self) -> None:
+        self.db_service.add_paper(
+            {
+                "arxiv_id": "2401.00310",
+                "title": "RAG Retrieval Optimization for Long-Context Reasoning Agents",
+                "authors": ["Alice"],
+                "abstract": "Retrieval-augmented generation improves hybrid retrieval and reranking.",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.00310",
+            }
+        )
+        self.db_service.record_user_paper_action(self.user_id, "2401.00310", "liked")
+        self.db_service.record_user_paper_action(self.user_id, "2401.00310", "liked")
+        self.db_service.record_user_paper_action(self.user_id, "2401.00310", "read")
+
+        before_events = self.db_service.list_user_profile_events(self.user_id, include_consumed=True)
+        self.assertGreater(self.db_service.get_user_profile_dirty_event_count(self.user_id), 0)
+        profile = self.memory_service.rebuild_user_research_profile(self.user_id)
+        after_events = self.db_service.list_user_profile_events(self.user_id, include_consumed=True)
+
+        self.assertEqual(len([event for event in before_events if event["event_type"] == "liked"]), 1)
+        self.assertIn("RAG retrieval optimization", profile["positive_topics"])
+        self.assertTrue(all(event["consumed_by_job_id"] for event in after_events))
+        self.assertEqual(self.db_service.get_user_profile_dirty_event_count(self.user_id), 0)
+        self.assertIn("read", {event["event_type"] for event in after_events})
+
+    def test_manual_profile_updates_emit_manual_events(self) -> None:
+        self.db_service.upsert_user_manual_profile(
+            self.user_id,
+            {
+                "positive_topics": ["manual retrieval topic"],
+                "preferred_answer_style": "concise",
+            },
+        )
+        self.db_service.patch_user_manual_profile(
+            self.user_id,
+            {
+                "positive_topics": [],
+                "negative_topics": ["vision-only generation"],
+            },
+        )
+
+        events = self.db_service.list_user_profile_events(self.user_id)
+        event_types = [event["event_type"] for event in events]
+
+        self.assertIn("manual_topic_added", event_types)
+        self.assertIn("manual_topic_removed", event_types)
+        self.assertIn("manual_style_updated", event_types)
+
+    def test_legacy_dirty_topics_do_not_migrate_into_new_profile_layers(self) -> None:
+        with self.db_service._get_connection() as conn:
+            self.db_service._upsert_legacy_research_profile_cache(
+                conn,
+                "legacy-user",
+                {
+                    "positive_topics": ["cs.CL", "A Complete Paper Title That Should Be Removed", "manual retrieval topic"],
+                    "negative_topics": ["https://arxiv.org/abs/2401.00001", "diffusion models"],
+                    "preferred_categories": ["cs.AI"],
+                    "representative_papers": ["A Complete Paper Title That Should Be Removed"],
+                },
+            )
+            conn.commit()
+            self.db_service._migrate_legacy_research_profiles(conn)
+
+        layers = self.db_service.get_user_profile_layers("legacy-user")
+
+        self.assertEqual(layers["manual_profile"]["positive_topics"], ["manual retrieval topic"])
+        self.assertEqual(layers["manual_profile"]["negative_topics"], ["diffusion models"])
+        self.assertEqual(layers["manual_profile"]["preferred_categories"], ["cs.AI"])
+        self.assertEqual(layers["manual_profile"]["representative_papers"], [])
+
+    def test_llm_evidence_card_drives_profile_topics_and_reuses_cache(self) -> None:
+        fake_llm = FakeEvidenceGenerationService(
+            """
+            {
+              "main_research_area": "retrieval-augmented generation",
+              "research_objects": ["long-context agents"],
+              "methods": ["hybrid retrieval", "reranking"],
+              "tasks": ["question answering"],
+              "application_domains": ["scientific literature search"],
+              "technical_concepts": ["RAG retrieval optimization", "agent memory"],
+              "evaluation_focus": ["retrieval quality"],
+              "system_type": "agentic RAG system",
+              "candidate_concepts": [
+                {"label": "RAG retrieval optimization", "type": "technical_concept", "confidence": 0.92, "evidence_text": "hybrid retrieval and reranking", "source": "llm", "whether_generalizable": true},
+                {"label": "cs.CL", "type": "technical_concept", "confidence": 0.99, "evidence_text": "category", "source": "llm", "whether_generalizable": true},
+                {"label": "RAG Retrieval Optimization for Long-Context Reasoning Agents", "type": "technical_concept", "confidence": 0.99, "evidence_text": "title", "source": "llm", "whether_generalizable": true}
+              ],
+              "excluded_concepts": [{"label": "cs.CL", "reason": "arXiv category"}],
+              "extraction_confidence": 0.9
+            }
+            """
+        )
+        service = MemoryService(db_service=self.db_service, generation_service=fake_llm)
+        self.db_service.add_paper(
+            {
+                "arxiv_id": "2401.00410",
+                "title": "RAG Retrieval Optimization for Long-Context Reasoning Agents",
+                "authors": ["Alice"],
+                "abstract": "Retrieval-augmented generation improves hybrid retrieval and reranking.",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.00410",
+            }
+        )
+        self.db_service.record_user_paper_action(self.user_id, "2401.00410", "liked")
+
+        profile = service.rebuild_user_research_profile(self.user_id)
+        repeated = service.rebuild_user_research_profile(self.user_id)
+        card = self.db_service.get_paper_profile_evidence("2401.00410")
+
+        self.assertEqual(fake_llm.call_count, 1)
+        self.assertTrue(card["schema_valid"])
+        self.assertIn("RAG retrieval optimization", profile["positive_topics"])
+        self.assertEqual(profile["positive_topics"], repeated["positive_topics"])
+        self.assertNotIn("cs.CL", card["technical_concepts"])
+        self.assertNotIn("RAG Retrieval Optimization for Long-Context Reasoning Agents", profile["positive_topics"])
+
+    def test_invalid_llm_evidence_card_records_error_and_does_not_use_title_ngrams(self) -> None:
+        fake_llm = FakeEvidenceGenerationService("not json")
+        service = MemoryService(db_service=self.db_service, generation_service=fake_llm)
+        self.db_service.add_paper(
+            {
+                "arxiv_id": "2401.00411",
+                "title": "A Complete Paper Title That Should Not Become Topic",
+                "authors": ["Alice"],
+                "abstract": "This abstract mentions retrieval augmented generation but the extractor output is invalid.",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.00411",
+            }
+        )
+        self.db_service.record_user_paper_action(self.user_id, "2401.00411", "liked")
+
+        profile = service.rebuild_user_research_profile(self.user_id)
+        card = self.db_service.get_paper_profile_evidence("2401.00411")
+
+        self.assertFalse(card["schema_valid"])
+        self.assertIn("llm_output_not_json", card["error_message"])
+        self.assertEqual(profile["positive_topics"], [])
+        self.assertNotIn("A Complete Paper Title That Should Not Become Topic", profile["positive_topics"])
+
+    def test_concept_normalization_merges_aliases_and_keeps_sources(self) -> None:
+        fake_llm = FakeEvidenceGenerationService(
+            """
+            {
+              "main_research_area": "agent memory",
+              "research_objects": ["LLM agents"],
+              "methods": ["graph-structured session memory"],
+              "tasks": [],
+              "application_domains": [],
+              "technical_concepts": ["agent memory", "LLM long-term memory", "memory-augmented agents"],
+              "evaluation_focus": [],
+              "system_type": "agentic memory system",
+              "candidate_concepts": [
+                {"label": "agent memory", "type": "technical_concept", "confidence": 0.91, "evidence_text": "agent memory", "source": "llm", "whether_generalizable": true},
+                {"label": "LLM long-term memory", "type": "technical_concept", "confidence": 0.88, "evidence_text": "long-term memory", "source": "llm", "whether_generalizable": true},
+                {"label": "memory-augmented agents", "type": "technical_concept", "confidence": 0.86, "evidence_text": "memory augmented agents", "source": "llm", "whether_generalizable": true}
+              ],
+              "excluded_concepts": [],
+              "extraction_confidence": 0.9
+            }
+            """
+        )
+        service = MemoryService(db_service=self.db_service, generation_service=fake_llm)
+        self.db_service.add_paper(
+            {
+                "arxiv_id": "2401.00420",
+                "title": "Memory Systems for Agents",
+                "authors": ["Alice"],
+                "abstract": "LLM long-term memory and memory-augmented agents use graph-structured session memory.",
+                "categories": ["cs.AI"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.00420",
+            }
+        )
+        self.db_service.record_user_paper_action(self.user_id, "2401.00420", "liked")
+
+        profile = service.rebuild_user_research_profile(self.user_id)
+        canonical = profile["canonical_topics"][0]
+
+        self.assertEqual(profile["positive_topics"].count("agent memory"), 1)
+        self.assertNotIn("LLM long-term memory", profile["positive_topics"])
+        self.assertNotIn("memory-augmented agents", profile["positive_topics"])
+        self.assertEqual(canonical["label"], "agent memory")
+        self.assertIn("LLM long-term memory", canonical["aliases"])
+        self.assertIn("2401.00420", canonical["source_papers"])
+        self.assertTrue(canonical["source_concepts"])
+        self.assertEqual(profile["normalizer_version"], "profile_normalizer_v1")
+
+    def test_manual_hidden_and_pinned_topics_affect_effective_profile(self) -> None:
+        self.db_service.upsert_user_manual_profile(
+            self.user_id,
+            {
+                "pinned_topics": ["manual agent memory"],
+                "hidden_topics": ["RAG retrieval optimization"],
+            },
+        )
+        self.db_service.add_paper(
+            {
+                "arxiv_id": "2401.00430",
+                "title": "RAG Systems",
+                "authors": ["Alice"],
+                "abstract": "Retrieval-augmented generation improves hybrid retrieval and reranking.",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.00430",
+            }
+        )
+        self.db_service.record_user_paper_action(self.user_id, "2401.00430", "liked")
+
+        profile = self.memory_service.rebuild_user_research_profile(self.user_id)
+        events = self.db_service.list_user_profile_events(self.user_id, include_consumed=True)
+        event_types = {event["event_type"] for event in events}
+
+        self.assertIn("manual agent memory", profile["positive_topics"])
+        self.assertNotIn("RAG retrieval optimization", profile["positive_topics"])
+        self.assertEqual(profile["canonical_topics"][0]["label"], "manual agent memory")
+        self.assertTrue(profile["canonical_topics"][0]["pinned"])
+        self.assertIn("manual_topic_pinned", event_types)
+        self.assertIn("manual_topic_hidden", event_types)
 
     def test_build_memory_debug_payload_has_stable_fields(self) -> None:
         debug_payload = build_memory_debug_payload(

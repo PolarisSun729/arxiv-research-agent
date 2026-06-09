@@ -1,9 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 import json
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from services.memory.concept_normalizer import ConceptNormalizer, PROFILE_NORMALIZER_VERSION
 
 
 CANONICAL_TOPIC_PATTERNS: List[Tuple[str, Tuple[str, ...]]] = [
@@ -100,11 +102,8 @@ ANCHOR_TERMS = {
 
 
 class ResearchProfileGenerator:
-    """把用户行为证据归纳成稳定的研究画像字段。
-
-    该生成器只接收已收集好的证据，不直接访问数据库，职责是把论文标题、
-    摘要、分类、行为和笔记转换成可展示、可检索的短主题。
-    """
+    """鎶婄敤鎴疯涓鸿瘉鎹綊绾虫垚绋冲畾鐨勭爺绌剁敾鍍忓瓧娈点€?
+    璇ョ敓鎴愬櫒鍙帴鏀跺凡鏀堕泦濂界殑璇佹嵁锛屼笉鐩存帴璁块棶鏁版嵁搴擄紝鑱岃矗鏄妸璁烘枃鏍囬銆?    鎽樿銆佸垎绫汇€佽涓哄拰绗旇杞崲鎴愬彲灞曠ず銆佸彲妫€绱㈢殑鐭富棰樸€?    """
 
     FIELD_LIMITS = {
         "positive_topics": 12,
@@ -115,6 +114,9 @@ class ResearchProfileGenerator:
         "representative_papers": 12,
     }
 
+    def __init__(self, concept_normalizer: Optional[ConceptNormalizer] = None):
+        self.concept_normalizer = concept_normalizer or ConceptNormalizer()
+
     def generate(
         self,
         evidence: Dict[str, Any],
@@ -123,7 +125,18 @@ class ResearchProfileGenerator:
         preserve_existing_topics: bool = True,
         preserve_existing_representative_papers: bool = True,
     ) -> Dict[str, Any]:
-        """根据当前证据重新生成完整画像，避免自动增量写入导致字段无限膨胀。"""
+        """根据当前事件和 evidence card 重新生成系统画像，并输出旧字段兼容投影。"""
+        from services.memory.profile_aggregator import ProfileAggregator
+        from services.memory.profile_reviewer import ProfileReviewer
+
+        # 兼容旧调用入口：真实画像生成已经拆到 aggregator/reviewer，避免继续在本类里维护 Counter 主路径。
+        draft = ProfileAggregator(concept_normalizer=self.concept_normalizer).aggregate(
+            evidence=evidence,
+            current_profile=current_profile,
+            preserve_existing_topics=preserve_existing_topics,
+            preserve_existing_representative_papers=preserve_existing_representative_papers,
+        )
+        return ProfileReviewer().review(draft)["revised_profile"]
         current = dict(current_profile or {})
         positive_scores: Counter[str] = Counter()
         negative_scores: Counter[str] = Counter()
@@ -131,6 +144,9 @@ class ResearchProfileGenerator:
         category_scores: Counter[str] = Counter()
         question_type_scores: Counter[str] = Counter()
         representative_papers: List[str] = []
+        positive_candidates: List[Dict[str, Any]] = []
+        negative_candidates: List[Dict[str, Any]] = []
+        recent_candidates: List[Dict[str, Any]] = []
 
         self._merge_existing_profile(
             current,
@@ -145,13 +161,13 @@ class ResearchProfileGenerator:
         )
 
         for paper in evidence.get("liked_papers") or []:
-            self._add_paper_topics(positive_scores, paper, weight=3.0)
+            self._add_paper_topics(positive_scores, paper, weight=3.0, candidate_bucket=positive_candidates, signal="positive")
             self._add_categories(category_scores, paper.get("categories"), weight=2.0)
             self._append_representative_paper(representative_papers, paper)
 
         for paper in evidence.get("disliked_papers") or []:
-            # 负向主题只从具体论文语义中抽取，不把 arXiv 大类当作“不感兴趣方向”。
-            self._add_paper_topics(negative_scores, paper, weight=2.0)
+            self._add_paper_topics(negative_scores, paper, weight=2.0, candidate_bucket=negative_candidates, signal="negative")
+            # 负向主题只来自具体论文语义，不把 arXiv 大类当作用户不感兴趣方向。
 
         for index, action in enumerate(evidence.get("recent_actions") or []):
             paper = action.get("paper") if isinstance(action, dict) else None
@@ -159,16 +175,32 @@ class ResearchProfileGenerator:
                 continue
             action_type = str(action.get("action_type") or "").strip().lower()
             recency_boost = max(0.2, 1.0 - index * 0.08)
-            if action_type in {"favorite", "later", "read", "note_saved", "like", "liked"}:
-                self._add_paper_topics(recent_scores, paper, weight=1.6 * recency_boost)
+            source_event = action.get("_profile_event") if isinstance(action.get("_profile_event"), dict) else None
+            if action_type in {"like", "liked"}:
+                self._add_paper_topics(recent_scores, paper, weight=1.5 * recency_boost, candidate_bucket=recent_candidates, signal="recent", source_event=source_event)
                 self._append_representative_paper(representative_papers, paper)
+            elif action_type == "favorite":
+                self._add_paper_topics(recent_scores, paper, weight=1.3 * recency_boost, candidate_bucket=recent_candidates, signal="recent", source_event=source_event)
+                self._append_representative_paper(representative_papers, paper)
+            elif action_type == "note_saved":
+                self._add_paper_topics(recent_scores, paper, weight=1.4 * recency_boost, candidate_bucket=recent_candidates, signal="recent", source_event=source_event)
+                self._append_representative_paper(representative_papers, paper)
+            elif action_type == "later":
+                self._add_paper_topics(recent_scores, paper, weight=0.5 * recency_boost, candidate_bucket=recent_candidates, signal="recent", source_event=source_event)
+            elif action_type == "read":
+                # 普通阅读只是弱兴趣，不能和点赞、收藏、笔记保存同等放大。
+                self._add_paper_topics(recent_scores, paper, weight=0.2 * recency_boost, candidate_bucket=recent_candidates, signal="recent", source_event=source_event)
+            elif action_type == "qa_asked":
+                self._add_paper_topics(recent_scores, paper, weight=0.35 * recency_boost, candidate_bucket=recent_candidates, signal="recent", source_event=source_event)
             elif action_type in {"not_interested", "dislike", "disliked"}:
-                self._add_paper_topics(negative_scores, paper, weight=1.0 * recency_boost)
+                # 负向点击只作为谨慎的负向候选，不直接用高权重否定整个大方向。
+                penalty_weight = 0.7 if action_type in {"dislike", "disliked"} else 0.45
+                self._add_paper_topics(negative_scores, paper, weight=penalty_weight * recency_boost, candidate_bucket=negative_candidates, signal="negative", source_event=source_event)
 
         for note in evidence.get("notes") or []:
             if not isinstance(note, dict) or not note.get("include_in_profile"):
                 continue
-            self._add_note_topics(positive_scores, recent_scores, note)
+            self._add_note_topics(positive_scores, recent_scores, note, positive_candidates, recent_candidates)
             note_type = str(note.get("note_type") or "").strip().lower()
             if note_type:
                 question_type_scores[note_type] += 2.0
@@ -176,14 +208,25 @@ class ResearchProfileGenerator:
 
         self._resolve_topic_conflicts(positive_scores, negative_scores)
 
-        positive_topics = self._rank_topics(positive_scores, self.FIELD_LIMITS["positive_topics"])
-        negative_topics = self._rank_topics(negative_scores, self.FIELD_LIMITS["negative_topics"])
-        recent_topics = self._rank_topics(recent_scores, self.FIELD_LIMITS["recent_topics"])
+        # 旧 positive_topics 等字段只作为兼容投影；内部主模型保留 canonical topic 对象和证据来源。
+        normalized_topics = self.concept_normalizer.normalize(
+            positive_candidates=positive_candidates or self._counter_candidates(positive_scores, "positive"),
+            negative_candidates=negative_candidates or self._counter_candidates(negative_scores, "negative"),
+            recent_candidates=recent_candidates or self._counter_candidates(recent_scores, "recent"),
+            positive_limit=self.FIELD_LIMITS["positive_topics"],
+            negative_limit=self.FIELD_LIMITS["negative_topics"],
+            recent_limit=self.FIELD_LIMITS["recent_topics"],
+        )
 
         return {
-            "positive_topics": positive_topics,
-            "negative_topics": negative_topics,
-            "recent_topics": recent_topics,
+            "positive_topics": normalized_topics["positive_topics"],
+            "negative_topics": normalized_topics["negative_topics"],
+            "recent_topics": normalized_topics["recent_topics"],
+            "canonical_topics": normalized_topics["canonical_topics"],
+            "canonical_negative_topics": normalized_topics["canonical_negative_topics"],
+            "canonical_recent_topics": normalized_topics["canonical_recent_topics"],
+            "normalizer_version": normalized_topics.get("normalizer_version", PROFILE_NORMALIZER_VERSION),
+            "normalization_signature": normalized_topics.get("normalization_signature", ""),
             "preferred_categories": self._rank_counter_values(category_scores, self.FIELD_LIMITS["preferred_categories"]),
             "preferred_answer_style": str(current.get("preferred_answer_style") or "").strip(),
             "common_question_types": self._rank_counter_values(question_type_scores, self.FIELD_LIMITS["common_question_types"]),
@@ -203,9 +246,9 @@ class ResearchProfileGenerator:
         preserve_topics: bool = True,
         preserve_representative_papers: bool = True,
     ) -> None:
-        """把已有画像作为弱证据保留，避免自动重生成抹掉用户手动偏好。"""
+        """把已有画像作为弱证据保留；新模型的正式重建默认不会走这条路径。"""
         if preserve_topics:
-            # 旧库没有字段来源标记，只能把存量 topic 当作低权重手动信号保留，并先经过清洗。
+            # 旧库没有来源标记，只能把存量 topic 当作低权重手动候选保留，并先经过清洗。
             for topic in self.normalize_system_topics(current.get("positive_topics"), limit=30):
                 positive_scores[topic] += 1.0
             for topic in self.normalize_system_topics(current.get("negative_topics"), limit=30):
@@ -221,23 +264,171 @@ class ResearchProfileGenerator:
                 if paper_id not in representative_papers:
                     representative_papers.append(paper_id)
 
-    def _add_paper_topics(self, scores: Counter[str], paper: Dict[str, Any], weight: float) -> None:
-        """从论文题名、摘要和显式 topic 字段抽取抽象主题，而不是保存原始标题。"""
-        text = self._paper_text(paper)
-        for topic in self.extract_topics(text, explicit_terms=self._extract_explicit_topic_terms(paper)):
-            scores[topic] += weight
+    def _add_paper_topics(
+        self,
+        scores: Counter[str],
+        paper: Dict[str, Any],
+        weight: float,
+        *,
+        candidate_bucket: Optional[List[Dict[str, Any]]] = None,
+        signal: str = "positive",
+        source_event: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """只从 evidence card 的可泛化候选概念聚合主题，不再从 title/abstract 直接切词。"""
+        card = paper.get("evidence_card") if isinstance(paper.get("evidence_card"), dict) else {}
+        for concept in self._extract_card_candidate_concepts(card):
+            confidence = float(concept.get("confidence") or 0.0)
+            if confidence <= 0:
+                continue
+            score = weight * confidence
+            scores[str(concept["label"])] += score
+            if candidate_bucket is not None:
+                candidate_bucket.append(
+                    self._build_concept_candidate(
+                        concept,
+                        paper=paper,
+                        weight=weight,
+                        score=score,
+                        signal=signal,
+                        source_event=source_event,
+                    )
+                )
 
-    def _add_note_topics(self, positive_scores: Counter[str], recent_scores: Counter[str], note: Dict[str, Any]) -> None:
-        """融合笔记信号：tags 高置信度入画像，标题/内容只作为抽象主题抽取的辅助证据。"""
+    def _extract_card_candidate_concepts(self, card: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if not isinstance(card, dict) or not card.get("schema_valid"):
+            return []
+        concepts: List[Dict[str, Any]] = []
+        for item in card.get("candidate_concepts") or []:
+            if not isinstance(item, dict) or not item.get("whether_generalizable", True):
+                continue
+            label = str(item.get("label") or "").strip()
+            if not self.normalize_system_topics([label], limit=1):
+                continue
+            concepts.append(
+                {
+                    "label": label,
+                    "type": str(item.get("type") or "technical_concept"),
+                    "confidence": float(item.get("confidence") or card.get("extraction_confidence") or 0.5),
+                    "evidence_text": str(item.get("evidence_text") or "").strip(),
+                    "source": str(item.get("source") or "llm").strip() or "llm",
+                }
+            )
+        return concepts[:20]
+
+    def _add_note_topics(
+        self,
+        positive_scores: Counter[str],
+        recent_scores: Counter[str],
+        note: Dict[str, Any],
+        positive_candidates: Optional[List[Dict[str, Any]]] = None,
+        recent_candidates: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """融合笔记信号；tags 是高置信度用户信号，标题/内容只作为辅助弱证据。"""
+        source_event = note.get("_profile_event") if isinstance(note.get("_profile_event"), dict) else None
         tag_topics = self.normalize_system_topics(note.get("tags"), limit=10)
         for topic in tag_topics:
             positive_scores[topic] += 3.0
             recent_scores[topic] += 2.5
+            candidate = self._build_manual_text_candidate(
+                topic,
+                note=note,
+                confidence=0.95,
+                weight=3.0,
+                score=3.0,
+                source="note_tag",
+                source_event=source_event,
+            )
+            if positive_candidates is not None:
+                positive_candidates.append(candidate)
+            if recent_candidates is not None:
+                recent_candidates.append({**candidate, "weight": 2.5, "score": 2.5, "signal": "recent"})
 
         auxiliary_text = " ".join([str(note.get("title") or ""), str(note.get("content") or "")])
         for topic in self.extract_topics(auxiliary_text):
             positive_scores[topic] += 0.8
             recent_scores[topic] += 0.8
+            candidate = self._build_manual_text_candidate(
+                topic,
+                note=note,
+                confidence=0.55,
+                weight=0.8,
+                score=0.8,
+                source="note_auxiliary_text",
+                source_event=source_event,
+            )
+            if positive_candidates is not None:
+                positive_candidates.append(candidate)
+            if recent_candidates is not None:
+                recent_candidates.append({**candidate, "signal": "recent"})
+
+    def _build_concept_candidate(
+        self,
+        concept: Dict[str, Any],
+        *,
+        paper: Dict[str, Any],
+        weight: float,
+        score: float,
+        signal: str,
+        source_event: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        event = source_event or paper.get("_profile_event")
+        event_id = str((event or {}).get("event_id") or "").strip()
+        arxiv_id = str(paper.get("arxiv_id") or paper.get("id") or "").strip()
+        return {
+            "label": str(concept.get("label") or "").strip(),
+            "type": str(concept.get("type") or "technical_concept").strip() or "technical_concept",
+            "confidence": float(concept.get("confidence") or 0.0),
+            "weight": weight,
+            "score": score,
+            "source": str(concept.get("source") or "paper_evidence_card").strip() or "paper_evidence_card",
+            "source_papers": [arxiv_id] if arxiv_id else [],
+            "source_events": [event_id] if event_id else [],
+            "evidence_text": str(concept.get("evidence_text") or "").strip(),
+            "signal": signal,
+        }
+
+    def _build_manual_text_candidate(
+        self,
+        topic: str,
+        *,
+        note: Dict[str, Any],
+        confidence: float,
+        weight: float,
+        score: float,
+        source: str,
+        source_event: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        event_id = str((source_event or {}).get("event_id") or "").strip()
+        arxiv_id = str(note.get("arxiv_id") or "").strip()
+        return {
+            "label": topic,
+            "type": "manual_topic" if source == "note_tag" else "technical_concept",
+            "confidence": confidence,
+            "weight": weight,
+            "score": score,
+            "source": source,
+            "source_papers": [arxiv_id] if arxiv_id else [],
+            "source_events": [event_id] if event_id else [],
+            "evidence_text": str(note.get("title") or "").strip()[:200],
+            "signal": "positive",
+        }
+
+    def _counter_candidates(self, scores: Counter[str], signal: str) -> List[Dict[str, Any]]:
+        """兼容少量旧调用：只有 score 字符串时，也先转成低来源信息的候选对象再归一化。"""
+        return [
+            {
+                "label": topic,
+                "type": "technical_concept",
+                "confidence": 0.65,
+                "weight": 1.0,
+                "score": float(score),
+                "source": "legacy_score_counter",
+                "source_papers": [],
+                "source_events": [],
+                "signal": signal,
+            }
+            for topic, score in scores.items()
+        ]
 
     def _add_categories(self, scores: Counter[str], values: Any, weight: float) -> None:
         for category in self.normalize_preferred_categories(values, limit=20):
@@ -259,7 +450,7 @@ class ResearchProfileGenerator:
         return terms
 
     def extract_topics(self, text: str, explicit_terms: Optional[Iterable[str]] = None) -> List[str]:
-        """从原始文本中提炼短主题，先匹配稳定概念，再用关键词短语兜底。"""
+        """从辅助文本中提取弱主题，主路径仍以 evidence card 和显式 tags 为准。"""
         candidates: List[str] = []
         candidates.extend(self.normalize_system_topics(explicit_terms, limit=20))
 
@@ -395,7 +586,7 @@ class ResearchProfileGenerator:
 
     @staticmethod
     def normalize_system_topics(values: Any, limit: int = 30) -> List[str]:
-        """统一规整 topic 输出，保证画像字段短小、去重且不混入原始标识。"""
+        """统一规整 topic 输出，避免混入标题、分类、URL 或低信息泛词。"""
         normalized: List[str] = []
         for item in ResearchProfileGenerator.normalize_profile_list(values, limit=limit * 3):
             text = str(item or "").strip()

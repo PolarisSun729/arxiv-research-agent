@@ -18,7 +18,9 @@ import type {
   PaperNoteType,
   UserPaperAction,
   UserPaperActionMap,
-  UserResearchProfile
+  UserResearchProfile,
+  UserResearchProfileDetail,
+  UserProfileBuildJob
 } from '@/types/paper'
 import { mockPapers, mockRecommendedPapers, mockLabeledPapers, mockStats } from '@/mock/papers'
 import { getCurrentUserId } from '@/composables/useUserContext'
@@ -89,6 +91,9 @@ function normalizePaper(raw: any): Paper {
     matched_terms: Array.isArray(raw.matched_terms) ? raw.matched_terms : undefined,
     personalized_reason: raw.personalized_reason || null,
     match_reason: raw.match_reason || null,
+    profile_reasons: Array.isArray(raw.profile_reasons) ? raw.profile_reasons : undefined,
+    profile_match_details: Array.isArray(raw.profile_match_details) ? raw.profile_match_details : undefined,
+    profile_match_score: typeof raw.profile_match_score === 'number' ? raw.profile_match_score : undefined,
     priority: typeof raw.priority === 'number' ? raw.priority : undefined
   }
 }
@@ -132,10 +137,20 @@ function emptyResearchProfile(userId?: string): UserResearchProfile {
     positive_topics: [],
     negative_topics: [],
     recent_topics: [],
+    pinned_topics: [],
+    hidden_topics: [],
     preferred_categories: [],
     preferred_answer_style: '',
     common_question_types: [],
-    representative_papers: []
+    representative_papers: [],
+    canonical_topics: [],
+    canonical_negative_topics: [],
+    canonical_recent_topics: [],
+    topic_evidence: {},
+    aggregation_report: {},
+    review_status: {},
+    quality_report: {},
+    snapshot_id: null
   }
 }
 
@@ -145,12 +160,51 @@ function normalizeResearchProfile(raw: any, fallbackUserId?: string): UserResear
     positive_topics: Array.isArray(raw?.positive_topics) ? raw.positive_topics : [],
     negative_topics: Array.isArray(raw?.negative_topics) ? raw.negative_topics : [],
     recent_topics: Array.isArray(raw?.recent_topics) ? raw.recent_topics : [],
+    pinned_topics: Array.isArray(raw?.pinned_topics) ? raw.pinned_topics : [],
+    hidden_topics: Array.isArray(raw?.hidden_topics) ? raw.hidden_topics : [],
     preferred_categories: Array.isArray(raw?.preferred_categories) ? raw.preferred_categories : [],
     preferred_answer_style: String(raw?.preferred_answer_style || ''),
     common_question_types: Array.isArray(raw?.common_question_types) ? raw.common_question_types : [],
     representative_papers: Array.isArray(raw?.representative_papers) ? raw.representative_papers : [],
+    canonical_topics: Array.isArray(raw?.canonical_topics) ? raw.canonical_topics : [],
+    canonical_negative_topics: Array.isArray(raw?.canonical_negative_topics) ? raw.canonical_negative_topics : [],
+    canonical_recent_topics: Array.isArray(raw?.canonical_recent_topics) ? raw.canonical_recent_topics : [],
+    topic_evidence: raw?.topic_evidence && typeof raw.topic_evidence === 'object' ? raw.topic_evidence : {},
+    aggregation_report: raw?.aggregation_report && typeof raw.aggregation_report === 'object' ? raw.aggregation_report : {},
+    review_status: raw?.review_status && typeof raw.review_status === 'object' ? raw.review_status : {},
+    quality_report: raw?.quality_report && typeof raw.quality_report === 'object' ? raw.quality_report : {},
+    snapshot_id: raw?.snapshot_id || null,
     created_at: raw?.created_at || null,
     updated_at: raw?.updated_at || null
+  }
+}
+
+function normalizeProfileBuildJob(raw: any): UserProfileBuildJob {
+  return {
+    job_id: String(raw?.job_id || ''),
+    user_id: raw?.user_id,
+    status: String(raw?.status || 'unknown'),
+    snapshot_id: raw?.snapshot_id || null,
+    current_stage: raw?.current_stage || null,
+    progress: typeof raw?.progress === 'number' ? raw.progress : Number(raw?.progress || 0),
+    error_message: raw?.error_message || null,
+    created_at: raw?.created_at || null,
+    updated_at: raw?.updated_at || null
+  }
+}
+
+function normalizeResearchProfileDetail(raw: any, fallbackUserId?: string): UserResearchProfileDetail {
+  const effectiveUserId = resolveUserId(fallbackUserId || raw?.user_id)
+  return {
+    user_id: effectiveUserId,
+    manual_profile: normalizeResearchProfile(raw?.manual_profile, effectiveUserId),
+    generated_profile: normalizeResearchProfile(raw?.generated_profile, effectiveUserId),
+    effective_profile: normalizeResearchProfile(raw?.effective_profile, effectiveUserId),
+    evidence_summary: raw?.evidence_summary || {},
+    quality_report: raw?.quality_report || {},
+    build_jobs: Array.isArray(raw?.build_jobs) ? raw.build_jobs.map(normalizeProfileBuildJob) : [],
+    snapshots: Array.isArray(raw?.snapshots) ? raw.snapshots : [],
+    latest_build_job: raw?.latest_build_job ? normalizeProfileBuildJob(raw.latest_build_job) : null
   }
 }
 
@@ -324,6 +378,12 @@ export async function getUserResearchProfile(userId?: string): Promise<UserResea
   }
 }
 
+export async function getUserResearchProfileDetail(userId?: string): Promise<UserResearchProfileDetail> {
+  const effectiveUserId = resolveUserId(userId)
+  const response: any = await request.get(`/user/research-profile/${effectiveUserId}/detail`)
+  return normalizeResearchProfileDetail(response?.detail || response, effectiveUserId)
+}
+
 export async function upsertUserResearchProfile(profile: Partial<UserResearchProfile>, userId?: string): Promise<UserResearchProfile> {
   const effectiveUserId = resolveUserId(userId || profile.user_id)
   const response: any = await request.put('/user/research-profile', {
@@ -342,10 +402,39 @@ export async function patchUserResearchProfile(profile: Partial<UserResearchProf
   return normalizeResearchProfile(response?.profile || response, effectiveUserId)
 }
 
-export async function rebuildUserResearchProfile(userId?: string): Promise<UserResearchProfile> {
+export async function rebuildUserResearchProfile(userId?: string, asyncBuild: boolean = true): Promise<{ profile: UserResearchProfile; job?: UserProfileBuildJob | null; status: string }> {
   const effectiveUserId = resolveUserId(userId)
   const response: any = await request.post('/user/research-profile/rebuild', {
-    user_id: effectiveUserId
+    user_id: effectiveUserId,
+    async_build: asyncBuild
+  })
+  return {
+    status: response?.status || 'success',
+    profile: normalizeResearchProfile(response?.profile || response, effectiveUserId),
+    job: response?.job ? normalizeProfileBuildJob(response.job) : null
+  }
+}
+
+export async function getUserResearchProfileBuildJob(jobId: string): Promise<UserProfileBuildJob> {
+  const response: any = await request.get(`/user/research-profile/build-jobs/${jobId}`)
+  return normalizeProfileBuildJob(response?.job || response)
+}
+
+export async function getUserResearchProfileTopicEvidence(topic: string, userId?: string): Promise<{ found: boolean; evidence: Record<string, any>; topic: string }> {
+  const effectiveUserId = resolveUserId(userId)
+  const response: any = await request.get(`/user/research-profile/${effectiveUserId}/topic-evidence`, { params: { topic } })
+  return {
+    found: Boolean(response?.found),
+    evidence: response?.evidence || {},
+    topic: response?.topic || topic
+  }
+}
+
+export async function activateUserResearchProfileSnapshot(snapshotId: string, userId?: string): Promise<UserResearchProfile> {
+  const effectiveUserId = resolveUserId(userId)
+  const response: any = await request.post('/user/research-profile/snapshots/activate', {
+    user_id: effectiveUserId,
+    snapshot_id: snapshotId
   })
   return normalizeResearchProfile(response?.profile || response, effectiveUserId)
 }

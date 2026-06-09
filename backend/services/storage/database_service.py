@@ -1,7 +1,8 @@
-import sqlite3
+﻿import sqlite3
 import os
 import json
 import uuid
+import re
 from typing import Dict, Any, List, Optional
 import logging
 from datetime import datetime, timezone, timedelta
@@ -28,6 +29,11 @@ PROFILE_LIST_FIELDS = {
     "common_question_types",
     "representative_papers",
 }
+PROFILE_CANONICAL_TOPIC_FIELDS = {
+    "canonical_topics",
+    "canonical_negative_topics",
+    "canonical_recent_topics",
+}
 PAPER_NOTE_TYPES = {
     "summary",
     "method",
@@ -39,6 +45,52 @@ PAPER_NOTE_TYPES = {
     "custom",
 }
 PAPER_INDEX_ACTIVE_JOB_STATUSES = ("pending", "running", "retrying")
+PROFILE_BUILD_VERSION = "research_profile_v2"
+PROFILE_EXTRACTOR_VERSION = "llm_paper_evidence_v1"
+PROFILE_NORMALIZER_VERSION = "profile_normalizer_v1"
+PROFILE_EVENT_STRENGTHS = {
+    "liked": 1.0,
+    "disliked": -0.7,
+    "favorite": 0.85,
+    "later": 0.35,
+    "read": 0.15,
+    "not_interested": -0.45,
+    "note_saved": 0.9,
+    "qa_asked": 0.25,
+    "manual_topic_added": 1.0,
+    "manual_topic_removed": -1.0,
+    "manual_topic_pinned": 1.2,
+    "manual_topic_hidden": -1.2,
+    "manual_style_updated": 0.4,
+}
+PROFILE_EVENT_ACTION_ALIASES = {
+    "like": "liked",
+    "liked": "liked",
+    "dislike": "disliked",
+    "disliked": "disliked",
+    "favorite": "favorite",
+    "later": "later",
+    "read": "read",
+    "not_interested": "not_interested",
+    "note_included": "note_saved",
+    "note_updated_in_profile": "note_saved",
+}
+PROFILE_TOPIC_BLOCKLIST = {
+    "analysis",
+    "approach",
+    "framework",
+    "method",
+    "methods",
+    "model",
+    "models",
+    "paper",
+    "papers",
+    "system",
+    "systems",
+}
+PROFILE_ARXIV_ID_PATTERN = re.compile(r"^(?:\d{4}\.\d{4,5}(?:v\d+)?|[a-z-]+(?:\.[A-Z]{2})?/\d{7}(?:v\d+)?)$")
+PROFILE_ARXIV_CATEGORY_PATTERN = re.compile(r"^[a-z-]+(?:\.[A-Z]{2})?$")
+PROFILE_URL_PATTERN = re.compile(r"https?://|www\.", re.IGNORECASE)
 
 
 class PaperQATurnPersistenceError(RuntimeError):
@@ -68,7 +120,7 @@ class DatabaseService:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             default_user_id_sql = DEFAULT_USER_ID.replace("'", "''")
-            
+
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS arxiv_papers (
                     arxiv_id TEXT PRIMARY KEY,
@@ -84,7 +136,7 @@ class DatabaseService:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            
+
             cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS user_liked_papers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,7 +147,7 @@ class DatabaseService:
                     FOREIGN KEY(arxiv_id) REFERENCES arxiv_papers(arxiv_id)
                 )
             ''')
-            
+
             cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS user_disliked_papers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,7 +158,7 @@ class DatabaseService:
                     FOREIGN KEY(arxiv_id) REFERENCES arxiv_papers(arxiv_id)
                 )
             ''')
-            
+
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS user_interest_vectors (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,7 +176,7 @@ class DatabaseService:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            
+
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS paper_qa_index (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -246,6 +298,126 @@ class DatabaseService:
                     preferred_answer_style TEXT,
                     common_question_types TEXT,
                     representative_papers TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_profile_events (
+                    event_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    event_type TEXT,
+                    source_type TEXT NOT NULL,
+                    source_id TEXT,
+                    action_type TEXT NOT NULL,
+                    action_strength REAL DEFAULT 0,
+                    source TEXT,
+                    arxiv_id TEXT,
+                    note_id TEXT,
+                    session_id TEXT,
+                    payload_json TEXT,
+                    metadata_json TEXT,
+                    include_in_profile INTEGER DEFAULT 1,
+                    consumed_by_job_id TEXT,
+                    consumed_at TIMESTAMP,
+                    dedupe_key TEXT,
+                    profile_dirty INTEGER DEFAULT 1,
+                    extractor_version TEXT,
+                    normalizer_version TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS paper_profile_evidence (
+                    evidence_id TEXT PRIMARY KEY,
+                    arxiv_id TEXT NOT NULL,
+                    concepts_json TEXT,
+                    methods_json TEXT,
+                    tasks_json TEXT,
+                    objects_json TEXT,
+                    applications_json TEXT,
+                    categories_json TEXT,
+                    raw_payload_json TEXT,
+                    extractor_version TEXT,
+                    normalizer_version TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(arxiv_id, extractor_version, normalizer_version)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_generated_profiles (
+                    user_id TEXT PRIMARY KEY,
+                    snapshot_id TEXT,
+                    profile_json TEXT NOT NULL,
+                    evidence_summary_json TEXT,
+                    quality_report_json TEXT,
+                    build_config_json TEXT,
+                    extractor_version TEXT,
+                    normalizer_version TEXT,
+                    profile_build_version TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_manual_profiles (
+                    user_id TEXT PRIMARY KEY,
+                    profile_json TEXT NOT NULL,
+                    pinned_items_json TEXT,
+                    blocked_items_json TEXT,
+                    deleted_items_json TEXT,
+                    source TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_effective_profiles (
+                    user_id TEXT PRIMARY KEY,
+                    profile_json TEXT NOT NULL,
+                    generated_snapshot_id TEXT,
+                    merge_report_json TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_profile_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    generated_profile_json TEXT NOT NULL,
+                    manual_profile_json TEXT,
+                    effective_profile_json TEXT NOT NULL,
+                    evidence_summary_json TEXT,
+                    quality_report_json TEXT,
+                    build_config_json TEXT,
+                    extractor_version TEXT,
+                    normalizer_version TEXT,
+                    profile_build_version TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_profile_build_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    snapshot_id TEXT,
+                    current_stage TEXT,
+                    progress INTEGER NOT NULL DEFAULT 0,
+                    error_message TEXT,
+                    build_config_json TEXT,
+                    extractor_version TEXT,
+                    normalizer_version TEXT,
+                    profile_build_version TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -376,6 +548,37 @@ class DatabaseService:
             ''')
 
             cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_user_profile_events_user_created
+                ON user_profile_events(user_id, created_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_user_profile_events_user_type_created
+                ON user_profile_events(user_id, event_type, created_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_user_profile_events_dedupe
+                ON user_profile_events(user_id, dedupe_key)
+                WHERE dedupe_key IS NOT NULL
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_user_profile_events_paper
+                ON user_profile_events(user_id, arxiv_id, action_type)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_user_profile_snapshots_user_created
+                ON user_profile_snapshots(user_id, created_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_user_profile_build_jobs_user_updated
+                ON user_profile_build_jobs(user_id, updated_at DESC)
+            ''')
+
+            cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_user_paper_actions_user_paper
                 ON user_paper_actions(user_id, arxiv_id)
             ''')
@@ -413,9 +616,11 @@ class DatabaseService:
             conn.commit()
             logger.info("Database tables initialized successfully")
             self._ensure_user_interest_vector_columns(conn)
+            self._ensure_user_profile_event_columns(conn)
             self._ensure_paper_qa_index_columns(conn)
             self._ensure_paper_qa_index_version_rows(conn)
             self._ensure_paper_index_job_columns(conn)
+            self._migrate_legacy_research_profiles(conn)
 
     def _ensure_user_interest_vector_columns(self, conn):
         required_columns = {
@@ -435,8 +640,44 @@ class DatabaseService:
                 )
         conn.commit()
 
+    def _ensure_user_profile_event_columns(self, conn):
+        # 画像事件表从辅助审计升级为主证据流；旧库启动时补齐新列，避免手工迁移数据库。
+        required_columns = {
+            "event_type": "TEXT",
+            "action_strength": "REAL DEFAULT 0",
+            "source": "TEXT",
+            "note_id": "TEXT",
+            "session_id": "TEXT",
+            "metadata_json": "TEXT",
+            "include_in_profile": "INTEGER DEFAULT 1",
+            "consumed_by_job_id": "TEXT",
+            "consumed_at": "TIMESTAMP",
+            "dedupe_key": "TEXT",
+            "profile_dirty": "INTEGER DEFAULT 1",
+        }
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(user_profile_events)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        for column_name, column_definition in required_columns.items():
+            if column_name not in existing_columns:
+                cursor.execute(
+                    f"ALTER TABLE user_profile_events ADD COLUMN {column_name} {column_definition}"
+                )
+        cursor.execute(
+            '''
+            UPDATE user_profile_events
+            SET event_type = COALESCE(event_type, action_type),
+                source = COALESCE(source, source_type),
+                metadata_json = COALESCE(metadata_json, payload_json),
+                include_in_profile = COALESCE(include_in_profile, 1),
+                profile_dirty = COALESCE(profile_dirty, 1)
+            WHERE event_type IS NULL OR source IS NULL OR metadata_json IS NULL
+            '''
+        )
+        conn.commit()
+
     def _ensure_paper_qa_index_columns(self, conn):
-        # 旧环境可能已经创建过 paper_qa_index；这里补齐 artifact 字段，确保失败后仍可追踪残留文件和 collection。
+        # 旧环境可能已经创建过 paper_qa_index；这里补齐 artifact 字段，保留失败后的文件与 collection 追踪。
         required_columns = {
             "chunk_file": "TEXT",
             "embedding_file": "TEXT",
@@ -462,7 +703,7 @@ class DatabaseService:
         conn.commit()
 
     def _ensure_paper_qa_index_version_rows(self, conn):
-        # 旧库只有 paper_qa_index 单行记录；这里把已可用索引补成 active version，避免升级后丢失可问答状态。
+        # 旧库只有 paper_qa_index 单行记录；启动时补 active version，避免升级后丢失可问答状态。
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -512,7 +753,7 @@ class DatabaseService:
         conn.commit()
 
     def _ensure_paper_index_job_columns(self, conn):
-        # 旧库可能缺少心跳和幂等键；启动时补齐，避免用户为了恢复僵尸任务而手工删库。
+        # 旧库可能缺少心跳和幂等键，启动时补齐，避免用户为了恢复任务而手工删库。
         required_columns = {
             "idempotency_key": "TEXT",
             "heartbeat_at": "TIMESTAMP",
@@ -578,23 +819,417 @@ class DatabaseService:
             "updated_at": None,
         }
 
+    @classmethod
+    def _empty_profile_projection(cls, user_id: str) -> Dict[str, Any]:
+        return cls._empty_user_research_profile(user_id)
+
+    @staticmethod
+    def _normalize_profile_list_value(values: Any, limit: int = 30) -> List[str]:
+        if values is None:
+            return []
+        source = values if isinstance(values, list) else [values]
+        normalized: List[str] = []
+        for item in source:
+            text = str(item or "").strip()
+            if text and text not in normalized:
+                normalized.append(text)
+            if len(normalized) >= limit:
+                break
+        return normalized
+
+    @staticmethod
+    def _looks_like_profile_arxiv_id(value: str) -> bool:
+        text = str(value or "").strip()
+        if text.startswith(("http://", "https://")):
+            text = text.rstrip("/").rsplit("/", 1)[-1]
+        return bool(text and PROFILE_ARXIV_ID_PATTERN.match(text))
+
+    @staticmethod
+    def _looks_like_profile_arxiv_category(value: str) -> bool:
+        text = str(value or "").strip()
+        return bool(text and PROFILE_ARXIV_CATEGORY_PATTERN.match(text) and ("." in text or text.startswith("cs.")))
+
+    @staticmethod
+    def _looks_like_profile_paper_title(value: str) -> bool:
+        text = str(value or "").strip()
+        words = [part for part in re.split(r"\s+", text) if part]
+        if len(text) > 60 or len(words) > 6:
+            return True
+        title_joiners = {"for", "with", "of", "using", "via", "towards", "toward", "based"}
+        lower_words = {word.strip(".,:;!?()[]{}").lower() for word in words}
+        if len(words) >= 4 and lower_words & title_joiners:
+            return True
+        return any(marker in text for marker in (":", "?", "!", " -- ", " - "))
+
+    @classmethod
+    def _normalize_profile_topics(cls, values: Any, limit: int = 30) -> List[str]:
+        normalized: List[str] = []
+        for item in cls._normalize_profile_list_value(values, limit=limit * 3):
+            text = str(item or "").strip()
+            if not text:
+                continue
+            if PROFILE_URL_PATTERN.search(text) or cls._looks_like_profile_arxiv_id(text):
+                continue
+            if cls._looks_like_profile_arxiv_category(text) or text.lower().startswith("cs."):
+                continue
+            if cls._looks_like_profile_paper_title(text) or text.lower() in PROFILE_TOPIC_BLOCKLIST:
+                continue
+            if text not in normalized:
+                normalized.append(text)
+            if len(normalized) >= limit:
+                break
+        return normalized
+
+    @classmethod
+    def _normalize_profile_categories(cls, values: Any, limit: int = 20) -> List[str]:
+        categories: List[str] = []
+        source: List[str] = []
+        for item in cls._normalize_profile_list_value(values, limit=limit * 4):
+            if item.startswith("["):
+                try:
+                    parsed = json.loads(item)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    source.extend(cls._normalize_profile_list_value(parsed, limit=limit * 4))
+                    continue
+            source.extend([part.strip() for part in re.split(r"[,\s]+", item) if part.strip()])
+        for item in source:
+            if not cls._looks_like_profile_arxiv_category(item):
+                continue
+            if item not in categories:
+                categories.append(item)
+            if len(categories) >= limit:
+                break
+        return categories
+
+    @classmethod
+    def _normalize_profile_papers(cls, values: Any, limit: int = 20) -> List[str]:
+        normalized: List[str] = []
+        for item in cls._normalize_profile_list_value(values, limit=limit * 2):
+            text = item.rstrip("/").rsplit("/", 1)[-1] if item.startswith(("http://", "https://")) else item
+            if not cls._looks_like_profile_arxiv_id(text):
+                continue
+            if text not in normalized:
+                normalized.append(text)
+            if len(normalized) >= limit:
+                break
+        return normalized
+
+    @classmethod
+    def _normalize_canonical_topics(cls, values: Any, limit: int = 30) -> List[Dict[str, Any]]:
+        """保留 canonical topic 对象边界，旧字段只从其中投影出可展示 label。"""
+        source = values if isinstance(values, list) else []
+        normalized: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in source:
+            if isinstance(item, str):
+                item = {"label": item}
+            if not isinstance(item, dict):
+                continue
+            label = cls._normalize_profile_topics([item.get("label")], limit=1)
+            if not label:
+                continue
+            normalized_label = label[0]
+            key = normalized_label.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(
+                {
+                    "label": normalized_label,
+                    "aliases": cls._normalize_profile_topics(item.get("aliases"), limit=20),
+                    "description": str(item.get("description") or "").strip()[:800],
+                    "topic_type": str(item.get("topic_type") or item.get("type") or "technical_concept").strip() or "technical_concept",
+                    "merge_confidence": cls._coerce_float(item.get("merge_confidence"), default=0.0),
+                    "score": cls._coerce_float(item.get("score"), default=0.0),
+                    "source_concepts": cls._normalize_source_concepts(item.get("source_concepts")),
+                    "source_papers": cls._normalize_profile_papers(item.get("source_papers"), limit=30),
+                    "source_events": cls._normalize_profile_list_value(item.get("source_events"), limit=50),
+                    "source": str(item.get("source") or "").strip(),
+                    "pinned": bool(item.get("pinned")),
+                    "normalizer_version": str(item.get("normalizer_version") or PROFILE_NORMALIZER_VERSION).strip(),
+                }
+            )
+            if len(normalized) >= limit:
+                break
+        return normalized
+
+    @classmethod
+    def _normalize_source_concepts(cls, values: Any, limit: int = 50) -> List[Dict[str, Any]]:
+        concepts: List[Dict[str, Any]] = []
+        for item in values if isinstance(values, list) else []:
+            if not isinstance(item, dict):
+                continue
+            label = cls._normalize_profile_topics([item.get("label")], limit=1)
+            if not label:
+                continue
+            concepts.append(
+                {
+                    "label": label[0],
+                    "type": str(item.get("type") or "technical_concept").strip() or "technical_concept",
+                    "confidence": cls._coerce_float(item.get("confidence"), default=0.0),
+                    "score": cls._coerce_float(item.get("score"), default=0.0),
+                    "source": str(item.get("source") or "").strip(),
+                    "source_papers": cls._normalize_profile_papers(item.get("source_papers"), limit=20),
+                    "source_events": cls._normalize_profile_list_value(item.get("source_events"), limit=30),
+                    "evidence_texts": cls._normalize_profile_list_value(item.get("evidence_texts"), limit=5),
+                }
+            )
+            if len(concepts) >= limit:
+                break
+        return concepts
+
+    @staticmethod
+    def _coerce_float(value: Any, *, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _topic_keys(cls, values: Any) -> set[str]:
+        return {item.lower() for item in cls._normalize_profile_topics(values, limit=100)}
+
+    @classmethod
+    def _filter_hidden_topics(cls, values: List[str], hidden_topics: Any, limit: int = 30) -> List[str]:
+        hidden_keys = cls._topic_keys(hidden_topics)
+        return [item for item in cls._normalize_profile_topics(values, limit=limit * 2) if item.lower() not in hidden_keys][:limit]
+
+    @classmethod
+    def _filter_hidden_canonical_topics(cls, values: List[Dict[str, Any]], hidden_topics: Any, limit: int = 30) -> List[Dict[str, Any]]:
+        hidden_keys = cls._topic_keys(hidden_topics)
+        return [item for item in cls._normalize_canonical_topics(values, limit=limit * 2) if item["label"].lower() not in hidden_keys][:limit]
+
+    @classmethod
+    def _normalize_profile_projection(cls, user_id: str, profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = dict(profile or {})
+        normalized = {
+            "user_id": user_id,
+            "positive_topics": cls._normalize_profile_topics(payload.get("positive_topics"), limit=30),
+            "negative_topics": cls._normalize_profile_topics(payload.get("negative_topics"), limit=30),
+            "recent_topics": cls._normalize_profile_topics(payload.get("recent_topics"), limit=30),
+            "preferred_categories": cls._normalize_profile_categories(payload.get("preferred_categories"), limit=20),
+            "preferred_answer_style": str(payload.get("preferred_answer_style", "") or "").strip(),
+            "common_question_types": cls._normalize_profile_list_value(payload.get("common_question_types"), limit=20),
+            "representative_papers": cls._normalize_profile_papers(payload.get("representative_papers"), limit=20),
+            "created_at": payload.get("created_at"),
+            "updated_at": payload.get("updated_at"),
+        }
+        normalized.update(
+            {
+                "canonical_topics": cls._normalize_canonical_topics(payload.get("canonical_topics"), limit=30),
+                "canonical_negative_topics": cls._normalize_canonical_topics(payload.get("canonical_negative_topics"), limit=30),
+                "canonical_recent_topics": cls._normalize_canonical_topics(payload.get("canonical_recent_topics"), limit=30),
+                "pinned_topics": cls._normalize_profile_topics(payload.get("pinned_topics"), limit=30),
+                "hidden_topics": cls._normalize_profile_topics(payload.get("hidden_topics"), limit=30),
+                "normalizer_version": str(payload.get("normalizer_version") or PROFILE_NORMALIZER_VERSION).strip(),
+                "normalization_signature": str(payload.get("normalization_signature") or "").strip(),
+            }
+        )
+        for extra_field in ("topic_evidence", "aggregation_report", "review_status", "quality_report", "aggregator_version"):
+            value = payload.get(extra_field)
+            if value is not None:
+                # 解释性字段不参与旧字段归一化，但 snapshot/effective 需要保留它们供调试和前端解释来源。
+                normalized[extra_field] = value
+        return normalized
+
+    @classmethod
+    def _merge_profile_projection(
+        cls,
+        user_id: str,
+        generated_profile: Optional[Dict[str, Any]],
+        manual_profile: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        generated = cls._normalize_profile_projection(user_id, generated_profile)
+        manual = cls._normalize_profile_projection(user_id, manual_profile)
+        hidden_topics = manual["hidden_topics"]
+        pinned_topics = manual["pinned_topics"]
+        generated_positive_topics = cls._filter_hidden_topics(generated["positive_topics"], hidden_topics, limit=30)
+        generated_negative_topics = cls._filter_hidden_topics(generated["negative_topics"], hidden_topics, limit=30)
+        generated_recent_topics = cls._filter_hidden_topics(generated["recent_topics"], hidden_topics, limit=30)
+        manual_positive_topics = cls._filter_hidden_topics(manual["positive_topics"], hidden_topics, limit=30)
+        manual_negative_topics = cls._filter_hidden_topics(manual["negative_topics"], hidden_topics, limit=30)
+        manual_recent_topics = cls._filter_hidden_topics(manual["recent_topics"], hidden_topics, limit=30)
+        pinned_canonical = cls._canonical_topics_from_manual(pinned_topics)
+        generated_canonical = cls._filter_hidden_canonical_topics(generated["canonical_topics"], hidden_topics, limit=30)
+        generated_negative_canonical = cls._filter_hidden_canonical_topics(generated["canonical_negative_topics"], hidden_topics, limit=30)
+        generated_recent_canonical = cls._filter_hidden_canonical_topics(generated["canonical_recent_topics"], hidden_topics, limit=30)
+        # 手动隐藏是用户显式排除项，合并时必须先过滤；手动固定则作为高优先级 canonical topic 保留。
+        effective = {
+            "user_id": user_id,
+            "positive_topics": cls._normalize_profile_list_value([*pinned_topics, *manual_positive_topics, *generated_positive_topics], limit=30),
+            "negative_topics": cls._normalize_profile_list_value([*manual_negative_topics, *generated_negative_topics], limit=30),
+            "recent_topics": cls._normalize_profile_list_value([*generated_recent_topics, *manual_recent_topics], limit=30),
+            "preferred_categories": cls._normalize_profile_list_value([*manual["preferred_categories"], *generated["preferred_categories"]], limit=20),
+            "preferred_answer_style": manual["preferred_answer_style"] or generated["preferred_answer_style"],
+            "common_question_types": cls._normalize_profile_list_value([*manual["common_question_types"], *generated["common_question_types"]], limit=20),
+            "representative_papers": cls._normalize_profile_list_value([*generated["representative_papers"], *manual["representative_papers"]], limit=20),
+            "canonical_topics": cls._normalize_canonical_topics([*pinned_canonical, *generated_canonical], limit=30),
+            "canonical_negative_topics": generated_negative_canonical,
+            "canonical_recent_topics": generated_recent_canonical,
+            "pinned_topics": pinned_topics,
+            "hidden_topics": hidden_topics,
+            "normalizer_version": generated.get("normalizer_version") or PROFILE_NORMALIZER_VERSION,
+            "normalization_signature": generated.get("normalization_signature") or "",
+        }
+        for extra_field in ("topic_evidence", "aggregation_report", "review_status", "quality_report", "aggregator_version"):
+            if extra_field in generated:
+                # effective profile 是推荐和 Agent 的读取边界，保留解释字段方便下游说明 topic 来源。
+                effective[extra_field] = generated[extra_field]
+        return effective
+
+    @classmethod
+    def _canonical_topics_from_manual(cls, topics: Any) -> List[Dict[str, Any]]:
+        canonical_topics: List[Dict[str, Any]] = []
+        for topic in cls._normalize_profile_topics(topics, limit=30):
+            canonical_topics.append(
+                {
+                    "label": topic,
+                    "aliases": [],
+                    "description": "用户手动固定的研究主题。",
+                    "topic_type": "manual_topic",
+                    "merge_confidence": 1.0,
+                    "score": 10.0,
+                    "source_concepts": [
+                        {
+                            "label": topic,
+                            "type": "manual_topic",
+                            "confidence": 1.0,
+                            "score": 10.0,
+                            "source": "manual_profile",
+                            "source_papers": [],
+                            "source_events": [],
+                            "evidence_texts": [],
+                        }
+                    ],
+                    "source_papers": [],
+                    "source_events": [],
+                    "source": "manual_profile",
+                    "pinned": True,
+                    "normalizer_version": PROFILE_NORMALIZER_VERSION,
+                }
+            )
+        return canonical_topics
+    def _upsert_legacy_research_profile_cache(self, conn, user_id: str, profile: Dict[str, Any]) -> None:
+        normalized = self._normalize_profile_projection(user_id, profile)
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO user_research_profiles (
+                user_id, positive_topics, negative_topics, recent_topics, preferred_categories,
+                preferred_answer_style, common_question_types, representative_papers, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                positive_topics = excluded.positive_topics,
+                negative_topics = excluded.negative_topics,
+                recent_topics = excluded.recent_topics,
+                preferred_categories = excluded.preferred_categories,
+                preferred_answer_style = excluded.preferred_answer_style,
+                common_question_types = excluded.common_question_types,
+                representative_papers = excluded.representative_papers,
+                updated_at = CURRENT_TIMESTAMP
+            ''',
+            (
+                user_id,
+                self._serialize_json_field(normalized["positive_topics"]),
+                self._serialize_json_field(normalized["negative_topics"]),
+                self._serialize_json_field(normalized["recent_topics"]),
+                self._serialize_json_field(normalized["preferred_categories"]),
+                normalized["preferred_answer_style"],
+                self._serialize_json_field(normalized["common_question_types"]),
+                self._serialize_json_field(normalized["representative_papers"]),
+            ),
+        )
+
+    def _migrate_legacy_research_profiles(self, conn) -> None:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT user_id, positive_topics, negative_topics, recent_topics, preferred_categories,
+                   preferred_answer_style, common_question_types, representative_papers
+            FROM user_research_profiles
+            '''
+        )
+        rows = cursor.fetchall()
+        for row in rows:
+            user_id = str(row[0] or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+            cursor.execute("SELECT 1 FROM user_manual_profiles WHERE user_id = ?", (user_id,))
+            manual_exists = cursor.fetchone() is not None
+            cursor.execute("SELECT 1 FROM user_generated_profiles WHERE user_id = ?", (user_id,))
+            generated_exists = cursor.fetchone() is not None
+            if manual_exists or generated_exists:
+                continue
+
+            legacy_profile = {
+                "positive_topics": self._deserialize_json_field(row[1]) or [],
+                "negative_topics": self._deserialize_json_field(row[2]) or [],
+                "recent_topics": self._deserialize_json_field(row[3]) or [],
+                "preferred_categories": self._deserialize_json_field(row[4]) or [],
+                "preferred_answer_style": row[5] or "",
+                "common_question_types": self._deserialize_json_field(row[6]) or [],
+                "representative_papers": self._deserialize_json_field(row[7]) or [],
+            }
+            manual_profile = self._normalize_profile_projection(
+                user_id,
+                {
+                    "positive_topics": legacy_profile.get("positive_topics"),
+                    "negative_topics": legacy_profile.get("negative_topics"),
+                    "preferred_categories": legacy_profile.get("preferred_categories"),
+                    "preferred_answer_style": legacy_profile.get("preferred_answer_style"),
+                    "common_question_types": legacy_profile.get("common_question_types"),
+                },
+            )
+            # 旧 topic 没有来源标记，只能以低置信度候选进入 manual；标题、URL、分类和 arXiv ID 会被清洗丢弃。
+            cursor.execute(
+                '''
+                INSERT OR IGNORE INTO user_manual_profiles (
+                    user_id, profile_json, pinned_items_json, blocked_items_json, deleted_items_json, source
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    user_id,
+                    self._serialize_json_field(manual_profile),
+                    self._serialize_json_field([]),
+                    self._serialize_json_field([]),
+                    self._serialize_json_field([]),
+                    "legacy_migration_low_confidence",
+                ),
+            )
+            effective = self._merge_profile_projection(user_id, {}, manual_profile)
+            cursor.execute(
+                '''
+                INSERT OR IGNORE INTO user_effective_profiles (user_id, profile_json, merge_report_json)
+                VALUES (?, ?, ?)
+                ''',
+                (
+                    user_id,
+                    self._serialize_json_field(effective),
+                    self._serialize_json_field({"source": "legacy_migration", "legacy_fields": list(legacy_profile.keys())}),
+                ),
+            )
+            self._upsert_legacy_research_profile_cache(conn, user_id, effective)
+        conn.commit()
+
     def add_liked_paper(self, user_id: str = DEFAULT_USER_ID, arxiv_id: str = None) -> bool:
         try:
             if arxiv_id is None:
                 logger.error("arxiv_id is required")
                 return False
-                
+
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     DELETE FROM user_disliked_papers WHERE user_id = ? AND arxiv_id = ?
                 ''', (user_id, arxiv_id))
-                
+
                 cursor.execute('''
                     INSERT OR IGNORE INTO user_liked_papers (user_id, arxiv_id)
                     VALUES (?, ?)
                 ''', (user_id, arxiv_id))
-                
+
                 conn.commit()
                 self.record_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="like")
                 self.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="dislike")
@@ -610,13 +1245,13 @@ class DatabaseService:
             if arxiv_id is None:
                 logger.error("arxiv_id is required")
                 return False
-                
+
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     DELETE FROM user_liked_papers WHERE user_id = ? AND arxiv_id = ?
                 ''', (user_id, arxiv_id))
-                
+
                 conn.commit()
                 self.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="like")
                 logger.info(f"Paper {arxiv_id} removed from liked list for user: {user_id}")
@@ -632,7 +1267,7 @@ class DatabaseService:
                 cursor.execute('''
                     SELECT arxiv_id FROM user_liked_papers WHERE user_id = ? ORDER BY created_at DESC
                 ''', (user_id,))
-                
+
                 return [row[0] for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"Error getting liked papers: {str(e)}")
@@ -649,7 +1284,7 @@ class DatabaseService:
                     WHERE ulp.user_id = ?
                     ORDER BY ulp.created_at DESC
                 ''', (user_id,))
-                
+
                 results = []
                 for row in cursor.fetchall():
                     results.append({
@@ -669,13 +1304,13 @@ class DatabaseService:
         try:
             if arxiv_id is None:
                 return False
-                
+
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     SELECT COUNT(*) FROM user_liked_papers WHERE user_id = ? AND arxiv_id = ?
                 ''', (user_id, arxiv_id))
-                
+
                 return cursor.fetchone()[0] > 0
         except Exception as e:
             logger.error(f"Error checking liked paper: {str(e)}")
@@ -686,18 +1321,18 @@ class DatabaseService:
             if arxiv_id is None:
                 logger.error("arxiv_id is required")
                 return False
-                
+
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     DELETE FROM user_liked_papers WHERE user_id = ? AND arxiv_id = ?
                 ''', (user_id, arxiv_id))
-                
+
                 cursor.execute('''
                     INSERT OR IGNORE INTO user_disliked_papers (user_id, arxiv_id)
                     VALUES (?, ?)
                 ''', (user_id, arxiv_id))
-                
+
                 conn.commit()
                 self.record_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="dislike")
                 self.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="like")
@@ -712,13 +1347,13 @@ class DatabaseService:
             if arxiv_id is None:
                 logger.error("arxiv_id is required")
                 return False
-                
+
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     DELETE FROM user_disliked_papers WHERE user_id = ? AND arxiv_id = ?
                 ''', (user_id, arxiv_id))
-                
+
                 conn.commit()
                 self.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="dislike")
                 logger.info(f"Paper {arxiv_id} removed from disliked list for user: {user_id}")
@@ -734,7 +1369,7 @@ class DatabaseService:
                 cursor.execute('''
                     SELECT arxiv_id FROM user_disliked_papers WHERE user_id = ? ORDER BY created_at DESC
                 ''', (user_id,))
-                
+
                 return [row[0] for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"Error getting disliked papers: {str(e)}")
@@ -744,13 +1379,13 @@ class DatabaseService:
         try:
             if arxiv_id is None:
                 return False
-                
+
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     SELECT COUNT(*) FROM user_disliked_papers WHERE user_id = ? AND arxiv_id = ?
                 ''', (user_id, arxiv_id))
-                
+
                 return cursor.fetchone()[0] > 0
         except Exception as e:
             logger.error(f"Error checking disliked paper: {str(e)}")
@@ -812,6 +1447,17 @@ class DatabaseService:
                     DO UPDATE SET metadata_json = excluded.metadata_json, updated_at = CURRENT_TIMESTAMP
                     ''',
                     (user_id, arxiv_id, normalized_action, self._serialize_json_field(metadata)),
+                )
+                # 琛屼负浜嬩欢灞備繚鐣欑敾鍍忕浉鍏崇殑鍘熷鐢ㄦ埛鍔ㄤ綔锛屽悗缁噸寤哄彲浠ヨВ閲婃煇涓敾鍍忛」鏉ヨ嚜鍝簺鏄惧紡琛屼负銆?
+                self.record_user_profile_event(
+                    user_id=user_id,
+                    event_type=self._normalize_profile_event_type(normalized_action),
+                    source_type="paper_action",
+                    source_id=arxiv_id,
+                    action_type=normalized_action,
+                    arxiv_id=arxiv_id,
+                    metadata={"metadata": metadata or {}, "source": "paper_action"},
+                    conn=conn,
                 )
                 conn.commit()
                 return True
@@ -917,57 +1563,35 @@ class DatabaseService:
         return state
 
     def upsert_user_research_profile(self, user_id: str = DEFAULT_USER_ID, profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        payload = dict(profile or {})
-        normalized: Dict[str, Any] = {}
-        for field_name in PROFILE_LIST_FIELDS:
-            value = payload.get(field_name)
-            if value is None:
-                normalized[field_name] = []
-            elif isinstance(value, list):
-                normalized[field_name] = [str(item).strip() for item in value if str(item).strip()]
-            else:
-                normalized[field_name] = [str(value).strip()] if str(value).strip() else []
-
-        normalized["preferred_answer_style"] = str(payload.get("preferred_answer_style", "") or "").strip()
-
+        normalized = self._normalize_profile_projection(user_id, profile)
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                # 鏃?upsert 鍏ュ彛鐜板湪鍙啓 manual profile锛沞ffective 鐢?manual/generated 鍚堝苟寰楀埌锛岄伩鍏嶆墜鍔ㄤ繚瀛樿鐩栬嚜鍔ㄧ敾鍍忋€?
                 cursor.execute(
                     '''
-                    INSERT INTO user_research_profiles (
-                        user_id,
-                        positive_topics,
-                        negative_topics,
-                        recent_topics,
-                        preferred_categories,
-                        preferred_answer_style,
-                        common_question_types,
-                        representative_papers,
-                        updated_at
+                    INSERT INTO user_manual_profiles (
+                        user_id, profile_json, pinned_items_json, blocked_items_json, deleted_items_json, source, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(user_id) DO UPDATE SET
-                        positive_topics = excluded.positive_topics,
-                        negative_topics = excluded.negative_topics,
-                        recent_topics = excluded.recent_topics,
-                        preferred_categories = excluded.preferred_categories,
-                        preferred_answer_style = excluded.preferred_answer_style,
-                        common_question_types = excluded.common_question_types,
-                        representative_papers = excluded.representative_papers,
+                        profile_json = excluded.profile_json,
+                        pinned_items_json = excluded.pinned_items_json,
+                        blocked_items_json = excluded.blocked_items_json,
+                        deleted_items_json = excluded.deleted_items_json,
+                        source = excluded.source,
                         updated_at = CURRENT_TIMESTAMP
                     ''',
                     (
                         user_id,
-                        self._serialize_json_field(normalized["positive_topics"]),
-                        self._serialize_json_field(normalized["negative_topics"]),
-                        self._serialize_json_field(normalized["recent_topics"]),
-                        self._serialize_json_field(normalized["preferred_categories"]),
-                        normalized["preferred_answer_style"],
-                        self._serialize_json_field(normalized["common_question_types"]),
-                        self._serialize_json_field(normalized["representative_papers"]),
+                        self._serialize_json_field(normalized),
+                        self._serialize_json_field([]),
+                        self._serialize_json_field([]),
+                        self._serialize_json_field([]),
+                        "legacy_manual_upsert",
                     ),
                 )
+                effective = self._refresh_effective_profile(conn, user_id)
                 conn.commit()
         except Exception as e:
             logger.error(f"Error upserting research profile: {str(e)}")
@@ -975,7 +1599,7 @@ class DatabaseService:
         return self.get_user_research_profile(user_id)
 
     def patch_user_research_profile(self, user_id: str = DEFAULT_USER_ID, profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        current = self.get_user_research_profile(user_id)
+        current = self.get_user_manual_profile(user_id)
         merged = {**current, **dict(profile or {})}
         return self.upsert_user_research_profile(user_id=user_id, profile=merged)
 
@@ -985,37 +1609,976 @@ class DatabaseService:
                 cursor = conn.cursor()
                 cursor.execute(
                     '''
+                    SELECT profile_json, created_at, updated_at
+                    FROM user_effective_profiles WHERE user_id = ?
+                    ''',
+                    (user_id,),
+                )
+                row = cursor.fetchone()
+                if row:
+                    profile = self._normalize_profile_projection(user_id, self._deserialize_json_field(row[0]) or {})
+                    profile["created_at"] = row[1]
+                    profile["updated_at"] = row[2]
+                    return profile
+
+                cursor.execute(
+                    '''
                     SELECT user_id, positive_topics, negative_topics, recent_topics, preferred_categories,
                            preferred_answer_style, common_question_types, representative_papers, created_at, updated_at
                     FROM user_research_profiles WHERE user_id = ?
                     ''',
                     (user_id,),
                 )
-                row = cursor.fetchone()
-                if not row:
-                    return self._empty_user_research_profile(user_id)
-
-                return {
-                    "user_id": row[0],
-                    "positive_topics": self._deserialize_json_field(row[1]) or [],
-                    "negative_topics": self._deserialize_json_field(row[2]) or [],
-                    "recent_topics": self._deserialize_json_field(row[3]) or [],
-                    "preferred_categories": self._deserialize_json_field(row[4]) or [],
-                    "preferred_answer_style": str(row[5] or ""),
-                    "common_question_types": self._deserialize_json_field(row[6]) or [],
-                    "representative_papers": self._deserialize_json_field(row[7]) or [],
-                    "created_at": row[8],
-                    "updated_at": row[9],
-                }
+                legacy_row = cursor.fetchone()
+                if legacy_row:
+                    legacy_profile = {
+                        "user_id": legacy_row[0],
+                        "positive_topics": self._deserialize_json_field(legacy_row[1]) or [],
+                        "negative_topics": self._deserialize_json_field(legacy_row[2]) or [],
+                        "recent_topics": self._deserialize_json_field(legacy_row[3]) or [],
+                        "preferred_categories": self._deserialize_json_field(legacy_row[4]) or [],
+                        "preferred_answer_style": str(legacy_row[5] or ""),
+                        "common_question_types": self._deserialize_json_field(legacy_row[6]) or [],
+                        "representative_papers": self._deserialize_json_field(legacy_row[7]) or [],
+                        "created_at": legacy_row[8],
+                        "updated_at": legacy_row[9],
+                    }
+                    return self._normalize_profile_projection(user_id, legacy_profile)
+                return self._empty_user_research_profile(user_id)
         except Exception as e:
             logger.error(f"Error getting research profile: {str(e)}")
             return self._empty_user_research_profile(user_id)
 
+    def get_user_manual_profile(self, user_id: str = DEFAULT_USER_ID) -> Dict[str, Any]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT profile_json, created_at, updated_at FROM user_manual_profiles WHERE user_id = ?",
+                    (user_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return self._empty_profile_projection(user_id)
+                profile = self._normalize_profile_projection(user_id, self._deserialize_json_field(row[0]) or {})
+                profile["created_at"] = row[1]
+                profile["updated_at"] = row[2]
+                return profile
+        except Exception as e:
+            logger.error(f"Error getting manual research profile: {str(e)}")
+            return self._empty_profile_projection(user_id)
+
+    def get_user_generated_profile(self, user_id: str = DEFAULT_USER_ID) -> Dict[str, Any]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT profile_json, snapshot_id, evidence_summary_json, quality_report_json,
+                           build_config_json, extractor_version, normalizer_version, profile_build_version,
+                           created_at, updated_at
+                    FROM user_generated_profiles WHERE user_id = ?
+                    ''',
+                    (user_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return self._empty_profile_projection(user_id)
+                profile = self._normalize_profile_projection(user_id, self._deserialize_json_field(row[0]) or {})
+                profile.update(
+                    {
+                        "snapshot_id": row[1],
+                        "evidence_summary": self._deserialize_json_field(row[2]) or {},
+                        "quality_report": self._deserialize_json_field(row[3]) or {},
+                        "build_config": self._deserialize_json_field(row[4]) or {},
+                        "extractor_version": row[5],
+                        "normalizer_version": row[6],
+                        "profile_build_version": row[7],
+                        "created_at": row[8],
+                        "updated_at": row[9],
+                    }
+                )
+                return profile
+        except Exception as e:
+            logger.error(f"Error getting generated research profile: {str(e)}")
+            return self._empty_profile_projection(user_id)
+
+    def get_user_profile_layers(self, user_id: str = DEFAULT_USER_ID) -> Dict[str, Any]:
+        return {
+            "manual_profile": self.get_user_manual_profile(user_id),
+            "generated_profile": self.get_user_generated_profile(user_id),
+            "effective_profile": self.get_user_research_profile(user_id),
+        }
+
+    def list_user_profile_build_jobs(self, user_id: str = DEFAULT_USER_ID, limit: int = 20) -> List[Dict[str, Any]]:
+        """返回画像构建任务历史，供前端轮询和排查慢速构建状态。"""
+        try:
+            with self._get_connection() as conn:
+                rows = conn.execute(
+                    '''
+                    SELECT job_id, user_id, status, snapshot_id, current_stage, progress, error_message,
+                           build_config_json, extractor_version, normalizer_version, profile_build_version,
+                           created_at, updated_at
+                    FROM user_profile_build_jobs
+                    WHERE user_id = ?
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT ?
+                    ''',
+                    (user_id, max(1, int(limit or 20))),
+                ).fetchall()
+            return [
+                {
+                    "job_id": row[0],
+                    "user_id": row[1],
+                    "status": row[2],
+                    "snapshot_id": row[3],
+                    "current_stage": row[4],
+                    "progress": int(row[5] or 0),
+                    "error_message": row[6],
+                    "build_config": self._deserialize_json_field(row[7]) or {},
+                    "extractor_version": row[8],
+                    "normalizer_version": row[9],
+                    "profile_build_version": row[10],
+                    "created_at": row[11],
+                    "updated_at": row[12],
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            logger.error(f"Error listing profile build jobs: {str(e)}")
+            return []
+
+    def get_user_profile_build_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """按 job_id 读取单个构建任务，返回结构与列表接口一致。"""
+        try:
+            with self._get_connection() as conn:
+                row = conn.execute(
+                    '''
+                    SELECT job_id, user_id, status, snapshot_id, current_stage, progress, error_message,
+                           build_config_json, extractor_version, normalizer_version, profile_build_version,
+                           created_at, updated_at
+                    FROM user_profile_build_jobs
+                    WHERE job_id = ?
+                    ''',
+                    (job_id,),
+                ).fetchone()
+            if not row:
+                return None
+            return {
+                "job_id": row[0],
+                "user_id": row[1],
+                "status": row[2],
+                "snapshot_id": row[3],
+                "current_stage": row[4],
+                "progress": int(row[5] or 0),
+                "error_message": row[6],
+                "build_config": self._deserialize_json_field(row[7]) or {},
+                "extractor_version": row[8],
+                "normalizer_version": row[9],
+                "profile_build_version": row[10],
+                "created_at": row[11],
+                "updated_at": row[12],
+            }
+        except Exception as e:
+            logger.error(f"Error getting profile build job: {str(e)}")
+            return None
+
+    def list_user_profile_snapshots(self, user_id: str = DEFAULT_USER_ID, limit: int = 20) -> List[Dict[str, Any]]:
+        """列出画像快照摘要，避免前端列表一次性拉取完整 profile payload。"""
+        try:
+            active_snapshot_id = (self.get_user_generated_profile(user_id) or {}).get("snapshot_id")
+            with self._get_connection() as conn:
+                rows = conn.execute(
+                    '''
+                    SELECT snapshot_id, user_id, evidence_summary_json, quality_report_json, build_config_json,
+                           extractor_version, normalizer_version, profile_build_version, created_at
+                    FROM user_profile_snapshots
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    ''',
+                    (user_id, max(1, int(limit or 20))),
+                ).fetchall()
+            return [
+                {
+                    "snapshot_id": row[0],
+                    "user_id": row[1],
+                    "evidence_summary": self._deserialize_json_field(row[2]) or {},
+                    "quality_report": self._deserialize_json_field(row[3]) or {},
+                    "build_config": self._deserialize_json_field(row[4]) or {},
+                    "extractor_version": row[5],
+                    "normalizer_version": row[6],
+                    "profile_build_version": row[7],
+                    "created_at": row[8],
+                    "active": row[0] == active_snapshot_id,
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            logger.error(f"Error listing profile snapshots: {str(e)}")
+            return []
+
+    def get_user_profile_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
+        """读取完整画像快照，用于证据解释、回滚前预览和问题排查。"""
+        try:
+            with self._get_connection() as conn:
+                row = conn.execute(
+                    '''
+                    SELECT snapshot_id, user_id, generated_profile_json, manual_profile_json, effective_profile_json,
+                           evidence_summary_json, quality_report_json, build_config_json,
+                           extractor_version, normalizer_version, profile_build_version, created_at
+                    FROM user_profile_snapshots
+                    WHERE snapshot_id = ?
+                    ''',
+                    (snapshot_id,),
+                ).fetchone()
+            if not row:
+                return None
+            return {
+                "snapshot_id": row[0],
+                "user_id": row[1],
+                "generated_profile": self._normalize_profile_projection(row[1], self._deserialize_json_field(row[2]) or {}),
+                "manual_profile": self._normalize_profile_projection(row[1], self._deserialize_json_field(row[3]) or {}),
+                "effective_profile": self._normalize_profile_projection(row[1], self._deserialize_json_field(row[4]) or {}),
+                "evidence_summary": self._deserialize_json_field(row[5]) or {},
+                "quality_report": self._deserialize_json_field(row[6]) or {},
+                "build_config": self._deserialize_json_field(row[7]) or {},
+                "extractor_version": row[8],
+                "normalizer_version": row[9],
+                "profile_build_version": row[10],
+                "created_at": row[11],
+            }
+        except Exception as e:
+            logger.error(f"Error getting profile snapshot: {str(e)}")
+            return None
+
+    def activate_user_profile_snapshot(self, user_id: str, snapshot_id: str) -> Dict[str, Any]:
+        """把历史 snapshot 切换为 active generated profile，并重新合并 effective profile。"""
+        snapshot = self.get_user_profile_snapshot(snapshot_id)
+        if not snapshot or snapshot.get("user_id") != user_id:
+            raise ValueError("profile_snapshot_not_found")
+        generated = self._normalize_profile_projection(user_id, snapshot.get("generated_profile") or {})
+        try:
+            with self._get_connection() as conn:
+                conn.execute(
+                    '''
+                    INSERT INTO user_generated_profiles (
+                        user_id, snapshot_id, profile_json, evidence_summary_json, quality_report_json, build_config_json,
+                        extractor_version, normalizer_version, profile_build_version, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        snapshot_id = excluded.snapshot_id,
+                        profile_json = excluded.profile_json,
+                        evidence_summary_json = excluded.evidence_summary_json,
+                        quality_report_json = excluded.quality_report_json,
+                        build_config_json = excluded.build_config_json,
+                        extractor_version = excluded.extractor_version,
+                        normalizer_version = excluded.normalizer_version,
+                        profile_build_version = excluded.profile_build_version,
+                        updated_at = CURRENT_TIMESTAMP
+                    ''',
+                    (
+                        user_id,
+                        snapshot_id,
+                        self._serialize_json_field(generated),
+                        self._serialize_json_field(snapshot.get("evidence_summary") or {}),
+                        self._serialize_json_field(snapshot.get("quality_report") or {}),
+                        self._serialize_json_field(snapshot.get("build_config") or {}),
+                        snapshot.get("extractor_version") or PROFILE_EXTRACTOR_VERSION,
+                        snapshot.get("normalizer_version") or PROFILE_NORMALIZER_VERSION,
+                        snapshot.get("profile_build_version") or PROFILE_BUILD_VERSION,
+                    ),
+                )
+                effective = self._refresh_effective_profile(conn, user_id, snapshot_id=snapshot_id)
+                conn.commit()
+            return self._normalize_profile_projection(user_id, effective)
+        except Exception as e:
+            logger.error(f"Error activating profile snapshot: {str(e)}")
+            raise
+
+    def _refresh_effective_profile(self, conn, user_id: str, snapshot_id: Optional[str] = None) -> Dict[str, Any]:
+        cursor = conn.cursor()
+        cursor.execute("SELECT profile_json FROM user_manual_profiles WHERE user_id = ?", (user_id,))
+        manual_row = cursor.fetchone()
+        cursor.execute("SELECT profile_json, snapshot_id FROM user_generated_profiles WHERE user_id = ?", (user_id,))
+        generated_row = cursor.fetchone()
+        manual = self._deserialize_json_field(manual_row[0]) if manual_row else {}
+        generated = self._deserialize_json_field(generated_row[0]) if generated_row else {}
+        resolved_snapshot_id = snapshot_id or (generated_row[1] if generated_row else None)
+        effective = self._merge_profile_projection(user_id, generated, manual)
+        merge_report = {
+            "manual_available": bool(manual),
+            "generated_available": bool(generated),
+            "generated_snapshot_id": resolved_snapshot_id,
+        }
+        cursor.execute(
+            '''
+            INSERT INTO user_effective_profiles (user_id, profile_json, generated_snapshot_id, merge_report_json, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                profile_json = excluded.profile_json,
+                generated_snapshot_id = excluded.generated_snapshot_id,
+                merge_report_json = excluded.merge_report_json,
+                updated_at = CURRENT_TIMESTAMP
+            ''',
+            (
+                user_id,
+                self._serialize_json_field(effective),
+                resolved_snapshot_id,
+                self._serialize_json_field(merge_report),
+            ),
+        )
+        self._upsert_legacy_research_profile_cache(conn, user_id, effective)
+        return effective
+
+    def upsert_user_manual_profile(
+        self,
+        user_id: str = DEFAULT_USER_ID,
+        profile: Optional[Dict[str, Any]] = None,
+        *,
+        source: str = "manual",
+    ) -> Dict[str, Any]:
+        previous_manual = self.get_user_manual_profile(user_id)
+        normalized = self._normalize_profile_projection(user_id, profile)
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                # 鎵嬪姩鐢诲儚鏄敤鎴锋樉寮忔剰鍥剧殑鍞竴鍐欏叆杈圭晫锛屽悗缁噸寤轰笉浼氫慨鏀硅繖寮犺〃銆?
+                cursor.execute(
+                    '''
+                    INSERT INTO user_manual_profiles (
+                        user_id, profile_json, pinned_items_json, blocked_items_json, deleted_items_json, source, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        profile_json = excluded.profile_json,
+                        source = excluded.source,
+                        updated_at = CURRENT_TIMESTAMP
+                    ''',
+                    (
+                        user_id,
+                        self._serialize_json_field(normalized),
+                        self._serialize_json_field(normalized.get("pinned_topics") or []),
+                        self._serialize_json_field(normalized.get("hidden_topics") or []),
+                        self._serialize_json_field([]),
+                        source,
+                    ),
+                )
+                self._record_manual_profile_delta_events(
+                    conn=conn,
+                    user_id=user_id,
+                    previous_profile=previous_manual,
+                    next_profile=normalized,
+                    source=source,
+                )
+                effective = self._refresh_effective_profile(conn, user_id)
+                conn.commit()
+                return self._normalize_profile_projection(user_id, effective)
+        except Exception as e:
+            logger.error(f"Error upserting manual research profile: {str(e)}")
+            return self.get_user_research_profile(user_id)
+
+    def patch_user_manual_profile(
+        self,
+        user_id: str = DEFAULT_USER_ID,
+        profile: Optional[Dict[str, Any]] = None,
+        *,
+        source: str = "manual_patch",
+    ) -> Dict[str, Any]:
+        current = self.get_user_manual_profile(user_id)
+        merged = {**current, **dict(profile or {})}
+        return self.upsert_user_manual_profile(user_id=user_id, profile=merged, source=source)
+
+    def _record_manual_profile_delta_events(
+        self,
+        *,
+        conn,
+        user_id: str,
+        previous_profile: Dict[str, Any],
+        next_profile: Dict[str, Any],
+        source: str,
+    ) -> None:
+        tracked_topic_fields = {
+            "positive_topics": ("manual_topic_added", "manual_topic_removed"),
+            "negative_topics": ("manual_topic_added", "manual_topic_removed"),
+            "recent_topics": ("manual_topic_added", "manual_topic_removed"),
+            "preferred_categories": ("manual_topic_added", "manual_topic_removed"),
+            "pinned_topics": ("manual_topic_pinned", "manual_topic_removed"),
+            "hidden_topics": ("manual_topic_hidden", "manual_topic_removed"),
+        }
+        for field_name, (added_event_type, removed_event_type) in tracked_topic_fields.items():
+            previous_values = set(self._normalize_profile_list_value(previous_profile.get(field_name), limit=100))
+            next_values = set(self._normalize_profile_list_value(next_profile.get(field_name), limit=100))
+            for topic in sorted(next_values - previous_values):
+                # 鎵嬪姩鏂板杩涘叆 manual event锛屽悗缁敱 manual/effective 鍚堝苟灞傚鐞嗭紝涓嶆薄鏌?generated profile銆?
+                self.record_user_profile_event(
+                    user_id=user_id,
+                    event_type=added_event_type,
+                    source_type="manual_profile",
+                    action_type=added_event_type,
+                    source=source,
+                    metadata={"topic": topic, "field": field_name},
+                    include_in_profile=True,
+                    conn=conn,
+                )
+            for topic in sorted(previous_values - next_values):
+                self.record_user_profile_event(
+                    user_id=user_id,
+                    event_type=removed_event_type,
+                    source_type="manual_profile",
+                    action_type=removed_event_type,
+                    source=source,
+                    metadata={"topic": topic, "field": field_name},
+                    include_in_profile=True,
+                    conn=conn,
+                )
+
+        previous_style = str(previous_profile.get("preferred_answer_style") or "").strip()
+        next_style = str(next_profile.get("preferred_answer_style") or "").strip()
+        if previous_style != next_style:
+            self.record_user_profile_event(
+                user_id=user_id,
+                event_type="manual_style_updated",
+                source_type="manual_profile",
+                action_type="manual_style_updated",
+                source=source,
+                metadata={"previous_style": previous_style, "style": next_style},
+                include_in_profile=True,
+                conn=conn,
+            )
+
+    def create_user_profile_build_job(
+        self,
+        user_id: str = DEFAULT_USER_ID,
+        *,
+        build_config: Optional[Dict[str, Any]] = None,
+        status: str = "running",
+    ) -> str:
+        job_id = str(uuid.uuid4())
+        try:
+            with self._get_connection() as conn:
+                conn.execute(
+                    '''
+                    INSERT INTO user_profile_build_jobs (
+                        job_id, user_id, status, current_stage, progress, build_config_json,
+                        extractor_version, normalizer_version, profile_build_version
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        job_id,
+                        user_id,
+                        status,
+                        "collect_evidence",
+                        0,
+                        self._serialize_json_field(build_config or {}),
+                        PROFILE_EXTRACTOR_VERSION,
+                        PROFILE_NORMALIZER_VERSION,
+                        PROFILE_BUILD_VERSION,
+                    ),
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error creating profile build job: {str(e)}")
+        return job_id
+
+    def update_user_profile_build_job(
+        self,
+        job_id: str,
+        *,
+        status: Optional[str] = None,
+        snapshot_id: Optional[str] = None,
+        current_stage: Optional[str] = None,
+        progress: Optional[int] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        updates: List[str] = []
+        values: List[Any] = []
+        for column, value in {
+            "status": status,
+            "snapshot_id": snapshot_id,
+            "current_stage": current_stage,
+            "progress": progress,
+            "error_message": error_message,
+        }.items():
+            if value is None:
+                continue
+            updates.append(f"{column} = ?")
+            values.append(value)
+        if not updates:
+            return
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(job_id)
+        try:
+            with self._get_connection() as conn:
+                conn.execute(
+                    f"UPDATE user_profile_build_jobs SET {', '.join(updates)} WHERE job_id = ?",
+                    values,
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error updating profile build job: {str(e)}")
+
+    def upsert_paper_profile_evidence(self, arxiv_id: str, evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = dict(evidence or {})
+        normalized = {
+            "concepts": self._normalize_profile_topics(
+                payload.get("technical_concepts")
+                or payload.get("concepts")
+                or payload.get("topics")
+                or [item.get("label") for item in payload.get("candidate_concepts") or [] if isinstance(item, dict)],
+                limit=20,
+            ),
+            "methods": self._normalize_profile_topics(payload.get("methods"), limit=20),
+            "tasks": self._normalize_profile_topics(payload.get("tasks"), limit=20),
+            "objects": self._normalize_profile_topics(payload.get("research_objects") or payload.get("objects"), limit=20),
+            "applications": self._normalize_profile_topics(payload.get("application_domains") or payload.get("applications"), limit=20),
+            "categories": self._normalize_profile_categories(payload.get("categories"), limit=20),
+        }
+        evidence_id = str(uuid.uuid4())
+        try:
+            with self._get_connection() as conn:
+                conn.execute(
+                    '''
+                    INSERT INTO paper_profile_evidence (
+                        evidence_id, arxiv_id, concepts_json, methods_json, tasks_json, objects_json,
+                        applications_json, categories_json, raw_payload_json, extractor_version, normalizer_version, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(arxiv_id, extractor_version, normalizer_version) DO UPDATE SET
+                        concepts_json = excluded.concepts_json,
+                        methods_json = excluded.methods_json,
+                        tasks_json = excluded.tasks_json,
+                        objects_json = excluded.objects_json,
+                        applications_json = excluded.applications_json,
+                        categories_json = excluded.categories_json,
+                        raw_payload_json = excluded.raw_payload_json,
+                        updated_at = CURRENT_TIMESTAMP
+                    ''',
+                    (
+                        evidence_id,
+                        arxiv_id,
+                        self._serialize_json_field(normalized["concepts"]),
+                        self._serialize_json_field(normalized["methods"]),
+                        self._serialize_json_field(normalized["tasks"]),
+                        self._serialize_json_field(normalized["objects"]),
+                        self._serialize_json_field(normalized["applications"]),
+                        self._serialize_json_field(normalized["categories"]),
+                        self._serialize_json_field(payload),
+                        PROFILE_EXTRACTOR_VERSION,
+                        PROFILE_NORMALIZER_VERSION,
+                    ),
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error upserting paper profile evidence: {str(e)}")
+        return {"arxiv_id": arxiv_id, **normalized}
+
+    def get_paper_profile_evidence(
+        self,
+        arxiv_id: str,
+        *,
+        extractor_version: str = PROFILE_EXTRACTOR_VERSION,
+        normalizer_version: str = PROFILE_NORMALIZER_VERSION,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT arxiv_id, concepts_json, methods_json, tasks_json, objects_json,
+                           applications_json, categories_json, raw_payload_json,
+                           extractor_version, normalizer_version, created_at, updated_at
+                    FROM paper_profile_evidence
+                    WHERE arxiv_id = ? AND extractor_version = ? AND normalizer_version = ?
+                    ''',
+                    (arxiv_id, extractor_version, normalizer_version),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                raw_payload = self._deserialize_json_field(row[7]) or {}
+                if isinstance(raw_payload, dict) and raw_payload:
+                    raw_payload.setdefault("arxiv_id", row[0])
+                    raw_payload.setdefault("extractor_version", row[8])
+                    raw_payload.setdefault("created_at", row[10])
+                    raw_payload.setdefault("updated_at", row[11])
+                    return raw_payload
+                return {
+                    "arxiv_id": row[0],
+                    "technical_concepts": self._deserialize_json_field(row[1]) or [],
+                    "methods": self._deserialize_json_field(row[2]) or [],
+                    "tasks": self._deserialize_json_field(row[3]) or [],
+                    "research_objects": self._deserialize_json_field(row[4]) or [],
+                    "application_domains": self._deserialize_json_field(row[5]) or [],
+                    "categories": self._deserialize_json_field(row[6]) or [],
+                    "candidate_concepts": [],
+                    "extractor_version": row[8],
+                    "normalizer_version": row[9],
+                    "schema_valid": False,
+                    "error_message": "legacy_evidence_without_full_card",
+                    "created_at": row[10],
+                    "updated_at": row[11],
+                }
+        except Exception as e:
+            logger.error(f"Error getting paper profile evidence: {str(e)}")
+            return None
+
+    def save_generated_profile_snapshot(
+        self,
+        user_id: str = DEFAULT_USER_ID,
+        *,
+        generated_profile: Dict[str, Any],
+        evidence_summary: Optional[Dict[str, Any]] = None,
+        quality_report: Optional[Dict[str, Any]] = None,
+        build_config: Optional[Dict[str, Any]] = None,
+        job_id: Optional[str] = None,
+        activate: bool = True,
+    ) -> Dict[str, Any]:
+        snapshot_id = str(uuid.uuid4())
+        normalized_generated = self._normalize_profile_projection(user_id, generated_profile)
+        evidence_summary = dict(evidence_summary or {})
+        quality_report = dict(quality_report or {})
+        build_config = dict(build_config or {})
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT profile_json FROM user_manual_profiles WHERE user_id = ?", (user_id,))
+                manual_row = cursor.fetchone()
+                manual_profile = self._deserialize_json_field(manual_row[0]) if manual_row else {}
+                if activate:
+                    effective_for_snapshot = self._merge_profile_projection(user_id, normalized_generated, manual_profile)
+                else:
+                    cursor.execute("SELECT profile_json FROM user_effective_profiles WHERE user_id = ?", (user_id,))
+                    effective_row = cursor.fetchone()
+                    effective_for_snapshot = self._deserialize_json_field(effective_row[0]) if effective_row else self._normalize_profile_projection(user_id, manual_profile)
+                # 每次重建都先落 snapshot；低质量结果也可追溯，但只有审查通过才移动 active 指针。
+                cursor.execute(
+                    '''
+                    INSERT INTO user_profile_snapshots (
+                        snapshot_id, user_id, generated_profile_json, manual_profile_json, effective_profile_json,
+                        evidence_summary_json, quality_report_json, build_config_json,
+                        extractor_version, normalizer_version, profile_build_version
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        snapshot_id,
+                        user_id,
+                        self._serialize_json_field(normalized_generated),
+                        self._serialize_json_field(manual_profile or {}),
+                        self._serialize_json_field(effective_for_snapshot),
+                        self._serialize_json_field(evidence_summary),
+                        self._serialize_json_field(quality_report),
+                        self._serialize_json_field(build_config),
+                        PROFILE_EXTRACTOR_VERSION,
+                        PROFILE_NORMALIZER_VERSION,
+                        PROFILE_BUILD_VERSION,
+                    ),
+                )
+                if activate:
+                    cursor.execute(
+                        '''
+                        INSERT INTO user_generated_profiles (
+                            user_id, snapshot_id, profile_json, evidence_summary_json, quality_report_json, build_config_json,
+                            extractor_version, normalizer_version, profile_build_version, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                            snapshot_id = excluded.snapshot_id,
+                            profile_json = excluded.profile_json,
+                            evidence_summary_json = excluded.evidence_summary_json,
+                            quality_report_json = excluded.quality_report_json,
+                            build_config_json = excluded.build_config_json,
+                            extractor_version = excluded.extractor_version,
+                            normalizer_version = excluded.normalizer_version,
+                            profile_build_version = excluded.profile_build_version,
+                            updated_at = CURRENT_TIMESTAMP
+                        ''',
+                        (
+                            user_id,
+                            snapshot_id,
+                            self._serialize_json_field(normalized_generated),
+                            self._serialize_json_field(evidence_summary),
+                            self._serialize_json_field(quality_report),
+                            self._serialize_json_field(build_config),
+                            PROFILE_EXTRACTOR_VERSION,
+                            PROFILE_NORMALIZER_VERSION,
+                            PROFILE_BUILD_VERSION,
+                        ),
+                    )
+                    effective = self._refresh_effective_profile(conn, user_id, snapshot_id=snapshot_id)
+                else:
+                    # 质量审查失败时只保留可追溯 snapshot，不移动 active 指针，避免低质量画像污染推荐和 Agent。
+                    effective = effective_for_snapshot
+                if job_id:
+                    next_status = "completed" if activate else "needs_review"
+                    next_stage = "completed" if activate else "quality_review"
+                    cursor.execute(
+                        '''
+                        UPDATE user_profile_build_jobs
+                        SET status = ?, snapshot_id = ?, current_stage = ?, progress = 100, updated_at = CURRENT_TIMESTAMP
+                        WHERE job_id = ?
+                        ''',
+                        (next_status, snapshot_id, next_stage, job_id),
+                    )
+                conn.commit()
+                return {
+                    "snapshot_id": snapshot_id,
+                    "generated_profile": normalized_generated,
+                    "manual_profile": self._normalize_profile_projection(user_id, manual_profile),
+                    "effective_profile": self._normalize_profile_projection(user_id, effective),
+                    "evidence_summary": evidence_summary,
+                    "quality_report": quality_report,
+                    "build_config": build_config,
+                    "extractor_version": PROFILE_EXTRACTOR_VERSION,
+                    "normalizer_version": PROFILE_NORMALIZER_VERSION,
+                    "profile_build_version": PROFILE_BUILD_VERSION,
+                }
+        except Exception as e:
+            logger.error(f"Error saving generated profile snapshot: {str(e)}")
+            if job_id:
+                self.update_user_profile_build_job(job_id, status="failed", current_stage="failed", error_message=str(e))
+            return {
+                "snapshot_id": None,
+                "generated_profile": normalized_generated,
+                "effective_profile": self.get_user_research_profile(user_id),
+                "evidence_summary": evidence_summary,
+                "quality_report": {"error": str(e), **quality_report},
+                "build_config": build_config,
+            }
+
+    def record_user_profile_event(
+        self,
+        *,
+        user_id: str,
+        event_type: Optional[str] = None,
+        source_type: str,
+        action_type: str,
+        source_id: Optional[str] = None,
+        arxiv_id: Optional[str] = None,
+        note_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        action_strength: Optional[float] = None,
+        source: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        include_in_profile: bool = True,
+        dedupe_key: Optional[str] = None,
+        conn=None,
+    ) -> str:
+        event_id = str(uuid.uuid4())
+        normalized_event_type = self._normalize_profile_event_type(event_type or action_type)
+        normalized_source = str(source or source_type or "unknown").strip() or "unknown"
+        normalized_arxiv_id = str(arxiv_id or "").strip() or None
+        normalized_note_id = str(note_id or "").strip() or None
+        normalized_session_id = str(session_id or "").strip() or None
+        resolved_source_id = str(source_id or normalized_arxiv_id or normalized_note_id or normalized_session_id or "").strip() or None
+        resolved_strength = float(action_strength if action_strength is not None else PROFILE_EVENT_STRENGTHS.get(normalized_event_type, 0.0))
+        normalized_metadata = dict(metadata or payload or {})
+        resolved_dedupe_key = dedupe_key or self._build_profile_event_dedupe_key(
+            normalized_event_type,
+            arxiv_id=normalized_arxiv_id,
+            note_id=normalized_note_id,
+            session_id=normalized_session_id,
+            source_id=resolved_source_id,
+            metadata=normalized_metadata,
+        )
+        owns_connection = conn is None
+        connection = conn or self._get_connection()
+        try:
+            connection.execute(
+                '''
+                INSERT INTO user_profile_events (
+                    event_id, user_id, event_type, source_type, source_id, action_type, action_strength,
+                    source, arxiv_id, note_id, session_id, payload_json, metadata_json, include_in_profile,
+                    consumed_by_job_id, consumed_at, dedupe_key, profile_dirty, extractor_version, normalizer_version
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
+                ON CONFLICT(user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO UPDATE SET
+                    action_strength = excluded.action_strength,
+                    source = excluded.source,
+                    source_type = excluded.source_type,
+                    action_type = excluded.action_type,
+                    payload_json = excluded.payload_json,
+                    metadata_json = excluded.metadata_json,
+                    include_in_profile = excluded.include_in_profile,
+                    profile_dirty = 1,
+                    created_at = CURRENT_TIMESTAMP
+                ''',
+                (
+                    event_id,
+                    user_id,
+                    normalized_event_type,
+                    source_type,
+                    resolved_source_id,
+                    action_type,
+                    resolved_strength,
+                    normalized_source,
+                    normalized_arxiv_id,
+                    normalized_note_id,
+                    normalized_session_id,
+                    self._serialize_json_field(payload or {}),
+                    self._serialize_json_field(normalized_metadata),
+                    1 if include_in_profile else 0,
+                    resolved_dedupe_key,
+                    1,
+                    PROFILE_EXTRACTOR_VERSION,
+                    PROFILE_NORMALIZER_VERSION,
+                ),
+            )
+            if owns_connection:
+                connection.commit()
+        except Exception as e:
+            logger.error(f"Error recording profile event: {str(e)}")
+        finally:
+            if owns_connection:
+                connection.close()
+        return event_id
+
+    @staticmethod
+    def _normalize_profile_event_type(value: Any) -> str:
+        normalized = str(value or "").strip().lower()
+        normalized = normalized.replace("-", "_")
+        return PROFILE_EVENT_ACTION_ALIASES.get(normalized, normalized or "unknown")
+
+    @staticmethod
+    def _build_profile_event_dedupe_key(
+        event_type: str,
+        *,
+        arxiv_id: Optional[str] = None,
+        note_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        source_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        if event_type.startswith("manual_topic_"):
+            topic = str((metadata or {}).get("topic") or "").strip().lower()
+            return f"{event_type}:topic:{topic}" if topic else f"{event_type}:{source_id or 'manual'}"
+        if event_type == "manual_style_updated":
+            return "manual_style_updated"
+        if note_id:
+            return f"{event_type}:note:{note_id}"
+        if arxiv_id:
+            return f"{event_type}:paper:{arxiv_id}"
+        if session_id:
+            return f"{event_type}:session:{session_id}"
+        return f"{event_type}:{source_id or uuid.uuid4()}"
+
+    def list_user_profile_events(
+        self,
+        user_id: str = DEFAULT_USER_ID,
+        *,
+        event_types: Optional[List[str]] = None,
+        include_consumed: bool = True,
+        include_in_profile_only: bool = True,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        filters = ["user_id = ?"]
+        values: List[Any] = [user_id]
+        normalized_types = [self._normalize_profile_event_type(item) for item in (event_types or []) if str(item or "").strip()]
+        if normalized_types:
+            placeholders = ", ".join("?" for _ in normalized_types)
+            filters.append(f"event_type IN ({placeholders})")
+            values.extend(normalized_types)
+        if not include_consumed:
+            filters.append("consumed_by_job_id IS NULL")
+        if include_in_profile_only:
+            filters.append("include_in_profile = 1")
+        if since:
+            filters.append("created_at >= ?")
+            values.append(since)
+        if until:
+            filters.append("created_at <= ?")
+            values.append(until)
+        values.append(max(1, int(limit or 500)))
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    f'''
+                    SELECT event_id, user_id, event_type, source_type, source_id, action_type, action_strength,
+                           source, arxiv_id, note_id, session_id, payload_json, metadata_json, include_in_profile,
+                           consumed_by_job_id, consumed_at, dedupe_key, profile_dirty, created_at
+                    FROM user_profile_events
+                    WHERE {' AND '.join(filters)}
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    ''',
+                    values,
+                )
+                return [
+                    {
+                        "event_id": row[0],
+                        "user_id": row[1],
+                        "event_type": row[2] or row[5],
+                        "source_type": row[3],
+                        "source_id": row[4],
+                        "action_type": row[5],
+                        "action_strength": float(row[6] or 0.0),
+                        "source": row[7],
+                        "arxiv_id": row[8],
+                        "note_id": row[9],
+                        "session_id": row[10],
+                        "payload": self._deserialize_json_field(row[11]) or {},
+                        "metadata": self._deserialize_json_field(row[12]) or {},
+                        "include_in_profile": bool(row[13]),
+                        "consumed_by_job_id": row[14],
+                        "consumed_at": row[15],
+                        "dedupe_key": row[16],
+                        "profile_dirty": bool(row[17]),
+                        "created_at": row[18],
+                    }
+                    for row in cursor.fetchall()
+                ]
+        except Exception as e:
+            logger.error(f"Error listing profile events: {str(e)}")
+            return []
+
+    def mark_user_profile_events_consumed(self, user_id: str, job_id: str, event_ids: List[str]) -> None:
+        normalized_event_ids = [str(item or "").strip() for item in event_ids if str(item or "").strip()]
+        if not normalized_event_ids:
+            return
+        placeholders = ", ".join("?" for _ in normalized_event_ids)
+        try:
+            with self._get_connection() as conn:
+                conn.execute(
+                    f'''
+                    UPDATE user_profile_events
+                    SET consumed_by_job_id = ?, consumed_at = CURRENT_TIMESTAMP, profile_dirty = 0
+                    WHERE user_id = ? AND event_id IN ({placeholders})
+                    ''',
+                    [job_id, user_id, *normalized_event_ids],
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error marking profile events consumed: {str(e)}")
+
+    def get_user_profile_dirty_event_count(self, user_id: str = DEFAULT_USER_ID) -> int:
+        """返回尚未被画像构建消费的事件数，供调度器判断是否需要排队重建。"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT COUNT(*)
+                    FROM user_profile_events
+                    WHERE user_id = ? AND include_in_profile = 1 AND profile_dirty = 1
+                    ''',
+                    (user_id,),
+                )
+                row = cursor.fetchone()
+                return int(row[0] or 0) if row else 0
+        except Exception as e:
+            logger.error(f"Error counting dirty profile events: {str(e)}")
+            return 0
+
     def get_latest_user_preference_timestamp(self, user_id: str = DEFAULT_USER_ID) -> Optional[str]:
         """
-        返回该用户最新一次偏好的创建时间。
-        用于判断兴趣向量是否已经过期。
-        """
+        杩斿洖璇ョ敤鎴锋渶鏂颁竴娆″亸濂界殑鍒涘缓鏃堕棿銆?        鐢ㄤ簬鍒ゆ柇鍏磋叮鍚戦噺鏄惁宸茬粡杩囨湡銆?        """
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -1049,9 +2612,17 @@ class DatabaseService:
                         SELECT updated_at AS latest_at FROM user_paper_actions WHERE user_id = ?
                         UNION ALL
                         SELECT updated_at AS latest_at FROM user_research_profiles WHERE user_id = ?
+                        UNION ALL
+                        SELECT updated_at AS latest_at FROM user_manual_profiles WHERE user_id = ?
+                        UNION ALL
+                        SELECT updated_at AS latest_at FROM user_generated_profiles WHERE user_id = ?
+                        UNION ALL
+                        SELECT updated_at AS latest_at FROM user_effective_profiles WHERE user_id = ?
+                        UNION ALL
+                        SELECT created_at AS latest_at FROM user_profile_events WHERE user_id = ?
                     )
                     ''',
-                    (user_id, user_id, user_id, user_id),
+                    (user_id, user_id, user_id, user_id, user_id, user_id, user_id, user_id),
                 )
                 row = cursor.fetchone()
                 return row[0] if row and row[0] else None
@@ -1109,7 +2680,7 @@ class DatabaseService:
                     normalized_paper["embedding_id"],
                     normalized_paper["embedding_model"],
                 ))
-                
+
                 conn.commit()
                 logger.info(f"Paper added: {normalized_paper.get('arxiv_id')}")
                 return True
@@ -1173,7 +2744,7 @@ class DatabaseService:
                     SELECT arxiv_id, title, authors, abstract, categories, published_date, url, embedding_id, embedding_model, created_at
                     FROM arxiv_papers WHERE arxiv_id = ?
                 ''', (arxiv_id,))
-                
+
                 row = cursor.fetchone()
                 if row:
                     return {
@@ -1201,7 +2772,7 @@ class DatabaseService:
                     SELECT arxiv_id, title, authors, abstract, categories, published_date, url, embedding_id, created_at
                     FROM arxiv_papers WHERE categories LIKE ?
                 ''', (f'%{category}%',))
-                
+
                 results = []
                 for row in cursor.fetchall():
                     results.append({
@@ -1228,7 +2799,7 @@ class DatabaseService:
                     SELECT arxiv_id, title, authors, abstract, categories, published_date, url, embedding_id, created_at
                     FROM arxiv_papers ORDER BY published_date DESC
                 ''')
-                
+
                 results = []
                 for row in cursor.fetchall():
                     results.append({
@@ -1309,32 +2880,31 @@ class DatabaseService:
 
     def update_paper_embedding(self, arxiv_id: str, embedding_id: int, embedding_model: str = None) -> bool:
         """
-        更新论文的embedding_id和embedding_model信息
-        
-        参数:
-            arxiv_id: 论文的arXiv ID
-            embedding_id: 向量数据库中的embedding ID
-            embedding_model: 使用的嵌入模型名称
-            
-        返回:
-            是否更新成功
+        鏇存柊璁烘枃鐨別mbedding_id鍜宔mbedding_model淇℃伅
+
+        鍙傛暟:
+            arxiv_id: 璁烘枃鐨刟rXiv ID
+            embedding_id: 鍚戦噺鏁版嵁搴撲腑鐨別mbedding ID
+            embedding_model: 浣跨敤鐨勫祵鍏ユā鍨嬪悕绉?
+        杩斿洖:
+            鏄惁鏇存柊鎴愬姛
         """
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 if embedding_model:
                     cursor.execute('''
-                        UPDATE arxiv_papers 
+                        UPDATE arxiv_papers
                         SET embedding_id = ?, embedding_model = ?, embedded_at = CURRENT_TIMESTAMP
                         WHERE arxiv_id = ?
                     ''', (str(embedding_id), embedding_model, arxiv_id))
                 else:
                     cursor.execute('''
-                        UPDATE arxiv_papers 
+                        UPDATE arxiv_papers
                         SET embedding_id = ?, embedded_at = CURRENT_TIMESTAMP
                         WHERE arxiv_id = ?
                     ''', (str(embedding_id), arxiv_id))
-                
+
                 conn.commit()
                 logger.info(f"Paper {arxiv_id} embedding updated with id: {embedding_id}")
                 return cursor.rowcount > 0
@@ -1359,7 +2929,7 @@ class DatabaseService:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    INSERT OR REPLACE INTO user_interest_vectors 
+                    INSERT OR REPLACE INTO user_interest_vectors
                     (user_id, vector_data, paper_count, embedding_model, vector_dimension, cluster_count, profile_mode, interest_clusters, weak_interest_pool, disliked_vector_data, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ''', (
@@ -1374,7 +2944,7 @@ class DatabaseService:
                     json.dumps(weak_interest_pool) if weak_interest_pool is not None else None,
                     json.dumps(disliked_vector_data) if disliked_vector_data is not None else None,
                 ))
-                
+
                 conn.commit()
                 logger.info(f"User interest vector saved for user: {user_id}")
                 return True
@@ -1390,7 +2960,7 @@ class DatabaseService:
                     SELECT user_id, vector_data, paper_count, embedding_model, vector_dimension, cluster_count, profile_mode, interest_clusters, weak_interest_pool, disliked_vector_data, created_at, updated_at
                     FROM user_interest_vectors WHERE user_id = ?
                 ''', (user_id,))
-                
+
                 row = cursor.fetchone()
                 if row:
                     interest_clusters = None
@@ -1442,7 +3012,7 @@ class DatabaseService:
                     WHERE ulp.arxiv_id IS NULL AND udp.arxiv_id IS NULL AND p.embedding_id IS NOT NULL
                     ORDER BY p.published_date DESC
                 ''', (user_id, user_id))
-                
+
                 results = []
                 for row in cursor.fetchall():
                     results.append({
@@ -1470,7 +3040,7 @@ class DatabaseService:
                            active_index_version, active_build_id, previous_build_id
                     FROM paper_qa_index WHERE arxiv_id = ?
                 ''', (arxiv_id,))
-                
+
                 row = cursor.fetchone()
                 if row:
                     return {
@@ -1549,7 +3119,7 @@ class DatabaseService:
             build_id = str(uuid.uuid4())
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                # building version 只记录新构建的临时状态，不覆盖 paper_qa_index 中仍在线的 active 指针。
+                # building version 鍙褰曟柊鏋勫缓鐨勪复鏃剁姸鎬侊紝涓嶈鐩?paper_qa_index 涓粛鍦ㄧ嚎鐨?active 鎸囬拡銆?
                 cursor.execute(
                     """
                     INSERT INTO paper_qa_index_versions (
@@ -1734,7 +3304,7 @@ class DatabaseService:
                         return False
                     build = self._row_to_paper_qa_index_version(row)
                     if build.get("status") not in {"build_success", "ready"}:
-                        # 只有已经完成向量写入并校验过的新版本才能切 active，避免半成品被问答链路读到。
+                        # 鍙湁宸茬粡瀹屾垚鍚戦噺鍐欏叆骞舵牎楠岃繃鐨勬柊鐗堟湰鎵嶈兘鍒?active锛岄伩鍏嶅崐鎴愬搧琚棶绛旈摼璺鍒般€?
                         conn.rollback()
                         return False
 
@@ -1751,7 +3321,7 @@ class DatabaseService:
                     old_active_row = cursor.fetchone()
                     old_build_id = old_active_row[0] if old_active_row else None
                     if old_build_id and old_build_id != build_id:
-                        # 旧 active 不在激活事务里删除，只标记为 cleanup_pending，给回滚和延迟清理留出空间。
+                        # 鏃?active 涓嶅湪婵€娲讳簨鍔￠噷鍒犻櫎锛屽彧鏍囪涓?cleanup_pending锛岀粰鍥炴粴鍜屽欢杩熸竻鐞嗙暀鍑虹┖闂淬€?
                         cursor.execute(
                             """
                             UPDATE paper_qa_index_versions
@@ -1841,11 +3411,7 @@ class DatabaseService:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    f"""
-                    SELECT COUNT(*)
-                    FROM paper_qa_index_versions
-                    WHERE {" AND ".join(where_parts)}
-                    """,
+                    "SELECT COUNT(*) FROM paper_qa_index_versions WHERE " + " AND ".join(where_parts),
                     values,
                 )
                 row = cursor.fetchone()
@@ -1925,7 +3491,7 @@ class DatabaseService:
         *,
         timeout_seconds: int,
     ) -> Optional[Dict[str, Any]]:
-        """在数据库写事务内领取 QA 索引任务，保证多进程下同一论文只产生一个 active job。"""
+        """在数据库写事务内领取 QA 索引任务，保证同一论文只产生一个 active job。"""
         job_id = str(uuid.uuid4())
         normalized_timeout = max(1, int(timeout_seconds or 1))
         idempotency_key = self._build_paper_index_job_idempotency_key(arxiv_id, loading_method)
@@ -1934,41 +3500,29 @@ class DatabaseService:
         stale_modifier = f"-{normalized_timeout} seconds"
         try:
             with self._get_connection() as conn:
-                # BEGIN IMMEDIATE 会提前获取写锁；并发提交会排队，后来的请求能复用先提交的 active job。
+                # BEGIN IMMEDIATE 浼氭彁鍓嶈幏鍙栧啓閿侊紱骞跺彂鎻愪氦浼氭帓闃燂紝鍚庢潵鐨勮姹傝兘澶嶇敤鍏堟彁浜ょ殑 active job銆?
                 conn.isolation_level = None
                 cursor = conn.cursor()
                 cursor.execute("BEGIN IMMEDIATE")
                 try:
                     cursor.execute(
-                        f"""
-                        SELECT job_id
-                        FROM paper_index_jobs
-                        WHERE arxiv_id = ?
-                          AND status IN ({placeholders})
-                          AND datetime(COALESCE(heartbeat_at, updated_at, created_at)) <= datetime('now', ?)
-                        ORDER BY updated_at DESC, created_at DESC
-                        """,
+                        "SELECT job_id FROM paper_index_jobs "
+                        "WHERE arxiv_id = ? "
+                        f"AND status IN ({placeholders}) "
+                        "AND datetime(COALESCE(heartbeat_at, updated_at, created_at)) <= datetime('now', ?) "
+                        "ORDER BY updated_at DESC, created_at DESC",
                         (arxiv_id, *active_statuses, stale_modifier),
                     )
                     stale_job_ids = [row[0] for row in cursor.fetchall()]
                     previous_job_id = stale_job_ids[0] if stale_job_ids else None
                     if stale_job_ids:
                         stale_placeholders = ",".join("?" for _ in stale_job_ids)
-                        # stale 是可重试终态；这里明确写入原因，前端轮询旧 job 时不会再看到无解释的 running。
+                        # stale 鏄彲閲嶈瘯缁堟€侊紱杩欓噷鏄庣‘鍐欏叆鍘熷洜锛屽墠绔疆璇㈡棫 job 鏃朵笉浼氬啀鐪嬪埌鏃犺В閲婄殑 running銆?
                         cursor.execute(
-                            f"""
-                            UPDATE paper_index_jobs
-                            SET status = 'stale',
-                                current_stage = 'stale',
-                                error_message = CASE
-                                    WHEN error_message IS NULL OR error_message = ''
-                                    THEN ?
-                                    ELSE error_message
-                                END,
-                                heartbeat_at = CURRENT_TIMESTAMP,
-                                updated_at = CURRENT_TIMESTAMP
-                            WHERE job_id IN ({stale_placeholders})
-                            """,
+                            "UPDATE paper_index_jobs SET status = 'stale', current_stage = 'stale', "
+                            "error_message = CASE WHEN error_message IS NULL OR error_message = '' THEN ? ELSE error_message END, "
+                            "heartbeat_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
+                            f"WHERE job_id IN ({stale_placeholders})",
                             (
                                 f"QA index job heartbeat timed out after {normalized_timeout} seconds; submit again to retry.",
                                 *stale_job_ids,
@@ -1976,15 +3530,11 @@ class DatabaseService:
                         )
 
                     cursor.execute(
-                        f"""
-                        SELECT job_id, arxiv_id, status, current_stage, progress, error_message,
-                               loading_method, created_at, updated_at, heartbeat_at, idempotency_key
-                        FROM paper_index_jobs
-                        WHERE arxiv_id = ?
-                          AND status IN ({placeholders})
-                        ORDER BY updated_at DESC, created_at DESC
-                        LIMIT 1
-                        """,
+                        "SELECT job_id, arxiv_id, status, current_stage, progress, error_message, "
+                        "loading_method, created_at, updated_at, heartbeat_at, idempotency_key "
+                        "FROM paper_index_jobs WHERE arxiv_id = ? "
+                        f"AND status IN ({placeholders}) "
+                        "ORDER BY updated_at DESC, created_at DESC LIMIT 1",
                         (arxiv_id, *active_statuses),
                     )
                     existing_row = cursor.fetchone()
@@ -2001,22 +3551,15 @@ class DatabaseService:
                         return job
 
                     cursor.execute(
-                        """
-                        INSERT INTO paper_index_jobs (
-                            job_id, arxiv_id, status, current_stage, progress,
-                            error_message, loading_method, idempotency_key, heartbeat_at
-                        )
-                        VALUES (?, ?, 'pending', 'pending', 0, NULL, ?, ?, CURRENT_TIMESTAMP)
-                        """,
+                        "INSERT INTO paper_index_jobs (job_id, arxiv_id, status, current_stage, progress, "
+                        "error_message, loading_method, idempotency_key, heartbeat_at) "
+                        "VALUES (?, ?, 'pending', 'pending', 0, NULL, ?, ?, CURRENT_TIMESTAMP)",
                         (job_id, arxiv_id, loading_method, idempotency_key),
                     )
                     cursor.execute(
-                        """
-                        SELECT job_id, arxiv_id, status, current_stage, progress, error_message,
-                               loading_method, created_at, updated_at, heartbeat_at, idempotency_key
-                        FROM paper_index_jobs
-                        WHERE job_id = ?
-                        """,
+                        "SELECT job_id, arxiv_id, status, current_stage, progress, error_message, "
+                        "loading_method, created_at, updated_at, heartbeat_at, idempotency_key "
+                        "FROM paper_index_jobs WHERE job_id = ?",
                         (job_id,),
                     )
                     created_row = cursor.fetchone()
@@ -2045,7 +3588,7 @@ class DatabaseService:
         job_id: Optional[str] = None,
         timeout_seconds: int,
     ) -> int:
-        """把超过心跳阈值的 pending/running 任务标记为 stale，供提交和轮询前自愈使用。"""
+        """把超过心跳阈值的 pending/running 任务标记为 stale。"""
         normalized_timeout = max(1, int(timeout_seconds or 1))
         stale_modifier = f"-{normalized_timeout} seconds"
         active_statuses = tuple(PAPER_INDEX_ACTIVE_JOB_STATUSES)
@@ -2061,21 +3604,11 @@ class DatabaseService:
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                # 查询接口也会调用本方法，因此错误信息要足够明确，方便前端展示旧任务已可重试。
+                # 鏌ヨ鎺ュ彛涔熶細璋冪敤鏈柟娉曪紝鍥犳閿欒淇℃伅瑕佽冻澶熸槑纭紝鏂逛究鍓嶇灞曠ず鏃т换鍔″凡鍙噸璇曘€?
                 cursor.execute(
-                    f"""
-                    UPDATE paper_index_jobs
-                    SET status = 'stale',
-                        current_stage = 'stale',
-                        error_message = CASE
-                            WHEN error_message IS NULL OR error_message = ''
-                            THEN ?
-                            ELSE error_message
-                        END,
-                        heartbeat_at = CURRENT_TIMESTAMP,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE {" AND ".join(filters)}
-                    """,
+                    "UPDATE paper_index_jobs SET status = 'stale', current_stage = 'stale', "
+                    "error_message = CASE WHEN error_message IS NULL OR error_message = '' THEN ? ELSE error_message END, "
+                    "heartbeat_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE " + " AND ".join(filters),
                     [
                         f"QA index job heartbeat timed out after {normalized_timeout} seconds; submit again to retry.",
                         *values,
@@ -2126,14 +3659,14 @@ class DatabaseService:
                     return False
 
                 if refresh_heartbeat and heartbeat_at is None:
-                    # 任何状态推进都代表后台线程仍活跃，同步刷新心跳用于后续 stale 判定。
+                    # 浠讳綍鐘舵€佹帹杩涢兘浠ｈ〃鍚庡彴绾跨▼浠嶆椿璺冿紝鍚屾鍒锋柊蹇冭烦鐢ㄤ簬鍚庣画 stale 鍒ゅ畾銆?
                     update_fields.append('heartbeat_at = CURRENT_TIMESTAMP')
                 update_fields.append('updated_at = CURRENT_TIMESTAMP')
                 update_values.append(job_id)
                 expected_status_values = [str(item) for item in (expected_statuses or []) if str(item).strip()]
                 expected_clause = ""
                 if expected_status_values:
-                    # 后台线程可能在 stale 恢复后才继续回写；条件更新能阻止旧线程复活不可恢复任务。
+                    # 鍚庡彴绾跨▼鍙兘鍦?stale 鎭㈠鍚庢墠缁х画鍥炲啓锛涙潯浠舵洿鏂拌兘闃绘鏃х嚎绋嬪娲讳笉鍙仮澶嶄换鍔°€?
                     expected_clause = f" AND status IN ({','.join('?' for _ in expected_status_values)})"
                     update_values.extend(expected_status_values)
 
@@ -2223,7 +3756,7 @@ class DatabaseService:
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                
+
                 update_fields = []
                 update_values = []
 
@@ -2279,7 +3812,7 @@ class DatabaseService:
                     if active_row and str(active_row[1] or "").strip():
                         legacy_version = active_row[15] or "legacy"
                         legacy_build_id = active_row[16] or f"legacy-{str(arxiv_id).replace('.', '_').replace('/', '_')}"
-                        # 旧式 update 成功后也补 active version，保证版本化读取和回滚信息完整。
+                        # 鏃у紡 update 鎴愬姛鍚庝篃琛?active version锛屼繚璇佺増鏈寲璇诲彇鍜屽洖婊氫俊鎭畬鏁淬€?
                         cursor.execute(
                             """
                             INSERT OR IGNORE INTO paper_qa_index_versions (
@@ -2316,7 +3849,7 @@ class DatabaseService:
                             """,
                             (legacy_version, legacy_build_id, arxiv_id),
                         )
-                
+
                 conn.commit()
                 logger.info(f"Paper QA index updated for: {arxiv_id}")
                 return cursor.rowcount > 0
@@ -2373,7 +3906,7 @@ class DatabaseService:
                 if kwargs.get("status") == "indexed" and str(kwargs.get("collection_name") or "").strip():
                     legacy_build_id = kwargs.get("active_build_id") or f"legacy-{str(arxiv_id).replace('.', '_').replace('/', '_')}"
                     legacy_version = kwargs.get("active_index_version") or "legacy"
-                    # 兼容测试和旧调用：直接写入 paper_qa_index 的可用记录也补成 active version。
+                    # 鍏煎娴嬭瘯鍜屾棫璋冪敤锛氱洿鎺ュ啓鍏?paper_qa_index 鐨勫彲鐢ㄨ褰曚篃琛ユ垚 active version銆?
                     cursor.execute(
                         """
                         INSERT OR IGNORE INTO paper_qa_index_versions (
@@ -2410,7 +3943,7 @@ class DatabaseService:
                         """,
                         (legacy_version, legacy_build_id, arxiv_id),
                     )
-                
+
                 conn.commit()
                 logger.info(f"Paper QA index inserted for: {arxiv_id}")
                 return True
@@ -2718,11 +4251,8 @@ class DatabaseService:
         error_summary: Optional[str] = None,
         expires_at: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """写入 Agent 执行现场 checkpoint。
-
-        这张表记录的是可恢复执行现场，不是前端展示镜像；pending_action 仍由 agent_sessions 保存，
-        但 resume 校验必须以这里的 pending_confirmation/status 为准。
-        """
+        """鍐欏叆 Agent 鎵ц鐜板満 checkpoint銆?
+        杩欏紶琛ㄨ褰曠殑鏄彲鎭㈠鎵ц鐜板満锛屼笉鏄墠绔睍绀洪暅鍍忥紱pending_action 浠嶇敱 agent_sessions 淇濆瓨锛?        浣?resume 鏍￠獙蹇呴』浠ヨ繖閲岀殑 pending_confirmation/status 涓哄噯銆?        """
         try:
             normalized_user_id = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
             normalized_session_id = str(session_id or '').strip()
@@ -2818,7 +4348,7 @@ class DatabaseService:
         error_summary: Optional[str] = None,
         clear_pending_confirmation: bool = False,
     ) -> bool:
-        """更新执行现场终态或过期态，避免旧 confirmation 被重复 resume。"""
+        """更新执行现场终态或过期状态，避免旧 confirmation 被重复 resume。"""
         try:
             normalized_user_id = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
             normalized_session_id = str(session_id or '').strip()
@@ -2846,10 +4376,7 @@ class DatabaseService:
             return False
 
     def expire_agent_runtime_checkpoints(self, *, now: Optional[str] = None) -> int:
-        """把超过 expires_at 的等待现场标记为 expired。
-
-        清理先改状态而不是直接删除，是为了让前端/日志能得到明确“过期”语义。
-        """
+        """把超过 expires_at 的等待现场标记为 expired，而不是直接删除。"""
         try:
             now_text = now or datetime.now(timezone.utc).isoformat()
             with self._get_connection() as conn:
@@ -2904,10 +4431,7 @@ class DatabaseService:
         metadata: Optional[Dict[str, Any]] = None,
         parent_checkpoint_id: Optional[str] = None,
     ) -> bool:
-        """保存 LangGraph 原始 checkpoint。
-
-        这里不解释业务语义，只负责把 LangGraph 恢复所需的快照落到 SQLite。
-        """
+        """保存 LangGraph 原始 checkpoint，只负责持久化恢复所需快照。"""
         try:
             normalized_thread_id = str(thread_id or '').strip()
             normalized_checkpoint_id = str(checkpoint_id or '').strip()
@@ -3317,11 +4841,11 @@ class DatabaseService:
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            # 一轮 QA 是业务上的最小一致性单元，显式开启事务以保证 user/assistant/session 统计同进同退。
+            # 涓€杞?QA 鏄笟鍔′笂鐨勬渶灏忎竴鑷存€у崟鍏冿紝鏄惧紡寮€鍚簨鍔′互淇濊瘉 user/assistant/session 缁熻鍚岃繘鍚岄€€銆?
             cursor.execute('BEGIN IMMEDIATE')
             cursor.execute(
                 '''
-                SELECT session_id, title FROM paper_chat_sessions
+                SELECT session_id, title, arxiv_id FROM paper_chat_sessions
                 WHERE session_id = ? AND user_id = ?
                 ''',
                 (normalized_session_id, normalized_user_id),
@@ -3381,7 +4905,7 @@ class DatabaseService:
             )
 
             if not str(session_row[1] or '').strip() and question:
-                # 首轮问题可作为会话标题，但必须和消息写入在同一事务内更新，避免标题和消息状态脱节。
+                # 棣栬疆闂鍙綔涓轰細璇濇爣棰橈紝浣嗗繀椤诲拰娑堟伅鍐欏叆鍦ㄥ悓涓€浜嬪姟鍐呮洿鏂帮紝閬垮厤鏍囬鍜屾秷鎭姸鎬佽劚鑺傘€?
                 cursor.execute(
                     '''
                     UPDATE paper_chat_sessions
@@ -3399,6 +4923,20 @@ class DatabaseService:
                 raise PaperQATurnPersistenceError(
                     f"paper qa turn write verification failed: session_id={normalized_session_id} turn_id={normalized_turn_id}"
                 )
+            if str(question or "").strip():
+                # QA 闂鏄急鍏磋叮淇″彿锛屽彧杩藉姞浜嬩欢骞剁瓑寰呭悗缁瀯寤轰换鍔℃秷璐癸紝閬垮厤闂瓟鍐欏叆琚敾鍍忕敓鎴愯€楁椂鎷栨參銆?
+                self.record_user_profile_event(
+                    user_id=normalized_user_id,
+                    event_type="qa_asked",
+                    source_type="paper_qa",
+                    source_id=user_message_id,
+                    action_type="qa_asked",
+                    arxiv_id=str(session_row[2] or "").strip(),
+                    session_id=normalized_session_id,
+                    metadata={"turn_id": normalized_turn_id, "question": str(question or "").strip()},
+                    include_in_profile=True,
+                    conn=conn,
+                )
             conn.commit()
             return {
                 'turn_id': normalized_turn_id,
@@ -3409,7 +4947,7 @@ class DatabaseService:
             }
         except Exception as exc:
             if conn is not None:
-                # 回滚发生在数据库访问层，调用方只需要处理明确的写入失败语义。
+                # 鍥炴粴鍙戠敓鍦ㄦ暟鎹簱璁块棶灞傦紝璋冪敤鏂瑰彧闇€瑕佸鐞嗘槑纭殑鍐欏叆澶辫触璇箟銆?
                 conn.rollback()
             logger.exception(
                 "Error appending paper QA turn: session_id=%s user_id=%s turn_id=%s",
@@ -3445,7 +4983,7 @@ class DatabaseService:
                 cursor = conn.cursor()
                 cursor.execute(
                     '''
-                    SELECT session_id, title FROM paper_chat_sessions
+                    SELECT session_id, title, arxiv_id FROM paper_chat_sessions
                     WHERE session_id = ? AND user_id = ?
                     ''',
                     (session_id, user_id),
@@ -3488,6 +5026,20 @@ class DatabaseService:
                         (str(content).strip()[:80], session_id),
                     )
 
+                if role == 'user' and str(content or '').strip():
+                    # 鍗曟秷鎭啓鍏ヨ矾寰勫悓鏍疯褰?qa_asked 浜嬩欢锛屽拰鍘熷瓙 turn 鍐欏叆淇濇寔璇佹嵁杈圭晫涓€鑷淬€?
+                    self.record_user_profile_event(
+                        user_id=user_id,
+                        event_type="qa_asked",
+                        source_type="paper_qa",
+                        source_id=message_id,
+                        action_type="qa_asked",
+                        arxiv_id=str(session_row[2] or "").strip(),
+                        session_id=session_id,
+                        metadata={"turn_id": normalized_turn_id, "question": str(content or "").strip()},
+                        include_in_profile=True,
+                        conn=conn,
+                    )
                 self._refresh_paper_chat_session_stats(conn, session_id)
                 conn.commit()
 
@@ -3592,6 +5144,24 @@ class DatabaseService:
                         1 if include_in_profile else 0,
                     ),
                 )
+                if include_in_profile:
+                    # 鍙湁鐢ㄦ埛鏄庣‘鍏佽杩涘叆鐢诲儚鐨勭瑪璁版墠杩涘叆鐢诲儚浜嬩欢灞傦紝閬垮厤鏅€氱鏈夌瑪璁版薄鏌撻暱鏈熷亸濂借瘉鎹€?
+                    self.record_user_profile_event(
+                        user_id=user_id,
+                        event_type="note_saved",
+                        source_type="paper_note",
+                        source_id=normalized_note_id,
+                        action_type="note_saved",
+                        arxiv_id=arxiv_id,
+                        note_id=normalized_note_id,
+                        payload={
+                            "title": title,
+                            "note_type": normalized_note_type,
+                            "tags": normalized_tags,
+                            "source_chunk_ids": normalized_chunk_ids,
+                        },
+                        conn=conn,
+                    )
                 conn.commit()
 
             return self.get_paper_note(normalized_note_id, user_id=user_id)
@@ -3657,7 +5227,7 @@ class DatabaseService:
             return []
 
     def list_user_profile_notes(self, user_id: str = DEFAULT_USER_ID) -> List[Dict[str, Any]]:
-        """列出某个用户明确允许进入研究画像的笔记，供画像生成器聚合长期证据。"""
+        """列出用户明确允许进入研究画像的笔记，供画像生成器聚合长期证据。"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -3736,7 +5306,24 @@ class DatabaseService:
                 if cursor.rowcount <= 0:
                     return None
 
-            return self.get_paper_note(note_id, user_id=user_id)
+            updated_note = self.get_paper_note(note_id, user_id=user_id)
+            if updated_note and updated_note.get("include_in_profile"):
+                # 绗旇鏇存柊鍚庝粛绾冲叆鐢诲儚鏃惰褰曟柊浜嬩欢锛屼繚鐣欓噸寤烘椂鍙拷婧殑鐢ㄦ埛缂栬緫璇佹嵁銆?
+                self.record_user_profile_event(
+                    user_id=user_id,
+                    event_type="note_saved",
+                    source_type="paper_note",
+                    source_id=note_id,
+                    action_type="note_saved",
+                    arxiv_id=str(updated_note.get("arxiv_id") or "").strip(),
+                    note_id=note_id,
+                    payload={
+                        "title": updated_note.get("title"),
+                        "note_type": updated_note.get("note_type"),
+                        "tags": updated_note.get("tags") or [],
+                    },
+                )
+            return updated_note
         except Exception as e:
             logger.error(f"Error updating paper note: {str(e)}")
             return None

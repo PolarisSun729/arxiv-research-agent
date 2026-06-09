@@ -27,12 +27,46 @@ export interface UserResearchProfile {
   positive_topics: string[]
   negative_topics: string[]
   recent_topics: string[]
+  pinned_topics?: string[]
+  hidden_topics?: string[]
   preferred_categories: string[]
   preferred_answer_style: string
   common_question_types: string[]
   representative_papers: string[]
+  canonical_topics?: Array<Record<string, any>>
+  canonical_negative_topics?: Array<Record<string, any>>
+  canonical_recent_topics?: Array<Record<string, any>>
+  topic_evidence?: Record<string, any>
+  aggregation_report?: Record<string, any>
+  review_status?: Record<string, any>
+  quality_report?: Record<string, any>
+  snapshot_id?: string | null
   created_at?: string | null
   updated_at?: string | null
+}
+
+export interface UserProfileBuildJob {
+  job_id: string
+  user_id?: string
+  status: string
+  snapshot_id?: string | null
+  current_stage?: string | null
+  progress?: number
+  error_message?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface UserResearchProfileDetail {
+  user_id: string
+  manual_profile: UserResearchProfile
+  generated_profile: UserResearchProfile
+  effective_profile: UserResearchProfile
+  evidence_summary?: Record<string, any>
+  quality_report?: Record<string, any>
+  build_jobs: UserProfileBuildJob[]
+  snapshots: Array<Record<string, any>>
+  latest_build_job?: UserProfileBuildJob | null
 }
 
 export interface UserPaperAction {
@@ -92,6 +126,9 @@ export interface Paper {
   matched_terms?: string[]
   personalized_reason?: string | null
   match_reason?: string | null
+  profile_reasons?: string[]
+  profile_match_details?: Array<Record<string, any>>
+  profile_match_score?: number
   priority?: number
 }
 
