@@ -617,7 +617,16 @@ def test_plan_executor_paper_qa_calls_real_answer_tool_once_and_preserves_debug(
                 "ok": True,
                 "tool_name": tool_name,
                 "summary": "answered",
-                "data": {"answer": "grounded answer", "sources": [{"chunk_id": "c1"}], "retrieval_debug": {"stages": {"rerank": {"count": 1}}}},
+                "data": {
+                    "answer": "grounded answer",
+                    "sources": [{"chunk_id": "c1"}],
+                    "retrieval_debug": {"stages": {"rerank": {"count": 1}}},
+                    "qa_observation": {
+                        "schema_version": "paper_qa_observation_v1",
+                        "retrieval_quality": "good",
+                        "recommended_repair_actions": [],
+                    },
+                },
                 "trace": {"tool_name": tool_name},
                 "error": None,
             }
@@ -634,9 +643,150 @@ def test_plan_executor_paper_qa_calls_real_answer_tool_once_and_preserves_debug(
     assert answer_calls == [{"arxiv_id": "2401.00001", "question": "what is the method?"}]
     assert result.outputs["paper_qa_result"]["sources"] == [{"chunk_id": "c1"}]
     assert result.outputs["paper_qa_result"]["retrieval_debug"] == {"stages": {"rerank": {"count": 1}}}
+    assert result.outputs["paper_qa_result"]["qa_observation"]["retrieval_quality"] == "good"
     pseudo_steps = {"retrieve_paper_chunks", "rewrite_paper_query", "rerank_paper_chunks", "validate_qa_evidence", "generate_paper_answer", "verify_answer_grounding"}
     assert not pseudo_steps.intersection({step.tool_name for step in result.plan.steps})
     assert not pseudo_steps.intersection({trace.step_id for trace in result.trace})
+    quality_traces = [trace for trace in result.trace if trace.event == "paper_qa_quality_decision"]
+    assert quality_traces
+    assert quality_traces[-1].detail["paper_qa_quality_trace"]["final_decision"] == "finalize"
+    assert quality_traces[-1].detail["paper_qa_quality_trace"]["repair_attempted"] is False
+
+
+def test_plan_executor_paper_qa_repairs_insufficient_evidence_and_records_quality_diff(monkeypatch) -> None:
+    answer_calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        if tool_name == "check_paper_qa_index":
+            return {
+                "ok": True,
+                "tool_name": tool_name,
+                "summary": "available",
+                "data": {"status": "available", "has_index": True},
+                "trace": {"tool_name": tool_name},
+                "error": None,
+            }
+        if tool_name == "answer_paper_question":
+            answer_calls.append(dict(kwargs))
+            if len(answer_calls) == 1:
+                return {
+                    "ok": True,
+                    "tool_name": tool_name,
+                    "summary": "answered",
+                    "data": {
+                        "answer": "当前证据不足。",
+                        "sources": [{"chunk_id": "weak-1"}],
+                        "retrieval_debug": {"route": "hybrid"},
+                        "qa_observation": {
+                            "schema_version": "paper_qa_observation_v1",
+                            "retrieval_quality": "weak",
+                            "answer_quality": "insufficient_evidence",
+                            "answer_quality_reason": "verification_insufficient_evidence",
+                            "answer_insufficient_evidence": "yes",
+                            "recommended_repair_actions": ["retry_with_expanded_context"],
+                            "source_count": 1,
+                        },
+                    },
+                    "trace": {"tool_name": tool_name},
+                    "error": None,
+                }
+            return {
+                "ok": True,
+                "tool_name": tool_name,
+                "summary": "answered",
+                "data": {
+                    "answer": "grounded repaired answer",
+                    "sources": [{"chunk_id": "strong-1"}, {"chunk_id": "strong-2"}],
+                    "retrieval_debug": {"route": "hybrid", "repair": True},
+                    "qa_observation": {
+                        "schema_version": "paper_qa_observation_v1",
+                        "retrieval_quality": "good",
+                        "answer_quality": "grounded",
+                        "answer_insufficient_evidence": "no",
+                        "recommended_repair_actions": [],
+                        "source_count": 2,
+                    },
+                },
+                "trace": {"tool_name": tool_name},
+                "error": None,
+            }
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    state = AgentState(intent="paper_qa", message="what is the method?", context={"selected_paper": {"arxiv_id": "2401.00001"}})
+    _, plan, _ = planner_module.build_executable_plan(state)
+    result = PlanExecutor().execute(plan, state)
+
+    assert result.status == "success"
+    assert result.final_answer == "grounded repaired answer"
+    assert len(answer_calls) == 2
+    assert answer_calls[1]["qa_recovery_strategy"]["repair_actions"] == ["retry_with_expanded_context"]
+    replan_trace = next(trace for trace in result.trace if trace.event == "plan_replanned" and trace.detail.get("paper_qa_repair_trace"))
+    assert replan_trace.detail["paper_qa_repair_trace"]["selected_repair_action"] == "retry_with_expanded_context"
+    quality_trace = [trace for trace in result.trace if trace.event == "paper_qa_quality_decision"][-1].detail["paper_qa_quality_trace"]
+    assert quality_trace["repair_attempted"] is True
+    assert quality_trace["retrieval_quality_before"] == "weak"
+    assert quality_trace["retrieval_quality_after"] == "good"
+    assert quality_trace["answer_insufficient_evidence_before"] == "yes"
+    assert quality_trace["answer_insufficient_evidence_after"] == "no"
+    assert quality_trace["sources_before"] == ["weak-1"]
+    assert quality_trace["sources_after"] == ["strong-1", "strong-2"]
+    assert quality_trace["final_decision"] == "finalize"
+
+
+def test_plan_executor_paper_qa_repair_limit_returns_conservative_fallback(monkeypatch) -> None:
+    answer_calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        if tool_name == "check_paper_qa_index":
+            return {
+                "ok": True,
+                "tool_name": tool_name,
+                "summary": "available",
+                "data": {"status": "available", "has_index": True},
+                "trace": {"tool_name": tool_name},
+                "error": None,
+            }
+        if tool_name == "answer_paper_question":
+            answer_calls.append(dict(kwargs))
+            return {
+                "ok": True,
+                "tool_name": tool_name,
+                "summary": "answered",
+                "data": {
+                    "answer": "当前证据仍不足。",
+                    "sources": [{"chunk_id": f"weak-{len(answer_calls)}"}],
+                    "retrieval_debug": {"route": "hybrid"},
+                    "qa_observation": {
+                        "schema_version": "paper_qa_observation_v1",
+                        "retrieval_quality": "weak",
+                        "retrieval_quality_reason": "source_chunks_too_few:1",
+                        "answer_quality": "insufficient_evidence",
+                        "answer_quality_reason": "verification_insufficient_evidence",
+                        "answer_insufficient_evidence": "yes",
+                        "recommended_repair_actions": ["retry_with_expanded_context"],
+                        "source_count": 1,
+                    },
+                },
+                "trace": {"tool_name": tool_name},
+                "error": None,
+            }
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    state = AgentState(intent="paper_qa", message="what is the method?", context={"selected_paper": {"arxiv_id": "2401.00001"}})
+    _, plan, _ = planner_module.build_executable_plan(state)
+    result = PlanExecutor().execute(plan, state)
+
+    assert result.status == "fallback"
+    assert len(answer_calls) == 3
+    assert "无法给出足够可靠的论文回答" in result.final_answer
+    assert any(trace.event == "replan_limit_exceeded" for trace in result.trace)
+    fallback_trace = next(trace for trace in result.trace if trace.event == "replan_fallback")
+    assert fallback_trace.detail["paper_qa_final_decision"]["final_decision"] == "fallback"
+    assert fallback_trace.detail["paper_qa_final_decision"]["max_repair_limit_triggered"] is True
 
 
 def test_plan_executor_replans_empty_profile_to_message_recommendation(monkeypatch) -> None:

@@ -822,6 +822,7 @@ export interface QaResult {
   interrupted_reason?: string | null
   persistence_status?: QaStreamPersistenceStatus
   retrieval_debug?: RetrievalDebug | null
+  qa_observation?: QaObservation | null
   sources: Array<{
     content: string
     page_number: string
@@ -1105,7 +1106,30 @@ export interface RetrievalDebug {
   final_chunks: RetrievalDebugChunk[]
   config?: Record<string, any>
   fusion?: Record<string, any>
+  qa_observation?: QaObservation
   trace_export?: Record<string, string>
+}
+
+export interface QaObservationStageStatus {
+  enabled: boolean | 'unknown'
+  status: string
+  fallback: boolean | 'unknown'
+  reason: string
+}
+
+export interface QaObservation {
+  schema_version: string
+  retrieval_quality: 'good' | 'partial' | 'weak' | 'failed' | 'unknown' | string
+  retrieval_stage_status: Record<string, QaObservationStageStatus>
+  missing_evidence_type: string
+  weak_source_reason: string
+  rerank_failed_reason: string
+  answer_insufficient_evidence: 'yes' | 'no' | 'unknown' | string
+  recommended_repair_actions: string[]
+  source_count?: number
+  error_code?: string
+  error_stage?: string
+  observation_reason?: string
 }
 
 export async function qaPaper(arxivId: string, question: string, options: QaRequestOptions = {}): Promise<QaResult> {
@@ -1210,6 +1234,7 @@ type QaStreamMetaPayload = {
   question_contextualization?: Record<string, any> | null
   sources: QaStreamSource[]
   retrieval_debug?: RetrievalDebug | null
+  qa_observation?: QaObservation | null
 }
 
 type QaStreamDonePayload = QaStreamMetaPayload & {
@@ -1291,6 +1316,7 @@ function applyQaStreamPayload(
   target: {
     sources: QaStreamSource[]
     retrievalDebug: RetrievalDebug | null
+    qaObservation: QaObservation | null
     sessionId: string
     chatSession: PaperChatSession | null
     originalQuestion: string
@@ -1304,6 +1330,9 @@ function applyQaStreamPayload(
   }
   if (payload.retrieval_debug) {
     target.retrievalDebug = payload.retrieval_debug
+  }
+  if (payload.qa_observation) {
+    target.qaObservation = payload.qa_observation
   }
   if (typeof payload.session_id === 'string' && payload.session_id) {
     target.sessionId = payload.session_id
@@ -1367,6 +1396,7 @@ export async function qaPaperStream(
   const finalState = {
     sources: [] as QaStreamSource[],
     retrievalDebug: null as RetrievalDebug | null,
+    qaObservation: null as QaObservation | null,
     sessionId: options.session_id || '',
     chatSession: null as PaperChatSession | null,
     originalQuestion: question,
@@ -1398,6 +1428,7 @@ export async function qaPaperStream(
       interrupted_reason: interruptedReason,
       persistence_status: persistenceStatus,
       sources: finalState.sources,
+      qa_observation: finalState.qaObservation,
       retrieval_debug: finalState.retrievalDebug
     }
   }

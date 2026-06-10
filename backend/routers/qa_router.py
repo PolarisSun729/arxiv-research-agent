@@ -34,6 +34,7 @@ from dependencies import (
 )
 from core.errors import AppError, ErrorCode, error_response
 from routers.qa_utils import build_qa_diagnostic, get_latest_retrieval_trace, sanitize_trace_slug
+from services.paper_qa.qa_observation import build_error_qa_observation, build_qa_observation
 from utils.config import get_default_user_id, get_qa_index_job_runtime_config
 
 logger = logging.getLogger(__name__)
@@ -760,6 +761,8 @@ async def qa_paper_stream(
         2. delta：模型逐段生成答案；
         3. done / error：结束态事件。
         """
+        retrieval_debug = None
+        source_payload: List[Dict[str, Any]] = []
         try:
             # 上下文构建也放在 SSE 生成器内，确保未建索引、检索异常等前置失败能返回统一 error 事件。
             _, search_results, qa_context, retrieval_debug = paper_qa_service.build_qa_context(arxiv_id, payload)
@@ -768,6 +771,11 @@ async def qa_paper_stream(
             contextualized_question = str(qa_context.get("generation_question", question) or question).strip() or question
             question_contextualization = qa_context.get("question_contextualization", {}) or {}
             chat_session = qa_context.get("chat_session", {}) or {}
+            # meta 阶段尚未生成答案，因此观察结构只代表当前检索/证据候选状态。
+            qa_observation = build_qa_observation(
+                retrieval_debug=retrieval_debug if isinstance(retrieval_debug, dict) else None,
+                sources=source_payload,
+            )
 
             yield sse_event(
                 "meta",
@@ -784,6 +792,7 @@ async def qa_paper_stream(
                     "sources": source_payload,
                     "image_inputs": qa_context["image_inputs"],
                     "asset_metadata": qa_context["asset_metadata"],
+                    "qa_observation": qa_observation,
                     "retrieval_debug": retrieval_debug,
                 },
             )
@@ -816,6 +825,13 @@ async def qa_paper_stream(
                         final_answer = verifier.apply_answer_guardrail(final_answer, verification_debug)
                     if isinstance(retrieval_debug, dict):
                         retrieval_debug["verification"] = verification_debug
+                    qa_observation = build_qa_observation(
+                        retrieval_debug=retrieval_debug if isinstance(retrieval_debug, dict) else None,
+                        sources=source_payload,
+                        verification_result=verification_debug,
+                    )
+                    if isinstance(retrieval_debug, dict):
+                        retrieval_debug["qa_observation"] = qa_observation
                     # 回答生成结束后，把本轮问答、来源和调试快照统一持久化，
                     # 这样后续会话恢复、笔记关联、问题追踪都有完整上下文。
                     persisted_turn = paper_qa_service.persist_completed_turn(
@@ -843,6 +859,7 @@ async def qa_paper_stream(
                             "image_inputs": qa_context["image_inputs"],
                             "asset_metadata": qa_context["asset_metadata"],
                             "verification_debug": verification_debug,
+                            "qa_observation": qa_observation,
                             "retrieval_debug": retrieval_debug,
                             "usage": chunk.get("usage"),
                         },
@@ -860,6 +877,13 @@ async def qa_paper_stream(
                 fallback_answer = verifier.apply_answer_guardrail("", verification_debug)
                 if isinstance(retrieval_debug, dict):
                     retrieval_debug["verification"] = verification_debug
+            qa_observation = build_qa_observation(
+                retrieval_debug=retrieval_debug if isinstance(retrieval_debug, dict) else None,
+                sources=source_payload,
+                verification_result=verification_debug,
+            )
+            if isinstance(retrieval_debug, dict):
+                retrieval_debug["qa_observation"] = qa_observation
             yield sse_event(
                 "done",
                 {
@@ -875,6 +899,7 @@ async def qa_paper_stream(
                     "image_inputs": qa_context["image_inputs"],
                     "asset_metadata": qa_context["asset_metadata"],
                     "verification_debug": verification_debug,
+                    "qa_observation": qa_observation,
                     "retrieval_debug": retrieval_debug,
                     "usage": None,
                 },
@@ -893,11 +918,18 @@ async def qa_paper_stream(
             yield sse_event("error", exc.to_payload())
         except Exception as exc:
             logger.exception("Error in QA stream: arxiv_id=%s code=%s", arxiv_id, ErrorCode.LLM_GENERATION_FAILED)
+            qa_observation = build_error_qa_observation(
+                error_code=ErrorCode.LLM_GENERATION_FAILED,
+                error_stage="qa_stream",
+                error_reason=str(exc),
+                retrieval_debug=retrieval_debug if isinstance(retrieval_debug, dict) else None,
+                sources=source_payload,
+            )
             # SSE 场景下不能直接抛异常中断连接，因此把错误包装成统一 error 事件返回。
             stream_error = AppError(
                 ErrorCode.LLM_GENERATION_FAILED,
-                detail=exc,
-                context={"arxiv_id": arxiv_id, "user_id": payload.user_id, "session_id": payload.session_id, "stage": "qa_stream"},
+                detail={"detail": exc, "qa_observation": qa_observation},
+                context={"arxiv_id": arxiv_id, "user_id": payload.user_id, "session_id": payload.session_id, "stage": "qa_stream", "qa_observation": qa_observation},
             )
             yield sse_event("error", stream_error.to_payload())
 

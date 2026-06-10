@@ -45,6 +45,7 @@ def _build_paper_qa_result_from_observation(state: AgentState) -> Optional[Dict[
         "answer": answer,
         "sources": (data or {}).get("sources", []),
         "retrieval_debug": (data or {}).get("retrieval_debug"),
+        "qa_observation": (data or {}).get("qa_observation"),
         "qa_index_status": (state.debug or {}).get("qa_index_status"),
         "index_created": bool((state.debug or {}).get("index_created")),
         "error": None,

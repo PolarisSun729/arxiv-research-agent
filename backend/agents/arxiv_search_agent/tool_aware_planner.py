@@ -66,6 +66,7 @@ class ToolCandidateSelector:
             "resolve_paper",
             "check_paper_index",
             "answer_paper_question",
+            "assess_paper_qa_quality",
             "request_confirmation",
             "parse_and_index_paper",
         },
@@ -688,6 +689,7 @@ class RuleBasedToolAwarePlanBuilder:
             return self._build_unclear(goal, state, context, tools_by_name)
         check_index = self._require_tool(tools_by_name, "check_paper_index", required_tags={"validate", "retrieve"})
         answer = self._require_tool(tools_by_name, "answer_paper_question", required_tags={"answer"})
+        assess_quality = self._require_tool(tools_by_name, "assess_paper_qa_quality", required_tags={"validate", "answer"})
         has_selected_paper = bool(_get_selected_paper_hint(context))
         answer_shape = _paper_qa_draft_answer_shape(goal.intent or state.intent)
         steps = [
@@ -728,6 +730,17 @@ class RuleBasedToolAwarePlanBuilder:
                     _binding_dict("paper_ref", source_type="step_output", step_id="resolve_paper"),
                     _binding_dict("message", source_type="state", source_key="message"),
                     _binding_dict("qa_mode", source_type="literal", value=answer_shape["qa_mode"], required=False),
+                ],
+            ),
+            self._draft_step(
+                "assess_paper_qa_quality",
+                assess_quality,
+                action_type="validate",
+                output_key="paper_qa_quality_decision",
+                reason="Paper QA 工具成功只代表调用完成；必须显式读取 qa_observation 决定直接完成、修复或兜底。",
+                depends_on=[answer_shape["step_id"]],
+                input_bindings=[
+                    _binding_dict("paper_qa_result", source_type="step_output", step_id=answer_shape["step_id"]),
                 ],
             ),
         ]
@@ -1263,16 +1276,19 @@ def _validate_required_llm_sequence(goal: Goal, steps: Sequence[PlanDraftStep]) 
     reasons: List[str] = []
 
     if goal_type == "paper_qa":
-        required_tools = ["resolve_paper", "check_paper_index", "answer_paper_question"]
+        required_tools = ["resolve_paper", "check_paper_index", "answer_paper_question", "assess_paper_qa_quality"]
         for tool_name in required_tools:
             if tool_name not in tool_names:
                 reasons.append(f"paper_qa plan missing required tool {tool_name}")
         reasons.extend(_validate_order(tool_names, required_tools, "paper_qa"))
         answer_step = _find_step_by_tool(steps, "answer_paper_question")
+        quality_step = _find_step_by_tool(steps, "assess_paper_qa_quality")
         if answer_step and not _depends_on_tool(answer_step, steps, "resolve_paper"):
             reasons.append("paper_qa answer_paper_question must depend on resolve_paper")
         if answer_step and not _depends_on_tool(answer_step, steps, "check_paper_index"):
             reasons.append("paper_qa answer_paper_question must depend on check_paper_index")
+        if quality_step and not _depends_on_tool(quality_step, steps, "answer_paper_question"):
+            reasons.append("paper_qa assess_paper_qa_quality must depend on answer_paper_question")
 
     if goal_type == "preference_action":
         if "update_preference_store" in tool_names:
@@ -1352,7 +1368,7 @@ def _validate_required_executable_sequence(goal: Goal, steps: Sequence[PlanStep]
     tool_names = [str(step.tool_name or "").strip() for step in list(steps or [])]
     reasons: List[str] = []
     if goal_type == "paper_qa" and "answer_paper_question" in tool_names:
-        for tool_name in ("resolve_paper", "check_paper_index"):
+        for tool_name in ("resolve_paper", "check_paper_index", "assess_paper_qa_quality"):
             if tool_name not in tool_names:
                 reasons.append(f"paper_qa plan missing required tool {tool_name}")
     if goal_type == "preference_action" and "update_preference_store" in tool_names:

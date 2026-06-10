@@ -2,8 +2,26 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 
+from services.paper_qa.repair_actions import (
+    ASK_USER_TO_REBUILD_INDEX,
+    RETRY_WITH_EXPANDED_CONTEXT,
+    RETRY_WITH_KEYWORD_EMPHASIS,
+    RETRY_WITH_QUERY_REWRITE,
+    RETRY_WITH_SECTION_FOCUS,
+    build_repair_strategy_payload,
+    normalize_repair_actions,
+)
+
 from .schemas import FailureCategory, ObservationResult, PlanRuntime, PlanStep, RecoveryCandidate
 from .state import AgentState
+
+
+def _paper_qa_repair_actions(observation: ObservationResult, defaults: Sequence[str]) -> List[str]:
+    """从质量门 evidence 读取受控 repair actions；缺失时使用策略默认值。"""
+    evidence = observation.evidence or {}
+    repair_strategy = evidence.get("repair_strategy") if isinstance(evidence.get("repair_strategy"), dict) else {}
+    raw_actions = repair_strategy.get("repair_actions") or evidence.get("repair_actions") or defaults
+    return normalize_repair_actions(raw_actions)
 
 
 class RecoveryPolicy(Protocol):
@@ -106,6 +124,11 @@ class PaperIndexMissingRecoveryPolicy(_BaseRecoveryPolicy):
                 target_step_id=step.step_id,
                 required_tools=["request_confirmation", "parse_and_index_paper"],
                 patch_strategy="inject_index_confirmation_chain",
+                strategy_payload=build_repair_strategy_payload(
+                    actions=[ASK_USER_TO_REBUILD_INDEX],
+                    reason=observation.reason or "paper_index_rebuild_confirmation",
+                    observation=observation.evidence or {},
+                ),
                 risk_level="high",
                 requires_confirmation=True,
                 max_attempts=1,
@@ -145,10 +168,11 @@ class EmptyUserProfileRecoveryPolicy(_BaseRecoveryPolicy):
 class QaNoAnswerRecoveryPolicy(_BaseRecoveryPolicy):
     policy_name = "qa_no_answer_recovery_policy"
     failure_categories = ("qa_no_answer",)
-    tool_names = ("answer_paper_question",)
+    tool_names = ("answer_paper_question", "assess_paper_qa_quality")
 
     def build_candidates(self, *, step: PlanStep, observation: ObservationResult, runtime: PlanRuntime, state: Optional[AgentState] = None) -> List[RecoveryCandidate]:
         del runtime, state
+        repair_actions = _paper_qa_repair_actions(observation, [RETRY_WITH_QUERY_REWRITE, RETRY_WITH_EXPANDED_CONTEXT])
         return [
             RecoveryCandidate(
                 candidate_id=f"{step.step_id}:retry_qa_with_more_top_k",
@@ -160,12 +184,11 @@ class QaNoAnswerRecoveryPolicy(_BaseRecoveryPolicy):
                 target_step_id=step.step_id,
                 required_tools=["answer_paper_question"],
                 patch_strategy="retry_step_with_adjusted_arguments",
-                strategy_payload={
-                    "strategy_name": "retry_qa_with_more_top_k",
-                    "retrieval_top_k": 30,
-                    "evidence_query": "expand_question_terms",
-                    "grounding_required": True,
-                },
+                strategy_payload=build_repair_strategy_payload(
+                    actions=repair_actions,
+                    reason=observation.reason or "qa_no_answer",
+                    observation=(observation.evidence or {}).get("qa_observation") or {},
+                ),
                 risk_level="medium",
                 requires_confirmation=False,
                 max_attempts=1,
@@ -194,10 +217,14 @@ class QaNoAnswerRecoveryPolicy(_BaseRecoveryPolicy):
 class QaNoSourcesRecoveryPolicy(_BaseRecoveryPolicy):
     policy_name = "qa_no_sources_recovery_policy"
     failure_categories = ("qa_no_sources", "qa_low_grounding")
-    tool_names = ("answer_paper_question",)
+    tool_names = ("answer_paper_question", "assess_paper_qa_quality")
 
     def build_candidates(self, *, step: PlanStep, observation: ObservationResult, runtime: PlanRuntime, state: Optional[AgentState] = None) -> List[RecoveryCandidate]:
         del runtime, state
+        repair_actions = _paper_qa_repair_actions(
+            observation,
+            [RETRY_WITH_SECTION_FOCUS, RETRY_WITH_EXPANDED_CONTEXT, RETRY_WITH_KEYWORD_EMPHASIS],
+        )
         return [
             RecoveryCandidate(
                 candidate_id=f"{step.step_id}:force_source_grounded_answer",
@@ -209,13 +236,11 @@ class QaNoSourcesRecoveryPolicy(_BaseRecoveryPolicy):
                 target_step_id=step.step_id,
                 required_tools=["answer_paper_question"],
                 patch_strategy="retry_step_with_adjusted_arguments",
-                strategy_payload={
-                    "strategy_name": "force_source_grounded_answer",
-                    "force_sources": True,
-                    "retrieval_top_k": 30,
-                    "route": "keyword_and_section",
-                    "grounding_required": True,
-                },
+                strategy_payload=build_repair_strategy_payload(
+                    actions=repair_actions,
+                    reason=observation.reason or "qa_low_grounding",
+                    observation=(observation.evidence or {}).get("qa_observation") or {},
+                ),
                 risk_level="medium",
                 requires_confirmation=False,
                 max_attempts=1,
@@ -244,7 +269,7 @@ class QaNoSourcesRecoveryPolicy(_BaseRecoveryPolicy):
 class PaperIndexStaleOrCorruptedRecoveryPolicy(_BaseRecoveryPolicy):
     policy_name = "paper_index_stale_or_corrupted_recovery_policy"
     failure_categories = ("paper_index_stale", "paper_index_corrupted")
-    tool_names = ("check_paper_index",)
+    tool_names = ("check_paper_index", "assess_paper_qa_quality")
 
     def build_candidates(self, *, step: PlanStep, observation: ObservationResult, runtime: PlanRuntime, state: Optional[AgentState] = None) -> List[RecoveryCandidate]:
         del runtime, state

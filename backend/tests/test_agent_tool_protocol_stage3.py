@@ -263,6 +263,41 @@ class AgentToolProtocolStage3Tests(unittest.TestCase):
         self.assertEqual(runtime_steps["step_2"]["last_tool_observation"]["tool_name"], "search_arxiv_structured")
         self.assertEqual(runtime_steps["step_2"]["last_tool_observation"]["status"], "failed")
 
+    def test_paper_qa_tool_observation_uses_quality_summary(self) -> None:
+        insufficient_details = tool_module._derive_observation_details(
+            "answer_paper_question",
+            {
+                "ok": True,
+                "data": {
+                    "answer": "guarded answer",
+                    "qa_observation": {
+                        "answer_quality": "insufficient_evidence",
+                        "answer_insufficient_evidence": "yes",
+                        "recommended_repair_actions": ["retry_with_expanded_context"],
+                    },
+                },
+            },
+        )
+        degraded_details = tool_module._derive_observation_details(
+            "answer_paper_question",
+            {
+                "ok": True,
+                "data": {
+                    "answer": "grounded answer",
+                    "qa_observation": {
+                        "retrieval_quality": "partial",
+                        "degraded_stages": ["rerank"],
+                        "recommended_repair_actions": ["retry_with_query_rewrite"],
+                    },
+                },
+            },
+        )
+
+        self.assertFalse(insufficient_details["is_sufficient"])
+        self.assertEqual(insufficient_details["next_action_hint"], "retry_with_expanded_context")
+        self.assertTrue(degraded_details["is_sufficient"])
+        self.assertEqual(degraded_details["next_action_hint"], "retry_with_query_rewrite")
+
     def test_tool_failure_still_allows_final_response_generation(self) -> None:
         state = AgentState(
             intent="arxiv_search",
@@ -386,11 +421,7 @@ class AgentToolProtocolStage3Tests(unittest.TestCase):
         self.assertEqual(result.preference_action_result["label"], "liked")
         self.assertEqual(result.tool_observations[-1].tool_name, "record_paper_preference")
 
-    def test_recommendation_intent_runs_unified_turn_runtime(self) -> None:
-        def parse(state, generation_service=None):
-            del generation_service
-            return _visit(state, "parse_search_request", intent="recommendation")
-
+    def test_run_agent_turn_compatibility_node_applies_runtime_result(self) -> None:
         def fake_run_agent_turn(state):
             self.assertEqual(_coerce_agent_state(state).intent, "recommendation")
             return _MODULES["schemas"].AgentTurnResult(
@@ -400,17 +431,16 @@ class AgentToolProtocolStage3Tests(unittest.TestCase):
                 trace=[],
             )
 
-        with mock.patch.object(graph_module, "parse_search_request", side_effect=parse), mock.patch.object(
+        with mock.patch.object(
             graph_module,
             "run_agent_turn_in_graph",
             side_effect=fake_run_agent_turn,
         ):
-            graph = build_arxiv_search_graph()
-            result = graph.invoke(AgentState(message="给我推荐一些论文").model_dump())
+            result_state = graph_module.run_agent_turn_node(AgentState(intent="recommendation", message="给我推荐一些论文"))
 
-        self.assertEqual(result["answer"], "recommended papers")
-        self.assertEqual(result["debug"]["visited"], ["parse_search_request"])
-        self.assertEqual(result["steps"][-1].step, "run_agent_turn")
+        self.assertEqual(result_state.answer, "recommended papers")
+        self.assertEqual(result_state.debug["agent_turn"]["status"], "success")
+        self.assertEqual(len(result_state.papers), 1)
 
 
 if __name__ == "__main__":

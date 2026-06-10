@@ -112,6 +112,8 @@ class AppError(Exception):
     ) -> None:
         self.code = code
         self.message = message or ERROR_MESSAGES.get(code, ERROR_MESSAGES[ErrorCode.UNKNOWN_ERROR])
+        # detail 对外会被压缩成短文本；原始 detail 单独保留，用来透传结构化观察信息等白名单字段。
+        self.raw_detail = detail
         self.detail = sanitize_detail(detail)
         self.recoverable = RECOVERABLE_DEFAULTS.get(code, True) if recoverable is None else bool(recoverable)
         self.status_code = status_code or ERROR_HTTP_STATUS.get(code, 500)
@@ -119,12 +121,21 @@ class AppError(Exception):
         super().__init__(self.message)
 
     def to_payload(self) -> Dict[str, Any]:
-        return make_error_payload(
+        payload = make_error_payload(
             code=self.code,
             message=self.message,
             detail=self.detail,
             recoverable=self.recoverable,
         )
+        qa_observation = None
+        if isinstance(self.raw_detail, dict):
+            qa_observation = self.raw_detail.get("qa_observation")
+        if qa_observation is None and isinstance(self.context, dict):
+            qa_observation = self.context.get("qa_observation")
+        if qa_observation is not None:
+            # Paper QA 失败时 Agent 需要结构化读取质量原因，不能只依赖 detail 文本。
+            payload["qa_observation"] = qa_observation
+        return payload
 
     def to_response(self) -> JSONResponse:
         return JSONResponse(status_code=self.status_code, content=self.to_payload())

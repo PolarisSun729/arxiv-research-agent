@@ -32,6 +32,8 @@ from .tool_adapters.clarification import (
 )
 from .tool_adapters.models import ToolError
 from .tool_adapters.paper_qa import (
+    AssessPaperQAQualityAdapter,
+    AssessPaperQAQualityInput,
     AnswerPaperQuestionAdapter,
     AnswerPaperQuestionInput,
     CheckPaperIndexAdapter,
@@ -39,6 +41,7 @@ from .tool_adapters.paper_qa import (
     IndexBuildOutput,
     PaperIndexStatusOutput,
     PaperQAAnswerOutput,
+    PaperQAQualityDecisionOutput,
     PaperReferenceOutput,
     ParseAndIndexPaperAdapter,
     ParseAndIndexPaperInput,
@@ -315,6 +318,7 @@ for contract in [
     _contract("request_confirmation", description="生成等待用户确认的结构化状态。", capability_tags=["clarify", "confirm"], input_schema={"pending_action": "dict"}, output_schema={"status": "str", "pending_action": "dict"}, side_effect_level="session_write", implementation="clarification.RequestConfirmationAdapter", input_model=RequestConfirmationInput, output_model=ConfirmationStatusOutput, error_model=ToolError, confirmation_policy={"mode": "explicit_user_confirmation_required"}, adapter=RequestConfirmationAdapter()),
     _contract("parse_and_index_paper", description="调用 Paper QA 索引构建工具解析并索引目标论文。", capability_tags=["retrieve", "index"], input_schema={"paper_reference": "dict"}, output_schema={"status": "str", "tool_result": "dict"}, side_effect_level="external_call", requires_confirmation=True, failure_modes=["paper_not_found", "index_build_failed"], implementation="paper_qa.ParseAndIndexPaperAdapter", backend_tool_name="build_paper_qa_index", input_model=ParseAndIndexPaperInput, output_model=IndexBuildOutput, error_model=ToolError, recovery_policy=_default_recovery("request_confirmation", "retry_step"), confirmation_policy={"mode": "explicit_user_confirmation_required", "reason": "external_index_build"}, adapter=ParseAndIndexPaperAdapter(invoke_backend_tool)),
     _contract("answer_paper_question", description="调用真实 PaperQAService 回答目标论文问题。", capability_tags=["answer"], input_schema={"paper_ref": "dict", "message": "str"}, output_schema={"paper_qa_result": "dict"}, side_effect_level="external_call", implementation="paper_qa.AnswerPaperQuestionAdapter", backend_tool_name="answer_paper_question", input_model=AnswerPaperQuestionInput, output_model=PaperQAAnswerOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step", "patch_plan", "fallback_answer"), adapter=AnswerPaperQuestionAdapter(invoke_backend_tool)),
+    _contract("assess_paper_qa_quality", description="读取 Paper QA observation 并决定 finalize、repair 或降级完成。", capability_tags=["validate", "answer"], input_schema={"paper_qa_result": "dict"}, output_schema={"qa_quality_decision": "dict"}, implementation="paper_qa.AssessPaperQAQualityAdapter", input_model=AssessPaperQAQualityInput, output_model=PaperQAQualityDecisionOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step", "patch_plan", "fallback_answer"), adapter=AssessPaperQAQualityAdapter()),
     _contract("load_user_profile", description="从上下文读取用户画像与记忆摘要。", capability_tags=["retrieve", "profile"], input_schema={"context": "dict"}, output_schema={"recommendation_profile": "dict"}, implementation="recommendation.LoadUserProfileAdapter", input_model=LoadUserProfileInput, output_model=UserProfileOutput, error_model=ToolError, recovery_policy=_default_recovery("patch_plan"), adapter=LoadUserProfileAdapter()),
     _contract("load_candidate_papers", description="从上下文读取已有候选论文列表。", capability_tags=["retrieve", "recommendation"], input_schema={"context": "dict"}, output_schema={"candidate_papers": "list"}, implementation="recommendation.LoadCandidatePapersAdapter", input_model=LoadCandidatePapersInput, output_model=CandidatePapersOutput, error_model=ToolError, adapter=LoadCandidatePapersAdapter()),
     _contract("generate_recommendations", description="调用后端推荐工具生成论文推荐。", capability_tags=["recommendation"], input_schema={"recommendation_profile": "dict", "candidate_papers": "list"}, output_schema={"recommendations": "list", "tool_result": "dict"}, side_effect_level="external_call", implementation="recommendation.GenerateRecommendationsAdapter", backend_tool_name="recommend_papers", input_model=GenerateRecommendationsInput, output_model=RecommendationResultOutput, error_model=ToolError, recovery_policy=_default_recovery("patch_plan", "fallback_answer"), adapter=GenerateRecommendationsAdapter(invoke_backend_tool)),

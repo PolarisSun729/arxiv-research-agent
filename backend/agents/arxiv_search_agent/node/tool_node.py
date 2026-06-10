@@ -28,6 +28,8 @@ try:  # pragma: no cover - import path differs between backend cwd and package i
 except ModuleNotFoundError:  # pragma: no cover
     from backend.tools.tool_registry import invoke_tool
 
+from services.paper_qa.repair_actions import RETRY_WITH_EXPANDED_CONTEXT, RETRY_WITH_QUERY_REWRITE
+
 from ..schemas import AgentToolCall, ToolObservation
 from ..state import AgentState
 from ..utils.result_utils import _extract_error_message, _result_mapping, _result_ok, _result_text, _to_plain_dict
@@ -68,6 +70,24 @@ def _build_result_ref(result: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         retrieval_debug = data.get("retrieval_debug")
         if isinstance(retrieval_debug, Mapping):
             compact["retrieval_debug_keys"] = sorted(str(key) for key in retrieval_debug.keys())
+        qa_observation = data.get("qa_observation")
+        if isinstance(qa_observation, Mapping):
+            # observation 只摘取质量和建议，避免把完整 stage map 塞进工具观察摘要。
+            compact["qa_observation"] = {
+                key: qa_observation.get(key)
+                for key in (
+                    "retrieval_quality",
+                    "retrieval_quality_reason",
+                    "answer_quality",
+                    "answer_quality_reason",
+                    "missing_evidence_type",
+                    "weak_source_reason",
+                    "degraded_stages",
+                    "observation_reason",
+                    "recommended_repair_actions",
+                )
+                if qa_observation.get(key) not in (None, "", [], {})
+            }
 
         return compact or {"data_keys": sorted(str(key) for key in data.keys())[:20]}
     if data is not None:
@@ -124,9 +144,38 @@ def _derive_observation_details(tool_name: Optional[str], result: Mapping[str, A
 
     if normalized_tool_name == "answer_paper_question":
         answer = str(data.get("answer") or "").strip()
+        qa_observation = data.get("qa_observation") if isinstance(data.get("qa_observation"), Mapping) else {}
+        if not answer:
+            return {
+                "is_sufficient": False,
+                "next_action_hint": "answer_with_available_context",
+            }
+        if qa_observation:
+            answer_quality = str(qa_observation.get("answer_quality") or "").strip()
+            retrieval_quality = str(qa_observation.get("retrieval_quality") or "").strip()
+            answer_insufficient = str(qa_observation.get("answer_insufficient_evidence") or "").strip()
+            repair_actions = qa_observation.get("recommended_repair_actions") if isinstance(qa_observation.get("recommended_repair_actions"), list) else []
+            repair_hint = next((str(action) for action in repair_actions if str(action).strip()), "")
+            if answer_quality in {"insufficient_evidence", "generation_failed"} or answer_insufficient == "yes":
+                return {
+                    "is_sufficient": False,
+                    "next_action_hint": repair_hint or RETRY_WITH_EXPANDED_CONTEXT,
+                }
+            if retrieval_quality in {"failed", "weak"}:
+                return {
+                    "is_sufficient": False,
+                    "next_action_hint": repair_hint or RETRY_WITH_QUERY_REWRITE,
+                }
+            degraded_stages = qa_observation.get("degraded_stages") if isinstance(qa_observation.get("degraded_stages"), list) else []
+            if retrieval_quality == "partial" or answer_quality == "warning" or degraded_stages:
+                # 有答案不代表链路完全健康；保留 sufficient，同时给 Agent 暴露可选的质量修复提示。
+                return {
+                    "is_sufficient": True,
+                    "next_action_hint": repair_hint or "inspect_qa_observation_degraded",
+                }
         return {
             "is_sufficient": bool(answer),
-            "next_action_hint": None if answer else "answer_with_available_context",
+            "next_action_hint": None,
         }
 
     if normalized_tool_name == "recommend_papers":

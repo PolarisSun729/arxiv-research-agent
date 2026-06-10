@@ -52,7 +52,7 @@ def record_recovery_fallback(runtime: PlanRuntime, *, fallback_reason: str) -> N
     可展示结果，避免 executor 在恢复分支里再次执行业务工具。
     """
     reason = _clean_text(fallback_reason) or "recovery_fallback"
-    runtime.outputs["final_answer"] = f"当前步骤无法继续自动恢复：{reason}。请补充信息或稍后重试。"
+    runtime.outputs["final_answer"] = _build_recovery_fallback_answer(runtime, reason)
     runtime.final_answer = runtime.outputs["final_answer"]
 
 
@@ -64,3 +64,23 @@ def _target_label(confirmation_request: ConfirmationRequest) -> str:
 def _clean_text(value: Any) -> Optional[str]:
     text = str(value or "").strip()
     return text or None
+
+
+def _build_recovery_fallback_answer(runtime: PlanRuntime, reason: str) -> str:
+    """为 Paper QA 质量失败生成保守答案，避免把低证据回答包装成确定结论。"""
+    outputs = runtime.outputs if isinstance(runtime.outputs, Mapping) else {}
+    paper_qa_result = outputs.get("paper_qa_result") if isinstance(outputs.get("paper_qa_result"), Mapping) else {}
+    qa_observation = paper_qa_result.get("qa_observation") if isinstance(paper_qa_result.get("qa_observation"), Mapping) else {}
+    lower_reason = reason.lower()
+    if qa_observation or any(token in lower_reason for token in ("qa_", "paper_qa", "paper_index", "answer_paper_question")):
+        retrieval_quality = _clean_text(qa_observation.get("retrieval_quality"))
+        answer_insufficient = _clean_text(qa_observation.get("answer_insufficient_evidence"))
+        observation_reason = _clean_text(
+            qa_observation.get("answer_quality_reason")
+            or qa_observation.get("retrieval_quality_reason")
+            or qa_observation.get("observation_reason")
+        )
+        reason_bits = [item for item in [observation_reason, f"retrieval_quality={retrieval_quality}" if retrieval_quality else None, f"answer_insufficient_evidence={answer_insufficient}" if answer_insufficient else None] if item]
+        reason_text = "；".join(reason_bits) or reason
+        return f"当前无法给出足够可靠的论文回答：{reason_text}。我没有把低证据结果当作确定答案；请尝试重建索引、缩小问题范围或稍后重试。"
+    return f"当前步骤无法继续自动恢复：{reason}。请补充信息或稍后重试。"

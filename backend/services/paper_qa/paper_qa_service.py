@@ -19,6 +19,7 @@ from services.paper_qa.answer_generator import AnswerGenerator
 from services.paper_qa.context_pack_builder import ContextPackBuilder
 from services.paper_qa.evidence_verifier import EvidenceVerifier
 from services.paper_qa.paper_qa_index_builder import PaperQAIndexBuilder
+from services.paper_qa.qa_observation import build_error_qa_observation, build_qa_observation
 from services.paper_qa.question_contextualizer import QuestionContextualizer
 from services.paper_qa.session_service import PaperQASessionService
 from services.storage.vector_store_service import VectorStoreService
@@ -243,6 +244,12 @@ class PaperQAService:
     def build_qa_context(self, arxiv_id: str, payload: Any):
         qa_index = self.db_service.get_paper_qa_index(arxiv_id)
         if not qa_index or qa_index["status"] != "indexed":
+            # 未建索引属于前置检索失败，也要生成观察结构，便于 Agent 直接决定是否重建索引。
+            qa_observation = build_error_qa_observation(
+                error_code=ErrorCode.QA_INDEX_NOT_FOUND,
+                error_stage="build_qa_context",
+                error_reason=f"index_status:{(qa_index or {}).get('status', 'missing')}",
+            )
             # 未建索引是可预期的业务状态，前端需要用稳定 code 引导用户先构建索引。
             raise AppError(
                 ErrorCode.QA_INDEX_NOT_FOUND,
@@ -250,8 +257,9 @@ class PaperQAService:
                     "arxiv_id": arxiv_id,
                     "stage": "build_qa_context",
                     "index_status": (qa_index or {}).get("status", "missing"),
+                    "qa_observation": qa_observation,
                 },
-                context={"arxiv_id": arxiv_id, "stage": "build_qa_context"},
+                context={"arxiv_id": arxiv_id, "stage": "build_qa_context", "qa_observation": qa_observation},
             )
 
         question = str(self._payload_get(payload, "question", "") or "").strip()
@@ -344,6 +352,12 @@ class PaperQAService:
         except AppError:
             raise
         except Exception as exc:
+            # 检索异常时没有 sources，但仍要把失败阶段和建议动作结构化暴露给 Agent。
+            qa_observation = build_error_qa_observation(
+                error_code=ErrorCode.VECTOR_STORE_ERROR,
+                error_stage="enhanced_retrieve",
+                error_reason=str(exc),
+            )
             # 检索链路异常不能降级成“没有相关 chunk”，否则前端无法区分数据为空和服务故障。
             logger.exception(
                 "QA retrieval failed: code=%s arxiv_id=%s collection_name=%s user_id=%s stage=%s",
@@ -355,31 +369,40 @@ class PaperQAService:
             )
             raise AppError(
                 ErrorCode.VECTOR_STORE_ERROR,
-                detail=exc,
+                detail={"detail": exc, "qa_observation": qa_observation},
                 context={
                     "arxiv_id": arxiv_id,
                     "user_id": user_id,
                     "stage": "enhanced_retrieve",
                     "collection_name": collection_name,
+                    "qa_observation": qa_observation,
                 },
             ) from exc
 
-        final_context_results = retrieval_result["chunks"]
-        search_results = final_context_results
-        if not search_results:
-            raise AppError(
-                ErrorCode.VECTOR_STORE_ERROR,
-                message="检索服务没有返回可用的论文片段，请检查索引后重试。",
-                detail={"arxiv_id": arxiv_id, "stage": "enhanced_retrieve", "collection_name": collection_name},
-                context={"arxiv_id": arxiv_id, "user_id": user_id, "stage": "enhanced_retrieve"},
-            )
-
-        context_pack = self.context_pack_builder.build(search_results)
         retrieval_debug = retrieval_result.get("debug")
         if retrieval_debug is None:
             retrieval_debug = {}
         elif not isinstance(retrieval_debug, dict):
             retrieval_debug = {"raw_debug": retrieval_debug}
+        final_context_results = retrieval_result["chunks"]
+        search_results = final_context_results
+        if not search_results:
+            # 空召回和检索服务异常都需要可观察状态；这里保留 debug 以区分 route 空、rerank 失败或预算层兜底。
+            qa_observation = build_error_qa_observation(
+                error_code=ErrorCode.VECTOR_STORE_ERROR,
+                error_stage="enhanced_retrieve",
+                error_reason="empty_retrieval_chunks",
+                retrieval_debug=retrieval_debug,
+                sources=[],
+            )
+            raise AppError(
+                ErrorCode.VECTOR_STORE_ERROR,
+                message="检索服务没有返回可用的论文片段，请检查索引后重试。",
+                detail={"arxiv_id": arxiv_id, "stage": "enhanced_retrieve", "collection_name": collection_name, "qa_observation": qa_observation},
+                context={"arxiv_id": arxiv_id, "user_id": user_id, "stage": "enhanced_retrieve", "qa_observation": qa_observation},
+            )
+
+        context_pack = self.context_pack_builder.build(search_results)
         retrieval_debug["original_question"] = question
         retrieval_debug["contextualized_question"] = retrieval_question
         retrieval_debug["question_contextualization"] = question_contextualization
@@ -462,6 +485,14 @@ class PaperQAService:
             )
             answer = generation_result["answer"]
         except Exception as exc:
+            # 生成失败发生在检索之后，因此观察结构要保留已有 sources/debug，方便区分“检索弱”和“LLM 失败”。
+            qa_observation = build_error_qa_observation(
+                error_code=ErrorCode.LLM_GENERATION_FAILED,
+                error_stage="paper_qa_final_answer",
+                error_reason=str(exc),
+                retrieval_debug=retrieval_debug if isinstance(retrieval_debug, dict) else None,
+                sources=source_payload,
+            )
             # LLM 失败时保留明确错误码，避免把检索结果拼成成功答案误导用户。
             logger.exception(
                 "QA generation failed: code=%s arxiv_id=%s session_id=%s stage=%s",
@@ -472,11 +503,12 @@ class PaperQAService:
             )
             raise AppError(
                 ErrorCode.LLM_GENERATION_FAILED,
-                detail=exc,
+                detail={"detail": exc, "qa_observation": qa_observation},
                 context={
                     "arxiv_id": arxiv_id,
                     "session_id": chat_session.get("session_id"),
                     "stage": "paper_qa_final_answer",
+                    "qa_observation": qa_observation,
                 },
             ) from exc
 
@@ -504,15 +536,35 @@ class PaperQAService:
                 },
             )
 
-        persisted_turn = self.persist_completed_turn(
-            chat_session=chat_session,
-            question=question,
-            answer=verified_answer,
-            source_payload=source_payload,
-            retrieval_debug=self.context_lifecycle_service.prepare_debug_snapshot(retrieval_debug) if isinstance(retrieval_debug, dict) else None,
-            contextualized_question=generation_question,
-            question_contextualization=question_contextualization,
+        qa_observation = build_qa_observation(
+            retrieval_debug=retrieval_debug if isinstance(retrieval_debug, dict) else None,
+            sources=source_payload,
+            verification_result=verification_result,
+            generation_result=generation_result,
         )
+        if isinstance(retrieval_debug, dict):
+            # 顶层 qa_observation 是 Agent 稳定读取入口；debug 内副本用于历史快照和人工排查。
+            retrieval_debug["qa_observation"] = qa_observation
+
+        try:
+            persisted_turn = self.persist_completed_turn(
+                chat_session=chat_session,
+                question=question,
+                answer=verified_answer,
+                source_payload=source_payload,
+                retrieval_debug=self.context_lifecycle_service.prepare_debug_snapshot(retrieval_debug) if isinstance(retrieval_debug, dict) else None,
+                contextualized_question=generation_question,
+                question_contextualization=question_contextualization,
+            )
+        except AppError as exc:
+            raise AppError(
+                exc.code,
+                message=exc.message,
+                detail={"detail": exc.detail, "qa_observation": qa_observation},
+                recoverable=exc.recoverable,
+                status_code=exc.status_code,
+                context={**exc.context, "qa_observation": qa_observation},
+            ) from exc
 
         return {
             "status": "success",
@@ -531,6 +583,7 @@ class PaperQAService:
             "asset_metadata": qa_context["asset_metadata"],
             "generation_debug": generation_result.get("generation_debug", {}),
             "verification_debug": verification_result,
+            "qa_observation": qa_observation,
             "retrieval_debug": retrieval_debug,
         }
 

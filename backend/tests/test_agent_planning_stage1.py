@@ -356,14 +356,31 @@ class Stage1PlanningTests(unittest.TestCase):
     def test_graph_uses_current_step6_main_nodes(self) -> None:
         payload = export_arxiv_search_graph_mermaid(generation_service=None)
 
-        self.assertEqual(payload["node_names"], ["parse_search_request", "run_agent_turn"])
-        self.assertIn("parse_search_request --> run_agent_turn", payload["mermaid"])
+        self.assertEqual(
+            payload["node_names"],
+            [
+                "parse_search_request",
+                "build_goal",
+                "build_plan",
+                "select_next_step",
+                "execute_step",
+                "observe_step",
+                "route_after_observation",
+                "replan",
+                "finalize",
+                "error_finalize",
+            ],
+        )
+        self.assertIn("parse_search_request", payload["mermaid"])
+        self.assertIn("observe_step", payload["mermaid"])
+        self.assertIn("replan", payload["mermaid"])
 
-    def test_graph_mermaid_contains_run_agent_turn(self) -> None:
+    def test_graph_mermaid_contains_explicit_runtime_nodes(self) -> None:
         payload = export_arxiv_search_graph_mermaid(generation_service=None)
 
-        self.assertIn("run_agent_turn", payload["node_names"])
-        self.assertIn("run_agent_turn", payload["mermaid"])
+        self.assertIn("route_after_observation", payload["node_names"])
+        self.assertIn("finalize", payload["node_names"])
+        self.assertIn("route_after_observation", payload["mermaid"])
 
     def test_response_and_compact_state_include_goal_and_execution_plan(self) -> None:
         state = AgentState(

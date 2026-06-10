@@ -83,6 +83,188 @@ def _json_safe(value: Any) -> Any:
     return repr(value)
 
 
+def _record_step_output(runtime: PlanRuntime, step: PlanStep, normalized_output: Any) -> None:
+    """写入步骤输出；QA 修复重试要同步 canonical 结果，避免最终响应继续读旧答案。"""
+    if not step.output_key:
+        return
+    runtime.outputs[step.output_key] = normalized_output
+    if step.tool_name == "answer_paper_question" and step.output_key != "paper_qa_result":
+        runtime.outputs["paper_qa_result"] = normalized_output
+
+
+_PAPER_QA_OBSERVATION_TRACE_KEYS = (
+    "schema_version",
+    "retrieval_quality",
+    "retrieval_quality_reason",
+    "answer_quality",
+    "answer_quality_reason",
+    "answer_insufficient_evidence",
+    "missing_evidence_type",
+    "weak_source_reason",
+    "rerank_failed_reason",
+    "degraded_stages",
+    "recommended_repair_actions",
+    "source_count",
+    "error_code",
+    "error_stage",
+    "observation_reason",
+)
+
+
+def _compact_paper_qa_observation(value: Any) -> Dict[str, Any]:
+    """质量闭环 trace 只保留 Agent 决策字段，避免把完整 retrieval_debug 塞回响应。"""
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        key: value.get(key)
+        for key in _PAPER_QA_OBSERVATION_TRACE_KEYS
+        if value.get(key) not in (None, "", [], {})
+    }
+
+
+def _paper_qa_source_fingerprints(value: Any) -> List[str]:
+    """用来源指纹做修复前后对比，不记录 chunk 正文或 prompt。"""
+    if not isinstance(value, list):
+        return []
+    fingerprints: List[str] = []
+    for item in value[:8]:
+        if not isinstance(item, Mapping):
+            continue
+        source_id = (
+            item.get("chunk_id")
+            or item.get("source_id")
+            or item.get("id")
+            or item.get("chunk_index")
+            or item.get("section")
+        )
+        if source_id is not None:
+            fingerprints.append(str(source_id))
+    return fingerprints
+
+
+def _answer_output_for_quality_step(runtime: PlanRuntime, step: PlanStep) -> Dict[str, Any]:
+    """从质量门输入绑定反查 answer 输出，供 debug 比较 observation 和 sources。"""
+    source_step_id = next(
+        (
+            str(binding.step_id)
+            for binding in list(step.input_bindings or [])
+            if binding.input_key == "paper_qa_result" and binding.source_type == "step_output" and binding.step_id
+        ),
+        "",
+    )
+    if not source_step_id or runtime.plan is None:
+        return {}
+    source_step = next((item for item in list(runtime.plan.steps or []) if item.step_id == source_step_id), None)
+    if source_step is None or not source_step.output_key:
+        return {}
+    source_output = runtime.outputs.get(source_step.output_key)
+    return dict(source_output or {}) if isinstance(source_output, Mapping) else {}
+
+
+def _latest_paper_qa_repair_trace(runtime: PlanRuntime) -> Dict[str, Any]:
+    """读取最近一次 Paper QA 修复计划摘要，修复后质量门用它生成 before/after 对比。"""
+    for trace in reversed(list(runtime.trace or [])):
+        if trace.event != "plan_replanned":
+            continue
+        detail = dict(trace.detail or {})
+        repair_trace = detail.get("paper_qa_repair_trace")
+        if isinstance(repair_trace, Mapping):
+            return dict(repair_trace)
+    return {}
+
+
+def _build_paper_qa_quality_trace(runtime: PlanRuntime, step: PlanStep, quality_output: Any) -> Dict[str, Any]:
+    """生成 Paper QA 质量门的固定 debug 结构，供验收直接读取最终决策和修复效果。"""
+    if step.tool_name != "assess_paper_qa_quality" or not isinstance(quality_output, Mapping):
+        return {}
+    answer_output = _answer_output_for_quality_step(runtime, step)
+    current_observation = _compact_paper_qa_observation(
+        quality_output.get("qa_observation") or answer_output.get("qa_observation")
+    )
+    current_sources = _paper_qa_source_fingerprints(answer_output.get("sources"))
+    repair_trace = _latest_paper_qa_repair_trace(runtime)
+    original_observation = dict(repair_trace.get("original_observation") or {})
+    before_sources = list(repair_trace.get("before_sources") or [])
+    retrieval_before = original_observation.get("retrieval_quality")
+    retrieval_after = current_observation.get("retrieval_quality")
+    insufficient_before = original_observation.get("answer_insufficient_evidence")
+    insufficient_after = current_observation.get("answer_insufficient_evidence") or quality_output.get("answer_insufficient_evidence")
+    decision = str(quality_output.get("decision") or "unknown")
+    reason = str(quality_output.get("reason") or current_observation.get("observation_reason") or "paper_qa_quality_decision")
+    return {
+        "original_observation": original_observation,
+        "current_observation": current_observation,
+        "decision_fields": {
+            "decision": decision,
+            "status": quality_output.get("status"),
+            "reason": reason,
+            "retrieval_quality": retrieval_after,
+            "answer_insufficient_evidence": insufficient_after,
+            "rerank_failed_reason": current_observation.get("rerank_failed_reason") or quality_output.get("rerank_failed_reason"),
+            "recommended_repair_actions": list(quality_output.get("repair_actions") or []),
+        },
+        "selected_repair_actions": list(repair_trace.get("selected_repair_actions") or []),
+        "selected_repair_action": repair_trace.get("selected_repair_action"),
+        "retrieval_quality_before": retrieval_before,
+        "retrieval_quality_after": retrieval_after,
+        "answer_insufficient_evidence_before": insufficient_before,
+        "answer_insufficient_evidence_after": insufficient_after,
+        "sources_before": before_sources,
+        "sources_after": current_sources,
+        "sources_changed": bool(before_sources or current_sources) and before_sources != current_sources,
+        "repair_attempted": bool(repair_trace),
+        "final_decision": decision,
+        "final_decision_reason": reason,
+        "max_repair_limit_triggered": False,
+    }
+
+
+def _compact_step_output_for_trace(step: PlanStep, value: Any) -> Any:
+    """Paper QA 输出可能包含长 debug/source；执行 trace 只保留可回放的轻量摘要。"""
+    if step.tool_name == "answer_paper_question" and isinstance(value, Mapping):
+        retrieval_debug = value.get("retrieval_debug")
+        return {
+            "status": value.get("status"),
+            "answer_preview": str(value.get("answer") or "")[:160],
+            "source_count": len(value.get("sources") or []) if isinstance(value.get("sources"), list) else 0,
+            "source_fingerprints": _paper_qa_source_fingerprints(value.get("sources")),
+            "retrieval_debug_keys": sorted(str(key) for key in retrieval_debug.keys()) if isinstance(retrieval_debug, Mapping) else [],
+            "qa_observation": _compact_paper_qa_observation(value.get("qa_observation")),
+            "error": value.get("error"),
+        }
+    if step.tool_name == "assess_paper_qa_quality" and isinstance(value, Mapping):
+        return {
+            "status": value.get("status"),
+            "decision": value.get("decision"),
+            "reason": value.get("reason"),
+            "repair_required": value.get("repair_required"),
+            "repair_optional": value.get("repair_optional"),
+            "repair_actions": list(value.get("repair_actions") or []),
+            "retrieval_quality": value.get("retrieval_quality"),
+            "answer_quality": value.get("answer_quality"),
+            "answer_insufficient_evidence": value.get("answer_insufficient_evidence"),
+            "rerank_failed_reason": value.get("rerank_failed_reason"),
+            "qa_observation": _compact_paper_qa_observation(value.get("qa_observation")),
+        }
+    return _safe_compact(value)
+
+
+def _compact_tool_execution_for_trace(step: PlanStep, raw_output: Any) -> Any:
+    """工具 envelope 也可能携带完整 data；Paper QA trace 只记录执行状态。"""
+    if not isinstance(raw_output, ToolExecutionResult):
+        return None
+    if step.tool_name in {"answer_paper_question", "assess_paper_qa_quality"}:
+        metadata = raw_output.metadata if isinstance(raw_output.metadata, Mapping) else {}
+        return {
+            "ok": raw_output.ok,
+            "tool_name": raw_output.tool_name,
+            "adapter_name": raw_output.adapter_name,
+            "summary": metadata.get("summary"),
+            "error": raw_output.error.model_dump() if raw_output.error is not None else None,
+        }
+    return _safe_compact(raw_output.model_dump())
+
+
 def _get_path_value(value: Any, path: Optional[str]) -> Any:
     if not path:
         return value
@@ -592,11 +774,12 @@ class PlanExecutor:
             return self._step_result_from_runtime(step=step, runtime=runtime, next_action="replan", observation=runtime.last_observation)
 
         if step.output_key:
-            runtime.outputs[step.output_key] = normalized_output
+            _record_step_output(runtime, step, normalized_output)
             runtime.final_answer = assemble_final_answer(runtime)
 
         runtime.step_status[step.step_id] = "success"
         runtime.needs_replan = False
+        self._append_paper_qa_quality_trace(runtime, step, normalized_output)
         self._append_trace(
             runtime,
             step,
@@ -605,10 +788,10 @@ class PlanExecutor:
             detail={
                 "tool_name": step.tool_name,
                 "tool_contract": self.tool_registry.describe_contract(step.tool_name),
-                "tool_execution": _safe_compact(raw_output.model_dump()) if isinstance(raw_output, ToolExecutionResult) else None,
+                "tool_execution": _compact_tool_execution_for_trace(step, raw_output),
                 "resolved_input": _safe_compact(resolved_input),
-                "raw_output": _safe_compact(_model_to_plain(raw_output.data) if isinstance(raw_output, ToolExecutionResult) else raw_output),
-                "normalized_output": _safe_compact(normalized_output),
+                "raw_output": _compact_step_output_for_trace(step, _model_to_plain(raw_output.data) if isinstance(raw_output, ToolExecutionResult) else raw_output),
+                "normalized_output": _compact_step_output_for_trace(step, normalized_output),
                 "started_at": output_payload.get("started_at"),
                 "finished_at": output_payload.get("finished_at") or _utcnow(),
             },
@@ -861,11 +1044,12 @@ class PlanExecutor:
                 return None
 
             if step.output_key:
-                runtime.outputs[step.output_key] = normalized_output
+                _record_step_output(runtime, step, normalized_output)
                 runtime.final_answer = assemble_final_answer(runtime)
 
             runtime.step_status[step.step_id] = "success"
             runtime.needs_replan = False
+            self._append_paper_qa_quality_trace(runtime, step, normalized_output)
             self._append_trace(
                 runtime,
                 step,
@@ -874,10 +1058,10 @@ class PlanExecutor:
                 detail={
                     "tool_name": step.tool_name,
                     "tool_contract": self.tool_registry.describe_contract(step.tool_name),
-                    "tool_execution": _safe_compact(raw_output.model_dump()) if isinstance(raw_output, ToolExecutionResult) else None,
+                    "tool_execution": _compact_tool_execution_for_trace(step, raw_output),
                     "resolved_input": _safe_compact(resolved_input),
-                    "raw_output": _safe_compact(_model_to_plain(raw_output.data) if isinstance(raw_output, ToolExecutionResult) else raw_output),
-                    "normalized_output": _safe_compact(normalized_output),
+                    "raw_output": _compact_step_output_for_trace(step, _model_to_plain(raw_output.data) if isinstance(raw_output, ToolExecutionResult) else raw_output),
+                    "normalized_output": _compact_step_output_for_trace(step, normalized_output),
                     "started_at": started_at,
                     "finished_at": _utcnow(),
                 },
@@ -1129,7 +1313,7 @@ class PlanExecutor:
             runtime.recovery_strategy = {"type": "patch_plan", "reason": observation.reason or observation.status}
             # 低质量 final_answer 只作为触发重规划的观察对象，不能提前污染最终答案。
             if step.output_key and step.output_key not in runtime.outputs and step.output_key != "final_answer":
-                runtime.outputs[step.output_key] = normalized_output
+                _record_step_output(runtime, step, normalized_output)
             runtime.step_status[step.step_id] = "success"
             self._append_trace(
                 runtime,
@@ -1166,6 +1350,7 @@ class PlanExecutor:
                 "observation_reason": observation.reason,
                 "failure_category": observation.failure_category,
                 "fallback_reason": fallback_reason,
+                "paper_qa_final_decision": self._build_paper_qa_fallback_decision(runtime, step, observation, fallback_reason),
             },
         )
         runtime.turn_status = "fallback"
@@ -1188,6 +1373,41 @@ class PlanExecutor:
                 detail=detail or {},
             )
         )
+
+    def _append_paper_qa_quality_trace(self, runtime: PlanRuntime, step: PlanStep, normalized_output: Any) -> None:
+        """质量门完成时单独记录 Paper QA 决策闭环，便于验收脚本无需解析通用 trace。"""
+        quality_trace = _build_paper_qa_quality_trace(runtime, step, normalized_output)
+        if not quality_trace:
+            return
+        self._append_trace(
+            runtime,
+            step,
+            event="paper_qa_quality_decision",
+            status="success",
+            detail={"paper_qa_quality_trace": quality_trace},
+        )
+
+    def _build_paper_qa_fallback_decision(
+        self,
+        runtime: PlanRuntime,
+        step: PlanStep,
+        observation: ObservationResult,
+        fallback_reason: str,
+    ) -> Dict[str, Any]:
+        """把 Paper QA 兜底原因显式化，避免证据不足被展示成普通工具失败。"""
+        if step.tool_name not in {"answer_paper_question", "assess_paper_qa_quality"}:
+            return {}
+        repair_trace = _latest_paper_qa_repair_trace(runtime)
+        return {
+            "final_decision": "fallback",
+            "final_decision_reason": fallback_reason,
+            "observation_status": observation.status,
+            "observation_reason": observation.reason,
+            "failure_category": observation.failure_category,
+            "selected_repair_actions": list(repair_trace.get("selected_repair_actions") or []),
+            "repair_attempted": bool(repair_trace),
+            "max_repair_limit_triggered": fallback_reason.startswith("replan_limit_exceeded:"),
+        }
 
     def _build_step_execution_result(
         self,

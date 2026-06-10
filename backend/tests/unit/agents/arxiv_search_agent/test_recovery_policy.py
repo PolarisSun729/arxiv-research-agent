@@ -172,7 +172,8 @@ def test_qa_no_answer_generates_retry_candidates() -> None:
     )
 
     assert any(candidate.candidate_id.endswith("retry_qa_with_more_top_k") for candidate in candidates)
-    assert candidates[0].strategy_payload["strategy_name"] == "retry_qa_with_more_top_k"
+    assert candidates[0].strategy_payload["strategy_name"] == "paper_qa_controlled_repair"
+    assert "retry_with_query_rewrite" in candidates[0].strategy_payload["repair_actions"]
     assert "retry_step" in candidates[0].tool_recovery_policy["modes"]
 
 
@@ -186,8 +187,54 @@ def test_qa_no_sources_generates_source_grounded_candidates() -> None:
         state=state,
     )
 
-    assert any(candidate.strategy_payload.get("force_sources") for candidate in candidates)
+    retry_payloads = [candidate.strategy_payload for candidate in candidates if candidate.action_type == "retry_step"]
+    assert retry_payloads
+    assert "retry_with_section_focus" in retry_payloads[0]["repair_actions"]
     assert any(candidate.action_type == "fallback_answer" for candidate in candidates)
+
+
+def test_observer_marks_paper_qa_insufficient_evidence_as_low_confidence() -> None:
+    _, _, observation = _observe(
+        AgentState(intent="paper_qa", message="method?", context={"selected_paper": {"arxiv_id": "2401.00001"}}),
+        "answer_paper_question",
+        raw_output={
+            "answer": "当前检索证据不足，无法可靠回答。",
+            "sources": [{"source_id": "s1"}],
+            "qa_observation": {
+                "answer_quality": "insufficient_evidence",
+                "answer_quality_reason": "verification_insufficient_evidence",
+                "answer_insufficient_evidence": "yes",
+                "recommended_repair_actions": ["retry_with_expanded_context"],
+            },
+        },
+    )
+
+    assert observation.status == "low_confidence"
+    assert observation.reason == "verification_insufficient_evidence"
+    assert observation.failure_category == "qa_low_grounding"
+    assert observation.observation_signal == "success_but_low_quality"
+
+
+def test_observer_marks_paper_qa_degraded_rerank_as_partial_success() -> None:
+    _, _, observation = _observe(
+        AgentState(intent="paper_qa", message="method?", context={"selected_paper": {"arxiv_id": "2401.00001"}}),
+        "answer_paper_question",
+        raw_output={
+            "answer": "grounded answer",
+            "sources": [{"source_id": "s1"}],
+            "qa_observation": {
+                "retrieval_quality": "partial",
+                "answer_quality": "grounded",
+                "degraded_stages": ["rerank"],
+                "observation_reason": "stage_fallback:rerank",
+                "recommended_repair_actions": ["retry_with_query_rewrite"],
+            },
+        },
+    )
+
+    assert observation.status == "partial_success"
+    assert observation.reason == "stage_fallback:rerank"
+    assert observation.observation_signal == "success_but_low_quality"
 
 
 def test_index_stale_prefers_last_good_index_when_available() -> None:

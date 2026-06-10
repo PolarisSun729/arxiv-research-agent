@@ -841,8 +841,11 @@ def test_rule_based_paper_qa_generates_resolve_check_answer_plan() -> None:
         ),
     )
 
-    assert _step_ids(plan) == ["resolve_paper", "check_paper_index", "answer_paper_question"]
-    assert _tool_names(plan) == ["resolve_paper", "check_paper_index", "answer_paper_question"]
+    assert _step_ids(plan) == ["resolve_paper", "check_paper_index", "answer_paper_question", "assess_paper_qa_quality"]
+    assert _tool_names(plan) == ["resolve_paper", "check_paper_index", "answer_paper_question", "assess_paper_qa_quality"]
+    quality_step = plan.steps[-1]
+    assert quality_step.action_type == "validate"
+    assert quality_step.depends_on == ["answer_paper_question"]
     assert debug["planner_context"]["goal_type"] == "paper_qa"
     assert "selected_paper" in debug["planner_context"]["used_context_fields"]
     assert "parse_and_index_paper" in debug["planner_context"]["high_risk_tools"]
@@ -865,13 +868,17 @@ def test_paper_summary_detail_and_qa_keep_distinct_plan_shapes() -> None:
         state=AgentState(intent="paper_qa", message="method?", context=base_context),
     )
 
-    assert _step_ids(summary_plan)[-1] == "summarize_paper"
-    assert _step_ids(detail_plan)[-1] == "inspect_paper_detail"
-    assert _step_ids(qa_plan)[-1] == "answer_paper_question"
-    assert summary_plan.steps[-1].action_type == "summarize"
-    assert detail_plan.steps[-1].action_type == "inspect_detail"
-    assert qa_plan.steps[-1].action_type == "answer"
-    assert summary_plan.steps[-1].tool_name == detail_plan.steps[-1].tool_name == qa_plan.steps[-1].tool_name == "answer_paper_question"
+    assert _step_ids(summary_plan)[-2] == "summarize_paper"
+    assert _step_ids(detail_plan)[-2] == "inspect_paper_detail"
+    assert _step_ids(summary_plan)[-1] == "assess_paper_qa_quality"
+    assert _step_ids(detail_plan)[-1] == "assess_paper_qa_quality"
+    assert _step_ids(qa_plan)[-1] == "assess_paper_qa_quality"
+    assert summary_plan.steps[-2].action_type == "summarize"
+    assert detail_plan.steps[-2].action_type == "inspect_detail"
+    assert qa_plan.steps[-1].action_type == "validate"
+    assert summary_plan.steps[-2].tool_name == detail_plan.steps[-2].tool_name == "answer_paper_question"
+    assert qa_plan.steps[-2].tool_name == "answer_paper_question"
+    assert qa_plan.steps[-1].tool_name == "assess_paper_qa_quality"
 
 
 def test_rule_based_recommendation_generates_full_plan() -> None:

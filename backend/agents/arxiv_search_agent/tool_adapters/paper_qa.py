@@ -7,6 +7,13 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from services.paper_qa.repair_actions import (
+    ASK_USER_TO_REBUILD_INDEX,
+    build_repair_strategy_payload,
+    describe_repair_actions,
+    normalize_repair_actions,
+)
+
 from .base import BaseToolAdapter, backend_tool_error
 from .models import ToolExecutionResult
 
@@ -110,10 +117,38 @@ class PaperQAAnswerOutput(BaseModel):
     answer: str = ""
     sources: List[Dict[str, Any]] = Field(default_factory=list)
     retrieval_debug: Any = None
+    qa_observation: Any = None
     error: Any = None
     arxiv_id: Optional[str] = None
     question: Optional[str] = None
     tool_result: Optional[Dict[str, Any]] = None
+
+
+class AssessPaperQAQualityInput(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    paper_qa_result: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PaperQAQualityDecisionOutput(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    status: str = "unknown"
+    decision: str = "finalize"
+    reason: str = "not_available"
+    repair_required: bool = False
+    repair_optional: bool = False
+    repair_actions: List[str] = Field(default_factory=list)
+    repair_action_details: List[Dict[str, Any]] = Field(default_factory=list)
+    repair_strategy: Dict[str, Any] = Field(default_factory=dict)
+    answer_available: bool = False
+    source_count: int = 0
+    retrieval_quality: str = "unknown"
+    answer_quality: str = "unknown"
+    answer_insufficient_evidence: str = "unknown"
+    rerank_failed_reason: str = "not_available"
+    degraded_stages: List[str] = Field(default_factory=list)
+    qa_observation: Dict[str, Any] = Field(default_factory=dict)
 
 
 def _resolve_paper_reference_fallback(message: str, context: Mapping[str, Any]) -> Dict[str, Any]:
@@ -250,6 +285,7 @@ class AnswerPaperQuestionAdapter(BaseToolAdapter[AnswerPaperQuestionInput, Paper
         tool_data.setdefault("status", "success" if bool((tool_result or {}).get("ok", False)) and str(tool_data.get("answer") or "").strip() else "failed")
         tool_data.setdefault("sources", [])
         tool_data.setdefault("retrieval_debug", None)
+        tool_data.setdefault("qa_observation", None)
         if not bool((tool_result or {}).get("ok", False)):
             error_payload = (tool_result or {}).get("error") if isinstance((tool_result or {}).get("error"), Mapping) else {}
             tool_data.setdefault("error", error_payload.get("message") or (tool_result or {}).get("summary") or "answer_paper_question failed")
@@ -259,3 +295,89 @@ class AnswerPaperQuestionAdapter(BaseToolAdapter[AnswerPaperQuestionInput, Paper
         tool_data.setdefault("question", tool_input.resolved_question)
         tool_data["tool_result"] = tool_result
         return PaperQAAnswerOutput.model_validate(tool_data)
+
+
+class AssessPaperQAQualityAdapter(BaseToolAdapter[AssessPaperQAQualityInput, PaperQAQualityDecisionOutput]):
+    tool_name = "assess_paper_qa_quality"
+    input_model = AssessPaperQAQualityInput
+    output_model = PaperQAQualityDecisionOutput
+
+    def _run(self, tool_input: AssessPaperQAQualityInput) -> PaperQAQualityDecisionOutput:
+        result = dict(tool_input.paper_qa_result or {})
+        qa_observation = result.get("qa_observation") if isinstance(result.get("qa_observation"), Mapping) else {}
+        answer = str(result.get("answer") or "").strip()
+        sources = result.get("sources") if isinstance(result.get("sources"), list) else []
+        repair_actions = normalize_repair_actions(
+            qa_observation.get("recommended_repair_actions") if isinstance(qa_observation.get("recommended_repair_actions"), list) else []
+        )
+        repair_action_details = describe_repair_actions(repair_actions)
+        retrieval_quality = str(qa_observation.get("retrieval_quality") or "unknown").strip() or "unknown"
+        answer_quality = str(qa_observation.get("answer_quality") or "unknown").strip() or "unknown"
+        answer_insufficient = str(qa_observation.get("answer_insufficient_evidence") or "unknown").strip() or "unknown"
+        rerank_failed_reason = str(qa_observation.get("rerank_failed_reason") or "not_available").strip() or "not_available"
+        degraded_stages = [
+            str(stage).strip()
+            for stage in (qa_observation.get("degraded_stages") if isinstance(qa_observation.get("degraded_stages"), list) else [])
+            if str(stage).strip()
+        ]
+
+        decision = "finalize"
+        status = "passed"
+        reason = str(qa_observation.get("observation_reason") or "paper_qa_quality_passed")
+        repair_required = False
+        repair_optional = False
+
+        if not answer:
+            decision, status, reason, repair_required = "repair_required", "low_quality", "paper_qa_answer_empty", True
+        elif not sources:
+            decision, status, reason, repair_required = "repair_required", "low_quality", "paper_qa_sources_empty", True
+        elif answer_insufficient.lower() in {"yes", "true", "1"} or answer_quality in {"insufficient_evidence", "generation_failed"}:
+            decision, status, reason, repair_required = (
+                "repair_required",
+                "low_quality",
+                str(qa_observation.get("answer_quality_reason") or "paper_qa_insufficient_evidence"),
+                True,
+            )
+        elif retrieval_quality in {"failed", "weak"}:
+            decision, status, reason, repair_required = (
+                "repair_required",
+                "low_quality",
+                str(qa_observation.get("retrieval_quality_reason") or f"paper_qa_retrieval_{retrieval_quality}"),
+                True,
+            )
+        elif ASK_USER_TO_REBUILD_INDEX in set(repair_actions):
+            decision, status, reason, repair_required = (
+                "repair_required",
+                "low_quality",
+                str(qa_observation.get("retrieval_quality_reason") or "paper_qa_index_rebuild_required"),
+                True,
+            )
+        elif (
+            retrieval_quality == "partial"
+            or answer_quality == "warning"
+            or degraded_stages
+            or rerank_failed_reason not in {"not_available", "disabled", "unknown"}
+            or repair_actions
+        ):
+            # 降级不一定要强制重试，但必须进入决策 trace，避免把 fallback/rerank 退化伪装成纯成功。
+            decision, status, repair_optional = "finalize_with_degradation", "degraded", True
+            reason = str(qa_observation.get("observation_reason") or qa_observation.get("retrieval_quality_reason") or "paper_qa_degraded")
+
+        return PaperQAQualityDecisionOutput(
+            status=status,
+            decision=decision,
+            reason=reason,
+            repair_required=repair_required,
+            repair_optional=repair_optional,
+            repair_actions=repair_actions,
+            repair_action_details=repair_action_details,
+            repair_strategy=build_repair_strategy_payload(actions=repair_actions, reason=reason, observation=qa_observation),
+            answer_available=bool(answer),
+            source_count=len(sources),
+            retrieval_quality=retrieval_quality,
+            answer_quality=answer_quality,
+            answer_insufficient_evidence=answer_insufficient,
+            rerank_failed_reason=rerank_failed_reason,
+            degraded_stages=degraded_stages,
+            qa_observation=dict(qa_observation),
+        )

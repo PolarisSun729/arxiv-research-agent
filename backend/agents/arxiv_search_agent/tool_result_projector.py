@@ -54,7 +54,7 @@ _LEGACY_OUTPUT_PROJECTION = {
     "paper_ref": ["arxiv_id", "title", "query", "matched_by", "source"],
     "paper_index_status": ["status", "has_index", "tool_result"],
     "index_build_result": ["status", "has_index", "tool_result"],
-    "paper_qa_result": ["status", "answer", "sources", "retrieval_debug", "error", "arxiv_id", "question", "tool_result"],
+    "paper_qa_result": ["status", "answer", "sources", "retrieval_debug", "qa_observation", "error", "arxiv_id", "question", "tool_result"],
     "recommendation_profile": ["user_id", "research_profile", "user_memory_summary", "message", "request_context"],
     "candidate_papers": ["candidate_papers"],
     "recommendation_result": ["recommendations", "tool_result", "candidate_papers"],

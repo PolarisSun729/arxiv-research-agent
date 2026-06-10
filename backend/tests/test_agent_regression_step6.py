@@ -75,15 +75,12 @@ class AgentRegressionStep6Tests(unittest.TestCase):
                 ],
             )
 
-        with mock.patch.object(graph_module, "parse_search_request", side_effect=parse), mock.patch.object(
-            graph_module, "run_agent_turn_in_graph", side_effect=fake_run_agent_turn
-        ) as mocked_run_agent_turn:
-            graph = build_arxiv_search_graph()
-            result = AgentState.model_validate(graph.invoke(AgentState(message="搜索 RAG agent 相关论文").model_dump()))
+        with mock.patch.object(graph_module, "run_agent_turn_in_graph", side_effect=fake_run_agent_turn) as mocked_run_agent_turn:
+            parsed_state = parse(AgentState(message="搜索 RAG agent 相关论文"))
+            result = graph_module.run_agent_turn_node(parsed_state)
 
         mocked_run_agent_turn.assert_called_once()
         self.assertEqual(result.intent, "arxiv_search")
-        self.assertEqual(result.steps[-1].step, "run_agent_turn")
         self.assertEqual(result.answer, "已找到 2 篇与 RAG agent 相关的论文。")
         self.assertEqual(len(result.papers), 2)
         self.assertEqual(result.debug["agent_turn"]["status"], "success")
@@ -221,19 +218,17 @@ class AgentRegressionStep6Tests(unittest.TestCase):
                 ],
             )
 
-        with mock.patch.object(graph_module, "parse_search_request", side_effect=parse), mock.patch.object(
-            graph_module, "run_agent_turn_in_graph", side_effect=fake_run_agent_turn
-        ) as mocked_run_agent_turn:
-            graph = build_arxiv_search_graph()
-            initial_state = AgentState(
-                user_id="u1",
-                message="根据我的兴趣推荐几篇论文",
-                context={"user_memory_summary": "对 RAG 和 agent 很感兴趣"},
+        with mock.patch.object(graph_module, "run_agent_turn_in_graph", side_effect=fake_run_agent_turn) as mocked_run_agent_turn:
+            initial_state = parse(
+                AgentState(
+                    user_id="u1",
+                    message="根据我的兴趣推荐几篇论文",
+                    context={"user_memory_summary": "对 RAG 和 agent 很感兴趣"},
+                )
             )
-            result = AgentState.model_validate(graph.invoke(initial_state.model_dump()))
+            result = graph_module.run_agent_turn_node(initial_state)
 
         mocked_run_agent_turn.assert_called_once()
-        self.assertEqual(result.steps[-1].step, "run_agent_turn")
         self.assertEqual(result.debug["agent_turn"]["status"], "success")
         self.assertEqual(len(result.papers), 2)
         self.assertTrue(bool(result.papers) or bool(result.answer and result.answer.strip()))

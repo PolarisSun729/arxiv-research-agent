@@ -260,7 +260,12 @@ def test_run_agent_turn_paper_qa_trace_only_real_answer_tool(monkeypatch) -> Non
     assert result.outputs["paper_qa_result"]["retrieval_debug"] == {"stages": ["real_rag"]}
     pseudo_steps = {"retrieve_paper_chunks", "rewrite_paper_query", "rerank_paper_chunks", "validate_qa_evidence", "generate_paper_answer", "verify_answer_grounding"}
     assert not pseudo_steps.intersection({trace.step_id for trace in result.trace})
-    assert [step.tool_name for step in result.plan.steps] == ["resolve_paper", "check_paper_index", "answer_paper_question"]
+    assert [step.tool_name for step in result.plan.steps] == [
+        "resolve_paper",
+        "check_paper_index",
+        "answer_paper_question",
+        "assess_paper_qa_quality",
+    ]
 
 
 def test_run_agent_turn_preference_action_persistent_write(monkeypatch) -> None:

@@ -553,6 +553,10 @@ class PaperQAServiceComponentTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["answer"], "generated answer")
         self.assertEqual(result["verification_debug"]["status"], "passed")
+        self.assertEqual(result["qa_observation"]["schema_version"], "paper_qa_observation_v1")
+        self.assertEqual(result["qa_observation"]["retrieval_quality"], "weak")
+        self.assertEqual(result["qa_observation"]["retrieval_quality_reason"], "source_chunks_too_few:1")
+        self.assertEqual(result["retrieval_debug"]["qa_observation"]["source_count"], 1)
         self.assertIn("generation", result["retrieval_debug"])
         self.assertIn("verification", result["retrieval_debug"])
         self.assertIn("context_pack", result["retrieval_debug"])
@@ -637,6 +641,9 @@ class PaperQAServiceComponentTests(unittest.TestCase):
 
         self.assertIn("当前检索证据不足", result["answer"])
         self.assertEqual(result["verification_debug"]["status"], "insufficient_evidence")
+        self.assertEqual(result["qa_observation"]["answer_insufficient_evidence"], "yes")
+        self.assertIn("retry_with_expanded_context", result["qa_observation"]["recommended_repair_actions"])
+        self.assertTrue(result["qa_observation"]["repair_action_details"])
         self.assertEqual(messages[1]["content"], result["answer"])
 
     def test_answer_question_reports_persistence_failure_without_half_turn(self) -> None:
@@ -683,6 +690,51 @@ class PaperQAServiceComponentTests(unittest.TestCase):
         retrieval_service.cleanup()
         self.assertEqual(ctx.exception.code, ErrorCode.VECTOR_STORE_ERROR)
         self.assertIn("检索服务没有返回可用的论文片段", str(ctx.exception))
+
+        error_payload = ctx.exception.to_payload()
+        self.assertEqual(error_payload["qa_observation"]["retrieval_quality"], "failed")
+        self.assertIn("retry_with_query_rewrite", error_payload["qa_observation"]["recommended_repair_actions"])
+
+    def test_answer_question_observation_reports_rerank_fallback(self) -> None:
+        self._insert_index(status="indexed")
+        session = self._create_session(session_id="qa-rerank-fallback")
+        retrieval_service = _FakeRetrievalService(
+            chunks=[
+                {
+                    "content": "Relevant method evidence with enough detail to support a grounded answer. " * 2,
+                    "chunk_type": "text",
+                    "page_number": 1,
+                    "source": "body",
+                },
+                {
+                    "content": "Additional experiment evidence with enough detail to avoid short evidence classification. " * 2,
+                    "chunk_type": "text",
+                    "page_number": 2,
+                    "source": "body",
+                },
+            ],
+            debug={
+                "provider": "fake-retrieval",
+                "llm_rerank": {
+                    "enabled": True,
+                    "applied": False,
+                    "mode": "fallback_fused",
+                    "reason": "rerank timed out",
+                },
+            },
+        )
+        generation_service = _FakeGenerationWithResponse(response_text="generated answer")
+        service = self._make_service(retrieval_service=retrieval_service, generation_service=generation_service)
+
+        result = service.answer_question(
+            self.arxiv_id,
+            {"question": "What is the method?", "user_id": self.user_id, "session_id": session["session_id"]},
+        )
+
+        retrieval_service.cleanup()
+        self.assertEqual(result["qa_observation"]["retrieval_stage_status"]["rerank"]["status"], "fallback")
+        self.assertEqual(result["qa_observation"]["rerank_failed_reason"], "rerank timed out")
+        self.assertIn("retry_with_query_rewrite", result["qa_observation"]["recommended_repair_actions"])
 
     def test_answer_question_reports_generation_failure_without_fallback_answer(self) -> None:
         self._insert_index(status="indexed")

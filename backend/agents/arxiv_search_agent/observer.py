@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from services.paper_qa.repair_actions import ASK_CLARIFICATION, ASK_USER_TO_REBUILD_INDEX, RETRY_WITH_QUERY_REWRITE
+
 from .schemas import FailureCategory, ObservationResult, ObservationSignal, PlanRuntime, PlanStep, RecoveryActionType, RecoverySeverity
 from .state import AgentState
 from .tool_adapters.models import ToolExecutionResult
@@ -41,6 +43,45 @@ def _extract_papers(value: Any) -> List[Dict[str, Any]]:
     if isinstance(value, list):
         return [dict(item) for item in value if isinstance(item, Mapping)]
     return []
+
+
+def _compact_qa_observation(value: Mapping[str, Any]) -> Dict[str, Any]:
+    """压缩 Paper QA 观察，只把规划和恢复需要的质量字段写入 runtime evidence。"""
+    compact: Dict[str, Any] = {}
+    for key in (
+        "schema_version",
+        "retrieval_quality",
+        "retrieval_quality_reason",
+        "answer_quality",
+        "answer_quality_reason",
+        "answer_insufficient_evidence",
+        "answer_insufficient_evidence_reason",
+        "missing_evidence_type",
+        "weak_source_reason",
+        "rerank_failed_reason",
+        "degraded_stages",
+        "recommended_repair_actions",
+        "repair_action_details",
+        "source_count",
+        "error_code",
+        "error_stage",
+        "observation_reason",
+    ):
+        item = value.get(key)
+        if item not in (None, "", [], {}):
+            compact[key] = item
+    return compact
+
+
+def _has_downstream_paper_qa_quality_gate(runtime: PlanRuntime, step: PlanStep) -> bool:
+    """判断当前 answer 步骤后是否已有显式质量门，避免在 answer 阶段提前抢跑重规划。"""
+    plan = runtime.plan
+    if plan is None:
+        return False
+    for item in list(plan.steps or []):
+        if item.tool_name == "assess_paper_qa_quality" and step.step_id in set(item.depends_on or []):
+            return True
+    return False
 
 
 def _recovery_semantics(
@@ -317,7 +358,7 @@ class Observer:
                 status="tool_error",
                 reason="paper_index_corrupted",
                 confidence=0.1,
-                suggested_action="rebuild_index",
+                suggested_action=ASK_USER_TO_REBUILD_INDEX,
                 **_recovery_semantics(
                     failure_category="paper_index_corrupted",
                     severity="error",
@@ -336,41 +377,174 @@ class Observer:
         return ObservationResult(status="success", reason="confirmation_already_available", confidence=1.0)
 
     def _observe_answer_paper_question(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
-        del resolved_input, raw_output, runtime, state
+        del resolved_input, raw_output, state
         normalized_output = _unwrap_payload(normalized_output)
         payload = normalized_output if isinstance(normalized_output, Mapping) else {}
         answer = str(payload.get("answer") or "").strip()
         sources = payload.get("sources")
+        qa_observation = payload.get("qa_observation") if isinstance(payload.get("qa_observation"), Mapping) else {}
+        qa_observation_summary = _compact_qa_observation(qa_observation)
         if not answer:
             return ObservationResult(
                 status="low_confidence",
                 reason="paper_qa_answer_empty",
                 confidence=0.2,
-                details={"status": payload.get("status"), "error": payload.get("error")},
+                details={"status": payload.get("status"), "error": payload.get("error"), "qa_observation": qa_observation_summary},
                 suggested_action="answer_with_available_context",
                 **_recovery_semantics(
                     failure_category="qa_no_answer",
                     suggested_recovery_types=["retry_step", "ask_clarification", "fallback_answer"],
-                    evidence={"status": payload.get("status"), "error": payload.get("error")},
+                    evidence={"status": payload.get("status"), "error": payload.get("error"), "qa_observation": qa_observation_summary},
                     retryable=True,
                 ),
+            )
+        current_step = None
+        if runtime.plan is not None:
+            current_step = next(
+                (
+                    item
+                    for item in list(runtime.plan.steps or [])
+                    if item.tool_name == "answer_paper_question" and item.step_id == runtime.current_step_id
+                ),
+                None,
+            )
+        if current_step is not None and _has_downstream_paper_qa_quality_gate(runtime, step=current_step):
+            return ObservationResult(
+                status="success",
+                reason="paper_qa_answer_deferred_to_quality_gate",
+                confidence=0.8,
+                details={"source_count": len(sources) if isinstance(sources, list) else 0, "qa_observation": qa_observation_summary},
             )
         if not sources:
             return ObservationResult(
                 status="low_confidence",
                 reason="paper_qa_answer_without_sources",
                 confidence=0.55,
-                details={"answer_preview": answer[:120]},
+                details={"answer_preview": answer[:120], "qa_observation": qa_observation_summary},
                 **_recovery_semantics(
                     failure_category="qa_no_sources",
                     severity="warning",
                     recoverable=True,
                     suggested_recovery_types=["retry_step", "fallback_answer"],
-                    evidence={"answer_preview": answer[:120]},
+                    evidence={"answer_preview": answer[:120], "qa_observation": qa_observation_summary},
                     retryable=True,
                 ),
             )
-        return ObservationResult(status="success", reason="paper_qa_answer_available", confidence=0.85, details={"source_count": len(sources) if isinstance(sources, list) else 0})
+        if qa_observation:
+            answer_quality = str(qa_observation.get("answer_quality") or "").strip()
+            retrieval_quality = str(qa_observation.get("retrieval_quality") or "").strip()
+            answer_insufficient = str(qa_observation.get("answer_insufficient_evidence") or "").strip()
+            if answer_quality == "insufficient_evidence" or answer_insufficient == "yes":
+                return ObservationResult(
+                    status="low_confidence",
+                    reason=str(qa_observation.get("answer_quality_reason") or "paper_qa_insufficient_evidence"),
+                    confidence=0.35,
+                    details={"source_count": len(sources) if isinstance(sources, list) else 0, "qa_observation": qa_observation_summary},
+                    suggested_action=RETRY_WITH_QUERY_REWRITE,
+                    **_recovery_semantics(
+                        failure_category="qa_low_grounding",
+                        severity="warning",
+                        recoverable=True,
+                        suggested_recovery_types=["retry_step", "fallback_answer"],
+                        evidence={"qa_observation": qa_observation_summary},
+                        retryable=True,
+                    ),
+                )
+            if retrieval_quality in {"failed", "weak"}:
+                return ObservationResult(
+                    status="low_confidence",
+                    reason=str(qa_observation.get("retrieval_quality_reason") or f"paper_qa_retrieval_{retrieval_quality}"),
+                    confidence=0.45,
+                    details={"source_count": len(sources) if isinstance(sources, list) else 0, "qa_observation": qa_observation_summary},
+                    suggested_action=RETRY_WITH_QUERY_REWRITE,
+                    **_recovery_semantics(
+                        failure_category="qa_low_grounding",
+                        severity="warning",
+                        recoverable=True,
+                        suggested_recovery_types=["retry_step", "fallback_answer"],
+                        evidence={"qa_observation": qa_observation_summary},
+                        retryable=True,
+                    ),
+                )
+            degraded_stages = qa_observation.get("degraded_stages") if isinstance(qa_observation.get("degraded_stages"), list) else []
+            if retrieval_quality == "partial" or answer_quality == "warning" or degraded_stages:
+                # 有答案和来源时不强制重规划，但要把降级信号暴露给 runtime trace 和最终响应。
+                return ObservationResult(
+                    status="partial_success",
+                    observation_signal="success_but_low_quality",
+                    reason=str(qa_observation.get("observation_reason") or "paper_qa_degraded"),
+                    confidence=0.65,
+                    details={"source_count": len(sources) if isinstance(sources, list) else 0, "qa_observation": qa_observation_summary},
+                )
+        return ObservationResult(status="success", reason="paper_qa_answer_available", confidence=0.85, details={"source_count": len(sources) if isinstance(sources, list) else 0, "qa_observation": qa_observation_summary})
+
+    def _observe_assess_paper_qa_quality(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
+        del resolved_input, raw_output, runtime, state
+        normalized_output = _unwrap_payload(normalized_output)
+        payload = normalized_output if isinstance(normalized_output, Mapping) else {}
+        decision = str(payload.get("decision") or "").strip()
+        status = str(payload.get("status") or "").strip()
+        reason = str(payload.get("reason") or status or "paper_qa_quality_unknown").strip()
+        qa_observation = payload.get("qa_observation") if isinstance(payload.get("qa_observation"), Mapping) else {}
+        qa_observation_summary = _compact_qa_observation(qa_observation)
+        evidence = {
+            "decision": decision,
+            "status": status,
+            "reason": reason,
+            "repair_actions": list(payload.get("repair_actions") or []) if isinstance(payload.get("repair_actions"), list) else [],
+            "repair_action_details": list(payload.get("repair_action_details") or []) if isinstance(payload.get("repair_action_details"), list) else [],
+            "repair_strategy": dict(payload.get("repair_strategy") or {}) if isinstance(payload.get("repair_strategy"), Mapping) else {},
+            "qa_observation": qa_observation_summary,
+        }
+        if decision == "repair_required" or status == "low_quality":
+            repair_action_set = set(evidence["repair_actions"])
+            failure_category: FailureCategory = "qa_no_answer" if reason == "paper_qa_answer_empty" else "qa_low_grounding"
+            if ASK_USER_TO_REBUILD_INDEX in repair_action_set:
+                failure_category = "paper_index_corrupted"
+            recovery_types: List[RecoveryActionType] = ["retry_step", "fallback_answer"]
+            if ASK_USER_TO_REBUILD_INDEX in repair_action_set:
+                recovery_types = ["patch_plan", "request_confirmation", "fallback_answer"]
+            if ASK_CLARIFICATION in repair_action_set:
+                recovery_types.append("ask_clarification")
+            return ObservationResult(
+                status="low_confidence",
+                reason=reason,
+                confidence=0.35,
+                details=evidence,
+                suggested_action=(evidence["repair_actions"][0] if evidence["repair_actions"] else RETRY_WITH_QUERY_REWRITE),
+                **_recovery_semantics(
+                    failure_category=failure_category,
+                    severity="warning",
+                    recoverable=True,
+                    suggested_recovery_types=recovery_types,
+                    evidence=evidence,
+                    retryable=True,
+                ),
+            )
+        if decision == "finalize_with_degradation" or status == "degraded":
+            return ObservationResult(
+                status="partial_success",
+                observation_signal="success_but_low_quality",
+                reason=reason,
+                confidence=0.65,
+                details=evidence,
+            )
+        if decision == "finalize" or status == "passed":
+            return ObservationResult(status="success", reason=reason or "paper_qa_quality_passed", confidence=0.9, details=evidence)
+        return ObservationResult(
+            status="invalid_output",
+            reason="paper_qa_quality_decision_invalid",
+            confidence=0.1,
+            details=evidence,
+            **_recovery_semantics(
+                failure_category="tool_invalid_output",
+                severity="error",
+                recoverable=False,
+                suggested_recovery_types=["fallback_answer"],
+                evidence=evidence,
+                retryable=False,
+            ),
+        )
 
     def _observe_load_user_profile(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
         del resolved_input, raw_output, runtime, state

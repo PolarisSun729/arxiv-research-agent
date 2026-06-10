@@ -265,7 +265,11 @@ def test_plan_patcher_inserts_qa_retry_step_with_strategy() -> None:
             "risk_level": "medium",
             "required_tools": ["answer_paper_question"],
             "max_attempts": 1,
-            "retry_strategy": {"strategy_name": "retry_qa_with_more_top_k", "retrieval_top_k": 30},
+            "retry_strategy": {
+                "strategy_name": "paper_qa_controlled_repair",
+                "repair_actions": ["retry_with_query_rewrite"],
+                "input_params": {"enable_query_rewrite": True, "top_k_min": 20},
+            },
         },
     )
 
@@ -288,7 +292,8 @@ def test_plan_patcher_inserts_qa_retry_step_with_strategy() -> None:
     retry_steps = [item for item in result.updated_plan.steps if item.step_id != step.step_id and item.tool_name == "answer_paper_question"]
     assert retry_steps
     strategy_bindings = [binding for binding in retry_steps[0].input_bindings if binding.input_key == "qa_recovery_strategy"]
-    assert strategy_bindings[0].value["strategy_name"] == "retry_qa_with_more_top_k"
+    assert strategy_bindings[0].value["strategy_name"] == "paper_qa_controlled_repair"
+    assert strategy_bindings[0].value["repair_actions"] == ["retry_with_query_rewrite"]
     PlanValidator().validate(result.updated_plan, PLANNER_TOOL_REGISTRY)
 
 
