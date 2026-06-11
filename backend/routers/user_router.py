@@ -9,10 +9,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, Response
+from pydantic import BaseModel, Field, field_validator
 
 from dependencies import get_database_service, get_memory_service, get_recommendation_service
+from services.user_behavior_policy import validate_weak_paper_action_type
 from utils.config import get_default_user_id
 
 logger = logging.getLogger(__name__)
@@ -21,16 +22,26 @@ router = APIRouter(prefix="/user", tags=["user"])
 
 
 class PaperActionRequest(BaseModel):
-    """记录用户对论文执行的某类动作。
+    """记录用户对论文执行的弱行为。
 
-    这里的 action_type 可以承载更广义的行为语义，
-    例如浏览、收藏、加入对话、导出等，而不限于点赞/点踩。
+    点赞/点踩是强偏好，必须走 like-paper/dislike-paper；这里提前拒绝等价 action_type，
+    避免 paper-action 和偏好表同时成为同一状态的权威来源。
     """
     user_id: str = Field(default_factory=get_default_user_id)
     arxiv_id: str
     action_type: str
     paper: Optional[Dict[str, Any]] = None
     metadata: Optional[Dict[str, Any]] = None
+
+    @field_validator("action_type", mode="before")
+    @classmethod
+    def _validate_action_type(cls, value: Any) -> str:
+        try:
+            return validate_weak_paper_action_type(value)
+        except ValueError as exc:
+            if str(exc) == "explicit_preference_action_not_allowed":
+                raise ValueError("paper-action 不接受 like/dislike；请使用 /user/like-paper 或 /user/dislike-paper") from exc
+            raise ValueError("unsupported paper action type") from exc
 
 
 class ResearchProfileRequest(BaseModel):
@@ -65,19 +76,34 @@ class ActivateProfileSnapshotRequest(BaseModel):
     snapshot_id: str
 
 
-@router.post("/preferences")
-async def upsert_user_preferences(
+@router.post(
+    "/preferences",
+    deprecated=True,
+    summary="Deprecated: read user preferences via GET instead",
+    description="兼容旧调用方的只读入口；新代码必须使用 GET /user/preferences/{user_id} 读取偏好。",
+)
+async def legacy_post_user_preferences(
+    response: Response,
     user_id: str = Body(default_factory=get_default_user_id),
     db_service=Depends(get_database_service),
 ):
-    """读取指定用户的偏好设置。
+    """兼容旧 POST 读取入口；正式读取语义已经收敛到 GET。
 
-    虽然路由名叫 upsert，但当前实现更像“按 user_id 读取偏好”，
-    便于前端初始化用户配置面板时直接获取现有数据。
+    保留该入口只是为了给旧前端/脚本迁移窗口；它不会创建、更新或 upsert 偏好。
+    返回头显式标记废弃，避免调用方继续把这个 POST 当作写接口扩展。
     """
     try:
+        response.headers["Deprecation"] = "true"
+        response.headers["Warning"] = '299 - "POST /api/user/preferences is deprecated; use GET /api/user/preferences/{user_id}"'
+        response.headers["Link"] = '</api/user/preferences/{user_id}>; rel="successor-version"; method="GET"'
         preferences = db_service.get_user_preferences(user_id=user_id)
-        return {"status": "success", "message": "User preferences retrieved", "preferences": preferences}
+        return {
+            "status": "success",
+            "message": "User preferences retrieved via deprecated POST compatibility endpoint; use GET /user/preferences/{user_id}.",
+            "deprecated": True,
+            "successor": "GET /user/preferences/{user_id}",
+            "preferences": preferences,
+        }
     except Exception as exc:
         logger.error("Error getting user preferences: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
@@ -144,7 +170,7 @@ async def record_paper_action(
     payload: PaperActionRequest,
     recommendation_service=Depends(get_recommendation_service),
 ):
-    """记录用户对论文执行的通用行为事件。"""
+    """记录用户对论文执行的弱行为事件。"""
     try:
         return recommendation_service.record_user_paper_action(
             user_id=payload.user_id,
@@ -167,9 +193,16 @@ async def remove_paper_action(
     user_id: str = Body(default_factory=get_default_user_id),
     db_service=Depends(get_database_service),
 ):
-    """删除某条已记录的用户论文行为。"""
+    """删除某条已记录的弱论文行为。"""
     try:
-        success = db_service.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type=action_type)
+        try:
+            normalized_action = validate_weak_paper_action_type(action_type)
+        except ValueError as exc:
+            if str(exc) == "explicit_preference_action_not_allowed":
+                # 强偏好撤销必须走专用接口，避免调用方误以为 paper-action 能删除权威点赞状态。
+                raise HTTPException(status_code=400, detail="paper-action 不接受 like/dislike；请使用 DELETE /user/like-paper 或 DELETE /user/dislike-paper") from exc
+            raise HTTPException(status_code=400, detail="unsupported paper action type") from exc
+        success = db_service.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type=normalized_action)
         if success:
             return {"status": "success", "message": "Paper action removed"}
         raise HTTPException(status_code=404, detail="Paper action not found")

@@ -1,10 +1,10 @@
-"""论文引用解析与上下文目标论文恢复工具。
+"""论文引用线索提取工具。
 
 这个模块负责把用户口语里的“这篇论文”“第一篇”“arXiv ID 2401.12345”
-这类目标引用，解析成统一的论文定位结果，供论文阅读、偏好更新等节点复用。
+这类目标引用，解析成统一的引用线索，供后续真正的上下文解析层继续判定。
 
-它本质上做的是“从对话上下文恢复用户到底在指哪篇论文”这件事，
-因此同时依赖消息文本和 state/context 中保留的最近论文列表、当前选中文献等信息。
+它只回答“用户文本里出现了哪种引用表达”，不再回答“最终是哪篇论文”。
+真正落地到 paper/arxiv_id 必须由后续模块结合页面状态、最近结果和用户选择来完成。
 """
 
 from __future__ import annotations
@@ -13,6 +13,17 @@ import re
 from typing import Any, Dict, List, Mapping, Optional
 
 from .text_utils import _matches_any, _normalize_text
+
+_REFERENCE_HINT_FIELDS = (
+    "reference_type",
+    "value",
+    "confidence",
+    "source",
+    "requires_context",
+    "status",
+    "reason",
+    "final_target_resolved",
+)
 
 _PREFERENCE_ORDINAL_MAP = {
     "一": 1,
@@ -57,6 +68,41 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(str(value).strip())
     except Exception:
         return default
+
+
+def _build_reference_hint(
+    *,
+    reference_type: str,
+    value: Any = None,
+    confidence: float,
+    source: str,
+    requires_context: bool,
+    reason: Optional[str] = None,
+    target: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """构造统一引用线索，明确禁止在本层落地到具体论文。
+
+    旧实现会在同一个函数里读取 selected_paper/last_papers 并返回 arxiv_id。
+    这里保留兼容字段但全部置空，让下游必须显式接入最终目标解析层后才能执行动作。
+    """
+    status = "unknown" if reference_type == "unknown" else "hint_extracted"
+    hint = {
+        "status": status,
+        "reference_type": reference_type,
+        "value": value,
+        "confidence": confidence,
+        "source": source,
+        "requires_context": requires_context,
+        "reason": reason,
+        "final_target_resolved": False,
+        "target": target,
+        "paper": None,
+        "arxiv_id": None,
+        "title": None,
+        "matched_from": source,
+    }
+    hint["reference_hint"] = {key: hint.get(key) for key in _REFERENCE_HINT_FIELDS}
+    return hint
 
 
 def _normalize_context_paper(raw: Any) -> Dict[str, Any]:
@@ -198,43 +244,68 @@ def _extract_last_papers(context: Any) -> List[Dict[str, Any]]:
     )
 
 
-def _parse_target_reference(message: str) -> Optional[Dict[str, Any]]:
-    """从用户消息里解析目标论文引用方式。
+def _parse_target_reference(message: str) -> Dict[str, Any]:
+    """从用户消息里提取论文引用线索。
 
-    支持三类典型表达：
+    支持五类典型表达：
     1. 显式 arXiv ID；
-    2. “这篇论文”这类上下文指代；
-    3. “第一篇 / 第 2 篇”这类序号引用。
+    2. “第一篇 / 第 2 篇”这类序号引用；
+    3. “最后一篇”这类相对位置引用；
+    4. “这篇论文”这类上下文指代；
+    5. 偏好动作里的裸数字引用。
     """
     text = _normalize_text(message)
     if not text:
-        return None
+        return _build_reference_hint(
+            reference_type="unknown",
+            value=None,
+            confidence=0.0,
+            source="empty_message",
+            requires_context=False,
+            reason="用户输入为空，无法提取论文引用线索。",
+            target=None,
+        )
 
     # 先处理“最后一篇 / 最后一篇论文”这类相对位置引用。
-    # 这类表达没有显式数字，如果不优先识别，后续往往会回退成 selected_paper，
-    # 从而错误命中当前默认选中的第一篇推荐结果。
+    # 这类表达只说明相对位置，必须等上下文解析层拿到最近结果列表后才能落地。
     special_ordinal_match = re.search(r"(最后一|最后1|最后|末一|末)\s*(?:篇|个)?(?:论文|paper)?", text)
     if special_ordinal_match:
         raw_value = special_ordinal_match.group(1)
         ordinal = _SPECIAL_ORDINAL_MAP.get(raw_value)
         if ordinal is not None:
-            return {
-                "target_type": "ordinal",
-                "target_value": ordinal,
-                "ordinal": ordinal,
-            }
+            return _build_reference_hint(
+                reference_type="last_item",
+                value="last",
+                confidence=0.88,
+                source="last_item_expression",
+                requires_context=True,
+                target={
+                    "target_type": "last_item",
+                    "target_value": ordinal,
+                    "ordinal": ordinal,
+                },
+            )
 
-    # 先尝试识别最明确的显式 arXiv ID，因为这类引用优先级最高、歧义最小。
+    # 先尝试识别最明确的显式 arXiv ID；即便文本置信度很高，本层也只返回线索，
+    # 避免下游绕过最终目标解析层直接触发 QA、下载或偏好写入。
     arxiv_match = re.search(r"(?:arxiv\.org/(?:abs|pdf)/)?(\d{4}\.\d{4,5}(?:v\d+)?)", text, flags=re.IGNORECASE)
     if arxiv_match:
-        return {
-            "target_type": "arxiv_id",
-            "target_value": arxiv_match.group(1),
-            "arxiv_id": arxiv_match.group(1),
-        }
+        arxiv_id = arxiv_match.group(1)
+        return _build_reference_hint(
+            reference_type="arxiv_id",
+            value=arxiv_id,
+            confidence=0.98,
+            source="explicit_arxiv_id",
+            requires_context=False,
+            target={
+                "target_type": "arxiv_id",
+                "target_value": arxiv_id,
+                "arxiv_id": arxiv_id,
+            },
+        )
 
-    # 再尝试解析“第几篇”形式的序号引用，用于指向上一轮搜索结果中的论文。
-    # 这里必须要求“第/篇/论文”等目标锚点，避免“讲一下第二篇”先把“一下”误判成第一篇。
+    # 再尝试解析“第几篇”形式的序号引用。这里必须要求“第/篇/论文”等目标锚点，
+    # 避免把普通数量或章节数字误当成论文列表下标。
     ordinal_match = re.search(
         r"(?:第\s*([一二三四五六七八九十两]{1,3}|[1-9]|1[0-9]|20)\s*(?:篇|个)?(?:论文|paper)?|([一二三四五六七八九十两]{1,3}|[1-9]|1[0-9]|20)\s*(?:篇|个)(?:论文|paper)?)",
         text,
@@ -245,164 +316,90 @@ def _parse_target_reference(message: str) -> Optional[Dict[str, Any]]:
         if ordinal is None:
             ordinal = _safe_int(raw_value, default=0)
         if 1 <= ordinal <= 20:
-            return {
-                "target_type": "ordinal",
-                "target_value": ordinal,
-                "ordinal": ordinal,
-            }
+            return _build_reference_hint(
+                reference_type="ordinal",
+                value=ordinal,
+                confidence=0.92,
+                source="ordinal_expression",
+                requires_context=True,
+                target={
+                    "target_type": "ordinal",
+                    "target_value": ordinal,
+                    "ordinal": ordinal,
+                },
+            )
 
     # 上下文指代必须放在序号引用之后；真实提问里常见“这第二篇论文/该第 2 篇论文”，
-    # 如果先命中“这篇/该论文”，就会错误回退到默认 selected_paper。
+    # 如果先命中“这篇/该论文”，就会掩盖更明确的序号线索。
     if _matches_any(
         text,
         (
             r"这篇",
+            r"这个",
+            r"这一个",
             r"该论文",
             r"这篇论文",
             r"本文",
             r"当前选中",
             r"当前论文",
             r"当前这篇",
+            r"刚才那篇",
+            r"刚才这篇",
+            r"刚才提到",
         ),
     ):
-        return {
-            "target_type": "context_paper",
-            "target_value": "selected_or_recent",
-        }
+        return _build_reference_hint(
+            reference_type="context_paper",
+            value="current",
+            confidence=0.76,
+            source="contextual_reference",
+            requires_context=True,
+            target={
+                "target_type": "context_paper",
+                "target_value": "selected_or_recent",
+            },
+        )
 
     bare_match = re.search(r"(?<!\d)([1-9]|1[0-9]|20)(?!\d)", text)
     if bare_match and (text.strip() in {bare_match.group(1), f"第{bare_match.group(1)}", f"第{bare_match.group(1)}篇"} or any(token in text for token in ("喜欢", "不喜欢", "收藏", "标记", "取消", "撤销"))):
         ordinal = _safe_int(bare_match.group(1), default=0)
         if 1 <= ordinal <= 20:
-            return {
-                "target_type": "ordinal",
-                "target_value": ordinal,
-                "ordinal": ordinal,
-            }
+            return _build_reference_hint(
+                reference_type="bare_number",
+                value=ordinal,
+                confidence=0.56,
+                source="bare_number",
+                requires_context=True,
+                target={
+                    "target_type": "bare_number",
+                    "target_value": ordinal,
+                    "ordinal": ordinal,
+                },
+            )
 
-    return None
+    return _build_reference_hint(
+        reference_type="unknown",
+        value=None,
+        confidence=0.0,
+        source="no_reference",
+        requires_context=False,
+        reason="用户输入里没有明确论文目标线索。",
+        target=None,
+    )
 
 
 def _resolve_paper_reference(message: str, context: Any) -> Dict[str, Any]:
-    """结合消息文本和上下文，解析出用户真正指向的论文对象。
+    """返回论文引用线索，不再解析最终目标论文。
 
-    这是整个模块的主入口。它会先解析引用类型，再按引用类型去 selected_paper、
-    last_papers 或显式 arXiv ID 中定位目标，最终返回统一的 success/failed 结果结构。
+    函数名暂时保留给现有调用点复用，但语义已经从“目标论文解析”降级为
+    “Reference Hint Extractor”。context 参数仅用于保持签名兼容，不能在这里读取
+    selected_paper/last_papers 并绑定具体论文，避免无目标请求被隐式落到默认论文上。
     """
-    reference = _parse_target_reference(message)
-    last_papers = _extract_last_papers(context)
-    selected_paper = _extract_selected_paper(context)
-
-    def build_success(paper_payload: Optional[Mapping[str, Any]], *, target: Optional[Dict[str, Any]], matched_from: str) -> Dict[str, Any]:
-        # 所有成功分支都通过统一构造器返回，保证字段形态稳定，便于上层节点直接消费。
-        normalized_paper = _normalize_context_paper(paper_payload or {})
-        resolved_arxiv_id = str(normalized_paper.get("arxiv_id") or "").strip() or None
-        resolved_title = str(normalized_paper.get("title") or "").strip() or None
-        return {
-            "status": "success",
-            "reason": None,
-            "target": target,
-            "paper": normalized_paper,
-            "arxiv_id": resolved_arxiv_id,
-            "title": resolved_title,
-            "matched_from": matched_from,
-        }
-
-    if reference is None:
-        # 用户没有显式说“哪篇”，则优先回退到当前选中论文；如果最近结果里只有一篇，也可直接默认命中。
-        if selected_paper is not None:
-            return build_success(selected_paper, target=None, matched_from="selected_paper")
-        if len(last_papers) == 1:
-            return build_success(last_papers[0], target=None, matched_from="single_recent_paper")
-        return {
-            "status": "failed",
-            "reason": "没有解析到目标论文。请先搜索论文，或直接提供 arXiv ID，或使用“第一篇 / 第二篇”指定搜索结果中的论文。",
-            "target": None,
-            "paper": None,
-            "arxiv_id": None,
-            "title": None,
-        }
-
-    if reference["target_type"] == "context_paper":
-        # “这篇论文”属于纯上下文引用，因此必须依赖 selected_paper 或唯一 recent paper 才能落地。
-        if selected_paper is not None:
-            return build_success(selected_paper, target=reference, matched_from="selected_paper")
-        if len(last_papers) == 1:
-            return build_success(last_papers[0], target=reference, matched_from="single_recent_paper")
-        return {
-            "status": "failed",
-            "reason": "当前没有可直接指代的目标论文。请先搜索论文、传入 selected_paper，或用“第一篇 / 第二篇”明确指定。",
-            "target": reference,
-            "paper": None,
-            "arxiv_id": None,
-            "title": None,
-        }
-
-    if reference["target_type"] == "ordinal":
-        ordinal = int(reference["target_value"])
-        if not last_papers:
-            return {
-                "status": "failed",
-                "reason": "没有可用的上一轮搜索结果，请先搜索论文，或者直接提供 arXiv ID",
-                "target": reference,
-                "paper": None,
-                "arxiv_id": None,
-                "title": None,
-            }
-        if ordinal < 0:
-            ordinal = len(last_papers) + ordinal + 1
-            reference = dict(reference)
-            reference["resolved_ordinal"] = ordinal
-        if ordinal > len(last_papers):
-            return {
-                "status": "failed",
-                "reason": f"上一轮搜索结果只有 {len(last_papers)} 篇，无法选择第 {ordinal} 篇",
-                "target": reference,
-                "paper": None,
-                "arxiv_id": None,
-                "title": None,
-            }
-        # 序号是按用户视角从 1 开始计数，因此内部访问列表时要减 1。
-        paper = dict(last_papers[ordinal - 1])
-        arxiv_id = str(paper.get("arxiv_id") or "").strip()
-        if not arxiv_id:
-            return {
-                "status": "failed",
-                "reason": "上一轮结果中目标论文缺少 arXiv ID，无法执行偏好动作",
-                "target": reference,
-                "paper": paper,
-                "arxiv_id": None,
-                "title": paper.get("title"),
-            }
-        return build_success(paper, target=reference, matched_from="last_papers")
-
-    arxiv_id = str(reference.get("arxiv_id") or reference.get("target_value") or "").strip()
-    if not arxiv_id:
-        return {
-            "status": "failed",
-            "reason": "无法解析 arXiv ID",
-            "target": reference,
-            "paper": None,
-            "arxiv_id": None,
-            "title": None,
-        }
-
-    # 对显式 arXiv ID，优先尝试在最近论文列表或当前选中论文中补全完整元数据。
-    paper = next((paper for paper in last_papers if str(paper.get("arxiv_id") or "").strip() == arxiv_id), None)
-    if paper is None and selected_paper is not None and str(selected_paper.get("arxiv_id") or "").strip() == arxiv_id:
-        paper = selected_paper
-    if paper is not None:
-        return build_success(paper, target=reference, matched_from="explicit_arxiv_id")
-
-    return {
-        "status": "success",
-        "reason": None,
-        "target": reference,
-        "paper": None,
-        "arxiv_id": arxiv_id,
-        "title": selected_paper.get("title") if isinstance(selected_paper, Mapping) and str(selected_paper.get("arxiv_id") or "").strip() == arxiv_id else None,
-        "matched_from": "explicit_arxiv_id",
-    }
+    del context
+    hint = _parse_target_reference(message)
+    if hint["reference_type"] == "unknown":
+        return hint
+    return hint
 
 
 __all__ = [

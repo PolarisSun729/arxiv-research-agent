@@ -46,6 +46,13 @@ CORE_CONFIG: Dict[str, Any] = {
     "service_load_mode": _env_str("BACKEND_SERVICE_LOAD_MODE", "preload"),
 }
 
+DEBUG_ROUTES_CONFIG: Dict[str, Any] = {
+    # 调试路由会读取本地诊断产物，默认关闭，避免生产或演示环境暴露内部文件结构。
+    "enable_debug_routes": _env_bool("ENABLE_DEBUG_ROUTES", False),
+    # chunk 调试接口只返回文本预览，防止一次请求把完整 PDF 解析文本或超大字段暴露出去。
+    "chunk_content_preview_chars": _env_int("DEBUG_CHUNK_CONTENT_PREVIEW_CHARS", 4000),
+}
+
 DOCLING_CONFIG: Dict[str, Any] = {
     "do_ocr_enabled": _env_bool("DOCLING_OCR_ENABLED", False),
     "annotated_pdf_export_enabled": _env_bool("DOCLING_ANNOTATED_PDF_EXPORT_ENABLED", True),
@@ -101,16 +108,27 @@ PROFILE_EVIDENCE_CONFIG: Dict[str, Any] = {
 }
 
 AGENT_PLANNER_CONFIG: Dict[str, Any] = {
-    # 默认启用规则型 Tool-Aware planner；LLM draft 仍需显式开启，避免规划链路直接依赖外部模型。
-    "enable_tool_aware_planner": _env_bool("ENABLE_TOOL_AWARE_PLANNER", True),
-    "enable_llm_plan_draft": _env_bool("ENABLE_LLM_PLAN_DRAFT", False),
+    # planner_runtime_mode 决定主路径策略：
+    # - llm_preferred: 先走 LLM draft，再做本地校验，失败时回退到 rule/template。
+    # - rule_only: 只走规则 planner。
+    # - llm_only_strict: 只测试 LLM draft，失败直接报错，不做业务兜底。
+    # - demo_rule: 演示/稳定场景优先固定规则路径，避免引入 LLM 波动。
+    "planner_runtime_mode": _env_str("AGENT_PLANNER_MODE", _env_str("PLANNER_RUNTIME_MODE", "llm_preferred")).lower() or "llm_preferred",
+    # 这些显式开关仍保留，用于兼容历史环境变量；最终是否生效由 planner_runtime_mode 统一裁决。
+    "enable_rule_based_planner": _env_bool("ENABLE_RULE_BASED_PLANNER", _env_bool("ENABLE_TOOL_AWARE_PLANNER", True)),
+    "enable_tool_aware_planner": _env_bool("ENABLE_TOOL_AWARE_PLANNER", _env_bool("ENABLE_RULE_BASED_PLANNER", True)),
+    "enable_experimental_llm_planner": _env_bool("ENABLE_EXPERIMENTAL_LLM_PLANNER", _env_bool("ENABLE_LLM_PLAN_DRAFT", True)),
+    "enable_llm_plan_draft": _env_bool("ENABLE_LLM_PLAN_DRAFT", _env_bool("ENABLE_EXPERIMENTAL_LLM_PLANNER", True)),
     # Recovery 诊断默认关闭；即使开启也只提供语义诊断/排序建议，不能直接改写计划或执行工具。
     "enable_llm_recovery_diagnosis": _env_bool("ENABLE_LLM_RECOVERY_DIAGNOSIS", False),
     "llm_recovery_timeout": _env_int("LLM_RECOVERY_TIMEOUT_SECONDS", 6),
     "llm_plan_timeout": _env_int("LLM_PLAN_TIMEOUT_SECONDS", 8),
     "llm_plan_max_steps": _env_int("LLM_PLAN_MAX_STEPS", 8),
-    "llm_plan_fallback_to_rule": _env_bool("LLM_PLAN_FALLBACK_TO_RULE", True),
-    "llm_plan_fallback_to_template": _env_bool("LLM_PLAN_FALLBACK_TO_TEMPLATE", True),
+    # LLM draft 失败后先回退到规则型 planner；显式开关便于日志和 trace 说明真实兜底顺序。
+    "enable_rule_fallback_after_llm_planner": _env_bool("ENABLE_RULE_FALLBACK_AFTER_LLM_PLANNER", _env_bool("LLM_PLAN_FALLBACK_TO_RULE", True)),
+    "llm_plan_fallback_to_rule": _env_bool("LLM_PLAN_FALLBACK_TO_RULE", _env_bool("ENABLE_RULE_FALLBACK_AFTER_LLM_PLANNER", True)),
+    "enable_template_fallback_planner": _env_bool("ENABLE_TEMPLATE_FALLBACK_PLANNER", _env_bool("LLM_PLAN_FALLBACK_TO_TEMPLATE", True)),
+    "llm_plan_fallback_to_template": _env_bool("LLM_PLAN_FALLBACK_TO_TEMPLATE", _env_bool("ENABLE_TEMPLATE_FALLBACK_PLANNER", True)),
     "expose_planner_debug": _env_bool("EXPOSE_PLANNER_DEBUG", True),
 }
 
@@ -502,6 +520,10 @@ def get_embedding_runtime_config() -> Dict[str, Any]:
 
 def get_chunking_runtime_config() -> Dict[str, Any]:
     return dict(CHUNKING_CONFIG)
+
+
+def get_debug_routes_runtime_config() -> Dict[str, Any]:
+    return dict(DEBUG_ROUTES_CONFIG)
 
 
 def get_arxiv_search_runtime_config() -> Dict[str, Any]:

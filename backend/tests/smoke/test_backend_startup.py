@@ -109,6 +109,9 @@ class BackendStartupSmokeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.app = self.main.create_app(load_mode="lazy")
         self.app.dependency_overrides[self.dependencies.get_arxiv_service] = lambda: _FakeArxivService()
+        # arxiv 下载路由的请求体校验发生在依赖解析之后；这里也覆盖 API service，
+        # 避免前序测试留下的 arXiv service 桩污染 smoke 测试的校验错误断言。
+        self.app.dependency_overrides[self.dependencies.get_arxiv_api_service] = lambda: _FakeArxivService()
         self.app.dependency_overrides[self.dependencies.get_database_service] = lambda: _FakeDatabaseService()
         self.app.dependency_overrides[self.dependencies.get_oai_database_service] = lambda: _FakeOaiDatabaseService()
         self.app.dependency_overrides[self.dependencies.get_paper_qa_service] = lambda: _FakePaperQAService()
@@ -129,9 +132,24 @@ class BackendStartupSmokeTests(unittest.TestCase):
             "/api/sync-status",
             "/api/paper/{arxiv_id}/qa-status",
             "/api/user/preferences/{user_id}",
-            "/api/chunks/files",
         }
         self.assertTrue(expected_paths.issubset(set(routes)))
+        self.assertNotIn("/api/chunks/files", routes)
+        self.assertNotIn("/api/debug/chunks/files", routes)
+
+    def test_debug_chunk_router_is_only_registered_when_enabled(self) -> None:
+        debug_app = self.main.create_app(load_mode="lazy", enable_debug_routes=True)
+        routes = {getattr(route, "path", "") for route in debug_app.routes}
+
+        self.assertIn("/api/debug/chunks/files", routes)
+        self.assertIn("/api/debug/chunks/file/{filename}", routes)
+        self.assertNotIn("/api/chunks/files", routes)
+
+    def test_openapi_excludes_debug_routes_by_default(self) -> None:
+        paths = self.client.get("/openapi.json").json()["paths"]
+
+        self.assertNotIn("/api/debug/chunks/files", paths)
+        self.assertNotIn("/api/chunks/files", paths)
 
     def test_basic_api_requests_return_stable_payloads_without_external_services(self) -> None:
         fields_response = self.client.get("/api/arxiv/fields")

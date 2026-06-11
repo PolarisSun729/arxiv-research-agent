@@ -4,14 +4,14 @@
 
 当前后端 HTTP 入口统一从 [backend/main.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/main.py) 进入。`FastAPI` 应用在 `create_app()` 中创建，所有对外 API 都先挂到同一个 `app` 上，然后通过 `app.include_router(..., prefix="/api")` 统一加上全局前缀 `/api`。
 
-也就是说，前端请求进入后端后，并不是先进入某个 service，而是先进入 `FastAPI app`，随后由 URL 路径匹配到对应 router。当前最关键的入口 router 有 6 个：
+也就是说，前端请求进入后端后，并不是先进入某个 service，而是先进入 `FastAPI app`，随后由 URL 路径匹配到对应 router。当前默认注册的正式入口 router 有 5 个：
 
 - `arxiv_router.py`：arXiv 搜索、字段、分类、下载、搜索并保存
 - `agent_router.py`：Agent 对话、流式对话、Graph 导出
 - `user_router.py`：用户偏好、行为、画像、兴趣向量、推荐
 - `paper_router.py`：论文基础信息、统计、同步状态
 - `qa_router.py`：论文 QA、索引、会话、笔记、trace
-- `chunk_router.py`：本地 chunk 调试查看
+- `chunk_router.py`：本地 chunk 调试查看，仅在 `ENABLE_DEBUG_ROUTES=true` 时作为内部调试接口注册
 
 如果只回答“一个请求最先会进入哪个 router”，答案是：
 
@@ -42,12 +42,13 @@
 | 3 | `user_router` | `backend/routers/user_router.py` | `/api` | `/user` | `/api/user` | `["user"]` |
 | 4 | `paper_router` | `backend/routers/paper_router.py` | `/api` | 无 | `/api` | `["paper"]` |
 | 5 | `qa_router` | `backend/routers/qa_router.py` | `/api` | `/paper/{arxiv_id}` | `/api/paper/{arxiv_id}` | `["paper-qa"]` |
-| 6 | `chunk_router` | `backend/routers/chunk_router.py` | `/api` | `/chunks` | `/api/chunks` | `["chunks"]` |
+| 条件注册 | `chunk_debug_router` | `backend/routers/chunk_router.py` | `/api` | `/debug/chunks` | `/api/debug/chunks` | `["debug-chunks"]` |
 
 这里有两个容易误判的点：
 
 - `paper_router.py` 没有声明 router 级别 `prefix`，所以它的接口会直接落在 `/api/stats`、`/api/paper/{arxiv_id}`、`/api/papers` 这类路径上。
 - `qa_router.py` 的 router 级别前缀是 `/paper/{arxiv_id}`，因此它本质上是“挂在单篇论文下面的一组子资源”，比如 `/api/paper/{arxiv_id}/qa`、`/api/paper/{arxiv_id}/notes`。
+- `chunk_router.py` 默认不注册；只有本地排查时显式开启 `ENABLE_DEBUG_ROUTES=true`，才会出现在 `/api/debug/chunks/*`。
 
 ### 2.3 全局入口逻辑
 
@@ -100,7 +101,7 @@
 | `user_router.py` | `/user` | `["user"]` | 用户偏好、论文行为、研究画像、兴趣向量、个性化推荐 |
 | `paper_router.py` | 无 | `["paper"]` | 首页统计、同步状态、论文基础信息增删查 |
 | `qa_router.py` | `/paper/{arxiv_id}` | `["paper-qa"]` | 单篇论文 QA、索引构建、QA trace、会话、笔记 |
-| `chunk_router.py` | `/chunks` | `["chunks"]` | 查看本地 chunk 调试产物 |
+| `chunk_router.py` | `/debug/chunks` | `["debug-chunks"]` | 条件注册的本地 chunk 调试产物查看，不属于默认正式 API |
 
 ## 4. Router 逐个分析
 
@@ -500,12 +501,12 @@
 #### Endpoints
 
 1. `POST /api/user/preferences`
-   - Endpoint：`upsert_user_preferences()`
+   - Endpoint：`legacy_post_user_preferences()`
    - 输入参数：
      - Body：`user_id`
    - 主要调用对象：`DatabaseService.get_user_preferences()`
-   - 业务功能：按 `user_id` 读取用户偏好
-   - 备注：函数名叫 `upsert`，但当前实现实际是读取，不是写入
+   - 业务功能：deprecated 兼容读取入口；正式读取应使用 `GET /api/user/preferences/{user_id}`
+   - 备注：不会创建、更新或 upsert 偏好；响应和 OpenAPI 都显式标记 deprecated
 
 2. `GET /api/user/preferences/{user_id}`
    - Endpoint：`get_user_preferences()`
@@ -520,7 +521,7 @@
      - `user_id`
      - `paper`
    - 主要调用对象：`RecommendationService.record_user_paper_preference(liked=True)`
-   - 业务功能：记录“喜欢论文”反馈，并触发论文物化与画像更新
+   - 业务功能：记录“喜欢论文”强偏好，并触发论文物化与画像事件写入；不写通用 paper-action
 
 4. `POST /api/user/dislike-paper`
    - Endpoint：`dislike_paper()`
@@ -529,7 +530,7 @@
      - `user_id`
      - `paper`
    - 主要调用对象：`RecommendationService.record_user_paper_preference(liked=False)`
-   - 业务功能：记录“不喜欢论文”反馈，并触发论文物化与画像更新
+   - 业务功能：记录“不喜欢论文”强偏好，并触发论文物化与画像事件写入；不写通用 paper-action
 
 5. `POST /api/user/paper-action`
    - Endpoint：`record_paper_action()`
@@ -540,7 +541,7 @@
      - `paper`
      - `metadata`
    - 主要调用对象：`RecommendationService.record_user_paper_action()`
-   - 业务功能：记录通用论文行为事件
+   - 业务功能：记录弱论文行为事件；拒绝 `like/dislike` 及其等价表达
 
 6. `DELETE /api/user/paper-action`
    - Endpoint：`remove_paper_action()`
@@ -549,7 +550,7 @@
      - `action_type`
      - `user_id`
    - 主要调用对象：`DatabaseService.remove_user_paper_action()`
-   - 业务功能：删除一条论文行为记录
+   - 业务功能：删除一条弱论文行为记录；取消喜欢/不喜欢必须走强偏好专用 DELETE
 
 7. `GET /api/user/paper-actions/{user_id}`
    - Endpoint：`get_user_paper_actions()`
@@ -628,23 +629,24 @@
 
 ### 4.6 `backend/routers/chunk_router.py`
 
-- Router prefix：`/chunks`
-- Tags：`["chunks"]`
-- 主要职责：查看本地 chunk 调试产物，不是核心业务入口，但已注册为 HTTP API
+- Router prefix：`/debug/chunks`
+- Tags：`["debug-chunks"]`
+- 注册条件：`ENABLE_DEBUG_ROUTES=true`
+- 主要职责：查看本地 chunk 调试产物，仅用于开发排查；默认生产/演示模式不会注册到 OpenAPI
 
 #### Endpoints
 
-1. `GET /api/chunks/files`
+1. `GET /api/debug/chunks/files`
    - Endpoint：`list_chunk_files()`
    - 输入参数：无
    - 主要调用对象：本地文件系统 `backend/01-loaded-docs`
-   - 业务功能：列出本地 chunk JSON 文件
+   - 业务功能：列出本地 chunk JSON 文件，只返回文件名、大小和修改时间，不返回绝对路径
 
-2. `GET /api/chunks/file/{filename}`
+2. `GET /api/debug/chunks/file/{filename}`
    - Endpoint：`get_chunk_file()`
    - 输入参数：Path `filename`
    - 主要调用对象：本地文件系统 `backend/01-loaded-docs`
-   - 业务功能：读取指定 chunk JSON 内容
+   - 业务功能：读取指定 chunk JSON 的裁剪调试视图，移除本地路径、原始页面全文和 embedding 向量
 
 ## 5. API Endpoint 映射表
 
@@ -685,12 +687,12 @@
 | `/api/paper/{arxiv_id}/notes/export` | GET | `qa_router.py` | `export_paper_notes_markdown()` | `DatabaseService` | 导出论文笔记 Markdown |
 | `/api/paper/{arxiv_id}/qa` | POST | `qa_router.py` | `qa_paper()` | `PaperQAService.answer_question` | 同步论文问答 |
 | `/api/paper/{arxiv_id}/qa/stream` | POST | `qa_router.py` | `qa_paper_stream()` | `PaperQAService` + `GenerationService` | 流式论文问答 |
-| `/api/user/preferences` | POST | `user_router.py` | `upsert_user_preferences()` | `DatabaseService` | 按 user_id 读取偏好 |
+| `/api/user/preferences` | POST | `user_router.py` | `legacy_post_user_preferences()` | `DatabaseService` | Deprecated 兼容读取；请改用 GET |
 | `/api/user/preferences/{user_id}` | GET | `user_router.py` | `get_user_preferences()` | `DatabaseService` | 读取用户偏好 |
-| `/api/user/like-paper` | POST | `user_router.py` | `like_paper()` | `RecommendationService.record_user_paper_preference` | 记录喜欢论文 |
-| `/api/user/dislike-paper` | POST | `user_router.py` | `dislike_paper()` | `RecommendationService.record_user_paper_preference` | 记录不喜欢论文 |
-| `/api/user/paper-action` | POST | `user_router.py` | `record_paper_action()` | `RecommendationService.record_user_paper_action` | 记录通用论文行为 |
-| `/api/user/paper-action` | DELETE | `user_router.py` | `remove_paper_action()` | `DatabaseService` | 删除论文行为记录 |
+| `/api/user/like-paper` | POST | `user_router.py` | `like_paper()` | `RecommendationService.record_user_paper_preference` | 记录喜欢论文强偏好 |
+| `/api/user/dislike-paper` | POST | `user_router.py` | `dislike_paper()` | `RecommendationService.record_user_paper_preference` | 记录不喜欢论文强偏好 |
+| `/api/user/paper-action` | POST | `user_router.py` | `record_paper_action()` | `RecommendationService.record_user_paper_action` | 记录弱论文行为，拒绝 like/dislike |
+| `/api/user/paper-action` | DELETE | `user_router.py` | `remove_paper_action()` | `DatabaseService` | 删除弱论文行为记录 |
 | `/api/user/paper-actions/{user_id}` | GET | `user_router.py` | `get_user_paper_actions()` | `DatabaseService` | 查询论文行为明细与映射 |
 | `/api/user/research-profile/{user_id}` | GET | `user_router.py` | `get_user_research_profile()` | `MemoryService` | 读取研究画像 |
 | `/api/user/research-profile` | PUT | `user_router.py` | `upsert_user_research_profile()` | `MemoryService.patch_user_profile` | 整体更新研究画像 |
@@ -700,8 +702,8 @@
 | `/api/user/generate-interest-vector` | POST | `user_router.py` | `generate_user_interest_vector()` | `RecommendationService.generate_user_interest_vector` | 重建兴趣向量 |
 | `/api/user/interest-vector` | GET | `user_router.py` | `get_user_interest_vector()` | `DatabaseService` | 查询兴趣向量 |
 | `/api/user/recommend-papers` | POST | `user_router.py` | `recommend_papers()` | `RecommendationService.recommend_papers` | 生成个性化推荐 |
-| `/api/chunks/files` | GET | `chunk_router.py` | `list_chunk_files()` | 本地 chunk 文件目录 | 列出 chunk JSON 文件 |
-| `/api/chunks/file/{filename}` | GET | `chunk_router.py` | `get_chunk_file()` | 本地 chunk 文件目录 | 读取指定 chunk 文件 |
+| `/api/debug/chunks/files` | GET | `chunk_router.py` | `list_chunk_files()` | 本地 chunk 文件目录 | Debug only；列出 chunk JSON 文件 |
+| `/api/debug/chunks/file/{filename}` | GET | `chunk_router.py` | `get_chunk_file()` | 本地 chunk 文件目录 | Debug only；读取裁剪后的 chunk 文件视图 |
 
 ## 6. 按业务功能归类
 
@@ -881,7 +883,8 @@
 负责的功能：
 
 - 用户偏好：`preferences` 相关接口
-- liked / disliked paper：`like-paper`、`dislike-paper`、对应 `DELETE`
+- liked / disliked paper：`like-paper`、`dislike-paper`、对应 `DELETE`，这是显式强偏好的唯一权威入口
+- 弱论文行为：`paper-action`，只用于 `favorite`、`read`、`later`、`archived`、`note_saved`、`not_interested` 等弱信号；`like/dislike` 及等价表达会被拒绝
 - 用户画像：`research-profile` 的 `GET/PUT/PATCH`
 - 推荐结果：`POST /api/user/recommend-papers`
 - memory 更新或读取：
@@ -921,7 +924,7 @@ flowchart TD
     Main --> UserRouter["user_router.py\n用户 / 偏好 / 推荐"]
     Main --> PaperRouter["paper_router.py\n论文基础信息与统计"]
     Main --> QARouter["qa_router.py\n单篇论文 QA / 会话 / 笔记"]
-    Main --> ChunkRouter["chunk_router.py\nchunk 调试查看"]
+    Main -. "ENABLE_DEBUG_ROUTES=true" .-> ChunkRouter["chunk_router.py\n内部 chunk 调试查看"]
 
     AgentRouter --> AgentService["agents/arxiv_search_agent"]
     QARouter --> PaperQAService["PaperQAService"]
@@ -937,7 +940,7 @@ flowchart TD
 
 - `agent_router.py` 的职责边界相对清晰，基本只做 Agent HTTP 封装
 - `arxiv_router.py` 的职责也比较清晰，主要围绕 arXiv 查询与下载
-- `chunk_router.py` 明显是调试辅助接口
+- `chunk_router.py` 已从默认正式 API 中剥离，只有开启 `ENABLE_DEBUG_ROUTES` 时才作为内部调试接口出现
 
 ### 8.2 哪些 router 的职责边界有些混合
 
@@ -979,7 +982,7 @@ flowchart TD
 
 有几处值得注意：
 
-- `POST /api/user/preferences` 对应函数名 `upsert_user_preferences()`，但当前实现其实只是读取偏好，不是 upsert
+- `POST /api/user/preferences` 已改为 deprecated 兼容读取入口 `legacy_post_user_preferences()`；正式读取统一走 `GET /api/user/preferences/{user_id}`，真正写入偏好走 like/dislike/paper-action 等写接口
 - `paper_router.py` 没有 router 级 prefix，导致它的接口分布在 `/api/stats`、`/api/sync-status`、`/api/paper/...`、`/api/papers/...`，第一次读代码时不太容易一眼看出它们属于同一个 router
 - `qa_router.py` 的 prefix 是 `/paper/{arxiv_id}`，这很合理，但也容易让人误以为所有 `/paper/...` 都在 `paper_router.py`，实际上 QA 子路径已经切到另一个 router 了
 

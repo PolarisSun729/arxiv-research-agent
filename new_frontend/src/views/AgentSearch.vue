@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { dislikePaper, likePaper, removePaperPreference } from '@/api/papers'
 import { useAgentSearchChat } from '@/composables/useAgentSearchChat'
 import AgentResponsePanel from '@/components/agent-search/AgentResponsePanel.vue'
 import RagChatPanel from '@/components/rag-chat/RagChatPanel.vue'
+import type { PaperTargetCandidate } from '@/types/agent'
 import type { Paper } from '@/types/paper'
 import { usePaperStore } from '@/stores/paperStore'
 
@@ -13,6 +14,7 @@ const router = useRouter()
 const store = usePaperStore()
 const agentPaperLabels = new Map<string, 'liked' | 'disliked'>()
 const profileTopicPreview = computed(() => (store.researchProfile?.positive_topics || []).slice(0, 4))
+const selectedPendingCandidateId = ref('')
 
 const {
   inputMessage,
@@ -45,7 +47,58 @@ function handleClear() {
   clearConversation()
 }
 
+const isPaperTargetConfirmation = computed(() => {
+  const action = pendingAction.value
+  return action?.request_type === 'paper_target_confirmation' || action?.type === 'paper_target_confirmation'
+})
+
+const pendingTargetCandidates = computed<PaperTargetCandidate[]>(() => {
+  const candidates = pendingAction.value?.candidates
+  return Array.isArray(candidates) ? candidates : []
+})
+
+function paperCandidateId(candidate: PaperTargetCandidate, index = 0) {
+  return String(
+    candidate.candidate_id ||
+    candidate.paper_id ||
+    candidate.arxiv_id ||
+    candidate.arxivId ||
+    candidate.id ||
+    candidate.title ||
+    `candidate-${index}`
+  )
+}
+
+function paperCandidateAuthors(candidate: PaperTargetCandidate) {
+  if (candidate.authors_summary) return candidate.authors_summary
+  if (Array.isArray(candidate.authors)) return candidate.authors.slice(0, 3).join(', ')
+  return candidate.authors || ''
+}
+
+function paperCandidateSource(candidate: PaperTargetCandidate) {
+  return candidate.source_label || candidate.list_name || candidate.source_type || candidate.source || '上下文候选'
+}
+
+function selectedPendingCandidate() {
+  return pendingTargetCandidates.value.find((candidate, index) => paperCandidateId(candidate, index) === selectedPendingCandidateId.value) || null
+}
+
 function handleConfirmPendingAction() {
+  if (isPaperTargetConfirmation.value) {
+    const candidate = selectedPendingCandidate()
+    if (!candidate) {
+      ElMessage.warning('请先选择一篇论文')
+      return
+    }
+    // 确认目标论文只提交稳定身份字段，后端会在 pending confirmation 候选集合内再次校验。
+    submitResume('approve', '用户确认目标论文', {
+      pending_action_id: pendingAction.value?.pending_action_id,
+      confirmed_paper_id: selectedPendingCandidateId.value,
+      confirmed_arxiv_id: candidate.arxiv_id || candidate.arxivId || candidate.id || null
+    })
+    return
+  }
+
   submitResume('approve', '用户在确认卡片中批准执行')
 }
 
@@ -129,6 +182,18 @@ function syncAgentPreferenceState() {
 watch(latestResponse, () => {
   syncAgentPreferenceState()
 }, { deep: true })
+
+watch(pendingAction, action => {
+  if (!action || !(action.request_type === 'paper_target_confirmation' || action.type === 'paper_target_confirmation')) {
+    selectedPendingCandidateId.value = ''
+    return
+  }
+
+  const candidates = Array.isArray(action.candidates) ? action.candidates : []
+  const recommended = action.recommended_candidate || action.target_paper || candidates[0]
+  selectedPendingCandidateId.value = action.default_candidate_id
+    || (recommended ? paperCandidateId(recommended) : '')
+}, { immediate: true })
 </script>
 
 <template>
@@ -174,17 +239,77 @@ watch(latestResponse, () => {
           <div class="pending-action-banner__desc">
             {{ pendingAction.qa_question || pendingAction.original_question || '需要先确认是否解析 PDF 并建立全文索引。' }}
           </div>
+          <div v-if="isPaperTargetConfirmation" class="paper-target-candidates">
+            <el-radio-group v-model="selectedPendingCandidateId" class="paper-target-candidates__group">
+              <el-radio
+                v-for="(candidate, index) in pendingTargetCandidates"
+                :key="paperCandidateId(candidate, index)"
+                :label="paperCandidateId(candidate, index)"
+                class="paper-target-candidate"
+                border
+              >
+                <div class="paper-target-candidate__main">
+                  <div class="paper-target-candidate__title">
+                    {{ candidate.title || candidate.arxiv_id || candidate.arxivId || paperCandidateId(candidate, index) }}
+                  </div>
+                  <div class="paper-target-candidate__meta">
+                    <span v-if="candidate.arxiv_id || candidate.arxivId">arXiv: {{ candidate.arxiv_id || candidate.arxivId }}</span>
+                    <span v-if="paperCandidateAuthors(candidate)">作者: {{ paperCandidateAuthors(candidate) }}</span>
+                    <span v-if="candidate.rank">排名: #{{ candidate.rank }}</span>
+                    <span>来源: {{ paperCandidateSource(candidate) }}</span>
+                  </div>
+                </div>
+                <el-tag
+                  v-if="pendingAction.default_candidate_id === paperCandidateId(candidate, index)"
+                  size="small"
+                  type="success"
+                  effect="plain"
+                >
+                  默认
+                </el-tag>
+              </el-radio>
+            </el-radio-group>
+            <el-empty
+              v-if="pendingTargetCandidates.length === 0"
+              description="No candidate papers. Cancel and start again."
+              :image-size="72"
+            />
+          </div>
           <div class="pending-action-banner__meta">
+            <span v-if="pendingAction.pending_action_id">pending: {{ pendingAction.pending_action_id }}</span>
             <span>tool: {{ pendingAction.tool_name || '-' }}</span>
             <span>step: {{ pendingAction.step_id || '-' }}</span>
             <span>session: {{ activeSessionId || pendingAction.session_id || '-' }}</span>
+            <span v-if="pendingAction.expires_at">expires: {{ pendingAction.expires_at }}</span>
           </div>
         </div>
         <div class="pending-action-banner__actions">
-          <el-button type="primary" :disabled="loading" @click="handleConfirmPendingAction">
+          <el-button
+            type="primary"
+            :disabled="loading || (isPaperTargetConfirmation && !selectedPendingCandidateId)"
+            @click="handleConfirmPendingAction"
+          >
+            <span v-if="isPaperTargetConfirmation">&#30830;&#35748;&#24182;&#32487;&#32493;</span>
+            <span v-else>&#30830;&#35748;&#25191;&#34892;</span>
+            <span v-pre class="legacy-hidden">
+            {{ isPaperTargetConfirmation ? '确认并继续' : '确认执行' }}
+            </span>
+          </el-button>
+          <el-button
+            v-if="false"
+            type="primary"
+            :disabled="loading || (isPaperTargetConfirmation && !selectedPendingCandidateId)"
+            @click="handleConfirmPendingAction"
+          >
             解析并回答
           </el-button>
           <el-button :disabled="loading" @click="handleCancelPendingAction">
+            &#21462;&#28040;
+          </el-button>
+          <el-button v-if="false" :disabled="loading" @click="handleCancelPendingAction">
+            取消
+          </el-button>
+          <el-button v-if="false" :disabled="loading" @click="handleCancelPendingAction">
             取消
           </el-button>
         </div>
@@ -346,6 +471,54 @@ watch(latestResponse, () => {
   display: flex;
   gap: 10px;
   flex: none;
+}
+
+.paper-target-candidates {
+  margin-top: 12px;
+}
+
+.paper-target-candidates__group {
+  display: grid;
+  gap: 10px;
+}
+
+.paper-target-candidate {
+  height: auto;
+  margin-right: 0;
+  padding: 12px;
+  white-space: normal;
+}
+
+.paper-target-candidate :deep(.el-radio__label) {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+}
+
+.paper-target-candidate__main {
+  min-width: 0;
+}
+
+.paper-target-candidate__title {
+  color: #0f172a;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.paper-target-candidate__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.legacy-hidden {
+  display: none;
 }
 
 @media (max-width: 1024px) {

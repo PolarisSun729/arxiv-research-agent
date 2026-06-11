@@ -1,8 +1,7 @@
 export type PaperLabel = 'liked' | 'disliked'
 
+// 显式喜欢/不喜欢由 PaperLabel 与专用偏好接口维护；paper-action 只表达弱行为。
 export type PaperActionType =
-  | 'like'
-  | 'dislike'
   | 'favorite'
   | 'read'
   | 'later'

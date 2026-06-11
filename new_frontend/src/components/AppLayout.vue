@@ -5,6 +5,7 @@ import { useRouter, useRoute } from 'vue-router'
 const router = useRouter()
 const route = useRoute()
 const collapsed = ref(false)
+const debugRoutesEnabled = import.meta.env.VITE_ENABLE_DEBUG_ROUTES === 'true'
 
 function handleMenuClick(path: string) {
   router.push(path)
@@ -61,9 +62,9 @@ function handleMenuClick(path: string) {
           <span>已标记论文</span>
         </el-menu-item>
 
-        <el-menu-item index="/chunks" class="menu-item-doc" @click="handleMenuClick('/chunks')">
+        <el-menu-item v-if="debugRoutesEnabled" index="/chunks" class="menu-item-doc" @click="handleMenuClick('/chunks')">
           <span class="menu-icon-badge badge-doc">📄</span>
-          <span>文档切片</span>
+          <span>调试切片</span>
         </el-menu-item>
       </el-menu>
     </el-aside>

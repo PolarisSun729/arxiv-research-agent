@@ -122,7 +122,7 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
             outputs={"reason": "当前请求不是 preference_action"},
         )
 
-    # 先把输入和引用论文解析成结构化对象，后续所有分支都复用这些结果。
+    # 先把偏好动作和论文引用线索拆开；线索未落地到最终论文前不能写入持久化偏好。
     message = _normalize_text(next_state.message or "")
     parsed_action = _parse_preference_action(message)
     resolution = _resolve_paper_reference(message, next_state.context or {})
@@ -146,6 +146,7 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
         "arxiv_id": arxiv_id or None,
         "title": paper_title or None,
         "resolution_status": resolution.get("status"),
+        "final_target_resolved": bool(resolution.get("final_target_resolved")),
     }
     debug["preference_action_status"] = "pending"
     next_state.debug = debug
@@ -164,16 +165,22 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
         }
         next_state.warnings = _dedupe_preserve_order(list(next_state.warnings) + [preference_result["message"]])
     # 第二类失败：动作明确，但目标论文不明确，避免把偏好写到错误对象上。
-    elif resolution.get("status") != "success" or not arxiv_id:
+    # 偏好写入有持久化副作用；兼容节点必须拒绝只有引用线索、没有 Target Resolver 最终判定的结果。
+    elif resolution.get("status") != "success" or not resolution.get("final_target_resolved") or not arxiv_id:
+        hint_only_reason = (
+            "已提取论文引用线索，但尚未结合上下文解析成最终论文。"
+            if resolution.get("status") == "hint_extracted"
+            else "无法解析目标论文，请先搜索论文或直接提供 arXiv ID"
+        )
         preference_result = {
             "status": "failed",
             "action": parsed_action["action"],
             "label": "none",
             "arxiv_id": resolution.get("arxiv_id"),
             "title": resolution.get("title"),
-            "message": str(resolution.get("reason") or "无法解析目标论文，请先搜索论文或直接提供 arXiv ID"),
+            "message": str(resolution.get("reason") or hint_only_reason),
             "paper": paper_payload,
-            "error": str(resolution.get("reason") or "paper reference resolution failed"),
+            "error": str(resolution.get("reason") or hint_only_reason),
         }
         next_state.warnings = _dedupe_preserve_order(list(next_state.warnings) + [preference_result["message"]])
     else:

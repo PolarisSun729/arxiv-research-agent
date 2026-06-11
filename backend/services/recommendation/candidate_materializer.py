@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
+from services.user_behavior_policy import validate_weak_paper_action_type
+
 logger = logging.getLogger(__name__)
 
 
@@ -18,7 +20,7 @@ class CandidateMaterializer:
         paper_payload: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """记录用户对论文的行为事件，并确保论文已被物化到本地存储链路中。
+        """记录用户对论文的弱行为事件，并确保论文已被物化到本地存储链路中。
 
         这里的“物化”包含论文表记录与向量信息准备，目的是让后续画像更新、
         推荐召回与排序都能基于一致的数据主键工作。
@@ -27,8 +29,13 @@ class CandidateMaterializer:
         normalized_action = str(action_type or "").strip()
         if not normalized_arxiv_id:
             raise HTTPException(status_code=400, detail="arxiv_id is required")
-        if not normalized_action:
-            raise HTTPException(status_code=400, detail="action_type is required")
+        try:
+            normalized_action = validate_weak_paper_action_type(normalized_action)
+        except ValueError as exc:
+            if str(exc) == "explicit_preference_action_not_allowed":
+                # 服务层也要挡住 like/dislike，避免 Agent 或测试绕过 router 后重新写出双套偏好状态。
+                raise HTTPException(status_code=400, detail="paper-action does not accept like/dislike; use like-paper or dislike-paper") from exc
+            raise HTTPException(status_code=400, detail="unsupported paper action type") from exc
 
         # 先确保论文已被标准化入库，避免只记录了行为却缺少可追踪的论文实体。
         paper = self._ensure_paper_materialized(normalized_arxiv_id, paper_payload=paper_payload)

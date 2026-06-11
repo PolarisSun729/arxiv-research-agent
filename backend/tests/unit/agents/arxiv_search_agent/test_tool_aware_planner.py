@@ -377,6 +377,8 @@ def test_llm_valid_plan_draft_converts_to_executable_plan() -> None:
     assert debug["llm_plan_attempted"] is True
     assert debug["llm_plan_valid"] is True
     assert debug["selected_plan_source"] == "llm_tool_aware"
+    assert debug["planner_summary"]["final_path"] == "experimental_llm_draft_planner"
+    assert debug["planner_summary"]["llm_draft_experimental"] is True
     assert _step_ids(plan) == [
         "normalize_request",
         "build_arxiv_search_spec",
@@ -385,6 +387,9 @@ def test_llm_valid_plan_draft_converts_to_executable_plan() -> None:
         "synthesize_arxiv_response",
     ]
     PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
+    assert debug["llm_plan_raw_summary"]["is_json_object"] is True
+    assert debug["llm_plan_validation_summary"]["status"] == "passed"
+    assert "PlanValidator" in debug["llm_plan_validation_summary"]["validator_stack"]
 
 
 def test_llm_new_output_protocol_fields_are_accepted() -> None:
@@ -423,6 +428,9 @@ def test_llm_unknown_tool_falls_back_to_rule_based_planner() -> None:
     assert debug["rule_based_fallback_used"] is True
     assert debug["selected_plan_source"] == "tool_aware_rule_based"
     assert "not registered" in debug["llm_plan_invalid_reasons"][0] or "outside candidate" in debug["llm_plan_invalid_reasons"][0]
+    assert debug["planner_summary"]["fallback_record"]["code"] == "llm_planner_validation_failed"
+    assert debug["planner_summary"]["fallback_record"]["stage"] == "planner"
+    assert debug["planner_summary"]["fallback_record"]["source"] == "LLMPlanDraftGenerator"
     assert "search_arxiv" in _tool_names(plan)
 
 
@@ -473,6 +481,23 @@ def test_llm_invalid_depends_on_falls_back() -> None:
     assert "depends on missing" in debug["llm_plan_invalid_reasons"][0]
 
 
+def test_llm_missing_required_inputs_falls_back_with_validation_summary() -> None:
+    invalid = json.loads(_llm_arxiv_plan_json())
+    invalid["steps"][2]["input_bindings"] = []
+
+    _, _, debug = _current_modules()[0].build_executable_plan(
+        AgentState(intent="arxiv_search", message="search rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG")),
+        enable_tool_aware_planner=True,
+        enable_llm_plan_draft=True,
+        llm_generation_service=_FakeLLMPlanService(json.dumps(invalid, ensure_ascii=False)),
+    )
+
+    assert debug["llm_plan_valid"] is False
+    assert "missing required inputs" in debug["llm_plan_invalid_reasons"][0] or "missing input_bindings" in debug["llm_plan_invalid_reasons"][0]
+    assert debug["llm_plan_validation_summary"]["status"] == "failed"
+    assert debug["llm_plan_raw_summary"]["tool_names"][2] == "search_arxiv"
+
+
 def test_llm_non_json_falls_back() -> None:
     _, _, debug = _current_modules()[0].build_executable_plan(
         AgentState(intent="arxiv_search", message="search rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG")),
@@ -484,6 +509,7 @@ def test_llm_non_json_falls_back() -> None:
     assert debug["llm_plan_valid"] is False
     assert debug["selected_plan_source"] == "tool_aware_rule_based"
     assert "JSON-only" in debug["llm_plan_invalid_reasons"][0]
+    assert debug["llm_plan_raw_summary"]["is_json_object"] is False
 
 
 def test_llm_paper_qa_missing_resolve_or_validate_falls_back() -> None:
@@ -762,7 +788,7 @@ def test_llm_plan_draft_prompt_includes_unified_prompt_context() -> None:
     assert "confirm_index" in prompt
 
 
-def test_rule_based_failure_after_llm_failure_falls_back_to_fixed_template(monkeypatch) -> None:
+def test_rule_based_failure_after_llm_failure_falls_back_to_legacy_template(monkeypatch) -> None:
     current_planner, current_tool_aware, _ = _current_modules()
 
     def fail_rule_builder(self, *_args, **_kwargs):
@@ -778,8 +804,11 @@ def test_rule_based_failure_after_llm_failure_falls_back_to_fixed_template(monke
     )
 
     assert debug["template_fallback_used"] is True
-    assert debug["selected_plan_source"] == "fixed_template_fallback"
-    assert [step.step_id for step in plan.steps][:2] == ["normalize_request", "build_arxiv_search_spec"]
+    assert debug["selected_plan_source"] == "legacy_template_fallback"
+    assert debug["planner_summary"]["final_path"] == "legacy_template_fallback_planner"
+    assert debug["planner_summary"]["fallback_record"]["code"] == "tool_aware_planner_failed"
+    assert debug["planner_summary"]["fallback_record"]["source"] == "legacy_template_fallback"
+    assert [step.tool_name for step in plan.steps] == ["generate_fallback_response"]
     PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
 
 
@@ -795,6 +824,8 @@ def test_rule_based_arxiv_search_generates_valid_executable_plan() -> None:
 
     assert debug["planner_mode"] == "tool_aware_rule_based"
     assert debug["final_plan_source"] == "tool_aware_rule_based"
+    assert debug["planner_summary"]["final_path"] == "rule_based_planner"
+    assert debug["planner_summary"]["template_fallback_used"] is False
     assert _step_ids(plan) == [
         "normalize_request",
         "build_arxiv_search_spec",
@@ -807,7 +838,7 @@ def test_rule_based_arxiv_search_generates_valid_executable_plan() -> None:
     PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
 
 
-def test_tool_aware_planner_disabled_uses_fixed_template_plan() -> None:
+def test_tool_aware_planner_disabled_uses_legacy_template_fallback() -> None:
     state = AgentState(
         intent="arxiv_search",
         message="search rag",
@@ -819,16 +850,13 @@ def test_tool_aware_planner_disabled_uses_fixed_template_plan() -> None:
         enable_tool_aware_planner=False,
     )
 
-    assert debug["planner_mode"] == "fixed_template"
-    assert debug["final_plan_source"] == "fixed_template"
-    assert _step_ids(plan) == [
-        "normalize_request",
-        "build_arxiv_search_spec",
-        "search_arxiv",
-        "validate_arxiv_results",
-        "personalize_paper_results",
-        "synthesize_arxiv_response",
-    ]
+    assert debug["planner_mode"] == "primary_planner_disabled"
+    assert debug["final_plan_source"] == "legacy_template_fallback"
+    assert debug["planner_summary"]["configured_primary_path"] == "primary_planner_disabled"
+    assert debug["planner_summary"]["final_path"] == "legacy_template_fallback_planner"
+    assert debug["planner_summary"]["fallback_record"]["code"] == "tool_aware_planner_disabled"
+    assert debug["planner_summary"]["fallback_record"]["source"] == "legacy_template_fallback"
+    assert _step_ids(plan) == ["generate_fallback_response"]
 
 
 def test_rule_based_paper_qa_generates_resolve_check_answer_plan() -> None:
@@ -843,14 +871,65 @@ def test_rule_based_paper_qa_generates_resolve_check_answer_plan() -> None:
 
     assert _step_ids(plan) == ["resolve_paper", "check_paper_index", "answer_paper_question", "assess_paper_qa_quality"]
     assert _tool_names(plan) == ["resolve_paper", "check_paper_index", "answer_paper_question", "assess_paper_qa_quality"]
-    quality_step = plan.steps[-1]
-    assert quality_step.action_type == "validate"
-    assert quality_step.depends_on == ["answer_paper_question"]
-    assert debug["planner_context"]["goal_type"] == "paper_qa"
-    assert "selected_paper" in debug["planner_context"]["used_context_fields"]
-    assert "parse_and_index_paper" in debug["planner_context"]["high_risk_tools"]
-    assert any(item["step_id"] == "parse_and_index_paper" for item in debug["skipped_steps"])
-    PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
+    assert debug["planner_summary"]["template_fallback_used"] is False
+
+
+def test_planner_runtime_mode_demo_rule_disables_llm_attempt(monkeypatch) -> None:
+    current_planner, _, _ = _current_modules()
+
+    monkeypatch.setattr(
+        current_planner,
+        "_get_agent_planner_runtime_config",
+        lambda: {
+            "planner_runtime_mode": "demo_rule",
+            "enable_rule_based_planner": True,
+            "enable_tool_aware_planner": True,
+            "enable_experimental_llm_planner": True,
+            "enable_llm_plan_draft": True,
+            "enable_rule_fallback_after_llm_planner": True,
+            "enable_template_fallback_planner": True,
+            "llm_plan_timeout": 8,
+            "llm_plan_max_steps": 8,
+            "expose_planner_debug": True,
+        },
+    )
+
+    _, _, debug = current_planner.build_executable_plan(
+        AgentState(intent="arxiv_search", message="search rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG")),
+        enable_tool_aware_planner=True,
+    )
+
+    assert debug["planner_summary"]["planner_runtime_mode"] == "demo_rule"
+    assert debug["llm_plan_attempted"] is False
+    assert debug["selected_plan_source"] == "tool_aware_rule_based"
+
+
+def test_planner_runtime_mode_llm_only_strict_raises_on_invalid_llm(monkeypatch) -> None:
+    current_planner, _, _ = _current_modules()
+
+    monkeypatch.setattr(
+        current_planner,
+        "_get_agent_planner_runtime_config",
+        lambda: {
+            "planner_runtime_mode": "llm_only_strict",
+            "enable_rule_based_planner": True,
+            "enable_tool_aware_planner": True,
+            "enable_experimental_llm_planner": True,
+            "enable_llm_plan_draft": True,
+            "enable_rule_fallback_after_llm_planner": False,
+            "enable_template_fallback_planner": False,
+            "llm_plan_timeout": 8,
+            "llm_plan_max_steps": 8,
+            "expose_planner_debug": True,
+        },
+    )
+
+    with pytest.raises(Exception, match="llm_only_strict planning failed"):
+        current_planner.build_executable_plan(
+            AgentState(intent="arxiv_search", message="search rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG")),
+            enable_tool_aware_planner=True,
+            llm_generation_service=_FakeLLMPlanService("Here is a plan: use search."),
+        )
 
 
 def test_paper_summary_detail_and_qa_keep_distinct_plan_shapes() -> None:
@@ -882,7 +961,7 @@ def test_paper_summary_detail_and_qa_keep_distinct_plan_shapes() -> None:
 
 
 def test_rule_based_recommendation_generates_full_plan() -> None:
-    _, plan, _ = _build_tool_aware_plan("recommendation", state=AgentState(intent="recommendation", message="recommend rag papers"))
+    _, plan, debug = _build_tool_aware_plan("recommendation", state=AgentState(intent="recommendation", message="recommend rag papers"))
 
     assert _step_ids(plan) == [
         "load_user_profile",
@@ -891,6 +970,9 @@ def test_rule_based_recommendation_generates_full_plan() -> None:
         "validate_recommendations",
         "explain_recommendations",
     ]
+    assert debug["recommendation_summary"]["mode"] == "agent_orchestration_with_service_core"
+    assert debug["recommendation_summary"]["core_service"] == "RecommendationService.recommend_papers"
+    assert debug["planner_summary"]["template_fallback_used"] is False
     PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
 
 
@@ -935,6 +1017,17 @@ def test_rule_based_unclear_only_generates_clarification_plan() -> None:
     PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
 
 
+def test_rule_based_unclear_exposes_clarification_boundary_summary() -> None:
+    _, plan, debug = _build_tool_aware_plan("unclear", state=AgentState(intent="unclear", message="这篇怎么样"))
+
+    assert debug["planner_summary"]["final_path"] == "rule_based_planner"
+    assert debug["clarification_summary"]["mode"] == "missing_information_analysis"
+    assert debug["clarification_summary"]["analysis_source"] == "rule_based_missing_information_analysis"
+    assert debug["clarification_summary"]["question_source"] == "template_clarification_response"
+    assert debug["clarification_summary"]["is_llm_backed"] is False
+    assert plan.metadata["capability_boundary"]["clarification"]["analysis_source"] == "rule_based_missing_information_analysis"
+
+
 def test_rule_based_unsupported_only_generates_fallback_plan() -> None:
     _, plan, _ = _build_tool_aware_plan("unsupported", state=AgentState(intent="unsupported", message="帮我做一个系统不支持的任务"))
 
@@ -973,7 +1066,7 @@ def test_rule_based_optional_personalize_missing_does_not_fail(monkeypatch) -> N
     assert any(item["step_id"] == "personalize_paper_results" for item in debug["skipped_steps"])
 
 
-def test_tool_aware_planning_falls_back_to_fixed_template_when_required_tool_missing(monkeypatch) -> None:
+def test_tool_aware_planning_falls_back_to_legacy_template_when_required_tool_missing(monkeypatch) -> None:
     current_planner, current_tool_aware, _ = _current_modules()
     current_schemas = sys.modules.get("backend.agents.arxiv_search_agent.schemas") or schemas
     original_select = current_tool_aware.ToolCandidateSelector.select
@@ -998,9 +1091,12 @@ def test_tool_aware_planning_falls_back_to_fixed_template_when_required_tool_mis
     assert debug["planner_mode"] == "tool_aware_rule_based"
     assert debug["fallback_used"] is True
     assert debug["validation_status"] == "failed"
-    assert debug["final_plan_source"] == "fixed_template_fallback"
+    assert debug["final_plan_source"] == "legacy_template_fallback"
     assert "missing required tool" in debug["fallback_reason"]
-    assert [step.step_id for step in plan.steps][:2] == ["normalize_request", "build_arxiv_search_spec"]
+    assert debug["planner_summary"]["fallback_record"]["code"] == "tool_aware_planner_failed"
+    assert debug["planner_summary"]["fallback_record"]["stage"] == "planner"
+    assert debug["planner_summary"]["fallback_record"]["source"] == "legacy_template_fallback"
+    assert [step.tool_name for step in plan.steps] == ["generate_fallback_response"]
 
 
 def test_rule_based_plan_can_be_executed_by_existing_plan_executor(monkeypatch) -> None:

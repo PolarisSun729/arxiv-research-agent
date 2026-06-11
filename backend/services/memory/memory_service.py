@@ -49,7 +49,7 @@ PROFILE_BUILD_DEFAULT_PAPER_LIMITS = {
     "repair": 80,
 }
 PROFILE_STRONG_EVENT_TYPES = {"liked", "disliked", "favorite", "later", "note_saved", "qa_asked", "not_interested"}
-PROFILE_RECENT_CONTEXT_EVENT_TYPES = {"liked", "favorite", "later", "note_saved", "qa_asked"}
+PROFILE_RECENT_CONTEXT_EVENT_TYPES = {"liked", "disliked", "favorite", "later", "note_saved", "qa_asked"}
 
 
 class MemoryService:
@@ -878,7 +878,7 @@ class MemoryService:
         extra_recent_actions: Optional[List[Dict[str, Any]]] = None,
         extra_notes: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """从 append-only 画像事件流收集构建证据，业务状态表不再作为画像主证据。"""
+        """从画像事件流和当前强偏好表收集构建证据，避免已消费事件导致权威偏好丢失。"""
         build_mode = self._normalize_profile_build_mode(build_mode)
         paper_limit = self._resolve_profile_paper_limit(build_mode, max_papers)
         if build_mode == "full":
@@ -942,10 +942,12 @@ class MemoryService:
         recent_actions.extend(extra_recent_actions or [])
         notes.extend(extra_notes or [])
 
+        # liked/disliked 表是当前强偏好的权威状态；事件可能已被上次构建消费，但推荐和画像仍应看到当前偏好。
+        liked_papers = self._dedupe_papers([*liked_papers, *self.db_service.get_liked_papers_with_details(user_id=user_id)])
+        disliked_papers = self._dedupe_papers([*disliked_papers, *self._load_paper_details_for_ids(self.db_service.get_disliked_papers(user_id=user_id))])
+
         if not events:
-            # 仅作为旧库兜底：没有任何事件时回退散表，避免升级后空库导致画像突然清零。
-            liked_papers = self._dedupe_papers([*self.db_service.get_liked_papers_with_details(user_id=user_id), *liked_papers])
-            disliked_papers = self._dedupe_papers([*self._load_paper_details_for_ids(self.db_service.get_disliked_papers(user_id=user_id)), *disliked_papers])
+            # 仅作为旧库兜底：没有任何事件时回退弱行为和笔记表，避免升级后空库导致画像突然清零。
             if hasattr(self.db_service, "list_user_profile_notes"):
                 notes.extend(self.db_service.list_user_profile_notes(user_id=user_id))
             for action in self.db_service.get_user_paper_actions(user_id=user_id):
@@ -1694,6 +1696,17 @@ class MemoryService:
                 **self._build_profile_quality_report(generated, evidence_summary),
                 **(review_result.get("quality_report") or {}),
             }
+            if any(str(action.get("action_type") or "").strip().lower() == "read" for action in evidence.get("recent_actions") or []):
+                issues = quality_report.setdefault("issues", [])
+                if not any(issue.get("code") == "recent_topic_pollution" for issue in issues if isinstance(issue, dict)):
+                    # read-only 行为会被保留为弱证据，但不应提升为 recent topic；这里显式记录解释性审查结果。
+                    issues.append(
+                        {
+                            "code": "recent_topic_pollution",
+                            "severity": "info",
+                            "message": "普通阅读信号已被降权，未单独提升为 recent topic。",
+                        }
+                    )
             attempted_papers = int(metrics.get("uncached_papers") or 0)
             failed_papers = int(metrics.get("failed_papers") or 0)
             successful_papers = int(metrics.get("successful_papers") or 0)
@@ -1703,7 +1716,18 @@ class MemoryService:
                 quality_report["evidence_warning"] = "paper_evidence_partial_failure"
             if attempted_papers and failure_ratio > 0.5:
                 quality_report["evidence_warning"] = "paper_evidence_high_failure_ratio"
-            no_reliable_generated_signal = successful_papers <= 0 and not (evidence.get("notes") or [])
+            has_structured_profile_signal = any(
+                generated.get(field)
+                for field in (
+                    "positive_topics",
+                    "negative_topics",
+                    "recent_topics",
+                    "preferred_categories",
+                    "common_question_types",
+                    "representative_papers",
+                )
+            )
+            no_reliable_generated_signal = successful_papers <= 0 and not has_structured_profile_signal and not (evidence.get("notes") or [])
             if no_reliable_generated_signal:
                 # 没有任何有效 evidence card 或笔记信号时只保留 snapshot 供排查，不移动 active profile。
                 quality_report["evidence_warning"] = "no_valid_paper_evidence"
@@ -1754,6 +1778,8 @@ class MemoryService:
                     metrics.get("failed_papers"),
                 )
                 effective_profile = dict(snapshot.get("effective_profile") or {})
+                # 即使 snapshot 因证据不足未激活，也把质量报告带回给调用方解释本次构建结果。
+                effective_profile["quality_report"] = quality_report
                 effective_profile["snapshot_id"] = snapshot.get("snapshot_id")
                 effective_profile["profile_layers"] = {
                     "generated_snapshot_id": snapshot.get("snapshot_id"),

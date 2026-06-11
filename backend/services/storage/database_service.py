@@ -6,21 +6,17 @@ import re
 from typing import Dict, Any, List, Optional
 import logging
 from datetime import datetime, timezone, timedelta
+from services.user_behavior_policy import (
+    WEAK_PAPER_ACTION_TYPES,
+    is_explicit_preference_action,
+    normalize_paper_action_type,
+)
 from utils.config import SQLITE_CONFIG, get_default_user_id
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_USER_ID = get_default_user_id()
-PAPER_ACTION_TYPES = {
-    "like",
-    "dislike",
-    "favorite",
-    "read",
-    "later",
-    "archived",
-    "note_saved",
-    "not_interested",
-}
+PAPER_ACTION_TYPES = set(WEAK_PAPER_ACTION_TYPES)
 PROFILE_LIST_FIELDS = {
     "positive_topics",
     "negative_topics",
@@ -836,18 +832,51 @@ class DatabaseService:
 
     @staticmethod
     def _normalize_action_type(action_type: Any) -> str:
-        normalized = str(action_type or "").strip().lower()
-        alias_map = {
-            "liked": "like",
-            "disliked": "dislike",
-            "bookmark": "favorite",
-            "bookmarked": "favorite",
-            "saved": "later",
-            "save_for_later": "later",
-            "uninterested": "not_interested",
-            "note": "note_saved",
-        }
-        return alias_map.get(normalized, normalized)
+        return normalize_paper_action_type(action_type)
+
+    def _record_preference_profile_event(self, conn, user_id: str, arxiv_id: str, event_type: str) -> None:
+        """强偏好不再写入 paper-action 表；画像只通过独立事件流消费这类显式信号。"""
+        self.record_user_profile_event(
+            user_id=user_id,
+            event_type=event_type,
+            source_type="paper_preference",
+            source_id=arxiv_id,
+            action_type=event_type,
+            arxiv_id=arxiv_id,
+            metadata={"source": "explicit_preference"},
+            include_in_profile=True,
+            conn=conn,
+        )
+
+    def _deactivate_profile_events_for_paper(self, conn, user_id: str, arxiv_id: str, event_types: List[str]) -> None:
+        """偏好或弱行为被撤销时停用对应画像证据，避免旧事件在重建时继续影响画像。"""
+        normalized_types = [self._normalize_profile_event_type(item) for item in event_types if str(item or "").strip()]
+        if not normalized_types:
+            return
+        placeholders = ", ".join("?" for _ in normalized_types)
+        conn.execute(
+            f'''
+            UPDATE user_profile_events
+            SET include_in_profile = 0, profile_dirty = 1
+            WHERE user_id = ? AND arxiv_id = ? AND event_type IN ({placeholders})
+            ''',
+            [user_id, arxiv_id, *normalized_types],
+        )
+
+    def _record_profile_signal_removed_event(self, conn, user_id: str, arxiv_id: str, removed_event_type: str) -> None:
+        """写入低权重删除事件，专门用于触发画像重建时重新计算已撤销的用户信号。"""
+        normalized_removed = self._normalize_profile_event_type(removed_event_type)
+        self.record_user_profile_event(
+            user_id=user_id,
+            event_type=f"{normalized_removed}_removed",
+            source_type="paper_signal_removal",
+            source_id=arxiv_id,
+            action_type=f"{normalized_removed}_removed",
+            arxiv_id=arxiv_id,
+            metadata={"removed_event_type": normalized_removed},
+            include_in_profile=True,
+            conn=conn,
+        )
 
     @staticmethod
     def _empty_user_research_profile(user_id: str) -> Dict[str, Any]:
@@ -1275,10 +1304,17 @@ class DatabaseService:
                     VALUES (?, ?)
                 ''', (user_id, arxiv_id))
 
+                # 强偏好表是 liked 状态的唯一权威来源；这里只清理历史 action 残留并写画像事件。
+                cursor.execute(
+                    '''
+                    DELETE FROM user_paper_actions
+                    WHERE user_id = ? AND arxiv_id = ? AND action_type IN ('like', 'dislike', 'not_interested')
+                    ''',
+                    (user_id, arxiv_id),
+                )
+                self._deactivate_profile_events_for_paper(conn, user_id, arxiv_id, ["disliked", "not_interested"])
+                self._record_preference_profile_event(conn, user_id, arxiv_id, "liked")
                 conn.commit()
-                self.record_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="like")
-                self.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="dislike")
-                self.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="not_interested")
                 logger.info(f"Paper {arxiv_id} added to liked list for user: {user_id}")
                 return True
         except Exception as e:
@@ -1296,11 +1332,20 @@ class DatabaseService:
                 cursor.execute('''
                     DELETE FROM user_liked_papers WHERE user_id = ? AND arxiv_id = ?
                 ''', (user_id, arxiv_id))
+                removed = cursor.rowcount > 0
 
+                if removed:
+                    cursor.execute(
+                        '''
+                        DELETE FROM user_paper_actions WHERE user_id = ? AND arxiv_id = ? AND action_type = 'like'
+                        ''',
+                        (user_id, arxiv_id),
+                    )
+                    self._deactivate_profile_events_for_paper(conn, user_id, arxiv_id, ["liked"])
+                    self._record_profile_signal_removed_event(conn, user_id, arxiv_id, "liked")
                 conn.commit()
-                self.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="like")
                 logger.info(f"Paper {arxiv_id} removed from liked list for user: {user_id}")
-                return cursor.rowcount > 0
+                return removed
         except Exception as e:
             logger.error(f"Error removing liked paper: {str(e)}")
             return False
@@ -1378,9 +1423,17 @@ class DatabaseService:
                     VALUES (?, ?)
                 ''', (user_id, arxiv_id))
 
+                # disliked 同样只落在强偏好表；历史 action 残留要清掉，避免推荐读取到双套负反馈。
+                cursor.execute(
+                    '''
+                    DELETE FROM user_paper_actions
+                    WHERE user_id = ? AND arxiv_id = ? AND action_type IN ('like', 'dislike', 'not_interested')
+                    ''',
+                    (user_id, arxiv_id),
+                )
+                self._deactivate_profile_events_for_paper(conn, user_id, arxiv_id, ["liked", "not_interested"])
+                self._record_preference_profile_event(conn, user_id, arxiv_id, "disliked")
                 conn.commit()
-                self.record_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="dislike")
-                self.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="like")
                 logger.info(f"Paper {arxiv_id} added to disliked list for user: {user_id}")
                 return True
         except Exception as e:
@@ -1398,11 +1451,20 @@ class DatabaseService:
                 cursor.execute('''
                     DELETE FROM user_disliked_papers WHERE user_id = ? AND arxiv_id = ?
                 ''', (user_id, arxiv_id))
+                removed = cursor.rowcount > 0
 
+                if removed:
+                    cursor.execute(
+                        '''
+                        DELETE FROM user_paper_actions WHERE user_id = ? AND arxiv_id = ? AND action_type = 'dislike'
+                        ''',
+                        (user_id, arxiv_id),
+                    )
+                    self._deactivate_profile_events_for_paper(conn, user_id, arxiv_id, ["disliked"])
+                    self._record_profile_signal_removed_event(conn, user_id, arxiv_id, "disliked")
                 conn.commit()
-                self.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type="dislike")
                 logger.info(f"Paper {arxiv_id} removed from disliked list for user: {user_id}")
-                return cursor.rowcount > 0
+                return removed
         except Exception as e:
             logger.error(f"Error removing disliked paper: {str(e)}")
             return False
@@ -1469,21 +1531,15 @@ class DatabaseService:
                 return False
 
             normalized_action = self._normalize_action_type(action_type)
+            if is_explicit_preference_action(action_type):
+                logger.error("Explicit preference action must use like/dislike endpoint: %s", action_type)
+                return False
             if normalized_action not in PAPER_ACTION_TYPES:
                 logger.error("Unsupported paper action type: %s", action_type)
                 return False
 
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                if normalized_action in {"like", "dislike", "not_interested"}:
-                    cursor.execute(
-                        '''
-                        DELETE FROM user_paper_actions
-                        WHERE user_id = ? AND arxiv_id = ? AND action_type IN ('like', 'dislike', 'not_interested') AND action_type != ?
-                        ''',
-                        (user_id, arxiv_id, normalized_action),
-                    )
-
                 cursor.execute(
                     '''
                     INSERT INTO user_paper_actions (user_id, arxiv_id, action_type, metadata_json)
@@ -1530,8 +1586,13 @@ class DatabaseService:
                     ''',
                     (user_id, arxiv_id, normalized_action),
                 )
+                removed = cursor.rowcount > 0
+                if removed:
+                    # 删除弱行为时同步停用画像事件，避免 action 表已清理但画像重建仍读取旧证据。
+                    self._deactivate_profile_events_for_paper(conn, user_id, arxiv_id, [normalized_action])
+                    self._record_profile_signal_removed_event(conn, user_id, arxiv_id, normalized_action)
                 conn.commit()
-                return cursor.rowcount > 0
+                return removed
         except Exception as e:
             logger.error(f"Error removing paper action: {str(e)}")
             return False
@@ -2480,6 +2541,8 @@ class DatabaseService:
                     payload_json = excluded.payload_json,
                     metadata_json = excluded.metadata_json,
                     include_in_profile = excluded.include_in_profile,
+                    consumed_by_job_id = NULL,
+                    consumed_at = NULL,
                     profile_dirty = 1,
                     created_at = CURRENT_TIMESTAMP
                 ''',

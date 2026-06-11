@@ -560,8 +560,8 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00310",
             }
         )
-        self.db_service.record_user_paper_action(self.user_id, "2401.00310", "liked")
-        self.db_service.record_user_paper_action(self.user_id, "2401.00310", "liked")
+        self.db_service.add_liked_paper(self.user_id, "2401.00310")
+        self.db_service.add_liked_paper(self.user_id, "2401.00310")
         self.db_service.record_user_paper_action(self.user_id, "2401.00310", "read")
 
         before_events = self.db_service.list_user_profile_events(self.user_id, include_consumed=True)
@@ -654,7 +654,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00410",
             }
         )
-        self.db_service.record_user_paper_action(self.user_id, "2401.00410", "liked")
+        self.db_service.add_liked_paper(self.user_id, "2401.00410")
 
         profile = service.rebuild_user_research_profile(self.user_id)
         repeated = service.rebuild_user_research_profile(self.user_id)
@@ -681,7 +681,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00411",
             }
         )
-        self.db_service.record_user_paper_action(self.user_id, "2401.00411", "liked")
+        self.db_service.add_liked_paper(self.user_id, "2401.00411")
 
         profile = service.rebuild_user_research_profile(self.user_id)
         card = self.db_service.get_paper_profile_evidence("2401.00411")
@@ -725,7 +725,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00420",
             }
         )
-        self.db_service.record_user_paper_action(self.user_id, "2401.00420", "liked")
+        self.db_service.add_liked_paper(self.user_id, "2401.00420")
 
         profile = service.rebuild_user_research_profile(self.user_id)
         canonical = profile["canonical_topics"][0]
@@ -758,7 +758,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00430",
             }
         )
-        self.db_service.record_user_paper_action(self.user_id, "2401.00430", "liked")
+        self.db_service.add_liked_paper(self.user_id, "2401.00430")
 
         profile = self.memory_service.rebuild_user_research_profile(self.user_id)
         events = self.db_service.list_user_profile_events(self.user_id, include_consumed=True)

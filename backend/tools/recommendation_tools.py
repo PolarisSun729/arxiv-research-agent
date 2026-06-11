@@ -22,6 +22,7 @@ def recommend_papers(
     user_memory_summary: Optional[str] = None,
     research_profile: Optional[Dict[str, Any]] = None,
     request_context: Optional[Dict[str, Any]] = None,
+    candidate_papers: Optional[list[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     tool_name = "recommend_papers"
     user_id = str(user_id or get_default_user_id()).strip() or get_default_user_id()
@@ -34,12 +35,21 @@ def recommend_papers(
         "has_user_memory_summary": bool(str(user_memory_summary or "").strip()),
         "has_research_profile": bool(research_profile),
         "request_context_keys": sorted((request_context or {}).keys()) if isinstance(request_context, dict) else [],
+        "candidate_paper_count": len(candidate_papers or []),
     }
     try:
-        result = _get_recommendation_service().recommend_papers(
+        service = _get_recommendation_service()
+        recommend = getattr(service, "recommend_papers_with_context", None) or service.recommend_papers
+        result = recommend(
             user_id=user_id,
             top_n=top_n,
             max_age_months=max_age_months,
+            message=message,
+            topic_hint=topic_hint,
+            user_memory_summary=user_memory_summary,
+            research_profile=research_profile,
+            request_context=request_context,
+            candidate_papers=candidate_papers,
         )
         payload = dict(result or {})
         paper_actions = payload.get("paper_actions") if isinstance(payload.get("paper_actions"), dict) else {}
@@ -51,7 +61,23 @@ def recommend_papers(
             "interest_cluster_count": payload.get("interest_cluster_count", 0),
             "has_behavior_history": any(bool(paper_actions.get(key)) for key in paper_actions),
             "recall_mode": payload.get("recall_mode"),
+            "used_agent_context_candidates": bool(candidate_papers),
+            "cold_start_mode": bool((payload.get("recommendation_context") or {}).get("cold_start")),
         }
+        if payload["personalization_signals"]["cold_start_mode"]:
+            payload["fallback_record"] = {
+                "code": "recommendation_cold_start",
+                "stage": "recommendation",
+                "category": "context_cold_start",
+                "message": "推荐已退化为当前请求驱动的冷启动路径。",
+                "raw_reason": "recommendation_cold_start",
+                "source": "recommendation_tools.recommend_papers",
+                "resolution": "continue_with_defaults",
+                "detail": {
+                    "used_request_topic": payload["personalization_signals"]["used_request_topic"],
+                    "used_research_profile": payload["personalization_signals"]["used_research_profile"],
+                },
+            }
         return make_tool_result(
             ok=True,
             tool_name=tool_name,
@@ -62,9 +88,12 @@ def recommend_papers(
                 inputs=trace_inputs,
                 source="recommendation_service",
                 notes={
-                    "uses_interest_vector": True,
+                    # trace 需要标明是否真正消费了会话上下文，避免 recommendation 看起来 Agent 化、实际上仍是旧服务直出。
+                    "uses_interest_vector": not bool((payload.get("recommendation_context") or {}).get("cold_start")),
                     "uses_historical_preferences": True,
                     "uses_research_profile": bool(research_profile) or bool(payload.get("research_profile")),
+                    "uses_request_context": bool(request_context),
+                    "uses_agent_context_candidates": bool(candidate_papers),
                 },
             ),
         )

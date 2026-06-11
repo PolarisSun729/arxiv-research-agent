@@ -1011,9 +1011,11 @@ def _build_pending_action_from_confirmation(confirmation_payload: Mapping[str, A
     target_paper = dict(confirmation_payload.get("target_paper") or {}) if isinstance(confirmation_payload.get("target_paper"), Mapping) else {}
     arguments_summary = dict(confirmation_payload.get("arguments_summary") or {}) if isinstance(confirmation_payload.get("arguments_summary"), Mapping) else {}
     return {
-        "type": "tool_approval",
+        "type": confirmation_payload.get("request_type") or "tool_approval",
+        "request_type": confirmation_payload.get("request_type") or "tool_approval",
         "status": "waiting_confirmation",
         "decision": None,
+        "pending_action_id": confirmation_payload.get("pending_action_id"),
         "step_id": confirmation_payload.get("step_id"),
         "tool_name": confirmation_payload.get("tool_name"),
         "action_type": confirmation_payload.get("action_type"),
@@ -1024,7 +1026,16 @@ def _build_pending_action_from_confirmation(confirmation_payload: Mapping[str, A
         "description": confirmation_payload.get("description"),
         "arxiv_id": target_paper.get("arxiv_id"),
         "original_question": confirmation_payload.get("original_question"),
+        "original_message": confirmation_payload.get("original_message"),
         "target_paper": target_paper or None,
+        "candidates": list(confirmation_payload.get("candidates") or []),
+        "recommended_candidate": confirmation_payload.get("recommended_candidate"),
+        "default_candidate_id": confirmation_payload.get("default_candidate_id"),
+        "reference_hint": confirmation_payload.get("reference_hint") or {},
+        "target_resolution": confirmation_payload.get("target_resolution") or {},
+        "confirmation_fields": confirmation_payload.get("confirmation_fields") or {},
+        "created_at": confirmation_payload.get("created_at"),
+        "expires_at": confirmation_payload.get("expires_at"),
         "allowed_decisions": [item.get("code") for item in list(confirmation_payload.get("allowed_decisions") or []) if isinstance(item, Mapping) and item.get("code")],
         "allow_argument_edit": bool(confirmation_payload.get("allow_argument_edit")),
         "allow_reject": bool(confirmation_payload.get("allow_reject", True)),
@@ -1112,6 +1123,55 @@ def _state_to_response(state: Any) -> ArxivSearchResponse:
     )
 
 
+def _planner_trace_summary_from_state(state: AgentState) -> Dict[str, Any]:
+    """为 tool trace 附带本轮 planner 真实路径，避免前端只能从最终 answer 反推。"""
+    planner_debug = dict((state.debug or {}).get("planner") or {})
+    planner_summary = dict(planner_debug.get("planner_summary") or {})
+    if not planner_summary and state.execution_plan is not None:
+        planner_summary = dict((state.execution_plan.metadata or {}).get("planner_summary") or {})
+    return {
+        key: planner_summary.get(key)
+        for key in (
+            "requested_path",
+            "selected_path",
+            "final_path",
+            "fallback_used",
+            "fallback_reason",
+        )
+        if planner_summary.get(key) not in (None, "", [], {})
+    }
+
+
+def _tool_call_boundary_trace(detail: Mapping[str, Any]) -> Dict[str, Any]:
+    """把工具层的能力边界摘要投影到轻量 trace，便于区分规则模块、实验能力和 service 直通。"""
+    tool_contract = detail.get("tool_contract")
+    tool_execution = detail.get("tool_execution")
+    contract = dict(tool_contract or {}) if isinstance(tool_contract, Mapping) else {}
+    execution = dict(tool_execution or {}) if isinstance(tool_execution, Mapping) else {}
+    metadata = dict(execution.get("metadata") or {}) if isinstance(execution.get("metadata"), Mapping) else {}
+    trace_payload = {
+        "contract_source": contract.get("contract_source"),
+        "adapter": contract.get("adapter"),
+        "backend_tool_name": contract.get("backend_tool_name"),
+        "clarification_stage": metadata.get("clarification_stage"),
+        "analysis_source": metadata.get("analysis_source"),
+        "analysis_mode": metadata.get("analysis_mode"),
+        "question_source": metadata.get("question_source"),
+        "recommendation_stage": metadata.get("recommendation_stage"),
+        "core_service": metadata.get("core_service"),
+        "core_execution_mode": metadata.get("core_execution_mode"),
+        "fallback_mode": metadata.get("fallback_mode"),
+        "profile_fallback": metadata.get("profile_fallback"),
+        "is_llm_backed": metadata.get("is_llm_backed"),
+        "is_algorithm_core_in_agent": metadata.get("is_algorithm_core_in_agent"),
+    }
+    return {
+        key: value
+        for key, value in trace_payload.items()
+        if value not in (None, "", [], {})
+    }
+
+
 def _tool_calls_from_runtime(state: AgentState) -> list[Dict[str, Any]]:
     """把 PlanRuntime trace 投影成前端沿用的 tool_calls 摘要。
 
@@ -1141,6 +1201,8 @@ def _tool_calls_from_runtime(state: AgentState) -> list[Dict[str, Any]]:
             summary = str(detail.get("failure_reason") or "工具执行失败")
         else:
             summary = "工具执行完成"
+        planner_trace = _planner_trace_summary_from_state(state)
+        boundary_trace = _tool_call_boundary_trace(detail)
         calls.append(
             {
                 "tool_name": tool_name,
@@ -1152,6 +1214,8 @@ def _tool_calls_from_runtime(state: AgentState) -> list[Dict[str, Any]]:
                     "event": trace.event,
                     "started_at": detail.get("started_at"),
                     "finished_at": detail.get("finished_at"),
+                    **planner_trace,
+                    **boundary_trace,
                 },
                 "error": {"message": detail.get("error") or detail.get("failure_reason")} if status == "failed" else None,
             }
@@ -1296,6 +1360,7 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
         for step in list(execution_plan_runtime.get("steps", []) or [])
         if isinstance(step, Mapping) and str(step.get("step_id") or "").strip()
     }
+    planner_debug = dict((state.debug or {}).get("planner") or {})
     return {
         "intent": state.intent,
         "intent_source": state.intent_source,
@@ -1331,6 +1396,10 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
         "warning_count": len(state.warnings or []),
         "next_actions": list(state.next_actions or []),
         "personalized_rerank_applied": bool(state.personalized_rerank_applied),
+        # 这三个摘要是能力边界的用户态出口，避免前端或排障只能读取内部旧字段名来猜测本轮走了什么 planner。
+        "planner_summary": dict(planner_debug.get("planner_summary") or {}),
+        "clarification_summary": dict(planner_debug.get("clarification_summary") or {}),
+        "recommendation_summary": dict(planner_debug.get("recommendation_summary") or {}),
         "debug": dict(state.debug or {}),
     }
 
@@ -1402,6 +1471,7 @@ def _active_runtime_tool_call(state: Optional[AgentState], *, approved_step_id: 
     """
     if state is None:
         return None
+    planner_trace = _planner_trace_summary_from_state(state)
     if state.runtime_state is None or state.execution_plan is None:
         if state.tool_name and not state.tool_calls:
             # 兼容旧节点流式状态：没有显式 runtime_state 时，只把当前轻量 tool_name/tool_args 当作进度展示，
@@ -1411,7 +1481,10 @@ def _active_runtime_tool_call(state: Optional[AgentState], *, approved_step_id: 
                 "arguments": _compact_tool_args(state.tool_args or {}),
                 "status": "running",
                 "summary": f"正在执行 {state.tool_name}",
-                "trace": {"source": "legacy_stream_state"},
+                "trace": {
+                    "source": "legacy_stream_state",
+                    **planner_trace,
+                },
             }
         return None
     current_step_id = str(state.runtime_state.current_step_id or "").strip()
@@ -1435,6 +1508,7 @@ def _active_runtime_tool_call(state: Optional[AgentState], *, approved_step_id: 
                     "step_id": step.step_id,
                     "action_type": step.action_type,
                     "plan_status": state.runtime_state.step_status.get(step.step_id),
+                    **planner_trace,
                 },
             }
     return None

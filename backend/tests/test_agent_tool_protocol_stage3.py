@@ -13,7 +13,6 @@ ExecutionPlanStep = _MODULES["schemas"].ExecutionPlanStep
 ToolObservation = _MODULES["schemas"].ToolObservation
 ToolCallRequest = _MODULES["schemas"].ToolCallRequest
 build_arxiv_search_graph = _MODULES["graph_module"].build_arxiv_search_graph
-graph_module = _MODULES["graph_module"]
 paper_reading_module = sys.modules["backend.agents.arxiv_search_agent.node.paper_reading_node"]
 preference_module = sys.modules["backend.agents.arxiv_search_agent.node.preference_node"]
 response_module = sys.modules["backend.agents.arxiv_search_agent.node.response_node"]
@@ -345,7 +344,7 @@ class AgentToolProtocolStage3Tests(unittest.TestCase):
         self.assertEqual(plan_status["response_synthesis"], "success")
         self.assertEqual(result.steps[-1].step, "final_answer_generation")
 
-    def test_paper_reading_uses_check_then_answer_tool_protocol(self) -> None:
+    def test_paper_reading_compat_node_does_not_execute_tools_before_target_resolution(self) -> None:
         state = AgentState(
             intent="paper_qa",
             message="问一下第一篇论文的方法",
@@ -356,39 +355,18 @@ class AgentToolProtocolStage3Tests(unittest.TestCase):
         )
 
         def fake_execute_tool(current_state):
-            current = _coerce_agent_state(current_state).model_copy(deep=True)
-            request = current.tool_call_request
-            self.assertIsInstance(request, ToolCallRequest)
-            if request.tool_name == "check_paper_qa_index":
-                current.tool_result = {
-                    "ok": True,
-                    "tool_name": request.tool_name,
-                    "summary": "checked index",
-                    "data": {"status": "indexed", "has_index": True},
-                    "trace": {"tool_name": request.tool_name},
-                    "error": None,
-                }
-                return _append_mock_observation(current, request.tool_name, True, "checked index")
-            self.assertEqual(request.tool_name, "answer_paper_question")
-            current.tool_result = {
-                "ok": True,
-                "tool_name": request.tool_name,
-                "summary": "answered question",
-                "data": {"answer": "这是论文答案", "sources": [{"chunk_id": "1"}]},
-                "trace": {"tool_name": request.tool_name},
-                "error": None,
-            }
-            return _append_mock_observation(current, request.tool_name, True, "answered question")
+            raise AssertionError("兼容阅读节点不应在最终论文解析前直接执行工具")
 
         with mock.patch.object(paper_reading_module, "execute_tool", side_effect=fake_execute_tool) as patched:
             result = paper_reading_module.handle_paper_reading_request(state)
 
-        self.assertEqual(patched.call_count, 2)
-        self.assertEqual(result.paper_qa_result["status"], "success")
-        self.assertEqual(result.paper_qa_result["answer"], "这是论文答案")
-        self.assertEqual([obs.tool_name for obs in result.tool_observations], ["check_paper_qa_index", "answer_paper_question"])
+        # 当前主路径由 resolve_paper + PlanExecutor 解析最终目标；旧节点只允许返回可读失败提示。
+        self.assertEqual(patched.call_count, 0)
+        self.assertEqual(result.paper_qa_result["status"], "failed")
+        self.assertIn("论文", result.paper_qa_result["error"])
+        self.assertEqual(result.tool_observations, [])
 
-    def test_preference_action_uses_tool_protocol(self) -> None:
+    def test_preference_action_compat_node_does_not_write_before_target_resolution(self) -> None:
         state = AgentState(
             intent="preference_action",
             user_id="u1",
@@ -400,47 +378,28 @@ class AgentToolProtocolStage3Tests(unittest.TestCase):
         )
 
         def fake_execute_tool(current_state):
-            current = _coerce_agent_state(current_state).model_copy(deep=True)
-            request = current.tool_call_request
-            self.assertEqual(request.tool_name, "record_paper_preference")
-            current.tool_result = {
-                "ok": True,
-                "tool_name": request.tool_name,
-                "summary": "recorded preference",
-                "data": {"message": "偏好已更新", "paper": {"arxiv_id": "2401.00001", "title": "RAG Paper"}},
-                "trace": {"tool_name": request.tool_name},
-                "error": None,
-            }
-            return _append_mock_observation(current, request.tool_name, True, "recorded preference")
+            raise AssertionError("兼容偏好节点不应在最终论文解析前写入偏好")
 
         with mock.patch.object(preference_module, "execute_tool", side_effect=fake_execute_tool) as patched:
             result = preference_module.apply_preference_action(state)
 
-        self.assertEqual(patched.call_count, 1)
-        self.assertEqual(result.preference_action_result["status"], "success")
-        self.assertEqual(result.preference_action_result["label"], "liked")
-        self.assertEqual(result.tool_observations[-1].tool_name, "record_paper_preference")
+        self.assertEqual(patched.call_count, 0)
+        self.assertEqual(result.preference_action_result["status"], "failed")
+        self.assertEqual(result.preference_action_result["action"], "like")
+        self.assertEqual(result.tool_observations, [])
 
-    def test_run_agent_turn_compatibility_node_applies_runtime_result(self) -> None:
-        def fake_run_agent_turn(state):
-            self.assertEqual(_coerce_agent_state(state).intent, "recommendation")
-            return _MODULES["schemas"].AgentTurnResult(
-                status="success",
-                final_answer="recommended papers",
-                outputs={"ranked_papers": [{"arxiv_id": "2401.00001", "title": "RAG Paper"}]},
-                trace=[],
-            )
+    def test_graph_uses_explicit_runtime_nodes_instead_of_compatibility_turn_node(self) -> None:
+        graph = build_arxiv_search_graph()
 
-        with mock.patch.object(
-            graph_module,
-            "run_agent_turn_in_graph",
-            side_effect=fake_run_agent_turn,
-        ):
-            result_state = graph_module.run_agent_turn_node(AgentState(intent="recommendation", message="给我推荐一些论文"))
-
-        self.assertEqual(result_state.answer, "recommended papers")
-        self.assertEqual(result_state.debug["agent_turn"]["status"], "success")
-        self.assertEqual(len(result_state.papers), 1)
+        # 当前主图必须暴露可观察的执行环，旧整轮兼容节点只允许留在 compat 层。
+        self.assertIn("build_goal", graph._nodes)
+        self.assertIn("build_plan", graph._nodes)
+        self.assertIn("select_next_step", graph._nodes)
+        self.assertIn("execute_step", graph._nodes)
+        self.assertIn("observe_step", graph._nodes)
+        self.assertIn("replan", graph._nodes)
+        self.assertNotIn("run_agent_turn", graph._nodes)
+        self.assertNotIn("run_agent_turn" + "_node", graph._nodes)
 
 
 if __name__ == "__main__":

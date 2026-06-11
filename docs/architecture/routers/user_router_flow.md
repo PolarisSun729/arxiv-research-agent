@@ -43,21 +43,28 @@
 
 | 方法 | 路径 | 函数名 | 主要职责 | 主要调用 | 副作用 |
 |---|---|---|---|---|---|
-| POST | `/user/preferences` | `upsert_user_preferences` | 读取指定用户偏好 | `DatabaseService.get_user_preferences()` | 读数据库；未实际 upsert |
+| POST | `/user/preferences` | `legacy_post_user_preferences` | Deprecated 兼容读取入口 | `DatabaseService.get_user_preferences()` | 读数据库；不会 upsert；正式读取走 GET |
 | GET | `/user/preferences/{user_id}` | `get_user_preferences` | 按 path 获取用户偏好 | `DatabaseService.get_user_preferences()` | 读数据库 |
-| POST | `/user/like-paper` | `like_paper` | 记录喜欢论文 | `RecommendationService.record_user_paper_preference()` | 写 liked/disliked/action/profile，必要时物化论文并写向量库 |
-| POST | `/user/dislike-paper` | `dislike_paper` | 记录不喜欢论文 | `RecommendationService.record_user_paper_preference()` | 写 disliked/liked/action/profile，必要时物化论文并写向量库 |
-| POST | `/user/paper-action` | `record_paper_action` | 记录通用论文行为 | `RecommendationService.record_user_paper_action()` | 写 action，必要时物化论文、更新 profile |
-| DELETE | `/user/paper-action` | `remove_paper_action` | 删除一条论文行为 | `DatabaseService.remove_user_paper_action()` | 写数据库 |
+| POST | `/user/like-paper` | `like_paper` | 记录喜欢论文 | `RecommendationService.record_user_paper_preference()` | 写 liked/disliked 强偏好表和 profile event，必要时物化论文并写向量库 |
+| POST | `/user/dislike-paper` | `dislike_paper` | 记录不喜欢论文 | `RecommendationService.record_user_paper_preference()` | 写 disliked/liked 强偏好表和 profile event，必要时物化论文并写向量库 |
+| POST | `/user/paper-action` | `record_paper_action` | 记录弱论文行为 | `RecommendationService.record_user_paper_action()` | 仅写弱行为 action；拒绝 like/dislike；必要时物化论文并写 profile event |
+| DELETE | `/user/paper-action` | `remove_paper_action` | 删除一条弱论文行为 | `DatabaseService.remove_user_paper_action()` | 删除 action，并停用对应 profile event |
 | GET | `/user/paper-actions/{user_id}` | `get_user_paper_actions` | 获取用户行为明细与 action_map | `DatabaseService.get_user_paper_actions()`、`DatabaseService.get_user_paper_action_map()` | 读数据库 |
 | GET | `/user/research-profile/{user_id}` | `get_user_research_profile` | 获取研究画像 | `MemoryService.load_user_profile()` | 读数据库 |
 | PUT | `/user/research-profile` | `upsert_user_research_profile` | 以整体更新语义写研究画像 | `MemoryService.patch_user_profile(source="manual_upsert")` | 写研究画像 |
 | PATCH | `/user/research-profile` | `patch_user_research_profile` | 以局部 patch 语义写研究画像 | `MemoryService.patch_user_profile(source="manual")` | 写研究画像 |
-| DELETE | `/user/like-paper` | `remove_like` | 取消喜欢 | `DatabaseService.remove_liked_paper()` | 删除 liked 记录，同时删除 like action |
-| DELETE | `/user/dislike-paper` | `remove_dislike` | 取消不喜欢 | `DatabaseService.remove_disliked_paper()` | 删除 disliked 记录，同时删除 dislike action |
+| DELETE | `/user/like-paper` | `remove_like` | 取消喜欢 | `DatabaseService.remove_liked_paper()` | 删除 liked 记录，并停用 liked profile event |
+| DELETE | `/user/dislike-paper` | `remove_dislike` | 取消不喜欢 | `DatabaseService.remove_disliked_paper()` | 删除 disliked 记录，并停用 disliked profile event |
 | POST | `/user/generate-interest-vector` | `generate_user_interest_vector` | 生成或重建用户兴趣向量 | `RecommendationService.generate_user_interest_vector()` | 读 liked/disliked，读写向量库，调用 embedding，写 `user_interest_vectors` |
 | GET | `/user/interest-vector` | `get_user_interest_vector` | 获取已保存兴趣向量 | `DatabaseService.get_user_interest_vector()` | 读数据库 |
 | POST | `/user/recommend-papers` | `recommend_papers` | 生成个性化推荐 | `RecommendationService.recommend_papers()` | 读偏好/画像/兴趣向量/OAI 数据/向量库，可能补 embedding/补论文记录；未发现保存推荐结果 |
+
+### 显式偏好与弱行为边界
+
+- `like-paper` / `dislike-paper` 是显式强偏好的唯一写入口，权威状态来自 `user_liked_papers` / `user_disliked_papers`。
+- `paper-action` 只记录弱行为，例如 `favorite`、`read`、`later`、`archived`、`note_saved`、`not_interested`；`like`、`liked`、`dislike`、`disliked` 以及等价点赞/点踩表达会被拒绝。
+- 推荐服务读取强偏好时直接读取 liked/disliked 表，读取弱行为时才读取 `user_paper_actions`，避免同一偏好在两张表里重复表达。
+- 撤销强偏好或删除弱行为时会停用对应 profile event，并写入低权重删除事件触发画像重建，避免旧事件继续作为画像证据。
 
 ## 3. Router 总览流程图
 
@@ -73,14 +80,11 @@ flowchart TD
     MAT1 --> DB2["[DB] arxiv_papers"]
     MAT1 --> EMB1["[Embedding] create_single_embedding"]
     MAT1 --> VS1["[VectorStore] insert_single_embedding / get_paper_embeddings_by_arxiv_ids"]
-    A1 --> DB3["[DB] add_liked_paper / add_disliked_paper / record_user_paper_action"]
-    A1 --> MEM1["[Memory] update_profile_from_preference"]
-    MEM1 --> DB4["[DB] user_research_profiles"]
+    A1 --> DB3["[DB] add_liked_paper / add_disliked_paper / record_user_profile_event"]
 
     R --> A2["[Recommendation] RecommendationService.record_user_paper_action"]
     A2 --> MAT2["[Service] _ensure_paper_materialized"]
-    A2 --> DB5["[DB] record_user_paper_action / remove_user_paper_action"]
-    A2 --> MEM2["[Memory] update_profile_from_paper_action"]
+    A2 --> DB5["[DB] record_user_paper_action / record_user_profile_event / remove_user_paper_action"]
 
     R --> P2["[Service] MemoryService.load_user_profile / patch_user_profile"]
     P2 --> DB6["[DB] user_research_profiles"]
@@ -108,28 +112,28 @@ flowchart TD
 
 ## 4. 每个接口单独流程图
 
-## 接口：POST `/user/preferences`
+## 接口：POST `/user/preferences`（deprecated）
 
 ### 职责
 
-虽然路由名叫 `upsert_user_preferences`，但当前实现只是按 `user_id` 读取用户偏好聚合结果。
+这是短期兼容旧调用方的只读入口，已经明确标记 deprecated。它只按 `user_id` 读取用户偏好聚合结果，不创建、不更新、也不 upsert 偏好；新前端和新测试应使用 `GET /user/preferences/{user_id}`。
 
 ### 处理流程图
 
 ```mermaid
 flowchart TD
-    A["前端 / 调用方"] --> B["[Router] upsert_user_preferences"]
+    A["旧前端 / 旧脚本"] --> B["[Router] legacy_post_user_preferences"]
     B --> C["[Validate] 解析 body.user_id"]
     C --> D["[DB] DatabaseService.get_user_preferences"]
     D --> E["[DB] get_liked_papers / get_disliked_papers / get_user_paper_action_map / get_user_research_profile"]
-    E --> F["[Response] status/message/preferences"]
+    E --> F["[Response] status/message/deprecated/successor/preferences"]
     D -. 异常 .-> G["[Error] 500"]
     D -. 数据缺失 .-> H["[Fallback] DatabaseService 返回空偏好结构"]
 ```
 
 ### 关键调用链
 
-`upsert_user_preferences() -> DatabaseService.get_user_preferences() -> get_liked_papers()/get_disliked_papers()/get_user_paper_action_map()/get_user_research_profile()`
+`legacy_post_user_preferences() -> DatabaseService.get_user_preferences() -> get_liked_papers()/get_disliked_papers()/get_user_paper_action_map()/get_user_research_profile()`
 
 ### 输入
 
@@ -140,6 +144,8 @@ flowchart TD
 
 - `status`
 - `message`
+- `deprecated`
+- `successor`
 - `preferences`
   - `user_id`
   - `liked_papers`
@@ -223,7 +229,7 @@ flowchart TD
 
 ### 职责
 
-记录“喜欢论文”的显式正反馈，并同步更新行为记录与长期研究画像；必要时先把论文物化到本地论文表和向量库。
+记录“喜欢论文”的显式正反馈；必要时先把论文物化到本地论文表和向量库。喜欢状态只以 `user_liked_papers` 为权威来源，不再写入通用 `user_paper_actions`。
 
 ### 处理流程图
 
@@ -241,21 +247,18 @@ flowchart TD
     D --> F["[DB] add_liked_paper"]
     F --> F1["[DB] DELETE user_disliked_papers"]
     F --> F2["[DB] INSERT user_liked_papers"]
-    F --> F3["[DB] record_user_paper_action('like')"]
-    F --> F4["[DB] remove_user_paper_action('dislike'/'not_interested')"]
-    D --> G["[Memory] update_profile_from_preference('like')"]
-    G --> H["[DB] patch_user_research_profile / upsert_user_research_profile"]
-    H --> I["[Response] status/message/arxiv_id/paper"]
+    F --> F3["[DB] DELETE legacy user_paper_actions('like'/'dislike'/'not_interested')"]
+    F --> F4["[DB] record_user_profile_event('liked')"]
+    F --> I["[Response] status/message/arxiv_id/paper"]
     C -. arxiv_id 缺失 .-> J["[Error] 400"]
     E -. 无法物化论文 .-> K["[Error] 404/500"]
     F -. 写入失败 .-> L["[Error] 500"]
-    G -. 画像更新失败 .-> M["[Fallback] 记录 warning，但不阻断主流程"]
     B -. 其他异常 .-> N["[Error] 500"]
 ```
 
 ### 关键调用链
 
-`like_paper() -> RecommendationService.record_user_paper_preference() -> CandidateMaterializer._ensure_paper_materialized() -> DatabaseService.add_liked_paper() -> DatabaseService.record_user_paper_action() -> MemoryService.update_profile_from_preference() -> DatabaseService.patch_user_research_profile()/upsert_user_research_profile()`
+`like_paper() -> RecommendationService.record_user_paper_preference() -> CandidateMaterializer._ensure_paper_materialized() -> DatabaseService.add_liked_paper() -> DatabaseService.record_user_profile_event('liked')`
 
 ### 输入
 
@@ -274,10 +277,10 @@ flowchart TD
 ### 副作用
 
 - 是否创建用户：否，未发现独立用户创建
-- 是否更新用户信息：是，更新研究画像
-- 是否写入 like / dislike / collect：是，写 like，并删除冲突 dislike
-- 是否更新用户兴趣画像：是
-- 是否更新 memory：是，通过 `MemoryService.update_profile_from_preference()`
+- 是否更新用户信息：是，写入画像事件，等待画像重建消费
+- 是否写入 like / dislike / collect：是，写 liked 强偏好表，并删除冲突 disliked 强偏好
+- 是否更新用户兴趣画像：是，通过 `liked` profile event 参与后续重建
+- 是否更新 memory：否，不同步直接改画像；只写 profile event
 - 是否实时计算推荐：否
 - 是否读取缓存推荐：否
 - 是否调用 embedding：可能会调用
@@ -289,13 +292,13 @@ flowchart TD
 - `arxiv_id` 缺失时返回 `400`
 - 论文元数据缺失且无法物化时返回 `404`
 - like 写入失败时返回 `500`
-- 研究画像更新失败只记录 warning，不阻断主流程
+- 画像生成不在同步点击链路中执行，避免点赞请求被慢速画像构建阻塞
 
 ## 接口：POST `/user/dislike-paper`
 
 ### 职责
 
-记录“不喜欢论文”的显式负反馈，并同步更新行为记录与长期研究画像；必要时先物化论文。
+记录“不喜欢论文”的显式负反馈；必要时先物化论文。不喜欢状态只以 `user_disliked_papers` 为权威来源，不再写入通用 `user_paper_actions`。
 
 ### 处理流程图
 
@@ -311,21 +314,18 @@ flowchart TD
     D --> F["[DB] add_disliked_paper"]
     F --> F1["[DB] DELETE user_liked_papers"]
     F --> F2["[DB] INSERT user_disliked_papers"]
-    F --> F3["[DB] record_user_paper_action('dislike')"]
-    F --> F4["[DB] remove_user_paper_action('like')"]
-    D --> G["[Memory] update_profile_from_preference('dislike')"]
-    G --> H["[DB] patch_user_research_profile / upsert_user_research_profile"]
-    H --> I["[Response] status/message/arxiv_id/paper"]
+    F --> F3["[DB] DELETE legacy user_paper_actions('like'/'dislike'/'not_interested')"]
+    F --> F4["[DB] record_user_profile_event('disliked')"]
+    F --> I["[Response] status/message/arxiv_id/paper"]
     C -. arxiv_id 缺失 .-> J["[Error] 400"]
     E -. 无法物化论文 .-> K["[Error] 404/500"]
     F -. 写入失败 .-> L["[Error] 500"]
-    G -. 画像更新失败 .-> M["[Fallback] warning，不阻断"]
     B -. 其他异常 .-> N["[Error] 500"]
 ```
 
 ### 关键调用链
 
-`dislike_paper() -> RecommendationService.record_user_paper_preference() -> CandidateMaterializer._ensure_paper_materialized() -> DatabaseService.add_disliked_paper() -> DatabaseService.record_user_paper_action() -> MemoryService.update_profile_from_preference()`
+`dislike_paper() -> RecommendationService.record_user_paper_preference() -> CandidateMaterializer._ensure_paper_materialized() -> DatabaseService.add_disliked_paper() -> DatabaseService.record_user_profile_event('disliked')`
 
 ### 输入
 
@@ -344,10 +344,10 @@ flowchart TD
 ### 副作用
 
 - 是否创建用户：否
-- 是否更新用户信息：是，更新研究画像
-- 是否写入 like / dislike / collect：是，写 dislike，并删除冲突 like
-- 是否更新用户兴趣画像：是
-- 是否更新 memory：是
+- 是否更新用户信息：是，写入画像事件，等待画像重建消费
+- 是否写入 like / dislike / collect：是，写 disliked 强偏好表，并删除冲突 liked 强偏好
+- 是否更新用户兴趣画像：是，通过 `disliked` profile event 参与后续重建
+- 是否更新 memory：否，不同步直接改画像；只写 profile event
 - 是否实时计算推荐：否
 - 是否读取缓存推荐：否
 - 是否调用 embedding：可能会调用
@@ -359,39 +359,36 @@ flowchart TD
 - `arxiv_id` 缺失时返回 `400`
 - 无法物化论文时返回 `404`
 - dislike 写入失败时返回 `500`
-- 画像更新失败只 warning，不阻断主流程
+- 画像生成不在同步点击链路中执行，避免点踩请求被慢速画像构建阻塞
 
 ## 接口：POST `/user/paper-action`
 
 ### 职责
 
-记录通用论文行为，如 `favorite`、`read`、`later`、`archived`、`note_saved` 等，并按行为类型决定是否更新长期画像。
+记录弱论文行为，如 `favorite`、`read`、`later`、`archived`、`note_saved`、`not_interested` 等。`like/dislike` 及其等价表达不属于 paper-action，必须使用专用强偏好接口。
 
 ### 处理流程图
 
 ```mermaid
 flowchart TD
     A["前端 / 调用方"] --> B["[Router] record_paper_action"]
-    B --> C["[Validate] 解析 payload.user_id/arxiv_id/action_type/paper/metadata"]
+    B --> C["[Validate] 解析 payload.user_id/arxiv_id/action_type/paper/metadata，并拒绝 like/dislike"]
     C --> D["[Recommendation] RecommendationService.record_user_paper_action"]
     D --> E["[Service] _ensure_paper_materialized"]
     E --> E1["[DB] get_paper / add_paper / update_paper_embedding"]
     E --> E2["[Embedding] create_single_embedding"]
     E --> E3["[VectorStore] get_paper_embeddings_by_arxiv_ids / insert_single_embedding"]
     D --> F["[DB] record_user_paper_action"]
-    D --> G["[Memory] update_profile_from_paper_action"]
-    G --> H["[Fallback] 某些 action 不更新画像，仅返回现有 profile"]
-    G --> I["[DB] patch_user_research_profile / upsert_user_research_profile"]
-    I --> J["[Response] status/message/arxiv_id/action_type/paper/metadata"]
+    F --> G["[DB] record_user_profile_event(action_type)"]
+    G --> J["[Response] status/message/arxiv_id/action_type/paper/metadata"]
     C -. 参数缺失 .-> K["[Error] 422 / 400"]
     F -. 写入失败 .-> L["[Error] 500"]
-    G -. 画像更新失败 .-> M["[Fallback] warning，不阻断"]
     B -. 其他异常 .-> N["[Error] 500"]
 ```
 
 ### 关键调用链
 
-`record_paper_action() -> RecommendationService.record_user_paper_action() -> CandidateMaterializer._ensure_paper_materialized() -> DatabaseService.record_user_paper_action() -> MemoryService.update_profile_from_paper_action()`
+`record_paper_action() -> PaperActionRequest.validate_action_type() -> RecommendationService.record_user_paper_action() -> CandidateMaterializer._ensure_paper_materialized() -> DatabaseService.record_user_paper_action() -> DatabaseService.record_user_profile_event()`
 
 ### 输入
 
@@ -415,9 +412,9 @@ flowchart TD
 
 - 是否创建用户：否
 - 是否更新用户信息：可能，取决于 action 类型
-- 是否写入 like / dislike / collect：写入通用 `action_type`；未发现专门 `collect` 表，若使用 collect 语义更接近 `favorite` / `later`
+- 是否写入 like / dislike / collect：不会写入 like/dislike；只写弱行为 `action_type`
 - 是否更新用户兴趣画像：可能
-- 是否更新 memory：是，经过 `MemoryService.update_profile_from_paper_action()`
+- 是否更新 memory：否，不同步直接改画像；只写 profile event，后续重建按弱行为低权重消费
 - 是否实时计算推荐：否
 - 是否读取缓存推荐：否
 - 是否调用 embedding：可能会调用
@@ -427,25 +424,26 @@ flowchart TD
 ### 异常 / fallback
 
 - Pydantic 缺字段会返回 `422`
+- `action_type` 为 `like`、`liked`、`dislike`、`disliked` 或等价点赞/点踩表达时返回校验错误；应改用 `/user/like-paper` 或 `/user/dislike-paper`
 - `arxiv_id` 或 `action_type` 缺失会返回 `400`
-- 不支持的 action 类型会导致 service 写入失败并转为 `500`
-- 某些 action 类型不会更新画像，只返回当前画像
-- 画像更新失败只 warning，不阻断主流程
+- 不支持的弱行为类型会返回校验错误或 `400`
+- 部分弱行为仅记录事件，画像聚合器可能不赋予权重
 
 ## 接口：DELETE `/user/paper-action`
 
 ### 职责
 
-删除一条已记录的用户论文行为。
+删除一条已记录的弱论文行为。该接口不负责取消喜欢/不喜欢，强偏好撤销必须使用 `DELETE /user/like-paper` 或 `DELETE /user/dislike-paper`。
 
 ### 处理流程图
 
 ```mermaid
 flowchart TD
     A["前端 / 调用方"] --> B["[Router] remove_paper_action"]
-    B --> C["[Validate] 解析 arxiv_id / action_type / user_id"]
+    B --> C["[Validate] 解析 arxiv_id / action_type / user_id，并拒绝 like/dislike"]
     C --> D["[DB] remove_user_paper_action"]
-    D --> E{"[Validate] 删除成功 ?"}
+    D --> D1["[DB] deactivate profile event + record removal event"]
+    D1 --> E{"[Validate] 删除成功 ?"}
     E -->|是| F["[Response] success"]
     E -->|否| G["[Error] 404"]
     B -. 异常 .-> H["[Error] 500"]
@@ -472,9 +470,9 @@ flowchart TD
 
 - 是否创建用户：否
 - 是否更新用户信息：否
-- 是否写入 like / dislike / collect：是，删除一条 action
-- 是否更新用户兴趣画像：否
-- 是否更新 memory：否
+- 是否写入 like / dislike / collect：不会删除 like/dislike；只删除弱行为 action
+- 是否更新用户兴趣画像：是，停用对应 profile event，等待画像重建消费
+- 是否更新 memory：否，不同步直接改画像
 - 是否实时计算推荐：否
 - 是否读取缓存推荐：否
 - 是否调用 embedding：否
@@ -484,6 +482,7 @@ flowchart TD
 ### 异常 / fallback
 
 - 删除不到记录时返回 `404`
+- `action_type` 为 `like/dislike` 时返回 `400`，调用方应使用强偏好专用删除接口
 - 其他异常返回 `500`
 - 未发现明确 fallback
 
@@ -728,7 +727,7 @@ flowchart TD
 
 ### 职责
 
-撤销用户对某篇论文的 like 记录，同时删除对应的 `like` action。
+撤销用户对某篇论文的 liked 强偏好记录，并停用对应画像证据；通用 action 表不是点赞状态来源。
 
 ### 处理流程图
 
@@ -738,8 +737,9 @@ flowchart TD
     B --> C["[Validate] 解析 arxiv_id / user_id"]
     C --> D["[DB] remove_liked_paper"]
     D --> E["[DB] DELETE user_liked_papers"]
-    D --> F["[DB] remove_user_paper_action('like')"]
-    F --> G{"[Validate] 删除成功 ?"}
+    D --> F["[DB] DELETE legacy user_paper_actions('like')"]
+    D --> F1["[DB] deactivate liked profile event + record liked_removed"]
+    F1 --> G{"[Validate] 删除成功 ?"}
     G -->|是| H["[Response] success"]
     G -->|否| I["[Error] 500"]
     B -. 异常 .-> J["[Error] 500"]
@@ -748,7 +748,7 @@ flowchart TD
 
 ### 关键调用链
 
-`remove_like() -> DatabaseService.remove_liked_paper() -> DatabaseService.remove_user_paper_action()`
+`remove_like() -> DatabaseService.remove_liked_paper() -> DatabaseService._deactivate_profile_events_for_paper() -> DatabaseService.record_user_profile_event('liked_removed')`
 
 ### 输入
 
@@ -765,9 +765,9 @@ flowchart TD
 
 - 是否创建用户：否
 - 是否更新用户信息：否
-- 是否写入 like / dislike / collect：是，删除 like
-- 是否更新用户兴趣画像：否，未发现自动重建画像
-- 是否更新 memory：否
+- 是否写入 like / dislike / collect：是，删除 liked 强偏好表记录；仅清理历史遗留 `like` action
+- 是否更新用户兴趣画像：是，停用 liked profile event，并写入 `liked_removed` 触发后续重建
+- 是否更新 memory：否，不同步直接改画像
 - 是否实时计算推荐：否
 - 是否读取缓存推荐：否
 - 是否调用 embedding：否
@@ -783,7 +783,7 @@ flowchart TD
 
 ### 职责
 
-撤销用户对某篇论文的 dislike 记录，同时删除对应的 `dislike` action。
+撤销用户对某篇论文的 disliked 强偏好记录，并停用对应画像证据；通用 action 表不是点踩状态来源。
 
 ### 处理流程图
 
@@ -793,8 +793,9 @@ flowchart TD
     B --> C["[Validate] 解析 arxiv_id / user_id"]
     C --> D["[DB] remove_disliked_paper"]
     D --> E["[DB] DELETE user_disliked_papers"]
-    D --> F["[DB] remove_user_paper_action('dislike')"]
-    F --> G{"[Validate] 删除成功 ?"}
+    D --> F["[DB] DELETE legacy user_paper_actions('dislike')"]
+    D --> F1["[DB] deactivate disliked profile event + record disliked_removed"]
+    F1 --> G{"[Validate] 删除成功 ?"}
     G -->|是| H["[Response] success"]
     G -->|否| I["[Error] 500"]
     B -. 异常 .-> J["[Error] 500"]
@@ -803,7 +804,7 @@ flowchart TD
 
 ### 关键调用链
 
-`remove_dislike() -> DatabaseService.remove_disliked_paper() -> DatabaseService.remove_user_paper_action()`
+`remove_dislike() -> DatabaseService.remove_disliked_paper() -> DatabaseService._deactivate_profile_events_for_paper() -> DatabaseService.record_user_profile_event('disliked_removed')`
 
 ### 输入
 
@@ -820,9 +821,9 @@ flowchart TD
 
 - 是否创建用户：否
 - 是否更新用户信息：否
-- 是否写入 like / dislike / collect：是，删除 dislike
-- 是否更新用户兴趣画像：否，未发现自动重建画像
-- 是否更新 memory：否
+- 是否写入 like / dislike / collect：是，删除 disliked 强偏好表记录；仅清理历史遗留 `dislike` action
+- 是否更新用户兴趣画像：是，停用 disliked profile event，并写入 `disliked_removed` 触发后续重建
+- 是否更新 memory：否，不同步直接改画像
 - 是否实时计算推荐：否
 - 是否读取缓存推荐：否
 - 是否调用 embedding：否
@@ -1104,8 +1105,7 @@ flowchart TD
 7. 是否使用 `MemoryService`？
    - 是，但不是在推荐主循环里做复杂会话记忆。
    - 主要用于：
-     - like/dislike 后更新长期研究画像
-     - paper action 后更新长期研究画像
+     - profile event 驱动的长期研究画像重建
      - research profile 读写
    - `recommend_papers()` 本身不直接调用 `MemoryService`，而是通过数据库读取 `user_research_profiles`。
 
@@ -1138,7 +1138,7 @@ flowchart TD
    - `research-profile` 的 `model_dump(exclude_none=True)` 处理
    - `remove_paper_action` 的 404/500 区分
 4. 推荐相关副作用不完全直观，尤其是：
-   - like/dislike 不只是写偏好，还会写 `user_paper_actions`
+   - like/dislike 是强偏好表的权威状态，同时写 profile event，但不再写 `user_paper_actions`
    - like/dislike / paper-action 可能触发论文物化、embedding、向量库写入
    - 推荐主流程虽然不保存推荐结果，但可能补写论文表、向量映射和兴趣向量
 5. 对后续个性化推荐系统的影响：

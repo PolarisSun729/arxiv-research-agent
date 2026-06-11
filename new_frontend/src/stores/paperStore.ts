@@ -251,17 +251,10 @@ export const usePaperStore = defineStore('paper', () => {
       await dislikePaper(paper)
     }
 
-    if (label === 'liked') {
-      paperActionMap.value.like = Array.from(new Set([...(paperActionMap.value.like || []), paper.arxivId || paper.id]))
-      paperActionMap.value.dislike = (paperActionMap.value.dislike || []).filter(item => item !== (paper.arxivId || paper.id))
-      paperActionMap.value.not_interested = (paperActionMap.value.not_interested || []).filter(item => item !== (paper.arxivId || paper.id))
-    } else if (label === 'disliked') {
-      paperActionMap.value.dislike = Array.from(new Set([...(paperActionMap.value.dislike || []), paper.arxivId || paper.id]))
-      paperActionMap.value.like = (paperActionMap.value.like || []).filter(item => item !== (paper.arxivId || paper.id))
-    } else if (paper.label === 'liked') {
-      paperActionMap.value.like = (paperActionMap.value.like || []).filter(item => item !== (paper.arxivId || paper.id))
-    } else if (paper.label === 'disliked') {
-      paperActionMap.value.dislike = (paperActionMap.value.dislike || []).filter(item => item !== (paper.arxivId || paper.id))
+    if (label === 'liked' || label === 'disliked') {
+      const targetPaperId = paper.arxivId || paper.id
+      // 显式偏好不再写入 paperActionMap；这里只同步清理与强偏好冲突的弱负反馈。
+      paperActionMap.value.not_interested = (paperActionMap.value.not_interested || []).filter((item: string) => item !== targetPaperId)
     }
 
     if (currentPaper.value?.id === id) {

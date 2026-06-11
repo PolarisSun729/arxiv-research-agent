@@ -154,6 +154,23 @@ class UserRouterApiTests(unittest.TestCase):
         self.assertIn("liked_papers", payload)
         self.assertIn("research_profile", payload)
 
+    def test_post_user_preferences_is_deprecated_read_compatibility(self) -> None:
+        response = self.client.post("/api/user/preferences", json="u1")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["deprecated"])
+        self.assertEqual(payload["successor"], "GET /user/preferences/{user_id}")
+        self.assertEqual(payload["preferences"]["user_id"], "u1")
+        self.assertEqual(response.headers["Deprecation"], "true")
+        self.assertIn("use GET", response.headers["Warning"])
+
+        # OpenAPI 中仍保留短期兼容入口，但必须显式标记 deprecated，且 operationId 不再暗示 upsert。
+        operation = self.client.get("/openapi.json").json()["paths"]["/api/user/preferences"]["post"]
+        self.assertTrue(operation["deprecated"])
+        self.assertIn("Deprecated", operation["summary"])
+        self.assertNotIn("upsert", operation["operationId"].lower())
+
     def test_like_and_dislike_routes_forward_to_recommendation_service(self) -> None:
         like_response = self.client.post("/api/user/like-paper", json={"user_id": "u1", "arxiv_id": "2401.00001"})
         dislike_response = self.client.post("/api/user/dislike-paper", json={"user_id": "u1", "arxiv_id": "2401.00001"})
@@ -177,10 +194,16 @@ class UserRouterApiTests(unittest.TestCase):
             json={"user_id": "u1", "arxiv_id": "2401.00001", "action_type": "favorite", "metadata": {"source": "ui"}},
         )
         invalid = self.client.post("/api/user/paper-action", json={"user_id": "u1", "arxiv_id": "2401.00001"})
+        explicit_preference = self.client.post(
+            "/api/user/paper-action",
+            json={"user_id": "u1", "arxiv_id": "2401.00001", "action_type": "like"},
+        )
 
         self.assertEqual(success.status_code, 200)
         self.assertEqual(success.json()["action_type"], "favorite")
         self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(explicit_preference.status_code, 422)
+        self.assertIn("like/dislike", str(explicit_preference.json()["detail"]))
 
     def test_delete_paper_action_returns_success_and_404(self) -> None:
         success = self.client.request(
@@ -198,6 +221,16 @@ class UserRouterApiTests(unittest.TestCase):
         self.assertEqual(success.status_code, 200)
         self.assertEqual(success.json()["status"], "success")
         self.assertEqual(missing.status_code, 404)
+
+    def test_delete_paper_action_rejects_explicit_preference_action(self) -> None:
+        response = self.client.request(
+            "DELETE",
+            "/api/user/paper-action",
+            json={"user_id": "u1", "arxiv_id": "2401.00001", "action_type": "dislike"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("DELETE /user/dislike-paper", response.json()["detail"])
 
     def test_get_user_paper_actions_returns_items_and_map(self) -> None:
         response = self.client.get("/api/user/paper-actions/u1")

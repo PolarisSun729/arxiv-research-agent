@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
+from .fallbacks import build_fallback_record
 from .plan_validator import PlanValidator
 from .schemas import (
     ExecutablePlan,
@@ -75,6 +76,7 @@ class PlanPatchResult:
     updated_runtime: Optional[PlanRuntime] = None
     fallback: bool = False
     fallback_reason: Optional[str] = None
+    fallback_record: Dict[str, Any] = field(default_factory=dict)
     patch_result: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -95,6 +97,30 @@ def _binding(
         value=value,
         required=required,
     )
+
+
+def _paper_reference_binding_from_index_step(failed_step: PlanStep) -> StepInputBinding:
+    """复用索引检查的目标来源，避免恢复链重新依赖引用线索提取器。
+
+    缺索引恢复会插入 parse_and_index_paper。目标论文应来自刚失败的
+    check_paper_index 输入：如果上游已经有最终解析后的 literal paper_ref，就直接沿用；
+    如果仍是旧的 resolve_paper step 输出，也保持原有绑定方式。
+    """
+    for binding in list(failed_step.input_bindings or []):
+        if binding.input_key not in {"paper_ref", "paper_reference"}:
+            continue
+        if binding.source_type == "literal":
+            return _binding("paper_reference", source_type="literal", value=binding.value, required=binding.required)
+        if binding.source_type == "step_output":
+            return _binding("paper_reference", source_type="step_output", step_id=binding.step_id, required=binding.required)
+        if binding.source_type in {"state", "context"}:
+            return _binding(
+                "paper_reference",
+                source_type=binding.source_type,
+                source_key=binding.source_key,
+                required=binding.required,
+            )
+    return _binding("paper_reference", source_type="step_output", step_id="resolve_paper")
 
 
 class PlanPatcher:
@@ -288,7 +314,7 @@ class PlanPatcher:
             output_key=self._make_unique_output_key(plan_copy, "index_build_result"),
             depends_on=[request_step_id],
             confirmation_policy=StepPolicy(policy_type="confirmation", mode="explicit_user_confirmation_required", requires_confirmation=True),
-            input_bindings=[_binding("paper_reference", source_type="step_output", step_id="resolve_paper")],
+            input_bindings=[_paper_reference_binding_from_index_step(failed_step)],
         )
         self._insert_steps_after(plan_copy, failed_step.step_id, [request_step, parse_step])
         return {
@@ -524,7 +550,22 @@ class PlanPatcher:
             safety_check_result=safety_check_result,
             patch_result=payload,
         )
-        return PlanPatchResult(updated_runtime=runtime_copy, fallback=True, fallback_reason=fallback_reason, patch_result=payload)
+        return PlanPatchResult(
+            updated_runtime=runtime_copy,
+            fallback=True,
+            fallback_reason=fallback_reason,
+            fallback_record=build_fallback_record(
+                fallback_reason,
+                stage="replan",
+                source="PlanPatcher.apply",
+                detail={
+                    "failed_step_id": failed_step.step_id,
+                    "tool_name": failed_step.tool_name,
+                    "patch_strategy": action.patch_strategy,
+                },
+            ),
+            patch_result=payload,
+        )
 
     def _build_step(
         self,

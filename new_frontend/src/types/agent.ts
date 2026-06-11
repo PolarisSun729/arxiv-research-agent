@@ -14,7 +14,7 @@ export interface ArxivSearchRequest {
   context?: {
     selected_paper?: AgentPaper | null
     last_papers?: AgentPaper[]
-    pending_action?: Record<string, any> | null
+    pending_action?: AgentPendingAction | Record<string, any> | null
     paper_qa_result?: Record<string, any> | null
     research_profile?: UserResearchProfile | null
     arxiv_id?: string | null
@@ -85,6 +85,7 @@ export interface AgentPaper {
   arxiv_id?: string
   arxivId?: string
   id?: string
+  paper_id?: string
   title?: string
   authors?: string[] | string
   abstract?: string
@@ -111,6 +112,58 @@ export interface AgentPaper {
   label?: 'liked' | 'disliked' | null
 }
 
+export interface PaperTargetCandidate extends AgentPaper {
+  candidate_id?: string
+  rank?: number
+  source?: string
+  source_type?: string
+  source_key?: string
+  source_label?: string
+  list_name?: string
+  authors_summary?: string
+}
+
+export interface AgentPendingAction {
+  type?: string
+  request_type?: string
+  status?: string
+  decision?: 'approve' | 'reject' | null
+  pending_action_id?: string | null
+  step_id?: string | null
+  interrupt_id?: string | null
+  tool_name?: string | null
+  action_type?: string | null
+  side_effect_level?: string | null
+  reason?: string | null
+  title?: string | null
+  title_text?: string | null
+  description?: string | null
+  arxiv_id?: string | null
+  original_question?: string | null
+  original_message?: string | null
+  qa_question?: string | null
+  target_paper?: PaperTargetCandidate | null
+  candidates?: PaperTargetCandidate[]
+  recommended_candidate?: PaperTargetCandidate | null
+  default_candidate_id?: string | null
+  allowed_decisions?: string[]
+  allow_argument_edit?: boolean
+  allow_reject?: boolean
+  allow_note?: boolean
+  arguments_summary?: Record<string, any>
+  confirmation_request?: Record<string, any>
+  reference_hint?: Record<string, any>
+  target_resolution?: Record<string, any>
+  confirmation_fields?: Record<string, any>
+  created_at?: string | null
+  expires_at?: string | null
+  thread_id?: string | null
+  session_id?: string | null
+  plan_id?: string | null
+  trace_id?: string | null
+  edited_arguments?: Record<string, any> | null
+}
+
 export interface AgentPreferenceActionResult {
   status: 'success' | 'failed'
   action: 'like' | 'dislike' | 'remove'
@@ -127,7 +180,7 @@ export interface ArxivSearchResponse {
   intent: string
   answer: string
   search_spec?: ArxivSearchSpec | null
-  pending_action?: Record<string, any> | null
+  pending_action?: AgentPendingAction | null
   paper_qa_result?: Record<string, any> | null
   preference_action_result?: AgentPreferenceActionResult | null
   plan: string[]

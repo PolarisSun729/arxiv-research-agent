@@ -134,7 +134,7 @@
  - `/profile`：研究画像
  - `/agent-search`：Agent 检索
  - `/labeled`：已标注论文
- - `/chunks`：chunk 查看器
+ - `/chunks`：chunk 调试查看器，仅 `VITE_ENABLE_DEBUG_ROUTES=true` 时注册前端路由
 
  ### 3.3 前后端联调方式
 
@@ -176,7 +176,7 @@
  - `user_router`：`/api/user/*`
  - `paper_router`：`/api/*` 下的论文与统计接口
  - `qa_router`：`/api/paper/{arxiv_id}/*`
- - `chunk_router`：`/api/chunks/*`
+ - `chunk_router`：仅在 `ENABLE_DEBUG_ROUTES=true` 时注册到 `/api/debug/chunks/*`，用于本地 chunk 调试，不属于默认正式 API
 
  ### 4.2 后端加载模式
 

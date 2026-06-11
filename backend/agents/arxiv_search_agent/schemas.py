@@ -443,6 +443,11 @@ class PlanDraftStep(BaseModel):
                         break
         if not normalized.get("fallback_reason") and normalized.get("failure_recovery_hint"):
             normalized["fallback_reason"] = normalized.get("failure_recovery_hint")
+        retry_policy = normalized.get("retry_policy")
+        model_dump = getattr(retry_policy, "model_dump", None)
+        if callable(model_dump):
+            # planner 单测会通过不同模块路径重复加载 schema；同形 StepPolicy 先转 dict，避免类身份不一致。
+            normalized["retry_policy"] = model_dump()
         return normalized
 
 
@@ -578,7 +583,7 @@ class ExecutionPlanStep(BaseModel):
 PlanStepStatus = Literal["pending", "running", "success", "failed", "skipped", "waiting_confirmation"]
 AgentTurnStatus = Literal["success", "waiting_confirmation", "need_clarification", "failed", "fallback"]
 SideEffectLevel = Literal["none", "low", "high"]
-ConfirmationRequestType = Literal["tool_approval"]
+ConfirmationRequestType = Literal["tool_approval", "paper_target_confirmation"]
 ConfirmationDecision = Literal["approve", "reject"]
 
 
@@ -694,8 +699,8 @@ class ConfirmationDecisionOption(BaseModel):
 class ConfirmationDecisionPayload(BaseModel):
     """定义用户恢复执行时提交的标准化决策。
 
-    第一版只支持 approve / reject。
-    edited_arguments 仅作为未来扩展预留字段，当前版本不启用参数修改能力。
+    edited_arguments 用于“确认目标论文”这类显式改参场景；后端仍只接受 pending confirmation
+    中声明和校验过的字段，不能把它当作重新解析自然语言的入口。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -708,8 +713,8 @@ class ConfirmationDecisionPayload(BaseModel):
 class ResumeRequest(BaseModel):
     """定义前端发起 interrupt 恢复时使用的结构化请求。
 
-    第一版只把 approve / reject 做成稳定契约。
-    step_id / interrupt_id 先作为幂等校验与后续扩展预留字段，不在当前版本里驱动参数编辑。
+    step_id / interrupt_id 用于幂等校验；edited_arguments 只承载确认框中用户明确选择的
+    paper_id/arxiv_id 等字段，后端必须用 pending confirmation 里的候选集合再次校验。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -731,6 +736,7 @@ class ConfirmationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     request_type: ConfirmationRequestType = "tool_approval"
+    pending_action_id: Optional[str] = None
     step_id: str
     tool_name: str
     action_type: str
@@ -740,7 +746,17 @@ class ConfirmationRequest(BaseModel):
     description: Optional[str] = None
     arguments_summary: Dict[str, Any] = Field(default_factory=dict)
     original_question: Optional[str] = None
+    original_message: Optional[str] = None
     target_paper: Optional[Dict[str, Any]] = None
+    # 目标论文确认需要把候选论文随 checkpoint 一起保存；resume 时只允许从这里匹配，不能重新解析自然语言。
+    candidates: List[Dict[str, Any]] = Field(default_factory=list)
+    recommended_candidate: Optional[Dict[str, Any]] = None
+    default_candidate_id: Optional[str] = None
+    reference_hint: Dict[str, Any] = Field(default_factory=dict)
+    target_resolution: Dict[str, Any] = Field(default_factory=dict)
+    confirmation_fields: Dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[str] = None
+    expires_at: Optional[str] = None
     allowed_decisions: List[ConfirmationDecisionOption] = Field(default_factory=list)
     allow_argument_edit: bool = False
     allow_reject: bool = True
@@ -782,6 +798,15 @@ class PlanStep(BaseModel):
     @classmethod
     def _coerce_tool_spec(cls, value: Any) -> Any:
         # 测试和轻量运行时可能用不同模块名加载同一份 schema，先转成 dict 避免类身份不一致。
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            return model_dump()
+        return value
+
+    @field_validator("retry_policy", "failure_policy", "confirmation_policy", mode="before")
+    @classmethod
+    def _coerce_step_policy(cls, value: Any) -> Any:
+        # planner/converter 可能跨模块实例传入同形 StepPolicy；统一转 dict 后再由当前 schema 校验。
         model_dump = getattr(value, "model_dump", None)
         if callable(model_dump):
             return model_dump()

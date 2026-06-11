@@ -14,11 +14,32 @@ class ResolvePreferenceTargetInput(BaseModel):
     message: str = ""
     selected_paper: Optional[Dict[str, Any]] = None
     context: Dict[str, Any] = Field(default_factory=dict)
+    action_type: Optional[str] = None
 
 
 class PreferenceTargetOutput(BaseModel):
     model_config = ConfigDict(extra="allow")
 
+    status: str = "unknown"
+    reference_type: str = "unknown"
+    value: Optional[Any] = None
+    confidence: float = 0.0
+    requires_context: bool = False
+    reason: Optional[str] = None
+    final_target_resolved: bool = False
+    reference_hint: Dict[str, Any] = Field(default_factory=dict)
+    target_resolution: Dict[str, Any] = Field(default_factory=dict)
+    target: Optional[Dict[str, Any]] = None
+    paper: Optional[Dict[str, Any]] = None
+    candidates: list[Dict[str, Any]] = Field(default_factory=list)
+    recommended_candidate: Optional[Dict[str, Any]] = None
+    requires_confirmation: bool = False
+    risk_level: Optional[str] = None
+    action_type: Optional[str] = None
+    resolution_reason: Optional[str] = None
+    resolution_debug: Dict[str, Any] = Field(default_factory=dict)
+    hint_confidence: float = 0.0
+    paper_reference: Dict[str, Any] = Field(default_factory=dict)
     arxiv_id: Optional[str] = None
     title: Optional[str] = None
     query: Optional[str] = None
@@ -93,10 +114,26 @@ class ResolvePreferenceTargetAdapter(BaseToolAdapter[ResolvePreferenceTargetInpu
         self.resolve_paper_adapter = resolve_paper_adapter
 
     def _run(self, tool_input: ResolvePreferenceTargetInput) -> PreferenceTargetOutput:
-        result = self.resolve_paper_adapter.execute(tool_input)
+        # 偏好写入是持久化副作用；目标解析必须携带 action_type，便于 resolver 提高确认门槛。
+        resolve_input = tool_input.model_copy(update={"action_type": tool_input.action_type or "preference_action"})
+        result = self.resolve_paper_adapter.execute(resolve_input)
         if result.ok and isinstance(result.data, BaseModel):
             return PreferenceTargetOutput.model_validate(result.data.model_dump())
-        return PreferenceTargetOutput(query=tool_input.message)
+        # 偏好目标解析失败时只返回 unknown 线索，不能再回退到默认论文并写入持久化偏好。
+        hint = {
+            "status": "unknown",
+            "reference_type": "unknown",
+            "value": None,
+            "confidence": 0.0,
+            "source": "resolve_preference_target_failed",
+            "requires_context": False,
+            "final_target_resolved": False,
+            "reason": "无法提取偏好动作的论文引用线索。",
+            "query": tool_input.message,
+        }
+        hint["reference_hint"] = dict(hint)
+        hint["paper_reference"] = dict(hint)
+        return PreferenceTargetOutput.model_validate(hint)
 
 
 class UpdatePreferenceStoreAdapter(BaseToolAdapter[UpdatePreferenceStoreInput, PreferenceActionOutput]):

@@ -21,7 +21,7 @@ def build_planner_context(
 ) -> PlannerContext:
     """构造本轮 planner 唯一可信的输入快照。
 
-    构造失败应由 planner 入口兜底到固定模板；这里保持纯整理逻辑，让错误边界集中在
+    构造失败应由 planner 入口兜底到 legacy 模板；这里保持纯整理逻辑，让错误边界集中在
     build_executable_plan_for_goal，避免执行链路因为局部上下文字段异常直接中断。
     """
 

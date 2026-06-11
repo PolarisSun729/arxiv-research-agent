@@ -71,6 +71,49 @@
 - 如果你本地没有代理，这一项通常需要改
 - 如果访问 arXiv 超时，优先检查代理配置是否可用
 
+### 3.3 Debug Router 配置
+
+chunk debug router 只用于本地排查 PDF 解析、chunk 切分和 RAG 召回问题。它会读取本地调试产物，因此默认不注册到后端正式 API，也不会出现在默认 OpenAPI 文档中。
+
+| 变量名 | 默认值 | 用途 |
+| --- | --- | --- |
+| `ENABLE_DEBUG_ROUTES` | `False` | 后端是否注册 `/api/debug/chunks/*` 等内部调试路由 |
+| `DEBUG_CHUNK_CONTENT_PREVIEW_CHARS` | `4000` | chunk 调试响应中长文本字段的最大预览长度 |
+| `VITE_ENABLE_DEBUG_ROUTES` | `False` | 前端是否注册 `/chunks` 调试页面和侧边栏入口 |
+
+本地开启方式：
+
+- 后端启动前设置 `ENABLE_DEBUG_ROUTES=true`
+- 前端启动前设置 `VITE_ENABLE_DEBUG_ROUTES=true`
+- 调试接口路径为 `/api/debug/chunks/files` 和 `/api/debug/chunks/file/{filename}`
+
+生产或演示环境建议保持关闭，因为该能力面向内部排查，会暴露 chunk 文件名、裁剪后的解析结构和调试元数据，不属于普通用户业务接口。
+
+### 3.4 Agent Planner 能力边界配置
+
+Agent Planner 当前需要特别注意的是“哪条路径是正式能力，哪条路径只是实验或兜底”。
+当前约定是：
+
+- **规则型 planner** 是默认开启的正式路径
+- **LLM draft planner** 是实验性能力，默认关闭
+- **legacy template fallback planner** 只在主 planner 关闭、失败或上下文异常时输出最小安全回复，不再承载业务规划
+
+| 变量名 | 默认值 | 用途 |
+| --- | --- | --- |
+| `ENABLE_RULE_BASED_PLANNER` | `True` | 正式的规则型 planner 开关 |
+| `ENABLE_TOOL_AWARE_PLANNER` | `True` | 历史兼容名称，建议优先看 `ENABLE_RULE_BASED_PLANNER` |
+| `ENABLE_EXPERIMENTAL_LLM_PLANNER` | `False` | 实验性的 LLM draft planner 开关 |
+| `ENABLE_LLM_PLAN_DRAFT` | `False` | 历史兼容名称，与 `ENABLE_EXPERIMENTAL_LLM_PLANNER` 同义 |
+| `ENABLE_RULE_FALLBACK_AFTER_LLM_PLANNER` | `True` | LLM draft 失败后是否回退到规则型 planner |
+| `ENABLE_TEMPLATE_FALLBACK_PLANNER` | `True` | 规划无法合法生成时是否允许 legacy 模板输出最小安全兜底 |
+| `EXPOSE_PLANNER_DEBUG` | `True` | 是否在 debug / trace 中暴露 planner 路径和兜底信息 |
+
+建议：
+
+- 排查行为时优先看 `debug.planner_summary.final_path`
+- 如果看到 `experimental_llm_draft_planner`，说明这轮走的是实验性 LLM draft，不是默认正式能力
+- 如果看到 `legacy_template_fallback_planner`，说明这轮没有走主规划路径；继续看 `fallback_record.code/raw_reason` 判断是 LLM 校验失败、tool-aware planner 失败、配置关闭还是缺少上下文
+
 ---
 
 ## 4. 数据库与存储配置

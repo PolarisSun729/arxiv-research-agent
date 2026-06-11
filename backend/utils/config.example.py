@@ -28,6 +28,12 @@ CORE_CONFIG = {
 }
 
 
+DEBUG_ROUTES_CONFIG = {
+    "enable_debug_routes": False,
+    "chunk_content_preview_chars": 4000,
+}
+
+
 DOCLING_CONFIG = {
     "do_ocr_enabled": False,
     "annotated_pdf_export_enabled": True,

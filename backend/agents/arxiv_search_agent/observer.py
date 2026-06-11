@@ -73,6 +73,18 @@ def _compact_qa_observation(value: Mapping[str, Any]) -> Dict[str, Any]:
     return compact
 
 
+def _paper_target_evidence(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """压缩论文目标解析 evidence，保留线索、候选和决策原因供日志/恢复链复盘。"""
+    target_resolution = payload.get("target_resolution") if isinstance(payload.get("target_resolution"), Mapping) else {}
+    return {
+        "reference_hint": dict(payload.get("reference_hint") or {}) if isinstance(payload.get("reference_hint"), Mapping) else dict(payload),
+        "target_resolution": dict(target_resolution),
+        "candidates": list(payload.get("candidates") or []),
+        "recommended_candidate": payload.get("recommended_candidate"),
+        "resolution_reason": payload.get("resolution_reason") or payload.get("reason"),
+    }
+
+
 def _has_downstream_paper_qa_quality_gate(runtime: PlanRuntime, step: PlanStep) -> bool:
     """判断当前 answer 步骤后是否已有显式质量门，避免在 answer 阶段提前抢跑重规划。"""
     plan = runtime.plan
@@ -313,12 +325,101 @@ class Observer:
             )
         return ObservationResult(status="success", reason="validated_arxiv_results_ok", confidence=0.85, details={"result_count": result_count})
 
+    def _observe_resolve_paper(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
+        del resolved_input, raw_output, runtime, state
+        payload = _unwrap_payload(normalized_output)
+        payload = payload if isinstance(payload, Mapping) else {}
+        reference_type = str(payload.get("reference_type") or "unknown").strip() or "unknown"
+        resolution_status = str(payload.get("status") or "").strip()
+        if str(payload.get("arxiv_id") or "").strip() and bool(payload.get("final_target_resolved")):
+            return ObservationResult(status="success", reason="paper_target_resolved", confidence=0.95)
+        if resolution_status == "need_confirmation":
+            # resolver 已经生成候选但不能唯一确定目标；继续 QA 会把候选误当最终论文，必须先让用户确认。
+            return ObservationResult(
+                status="need_confirmation",
+                reason=str(payload.get("resolution_reason") or payload.get("reason") or "paper_target_requires_confirmation"),
+                confidence=float(payload.get("confidence") or 0.0),
+                suggested_action="confirm_target",
+                **_recovery_semantics(
+                    failure_category="ambiguous_user_request",
+                    suggested_recovery_types=["ask_clarification"],
+                    evidence=_paper_target_evidence(payload),
+                    retryable=False,
+                    requires_user_input=True,
+                ),
+            )
+        # resolve_paper 现在会产出“引用线索 + 候选解析结果”。没有 final target 时不能继续 QA/详情/下载等动作。
+        return ObservationResult(
+            status="need_clarification",
+            reason=str(payload.get("resolution_reason") or payload.get("reason") or ("paper_target_not_resolved" if reference_type != "unknown" else "paper_reference_missing")),
+            confidence=float(payload.get("confidence") or 0.0),
+            suggested_action="clarify_target",
+            **_recovery_semantics(
+                failure_category="ambiguous_user_request",
+                suggested_recovery_types=["ask_clarification"],
+                evidence=_paper_target_evidence(payload),
+                retryable=False,
+                requires_user_input=True,
+            ),
+        )
+
+    def _observe_resolve_preference_target(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
+        del resolved_input, raw_output, runtime, state
+        payload = _unwrap_payload(normalized_output)
+        payload = payload if isinstance(payload, Mapping) else {}
+        resolution_status = str(payload.get("status") or "").strip()
+        if str(payload.get("arxiv_id") or "").strip() and bool(payload.get("final_target_resolved")):
+            return ObservationResult(status="success", reason="preference_target_resolved", confidence=0.95)
+        if resolution_status == "need_confirmation":
+            # 偏好写入是持久化副作用；候选存在但目标不唯一时，不能继续 update_preference_store。
+            return ObservationResult(
+                status="need_confirmation",
+                reason=str(payload.get("resolution_reason") or payload.get("reason") or "preference_target_requires_confirmation"),
+                confidence=float(payload.get("confidence") or 0.0),
+                suggested_action="confirm_target",
+                **_recovery_semantics(
+                    failure_category="preference_target_missing",
+                    suggested_recovery_types=["ask_clarification"],
+                    evidence=_paper_target_evidence(payload),
+                    retryable=False,
+                    requires_user_input=True,
+                ),
+            )
+        # 偏好写入是持久化副作用；线索没落到最终论文前必须拦截，不能继续 update_preference_store。
+        return ObservationResult(
+            status="need_clarification",
+            reason=str(payload.get("resolution_reason") or payload.get("reason") or "preference_target_not_resolved"),
+            confidence=float(payload.get("confidence") or 0.0),
+            suggested_action="clarify_target",
+            **_recovery_semantics(
+                failure_category="preference_target_missing",
+                suggested_recovery_types=["ask_clarification"],
+                evidence=_paper_target_evidence(payload),
+                retryable=False,
+                requires_user_input=True,
+            ),
+        )
+
     def _observe_check_paper_index(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
         del resolved_input, raw_output, runtime, state
         normalized_output = _unwrap_payload(normalized_output)
         payload = normalized_output if isinstance(normalized_output, Mapping) else {}
         status = str(payload.get("status") or "").lower()
         has_index = bool(payload.get("has_index"))
+        if status == "target_unresolved":
+            return ObservationResult(
+                status="need_clarification",
+                reason="paper_target_unresolved_before_index_check",
+                confidence=0.3,
+                suggested_action="clarify_target",
+                **_recovery_semantics(
+                    failure_category="ambiguous_user_request",
+                    suggested_recovery_types=["ask_clarification"],
+                    evidence={"reference_hint": payload.get("reference_hint") or payload.get("tool_result")},
+                    retryable=False,
+                    requires_user_input=True,
+                ),
+            )
         if status in {"available", "indexed"} or has_index:
             return ObservationResult(status="success", reason="paper_index_available", confidence=0.95)
         if status in {"stale", "outdated", "collection_missing", "vector_store_unavailable"}:

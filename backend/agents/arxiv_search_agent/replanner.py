@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from .fallbacks import build_fallback_record
 from .failure_classifier import FailureClassifier
 from .plan_patcher import PlanPatcher
 from .recovery_chooser import RecoveryChooser
@@ -27,6 +28,7 @@ class ReplanDecision:
     updated_runtime: Optional[PlanRuntime] = None
     fallback: bool = False
     fallback_reason: Optional[str] = None
+    fallback_record: Dict[str, Any] = field(default_factory=dict)
     recovery_debug: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -102,6 +104,17 @@ class Replanner:
             return ReplanDecision(
                 fallback=True,
                 fallback_reason=limit_reason,
+                fallback_record=build_fallback_record(
+                    limit_reason,
+                    stage="replan",
+                    source="Replanner.replan",
+                    detail={
+                        "reason_key": reason_key,
+                        "reason_replan_count": current_reason_count,
+                        "step_replan_count": current_step_count,
+                        "turn_replan_count": total_replans,
+                    },
+                ),
                 updated_runtime=runtime_copy,
                 recovery_debug={
                     "fallback_used": True,
@@ -173,12 +186,25 @@ class Replanner:
             return ReplanDecision(
                 fallback=True,
                 fallback_reason=patch_result.fallback_reason or recovery_choice.action.fallback_reason or reason_key,
+                fallback_record=dict(patch_result.fallback_record or {}),
                 updated_runtime=patch_result.updated_runtime,
                 recovery_debug=recovery_debug,
             )
         if patch_result.updated_plan is not None and patch_result.updated_runtime is not None:
             return ReplanDecision(updated_plan=patch_result.updated_plan, updated_runtime=patch_result.updated_runtime, recovery_debug=recovery_debug)
-        return ReplanDecision(fallback=True, fallback_reason=f"recovery_patch_failed:{reason_key}", updated_runtime=patch_result.updated_runtime, recovery_debug=recovery_debug)
+        fallback_reason = f"recovery_patch_failed:{reason_key}"
+        return ReplanDecision(
+            fallback=True,
+            fallback_reason=fallback_reason,
+            fallback_record=build_fallback_record(
+                fallback_reason,
+                stage="replan",
+                source="Replanner.replan",
+                detail={"reason_key": reason_key},
+            ),
+            updated_runtime=patch_result.updated_runtime,
+            recovery_debug=recovery_debug,
+        )
 
 
 __all__ = ["Replanner", "ReplanRule", "ReplanDecision"]

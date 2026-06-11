@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections import Counter
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from fastapi import HTTPException
 
@@ -100,11 +100,15 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             }
         profile = self.db_service.get_user_research_profile(user_id)
         actions = self.db_service.get_user_paper_action_map(user_id)
+        explicit_preference_ids = [
+            *self.db_service.get_liked_papers(user_id),
+            *self.db_service.get_disliked_papers(user_id),
+        ]
         excluded_ids = list(
             dict.fromkeys(
                 [
-                    *self._normalize_text_terms(actions.get("like", [])),
-                    *self._normalize_text_terms(actions.get("dislike", [])),
+                    # like/dislike 是强偏好权威状态，不再从弱行为 action_map 读取。
+                    *self._normalize_text_terms(explicit_preference_ids),
                     *self._normalize_text_terms(actions.get("not_interested", [])),
                     *self._normalize_text_terms(actions.get("archived", [])),
                 ]
@@ -290,6 +294,433 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             raise HTTPException(status_code=400, detail="User interest vector not found. Please generate it first.")
 
         return vector_data
+
+    def _coerce_mapping(self, value: Any) -> Dict[str, Any]:
+        return dict(value) if isinstance(value, Mapping) else {}
+
+    def _coerce_candidate_list(self, value: Any) -> List[Dict[str, Any]]:
+        return [dict(item) for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+
+    def _resolve_effective_research_profile(
+        self,
+        *,
+        stored_profile: Optional[Dict[str, Any]],
+        request_profile: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        effective = dict(stored_profile or {})
+        # 当前请求显式传入的画像字段优先，避免 Agent 已经识别出的会话约束在服务层被旧缓存覆盖。
+        for key, value in dict(request_profile or {}).items():
+            if value in (None, "", [], {}):
+                continue
+            effective[key] = value
+        return effective
+
+    def _build_recommendation_context_bundle(
+        self,
+        *,
+        message: Optional[str],
+        topic_hint: Optional[str],
+        research_profile: Optional[Dict[str, Any]],
+        request_context: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        context = self._coerce_mapping(request_context)
+        query_text = str(topic_hint or message or context.get("query") or "").strip()
+        positive_topics = self._normalize_text_terms(context.get("positive_topics"))
+        negative_topics = self._normalize_text_terms(context.get("negative_topics"))
+        category_constraints = self._normalize_text_terms(context.get("category_constraints"))
+        recent_papers = self._coerce_candidate_list(context.get("recent_papers"))
+        recent_text = " ".join(
+            filter(
+                None,
+                [
+                    f"{paper.get('title', '')} {paper.get('abstract', '') or paper.get('summary', '')}"
+                    for paper in recent_papers[:5]
+                    if isinstance(paper, dict)
+                ],
+            )
+        )
+        recent_topics = self._extract_query_terms(recent_text)
+        profile = research_profile or {}
+        profile_negative_topics = self._normalize_text_terms(profile.get("negative_topics"))
+        profile_positive_topics = self._normalize_text_terms(profile.get("positive_topics"))
+        if not positive_topics:
+            positive_topics = profile_positive_topics[:]
+        cold_start = bool(context.get("force_cold_start")) or (not bool(query_text) and not bool(profile_positive_topics))
+        return {
+            "query_text": query_text,
+            "topic_hint": str(topic_hint or "").strip() or None,
+            "positive_topics": positive_topics,
+            "negative_topics": list(dict.fromkeys([*negative_topics, *profile_negative_topics])),
+            "category_constraints": category_constraints,
+            "recent_papers": recent_papers,
+            "recent_topics": recent_topics,
+            "temporary_requirements": self._normalize_text_terms(context.get("temporary_requirements")),
+            "cold_start": cold_start,
+            "user_id_provided": bool(context.get("user_id_provided")),
+        }
+
+    def _merge_candidate_sources(
+        self,
+        *,
+        recalled_candidates: List[Dict[str, Any]],
+        context_candidates: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        # 会话里最近出现过的论文会先进入候选池，后续仍由统一排序逻辑决定是否留下，避免 Agent 和 Service 重复做两套推荐。
+        for source_name, source_candidates in (("context", context_candidates), ("recall", recalled_candidates)):
+            for candidate in source_candidates:
+                arxiv_id = str(candidate.get("arxiv_id", "") or candidate.get("id", "") or "").strip()
+                if not arxiv_id or arxiv_id in seen:
+                    continue
+                seen.add(arxiv_id)
+                normalized = self._normalize_paper_record(dict(candidate), arxiv_id)
+                merged.append({**candidate, **normalized, "candidate_source": source_name})
+        return merged
+
+    def _compute_contextual_adjustment(
+        self,
+        candidate: Dict[str, Any],
+        *,
+        context_bundle: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        query_breakdown = self._build_query_match_score(
+            candidate,
+            query=context_bundle.get("query_text"),
+            search_categories=context_bundle.get("category_constraints") or [],
+        )
+        candidate_text = " ".join(
+            [
+                str(candidate.get("title", "") or ""),
+                str(candidate.get("abstract", "") or candidate.get("summary", "") or ""),
+                " ".join(self._split_categories(candidate.get("categories"))),
+                " ".join(str(item.get("label") or "") for item in self._candidate_profile_concepts(candidate)),
+            ]
+        ).lower()
+        positive_hits = [term for term in context_bundle.get("positive_topics", []) if term and term in candidate_text]
+        negative_hits = [term for term in context_bundle.get("negative_topics", []) if term and term in candidate_text]
+        recent_hits = [term for term in context_bundle.get("recent_topics", []) if term and term in candidate_text]
+        category_constraints = {item.lower() for item in context_bundle.get("category_constraints", [])}
+        candidate_categories = {item.lower() for item in self._split_categories(candidate.get("categories"))}
+        category_hits = sorted(category_constraints & candidate_categories)
+        category_mismatch_penalty = 0.12 if category_constraints and not category_hits else 0.0
+        recent_behavior_score = min(0.18, len(recent_hits) * 0.03)
+        request_score = min(
+            0.38,
+            float(query_breakdown.get("query_match_score", 0.0) or 0.0) * 0.24
+            + len(positive_hits) * 0.05
+            + recent_behavior_score
+            + len(category_hits) * 0.03,
+        )
+        request_penalty = min(0.45, len(negative_hits) * 0.15 + category_mismatch_penalty)
+        # 显式负向主题优先级高于泛化查询词命中，避免“用户说不要 vision，但因为也提到 agent 仍被保留”。
+        exclude_candidate = bool(negative_hits and not positive_hits)
+        negative_filter_reason = None
+        if exclude_candidate:
+            negative_filter_reason = f"matched negative topics: {', '.join(negative_hits[:3])}"
+        elif category_mismatch_penalty > 0:
+            negative_filter_reason = "category constraints not matched"
+        sources: List[str] = []
+        if query_breakdown.get("matched_terms") or positive_hits:
+            sources.append("current_request")
+        if recent_hits:
+            sources.append("recent_behavior")
+        if context_bundle.get("cold_start"):
+            sources.append("cold_start")
+        return {
+            "request_score": request_score,
+            "request_penalty": request_penalty,
+            "query_match_score": float(query_breakdown.get("query_match_score", 0.0) or 0.0),
+            "matched_query_terms": list(query_breakdown.get("matched_terms") or []),
+            "matched_request_topics": positive_hits,
+            "matched_negative_terms": negative_hits,
+            "matched_category_constraints": category_hits,
+            "recent_behavior_score": recent_behavior_score,
+            "recent_behavior_terms": recent_hits,
+            "exclude_candidate": exclude_candidate,
+            "negative_filter_reason": negative_filter_reason,
+            "query_score_breakdown": dict(query_breakdown.get("query_score_breakdown") or {}),
+            "context_sources": sources,
+        }
+
+    def _build_recommendation_explanation(self, candidate: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        matched_profile_terms = list(candidate.get("matched_profile_terms") or [])
+        matched_query_terms = list(candidate.get("matched_query_terms") or [])
+        recent_terms = list(candidate.get("recent_behavior_terms") or [])
+        if matched_profile_terms:
+            parts.append(f"长期兴趣命中 {', '.join(matched_profile_terms[:3])}")
+        if matched_query_terms:
+            parts.append(f"当前请求命中 {', '.join(matched_query_terms[:3])}")
+        if recent_terms:
+            parts.append(f"最近交互相关 {', '.join(recent_terms[:3])}")
+        if not parts:
+            if candidate.get("recommendation_basis", {}).get("cold_start"):
+                parts.append("主要依据当前主题与最新候选进行冷启动推荐")
+            else:
+                parts.append("依据综合相关度、多样性和用户画像排序")
+        return "；".join(parts)
+
+    def recommend_papers_with_context(
+        self,
+        user_id: str,
+        top_n: int = RECOMMENDATION_CONFIG["default_top_n"],
+        max_age_months: int = RECOMMENDATION_CONFIG["default_max_age_months"],
+        message: Optional[str] = None,
+        topic_hint: Optional[str] = None,
+        user_memory_summary: Optional[Any] = None,
+        research_profile: Optional[Dict[str, Any]] = None,
+        request_context: Optional[Dict[str, Any]] = None,
+        candidate_papers: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """在不破坏旧接口的前提下，为 Agent 推荐链路提供真正消费上下文的推荐实现。"""
+        logger.info("Starting context-aware recommendation for user %s with top_n=%s max_age_months=%s", user_id, top_n, max_age_months)
+
+        preferences = self.db_service.get_user_preferences(user_id=user_id)
+        liked_ids = preferences.get("liked_papers", [])
+        disliked_ids = preferences.get("disliked_papers", [])
+        profile_bundle = self._build_profile_signal_bundle(user_id)
+        effective_profile = self._resolve_effective_research_profile(
+            stored_profile=profile_bundle.get("profile", {}),
+            request_profile=research_profile,
+        )
+        paper_actions = profile_bundle.get("actions", {})
+        excluded_ids = list(dict.fromkeys([*liked_ids, *disliked_ids, *profile_bundle.get("excluded_ids", [])]))
+        liked_details = self.db_service.get_liked_papers_with_details(user_id=user_id)
+        liked_category_freq = self._build_liked_category_frequency(liked_details)
+        context_bundle = self._build_recommendation_context_bundle(
+            message=message,
+            topic_hint=topic_hint,
+            research_profile=effective_profile,
+            request_context=request_context,
+        )
+
+        user_vector_data: Dict[str, Any] = {"profile_mode": "cold_start", "cluster_count": 0}
+        user_vector = None
+        interest_clusters: List[Dict[str, Any]] = []
+        disliked_vector = None
+        personalized_available = not bool(context_bundle.get("cold_start"))
+        if personalized_available:
+            try:
+                user_vector_data = self._get_or_refresh_interest_vector(user_id)
+                user_vector = user_vector_data["vector_data"]
+                interest_clusters = user_vector_data.get("interest_clusters", []) or []
+                disliked_vector = user_vector_data.get("disliked_vector_data")
+            except Exception as exc:
+                # 只要当前请求能提供足够主题信号，就允许安全退化成冷启动主题推荐，而不是直接报错。
+                logger.info("Interest vector unavailable for user %s, falling back to context-driven recommendation: %s", user_id, exc)
+                personalized_available = False
+                user_vector_data = {"profile_mode": "cold_start", "cluster_count": 0, "fallback_reason": str(exc)}
+
+        candidate_limit = max(top_n * 5, 50)
+        cluster_recall_candidates: List[Dict[str, Any]] = []
+        if personalized_available and interest_clusters:
+            cluster_recall_candidates = self._fetch_cluster_recall_candidates(
+                interest_clusters=interest_clusters,
+                excluded_ids=excluded_ids,
+                top_k=max(top_n * 3, 20),
+            )
+
+        if cluster_recall_candidates:
+            recalled_candidates = cluster_recall_candidates
+            recall_mode = "cluster_recall"
+        else:
+            recalled_candidates = self._fetch_recent_db_candidates(
+                liked_category_freq=liked_category_freq,
+                max_age_months=max_age_months,
+                max_results=max(candidate_limit * 2, candidate_limit),
+            )
+            recall_mode = "recent_pool" if personalized_available else "cold_start_recent_pool"
+
+        merged_candidates = self._merge_candidate_sources(
+            recalled_candidates=recalled_candidates,
+            context_candidates=self._coerce_candidate_list(candidate_papers),
+        )
+        filtered_candidates = self._deduplicate_candidates(merged_candidates, excluded_ids)
+        if not filtered_candidates:
+            raise HTTPException(status_code=400, detail=f"No papers found for recommendation within the last {max_age_months} months")
+
+        materialized_candidates, materialize_stats = self._materialize_candidate_papers_for_recommendation(filtered_candidates)
+        embedding_config = self.get_embedding_config() if personalized_available else None
+        candidate_ids = [str(candidate.get("arxiv_id", "") or "").strip() for candidate in materialized_candidates]
+        candidate_embedding_map: Dict[str, List[float]] = {}
+        if personalized_available and candidate_ids:
+            existing_candidate_embeddings = self.vector_store_service.get_paper_embeddings_by_arxiv_ids(
+                collection_name=self.collection_name,
+                arxiv_ids=candidate_ids,
+            )
+            candidate_embedding_map = {
+                str(item.get("arxiv_id", "") or "").strip(): item.get("vector", [])
+                for item in existing_candidate_embeddings
+                if item.get("arxiv_id") and item.get("vector")
+            }
+
+        reused_vector_count = 0
+        for candidate in materialized_candidates:
+            arxiv_id = str(candidate.get("arxiv_id", "") or "").strip()
+            if arxiv_id in candidate_embedding_map:
+                candidate["_stored_vector"] = candidate_embedding_map[arxiv_id]
+                reused_vector_count += 1
+
+        scored_candidates = []
+        filtered_out_candidates = []
+        recomputed_vector_count = 0
+        missing_vector_count = 0
+        for candidate in materialized_candidates:
+            scored_candidate = self._build_candidate_score(
+                candidate=candidate,
+                liked_category_freq=liked_category_freq,
+                user_vector=user_vector,
+                interest_clusters=interest_clusters,
+                disliked_vector=disliked_vector,
+                embedding_config=embedding_config,
+            )
+            profile_adjustment = self._compute_profile_adjustment(
+                scored_candidate,
+                profile=effective_profile,
+                actions=paper_actions,
+            )
+            context_adjustment = self._compute_contextual_adjustment(
+                scored_candidate,
+                context_bundle=context_bundle,
+            )
+            if context_adjustment["exclude_candidate"]:
+                filtered_out_candidates.append(
+                    {
+                        "arxiv_id": scored_candidate.get("arxiv_id"),
+                        "title": scored_candidate.get("title"),
+                        "reason": context_adjustment["negative_filter_reason"],
+                    }
+                )
+                continue
+
+            profile_terms = list(profile_adjustment.get("matched_positive_topics") or [])
+            query_terms = list(dict.fromkeys([*context_adjustment["matched_query_terms"], *context_adjustment["matched_request_topics"]]))
+            basis = {
+                "long_term_profile": bool(profile_terms),
+                "current_request": bool(query_terms),
+                "recent_behavior": bool(context_adjustment["recent_behavior_terms"]),
+                "cold_start": bool(context_bundle.get("cold_start")),
+            }
+
+            scored_candidate["profile_score"] = profile_adjustment["profile_score"]
+            scored_candidate["profile_penalty"] = profile_adjustment["profile_penalty"]
+            scored_candidate["profile_reasons"] = profile_adjustment["profile_reasons"]
+            scored_candidate["matched_positive_topics"] = profile_adjustment["matched_positive_topics"]
+            scored_candidate["matched_negative_topics"] = profile_adjustment["matched_negative_topics"]
+            scored_candidate["matched_preferred_categories"] = profile_adjustment["matched_preferred_categories"]
+            scored_candidate["profile_match_details"] = profile_adjustment.get("profile_match_details", [])
+            scored_candidate["profile_match_score"] = profile_adjustment.get("profile_match_score", profile_adjustment["profile_score"])
+            scored_candidate["matched_profile_terms"] = profile_terms
+            scored_candidate["matched_query_terms"] = query_terms
+            scored_candidate["matched_request_topics"] = context_adjustment["matched_request_topics"]
+            scored_candidate["matched_category_constraints"] = context_adjustment["matched_category_constraints"]
+            scored_candidate["recent_behavior_score"] = context_adjustment["recent_behavior_score"]
+            scored_candidate["recent_behavior_terms"] = context_adjustment["recent_behavior_terms"]
+            scored_candidate["negative_filter_reason"] = context_adjustment["negative_filter_reason"]
+            scored_candidate["recommendation_basis"] = basis
+            scored_candidate["trace_sources"] = list(
+                dict.fromkeys(
+                    [
+                        *context_adjustment["context_sources"],
+                        *(["long_term_profile"] if basis["long_term_profile"] else []),
+                    ]
+                )
+            )
+            scored_candidate["relevance_score"] = (
+                float(scored_candidate.get("relevance_score", 0.0) or 0.0)
+                + profile_adjustment["profile_adjustment"]
+                + context_adjustment["request_score"]
+                - context_adjustment["request_penalty"]
+            )
+            scored_candidate["final_score"] = (
+                float(scored_candidate.get("final_score", 0.0) or 0.0)
+                + profile_adjustment["profile_adjustment"]
+                + context_adjustment["request_score"]
+                - context_adjustment["request_penalty"]
+            )
+            scored_candidate["match_reason"] = self._build_match_reason(context_adjustment["query_match_score"], query_terms)
+            scored_candidate["personalized_reason"] = self._build_personalized_reason(scored_candidate, dict(scored_candidate.get("score_breakdown", {})))
+            scored_candidate["recommendation_explanation"] = self._build_recommendation_explanation(scored_candidate)
+            scored_candidate["score_components"] = {
+                "semantic_score": float(scored_candidate.get("semantic_score", 0.0) or 0.0),
+                "profile_adjustment": profile_adjustment["profile_adjustment"],
+                "request_score": context_adjustment["request_score"],
+                "request_penalty": context_adjustment["request_penalty"],
+                "recent_behavior_score": context_adjustment["recent_behavior_score"],
+                "final_score": float(scored_candidate.get("final_score", 0.0) or 0.0),
+            }
+            score_breakdown = dict(scored_candidate.get("score_breakdown", {}))
+            score_breakdown.update(context_adjustment["query_score_breakdown"])
+            score_breakdown["profile_score"] = profile_adjustment["profile_score"]
+            score_breakdown["profile_penalty"] = profile_adjustment["profile_penalty"]
+            score_breakdown["request_score"] = context_adjustment["request_score"]
+            score_breakdown["request_penalty"] = context_adjustment["request_penalty"]
+            score_breakdown["query_match_score"] = context_adjustment["query_match_score"]
+            score_breakdown["recent_behavior_score"] = context_adjustment["recent_behavior_score"]
+            score_breakdown["relevance_score"] = scored_candidate["relevance_score"]
+            score_breakdown["final_score"] = scored_candidate["final_score"]
+            scored_candidate["score_breakdown"] = score_breakdown
+            scored_candidates.append(scored_candidate)
+            embedding_source = str(scored_candidate.get("_embedding_source", "") or "")
+            if embedding_source == "recomputed":
+                recomputed_vector_count += 1
+            elif embedding_source == "missing":
+                missing_vector_count += 1
+
+        selected = self._select_diverse_candidates(
+            scored_candidates,
+            top_n,
+            interest_clusters=interest_clusters,
+        )
+        for item in selected:
+            item["score_components"]["diversity_score"] = float(item.get("diversity_score", 0.0) or 0.0)
+            item["recommendation_explanation"] = self._build_recommendation_explanation(item)
+
+        logger.info(
+            "Context-aware recommendation finished for user %s: scored=%s selected=%s filtered=%s reused=%s recomputed=%s missing=%s",
+            user_id,
+            len(scored_candidates),
+            len(selected),
+            len(filtered_out_candidates),
+            reused_vector_count,
+            recomputed_vector_count,
+            missing_vector_count,
+        )
+
+        return {
+            "status": "success",
+            "message": f"Generated {len(selected)} recommendations",
+            "total_found": len(scored_candidates),
+            "interest_profile_mode": user_vector_data.get("profile_mode", "cold_start"),
+            "interest_cluster_count": user_vector_data.get("cluster_count", 0),
+            "research_profile": effective_profile,
+            "paper_actions": paper_actions,
+            "recall_mode": recall_mode,
+            "recommendation_context": {
+                "query_text": context_bundle.get("query_text"),
+                "topic_hint": context_bundle.get("topic_hint"),
+                "positive_topics": context_bundle.get("positive_topics"),
+                "negative_topics": context_bundle.get("negative_topics"),
+                "category_constraints": context_bundle.get("category_constraints"),
+                "recent_paper_count": len(context_bundle.get("recent_papers") or []),
+                "cold_start": bool(context_bundle.get("cold_start")),
+                "used_candidate_papers": bool(candidate_papers),
+                "used_user_memory_summary": bool(user_memory_summary),
+            },
+            "filter_debug": {
+                "excluded_ids_count": len(excluded_ids),
+                "filtered_out_by_context": filtered_out_candidates,
+                "materialize_stats": materialize_stats,
+            },
+            "ranking_debug": {
+                "personalized_available": personalized_available,
+                "context_candidate_count": len(candidate_papers or []),
+                "request_query_used": bool(context_bundle.get("query_text")),
+                "profile_topics_used": bool(effective_profile.get("positive_topics") or effective_profile.get("canonical_topics")),
+            },
+            "recommendations": selected,
+        }
 
     def recommend_papers(
         self,

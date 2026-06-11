@@ -2,7 +2,7 @@ import { ref, watch, type Ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { runAgentChat, streamAgentChat } from '@/api/agent'
 import { getErrorMessage } from '@/api/errors'
-import type { AgentPaper, AgentStep, AgentStreamEvent, AgentToolCall, ArxivSearchResponse } from '@/types/agent'
+import type { AgentPaper, AgentPendingAction, AgentStep, AgentStreamEvent, AgentToolCall, ArxivSearchResponse } from '@/types/agent'
 import type { AgentChatMessage } from '@/types/agentChat'
 import type { UserResearchProfile } from '@/types/paper'
 import { usePaperStore } from '@/stores/paperStore'
@@ -110,10 +110,10 @@ function upsertToolCall(response: ArxivSearchResponse, toolCall: AgentToolCall) 
   response.tool_calls.push(toolCall)
 }
 
-function normalizePendingActionForDisplay(action: Record<string, any> | null | undefined) {
+function normalizePendingActionForDisplay(action: AgentPendingAction | Record<string, any> | null | undefined): AgentPendingAction | null {
   // pending_action 只是后端确认请求的展示镜像；批准后的 approved/cancelled 中间态不能继续当待确认卡片展示。
   if (!action || typeof action !== 'object') return null
-  return action.status === 'waiting_confirmation' ? action : null
+  return action.status === 'waiting_confirmation' ? { ...action } as AgentPendingAction : null
 }
 
 function applyFinalResponse(response: ArxivSearchResponse, finalResponse: Record<string, any>) {
@@ -322,7 +322,7 @@ export function useAgentSearchChat() {
   const messages: Ref<AgentChatMessage<ArxivSearchResponse>[]> = ref([])
   const latestResponse = ref<ArxivSearchResponse | null>(null)
   const lastSearchPapers = ref<AgentPaper[]>([])
-  const pendingAction = ref<Record<string, any> | null>(null)
+  const pendingAction = ref<AgentPendingAction | null>(null)
   const selectedPaper = ref<AgentPaper | null>(null)
   const paperQaResult = ref<Record<string, any> | null>(null)
   const activeSessionId = ref<string | null>(null)
@@ -355,7 +355,8 @@ export function useAgentSearchChat() {
   function rememberSearchPapers(response: ArxivSearchResponse | null | undefined) {
     if (response?.intent === 'arxiv_search' && Array.isArray(response.papers) && response.papers.length > 0) {
       lastSearchPapers.value = response.papers.map(item => ({ ...item }))
-      selectedPaper.value = response.papers[0] ? { ...response.papers[0] } : null
+      // 搜索结果第一篇只是列表项，不代表用户当前选中；伪造 selected_paper 会让“这篇论文”误指向第一篇。
+      selectedPaper.value = null
     }
   }
 
@@ -480,7 +481,7 @@ export function useAgentSearchChat() {
     const requestContext: {
       selected_paper?: AgentPaper | null
       last_papers?: AgentPaper[]
-      pending_action?: Record<string, any> | null
+      pending_action?: AgentPendingAction | Record<string, any> | null
       paper_qa_result?: Record<string, any> | null
       research_profile?: UserResearchProfile | null
       arxiv_id?: string | null
@@ -491,11 +492,7 @@ export function useAgentSearchChat() {
           ...(lastSearchPapers.value.length
             ? { last_papers: lastSearchPapers.value.map(item => ({ ...item })) }
             : {}),
-          selected_paper: selectedPaper.value
-            ? { ...selectedPaper.value }
-            : lastSearchPapers.value[0]
-              ? { ...lastSearchPapers.value[0] }
-              : null,
+          selected_paper: selectedPaper.value ? { ...selectedPaper.value } : null,
           ...(paperQaResult.value ? { paper_qa_result: { ...paperQaResult.value } } : {}),
           ...(paperStore.researchProfile ? { research_profile: { ...paperStore.researchProfile } } : {}),
           arxiv_id:
@@ -606,30 +603,41 @@ export function useAgentSearchChat() {
     }
   }
 
-  async function submitResume(decision: ResumeDecision, note?: string) {
+  async function submitResume(decision: ResumeDecision, note?: string, editedArguments?: Record<string, any>) {
     if (!pendingAction.value || loading.value) return
     const confirmationRequest = pendingAction.value.confirmation_request || {}
     const currentPendingAction = { ...pendingAction.value }
+    const mergedEditedArguments = {
+      ...(currentPendingAction.edited_arguments || {}),
+      ...(editedArguments || {})
+    }
     const resumePayload: AgentResumePayload = {
       decision,
       note: note || null,
       step_id: currentPendingAction.step_id || confirmationRequest.step_id || null,
       interrupt_id: currentPendingAction.interrupt_id || confirmationRequest.interrupt_id || null
     }
-    if (currentPendingAction.edited_arguments) {
-      resumePayload.edited_arguments = { ...currentPendingAction.edited_arguments }
+    if (Object.keys(mergedEditedArguments).length) {
+      // 目标论文确认只通过 edited_arguments 传稳定 paper_id/arxiv_id；message 仍只是占位文本。
+      resumePayload.edited_arguments = mergedEditedArguments
     }
     pendingAction.value = null
+    const isPaperTargetConfirmation = currentPendingAction.request_type === 'paper_target_confirmation'
+      || currentPendingAction.type === 'paper_target_confirmation'
 
     await submitMessage(decision === 'approve' ? '确认执行当前工具操作' : '拒绝执行当前工具操作', {
       // 确认按钮必须走结构化 resume；message 只是满足后端请求模型的可读占位文本。
       resume: resumePayload,
       optimisticToolCall: decision === 'approve'
         ? {
-            tool_name: String(currentPendingAction.tool_name || 'parse_and_index_paper'),
-            arguments: currentPendingAction.arguments_summary || {},
+            tool_name: String(currentPendingAction.tool_name || (isPaperTargetConfirmation ? 'resolve_paper' : 'parse_and_index_paper')),
+            arguments: isPaperTargetConfirmation
+              ? { ...(currentPendingAction.arguments_summary || {}), ...(resumePayload.edited_arguments || {}) }
+              : currentPendingAction.arguments_summary || {},
             status: 'running',
-            summary: '用户已确认，正在执行索引构建工具',
+            summary: isPaperTargetConfirmation
+              ? '已确认目标论文，正在继续执行原动作'
+              : '用户已确认，正在执行索引构建工具',
             trace: {
               step_id: resumePayload.step_id,
               source: 'resume_approve'

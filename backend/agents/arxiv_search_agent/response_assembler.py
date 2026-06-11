@@ -45,13 +45,21 @@ def record_confirmation_rejection(
     runtime.final_answer = final_answer
 
 
-def record_recovery_fallback(runtime: PlanRuntime, *, fallback_reason: str) -> None:
+def record_recovery_fallback(
+    runtime: PlanRuntime,
+    *,
+    fallback_reason: str,
+    fallback_record: Optional[Mapping[str, Any]] = None,
+) -> None:
     """记录无法继续自动恢复时的兜底输出。
 
     这里不再触发额外工具调用；replanner 只决定 fallback，response assembler 负责把结构化原因转成
     可展示结果，避免 executor 在恢复分支里再次执行业务工具。
     """
     reason = _clean_text(fallback_reason) or "recovery_fallback"
+    if isinstance(fallback_record, Mapping):
+        # fallback 原因需要同时写入结构化输出，方便前端和 trace 统一读取，而不是只剩一段自然语言。
+        runtime.outputs["fallback_record"] = dict(fallback_record)
     runtime.outputs["final_answer"] = _build_recovery_fallback_answer(runtime, reason)
     runtime.final_answer = runtime.outputs["final_answer"]
 

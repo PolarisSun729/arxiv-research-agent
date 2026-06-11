@@ -320,6 +320,130 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         self.assertIn("final_score", first)
         self.assertIn("score_breakdown", first)
 
+    def test_context_aware_recommendation_changes_with_query(self) -> None:
+        candidate_pool = [
+            {
+                "arxiv_id": "2401.20001",
+                "title": "RAG Pipeline",
+                "authors": ["A"],
+                "abstract": "retrieval augmented generation for enterprise qa",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.20001",
+                "score": 0.5,
+            },
+            {
+                "arxiv_id": "2401.20002",
+                "title": "Agent Planning",
+                "authors": ["B"],
+                "abstract": "llm agent planning and tool orchestration",
+                "categories": ["cs.AI"],
+                "published_date": "2024-01-02",
+                "url": "https://arxiv.org/abs/2401.20002",
+                "score": 0.5,
+            },
+        ]
+
+        with mock.patch.object(self.service, "_get_or_refresh_interest_vector", side_effect=HTTPException(status_code=400, detail="missing vector")), \
+             mock.patch.object(self.service, "_fetch_recent_db_candidates", return_value=list(candidate_pool)), \
+             mock.patch.object(self.service, "_materialize_candidate_papers_for_recommendation", return_value=(list(candidate_pool), {"total": 2, "reused_existing": 0, "db_only": 0, "batch_embedded": 0, "batch_inserted": 0, "unresolved": 0})):
+            rag_result = self.service.recommend_papers_with_context(
+                self.user_id,
+                top_n=1,
+                message="推荐 RAG 方向论文",
+                topic_hint="RAG",
+                request_context={"force_cold_start": True, "positive_topics": ["rag"]},
+            )
+            agent_result = self.service.recommend_papers_with_context(
+                self.user_id,
+                top_n=1,
+                message="推荐 Agent 方向论文",
+                topic_hint="Agent",
+                request_context={"force_cold_start": True, "positive_topics": ["agent"]},
+            )
+
+        self.assertEqual(rag_result["recommendations"][0]["arxiv_id"], "2401.20001")
+        self.assertEqual(agent_result["recommendations"][0]["arxiv_id"], "2401.20002")
+
+    def test_context_aware_recommendation_filters_negative_topics(self) -> None:
+        candidate_pool = [
+            {
+                "arxiv_id": "2401.30001",
+                "title": "Vision Agent",
+                "authors": ["A"],
+                "abstract": "vision language agent benchmark",
+                "categories": ["cs.CV"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.30001",
+                "score": 0.8,
+            },
+            {
+                "arxiv_id": "2401.30002",
+                "title": "RAG Agent",
+                "authors": ["B"],
+                "abstract": "rag agent retrieval workflow",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-02",
+                "url": "https://arxiv.org/abs/2401.30002",
+                "score": 0.7,
+            },
+        ]
+
+        with mock.patch.object(self.service, "_get_or_refresh_interest_vector", side_effect=HTTPException(status_code=400, detail="missing vector")), \
+             mock.patch.object(self.service, "_fetch_recent_db_candidates", return_value=list(candidate_pool)), \
+             mock.patch.object(self.service, "_materialize_candidate_papers_for_recommendation", return_value=(list(candidate_pool), {"total": 2, "reused_existing": 0, "db_only": 0, "batch_embedded": 0, "batch_inserted": 0, "unresolved": 0})):
+            result = self.service.recommend_papers_with_context(
+                self.user_id,
+                top_n=2,
+                message="推荐 agent 论文，但不要 vision",
+                topic_hint="agent",
+                research_profile={"negative_topics": ["vision"]},
+                request_context={"force_cold_start": True, "negative_topics": ["vision"]},
+            )
+
+        self.assertEqual([item["arxiv_id"] for item in result["recommendations"]], ["2401.30002"])
+        self.assertTrue(result["filter_debug"]["filtered_out_by_context"])
+
+    def test_context_aware_recommendation_supports_cold_start_without_user_history(self) -> None:
+        candidate_pool = [
+            {
+                "arxiv_id": "2401.40001",
+                "title": "Cold Start RAG",
+                "authors": ["A"],
+                "abstract": "retrieval augmented generation tutorial",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.40001",
+                "score": 0.6,
+            },
+            {
+                "arxiv_id": "2401.40002",
+                "title": "General Vision",
+                "authors": ["B"],
+                "abstract": "image generation benchmark",
+                "categories": ["cs.CV"],
+                "published_date": "2024-01-02",
+                "url": "https://arxiv.org/abs/2401.40002",
+                "score": 0.6,
+            },
+        ]
+
+        with mock.patch.object(self.service, "_get_or_refresh_interest_vector", side_effect=HTTPException(status_code=400, detail="missing vector")), \
+             mock.patch.object(self.service, "_fetch_recent_db_candidates", return_value=list(candidate_pool)), \
+             mock.patch.object(self.service, "_materialize_candidate_papers_for_recommendation", return_value=(list(candidate_pool), {"total": 2, "reused_existing": 0, "db_only": 0, "batch_embedded": 0, "batch_inserted": 0, "unresolved": 0})):
+            result = self.service.recommend_papers_with_context(
+                user_id="anonymous",
+                top_n=1,
+                message="推荐 RAG 论文",
+                topic_hint="RAG",
+                request_context={"force_cold_start": True, "positive_topics": ["rag"]},
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["recommendation_context"]["cold_start"])
+        self.assertEqual(result["recommendations"][0]["arxiv_id"], "2401.40001")
+        self.assertIn("recommendation_explanation", result["recommendations"][0])
+
     def test_recommend_papers_raises_for_empty_liked_papers(self) -> None:
         with self.assertRaises(HTTPException) as ctx:
             self.service.generate_user_interest_vector(self.user_id)

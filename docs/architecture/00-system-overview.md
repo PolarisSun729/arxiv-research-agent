@@ -116,7 +116,7 @@
   - `/profile`
   - `/agent-search`
   - `/labeled`
-  - `/chunks`
+  - `/chunks`（仅 `VITE_ENABLE_DEBUG_ROUTES=true` 时注册）
 - `api/request.ts` 统一定义前端到后端的 HTTP 客户端，`baseURL=/api`
 - `api/agent.ts` 封装 Agent 同步调用、SSE 流式消费、图结构拉取
 - `api/papers.ts` 封装论文详情、推荐、QA、会话、笔记、诊断、索引构建等能力
@@ -145,7 +145,7 @@
 - `/api/user/*` -> `user_router`
 - `/api/paper`、`/api/papers`、`/api/stats` 等 -> `paper_router`
 - `/api/paper/{arxiv_id}/*` -> `qa_router`
-- `/api/chunks/*` -> `chunk_router`
+- `/api/debug/chunks/*` -> `chunk_router`（仅 `ENABLE_DEBUG_ROUTES=true` 时注册，属于本地调试入口）
 
 已确认职责：
 
@@ -156,7 +156,7 @@
 - `qa_router.py` 负责论文 QA、QA 索引状态、诊断、trace 导出、会话、消息、笔记
 - `user_router.py` 负责偏好、喜欢/不喜欢、通用行为埋点、研究画像、兴趣向量、推荐
 - `agent_router.py` 负责 Agent chat、Agent chat SSE、Agent graph 导出
-- `chunk_router.py` 负责调试用 chunk 文件列表和文件内容查看
+- `chunk_router.py` 负责调试用 chunk 文件列表和文件内容查看；默认不注册，避免正式 API 暴露本地解析产物
 
 职责边界：
 

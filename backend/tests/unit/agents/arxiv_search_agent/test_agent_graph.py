@@ -67,7 +67,7 @@ class AgentGraphFlowTests(unittest.TestCase):
             plan_id="plan-1",
             trace_id="goal-1",
         )
-        pending_action = graph_module._build_compatible_pending_action(
+        pending_action = graph_module._build_pending_action_mirror(
             schemas.AgentTurnResult(
                 status="waiting_confirmation",
                 pending_confirmation=confirmation,

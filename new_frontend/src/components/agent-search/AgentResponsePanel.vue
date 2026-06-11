@@ -99,6 +99,13 @@ const pendingAction = computed(() => responseData.value.pending_action || null)
 const paperQaResult = computed(() => responseData.value.paper_qa_result || null)
 const preferenceActionResult = computed(() => responseData.value.preference_action_result || null)
 const streamingState = computed(() => responseData.value.streaming_state || null)
+const responseDebug = computed(() => (responseData.value.debug || {}) as Record<string, any>)
+const plannerSummary = computed(() => (responseDebug.value.planner_summary || {}) as Record<string, any>)
+const clarificationSummary = computed(() => (responseDebug.value.clarification_summary || {}) as Record<string, any>)
+const recommendationSummary = computed(() => (responseDebug.value.recommendation_summary || {}) as Record<string, any>)
+const capabilityBoundaryCount = computed(() =>
+  [plannerSummary.value, clarificationSummary.value, recommendationSummary.value].filter(item => Object.keys(item).length > 0).length
+)
 
 function handleViewDetail(id: string) {
   emit('view-detail', id)
@@ -116,6 +123,21 @@ function getPreferenceActionLabel(result: AgentPreferenceActionResult | null) {
   if (result.status === 'success' && result.action === 'dislike') return '已标记为不感兴趣'
   if (result.status === 'success' && result.action === 'remove') return '已取消偏好标记'
   return result.message || ''
+}
+
+function formatPlannerPath(path: string | null | undefined) {
+  const map: Record<string, string> = {
+    rule_based_planner: '规则型 planner',
+    experimental_llm_draft_planner: '实验性 LLM draft planner',
+    template_fallback_planner: '模板兜底 planner',
+    fixed_template_planner: '固定模板 planner',
+    unsupported_fallback_planner: '不支持请求兜底 planner'
+  }
+  return map[path || ''] || path || '-'
+}
+
+function formatBoolLabel(value: unknown) {
+  return value === true ? '是' : value === false ? '否' : '-'
 }
 </script>
 
@@ -157,6 +179,55 @@ function getPreferenceActionLabel(result: AgentPreferenceActionResult | null) {
         </div>
       </div>
     </section>
+
+    <details class="agent-collapse">
+      <summary class="agent-collapse__summary">
+        <span>Capability Boundary</span>
+        <span class="agent-collapse__count">{{ capabilityBoundaryCount }}</span>
+      </summary>
+      <div v-if="capabilityBoundaryCount === 0" class="empty-state">暂无能力边界摘要</div>
+      <div v-else class="capability-grid">
+        <article v-if="Object.keys(plannerSummary).length" class="capability-card">
+          <div class="capability-card__title">Planner</div>
+          <div class="capability-card__row"><strong>requested</strong>: {{ formatPlannerPath(plannerSummary.requested_path) }}</div>
+          <div class="capability-card__row"><strong>final</strong>: {{ formatPlannerPath(plannerSummary.final_path) }}</div>
+          <div class="capability-card__row"><strong>fallback</strong>: {{ formatBoolLabel(plannerSummary.fallback_used) }}</div>
+          <div v-if="plannerSummary.fallback_reason" class="capability-card__row">
+            <strong>reason</strong>: {{ plannerSummary.fallback_reason }}
+          </div>
+          <details class="inline-details">
+            <summary>查看 planner 摘要</summary>
+            <pre class="json-block">{{ formatJson(plannerSummary) }}</pre>
+          </details>
+        </article>
+
+        <article v-if="Object.keys(clarificationSummary).length" class="capability-card">
+          <div class="capability-card__title">Clarification</div>
+          <div class="capability-card__row"><strong>mode</strong>: {{ clarificationSummary.mode || '-' }}</div>
+          <div class="capability-card__row"><strong>analysis</strong>: {{ clarificationSummary.analysis_source || '-' }}</div>
+          <div class="capability-card__row"><strong>question</strong>: {{ clarificationSummary.question_source || '-' }}</div>
+          <div class="capability-card__row"><strong>llm</strong>: {{ formatBoolLabel(clarificationSummary.is_llm_backed) }}</div>
+          <details class="inline-details">
+            <summary>查看澄清摘要</summary>
+            <pre class="json-block">{{ formatJson(clarificationSummary) }}</pre>
+          </details>
+        </article>
+
+        <article v-if="Object.keys(recommendationSummary).length" class="capability-card">
+          <div class="capability-card__title">Recommendation</div>
+          <div class="capability-card__row"><strong>mode</strong>: {{ recommendationSummary.mode || '-' }}</div>
+          <div class="capability-card__row"><strong>agent step</strong>: {{ recommendationSummary.agent_step || '-' }}</div>
+          <div class="capability-card__row"><strong>core</strong>: {{ recommendationSummary.core_service || '-' }}</div>
+          <div class="capability-card__row">
+            <strong>algorithm in agent</strong>: {{ formatBoolLabel(recommendationSummary.is_algorithm_core_in_agent) }}
+          </div>
+          <details class="inline-details">
+            <summary>查看推荐摘要</summary>
+            <pre class="json-block">{{ formatJson(recommendationSummary) }}</pre>
+          </details>
+        </article>
+      </div>
+    </details>
 
     <details class="agent-collapse">
       <summary class="agent-collapse__summary">
@@ -318,6 +389,33 @@ function getPreferenceActionLabel(result: AgentPreferenceActionResult | null) {
   border-radius: 20px;
   background: linear-gradient(180deg, #ffffff, #f8fbff);
   border: 1px solid rgba(148, 163, 184, 0.14);
+}
+
+.capability-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.capability-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(248, 250, 252, 0.9);
+}
+
+.capability-card__title {
+  font-size: 13px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.capability-card__row {
+  font-size: 12px;
+  color: #334155;
 }
 
 .agent-response-panel__meta {

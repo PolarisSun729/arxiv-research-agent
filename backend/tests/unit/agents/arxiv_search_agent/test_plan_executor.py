@@ -34,6 +34,62 @@ def _tool(tool_name: str):
     return tool
 
 
+def _resolved_paper_qa_plan(arxiv_id: str = "2401.00001", title: str = "RAG") -> ExecutablePlan:
+    """构造已完成最终目标解析的 QA 计划，避免下游执行器测试依赖引用线索提取器。"""
+    paper_ref = {"arxiv_id": arxiv_id, "title": title, "final_target_resolved": True}
+    goal = Goal(goal_id="paper_qa:resolved", goal_type="paper_qa", user_request="what is the method?")
+    return ExecutablePlan(
+        plan_id="paper_qa:resolved",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="resolve_paper",
+                action_type="retrieve",
+                tool_name="resolve_paper",
+                tool=_tool("resolve_paper"),
+                output_key="paper_ref",
+                input_bindings=[StepInputBinding(input_key="message", source_type="state", source_key="message")],
+                # 下游执行器测试需要一个“最终目标已解析”的输入；这里保留结构占位但不执行引用线索提取器。
+                condition=StepCondition(condition_type="field_equals", field_path="state.intent", expected_value="__skip_reference_hint_extractor__"),
+            ),
+            PlanStep(
+                step_id="check_paper_index",
+                action_type="validate",
+                tool_name="check_paper_index",
+                tool=_tool("check_paper_index"),
+                output_key="paper_index_status",
+                depends_on=["resolve_paper"],
+                input_bindings=[StepInputBinding(input_key="paper_ref", source_type="literal", value=paper_ref)],
+            ),
+            PlanStep(
+                step_id="answer_paper_question",
+                action_type="answer",
+                tool_name="answer_paper_question",
+                tool=_tool("answer_paper_question"),
+                output_key="paper_qa_result",
+                side_effect_level="external_call",
+                depends_on=["resolve_paper", "check_paper_index"],
+                input_bindings=[
+                    StepInputBinding(input_key="paper_ref", source_type="step_output", step_id="resolve_paper", required=False),
+                    StepInputBinding(input_key="paper_ref", source_type="literal", value=paper_ref),
+                    StepInputBinding(input_key="message", source_type="state", source_key="message"),
+                ],
+            ),
+            PlanStep(
+                step_id="assess_paper_qa_quality",
+                action_type="validate",
+                tool_name="assess_paper_qa_quality",
+                tool=_tool("assess_paper_qa_quality"),
+                output_key="paper_qa_quality_decision",
+                depends_on=["answer_paper_question"],
+                input_bindings=[StepInputBinding(input_key="paper_qa_result", source_type="step_output", step_id="answer_paper_question")],
+            ),
+        ],
+        entry_step_ids=["resolve_paper"],
+        final_step_ids=["assess_paper_qa_quality"],
+    )
+
+
 def test_plan_executor_executes_linear_arxiv_plan(monkeypatch) -> None:
     def fake_invoke_tool(tool_name: str, **kwargs):
         assert tool_name == "search_arxiv_structured"
@@ -581,8 +637,8 @@ def test_plan_executor_replans_missing_paper_index_to_confirmation(monkeypatch) 
 
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
 
-    state = AgentState(intent="paper_qa", message="what is the method?", context={"selected_paper": {"arxiv_id": "2401.00001", "title": "RAG"}})
-    _, plan, _ = planner_module.build_executable_plan(state)
+    state = AgentState(intent="paper_qa", message="what is the method?")
+    plan = _resolved_paper_qa_plan(title="RAG")
     result = PlanExecutor().execute(plan, state)
 
     assert result.status == "waiting_confirmation"
@@ -634,8 +690,8 @@ def test_plan_executor_paper_qa_calls_real_answer_tool_once_and_preserves_debug(
 
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
 
-    state = AgentState(intent="paper_qa", message="what is the method?", context={"selected_paper": {"arxiv_id": "2401.00001"}})
-    _, plan, _ = planner_module.build_executable_plan(state)
+    state = AgentState(intent="paper_qa", message="what is the method?")
+    plan = _resolved_paper_qa_plan()
     result = PlanExecutor().execute(plan, state)
 
     assert result.status == "success"
@@ -714,8 +770,8 @@ def test_plan_executor_paper_qa_repairs_insufficient_evidence_and_records_qualit
 
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
 
-    state = AgentState(intent="paper_qa", message="what is the method?", context={"selected_paper": {"arxiv_id": "2401.00001"}})
-    _, plan, _ = planner_module.build_executable_plan(state)
+    state = AgentState(intent="paper_qa", message="what is the method?")
+    plan = _resolved_paper_qa_plan()
     result = PlanExecutor().execute(plan, state)
 
     assert result.status == "success"
@@ -776,8 +832,8 @@ def test_plan_executor_paper_qa_repair_limit_returns_conservative_fallback(monke
 
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
 
-    state = AgentState(intent="paper_qa", message="what is the method?", context={"selected_paper": {"arxiv_id": "2401.00001"}})
-    _, plan, _ = planner_module.build_executable_plan(state)
+    state = AgentState(intent="paper_qa", message="what is the method?")
+    plan = _resolved_paper_qa_plan()
     result = PlanExecutor().execute(plan, state)
 
     assert result.status == "fallback"
@@ -845,6 +901,11 @@ def test_plan_executor_search_missing_search_spec_returns_structured_input_error
     assert result.error.startswith("fallback:search_arxiv:")
     assert result.runtime is not None
     assert result.runtime.recovery_strategy["type"] == "fallback_answer"
+    # 主链路进入最终兜底时，需要把结构化 fallback 信息写入 runtime/output，
+    # 这样 trace、前端和后续诊断都能拿到统一字段，而不是各处拼接自由文本。
+    assert result.runtime.recovery_strategy["fallback_record"]["code"] == "executor_fallback_answer"
+    assert result.runtime.outputs["fallback_record"]["code"] == "executor_fallback_answer"
+    assert result.runtime.outputs["fallback_record"]["raw_reason"] == "fallback_answer"
     observation_trace = next(trace for trace in result.trace if trace.event == "step_observed" and trace.step_id == "search_arxiv")
     assert observation_trace.detail["observation_status"] == "tool_error"
     assert observation_trace.detail["failure_category"] == "ambiguous_user_request"

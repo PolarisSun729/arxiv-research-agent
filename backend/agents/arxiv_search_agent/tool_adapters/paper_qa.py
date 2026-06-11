@@ -22,6 +22,11 @@ try:
 except Exception:  # pragma: no cover - 测试轻量导入场景下允许缺失。
     _resolve_paper_reference = None
 
+try:
+    from ..utils.paper_target_resolver import resolve_paper_target as _resolve_paper_target
+except Exception:  # pragma: no cover - 测试轻量导入场景下允许缺失。
+    _resolve_paper_target = None
+
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +37,33 @@ class ResolvePaperInput(BaseModel):
     message: str = ""
     selected_paper: Optional[Dict[str, Any]] = None
     context: Dict[str, Any] = Field(default_factory=dict)
+    action_type: Optional[str] = None
 
 
 class PaperReferenceOutput(BaseModel):
     model_config = ConfigDict(extra="allow")
 
+    status: str = "unknown"
+    reference_type: str = "unknown"
+    value: Optional[Any] = None
+    confidence: float = 0.0
+    requires_context: bool = False
+    reason: Optional[str] = None
+    final_target_resolved: bool = False
+    reference_hint: Dict[str, Any] = Field(default_factory=dict)
+    target_resolution: Dict[str, Any] = Field(default_factory=dict)
+    target: Optional[Dict[str, Any]] = None
+    paper: Optional[Dict[str, Any]] = None
+    candidates: List[Dict[str, Any]] = Field(default_factory=list)
+    recommended_candidate: Optional[Dict[str, Any]] = None
+    requires_confirmation: bool = False
+    risk_level: Optional[str] = None
+    action_type: Optional[str] = None
+    resolution_reason: Optional[str] = None
+    resolution_debug: Dict[str, Any] = Field(default_factory=dict)
+    hint_confidence: float = 0.0
+    paper_ref: Dict[str, Any] = Field(default_factory=dict)
+    paper_reference: Dict[str, Any] = Field(default_factory=dict)
     arxiv_id: Optional[str] = None
     title: Optional[str] = None
     query: Optional[str] = None
@@ -54,6 +81,14 @@ class CheckPaperIndexInput(BaseModel):
     def arxiv_id(self) -> str:
         paper_ref = self.paper_ref or self.paper_reference or {}
         return str((paper_ref or {}).get("arxiv_id") or "").strip() if isinstance(paper_ref, Mapping) else ""
+
+    @property
+    def reference_hint(self) -> Dict[str, Any]:
+        paper_ref = self.paper_ref or self.paper_reference or {}
+        if isinstance(paper_ref, Mapping) and (paper_ref.get("reference_type") or paper_ref.get("reference_hint")):
+            nested_hint = paper_ref.get("reference_hint")
+            return dict(nested_hint if isinstance(nested_hint, Mapping) else paper_ref)
+        return {}
 
 
 class PaperIndexStatusOutput(BaseModel):
@@ -151,18 +186,93 @@ class PaperQAQualityDecisionOutput(BaseModel):
     qa_observation: Dict[str, Any] = Field(default_factory=dict)
 
 
+def _with_reference_hint_aliases(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """把解析结果复制到旧 output_key 名称下，避免投影层丢失新增字段。
+
+    resolved 状态下 paper_ref/paper_reference 才携带最终 arxiv_id；未解析状态只保留
+    reference_hint、candidates 和 target_resolution，保证下游不能把线索误当最终目标。
+    """
+    normalized = dict(payload or {})
+    normalized.setdefault("final_target_resolved", False)
+    normalized.setdefault("arxiv_id", None)
+    normalized.setdefault("title", None)
+    hint = dict(normalized.get("reference_hint") if isinstance(normalized.get("reference_hint"), Mapping) else normalized)
+    hint.setdefault("final_target_resolved", False)
+    normalized.setdefault("reference_hint", hint)
+    target_resolution = dict(normalized.get("target_resolution") if isinstance(normalized.get("target_resolution"), Mapping) else {})
+    target = normalized.get("target") if isinstance(normalized.get("target"), Mapping) else None
+    paper_payload = {
+        "status": normalized.get("status"),
+        "reference_type": normalized.get("reference_type"),
+        "value": normalized.get("value"),
+        "confidence": normalized.get("confidence"),
+        "hint_confidence": normalized.get("hint_confidence", hint.get("confidence")),
+        "source": normalized.get("source"),
+        "requires_context": normalized.get("requires_context"),
+        "reason": normalized.get("reason"),
+        "resolution_reason": normalized.get("resolution_reason") or normalized.get("reason"),
+        "reference_hint": hint,
+        "target_resolution": target_resolution,
+        "candidates": list(normalized.get("candidates") or []),
+        "recommended_candidate": normalized.get("recommended_candidate"),
+        "requires_confirmation": bool(normalized.get("requires_confirmation")),
+        "risk_level": normalized.get("risk_level"),
+        "action_type": normalized.get("action_type"),
+        "final_target_resolved": bool(normalized.get("final_target_resolved")),
+        "target": target,
+        "paper": target,
+        "arxiv_id": normalized.get("arxiv_id") if bool(normalized.get("final_target_resolved")) else None,
+        "title": normalized.get("title") if bool(normalized.get("final_target_resolved")) else None,
+        "matched_by": normalized.get("matched_by"),
+    }
+    normalized["paper_ref"] = paper_payload
+    normalized["paper_reference"] = dict(paper_payload)
+    return normalized
+
+
+def _resolve_reference_then_target(message: str, context: Mapping[str, Any], *, action_type: str) -> Dict[str, Any]:
+    """先抽取引用线索，再由 Target Resolver 结合上下文生成候选或最终目标。"""
+    if callable(_resolve_paper_reference):
+        reference_hint = _resolve_paper_reference(message, context)
+    else:
+        reference_hint = _resolve_paper_reference_fallback(message, context)
+    if callable(_resolve_paper_target):
+        return _resolve_paper_target(
+            reference_hint=reference_hint if isinstance(reference_hint, Mapping) else {},
+            message=message,
+            context=context,
+            action_type=action_type,
+        )
+    return dict(reference_hint or {})
+
+
 def _resolve_paper_reference_fallback(message: str, context: Mapping[str, Any]) -> Dict[str, Any]:
-    selected_paper = context.get("selected_paper")
-    if isinstance(selected_paper, Mapping):
-        return dict(selected_paper)
-    for key in ("papers", "last_papers"):
-        papers = context.get(key)
-        if isinstance(papers, list) and papers and isinstance(papers[0], Mapping):
-            return dict(papers[0])
+    del context
     arxiv_id_match = re.search(r"\b\d{4}\.\d{4,5}(?:v\d+)?\b", message or "")
     if arxiv_id_match:
-        return {"arxiv_id": arxiv_id_match.group(0), "query": message}
-    return {"query": message}
+        return _with_reference_hint_aliases(
+            {
+                "status": "hint_extracted",
+                "reference_type": "arxiv_id",
+                "value": arxiv_id_match.group(0),
+                "confidence": 0.9,
+                "source": "explicit_arxiv_id_fallback",
+                "requires_context": False,
+                "reason": None,
+            }
+        )
+    return _with_reference_hint_aliases(
+        {
+            "status": "unknown",
+            "reference_type": "unknown",
+            "value": None,
+            "confidence": 0.0,
+            "source": "fallback_no_reference",
+            "requires_context": False,
+            "reason": "无法提取论文引用线索。",
+            "query": message,
+        }
+    )
 
 
 class ResolvePaperAdapter(BaseToolAdapter[ResolvePaperInput, PaperReferenceOutput]):
@@ -172,15 +282,17 @@ class ResolvePaperAdapter(BaseToolAdapter[ResolvePaperInput, PaperReferenceOutpu
 
     def _run(self, tool_input: ResolvePaperInput) -> PaperReferenceOutput:
         message = str(tool_input.message or "").strip()
-        context = tool_input.context if isinstance(tool_input.context, Mapping) else {}
+        context = dict(tool_input.context if isinstance(tool_input.context, Mapping) else {})
         selected_paper = tool_input.selected_paper
-        if callable(_resolve_paper_reference):
-            resolution = _resolve_paper_reference(message, context)
-            if isinstance(resolution, Mapping):
-                return PaperReferenceOutput.model_validate(dict(resolution))
-        if isinstance(selected_paper, Mapping):
-            return PaperReferenceOutput.model_validate(dict(selected_paper))
-        return PaperReferenceOutput.model_validate(_resolve_paper_reference_fallback(message, context))
+        if isinstance(selected_paper, Mapping) and "selected_paper" not in context:
+            # selected_paper 是目标解析层的候选材料，不允许引用线索提取器直接消费。
+            context["selected_paper"] = dict(selected_paper)
+        resolution = _resolve_reference_then_target(
+            message,
+            context,
+            action_type=str(tool_input.action_type or "paper_qa"),
+        )
+        return PaperReferenceOutput.model_validate(_with_reference_hint_aliases(resolution))
 
 
 class CheckPaperIndexAdapter(BaseToolAdapter[CheckPaperIndexInput, PaperIndexStatusOutput]):
@@ -193,6 +305,15 @@ class CheckPaperIndexAdapter(BaseToolAdapter[CheckPaperIndexInput, PaperIndexSta
 
     def _run(self, tool_input: CheckPaperIndexInput) -> PaperIndexStatusOutput:
         if not tool_input.arxiv_id:
+            if tool_input.reference_hint:
+                return PaperIndexStatusOutput(
+                    status="target_unresolved",
+                    has_index=False,
+                    tool_result={
+                        "reference_hint": tool_input.reference_hint,
+                        "reason": "引用线索尚未解析成最终论文，不能检查或构建 QA 索引。",
+                    },
+                )
             return PaperIndexStatusOutput(status="missing", has_index=False)
         started = perf_counter()
         logger.info("arxiv_agent paper qa index check started: arxiv_id=%s", tool_input.arxiv_id)

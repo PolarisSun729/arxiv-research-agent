@@ -12,7 +12,7 @@
 | 是否调用 LLM | 间接调用。`/agent/chat` 与 `/agent/chat/stream` 会进入 `parse_search_request()`，其中可能调用 `GenerationService.complete_with_qwen()`；如生成服务不可用则走规则兜底 |
 | 是否调用 tool | 间接调用。由 `PlanExecutor` 通过 `backend/tools/tool_registry.py::invoke_tool()` 调用实际 tool |
 | 是否存在 tool registry | 存在两层：`backend/agents/arxiv_search_agent/tool_registry.py`（planner 可见工具注册表），`backend/tools/tool_registry.py`（实际工具执行注册表） |
-| 是否存在 planner | 存在。`GoalBuilder` + `PlanBuilderRegistry` + 各类 `*PlanBuilder` 组成代码式 planner |
+| 是否存在 planner | 存在。主路径是 `GoalBuilder` + LLM/规则型 Tool-Aware planner；`LegacyTemplateFallbackPlanBuilder` 只在主 planner 不可用时输出最小安全回复 |
 | 是否存在多轮 agent loop | 存在有限循环，但不是开放式 think-act loop。`PlanExecutor._execute_runtime()` 会在 plan step 级别循环执行，并在 observation 后触发 rule-based replan；另有基于 `interrupt/resume` 的跨请求续跑 |
 | 是否存在 observation | 存在。`backend/agents/arxiv_search_agent/observer.py::Observer` |
 | 是否访问数据库 | Router 文件本身未直接访问；`/agent/chat` 与 `/agent/chat/stream` 通过 `MemoryService`、`DatabaseService`、`PaperQAService`、`RecommendationService` 等间接访问数据库 |
@@ -60,11 +60,11 @@ flowchart TD
     E1 --> F1["[LLM] parse_search_request()<br/>可选调用 complete_with_qwen()"]
     E2 --> F2["[LLM] parse_search_request()<br/>可选调用 complete_with_qwen()"]
 
-    F1 --> G1["[Planner] GoalBuilder + PlanBuilderRegistry"]
-    F2 --> G2["[Planner] GoalBuilder + PlanBuilderRegistry"]
+    F1 --> G1["[Planner] GoalBuilder + Tool-Aware Planner"]
+    F2 --> G2["[Planner] GoalBuilder + Tool-Aware Planner"]
 
-    G1 --> H1["[Tool Selection] 代码固定生成 ExecutablePlan"]
-    G2 --> H2["[Tool Selection] 代码固定生成 ExecutablePlan"]
+    G1 --> H1["[Tool Selection] LLM/规则草稿转 ExecutablePlan"]
+    G2 --> H2["[Tool Selection] LLM/规则草稿转 ExecutablePlan"]
 
     H1 --> I1["[Tool] PlanExecutor 执行 step"]
     H2 --> I2["[Tool] PlanExecutor 执行 step"]
@@ -118,9 +118,9 @@ flowchart TD
     L --> M
 
     M --> N["[LLM] parse_search_request()<br/>可选调用 complete_with_qwen()<br/>失败时规则兜底"]
-    N --> O["[Planner] run_agent_turn_in_graph()<br/>GoalBuilder + PlanBuilderRegistry"]
-    O --> P["[Tool Selection] 固定生成 ExecutablePlan"]
-    P --> Q["[Tool] PlanExecutor._execute_runtime()"]
+    N --> O["[Planner] build_goal_node()<br/>GoalBuilder"]
+    O --> P["[Planner] build_plan_node()<br/>LLM/规则草稿生成 ExecutablePlan<br/>失败时 legacy 模板最小兜底"]
+    P --> Q["[Runtime] select_next_step_node() / execute_step_node() / observe_step_node()"]
     Q --> R["[Tool] _invoke_step_tool()"]
     R --> S["[External API] 可能调用 search_arxiv_structured / answer_paper_question / recommend_papers 等"]
     S --> T["[Observation] Observer.observe()"]
@@ -141,7 +141,7 @@ flowchart TD
 
 ### 关键调用链
 
-`agent_chat_endpoint() -> run_arxiv_search_agent() -> _coerce_request() -> _load_agent_request_context() -> build_arxiv_search_graph() -> graph.invoke() -> parse_search_request() -> run_agent_turn_node() -> run_agent_turn_in_graph() -> GoalBuilder.from_state() -> PLAN_BUILDER_REGISTRY.get(...).build() -> PlanExecutor._execute_runtime() -> _invoke_step_tool() -> invoke_backend_tool() / GenerationService.complete_with_qwen() -> Observer.observe() -> Replanner.replan() -> _persist_agent_session_memory() -> _state_to_response()`
+`agent_chat_endpoint() -> run_arxiv_search_agent() -> _coerce_request() -> _load_agent_request_context() -> build_arxiv_search_graph() -> graph.invoke() -> parse_search_request() -> build_goal_node() -> build_plan_node() -> select_next_step_node() -> execute_step_node() -> observe_step_node() -> route_after_observation_node() -> replan_node() -> finalize_node() -> _persist_agent_session_memory() -> _state_to_response()`
 
 ### 输入
 
@@ -276,7 +276,7 @@ flowchart TD
 
 ### 关键调用链
 
-`agent_chat_stream_endpoint() -> stream_arxiv_search_agent() -> event_stream() -> _load_agent_request_context() -> build_arxiv_search_graph() -> graph.stream(..., stream_mode="updates") -> parse_search_request() / run_agent_turn_node() -> _extract_interrupt_payload() / _apply_stream_interrupt_state() -> _make_stream_event() -> _sse_event()`
+`agent_chat_stream_endpoint() -> stream_arxiv_search_agent() -> event_stream() -> _load_agent_request_context() -> build_arxiv_search_graph() -> graph.stream(..., stream_mode="updates") -> parse_search_request() / build_goal_node() / build_plan_node() / select_next_step_node() / execute_step_node() / observe_step_node() / replan_node() / finalize_node() -> _extract_interrupt_payload() / _apply_stream_interrupt_state() -> _make_stream_event() -> _sse_event()`
 
 ### 输入
 
@@ -388,16 +388,18 @@ flowchart TD
 
 ### 1. 这个 agent 是否真的有 planner？
 
-有，但不是 LLM 自由规划器，而是代码式 planner。
+有。当前主路径不是历史固定模板，而是受控的 LLM/规则型 Tool-Aware planner。
 
 真实实现：
 
 - `GoalBuilder.from_state()`：从 `AgentState.intent`、`message`、`context` 生成 `Goal`
-- `PlanBuilderRegistry`：按 `goal_type` 选择 `ArxivSearchPlanBuilder`、`PaperQAPlanBuilder`、`RecommendationPlanBuilder` 等
-- 每个 `PlanBuilder` 直接返回固定结构的 `ExecutablePlan`
-- `PlanValidator`：在执行前校验 plan 的工具名、依赖、side effect 等
+- `ToolCandidateSelector`：按目标、上下文和工具 contract 收敛候选工具
+- `LLMPlanDraftGenerator`：可选生成结构化草稿，失败后按配置回退到规则 planner
+- `RuleBasedToolAwarePlanBuilder`：默认正式路径，生成受工具 contract 约束的 PlanDraft
+- `PlanDraftConverter` + `PlanValidator`：在执行前校验工具名、依赖、side effect、确认策略等
+- `LegacyTemplateFallbackPlanBuilder`：只在主 planner 关闭、失败或上下文异常时输出单步安全 fallback，不再承载业务规划
 
-结论：存在 planner，但更接近“基于意图分发的静态 plan builder”，不是开放式 LLM planner。
+结论：存在 planner，但不是开放式 think-act LLM；主路径是受工具 contract 约束的 LLM/规则规划，legacy 模板只是最后兜底。
 
 ### 2. 是否存在 tool registry？
 
@@ -413,14 +415,15 @@ flowchart TD
 
 ### 3. tool selection 是 LLM 决策，还是代码固定分支？
 
-以代码固定分支为主。
+以受控规则 planner 为主，可选 LLM draft。
 
-- LLM 只参与 `parse_search_request()` 的意图识别与搜索条件解析
-- 一旦 `intent` 确定，后续 plan 是 `PlanBuilder` 固定生成
-- 工具顺序、依赖、输入绑定、确认策略都写死在代码里
+- LLM 可参与 `parse_search_request()` 的意图识别，也可在开启实验开关时生成 planner 草稿
+- 草稿只能选择候选工具，必须经过 schema、依赖、风险和 `PlanValidator` 校验
+- 默认规则 planner 负责普通 arXiv 搜索、论文 QA、推荐和偏好更新的正式计划
+- legacy 模板不会继续追加新业务分支，只负责主 planner 不可用时的最小安全回复
 - observation 后的 replan 也不是 LLM 决策，而是 `Replanner._apply_rule()` 的规则改写
 
-结论：tool selection 不是 LLM 自主决策，而是“LLM 决定意图，代码决定工具链”。
+结论：tool selection 不是 LLM 自主决策，而是“候选工具受 contract 收敛，LLM/规则草稿再经校验转成可执行计划”。
 
 ### 4. 是否存在 observe → think → act 的循环？
 
@@ -490,13 +493,13 @@ flowchart TD
 
 ### 8. 整体更像 agent，还是固定 workflow？
 
-整体更像“带有 planner/executor/replanner 外形的固定 workflow”。
+整体更像“受控 planner/executor/replanner workflow”，不是开放式自由工具自治 agent。
 
 原因：
 
 - 主图只有两个业务节点：`parse_search_request -> run_agent_turn`
-- plan 生成是固定模板，不是动态推理拼装
-- tool selection 不由 LLM 决定
+- plan 生成主路径来自 LLM/规则型 Tool-Aware planner，legacy 模板只在失败时兜底
+- tool selection 不由 LLM 自由决定，而是先被 ToolRegistry contract 和候选筛选收敛
 - replan 是规则表驱动，不是自由推理
 - 但它又比纯 if/else workflow 更强，因为：
 - 有显式 `Goal`
@@ -547,15 +550,16 @@ Router 中唯一额外逻辑主要是 import fallback，用于兼容不同启动
 - `unclear`
 - `unsupported`
 
-但这些能力大多通过固定 plan 实现，不是通用工具自治能力。
+这些能力通过受控 plan 实现，不是通用工具自治能力；新增业务能力应扩展 Tool-Aware planner，而不是 legacy template fallback。
 
 ### 5. 对后续重构为真正 planner-agent 有什么影响？
 
 当前 Router 基本不是阻碍，主要限制在 agent 内部实现：
 
 - 主图节点过粗，真正的推理/执行细节都被折叠进 `run_agent_turn`
-- planner 目前是按 `goal_type` 返回固定模板
-- tool selection 和 replan 都是规则型，而非模型驱动
+- planner 当前默认由规则型 Tool-Aware builder 生成计划，可选 LLM draft 只产出受校验草稿
+- legacy template fallback 只输出最小安全回复，不再作为业务 planner 扩展面
+- tool selection 和 replan 都有强规则边界，不是开放式模型驱动
 
 这意味着：
 

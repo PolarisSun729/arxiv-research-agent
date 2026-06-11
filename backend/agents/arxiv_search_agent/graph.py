@@ -7,7 +7,7 @@ from langgraph.graph import END, START, StateGraph
 
 from .node import parse_search_request
 from .planner import GoalBuilder, build_executable_plan_for_goal, build_plan_runtime
-from .plan_executor import PlanExecutor, run_agent_turn_in_graph
+from .plan_executor import PlanExecutor
 from .runtime_checkpoint import build_agent_checkpointer
 from .schemas import AgentRuntimeState, AgentStep, AgentTurnResult, PlanRuntime, StepExecutionResult
 from .state import AgentState
@@ -335,21 +335,6 @@ def route_after_replan(state: Any) -> str:
     return "select_next_step"
 
 
-def route_after_parse(state: Any) -> str:
-    """兼容旧导出名；当前主图 parse 后固定进入 build_goal。"""
-    del state
-    return "build_goal"
-
-
-def run_agent_turn_node(state: Any) -> AgentState:
-    """兼容旧测试/导入名：实际仍走旧 executor 图内入口。"""
-    current_state = _coerce_state(state)
-    result = run_agent_turn_in_graph(current_state)
-    next_state = current_state.model_copy(deep=True)
-    _apply_turn_result(next_state, result)
-    return next_state
-
-
 def build_arxiv_search_graph(
     generation_service: Optional[Any] = None,
     *,
@@ -508,7 +493,7 @@ def _apply_turn_result(state: AgentState, result: AgentTurnResult) -> None:
     state.plan_runtime = result.runtime
     state.answer = result.final_answer or state.answer
     confirmation_payload = result.pending_confirmation.model_dump() if result.pending_confirmation is not None else None
-    state.pending_action = _build_compatible_pending_action(result)
+    state.pending_action = _build_pending_action_mirror(result)
     state.debug = dict(state.debug or {})
     state.debug["agent_turn"] = {
         "status": result.status,
@@ -544,8 +529,8 @@ def _extract_resolved_paper_from_runtime(state: AgentState) -> Dict[str, Any]:
         return {}
     nested_paper = paper_ref.get("paper")
     if isinstance(nested_paper, Mapping):
-        # resolve_paper 会同时返回顶层 arxiv_id/title 和完整 paper；
-        # 嵌套 paper 字段通常更完整，但顶层字段是最终解析结果，保留其优先级。
+        # Target Resolver 会同时返回顶层 arxiv_id/title 和完整 paper；
+        # 嵌套 paper 字段通常更完整，但顶层字段代表最终解析结果，保留其优先级。
         return {
             **dict(nested_paper),
             **{key: value for key, value in dict(paper_ref).items() if key in {"arxiv_id", "title"} and value not in (None, "", [], {})},
@@ -576,8 +561,12 @@ def _build_paper_qa_result(state: AgentState, payload: Any) -> Dict[str, Any]:
     }
 
 
-def _build_compatible_pending_action(result: AgentTurnResult) -> Optional[Dict[str, Any]]:
-    """把新的确认请求结构映射成前端沿用的 pending_action 外显字段。"""
+def _build_pending_action_mirror(result: AgentTurnResult) -> Optional[Dict[str, Any]]:
+    """把结构化确认请求投影成旧前端仍读取的 pending_action 镜像。
+
+    pending_action 只承担展示兼容职责，真实可恢复状态仍以
+    pending_confirmation 和 LangGraph resume/checkpoint 为准。
+    """
     confirmation = result.pending_confirmation
     if confirmation is None:
         return None
@@ -585,9 +574,11 @@ def _build_compatible_pending_action(result: AgentTurnResult) -> Optional[Dict[s
     target_paper = dict(confirmation.target_paper or {})
     arguments_summary = dict(confirmation.arguments_summary or {})
     return {
-        "type": "tool_approval",
+        "type": confirmation.request_type,
+        "request_type": confirmation.request_type,
         "status": "waiting_confirmation",
         "decision": None,
+        "pending_action_id": confirmation.pending_action_id,
         "step_id": confirmation.step_id,
         "tool_name": confirmation.tool_name,
         "action_type": confirmation.action_type,
@@ -598,7 +589,16 @@ def _build_compatible_pending_action(result: AgentTurnResult) -> Optional[Dict[s
         "description": confirmation.description,
         "arxiv_id": target_paper.get("arxiv_id"),
         "original_question": confirmation.original_question,
+        "original_message": confirmation.original_message,
         "target_paper": target_paper or None,
+        "candidates": list(confirmation.candidates or []),
+        "recommended_candidate": dict(confirmation.recommended_candidate or {}) if confirmation.recommended_candidate else None,
+        "default_candidate_id": confirmation.default_candidate_id,
+        "reference_hint": dict(confirmation.reference_hint or {}),
+        "target_resolution": dict(confirmation.target_resolution or {}),
+        "confirmation_fields": dict(confirmation.confirmation_fields or {}),
+        "created_at": confirmation.created_at,
+        "expires_at": confirmation.expires_at,
         "allowed_decisions": [item.code for item in list(confirmation.allowed_decisions or [])],
         "allow_argument_edit": confirmation.allow_argument_edit,
         "allow_reject": confirmation.allow_reject,
@@ -686,7 +686,6 @@ __all__ = [
     "build_arxiv_search_graph",
     "export_arxiv_search_graph_mermaid",
     "route_after_observation",
-    "route_after_parse",
     "route_after_replan",
     "route_after_execution",
     "route_after_selection",

@@ -247,8 +247,10 @@ class LLMPlanDraftGenerator:
         self.prompt_context_builder = PromptContextBuilder()
         self.last_debug: Dict[str, Any] = {
             "raw_llm_plan": None,
+            "raw_llm_plan_summary": None,
             "invalid_reasons": [],
             "normalized_plan": None,
+            "validation_summary": {},
         }
 
     def generate(
@@ -265,6 +267,7 @@ class LLMPlanDraftGenerator:
         prompt = self._build_prompt(goal, state, candidate_tools, tool_registry, planner_context)
         raw_text = self._invoke_generation_service(prompt)
         self.last_debug["raw_llm_plan"] = _safe_debug_text(raw_text)
+        self.last_debug["raw_llm_plan_summary"] = _summarize_llm_raw_plan(raw_text)
         payload = self._parse_json_only(raw_text)
         draft = PlanDraft.model_validate(payload)
         normalized = self._normalize_draft(draft, goal, state, candidate_tools, tool_registry)
@@ -342,6 +345,12 @@ class LLMPlanDraftGenerator:
                 "persistent_write_requires_clear_target": True,
                 "confirmation_required_for_tool_policy": True,
                 "unsupported_or_unclear_must_use_clarification_or_fallback": True,
+            },
+            "planner_limits": {
+                "max_steps": self.max_steps,
+                # 这里只暴露是否允许规划出 confirmation-required step，
+                # 真正的确认门禁仍由 converter / validator / executor 统一兜底。
+                "allow_human_confirmation": any(tool.requires_confirmation for tool in list(candidate_tools or [])),
             },
             "allowed_output_schema": {
                 "draft_id": "string",
@@ -477,6 +486,14 @@ class LLMPlanDraftGenerator:
 
             if tool.input_schema and not list(step.input_bindings or []):
                 invalid_reasons.append(f"step {step_id} missing input_bindings")
+            contract = tool_registry.get_contract(tool_name)
+            required_inputs = _required_input_keys_from_contract(contract)
+            provided_inputs = {str(binding.input_key or "").strip() for binding in list(step.input_bindings or []) if str(binding.input_key or "").strip()}
+            missing_required_inputs = sorted(required_inputs - provided_inputs)
+            if missing_required_inputs:
+                invalid_reasons.append(
+                    f"step {step_id} missing required inputs {missing_required_inputs} for tool {tool_name}"
+                )
             for binding in list(step.input_bindings or []):
                 if binding.source_type == "step_output" and str(binding.step_id or "").strip() not in seen_step_ids:
                     invalid_reasons.append(f"step {step_id} input {binding.input_key} references missing step {binding.step_id}")
@@ -504,6 +521,11 @@ class LLMPlanDraftGenerator:
         invalid_reasons.extend(_validate_required_llm_sequence(goal, normalized_steps))
 
         self.last_debug["invalid_reasons"] = invalid_reasons
+        self.last_debug["validation_summary"] = _build_llm_validation_summary(
+            status="failed" if invalid_reasons else "passed",
+            draft=draft,
+            reasons=invalid_reasons,
+        )
         if invalid_reasons:
             raise LLMPlanDraftError("; ".join(invalid_reasons))
         return draft.model_copy(
@@ -699,14 +721,14 @@ class RuleBasedToolAwarePlanBuilder:
                 action_type="retrieve",
                 output_key="paper_ref",
                 reason=(
-                    "上下文已有 selected_paper，但仍保留 resolve 校验以统一后续 paper_ref 契约。"
+                    "上下文已有 selected_paper，本步骤统一解析目标候选；只有 resolved 结果才能继续 QA。"
                     if has_selected_paper
-                    else "先解析目标论文，避免后续 QA 工具在缺少论文引用时误执行。"
+                    else "先提取引用线索并结合上下文解析候选；未落地到最终论文前不能执行 QA 工具。"
                 ),
                 input_bindings=[
                     _binding_dict("message", source_type="state", source_key="message"),
                     _binding_dict("selected_paper", source_type="context", source_key="selected_paper", required=False),
-                    # resolve_paper 需要完整上下文里的 last_papers，才能稳定处理“第二篇”等序号引用。
+                    # context 是 Target Resolver 的候选材料；业务工具不能再自行解析用户文本或默认 selected_paper。
                     _binding_dict("context", source_type="state", source_key="context", required=False),
                 ],
             ),
@@ -850,11 +872,11 @@ class RuleBasedToolAwarePlanBuilder:
                 resolve,
                 action_type="retrieve",
                 output_key="paper_reference",
-                reason="写入偏好前必须先解析目标论文，避免无目标持久化写入。",
+                reason="写入偏好前先统一解析目标候选；未解析为最终论文时必须阻断持久化写入。",
                 input_bindings=[
                     _binding_dict("message", source_type="state", source_key="message"),
                     _binding_dict("selected_paper", source_type="context", source_key="selected_paper", required=False),
-                    # 偏好动作也会用“喜欢第二篇”这种说法，必须把最近搜索列表传给解析器。
+                    # 偏好动作里的“第二篇”要经统一 resolver 生成候选，避免写入工具自行猜目标。
                     _binding_dict("context", source_type="state", source_key="context", required=False),
                 ],
             ),
@@ -908,7 +930,13 @@ class RuleBasedToolAwarePlanBuilder:
                 action_type="clarify",
                 output_key="missing_information",
                 reason="不明确目标只能先分析缺失信息，不能暴露业务工具。",
-                input_bindings=[_binding_dict("message", source_type="state", source_key="message")],
+                input_bindings=[
+                    _binding_dict("message", source_type="state", source_key="message"),
+                    _binding_dict("context", source_type="state", source_key="context", required=False),
+                    _binding_dict("user_id", source_type="state", source_key="user_id", required=False),
+                    _binding_dict("search_spec", source_type="state", source_key="search_spec", required=False),
+                    _binding_dict("goal", source_type="literal", value={"intent": goal.goal_type, "goal_type": goal.goal_type}, required=False),
+                ],
             ),
             self._draft_step(
                 "generate_clarification",
@@ -1189,13 +1217,21 @@ class PlanDraftConverter:
             raise PlanDraftConversionError(
                 f"Draft step {draft_step.step_id} missing required input bindings"
             )
+        contract = self.tool_registry.get_contract(tool.tool_name)
+        required_inputs = _required_input_keys_from_contract(contract)
+        provided_inputs = {str(binding.input_key or "").strip() for binding in bindings if str(binding.input_key or "").strip()}
+        missing_required_inputs = sorted(required_inputs - provided_inputs)
+        if missing_required_inputs:
+            raise PlanDraftConversionError(
+                f"Draft step {draft_step.step_id} missing required inputs {missing_required_inputs} for tool {tool.tool_name}"
+            )
         return bindings
 
 
 def plan_to_draft(plan: ExecutablePlan, *, selected_tools: Sequence[str], fallback_reason: Optional[str] = None) -> PlanDraft:
-    """把固定模板计划投影成 PlanDraft，作为当前阶段的规则型 draft 生成器。
+    """把 legacy 模板兜底计划投影成 PlanDraft，供少量兼容入口消费。
 
-    这样启用 Tool-Aware Planner 后仍先经过不可信草稿和转换边界，但不会改变现有模板行为。
+    主规划能力不再从这里扩展；正常搜索、QA、推荐计划应由 LLM draft 或规则型 tool-aware planner 生成。
     """
     used_tool_names = _dedupe_tool_names([step.tool_name for step in list(plan.steps or [])])
     return PlanDraft(
@@ -1207,14 +1243,14 @@ def plan_to_draft(plan: ExecutablePlan, *, selected_tools: Sequence[str], fallba
                 step_id=step.step_id,
                 action_type=step.action_type,
                 tool_name=step.tool_name,
-                step_reason=f"fixed template step for {plan.goal.goal_type}",
+                step_reason=f"legacy template fallback step for {plan.goal.goal_type}",
                 input_bindings=list(step.input_bindings or []),
                 depends_on=list(step.depends_on or []),
                 expected_output_key=step.output_key,
                 expected_output={"output_key": step.output_key} if step.output_key else {},
                 risk_level="high" if step.side_effect_level == "persistent_write" else ("medium" if step.side_effect_level == "external_call" else "low"),
                 risk_notes=(
-                    f"{step.side_effect_level} step projected from validated fixed template"
+                    f"{step.side_effect_level} step projected from validated legacy template fallback"
                     if step.side_effect_level in {"persistent_write", "external_call"} or bool(step.confirmation_policy and step.confirmation_policy.requires_confirmation)
                     else None
                 ),
@@ -1225,7 +1261,7 @@ def plan_to_draft(plan: ExecutablePlan, *, selected_tools: Sequence[str], fallba
             for step in list(plan.steps or [])
         ],
         fallback_reason=fallback_reason,
-        metadata={"source": "fixed_template_projection"},
+        metadata={"source": "legacy_template_fallback_projection"},
     )
 
 
@@ -1242,6 +1278,70 @@ def _dedupe_tool_names(tool_names: Sequence[str]) -> List[str]:
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _required_input_keys_from_contract(contract: Optional[Any]) -> Set[str]:
+    if contract is None or getattr(contract, "input_model", None) is None:
+        return set()
+    model = contract.input_model
+    model_fields = getattr(model, "model_fields", None) or {}
+    required_inputs: Set[str] = set()
+    for field_name, field in dict(model_fields).items():
+        try:
+            is_required = bool(field.is_required())
+        except Exception:
+            is_required = False
+        if is_required:
+            required_inputs.add(str(field_name))
+    return required_inputs
+
+
+def _summarize_llm_raw_plan(raw_text: Any) -> Dict[str, Any]:
+    text = str(raw_text or "").strip()
+    summary: Dict[str, Any] = {
+        "chars": len(text),
+        "is_json_object": text.startswith("{") and text.endswith("}"),
+        "preview": text[:280],
+    }
+    if not summary["is_json_object"]:
+        return summary
+    try:
+        payload = json.loads(text)
+    except Exception as exc:
+        summary["json_error"] = str(exc)
+        return summary
+    if not isinstance(payload, dict):
+        summary["json_type"] = type(payload).__name__
+        return summary
+    steps = payload.get("steps")
+    summary.update(
+        {
+            "top_level_keys": sorted(payload.keys()),
+            "selected_tools": list(payload.get("selected_tools") or []),
+            "step_count": len(steps) if isinstance(steps, list) else 0,
+            "step_ids": [str(item.get("step_id")) for item in steps[:8]] if isinstance(steps, list) else [],
+            "tool_names": [str(item.get("tool_name")) for item in steps[:8]] if isinstance(steps, list) else [],
+        }
+    )
+    return summary
+
+
+def _build_llm_validation_summary(*, status: str, draft: Optional[PlanDraft], reasons: Sequence[str]) -> Dict[str, Any]:
+    steps = list(draft.steps or []) if draft is not None else []
+    return {
+        "status": status,
+        "validator_stack": [
+            "llm_json_only_parse",
+            "PlanDraft.model_validate",
+            "llm_draft_normalization",
+            "PlanDraftConverter",
+            "PlanValidator",
+        ],
+        "reason_count": len(list(reasons or [])),
+        "reasons": list(reasons or []),
+        "step_count": len(steps),
+        "tool_names": [str(step.tool_name or "").strip() for step in steps],
+    }
 
 
 def _binding_dict(

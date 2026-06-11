@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import json
 
 from tests.helpers.agent_runtime import load_agent_test_modules
 
@@ -22,6 +21,20 @@ PLANNER_TOOL_REGISTRY = planner_registry_module.PLANNER_TOOL_REGISTRY
 
 def _step_ids(result):
     return [trace.step_id for trace in result.trace if trace.event == "step_succeeded"]
+
+
+def _reference_hint_from_trace(result, step_id: str) -> dict:
+    for trace in result.trace:
+        if trace.step_id == step_id and trace.event == "step_observed":
+            evidence = trace.detail.get("evidence") if isinstance(trace.detail, dict) else {}
+            hint = (evidence or {}).get("reference_hint") if isinstance(evidence, dict) else None
+            return dict(hint or {})
+    for trace in result.trace:
+        if trace.step_id == step_id and trace.event == "step_succeeded":
+            output = trace.detail.get("normalized_output") if isinstance(trace.detail, dict) else {}
+            hint = (output or {}).get("reference_hint") if isinstance(output, dict) else None
+            return dict(hint or {})
+    return {}
 
 
 def test_run_agent_turn_arxiv_search_success(monkeypatch) -> None:
@@ -82,12 +95,24 @@ def test_run_agent_turn_arxiv_empty_result_replans(monkeypatch) -> None:
     assert sum(result.runtime.replan_counts.values()) <= 5
 
 
-def test_run_agent_turn_paper_qa_available_index(monkeypatch) -> None:
+def test_run_agent_turn_paper_qa_context_reference_resolves_selected_and_answers(monkeypatch) -> None:
+    called_tools = []
+
     def fake_invoke_tool(tool_name: str, **kwargs):
+        called_tools.append((tool_name, dict(kwargs)))
         if tool_name == "check_paper_qa_index":
-            return {"ok": True, "tool_name": tool_name, "summary": "available", "data": {"status": "available", "has_index": True}, "trace": {}, "error": None}
+            assert kwargs["arxiv_id"] == "2401.00001"
+            return {"ok": True, "tool_name": tool_name, "summary": "indexed", "data": {"status": "indexed", "has_index": True}, "trace": {}, "error": None}
         if tool_name == "answer_paper_question":
-            return {"ok": True, "tool_name": tool_name, "summary": "answered", "data": {"answer": "grounded answer", "sources": [{"chunk_id": "c1"}], "retrieval_debug": {"route": "hybrid"}} , "trace": {}, "error": None}
+            assert kwargs["arxiv_id"] == "2401.00001"
+            return {
+                "ok": True,
+                "tool_name": tool_name,
+                "summary": "answered",
+                "data": {"answer": "method answer", "sources": [{"chunk_id": "c1"}], "retrieval_debug": {}},
+                "trace": {},
+                "error": None,
+            }
         raise AssertionError(f"unexpected tool: {tool_name}")
 
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
@@ -104,22 +129,27 @@ def test_run_agent_turn_paper_qa_available_index(monkeypatch) -> None:
     )
 
     assert result.status == "success"
-    assert result.final_answer == "grounded answer"
-    assert {"paper_ref", "paper_qa_result"}.issubset(result.outputs.keys())
-    assert result.outputs["paper_qa_result"]["retrieval_debug"] == {"route": "hybrid"}
+    assert result.pending_confirmation is None
+    assert result.outputs["paper_ref"]["arxiv_id"] == "2401.00001"
+    assert result.outputs["paper_ref"]["final_target_resolved"] is True
+    assert result.outputs["paper_ref"]["reference_hint"]["reference_type"] == "context_paper"
+    assert result.outputs["paper_ref"]["reference_hint"]["requires_context"] is True
+    assert result.outputs["paper_qa_result"]["arxiv_id"] == "2401.00001"
+    assert [tool_name for tool_name, _ in called_tools] == ["check_paper_qa_index", "answer_paper_question"]
     assert not {"retrieved_chunks", "reranked_chunks", "draft_answer"}.intersection(result.outputs.keys())
     assert not any(trace.step_id == "request_confirmation" for trace in result.trace)
 
 
-def test_run_agent_turn_paper_qa_ordinal_uses_last_papers_over_selected(monkeypatch) -> None:
-    answer_calls = []
+def test_run_agent_turn_paper_qa_ordinal_resolves_second_paper(monkeypatch) -> None:
+    called_tools = []
 
     def fake_invoke_tool(tool_name: str, **kwargs):
+        called_tools.append((tool_name, dict(kwargs)))
         if tool_name == "check_paper_qa_index":
             assert kwargs["arxiv_id"] == "2401.00002"
-            return {"ok": True, "tool_name": tool_name, "summary": "available", "data": {"status": "available", "has_index": True}, "trace": {}, "error": None}
+            return {"ok": True, "tool_name": tool_name, "summary": "indexed", "data": {"status": "indexed", "has_index": True}, "trace": {}, "error": None}
         if tool_name == "answer_paper_question":
-            answer_calls.append(dict(kwargs))
+            assert kwargs["arxiv_id"] == "2401.00002"
             return {
                 "ok": True,
                 "tool_name": tool_name,
@@ -149,17 +179,152 @@ def test_run_agent_turn_paper_qa_ordinal_uses_last_papers_over_selected(monkeypa
 
     assert result.status == "success"
     assert result.outputs["paper_ref"]["arxiv_id"] == "2401.00002"
-    assert result.outputs["paper_ref"]["title"] == "Second Paper"
-    assert answer_calls == [{"arxiv_id": "2401.00002", "question": "这第2篇论文的方法是什么？"}]
+    assert result.outputs["paper_ref"]["final_target_resolved"] is True
+    assert result.outputs["paper_ref"]["reference_hint"]["reference_type"] == "ordinal"
+    assert result.outputs["paper_ref"]["reference_hint"]["value"] == 2
+    assert [kwargs["arxiv_id"] for _, kwargs in called_tools] == ["2401.00002", "2401.00002"]
 
 
-def test_run_agent_turn_preference_action_ordinal_uses_last_papers_over_selected(monkeypatch) -> None:
+def test_run_agent_turn_paper_qa_ambiguous_ordinal_returns_target_confirmation(monkeypatch) -> None:
+    def fail_if_called(tool_name: str, **kwargs):
+        raise AssertionError(f"business tool must wait for target confirmation: {tool_name}")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fail_if_called)
+
+    result = run_agent_turn(
+        AgentState(
+            intent="paper_qa",
+            message="讲一下第二篇论文",
+            context={
+                "last_papers": [
+                    {"arxiv_id": "2401.00001", "title": "Search First"},
+                    {"arxiv_id": "2401.00002", "title": "Search Second"},
+                ],
+                "recommendations": [
+                    {"arxiv_id": "2501.00001", "title": "Rec First"},
+                    {"arxiv_id": "2501.00002", "title": "Rec Second"},
+                ],
+            },
+        )
+    )
+
+    assert result.status == "waiting_confirmation"
+    assert result.pending_confirmation is not None
+    assert result.pending_confirmation.request_type == "paper_target_confirmation"
+    assert result.pending_confirmation.tool_name == "resolve_paper"
+    assert result.pending_confirmation.pending_action_id
+    assert len(result.pending_confirmation.candidates) == 2
+    assert result.outputs["paper_ref"]["status"] == "need_confirmation"
+    assert result.outputs["paper_ref"]["final_target_resolved"] is False
+
+
+def test_run_agent_turn_in_graph_target_confirmation_uses_user_selected_candidate(monkeypatch) -> None:
+    called_tools = []
+
+    def fake_interrupt(payload):
+        if payload.get("request_type") == "paper_target_confirmation":
+            return {
+                "decision": "approve",
+                "step_id": payload.get("step_id"),
+                "edited_arguments": {
+                    "pending_action_id": payload.get("pending_action_id"),
+                    "confirmed_paper_id": "2501.00002",
+                    "confirmed_arxiv_id": "2501.00002",
+                },
+            }
+        return {"decision": "reject", "step_id": payload.get("step_id")}
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        called_tools.append((tool_name, dict(kwargs)))
+        if tool_name == "check_paper_qa_index":
+            assert kwargs["arxiv_id"] == "2501.00002"
+            return {"ok": True, "tool_name": tool_name, "summary": "indexed", "data": {"status": "indexed", "has_index": True}, "trace": {}, "error": None}
+        if tool_name == "answer_paper_question":
+            assert kwargs["arxiv_id"] == "2501.00002"
+            return {
+                "ok": True,
+                "tool_name": tool_name,
+                "summary": "answered",
+                "data": {"answer": "selected recommendation answer", "sources": [{"chunk_id": "c2"}], "retrieval_debug": {}},
+                "trace": {},
+                "error": None,
+            }
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    monkeypatch.setattr(executor_module, "interrupt", fake_interrupt)
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    result = run_agent_turn_in_graph(
+        AgentState(
+            intent="paper_qa",
+            message="讲一下第二篇论文",
+            context={
+                "last_papers": [
+                    {"arxiv_id": "2401.00001", "title": "Search First"},
+                    {"arxiv_id": "2401.00002", "title": "Search Second"},
+                ],
+                "recommendations": [
+                    {"arxiv_id": "2501.00001", "title": "Rec First"},
+                    {"arxiv_id": "2501.00002", "title": "Rec Second"},
+                ],
+            },
+        )
+    )
+
+    assert result.status == "success"
+    assert result.pending_confirmation is None
+    assert result.outputs["paper_ref"]["arxiv_id"] == "2501.00002"
+    assert result.outputs["paper_ref"]["confirmed_by_user"] is True
+    assert result.outputs["paper_ref"]["target_resolution"]["resolution_reason"] == "user_confirmed_target"
+    assert [tool_name for tool_name, _ in called_tools] == ["check_paper_qa_index", "answer_paper_question"]
+
+
+def test_run_agent_turn_in_graph_target_confirmation_reject_cancels_original_action(monkeypatch) -> None:
+    called_tools = []
+
+    def fake_interrupt(payload):
+        assert payload.get("request_type") == "paper_target_confirmation"
+        assert payload.get("pending_action_id")
+        return {"decision": "reject", "step_id": payload.get("step_id")}
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        called_tools.append((tool_name, dict(kwargs)))
+        raise AssertionError(f"business tool must not run after target rejection: {tool_name}")
+
+    monkeypatch.setattr(executor_module, "interrupt", fake_interrupt)
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    result = run_agent_turn_in_graph(
+        AgentState(
+            intent="paper_qa",
+            message="讲一下第二篇论文",
+            context={
+                "last_papers": [
+                    {"arxiv_id": "2401.00001", "title": "Search First"},
+                    {"arxiv_id": "2401.00002", "title": "Search Second"},
+                ],
+                "recommendations": [
+                    {"arxiv_id": "2501.00001", "title": "Rec First"},
+                    {"arxiv_id": "2501.00002", "title": "Rec Second"},
+                ],
+            },
+        )
+    )
+
+    assert result.status == "success"
+    assert result.pending_confirmation is None
+    assert result.outputs["paper_ref"]["status"] == "need_confirmation"
+    assert called_tools == []
+    assert any(trace.event == "confirmation_requested" and trace.step_id == "resolve_paper" for trace in result.trace)
+    assert any(trace.event == "confirmation_rejected" and trace.step_id == "resolve_paper" for trace in result.trace)
+    assert not any(trace.step_id == "check_paper_index" and trace.event == "step_succeeded" for trace in result.trace)
+
+
+def test_run_agent_turn_preference_action_ordinal_resolves_then_waits_for_write_confirmation(monkeypatch) -> None:
     preference_calls = []
 
     def fake_invoke_tool(tool_name: str, **kwargs):
-        if tool_name == "record_paper_preference":
-            preference_calls.append(dict(kwargs))
-            return {"ok": True, "tool_name": tool_name, "summary": "recorded", "data": {"ok": True}, "trace": {}, "error": None}
+        preference_calls.append((tool_name, dict(kwargs)))
         raise AssertionError(f"unexpected tool: {tool_name}")
 
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
@@ -182,20 +347,22 @@ def test_run_agent_turn_preference_action_ordinal_uses_last_papers_over_selected
     assert result.status == "waiting_confirmation"
     assert result.pending_confirmation is not None
     assert result.pending_confirmation.tool_name == "update_preference_store"
-    assert result.pending_confirmation.target_paper is not None
-    assert result.pending_confirmation.target_paper["arxiv_id"] == "2401.00002"
     assert result.outputs["paper_reference"]["arxiv_id"] == "2401.00002"
+    assert result.outputs["paper_reference"]["final_target_resolved"] is True
+    assert result.outputs["paper_reference"]["requires_confirmation"] is True
+    assert result.outputs["paper_reference"]["reference_hint"]["reference_type"] == "ordinal"
+    assert result.outputs["paper_reference"]["reference_hint"]["value"] == 2
     assert preference_calls == []
 
 
-def test_run_agent_turn_paper_qa_missing_index_waits_for_confirmation(monkeypatch) -> None:
+def test_run_agent_turn_paper_qa_context_target_checks_index_then_requests_build_confirmation(monkeypatch) -> None:
     called_tools = []
 
     def fake_invoke_tool(tool_name: str, **kwargs):
         called_tools.append(tool_name)
         if tool_name == "check_paper_qa_index":
             return {"ok": True, "tool_name": tool_name, "summary": "missing", "data": {"status": "missing", "has_index": False}, "trace": {}, "error": None}
-        raise AssertionError(f"{tool_name} should not run before confirmation")
+        raise AssertionError(f"{tool_name} should not run before index build confirmation")
 
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
 
@@ -208,19 +375,22 @@ def test_run_agent_turn_paper_qa_missing_index_waits_for_confirmation(monkeypatc
     )
 
     assert result.status == "waiting_confirmation"
-    assert result.pending_confirmation
-    assert result.pending_confirmation.step_id == "parse_and_index_paper"
-    assert [item.code for item in result.pending_confirmation.allowed_decisions] == ["approve", "reject"]
-    json.dumps(result.pending_confirmation.model_dump(), ensure_ascii=False)
-    assert any(trace.step_id == "parse_and_index_paper" and trace.event == "confirmation_requested" for trace in result.trace)
-    assert "build_paper_qa_index" not in called_tools
+    assert result.pending_confirmation is not None
+    assert result.pending_confirmation.tool_name == "parse_and_index_paper"
+    assert result.pending_confirmation.target_paper["arxiv_id"] == "2401.00001"
+    assert result.outputs["paper_ref"]["reference_hint"]["reference_type"] == "context_paper"
+    assert called_tools == ["check_paper_qa_index"]
+    assert any(trace.event == "confirmation_requested" for trace in result.trace)
 
 
 def test_run_agent_turn_in_graph_reject_skips_index_build(monkeypatch) -> None:
+    called_tools = []
+
     def fake_invoke_tool(tool_name: str, **kwargs):
+        called_tools.append((tool_name, dict(kwargs)))
         if tool_name == "check_paper_qa_index":
             return {"ok": True, "tool_name": tool_name, "summary": "missing", "data": {"status": "missing", "has_index": False}, "trace": {}, "error": None}
-        raise AssertionError(f"{tool_name} should not run before confirmation")
+        raise AssertionError(f"{tool_name} should not run after rejected confirmation")
 
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
     monkeypatch.setattr(executor_module, "interrupt", lambda payload: {"decision": "reject"})
@@ -228,22 +398,24 @@ def test_run_agent_turn_in_graph_reject_skips_index_build(monkeypatch) -> None:
     result = run_agent_turn_in_graph(
         AgentState(
             intent="paper_qa",
-            message="杩欑瘒璁烘枃鐨勬柟娉曟槸浠€涔堬紵",
+            message="这篇论文的方法是什么？",
             context={"selected_paper": {"arxiv_id": "2401.00001", "title": "RAG Method"}},
         )
     )
 
-    assert result.final_answer == "已取消解析 RAG Method，因此无法继续基于全文回答。"
+    assert result.status == "success"
+    assert result.pending_confirmation is None
+    assert [tool_name for tool_name, _ in called_tools] == ["check_paper_qa_index"]
     assert any(trace.event == "confirmation_requested" for trace in result.trace)
     assert any(trace.event == "confirmation_rejected" for trace in result.trace)
+    assert not any(tool_name == "parse_and_index_paper" for tool_name, _ in called_tools)
 
 
-def test_run_agent_turn_paper_qa_trace_only_real_answer_tool(monkeypatch) -> None:
+def test_run_agent_turn_paper_qa_without_reference_does_not_call_real_answer_tool(monkeypatch) -> None:
+    called_tools = []
+
     def fake_invoke_tool(tool_name: str, **kwargs):
-        if tool_name == "check_paper_qa_index":
-            return {"ok": True, "tool_name": tool_name, "summary": "available", "data": {"status": "available", "has_index": True}, "trace": {}, "error": None}
-        if tool_name == "answer_paper_question":
-            return {"ok": True, "tool_name": tool_name, "summary": "answered", "data": {"answer": "grounded answer", "sources": [{"chunk_id": "c2"}], "retrieval_debug": {"stages": ["real_rag"]}}, "trace": {}, "error": None}
+        called_tools.append((tool_name, dict(kwargs)))
         raise AssertionError(f"unexpected tool: {tool_name}")
 
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
@@ -256,8 +428,10 @@ def test_run_agent_turn_paper_qa_trace_only_real_answer_tool(monkeypatch) -> Non
         )
     )
 
-    assert result.status == "success"
-    assert result.outputs["paper_qa_result"]["retrieval_debug"] == {"stages": ["real_rag"]}
+    assert result.status == "fallback"
+    assert _reference_hint_from_trace(result, "resolve_paper")["reference_type"] == "unknown"
+    assert "paper_qa_result" not in result.outputs
+    assert called_tools == []
     pseudo_steps = {"retrieve_paper_chunks", "rewrite_paper_query", "rerank_paper_chunks", "validate_qa_evidence", "generate_paper_answer", "verify_answer_grounding"}
     assert not pseudo_steps.intersection({trace.step_id for trace in result.trace})
     assert [step.tool_name for step in result.plan.steps] == [
@@ -268,40 +442,47 @@ def test_run_agent_turn_paper_qa_trace_only_real_answer_tool(monkeypatch) -> Non
     ]
 
 
-def test_run_agent_turn_preference_action_persistent_write(monkeypatch) -> None:
+def test_run_agent_turn_preference_action_ambiguous_target_does_not_persistent_write(monkeypatch) -> None:
     preference_calls = []
 
     def fake_invoke_tool(tool_name: str, **kwargs):
-        assert tool_name == "record_paper_preference"
-        preference_calls.append(dict(kwargs))
-        return {"ok": True, "tool_name": tool_name, "summary": "recorded", "data": {"ok": True}, "trace": {}, "error": None}
+        preference_calls.append((tool_name, dict(kwargs)))
+        raise AssertionError(f"unexpected tool: {tool_name}")
 
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
-    monkeypatch.setattr(executor_module, "interrupt", lambda payload: {"decision": "approve"})
 
-    result = run_agent_turn_in_graph(
+    result = run_agent_turn(
         AgentState(
             intent="preference_action",
-            message="喜欢这篇论文",
-            context={"selected_paper": {"arxiv_id": "2401.00001", "title": "RAG"}},
+            message="喜欢第二篇论文",
+            context={
+                "last_papers": [
+                    {"arxiv_id": "2401.00001", "title": "Search First"},
+                    {"arxiv_id": "2401.00002", "title": "Search Second"},
+                ],
+                "recommendations": [
+                    {"arxiv_id": "2501.00001", "title": "Rec First"},
+                    {"arxiv_id": "2501.00002", "title": "Rec Second"},
+                ],
+            },
         )
     )
 
     side_effects = {step.tool_name: step.side_effect_level for step in result.plan.steps}
     assert side_effects["update_preference_store"] == "persistent_write"
     assert not any("interest" in tool_name or "profile" in tool_name for tool_name in side_effects)
-    assert result.status == "success"
-    assert result.final_answer
-    assert preference_calls == [
-        {
-            "user_id": "",
-            "arxiv_id": "2401.00001",
-            "liked": True,
-            "paper": {"arxiv_id": "2401.00001", "title": "RAG", "query": None, "matched_by": None, "source": None},
-        }
-    ]
-    assert any(trace.event == "confirmation_approved" and trace.step_id == "update_preference_store" for trace in result.trace)
-    assert any(trace.step_id == "update_preference_store" and trace.event == "step_succeeded" for trace in result.trace)
+    assert result.status == "waiting_confirmation"
+    assert result.pending_confirmation is not None
+    assert result.pending_confirmation.request_type == "paper_target_confirmation"
+    assert result.pending_confirmation.tool_name == "resolve_preference_target"
+    assert len(result.pending_confirmation.candidates) == 2
+    hint = _reference_hint_from_trace(result, "resolve_preference_target")
+    assert hint["reference_type"] == "ordinal"
+    assert result.outputs["paper_reference"]["status"] == "need_confirmation"
+    assert len(result.outputs["paper_reference"]["candidates"]) == 2
+    assert preference_calls == []
+    assert not any(trace.event == "confirmation_approved" and trace.step_id == "update_preference_store" for trace in result.trace)
+    assert not any(trace.step_id == "update_preference_store" and trace.event == "step_succeeded" for trace in result.trace)
     assert not any("interest" in output_key or "profile" in output_key for output_key in result.outputs)
 
 

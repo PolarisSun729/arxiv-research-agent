@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from inspect import signature
 from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence
 
+from .fallbacks import build_fallback_record
 from .plan_validator import PlanValidator
 from .planner_context import build_planner_context, planner_context_debug
 from .schemas import ExecutablePlan, Goal, PlanRuntime, PlanStep, StepCondition, StepInputBinding, StepPolicy
@@ -16,6 +18,8 @@ from .state import AgentState
 from .tool_aware_planner import LLMPlanDraftGenerator, PlanDraftConverter, PlanDraftPlanningError, RuleBasedToolAwarePlanBuilder, ToolCandidateSelector
 from .tool_registry import PLANNER_TOOL_REGISTRY, ToolRegistry
 from .utils.state_utils import _compact_search_spec
+
+logger = logging.getLogger(__name__)
 
 
 SUPPORTED_GOAL_TYPES = {
@@ -29,6 +33,17 @@ SUPPORTED_GOAL_TYPES = {
     "unsupported",
 }
 
+PLANNER_RUNTIME_MODES = {
+    "rule_only",
+    "llm_preferred",
+    "llm_only_strict",
+    "demo_rule",
+}
+
+LEGACY_TEMPLATE_FALLBACK_SOURCE = "legacy_template_fallback"
+LEGACY_TEMPLATE_FALLBACK_PATH = "legacy_template_fallback_planner"
+UNSUPPORTED_FALLBACK_SOURCE = "unsupported_fallback"
+
 
 def _get_agent_planner_runtime_config() -> Dict[str, Any]:
     try:
@@ -37,14 +52,183 @@ def _get_agent_planner_runtime_config() -> Dict[str, Any]:
         return dict(get_agent_planner_runtime_config())
     except Exception:
         return {
+            "enable_rule_based_planner": True,
             "enable_tool_aware_planner": True,
+            "enable_experimental_llm_planner": False,
             "enable_llm_plan_draft": False,
             "llm_plan_timeout": 8,
             "llm_plan_max_steps": 8,
+            "enable_rule_fallback_after_llm_planner": True,
             "llm_plan_fallback_to_rule": True,
+            "enable_template_fallback_planner": True,
             "llm_plan_fallback_to_template": True,
             "expose_planner_debug": True,
         }
+
+
+def _normalized_planner_runtime_flags(planner_config: Mapping[str, Any]) -> Dict[str, Any]:
+    planner_mode = str(planner_config.get("planner_runtime_mode") or planner_config.get("planner_mode") or "llm_preferred").strip().lower()
+    if planner_mode not in PLANNER_RUNTIME_MODES:
+        planner_mode = "llm_preferred"
+
+    if planner_mode == "rule_only":
+        rule_planner_enabled = True
+        llm_draft_enabled = False
+        rule_fallback_enabled = False
+        template_fallback_enabled = True
+        strict_llm_failure = False
+    elif planner_mode == "llm_only_strict":
+        rule_planner_enabled = True
+        llm_draft_enabled = True
+        rule_fallback_enabled = False
+        template_fallback_enabled = False
+        strict_llm_failure = True
+    elif planner_mode == "demo_rule":
+        rule_planner_enabled = True
+        llm_draft_enabled = False
+        rule_fallback_enabled = False
+        template_fallback_enabled = True
+        strict_llm_failure = False
+    else:
+        rule_planner_enabled = bool(
+            planner_config.get("enable_rule_based_planner", planner_config.get("enable_tool_aware_planner", True))
+        )
+        llm_draft_enabled = bool(
+            planner_config.get("enable_experimental_llm_planner", planner_config.get("enable_llm_plan_draft", True))
+        )
+        rule_fallback_enabled = bool(
+            planner_config.get("enable_rule_fallback_after_llm_planner", planner_config.get("llm_plan_fallback_to_rule", True))
+        )
+        template_fallback_enabled = bool(
+            planner_config.get("enable_template_fallback_planner", planner_config.get("llm_plan_fallback_to_template", True))
+        )
+        strict_llm_failure = False
+    requested_path = "experimental_llm_draft_planner" if llm_draft_enabled else "rule_based_planner"
+    configured_fallback_order: List[str] = []
+    if llm_draft_enabled and rule_fallback_enabled:
+        configured_fallback_order.append("rule_based_planner")
+    if template_fallback_enabled:
+        configured_fallback_order.append(LEGACY_TEMPLATE_FALLBACK_PATH)
+    configured_fallback_order.append("unsupported_fallback_planner")
+    return {
+        "rule_planner_enabled": rule_planner_enabled,
+        "llm_draft_enabled": llm_draft_enabled,
+        "rule_fallback_enabled": rule_fallback_enabled,
+        "template_fallback_enabled": template_fallback_enabled,
+        "strict_llm_failure": strict_llm_failure,
+        "planner_runtime_mode": planner_mode,
+        "requested_path": requested_path,
+        "configured_primary_path": requested_path if rule_planner_enabled else "primary_planner_disabled",
+        "configured_fallback_order": configured_fallback_order,
+    }
+
+
+def _planner_path_from_source(source: Optional[str]) -> Optional[str]:
+    mapping = {
+        "fixed_template": LEGACY_TEMPLATE_FALLBACK_PATH,
+        "llm_tool_aware": "experimental_llm_draft_planner",
+        "tool_aware_rule_based": "rule_based_planner",
+        "fixed_template_fallback": LEGACY_TEMPLATE_FALLBACK_PATH,
+        LEGACY_TEMPLATE_FALLBACK_SOURCE: LEGACY_TEMPLATE_FALLBACK_PATH,
+        "unsupported_fallback": "unsupported_fallback_planner",
+    }
+    normalized = str(source or "").strip()
+    if not normalized:
+        return None
+    return mapping.get(normalized, normalized)
+
+
+def _build_capability_boundary(goal: Goal, plan: ExecutablePlan) -> Dict[str, Any]:
+    plan_tools = {step.tool_name for step in list(plan.steps or [])}
+    clarification_summary: Optional[Dict[str, Any]] = None
+    if {"analyze_ambiguity", "generate_clarification"}.intersection(plan_tools) or goal.goal_type == "unclear":
+        clarification_summary = {
+            "mode": "missing_information_analysis",
+            "analysis_tool": "analyze_ambiguity",
+            "question_tool": "generate_clarification",
+            "analysis_source": "rule_based_missing_information_analysis",
+            "question_source": "template_clarification_response",
+            "is_llm_backed": False,
+        }
+
+    recommendation_summary: Optional[Dict[str, Any]] = None
+    if "generate_recommendations" in plan_tools:
+        recommendation_summary = {
+            "mode": "agent_orchestration_with_service_core",
+            "agent_step": "generate_recommendations",
+            "backend_tool_name": "recommend_papers",
+            "core_service": "RecommendationService.recommend_papers",
+            "is_algorithm_core_in_agent": False,
+        }
+
+    return {
+        "clarification": clarification_summary,
+        "recommendation": recommendation_summary,
+    }
+
+
+def _finalize_plan_debug_and_metadata(
+    goal: Goal,
+    plan: ExecutablePlan,
+    planning_debug: Dict[str, Any],
+    runtime_flags: Mapping[str, Any],
+) -> tuple[ExecutablePlan, Dict[str, Any]]:
+    planner_summary = {
+        "configured_primary_path": runtime_flags.get("configured_primary_path"),
+        "configured_fallback_order": list(runtime_flags.get("configured_fallback_order") or []),
+        "planner_runtime_mode": runtime_flags.get("planner_runtime_mode"),
+        "requested_path": runtime_flags.get("requested_path"),
+        "selected_path": _planner_path_from_source(planning_debug.get("selected_plan_source")),
+        "final_path": _planner_path_from_source(planning_debug.get("final_plan_source")),
+        "rule_planner_enabled": bool(runtime_flags.get("rule_planner_enabled")),
+        "llm_draft_enabled": bool(runtime_flags.get("llm_draft_enabled")),
+        "llm_draft_experimental": bool(runtime_flags.get("llm_draft_enabled")),
+        "llm_draft_attempted": bool(planning_debug.get("llm_plan_attempted")),
+        "llm_draft_disabled_reason": None if bool(runtime_flags.get("llm_draft_enabled")) else "llm_planner_disabled",
+        "llm_draft_valid": bool(planning_debug.get("llm_plan_valid")),
+        "rule_fallback_enabled": bool(runtime_flags.get("rule_fallback_enabled")),
+        "rule_fallback_used": bool(planning_debug.get("rule_based_fallback_used")),
+        "template_fallback_enabled": bool(runtime_flags.get("template_fallback_enabled")),
+        "template_fallback_used": bool(planning_debug.get("template_fallback_used")),
+        "fallback_used": bool(planning_debug.get("fallback_used")),
+        "fallback_reason": planning_debug.get("fallback_reason"),
+        "fallback_record": dict(planning_debug.get("fallback_record") or {}),
+        "validation_status": planning_debug.get("validation_status"),
+        "strict_llm_failure": bool(runtime_flags.get("strict_llm_failure")),
+    }
+    capability_boundary = _build_capability_boundary(goal, plan)
+    planning_debug["planner_runtime_flags"] = dict(runtime_flags)
+    planning_debug["planner_summary"] = planner_summary
+    planning_debug["planner_requested_path"] = planner_summary["requested_path"]
+    planning_debug["planner_selected_path"] = planner_summary["selected_path"]
+    planning_debug["planner_final_path"] = planner_summary["final_path"]
+    planning_debug["clarification_summary"] = capability_boundary.get("clarification")
+    planning_debug["recommendation_summary"] = capability_boundary.get("recommendation")
+    metadata = dict(plan.metadata or {})
+    metadata["planner_summary"] = planner_summary
+    metadata["capability_boundary"] = capability_boundary
+    annotated_plan = plan.model_copy(update={"metadata": metadata})
+    planning_debug["execution_plan"] = annotated_plan.model_dump()
+    if planner_summary["template_fallback_used"]:
+        logger.warning(
+            "agent planner legacy template fallback used goal_type=%s requested=%s final=%s reason=%s code=%s",
+            goal.goal_type,
+            planner_summary["requested_path"],
+            planner_summary["final_path"],
+            planner_summary["fallback_reason"],
+            planner_summary["fallback_record"].get("code"),
+        )
+    else:
+        logger.info(
+            "agent planner selected path goal_type=%s requested=%s final=%s llm_attempted=%s llm_valid=%s fallback=%s",
+            goal.goal_type,
+            planner_summary["requested_path"],
+            planner_summary["final_path"],
+            planner_summary["llm_draft_attempted"],
+            planner_summary["llm_draft_valid"],
+            planner_summary["fallback_used"],
+        )
+    return annotated_plan, planning_debug
 
 
 def _resolve_generation_service() -> Any:
@@ -341,251 +525,92 @@ class GoalBuilder:
         )
 
 
-class PlanBuilder(Protocol):
-    def can_handle(self, goal: Goal) -> bool:
+class LegacyTemplateFallbackBuilder(Protocol):
+    def build(
+        self,
+        goal: Goal,
+        state: AgentState,
+        tool_registry: ToolRegistry,
+        *,
+        fallback_reason: str,
+    ) -> ExecutablePlan:
         ...
 
-    def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
-        ...
+
+# 兼容旧测试/外部导入的类型名；新业务规划不要继续扩展这个别名。
+PlanBuilder = LegacyTemplateFallbackBuilder
 
 
-class ArxivSearchPlanBuilder:
-    def can_handle(self, goal: Goal) -> bool:
-        return goal.goal_type == "arxiv_search"
+class LegacyTemplateFallbackPlanBuilder:
+    """最后兜底模板，只生成安全回复，不承载搜索/QA/推荐等业务规划。
 
-    def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
+    新 planner 能力应加到 LLM draft 或 RuleBasedToolAwarePlanBuilder；
+    这里保留的价值只是当主 planner 关闭、失败或上下文极端异常时，仍能给用户一个可解释回复。
+    """
+
+    def build(
+        self,
+        goal: Goal,
+        state: AgentState,
+        tool_registry: ToolRegistry,
+        *,
+        fallback_reason: str,
+    ) -> ExecutablePlan:
+        reason = _normalize_text(fallback_reason) or "template_fallback_used"
         steps = [
             _build_plan_step(
-                step_id="normalize_request",
-                action_type="write_state",
-                tool_name="normalize_request",
-                output_key="normalized_request",
-                tool_registry=tool_registry,
-                input_bindings=[
-                    _binding("intent", source_type="state", source_key="intent"),
-                    _binding("message", source_type="state", source_key="message"),
-                    _binding("search_spec", source_type="search_spec"),
-                ],
-            ),
-            _build_plan_step(
-                step_id="build_arxiv_search_spec",
-                action_type="search",
-                tool_name="build_arxiv_search_spec",
-                output_key="search_spec",
-                tool_registry=tool_registry,
-                input_bindings=[_binding("normalized_request", source_type="step_output", step_id="normalize_request")],
-                depends_on=["normalize_request"],
-            ),
-            _build_plan_step(
-                step_id="search_arxiv",
-                action_type="search",
-                tool_name="search_arxiv",
-                output_key="arxiv_results",
-                tool_registry=tool_registry,
-                input_bindings=[_binding("search_spec", source_type="step_output", step_id="build_arxiv_search_spec")],
-                depends_on=["build_arxiv_search_spec"],
-                retry_policy=StepPolicy(policy_type="retry", mode="allow_search_relaxation", max_attempts=3),
-            ),
-            _build_plan_step(
-                step_id="validate_arxiv_results",
-                action_type="validate",
-                tool_name="validate_arxiv_results",
-                output_key="arxiv_result_quality",
-                tool_registry=tool_registry,
-                input_bindings=[_binding("arxiv_results", source_type="step_output", step_id="search_arxiv")],
-                depends_on=["search_arxiv"],
-            ),
-            _build_plan_step(
-                step_id="personalize_paper_results",
-                action_type="rerank",
-                tool_name="personalize_paper_results",
-                output_key="ranked_papers",
-                tool_registry=tool_registry,
-                input_bindings=[
-                    _binding("arxiv_results", source_type="step_output", step_id="search_arxiv"),
-                    _binding("user_memory_summary", source_type="context", source_key="user_memory_summary", required=False),
-                    _binding("research_profile", source_type="context", source_key="research_profile", required=False),
-                ],
-                depends_on=["search_arxiv"],
-            ),
-            _build_plan_step(
-                step_id="synthesize_arxiv_response",
+                step_id="generate_fallback_response",
                 action_type="answer",
-                tool_name="synthesize_arxiv_response",
+                tool_name="generate_fallback_response",
                 output_key="final_answer",
                 tool_registry=tool_registry,
-                input_bindings=[
-                    _binding("ranked_papers", source_type="step_output", step_id="personalize_paper_results", required=False),
-                    _binding("arxiv_result_quality", source_type="step_output", step_id="validate_arxiv_results"),
-                ],
-                depends_on=["validate_arxiv_results", "personalize_paper_results"],
-            ),
-        ]
-        return _make_plan(goal, steps=steps)
-
-
-class PaperQAPlanBuilder:
-    def can_handle(self, goal: Goal) -> bool:
-        return goal.goal_type == "paper_qa"
-
-    def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
-        answer_shape = _paper_qa_answer_shape(goal.intent or state.intent)
-        steps = [
-            _build_plan_step(
-                step_id="resolve_paper",
-                action_type="retrieve",
-                tool_name="resolve_paper",
-                output_key="paper_ref",
-                tool_registry=tool_registry,
-                # 目标论文解析既要看当前选中论文，也要看 last_papers；
-                # 显式绑定完整 context，避免“第二篇”这类序号引用退回到默认 selected_paper。
+                # legacy fallback 不能再猜业务参数，只把原始请求和结构化原因交给安全回复工具。
                 input_bindings=[
                     _binding("message", source_type="state", source_key="message"),
-                    _binding("selected_paper", source_type="context", source_key="selected_paper", required=False),
-                    _binding("context", source_type="state", source_key="context", required=False),
+                    _binding("fallback_reason", source_type="literal", value=reason, required=False),
                 ],
-            ),
-            _build_plan_step(step_id="check_paper_index", action_type="validate", tool_name="check_paper_index", output_key="paper_index_status", tool_registry=tool_registry, input_bindings=[_binding("paper_ref", source_type="step_output", step_id="resolve_paper")], depends_on=["resolve_paper"]),
-            # Agent 只负责调度真实 PaperQA 工具；检索、重写、rerank 和 grounding 校验均由 PaperQAService 内部完成。
-            _build_plan_step(step_id=answer_shape["step_id"], action_type=answer_shape["action_type"], tool_name="answer_paper_question", output_key="paper_qa_result", tool_registry=tool_registry, input_bindings=[_binding("paper_ref", source_type="step_output", step_id="resolve_paper"), _binding("message", source_type="state", source_key="message"), _binding("qa_mode", source_type="literal", value=answer_shape["qa_mode"], required=False)], depends_on=["resolve_paper", "check_paper_index"]),
+            )
         ]
-        return _make_plan(goal, steps=steps)
+        plan = _make_plan(goal, steps=steps)
+        metadata = dict(plan.metadata or {})
+        metadata.update(
+            {
+                "planner_version": "legacy-template-fallback-v1",
+                "legacy_template_fallback": True,
+                "legacy_template_fallback_reason": reason,
+                "source": LEGACY_TEMPLATE_FALLBACK_SOURCE,
+                # 这里显式写入维护边界，避免后续把新业务分支再塞回模板 builder。
+                "maintenance_boundary": "do_not_extend_for_new_business_capabilities",
+            }
+        )
+        return plan.model_copy(update={"metadata": metadata})
 
 
-class RecommendationPlanBuilder:
-    def can_handle(self, goal: Goal) -> bool:
-        return goal.goal_type == "recommendation"
-
-    def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
-        steps = [
-            _build_plan_step(step_id="load_user_profile", action_type="retrieve", tool_name="load_user_profile", output_key="recommendation_profile", tool_registry=tool_registry, input_bindings=[_binding("context", source_type="state", source_key="context", required=False)]),
-            _build_plan_step(step_id="load_candidate_papers", action_type="retrieve", tool_name="load_candidate_papers", output_key="candidate_papers", tool_registry=tool_registry, input_bindings=[_binding("recommendation_profile", source_type="step_output", step_id="load_user_profile")], depends_on=["load_user_profile"]),
-            _build_plan_step(step_id="generate_recommendations", action_type="search", tool_name="generate_recommendations", output_key="recommendation_result", tool_registry=tool_registry, input_bindings=[_binding("recommendation_profile", source_type="step_output", step_id="load_user_profile"), _binding("candidate_papers", source_type="step_output", step_id="load_candidate_papers", required=False)], depends_on=["load_user_profile", "load_candidate_papers"]),
-            _build_plan_step(step_id="validate_recommendations", action_type="validate", tool_name="validate_recommendations", output_key="validated_recommendations", tool_registry=tool_registry, input_bindings=[_binding("recommendation_result", source_type="step_output", step_id="generate_recommendations")], depends_on=["generate_recommendations"]),
-            _build_plan_step(step_id="explain_recommendations", action_type="answer", tool_name="explain_recommendations", output_key="final_answer", tool_registry=tool_registry, input_bindings=[_binding("validated_recommendations", source_type="step_output", step_id="validate_recommendations")], depends_on=["validate_recommendations"]),
-        ]
-        return _make_plan(goal, steps=steps)
-
-
-class PreferenceActionPlanBuilder:
-    def can_handle(self, goal: Goal) -> bool:
-        return goal.goal_type == "preference_action"
-
-    def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
-        # 偏好计划只声明真实发生的持久化写入；兴趣画像/向量重建应走显式推荐接口，
-        # 不能在 Agent 里追加没有实际同步实现的“成功步骤”。
-        steps = [
-            _build_plan_step(
-                step_id="resolve_preference_target",
-                action_type="retrieve",
-                tool_name="resolve_preference_target",
-                output_key="paper_reference",
-                tool_registry=tool_registry,
-                # 偏好写入同样支持“第一篇/第二篇”，必须让解析器拿到最近论文列表。
-                input_bindings=[
-                    _binding("message", source_type="state", source_key="message"),
-                    _binding("selected_paper", source_type="context", source_key="selected_paper", required=False),
-                    _binding("context", source_type="state", source_key="context", required=False),
-                ],
-            ),
-            _build_plan_step(step_id="update_preference_store", action_type="write_state", tool_name="update_preference_store", output_key="preference_action_result", tool_registry=tool_registry, input_bindings=[_binding("paper_reference", source_type="step_output", step_id="resolve_preference_target"), _binding("message", source_type="state", source_key="message")], depends_on=["resolve_preference_target"], side_effect_level="persistent_write"),
-            _build_plan_step(step_id="verify_preference_update", action_type="validate", tool_name="verify_preference_update", output_key="verified_preference_update", tool_registry=tool_registry, input_bindings=[_binding("preference_action_result", source_type="step_output", step_id="update_preference_store")], depends_on=["update_preference_store"]),
-            _build_plan_step(step_id="synthesize_preference_response", action_type="answer", tool_name="synthesize_preference_response", output_key="final_answer", tool_registry=tool_registry, input_bindings=[_binding("verified_preference_update", source_type="step_output", step_id="verify_preference_update")], depends_on=["verify_preference_update"]),
-        ]
-        return _make_plan(goal, steps=steps)
-
-
-class ClarificationPlanBuilder:
-    def can_handle(self, goal: Goal) -> bool:
-        return goal.goal_type == "unclear"
-
-    def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
-        steps = [
-            _build_plan_step(step_id="analyze_ambiguity", action_type="clarify", tool_name="analyze_ambiguity", output_key="missing_information", tool_registry=tool_registry, input_bindings=[_binding("message", source_type="state", source_key="message")]),
-            _build_plan_step(step_id="generate_clarification", action_type="answer", tool_name="generate_clarification", output_key="final_answer", tool_registry=tool_registry, input_bindings=[_binding("missing_information", source_type="step_output", step_id="analyze_ambiguity")], depends_on=["analyze_ambiguity"]),
-        ]
-        return _make_plan(goal, steps=steps)
-
-
-class UnsupportedPlanBuilder:
-    def can_handle(self, goal: Goal) -> bool:
-        return goal.goal_type == "unsupported"
-
-    def build(self, goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> ExecutablePlan:
-        steps = [
-            _build_plan_step(step_id="generate_fallback_response", action_type="answer", tool_name="generate_fallback_response", output_key="final_answer", tool_registry=tool_registry, input_bindings=[_binding("message", source_type="state", source_key="message")]),
-        ]
-        return _make_plan(goal, steps=steps)
-
-
-class PlanBuilderRegistry:
-    """根据 goal_type 分发到对应 PlanBuilder。"""
+class LegacyTemplateFallbackRegistry:
+    """保留注册表形态只是为了兼容旧入口；当前只允许一个最小 fallback builder。"""
 
     def __init__(self) -> None:
-        self._builders: List[PlanBuilder] = []
+        self._builder = LegacyTemplateFallbackPlanBuilder()
 
-    def register(self, builder: PlanBuilder) -> None:
-        self._builders.append(builder)
-
-    def get(self, goal_type: str) -> PlanBuilder:
-        normalized_goal_type = _normalize_intent(goal_type)
-        for builder in self._builders:
-            if builder.can_handle(Goal(goal_type=normalized_goal_type)):
-                return builder
-        raise ValueError(f"No plan builder registered for goal_type={goal_type}")
+    def get(self, _goal_type: str) -> LegacyTemplateFallbackPlanBuilder:
+        return self._builder
 
 
-PLAN_BUILDER_REGISTRY = PlanBuilderRegistry()
-for builder in [
-    ArxivSearchPlanBuilder(),
-    PaperQAPlanBuilder(),
-    RecommendationPlanBuilder(),
-    PreferenceActionPlanBuilder(),
-    ClarificationPlanBuilder(),
-    UnsupportedPlanBuilder(),
-]:
-    PLAN_BUILDER_REGISTRY.register(builder)
+# 旧名称只作为兼容壳保留；看到它不代表存在多套业务 PlanBuilder。
+PlanBuilderRegistry = LegacyTemplateFallbackRegistry
+PLAN_BUILDER_REGISTRY = LegacyTemplateFallbackRegistry()
 
 
-def _build_fixed_template_plan(goal: Goal, state: AgentState, tool_registry: ToolRegistry) -> tuple[ExecutablePlan, PlanBuilder]:
+def _build_legacy_template_fallback_plan(
+    goal: Goal,
+    state: AgentState,
+    tool_registry: ToolRegistry,
+    *,
+    reason: str,
+) -> tuple[ExecutablePlan, LegacyTemplateFallbackPlanBuilder]:
     builder = PLAN_BUILDER_REGISTRY.get(goal.goal_type or "unsupported")
-    plan = builder.build(goal, state, tool_registry)
+    plan = builder.build(goal, state, tool_registry, fallback_reason=reason)
     return plan, builder
-
-
-def _fixed_template_debug(goal: Goal, plan: ExecutablePlan, builder: PlanBuilder, *, planner_mode: str, tool_registry: ToolRegistry) -> Dict[str, Any]:
-    return {
-        "planner_mode": planner_mode,
-        "goal": goal.model_dump(),
-        "candidate_tools": [],
-        "excluded_tools": [],
-        "draft_steps": [],
-        "selected_steps": _debug_steps_from_plan(plan),
-        "skipped_steps": [],
-        "skipped_tools": [],
-        "llm_plan_attempted": False,
-        "llm_plan_valid": False,
-        "llm_plan_invalid_reasons": [],
-        "rule_based_fallback_used": False,
-        "template_fallback_used": False,
-        "validation_status": "passed",
-        "fallback_used": False,
-        "fallback_reason": None,
-        "final_plan_source": "fixed_template",
-        "selected_plan_source": "fixed_template",
-        "tool_risk_summary": {},
-        "tool_contract_source": _tool_contract_source_summary(plan.steps),
-        "tool_contract_matrix": tool_registry.tool_contract_matrix(),
-        "confirmation_required_steps": _confirmation_required_step_ids(plan),
-        "plan_builder": builder.__class__.__name__,
-        "execution_plan": plan.model_dump(),
-    }
-
-
-def _is_tool_aware_planner_enabled(enable_tool_aware_planner: Optional[bool]) -> bool:
-    if enable_tool_aware_planner is not None:
-        return bool(enable_tool_aware_planner)
-    return bool(_get_agent_planner_runtime_config().get("enable_tool_aware_planner", False))
 
 
 def _debug_steps_from_plan(plan: ExecutablePlan) -> List[Dict[str, Any]]:
@@ -645,23 +670,32 @@ def _fallback_to_template_or_unsupported(
     state: AgentState,
     tool_registry: ToolRegistry,
     planning_debug: Dict[str, Any],
+    runtime_flags: Mapping[str, Any],
     *,
     reason: str,
     allow_template: bool,
 ) -> tuple[Goal, ExecutablePlan, Dict[str, Any]]:
     if allow_template:
         try:
-            plan, builder = _build_fixed_template_plan(goal, state, tool_registry)
-            # 固定模板是最后业务兜底，也必须经过 Validator，不能因为 fallback 就绕过安全边界。
+            plan, builder = _build_legacy_template_fallback_plan(goal, state, tool_registry, reason=reason)
+            # legacy 模板是最后安全兜底，也必须经过 Validator，不能因为 fallback 就绕过执行边界。
             PlanValidator().validate(plan, tool_registry)
+            fallback_record = build_fallback_record(
+                reason,
+                stage="planner",
+                source=LEGACY_TEMPLATE_FALLBACK_SOURCE,
+                detail={"goal_type": goal.goal_type, "intent": goal.intent},
+            )
             planning_debug.update(
                 {
                     "validation_status": "failed",
+                    "fallback_validation_status": "passed",
                     "fallback_used": True,
                     "fallback_reason": reason,
+                    "fallback_record": fallback_record,
                     "template_fallback_used": True,
-                    "final_plan_source": "fixed_template_fallback",
-                    "selected_plan_source": "fixed_template_fallback",
+                    "final_plan_source": LEGACY_TEMPLATE_FALLBACK_SOURCE,
+                    "selected_plan_source": LEGACY_TEMPLATE_FALLBACK_SOURCE,
                     "plan_builder": builder.__class__.__name__,
                     "tool_contract_source": _tool_contract_source_summary(plan.steps),
                     "tool_contract_matrix": tool_registry.tool_contract_matrix(),
@@ -669,21 +703,35 @@ def _fallback_to_template_or_unsupported(
                     "execution_plan": plan.model_dump(),
                 }
             )
+            plan, planning_debug = _finalize_plan_debug_and_metadata(goal, plan, planning_debug, runtime_flags)
             return goal, plan, planning_debug
         except Exception as template_exc:
             reason = f"{reason}; template fallback failed: {template_exc}"
 
     unsupported_goal = goal.model_copy(update={"goal_type": "unsupported", "intent": "unsupported", "risk_level": "low"})
-    plan, builder = _build_fixed_template_plan(unsupported_goal, state.model_copy(update={"intent": "unsupported"}), tool_registry)
+    plan, builder = _build_legacy_template_fallback_plan(
+        unsupported_goal,
+        state.model_copy(update={"intent": "unsupported"}),
+        tool_registry,
+        reason=reason,
+    )
     PlanValidator().validate(plan, tool_registry)
+    fallback_record = build_fallback_record(
+        reason,
+        stage="planner",
+        source=UNSUPPORTED_FALLBACK_SOURCE,
+        detail={"goal_type": goal.goal_type, "intent": goal.intent},
+    )
     planning_debug.update(
         {
             "validation_status": "failed",
+            "fallback_validation_status": "passed",
             "fallback_used": True,
             "fallback_reason": reason,
+            "fallback_record": fallback_record,
             "template_fallback_used": bool(allow_template),
-            "final_plan_source": "unsupported_fallback",
-            "selected_plan_source": "unsupported_fallback",
+            "final_plan_source": UNSUPPORTED_FALLBACK_SOURCE,
+            "selected_plan_source": UNSUPPORTED_FALLBACK_SOURCE,
             "plan_builder": builder.__class__.__name__,
             "tool_contract_source": _tool_contract_source_summary(plan.steps),
             "tool_contract_matrix": tool_registry.tool_contract_matrix(),
@@ -691,7 +739,21 @@ def _fallback_to_template_or_unsupported(
             "execution_plan": plan.model_dump(),
         }
     )
+    plan, planning_debug = _finalize_plan_debug_and_metadata(unsupported_goal, plan, planning_debug, runtime_flags)
     return unsupported_goal, plan, planning_debug
+
+
+def _raise_strict_planner_failure(
+    planning_debug: Mapping[str, Any],
+    *,
+    reason: str,
+) -> None:
+    llm_summary = dict(planning_debug.get("llm_plan_validation_summary") or {})
+    invalid_reasons = list(planning_debug.get("llm_plan_invalid_reasons") or [])
+    suffix = f" validation={llm_summary}" if llm_summary else ""
+    if invalid_reasons:
+        suffix = f" invalid_reasons={invalid_reasons}{suffix}"
+    raise PlanDraftPlanningError(f"llm_only_strict planning failed: {reason}{suffix}")
 
 
 def build_executable_plan(
@@ -729,16 +791,79 @@ def build_executable_plan_for_goal(
     而不是再次从 state 推断，避免图上 goal 节点变成只做展示的空节点。
     """
 
-    if not _is_tool_aware_planner_enabled(enable_tool_aware_planner):
-        plan, builder = _build_fixed_template_plan(goal, state, tool_registry)
-        # 固定模板路径保持原行为，但仍通过统一校验器守住 Executor 入口边界。
-        PlanValidator().validate(plan, tool_registry)
-        return goal, plan, _fixed_template_debug(goal, plan, builder, planner_mode="fixed_template", tool_registry=tool_registry)
+    planner_config = _get_agent_planner_runtime_config()
+    runtime_flags = _normalized_planner_runtime_flags(planner_config)
+    if enable_tool_aware_planner is not None:
+        runtime_flags["rule_planner_enabled"] = bool(enable_tool_aware_planner)
+    if enable_llm_plan_draft is not None:
+        runtime_flags["llm_draft_enabled"] = bool(enable_llm_plan_draft)
+        # 显式调用参数优先于运行模式的默认值：
+        # 例如测试或灰度入口希望“临时打开 LLM draft 并允许正常 fallback”，
+        # 不应继续沿用 rule_only/demo_rule 的禁用语义。
+        if bool(enable_llm_plan_draft):
+            runtime_flags["rule_fallback_enabled"] = bool(
+                planner_config.get("enable_rule_fallback_after_llm_planner", planner_config.get("llm_plan_fallback_to_rule", True))
+            )
+            runtime_flags["template_fallback_enabled"] = bool(
+                planner_config.get("enable_template_fallback_planner", planner_config.get("llm_plan_fallback_to_template", True))
+            )
+            runtime_flags["strict_llm_failure"] = False
+    runtime_flags["requested_path"] = "experimental_llm_draft_planner" if runtime_flags["llm_draft_enabled"] else "rule_based_planner"
+    runtime_flags["configured_primary_path"] = runtime_flags["requested_path"] if runtime_flags["rule_planner_enabled"] else "primary_planner_disabled"
+
+    if not bool(runtime_flags.get("rule_planner_enabled")):
+        reason = "tool_aware_planner_disabled"
+        # 配置关闭主 planner 时也只允许进入 legacy fallback，避免模板重新成为主扩展路径。
+        planning_debug = {
+            "planner_mode": "primary_planner_disabled",
+            "goal": goal.model_dump(),
+            "candidate_tools": [],
+            "excluded_tools": [],
+            "draft_steps": [],
+            "selected_steps": [],
+            "skipped_steps": [],
+            "skipped_tools": [],
+            "llm_plan_raw_summary": {},
+            "llm_plan_attempted": False,
+            "llm_plan_valid": False,
+            "llm_plan_invalid_reasons": [],
+            "llm_plan_validation_summary": {},
+            "rule_based_fallback_used": False,
+            "template_fallback_used": False,
+            "validation_status": "not_started",
+            "fallback_used": False,
+            "fallback_reason": reason,
+            "fallback_record": build_fallback_record(
+                reason,
+                stage="planner",
+                source="build_executable_plan_for_goal",
+                detail={"planner_runtime_mode": runtime_flags.get("planner_runtime_mode")},
+            ),
+            "final_plan_source": None,
+            "selected_plan_source": None,
+            "planner_context": {},
+            "tool_selection": {},
+            "tool_risk_summary": {},
+            "tool_contract_source": {},
+            "tool_contract_matrix": tool_registry.tool_contract_matrix(),
+            "confirmation_required_steps": [],
+            "planner_runtime_flags": dict(runtime_flags),
+        }
+        return _fallback_to_template_or_unsupported(
+            goal,
+            state,
+            tool_registry,
+            planning_debug,
+            runtime_flags,
+            reason=reason,
+            allow_template=bool(runtime_flags.get("template_fallback_enabled")),
+        )
 
     planner_config = _get_agent_planner_runtime_config()
-    llm_enabled = bool(planner_config.get("enable_llm_plan_draft", False)) if enable_llm_plan_draft is None else bool(enable_llm_plan_draft)
-    llm_fallback_to_rule = bool(planner_config.get("llm_plan_fallback_to_rule", True))
-    llm_fallback_to_template = bool(planner_config.get("llm_plan_fallback_to_template", True))
+    llm_enabled = bool(runtime_flags.get("llm_draft_enabled"))
+    llm_fallback_to_rule = bool(runtime_flags.get("rule_fallback_enabled", True))
+    llm_fallback_to_template = bool(runtime_flags.get("template_fallback_enabled", True))
+    strict_llm_failure = bool(runtime_flags.get("strict_llm_failure"))
     expose_planner_debug = bool(planner_config.get("expose_planner_debug", True))
 
     selector = ToolCandidateSelector(tool_registry)
@@ -756,14 +881,17 @@ def build_executable_plan_for_goal(
             "selected_steps": [],
             "skipped_steps": [],
             "skipped_tools": [],
+            "llm_plan_raw_summary": {},
             "llm_plan_attempted": False,
             "llm_plan_valid": False,
             "llm_plan_invalid_reasons": [],
+            "llm_plan_validation_summary": {},
             "rule_based_fallback_used": False,
             "template_fallback_used": False,
             "validation_status": "not_started",
             "fallback_used": False,
             "fallback_reason": None,
+            "fallback_record": {},
             "final_plan_source": None,
             "selected_plan_source": None,
             "planner_context": {"build_error": str(exc)},
@@ -772,13 +900,15 @@ def build_executable_plan_for_goal(
             "tool_contract_source": {},
             "tool_contract_matrix": tool_registry.tool_contract_matrix(),
             "confirmation_required_steps": [],
+            "planner_runtime_flags": dict(runtime_flags),
         }
         return _fallback_to_template_or_unsupported(
             goal,
             state,
             tool_registry,
             planning_debug,
-            reason=f"planner_context_build_failed: {exc}",
+            runtime_flags,
+            reason=f"missing_required_context: planner_context_build_failed: {exc}",
             allow_template=llm_fallback_to_template,
         )
 
@@ -794,14 +924,17 @@ def build_executable_plan_for_goal(
         "selected_steps": [],
         "skipped_steps": [],
         "skipped_tools": [],
+        "llm_plan_raw_summary": {},
         "llm_plan_attempted": False,
         "llm_plan_valid": False,
         "llm_plan_invalid_reasons": [],
+        "llm_plan_validation_summary": {},
         "rule_based_fallback_used": False,
         "template_fallback_used": False,
         "validation_status": "not_started",
         "fallback_used": False,
         "fallback_reason": None,
+        "fallback_record": {},
         "final_plan_source": None,
         "selected_plan_source": None,
         "tool_selection": selection.model_dump(),
@@ -809,16 +942,26 @@ def build_executable_plan_for_goal(
         "tool_contract_source": {},
         "tool_contract_matrix": tool_registry.tool_contract_matrix(),
         "confirmation_required_steps": [],
+        "planner_runtime_flags": dict(runtime_flags),
     }
 
     if not candidate_tool_names:
-        # 候选为空说明动态筛选边界过窄或上下文不足；此时保留 debug，再交给固定模板兜底。
+        if llm_enabled and strict_llm_failure:
+            planning_debug["fallback_reason"] = "planner_context_candidate_tools_empty"
+            planning_debug["fallback_record"] = build_fallback_record(
+                "planner_context_candidate_tools_empty",
+                stage="planner",
+                source="build_executable_plan_for_goal",
+            )
+            _raise_strict_planner_failure(planning_debug, reason="planner_context_candidate_tools_empty")
+        # 候选为空说明动态筛选边界过窄或上下文不足；此时保留 debug，再交给 legacy 模板兜底。
         return _fallback_to_template_or_unsupported(
             goal,
             state,
             tool_registry,
             planning_debug,
-            reason="planner_context_candidate_tools_empty",
+            runtime_flags,
+            reason="missing_required_context: planner_context_candidate_tools_empty",
             allow_template=llm_fallback_to_template,
         )
 
@@ -833,12 +976,21 @@ def build_executable_plan_for_goal(
             draft = llm_generator.generate(goal, state, selection.candidate_tools, tool_registry, planner_context)
             if expose_planner_debug:
                 planning_debug["raw_llm_plan"] = llm_generator.last_debug.get("raw_llm_plan")
+            planning_debug["llm_plan_raw_summary"] = dict(llm_generator.last_debug.get("raw_llm_plan_summary") or {})
             planning_debug["draft_steps"] = [step.model_dump() for step in list(draft.steps or [])]
             plan = PlanDraftConverter(tool_registry).convert(draft, goal, allowed_tool_names=candidate_tool_names)
             PlanValidator().validate(plan, tool_registry)
             planning_debug.update(
                 {
                     "llm_plan_valid": True,
+                    "llm_plan_validation_summary": dict(
+                        llm_generator.last_debug.get("validation_summary")
+                        or {
+                            "status": "passed",
+                            "validator_stack": ["llm_json_only_parse", "PlanDraft.model_validate", "llm_draft_normalization", "PlanDraftConverter", "PlanValidator"],
+                            "reasons": [],
+                        }
+                    ),
                     "validation_status": "passed",
                     "final_plan_source": "llm_tool_aware",
                     "selected_plan_source": "llm_tool_aware",
@@ -848,18 +1000,41 @@ def build_executable_plan_for_goal(
                     "execution_plan": plan.model_dump(),
                 }
             )
+            plan, planning_debug = _finalize_plan_debug_and_metadata(goal, plan, planning_debug, runtime_flags)
             return goal, plan, planning_debug
         except Exception as exc:
-            invalid_reason = str(exc)
+            invalid_reason = f"llm_planner_validation_failed: {exc}"
             planning_debug["llm_plan_valid"] = False
             planning_debug["llm_plan_invalid_reasons"] = [invalid_reason]
             planning_debug["fallback_reason"] = invalid_reason
+            planning_debug["fallback_record"] = build_fallback_record(
+                invalid_reason,
+                stage="planner",
+                source="LLMPlanDraftGenerator",
+                detail={"planner_runtime_mode": runtime_flags.get("planner_runtime_mode")},
+            )
+            planning_debug["llm_plan_validation_summary"] = dict(
+                getattr(locals().get("llm_generator", None), "last_debug", {}).get("validation_summary")
+                or {
+                    "status": "failed",
+                    "validator_stack": ["llm_json_only_parse", "PlanDraft.model_validate", "llm_draft_normalization", "PlanDraftConverter", "PlanValidator"],
+                    "reasons": [invalid_reason],
+                }
+            )
+            if expose_planner_debug:
+                planning_debug["raw_llm_plan"] = getattr(locals().get("llm_generator", None), "last_debug", {}).get("raw_llm_plan")
+            planning_debug["llm_plan_raw_summary"] = dict(
+                getattr(locals().get("llm_generator", None), "last_debug", {}).get("raw_llm_plan_summary") or {}
+            )
+            if strict_llm_failure:
+                _raise_strict_planner_failure(planning_debug, reason=invalid_reason)
             if not llm_fallback_to_rule:
                 return _fallback_to_template_or_unsupported(
                     goal,
                     state,
                     tool_registry,
                     planning_debug,
+                    runtime_flags,
                     reason=invalid_reason,
                     allow_template=llm_fallback_to_template,
                 )
@@ -877,7 +1052,7 @@ def build_executable_plan_for_goal(
             }
         )
         if draft.fallback_reason:
-            # 规则型 builder 可以显式声明“不要执行这个草稿”，统一交给固定模板兜底。
+            # 规则型 builder 可以显式声明“不要执行这个草稿”，统一交给 legacy 模板兜底。
             raise PlanDraftPlanningError(draft.fallback_reason)
         planning_debug["draft_steps"] = [step.model_dump() for step in list(draft.steps or [])]
         plan = PlanDraftConverter(tool_registry).convert(draft, goal, allowed_tool_names=candidate_tool_names)
@@ -893,14 +1068,32 @@ def build_executable_plan_for_goal(
                 "execution_plan": plan.model_dump(),
             }
         )
+        if goal.goal_type == "unsupported":
+            # unsupported 是规则 planner 主动选择的安全回复，不是 legacy 模板兜底；
+            # 仍写入结构化原因，避免 trace 读者从工具名猜测 fallback 语义。
+            planning_debug.update(
+                {
+                    "fallback_used": True,
+                    "fallback_reason": "unsupported_goal",
+                    "fallback_record": build_fallback_record(
+                        "unsupported_goal",
+                        stage="planner",
+                        source="tool_aware_rule_based",
+                        detail={"goal_type": goal.goal_type, "intent": goal.intent},
+                    ),
+                    "unsupported_fallback_used": True,
+                }
+            )
+        plan, planning_debug = _finalize_plan_debug_and_metadata(goal, plan, planning_debug, runtime_flags)
         return goal, plan, planning_debug
     except Exception as exc:
-        fallback_reason = str(exc)
+        fallback_reason = f"tool_aware_planner_failed: {exc}"
         return _fallback_to_template_or_unsupported(
             goal,
             state,
             tool_registry,
             planning_debug,
+            runtime_flags,
             reason=fallback_reason,
             allow_template=llm_fallback_to_template,
         )
@@ -908,6 +1101,8 @@ def build_executable_plan_for_goal(
 
 __all__ = [
     "GoalBuilder",
+    "LegacyTemplateFallbackPlanBuilder",
+    "LegacyTemplateFallbackRegistry",
     "PlanBuilder",
     "PlanBuilderRegistry",
     "PLAN_BUILDER_REGISTRY",

@@ -184,7 +184,7 @@
    - endpoint：`get_paper_qa_status`、`diagnose_paper_qa`、`download_latest_qa_trace`、`create_paper_qa_index`、`get_latest_paper_qa_index_job`、`get_paper_qa_index_job`、`list_paper_chat_sessions`、`get_recent_paper_chat_session`、`create_paper_chat_session`、`get_paper_chat_session`、`get_paper_chat_messages`、`clear_paper_chat_session`、`delete_paper_chat_session`、`list_paper_notes`、`create_paper_note`、`update_paper_note`、`delete_paper_note`、`export_paper_notes_markdown`、`qa_paper`、`qa_paper_stream`
  - `user_router.py`
    - 请求模型：`PaperActionRequest`、`ResearchProfileRequest`
-   - endpoint：`upsert_user_preferences`、`get_user_preferences`、`like_paper`、`dislike_paper`、`record_paper_action`、`remove_paper_action`、`get_user_paper_actions`、`get_user_research_profile`、`upsert_user_research_profile`、`patch_user_research_profile`、`remove_like`、`remove_dislike`、`generate_user_interest_vector`、`get_user_interest_vector`、`recommend_papers`
+   - endpoint：`legacy_post_user_preferences`、`get_user_preferences`、`like_paper`、`dislike_paper`、`record_paper_action`、`remove_paper_action`、`get_user_paper_actions`、`get_user_research_profile`、`upsert_user_research_profile`、`patch_user_research_profile`、`remove_like`、`remove_dislike`、`generate_user_interest_vector`、`get_user_interest_vector`、`recommend_papers`
  - `chunk_router.py`
    - `list_chunk_files`
    - `get_chunk_file`
@@ -704,30 +704,33 @@
  ### 5.5 user endpoints
 
  #### `POST /api/user/preferences`
- - 返回指定用户偏好
+ - Deprecated 兼容读取入口，返回 `deprecated=true` 和 successor
+ - 响应头包含 `Deprecation: true`
  - DB 异常
 
  #### `GET /api/user/preferences/{user_id}`
  - 返回用户偏好
  - DB 异常
 
- #### `POST /api/user/like-paper`
- - 成功记录正反馈
- - 传 paper payload 时透传
- - service 异常
+#### `POST /api/user/like-paper`
+- 成功记录正反馈，状态权威来源是 `user_liked_papers`
+- 传 paper payload 时透传
+- service 异常
 
- #### `POST /api/user/dislike-paper`
- - 成功记录负反馈
- - service 异常
+#### `POST /api/user/dislike-paper`
+- 成功记录负反馈，状态权威来源是 `user_disliked_papers`
+- service 异常
 
- #### `POST /api/user/paper-action`
- - 成功记录通用行为
- - metadata 透传
- - service 异常
+#### `POST /api/user/paper-action`
+- 成功记录弱行为
+- metadata 透传
+- `action_type=like/dislike/liked/disliked` 返回校验错误，提示使用强偏好接口
+- service 异常
 
- #### `DELETE /api/user/paper-action`
- - 删除成功
- - 未找到返回 404
+#### `DELETE /api/user/paper-action`
+- 删除成功
+- 未找到返回 404
+- `action_type=like/dislike` 返回 400，提示使用强偏好删除接口
 
  #### `GET /api/user/paper-actions/{user_id}`
  - 返回 actions 和 action_map
@@ -745,13 +748,15 @@
  - 局部 patch 成功
  - 空 patch 行为
 
- #### `DELETE /api/user/like-paper`
- - 移除成功
- - 失败路径
+#### `DELETE /api/user/like-paper`
+- 移除成功
+- 停用 liked profile event，不依赖 `user_paper_actions`
+- 失败路径
 
- #### `DELETE /api/user/dislike-paper`
- - 移除成功
- - 失败路径
+#### `DELETE /api/user/dislike-paper`
+- 移除成功
+- 停用 disliked profile event，不依赖 `user_paper_actions`
+- 失败路径
 
  #### `POST /api/user/generate-interest-vector`
  - 生成成功
@@ -766,17 +771,25 @@
  - top_n / max_age_months 透传
  - service 异常
 
- ### 5.6 chunk endpoints
+ ### 5.6 debug chunk endpoints
 
- #### `GET /api/chunks/files`
+ #### 默认模式
+ - `ENABLE_DEBUG_ROUTES` 未开启时不注册 chunk debug router
+ - OpenAPI 中不出现 `/api/debug/chunks/*`
+ - 旧的 `/api/chunks/*` 不再作为正式 API 暴露
+
+ #### `GET /api/debug/chunks/files`
  - 目录存在时正常列出
  - 目录不存在返回空列表
  - 仅返回 JSON 文件
+ - 返回字段只包含调试所需的文件元数据，不暴露本地绝对路径
 
- #### `GET /api/chunks/file/{filename}`
+ #### `GET /api/debug/chunks/file/{filename}`
  - 读取成功
  - 文件不存在返回 404
- - 非法 JSON / 读取异常返回 500
+ - 非法文件名返回 400
+ - 非法 JSON / 读取异常返回 500，并使用稳定错误文案
+ - 响应中裁剪本地路径、原始页面全文、embedding 向量和超长文本
 
  ---
 
@@ -818,7 +831,7 @@
 
  ### 6.6 用户反馈与推荐流程
 
- - like/dislike/action -> DB 落库
+ - like/dislike -> 强偏好表 + profile event；paper-action -> 弱行为表 + profile event
  - generate interest vector -> 向量保存
  - recommend papers -> candidate recall -> rank -> return
  - negative feedback 对排序的影响

@@ -41,7 +41,7 @@ _resolve_paper_reference = _load_paper_reference_resolver()._resolve_paper_refer
 
 
 class PaperReferenceResolverTests(unittest.TestCase):
-    def test_resolves_last_paper_reference_from_recent_results(self) -> None:
+    def test_last_paper_reference_is_only_a_context_dependent_hint(self) -> None:
         context = {
             "last_papers": [
                 {"arxiv_id": "2505.00001", "title": "Paper 1"},
@@ -53,13 +53,14 @@ class PaperReferenceResolverTests(unittest.TestCase):
 
         result = _resolve_paper_reference("给我讲一下最后一篇论文的方法", context)
 
-        self.assertEqual(result["status"], "success")
-        self.assertEqual(result["arxiv_id"], "2505.00003")
-        self.assertEqual(result["title"], "Paper 3")
-        self.assertEqual(result["target"]["target_type"], "ordinal")
-        self.assertEqual(result["target"]["resolved_ordinal"], 3)
+        self.assertEqual(result["status"], "hint_extracted")
+        self.assertEqual(result["reference_type"], "last_item")
+        self.assertEqual(result["value"], "last")
+        self.assertTrue(result["requires_context"])
+        self.assertIsNone(result["arxiv_id"])
+        self.assertIsNone(result["paper"])
 
-    def test_last_reference_wins_over_selected_paper_fallback(self) -> None:
+    def test_last_reference_does_not_fall_back_to_selected_paper(self) -> None:
         context = {
             "last_papers": [
                 {"arxiv_id": "2505.00011", "title": "Autofocus Retrieval"},
@@ -70,9 +71,10 @@ class PaperReferenceResolverTests(unittest.TestCase):
 
         result = _resolve_paper_reference("最后一篇", context)
 
-        self.assertEqual(result["status"], "success")
-        self.assertEqual(result["arxiv_id"], "2505.00012")
-        self.assertEqual(result["matched_from"], "last_papers")
+        self.assertEqual(result["status"], "hint_extracted")
+        self.assertEqual(result["reference_type"], "last_item")
+        self.assertEqual(result["value"], "last")
+        self.assertIsNone(result["arxiv_id"])
 
 
 if __name__ == "__main__":

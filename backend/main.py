@@ -14,16 +14,22 @@ from core.errors import AppError, ErrorCode, http_exception_to_app_error, make_e
 from dependencies import SERVICE_LOAD_MODE, normalize_service_load_mode, warm_up_services
 from routers.agent_router import router as agent_router
 from routers.arxiv_router import router as arxiv_router
-from routers.chunk_router import router as chunk_router
 from routers.paper_router import router as paper_router
 from routers.qa_router import router as qa_router
 from routers.user_router import router as user_router
+from utils.config import get_debug_routes_runtime_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 
-def create_app(load_mode: str | None = None) -> FastAPI:
+def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None = None) -> FastAPI:
     resolved_load_mode = normalize_service_load_mode(load_mode)
+    debug_route_config = get_debug_routes_runtime_config()
+    resolved_enable_debug_routes = (
+        bool(debug_route_config.get("enable_debug_routes"))
+        if enable_debug_routes is None
+        else bool(enable_debug_routes)
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -109,7 +115,14 @@ def create_app(load_mode: str | None = None) -> FastAPI:
     app.include_router(user_router, prefix="/api")
     app.include_router(paper_router, prefix="/api")
     app.include_router(qa_router, prefix="/api")
-    app.include_router(chunk_router, prefix="/api")
+    if resolved_enable_debug_routes:
+        # chunk debug 会暴露本地解析产物，只有显式开启调试路由时才挂载到内部 debug 前缀。
+        from routers.chunk_router import router as chunk_debug_router
+
+        app.include_router(chunk_debug_router, prefix="/api")
+        logging.getLogger(__name__).info("Debug routes enabled: /api/debug/chunks")
+    else:
+        logging.getLogger(__name__).info("Debug routes disabled")
 
     return app
 

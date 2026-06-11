@@ -110,22 +110,29 @@ def handle_paper_reading_request(state: Union[AgentState, Mapping[str, Any]]) ->
             outputs={"reason": "当前 intent 不是论文阅读类请求"},
         )
 
-    # 先基于当前消息和上下文定位“这篇论文 / 第一篇论文”究竟指向哪一篇文献。
+    # 先提取“这篇论文 / 第一篇论文”这类引用线索；最终论文绑定必须交给后续解析层。
     message = _normalize_text(next_state.message or "")
     context = dict(next_state.context or {})
     resolution = _resolve_paper_reference(message, context)
-    if resolution.get("status") != "success":
+    # 兼容节点不能把 hint extractor 的结果当作最终论文；只有统一 Target Resolver 标记
+    # final_target_resolved 后，才允许进入后续业务工具。
+    if resolution.get("status") != "success" or not resolution.get("final_target_resolved"):
+        hint_only_reason = (
+            "已提取论文引用线索，但尚未结合上下文解析成最终论文。"
+            if resolution.get("status") == "hint_extracted"
+            else "无法解析目标论文"
+        )
         result = {
             "status": "failed",
             "arxiv_id": None,
             "title": None,
             "question": message,
-            "answer": str(resolution.get("reason") or "无法解析目标论文"),
+            "answer": str(resolution.get("reason") or hint_only_reason),
             "sources": [],
             "retrieval_debug": None,
             "qa_index_status": None,
             "index_created": False,
-            "error": str(resolution.get("reason") or "paper reference resolution failed"),
+            "error": str(resolution.get("reason") or hint_only_reason),
         }
         next_state.paper_qa_result = result
         next_state.answer = result["answer"]

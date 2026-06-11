@@ -1,13 +1,14 @@
-# `chunk_router.py` 接口处理流程
+# `chunk_router.py` 调试接口处理流程
 
-本文仅分析当前仓库中的 `backend/routers/chunk_router.py` 及其实际调用到的本地 chunk 文件读取、chunk 调试查看、metadata 展示相关逻辑，不覆盖其他 router。
+本文仅分析当前仓库中的 `backend/routers/chunk_router.py` 及其实际调用到的本地 chunk 文件读取、chunk 调试查看、metadata 展示相关逻辑，不覆盖其他 router。该 router 已从默认正式 API 中剥离，只在 `ENABLE_DEBUG_ROUTES=true` 时注册。
 
 ## 1. Router 基本信息
 
 - Router 文件路径：`backend/routers/chunk_router.py`
-- Router prefix：`/chunks`
-- Router tags：`["chunks"]`
-- 主要职责：暴露本地 chunk JSON 调试产物，支持列出 chunk 文件列表、读取指定 chunk 文件完整内容，主要用于调试文档切分结果、查看页结构、chunk 内容和元数据。
+- Router prefix：`/debug/chunks`
+- Router tags：`["debug-chunks"]`
+- 注册条件：`ENABLE_DEBUG_ROUTES=true`
+- 主要职责：暴露本地 chunk JSON 调试产物的受控视图，支持列出 chunk 文件列表、读取指定 chunk 文件的裁剪调试内容，主要用于调试文档切分结果、查看页结构、chunk 内容和元数据。
 - 主要依赖的 service / function：
   - `pathlib.Path`
   - `json.load()`
@@ -18,14 +19,15 @@
 - 是否访问向量库：未发现
 - 是否支持分页：未发现
 - 是否支持过滤：未发现
-- 是否返回 `rerank_text`：是，前提是目标 JSON 文件中的 chunk 结构本身包含该字段；router 未做裁剪
+- 是否返回 `rerank_text`：是，前提是目标 JSON 文件中的 chunk 结构本身包含该字段；长文本会按 `DEBUG_CHUNK_CONTENT_PREVIEW_CHARS` 裁剪
 - 是否返回 `metadata`：是
-- 是否返回 `section_path`：是，前提是目标 JSON 文件中的 chunk metadata 包含该字段；router 未做裁剪
-- 是否返回 `page` 信息：是，前提是目标 JSON 文件中的 `pages` 或 chunk metadata 包含页码字段；router 未做裁剪
+- 是否返回 `section_path`：是，前提是目标 JSON 文件中的 chunk metadata 包含该字段；本地路径字段会只保留 basename
+- 是否返回 `page` 信息：chunk metadata 中的页码会保留；原始 `pages/raw_pages` 全文会被移除，避免暴露完整解析产物
 
 ### 依赖边界说明
 
 - `chunk_router.py` 本身没有接入 `DatabaseService`、`VectorStoreService` 或其他业务 service，属于直接面向本地文件系统的轻量调试 router。
+- `chunk_router.py` 默认不注册到 FastAPI；本地开发需要设置 `ENABLE_DEBUG_ROUTES=true` 后才会挂到 `/api/debug/chunks/*`。
 - chunk 文件目录通过 `BASE_DIR = Path(__file__).resolve().parents[1]` 计算到 `backend` 目录，再拼接为 `backend/01-loaded-docs`。
 - 该 router 不负责根据 `paper_id` 检索数据库、定位向量库记录或反查 chunk；它直接接收文件名并读取对应本地 JSON。
 - 从真实保存逻辑看，chunk 文件由 `LoadingService.save_document()` 落盘到 `01-loaded-docs`，文件名通常形如：
@@ -37,8 +39,8 @@
 
 | 方法 | 路径 | 函数名 | 主要职责 | 主要调用 | 副作用 |
 |---|---|---|---|---|---|
-| GET | `/chunks/files` | `list_chunk_files` | 列出本地 chunk 目录中的 JSON 文件，并返回文件名、大小、修改时间 | `CHUNK_DOCS_DIR.exists()`、`CHUNK_DOCS_DIR.iterdir()`、`Path.stat()` | 读取本地目录与文件元数据；不访问数据库；不访问向量库；只读 |
-| GET | `/chunks/file/{filename}` | `get_chunk_file` | 读取指定 chunk JSON 文件的完整内容并直接返回 | `CHUNK_DOCS_DIR / filename`、`Path.exists()`、`json.load()` | 读取本地 JSON 文件；不访问数据库；不访问向量库；只读 |
+| GET | `/debug/chunks/files` | `list_chunk_files` | 列出本地 chunk 目录中的 JSON 文件，并返回文件名、大小、修改时间 | `CHUNK_DOCS_DIR.exists()`、`CHUNK_DOCS_DIR.iterdir()`、`Path.stat()` | 读取本地目录与文件元数据；不访问数据库；不访问向量库；只读 |
+| GET | `/debug/chunks/file/{filename}` | `get_chunk_file` | 读取指定 chunk JSON 文件的裁剪调试视图 | `_resolve_chunk_debug_file()`、`json.load()`、`_sanitize_debug_payload()` | 读取本地 JSON 文件；不访问数据库；不访问向量库；只读 |
 
 ## 3. Router 总览流程图
 
@@ -46,18 +48,19 @@
 flowchart TD
     U["前端 / 调用方"] --> R["[Router] chunk_router.py"]
 
-    R --> F1["[Router] GET /chunks/files"]
+    R --> F1["[Router] GET /debug/chunks/files"]
     F1 --> V1["[Validate] 检查 CHUNK_DOCS_DIR 是否存在"]
     V1 --> D1["[File] backend/01-loaded-docs"]
     D1 --> L1["[File] 遍历 .json 文件并读取 size / modified_time"]
     L1 --> S1["[Response] files 列表"]
     V1 --> FB1["[Fallback] 目录不存在时返回空列表"]
 
-    R --> F2["[Router] GET /chunks/file/{filename}"]
-    F2 --> V2["[Validate] 解析 filename 并拼接目标路径"]
+    R --> F2["[Router] GET /debug/chunks/file/{filename}"]
+    F2 --> V2["[Validate] 校验 filename 只能是当前目录 JSON 文件"]
     V2 --> D2["[File] backend/01-loaded-docs/{filename}"]
-    D2 --> J1["[JSON] json.load() 读取完整 chunk 文件"]
-    J1 --> S2["[Response] filename + data"]
+    D2 --> J1["[JSON] json.load() 读取 chunk 文件"]
+    J1 --> Sanitize["[Sanitize] 裁剪路径 / 原始 pages / embedding 向量"]
+    Sanitize --> S2["[Response] filename + sanitized data"]
     D2 --> E1["[Error] 文件不存在 -> 404"]
     J1 --> E2["[Error] 读取/解析异常 -> 500"]
 
@@ -67,7 +70,7 @@ flowchart TD
 
 ## 4. 每个接口单独流程图
 
-## 接口：GET `/chunks/files`
+## 接口：GET `/debug/chunks/files`
 
 ### 职责
 
@@ -126,31 +129,32 @@ flowchart TD
 - 未发现分页参数校验逻辑
 - 未发现过滤条件逻辑
 
-## 接口：GET `/chunks/file/{filename}`
+## 接口：GET `/debug/chunks/file/{filename}`
 
 ### 职责
 
-读取指定文件名对应的 chunk JSON 完整内容，并直接把反序列化结果返回给前端。该接口主要用于调试查看单个切分结果文件，验证 `pages`、`chunks`、`metadata`、`rerank_text`、`section_path`、页码等结构是否符合预期。
+读取指定文件名对应的 chunk JSON，并返回裁剪后的调试视图。该接口主要用于调试查看单个切分结果文件，验证 `chunks`、`metadata`、`rerank_text`、`section_path`、页码等结构是否符合预期；本地路径、原始页面全文和 embedding 向量不会直接返回。
 
 ### 处理流程图
 
 ```mermaid
 flowchart TD
     A["前端 / 调用方"] --> B["[Router] get_chunk_file"]
-    B --> C["[Validate] 解析 path 参数 filename"]
-    C --> D["[File] 拼接路径 CHUNK_DOCS_DIR / filename"]
+    B --> C["[Validate] 解析 path 参数 filename，并限制为当前目录 JSON 文件"]
+    C --> D["[File] resolve 到 CHUNK_DOCS_DIR 下的目标文件"]
     D --> E{"[Validate] 文件是否存在?"}
     E -->|否| F["[Error] 404 File not found"]
     E -->|是| G["[File] open(file_path, utf-8)"]
-    G --> H["[JSON] json.load() 反序列化完整文件"]
-    H --> I["[Response] status + filename + data"]
+    G --> H["[JSON] json.load() 反序列化文件"]
+    H --> S["[Sanitize] 移除路径 / pages / embedding 向量并裁剪长文本"]
+    S --> I["[Response] status + filename + sanitized data"]
     G -. "读取异常" .-> J["[Error] 500 HTTPException"]
     H -. "JSON 解析异常" .-> J
 ```
 
 ### 关键调用链
 
-`get_chunk_file(filename) -> CHUNK_DOCS_DIR / filename -> Path.exists() -> open(..., encoding="utf-8") -> json.load()`
+`get_chunk_file(filename) -> _resolve_chunk_debug_file() -> open(..., encoding="utf-8") -> json.load() -> _sanitize_debug_payload()`
 
 ### 输入
 
@@ -162,9 +166,11 @@ flowchart TD
 ### 输出
 
 - `status`
+- `debug`
 - `filename`
+- `sanitized`
 - `data`
-  - 真实文件中的顶层字段未被 router 裁剪。基于样例文件，可能包括：
+  - 真实文件中的顶层字段会被 router 裁剪。基于样例文件，可能包括：
   - `filename`
   - `total_chunks`
   - `total_pages`
@@ -173,10 +179,10 @@ flowchart TD
   - `chunking_strategy`
   - `chunking_method`
   - `timestamp`
-  - `pages`
+  - `pages` 会以 redacted 标记替代
   - `chunks`
   - `metadata`
-  - `source_path`
+  - `source_path` 等路径字段只保留 basename
   - `text`
   - `document_markdown`
   - `docling_items`
@@ -192,18 +198,18 @@ flowchart TD
 - 是否读取数据库：否
 - 是否访问向量库：否
 - 是否只读：是
-- 是否返回 chunk 原文：是，返回完整 `data`，其中通常包含 `chunks[].content`
-- 是否返回 `metadata`：是，返回完整 `data`，其中通常包含 `chunks[].metadata`
-- 是否返回 `rerank_text`：是，若文件中 chunk 结构包含 `rerank_text` 字段，则会随完整 JSON 一并返回
+- 是否返回 chunk 原文：是，但长文本按 `DEBUG_CHUNK_CONTENT_PREVIEW_CHARS` 裁剪
+- 是否返回 `metadata`：是，但路径字段只保留 basename
+- 是否返回 `rerank_text`：是，若文件中 chunk 结构包含 `rerank_text` 字段，长文本同样会裁剪
 - 是否返回 `section_path`：是，若 `chunks[].metadata.section_path` 存在，则会一并返回
-- 是否返回 `page` 信息：是，若 `pages[].page`、`pages[].page_number` 或 `chunks[].metadata.page_number` 存在，则会一并返回
+- 是否返回 `page` 信息：chunk metadata 页码保留；顶层 `pages/raw_pages` 原始全文会被移除
 
 ### 异常 / fallback
 
 - 文件不存在时返回 `404`
+- 文件名不是当前目录 JSON 文件时返回 `400`
 - 文件读取异常时返回 `500`
 - JSON 解析失败时返回 `500`
-- 未发现 `filename` 白名单、路径穿越防护或文件后缀校验
 - 未发现基于 `paper_id`、`chunk_id` 的 fallback 查询逻辑
 - 未发现分页逻辑
 - 未发现过滤逻辑
@@ -280,9 +286,9 @@ flowchart TD
    - 当前只能确认该 router 不依赖这些字段；是否有其他保存路径会写入类似字段，基于本 router 范围内未发现。
 
 10. `chunk_router` 返回的是完整 chunk，还是裁剪后的字段？
-   - `GET /chunks/file/{filename}` 返回的是完整 JSON 文件内容，放在 `data` 字段下。
-   - router 未做字段裁剪、分页、过滤或脱敏。
-   - 因此它更像“调试查看原始工件”的接口，而不是“面向正式业务的精简 chunk 查询接口”。
+   - `GET /debug/chunks/file/{filename}` 返回的是裁剪后的 JSON 调试视图，放在 `data` 字段下。
+   - router 会移除或裁剪本地路径、原始页面全文、embedding 向量和超长文本。
+   - 因此它是受控的“调试查看工件”接口，而不是“面向正式业务的完整 chunk 查询接口”。
 
 ## 6. 设计观察
 

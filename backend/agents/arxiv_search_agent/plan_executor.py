@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from langgraph.types import interrupt
 from pydantic import ValidationError
+from utils.config import get_agent_runtime_checkpoint_config
 
 from . import tool_registry as agent_tool_registry
+from .fallbacks import build_fallback_record
 from .observer import Observer
 from .planner import build_executable_plan, build_plan_runtime
 from .replanner import Replanner
@@ -38,6 +40,166 @@ invoke_backend_tool = agent_tool_registry.invoke_backend_tool
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _checkpoint_ttl_seconds() -> int:
+    """读取 checkpoint TTL 作为 pending action 展示过期时间；真正校验仍由 checkpoint manager 执行。"""
+    try:
+        config = get_agent_runtime_checkpoint_config()
+        return max(int(config.get("ttl_seconds") or 0), 60)
+    except Exception:
+        return 24 * 60 * 60
+
+
+def _confirmation_expires_at() -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=_checkpoint_ttl_seconds())).isoformat()
+
+
+def _is_paper_target_resolution_step(step: PlanStep) -> bool:
+    return step.tool_name in {"resolve_paper", "resolve_preference_target"}
+
+
+def _candidate_identity_values(candidate: Mapping[str, Any]) -> List[str]:
+    values: List[str] = []
+    for key in ("candidate_id", "paper_id", "paperId", "stable_id", "id", "arxiv_id", "arxivId"):
+        value = str(candidate.get(key) or "").strip()
+        if value and value not in values:
+            values.append(value)
+    if not values:
+        title = str(candidate.get("title") or "").strip()
+        if title:
+            values.append(title)
+    return values
+
+
+def _candidate_display_id(candidate: Mapping[str, Any]) -> Optional[str]:
+    values = _candidate_identity_values(candidate)
+    return values[0] if values else None
+
+
+def _normalize_confirmation_candidate(candidate: Mapping[str, Any]) -> Dict[str, Any]:
+    """裁剪候选论文给前端展示，保留恢复所需稳定身份和来源信息。"""
+    payload = dict(candidate or {})
+    candidate_id = _candidate_display_id(payload)
+    if candidate_id:
+        payload["candidate_id"] = candidate_id
+    authors = payload.get("authors")
+    if isinstance(authors, list):
+        visible_authors = [str(item).strip() for item in authors if str(item or "").strip()]
+        payload["authors_summary"] = ", ".join(visible_authors[:3])
+    elif authors not in (None, "", [], {}):
+        payload["authors_summary"] = str(authors).strip()
+    payload.setdefault("source_label", payload.get("list_name") or payload.get("source") or payload.get("source_type"))
+    return payload
+
+
+def _confirmation_candidate_sources(candidates: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """确认日志只记录候选身份和来源，避免把完整论文摘要写入运行日志。"""
+    sources: List[Dict[str, Any]] = []
+    for candidate in list(candidates or [])[:8]:
+        if not isinstance(candidate, Mapping):
+            continue
+        sources.append(
+            {
+                "candidate_id": _candidate_display_id(candidate),
+                "arxiv_id": candidate.get("arxiv_id") or candidate.get("arxivId"),
+                "source": candidate.get("source_label") or candidate.get("list_name") or candidate.get("source") or candidate.get("source_type"),
+                "source_key": candidate.get("source_key"),
+                "rank": candidate.get("rank"),
+            }
+        )
+    return sources
+
+
+def _resume_edited_arguments(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        return {}
+    edited = payload.get("edited_arguments")
+    if isinstance(edited, Mapping):
+        return dict(edited)
+    return {}
+
+
+def _match_confirmed_candidate(candidates: Sequence[Mapping[str, Any]], edited_arguments: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """只在 pending confirmation 保存的候选内匹配，禁止 resume 时重新解析用户自然语言。"""
+    requested_values = [
+        str(edited_arguments.get(key) or "").strip()
+        for key in (
+            "confirmed_paper_id",
+            "paper_id",
+            "candidate_id",
+            "confirmed_arxiv_id",
+            "arxiv_id",
+            "confirmed_title",
+            "title",
+        )
+    ]
+    requested_values = [value for value in requested_values if value]
+    if not requested_values:
+        return None
+    for candidate in list(candidates or []):
+        if not isinstance(candidate, Mapping):
+            continue
+        identities = _candidate_identity_values(candidate)
+        if any(value in identities for value in requested_values):
+            return dict(candidate)
+    return None
+
+
+def _build_confirmed_paper_target_output(
+    *,
+    step: PlanStep,
+    confirmation_request: ConfirmationRequest,
+    candidate: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """把用户确认的候选物化成 resolver 的成功输出，供下游工具直接按 paper_id/arxiv_id 执行。"""
+    selected = dict(candidate or {})
+    reference_hint = dict(confirmation_request.reference_hint or {})
+    original_resolution = dict(confirmation_request.target_resolution or {})
+    resolution_hint = original_resolution.get("reference_hint") if isinstance(original_resolution.get("reference_hint"), Mapping) else {}
+    target_resolution = {
+        **original_resolution,
+        "status": "resolved",
+        "target": selected,
+        "recommended_candidate": selected,
+        "confirmed_candidate": selected,
+        "confidence": max(float(original_resolution.get("confidence") or 0.0), 0.99),
+        "resolution_reason": "user_confirmed_target",
+        "requires_confirmation": False,
+        "user_confirmed": True,
+    }
+    base = {
+        "status": "resolved",
+        "reference_type": reference_hint.get("reference_type") or resolution_hint.get("reference_type") or "unknown",
+        "value": reference_hint.get("value"),
+        "confidence": target_resolution["confidence"],
+        "hint_confidence": reference_hint.get("confidence", 0.0),
+        "source": reference_hint.get("source"),
+        "requires_context": bool(reference_hint.get("requires_context")),
+        "reason": "user_confirmed_target",
+        "resolution_reason": "user_confirmed_target",
+        "final_target_resolved": True,
+        "reference_hint": reference_hint,
+        "target": selected,
+        "paper": selected,
+        "arxiv_id": selected.get("arxiv_id") or selected.get("arxivId"),
+        "title": selected.get("title"),
+        "matched_by": "user_confirmed_target",
+        "target_resolution": target_resolution,
+        "candidates": list(confirmation_request.candidates or []),
+        "recommended_candidate": selected,
+        "requires_confirmation": False,
+        "risk_level": original_resolution.get("risk_level") or confirmation_request.arguments_summary.get("risk_level"),
+        "action_type": original_resolution.get("action_type") or confirmation_request.action_type,
+        "confirmed_by_user": True,
+        "confirmed_paper_id": selected.get("paper_id") or selected.get("candidate_id") or selected.get("id"),
+        "confirmed_arxiv_id": selected.get("arxiv_id") or selected.get("arxivId"),
+    }
+    alias_payload = dict(base)
+    if step.tool_name == "resolve_paper":
+        base["paper_ref"] = dict(alias_payload)
+    base["paper_reference"] = dict(alias_payload)
+    return base
 
 
 def _safe_compact(value: Any, *, limit: int = 1200) -> Any:
@@ -90,6 +252,20 @@ def _record_step_output(runtime: PlanRuntime, step: PlanStep, normalized_output:
     runtime.outputs[step.output_key] = normalized_output
     if step.tool_name == "answer_paper_question" and step.output_key != "paper_qa_result":
         runtime.outputs["paper_qa_result"] = normalized_output
+
+
+def _should_preserve_non_success_observation_output(step: PlanStep, normalized_output: Any) -> bool:
+    """保留“目标解析未完成”类输出，便于 fallback/debug 说明为何不能继续。
+
+    resolve_paper / resolve_preference_target 可能已经生成 reference_hint 和候选列表，
+    但 Observer 会因为未得到唯一 final target 而拦截。此类输出不是业务成功结果，
+    不能把 step 标成 success；但必须进入 runtime.outputs，供前端和测试读取解析原因。
+    """
+    if step.tool_name not in {"resolve_paper", "resolve_preference_target"}:
+        return False
+    if not step.output_key:
+        return False
+    return normalized_output not in (None, "", [], {})
 
 
 _PAPER_QA_OBSERVATION_TRACE_KEYS = (
@@ -540,6 +716,15 @@ class PlanExecutor:
                     pending_confirmation=runtime.pending_confirmation,
                     turn_result=turn_result,
                 )
+            if _is_paper_target_resolution_step(step) and runtime.step_status.get(step.step_id) == "success":
+                self._sync_runtime_state(state, runtime, current_step=step)
+                return self._step_result_from_runtime(
+                    step=step,
+                    runtime=runtime,
+                    next_action="continue",
+                    output=runtime.outputs.get(step.output_key) if step.output_key else None,
+                    observation=runtime.last_observation,
+                )
 
         runtime.step_status[step.step_id] = "running"
         runtime.last_step_output = None
@@ -738,6 +923,26 @@ class PlanExecutor:
             },
         )
 
+        if observation.status == "need_confirmation" and _is_paper_target_resolution_step(step):
+            turn_result = self._handle_paper_target_confirmation_gate(
+                step=step,
+                runtime=runtime,
+                state=state,
+                observation=observation,
+                normalized_output=normalized_output,
+                started_at=str(output_payload.get("started_at") or _utcnow()),
+                allow_interrupt=True,
+            )
+            self._sync_runtime_state(state, runtime, current_step=step)
+            return self._step_result_from_runtime(
+                step=step,
+                runtime=runtime,
+                next_action="wait_for_confirmation" if runtime.pending_confirmation else "continue",
+                observation=runtime.last_observation,
+                pending_confirmation=runtime.pending_confirmation,
+                turn_result=turn_result,
+            )
+
         if observation.status == "need_confirmation" and step.tool_name == "request_confirmation":
             pending_action = raw_output.get("pending_action") if isinstance(raw_output, Mapping) else None
             confirmation_request = self._build_confirmation_request(
@@ -769,6 +974,8 @@ class PlanExecutor:
             )
 
         if observation.status not in {"success", "partial_success"}:
+            if _should_preserve_non_success_observation_output(step, normalized_output):
+                _record_step_output(runtime, step, normalized_output)
             runtime.needs_replan = True
             self._sync_runtime_state(state, runtime, current_step=step)
             return self._step_result_from_runtime(step=step, runtime=runtime, next_action="replan", observation=runtime.last_observation)
@@ -994,6 +1201,17 @@ class PlanExecutor:
                 },
             )
 
+            if observation.status == "need_confirmation" and _is_paper_target_resolution_step(step):
+                return self._handle_paper_target_confirmation_gate(
+                    step=step,
+                    runtime=runtime,
+                    state=state,
+                    observation=observation,
+                    normalized_output=normalized_output,
+                    started_at=started_at,
+                    allow_interrupt=allow_interrupt,
+                )
+
             if observation.status == "need_confirmation" and step.tool_name == "request_confirmation":
                 runtime.step_status[step.step_id] = "waiting_confirmation"
                 pending_action = raw_output.get("pending_action") if isinstance(raw_output, Mapping) else None
@@ -1017,6 +1235,8 @@ class PlanExecutor:
 
             if observation.status not in {"success", "partial_success"}:
                 # observation 代表“工具执行后质量不足”，先写入 runtime，方便重规划节点或调试视图复盘触发原因。
+                if _should_preserve_non_success_observation_output(step, normalized_output):
+                    _record_step_output(runtime, step, normalized_output)
                 runtime.needs_replan = True
                 runtime.last_step_output = {
                     "step_id": step.step_id,
@@ -1272,6 +1492,19 @@ class PlanExecutor:
             payload.setdefault("user_id", state.user_id)
         if tool_name in {"load_user_profile", "generate_recommendations", "answer_paper_question"}:
             payload.setdefault("message", state.message)
+        if tool_name == "analyze_ambiguity":
+            # 结构化澄清要根据现有上下文判断“缺的到底是什么”，而不是回退成只看 message 的占位逻辑。
+            payload.setdefault("context", dict(state.context or {}) if isinstance(state.context, Mapping) else {})
+            payload.setdefault("user_id", state.user_id)
+            payload.setdefault("search_spec", _model_to_plain(state.search_spec) if state.search_spec is not None else {})
+            payload.setdefault("pending_action", dict(state.pending_action or {}) if isinstance(state.pending_action, Mapping) else {})
+            payload.setdefault(
+                "goal",
+                {
+                    "intent": str(state.intent or "").strip() or "unclear",
+                    "goal_type": str(state.intent or "").strip() or "unclear",
+                },
+            )
         if tool_name == "request_confirmation":
             payload.setdefault("pending_state", dict(state.pending_action or {}) if isinstance(state.pending_action, Mapping) else {})
         return payload
@@ -1336,10 +1569,22 @@ class PlanExecutor:
             runtime.step_replan_counts = dict(replan_decision.updated_runtime.step_replan_counts or runtime.step_replan_counts)
         runtime.step_status[step.step_id] = "failed"
         fallback_reason = str(replan_decision.fallback_reason or observation.reason or observation.status)
+        existing_fallback_record = dict(replan_decision.fallback_record or {})
+        fallback_record = dict(existing_fallback_record)
+        # replan 阶段可能已经给出一个 fallback_record，但最终 turn 是在 executor
+        # 收口为 fallback_answer。这里统一再归一化一次，确保最终 trace/输出表达的是
+        # “本轮最终如何结束”，而不是保留上一层的临时 reason。
+        if not fallback_record or fallback_record.get("code") == fallback_reason:
+            fallback_record = build_fallback_record(
+                fallback_reason,
+                stage="executor",
+                source="PlanExecutor._handle_observation_replan",
+                detail={"step_id": step.step_id, "tool_name": step.tool_name},
+            )
         runtime.error = f"fallback:{step.step_id}:{fallback_reason}"
         runtime.needs_replan = False
-        runtime.recovery_strategy = {"type": "fallback_answer", "reason": fallback_reason}
-        record_recovery_fallback(runtime, fallback_reason=fallback_reason)
+        runtime.recovery_strategy = {"type": "fallback_answer", "reason": fallback_reason, "fallback_record": fallback_record}
+        record_recovery_fallback(runtime, fallback_reason=fallback_reason, fallback_record=fallback_record)
         self._append_trace(
             runtime,
             step,
@@ -1350,6 +1595,7 @@ class PlanExecutor:
                 "observation_reason": observation.reason,
                 "failure_category": observation.failure_category,
                 "fallback_reason": fallback_reason,
+                "fallback_record": fallback_record,
                 "paper_qa_final_decision": self._build_paper_qa_fallback_decision(runtime, step, observation, fallback_reason),
             },
         )
@@ -1707,6 +1953,263 @@ class PlanExecutor:
         )
         return True
 
+    def _handle_paper_target_confirmation_gate(
+        self,
+        *,
+        step: PlanStep,
+        runtime: PlanRuntime,
+        state: AgentState,
+        observation: ObservationResult,
+        normalized_output: Any,
+        started_at: str,
+        allow_interrupt: bool,
+    ) -> Optional[AgentTurnResult]:
+        """把目标解析候选转成可恢复确认请求，而不是让 resolver 的候选结果继续流入业务工具。"""
+        payload = _model_to_plain(normalized_output)
+        payload = payload if isinstance(payload, Mapping) else {}
+        if step.output_key:
+            # 候选解析结果先进入 outputs，等待确认时前端/debug 能看到候选来源；确认后会被 resolved 输出覆盖。
+            _record_step_output(runtime, step, dict(payload))
+        confirmation_request = self._build_paper_target_confirmation_request(
+            step=step,
+            runtime=runtime,
+            state=state,
+            payload=payload,
+            observation=observation,
+        )
+        return self._handle_confirmation_gate(
+            step=step,
+            runtime=runtime,
+            state=state,
+            confirmation_request=confirmation_request,
+            resolved_input=payload,
+            started_at=started_at,
+            allow_interrupt=allow_interrupt,
+        )
+
+    def _build_paper_target_confirmation_request(
+        self,
+        *,
+        step: PlanStep,
+        runtime: PlanRuntime,
+        state: AgentState,
+        payload: Mapping[str, Any],
+        observation: ObservationResult,
+    ) -> ConfirmationRequest:
+        """生成“确认目标论文”请求；它只确认候选选择，不批准后续收藏/不喜欢等副作用动作。"""
+        target_resolution = dict(payload.get("target_resolution") or {})
+        raw_candidates = payload.get("candidates") or target_resolution.get("candidates") or []
+        candidates = [
+            _normalize_confirmation_candidate(candidate)
+            for candidate in list(raw_candidates or [])
+            if isinstance(candidate, Mapping)
+        ]
+        recommended_source = payload.get("recommended_candidate") or target_resolution.get("recommended_candidate")
+        recommended_candidate = (
+            _normalize_confirmation_candidate(recommended_source)
+            if isinstance(recommended_source, Mapping)
+            else (candidates[0] if candidates else None)
+        )
+        if recommended_candidate:
+            recommended_id = _candidate_display_id(recommended_candidate)
+            if recommended_id and not any(recommended_id in _candidate_identity_values(candidate) for candidate in candidates):
+                candidates.insert(0, dict(recommended_candidate))
+        default_candidate_id = _candidate_display_id(recommended_candidate or {}) if recommended_candidate else None
+        reference_hint = dict(payload.get("reference_hint") or target_resolution.get("reference_hint") or {})
+        created_at = _utcnow()
+        pending_action_id = ":".join(
+            item
+            for item in [
+                str(state.session_id or "session"),
+                str(runtime.plan.plan_id if runtime.plan else "plan"),
+                step.step_id,
+                str(int(datetime.now(timezone.utc).timestamp() * 1000)),
+            ]
+            if item
+        )
+        action_type = str(payload.get("action_type") or target_resolution.get("action_type") or step.action_type or "").strip()
+        risk_level = str(payload.get("risk_level") or target_resolution.get("risk_level") or "low").strip()
+        return ConfirmationRequest(
+            request_type="paper_target_confirmation",
+            pending_action_id=pending_action_id,
+            step_id=step.step_id,
+            tool_name=step.tool_name,
+            action_type=action_type or step.action_type,
+            side_effect_level=str(step.side_effect_level or "none"),
+            reason=str(payload.get("resolution_reason") or payload.get("reason") or observation.reason or "paper_target_requires_confirmation").strip(),
+            title="确认目标论文",
+            description="系统根据当前会话状态找到了可能的论文目标，请确认要继续操作哪一篇。",
+            arguments_summary={
+                "reference_hint": reference_hint,
+                "resolution_reason": payload.get("resolution_reason") or payload.get("reason") or observation.reason,
+                "candidate_count": len(candidates),
+                "default_candidate_id": default_candidate_id,
+                "risk_level": risk_level,
+                "action_type": action_type,
+            },
+            original_question=state.message,
+            original_message=state.message,
+            target_paper=dict(recommended_candidate or {}) or None,
+            candidates=candidates,
+            recommended_candidate=dict(recommended_candidate or {}) or None,
+            default_candidate_id=default_candidate_id,
+            reference_hint=reference_hint,
+            target_resolution=target_resolution,
+            confirmation_fields={
+                "payload_location": "resume.edited_arguments",
+                "required": ["pending_action_id", "confirmed_paper_id"],
+                "optional": ["confirmed_arxiv_id", "note"],
+            },
+            created_at=created_at,
+            expires_at=_confirmation_expires_at(),
+            allowed_decisions=[
+                ConfirmationDecisionOption(code="approve", label="确认", description="使用选中的论文继续执行原动作"),
+                ConfirmationDecisionOption(code="reject", label="取消", description="取消当前论文动作"),
+            ],
+            allow_argument_edit=True,
+            allow_reject=True,
+            allow_note=True,
+            trace_id=str(runtime.goal.goal_id if runtime.goal else "") or None,
+            plan_id=str(runtime.plan.plan_id if runtime.plan else "") or None,
+            session_id=state.session_id,
+            thread_id=state.session_id,
+        )
+
+    def _materialize_paper_target_confirmation(
+        self,
+        *,
+        step: PlanStep,
+        runtime: PlanRuntime,
+        state: AgentState,
+        confirmation_request: ConfirmationRequest,
+        resume_payload: Any,
+    ) -> bool:
+        """把用户确认的候选写成 resolver 成功输出；失败时不做默认兜底，避免误选论文。"""
+        edited_arguments = _resume_edited_arguments(resume_payload)
+        submitted_pending_id = str(edited_arguments.get("pending_action_id") or "").strip()
+        if confirmation_request.pending_action_id and not submitted_pending_id:
+            self._append_trace(
+                runtime,
+                step,
+                event="paper_target_confirmation_invalid",
+                status="failed",
+                detail={"reason": "pending_action_id_missing"},
+            )
+            return False
+        if confirmation_request.pending_action_id and submitted_pending_id and submitted_pending_id != confirmation_request.pending_action_id:
+            self._append_trace(
+                runtime,
+                step,
+                event="paper_target_confirmation_invalid",
+                status="failed",
+                detail={"reason": "pending_action_id_mismatch", "submitted_pending_action_id": submitted_pending_id},
+            )
+            return False
+        candidate = _match_confirmed_candidate(confirmation_request.candidates, edited_arguments)
+        if candidate is None:
+            self._append_trace(
+                runtime,
+                step,
+                event="paper_target_confirmation_invalid",
+                status="failed",
+                detail={"reason": "confirmed_candidate_not_found", "edited_argument_keys": sorted(edited_arguments.keys())},
+            )
+            return False
+
+        confirmed_output = _build_confirmed_paper_target_output(
+            step=step,
+            confirmation_request=confirmation_request,
+            candidate=candidate,
+        )
+        if step.output_key:
+            _record_step_output(runtime, step, confirmed_output)
+        runtime.last_step_output = {
+            "step_id": step.step_id,
+            "tool_contract": _json_safe(self.tool_registry.describe_contract(step.tool_name)),
+            "tool_execution": None,
+            "resolved_input": {"confirmed_by_user": True, "pending_action_id": confirmation_request.pending_action_id},
+            "raw_output": _json_safe(confirmed_output),
+            "normalized_output": _json_safe(confirmed_output),
+            "started_at": _utcnow(),
+            "finished_at": _utcnow(),
+        }
+        runtime.last_observation = {
+            "status": "success",
+            "reason": "paper_target_user_confirmed",
+            "confidence": 0.99,
+            "evidence": {
+                "confirmed_paper_id": confirmed_output.get("confirmed_paper_id"),
+                "confirmed_arxiv_id": confirmed_output.get("confirmed_arxiv_id"),
+                "source": candidate.get("source_label") or candidate.get("source"),
+            },
+        }
+        state.context = dict(state.context or {})
+        approved_step_ids = list(state.context.get("approved_step_ids") or [])
+        if step.step_id not in approved_step_ids:
+            approved_step_ids.append(step.step_id)
+        state.context["approved_step_ids"] = approved_step_ids
+        runtime_approved_step_ids = list(runtime.approved_step_ids or [])
+        if step.step_id not in runtime_approved_step_ids:
+            runtime_approved_step_ids.append(step.step_id)
+        runtime.approved_step_ids = runtime_approved_step_ids
+        runtime.step_status[step.step_id] = "success"
+        runtime.pending_confirmation = None
+        runtime.needs_replan = False
+        runtime.recovery_strategy = None
+        if state.runtime_state is not None:
+            state.runtime_state.pending_confirmation = None
+            state.runtime_state.approved_step_ids = list(runtime.approved_step_ids or [])
+        state.pending_action = {
+            "type": "paper_target_confirmation",
+            "status": "approved",
+            "decision": "approve",
+            "step_id": step.step_id,
+            "tool_name": step.tool_name,
+            "pending_action_id": confirmation_request.pending_action_id,
+            "confirmed_paper_id": confirmed_output.get("confirmed_paper_id"),
+            "confirmed_arxiv_id": confirmed_output.get("confirmed_arxiv_id"),
+        }
+        self._append_trace(
+            runtime,
+            step,
+            event="confirmation_approved",
+            status="success",
+            detail={
+                "tool_name": step.tool_name,
+                "request_type": confirmation_request.request_type,
+                "pending_action_id": confirmation_request.pending_action_id,
+                "confirmed_paper_id": confirmed_output.get("confirmed_paper_id"),
+                "confirmed_arxiv_id": confirmed_output.get("confirmed_arxiv_id"),
+                "confirmed_source": candidate.get("source_label") or candidate.get("source") or candidate.get("source_type"),
+                "resumed_at": _utcnow(),
+            },
+        )
+        self._append_trace(
+            runtime,
+            step,
+            event="step_succeeded",
+            status="success",
+            detail={
+                "tool_name": step.tool_name,
+                "tool_contract": self.tool_registry.describe_contract(step.tool_name),
+                "resolved_input": {"confirmed_by_user": True},
+                "raw_output": _compact_step_output_for_trace(step, confirmed_output),
+                "normalized_output": _compact_step_output_for_trace(step, confirmed_output),
+                "started_at": runtime.last_step_output.get("started_at"),
+                "finished_at": runtime.last_step_output.get("finished_at"),
+            },
+        )
+        logger.info(
+            "arxiv_agent paper target confirmed: step_id=%s tool_name=%s pending_action_id=%s paper_id=%s arxiv_id=%s source=%s",
+            step.step_id,
+            step.tool_name,
+            confirmation_request.pending_action_id,
+            confirmed_output.get("confirmed_paper_id"),
+            confirmed_output.get("confirmed_arxiv_id"),
+            candidate.get("source_label") or candidate.get("source") or candidate.get("source_type"),
+        )
+        return True
+
     def _build_confirmation_request(
         self,
         *,
@@ -1808,6 +2311,7 @@ class PlanExecutor:
         runtime.step_status[step.step_id] = "waiting_confirmation"
         runtime.pending_confirmation = confirmation_request
         runtime.recovery_strategy = {"type": "request_confirmation", "reason": confirmation_request.reason or "waiting_confirmation"}
+        candidate_sources = _confirmation_candidate_sources(confirmation_request.candidates or [])
         self._append_trace(
             runtime,
             step,
@@ -1815,17 +2319,31 @@ class PlanExecutor:
             status="waiting_confirmation",
             detail={
                 "tool_name": step.tool_name,
+                "request_type": confirmation_request.request_type,
+                "pending_action_id": confirmation_request.pending_action_id,
                 "side_effect_level": step.side_effect_level,
                 "allowed_decisions": [item.code for item in list(confirmation_request.allowed_decisions or [])],
+                "candidate_count": len(confirmation_request.candidates or []),
+                "candidate_sources": candidate_sources,
+                "default_candidate_id": confirmation_request.default_candidate_id,
+                "reference_hint": _safe_compact(confirmation_request.reference_hint),
+                "target_resolution_status": (confirmation_request.target_resolution or {}).get("status") if isinstance(confirmation_request.target_resolution, Mapping) else None,
                 "started_at": started_at,
             },
         )
         logger.info(
-            "arxiv_agent confirmation requested: step_id=%s tool_name=%s side_effect_level=%s allowed_decisions=%s",
+            "arxiv_agent confirmation requested: step_id=%s tool_name=%s request_type=%s pending_action_id=%s side_effect_level=%s allowed_decisions=%s candidate_count=%s default_candidate_id=%s candidate_sources=%s reference_hint=%s original_message=%r",
             confirmation_request.step_id,
             confirmation_request.tool_name,
+            confirmation_request.request_type,
+            confirmation_request.pending_action_id,
             confirmation_request.side_effect_level,
             [item.code for item in list(confirmation_request.allowed_decisions or [])],
+            len(confirmation_request.candidates or []),
+            confirmation_request.default_candidate_id,
+            candidate_sources,
+            _safe_compact(confirmation_request.reference_hint),
+            confirmation_request.original_message or confirmation_request.original_question,
         )
 
         if not allow_interrupt:
@@ -1841,6 +2359,21 @@ class PlanExecutor:
             type(resume_payload).__name__,
         )
         if decision == "approve":
+            if confirmation_request.request_type == "paper_target_confirmation":
+                if self._materialize_paper_target_confirmation(
+                    step=step,
+                    runtime=runtime,
+                    state=state,
+                    confirmation_request=confirmation_request,
+                    resume_payload=resume_payload,
+                ):
+                    return None
+                return self._handle_confirmation_rejection(
+                    step=step,
+                    runtime=runtime,
+                    state=state,
+                    confirmation_request=confirmation_request,
+                )
             state.context = dict(state.context or {})
             # 恢复后把当前步骤标为已批准，避免同一工具在续跑时再次触发 interrupt。
             approved_step_ids = list(state.context.get("approved_step_ids") or [])
@@ -1899,6 +2432,16 @@ class PlanExecutor:
         )
         if decision != "approve":
             return decision
+        if confirmation_request is not None and confirmation_request.request_type == "paper_target_confirmation":
+            if self._materialize_paper_target_confirmation(
+                step=step,
+                runtime=runtime,
+                state=state,
+                confirmation_request=confirmation_request,
+                resume_payload=resume_payload,
+            ):
+                return decision
+            return "reject"
 
         state.context = dict(state.context or {})
         approved_step_ids = list(state.context.get("approved_step_ids") or [])
@@ -1963,18 +2506,19 @@ class PlanExecutor:
         runtime.step_status[step.step_id] = "skipped"
         runtime.recovery_strategy = {"type": "skip_step", "reason": "confirmation_rejected"}
         state.pending_action = {
-            "type": "tool_approval",
+            "type": confirmation_request.request_type,
             "status": "cancelled",
             "decision": "reject",
             "step_id": step.step_id,
             "tool_name": step.tool_name,
+            "pending_action_id": confirmation_request.pending_action_id,
         }
         self._append_trace(
             runtime,
             step,
             event="confirmation_rejected",
             status="skipped",
-            detail={"tool_name": step.tool_name, "side_effect_level": step.side_effect_level, "finished_at": _utcnow()},
+            detail={"tool_name": step.tool_name, "request_type": confirmation_request.request_type, "side_effect_level": step.side_effect_level, "finished_at": _utcnow()},
         )
         logger.info("arxiv_agent confirmation rejected: step_id=%s tool_name=%s", step.step_id, step.tool_name)
 
@@ -1984,7 +2528,7 @@ class PlanExecutor:
 def run_agent_turn(state: AgentState, tool_registry: ToolRegistry = PLANNER_TOOL_REGISTRY) -> AgentTurnResult:
     """统一 Agent 单轮入口：通过 planner 门面拿到已校验计划后执行。
 
-    planner 门面负责固定模板和 Tool-Aware 草稿路径的切换、校验与回退；
+    planner 门面优先使用 LLM/规则型 Tool-Aware 路径；legacy 模板只在主 planner 不可用时兜底，
     执行器这里只消费可信 ExecutablePlan，避免运行期再关心草稿来源。
     """
     goal, plan, planning_debug = build_executable_plan(state, tool_registry=tool_registry)

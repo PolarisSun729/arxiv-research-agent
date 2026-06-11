@@ -20,7 +20,8 @@ agent.ts / papers.ts"]
         app["backend/main.py
 /api 路由注册"]
         routes["routers
-agent_router / qa_router / paper_router / user_router / arxiv_router / chunk_router"]
+agent_router / qa_router / paper_router / user_router / arxiv_router
+chunk_router(debug only)"]
         deps["dependencies.py
 Service 单例装配"]
     end
@@ -141,7 +142,7 @@ Milvus / VectorStoreService"]
   - `backend/routers/paper_router.py`
   - `backend/routers/user_router.py`
   - `backend/routers/arxiv_router.py`
-  - `backend/routers/chunk_router.py`
+  - `backend/routers/chunk_router.py`（仅 `ENABLE_DEBUG_ROUTES=true` 时作为内部调试路由注册）
 
 - Agent 主入口
   - `backend/agents/arxiv_search_agent/service.py`

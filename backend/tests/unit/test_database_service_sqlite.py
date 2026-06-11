@@ -95,25 +95,25 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
     def test_record_user_paper_action_supports_aliases_and_rejects_invalid_values(self) -> None:
         paper = self._add_sample_paper("2401.00002")
 
-        self.assertTrue(self.service.record_user_paper_action(self.user_id, paper["arxiv_id"], "liked"))
+        self.assertFalse(self.service.record_user_paper_action(self.user_id, paper["arxiv_id"], "liked"))
         self.assertTrue(self.service.record_user_paper_action(self.user_id, paper["arxiv_id"], "bookmark"))
         self.assertTrue(self.service.record_user_paper_action(self.user_id, paper["arxiv_id"], "save_for_later"))
-        self.assertTrue(self.service.record_user_paper_action(self.user_id, paper["arxiv_id"], "disliked"))
+        self.assertFalse(self.service.record_user_paper_action(self.user_id, paper["arxiv_id"], "disliked"))
         self.assertFalse(self.service.record_user_paper_action(self.user_id, paper["arxiv_id"], "invalid_action"))
 
         actions = self.service.get_user_paper_actions(self.user_id)
         action_types = {item["action_type"] for item in actions}
 
-        self.assertIn("dislike", action_types)
         self.assertIn("favorite", action_types)
         self.assertIn("later", action_types)
+        self.assertNotIn("dislike", action_types)
         self.assertNotIn("like", action_types)
 
     def test_profile_events_are_append_only_and_deduped_by_semantic_target(self) -> None:
         paper = self._add_sample_paper("2401.00999")
 
-        self.assertTrue(self.service.record_user_paper_action(self.user_id, paper["arxiv_id"], "liked"))
-        self.assertTrue(self.service.record_user_paper_action(self.user_id, paper["arxiv_id"], "liked"))
+        self.assertTrue(self.service.add_liked_paper(self.user_id, paper["arxiv_id"]))
+        self.assertTrue(self.service.add_liked_paper(self.user_id, paper["arxiv_id"]))
         self.assertTrue(self.service.record_user_paper_action(self.user_id, paper["arxiv_id"], "read"))
         events = self.service.list_user_profile_events(self.user_id)
         liked_events = [event for event in events if event["event_type"] == "liked"]
@@ -124,6 +124,19 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
         self.assertEqual(liked_events[0]["arxiv_id"], paper["arxiv_id"])
         self.assertGreater(liked_events[0]["action_strength"], read_events[0]["action_strength"])
         self.assertTrue(liked_events[0]["include_in_profile"])
+        self.assertNotIn("like", self.service.get_user_paper_action_map(self.user_id))
+
+    def test_removing_preference_deactivates_profile_event_without_action_residue(self) -> None:
+        paper = self._add_sample_paper("2401.00998")
+
+        self.assertTrue(self.service.add_liked_paper(self.user_id, paper["arxiv_id"]))
+        self.assertTrue(self.service.remove_liked_paper(self.user_id, paper["arxiv_id"]))
+
+        self.assertEqual(self.service.get_liked_papers(self.user_id), [])
+        self.assertNotIn("like", self.service.get_user_paper_action_map(self.user_id))
+        active_events = self.service.list_user_profile_events(self.user_id)
+        self.assertNotIn("liked", {event["event_type"] for event in active_events})
+        self.assertIn("liked_removed", {event["event_type"] for event in active_events})
 
     def test_get_user_preferences_returns_stable_structure(self) -> None:
         paper = self._add_sample_paper("2401.00003")

@@ -111,11 +111,11 @@ async function loadFiles() {
   loadingFiles.value = true
   errorMessage.value = ''
   try {
-    const response = await request.get('/chunks/files') as { files?: ChunkFile[] }
+    const response = await request.get('/debug/chunks/files') as { files?: ChunkFile[] }
     files.value = response.files || []
   } catch (error) {
     console.error('Failed to load chunk files:', error)
-    errorMessage.value = '加载分块文件失败，请确认后端服务已启动。'
+    errorMessage.value = '加载分块文件失败，请确认后端已开启 ENABLE_DEBUG_ROUTES。'
     files.value = []
   } finally {
     loadingFiles.value = false
@@ -130,7 +130,7 @@ async function selectFile(filename: string) {
   errorMessage.value = ''
 
   try {
-    const response = await request.get(`/chunks/file/${encodeURIComponent(filename)}`) as { data?: ChunkData }
+    const response = await request.get(`/debug/chunks/file/${encodeURIComponent(filename)}`) as { data?: ChunkData }
     if (!response.data) {
       throw new Error('invalid chunk file data')
     }
