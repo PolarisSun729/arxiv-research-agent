@@ -462,6 +462,10 @@ def _coerce_state_mapping(state: AgentState) -> Dict[str, Any]:
 def _extract_state_value(state: AgentState, source_key: Optional[str]) -> Any:
     if not source_key:
         return None
+    # LLM 草稿常把用户原始问题写成 user_request/original_question；
+    # 执行态的权威字段是 message，这里在边界收敛别名，避免计划通过校验后执行期缺参。
+    if source_key in {"user_request", "original_question", "question"}:
+        return state.message
     if hasattr(state, source_key):
         return getattr(state, source_key)
     state_mapping = _coerce_state_mapping(state)
@@ -574,6 +578,22 @@ def _model_to_plain(value: Any) -> Any:
     if callable(model_dump):
         return model_dump()
     return value
+
+
+def _compact_validation_errors(errors: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """压缩 Pydantic errors()，保留字段路径和原因，避免日志被完整输入对象淹没。"""
+    compact: List[Dict[str, Any]] = []
+    for item in list(errors or []):
+        detail = dict(item or {})
+        loc = detail.get("loc")
+        if isinstance(loc, (list, tuple)):
+            detail["loc"] = ".".join(str(part) for part in loc)
+        if "input" in detail:
+            detail["input"] = _safe_compact(_model_to_plain(detail.get("input")), limit=400)
+        if isinstance(detail.get("ctx"), Mapping):
+            detail["ctx"] = _safe_compact(dict(detail.get("ctx") or {}), limit=400)
+        compact.append(detail)
+    return compact
 
 
 def _compact_confirmation_arguments(arguments: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1362,11 +1382,22 @@ class PlanExecutor:
             contract.adapter.invoke_backend_tool = invoke_backend_tool
         tool_input = self._validate_tool_input(contract, resolved_input, state)
         if isinstance(tool_input, ToolExecutionResult):
-            logger.info(
-                "arxiv_agent tool input validation failed: step_id=%s tool_name=%s error_code=%s",
+            tool_error = tool_input.error
+            error_detail = dict(tool_error.detail or {}) if tool_error is not None and isinstance(tool_error.detail, Mapping) else {}
+            logger.warning(
+                "arxiv_agent tool input validation failed: step_id=%s tool_name=%s backend_tool=%s adapter=%s input_model=%s error_code=%s failed_stage=%s suggested_recovery=%s input_keys=%s input_types=%s errors=%s raw_input=%s",
                 step.step_id,
                 tool_name,
-                tool_input.error.error_code if tool_input.error else None,
+                getattr(contract, "backend_tool_name", None),
+                contract.adapter.__class__.__name__,
+                getattr(getattr(contract, "input_model", None), "__name__", None),
+                tool_error.error_code if tool_error else None,
+                tool_error.failed_stage if tool_error else None,
+                tool_error.suggested_recovery if tool_error else None,
+                error_detail.get("input_keys"),
+                error_detail.get("input_types"),
+                _safe_compact(error_detail.get("errors")),
+                _safe_compact(error_detail.get("raw_input")),
             )
             return tool_input
         started = perf_counter()
@@ -1440,13 +1471,21 @@ class PlanExecutor:
         try:
             return input_model.model_validate(raw_input)
         except ValidationError as exc:
+            # 结构化校验失败需要把字段路径和原始绑定形态写进 detail；
+            # 否则日志只剩 input_validation_error，无法判断是 planner 绑定错还是 adapter 契约变更。
+            input_types = {str(key): type(value).__name__ for key, value in dict(raw_input or {}).items()}
             return ToolExecutionResult(
                 ok=False,
                 data=None,
                 error=_make_tool_error(
                     error_code="input_validation_error",
                     message="工具输入未通过 Pydantic 模型校验",
-                    detail={"errors": exc.errors(), "input_keys": sorted(raw_input.keys())},
+                    detail={
+                        "errors": _compact_validation_errors(exc.errors()),
+                        "input_keys": sorted(str(key) for key in raw_input.keys()),
+                        "input_types": input_types,
+                        "raw_input": _safe_compact(raw_input),
+                    },
                     recoverable=True,
                     retryable=False,
                     suggested_recovery="ask_clarification",
@@ -1484,6 +1523,14 @@ class PlanExecutor:
     def _augment_tool_input(self, tool_name: str, resolved_input: Dict[str, Any], state: AgentState) -> Dict[str, Any]:
         payload = dict(resolved_input or {})
         # adapter 不直接读 state；这些上下文由 executor 在模型校验前显式注入。
+        if tool_name in {"normalize_request", "build_arxiv_search_spec"}:
+            # LLM planner 有时会省略可选 search_spec 绑定；parse 节点已经产出的结构化规格
+            # 必须在工具边界作为兜底输入，否则 build_spec 会退回到原始用户句子并丢失时间/数量约束。
+            payload.setdefault("message", state.message)
+            if payload.get("intent") in (None, "", [], {}):
+                payload["intent"] = state.intent
+            if state.search_spec is not None and payload.get("search_spec") in (None, "", [], {}):
+                payload["search_spec"] = _model_to_plain(state.search_spec)
         if tool_name in {"resolve_paper", "resolve_preference_target"}:
             payload.setdefault("context", dict(state.context or {}) if isinstance(state.context, Mapping) else {})
         if tool_name in {"load_user_profile", "load_candidate_papers"}:

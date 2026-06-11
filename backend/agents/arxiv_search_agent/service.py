@@ -872,6 +872,13 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
             )
         except Exception as exc:
             # 阶段 F：流式过程中任何异常都转成结构化事件，而不是让连接直接中断。
+            # 同时写入 traceback；前端为了稳定体验会展示泛化错误，后端日志必须保留真实失败点。
+            logger.exception(
+                "arxiv_agent stream runtime failed: run_id=%s session_id=%s message=%s",
+                run_id,
+                resolved_session_id if "resolved_session_id" in locals() else None,
+                normalized_request.message,
+            )
             if "checkpoint_manager" in locals():
                 _mark_runtime_checkpoint_failed(
                     checkpoint_manager,

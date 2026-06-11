@@ -136,6 +136,28 @@ class AgentGraphFlowTests(unittest.TestCase):
         self.assertEqual(state.paper_qa_result["arxiv_id"], "2401.00002")
         self.assertEqual(state.paper_qa_result["title"], "Second Paper")
 
+    def test_apply_turn_result_projects_arxiv_results_to_visible_papers(self) -> None:
+        state = AgentState(intent="arxiv_search", message="帮我找最近 7 天关于 RAG 的 5 篇论文")
+        result = schemas.AgentTurnResult(
+            status="success",
+            final_answer="已检索到 1 篇相关论文",
+            outputs={
+                "arxiv_results": {
+                    "papers": [
+                        {"arxiv_id": "2606.00001", "title": "RAG Agents in Practice"},
+                    ],
+                    "tool_result": {"ok": True},
+                }
+            },
+            trace=[],
+        )
+
+        graph_module._apply_turn_result(state, result)
+
+        # LLM 计划可能跳过个性化排序步骤；前端论文卡片仍应从 arxiv_results.papers 获得数据。
+        self.assertEqual(len(state.papers), 1)
+        self.assertEqual(state.papers[0]["arxiv_id"], "2606.00001")
+
 
 if __name__ == "__main__":
     unittest.main()

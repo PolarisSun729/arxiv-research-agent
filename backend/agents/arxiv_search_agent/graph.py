@@ -486,6 +486,49 @@ def _display_step_status_from_plan_status(status: Optional[str], *, next_action:
     return "success"
 
 
+def _extract_arxiv_papers_from_outputs(outputs: Mapping[str, Any]) -> list[Dict[str, Any]]:
+    """从执行输出中提取可展示论文列表。
+
+    LLM 计划不一定包含 personalize_paper_results；此时真实论文在 arxiv_results.papers，
+    出站适配仍要回填 state.papers，避免前端拿到“有回答但无卡片”的结果。
+    """
+
+    def _papers_from_value(value: Any) -> list[Dict[str, Any]]:
+        if isinstance(value, list):
+            return [dict(item) for item in value if isinstance(item, Mapping)]
+        if not isinstance(value, Mapping):
+            return []
+        papers = value.get("papers")
+        if isinstance(papers, list):
+            return [dict(item) for item in papers if isinstance(item, Mapping)]
+        data = value.get("data")
+        if isinstance(data, Mapping):
+            nested = _papers_from_value(data)
+            if nested:
+                return nested
+        tool_result = value.get("tool_result")
+        if isinstance(tool_result, Mapping):
+            nested = _papers_from_value(tool_result.get("data") if isinstance(tool_result.get("data"), Mapping) else tool_result)
+            if nested:
+                return nested
+        return []
+
+    ranked = outputs.get("ranked_papers")
+    papers = _papers_from_value(ranked)
+    if papers:
+        return papers
+    arxiv_results = outputs.get("arxiv_results")
+    papers = _papers_from_value(arxiv_results)
+    if papers:
+        return papers
+    for output_key, value in outputs.items():
+        if str(output_key or "").startswith("arxiv_results"):
+            papers = _papers_from_value(value)
+            if papers:
+                return papers
+    return []
+
+
 def _apply_turn_result(state: AgentState, result: AgentTurnResult) -> None:
     """把统一执行结果回写到 AgentState，供 service/stream 复用响应适配器。"""
     state.goal = result.plan.goal if result.plan is not None else state.goal
@@ -514,8 +557,9 @@ def _apply_turn_result(state: AgentState, result: AgentTurnResult) -> None:
         state.paper_qa_result = _build_paper_qa_result(state, paper_qa_result)
         if state.paper_qa_result.get("answer"):
             state.answer = str(state.paper_qa_result.get("answer") or "")
-    if "ranked_papers" in result.outputs and isinstance(result.outputs.get("ranked_papers"), list):
-        state.papers = [dict(item) for item in result.outputs["ranked_papers"] if isinstance(item, Mapping)]
+    arxiv_papers = _extract_arxiv_papers_from_outputs(result.outputs)
+    if arxiv_papers:
+        state.papers = arxiv_papers
     runtime = state.plan_runtime
     state.runtime_state = _runtime_state_from_runtime(state, runtime) if runtime is not None else state.runtime_state
 

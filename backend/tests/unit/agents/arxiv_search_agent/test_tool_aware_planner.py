@@ -228,6 +228,28 @@ def test_plan_draft_missing_required_source_key_conversion_fails() -> None:
         PlanDraftConverter(PLANNER_TOOL_REGISTRY).convert(draft, Goal(goal_type="arxiv_search"))
 
 
+def test_plan_draft_rejects_arxiv_build_spec_goal_constraints_binding() -> None:
+    payload = json.loads(_llm_arxiv_plan_json())
+    payload["steps"][1]["input_bindings"] = [
+        {"input_key": "normalized_request", "source_type": "goal", "source_key": "constraints"},
+        {
+            "input_key": "search_spec",
+            "source_type": "literal",
+            "value": {
+                "query": "RAG",
+                "categories": ["cs.CL", "cs.LG"],
+                "submitted_days_ago": 7,
+                "max_results": 5,
+                "sort_by": "submittedDate:descending",
+            },
+        },
+    ]
+    draft = PlanDraft.model_validate(payload)
+
+    with pytest.raises(PlanDraftConversionError, match="normalized_request must come from normalize_request step_output"):
+        PlanDraftConverter(PLANNER_TOOL_REGISTRY).convert(draft, Goal(goal_type="arxiv_search"))
+
+
 def test_plan_draft_cycle_conversion_fails() -> None:
     draft = PlanDraft(
         draft_id="draft:cycle",
@@ -496,6 +518,36 @@ def test_llm_missing_required_inputs_falls_back_with_validation_summary() -> Non
     assert "missing required inputs" in debug["llm_plan_invalid_reasons"][0] or "missing input_bindings" in debug["llm_plan_invalid_reasons"][0]
     assert debug["llm_plan_validation_summary"]["status"] == "failed"
     assert debug["llm_plan_raw_summary"]["tool_names"][2] == "search_arxiv"
+
+
+def test_llm_arxiv_bad_build_spec_binding_falls_back_to_rule_based() -> None:
+    invalid = json.loads(_llm_arxiv_plan_json())
+    invalid["steps"][1]["input_bindings"] = [
+        {"input_key": "normalized_request", "source_type": "goal", "source_key": "constraints"},
+        {
+            "input_key": "search_spec",
+            "source_type": "literal",
+            "value": {
+                "query": "RAG",
+                "categories": ["cs.CL", "cs.LG"],
+                "submitted_days_ago": 7,
+                "max_results": 5,
+                "sort_by": "submittedDate:descending",
+            },
+        },
+    ]
+
+    _, plan, debug = _current_modules()[0].build_executable_plan(
+        AgentState(intent="arxiv_search", message="search rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG")),
+        enable_tool_aware_planner=True,
+        enable_llm_plan_draft=True,
+        llm_generation_service=_FakeLLMPlanService(json.dumps(invalid, ensure_ascii=False)),
+    )
+
+    assert debug["llm_plan_valid"] is False
+    assert "normalized_request must come from normalize_request" in debug["llm_plan_invalid_reasons"][0]
+    assert debug["selected_plan_source"] == "tool_aware_rule_based"
+    assert _step_ids(plan)[:4] == ["normalize_request", "build_arxiv_search_spec", "search_arxiv", "validate_arxiv_results"]
 
 
 def test_llm_non_json_falls_back() -> None:
@@ -786,6 +838,38 @@ def test_llm_plan_draft_prompt_includes_unified_prompt_context() -> None:
     assert "## user_memory" in prompt
     assert "## agent_state" in prompt
     assert "confirm_index" in prompt
+
+
+def test_llm_plan_draft_prompt_includes_arxiv_binding_few_shot() -> None:
+    _, current_tool_aware, current_registry = _current_modules()
+    goal = Goal(goal_type="arxiv_search", intent="arxiv_search")
+    state = AgentState(
+        intent="arxiv_search",
+        message="帮我找最近 7 天关于 RAG 的 5 篇论文",
+        search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG", submitted_days_ago=7, max_results=5),
+    )
+    planner_context = current_tool_aware._minimal_planner_context(goal, state, current_registry.PLANNER_TOOL_REGISTRY)
+    selection = current_tool_aware.ToolCandidateSelector(current_registry.PLANNER_TOOL_REGISTRY).select(
+        goal,
+        state,
+        planner_context,
+    )
+    generator = current_tool_aware.LLMPlanDraftGenerator(generation_service=_FakeLLMPlanService("{}"))
+
+    prompt = generator._build_prompt(
+        goal,
+        state,
+        selection.candidate_tools,
+        current_registry.PLANNER_TOOL_REGISTRY,
+        planner_context,
+    )
+
+    assert "arxiv_search_binding_examples" in prompt
+    assert '"input_key": "normalized_request"' in prompt
+    assert '"source_type": "step_output"' in prompt
+    assert '"step_id": "normalize_request"' in prompt
+    assert "goal.constraints" in prompt
+    assert "submittedDate:descending" in prompt
 
 
 def test_rule_based_failure_after_llm_failure_falls_back_to_legacy_template(monkeypatch) -> None:

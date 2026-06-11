@@ -34,6 +34,93 @@ def _tool(tool_name: str):
     return tool
 
 
+def _step(
+    *,
+    step_id: str,
+    action_type: str,
+    tool_name: str,
+    output_key: str,
+    input_bindings: list[StepInputBinding],
+    depends_on: list[str] | None = None,
+) -> PlanStep:
+    tool = _tool(tool_name)
+    return PlanStep(
+        step_id=step_id,
+        action_type=action_type,
+        tool_name=tool_name,
+        tool=tool,
+        output_key=output_key,
+        input_bindings=input_bindings,
+        depends_on=list(depends_on or []),
+        side_effect_level=tool.side_effect_level,
+    )
+
+
+def _llm_prefixed_arxiv_plan() -> ExecutablePlan:
+    goal = Goal(goal_id="arxiv_search:prefixed", goal_type="arxiv_search", user_request="帮我找 RAG 论文")
+    steps = [
+        _step(
+            step_id="step_normalize_request",
+            action_type="write_state",
+            tool_name="normalize_request",
+            output_key="normalized_request",
+            input_bindings=[
+                StepInputBinding(input_key="intent", source_type="state", source_key="intent"),
+                StepInputBinding(input_key="message", source_type="state", source_key="message"),
+                StepInputBinding(input_key="search_spec", source_type="search_spec", required=False),
+            ],
+        ),
+        _step(
+            step_id="step_build_arxiv_search_spec",
+            action_type="search",
+            tool_name="build_arxiv_search_spec",
+            output_key="search_spec",
+            input_bindings=[
+                StepInputBinding(input_key="normalized_request", source_type="step_output", step_id="step_normalize_request"),
+            ],
+            depends_on=["step_normalize_request"],
+        ),
+        _step(
+            step_id="step_search_arxiv",
+            action_type="search",
+            tool_name="search_arxiv",
+            output_key="arxiv_results",
+            input_bindings=[
+                StepInputBinding(input_key="search_spec", source_type="step_output", step_id="step_build_arxiv_search_spec"),
+            ],
+            depends_on=["step_build_arxiv_search_spec"],
+        ),
+        _step(
+            step_id="step_validate_arxiv_results",
+            action_type="validate",
+            tool_name="validate_arxiv_results",
+            output_key="arxiv_result_quality",
+            input_bindings=[
+                StepInputBinding(input_key="arxiv_results", source_type="step_output", step_id="step_search_arxiv"),
+            ],
+            depends_on=["step_search_arxiv"],
+        ),
+        _step(
+            step_id="step_synthesize_arxiv_response",
+            action_type="answer",
+            tool_name="synthesize_arxiv_response",
+            output_key="final_answer",
+            input_bindings=[
+                StepInputBinding(input_key="arxiv_results", source_type="step_output", step_id="step_search_arxiv"),
+                StepInputBinding(input_key="arxiv_result_quality", source_type="step_output", step_id="step_validate_arxiv_results"),
+            ],
+            depends_on=["step_validate_arxiv_results"],
+        ),
+    ]
+    return ExecutablePlan(
+        plan_id="arxiv_search:prefixed-plan",
+        goal=goal,
+        steps=steps,
+        entry_step_ids=["step_normalize_request"],
+        final_step_ids=["step_synthesize_arxiv_response"],
+    )
+
+
 def _resolved_paper_qa_plan(arxiv_id: str = "2401.00001", title: str = "RAG") -> ExecutablePlan:
     """构造已完成最终目标解析的 QA 计划，避免下游执行器测试依赖引用线索提取器。"""
     paper_ref = {"arxiv_id": arxiv_id, "title": title, "final_target_resolved": True}
@@ -129,6 +216,199 @@ def test_plan_executor_executes_linear_arxiv_plan(monkeypatch) -> None:
     assert result.plan is not None
     assert [step.status for step in result.plan.steps] == ["success"] * 6
     assert any(trace.event == "step_succeeded" and trace.step_id == "search_arxiv" for trace in result.trace)
+
+
+def test_plan_executor_build_spec_accepts_state_search_spec_object(monkeypatch) -> None:
+    """覆盖 LLM planner 直接把 state.search_spec 绑定给 build_spec 的路径。"""
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        assert tool_name == "search_arxiv_structured"
+        assert kwargs["query"] == "rag"
+        assert kwargs["max_results"] == 5
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": "searched",
+            "data": {"papers": [{"arxiv_id": "2401.00001", "title": "RAG Foundations"}]},
+            "trace": {"tool_name": tool_name},
+            "error": None,
+        }
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    state = AgentState(
+        intent="arxiv_search",
+        message="search rag",
+        search_spec=ArxivSearchSpec(intent="arxiv_search", query="rag", max_results=5),
+    )
+    for input_key in ("search_spec", "normalized_request"):
+        goal = Goal(goal_id=f"arxiv_search:llm-direct-spec:{input_key}", goal_type="arxiv_search", user_request="search rag")
+        plan = ExecutablePlan(
+            plan_id=f"arxiv_search:llm-direct-spec:{input_key}",
+            goal=goal,
+            steps=[
+                PlanStep(
+                    step_id="step_1_build_spec",
+                    action_type="search",
+                    tool_name="build_arxiv_search_spec",
+                    tool=_tool("build_arxiv_search_spec"),
+                    output_key="search_spec",
+                    input_bindings=[StepInputBinding(input_key=input_key, source_type="search_spec")],
+                ),
+                PlanStep(
+                    step_id="step_2_search",
+                    action_type="search",
+                    tool_name="search_arxiv",
+                    tool=_tool("search_arxiv"),
+                    output_key="arxiv_results",
+                    depends_on=["step_1_build_spec"],
+                    input_bindings=[StepInputBinding(input_key="search_spec", source_type="step_output", step_id="step_1_build_spec")],
+                ),
+                PlanStep(
+                    step_id="step_3_validate",
+                    action_type="validate",
+                    tool_name="validate_arxiv_results",
+                    tool=_tool("validate_arxiv_results"),
+                    output_key="arxiv_result_quality",
+                    depends_on=["step_2_search"],
+                    input_bindings=[StepInputBinding(input_key="arxiv_results", source_type="step_output", step_id="step_2_search")],
+                ),
+                PlanStep(
+                    step_id="step_4_answer",
+                    action_type="answer",
+                    tool_name="synthesize_arxiv_response",
+                    tool=_tool("synthesize_arxiv_response"),
+                    output_key="final_answer",
+                    depends_on=["step_3_validate"],
+                    input_bindings=[
+                        StepInputBinding(input_key="arxiv_results", source_type="step_output", step_id="step_2_search"),
+                        StepInputBinding(input_key="arxiv_result_quality", source_type="step_output", step_id="step_3_validate"),
+                    ],
+                ),
+            ],
+            entry_step_ids=["step_1_build_spec"],
+            final_step_ids=["step_4_answer"],
+        )
+
+        result = PlanExecutor().execute(plan, state)
+
+        assert result.status == "success"
+        assert result.outputs["search_spec"]["query"] == "rag"
+        assert result.outputs["search_spec"]["max_results"] == 5
+        assert "RAG Foundations" in result.final_answer
+        assert not any(
+            trace.event == "step_observed"
+            and trace.step_id == "step_1_build_spec"
+            and trace.detail.get("observation_status") == "tool_error"
+            for trace in result.trace
+        )
+
+
+def test_plan_executor_build_spec_normalizes_llm_constraint_list(monkeypatch) -> None:
+    """复现 LLM planner 把 goal.constraints 误绑到 normalized_request 的输入形态。"""
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        assert tool_name == "search_arxiv_structured"
+        assert kwargs["query"] == "RAG"
+        assert kwargs["categories"] == ["cs.CL", "cs.LG", "cs.IR", "cs.AI"]
+        assert kwargs["submitted_days_ago"] == 7
+        assert kwargs["max_results"] == 5
+        assert kwargs["sort_by"] == "submittedDate"
+        assert kwargs["sort_order"] == "descending"
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": "searched",
+            "data": {"papers": [{"arxiv_id": "2401.00001", "title": "RAG Foundations"}]},
+            "trace": {"tool_name": tool_name},
+            "error": None,
+        }
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    goal = Goal(goal_id="arxiv_search:llm-constraints", goal_type="arxiv_search", user_request="search rag")
+    plan = ExecutablePlan(
+        plan_id="arxiv_search:llm-constraints",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="step_1_build_spec",
+                action_type="search",
+                tool_name="build_arxiv_search_spec",
+                tool=_tool("build_arxiv_search_spec"),
+                output_key="search_spec",
+                input_bindings=[
+                    StepInputBinding(
+                        input_key="normalized_request",
+                        source_type="literal",
+                        value=[
+                            "query=RAG",
+                            "categories=cs.CL, cs.LG, cs.IR, cs.AI",
+                            "submitted_days_ago=7",
+                            "max_results=5",
+                            "sort_by=submittedDate:descending",
+                        ],
+                    ),
+                    StepInputBinding(
+                        input_key="search_spec",
+                        source_type="literal",
+                        value={
+                            "query": "RAG",
+                            "categories": ["cs.CL", "cs.LG", "cs.IR", "cs.AI"],
+                            "submitted_days_ago": 7,
+                            "max_results": 5,
+                            "sort_by": "submittedDate:descending",
+                        },
+                    ),
+                ],
+            ),
+            PlanStep(
+                step_id="step_2_search",
+                action_type="search",
+                tool_name="search_arxiv",
+                tool=_tool("search_arxiv"),
+                output_key="arxiv_results",
+                depends_on=["step_1_build_spec"],
+                input_bindings=[StepInputBinding(input_key="search_spec", source_type="step_output", step_id="step_1_build_spec")],
+            ),
+            PlanStep(
+                step_id="step_3_validate",
+                action_type="validate",
+                tool_name="validate_arxiv_results",
+                tool=_tool("validate_arxiv_results"),
+                output_key="arxiv_result_quality",
+                depends_on=["step_2_search"],
+                input_bindings=[StepInputBinding(input_key="arxiv_results", source_type="step_output", step_id="step_2_search")],
+            ),
+            PlanStep(
+                step_id="step_4_answer",
+                action_type="answer",
+                tool_name="synthesize_arxiv_response",
+                tool=_tool("synthesize_arxiv_response"),
+                output_key="final_answer",
+                depends_on=["step_3_validate"],
+                input_bindings=[
+                    StepInputBinding(input_key="arxiv_results", source_type="step_output", step_id="step_2_search"),
+                    StepInputBinding(input_key="arxiv_result_quality", source_type="step_output", step_id="step_3_validate"),
+                ],
+            ),
+        ],
+        entry_step_ids=["step_1_build_spec"],
+        final_step_ids=["step_4_answer"],
+    )
+
+    result = PlanExecutor().execute(plan, AgentState(intent="arxiv_search", message="search rag"))
+
+    assert result.status == "success"
+    assert result.outputs["search_spec"]["intent"] == "arxiv_search"
+    assert result.outputs["search_spec"]["sort_by"] == "submittedDate"
+    assert result.outputs["search_spec"]["sort_order"] == "descending"
+    assert not any(
+        trace.event == "step_observed"
+        and trace.step_id == "step_1_build_spec"
+        and trace.detail.get("observation_status") == "tool_error"
+        for trace in result.trace
+    )
 
 
 def test_plan_executor_skips_false_condition_and_continues_dag() -> None:
@@ -530,6 +810,261 @@ def test_plan_executor_replans_empty_arxiv_search_before_fallback(monkeypatch) -
     assert replan_traces[0].detail.get("recovery_candidates")
     assert any(step.tool_name == "rewrite_arxiv_query" for step in result.plan.steps)
     assert any(trace.event == "step_succeeded" and trace.step_id == "rewrite_arxiv_query" for trace in result.trace)
+
+
+def test_plan_executor_replans_prefixed_llm_arxiv_steps_without_losing_search_spec(monkeypatch) -> None:
+    calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        assert tool_name == "search_arxiv_structured"
+        calls.append(dict(kwargs))
+        papers = [] if len(calls) == 1 else [{"arxiv_id": "2401.00001", "title": "RAG retry result"}]
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": "searched",
+            "data": {"papers": papers},
+            "trace": {"tool_name": tool_name, "query": kwargs.get("query")},
+            "error": None,
+        }
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    state = AgentState(
+        intent="arxiv_search",
+        message="帮我找最近 7 天关于 RAG 的 5 篇论文",
+        search_spec=ArxivSearchSpec(
+            intent="arxiv_search",
+            query="RAG",
+            submitted_days_ago=7,
+            max_results=5,
+            sort_by="submittedDate",
+            sort_order="descending",
+        ),
+    )
+
+    result = PlanExecutor().execute(_llm_prefixed_arxiv_plan(), state)
+
+    assert result.status == "success"
+    assert len(calls) == 2
+    assert calls[1]["query"] == "RAG"
+    assert calls[1]["submitted_days_ago"] == 7
+    assert calls[1]["max_results"] == 5
+    assert "RAG retry result" in result.final_answer
+    assert any(trace.event == "plan_replanned" for trace in result.trace)
+    assert any(trace.step_id == "rewrite_arxiv_query" and trace.event == "step_succeeded" for trace in result.trace)
+
+
+def test_plan_executor_injects_parsed_search_spec_when_llm_plan_omits_optional_binding(monkeypatch) -> None:
+    calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        assert tool_name == "search_arxiv_structured"
+        calls.append(dict(kwargs))
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": "searched",
+            "data": {"papers": [{"arxiv_id": "2401.00001", "title": "RAG parsed spec"}]},
+            "trace": {"tool_name": tool_name, "query": kwargs.get("query")},
+            "error": None,
+        }
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    goal = Goal(goal_id="arxiv_search:omitted-spec-binding", goal_type="arxiv_search", user_request="帮我找最近 7 天关于 RAG 的 5 篇论文")
+    plan = ExecutablePlan(
+        plan_id="arxiv_search:omitted-spec-binding",
+        goal=goal,
+        steps=[
+            _step(
+                step_id="normalize_request",
+                action_type="write_state",
+                tool_name="normalize_request",
+                output_key="normalized_request",
+                input_bindings=[StepInputBinding(input_key="message", source_type="state", source_key="message")],
+            ),
+            _step(
+                step_id="build_arxiv_search_spec",
+                action_type="search",
+                tool_name="build_arxiv_search_spec",
+                output_key="search_spec",
+                input_bindings=[StepInputBinding(input_key="normalized_request", source_type="step_output", step_id="normalize_request")],
+                depends_on=["normalize_request"],
+            ),
+            _step(
+                step_id="search_arxiv",
+                action_type="search",
+                tool_name="search_arxiv",
+                output_key="arxiv_results",
+                input_bindings=[StepInputBinding(input_key="search_spec", source_type="step_output", step_id="build_arxiv_search_spec")],
+                depends_on=["build_arxiv_search_spec"],
+            ),
+            _step(
+                step_id="validate_arxiv_results",
+                action_type="validate",
+                tool_name="validate_arxiv_results",
+                output_key="arxiv_result_quality",
+                input_bindings=[StepInputBinding(input_key="arxiv_results", source_type="step_output", step_id="search_arxiv")],
+                depends_on=["search_arxiv"],
+            ),
+            _step(
+                step_id="synthesize_arxiv_response",
+                action_type="answer",
+                tool_name="synthesize_arxiv_response",
+                output_key="final_answer",
+                input_bindings=[
+                    StepInputBinding(input_key="arxiv_results", source_type="step_output", step_id="search_arxiv"),
+                    StepInputBinding(input_key="arxiv_result_quality", source_type="step_output", step_id="validate_arxiv_results"),
+                ],
+                depends_on=["validate_arxiv_results"],
+            ),
+        ],
+        entry_step_ids=["normalize_request"],
+        final_step_ids=["synthesize_arxiv_response"],
+    )
+    state = AgentState(
+        intent="arxiv_search",
+        message="帮我找最近 7 天关于 RAG 的 5 篇论文",
+        search_spec=ArxivSearchSpec(
+            intent="arxiv_search",
+            query="RAG",
+            categories=["cs.CL", "cs.LG", "cs.IR", "cs.AI"],
+            submitted_days_ago=7,
+            max_results=5,
+            sort_by="submittedDate",
+            sort_order="descending",
+        ),
+    )
+
+    result = PlanExecutor().execute(plan, state)
+
+    assert result.status == "success"
+    assert calls == [
+        {
+            "intent": "arxiv_search",
+            "query": "RAG",
+            "categories": ["cs.CL", "cs.LG", "cs.IR", "cs.AI"],
+            "submitted_days_ago": 7,
+            "max_results": 5,
+            "sort_by": "submittedDate",
+            "sort_order": "descending",
+            "field_operator": "AND",
+            "category_operator": "OR",
+        }
+    ]
+    assert "RAG parsed spec" in result.final_answer
+
+
+def test_plan_executor_accepts_llm_user_request_alias_and_wrapped_ranked_papers(monkeypatch) -> None:
+    """复现 19:31 的 LLM 草稿形态，避免 state/user_request 和 ranked_papers 包裹体再次打断执行。"""
+    calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        assert tool_name == "search_arxiv_structured"
+        calls.append(dict(kwargs))
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": "searched",
+            "data": {"papers": [{"arxiv_id": "2606.00001", "title": "RAG Agents in Practice"}]},
+            "trace": {"tool_name": tool_name, "query": kwargs.get("query")},
+            "error": None,
+        }
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    goal = Goal(goal_id="arxiv_search:llm-aliases", goal_type="arxiv_search", user_request="帮我找最近 7 天关于 RAG 的 5 篇论文")
+    plan = ExecutablePlan(
+        plan_id="arxiv_search:llm-aliases",
+        goal=goal,
+        steps=[
+            _step(
+                step_id="normalize_request",
+                action_type="tool_call",
+                tool_name="normalize_request",
+                output_key="normalized_request",
+                input_bindings=[
+                    StepInputBinding(input_key="message", source_type="state", source_key="user_request"),
+                ],
+            ),
+            _step(
+                step_id="build_arxiv_search_spec",
+                action_type="tool_call",
+                tool_name="build_arxiv_search_spec",
+                output_key="arxiv_search_spec",
+                input_bindings=[
+                    StepInputBinding(input_key="normalized_request", source_type="step_output", step_id="normalize_request"),
+                ],
+                depends_on=["normalize_request"],
+            ),
+            _step(
+                step_id="search_arxiv",
+                action_type="tool_call",
+                tool_name="search_arxiv",
+                output_key="arxiv_results",
+                input_bindings=[
+                    StepInputBinding(input_key="search_spec", source_type="step_output", step_id="build_arxiv_search_spec"),
+                ],
+                depends_on=["build_arxiv_search_spec"],
+            ),
+            _step(
+                step_id="validate_arxiv_results",
+                action_type="tool_call",
+                tool_name="validate_arxiv_results",
+                output_key="validation_result",
+                input_bindings=[
+                    StepInputBinding(input_key="arxiv_results", source_type="step_output", step_id="search_arxiv"),
+                ],
+                depends_on=["search_arxiv"],
+            ),
+            _step(
+                step_id="synthesize_arxiv_response",
+                action_type="tool_call",
+                tool_name="synthesize_arxiv_response",
+                output_key="final_answer",
+                input_bindings=[
+                    StepInputBinding(input_key="ranked_papers", source_type="step_output", step_id="search_arxiv"),
+                    StepInputBinding(input_key="warnings", source_type="step_output", step_id="validate_arxiv_results"),
+                ],
+                depends_on=["search_arxiv", "validate_arxiv_results"],
+            ),
+        ],
+        entry_step_ids=["normalize_request"],
+        final_step_ids=["synthesize_arxiv_response"],
+    )
+    state = AgentState(
+        intent="arxiv_search",
+        message="帮我找最近 7 天关于 RAG 的 5 篇论文",
+        search_spec=ArxivSearchSpec(
+            intent="arxiv_search",
+            query="RAG",
+            categories=["cs.CL", "cs.LG", "cs.IR", "cs.AI"],
+            submitted_days_ago=7,
+            max_results=5,
+            sort_by="submittedDate",
+            sort_order="descending",
+        ),
+    )
+
+    result = PlanExecutor().execute(plan, state)
+
+    assert result.status == "success"
+    assert calls == [
+        {
+            "intent": "arxiv_search",
+            "query": "RAG",
+            "categories": ["cs.CL", "cs.LG", "cs.IR", "cs.AI"],
+            "submitted_days_ago": 7,
+            "max_results": 5,
+            "sort_by": "submittedDate",
+            "sort_order": "descending",
+            "field_operator": "AND",
+            "category_operator": "OR",
+        }
+    ]
+    assert "RAG Agents in Practice" in result.final_answer
+    assert not any(trace.detail.get("failure_reason") == "missing_input" for trace in result.trace)
 
 
 def test_plan_executor_reuses_persistent_write_output_without_duplicate_call(monkeypatch) -> None:

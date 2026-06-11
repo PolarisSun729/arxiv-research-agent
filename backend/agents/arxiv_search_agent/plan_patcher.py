@@ -123,6 +123,38 @@ def _paper_reference_binding_from_index_step(failed_step: PlanStep) -> StepInput
     return _binding("paper_reference", source_type="step_output", step_id="resolve_paper")
 
 
+def _step_ids_for_tool(plan: ExecutablePlan, tool_name: str) -> List[str]:
+    """按工具名查找真实 step_id，兼容 LLM 草稿生成的自定义步骤命名。"""
+    return [
+        step.step_id
+        for step in list(plan.steps or [])
+        if step.tool_name == tool_name
+    ]
+
+
+def _search_spec_binding_for_rewrite(plan: ExecutablePlan, failed_step: PlanStep) -> StepInputBinding:
+    """复用失败搜索步骤的搜索规格来源，避免恢复链硬编码规则计划的 step_id。"""
+    for binding in list(failed_step.input_bindings or []):
+        if binding.input_key != "search_spec":
+            continue
+        if binding.source_type == "step_output" and binding.step_id:
+            return _binding("search_spec", source_type="step_output", step_id=binding.step_id, required=False)
+        if binding.source_type == "literal":
+            return _binding("search_spec", source_type="literal", value=binding.value, required=False)
+        if binding.source_type in {"state", "context", "goal", "search_spec"}:
+            return _binding(
+                "search_spec",
+                source_type=binding.source_type,
+                source_key=binding.source_key,
+                required=False,
+            )
+
+    build_step_ids = _step_ids_for_tool(plan, "build_arxiv_search_spec")
+    if build_step_ids:
+        return _binding("search_spec", source_type="step_output", step_id=build_step_ids[-1], required=False)
+    return _binding("search_spec", source_type="search_spec", required=False)
+
+
 class PlanPatcher:
     """把 RecoveryAction 落地为计划修改或 fallback，并统一负责 patch 后校验。"""
 
@@ -232,13 +264,15 @@ class PlanPatcher:
         rewrite_step_id = self._make_unique_step_id(plan_copy, "rewrite_arxiv_query")
         search_step_id = self._make_unique_step_id(plan_copy, "search_arxiv")
         validate_step_id = self._make_unique_step_id(plan_copy, "validate_arxiv_results")
+        existing_search_step_ids = list(dict.fromkeys([failed_step.step_id, "search_arxiv", *_step_ids_for_tool(plan_copy, "search_arxiv")]))
+        existing_validate_step_ids = list(dict.fromkeys(["validate_arxiv_results", *_step_ids_for_tool(plan_copy, "validate_arxiv_results")]))
         rewrite_step = self._build_step(
             step_id=rewrite_step_id,
             action_type="rewrite",
             tool_name="rewrite_arxiv_query",
             output_key=self._make_unique_output_key(plan_copy, "rewritten_search_spec"),
             depends_on=[failed_step.step_id],
-            input_bindings=[_binding("search_spec", source_type="step_output", step_id="build_arxiv_search_spec", required=False)],
+            input_bindings=[_search_spec_binding_for_rewrite(plan_copy, failed_step)],
         )
         search_step = self._build_step(
             step_id=search_step_id,
@@ -262,7 +296,7 @@ class PlanPatcher:
         self._repoint_pending_bindings(
             plan_copy,
             runtime_copy,
-            old_step_ids=["search_arxiv"],
+            old_step_ids=existing_search_step_ids,
             new_step_id=search_step_id,
             input_keys=["arxiv_results"],
             exclude_step_ids=inserted_step_ids,
@@ -270,7 +304,7 @@ class PlanPatcher:
         self._repoint_pending_bindings(
             plan_copy,
             runtime_copy,
-            old_step_ids=["validate_arxiv_results"],
+            old_step_ids=existing_validate_step_ids,
             new_step_id=validate_step_id,
             input_keys=["arxiv_result_quality"],
             exclude_step_ids=inserted_step_ids,

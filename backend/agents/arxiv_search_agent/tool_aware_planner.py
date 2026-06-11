@@ -233,6 +233,51 @@ class ToolCandidateSelector:
         return f"tool capabilities {sorted(tags)} do not match goal_type={goal_type}"
 
 
+def _planner_few_shot_examples(goal_type: Optional[str]) -> Dict[str, Any]:
+    """给 LLM planner 提供短示例，重点约束容易错绑的 arXiv 搜索输入。"""
+    normalized_goal_type = str(goal_type or "").strip()
+    if normalized_goal_type != "arxiv_search":
+        return {}
+    return {
+        "arxiv_search_binding_examples": {
+            "valid": {
+                "steps": [
+                    {
+                        "step_id": "normalize_request",
+                        "tool_name": "normalize_request",
+                        "input_bindings": [
+                            {"input_key": "intent", "source_type": "state", "source_key": "intent"},
+                            {"input_key": "message", "source_type": "state", "source_key": "message"},
+                            {"input_key": "search_spec", "source_type": "search_spec"},
+                        ],
+                        "expected_output": {"output_key": "normalized_request"},
+                    },
+                    {
+                        "step_id": "build_arxiv_search_spec",
+                        "tool_name": "build_arxiv_search_spec",
+                        "depends_on": ["normalize_request"],
+                        "input_bindings": [
+                            {"input_key": "normalized_request", "source_type": "step_output", "step_id": "normalize_request"}
+                        ],
+                        "expected_output": {"output_key": "search_spec"},
+                    },
+                ],
+            },
+            "invalid": [
+                {
+                    "reason": "goal.constraints 是解释性约束列表，不是 normalized_request dict。",
+                    "binding": {"input_key": "normalized_request", "source_type": "goal", "source_key": "constraints"},
+                },
+                {
+                    "reason": "不要把 sort_by 和 sort_order 合并成一个字符串。",
+                    "search_spec": {"sort_by": "submittedDate:descending"},
+                    "use_instead": {"sort_by": "submittedDate", "sort_order": "descending"},
+                },
+            ],
+        }
+    }
+
+
 class LLMPlanDraftGenerator:
     """受控 LLM PlanDraft 生成器。
 
@@ -352,6 +397,7 @@ class LLMPlanDraftGenerator:
                 # 真正的确认门禁仍由 converter / validator / executor 统一兜底。
                 "allow_human_confirmation": any(tool.requires_confirmation for tool in list(candidate_tools or [])),
             },
+            "few_shot_examples": _planner_few_shot_examples(goal.goal_type),
             "allowed_output_schema": {
                 "draft_id": "string",
                 "plan_intent": "string",
@@ -394,6 +440,8 @@ class LLMPlanDraftGenerator:
             "paper_qa 必须先 resolve_paper，再 check_paper_index，再 answer_paper_question。\n"
             "preference_action 写入必须先 resolve_preference_target，再 update_preference_store，再 verify，再 answer。\n"
             "unsupported 请求只能选择 fallback 工具。\n"
+            "arxiv_search 的 build_arxiv_search_spec.normalized_request 必须来自 normalize_request 的 step_output；不要绑定 goal.constraints。\n"
+            "arxiv_search 的 sort_by 和 sort_order 必须拆成两个字段，不要输出 submittedDate:descending 这类合并字符串。\n"
             "输出 JSON 必须符合 allowed_output_schema。\n"
             f"{json.dumps(prompt_payload, ensure_ascii=False)}"
         )
@@ -1467,6 +1515,8 @@ def _validate_required_executable_sequence(goal: Goal, steps: Sequence[PlanStep]
     goal_type = str(goal.goal_type or "").strip()
     tool_names = [str(step.tool_name or "").strip() for step in list(steps or [])]
     reasons: List[str] = []
+    if goal_type == "arxiv_search":
+        reasons.extend(_validate_arxiv_search_executable_sequence(steps))
     if goal_type == "paper_qa" and "answer_paper_question" in tool_names:
         for tool_name in ("resolve_paper", "check_paper_index", "assess_paper_qa_quality"):
             if tool_name not in tool_names:
@@ -1476,6 +1526,79 @@ def _validate_required_executable_sequence(goal: Goal, steps: Sequence[PlanStep]
             if tool_name not in tool_names:
                 reasons.append(f"preference_action plan missing required tool {tool_name}")
     return reasons
+
+
+def _validate_arxiv_search_executable_sequence(steps: Sequence[PlanStep]) -> List[str]:
+    """校验 arXiv 搜索计划的绑定语义，避免解释性 constraints 在执行期才暴露为类型错误。"""
+    tool_names = [str(step.tool_name or "").strip() for step in list(steps or [])]
+    steps_by_id = {str(step.step_id or "").strip(): step for step in list(steps or []) if str(step.step_id or "").strip()}
+    reasons: List[str] = []
+    required_tools = [
+        "normalize_request",
+        "build_arxiv_search_spec",
+        "search_arxiv",
+        "validate_arxiv_results",
+        "synthesize_arxiv_response",
+    ]
+    for tool_name in required_tools:
+        if tool_name not in tool_names:
+            reasons.append(f"arxiv_search plan missing required tool {tool_name}")
+    reasons.extend(_validate_order(tool_names, required_tools, "arxiv_search"))
+
+    for step in list(steps or []):
+        if step.tool_name != "build_arxiv_search_spec":
+            continue
+        if not _depends_on_tool(step, steps, "normalize_request"):
+            reasons.append("arxiv_search build_arxiv_search_spec must depend on normalize_request")
+        normalized_bindings = [
+            binding
+            for binding in list(step.input_bindings or [])
+            if str(binding.input_key or "").strip() == "normalized_request"
+        ]
+        if not normalized_bindings:
+            reasons.append("arxiv_search build_arxiv_search_spec requires normalized_request from normalize_request")
+        for binding in normalized_bindings:
+            dependency_step = steps_by_id.get(str(binding.step_id or "").strip())
+            if not (
+                binding.source_type == "step_output"
+                and dependency_step is not None
+                and dependency_step.tool_name == "normalize_request"
+            ):
+                reasons.append(
+                    "arxiv_search build_arxiv_search_spec.normalized_request must come from normalize_request step_output"
+                    f", got {_binding_source_label(binding)}"
+                )
+        for binding in list(step.input_bindings or []):
+            input_key = str(binding.input_key or "").strip()
+            if input_key not in {"normalized_request", "search_spec"}:
+                continue
+            if binding.source_type == "goal" and str(binding.source_key or "").strip() == "constraints":
+                reasons.append(
+                    f"arxiv_search build_arxiv_search_spec.{input_key} cannot bind goal.constraints; use normalize_request output or search_spec"
+                )
+            if binding.source_type == "literal" and isinstance(binding.value, (list, tuple, set)):
+                reasons.append(
+                    f"arxiv_search build_arxiv_search_spec.{input_key} cannot use constraint list literal"
+                )
+            if binding.source_type == "literal" and isinstance(binding.value, Mapping):
+                sort_by = str(binding.value.get("sort_by") or "").strip()
+                if ":" in sort_by:
+                    reasons.append(
+                        f"arxiv_search build_arxiv_search_spec.{input_key} must split sort_by and sort_order instead of {sort_by}"
+                    )
+    return reasons
+
+
+def _binding_source_label(binding: StepInputBinding) -> str:
+    """把绑定来源压成日志/错误里可读的一行，便于定位 LLM 草稿错绑点。"""
+    source_type = str(binding.source_type or "").strip()
+    if source_type == "step_output":
+        return f"step_output:{binding.step_id}"
+    if source_type in {"state", "context", "goal"}:
+        return f"{source_type}:{binding.source_key}"
+    if source_type == "literal":
+        return f"literal:{type(binding.value).__name__}"
+    return source_type or "unknown"
 
 
 def _has_draft_cycle(dependencies_by_step: Mapping[str, Sequence[str]]) -> bool:
