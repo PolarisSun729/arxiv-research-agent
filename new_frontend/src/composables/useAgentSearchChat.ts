@@ -17,7 +17,23 @@ interface AgentResumePayload {
   note?: string | null
   step_id?: string | null
   interrupt_id?: string | null
+  tool_name?: string | null
+  pending_action_id?: string | null
   edited_arguments?: Record<string, any> | null
+}
+
+interface ActiveConfirmationSubmission {
+  key: string
+  decision: ResumeDecision
+  step_id?: string | null
+  tool_name?: string | null
+  pending_action_id?: string | null
+}
+
+interface SubmitMessageOptions {
+  resume?: AgentResumePayload
+  optimisticToolCall?: AgentToolCall
+  skipUserMessage?: boolean
 }
 
 function createMessageId(prefix: 'user' | 'assistant') {
@@ -111,9 +127,12 @@ function upsertToolCall(response: ArxivSearchResponse, toolCall: AgentToolCall) 
 }
 
 function normalizePendingActionForDisplay(action: AgentPendingAction | Record<string, any> | null | undefined): AgentPendingAction | null {
+  if (!action || typeof action !== 'object') return null
   // pending_action 只是后端确认请求的展示镜像；批准后的 approved/cancelled 中间态不能继续当待确认卡片展示。
   if (!action || typeof action !== 'object') return null
-  return action.status === 'waiting_confirmation' ? { ...action } as AgentPendingAction : null
+  return action.status === 'waiting_confirmation' || action.status === 'confirming'
+    ? { ...action } as AgentPendingAction
+    : null
 }
 
 function applyFinalResponse(response: ArxivSearchResponse, finalResponse: Record<string, any>) {
@@ -126,9 +145,69 @@ function applyFinalResponse(response: ArxivSearchResponse, finalResponse: Record
   response.pending_action = normalizePendingActionForDisplay(response.pending_action)
 }
 
+function getPendingActionKey(action: AgentPendingAction | Record<string, any> | null | undefined) {
+  if (!action || typeof action !== 'object') return ''
+  const pendingActionId = String(action.pending_action_id || action.confirmation_request?.pending_action_id || '').trim()
+  if (pendingActionId) return `pending:${pendingActionId}`
+  const sessionId = String(action.session_id || action.confirmation_request?.session_id || '').trim()
+  const stepId = String(action.step_id || action.confirmation_request?.step_id || '').trim()
+  const toolName = String(action.tool_name || action.confirmation_request?.tool_name || '').trim()
+  return [sessionId, stepId, toolName].some(Boolean) ? `step:${sessionId}:${stepId}:${toolName}` : ''
+}
+
+function isPendingActionVisible(action: AgentPendingAction | Record<string, any> | null | undefined): action is AgentPendingAction {
+  return Boolean(action && typeof action === 'object' && (action.status === 'waiting_confirmation' || action.status === 'confirming'))
+}
+
+function normalizePendingActionForBanner(action: AgentPendingAction | Record<string, any> | null | undefined): AgentPendingAction | null {
+  if (!isPendingActionVisible(action)) return null
+  return { ...action }
+}
+
+function buildConfirmationPlaceholder(decision: ResumeDecision, action: AgentPendingAction) {
+  const toolName = String(action.tool_name || '').trim() || '当前工具'
+  const stepId = String(action.step_id || '').trim()
+  const pendingActionId = String(action.pending_action_id || '').trim()
+  if (decision === 'approve') {
+    return `已提交确认请求，等待执行 ${toolName}${stepId ? ` (${stepId})` : ''}`
+  }
+  return `已提交取消请求，等待后端消费 ${toolName}${pendingActionId ? ` [${pendingActionId}]` : ''}`
+}
+
+function shouldIgnoreBlockedPendingAction(
+  action: AgentPendingAction | Record<string, any> | null | undefined,
+  blockedPendingActionKey?: string | null
+) {
+  if (!blockedPendingActionKey) return false
+  const incomingKey = getPendingActionKey(action)
+  return Boolean(incomingKey) && incomingKey === blockedPendingActionKey
+}
+
+function applyFinalResponseWithConfirmationGuard(
+  response: ArxivSearchResponse,
+  finalResponse: Record<string, any>,
+  blockedPendingActionKey?: string | null
+) {
+  if (!blockedPendingActionKey) {
+    applyFinalResponse(response, finalResponse)
+    return
+  }
+  const existingToolCalls = Array.isArray(response.tool_calls) ? [...response.tool_calls] : []
+  Object.assign(response, finalResponse)
+  if ((!Array.isArray(response.tool_calls) || response.tool_calls.length === 0) && existingToolCalls.length) {
+    response.tool_calls = existingToolCalls
+  }
+  response.pending_action = shouldIgnoreBlockedPendingAction(response.pending_action, blockedPendingActionKey)
+    ? null
+    : normalizePendingActionForBanner(response.pending_action)
+}
+
 function applyStreamEvent(
   target: AgentChatMessage<ArxivSearchResponse>,
-  event: AgentStreamEvent
+  event: AgentStreamEvent,
+  options?: {
+    blockedPendingActionKey?: string | null
+  }
 ) {
   const response = ensureAssistantResponse(target)
   response.streaming_state = {
@@ -181,7 +260,10 @@ function applyStreamEvent(
         response.search_spec = event.data.state.search_spec
       }
       if (Object.prototype.hasOwnProperty.call(event.data.state, 'pending_action')) {
-        response.pending_action = normalizePendingActionForDisplay(event.data.state.pending_action)
+        const incomingPendingAction = normalizePendingActionForBanner(event.data.state.pending_action)
+        response.pending_action = shouldIgnoreBlockedPendingAction(incomingPendingAction, options?.blockedPendingActionKey)
+          ? null
+          : incomingPendingAction
       }
       if (Object.prototype.hasOwnProperty.call(event.data.state, 'paper_qa_result')) {
         response.paper_qa_result = event.data.state.paper_qa_result || null
@@ -237,7 +319,7 @@ function applyStreamEvent(
   if (event.event_type === 'final_response') {
     const finalResponse = event.data?.response
     if (finalResponse && typeof finalResponse === 'object') {
-      applyFinalResponse(response, finalResponse)
+      applyFinalResponseWithConfirmationGuard(response, finalResponse, options?.blockedPendingActionKey)
       response.streaming_state = {
         run_id: event.run_id,
         sequence: event.sequence,
@@ -253,7 +335,7 @@ function applyStreamEvent(
   if (event.event_type === 'exception') {
     const exceptionResponse = event.data?.response
     if (exceptionResponse && typeof exceptionResponse === 'object') {
-      applyFinalResponse(response, exceptionResponse)
+      applyFinalResponseWithConfirmationGuard(response, exceptionResponse, options?.blockedPendingActionKey)
       target.content = response.answer || String(event.data?.detail || 'Agent 流式请求失败')
     }
     target.error = String(event.data?.detail || 'Agent 流式请求失败')
@@ -263,7 +345,7 @@ function applyStreamEvent(
   if (event.event_type === 'stream_end') {
     const finalResponse = event.data?.response
     if (finalResponse && typeof finalResponse === 'object') {
-      applyFinalResponse(response, finalResponse)
+      applyFinalResponseWithConfirmationGuard(response, finalResponse, options?.blockedPendingActionKey)
       target.content = response.answer || target.content
     }
     target.loading = false
@@ -323,6 +405,7 @@ export function useAgentSearchChat() {
   const latestResponse = ref<ArxivSearchResponse | null>(null)
   const lastSearchPapers = ref<AgentPaper[]>([])
   const pendingAction = ref<AgentPendingAction | null>(null)
+  const activeConfirmationSubmission = ref<ActiveConfirmationSubmission | null>(null)
   const selectedPaper = ref<AgentPaper | null>(null)
   const paperQaResult = ref<Record<string, any> | null>(null)
   const activeSessionId = ref<string | null>(null)
@@ -345,6 +428,7 @@ export function useAgentSearchChat() {
     latestResponse.value = null
     lastSearchPapers.value = []
     pendingAction.value = null
+    activeConfirmationSubmission.value = null
     selectedPaper.value = null
     paperQaResult.value = null
     activeSessionId.value = null
@@ -388,23 +472,38 @@ export function useAgentSearchChat() {
   function rememberPendingAction(response: ArxivSearchResponse | null | undefined) {
     if (isResumeCheckpointNotFound(response)) {
       pendingAction.value = null
+      activeConfirmationSubmission.value = null
       return
     }
 
     const resultStatus = response?.paper_qa_result?.status
-    const displayPendingAction = normalizePendingActionForDisplay(response?.pending_action)
+    const displayPendingAction = normalizePendingActionForBanner(response?.pending_action)
+    const activePendingActionKey = activeConfirmationSubmission.value?.key || null
+    if (shouldIgnoreBlockedPendingAction(displayPendingAction, activePendingActionKey)) {
+      return
+    }
     if (displayPendingAction && resultStatus === 'waiting_confirmation') {
       pendingAction.value = { ...displayPendingAction }
+      activeConfirmationSubmission.value = null
       return
     }
 
-    if (resultStatus === 'success' || resultStatus === 'failed') {
+    const responsePendingStatus = String(response?.pending_action?.status || '').trim()
+    if (
+      resultStatus === 'success'
+      || resultStatus === 'failed'
+      || responsePendingStatus === 'approved'
+      || responsePendingStatus === 'rejected'
+      || response?.pending_action?.confirmation_consumed === true
+    ) {
       pendingAction.value = null
+      activeConfirmationSubmission.value = null
       return
     }
 
     if (!response?.pending_action && resultStatus !== 'waiting_confirmation') {
       pendingAction.value = null
+      activeConfirmationSubmission.value = null
     }
   }
 
@@ -423,10 +522,7 @@ export function useAgentSearchChat() {
 
   async function submitMessage(
     rawMessage?: string,
-    options?: {
-      resume?: AgentResumePayload
-      optimisticToolCall?: AgentToolCall
-    }
+    options?: SubmitMessageOptions
   ) {
     const message = (rawMessage ?? inputMessage.value).trim()
     if (!message || loading.value) return
@@ -438,7 +534,7 @@ export function useAgentSearchChat() {
 
     const userMessage: AgentChatMessage<ArxivSearchResponse> = {
       id: userMessageId,
-      role: 'user',
+      role: options?.skipUserMessage ? 'system' : 'user',
       content: message,
       loading: false,
       createdAt,
@@ -467,7 +563,10 @@ export function useAgentSearchChat() {
       }
     }
 
-    messages.value.push(userMessage, assistantMessage)
+    if (!options?.skipUserMessage) {
+      messages.value.push(userMessage)
+    }
+    messages.value.push(assistantMessage)
     latestResponse.value = null
     inputMessage.value = ''
     loading.value = true
@@ -521,7 +620,9 @@ export function useAgentSearchChat() {
           onEvent: event => {
             const currentTarget = messages.value.find(item => item.id === assistantId)
             if (currentTarget) {
-              applyStreamEvent(currentTarget, event)
+              applyStreamEvent(currentTarget, event, {
+                blockedPendingActionKey: activeConfirmationSubmission.value?.key || null
+              })
             }
           }
         }
@@ -537,23 +638,33 @@ export function useAgentSearchChat() {
       rememberSelectedPaper(response)
       rememberPaperQaResult(response)
       rememberPendingAction(response)
+      const displayResponse: ArxivSearchResponse = {
+        ...response,
+        pending_action: shouldIgnoreBlockedPendingAction(response.pending_action, activeConfirmationSubmission.value?.key || null)
+          ? null
+          : normalizePendingActionForBanner(response.pending_action)
+      }
       if (target.response) {
         target.response = {
           ...target.response,
-          ...response
+          ...displayResponse
         }
       } else {
-        target.response = response
+        target.response = displayResponse
       }
-      setAssistantResponse(target, response)
+      setAssistantResponse(target, (target.response || displayResponse) as ArxivSearchResponse)
     } catch (streamError) {
       // stream 已经返回明确 resume 失效语义时，不再把同一份 resume 请求 fallback 到普通接口重复尝试。
       if (options?.resume && target.response && isResumeCheckpointNotFound(target.response)) {
         const failedResponse = normalizeResumeCheckpointFailure(target.response)
+        const failedDisplayResponse: ArxivSearchResponse = {
+          ...failedResponse,
+          pending_action: normalizePendingActionForBanner(failedResponse.pending_action)
+        }
         latestResponse.value = failedResponse
         rememberPaperQaResult(failedResponse)
         rememberPendingAction(failedResponse)
-        setAssistantResponse(target, failedResponse)
+        setAssistantResponse(target, failedDisplayResponse)
         ElMessage.warning(RESUME_CHECKPOINT_NOT_FOUND_MESSAGE)
         return
       }
@@ -570,13 +681,17 @@ export function useAgentSearchChat() {
           normalizeResumeCheckpointFailure(fallbackResponse)
           ElMessage.warning(RESUME_CHECKPOINT_NOT_FOUND_MESSAGE)
         }
+        const fallbackDisplayResponse: ArxivSearchResponse = {
+          ...fallbackResponse,
+          pending_action: normalizePendingActionForBanner(fallbackResponse.pending_action)
+        }
         latestResponse.value = fallbackResponse
         rememberSessionId(fallbackResponse)
         rememberSearchPapers(fallbackResponse)
         rememberSelectedPaper(fallbackResponse)
         rememberPaperQaResult(fallbackResponse)
         rememberPendingAction(fallbackResponse)
-        setAssistantResponse(target, fallbackResponse)
+        setAssistantResponse(target, fallbackDisplayResponse)
       } catch (fallbackError) {
         const errorMessage = getErrorMessage(
           fallbackError,
@@ -587,6 +702,8 @@ export function useAgentSearchChat() {
           'Agent 流式请求失败，已切换到错误响应',
           errorMessage
         )
+        pendingAction.value = null
+        activeConfirmationSubmission.value = null
         latestResponse.value = errorResponse
         target.content = errorMessage
         target.response = errorResponse
@@ -604,7 +721,7 @@ export function useAgentSearchChat() {
   }
 
   async function submitResume(decision: ResumeDecision, note?: string, editedArguments?: Record<string, any>) {
-    if (!pendingAction.value || loading.value) return
+    if (!pendingAction.value || loading.value || pendingAction.value.status === 'confirming') return
     const confirmationRequest = pendingAction.value.confirmation_request || {}
     const currentPendingAction = { ...pendingAction.value }
     const mergedEditedArguments = {
@@ -615,19 +732,37 @@ export function useAgentSearchChat() {
       decision,
       note: note || null,
       step_id: currentPendingAction.step_id || confirmationRequest.step_id || null,
-      interrupt_id: currentPendingAction.interrupt_id || confirmationRequest.interrupt_id || null
+      interrupt_id: currentPendingAction.interrupt_id || confirmationRequest.interrupt_id || null,
+      tool_name: currentPendingAction.tool_name || confirmationRequest.tool_name || null,
+      pending_action_id: currentPendingAction.pending_action_id || confirmationRequest.pending_action_id || null
     }
     if (Object.keys(mergedEditedArguments).length) {
       // 目标论文确认只通过 edited_arguments 传稳定 paper_id/arxiv_id；message 仍只是占位文本。
       resumePayload.edited_arguments = mergedEditedArguments
     }
-    pendingAction.value = null
+    const pendingActionKey = getPendingActionKey(currentPendingAction)
+    activeConfirmationSubmission.value = pendingActionKey
+      ? {
+          key: pendingActionKey,
+          decision,
+          step_id: resumePayload.step_id,
+          tool_name: resumePayload.tool_name,
+          pending_action_id: resumePayload.pending_action_id
+        }
+      : null
+    pendingAction.value = {
+      ...currentPendingAction,
+      status: 'confirming',
+      decision,
+      edited_arguments: Object.keys(mergedEditedArguments).length ? mergedEditedArguments : currentPendingAction.edited_arguments || null
+    }
     const isPaperTargetConfirmation = currentPendingAction.request_type === 'paper_target_confirmation'
       || currentPendingAction.type === 'paper_target_confirmation'
 
-    await submitMessage(decision === 'approve' ? '确认执行当前工具操作' : '拒绝执行当前工具操作', {
-      // 确认按钮必须走结构化 resume；message 只是满足后端请求模型的可读占位文本。
+    await submitMessage(buildConfirmationPlaceholder(decision, currentPendingAction), {
+      // 确认按钮必须走结构化 resume；这里的 message 只保留给请求体做可读占位，不能再驱动后端判断确认对象。
       resume: resumePayload,
+      skipUserMessage: true,
       optimisticToolCall: decision === 'approve'
         ? {
             tool_name: String(currentPendingAction.tool_name || (isPaperTargetConfirmation ? 'resolve_paper' : 'parse_and_index_paper')),

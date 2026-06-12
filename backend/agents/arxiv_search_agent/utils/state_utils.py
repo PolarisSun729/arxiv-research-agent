@@ -65,15 +65,13 @@ def _replace_plan_steps(state: AgentState, steps: List[PlanStep]) -> AgentState:
 def _ensure_plan_runtime(state: AgentState) -> PlanRuntime:
     if isinstance(state.plan_runtime, PlanRuntime):
         return state.plan_runtime
+    # 新确认链路的恢复真源只能来自 PlanRuntime/AgentRuntimeState 本身；
+    # pending_action.confirmation_request 是前端展示镜像，不能在这里重新提升成待确认现场。
     return PlanRuntime(
         state={},
         goal=state.goal,
         plan=state.execution_plan,
-        pending_confirmation=(
-            (state.pending_action or {}).get("confirmation_request")
-            if isinstance(state.pending_action, Mapping) and isinstance((state.pending_action or {}).get("confirmation_request"), Mapping)
-            else None
-        ),
+        pending_confirmation=None,
     )
 
 
@@ -247,11 +245,9 @@ def _refresh_execution_plan_runtime(state: AgentState) -> AgentState:
         update={
             "goal": next_state.goal,
             "plan": next_state.execution_plan,
-            "pending_confirmation": (
-                (next_state.pending_action or {}).get("confirmation_request")
-                if isinstance(next_state.pending_action, Mapping) and isinstance((next_state.pending_action or {}).get("confirmation_request"), Mapping)
-                else runtime.pending_confirmation
-            ),
+            # pending_action 只用于兼容展示；刷新 runtime 时必须保留已有业务真源，
+            # 避免旧展示镜像把已清空的 pending_confirmation 再写回执行现场。
+            "pending_confirmation": runtime.pending_confirmation,
             "final_answer": next_state.answer,
         }
     )

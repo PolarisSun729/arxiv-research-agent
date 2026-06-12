@@ -510,6 +510,78 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
             )
         )
 
+    def test_consume_agent_runtime_pending_confirmation_clears_runtime_state_snapshot(self) -> None:
+        self.service.upsert_agent_runtime_checkpoint(
+            user_id=self.user_id,
+            session_id="agent-confirm-once",
+            thread_id="agent-confirm-once",
+            runtime_state={
+                "pending_confirmation": {
+                    "step_id": "parse_and_index_paper",
+                    "tool_name": "parse_and_index_paper",
+                    "pending_action_id": "pending:parse_and_index_paper",
+                },
+                "step_status": {"parse_and_index_paper": "waiting_confirmation"},
+                "turn_status": "waiting_confirmation",
+                "recovery_strategy": {"type": "request_confirmation", "reason": "paper_index_missing"},
+                "approved_step_ids": [],
+            },
+            pending_confirmation={
+                "step_id": "parse_and_index_paper",
+                "tool_name": "parse_and_index_paper",
+                "pending_action_id": "pending:parse_and_index_paper",
+            },
+            status="waiting_confirmation",
+            expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+        )
+
+        self.assertFalse(
+            self.service.consume_agent_runtime_pending_confirmation(
+                user_id=self.user_id,
+                session_id="agent-confirm-once",
+                thread_id="agent-confirm-once",
+                decision="approve",
+                step_id="parse_and_index_paper",
+                tool_name="other_tool",
+                pending_action_id="pending:other-step",
+            )
+        )
+        consumed = self.service.consume_agent_runtime_pending_confirmation(
+            user_id=self.user_id,
+            session_id="agent-confirm-once",
+            thread_id="agent-confirm-once",
+            decision="approve",
+            step_id="parse_and_index_paper",
+            tool_name="parse_and_index_paper",
+            pending_action_id="pending:parse_and_index_paper",
+        )
+
+        self.assertTrue(consumed)
+        record = self.service.get_agent_runtime_checkpoint(
+            user_id=self.user_id,
+            session_id="agent-confirm-once",
+            thread_id="agent-confirm-once",
+        )
+        self.assertEqual(record["status"], "running")
+        self.assertIsNone(record["pending_confirmation"])
+        self.assertIsNone(record["expires_at"])
+        self.assertIsNone(record["runtime_state"]["pending_confirmation"])
+        self.assertIsNone(record["runtime_state"]["turn_status"])
+        self.assertIsNone(record["runtime_state"]["recovery_strategy"])
+        self.assertEqual(record["runtime_state"]["step_status"]["parse_and_index_paper"], "pending")
+        self.assertEqual(record["runtime_state"]["approved_step_ids"], ["parse_and_index_paper"])
+        self.assertFalse(
+            self.service.consume_agent_runtime_pending_confirmation(
+                user_id=self.user_id,
+                session_id="agent-confirm-once",
+                thread_id="agent-confirm-once",
+                decision="approve",
+                step_id="parse_and_index_paper",
+                tool_name="parse_and_index_paper",
+                pending_action_id="pending:parse_and_index_paper",
+            )
+        )
+
     def test_paper_notes_support_create_update_list_and_delete(self) -> None:
         session = self._create_session(arxiv_id="2401.00008", session_id="session-note")
         message = self.service.append_paper_chat_message(session["session_id"], "assistant", "answer", user_id=self.user_id)

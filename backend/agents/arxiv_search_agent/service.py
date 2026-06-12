@@ -36,7 +36,7 @@ from .runtime_checkpoint import (
     AgentRuntimeCheckpointManager,
     build_agent_checkpointer,
 )
-from .schemas import AgentStep, AgentStreamEvent, ArxivSearchRequest, ArxivSearchResponse, ResumeRequest
+from .schemas import AgentRuntimeState, AgentStep, AgentStreamEvent, ArxivSearchRequest, ArxivSearchResponse, ConfirmationRequest, ResumeRequest
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -104,6 +104,10 @@ def _build_resume_payload(resume: ResumeRequest) -> Dict[str, Any]:
         payload["step_id"] = resume.step_id
     if resume.interrupt_id:
         payload["interrupt_id"] = resume.interrupt_id
+    if resume.tool_name:
+        payload["tool_name"] = resume.tool_name
+    if resume.pending_action_id:
+        payload["pending_action_id"] = resume.pending_action_id
     if resume.edited_arguments:
         payload["edited_arguments"] = dict(resume.edited_arguments)
     return payload
@@ -158,11 +162,12 @@ def _ensure_resume_checkpoint(
     业务 checkpoint 负责 user/session/thread/pending_confirmation/status 校验；
     LangGraph checkpoint 负责确认图本身有可 resume 的原始现场。两者都通过后才允许 Command(resume)。
     """
+    normalized_session_id = session_id or thread_id
     if checkpoint_manager is not None:
         try:
             checkpoint_manager.validate_resume(
                 user_id=user_id,
-                session_id=session_id or thread_id,
+                session_id=normalized_session_id,
                 thread_id=thread_id,
                 resume_payload=dict(resume_payload or {}),
             )
@@ -183,6 +188,19 @@ def _ensure_resume_checkpoint(
     if not _has_resume_checkpoint(graph_state):
         # checkpoint 缺失是可预期的恢复失败，不应进入通用 Agent runtime error 分支。
         raise ResumeCheckpointNotFoundError(thread_id=thread_id)
+
+    if checkpoint_manager is not None:
+        try:
+            # 两层 checkpoint 都确认可恢复后再抢占业务 pending；这样既避免 LangGraph 缺失时误清现场，
+            # 又能阻止快速连续点击确认导致同一 pending_confirmation 被消费两次。
+            checkpoint_manager.consume_pending_confirmation(
+                user_id=user_id,
+                session_id=normalized_session_id,
+                thread_id=thread_id,
+                resume_payload=dict(resume_payload or {}),
+            )
+        except AgentRuntimeCheckpointError as exc:
+            raise ResumeCheckpointNotFoundError(thread_id=exc.thread_id, reason=exc.reason) from exc
 
 
 def _has_resume_checkpoint(graph_state: Any) -> bool:
@@ -384,24 +402,26 @@ def _persist_runtime_checkpoint_after_turn(
 
 
 def _extract_state_pending_confirmation(state: AgentState) -> Optional[Dict[str, Any]]:
-    """读取结构化 pending_confirmation，不使用 pending_action 作为恢复真源。"""
-    if state.runtime_state is not None and state.runtime_state.pending_confirmation is not None:
+    """读取结构化 pending_confirmation，不使用 pending_action/debug 作为恢复真源。"""
+    if state.runtime_state is not None:
+        # runtime_state 是跨节点/跨请求的业务快照；即使 debug 里残留旧确认，也不能回退读取。
+        if state.runtime_state.pending_confirmation is None:
+            return None
         return state.runtime_state.pending_confirmation.model_dump(mode="json")
     if state.plan_runtime is not None and state.plan_runtime.pending_confirmation is not None:
         return state.plan_runtime.pending_confirmation.model_dump(mode="json")
-    debug_pending = (state.debug or {}).get("pending_confirmation")
-    return dict(debug_pending) if isinstance(debug_pending, Mapping) else None
+    return None
 
 
 def _terminal_checkpoint_status(state: AgentState, *, is_resume: bool) -> Optional[str]:
     """把 Agent 最终状态映射成 checkpoint 生命周期状态。"""
-    pending_action = state.pending_action if isinstance(state.pending_action, Mapping) else {}
-    if str(pending_action.get("status") or "").strip() == "cancelled":
+    if _state_recovery_is_confirmation_rejected(state):
         return CHECKPOINT_STATUS_CANCELLED
     runtime_status = ""
     if state.runtime_state is not None:
+        # runtime_state 存在时就是本轮最终业务快照，不能再让旧 plan_runtime 覆盖终态判断。
         runtime_status = str(state.runtime_state.turn_status or "").strip()
-    if not runtime_status and state.plan_runtime is not None:
+    elif state.plan_runtime is not None:
         runtime_status = str(state.plan_runtime.turn_status or "").strip()
     if runtime_status == "failed" or _state_error_summary(state):
         return CHECKPOINT_STATUS_FAILED
@@ -413,10 +433,25 @@ def _terminal_checkpoint_status(state: AgentState, *, is_resume: bool) -> Option
     return None
 
 
+def _state_recovery_is_confirmation_rejected(state: AgentState) -> bool:
+    """从业务恢复策略识别用户拒绝确认，不再依赖 pending_action 展示镜像。"""
+    strategy: Any = None
+    if state.runtime_state is not None:
+        # 与 pending_confirmation 一样，runtime_state 已存在时不回退旧 plan_runtime。
+        strategy = state.runtime_state.recovery_strategy
+    elif state.plan_runtime is not None:
+        strategy = state.plan_runtime.recovery_strategy
+    if not isinstance(strategy, Mapping):
+        return False
+    return str(strategy.get("type") or "").strip() == "skip_step" and str(strategy.get("reason") or "").strip() == "confirmation_rejected"
+
+
 def _state_error_summary(state: AgentState) -> str:
-    if state.runtime_state is not None and state.runtime_state.failure_reason:
-        return str(state.runtime_state.failure_reason)
-    if state.plan_runtime is not None and state.plan_runtime.error:
+    if state.runtime_state is not None:
+        # 错误摘要同样以 runtime_state 为边界；旧 plan_runtime.error 不能污染已完成的业务快照。
+        if state.runtime_state.failure_reason:
+            return str(state.runtime_state.failure_reason)
+    elif state.plan_runtime is not None and state.plan_runtime.error:
         return str(state.plan_runtime.error)
     if state.errors:
         latest_error = state.errors[-1] if isinstance(state.errors[-1], Mapping) else {}
@@ -519,11 +554,13 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
             # 不能重新构造一轮完整业务初始状态，否则会把确认恢复退化回“伪恢复”。
             resume_payload = _build_resume_payload(normalized_request.resume)
             logger.info(
-                "arxiv_agent resume received: session_id=%s thread_id=%s decision=%s step_id=%s interrupt_id=%s",
+                "arxiv_agent resume received: session_id=%s thread_id=%s decision=%s step_id=%s tool_name=%s pending_action_id=%s interrupt_id=%s",
                 resolved_session_id,
                 resolved_session_id,
                 resume_payload.get("decision"),
                 resume_payload.get("step_id"),
+                resume_payload.get("tool_name"),
+                resume_payload.get("pending_action_id"),
                 resume_payload.get("interrupt_id"),
             )
             _ensure_resume_checkpoint(
@@ -535,9 +572,11 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
                 resume_payload=resume_payload,
             )
             logger.info(
-                "arxiv_agent resume checkpoint validated: session_id=%s step_id=%s",
+                "arxiv_agent resume checkpoint validated: session_id=%s step_id=%s tool_name=%s pending_action_id=%s",
                 resolved_session_id,
                 resume_payload.get("step_id"),
+                resume_payload.get("tool_name"),
+                resume_payload.get("pending_action_id"),
             )
             final_state = _coerce_state(graph.invoke(Command(resume=resume_payload), config=graph_config))
         else:
@@ -647,12 +686,14 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
             if _is_resume_request(normalized_request):
                 resume_payload = _build_resume_payload(normalized_request.resume)
                 logger.info(
-                    "arxiv_agent stream resume received: run_id=%s session_id=%s thread_id=%s decision=%s step_id=%s interrupt_id=%s",
+                    "arxiv_agent stream resume received: run_id=%s session_id=%s thread_id=%s decision=%s step_id=%s tool_name=%s pending_action_id=%s interrupt_id=%s",
                     run_id,
                     resolved_session_id,
                     resolved_session_id,
                     resume_payload.get("decision"),
                     resume_payload.get("step_id"),
+                    resume_payload.get("tool_name"),
+                    resume_payload.get("pending_action_id"),
                     resume_payload.get("interrupt_id"),
                 )
                 _ensure_resume_checkpoint(
@@ -664,10 +705,12 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     resume_payload=resume_payload,
                 )
                 logger.info(
-                    "arxiv_agent stream resume checkpoint validated: run_id=%s session_id=%s step_id=%s",
+                    "arxiv_agent stream resume checkpoint validated: run_id=%s session_id=%s step_id=%s tool_name=%s pending_action_id=%s",
                     run_id,
                     resolved_session_id,
                     resume_payload.get("step_id"),
+                    resume_payload.get("tool_name"),
+                    resume_payload.get("pending_action_id"),
                 )
                 if str(resume_payload.get("decision") or "").strip().lower() == "approve":
                     resume_approved_step_id = str(resume_payload.get("step_id") or "").strip() or None
@@ -1060,6 +1103,7 @@ def _build_pending_action_from_confirmation(confirmation_payload: Mapping[str, A
 def _apply_stream_interrupt_state(previous_state: Optional[AgentState], confirmation_payload: Mapping[str, Any]) -> AgentState:
     """把 interrupt 载荷还原成可对外返回的待确认 AgentState。"""
     next_state = previous_state.model_copy(deep=True) if isinstance(previous_state, AgentState) else AgentState()
+    confirmation_request = ConfirmationRequest.model_validate(dict(confirmation_payload))
     pending_action = _build_pending_action_from_confirmation(confirmation_payload)
     next_state.pending_action = pending_action
     next_state.paper_qa_result = {
@@ -1078,6 +1122,29 @@ def _apply_stream_interrupt_state(previous_state: Optional[AgentState], confirma
         "status": "waiting_confirmation",
     }
     next_state.debug = debug
+
+    # 流式 __interrupt__ 事件只有展示载荷；checkpoint 判定不能再从 debug 反推，
+    # 所以这里必须同步写入 runtime_state/plan_runtime 的业务 pending 真源。
+    runtime_state = next_state.runtime_state.model_copy(deep=True) if next_state.runtime_state is not None else AgentRuntimeState()
+    runtime_state.pending_confirmation = confirmation_request
+    runtime_state.turn_status = "waiting_confirmation"
+    runtime_state.recovery_strategy = {
+        "type": "request_confirmation",
+        "reason": confirmation_request.reason or "waiting_confirmation",
+    }
+    if confirmation_request.step_id:
+        runtime_state.current_step_id = runtime_state.current_step_id or confirmation_request.step_id
+        runtime_state.step_status = dict(runtime_state.step_status or {})
+        runtime_state.step_status[confirmation_request.step_id] = "waiting_confirmation"
+    next_state.runtime_state = runtime_state
+    if next_state.plan_runtime is not None:
+        next_state.plan_runtime.pending_confirmation = confirmation_request
+        next_state.plan_runtime.turn_status = "waiting_confirmation"
+        next_state.plan_runtime.recovery_strategy = dict(runtime_state.recovery_strategy or {})
+        if confirmation_request.step_id:
+            next_state.plan_runtime.step_status = dict(next_state.plan_runtime.step_status or {})
+            next_state.plan_runtime.step_status[confirmation_request.step_id] = "waiting_confirmation"
+
     next_state.steps = list(next_state.steps or []) + [
         AgentStep(
             step="run_agent_turn",
@@ -1194,16 +1261,22 @@ def _tool_calls_from_runtime(state: AgentState) -> list[Dict[str, Any]]:
     }
     calls: list[Dict[str, Any]] = []
     for trace in list((runtime.trace if runtime else []) or []):
-        if trace.event not in {"step_succeeded", "step_failed", "confirmation_requested", "confirmation_approved"}:
+        if trace.event not in {"step_succeeded", "step_failed", "confirmation_created", "confirmation_requested", "confirmation_approved", "confirmation_rejected", "confirmation_consumed"}:
             continue
         step = plan_steps.get(trace.step_id)
         detail = dict(trace.detail or {})
         tool_name = str(detail.get("tool_name") or getattr(step, "tool_name", None) or trace.step_id or "unknown")
         status = str(trace.status or "").strip() or "success"
-        if trace.event == "confirmation_requested":
+        if trace.event == "confirmation_created":
+            summary = "已创建待确认请求"
+        elif trace.event == "confirmation_requested":
             summary = "等待用户确认后执行工具"
         elif trace.event == "confirmation_approved":
             summary = "用户已确认，准备执行工具"
+        elif trace.event == "confirmation_rejected":
+            summary = "用户已拒绝，工具不会执行"
+        elif trace.event == "confirmation_consumed":
+            summary = "确认请求已消费"
         elif status == "failed":
             summary = str(detail.get("failure_reason") or "工具执行失败")
         else:

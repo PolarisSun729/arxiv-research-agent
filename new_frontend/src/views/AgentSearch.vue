@@ -52,6 +52,8 @@ const isPaperTargetConfirmation = computed(() => {
   return action?.request_type === 'paper_target_confirmation' || action?.type === 'paper_target_confirmation'
 })
 
+const isPendingActionConfirming = computed(() => pendingAction.value?.status === 'confirming')
+
 const pendingTargetCandidates = computed<PaperTargetCandidate[]>(() => {
   const candidates = pendingAction.value?.candidates
   return Array.isArray(candidates) ? candidates : []
@@ -232,6 +234,9 @@ watch(pendingAction, action => {
     <section class="conversation-shell">
       <div v-if="pendingAction" class="pending-action-banner">
         <div class="pending-action-banner__copy">
+          <div v-if="isPendingActionConfirming" class="pending-action-banner__status">
+            确认请求已提交，正在等待后端消费并继续执行。
+          </div>
           <div class="pending-action-banner__label">待确认任务</div>
           <div class="pending-action-banner__title">
             {{ pendingAction.title || '当前论文' }}
@@ -286,7 +291,8 @@ watch(pendingAction, action => {
         <div class="pending-action-banner__actions">
           <el-button
             type="primary"
-            :disabled="loading || (isPaperTargetConfirmation && !selectedPendingCandidateId)"
+            :loading="isPendingActionConfirming"
+            :disabled="loading || isPendingActionConfirming || (isPaperTargetConfirmation && !selectedPendingCandidateId)"
             @click="handleConfirmPendingAction"
           >
             <span v-if="isPaperTargetConfirmation">&#30830;&#35748;&#24182;&#32487;&#32493;</span>
@@ -303,7 +309,7 @@ watch(pendingAction, action => {
           >
             解析并回答
           </el-button>
-          <el-button :disabled="loading" @click="handleCancelPendingAction">
+          <el-button :disabled="loading || isPendingActionConfirming" @click="handleCancelPendingAction">
             &#21462;&#28040;
           </el-button>
           <el-button v-if="false" :disabled="loading" @click="handleCancelPendingAction">
@@ -443,6 +449,13 @@ watch(pendingAction, action => {
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+}
+
+.pending-action-banner__status {
+  margin-bottom: 8px;
+  color: #0f766e;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .pending-action-banner__title {

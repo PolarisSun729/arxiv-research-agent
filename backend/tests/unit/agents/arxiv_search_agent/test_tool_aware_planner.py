@@ -189,6 +189,21 @@ def test_confirmation_required_tool_gets_confirmation_policy() -> None:
     assert plan.steps[0].side_effect_level == "external_call"
 
 
+def test_external_search_draft_confirmation_flag_is_ignored() -> None:
+    payload = json.loads(_llm_arxiv_plan_json())
+    payload["steps"][2]["requires_confirmation"] = True
+    payload["steps"][2]["risk_level"] = "high"
+    payload["steps"][2]["risk_notes"] = "external arxiv search should use recovery policy, not human confirmation"
+    draft = PlanDraft.model_validate(payload)
+
+    plan = PlanDraftConverter(PLANNER_TOOL_REGISTRY).convert(draft, Goal(goal_type="arxiv_search"))
+    search_step = next(step for step in plan.steps if step.tool_name == "search_arxiv")
+
+    assert search_step.side_effect_level == "external_call"
+    # 普通检索的确认策略以 ToolContract 为准；LLM 草稿错标不能把搜索链路拦进确认门。
+    assert search_step.confirmation_policy is None
+
+
 def test_plan_draft_missing_input_bindings_conversion_fails() -> None:
     draft = PlanDraft(
         draft_id="draft:test",
@@ -870,6 +885,8 @@ def test_llm_plan_draft_prompt_includes_arxiv_binding_few_shot() -> None:
     assert '"step_id": "normalize_request"' in prompt
     assert "goal.constraints" in prompt
     assert "submittedDate:descending" in prompt
+    assert '"external_call_requires_confirmation": false' in prompt
+    assert "不要仅因外部调用要求人工确认" in prompt
 
 
 def test_rule_based_failure_after_llm_failure_falls_back_to_legacy_template(monkeypatch) -> None:

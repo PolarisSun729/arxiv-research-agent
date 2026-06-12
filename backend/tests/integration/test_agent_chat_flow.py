@@ -9,6 +9,7 @@ from unittest import mock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 
 def _load_agent_runtime_helper():
@@ -25,6 +26,7 @@ def _load_agent_runtime_helper():
 
 
 load_agent_test_modules = _load_agent_runtime_helper().load_agent_test_modules
+FakeDatabaseService = _load_agent_runtime_helper().FakeDatabaseService
 
 
 _MODULES = load_agent_test_modules()
@@ -277,13 +279,26 @@ class AgentChatFlowIntegrationTests(unittest.TestCase):
                     user_id="u1",
                     session_id="s1",
                     message="approve",
-                    resume={"decision": "approve", "step_id": "parse_and_index_paper"},
+                    resume={
+                        "decision": "approve",
+                        "step_id": "parse_and_index_paper",
+                        "tool_name": "parse_and_index_paper",
+                        "pending_action_id": "pending:parse_and_index_paper",
+                    },
                 )
             )
 
         self.assertEqual(response.answer, "resume finished")
         self.assertIsInstance(fake_graph.last_invoke_input, Command)
-        self.assertEqual(fake_graph.last_invoke_input.resume, {"decision": "approve", "step_id": "parse_and_index_paper"})
+        self.assertEqual(
+            fake_graph.last_invoke_input.resume,
+            {
+                "decision": "approve",
+                "step_id": "parse_and_index_paper",
+                "tool_name": "parse_and_index_paper",
+                "pending_action_id": "pending:parse_and_index_paper",
+            },
+        )
         self.assertEqual(fake_graph.last_invoke_config, {"configurable": {"thread_id": "s1"}})
 
     def test_run_arxiv_search_agent_resume_reject_uses_same_thread_id(self) -> None:
@@ -306,13 +321,26 @@ class AgentChatFlowIntegrationTests(unittest.TestCase):
                     user_id="u1",
                     session_id="s1",
                     message="reject",
-                    resume={"decision": "reject", "step_id": "parse_and_index_paper"},
+                    resume={
+                        "decision": "reject",
+                        "step_id": "parse_and_index_paper",
+                        "tool_name": "parse_and_index_paper",
+                        "pending_action_id": "pending:parse_and_index_paper",
+                    },
                 )
             )
 
         self.assertEqual(response.answer, "cancelled")
         self.assertIsInstance(fake_graph.last_invoke_input, Command)
-        self.assertEqual(fake_graph.last_invoke_input.resume, {"decision": "reject", "step_id": "parse_and_index_paper"})
+        self.assertEqual(
+            fake_graph.last_invoke_input.resume,
+            {
+                "decision": "reject",
+                "step_id": "parse_and_index_paper",
+                "tool_name": "parse_and_index_paper",
+                "pending_action_id": "pending:parse_and_index_paper",
+            },
+        )
         self.assertEqual(fake_graph.last_invoke_config, {"configurable": {"thread_id": "s1"}})
 
     def test_run_arxiv_search_agent_resume_with_missing_checkpoint_returns_explicit_error(self) -> None:
@@ -328,7 +356,11 @@ class AgentChatFlowIntegrationTests(unittest.TestCase):
                     user_id="u1",
                     session_id="missing-session",
                     message="reject",
-                    resume={"decision": "reject", "step_id": "parse_and_index_paper"},
+                    resume={
+                        "decision": "reject",
+                        "step_id": "parse_and_index_paper",
+                        "tool_name": "parse_and_index_paper",
+                    },
                 )
             )
 
@@ -338,6 +370,51 @@ class AgentChatFlowIntegrationTests(unittest.TestCase):
         self.assertEqual(response.paper_qa_result["error_code"], "resume_checkpoint_not_found")
         self.assertEqual(response.debug["runtime_error"]["code"], "resume_checkpoint_not_found")
         self.assertEqual(response.steps[-1].error, "resume_checkpoint_not_found")
+        self.assertIsNone(fake_graph.last_invoke_input)
+
+    def test_run_arxiv_search_agent_resume_requires_structured_locator_fields(self) -> None:
+        # resume 不能再退回到“靠自然语言猜当前确认对象”；缺少稳定定位字段时要在请求层直接拒绝。
+        with self.assertRaises(ValidationError) as context:
+            ArxivSearchRequest(
+                user_id="u1",
+                session_id="s1",
+                message="approve",
+                resume={"decision": "approve"},
+            )
+
+        self.assertIn(
+            "resume request must include pending_action_id or step_id plus tool_name",
+            str(context.exception),
+        )
+
+    def test_run_arxiv_search_agent_resume_already_consumed_does_not_invoke_graph(self) -> None:
+        class _ConsumedCheckpointDatabase(FakeDatabaseService):
+            def consume_agent_runtime_pending_confirmation(self, **_kwargs):
+                return False
+
+        fake_graph = _FakeCompiledGraph(final_state=AgentState(session_id="s1", answer="should not run").model_dump(), checkpoint_exists=True)
+
+        with mock.patch.object(service_module, "DatabaseService", _ConsumedCheckpointDatabase), mock.patch.object(
+            service_module,
+            "build_arxiv_search_graph",
+            return_value=fake_graph,
+        ), mock.patch.object(service_module, "_persist_agent_session_memory", return_value=None):
+            response = service_module.run_arxiv_search_agent(
+                ArxivSearchRequest(
+                    user_id="u1",
+                    session_id="s1",
+                    message="approve",
+                    resume={
+                        "decision": "approve",
+                        "step_id": "parse_and_index_paper",
+                        "tool_name": "parse_and_index_paper",
+                    },
+                )
+            )
+
+        self.assertEqual(response.debug["runtime_error"]["code"], "resume_checkpoint_not_found")
+        self.assertIn("confirmation_already_consumed", response.debug["runtime_error"]["detail"])
+        self.assertIsNone(response.pending_action)
         self.assertIsNone(fake_graph.last_invoke_input)
 
     def test_stream_arxiv_search_agent_resume_uses_command_with_same_thread_id(self) -> None:
@@ -373,13 +450,26 @@ class AgentChatFlowIntegrationTests(unittest.TestCase):
                     "user_id": "u1",
                     "session_id": "s1",
                     "message": "approve",
-                    "resume": {"decision": "approve", "step_id": "parse_and_index_paper"},
+                    "resume": {
+                        "decision": "approve",
+                        "step_id": "parse_and_index_paper",
+                        "tool_name": "parse_and_index_paper",
+                        "pending_action_id": "pending:parse_and_index_paper",
+                    },
                 },
             )
 
         self.assertEqual(response.status_code, 200)
         self.assertIsInstance(fake_graph.last_stream_input, Command)
-        self.assertEqual(fake_graph.last_stream_input.resume, {"decision": "approve", "step_id": "parse_and_index_paper"})
+        self.assertEqual(
+            fake_graph.last_stream_input.resume,
+            {
+                "decision": "approve",
+                "step_id": "parse_and_index_paper",
+                "tool_name": "parse_and_index_paper",
+                "pending_action_id": "pending:parse_and_index_paper",
+            },
+        )
         self.assertEqual(fake_graph.last_stream_config, {"configurable": {"thread_id": "s1"}})
 
     def test_stream_arxiv_search_agent_resume_with_missing_checkpoint_returns_explicit_error(self) -> None:
@@ -404,7 +494,11 @@ class AgentChatFlowIntegrationTests(unittest.TestCase):
                     "user_id": "u1",
                     "session_id": "missing-session",
                     "message": "approve",
-                    "resume": {"decision": "approve", "step_id": "parse_and_index_paper"},
+                    "resume": {
+                        "decision": "approve",
+                        "step_id": "parse_and_index_paper",
+                        "tool_name": "parse_and_index_paper",
+                    },
                 },
             )
 

@@ -158,6 +158,105 @@ class AgentGraphFlowTests(unittest.TestCase):
         self.assertEqual(len(state.papers), 1)
         self.assertEqual(state.papers[0]["arxiv_id"], "2606.00001")
 
+    def test_apply_turn_result_keeps_consumed_confirmation_result_but_clears_pending_snapshot(self) -> None:
+        state = AgentState(
+            intent="paper_qa",
+            message="approve",
+            pending_action={
+                "status": "approved",
+                "decision": "approve",
+                "step_id": "parse_and_index_paper",
+                "tool_name": "parse_and_index_paper",
+                "confirmation_consumed": True,
+            },
+            debug={
+                "pending_confirmation": {
+                    "step_id": "parse_and_index_paper",
+                    "tool_name": "parse_and_index_paper",
+                },
+                "confirmation_consumed": {
+                    "decision": "approve",
+                    "step_id": "parse_and_index_paper",
+                },
+            },
+            paper_qa_result={
+                "status": "waiting_confirmation",
+                "pending_confirmation": {
+                    "step_id": "parse_and_index_paper",
+                    "tool_name": "parse_and_index_paper",
+                },
+            },
+        )
+        runtime = PlanRuntime(
+            goal=Goal(goal_type="paper_qa"),
+            plan=ExecutablePlan(plan_id="paper_qa:test", goal=Goal(goal_type="paper_qa")),
+            trace=[ExecutionTrace(step_id="parse_and_index_paper", event="confirmation_consumed", status="pending")],
+        )
+        result = schemas.AgentTurnResult(
+            status="success",
+            final_answer="resume finished",
+            outputs={},
+            trace=list(runtime.trace),
+            runtime=runtime,
+        )
+
+        graph_module._apply_turn_result(state, result)
+
+        self.assertIsNotNone(state.pending_action)
+        self.assertEqual(state.pending_action["status"], "approved")
+        self.assertTrue(state.pending_action["confirmation_consumed"])
+        self.assertNotIn("pending_confirmation", state.debug)
+        self.assertEqual(state.debug["confirmation_consumed"]["decision"], "approve")
+        self.assertEqual(state.paper_qa_result["status"], "ready")
+        self.assertIsNone(state.paper_qa_result["pending_confirmation"])
+        self.assertTrue(state.paper_qa_result["confirmation_consumed"])
+
+    def test_apply_turn_result_marks_rejected_confirmation_snapshot_as_cancelled(self) -> None:
+        state = AgentState(
+            intent="paper_qa",
+            message="reject",
+            pending_action={
+                "status": "rejected",
+                "decision": "reject",
+                "step_id": "parse_and_index_paper",
+                "tool_name": "parse_and_index_paper",
+                "confirmation_consumed": True,
+            },
+            paper_qa_result={
+                "status": "waiting_confirmation",
+                "pending_confirmation": {
+                    "step_id": "parse_and_index_paper",
+                    "tool_name": "parse_and_index_paper",
+                },
+            },
+            debug={
+                "pending_confirmation": {
+                    "step_id": "parse_and_index_paper",
+                    "tool_name": "parse_and_index_paper",
+                },
+            },
+        )
+        runtime = PlanRuntime(
+            goal=Goal(goal_type="paper_qa"),
+            plan=ExecutablePlan(plan_id="paper_qa:test", goal=Goal(goal_type="paper_qa")),
+            trace=[ExecutionTrace(step_id="parse_and_index_paper", event="confirmation_consumed", status="skipped")],
+        )
+        result = schemas.AgentTurnResult(
+            status="success",
+            final_answer="cancelled",
+            outputs={},
+            trace=list(runtime.trace),
+            runtime=runtime,
+        )
+
+        graph_module._apply_turn_result(state, result)
+
+        self.assertEqual(state.paper_qa_result["status"], "cancelled")
+        self.assertIsNone(state.paper_qa_result["pending_confirmation"])
+        self.assertTrue(state.paper_qa_result["confirmation_consumed"])
+        self.assertEqual(state.paper_qa_result["confirmation_decision"], "reject")
+        self.assertNotIn("pending_confirmation", state.debug)
+
 
 if __name__ == "__main__":
     unittest.main()

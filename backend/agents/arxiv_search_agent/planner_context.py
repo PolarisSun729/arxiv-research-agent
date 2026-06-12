@@ -60,7 +60,9 @@ def build_planner_context(
         high_risk_tools=[
             tool.tool_name
             for tool in available_tools
-            if tool.requires_confirmation or tool.side_effect_level in {"persistent_write", "external_call"}
+            # 这里的 high_risk_tools 只暴露“需要人工确认”的工具；
+            # external_call 仍是中风险工具，但普通检索/问答不能因此被 planner 误标为待确认。
+            if tool.requires_confirmation or tool.side_effect_level == "persistent_write"
         ],
     )
 

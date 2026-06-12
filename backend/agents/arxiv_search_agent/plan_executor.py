@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from langgraph.types import interrupt
 from pydantic import ValidationError
+from services.storage.database_service import DatabaseService
 from utils.config import get_agent_runtime_checkpoint_config
 
 from . import tool_registry as agent_tool_registry
@@ -57,6 +58,148 @@ def _confirmation_expires_at() -> str:
 
 def _is_paper_target_resolution_step(step: PlanStep) -> bool:
     return step.tool_name in {"resolve_paper", "resolve_preference_target"}
+
+
+def _should_resume_confirmation_for_step(
+    step: PlanStep,
+    runtime: PlanRuntime,
+) -> bool:
+    """判断当前 execute_step 重入时，是否应该先消费挂起的确认请求。
+
+    缺索引补丁链里当前执行步可能是 `request_confirmation`，但真正被批准的是后续
+    `parse_and_index_paper`。如果这里只按“当前 step_id 等于 pending step_id”判断，
+    resume 后会再次执行确认准备步，然后又把同一个副作用工具重新拦回确认门。
+    """
+    confirmation_request = runtime.pending_confirmation
+    if confirmation_request is None:
+        return False
+    current_status = runtime.step_status.get(step.step_id)
+    if current_status != "waiting_confirmation":
+        return False
+    if confirmation_request.step_id == step.step_id:
+        return True
+    return step.tool_name == "request_confirmation"
+
+
+def _confirmation_target_step_ref(
+    step: PlanStep,
+    confirmation_request: Optional[ConfirmationRequest],
+) -> tuple[str, str]:
+    """返回本次确认真正对应的目标 step/tool。
+
+    `request_confirmation` 这类桥接步会替后续副作用工具发起确认，因此消费确认时
+    必须优先使用 confirmation_request 里记录的目标 step，而不是当前正在执行的桥接步。
+    """
+    if confirmation_request is None:
+        return step.step_id, step.tool_name
+    target_step_id = str(confirmation_request.step_id or "").strip() or step.step_id
+    target_tool_name = str(confirmation_request.tool_name or "").strip() or step.tool_name
+    return target_step_id, target_tool_name
+
+
+def _is_confirmation_bridge_step(
+    step: PlanStep,
+    confirmation_request: Optional[ConfirmationRequest],
+) -> bool:
+    """识别只负责准备确认上下文的桥接 step。
+
+    缺索引补丁链里 `request_confirmation` 本身没有副作用；用户批准后应放行
+    confirmation_request 指向的目标工具，而不是再次执行这个准备步骤。
+    """
+    target_step_id, _target_tool_name = _confirmation_target_step_ref(step, confirmation_request)
+    return step.tool_name == "request_confirmation" and target_step_id != step.step_id
+
+
+def _normalized_step_ids(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _plan_id_from_value(value: Any) -> str:
+    if isinstance(value, Mapping):
+        return str(value.get("plan_id") or "").strip()
+    return str(getattr(value, "plan_id", None) or "").strip()
+
+
+def _current_plan_id(runtime: Optional[PlanRuntime], state: AgentState) -> str:
+    if runtime is not None and runtime.plan is not None:
+        return _plan_id_from_value(runtime.plan)
+    if state.plan_runtime is not None and state.plan_runtime.plan is not None:
+        return _plan_id_from_value(state.plan_runtime.plan)
+    return _plan_id_from_value(state.execution_plan)
+
+
+def _checkpoint_approved_step_ids_for_state(
+    *,
+    state: AgentState,
+    runtime: Optional[PlanRuntime],
+    step: PlanStep,
+) -> List[str]:
+    """从业务 checkpoint 读取已消费的批准态，作为 LangGraph 重入丢态时的兜底。
+
+    这里仍以 runtime checkpoint 为真源，不读取 pending_action 展示镜像；并且只接受
+    running、已清空 pending_confirmation、plan_id 匹配的记录，避免旧会话终态误放行副作用工具。
+    """
+    session_id = str(state.session_id or "").strip()
+    if not session_id:
+        return []
+    try:
+        checkpoint = DatabaseService().get_agent_runtime_checkpoint(
+            user_id=str(state.user_id or "").strip(),
+            session_id=session_id,
+            thread_id=session_id,
+        )
+    except Exception as exc:  # pragma: no cover - checkpoint 兜底失败时应回到正常确认门
+        logger.debug(
+            "arxiv_agent checkpoint approved lookup failed: session_id=%s step_id=%s error=%s",
+            session_id,
+            step.step_id,
+            exc,
+        )
+        return []
+    if not isinstance(checkpoint, Mapping):
+        return []
+    if str(checkpoint.get("status") or "").strip() != "running":
+        return []
+    if checkpoint.get("pending_confirmation"):
+        return []
+    runtime_state = checkpoint.get("runtime_state") if isinstance(checkpoint.get("runtime_state"), Mapping) else {}
+    approved_step_ids = _normalized_step_ids(runtime_state.get("approved_step_ids") if isinstance(runtime_state, Mapping) else None)
+    if step.step_id not in approved_step_ids:
+        return []
+    checkpoint_plan_id = _plan_id_from_value(runtime_state.get("plan") if isinstance(runtime_state, Mapping) else None)
+    current_plan_id = _current_plan_id(runtime, state)
+    if checkpoint_plan_id and current_plan_id and checkpoint_plan_id != current_plan_id:
+        logger.info(
+            "arxiv_agent checkpoint approval ignored: step_id=%s checkpoint_plan_id=%s current_plan_id=%s",
+            step.step_id,
+            checkpoint_plan_id,
+            current_plan_id,
+        )
+        return []
+    return approved_step_ids
+
+
+def _record_approved_step_ids(
+    *,
+    state: AgentState,
+    runtime: Optional[PlanRuntime],
+    approved_step_ids: Sequence[str],
+) -> None:
+    """把 checkpoint 兜底读到的批准态补回图内 runtime，供后续节点继续使用。"""
+    normalized_ids = _normalized_step_ids(list(approved_step_ids or []))
+    if not normalized_ids:
+        return
+    if runtime is not None:
+        runtime.approved_step_ids = list(dict.fromkeys([*list(runtime.approved_step_ids or []), *normalized_ids]))
+    state.context = dict(state.context or {})
+    context_ids = _normalized_step_ids(state.context.get("approved_step_ids"))
+    state.context["approved_step_ids"] = list(dict.fromkeys([*context_ids, *normalized_ids]))
+    if state.plan_runtime is not None:
+        state.plan_runtime.approved_step_ids = list(dict.fromkeys([*list(state.plan_runtime.approved_step_ids or []), *normalized_ids]))
+    if state.runtime_state is not None:
+        state.runtime_state.approved_step_ids = list(dict.fromkeys([*list(state.runtime_state.approved_step_ids or []), *normalized_ids]))
 
 
 def _candidate_identity_values(candidate: Mapping[str, Any]) -> List[str]:
@@ -712,14 +855,10 @@ class PlanExecutor:
         if step is None:
             return self.execute_next_step(runtime, state, allow_interrupt=allow_interrupt, auto_replan=False)
 
-        if (
-            allow_interrupt
-            and runtime.step_status.get(step.step_id) == "waiting_confirmation"
-            and runtime.pending_confirmation is not None
-            and runtime.pending_confirmation.step_id == step.step_id
-        ):
+        if allow_interrupt and _should_resume_confirmation_for_step(step, runtime):
             # LangGraph resume 会从节点函数开头重入，而不是直接跳到上一轮 interrupt 的下一行。
             # 先消费同一确认请求的 resume payload，并写入 runtime/context 批准态，避免重新经过确认判断时二次弹窗。
+            resume_confirmation = runtime.pending_confirmation
             decision = self._resume_pending_confirmation(step=step, runtime=runtime, state=state)
             if decision != "approve":
                 turn_result = self._handle_confirmation_rejection(
@@ -735,6 +874,14 @@ class PlanExecutor:
                     next_action="fail",
                     pending_confirmation=runtime.pending_confirmation,
                     turn_result=turn_result,
+                )
+            if _is_confirmation_bridge_step(step, resume_confirmation):
+                self._sync_runtime_state(state, runtime, current_step=step)
+                return self._step_result_from_runtime(
+                    step=step,
+                    runtime=runtime,
+                    next_action="continue",
+                    observation=runtime.last_observation,
                 )
             if _is_paper_target_resolution_step(step) and runtime.step_status.get(step.step_id) == "success":
                 self._sync_runtime_state(state, runtime, current_step=step)
@@ -793,7 +940,7 @@ class PlanExecutor:
             self._sync_runtime_state(state, runtime, current_step=step)
             return self._step_result_from_runtime(step=step, runtime=runtime, next_action="continue", output=reused_output)
 
-        if self._needs_confirmation(step, state):
+        if self._needs_confirmation(step, state, runtime=runtime):
             confirmation_request = self._build_confirmation_request(
                 step=step,
                 runtime=runtime,
@@ -1110,7 +1257,7 @@ class PlanExecutor:
             )
             return None
 
-        if self._needs_confirmation(step, state):
+        if self._needs_confirmation(step, state, runtime=runtime):
             confirmation_request = self._build_confirmation_request(
                 step=step,
                 runtime=runtime,
@@ -1233,7 +1380,6 @@ class PlanExecutor:
                 )
 
             if observation.status == "need_confirmation" and step.tool_name == "request_confirmation":
-                runtime.step_status[step.step_id] = "waiting_confirmation"
                 pending_action = raw_output.get("pending_action") if isinstance(raw_output, Mapping) else None
                 confirmation_request = self._build_confirmation_request(
                     step=step,
@@ -1243,15 +1389,15 @@ class PlanExecutor:
                     reason=observation.reason,
                     pending_action=pending_action if isinstance(pending_action, Mapping) else None,
                 )
-                runtime.pending_confirmation = confirmation_request
-                logger.info(
-                    "arxiv_agent confirmation requested: step_id=%s tool_name=%s side_effect_level=%s allowed_decisions=%s",
-                    confirmation_request.step_id,
-                    confirmation_request.tool_name,
-                    confirmation_request.side_effect_level,
-                    [item.code for item in list(confirmation_request.allowed_decisions or [])],
+                return self._handle_confirmation_gate(
+                    step=step,
+                    runtime=runtime,
+                    state=state,
+                    confirmation_request=confirmation_request,
+                    resolved_input=resolved_input,
+                    started_at=started_at,
+                    allow_interrupt=allow_interrupt,
                 )
-                return self._build_turn_result(runtime)
 
             if observation.status not in {"success", "partial_success"}:
                 # observation 代表“工具执行后质量不足”，先写入 runtime，方便重规划节点或调试视图复盘触发原因。
@@ -1402,7 +1548,7 @@ class PlanExecutor:
             return tool_input
         started = perf_counter()
         logger.info(
-            "arxiv_agent tool execution started: step_id=%s tool_name=%s backend_tool=%s adapter=%s input=%s",
+            "arxiv_agent tool_started: step_id=%s tool_name=%s backend_tool=%s adapter=%s input=%s",
             step.step_id,
             tool_name,
             getattr(contract, "backend_tool_name", None),
@@ -1413,7 +1559,7 @@ class PlanExecutor:
             result = contract.adapter.execute(tool_input)
         except Exception:
             logger.exception(
-                "arxiv_agent tool execution raised: step_id=%s tool_name=%s backend_tool=%s elapsed_ms=%.1f",
+                "arxiv_agent tool_finished: step_id=%s tool_name=%s backend_tool=%s ok=false error=exception elapsed_ms=%.1f",
                 step.step_id,
                 tool_name,
                 getattr(contract, "backend_tool_name", None),
@@ -1422,7 +1568,7 @@ class PlanExecutor:
             raise
         if not isinstance(result, ToolExecutionResult):
             logger.error(
-                "arxiv_agent tool adapter contract violation: step_id=%s tool_name=%s returned_type=%s elapsed_ms=%.1f",
+                "arxiv_agent tool_finished: step_id=%s tool_name=%s ok=false error=adapter_contract_violation returned_type=%s elapsed_ms=%.1f",
                 step.step_id,
                 tool_name,
                 type(result).__name__,
@@ -1443,7 +1589,7 @@ class PlanExecutor:
             )
         if not result.ok:
             logger.info(
-                "arxiv_agent tool execution failed: step_id=%s tool_name=%s backend_tool=%s error_code=%s message=%s elapsed_ms=%.1f",
+                "arxiv_agent tool_finished: step_id=%s tool_name=%s backend_tool=%s ok=false error_code=%s message=%s elapsed_ms=%.1f",
                 step.step_id,
                 tool_name,
                 getattr(contract, "backend_tool_name", None),
@@ -1454,7 +1600,7 @@ class PlanExecutor:
             return result
         validated_result = self._validate_tool_output(contract, result)
         logger.info(
-            "arxiv_agent tool execution finished: step_id=%s tool_name=%s backend_tool=%s ok=%s elapsed_ms=%.1f",
+            "arxiv_agent tool_finished: step_id=%s tool_name=%s backend_tool=%s ok=%s elapsed_ms=%.1f",
             step.step_id,
             tool_name,
             getattr(contract, "backend_tool_name", None),
@@ -1949,12 +2095,14 @@ class PlanExecutor:
             for step in list(plan.steps or [])
         ]
 
-    def _needs_confirmation(self, step: PlanStep, state: AgentState) -> bool:
+    def _needs_confirmation(self, step: PlanStep, state: AgentState, *, runtime: Optional[PlanRuntime] = None) -> bool:
         policy = step.confirmation_policy
         if not policy or not policy.requires_confirmation:
             return False
         context = state.context if isinstance(state.context, Mapping) else {}
         runtime_approved_step_ids = []
+        if runtime is not None:
+            runtime_approved_step_ids.extend(list(runtime.approved_step_ids or []))
         if state.plan_runtime is not None:
             runtime_approved_step_ids.extend(list(state.plan_runtime.approved_step_ids or []))
         if state.runtime_state is not None:
@@ -1974,28 +2122,34 @@ class PlanExecutor:
                 step.tool_name,
             )
             return False
+        checkpoint_approved_step_ids = _checkpoint_approved_step_ids_for_state(
+            state=state,
+            runtime=runtime,
+            step=step,
+        )
+        if step.step_id in checkpoint_approved_step_ids:
+            # resume 已经原子消费业务 checkpoint，但 LangGraph 可能从节点开头重跑；
+            # 这里把批准态补回图内 runtime，保证目标副作用 step 只放行一次。
+            _record_approved_step_ids(
+                state=state,
+                runtime=runtime,
+                approved_step_ids=checkpoint_approved_step_ids,
+            )
+            logger.info(
+                "arxiv_agent confirmation bypassed: step_id=%s tool_name=%s source=runtime_checkpoint_approved_step_ids",
+                step.step_id,
+                step.tool_name,
+            )
+            return False
         pending_action = state.pending_action if isinstance(state.pending_action, Mapping) else {}
-        approval_decision = str(pending_action.get("decision") or "").strip().lower()
-        if approval_decision == "approve" and pending_action.get("step_id") == step.step_id:
-            logger.info(
-                "arxiv_agent confirmation bypassed: step_id=%s tool_name=%s source=pending_action_decision",
-                step.step_id,
-                step.tool_name,
-            )
-            return False
-        if pending_action.get("status") == "approved" and pending_action.get("step_id") == step.step_id:
-            logger.info(
-                "arxiv_agent confirmation bypassed: step_id=%s tool_name=%s source=pending_action_status",
-                step.step_id,
-                step.tool_name,
-            )
-            return False
+        # pending_action 是前端展示镜像，不能作为批准真源；只保留日志摘要辅助排查展示态残留。
         logger.info(
-            "arxiv_agent confirmation required: step_id=%s tool_name=%s runtime_approved=%s context_approved=%s pending_status=%s",
+            "arxiv_agent confirmation required: step_id=%s tool_name=%s runtime_approved=%s context_approved=%s checkpoint_approved=%s pending_status=%s",
             step.step_id,
             step.tool_name,
             runtime_approved_step_ids,
             approved_step_ids if isinstance(approved_step_ids, list) else [],
+            checkpoint_approved_step_ids,
             pending_action.get("status"),
         )
         return True
@@ -2122,6 +2276,227 @@ class PlanExecutor:
             thread_id=state.session_id,
         )
 
+    def _mark_debug_confirmation_consumed(
+        self,
+        *,
+        state: AgentState,
+        confirmation_request: ConfirmationRequest,
+        decision: str,
+        source: str,
+        consumed_at: str,
+    ) -> None:
+        """清理 debug 中的旧确认快照，并记录它已被消费。
+
+        debug.pending_confirmation 只能用于排查；确认完成后如果继续保留原字段，后续
+        checkpoint 或前端适配层容易把它误看成新的待确认任务。
+        """
+        debug = dict(state.debug or {})
+        previous = debug.pop("pending_confirmation", None)
+        previous_mapping = previous if isinstance(previous, Mapping) else {}
+        debug["confirmation_consumed"] = {
+            "decision": decision,
+            "step_id": confirmation_request.step_id,
+            "tool_name": confirmation_request.tool_name,
+            "request_type": confirmation_request.request_type,
+            "pending_action_id": confirmation_request.pending_action_id,
+            "source": source,
+            "consumed_at": consumed_at,
+            "previous_pending_step_id": previous_mapping.get("step_id") if isinstance(previous_mapping, Mapping) else None,
+        }
+        state.debug = debug
+
+    def _clear_confirmation_runtime_state(
+        self,
+        *,
+        step: PlanStep,
+        runtime: PlanRuntime,
+        state: AgentState,
+        next_step_status: str,
+        recovery_strategy: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """统一清理确认消费后的执行现场，避免旧 waiting_confirmation 残留回灌。
+
+        这里负责维护 runtime / runtime_state 两份真源：
+        1. 清空 pending_confirmation，保证同一个确认只消费一次；
+        2. 重置 turn_status，避免后续 finalize/checkpoint 继续把本轮误判成 waiting_confirmation；
+        3. 显式写入下一步状态和恢复语义，保证批准/拒绝/目标确认三条链路的收尾一致。
+        """
+        runtime.step_status[step.step_id] = next_step_status  # type: ignore[assignment]
+        runtime.pending_confirmation = None
+        runtime.recovery_strategy = dict(recovery_strategy) if recovery_strategy else None
+        runtime.turn_status = None
+
+        if state.runtime_state is not None:
+            state.runtime_state.pending_confirmation = None
+            state.runtime_state.recovery_strategy = dict(recovery_strategy) if recovery_strategy else None
+            state.runtime_state.turn_status = None
+            state.runtime_state.current_step_id = step.step_id
+            state.runtime_state.step_status = dict(state.runtime_state.step_status or {})
+            state.runtime_state.step_status[step.step_id] = next_step_status
+
+    def _consume_confirmation_approval(
+        self,
+        *,
+        step: PlanStep,
+        runtime: PlanRuntime,
+        state: AgentState,
+        confirmation_request: ConfirmationRequest,
+        next_step_status: str,
+        source: str,
+        pending_action_type: Optional[str] = None,
+        pending_action_extra: Optional[Mapping[str, Any]] = None,
+        trace_status: Optional[str] = None,
+    ) -> None:
+        """统一处理确认批准后的状态收尾。
+
+        批准只消费一次：批准态写入 runtime/context/runtime_state，旧 pending_confirmation
+        和 recovery_strategy 立即清空，当前 step 再回到可执行状态或目标确认的 success 状态。
+        """
+        consumed_at = _utcnow()
+        target_step_id, target_tool_name = _confirmation_target_step_ref(step, confirmation_request)
+        current_step_status = (
+            "success"
+            if _is_confirmation_bridge_step(step, confirmation_request) and next_step_status == "pending"
+            else next_step_status
+        )
+        state.context = dict(state.context or {})
+        approved_step_ids = list(state.context.get("approved_step_ids") or [])
+        if target_step_id not in approved_step_ids:
+            approved_step_ids.append(target_step_id)
+        state.context["approved_step_ids"] = approved_step_ids
+
+        runtime_approved_step_ids = list(runtime.approved_step_ids or [])
+        if target_step_id not in runtime_approved_step_ids:
+            runtime_approved_step_ids.append(target_step_id)
+        runtime.approved_step_ids = runtime_approved_step_ids
+        # 批准后要先清空所有待确认真源，再让当前 step 重新进入可执行/已确认状态。
+        self._clear_confirmation_runtime_state(
+            step=step,
+            runtime=runtime,
+            state=state,
+            next_step_status=current_step_status,
+        )
+        if target_step_id != step.step_id and next_step_status == "pending":
+            # 桥接确认批准后，当前 step 已完成；目标副作用 step 保持 pending，
+            # 由下一轮 select_next_step 进入真实工具执行，并通过 approved_step_ids 跳过确认门。
+            runtime.step_status[target_step_id] = "pending"
+            if state.runtime_state is not None:
+                state.runtime_state.step_status = dict(state.runtime_state.step_status or {})
+                state.runtime_state.step_status[target_step_id] = "pending"
+
+        if state.runtime_state is not None:
+            state.runtime_state.approved_step_ids = list(runtime.approved_step_ids or [])
+
+        self._mark_debug_confirmation_consumed(
+            state=state,
+            confirmation_request=confirmation_request,
+            decision="approve",
+            source=source,
+            consumed_at=consumed_at,
+        )
+        state.pending_action = {
+            "type": pending_action_type or confirmation_request.request_type or "tool_approval",
+            "request_type": confirmation_request.request_type,
+            "status": "approved",
+            "decision": "approve",
+            "step_id": target_step_id,
+            "tool_name": target_tool_name,
+            "pending_action_id": confirmation_request.pending_action_id,
+            "confirmation_consumed": True,
+            "consumed_at": consumed_at,
+            **dict(pending_action_extra or {}),
+        }
+        trace_detail = {
+            "tool_name": target_tool_name,
+            "target_step_id": target_step_id,
+            "request_type": confirmation_request.request_type,
+            "pending_action_id": confirmation_request.pending_action_id,
+            "source": source,
+            "consumed_at": consumed_at,
+        }
+        self._append_trace(runtime, step, event="confirmation_approved", status=trace_status or next_step_status, detail=trace_detail)
+        self._append_trace(runtime, step, event="confirmation_consumed", status=trace_status or next_step_status, detail={**trace_detail, "decision": "approve"})
+        logger.info(
+            "arxiv_agent confirmation_approved: step_id=%s tool_name=%s request_type=%s pending_action_id=%s source=%s next_status=%s",
+            target_step_id,
+            target_tool_name,
+            confirmation_request.request_type,
+            confirmation_request.pending_action_id,
+            source,
+            current_step_status,
+        )
+        logger.info(
+            "arxiv_agent confirmation_consumed: step_id=%s tool_name=%s decision=approve pending_action_id=%s source=%s",
+            target_step_id,
+            target_tool_name,
+            confirmation_request.pending_action_id,
+            source,
+        )
+
+    def _consume_confirmation_rejection(
+        self,
+        *,
+        step: PlanStep,
+        runtime: PlanRuntime,
+        state: AgentState,
+        confirmation_request: ConfirmationRequest,
+        source: str,
+    ) -> None:
+        """统一处理确认拒绝后的状态收尾，确保工具不会继续执行。"""
+        consumed_at = _utcnow()
+        # 拒绝后必须同步撤掉 pending_confirmation，避免 checkpoint/前端继续把它当成可恢复确认。
+        self._clear_confirmation_runtime_state(
+            step=step,
+            runtime=runtime,
+            state=state,
+            next_step_status="skipped",
+            recovery_strategy={"type": "skip_step", "reason": "confirmation_rejected"},
+        )
+        self._mark_debug_confirmation_consumed(
+            state=state,
+            confirmation_request=confirmation_request,
+            decision="reject",
+            source=source,
+            consumed_at=consumed_at,
+        )
+        state.pending_action = {
+            "type": confirmation_request.request_type,
+            "request_type": confirmation_request.request_type,
+            "status": "rejected",
+            "legacy_status": "cancelled",
+            "decision": "reject",
+            "step_id": step.step_id,
+            "tool_name": step.tool_name,
+            "pending_action_id": confirmation_request.pending_action_id,
+            "confirmation_consumed": True,
+            "consumed_at": consumed_at,
+        }
+        trace_detail = {
+            "tool_name": step.tool_name,
+            "request_type": confirmation_request.request_type,
+            "pending_action_id": confirmation_request.pending_action_id,
+            "side_effect_level": step.side_effect_level,
+            "source": source,
+            "finished_at": consumed_at,
+        }
+        self._append_trace(runtime, step, event="confirmation_rejected", status="skipped", detail=trace_detail)
+        self._append_trace(runtime, step, event="confirmation_consumed", status="skipped", detail={**trace_detail, "decision": "reject"})
+        logger.info(
+            "arxiv_agent confirmation_rejected: step_id=%s tool_name=%s request_type=%s pending_action_id=%s source=%s",
+            step.step_id,
+            step.tool_name,
+            confirmation_request.request_type,
+            confirmation_request.pending_action_id,
+            source,
+        )
+        logger.info(
+            "arxiv_agent confirmation_consumed: step_id=%s tool_name=%s decision=reject pending_action_id=%s source=%s",
+            step.step_id,
+            step.tool_name,
+            confirmation_request.pending_action_id,
+            source,
+        )
+
     def _materialize_paper_target_confirmation(
         self,
         *,
@@ -2190,46 +2565,21 @@ class PlanExecutor:
                 "source": candidate.get("source_label") or candidate.get("source"),
             },
         }
-        state.context = dict(state.context or {})
-        approved_step_ids = list(state.context.get("approved_step_ids") or [])
-        if step.step_id not in approved_step_ids:
-            approved_step_ids.append(step.step_id)
-        state.context["approved_step_ids"] = approved_step_ids
-        runtime_approved_step_ids = list(runtime.approved_step_ids or [])
-        if step.step_id not in runtime_approved_step_ids:
-            runtime_approved_step_ids.append(step.step_id)
-        runtime.approved_step_ids = runtime_approved_step_ids
-        runtime.step_status[step.step_id] = "success"
         runtime.pending_confirmation = None
         runtime.needs_replan = False
-        runtime.recovery_strategy = None
-        if state.runtime_state is not None:
-            state.runtime_state.pending_confirmation = None
-            state.runtime_state.approved_step_ids = list(runtime.approved_step_ids or [])
-        state.pending_action = {
-            "type": "paper_target_confirmation",
-            "status": "approved",
-            "decision": "approve",
-            "step_id": step.step_id,
-            "tool_name": step.tool_name,
-            "pending_action_id": confirmation_request.pending_action_id,
-            "confirmed_paper_id": confirmed_output.get("confirmed_paper_id"),
-            "confirmed_arxiv_id": confirmed_output.get("confirmed_arxiv_id"),
-        }
-        self._append_trace(
-            runtime,
-            step,
-            event="confirmation_approved",
-            status="success",
-            detail={
-                "tool_name": step.tool_name,
-                "request_type": confirmation_request.request_type,
-                "pending_action_id": confirmation_request.pending_action_id,
+        self._consume_confirmation_approval(
+            step=step,
+            runtime=runtime,
+            state=state,
+            confirmation_request=confirmation_request,
+            next_step_status="success",
+            source="paper_target_confirmation",
+            pending_action_type="paper_target_confirmation",
+            pending_action_extra={
                 "confirmed_paper_id": confirmed_output.get("confirmed_paper_id"),
                 "confirmed_arxiv_id": confirmed_output.get("confirmed_arxiv_id"),
-                "confirmed_source": candidate.get("source_label") or candidate.get("source") or candidate.get("source_type"),
-                "resumed_at": _utcnow(),
             },
+            trace_status="success",
         )
         self._append_trace(
             runtime,
@@ -2362,6 +2712,20 @@ class PlanExecutor:
         self._append_trace(
             runtime,
             step,
+            event="confirmation_created",
+            status="waiting_confirmation",
+            detail={
+                "tool_name": step.tool_name,
+                "request_type": confirmation_request.request_type,
+                "pending_action_id": confirmation_request.pending_action_id,
+                "side_effect_level": step.side_effect_level,
+                "reason": confirmation_request.reason,
+                "started_at": started_at,
+            },
+        )
+        self._append_trace(
+            runtime,
+            step,
             event="confirmation_requested",
             status="waiting_confirmation",
             detail={
@@ -2379,7 +2743,7 @@ class PlanExecutor:
             },
         )
         logger.info(
-            "arxiv_agent confirmation requested: step_id=%s tool_name=%s request_type=%s pending_action_id=%s side_effect_level=%s allowed_decisions=%s candidate_count=%s default_candidate_id=%s candidate_sources=%s reference_hint=%s original_message=%r",
+            "arxiv_agent confirmation_created: step_id=%s tool_name=%s request_type=%s pending_action_id=%s side_effect_level=%s allowed_decisions=%s candidate_count=%s default_candidate_id=%s candidate_sources=%s reference_hint=%s original_message=%r",
             confirmation_request.step_id,
             confirmation_request.tool_name,
             confirmation_request.request_type,
@@ -2421,36 +2785,16 @@ class PlanExecutor:
                     state=state,
                     confirmation_request=confirmation_request,
                 )
-            state.context = dict(state.context or {})
-            # 恢复后把当前步骤标为已批准，避免同一工具在续跑时再次触发 interrupt。
-            approved_step_ids = list(state.context.get("approved_step_ids") or [])
-            if step.step_id not in approved_step_ids:
-                approved_step_ids.append(step.step_id)
-            state.context["approved_step_ids"] = approved_step_ids
-            # 批准状态属于执行现场，必须和 step_status 一起进入 PlanRuntime；
-            # 只写 context/pending_action 容易在图恢复后的下一节点合并中丢失，导致同一工具二次确认。
-            runtime_approved_step_ids = list(runtime.approved_step_ids or [])
-            if step.step_id not in runtime_approved_step_ids:
-                runtime_approved_step_ids.append(step.step_id)
-            runtime.approved_step_ids = runtime_approved_step_ids
-            state.pending_action = {
-                "type": "tool_approval",
-                "status": "approved",
-                "decision": "approve",
-                "step_id": step.step_id,
-                "tool_name": step.tool_name,
-            }
-            runtime.step_status[step.step_id] = "pending"
-            runtime.pending_confirmation = None
-            runtime.recovery_strategy = None
-            self._append_trace(
-                runtime,
-                step,
-                event="confirmation_approved",
-                status="pending",
-                detail={"tool_name": step.tool_name, "resumed_at": _utcnow()},
+            self._consume_confirmation_approval(
+                step=step,
+                runtime=runtime,
+                state=state,
+                confirmation_request=confirmation_request,
+                next_step_status="pending",
+                source="interrupt_inline_resume",
+                pending_action_type="tool_approval",
+                trace_status="pending",
             )
-            logger.info("arxiv_agent confirmation approved: step_id=%s tool_name=%s", step.step_id, step.tool_name)
             return None
 
         return self._handle_confirmation_rejection(
@@ -2490,41 +2834,16 @@ class PlanExecutor:
                 return decision
             return "reject"
 
-        state.context = dict(state.context or {})
-        approved_step_ids = list(state.context.get("approved_step_ids") or [])
-        if step.step_id not in approved_step_ids:
-            approved_step_ids.append(step.step_id)
-        state.context["approved_step_ids"] = approved_step_ids
-
-        runtime_approved_step_ids = list(runtime.approved_step_ids or [])
-        if step.step_id not in runtime_approved_step_ids:
-            runtime_approved_step_ids.append(step.step_id)
-        runtime.approved_step_ids = runtime_approved_step_ids
-        if state.runtime_state is not None:
-            runtime_state_approved = list(state.runtime_state.approved_step_ids or [])
-            if step.step_id not in runtime_state_approved:
-                runtime_state_approved.append(step.step_id)
-            state.runtime_state.approved_step_ids = runtime_state_approved
-            state.runtime_state.pending_confirmation = None
-
-        state.pending_action = {
-            "type": "tool_approval",
-            "status": "approved",
-            "decision": "approve",
-            "step_id": step.step_id,
-            "tool_name": step.tool_name,
-        }
-        runtime.step_status[step.step_id] = "pending"
-        runtime.pending_confirmation = None
-        runtime.recovery_strategy = None
-        self._append_trace(
-            runtime,
-            step,
-            event="confirmation_approved",
-            status="pending",
-            detail={"tool_name": step.tool_name, "resumed_at": _utcnow(), "source": "pending_confirmation_resume"},
+        self._consume_confirmation_approval(
+            step=step,
+            runtime=runtime,
+            state=state,
+            confirmation_request=confirmation_request,
+            next_step_status="pending",
+            source="pending_confirmation_resume",
+            pending_action_type="tool_approval",
+            trace_status="pending",
         )
-        logger.info("arxiv_agent confirmation approved: step_id=%s tool_name=%s source=pending_confirmation", step.step_id, step.tool_name)
         return decision
 
     def _normalize_confirmation_resume_payload(self, payload: Any) -> str:
@@ -2549,26 +2868,13 @@ class PlanExecutor:
         confirmation_request: ConfirmationRequest,
     ) -> AgentTurnResult:
         """处理用户拒绝确认后的取消语义。"""
-        runtime.pending_confirmation = None
-        runtime.step_status[step.step_id] = "skipped"
-        runtime.recovery_strategy = {"type": "skip_step", "reason": "confirmation_rejected"}
-        state.pending_action = {
-            "type": confirmation_request.request_type,
-            "status": "cancelled",
-            "decision": "reject",
-            "step_id": step.step_id,
-            "tool_name": step.tool_name,
-            "pending_action_id": confirmation_request.pending_action_id,
-        }
-        self._append_trace(
-            runtime,
-            step,
-            event="confirmation_rejected",
-            status="skipped",
-            detail={"tool_name": step.tool_name, "request_type": confirmation_request.request_type, "side_effect_level": step.side_effect_level, "finished_at": _utcnow()},
+        self._consume_confirmation_rejection(
+            step=step,
+            runtime=runtime,
+            state=state,
+            confirmation_request=confirmation_request,
+            source="confirmation_reject_resume",
         )
-        logger.info("arxiv_agent confirmation rejected: step_id=%s tool_name=%s", step.step_id, step.tool_name)
-
         record_confirmation_rejection(runtime, confirmation_request=confirmation_request)
         return self._build_turn_result(runtime)
 

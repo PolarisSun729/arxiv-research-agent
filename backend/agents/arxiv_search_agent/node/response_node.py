@@ -298,6 +298,12 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
         personalization_signals = dict(recommendation_debug.get("personalization_signals") or {})
         paper_count = len(papers)
         priority_titles = _collect_priority_titles(papers, limit=3)
+
+        # 关键修复：把推荐结果同步到 context.last_papers，供会话记忆和前端展示使用
+        if paper_count > 0:
+            next_state.context = dict(next_state.context or {})
+            next_state.context["last_papers"] = papers
+
         if paper_count > 0:
             next_state.answer = f"已生成 {paper_count} 篇个性化论文推荐。"
             if priority_titles:
@@ -383,6 +389,11 @@ def synthesize_response(state: Union[AgentState, Mapping[str, Any]]) -> AgentSta
         summary = _summarize_search_spec(spec)
         priority_titles = _collect_priority_titles(papers, limit=3)
         personalized_applied = bool(next_state.personalized_rerank_applied)
+
+        # 关键修复：把搜索结果同步到 context.last_papers，供会话记忆和前端展示使用
+        if paper_count > 0:
+            next_state.context = dict(next_state.context or {})
+            next_state.context["last_papers"] = papers
 
         if paper_count > 0:
             next_state.answer = f"已按“{summary}”搜索 arXiv，当前返回 {paper_count} 篇论文。"

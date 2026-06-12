@@ -96,6 +96,9 @@ class FakeDatabaseService:
     def mark_agent_runtime_checkpoint_status(self, **_kwargs: Any) -> bool:
         return True
 
+    def consume_agent_runtime_pending_confirmation(self, **_kwargs: Any) -> bool:
+        return True
+
     def expire_agent_runtime_checkpoints(self, **_kwargs: Any) -> int:
         return 0
 

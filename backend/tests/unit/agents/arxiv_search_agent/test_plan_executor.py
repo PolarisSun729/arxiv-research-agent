@@ -34,6 +34,33 @@ def _tool(tool_name: str):
     return tool
 
 
+def _paper_index_confirmation_plan() -> tuple[Goal, ExecutablePlan]:
+    goal = Goal(goal_id="paper_qa:test", goal_type="paper_qa", user_request="index paper")
+    plan = ExecutablePlan(
+        plan_id="paper_qa:test",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="parse_and_index_paper",
+                action_type="index",
+                tool_name="parse_and_index_paper",
+                tool=_tool("parse_and_index_paper"),
+                output_key="index_build_result",
+                input_bindings=[StepInputBinding(input_key="paper_reference", source_type="literal", value={"arxiv_id": "2401.00001", "title": "RAG Paper"})],
+                confirmation_policy=StepPolicy(
+                    policy_type="confirmation",
+                    mode="explicit_user_confirmation_required",
+                    requires_confirmation=True,
+                ),
+                side_effect_level="external_call",
+            ),
+        ],
+        entry_step_ids=["parse_and_index_paper"],
+        final_step_ids=["parse_and_index_paper"],
+    )
+    return goal, plan
+
+
 def _step(
     *,
     step_id: str,
@@ -602,6 +629,49 @@ def test_plan_executor_runtime_approved_step_does_not_request_confirmation_again
     assert not any(trace.event == "confirmation_requested" for trace in result.trace)
 
 
+def test_plan_executor_checkpoint_approved_step_does_not_request_confirmation_again(monkeypatch) -> None:
+    calls = []
+
+    class ApprovedCheckpointDatabase:
+        def get_agent_runtime_checkpoint(self, **kwargs):
+            assert kwargs["user_id"] == "u1"
+            assert kwargs["session_id"] == "s1"
+            return {
+                "status": "running",
+                "pending_confirmation": None,
+                "runtime_state": {
+                    "approved_step_ids": ["parse_and_index_paper"],
+                    "plan": {"plan_id": "paper_qa:test"},
+                },
+            }
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        calls.append((tool_name, dict(kwargs)))
+        if tool_name == "build_paper_qa_index":
+            return {"ok": True, "tool_name": tool_name, "summary": "indexed", "data": {"status": "indexed", "has_index": True}, "trace": {}, "error": None}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    def fail_if_interrupted(*args, **kwargs):
+        raise AssertionError("approved checkpoint step must not request confirmation again")
+
+    monkeypatch.setattr(executor_module, "DatabaseService", ApprovedCheckpointDatabase)
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+    monkeypatch.setattr(executor_module, "interrupt", fail_if_interrupted)
+
+    goal, plan = _paper_index_confirmation_plan()
+    state = AgentState(user_id="u1", session_id="s1", intent="paper_qa", message="build index")
+    runtime = planner_module.build_plan_runtime(state, goal=goal, plan=plan, turn_status="success")
+    runtime.step_status = {step.step_id: "pending" for step in list(plan.steps or [])}
+
+    result = PlanExecutor()._execute_runtime(runtime, state, allow_interrupt=True)
+
+    assert result.status == "success"
+    assert calls and calls[0][0] == "build_paper_qa_index"
+    assert runtime.approved_step_ids == ["parse_and_index_paper"]
+    assert state.context["approved_step_ids"] == ["parse_and_index_paper"]
+    assert not any(trace.event == "confirmation_requested" for trace in result.trace)
+
+
 def test_plan_executor_resume_reentry_consumes_pending_confirmation(monkeypatch) -> None:
     calls = []
 
@@ -637,7 +707,11 @@ def test_plan_executor_resume_reentry_consumes_pending_confirmation(monkeypatch)
         entry_step_ids=["parse_and_index_paper"],
         final_step_ids=["parse_and_index_paper"],
     )
-    state = AgentState(intent="paper_qa", message="build index")
+    state = AgentState(
+        intent="paper_qa",
+        message="build index",
+        debug={"pending_confirmation": {"step_id": "parse_and_index_paper", "tool_name": "parse_and_index_paper"}},
+    )
     runtime = planner_module.build_plan_runtime(state, goal=goal, plan=plan, turn_status="success")
     runtime.step_status = {"parse_and_index_paper": "waiting_confirmation"}
     runtime.current_step_id = "parse_and_index_paper"
@@ -656,7 +730,157 @@ def test_plan_executor_resume_reentry_consumes_pending_confirmation(monkeypatch)
     assert runtime.approved_step_ids == ["parse_and_index_paper"]
     assert state.context["approved_step_ids"] == ["parse_and_index_paper"]
     assert runtime.pending_confirmation is None
+    assert runtime.recovery_strategy is None
+    assert state.pending_action["status"] == "approved"
+    assert state.pending_action["confirmation_consumed"] is True
+    assert "pending_confirmation" not in state.debug
+    assert state.debug["confirmation_consumed"]["decision"] == "approve"
+    assert state.runtime_state is not None
+    assert state.runtime_state.pending_confirmation is None
+    assert state.runtime_state.turn_status is None
     assert any(trace.event == "confirmation_approved" for trace in runtime.trace)
+    assert any(trace.event == "confirmation_consumed" for trace in runtime.trace)
+    events = [trace.event for trace in runtime.trace]
+    assert events.index("confirmation_consumed") < events.index("step_started")
+
+
+def test_plan_executor_resume_reentry_from_request_confirmation_consumes_target_step_approval(monkeypatch) -> None:
+    calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        calls.append((tool_name, dict(kwargs)))
+        if tool_name == "request_confirmation":
+            return {
+                "ok": True,
+                "tool_name": tool_name,
+                "summary": "waiting",
+                "data": {
+                    "status": "waiting_confirmation",
+                    "pending_action": {
+                        "type": "tool_approval",
+                        "status": "waiting_confirmation",
+                        "step_id": "parse_and_index_paper",
+                        "tool_name": "parse_and_index_paper",
+                        "action_label": "解析并索引论文",
+                    },
+                },
+                "trace": {},
+                "error": None,
+            }
+        if tool_name == "build_paper_qa_index":
+            return {
+                "ok": True,
+                "tool_name": tool_name,
+                "summary": "indexed",
+                "data": {"status": "indexed", "has_index": True},
+                "trace": {},
+                "error": None,
+            }
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+    monkeypatch.setattr(
+        executor_module,
+        "interrupt",
+        lambda payload: {
+            "decision": "approve",
+            "step_id": "parse_and_index_paper",
+            "tool_name": "parse_and_index_paper",
+        },
+    )
+
+    goal = Goal(goal_id="paper_qa:test", goal_type="paper_qa", user_request="index paper")
+    plan = ExecutablePlan(
+        plan_id="paper_qa:test",
+        goal=goal,
+        steps=[
+            PlanStep(
+                step_id="request_confirmation",
+                action_type="clarify",
+                tool_name="request_confirmation",
+                tool=_tool("request_confirmation"),
+                output_key="confirmation_status",
+                input_bindings=[
+                    StepInputBinding(
+                        input_key="pending_action",
+                        source_type="literal",
+                        value={
+                            "type": "tool_approval",
+                            "status": "waiting_confirmation",
+                            "step_id": "parse_and_index_paper",
+                            "tool_name": "parse_and_index_paper",
+                            "action_label": "解析并索引论文",
+                        },
+                    )
+                ],
+            ),
+            PlanStep(
+                step_id="parse_and_index_paper",
+                action_type="index",
+                tool_name="parse_and_index_paper",
+                tool=_tool("parse_and_index_paper"),
+                output_key="index_build_result",
+                depends_on=["request_confirmation"],
+                input_bindings=[StepInputBinding(input_key="paper_reference", source_type="literal", value={"arxiv_id": "2401.00001"})],
+                confirmation_policy=StepPolicy(
+                    policy_type="confirmation",
+                    mode="explicit_user_confirmation_required",
+                    requires_confirmation=True,
+                ),
+                side_effect_level="external_call",
+            ),
+        ],
+        entry_step_ids=["request_confirmation"],
+        final_step_ids=["parse_and_index_paper"],
+    )
+    state = AgentState(intent="paper_qa", message="build index")
+    runtime = planner_module.build_plan_runtime(state, goal=goal, plan=plan, turn_status="success")
+    runtime.step_status = {
+        "request_confirmation": "waiting_confirmation",
+        "parse_and_index_paper": "pending",
+    }
+    runtime.current_step_id = "request_confirmation"
+    runtime.pending_confirmation = executor_module.ConfirmationRequest(
+        step_id="parse_and_index_paper",
+        tool_name="parse_and_index_paper",
+        action_type="index",
+        side_effect_level="external_call",
+        reason="explicit_user_confirmation_required",
+        request_type="tool_approval",
+    )
+
+    step_result = PlanExecutor().execute_current_step_tool(runtime, state, allow_interrupt=True)
+
+    assert step_result.next_action in {"observe", "continue"}
+    assert runtime.approved_step_ids == ["parse_and_index_paper"]
+    assert state.context["approved_step_ids"] == ["parse_and_index_paper"]
+    assert runtime.pending_confirmation is None
+    assert state.pending_action["step_id"] == "parse_and_index_paper"
+    assert state.pending_action["status"] == "approved"
+
+
+def test_plan_executor_pending_action_approved_does_not_bypass_confirmation(monkeypatch) -> None:
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("display-only pending_action approval must not execute side effect tool")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fail_if_called)
+    _goal, plan = _paper_index_confirmation_plan()
+    state = AgentState(
+        intent="paper_qa",
+        message="build index",
+        pending_action={
+            "status": "approved",
+            "decision": "approve",
+            "step_id": "parse_and_index_paper",
+        },
+    )
+
+    result = PlanExecutor().execute(plan, state)
+
+    assert result.status == "waiting_confirmation"
+    assert result.pending_confirmation is not None
+    assert result.pending_confirmation.step_id == "parse_and_index_paper"
+    assert any(trace.event == "confirmation_created" for trace in result.trace)
 
 
 def test_plan_executor_interrupt_reject_skips_side_effect_tool(monkeypatch) -> None:
@@ -690,14 +914,31 @@ def test_plan_executor_interrupt_reject_skips_side_effect_tool(monkeypatch) -> N
         final_step_ids=["parse_and_index_paper"],
     )
 
-    runtime = planner_module.build_plan_runtime(AgentState(intent="paper_qa", message="build index"), goal=goal, plan=plan, turn_status="success")
+    state = AgentState(
+        intent="paper_qa",
+        message="build index",
+        debug={"pending_confirmation": {"step_id": "parse_and_index_paper", "tool_name": "parse_and_index_paper"}},
+    )
+    runtime = planner_module.build_plan_runtime(state, goal=goal, plan=plan, turn_status="success")
     runtime.step_status = {step.step_id: "pending" for step in list(plan.steps or [])}
-    result = PlanExecutor()._execute_runtime(runtime, AgentState(intent="paper_qa", message="build index"), allow_interrupt=True)
+    result = PlanExecutor()._execute_runtime(runtime, state, allow_interrupt=True)
 
     assert result.status in {"success", "waiting_confirmation", "fallback"}
     assert result.final_answer == "已取消解析 RAG Paper，因此无法继续基于全文回答。"
     assert any(trace.event == "confirmation_requested" for trace in result.trace)
     assert any(trace.event == "confirmation_rejected" for trace in result.trace)
+    assert any(trace.event == "confirmation_consumed" for trace in result.trace)
+    assert runtime.pending_confirmation is None
+    assert state.pending_action["status"] == "rejected"
+    assert state.pending_action["decision"] == "reject"
+    assert state.pending_action["confirmation_consumed"] is True
+    assert "pending_confirmation" not in state.debug
+    assert state.debug["confirmation_consumed"]["decision"] == "reject"
+    assert state.runtime_state is not None
+    assert state.runtime_state.pending_confirmation is None
+    # 拒绝后中间 waiting_confirmation 已被清掉，但最终整轮会收束成可展示的终态。
+    assert state.runtime_state.turn_status == "success"
+    assert state.runtime_state.recovery_strategy == {"type": "skip_step", "reason": "confirmation_rejected"}
     assert result.plan is not None
     assert result.plan.steps[0].status == "skipped"
 

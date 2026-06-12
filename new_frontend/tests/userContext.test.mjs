@@ -68,7 +68,13 @@ assert.doesNotMatch(ragSource, /user_id:\s*['"]local_user['"]/)
 const agentSource = await readFile(new URL('../src/composables/useAgentSearchChat.ts', import.meta.url), 'utf8')
 assert.match(agentSource, /effectiveUserId/)
 assert.match(agentSource, /activeSessionUserId/)
+assert.match(agentSource, /buildConfirmationPlaceholder/)
+assert.match(agentSource, /skipUserMessage:\s*true/)
+assert.match(agentSource, /if\s*\(!options\?\.skipUserMessage\)\s*\{/)
 assert.doesNotMatch(agentSource, /user_id:\s*['"]local_user['"]/)
+
+const agentChatSource = await readFile(new URL('../src/types/agentChat.ts', import.meta.url), 'utf8')
+assert.match(agentChatSource, /'system'/)
 
 const papersSource = await readFile(new URL('../src/api/papers.ts', import.meta.url), 'utf8')
 assert.match(papersSource, /getCurrentUserId/)

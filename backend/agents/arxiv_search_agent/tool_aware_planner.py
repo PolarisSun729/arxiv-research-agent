@@ -389,6 +389,7 @@ class LLMPlanDraftGenerator:
                 "no_tool_execution": True,
                 "persistent_write_requires_clear_target": True,
                 "confirmation_required_for_tool_policy": True,
+                "external_call_requires_confirmation": False,
                 "unsupported_or_unclear_must_use_clarification_or_fallback": True,
             },
             "planner_limits": {
@@ -435,7 +436,7 @@ class LLMPlanDraftGenerator:
             "禁止输出自然语言解释、Markdown、代码块或工具执行结果。\n"
             "只能选择 candidate_tools 中存在的工具，不要创造新工具。\n"
             "每个 step 必须有 why_this_step、合法 depends_on、input_bindings 和 expected_output。\n"
-            "高风险或 requires_confirmation 工具必须标记 requires_confirmation=true。\n"
+            "只有 ToolContract.requires_confirmation=true 或 persistent_write 工具才必须标记 requires_confirmation=true；external_call 只写 risk_notes/recovery，不要仅因外部调用要求人工确认。\n"
             "persistent_write 工具只能在目标明确时使用；不确定时选择 clarification 工具。\n"
             "paper_qa 必须先 resolve_paper，再 check_paper_index，再 answer_paper_question。\n"
             "preference_action 写入必须先 resolve_preference_target，再 update_preference_store，再 verify，再 answer。\n"
@@ -1214,8 +1215,9 @@ class PlanDraftConverter:
             raise PlanDraftConversionError(f"Draft step {draft_step.step_id} uses risky tool {tool_name} without risk strategy")
 
         confirmation_policy = None
-        if tool.requires_confirmation or draft_step.requires_confirmation or tool.side_effect_level == "persistent_write":
-            # 草稿只声明“需要确认”，真正的确认策略在转换时统一补齐，避免未校验草稿绕过确认门。
+        if _tool_requires_human_confirmation(tool):
+            # LLM 草稿不是真源：只有 contract 明确要求人工确认的工具才进入确认门，
+            # 避免普通 external_call 检索被模型错标 requires_confirmation 后卡住搜索链路。
             confirmation_policy = StepPolicy(
                 policy_type="confirmation",
                 mode="explicit_user_confirmation_required",
@@ -1835,6 +1837,15 @@ def _risk_level_for_tool(tool: ToolSpec) -> str:
     if tool.side_effect_level == "external_call" or tool.requires_confirmation:
         return "medium"
     return "low"
+
+
+def _tool_requires_human_confirmation(tool: ToolSpec) -> bool:
+    """判断工具 contract 是否真正需要人工确认。
+
+    PlanDraft 里的 requires_confirmation 可能来自 LLM 对“外部调用风险”的误读；
+    确认门只能由受控 ToolContract 决定，避免普通 arXiv 搜索被错误拦截。
+    """
+    return bool(tool.requires_confirmation or tool.side_effect_level == "persistent_write")
 
 
 def _side_effect_rank(side_effect_level: str) -> int:

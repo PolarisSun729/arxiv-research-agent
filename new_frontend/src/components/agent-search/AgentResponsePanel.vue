@@ -89,13 +89,19 @@ function formatToolCallStatus(status: string) {
   return status || 'unknown'
 }
 
+function normalizePendingActionForDebug(value: Record<string, any> | null | undefined) {
+  if (!value || typeof value !== 'object') return null
+  const status = String(value.status || '').trim()
+  return status === 'waiting_confirmation' || status === 'confirming' ? value : null
+}
+
 const responseData = computed(() => props.response || ({} as ArxivSearchResponse))
 const papers = computed(() => (responseData.value.papers || []).map(normalizePaper))
 const steps = computed(() => responseData.value.steps || [])
 const toolCalls = computed(() => responseData.value.tool_calls || [])
 const warnings = computed(() => responseData.value.warnings || [])
 const searchSpec = computed(() => responseData.value.search_spec || null)
-const pendingAction = computed(() => responseData.value.pending_action || null)
+const pendingAction = computed(() => normalizePendingActionForDebug(responseData.value.pending_action || null))
 const paperQaResult = computed(() => responseData.value.paper_qa_result || null)
 const preferenceActionResult = computed(() => responseData.value.preference_action_result || null)
 const streamingState = computed(() => responseData.value.streaming_state || null)

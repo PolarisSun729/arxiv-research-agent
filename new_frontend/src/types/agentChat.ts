@@ -1,4 +1,4 @@
-export type AgentChatRole = 'user' | 'assistant'
+export type AgentChatRole = 'user' | 'assistant' | 'system'
 
 export interface AgentChatMessage<ResponseType = unknown> {
   id: string

@@ -4509,6 +4509,55 @@ class DatabaseService:
             logger.error(f"Error getting agent runtime checkpoint: {str(e)}")
             return None
 
+    def _runtime_state_without_pending_confirmation(
+        self,
+        raw_runtime_state: Any,
+        *,
+        decision: Optional[str] = None,
+        step_id: Optional[str] = None,
+    ) -> str:
+        """清理 runtime_state_json 内嵌的确认真源，避免查库或后续诊断看到旧 pending。
+
+        关键修复：在批准决策时，必须把 pending_confirmation 中记录的真正目标 step_id 添加到
+        approved_step_ids，而不仅仅是传入的 step_id。这对于缺索引补丁链等桥接确认场景至关重要。
+        """
+        payload = self._deserialize_json_field(raw_runtime_state)
+        if not isinstance(payload, dict):
+            return self._serialize_json_field(payload)
+
+        previous_pending = payload.get("pending_confirmation") if isinstance(payload.get("pending_confirmation"), dict) else {}
+        # 关键修复：优先使用 pending_confirmation 中记录的目标 step_id，而不是 resume_payload 传入的 step_id
+        # 因为在桥接确认场景（如 request_confirmation），真正需要批准的是目标工具，而不是桥接步骤本身
+        pending_step_id = str(previous_pending.get("step_id") or "").strip()
+        normalized_step_id = str(step_id or "").strip() or pending_step_id
+        normalized_decision = str(decision or "").strip().lower()
+        payload["pending_confirmation"] = None
+
+        # confirmation 已消费后，request_confirmation 恢复策略不再代表可恢复现场；拒绝分支保留 skip 语义。
+        recovery_strategy = payload.get("recovery_strategy") if isinstance(payload.get("recovery_strategy"), dict) else {}
+        if normalized_decision == "reject":
+            payload["recovery_strategy"] = {
+                "type": "skip_step",
+                "reason": "confirmation_rejected",
+                **({"step_id": normalized_step_id} if normalized_step_id else {}),
+            }
+        elif normalized_decision == "approve" or str(recovery_strategy.get("type") or "").strip() == "request_confirmation":
+            payload["recovery_strategy"] = None
+
+        if normalized_decision == "approve" and normalized_step_id:
+            approved_step_ids = [str(item).strip() for item in list(payload.get("approved_step_ids") or []) if str(item).strip()]
+            if normalized_step_id not in approved_step_ids:
+                approved_step_ids.append(normalized_step_id)
+            payload["approved_step_ids"] = approved_step_ids
+
+        step_status = payload.get("step_status") if isinstance(payload.get("step_status"), dict) else None
+        if step_status is not None and normalized_step_id and step_status.get(normalized_step_id) == "waiting_confirmation":
+            step_status[normalized_step_id] = "skipped" if normalized_decision == "reject" else "pending"
+            payload["step_status"] = step_status
+        if str(payload.get("turn_status") or "").strip() == "waiting_confirmation":
+            payload["turn_status"] = None
+        return self._serialize_json_field(payload)
+
     def mark_agent_runtime_checkpoint_status(
         self,
         *,
@@ -4528,10 +4577,21 @@ class DatabaseService:
                 return False
             assignments = ['status = ?', 'error_summary = ?', 'updated_at = CURRENT_TIMESTAMP']
             values: List[Any] = [str(status or '').strip(), str(error_summary or '').strip()]
-            if clear_pending_confirmation:
-                assignments.append("pending_confirmation_json = ''")
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                if clear_pending_confirmation:
+                    cursor.execute(
+                        '''
+                        SELECT runtime_state_json
+                        FROM agent_runtime_checkpoints
+                        WHERE user_id = ? AND session_id = ? AND thread_id = ?
+                        ''',
+                        (normalized_user_id, normalized_session_id, normalized_thread_id),
+                    )
+                    row = cursor.fetchone()
+                    cleaned_runtime_state = self._runtime_state_without_pending_confirmation(row[0] if row else None)
+                    assignments.extend(["pending_confirmation_json = ''", "runtime_state_json = ?", "expires_at = NULL"])
+                    values.append(cleaned_runtime_state)
                 cursor.execute(
                     f'''
                     UPDATE agent_runtime_checkpoints
@@ -4544,6 +4604,100 @@ class DatabaseService:
                 return cursor.rowcount > 0
         except Exception as e:
             logger.error(f"Error marking agent runtime checkpoint status: {str(e)}")
+            return False
+
+    def consume_agent_runtime_pending_confirmation(
+        self,
+        *,
+        user_id: str = DEFAULT_USER_ID,
+        session_id: str,
+        thread_id: Optional[str] = None,
+        next_route: str = "running",
+        decision: Optional[str] = None,
+        step_id: Optional[str] = None,
+        tool_name: Optional[str] = None,
+        pending_action_id: Optional[str] = None,
+    ) -> bool:
+        """原子消费等待确认的业务 checkpoint。
+
+        快速连续点击确认时，多个请求可能同时读到同一张确认卡片；这里用
+        status='waiting_confirmation' 作为抢占条件，只有第一个请求能清空
+        pending_confirmation 并进入 running，后续请求会因为 rowcount=0 被拒绝恢复。
+        """
+        try:
+            normalized_user_id = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+            normalized_session_id = str(session_id or '').strip()
+            normalized_thread_id = str(thread_id or normalized_session_id).strip()
+            if not normalized_session_id or not normalized_thread_id:
+                return False
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT runtime_state_json, pending_confirmation_json
+                    FROM agent_runtime_checkpoints
+                    WHERE user_id = ?
+                      AND session_id = ?
+                      AND thread_id = ?
+                      AND status = 'waiting_confirmation'
+                      AND COALESCE(NULLIF(pending_confirmation_json, ''), '') <> ''
+                    ''',
+                    (normalized_user_id, normalized_session_id, normalized_thread_id),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return False
+                pending_payload = self._deserialize_json_field(row[1]) if row else None
+                pending_step_id = pending_payload.get("step_id") if isinstance(pending_payload, dict) else None
+                pending_tool_name = pending_payload.get("tool_name") if isinstance(pending_payload, dict) else None
+                stored_pending_action_id = pending_payload.get("pending_action_id") if isinstance(pending_payload, dict) else None
+                normalized_step_id = str(step_id or "").strip()
+                normalized_tool_name = str(tool_name or "").strip()
+                normalized_pending_action_id = str(pending_action_id or "").strip()
+                if normalized_step_id and pending_step_id and normalized_step_id != str(pending_step_id).strip():
+                    # 消费动作必须绑定当前确认任务本身，避免旧按钮把新的 waiting 任务误消费。
+                    return False
+                if normalized_tool_name and pending_tool_name and normalized_tool_name != str(pending_tool_name).strip():
+                    return False
+                if (
+                    normalized_pending_action_id
+                    and stored_pending_action_id
+                    and normalized_pending_action_id != str(stored_pending_action_id).strip()
+                ):
+                    return False
+                cleaned_runtime_state = self._runtime_state_without_pending_confirmation(
+                    row[0],
+                    decision=decision,
+                    step_id=normalized_step_id or pending_step_id,
+                )
+                cursor.execute(
+                    '''
+                    UPDATE agent_runtime_checkpoints
+                    SET status = 'running',
+                        pending_confirmation_json = '',
+                        runtime_state_json = ?,
+                        next_route = ?,
+                        error_summary = '',
+                        expires_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                      AND session_id = ?
+                      AND thread_id = ?
+                      AND status = 'waiting_confirmation'
+                      AND COALESCE(NULLIF(pending_confirmation_json, ''), '') <> ''
+                    ''',
+                    (
+                        cleaned_runtime_state,
+                        str(next_route or 'running').strip() or 'running',
+                        normalized_user_id,
+                        normalized_session_id,
+                        normalized_thread_id,
+                    ),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error consuming agent runtime pending confirmation: {str(e)}")
             return False
 
     def expire_agent_runtime_checkpoints(self, *, now: Optional[str] = None) -> int:

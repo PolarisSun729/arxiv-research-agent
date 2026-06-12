@@ -713,8 +713,9 @@ class ConfirmationDecisionPayload(BaseModel):
 class ResumeRequest(BaseModel):
     """定义前端发起 interrupt 恢复时使用的结构化请求。
 
-    step_id / interrupt_id 用于幂等校验；edited_arguments 只承载确认框中用户明确选择的
-    paper_id/arxiv_id 等字段，后端必须用 pending confirmation 里的候选集合再次校验。
+    step_id / interrupt_id / tool_name / pending_action_id 共同标识本次要消费的确认任务；
+    edited_arguments 只承载确认框中用户明确选择的 paper_id/arxiv_id 等字段，后端必须用
+    pending confirmation 里的候选集合再次校验。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -723,7 +724,27 @@ class ResumeRequest(BaseModel):
     note: Optional[str] = None
     step_id: Optional[str] = None
     interrupt_id: Optional[str] = None
+    tool_name: Optional[str] = None
+    pending_action_id: Optional[str] = None
     edited_arguments: Optional[Dict[str, Any]] = None
+
+    @field_validator("note", "step_id", "interrupt_id", "tool_name", "pending_action_id", mode="before")
+    @classmethod
+    def _strip_optional_text(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @model_validator(mode="after")
+    def _validate_locator_fields(self) -> "ResumeRequest":
+        # resume 是结构化确认动作，不能再退回“只靠 message 文本猜当前待确认任务”。
+        # 至少要携带 pending_action_id 或 step_id/tool_name 这组稳定定位字段，后端才能可靠校验并发、旧 checkpoint 和重复点击。
+        has_pending_action_id = bool(self.pending_action_id)
+        has_step_and_tool = bool(self.step_id and self.tool_name)
+        if not has_pending_action_id and not has_step_and_tool:
+            raise ValueError("resume request must include pending_action_id or step_id plus tool_name")
+        return self
 
 
 class ConfirmationRequest(BaseModel):

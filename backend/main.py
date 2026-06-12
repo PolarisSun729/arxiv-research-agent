@@ -19,7 +19,7 @@ from routers.qa_router import router as qa_router
 from routers.user_router import router as user_router
 from utils.config import get_debug_routes_runtime_config
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 
 def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None = None) -> FastAPI:

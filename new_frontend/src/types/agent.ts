@@ -9,6 +9,8 @@ export interface ArxivSearchRequest {
     note?: string | null
     step_id?: string | null
     interrupt_id?: string | null
+    tool_name?: string | null
+    pending_action_id?: string | null
     edited_arguments?: Record<string, any> | null
   } | null
   context?: {
@@ -128,6 +130,7 @@ export interface AgentPendingAction {
   request_type?: string
   status?: string
   decision?: 'approve' | 'reject' | null
+  confirmation_consumed?: boolean
   pending_action_id?: string | null
   step_id?: string | null
   interrupt_id?: string | null

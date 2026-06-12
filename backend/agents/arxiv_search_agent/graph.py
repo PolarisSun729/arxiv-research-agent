@@ -535,8 +535,16 @@ def _apply_turn_result(state: AgentState, result: AgentTurnResult) -> None:
     state.execution_plan = result.plan
     state.plan_runtime = result.runtime
     state.answer = result.final_answer or state.answer
+    previous_pending_action = dict(state.pending_action or {}) if isinstance(state.pending_action, Mapping) else None
     confirmation_payload = result.pending_confirmation.model_dump() if result.pending_confirmation is not None else None
-    state.pending_action = _build_pending_action_mirror(result)
+    if confirmation_payload is not None:
+        state.pending_action = _build_pending_action_mirror(result)
+    elif previous_pending_action and previous_pending_action.get("confirmation_consumed") is True:
+        # 确认已被消费时，最终响应仍要保留 approved/rejected 结果给前端和日志层，
+        # 但它不会再被当成新的待确认卡片，因为 display 层只展示 waiting_confirmation。
+        state.pending_action = previous_pending_action
+    else:
+        state.pending_action = None
     state.debug = dict(state.debug or {})
     state.debug["agent_turn"] = {
         "status": result.status,
@@ -546,8 +554,22 @@ def _apply_turn_result(state: AgentState, result: AgentTurnResult) -> None:
     }
     if confirmation_payload is not None:
         state.debug["pending_confirmation"] = confirmation_payload
+    else:
+        state.debug.pop("pending_confirmation", None)
     if result.status == "waiting_confirmation":
         state.paper_qa_result = {"status": "waiting_confirmation", "pending_confirmation": confirmation_payload}
+    elif previous_pending_action and previous_pending_action.get("confirmation_consumed") is True:
+        # 确认已消费后，要同步撤掉业务快照里的 waiting_confirmation 残留，
+        # 避免后续持久化上下文或前端状态机继续把旧确认当成待处理任务。
+        existing_paper_qa_result = dict(state.paper_qa_result or {}) if isinstance(state.paper_qa_result, Mapping) else {}
+        if str(existing_paper_qa_result.get("status") or "").strip() == "waiting_confirmation":
+            state.paper_qa_result = {
+                **existing_paper_qa_result,
+                "status": "cancelled" if previous_pending_action.get("decision") == "reject" else "ready",
+                "pending_confirmation": None,
+                "confirmation_consumed": True,
+                "confirmation_decision": previous_pending_action.get("decision"),
+            }
     if "preference_action_result" in result.outputs:
         preference_result = result.outputs.get("preference_action_result")
         state.preference_action_result = dict(preference_result) if isinstance(preference_result, Mapping) else {"value": preference_result}

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from tests.helpers.agent_runtime import load_agent_test_modules
@@ -7,6 +9,10 @@ from tests.helpers.agent_runtime import load_agent_test_modules
 
 _MODULES = load_agent_test_modules()
 runtime_checkpoint = _MODULES["runtime_checkpoint_module"]
+service = _MODULES["service_module"]
+AgentState = _MODULES["state_module"].AgentState
+schemas = _MODULES["schemas"]
+state_utils = sys.modules["backend.agents.arxiv_search_agent.utils.state_utils"]
 
 
 class _InMemoryCheckpointDatabase:
@@ -37,6 +43,25 @@ class _InMemoryCheckpointDatabase:
             self.record["pending_confirmation"] = None
         return True
 
+    def consume_agent_runtime_pending_confirmation(self, **kwargs):
+        if not self.record:
+            return False
+        if self.record.get("user_id") != kwargs.get("user_id"):
+            return False
+        if self.record.get("session_id") != kwargs.get("session_id"):
+            return False
+        if self.record.get("thread_id") != kwargs.get("thread_id"):
+            return False
+        if self.record.get("status") != runtime_checkpoint.CHECKPOINT_STATUS_WAITING:
+            return False
+        if not self.record.get("pending_confirmation"):
+            return False
+        self.record["status"] = runtime_checkpoint.CHECKPOINT_STATUS_RUNNING
+        self.record["pending_confirmation"] = None
+        self.record["next_route"] = kwargs.get("next_route")
+        self.record["expires_at"] = None
+        return True
+
     def expire_agent_runtime_checkpoints(self, **_kwargs):
         return 0
 
@@ -46,6 +71,17 @@ class _InMemoryCheckpointDatabase:
     def cleanup_langgraph_checkpoints_for_terminal_runtime(self, **_kwargs):
         self.langgraph_cleanup_called = True
         return {"threads": 0, "checkpoints": 0, "writes": 0}
+
+
+def _confirmation_payload(step_id: str = "parse_and_index_paper") -> dict:
+    return {
+        "pending_action_id": f"pending:{step_id}",
+        "step_id": step_id,
+        "tool_name": "parse_and_index_paper",
+        "action_type": "paper_index",
+        "side_effect_level": "external_call",
+        "reason": "paper_index_missing",
+    }
 
 
 def test_runtime_checkpoint_persists_pending_confirmation_as_resume_truth() -> None:
@@ -80,6 +116,84 @@ def test_runtime_checkpoint_persists_pending_confirmation_as_resume_truth() -> N
     )
 
 
+def test_runtime_checkpoint_ignores_debug_pending_confirmation_after_business_state_cleared() -> None:
+    database = _InMemoryCheckpointDatabase()
+    manager = runtime_checkpoint.AgentRuntimeCheckpointManager(database_service=database)
+
+    manager.persist_state(
+        {
+            "user_id": "u1",
+            "session_id": "s1",
+            "runtime_state": {"turn_status": "success", "pending_confirmation": None},
+            "plan_runtime": {"pending_confirmation": _confirmation_payload("stale-plan-step"), "error": "stale-error"},
+            "pending_action": {"status": "waiting_confirmation", "step_id": "display-only"},
+            # debug 只保留排查快照；即使残留旧确认和旧 route，也不能重新驱动 checkpoint。
+            "debug": {
+                "pending_confirmation": _confirmation_payload("stale-debug-step"),
+                "agent_route": {"decision": "waiting_confirmation"},
+            },
+        },
+        current_node="finalize",
+    )
+
+    record = database.record
+    assert record["status"] == runtime_checkpoint.CHECKPOINT_STATUS_COMPLETED
+    assert record["pending_confirmation"] is None
+    assert record["next_route"] == runtime_checkpoint.CHECKPOINT_STATUS_COMPLETED
+    assert record["expires_at"] is None
+
+
+def test_service_final_persist_uses_runtime_state_over_stale_debug_and_plan_runtime() -> None:
+    database = _InMemoryCheckpointDatabase()
+    manager = runtime_checkpoint.AgentRuntimeCheckpointManager(database_service=database)
+    stale_confirmation = schemas.ConfirmationRequest(**_confirmation_payload("stale-plan-step"))
+    state = AgentState(
+        user_id="u1",
+        session_id="s1",
+        debug={"pending_confirmation": _confirmation_payload("stale-debug-step")},
+        pending_action={"status": "waiting_confirmation", "step_id": "display-only"},
+        runtime_state=schemas.AgentRuntimeState(turn_status="success", pending_confirmation=None),
+        plan_runtime=schemas.PlanRuntime(pending_confirmation=stale_confirmation, error="stale-error"),
+    )
+
+    service._persist_runtime_checkpoint_after_turn(manager, state, is_resume=True)
+
+    assert database.record["status"] == runtime_checkpoint.CHECKPOINT_STATUS_COMPLETED
+    assert database.record["pending_confirmation"] is None
+
+
+def test_stream_interrupt_state_promotes_confirmation_to_runtime_truth() -> None:
+    database = _InMemoryCheckpointDatabase()
+    manager = runtime_checkpoint.AgentRuntimeCheckpointManager(database_service=database)
+    state = AgentState(user_id="u1", session_id="s1", debug={})
+
+    next_state = service._apply_stream_interrupt_state(state, _confirmation_payload())
+    manager.persist_state(next_state, current_node="__interrupt__")
+
+    assert next_state.runtime_state is not None
+    assert next_state.runtime_state.pending_confirmation is not None
+    assert next_state.runtime_state.pending_confirmation.step_id == "parse_and_index_paper"
+    assert database.record["status"] == runtime_checkpoint.CHECKPOINT_STATUS_WAITING
+    assert database.record["pending_confirmation"]["step_id"] == "parse_and_index_paper"
+
+
+def test_refresh_execution_plan_runtime_does_not_restore_pending_confirmation_from_pending_action() -> None:
+    confirmation = schemas.ConfirmationRequest(**_confirmation_payload("display-only-step"))
+    state = AgentState(
+        execution_plan=schemas.ExecutablePlan(plan_id="plan-1", goal=schemas.Goal(goal_type="paper_qa")),
+        pending_action={
+            "status": "waiting_confirmation",
+            "step_id": "display-only-step",
+            "confirmation_request": confirmation.model_dump(mode="json"),
+        },
+    )
+
+    next_state = state_utils._refresh_execution_plan_runtime(state)
+
+    assert next_state.plan_runtime is not None
+    assert next_state.plan_runtime.pending_confirmation is None
+
+
 def test_runtime_checkpoint_rejects_wrong_step_id() -> None:
     database = _InMemoryCheckpointDatabase()
     manager = runtime_checkpoint.AgentRuntimeCheckpointManager(database_service=database)
@@ -100,6 +214,77 @@ def test_runtime_checkpoint_rejects_wrong_step_id() -> None:
         )
 
     assert exc_info.value.reason == "step_id_mismatch"
+
+
+def test_runtime_checkpoint_rejects_wrong_pending_action_identity() -> None:
+    database = _InMemoryCheckpointDatabase()
+    manager = runtime_checkpoint.AgentRuntimeCheckpointManager(database_service=database)
+    manager.persist_state(
+        {
+            "user_id": "u1",
+            "session_id": "s1",
+            "runtime_state": {"pending_confirmation": _confirmation_payload("parse_and_index_paper")},
+        }
+    )
+
+    with pytest.raises(runtime_checkpoint.AgentRuntimeCheckpointError) as exc_info:
+        manager.validate_resume(
+            user_id="u1",
+            session_id="s1",
+            thread_id="s1",
+            resume_payload={
+                "decision": "approve",
+                "step_id": "parse_and_index_paper",
+                "tool_name": "other_tool",
+                "pending_action_id": "pending:other-step",
+            },
+        )
+
+    assert exc_info.value.reason in {"tool_name_mismatch", "pending_action_id_mismatch"}
+
+
+def test_runtime_checkpoint_consumes_pending_confirmation_once() -> None:
+    database = _InMemoryCheckpointDatabase()
+    manager = runtime_checkpoint.AgentRuntimeCheckpointManager(database_service=database)
+    manager.persist_state(
+        {
+            "user_id": "u1",
+            "session_id": "s1",
+            "runtime_state": {"pending_confirmation": {"step_id": "parse_and_index_paper"}},
+        }
+    )
+
+    manager.validate_resume(
+        user_id="u1",
+        session_id="s1",
+        thread_id="s1",
+        resume_payload={"decision": "approve", "step_id": "parse_and_index_paper"},
+    )
+    manager.consume_pending_confirmation(
+        user_id="u1",
+        session_id="s1",
+        thread_id="s1",
+        resume_payload={"decision": "approve", "step_id": "parse_and_index_paper"},
+    )
+
+    assert database.record["status"] == runtime_checkpoint.CHECKPOINT_STATUS_RUNNING
+    assert database.record["pending_confirmation"] is None
+    with pytest.raises(runtime_checkpoint.AgentRuntimeCheckpointError) as consumed_info:
+        manager.consume_pending_confirmation(
+            user_id="u1",
+            session_id="s1",
+            thread_id="s1",
+            resume_payload={"decision": "approve", "step_id": "parse_and_index_paper"},
+        )
+    assert consumed_info.value.reason == "confirmation_already_consumed"
+    with pytest.raises(runtime_checkpoint.AgentRuntimeCheckpointError) as validate_info:
+        manager.validate_resume(
+            user_id="u1",
+            session_id="s1",
+            thread_id="s1",
+            resume_payload={"decision": "approve", "step_id": "parse_and_index_paper"},
+        )
+    assert validate_info.value.reason == "checkpoint_not_waiting:running"
 
 
 def test_runtime_checkpoint_terminal_status_cannot_resume_again() -> None:
