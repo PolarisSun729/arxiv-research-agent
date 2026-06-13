@@ -203,6 +203,15 @@ RECOMMENDATION_CONFIG = {
     "default_top_n": 10,
     "default_max_age_months": 6,
     "category_query_max_categories": 5,
+    "candidate_concept_enrichment": {
+        "enabled": True,
+        "top_k": 20,
+        "max_llm_calls": 5,
+        "allow_lazy_generation": False,
+        "allow_async_generation": False,
+        "cache_version": "llm_paper_evidence_v1",
+        "score_field": "base_score",
+    },
     "score_weights": {
         "semantic": 0.65,
         "category": 0.08,

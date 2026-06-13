@@ -6,6 +6,7 @@ from typing import Any, Dict
 
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent.parent
+DEFAULT_RECOMMENDATION_CONCEPT_CACHE_VERSION = "llm_paper_evidence_v1"
 
 
 class VectorDBProvider(str, Enum):
@@ -311,6 +312,21 @@ RECOMMENDATION_CONFIG: Dict[str, Any] = {
     "default_top_n": _env_int("RECOMMENDATION_DEFAULT_TOP_N", 10),
     "default_max_age_months": _env_int("RECOMMENDATION_DEFAULT_MAX_AGE_MONTHS", 6),
     "category_query_max_categories": _env_int("RECOMMENDATION_CATEGORY_QUERY_MAX_CATEGORIES", 5),
+    "candidate_concept_enrichment": {
+        # 只对基础相关性靠前的候选补 evidence concepts，避免在大召回池上无差别调用 LLM。
+        "enabled": _env_bool("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_ENABLED", True),
+        "top_k": _env_int("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_TOP_K", 20),
+        "max_llm_calls": _env_int("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_MAX_LLM_CALLS", 5),
+        # 当前推荐接口优先保障稳定延迟；打开后只复用缓存，不在主链路同步等待新的概念抽取。
+        "allow_lazy_generation": _env_bool("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_ALLOW_LAZY_GENERATION", False),
+        # 预留异步开关；当前实现与 lazy 一致，都用于禁止主链路继续发起新的 LLM 调用。
+        "allow_async_generation": _env_bool("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_ALLOW_ASYNC_GENERATION", False),
+        "cache_version": _env_str(
+            "RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_CACHE_VERSION",
+            DEFAULT_RECOMMENDATION_CONCEPT_CACHE_VERSION,
+        ),
+        "score_field": _env_str("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_SCORE_FIELD", "base_score"),
+    },
     "score_weights": {
         "semantic": float(_env_str("RECOMMENDATION_SCORE_WEIGHT_SEMANTIC", "0.65")),
         "category": float(_env_str("RECOMMENDATION_SCORE_WEIGHT_CATEGORY", "0.08")),

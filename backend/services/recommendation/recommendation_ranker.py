@@ -130,6 +130,7 @@ class RecommendationRanker:
             "similarity_score": semantic_score,
             "semantic_score": semantic_score,
             "positive_score": semantic_score,
+            "base_score": base_score,
             "relevance_score": base_score,
             "best_matched_cluster_id": best_matched_cluster_id,
             "best_matched_cluster_similarity": best_matched_cluster_similarity,

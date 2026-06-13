@@ -68,6 +68,11 @@ if errorlevel 1 (
 )
 
 set "PYTHON_EXE=python"
+
+rem Force traffic through the local proxy so arXiv stays reachable from CN networks.
+set "HTTP_PROXY=http://127.0.0.1:7897"
+set "HTTPS_PROXY=http://127.0.0.1:7897"
+
 echo [%DATE% %TIME%] Running incremental arXiv OAI-PMH sync from !FROM_DATE! to !UNTIL_DATE!
 echo [%DATE% %TIME%] Last successful until: !LAST_UNTIL_DATE!
 echo [%DATE% %TIME%] State file: %STATE_FILE%

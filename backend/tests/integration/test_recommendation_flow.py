@@ -1,5 +1,6 @@
 import gc
 import importlib.util
+import json
 import sys
 import types
 import unittest
@@ -11,6 +12,51 @@ from fastapi import HTTPException
 
 from services.storage.database_service import DatabaseService
 from tests.helpers import FakeEmbeddingService, build_database_service
+
+
+class FakeEvidenceGenerationService:
+    def __init__(self, payload: str = ""):
+        self.payload = payload
+        self.call_count = 0
+
+    def complete_with_qwen(self, prompt, *args, **kwargs):
+        self.call_count += 1
+        if self.payload:
+            return self.payload
+        text = str(prompt or "").lower()
+        concepts = []
+        if "retrieval augmented generation" in text or "rag" in text or "reranking" in text:
+            concepts.append("RAG retrieval optimization")
+        if "agent" in text:
+            concepts.append("agent planning")
+        if not concepts:
+            concepts.append("question answering")
+        return json.dumps(
+            {
+                "main_research_area": concepts[0],
+                "research_objects": ["LLM agents"] if "agent" in text else [],
+                "methods": [item for item in concepts if item == "RAG retrieval optimization"],
+                "tasks": ["question answering"] if "question answering" in text or "qa" in text else [],
+                "application_domains": [],
+                "technical_concepts": concepts,
+                "evaluation_focus": ["retrieval quality"] if "retrieval" in text else [],
+                "system_type": "",
+                "candidate_concepts": [
+                    {
+                        "label": concept,
+                        "type": "technical_concept",
+                        "confidence": 0.9,
+                        "evidence_text": "fake evidence",
+                        "source": "llm",
+                        "whether_generalizable": True,
+                    }
+                    for concept in concepts
+                ],
+                "excluded_concepts": [],
+                "extraction_confidence": 0.9,
+            },
+            ensure_ascii=False,
+        )
 
 
 def _load_recommendation_service_class():
@@ -165,11 +211,16 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
             },
         ]
         self.oai_db_service = _FakeOaiDbService(papers=self.recent_papers)
+        self.fake_llm = FakeEvidenceGenerationService()
         self.service = RecommendationService(
             db_service=self.db_service,
             embedding_service=self.embedding_service,
             vector_store_service=self.vector_store_service,
             get_embedding_config=self.embedding_service.get_default_embedding_config,
+            memory_service=sys.modules["services.memory"].MemoryService(
+                db_service=self.db_service,
+                generation_service=self.fake_llm,
+            ),
             oai_db_service=self.oai_db_service,
             arxiv_service_factory=lambda: types.SimpleNamespace(),
             collection_name=self.collection_name,
@@ -603,6 +654,246 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         self.assertIn("title", first)
         self.assertIn("final_score", first)
         self.assertIn("score_breakdown", first)
+
+    def test_recommendation_enriches_top_candidate_concepts_and_reuses_cache(self) -> None:
+        self.db_service.add_liked_paper(self.user_id, "2401.00001")
+        self.db_service.upsert_user_research_profile(
+            self.user_id,
+            {
+                "positive_topics": ["RAG retrieval optimization"],
+                "canonical_topics": [{"label": "RAG retrieval optimization", "aliases": []}],
+            },
+        )
+        candidate_pool = [
+            {
+                "arxiv_id": "2401.11001",
+                "title": "Fresh RAG Candidate",
+                "authors": ["A"],
+                "abstract": "retrieval augmented generation with reranking for enterprise qa",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.11001",
+                "score": 0.95,
+                "_stored_vector": [1.0, 0.0, 0.0],
+            },
+            {
+                "arxiv_id": "2401.11002",
+                "title": "Lower Candidate",
+                "authors": ["B"],
+                "abstract": "generic benchmark paper",
+                "categories": ["cs.AI"],
+                "published_date": "2024-01-02",
+                "url": "https://arxiv.org/abs/2401.11002",
+                "score": 0.30,
+                "_stored_vector": [0.2, 0.1, 0.0],
+            },
+        ]
+
+        with mock.patch.dict(self.service.RECOMMENDATION_CONFIG["candidate_concept_enrichment"], {"top_k": 1}, clear=False), \
+             mock.patch.object(self.service, "_build_profile_signal_bundle", return_value={"profile": {"positive_topics": ["RAG retrieval optimization"], "canonical_topics": [{"label": "RAG retrieval optimization", "aliases": []}]}, "actions": {}, "excluded_ids": [], "disabled": False}), \
+             mock.patch.object(self.service, "_get_or_refresh_interest_vector", return_value={"vector_data": [1.0, 0.0, 0.0], "interest_clusters": [], "disliked_vector_data": None, "negative_feedback_profile": {}, "profile_mode": "mean", "cluster_count": 0}), \
+             mock.patch.object(self.service, "_fetch_recent_db_candidates", return_value=list(candidate_pool)), \
+             mock.patch.object(self.service, "_materialize_candidate_papers_for_recommendation", return_value=(list(candidate_pool), {"total": 2, "reused_existing": 0, "db_only": 0, "batch_embedded": 0, "batch_inserted": 0, "unresolved": 0})):
+            result = self.service.recommend_papers(self.user_id, top_n=2)
+            repeated = self.service.recommend_papers(self.user_id, top_n=2)
+
+        first = result["recommendations"][0]
+        self.assertEqual(self.fake_llm.call_count, 1)
+        self.assertEqual(first["arxiv_id"], "2401.11001")
+        self.assertEqual(first["candidate_concept_source"], "runtime_enriched")
+        self.assertIn("RAG retrieval optimization", first["matched_positive_topics"])
+        self.assertEqual(first["candidate_concept_debug"]["source"], "runtime_enriched")
+        self.assertEqual(first["profile_adjustment_debug"]["profile_score"], first["profile_score"])
+        self.assertIn("RAG retrieval optimization", first["profile_adjustment_debug"]["candidate_concept_debug"]["generated_concepts"])
+        second = next(item for item in result["recommendations"] if item["arxiv_id"] == "2401.11002")
+        self.assertEqual(second["candidate_concept_source"], "title_abstract_fallback")
+        self.assertEqual(repeated["ranking_debug"]["candidate_concept_enrichment"]["cache_hit_count"], 1)
+        self.assertEqual(result["ranking_debug"]["candidate_concept_enrichment"]["selected_count"], 1)
+        cached = self.db_service.get_paper_profile_evidence("2401.11001")
+        self.assertTrue(cached["candidate_concepts"])
+        self.assertIsNone(self.db_service.get_paper_profile_evidence("2401.11002"))
+
+    def test_recommendation_concept_enrichment_failure_falls_back_without_crashing(self) -> None:
+        self.db_service.add_liked_paper(self.user_id, "2401.00001")
+        self.db_service.upsert_user_research_profile(
+            self.user_id,
+            {
+                "positive_topics": ["question answering"],
+                "canonical_topics": [{"label": "question answering", "aliases": []}],
+            },
+        )
+        failing_service = RecommendationService(
+            db_service=self.db_service,
+            embedding_service=self.embedding_service,
+            vector_store_service=self.vector_store_service,
+            get_embedding_config=self.embedding_service.get_default_embedding_config,
+            memory_service=sys.modules["services.memory"].MemoryService(
+                db_service=self.db_service,
+                generation_service=FakeEvidenceGenerationService("not json"),
+            ),
+            oai_db_service=self.oai_db_service,
+            arxiv_service_factory=lambda: types.SimpleNamespace(),
+            collection_name=self.collection_name,
+        )
+        candidate_pool = [
+            {
+                "arxiv_id": "2401.12001",
+                "title": "Broken Evidence Candidate",
+                "authors": ["A"],
+                "abstract": "question answering without cached evidence",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.12001",
+                "score": 0.8,
+                "_stored_vector": [1.0, 0.0, 0.0],
+            }
+        ]
+
+        with mock.patch.dict(failing_service.RECOMMENDATION_CONFIG["candidate_concept_enrichment"], {"top_k": 1}, clear=False), \
+             mock.patch.object(failing_service, "_build_profile_signal_bundle", return_value={"profile": {"positive_topics": ["question answering"], "canonical_topics": [{"label": "question answering", "aliases": []}]}, "actions": {}, "excluded_ids": [], "disabled": False}), \
+             mock.patch.object(failing_service, "_get_or_refresh_interest_vector", return_value={"vector_data": [1.0, 0.0, 0.0], "interest_clusters": [], "disliked_vector_data": None, "negative_feedback_profile": {}, "profile_mode": "mean", "cluster_count": 0}), \
+             mock.patch.object(failing_service, "_fetch_recent_db_candidates", return_value=list(candidate_pool)), \
+             mock.patch.object(failing_service, "_materialize_candidate_papers_for_recommendation", return_value=(list(candidate_pool), {"total": 1, "reused_existing": 0, "db_only": 0, "batch_embedded": 0, "batch_inserted": 0, "unresolved": 0})):
+            result = failing_service.recommend_papers(self.user_id, top_n=1)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["ranking_debug"]["candidate_concept_enrichment"]["failed_count"], 1)
+        self.assertEqual(result["recommendations"][0]["candidate_concept_source"], "title_abstract_fallback")
+        self.assertEqual(result["recommendations"][0]["candidate_concept_debug"]["source_detail"], "generation_failed")
+        self.assertIsNotNone(self.db_service.get_paper_profile_evidence("2401.12001"))
+
+    def test_recommendation_concept_enrichment_can_be_disabled(self) -> None:
+        self.db_service.add_liked_paper(self.user_id, "2401.00001")
+        candidate_pool = [
+            {
+                "arxiv_id": "2401.13001",
+                "title": "Disabled Enrichment Candidate",
+                "authors": ["A"],
+                "abstract": "retrieval augmented generation without cache",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.13001",
+                "score": 0.9,
+                "_stored_vector": [1.0, 0.0, 0.0],
+            }
+        ]
+
+        with mock.patch.dict(self.service.RECOMMENDATION_CONFIG["candidate_concept_enrichment"], {"enabled": False, "top_k": 1}, clear=False), \
+             mock.patch.object(self.service, "_build_profile_signal_bundle", return_value={"profile": {"positive_topics": ["RAG retrieval optimization"], "canonical_topics": [{"label": "RAG retrieval optimization", "aliases": []}]}, "actions": {}, "excluded_ids": [], "disabled": False}), \
+             mock.patch.object(self.service, "_get_or_refresh_interest_vector", return_value={"vector_data": [1.0, 0.0, 0.0], "interest_clusters": [], "disliked_vector_data": None, "negative_feedback_profile": {}, "profile_mode": "mean", "cluster_count": 0}), \
+             mock.patch.object(self.service, "_fetch_recent_db_candidates", return_value=list(candidate_pool)), \
+             mock.patch.object(self.service, "_materialize_candidate_papers_for_recommendation", return_value=(list(candidate_pool), {"total": 1, "reused_existing": 0, "db_only": 0, "batch_embedded": 0, "batch_inserted": 0, "unresolved": 0})):
+            result = self.service.recommend_papers(self.user_id, top_n=1)
+
+        self.assertEqual(self.fake_llm.call_count, 0)
+        self.assertFalse(result["ranking_debug"]["candidate_concept_enrichment"]["enabled"])
+        self.assertEqual(result["recommendations"][0]["candidate_concept_source"], "title_abstract_fallback")
+
+    def test_recommendation_concept_enrichment_respects_llm_budget(self) -> None:
+        self.db_service.add_liked_paper(self.user_id, "2401.00001")
+        candidate_pool = [
+            {
+                "arxiv_id": "2401.14001",
+                "title": "Budget Candidate A",
+                "authors": ["A"],
+                "abstract": "retrieval augmented generation",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.14001",
+                "score": 0.95,
+                "_stored_vector": [1.0, 0.0, 0.0],
+            },
+            {
+                "arxiv_id": "2401.14002",
+                "title": "Budget Candidate B",
+                "authors": ["B"],
+                "abstract": "agent planning and retrieval",
+                "categories": ["cs.AI"],
+                "published_date": "2024-01-02",
+                "url": "https://arxiv.org/abs/2401.14002",
+                "score": 0.94,
+                "_stored_vector": [0.9, 0.1, 0.0],
+            },
+        ]
+
+        with mock.patch.dict(self.service.RECOMMENDATION_CONFIG["candidate_concept_enrichment"], {"top_k": 2, "max_llm_calls": 1}, clear=False), \
+             mock.patch.object(self.service, "_build_profile_signal_bundle", return_value={"profile": {"positive_topics": ["RAG retrieval optimization"], "canonical_topics": [{"label": "RAG retrieval optimization", "aliases": []}]}, "actions": {}, "excluded_ids": [], "disabled": False}), \
+             mock.patch.object(self.service, "_get_or_refresh_interest_vector", return_value={"vector_data": [1.0, 0.0, 0.0], "interest_clusters": [], "disliked_vector_data": None, "negative_feedback_profile": {}, "profile_mode": "mean", "cluster_count": 0}), \
+             mock.patch.object(self.service, "_fetch_recent_db_candidates", return_value=list(candidate_pool)), \
+             mock.patch.object(self.service, "_materialize_candidate_papers_for_recommendation", return_value=(list(candidate_pool), {"total": 2, "reused_existing": 0, "db_only": 0, "batch_embedded": 0, "batch_inserted": 0, "unresolved": 0})):
+            result = self.service.recommend_papers(self.user_id, top_n=2)
+
+        self.assertEqual(self.fake_llm.call_count, 1)
+        self.assertEqual(result["ranking_debug"]["candidate_concept_enrichment"]["llm_attempt_count"], 1)
+        self.assertEqual(result["ranking_debug"]["candidate_concept_enrichment"]["budget_skipped_count"], 1)
+
+    def test_recommendation_concept_enrichment_supports_negative_profile_debug(self) -> None:
+        self.db_service.add_liked_paper(self.user_id, "2401.00001")
+        negative_llm = FakeEvidenceGenerationService(
+            json.dumps(
+                {
+                    "main_research_area": "vision-only generation",
+                    "research_objects": [],
+                    "methods": [],
+                    "tasks": [],
+                    "application_domains": [],
+                    "technical_concepts": ["vision-only generation"],
+                    "evaluation_focus": [],
+                    "system_type": "",
+                    "candidate_concepts": [
+                        {
+                            "label": "vision-only generation",
+                            "type": "technical_concept",
+                            "confidence": 0.9,
+                            "evidence_text": "fake evidence",
+                            "source": "llm",
+                            "whether_generalizable": True,
+                        }
+                    ],
+                    "excluded_concepts": [],
+                    "extraction_confidence": 0.9,
+                },
+                ensure_ascii=False,
+            )
+        )
+        negative_service = RecommendationService(
+            db_service=self.db_service,
+            embedding_service=self.embedding_service,
+            vector_store_service=self.vector_store_service,
+            get_embedding_config=self.embedding_service.get_default_embedding_config,
+            memory_service=sys.modules["services.memory"].MemoryService(
+                db_service=self.db_service,
+                generation_service=negative_llm,
+            ),
+            oai_db_service=self.oai_db_service,
+            arxiv_service_factory=lambda: types.SimpleNamespace(),
+            collection_name=self.collection_name,
+        )
+        candidate_pool = [
+            {
+                "arxiv_id": "2401.15001",
+                "title": "Vision Generator",
+                "authors": ["A"],
+                "abstract": "vision-only generation system for image synthesis",
+                "categories": ["cs.CV"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.15001",
+                "score": 0.9,
+                "_stored_vector": [1.0, 0.0, 0.0],
+            }
+        ]
+
+        with mock.patch.dict(negative_service.RECOMMENDATION_CONFIG["candidate_concept_enrichment"], {"top_k": 1}, clear=False), \
+             mock.patch.object(negative_service, "_build_profile_signal_bundle", return_value={"profile": {"negative_topics": ["vision-only generation"], "canonical_negative_topics": [{"label": "vision-only generation", "aliases": []}]}, "actions": {}, "excluded_ids": [], "disabled": False}), \
+             mock.patch.object(negative_service, "_get_or_refresh_interest_vector", return_value={"vector_data": [1.0, 0.0, 0.0], "interest_clusters": [], "disliked_vector_data": None, "negative_feedback_profile": {}, "profile_mode": "mean", "cluster_count": 0}), \
+             mock.patch.object(negative_service, "_fetch_recent_db_candidates", return_value=list(candidate_pool)), \
+             mock.patch.object(negative_service, "_materialize_candidate_papers_for_recommendation", return_value=(list(candidate_pool), {"total": 1, "reused_existing": 0, "db_only": 0, "batch_embedded": 0, "batch_inserted": 0, "unresolved": 0})):
+            result = negative_service.recommend_papers(self.user_id, top_n=1)
+
+        first = result["recommendations"][0]
+        self.assertIn("vision-only generation", first["matched_negative_topics"])
+        self.assertGreater(first["profile_penalty"], 0.0)
+        self.assertLess(first["profile_adjustment_debug"]["profile_adjustment"], 0.0)
 
     def test_context_aware_recommendation_changes_with_query(self) -> None:
         candidate_pool = [

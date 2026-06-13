@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from copy import deepcopy
 from collections import Counter
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
@@ -195,29 +196,385 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         return topics
 
     def _candidate_profile_concepts(self, candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
-        arxiv_id = str(candidate.get("arxiv_id", "") or candidate.get("id", "") or "").strip()
-        card = None
-        if arxiv_id and hasattr(self.db_service, "get_paper_profile_evidence"):
-            card = self.db_service.get_paper_profile_evidence(arxiv_id, extractor_version=PAPER_EVIDENCE_EXTRACTOR_VERSION)
-        if not isinstance(card, dict):
-            card = candidate.get("evidence_card") if isinstance(candidate.get("evidence_card"), dict) else None
+        card = self._resolve_candidate_evidence_card(candidate)
         concepts: List[Dict[str, Any]] = []
+        concept_source = "missing"
         for item in (card or {}).get("candidate_concepts") or []:
             if not isinstance(item, dict) or not item.get("whether_generalizable", True):
                 continue
             label = ConceptNormalizer.clean_label(item.get("label"))
             if label:
                 concepts.append({"label": label, "confidence": float(item.get("confidence") or 0.6), "source": "paper_evidence_card"})
+        if concepts:
+            card_source = str((card or {}).get("_concept_source") or "").strip()
+            concept_source = card_source if card_source in {"cached_evidence_card", "runtime_enriched"} else "cached_evidence_card"
         for label in candidate.get("technical_concepts") or candidate.get("concepts") or []:
             clean = ConceptNormalizer.clean_label(label)
             if clean:
                 concepts.append({"label": clean, "confidence": 0.55, "source": "candidate_payload"})
+        if not concepts and (candidate.get("technical_concepts") or candidate.get("concepts")):
+            concept_source = "candidate_payload"
         if not concepts:
             # 只有 evidence card 缺失时才启用低置信度文本 fallback，避免推荐主路径退回字符串包含匹配。
             text = f"{candidate.get('title', '')} {candidate.get('abstract', '') or candidate.get('summary', '')}"
             for topic in self.memory_service.profile_generator.extract_topics(text):
                 concepts.append({"label": topic, "confidence": 0.35, "source": "low_confidence_text_fallback"})
+            if concepts:
+                concept_source = "title_abstract_fallback"
+        candidate["_resolved_candidate_concepts"] = list(concepts)
+        candidate["_resolved_candidate_concept_source"] = concept_source if concepts else "missing"
         return concepts
+
+    def _resolve_candidate_evidence_card(self, candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """按固定优先级解析候选 evidence card，保证画像修正先消费高质量 concepts。"""
+        attached_card = candidate.get("evidence_card") if isinstance(candidate.get("evidence_card"), dict) else None
+        attached_source = str((attached_card or {}).get("_concept_source") or "").strip()
+        if attached_source == "runtime_enriched" and (attached_card or {}).get("candidate_concepts"):
+            return attached_card
+        if attached_source == "cached_evidence_card" and (attached_card or {}).get("candidate_concepts"):
+            return attached_card
+
+        arxiv_id = str(candidate.get("arxiv_id", "") or candidate.get("id", "") or "").strip()
+        if arxiv_id and hasattr(self.db_service, "get_paper_profile_evidence"):
+            cached_card = self.db_service.get_paper_profile_evidence(arxiv_id, extractor_version=PAPER_EVIDENCE_EXTRACTOR_VERSION)
+            if isinstance(cached_card, dict) and cached_card.get("candidate_concepts"):
+                # 命中缓存后写回候选，后续同一请求内的多次匹配都复用同一份 evidence。
+                cached_card["_concept_source"] = "cached_evidence_card"
+                candidate["evidence_card"] = cached_card
+                return cached_card
+
+        if attached_source == "generated_candidate_concepts" and (attached_card or {}).get("candidate_concepts"):
+            return attached_card
+        if isinstance(attached_card, dict) and attached_card.get("candidate_concepts"):
+            return attached_card
+        return attached_card if isinstance(attached_card, dict) else None
+
+    def _resolve_candidate_concept_source(self, candidate: Dict[str, Any]) -> str:
+        """给推荐调试信息标记 concepts 来源，便于区分缓存命中、即时补全与低置信度兜底。"""
+        concepts = candidate.get("_resolved_candidate_concepts")
+        if not isinstance(concepts, list):
+            concepts = self._candidate_profile_concepts(candidate)
+        source = str(candidate.get("_resolved_candidate_concept_source") or "").strip()
+        if source:
+            return source
+        return "missing" if not concepts else "title_abstract_fallback"
+
+    def _attach_candidate_concept_debug(self, candidate: Dict[str, Any]) -> None:
+        """把 concepts 来源写回候选，避免后续调试只能靠日志推断。"""
+        concepts = self._candidate_profile_concepts(candidate)
+        candidate["candidate_concept_source"] = self._resolve_candidate_concept_source(candidate)
+        evidence_card = candidate.get("evidence_card") if isinstance(candidate.get("evidence_card"), dict) else {}
+        candidate["candidate_concept_debug"] = {
+            "source": candidate["candidate_concept_source"],
+            "source_detail": str(evidence_card.get("_concept_source_detail") or candidate["candidate_concept_source"]).strip() or candidate["candidate_concept_source"],
+            "cache_version": str(evidence_card.get("extractor_version") or "").strip(),
+            "enrichment_attempted": bool(evidence_card.get("_enrichment_attempted", False)),
+            "enrichment_status": str(evidence_card.get("_enrichment_status") or "").strip() or "not_attempted",
+            "used_cache": candidate["candidate_concept_source"] == "cached_evidence_card",
+            "generated_concepts": [str(item.get("label") or "").strip() for item in concepts if isinstance(item, dict) and str(item.get("label") or "").strip()],
+            "concept_count": len(concepts),
+            "fallback_used": candidate["candidate_concept_source"] == "title_abstract_fallback",
+            "missing": candidate["candidate_concept_source"] == "missing",
+        }
+        score_breakdown = dict(candidate.get("score_breakdown", {}))
+        score_breakdown["candidate_concept_source"] = candidate["candidate_concept_source"]
+        candidate["score_breakdown"] = score_breakdown
+
+    def _get_candidate_concept_enrichment_config(self) -> Dict[str, Any]:
+        config = self.RECOMMENDATION_CONFIG.get("candidate_concept_enrichment", {}) or {}
+        try:
+            top_k = int(config.get("top_k", 20) or 20)
+        except (TypeError, ValueError):
+            top_k = 20
+        try:
+            max_llm_calls = int(config.get("max_llm_calls", 5) or 5)
+        except (TypeError, ValueError):
+            max_llm_calls = 5
+        score_field = str(config.get("score_field") or "base_score").strip() or "base_score"
+        return {
+            "enabled": bool(config.get("enabled", True)),
+            "top_k": max(1, top_k),
+            "max_llm_calls": max(0, max_llm_calls),
+            "allow_lazy_generation": bool(config.get("allow_lazy_generation", False)),
+            "allow_async_generation": bool(config.get("allow_async_generation", False)),
+            "cache_version": str(config.get("cache_version") or PAPER_EVIDENCE_EXTRACTOR_VERSION).strip() or PAPER_EVIDENCE_EXTRACTOR_VERSION,
+            "score_field": score_field,
+        }
+
+    def _get_candidate_concept_sort_score(self, candidate: Dict[str, Any], score_field: str) -> float:
+        if score_field == "relevance_score":
+            return float(candidate.get("relevance_score", candidate.get("base_score", 0.0)) or 0.0)
+        return float(candidate.get("base_score", candidate.get("relevance_score", 0.0)) or 0.0)
+
+    def _can_skip_candidate_concept_enrichment(self, candidate: Dict[str, Any]) -> bool:
+        """已有可用 evidence card 或候选自带 concepts 时直接跳过，避免重复 LLM 调用。"""
+        evidence_card = candidate.get("evidence_card") if isinstance(candidate.get("evidence_card"), dict) else {}
+        if evidence_card.get("candidate_concepts"):
+            return True
+        if candidate.get("technical_concepts") or candidate.get("concepts"):
+            return True
+        return False
+
+    def _enrich_top_candidate_concepts(self, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """在基础分计算后只补齐 top K 候选的 concepts，供长期画像修正阶段稳定复用。"""
+        config = self._get_candidate_concept_enrichment_config()
+        stats = {
+            "enabled": bool(config["enabled"]),
+            "top_k": int(config["top_k"]),
+            "max_llm_calls": int(config["max_llm_calls"]),
+            "allow_lazy_generation": bool(config["allow_lazy_generation"]),
+            "allow_async_generation": bool(config["allow_async_generation"]),
+            "cache_version": config["cache_version"],
+            "score_field": config["score_field"],
+            "selected_count": 0,
+            "cache_hit_count": 0,
+            "payload_hit_count": 0,
+            "generated_count": 0,
+            "failed_count": 0,
+            "skipped_count": 0,
+            "llm_attempt_count": 0,
+            "budget_skipped_count": 0,
+            "deferred_count": 0,
+        }
+        if not config["enabled"] or not candidates:
+            for candidate in candidates:
+                self._attach_candidate_concept_debug(candidate)
+            return stats
+
+        ranked_candidates = sorted(
+            candidates,
+            key=lambda item: (
+                self._get_candidate_concept_sort_score(item, config["score_field"]),
+                str(item.get("arxiv_id", "") or item.get("id", "") or ""),
+            ),
+            reverse=True,
+        )
+        selected_candidates = ranked_candidates[: config["top_k"]]
+        stats["selected_count"] = len(selected_candidates)
+
+        for candidate in candidates:
+            arxiv_id = str(candidate.get("arxiv_id", "") or candidate.get("id", "") or "").strip()
+            card = None
+            if arxiv_id and hasattr(self.db_service, "get_paper_profile_evidence"):
+                card = self.db_service.get_paper_profile_evidence(arxiv_id, extractor_version=config["cache_version"])
+            if isinstance(card, dict):
+                candidate["evidence_card"] = card
+                if card.get("candidate_concepts"):
+                    card["_concept_source"] = "cached_evidence_card"
+                    card["_concept_source_detail"] = "cache_hit"
+                    card["_enrichment_status"] = "cache_hit"
+                    stats["cache_hit_count"] += 1
+                elif card.get("schema_valid") is False:
+                    card["_concept_source_detail"] = "failed_cache"
+                    card["_enrichment_status"] = str(card.get("error_type") or "failed_cache")
+            elif self._can_skip_candidate_concept_enrichment(candidate):
+                stats["payload_hit_count"] += 1
+
+        for candidate in selected_candidates:
+            if self._can_skip_candidate_concept_enrichment(candidate):
+                continue
+            evidence_card = candidate.get("evidence_card") if isinstance(candidate.get("evidence_card"), dict) else {}
+            if evidence_card.get("candidate_concepts"):
+                continue
+            if config["allow_lazy_generation"] or config["allow_async_generation"]:
+                stats["deferred_count"] += 1
+                if isinstance(evidence_card, dict):
+                    evidence_card["_enrichment_attempted"] = False
+                    evidence_card["_enrichment_status"] = "deferred"
+                    evidence_card["_concept_source_detail"] = "deferred_generation"
+                continue
+            if stats["llm_attempt_count"] >= int(config["max_llm_calls"]):
+                stats["budget_skipped_count"] += 1
+                if isinstance(evidence_card, dict):
+                    evidence_card["_enrichment_attempted"] = False
+                    evidence_card["_enrichment_status"] = "llm_budget_exhausted"
+                    evidence_card["_concept_source_detail"] = "llm_budget_exhausted"
+                continue
+
+            arxiv_id = str(candidate.get("arxiv_id", "") or candidate.get("id", "") or "").strip()
+            try:
+                stats["llm_attempt_count"] += 1
+                card = self.memory_service.paper_evidence_extractor.extract(candidate)
+                if isinstance(card, dict):
+                    card["_enrichment_attempted"] = True
+            except Exception as exc:
+                logger.warning("Candidate concept enrichment crashed arxiv_id=%s error=%s", arxiv_id, exc)
+                card = self.memory_service.paper_evidence_extractor._error_card(
+                    self.memory_service.paper_evidence_extractor.normalize_paper(candidate),
+                    str(exc),
+                    extraction_confidence=0.0,
+                )
+                card["_enrichment_attempted"] = True
+
+            if arxiv_id and hasattr(self.db_service, "upsert_paper_profile_evidence"):
+                if isinstance(card, dict):
+                    card["extractor_version"] = config["cache_version"]
+                self.db_service.upsert_paper_profile_evidence(arxiv_id, card)
+
+            if isinstance(card, dict) and card.get("candidate_concepts"):
+                card["_concept_source"] = "runtime_enriched"
+                card["_concept_source_detail"] = "llm_generated"
+                card["_enrichment_status"] = "generated"
+                candidate["evidence_card"] = card
+                stats["generated_count"] += 1
+            else:
+                # 失败卡也要挂回候选，后续能明确知道这里已经尝试过补全并安全降级。
+                if isinstance(card, dict):
+                    card["_concept_source_detail"] = "generation_failed"
+                    card["_enrichment_status"] = str(card.get("error_type") or card.get("error_message") or "failed")
+                    candidate["evidence_card"] = card
+                stats["failed_count"] += 1
+
+        stats["skipped_count"] = max(0, stats["selected_count"] - stats["generated_count"] - stats["failed_count"])
+        for candidate in candidates:
+            self._attach_candidate_concept_debug(candidate)
+        logger.info(
+            "Candidate concept enrichment finished selected=%s cache_hit=%s payload_hit=%s generated=%s failed=%s score_field=%s",
+            stats["selected_count"],
+            stats["cache_hit_count"],
+            stats["payload_hit_count"],
+            stats["generated_count"],
+            stats["failed_count"],
+            stats["score_field"],
+        )
+        return stats
+
+    def _apply_profile_adjustment_to_scored_candidates(
+        self,
+        scored_candidates: List[Dict[str, Any]],
+        *,
+        profile: Optional[Dict[str, Any]] = None,
+        actions: Optional[Dict[str, List[str]]] = None,
+        context_bundle: Optional[Dict[str, Any]] = None,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """先补齐高分候选 concepts，再统一叠加长期画像与上下文修正。"""
+        profile = profile or {}
+        actions = actions or {}
+        context_bundle = context_bundle or {}
+        filtered_out_candidates: List[Dict[str, Any]] = []
+        enrichment_stats = self._enrich_top_candidate_concepts(scored_candidates)
+
+        adjusted_candidates: List[Dict[str, Any]] = []
+        for scored_candidate in scored_candidates:
+            profile_adjustment = self._compute_profile_adjustment(
+                scored_candidate,
+                profile=profile,
+                actions=actions,
+            )
+            context_adjustment = (
+                self._compute_contextual_adjustment(
+                    scored_candidate,
+                    context_bundle=context_bundle,
+                )
+                if context_bundle
+                else None
+            )
+            if context_adjustment and context_adjustment["exclude_candidate"]:
+                filtered_out_candidates.append(
+                    {
+                        "arxiv_id": scored_candidate.get("arxiv_id"),
+                        "title": scored_candidate.get("title"),
+                        "reason": context_adjustment["negative_filter_reason"],
+                    }
+                )
+                continue
+
+            profile_terms = list(profile_adjustment.get("matched_positive_topics") or [])
+            query_terms = list(
+                dict.fromkeys(
+                    [
+                        *(context_adjustment["matched_query_terms"] if context_adjustment else []),
+                        *(context_adjustment["matched_request_topics"] if context_adjustment else []),
+                    ]
+                )
+            )
+            basis = {
+                "long_term_profile": bool(profile_terms),
+                "current_request": bool(query_terms),
+                "recent_behavior": bool((context_adjustment or {}).get("recent_behavior_terms")),
+                "cold_start": bool(context_bundle.get("cold_start")) if context_bundle else False,
+            }
+
+            scored_candidate["profile_score"] = profile_adjustment["profile_score"]
+            scored_candidate["profile_penalty"] = profile_adjustment["profile_penalty"]
+            scored_candidate["profile_reasons"] = profile_adjustment["profile_reasons"]
+            scored_candidate["matched_positive_topics"] = profile_adjustment["matched_positive_topics"]
+            scored_candidate["matched_negative_topics"] = profile_adjustment["matched_negative_topics"]
+            scored_candidate["matched_preferred_categories"] = profile_adjustment["matched_preferred_categories"]
+            scored_candidate["profile_match_details"] = profile_adjustment.get("profile_match_details", [])
+            scored_candidate["profile_match_score"] = profile_adjustment.get("profile_match_score", profile_adjustment["profile_score"])
+            scored_candidate["matched_profile_terms"] = profile_terms
+            scored_candidate["matched_query_terms"] = query_terms
+            scored_candidate["recommendation_basis"] = basis
+
+            request_score = float((context_adjustment or {}).get("request_score", 0.0) or 0.0)
+            request_penalty = float((context_adjustment or {}).get("request_penalty", 0.0) or 0.0)
+            scored_candidate["base_score"] = float(scored_candidate.get("base_score", scored_candidate.get("relevance_score", 0.0)) or 0.0)
+            scored_candidate["relevance_score"] = (
+                float(scored_candidate.get("relevance_score", 0.0) or 0.0)
+                + profile_adjustment["profile_adjustment"]
+                + request_score
+                - request_penalty
+            )
+            scored_candidate["final_score"] = (
+                float(scored_candidate.get("final_score", 0.0) or 0.0)
+                + profile_adjustment["profile_adjustment"]
+                + request_score
+                - request_penalty
+            )
+            scored_candidate["concept_enrichment_debug"] = deepcopy(enrichment_stats)
+            scored_candidate["profile_adjustment_debug"] = {
+                "concept_enrichment": deepcopy(enrichment_stats),
+                "candidate_concept_debug": dict(scored_candidate.get("candidate_concept_debug", {})),
+                "matched_positive_topics": list(profile_adjustment["matched_positive_topics"]),
+                "matched_negative_topics": list(profile_adjustment["matched_negative_topics"]),
+                "profile_score": float(profile_adjustment["profile_score"] or 0.0),
+                "profile_penalty": float(profile_adjustment["profile_penalty"] or 0.0),
+                "profile_adjustment": float(profile_adjustment["profile_adjustment"] or 0.0),
+            }
+
+            if context_adjustment:
+                scored_candidate["matched_request_topics"] = context_adjustment["matched_request_topics"]
+                scored_candidate["matched_category_constraints"] = context_adjustment["matched_category_constraints"]
+                scored_candidate["recent_behavior_score"] = context_adjustment["recent_behavior_score"]
+                scored_candidate["recent_behavior_terms"] = context_adjustment["recent_behavior_terms"]
+                scored_candidate["negative_filter_reason"] = context_adjustment["negative_filter_reason"]
+                scored_candidate["trace_sources"] = list(
+                    dict.fromkeys(
+                        [
+                            *context_adjustment["context_sources"],
+                            *(["long_term_profile"] if basis["long_term_profile"] else []),
+                        ]
+                    )
+                )
+                scored_candidate["match_reason"] = self._build_match_reason(context_adjustment["query_match_score"], query_terms)
+                scored_candidate["score_components"] = {
+                    "semantic_score": float(scored_candidate.get("semantic_score", 0.0) or 0.0),
+                    "negative_score": float(scored_candidate.get("negative_score", 0.0) or 0.0),
+                    "negative_penalty": float(scored_candidate.get("negative_penalty", 0.0) or 0.0),
+                    "negative_confidence": float(scored_candidate.get("negative_confidence", 0.0) or 0.0),
+                    "profile_adjustment": profile_adjustment["profile_adjustment"],
+                    "request_score": request_score,
+                    "request_penalty": request_penalty,
+                    "recent_behavior_score": context_adjustment["recent_behavior_score"],
+                    "final_score": float(scored_candidate.get("final_score", 0.0) or 0.0),
+                }
+            score_breakdown = dict(scored_candidate.get("score_breakdown", {}))
+            score_breakdown["candidate_concept_source"] = scored_candidate.get("candidate_concept_source")
+            score_breakdown["profile_score"] = profile_adjustment["profile_score"]
+            score_breakdown["profile_penalty"] = profile_adjustment["profile_penalty"]
+            score_breakdown["profile_adjustment"] = profile_adjustment["profile_adjustment"]
+            score_breakdown["relevance_score"] = scored_candidate["relevance_score"]
+            score_breakdown["final_score"] = scored_candidate["final_score"]
+            if context_adjustment:
+                score_breakdown.update(context_adjustment["query_score_breakdown"])
+                score_breakdown["request_score"] = request_score
+                score_breakdown["request_penalty"] = request_penalty
+                score_breakdown["query_match_score"] = context_adjustment["query_match_score"]
+                score_breakdown["recent_behavior_score"] = context_adjustment["recent_behavior_score"]
+            scored_candidate["score_breakdown"] = score_breakdown
+            adjusted_candidates.append(scored_candidate)
+        return adjusted_candidates, filtered_out_candidates
 
     def _match_profile_topics_to_candidate(self, profile_topics: List[Dict[str, Any]], candidate_concepts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         matches: List[Dict[str, Any]] = []
@@ -587,101 +944,23 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                     }
                 )
                 continue
-            profile_adjustment = self._compute_profile_adjustment(
-                scored_candidate,
-                profile=effective_profile,
-                actions=paper_actions,
-            )
-            context_adjustment = self._compute_contextual_adjustment(
-                scored_candidate,
-                context_bundle=context_bundle,
-            )
-            if context_adjustment["exclude_candidate"]:
-                filtered_out_candidates.append(
-                    {
-                        "arxiv_id": scored_candidate.get("arxiv_id"),
-                        "title": scored_candidate.get("title"),
-                        "reason": context_adjustment["negative_filter_reason"],
-                    }
-                )
-                continue
-
-            profile_terms = list(profile_adjustment.get("matched_positive_topics") or [])
-            query_terms = list(dict.fromkeys([*context_adjustment["matched_query_terms"], *context_adjustment["matched_request_topics"]]))
-            basis = {
-                "long_term_profile": bool(profile_terms),
-                "current_request": bool(query_terms),
-                "recent_behavior": bool(context_adjustment["recent_behavior_terms"]),
-                "cold_start": bool(context_bundle.get("cold_start")),
-            }
-
-            scored_candidate["profile_score"] = profile_adjustment["profile_score"]
-            scored_candidate["profile_penalty"] = profile_adjustment["profile_penalty"]
-            scored_candidate["profile_reasons"] = profile_adjustment["profile_reasons"]
-            scored_candidate["matched_positive_topics"] = profile_adjustment["matched_positive_topics"]
-            scored_candidate["matched_negative_topics"] = profile_adjustment["matched_negative_topics"]
-            scored_candidate["matched_preferred_categories"] = profile_adjustment["matched_preferred_categories"]
-            scored_candidate["profile_match_details"] = profile_adjustment.get("profile_match_details", [])
-            scored_candidate["profile_match_score"] = profile_adjustment.get("profile_match_score", profile_adjustment["profile_score"])
-            scored_candidate["matched_profile_terms"] = profile_terms
-            scored_candidate["matched_query_terms"] = query_terms
-            scored_candidate["matched_request_topics"] = context_adjustment["matched_request_topics"]
-            scored_candidate["matched_category_constraints"] = context_adjustment["matched_category_constraints"]
-            scored_candidate["recent_behavior_score"] = context_adjustment["recent_behavior_score"]
-            scored_candidate["recent_behavior_terms"] = context_adjustment["recent_behavior_terms"]
-            scored_candidate["negative_filter_reason"] = context_adjustment["negative_filter_reason"]
-            scored_candidate["recommendation_basis"] = basis
-            scored_candidate["trace_sources"] = list(
-                dict.fromkeys(
-                    [
-                        *context_adjustment["context_sources"],
-                        *(["long_term_profile"] if basis["long_term_profile"] else []),
-                    ]
-                )
-            )
-            scored_candidate["relevance_score"] = (
-                float(scored_candidate.get("relevance_score", 0.0) or 0.0)
-                + profile_adjustment["profile_adjustment"]
-                + context_adjustment["request_score"]
-                - context_adjustment["request_penalty"]
-            )
-            scored_candidate["final_score"] = (
-                float(scored_candidate.get("final_score", 0.0) or 0.0)
-                + profile_adjustment["profile_adjustment"]
-                + context_adjustment["request_score"]
-                - context_adjustment["request_penalty"]
-            )
-            scored_candidate["match_reason"] = self._build_match_reason(context_adjustment["query_match_score"], query_terms)
-            scored_candidate["personalized_reason"] = self._build_personalized_reason(scored_candidate, dict(scored_candidate.get("score_breakdown", {})))
-            scored_candidate["recommendation_explanation"] = self._build_recommendation_explanation(scored_candidate)
-            scored_candidate["score_components"] = {
-                "semantic_score": float(scored_candidate.get("semantic_score", 0.0) or 0.0),
-                "negative_score": float(scored_candidate.get("negative_score", 0.0) or 0.0),
-                "negative_penalty": float(scored_candidate.get("negative_penalty", 0.0) or 0.0),
-                "negative_confidence": float(scored_candidate.get("negative_confidence", 0.0) or 0.0),
-                "profile_adjustment": profile_adjustment["profile_adjustment"],
-                "request_score": context_adjustment["request_score"],
-                "request_penalty": context_adjustment["request_penalty"],
-                "recent_behavior_score": context_adjustment["recent_behavior_score"],
-                "final_score": float(scored_candidate.get("final_score", 0.0) or 0.0),
-            }
-            score_breakdown = dict(scored_candidate.get("score_breakdown", {}))
-            score_breakdown.update(context_adjustment["query_score_breakdown"])
-            score_breakdown["profile_score"] = profile_adjustment["profile_score"]
-            score_breakdown["profile_penalty"] = profile_adjustment["profile_penalty"]
-            score_breakdown["request_score"] = context_adjustment["request_score"]
-            score_breakdown["request_penalty"] = context_adjustment["request_penalty"]
-            score_breakdown["query_match_score"] = context_adjustment["query_match_score"]
-            score_breakdown["recent_behavior_score"] = context_adjustment["recent_behavior_score"]
-            score_breakdown["relevance_score"] = scored_candidate["relevance_score"]
-            score_breakdown["final_score"] = scored_candidate["final_score"]
-            scored_candidate["score_breakdown"] = score_breakdown
             scored_candidates.append(scored_candidate)
             embedding_source = str(scored_candidate.get("_embedding_source", "") or "")
             if embedding_source == "recomputed":
                 recomputed_vector_count += 1
             elif embedding_source == "missing":
                 missing_vector_count += 1
+
+        scored_candidates, concept_filtered_candidates = self._apply_profile_adjustment_to_scored_candidates(
+            scored_candidates,
+            profile=effective_profile,
+            actions=paper_actions,
+            context_bundle=context_bundle,
+        )
+        filtered_out_candidates.extend(concept_filtered_candidates)
+        for scored_candidate in scored_candidates:
+            scored_candidate["personalized_reason"] = self._build_personalized_reason(scored_candidate, dict(scored_candidate.get("score_breakdown", {})))
+            scored_candidate["recommendation_explanation"] = self._build_recommendation_explanation(scored_candidate)
 
         selected = self._select_diverse_candidates(
             scored_candidates,
@@ -728,6 +1007,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                 "filtered_out_by_context": filtered_out_candidates,
                 "negative_hard_filtered_count": sum(1 for item in filtered_out_candidates if item.get("reason") == "negative_feedback_hard_filter"),
                 "materialize_stats": materialize_stats,
+                "candidate_concept_enrichment": scored_candidates[0].get("concept_enrichment_debug", {}) if scored_candidates else {},
             },
             "ranking_debug": {
                 "personalized_available": personalized_available,
@@ -883,33 +1163,18 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                     }
                 )
                 continue
-            profile_adjustment = self._compute_profile_adjustment(
-                scored_candidate,
-                profile=research_profile,
-                actions=paper_actions,
-            )
-            scored_candidate["profile_score"] = profile_adjustment["profile_score"]
-            scored_candidate["profile_penalty"] = profile_adjustment["profile_penalty"]
-            scored_candidate["profile_reasons"] = profile_adjustment["profile_reasons"]
-            scored_candidate["matched_positive_topics"] = profile_adjustment["matched_positive_topics"]
-            scored_candidate["matched_negative_topics"] = profile_adjustment["matched_negative_topics"]
-            scored_candidate["matched_preferred_categories"] = profile_adjustment["matched_preferred_categories"]
-            scored_candidate["profile_match_details"] = profile_adjustment.get("profile_match_details", [])
-            scored_candidate["profile_match_score"] = profile_adjustment.get("profile_match_score", profile_adjustment["profile_score"])
-            scored_candidate["relevance_score"] = float(scored_candidate.get("relevance_score", 0.0) or 0.0) + profile_adjustment["profile_adjustment"]
-            scored_candidate["final_score"] = float(scored_candidate.get("final_score", 0.0) or 0.0) + profile_adjustment["profile_adjustment"]
-            score_breakdown = dict(scored_candidate.get("score_breakdown", {}))
-            score_breakdown["profile_score"] = profile_adjustment["profile_score"]
-            score_breakdown["profile_penalty"] = profile_adjustment["profile_penalty"]
-            score_breakdown["relevance_score"] = scored_candidate["relevance_score"]
-            score_breakdown["final_score"] = scored_candidate["final_score"]
-            scored_candidate["score_breakdown"] = score_breakdown
             scored_candidates.append(scored_candidate)
             embedding_source = str(scored_candidate.get("_embedding_source", "") or "")
             if embedding_source == "recomputed":
                 recomputed_vector_count += 1
             elif embedding_source == "missing":
                 missing_vector_count += 1
+
+        scored_candidates, _ = self._apply_profile_adjustment_to_scored_candidates(
+            scored_candidates,
+            profile=research_profile,
+            actions=paper_actions,
+        )
 
         logger.info(
             "Candidate embedding summary for user %s: total=%s reused=%s recomputed=%s missing=%s",
@@ -948,6 +1213,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             "ranking_debug": {
                 "negative_hard_filtered_count": len(negative_hard_filtered_candidates),
                 "negative_hard_filtered_candidates": negative_hard_filtered_candidates,
+                "candidate_concept_enrichment": scored_candidates[0].get("concept_enrichment_debug", {}) if scored_candidates else {},
             },
             "recommendations": selected,
         }
@@ -1114,42 +1380,49 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                     }
                 )
                 continue
-
-            query_match_score = float(query_breakdown["query_match_score"] or 0.0)
-            profile_adjustment = self._compute_profile_adjustment(
-                ranked_candidate,
-                profile=research_profile,
-                actions=paper_actions,
-            )
-            final_score = query_match_score * 0.60 + personalization_score * 0.30 + profile_adjustment["profile_adjustment"]
-            ranked_candidate["query_match_score"] = query_match_score
-            ranked_candidate["personalization_score"] = personalization_score
-            ranked_candidate["profile_score"] = profile_adjustment["profile_score"]
-            ranked_candidate["profile_penalty"] = profile_adjustment["profile_penalty"]
-            ranked_candidate["profile_reasons"] = profile_adjustment["profile_reasons"]
-            ranked_candidate["matched_positive_topics"] = profile_adjustment["matched_positive_topics"]
-            ranked_candidate["matched_negative_topics"] = profile_adjustment["matched_negative_topics"]
-            ranked_candidate["matched_preferred_categories"] = profile_adjustment["matched_preferred_categories"]
-            ranked_candidate["profile_match_details"] = profile_adjustment.get("profile_match_details", [])
-            ranked_candidate["profile_match_score"] = profile_adjustment.get("profile_match_score", profile_adjustment["profile_score"])
-            ranked_candidate["final_score"] = final_score
-            ranked_candidate["score_breakdown"] = {
-                **score_breakdown,
-                "query_match_score": query_match_score,
-                "personalization_score": personalization_score,
-                "profile_score": profile_adjustment["profile_score"],
-                "profile_penalty": profile_adjustment["profile_penalty"],
-                "final_score": final_score,
-            }
-            ranked_candidate["match_reason"] = self._build_match_reason(query_match_score, list(query_breakdown["matched_terms"]))
-            ranked_candidate["personalized_reason"] = self._build_personalized_reason(ranked_candidate, ranked_candidate["score_breakdown"])
-            ranked_candidate["priority"] = 0
-
             ranked_candidate.pop("_candidate_embedding", None)
             ranked_candidate.pop("_candidate_categories", None)
             ranked_candidate.pop("_stored_vector", None)
             ranked_candidate.pop("query_score_breakdown", None)
+            ranked_candidate["query_match_score"] = float(query_breakdown["query_match_score"] or 0.0)
+            ranked_candidate["personalization_score"] = personalization_score
+            ranked_candidate["base_score"] = float(ranked_candidate.get("relevance_score", 0.0) or 0.0)
+            ranked_candidate["score_breakdown"] = {
+                **score_breakdown,
+                "query_match_score": float(query_breakdown["query_match_score"] or 0.0),
+                "personalization_score": personalization_score,
+            }
             scored_candidates.append(ranked_candidate)
+
+        context_bundle = {
+            "query_text": query_text,
+            "positive_topics": [],
+            "negative_topics": [],
+            "category_constraints": search_categories,
+            "recent_topics": [],
+            "cold_start": not personalized_available,
+        }
+        scored_candidates, _ = self._apply_profile_adjustment_to_scored_candidates(
+            scored_candidates,
+            profile=research_profile,
+            actions=paper_actions,
+            context_bundle=context_bundle,
+        )
+        for ranked_candidate in scored_candidates:
+            query_match_score = float(ranked_candidate.get("query_match_score", 0.0) or 0.0)
+            personalization_score = float(ranked_candidate.get("personalization_score", 0.0) or 0.0)
+            profile_adjustment = float(ranked_candidate.get("profile_score", 0.0) or 0.0) - float(ranked_candidate.get("profile_penalty", 0.0) or 0.0)
+            final_score = query_match_score * 0.60 + personalization_score * 0.30 + profile_adjustment
+            ranked_candidate["final_score"] = final_score
+            ranked_candidate["score_breakdown"] = {
+                **dict(ranked_candidate.get("score_breakdown", {})),
+                "query_match_score": query_match_score,
+                "personalization_score": personalization_score,
+                "final_score": final_score,
+            }
+            ranked_candidate["match_reason"] = self._build_match_reason(query_match_score, list(ranked_candidate.get("matched_terms") or []))
+            ranked_candidate["personalized_reason"] = self._build_personalized_reason(ranked_candidate, ranked_candidate["score_breakdown"])
+            ranked_candidate["priority"] = 0
 
         scored_candidates.sort(
             key=lambda item: (
@@ -1188,4 +1461,5 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             "negative_hard_filtered_count": len(negative_hard_filtered_candidates),
             "research_profile": research_profile,
             "paper_actions": paper_actions,
+            "candidate_concept_enrichment": scored_candidates[0].get("concept_enrichment_debug", {}) if scored_candidates else {},
         }
