@@ -38,6 +38,7 @@ class RecommendationRanker:
         user_vector: Optional[List[float]] = None,
         interest_clusters: Optional[List[Dict[str, Any]]] = None,
         disliked_vector: Optional[List[float]] = None,
+        negative_feedback_profile: Optional[Dict[str, Any]] = None,
         embedding_config: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """构建单篇候选论文的基础相关性分数及详细分解信息。
@@ -50,6 +51,9 @@ class RecommendationRanker:
         best_matched_cluster_similarity = None
         cluster_similarities: List[Dict[str, Any]] = []
         disliked_penalty = 0.0
+        negative_feedback_match: Dict[str, Any] = {}
+        negative_score = 0.0
+        negative_penalty_debug = self._empty_negative_penalty_debug()
         embedding_source = "none"
         candidate_embedding: Optional[List[float]] = None
         if user_vector and embedding_config:
@@ -96,9 +100,19 @@ class RecommendationRanker:
                         semantic_score = self._cosine_similarity(user_vector, candidate_embedding)
                 else:
                     semantic_score = self._cosine_similarity(user_vector, candidate_embedding)
-                if interest_clusters and disliked_vector:
-                    # 点踩向量只作为惩罚项参与，避免负反馈直接覆盖正向相关性。
-                    disliked_penalty = self._cosine_similarity(disliked_vector, candidate_embedding)
+                # 负向画像优先使用多簇中心，其次使用实例级样本；旧单均值只作为兼容兜底。
+                negative_score, negative_feedback_match = self._calculate_negative_feedback_score(
+                    candidate_embedding=candidate_embedding,
+                    negative_feedback_profile=negative_feedback_profile,
+                    disliked_vector=disliked_vector,
+                )
+                negative_penalty_debug = self._calculate_negative_feedback_penalty(
+                    positive_score=semantic_score,
+                    negative_score=negative_score,
+                    negative_feedback_profile=negative_feedback_profile,
+                    negative_feedback_match=negative_feedback_match,
+                )
+                disliked_penalty = float(negative_penalty_debug["penalty"])
         categories = self._split_categories(candidate.get("categories"))
         category_score = self._calculate_category_score(categories, liked_category_freq)
         recency_score = self._calculate_recency_score(candidate.get("published_date"))
@@ -108,30 +122,216 @@ class RecommendationRanker:
             semantic_score * score_weights["semantic"]
             + category_score * score_weights["category"]
             + recency_score * score_weights["recency"]
-            - disliked_penalty * score_weights["disliked_penalty"]
+            - disliked_penalty
         )
 
         return {
             **candidate,
             "similarity_score": semantic_score,
             "semantic_score": semantic_score,
+            "positive_score": semantic_score,
             "relevance_score": base_score,
             "best_matched_cluster_id": best_matched_cluster_id,
             "best_matched_cluster_similarity": best_matched_cluster_similarity,
             "cluster_similarities": cluster_similarities,
             "disliked_penalty": disliked_penalty,
+            "negative_score": negative_score,
+            "negative_penalty": disliked_penalty,
+            "negative_confidence": negative_penalty_debug["confidence"],
+            "negative_feedback_hit": bool(negative_penalty_debug["hit"]),
+            "negative_penalty_applied": bool(negative_penalty_debug["penalty_applied"]),
+            "negative_hard_filter": bool(negative_penalty_debug["hard_filter"]),
+            "negative_feedback_mode": (negative_feedback_profile or {}).get("mode") or negative_feedback_match.get("source") or "none",
+            "negative_feedback_match": negative_feedback_match,
+            "negative_feedback_debug": negative_penalty_debug["debug"],
             "_embedding_source": embedding_source,
             "_candidate_embedding": candidate_embedding,
             "final_score": base_score,
             "score_breakdown": {
                 "semantic_score": semantic_score,
+                "positive_score": semantic_score,
                 "category_score": category_score,
                 "recency_score": recency_score,
                 "disliked_penalty": disliked_penalty,
+                "negative_score": negative_score,
+                "negative_penalty": disliked_penalty,
+                "negative_confidence": negative_penalty_debug["confidence"],
+                "negative_threshold_penalty": negative_penalty_debug["threshold_penalty"],
+                "negative_margin_penalty": negative_penalty_debug["margin_penalty"],
+                "negative_penalty_applied": bool(negative_penalty_debug["penalty_applied"]),
+                "negative_hard_filter": bool(negative_penalty_debug["hard_filter"]),
                 "relevance_score": base_score,
                 "diversity_score": 0.0,
             },
             "_candidate_categories": categories,
+        }
+
+    def _calculate_negative_feedback_score(
+        self,
+        *,
+        candidate_embedding: List[float],
+        negative_feedback_profile: Optional[Dict[str, Any]],
+        disliked_vector: Optional[List[float]],
+    ) -> tuple[float, Dict[str, Any]]:
+        """计算候选论文与负向画像的最大相似度，作为排序阶段的独立惩罚信号。"""
+        profile = negative_feedback_profile if isinstance(negative_feedback_profile, dict) else {}
+        profile_provided = bool(profile)
+        if bool(profile.get("enabled", False)):
+            clusters = [item for item in profile.get("clusters") or [] if isinstance(item, dict) and item.get("centroid_vector")]
+            if clusters:
+                # 足量负反馈时优先按负向簇中心惩罚，避免多个 dislike 方向被单一均值压扁。
+                matches = [
+                    {
+                        "source": "negative_cluster",
+                        "cluster_id": cluster.get("cluster_id"),
+                        "cluster_label": cluster.get("cluster_label"),
+                        "paper_ids": cluster.get("paper_ids", []),
+                        "similarity": self._cosine_similarity(
+                            candidate_embedding,
+                            [float(value) for value in cluster.get("centroid_vector", [])],
+                        ),
+                    }
+                    for cluster in clusters
+                ]
+                best_match = max(matches, key=lambda item: float(item.get("similarity", 0.0) or 0.0))
+                return float(best_match.get("similarity", 0.0) or 0.0), best_match
+
+            examples = [item for item in profile.get("examples") or [] if isinstance(item, dict) and item.get("vector")]
+            if examples:
+                # 样本少或聚类失败时，取与任一点踩样本的最大相似度，表达实例级“不要再类似这个”。
+                matches = [
+                    {
+                        "source": "negative_example",
+                        "arxiv_id": example.get("arxiv_id"),
+                        "title": example.get("title"),
+                        "similarity": self._cosine_similarity(
+                            candidate_embedding,
+                            [float(value) for value in example.get("vector", [])],
+                        ),
+                    }
+                    for example in examples
+                ]
+                best_match = max(matches, key=lambda item: float(item.get("similarity", 0.0) or 0.0))
+                return float(best_match.get("similarity", 0.0) or 0.0), best_match
+
+        if not profile_provided and disliked_vector:
+            # 兼容旧调用方直接传入 disliked_vector 的场景；新画像会通过 profile 进入。
+            similarity = self._cosine_similarity(disliked_vector, candidate_embedding)
+            return similarity, {"source": "legacy_disliked_vector", "similarity": similarity}
+
+        return 0.0, {}
+
+    def _calculate_negative_feedback_penalty(
+        self,
+        *,
+        positive_score: float,
+        negative_score: float,
+        negative_feedback_profile: Optional[Dict[str, Any]],
+        negative_feedback_match: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """按阈值、margin 和置信度把负向相似度转换为实际排序扣分。"""
+        config = self.RECOMMENDATION_CONFIG["ranking"]["negative"]
+        debug_enabled = bool(config["debug_enabled"])
+        empty = self._empty_negative_penalty_debug()
+        if not bool(config["enabled"]) or not negative_feedback_match:
+            return empty
+
+        threshold = float(config["similarity_threshold"])
+        if negative_score <= threshold:
+            debug = {
+                "reason": "below_negative_similarity_threshold",
+                "positive_score": positive_score,
+                "negative_score": negative_score,
+                "similarity_threshold": threshold,
+            } if debug_enabled else {}
+            return {**empty, "debug": debug}
+
+        confidence = self._calculate_negative_feedback_confidence(negative_feedback_profile, negative_feedback_match)
+        penalty_weight = float(config["penalty_weight"])
+        threshold_penalty = 0.0
+        if bool(config["use_threshold_penalty"]):
+            threshold_range = max(1.0 - threshold, 1e-9)
+            threshold_penalty = ((negative_score - threshold) / threshold_range) * penalty_weight
+
+        margin = float(config["margin"])
+        margin_penalty = 0.0
+        margin_boundary = positive_score - margin
+        if bool(config["use_margin_penalty"]) and negative_score > margin_boundary:
+            margin_range = max(margin, 1e-9)
+            margin_penalty = ((negative_score - margin_boundary) / margin_range) * penalty_weight
+
+        raw_penalty = threshold_penalty + margin_penalty
+        scaled_threshold_penalty = threshold_penalty * confidence
+        scaled_margin_penalty = margin_penalty * confidence
+        scaled_penalty = scaled_threshold_penalty + scaled_margin_penalty
+        penalty = min(float(config["max_penalty"]), scaled_penalty)
+        if scaled_penalty > penalty and scaled_penalty > 0:
+            # max_penalty 截断后同步缩放分项，保证 debug 分解能加总回最终扣分。
+            component_scale = penalty / scaled_penalty
+            scaled_threshold_penalty *= component_scale
+            scaled_margin_penalty *= component_scale
+        hard_filter = (
+            bool(config["enable_hard_filter"])
+            and negative_score >= float(config["hard_filter_threshold"])
+        )
+        debug = {
+            "reason": "negative_feedback_penalty_applied" if penalty > 0 else "negative_feedback_hit_without_penalty",
+            "positive_score": positive_score,
+            "negative_score": negative_score,
+            "similarity_threshold": threshold,
+            "margin": margin,
+            "margin_boundary": margin_boundary,
+            "confidence": confidence,
+            "threshold_penalty": scaled_threshold_penalty,
+            "margin_penalty": scaled_margin_penalty,
+            "raw_penalty": raw_penalty,
+            "scaled_penalty_before_cap": scaled_penalty,
+            "penalty": penalty,
+            "max_penalty": float(config["max_penalty"]),
+            "hard_filter": hard_filter,
+            "match": negative_feedback_match,
+        } if debug_enabled else {}
+        return {
+            "hit": True,
+            "penalty_applied": penalty > 0,
+            "penalty": penalty,
+            "threshold_penalty": scaled_threshold_penalty,
+            "margin_penalty": scaled_margin_penalty,
+            "confidence": confidence,
+            "hard_filter": hard_filter,
+            "debug": debug,
+        }
+
+    def _calculate_negative_feedback_confidence(
+        self,
+        negative_feedback_profile: Optional[Dict[str, Any]],
+        negative_feedback_match: Dict[str, Any],
+    ) -> float:
+        """根据可用 disliked 样本数量降低少量点踩带来的误伤风险。"""
+        config = self.RECOMMENDATION_CONFIG["ranking"]["negative"]
+        min_count = int(config["confidence_min_count"])
+        if min_count <= 0:
+            return 1.0
+        profile = negative_feedback_profile if isinstance(negative_feedback_profile, dict) else {}
+        stats = profile.get("stats") if isinstance(profile.get("stats"), dict) else {}
+        usable_count = int(stats.get("usable_disliked") or 0)
+        if usable_count <= 0 and negative_feedback_match.get("source") == "negative_cluster":
+            usable_count = len(negative_feedback_match.get("paper_ids") or [])
+        if usable_count <= 0 and negative_feedback_match:
+            usable_count = 1
+        return max(0.0, min(1.0, usable_count / min_count))
+
+    @staticmethod
+    def _empty_negative_penalty_debug() -> Dict[str, Any]:
+        return {
+            "hit": False,
+            "penalty_applied": False,
+            "penalty": 0.0,
+            "threshold_penalty": 0.0,
+            "margin_penalty": 0.0,
+            "confidence": 0.0,
+            "hard_filter": False,
+            "debug": {},
         }
 
     def _select_diverse_candidates(
@@ -505,6 +705,8 @@ class RecommendationRanker:
         category_score = float(score_breakdown.get("category_score", 0.0) or 0.0)
         recency_score = float(score_breakdown.get("recency_score", 0.0) or 0.0)
         disliked_penalty = float(score_breakdown.get("disliked_penalty", 0.0) or 0.0)
+        negative_score = float(score_breakdown.get("negative_score", 0.0) or 0.0)
+        negative_penalty_applied = bool(score_breakdown.get("negative_penalty_applied", False))
         best_cluster_id = str(candidate.get("best_matched_cluster_id", "") or "").strip()
 
         if best_cluster_id:
@@ -519,8 +721,10 @@ class RecommendationRanker:
             parts.append(f"部分类别匹配 {round(category_score * 100)}%")
         if recency_score >= 0.5:
             parts.append(f"发布时间较新 {round(recency_score * 100)}%")
-        if disliked_penalty >= 0.25:
-            parts.append(f"受到不喜欢论文相似度惩罚 {round(disliked_penalty * 100)}%")
+        if negative_penalty_applied:
+            match = candidate.get("negative_feedback_match") if isinstance(candidate.get("negative_feedback_match"), dict) else {}
+            source_text = "负向簇" if match.get("source") == "negative_cluster" else "点踩样本"
+            parts.append(f"接近{source_text}，负向相似度 {round(negative_score * 100)}%，扣分 {round(disliked_penalty, 3)}")
 
         if not parts:
             return "基于用户兴趣向量进行了重排"

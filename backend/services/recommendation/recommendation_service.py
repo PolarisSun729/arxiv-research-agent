@@ -34,8 +34,6 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
     RECOMMENDATION_CONFIG = get_recommendation_runtime_config()
     ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
     ARXIV_BACKFILL_REQUEST_INTERVAL_SECONDS = RECOMMENDATION_CONFIG["backfill_request_interval_seconds"]
-    MIN_LIKED_PAPERS_FOR_CLUSTERING = RECOMMENDATION_CONFIG["min_liked_papers_for_clustering"]
-    MAX_INTEREST_CLUSTERS = RECOMMENDATION_CONFIG["max_interest_clusters"]
     RECOMMEND_CANDIDATE_CATEGORIES = [
         "cs.CL",
         "cs.LG",
@@ -499,6 +497,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         user_vector = None
         interest_clusters: List[Dict[str, Any]] = []
         disliked_vector = None
+        negative_feedback_profile: Dict[str, Any] = {}
         personalized_available = not bool(context_bundle.get("cold_start"))
         if personalized_available:
             try:
@@ -506,6 +505,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                 user_vector = user_vector_data["vector_data"]
                 interest_clusters = user_vector_data.get("interest_clusters", []) or []
                 disliked_vector = user_vector_data.get("disliked_vector_data")
+                negative_feedback_profile = user_vector_data.get("negative_feedback_profile", {}) or {}
             except Exception as exc:
                 # 只要当前请求能提供足够主题信号，就允许安全退化成冷启动主题推荐，而不是直接报错。
                 logger.info("Interest vector unavailable for user %s, falling back to context-driven recommendation: %s", user_id, exc)
@@ -573,8 +573,20 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                 user_vector=user_vector,
                 interest_clusters=interest_clusters,
                 disliked_vector=disliked_vector,
+                negative_feedback_profile=negative_feedback_profile,
                 embedding_config=embedding_config,
             )
+            if scored_candidate.get("negative_hard_filter"):
+                filtered_out_candidates.append(
+                    {
+                        "arxiv_id": scored_candidate.get("arxiv_id"),
+                        "title": scored_candidate.get("title"),
+                        "reason": "negative_feedback_hard_filter",
+                        "negative_score": scored_candidate.get("negative_score"),
+                        "negative_feedback_match": scored_candidate.get("negative_feedback_match"),
+                    }
+                )
+                continue
             profile_adjustment = self._compute_profile_adjustment(
                 scored_candidate,
                 profile=effective_profile,
@@ -644,6 +656,9 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             scored_candidate["recommendation_explanation"] = self._build_recommendation_explanation(scored_candidate)
             scored_candidate["score_components"] = {
                 "semantic_score": float(scored_candidate.get("semantic_score", 0.0) or 0.0),
+                "negative_score": float(scored_candidate.get("negative_score", 0.0) or 0.0),
+                "negative_penalty": float(scored_candidate.get("negative_penalty", 0.0) or 0.0),
+                "negative_confidence": float(scored_candidate.get("negative_confidence", 0.0) or 0.0),
                 "profile_adjustment": profile_adjustment["profile_adjustment"],
                 "request_score": context_adjustment["request_score"],
                 "request_penalty": context_adjustment["request_penalty"],
@@ -711,6 +726,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             "filter_debug": {
                 "excluded_ids_count": len(excluded_ids),
                 "filtered_out_by_context": filtered_out_candidates,
+                "negative_hard_filtered_count": sum(1 for item in filtered_out_candidates if item.get("reason") == "negative_feedback_hard_filter"),
                 "materialize_stats": materialize_stats,
             },
             "ranking_debug": {
@@ -733,6 +749,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         user_vector = user_vector_data["vector_data"]
         interest_clusters = user_vector_data.get("interest_clusters", []) or []
         disliked_vector = user_vector_data.get("disliked_vector_data")
+        negative_feedback_profile = user_vector_data.get("negative_feedback_profile", {}) or {}
 
         logger.info("Starting paper recommendation for user %s with top_n=%s max_age_months=%s", user_id, top_n, max_age_months)
 
@@ -842,6 +859,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         logger.info("Reused %s/%s candidate vectors from Milvus for user %s", reused_vector_count, len(materialized_candidates), user_id)
 
         scored_candidates = []
+        negative_hard_filtered_candidates = []
         recomputed_vector_count = 0
         missing_vector_count = 0
         for candidate in materialized_candidates:
@@ -852,8 +870,19 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                 user_vector=user_vector,
                 interest_clusters=interest_clusters,
                 disliked_vector=disliked_vector,
+                negative_feedback_profile=negative_feedback_profile,
                 embedding_config=embedding_config,
             )
+            if scored_candidate.get("negative_hard_filter"):
+                negative_hard_filtered_candidates.append(
+                    {
+                        "arxiv_id": scored_candidate.get("arxiv_id"),
+                        "title": scored_candidate.get("title"),
+                        "negative_score": scored_candidate.get("negative_score"),
+                        "negative_feedback_match": scored_candidate.get("negative_feedback_match"),
+                    }
+                )
+                continue
             profile_adjustment = self._compute_profile_adjustment(
                 scored_candidate,
                 profile=research_profile,
@@ -916,6 +945,10 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             "research_profile": research_profile,
             "paper_actions": paper_actions,
             "recall_mode": recall_mode,
+            "ranking_debug": {
+                "negative_hard_filtered_count": len(negative_hard_filtered_candidates),
+                "negative_hard_filtered_candidates": negative_hard_filtered_candidates,
+            },
             "recommendations": selected,
         }
 
@@ -977,12 +1010,15 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             user_vector = None
             interest_clusters = []
             disliked_vector = None
+            negative_feedback_profile = {}
             embedding_config = None
 
         user_vector = user_vector_data.get("vector_data") if user_vector_data else None
         interest_clusters = user_vector_data.get("interest_clusters", []) if user_vector_data else []
         disliked_vector = user_vector_data.get("disliked_vector_data") if user_vector_data else None
+        negative_feedback_profile = user_vector_data.get("negative_feedback_profile", {}) if user_vector_data else {}
         embedding_config = self.get_embedding_config() if personalized_available else None
+        hard_excluded_ids = set(self._normalize_text_terms(disliked_ids))
 
         candidate_ids = [str(paper.get("arxiv_id", "") or paper.get("id", "") or "").strip() for paper in normalized_papers if str(paper.get("arxiv_id", "") or paper.get("id", "") or "").strip()]
         stored_embeddings: Dict[str, List[float]] = {}
@@ -1002,8 +1038,14 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                 stored_embeddings = {}
 
         scored_candidates: List[Dict[str, Any]] = []
+        hard_excluded_candidates: List[Dict[str, Any]] = []
+        negative_hard_filtered_candidates: List[Dict[str, Any]] = []
         for paper in normalized_papers:
             fallback_arxiv_id = str(paper.get("arxiv_id", "") or paper.get("id", "") or "").strip()
+            if fallback_arxiv_id.lower() in hard_excluded_ids:
+                # 显式点踩是强过滤信号；搜索重排也不能把这类论文重新推荐回结果里。
+                hard_excluded_candidates.append({"arxiv_id": fallback_arxiv_id, "title": paper.get("title")})
+                continue
             normalized_paper = self._normalize_paper_record(paper, fallback_arxiv_id or "unknown")
             candidate = {**paper, **normalized_paper}
 
@@ -1030,6 +1072,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                         user_vector=user_vector,
                         interest_clusters=interest_clusters,
                         disliked_vector=disliked_vector,
+                        negative_feedback_profile=negative_feedback_profile,
                         embedding_config=embedding_config,
                     )
                     personalization_score = float(ranked_candidate.get("relevance_score", 0.0) or 0.0)
@@ -1060,6 +1103,17 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                     "diversity_score": 0.0,
                 }
                 score_breakdown.update(query_breakdown["query_score_breakdown"])
+
+            if ranked_candidate.get("negative_hard_filter"):
+                negative_hard_filtered_candidates.append(
+                    {
+                        "arxiv_id": fallback_arxiv_id,
+                        "title": ranked_candidate.get("title"),
+                        "negative_score": ranked_candidate.get("negative_score"),
+                        "negative_feedback_match": ranked_candidate.get("negative_feedback_match"),
+                    }
+                )
+                continue
 
             query_match_score = float(query_breakdown["query_match_score"] or 0.0)
             profile_adjustment = self._compute_profile_adjustment(
@@ -1130,6 +1184,8 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             "top_n": limit,
             "liked_papers_count": len(liked_ids),
             "disliked_papers_count": len(disliked_ids),
+            "hard_excluded_count": len(hard_excluded_candidates),
+            "negative_hard_filtered_count": len(negative_hard_filtered_candidates),
             "research_profile": research_profile,
             "paper_actions": paper_actions,
         }

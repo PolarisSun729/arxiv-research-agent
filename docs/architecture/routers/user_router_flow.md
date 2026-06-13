@@ -839,7 +839,7 @@ flowchart TD
 
 ### 职责
 
-根据用户 liked / disliked 历史生成兴趣向量，并在 liked 数量足够时尝试进行兴趣簇聚类；结果保存到 `user_interest_vectors`。
+根据用户 liked 历史生成主正向兴趣向量，并在 liked 数量足够时尝试进行兴趣簇聚类；disliked 历史只作为独立负向反馈保存到 `user_interest_vectors`。
 
 ### 处理流程图
 
@@ -849,14 +849,18 @@ flowchart TD
     B --> C["[Validate] 解析 user_id"]
     C --> D["[Recommendation] RecommendationService.generate_user_interest_vector"]
     D --> E["[DB] get_liked_papers / get_disliked_papers"]
-    E --> F{"[Validate] liked_papers 是否为空 ?"}
-    F -->|是| G["[Error] 400 No liked papers found for user"]
-    F -->|否| H["[VectorStore] get_paper_embeddings_by_arxiv_ids"]
+    E --> F{"[Validate] liked 数量是否达到配置阈值 ?"}
+    F -->|否| G["[Error] 400 liked papers 不足"]
+    F -->|是| H["[VectorStore] get_paper_embeddings_by_arxiv_ids"]
     H --> I["[Fallback] 缺失向量时 _hydrate_vectors_with_metadata"]
     I --> I1["[Service] arXiv/OAI backfill"]
     I --> I2["[Embedding] create_single_embedding"]
     I --> I3["[VectorStore] insert_single_embedding / add_paper"]
-    D --> J["[Service] _mean_vector / _normalize_vector"]
+    D --> J["[Service] 仅对 liked 向量 _mean_vector / _normalize_vector"]
+    D --> J1{"[Service] disliked 数量足够负向聚类 ?"}
+    J1 -->|否| J2["[Negative] 保存实例级 negative examples"]
+    J1 -->|是| J3["[Negative] HDBSCAN 负向聚类"]
+    J3 --> J4["[Fallback] 聚类失败或无稳定簇时退回 examples"]
     D --> K{"[Validate] liked 数量足够聚类 ?"}
     K -->|是| L["[Recommendation] HDBSCAN 聚类"]
     K -->|否| M["[Fallback] mean profile"]
@@ -894,6 +898,12 @@ flowchart TD
 - `weak_interest_pool`
 - `weak_interest_pool_count`
 - `cluster_summary`
+- `negative_feedback_stats`
+- `disliked_paper_examples`
+- `negative_feedback_profile`
+- `negative_clusters`
+- `negative_cluster_count`
+- `disliked_vector_available`
 
 ### 副作用
 
@@ -959,6 +969,9 @@ flowchart TD
 - `interest_clusters`
 - `weak_interest_pool`
 - `disliked_vector_data`
+- `disliked_paper_examples`
+- `negative_feedback_stats`
+- `negative_feedback_profile`
 - `created_at`
 - `updated_at`
 
@@ -1086,8 +1099,11 @@ flowchart TD
 
 3. 是否使用用户 dislike 信息？
    - 是。
-   - `generate_user_interest_vector()` 会读取 disliked papers，并生成 `disliked_vector_data`。
-   - `recommend_papers()` 会把 disliked IDs 纳入 `excluded_ids`，并在打分阶段作为 `disliked_penalty` 参与惩罚。
+   - `generate_user_interest_vector()` 会读取 disliked papers，并生成独立的 `negative_feedback_profile`，其中包含实例级 `examples`、可选 `negative clusters`、`hard_exclude_ids` 和统计信息。
+   - disliked 数量不足时使用实例级负反馈；达到阈值时尝试负向聚类；聚类失败或无稳定簇时按配置退回实例级样本。
+   - `recommend_papers()` / Agent 推荐会把 disliked IDs 纳入 `excluded_ids`；搜索重排也会 hard exclude disliked IDs。
+   - 打分阶段统一读取 `negative_feedback_profile`，先计算 `negative_score`，再按配置的相似度阈值、margin、置信度和最大扣分得到最终 `negative_penalty`。
+   - 可选 hard filter 只在 `RECOMMENDATION_RANKING_NEGATIVE_ENABLE_HARD_FILTER` 开启且超过 hard filter 阈值时生效，默认关闭以避免误伤。
 
 4. 是否使用 collect 信息？
    - 未发现名为 `collect` 的独立表或独立逻辑。
@@ -1115,9 +1131,9 @@ flowchart TD
    - 缺失时尝试：
      - 从 arXiv / OAI 回填论文并写入向量库
      - 再退化为基于本地论文文本重建 embedding
-   - 对 liked 向量取均值；
-   - 若存在 disliked 向量，则按 `liked_mean - negative_weight * disliked_mean` 做减权；
-   - 最后做归一化，保存为主兴趣向量。
+   - 对 liked 向量取均值并归一化，保存为主正向兴趣向量；
+   - disliked 向量不再参与 `vector_data` 生成；少量 disliked 保存为带向量的实例级 examples，数量达到阈值时尝试生成 negative clusters。
+   - 负向聚类失败或没有稳定簇时，按配置退回实例级 examples；这些负向信号只供排序阶段降权、过滤或解释。
    - 当 liked 数量足够时，还会用 HDBSCAN 构建多兴趣簇，并保存 `interest_clusters` 与 `weak_interest_pool`。
 
 9. 推荐结果是否保存到数据库？

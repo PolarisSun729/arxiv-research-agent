@@ -3,35 +3,22 @@
 import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from .intent_definitions import ALL_INTENTS, MINIMUM_EXECUTION_REQUIREMENTS
+
 try:
     from .utils.paper_reference_resolver import _resolve_paper_reference
 except Exception:  # pragma: no cover - 轻量导入场景允许缺失解析器
     _resolve_paper_reference = None
 
 
-SUPPORTED_INTENTS = {
-    "arxiv_search",
-    "paper_summary",
-    "paper_detail",
-    "paper_qa",
-    "recommendation",
-    "preference_action",
-    "confirmation",
-    "unclear",
-    "unsupported",
-}
+# intent 名单不再本地维护：单一事实来源在 .intent_definitions。
+# 澄清/确认链路使用包含运行时 confirmation 的全集。
+SUPPORTED_INTENTS = set(ALL_INTENTS)
 
-# 每类任务的最小可执行条件独立保留，方便澄清 trace 解释“为什么现在不能继续”。
+# 各 intent 最小可执行条件不再本地维护：派生自 .intent_definitions 的单一事实来源，
+# 方便澄清 trace 解释“为什么现在不能继续”。
 _MINIMUM_EXECUTION_REQUIREMENTS: Dict[str, List[str]] = {
-    "arxiv_search": ["search_topic"],
-    "paper_summary": ["target_paper"],
-    "paper_detail": ["target_paper"],
-    "paper_qa": ["target_paper", "user_question"],
-    "recommendation": ["user_identity_or_profile_or_constraints"],
-    "preference_action": ["preference_action", "preference_target", "user_identity"],
-    "confirmation": ["confirmation_request", "confirmation_decision"],
-    "unclear": ["task_intent"],
-    "unsupported": [],
+    name: list(fields) for name, fields in MINIMUM_EXECUTION_REQUIREMENTS.items()
 }
 
 _CONFIRM_APPROVE_TOKENS = {

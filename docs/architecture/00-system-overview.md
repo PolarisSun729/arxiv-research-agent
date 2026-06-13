@@ -341,6 +341,8 @@
 - `backend/services/embedding/embedding_service.py`
 - `backend/services/llm/generation_service.py`
 - `backend/services/retrieval/rerank_service.py`
+- `backend/services/retrieval/retrieval_pipeline.py`
+- `backend/services/retrieval/retrieval_rules.py`
 - `backend/services/retrieval/enhanced_retrieval_service.py`
 
 已确认配置入口：
@@ -369,9 +371,9 @@
   - 负责通用生成
   - 负责 Qwen 大/小模型路由
   - 负责 `compress_chunk_for_rerank()` / `compress_chunks_for_rerank()`
-- `EnhancedRetrievalService`
+- `EnhancedRetrievalService`??????????
   - 负责检索路线规划、query rewrite、HyDE、融合、final top-k、trace 导出
-- `RerankService`
+- `RerankService`???/?? rerank?fallback ??????
   - 负责重排逻辑
   - 与 asset-aware 文本、局部 LLM rerank / CrossEncoder 协同
 
@@ -407,6 +409,7 @@ PaperDetail.vue
   -> EmbeddingService
   -> VectorStoreService (Milvus)
   -> EnhancedRetrievalService
+  -> RetrievalPipeline
   -> GenerationService
   -> 返回答案、sources、retrieval_debug、trace
 ```

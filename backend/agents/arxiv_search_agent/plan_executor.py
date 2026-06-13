@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from langgraph.types import interrupt
 from pydantic import ValidationError
-from services.storage.database_service import DatabaseService
+from services.storage import database_service as database_service_module
 from utils.config import get_agent_runtime_checkpoint_config
 
 from . import tool_registry as agent_tool_registry
@@ -37,6 +37,9 @@ from .tool_registry import PLANNER_TOOL_REGISTRY, ToolRegistry
 
 logger = logging.getLogger(__name__)
 invoke_backend_tool = agent_tool_registry.invoke_backend_tool
+DatabaseService = database_service_module.DatabaseService
+_DEFAULT_CHECKPOINT_USER_ID = str(getattr(database_service_module, "DEFAULT_USER_ID", "") or "").strip()
+DEFAULT_USER_ID = _DEFAULT_CHECKPOINT_USER_ID or "default"
 
 
 def _utcnow() -> str:
@@ -130,6 +133,35 @@ def _current_plan_id(runtime: Optional[PlanRuntime], state: AgentState) -> str:
     return _plan_id_from_value(state.execution_plan)
 
 
+def _goal_type_from_value(value: Any) -> str:
+    """从 goal mapping/对象中取出 goal_type，兼容 checkpoint dict 与运行时 Goal 实例。"""
+    if isinstance(value, Mapping):
+        return str(value.get("goal_type") or "").strip()
+    return str(getattr(value, "goal_type", None) or "").strip()
+
+
+def _current_goal_type(runtime: Optional[PlanRuntime], state: AgentState) -> str:
+    """当前轮的权威 goal_type：优先取运行时 goal，再退回 state.goal。"""
+    if runtime is not None and runtime.goal is not None:
+        return _goal_type_from_value(runtime.goal)
+    if state.plan_runtime is not None and state.plan_runtime.goal is not None:
+        return _goal_type_from_value(state.plan_runtime.goal)
+    return _goal_type_from_value(state.goal)
+
+
+def _checkpoint_goal_type_from_runtime_state(runtime_state: Any) -> str:
+    """从 checkpoint runtime_state 还原 goal_type：先看顶层 goal，再退回 plan.goal。"""
+    if not isinstance(runtime_state, Mapping):
+        return ""
+    goal_type = _goal_type_from_value(runtime_state.get("goal"))
+    if goal_type:
+        return goal_type
+    plan = runtime_state.get("plan")
+    if isinstance(plan, Mapping):
+        return _goal_type_from_value(plan.get("goal"))
+    return ""
+
+
 def _checkpoint_approved_step_ids_for_state(
     *,
     state: AgentState,
@@ -144,9 +176,13 @@ def _checkpoint_approved_step_ids_for_state(
     session_id = str(state.session_id or "").strip()
     if not session_id:
         return []
+    # stream resume 可能只携带 session/thread，而 user_id 仍留空；
+    # business checkpoint 在写入/消费时会回退到 DEFAULT_USER_ID，这里必须做同样归一，
+    # 否则 executor 会查不到刚刚消费过的批准态，又把同一步误判成“仍需确认”。
+    normalized_user_id = str(state.user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
     try:
         checkpoint = DatabaseService().get_agent_runtime_checkpoint(
-            user_id=str(state.user_id or "").strip(),
+            user_id=normalized_user_id,
             session_id=session_id,
             thread_id=session_id,
         )
@@ -176,6 +212,18 @@ def _checkpoint_approved_step_ids_for_state(
             step.step_id,
             checkpoint_plan_id,
             current_plan_id,
+        )
+        return []
+    # plan_id 之外还要校验 goal 类型：plan_id 偶然相同但 goal 类型不同（例如复用 session 切换意图）时，
+    # 旧批准态绝不能放行新计划里的副作用工具。
+    checkpoint_goal_type = _checkpoint_goal_type_from_runtime_state(runtime_state)
+    current_goal_type = _current_goal_type(runtime, state)
+    if checkpoint_goal_type and current_goal_type and checkpoint_goal_type != current_goal_type:
+        logger.info(
+            "arxiv_agent checkpoint approval ignored: step_id=%s checkpoint_goal_type=%s current_goal_type=%s",
+            step.step_id,
+            checkpoint_goal_type,
+            current_goal_type,
         )
         return []
     return approved_step_ids
@@ -763,6 +811,94 @@ def _compact_confirmation_arguments(arguments: Mapping[str, Any]) -> Dict[str, A
     return summary
 
 
+_EXECUTION_PATH_TURN_STATUS_TO_FINAL = {
+    "waiting_confirmation": "waiting_confirmation",
+    "failed": "failed",
+    "fallback": "failed",
+    "need_clarification": "need_clarification",
+    "success": "success",
+}
+
+
+def _summarize_step_path(runtime: "PlanRuntime", step_id: str) -> Dict[str, Any]:
+    """汇总单个 step 的执行路径事实，作为只读 debug 视图。
+
+    只读 runtime 已有的 trace / 计数 / 状态，不改变任何执行语义；目的是让“这一步到底走了哪条
+    路径”一眼可见，避免后续拆分时还要靠人肉串 trace 判断 confirmation/resume/retry/replan/复用。
+    """
+    events = [trace.event for trace in list(runtime.trace or []) if trace.step_id == step_id]
+    event_set = set(events)
+    return {
+        "step_id": step_id,
+        "tool_name": next(
+            (
+                str(trace.detail.get("tool_name"))
+                for trace in list(runtime.trace or [])
+                if trace.step_id == step_id and trace.detail.get("tool_name")
+            ),
+            None,
+        ),
+        "status": runtime.step_status.get(step_id),
+        "needs_confirmation": "confirmation_created" in event_set or "confirmation_requested" in event_set,
+        "confirmation_approved": "confirmation_approved" in event_set,
+        "confirmation_rejected": "confirmation_rejected" in event_set,
+        "from_checkpoint_resume": "confirmation_consumed" in event_set and "confirmation_created" not in event_set,
+        "retried": int(runtime.retry_counts.get(step_id, 0) or 0) > 0,
+        "retry_count": int(runtime.retry_counts.get(step_id, 0) or 0),
+        "replanned": "step_replanned" in event_set,
+        "reused_side_effect_output": "step_reused_output" in event_set,
+        "events": events,
+    }
+
+
+def _build_execution_path_summary(runtime: "PlanRuntime", *, current_step_id: Optional[str]) -> Dict[str, Any]:
+    """生成一份固定结构的“本轮执行路径”只读摘要，供 debug 视图和验收脚本直接读取。
+
+    它不替代细粒度 trace，而是把任务最关心的几类状态链路结论收敛到一处：当前 step/tool、是否经过
+    确认、是否来自 checkpoint resume、是否 retry、是否 replan、是否复用副作用结果，以及本轮最终状态。
+    所有字段都从 runtime 现有事实派生，因此是纯附加、可序列化、不影响执行行为的观测信息。
+    """
+    plan = runtime.plan
+    step_ids = [step.step_id for step in list(plan.steps or [])] if plan is not None else list(runtime.step_status or {})
+    step_paths = [_summarize_step_path(runtime, step_id) for step_id in step_ids]
+    replanned = any(item["replanned"] for item in step_paths) or bool(runtime.replan_counts)
+    final_status = _EXECUTION_PATH_TURN_STATUS_TO_FINAL.get(str(runtime.turn_status or "")) if runtime.turn_status else None
+    if final_status is None:
+        if runtime.pending_confirmation is not None:
+            final_status = "waiting_confirmation"
+        elif runtime.error:
+            final_status = "failed"
+        elif replanned and not runtime.error:
+            final_status = "replanned"
+        else:
+            final_status = "in_progress"
+    elif final_status == "success" and replanned:
+        # 本轮虽然最终成功，但确实经历过 replan；显式区分出来，便于排查“成功但绕过弯路”的链路。
+        final_status = "replanned_success"
+    return {
+        "plan_id": _plan_id_from_value(plan) if plan is not None else None,
+        "current_step_id": current_step_id,
+        "current_tool_name": next(
+            (item["tool_name"] for item in step_paths if item["step_id"] == current_step_id),
+            None,
+        ),
+        "needs_confirmation": any(item["needs_confirmation"] for item in step_paths),
+        "from_checkpoint_resume": any(item["from_checkpoint_resume"] for item in step_paths),
+        "retry_occurred": any(item["retried"] for item in step_paths),
+        "replan_occurred": replanned,
+        "reused_side_effect_output": any(item["reused_side_effect_output"] for item in step_paths),
+        "pending_confirmation": runtime.pending_confirmation is not None,
+        "needs_replan": bool(runtime.needs_replan),
+        "failure_reason": runtime.error,
+        "final_status": final_status,
+        "retry_counts": dict(runtime.retry_counts or {}),
+        "replan_counts": dict(runtime.replan_counts or {}),
+        "step_replan_counts": dict(runtime.step_replan_counts or {}),
+        "approved_step_ids": list(runtime.approved_step_ids or []),
+        "steps": step_paths,
+    }
+
+
 class PlanExecutor:
     """按计划拓扑、输入绑定和策略约束执行 ExecutablePlan。"""
 
@@ -1047,7 +1183,7 @@ class PlanExecutor:
         self._sync_runtime_state(state, runtime, current_step=step)
         return self._step_result_from_runtime(step=step, runtime=runtime, next_action="continue", output=normalized_output)
 
-    def observe_current_step(self, runtime: PlanRuntime, state: AgentState) -> StepExecutionResult:
+    def observe_current_step(self, runtime: PlanRuntime, state: AgentState, *, allow_interrupt: bool = True) -> StepExecutionResult:
         """只观察当前 step 的工具输出质量，不执行工具、不重规划。"""
         step = self._get_current_step(runtime)
         output_payload = runtime.last_step_output if isinstance(runtime.last_step_output, Mapping) else None
@@ -1098,7 +1234,7 @@ class PlanExecutor:
                 observation=observation,
                 normalized_output=normalized_output,
                 started_at=str(output_payload.get("started_at") or _utcnow()),
-                allow_interrupt=True,
+                allow_interrupt=allow_interrupt,
             )
             self._sync_runtime_state(state, runtime, current_step=step)
             return self._step_result_from_runtime(
@@ -1128,7 +1264,7 @@ class PlanExecutor:
                 confirmation_request=confirmation_request,
                 resolved_input=resolved_input,
                 started_at=str(output_payload.get("started_at") or _utcnow()),
-                allow_interrupt=True,
+                allow_interrupt=allow_interrupt,
             )
             self._sync_runtime_state(state, runtime, current_step=step)
             return self._step_result_from_runtime(
@@ -1213,251 +1349,52 @@ class PlanExecutor:
         return None
 
     def _execute_step(self, step: PlanStep, runtime: PlanRuntime, state: AgentState, *, allow_interrupt: bool, auto_replan: bool = True) -> Optional[AgentTurnResult]:
-        runtime.step_status[step.step_id] = "running"
-        started_at = _utcnow()
-        resolved_input, missing_input = self._resolve_input_bindings(step, runtime, state)
-        if missing_input:
-            runtime.step_status[step.step_id] = "failed"
-            runtime.error = f"missing_input:{step.step_id}:{missing_input}"
-            runtime.recovery_strategy = {"type": "ask_clarification", "reason": "missing_required_input", "input_key": missing_input}
-            self._append_trace(
-                runtime,
-                step,
-                event="step_failed",
-                status="failed",
-                detail={"failure_reason": "missing_input", "missing_input": missing_input, "resolved_input": _safe_compact(resolved_input), "started_at": started_at, "finished_at": _utcnow()},
-            )
+        """兼容入口：旧连续执行循环的单步执行。
+
+        重构后这里不再内联工具执行/观察/重规划，而是委托给同一套显式 step 执行内核：
+        execute_current_step_tool -> observe_current_step -> replan_after_observation。
+        这样新旧路径共享唯一的工具调用、确认、副作用复用与观察重规划逻辑，避免双份实现漂移。
+
+        返回语义保持与旧实现一致：返回 AgentTurnResult 表示本轮已收口（等待确认/失败/兜底），
+        返回 None 表示本步已处理完（成功、低质量但未触发兜底、或 auto_replan=False 时暂停），
+        由调用方继续推进后续步骤。
+        """
+        # 显式 step 执行内核以 runtime.current_step_id 定位当前步；兼容入口已经选中 step，先对齐定位。
+        runtime.current_step_id = step.step_id
+
+        exec_result = self.execute_current_step_tool(runtime, state, allow_interrupt=allow_interrupt)
+        if exec_result.turn_result is not None:
+            # 等待确认/拒绝收口等已经产出终态 turn。
+            return exec_result.turn_result
+        if exec_result.next_action == "wait_for_confirmation":
+            return self._build_turn_result(runtime)
+        if exec_result.next_action == "fail":
+            # 输入缺失、工具执行异常、duplicate_output_key、postcondition 失败：与旧实现一致返回 None，
+            # 由上层循环在没有可执行 step 后统一收口为 failed/fallback。
+            return None
+        if exec_result.next_action != "continue":
             return None
 
-        if _can_reuse_side_effect_output(runtime, step):
-            # 兼容执行循环同样必须遵守副作用幂等边界，避免旧入口绕过显式节点的复用保护。
-            reused_output = _existing_step_output(runtime, step)
-            runtime.step_status[step.step_id] = "success"
-            runtime.needs_replan = False
-            runtime.last_step_output = {
-                "step_id": step.step_id,
-                "reused_output": True,
-                "tool_contract": _json_safe(self.tool_registry.describe_contract(step.tool_name)),
-                "resolved_input": _json_safe(resolved_input),
-                "normalized_output": _json_safe(reused_output),
-                "started_at": started_at,
-                "finished_at": _utcnow(),
-            }
-            self._append_trace(
-                runtime,
-                step,
-                event="step_reused_output",
-                status="success",
-                detail={
-                    "tool_name": step.tool_name,
-                    "side_effect_level": step.side_effect_level,
-                    "output_key": step.output_key,
-                    "reason": "side_effect_output_already_available",
-                },
-            )
+        # continue 之后，仅当当前 step 仍处于 running 才需要观察：
+        # reused 副作用输出、确认桥接、目标解析 resume 等已在执行内核内置为非 running 终态，
+        # 与旧 _execute_step “复用输出直接完成、不再观察” 的语义保持一致。
+        if runtime.step_status.get(step.step_id) != "running":
             return None
 
-        if self._needs_confirmation(step, state, runtime=runtime):
-            confirmation_request = self._build_confirmation_request(
-                step=step,
-                runtime=runtime,
-                state=state,
-                resolved_input=resolved_input,
-                reason="explicit_user_confirmation_required",
-                pending_action=resolved_input.get("pending_action") if isinstance(resolved_input.get("pending_action"), Mapping) else None,
-            )
-            return self._handle_confirmation_gate(
-                step=step,
-                runtime=runtime,
-                state=state,
-                confirmation_request=confirmation_request,
-                resolved_input=resolved_input,
-                started_at=started_at,
-                allow_interrupt=allow_interrupt,
-            )
-
-        self._append_trace(
-            runtime,
-            step,
-            event="step_started",
-            status="running",
-            detail={
-                "tool_name": step.tool_name,
-                "tool_contract": self.tool_registry.describe_contract(step.tool_name),
-                "resolved_input": _safe_compact(resolved_input),
-                "started_at": started_at,
-            },
-        )
-
-        attempts = 0
-        last_error: Optional[str] = None
-        max_attempts = max(int(getattr(step.retry_policy, "max_attempts", 0) or 0), 1)
-        while attempts < max_attempts:
-            attempts += 1
-            runtime.retry_counts[step.step_id] = attempts - 1
-            try:
-                raw_output = self._invoke_step_tool(step, resolved_input, state, runtime)
-            except Exception as exc:  # pragma: no cover - 这里兜住未知工具实现异常
-                last_error = str(exc)
-                if attempts < max_attempts and bool(step.tool.can_retry or step.retry_policy):
-                    continue
-                runtime.step_status[step.step_id] = "failed"
-                runtime.error = f"tool_execution_failed:{step.step_id}:{last_error}"
-                runtime.recovery_strategy = {"type": "retry_or_abort", "reason": "tool_execution_failed", "error": last_error}
-                self._append_trace(
-                    runtime,
-                    step,
-                    event="step_failed",
-                    status="failed",
-                    detail={"failure_reason": "tool_execution_failed", "error": last_error, "resolved_input": _safe_compact(resolved_input), "started_at": started_at, "finished_at": _utcnow()},
-                )
-                return None
-
-            if isinstance(raw_output, ToolExecutionResult) and not raw_output.ok:
-                tool_error = raw_output.error or _make_tool_error(error_code="tool_failed", message="工具执行失败")
-                last_error = _tool_error_to_text(tool_error)
-                if attempts < max_attempts and (tool_error.retryable or bool(step.tool.can_retry or step.retry_policy)):
-                    continue
-                # 结构化工具错误仍交给 Observer/Replanner 判断，执行器只保存 envelope 和调度下一节点。
-                normalized_output = None
-            else:
-                normalized_output = project_tool_result(step, raw_output) if isinstance(raw_output, ToolExecutionResult) else raw_output
-
-            if step.output_key and step.output_key in runtime.outputs:
-                runtime.step_status[step.step_id] = "failed"
-                runtime.error = f"duplicate_output_key:{step.output_key}"
-                runtime.recovery_strategy = {"type": "abort_with_error", "reason": "duplicate_output_key", "output_key": step.output_key}
-                self._append_trace(runtime, step, event="step_failed", status="failed", detail={"failure_reason": "duplicate_output_key", "output_key": step.output_key})
-                return None
-
-            tool_failed = isinstance(raw_output, ToolExecutionResult) and not raw_output.ok
-            if not tool_failed and any(not _evaluate_condition(condition, state, runtime.model_copy(update={"outputs": dict(runtime.outputs, **({step.output_key: normalized_output} if step.output_key else {}))})) for condition in list(step.postconditions or [])):
-                runtime.step_status[step.step_id] = "failed"
-                runtime.error = f"postcondition_failed:{step.step_id}"
-                runtime.recovery_strategy = {"type": "abort_with_error", "reason": "postcondition_failed"}
-                self._append_trace(runtime, step, event="step_failed", status="failed", detail={"failure_reason": "postcondition_failed", "raw_output": _safe_compact(raw_output)})
-                return None
-
-            observation = self.observer.observe(
-                step=step,
-                resolved_input=resolved_input,
-                raw_output=raw_output,
-                normalized_output=normalized_output,
-                runtime=runtime,
-                state=state,
-            )
-            runtime.last_observation = observation.model_dump()
-            self._append_trace(
-                runtime,
-                step,
-                event="step_observed",
-                status="running",
-                detail={
-                    "observation_status": observation.status,
-                    "observation_signal": observation.observation_signal,
-                    "observation_reason": observation.reason,
-                    "failure_category": observation.failure_category,
-                    "severity": observation.severity,
-                    "recoverable": observation.recoverable,
-                    "retryable": observation.retryable,
-                    "requires_user_input": observation.requires_user_input,
-                    "suggested_recovery_types": list(observation.suggested_recovery_types or []),
-                    "evidence": _safe_compact(observation.evidence),
-                    "suggested_action": observation.suggested_action,
-                    "confidence": observation.confidence,
-                },
-            )
-
-            if observation.status == "need_confirmation" and _is_paper_target_resolution_step(step):
-                return self._handle_paper_target_confirmation_gate(
-                    step=step,
-                    runtime=runtime,
-                    state=state,
-                    observation=observation,
-                    normalized_output=normalized_output,
-                    started_at=started_at,
-                    allow_interrupt=allow_interrupt,
-                )
-
-            if observation.status == "need_confirmation" and step.tool_name == "request_confirmation":
-                pending_action = raw_output.get("pending_action") if isinstance(raw_output, Mapping) else None
-                confirmation_request = self._build_confirmation_request(
-                    step=step,
-                    runtime=runtime,
-                    state=state,
-                    resolved_input=resolved_input,
-                    reason=observation.reason,
-                    pending_action=pending_action if isinstance(pending_action, Mapping) else None,
-                )
-                return self._handle_confirmation_gate(
-                    step=step,
-                    runtime=runtime,
-                    state=state,
-                    confirmation_request=confirmation_request,
-                    resolved_input=resolved_input,
-                    started_at=started_at,
-                    allow_interrupt=allow_interrupt,
-                )
-
-            if observation.status not in {"success", "partial_success"}:
-                # observation 代表“工具执行后质量不足”，先写入 runtime，方便重规划节点或调试视图复盘触发原因。
-                if _should_preserve_non_success_observation_output(step, normalized_output):
-                    _record_step_output(runtime, step, normalized_output)
-                runtime.needs_replan = True
-                runtime.last_step_output = {
-                    "step_id": step.step_id,
-                    "tool_contract": _json_safe(self.tool_registry.describe_contract(step.tool_name)),
-                    "tool_execution": _json_safe(raw_output) if isinstance(raw_output, ToolExecutionResult) else None,
-                    "resolved_input": _json_safe(resolved_input),
-                    "raw_output": _json_safe(_model_to_plain(raw_output.data) if isinstance(raw_output, ToolExecutionResult) else raw_output),
-                    "normalized_output": _json_safe(normalized_output),
-                    "started_at": started_at,
-                    "finished_at": _utcnow(),
-                }
-                if not auto_replan:
-                    # 新 LangGraph 执行环需要把重规划显式暴露成图节点，这里只记录观察结果并暂停本步。
-                    return None
-                replan_result = self._handle_observation_replan(
-                    step=step,
-                    runtime=runtime,
-                    state=state,
-                    observation=observation,
-                    raw_output=raw_output,
-                    normalized_output=normalized_output,
-                )
-                if replan_result is not None:
-                    return replan_result
-                return None
-
-            if step.output_key:
-                _record_step_output(runtime, step, normalized_output)
-                runtime.final_answer = assemble_final_answer(runtime)
-
-            runtime.step_status[step.step_id] = "success"
-            runtime.needs_replan = False
-            self._append_paper_qa_quality_trace(runtime, step, normalized_output)
-            self._append_trace(
-                runtime,
-                step,
-                event="step_succeeded",
-                status="success",
-                detail={
-                    "tool_name": step.tool_name,
-                    "tool_contract": self.tool_registry.describe_contract(step.tool_name),
-                    "tool_execution": _compact_tool_execution_for_trace(step, raw_output),
-                    "resolved_input": _safe_compact(resolved_input),
-                    "raw_output": _compact_step_output_for_trace(step, _model_to_plain(raw_output.data) if isinstance(raw_output, ToolExecutionResult) else raw_output),
-                    "normalized_output": _compact_step_output_for_trace(step, normalized_output),
-                    "started_at": started_at,
-                    "finished_at": _utcnow(),
-                },
-            )
+        observe_result = self.observe_current_step(runtime, state, allow_interrupt=allow_interrupt)
+        if observe_result.turn_result is not None:
+            return observe_result.turn_result
+        if observe_result.next_action == "wait_for_confirmation":
+            return self._build_turn_result(runtime)
+        if observe_result.next_action != "replan":
+            # success / fail 等：本步已收尾，交回上层推进。
             return None
 
-        runtime.step_status[step.step_id] = "failed"
-        runtime.error = f"tool_execution_failed:{step.step_id}:{last_error or 'unknown_error'}"
-        runtime.recovery_strategy = {"type": "abort_with_error", "reason": "tool_execution_failed", "error": last_error or "unknown_error"}
-        return None
+        # 低质量观察 -> 需要重规划。
+        if not auto_replan:
+            # 新 LangGraph 执行环把重规划显式暴露成图节点，这里只记录观察结果并暂停本步。
+            return None
+        return self.replan_after_observation(runtime, state)
 
     def replan_after_observation(self, runtime: PlanRuntime, state: AgentState) -> Optional[AgentTurnResult]:
         """根据 runtime 中最近一次 observation 显式执行重规划。
@@ -1997,6 +1934,8 @@ class PlanExecutor:
             "is_finished": bool(runtime_state.is_finished),
             "failure_reason": runtime.error,
             "recovery_strategy": _json_safe(runtime.recovery_strategy or {}),
+            # 纯附加的只读执行路径摘要：不参与调度，仅供 debug/验收快速判断本轮走了哪条链路。
+            "execution_path": _build_execution_path_summary(runtime, current_step_id=runtime_state.current_step_id),
         }
 
     def _build_agent_runtime_state(self, runtime: PlanRuntime, *, current_step: Optional[PlanStep]) -> AgentRuntimeState:
@@ -2048,6 +1987,13 @@ class PlanExecutor:
                     break
         state.plan_runtime = runtime
         state.runtime_state = self._build_agent_runtime_state(runtime, current_step=current_step)
+        # 纯附加调试镜像：把本轮执行路径摘要写入 debug，供前端调试视图/验收脚本直接读取，
+        # 不影响 runtime/runtime_state 等调度真源，也不改变任何对外协议。
+        state.debug = dict(state.debug or {})
+        state.debug["execution_path"] = _build_execution_path_summary(
+            runtime,
+            current_step_id=current_step.step_id if current_step else runtime.current_step_id,
+        )
 
     def _finalize_blocked_pending_steps(self, runtime: PlanRuntime) -> None:
         plan = runtime.plan

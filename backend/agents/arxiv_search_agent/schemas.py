@@ -563,11 +563,21 @@ class ToolCandidateSelection(BaseModel):
     risk_summary: Dict[str, Any] = Field(default_factory=dict)
 
 
+# =============================================================================
+# LEGACY 计划模型区（兼容专用，新 planner 开发不要在这里扩展）
+# -----------------------------------------------------------------------------
+# 下面的 ExecutionPlanStep 是历史轻量计划步骤模型，仅供：
+#   1) state.py 的 _coerce_legacy_execution_plan 把旧 step 列表转成 ExecutablePlan；
+#   2) 历史测试构造只含 step_type/description 的步骤。
+# 当前主路径计划模型是 PlanStep / ExecutablePlan / PlanRuntime / AgentRuntimeState，
+# 新增计划能力请改这些模型，不要再扩展 ExecutionPlanStep。
+# =============================================================================
 class ExecutionPlanStep(BaseModel):
-    """兼容旧版节点流使用的轻量计划步骤。
+    """[LEGACY] 兼容旧版节点流使用的轻量计划步骤。
 
     新执行器使用 PlanStep/ExecutablePlan 承载工具契约；旧 LangGraph 节点和历史测试仍会
     构造只包含 step_type/description 的步骤，因此这里保留窄模型避免破坏旧入口。
+    新开发不要依赖本模型，详见上方 LEGACY 计划模型区说明。
     """
     model_config = ConfigDict(extra="forbid")
 

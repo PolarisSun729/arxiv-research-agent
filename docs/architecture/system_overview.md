@@ -50,8 +50,8 @@ build_qa_context / answer_question"]
         memory["Memory
 短期会话 / Agent Session / 用户画像"]
         retriever["Retriever
-EnhancedRetrievalService
-RouteRetriever / QueryPlanner"]
+EnhancedRetrievalService(????)
+RetrievalPipeline / RouteRetriever / QueryPlanner / RetrievalRules"]
         reranker["Reranker
 RerankService
 LLM 压缩 + rerank"]
@@ -171,6 +171,8 @@ Milvus / VectorStoreService"]
 
 - Retriever
   - `backend/services/retrieval/enhanced_retrieval_service.py`
+  - `backend/services/retrieval/retrieval_pipeline.py`
+  - `backend/services/retrieval/retrieval_rules.py`
   - `backend/services/retrieval/route_retriever.py`
   - `backend/services/retrieval/query_planner.py`
   - 在论文 QA 主链路里由 `PaperQAService.build_qa_context()` 调用 `enhanced_retrieve()`

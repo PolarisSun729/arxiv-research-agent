@@ -91,18 +91,41 @@ class AgentState(BaseModel):
     - 偏好更新链路，
     最终都能通过同一个状态模型进行衔接。
 
-    字段大致可以分成几组：
-    1. 请求上下文：user_id、session_id、message、context；
-    2. 意图识别结果：intent、intent_source、fallback_reason、llm_confidence、search_spec；
-    3. 工具与数据结果：tool_name、tool_args、tool_result、tool_calls、papers；
-    4. 阅读/偏好相关中间态：待确认任务（pending_action）、paper_qa_result、preference_action_result；
-    5. 面向用户与调试的信息：plan、warnings、answer、next_actions、steps、errors、debug；
-    6. 运行时控制字段：personalized_rerank_applied、search_retry_count、fallback_specs。
+    ====================================================================
+    字段分层（务必先读这一段，再读下面各字段）：本模型刻意区分三类字段，
+    维护者改动前必须分清自己在动哪一类，避免再次出现“同一件事多处副本”。
+
+    A. 执行真源（唯一可写的业务状态，所有判断都应只读这里）：
+       - goal / execution_plan：本轮目标与结构化计划；
+       - plan_runtime（PlanRuntime）：运行中执行现场，承载当前 step、工具输出
+         （runtime.outputs）、最近 observation、pending_confirmation、final_answer
+         与失败原因。用户是否等待确认、工具结果、最终回答都以它为准。
+       - runtime_state（AgentRuntimeState）：plan_runtime 的可序列化 checkpoint
+         投影，专供 resume 恢复；它是 plan_runtime 的快照镜像，业务逻辑不得
+         把它当成与 plan_runtime 并列的第二份真源同时读写。
+
+    B. 出站展示 / 响应投影（出站时从执行真源生成，输入侧不可信、不得反向驱动执行）：
+       - pending_action：ConfirmationRequest 的前端展示镜像；
+       - answer / papers / paper_qa_result / preference_action_result：最终响应
+         适配字段，由 graph._apply_turn_result 从 runtime.outputs 投影得到。
+
+    C. 旧式平行节点的兼容字段（不在 graph 主路径上，仅历史 node/* 与其测试使用）：
+       - tool_name / tool_args / tool_result：旧 node 路径单步工具中间态，
+         主路径（graph → PlanExecutor → tool_adapters）不读写它们；
+       - tool_calls：工具调用轨迹列表，仅供展示与调试。
+       新协议字段 tool_call_request / tool_observations 属于工具协议层，
+       同样不替代主路径的 runtime.outputs。
+
+    其余请求上下文（user_id/session_id/message/context）、意图识别结果
+    （intent/search_spec 等）、调试信息（debug/steps/errors/warnings）和运行时
+    控制位（personalized_rerank_applied/search_retry_count/fallback_specs）按字段
+    注释理解即可。
 
     之所以把这些状态集中到一个模型里，而不是拆成多个零散 dict，主要是为了：
     - 保持节点之间的数据契约稳定；
     - 让调试和日志更容易理解；
     - 利用 Pydantic 的默认值和类型约束，减少状态缺字段的问题。
+    ====================================================================
     """
     user_id: Optional[str] = None
     session_id: Optional[str] = None
@@ -111,12 +134,13 @@ class AgentState(BaseModel):
     # 例如 selected_paper、last_papers、research_profile、loading_method 等。
     context: Dict[str, Any] = Field(default_factory=dict)
 
-    # pending_action 是对外兼容字段：新确认链路里它主要镜像 ConfirmationRequest 供前端展示。
-    # 真正的 interrupt/resume 执行现场依赖 LangGraph checkpointer，不能只靠这个业务摘要恢复。
+    # [B 出站展示] pending_action 是 ConfirmationRequest 的前端展示镜像，由出站投影生成。
+    # 业务真源是 plan_runtime.pending_confirmation；interrupt/resume 现场依赖 LangGraph
+    # checkpointer + runtime_state，不能只靠这个展示摘要恢复，也不得据它做执行判断。
     pending_action: Optional[Dict[str, Any]] = None
 
-    # paper_qa_result 保存论文阅读链路的结构化结果：可能是成功答案、失败信息，
-    # 也可能是 waiting_confirmation 状态。
+    # [B 出站响应投影] paper_qa_result 由 _apply_turn_result 从 runtime.outputs 投影得到，
+    # 可能是成功答案、失败信息或 waiting_confirmation 状态，仅供最终响应/前端消费。
     paper_qa_result: Optional[Dict[str, Any]] = None
 
     # intent 系列字段由 parse_search_request 节点产出，决定图中后续路由方向。
@@ -126,8 +150,11 @@ class AgentState(BaseModel):
     llm_confidence: Optional[float] = None
     search_spec: Optional[ArxivSearchSpec] = None
 
-    # goal 表达用户本轮真实想完成的目标；execution_plan 表达结构化步骤规划。
-    # runtime_state 是一等执行现场，负责跨节点/跨请求承载当前 step、工具输出、观察和确认状态。
+    # [A 执行真源] goal 表达用户本轮真实想完成的目标；execution_plan 表达结构化步骤规划。
+    # plan_runtime（PlanRuntime）是运行中执行现场，承载当前 step、工具输出、observation
+    # 与 pending_confirmation，所有业务判断只读它。
+    # runtime_state（AgentRuntimeState）是 plan_runtime 的可序列化 checkpoint 投影，
+    # 仅供 resume 恢复，不得与 plan_runtime 并列当成第二份真源同时读写。
     goal: Optional[Goal] = None
     execution_plan: Optional[ExecutablePlan] = None
     plan_runtime: Optional[PlanRuntime] = None
@@ -138,7 +165,8 @@ class AgentState(BaseModel):
     def _normalize_execution_plan(cls, value: Any) -> Any:
         return _coerce_legacy_execution_plan(value)
 
-    # 偏好动作执行后的结果，例如喜欢/不喜欢/取消标记的处理结果。
+    # [B 出站投影] 偏好动作执行后的结果，例如喜欢/不喜欢/取消标记的处理结果；
+    # 由 _apply_turn_result 从 runtime.outputs 投影，不作为执行过程真源。
     preference_action_result: Optional[Dict[str, Any]] = None
 
     # debug 保存面向开发排查的中间态与详细错误上下文，不直接面向终端用户。
@@ -147,10 +175,10 @@ class AgentState(BaseModel):
     # plan 表示系统理解到的处理计划；next_actions 表示建议用户下一步可以做什么。
     plan: List[str] = Field(default_factory=list)
 
-    # tool_* 字段记录当前节点最近一次工具调用的名称、参数和原始结果；
-    # tool_calls 则保留完整工具调用轨迹列表。
-    # 阶段 2 新增的 tool_call_request / tool_observations 先只作为统一协议字段，
-    # 暂不替代已有工具执行流，避免影响现有搜索链路和调试展示逻辑。
+    # [C 兼容字段] tool_name / tool_args / tool_result 是旧式平行 node 路径的单步工具
+    # 中间态：当前节点最近一次工具调用的名称、参数和原始结果；tool_calls 保留调用轨迹。
+    # graph 主路径（PlanExecutor + tool_adapters）不读写它们，工具结果以 runtime.outputs 为真源。
+    # tool_call_request / tool_observations 属于工具协议层，同样不替代主路径的 runtime.outputs。
     tool_name: Optional[str] = None
     tool_args: Dict[str, Any] = Field(default_factory=dict)
     tool_result: Optional[Dict[str, Any]] = None
@@ -158,10 +186,12 @@ class AgentState(BaseModel):
     tool_call_request: Optional[ToolCallRequest] = None
     tool_observations: List[ToolObservation] = Field(default_factory=list)
 
-    # papers 用于保存搜索结果或某些阅读链路回传的论文列表。
+    # [B 出站投影] papers 保存搜索结果或阅读链路回传的论文列表，
+    # 由 _apply_turn_result 从 runtime.outputs（ranked_papers/arxiv_results 等）投影。
     papers: List[Dict[str, Any]] = Field(default_factory=list)
 
-    # warnings 只放用户或前端可理解的提示；answer / next_actions 是最终回复层直接消费的字段。
+    # [B 出站投影] warnings 只放用户或前端可理解的提示；answer / next_actions 是最终回复层
+    # 直接消费的字段，answer 由 runtime.final_answer / outputs 投影，不作为执行过程真源。
     warnings: List[str] = Field(default_factory=list)
     answer: Optional[str] = None
     next_actions: List[str] = Field(default_factory=list)

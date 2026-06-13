@@ -33,8 +33,8 @@ backend/tools/tool_registry.py"]
     tools --> arxiv
 
     qa --> retrieval["检索 / 重排
-EnhancedRetrievalService
-RerankService"]
+EnhancedRetrievalService(????)
+RetrievalPipeline / RerankService"]
     qa --> llm["LLM 生成
 GenerationService"]
     qa --> vector["向量库

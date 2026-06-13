@@ -211,18 +211,102 @@ VECTOR_STORE_CONFIG: Dict[str, Any] = {
     "asset_preview_max_length": _env_int("VECTOR_STORE_ASSET_PREVIEW_MAX_LENGTH", 6000),
 }
 
+RECOMMENDATION_PROFILE_CONFIG: Dict[str, Any] = {
+    "positive": {
+        # 正向画像只表达“用户喜欢什么”，主向量和兴趣簇阈值都集中在这里，避免业务代码散落默认值。
+        "min_liked_for_vector": _env_int("RECOMMENDATION_PROFILE_POSITIVE_MIN_LIKED_FOR_VECTOR", 1),
+        "min_liked_for_clustering": _env_int(
+            "RECOMMENDATION_PROFILE_POSITIVE_MIN_LIKED_FOR_CLUSTERING",
+            _env_int("RECOMMENDATION_MIN_LIKED_PAPERS_FOR_CLUSTERING", 4),
+        ),
+        "max_interest_clusters": _env_int(
+            "RECOMMENDATION_PROFILE_POSITIVE_MAX_INTEREST_CLUSTERS",
+            _env_int("RECOMMENDATION_MAX_INTEREST_CLUSTERS", 4),
+        ),
+        "clustering": {
+            "min_cluster_size": _env_int(
+                "RECOMMENDATION_PROFILE_POSITIVE_CLUSTERING_MIN_CLUSTER_SIZE",
+                _env_int("RECOMMENDATION_HDBSCAN_MIN_CLUSTER_SIZE", 2),
+            ),
+            "min_samples": _env_int(
+                "RECOMMENDATION_PROFILE_POSITIVE_CLUSTERING_MIN_SAMPLES",
+                _env_int("RECOMMENDATION_HDBSCAN_MIN_SAMPLES", 1),
+            ),
+            "metric": _env_str(
+                "RECOMMENDATION_PROFILE_POSITIVE_CLUSTERING_METRIC",
+                _env_str("RECOMMENDATION_HDBSCAN_METRIC", "cosine"),
+            ),
+            "cluster_selection_method": _env_str(
+                "RECOMMENDATION_PROFILE_POSITIVE_CLUSTERING_CLUSTER_SELECTION_METHOD",
+                _env_str("RECOMMENDATION_HDBSCAN_CLUSTER_SELECTION_METHOD", "eom"),
+            ),
+            "allow_single_cluster": _env_bool(
+                "RECOMMENDATION_PROFILE_POSITIVE_CLUSTERING_ALLOW_SINGLE_CLUSTER",
+                _env_bool("RECOMMENDATION_HDBSCAN_ALLOW_SINGLE_CLUSTER", True),
+            ),
+        },
+    },
+    "negative": {
+        # 负向反馈只作为“不要再推荐什么”的独立信号保存，后续由排序/过滤阶段消费。
+        "enabled": _env_bool("RECOMMENDATION_PROFILE_NEGATIVE_ENABLED", True),
+        "store_disliked_examples": _env_bool("RECOMMENDATION_PROFILE_NEGATIVE_STORE_DISLIKED_EXAMPLES", True),
+        "min_disliked_for_instance_feedback": _env_int(
+            "RECOMMENDATION_PROFILE_NEGATIVE_MIN_DISLIKED_FOR_INSTANCE_FEEDBACK",
+            1,
+        ),
+        "max_disliked_examples": _env_int("RECOMMENDATION_PROFILE_NEGATIVE_MAX_DISLIKED_EXAMPLES", 20),
+        "enable_negative_clustering": _env_bool("RECOMMENDATION_PROFILE_NEGATIVE_ENABLE_NEGATIVE_CLUSTERING", True),
+        "min_disliked_for_clustering": _env_int("RECOMMENDATION_PROFILE_NEGATIVE_MIN_DISLIKED_FOR_CLUSTERING", 4),
+        "max_negative_clusters": _env_int("RECOMMENDATION_PROFILE_NEGATIVE_MAX_NEGATIVE_CLUSTERS", 4),
+        "clustering": {
+            "min_cluster_size": _env_int("RECOMMENDATION_PROFILE_NEGATIVE_CLUSTERING_MIN_CLUSTER_SIZE", 2),
+            "min_samples": _env_int("RECOMMENDATION_PROFILE_NEGATIVE_CLUSTERING_MIN_SAMPLES", 1),
+            "metric": _env_str("RECOMMENDATION_PROFILE_NEGATIVE_CLUSTERING_METRIC", "cosine"),
+            "cluster_selection_method": _env_str(
+                "RECOMMENDATION_PROFILE_NEGATIVE_CLUSTERING_CLUSTER_SELECTION_METHOD",
+                "eom",
+            ),
+            "allow_single_cluster": _env_bool(
+                "RECOMMENDATION_PROFILE_NEGATIVE_CLUSTERING_ALLOW_SINGLE_CLUSTER",
+                True,
+            ),
+        },
+        "fallback_to_examples_when_cluster_failed": _env_bool(
+            "RECOMMENDATION_PROFILE_NEGATIVE_FALLBACK_TO_EXAMPLES_WHEN_CLUSTER_FAILED",
+            True,
+        ),
+    },
+}
+
 RECOMMENDATION_CLUSTERING_CONFIG: Dict[str, Any] = {
-    "hdbscan_min_cluster_size": _env_int("RECOMMENDATION_HDBSCAN_MIN_CLUSTER_SIZE", 2),
-    "hdbscan_min_samples": _env_int("RECOMMENDATION_HDBSCAN_MIN_SAMPLES", 1),
-    "hdbscan_metric": _env_str("RECOMMENDATION_HDBSCAN_METRIC", "cosine"),
-    "hdbscan_cluster_selection_method": _env_str("RECOMMENDATION_HDBSCAN_CLUSTER_SELECTION_METHOD", "eom"),
-    "hdbscan_allow_single_cluster": _env_bool("RECOMMENDATION_HDBSCAN_ALLOW_SINGLE_CLUSTER", True),
+    **RECOMMENDATION_PROFILE_CONFIG["positive"]["clustering"],
+}
+
+RECOMMENDATION_RANKING_CONFIG: Dict[str, Any] = {
+    "negative": {
+        # 负向反馈只在排序阶段生效；默认不开 hard filter，避免一两次点踩误伤相近但可能有价值的论文。
+        "enabled": _env_bool("RECOMMENDATION_RANKING_NEGATIVE_ENABLED", True),
+        "similarity_threshold": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_SIMILARITY_THRESHOLD", "0.82")),
+        "margin": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_MARGIN", "0.05")),
+        "penalty_weight": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_PENALTY_WEIGHT", "0.15")),
+        "confidence_min_count": _env_int("RECOMMENDATION_RANKING_NEGATIVE_CONFIDENCE_MIN_COUNT", 6),
+        "max_penalty": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_MAX_PENALTY", "0.22")),
+        "use_margin_penalty": _env_bool("RECOMMENDATION_RANKING_NEGATIVE_USE_MARGIN_PENALTY", True),
+        "use_threshold_penalty": _env_bool("RECOMMENDATION_RANKING_NEGATIVE_USE_THRESHOLD_PENALTY", True),
+        "hard_filter_threshold": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_HARD_FILTER_THRESHOLD", "0.97")),
+        "enable_hard_filter": _env_bool("RECOMMENDATION_RANKING_NEGATIVE_ENABLE_HARD_FILTER", False),
+        "debug_enabled": _env_bool("RECOMMENDATION_RANKING_NEGATIVE_DEBUG_ENABLED", True),
+    },
 }
 
 RECOMMENDATION_CONFIG: Dict[str, Any] = {
     "backfill_request_interval_seconds": float(_env_str("RECOMMENDATION_BACKFILL_REQUEST_INTERVAL_SECONDS", "8.0")),
-    "min_liked_papers_for_clustering": _env_int("RECOMMENDATION_MIN_LIKED_PAPERS_FOR_CLUSTERING", 4),
-    "max_interest_clusters": _env_int("RECOMMENDATION_MAX_INTEREST_CLUSTERS", 4),
+    "profile": RECOMMENDATION_PROFILE_CONFIG,
+    "ranking": RECOMMENDATION_RANKING_CONFIG,
+    # 兼容旧环境变量/读取路径：这些字段已迁移到 recommendation.profile.positive，不再作为业务读取入口。
+    "min_liked_papers_for_clustering": RECOMMENDATION_PROFILE_CONFIG["positive"]["min_liked_for_clustering"],
+    "max_interest_clusters": RECOMMENDATION_PROFILE_CONFIG["positive"]["max_interest_clusters"],
+    # deprecated: 负向反馈不再参与主兴趣向量生成，仅保留旧配置读取兼容。
     "negative_weight_default": float(_env_str("RECOMMENDATION_NEGATIVE_WEIGHT_DEFAULT", "0.3")),
     "default_top_n": _env_int("RECOMMENDATION_DEFAULT_TOP_N", 10),
     "default_max_age_months": _env_int("RECOMMENDATION_DEFAULT_MAX_AGE_MONTHS", 6),
@@ -231,6 +315,7 @@ RECOMMENDATION_CONFIG: Dict[str, Any] = {
         "semantic": float(_env_str("RECOMMENDATION_SCORE_WEIGHT_SEMANTIC", "0.65")),
         "category": float(_env_str("RECOMMENDATION_SCORE_WEIGHT_CATEGORY", "0.08")),
         "recency": float(_env_str("RECOMMENDATION_SCORE_WEIGHT_RECENCY", "0.05")),
+        # deprecated: 负向扣分已迁移到 recommendation.ranking.negative.penalty_weight / max_penalty。
         "disliked_penalty": float(_env_str("RECOMMENDATION_SCORE_WEIGHT_DISLIKED_PENALTY", "0.15")),
     },
     "semantic_similarity_penalty_threshold": float(

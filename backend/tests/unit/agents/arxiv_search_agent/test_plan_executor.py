@@ -672,6 +672,50 @@ def test_plan_executor_checkpoint_approved_step_does_not_request_confirmation_ag
     assert not any(trace.event == "confirmation_requested" for trace in result.trace)
 
 
+def test_plan_executor_checkpoint_approved_step_uses_default_user_id_when_state_user_missing(monkeypatch) -> None:
+    calls = []
+
+    class ApprovedCheckpointDatabase:
+        def get_agent_runtime_checkpoint(self, **kwargs):
+            # stream resume 可能不显式回填 user_id；executor 需要和数据库层保持同样的默认值归一。
+            assert kwargs["user_id"] == executor_module.DEFAULT_USER_ID
+            assert kwargs["session_id"] == "s1"
+            return {
+                "status": "running",
+                "pending_confirmation": None,
+                "runtime_state": {
+                    "approved_step_ids": ["parse_and_index_paper"],
+                    "plan": {"plan_id": "paper_qa:test"},
+                },
+            }
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        calls.append((tool_name, dict(kwargs)))
+        if tool_name == "build_paper_qa_index":
+            return {"ok": True, "tool_name": tool_name, "summary": "indexed", "data": {"status": "indexed", "has_index": True}, "trace": {}, "error": None}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    def fail_if_interrupted(*args, **kwargs):
+        raise AssertionError("approved checkpoint step must not request confirmation again")
+
+    monkeypatch.setattr(executor_module, "DatabaseService", ApprovedCheckpointDatabase)
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+    monkeypatch.setattr(executor_module, "interrupt", fail_if_interrupted)
+
+    goal, plan = _paper_index_confirmation_plan()
+    state = AgentState(session_id="s1", intent="paper_qa", message="build index")
+    runtime = planner_module.build_plan_runtime(state, goal=goal, plan=plan, turn_status="success")
+    runtime.step_status = {step.step_id: "pending" for step in list(plan.steps or [])}
+
+    result = PlanExecutor()._execute_runtime(runtime, state, allow_interrupt=True)
+
+    assert result.status == "success"
+    assert calls and calls[0][0] == "build_paper_qa_index"
+    assert runtime.approved_step_ids == ["parse_and_index_paper"]
+    assert state.context["approved_step_ids"] == ["parse_and_index_paper"]
+    assert not any(trace.event == "confirmation_requested" for trace in result.trace)
+
+
 def test_plan_executor_resume_reentry_consumes_pending_confirmation(monkeypatch) -> None:
     calls = []
 

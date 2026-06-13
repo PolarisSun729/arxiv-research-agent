@@ -227,6 +227,117 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result["disliked_count"], 1)
         self.assertIsNotNone(stored["disliked_vector_data"])
+        self.assertEqual(stored["vector_data"], [1.0, 0.0, 0.0])
+        self.assertEqual(stored["paper_count"], 1)
+        self.assertEqual(stored["negative_feedback_stats"]["usable_disliked"], 1)
+        self.assertFalse(stored["negative_feedback_stats"]["participates_in_main_vector"])
+        self.assertEqual(stored["disliked_paper_examples"][0]["arxiv_id"], "2401.00003")
+        self.assertEqual(stored["negative_feedback_profile"]["mode"], "examples")
+        self.assertEqual(stored["negative_feedback_profile"]["examples"][0]["arxiv_id"], "2401.00003")
+        self.assertEqual(len(stored["negative_feedback_profile"]["examples"][0]["vector"]), 3)
+
+    def test_legacy_interest_vector_projects_disliked_examples_to_negative_profile(self) -> None:
+        legacy_examples = [
+            {
+                "arxiv_id": "2401.00003",
+                "title": "Disliked Paper",
+                "vector": [0.0, 1.0, 0.0],
+                "vector_source": "milvus",
+            }
+        ]
+        self.db_service.save_user_interest_vector(
+            user_id=self.user_id,
+            vector_data=[1.0, 0.0, 0.0],
+            paper_count=1,
+            embedding_model="fake-embedding-model",
+            vector_dimension=3,
+            disliked_paper_examples=legacy_examples,
+        )
+
+        stored = self.db_service.get_user_interest_vector(self.user_id)
+
+        self.assertTrue(stored["negative_feedback_profile"]["enabled"])
+        self.assertEqual(stored["negative_feedback_profile"]["mode"], "examples")
+        self.assertEqual(stored["negative_feedback_profile"]["examples"], legacy_examples)
+        self.assertEqual(stored["negative_feedback_stats"]["stored_examples"], 1)
+        self.assertEqual(stored["negative_feedback_stats"]["usable_disliked"], 1)
+
+    def test_generate_user_interest_vector_builds_negative_clusters(self) -> None:
+        self._seed_interest_vectors()
+        self.db_service.add_liked_paper(self.user_id, "2401.00001")
+        extra_disliked = [
+            ("2401.00004", [0.0, 0.9, 0.1]),
+            ("2401.00005", [0.0, 0.8, 0.2]),
+            ("2401.00006", [0.0, 1.0, 0.1]),
+        ]
+        self.db_service.add_disliked_paper(self.user_id, "2401.00003")
+        for arxiv_id, vector in extra_disliked:
+            self._add_paper(arxiv_id, title=f"Disliked {arxiv_id}", abstract="vision benchmark", categories=["cs.CV"])
+            self.vector_store_service.seed_paper_embedding(arxiv_id, vector, title=f"Disliked {arxiv_id}", abstract="vision benchmark", categories=["cs.CV"])
+            self.db_service.add_disliked_paper(self.user_id, arxiv_id)
+
+        cluster_payload = [
+            {
+                "cluster_id": "negative_cluster_0",
+                "cluster_label": 7,
+                "centroid_vector": [0.0, 1.0, 0.0],
+                "paper_count": 4,
+                "paper_ids": ["2401.00003", "2401.00004", "2401.00005", "2401.00006"],
+            }
+        ]
+        with mock.patch.object(self.service, "_cluster_negative_feedback_vectors", return_value=cluster_payload) as cluster_mock:
+            result = self.service.generate_user_interest_vector(self.user_id)
+
+        stored = self.db_service.get_user_interest_vector(self.user_id)
+        cluster_mock.assert_called_once()
+        self.assertEqual(result["negative_cluster_count"], 1)
+        self.assertEqual(stored["negative_feedback_profile"]["mode"], "clusters")
+        self.assertEqual(stored["negative_feedback_profile"]["clusters"], cluster_payload)
+        self.assertEqual(stored["negative_feedback_stats"]["negative_cluster_count"], 1)
+
+    def test_generate_user_interest_vector_falls_back_to_negative_examples_when_clustering_fails(self) -> None:
+        self._seed_interest_vectors()
+        self.db_service.add_liked_paper(self.user_id, "2401.00001")
+        for index in range(4, 7):
+            arxiv_id = f"2401.0000{index}"
+            self._add_paper(arxiv_id, title=f"Disliked {index}", abstract="survey only", categories=["cs.AI"])
+            self.vector_store_service.seed_paper_embedding(arxiv_id, [0.0, 1.0, float(index) / 10.0], title=f"Disliked {index}", abstract="survey only", categories=["cs.AI"])
+            self.db_service.add_disliked_paper(self.user_id, arxiv_id)
+        self.db_service.add_disliked_paper(self.user_id, "2401.00003")
+
+        with mock.patch.object(self.service, "_cluster_negative_feedback_vectors", return_value=[]):
+            self.service.generate_user_interest_vector(self.user_id)
+
+        stored = self.db_service.get_user_interest_vector(self.user_id)
+        self.assertEqual(stored["negative_feedback_profile"]["mode"], "cluster_fallback_examples")
+        self.assertEqual(stored["negative_feedback_stats"]["fallback_reason"], "no_stable_negative_clusters")
+        self.assertGreaterEqual(len(stored["negative_feedback_profile"]["examples"]), 1)
+
+    def test_generate_user_interest_vector_builds_positive_clusters(self) -> None:
+        self._seed_interest_vectors()
+        self._add_paper("2401.00004", title="Liked Paper C", abstract="retrieval reranking", categories=["cs.IR"])
+        self._add_paper("2401.00005", title="Liked Paper D", abstract="rag evaluation", categories=["cs.CL"])
+        self.vector_store_service.seed_paper_embedding("2401.00004", [0.7, 0.3, 0.0], title="Liked Paper C", abstract="retrieval reranking", categories=["cs.IR"])
+        self.vector_store_service.seed_paper_embedding("2401.00005", [0.9, 0.1, 0.0], title="Liked Paper D", abstract="rag evaluation", categories=["cs.CL"])
+        for arxiv_id in ("2401.00001", "2401.00002", "2401.00004", "2401.00005"):
+            self.db_service.add_liked_paper(self.user_id, arxiv_id)
+
+        cluster_payload = [
+            {
+                "cluster_id": "cluster_0",
+                "centroid_vector": [1.0, 0.0, 0.0],
+                "paper_count": 4,
+                "paper_ids": ["2401.00001", "2401.00002", "2401.00004", "2401.00005"],
+            }
+        ]
+        with mock.patch.object(self.service, "_cluster_interest_vectors", return_value=(cluster_payload, None)) as cluster_mock:
+            result = self.service.generate_user_interest_vector(self.user_id)
+
+        stored = self.db_service.get_user_interest_vector(self.user_id)
+        cluster_mock.assert_called_once()
+        self.assertEqual(result["profile_mode"], "clustered")
+        self.assertEqual(stored["cluster_count"], 1)
+        self.assertEqual(stored["interest_clusters"], cluster_payload)
 
     def test_candidate_recall_returns_fixed_candidates(self) -> None:
         candidates = self.service._fetch_recent_db_candidates(Counter(), max_age_months=12, max_results=10)
@@ -242,10 +353,7 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
             "categories": ["cs.CL"],
             "published_date": "2024-01-01",
         }
-        stored_vector = self.embedding_service.create_single_embedding(
-            self.embedding_service.build_paper_embedding_text(candidate["title"], candidate["abstract"])
-        )
-        candidate["_stored_vector"] = stored_vector
+        candidate["_stored_vector"] = [1.0, 0.0, 0.0]
         liked_category_freq = Counter({"cs.CL": 2})
         config = self.embedding_service.get_default_embedding_config()
         scored_without_penalty = self.service._build_candidate_score(
@@ -260,13 +368,189 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
             candidate=dict(candidate),
             liked_category_freq=liked_category_freq,
             user_vector=[1.0, 0.0, 0.0],
-            interest_clusters=[{"cluster_id": "c1", "centroid_vector": [1.0, 0.0, 0.0]}],
+            interest_clusters=[],
             disliked_vector=[1.0, 0.0, 0.0],
             embedding_config=config,
         )
 
         self.assertGreater(scored_with_penalty["disliked_penalty"], 0.0)
+        self.assertGreater(scored_with_penalty["negative_score"], scored_with_penalty["negative_feedback_debug"]["similarity_threshold"])
+        self.assertTrue(scored_with_penalty["negative_penalty_applied"])
         self.assertLess(scored_with_penalty["final_score"], scored_without_penalty["final_score"])
+
+    def test_ranker_uses_negative_examples_and_clusters(self) -> None:
+        candidate = {
+            "arxiv_id": "2401.10001",
+            "title": "Candidate A",
+            "abstract": "retrieval augmented generation benchmark",
+            "categories": ["cs.CL"],
+            "published_date": "2024-01-01",
+            "_stored_vector": [0.0, 1.0, 0.0],
+        }
+        config = self.embedding_service.get_default_embedding_config()
+        example_profile = {
+            "version": "negative_feedback_profile_v1",
+            "enabled": True,
+            "mode": "examples",
+            "examples": [{"arxiv_id": "bad-1", "vector": [0.0, 1.0, 0.0]}],
+            "clusters": [],
+            "stats": {"mode": "examples", "usable_disliked": 1},
+        }
+        cluster_profile = {
+            "version": "negative_feedback_profile_v1",
+            "enabled": True,
+            "mode": "clusters",
+            "examples": [],
+            "clusters": [{"cluster_id": "negative_cluster_0", "cluster_label": 0, "centroid_vector": [0.0, 1.0, 0.0], "paper_ids": ["bad-1"], "paper_count": 1}],
+            "stats": {"mode": "clusters", "usable_disliked": 6},
+        }
+
+        scored_by_example = self.service._build_candidate_score(
+            candidate=dict(candidate),
+            liked_category_freq=Counter(),
+            user_vector=[1.0, 0.0, 0.0],
+            interest_clusters=[],
+            negative_feedback_profile=example_profile,
+            embedding_config=config,
+        )
+        scored_by_cluster = self.service._build_candidate_score(
+            candidate=dict(candidate),
+            liked_category_freq=Counter(),
+            user_vector=[1.0, 0.0, 0.0],
+            interest_clusters=[],
+            negative_feedback_profile=cluster_profile,
+            embedding_config=config,
+        )
+
+        self.assertEqual(scored_by_example["negative_feedback_match"]["source"], "negative_example")
+        self.assertEqual(scored_by_cluster["negative_feedback_match"]["source"], "negative_cluster")
+        self.assertGreater(scored_by_example["disliked_penalty"], 0.0)
+        self.assertGreater(scored_by_cluster["disliked_penalty"], 0.0)
+        self.assertLess(scored_by_example["negative_confidence"], scored_by_cluster["negative_confidence"])
+
+    def test_ranker_negative_feedback_uses_threshold_margin_and_confidence(self) -> None:
+        config = self.embedding_service.get_default_embedding_config()
+        base_candidate = {
+            "arxiv_id": "2401.10001",
+            "title": "Candidate A",
+            "abstract": "retrieval augmented generation benchmark",
+            "categories": ["cs.CL"],
+            "published_date": "2024-01-01",
+            "_stored_vector": [1.0, 0.0, 0.0],
+        }
+        low_negative_profile = {
+            "version": "negative_feedback_profile_v1",
+            "enabled": True,
+            "mode": "examples",
+            "examples": [{"arxiv_id": "bad-low", "vector": [0.0, 1.0, 0.0]}],
+            "clusters": [],
+            "stats": {"mode": "examples", "usable_disliked": 6},
+        }
+        weak_negative_profile = {
+            "version": "negative_feedback_profile_v1",
+            "enabled": True,
+            "mode": "examples",
+            "examples": [{"arxiv_id": "bad-weak", "vector": [1.0, 0.0, 0.0]}],
+            "clusters": [],
+            "stats": {"mode": "examples", "usable_disliked": 1},
+        }
+        full_negative_profile = {
+            **weak_negative_profile,
+            "stats": {"mode": "examples", "usable_disliked": 6},
+        }
+        near_threshold_profile = {
+            "version": "negative_feedback_profile_v1",
+            "enabled": True,
+            "mode": "examples",
+            "examples": [{"arxiv_id": "bad-near", "vector": [0.7, 0.714142842854285, 0.0]}],
+            "clusters": [],
+            "stats": {"mode": "examples", "usable_disliked": 6},
+        }
+
+        scored_low = self.service._build_candidate_score(
+            candidate=dict(base_candidate),
+            liked_category_freq=Counter(),
+            user_vector=[1.0, 0.0, 0.0],
+            interest_clusters=[],
+            negative_feedback_profile=low_negative_profile,
+            embedding_config=config,
+        )
+        scored_weak = self.service._build_candidate_score(
+            candidate=dict(base_candidate),
+            liked_category_freq=Counter(),
+            user_vector=[1.0, 0.0, 0.0],
+            interest_clusters=[],
+            negative_feedback_profile=weak_negative_profile,
+            embedding_config=config,
+        )
+        scored_full = self.service._build_candidate_score(
+            candidate=dict(base_candidate),
+            liked_category_freq=Counter(),
+            user_vector=[1.0, 0.0, 0.0],
+            interest_clusters=[],
+            negative_feedback_profile=full_negative_profile,
+            embedding_config=config,
+        )
+        scored_near_threshold = self.service._build_candidate_score(
+            candidate=dict(base_candidate),
+            liked_category_freq=Counter(),
+            user_vector=[1.0, 0.0, 0.0],
+            interest_clusters=[],
+            negative_feedback_profile=near_threshold_profile,
+            embedding_config=config,
+        )
+
+        self.assertEqual(scored_low["disliked_penalty"], 0.0)
+        self.assertFalse(scored_low["negative_penalty_applied"])
+        self.assertLess(scored_weak["disliked_penalty"], scored_full["disliked_penalty"])
+        self.assertGreater(scored_full["score_breakdown"]["negative_margin_penalty"], 0.0)
+        self.assertGreater(scored_full["disliked_penalty"], scored_near_threshold["disliked_penalty"])
+
+    def test_ranker_negative_hard_filter_is_config_gated(self) -> None:
+        config = self.embedding_service.get_default_embedding_config()
+        candidate = {
+            "arxiv_id": "2401.10001",
+            "title": "Candidate A",
+            "abstract": "retrieval augmented generation benchmark",
+            "categories": ["cs.CL"],
+            "published_date": "2024-01-01",
+            "_stored_vector": [1.0, 0.0, 0.0],
+        }
+        negative_profile = {
+            "version": "negative_feedback_profile_v1",
+            "enabled": True,
+            "mode": "examples",
+            "examples": [{"arxiv_id": "bad-hard", "vector": [1.0, 0.0, 0.0]}],
+            "clusters": [],
+            "stats": {"mode": "examples", "usable_disliked": 6},
+        }
+        negative_config = self.service.RECOMMENDATION_CONFIG["ranking"]["negative"]
+        original_config = dict(negative_config)
+        try:
+            negative_config["enable_hard_filter"] = False
+            soft_scored = self.service._build_candidate_score(
+                candidate=dict(candidate),
+                liked_category_freq=Counter(),
+                user_vector=[1.0, 0.0, 0.0],
+                interest_clusters=[],
+                negative_feedback_profile=negative_profile,
+                embedding_config=config,
+            )
+            negative_config["enable_hard_filter"] = True
+            hard_scored = self.service._build_candidate_score(
+                candidate=dict(candidate),
+                liked_category_freq=Counter(),
+                user_vector=[1.0, 0.0, 0.0],
+                interest_clusters=[],
+                negative_feedback_profile=negative_profile,
+                embedding_config=config,
+            )
+        finally:
+            negative_config.clear()
+            negative_config.update(original_config)
+
+        self.assertFalse(soft_scored["negative_hard_filter"])
+        self.assertTrue(hard_scored["negative_hard_filter"])
 
     def test_recommend_papers_applies_top_n_and_stable_fields(self) -> None:
         self.db_service.add_liked_paper(self.user_id, "2401.00001")
@@ -443,6 +727,45 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         self.assertTrue(result["recommendation_context"]["cold_start"])
         self.assertEqual(result["recommendations"][0]["arxiv_id"], "2401.40001")
         self.assertIn("recommendation_explanation", result["recommendations"][0])
+
+    def test_search_rerank_hard_excludes_disliked_papers(self) -> None:
+        self.db_service.add_disliked_paper(self.user_id, "2401.00003")
+        papers = [
+            {
+                "arxiv_id": "2401.00003",
+                "title": "Disliked Paper",
+                "abstract": "prompt engineering only",
+                "categories": ["cs.AI"],
+                "published_date": "2024-01-01",
+            },
+            {
+                "arxiv_id": "2401.50001",
+                "title": "Allowed Paper",
+                "abstract": "retrieval augmented generation",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-02",
+            },
+        ]
+        with mock.patch.object(
+            self.service,
+            "_get_or_refresh_interest_vector",
+            return_value={
+                "vector_data": [1.0, 0.0, 0.0],
+                "interest_clusters": [],
+                "negative_feedback_profile": {"version": "negative_feedback_profile_v1", "enabled": True, "mode": "none", "examples": [], "clusters": [], "stats": {}},
+                "profile_mode": "mean",
+                "cluster_count": 0,
+            },
+        ):
+            result = self.service.rerank_search_results_for_user(
+                user_id=self.user_id,
+                papers=papers,
+                query="retrieval",
+                top_n=2,
+            )
+
+        self.assertEqual(result["hard_excluded_count"], 1)
+        self.assertEqual([paper["arxiv_id"] for paper in result["papers"]], ["2401.50001"])
 
     def test_recommend_papers_raises_for_empty_liked_papers(self) -> None:
         with self.assertRaises(HTTPException) as ctx:

@@ -4,6 +4,7 @@ temp/*
 __pycache__/
 *.py[cod]
 *$py.class
+.codex/*
 
 *.db
 frontend/node_modules/

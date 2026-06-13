@@ -19,25 +19,17 @@ from pydantic import ValidationError
 
 from ..utils.search_spec_builder import ABSTRACT_HINT_PATTERNS
 from ..utils.text_utils import _extract_json_block, _matches_any, _normalize_text
+from ..intent_definitions import (
+    LLM_CLASSIFICATION_GUIDANCE,
+    LLM_INTENT_CHOICES,
+    NON_SEARCH_INTENTS,
+    PARSE_SUPPORTED_INTENTS,
+)
 
-SUPPORTED_INTENTS = {
-    "arxiv_search",
-    "paper_detail",
-    "paper_summary",
-    "paper_qa",
-    "recommendation",
-    "preference_action",
-    "unclear",
-    "unsupported",
-}
-
-NON_SEARCH_INTENTS = {
-    "paper_detail",
-    "paper_summary",
-    "paper_qa",
-    "recommendation",
-    "preference_action",
-}
+# intent 名单不再在此本地维护：单一事实来源在 ..intent_definitions。
+# SUPPORTED_INTENTS 兼容旧调用方名称，等于 parse 阶段可产出的意图全集（不含运行时 confirmation）。
+SUPPORTED_INTENTS = set(PARSE_SUPPORTED_INTENTS)
+# NON_SEARCH_INTENTS 直接复用 intent_definitions 中的派生集合（已 import）。
 
 LLM_CONFIDENCE_THRESHOLD = 0.55
 # 这里的 hard rule 只负责“高精度优先”的第一层拦截。
@@ -459,11 +451,11 @@ def _build_llm_prompt_with_profile(message: str, research_profile: Optional[Mapp
     return (
         "You are an intent parser for a natural-language arXiv paper agent.\n"
         "Return JSON only.\n"
-        "Classify the message into one of: arxiv_search, paper_detail, paper_summary, paper_qa, recommendation, preference_action, unclear, unsupported.\n"
+        f"Classify the message into one of: {', '.join(LLM_INTENT_CHOICES)}.\n"
         "If it is a search request, extract a structured search spec.\n"
         "Schema:\n"
         "{"
-        '\"intent\":\"arxiv_search|paper_detail|paper_summary|paper_qa|recommendation|preference_action|unclear|unsupported\",'
+        f'\"intent\":\"{"|".join(LLM_INTENT_CHOICES)}\",'
         '\"confidence\":0.0,'
         '\"query\":null|string,'
         '\"title_query\":null|string,'
@@ -482,11 +474,8 @@ def _build_llm_prompt_with_profile(message: str, research_profile: Optional[Mapp
         '\"next_actions\":[]'
         "}\n"
         "Guidance:\n"
-        "- If the user is asking to summarize/explain/QA a specific paper, do not classify as arxiv_search.\n"
-        "- If the user is expressing like/dislike or cancelling like/dislike about a specific paper, classify as preference_action.\n"
-        "- If the user asks to save/bookmark/add to a reading list/read later/list saved papers, classify as unsupported.\n"
-        "- If the user is asking for personalized recommendations, classify as recommendation.\n"
-        "- If the topic is too vague, classify as unclear.\n"
+        + "".join(f"- {line}\n" for line in LLM_CLASSIFICATION_GUIDANCE)
+        +
         f"Research profile hint: {profile_hint}\n"
         f"User message: {message}\n"
     )

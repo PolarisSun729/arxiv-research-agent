@@ -16,17 +16,10 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ..schemas import ArxivSearchSpec, get_default_agent_arxiv_categories
 from .text_utils import CHINESE_NUMBER_MAP, _matches_any, _normalize_optional_str, _normalize_text, _parse_small_chinese_number
+from ..intent_definitions import PARSE_SUPPORTED_INTENTS
 
-SUPPORTED_INTENTS = {
-    "arxiv_search",
-    "paper_detail",
-    "paper_summary",
-    "paper_qa",
-    "recommendation",
-    "preference_action",
-    "unclear",
-    "unsupported",
-}
+# intent 名单不再本地维护：单一事实来源在 ..intent_definitions。
+SUPPORTED_INTENTS = set(PARSE_SUPPORTED_INTENTS)
 
 TIME_PATTERNS: Sequence[Tuple[str, int]] = (
     (r"最近\s*(\d+)\s*天", -1),

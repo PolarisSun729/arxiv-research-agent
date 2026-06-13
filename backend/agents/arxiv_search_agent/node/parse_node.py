@@ -287,7 +287,6 @@ def _build_debug_payload(
     intent_source: str,
     llm_result: Optional[Dict[str, Any]],
     rule_result: Optional[Dict[str, Any]],
-    hard_rule_result: Optional[Dict[str, Any]],
     fallback_reason: Optional[str],
     final_search_spec: Optional[ArxivSearchSpec],
     search_spec_before_enrichment: Optional[Dict[str, Any]],
@@ -307,7 +306,6 @@ def _build_debug_payload(
         "intent_source": intent_source,
         "llm_result": llm_result,
         "rule_result": rule_result,
-        "hard_rule_result": hard_rule_result,
         "llm_confidence": llm_result.get("confidence") if isinstance(llm_result, dict) else None,
         "fallback_reason": fallback_reason,
         "final_search_spec": _compact_search_spec(final_search_spec),
@@ -607,7 +605,6 @@ def _write_parse_search_request_state(
     fallback_reason: Optional[str],
     llm_result: Optional[Dict[str, Any]],
     rule_result: Optional[Dict[str, Any]],
-    hard_rule_result: Optional[Dict[str, Any]],
     search_spec: Optional[ArxivSearchSpec],
     plan: Sequence[str],
     warnings: Sequence[str],
@@ -651,7 +648,6 @@ def _write_parse_search_request_state(
         intent_source=intent_source,
         llm_result=llm_result,
         rule_result=rule_result,
-        hard_rule_result=hard_rule_result,
         fallback_reason=fallback_reason,
         final_search_spec=search_spec,
         search_spec_before_enrichment=search_spec_before_enrichment,
@@ -699,7 +695,6 @@ def parse_search_request(
     message = prepared["message"]
     research_profile = prepared["research_profile"]
 
-    hard_rule_result: Optional[Dict[str, Any]] = None
     detector_result = _run_parse_search_request_detectors(
         message,
         generation_service=generation_service,
@@ -749,7 +744,6 @@ def parse_search_request(
         fallback_reason=finalized["fallback_reason"],
         llm_result=llm_result,
         rule_result=rule_result,
-        hard_rule_result=hard_rule_result,
         search_spec=finalized["search_spec"],
         plan=finalized["plan"],
         warnings=finalized["warnings"],

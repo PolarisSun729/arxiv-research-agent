@@ -170,6 +170,14 @@ export interface RecommendationScoreBreakdown {
   cluster_diversity_score?: number | null
   category_diversity_score?: number | null
   disliked_penalty?: number
+  positive_score?: number
+  negative_score?: number
+  negative_penalty?: number
+  negative_confidence?: number
+  negative_threshold_penalty?: number
+  negative_margin_penalty?: number
+  negative_penalty_applied?: boolean
+  negative_hard_filter?: boolean
 }
 
 export interface RecommendedPaper extends Paper {
@@ -193,6 +201,15 @@ export interface RecommendedPaper extends Paper {
     similarity?: number
   }>
   disliked_penalty?: number
+  negative_score?: number
+  negative_penalty?: number
+  negative_confidence?: number
+  negative_feedback_hit?: boolean
+  negative_penalty_applied?: boolean
+  negative_hard_filter?: boolean
+  negative_feedback_mode?: string
+  negative_feedback_match?: Record<string, any>
+  negative_feedback_debug?: Record<string, any>
   diversityDebug?: {
     diversity_reason?: string
     diversity_penalty_source?: string | null
@@ -269,6 +286,47 @@ export interface InterestClusterSummary {
   paper_ids: string[]
 }
 
+export interface NegativeFeedbackStats {
+  enabled: boolean
+  mode?: string
+  total_disliked: number
+  usable_disliked: number
+  unresolved_disliked: number
+  milvus_count: number
+  fallback_count: number
+  stored_examples: number
+  negative_cluster_count?: number
+  vector_available: boolean
+  participates_in_main_vector: boolean
+  fallback_reason?: string
+}
+
+export interface DislikedPaperExample {
+  arxiv_id: string
+  title?: string
+  categories?: string[]
+  vector?: number[]
+  vector_source?: string
+}
+
+export interface NegativeFeedbackCluster {
+  cluster_id: string
+  cluster_label?: number
+  centroid_vector: number[]
+  paper_count: number
+  paper_ids: string[]
+}
+
+export interface NegativeFeedbackProfile {
+  version: string
+  enabled: boolean
+  mode: string
+  hard_exclude_ids: string[]
+  examples: DislikedPaperExample[]
+  clusters: NegativeFeedbackCluster[]
+  stats: NegativeFeedbackStats
+}
+
 export interface InterestVector {
   user_id: string
   vector_data: number[]
@@ -279,6 +337,9 @@ export interface InterestVector {
   profile_mode?: string
   interest_clusters?: InterestClusterSummary[]
   disliked_vector_data?: number[] | null
+  disliked_paper_examples?: DislikedPaperExample[]
+  negative_feedback_stats?: NegativeFeedbackStats
+  negative_feedback_profile?: NegativeFeedbackProfile
   created_at: string
   updated_at: string
 }
@@ -291,8 +352,11 @@ export interface InterestVectorResult {
   milvus_used_count?: number
   fallback_used_count?: number
   unresolved_count?: number
+  total_signal_count?: number
+  feedback_used_count?: number
   liked_count?: number
   disliked_count?: number
+  raw_disliked_count?: number
   liked_milvus_count?: number
   disliked_milvus_count?: number
   liked_fallback_count?: number
@@ -303,6 +367,12 @@ export interface InterestVectorResult {
   embedding_model: string
   cluster_count?: number
   profile_mode?: string
+  disliked_vector_available?: boolean
+  disliked_paper_examples?: DislikedPaperExample[]
+  negative_feedback_stats?: NegativeFeedbackStats
+  negative_feedback_profile?: NegativeFeedbackProfile
+  negative_cluster_count?: number
+  negative_clusters?: NegativeFeedbackCluster[]
   cluster_summary?: Array<{
     cluster_id?: string
     paper_count?: number

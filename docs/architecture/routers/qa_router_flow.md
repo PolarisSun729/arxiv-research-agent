@@ -1288,7 +1288,7 @@ flowchart TD
 
 主调用链：
 
-`qa_paper() -> PaperQAService.answer_question() -> PaperQAService.build_qa_context() -> EnhancedRetrievalService.enhanced_retrieve() -> QueryPlanner.build_query_bundle() -> RouteRetriever.build_route_bundle() -> RerankService.llm_rerank() -> PaperQAService.build_generation_context() -> GenerationService.generate() -> PaperQAService.persist_completed_turn() -> DatabaseService.append_paper_chat_message()`
+`qa_paper() -> PaperQAService.answer_question() -> PaperQAService.build_qa_context() -> EnhancedRetrievalService.enhanced_retrieve() -> RetrievalPipeline.retrieve() -> QueryPlanner.build_query_bundle() -> RouteRetriever.build_route_bundle() -> RerankService.llm_rerank() -> PaperQAService.build_generation_context() -> GenerationService.generate() -> PaperQAService.persist_completed_turn() -> DatabaseService.append_paper_chat_message()`
 
 会话与上下文化链路：
 
@@ -1298,13 +1298,13 @@ flowchart TD
 
 检索链路：
 
-`EnhancedRetrievalService.enhanced_retrieve() -> QueryPlanner.build_query_bundle() -> EnhancedRetrievalService._build_query_views()`
+`EnhancedRetrievalService.enhanced_retrieve() -> RetrievalPipeline.retrieve() -> QueryPlanner.build_query_bundle() -> QueryPlanner.build_query_views()`
 
-`EnhancedRetrievalService.enhanced_retrieve() -> RouteRetriever.build_route_bundle() -> RouteRetriever._vector_retrieve() -> VectorStoreService.search_similar_vectors()`
+`EnhancedRetrievalService.enhanced_retrieve() -> RetrievalPipeline.retrieve() -> RouteRetriever.build_route_bundle() -> RouteRetriever.vector_retrieve() -> VectorStoreService.search_similar_vectors()`
 
-`EnhancedRetrievalService.enhanced_retrieve() -> RouteRetriever.build_route_bundle() -> RouteRetriever._keyword_retrieve() -> VectorStoreService.get_all_chunks()`
+`EnhancedRetrievalService.enhanced_retrieve() -> RetrievalPipeline.retrieve() -> RouteRetriever.build_route_bundle() -> RouteRetriever.keyword_retrieve() -> VectorStoreService.get_all_chunks()`
 
-`EnhancedRetrievalService.enhanced_retrieve() -> RouteRetriever.build_route_bundle() -> RouteRetriever._memory_retrieve() -> VectorStoreService.get_all_chunks()`
+`EnhancedRetrievalService.enhanced_retrieve() -> RetrievalPipeline.retrieve() -> RouteRetriever.build_route_bundle() -> RouteRetriever.memory_retrieve() -> VectorStoreService.get_all_chunks()`
 
 ### 输入
 

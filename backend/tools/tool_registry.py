@@ -29,6 +29,23 @@ class ToolSpec:
     result_tool_name: str | None = None
 
 
+# 工具别名表：别名 -> canonical 工具名。
+#
+# 历史上同一实现会用多个工具名各登记一份完整 ToolSpec（例如 record_user_paper_preference
+# 与 record_paper_preference 指向同一函数），导致注册表里出现重复条目、难以判断哪个是真名。
+# 现在统一用 alias map 表达“同义工具名”，注册表只保留 canonical ToolSpec，别名在 invoke 时
+# 解析到 canonical 名再执行；trace 仍保留 requested_tool_name 以便审计调用来源。
+TOOL_ALIASES: Dict[str, str] = {
+    "record_user_paper_preference": "record_paper_preference",
+    "remove_user_paper_preference": "remove_paper_preference",
+}
+
+
+def resolve_tool_name(tool_name: str) -> str:
+    """把可能的别名解析成 canonical 工具名；非别名原样返回。"""
+    return TOOL_ALIASES.get(tool_name, tool_name)
+
+
 def _normalize_tool_result(tool_name: str, spec: ToolSpec, result: Mapping[str, Any]) -> Dict[str, Any]:
     """Normalize tool outputs so every registry invocation returns the same envelope."""
     plain_result = dict(result)
@@ -49,6 +66,7 @@ def _normalize_tool_result(tool_name: str, spec: ToolSpec, result: Mapping[str, 
     )
 
 
+# 注册表只登记 canonical 工具：同义工具名统一走 TOOL_ALIASES 解析，不再复制多份 ToolSpec。
 TOOL_REGISTRY: Dict[str, ToolSpec] = {
     "search_arxiv_raw": ToolSpec(
         name="search_arxiv_raw",
@@ -80,26 +98,11 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         input_schema=RecordPaperPreferenceInput,
         func=recommendation_tools.record_paper_preference,
     ),
-    "record_user_paper_preference": ToolSpec(
-        name="record_user_paper_preference",
-        description="Record a user preference for a paper.",
-        input_schema=RecordPaperPreferenceInput,
-        func=recommendation_tools.record_paper_preference,
-        result_tool_name="record_paper_preference",
-    ),
-    "remove_user_paper_preference": ToolSpec(
-        name="remove_user_paper_preference",
-        description="Remove a user preference for a paper.",
-        input_schema=RemovePaperPreferenceInput,
-        func=recommendation_tools.remove_user_paper_preference,
-        result_tool_name="remove_paper_preference",
-    ),
     "remove_paper_preference": ToolSpec(
         name="remove_paper_preference",
         description="Remove a user preference for a paper.",
         input_schema=RemovePaperPreferenceInput,
         func=recommendation_tools.remove_user_paper_preference,
-        result_tool_name="remove_paper_preference",
     ),
     "check_paper_qa_index": ToolSpec(
         name="check_paper_qa_index",
@@ -141,8 +144,13 @@ def get_tool_names() -> list[str]:
     return list(TOOL_REGISTRY.keys())
 
 
+def get_tool_aliases() -> Dict[str, str]:
+    return dict(TOOL_ALIASES)
+
+
 def invoke_tool(tool_name: str, **kwargs: Any) -> Dict[str, Any]:
-    spec = TOOL_REGISTRY.get(tool_name)
+    canonical_name = resolve_tool_name(tool_name)
+    spec = TOOL_REGISTRY.get(canonical_name)
     if spec is None:
         return make_tool_result(
             ok=False,

@@ -137,19 +137,68 @@ VECTOR_STORE_CONFIG = {
 }
 
 
+RECOMMENDATION_PROFILE_CONFIG = {
+    "positive": {
+        "min_liked_for_vector": 1,
+        "min_liked_for_clustering": 4,
+        "max_interest_clusters": 4,
+        "clustering": {
+            "min_cluster_size": 2,
+            "min_samples": 1,
+            "metric": "cosine",
+            "cluster_selection_method": "eom",
+            "allow_single_cluster": True,
+        },
+    },
+    "negative": {
+        "enabled": True,
+        "store_disliked_examples": True,
+        "min_disliked_for_instance_feedback": 1,
+        "max_disliked_examples": 20,
+        "enable_negative_clustering": True,
+        "min_disliked_for_clustering": 4,
+        "max_negative_clusters": 4,
+        "clustering": {
+            "min_cluster_size": 2,
+            "min_samples": 1,
+            "metric": "cosine",
+            "cluster_selection_method": "eom",
+            "allow_single_cluster": True,
+        },
+        "fallback_to_examples_when_cluster_failed": True,
+    },
+}
+
+
 RECOMMENDATION_CLUSTERING_CONFIG = {
-    "hdbscan_min_cluster_size": 2,
-    "hdbscan_min_samples": 1,
-    "hdbscan_metric": "cosine",
-    "hdbscan_cluster_selection_method": "eom",
-    "hdbscan_allow_single_cluster": True,
+    **RECOMMENDATION_PROFILE_CONFIG["positive"]["clustering"],
+}
+
+
+RECOMMENDATION_RANKING_CONFIG = {
+    "negative": {
+        "enabled": True,
+        "similarity_threshold": 0.82,
+        "margin": 0.05,
+        "penalty_weight": 0.15,
+        "confidence_min_count": 6,
+        "max_penalty": 0.22,
+        "use_margin_penalty": True,
+        "use_threshold_penalty": True,
+        "hard_filter_threshold": 0.97,
+        "enable_hard_filter": False,
+        "debug_enabled": True,
+    },
 }
 
 
 RECOMMENDATION_CONFIG = {
     "backfill_request_interval_seconds": 8.0,
-    "min_liked_papers_for_clustering": 4,
-    "max_interest_clusters": 4,
+    "profile": RECOMMENDATION_PROFILE_CONFIG,
+    "ranking": RECOMMENDATION_RANKING_CONFIG,
+    "min_liked_papers_for_clustering": RECOMMENDATION_PROFILE_CONFIG["positive"]["min_liked_for_clustering"],
+    "max_interest_clusters": RECOMMENDATION_PROFILE_CONFIG["positive"]["max_interest_clusters"],
+    # deprecated: 负向反馈不再参与主兴趣向量生成，仅保留旧配置读取兼容。
     "negative_weight_default": 0.3,
     "default_top_n": 10,
     "default_max_age_months": 6,
@@ -158,6 +207,7 @@ RECOMMENDATION_CONFIG = {
         "semantic": 0.65,
         "category": 0.08,
         "recency": 0.05,
+        # deprecated: 负向扣分已迁移到 recommendation.ranking.negative.penalty_weight / max_penalty。
         "disliked_penalty": 0.15,
     },
     "semantic_similarity_penalty_threshold": 0.75,

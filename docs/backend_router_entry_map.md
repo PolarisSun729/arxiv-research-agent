@@ -84,7 +84,13 @@
 
 #### 4. 异常处理
 
-`main.py` 中没有看到全局异常处理器，例如 `@app.exception_handler(...)` 这类统一入口。当前异常处理主要分散在各个 router endpoint 内部，通过 `try/except` 将异常包装成 `HTTPException`。
+`main.py` 当前已经注册了全局异常处理器，包括：
+
+- `@app.exception_handler(AppError)`：统一返回项目约定的错误契约；
+- `@app.exception_handler(HTTPException)`：把 FastAPI/业务层抛出的 `HTTPException` 映射到统一错误结构；
+- `@app.exception_handler(RequestValidationError)`：把请求参数校验失败收敛为稳定的 422 错误响应。
+
+因此，router 内部仍然可能存在局部 `try/except`，但后端并不是“没有全局异常处理器”。
 
 #### 5. 启动事件 / 中间件 / 依赖注入边界
 
