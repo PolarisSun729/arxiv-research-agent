@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -15,6 +16,15 @@ from services.retrieval.collection_profile import CollectionRetrievalProfile
 
 logger = logging.getLogger(__name__)
 
+KEYWORD_FIELD_WEIGHTS = {
+    "body": 1.0,
+    "title": 1.35,
+    "section_title": 1.2,
+    "section_path": 0.85,
+    "asset_caption": 0.18,
+    "asset_aux": 0.08,
+}
+
 
 @dataclass
 class KeywordDocument:
@@ -25,6 +35,10 @@ class KeywordDocument:
     token_counts: Counter
     doc_length: int
     content_prefix: str
+    field_token_counts: Dict[str, Counter] = field(default_factory=dict)
+    field_lengths: Dict[str, int] = field(default_factory=dict)
+    token_sources: Dict[str, List[str]] = field(default_factory=dict)
+    keyword_document_debug: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -190,29 +204,32 @@ class CollectionRetrievalIndexProvider:
 
         for doc_id, chunk in enumerate(normalized_chunks):
             chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
-            allow_section_terms = self._asset_section_anchor_allowed_for_search_text(chunk, chunk_type)
-            text_parts = [
-                str(chunk.get("content", "") or ""),
-                str(chunk.get("title", "") or ""),
-                str(chunk.get("section_path", "") or "") if allow_section_terms else "",
-                str(chunk.get("section_title", "") or "") if allow_section_terms else "",
-                str(chunk.get("asset_summary", "") or ""),
-                str(chunk.get("asset_caption", "") or ""),
-                str(chunk.get("asset_preview_text", "") or ""),
-            ]
-            tokens = self.tokenizer(" ".join(text_parts))
-            token_counts = Counter(tokens)
+            keyword_document = self._build_keyword_document_fields(chunk, chunk_type)
+            field_token_counts = keyword_document["field_token_counts"]
+            token_sources = keyword_document["token_sources"]
+            field_lengths = keyword_document["field_lengths"]
+            # token_counts 保留兼容字段，但计数已按字段权重合成，避免图表 OCR 与正文等权进入 BM25。
+            token_counts = Counter()
+            for field_name, field_counts in field_token_counts.items():
+                weight = KEYWORD_FIELD_WEIGHTS.get(field_name, 1.0)
+                for token, count in field_counts.items():
+                    token_counts[token] += count * weight
             for token in token_counts:
                 document_frequency[token] += 1
                 postings[token].add(doc_id)
 
+            doc_length = max(int(round(sum(token_counts.values()))), 1)
             documents.append(
                 KeywordDocument(
                     doc_id=doc_id,
                     chunk=chunk,
                     token_counts=token_counts,
-                    doc_length=max(len(tokens), 1),
+                    doc_length=doc_length,
                     content_prefix=str(chunk.get("content", "") or "").lower()[:300],
+                    field_token_counts=field_token_counts,
+                    field_lengths=field_lengths,
+                    token_sources=token_sources,
+                    keyword_document_debug=keyword_document["debug"],
                 )
             )
             self._add_lookup_entries(
@@ -287,6 +304,103 @@ class CollectionRetrievalIndexProvider:
         if callable(resolver):
             return resolver(collection_name)
         return collection_name
+
+    def _build_keyword_document_fields(self, chunk: Dict[str, Any], chunk_type: str) -> Dict[str, Any]:
+        """构建字段化 keyword document，避免正文、结构字段和图表 OCR 噪声无差别混入索引。"""
+        field_texts: Dict[str, List[str]] = {
+            "body": [str(chunk.get("content", "") or "")],
+            "title": [],
+            "section_title": [],
+            "section_path": [],
+            "asset_caption": [],
+            "asset_aux": [],
+        }
+        skipped_fields: Dict[str, str] = {}
+
+        body_text = self._normalize_keyword_field_text(field_texts["body"][0])
+        title = str(chunk.get("title", "") or "")
+        if self._keyword_field_looks_noisy(title, field_name="title"):
+            skipped_fields["title"] = "noisy_or_too_short"
+        else:
+            field_texts["title"].append(title)
+
+        allow_section_terms = self._asset_section_anchor_allowed_for_search_text(chunk, chunk_type)
+        if allow_section_terms:
+            for field_name in ("section_title", "section_path"):
+                value = str(chunk.get(field_name, "") or "")
+                if self._keyword_field_looks_noisy(value, field_name=field_name):
+                    skipped_fields[field_name] = "noisy_or_too_short"
+                else:
+                    field_texts[field_name].append(value)
+        else:
+            # 图表 chunk 的弱章节锚点来自启发式匹配时不进入 keyword 索引，避免错误 section header 放大召回噪声。
+            skipped_fields["section_title"] = "asset_section_anchor_not_allowed"
+            skipped_fields["section_path"] = "asset_section_anchor_not_allowed"
+
+        for field_name, target_field in (("asset_caption", "asset_caption"), ("asset_summary", "asset_aux"), ("asset_preview_text", "asset_aux")):
+            value = str(chunk.get(field_name, "") or "")
+            if not value:
+                continue
+            normalized_value = self._normalize_keyword_field_text(value)
+            if normalized_value and normalized_value in body_text:
+                skipped_fields[field_name] = "duplicated_in_body"
+                continue
+            if self._keyword_field_looks_noisy(value, field_name=field_name):
+                skipped_fields[field_name] = "noisy_or_low_information"
+                continue
+            field_texts[target_field].append(value)
+
+        field_token_counts: Dict[str, Counter] = {}
+        field_lengths: Dict[str, int] = {}
+        token_sources: Dict[str, List[str]] = defaultdict(list)
+        for field_name, texts in field_texts.items():
+            tokens: List[str] = []
+            for text in texts:
+                tokens.extend(self.tokenizer(text))
+            if not tokens:
+                continue
+            counts = Counter(tokens)
+            field_token_counts[field_name] = counts
+            field_lengths[field_name] = len(tokens)
+            for token in counts:
+                token_sources[token].append(field_name)
+
+        return {
+            "field_token_counts": field_token_counts,
+            "field_lengths": field_lengths,
+            "token_sources": {token: list(sources) for token, sources in token_sources.items()},
+            "debug": {
+                "field_lengths": dict(field_lengths),
+                "field_weights": dict(KEYWORD_FIELD_WEIGHTS),
+                "skipped_fields": skipped_fields,
+                "has_asset_field": any(field in field_token_counts for field in ("asset_caption", "asset_aux")),
+            },
+        }
+
+    @staticmethod
+    def _normalize_keyword_field_text(text: str) -> str:
+        return " ".join(str(text or "").strip().lower().split())
+
+    @classmethod
+    def _keyword_field_looks_noisy(cls, text: str, *, field_name: str) -> bool:
+        """识别短标题、乱码和数值密集 preview，降低 OCR/版面解析污染进入 keyword 索引的概率。"""
+        normalized = cls._normalize_keyword_field_text(text)
+        if not normalized:
+            return True
+        alpha_cjk_count = len([char for char in normalized if char.isalnum() or "\u4e00" <= char <= "\u9fff"])
+        if alpha_cjk_count < 3:
+            return True
+        if re.search(r"[\ufffd�]", normalized):
+            return True
+        symbol_count = len(re.findall(r"[^a-z0-9\u4e00-\u9fff\s_\-./:]", normalized))
+        if symbol_count / max(len(normalized), 1) > 0.28:
+            return True
+        if field_name in {"asset_preview_text", "asset_summary"}:
+            digit_count = len(re.findall(r"\d", normalized))
+            # preview 中纯表格数值和 OCR 残片信息量低，只让结构化表格 route 负责精确数值问题。
+            if digit_count / max(len(normalized), 1) > 0.45:
+                return True
+        return False
 
     @staticmethod
     def _asset_section_anchor_allowed_for_search_text(chunk: Dict[str, Any], chunk_type: str) -> bool:

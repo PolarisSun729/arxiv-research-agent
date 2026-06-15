@@ -51,22 +51,74 @@ EN_STOPWORDS = {
 }
 
 ZH_STOPWORDS = {
-    "鐨?",
-    "浜?",
-    "鍚?",
-    "鍛?",
-    "璇?",
-    "杩欑瘒",
-    "璁烘枃",
-    "鏈枃",
-    "璇ユ枃",
-    "杩欎釜",
-    "閭ｄ釜",
-    "濡備綍",
-    "浠€涔?",
-    "鎬荤粨",
-    "璇存槑",
-    "涓€涓?",
+    "的",
+    "了",
+    "和",
+    "呢",
+    "请",
+    "这篇",
+    "论文",
+    "本文",
+    "该文",
+    "这个",
+    "那个",
+    "如何",
+    "什么",
+    "总结",
+    "说明",
+    "一个",
+    "一下",
+    "怎样",
+    "是什么",
+    "有哪些",
+}
+
+ZH_QUERY_EXPANSION = {
+    "方法": ["method", "methods", "approach"],
+    "流程": ["pipeline", "workflow", "procedure"],
+    "方法流程": ["method", "approach", "pipeline", "framework", "procedure"],
+    "框架": ["framework", "architecture"],
+    "架构": ["architecture", "framework"],
+    "模型": ["model"],
+    "算法": ["algorithm", "method"],
+    "训练": ["training"],
+    "推理": ["inference"],
+    "实验": ["experiment", "experiments", "evaluation"],
+    "实验设置": ["experiment", "experimental", "setup", "evaluation", "implementation"],
+    "设置": ["setup", "setting", "configuration"],
+    "评估": ["evaluation", "benchmark", "metric"],
+    "指标": ["metric", "metrics", "score"],
+    "数据": ["data", "dataset", "datasets"],
+    "数据集": ["dataset", "datasets", "corpus", "benchmark"],
+    "基准": ["benchmark", "baseline"],
+    "基线": ["baseline", "baselines"],
+    "对比": ["comparison", "compare", "baseline"],
+    "比较": ["comparison", "compare", "baseline"],
+    "消融": ["ablation"],
+    "结果": ["result", "results", "performance"],
+    "性能": ["performance", "result", "results"],
+    "贡献": ["contribution", "contributions", "novelty"],
+    "主要贡献": ["contribution", "contributions", "novelty", "key", "idea"],
+    "创新": ["innovation", "novelty", "contribution"],
+    "局限": ["limitation", "limitations", "weakness"],
+    "不足": ["limitation", "limitations", "weakness"],
+    "未来工作": ["future", "work", "limitations"],
+    "图": ["figure", "fig", "diagram"],
+    "表": ["table"],
+    "图表": ["figure", "table", "chart"],
+}
+
+EN_QUERY_EXPANSION = {
+    "dataset": ["datasets", "data", "corpus", "benchmark"],
+    "datasets": ["dataset", "data", "corpus", "benchmark"],
+    "baseline": ["baselines", "comparison", "experiment"],
+    "baselines": ["baseline", "comparison", "experiment"],
+    "method": ["methods", "approach", "pipeline", "framework"],
+    "methods": ["method", "approach", "pipeline", "framework"],
+    "limitation": ["limitations", "weakness", "future", "work"],
+    "limitations": ["limitation", "weakness", "future", "work"],
+    "contribution": ["contributions", "novelty", "innovation"],
+    "contributions": ["contribution", "novelty", "innovation"],
 }
 
 INTENT_RULES = {
@@ -80,11 +132,11 @@ INTENT_RULES = {
             "contributions",
             "finding",
             "findings",
-            "鏍稿績",
-            "鎬荤粨",
-            "璐＄尞",
-            "姒傝堪",
-            "瑕佺偣",
+            "核心",
+            "总结",
+            "贡献",
+            "概述",
+            "要点",
         ],
         "preferred_sections": ["abstract", "introduction", "conclusion"],
     },
@@ -98,12 +150,12 @@ INTENT_RULES = {
             "model",
             "training",
             "implementation",
-            "鏂规硶",
-            "妯″瀷",
-            "妗嗘灦",
-            "鏋舵瀯",
-            "璁粌",
-            "瀹炵幇",
+            "方法",
+            "模型",
+            "框架",
+            "架构",
+            "训练",
+            "实现",
         ],
         "preferred_sections": ["method", "approach", "model", "architecture"],
     },
@@ -118,10 +170,10 @@ INTENT_RULES = {
             "benchmarks",
             "metric",
             "metrics",
-            "瀹為獙",
-            "缁撴灉",
-            "璇勪及",
-            "鍩哄噯",
+            "实验",
+            "结果",
+            "评估",
+            "基准",
         ],
         "preferred_sections": ["experiment", "results", "evaluation", "ablation"],
     },
@@ -133,10 +185,10 @@ INTENT_RULES = {
             "comparison",
             "ablation",
             "compared",
-            "瀵规瘮",
-            "姣旇緝",
-            "鍩虹嚎",
-            "娑堣瀺",
+            "对比",
+            "比较",
+            "基线",
+            "消融",
         ],
         "preferred_sections": ["experiment", "results", "ablation"],
     },
@@ -147,10 +199,10 @@ INTENT_RULES = {
             "weakness",
             "future work",
             "failure",
-            "灞€闄?",
-            "闄愬埗",
-            "涓嶈冻",
-            "鏈潵宸ヤ綔",
+            "局限",
+            "限制",
+            "不足",
+            "未来工作",
         ],
         "preferred_sections": ["conclusion", "discussion", "limitations", "appendix"],
     },
@@ -161,10 +213,10 @@ INTENT_RULES = {
             "what is",
             "problem setup",
             "formulation",
-            "瀹氫箟",
-            "姒傚康",
-            "浠诲姟瀹氫箟",
-            "闂璁惧畾",
+            "定义",
+            "概念",
+            "任务定义",
+            "问题设定",
         ],
         "preferred_sections": ["introduction", "background", "method"],
     },
@@ -175,9 +227,9 @@ INTENT_RULES = {
             "corpus",
             "data",
             "training set",
-            "娴嬭瘯闆?",
-            "鏁版嵁闆?",
-            "璇枡",
+            "测试集",
+            "数据集",
+            "语料",
         ],
         "preferred_sections": ["experiment", "dataset", "data"],
     },
@@ -197,11 +249,11 @@ QUESTION_TYPE_RULES = {
             "architecture",
             "training",
             "inference",
-            "娴佺▼",
-            "鏂规硶",
-            "妗嗘灦",
-            "妯″瀷",
-            "绠楁硶",
+            "流程",
+            "方法",
+            "框架",
+            "模型",
+            "算法",
         ],
         "preferred_sections": ["method", "approach", "model", "architecture", "introduction"],
     },
@@ -216,11 +268,11 @@ QUESTION_TYPE_RULES = {
             "baseline",
             "metric",
             "implementation",
-            "瀹為獙",
-            "璁剧疆",
-            "鏁版嵁闆?",
-            "鍩哄噯",
-            "璇勪及",
+            "实验",
+            "设置",
+            "数据集",
+            "基准",
+            "评估",
         ],
         "preferred_sections": ["experiment", "evaluation", "dataset", "implementation"],
     },
@@ -233,10 +285,10 @@ QUESTION_TYPE_RULES = {
             "comparison",
             "baseline",
             "finding",
-            "缁撴灉",
-            "鎬ц兘",
-            "娑堣瀺",
-            "瀵规瘮",
+            "结果",
+            "性能",
+            "消融",
+            "对比",
         ],
         "preferred_sections": ["results", "experiment", "evaluation", "ablation"],
     },
@@ -247,9 +299,9 @@ QUESTION_TYPE_RULES = {
             "main idea",
             "innovation",
             "key idea",
-            "璐＄尞",
-            "鍒涙柊",
-            "鏍稿績鎬濇兂",
+            "贡献",
+            "创新",
+            "核心思想",
         ],
         "preferred_sections": ["abstract", "introduction", "conclusion"],
     },
@@ -260,26 +312,26 @@ QUESTION_TYPE_RULES = {
             "weakness",
             "future work",
             "failure",
-            "灞€闄?",
-            "涓嶈冻",
-            "鏈潵宸ヤ綔",
+            "局限",
+            "不足",
+            "未来工作",
         ],
         "preferred_sections": ["discussion", "conclusion", "limitations", "appendix"],
     },
     "dataset": {
-        "keywords": ["dataset", "datasets", "corpus", "benchmark", "data", "鏁版嵁闆?", "璇枡", "鍩哄噯"],
+        "keywords": ["dataset", "datasets", "corpus", "benchmark", "data", "数据集", "语料", "基准"],
         "preferred_sections": ["dataset", "experiment", "data"],
     },
     "metric": {
-        "keywords": ["metric", "metrics", "score", "formula", "objective", "鎸囨爣", "鍏紡", "璇勪环"],
+        "keywords": ["metric", "metrics", "score", "formula", "objective", "指标", "公式", "评价"],
         "preferred_sections": ["experiment", "method", "evaluation"],
     },
     "figure_table": {
-        "keywords": ["figure", "fig.", "table", "chart", "diagram", "鍥?", "琛?", "鍥捐〃"],
+        "keywords": ["figure", "fig.", "table", "chart", "diagram", "图", "表", "图表"],
         "preferred_sections": ["figure", "table", "results", "appendix"],
     },
     "summary": {
-        "keywords": ["summary", "summarize", "overview", "main", "abstract", "鎬荤粨", "姒傝堪", "涓昏"],
+        "keywords": ["summary", "summarize", "overview", "main", "abstract", "总结", "概述", "主要"],
         "preferred_sections": ["abstract", "introduction", "conclusion"],
     },
     "other": {
@@ -315,12 +367,71 @@ class RetrievalRules:
     def normalize_query_text(text: str) -> str:
         return re.sub(r"\s+", " ", text.strip().lower())
 
-    @staticmethod
-    def tokenize_for_keyword_search(text: str) -> List[str]:
+    @classmethod
+    def tokenize_for_keyword_search(cls, text: str) -> List[str]:
         lowered = text.lower()
         english_tokens = re.findall(r"[a-z0-9][a-z0-9_\-]{1,}", lowered)
-        chinese_tokens = re.findall(r"[\u4e00-\u9fff]{2,}", lowered)
-        return english_tokens + chinese_tokens
+        chinese_tokens: List[str] = []
+        for segment in re.findall(r"[\u4e00-\u9fff]{2,}", lowered):
+            chinese_tokens.extend(cls.split_chinese_keyword_segment(segment))
+        return [token for token in english_tokens + chinese_tokens if cls.is_informative_keyword_token(token)]
+
+    @staticmethod
+    def split_chinese_keyword_segment(segment: str) -> List[str]:
+        """轻量抽取论文 QA 常用中文短语，避免整句中文只形成一个不可命中的长 token。"""
+        normalized = str(segment or "").strip()
+        if not normalized:
+            return []
+        tokens: List[str] = []
+        for phrase in sorted(ZH_QUERY_EXPANSION, key=len, reverse=True):
+            if phrase in normalized and phrase not in tokens:
+                tokens.append(phrase)
+        # 已命中领域短语时不保留过长整句，防止“这篇论文的方法流程是怎样的”这类问句污染关键词。
+        if normalized not in tokens and not (tokens and len(normalized) > 8):
+            tokens.append(normalized)
+        return tokens
+
+    @staticmethod
+    def is_informative_keyword_token(token: str) -> bool:
+        """过滤 OCR/乱码/低信息量 token，避免噪声在 BM25 倒排表里被放大。"""
+        normalized = str(token or "").strip().lower()
+        if not normalized:
+            return False
+        if re.search(r"[\ufffd�]", normalized):
+            return False
+        if re.fullmatch(r"[_\-\d.]+", normalized):
+            return False
+        if len(normalized) <= 1:
+            return False
+        # 连续重复字符和符号占比过高通常来自 OCR 或版面解析污染，不适合作为关键词。
+        if re.search(r"(.)\1{4,}", normalized):
+            return False
+        symbol_count = len(re.findall(r"[^a-z0-9\u4e00-\u9fff_\-]", normalized))
+        if symbol_count / max(len(normalized), 1) > 0.3:
+            return False
+        return True
+
+    def expand_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
+        """把中文论文 QA 表达映射到英文论文术语，补齐中文问题到英文正文之间的词项桥接。"""
+        expanded: List[str] = []
+        token_set = set(tokens)
+        compact_query = "".join(token for token in tokens if re.search(r"[\u4e00-\u9fff]", token))
+        for token in tokens:
+            if token not in expanded:
+                expanded.append(token)
+            for synonym in EN_QUERY_EXPANSION.get(token, []):
+                if self.is_informative_keyword_token(synonym) and synonym not in expanded:
+                    expanded.append(synonym)
+            for synonym in ZH_QUERY_EXPANSION.get(token, []):
+                if self.is_informative_keyword_token(synonym) and synonym not in expanded:
+                    expanded.append(synonym)
+        # 正则分词会把连续中文问句作为一个片段；这里额外按子串触发常见问法扩展。
+        for phrase, synonyms in ZH_QUERY_EXPANSION.items():
+            if phrase in token_set or (compact_query and phrase in compact_query):
+                for synonym in synonyms:
+                    if self.is_informative_keyword_token(synonym) and synonym not in expanded:
+                        expanded.append(synonym)
+        return expanded
 
     def dedupe_terms(self, terms: List[str]) -> str:
         seen: List[str] = []
@@ -343,7 +454,11 @@ class RetrievalRules:
 
     def extract_query_keywords(self, tokens: List[str], limit: Optional[int] = None) -> List[str]:
         limit = int(limit or self.config["extract_query_keywords_limit"])
-        filtered = [token for token in tokens if token not in EN_STOPWORDS and token not in ZH_STOPWORDS]
+        filtered = [
+            token
+            for token in tokens
+            if self.is_informative_keyword_token(token) and token not in EN_STOPWORDS and token not in ZH_STOPWORDS
+        ]
         if not filtered:
             filtered = [token for token in tokens if len(token) > 1]
         seen: List[str] = []
@@ -355,7 +470,11 @@ class RetrievalRules:
     def extract_paper_terms_from_text(self, text: str, limit: Optional[int] = None) -> List[str]:
         limit = int(limit or self.config["extract_paper_terms_limit"])
         tokens = self.tokenize_for_keyword_search(text)
-        filtered = [token for token in tokens if token not in EN_STOPWORDS and token not in ZH_STOPWORDS]
+        filtered = [
+            token
+            for token in tokens
+            if self.is_informative_keyword_token(token) and token not in EN_STOPWORDS and token not in ZH_STOPWORDS
+        ]
         seen: List[str] = []
         for token in filtered:
             if token not in seen:

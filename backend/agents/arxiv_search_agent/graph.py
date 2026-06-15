@@ -9,7 +9,7 @@ from .node import parse_search_request
 from .planner import GoalBuilder, build_executable_plan_for_goal, build_plan_runtime
 from .plan_executor import PlanExecutor
 from .runtime_checkpoint import build_agent_checkpointer
-from .schemas import AgentRuntimeState, AgentStep, AgentTurnResult, PlanRuntime, StepExecutionResult
+from .schemas import AgentRuntimeState, AgentStep, AgentTurnResult, ExecutablePlan, PlanRuntime, StepExecutionResult
 from .state import AgentState
 from .tool_registry import PLANNER_TOOL_REGISTRY
 
@@ -486,47 +486,107 @@ def _display_step_status_from_plan_status(status: Optional[str], *, next_action:
     return "success"
 
 
-def _extract_arxiv_papers_from_outputs(outputs: Mapping[str, Any]) -> list[Dict[str, Any]]:
-    """从执行输出中提取可展示论文列表。
+# 产出可展示论文的工具，按优先级排列：个性化重排结果优先于原始检索结果。
+# 出站 papers 投影必须和 synthesize_arxiv_response 读取的来源一致，否则会出现
+# “回答说检索到 N 篇，但 papers 为空”的不一致。
+_PAPER_PRODUCING_TOOLS = ("personalize_paper_results", "search_arxiv")
 
-    LLM 计划不一定包含 personalize_paper_results；此时真实论文在 arxiv_results.papers，
-    出站适配仍要回填 state.papers，避免前端拿到“有回答但无卡片”的结果。
+
+def _papers_from_value(value: Any) -> list[Dict[str, Any]]:
+    """从任意工具输出形态中提取论文列表。
+
+    兼容 personalize_paper_results 的 ranked_papers、search_arxiv 的 papers，
+    以及后端 tool_result.data 包裹体，避免因输出包装层级不同而漏取。
     """
-
-    def _papers_from_value(value: Any) -> list[Dict[str, Any]]:
-        if isinstance(value, list):
-            return [dict(item) for item in value if isinstance(item, Mapping)]
-        if not isinstance(value, Mapping):
-            return []
-        papers = value.get("papers")
-        if isinstance(papers, list):
-            return [dict(item) for item in papers if isinstance(item, Mapping)]
-        data = value.get("data")
-        if isinstance(data, Mapping):
-            nested = _papers_from_value(data)
-            if nested:
-                return nested
-        tool_result = value.get("tool_result")
-        if isinstance(tool_result, Mapping):
-            nested = _papers_from_value(tool_result.get("data") if isinstance(tool_result.get("data"), Mapping) else tool_result)
-            if nested:
-                return nested
+    if isinstance(value, list):
+        return [dict(item) for item in value if isinstance(item, Mapping)]
+    if not isinstance(value, Mapping):
         return []
-
-    ranked = outputs.get("ranked_papers")
-    papers = _papers_from_value(ranked)
-    if papers:
-        return papers
-    arxiv_results = outputs.get("arxiv_results")
-    papers = _papers_from_value(arxiv_results)
-    if papers:
-        return papers
-    for output_key, value in outputs.items():
-        if str(output_key or "").startswith("arxiv_results"):
-            papers = _papers_from_value(value)
+    for papers_key in ("ranked_papers", "papers"):
+        sequence = value.get(papers_key)
+        if isinstance(sequence, list):
+            papers = [dict(item) for item in sequence if isinstance(item, Mapping)]
             if papers:
                 return papers
+    data = value.get("data")
+    if isinstance(data, Mapping):
+        nested = _papers_from_value(data)
+        if nested:
+            return nested
+    tool_result = value.get("tool_result")
+    if isinstance(tool_result, Mapping):
+        nested = _papers_from_value(tool_result.get("data") if isinstance(tool_result.get("data"), Mapping) else tool_result)
+        if nested:
+            return nested
     return []
+
+
+def _papers_output_keys_by_tool(plan: Optional[ExecutablePlan]) -> list[str]:
+    """按工具优先级解析出本轮真实承载论文的 output_key。
+
+    LLM planner 只锁定 tool_name，output_key 可任意命名；这里像 input_bindings 一样
+    通过 tool_name -> output_key 做确定性解析，使 papers 投影与回答口径一致，
+    不再依赖 output_key 字面量是否恰好叫 arxiv_results/ranked_papers。
+    """
+    if plan is None:
+        return []
+    ordered_keys: list[str] = []
+    for tool_name in _PAPER_PRODUCING_TOOLS:
+        for step in list(plan.steps or []):
+            if step.tool_name == tool_name and step.output_key and step.output_key not in ordered_keys:
+                ordered_keys.append(step.output_key)
+    return ordered_keys
+
+
+def _extract_arxiv_papers_from_outputs(
+    outputs: Mapping[str, Any],
+    *,
+    plan: Optional[ExecutablePlan] = None,
+) -> list[Dict[str, Any]]:
+    """从执行输出中提取可展示论文列表。
+
+    解析优先级：
+    1. 按 plan 中 papers 工具（personalize/search）的真实 output_key 取值，与回答口径对齐；
+    2. 退回固定 output_key（ranked_papers/arxiv_results），兼容规则型 planner；
+    3. 最后对全部 outputs 做一次兜底扫描，避免 LLM 任意命名导致“有回答无卡片”。
+    """
+    for output_key in _papers_output_keys_by_tool(plan):
+        papers = _papers_from_value(outputs.get(output_key))
+        if papers:
+            return papers
+
+    for fixed_key in ("ranked_papers", "arxiv_results"):
+        papers = _papers_from_value(outputs.get(fixed_key))
+        if papers:
+            return papers
+
+    for value in outputs.values():
+        papers = _papers_from_value(value)
+        if papers:
+            return papers
+    return []
+
+
+def _warn_if_answer_claims_unprojected_papers(state: AgentState, result: AgentTurnResult) -> None:
+    """当回答声称检索到论文、但 papers 投影为空时，记录关键诊断日志。
+
+    这是“回答正常但 Paper 展示区为空”不一致的最后一道哨兵：正常情况下不应触发；
+    若触发，日志会带上 output_keys 与 result_count，便于定位是哪种工具输出形态没被识别。
+    """
+    quality = result.outputs.get("arxiv_result_quality") if isinstance(result.outputs, Mapping) else None
+    result_count = int(quality.get("result_count") or 0) if isinstance(quality, Mapping) else 0
+    if result_count <= 0 and not state.papers:
+        return
+    if state.papers:
+        return
+    logger.warning(
+        "arxiv_agent papers projection empty while answer implies results: "
+        "intent=%s result_count=%s output_keys=%s plan_tools=%s",
+        state.intent,
+        result_count,
+        sorted(dict(result.outputs or {}).keys()),
+        [step.tool_name for step in list((result.plan.steps if result.plan else []) or [])],
+    )
 
 
 def _apply_turn_result(state: AgentState, result: AgentTurnResult) -> None:
@@ -579,9 +639,11 @@ def _apply_turn_result(state: AgentState, result: AgentTurnResult) -> None:
         state.paper_qa_result = _build_paper_qa_result(state, paper_qa_result)
         if state.paper_qa_result.get("answer"):
             state.answer = str(state.paper_qa_result.get("answer") or "")
-    arxiv_papers = _extract_arxiv_papers_from_outputs(result.outputs)
+    arxiv_papers = _extract_arxiv_papers_from_outputs(result.outputs, plan=result.plan or state.execution_plan)
     if arxiv_papers:
         state.papers = arxiv_papers
+    else:
+        _warn_if_answer_claims_unprojected_papers(state, result)
     runtime = state.plan_runtime
     state.runtime_state = _runtime_state_from_runtime(state, runtime) if runtime is not None else state.runtime_state
 

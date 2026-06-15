@@ -80,6 +80,217 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertIn("chunk-figure-table", [item["chunk_id"] for item in keyword_hits[:3]])
         figure_hit = next(item for item in keyword_hits if item["chunk_id"] == "chunk-figure-table")
         self.assertEqual(figure_hit["chunk_type"], "figure")
+        self.assertTrue(figure_hit["keyword_hit_asset_field"])
+
+    def test_keyword_route_expands_chinese_method_query_and_reports_fields(self) -> None:
+        bundle = self._build_route_bundle("这篇论文的方法流程是怎样的？", enable_hyde=False)
+        keyword_debug = bundle["keyword_debug"]
+        keyword_hits = bundle["routes"]["keyword"]
+
+        self.assertTrue(keyword_hits)
+        self.assertEqual(keyword_hits[0]["chunk_id"], "chunk-method")
+        self.assertIn("method", keyword_debug["expanded_tokens"])
+        self.assertIn("pipeline", keyword_debug["expanded_tokens"])
+        self.assertIn("body", keyword_hits[0]["keyword_match_fields"])
+        self.assertFalse(keyword_hits[0]["keyword_hit_asset_field"])
+        self.assertEqual(keyword_debug["matched_chunks"][0]["chunk_id"], "chunk-method")
+        self.assertIn("body", keyword_debug["matched_chunks"][0]["matched_fields"])
+
+    def test_keyword_route_expands_english_plural_dataset_query(self) -> None:
+        bundle = self._build_route_bundle("What datasets are used?", enable_hyde=False)
+        keyword_debug = bundle["keyword_debug"]
+        keyword_hits = bundle["routes"]["keyword"]
+
+        self.assertTrue(keyword_hits)
+        self.assertEqual(keyword_hits[0]["chunk_id"], "chunk-dataset")
+        self.assertIn("dataset", keyword_debug["expanded_tokens"])
+        self.assertIn("corpus", keyword_debug["expanded_tokens"])
+
+    def test_keyword_route_downweights_asset_chunks_for_non_figure_query(self) -> None:
+        bundle = self._build_route_bundle("What is the method pipeline?", enable_hyde=False)
+        keyword_hits = bundle["routes"]["keyword"]
+
+        self.assertTrue(keyword_hits)
+        self.assertEqual(keyword_hits[0]["chunk_id"], "chunk-method")
+        top_asset_hits = [item for item in keyword_hits[:2] if item.get("chunk_type") in {"figure", "table"}]
+        self.assertEqual(top_asset_hits, [])
+
+    def test_keyword_route_debug_contains_query_view_contributions(self) -> None:
+        bundle = self._build_route_bundle("What datasets are used?", enable_hyde=False)
+        keyword_debug = bundle["keyword_debug"]
+        top_hit = bundle["routes"]["keyword"][0]
+
+        self.assertEqual(top_hit["chunk_id"], "chunk-dataset")
+        self.assertTrue(keyword_debug["query_views"])
+        self.assertEqual(keyword_debug["keyword_fusion_strategy"], "weighted_rrf")
+        self.assertTrue(keyword_debug["query_contributions"])
+        self.assertIn("view_contributions", keyword_debug["matched_chunks"][0])
+        self.assertIn("rank", keyword_debug["matched_chunks"][0]["view_contributions"][0])
+        self.assertIn("rrf_vote", keyword_debug["matched_chunks"][0]["view_contributions"][0])
+        self.assertIn("keyword_query_contributions", top_hit)
+        self.assertGreater(top_hit["route_score"], 0.0)
+
+    def test_keyword_route_dedupes_high_similarity_query_views(self) -> None:
+        query_bundle = self.service.query_planner.build_query_bundle(
+            user_query="What is the method pipeline?",
+            collection_name=self.collection_name,
+            enable_query_rewrite=True,
+        )
+        query_bundle["query_views"]["selected_queries"] = [
+            "method pipeline framework",
+            "framework method pipeline",
+            "method pipeline framework component",
+        ]
+        bundle = self.service.route_retriever.build_route_bundle(
+            collection_name=self.collection_name,
+            user_query="What is the method pipeline?",
+            query_profile=query_bundle["query_profile"],
+            query_views=query_bundle["query_views"],
+            options=self.options,
+            enable_hyde=False,
+            enable_keyword_search=True,
+            enable_table_structured_route=False,
+            recall_candidate_limit=6,
+        )
+        query_views = bundle["keyword_debug"]["query_views"]
+        rewrite_views = [item for item in query_views if item["source"] == "rewrite"]
+
+        self.assertLessEqual(len(rewrite_views), 2)
+
+    def test_keyword_route_rewrite_count_does_not_linearly_boost_keyword_score(self) -> None:
+        query_bundle = self.service.query_planner.build_query_bundle(
+            user_query="What is the method pipeline?",
+            collection_name=self.collection_name,
+            enable_query_rewrite=True,
+        )
+        sparse_views = dict(query_bundle["query_views"])
+        sparse_views["selected_queries"] = ["method pipeline framework"]
+        dense_views = dict(query_bundle["query_views"])
+        dense_views["selected_queries"] = [
+            "method pipeline framework",
+            "method pipeline architecture",
+            "framework method pipeline",
+            "method approach pipeline",
+        ]
+
+        sparse_bundle = self.service.route_retriever.build_route_bundle(
+            collection_name=self.collection_name,
+            user_query="What is the method pipeline?",
+            query_profile=query_bundle["query_profile"],
+            query_views=sparse_views,
+            options=self.options,
+            enable_hyde=False,
+            enable_keyword_search=True,
+            enable_table_structured_route=False,
+            recall_candidate_limit=6,
+        )
+        dense_bundle = self.service.route_retriever.build_route_bundle(
+            collection_name=self.collection_name,
+            user_query="What is the method pipeline?",
+            query_profile=query_bundle["query_profile"],
+            query_views=dense_views,
+            options=self.options,
+            enable_hyde=False,
+            enable_keyword_search=True,
+            enable_table_structured_route=False,
+            recall_candidate_limit=6,
+        )
+
+        sparse_score = sparse_bundle["routes"]["keyword"][0]["route_score"]
+        dense_score = dense_bundle["routes"]["keyword"][0]["route_score"]
+        self.assertEqual(sparse_bundle["routes"]["keyword"][0]["chunk_id"], "chunk-method")
+        self.assertEqual(dense_bundle["routes"]["keyword"][0]["chunk_id"], "chunk-method")
+        self.assertLess(dense_score, sparse_score * 1.35)
+
+    def test_keyword_result_exposes_bm25_matched_terms_with_idf_and_fields(self) -> None:
+        bundle = self._build_route_bundle("Which datasets and benchmark corpus are used?", enable_hyde=False)
+        top_hit = bundle["routes"]["keyword"][0]
+
+        self.assertEqual(top_hit["chunk_id"], "chunk-dataset")
+        self.assertGreater(top_hit["bm25_raw_score"], 0.0)
+        self.assertGreater(top_hit["bm25_fused_score"], 0.0)
+        matched_terms = top_hit["keyword_matched_terms"]
+        self.assertTrue(matched_terms)
+        tokens = {term["token"] for term in matched_terms}
+        self.assertIn("dataset", tokens)
+        for term in matched_terms:
+            self.assertIn("idf", term)
+            self.assertIn("fields", term)
+            self.assertGreaterEqual(term["idf"], 0.0)
+        dataset_term = next(term for term in matched_terms if term["token"] == "dataset")
+        self.assertIn("body", dataset_term["fields"])
+        self.assertTrue(top_hit["keyword_query_sources"])
+        self.assertEqual(top_hit["keyword_noise_flags"], [])
+
+    def test_keyword_debug_matched_chunks_carry_terms_and_noise_flags(self) -> None:
+        bundle = self._build_route_bundle("Which datasets and benchmark corpus are used?", enable_hyde=False)
+        matched = bundle["keyword_debug"]["matched_chunks"][0]
+
+        self.assertEqual(matched["chunk_id"], "chunk-dataset")
+        self.assertIn("matched_terms", matched)
+        self.assertIn("query_sources", matched)
+        self.assertIn("noise_flags", matched)
+        self.assertIn("base_route_confidence", bundle["keyword_debug"])
+        term = matched["matched_terms"][0]
+        self.assertIn("token", term)
+        self.assertIn("idf", term)
+
+    def test_keyword_confidence_downweighted_for_overview_versus_method(self) -> None:
+        overview = self._build_route_bundle(
+            "Give an overview and summary of the paper's main contributions.",
+            enable_hyde=False,
+        )
+        method = self._build_route_bundle("What is the method pipeline and framework?", enable_hyde=False)
+
+        overview_conf = overview["routes"]["keyword"][0]["route_confidence"]
+        method_conf = method["routes"]["keyword"][0]["route_confidence"]
+        overview_base = overview["routes"]["keyword"][0]["keyword_base_route_confidence"]
+        method_base = method["routes"]["keyword"][0]["keyword_base_route_confidence"]
+
+        # overview 问题降权后 keyword confidence 应低于其自身基线，并低于 method 问题。
+        self.assertLess(overview_conf, overview_base)
+        self.assertGreaterEqual(method_conf, method_base)
+        self.assertLess(overview_conf, method_conf)
+
+    def test_keyword_confidence_drops_when_only_low_idf_token_matches(self) -> None:
+        bundle = self._build_route_bundle(
+            "Give an overview and summary of the paper's main contributions.",
+            enable_hyde=False,
+        )
+        keyword_hits = bundle["routes"]["keyword"]
+        section_only = [
+            hit
+            for hit in keyword_hits
+            if len(hit["keyword_matched_terms"]) == 1 and hit["keyword_matched_terms"][0]["idf"] < 1.2
+        ]
+        self.assertTrue(section_only, "expected at least one chunk matching only a low-idf generic token")
+        weak_hit = section_only[0]
+        full_hit = next(hit for hit in keyword_hits if len(hit["keyword_matched_terms"]) > 1)
+        self.assertLess(weak_hit["route_confidence"], full_hit["route_confidence"])
+
+    def test_keyword_bm25_does_not_dominate_final_context_for_overview(self) -> None:
+        result = self.service.enhanced_retrieve(
+            user_query="Give an overview and summary of the paper's main contributions.",
+            collection_name=self.collection_name,
+            options=self.modules["enhanced"].RetrievalOptions(debug=True, enable_llm_rerank=False),
+        )
+        stages = result["debug"]["stages"]
+        final_routes = [item.get("retrieval_route") for item in stages["final_context_top15"]]
+        self.assertTrue(final_routes)
+        # overview 问题里 BM25-only 命中不应主导最终上下文，向量召回必须保留主导地位。
+        self.assertGreater(
+            sum(1 for route in final_routes if route and route.startswith("vector")),
+            sum(1 for route in final_routes if route == "keyword"),
+        )
+
+    def test_keyword_method_question_supplements_vector_with_exact_term_chunk(self) -> None:
+        bundle = self._build_route_bundle("What is the method pipeline and framework?", enable_hyde=False)
+        keyword_ids = [hit["chunk_id"] for hit in bundle["routes"]["keyword"]]
+
+        self.assertIn("chunk-method", keyword_ids)
+        method_hit = next(hit for hit in bundle["routes"]["keyword"] if hit["chunk_id"] == "chunk-method")
+        method_tokens = {term["token"] for term in method_hit["keyword_matched_terms"]}
+        self.assertTrue({"method", "pipeline", "framework"} & method_tokens)
 
     def test_table_structured_route_hits_specific_max_cell_for_metric_question(self) -> None:
         bundle = self._build_route_bundle(

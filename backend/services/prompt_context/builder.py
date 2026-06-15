@@ -81,7 +81,9 @@ class PromptContextBuilder:
                 (
                     "You are a strict academic QA assistant. Answer only from RAG evidence in the RAG evidence section. "
                     "Use user memory, session summary, and recent turns only to understand the question, preferences, and continuity. "
-                    "If RAG evidence is insufficient, say you cannot determine it from the provided evidence."
+                    "If RAG evidence is insufficient, say you cannot determine it from the provided evidence. "
+                    "When the question asks about table values, rankings, increases, decreases, or differences, prefer structured Table Evidence blocks "
+                    "over table summaries or previews, and cite the table row, column, value, unit, operation, and source_id."
                 ),
                 priority=1,
             ),
@@ -96,7 +98,15 @@ class PromptContextBuilder:
                 priority=6,
             ),
         ]
-        return self._assemble(sections)
+        assembly = self._assemble(sections)
+        context_debug = context_pack.get("context_budget_debug") if isinstance(context_pack.get("context_budget_debug"), Mapping) else {}
+        if isinstance(context_debug, Mapping):
+            # prompt debug 只暴露结构化表格证据计数，不复制完整 cell，避免 debug 体积膨胀。
+            assembly["debug"]["table_evidence_count"] = int(context_debug.get("table_evidence_count") or 0)
+            assembly["debug"]["table_cell_evidence_count"] = int(context_debug.get("table_cell_evidence_count") or 0)
+            assembly["debug"]["table_numeric_operations"] = list(context_debug.get("table_numeric_operations") or [])
+            assembly["debug"]["table_numeric_calculation_used"] = bool(context_debug.get("table_numeric_calculation_used", False))
+        return assembly
 
     def build_question_contextualization_context(
         self,
@@ -159,6 +169,9 @@ class PromptContextBuilder:
                 "metadata": {
                     "assembled_section_order": list((assembly.get("debug") or {}).get("section_order") or []),
                     "original_generation_search_result_count": len(list(context_pack.get("generation_search_results") or [])),
+                    "table_evidence_count": (assembly.get("debug") or {}).get("table_evidence_count", 0),
+                    "table_cell_evidence_count": (assembly.get("debug") or {}).get("table_cell_evidence_count", 0),
+                    "table_numeric_calculation_used": (assembly.get("debug") or {}).get("table_numeric_calculation_used", False),
                 },
             }
         ]

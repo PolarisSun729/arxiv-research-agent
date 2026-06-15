@@ -525,6 +525,90 @@ class PaperQAServiceComponentTests(unittest.TestCase):
         self.assertIn("chunk_type", source_payload[2])
         self.assertTrue(truncated.endswith("..."))
 
+    def test_structured_table_evidence_enters_prompt_sources_and_numeric_verifier(self) -> None:
+        table_result = {
+            "chunk_id": "chunk-table-results",
+            "original_chunk_id": "orig-table-results",
+            "chunk_type": "table",
+            "asset_kind": "table",
+            "asset_summary": "Table 2 Main results on the benchmark.",
+            "asset_preview_text": "Full model 87.5 | w/o memory 84.1",
+            "table_id": "paper-table-2",
+            "page_number": 5,
+            "section_path": "Results/Ablation",
+            "source": "table-source",
+            "table_structured_evidence": {
+                "table_id": "paper-table-2",
+                "matched_rows": ["Full model", "w/o memory"],
+                "matched_columns": ["Accuracy"],
+                "matched_cells": [
+                    {
+                        "row_index": 0,
+                        "row_label": "Full model",
+                        "col_name": "Accuracy",
+                        "raw_value": "87.5",
+                        "normalized_value": 87.5,
+                        "unit": "%",
+                        "confidence": 0.94,
+                    },
+                    {
+                        "row_index": 1,
+                        "row_label": "w/o memory",
+                        "col_name": "Accuracy",
+                        "raw_value": "84.1",
+                        "normalized_value": 84.1,
+                        "unit": "%",
+                        "confidence": 0.92,
+                    },
+                ],
+                "evidence_type": "cell_comparison",
+                "numeric_operation": "difference",
+                "computed_value": 3.4,
+                "confidence": 0.91,
+            },
+        }
+
+        context_pack = self.service.context_pack_builder.build([table_result])
+        source_payload = context_pack["source_payload"]
+        text_context = context_pack["text_context"]
+
+        self.assertTrue(source_payload[0]["source_id"].startswith("table-structured-paper-table-2-chunk-table-results"))
+        self.assertIn("Table Evidence:", text_context)
+        self.assertIn("table_id: paper-table-2", text_context)
+        self.assertIn("matched row: Full model, w/o memory", text_context)
+        self.assertIn("matched column: Accuracy", text_context)
+        self.assertIn("value: 87.5", text_context)
+        self.assertIn("difference = 3.4", text_context)
+        self.assertIn("source chunk: chunk-table-results", text_context)
+        self.assertIn("Table Supplemental Context:", text_context)
+        self.assertEqual(source_payload[0]["table_cell_citations"][1]["row_label"], "w/o memory")
+        self.assertEqual(context_pack["context_budget_debug"]["table_evidence_count"], 1)
+        self.assertEqual(context_pack["context_budget_debug"]["table_cell_evidence_count"], 2)
+        self.assertTrue(context_pack["context_budget_debug"]["table_numeric_calculation_used"])
+
+        prompt_assembly = self.service.answer_generator.prompt_context_builder.build_paper_qa_final_answer_context(
+            question="Ablation 里去掉 memory 后下降多少？",
+            contextualized_question="Ablation 里去掉 memory 后下降多少？",
+            context_pack=context_pack,
+        )
+        self.assertIn("prefer structured Table Evidence blocks", prompt_assembly["text"])
+        self.assertEqual(prompt_assembly["debug"]["table_evidence_count"], 1)
+        self.assertEqual(prompt_assembly["debug"]["table_cell_evidence_count"], 2)
+
+        passed = self.service.evidence_verifier.verify(
+            answer=f"去掉 memory 后下降 3.4 个点，来源 {source_payload[0]['source_id']}。",
+            sources=source_payload,
+        )
+        self.assertEqual(passed["status"], "passed")
+        self.assertEqual(passed["unsupported_numeric_values"], [])
+
+        failed = self.service.evidence_verifier.verify(
+            answer="去掉 memory 后下降 3.7 个点。",
+            sources=source_payload,
+        )
+        self.assertEqual(failed["status"], "insufficient_evidence")
+        self.assertIn("answer_numeric_value_not_in_table_evidence", failed["warnings"])
+
     def test_answer_question_success_generates_answer_and_persists_turn(self) -> None:
         self._insert_index(status="indexed")
         session = self._create_session(session_id="qa-success")

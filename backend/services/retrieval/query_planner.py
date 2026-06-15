@@ -639,6 +639,9 @@ class QueryPlanner:
     def build_query_keywords(self, queries: List[str], limit: Optional[int] = None) -> List[str]:
         return self.retrieval_rules.build_query_keywords(queries, limit=limit)
 
+    def expand_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
+        return self.retrieval_rules.expand_keyword_query_tokens(tokens)
+
     def build_query_term_details(self, queries: List[str]) -> List[Dict[str, Any]]:
         return self.retrieval_rules.build_query_term_details(queries)
 

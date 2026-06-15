@@ -1,0 +1,70 @@
+{
+  "description": "BM25 召回回归观察集。每条 case 固定一个问题与意图类别，用于对比 BM25 修改前后召回是否更干净、更稳定。expected_* 字段是软期望，runner 仅做提示，不作为硬断言。",
+  "cases": [
+    {
+      "id": "zh_method_flow",
+      "category": "method",
+      "question": "这篇论文的方法流程是怎样的？",
+      "expected_top_chunk": "chunk-method",
+      "bm25_should_supplement_vector": true,
+      "notes": "中文方法流程问题，期望 BM25 命中 method/pipeline 等精确术语 chunk。"
+    },
+    {
+      "id": "en_method_flow",
+      "category": "method",
+      "question": "What is the method pipeline and framework of the paper?",
+      "expected_top_chunk": "chunk-method",
+      "bm25_should_supplement_vector": true,
+      "notes": "英文方法流程问题。"
+    },
+    {
+      "id": "en_experiment_setup",
+      "category": "experiment",
+      "question": "What experimental setup and evaluation metrics are used?",
+      "expected_top_chunk": "chunk-experiment",
+      "bm25_should_supplement_vector": true,
+      "notes": "实验设置问题，期望命中 experiment/evaluation/metric。"
+    },
+    {
+      "id": "en_baseline_ablation",
+      "category": "comparison",
+      "question": "What baselines are compared and what does the ablation study show?",
+      "expected_top_chunk": "chunk-results",
+      "bm25_should_supplement_vector": true,
+      "notes": "baseline / ablation 问题，期望命中 baseline/ablation/comparison。"
+    },
+    {
+      "id": "en_dataset",
+      "category": "dataset",
+      "question": "Which datasets and benchmark corpus are used?",
+      "expected_top_chunk": "chunk-dataset",
+      "bm25_should_supplement_vector": true,
+      "notes": "数据集问题。"
+    },
+    {
+      "id": "en_figure_table",
+      "category": "figure_table",
+      "question": "What do Figure 2 and Table 3 show about the results?",
+      "expected_top_chunk": "chunk-figure-table",
+      "bm25_should_supplement_vector": true,
+      "asset_fields_should_be_active": true,
+      "notes": "图表问题，期望图表字段发挥作用。"
+    },
+    {
+      "id": "en_overview",
+      "category": "summary",
+      "question": "Give an overview and summary of the paper's main contributions.",
+      "expected_top_chunk": null,
+      "bm25_should_not_dominate_vector": true,
+      "notes": "overview/summary 问题，BM25 不应压过向量召回。"
+    },
+    {
+      "id": "en_limitation",
+      "category": "limitation",
+      "question": "What are the limitations and weaknesses discussed in the paper?",
+      "expected_top_chunk": "chunk-limitation",
+      "bm25_should_supplement_vector": true,
+      "notes": "limitation 问题。"
+    }
+  ]
+}

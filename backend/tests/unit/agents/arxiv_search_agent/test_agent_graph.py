@@ -158,6 +158,100 @@ class AgentGraphFlowTests(unittest.TestCase):
         self.assertEqual(len(state.papers), 1)
         self.assertEqual(state.papers[0]["arxiv_id"], "2606.00001")
 
+    def test_apply_turn_result_projects_papers_for_llm_named_output_key(self) -> None:
+        # 复现间歇性 bug：experimental LLM planner 把 search_arxiv 的 output_key
+        # 命名成非 arxiv_results/ranked_papers 的任意名字（这里用 my_search_hits）。
+        # 回答可以通过 input_bindings 正常读到论文数，但旧投影只认固定字面量 key，
+        # 导致 state.papers 为空 -> 前端“有回答无卡片”。
+        PlanStep = schemas.PlanStep
+        ToolSpec = schemas.ToolSpec
+        plan = ExecutablePlan(
+            plan_id="arxiv_search:llm_draft",
+            goal=Goal(goal_type="arxiv_search"),
+            steps=[
+                PlanStep(
+                    step_id="search_arxiv",
+                    action_type="search",
+                    tool_name="search_arxiv",
+                    tool=ToolSpec(tool_name="search_arxiv"),
+                    output_key="my_search_hits",
+                ),
+                PlanStep(
+                    step_id="synthesize_arxiv_response",
+                    action_type="answer",
+                    tool_name="synthesize_arxiv_response",
+                    tool=ToolSpec(tool_name="synthesize_arxiv_response"),
+                    output_key="final_answer",
+                ),
+            ],
+        )
+        state = AgentState(intent="arxiv_search", message="帮我找最近 7 天关于 RAG 的 5 篇论文")
+        result = schemas.AgentTurnResult(
+            status="success",
+            final_answer="已检索到 2 篇相关 arXiv 论文",
+            plan=plan,
+            outputs={
+                "my_search_hits": {
+                    "papers": [
+                        {"arxiv_id": "2606.00001", "title": "RAG Agents in Practice"},
+                        {"arxiv_id": "2606.00002", "title": "Agentic Retrieval"},
+                    ],
+                    "tool_result": {"ok": True},
+                },
+                "final_answer": "已检索到 2 篇相关 arXiv 论文",
+            },
+            trace=[],
+        )
+
+        graph_module._apply_turn_result(state, result)
+
+        # papers 必须与回答口径一致地稳定回填，无论 LLM 把 output_key 取成什么名字。
+        self.assertEqual(len(state.papers), 2)
+        self.assertEqual(
+            [paper["arxiv_id"] for paper in state.papers],
+            ["2606.00001", "2606.00002"],
+        )
+
+    def test_apply_turn_result_prefers_ranked_papers_over_raw_search_output(self) -> None:
+        # 同时存在原始检索与个性化重排时，papers 应取个性化结果，避免展示未重排的旧顺序。
+        PlanStep = schemas.PlanStep
+        ToolSpec = schemas.ToolSpec
+        plan = ExecutablePlan(
+            plan_id="arxiv_search:llm_draft",
+            goal=Goal(goal_type="arxiv_search"),
+            steps=[
+                PlanStep(
+                    step_id="search_arxiv",
+                    action_type="search",
+                    tool_name="search_arxiv",
+                    tool=ToolSpec(tool_name="search_arxiv"),
+                    output_key="raw_hits",
+                ),
+                PlanStep(
+                    step_id="personalize_paper_results",
+                    action_type="rerank",
+                    tool_name="personalize_paper_results",
+                    tool=ToolSpec(tool_name="personalize_paper_results"),
+                    output_key="reranked",
+                ),
+            ],
+        )
+        state = AgentState(intent="arxiv_search", message="找 RAG 论文")
+        result = schemas.AgentTurnResult(
+            status="success",
+            final_answer="已检索到 2 篇相关 arXiv 论文",
+            plan=plan,
+            outputs={
+                "raw_hits": {"papers": [{"arxiv_id": "raw-1"}, {"arxiv_id": "raw-2"}]},
+                "reranked": {"ranked_papers": [{"arxiv_id": "ranked-1"}, {"arxiv_id": "ranked-2"}]},
+            },
+            trace=[],
+        )
+
+        graph_module._apply_turn_result(state, result)
+
+        self.assertEqual([paper["arxiv_id"] for paper in state.papers], ["ranked-1", "ranked-2"])
+
     def test_apply_turn_result_keeps_consumed_confirmation_result_but_clears_pending_snapshot(self) -> None:
         state = AgentState(
             intent="paper_qa",
