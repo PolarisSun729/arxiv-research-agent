@@ -76,11 +76,15 @@ class RerankService:
     def build_rerank_document_text(self, chunk: Dict[str, object]) -> str:
         chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
         if chunk_type in {"figure", "table"}:
+            match_type = str(chunk.get("asset_section_match_type", "") or "").strip()
+            allow_section_anchor = bool(chunk.get("asset_section_match_allow_embedding")) if match_type else True
+            # 新 asset 会显式标记弱章节锚点是否可入文本；旧数据缺字段时继续沿用历史 rerank 行为。
             parts = [
                 str(chunk.get("asset_summary", "") or "").strip(),
+                str(chunk.get("table_structured_text", "") or "").strip(),
                 str(chunk.get("asset_preview_text", "") or "").strip(),
-                str(chunk.get("section_title", "") or "").strip(),
-                str(chunk.get("section_path", "") or "").strip(),
+                str(chunk.get("section_title", "") or "").strip() if allow_section_anchor else "",
+                str(chunk.get("section_path", "") or "").strip() if allow_section_anchor else "",
                 f"page {chunk.get('page_number') or chunk.get('page_range') or ''}".strip(),
             ]
             content = "\n".join(part for part in parts if part).strip()

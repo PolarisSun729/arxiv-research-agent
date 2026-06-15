@@ -27,6 +27,7 @@ class RouteRetriever:
         generation_service: Any,
         query_tools: Any,
         fusion_service: Any,
+        table_structured_retriever: Any,
         route_confidence_builder: Any,
         structural_bonus_builder: Any,
         chunk_normalizer: Any,
@@ -39,6 +40,7 @@ class RouteRetriever:
         self.generation_service = generation_service
         self.query_tools = query_tools
         self.fusion_service = fusion_service
+        self.table_structured_retriever = table_structured_retriever
         self.route_confidence_builder = route_confidence_builder
         self.structural_bonus_builder = structural_bonus_builder
         self.chunk_normalizer = chunk_normalizer
@@ -53,6 +55,7 @@ class RouteRetriever:
                 "vector_rewrite": ENHANCED_RETRIEVAL_CONFIG.get("route_timeout_vector_rewrite_seconds", 8),
                 "vector_hyde": ENHANCED_RETRIEVAL_CONFIG.get("route_timeout_vector_hyde_seconds", 8),
                 "keyword": ENHANCED_RETRIEVAL_CONFIG.get("route_timeout_keyword_seconds", 4),
+                "table_structured": ENHANCED_RETRIEVAL_CONFIG.get("route_timeout_table_structured_seconds", 3),
                 "memory_context": ENHANCED_RETRIEVAL_CONFIG.get("route_timeout_memory_context_seconds", 3),
             },
             max_workers=ENHANCED_RETRIEVAL_CONFIG.get("route_max_workers", 4),
@@ -68,6 +71,7 @@ class RouteRetriever:
         options: RetrievalOptions,
         enable_hyde: bool,
         enable_keyword_search: bool,
+        enable_table_structured_route: bool,
         recall_candidate_limit: int,
         collection_profile: Optional[CollectionRetrievalProfile] = None,
         collection_retrieval_index: Optional[CollectionRetrievalIndex] = None,
@@ -227,6 +231,40 @@ class RouteRetriever:
             keyword_result = {"debug": collection_retrieval_index.to_keyword_debug(0, full_scan_used=False)}
             route_metrics["keyword"] = {"enabled": False, "applied": False, "status": "disabled", "latency_ms": 0.0, "candidate_count": 0, "error": "", "fallback_reason": "disabled", "cache_hit": bool(collection_retrieval_index.cache_hit), "timeout": False}
 
+        if enable_table_structured_route:
+            table_structured_debug_holder: Dict[str, Any] = {}
+
+            def run_table_structured_route() -> List[Dict[str, Any]]:
+                table_payload = self.table_structured_retrieve(
+                    user_query=user_query,
+                    query_profile=query_profile,
+                    top_k=recall_candidate_limit,
+                    retrieval_index=collection_retrieval_index,
+                )
+                table_structured_debug_holder.update(table_payload["debug"])
+                return table_payload["results"]
+
+            table_exec = self.route_executor.run(
+                "table_structured",
+                run_table_structured_route,
+                required=False,
+                cache_hit=bool(collection_retrieval_index.cache_hit),
+            )
+            routes["table_structured"] = table_exec.results
+            table_structured_debug = dict(table_structured_debug_holder)
+            route_metrics["table_structured"] = table_exec.to_metric()
+        else:
+            routes["table_structured"] = []
+            table_structured_debug = {
+                "enabled": False,
+                "triggered_terms": [],
+                "candidate_tables": [],
+                "matched_tables": [],
+                "matched_cells": [],
+                "reason": "disabled",
+            }
+            route_metrics["table_structured"] = {"enabled": False, "applied": False, "status": "disabled", "latency_ms": 0.0, "candidate_count": 0, "error": "", "fallback_reason": "disabled", "cache_hit": bool(collection_retrieval_index.cache_hit), "timeout": False}
+
         memory_context = options.memory_context or {}
         memory_retrieval_enabled = bool(self.memory_flag_reader("enable_memory_aware_retrieval", True))
         if memory_retrieval_enabled:
@@ -274,6 +312,10 @@ class RouteRetriever:
             "keywords": self.query_tools.build_query_keywords(keyword_queries),
             **keyword_result["debug"],
         }
+        table_structured_debug = {
+            "enabled": bool(enable_table_structured_route and table_structured_debug.get("enabled", False)),
+            **table_structured_debug,
+        }
         memory_debug = {
             "enabled": memory_retrieval_enabled,
             "applied": bool(memory_retrieval_enabled and memory_context.get("enabled", False) and routes["memory_context"]),
@@ -291,6 +333,7 @@ class RouteRetriever:
             "hyde_text": hyde_text,
             "hyde_debug": hyde_debug,
             "keyword_debug": keyword_debug,
+            "table_structured_debug": table_structured_debug,
             "memory_debug": memory_debug,
             "collection_profile": collection_profile.to_debug() if collection_profile else None,
             "route_metrics": route_metrics,
@@ -593,6 +636,34 @@ class RouteRetriever:
             score += min(0.28, overlap / max(len(query_keywords[:10]), 1) * 0.28)
         score += max(0.0, float(self.structural_bonus_builder(chunk, query_profile)))
         return min(1.4, score)
+
+    def table_structured_retrieve(
+        self,
+        *,
+        user_query: str,
+        query_profile: QueryProfile,
+        top_k: int,
+        retrieval_index: CollectionRetrievalIndex,
+    ) -> Dict[str, Any]:
+        """对结构化表格索引执行精确匹配，并转成统一 route 结果格式。"""
+        payload = self.table_structured_retriever.retrieve(
+            user_query=user_query,
+            query_profile=query_profile,
+            retrieval_index=retrieval_index,
+            top_k=top_k,
+        )
+        raw_results = list(payload.get("results") or [])
+        route_confidence = self.route_confidence_builder(
+            "table_structured",
+            query_profile,
+            user_query,
+            route_queries=[user_query, query_profile.evidence_query, query_profile.keyword_query],
+            intent_profile=query_profile.intent_profile,
+        )
+        return {
+            "results": self.normalize_route_results(raw_results, "table_structured", user_query, route_confidence, query_profile),
+            "debug": payload.get("debug") or {},
+        }
 
     @staticmethod
     def bm25_score(

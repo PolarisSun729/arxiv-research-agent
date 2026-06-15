@@ -2,6 +2,7 @@ import unittest
 from unittest import mock
 
 from tests.helpers import build_retrieval_service, build_sample_chunks
+from services.paper_qa.context_pack_builder import ContextPackBuilder
 
 
 class _FakeReranker:
@@ -32,6 +33,30 @@ class RerankServiceTests(unittest.TestCase):
 
         self.assertIn("Figure 2 compares model performance", text)
         self.assertIn("page 6", text)
+
+    def test_low_confidence_asset_section_does_not_enter_rerank_or_context_text(self) -> None:
+        figure_chunk = dict(self.service._normalize_chunk(self.sample_chunks[5]))
+        figure_chunk.update(
+            {
+                "section_title": "Wrong Section",
+                "section_path": "9 Wrong Section",
+                "asset_abs_path": "figure-low.png",
+                "asset_section_match_type": "heuristic",
+                "asset_section_match_confidence": 0.32,
+                "asset_section_match_reason": "basis=page_range+order_index; embedding_anchor=metadata_only",
+                "asset_section_match_is_heuristic": True,
+                "asset_section_match_allow_embedding": False,
+            }
+        )
+
+        rerank_text = self.service.rerank_service.build_rerank_document_text(figure_chunk)
+        context_pack = ContextPackBuilder().build([figure_chunk])
+
+        self.assertNotIn("Wrong Section", rerank_text)
+        self.assertNotIn("Wrong Section", context_pack["text_context"])
+        self.assertEqual(context_pack["source_payload"][0]["section_path"], "9 Wrong Section")
+        self.assertEqual(context_pack["source_payload"][0]["asset_section_match_type"], "heuristic")
+        self.assertFalse(context_pack["asset_metadata"][0]["asset_section_match_allow_embedding"])
 
     def test_rerank_success_changes_chunk_order(self) -> None:
         chunks = [
@@ -80,9 +105,13 @@ class RerankServiceTests(unittest.TestCase):
         self.assertEqual([item["chunk_id"] for item in result["chunks"]], ["chunk-method", "chunk-results"])
 
     def test_noisy_section_penalty_penalizes_appendix_and_references(self) -> None:
-        appendix_chunk = self.service._normalize_chunk(self.sample_chunks[6])
-        references_chunk = self.service._normalize_chunk(self.sample_chunks[7])
-        method_chunk = self.service._normalize_chunk(self.sample_chunks[0])
+        chunks_by_id = {}
+        for chunk in self.sample_chunks:
+            normalized_chunk = self.service._normalize_chunk(chunk)
+            chunks_by_id[normalized_chunk["chunk_id"]] = normalized_chunk
+        appendix_chunk = chunks_by_id["chunk-appendix"]
+        references_chunk = chunks_by_id["chunk-references"]
+        method_chunk = chunks_by_id["chunk-method"]
 
         appendix_bonus = self.service._compute_structural_bonus(appendix_chunk, self.query_profile)
         references_bonus = self.service._compute_structural_bonus(references_chunk, self.query_profile)

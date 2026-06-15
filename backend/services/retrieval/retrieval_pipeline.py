@@ -90,12 +90,14 @@ class RetrievalPipeline:
             options=options,
             enable_hyde=runtime["enable_hyde"],
             enable_keyword_search=runtime["enable_keyword_search"],
+            enable_table_structured_route=runtime["enable_table_structured_route"],
             recall_candidate_limit=runtime["recall_candidate_limit"],
             collection_profile=collection_profile,
             collection_retrieval_index=collection_retrieval_index,
         )
         routes = route_bundle["routes"]
         memory_debug = route_bundle["memory_debug"]
+        table_structured_debug = route_bundle["table_structured_debug"]
         collection_profile_debug = route_bundle.get("collection_profile") or collection_profile.to_debug()
         route_metrics = dict(route_bundle.get("route_metrics") or {})
         embedding_batch_debug = route_bundle.get("embedding_batch") or {}
@@ -152,6 +154,7 @@ class RetrievalPipeline:
                 hyde_text=route_bundle["hyde_text"],
                 hyde_debug=route_bundle["hyde_debug"],
                 keyword_debug=route_bundle["keyword_debug"],
+                table_structured_debug=table_structured_debug,
                 memory_debug=memory_debug,
                 collection_profile=collection_profile_debug,
                 route_metrics=route_metrics,
@@ -177,6 +180,7 @@ class RetrievalPipeline:
                     "enable_query_rewrite": runtime["enable_query_rewrite"],
                     "enable_hyde": runtime["enable_hyde"],
                     "enable_keyword_search": runtime["enable_keyword_search"],
+                    "enable_table_structured_route": runtime["enable_table_structured_route"],
                     "enable_llm_rerank": runtime["enable_llm_rerank"],
                     "enable_context_expansion": runtime["enable_context_expansion"],
                     "context_budget_max_chars": runtime["context_budget_max_chars"],
@@ -203,6 +207,7 @@ class RetrievalPipeline:
                 "enable_query_rewrite": runtime["enable_query_rewrite"],
                 "enable_hyde": runtime["enable_hyde"],
                 "enable_keyword_search": runtime["enable_keyword_search"],
+                "enable_table_structured_route": runtime["enable_table_structured_route"],
                 "enable_llm_rerank": runtime["enable_llm_rerank"],
                 "enable_context_expansion": runtime["enable_context_expansion"],
                 "debug": runtime["debug_enabled"],
@@ -212,6 +217,7 @@ class RetrievalPipeline:
             rerank_query=rerank_query,
             query_views=query_views,
             hyde_debug=route_bundle["hyde_debug"],
+            table_structured_debug=table_structured_debug,
             collection_profile=collection_profile_debug,
             route_metrics=route_metrics,
             embedding_batch=embedding_batch_debug,
@@ -333,6 +339,10 @@ class RetrievalPipeline:
             "enable_query_rewrite": self.option_resolver(options.enable_query_rewrite, self.retrieval_config["enable_query_rewrite"]),
             "enable_hyde": self.option_resolver(options.enable_hyde, self.retrieval_config["enable_hyde"]),
             "enable_keyword_search": self.option_resolver(options.enable_keyword_search, self.retrieval_config["enable_keyword_search"]),
+            "enable_table_structured_route": self.option_resolver(
+                options.enable_table_structured_route,
+                self.retrieval_config.get("enable_table_structured_route", self.enhanced_config.get("enable_table_structured_route", True)),
+            ),
             "enable_llm_rerank": self.option_resolver(options.enable_llm_rerank, self.retrieval_config.get("enable_llm_rerank", False)),
             "enable_context_expansion": self.option_resolver(options.enable_context_expansion, self.enhanced_config.get("enable_context_expansion", True)),
             "debug_enabled": self.option_resolver(options.debug, self.retrieval_config["debug"]),

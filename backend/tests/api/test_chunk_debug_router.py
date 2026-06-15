@@ -24,7 +24,11 @@ class ChunkDebugRouterApiTests(unittest.TestCase):
             "chunks": [
                 {
                     "content": "x" * (chunk_router.CONTENT_PREVIEW_CHARS + 20),
-                    "metadata": {"chunk_id": 1, "source": r"D:\internal\papers\paper.pdf"},
+                    "metadata": {
+                        "chunk_id": 1,
+                        "source": r"D:\internal\papers\paper.pdf",
+                        "asset_json_path": r"D:\internal\assets\table.json",
+                    },
                 }
             ],
             "embeddings": [
@@ -72,6 +76,7 @@ class ChunkDebugRouterApiTests(unittest.TestCase):
         self.assertEqual(data["pdf_path"], "paper.pdf")
         self.assertEqual(data["pages"], "[redacted: raw pages omitted from debug API]")
         self.assertEqual(data["chunks"][0]["metadata"]["source"], "paper.pdf")
+        self.assertEqual(data["chunks"][0]["metadata"]["asset_json_path"], "table.json")
         self.assertLess(len(data["chunks"][0]["content"]), chunk_router.CONTENT_PREVIEW_CHARS + 50)
         self.assertEqual(data["embeddings"][0]["embedding"], {"redacted": True, "vector_length": 3})
         self.assertEqual(data["embeddings"][0]["metadata"]["filename"], "sample.json")

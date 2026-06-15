@@ -17,6 +17,7 @@ class RouteRetrieverTests(unittest.TestCase):
         enable_query_rewrite: bool = True,
         enable_hyde: bool = True,
         enable_keyword_search: bool = True,
+        enable_table_structured_route: bool = True,
     ):
         query_bundle = self.service.query_planner.build_query_bundle(
             user_query=question,
@@ -31,6 +32,7 @@ class RouteRetrieverTests(unittest.TestCase):
             options=self.options,
             enable_hyde=enable_hyde,
             enable_keyword_search=enable_keyword_search,
+            enable_table_structured_route=enable_table_structured_route,
             recall_candidate_limit=6,
         )
 
@@ -78,6 +80,64 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertIn("chunk-figure-table", [item["chunk_id"] for item in keyword_hits[:3]])
         figure_hit = next(item for item in keyword_hits if item["chunk_id"] == "chunk-figure-table")
         self.assertEqual(figure_hit["chunk_type"], "figure")
+
+    def test_table_structured_route_hits_specific_max_cell_for_metric_question(self) -> None:
+        bundle = self._build_route_bundle(
+            "表 2 中最高的 accuracy 是多少？",
+            enable_hyde=False,
+            enable_keyword_search=False,
+            enable_table_structured_route=True,
+        )
+
+        table_hits = bundle["routes"]["table_structured"]
+        self.assertTrue(table_hits)
+        top_hit = table_hits[0]
+        self.assertEqual(top_hit["chunk_id"], "chunk-table-results")
+        self.assertEqual(top_hit["retrieval_route"], "table_structured")
+        self.assertEqual(top_hit["table_structured_evidence"]["numeric_operation"], "max")
+        self.assertEqual(top_hit["table_structured_evidence"]["matched_rows"], ["Ours"])
+        self.assertEqual(top_hit["table_structured_evidence"]["matched_columns"], ["Accuracy"])
+        self.assertEqual(top_hit["table_structured_evidence"]["matched_cells"][0]["raw_value"], "89.2%")
+        self.assertTrue(bundle["table_structured_debug"]["enabled"])
+        self.assertEqual(bundle["table_structured_debug"]["matched_tables"][0]["table_id"], "paper-table-2")
+
+    def test_table_structured_route_computes_difference_for_ablation_question(self) -> None:
+        bundle = self._build_route_bundle(
+            "ablation 里去掉 memory 后下降多少？",
+            enable_hyde=False,
+            enable_keyword_search=False,
+            enable_table_structured_route=True,
+        )
+
+        table_hits = bundle["routes"]["table_structured"]
+        self.assertTrue(table_hits)
+        evidence = table_hits[0]["table_structured_evidence"]
+        self.assertEqual(evidence["numeric_operation"], "difference")
+        self.assertEqual(evidence["matched_rows"], ["w/o memory", "Ours"])
+        self.assertEqual(evidence["matched_columns"], ["Accuracy"])
+        self.assertAlmostEqual(float(evidence["computed_value"]), 0.031, places=6)
+        self.assertEqual(len(evidence["matched_cells"]), 2)
+
+    def test_table_structured_route_prefers_structured_evidence_in_fusion(self) -> None:
+        bundle = self._build_route_bundle(
+            "表 2 中最高的 accuracy 是多少？",
+            enable_hyde=False,
+            enable_keyword_search=False,
+            enable_table_structured_route=True,
+        )
+
+        fused = self.service._fuse_routes(
+            bundle["routes"],
+            top_k=6,
+            query_profile=self.service.query_planner.build_query_bundle(
+                user_query="表 2 中最高的 accuracy 是多少？",
+                collection_name=self.collection_name,
+                enable_query_rewrite=True,
+            )["query_profile"],
+        )
+
+        self.assertEqual(fused[0]["chunk_id"], "chunk-table-results")
+        self.assertIn("table_structured", fused[0]["matched_routes"])
 
     def test_multi_route_rrf_fusion_dedupes_and_preserves_scores(self) -> None:
         query_bundle = self.service.query_planner.build_query_bundle(

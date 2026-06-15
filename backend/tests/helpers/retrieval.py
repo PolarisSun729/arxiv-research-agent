@@ -103,6 +103,7 @@ def load_retrieval_modules() -> Dict[str, Any]:
             "enable_query_rewrite": True,
             "enable_hyde": True,
             "enable_keyword_search": True,
+            "enable_table_structured_route": True,
             "enable_llm_rerank": False,
             "debug": True,
             "rrf_k": 20,
@@ -112,6 +113,7 @@ def load_retrieval_modules() -> Dict[str, Any]:
                 "vector_rewrite": 0.9,
                 "vector_hyde": 0.75,
                 "keyword": 0.8,
+                "table_structured": 1.0,
                 "memory_context": 0.7,
             },
         }
@@ -250,6 +252,27 @@ def build_sample_chunks() -> List[Dict[str, Any]]:
             },
         },
         {
+            "content": "Table evidence\nTable 2: Main results on LongBench\nModel: Baseline-A; Accuracy: 82.5%; F1: 0.71 | Model: Baseline-B; Accuracy: 84.7%; F1: 0.76 | Model: Ours; Accuracy: 89.2%; F1: 0.81 | Model: w/o memory; Accuracy: 86.1%; F1: 0.78",
+            "metadata": {
+                "chunk_id": "chunk-table-results",
+                "parent_chunk_id": "parent-table-results",
+                "original_chunk_id": "parent-table-results",
+                "page_number": 6,
+                "page_range": "6",
+                "section_title": "Results",
+                "section_path": "5 Results/Table 2",
+                "source": "paper.pdf",
+                "chunk_type": "table",
+                "asset_kind": "table",
+                "asset_path": "table-2.csv",
+                "asset_summary": "Table 2: Main results on LongBench.",
+                "asset_preview_text": "Model: Baseline-A; Accuracy: 82.5% | Model: Baseline-B; Accuracy: 84.7% | Model: Ours; Accuracy: 89.2% | Model: w/o memory; Accuracy: 86.1%",
+                "asset_caption": "Table 2: Main results on LongBench",
+                "order_index": 7,
+                "table_id": "paper-table-2",
+            },
+        },
+        {
             "content": "Appendix prompt template: the prompt text is long and mostly implementation detail.",
             "metadata": {
                 "chunk_id": "chunk-appendix",
@@ -277,6 +300,47 @@ def build_sample_chunks() -> List[Dict[str, Any]]:
                 "order_index": 8,
             },
         },
+    ]
+
+
+def build_sample_structured_tables() -> List[Dict[str, Any]]:
+    return [
+        {
+            "table_id": "paper-table-2",
+            "caption": "Table 2: Main results on LongBench",
+            "section_path": "5 Results/Table 2",
+            "section_title": "Results",
+            "page_number": 6,
+            "columns": ["Model", "Accuracy", "F1"],
+            "rows": [
+                {"Model": "Baseline-A", "Accuracy": "82.5%", "F1": "0.71"},
+                {"Model": "Baseline-B", "Accuracy": "84.7%", "F1": "0.76"},
+                {"Model": "Ours", "Accuracy": "89.2%", "F1": "0.81"},
+                {"Model": "w/o memory", "Accuracy": "86.1%", "F1": "0.78"},
+            ],
+            "cells": [
+                {"row_index": 0, "col_name": "Model", "raw_value": "Baseline-A", "normalized_value": None, "unit": None, "row_label": "Baseline-A", "confidence": 0.95},
+                {"row_index": 0, "col_name": "Accuracy", "raw_value": "82.5%", "normalized_value": 0.825, "unit": "percent", "row_label": "Baseline-A", "confidence": 0.95},
+                {"row_index": 0, "col_name": "F1", "raw_value": "0.71", "normalized_value": 0.71, "unit": "f1", "row_label": "Baseline-A", "confidence": 0.95},
+                {"row_index": 1, "col_name": "Model", "raw_value": "Baseline-B", "normalized_value": None, "unit": None, "row_label": "Baseline-B", "confidence": 0.95},
+                {"row_index": 1, "col_name": "Accuracy", "raw_value": "84.7%", "normalized_value": 0.847, "unit": "percent", "row_label": "Baseline-B", "confidence": 0.95},
+                {"row_index": 1, "col_name": "F1", "raw_value": "0.76", "normalized_value": 0.76, "unit": "f1", "row_label": "Baseline-B", "confidence": 0.95},
+                {"row_index": 2, "col_name": "Model", "raw_value": "Ours", "normalized_value": None, "unit": None, "row_label": "Ours", "confidence": 0.95},
+                {"row_index": 2, "col_name": "Accuracy", "raw_value": "89.2%", "normalized_value": 0.892, "unit": "percent", "row_label": "Ours", "confidence": 0.95},
+                {"row_index": 2, "col_name": "F1", "raw_value": "0.81", "normalized_value": 0.81, "unit": "f1", "row_label": "Ours", "confidence": 0.95},
+                {"row_index": 3, "col_name": "Model", "raw_value": "w/o memory", "normalized_value": None, "unit": None, "row_label": "w/o memory", "confidence": 0.95},
+                {"row_index": 3, "col_name": "Accuracy", "raw_value": "86.1%", "normalized_value": 0.861, "unit": "percent", "row_label": "w/o memory", "confidence": 0.95},
+                {"row_index": 3, "col_name": "F1", "raw_value": "0.78", "normalized_value": 0.78, "unit": "f1", "row_label": "w/o memory", "confidence": 0.95},
+            ],
+            "row_count": 4,
+            "column_count": 3,
+            "source_chunk_id": "chunk-table-results",
+            "original_chunk_id": "parent-table-results",
+            "asset_path": "table-2.csv",
+            "order_index": 7,
+            "parse_source": "structured",
+            "confidence": 0.95,
+        }
     ]
 
 
@@ -308,11 +372,26 @@ def build_retrieval_service(chunks: List[Dict[str, Any]] | None = None):
     embedding_service = ControlledFakeEmbeddingService()
     vector_store_service = ControlledFakeVectorStoreService()
     generation_service = FakeGenerationService(response_text="fake generation response")
+    seeded_chunks = chunks or build_sample_chunks()
     collection_name = seed_collection(
         vector_store_service,
         "paper_qa_test",
         embedding_service,
-        chunks or build_sample_chunks(),
+        seeded_chunks,
+    )
+    vector_store_service.write_chunk_payload(
+        collection_name,
+        {
+            "filename": "paper.pdf",
+            "chunks": seeded_chunks,
+            "structured_tables": build_sample_structured_tables(),
+            "table_structure_debug": {
+                "enabled": True,
+                "table_count": 1,
+                "structured_table_count": 1,
+                "failed_table_parse_count": 0,
+            },
+        },
     )
     service = EnhancedRetrievalService(
         embedding_service=embedding_service,

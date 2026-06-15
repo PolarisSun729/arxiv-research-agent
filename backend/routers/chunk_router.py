@@ -30,6 +30,8 @@ _PATH_FIELD_NAMES = {
     "chunk_file",
     "embedding_file",
     "asset_path",
+    "asset_abs_path",
+    "asset_json_path",
     "image_path",
     "source_path",
 }

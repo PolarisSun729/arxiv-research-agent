@@ -441,8 +441,10 @@ class IntentService:
         if "result_check" in sub_intents:
             weights["vector_rewrite"] *= 1.07
             weights["keyword"] *= 1.08
+            weights["table_structured"] = weights.get("table_structured", 1.0) * 1.12
         if "table_lookup" in sub_intents:
             weights["keyword"] *= 1.1
+            weights["table_structured"] = weights.get("table_structured", 1.0) * 1.18
         if "deep_method" in sub_intents:
             weights["vector_rewrite"] *= 1.05
         return {key: round(value, 3) for key, value in weights.items()}

@@ -489,6 +489,66 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
         self.assertEqual(embedding_service.calls[0]["method"], "create_embeddings")
         self.assertEqual(vector_store_service.calls[0]["method"], "index_embeddings")
 
+    def test_build_qa_index_persists_structured_table_objects_in_chunk_file(self) -> None:
+        self.db_service.add_paper(self._paper_payload())
+        document = {
+            "docling_table_items": [
+                {
+                    "asset_kind": "table",
+                    "asset_path": "03-docling-assets/paper/tables/table-1.csv",
+                    "asset_caption": "Table 1: Main results",
+                    "asset_preview": [
+                        {"Method": "Baseline", "Accuracy": "82.5%", "F1": "0.71"},
+                        {"Method": "Ours", "Accuracy": "91.0%", "F1": "0.83"},
+                    ],
+                    "page_start": 5,
+                    "order_index": 1,
+                }
+            ]
+        }
+        table_chunk = {
+            "content": "Table evidence\nMain results\nMethod: Baseline; Accuracy: 82.5% | Method: Ours; Accuracy: 91.0%",
+            "metadata": {
+                "chunk_type": "table",
+                "chunk_id": 7,
+                "page_start": 5,
+                "section_path": "Experiments > Results",
+                "asset_path": "03-docling-assets/paper/tables/table-1.csv",
+                "asset_caption": "Table 1: Main results",
+                "order_index": 1,
+            },
+        }
+        chunking_service = _FakeChunkingService(chunks=[table_chunk])
+        loading_service = _FakeLoadingService(document=document)
+        builder, loading_service, *_ = self._make_builder(
+            loading_service=loading_service,
+            chunking_service=chunking_service,
+        )
+
+        result = builder.build_qa_index(self.arxiv_id, loading_method="docling")
+        save_call = next(call for call in loading_service.calls if call["method"] == "save_document")
+        saved_document = save_call["kwargs"]["document_data"]
+        saved_chunks = save_call["kwargs"]["chunks"]
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(saved_document["table_structure_debug"]["table_count"], 1)
+        self.assertEqual(saved_document["table_structure_debug"]["structured_table_count"], 1)
+        self.assertEqual(saved_document["table_structure_debug"]["failed_table_parse_count"], 0)
+        self.assertEqual(saved_chunks[0]["metadata"]["table_id"], saved_document["structured_tables"][0]["table_id"])
+        table_object = saved_document["structured_tables"][0]
+        self.assertEqual(table_object["source_chunk_id"], 7)
+        self.assertEqual(table_object["page_number"], 5)
+        self.assertEqual(table_object["section_path"], "Experiments > Results")
+        self.assertEqual(table_object["columns"], ["Method", "Accuracy", "F1"])
+        ours_accuracy = next(
+            cell
+            for cell in table_object["cells"]
+            if cell["row_label"] == "Ours" and cell["col_name"] == "Accuracy"
+        )
+        self.assertEqual(ours_accuracy["raw_value"], "91.0%")
+        self.assertAlmostEqual(ours_accuracy["normalized_value"], 0.91)
+        self.assertEqual(ours_accuracy["unit"], "percent")
+
     def test_rebuild_keeps_old_collection_until_new_index_activates(self) -> None:
         self.db_service.add_paper(self._paper_payload())
         self.db_service.insert_paper_qa_index(

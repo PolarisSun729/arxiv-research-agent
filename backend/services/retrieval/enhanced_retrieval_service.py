@@ -15,6 +15,7 @@ from services.retrieval.retrieval_index import CollectionRetrievalIndexProvider
 from services.retrieval.retrieval_pipeline import RetrievalPipeline
 from services.retrieval.retrieval_rules import RetrievalRules
 from services.retrieval.route_retriever import RouteRetriever
+from services.retrieval.table_structured_retriever import TableStructuredRetriever
 from services.retrieval.trace_builder import RetrievalTraceBuilder
 from services.storage.vector_store_service import VectorStoreService
 from utils.config import RETRIEVAL_CONFIG, get_enhanced_retrieval_runtime_config, get_memory_runtime_config
@@ -132,6 +133,12 @@ class EnhancedRetrievalService:
             generation_service=self.generation_service,
             query_tools=self.query_planner,
             fusion_service=self.fusion_service,
+            table_structured_retriever=TableStructuredRetriever(
+                query_tools=self.query_planner,
+                route_confidence_builder=self._route_confidence,
+                structural_bonus_builder=self._compute_structural_bonus,
+                config=ENHANCED_RETRIEVAL_CONFIG,
+            ),
             route_confidence_builder=self._route_confidence,
             structural_bonus_builder=self._compute_structural_bonus,
             chunk_normalizer=self._normalize_chunk,

@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 CHUNKING_CONFIG = get_chunking_runtime_config()
 MAX_CHUNK_CONTENT_LENGTH = CHUNKING_CONFIG["max_chunk_content_length"]
 CHUNK_OVERLAP_LENGTH = CHUNKING_CONFIG["chunk_overlap_length"]
+ASSET_SECTION_EMBEDDING_CONFIDENCE_FLOOR = 0.70
 
 
 class ChunkingService:
@@ -705,22 +706,25 @@ class ChunkingService:
 
             page_start = int(asset.get("page_start") or asset.get("page") or 1)
             page_end = int(asset.get("page_end") or page_start)
-            section = self._match_docling_asset_section(asset, sections)
+            section_match = self._match_docling_asset_section(asset, sections)
+            section = dict(section_match.get("section") or {})
             section_title = str(section.get("title", "") or "").strip()
             section_level = int(section.get("level") or 0) if section else 0
             section_path = str(section.get("path", "") or "").strip()
             asset_summary = self._normalize_asset_summary(asset)
             asset_preview_text = self._build_asset_preview_text(asset)
+            allow_section_in_embedding = bool(section_match.get("allow_embedding"))
 
-            # 资产 chunk 通过摘要、预览文本、章节锚点拼出“可向量化描述”，
-            # 让图片/表格即使没有纯正文，也能参与召回。
+            # section_match 可能来自 caption 引用，也可能退回到页码/order_index；
+            # 只有置信度足够时才进入可向量化正文，避免弱位置锚点污染 embedding。
             content = self._build_docling_asset_content(
                 asset=asset,
                 chunk_type=chunk_type,
                 asset_summary=asset_summary,
                 asset_preview_text=asset_preview_text,
-                section_title=section_title,
-                section_path=section_path,
+                section_title=section_title if allow_section_in_embedding else "",
+                section_path=section_path if allow_section_in_embedding else "",
+                allow_section_anchor=allow_section_in_embedding,
             )
             if not content:
                 continue
@@ -729,15 +733,23 @@ class ChunkingService:
                 "chunk_type": chunk_type,
                 "asset_kind": asset_kind,
                 "asset_path": str(asset.get("asset_path", "") or ""),
+                "asset_json_path": str(asset.get("asset_json_path", "") or ""),
                 "asset_abs_path": str(asset.get("asset_abs_path", "") or ""),
                 "asset_summary": asset_summary,
                 "asset_preview_text": asset_preview_text,
                 "asset_rows": int(asset.get("asset_rows") or 0),
                 "asset_columns": int(asset.get("asset_columns") or 0),
-                "asset_caption": str(asset.get("caption", "") or asset.get("text", "") or ""),
+                # Docling 导出的 caption 会被后续表格结构化复用，优先保留清洗后的 asset_caption。
+                "asset_caption": str(asset.get("asset_caption", "") or asset.get("caption", "") or asset.get("text", "") or ""),
+                # 下面的 section 字段保留为展示/调试锚点，不表示图表真实归属该章节。
                 "section_title": section_title,
                 "section_level": section_level,
                 "section_path": section_path,
+                "asset_section_match_type": str(section_match.get("match_type", "none") or "none"),
+                "asset_section_match_confidence": float(section_match.get("confidence", 0.0) or 0.0),
+                "asset_section_match_reason": str(section_match.get("reason", "") or ""),
+                "asset_section_match_is_heuristic": bool(section_match.get("is_heuristic", False)),
+                "asset_section_match_allow_embedding": allow_section_in_embedding,
                 "order_index": int(asset.get("order_index") or 0),
             }
 
@@ -818,41 +830,334 @@ class ChunkingService:
         asset: Dict[str, Any],
         sections: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """为资产找到最接近的章节上下文。
+        """为资产找到弱章节锚点，并显式记录匹配依据和置信度。
 
         参数:
             asset (Dict[str, Any]): 单个图片或表格资产。
             sections (List[Dict[str, Any]]): 已构建的章节列表。
 
         返回:
-            Dict[str, Any]: 最匹配的 section；若无匹配则返回空字典。
+            Dict[str, Any]: 包含 section、匹配类型、置信度和是否可进入 embedding 的结果。
         """
+        empty_match = {
+            "section": {},
+            "match_type": "none",
+            "confidence": 0.0,
+            "reason": "no_sections_available",
+            "is_heuristic": False,
+            "allow_embedding": False,
+        }
         if not sections:
-            return {}
+            return empty_match
 
+        reference_labels = self._extract_asset_reference_labels(asset)
+        reference_match = self._match_docling_asset_section_by_reference(asset, sections, reference_labels)
+        if reference_match is not None:
+            return reference_match
+
+        fallback_reason = "caption_reference_missing" if not reference_labels else "caption_reference_not_found"
+        return self._match_docling_asset_section_by_position(
+            asset,
+            sections,
+            reference_labels=reference_labels,
+            fallback_reason=fallback_reason,
+        )
+
+    def _match_docling_asset_section_by_reference(
+        self,
+        asset: Dict[str, Any],
+        sections: List[Dict[str, Any]],
+        reference_labels: List[Dict[str, str]],
+    ) -> Optional[Dict[str, Any]]:
+        """优先用 caption 编号在正文中的引用位置确定章节锚点。"""
+        if not reference_labels:
+            return None
+
+        asset_page = int(asset.get("page_start") or asset.get("page") or 0)
+        matches: List[Dict[str, Any]] = []
+        for section_index, section in enumerate(sections):
+            reference_hit = self._first_asset_reference_hit(section, reference_labels)
+            if reference_hit is None:
+                continue
+            section_start = int(section.get("page_start") or 0)
+            section_end = int(section.get("page_end") or section_start)
+            page_gap = self._asset_section_page_gap(asset_page, section_start, section_end)
+            # 引用所在正文 item 的 order_index 更能代表语义归属；缺失时用 section 顺序兜底。
+            reference_order = reference_hit.get("order_index")
+            if reference_order is None:
+                reference_order = section_index * 100000 + int(reference_hit.get("item_index", 0))
+            matches.append(
+                {
+                    "section": section,
+                    "section_index": section_index,
+                    "reference_hit": reference_hit,
+                    "page_gap": page_gap,
+                    "score": (int(reference_order), page_gap, section_index, int(reference_hit.get("char_index", 0))),
+                }
+            )
+
+        if not matches:
+            return None
+
+        matches.sort(key=lambda item: item["score"])
+        best_match = matches[0]
+        confidence = self._asset_section_reference_confidence(
+            page_gap=int(best_match["page_gap"]),
+            matched_section_count=len(matches),
+        )
+        allow_embedding = confidence >= ASSET_SECTION_EMBEDDING_CONFIDENCE_FLOOR
+        reference_hit = best_match["reference_hit"]
+        reason = (
+            "basis=caption_reference; "
+            f"asset_refs={self._format_asset_reference_labels(reference_labels)}; "
+            f"matched_ref={reference_hit.get('matched_text', '')}; "
+            f"selection=first_reference; matched_section_count={len(matches)}; "
+            f"section_index={best_match['section_index']}; "
+            f"page_gap={best_match['page_gap']}; "
+            f"reference_order={reference_hit.get('order_index')}; "
+            f"embedding_anchor={'allowed' if allow_embedding else 'metadata_only'}"
+        )
+        return {
+            "section": best_match["section"],
+            "match_type": "caption_reference",
+            "confidence": confidence,
+            "reason": reason,
+            "is_heuristic": False,
+            "allow_embedding": allow_embedding,
+        }
+
+    def _match_docling_asset_section_by_position(
+        self,
+        asset: Dict[str, Any],
+        sections: List[Dict[str, Any]],
+        *,
+        reference_labels: List[Dict[str, str]],
+        fallback_reason: str,
+    ) -> Dict[str, Any]:
+        """caption 引用不可用时，退回到页码/order_index 弱位置锚点。"""
         asset_page = int(asset.get("page_start") or asset.get("page") or 0)
         asset_order = int(asset.get("order_index") or 0)
         best_section: Dict[str, Any] = {}
         best_score: Optional[tuple] = None
+        best_relation = "unknown"
+        best_page_gap = 0
+        best_order_gap = 0
 
         for section in sections:
             section_start = int(section.get("page_start") or 0)
             section_end = int(section.get("page_end") or section_start)
+            heading_order = int((section.get("heading_item") or {}).get("order_index") or 0)
             if section_start <= asset_page <= section_end:
                 page_gap = asset_page - section_start
-                heading_order = int((section.get("heading_item") or {}).get("order_index") or 0)
                 order_gap = abs(asset_order - heading_order)
                 score = (0, page_gap, order_gap)
+                relation = "same_page_section" if page_gap == 0 else "within_section_page_range"
             elif section_end < asset_page:
-                score = (1, asset_page - section_end, abs(asset_order - int((section.get("heading_item") or {}).get("order_index") or 0)))
+                page_gap = asset_page - section_end
+                order_gap = abs(asset_order - heading_order)
+                score = (1, page_gap, order_gap)
+                relation = "nearest_preceding_section"
             else:
-                score = (2, section_start - asset_page, abs(asset_order - int((section.get("heading_item") or {}).get("order_index") or 0)))
+                page_gap = section_start - asset_page
+                order_gap = abs(asset_order - heading_order)
+                score = (2, page_gap, order_gap)
+                relation = "nearest_following_section"
 
             if best_score is None or score < best_score:
                 best_score = score
                 best_section = section
+                best_relation = relation
+                best_page_gap = page_gap
+                best_order_gap = order_gap
 
-        return best_section
+        if not best_section:
+            return {
+                "section": {},
+                "match_type": "none",
+                "confidence": 0.0,
+                "reason": f"position_fallback_no_section; fallback_from={fallback_reason}",
+                "is_heuristic": True,
+                "allow_embedding": False,
+            }
+
+        confidence = self._asset_section_match_confidence(
+            relation=best_relation,
+            page_gap=best_page_gap,
+            order_gap=best_order_gap,
+        )
+        allow_embedding = confidence >= ASSET_SECTION_EMBEDDING_CONFIDENCE_FLOOR
+        reason = (
+            f"basis=page_range+order_index; fallback_from={fallback_reason}; "
+            f"asset_refs={self._format_asset_reference_labels(reference_labels) or '-'}; "
+            f"relation={best_relation}; "
+            f"page_gap={best_page_gap}; order_gap={best_order_gap}; "
+            f"embedding_anchor={'allowed' if allow_embedding else 'metadata_only'}"
+        )
+        return {
+            "section": best_section,
+            "match_type": "heuristic",
+            "confidence": confidence,
+            "reason": reason,
+            "is_heuristic": True,
+            "allow_embedding": allow_embedding,
+        }
+
+    def _extract_asset_reference_labels(self, asset: Dict[str, Any]) -> List[Dict[str, str]]:
+        """从 caption/summary 中提取标准化 Figure/Table 编号，作为正文引用检索键。"""
+        asset_kind = str(asset.get("asset_kind", "") or "").strip().lower()
+        if asset_kind == "picture":
+            candidate_kinds = ["figure"]
+        elif asset_kind == "table":
+            candidate_kinds = ["table"]
+        else:
+            candidate_kinds = ["figure", "table"]
+
+        caption_text = " ".join(
+            str(asset.get(key, "") or "")
+            for key in ("asset_caption", "caption", "text", "asset_summary")
+            if str(asset.get(key, "") or "").strip()
+        )
+        if not caption_text.strip():
+            return []
+
+        references: List[Dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for kind in candidate_kinds:
+            for match in self._asset_reference_caption_pattern(kind).finditer(caption_text):
+                label = self._normalize_asset_reference_label(match.group("number"), match.groupdict().get("suffix"))
+                if not label:
+                    continue
+                key = (kind, label)
+                if key in seen:
+                    continue
+                seen.add(key)
+                references.append({"kind": kind, "label": label, "raw": match.group(0).strip()})
+        return references
+
+    def _first_asset_reference_hit(
+        self,
+        section: Dict[str, Any],
+        reference_labels: List[Dict[str, str]],
+    ) -> Optional[Dict[str, Any]]:
+        """扫描 section 正文 item，返回最早出现的目标图表引用。"""
+        raw_items = section.get("body_items") or section.get("section_items") or []
+        if not isinstance(raw_items, list):
+            return None
+
+        best_hit: Optional[Dict[str, Any]] = None
+        best_score: Optional[tuple] = None
+        for item_index, item in enumerate(raw_items):
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text", "") or "").strip()
+            if not text:
+                continue
+            item_order = self._safe_int(item.get("order_index"))
+            order_for_score = item_order if item_order is not None else item_index
+            for reference in reference_labels:
+                match = self._find_asset_reference_in_text(text, reference)
+                if match is None:
+                    continue
+                score = (int(order_for_score), int(match.start()), item_index)
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_hit = {
+                        "kind": reference["kind"],
+                        "label": reference["label"],
+                        "matched_text": match.group(0).strip(),
+                        "order_index": item_order,
+                        "item_index": item_index,
+                        "char_index": match.start(),
+                    }
+        return best_hit
+
+    def _find_asset_reference_in_text(self, text: str, reference: Dict[str, str]) -> Optional[re.Match[str]]:
+        pattern = self._asset_reference_text_pattern(reference["kind"], reference["label"])
+        return pattern.search(text)
+
+    @staticmethod
+    def _asset_reference_caption_pattern(kind: str) -> re.Pattern[str]:
+        if kind == "table":
+            aliases = r"(?:table|tab\.?|表)"
+        else:
+            aliases = r"(?:figure|fig\.?|图)"
+        return re.compile(
+            rf"(?<![A-Za-z]){aliases}\s*(?P<number>[0-9]+[A-Za-z]?)(?:\s*\((?P<suffix>[A-Za-z])\))?",
+            re.IGNORECASE,
+        )
+
+    @staticmethod
+    def _asset_reference_text_pattern(kind: str, label: str) -> re.Pattern[str]:
+        if kind == "table":
+            aliases = r"(?:table|tab\.?|表)"
+        else:
+            aliases = r"(?:figure|fig\.?|图)"
+        label_pattern = ChunkingService._asset_reference_label_pattern(label)
+        return re.compile(rf"(?<![A-Za-z]){aliases}\s*{label_pattern}", re.IGNORECASE)
+
+    @staticmethod
+    def _asset_reference_label_pattern(label: str) -> str:
+        match = re.fullmatch(r"([0-9]+)([a-z]?)", str(label or "").strip().lower())
+        if not match:
+            return re.escape(str(label or ""))
+        number, suffix = match.groups()
+        if suffix:
+            return rf"{re.escape(number)}\s*(?:{re.escape(suffix)}|\({re.escape(suffix)}\))(?![0-9A-Za-z])"
+        return rf"{re.escape(number)}(?![0-9A-Za-z]|\s*\([A-Za-z]\))"
+
+    @staticmethod
+    def _normalize_asset_reference_label(number: Any, suffix: Any = "") -> str:
+        raw_number = re.sub(r"[^0-9A-Za-z]", "", str(number or "")).strip().lower()
+        raw_suffix = re.sub(r"[^A-Za-z]", "", str(suffix or "")).strip().lower()
+        if not raw_number:
+            return ""
+        if raw_suffix and raw_number[-1:].isalpha():
+            return raw_number
+        return f"{raw_number}{raw_suffix}"
+
+    @staticmethod
+    def _format_asset_reference_labels(reference_labels: List[Dict[str, str]]) -> str:
+        return ",".join(
+            f"{item.get('kind', '')} {item.get('label', '')}".strip()
+            for item in reference_labels
+            if item.get("kind") and item.get("label")
+        )
+
+    @staticmethod
+    def _asset_section_page_gap(asset_page: int, section_start: int, section_end: int) -> int:
+        if asset_page <= 0:
+            return 0
+        if section_start <= asset_page <= section_end:
+            return 0
+        if section_end < asset_page:
+            return asset_page - section_end
+        return section_start - asset_page
+
+    @staticmethod
+    def _asset_section_reference_confidence(*, page_gap: int, matched_section_count: int) -> float:
+        """caption 引用属于强证据，但跨页和多处引用仍需要轻微降权。"""
+        base = 0.94
+        page_penalty = min(0.12, max(0, page_gap) * 0.02)
+        multi_reference_penalty = 0.02 if matched_section_count > 1 else 0.0
+        return round(max(0.75, min(0.98, base - page_penalty - multi_reference_penalty)), 3)
+
+    @staticmethod
+    def _asset_section_match_confidence(*, relation: str, page_gap: int, order_gap: int) -> float:
+        """把页码/order_index 的弱匹配压成稳定分数，供 embedding 文本门控使用。"""
+        if relation == "same_page_section":
+            base = 0.76
+        elif relation == "within_section_page_range":
+            base = 0.70
+        elif relation == "nearest_preceding_section":
+            base = 0.58 if page_gap <= 1 else 0.42
+        elif relation == "nearest_following_section":
+            base = 0.42 if page_gap <= 1 else 0.28
+        else:
+            base = 0.20
+
+        # order_index 只是 Docling 抽取顺序，不能当作空间归属；这里只作为弱惩罚项。
+        penalty = min(0.18, max(0, order_gap) * 0.003)
+        return round(max(0.0, min(0.95, base - penalty)), 3)
 
     def _normalize_asset_summary(self, asset: Dict[str, Any]) -> str:
         summary = str(asset.get("asset_summary", "") or "").strip()
@@ -893,6 +1198,7 @@ class ChunkingService:
         asset_preview_text: str,
         section_title: str,
         section_path: str,
+        allow_section_anchor: bool,
     ) -> str:
         """把图片或表格资产整理成适合向量化的描述文本。
 
@@ -901,14 +1207,16 @@ class ChunkingService:
             chunk_type (str): 资产转出的 chunk 类型，例如 figure 或 table。
             asset_summary (str): 资产摘要。
             asset_preview_text (str): 表格预览或补充说明。
-            section_title (str): 资产所在章节标题。
-            section_path (str): 资产所在章节路径。
+            section_title (str): 可进入 embedding 的章节锚点标题。
+            section_path (str): 可进入 embedding 的章节锚点路径。
+            allow_section_anchor (bool): 是否允许弱 section 锚点写入 embedding 正文。
 
         返回:
             str: 可直接送入 embedding 的描述文本。
         """
         page_text = f"page {int(asset.get('page_start') or asset.get('page') or 1)}"
-        anchor_parts = [part for part in [section_title, section_path, page_text] if part]
+        section_anchor_parts = [section_title, section_path] if allow_section_anchor else []
+        anchor_parts = [part for part in [*section_anchor_parts, page_text] if part]
         anchor_text = " | ".join(self._dedupe_text_units(anchor_parts))
 
         if chunk_type == "figure":

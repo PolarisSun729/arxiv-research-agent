@@ -253,6 +253,11 @@ class VectorStoreService:
                 {"name": "asset_summary", "dtype": "VARCHAR", "max_length": ASSET_SUMMARY_MAX_LENGTH},
                 {"name": "asset_preview_text", "dtype": "VARCHAR", "max_length": ASSET_PREVIEW_MAX_LENGTH},
                 {"name": "asset_caption", "dtype": "VARCHAR", "max_length": ASSET_SUMMARY_MAX_LENGTH},
+                {"name": "asset_section_match_type", "dtype": "VARCHAR", "max_length": 32},
+                {"name": "asset_section_match_confidence", "dtype": "DOUBLE"},
+                {"name": "asset_section_match_reason", "dtype": "VARCHAR", "max_length": 512},
+                {"name": "asset_section_match_is_heuristic", "dtype": "BOOL"},
+                {"name": "asset_section_match_allow_embedding", "dtype": "BOOL"},
                 {"name": "asset_rows", "dtype": "INT64"},
                 {"name": "asset_columns", "dtype": "INT64"},
                 {"name": "order_index", "dtype": "INT64"},
@@ -278,6 +283,8 @@ class VectorStoreService:
                 {"name": "content_part_label", "dtype": "VARCHAR", "max_length": 32},
                 # {"name": "chunking_method", "dtype": "VARCHAR", "max_length": 50},
                 {"name": "section_path", "dtype": "VARCHAR", "max_length": 1024},
+                {"name": "section_title", "dtype": "VARCHAR", "max_length": 512},
+                {"name": "section_level", "dtype": "INT64"},
                 {"name": "embedding_provider", "dtype": "VARCHAR", "max_length": 50},
                 {"name": "embedding_model", "dtype": "VARCHAR", "max_length": 50},
                 {"name": "embedding_timestamp", "dtype": "VARCHAR", "max_length": 50},
@@ -320,6 +327,12 @@ class VectorStoreService:
                     "asset_summary": str(metadata.get("asset_summary", "") or ""),
                     "asset_preview_text": str(metadata.get("asset_preview_text", "") or ""),
                     "asset_caption": str(metadata.get("asset_caption", "") or ""),
+                    # 这些字段说明 section 是弱锚点还是可信归属，真实检索结果需要原样带回 debug/source。
+                    "asset_section_match_type": str(metadata.get("asset_section_match_type", "") or ""),
+                    "asset_section_match_confidence": float(metadata.get("asset_section_match_confidence", 0.0) or 0.0),
+                    "asset_section_match_reason": str(metadata.get("asset_section_match_reason", "") or ""),
+                    "asset_section_match_is_heuristic": bool(metadata.get("asset_section_match_is_heuristic", False)),
+                    "asset_section_match_allow_embedding": bool(metadata.get("asset_section_match_allow_embedding", False)),
                     "asset_rows": int(metadata.get("asset_rows", 0) or 0),
                     "asset_columns": int(metadata.get("asset_columns", 0) or 0),
                     "order_index": int(metadata.get("order_index", 0) or 0),
@@ -344,6 +357,8 @@ class VectorStoreService:
                         metadata.get("content_part_label", subchunk_label)
                     ),
                     "section_path": str(metadata.get("section_path", "")),
+                    "section_title": str(metadata.get("section_title", "")),
+                    "section_level": int(metadata.get("section_level", 0) or 0),
                     # "chunking_method": str(metadata.get("chunking_method", "")),
                     "embedding_provider": embeddings_data.get("embedding_provider", ""),
                     "embedding_model": embeddings_data.get("embedding_model", ""),
@@ -675,6 +690,11 @@ class VectorStoreService:
                 "asset_summary",
                 "asset_preview_text",
                 "asset_caption",
+                "asset_section_match_type",
+                "asset_section_match_confidence",
+                "asset_section_match_reason",
+                "asset_section_match_is_heuristic",
+                "asset_section_match_allow_embedding",
                 "asset_rows",
                 "asset_columns",
                 "order_index",
@@ -887,6 +907,11 @@ class VectorStoreService:
                 "asset_summary",
                 "asset_preview_text",
                 "asset_caption",
+                "asset_section_match_type",
+                "asset_section_match_confidence",
+                "asset_section_match_reason",
+                "asset_section_match_is_heuristic",
+                "asset_section_match_allow_embedding",
                 "asset_rows",
                 "asset_columns",
                 "order_index",
@@ -963,6 +988,11 @@ class VectorStoreService:
         asset_summary = getter("asset_summary", "") or ""
         asset_preview_text = getter("asset_preview_text", "") or ""
         asset_caption = getter("asset_caption", "") or ""
+        asset_section_match_type = getter("asset_section_match_type", "") or ""
+        asset_section_match_confidence = getter("asset_section_match_confidence", 0.0)
+        asset_section_match_reason = getter("asset_section_match_reason", "") or ""
+        asset_section_match_is_heuristic = getter("asset_section_match_is_heuristic", False)
+        asset_section_match_allow_embedding = getter("asset_section_match_allow_embedding", False)
         asset_rows = getter("asset_rows", None)
         asset_columns = getter("asset_columns", None)
         order_index = getter("order_index", None)
@@ -1014,6 +1044,11 @@ class VectorStoreService:
             "asset_summary": str(asset_summary or ""),
             "asset_preview_text": str(asset_preview_text or ""),
             "asset_caption": str(asset_caption or ""),
+            "asset_section_match_type": str(asset_section_match_type or ""),
+            "asset_section_match_confidence": float(asset_section_match_confidence or 0.0),
+            "asset_section_match_reason": str(asset_section_match_reason or ""),
+            "asset_section_match_is_heuristic": bool(asset_section_match_is_heuristic),
+            "asset_section_match_allow_embedding": bool(asset_section_match_allow_embedding),
             "asset_rows": int(asset_rows or 0),
             "asset_columns": int(asset_columns or 0),
             "order_index": int(order_index or 0),
@@ -1048,6 +1083,11 @@ class VectorStoreService:
             "asset_summary": metadata["asset_summary"],
             "asset_preview_text": metadata["asset_preview_text"],
             "asset_caption": metadata["asset_caption"],
+            "asset_section_match_type": metadata["asset_section_match_type"],
+            "asset_section_match_confidence": metadata["asset_section_match_confidence"],
+            "asset_section_match_reason": metadata["asset_section_match_reason"],
+            "asset_section_match_is_heuristic": metadata["asset_section_match_is_heuristic"],
+            "asset_section_match_allow_embedding": metadata["asset_section_match_allow_embedding"],
             "asset_rows": metadata["asset_rows"],
             "asset_columns": metadata["asset_columns"],
             "order_index": metadata["order_index"],

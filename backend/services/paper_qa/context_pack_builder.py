@@ -39,6 +39,8 @@ class ContextPackBuilder:
                         "page_number": asset_info["page_number"],
                         "asset_summary": asset_info["asset_summary"],
                         "section_path": asset_info["section_path"],
+                        "asset_section_match_type": asset_info["asset_section_match_type"],
+                        "asset_section_match_confidence": asset_info["asset_section_match_confidence"],
                     }
                 )
                 asset_metadata.append(asset_info)
@@ -68,6 +70,11 @@ class ContextPackBuilder:
                     "asset_kind": result.get("asset_kind", ""),
                     "asset_summary": result.get("asset_summary", ""),
                     "asset_preview_text": result.get("asset_preview_text", ""),
+                    "asset_section_match_type": result.get("asset_section_match_type", ""),
+                    "asset_section_match_confidence": result.get("asset_section_match_confidence", 0.0),
+                    "asset_section_match_reason": result.get("asset_section_match_reason", ""),
+                    "asset_section_match_is_heuristic": result.get("asset_section_match_is_heuristic", False),
+                    "asset_section_match_allow_embedding": result.get("asset_section_match_allow_embedding", False),
                 }
             )
 
@@ -130,10 +137,18 @@ class ContextPackBuilder:
             "asset_abs_path": result.get("asset_abs_path", ""),
             "asset_summary": result.get("asset_summary", ""),
             "asset_preview_text": result.get("asset_preview_text", ""),
+            "table_id": result.get("table_id", ""),
+            "table_structured_text": result.get("table_structured_text", ""),
+            "table_structured_evidence": result.get("table_structured_evidence", {}),
             "page_number": result.get("page_number", ""),
             "page_range": result.get("page_range", ""),
             "section_path": result.get("section_path", ""),
             "section_title": result.get("section_title", ""),
+            "asset_section_match_type": result.get("asset_section_match_type", ""),
+            "asset_section_match_confidence": result.get("asset_section_match_confidence", 0.0),
+            "asset_section_match_reason": result.get("asset_section_match_reason", ""),
+            "asset_section_match_is_heuristic": result.get("asset_section_match_is_heuristic", False),
+            "asset_section_match_allow_embedding": result.get("asset_section_match_allow_embedding", False),
             "source": result.get("source", ""),
         }
 
@@ -148,6 +163,11 @@ class ContextPackBuilder:
             "chunk_label": result.get("chunk_label", result.get("subchunk_label", "")),
             "section_path": result.get("section_path", ""),
             "section_title": result.get("section_title", ""),
+            "asset_section_match_type": result.get("asset_section_match_type", ""),
+            "asset_section_match_confidence": result.get("asset_section_match_confidence", 0.0),
+            "asset_section_match_reason": result.get("asset_section_match_reason", ""),
+            "asset_section_match_is_heuristic": result.get("asset_section_match_is_heuristic", False),
+            "asset_section_match_allow_embedding": result.get("asset_section_match_allow_embedding", False),
             "chunk_id": result.get("chunk_id", ""),
             "parent_chunk_id": result.get("parent_chunk_id", result.get("chunk_id", 0)),
             "original_chunk_id": result.get("original_chunk_id", ""),
@@ -163,6 +183,14 @@ class ContextPackBuilder:
             "asset_path": result.get("asset_path", ""),
             "asset_summary": result.get("asset_summary", ""),
             "asset_preview_text": result.get("asset_preview_text", ""),
+            "asset_section_match_type": result.get("asset_section_match_type", ""),
+            "asset_section_match_confidence": result.get("asset_section_match_confidence", 0.0),
+            "asset_section_match_reason": result.get("asset_section_match_reason", ""),
+            "asset_section_match_is_heuristic": result.get("asset_section_match_is_heuristic", False),
+            "asset_section_match_allow_embedding": result.get("asset_section_match_allow_embedding", False),
+            "table_id": result.get("table_id", ""),
+            "table_structured_text": result.get("table_structured_text", ""),
+            "table_structured_evidence": result.get("table_structured_evidence", {}),
         }
 
     @staticmethod
@@ -172,26 +200,28 @@ class ContextPackBuilder:
         asset_preview_text = str(result.get("asset_preview_text", "") or "").strip()
         section_path = str(result.get("section_path", "") or "").strip()
         page_number = str(result.get("page_number", "") or result.get("page_range", "") or "").strip()
+        allow_section_anchor = ContextPackBuilder.asset_section_anchor_allowed(result, chunk_type)
 
         if chunk_type == "table":
-            # 表格 chunk 的正文常为空，必须显式把摘要和预览表格送入生成上下文。
+            # 表格 chunk 的正文常为空；低置信度章节锚点只留在 metadata，避免误导生成上下文。
             parts = [
                 f"[Table {index}]",
                 f"source_id: {source_id}",
                 f"page: {page_number}" if page_number else "",
-                f"section: {section_path}" if section_path else "",
+                f"section: {section_path}" if section_path and allow_section_anchor else "",
                 asset_summary,
+                str(result.get("table_structured_text", "") or "").strip(),
                 asset_preview_text,
             ]
             return "\n".join(part for part in parts if part).strip()
 
         if chunk_type == "figure":
-            # 图片 chunk 由 image_inputs 承载原图，这里补充 caption/summary 让纯文本路径也能保留证据线索。
+            # 图片 chunk 由 image_inputs 承载原图；弱章节锚点只在可信时进入文本上下文。
             parts = [
                 f"[Figure {index}]",
                 f"source_id: {source_id}",
                 f"page: {page_number}" if page_number else "",
-                f"section: {section_path}" if section_path else "",
+                f"section: {section_path}" if section_path and allow_section_anchor else "",
                 asset_summary,
                 asset_preview_text,
                 content,
@@ -209,3 +239,14 @@ class ContextPackBuilder:
         if context_role:
             header_parts.append(f"role: {context_role}")
         return "\n".join(header_parts + [content]).strip()
+
+    @staticmethod
+    def asset_section_anchor_allowed(result: Dict[str, Any], chunk_type: str) -> bool:
+        """旧数据缺少 match 字段时沿用历史行为；新 asset 按显式门控决定是否文本化 section。"""
+        normalized_type = ContextPackBuilder.normalize_chunk_type(chunk_type)
+        if normalized_type not in {"figure", "table"}:
+            return True
+        match_type = str(result.get("asset_section_match_type", "") or "").strip()
+        if not match_type:
+            return True
+        return bool(result.get("asset_section_match_allow_embedding", False))

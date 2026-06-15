@@ -208,6 +208,44 @@ class SearchService:
             }
             logger.debug(f"Executing search with params: {search_params}")
             logger.debug(f"Word count threshold filter: word_count >= {word_count_threshold}")
+            field_names = {field.name for field in collection.schema.fields}
+            candidate_output_fields = [
+                "content",
+                "document_name",
+                "source",
+                "chunk_type",
+                "asset_kind",
+                "asset_path",
+                "asset_summary",
+                "asset_preview_text",
+                "asset_caption",
+                "asset_section_match_type",
+                "asset_section_match_confidence",
+                "asset_section_match_reason",
+                "asset_section_match_is_heuristic",
+                "asset_section_match_allow_embedding",
+                "chunk_id",
+                "chunk_index",
+                "parent_chunk_id",
+                "original_chunk_id",
+                "total_chunks",
+                "word_count",
+                "page_number",
+                "page_start",
+                "page_end",
+                "page_range",
+                "subchunk_index",
+                "subchunk_count",
+                "subchunk_label",
+                "section_path",
+                "section_title",
+                "section_level",
+                "embedding_provider",
+                "embedding_model",
+                "embedding_timestamp",
+            ]
+            # 旧 collection 可能没有新增 asset-section 字段，查询前按 schema 过滤避免 Milvus 报 unknown field。
+            output_fields = [field for field in candidate_output_fields if field in field_names]
             
             results = collection.search(
                 data=[query_embedding],
@@ -215,28 +253,7 @@ class SearchService:
                 param=search_params,
                 limit=top_k,
                 expr=f"word_count >= {word_count_threshold}",
-                output_fields=[
-                    "content",
-                    "document_name",
-                    "source",
-                    "chunk_id",
-                    "chunk_index",
-                    "parent_chunk_id",
-                    "original_chunk_id",
-                    "total_chunks",
-                    "word_count",
-                    "page_number",
-                    "page_start",
-                    "page_end",
-                    "page_range",
-                    "subchunk_index",
-                    "subchunk_count",
-                    "subchunk_label",
-                    "section_path",
-                    "embedding_provider",
-                    "embedding_model",
-                    "embedding_timestamp"
-                ]
+                output_fields=output_fields
             )
             
             # 处理结果
@@ -269,6 +286,19 @@ class SearchService:
                                 "subchunk_count": int(getattr(hit.entity, "subchunk_count", 0) or 0),
                                 "subchunk_label": str(getattr(hit.entity, "subchunk_label", "") or ""),
                                 "section_path": str(getattr(hit.entity, "section_path", "") or ""),
+                                "section_title": str(getattr(hit.entity, "section_title", "") or ""),
+                                "section_level": int(getattr(hit.entity, "section_level", 0) or 0),
+                                "chunk_type": str(getattr(hit.entity, "chunk_type", "text") or "text"),
+                                "asset_kind": str(getattr(hit.entity, "asset_kind", "") or ""),
+                                "asset_path": str(getattr(hit.entity, "asset_path", "") or ""),
+                                "asset_summary": str(getattr(hit.entity, "asset_summary", "") or ""),
+                                "asset_preview_text": str(getattr(hit.entity, "asset_preview_text", "") or ""),
+                                "asset_caption": str(getattr(hit.entity, "asset_caption", "") or ""),
+                                "asset_section_match_type": str(getattr(hit.entity, "asset_section_match_type", "") or ""),
+                                "asset_section_match_confidence": float(getattr(hit.entity, "asset_section_match_confidence", 0.0) or 0.0),
+                                "asset_section_match_reason": str(getattr(hit.entity, "asset_section_match_reason", "") or ""),
+                                "asset_section_match_is_heuristic": bool(getattr(hit.entity, "asset_section_match_is_heuristic", False)),
+                                "asset_section_match_allow_embedding": bool(getattr(hit.entity, "asset_section_match_allow_embedding", False)),
                                 "total_chunks": hit.entity.total_chunks,
                                 "embedding_provider": hit.entity.embedding_provider,
                                 "embedding_model": hit.entity.embedding_model,

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -49,6 +52,8 @@ class CollectionRetrievalIndex:
     by_chunk_type: Dict[str, List[int]] = field(default_factory=dict)
     by_subchunk_index: Dict[str, List[int]] = field(default_factory=dict)
     by_parent_subchunk: Dict[Tuple[str, str], List[int]] = field(default_factory=dict)
+    structured_tables: List[Dict[str, Any]] = field(default_factory=list)
+    table_structure_debug: Dict[str, Any] = field(default_factory=dict)
     cache_hit: bool = False
     build_time: float = 0.0
     fallback_reason: str = ""
@@ -162,6 +167,12 @@ class CollectionRetrievalIndexProvider:
             fallback_reasons.append(f"chunk_index_build_failed: {exc}")
             logger.warning("Failed to build collection retrieval index: collection=%s error=%s", collection_name, exc)
 
+        structured_tables, table_structure_debug = self._load_structured_tables(index_record)
+        if structured_tables:
+            fallback_reasons.append(f"structured_table_count:{len(structured_tables)}")
+        elif table_structure_debug.get("enabled", False) and table_structure_debug.get("reason"):
+            fallback_reasons.append(f"structured_table_unavailable:{table_structure_debug.get('reason')}")
+
         normalized_chunks = [self.chunk_normalizer(chunk) for chunk in raw_chunks]
         documents: List[KeywordDocument] = []
         document_frequency: Dict[str, int] = defaultdict(int)
@@ -178,11 +189,13 @@ class CollectionRetrievalIndexProvider:
         by_parent_subchunk: Dict[Tuple[str, str], List[int]] = defaultdict(list)
 
         for doc_id, chunk in enumerate(normalized_chunks):
+            chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
+            allow_section_terms = self._asset_section_anchor_allowed_for_search_text(chunk, chunk_type)
             text_parts = [
                 str(chunk.get("content", "") or ""),
                 str(chunk.get("title", "") or ""),
-                str(chunk.get("section_path", "") or ""),
-                str(chunk.get("section_title", "") or ""),
+                str(chunk.get("section_path", "") or "") if allow_section_terms else "",
+                str(chunk.get("section_title", "") or "") if allow_section_terms else "",
                 str(chunk.get("asset_summary", "") or ""),
                 str(chunk.get("asset_caption", "") or ""),
                 str(chunk.get("asset_preview_text", "") or ""),
@@ -240,6 +253,8 @@ class CollectionRetrievalIndexProvider:
             by_chunk_type={key: list(value) for key, value in by_chunk_type.items()},
             by_subchunk_index={key: list(value) for key, value in by_subchunk_index.items()},
             by_parent_subchunk={key: list(value) for key, value in by_parent_subchunk.items()},
+            structured_tables=[dict(item) for item in structured_tables],
+            table_structure_debug=dict(table_structure_debug),
             cache_hit=False,
             build_time=perf_counter() - started,
             fallback_reason="; ".join(fallback_reasons),
@@ -272,6 +287,79 @@ class CollectionRetrievalIndexProvider:
         if callable(resolver):
             return resolver(collection_name)
         return collection_name
+
+    @staticmethod
+    def _asset_section_anchor_allowed_for_search_text(chunk: Dict[str, Any], chunk_type: str) -> bool:
+        """控制弱章节锚点是否进入 keyword 文本，和 embedding/rerank 的门控保持一致。"""
+        if chunk_type not in {"figure", "table"}:
+            return True
+        match_type = str(chunk.get("asset_section_match_type", "") or "").strip()
+        if not match_type:
+            return True
+        return bool(chunk.get("asset_section_match_allow_embedding", False))
+
+    def _load_structured_tables(self, index_record: Optional[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """从 chunk 调试产物中恢复结构化表格索引。"""
+        fallback_record = self._fallback_index_record(index_record)
+        debug: Dict[str, Any] = {"enabled": bool(index_record or fallback_record), "structured_table_count": 0, "reason": ""}
+        chunk_file = str((index_record or {}).get("chunk_file") or (fallback_record or {}).get("chunk_file") or "").strip()
+        if not chunk_file:
+            debug["reason"] = "missing_chunk_file"
+            return [], debug
+
+        chunk_path = self._resolve_chunk_file_path(chunk_file)
+        if chunk_path is None:
+            debug["reason"] = "chunk_file_not_found"
+            return [], debug
+
+        try:
+            with open(chunk_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as exc:
+            logger.warning("Failed to load structured tables from chunk file %s: %s", chunk_path, exc)
+            debug["reason"] = f"chunk_file_read_failed:{exc}"
+            return [], debug
+
+        structured_tables = [item for item in (payload.get("structured_tables") or []) if isinstance(item, dict)]
+        table_debug = payload.get("table_structure_debug") if isinstance(payload.get("table_structure_debug"), dict) else {}
+        debug.update(table_debug)
+        debug["structured_table_count"] = len(structured_tables)
+        if not structured_tables:
+            debug["reason"] = debug.get("reason") or "structured_tables_empty"
+        return structured_tables, debug
+
+    def _fallback_index_record(self, index_record: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """兼容测试夹具：未显式传入 paper_context 时，从 fake vector store 读取 chunk_file。"""
+        if index_record:
+            return index_record
+        index_records = getattr(self.vector_store_service, "index_records", None)
+        if isinstance(index_records, dict):
+            for record in index_records.values():
+                if isinstance(record, dict) and record.get("chunk_file"):
+                    return record
+        return None
+
+    def _resolve_chunk_file_path(self, chunk_file: str) -> Optional[Path]:
+        raw_path = Path(str(chunk_file or "").strip())
+        candidates = [raw_path]
+        backend_root = Path(__file__).resolve().parents[2]
+        repo_root = backend_root.parent
+        if not raw_path.is_absolute():
+            candidates.extend(
+                [
+                    Path(os.getcwd()) / raw_path,
+                    backend_root / raw_path,
+                    repo_root / raw_path,
+                ]
+            )
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if resolved.is_file():
+                return resolved
+        return None
 
     @staticmethod
     def _resolve_expected_count(
@@ -365,6 +453,8 @@ class CollectionRetrievalIndexProvider:
             by_chunk_type={key: list(value) for key, value in index.by_chunk_type.items()},
             by_subchunk_index={key: list(value) for key, value in index.by_subchunk_index.items()},
             by_parent_subchunk={key: list(value) for key, value in index.by_parent_subchunk.items()},
+            structured_tables=[dict(item) for item in index.structured_tables],
+            table_structure_debug=dict(index.table_structure_debug),
             cache_hit=index.cache_hit,
             build_time=index.build_time,
             fallback_reason=index.fallback_reason,

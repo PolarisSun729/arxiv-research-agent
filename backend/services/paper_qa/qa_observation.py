@@ -36,6 +36,7 @@ ROUTE_STAGE_NAMES = (
     "vector_rewrite",
     "vector_hyde",
     "keyword",
+    "table_structured",
     "memory_context",
 )
 

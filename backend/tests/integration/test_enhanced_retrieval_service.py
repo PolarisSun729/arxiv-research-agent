@@ -340,6 +340,37 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
         self.assertIn("context_budget_score", figure_source)
         self.assertIn("role: sibling_context", context_pack["text_context"])
 
+    def test_table_structured_route_promotes_cell_level_evidence_for_table_question(self) -> None:
+        result = self.service.enhanced_retrieve(
+            "表 2 中最高的 accuracy 是多少？",
+            self.collection_name,
+            options=self.options_cls(debug=True, enable_llm_rerank=False, enable_hyde=False, enable_keyword_search=False),
+        )
+
+        self.assertTrue(result["chunks"])
+        top_chunk = result["chunks"][0]
+        self.assertEqual(top_chunk["chunk_id"], "chunk-table-results")
+        self.assertEqual(top_chunk["retrieval_route"], "table_structured")
+        self.assertEqual(top_chunk["table_structured_evidence"]["numeric_operation"], "max")
+        self.assertEqual(top_chunk["table_structured_evidence"]["matched_rows"], ["Ours"])
+        self.assertEqual(top_chunk["table_structured_evidence"]["matched_columns"], ["Accuracy"])
+        self.assertEqual(top_chunk["table_structured_evidence"]["matched_cells"][0]["raw_value"], "89.2%")
+        self.assertIn("table_structured", result["debug"]["routes"])
+        self.assertEqual(result["debug"]["route_metrics"]["table_structured"]["status"], "ok")
+        self.assertEqual(result["debug"]["table_structured"]["matched_tables"][0]["table_id"], "paper-table-2")
+        self.assertEqual(result["debug"]["stages"]["fused_top30"][0]["chunk_id"], "chunk-table-results")
+
+    def test_table_structured_route_falls_back_cleanly_for_summary_question(self) -> None:
+        result = self.service.enhanced_retrieve(
+            "What is the main contribution of the paper?",
+            self.collection_name,
+            options=self.options_cls(debug=True, enable_llm_rerank=False),
+        )
+
+        self.assertTrue(result["chunks"])
+        self.assertEqual(result["debug"]["route_metrics"]["table_structured"]["candidate_count"], 0)
+        self.assertEqual(result["debug"]["table_structured"]["reason"], "query_not_table_like")
+
 
 if __name__ == "__main__":
     unittest.main()

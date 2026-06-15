@@ -630,6 +630,13 @@ class RetrievalRules:
             )
             if main_intent in {"method", "experiment", "figure_table"}:
                 base += self.config["route_keyword_bonus"]
+        elif route_name == "table_structured":
+            base = self.config["query_weight_base_keyword"] + 0.22 * min(
+                1.0,
+                len(query_profile.keywords) / self.config["extract_query_keywords_limit"],
+            )
+            if main_intent in {"experiment", "comparison", "figure_table", "dataset"}:
+                base += self.config["route_keyword_bonus"] + 0.06
         elif route_name == "memory_context":
             base = 0.42 + 0.2 * ambiguity
             if main_intent in {"method", "experiment", "comparison", "figure_table", "dataset"}:
@@ -669,6 +676,11 @@ class RetrievalRules:
     def normalize_chunk(self, item: Dict[str, Any]) -> Dict[str, Any]:
         metadata = dict(item.get("metadata", {}) or {})
         chunk = dict(item)
+
+        def first_present(key: str, default: Any = "") -> Any:
+            value = item.get(key) if key in item else metadata.get(key, default)
+            return default if value is None else value
+
         chunk["content"] = item.get("content") or item.get("text") or metadata.get("content") or metadata.get("text") or ""
         chunk["text"] = chunk["content"]
         chunk["source"] = item.get("source") or metadata.get("source", "")
@@ -693,12 +705,21 @@ class RetrievalRules:
         chunk["published_date"] = item.get("published_date") or metadata.get("published_date", "")
         chunk["url"] = item.get("url") or metadata.get("url", "")
         chunk["chunk_type"] = item.get("chunk_type") or metadata.get("chunk_type", "text")
+        chunk["table_id"] = item.get("table_id") or metadata.get("table_id", "")
         chunk["asset_kind"] = item.get("asset_kind") or metadata.get("asset_kind", "")
         chunk["asset_path"] = item.get("asset_path") or metadata.get("asset_path", "")
         chunk["asset_abs_path"] = item.get("asset_abs_path") or metadata.get("asset_abs_path", "")
         chunk["asset_summary"] = item.get("asset_summary") or metadata.get("asset_summary", "")
         chunk["asset_preview_text"] = item.get("asset_preview_text") or metadata.get("asset_preview_text", "")
         chunk["asset_caption"] = item.get("asset_caption") or metadata.get("asset_caption", "")
+        # asset-section 匹配字段用于解释章节锚点来源，不应被 section_title/path 的旧字段语义吞掉。
+        chunk["asset_section_match_type"] = first_present("asset_section_match_type", "")
+        chunk["asset_section_match_confidence"] = first_present("asset_section_match_confidence", 0.0)
+        chunk["asset_section_match_reason"] = first_present("asset_section_match_reason", "")
+        chunk["asset_section_match_is_heuristic"] = first_present("asset_section_match_is_heuristic", False)
+        chunk["asset_section_match_allow_embedding"] = first_present("asset_section_match_allow_embedding", False)
+        chunk["table_structured_text"] = item.get("table_structured_text") or metadata.get("table_structured_text", "")
+        chunk["table_structured_evidence"] = item.get("table_structured_evidence") or metadata.get("table_structured_evidence", {})
         chunk["asset_rows"] = item.get("asset_rows") or metadata.get("asset_rows", 0)
         chunk["asset_columns"] = item.get("asset_columns") or metadata.get("asset_columns", 0)
         chunk["order_index"] = item.get("order_index") or metadata.get("order_index", 0)

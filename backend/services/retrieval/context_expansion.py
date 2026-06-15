@@ -117,6 +117,7 @@ class ContextBudgetSelector:
             ]
             anchor_rank = {chunk_id: index for index, chunk_id in enumerate(anchor_order)}
             policy = context_expansion.get("policy") or {}
+            policy_name = str(policy.get("name", "default") or "default")
             candidates = self._score_budget_candidates(
                 context_expansion=context_expansion,
                 chunk_lookup=chunk_lookup,
@@ -146,7 +147,7 @@ class ContextBudgetSelector:
                     max_context_chars=max_context_chars,
                 )
 
-            ordered = self._order_final_context(selected, anchor_rank=anchor_rank)
+            ordered = self._order_final_context(selected, anchor_rank=anchor_rank, policy_name=policy_name)
             final_chunks = [self._annotate_final_chunk(item["chunk"], item) for item in ordered]
             debug = self._budget_debug(
                 original_top_chunks=reranked_chunks[:final_context_top_k],
@@ -155,7 +156,7 @@ class ContextBudgetSelector:
                 decisions=decisions,
                 final_chunks=final_chunks,
                 max_context_chars=max_context_chars,
-                policy_name=str(policy.get("name", "default") or "default"),
+                policy_name=policy_name,
             )
             return final_chunks, debug
         except Exception as exc:  # pragma: no cover - 预算层不能影响基础 QA 可用性
@@ -225,6 +226,9 @@ class ContextBudgetSelector:
         used_chars = 0
 
         anchor_slots = 1 if final_context_top_k <= 1 else max(1, min(len(anchor_rank), int(final_context_top_k * 0.65)))
+        # figure/table 问题常同时需要正文解释和命中的图表证据，至少保留两个 anchor 槽位避免主证据被预算规则挤掉。
+        if policy_name == "figure_table" and final_context_top_k > 1:
+            anchor_slots = max(anchor_slots, min(len(anchor_rank), 2))
         anchor_candidates = [
             item for item in candidates
             if item["context_role"] in {"anchor_evidence", "memory_context"}
@@ -285,10 +289,11 @@ class ContextBudgetSelector:
                 decisions.append(self._decision(item, include=True, reason="include_anchor_to_fill_budget", used_chars=used_chars, max_context_chars=max_context_chars))
         return selected, decisions
 
-    def _order_final_context(self, selected: List[Dict[str, Any]], *, anchor_rank: Dict[str, int]) -> List[Dict[str, Any]]:
+    def _order_final_context(self, selected: List[Dict[str, Any]], *, anchor_rank: Dict[str, int], policy_name: str) -> List[Dict[str, Any]]:
         return sorted(
             selected,
             key=lambda item: (
+                self._final_context_priority(item, policy_name),
                 item["anchor_group_index"],
                 self._role_order(item["context_role"]),
                 self._optional_int(item["chunk"].get("page_number")) or 9999,
@@ -297,6 +302,20 @@ class ContextBudgetSelector:
                 str(item["candidate_chunk_id"]),
             ),
         )
+
+    def _final_context_priority(self, item: Dict[str, Any], policy_name: str) -> int:
+        # figure_table 场景里，结构化表格单元格证据要优先于旁边的正文解释段落，避免答案被“更像上下文”的文本挤下去。
+        if policy_name == "figure_table":
+            chunk = item["chunk"]
+            matched_routes = set(item["candidate"].get("matched_routes") or [])
+            if str(chunk.get("chunk_type", "") or "").lower() == "table" and "table_structured" in matched_routes:
+                return 0
+            if str(chunk.get("chunk_type", "") or "").lower() == "figure":
+                return 1
+            if item["context_role"] in {"anchor_evidence", "table_evidence", "figure_evidence"}:
+                return 2
+            return 3
+        return 0
 
     def _annotate_final_chunk(self, chunk: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
         annotated = dict(chunk)
@@ -442,6 +461,9 @@ class ContextBudgetSelector:
         matched_routes = set(candidate.get("matched_routes", []) or [])
         if "memory_context" in matched_routes:
             return "memory_context"
+        # 进入预算层后 candidate 只保留 route 痕迹，不再携带完整 evidence；因此用命中的 route 标记识别结构化表格主证据。
+        if chunk_type == "table" and "table_structured" in matched_routes:
+            return "anchor_evidence"
         if chunk_type == "figure":
             return "figure_evidence"
         if chunk_type == "table":

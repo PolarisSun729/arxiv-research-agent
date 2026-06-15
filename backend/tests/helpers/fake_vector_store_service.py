@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+import tempfile
 from typing import Any, Dict, Iterable, List
 
 
@@ -12,6 +14,8 @@ class FakeVectorStoreService:
     def __init__(self) -> None:
         self.collections: dict[str, list[dict[str, Any]]] = {}
         self.calls: list[dict[str, Any]] = []
+        self.index_records: dict[str, dict[str, Any]] = {}
+        self.temp_dir = tempfile.TemporaryDirectory()
 
     def _record(self, method: str, **payload: Any) -> None:
         self.calls.append({"method": method, **payload})
@@ -77,6 +81,24 @@ class FakeVectorStoreService:
         self._record("get_collection_info", collection_name=normalized)
         return {"collection_name": normalized, "row_count": len(rows)}
 
+    def set_index_record(self, collection_name: str, record: Dict[str, Any]) -> None:
+        normalized = self._normalize_collection_name(collection_name)
+        self.index_records[normalized] = dict(record or {})
+
+    def write_chunk_payload(self, collection_name: str, payload: Dict[str, Any]) -> str:
+        normalized = self._normalize_collection_name(collection_name)
+        handle = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".json",
+            delete=False,
+            dir=self.temp_dir.name,
+        )
+        with handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        self.set_index_record(normalized, {"chunk_file": handle.name})
+        return handle.name
+
     def get_all_chunks(self, collection_name: str, limit: int | None = None) -> list[dict[str, Any]]:
         normalized = self._normalize_collection_name(collection_name)
         rows = list(self.collections.get(normalized, []))
@@ -120,3 +142,11 @@ class FakeVectorStoreService:
                 rows.append(dict(row))
         self._record("get_paper_embeddings_by_arxiv_ids", collection_name=normalized, count=len(rows))
         return rows
+
+    def __del__(self) -> None:
+        temp_dir = getattr(self, "temp_dir", None)
+        if temp_dir is not None:
+            try:
+                temp_dir.cleanup()
+            except Exception:
+                pass

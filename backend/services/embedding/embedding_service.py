@@ -656,6 +656,18 @@ class EmbeddingService:
             "asset_rows": int(chunk.get("asset_rows", chunk_metadata.get("asset_rows", 0)) or 0),
             "asset_columns": int(chunk.get("asset_columns", chunk_metadata.get("asset_columns", 0)) or 0),
             "asset_caption": str(chunk.get("asset_caption", chunk_metadata.get("asset_caption", "")) or ""),
+            # asset-section 匹配结果是弱章节锚点语义，下游需要保留依据和门控结果来解释召回来源。
+            "asset_section_match_type": str(chunk.get("asset_section_match_type", chunk_metadata.get("asset_section_match_type", "")) or ""),
+            "asset_section_match_confidence": float(
+                chunk.get("asset_section_match_confidence", chunk_metadata.get("asset_section_match_confidence", 0.0)) or 0.0
+            ),
+            "asset_section_match_reason": str(chunk.get("asset_section_match_reason", chunk_metadata.get("asset_section_match_reason", "")) or ""),
+            "asset_section_match_is_heuristic": bool(
+                chunk.get("asset_section_match_is_heuristic", chunk_metadata.get("asset_section_match_is_heuristic", False))
+            ),
+            "asset_section_match_allow_embedding": bool(
+                chunk.get("asset_section_match_allow_embedding", chunk_metadata.get("asset_section_match_allow_embedding", False))
+            ),
             "order_index": int(chunk.get("order_index", chunk_metadata.get("order_index", 0)) or 0),
             "word_count": int(chunk_metadata.get("word_count", len(chunk["content"].split()))),
             "total_chunks": int(chunk_count),

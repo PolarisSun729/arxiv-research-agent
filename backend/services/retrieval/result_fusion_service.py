@@ -6,7 +6,7 @@ from services.retrieval.contracts import FusionResult, QueryProfile
 
 
 class ResultFusionService:
-    """负责 route 去重与 RRF 融合，不执行召回或 rerank。"""
+    """负责 route 去重和 RRF 融合，不承担具体召回与 rerank。"""
 
     def __init__(
         self,
@@ -26,7 +26,7 @@ class ResultFusionService:
         fused_stage_limit: int,
         query_profile: QueryProfile,
     ) -> FusionResult:
-        """对各 route 先去重再做 RRF，输出 raw/fused 两级阶段结果。"""
+        """先对各 route 去重，再做 RRF 融合，输出 raw/fused 两级结果。"""
         deduped_routes = {
             route_name: self.dedupe_route_results(route_results)
             for route_name, route_results in routes.items()
@@ -64,12 +64,23 @@ class ResultFusionService:
                         "source_queries": [],
                     },
                 )
-                # RRF 投票只使用 route 排名、route 权重和 route confidence，避免混入 rerank 语义。
+                # RRF 投票只依赖 route 排名、route 权重和 route confidence，避免提前混入 rerank 语义。
                 vote = weight * route_confidence * (1.0 / (self.rrf_k + rank + 1))
+                vote *= self._table_structured_vote_multiplier(route_name, item)
                 entry["score"] += vote
                 entry["matched_routes"].append(route_name)
                 entry["route_scores"][route_name] = item.get("route_score")
                 entry["route_confidences"][route_name] = route_confidence
+                # 融合结果如果命中了结构化表格证据，主路由应指向 table_structured，方便下游调试与断言看到真实证据来源。
+                if route_name == "table_structured" and item.get("table_structured_evidence"):
+                    entry["retrieval_route"] = "table_structured"
+                    entry["table_structured_text"] = item.get("table_structured_text", entry.get("table_structured_text", ""))
+                    entry["table_structured_evidence"] = item.get("table_structured_evidence", entry.get("table_structured_evidence", {}))
+                    entry["table_structured_reason"] = item.get("table_structured_reason", entry.get("table_structured_reason", ""))
+                    entry["table_structured_confidence"] = item.get(
+                        "table_structured_confidence",
+                        entry.get("table_structured_confidence", 0.0),
+                    )
                 if item.get("source_query") and item["source_query"] not in entry["source_queries"]:
                     entry["source_queries"].append(item["source_query"])
 
@@ -126,6 +137,21 @@ class ResultFusionService:
                 if len(raw_results) >= limit:
                     return raw_results[:limit]
         return raw_results[:limit]
+
+    @staticmethod
+    def _table_structured_vote_multiplier(route_name: str, item: Dict[str, Any]) -> float:
+        """结构化单元格证据更接近最终答案，融合时给一个有限提权。"""
+        if route_name != "table_structured":
+            return 1.0
+        evidence = item.get("table_structured_evidence") or {}
+        if not isinstance(evidence, dict) or not evidence.get("matched_cells"):
+            return 1.0
+        numeric_operation = str(evidence.get("numeric_operation", "") or "").strip().lower()
+        confidence = float(evidence.get("confidence", 0.0) or 0.0)
+        multiplier = 1.0 + min(0.3, confidence * 0.22)
+        if numeric_operation in {"max", "min", "difference"}:
+            multiplier += 0.08
+        return multiplier
 
     @staticmethod
     def chunk_unique_key(item: Dict[str, Any]) -> str:

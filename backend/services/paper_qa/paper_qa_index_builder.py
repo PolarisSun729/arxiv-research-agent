@@ -12,6 +12,7 @@ from core.errors import AppError, ErrorCode
 from services.arxiv.arxiv_search_service import ArxivSearchService
 from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
 from services.document.chunking_service import ChunkingService
+from services.document.table_structure_service import TableStructureService
 from services.storage.database_service import DatabaseService
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
 from services.llm.generation_service import GenerationService, QWEN_RERANK_COMPRESS_MODEL_NAME
@@ -504,6 +505,48 @@ class PaperQAIndexBuilder:
         )
         return chunked_data, chunking_strategy
 
+    def structure_table_chunks(
+        self,
+        arxiv_id: str,
+        loading_method: str,
+        document: Dict[str, Any],
+        chunks: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """为 Docling table chunk 生成结构化表格对象，并把结果挂回文档产物。"""
+        if loading_method != "docling":
+            debug = {
+                "table_count": self._chunk_type_counts(chunks)[2],
+                "structured_table_count": 0,
+                "failed_table_parse_count": 0,
+                "docling_table_item_count": 0,
+            }
+            document["structured_tables"] = []
+            document["table_structure_debug"] = debug
+            return {"structured_tables": [], "debug": debug}
+
+        # 结构化表格是索引构建阶段的旁路证据：失败只影响 table index 调试信息，
+        # 不允许阻断 chunk 保存、embedding 和原有文本/图片/表格召回链路。
+        try:
+            service = TableStructureService(workspace_root=str(self._workspace_root()))
+            result = service.build_structured_tables(arxiv_id=arxiv_id, document=document, chunks=chunks)
+        except Exception as exc:
+            table_count = self._chunk_type_counts(chunks)[2]
+            logger.exception("Failed to build structured table index for %s: %s", arxiv_id, exc)
+            result = {
+                "structured_tables": [],
+                "debug": {
+                    "table_count": table_count,
+                    "structured_table_count": 0,
+                    "failed_table_parse_count": table_count,
+                    "docling_table_item_count": 0,
+                    "error": str(exc),
+                },
+            }
+
+        document["structured_tables"] = list(result.get("structured_tables") or [])
+        document["table_structure_debug"] = dict(result.get("debug") or {})
+        return result
+
     def save_chunk_file(
         self,
         loading_service: LoadingService,
@@ -812,6 +855,26 @@ class PaperQAIndexBuilder:
                 "document chunked",
                 chunk_count=len(chunks),
                 chunking_strategy=chunking_strategy,
+            )
+
+            current_stage = "structure_table_chunks"
+            self._notify_progress(
+                progress_callback,
+                current_stage=current_stage,
+                progress=50,
+                message="Structuring table chunks",
+            )
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
+            table_structure_result = self.structure_table_chunks(arxiv_id, loading_method, document, chunks)
+            table_debug = dict(table_structure_result.get("debug") or {})
+            self._log_stage(
+                "structure_table_chunks",
+                arxiv_id,
+                loading_method,
+                "table chunks structured",
+                table_count=table_debug.get("table_count"),
+                structured_table_count=table_debug.get("structured_table_count"),
+                failed_table_parse_count=table_debug.get("failed_table_parse_count"),
             )
 
             current_stage = "save_chunk_file"

@@ -343,6 +343,7 @@ class PaperQAService:
                     enable_query_rewrite=self._payload_get(payload, "enable_query_rewrite", None),
                     enable_hyde=self._payload_get(payload, "enable_hyde", None),
                     enable_keyword_search=self._payload_get(payload, "enable_keyword_search", None),
+                    enable_table_structured_route=self._payload_get(payload, "enable_table_structured_route", None),
                     enable_llm_rerank=self._payload_get(payload, "enable_llm_rerank", None),
                     enable_context_expansion=self._payload_get(payload, "enable_context_expansion", None),
                     debug=self._payload_get(payload, "debug", None),
