@@ -384,12 +384,33 @@ class RouteRetriever:
                     duplicate_reason = "same_normalized_query"
                     merged_into = existing["view_id"]
                     duplicate_of = existing["query"]
+                    # 去重不是简单丢弃：把被合并 view 挂到主 view 上，debug 才能解释 rewrite 数量为何没有继续抬分。
+                    existing.setdefault("merged_views", []).append(
+                        {
+                            "query": query,
+                            "normalized": normalized,
+                            "source": str(row.get("source", "rewrite") or "rewrite"),
+                            "source_index": int(row.get("source_index", 0) or 0),
+                            "reason": duplicate_reason,
+                        }
+                    )
                     break
                 similarity = self.keyword_query_similarity(normalized, existing["normalized"])
                 if similarity >= 0.88:
                     duplicate_reason = f"high_similarity:{similarity:.2f}"
                     merged_into = existing["view_id"]
                     duplicate_of = existing["query"]
+                    # 高相似 query 只贡献一次 BM25 召回，避免同一关键词因多个 rewrite 重复投票。
+                    existing.setdefault("merged_views", []).append(
+                        {
+                            "query": query,
+                            "normalized": normalized,
+                            "source": str(row.get("source", "rewrite") or "rewrite"),
+                            "source_index": int(row.get("source_index", 0) or 0),
+                            "reason": duplicate_reason,
+                            "similarity": round(float(similarity), 4),
+                        }
+                    )
                     break
             if duplicate_reason:
                 row["normalized"] = normalized
@@ -410,6 +431,7 @@ class RouteRetriever:
                     "source_index": source_index,
                     "selected": True,
                     "reason": "kept",
+                    "merged_views": [],
                 }
             )
 

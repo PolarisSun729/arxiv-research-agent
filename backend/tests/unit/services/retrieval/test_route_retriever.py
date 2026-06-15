@@ -156,6 +156,13 @@ class RouteRetrieverTests(unittest.TestCase):
         rewrite_views = [item for item in query_views if item["source"] == "rewrite"]
 
         self.assertLessEqual(len(rewrite_views), 2)
+        merged_views = [
+            merged
+            for item in query_views
+            for merged in item.get("merged_views", [])
+        ]
+        self.assertTrue(merged_views)
+        self.assertTrue(any(item["reason"].startswith("high_similarity") for item in merged_views))
 
     def test_keyword_route_rewrite_count_does_not_linearly_boost_keyword_score(self) -> None:
         query_bundle = self.service.query_planner.build_query_bundle(

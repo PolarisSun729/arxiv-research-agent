@@ -186,6 +186,17 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
         self.assertIn("routes", debug)
         self.assertIn("collection_profile", debug)
 
+    def test_non_debug_response_keeps_debug_payload_hidden(self) -> None:
+        result = self.service.enhanced_retrieve(
+            "What is the method of the paper?",
+            self.collection_name,
+            options=self.options_cls(debug=False, enable_llm_rerank=False),
+        )
+
+        self.assertIn("chunks", result)
+        self.assertNotIn("debug", result)
+        self.assertNotIn("trace_export", result)
+
     def test_context_expansion_debug_links_subchunks_sections_and_assets(self) -> None:
         service, collection_name, *_ = build_retrieval_service(chunks=build_context_expansion_chunks())
         options_cls = type(service).enhanced_retrieve.__globals__["RetrievalOptions"]

@@ -331,9 +331,12 @@ class RetrievalTraceBuilder:
             # keyword route 的 BM25 可解释字段，便于在 debug 里直接看到“为什么召回”。
             "bm25_raw_score": item.get("bm25_raw_score"),
             "bm25_fused_score": item.get("bm25_fused_score"),
+            "keyword_best_raw_bm25_score": item.get("keyword_best_raw_bm25_score"),
+            "keyword_base_route_confidence": item.get("keyword_base_route_confidence"),
             "keyword_match_fields": item.get("keyword_match_fields", []),
             "keyword_matched_terms": item.get("keyword_matched_terms", []),
             "keyword_query_sources": item.get("keyword_query_sources", []),
+            "keyword_query_contributions": item.get("keyword_query_contributions", []),
             "keyword_noise_flags": item.get("keyword_noise_flags", []),
             "keyword_hit_asset_field": item.get("keyword_hit_asset_field"),
             "memory_score": item.get("memory_score"),
