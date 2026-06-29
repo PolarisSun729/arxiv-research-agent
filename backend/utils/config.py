@@ -551,6 +551,7 @@ RERANK_CONFIG: Dict[str, Any] = {
     "enable_query_rewrite": _env_bool("ENABLE_QUERY_REWRITE", True),
     "enable_hyde": _env_bool("ENABLE_HYDE", False),
     "enable_keyword_search": _env_bool("ENABLE_KEYWORD_SEARCH", True),
+    "keyword_backend": _env_str("KEYWORD_BACKEND", "bm25s"),  # bm25s or internal_bm25
     "enable_table_structured_route": _env_bool("ENABLE_TABLE_STRUCTURED_ROUTE", True),
     "enable_llm_rerank": _env_bool("ENABLE_LLM_RERANK", True),
     "debug": _env_bool("RETRIEVAL_DEBUG", False),
@@ -577,6 +578,7 @@ RETRIEVAL_CONFIG: Dict[str, Any] = {
     "enable_query_rewrite": RERANK_CONFIG["enable_query_rewrite"],
     "enable_hyde": RERANK_CONFIG["enable_hyde"],
     "enable_keyword_search": RERANK_CONFIG["enable_keyword_search"],
+    "keyword_backend": RERANK_CONFIG["keyword_backend"],
     "enable_table_structured_route": RERANK_CONFIG["enable_table_structured_route"],
     "enable_llm_rerank": RERANK_CONFIG["enable_llm_rerank"],
     "debug": RERANK_CONFIG["debug"],

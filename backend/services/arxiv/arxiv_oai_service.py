@@ -1003,6 +1003,8 @@ class ArxivOaiSyncService:
                 )
                 return None
 
+            # 显式指定 UTF-8 编码，避免 requests 自动推断编码错误导致字符乱码
+            response.encoding = 'utf-8'
             return response.text
 
         return None

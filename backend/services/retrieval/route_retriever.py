@@ -61,6 +61,51 @@ class RouteRetriever:
             },
             max_workers=ENHANCED_RETRIEVAL_CONFIG.get("route_max_workers", 4),
         )
+        # Initialize keyword backends
+        self._keyword_backend = self._initialize_keyword_backend()
+
+    def _initialize_keyword_backend(self) -> Any:
+        """Initialize keyword backend based on config, with fallback to internal_bm25."""
+        from services.retrieval.keyword_backend import InternalBM25Backend
+        from services.retrieval.bm25s_backend import BM25sBackend
+
+        backend_config = str(ENHANCED_RETRIEVAL_CONFIG.get("keyword_backend", "bm25s") or "bm25s").strip().lower()
+
+        # Always create internal backend as fallback
+        internal_backend = InternalBM25Backend(
+            query_tools=self.query_tools,
+            route_confidence_builder=self.route_confidence_builder,
+            structural_bonus_builder=self.structural_bonus_builder,
+            fusion_service=self.fusion_service,
+        )
+
+        if backend_config == "internal_bm25":
+            logger.info("Using internal_bm25 keyword backend")
+            return internal_backend
+
+        # Try to use bm25s backend
+        try:
+            bm25s_backend = BM25sBackend(
+                query_tools=self.query_tools,
+                route_confidence_builder=self.route_confidence_builder,
+                structural_bonus_builder=self.structural_bonus_builder,
+                fusion_service=self.fusion_service,
+            )
+
+            # Check if bm25s is actually available
+            if bm25s_backend._bm25s_available:
+                logger.info("Using bm25s keyword backend")
+                return bm25s_backend
+            else:
+                logger.warning(
+                    "bm25s backend configured but not available, falling back to internal_bm25: %s",
+                    bm25s_backend._import_error,
+                )
+                return internal_backend
+        except Exception as exc:
+            logger.warning("Failed to initialize bm25s backend, falling back to internal_bm25: %s", exc)
+            return internal_backend
+
 
     def build_route_bundle(
         self,
@@ -671,276 +716,58 @@ class RouteRetriever:
         return self.normalize_route_results(results, route_name, source_query, route_confidence, query_profile)
 
     def keyword_retrieve(self, collection_name: str, query_views: List[Dict[str, Any]], top_k: int, query_profile: QueryProfile, retrieval_index: CollectionRetrievalIndex) -> Dict[str, Any]:
-        if not retrieval_index.documents:
-            return {"results": [], "debug": retrieval_index.to_keyword_debug(0, full_scan_used=False)}
-        aggregated: Dict[int, Dict[str, Any]] = {}
-        per_query_debug: List[Dict[str, Any]] = []
-        original_query_tokens: List[str] = []
-        expanded_query_tokens: List[str] = []
-        field_weights = self.keyword_field_weights_for_query(query_profile)
-        for query_view in query_views:
-            query = str(query_view.get("query", "") or "")
-            raw_tokens = self.query_tools.tokenize_for_keyword_search(query)
-            tokens = self.filter_keyword_query_tokens(raw_tokens)
-            if not tokens:
-                continue
-            query_weight = float(query_view.get("weight", 0.0) or 0.0)
-            if query_weight <= 0:
-                continue
-            expanded_tokens = self.expand_keyword_query_tokens(tokens)
-            for token in tokens:
-                if token not in original_query_tokens:
-                    original_query_tokens.append(token)
-            for token in expanded_tokens:
-                if token not in expanded_query_tokens:
-                    expanded_query_tokens.append(token)
-            token_counter = Counter(expanded_tokens)
-            # 只遍历倒排表命中的 doc，避免每次 query 都对 collection 全量 chunk 重算 BM25。
-            candidate_doc_ids = set()
-            for token in token_counter:
-                candidate_doc_ids.update(retrieval_index.postings.get(token, set()))
-            query_candidate_rows: List[Dict[str, Any]] = []
-            for doc_id in candidate_doc_ids:
-                document = retrieval_index.documents[doc_id]
-                doc_field_weights = self.keyword_field_weights_for_document(field_weights, document.chunk, query_profile)
-                doc_counts, doc_length, match_fields, token_field_hits = self.weight_keyword_document_fields(
-                    document.field_token_counts or {"body": document.token_counts},
-                    token_counter,
-                    doc_field_weights,
-                )
-                if not doc_counts:
-                    continue
-                bm25_detail = self.bm25_score_detailed(
-                    token_counter,
-                    doc_counts,
-                    retrieval_index.document_frequency,
-                    len(retrieval_index.documents),
-                    retrieval_index.avgdl,
-                    document.content_prefix,
-                    doc_length=doc_length or document.doc_length,
-                    token_field_hits=token_field_hits,
-                )
-                raw_score = bm25_detail["score"]
-                if raw_score <= 0:
-                    continue
-                query_candidate_rows.append(
-                    {
-                        "doc_id": doc_id,
-                        "raw_score": float(raw_score),
-                        "matched_fields": Counter(match_fields),
-                        "term_details": bm25_detail["term_details"],
-                    }
-                )
-            query_candidate_rows.sort(key=lambda item: item["raw_score"], reverse=True)
-            if not query_candidate_rows:
-                per_query_debug.append(
-                    {
-                        "view_id": query_view["view_id"],
-                        "query": query,
-                        "source": query_view["source"],
-                        "weight": query_weight,
-                        "query_tokens": tokens,
-                        "expanded_tokens": expanded_tokens,
-                        "candidate_count": 0,
-                        "top_hits": [],
-                    }
-                )
-                continue
-            normalized_scores = self.normalize_scores([float(item["raw_score"]) for item in query_candidate_rows])
-            per_query_top_rows: List[Dict[str, Any]] = []
-            for rank, row in enumerate(query_candidate_rows[:top_k], start=1):
-                normalized_score = float(normalized_scores[rank - 1]) if rank - 1 < len(normalized_scores) else 0.0
-                rrf_vote = query_weight * (1.0 / (self.keyword_rrf_k() + rank))
-                contribution_score = query_weight * normalized_score
-                entry = aggregated.setdefault(
-                    row["doc_id"],
-                    {
-                        "fusion_score": 0.0,
-                        "best_raw_score": 0.0,
-                        "matched_fields": Counter(),
-                        "view_contributions": [],
-                        "term_traces": {},
-                        "query_sources": [],
-                    },
-                )
-                entry["fusion_score"] += rrf_vote
-                entry["best_raw_score"] = max(float(entry["best_raw_score"]), float(row["raw_score"]))
-                entry["matched_fields"].update(row["matched_fields"])
-                if query_view["source"] not in entry["query_sources"]:
-                    entry["query_sources"].append(query_view["source"])
-                # 跨 query view 聚合每个命中词，保留最大贡献分与最高 idf，便于解释“为什么召回”。
-                for term in row.get("term_details", []):
-                    token = term["token"]
-                    trace = entry["term_traces"].setdefault(
-                        token,
-                        {
-                            "token": token,
-                            "idf": float(term["idf"]),
-                            "best_term_score": 0.0,
-                            "fields": [],
-                            "query_sources": [],
-                        },
-                    )
-                    trace["idf"] = max(float(trace["idf"]), float(term["idf"]))
-                    trace["best_term_score"] = max(float(trace["best_term_score"]), float(term["term_score"]))
-                    for field in term.get("fields", []):
-                        if field not in trace["fields"]:
-                            trace["fields"].append(field)
-                    if query_view["source"] not in trace["query_sources"]:
-                        trace["query_sources"].append(query_view["source"])
-                entry["view_contributions"].append(
-                    {
-                        "view_id": query_view["view_id"],
-                        "source": query_view["source"],
-                        "query": query,
-                        "rank": rank,
-                        "weight": query_weight,
-                        "raw_score": float(row["raw_score"]),
-                        "normalized_score": normalized_score,
-                        "rrf_vote": float(rrf_vote),
-                        "contribution_score": float(contribution_score),
-                        "matched_fields": [field for field, _ in row["matched_fields"].most_common(4)],
-                        "matched_terms": [term["token"] for term in row.get("term_details", [])[:6]],
-                    }
-                )
-                per_query_top_rows.append(
-                    {
-                        "chunk_id": str(retrieval_index.documents[row["doc_id"]].chunk.get("chunk_id", "") or ""),
-                        "rank": rank,
-                        "raw_score": float(row["raw_score"]),
-                        "normalized_score": normalized_score,
-                        "rrf_vote": float(rrf_vote),
-                        "matched_fields": [field for field, _ in row["matched_fields"].most_common(4)],
-                    }
-                )
-            per_query_debug.append(
-                {
-                    "view_id": query_view["view_id"],
-                    "query": query,
-                    "source": query_view["source"],
-                    "weight": query_weight,
-                    "query_tokens": tokens,
-                    "expanded_tokens": expanded_tokens,
-                    "candidate_count": len(query_candidate_rows),
-                    "top_hits": per_query_top_rows,
-                }
-            )
-        ranked = [(doc_id, payload) for doc_id, payload in aggregated.items() if float(payload.get("fusion_score", 0.0) or 0.0) > 0]
-        ranked.sort(
-            key=lambda item: (
-                float(item[1].get("fusion_score", 0.0) or 0.0),
-                float(item[1].get("best_raw_score", 0.0) or 0.0),
-            ),
-            reverse=True,
-        )
-        if not ranked:
-            return {
-                "results": [],
-                "debug": {
-                    **retrieval_index.to_keyword_debug(0, full_scan_used=False),
-                    "query_tokens": original_query_tokens,
-                    "expanded_tokens": expanded_query_tokens,
-                    "query_expansion_applied": bool(set(expanded_query_tokens) - set(original_query_tokens)),
-                    "matched_chunks": [],
-                    "field_weights": field_weights,
-                    "query_contributions": per_query_debug,
-                    "keyword_fusion_strategy": "weighted_rrf",
-                },
-            }
-        normalized_scores = self.normalize_scores([float(payload.get("fusion_score", 0.0) or 0.0) for _, payload in ranked])
-        base_route_confidence = self.route_confidence_builder(
-            "keyword",
-            query_profile,
-            " | ".join([row["query"] for row in query_views]) if query_views else query_profile.original_query,
-            route_queries=[row["query"] for row in query_views] or [query_profile.keyword_query],
-            intent_profile=query_profile.intent_profile,
-        )
-        results: List[Dict[str, Any]] = []
-        for rank, ((doc_id, payload), normalized_score) in enumerate(zip(ranked[:top_k], normalized_scores[:top_k]), start=1):
-            chunk = dict(retrieval_index.documents[doc_id].chunk)
-            fusion_score = float(payload.get("fusion_score", 0.0) or 0.0)
-            best_raw_score = float(payload.get("best_raw_score", 0.0) or 0.0)
-            query_contributions = sorted(
-                list(payload.get("view_contributions", [])),
-                key=lambda item: (float(item.get("rrf_vote", 0.0) or 0.0), float(item.get("raw_score", 0.0) or 0.0)),
-                reverse=True,
-            )
-            match_fields = payload.get("matched_fields", Counter())
-            main_fields = [field for field, _ in match_fields.most_common(4)]
-            matched_terms = self.build_matched_terms(payload.get("term_traces", {}))
-            query_sources = list(payload.get("query_sources", []))
-            noise_flags = self.detect_keyword_noise_flags(
-                matched_terms=matched_terms,
-                matched_fields=main_fields,
+        """Keyword retrieval with backend selection and automatic fallback."""
+        from services.retrieval.keyword_backend import InternalBM25Backend
+
+        # Try configured backend first
+        try:
+            result = self._keyword_backend.retrieve(
+                query_views=query_views,
+                top_k=top_k,
                 query_profile=query_profile,
-                chunk=chunk,
+                retrieval_index=retrieval_index,
             )
-            route_confidence = self.adjust_keyword_route_confidence(
-                base_route_confidence,
-                matched_terms=matched_terms,
-                noise_flags=noise_flags,
-                query_profile=query_profile,
+
+            # If backend succeeded, return results with backend info
+            if not result.fallback_reason:
+                debug = dict(result.debug)
+                debug["keyword_backend"] = result.backend_name
+                debug["keyword_backend_fallback"] = False
+                return {"results": result.results, "debug": debug}
+
+            # Backend returned with fallback reason - log and fallback
+            logger.warning(
+                "Keyword backend %s failed, falling back to internal_bm25: %s",
+                result.backend_name,
+                result.fallback_reason,
             )
-            chunk["retrieval_route"] = "keyword"
-            chunk["source_query"] = " | ".join([item["query"] for item in query_contributions[:3]])
-            chunk["route_rank"] = rank
-            # keyword route 的 route_score 现在表示 query-view fusion 后的 relevance，不再是跨 query 原始 BM25 生硬累加。
-            chunk["route_score"] = fusion_score
-            chunk["normalized_route_score"] = float(normalized_score)
-            chunk["route_confidence"] = float(route_confidence)
-            chunk["structural_bonus"] = float(self.structural_bonus_builder(chunk, query_profile))
-            chunk["keyword_match_fields"] = main_fields
-            chunk["keyword_hit_asset_field"] = any(field in {"asset_caption", "asset_aux"} for field in main_fields)
-            chunk["keyword_query_contributions"] = query_contributions
-            chunk["keyword_best_raw_bm25_score"] = best_raw_score
-            # Step3 可解释字段：matched_terms / query_sources / 原始与融合分 / 噪声标记。
-            chunk["bm25_raw_score"] = best_raw_score
-            chunk["bm25_fused_score"] = fusion_score
-            chunk["keyword_matched_terms"] = matched_terms
-            chunk["keyword_query_sources"] = query_sources
-            chunk["keyword_noise_flags"] = noise_flags
-            chunk["keyword_base_route_confidence"] = float(base_route_confidence)
-            results.append(chunk)
-        return {
-            "results": results,
-            "debug": {
-                **retrieval_index.to_keyword_debug(len(ranked), full_scan_used=False),
-                "query_tokens": original_query_tokens,
-                "expanded_tokens": expanded_query_tokens,
-                "query_expansion_applied": bool(set(expanded_query_tokens) - set(original_query_tokens)),
-                "field_weights": field_weights,
-                "query_contributions": per_query_debug,
-                "keyword_fusion_strategy": "weighted_rrf",
-                "keyword_rrf_k": self.keyword_rrf_k(),
-                "base_route_confidence": float(base_route_confidence),
-                "matched_chunks": [
-                    {
-                        "chunk_id": str(retrieval_index.documents[doc_id].chunk.get("chunk_id", "") or ""),
-                        "keyword_fusion_score": float(payload.get("fusion_score", 0.0) or 0.0),
-                        "best_raw_bm25_score": float(payload.get("best_raw_score", 0.0) or 0.0),
-                        "matched_fields": [field for field, _ in payload.get("matched_fields", Counter()).most_common(4)],
-                        "matched_terms": self.build_matched_terms(payload.get("term_traces", {})),
-                        "query_sources": list(payload.get("query_sources", [])),
-                        "noise_flags": self.detect_keyword_noise_flags(
-                            matched_terms=self.build_matched_terms(payload.get("term_traces", {})),
-                            matched_fields=[field for field, _ in payload.get("matched_fields", Counter()).most_common(4)],
-                            query_profile=query_profile,
-                            chunk=retrieval_index.documents[doc_id].chunk,
-                        ),
-                        "hit_asset_field": any(
-                            field in {"asset_caption", "asset_aux"}
-                            for field, _ in payload.get("matched_fields", Counter()).most_common(4)
-                        ),
-                        "view_contributions": sorted(
-                            list(payload.get("view_contributions", [])),
-                            key=lambda item: (float(item.get("rrf_vote", 0.0) or 0.0), float(item.get("raw_score", 0.0) or 0.0)),
-                            reverse=True,
-                        )[:4],
-                    }
-                    for doc_id, payload in ranked[:top_k]
-                ],
-            },
-        }
+
+        except Exception as exc:
+            logger.warning("Keyword backend execution failed, falling back to internal_bm25: %s", exc, exc_info=True)
+
+        # Fallback to internal_bm25
+        internal_backend = InternalBM25Backend(
+            query_tools=self.query_tools,
+            route_confidence_builder=self.route_confidence_builder,
+            structural_bonus_builder=self.structural_bonus_builder,
+            fusion_service=self.fusion_service,
+        )
+
+        fallback_result = internal_backend.retrieve(
+            query_views=query_views,
+            top_k=top_k,
+            query_profile=query_profile,
+            retrieval_index=retrieval_index,
+        )
+
+        debug = dict(fallback_result.debug)
+        debug["keyword_backend"] = "internal_bm25"
+        debug["keyword_backend_fallback"] = True
+        debug["keyword_backend_fallback_reason"] = getattr(
+            self._keyword_backend, "backend_name", lambda: "unknown"
+        )() + " failed"
+        return {"results": fallback_result.results, "debug": debug}
+        return {"results": fallback_result.results, "debug": debug}
 
     def expand_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
         expander = getattr(self.query_tools, "expand_keyword_query_tokens", None)

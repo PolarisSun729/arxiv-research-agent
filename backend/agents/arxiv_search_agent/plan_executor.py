@@ -2262,10 +2262,13 @@ class PlanExecutor:
     ) -> None:
         """统一清理确认消费后的执行现场，避免旧 waiting_confirmation 残留回灌。
 
-        这里负责维护 runtime / runtime_state 两份真源：
+        这里负责维护 runtime / runtime_state / plan_runtime 三份真源：
         1. 清空 pending_confirmation，保证同一个确认只消费一次；
         2. 重置 turn_status，避免后续 finalize/checkpoint 继续把本轮误判成 waiting_confirmation；
         3. 显式写入下一步状态和恢复语义，保证批准/拒绝/目标确认三条链路的收尾一致。
+
+        CRITICAL: 必须同时清空 runtime / runtime_state / plan_runtime 三处的 pending_confirmation，
+        否则 persist_state 会从残留的 pending_confirmation 重新生成 waiting 状态，导致确认循环。
         """
         runtime.step_status[step.step_id] = next_step_status  # type: ignore[assignment]
         runtime.pending_confirmation = None
@@ -2279,6 +2282,12 @@ class PlanExecutor:
             state.runtime_state.current_step_id = step.step_id
             state.runtime_state.step_status = dict(state.runtime_state.step_status or {})
             state.runtime_state.step_status[step.step_id] = next_step_status
+
+        # 同步清空 plan_runtime.pending_confirmation，避免 persist_state 从中读取并覆盖已消费的状态
+        if state.plan_runtime is not None:
+            state.plan_runtime.pending_confirmation = None
+            state.plan_runtime.recovery_strategy = dict(recovery_strategy) if recovery_strategy else None
+            state.plan_runtime.turn_status = None
 
     def _consume_confirmation_approval(
         self,
