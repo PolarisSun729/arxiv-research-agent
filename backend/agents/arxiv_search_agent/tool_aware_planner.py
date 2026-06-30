@@ -1535,6 +1535,19 @@ def _validate_arxiv_search_executable_sequence(steps: Sequence[PlanStep]) -> Lis
     tool_names = [str(step.tool_name or "").strip() for step in list(steps or [])]
     steps_by_id = {str(step.step_id or "").strip(): step for step in list(steps or []) if str(step.step_id or "").strip()}
     reasons: List[str] = []
+    if _is_context_backed_arxiv_sequence(steps):
+        # Artifact skeleton 已经裁剪 candidate_paper_set 时，计划可以直接消费上下文论文；
+        # 但仍必须保留 validate -> synthesize 质量门，不能让回答步骤绕过证据检查。
+        required_tools = ["validate_arxiv_results", "synthesize_arxiv_response"]
+        for tool_name in required_tools:
+            if tool_name not in tool_names:
+                reasons.append(f"context-backed arxiv_search plan missing required tool {tool_name}")
+        reasons.extend(_validate_order(tool_names, required_tools, "context-backed arxiv_search"))
+        synthesize_step = _find_plan_step_by_tool(steps, "synthesize_arxiv_response")
+        if synthesize_step and not _depends_on_tool(synthesize_step, steps, "validate_arxiv_results"):
+            reasons.append("context-backed arxiv_search synthesize_arxiv_response must depend on validate_arxiv_results")
+        return reasons
+
     required_tools = [
         "normalize_request",
         "build_arxiv_search_spec",
@@ -1589,6 +1602,31 @@ def _validate_arxiv_search_executable_sequence(steps: Sequence[PlanStep]) -> Lis
                         f"arxiv_search build_arxiv_search_spec.{input_key} must split sort_by and sort_order instead of {sort_by}"
                     )
     return reasons
+
+
+def _is_context_backed_arxiv_sequence(steps: Sequence[PlanStep]) -> bool:
+    tool_names = {str(step.tool_name or "").strip() for step in list(steps or [])}
+    if {"normalize_request", "build_arxiv_search_spec", "search_arxiv"}.intersection(tool_names):
+        return False
+    validate_step = _find_plan_step_by_tool(steps, "validate_arxiv_results")
+    if validate_step is None:
+        return False
+    for binding in list(validate_step.input_bindings or []):
+        if str(binding.input_key or "").strip() != "arxiv_results":
+            continue
+        if binding.source_type != "literal" or not isinstance(binding.value, Mapping):
+            continue
+        papers = binding.value.get("papers")
+        if isinstance(papers, list) and papers:
+            return True
+    return False
+
+
+def _find_plan_step_by_tool(steps: Sequence[PlanStep], tool_name: str) -> Optional[PlanStep]:
+    for step in list(steps or []):
+        if step.tool_name == tool_name:
+            return step
+    return None
 
 
 def _binding_source_label(binding: StepInputBinding) -> str:

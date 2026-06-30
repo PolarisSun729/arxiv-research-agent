@@ -756,6 +756,12 @@ def _unmet_evidence_requirements(plan: ArtifactEvidencePlan, planner_context: Pl
             elif requirement.capability_status == "requires_index" and not qa_result:
                 # 正文、图表类证据需要 Paper QA 索引或后续回答工具确认；这里先记录缺口，避免 planner 假装证据已满足。
                 unmet.append(_unmet_payload(artifact, requirement, "paper index evidence is not observed at planning time"))
+            elif requirement.capability_status == "requires_confirmation":
+                # 索引构建或高风险获取路径需要用户确认时，planner 只能记录等待确认边界，不能直接编译成无确认工具步骤。
+                unmet.append(_unmet_payload(artifact, requirement, "evidence acquisition requires explicit confirmation"))
+            elif requirement.capability_status in {"blocked", "unsupported"}:
+                # blocked/unsupported 是能力边界，不是执行失败；后续 Tool Planner 不应为它生成虚假的工具步骤。
+                unmet.append(_unmet_payload(artifact, requirement, "evidence is outside the currently executable capability boundary"))
             elif requirement.capability_status == "degraded":
                 unmet.append(_unmet_payload(artifact, requirement, "evidence is available only as a degraded planning signal"))
     return unmet
@@ -794,7 +800,7 @@ def _diagnostic_events_for_plan(plan: ArtifactEvidencePlan, unmet: Sequence[Mapp
         )
     for item in list(unmet or []):
         status = str(item.get("capability_status") or "")
-        severity = "info" if status == "degraded" else "warning"
+        severity = "error" if status in {"blocked", "unsupported"} else ("info" if status == "degraded" else "warning")
         events.append(
             PlanningDiagnostic(
                 code=f"evidence_{status or 'unknown'}",

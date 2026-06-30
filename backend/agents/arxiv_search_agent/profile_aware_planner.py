@@ -11,6 +11,14 @@ from .artifact_templates import (
     build_artifact_evidence_plan,
     evidence_quality_reservations,
     evidence_tool_mapping,
+    refresh_artifact_evidence_diagnostics,
+)
+from .artifact_validation import (
+    ArtifactPlanValidator,
+    CapabilityAlignmentChecker,
+    attach_artifact_tooling_diagnostics,
+    build_artifact_progress_reservations,
+    build_artifact_step_mapping,
 )
 from .schemas import (
     ArtifactEvidencePlan,
@@ -25,6 +33,7 @@ from .schemas import (
 from .state import AgentState
 from .tool_registry import ToolRegistry
 from .tool_aware_planner import (
+    PlanDraftPlanningError,
     RuleBasedToolAwarePlanBuilder,
     _binding_dict,
     _context_mapping_from_planner_context,
@@ -102,6 +111,10 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
             "artifact_plan": [],
             "evidence_tool_mapping": [],
             "unmet_evidence_requirements": [],
+            "artifact_plan_validation": {},
+            "capability_alignment": [],
+            "artifact_step_mapping": [],
+            "artifact_progress_reservations": [],
             "evidence_quality_reservations": {},
             "artifact_refinement": {
                 "enabled": self.enable_artifact_refinement,
@@ -162,65 +175,97 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
         profile: Mapping[str, Any],
         tools_by_name: Mapping[str, ToolSpec],
     ) -> PlanDraft:
-        normalize = self._require_tool(tools_by_name, "normalize_request", required_tags={"search"})
-        build_spec = self._require_tool(tools_by_name, "build_arxiv_search_spec", required_tags={"search"})
-        search = self._require_tool(tools_by_name, "search_arxiv", required_tags={"search"})
         validate = self._require_tool(tools_by_name, "validate_arxiv_results", required_tags={"validate"})
         synthesize = self._require_tool(tools_by_name, "synthesize_arxiv_response", required_tags={"answer"})
         task_type = str(profile.get("research_task_type") or "direction_exploration").strip()
         artifact_evidence_plan = build_artifact_evidence_plan(_profile_with_task_type(profile, task_type), planner_context)
         artifact_evidence_plan = self._refine_artifact_evidence_plan(artifact_evidence_plan, profile, planner_context)
+        artifact_evidence_plan = self._align_artifact_evidence_plan(artifact_evidence_plan, planner_context, tools_by_name)
 
-        steps: List[PlanDraftStep] = [
-            self._draft_step(
-                "normalize_request",
-                normalize,
-                action_type="write_state",
-                output_key="topic_terms",
-                reason="先把用户请求归一成主题术语和约束，后续候选集、代表集和综述产物都以这个科研对象为锚点。",
-                input_bindings=[
-                    _binding_dict("intent", source_type="state", source_key="intent"),
-                    _binding_dict("message", source_type="state", source_key="message"),
-                    _binding_dict("search_spec", source_type="search_spec"),
-                ],
-            ),
-            self._draft_step(
-                "build_arxiv_search_spec",
-                build_spec,
-                action_type="search",
-                output_key="candidate_search_spec",
-                reason="把主题术语编译成可执行检索规格，承担“候选论文集合”这一中间产物的证据入口职责。",
-                depends_on=["normalize_request"],
-                input_bindings=[_binding_dict("normalized_request", source_type="step_output", step_id="normalize_request")],
-            ),
-            self._draft_step(
-                "search_arxiv",
-                search,
-                action_type="search",
-                output_key="candidate_paper_set",
-                reason="复杂科研任务先产生候选论文集合，而不是直接生成回答；后续比较、gap 或阅读顺序都依赖这个候选集。",
-                depends_on=["build_arxiv_search_spec"],
-                input_bindings=[_binding_dict("search_spec", source_type="step_output", step_id="build_arxiv_search_spec")],
-                retry_policy=StepPolicy(policy_type="retry", mode="allow_search_relaxation", max_attempts=3) if search.can_retry else None,
-            ),
-            self._draft_step(
-                "validate_arxiv_results",
-                validate,
-                action_type="validate",
-                output_key="candidate_evidence_quality",
-                reason="先评估候选集数量和可用性，给 Observer/Replanner 预留“证据不足也可补检索”的质量入口。",
-                depends_on=["search_arxiv"],
-                input_bindings=[_binding_dict("arxiv_results", source_type="step_output", step_id="search_arxiv")],
-            ),
-        ]
+        context_arxiv_results = _candidate_context_arxiv_results(planner_context)
+        use_context_candidates = bool(context_arxiv_results.get("papers")) and not _artifact_id_exists(
+            artifact_evidence_plan,
+            "candidate_papers",
+        )
+        steps: List[PlanDraftStep] = []
+        arxiv_results_binding: Dict[str, Any]
+        candidate_source_step_id: Optional[str] = None
+
+        if use_context_candidates:
+            # Skeleton 已经确认候选集来自上下文，Tool Planner 不能再无脑触发外部检索；
+            # 这里把上下文论文包成 validate_arxiv_results 可消费的结构，保证后续质量门仍存在。
+            for skipped_step in ("normalize_request", "build_arxiv_search_spec", "search_arxiv"):
+                self._skip_step(skipped_step, "candidate_paper_set_pruned_by_context")
+            arxiv_results_binding = _binding_dict("arxiv_results", source_type="literal", value=context_arxiv_results)
+            steps.append(
+                self._draft_step(
+                    "validate_arxiv_results",
+                    validate,
+                    action_type="validate",
+                    output_key="candidate_evidence_quality",
+                    reason="已有候选论文上下文时只验证可用性，不重复触发外部 arXiv 检索。",
+                    input_bindings=[arxiv_results_binding],
+                )
+            )
+        else:
+            normalize = self._require_tool(tools_by_name, "normalize_request", required_tags={"search"})
+            build_spec = self._require_tool(tools_by_name, "build_arxiv_search_spec", required_tags={"search"})
+            search = self._require_tool(tools_by_name, "search_arxiv", required_tags={"search"})
+            arxiv_results_binding = _binding_dict("arxiv_results", source_type="step_output", step_id="search_arxiv", required=False)
+            candidate_source_step_id = "search_arxiv"
+            steps.extend(
+                [
+                    self._draft_step(
+                        "normalize_request",
+                        normalize,
+                        action_type="write_state",
+                        output_key="topic_terms",
+                        reason="先把用户请求归一成主题术语和约束，后续候选集、代表集和综述产物都以这个科研对象为锚点。",
+                        input_bindings=[
+                            _binding_dict("intent", source_type="state", source_key="intent"),
+                            _binding_dict("message", source_type="state", source_key="message"),
+                            _binding_dict("search_spec", source_type="search_spec"),
+                        ],
+                    ),
+                    self._draft_step(
+                        "build_arxiv_search_spec",
+                        build_spec,
+                        action_type="search",
+                        output_key="candidate_search_spec",
+                        reason="把主题术语编译成可执行检索规格，承担“候选论文集合”这一中间产物的证据入口职责。",
+                        depends_on=["normalize_request"],
+                        input_bindings=[_binding_dict("normalized_request", source_type="step_output", step_id="normalize_request")],
+                    ),
+                    self._draft_step(
+                        "search_arxiv",
+                        search,
+                        action_type="search",
+                        output_key="candidate_paper_set",
+                        reason="复杂科研任务先产生候选论文集合，而不是直接生成回答；后续比较、gap 或阅读顺序都依赖这个候选集。",
+                        depends_on=["build_arxiv_search_spec"],
+                        input_bindings=[_binding_dict("search_spec", source_type="step_output", step_id="build_arxiv_search_spec")],
+                        retry_policy=StepPolicy(policy_type="retry", mode="allow_search_relaxation", max_attempts=3) if search.can_retry else None,
+                    ),
+                    self._draft_step(
+                        "validate_arxiv_results",
+                        validate,
+                        action_type="validate",
+                        output_key="candidate_evidence_quality",
+                        reason="先评估候选集数量和可用性，给 Observer/Replanner 预留“证据不足也可补检索”的质量入口。",
+                        depends_on=["search_arxiv"],
+                        input_bindings=[_binding_dict("arxiv_results", source_type="step_output", step_id="search_arxiv")],
+                    ),
+                ]
+            )
 
         personalize = self._optional_tool(tools_by_name, preferred_name="personalize_paper_results", required_tags={"personalize", "rerank"})
         synthesize_depends_on = ["validate_arxiv_results"]
         synthesize_bindings = [
             _binding_dict("arxiv_result_quality", source_type="step_output", step_id="validate_arxiv_results"),
-            _binding_dict("arxiv_results", source_type="step_output", step_id="search_arxiv", required=False),
+            arxiv_results_binding,
         ]
         if personalize and _planner_has_profile_context(planner_context):
+            personalize_depends_on = [candidate_source_step_id] if candidate_source_step_id else []
             steps.append(
                 self._draft_step(
                     "personalize_paper_results",
@@ -228,9 +273,11 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
                     action_type="rerank",
                     output_key="representative_paper_set",
                     reason="存在用户画像时才把候选集重排为代表论文集合，避免无画像时伪造个性化阅读依据。",
-                    depends_on=["search_arxiv"],
+                    depends_on=personalize_depends_on,
                     input_bindings=[
-                        _binding_dict("arxiv_results", source_type="step_output", step_id="search_arxiv"),
+                        _binding_dict("arxiv_results", source_type="step_output", step_id=candidate_source_step_id)
+                        if candidate_source_step_id
+                        else _binding_dict("arxiv_results", source_type="literal", value=context_arxiv_results),
                         _binding_dict("user_memory_summary", source_type="context", source_key="user_memory_summary", required=False),
                         _binding_dict("research_profile", source_type="context", source_key="research_profile", required=False),
                     ],
@@ -247,7 +294,7 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
                         "evidence_type": "user_profile",
                         "reason": reason,
                         "fallback_policy": "generic_without_profile",
-                        "capability_status": "requires_user_profile",
+                        "capability_status": "degraded",
                     }
                 )
 
@@ -261,9 +308,9 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
                 depends_on=synthesize_depends_on,
                 input_bindings=synthesize_bindings,
             )
-        )
+            )
         draft = self._make_draft(goal, task_type, steps)
-        return self._attach_profile_metadata(draft, profile, artifact_evidence_plan)
+        return self._attach_profile_metadata(draft, profile, artifact_evidence_plan, planner_context)
 
     def _build_profile_aware_paper_qa(
         self,
@@ -282,6 +329,7 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
         assess_quality = self._require_tool(tools_by_name, "assess_paper_qa_quality", required_tags={"validate", "answer"})
         artifact_evidence_plan = build_artifact_evidence_plan(_profile_with_task_type(profile, "single_paper_deep_read"), planner_context)
         artifact_evidence_plan = self._refine_artifact_evidence_plan(artifact_evidence_plan, profile, planner_context)
+        artifact_evidence_plan = self._align_artifact_evidence_plan(artifact_evidence_plan, planner_context, tools_by_name)
 
         steps = [
             self._draft_step(
@@ -329,7 +377,7 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
             ),
         ]
         draft = self._make_draft(goal, "single_paper_deep_read", steps)
-        return self._attach_profile_metadata(draft, profile, artifact_evidence_plan)
+        return self._attach_profile_metadata(draft, profile, artifact_evidence_plan, planner_context)
 
     def _refine_artifact_evidence_plan(
         self,
@@ -348,24 +396,65 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
             max_patches=self.max_refinement_patches,
         )
 
+    def _align_artifact_evidence_plan(
+        self,
+        artifact_evidence_plan: ArtifactEvidencePlan,
+        planner_context: PlannerContext,
+        tools_by_name: Mapping[str, ToolSpec],
+    ) -> ArtifactEvidencePlan:
+        # capability alignment 是把“证据想要什么”落到当前工具/上下文边界上的本地步骤；
+        # 它只更新证据能力状态和诊断，不负责选择或执行具体工具。
+        aligned = CapabilityAlignmentChecker().align(
+            artifact_evidence_plan,
+            planner_context=planner_context,
+            available_tool_names=tools_by_name.keys(),
+        )
+        return refresh_artifact_evidence_diagnostics(aligned, planner_context)
+
     def _attach_profile_metadata(
         self,
         draft: PlanDraft,
         profile: Mapping[str, Any],
         artifact_evidence_plan: ArtifactEvidencePlan,
+        planner_context: PlannerContext,
     ) -> PlanDraft:
+        step_mapping = build_artifact_step_mapping(artifact_evidence_plan, draft.steps)
+        progress_reservations = build_artifact_progress_reservations(artifact_evidence_plan, step_mapping)
+        validation_report = ArtifactPlanValidator().validate(
+            artifact_evidence_plan,
+            planner_context=planner_context,
+            step_mapping=step_mapping,
+        )
+        artifact_evidence_plan = attach_artifact_tooling_diagnostics(
+            artifact_evidence_plan,
+            validation_report=validation_report,
+            step_mapping=step_mapping,
+            progress_reservations=progress_reservations,
+        )
+        if validation_report.status == "failed":
+            # Validator 是 profile-aware 分支的最后一道本地护栏；失败时不能继续把草稿交给执行器。
+            reasons = [issue.message for issue in list(validation_report.issues or []) if issue.severity == "error"]
+            raise PlanDraftPlanningError("; ".join(reasons) or "artifact evidence plan validation failed")
+
+        draft = _annotate_draft_steps_with_artifact_mapping(draft, step_mapping)
         artifact_evidence_payload = artifact_evidence_plan.model_dump(mode="json")
         artifact_plan = artifact_plan_projection(artifact_evidence_plan)
         evidence_mapping = evidence_tool_mapping(artifact_evidence_plan)
         unmet_evidence = list(artifact_evidence_plan.diagnostics.unmet_evidence_requirements or [])
         quality_reservations = evidence_quality_reservations(artifact_evidence_plan)
         planning_diagnostics = artifact_evidence_payload.get("diagnostics") or {}
+        validation_payload = validation_report.model_dump(mode="json")
+        step_mapping_payload = [item.model_dump(mode="json") for item in step_mapping]
+        progress_payload = [item.model_dump(mode="json") for item in progress_reservations]
         metadata = dict(draft.metadata or {})
         metadata.update(
             {
                 "source": PROFILE_AWARE_TASK_PLANNER_SOURCE,
                 "research_task_profile": _compact_profile_for_debug(profile),
                 "artifact_evidence_plan": artifact_evidence_payload,
+                "artifact_plan_validation_report": validation_payload,
+                "artifact_step_mapping": step_mapping_payload,
+                "artifact_progress_reservations": progress_payload,
                 "profile_aware_plan": {
                     "research_task_type": profile.get("research_task_type"),
                     "profile_source": profile.get("source"),
@@ -373,9 +462,16 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
                     "artifact_evidence_plan": artifact_evidence_payload,
                     "artifact_plan": list(artifact_plan or []),
                     "evidence_tool_mapping": list(evidence_mapping or []),
+                    "capability_alignment": [
+                        item.model_dump(mode="json")
+                        for item in list(artifact_evidence_plan.diagnostics.capability_alignment or [])
+                    ],
+                    "validation_report": validation_payload,
+                    "artifact_step_mapping": step_mapping_payload,
+                    "artifact_progress_reservations": progress_payload,
                     "unmet_evidence_requirements": list(unmet_evidence or []),
                     "planning_diagnostics": planning_diagnostics,
-                    # 第一版只预留质量字段，执行期仍由现有 Observer/Replanner 按工具结果推进。
+                    # 这里仍只预留观察槽位，真实完成度由执行期 Observer/Replanner 按工具结果推进。
                     "evidence_quality_reservations": quality_reservations,
                 },
             }
@@ -386,6 +482,10 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
                 "artifact_plan": list(artifact_plan or []),
                 "evidence_tool_mapping": list(evidence_mapping or []),
                 "unmet_evidence_requirements": list(unmet_evidence or []),
+                "artifact_plan_validation": validation_payload,
+                "capability_alignment": metadata["profile_aware_plan"]["capability_alignment"],
+                "artifact_step_mapping": step_mapping_payload,
+                "artifact_progress_reservations": progress_payload,
                 "evidence_quality_reservations": quality_reservations,
                 "planning_diagnostics": planning_diagnostics,
                 "artifact_refinement": {
@@ -410,7 +510,15 @@ def attach_profile_aware_metadata(plan: Any, draft: PlanDraft, builder_debug: Ma
     """把科研产物规划挂到 ExecutablePlan.metadata，保持 PlanStep 结构不变。"""
     metadata = dict(getattr(plan, "metadata", None) or {})
     draft_metadata = dict(draft.metadata or {})
-    for key in ("source", "research_task_profile", "artifact_evidence_plan", "profile_aware_plan"):
+    for key in (
+        "source",
+        "research_task_profile",
+        "artifact_evidence_plan",
+        "artifact_plan_validation_report",
+        "artifact_step_mapping",
+        "artifact_progress_reservations",
+        "profile_aware_plan",
+    ):
         if key in draft_metadata:
             metadata[key] = draft_metadata[key]
     metadata["profile_aware_used"] = bool(builder_debug.get("enabled"))
@@ -445,6 +553,48 @@ def _profile_with_task_type(profile: Mapping[str, Any], task_type: str) -> Dict[
     payload = dict(profile or {})
     payload["research_task_type"] = task_type
     return payload
+
+
+def _artifact_id_exists(plan: ArtifactEvidencePlan, artifact_id: str) -> bool:
+    return any(artifact.artifact_id == artifact_id for artifact in list(plan.artifacts or []))
+
+
+def _candidate_context_arxiv_results(planner_context: PlannerContext) -> Dict[str, Any]:
+    papers = [dict(item) for item in list(planner_context.last_papers or []) if isinstance(item, Mapping)]
+    if not papers:
+        value = planner_context.intermediate_results.get("papers") or planner_context.intermediate_results.get("last_papers")
+        if isinstance(value, list):
+            papers = [dict(item) for item in value if isinstance(item, Mapping)]
+    return {
+        "papers": papers,
+        "tool_result": {"ok": True, "source": "planner_context"},
+        "search_spec": {"source": "context_reuse"},
+    }
+
+
+def _annotate_draft_steps_with_artifact_mapping(
+    draft: PlanDraft,
+    step_mapping: Sequence[Any],
+) -> PlanDraft:
+    mapping_by_step: Dict[str, List[Dict[str, Any]]] = {}
+    for item in list(step_mapping or []):
+        step_id = str(getattr(item, "step_id", "") or "").strip()
+        if not step_id:
+            continue
+        model_dump = getattr(item, "model_dump", None)
+        mapping_by_step.setdefault(step_id, []).append(model_dump(mode="json") if callable(model_dump) else dict(item))
+
+    annotated_steps: List[PlanDraftStep] = []
+    for step in list(draft.steps or []):
+        contributions = mapping_by_step.get(step.step_id)
+        if not contributions:
+            annotated_steps.append(step)
+            continue
+        expected_output = dict(step.expected_output or {})
+        # expected_output 是现有 debug 通道；把贡献投影放这里，避免为执行器模型新增平行 step metadata。
+        expected_output["artifact_contributions"] = contributions
+        annotated_steps.append(step.model_copy(update={"expected_output": expected_output}))
+    return draft.model_copy(update={"steps": annotated_steps})
 
 
 def _coerce_float(value: Any, *, default: float) -> float:

@@ -560,6 +560,8 @@ CapabilityStatus = Literal[
     "degraded",
     "requires_index",
     "requires_user_profile",
+    "requires_confirmation",
+    "blocked",
     "unsupported",
 ]
 
@@ -587,6 +589,16 @@ EvidenceFallbackPolicy = Literal[
 ConfidenceImpact = Literal["none", "low", "medium", "high"]
 EvidencePriority = Literal["low", "normal", "high"]
 PlanningDiagnosticSeverity = Literal["info", "warning", "error"]
+ArtifactPlanValidationIssueSeverity = Literal["info", "warning", "error"]
+ArtifactContributionType = Literal[
+    "acquire_evidence",
+    "validate_evidence",
+    "derive_artifact",
+    "synthesize_artifact",
+    "quality_gate",
+    "context_reuse",
+]
+ArtifactProgressStatus = Literal["pending", "partial", "completed", "degraded", "blocked"]
 
 ArtifactRefinementPatchOperation = Literal[
     "enable_optional_artifact",
@@ -703,6 +715,87 @@ class PlanningDiagnostic(BaseModel):
     capability_status: Optional[CapabilityStatus] = None
 
 
+class ArtifactPlanValidationIssue(BaseModel):
+    """ArtifactPlanValidator 输出的单条结构化问题。"""
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    severity: ArtifactPlanValidationIssueSeverity = "error"
+    message: str
+    target_artifact_id: Optional[str] = None
+    target_evidence_id: Optional[str] = None
+    evidence_type: Optional[EvidenceType] = None
+    capability_status: Optional[CapabilityStatus] = None
+
+
+class ArtifactPlanValidationReport(BaseModel):
+    """Validator-guarded planning 的结构化报告。
+
+    report 进入 plan metadata/debug，便于后续确认是 schema、任务一致性、预算还是工具映射问题。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["passed", "warning", "failed"] = "passed"
+    issue_count: int = 0
+    error_count: int = 0
+    warning_count: int = 0
+    issues: List[ArtifactPlanValidationIssue] = Field(default_factory=list)
+    checked_artifact_ids: List[str] = Field(default_factory=list)
+    checked_evidence_ids: List[str] = Field(default_factory=list)
+    final_artifact_ids: List[str] = Field(default_factory=list)
+    validator_stack: List[str] = Field(default_factory=list)
+
+
+class EvidenceCapabilityAlignment(BaseModel):
+    """单条 EvidenceRequirement 与当前系统能力的对齐结果。"""
+    model_config = ConfigDict(extra="forbid")
+
+    target_artifact_id: str
+    requirement_id: str
+    evidence_type: EvidenceType
+    target_fields: List[str] = Field(default_factory=list)
+    capability_status: CapabilityStatus
+    reason: str
+    acquisition_tools: List[str] = Field(default_factory=list)
+    fallback_policy: EvidenceFallbackPolicy = "none"
+    confidence_impact: ConfidenceImpact = "medium"
+    blocked: bool = False
+
+
+class ArtifactStepMapping(BaseModel):
+    """ExecutablePlan step 与 artifact/evidence requirement 的映射。
+
+    PlanStep 暂不扩展 metadata 字段，因此映射集中保存在 ExecutablePlan.metadata；
+    Observer/Replanner 后续可以按 step_id 反查该步骤预计推进哪个科研产物。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: str
+    tool_name: str
+    target_artifact_id: str
+    target_evidence_id: Optional[str] = None
+    artifact_type: ArtifactType
+    evidence_type: Optional[EvidenceType] = None
+    contribution_type: ArtifactContributionType
+    expected_artifact_update: str
+    capability_status: Optional[CapabilityStatus] = None
+
+
+class ArtifactProgressReservation(BaseModel):
+    """执行前预留的 artifact 进度槽位。
+
+    这里只记录 planner 对未来观察点的预期，不把执行结果提前写死；真实完成度仍由 Observer 根据工具输出推进。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: str
+    artifact_type: ArtifactType
+    status: ArtifactProgressStatus = "pending"
+    mapped_step_ids: List[str] = Field(default_factory=list)
+    missing_evidence_ids: List[str] = Field(default_factory=list)
+    blocked_evidence_ids: List[str] = Field(default_factory=list)
+
+
 class ArtifactRefinementPatch(BaseModel):
     """LLM refinement 的唯一允许输出单元。
 
@@ -798,6 +891,11 @@ class PlanningDiagnostics(BaseModel):
     rejected_refinement_patches: List[Dict[str, Any]] = Field(default_factory=list)
     local_corrections: List[Dict[str, Any]] = Field(default_factory=list)
     final_evidence_requirements: List[Dict[str, Any]] = Field(default_factory=list)
+    validation_report: ArtifactPlanValidationReport = Field(default_factory=ArtifactPlanValidationReport)
+    capability_alignment: List[EvidenceCapabilityAlignment] = Field(default_factory=list)
+    artifact_step_mapping: List[ArtifactStepMapping] = Field(default_factory=list)
+    artifact_progress_reservations: List[ArtifactProgressReservation] = Field(default_factory=list)
+    blocked_evidence_requirements: List[Dict[str, Any]] = Field(default_factory=list)
     diagnostic_events: List[PlanningDiagnostic] = Field(default_factory=list)
 
 

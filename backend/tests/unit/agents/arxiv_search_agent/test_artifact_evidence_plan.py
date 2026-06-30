@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from pydantic import ValidationError
 
@@ -8,6 +10,8 @@ from tests.helpers.agent_runtime import load_agent_test_modules
 
 _MODULES = load_agent_test_modules()
 schemas = _MODULES["schemas"]
+from backend.agents.arxiv_search_agent import artifact_validation  # noqa: E402
+from backend.agents.arxiv_search_agent.tool_registry import ToolRegistry  # noqa: E402
 
 
 def _evidence(
@@ -140,3 +144,54 @@ def test_required_artifact_cannot_depend_on_unsupported_evidence() -> None:
             consumer=["tool_planner"],
             evidence_requirements=[unsupported],
         )
+
+
+def test_capability_alignment_blocks_required_evidence_without_acquisition_path() -> None:
+    plan = schemas.ArtifactEvidencePlan(
+        plan_id="direction:artifact_evidence_plan",
+        research_task_type="direction_exploration",
+        artifacts=[_artifact("candidate_papers")],
+    )
+
+    aligned = artifact_validation.CapabilityAlignmentChecker(ToolRegistry()).align(
+        plan,
+        planner_context=schemas.PlannerContext(),
+        available_tool_names=[],
+    )
+    report = artifact_validation.ArtifactPlanValidator().validate(
+        aligned,
+        planner_context=schemas.PlannerContext(),
+        step_mapping=[],
+    )
+
+    requirement = aligned.artifacts[0].evidence_requirements[0]
+    assert requirement.capability_status == "blocked"
+    assert aligned.diagnostics.blocked_evidence_requirements[0]["requirement_id"] == "candidate_papers_metadata"
+    assert report.status == "failed"
+    assert any(issue.code == "required_evidence_not_acquirable" for issue in report.issues)
+
+
+def test_artifact_step_mapping_and_progress_reservation_are_structured() -> None:
+    plan = schemas.ArtifactEvidencePlan(
+        plan_id="direction:artifact_evidence_plan",
+        research_task_type="direction_exploration",
+        artifacts=[_artifact("candidate_papers")],
+    )
+    steps = [
+        SimpleNamespace(step_id="search_arxiv", tool_name="search_arxiv"),
+        SimpleNamespace(step_id="validate_arxiv_results", tool_name="validate_arxiv_results"),
+    ]
+
+    mapping = artifact_validation.build_artifact_step_mapping(plan, steps)
+    progress = artifact_validation.build_artifact_progress_reservations(plan, mapping)
+    report = artifact_validation.ArtifactPlanValidator().validate(
+        plan,
+        planner_context=schemas.PlannerContext(),
+        step_mapping=mapping,
+    )
+
+    assert {item.step_id for item in mapping} == {"search_arxiv", "validate_arxiv_results"}
+    assert mapping[0].target_artifact_id == "candidate_papers"
+    assert progress[0].artifact_id == "candidate_papers"
+    assert progress[0].mapped_step_ids == ["search_arxiv", "validate_arxiv_results"]
+    assert report.status == "passed"

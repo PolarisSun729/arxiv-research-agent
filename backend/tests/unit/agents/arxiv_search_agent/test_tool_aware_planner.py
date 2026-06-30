@@ -1276,6 +1276,39 @@ def test_profile_aware_multi_paper_comparison_builds_artifact_evidence_plan() ->
     assert any(req.evidence_type == "result_section" and req.capability_status == "requires_index" for req in matrix.evidence_requirements)
     assert any(item["artifact"] == "candidate_paper_set" and "search_arxiv" in item["tool_steps"] for item in profile_plan["evidence_tool_mapping"])
     assert next(step for step in plan.steps if step.tool_name == "search_arxiv").output_key == "candidate_paper_set"
+    assert profile_plan["validation_report"]["status"] in {"passed", "warning"}
+    assert any(item["target_artifact_id"] == "candidate_papers" for item in profile_plan["artifact_step_mapping"])
+    PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
+
+
+def test_profile_aware_multi_paper_comparison_reuses_context_candidates_without_search() -> None:
+    state = AgentState(
+        intent="arxiv_search",
+        message="基于这些论文做方法对比",
+        context={
+            "last_papers": [
+                {"title": "Paper A", "abstract": "retrieval augmented generation", "arxiv_id": "2401.00001"},
+                {"title": "Paper B", "abstract": "graph retrieval augmented generation", "arxiv_id": "2401.00002"},
+            ]
+        },
+    )
+    state.research_task_profile = _research_task_profile("multi_paper_comparison", object_type="paper_set")
+
+    _, plan, debug = _current_modules()[0].build_executable_plan(
+        state,
+        enable_tool_aware_planner=True,
+        enable_llm_plan_draft=False,
+    )
+
+    assert debug["selected_plan_source"] == "profile_aware_task_planner"
+    assert "search_arxiv" not in _tool_names(plan)
+    assert _step_ids(plan)[:2] == ["validate_arxiv_results", "synthesize_arxiv_response"]
+    validate_step = next(step for step in plan.steps if step.tool_name == "validate_arxiv_results")
+    assert validate_step.input_bindings[0].source_type == "literal"
+    assert len(validate_step.input_bindings[0].value["papers"]) == 2
+    profile_plan = plan.metadata["profile_aware_plan"]
+    assert any(item["artifact_id"] == "candidate_papers" for item in profile_plan["planning_diagnostics"]["pruned_artifacts"])
+    assert any(item["contribution_type"] == "context_reuse" for item in profile_plan["artifact_step_mapping"])
     PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
 
 
@@ -1326,6 +1359,10 @@ def test_profile_aware_single_paper_deep_read_builds_paper_qa_artifact_plan() ->
     artifact_evidence_plan = schemas.ArtifactEvidencePlan.model_validate(profile_plan["artifact_evidence_plan"])
     assert "paper_feature_card_set" in {item.artifact_type for item in artifact_evidence_plan.artifacts}
     assert any(item["capability_status"] == "requires_index" for item in profile_plan["unmet_evidence_requirements"])
+    assert any(
+        item["target_artifact_id"] == "paper_feature_cards" and item["tool_name"] == "answer_paper_question"
+        for item in profile_plan["artifact_step_mapping"]
+    )
     assert next(step for step in plan.steps if step.tool_name == "assess_paper_qa_quality").output_key == "deep_read_evidence_quality"
     PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
 
