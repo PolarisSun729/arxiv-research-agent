@@ -125,6 +125,10 @@ AGENT_PLANNER_CONFIG: Dict[str, Any] = {
     "llm_recovery_timeout": _env_int("LLM_RECOVERY_TIMEOUT_SECONDS", 6),
     "llm_plan_timeout": _env_int("LLM_PLAN_TIMEOUT_SECONDS", 8),
     "llm_plan_max_steps": _env_int("LLM_PLAN_MAX_STEPS", 8),
+    # Artifact refinement 只允许 LLM 输出受控 patch；默认关闭，避免 profile-aware 路径无意增加模型成本。
+    "enable_artifact_refinement": _env_bool("ENABLE_ARTIFACT_REFINEMENT", _env_bool("ENABLE_LLM_ARTIFACT_REFINEMENT", False)),
+    "artifact_refinement_timeout": _env_int("ARTIFACT_REFINEMENT_TIMEOUT_SECONDS", 6),
+    "artifact_refinement_max_patches": _env_int("ARTIFACT_REFINEMENT_MAX_PATCHES", 12),
     # LLM draft 失败后先回退到规则型 planner；显式开关便于日志和 trace 说明真实兜底顺序。
     "enable_rule_fallback_after_llm_planner": _env_bool("ENABLE_RULE_FALLBACK_AFTER_LLM_PLANNER", _env_bool("LLM_PLAN_FALLBACK_TO_RULE", True)),
     "llm_plan_fallback_to_rule": _env_bool("LLM_PLAN_FALLBACK_TO_RULE", _env_bool("ENABLE_RULE_FALLBACK_AFTER_LLM_PLANNER", True)),

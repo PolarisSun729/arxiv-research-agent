@@ -1269,7 +1269,11 @@ def test_profile_aware_multi_paper_comparison_builds_artifact_evidence_plan() ->
     assert plan.metadata["profile_aware_used"] is True
     profile_plan = plan.metadata["profile_aware_plan"]
     assert profile_plan["research_task_type"] == "multi_paper_comparison"
-    assert "comparison_matrix" in {item["artifact"] for item in profile_plan["artifact_plan"]}
+    artifact_evidence_plan = schemas.ArtifactEvidencePlan.model_validate(profile_plan["artifact_evidence_plan"])
+    assert "comparison_matrix" in {item.artifact_type for item in artifact_evidence_plan.artifacts}
+    assert all(item.evidence_requirements for item in artifact_evidence_plan.artifacts if item.required)
+    matrix = next(item for item in artifact_evidence_plan.artifacts if item.artifact_type == "comparison_matrix")
+    assert any(req.evidence_type == "result_section" and req.capability_status == "requires_index" for req in matrix.evidence_requirements)
     assert any(item["artifact"] == "candidate_paper_set" and "search_arxiv" in item["tool_steps"] for item in profile_plan["evidence_tool_mapping"])
     assert next(step for step in plan.steps if step.tool_name == "search_arxiv").output_key == "candidate_paper_set"
     PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
@@ -1290,8 +1294,10 @@ def test_profile_aware_direction_exploration_uses_enhanced_route_for_high_confid
     )
 
     assert debug["selected_plan_source"] == "profile_aware_task_planner"
-    artifacts = {item["artifact"] for item in plan.metadata["profile_aware_plan"]["artifact_plan"]}
-    assert {"topic_terms", "candidate_paper_set", "direction_overview"}.issubset(artifacts)
+    artifact_evidence_plan = schemas.ArtifactEvidencePlan.model_validate(plan.metadata["artifact_evidence_plan"])
+    artifacts = {item.artifact_type for item in artifact_evidence_plan.artifacts}
+    assert {"topic_term_set", "candidate_paper_set", "grounded_summary"}.issubset(artifacts)
+    assert artifact_evidence_plan.diagnostics.dependency_order[:2] == ["topic_terms", "candidate_papers"]
     assert _step_ids(plan)[:4] == ["normalize_request", "build_arxiv_search_spec", "search_arxiv", "validate_arxiv_results"]
 
 
@@ -1317,7 +1323,9 @@ def test_profile_aware_single_paper_deep_read_builds_paper_qa_artifact_plan() ->
     assert _tool_names(plan) == ["resolve_paper", "check_paper_index", "answer_paper_question", "assess_paper_qa_quality"]
     profile_plan = plan.metadata["profile_aware_plan"]
     assert profile_plan["research_task_type"] == "single_paper_deep_read"
-    assert "method_explanation" in {item["artifact"] for item in profile_plan["artifact_plan"]}
+    artifact_evidence_plan = schemas.ArtifactEvidencePlan.model_validate(profile_plan["artifact_evidence_plan"])
+    assert "paper_feature_card_set" in {item.artifact_type for item in artifact_evidence_plan.artifacts}
+    assert any(item["capability_status"] == "requires_index" for item in profile_plan["unmet_evidence_requirements"])
     assert next(step for step in plan.steps if step.tool_name == "assess_paper_qa_quality").output_key == "deep_read_evidence_quality"
     PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
 

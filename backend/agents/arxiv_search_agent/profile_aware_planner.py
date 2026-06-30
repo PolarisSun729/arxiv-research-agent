@@ -4,7 +4,24 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from .schemas import Goal, PlanDraft, PlanDraftStep, PlannerContext, StepPolicy, ToolCandidate, ToolSpec
+from .artifact_refinement import refine_artifact_evidence_plan
+from .artifact_templates import (
+    artifact_plan_needs_evidence,
+    artifact_plan_projection,
+    build_artifact_evidence_plan,
+    evidence_quality_reservations,
+    evidence_tool_mapping,
+)
+from .schemas import (
+    ArtifactEvidencePlan,
+    Goal,
+    PlanDraft,
+    PlanDraftStep,
+    PlannerContext,
+    StepPolicy,
+    ToolCandidate,
+    ToolSpec,
+)
 from .state import AgentState
 from .tool_registry import ToolRegistry
 from .tool_aware_planner import (
@@ -39,6 +56,20 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
         "research_gap_analysis",
     }
 
+    def __init__(
+        self,
+        *,
+        generation_service: Optional[Any] = None,
+        enable_artifact_refinement: bool = False,
+        refinement_timeout_seconds: int = 6,
+        max_refinement_patches: int = 12,
+    ) -> None:
+        super().__init__()
+        self.generation_service = generation_service
+        self.enable_artifact_refinement = bool(enable_artifact_refinement)
+        self.refinement_timeout_seconds = max(1, int(refinement_timeout_seconds or 6))
+        self.max_refinement_patches = max(1, int(max_refinement_patches or 12))
+
     def build(
         self,
         goal: Goal,
@@ -67,10 +98,15 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
             "planner_context_refs": list(planner_context.context_refs or []),
             "planner_context_used_fields": _planner_context_used_fields(planner_context),
             "research_task_profile": _compact_profile_for_debug(profile),
+            "artifact_evidence_plan": {},
             "artifact_plan": [],
             "evidence_tool_mapping": [],
             "unmet_evidence_requirements": [],
             "evidence_quality_reservations": {},
+            "artifact_refinement": {
+                "enabled": self.enable_artifact_refinement,
+                "llm_available": self.generation_service is not None,
+            },
         }
         if not profile:
             return self._skip_profile("research_task_profile_missing")
@@ -132,9 +168,8 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
         validate = self._require_tool(tools_by_name, "validate_arxiv_results", required_tags={"validate"})
         synthesize = self._require_tool(tools_by_name, "synthesize_arxiv_response", required_tags={"answer"})
         task_type = str(profile.get("research_task_type") or "direction_exploration").strip()
-        artifact_plan = _default_artifact_plan_for_task(task_type)
-        evidence_mapping = _map_artifacts_to_tools(artifact_plan)
-        unmet_evidence = _unmet_evidence_requirements(artifact_plan, planner_context)
+        artifact_evidence_plan = build_artifact_evidence_plan(_profile_with_task_type(profile, task_type), planner_context)
+        artifact_evidence_plan = self._refine_artifact_evidence_plan(artifact_evidence_plan, profile, planner_context)
 
         steps: List[PlanDraftStep] = [
             self._draft_step(
@@ -206,8 +241,15 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
         else:
             reason = "no user profile context; use validated candidate_paper_set as generic representative evidence"
             self._skip_step("personalize_paper_results", reason)
-            if _artifact_plan_needs_evidence(artifact_plan, "user_profile_evidence"):
-                unmet_evidence.append({"evidence_type": "user_profile_evidence", "reason": reason, "fallback": "generic_priority"})
+            if artifact_plan_needs_evidence(artifact_evidence_plan, "user_profile"):
+                artifact_evidence_plan.diagnostics.unmet_evidence_requirements.append(
+                    {
+                        "evidence_type": "user_profile",
+                        "reason": reason,
+                        "fallback_policy": "generic_without_profile",
+                        "capability_status": "requires_user_profile",
+                    }
+                )
 
         steps.append(
             self._draft_step(
@@ -221,7 +263,7 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
             )
         )
         draft = self._make_draft(goal, task_type, steps)
-        return self._attach_profile_metadata(draft, profile, artifact_plan, evidence_mapping, unmet_evidence)
+        return self._attach_profile_metadata(draft, profile, artifact_evidence_plan)
 
     def _build_profile_aware_paper_qa(
         self,
@@ -238,9 +280,8 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
         check_index = self._require_tool(tools_by_name, "check_paper_index", required_tags={"validate", "retrieve"})
         answer = self._require_tool(tools_by_name, "answer_paper_question", required_tags={"answer"})
         assess_quality = self._require_tool(tools_by_name, "assess_paper_qa_quality", required_tags={"validate", "answer"})
-        artifact_plan = _default_artifact_plan_for_task("single_paper_deep_read")
-        evidence_mapping = _map_artifacts_to_tools(artifact_plan)
-        unmet_evidence = _unmet_evidence_requirements(artifact_plan, planner_context)
+        artifact_evidence_plan = build_artifact_evidence_plan(_profile_with_task_type(profile, "single_paper_deep_read"), planner_context)
+        artifact_evidence_plan = self._refine_artifact_evidence_plan(artifact_evidence_plan, profile, planner_context)
 
         steps = [
             self._draft_step(
@@ -288,29 +329,52 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
             ),
         ]
         draft = self._make_draft(goal, "single_paper_deep_read", steps)
-        return self._attach_profile_metadata(draft, profile, artifact_plan, evidence_mapping, unmet_evidence)
+        return self._attach_profile_metadata(draft, profile, artifact_evidence_plan)
+
+    def _refine_artifact_evidence_plan(
+        self,
+        artifact_evidence_plan: ArtifactEvidencePlan,
+        profile: Mapping[str, Any],
+        planner_context: PlannerContext,
+    ) -> ArtifactEvidencePlan:
+        # refinement 是模板 skeleton 之后的增强层；即使 LLM 未启用，也会通过本地 binder 生成最终 evidence requirements。
+        return refine_artifact_evidence_plan(
+            artifact_evidence_plan,
+            profile=profile,
+            planner_context=planner_context,
+            generation_service=self.generation_service,
+            enabled=self.enable_artifact_refinement,
+            timeout_seconds=self.refinement_timeout_seconds,
+            max_patches=self.max_refinement_patches,
+        )
 
     def _attach_profile_metadata(
         self,
         draft: PlanDraft,
         profile: Mapping[str, Any],
-        artifact_plan: Sequence[Mapping[str, Any]],
-        evidence_mapping: Sequence[Mapping[str, Any]],
-        unmet_evidence: Sequence[Mapping[str, Any]],
+        artifact_evidence_plan: ArtifactEvidencePlan,
     ) -> PlanDraft:
-        quality_reservations = _evidence_quality_reservations(artifact_plan)
+        artifact_evidence_payload = artifact_evidence_plan.model_dump(mode="json")
+        artifact_plan = artifact_plan_projection(artifact_evidence_plan)
+        evidence_mapping = evidence_tool_mapping(artifact_evidence_plan)
+        unmet_evidence = list(artifact_evidence_plan.diagnostics.unmet_evidence_requirements or [])
+        quality_reservations = evidence_quality_reservations(artifact_evidence_plan)
+        planning_diagnostics = artifact_evidence_payload.get("diagnostics") or {}
         metadata = dict(draft.metadata or {})
         metadata.update(
             {
                 "source": PROFILE_AWARE_TASK_PLANNER_SOURCE,
                 "research_task_profile": _compact_profile_for_debug(profile),
+                "artifact_evidence_plan": artifact_evidence_payload,
                 "profile_aware_plan": {
                     "research_task_type": profile.get("research_task_type"),
                     "profile_source": profile.get("source"),
                     "classification_basis": profile.get("classification_basis"),
+                    "artifact_evidence_plan": artifact_evidence_payload,
                     "artifact_plan": list(artifact_plan or []),
                     "evidence_tool_mapping": list(evidence_mapping or []),
                     "unmet_evidence_requirements": list(unmet_evidence or []),
+                    "planning_diagnostics": planning_diagnostics,
                     # 第一版只预留质量字段，执行期仍由现有 Observer/Replanner 按工具结果推进。
                     "evidence_quality_reservations": quality_reservations,
                 },
@@ -318,10 +382,20 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
         )
         self.last_debug.update(
             {
+                "artifact_evidence_plan": artifact_evidence_payload,
                 "artifact_plan": list(artifact_plan or []),
                 "evidence_tool_mapping": list(evidence_mapping or []),
                 "unmet_evidence_requirements": list(unmet_evidence or []),
                 "evidence_quality_reservations": quality_reservations,
+                "planning_diagnostics": planning_diagnostics,
+                "artifact_refinement": {
+                    "enabled": self.enable_artifact_refinement,
+                    "llm_available": self.generation_service is not None,
+                    "attempted": bool(planning_diagnostics.get("llm_refinement_attempted")),
+                    "accepted_patch_count": len(planning_diagnostics.get("accepted_refinement_patches") or []),
+                    "rejected_patch_count": len(planning_diagnostics.get("rejected_refinement_patches") or []),
+                    "error": planning_diagnostics.get("llm_refinement_error"),
+                },
             }
         )
         return draft.model_copy(update={"metadata": metadata})
@@ -336,7 +410,7 @@ def attach_profile_aware_metadata(plan: Any, draft: PlanDraft, builder_debug: Ma
     """把科研产物规划挂到 ExecutablePlan.metadata，保持 PlanStep 结构不变。"""
     metadata = dict(getattr(plan, "metadata", None) or {})
     draft_metadata = dict(draft.metadata or {})
-    for key in ("source", "research_task_profile", "profile_aware_plan"):
+    for key in ("source", "research_task_profile", "artifact_evidence_plan", "profile_aware_plan"):
         if key in draft_metadata:
             metadata[key] = draft_metadata[key]
     metadata["profile_aware_used"] = bool(builder_debug.get("enabled"))
@@ -367,105 +441,10 @@ def _compact_profile_for_debug(profile: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _default_artifact_plan_for_task(task_type: str) -> List[Dict[str, Any]]:
-    """定义 task -> artifact -> evidence 的默认路线；这里只描述规划语义，不直接驱动执行。"""
-    plans: Dict[str, List[Dict[str, Any]]] = {
-        "direction_exploration": [
-            {"artifact": "topic_terms", "evidence_types": ["metadata"], "purpose": "确定主题词、时间范围和检索约束"},
-            {"artifact": "candidate_paper_set", "evidence_types": ["metadata", "abstract"], "purpose": "形成可筛选的候选论文集合"},
-            {"artifact": "representative_paper_set", "evidence_types": ["metadata", "abstract"], "purpose": "挑选能代表方向分支的论文"},
-            {"artifact": "direction_overview", "evidence_types": ["metadata", "abstract"], "purpose": "总结方向脉络和近期关注点"},
-        ],
-        "multi_paper_comparison": [
-            {"artifact": "candidate_paper_set", "evidence_types": ["metadata", "abstract"], "purpose": "收集可比较候选论文"},
-            {"artifact": "representative_paper_set", "evidence_types": ["metadata", "abstract"], "purpose": "筛出代表论文，避免比较对象过散"},
-            {"artifact": "method_cards", "evidence_types": ["abstract", "method_chunk"], "purpose": "抽取每篇论文的方法要点"},
-            {"artifact": "comparison_dimensions", "evidence_types": ["metadata", "method_chunk", "experiment_chunk"], "purpose": "确定统一比较维度"},
-            {"artifact": "comparison_matrix", "evidence_types": ["metadata", "abstract", "method_chunk", "experiment_chunk", "table_evidence"], "purpose": "形成可解释的对比矩阵"},
-        ],
-        "single_paper_deep_read": [
-            {"artifact": "paper_structure", "evidence_types": ["metadata", "full_text_chunk"], "purpose": "识别论文结构和章节边界"},
-            {"artifact": "method_explanation", "evidence_types": ["method_chunk", "figure_evidence"], "purpose": "解释核心方法和模型设计"},
-            {"artifact": "experiment_setup", "evidence_types": ["experiment_chunk", "table_evidence"], "purpose": "梳理实验设置、指标和数据集"},
-            {"artifact": "contributions_and_limitations", "evidence_types": ["abstract", "method_chunk", "experiment_chunk"], "purpose": "归纳贡献、局限和适用边界"},
-        ],
-        "reading_planning": [
-            {"artifact": "candidate_paper_set", "evidence_types": ["metadata", "abstract"], "purpose": "收集可读论文候选"},
-            {"artifact": "profile_match", "evidence_types": ["metadata", "abstract", "user_profile_evidence"], "purpose": "评估候选与用户画像的匹配度"},
-            {"artifact": "difficulty_priority", "evidence_types": ["metadata", "abstract"], "purpose": "判断阅读难度和优先级"},
-            {"artifact": "reading_order", "evidence_types": ["metadata", "abstract", "user_profile_evidence"], "purpose": "生成循序渐进的阅读顺序"},
-        ],
-        "research_gap_analysis": [
-            {"artifact": "candidate_paper_set", "evidence_types": ["metadata", "abstract"], "purpose": "收集已有工作"},
-            {"artifact": "existing_method_categories", "evidence_types": ["abstract", "method_chunk"], "purpose": "归类现有方法路线"},
-            {"artifact": "limitation_evidence", "evidence_types": ["abstract", "method_chunk", "experiment_chunk", "table_evidence"], "purpose": "定位局限和失败条件"},
-            {"artifact": "uncovered_questions", "evidence_types": ["metadata", "abstract", "experiment_chunk"], "purpose": "识别尚未覆盖的问题"},
-            {"artifact": "potential_directions", "evidence_types": ["metadata", "abstract", "method_chunk"], "purpose": "形成潜在研究方向"},
-        ],
-    }
-    return [dict(item) for item in plans.get(task_type, [])]
-
-
-def _map_artifacts_to_tools(artifact_plan: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    mapping_by_artifact = {
-        "topic_terms": ["normalize_request", "build_arxiv_search_spec"],
-        "candidate_paper_set": ["build_arxiv_search_spec", "search_arxiv", "validate_arxiv_results"],
-        "representative_paper_set": ["validate_arxiv_results", "personalize_paper_results", "synthesize_arxiv_response"],
-        "direction_overview": ["synthesize_arxiv_response"],
-        "method_cards": ["search_arxiv", "validate_arxiv_results", "synthesize_arxiv_response"],
-        "comparison_dimensions": ["validate_arxiv_results", "synthesize_arxiv_response"],
-        "comparison_matrix": ["synthesize_arxiv_response"],
-        "paper_structure": ["resolve_paper", "check_paper_index", "answer_paper_question"],
-        "method_explanation": ["answer_paper_question", "assess_paper_qa_quality"],
-        "experiment_setup": ["answer_paper_question", "assess_paper_qa_quality"],
-        "contributions_and_limitations": ["answer_paper_question", "assess_paper_qa_quality"],
-        "profile_match": ["personalize_paper_results", "synthesize_arxiv_response"],
-        "difficulty_priority": ["validate_arxiv_results", "synthesize_arxiv_response"],
-        "reading_order": ["personalize_paper_results", "synthesize_arxiv_response"],
-        "existing_method_categories": ["search_arxiv", "validate_arxiv_results", "synthesize_arxiv_response"],
-        "limitation_evidence": ["validate_arxiv_results", "synthesize_arxiv_response"],
-        "uncovered_questions": ["validate_arxiv_results", "synthesize_arxiv_response"],
-        "potential_directions": ["synthesize_arxiv_response"],
-    }
-    result: List[Dict[str, Any]] = []
-    for item in list(artifact_plan or []):
-        artifact = str(item.get("artifact") or "").strip()
-        result.append(
-            {
-                "artifact": artifact,
-                "evidence_types": list(item.get("evidence_types") or []),
-                "tool_steps": list(mapping_by_artifact.get(artifact, ["synthesize_arxiv_response"])),
-            }
-        )
-    return result
-
-
-def _unmet_evidence_requirements(artifact_plan: Sequence[Mapping[str, Any]], planner_context: PlannerContext) -> List[Dict[str, Any]]:
-    unmet: List[Dict[str, Any]] = []
-    if _artifact_plan_needs_evidence(artifact_plan, "user_profile_evidence") and not _planner_has_profile_context(planner_context):
-        unmet.append({"evidence_type": "user_profile_evidence", "reason": "user profile is unavailable in planner context", "fallback": "generic_direction_or_priority"})
-    indexed_evidence = {"full_text_chunk", "method_chunk", "experiment_chunk", "table_evidence", "figure_evidence"}
-    if any(evidence in indexed_evidence for item in artifact_plan for evidence in list(item.get("evidence_types") or [])):
-        qa_result = planner_context.paper_qa_result if isinstance(planner_context.paper_qa_result, Mapping) else {}
-        if not qa_result:
-            # 正文、图表类证据需要 Paper QA 索引或后续回答工具确认；这里先记录缺口，避免 planner 假装证据已满足。
-            unmet.append({"evidence_type": "indexed_paper_evidence", "reason": "paper index evidence is not observed at planning time", "fallback": "check_paper_index_then_observe_quality"})
-    return unmet
-
-
-def _evidence_quality_reservations(artifact_plan: Sequence[Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    return {
-        str(item.get("artifact") or "unknown"): {
-            "status": "not_observed_yet",
-            "observer_reserved": True,
-            "expected_evidence_types": list(item.get("evidence_types") or []),
-        }
-        for item in list(artifact_plan or [])
-    }
-
-
-def _artifact_plan_needs_evidence(artifact_plan: Sequence[Mapping[str, Any]], evidence_type: str) -> bool:
-    return any(evidence_type in set(item.get("evidence_types") or []) for item in list(artifact_plan or []))
+def _profile_with_task_type(profile: Mapping[str, Any], task_type: str) -> Dict[str, Any]:
+    payload = dict(profile or {})
+    payload["research_task_type"] = task_type
+    return payload
 
 
 def _coerce_float(value: Any, *, default: float) -> float:

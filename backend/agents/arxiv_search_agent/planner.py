@@ -59,6 +59,9 @@ def _get_agent_planner_runtime_config() -> Dict[str, Any]:
             "enable_llm_plan_draft": False,
             "llm_plan_timeout": 8,
             "llm_plan_max_steps": 8,
+            "enable_artifact_refinement": False,
+            "artifact_refinement_timeout": 6,
+            "artifact_refinement_max_patches": 12,
             "enable_rule_fallback_after_llm_planner": True,
             "llm_plan_fallback_to_rule": True,
             "enable_template_fallback_planner": True,
@@ -105,6 +108,9 @@ def _normalized_planner_runtime_flags(planner_config: Mapping[str, Any]) -> Dict
         )
         strict_llm_failure = False
     requested_path = "experimental_llm_draft_planner" if llm_draft_enabled else "rule_based_planner"
+    artifact_refinement_enabled = bool(
+        planner_config.get("enable_artifact_refinement", planner_config.get("enable_llm_artifact_refinement", False))
+    )
     configured_fallback_order: List[str] = []
     if llm_draft_enabled and rule_fallback_enabled:
         configured_fallback_order.append("rule_based_planner")
@@ -121,6 +127,7 @@ def _normalized_planner_runtime_flags(planner_config: Mapping[str, Any]) -> Dict
         "requested_path": requested_path,
         "configured_primary_path": requested_path if rule_planner_enabled else "primary_planner_disabled",
         "configured_fallback_order": configured_fallback_order,
+        "artifact_refinement_enabled": artifact_refinement_enabled,
     }
 
 
@@ -197,6 +204,7 @@ def _finalize_plan_debug_and_metadata(
         "fallback_record": dict(planning_debug.get("fallback_record") or {}),
         "validation_status": planning_debug.get("validation_status"),
         "strict_llm_failure": bool(runtime_flags.get("strict_llm_failure")),
+        "artifact_refinement_enabled": bool(runtime_flags.get("artifact_refinement_enabled")),
         "profile_aware_used": bool((planning_debug.get("profile_aware_planning") or {}).get("enabled")),
     }
     capability_boundary = _build_capability_boundary(goal, plan)
@@ -765,6 +773,7 @@ def build_executable_plan(
     *,
     enable_tool_aware_planner: Optional[bool] = None,
     enable_llm_plan_draft: Optional[bool] = None,
+    enable_artifact_refinement: Optional[bool] = None,
     llm_generation_service: Any = None,
 ) -> tuple[Goal, ExecutablePlan, Dict[str, Any]]:
     """统一 planner 入口：可选启用 Tool-Aware 草稿层，最终始终产出已校验 ExecutablePlan。"""
@@ -775,6 +784,7 @@ def build_executable_plan(
         tool_registry=tool_registry,
         enable_tool_aware_planner=enable_tool_aware_planner,
         enable_llm_plan_draft=enable_llm_plan_draft,
+        enable_artifact_refinement=enable_artifact_refinement,
         llm_generation_service=llm_generation_service,
     )
 
@@ -786,6 +796,7 @@ def build_executable_plan_for_goal(
     *,
     enable_tool_aware_planner: Optional[bool] = None,
     enable_llm_plan_draft: Optional[bool] = None,
+    enable_artifact_refinement: Optional[bool] = None,
     llm_generation_service: Any = None,
 ) -> tuple[Goal, ExecutablePlan, Dict[str, Any]]:
     """基于已构建 Goal 生成计划，供显式 LangGraph planning 节点复用。
@@ -811,6 +822,8 @@ def build_executable_plan_for_goal(
                 planner_config.get("enable_template_fallback_planner", planner_config.get("llm_plan_fallback_to_template", True))
             )
             runtime_flags["strict_llm_failure"] = False
+    if enable_artifact_refinement is not None:
+        runtime_flags["artifact_refinement_enabled"] = bool(enable_artifact_refinement)
     runtime_flags["requested_path"] = "experimental_llm_draft_planner" if runtime_flags["llm_draft_enabled"] else "rule_based_planner"
     runtime_flags["configured_primary_path"] = runtime_flags["requested_path"] if runtime_flags["rule_planner_enabled"] else "primary_planner_disabled"
 
@@ -1045,7 +1058,18 @@ def build_executable_plan_for_goal(
                     allow_template=llm_fallback_to_template,
                 )
 
-    profile_builder = ProfileAwareResearchTaskPlanBuilder()
+    artifact_refinement_enabled = bool(runtime_flags.get("artifact_refinement_enabled"))
+    artifact_refinement_generation_service = (
+        llm_generation_service
+        if llm_generation_service is not None
+        else (_resolve_generation_service() if artifact_refinement_enabled else None)
+    )
+    profile_builder = ProfileAwareResearchTaskPlanBuilder(
+        generation_service=artifact_refinement_generation_service,
+        enable_artifact_refinement=artifact_refinement_enabled,
+        refinement_timeout_seconds=int(planner_config.get("artifact_refinement_timeout", 6) or 6),
+        max_refinement_patches=int(planner_config.get("artifact_refinement_max_patches", 12) or 12),
+    )
     try:
         profile_draft = profile_builder.build(goal, state, selection.candidate_tools, tool_registry, planner_context)
         planning_debug["profile_aware_planning"] = dict(profile_builder.last_debug or {})

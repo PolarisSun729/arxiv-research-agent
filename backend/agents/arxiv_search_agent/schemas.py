@@ -515,6 +515,370 @@ class ResearchTaskProfile(BaseModel):
     source: Optional[str] = None
 
 
+# =============================================================================
+# Artifact / Evidence Plan 契约层（科研任务语义与工具计划之间的证据规划）
+# -----------------------------------------------------------------------------
+# ResearchTaskProfile 只回答“用户正在做哪类科研任务”；ArtifactEvidencePlan 继续回答：
+# 为了完成该任务，需要哪些科研中间产物、每个产物需要哪些证据、这些证据是否被当前系统能力支持。
+#
+# 这里的类型集合全部固定，目的是把 LLM/规则产出的自然语言判断收敛到系统可识别的能力边界内。
+# 该层只描述科研产物和证据需求，不直接选择工具，也不替代 ExecutablePlan / PlanRuntime。
+# =============================================================================
+
+# 当前系统允许进入主流程的科研中间产物类型。暂不稳定的外部统计、引用图或复现实验不进入第一版集合。
+ArtifactType = Literal[
+    "topic_term_set",
+    "candidate_paper_set",
+    "selected_paper_set",
+    "paper_feature_card_set",
+    "comparison_dimension_set",
+    "comparison_matrix",
+    "reading_plan",
+    "gap_hypothesis_set",
+    "grounded_summary",
+    "user_profile_match",
+]
+
+# 当前 RAG / 画像 / 上下文层能直接获取或能明确降级处理的证据类型。
+EvidenceType = Literal[
+    "metadata",
+    "abstract",
+    "paper_chunk",
+    "method_section",
+    "experiment_section",
+    "result_section",
+    "limitation_section",
+    "table",
+    "figure",
+    "user_profile",
+    "previous_context",
+]
+
+# 能力状态用于向 Tool Planner / Observer / Replanner 显式暴露边界，而不是让下游猜测证据是否可取。
+CapabilityStatus = Literal[
+    "supported",
+    "degraded",
+    "requires_index",
+    "requires_user_profile",
+    "unsupported",
+]
+
+ArtifactTargetScope = Literal["topic", "paper", "paper_set", "user_profile", "conversation"]
+ArtifactConsumer = Literal["tool_planner", "observer", "replanner", "response_synthesizer"]
+EvidenceSourceScope = Literal["arxiv_metadata", "search_results", "paper_index", "user_profile", "previous_context"]
+EvidenceSection = Literal["title", "abstract", "method", "experiment", "result", "limitation", "table", "figure", "profile", "context"]
+ArtifactFallbackStrategy = Literal[
+    "none",
+    "skip_optional",
+    "generate_partial_summary",
+    "ask_user_clarification",
+    "fallback_to_generic_route",
+    "defer_until_evidence_ready",
+]
+EvidenceFallbackPolicy = Literal[
+    "none",
+    "use_metadata_abstract_surrogate",
+    "use_previous_context",
+    "ask_user_clarification",
+    "skip_optional_artifact",
+    "generic_without_profile",
+    "defer_until_index_ready",
+]
+ConfidenceImpact = Literal["none", "low", "medium", "high"]
+EvidencePriority = Literal["low", "normal", "high"]
+PlanningDiagnosticSeverity = Literal["info", "warning", "error"]
+
+ArtifactRefinementPatchOperation = Literal[
+    "enable_optional_artifact",
+    "disable_optional_artifact",
+    "raise_evidence_priority",
+    "lower_evidence_priority",
+    "add_target_field",
+    "remove_optional_field",
+    "refine_comparison_dimension",
+    "set_scope_constraint",
+    "set_budget_hint",
+    "add_fallback_note",
+]
+
+
+class EvidenceRequirement(BaseModel):
+    """描述某个 artifact 的字段需要什么证据来支撑。
+
+    EvidenceRequirement 绑定 target_artifact_id 与 target_fields，避免后续 Observer 只看到
+    “需要摘要/方法”这种粗标签却无法判断哪个产物、哪个字段已经被证据覆盖。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    requirement_id: str
+    target_artifact_id: str
+    required: bool = True
+    target_fields: List[str] = Field(default_factory=list, min_length=1)
+    evidence_type: EvidenceType
+    source_scope: EvidenceSourceScope
+    source_preference: List[EvidenceSourceScope] = Field(default_factory=list)
+    preferred_sections: List[EvidenceSection] = Field(default_factory=list)
+    min_evidence_count: int = Field(default=1, ge=0)
+    coverage_criteria: List[str] = Field(default_factory=list, min_length=1)
+    fallback_policy: EvidenceFallbackPolicy = "none"
+    confidence_impact: ConfidenceImpact = "medium"
+    capability_status: CapabilityStatus = "supported"
+    priority: EvidencePriority = "normal"
+    field_weights: Dict[str, float] = Field(default_factory=dict)
+    scope_notes: List[str] = Field(default_factory=list)
+
+    @field_validator("requirement_id", "target_artifact_id")
+    @classmethod
+    def _require_non_empty_id(cls, value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("EvidenceRequirement id fields cannot be empty")
+        return text
+
+    @model_validator(mode="after")
+    def _normalize_source_preference(self) -> "EvidenceRequirement":
+        # source_preference 是给检索/Observer 的偏好顺序；未显式设置时至少保留主 source_scope。
+        if not self.source_preference:
+            self.source_preference = [self.source_scope]
+        return self
+
+
+class Artifact(BaseModel):
+    """科研中间产物的结构化定义。
+
+    Artifact 只表达“要产出什么”和“证据完成标准是什么”，不表达具体调用哪个工具；
+    工具选择仍由 Tool Planner / ExecutablePlan 负责。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: str
+    artifact_type: ArtifactType
+    depends_on: List[str] = Field(default_factory=list)
+    required: bool = True
+    prunable: bool = False
+    target_scope: ArtifactTargetScope
+    expected_output: str
+    target_fields: List[str] = Field(default_factory=list)
+    quality_criteria: List[str] = Field(default_factory=list, min_length=1)
+    scope_constraints: List[str] = Field(default_factory=list)
+    fallback_strategy: ArtifactFallbackStrategy = "none"
+    fallback_notes: List[str] = Field(default_factory=list)
+    consumer: List[ArtifactConsumer] = Field(default_factory=list, min_length=1)
+    evidence_requirements: List[EvidenceRequirement] = Field(default_factory=list)
+    budget_cost: Dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("artifact_id")
+    @classmethod
+    def _require_non_empty_artifact_id(cls, value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("Artifact artifact_id cannot be empty")
+        return text
+
+    @model_validator(mode="after")
+    def _validate_artifact_contract(self) -> "Artifact":
+        if self.required and not self.evidence_requirements:
+            raise ValueError(f"Required artifact {self.artifact_id} must define evidence_requirements")
+        for requirement in self.evidence_requirements:
+            if requirement.target_artifact_id != self.artifact_id:
+                raise ValueError(
+                    f"EvidenceRequirement {requirement.requirement_id} targets {requirement.target_artifact_id}, "
+                    f"but is nested under artifact {self.artifact_id}"
+                )
+            if self.required and requirement.capability_status == "unsupported":
+                # unsupported 只能作为边界诊断存在，不能进入 required 主流程，避免后续 planner 规划不可兑现的证据。
+                raise ValueError(f"Required artifact {self.artifact_id} cannot depend on unsupported evidence")
+        return self
+
+
+class PlanningDiagnostic(BaseModel):
+    """Artifact / Evidence 规划过程中的可观测诊断事件。"""
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    severity: PlanningDiagnosticSeverity = "info"
+    message: str
+    target_artifact_id: Optional[str] = None
+    evidence_type: Optional[EvidenceType] = None
+    capability_status: Optional[CapabilityStatus] = None
+
+
+class ArtifactRefinementPatch(BaseModel):
+    """LLM refinement 的唯一允许输出单元。
+
+    LLM 只能提交这些受控 patch，不能直接生成 ArtifactEvidencePlan，也不能改写工具步骤；
+    后续 ArtifactRefinementService 会逐条校验、部分接受，并把拒绝原因写入 diagnostics。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    patch_id: Optional[str] = None
+    operation: ArtifactRefinementPatchOperation
+    target_artifact_id: Optional[str] = None
+    target_evidence_type: Optional[EvidenceType] = None
+    target_fields: List[str] = Field(default_factory=list)
+    comparison_dimension: Optional[str] = None
+    scope_constraint: Optional[str] = None
+    budget_hint: Dict[str, int] = Field(default_factory=dict)
+    fallback_note: Optional[str] = None
+    priority: Optional[EvidencePriority] = None
+    rationale: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_patch_shape(self) -> "ArtifactRefinementPatch":
+        operation = self.operation
+        if operation != "set_budget_hint" and not str(self.target_artifact_id or "").strip():
+            raise ValueError(f"{operation} requires target_artifact_id")
+        if operation in {"raise_evidence_priority", "lower_evidence_priority"} and not (
+            self.target_evidence_type or self.target_fields
+        ):
+            raise ValueError(f"{operation} requires target_evidence_type or target_fields")
+        if operation in {"add_target_field", "remove_optional_field"} and not self.target_fields:
+            raise ValueError(f"{operation} requires target_fields")
+        if operation == "refine_comparison_dimension" and not (self.comparison_dimension or self.target_fields):
+            raise ValueError("refine_comparison_dimension requires comparison_dimension or target_fields")
+        if operation == "set_scope_constraint" and not str(self.scope_constraint or "").strip():
+            raise ValueError("set_scope_constraint requires scope_constraint")
+        if operation == "set_budget_hint" and not self.budget_hint:
+            raise ValueError("set_budget_hint requires budget_hint")
+        if operation == "add_fallback_note" and not str(self.fallback_note or "").strip():
+            raise ValueError("add_fallback_note requires fallback_note")
+        return self
+
+
+class ArtifactRefinementPatchSet(BaseModel):
+    """LLM refinement 的 JSON-only 顶层协议。"""
+    model_config = ConfigDict(extra="forbid")
+
+    patches: List[ArtifactRefinementPatch] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
+
+
+class ArtifactPlanningBudget(BaseModel):
+    """Artifact skeleton 的成本边界。
+
+    预算属于模板能力边界的一部分：Skeleton Builder 只把预算写入 plan metadata，
+    后续 Tool Planner / Replanner 再据此控制检索、全文深读和 refinement 成本。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    max_candidate_papers: Optional[int] = Field(default=None, ge=0)
+    max_selected_papers: Optional[int] = Field(default=None, ge=0)
+    max_deep_read_papers: Optional[int] = Field(default=None, ge=0)
+    max_qa_calls: Optional[int] = Field(default=None, ge=0)
+    max_refinement_rounds: Optional[int] = Field(default=None, ge=0)
+
+
+class PlanningDiagnostics(BaseModel):
+    """给 debug / metadata 使用的规划摘要。
+
+    diagnostics 只描述契约构造和能力边界，不记录执行结果；执行期质量仍由 Observer / PlanRuntime 负责。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    planner_source: Optional[str] = None
+    template_id: Optional[str] = None
+    template_version: Optional[str] = None
+    research_task_type: Optional[ResearchTaskType] = None
+    profile_source: Optional[str] = None
+    classification_basis: Optional[str] = None
+    budget: ArtifactPlanningBudget = Field(default_factory=ArtifactPlanningBudget)
+    dependency_order: List[str] = Field(default_factory=list)
+    capability_summary: Dict[str, int] = Field(default_factory=dict)
+    unmet_evidence_requirements: List[Dict[str, Any]] = Field(default_factory=list)
+    pruned_artifacts: List[Dict[str, Any]] = Field(default_factory=list)
+    retained_optional_artifacts: List[str] = Field(default_factory=list)
+    degraded_evidence_requirements: List[Dict[str, Any]] = Field(default_factory=list)
+    context_adjustments: List[str] = Field(default_factory=list)
+    template_defaults: Dict[str, Any] = Field(default_factory=dict)
+    llm_refinement_attempted: bool = False
+    llm_refinement_raw_summary: Dict[str, Any] = Field(default_factory=dict)
+    llm_refinement_error: Optional[str] = None
+    llm_refinement_patches: List[Dict[str, Any]] = Field(default_factory=list)
+    accepted_refinement_patches: List[Dict[str, Any]] = Field(default_factory=list)
+    rejected_refinement_patches: List[Dict[str, Any]] = Field(default_factory=list)
+    local_corrections: List[Dict[str, Any]] = Field(default_factory=list)
+    final_evidence_requirements: List[Dict[str, Any]] = Field(default_factory=list)
+    diagnostic_events: List[PlanningDiagnostic] = Field(default_factory=list)
+
+
+class ArtifactEvidencePlan(BaseModel):
+    """ResearchTaskProfile 与 ExecutablePlan 之间的统一 Artifact / Evidence 契约。
+
+    这个对象可以直接序列化进 debug 和 plan metadata；下游只需要消费固定字段，
+    不再依赖临时 dict 或自然语言说明来理解科研中间产物与证据需求。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: Optional[str] = None
+    research_task_type: ResearchTaskType
+    profile_source: Optional[str] = None
+    classification_basis: Optional[str] = None
+    artifacts: List[Artifact] = Field(default_factory=list, min_length=1)
+    diagnostics: PlanningDiagnostics = Field(default_factory=PlanningDiagnostics)
+
+    @model_validator(mode="after")
+    def _validate_plan_contract(self) -> "ArtifactEvidencePlan":
+        artifacts_by_id: Dict[str, Artifact] = {}
+        for artifact in self.artifacts:
+            if artifact.artifact_id in artifacts_by_id:
+                raise ValueError(f"Duplicate artifact_id: {artifact.artifact_id}")
+            artifacts_by_id[artifact.artifact_id] = artifact
+
+        for artifact in self.artifacts:
+            for dependency in artifact.depends_on:
+                if dependency not in artifacts_by_id:
+                    raise ValueError(f"Artifact {artifact.artifact_id} depends on unknown artifact {dependency}")
+            for requirement in artifact.evidence_requirements:
+                if requirement.target_artifact_id not in artifacts_by_id:
+                    raise ValueError(
+                        f"EvidenceRequirement {requirement.requirement_id} targets unknown artifact {requirement.target_artifact_id}"
+                    )
+
+        dependency_order = _topological_sort_artifact_ids(artifacts_by_id)
+        self.diagnostics.dependency_order = self.diagnostics.dependency_order or dependency_order
+        self.diagnostics.research_task_type = self.diagnostics.research_task_type or self.research_task_type
+        self.diagnostics.profile_source = self.diagnostics.profile_source or self.profile_source
+        self.diagnostics.classification_basis = self.diagnostics.classification_basis or self.classification_basis
+        self.diagnostics.capability_summary = self.diagnostics.capability_summary or _capability_summary_from_artifacts(self.artifacts)
+        return self
+
+
+def _topological_sort_artifact_ids(artifacts_by_id: Dict[str, Artifact]) -> List[str]:
+    """校验 artifact 依赖并返回拓扑顺序。
+
+    当前依赖图只是少量 artifact_id 的 DAG，本地 DFS 足够且更轻；如果后续引入跨任务复杂图，
+    再切换到 networkx 这类成熟图工具，避免在这里重复实现复杂图算法。
+    """
+    visited: Set[str] = set()
+    visiting: Set[str] = set()
+    ordered: List[str] = []
+
+    def visit(artifact_id: str) -> None:
+        if artifact_id in visited:
+            return
+        if artifact_id in visiting:
+            raise ValueError(f"Artifact dependency graph contains cycle at {artifact_id}")
+        visiting.add(artifact_id)
+        for dependency in artifacts_by_id[artifact_id].depends_on:
+            visit(dependency)
+        visiting.remove(artifact_id)
+        visited.add(artifact_id)
+        ordered.append(artifact_id)
+
+    for artifact_id in artifacts_by_id:
+        visit(artifact_id)
+    return ordered
+
+
+def _capability_summary_from_artifacts(artifacts: List[Artifact]) -> Dict[str, int]:
+    summary: Dict[str, int] = {}
+    for artifact in artifacts:
+        for requirement in artifact.evidence_requirements:
+            status = requirement.capability_status
+            summary[status] = summary.get(status, 0) + 1
+    return summary
+
+
 class PlanDraftStep(BaseModel):
     """表示尚未被信任的单个规划草稿步骤。
 
