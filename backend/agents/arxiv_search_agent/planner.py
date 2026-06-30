@@ -15,6 +15,7 @@ from .plan_validator import PlanValidator
 from .planner_context import build_planner_context, planner_context_debug
 from .schemas import ExecutablePlan, Goal, PlanRuntime, PlanStep, StepCondition, StepInputBinding, StepPolicy
 from .state import AgentState
+from .profile_aware_planner import PROFILE_AWARE_TASK_PLANNER_SOURCE, ProfileAwareResearchTaskPlanBuilder, attach_profile_aware_metadata
 from .tool_aware_planner import LLMPlanDraftGenerator, PlanDraftConverter, PlanDraftPlanningError, RuleBasedToolAwarePlanBuilder, ToolCandidateSelector
 from .tool_registry import PLANNER_TOOL_REGISTRY, ToolRegistry
 from .utils.state_utils import _compact_search_spec
@@ -128,6 +129,7 @@ def _planner_path_from_source(source: Optional[str]) -> Optional[str]:
         "fixed_template": LEGACY_TEMPLATE_FALLBACK_PATH,
         "llm_tool_aware": "experimental_llm_draft_planner",
         "tool_aware_rule_based": "rule_based_planner",
+        PROFILE_AWARE_TASK_PLANNER_SOURCE: "profile_aware_task_planner",
         "fixed_template_fallback": LEGACY_TEMPLATE_FALLBACK_PATH,
         LEGACY_TEMPLATE_FALLBACK_SOURCE: LEGACY_TEMPLATE_FALLBACK_PATH,
         "unsupported_fallback": "unsupported_fallback_planner",
@@ -195,6 +197,7 @@ def _finalize_plan_debug_and_metadata(
         "fallback_record": dict(planning_debug.get("fallback_record") or {}),
         "validation_status": planning_debug.get("validation_status"),
         "strict_llm_failure": bool(runtime_flags.get("strict_llm_failure")),
+        "profile_aware_used": bool((planning_debug.get("profile_aware_planning") or {}).get("enabled")),
     }
     capability_boundary = _build_capability_boundary(goal, plan)
     planning_debug["planner_runtime_flags"] = dict(runtime_flags)
@@ -847,6 +850,7 @@ def build_executable_plan_for_goal(
             "tool_contract_source": {},
             "tool_contract_matrix": tool_registry.tool_contract_matrix(),
             "confirmation_required_steps": [],
+            "profile_aware_planning": {},
             "planner_runtime_flags": dict(runtime_flags),
         }
         return _fallback_to_template_or_unsupported(
@@ -900,6 +904,7 @@ def build_executable_plan_for_goal(
             "tool_contract_source": {},
             "tool_contract_matrix": tool_registry.tool_contract_matrix(),
             "confirmation_required_steps": [],
+            "profile_aware_planning": {},
             "planner_runtime_flags": dict(runtime_flags),
         }
         return _fallback_to_template_or_unsupported(
@@ -942,6 +947,7 @@ def build_executable_plan_for_goal(
         "tool_contract_source": {},
         "tool_contract_matrix": tool_registry.tool_contract_matrix(),
         "confirmation_required_steps": [],
+        "profile_aware_planning": {},
         "planner_runtime_flags": dict(runtime_flags),
     }
 
@@ -1039,6 +1045,46 @@ def build_executable_plan_for_goal(
                     allow_template=llm_fallback_to_template,
                 )
 
+    profile_builder = ProfileAwareResearchTaskPlanBuilder()
+    try:
+        profile_draft = profile_builder.build(goal, state, selection.candidate_tools, tool_registry, planner_context)
+        planning_debug["profile_aware_planning"] = dict(profile_builder.last_debug or {})
+        if profile_draft is not None:
+            if profile_draft.fallback_reason:
+                # Profile-aware 分支只能产出可执行草案；显式 fallback_reason 说明本地仲裁认为应交回原规则路线。
+                raise PlanDraftPlanningError(profile_draft.fallback_reason)
+            planning_debug.update(
+                {
+                    "selected_steps": list(profile_builder.last_debug.get("selected_steps") or []),
+                    "skipped_steps": list(profile_builder.last_debug.get("skipped_steps") or []),
+                    "skipped_tools": list(profile_builder.last_debug.get("skipped_tools") or []),
+                    "profile_aware_builder": profile_builder.__class__.__name__,
+                    "rule_based_fallback_used": bool(llm_enabled),
+                }
+            )
+            planning_debug["draft_steps"] = [step.model_dump() for step in list(profile_draft.steps or [])]
+            plan = PlanDraftConverter(tool_registry).convert(profile_draft, goal, allowed_tool_names=candidate_tool_names)
+            PlanValidator().validate(plan, tool_registry)
+            plan = attach_profile_aware_metadata(plan, profile_draft, profile_builder.last_debug)
+            planning_debug.update(
+                {
+                    "validation_status": "passed",
+                    "final_plan_source": PROFILE_AWARE_TASK_PLANNER_SOURCE,
+                    "selected_plan_source": PROFILE_AWARE_TASK_PLANNER_SOURCE,
+                    "selected_steps": _debug_steps_from_plan(plan),
+                    "tool_contract_source": _tool_contract_source_summary(plan.steps),
+                    "confirmation_required_steps": _confirmation_required_step_ids(plan),
+                    "execution_plan": plan.model_dump(),
+                }
+            )
+            plan, planning_debug = _finalize_plan_debug_and_metadata(goal, plan, planning_debug, runtime_flags)
+            return goal, plan, planning_debug
+    except Exception as exc:
+        # 增强规划层不能成为执行阻断点；校验失败时保留 debug，然后回到原有 intent-to-tool 规则路线。
+        profile_debug = dict(getattr(profile_builder, "last_debug", {}) or {})
+        profile_debug["error"] = str(exc)
+        profile_debug.setdefault("enabled", False)
+        planning_debug["profile_aware_planning"] = profile_debug
     try:
         rule_builder = RuleBasedToolAwarePlanBuilder()
         draft = rule_builder.build(goal, state, selection.candidate_tools, tool_registry, planner_context)

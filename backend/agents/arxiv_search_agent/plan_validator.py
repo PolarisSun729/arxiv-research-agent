@@ -125,7 +125,8 @@ class PlanValidator:
             unsupported_tools = [step.tool_name for step in steps if step.tool_name != "generate_fallback_response"]
             if unsupported_tools:
                 raise PlanValidationError(f"Unsupported plan must only use generate_fallback_response, got: {unsupported_tools}")
-        if goal_type == "paper_qa":
+        if goal_type == "paper_qa" and not self._is_clarification_only_plan(steps):
+            # 目标论文缺失时 planner 可以安全降级为澄清计划；只有真正进入 Paper QA 业务链路时才强制 resolve/check/answer。
             self._validate_paper_qa_plan(steps_by_id, steps)
         if goal_type == "preference_action":
             self._validate_preference_plan(steps_by_id, steps)
@@ -186,6 +187,10 @@ class PlanValidator:
             if step.tool_name in terminal_tools or tags.intersection({"answer", "fallback", "clarify"}):
                 return True
         return False
+
+    def _is_clarification_only_plan(self, steps: List[PlanStep]) -> bool:
+        tool_names = {step.tool_name for step in steps}
+        return bool(tool_names) and tool_names.issubset({"analyze_ambiguity", "generate_clarification"}) and "generate_clarification" in tool_names
 
     def _validate_paper_qa_plan(self, steps_by_id: Dict[str, PlanStep], steps: List[PlanStep]) -> None:
         tool_by_name = {step.tool_name: step for step in steps}

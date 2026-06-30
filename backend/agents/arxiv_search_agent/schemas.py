@@ -397,6 +397,124 @@ class Goal(BaseModel):
     task_scope: Optional[str] = None
 
 
+# =============================================================================
+# Research Task Profile 语义层（intent 与工具计划之间的科研任务语义）
+# -----------------------------------------------------------------------------
+# 设计动机见 docs/项目说明：intent 只说明“系统进入哪条能力链路”，而 research_task_type
+# 说明“用户正处于哪一类科研任务场景”。同一个 intent=arxiv_search 可能对应方向探索、
+# 多论文比较或阅读规划等不同科研任务，因此需要一个与 intent 并行存在的结构化 Profile，
+# 显式表达任务类型、任务对象、中间产物、证据需求和置信度，供后续 planner 从
+# “科研任务 → 中间产物 → 证据需求 → 工具计划”而不是“intent → 工具”进行规划。
+#
+# 枚举刻意固定，避免后续规则或 LLM 自由创造标签导致语义漂移。
+# =============================================================================
+
+# 固定的科研任务类型枚举：方向探索 / 多论文比较 / 单篇深读 / 阅读规划 / 研究空白分析 / 个性化推荐。
+ResearchTaskType = Literal[
+    "direction_exploration",
+    "multi_paper_comparison",
+    "single_paper_deep_read",
+    "reading_planning",
+    "research_gap_analysis",
+    "personalized_recommendation",
+]
+
+# 任务对象类型：主题词、单篇论文、论文集合或用户画像。
+ResearchTaskObjectType = Literal["topic", "paper", "paper_set", "user_profile"]
+
+# 后续 planner 需要消费的“中间产物”枚举（工作产物，而非工具本身）。
+ResearchTaskArtifact = Literal[
+    "candidate_paper_set",
+    "representative_paper_set",
+    "method_cards",
+    "experiment_info",
+    "comparison_matrix",
+    "reading_order",
+]
+
+# 中间产物需要的“证据需求”枚举（这些产物要由什么证据支撑）。
+ResearchTaskEvidence = Literal[
+    "metadata",
+    "abstract",
+    "method_chunk",
+    "experiment_chunk",
+    "table_evidence",
+    "user_profile_evidence",
+]
+
+
+# Profile 的本地可执行性状态：ready 表示可按当前上下文规划；needs_retrieval 表示需先检索候选；
+# needs_user_clarification 表示缺少目标论文/主题等关键条件；fallback_intent_route 表示语义层放弃接管。
+ResearchTaskExecutionReadiness = Literal[
+    "ready",
+    "needs_retrieval",
+    "needs_user_clarification",
+    "fallback_intent_route",
+]
+
+class ResearchTaskObject(BaseModel):
+    """描述本轮科研任务真正作用的对象。
+
+    object_type 决定后续 planner 应该围绕主题检索、围绕单篇深读，还是围绕论文集合做比较；
+    topic / paper_refs / description 则是更细的对象描述，便于 debug 解释“任务对象是什么”。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    object_type: ResearchTaskObjectType
+    topic: Optional[str] = None
+    paper_refs: List[str] = Field(default_factory=list)
+    description: Optional[str] = None
+
+
+class ResearchTaskConstraints(BaseModel):
+    """承载用户对科研任务显式提出的约束。
+
+    这些约束来自请求和 search_spec，例如时间范围、数量上限、研究领域，以及是否要结合个人兴趣。
+    它们不替代 search_spec，而是把“科研任务层面关心的限制”单独抽出来，供 planner 解释和复用。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    time_range: Optional[str] = None
+    max_count: Optional[int] = None
+    research_fields: List[str] = Field(default_factory=list)
+    combine_with_interest: bool = False
+
+
+class ResearchTaskProfile(BaseModel):
+    """科研任务语义层的统一数据契约。
+
+    它与 intent 并行存在：intent 表示系统能力入口，research_task_type 表示用户处于哪一类科研任务。
+    第一版不引入复杂 ResearchTaskGraph，只用结构化 Profile 明确：
+    - research_task_type：科研任务类型（固定枚举）；
+    - task_object：任务对象（主题/论文/论文集合/用户画像）；
+    - constraints：显式约束（时间范围/数量/领域/是否结合兴趣）；
+    - intermediate_artifacts：后续 planner 需要产出的中间产物；
+    - evidence_requirements：这些产物需要的证据支撑；
+    - confidence / classification_basis / needs_clarification：分类置信度、分类依据与是否需要澄清。
+
+    Profile 不替代 Goal、intent 或 ExecutablePlan：Goal 表示用户目标，intent 表示系统能力入口，
+    ExecutablePlan 仍表示最终可执行工具步骤；Profile 只补齐二者之间缺失的科研任务语义。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    profile_id: Optional[str] = None
+    research_task_type: ResearchTaskType
+    secondary_task_types: List[ResearchTaskType] = Field(default_factory=list)
+    intent: Optional[str] = None
+    goal_type: Optional[str] = None
+    task_object: ResearchTaskObject
+    constraints: ResearchTaskConstraints = Field(default_factory=ResearchTaskConstraints)
+    intermediate_artifacts: List[ResearchTaskArtifact] = Field(default_factory=list)
+    evidence_requirements: List[ResearchTaskEvidence] = Field(default_factory=list)
+    confidence: float = 0.0
+    classification_basis: Optional[str] = None
+    needs_clarification: bool = False
+    execution_readiness: ResearchTaskExecutionReadiness = "ready"
+    arbitration_notes: List[str] = Field(default_factory=list)
+    classification_trace: Dict[str, Any] = Field(default_factory=dict)
+    source: Optional[str] = None
+
+
 class PlanDraftStep(BaseModel):
     """表示尚未被信任的单个规划草稿步骤。
 
@@ -507,6 +625,9 @@ class PlannerContext(BaseModel):
     pending_action: Optional[Dict[str, Any]] = None
     user_memory_summary: Any = None
     research_profile: Any = None
+    # research_task_profile 是 intent 与工具计划之间的科研任务语义层；planner 可据此从
+    # “科研任务 → 中间产物 → 证据需求”推导计划，而不是直接 intent → 工具。缺失时不影响既有规划。
+    research_task_profile: Any = None
     available_tools: List[PlannerToolContext] = Field(default_factory=list)
     available_tool_names: List[str] = Field(default_factory=list)
     context_refs: List[str] = Field(default_factory=list)
@@ -1241,6 +1362,9 @@ class ArxivSearchResponse(BaseModel):
     answer: str
     search_spec: Optional[ArxivSearchSpec] = None
     goal: Optional[Goal] = None
+    # research_task_profile 与 intent 并行存在，描述本轮科研任务语义（任务类型/对象/中间产物/证据需求）；
+    # 它是可选语义层，缺失时不影响其余响应字段。
+    research_task_profile: Optional[ResearchTaskProfile] = None
     execution_plan: Optional[ExecutablePlan] = None
     plan_runtime: Optional[PlanRuntime] = None
     runtime_state: Optional[AgentRuntimeState] = None

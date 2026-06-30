@@ -1181,6 +1181,7 @@ def _state_to_response(state: Any) -> ArxivSearchResponse:
         answer=final_state.answer or "",
         search_spec=final_state.search_spec,
         goal=final_state.goal,
+        research_task_profile=final_state.research_task_profile,
         execution_plan=final_state.execution_plan,
         plan_runtime=final_state.plan_runtime,
         runtime_state=final_state.runtime_state,
@@ -1448,6 +1449,9 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
         "llm_confidence": state.llm_confidence,
         "search_spec": state.search_spec.model_dump() if state.search_spec is not None else None,
         "goal": state.goal.model_dump() if state.goal is not None else None,
+        # research_task_profile 是 intent 与计划之间的科研任务语义层；这里随状态快照一并暴露，
+        # 让流式事件和调试面板能看到 Goal → intent → ResearchTaskProfile → ExecutablePlan 的对应关系。
+        "research_task_profile": state.research_task_profile.model_dump() if state.research_task_profile is not None else None,
         "execution_plan": [_compact_execution_plan_step(step, runtime_step=execution_plan_runtime_steps.get(step.step_id)) for step in list((state.execution_plan.steps if state.execution_plan else []) or [])],
         "execution_plan_metadata": state.execution_plan.metadata if state.execution_plan is not None else {},
         "execution_plan_summary": {

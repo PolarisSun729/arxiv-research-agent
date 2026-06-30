@@ -14,6 +14,7 @@ from .schemas import (
     Goal,
     PlanStep,
     PlanRuntime,
+    ResearchTaskProfile,
     ToolCallRequest,
     ToolObservation,
     ToolSpec,
@@ -159,6 +160,13 @@ class AgentState(BaseModel):
     execution_plan: Optional[ExecutablePlan] = None
     plan_runtime: Optional[PlanRuntime] = None
     runtime_state: Optional[AgentRuntimeState] = None
+
+    # [A 执行真源-语义层] research_task_profile 表达本轮“科研任务语义”，与 intent 并行存在：
+    # intent 说明系统进入哪条能力链路，research_task_profile.research_task_type 说明用户处于
+    # 哪一类科研任务（方向探索 / 多论文比较 / 单篇深读 / 阅读规划 / 研究空白分析 / 个性化推荐）。
+    # 它由 build_goal 阶段在 Goal 之后、ExecutablePlan 之前推断；缺失时不影响既有 intent/计划流程，
+    # 后续 planner 可选择消费其中的中间产物（intermediate_artifacts）和证据需求（evidence_requirements）。
+    research_task_profile: Optional[ResearchTaskProfile] = None
 
     @field_validator("execution_plan", mode="before")
     @classmethod

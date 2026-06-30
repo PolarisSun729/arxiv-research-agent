@@ -1229,3 +1229,135 @@ def test_rule_based_plan_can_be_executed_by_existing_plan_executor(monkeypatch) 
     assert result.status == "success"
     assert result.final_answer
     assert any(trace.step_id == "search_arxiv" and trace.event == "step_succeeded" for trace in result.trace)
+
+
+def _research_task_profile(
+    task_type: str,
+    *,
+    goal_type: str = "arxiv_search",
+    source: str = "rule_high_confidence",
+    confidence: float = 0.92,
+    readiness: str = "ready",
+    object_type: str | None = None,
+):
+    object_type = object_type or ("paper" if task_type == "single_paper_deep_read" else "topic")
+    return schemas.ResearchTaskProfile(
+        research_task_type=task_type,
+        intent=goal_type,
+        goal_type=goal_type,
+        task_object={"object_type": object_type, "topic": "retrieval augmented generation"},
+        confidence=confidence,
+        execution_readiness=readiness,
+        classification_basis="test profile",
+        source=source,
+    )
+
+
+def test_profile_aware_multi_paper_comparison_builds_artifact_evidence_plan() -> None:
+    state = AgentState(intent="arxiv_search", message="比较 RAG 和 GraphRAG 最近的代表论文")
+    state.research_task_profile = _research_task_profile("multi_paper_comparison", object_type="paper_set")
+
+    _, plan, debug = _current_modules()[0].build_executable_plan(
+        state,
+        enable_tool_aware_planner=True,
+        enable_llm_plan_draft=False,
+    )
+
+    assert debug["selected_plan_source"] == "profile_aware_task_planner"
+    assert debug["planner_summary"]["profile_aware_used"] is True
+    assert debug["profile_aware_planning"]["enabled"] is True
+    assert plan.metadata["profile_aware_used"] is True
+    profile_plan = plan.metadata["profile_aware_plan"]
+    assert profile_plan["research_task_type"] == "multi_paper_comparison"
+    assert "comparison_matrix" in {item["artifact"] for item in profile_plan["artifact_plan"]}
+    assert any(item["artifact"] == "candidate_paper_set" and "search_arxiv" in item["tool_steps"] for item in profile_plan["evidence_tool_mapping"])
+    assert next(step for step in plan.steps if step.tool_name == "search_arxiv").output_key == "candidate_paper_set"
+    PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
+
+
+def test_profile_aware_direction_exploration_uses_enhanced_route_for_high_confidence_profile() -> None:
+    state = AgentState(intent="arxiv_search", message="这个方向最近有什么值得关注的工作")
+    state.research_task_profile = _research_task_profile(
+        "direction_exploration",
+        source="llm_semantic_classifier",
+        confidence=0.82,
+    )
+
+    _, plan, debug = _current_modules()[0].build_executable_plan(
+        state,
+        enable_tool_aware_planner=True,
+        enable_llm_plan_draft=False,
+    )
+
+    assert debug["selected_plan_source"] == "profile_aware_task_planner"
+    artifacts = {item["artifact"] for item in plan.metadata["profile_aware_plan"]["artifact_plan"]}
+    assert {"topic_terms", "candidate_paper_set", "direction_overview"}.issubset(artifacts)
+    assert _step_ids(plan)[:4] == ["normalize_request", "build_arxiv_search_spec", "search_arxiv", "validate_arxiv_results"]
+
+
+def test_profile_aware_single_paper_deep_read_builds_paper_qa_artifact_plan() -> None:
+    state = AgentState(
+        intent="paper_qa",
+        message="深入读一下这篇论文的方法和局限",
+        context={"selected_paper": {"arxiv_id": "2401.00001", "title": "RAG"}},
+    )
+    state.research_task_profile = _research_task_profile(
+        "single_paper_deep_read",
+        goal_type="paper_qa",
+        object_type="paper",
+    )
+
+    _, plan, debug = _current_modules()[0].build_executable_plan(
+        state,
+        enable_tool_aware_planner=True,
+        enable_llm_plan_draft=False,
+    )
+
+    assert debug["selected_plan_source"] == "profile_aware_task_planner"
+    assert _tool_names(plan) == ["resolve_paper", "check_paper_index", "answer_paper_question", "assess_paper_qa_quality"]
+    profile_plan = plan.metadata["profile_aware_plan"]
+    assert profile_plan["research_task_type"] == "single_paper_deep_read"
+    assert "method_explanation" in {item["artifact"] for item in profile_plan["artifact_plan"]}
+    assert next(step for step in plan.steps if step.tool_name == "assess_paper_qa_quality").output_key == "deep_read_evidence_quality"
+    PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
+
+
+def test_profile_aware_simple_fallback_profile_keeps_original_rule_route() -> None:
+    state = AgentState(intent="arxiv_search", message="搜一下 RAG 最新论文")
+    state.research_task_profile = _research_task_profile(
+        "direction_exploration",
+        source="fallback_to_intent_route",
+        confidence=0.3,
+        readiness="fallback_intent_route",
+    )
+
+    _, plan, debug = _current_modules()[0].build_executable_plan(
+        state,
+        enable_tool_aware_planner=True,
+        enable_llm_plan_draft=False,
+    )
+
+    assert debug["selected_plan_source"] == "tool_aware_rule_based"
+    assert debug["profile_aware_planning"]["skip_reason"] == "profile_fallback_to_intent_route"
+    assert "profile_aware_plan" not in plan.metadata
+    assert next(step for step in plan.steps if step.tool_name == "search_arxiv").output_key == "arxiv_results"
+
+
+def test_profile_aware_deep_read_without_target_degrades_to_clarification_route() -> None:
+    state = AgentState(intent="paper_qa", message="深入读一下这篇论文")
+    state.research_task_profile = _research_task_profile(
+        "single_paper_deep_read",
+        goal_type="paper_qa",
+        object_type="paper",
+    )
+
+    _, plan, debug = _current_modules()[0].build_executable_plan(
+        state,
+        enable_tool_aware_planner=True,
+        enable_llm_plan_draft=False,
+    )
+
+    assert debug["selected_plan_source"] == "tool_aware_rule_based"
+    assert debug["profile_aware_planning"]["skip_reason"] == "single_paper_deep_read_missing_target_paper"
+    assert "answer_paper_question" not in _tool_names(plan)
+    assert {"analyze_ambiguity", "generate_clarification"}.issubset(set(_tool_names(plan)))

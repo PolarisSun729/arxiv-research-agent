@@ -8,6 +8,7 @@ from langgraph.graph import END, START, StateGraph
 from .node import parse_search_request
 from .planner import GoalBuilder, build_executable_plan_for_goal, build_plan_runtime
 from .plan_executor import PlanExecutor
+from .research_task_profile import build_research_task_profile, research_task_profile_debug
 from .runtime_checkpoint import build_agent_checkpointer
 from .schemas import AgentRuntimeState, AgentStep, AgentTurnResult, ExecutablePlan, PlanRuntime, StepExecutionResult
 from .state import AgentState
@@ -47,21 +48,36 @@ def _executor() -> PlanExecutor:
     return PlanExecutor(tool_registry=PLANNER_TOOL_REGISTRY)
 
 
-def build_goal_node(state: Any) -> AgentState:
-    """只负责把 parse 后的 intent/context 转成结构化 Goal。"""
+def build_goal_node(state: Any, generation_service: Optional[Any] = None) -> AgentState:
+    """只负责把 parse 后的 intent/context 转成结构化 Goal 与科研任务语义 Profile。"""
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
     goal = GoalBuilder.from_state(next_state)
     next_state.goal = goal
     next_state.debug = dict(next_state.debug or {})
     next_state.debug["goal"] = goal.model_dump()
+
+    # Research Task Profile 是 intent 与工具计划之间的科研任务语义层；它在 Goal 之后、
+    # 计划之前推断，缺失/异常都不能影响既有 intent 与计划流程，因此整体包在保护分支里。
+    profile = None
+    try:
+        profile = build_research_task_profile(goal=goal, state=next_state, generation_service=generation_service)
+    except Exception as exc:  # pragma: no cover - 语义层失败必须降级，不阻断主流程
+        next_state.debug["research_task_profile_error"] = str(exc)
+    next_state.research_task_profile = profile
+    next_state.debug["research_task_profile"] = research_task_profile_debug(profile)
+
     next_state.steps = list(next_state.steps or []) + [
         AgentStep(
             step="build_goal",
             status="success",
-            action="根据解析结果构建本轮目标",
+            action="根据解析结果构建本轮目标与科研任务语义 Profile",
             inputs={"intent": next_state.intent, "message": next_state.message},
-            outputs={"goal_type": goal.goal_type, "risk_level": goal.risk_level},
+            outputs={
+                "goal_type": goal.goal_type,
+                "risk_level": goal.risk_level,
+                "research_task_type": profile.research_task_type if profile is not None else None,
+            },
             error=None,
         )
     ]
@@ -348,7 +364,7 @@ def build_arxiv_search_graph(
     graph = StateGraph(AgentState)
 
     graph.add_node("parse_search_request", lambda state: parse_search_request(state, generation_service=generation_service))
-    graph.add_node("build_goal", build_goal_node)
+    graph.add_node("build_goal", lambda state: build_goal_node(state, generation_service=generation_service))
     graph.add_node("build_plan", build_plan_node)
     graph.add_node("select_next_step", select_next_step_node)
     graph.add_node("execute_step", execute_step_node)

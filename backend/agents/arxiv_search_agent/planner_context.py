@@ -42,6 +42,9 @@ def build_planner_context(
         pending_action=_normalize_mapping(state.pending_action or context.get("pending_action")),
         user_memory_summary=context.get("user_memory_summary", context.get("memory_summary")),
         research_profile=context.get("research_profile"),
+        # research_task_profile 是科研任务语义层；planner 可选择消费其中间产物/证据需求，
+        # 缺失时（如 unclear/unsupported/preference_action 或语义层降级）保持 None，不影响既有规划。
+        research_task_profile=state.research_task_profile.model_dump() if state.research_task_profile is not None else None,
         available_tools=available_tools,
         available_tool_names=[tool.tool_name for tool in available_tools],
         context_refs=_build_context_refs(state, context, runtime_outputs),
@@ -80,6 +83,8 @@ def planner_context_debug(planner_context: PlannerContext) -> Dict[str, Any]:
         "goal_type": planner_context.goal_type,
         "intent": planner_context.intent,
         "intent_confidence": planner_context.intent_confidence,
+        # research_task_profile 让 planner debug 能展示 Goal/intent/科研任务语义/计划的完整对应关系。
+        "research_task_profile": _research_task_profile_debug(planner_context.research_task_profile),
         "context_refs": list(planner_context.context_refs or []),
         "context_field_summary": dict(planner_context.context_field_summary or {}),
         "used_context_fields": _used_context_fields(planner_context),
@@ -108,6 +113,33 @@ def planner_context_debug(planner_context: PlannerContext) -> Dict[str, Any]:
             }
             for tool in list(planner_context.available_tools or [])
         ],
+    }
+
+
+def _research_task_profile_debug(profile: Any) -> Optional[Dict[str, Any]]:
+    """把 planner 看到的科研任务语义层压成 debug 摘要。
+
+    PlannerContext.research_task_profile 为求构造稳定保存为 dict（model_dump 结果），
+    这里只挑出最能解释“科研任务 → 中间产物 → 证据需求”链路的字段，
+    让 planner debug 与 build_goal 阶段的 Profile 摘要口径一致。
+    """
+    if not isinstance(profile, Mapping):
+        return None
+    return {
+        "research_task_type": profile.get("research_task_type"),
+        "intent": profile.get("intent"),
+        "goal_type": profile.get("goal_type"),
+        "task_object": profile.get("task_object"),
+        "constraints": profile.get("constraints"),
+        "intermediate_artifacts": list(profile.get("intermediate_artifacts") or []),
+        "evidence_requirements": list(profile.get("evidence_requirements") or []),
+        "confidence": profile.get("confidence"),
+        "classification_basis": profile.get("classification_basis"),
+        "needs_clarification": profile.get("needs_clarification"),
+        "execution_readiness": profile.get("execution_readiness"),
+        "arbitration_notes": list(profile.get("arbitration_notes") or []),
+        "source": profile.get("source"),
+        "classification_trace": dict(profile.get("classification_trace") or {}),
     }
 
 

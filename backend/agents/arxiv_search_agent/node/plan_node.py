@@ -8,9 +8,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Union
+from typing import Any, Dict, Mapping, Optional, Union
 
 from ..planner import build_executable_plan, build_plan_runtime
+from ..research_task_profile import build_research_task_profile, research_task_profile_debug
+from ..schemas import Goal
 from ..state import AgentState
 from ..utils.state_utils import _append_step, _coerce_state, _compact_search_spec, _refresh_execution_plan_runtime, _update_execution_plan_step
 
@@ -21,6 +23,23 @@ def _build_goal_and_plan(state: AgentState):
     turn_status = "waiting_confirmation" if any(step.status == "waiting_confirmation" for step in list(execution_plan.steps or [])) else "success"
     plan_runtime = build_plan_runtime(state, goal=goal, plan=execution_plan, turn_status=turn_status)
     return goal, execution_plan, plan_runtime, planning_debug
+
+
+def _attach_research_task_profile(state: AgentState, goal: Goal, generation_service: Optional[Any] = None) -> AgentState:
+    """在 plan_task facade 中补齐科研任务语义层，行为与 graph build_goal 节点一致。
+
+    Profile 是可选增强层：构造异常时只记录 debug，不影响既有 intent/计划流程。
+    """
+    profile = None
+    try:
+        profile = build_research_task_profile(goal=goal, state=state, generation_service=generation_service)
+    except Exception as exc:  # pragma: no cover - 语义层失败必须降级
+        state.debug = dict(state.debug or {})
+        state.debug["research_task_profile_error"] = str(exc)
+    state.research_task_profile = profile
+    state.debug = dict(state.debug or {})
+    state.debug["research_task_profile"] = research_task_profile_debug(profile)
+    return state
 
 
 def plan_task(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
@@ -34,6 +53,9 @@ def plan_task(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:
         next_state.execution_plan = execution_plan
         next_state.plan_runtime = plan_runtime
         next_state = _refresh_execution_plan_runtime(next_state)
+        # 这个 facade 同时承担显式图之外的兼容入口；科研任务语义层在此一并补齐，
+        # 保证无论从 graph 还是从 plan_task 进入，research_task_profile 行为一致。
+        next_state = _attach_research_task_profile(next_state, goal)
 
         # 请求规范化是 planner 自己可完成的输入整理动作，构造完计划后即可视为完成。
         if goal.goal_type == "arxiv_search":
