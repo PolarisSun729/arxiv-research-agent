@@ -74,6 +74,14 @@ class RetrievalTraceBuilder:
             "final_context_top15": self.count_chunk_types(final_context_top15),
         }
         memory_retrieval_enabled = bool(memory_debug.get("enabled", False))
+        multi_index_debug = self.build_multi_index_debug(
+            routes=deduped_routes,
+            raw_retrieval_top30=raw_retrieval_top30,
+            fused_top30=fused_top30,
+            reranked_top30=reranked_top30,
+            final_context_top15=final_context_top15,
+            config=config,
+        )
         return {
             "original_query": user_query,
             "original_question": user_query,
@@ -103,6 +111,7 @@ class RetrievalTraceBuilder:
                 route_name: [self.debug_chunk_item(item) for item in route_results]
                 for route_name, route_results in deduped_routes.items()
             },
+            "multi_index": multi_index_debug,
             "stages": {
                 "raw_retrieval_top30": [self.debug_chunk_item(item) for item in raw_retrieval_top30],
                 "fused_top30": [self.debug_chunk_item(item) for item in fused_top30],
@@ -180,6 +189,14 @@ class RetrievalTraceBuilder:
             json_path = export_dir / f"{base_name}.json"
             md_path = export_dir / f"{base_name}.md"
 
+            multi_index_debug = self.build_multi_index_debug(
+                routes=routes,
+                raw_retrieval_top30=raw_retrieval_top30,
+                fused_top30=fused_results[:30],
+                reranked_top30=reranked_results[:30],
+                final_context_top15=final_results,
+                config=options,
+            )
             payload = {
                 "exported_at": datetime.now().isoformat(timespec="seconds"),
                 "arxiv_id": str(paper_context.get("arxiv_id", "") or ""),
@@ -195,6 +212,7 @@ class RetrievalTraceBuilder:
                 "collection_profile": self.normalize_trace_value(collection_profile),
                 "embedding_batch": self.normalize_trace_value(embedding_batch),
                 "route_metrics": self.normalize_trace_value(route_metrics),
+                "multi_index": self.normalize_trace_value(multi_index_debug),
                 "context_expansion": self.normalize_trace_value(context_expansion),
                 "context_budget": self.normalize_trace_value(context_budget),
                 "steps": [
@@ -214,6 +232,10 @@ class RetrievalTraceBuilder:
                             route_name: [self.normalize_trace_value(self.debug_chunk_item(item)) for item in route_results]
                             for route_name, route_results in routes.items()
                         },
+                    },
+                    {
+                        "step": "multi_index",
+                        "result": self.normalize_trace_value(multi_index_debug),
                     },
                     {
                         "step": "raw_retrieval_top30",
@@ -301,6 +323,25 @@ class RetrievalTraceBuilder:
         return {
             "chunk_id": item.get("chunk_id"),
             "original_chunk_id": item.get("original_chunk_id"),
+            "index_id": item.get("index_id", ""),
+            "index_type": item.get("index_type", ""),
+            "retrieval_index_id": item.get("retrieval_index_id", ""),
+            "retrieval_index_type": item.get("retrieval_index_type", ""),
+            "retrieval_index_text_preview": self.short_text_preview(item.get("retrieval_index_text", ""), 180),
+            "retrieval_index_weight": item.get("retrieval_index_weight", 1.0),
+            "matched_index_id": item.get("matched_index_id", ""),
+            "matched_index_type": item.get("matched_index_type", ""),
+            "matched_index_text_preview": self.short_text_preview(item.get("matched_index_text", ""), 180),
+            "matched_index_score": item.get("matched_index_score"),
+            "matched_indexes": item.get("matched_indexes", []),
+            "best_matched_index": item.get("best_matched_index", {}),
+            "matched_index_types": item.get("matched_index_types", []),
+            "index_aggregation_applied": item.get("index_aggregation_applied"),
+            "index_aggregation_strategy": item.get("index_aggregation_strategy"),
+            "index_aggregation_bonus": item.get("index_aggregation_bonus"),
+            "index_aggregation_hit_count": item.get("index_aggregation_hit_count"),
+            "index_aggregation_distinct_type_count": item.get("index_aggregation_distinct_type_count"),
+            "index_aggregation_best_rank": item.get("index_aggregation_best_rank"),
             "chunk_type": item.get("chunk_type", "text"),
             "asset_kind": item.get("asset_kind", ""),
             "asset_path": item.get("asset_path", ""),
@@ -451,6 +492,146 @@ class RetrievalTraceBuilder:
             "final_count": len(fused_results),
             "dedupe_per_route": True,
         }
+
+    def build_multi_index_debug(
+        self,
+        *,
+        routes: Dict[str, List[Dict[str, Any]]],
+        raw_retrieval_top30: List[Dict[str, Any]],
+        fused_top30: List[Dict[str, Any]],
+        reranked_top30: List[Dict[str, Any]],
+        final_context_top15: List[Dict[str, Any]],
+        config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """汇总 multi-index 召回解释，帮助判断问题发生在 index、聚合、fusion 还是 rerank。"""
+        raw_index_hits: Dict[str, List[Dict[str, Any]]] = {}
+        chunk_aggregation: Dict[str, List[Dict[str, Any]]] = {}
+        route_hit_distribution: Dict[str, int] = {}
+        index_type_counter: Counter[str] = Counter()
+
+        for route_name, route_results in (routes or {}).items():
+            flattened_hits: List[Dict[str, Any]] = []
+            aggregation_rows: List[Dict[str, Any]] = []
+            route_type_counter: Counter[str] = Counter()
+            for candidate in route_results:
+                matched_rows = self.collect_matched_index_rows(candidate)
+                aggregation_rows.append(self.debug_index_aggregation_item(candidate, route_name=route_name))
+                for row in matched_rows:
+                    hit = self.debug_index_hit_item(candidate, row, route_name=route_name)
+                    flattened_hits.append(hit)
+                    index_type = str(hit.get("matched_index_type") or "body")
+                    route_type_counter[index_type] += 1
+                    index_type_counter[index_type] += 1
+            raw_index_hits[route_name] = flattened_hits[:30]
+            chunk_aggregation[route_name] = aggregation_rows[:30]
+            route_hit_distribution[route_name] = len(route_results)
+
+        return {
+            "enabled": bool(
+                config.get("enable_multi_index_embedding", True)
+                or config.get("enable_index_level_bm25", True)
+            ),
+            "config": {
+                "enable_multi_index_embedding": config.get("enable_multi_index_embedding"),
+                "enable_index_level_bm25": config.get("enable_index_level_bm25"),
+                "enable_generated_question_index": config.get("enable_generated_question_index"),
+                "enable_chunk_level_retrieval_fallback": config.get("enable_chunk_level_retrieval_fallback"),
+            },
+            "route_hit_distribution": route_hit_distribution,
+            "index_type_contribution": dict(index_type_counter),
+            "raw_index_hits": raw_index_hits,
+            "chunk_aggregation": chunk_aggregation,
+            "stage_index_type_contribution": {
+                "raw_retrieval_top30": self.count_matched_index_types(raw_retrieval_top30),
+                "fused_top30": self.count_matched_index_types(fused_top30),
+                "reranked_top30": self.count_matched_index_types(reranked_top30),
+                "final_context_top15": self.count_matched_index_types(final_context_top15),
+            },
+        }
+
+    def debug_index_hit_item(
+        self,
+        candidate: Dict[str, Any],
+        row: Dict[str, Any],
+        *,
+        route_name: str,
+    ) -> Dict[str, Any]:
+        return {
+            "retrieval_route": str(route_name or row.get("retrieval_route") or ""),
+            "chunk_id": candidate.get("chunk_id"),
+            "matched_index_id": row.get("matched_index_id") or row.get("index_id"),
+            "matched_index_type": row.get("matched_index_type") or row.get("index_type"),
+            "matched_index_text_preview": self.short_text_preview(
+                row.get("matched_index_text") or row.get("index_text") or "",
+                180,
+            ),
+            "index_level_score": row.get("matched_index_score"),
+            "weighted_index_score": row.get("weighted_index_score"),
+            "chunk_level_aggregated_score": candidate.get("route_score"),
+            "source_query": row.get("source_query") or candidate.get("source_query"),
+            "source_queries": row.get("source_queries") or candidate.get("source_queries", []),
+            "hit_rank": row.get("hit_rank"),
+        }
+
+    def debug_index_aggregation_item(
+        self,
+        candidate: Dict[str, Any],
+        *,
+        route_name: str,
+    ) -> Dict[str, Any]:
+        best_index = candidate.get("best_matched_index") or {}
+        if not isinstance(best_index, dict):
+            best_index = {}
+        return {
+            "retrieval_route": route_name,
+            "chunk_id": candidate.get("chunk_id"),
+            "route_score": candidate.get("route_score"),
+            "normalized_route_score": candidate.get("normalized_route_score"),
+            "aggregation_applied": candidate.get("index_aggregation_applied"),
+            "aggregation_strategy": candidate.get("index_aggregation_strategy"),
+            "aggregation_bonus": candidate.get("index_aggregation_bonus"),
+            "matched_index_count": candidate.get("index_aggregation_hit_count", len(candidate.get("matched_indexes", []) or [])),
+            "matched_index_types": candidate.get("matched_index_types", []),
+            "best_matched_index": {
+                "matched_index_id": best_index.get("matched_index_id") or best_index.get("index_id"),
+                "matched_index_type": best_index.get("matched_index_type") or best_index.get("index_type"),
+                "matched_index_score": best_index.get("matched_index_score"),
+                "weighted_index_score": best_index.get("weighted_index_score"),
+                "matched_index_text_preview": self.short_text_preview(
+                    best_index.get("matched_index_text") or best_index.get("index_text") or "",
+                    180,
+                ),
+            },
+            "source_queries": candidate.get("source_queries", []),
+        }
+
+    def collect_matched_index_rows(self, item: Dict[str, Any]) -> List[Dict[str, Any]]:
+        rows = [row for row in (item.get("matched_indexes") or []) if isinstance(row, dict)]
+        if rows:
+            return [dict(row) for row in rows]
+        if item.get("matched_index_id") or item.get("retrieval_index_id") or item.get("index_id"):
+            # 旧 chunk-level 或聚合前结果只有主命中字段时，也转换成统一 index-hit 行，保证 trace 不断层。
+            return [
+                {
+                    "matched_index_id": item.get("matched_index_id") or item.get("retrieval_index_id") or item.get("index_id"),
+                    "matched_index_type": item.get("matched_index_type") or item.get("retrieval_index_type") or item.get("index_type"),
+                    "matched_index_text": item.get("matched_index_text") or item.get("retrieval_index_text") or item.get("index_text"),
+                    "matched_index_score": item.get("matched_index_score") or item.get("route_score") or item.get("score"),
+                    "source_query": item.get("source_query"),
+                }
+            ]
+        return []
+
+    def count_matched_index_types(self, chunks: List[Dict[str, Any]]) -> Dict[str, int]:
+        counts: Counter[str] = Counter()
+        for chunk in chunks or []:
+            rows = self.collect_matched_index_rows(chunk)
+            if rows:
+                for row in rows:
+                    counts[str(row.get("matched_index_type") or row.get("index_type") or "body")] += 1
+            elif chunk.get("matched_index_type") or chunk.get("index_type"):
+                counts[str(chunk.get("matched_index_type") or chunk.get("index_type") or "body")] += 1
+        return dict(counts)
 
     def render_retrieval_trace_text(self, payload: Dict[str, Any]) -> str:
         lines: List[str] = []

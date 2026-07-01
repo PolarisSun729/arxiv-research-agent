@@ -165,6 +165,10 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
                 embedding_model="fake-model",
                 pdf_path="/tmp/paper.pdf",
                 chunk_file="/tmp/chunks.json",
+                retrieval_index_file="/tmp/retrieval_indexes.json",
+                retrieval_index_count=5,
+                retrieval_index_types='["body","section_anchor"]',
+                retrieval_index_version="retrieval-v1",
                 embedding_file="/tmp/embeddings.json",
                 loading_method="docling",
                 chunking_strategy="docling_sections",
@@ -189,6 +193,10 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
         self.assertEqual(qa_index["status"], "indexed")
         self.assertEqual(qa_index["chunk_count"], 3)
         self.assertEqual(qa_index["chunk_file"], "/tmp/chunks.json")
+        self.assertEqual(qa_index["retrieval_index_file"], "/tmp/retrieval_indexes.json")
+        self.assertEqual(qa_index["retrieval_index_count"], 5)
+        self.assertEqual(qa_index["retrieval_index_types"], '["body","section_anchor"]')
+        self.assertEqual(qa_index["retrieval_index_version"], "retrieval-v1")
         self.assertEqual(qa_index["embedding_file"], "/tmp/embeddings.json")
         self.assertEqual(qa_index["loading_method"], "docling")
         self.assertEqual(qa_index["chunking_strategy"], "docling_sections")
@@ -215,6 +223,10 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
                 collection_name="qa_new",
                 chunk_count=2,
                 embedding_model="new-model",
+                retrieval_index_file="retrieval-new.json",
+                retrieval_index_count=4,
+                retrieval_index_types='["body","summary"]',
+                retrieval_index_version="retrieval-new",
                 current_stage="activate_index",
             )
         )
@@ -226,6 +238,9 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
         cleanup_versions = self.service.list_paper_qa_index_builds(arxiv_id, statuses=["cleanup_pending"], limit=10)
         self.assertEqual(active["collection_name"], "qa_new")
         self.assertEqual(active["active_build_id"], build["build_id"])
+        self.assertEqual(active["retrieval_index_file"], "retrieval-new.json")
+        self.assertEqual(active["retrieval_index_count"], 4)
+        self.assertEqual(active_versions[0]["retrieval_index_file"], "retrieval-new.json")
         self.assertEqual(len(active_versions), 1)
         self.assertEqual(cleanup_versions[0]["build_id"], old_active["build_id"])
 

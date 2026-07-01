@@ -9,7 +9,8 @@ from typing import Any, Dict, List, Optional
 from services.retrieval.collection_profile import CollectionRetrievalProfile
 from services.retrieval.contracts import QueryProfile, RetrievalOptions
 from services.retrieval.execution import QueryEmbeddingBatcher, RouteExecutionSupport
-from services.retrieval.retrieval_index import CollectionRetrievalIndex, KEYWORD_FIELD_WEIGHTS
+from services.retrieval.index_hit_aggregator import IndexHitAggregator
+from services.retrieval.retrieval_index import CollectionRetrievalIndex, KEYWORD_FIELD_WEIGHTS, VECTOR_ROUTE_NAMES
 from utils.config import get_enhanced_retrieval_runtime_config
 
 ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
@@ -49,6 +50,7 @@ class RouteRetriever:
         self.collection_profile_provider = collection_profile_provider
         self.collection_retrieval_index_provider = collection_retrieval_index_provider
         self.embedding_batcher = QueryEmbeddingBatcher(embedding_service=self.embedding_service)
+        self.index_hit_aggregator = IndexHitAggregator()
         self.route_executor = RouteExecutionSupport(
             timeouts={
                 "default": ENHANCED_RETRIEVAL_CONFIG.get("route_timeout_default_seconds", 8),
@@ -61,7 +63,11 @@ class RouteRetriever:
             },
             max_workers=ENHANCED_RETRIEVAL_CONFIG.get("route_max_workers", 4),
         )
-        # Initialize keyword backends
+        self._keyword_backend_config = str(
+            ENHANCED_RETRIEVAL_CONFIG.get("keyword_backend", "bm25s") or "bm25s"
+        ).strip().lower()
+        self._keyword_backend_init_fallback_reason = ""
+        # keyword backend 会在初始化阶段就可能降级；保留配置值和降级原因，便于 benchmark/debug 判断实际跑的是哪套 BM25。
         self._keyword_backend = self._initialize_keyword_backend()
 
     def _initialize_keyword_backend(self) -> Any:
@@ -69,7 +75,7 @@ class RouteRetriever:
         from services.retrieval.keyword_backend import InternalBM25Backend
         from services.retrieval.bm25s_backend import BM25sBackend
 
-        backend_config = str(ENHANCED_RETRIEVAL_CONFIG.get("keyword_backend", "bm25s") or "bm25s").strip().lower()
+        backend_config = self._keyword_backend_config
 
         # Always create internal backend as fallback
         internal_backend = InternalBM25Backend(
@@ -97,14 +103,27 @@ class RouteRetriever:
                 logger.info("Using bm25s keyword backend")
                 return bm25s_backend
             else:
+                self._keyword_backend_init_fallback_reason = (
+                    f"bm25s_not_available: {bm25s_backend._import_error}"
+                )
                 logger.warning(
                     "bm25s backend configured but not available, falling back to internal_bm25: %s",
                     bm25s_backend._import_error,
                 )
                 return internal_backend
         except Exception as exc:
+            self._keyword_backend_init_fallback_reason = f"bm25s_initialization_failed: {exc}"
             logger.warning("Failed to initialize bm25s backend, falling back to internal_bm25: %s", exc)
             return internal_backend
+
+    def _keyword_backend_debug(self, backend_name: str) -> Dict[str, Any]:
+        """输出 keyword backend 的真实运行状态，避免 bm25s 初始化降级后指标被误读。"""
+        return {
+            "keyword_backend": backend_name,
+            "keyword_backend_config": self._keyword_backend_config,
+            "keyword_backend_init_fallback": bool(self._keyword_backend_init_fallback_reason),
+            "keyword_backend_init_fallback_reason": self._keyword_backend_init_fallback_reason,
+        }
 
 
     def build_route_bundle(
@@ -711,9 +730,15 @@ class RouteRetriever:
         embedding = embedding_map.get(normalized_query)
         if embedding is None:
             raise RuntimeError(f"Missing batch embedding for route={route_name} query={normalized_query[:80]}")
-        results = self.vector_store_service.search_similar_vectors(collection_name=collection_name, query_vector=embedding, top_k=top_k)
+        # 向量库现在一条记录对应一个 retrieval index；多取少量 index hit 再聚合，避免 top_k 被同一 chunk 占满。
+        index_hit_top_k = max(top_k, top_k * 3)
+        results = self.vector_store_service.search_similar_vectors(
+            collection_name=collection_name,
+            query_vector=embedding,
+            top_k=index_hit_top_k,
+        )
         route_confidence = self.route_confidence_builder(route_name, query_profile, source_query, route_queries=route_queries, intent_profile=query_profile.intent_profile)
-        return self.normalize_route_results(results, route_name, source_query, route_confidence, query_profile)
+        return self.normalize_route_results(results, route_name, source_query, route_confidence, query_profile, top_k=top_k)
 
     def keyword_retrieve(self, collection_name: str, query_views: List[Dict[str, Any]], top_k: int, query_profile: QueryProfile, retrieval_index: CollectionRetrievalIndex) -> Dict[str, Any]:
         """Keyword retrieval with backend selection and automatic fallback."""
@@ -731,9 +756,20 @@ class RouteRetriever:
             # If backend succeeded, return results with backend info
             if not result.fallback_reason:
                 debug = dict(result.debug)
-                debug["keyword_backend"] = result.backend_name
+                debug.update(self._keyword_backend_debug(result.backend_name))
                 debug["keyword_backend_fallback"] = False
-                return {"results": result.results, "debug": debug}
+                aggregated_results = self.index_hit_aggregator.aggregate(
+                    result.results,
+                    route_name="keyword",
+                    top_k=top_k,
+                )
+                debug["index_hit_aggregation"] = {
+                    "applied": True,
+                    "input_count": len(result.results),
+                    "output_count": len(aggregated_results),
+                    "max_matched_indexes": self.index_hit_aggregator.max_matched_indexes,
+                }
+                return {"results": aggregated_results, "debug": debug}
 
             # Backend returned with fallback reason - log and fallback
             logger.warning(
@@ -759,15 +795,25 @@ class RouteRetriever:
             query_profile=query_profile,
             retrieval_index=retrieval_index,
         )
+        aggregated_results = self.index_hit_aggregator.aggregate(
+            fallback_result.results,
+            route_name="keyword",
+            top_k=top_k,
+        )
 
         debug = dict(fallback_result.debug)
-        debug["keyword_backend"] = "internal_bm25"
+        debug.update(self._keyword_backend_debug("internal_bm25"))
         debug["keyword_backend_fallback"] = True
         debug["keyword_backend_fallback_reason"] = getattr(
             self._keyword_backend, "backend_name", lambda: "unknown"
         )() + " failed"
-        return {"results": fallback_result.results, "debug": debug}
-        return {"results": fallback_result.results, "debug": debug}
+        debug["index_hit_aggregation"] = {
+            "applied": True,
+            "input_count": len(fallback_result.results),
+            "output_count": len(aggregated_results),
+            "max_matched_indexes": self.index_hit_aggregator.max_matched_indexes,
+        }
+        return {"results": aggregated_results, "debug": debug}
 
     def expand_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
         expander = getattr(self.query_tools, "expand_keyword_query_tokens", None)
@@ -973,7 +1019,16 @@ class RouteRetriever:
         )
         return memory_chunk
 
-    def normalize_route_results(self, results: List[Dict[str, Any]], route_name: str, source_query: str, route_confidence: float, query_profile: QueryProfile) -> List[Dict[str, Any]]:
+    def normalize_route_results(
+        self,
+        results: List[Dict[str, Any]],
+        route_name: str,
+        source_query: str,
+        route_confidence: float,
+        query_profile: QueryProfile,
+        *,
+        top_k: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         if not results:
             return []
         normalized_scores = self.normalize_scores([float(item.get("score", 0.0) or 0.0) for item in results])
@@ -988,6 +1043,13 @@ class RouteRetriever:
             chunk["route_confidence"] = float(route_confidence)
             chunk["structural_bonus"] = float(self.structural_bonus_builder(chunk, query_profile))
             normalized.append(chunk)
+        if route_name in VECTOR_ROUTE_NAMES:
+            # dense route 命中的是 index 向量；聚合后再进入 RRF，保证下游继续按 chunk candidate 工作。
+            return self.index_hit_aggregator.aggregate(
+                normalized,
+                route_name=route_name,
+                top_k=top_k if top_k is not None else len(normalized),
+            )
         return normalized
 
     def heuristic_hyde_document(self, query_profile: QueryProfile, rewritten_queries: List[str]) -> str:

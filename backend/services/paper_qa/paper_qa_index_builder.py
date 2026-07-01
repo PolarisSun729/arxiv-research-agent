@@ -17,7 +17,16 @@ from services.storage.database_service import DatabaseService
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
 from services.llm.generation_service import GenerationService, QWEN_RERANK_COMPRESS_MODEL_NAME
 from services.document.loading_service import LoadingService
+from services.retrieval.retrieval_index import (
+    RETRIEVAL_INDEX_ARTIFACT_SCHEMA_VERSION,
+    DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK,
+    build_retrieval_index_payload,
+    build_retrieval_indexes,
+    save_retrieval_index_artifact as persist_retrieval_index_artifact,
+    summarize_retrieval_indexes,
+)
 from services.storage.vector_store_service import VectorDBConfig, VectorStoreService
+from utils.config import get_enhanced_retrieval_runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +41,10 @@ DATABASE_WRITE_STAGES = {
 QA_INDEX_ARTIFACT_FIELDS = {
     "pdf_path",
     "chunk_file",
+    "retrieval_index_file",
+    "retrieval_index_count",
+    "retrieval_index_types",
+    "retrieval_index_version",
     "embedding_file",
     "collection_name",
     "loading_method",
@@ -65,6 +78,7 @@ class PaperQAIndexBuilder:
         self.get_embedding_config = get_embedding_config or self.embedding_service.get_default_embedding_config
         self.loading_service_factory = loading_service_factory
         self.chunking_service_factory = chunking_service_factory
+        self.retrieval_runtime_config = get_enhanced_retrieval_runtime_config()
 
     @staticmethod
     def _chunk_type_counts(chunks: List[Dict[str, Any]]) -> Tuple[int, int, int]:
@@ -73,6 +87,12 @@ class PaperQAIndexBuilder:
         figure_count = sum(1 for chunk in chunks if str((chunk.get("metadata", {}) or {}).get("chunk_type", "")) == "figure")
         table_count = sum(1 for chunk in chunks if str((chunk.get("metadata", {}) or {}).get("chunk_type", "")) == "table")
         return text_count, figure_count, table_count
+
+    @staticmethod
+    def _retrieval_index_type_list(retrieval_index_debug: Dict[str, Any]) -> List[str]:
+        """把类型分布压成稳定列表，便于数据库记录和前端状态展示复用。"""
+        type_counts = dict((retrieval_index_debug or {}).get("index_type_counts") or {})
+        return sorted(str(index_type) for index_type in type_counts if str(index_type).strip())
 
     def validate_loading_method(self, loading_method: str) -> str:
         """校验并规范化 PDF 加载方式，只允许当前支持的方法。"""
@@ -159,7 +179,7 @@ class PaperQAIndexBuilder:
             # 重建前必须先移除旧 collection，否则检索链路可能继续命中上一轮 chunk。
             result["collection_deleted"] = self.vector_store_service.delete_collection("milvus", collection_name)
 
-        for field_name in ("pdf_path", "chunk_file", "embedding_file"):
+        for field_name in ("pdf_path", "chunk_file", "retrieval_index_file", "embedding_file"):
             artifact_path = str(existing.get(field_name) or "").strip()
             if not artifact_path:
                 continue
@@ -559,13 +579,18 @@ class PaperQAIndexBuilder:
         index_version: Optional[str] = None,
     ) -> str:
         filename = f"{arxiv_id}_{index_version}.pdf" if index_version else f"{arxiv_id}.pdf"
+        retrieval_indexes = build_retrieval_indexes(chunks)
+        document_for_save = dict(document or {})
+        # retrieval index 是 chunk 之上的派生层，写入调试产物时不改变原 chunks 列表本身。
+        document_for_save["retrieval_indexes"] = retrieval_indexes
+        document_for_save["retrieval_index_debug"] = summarize_retrieval_indexes(retrieval_indexes)
         chunk_file = loading_service.save_document(
             filename=filename,
             chunks=chunks,
             metadata={"total_pages": len(page_map)},
             loading_method=loading_method,
             chunking_strategy=chunking_strategy,
-            document_data=document,
+            document_data=document_for_save,
         )
         logger.info("Chunked document saved to: %s", chunk_file)
         return chunk_file
@@ -579,10 +604,54 @@ class PaperQAIndexBuilder:
         logger.info("Generated rerank_text for %d chunks", len(compressed_chunks))
         return compressed_chunks
 
+    def build_retrieval_indexes(self, chunks: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """显式生成 chunk 之上的 retrieval index 层，失败时保留规则索引继续建库。"""
+        enable_generated_question_index = bool(self.retrieval_runtime_config.get("enable_generated_question_index", True))
+        max_questions_per_chunk = (
+            DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK if enable_generated_question_index else 0
+        )
+        # 生成式 summary/question 只是召回增强；失败时 builder 会回落到规则索引，不能阻断整篇论文建库。
+        retrieval_indexes, retrieval_index_debug = build_retrieval_index_payload(
+            chunks,
+            generation_service=self.generation_service,
+            enable_generative_indexes=True,
+            max_questions_per_chunk=max_questions_per_chunk,
+        )
+        retrieval_index_debug["generated_question_index_enabled"] = enable_generated_question_index
+        logger.info(
+            "Built retrieval indexes: count=%s type_counts=%s generation_errors=%s",
+            retrieval_index_debug.get("index_count"),
+            retrieval_index_debug.get("index_type_counts"),
+            retrieval_index_debug.get("generation_error_count"),
+        )
+        return retrieval_indexes, retrieval_index_debug
+
+    def save_retrieval_index_artifact(
+        self,
+        arxiv_id: str,
+        chunks: List[Dict[str, Any]],
+        retrieval_indexes: List[Dict[str, Any]],
+        retrieval_index_debug: Dict[str, Any],
+        *,
+        index_version: Optional[str] = None,
+    ) -> str:
+        """把 RetrievalIndex 独立落盘，供后续重建 embedding、BM25 和 debug trace 使用。"""
+        artifact_file = persist_retrieval_index_artifact(
+            paper_id=arxiv_id,
+            retrieval_indexes=retrieval_indexes,
+            retrieval_index_debug=retrieval_index_debug,
+            chunks=chunks,
+            index_version=index_version,
+        )
+        logger.info("Retrieval index artifact saved to: %s", artifact_file)
+        return artifact_file
+
     def create_chunk_embeddings(
         self,
         arxiv_id: str,
         chunks: List[Dict[str, Any]],
+        retrieval_indexes: Optional[List[Dict[str, Any]]] = None,
+        retrieval_index_debug: Optional[Dict[str, Any]] = None,
         index_version: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], EmbeddingConfig]:
         embedding_config = self.get_embedding_config()
@@ -593,13 +662,39 @@ class PaperQAIndexBuilder:
         )
 
         filename = f"{arxiv_id}_{index_version}.pdf" if index_version else f"{arxiv_id}.pdf"
+        if retrieval_indexes is None:
+            # 兼容旧调用入口：没有显式阶段产物时仍能基于 chunk 派生规则索引。
+            retrieval_indexes, retrieval_index_debug = build_retrieval_index_payload(chunks)
+        elif retrieval_index_debug is None:
+            retrieval_index_debug = summarize_retrieval_indexes(retrieval_indexes)
         input_data = {
             "chunks": chunks,
-            "metadata": {"filename": filename},
+            "retrieval_indexes": retrieval_indexes,
+            "metadata": {
+                "filename": filename,
+                "embedding_mode": (
+                    "retrieval_index"
+                    if self.retrieval_runtime_config.get("enable_multi_index_embedding", True)
+                    else "legacy_chunk_level"
+                ),
+                "enable_multi_index_embedding": bool(
+                    self.retrieval_runtime_config.get("enable_multi_index_embedding", True)
+                ),
+                "enable_chunk_level_retrieval_fallback": bool(
+                    self.retrieval_runtime_config.get("enable_chunk_level_retrieval_fallback", True)
+                ),
+            },
         }
         embeddings, _ = self.embedding_service.create_embeddings(input_data, embedding_config)
+        if not embeddings:
+            raise RuntimeError("No valid retrieval indexes produced embeddings")
 
-        logger.info("Created %d embeddings", len(embeddings))
+        # 一个 PaperChunk 会派生多个 RetrievalIndex，因此 embedding 数量现在表示可检索入口数。
+        logger.info(
+            "Created %d retrieval-index embeddings: %s",
+            len(embeddings),
+            retrieval_index_debug,
+        )
         text_count, figure_count, table_count = self._chunk_type_counts(embeddings)
         logger.info(
             "Embedding composition: text=%d figure=%d table=%d",
@@ -643,6 +738,10 @@ class PaperQAIndexBuilder:
         embedding_model: str,
         pdf_path: str,
         chunk_file: str,
+        retrieval_index_file: str,
+        retrieval_index_count: int,
+        retrieval_index_types: str,
+        retrieval_index_version: str,
         embedding_file: str,
         loading_method: str,
         chunking_strategy: str,
@@ -657,6 +756,10 @@ class PaperQAIndexBuilder:
                 embedding_model=embedding_model,
                 pdf_path=pdf_path,
                 chunk_file=chunk_file,
+                retrieval_index_file=retrieval_index_file,
+                retrieval_index_count=retrieval_index_count,
+                retrieval_index_types=retrieval_index_types,
+                retrieval_index_version=retrieval_index_version,
                 embedding_file=embedding_file,
                 loading_method=loading_method,
                 chunking_strategy=chunking_strategy,
@@ -677,6 +780,10 @@ class PaperQAIndexBuilder:
             embedding_model=embedding_model,
             pdf_path=pdf_path,
             chunk_file=chunk_file,
+            retrieval_index_file=retrieval_index_file,
+            retrieval_index_count=retrieval_index_count,
+            retrieval_index_types=retrieval_index_types,
+            retrieval_index_version=retrieval_index_version,
             embedding_file=embedding_file,
             loading_method=loading_method,
             chunking_strategy=chunking_strategy,
@@ -705,7 +812,14 @@ class PaperQAIndexBuilder:
             "error_message": str(error_message or "")[:2000],
             "loading_method": loading_method,
             # 构建失败产生的新 artifact 不能成为 active，只能等待后续清理。
-            "artifact_status": "cleanup_pending" if artifacts.get("collection_name") or artifacts.get("embedding_file") else "active",
+            "artifact_status": (
+                "cleanup_pending"
+                if any(
+                    artifacts.get(field_name)
+                    for field_name in ("collection_name", "pdf_path", "chunk_file", "retrieval_index_file", "embedding_file")
+                )
+                else "active"
+            ),
         }
         payload.update({key: value for key, value in artifacts.items() if key in QA_INDEX_ARTIFACT_FIELDS})
         if build_id:
@@ -910,15 +1024,73 @@ class PaperQAIndexBuilder:
             chunks = self.compress_chunks_for_rerank(chunks)
             self._log_stage("compress_chunks_for_rerank", arxiv_id, loading_method, "chunk text compressed", chunk_count=len(chunks))
 
+            current_stage = "build_retrieval_indexes"
+            self._notify_progress(
+                progress_callback,
+                current_stage=current_stage,
+                progress=72,
+                message="Building retrieval indexes",
+            )
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
+            # retrieval index 必须在 embedding 前冻结：向量命中 index，但后续 rerank/生成仍回填原始 chunk。
+            retrieval_indexes, retrieval_index_debug = self.build_retrieval_indexes(chunks)
+            self._log_stage(
+                "build_retrieval_indexes",
+                arxiv_id,
+                loading_method,
+                "retrieval indexes built",
+                retrieval_index_count=retrieval_index_debug.get("index_count"),
+                retrieval_index_type_counts=retrieval_index_debug.get("index_type_counts"),
+                retrieval_index_generation_error_count=retrieval_index_debug.get("generation_error_count"),
+                empty_index_text_count=retrieval_index_debug.get("empty_index_text_count"),
+            )
+
+            current_stage = "save_retrieval_index_artifact"
+            self._notify_progress(
+                progress_callback,
+                current_stage=current_stage,
+                progress=76,
+                message="Saving retrieval index artifact",
+            )
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
+            retrieval_index_file = self.save_retrieval_index_artifact(
+                arxiv_id,
+                chunks,
+                retrieval_indexes,
+                retrieval_index_debug,
+                index_version=index_version,
+            )
+            retrieval_index_types = self._retrieval_index_type_list(retrieval_index_debug)
+            artifact_state["retrieval_index_file"] = retrieval_index_file
+            artifact_state["retrieval_index_count"] = int(retrieval_index_debug.get("index_count", 0) or 0)
+            artifact_state["retrieval_index_types"] = json.dumps(retrieval_index_types, ensure_ascii=False)
+            artifact_state["retrieval_index_version"] = index_version or RETRIEVAL_INDEX_ARTIFACT_SCHEMA_VERSION
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
+            self._log_stage(
+                "save_retrieval_index_artifact",
+                arxiv_id,
+                loading_method,
+                "retrieval index artifact saved",
+                retrieval_index_file=retrieval_index_file,
+                retrieval_index_count=artifact_state["retrieval_index_count"],
+                retrieval_index_types=retrieval_index_types,
+            )
+
             current_stage = "create_chunk_embeddings"
             self._notify_progress(
                 progress_callback,
-                current_stage="create_chunk_embeddings",
-                progress=78,
-                message="Creating chunk embeddings",
+                current_stage=current_stage,
+                progress=80,
+                message="Creating retrieval index embeddings",
             )
             self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
-            embeddings, embedding_config = self.create_chunk_embeddings(arxiv_id, chunks, index_version=index_version)
+            embeddings, embedding_config = self.create_chunk_embeddings(
+                arxiv_id,
+                chunks,
+                retrieval_indexes=retrieval_indexes,
+                retrieval_index_debug=retrieval_index_debug,
+                index_version=index_version,
+            )
             artifact_state["embedding_model"] = embedding_config.model_name
             self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
             self._log_stage(
@@ -929,6 +1101,8 @@ class PaperQAIndexBuilder:
                 embedding_provider=embedding_config.provider,
                 embedding_model=embedding_config.model_name,
                 embedding_count=len(embeddings),
+                retrieval_index_count=retrieval_index_debug.get("index_count"),
+                retrieval_index_type_counts=retrieval_index_debug.get("index_type_counts"),
             )
 
             current_stage = "save_embeddings"
@@ -990,6 +1164,10 @@ class PaperQAIndexBuilder:
                 embedding_model=embedding_config.model_name,
                 pdf_path=pdf_path,
                 chunk_file=chunk_file,
+                retrieval_index_file=retrieval_index_file,
+                retrieval_index_count=int(retrieval_index_debug.get("index_count", 0) or 0),
+                retrieval_index_types=json.dumps(self._retrieval_index_type_list(retrieval_index_debug), ensure_ascii=False),
+                retrieval_index_version=index_version or RETRIEVAL_INDEX_ARTIFACT_SCHEMA_VERSION,
                 embedding_file=embedding_file,
                 loading_method=loading_method,
                 chunking_strategy=chunking_strategy,
@@ -1027,6 +1205,12 @@ class PaperQAIndexBuilder:
                 "index_version": index_version,
                 "build_id": build_id,
                 "chunk_file": chunk_file,
+                "retrieval_index_file": retrieval_index_file,
+                "retrieval_index_count": retrieval_index_debug.get("index_count"),
+                "retrieval_index_type_counts": retrieval_index_debug.get("index_type_counts"),
+                "retrieval_index_types": retrieval_index_types,
+                "retrieval_index_version": index_version or RETRIEVAL_INDEX_ARTIFACT_SCHEMA_VERSION,
+                "retrieval_index_generation_error_count": retrieval_index_debug.get("generation_error_count"),
             }
         except AppError as exc:
             self._tag_exception(

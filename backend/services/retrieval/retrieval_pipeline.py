@@ -183,6 +183,10 @@ class RetrievalPipeline:
                     "enable_table_structured_route": runtime["enable_table_structured_route"],
                     "enable_llm_rerank": runtime["enable_llm_rerank"],
                     "enable_context_expansion": runtime["enable_context_expansion"],
+                    "enable_multi_index_embedding": runtime["enable_multi_index_embedding"],
+                    "enable_index_level_bm25": runtime["enable_index_level_bm25"],
+                    "enable_generated_question_index": runtime["enable_generated_question_index"],
+                    "enable_chunk_level_retrieval_fallback": runtime["enable_chunk_level_retrieval_fallback"],
                     "context_budget_max_chars": runtime["context_budget_max_chars"],
                     "memory_source_boost_weight": float(
                         self.memory_flag_reader(
@@ -214,6 +218,10 @@ class RetrievalPipeline:
                     "enable_table_structured_route": runtime["enable_table_structured_route"],
                     "enable_llm_rerank": runtime["enable_llm_rerank"],
                     "enable_context_expansion": runtime["enable_context_expansion"],
+                    "enable_multi_index_embedding": runtime["enable_multi_index_embedding"],
+                    "enable_index_level_bm25": runtime["enable_index_level_bm25"],
+                    "enable_generated_question_index": runtime["enable_generated_question_index"],
+                    "enable_chunk_level_retrieval_fallback": runtime["enable_chunk_level_retrieval_fallback"],
                     "debug": runtime["debug_enabled"],
                 },
                 query_profile=query_profile,
@@ -350,6 +358,12 @@ class RetrievalPipeline:
             "enable_llm_rerank": self.option_resolver(options.enable_llm_rerank, self.retrieval_config.get("enable_llm_rerank", False)),
             "enable_context_expansion": self.option_resolver(options.enable_context_expansion, self.enhanced_config.get("enable_context_expansion", True)),
             "debug_enabled": self.option_resolver(options.debug, self.retrieval_config["debug"]),
+            "enable_multi_index_embedding": bool(self.enhanced_config.get("enable_multi_index_embedding", True)),
+            "enable_index_level_bm25": bool(self.enhanced_config.get("enable_index_level_bm25", True)),
+            "enable_generated_question_index": bool(self.enhanced_config.get("enable_generated_question_index", True)),
+            "enable_chunk_level_retrieval_fallback": bool(
+                self.enhanced_config.get("enable_chunk_level_retrieval_fallback", True)
+            ),
             "recall_candidate_limit": self.enhanced_config["recall_candidate_limit"],
             "rrf_candidate_limit": self.enhanced_config["rrf_candidate_limit"],
             "rerank_candidate_limit": self.enhanced_config["rerank_candidate_limit"],

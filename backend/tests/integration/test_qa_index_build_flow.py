@@ -252,18 +252,64 @@ class _FakeEmbeddingService:
         return _FakeEmbeddingConfig(model_name=self.model_name)
 
     def create_embeddings(self, input_data, config):
-        self.calls.append({"method": "create_embeddings", "config_model": config.model_name})
+        retrieval_indexes = list((input_data or {}).get("retrieval_indexes") or [])
+        self.calls.append(
+            {
+                "method": "create_embeddings",
+                "config_model": config.model_name,
+                "retrieval_index_count": len(retrieval_indexes),
+            }
+        )
         if self.fail_stage == "create_chunk_embeddings":
             raise RuntimeError("embedding failed")
         chunks = list((input_data or {}).get("chunks") or [])
+        chunk_lookup = {
+            str((chunk.get("metadata", {}) or {}).get("chunk_id") or chunk.get("chunk_id") or index): chunk
+            for index, chunk in enumerate(chunks, start=1)
+        }
         embeddings = []
-        for index, chunk in enumerate(chunks, start=1):
-            embeddings.append(
+        vector_routes = {"vector", "vector_original", "vector_rewrite", "vector_hyde"}
+        if retrieval_indexes:
+            # fake 与真实 embedding service 一样消费 retrieval index，避免集成测试继续绑定旧的一 chunk 一向量假设。
+            embedding_sources = []
+            for index_payload in retrieval_indexes:
+                index_text = str(index_payload.get("index_text") or "").strip()
+                routes = {str(route) for route in index_payload.get("enabled_routes", [])}
+                if not index_text or (routes and not routes & vector_routes):
+                    continue
+                chunk = chunk_lookup.get(str(index_payload.get("chunk_id"))) or {}
+                metadata = {
+                    **dict((chunk.get("metadata", {}) or {})),
+                    "content": chunk.get("content", ""),
+                    "retrieval_index_id": index_payload.get("index_id", ""),
+                    "retrieval_index_type": index_payload.get("index_type", ""),
+                    "retrieval_index_text": index_text,
+                    "retrieval_index_weight": index_payload.get("index_weight", 1.0),
+                    "retrieval_index_enabled_routes": list(index_payload.get("enabled_routes", [])),
+                }
+                embedding_sources.append(
+                    {
+                        "id": index_payload.get("index_id") or index_payload.get("chunk_id"),
+                        "content": index_text,
+                        "metadata": metadata,
+                    }
+                )
+        else:
+            embedding_sources = [
                 {
                     "id": chunk.get("metadata", {}).get("chunk_id", f"chunk-{index}"),
                     "content": chunk.get("content", ""),
-                    "embedding": [float(index), float(index) / 10.0, 0.5],
                     "metadata": dict(chunk.get("metadata", {}) or {}),
+                }
+                for index, chunk in enumerate(chunks, start=1)
+            ]
+        for index, source in enumerate(embedding_sources, start=1):
+            embeddings.append(
+                {
+                    "id": source.get("id", f"chunk-{index}"),
+                    "content": source.get("content", ""),
+                    "embedding": [float(index), float(index) / 10.0, 0.5],
+                    "metadata": dict(source.get("metadata", {}) or {}),
                 }
             )
         return embeddings, {"input_count": len(embeddings)}
@@ -359,11 +405,33 @@ class _BaseIndexTestCase(unittest.TestCase):
         self.arxiv_id = "2401.00001"
 
     def tearDown(self) -> None:
+        self._cleanup_retrieval_index_artifacts()
         temp_db = getattr(self.db_service, "_test_temp_db", None)
         self.db_service = None
         gc.collect()
         if temp_db is not None:
             temp_db.cleanup()
+
+    def _cleanup_retrieval_index_artifacts(self) -> None:
+        """测试会真实落 retrieval index 文件；用例结束时只清理当前测试数据库记录到的文件。"""
+        if self.db_service is None:
+            return
+        paths = set()
+        active = self.db_service.get_paper_qa_index(self.arxiv_id)
+        if active and active.get("retrieval_index_file"):
+            paths.add(str(active["retrieval_index_file"]))
+        for build in self.db_service.list_paper_qa_index_builds(self.arxiv_id, limit=20):
+            if build.get("retrieval_index_file"):
+                paths.add(str(build["retrieval_index_file"]))
+        for path_text in paths:
+            path = Path(path_text)
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            try:
+                if path.is_file() and "02-retrieval-indexes" in path.parts:
+                    path.unlink()
+            except OSError:
+                pass
 
     def _paper_payload(self, arxiv_id=None, title="Paper Title", abstract="Paper abstract"):
         value = arxiv_id or self.arxiv_id
@@ -474,6 +542,10 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
         self.assertEqual(record["embedding_model"], "fake-embedding-model")
         self.assertEqual(record["pdf_path"], "tmp/fake-paper.pdf")
         self.assertEqual(record["chunk_file"], "chunk-output.json")
+        self.assertEqual(record["retrieval_index_file"], result["retrieval_index_file"])
+        self.assertEqual(record["retrieval_index_count"], result["retrieval_index_count"])
+        self.assertEqual(json.loads(record["retrieval_index_types"]), result["retrieval_index_types"])
+        self.assertEqual(record["retrieval_index_version"], result["retrieval_index_version"])
         self.assertIn('"filename": "2401.00001_', record["embedding_file"])
         self.assertIn("_pdf", record["collection_name"])
         self.assertEqual(record["loading_method"], "docling")
@@ -484,9 +556,21 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
         self.assertIsNotNone(record["indexed_at"])
         self.assertIsNotNone(record["active_build_id"])
         self.assertNotEqual(record["active_index_version"], "legacy")
+        self.assertGreaterEqual(result["retrieval_index_count"], 4)
+        self.assertEqual(result["retrieval_index_type_counts"]["body"], 2)
+        self.assertEqual(result["retrieval_index_type_counts"]["section_anchor"], 2)
+        self.assertGreaterEqual(result["retrieval_index_generation_error_count"], 1)
+        artifact_path = Path(result["retrieval_index_file"])
+        self.assertTrue(artifact_path.is_file())
+        artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        self.assertEqual(artifact_payload["index_count"], result["retrieval_index_count"])
+        self.assertEqual(len(artifact_payload["retrieval_indexes"]), result["retrieval_index_count"])
+        self.assertTrue(all(item["paper_id"] == self.arxiv_id for item in artifact_payload["retrieval_indexes"]))
+        self.assertTrue(all(item["chunk_id"] in artifact_payload["chunk_ids"] for item in artifact_payload["retrieval_indexes"]))
         self.assertEqual(loading_service.calls[0]["method"], "load_pdf")
         self.assertEqual(chunking_service.calls[0]["method"], "chunk_docling")
         self.assertEqual(embedding_service.calls[0]["method"], "create_embeddings")
+        self.assertEqual(embedding_service.calls[0]["retrieval_index_count"], result["retrieval_index_count"])
         self.assertEqual(vector_store_service.calls[0]["method"], "index_embeddings")
 
     def test_build_qa_index_persists_structured_table_objects_in_chunk_file(self) -> None:
@@ -630,6 +714,9 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
         self.assertEqual(failed_build["failed_stage"], "create_chunk_embeddings")
         self.assertEqual(failed_build["error_message"], "embedding failed")
         self.assertEqual(failed_build["chunk_file"], "chunk-output.json")
+        self.assertTrue(failed_build["retrieval_index_file"])
+        self.assertGreater(failed_build["retrieval_index_count"], 0)
+        self.assertEqual(failed_build["artifact_status"], "cleanup_pending")
         self.assertEqual(ctx.exception.context.get("stage"), "create_chunk_embeddings")
 
     def test_build_qa_index_records_failure_when_vector_write_fails(self) -> None:
@@ -675,16 +762,25 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
 
     def test_cleanup_pending_builds_does_not_delete_active_collection(self) -> None:
         self.db_service.add_paper(self._paper_payload())
+        old_retrieval_index_file = Path("02-retrieval-indexes") / "old_active_retrieval_indexes.json"
+        old_retrieval_index_file.parent.mkdir(exist_ok=True)
+        old_retrieval_index_file.write_text('{"retrieval_indexes":[]}', encoding="utf-8")
         self.db_service.insert_paper_qa_index(
             self.arxiv_id,
             collection_name="qa_old_collection",
             status="indexed",
             chunk_count=2,
             embedding_model="old-model",
+            retrieval_index_file=str(old_retrieval_index_file),
+            retrieval_index_count=2,
+            retrieval_index_types=json.dumps(["body"], ensure_ascii=False),
+            retrieval_index_version="old-version",
         )
         builder, *_services, vector_store_service = self._make_builder()
         builder.build_qa_index(self.arxiv_id, loading_method="docling")
         active = self.db_service.get_paper_qa_index(self.arxiv_id)
+        active_retrieval_index_file = Path(active["retrieval_index_file"])
+        self.assertTrue(active_retrieval_index_file.is_file())
 
         cleanup_result = builder.cleanup_pending_index_builds(self.arxiv_id)
 
@@ -695,6 +791,8 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
         ]
         self.assertIn("qa_old_collection", deleted_collections)
         self.assertNotIn(active["collection_name"], deleted_collections)
+        self.assertFalse(old_retrieval_index_file.exists())
+        self.assertTrue(active_retrieval_index_file.exists())
         self.assertEqual(len(cleanup_result["failed"]), 0)
 
 

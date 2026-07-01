@@ -10,20 +10,782 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from services.retrieval.collection_profile import CollectionRetrievalProfile
+from utils.config import get_enhanced_retrieval_runtime_config
 
 logger = logging.getLogger(__name__)
+
+ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
 
 KEYWORD_FIELD_WEIGHTS = {
     "body": 1.0,
     "title": 1.35,
     "section_title": 1.2,
     "section_path": 0.85,
+    "summary": 0.95,
+    "question": 0.9,
+    "table_or_figure": 1.05,
     "asset_caption": 0.18,
     "asset_aux": 0.08,
 }
+
+RETRIEVAL_INDEX_TYPES = {"body", "section_anchor", "summary", "question", "table_or_figure"}
+VECTOR_ROUTE_NAMES = {"vector", "vector_original", "vector_rewrite", "vector_hyde"}
+KEYWORD_ROUTE_NAMES = {"keyword"}
+
+RETRIEVAL_INDEX_ROUTE_DEFAULTS = {
+    "body": ["vector_original", "vector_rewrite", "vector_hyde", "keyword"],
+    "section_anchor": ["keyword"],
+    "summary": ["vector_original", "vector_rewrite", "vector_hyde", "keyword"],
+    "question": ["vector_original", "vector_rewrite", "vector_hyde", "keyword"],
+    "table_or_figure": ["vector_original", "vector_rewrite", "vector_hyde", "keyword", "table_structured"],
+}
+
+RETRIEVAL_INDEX_WEIGHTS = {
+    "body": 1.0,
+    "section_anchor": 0.45,
+    "summary": 0.78,
+    "question": 0.82,
+    "table_or_figure": 1.12,
+}
+
+DEFAULT_RETRIEVAL_INDEX_MAX_PER_CHUNK = 6
+DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK = 3
+RETRIEVAL_INDEX_PREVIEW_CHARS = 360
+RETRIEVAL_INDEX_ARTIFACT_SCHEMA_VERSION = "retrieval_index_artifact_v1"
+DEFAULT_RETRIEVAL_INDEX_ARTIFACT_DIR = "02-retrieval-indexes"
+
+PAPER_CHUNK_METADATA_KEYS = {
+    "source",
+    "document_name",
+    "chunk_id",
+    "chunk_index",
+    "parent_chunk_id",
+    "original_chunk_id",
+    "total_chunks",
+    "word_count",
+    "rerank_text",
+    "chunk_type",
+    "page_number",
+    "page_start",
+    "page_end",
+    "page_range",
+    "section_path",
+    "section_title",
+    "section_level",
+    "asset_kind",
+    "asset_path",
+    "asset_abs_path",
+    "asset_summary",
+    "asset_preview_text",
+    "asset_caption",
+    "asset_rows",
+    "asset_columns",
+    "table_structured_text",
+    "table_id",
+    "order_index",
+    "subchunk_index",
+    "subchunk_count",
+    "subchunk_label",
+    "content_part_index",
+    "content_part_count",
+    "content_part_label",
+}
+
+
+@dataclass
+class PaperChunk:
+    """最终证据单元的轻量模型；现有 chunk payload 仍是对外兼容的真实载体。"""
+
+    chunk_id: str
+    content: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    payload: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_chunk(cls, chunk: Dict[str, Any], fallback_index: int = 0) -> "PaperChunk":
+        metadata = dict(chunk.get("metadata", {}) or {})
+        chunk_id = normalize_chunk_id(chunk, fallback_index=fallback_index)
+        content = str(chunk.get("content") or chunk.get("text") or metadata.get("content") or metadata.get("text") or "")
+        # 只补齐派生索引需要的稳定元数据，避免把 index 层字段混回 PaperChunk 的核心语义。
+        normalized_metadata = {
+            key: (chunk.get(key) if key in chunk else metadata.get(key))
+            for key in PAPER_CHUNK_METADATA_KEYS
+            if (chunk.get(key) if key in chunk else metadata.get(key)) not in (None, "")
+        }
+        normalized_metadata.setdefault("chunk_id", chunk_id)
+        return cls(chunk_id=chunk_id, content=content, metadata=normalized_metadata, payload=dict(chunk))
+
+
+@dataclass
+class RetrievalIndex:
+    """检索入口单元；命中它以后必须通过 chunk_id 回填到 PaperChunk。"""
+
+    index_id: str
+    chunk_id: str
+    index_type: str
+    index_text: str
+    index_weight: float = 1.0
+    enabled_routes: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "index_id": self.index_id,
+            "chunk_id": self.chunk_id,
+            "index_type": self.index_type,
+            "index_text": self.index_text,
+            "index_weight": self.index_weight,
+            "enabled_routes": list(self.enabled_routes),
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "RetrievalIndex":
+        index_type = normalize_index_type(payload.get("index_type") or payload.get("retrieval_index_type"))
+        return cls(
+            index_id=str(payload.get("index_id") or payload.get("retrieval_index_id") or ""),
+            chunk_id=str(payload.get("chunk_id") or payload.get("retrieval_index_chunk_id") or ""),
+            index_type=index_type,
+            index_text=str(payload.get("index_text") or payload.get("retrieval_index_text") or ""),
+            index_weight=float(
+                payload.get(
+                    "index_weight",
+                    payload.get("retrieval_index_weight", RETRIEVAL_INDEX_WEIGHTS.get(index_type, 1.0)),
+                )
+                or 0.0
+            ),
+            enabled_routes=normalize_enabled_routes(payload.get("enabled_routes") or payload.get("retrieval_index_enabled_routes")),
+            metadata=dict(payload.get("metadata", payload.get("retrieval_index_metadata", {})) or {}),
+        )
+
+
+def normalize_index_type(value: Any) -> str:
+    index_type = str(value or "body").strip().lower()
+    return index_type if index_type in RETRIEVAL_INDEX_TYPES else "body"
+
+
+def normalize_chunk_id(chunk: Dict[str, Any], fallback_index: int = 0) -> str:
+    metadata = dict(chunk.get("metadata", {}) or {})
+    for key in ("chunk_id", "chunk_index", "parent_chunk_id", "original_chunk_id"):
+        value = chunk.get(key) if key in chunk else metadata.get(key)
+        normalized = str(value or "").strip()
+        if normalized:
+            return normalized
+    return str(fallback_index or 0)
+
+
+def normalize_enabled_routes(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            except json.JSONDecodeError:
+                pass
+        return [item.strip() for item in re.split(r"[,|]", raw) if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def retrieval_index_enabled_for(index: RetrievalIndex | Dict[str, Any], route_names: Set[str]) -> bool:
+    routes = normalize_enabled_routes(index.enabled_routes if isinstance(index, RetrievalIndex) else index.get("enabled_routes"))
+    if not routes:
+        return True
+    return bool(set(routes) & route_names)
+
+
+class RetrievalIndexBuilder:
+    """为 PaperChunk 生成多视角 RetrievalIndex，并把生成式失败限制在单 chunk 内。"""
+
+    def __init__(
+        self,
+        *,
+        generation_service: Any = None,
+        enable_generative_indexes: bool = False,
+        max_indexes_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_PER_CHUNK,
+        max_questions_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK,
+    ) -> None:
+        self.generation_service = generation_service
+        self.enable_generative_indexes = bool(enable_generative_indexes)
+        self.max_indexes_per_chunk = max(2, int(max_indexes_per_chunk or DEFAULT_RETRIEVAL_INDEX_MAX_PER_CHUNK))
+        # 0 是显式关闭 question index 的有效配置，不能被 Python 的 truthy fallback 恢复成默认值。
+        question_limit = (
+            DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK
+            if max_questions_per_chunk is None
+            else max_questions_per_chunk
+        )
+        self.max_questions_per_chunk = max(0, min(3, int(question_limit)))
+
+    def build(self, chunks: Iterable[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        all_indexes: List[Dict[str, Any]] = []
+        chunk_debug: List[Dict[str, Any]] = []
+        for fallback_index, chunk in enumerate(chunks or [], start=1):
+            indexes, debug = self.build_for_chunk(dict(chunk or {}), fallback_index=fallback_index)
+            all_indexes.extend(index.to_dict() for index in indexes)
+            chunk_debug.append(debug)
+
+        summary = summarize_retrieval_indexes(all_indexes)
+        generation_errors = [
+            error
+            for item in chunk_debug
+            for error in item.get("generation_errors", [])
+        ]
+        summary.update(
+            {
+                "chunk_count": len(chunk_debug),
+                "generative_enabled": self.enable_generative_indexes,
+                "max_indexes_per_chunk": self.max_indexes_per_chunk,
+                "max_questions_per_chunk": self.max_questions_per_chunk,
+                "chunks_with_body_index": sum(1 for item in chunk_debug if "body" in item.get("index_types", [])),
+                "chunks_with_section_anchor_index": sum(
+                    1 for item in chunk_debug if "section_anchor" in item.get("index_types", [])
+                ),
+                "generated_summary_count": sum(int(item.get("generated_summary_count", 0) or 0) for item in chunk_debug),
+                "generated_question_count": sum(int(item.get("generated_question_count", 0) or 0) for item in chunk_debug),
+                "generation_error_count": len(generation_errors),
+                "generation_errors": generation_errors[:20],
+                "per_chunk": chunk_debug[:50],
+            }
+        )
+        return all_indexes, summary
+
+    def build_for_chunk(self, chunk: Dict[str, Any], fallback_index: int = 0) -> tuple[List[RetrievalIndex], Dict[str, Any]]:
+        paper_chunk = PaperChunk.from_chunk(chunk, fallback_index=fallback_index)
+        metadata = dict(paper_chunk.metadata)
+        metadata["chunk_type"] = str(metadata.get("chunk_type", chunk.get("chunk_type", "text")) or "text").strip().lower()
+        chunk_type = str(metadata.get("chunk_type", "text") or "text").strip().lower()
+        is_asset = chunk_type in {"figure", "table"}
+        indexes: List[RetrievalIndex] = []
+        generation_errors: List[Dict[str, Any]] = []
+        generated_summary_count = 0
+        generated_question_count = 0
+
+        def add_index(
+            index_type: str,
+            text: str,
+            *,
+            source_fields: List[str],
+            generation_status: str = "rule",
+        ) -> None:
+            if len(indexes) >= self.max_indexes_per_chunk:
+                return
+            normalized_type = normalize_index_type(index_type)
+            ordinal = 1 + sum(1 for item in indexes if item.index_type == normalized_type)
+            index_metadata = {
+                **metadata,
+                "source_fields": source_fields,
+                "generation_status": generation_status,
+                "has_index_text": bool(str(text or "").strip()),
+            }
+            # index_id 只依赖 chunk_id、类型和序号，保证同一 chunk 重建时标识稳定，便于 trace 对比。
+            indexes.append(
+                RetrievalIndex(
+                    index_id=f"{paper_chunk.chunk_id}:{normalized_type}:{ordinal}",
+                    chunk_id=paper_chunk.chunk_id,
+                    index_type=normalized_type,
+                    index_text=str(text or "").strip(),
+                    index_weight=float(RETRIEVAL_INDEX_WEIGHTS.get(normalized_type, 1.0)),
+                    enabled_routes=list(RETRIEVAL_INDEX_ROUTE_DEFAULTS.get(normalized_type, ["keyword"])),
+                    metadata=index_metadata,
+                )
+            )
+
+        # body 和 section_anchor 是每个 chunk 的保底入口；后续生成式索引失败时仍能完成建库。
+        body_text = self._asset_index_text(paper_chunk, metadata) if is_asset else paper_chunk.content
+        add_index("body", body_text, source_fields=["asset_fields" if is_asset else "content"])
+
+        section_anchor_text = self._section_anchor_text(paper_chunk, metadata)
+        add_index("section_anchor", section_anchor_text, source_fields=["section_path", "section_title", "page_number", "summary"])
+
+        if is_asset:
+            # 图表/表格 chunk 优先使用 caption、summary、preview 和结构化表格文本，避免按普通正文逻辑稀释资产语义。
+            asset_text = self._asset_index_text(paper_chunk, metadata)
+            if asset_text:
+                add_index(
+                    "table_or_figure",
+                    asset_text,
+                    source_fields=["asset_caption", "asset_summary", "asset_preview_text", "table_structured_text", "content"],
+                )
+
+        # summary/question 是召回增强层；数量受上限约束，避免一个 chunk 扩张出过多向量。
+        summary_text, summary_status, summary_errors = self._summary_text(chunk, paper_chunk, metadata)
+        generation_errors.extend(summary_errors)
+        if summary_text and self._normalized_text(summary_text) != self._normalized_text(body_text):
+            add_index("summary", summary_text, source_fields=["rerank_text", "asset_summary", "generated_summary"], generation_status=summary_status)
+            if summary_status == "generated_llm":
+                generated_summary_count += 1
+
+        question_texts, question_status, question_errors = self._question_texts(chunk, paper_chunk, metadata)
+        generation_errors.extend(question_errors)
+        for question_text in question_texts[: self.max_questions_per_chunk]:
+            add_index("question", question_text, source_fields=["retrieval_questions", "generated_questions"], generation_status=question_status)
+            if question_status == "generated_llm":
+                generated_question_count += 1
+
+        debug = {
+            "chunk_id": paper_chunk.chunk_id,
+            "chunk_type": chunk_type,
+            "index_count": len(indexes),
+            "index_types": [index.index_type for index in indexes],
+            "generated_summary_count": generated_summary_count,
+            "generated_question_count": generated_question_count,
+            "generation_errors": generation_errors,
+        }
+        return indexes, debug
+
+    def _summary_text(
+        self,
+        chunk: Dict[str, Any],
+        paper_chunk: PaperChunk,
+        metadata: Dict[str, Any],
+    ) -> tuple[str, str, List[Dict[str, Any]]]:
+        existing = str(chunk.get("rerank_text") or metadata.get("rerank_text") or metadata.get("asset_summary") or "").strip()
+        if existing:
+            return existing, "reused_existing", []
+        if not self.enable_generative_indexes:
+            return "", "disabled", []
+        try:
+            generated = self._generate_summary_with_service(paper_chunk, metadata)
+            if generated:
+                return generated, "generated_llm", []
+        except Exception as exc:
+            # 生成失败只降级当前 chunk 的增强索引，规则索引已经足够维持后续 embedding/BM25 流程。
+            return self._short_text(paper_chunk.content), "generated_fallback", [
+                {"chunk_id": paper_chunk.chunk_id, "index_type": "summary", "error": str(exc)[:300]}
+            ]
+        return self._short_text(paper_chunk.content), "generated_fallback", []
+
+    def _question_texts(
+        self,
+        chunk: Dict[str, Any],
+        paper_chunk: PaperChunk,
+        metadata: Dict[str, Any],
+    ) -> tuple[List[str], str, List[Dict[str, Any]]]:
+        existing_questions = extract_question_index_texts(chunk)
+        if existing_questions:
+            return self._dedupe_texts(existing_questions), "reused_existing", []
+        if not self.enable_generative_indexes or self.max_questions_per_chunk <= 0:
+            return [], "disabled", []
+        try:
+            generated = self._generate_questions_with_service(paper_chunk, metadata)
+            if generated:
+                return self._dedupe_texts(generated)[: self.max_questions_per_chunk], "generated_llm", []
+        except Exception as exc:
+            # 问题索引是可选召回视角；失败时用可解释模板问题兜底，并把错误写进 debug。
+            fallback = self._fallback_questions(paper_chunk, metadata)
+            return fallback, "generated_fallback", [
+                {"chunk_id": paper_chunk.chunk_id, "index_type": "question", "error": str(exc)[:300]}
+            ]
+        return self._fallback_questions(paper_chunk, metadata), "generated_fallback", []
+
+    def _generate_summary_with_service(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> str:
+        if self.generation_service is None:
+            return ""
+        generator = getattr(self.generation_service, "generate_retrieval_index_summary", None)
+        if callable(generator):
+            result = generator(chunk=paper_chunk.payload, max_chars=RETRIEVAL_INDEX_PREVIEW_CHARS)
+            return self._normalize_generated_text(result)
+        completer = getattr(self.generation_service, "complete_with_qwen", None)
+        if not callable(completer):
+            return ""
+        prompt = self._summary_prompt(paper_chunk, metadata)
+        # 复用现有生成服务时只接受严格 JSON，防止自由文本被误当成可追踪的 index_text。
+        response = completer(prompt, task_type="retrieval_index_generation", enable_thinking=False)
+        parsed = self._parse_generated_payload(response)
+        return self._normalize_generated_text(parsed.get("summary", ""))
+
+    def _generate_questions_with_service(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> List[str]:
+        if self.generation_service is None:
+            return []
+        generator = getattr(self.generation_service, "generate_retrieval_index_questions", None)
+        if callable(generator):
+            result = generator(
+                chunk=paper_chunk.payload,
+                max_questions=self.max_questions_per_chunk,
+            )
+            return self._normalize_generated_questions(result)
+        completer = getattr(self.generation_service, "complete_with_qwen", None)
+        if not callable(completer):
+            return []
+        prompt = self._question_prompt(paper_chunk, metadata)
+        # question index 直接进入召回入口，因此解析失败必须显式降级而不是吞掉格式问题。
+        response = completer(prompt, task_type="retrieval_index_generation", enable_thinking=False)
+        parsed = self._parse_generated_payload(response)
+        return self._normalize_generated_questions(parsed.get("questions", []))
+
+    def _summary_prompt(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> str:
+        chunk_type = metadata.get("chunk_type", "text")
+        content = self._short_text(self._asset_index_text(paper_chunk, metadata) or paper_chunk.content, limit=900)
+        return (
+            "请为论文 QA 检索索引生成一个短摘要，必须只基于给定 chunk，不要补充外部信息。\n"
+            "输出严格 JSON：{\"summary\":\"...\"}\n"
+            f"chunk_type: {chunk_type}\n"
+            f"section: {metadata.get('section_path') or metadata.get('section_title') or ''}\n"
+            f"page: {metadata.get('page_number') or metadata.get('page_range') or ''}\n"
+            f"content:\n{content}"
+        )
+
+    def _question_prompt(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> str:
+        chunk_type = metadata.get("chunk_type", "text")
+        content = self._short_text(self._asset_index_text(paper_chunk, metadata) or paper_chunk.content, limit=900)
+        return (
+            "请为论文 QA 检索索引生成 1-3 个这个 chunk 可以回答的问题。\n"
+            "要求：问题必须具体、可由该 chunk 直接支持；不要生成无法从 chunk 证明的问题。\n"
+            "输出严格 JSON：{\"questions\":[\"...\",\"...\"]}\n"
+            f"chunk_type: {chunk_type}\n"
+            f"section: {metadata.get('section_path') or metadata.get('section_title') or ''}\n"
+            f"page: {metadata.get('page_number') or metadata.get('page_range') or ''}\n"
+            f"content:\n{content}"
+        )
+
+    @classmethod
+    def _parse_generated_payload(cls, value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        raw = str(value or "").strip()
+        if not raw:
+            return {}
+        match = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", raw, flags=re.DOTALL)
+        candidate = match.group(1).strip() if match else raw
+        if not (candidate.startswith("{") or candidate.startswith("[")):
+            braces = re.search(r"(\{.*\}|\[.*\])", candidate, flags=re.DOTALL)
+            candidate = braces.group(1).strip() if braces else candidate
+        parsed = json.loads(candidate)
+        if isinstance(parsed, list):
+            return {"questions": parsed}
+        if isinstance(parsed, dict):
+            return parsed
+        return {}
+
+    @staticmethod
+    def _normalize_generated_text(value: Any) -> str:
+        if isinstance(value, dict):
+            value = value.get("summary") or value.get("text") or ""
+        if isinstance(value, list):
+            value = " ".join(str(item).strip() for item in value if str(item).strip())
+        return re.sub(r"\s+", " ", str(value or "")).strip()
+
+    @classmethod
+    def _normalize_generated_questions(cls, value: Any) -> List[str]:
+        if isinstance(value, dict):
+            value = value.get("questions") or value.get("question") or []
+        if isinstance(value, str):
+            value = re.split(r"[\n;]+", value)
+        if not isinstance(value, (list, tuple, set)):
+            return []
+        normalized = []
+        for item in value:
+            text = re.sub(r"^\s*[-*\d.)]+\s*", "", str(item or "")).strip()
+            if text:
+                normalized.append(text)
+        return cls._dedupe_texts(normalized)
+
+    def _asset_index_text(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> str:
+        parts = [
+            str(metadata.get("asset_caption") or "").strip(),
+            str(metadata.get("asset_summary") or "").strip(),
+            str(metadata.get("table_structured_text") or "").strip(),
+            str(metadata.get("asset_preview_text") or "").strip(),
+            paper_chunk.content.strip(),
+        ]
+        return "\n".join(self._dedupe_texts([part for part in parts if part]))
+
+    def _section_anchor_text(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> str:
+        summary = str(metadata.get("rerank_text") or metadata.get("asset_summary") or "").strip()
+        if not summary:
+            summary = self._short_text(self._asset_index_text(paper_chunk, metadata) or paper_chunk.content, limit=180)
+        parts = [
+            f"Section: {metadata.get('section_path') or metadata.get('section_title')}" if metadata.get("section_path") or metadata.get("section_title") else "",
+            f"Page: {metadata.get('page_number') or metadata.get('page_range')}" if metadata.get("page_number") or metadata.get("page_range") else "",
+            f"Summary: {summary}" if summary else "",
+            f"Chunk: {paper_chunk.chunk_id}" if not summary and not metadata.get("section_path") and not metadata.get("section_title") else "",
+        ]
+        return "\n".join([part for part in parts if part]).strip() or f"Chunk: {paper_chunk.chunk_id}"
+
+    def _fallback_questions(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> List[str]:
+        chunk_type = str(metadata.get("chunk_type", "text") or "text").strip().lower()
+        topic = str(metadata.get("section_title") or metadata.get("section_path") or "this evidence").strip()
+        if chunk_type == "figure":
+            questions = [
+                f"What does the figure show about {topic}?",
+                f"How should the figure evidence be interpreted in this paper?",
+            ]
+        elif chunk_type == "table":
+            questions = [
+                f"What results are reported in the table for {topic}?",
+                f"Which values or comparisons does the table support?",
+            ]
+        else:
+            questions = [
+                f"What does the paper say about {topic}?",
+                f"How does this chunk support questions about {topic}?",
+            ]
+        return self._dedupe_texts(questions)[: self.max_questions_per_chunk]
+
+    @staticmethod
+    def _short_text(text: str, limit: int = RETRIEVAL_INDEX_PREVIEW_CHARS) -> str:
+        normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[:limit].rsplit(" ", 1)[0].strip() or normalized[:limit].strip()
+
+    @staticmethod
+    def _normalized_text(text: str) -> str:
+        return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+    @classmethod
+    def _dedupe_texts(cls, texts: Iterable[str]) -> List[str]:
+        deduped: List[str] = []
+        seen: Set[str] = set()
+        for text in texts:
+            normalized = cls._normalized_text(text)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(str(text).strip())
+        return deduped
+
+
+def build_retrieval_indexes_for_chunk(
+    chunk: Dict[str, Any],
+    fallback_index: int = 0,
+    *,
+    generation_service: Any = None,
+    enable_generative_indexes: bool = False,
+    max_indexes_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_PER_CHUNK,
+    max_questions_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK,
+) -> List[RetrievalIndex]:
+    builder = RetrievalIndexBuilder(
+        generation_service=generation_service,
+        enable_generative_indexes=enable_generative_indexes,
+        max_indexes_per_chunk=max_indexes_per_chunk,
+        max_questions_per_chunk=max_questions_per_chunk,
+    )
+    indexes, _ = builder.build_for_chunk(chunk, fallback_index=fallback_index)
+    return indexes
+
+
+def build_retrieval_indexes(
+    chunks: Iterable[Dict[str, Any]],
+    *,
+    generation_service: Any = None,
+    enable_generative_indexes: bool = False,
+    max_indexes_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_PER_CHUNK,
+    max_questions_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK,
+) -> List[Dict[str, Any]]:
+    builder = RetrievalIndexBuilder(
+        generation_service=generation_service,
+        enable_generative_indexes=enable_generative_indexes,
+        max_indexes_per_chunk=max_indexes_per_chunk,
+        max_questions_per_chunk=max_questions_per_chunk,
+    )
+    indexes, _ = builder.build(chunks)
+    return indexes
+
+
+def build_retrieval_index_payload(
+    chunks: Iterable[Dict[str, Any]],
+    *,
+    generation_service: Any = None,
+    enable_generative_indexes: bool = False,
+    max_indexes_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_PER_CHUNK,
+    max_questions_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    builder = RetrievalIndexBuilder(
+        generation_service=generation_service,
+        enable_generative_indexes=enable_generative_indexes,
+        max_indexes_per_chunk=max_indexes_per_chunk,
+        max_questions_per_chunk=max_questions_per_chunk,
+    )
+    return builder.build(chunks)
+
+
+def iter_retrieval_indexes_for_embedding(retrieval_indexes: Iterable[Dict[str, Any]]) -> List[RetrievalIndex]:
+    indexes: List[RetrievalIndex] = []
+    for payload in retrieval_indexes or []:
+        index = RetrievalIndex.from_dict(dict(payload or {}))
+        # 空 index_text 只保留在调试/落盘模型里，不能进入 embedding 或 BM25 的真实候选池。
+        if not index.index_text.strip():
+            continue
+        if not retrieval_index_enabled_for(index, VECTOR_ROUTE_NAMES):
+            continue
+        indexes.append(index)
+    return indexes
+
+
+def summarize_retrieval_indexes(retrieval_indexes: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    counts: Dict[str, int] = defaultdict(int)
+    empty_count = 0
+    for payload in retrieval_indexes or []:
+        index = RetrievalIndex.from_dict(dict(payload or {}))
+        counts[index.index_type] += 1
+        if not index.index_text.strip():
+            empty_count += 1
+    return {
+        "index_count": sum(counts.values()),
+        "index_type_counts": dict(counts),
+        "empty_index_text_count": empty_count,
+    }
+
+
+def _safe_artifact_slug(value: Any, fallback: str = "paper") -> str:
+    slug = re.sub(r"[^0-9A-Za-z._-]+", "_", str(value or "").strip()).strip("._-")
+    return slug or fallback
+
+
+def normalize_retrieval_index_artifact_records(
+    retrieval_indexes: Iterable[Dict[str, Any]],
+    *,
+    paper_id: str,
+    index_version: str,
+    created_at: str,
+) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for payload in retrieval_indexes or []:
+        index = RetrievalIndex.from_dict(dict(payload or {}))
+        metadata = dict(index.metadata or {})
+        source = str(
+            (payload or {}).get("source")
+            or metadata.get("source")
+            or metadata.get("document_name")
+            or ""
+        ).strip()
+        records.append(
+            {
+                "index_id": index.index_id,
+                "paper_id": paper_id,
+                "chunk_id": index.chunk_id,
+                "index_type": index.index_type,
+                "index_text": index.index_text,
+                "index_weight": float(index.index_weight),
+                "enabled_routes": list(index.enabled_routes),
+                "source": source,
+                "metadata": metadata,
+                "index_version": index_version,
+                "created_at": created_at,
+            }
+        )
+    return records
+
+
+def save_retrieval_index_artifact(
+    *,
+    paper_id: str,
+    retrieval_indexes: Iterable[Dict[str, Any]],
+    retrieval_index_debug: Optional[Dict[str, Any]] = None,
+    chunks: Optional[Iterable[Dict[str, Any]]] = None,
+    index_version: Optional[str] = None,
+    output_dir: str = DEFAULT_RETRIEVAL_INDEX_ARTIFACT_DIR,
+) -> str:
+    created_at = datetime.now().isoformat(timespec="seconds")
+    version = str(index_version or created_at.replace(":", "").replace("-", "")).strip()
+    records = normalize_retrieval_index_artifact_records(
+        retrieval_indexes,
+        paper_id=str(paper_id or ""),
+        index_version=version,
+        created_at=created_at,
+    )
+    chunk_ids = {
+        normalize_chunk_id(dict(chunk or {}), fallback_index=index)
+        for index, chunk in enumerate(chunks or [], start=1)
+    }
+    missing_chunk_ids = sorted(
+        {
+            str(record.get("chunk_id") or "")
+            for record in records
+            if chunk_ids and str(record.get("chunk_id") or "") not in chunk_ids
+        }
+    )
+    summary = dict(retrieval_index_debug or summarize_retrieval_indexes(records))
+    payload = {
+        "schema_version": RETRIEVAL_INDEX_ARTIFACT_SCHEMA_VERSION,
+        "paper_id": str(paper_id or ""),
+        "index_version": version,
+        "created_at": created_at,
+        "index_count": len(records),
+        "index_type_counts": summary.get("index_type_counts", {}),
+        "empty_index_text_count": summary.get("empty_index_text_count", 0),
+        "chunk_count": len(chunk_ids),
+        "chunk_ids": sorted(chunk_ids),
+        "missing_chunk_ids": missing_chunk_ids,
+        "debug": summary,
+        # 完整 index_text 在这里持久化；Milvus metadata 只作为向量检索副本，不再是唯一来源。
+        "retrieval_indexes": records,
+    }
+
+    os.makedirs(output_dir, exist_ok=True)
+    filename = (
+        f"{_safe_artifact_slug(paper_id)}_"
+        f"{_safe_artifact_slug(version, fallback='version')}_retrieval_indexes.json"
+    )
+    filepath = os.path.join(output_dir, filename)
+    with open(filepath, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+    return filepath
+
+
+def resolve_artifact_file_path(file_path: Any) -> Optional[Path]:
+    raw_path = Path(str(file_path or "").strip())
+    if not str(raw_path):
+        return None
+    candidates = [raw_path]
+    backend_root = Path(__file__).resolve().parents[2]
+    repo_root = backend_root.parent
+    if not raw_path.is_absolute():
+        candidates.extend(
+            [
+                Path(os.getcwd()) / raw_path,
+                backend_root / raw_path,
+                repo_root / raw_path,
+            ]
+        )
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def load_retrieval_index_artifact(file_path: Any) -> Dict[str, Any]:
+    resolved = resolve_artifact_file_path(file_path)
+    if resolved is None:
+        raise FileNotFoundError(str(file_path or ""))
+    with open(resolved, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid retrieval index artifact: {resolved}")
+    return payload
+
+
+def extract_question_index_texts(chunk: Dict[str, Any]) -> List[str]:
+    metadata = dict(chunk.get("metadata", {}) or {})
+    raw_value = (
+        chunk.get("retrieval_questions")
+        or chunk.get("questions")
+        or metadata.get("retrieval_questions")
+        or metadata.get("questions")
+        or []
+    )
+    if isinstance(raw_value, str):
+        candidates = re.split(r"[\n;]+", raw_value)
+    elif isinstance(raw_value, (list, tuple, set)):
+        candidates = list(raw_value)
+    else:
+        candidates = []
+    return [str(item).strip() for item in candidates if str(item).strip()]
 
 
 @dataclass
@@ -39,6 +801,11 @@ class KeywordDocument:
     field_lengths: Dict[str, int] = field(default_factory=dict)
     token_sources: Dict[str, List[str]] = field(default_factory=dict)
     keyword_document_debug: Dict[str, Any] = field(default_factory=dict)
+    retrieval_index_id: str = ""
+    retrieval_index_type: str = "body"
+    retrieval_index_text: str = ""
+    retrieval_index_weight: float = 1.0
+    retrieval_index_enabled_routes: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -68,6 +835,7 @@ class CollectionRetrievalIndex:
     by_parent_subchunk: Dict[Tuple[str, str], List[int]] = field(default_factory=dict)
     structured_tables: List[Dict[str, Any]] = field(default_factory=list)
     table_structure_debug: Dict[str, Any] = field(default_factory=dict)
+    retrieval_index_artifact_debug: Dict[str, Any] = field(default_factory=dict)
     cache_hit: bool = False
     build_time: float = 0.0
     fallback_reason: str = ""
@@ -79,12 +847,15 @@ class CollectionRetrievalIndex:
             "keyword_index_version": self.index_version,
             "keyword_candidate_count": candidate_count,
             "keyword_index_chunk_count": self.chunk_count,
+            "keyword_index_document_count": len(self.documents),
             "keyword_index_build_id": self.build_id,
             "keyword_index_created_at": self.created_at,
             "keyword_index_build_time": self.build_time,
             "keyword_full_scan_used": full_scan_used,
             "keyword_index_build_source": self.build_source,
             "keyword_index_fallback_reason": self.fallback_reason,
+            "keyword_index_model": "retrieval_index_v1",
+            "retrieval_index_artifact": dict(self.retrieval_index_artifact_debug),
         }
 
     def to_memory_debug(
@@ -106,6 +877,7 @@ class CollectionRetrievalIndex:
             "memory_index_chunk_count": self.chunk_count,
             "memory_full_scan_used": full_scan_used,
             "memory_index_fallback_reason": self.fallback_reason,
+            "retrieval_index_artifact": dict(self.retrieval_index_artifact_debug),
         }
 
 
@@ -173,13 +945,46 @@ class CollectionRetrievalIndexProvider:
         if stale_reason:
             fallback_reasons.append(f"rebuilt_after_stale: {stale_reason}")
 
-        try:
-            raw_chunks = self.vector_store_service.get_all_chunks(collection_name) or []
-        except Exception as exc:
-            # route 查询不能继续回到无上限扫描；构建失败时返回空索引并把原因暴露给 debug。
-            raw_chunks = []
-            fallback_reasons.append(f"chunk_index_build_failed: {exc}")
-            logger.warning("Failed to build collection retrieval index: collection=%s error=%s", collection_name, exc)
+        use_index_level_bm25 = bool(ENHANCED_RETRIEVAL_CONFIG.get("enable_index_level_bm25", True))
+        if use_index_level_bm25:
+            raw_chunks, retrieval_index_artifact_debug = self._load_retrieval_index_chunks(index_record)
+            build_source = "retrieval_index_artifact" if raw_chunks else "milvus_chunk_scan"
+            if raw_chunks:
+                fallback_reasons.append(f"retrieval_index_artifact_count:{len(raw_chunks)}")
+            else:
+                reason = str(retrieval_index_artifact_debug.get("reason") or "").strip()
+                if retrieval_index_artifact_debug.get("enabled") and reason:
+                    fallback_reasons.append(f"retrieval_index_artifact_unavailable:{reason}")
+                try:
+                    raw_chunks = self.vector_store_service.get_all_chunks(collection_name) or []
+                except Exception as exc:
+                    # route 查询不能继续回到无上限扫描；构建失败时返回空索引并把原因暴露给 debug。
+                    raw_chunks = []
+                    fallback_reasons.append(f"chunk_index_build_failed: {exc}")
+                    logger.warning("Failed to build collection retrieval index: collection=%s error=%s", collection_name, exc)
+        else:
+            # 灰度开关关闭时强制回到 chunk-level BM25，避免未迁移 collection 因多 index 行产生重复候选。
+            raw_chunks, retrieval_index_artifact_debug = self._load_legacy_chunk_rows(index_record)
+            build_source = "legacy_chunk_file" if raw_chunks else "legacy_milvus_chunk_scan"
+            fallback_reasons.append("index_level_bm25_disabled")
+            if raw_chunks:
+                fallback_reasons.append(f"legacy_chunk_file_count:{len(raw_chunks)}")
+            else:
+                try:
+                    raw_chunks = self._collapse_to_legacy_chunk_rows(
+                        self.vector_store_service.get_all_chunks(collection_name) or []
+                    )
+                    retrieval_index_artifact_debug["source"] = "legacy_milvus_chunk_scan"
+                    retrieval_index_artifact_debug["row_count"] = len(raw_chunks)
+                    if raw_chunks:
+                        retrieval_index_artifact_debug["reason"] = "index_level_bm25_disabled"
+                except Exception as exc:
+                    # 兼容路径同样要显式失败原因，便于确认是灰度开关还是底层读库异常。
+                    raw_chunks = []
+                    fallback_reasons.append(f"legacy_chunk_index_build_failed: {exc}")
+                    logger.warning("Failed to build legacy collection retrieval index: collection=%s error=%s", collection_name, exc)
+
+        retrieval_index_artifact_debug["index_level_bm25_enabled"] = use_index_level_bm25
 
         structured_tables, table_structure_debug = self._load_structured_tables(index_record)
         if structured_tables:
@@ -202,10 +1007,19 @@ class CollectionRetrievalIndexProvider:
         by_subchunk_index: Dict[str, List[int]] = defaultdict(list)
         by_parent_subchunk: Dict[Tuple[str, str], List[int]] = defaultdict(list)
 
-        for doc_id, chunk in enumerate(normalized_chunks):
+        for raw_chunk in normalized_chunks:
+            chunk = self._ensure_retrieval_index_fields(raw_chunk)
+            if not self._retrieval_index_enabled_for_keyword(chunk):
+                continue
+            if not str(chunk.get("retrieval_index_text", "") or "").strip():
+                continue
+
+            doc_id = len(documents)
             chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
             keyword_document = self._build_keyword_document_fields(chunk, chunk_type)
             field_token_counts = keyword_document["field_token_counts"]
+            if not field_token_counts:
+                continue
             token_sources = keyword_document["token_sources"]
             field_lengths = keyword_document["field_lengths"]
             # token_counts 保留兼容字段，但计数已按字段权重合成，避免图表 OCR 与正文等权进入 BM25。
@@ -225,11 +1039,16 @@ class CollectionRetrievalIndexProvider:
                     chunk=chunk,
                     token_counts=token_counts,
                     doc_length=doc_length,
-                    content_prefix=str(chunk.get("content", "") or "").lower()[:300],
+                    content_prefix=str(chunk.get("retrieval_index_text") or chunk.get("content", "") or "").lower()[:300],
                     field_token_counts=field_token_counts,
                     field_lengths=field_lengths,
                     token_sources=token_sources,
                     keyword_document_debug=keyword_document["debug"],
+                    retrieval_index_id=str(chunk.get("retrieval_index_id") or ""),
+                    retrieval_index_type=str(chunk.get("retrieval_index_type") or "body"),
+                    retrieval_index_text=str(chunk.get("retrieval_index_text") or ""),
+                    retrieval_index_weight=float(chunk.get("retrieval_index_weight", 1.0) or 1.0),
+                    retrieval_index_enabled_routes=normalize_enabled_routes(chunk.get("retrieval_index_enabled_routes")),
                 )
             )
             self._add_lookup_entries(
@@ -272,9 +1091,11 @@ class CollectionRetrievalIndexProvider:
             by_parent_subchunk={key: list(value) for key, value in by_parent_subchunk.items()},
             structured_tables=[dict(item) for item in structured_tables],
             table_structure_debug=dict(table_structure_debug),
+            retrieval_index_artifact_debug=dict(retrieval_index_artifact_debug),
             cache_hit=False,
             build_time=perf_counter() - started,
             fallback_reason="; ".join(fallback_reasons),
+            build_source=build_source,
         )
         return index
 
@@ -286,6 +1107,11 @@ class CollectionRetrievalIndexProvider:
     ) -> str:
         if index is None:
             return ""
+        expected_index_level = bool(ENHANCED_RETRIEVAL_CONFIG.get("enable_index_level_bm25", True))
+        cached_index_level = index.retrieval_index_artifact_debug.get("index_level_bm25_enabled")
+        if cached_index_level is not None and bool(cached_index_level) != expected_index_level:
+            # 灰度开关切换会改变 BM25 文档粒度，缓存必须重建，否则 route 输出会混用新旧语义。
+            return f"index_level_bm25_changed:{bool(cached_index_level)}->{expected_index_level}"
         expected_count = self._resolve_expected_count(collection_profile, index_record)
         if expected_count is not None and expected_count != index.chunk_count:
             return f"chunk_count_changed:{index.chunk_count}->{expected_count}"
@@ -305,8 +1131,74 @@ class CollectionRetrievalIndexProvider:
             return resolver(collection_name)
         return collection_name
 
+    def _ensure_retrieval_index_fields(self, chunk: Dict[str, Any]) -> Dict[str, Any]:
+        """兼容新旧 collection：新数据使用 retrieval index，旧数据自动合成 body index。"""
+        normalized = dict(chunk)
+        metadata = dict(normalized.get("metadata", {}) or {})
+        chunk_id = normalize_chunk_id(normalized)
+        index_id = str(
+            normalized.get("retrieval_index_id")
+            or normalized.get("index_id")
+            or metadata.get("retrieval_index_id")
+            or metadata.get("index_id")
+            or ""
+        ).strip()
+        index_type = normalize_index_type(
+            normalized.get("retrieval_index_type")
+            or normalized.get("index_type")
+            or metadata.get("retrieval_index_type")
+            or metadata.get("index_type")
+        )
+        index_text = str(
+            normalized.get("retrieval_index_text")
+            or normalized.get("index_text")
+            or metadata.get("retrieval_index_text")
+            or metadata.get("index_text")
+            or ""
+        ).strip()
+
+        if not index_id:
+            # 旧 collection 没有 index 层时只合成 body index，保证现有问答链路仍可读取旧 chunk。
+            index_id = f"{chunk_id}:body:1"
+            index_type = "body"
+            index_text = str(normalized.get("content") or normalized.get("text") or metadata.get("content") or metadata.get("text") or "").strip()
+
+        normalized["retrieval_index_id"] = index_id
+        normalized["retrieval_index_type"] = index_type
+        normalized["retrieval_index_text"] = index_text
+        normalized["retrieval_index_weight"] = float(
+            normalized.get("retrieval_index_weight")
+            or normalized.get("index_weight")
+            or metadata.get("retrieval_index_weight")
+            or metadata.get("index_weight")
+            or RETRIEVAL_INDEX_WEIGHTS.get(index_type, 1.0)
+        )
+        normalized["retrieval_index_enabled_routes"] = normalize_enabled_routes(
+            normalized.get("retrieval_index_enabled_routes")
+            or metadata.get("retrieval_index_enabled_routes")
+            or RETRIEVAL_INDEX_ROUTE_DEFAULTS.get(index_type, [])
+        )
+        # index_* 是新向量 schema 的短字段名；BM25 内部继续同步旧字段，兼容历史调用方。
+        normalized["index_id"] = normalized["retrieval_index_id"]
+        normalized["index_type"] = normalized["retrieval_index_type"]
+        normalized["index_text"] = normalized["retrieval_index_text"]
+        normalized["index_weight"] = normalized["retrieval_index_weight"]
+        return normalized
+
+    @staticmethod
+    def _retrieval_index_enabled_for_keyword(chunk: Dict[str, Any]) -> bool:
+        routes = normalize_enabled_routes(chunk.get("retrieval_index_enabled_routes"))
+        if not routes:
+            return True
+        return bool(set(routes) & KEYWORD_ROUTE_NAMES)
+
     def _build_keyword_document_fields(self, chunk: Dict[str, Any], chunk_type: str) -> Dict[str, Any]:
         """构建字段化 keyword document，避免正文、结构字段和图表 OCR 噪声无差别混入索引。"""
+        index_type = normalize_index_type(chunk.get("retrieval_index_type"))
+        index_text = str(chunk.get("retrieval_index_text") or "").strip()
+        if index_text:
+            return self._build_keyword_document_fields_from_retrieval_index(chunk, chunk_type, index_type, index_text)
+
         field_texts: Dict[str, List[str]] = {
             "body": [str(chunk.get("content", "") or "")],
             "title": [],
@@ -377,6 +1269,55 @@ class CollectionRetrievalIndexProvider:
             },
         }
 
+    def _build_keyword_document_fields_from_retrieval_index(
+        self,
+        chunk: Dict[str, Any],
+        chunk_type: str,
+        index_type: str,
+        index_text: str,
+    ) -> Dict[str, Any]:
+        """把 RetrievalIndex 文本映射到 BM25 字段，命中后仍返回原 chunk payload。"""
+        field_name = self._keyword_field_for_retrieval_index(index_type, chunk_type)
+        field_token_counts: Dict[str, Counter] = {}
+        field_lengths: Dict[str, int] = {}
+        token_sources: Dict[str, List[str]] = defaultdict(list)
+
+        tokens = self.tokenizer(index_text)
+        if tokens:
+            counts = Counter(tokens)
+            field_token_counts[field_name] = counts
+            field_lengths[field_name] = len(tokens)
+            for token in counts:
+                token_sources[token].append(field_name)
+
+        return {
+            "field_token_counts": field_token_counts,
+            "field_lengths": field_lengths,
+            "token_sources": {token: list(sources) for token, sources in token_sources.items()},
+            "debug": {
+                "field_lengths": dict(field_lengths),
+                "field_weights": dict(KEYWORD_FIELD_WEIGHTS),
+                "skipped_fields": {},
+                "has_asset_field": field_name in {"asset_caption", "asset_aux", "table_or_figure"},
+                "retrieval_index_id": str(chunk.get("retrieval_index_id") or ""),
+                "retrieval_index_type": index_type,
+                "retrieval_index_weight": float(chunk.get("retrieval_index_weight", 1.0) or 1.0),
+            },
+        }
+
+    @staticmethod
+    def _keyword_field_for_retrieval_index(index_type: str, chunk_type: str) -> str:
+        """保持 index_type 可见，同时复用既有字段加权和图表噪声控制规则。"""
+        if index_type == "section_anchor":
+            return "section_title"
+        if index_type == "summary":
+            return "summary"
+        if index_type == "question":
+            return "question"
+        if index_type == "table_or_figure" or chunk_type in {"figure", "table"}:
+            return "asset_caption"
+        return "body"
+
     @staticmethod
     def _normalize_keyword_field_text(text: str) -> str:
         return " ".join(str(text or "").strip().lower().split())
@@ -442,6 +1383,195 @@ class CollectionRetrievalIndexProvider:
             debug["reason"] = debug.get("reason") or "structured_tables_empty"
         return structured_tables, debug
 
+    def _load_retrieval_index_chunks(self, index_record: Optional[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """从 retrieval index artifact 和 chunk file 恢复 BM25 输入，避免重启后依赖 Milvus metadata。"""
+        fallback_record = self._fallback_index_record(index_record)
+        debug: Dict[str, Any] = {
+            "enabled": bool(fallback_record),
+            "source": "retrieval_index_artifact",
+            "retrieval_index_file": "",
+            "chunk_file": "",
+            "index_count": 0,
+            "row_count": 0,
+            "missing_chunk_ids": [],
+            "reason": "",
+        }
+        retrieval_index_file = str((fallback_record or {}).get("retrieval_index_file") or "").strip()
+        if not retrieval_index_file:
+            debug["reason"] = "missing_retrieval_index_file"
+            return [], debug
+        debug["retrieval_index_file"] = retrieval_index_file
+
+        try:
+            artifact_payload = load_retrieval_index_artifact(retrieval_index_file)
+        except Exception as exc:
+            logger.warning("Failed to load retrieval index artifact %s: %s", retrieval_index_file, exc)
+            debug["reason"] = f"retrieval_index_file_read_failed:{exc}"
+            return [], debug
+
+        raw_indexes = artifact_payload.get("retrieval_indexes") or artifact_payload.get("indexes") or []
+        if not isinstance(raw_indexes, list):
+            debug["reason"] = "retrieval_indexes_invalid"
+            return [], debug
+        debug["index_count"] = len(raw_indexes)
+
+        chunk_file = str((fallback_record or {}).get("chunk_file") or "").strip()
+        if not chunk_file:
+            debug["reason"] = "missing_chunk_file"
+            return [], debug
+        debug["chunk_file"] = chunk_file
+        chunk_path = self._resolve_chunk_file_path(chunk_file)
+        if chunk_path is None:
+            debug["reason"] = "chunk_file_not_found"
+            return [], debug
+        try:
+            with open(chunk_path, "r", encoding="utf-8") as handle:
+                chunk_payload = json.load(handle)
+        except Exception as exc:
+            logger.warning("Failed to load chunks for retrieval index artifact %s: %s", chunk_file, exc)
+            debug["reason"] = f"chunk_file_read_failed:{exc}"
+            return [], debug
+
+        chunks = chunk_payload.get("chunks") if isinstance(chunk_payload, dict) else []
+        if not isinstance(chunks, list):
+            debug["reason"] = "chunk_file_missing_chunks"
+            return [], debug
+        chunk_lookup = {
+            normalize_chunk_id(dict(chunk or {}), fallback_index=index): dict(chunk or {})
+            for index, chunk in enumerate(chunks, start=1)
+            if isinstance(chunk, dict)
+        }
+
+        rows: List[Dict[str, Any]] = []
+        missing_chunk_ids: Set[str] = set()
+        for index_payload in raw_indexes:
+            if not isinstance(index_payload, dict):
+                continue
+            retrieval_index = RetrievalIndex.from_dict(index_payload)
+            chunk = chunk_lookup.get(str(retrieval_index.chunk_id))
+            if chunk is None:
+                missing_chunk_ids.add(str(retrieval_index.chunk_id))
+                continue
+            metadata = dict(chunk.get("metadata", {}) or {})
+            retrieval_metadata = {
+                "index_id": retrieval_index.index_id,
+                "index_type": retrieval_index.index_type,
+                "index_text": retrieval_index.index_text,
+                "index_weight": float(retrieval_index.index_weight),
+                "retrieval_index_id": retrieval_index.index_id,
+                "retrieval_index_chunk_id": retrieval_index.chunk_id,
+                "retrieval_index_type": retrieval_index.index_type,
+                "retrieval_index_text": retrieval_index.index_text,
+                "retrieval_index_weight": float(retrieval_index.index_weight),
+                "retrieval_index_enabled_routes": list(retrieval_index.enabled_routes),
+                "retrieval_index_metadata": dict(retrieval_index.metadata),
+            }
+            # BM25 需要 index_text，但最终 evidence 仍读取原 chunk；这里把两层字段并存后交给 normalize_chunk。
+            row = {
+                **chunk,
+                **retrieval_metadata,
+                "metadata": {
+                    **metadata,
+                    **retrieval_metadata,
+                },
+            }
+            rows.append(row)
+
+        debug["row_count"] = len(rows)
+        debug["missing_chunk_ids"] = sorted(missing_chunk_ids)[:50]
+        if not rows:
+            debug["reason"] = debug["reason"] or "no_retrieval_index_rows"
+        elif missing_chunk_ids:
+            debug["reason"] = f"missing_chunk_ids:{len(missing_chunk_ids)}"
+        return rows, debug
+
+    def _load_legacy_chunk_rows(self, index_record: Optional[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """读取原始 chunk 文件作为旧 BM25 输入；只在灰度关闭 index-level BM25 时使用。"""
+        fallback_record = self._fallback_index_record(index_record)
+        debug: Dict[str, Any] = {
+            "enabled": bool(fallback_record),
+            "source": "legacy_chunk_file",
+            "index_level_bm25_enabled": False,
+            "chunk_file": "",
+            "row_count": 0,
+            "reason": "index_level_bm25_disabled",
+        }
+        chunk_file = str((fallback_record or {}).get("chunk_file") or "").strip()
+        if not chunk_file:
+            debug["reason"] = "missing_chunk_file"
+            return [], debug
+        debug["chunk_file"] = chunk_file
+
+        chunk_path = self._resolve_chunk_file_path(chunk_file)
+        if chunk_path is None:
+            debug["reason"] = "chunk_file_not_found"
+            return [], debug
+
+        try:
+            with open(chunk_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as exc:
+            logger.warning("Failed to load legacy chunks from chunk file %s: %s", chunk_path, exc)
+            debug["reason"] = f"chunk_file_read_failed:{exc}"
+            return [], debug
+
+        chunks = payload.get("chunks") if isinstance(payload, dict) else []
+        if not isinstance(chunks, list):
+            debug["reason"] = "chunk_file_missing_chunks"
+            return [], debug
+
+        rows = self._collapse_to_legacy_chunk_rows([chunk for chunk in chunks if isinstance(chunk, dict)])
+        debug["row_count"] = len(rows)
+        if not rows:
+            debug["reason"] = "no_legacy_chunk_rows"
+        return rows, debug
+
+    @staticmethod
+    def _collapse_to_legacy_chunk_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把 index-level 行折叠回 chunk 行，并清除 index 字段以触发旧 body index 合成。"""
+        legacy_index_keys = {
+            "index_id",
+            "index_type",
+            "index_text",
+            "index_weight",
+            "retrieval_index_id",
+            "retrieval_index_type",
+            "retrieval_index_text",
+            "retrieval_index_weight",
+            "retrieval_index_enabled_routes",
+            "retrieval_index_metadata",
+            "matched_index_id",
+            "matched_index_type",
+            "matched_index_text",
+            "matched_index_score",
+            "matched_indexes",
+        }
+        collapsed: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str, str, str, str]] = set()
+        for index, row in enumerate(rows, start=1):
+            if not isinstance(row, dict):
+                continue
+            metadata = dict(row.get("metadata", {}) or {})
+            chunk_key = (
+                normalize_chunk_id(row, fallback_index=index),
+                str(row.get("content_part_label") or metadata.get("content_part_label") or ""),
+                str(row.get("subchunk_index") or metadata.get("subchunk_index") or ""),
+                str(row.get("order_index") or metadata.get("order_index") or ""),
+                str(row.get("content") or metadata.get("content") or "")[:120],
+            )
+            if chunk_key in seen:
+                continue
+            seen.add(chunk_key)
+
+            legacy_row = {key: value for key, value in row.items() if key not in legacy_index_keys}
+            legacy_metadata = {key: value for key, value in metadata.items() if key not in legacy_index_keys}
+            if legacy_metadata:
+                legacy_row["metadata"] = legacy_metadata
+            elif "metadata" in legacy_row:
+                legacy_row["metadata"] = {}
+            collapsed.append(legacy_row)
+        return collapsed
+
     def _fallback_index_record(self, index_record: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """兼容测试夹具：未显式传入 paper_context 时，从 fake vector store 读取 chunk_file。"""
         if index_record:
@@ -449,31 +1579,12 @@ class CollectionRetrievalIndexProvider:
         index_records = getattr(self.vector_store_service, "index_records", None)
         if isinstance(index_records, dict):
             for record in index_records.values():
-                if isinstance(record, dict) and record.get("chunk_file"):
+                if isinstance(record, dict) and (record.get("chunk_file") or record.get("retrieval_index_file")):
                     return record
         return None
 
     def _resolve_chunk_file_path(self, chunk_file: str) -> Optional[Path]:
-        raw_path = Path(str(chunk_file or "").strip())
-        candidates = [raw_path]
-        backend_root = Path(__file__).resolve().parents[2]
-        repo_root = backend_root.parent
-        if not raw_path.is_absolute():
-            candidates.extend(
-                [
-                    Path(os.getcwd()) / raw_path,
-                    backend_root / raw_path,
-                    repo_root / raw_path,
-                ]
-            )
-        for candidate in candidates:
-            try:
-                resolved = candidate.resolve()
-            except OSError:
-                continue
-            if resolved.is_file():
-                return resolved
-        return None
+        return resolve_artifact_file_path(chunk_file)
 
     @staticmethod
     def _resolve_expected_count(
@@ -569,6 +1680,7 @@ class CollectionRetrievalIndexProvider:
             by_parent_subchunk={key: list(value) for key, value in index.by_parent_subchunk.items()},
             structured_tables=[dict(item) for item in index.structured_tables],
             table_structure_debug=dict(index.table_structure_debug),
+            retrieval_index_artifact_debug=dict(index.retrieval_index_artifact_debug),
             cache_hit=index.cache_hit,
             build_time=index.build_time,
             fallback_reason=index.fallback_reason,

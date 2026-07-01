@@ -77,7 +77,36 @@ class FakeEmbeddingService:
         input_data: Iterable[Any],
         _config: Optional[Any] = None,
     ) -> Tuple[list[dict[str, Any]], dict[str, Any]]:
-        normalized = list(input_data)
+        retrieval_indexes = []
+        if isinstance(input_data, dict):
+            chunks = list(input_data.get("chunks") or [])
+            retrieval_indexes = list(input_data.get("retrieval_indexes") or [])
+            chunk_lookup = {
+                str((chunk.get("metadata", {}) or {}).get("chunk_id") or chunk.get("chunk_id") or index): chunk
+                for index, chunk in enumerate(chunks, start=1)
+            }
+            # QA 索引构建现在按 RetrievalIndex 生成向量；fake 同步该输入形态，避免测试仍假设一 chunk 一向量。
+            if retrieval_indexes:
+                normalized = [
+                    {
+                        "content": str(index.get("index_text") or ""),
+                        "metadata": {
+                            **dict((chunk_lookup.get(str(index.get("chunk_id"))) or {}).get("metadata", {}) or {}),
+                            "content": (chunk_lookup.get(str(index.get("chunk_id"))) or {}).get("content", ""),
+                            "retrieval_index_id": index.get("index_id", ""),
+                            "retrieval_index_type": index.get("index_type", ""),
+                            "retrieval_index_text": index.get("index_text", ""),
+                            "retrieval_index_weight": index.get("index_weight", 1.0),
+                            "retrieval_index_enabled_routes": index.get("enabled_routes", []),
+                        },
+                    }
+                    for index in retrieval_indexes
+                    if str(index.get("index_text") or "").strip()
+                ]
+            else:
+                normalized = chunks
+        else:
+            normalized = list(input_data)
         rows: list[dict[str, Any]] = []
         for index, item in enumerate(normalized):
             if isinstance(item, dict):

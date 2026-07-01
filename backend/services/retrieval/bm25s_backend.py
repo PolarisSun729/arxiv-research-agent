@@ -10,7 +10,13 @@ import re
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
-from services.retrieval.keyword_backend import KeywordBackend, KeywordBackendResult
+from services.retrieval.keyword_backend import (
+    KeywordBackend,
+    KeywordBackendResult,
+    aggregate_keyword_index_hits_to_chunks,
+    build_keyword_matched_index_entry,
+    build_keyword_matched_terms,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +233,8 @@ class BM25sBackend(KeywordBackend):
                     per_query_top_rows.append(
                         {
                             "chunk_id": str(retrieval_index.documents[doc_id].chunk.get("chunk_id", "") or ""),
+                            "retrieval_index_id": retrieval_index.documents[doc_id].retrieval_index_id,
+                            "retrieval_index_type": retrieval_index.documents[doc_id].retrieval_index_type,
                             "rank": rank,
                             "raw_score": float(raw_score),
                             "normalized_score": normalized_score,
@@ -261,6 +269,8 @@ class BM25sBackend(KeywordBackend):
                 ),
                 reverse=True,
             )
+            # bm25s 的 corpus 仍是一条 index 一个 document；route 输出前必须聚合回 chunk，避免候选重复。
+            ranked = aggregate_keyword_index_hits_to_chunks(ranked, retrieval_index)
 
             if not ranked:
                 return KeywordBackendResult(
@@ -347,8 +357,8 @@ class BM25sBackend(KeywordBackend):
         # Create BM25 object
         bm25_index = bm25s.BM25()
 
-        # Index the corpus (bm25s expects tokenized texts)
-        bm25_index.index(corpus_texts)
+        # benchmark/接口会频繁构建小集合索引，关闭 bm25s 自带进度条，避免诊断输出被 tqdm 打散。
+        bm25_index.index(corpus_texts, show_progress=False)
 
         # Cache in retrieval_index
         retrieval_index._bm25s_index = bm25_index
@@ -368,6 +378,10 @@ class BM25sBackend(KeywordBackend):
 
         tokens: List[str] = []
         field_token_counts = document.field_token_counts or {"body": document.token_counts}
+        try:
+            index_weight = float(getattr(document, "retrieval_index_weight", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            index_weight = 1.0
 
         # Apply field weights by repeating tokens
         for field_name, field_counts in field_token_counts.items():
@@ -375,9 +389,9 @@ class BM25sBackend(KeywordBackend):
             if weight <= 0:
                 continue
 
-            # Repeat tokens based on weight (approximate field importance)
+            # bm25s 只能接收离散 token，低权重 index 仍保留至少一次匹配，避免 section_anchor 被取整吞掉。
             for token, count in field_counts.items():
-                weighted_count = int(round(count * weight))
+                weighted_count = max(1, int(round(count * weight * index_weight)))
                 tokens.extend([token] * weighted_count)
 
         return tokens if tokens else [""]
@@ -395,9 +409,17 @@ class BM25sBackend(KeywordBackend):
         if not query_tokens:
             return []
 
-        # Query bm25s (expects list of tokenized queries, i.e., [[tokens]])
-        # We only have one query, so wrap it in another list
-        results, scores = bm25s_index.retrieve([query_tokens], k=top_k)
+        effective_top_k = min(max(int(top_k or 0), 0), len(corpus_mapping))
+        if effective_top_k <= 0:
+            return []
+
+        # bm25s 要求 k 不能超过 corpus size；benchmark 小 fixture 会传较大的 recall_candidate_limit，
+        # 因此这里按真实索引规模截断，只影响候选上限，不改变 BM25 排序语义。
+        results, scores = bm25s_index.retrieve(
+            [query_tokens],
+            k=effective_top_k,
+            show_progress=False,
+        )
 
         # Convert to standard format
         query_results: List[Dict[str, Any]] = []
@@ -407,6 +429,9 @@ class BM25sBackend(KeywordBackend):
 
             doc_id = corpus_mapping[corpus_idx]
             if doc_id >= len(retrieval_index.documents):
+                continue
+            if float(score) <= 0:
+                # bm25s 会用 0 分候选补齐 top_k；这些不是关键词命中，不能进入后续 RRF 投票。
                 continue
 
             document = retrieval_index.documents[doc_id]
@@ -500,9 +525,12 @@ class BM25sBackend(KeywordBackend):
         for rank, ((doc_id, payload), normalized_score) in enumerate(
             zip(ranked[:top_k], normalized_scores[:top_k]), start=1
         ):
-            chunk = dict(retrieval_index.documents[doc_id].chunk)
+            document = retrieval_index.documents[doc_id]
+            chunk = dict(document.chunk)
             fusion_score = float(payload.get("fusion_score", 0.0) or 0.0)
             best_raw_score = float(payload.get("best_raw_score", 0.0) or 0.0)
+            top_matched_indexes = list(payload.get("top_matched_indexes", []) or [])
+            top_index = top_matched_indexes[0] if top_matched_indexes else build_keyword_matched_index_entry(document, payload)
 
             query_contributions = sorted(
                 list(payload.get("view_contributions", [])),
@@ -551,6 +579,23 @@ class BM25sBackend(KeywordBackend):
             chunk["keyword_query_sources"] = query_sources
             chunk["keyword_noise_flags"] = noise_flags
             chunk["keyword_base_route_confidence"] = float(base_route_confidence)
+            # 对外仍是 chunk candidate；index 字段只说明本次 BM25 最强命中入口。
+            chunk["retrieval_index_id"] = top_index.get("index_id", document.retrieval_index_id)
+            chunk["retrieval_index_type"] = top_index.get("index_type", document.retrieval_index_type)
+            chunk["retrieval_index_text"] = top_index.get("index_text", document.retrieval_index_text)
+            chunk["retrieval_index_weight"] = top_index.get("index_weight", document.retrieval_index_weight)
+            chunk["retrieval_index_enabled_routes"] = list(document.retrieval_index_enabled_routes)
+            chunk["index_id"] = chunk["retrieval_index_id"]
+            chunk["index_type"] = chunk["retrieval_index_type"]
+            chunk["index_text"] = chunk["retrieval_index_text"]
+            chunk["index_weight"] = chunk["retrieval_index_weight"]
+            chunk["matched_index_id"] = top_index.get("matched_index_id", chunk["retrieval_index_id"])
+            chunk["matched_index_type"] = top_index.get("matched_index_type", chunk["retrieval_index_type"])
+            chunk["matched_index_text"] = top_index.get("matched_index_text", chunk["retrieval_index_text"])
+            chunk["matched_index_score"] = top_index.get("matched_index_score", fusion_score)
+            chunk["matched_indexes"] = top_matched_indexes
+            chunk["keyword_top_matched_indexes"] = top_matched_indexes
+            chunk["keyword_matched_index_count"] = int(payload.get("matched_index_count", len(top_matched_indexes)) or 0)
             results.append(chunk)
 
         return results
@@ -577,11 +622,21 @@ class BM25sBackend(KeywordBackend):
             matched_chunks.append(
                 {
                     "chunk_id": str(retrieval_index.documents[doc_id].chunk.get("chunk_id", "") or ""),
+                    "retrieval_index_id": (payload.get("top_matched_indexes") or [{}])[0].get(
+                        "matched_index_id",
+                        retrieval_index.documents[doc_id].retrieval_index_id,
+                    ),
+                    "retrieval_index_type": (payload.get("top_matched_indexes") or [{}])[0].get(
+                        "matched_index_type",
+                        retrieval_index.documents[doc_id].retrieval_index_type,
+                    ),
                     "keyword_fusion_score": float(payload.get("fusion_score", 0.0) or 0.0),
                     "best_raw_bm25_score": float(payload.get("best_raw_score", 0.0) or 0.0),
                     "matched_fields": main_fields,
                     "matched_terms": matched_terms,
                     "query_sources": list(payload.get("query_sources", [])),
+                    "matched_index_count": int(payload.get("matched_index_count", 0) or 0),
+                    "top_matched_indexes": list(payload.get("top_matched_indexes", []) or []),
                     "noise_flags": self._detect_keyword_noise_flags(
                         matched_terms=matched_terms,
                         matched_fields=main_fields,
@@ -606,18 +661,7 @@ class BM25sBackend(KeywordBackend):
     @staticmethod
     def _build_matched_terms(term_traces: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Build matched terms list from term traces."""
-        matched = [
-            {
-                "token": str(trace.get("token", "")),
-                "idf": float(trace.get("idf", 0.0) or 0.0),
-                "term_score": float(trace.get("best_term_score", 0.0) or 0.0),
-                "fields": list(trace.get("fields", []) or []),
-                "query_sources": list(trace.get("query_sources", []) or []),
-            }
-            for trace in term_traces.values()
-        ]
-        matched.sort(key=lambda item: (item["term_score"], item["idf"]), reverse=True)
-        return matched
+        return build_keyword_matched_terms(term_traces)
 
     def _expand_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
         """Expand query tokens using query_tools."""

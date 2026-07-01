@@ -89,7 +89,7 @@ class RerankService:
             ]
             content = "\n".join(part for part in parts if part).strip()
             if content:
-                return self.limit_rerank_text(content, self.config_owner.llm_rerank_max_doc_chars)
+                return self._build_multi_index_rerank_document(chunk, content)
         content = self.limit_rerank_text(str(chunk.get("rerank_text", "") or ""), self.config_owner.llm_rerank_max_doc_chars)
         if not content:
             content = self.limit_rerank_text(str(chunk.get("content", "") or ""), self.config_owner.llm_rerank_max_doc_chars)
@@ -101,7 +101,86 @@ class RerankService:
             normalized_content = self.query_normalizer(content)
             if normalized_title and normalized_title not in normalized_content[: max(len(normalized_title), 1) * 2]:
                 content = f"{section_title}\n{content}".strip()
-        return self.limit_rerank_text(content, self.config_owner.llm_rerank_max_doc_chars)
+        return self._build_multi_index_rerank_document(chunk, content)
+
+    def _build_multi_index_rerank_document(self, chunk: Dict[str, object], evidence_text: str) -> str:
+        """把 index 命中摘要拼到 rerank 输入头部，同时保留 chunk 原始证据作为主体。"""
+        max_chars = max(1, int(self.config_owner.llm_rerank_max_doc_chars or 4096))
+        prefix_parts: List[str] = []
+        section_path = str(chunk.get("section_path", "") or "").strip()
+        section_title = str(chunk.get("section_title", "") or "").strip()
+        chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
+        match_type = str(chunk.get("asset_section_match_type", "") or "").strip()
+        allow_section_anchor = bool(chunk.get("asset_section_match_allow_embedding")) if match_type else True
+        # 图表弱章节锚点已由上游判定不可入 embedding/rerank 时，摘要头也不能重新暴露该章节文本。
+        if (section_path or section_title) and not (chunk_type in {"figure", "table"} and not allow_section_anchor):
+            prefix_parts.append(f"Section: {section_path or section_title}")
+        matched_index_summary = self._matched_indexes_rerank_summary(chunk)
+        if matched_index_summary:
+            # matched index 是召回解释，不是最终证据；rerank 仍必须看到完整 chunk evidence。
+            prefix_parts.append(f"Matched retrieval indexes:\n{matched_index_summary}")
+        if not prefix_parts:
+            return self.limit_rerank_text(evidence_text, max_chars)
+
+        prefix = "\n".join(prefix_parts).strip()
+        evidence_header = "Chunk evidence:"
+        evidence_budget = max(1, max_chars - len(prefix) - len(evidence_header) - 2)
+        evidence = self.limit_rerank_text(evidence_text, evidence_budget)
+        return self.limit_rerank_text(f"{prefix}\n{evidence_header}\n{evidence}", max_chars)
+
+    def _matched_indexes_rerank_summary(self, chunk: Dict[str, object], *, limit: int = 3) -> str:
+        rows = self._matched_index_rows_for_rerank(chunk)
+        if not rows:
+            return ""
+        lines: List[str] = []
+        for row in rows[: max(1, limit)]:
+            index_type = str(row.get("matched_index_type") or row.get("index_type") or "body")
+            index_id = str(row.get("matched_index_id") or row.get("index_id") or "")
+            score = row.get("matched_index_score")
+            score_text = ""
+            try:
+                if score is not None:
+                    score_text = f" score={float(score):.4f}"
+            except (TypeError, ValueError):
+                score_text = ""
+            text_preview = self.limit_rerank_text(
+                str(row.get("matched_index_text") or row.get("index_text") or ""),
+                240,
+            )
+            lines.append(f"- type={index_type} id={index_id}{score_text}: {text_preview}".strip())
+        return "\n".join(line for line in lines if line)
+
+    def _matched_index_rows_for_rerank(self, chunk: Dict[str, object]) -> List[Dict[str, Any]]:
+        raw_rows = [row for row in (chunk.get("matched_indexes") or []) if isinstance(row, dict)]
+        if not raw_rows and (chunk.get("matched_index_id") or chunk.get("retrieval_index_id") or chunk.get("index_id")):
+            # 旧路径只有主 index 字段时合成一行，保证 rerank/debug 仍能展示命中入口。
+            raw_rows = [
+                {
+                    "matched_index_id": chunk.get("matched_index_id") or chunk.get("retrieval_index_id") or chunk.get("index_id"),
+                    "matched_index_type": chunk.get("matched_index_type") or chunk.get("retrieval_index_type") or chunk.get("index_type"),
+                    "matched_index_text": chunk.get("matched_index_text") or chunk.get("retrieval_index_text") or chunk.get("index_text"),
+                    "matched_index_score": chunk.get("matched_index_score") or chunk.get("route_score") or chunk.get("score"),
+                }
+            ]
+        deduped: List[Dict[str, Any]] = []
+        seen_ids = set()
+        for row in raw_rows:
+            index_id = str(row.get("matched_index_id") or row.get("index_id") or "")
+            if index_id and index_id in seen_ids:
+                continue
+            if index_id:
+                seen_ids.add(index_id)
+            deduped.append(dict(row))
+        deduped.sort(
+            key=lambda row: self._score_value(
+                row.get("weighted_index_score"),
+                row.get("matched_index_score"),
+                row.get("bm25_fusion_score"),
+                row.get("best_raw_bm25_score"),
+            ),
+            reverse=True,
+        )
+        return deduped
 
     def llm_rerank(
         self,
@@ -527,6 +606,8 @@ class RerankService:
             "rerank_document_preview": chunk.get("llm_rerank_document_preview", "")[: ENHANCED_RETRIEVAL_CONFIG["preview_text_limit"]],
             "section_tags": chunk.get("section_tags", []),
             "source_query": chunk.get("source_query", ""),
+            "matched_index_types": chunk.get("matched_index_types", []),
+            "matched_indexes": self._matched_index_rows_for_rerank(chunk)[:3],
         }
 
     def _build_tail_chunks(self, chunks: List[Dict[str, Any]], rerank_limit: int, *, model_name: Optional[str]) -> List[Dict[str, Any]]:
@@ -618,6 +699,17 @@ class RerankService:
     def limit_rerank_text(text: str, max_chars: int) -> str:
         normalized = re.sub(r"\s+", " ", text or "").strip()
         return normalized if len(normalized) <= max_chars else normalized[:max_chars].rstrip()
+
+    @staticmethod
+    def _score_value(*values: Any) -> float:
+        for value in values:
+            if value is None or value == "":
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
 
     def log_rerank_inputs(
         self,

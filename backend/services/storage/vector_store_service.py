@@ -199,6 +199,34 @@ class VectorStoreService:
         except Exception as e:
             logger.error(f"Error loading embeddings from {file_path}: {str(e)}")
             raise
+
+    @staticmethod
+    def _serialize_json_list(value: Any) -> str:
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return "[]"
+            if raw.startswith("["):
+                return raw
+            return json.dumps([item.strip() for item in re.split(r"[,|]", raw) if item.strip()], ensure_ascii=False)
+        if isinstance(value, (list, tuple, set)):
+            return json.dumps([str(item).strip() for item in value if str(item).strip()], ensure_ascii=False)
+        return "[]"
+
+    @staticmethod
+    def _parse_json_list(value: Any) -> List[str]:
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        raw = str(value or "").strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except json.JSONDecodeError:
+            pass
+        return [item.strip() for item in re.split(r"[,|]", raw) if item.strip()]
     
     def _index_to_milvus(self, embeddings_data: Dict[str, Any], config: VectorDBConfig) -> Dict[str, Any]:
         """
@@ -246,6 +274,15 @@ class VectorStoreService:
                 {"name": "id", "dtype": "INT64", "is_primary": True, "auto_id": True},
                 {"name": "content", "dtype": "VARCHAR", "max_length": CONTENT_MAX_LENGTH},
                 {"name": "rerank_text", "dtype": "VARCHAR", "max_length": RERANK_TEXT_MAX_LENGTH},
+                {"name": "index_id", "dtype": "VARCHAR", "max_length": 192},
+                {"name": "index_type", "dtype": "VARCHAR", "max_length": 32},
+                {"name": "index_text", "dtype": "VARCHAR", "max_length": CONTENT_MAX_LENGTH},
+                {"name": "index_weight", "dtype": "DOUBLE"},
+                {"name": "retrieval_index_id", "dtype": "VARCHAR", "max_length": 192},
+                {"name": "retrieval_index_type", "dtype": "VARCHAR", "max_length": 32},
+                {"name": "retrieval_index_text", "dtype": "VARCHAR", "max_length": CONTENT_MAX_LENGTH},
+                {"name": "retrieval_index_weight", "dtype": "DOUBLE"},
+                {"name": "retrieval_index_enabled_routes", "dtype": "VARCHAR", "max_length": 512},
                 {"name": "chunk_type", "dtype": "VARCHAR", "max_length": 24},
                 {"name": "asset_kind", "dtype": "VARCHAR", "max_length": 24},
                 {"name": "asset_path", "dtype": "VARCHAR", "max_length": ASSET_PATH_MAX_LENGTH},
@@ -302,6 +339,10 @@ class VectorStoreService:
                 metadata = emb["metadata"]
                 content = str(metadata.get("content", ""))
                 rerank_text = str(metadata.get("rerank_text", ""))
+                index_id = str(metadata.get("index_id") or metadata.get("retrieval_index_id") or "")
+                index_type = str(metadata.get("index_type") or metadata.get("retrieval_index_type") or "body")
+                index_text = str(metadata.get("index_text") or metadata.get("retrieval_index_text") or "")
+                index_weight = float(metadata.get("index_weight", metadata.get("retrieval_index_weight", 1.0)) or 1.0)
                 parent_chunk_id = int(metadata.get("parent_chunk_id", metadata.get("chunk_id", metadata.get("chunk_index", 0))))
                 original_chunk_id = int(metadata.get("original_chunk_id", parent_chunk_id))
                 subchunk_index = int(metadata.get("subchunk_index", 1))
@@ -320,6 +361,18 @@ class VectorStoreService:
                 entity = {
                     "content": content,
                     "rerank_text": rerank_text,
+                    # index_* 是新的 index-level 合约字段；retrieval_index_* 暂时保留，避免旧调用方立刻失效。
+                    "index_id": index_id,
+                    "index_type": index_type,
+                    "index_text": index_text,
+                    "index_weight": index_weight,
+                    "retrieval_index_id": index_id,
+                    "retrieval_index_type": index_type,
+                    "retrieval_index_text": index_text,
+                    "retrieval_index_weight": index_weight,
+                    "retrieval_index_enabled_routes": self._serialize_json_list(
+                        metadata.get("retrieval_index_enabled_routes", [])
+                    ),
                     "chunk_type": str(metadata.get("chunk_type", "text") or "text"),
                     "asset_kind": str(metadata.get("asset_kind", "") or ""),
                     "asset_path": str(metadata.get("asset_path", "") or ""),
@@ -414,6 +467,8 @@ class VectorStoreService:
                 {key: value for key, value in entity.items() if key in insertable_fields}
                 for entity in entities
             ]
+            # Milvus 只保存可检索 preview 字段，完整 index_text 已落在 retrieval index artifact / embedding 文件中。
+            normalized_entities = self._truncate_entities_to_varchar_limits(normalized_entities, fields)
             self._validate_varchar_lengths(normalized_entities, fields)
             insert_result = client.insert(
                 collection_name=collection_name,
@@ -429,18 +484,41 @@ class VectorStoreService:
             logger.error(f"Error indexing to Milvus: {str(e)}")
             raise
 
-    def _validate_varchar_lengths(self, entities: List[Dict[str, Any]], fields: List[Any]) -> None:
+    @staticmethod
+    def _is_varchar_field(field: Any) -> bool:
+        dtype = (
+            (field.get("dtype") or field.get("type"))
+            if isinstance(field, dict)
+            else (getattr(field, "dtype", None) or getattr(field, "type", None))
+        )
         varchar_type = getattr(DataType.VARCHAR, "value", DataType.VARCHAR)
+        if dtype == DataType.VARCHAR or dtype == varchar_type:
+            return True
+        dtype_text = str(getattr(dtype, "name", dtype) or "").upper()
+        return "VARCHAR" in dtype_text or "VAR_CHAR" in dtype_text
+
+    @staticmethod
+    def _varchar_max_length(field: Any) -> Optional[int]:
+        if isinstance(field, dict):
+            raw_value = field.get("max_length") or (field.get("params", {}) or {}).get("max_length")
+        else:
+            raw_value = getattr(field, "max_length", None)
+            if raw_value is None:
+                raw_value = (getattr(field, "params", {}) or {}).get("max_length")
+        if raw_value in (None, ""):
+            return None
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError):
+            return None
+
+    def _validate_varchar_lengths(self, entities: List[Dict[str, Any]], fields: List[Any]) -> None:
         varchar_limits = {
             (field.get("name") if isinstance(field, dict) else getattr(field, "name", "")): (
-                (field.get("params", {}) or {}).get("max_length")
-                if isinstance(field, dict)
-                else getattr(field, "max_length", None)
+                self._varchar_max_length(field)
             )
             for field in fields
-            if (
-                (field.get("type") if isinstance(field, dict) else getattr(field, "dtype", None)) == varchar_type
-            )
+            if self._is_varchar_field(field)
         }
 
         violations = []
@@ -480,17 +558,12 @@ class VectorStoreService:
         return ""
 
     def _truncate_entities_to_varchar_limits(self, entities: List[Dict[str, Any]], fields: List[Any]) -> List[Dict[str, Any]]:
-        varchar_type = getattr(DataType.VARCHAR, "value", DataType.VARCHAR)
         varchar_limits = {
             (field.get("name") if isinstance(field, dict) else getattr(field, "name", "")): (
-                (field.get("params", {}) or {}).get("max_length")
-                if isinstance(field, dict)
-                else getattr(field, "max_length", None)
+                self._varchar_max_length(field)
             )
             for field in fields
-            if (
-                (field.get("type") if isinstance(field, dict) else getattr(field, "dtype", None)) == varchar_type
-            )
+            if self._is_varchar_field(field)
         }
 
         normalized_entities: List[Dict[str, Any]] = []
@@ -683,6 +756,15 @@ class VectorStoreService:
             candidate_fields = [
                 "content",
                 "rerank_text",
+                "index_id",
+                "index_type",
+                "index_text",
+                "index_weight",
+                "retrieval_index_id",
+                "retrieval_index_type",
+                "retrieval_index_text",
+                "retrieval_index_weight",
+                "retrieval_index_enabled_routes",
                 "chunk_type",
                 "asset_kind",
                 "asset_path",
@@ -900,6 +982,15 @@ class VectorStoreService:
                 "id",
                 "content",
                 "rerank_text",
+                "index_id",
+                "index_type",
+                "index_text",
+                "index_weight",
+                "retrieval_index_id",
+                "retrieval_index_type",
+                "retrieval_index_text",
+                "retrieval_index_weight",
+                "retrieval_index_enabled_routes",
                 "chunk_type",
                 "asset_kind",
                 "asset_path",
@@ -981,6 +1072,11 @@ class VectorStoreService:
 
         content = getter("content", "") or ""
         rerank_text = getter("rerank_text", "") or ""
+        retrieval_index_id = getter("retrieval_index_id", "") or getter("index_id", "") or ""
+        retrieval_index_type = getter("retrieval_index_type", "") or getter("index_type", "") or ""
+        retrieval_index_text = getter("retrieval_index_text", "") or getter("index_text", "") or ""
+        retrieval_index_weight = getter("retrieval_index_weight", getter("index_weight", 1.0))
+        retrieval_index_enabled_routes = self._parse_json_list(getter("retrieval_index_enabled_routes", ""))
         chunk_type = getter("chunk_type", "text") or "text"
         asset_kind = getter("asset_kind", "") or ""
         asset_path = getter("asset_path", "") or ""
@@ -1026,6 +1122,14 @@ class VectorStoreService:
             page_number = str(page_start)
         if chunk_index is None and chunk_id is not None:
             chunk_index = chunk_id
+        if not retrieval_index_id:
+            chunk_ref = parent_chunk_id or original_chunk_id or chunk_id or chunk_index or 0
+            # 旧 chunk-level collection 没有 index 字段；这里合成 body index，保证检索输出仍满足统一 index 合约。
+            retrieval_index_id = f"{chunk_ref}:body:legacy"
+            retrieval_index_type = "body"
+            retrieval_index_text = str(content or "")
+            retrieval_index_weight = 1.0
+        matched_index_score = score
 
         metadata = {
             "source": source,
@@ -1037,6 +1141,19 @@ class VectorStoreService:
             "total_chunks": int(getter("total_chunks", 0) or 0),
             "word_count": int(getter("word_count", 0) or 0),
             "rerank_text": str(rerank_text or ""),
+            "index_id": str(retrieval_index_id or ""),
+            "index_type": str(retrieval_index_type or ""),
+            "index_text": str(retrieval_index_text or ""),
+            "index_weight": float(retrieval_index_weight or 1.0),
+            "retrieval_index_id": str(retrieval_index_id or ""),
+            "retrieval_index_type": str(retrieval_index_type or ""),
+            "retrieval_index_text": str(retrieval_index_text or ""),
+            "retrieval_index_weight": float(retrieval_index_weight or 1.0),
+            "retrieval_index_enabled_routes": list(retrieval_index_enabled_routes),
+            "matched_index_id": str(retrieval_index_id or ""),
+            "matched_index_type": str(retrieval_index_type or ""),
+            "matched_index_text": str(retrieval_index_text or ""),
+            "matched_index_score": matched_index_score,
             "chunk_type": str(chunk_type or "text"),
             "asset_kind": str(asset_kind or ""),
             "asset_path": str(asset_path or ""),
@@ -1076,6 +1193,19 @@ class VectorStoreService:
             "text": content,
             "content": content,
             "rerank_text": metadata["rerank_text"],
+            "index_id": metadata["index_id"],
+            "index_type": metadata["index_type"],
+            "index_text": metadata["index_text"],
+            "index_weight": metadata["index_weight"],
+            "retrieval_index_id": metadata["retrieval_index_id"],
+            "retrieval_index_type": metadata["retrieval_index_type"],
+            "retrieval_index_text": metadata["retrieval_index_text"],
+            "retrieval_index_weight": metadata["retrieval_index_weight"],
+            "retrieval_index_enabled_routes": metadata["retrieval_index_enabled_routes"],
+            "matched_index_id": metadata["matched_index_id"],
+            "matched_index_type": metadata["matched_index_type"],
+            "matched_index_text": metadata["matched_index_text"],
+            "matched_index_score": metadata["matched_index_score"],
             "chunk_type": metadata["chunk_type"],
             "asset_kind": metadata["asset_kind"],
             "asset_path": metadata["asset_path"],

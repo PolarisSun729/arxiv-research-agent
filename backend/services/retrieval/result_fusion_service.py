@@ -51,6 +51,7 @@ class ResultFusionService:
         for route_name, route_results in routes.items():
             weight = route_weights.get(route_name, self.route_weights.get(route_name, 1.0))
             for rank, item in enumerate(route_results):
+                item = self.with_matched_index_fields(item, route_name=route_name)
                 chunk_key = self.chunk_unique_key(item)
                 route_confidence = float(item.get("route_confidence", 1.0) or 1.0)
                 entry = aggregated.setdefault(
@@ -62,6 +63,7 @@ class ResultFusionService:
                         "route_scores": {},
                         "route_confidences": {},
                         "source_queries": [],
+                        "matched_indexes": [],
                     },
                 )
                 # RRF 投票只依赖 route 排名、route 权重和 route confidence，避免提前混入 rerank 语义。
@@ -71,6 +73,11 @@ class ResultFusionService:
                 entry["matched_routes"].append(route_name)
                 entry["route_scores"][route_name] = item.get("route_score")
                 entry["route_confidences"][route_name] = route_confidence
+                entry["matched_indexes"] = self.merge_matched_indexes(
+                    entry.get("matched_indexes", []),
+                    item,
+                    route_name=route_name,
+                )
                 # 融合结果如果命中了结构化表格证据，主路由应指向 table_structured，方便下游调试与断言看到真实证据来源。
                 if route_name == "table_structured" and item.get("table_structured_evidence"):
                     entry["retrieval_route"] = "table_structured"
@@ -105,24 +112,40 @@ class ResultFusionService:
 
     def dedupe_preserve_order(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         deduped = []
-        seen = set()
+        seen: Dict[str, Dict[str, Any]] = {}
         for item in items:
+            item = self.with_matched_index_fields(item)
             key = self.chunk_unique_key(item)
             if key in seen:
+                seen[key]["matched_indexes"] = self.merge_matched_indexes(
+                    seen[key].get("matched_indexes", []),
+                    item,
+                    route_name=item.get("retrieval_route"),
+                )
                 continue
-            seen.add(key)
-            deduped.append(item)
+            normalized = dict(item)
+            normalized["matched_indexes"] = self.merge_matched_indexes([], normalized, route_name=normalized.get("retrieval_route"))
+            seen[key] = normalized
+            deduped.append(normalized)
         return deduped
 
     def dedupe_route_results(self, route_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         deduped: List[Dict[str, Any]] = []
-        seen: set[str] = set()
+        seen: Dict[str, Dict[str, Any]] = {}
         for item in route_results:
+            item = self.with_matched_index_fields(item)
             key = self.chunk_unique_key(item)
             if key in seen:
+                seen[key]["matched_indexes"] = self.merge_matched_indexes(
+                    seen[key].get("matched_indexes", []),
+                    item,
+                    route_name=item.get("retrieval_route"),
+                )
                 continue
-            seen.add(key)
-            deduped.append(dict(item))
+            normalized = dict(item)
+            normalized["matched_indexes"] = self.merge_matched_indexes([], normalized, route_name=normalized.get("retrieval_route"))
+            seen[key] = normalized
+            deduped.append(normalized)
         return deduped
 
     def build_raw_retrieval_top_n(
@@ -137,6 +160,120 @@ class ResultFusionService:
                 if len(raw_results) >= limit:
                     return raw_results[:limit]
         return raw_results[:limit]
+
+    @staticmethod
+    def with_matched_index_fields(item: Dict[str, Any], route_name: Any = None) -> Dict[str, Any]:
+        normalized = dict(item)
+        matched_index_id = (
+            normalized.get("matched_index_id")
+            or normalized.get("retrieval_index_id")
+            or normalized.get("index_id")
+            or ""
+        )
+        matched_index_type = (
+            normalized.get("matched_index_type")
+            or normalized.get("retrieval_index_type")
+            or normalized.get("index_type")
+            or ""
+        )
+        matched_index_text = (
+            normalized.get("matched_index_text")
+            or normalized.get("retrieval_index_text")
+            or normalized.get("index_text")
+            or ""
+        )
+        if not matched_index_id:
+            chunk_ref = normalized.get("parent_chunk_id") or normalized.get("original_chunk_id") or normalized.get("chunk_id") or 0
+            # 旧 chunk-level 结果没有 index 字段，融合层合成 body index，保证外部结果始终有命中入口。
+            matched_index_id = f"{chunk_ref}:body:legacy"
+            matched_index_type = "body"
+            matched_index_text = str(normalized.get("content") or normalized.get("text") or "")
+        matched_index_score = normalized.get("matched_index_score", normalized.get("route_score", normalized.get("score")))
+        normalized["index_id"] = normalized.get("index_id") or matched_index_id
+        normalized["index_type"] = normalized.get("index_type") or matched_index_type
+        normalized["index_text"] = normalized.get("index_text") or matched_index_text
+        normalized["index_weight"] = normalized.get("index_weight") or normalized.get("retrieval_index_weight", 1.0)
+        normalized["retrieval_index_id"] = normalized.get("retrieval_index_id") or matched_index_id
+        normalized["retrieval_index_type"] = normalized.get("retrieval_index_type") or matched_index_type
+        normalized["retrieval_index_text"] = normalized.get("retrieval_index_text") or matched_index_text
+        normalized["retrieval_index_weight"] = normalized.get("retrieval_index_weight") or normalized.get("index_weight", 1.0)
+        normalized["matched_index_id"] = matched_index_id
+        normalized["matched_index_type"] = matched_index_type
+        normalized["matched_index_text"] = matched_index_text
+        normalized["matched_index_score"] = matched_index_score
+        if route_name and not normalized.get("retrieval_route"):
+            normalized["retrieval_route"] = route_name
+        return normalized
+
+    @classmethod
+    def merge_matched_indexes(
+        cls,
+        current: List[Dict[str, Any]],
+        item: Dict[str, Any],
+        *,
+        route_name: Any = None,
+    ) -> List[Dict[str, Any]]:
+        merged = [dict(row) for row in (current or []) if isinstance(row, dict)]
+        normalized = cls.with_matched_index_fields(item, route_name=route_name)
+        source_indexes = [
+            row for row in normalized.get("matched_indexes", []) or []
+            if isinstance(row, dict)
+        ]
+        if source_indexes:
+            # keyword route 可能已经聚合了同一 chunk 的多个 index 命中；融合层需要保留这些明细。
+            for source_index in source_indexes:
+                merged = cls._merge_single_matched_index(
+                    merged,
+                    {**normalized, **source_index},
+                    route_name=route_name,
+                )
+            return merged
+        merged = cls._merge_single_matched_index(merged, normalized, route_name=route_name)
+        return merged
+
+    @classmethod
+    def _merge_single_matched_index(
+        cls,
+        merged: List[Dict[str, Any]],
+        item: Dict[str, Any],
+        *,
+        route_name: Any = None,
+    ) -> List[Dict[str, Any]]:
+        """合并单条 index 命中，保持 route/source 去重逻辑集中在一个位置。"""
+        normalized = cls.with_matched_index_fields(item, route_name=route_name)
+        index_id = str(normalized.get("matched_index_id") or "")
+        if not index_id:
+            return merged
+        entry = {
+            "matched_index_id": index_id,
+            "matched_index_type": str(normalized.get("matched_index_type") or ""),
+            "matched_index_text": str(normalized.get("matched_index_text") or ""),
+            "matched_index_score": normalized.get("matched_index_score"),
+            "retrieval_route": str(route_name or normalized.get("retrieval_route") or ""),
+            "source_query": str(normalized.get("source_query") or ""),
+        }
+        for existing in merged:
+            if existing.get("matched_index_id") != index_id:
+                continue
+            route = entry["retrieval_route"]
+            if route:
+                routes = list(existing.get("retrieval_routes") or [])
+                if route not in routes:
+                    routes.append(route)
+                existing["retrieval_routes"] = routes
+            source_query = entry["source_query"]
+            if source_query:
+                source_queries = list(existing.get("source_queries") or [])
+                if source_query not in source_queries:
+                    source_queries.append(source_query)
+                existing["source_queries"] = source_queries
+            if existing.get("matched_index_score") is None:
+                existing["matched_index_score"] = entry["matched_index_score"]
+            return merged
+        entry["retrieval_routes"] = [entry["retrieval_route"]] if entry["retrieval_route"] else []
+        entry["source_queries"] = [entry["source_query"]] if entry["source_query"] else []
+        merged.append(entry)
+        return merged
 
     @staticmethod
     def _table_structured_vote_multiplier(route_name: str, item: Dict[str, Any]) -> float:

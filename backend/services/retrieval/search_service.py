@@ -211,6 +211,15 @@ class SearchService:
             field_names = {field.name for field in collection.schema.fields}
             candidate_output_fields = [
                 "content",
+                "index_id",
+                "index_type",
+                "index_text",
+                "index_weight",
+                "retrieval_index_id",
+                "retrieval_index_type",
+                "retrieval_index_text",
+                "retrieval_index_weight",
+                "retrieval_index_enabled_routes",
                 "document_name",
                 "source",
                 "chunk_type",
@@ -266,13 +275,63 @@ class SearchService:
                     if hit.score >= threshold:
                         page_start = getattr(hit.entity, "page_start", "")
                         page_end = getattr(hit.entity, "page_end", "")
+                        matched_index_id = str(
+                            getattr(hit.entity, "retrieval_index_id", "")
+                            or getattr(hit.entity, "index_id", "")
+                            or ""
+                        )
+                        matched_index_type = str(
+                            getattr(hit.entity, "retrieval_index_type", "")
+                            or getattr(hit.entity, "index_type", "")
+                            or ""
+                        )
+                        matched_index_text = str(
+                            getattr(hit.entity, "retrieval_index_text", "")
+                            or getattr(hit.entity, "index_text", "")
+                            or ""
+                        )
+                        matched_index_weight = float(
+                            getattr(
+                                hit.entity,
+                                "retrieval_index_weight",
+                                getattr(hit.entity, "index_weight", 1.0),
+                            )
+                            or 1.0
+                        )
+                        if not matched_index_id:
+                            # 旧 collection 只有 chunk 级向量时，按 body index 合成命中入口，避免调用方再做双协议判断。
+                            chunk_ref = getattr(hit.entity, "parent_chunk_id", None) or getattr(hit.entity, "chunk_id", 0)
+                            matched_index_id = f"{chunk_ref}:body:legacy"
+                            matched_index_type = "body"
+                            matched_index_text = str(hit.entity.content or "")
+                            matched_index_weight = 1.0
                         # 把页码、chunk 序号和来源一起返回，前端展示和 QA 回答都能直接使用。
                         processed_results.append({
                             "text": hit.entity.content,
                             "score": float(hit.score),
+                            "index_id": matched_index_id,
+                            "index_type": matched_index_type,
+                            "index_text": matched_index_text,
+                            "index_weight": matched_index_weight,
+                            "matched_index_id": matched_index_id,
+                            "matched_index_type": matched_index_type,
+                            "matched_index_text": matched_index_text,
+                            "matched_index_score": float(hit.score),
                             "metadata": {
                                 "source": getattr(hit.entity, "source", "") or hit.entity.document_name,
                                 "document_name": hit.entity.document_name,
+                                "index_id": matched_index_id,
+                                "index_type": matched_index_type,
+                                "index_text": matched_index_text,
+                                "index_weight": matched_index_weight,
+                                "retrieval_index_id": matched_index_id,
+                                "retrieval_index_type": matched_index_type,
+                                "retrieval_index_text": matched_index_text,
+                                "retrieval_index_weight": matched_index_weight,
+                                "matched_index_id": matched_index_id,
+                                "matched_index_type": matched_index_type,
+                                "matched_index_text": matched_index_text,
+                                "matched_index_score": float(hit.score),
                                 "page": hit.entity.page_number,
                                 "page_start": page_start,
                                 "page_end": page_end,

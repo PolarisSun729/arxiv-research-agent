@@ -174,6 +174,10 @@ class PaperQAService:
                 "cleanup_pending_count": cleanup_pending_count,
                 "pdf_path": qa_index.get("pdf_path"),
                 "chunk_file": qa_index.get("chunk_file"),
+                "retrieval_index_file": qa_index.get("retrieval_index_file"),
+                "retrieval_index_count": qa_index.get("retrieval_index_count"),
+                "retrieval_index_types": qa_index.get("retrieval_index_types"),
+                "retrieval_index_version": qa_index.get("retrieval_index_version"),
                 "embedding_file": qa_index.get("embedding_file"),
                 "loading_method": qa_index.get("loading_method"),
                 "chunking_strategy": qa_index.get("chunking_strategy"),
@@ -279,6 +283,11 @@ class PaperQAService:
             # 检索画像用 DB index record 校验缓存是否还匹配当前 active collection。
             "chunk_count": qa_index.get("chunk_count", 0),
             "embedding_model": qa_index.get("embedding_model", ""),
+            "chunk_file": qa_index.get("chunk_file", ""),
+            "retrieval_index_file": qa_index.get("retrieval_index_file", ""),
+            "retrieval_index_count": qa_index.get("retrieval_index_count", 0),
+            "retrieval_index_types": qa_index.get("retrieval_index_types", ""),
+            "retrieval_index_version": qa_index.get("retrieval_index_version", ""),
             "active_build_id": qa_index.get("active_build_id"),
             "active_index_version": qa_index.get("active_index_version"),
         }

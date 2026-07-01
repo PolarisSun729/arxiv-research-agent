@@ -802,6 +802,27 @@ class RetrievalRules:
 
         chunk["content"] = item.get("content") or item.get("text") or metadata.get("content") or metadata.get("text") or ""
         chunk["text"] = chunk["content"]
+        # retrieval_index_* 描述本次召回命中的入口文本，必须和原 chunk 字段并存，不能覆盖最终证据内容。
+        chunk["retrieval_index_id"] = item.get("retrieval_index_id") or item.get("index_id") or metadata.get("retrieval_index_id", metadata.get("index_id", ""))
+        chunk["retrieval_index_type"] = item.get("retrieval_index_type") or item.get("index_type") or metadata.get("retrieval_index_type", metadata.get("index_type", ""))
+        chunk["retrieval_index_text"] = item.get("retrieval_index_text") or item.get("index_text") or metadata.get("retrieval_index_text", metadata.get("index_text", ""))
+        chunk["retrieval_index_weight"] = item.get("retrieval_index_weight") or item.get("index_weight") or metadata.get("retrieval_index_weight", metadata.get("index_weight", 1.0))
+        chunk["retrieval_index_enabled_routes"] = item.get("retrieval_index_enabled_routes") or metadata.get("retrieval_index_enabled_routes", [])
+        # matched_index_* 描述“本次命中的检索入口”，和 chunk.content 的最终证据职责分离，方便 trace 解释同一 chunk 的多入口命中。
+        if not chunk["retrieval_index_id"]:
+            legacy_chunk_ref = item.get("parent_chunk_id") or metadata.get("parent_chunk_id") or item.get("chunk_id") or metadata.get("chunk_id", 0)
+            chunk["retrieval_index_id"] = f"{legacy_chunk_ref}:body:legacy"
+            chunk["retrieval_index_type"] = "body"
+            chunk["retrieval_index_text"] = chunk["content"]
+            chunk["retrieval_index_weight"] = 1.0
+        chunk["index_id"] = chunk["retrieval_index_id"]
+        chunk["index_type"] = chunk["retrieval_index_type"]
+        chunk["index_text"] = chunk["retrieval_index_text"]
+        chunk["index_weight"] = chunk["retrieval_index_weight"]
+        chunk["matched_index_id"] = item.get("matched_index_id") or metadata.get("matched_index_id") or chunk["retrieval_index_id"]
+        chunk["matched_index_type"] = item.get("matched_index_type") or metadata.get("matched_index_type") or chunk["retrieval_index_type"]
+        chunk["matched_index_text"] = item.get("matched_index_text") or metadata.get("matched_index_text") or chunk["retrieval_index_text"]
+        chunk["matched_index_score"] = item.get("matched_index_score", metadata.get("matched_index_score", item.get("score")))
         chunk["source"] = item.get("source") or metadata.get("source", "")
         chunk["document_name"] = item.get("document_name") or metadata.get("document_name", "")
         chunk["chunk_id"] = item.get("chunk_id") or metadata.get("chunk_id", 0)

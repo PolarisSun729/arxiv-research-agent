@@ -248,6 +248,14 @@ ENHANCED_RETRIEVAL_CONFIG = {
     "final_context_top_k": 15,
     "max_final_context_top_k": 30,
     "enable_context_expansion": True,
+    # 灰度开关：开启后 dense embedding 按 retrieval index 生成；关闭时回退旧 chunk.content 向量。
+    "enable_multi_index_embedding": True,
+    # 灰度开关：开启后 keyword/BM25 使用 retrieval index 作为 sparse document，关闭时回退旧 chunk-level BM25。
+    "enable_index_level_bm25": True,
+    # 灰度开关：控制 LLM/规则生成的问题型 retrieval index，便于定位 question index 对召回的影响。
+    "enable_generated_question_index": True,
+    # 灰度开关：index-level 输入为空或旧 collection 未迁移时，是否允许回退 chunk-level 检索。
+    "enable_chunk_level_retrieval_fallback": True,
     "context_budget_max_chars": 24000,
     "sample_limit": 24,
     "merge_candidate_terms_limit": 24,

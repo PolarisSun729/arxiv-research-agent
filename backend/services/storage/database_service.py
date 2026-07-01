@@ -186,6 +186,10 @@ class DatabaseService:
                     embedding_model TEXT,
                     pdf_path TEXT,
                     chunk_file TEXT,
+                    retrieval_index_file TEXT,
+                    retrieval_index_count INTEGER DEFAULT 0,
+                    retrieval_index_types TEXT,
+                    retrieval_index_version TEXT,
                     embedding_file TEXT,
                     loading_method TEXT,
                     chunking_strategy TEXT,
@@ -211,6 +215,10 @@ class DatabaseService:
                     embedding_model TEXT,
                     pdf_path TEXT,
                     chunk_file TEXT,
+                    retrieval_index_file TEXT,
+                    retrieval_index_count INTEGER DEFAULT 0,
+                    retrieval_index_types TEXT,
+                    retrieval_index_version TEXT,
                     embedding_file TEXT,
                     loading_method TEXT,
                     chunking_strategy TEXT,
@@ -628,6 +636,7 @@ class DatabaseService:
             self._ensure_user_profile_event_columns(conn)
             self._ensure_user_profile_build_job_columns(conn)
             self._ensure_paper_qa_index_columns(conn)
+            self._ensure_paper_qa_index_version_columns(conn)
             self._ensure_paper_qa_index_version_rows(conn)
             self._ensure_paper_index_job_columns(conn)
             self._ensure_paper_chat_session_summary_columns(conn)
@@ -694,6 +703,10 @@ class DatabaseService:
         # 旧环境可能已经创建过 paper_qa_index；这里补齐 artifact 字段，保留失败后的文件与 collection 追踪。
         required_columns = {
             "chunk_file": "TEXT",
+            "retrieval_index_file": "TEXT",
+            "retrieval_index_count": "INTEGER DEFAULT 0",
+            "retrieval_index_types": "TEXT",
+            "retrieval_index_version": "TEXT",
             "embedding_file": "TEXT",
             "loading_method": "TEXT",
             "chunking_strategy": "TEXT",
@@ -716,6 +729,24 @@ class DatabaseService:
                 )
         conn.commit()
 
+    def _ensure_paper_qa_index_version_columns(self, conn):
+        # 版本表和 active 表必须拥有同一组 artifact 字段，否则激活/回滚时会丢失 retrieval index 产物定位。
+        required_columns = {
+            "retrieval_index_file": "TEXT",
+            "retrieval_index_count": "INTEGER DEFAULT 0",
+            "retrieval_index_types": "TEXT",
+            "retrieval_index_version": "TEXT",
+        }
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(paper_qa_index_versions)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        for column_name, column_definition in required_columns.items():
+            if column_name not in existing_columns:
+                cursor.execute(
+                    f"ALTER TABLE paper_qa_index_versions ADD COLUMN {column_name} {column_definition}"
+                )
+        conn.commit()
+
     def _ensure_paper_qa_index_version_rows(self, conn):
         # 旧库只有 paper_qa_index 单行记录；启动时补 active version，避免升级后丢失可问答状态。
         cursor = conn.cursor()
@@ -723,7 +754,9 @@ class DatabaseService:
             """
             INSERT OR IGNORE INTO paper_qa_index_versions (
                 build_id, arxiv_id, index_version, status, is_active, collection_name,
-                chunk_count, embedding_model, pdf_path, chunk_file, embedding_file,
+                chunk_count, embedding_model, pdf_path, chunk_file,
+                retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version,
+                embedding_file,
                 loading_method, chunking_strategy, current_stage, failed_stage,
                 error_message, artifact_status, indexed_at, activated_at, created_at, updated_at
             )
@@ -738,6 +771,10 @@ class DatabaseService:
                 embedding_model,
                 pdf_path,
                 chunk_file,
+                retrieval_index_file,
+                COALESCE(retrieval_index_count, 0),
+                retrieval_index_types,
+                retrieval_index_version,
                 embedding_file,
                 loading_method,
                 chunking_strategy,
@@ -3282,7 +3319,8 @@ class DatabaseService:
                     SELECT arxiv_id, collection_name, status, chunk_count, embedding_model, pdf_path,
                            chunk_file, embedding_file, loading_method, chunking_strategy, current_stage,
                            failed_stage, error_message, artifact_status, indexed_at, created_at, updated_at,
-                           active_index_version, active_build_id, previous_build_id
+                           active_index_version, active_build_id, previous_build_id,
+                           retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version
                     FROM paper_qa_index WHERE arxiv_id = ?
                 ''', (arxiv_id,))
 
@@ -3309,6 +3347,10 @@ class DatabaseService:
                         'active_index_version': row[17],
                         'active_build_id': row[18],
                         'previous_build_id': row[19],
+                        'retrieval_index_file': row[20],
+                        'retrieval_index_count': row[21] or 0,
+                        'retrieval_index_types': row[22],
+                        'retrieval_index_version': row[23],
                     }
                 return None
         except Exception as e:
@@ -3339,6 +3381,10 @@ class DatabaseService:
             "activated_at": row[18],
             "created_at": row[19],
             "updated_at": row[20],
+            "retrieval_index_file": row[21] if len(row) > 21 else "",
+            "retrieval_index_count": (row[22] if len(row) > 22 else 0) or 0,
+            "retrieval_index_types": row[23] if len(row) > 23 else "",
+            "retrieval_index_version": row[24] if len(row) > 24 else "",
         }
 
     @staticmethod
@@ -3347,7 +3393,8 @@ class DatabaseService:
             SELECT build_id, arxiv_id, index_version, status, is_active, collection_name,
                    chunk_count, embedding_model, pdf_path, chunk_file, embedding_file,
                    loading_method, chunking_strategy, current_stage, failed_stage,
-                   error_message, artifact_status, indexed_at, activated_at, created_at, updated_at
+                   error_message, artifact_status, indexed_at, activated_at, created_at, updated_at,
+                   retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version
             FROM paper_qa_index_versions
         """
 
@@ -3497,6 +3544,10 @@ class DatabaseService:
                 "embedding_model",
                 "pdf_path",
                 "chunk_file",
+                "retrieval_index_file",
+                "retrieval_index_count",
+                "retrieval_index_types",
+                "retrieval_index_version",
                 "embedding_file",
                 "loading_method",
                 "chunking_strategy",
@@ -3595,11 +3646,13 @@ class DatabaseService:
                         """
                         INSERT INTO paper_qa_index (
                             arxiv_id, collection_name, status, chunk_count, embedding_model,
-                            pdf_path, chunk_file, embedding_file, loading_method, chunking_strategy,
+                            pdf_path, chunk_file,
+                            retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version,
+                            embedding_file, loading_method, chunking_strategy,
                             current_stage, failed_stage, error_message, artifact_status, indexed_at,
                             active_index_version, active_build_id, previous_build_id
                         )
-                        VALUES (?, ?, 'indexed', ?, ?, ?, ?, ?, ?, ?, 'activate_index', '', '', 'active', ?, ?, ?, ?)
+                        VALUES (?, ?, 'indexed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'activate_index', '', '', 'active', ?, ?, ?, ?)
                         ON CONFLICT(arxiv_id) DO UPDATE SET
                             collection_name = excluded.collection_name,
                             status = excluded.status,
@@ -3607,6 +3660,10 @@ class DatabaseService:
                             embedding_model = excluded.embedding_model,
                             pdf_path = excluded.pdf_path,
                             chunk_file = excluded.chunk_file,
+                            retrieval_index_file = excluded.retrieval_index_file,
+                            retrieval_index_count = excluded.retrieval_index_count,
+                            retrieval_index_types = excluded.retrieval_index_types,
+                            retrieval_index_version = excluded.retrieval_index_version,
                             embedding_file = excluded.embedding_file,
                             loading_method = excluded.loading_method,
                             chunking_strategy = excluded.chunking_strategy,
@@ -3627,6 +3684,10 @@ class DatabaseService:
                             build.get("embedding_model"),
                             build.get("pdf_path"),
                             build.get("chunk_file"),
+                            build.get("retrieval_index_file"),
+                            build.get("retrieval_index_count") or 0,
+                            build.get("retrieval_index_types"),
+                            build.get("retrieval_index_version"),
                             build.get("embedding_file"),
                             build.get("loading_method"),
                             build.get("chunking_strategy"),
@@ -4012,6 +4073,10 @@ class DatabaseService:
                     'embedding_model',
                     'pdf_path',
                     'chunk_file',
+                    'retrieval_index_file',
+                    'retrieval_index_count',
+                    'retrieval_index_types',
+                    'retrieval_index_version',
                     'embedding_file',
                     'loading_method',
                     'chunking_strategy',
@@ -4047,7 +4112,8 @@ class DatabaseService:
                         SELECT arxiv_id, collection_name, status, chunk_count, embedding_model, pdf_path,
                                chunk_file, embedding_file, loading_method, chunking_strategy, current_stage,
                                failed_stage, error_message, artifact_status, indexed_at,
-                               active_index_version, active_build_id
+                               active_index_version, active_build_id,
+                               retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version
                         FROM paper_qa_index
                         WHERE arxiv_id = ?
                         """,
@@ -4062,11 +4128,13 @@ class DatabaseService:
                             """
                             INSERT OR IGNORE INTO paper_qa_index_versions (
                                 build_id, arxiv_id, index_version, status, is_active, collection_name,
-                                chunk_count, embedding_model, pdf_path, chunk_file, embedding_file,
+                                chunk_count, embedding_model, pdf_path, chunk_file,
+                                retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version,
+                                embedding_file,
                                 loading_method, chunking_strategy, current_stage, failed_stage,
                                 error_message, artifact_status, indexed_at, activated_at
                             )
-                            VALUES (?, ?, ?, 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, CURRENT_TIMESTAMP)
+                            VALUES (?, ?, ?, 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, CURRENT_TIMESTAMP)
                             """,
                             (
                                 legacy_build_id,
@@ -4077,6 +4145,10 @@ class DatabaseService:
                                 active_row[4],
                                 active_row[5],
                                 active_row[6],
+                                active_row[17],
+                                active_row[18] or 0,
+                                active_row[19],
+                                active_row[20],
                                 active_row[7],
                                 active_row[8],
                                 active_row[9],
@@ -4117,6 +4189,10 @@ class DatabaseService:
                     'embedding_model',
                     'pdf_path',
                     'chunk_file',
+                    'retrieval_index_file',
+                    'retrieval_index_count',
+                    'retrieval_index_types',
+                    'retrieval_index_version',
                     'embedding_file',
                     'loading_method',
                     'chunking_strategy',
@@ -4156,11 +4232,13 @@ class DatabaseService:
                         """
                         INSERT OR IGNORE INTO paper_qa_index_versions (
                             build_id, arxiv_id, index_version, status, is_active, collection_name,
-                            chunk_count, embedding_model, pdf_path, chunk_file, embedding_file,
+                            chunk_count, embedding_model, pdf_path, chunk_file,
+                            retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version,
+                            embedding_file,
                             loading_method, chunking_strategy, current_stage, failed_stage,
                             error_message, artifact_status, indexed_at, activated_at
                         )
-                        VALUES (?, ?, ?, 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, CURRENT_TIMESTAMP)
+                        VALUES (?, ?, ?, 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, CURRENT_TIMESTAMP)
                         """,
                         (
                             legacy_build_id,
@@ -4171,6 +4249,10 @@ class DatabaseService:
                             kwargs.get("embedding_model"),
                             kwargs.get("pdf_path"),
                             kwargs.get("chunk_file"),
+                            kwargs.get("retrieval_index_file"),
+                            kwargs.get("retrieval_index_count") or 0,
+                            kwargs.get("retrieval_index_types"),
+                            kwargs.get("retrieval_index_version"),
                             kwargs.get("embedding_file"),
                             kwargs.get("loading_method"),
                             kwargs.get("chunking_strategy"),

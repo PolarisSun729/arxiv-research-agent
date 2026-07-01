@@ -185,6 +185,63 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
         self.assertIn("final_context_top15", debug["stages"])
         self.assertIn("routes", debug)
         self.assertIn("collection_profile", debug)
+        self.assertIn("multi_index", debug)
+        self.assertIn("raw_index_hits", debug["multi_index"])
+        self.assertIn("chunk_aggregation", debug["multi_index"])
+        self.assertIn("route_hit_distribution", debug["multi_index"])
+
+    def test_debug_trace_records_multi_index_hit_aggregation(self) -> None:
+        base_metadata = {
+            "chunk_id": "chunk-method",
+            "parent_chunk_id": "parent-method",
+            "original_chunk_id": "parent-method",
+            "page_number": 2,
+            "page_range": "2",
+            "section_title": "Method",
+            "section_path": "2 Method",
+            "source": "paper.pdf",
+            "chunk_type": "text",
+            "order_index": 1,
+        }
+        collection_rows = self.service.vector_store_service.collections[self.collection_name]
+        for suffix, index_type, index_text, index_weight in (
+            ("question", "question", "What method framework pipeline is used?", 0.82),
+            ("summary", "summary", "The method framework uses a retrieval pipeline.", 0.78),
+        ):
+            metadata = dict(
+                base_metadata,
+                retrieval_index_id=f"chunk-method:{suffix}:1",
+                retrieval_index_type=index_type,
+                retrieval_index_text=index_text,
+                retrieval_index_weight=index_weight,
+                retrieval_index_enabled_routes=["vector_original"],
+            )
+            collection_rows.append(
+                {
+                    "id": len(collection_rows) + 1,
+                    "content": "Method section: the framework uses a retrieval pipeline with two encoder stages.",
+                    "embedding": self.service.embedding_service.create_single_embedding(index_text),
+                    "metadata": metadata,
+                }
+            )
+
+        result = self.service.enhanced_retrieve(
+            "What is the method framework of the paper?",
+            self.collection_name,
+            options=self.options_cls(debug=True, enable_llm_rerank=False, enable_keyword_search=False),
+        )
+        multi_index = result["debug"]["multi_index"]
+        vector_hits = multi_index["raw_index_hits"]["vector_original"]
+        method_aggregation = [
+            row for row in multi_index["chunk_aggregation"]["vector_original"]
+            if row["chunk_id"] == "chunk-method"
+        ]
+        fused_ids = [item["chunk_id"] for item in result["debug"]["stages"]["fused_top30"]]
+
+        self.assertTrue({"question", "summary"} & {hit["matched_index_type"] for hit in vector_hits})
+        self.assertEqual(len(method_aggregation), 1)
+        self.assertTrue({"question", "summary"} & set(method_aggregation[0]["matched_index_types"]))
+        self.assertEqual(len(fused_ids), len(set(fused_ids)))
 
     def test_non_debug_response_keeps_debug_payload_hidden(self) -> None:
         result = self.service.enhanced_retrieve(

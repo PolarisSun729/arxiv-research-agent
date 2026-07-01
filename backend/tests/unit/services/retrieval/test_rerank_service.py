@@ -34,6 +34,31 @@ class RerankServiceTests(unittest.TestCase):
         self.assertIn("Figure 2 compares model performance", text)
         self.assertIn("page 6", text)
 
+    def test_build_rerank_document_text_includes_matched_indexes_and_chunk_evidence(self) -> None:
+        method_chunk = dict(self.service._normalize_chunk(self.sample_chunks[0]))
+        method_chunk["matched_indexes"] = [
+            {
+                "matched_index_id": "chunk-method:question:1",
+                "matched_index_type": "question",
+                "matched_index_text": "What method framework pipeline is used?",
+                "matched_index_score": 0.91,
+            },
+            {
+                "matched_index_id": "chunk-method:summary:1",
+                "matched_index_type": "summary",
+                "matched_index_text": "The method section summarizes the retrieval pipeline.",
+                "matched_index_score": 0.73,
+            },
+        ]
+
+        text = self.service.rerank_service.build_rerank_document_text(method_chunk)
+
+        self.assertIn("Matched retrieval indexes", text)
+        self.assertIn("type=question", text)
+        self.assertIn("What method framework pipeline is used?", text)
+        self.assertIn("Chunk evidence", text)
+        self.assertIn("framework uses a retrieval pipeline", text)
+
     def test_low_confidence_asset_section_does_not_enter_rerank_or_context_text(self) -> None:
         figure_chunk = dict(self.service._normalize_chunk(self.sample_chunks[5]))
         figure_chunk.update(

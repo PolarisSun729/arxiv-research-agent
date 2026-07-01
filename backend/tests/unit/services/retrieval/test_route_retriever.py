@@ -48,6 +48,60 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertEqual(bundle["collection_profile"]["embedding_model"], "fake-embedding-model")
         self.assertEqual(bundle["collection_profile"]["vector_dimension"], 3)
 
+    def test_vector_route_aggregates_multiple_index_hits_to_one_chunk_candidate(self) -> None:
+        base_metadata = {
+            "chunk_id": "chunk-method",
+            "parent_chunk_id": "parent-method",
+            "original_chunk_id": "parent-method",
+            "page_number": 2,
+            "page_range": "2",
+            "section_title": "Method",
+            "section_path": "2 Method",
+            "source": "paper.pdf",
+            "chunk_type": "text",
+            "order_index": 1,
+        }
+        collection_rows = self.service.vector_store_service.collections[self.collection_name]
+        for suffix, index_type, index_text, index_weight in (
+            ("question", "question", "What method framework pipeline is used?", 0.82),
+            ("summary", "summary", "The method framework uses a retrieval pipeline.", 0.78),
+        ):
+            metadata = dict(
+                base_metadata,
+                retrieval_index_id=f"chunk-method:{suffix}:1",
+                retrieval_index_type=index_type,
+                retrieval_index_text=index_text,
+                retrieval_index_weight=index_weight,
+                retrieval_index_enabled_routes=["vector_original"],
+            )
+            collection_rows.append(
+                {
+                    "id": len(collection_rows) + 1,
+                    "content": "Method section: the framework uses a retrieval pipeline with two encoder stages.",
+                    "embedding": self.service.embedding_service.create_single_embedding(index_text),
+                    "metadata": metadata,
+                }
+            )
+
+        bundle = self._build_route_bundle(
+            "What is the method framework of the paper?",
+            enable_hyde=False,
+            enable_keyword_search=False,
+        )
+        method_hits = [
+            item for item in bundle["routes"]["vector_original"]
+            if item["chunk_id"] == "chunk-method"
+        ]
+
+        self.assertEqual(len(method_hits), 1)
+        hit = method_hits[0]
+        self.assertTrue(hit["index_aggregation_applied"])
+        self.assertLessEqual(len(hit["matched_indexes"]), 3)
+        self.assertIn("best_matched_index", hit)
+        self.assertIn("body", hit["matched_index_types"])
+        self.assertTrue({"question", "summary"} & set(hit["matched_index_types"]))
+        self.assertIn("What is the method framework of the paper?", hit["source_queries"])
+
     def test_query_rewrite_toggle_controls_vector_rewrite_route(self) -> None:
         enabled = self._build_route_bundle("What is the method framework of the paper?", enable_query_rewrite=True)
         disabled = self._build_route_bundle("What is the method framework of the paper?", enable_query_rewrite=False)
@@ -129,6 +183,115 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertIn("rrf_vote", keyword_debug["matched_chunks"][0]["view_contributions"][0])
         self.assertIn("keyword_query_contributions", top_hit)
         self.assertGreater(top_hit["route_score"], 0.0)
+        self.assertTrue(top_hit["index_aggregation_applied"])
+        self.assertIn("best_matched_index", top_hit)
+        self.assertTrue(top_hit["matched_indexes"])
+
+    def test_keyword_backend_aggregates_index_hits_to_chunk_candidates(self) -> None:
+        from services.retrieval.keyword_backend import InternalBM25Backend
+        from services.retrieval.retrieval_index import CollectionRetrievalIndexProvider
+
+        source_chunk = {
+            "content": "The final evidence chunk discusses training details.",
+            "chunk_id": "chunk-indexed-method",
+            "parent_chunk_id": "parent-indexed-method",
+            "chunk_type": "text",
+            "section_title": "Training",
+            "section_path": "3 Training",
+            "source": "paper.pdf",
+        }
+        rows = [
+            {
+                **source_chunk,
+                "retrieval_index_id": "chunk-indexed-method:question:1",
+                "retrieval_index_type": "question",
+                "retrieval_index_text": "Which contrastive alignment objective is used?",
+                "retrieval_index_weight": 0.82,
+                "retrieval_index_enabled_routes": ["keyword"],
+            },
+            {
+                **source_chunk,
+                "retrieval_index_id": "chunk-indexed-method:summary:1",
+                "retrieval_index_type": "summary",
+                "retrieval_index_text": "The section explains the contrastive alignment objective for training.",
+                "retrieval_index_weight": 0.78,
+                "retrieval_index_enabled_routes": ["keyword"],
+            },
+            {
+                "content": "A different chunk mentions evaluation only.",
+                "chunk_id": "chunk-other",
+                "parent_chunk_id": "parent-other",
+                "chunk_type": "text",
+                "section_title": "Evaluation",
+                "section_path": "4 Evaluation",
+                "source": "paper.pdf",
+                "retrieval_index_id": "chunk-other:body:1",
+                "retrieval_index_type": "body",
+                "retrieval_index_text": "Evaluation baseline metrics.",
+                "retrieval_index_weight": 1.0,
+                "retrieval_index_enabled_routes": ["keyword"],
+            },
+        ]
+
+        class Store:
+            def get_all_chunks(self, _collection_name: str):
+                return list(rows)
+
+        provider = CollectionRetrievalIndexProvider(
+            vector_store_service=Store(),
+            chunk_normalizer=self.service._normalize_chunk,
+            tokenizer=self.service._tokenize_for_keyword_search,
+        )
+        retrieval_index = provider.get_index("paper_collection")
+        query_bundle = self.service.query_planner.build_query_bundle(
+            user_query="Which contrastive alignment objective is used?",
+            collection_name=self.collection_name,
+            enable_query_rewrite=False,
+        )
+        backend = InternalBM25Backend(
+            query_tools=self.service.query_planner,
+            route_confidence_builder=self.service._route_confidence,
+            structural_bonus_builder=self.service._compute_structural_bonus,
+            fusion_service=self.service.fusion_service,
+        )
+
+        payload = backend._internal_keyword_retrieve(
+            query_views=[
+                {
+                    "view_id": "original:0",
+                    "query": "Which contrastive alignment objective is used?",
+                    "source": "original",
+                    "source_index": 0,
+                    "selected": True,
+                    "reason": "kept",
+                    "weight": 1.0,
+                }
+            ],
+            top_k=5,
+            query_profile=query_bundle["query_profile"],
+            retrieval_index=retrieval_index,
+        )
+
+        hits = payload["results"]
+        indexed_hits = [hit for hit in hits if hit["chunk_id"] == "chunk-indexed-method"]
+        self.assertEqual(len(indexed_hits), 1)
+        hit = indexed_hits[0]
+        self.assertEqual(hit["content"], source_chunk["content"])
+        self.assertEqual(hit["keyword_matched_index_count"], 2)
+        self.assertEqual(
+            {item["matched_index_id"] for item in hit["matched_indexes"]},
+            {"chunk-indexed-method:question:1", "chunk-indexed-method:summary:1"},
+        )
+        deduped = self.service.fusion_service.dedupe_route_results([hit])
+        self.assertEqual(
+            {item["matched_index_id"] for item in deduped[0]["matched_indexes"]},
+            {"chunk-indexed-method:question:1", "chunk-indexed-method:summary:1"},
+        )
+        matched_debug = payload["debug"]["matched_chunks"][0]
+        self.assertEqual(matched_debug["chunk_id"], "chunk-indexed-method")
+        self.assertEqual(matched_debug["matched_index_count"], 2)
+        self.assertTrue(matched_debug["top_matched_indexes"])
+        self.assertIn("query_sources", matched_debug["top_matched_indexes"][0])
 
     def test_keyword_route_dedupes_high_similarity_query_views(self) -> None:
         query_bundle = self.service.query_planner.build_query_bundle(
@@ -375,8 +538,24 @@ class RouteRetrieverTests(unittest.TestCase):
             "source_query": "method",
         }
         routes = {
-            "vector_original": [dict(base_chunk, route_score=0.9)],
-            "keyword": [dict(base_chunk, route_score=0.7)],
+            "vector_original": [
+                dict(
+                    base_chunk,
+                    route_score=0.9,
+                    matched_index_id="chunk-method:body:1",
+                    matched_index_type="body",
+                    matched_index_text="Method chunk",
+                )
+            ],
+            "keyword": [
+                dict(
+                    base_chunk,
+                    route_score=0.7,
+                    matched_index_id="chunk-method:question:1",
+                    matched_index_type="question",
+                    matched_index_text="What does the method do?",
+                )
+            ],
         }
 
         fused = self.service._fuse_routes(routes, top_k=5, query_profile=profile)
@@ -385,6 +564,11 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertEqual(set(fused[0]["matched_routes"]), {"vector_original", "keyword"})
         self.assertIn("vector_original", fused[0]["route_scores"])
         self.assertIn("keyword", fused[0]["route_scores"])
+        self.assertEqual(
+            {item["matched_index_id"] for item in fused[0]["matched_indexes"]},
+            {"chunk-method:body:1", "chunk-method:question:1"},
+        )
+        self.assertEqual(fused[0]["matched_index_id"], "chunk-method:body:1")
         self.assertGreater(fused[0]["score"], 0.0)
 
     def test_vector_route_reuses_collection_profile_cache(self) -> None:

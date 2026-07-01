@@ -10,7 +10,7 @@ import json
 from datetime import datetime
 import logging
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import os
 import base64
 import mimetypes
@@ -20,9 +20,16 @@ from utils.model_utils import get_huggingface_model_path
 import numpy as np
 import sys
 import requests
-from utils.config import EMBEDDING_CONFIG
+from services.retrieval.retrieval_index import (
+    RetrievalIndex,
+    build_retrieval_indexes,
+    iter_retrieval_indexes_for_embedding,
+    normalize_chunk_id,
+)
+from utils.config import EMBEDDING_CONFIG, get_enhanced_retrieval_runtime_config
 
 logger = logging.getLogger(__name__)
+ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
 
 class EmbeddingProvider(str, Enum):
     OPENAI = "openai"
@@ -442,17 +449,44 @@ class EmbeddingService:
         chunks = input_data.get("chunks", [])
         input_metadata = input_data.get("metadata", {})
         filename = input_metadata.get("filename", "")
+        retrieval_indexes = input_data.get("retrieval_indexes")
+        multi_index_embedding_enabled = self._metadata_bool(
+            input_metadata.get("enable_multi_index_embedding"),
+            bool(ENHANCED_RETRIEVAL_CONFIG.get("enable_multi_index_embedding", True)),
+        )
+        chunk_level_fallback_enabled = self._metadata_bool(
+            input_metadata.get("enable_chunk_level_retrieval_fallback"),
+            bool(ENHANCED_RETRIEVAL_CONFIG.get("enable_chunk_level_retrieval_fallback", True)),
+        )
+        default_embedding_mode = "retrieval_index" if multi_index_embedding_enabled else "legacy_chunk_level"
+        embedding_mode = str(
+            input_data.get("embedding_mode") or input_metadata.get("embedding_mode") or default_embedding_mode
+        ).strip().lower()
+        use_legacy_chunk_embeddings = (
+            embedding_mode in {"chunk", "chunk_level", "legacy_chunk", "legacy_chunk_level"}
+            or not multi_index_embedding_enabled
+        )
+        if retrieval_indexes is None and not use_legacy_chunk_embeddings:
+            retrieval_indexes = build_retrieval_indexes(chunks)
 
         provider_key = str(config.provider).strip().lower()
         batch_size = int(config.batch_size or (10 if provider_key == EmbeddingProvider.DASHSCOPE.value else 20))
         results = []
-        prepared_inputs = [
-            {
-                "chunk": chunk,
-                "embedding_input": self.build_embedding_input(chunk, provider_key),
-            }
-            for chunk in chunks
-        ]
+        if use_legacy_chunk_embeddings:
+            prepared_inputs = self._prepare_legacy_chunk_inputs(chunks, provider_key)
+        else:
+            prepared_inputs = self._prepare_retrieval_index_inputs(chunks, retrieval_indexes or [], provider_key)
+            if not prepared_inputs and chunks:
+                if chunk_level_fallback_enabled:
+                    logger.warning(
+                        "No valid retrieval index embedding inputs; falling back to legacy chunk-level embeddings"
+                    )
+                    # 兼容旧灰度路径：index 层为空或全部被路由过滤时，仍按 chunk.content 建向量，避免整篇论文无法建库。
+                    prepared_inputs = self._prepare_legacy_chunk_inputs(chunks, provider_key)
+                else:
+                    logger.warning(
+                        "No valid retrieval index embedding inputs and chunk-level fallback is disabled"
+                    )
 
         if provider_key == EmbeddingProvider.LOCAL.value:
             if self.local_embedder is None:
@@ -472,6 +506,7 @@ class EmbeddingService:
                             provider=provider_key,
                             model=config.model_name,
                             filename=filename,
+                            retrieval_index=prepared["retrieval_index"],
                         ),
                     }
                 )
@@ -493,6 +528,7 @@ class EmbeddingService:
                                 provider=provider_key,
                                 model=config.model_name,
                                 filename=filename,
+                                retrieval_index=prepared["retrieval_index"],
                             ),
                         }
                     )
@@ -515,6 +551,7 @@ class EmbeddingService:
                                     provider=provider_key,
                                     model=config.model_name,
                                     filename=filename,
+                                    retrieval_index=prepared["retrieval_index"],
                                 ),
                             }
                         )
@@ -546,6 +583,7 @@ class EmbeddingService:
                                 provider=provider_key,
                                 model=config.model_name,
                                 filename=filename,
+                                retrieval_index=prepared["retrieval_index"],
                             ),
                         }
                     )
@@ -568,18 +606,91 @@ class EmbeddingService:
                                 provider=provider_key,
                                 model=config.model_name,
                                 filename=filename,
+                                retrieval_index=prepared["retrieval_index"],
                             ),
                         }
                 )
 
         return results, {}
 
-    def build_embedding_input(self, chunk: dict, provider_key: str) -> dict:
-        """把 chunk 转成 provider 可消费的 embedding 输入载荷。"""
+    @staticmethod
+    def _metadata_bool(value: Any, default: bool) -> bool:
+        """解析单次建库 metadata 中的布尔开关；缺失时回到全局配置。"""
+        if value is None:
+            return bool(default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        normalized = str(value or "").strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        return bool(default)
+
+    def _prepare_retrieval_index_inputs(
+        self,
+        chunks: List[Dict[str, Any]],
+        retrieval_indexes: List[Dict[str, Any]],
+        provider_key: str,
+    ) -> List[Dict[str, Any]]:
+        chunk_lookup = {
+            normalize_chunk_id(chunk, fallback_index=index): chunk
+            for index, chunk in enumerate(chunks or [], start=1)
+        }
+        prepared_inputs: List[Dict[str, Any]] = []
+        for retrieval_index in iter_retrieval_indexes_for_embedding(retrieval_indexes):
+            chunk = chunk_lookup.get(str(retrieval_index.chunk_id))
+            if chunk is None:
+                logger.warning(
+                    "Skip retrieval index without source chunk: index_id=%s chunk_id=%s",
+                    retrieval_index.index_id,
+                    retrieval_index.chunk_id,
+                )
+                continue
+            # 向量输入来自 index_text，元数据来自 PaperChunk；两者分开才能让召回入口更细、最终证据仍完整。
+            prepared_inputs.append(
+                {
+                    "chunk": chunk,
+                    "retrieval_index": retrieval_index,
+                    "embedding_input": self.build_embedding_input(
+                        chunk,
+                        provider_key,
+                        retrieval_index=retrieval_index,
+                    ),
+                }
+            )
+        return prepared_inputs
+
+    def _prepare_legacy_chunk_inputs(
+        self,
+        chunks: List[Dict[str, Any]],
+        provider_key: str,
+    ) -> List[Dict[str, Any]]:
+        prepared_inputs: List[Dict[str, Any]] = []
+        for chunk in chunks or []:
+            embedding_input = self.build_embedding_input(chunk, provider_key, retrieval_index=None)
+            if embedding_input.get("mode") == "text" and not str(embedding_input.get("text") or "").strip():
+                continue
+            # 旧 chunk-level 路径只作为兼容兜底；metadata 会合成 body index 标识，方便下游统一按 index 字段消费。
+            prepared_inputs.append(
+                {
+                    "chunk": chunk,
+                    "retrieval_index": None,
+                    "embedding_input": embedding_input,
+                    "embedding_source_level": "chunk_level_fallback",
+                }
+            )
+        return prepared_inputs
+
+    def build_embedding_input(self, chunk: dict, provider_key: str, retrieval_index: Optional[RetrievalIndex] = None) -> dict:
+        """把 chunk 或 retrieval index 转成 provider 可消费的 embedding 输入载荷。"""
         metadata = chunk.get("metadata", {}) or {}
         chunk_type = str(chunk.get("chunk_type") or metadata.get("chunk_type") or "text").strip().lower()
         text = str(
-            chunk.get("content")
+            (retrieval_index.index_text if retrieval_index is not None else "")
+            or chunk.get("content")
             or metadata.get("content")
             or chunk.get("text")
             or metadata.get("text")
@@ -626,6 +737,7 @@ class EmbeddingService:
         provider: str,
         model: str,
         filename: str,
+        retrieval_index: Optional[RetrievalIndex] = None,
     ) -> dict:
         """构造随向量一起保存的溯源元数据。"""
         chunk_metadata = chunk.get("metadata", {})
@@ -634,6 +746,53 @@ class EmbeddingService:
         page_end = int(chunk_metadata.get("page_end", page_start))
         source = chunk_metadata.get("source", filename)
         chunk_index = int(chunk_metadata.get("chunk_index", chunk_metadata.get("chunk_id", 0)))
+
+        retrieval_index_payload = {}
+        if retrieval_index is not None:
+            retrieval_index_payload = {
+                "index_id": retrieval_index.index_id,
+                "index_type": retrieval_index.index_type,
+                "index_text": retrieval_index.index_text,
+                "index_weight": float(retrieval_index.index_weight),
+                "retrieval_index_id": retrieval_index.index_id,
+                "retrieval_index_chunk_id": retrieval_index.chunk_id,
+                "retrieval_index_type": retrieval_index.index_type,
+                "retrieval_index_text": retrieval_index.index_text,
+                "retrieval_index_weight": float(retrieval_index.index_weight),
+                "retrieval_index_enabled_routes": list(retrieval_index.enabled_routes),
+                "retrieval_index_metadata": dict(retrieval_index.metadata),
+                "matched_index_id": retrieval_index.index_id,
+                "matched_index_type": retrieval_index.index_type,
+                "matched_index_text": retrieval_index.index_text,
+                "embedding_source_level": "retrieval_index",
+            }
+        else:
+            legacy_chunk_id = normalize_chunk_id(chunk)
+            legacy_index_text = str(
+                chunk.get("content")
+                or chunk_metadata.get("content")
+                or chunk.get("text")
+                or chunk_metadata.get("text")
+                or ""
+            ).strip()
+            # chunk-level 兜底也写成 body index 形态，保证 Milvus/检索输出不需要再区分两套 metadata 合约。
+            retrieval_index_payload = {
+                "index_id": f"{legacy_chunk_id}:body:legacy",
+                "index_type": "body",
+                "index_text": legacy_index_text,
+                "index_weight": 1.0,
+                "retrieval_index_id": f"{legacy_chunk_id}:body:legacy",
+                "retrieval_index_chunk_id": legacy_chunk_id,
+                "retrieval_index_type": "body",
+                "retrieval_index_text": legacy_index_text,
+                "retrieval_index_weight": 1.0,
+                "retrieval_index_enabled_routes": ["vector_original", "vector_rewrite", "vector_hyde", "keyword"],
+                "retrieval_index_metadata": {"fallback": "chunk_level"},
+                "matched_index_id": f"{legacy_chunk_id}:body:legacy",
+                "matched_index_type": "body",
+                "matched_index_text": legacy_index_text,
+                "embedding_source_level": "chunk_level_fallback",
+            }
 
         return {
             **chunk_metadata,
@@ -676,6 +835,7 @@ class EmbeddingService:
             "embedding_timestamp": datetime.now().isoformat(),
             "vector_dimension": len(embedding_vector),
             "filename": filename,
+            **retrieval_index_payload,
         }
 
     def save_embeddings(self, doc_name: str, embeddings: list) -> str:
@@ -685,6 +845,18 @@ class EmbeddingService:
         first_embedding = embeddings[0]
         provider = first_embedding["metadata"]["embedding_provider"]
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        retrieval_index_ids = [
+            str(item.get("metadata", {}).get("retrieval_index_id") or "")
+            for item in embeddings
+            if str(item.get("metadata", {}).get("retrieval_index_id") or "")
+        ]
+        retrieval_index_types = sorted(
+            {
+                str(item.get("metadata", {}).get("retrieval_index_type") or "")
+                for item in embeddings
+                if str(item.get("metadata", {}).get("retrieval_index_type") or "")
+            }
+        )
 
         base_name = doc_name.split("_")[0]
         if not base_name.endswith(".pdf"):
@@ -702,6 +874,9 @@ class EmbeddingService:
             "embedding_model": first_embedding["metadata"]["embedding_model"],
             "vector_dimension": first_embedding["metadata"]["vector_dimension"],
             "source_file": first_embedding["metadata"].get("source", base_name),
+            # embedding 文件的条数现在对应 RetrievalIndex，单独记录数量避免和原始 chunk_count 混淆。
+            "retrieval_index_count": len(retrieval_index_ids),
+            "retrieval_index_types": retrieval_index_types,
         }
 
         class CompactJSONEncoder(json.JSONEncoder):

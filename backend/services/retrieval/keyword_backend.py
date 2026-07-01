@@ -14,6 +14,158 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def build_keyword_matched_terms(term_traces: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    matched = [
+        {
+            "token": str(trace.get("token", "")),
+            "idf": float(trace.get("idf", 0.0) or 0.0),
+            "term_score": float(trace.get("best_term_score", 0.0) or 0.0),
+            "fields": list(trace.get("fields", []) or []),
+            "query_sources": list(trace.get("query_sources", []) or []),
+        }
+        for trace in term_traces.values()
+    ]
+    matched.sort(key=lambda item: (item["term_score"], item["idf"]), reverse=True)
+    return matched
+
+
+def aggregate_keyword_index_hits_to_chunks(ranked: List[tuple], retrieval_index: Any) -> List[tuple]:
+    """把 retrieval-index 级 BM25 命中聚合回 chunk，保留每个 chunk 的 top index 命中供 debug/rerank 使用。"""
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for doc_id, payload in ranked:
+        if doc_id < 0 or doc_id >= len(retrieval_index.documents):
+            continue
+        document = retrieval_index.documents[doc_id]
+        chunk_key = keyword_chunk_key_for_document(document, doc_id)
+        group = grouped.setdefault(
+            chunk_key,
+            {
+                "representative_doc_id": doc_id,
+                "fusion_score": 0.0,
+                "best_raw_score": 0.0,
+                "matched_fields": Counter(),
+                "view_contributions": [],
+                "term_traces": {},
+                "query_sources": [],
+                "matched_doc_ids": [],
+                "top_matched_indexes": [],
+            },
+        )
+        group["fusion_score"] += float(payload.get("fusion_score", 0.0) or 0.0)
+        group["best_raw_score"] = max(
+            float(group.get("best_raw_score", 0.0) or 0.0),
+            float(payload.get("best_raw_score", 0.0) or 0.0),
+        )
+        group["matched_fields"].update(payload.get("matched_fields", Counter()))
+        if doc_id not in group["matched_doc_ids"]:
+            group["matched_doc_ids"].append(doc_id)
+        for source in payload.get("query_sources", []) or []:
+            if source not in group["query_sources"]:
+                group["query_sources"].append(source)
+
+        for contribution in payload.get("view_contributions", []) or []:
+            contribution_row = dict(contribution)
+            contribution_row.setdefault("retrieval_index_id", document.retrieval_index_id)
+            contribution_row.setdefault("retrieval_index_type", document.retrieval_index_type)
+            group["view_contributions"].append(contribution_row)
+
+        _merge_keyword_term_traces(group["term_traces"], payload.get("term_traces", {}) or {})
+        group["top_matched_indexes"].append(build_keyword_matched_index_entry(document, payload))
+
+    chunk_ranked: List[tuple] = []
+    for group in grouped.values():
+        group["top_matched_indexes"].sort(
+            key=lambda item: (
+                float(item.get("bm25_fusion_score", 0.0) or 0.0),
+                float(item.get("best_raw_bm25_score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        group["top_matched_indexes"] = group["top_matched_indexes"][:3]
+        group["matched_index_count"] = len(group.get("matched_doc_ids", []) or [])
+        representative_doc_id = int(group.pop("representative_doc_id"))
+        chunk_ranked.append((representative_doc_id, group))
+
+    chunk_ranked.sort(
+        key=lambda item: (
+            float(item[1].get("fusion_score", 0.0) or 0.0),
+            float(item[1].get("best_raw_score", 0.0) or 0.0),
+            int(item[1].get("matched_index_count", 0) or 0),
+        ),
+        reverse=True,
+    )
+    return chunk_ranked
+
+
+def keyword_chunk_key_for_document(document: Any, fallback_doc_id: int) -> str:
+    """生成 chunk 聚合键；优先使用稳定 chunk 标识，缺失时才退回内容前缀防止误合并。"""
+    chunk = dict(getattr(document, "chunk", {}) or {})
+    metadata = dict(chunk.get("metadata", {}) or {})
+    for key in ("chunk_id", "parent_chunk_id", "original_chunk_id"):
+        value = chunk.get(key) if key in chunk else metadata.get(key)
+        normalized = str(value or "").strip()
+        if normalized:
+            return f"{key}:{normalized}"
+    content = str(chunk.get("content") or metadata.get("content") or "")[:120]
+    return f"doc:{fallback_doc_id}:{content}"
+
+
+def build_keyword_matched_index_entry(document: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """把单个 index 命中的 BM25 证据压成可透传的 debug/rerank 明细。"""
+    terms = build_keyword_matched_terms(payload.get("term_traces", {}) or {})
+    contributions = sorted(
+        list(payload.get("view_contributions", []) or []),
+        key=lambda item: (
+            float(item.get("rrf_vote", 0.0) or 0.0),
+            float(item.get("raw_score", 0.0) or 0.0),
+        ),
+        reverse=True,
+    )[:4]
+    fusion_score = float(payload.get("fusion_score", 0.0) or 0.0)
+    return {
+        "index_id": str(getattr(document, "retrieval_index_id", "") or ""),
+        "index_type": str(getattr(document, "retrieval_index_type", "") or "body"),
+        "index_text": str(getattr(document, "retrieval_index_text", "") or ""),
+        "index_weight": float(getattr(document, "retrieval_index_weight", 1.0) or 1.0),
+        "matched_index_id": str(getattr(document, "retrieval_index_id", "") or ""),
+        "matched_index_type": str(getattr(document, "retrieval_index_type", "") or "body"),
+        "matched_index_text": str(getattr(document, "retrieval_index_text", "") or ""),
+        "matched_index_score": fusion_score,
+        "bm25_fusion_score": fusion_score,
+        "best_raw_bm25_score": float(payload.get("best_raw_score", 0.0) or 0.0),
+        "matched_fields": [field for field, _ in payload.get("matched_fields", Counter()).most_common(4)],
+        "matched_terms": terms[:8],
+        "query_sources": list(payload.get("query_sources", []) or []),
+        "view_contributions": contributions,
+    }
+
+
+def _merge_keyword_term_traces(target: Dict[str, Dict[str, Any]], source: Dict[str, Dict[str, Any]]) -> None:
+    """合并多个 index 的 term trace，保留最高 term score 和所有来源字段。"""
+    for token, term in source.items():
+        trace = target.setdefault(
+            token,
+            {
+                "token": token,
+                "idf": 0.0,
+                "best_term_score": 0.0,
+                "fields": [],
+                "query_sources": [],
+            },
+        )
+        trace["idf"] = max(float(trace.get("idf", 0.0) or 0.0), float(term.get("idf", 0.0) or 0.0))
+        trace["best_term_score"] = max(
+            float(trace.get("best_term_score", 0.0) or 0.0),
+            float(term.get("best_term_score", 0.0) or 0.0),
+        )
+        for field_name in term.get("fields", []) or []:
+            if field_name not in trace["fields"]:
+                trace["fields"].append(field_name)
+        for source_name in term.get("query_sources", []) or []:
+            if source_name not in trace["query_sources"]:
+                trace["query_sources"].append(source_name)
+
+
 class KeywordBackendResult:
     """Standardized result from keyword backend."""
 
@@ -270,6 +422,8 @@ class InternalBM25Backend(KeywordBackend):
                 per_query_top_rows.append(
                     {
                         "chunk_id": str(retrieval_index.documents[row["doc_id"]].chunk.get("chunk_id", "") or ""),
+                        "retrieval_index_id": retrieval_index.documents[row["doc_id"]].retrieval_index_id,
+                        "retrieval_index_type": retrieval_index.documents[row["doc_id"]].retrieval_index_type,
                         "rank": rank,
                         "raw_score": float(row["raw_score"]),
                         "normalized_score": normalized_score,
@@ -303,6 +457,8 @@ class InternalBM25Backend(KeywordBackend):
             ),
             reverse=True,
         )
+        # BM25 文档是 retrieval index，但 route 对外仍输出 chunk；这里集中聚合，避免同一 chunk 重复进入候选集。
+        ranked = aggregate_keyword_index_hits_to_chunks(ranked, retrieval_index)
 
         if not ranked:
             return {
@@ -334,9 +490,12 @@ class InternalBM25Backend(KeywordBackend):
         for rank, ((doc_id, payload), normalized_score) in enumerate(
             zip(ranked[:top_k], normalized_scores[:top_k]), start=1
         ):
-            chunk = dict(retrieval_index.documents[doc_id].chunk)
+            document = retrieval_index.documents[doc_id]
+            chunk = dict(document.chunk)
             fusion_score = float(payload.get("fusion_score", 0.0) or 0.0)
             best_raw_score = float(payload.get("best_raw_score", 0.0) or 0.0)
+            top_matched_indexes = list(payload.get("top_matched_indexes", []) or [])
+            top_index = top_matched_indexes[0] if top_matched_indexes else build_keyword_matched_index_entry(document, payload)
             query_contributions = sorted(
                 list(payload.get("view_contributions", [])),
                 key=lambda item: (
@@ -385,6 +544,23 @@ class InternalBM25Backend(KeywordBackend):
             chunk["keyword_query_sources"] = query_sources
             chunk["keyword_noise_flags"] = noise_flags
             chunk["keyword_base_route_confidence"] = float(base_route_confidence)
+            # keyword 命中的是 RetrievalIndex；聚合后把最强 index 作为主命中，同时保留 top 列表给 rerank/debug。
+            chunk["retrieval_index_id"] = top_index.get("index_id", document.retrieval_index_id)
+            chunk["retrieval_index_type"] = top_index.get("index_type", document.retrieval_index_type)
+            chunk["retrieval_index_text"] = top_index.get("index_text", document.retrieval_index_text)
+            chunk["retrieval_index_weight"] = top_index.get("index_weight", document.retrieval_index_weight)
+            chunk["retrieval_index_enabled_routes"] = list(document.retrieval_index_enabled_routes)
+            chunk["index_id"] = chunk["retrieval_index_id"]
+            chunk["index_type"] = chunk["retrieval_index_type"]
+            chunk["index_text"] = chunk["retrieval_index_text"]
+            chunk["index_weight"] = chunk["retrieval_index_weight"]
+            chunk["matched_index_id"] = top_index.get("matched_index_id", chunk["retrieval_index_id"])
+            chunk["matched_index_type"] = top_index.get("matched_index_type", chunk["retrieval_index_type"])
+            chunk["matched_index_text"] = top_index.get("matched_index_text", chunk["retrieval_index_text"])
+            chunk["matched_index_score"] = top_index.get("matched_index_score", fusion_score)
+            chunk["matched_indexes"] = top_matched_indexes
+            chunk["keyword_top_matched_indexes"] = top_matched_indexes
+            chunk["keyword_matched_index_count"] = int(payload.get("matched_index_count", len(top_matched_indexes)) or 0)
             results.append(chunk)
 
         return {
@@ -402,11 +578,21 @@ class InternalBM25Backend(KeywordBackend):
                 "matched_chunks": [
                     {
                         "chunk_id": str(retrieval_index.documents[doc_id].chunk.get("chunk_id", "") or ""),
+                        "retrieval_index_id": (payload.get("top_matched_indexes") or [{}])[0].get(
+                            "matched_index_id",
+                            retrieval_index.documents[doc_id].retrieval_index_id,
+                        ),
+                        "retrieval_index_type": (payload.get("top_matched_indexes") or [{}])[0].get(
+                            "matched_index_type",
+                            retrieval_index.documents[doc_id].retrieval_index_type,
+                        ),
                         "keyword_fusion_score": float(payload.get("fusion_score", 0.0) or 0.0),
                         "best_raw_bm25_score": float(payload.get("best_raw_score", 0.0) or 0.0),
                         "matched_fields": [field for field, _ in payload.get("matched_fields", Counter()).most_common(4)],
                         "matched_terms": self._build_matched_terms(payload.get("term_traces", {})),
                         "query_sources": list(payload.get("query_sources", [])),
+                        "matched_index_count": int(payload.get("matched_index_count", 0) or 0),
+                        "top_matched_indexes": list(payload.get("top_matched_indexes", []) or []),
                         "noise_flags": self._detect_keyword_noise_flags(
                             matched_terms=self._build_matched_terms(payload.get("term_traces", {})),
                             matched_fields=[
@@ -481,22 +667,18 @@ class InternalBM25Backend(KeywordBackend):
             weights["section_path"] = min(weights.get("section_path", 1.0), 0.25)
             weights["asset_caption"] = min(weights.get("asset_caption", 0.0), 0.08)
             weights["asset_aux"] = min(weights.get("asset_aux", 0.0), 0.03)
+        try:
+            index_weight = float(chunk.get("retrieval_index_weight", chunk.get("index_weight", 1.0)) or 1.0)
+        except (TypeError, ValueError):
+            index_weight = 1.0
+        if index_weight != 1.0:
+            # index_type 权重只调节该 index 文档的稀疏匹配强度，不改变 chunk 回填字段。
+            weights = {field_name: float(value) * index_weight for field_name, value in weights.items()}
         return weights
 
     @staticmethod
     def _build_matched_terms(term_traces: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
-        matched = [
-            {
-                "token": str(trace.get("token", "")),
-                "idf": float(trace.get("idf", 0.0) or 0.0),
-                "term_score": float(trace.get("best_term_score", 0.0) or 0.0),
-                "fields": list(trace.get("fields", []) or []),
-                "query_sources": list(trace.get("query_sources", []) or []),
-            }
-            for trace in term_traces.values()
-        ]
-        matched.sort(key=lambda item: (item["term_score"], item["idf"]), reverse=True)
-        return matched
+        return build_keyword_matched_terms(term_traces)
 
     def _detect_keyword_noise_flags(
         self,
