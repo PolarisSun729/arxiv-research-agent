@@ -639,6 +639,11 @@ class DatabaseService:
             ''')
 
             cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_agent_runtime_checkpoints_thread
+                ON agent_runtime_checkpoints(session_id, thread_id, updated_at DESC)
+            ''')
+
+            cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_agent_runtime_checkpoints_expiry
                 ON agent_runtime_checkpoints(status, expires_at)
             ''')
@@ -4847,6 +4852,60 @@ class DatabaseService:
             logger.error(f"Error getting agent runtime checkpoint: {str(e)}")
             return None
 
+    def list_agent_runtime_checkpoints_by_thread(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """按 session/thread 列出候选 runtime checkpoint，供恢复态丢失 user_id 时二次校验。"""
+        try:
+            normalized_session_id = str(session_id or '').strip()
+            normalized_thread_id = str(thread_id or normalized_session_id).strip()
+            if not normalized_session_id or not normalized_thread_id:
+                return []
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT checkpoint_id, user_id, session_id, thread_id, runtime_state_json,
+                           graph_state_json, pending_confirmation_json, current_node, next_route,
+                           status, error_summary, created_at, updated_at, expires_at
+                    FROM agent_runtime_checkpoints
+                    WHERE session_id = ? AND thread_id = ?
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT ?
+                    ''',
+                    (normalized_session_id, normalized_thread_id, max(int(limit or 1), 1)),
+                )
+                rows = cursor.fetchall()
+                return [self._row_to_agent_runtime_checkpoint(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error listing agent runtime checkpoints by thread: {str(e)}")
+            return []
+
+    def get_agent_runtime_checkpoint_by_thread(
+        self,
+        *,
+        session_id: str,
+        thread_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """按 session/thread 找回唯一 runtime checkpoint，兼容旧调用方的单记录接口。"""
+        try:
+            checkpoints = self.list_agent_runtime_checkpoints_by_thread(
+                session_id=session_id,
+                thread_id=thread_id,
+                limit=2,
+            )
+            # 旧接口只在原始候选唯一时返回，避免缺失 user_id 时误读其他用户现场。
+            if len(checkpoints) != 1:
+                return None
+            return checkpoints[0]
+        except Exception as e:
+            logger.error(f"Error getting agent runtime checkpoint by thread: {str(e)}")
+            return None
+
     def _runtime_state_without_pending_confirmation(
         self,
         raw_runtime_state: Any,
@@ -4867,7 +4926,8 @@ class DatabaseService:
         # 关键修复：优先使用 pending_confirmation 中记录的目标 step_id，而不是 resume_payload 传入的 step_id
         # 因为在桥接确认场景（如 request_confirmation），真正需要批准的是目标工具，而不是桥接步骤本身
         pending_step_id = str(previous_pending.get("step_id") or "").strip()
-        normalized_step_id = str(step_id or "").strip() or pending_step_id
+        requested_step_id = str(step_id or "").strip()
+        normalized_step_id = pending_step_id or requested_step_id
         normalized_decision = str(decision or "").strip().lower()
         payload["pending_confirmation"] = None
 

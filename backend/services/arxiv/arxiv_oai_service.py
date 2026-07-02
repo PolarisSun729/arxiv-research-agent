@@ -446,11 +446,21 @@ class ArxivOaiDatabaseService:
             return 0
         if " ANDNOT " in text:
             parts = self._split_top_level(text, " ANDNOT ")
-            return self._score_relevance_query(paper, parts[0]) if parts else 0
+            if len(parts) > 1:
+                return self._score_relevance_query(paper, parts[0])
+            if not parts:
+                return 0
         if " AND " in text:
-            return sum(self._score_relevance_query(paper, part) for part in self._split_top_level(text, " AND "))
+            parts = self._split_top_level(text, " AND ")
+            # relevance 排序和过滤共用同一套轻量 query 解释，只有顶层切分成功才递归，
+            # 避免括号内操作符让评分阶段也重复处理原查询。
+            if len(parts) > 1:
+                return sum(self._score_relevance_query(paper, part) for part in parts)
         if " OR " in text:
-            return max((self._score_relevance_query(paper, part) for part in self._split_top_level(text, " OR ")), default=0)
+            parts = self._split_top_level(text, " OR ")
+            # 和匹配阶段保持一致：括号内部 OR 不应触发对原字符串的递归评分。
+            if len(parts) > 1:
+                return max((self._score_relevance_query(paper, part) for part in parts), default=0)
         if ":" in text:
             field, raw_query = text.split(":", 1)
             field = field.strip().lower()
@@ -490,17 +500,23 @@ class ArxivOaiDatabaseService:
             return True
         if " ANDNOT " in text:
             parts = self._split_top_level(text, " ANDNOT ")
+            if len(parts) > 1:
+                return self._matches_query(paper, parts[0]) and all(
+                    not self._matches_query(paper, part) for part in parts[1:]
+                )
             if not parts:
                 return True
-            return self._matches_query(paper, parts[0]) and all(
-                not self._matches_query(paper, part) for part in parts[1:]
-            )
         if " AND " in text:
             parts = self._split_top_level(text, " AND ")
-            return all(self._matches_query(paper, part) for part in parts)
+            # 只有顶层逻辑符真正拆出多个子句时才递归；括号内部的 AND 不能让原串原样递归，
+            # 否则类似 `A OR (B AND C)` 会反复处理同一段文本直到栈溢出。
+            if len(parts) > 1:
+                return all(self._matches_query(paper, part) for part in parts)
         if " OR " in text:
             parts = self._split_top_level(text, " OR ")
-            return any(self._matches_query(paper, part) for part in parts)
+            # 同上，OR 也必须确认发生了顶层切分，避免操作符只出现在括号内时递归不收敛。
+            if len(parts) > 1:
+                return any(self._matches_query(paper, part) for part in parts)
         return self._matches_atomic_clause(paper, text)
 
     def _build_paper_response(self, paper: Dict[str, Any]) -> Dict[str, Any]:

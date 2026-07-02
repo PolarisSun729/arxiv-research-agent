@@ -509,7 +509,124 @@ def test_plan_executor_checkpoint_approval_honored_when_goal_type_matches(monkey
 
 
 # --------------------------------------------------------------------------------------
-# 11. replan 后不污染原始成功输出：低质量 search 触发 replan 修复，最终成功；
+# 11. resume 后状态丢失 user_id：批准态已经写入真实用户的 checkpoint 时，执行器应能按
+#     同一 session/thread 安全找回批准态，而不是再次进入确认门。
+# --------------------------------------------------------------------------------------
+def test_plan_executor_checkpoint_approval_honored_when_resume_state_loses_user_id(monkeypatch) -> None:
+    calls = []
+
+    class ResumeCheckpointDatabase:
+        def get_agent_runtime_checkpoint(self, **kwargs):
+            # 复现线上日志里的断点：LangGraph 恢复态没有带回真实 user_id，
+            # 精确 user 查询会落到默认用户，因此读不到刚刚消费过的批准态。
+            assert kwargs.get("user_id") == executor_module.DEFAULT_USER_ID
+            return None
+
+        def get_agent_runtime_checkpoint_by_thread(self, **kwargs):
+            assert kwargs.get("session_id") == "s1"
+            assert kwargs.get("thread_id") == "s1"
+            return {
+                "user_id": "local_user",
+                "status": "running",
+                "pending_confirmation": None,
+                "runtime_state": {
+                    "approved_step_ids": ["parse_and_index_paper"],
+                    "plan": {"plan_id": "paper_qa:test"},
+                    "goal": {"goal_type": "paper_qa"},
+                },
+            }
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        calls.append((tool_name, dict(kwargs)))
+        if tool_name == "build_paper_qa_index":
+            return {"ok": True, "tool_name": tool_name, "summary": "indexed", "data": {"status": "indexed", "has_index": True}, "trace": {}, "error": None}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    def fail_if_interrupted(*args, **kwargs):
+        raise AssertionError("consumed checkpoint approval must not request confirmation again")
+
+    monkeypatch.setattr(executor_module, "DatabaseService", ResumeCheckpointDatabase)
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+    monkeypatch.setattr(executor_module, "interrupt", fail_if_interrupted)
+
+    goal, plan = _paper_index_confirmation_plan()
+    state = AgentState(user_id="", session_id="s1", intent="paper_qa", message="build index")
+    runtime = planner_module.build_plan_runtime(state, goal=goal, plan=plan, turn_status="success")
+    runtime.step_status = {step.step_id: "pending" for step in list(plan.steps or [])}
+
+    result = PlanExecutor()._execute_runtime(runtime, state, allow_interrupt=True)
+
+    assert result.status == "success"
+    assert calls and calls[0][0] == "build_paper_qa_index"
+    assert not any(trace.event == "confirmation_requested" for trace in result.trace)
+
+
+# --------------------------------------------------------------------------------------
+# 12. resume 后存在多个同 thread checkpoint：只有通过批准态、plan、goal 校验的唯一候选
+#     可以放行，避免默认用户旧记录遮住真实用户的已消费批准态。
+# --------------------------------------------------------------------------------------
+def test_plan_executor_checkpoint_approval_recovers_single_valid_thread_candidate(monkeypatch) -> None:
+    calls = []
+
+    class MultiCandidateCheckpointDatabase:
+        def get_agent_runtime_checkpoint(self, **kwargs):
+            assert kwargs.get("user_id") == executor_module.DEFAULT_USER_ID
+            return {
+                "user_id": executor_module.DEFAULT_USER_ID,
+                "status": "waiting_confirmation",
+                "pending_confirmation": {"step_id": "parse_and_index_paper"},
+                "runtime_state": {
+                    "approved_step_ids": [],
+                    "plan": {"plan_id": "paper_qa:test"},
+                    "goal": {"goal_type": "paper_qa"},
+                },
+            }
+
+        def list_agent_runtime_checkpoints_by_thread(self, **kwargs):
+            assert kwargs.get("session_id") == "s1"
+            assert kwargs.get("thread_id") == "s1"
+            # 默认用户旧记录仍处于 waiting，不应被放行；真实用户记录已经消费确认并写入批准态。
+            return [
+                self.get_agent_runtime_checkpoint(user_id=executor_module.DEFAULT_USER_ID, session_id="s1", thread_id="s1"),
+                {
+                    "user_id": "local_user",
+                    "status": "running",
+                    "pending_confirmation": None,
+                    "runtime_state": {
+                        "approved_step_ids": ["parse_and_index_paper"],
+                        "plan": {"plan_id": "paper_qa:test"},
+                        "goal": {"goal_type": "paper_qa"},
+                    },
+                },
+            ]
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        calls.append((tool_name, dict(kwargs)))
+        if tool_name == "build_paper_qa_index":
+            return {"ok": True, "tool_name": tool_name, "summary": "indexed", "data": {"status": "indexed", "has_index": True}, "trace": {}, "error": None}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    def fail_if_interrupted(*args, **kwargs):
+        raise AssertionError("single valid thread fallback candidate must not request confirmation again")
+
+    monkeypatch.setattr(executor_module, "DatabaseService", MultiCandidateCheckpointDatabase)
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+    monkeypatch.setattr(executor_module, "interrupt", fail_if_interrupted)
+
+    goal, plan = _paper_index_confirmation_plan()
+    state = AgentState(user_id="", session_id="s1", intent="paper_qa", message="build index")
+    runtime = planner_module.build_plan_runtime(state, goal=goal, plan=plan, turn_status="success")
+    runtime.step_status = {step.step_id: "pending" for step in list(plan.steps or [])}
+
+    result = PlanExecutor()._execute_runtime(runtime, state, allow_interrupt=True)
+
+    assert result.status == "success"
+    assert calls and calls[0][0] == "build_paper_qa_index"
+    assert not any(trace.event == "confirmation_requested" for trace in result.trace)
+
+
+# --------------------------------------------------------------------------------------
+# 13. replan 后不污染原始成功输出：低质量 search 触发 replan 修复，最终成功；
 #     原始已成功步骤的输出在 replan 后仍然可用，未被覆盖或清空。
 # --------------------------------------------------------------------------------------
 def test_plan_executor_replan_preserves_prior_success_outputs(monkeypatch) -> None:
@@ -551,7 +668,7 @@ def test_plan_executor_replan_preserves_prior_success_outputs(monkeypatch) -> No
 
 
 # --------------------------------------------------------------------------------------
-# 12. 终态可区分性：成功 / 等待确认 / 用户取消（拒绝）三类终态在 turn_status 和
+# 14. 终态可区分性：成功 / 等待确认 / 用户取消（拒绝）三类终态在 turn_status 和
 #     execution_path.final_status 上必须可区分，不能都坍缩成同一种状态。
 # --------------------------------------------------------------------------------------
 def test_terminal_states_are_distinguishable_cancel_vs_waiting_vs_success(monkeypatch) -> None:

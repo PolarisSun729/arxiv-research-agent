@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import sys
 
 import pytest
 
+from services.storage.database_service import DatabaseService
 from tests.helpers.agent_runtime import load_agent_test_modules
 
 
@@ -285,6 +287,165 @@ def test_runtime_checkpoint_consumes_pending_confirmation_once() -> None:
             resume_payload={"decision": "approve", "step_id": "parse_and_index_paper"},
         )
     assert validate_info.value.reason == "checkpoint_not_waiting:running"
+
+
+def test_database_consume_approves_pending_confirmation_target_step() -> None:
+    database = DatabaseService.__new__(DatabaseService)
+    raw_runtime_state = json.dumps(
+        {
+            "pending_confirmation": _confirmation_payload("parse_and_index_paper"),
+            "approved_step_ids": [],
+            "step_status": {
+                "parse_and_index_paper": "waiting_confirmation",
+                "request_confirmation": "waiting_confirmation",
+            },
+            "recovery_strategy": {"type": "request_confirmation", "step_id": "request_confirmation"},
+        }
+    )
+
+    cleaned_raw = database._runtime_state_without_pending_confirmation(
+        raw_runtime_state,
+        decision="approve",
+        step_id="request_confirmation",
+    )
+    cleaned = json.loads(cleaned_raw)
+
+    assert cleaned["pending_confirmation"] is None
+    assert cleaned["approved_step_ids"] == ["parse_and_index_paper"]
+    assert cleaned["step_status"]["parse_and_index_paper"] == "pending"
+    assert cleaned["step_status"]["request_confirmation"] == "waiting_confirmation"
+    assert cleaned["recovery_strategy"] is None
+
+
+def test_database_lists_runtime_checkpoints_by_thread_candidates(tmp_path) -> None:
+    database = DatabaseService.__new__(DatabaseService)
+    database.db_path = str(tmp_path / "runtime-checkpoints.sqlite")
+    database.check_same_thread = False
+
+    with database._get_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE agent_runtime_checkpoints (
+                checkpoint_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                runtime_state_json TEXT,
+                graph_state_json TEXT,
+                pending_confirmation_json TEXT,
+                current_node TEXT,
+                next_route TEXT,
+                status TEXT,
+                error_summary TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                expires_at TEXT
+            )
+            """
+        )
+        rows = [
+            (
+                "default:s1:s1",
+                "default",
+                "s1",
+                "s1",
+                {"approved_step_ids": []},
+                {"node": "execute_step"},
+                {"step_id": "parse_and_index_paper"},
+                "execute_step",
+                "running",
+                "waiting_confirmation",
+                "",
+                "2026-07-02T13:07:15",
+                "2026-07-02T13:07:15",
+                None,
+            ),
+            (
+                "local_user:s1:s1",
+                "local_user",
+                "s1",
+                "s1",
+                {"approved_step_ids": ["parse_and_index_paper"]},
+                {"node": "execute_step"},
+                None,
+                "execute_step",
+                "running",
+                "running",
+                "",
+                "2026-07-02T13:07:16",
+                "2026-07-02T13:07:16",
+                None,
+            ),
+        ]
+        for row in rows:
+            conn.execute(
+                """
+                INSERT INTO agent_runtime_checkpoints (
+                    checkpoint_id, user_id, session_id, thread_id, runtime_state_json,
+                    graph_state_json, pending_confirmation_json, current_node, next_route,
+                    status, error_summary, created_at, updated_at, expires_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3],
+                    json.dumps(row[4]),
+                    json.dumps(row[5]),
+                    json.dumps(row[6]) if row[6] is not None else "",
+                    row[7],
+                    row[8],
+                    row[9],
+                    row[10],
+                    row[11],
+                    row[12],
+                    row[13],
+                ),
+            )
+        conn.commit()
+
+    candidates = database.list_agent_runtime_checkpoints_by_thread(session_id="s1", thread_id="s1")
+
+    assert [candidate["user_id"] for candidate in candidates] == ["local_user", "default"]
+    assert candidates[0]["runtime_state"]["approved_step_ids"] == ["parse_and_index_paper"]
+    # 单记录兼容接口只在原始候选唯一时返回，避免 user_id 丢失时直接误用多用户记录。
+    assert database.get_agent_runtime_checkpoint_by_thread(session_id="s1", thread_id="s1") is None
+
+
+def test_runtime_checkpoint_does_not_restore_consumed_confirmation_from_stale_stream_state() -> None:
+    database = _InMemoryCheckpointDatabase()
+    database.record = {
+        "user_id": "u1",
+        "session_id": "s1",
+        "thread_id": "s1",
+        "runtime_state": {
+            "pending_confirmation": None,
+            "approved_step_ids": ["parse_and_index_paper"],
+        },
+        "pending_confirmation": None,
+        "status": runtime_checkpoint.CHECKPOINT_STATUS_RUNNING,
+        "next_route": runtime_checkpoint.CHECKPOINT_STATUS_RUNNING,
+        "expires_at": None,
+    }
+    manager = runtime_checkpoint.AgentRuntimeCheckpointManager(database_service=database)
+
+    manager.persist_state(
+        {
+            "user_id": "u1",
+            "session_id": "s1",
+            "runtime_state": {
+                "pending_confirmation": _confirmation_payload("parse_and_index_paper"),
+                "approved_step_ids": [],
+            },
+        },
+        current_node="execute_step",
+    )
+
+    assert database.record["status"] == runtime_checkpoint.CHECKPOINT_STATUS_RUNNING
+    assert database.record["pending_confirmation"] is None
+    assert database.record["runtime_state"]["approved_step_ids"] == ["parse_and_index_paper"]
 
 
 def test_runtime_checkpoint_terminal_status_cannot_resume_again() -> None:

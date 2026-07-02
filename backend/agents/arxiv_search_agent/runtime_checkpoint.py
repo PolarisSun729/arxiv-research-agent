@@ -332,6 +332,15 @@ class AgentRuntimeCheckpointManager:
         status = _status_from_state(payload, pending_confirmation=pending_confirmation)
         expires_at = _iso(_utcnow() + timedelta(seconds=self.ttl_seconds)) if status == CHECKPOINT_STATUS_WAITING else None
         error_summary = _extract_error_summary(payload)
+        if _is_consumed_confirmation_replay(
+            self.database_service,
+            user_id=user_id,
+            session_id=session_id,
+            thread_id=session_id,
+            status=status,
+            pending_confirmation=pending_confirmation,
+        ):
+            return
         self.database_service.upsert_agent_runtime_checkpoint(
             user_id=user_id,
             session_id=session_id,
@@ -529,6 +538,38 @@ def _status_from_state(payload: Mapping[str, Any], *, pending_confirmation: Opti
     if turn_status:
         return CHECKPOINT_STATUS_COMPLETED
     return CHECKPOINT_STATUS_RUNNING
+
+
+def _is_consumed_confirmation_replay(
+    database_service: Any,
+    *,
+    user_id: str,
+    session_id: str,
+    thread_id: str,
+    status: str,
+    pending_confirmation: Optional[Mapping[str, Any]],
+) -> bool:
+    """判断当前 waiting 快照是否只是已消费确认的旧流式回放。"""
+    if status != CHECKPOINT_STATUS_WAITING or not isinstance(pending_confirmation, Mapping):
+        return False
+    pending_step_id = str(pending_confirmation.get("step_id") or "").strip()
+    if not pending_step_id:
+        return False
+    get_checkpoint = getattr(database_service, "get_agent_runtime_checkpoint", None)
+    if not callable(get_checkpoint):
+        return False
+    existing = get_checkpoint(user_id=user_id, session_id=session_id, thread_id=thread_id)
+    if not isinstance(existing, Mapping):
+        return False
+    if str(existing.get("status") or "").strip() != CHECKPOINT_STATUS_RUNNING:
+        return False
+    if existing.get("pending_confirmation"):
+        return False
+    runtime_state = existing.get("runtime_state") if isinstance(existing.get("runtime_state"), Mapping) else {}
+    approved_step_ids = {str(item).strip() for item in list(runtime_state.get("approved_step_ids") or []) if str(item).strip()}
+    # LangGraph resume 后可能先吐出中断前的旧状态；如果业务 checkpoint 已经记录同一 step 被批准，
+    # 这里必须保留 running 现场，避免旧 pending_confirmation 把恢复流程重新拉回等待确认。
+    return pending_step_id in approved_step_ids
 
 
 def _extract_error_summary(payload: Mapping[str, Any]) -> str:

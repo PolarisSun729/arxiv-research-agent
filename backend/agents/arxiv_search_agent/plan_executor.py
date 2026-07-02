@@ -162,38 +162,14 @@ def _checkpoint_goal_type_from_runtime_state(runtime_state: Any) -> str:
     return ""
 
 
-def _checkpoint_approved_step_ids_for_state(
+def _approved_step_ids_from_checkpoint(
+    checkpoint: Any,
     *,
-    state: AgentState,
     runtime: Optional[PlanRuntime],
+    state: AgentState,
     step: PlanStep,
 ) -> List[str]:
-    """从业务 checkpoint 读取已消费的批准态，作为 LangGraph 重入丢态时的兜底。
-
-    这里仍以 runtime checkpoint 为真源，不读取 pending_action 展示镜像；并且只接受
-    running、已清空 pending_confirmation、plan_id 匹配的记录，避免旧会话终态误放行副作用工具。
-    """
-    session_id = str(state.session_id or "").strip()
-    if not session_id:
-        return []
-    # stream resume 可能只携带 session/thread，而 user_id 仍留空；
-    # business checkpoint 在写入/消费时会回退到 DEFAULT_USER_ID，这里必须做同样归一，
-    # 否则 executor 会查不到刚刚消费过的批准态，又把同一步误判成“仍需确认”。
-    normalized_user_id = str(state.user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
-    try:
-        checkpoint = DatabaseService().get_agent_runtime_checkpoint(
-            user_id=normalized_user_id,
-            session_id=session_id,
-            thread_id=session_id,
-        )
-    except Exception as exc:  # pragma: no cover - checkpoint 兜底失败时应回到正常确认门
-        logger.debug(
-            "arxiv_agent checkpoint approved lookup failed: session_id=%s step_id=%s error=%s",
-            session_id,
-            step.step_id,
-            exc,
-        )
-        return []
+    """校验 checkpoint 中的批准态是否属于当前执行计划。"""
     if not isinstance(checkpoint, Mapping):
         return []
     if str(checkpoint.get("status") or "").strip() != "running":
@@ -227,6 +203,83 @@ def _checkpoint_approved_step_ids_for_state(
         )
         return []
     return approved_step_ids
+
+
+def _checkpoint_approved_step_ids_for_state(
+    *,
+    state: AgentState,
+    runtime: Optional[PlanRuntime],
+    step: PlanStep,
+) -> List[str]:
+    """从业务 checkpoint 读取已消费的批准态，作为 LangGraph 重入丢态时的兜底。
+
+    这里仍以 runtime checkpoint 为真源，不读取 pending_action 展示镜像；并且只接受
+    running、已清空 pending_confirmation、plan_id 匹配的记录，避免旧会话终态误放行副作用工具。
+    """
+    session_id = str(state.session_id or "").strip()
+    if not session_id:
+        return []
+    normalized_user_id = str(state.user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+    try:
+        database = DatabaseService()
+        checkpoint = database.get_agent_runtime_checkpoint(
+            user_id=normalized_user_id,
+            session_id=session_id,
+            thread_id=session_id,
+        )
+        approved_step_ids = _approved_step_ids_from_checkpoint(
+            checkpoint,
+            runtime=runtime,
+            state=state,
+            step=step,
+        )
+        if approved_step_ids:
+            return approved_step_ids
+        # LangGraph resume 的业务 state 可能只恢复了 session/thread，丢失真实 user_id；
+        # 精确用户查询失败后，按同一 session/thread 取候选，再用同一套 plan/goal 校验收窄到唯一有效记录。
+        list_by_thread = getattr(database, "list_agent_runtime_checkpoints_by_thread", None)
+        if callable(list_by_thread):
+            fallback_candidates = list_by_thread(session_id=session_id, thread_id=session_id)
+        else:
+            get_by_thread = getattr(database, "get_agent_runtime_checkpoint_by_thread", None)
+            fallback_candidates = [get_by_thread(session_id=session_id, thread_id=session_id)] if callable(get_by_thread) else []
+        valid_fallbacks: List[Tuple[Mapping[str, Any], List[str]]] = []
+        for fallback_checkpoint in list(fallback_candidates or []):
+            fallback_approved_step_ids = _approved_step_ids_from_checkpoint(
+                fallback_checkpoint,
+                runtime=runtime,
+                state=state,
+                step=step,
+            )
+            if fallback_approved_step_ids and isinstance(fallback_checkpoint, Mapping):
+                valid_fallbacks.append((fallback_checkpoint, fallback_approved_step_ids))
+        if len(valid_fallbacks) > 1:
+            logger.info(
+                "arxiv_agent checkpoint approval ignored: step_id=%s tool_name=%s reason=ambiguous_thread_fallback candidate_count=%s",
+                step.step_id,
+                step.tool_name,
+                len(valid_fallbacks),
+            )
+            return []
+        if valid_fallbacks:
+            fallback_checkpoint, fallback_approved_step_ids = valid_fallbacks[0]
+            logger.info(
+                "arxiv_agent checkpoint approval recovered by thread: step_id=%s tool_name=%s state_user_id=%s checkpoint_user_id=%s",
+                step.step_id,
+                step.tool_name,
+                normalized_user_id,
+                fallback_checkpoint.get("user_id"),
+            )
+            return fallback_approved_step_ids
+    except Exception as exc:  # pragma: no cover - checkpoint 兜底失败时应回到正常确认门
+        logger.debug(
+            "arxiv_agent checkpoint approved lookup failed: session_id=%s step_id=%s error=%s",
+            session_id,
+            step.step_id,
+            exc,
+        )
+        return []
+    return []
 
 
 def _record_approved_step_ids(
