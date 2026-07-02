@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
 
+from services.retrieval.contracts import RetrievalOptions
 from tests.helpers.retrieval import build_retrieval_service
 
 
@@ -13,11 +14,8 @@ class RagGoldenPipelineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.service, self.collection_name, *_ = build_retrieval_service()
-        self.modules = __import__(
-            "services.retrieval.enhanced_retrieval_service",
-            fromlist=["RetrievalOptions"],
-        )
         self.service.trace_export_dir = Path(self.temp_dir.name)
+        self.service.trace_builder.trace_export_dir = Path(self.temp_dir.name)
         self.paper_context = {
             "arxiv_id": "2401.00001",
             "title": "Fixed RAG Golden Paper",
@@ -28,7 +26,7 @@ class RagGoldenPipelineTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def _retrieve(self, question: str, *, top_k: int = 4) -> Dict[str, Any]:
-        options = self.modules.RetrievalOptions(
+        options = RetrievalOptions(
             top_k=top_k,
             enable_query_rewrite=True,
             enable_hyde=False,
@@ -36,7 +34,7 @@ class RagGoldenPipelineTests(unittest.TestCase):
             enable_llm_rerank=False,
             debug=True,
         )
-        return self.service.enhanced_retrieve(
+        return self.service.retrieval_pipeline.retrieve(
             question,
             self.collection_name,
             paper_context=self.paper_context,
@@ -111,6 +109,9 @@ class RagGoldenPipelineTests(unittest.TestCase):
                 trace_payload = json.loads(Path(result["trace_export"]["json"]).read_text(encoding="utf-8"))
                 self.assertEqual(trace_payload["paper_context"]["arxiv_id"], "2401.00001")
                 self.assertTrue(trace_payload["steps"])
+                self.assertIn(trace_payload["sparse_index"]["load_source"], {"persistent_sparse_artifact", "runtime_build_fallback"})
+                self.assertIn("keyword_search", trace_payload)
+                self.assertIn("sparse_index", [step["step"] for step in trace_payload["steps"]])
 
     def test_figure_table_question_keeps_visual_asset_in_candidates_and_trace(self) -> None:
         result = self._assert_evidence_hit(

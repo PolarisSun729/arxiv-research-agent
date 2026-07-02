@@ -23,7 +23,7 @@ python scripts/check_quality.py
 
 basic doctor 是默认入口的第一阶段，只检查 Python / Node / 依赖安装 / 配置加载 / 本地目录 / SQLite 临时写入 / FastAPI lazy 创建等本地运行条件。它不会访问外部网络，也不会要求 Milvus、arXiv、LLM、Embedding 或 rerank 服务可用。
 
-后端静态检查是独立阶段，不等同于普通单元测试。它会先执行 `compileall` 覆盖 `backend/` 下所有 Python 文件，再导入应用入口、依赖装配、router、service、Agent、tool、config 等关键模块，用来提前发现语法错误、基础编译错误、模块重命名遗漏和导出契约断裂。导入检查固定使用 lazy/offline 模式，不会实例化真实 LLM、Embedding、Milvus、arXiv 或 PDF 解析链路。
+后端静态检查是独立阶段，不等同于普通单元测试。它会先扫描已删除的 legacy 入口，再执行 `compileall` 覆盖 `backend/` 下所有 Python 文件，并导入应用入口、依赖装配、router、service、Agent、tool、config 等关键模块，用来提前发现语法错误、基础编译错误、模块重命名遗漏和导出契约断裂。导入检查固定使用 lazy/offline 模式，不会实例化真实 LLM、Embedding、Milvus、arXiv 或 PDF 解析链路。Agent 确认恢复状态以 `pending_confirmation` / `runtime_state` / `resume` 为准，不再新增独立 legacy 映射入口；向量存储服务统一走 `dependencies.get_vector_store_service()` 或 `services.storage.vector_store_service.VectorStoreService`，不再恢复 archive 旧实现。
 
 如果当前环境安装了 `ruff`，静态检查会额外运行：
 
@@ -54,6 +54,15 @@ smoke test 和 full integration test 的边界如下：
 - smoke test 只证明应用入口、router 装配、依赖注入表面和错误契约没有被改坏，使用 fake service 和 `TestClient`，不跑完整业务链路。
 - full integration test 才验证 RAG、Recommendation、Paper QA、Memory 等业务流程，仍应使用 fake 或临时 SQLite，不进入默认真实外部服务连接。
 - 真实 Milvus、真实 arXiv、真实模型调用、真实 PDF 下载解析属于手动外部集成检查，不进入默认 smoke。
+
+## Paper QA 边界审查规则
+
+Paper QA 相关改动除运行测试外，还需要在 code review 中检查服务边界：
+
+1. `PaperQAService` 只应新增主流程编排入口，不应为了测试方便新增 `SessionService`、`ContextPackBuilder`、`AnswerGenerator` 或 `qa_utils` 的透传 wrapper。
+2. 组件能力测试应直接放到 `backend/tests/unit/services/paper_qa/`，集成测试只覆盖 QA 主流程、副作用和输出结构。
+3. 新增或修改 LLM 调用、规则兜底、参数校验、状态流转、debug/trace 记录时，应同步更新中文注释、边界文档和对应断言。
+4. 若确实需要保留 router 兼容入口，需要在 `docs/paper_qa_service_wrapper_boundary.md` 说明调用方、迁移条件和删除时机。
 
 ## 分阶段命令
 

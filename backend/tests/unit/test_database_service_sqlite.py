@@ -169,6 +169,15 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
                 retrieval_index_count=5,
                 retrieval_index_types='["body","section_anchor"]',
                 retrieval_index_version="retrieval-v1",
+                sparse_index_dir="/tmp/sparse-index",
+                sparse_index_manifest_file="/tmp/sparse-index/manifest.json",
+                sparse_index_document_count=6,
+                sparse_index_token_count=42,
+                sparse_index_backend="internal_bm25",
+                sparse_index_schema_version="sparse_index_artifact_v1",
+                sparse_index_source_file="/tmp/chunks.json",
+                sparse_index_source_hash="abc123",
+                sparse_index_avgdl=12.5,
                 embedding_file="/tmp/embeddings.json",
                 loading_method="docling",
                 chunking_strategy="docling_sections",
@@ -197,6 +206,15 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
         self.assertEqual(qa_index["retrieval_index_count"], 5)
         self.assertEqual(qa_index["retrieval_index_types"], '["body","section_anchor"]')
         self.assertEqual(qa_index["retrieval_index_version"], "retrieval-v1")
+        self.assertEqual(qa_index["sparse_index_dir"], "/tmp/sparse-index")
+        self.assertEqual(qa_index["sparse_index_manifest_file"], "/tmp/sparse-index/manifest.json")
+        self.assertEqual(qa_index["sparse_index_document_count"], 6)
+        self.assertEqual(qa_index["sparse_index_token_count"], 42)
+        self.assertEqual(qa_index["sparse_index_backend"], "internal_bm25")
+        self.assertEqual(qa_index["sparse_index_schema_version"], "sparse_index_artifact_v1")
+        self.assertEqual(qa_index["sparse_index_source_file"], "/tmp/chunks.json")
+        self.assertEqual(qa_index["sparse_index_source_hash"], "abc123")
+        self.assertEqual(qa_index["sparse_index_avgdl"], 12.5)
         self.assertEqual(qa_index["embedding_file"], "/tmp/embeddings.json")
         self.assertEqual(qa_index["loading_method"], "docling")
         self.assertEqual(qa_index["chunking_strategy"], "docling_sections")
@@ -227,6 +245,15 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
                 retrieval_index_count=4,
                 retrieval_index_types='["body","summary"]',
                 retrieval_index_version="retrieval-new",
+                sparse_index_dir="sparse-new",
+                sparse_index_manifest_file="sparse-new/manifest.json",
+                sparse_index_document_count=4,
+                sparse_index_token_count=33,
+                sparse_index_backend="internal_bm25",
+                sparse_index_schema_version="sparse_index_artifact_v1",
+                sparse_index_source_file="chunks-new.json",
+                sparse_index_source_hash="hash-new",
+                sparse_index_avgdl=9.25,
                 current_stage="activate_index",
             )
         )
@@ -240,9 +267,53 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
         self.assertEqual(active["active_build_id"], build["build_id"])
         self.assertEqual(active["retrieval_index_file"], "retrieval-new.json")
         self.assertEqual(active["retrieval_index_count"], 4)
+        self.assertEqual(active["sparse_index_manifest_file"], "sparse-new/manifest.json")
+        self.assertEqual(active["sparse_index_document_count"], 4)
+        self.assertEqual(active["sparse_index_token_count"], 33)
+        self.assertEqual(active["sparse_index_source_hash"], "hash-new")
         self.assertEqual(active_versions[0]["retrieval_index_file"], "retrieval-new.json")
+        self.assertEqual(active_versions[0]["sparse_index_manifest_file"], "sparse-new/manifest.json")
+        self.assertEqual(active_versions[0]["sparse_index_token_count"], 33)
         self.assertEqual(len(active_versions), 1)
         self.assertEqual(cleanup_versions[0]["build_id"], old_active["build_id"])
+
+    def test_paper_qa_index_build_activation_requires_sparse_artifact(self) -> None:
+        arxiv_id = "2401.01002"
+        self.assertTrue(
+            self.service.insert_paper_qa_index(
+                arxiv_id,
+                collection_name="qa_old_sparse_guard",
+                status="indexed",
+                chunk_count=1,
+                embedding_model="old-model",
+            )
+        )
+        old_active = self.service.get_active_paper_qa_index_build(arxiv_id)
+        build = self.service.create_paper_qa_index_build(arxiv_id, "docling")
+        self.assertTrue(
+            self.service.update_paper_qa_index_build(
+                build["build_id"],
+                status="build_success",
+                collection_name="qa_new_missing_sparse",
+                chunk_count=2,
+                embedding_model="new-model",
+                retrieval_index_file="retrieval-new.json",
+                retrieval_index_count=4,
+                retrieval_index_types='["body","summary"]',
+                retrieval_index_version="retrieval-new",
+                current_stage="activate_index",
+            )
+        )
+
+        self.assertFalse(self.service.activate_paper_qa_index_build(build["build_id"]))
+
+        active = self.service.get_paper_qa_index(arxiv_id)
+        new_build = self.service.get_paper_qa_index_build(build["build_id"])
+        cleanup_versions = self.service.list_paper_qa_index_builds(arxiv_id, statuses=["cleanup_pending"], limit=10)
+        self.assertEqual(active["collection_name"], "qa_old_sparse_guard")
+        self.assertEqual(active["active_build_id"], old_active["build_id"])
+        self.assertEqual(new_build["status"], "build_success")
+        self.assertEqual(cleanup_versions, [])
 
     def test_legacy_qa_index_row_is_recognized_as_active_version(self) -> None:
         arxiv_id = "2401.01001"

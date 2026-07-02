@@ -227,8 +227,8 @@ class RerankService:
                     provider="dashscope",
                 )
 
-        loader = getattr(self.config_owner, "_load_llm_reranker", None)
-        reranker = loader() if callable(loader) else self.load_llm_reranker()
+        # reranker 的加载职责属于 RerankService；不再绕回 EnhancedRetrievalService 的历史私有 wrapper。
+        reranker = self.load_llm_reranker()
         if reranker is None:
             return self._fallback_result(
                 limited_chunks,

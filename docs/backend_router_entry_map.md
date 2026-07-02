@@ -506,21 +506,13 @@
 
 #### Endpoints
 
-1. `POST /api/user/preferences`
-   - Endpoint：`legacy_post_user_preferences()`
-   - 输入参数：
-     - Body：`user_id`
-   - 主要调用对象：`DatabaseService.get_user_preferences()`
-   - 业务功能：deprecated 兼容读取入口；正式读取应使用 `GET /api/user/preferences/{user_id}`
-   - 备注：不会创建、更新或 upsert 偏好；响应和 OpenAPI 都显式标记 deprecated
-
-2. `GET /api/user/preferences/{user_id}`
+1. `GET /api/user/preferences/{user_id}`
    - Endpoint：`get_user_preferences()`
    - 输入参数：Path `user_id`
    - 主要调用对象：`DatabaseService.get_user_preferences()`
    - 业务功能：读取用户偏好
 
-3. `POST /api/user/like-paper`
+2. `POST /api/user/like-paper`
    - Endpoint：`like_paper()`
    - 输入参数：
      - `arxiv_id`
@@ -529,7 +521,7 @@
    - 主要调用对象：`RecommendationService.record_user_paper_preference(liked=True)`
    - 业务功能：记录“喜欢论文”强偏好，并触发论文物化与画像事件写入；不写通用 paper-action
 
-4. `POST /api/user/dislike-paper`
+3. `POST /api/user/dislike-paper`
    - Endpoint：`dislike_paper()`
    - 输入参数：
      - `arxiv_id`
@@ -538,7 +530,7 @@
    - 主要调用对象：`RecommendationService.record_user_paper_preference(liked=False)`
    - 业务功能：记录“不喜欢论文”强偏好，并触发论文物化与画像事件写入；不写通用 paper-action
 
-5. `POST /api/user/paper-action`
+4. `POST /api/user/paper-action`
    - Endpoint：`record_paper_action()`
    - 输入参数：`PaperActionRequest`
      - `user_id`
@@ -549,7 +541,7 @@
    - 主要调用对象：`RecommendationService.record_user_paper_action()`
    - 业务功能：记录弱论文行为事件；拒绝 `like/dislike` 及其等价表达
 
-6. `DELETE /api/user/paper-action`
+5. `DELETE /api/user/paper-action`
    - Endpoint：`remove_paper_action()`
    - 输入参数：
      - `arxiv_id`
@@ -558,7 +550,7 @@
    - 主要调用对象：`DatabaseService.remove_user_paper_action()`
    - 业务功能：删除一条弱论文行为记录；取消喜欢/不喜欢必须走强偏好专用 DELETE
 
-7. `GET /api/user/paper-actions/{user_id}`
+6. `GET /api/user/paper-actions/{user_id}`
    - Endpoint：`get_user_paper_actions()`
    - 输入参数：
      - Path：`user_id`
@@ -568,13 +560,13 @@
      - `DatabaseService.get_user_paper_action_map()`
    - 业务功能：查询用户论文行为明细与映射
 
-8. `GET /api/user/research-profile/{user_id}`
+7. `GET /api/user/research-profile/{user_id}`
    - Endpoint：`get_user_research_profile()`
    - 输入参数：Path `user_id`
    - 主要调用对象：`MemoryService.load_user_profile()`
    - 业务功能：读取用户研究画像
 
-9. `PUT /api/user/research-profile`
+8. `PUT /api/user/research-profile`
    - Endpoint：`upsert_user_research_profile()`
    - 输入参数：`ResearchProfileRequest`
      - `user_id`
@@ -588,13 +580,13 @@
    - 主要调用对象：`MemoryService.patch_user_profile(source="manual_upsert")`
    - 业务功能：整体式更新/补全研究画像
 
-10. `PATCH /api/user/research-profile`
+9. `PATCH /api/user/research-profile`
    - Endpoint：`patch_user_research_profile()`
    - 输入参数：`ResearchProfileRequest`
    - 主要调用对象：`MemoryService.patch_user_profile(source="manual")`
    - 业务功能：局部补丁式更新研究画像
 
-11. `DELETE /api/user/like-paper`
+10. `DELETE /api/user/like-paper`
    - Endpoint：`remove_like()`
    - 输入参数：
      - `arxiv_id`
@@ -602,7 +594,7 @@
    - 主要调用对象：`DatabaseService.remove_liked_paper()`
    - 业务功能：撤销喜欢记录
 
-12. `DELETE /api/user/dislike-paper`
+11. `DELETE /api/user/dislike-paper`
    - Endpoint：`remove_dislike()`
    - 输入参数：
      - `arxiv_id`
@@ -610,21 +602,21 @@
    - 主要调用对象：`DatabaseService.remove_disliked_paper()`
    - 业务功能：撤销不喜欢记录
 
-13. `POST /api/user/generate-interest-vector`
+12. `POST /api/user/generate-interest-vector`
    - Endpoint：`generate_user_interest_vector()`
    - 输入参数：
      - Body：`user_id`
    - 主要调用对象：`RecommendationService.generate_user_interest_vector()`
    - 业务功能：根据偏好与行为重建用户兴趣向量
 
-14. `GET /api/user/interest-vector`
+13. `GET /api/user/interest-vector`
    - Endpoint：`get_user_interest_vector()`
    - 输入参数：
      - Query：`user_id`
    - 主要调用对象：`DatabaseService.get_user_interest_vector()`
    - 业务功能：读取用户当前兴趣向量
 
-15. `POST /api/user/recommend-papers`
+14. `POST /api/user/recommend-papers`
    - Endpoint：`recommend_papers()`
    - 输入参数：
      - `user_id`
@@ -693,7 +685,6 @@
 | `/api/paper/{arxiv_id}/notes/export` | GET | `qa_router.py` | `export_paper_notes_markdown()` | `DatabaseService` | 导出论文笔记 Markdown |
 | `/api/paper/{arxiv_id}/qa` | POST | `qa_router.py` | `qa_paper()` | `PaperQAService.answer_question` | 同步论文问答 |
 | `/api/paper/{arxiv_id}/qa/stream` | POST | `qa_router.py` | `qa_paper_stream()` | `PaperQAService` + `GenerationService` | 流式论文问答 |
-| `/api/user/preferences` | POST | `user_router.py` | `legacy_post_user_preferences()` | `DatabaseService` | Deprecated 兼容读取；请改用 GET |
 | `/api/user/preferences/{user_id}` | GET | `user_router.py` | `get_user_preferences()` | `DatabaseService` | 读取用户偏好 |
 | `/api/user/like-paper` | POST | `user_router.py` | `like_paper()` | `RecommendationService.record_user_paper_preference` | 记录喜欢论文强偏好 |
 | `/api/user/dislike-paper` | POST | `user_router.py` | `dislike_paper()` | `RecommendationService.record_user_paper_preference` | 记录不喜欢论文强偏好 |
@@ -784,7 +775,7 @@
 是否触发 retrieval / rerank / generation：
 
 - 会
-- `PaperQAService.build_qa_context()` 内部会调用 `EnhancedRetrievalService.enhanced_retrieve(...)`
+- `PaperQAService.build_qa_context()` 内部会调用 `EnhancedRetrievalService.enhanced_retrieve(...)`，该入口再委托 `RetrievalPipeline.retrieve(...)`
 - `RetrievalOptions` 中可控制：
   - `enable_query_rewrite`
   - `enable_hyde`
@@ -799,7 +790,8 @@
   - `DatabaseService`：存 QA index、会话、消息、笔记、任务状态
   - `VectorStoreService`：检索 chunk 向量
   - `GenerationService`：最终答案生成、流式生成
-  - `EnhancedRetrievalService`：增强检索与 rerank
+  - `EnhancedRetrievalService`：检索 facade 与 trace 目录配置
+  - `RetrievalPipeline` / `QueryPlanner` / `RouteRetriever` / `ResultFusionService` / `RerankService`：检索编排、query planning、route 召回、融合与 rerank
   - `MemoryService`：短期记忆、会话上下文、用户画像联动
 - 具体向量库实现细节没有在 router 层直接暴露，但从项目命名与服务分层看，底层向量检索走的是 `VectorStoreService`
 
@@ -988,7 +980,7 @@ flowchart TD
 
 有几处值得注意：
 
-- `POST /api/user/preferences` 已改为 deprecated 兼容读取入口 `legacy_post_user_preferences()`；正式读取统一走 `GET /api/user/preferences/{user_id}`，真正写入偏好走 like/dislike/paper-action 等写接口
+- 用户偏好读取统一走 `GET /api/user/preferences/{user_id}`，真正写入偏好走 like/dislike/paper-action 等写接口
 - `paper_router.py` 没有 router 级 prefix，导致它的接口分布在 `/api/stats`、`/api/sync-status`、`/api/paper/...`、`/api/papers/...`，第一次读代码时不太容易一眼看出它们属于同一个 router
 - `qa_router.py` 的 prefix 是 `/paper/{arxiv_id}`，这很合理，但也容易让人误以为所有 `/paper/...` 都在 `paper_router.py`，实际上 QA 子路径已经切到另一个 router 了
 
@@ -1009,10 +1001,13 @@ flowchart TD
 1. [backend/services/paper_qa/paper_qa_service.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/services/paper_qa/paper_qa_service.py)
    - 这是论文 QA 主入口
 
-2. [backend/services/retrieval/enhanced_retrieval_service.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/services/retrieval/enhanced_retrieval_service.py)
-   - 这是 retrieval / rerank 的关键实现
+2. [backend/services/retrieval/retrieval_pipeline.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/services/retrieval/retrieval_pipeline.py)
+   - 这是 retrieval workflow 的关键编排实现
 
-3. [backend/services/recommendation/recommendation_service.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/services/recommendation/recommendation_service.py)
+3. [backend/services/retrieval/enhanced_retrieval_service.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/services/retrieval/enhanced_retrieval_service.py)
+   - 这是检索依赖装配与 public facade，主逻辑不在这里扩展
+
+4. [backend/services/recommendation/recommendation_service.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/services/recommendation/recommendation_service.py)
    - 这是推荐链路主入口
 
 4. [backend/services/recommendation/candidate_materializer.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/services/recommendation/candidate_materializer.py)

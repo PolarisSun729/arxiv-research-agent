@@ -50,8 +50,8 @@ build_qa_context / answer_question"]
         memory["Memory
 短期会话 / Agent Session / 用户画像"]
         retriever["Retriever
-EnhancedRetrievalService(????)
-RetrievalPipeline / RouteRetriever / QueryPlanner / RetrievalRules"]
+EnhancedRetrievalService(facade)
+RetrievalPipeline / QueryPlanner / RouteRetriever / RetrievalRules"]
         reranker["Reranker
 RerankService
 LLM 压缩 + rerank"]
@@ -238,7 +238,7 @@ Milvus / VectorStoreService"]
 
 如果是论文 QA，请求主线是：
 
-`qa_router.py -> PaperQAService.build_qa_context() -> EnhancedRetrievalService.enhanced_retrieve() -> RerankService / GenerationService -> GenerationService.generate() 或 stream_qwen_responses() -> 返回 answer / sources / retrieval_debug`
+`qa_router.py -> PaperQAService.build_qa_context() -> EnhancedRetrievalService.enhanced_retrieve() -> RetrievalPipeline.retrieve() -> QueryPlanner / RouteRetriever / ResultFusionService / RerankService -> GenerationService.generate() 或 stream_qwen_responses() -> 返回 answer / sources / retrieval_debug`
 
 如果是 Agent 请求，请求主线是：
 

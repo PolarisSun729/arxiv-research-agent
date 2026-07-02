@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 from core.errors import AppError, ErrorCode
 from services.arxiv.arxiv_search_service import ArxivSearchService
@@ -28,6 +27,12 @@ from utils.config import get_memory_runtime_config
 logger = logging.getLogger(__name__)
 
 class PaperQAService:
+    """论文 QA 主流程编排服务。
+
+    该服务只保留 router、工具入口和 QA 主流程需要的高层入口；会话解析、上下文打包、
+    答案生成、证据校验等底层能力由专门组件负责，避免为了测试或兼容旧调用点继续新增透传 wrapper。
+    """
+
     def __init__(
         self,
         *,
@@ -85,10 +90,6 @@ class PaperQAService:
         self.answer_generator = AnswerGenerator(generation_service=self.generation_service)
         self.evidence_verifier = EvidenceVerifier()
         self.context_lifecycle_service = ContextLifecycleService(db_service=self.db_service)
-
-    def _memory_flag(self, key: str, default: Any = None) -> Any:
-        """兼容旧调用点：记忆开关实际由 session_service 统一读取。"""
-        return self.session_service.memory_flag(key, default)
 
     def _build_memory_runtime_debug(self) -> Dict[str, Any]:
         """兼容旧调用点：记忆运行时 debug 由 session_service 负责构造。"""
@@ -178,6 +179,15 @@ class PaperQAService:
                 "retrieval_index_count": qa_index.get("retrieval_index_count"),
                 "retrieval_index_types": qa_index.get("retrieval_index_types"),
                 "retrieval_index_version": qa_index.get("retrieval_index_version"),
+                "sparse_index_dir": qa_index.get("sparse_index_dir"),
+                "sparse_index_manifest_file": qa_index.get("sparse_index_manifest_file"),
+                "sparse_index_document_count": qa_index.get("sparse_index_document_count"),
+                "sparse_index_token_count": qa_index.get("sparse_index_token_count"),
+                "sparse_index_backend": qa_index.get("sparse_index_backend"),
+                "sparse_index_schema_version": qa_index.get("sparse_index_schema_version"),
+                "sparse_index_source_file": qa_index.get("sparse_index_source_file"),
+                "sparse_index_source_hash": qa_index.get("sparse_index_source_hash"),
+                "sparse_index_avgdl": qa_index.get("sparse_index_avgdl"),
                 "embedding_file": qa_index.get("embedding_file"),
                 "loading_method": qa_index.get("loading_method"),
                 "chunking_strategy": qa_index.get("chunking_strategy"),
@@ -210,7 +220,7 @@ class PaperQAService:
         if not qa_index:
             return {"status": "not_found", "arxiv_id": arxiv_id}
 
-        cleanup_result = self.qa_index_builder.cleanup_qa_index_artifacts(arxiv_id, qa_index)
+        cleanup_result = self.qa_index_builder.cleanup_qa_index_artifacts(arxiv_id, qa_index, allow_active=True)
         updated = self.db_service.update_paper_qa_index(
             arxiv_id,
             status="deleted",
@@ -231,19 +241,10 @@ class PaperQAService:
             "cleanup": cleanup_result,
         }
 
-    def build_generation_context(self, search_results: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
-        # 兼容旧测试和流式路由入口；真实上下文打包职责已经迁移到 ContextPackBuilder。
-        return self.context_pack_builder.build_generation_context(search_results)
-
     def build_source_payload(self, search_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """把检索结果整理成统一的来源载荷，供前端展示与会话持久化复用。"""
         # 兼容旧调用点；source_id 与资产字段由 ContextPackBuilder 统一分配，避免会话记忆和前端证据不一致。
         return self.context_pack_builder.build_source_payload(search_results)
-
-    @staticmethod
-    def _truncate_text(value: Any, max_length: int) -> str:
-        """兼容旧调用点：文本裁剪规则由 session_service 固化。"""
-        return PaperQASessionService.truncate_text(value, max_length)
 
     def build_qa_context(self, arxiv_id: str, payload: Any):
         qa_index = self.db_service.get_paper_qa_index(arxiv_id)
@@ -288,6 +289,15 @@ class PaperQAService:
             "retrieval_index_count": qa_index.get("retrieval_index_count", 0),
             "retrieval_index_types": qa_index.get("retrieval_index_types", ""),
             "retrieval_index_version": qa_index.get("retrieval_index_version", ""),
+            "sparse_index_dir": qa_index.get("sparse_index_dir", ""),
+            "sparse_index_manifest_file": qa_index.get("sparse_index_manifest_file", ""),
+            "sparse_index_document_count": qa_index.get("sparse_index_document_count", 0),
+            "sparse_index_token_count": qa_index.get("sparse_index_token_count", 0),
+            "sparse_index_backend": qa_index.get("sparse_index_backend", ""),
+            "sparse_index_schema_version": qa_index.get("sparse_index_schema_version", ""),
+            "sparse_index_source_file": qa_index.get("sparse_index_source_file", ""),
+            "sparse_index_source_hash": qa_index.get("sparse_index_source_hash", ""),
+            "sparse_index_avgdl": qa_index.get("sparse_index_avgdl", 0),
             "active_build_id": qa_index.get("active_build_id"),
             "active_index_version": qa_index.get("active_index_version"),
         }
@@ -596,26 +606,3 @@ class PaperQAService:
             "qa_observation": qa_observation,
             "retrieval_debug": retrieval_debug,
         }
-
-    def _sanitize_trace_slug(self, text: str, max_length: int = 40) -> str:
-        import re
-
-        slug = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "_", (text or "").strip())
-        slug = re.sub(r"_+", "_", slug).strip("_")
-        if not slug:
-            slug = "query"
-        return slug[:max_length]
-
-    def _get_latest_retrieval_trace(self, arxiv_id: str, format_name: str = "md") -> Optional[Path]:
-        trace_root = Path(str(self.enhanced_retrieval_service.trace_export_dir))
-        paper_dir = trace_root / self._sanitize_trace_slug(arxiv_id)
-        if not paper_dir.exists() or not paper_dir.is_dir():
-            return None
-
-        suffix = ".json" if format_name == "json" else ".md"
-        trace_files = sorted(
-            paper_dir.glob(f"*{suffix}"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        return trace_files[0] if trace_files else None

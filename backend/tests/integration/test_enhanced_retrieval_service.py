@@ -1,8 +1,10 @@
 import unittest
 from unittest import mock
+from pathlib import Path
 
 from tests.helpers import build_retrieval_service, build_sample_chunks
 from services.paper_qa.context_pack_builder import ContextPackBuilder
+from services.retrieval.contracts import RetrievalOptions
 
 
 def build_context_expansion_chunks():
@@ -94,24 +96,72 @@ def build_context_expansion_chunks():
     ]
 
 
-class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
+class EnhancedRetrievalServiceFacadeSmokeTests(unittest.TestCase):
+    def test_enhanced_retrieval_service_does_not_reintroduce_private_forwarding_wrappers(self) -> None:
+        source_path = Path(__file__).resolve().parents[2] / "services" / "retrieval" / "enhanced_retrieval_service.py"
+        source = source_path.read_text(encoding="utf-8")
+        forbidden_wrappers = [
+            "_build_paper_context",
+            "_build_query_plan",
+            "_build_query_profile",
+            "_build_query_views",
+            "_normalize_route_results",
+            "_fuse_routes",
+            "_load_llm_reranker",
+            "_normalize_chunk",
+            "_compute_structural_bonus",
+            "_tokenize_for_keyword_search",
+            "_route_confidence",
+            "_normalize_query_text",
+            "_debug_query_profile",
+            "_debug_intent_profile",
+        ]
+
+        for wrapper_name in forbidden_wrappers:
+            with self.subTest(wrapper_name=wrapper_name):
+                self.assertNotIn(f"def {wrapper_name}", source)
+
+    def test_enhanced_retrieve_delegates_to_retrieval_pipeline(self) -> None:
+        service, collection_name, *_ = build_retrieval_service()
+        options = RetrievalOptions(top_k=2, debug=True)
+        expected = {"chunks": [{"chunk_id": "smoke"}]}
+
+        with mock.patch.object(service.retrieval_pipeline, "retrieve", return_value=expected) as retrieve:
+            result = service.enhanced_retrieve(
+                "What is the method?",
+                collection_name,
+                paper_context={"arxiv_id": "2401.00001"},
+                options=options,
+            )
+
+        self.assertEqual(result, expected)
+        retrieve.assert_called_once_with(
+            user_query="What is the method?",
+            collection_name=collection_name,
+            paper_context={"arxiv_id": "2401.00001"},
+            options=options,
+        )
+
+
+class RetrievalPipelineIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service, self.collection_name, *_ = build_retrieval_service()
+        self.pipeline = self.service.retrieval_pipeline
         self.sample_chunks = build_sample_chunks()
-        self.options_cls = type(self.service).enhanced_retrieve.__globals__["RetrievalOptions"]
+        self.options_cls = RetrievalOptions
 
-    def test_enhanced_retrieve_top_k_boundaries_and_debug_snapshot(self) -> None:
-        default_result = self.service.enhanced_retrieve(
+    def test_retrieve_top_k_boundaries_and_debug_snapshot(self) -> None:
+        default_result = self.pipeline.retrieve(
             "What is the method of the paper?",
             self.collection_name,
             options=self.options_cls(top_k=None, debug=True, enable_llm_rerank=False),
         )
-        one_result = self.service.enhanced_retrieve(
+        one_result = self.pipeline.retrieve(
             "What is the method of the paper?",
             self.collection_name,
             options=self.options_cls(top_k=1, debug=True, enable_llm_rerank=False),
         )
-        capped_result = self.service.enhanced_retrieve(
+        capped_result = self.pipeline.retrieve(
             "What is the method of the paper?",
             self.collection_name,
             options=self.options_cls(top_k=99, debug=True, enable_llm_rerank=False),
@@ -134,8 +184,8 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(debug["route_metrics"]["vector_original"]["status"], "ok")
         self.assertIn("latency_ms", debug["route_metrics"]["keyword"])
 
-    def test_enhanced_retrieve_fuses_routes_dedupes_and_preserves_source_fields(self) -> None:
-        result = self.service.enhanced_retrieve(
+    def test_retrieve_fuses_routes_dedupes_and_preserves_source_fields(self) -> None:
+        result = self.pipeline.retrieve(
             "What does Figure 2 and Table 3 show?",
             self.collection_name,
             options=self.options_cls(debug=True, enable_llm_rerank=False),
@@ -154,11 +204,11 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
         self.assertTrue(any(len(item.get("matched_routes", [])) > 1 for item in result["chunks"]))
         self.assertIn("mode", debug["llm_rerank"])
 
-    def test_enhanced_retrieve_rerank_failure_falls_back_to_fused_order(self) -> None:
-        with mock.patch.object(self.service, "_load_llm_reranker", return_value=None):
+    def test_retrieve_rerank_failure_falls_back_to_fused_order(self) -> None:
+        with mock.patch.object(self.service.rerank_service, "load_llm_reranker", return_value=None):
             self.service.llm_rerank_provider = "local"
             self.service._llm_reranker_error = "unavailable"
-            result = self.service.enhanced_retrieve(
+            result = self.pipeline.retrieve(
                 "What is the method of the paper?",
                 self.collection_name,
                 options=self.options_cls(debug=True, enable_llm_rerank=True, top_k=2),
@@ -171,7 +221,7 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(final_ids, fused_ids)
 
     def test_debug_snapshot_contains_required_trace_sections(self) -> None:
-        result = self.service.enhanced_retrieve(
+        result = self.pipeline.retrieve(
             "Which dataset and results are most important?",
             self.collection_name,
             options=self.options_cls(debug=True, enable_llm_rerank=False),
@@ -225,7 +275,7 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
                 }
             )
 
-        result = self.service.enhanced_retrieve(
+        result = self.pipeline.retrieve(
             "What is the method framework of the paper?",
             self.collection_name,
             options=self.options_cls(debug=True, enable_llm_rerank=False, enable_keyword_search=False),
@@ -244,7 +294,7 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(len(fused_ids), len(set(fused_ids)))
 
     def test_non_debug_response_keeps_debug_payload_hidden(self) -> None:
-        result = self.service.enhanced_retrieve(
+        result = self.pipeline.retrieve(
             "What is the method of the paper?",
             self.collection_name,
             options=self.options_cls(debug=False, enable_llm_rerank=False),
@@ -256,9 +306,9 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
 
     def test_context_expansion_debug_links_subchunks_sections_and_assets(self) -> None:
         service, collection_name, *_ = build_retrieval_service(chunks=build_context_expansion_chunks())
-        options_cls = type(service).enhanced_retrieve.__globals__["RetrievalOptions"]
+        options_cls = RetrievalOptions
 
-        result = service.enhanced_retrieve(
+        result = service.retrieval_pipeline.retrieve(
             "How does the method pipeline work step by step?",
             collection_name,
             options=options_cls(top_k=1, debug=True, enable_llm_rerank=False),
@@ -303,9 +353,9 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
 
     def test_context_expansion_uses_question_type_specific_policies(self) -> None:
         service, collection_name, *_ = build_retrieval_service(chunks=build_context_expansion_chunks())
-        options_cls = type(service).enhanced_retrieve.__globals__["RetrievalOptions"]
+        options_cls = RetrievalOptions
 
-        figure_result = service.enhanced_retrieve(
+        figure_result = service.retrieval_pipeline.retrieve(
             "What does Figure 1 show in the method pipeline?",
             collection_name,
             options=options_cls(top_k=1, debug=True, enable_llm_rerank=False),
@@ -315,7 +365,7 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
         figure_candidate = next(item for item in figure_expansion["candidate_pool"] if item["candidate_chunk_id"] == "method-figure")
         self.assertTrue({"asset_related", "cited_asset_context"} & set(figure_candidate["relationship_types"]))
 
-        experiment_result = service.enhanced_retrieve(
+        experiment_result = service.retrieval_pipeline.retrieve(
             "Which dataset baseline metric and implementation details are used in the experiments?",
             collection_name,
             options=options_cls(top_k=1, debug=True, enable_llm_rerank=False),
@@ -326,7 +376,7 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
         experiment_candidate = next(item for item in experiment_expansion["candidate_pool"] if item["candidate_chunk_id"] == "experiment-setup")
         self.assertTrue({"self", "section_neighbors", "page_neighbors"} & set(experiment_candidate["relationship_types"]))
 
-        result_result = service.enhanced_retrieve(
+        result_result = service.retrieval_pipeline.retrieve(
             "What results ablation and performance comparison are reported?",
             collection_name,
             options=options_cls(top_k=1, debug=True, enable_llm_rerank=False),
@@ -347,9 +397,9 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
                 }
             ]
         )
-        options_cls = type(service).enhanced_retrieve.__globals__["RetrievalOptions"]
+        options_cls = RetrievalOptions
 
-        result = service.enhanced_retrieve(
+        result = service.retrieval_pipeline.retrieve(
             "What is the method?",
             collection_name,
             options=options_cls(top_k=1, debug=True, enable_llm_rerank=False),
@@ -361,14 +411,14 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
 
     def test_context_budget_selects_expanded_final_context_and_can_be_disabled(self) -> None:
         service, collection_name, *_ = build_retrieval_service(chunks=build_context_expansion_chunks())
-        options_cls = type(service).enhanced_retrieve.__globals__["RetrievalOptions"]
+        options_cls = RetrievalOptions
 
-        expanded = service.enhanced_retrieve(
+        expanded = service.retrieval_pipeline.retrieve(
             "How does the method pipeline work step by step?",
             collection_name,
             options=options_cls(top_k=4, debug=True, enable_llm_rerank=False),
         )
-        disabled = service.enhanced_retrieve(
+        disabled = service.retrieval_pipeline.retrieve(
             "How does the method pipeline work step by step?",
             collection_name,
             options=options_cls(top_k=4, debug=True, enable_llm_rerank=False, enable_context_expansion=False),
@@ -390,9 +440,9 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
 
     def test_context_pack_sources_preserve_context_budget_metadata(self) -> None:
         service, collection_name, *_ = build_retrieval_service(chunks=build_context_expansion_chunks())
-        options_cls = type(service).enhanced_retrieve.__globals__["RetrievalOptions"]
+        options_cls = RetrievalOptions
 
-        result = service.enhanced_retrieve(
+        result = service.retrieval_pipeline.retrieve(
             "How does the method pipeline work step by step?",
             collection_name,
             options=options_cls(top_k=4, debug=True, enable_llm_rerank=False),
@@ -409,7 +459,7 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
         self.assertIn("role: sibling_context", context_pack["text_context"])
 
     def test_table_structured_route_promotes_cell_level_evidence_for_table_question(self) -> None:
-        result = self.service.enhanced_retrieve(
+        result = self.pipeline.retrieve(
             "表 2 中最高的 accuracy 是多少？",
             self.collection_name,
             options=self.options_cls(debug=True, enable_llm_rerank=False, enable_hyde=False, enable_keyword_search=False),
@@ -429,7 +479,7 @@ class EnhancedRetrievalServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(result["debug"]["stages"]["fused_top30"][0]["chunk_id"], "chunk-table-results")
 
     def test_table_structured_route_falls_back_cleanly_for_summary_question(self) -> None:
-        result = self.service.enhanced_retrieve(
+        result = self.pipeline.retrieve(
             "What is the main contribution of the paper?",
             self.collection_name,
             options=self.options_cls(debug=True, enable_llm_rerank=False),

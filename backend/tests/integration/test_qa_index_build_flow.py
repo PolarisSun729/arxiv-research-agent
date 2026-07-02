@@ -2,6 +2,7 @@ import gc
 import importlib.util
 import json
 import re
+import shutil
 import sys
 import threading
 import types
@@ -420,9 +421,13 @@ class _BaseIndexTestCase(unittest.TestCase):
         active = self.db_service.get_paper_qa_index(self.arxiv_id)
         if active and active.get("retrieval_index_file"):
             paths.add(str(active["retrieval_index_file"]))
+        if active and active.get("sparse_index_dir"):
+            paths.add(str(active["sparse_index_dir"]))
         for build in self.db_service.list_paper_qa_index_builds(self.arxiv_id, limit=20):
             if build.get("retrieval_index_file"):
                 paths.add(str(build["retrieval_index_file"]))
+            if build.get("sparse_index_dir"):
+                paths.add(str(build["sparse_index_dir"]))
         for path_text in paths:
             path = Path(path_text)
             if not path.is_absolute():
@@ -430,6 +435,9 @@ class _BaseIndexTestCase(unittest.TestCase):
             try:
                 if path.is_file() and "02-retrieval-indexes" in path.parts:
                     path.unlink()
+                elif path.is_dir() and "02-sparse-indexes" in path.parts:
+                    # sparse artifact 是目录布局，测试结束只清理本用例登记到 DB 的目录。
+                    shutil.rmtree(path)
             except OSError:
                 pass
 
@@ -546,6 +554,14 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
         self.assertEqual(record["retrieval_index_count"], result["retrieval_index_count"])
         self.assertEqual(json.loads(record["retrieval_index_types"]), result["retrieval_index_types"])
         self.assertEqual(record["retrieval_index_version"], result["retrieval_index_version"])
+        self.assertEqual(record["sparse_index_manifest_file"], result["sparse_index_manifest_file"])
+        self.assertEqual(record["sparse_index_document_count"], result["sparse_index_document_count"])
+        self.assertEqual(record["sparse_index_token_count"], result["sparse_index_token_count"])
+        self.assertEqual(record["sparse_index_schema_version"], result["sparse_index_schema_version"])
+        self.assertEqual(record["sparse_index_source_file"], result["sparse_index_source_file"])
+        self.assertEqual(record["sparse_index_source_hash"], result["sparse_index_source_hash"])
+        self.assertEqual(result["sparse_index_source_file"], result["chunk_file"])
+        self.assertEqual(result["sparse_index_document_count"], result["chunk_count"])
         self.assertIn('"filename": "2401.00001_', record["embedding_file"])
         self.assertIn("_pdf", record["collection_name"])
         self.assertEqual(record["loading_method"], "docling")
@@ -567,6 +583,29 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
         self.assertEqual(len(artifact_payload["retrieval_indexes"]), result["retrieval_index_count"])
         self.assertTrue(all(item["paper_id"] == self.arxiv_id for item in artifact_payload["retrieval_indexes"]))
         self.assertTrue(all(item["chunk_id"] in artifact_payload["chunk_ids"] for item in artifact_payload["retrieval_indexes"]))
+        sparse_manifest_path = Path(result["sparse_index_manifest_file"])
+        self.assertTrue(sparse_manifest_path.is_file())
+        sparse_manifest = json.loads(sparse_manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(sparse_manifest["paper_id"], self.arxiv_id)
+        self.assertEqual(sparse_manifest["build_id"], result["build_id"])
+        self.assertEqual(sparse_manifest["index_version"], result["index_version"])
+        self.assertEqual(sparse_manifest["source_type"], "chunk")
+        self.assertEqual(sparse_manifest["source_file"], result["chunk_file"])
+        self.assertEqual(sparse_manifest["source_hash"], result["sparse_index_source_hash"])
+        self.assertEqual(sparse_manifest["schema_version"], result["sparse_index_schema_version"])
+        self.assertEqual(sparse_manifest["token_count"], result["sparse_index_token_count"])
+        documents_file = sparse_manifest_path.parent / sparse_manifest["files"]["documents"]
+        self.assertEqual(len(documents_file.read_text(encoding="utf-8").splitlines()), result["sparse_index_document_count"])
+        token_stats = json.loads((sparse_manifest_path.parent / sparse_manifest["files"]["token_stats"]).read_text(encoding="utf-8"))
+        self.assertEqual(token_stats["document_count"], result["sparse_index_document_count"])
+        self.assertEqual(token_stats["total_document_length"], result["sparse_index_token_count"])
+        self.assertIn("field_stats", token_stats)
+        postings = json.loads((sparse_manifest_path.parent / sparse_manifest["files"]["postings"]).read_text(encoding="utf-8"))
+        document_frequency = json.loads((sparse_manifest_path.parent / sparse_manifest["files"]["document_frequency"]).read_text(encoding="utf-8"))
+        self.assertTrue(postings)
+        self.assertTrue(document_frequency)
+        self.assertNotIn("", postings)
+        self.assertNotIn("", document_frequency)
         self.assertEqual(loading_service.calls[0]["method"], "load_pdf")
         self.assertEqual(chunking_service.calls[0]["method"], "chunk_docling")
         self.assertEqual(embedding_service.calls[0]["method"], "create_embeddings")
@@ -765,6 +804,10 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
         old_retrieval_index_file = Path("02-retrieval-indexes") / "old_active_retrieval_indexes.json"
         old_retrieval_index_file.parent.mkdir(exist_ok=True)
         old_retrieval_index_file.write_text('{"retrieval_indexes":[]}', encoding="utf-8")
+        old_sparse_dir = Path("02-sparse-indexes") / "old_active_sparse"
+        old_sparse_dir.mkdir(parents=True, exist_ok=True)
+        old_sparse_manifest = old_sparse_dir / "manifest.json"
+        old_sparse_manifest.write_text("{}", encoding="utf-8")
         self.db_service.insert_paper_qa_index(
             self.arxiv_id,
             collection_name="qa_old_collection",
@@ -775,12 +818,22 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
             retrieval_index_count=2,
             retrieval_index_types=json.dumps(["body"], ensure_ascii=False),
             retrieval_index_version="old-version",
+            sparse_index_dir=str(old_sparse_dir),
+            sparse_index_manifest_file=str(old_sparse_manifest),
+            sparse_index_document_count=2,
+            sparse_index_token_count=12,
+            sparse_index_backend="internal_bm25",
+            sparse_index_schema_version="sparse_index_artifact_v1",
+            sparse_index_source_file="old-chunks.json",
+            sparse_index_source_hash="old-sparse-hash",
         )
         builder, *_services, vector_store_service = self._make_builder()
         builder.build_qa_index(self.arxiv_id, loading_method="docling")
         active = self.db_service.get_paper_qa_index(self.arxiv_id)
         active_retrieval_index_file = Path(active["retrieval_index_file"])
+        active_sparse_dir = Path(active["sparse_index_dir"])
         self.assertTrue(active_retrieval_index_file.is_file())
+        self.assertTrue(active_sparse_dir.is_dir())
 
         cleanup_result = builder.cleanup_pending_index_builds(self.arxiv_id)
 
@@ -792,7 +845,12 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
         self.assertIn("qa_old_collection", deleted_collections)
         self.assertNotIn(active["collection_name"], deleted_collections)
         self.assertFalse(old_retrieval_index_file.exists())
+        self.assertFalse(old_sparse_dir.exists())
         self.assertTrue(active_retrieval_index_file.exists())
+        self.assertTrue(active_sparse_dir.exists())
+        active_cleanup = builder.cleanup_qa_index_artifacts(self.arxiv_id, active)
+        self.assertTrue(active_cleanup["skipped_active_build"])
+        self.assertTrue(active_sparse_dir.exists())
         self.assertEqual(len(cleanup_result["failed"]), 0)
 
 

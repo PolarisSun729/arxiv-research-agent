@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 from dependencies import get_database_service, get_memory_service, get_recommendation_service
@@ -74,39 +74,6 @@ class ActivateProfileSnapshotRequest(BaseModel):
     """切换 active snapshot 的请求。"""
     user_id: str = Field(default_factory=get_default_user_id)
     snapshot_id: str
-
-
-@router.post(
-    "/preferences",
-    deprecated=True,
-    summary="Deprecated: read user preferences via GET instead",
-    description="兼容旧调用方的只读入口；新代码必须使用 GET /user/preferences/{user_id} 读取偏好。",
-)
-async def legacy_post_user_preferences(
-    response: Response,
-    user_id: str = Body(default_factory=get_default_user_id),
-    db_service=Depends(get_database_service),
-):
-    """兼容旧 POST 读取入口；正式读取语义已经收敛到 GET。
-
-    保留该入口只是为了给旧前端/脚本迁移窗口；它不会创建、更新或 upsert 偏好。
-    返回头显式标记废弃，避免调用方继续把这个 POST 当作写接口扩展。
-    """
-    try:
-        response.headers["Deprecation"] = "true"
-        response.headers["Warning"] = '299 - "POST /api/user/preferences is deprecated; use GET /api/user/preferences/{user_id}"'
-        response.headers["Link"] = '</api/user/preferences/{user_id}>; rel="successor-version"; method="GET"'
-        preferences = db_service.get_user_preferences(user_id=user_id)
-        return {
-            "status": "success",
-            "message": "User preferences retrieved via deprecated POST compatibility endpoint; use GET /user/preferences/{user_id}.",
-            "deprecated": True,
-            "successor": "GET /user/preferences/{user_id}",
-            "preferences": preferences,
-        }
-    except Exception as exc:
-        logger.error("Error getting user preferences: %s", str(exc))
-        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.get("/preferences/{user_id}")

@@ -150,26 +150,17 @@ class UserRouterApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
+        self.assertEqual(
+            set(payload.keys()),
+            {"user_id", "liked_papers", "disliked_papers", "paper_actions", "research_profile"},
+        )
         self.assertEqual(payload["user_id"], "u1")
-        self.assertIn("liked_papers", payload)
-        self.assertIn("research_profile", payload)
-
-    def test_post_user_preferences_is_deprecated_read_compatibility(self) -> None:
-        response = self.client.post("/api/user/preferences", json="u1")
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertTrue(payload["deprecated"])
-        self.assertEqual(payload["successor"], "GET /user/preferences/{user_id}")
-        self.assertEqual(payload["preferences"]["user_id"], "u1")
-        self.assertEqual(response.headers["Deprecation"], "true")
-        self.assertIn("use GET", response.headers["Warning"])
-
-        # OpenAPI 中仍保留短期兼容入口，但必须显式标记 deprecated，且 operationId 不再暗示 upsert。
-        operation = self.client.get("/openapi.json").json()["paths"]["/api/user/preferences"]["post"]
-        self.assertTrue(operation["deprecated"])
-        self.assertIn("Deprecated", operation["summary"])
-        self.assertNotIn("upsert", operation["operationId"].lower())
+        self.assertEqual(payload["liked_papers"], ["2401.00001"])
+        self.assertEqual(payload["disliked_papers"], [])
+        self.assertEqual(payload["paper_actions"], {"favorite": ["2401.00001"]})
+        self.assertEqual(payload["research_profile"]["preferred_answer_style"], "concise")
+        self.assertNotIn("deprecated", payload)
+        self.assertNotIn("preferences", payload)
 
     def test_like_and_dislike_routes_forward_to_recommendation_service(self) -> None:
         like_response = self.client.post("/api/user/like-paper", json={"user_id": "u1", "arxiv_id": "2401.00001"})

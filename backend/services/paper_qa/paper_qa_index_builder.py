@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -19,12 +21,19 @@ from services.llm.generation_service import GenerationService, QWEN_RERANK_COMPR
 from services.document.loading_service import LoadingService
 from services.retrieval.retrieval_index import (
     RETRIEVAL_INDEX_ARTIFACT_SCHEMA_VERSION,
+    SPARSE_INDEX_ARTIFACT_SCHEMA_VERSION,
+    CollectionRetrievalIndexProvider,
     DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK,
     build_retrieval_index_payload,
     build_retrieval_indexes,
+    compute_artifact_file_hash,
+    load_sparse_index_artifact_files,
+    normalize_sparse_source_type,
     save_retrieval_index_artifact as persist_retrieval_index_artifact,
+    save_sparse_index_artifact as persist_sparse_index_artifact,
     summarize_retrieval_indexes,
 )
+from services.retrieval.retrieval_rules import RetrievalRules
 from services.storage.vector_store_service import VectorDBConfig, VectorStoreService
 from utils.config import get_enhanced_retrieval_runtime_config
 
@@ -45,6 +54,15 @@ QA_INDEX_ARTIFACT_FIELDS = {
     "retrieval_index_count",
     "retrieval_index_types",
     "retrieval_index_version",
+    "sparse_index_dir",
+    "sparse_index_manifest_file",
+    "sparse_index_document_count",
+    "sparse_index_token_count",
+    "sparse_index_backend",
+    "sparse_index_schema_version",
+    "sparse_index_source_file",
+    "sparse_index_source_hash",
+    "sparse_index_avgdl",
     "embedding_file",
     "collection_name",
     "loading_method",
@@ -164,30 +182,131 @@ class PaperQAIndexBuilder:
             logger.exception("Failed to delete QA artifact file: %s", path_text)
             raise
 
-    def cleanup_qa_index_artifacts(self, arxiv_id: str, qa_index: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _safe_delete_directory(self, dir_path: Any) -> bool:
+        path_text = str(dir_path or "").strip()
+        if not path_text:
+            return False
+        path = Path(path_text)
+        if not path.is_absolute():
+            path = self._workspace_root() / path
+        try:
+            resolved_path = path.resolve()
+            workspace_root = self._workspace_root().resolve()
+            if workspace_root not in resolved_path.parents and resolved_path != workspace_root:
+                logger.warning("Skip deleting QA artifact directory outside workspace: %s", resolved_path)
+                return False
+            if not resolved_path.exists():
+                return False
+            if not resolved_path.is_dir():
+                logger.warning("Skip deleting non-directory QA artifact: %s", resolved_path)
+                return False
+            # sparse index 是目录型 artifact；递归删除前只允许工作区内已解析路径，避免误删外部文件。
+            shutil.rmtree(resolved_path)
+            return True
+        except Exception:
+            logger.exception("Failed to delete QA artifact directory: %s", path_text)
+            raise
+
+    def _resolve_cleanup_path(self, path_text: Any) -> Optional[Path]:
+        raw_text = str(path_text or "").strip()
+        if not raw_text:
+            return None
+        path = Path(raw_text)
+        if not path.is_absolute():
+            path = self._workspace_root() / path
+        try:
+            return path.resolve()
+        except OSError:
+            return None
+
+    def _active_artifact_guard(self, arxiv_id: str, *, allow_active: bool) -> Dict[str, Any]:
+        if allow_active:
+            return {"build_id": "", "collection_name": "", "paths": []}
+        active = self.db_service.get_active_paper_qa_index_build(arxiv_id) or {}
+        protected_paths = []
+        for field_name in ("pdf_path", "chunk_file", "retrieval_index_file", "embedding_file", "sparse_index_dir", "sparse_index_manifest_file"):
+            resolved = self._resolve_cleanup_path(active.get(field_name))
+            if resolved is not None:
+                protected_paths.append(resolved)
+        return {
+            "build_id": str(active.get("build_id") or ""),
+            "collection_name": str(active.get("collection_name") or "").strip(),
+            "paths": protected_paths,
+        }
+
+    def _is_active_artifact_path(self, path_text: Any, active_guard: Dict[str, Any]) -> bool:
+        candidate = self._resolve_cleanup_path(path_text)
+        if candidate is None:
+            return False
+        for protected in active_guard.get("paths") or []:
+            # 清理目录时要防止删到 active 文件的父目录；清理文件时也不能删 active 目录下的成员。
+            if candidate == protected or candidate in protected.parents or protected in candidate.parents:
+                return True
+        return False
+
+    def cleanup_qa_index_artifacts(
+        self,
+        arxiv_id: str,
+        qa_index: Optional[Dict[str, Any]] = None,
+        *,
+        allow_active: bool = False,
+    ) -> Dict[str, Any]:
         """清理指定 QA 索引版本留下的文件和 Milvus collection。
 
-        该方法不再由重建主流程调用；调用方必须确保传入的不是当前 active 版本。
+        默认用于 cleanup_pending 旧版本清理，并防御性保护当前 active build；
+        只有用户显式删除 QA 索引时，调用方才传入 allow_active=True。
         """
         existing = qa_index if qa_index is not None else self.db_service.get_paper_qa_index(arxiv_id)
-        result = {"collection_deleted": False, "files_deleted": [], "files_missing": []}
+        result = {"collection_deleted": False, "collection_skipped_active": False, "files_deleted": [], "files_missing": [], "files_skipped_active": [], "skipped_active_build": False}
         if not existing:
+            return result
+        active_guard = self._active_artifact_guard(arxiv_id, allow_active=allow_active)
+        existing_build_id = str(existing.get("build_id") or existing.get("active_build_id") or "").strip()
+        if not allow_active and existing_build_id and existing_build_id == active_guard.get("build_id"):
+            # cleanup_pending 流程只清理旧版本；若输入误指向 active build，直接跳过整个版本。
+            result["skipped_active_build"] = True
             return result
 
         collection_name = str(existing.get("collection_name") or "").strip()
         if collection_name:
-            # 重建前必须先移除旧 collection，否则检索链路可能继续命中上一轮 chunk。
-            result["collection_deleted"] = self.vector_store_service.delete_collection("milvus", collection_name)
+            if not allow_active and collection_name == active_guard.get("collection_name"):
+                result["collection_skipped_active"] = True
+            else:
+                # 只删除非 active collection，避免旧版本清理误切断当前问答路径。
+                result["collection_deleted"] = self.vector_store_service.delete_collection("milvus", collection_name)
 
         for field_name in ("pdf_path", "chunk_file", "retrieval_index_file", "embedding_file"):
             artifact_path = str(existing.get(field_name) or "").strip()
             if not artifact_path:
+                continue
+            if self._is_active_artifact_path(artifact_path, active_guard):
+                result["files_skipped_active"].append({"field": field_name, "path": artifact_path})
                 continue
             deleted = self._safe_delete_file(artifact_path)
             if deleted:
                 result["files_deleted"].append({"field": field_name, "path": artifact_path})
             else:
                 result["files_missing"].append({"field": field_name, "path": artifact_path})
+        sparse_dir = str(existing.get("sparse_index_dir") or "").strip()
+        if sparse_dir:
+            if self._is_active_artifact_path(sparse_dir, active_guard):
+                result["files_skipped_active"].append({"field": "sparse_index_dir", "path": sparse_dir})
+                return result
+            deleted = self._safe_delete_directory(sparse_dir)
+            if deleted:
+                result["files_deleted"].append({"field": "sparse_index_dir", "path": sparse_dir})
+            else:
+                result["files_missing"].append({"field": "sparse_index_dir", "path": sparse_dir})
+        elif str(existing.get("sparse_index_manifest_file") or "").strip():
+            manifest_path = str(existing.get("sparse_index_manifest_file") or "").strip()
+            if self._is_active_artifact_path(manifest_path, active_guard):
+                result["files_skipped_active"].append({"field": "sparse_index_manifest_file", "path": manifest_path})
+                return result
+            deleted = self._safe_delete_file(manifest_path)
+            if deleted:
+                result["files_deleted"].append({"field": "sparse_index_manifest_file", "path": manifest_path})
+            else:
+                result["files_missing"].append({"field": "sparse_index_manifest_file", "path": manifest_path})
         return result
 
     def cleanup_pending_index_builds(self, arxiv_id: str, *, limit: int = 5) -> Dict[str, Any]:
@@ -646,6 +765,126 @@ class PaperQAIndexBuilder:
         logger.info("Retrieval index artifact saved to: %s", artifact_file)
         return artifact_file
 
+    def save_sparse_index_artifact(
+        self,
+        arxiv_id: str,
+        *,
+        build_id: str,
+        chunks: List[Dict[str, Any]],
+        chunk_file: str,
+        chunk_count: int,
+        index_version: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """基于 chunk file 生成 chunk-level sparse index，作为第一版低风险 BM25 构建产物。"""
+        sparse_rows = self._load_sparse_source_chunks(chunk_file, fallback_chunks=chunks)
+
+        class _SparseBuildVectorStore:
+            def __init__(self, rows: List[Dict[str, Any]]) -> None:
+                self.rows = [dict(row) for row in rows]
+
+            def get_all_chunks(self, _collection_name: str):
+                return [dict(row) for row in self.rows]
+
+        retrieval_rules = RetrievalRules(config=self.retrieval_runtime_config)
+        provider = CollectionRetrievalIndexProvider(
+            vector_store_service=_SparseBuildVectorStore(sparse_rows),
+            chunk_normalizer=retrieval_rules.normalize_chunk,
+            tokenizer=retrieval_rules.tokenize_for_keyword_search,
+        )
+        version = str(index_version or RETRIEVAL_INDEX_ARTIFACT_SCHEMA_VERSION)
+        source_hash = self._compute_sparse_source_hash(chunk_file, sparse_rows)
+        index_record = {
+            "arxiv_id": arxiv_id,
+            "chunk_count": int(chunk_count or 0),
+            "active_index_version": version,
+            "active_build_id": build_id,
+        }
+        collection_name = f"sparse_artifact_{str(arxiv_id or 'paper').replace('.', '_').replace('/', '_')}_{version}"
+        sparse_index = provider.get_index(
+            collection_name,
+            index_record=index_record,
+            force_refresh=True,
+        )
+        if not sparse_index.documents:
+            # sparse artifact 必须有可查询文档；为空说明 chunk 文件无法支撑 keyword route，不能激活新版本。
+            raise RuntimeError(
+                "Sparse index artifact build failed: source="
+                f"{sparse_index.build_source} documents={len(sparse_index.documents)}"
+            )
+        # 第一版 sparse artifact 明确以 chunk 文件为源，降低 retrieval-index-level 迁移风险。
+        sparse_index.build_source = "chunk"
+        sparse_index.fallback_reason = ""
+        sparse_index.retrieval_index_artifact_debug = {
+            "source": "chunk",
+            "chunk_file": chunk_file,
+            "row_count": len(sparse_rows),
+            "document_count": len(sparse_index.documents),
+            "reason": "",
+        }
+        artifact = persist_sparse_index_artifact(
+            index=sparse_index,
+            paper_id=arxiv_id,
+            build_id=build_id,
+            index_version=version,
+            source_type="chunk",
+            source_file=chunk_file,
+            source_hash=source_hash,
+            backend="internal_bm25",
+        )
+        logger.info(
+            "Chunk-level sparse index artifact saved to: %s document_count=%s token_count=%s source_hash=%s",
+            artifact.get("manifest_file"),
+            artifact.get("document_count"),
+            artifact.get("token_count"),
+            artifact.get("source_hash"),
+        )
+        return artifact
+
+    @staticmethod
+    def _compute_sparse_source_hash(chunk_file: str, sparse_rows: List[Dict[str, Any]]) -> str:
+        resolved = Path(str(chunk_file or "").strip())
+        candidates = [resolved]
+        if not resolved.is_absolute():
+            workspace_root = Path(__file__).resolve().parents[3]
+            candidates.extend([Path.cwd() / resolved, workspace_root / resolved])
+        for candidate in candidates:
+            try:
+                path = candidate.resolve()
+            except OSError:
+                continue
+            if path.is_file():
+                return compute_artifact_file_hash(str(path))
+        # 生产路径必须以真实 chunk file 为 source；测试 stub 可能只返回文件名不落盘，
+        # 此时用同一批 sparse 输入生成稳定 hash，避免把轻量测试误判为构建失败。
+        payload = json.dumps({"chunks": sparse_rows}, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _load_sparse_source_chunks(chunk_file: str, *, fallback_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """从 chunk file 恢复 sparse 输入；测试 stub 未落盘时才使用内存 chunk 兜底。"""
+        resolved = Path(str(chunk_file or "").strip())
+        candidates = [resolved]
+        if not resolved.is_absolute():
+            workspace_root = Path(__file__).resolve().parents[3]
+            candidates.extend([Path.cwd() / resolved, workspace_root / resolved])
+        for candidate in candidates:
+            try:
+                path = candidate.resolve()
+            except OSError:
+                continue
+            if not path.is_file():
+                continue
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            chunks = payload.get("chunks") if isinstance(payload, dict) else []
+            if not isinstance(chunks, list):
+                raise RuntimeError(f"Chunk file missing chunks list: {chunk_file}")
+            return [dict(chunk) for chunk in chunks if isinstance(chunk, dict)]
+        if fallback_chunks:
+            # 兼容旧测试和轻量 stub：生产环境应以真实 chunk file 为准，兜底只保证构建链路可验证。
+            return [dict(chunk) for chunk in fallback_chunks if isinstance(chunk, dict)]
+        raise FileNotFoundError(str(chunk_file or ""))
+
     def create_chunk_embeddings(
         self,
         arxiv_id: str,
@@ -728,6 +967,53 @@ class PaperQAIndexBuilder:
         if expected_count <= 0:
             raise RuntimeError("New QA index has no chunks to activate")
 
+    def validate_sparse_index_artifact(
+        self,
+        *,
+        build_id: str,
+        index_version: str,
+        sparse_index_manifest_file: str,
+        sparse_index_source_hash: str,
+        sparse_index_document_count: int,
+        sparse_index_token_count: int,
+        sparse_index_backend: str,
+    ) -> Dict[str, Any]:
+        """激活前校验 sparse artifact 与当前 build 一致，避免 dense/sparse 指向不同版本。"""
+        manifest_file = str(sparse_index_manifest_file or "").strip()
+        if not manifest_file:
+            raise RuntimeError("Sparse index manifest is missing")
+        payload = load_sparse_index_artifact_files(manifest_file)
+        manifest = dict(payload.get("manifest") or {})
+        source_type = normalize_sparse_source_type(manifest.get("source_type"))
+        if source_type not in {"chunk", "retrieval_index"}:
+            raise RuntimeError(f"Unsupported sparse index source_type: {manifest.get('source_type')}")
+        checks = {
+            "build_id": (str(build_id or ""), str(manifest.get("build_id") or "")),
+            "index_version": (str(index_version or ""), str(manifest.get("index_version") or "")),
+            "source_hash": (str(sparse_index_source_hash or ""), str(manifest.get("source_hash") or "")),
+            "backend": (str(sparse_index_backend or ""), str(manifest.get("backend") or "")),
+        }
+        for field_name, (expected, actual) in checks.items():
+            if expected and actual and expected != actual:
+                raise RuntimeError(f"Sparse index {field_name} mismatch: expected={expected} actual={actual}")
+            if expected and not actual:
+                raise RuntimeError(f"Sparse index {field_name} missing in manifest")
+        documents = list(payload.get("documents") or [])
+        manifest_document_count = int(manifest.get("document_count", 0) or 0)
+        if manifest_document_count != len(documents):
+            raise RuntimeError("Sparse index document_count mismatch between manifest and documents")
+        if int(sparse_index_document_count or 0) <= 0 or int(sparse_index_document_count or 0) != manifest_document_count:
+            raise RuntimeError("Sparse index document_count does not match build record")
+        manifest_token_count = int(manifest.get("token_count", 0) or 0)
+        if int(sparse_index_token_count or 0) > 0 and int(sparse_index_token_count or 0) != manifest_token_count:
+            raise RuntimeError("Sparse index token_count does not match build record")
+        return {
+            "source_type": source_type,
+            "document_count": manifest_document_count,
+            "token_count": manifest_token_count,
+            "backend": str(manifest.get("backend") or ""),
+        }
+
     def mark_index_success(
         self,
         arxiv_id: str,
@@ -745,7 +1031,19 @@ class PaperQAIndexBuilder:
         embedding_file: str,
         loading_method: str,
         chunking_strategy: str,
+        sparse_index_dir: str = "",
+        sparse_index_manifest_file: str = "",
+        sparse_index_document_count: int = 0,
+        sparse_index_token_count: int = 0,
+        sparse_index_backend: str = "",
+        sparse_index_schema_version: str = "",
+        sparse_index_source_file: str = "",
+        sparse_index_source_hash: str = "",
+        sparse_index_avgdl: float = 0.0,
     ) -> bool:
+        if build_id and (not str(sparse_index_manifest_file or "").strip() or int(sparse_index_document_count or 0) <= 0):
+            # 新版 QA index 必须 dense/sparse 同时完成；缺 sparse 时不能进入 active 事务。
+            raise RuntimeError("Sparse index artifact is required before activating QA index build")
         if build_id:
             indexed_at = datetime.now().isoformat(timespec="seconds")
             updated = self.db_service.update_paper_qa_index_build(
@@ -760,6 +1058,15 @@ class PaperQAIndexBuilder:
                 retrieval_index_count=retrieval_index_count,
                 retrieval_index_types=retrieval_index_types,
                 retrieval_index_version=retrieval_index_version,
+                sparse_index_dir=sparse_index_dir,
+                sparse_index_manifest_file=sparse_index_manifest_file,
+                sparse_index_document_count=sparse_index_document_count,
+                sparse_index_token_count=sparse_index_token_count,
+                sparse_index_backend=sparse_index_backend,
+                sparse_index_schema_version=sparse_index_schema_version,
+                sparse_index_source_file=sparse_index_source_file,
+                sparse_index_source_hash=sparse_index_source_hash,
+                sparse_index_avgdl=sparse_index_avgdl,
                 embedding_file=embedding_file,
                 loading_method=loading_method,
                 chunking_strategy=chunking_strategy,
@@ -784,6 +1091,15 @@ class PaperQAIndexBuilder:
             retrieval_index_count=retrieval_index_count,
             retrieval_index_types=retrieval_index_types,
             retrieval_index_version=retrieval_index_version,
+            sparse_index_dir=sparse_index_dir,
+            sparse_index_manifest_file=sparse_index_manifest_file,
+            sparse_index_document_count=sparse_index_document_count,
+            sparse_index_token_count=sparse_index_token_count,
+            sparse_index_backend=sparse_index_backend,
+            sparse_index_schema_version=sparse_index_schema_version,
+            sparse_index_source_file=sparse_index_source_file,
+            sparse_index_source_hash=sparse_index_source_hash,
+            sparse_index_avgdl=sparse_index_avgdl,
             embedding_file=embedding_file,
             loading_method=loading_method,
             chunking_strategy=chunking_strategy,
@@ -816,7 +1132,15 @@ class PaperQAIndexBuilder:
                 "cleanup_pending"
                 if any(
                     artifacts.get(field_name)
-                    for field_name in ("collection_name", "pdf_path", "chunk_file", "retrieval_index_file", "embedding_file")
+                    for field_name in (
+                        "collection_name",
+                        "pdf_path",
+                        "chunk_file",
+                        "retrieval_index_file",
+                        "sparse_index_dir",
+                        "sparse_index_manifest_file",
+                        "embedding_file",
+                    )
                 )
                 else "active"
             ),
@@ -1013,6 +1337,43 @@ class PaperQAIndexBuilder:
             self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
             self._log_stage("save_chunk_file", arxiv_id, loading_method, "chunk file saved", chunk_file=chunk_file)
 
+            current_stage = "save_sparse_index_artifact"
+            self._notify_progress(
+                progress_callback,
+                current_stage=current_stage,
+                progress=62,
+                message="Saving chunk-level sparse keyword index artifact",
+            )
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
+            sparse_artifact = self.save_sparse_index_artifact(
+                arxiv_id,
+                build_id=build_id,
+                chunks=chunks,
+                chunk_file=chunk_file,
+                chunk_count=len(chunks),
+                index_version=index_version,
+            )
+            artifact_state["sparse_index_dir"] = sparse_artifact.get("artifact_dir", "")
+            artifact_state["sparse_index_manifest_file"] = sparse_artifact.get("manifest_file", "")
+            artifact_state["sparse_index_document_count"] = int(sparse_artifact.get("document_count", 0) or 0)
+            artifact_state["sparse_index_token_count"] = int(sparse_artifact.get("token_count", 0) or 0)
+            artifact_state["sparse_index_backend"] = str(sparse_artifact.get("backend", "") or "")
+            artifact_state["sparse_index_schema_version"] = str(sparse_artifact.get("schema_version", "") or SPARSE_INDEX_ARTIFACT_SCHEMA_VERSION)
+            artifact_state["sparse_index_source_file"] = str(sparse_artifact.get("source_file", "") or "")
+            artifact_state["sparse_index_source_hash"] = str(sparse_artifact.get("source_hash", "") or "")
+            artifact_state["sparse_index_avgdl"] = float(sparse_artifact.get("avgdl", 0.0) or 0.0)
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
+            self._log_stage(
+                "save_sparse_index_artifact",
+                arxiv_id,
+                loading_method,
+                "chunk-level sparse index artifact saved",
+                sparse_index_manifest_file=artifact_state["sparse_index_manifest_file"],
+                sparse_index_document_count=artifact_state["sparse_index_document_count"],
+                sparse_index_token_count=artifact_state["sparse_index_token_count"],
+                sparse_index_source_hash=artifact_state["sparse_index_source_hash"],
+            )
+
             current_stage = "compress_chunks_for_rerank"
             self._notify_progress(
                 progress_callback,
@@ -1148,6 +1509,34 @@ class PaperQAIndexBuilder:
             self.validate_new_collection(collection_name, len(chunks))
             self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
 
+            current_stage = "validate_sparse_index_artifact"
+            self._notify_progress(
+                progress_callback,
+                current_stage=current_stage,
+                progress=99,
+                message="Validating sparse index artifact",
+            )
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
+            sparse_validation = self.validate_sparse_index_artifact(
+                build_id=build_id,
+                index_version=index_version or RETRIEVAL_INDEX_ARTIFACT_SCHEMA_VERSION,
+                sparse_index_manifest_file=str(artifact_state.get("sparse_index_manifest_file", "") or ""),
+                sparse_index_source_hash=str(artifact_state.get("sparse_index_source_hash", "") or ""),
+                sparse_index_document_count=int(artifact_state.get("sparse_index_document_count", 0) or 0),
+                sparse_index_token_count=int(artifact_state.get("sparse_index_token_count", 0) or 0),
+                sparse_index_backend=str(artifact_state.get("sparse_index_backend", "") or ""),
+            )
+            self._log_stage(
+                "validate_sparse_index_artifact",
+                arxiv_id,
+                loading_method,
+                "sparse index artifact validated",
+                sparse_source_type=sparse_validation.get("source_type"),
+                sparse_document_count=sparse_validation.get("document_count"),
+                sparse_token_count=sparse_validation.get("token_count"),
+            )
+            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
+
             current_stage = "activate_index"
             self._notify_progress(
                 progress_callback,
@@ -1171,6 +1560,15 @@ class PaperQAIndexBuilder:
                 embedding_file=embedding_file,
                 loading_method=loading_method,
                 chunking_strategy=chunking_strategy,
+                sparse_index_dir=str(artifact_state.get("sparse_index_dir", "") or ""),
+                sparse_index_manifest_file=str(artifact_state.get("sparse_index_manifest_file", "") or ""),
+                sparse_index_document_count=int(artifact_state.get("sparse_index_document_count", 0) or 0),
+                sparse_index_token_count=int(artifact_state.get("sparse_index_token_count", 0) or 0),
+                sparse_index_backend=str(artifact_state.get("sparse_index_backend", "") or ""),
+                sparse_index_schema_version=str(artifact_state.get("sparse_index_schema_version", "") or ""),
+                sparse_index_source_file=str(artifact_state.get("sparse_index_source_file", "") or ""),
+                sparse_index_source_hash=str(artifact_state.get("sparse_index_source_hash", "") or ""),
+                sparse_index_avgdl=float(artifact_state.get("sparse_index_avgdl", 0.0) or 0.0),
             )
             if not success_marked:
                 # 新 collection 已经生成但未能激活时，不能覆盖旧 active，只把新版本留给后续清理。
@@ -1210,6 +1608,15 @@ class PaperQAIndexBuilder:
                 "retrieval_index_type_counts": retrieval_index_debug.get("index_type_counts"),
                 "retrieval_index_types": retrieval_index_types,
                 "retrieval_index_version": index_version or RETRIEVAL_INDEX_ARTIFACT_SCHEMA_VERSION,
+                "sparse_index_dir": artifact_state.get("sparse_index_dir", ""),
+                "sparse_index_manifest_file": artifact_state.get("sparse_index_manifest_file", ""),
+                "sparse_index_document_count": artifact_state.get("sparse_index_document_count", 0),
+                "sparse_index_token_count": artifact_state.get("sparse_index_token_count", 0),
+                "sparse_index_backend": artifact_state.get("sparse_index_backend", ""),
+                "sparse_index_schema_version": artifact_state.get("sparse_index_schema_version", ""),
+                "sparse_index_source_file": artifact_state.get("sparse_index_source_file", ""),
+                "sparse_index_source_hash": artifact_state.get("sparse_index_source_hash", ""),
+                "sparse_index_avgdl": artifact_state.get("sparse_index_avgdl", 0.0),
                 "retrieval_index_generation_error_count": retrieval_index_debug.get("generation_error_count"),
             }
         except AppError as exc:

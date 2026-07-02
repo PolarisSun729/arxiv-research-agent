@@ -43,7 +43,6 @@
 
 | 方法 | 路径 | 函数名 | 主要职责 | 主要调用 | 副作用 |
 |---|---|---|---|---|---|
-| POST | `/user/preferences` | `legacy_post_user_preferences` | Deprecated 兼容读取入口 | `DatabaseService.get_user_preferences()` | 读数据库；不会 upsert；正式读取走 GET |
 | GET | `/user/preferences/{user_id}` | `get_user_preferences` | 按 path 获取用户偏好 | `DatabaseService.get_user_preferences()` | 读数据库 |
 | POST | `/user/like-paper` | `like_paper` | 记录喜欢论文 | `RecommendationService.record_user_paper_preference()` | 写 liked/disliked 强偏好表和 profile event，必要时物化论文并写向量库 |
 | POST | `/user/dislike-paper` | `dislike_paper` | 记录不喜欢论文 | `RecommendationService.record_user_paper_preference()` | 写 disliked/liked 强偏好表和 profile event，必要时物化论文并写向量库 |
@@ -58,6 +57,12 @@
 | POST | `/user/generate-interest-vector` | `generate_user_interest_vector` | 生成或重建用户兴趣向量 | `RecommendationService.generate_user_interest_vector()` | 读 liked/disliked，读写向量库，调用 embedding，写 `user_interest_vectors` |
 | GET | `/user/interest-vector` | `get_user_interest_vector` | 获取已保存兴趣向量 | `DatabaseService.get_user_interest_vector()` | 读数据库 |
 | POST | `/user/recommend-papers` | `recommend_papers` | 生成个性化推荐 | `RecommendationService.recommend_papers()` | 读偏好/画像/兴趣向量/OAI 数据/向量库，可能补 embedding/补论文记录；未发现保存推荐结果 |
+
+### 偏好读取入口约束
+
+- 用户偏好读取的唯一正式入口是 `GET /user/preferences/{user_id}`，返回 `liked_papers`、`disliked_papers`、`paper_actions` 和 `research_profile` 聚合结构。
+- 不再恢复旧的 POST 偏好读取入口；POST 只用于 like/dislike、paper-action、画像重建、推荐生成等具有明确写入、行为记录或计算语义的接口。
+- 静态检查会扫描旧 POST 偏好读取路由、前端 POST 调用和 deprecated successor 文案，防止临时兼容入口回流。
 
 ### 显式偏好与弱行为边界
 
@@ -111,65 +116,6 @@ flowchart TD
 ```
 
 ## 4. 每个接口单独流程图
-
-## 接口：POST `/user/preferences`（deprecated）
-
-### 职责
-
-这是短期兼容旧调用方的只读入口，已经明确标记 deprecated。它只按 `user_id` 读取用户偏好聚合结果，不创建、不更新、也不 upsert 偏好；新前端和新测试应使用 `GET /user/preferences/{user_id}`。
-
-### 处理流程图
-
-```mermaid
-flowchart TD
-    A["旧前端 / 旧脚本"] --> B["[Router] legacy_post_user_preferences"]
-    B --> C["[Validate] 解析 body.user_id"]
-    C --> D["[DB] DatabaseService.get_user_preferences"]
-    D --> E["[DB] get_liked_papers / get_disliked_papers / get_user_paper_action_map / get_user_research_profile"]
-    E --> F["[Response] status/message/deprecated/successor/preferences"]
-    D -. 异常 .-> G["[Error] 500"]
-    D -. 数据缺失 .-> H["[Fallback] DatabaseService 返回空偏好结构"]
-```
-
-### 关键调用链
-
-`legacy_post_user_preferences() -> DatabaseService.get_user_preferences() -> get_liked_papers()/get_disliked_papers()/get_user_paper_action_map()/get_user_research_profile()`
-
-### 输入
-
-- Body：
-  - `user_id`
-
-### 输出
-
-- `status`
-- `message`
-- `deprecated`
-- `successor`
-- `preferences`
-  - `user_id`
-  - `liked_papers`
-  - `disliked_papers`
-  - `paper_actions`
-  - `research_profile`
-
-### 副作用
-
-- 是否创建用户：否，未发现
-- 是否更新用户信息：否
-- 是否写入 like / dislike / collect：否
-- 是否更新用户兴趣画像：否
-- 是否更新 memory：否
-- 是否实时计算推荐：否
-- 是否读取缓存推荐：否
-- 是否调用 embedding：否
-- 是否访问 vector store：否
-- 是否写数据库：否
-
-### 异常 / fallback
-
-- router 捕获异常并返回 `500`
-- `DatabaseService.get_user_preferences()` 内部失败时会返回空偏好结构
 
 ## 接口：GET `/user/preferences/{user_id}`
 

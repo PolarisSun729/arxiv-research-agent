@@ -32,7 +32,7 @@
   - 会话、消息、笔记、QA 索引状态、索引任务状态、论文元数据均通过 `DatabaseService` 访问。
 - 向量库访问：
   - QA 诊断通过 `VectorStoreService` 查询集合状态；
-  - QA 检索通过 `EnhancedRetrievalService -> RouteRetriever -> VectorStoreService` 完成；
+  - QA 检索入口是 `EnhancedRetrievalService.enhanced_retrieve()`，真实编排由 `RetrievalPipeline -> RouteRetriever -> VectorStoreService` 完成；
   - QA 索引构建通过 `PaperQAIndexBuilder -> VectorStoreService.index_embeddings()` 写入向量库。
 - 本地文件访问：
   - `qa-trace/latest` 直接读取检索 trace 文件；
@@ -40,7 +40,7 @@
   - QA 主流程会把 `figure` 类型结果中的 `asset_abs_path` 作为多模态输入传给 LLM，但未发现直接读取本地 chunk 文件。
 - LLM 调用：
   - `PaperQAService._contextualize_question()`：会话追问改写
-  - `EnhancedRetrievalService` / `QueryPlanner`：query rewrite、HyDE、rerank query 构造
+  - `RetrievalPipeline` / `QueryPlanner` / `RouteRetriever`：query rewrite、HyDE、rerank query 构造
   - `RerankService`：可选 LLM rerank
   - `PaperQAService.answer_question()` / `qa_paper_stream()`：最终回答生成
   - `PaperQAIndexBuilder.compress_chunks_for_rerank()`：为 rerank 预压缩 chunk 文本
@@ -103,9 +103,10 @@ flowchart TD
     QA --> DB7["[DB] QA 索引 / 论文元数据 / 会话上下文"]
     QA --> MEM2["[Service] MemoryService 会话上下文加载/合并"]
     QA --> LLM2["[LLM] 问题上下文化"]
-    QA --> RET["[Service] EnhancedRetrievalService.enhanced_retrieve"]
-    RET --> VS4["[VectorStore] 向量检索 / 全量 chunk 读取"]
-    RET --> LLM3["[LLM] Query Rewrite / HyDE / Rerank"]
+    QA --> RET["[Facade] EnhancedRetrievalService.enhanced_retrieve"]
+    RET --> PIPE["[Service] RetrievalPipeline.retrieve"]
+    PIPE --> VS4["[VectorStore] 向量检索 / 全量 chunk 读取"]
+    PIPE --> LLM3["[LLM] Query Rewrite / HyDE / Rerank"]
     QA --> GEN["[LLM] GenerationService.generate / stream_qwen_responses"]
     GEN --> FILE2["[File] figure 资产路径作为图像输入"]
     QA --> DB8["[DB] 保存 user / assistant 消息"]
@@ -1260,7 +1261,8 @@ flowchart TD
     E --> E5["[Service] MemoryService.load_paper_conversation_context / merge_conversation_context"]
     E --> E6["[LLM] _contextualize_question"]
     E --> E7["[Service] _build_memory_context"]
-    E --> F["[Service] EnhancedRetrievalService.enhanced_retrieve"]
+    E --> F0["[Facade] EnhancedRetrievalService.enhanced_retrieve"]
+    F0 --> F["[Service] RetrievalPipeline.retrieve"]
     F --> F1["[Service] QueryPlanner.build_query_bundle"]
     F1 --> F2["[Service] build_query_views / build_rerank_query"]
     F2 --> F3["[Fallback] query rewrite 失败时启发式 rewrite"]
@@ -1288,7 +1290,7 @@ flowchart TD
 
 主调用链：
 
-`qa_paper() -> PaperQAService.answer_question() -> PaperQAService.build_qa_context() -> EnhancedRetrievalService.enhanced_retrieve() -> RetrievalPipeline.retrieve() -> QueryPlanner.build_query_bundle() -> RouteRetriever.build_route_bundle() -> RerankService.llm_rerank() -> PaperQAService.build_generation_context() -> GenerationService.generate() -> PaperQAService.persist_completed_turn() -> DatabaseService.append_paper_chat_message()`
+`qa_paper() -> PaperQAService.answer_question() -> PaperQAService.build_qa_context() -> EnhancedRetrievalService.enhanced_retrieve() -> RetrievalPipeline.retrieve() -> QueryPlanner.build_query_bundle() -> RouteRetriever.build_route_bundle() -> RerankService.llm_rerank() -> ContextPackBuilder.build() -> AnswerGenerator.generate() -> GenerationService.generate() -> PaperQAService.persist_completed_turn() -> DatabaseService.append_paper_chat_message()`
 
 会话与上下文化链路：
 
@@ -1298,13 +1300,15 @@ flowchart TD
 
 检索链路：
 
-`EnhancedRetrievalService.enhanced_retrieve() -> RetrievalPipeline.retrieve() -> QueryPlanner.build_query_bundle() -> QueryPlanner.build_query_views()`
+`EnhancedRetrievalService.enhanced_retrieve() -> RetrievalPipeline.retrieve()`，其中 `EnhancedRetrievalService` 只承担依赖装配和对外兼容入口职责。
 
-`EnhancedRetrievalService.enhanced_retrieve() -> RetrievalPipeline.retrieve() -> RouteRetriever.build_route_bundle() -> RouteRetriever.vector_retrieve() -> VectorStoreService.search_similar_vectors()`
+`RetrievalPipeline.retrieve() -> QueryPlanner.build_query_bundle() -> QueryPlanner.build_query_views()`
 
-`EnhancedRetrievalService.enhanced_retrieve() -> RetrievalPipeline.retrieve() -> RouteRetriever.build_route_bundle() -> RouteRetriever.keyword_retrieve() -> VectorStoreService.get_all_chunks()`
+`RetrievalPipeline.retrieve() -> RouteRetriever.build_route_bundle() -> RouteRetriever.vector_retrieve() -> VectorStoreService.search_similar_vectors()`
 
-`EnhancedRetrievalService.enhanced_retrieve() -> RetrievalPipeline.retrieve() -> RouteRetriever.build_route_bundle() -> RouteRetriever.memory_retrieve() -> VectorStoreService.get_all_chunks()`
+`RetrievalPipeline.retrieve() -> RouteRetriever.build_route_bundle() -> RouteRetriever.keyword_retrieve() -> VectorStoreService.get_all_chunks()`
+
+`RetrievalPipeline.retrieve() -> RouteRetriever.build_route_bundle() -> RouteRetriever.memory_retrieve() -> VectorStoreService.get_all_chunks()`
 
 ### 输入
 
@@ -1387,9 +1391,9 @@ flowchart TD
   - 未发现名为 “keyword expansion” 的独立 service
 - vector retrieval：已实现
 - keyword retrieval：已实现
-- RRF fusion：已实现，`_fuse_routes()`，debug 中标记为 `pure_rrf`
+- RRF fusion：已实现，入口为 `ResultFusionService.fuse_routes()`，debug 中标记为 `pure_rrf`
 - rerank：已实现，可选 LLM rerank
-- context packing：已实现，`build_generation_context()`
+- context packing：已实现，`ContextPackBuilder.build()`
 - prompt 构造：已实现，`GenerationService._build_qwen_input()` / `generate()` 中 context 拼接
 - LLM generation：已实现
 - sources 组装：已实现，`build_source_payload()`
@@ -1424,7 +1428,7 @@ flowchart TD
 
 ### 关键调用链
 
-`qa_paper_stream() -> PaperQAService.build_qa_context() -> EnhancedRetrievalService.enhanced_retrieve() -> PaperQAService.build_source_payload() -> GenerationService.stream_qwen_responses() -> PaperQAService.persist_completed_turn()`
+`qa_paper_stream() -> PaperQAService.build_qa_context() -> EnhancedRetrievalService.enhanced_retrieve() -> RetrievalPipeline.retrieve() -> PaperQAService.build_source_payload() -> GenerationService.stream_qwen_responses() -> PaperQAService.persist_completed_turn()`
 
 ### 输入
 
@@ -1528,8 +1532,8 @@ flowchart TD
    - 会把 `retrieval_debug` 存进 assistant message
    - 流式与非流式都可能把图像资产路径传给多模态 LLM
 7. 对后续 agent / RAG 重构的影响：
-   - 现有 `PaperQAService` 已经把主流程沉到底层，适合作为后续拆分的核心编排层
-   - `EnhancedRetrievalService` 已经具备较强 workflow 特征，后续若要拆成更细的 retrieval graph，迁移成本相对可控
+   - 现有 `PaperQAService` 已经把 QA 主流程沉到底层，适合作为后续拆分的核心编排层
+   - 检索 workflow 已收敛到 `RetrievalPipeline`，后续若要拆成更细的 retrieval graph，应优先迁移 pipeline 与组件协作，而不是扩展 `EnhancedRetrievalService` 私有方法
    - 会话、笔记、trace、debug 都已经和 QA 主链路耦合，后续重构时需要特别注意“副作用保持一致”，否则前端会话恢复、笔记溯源和调试体验容易回退
 
 ## 6. 检查结论

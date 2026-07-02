@@ -27,7 +27,7 @@ class RerankServiceTests(unittest.TestCase):
         self.query_profile = self.query_bundle["query_profile"]
 
     def test_build_rerank_document_text_uses_asset_metadata_for_figure_table(self) -> None:
-        figure_chunk = self.service._normalize_chunk(self.sample_chunks[5])
+        figure_chunk = self.service.retrieval_rules.normalize_chunk(self.sample_chunks[5])
 
         text = self.service.rerank_service.build_rerank_document_text(figure_chunk)
 
@@ -35,7 +35,7 @@ class RerankServiceTests(unittest.TestCase):
         self.assertIn("page 6", text)
 
     def test_build_rerank_document_text_includes_matched_indexes_and_chunk_evidence(self) -> None:
-        method_chunk = dict(self.service._normalize_chunk(self.sample_chunks[0]))
+        method_chunk = dict(self.service.retrieval_rules.normalize_chunk(self.sample_chunks[0]))
         method_chunk["matched_indexes"] = [
             {
                 "matched_index_id": "chunk-method:question:1",
@@ -60,7 +60,7 @@ class RerankServiceTests(unittest.TestCase):
         self.assertIn("framework uses a retrieval pipeline", text)
 
     def test_low_confidence_asset_section_does_not_enter_rerank_or_context_text(self) -> None:
-        figure_chunk = dict(self.service._normalize_chunk(self.sample_chunks[5]))
+        figure_chunk = dict(self.service.retrieval_rules.normalize_chunk(self.sample_chunks[5]))
         figure_chunk.update(
             {
                 "section_title": "Wrong Section",
@@ -85,15 +85,15 @@ class RerankServiceTests(unittest.TestCase):
 
     def test_rerank_success_changes_chunk_order(self) -> None:
         chunks = [
-            dict(self.service._normalize_chunk(self.sample_chunks[0]), score=0.2, route_rank=1),
-            dict(self.service._normalize_chunk(self.sample_chunks[2]), score=0.1, route_rank=2),
+            dict(self.service.retrieval_rules.normalize_chunk(self.sample_chunks[0]), score=0.2, route_rank=1),
+            dict(self.service.retrieval_rules.normalize_chunk(self.sample_chunks[2]), score=0.1, route_rank=2),
         ]
         reranker = _FakeReranker(scores=[0.1, 5.0])
         self.service.llm_rerank_provider = "local"
         self.service._llm_reranker_path = "fake-reranker"
         self.service._llm_reranker_device = "cpu"
 
-        with mock.patch.object(self.service, "_load_llm_reranker", return_value=reranker):
+        with mock.patch.object(self.service.rerank_service, "load_llm_reranker", return_value=reranker):
             result = self.service.rerank_service.llm_rerank(
                 "method evidence",
                 chunks,
@@ -110,13 +110,13 @@ class RerankServiceTests(unittest.TestCase):
 
     def test_rerank_failure_falls_back_to_original_order(self) -> None:
         chunks = [
-            dict(self.service._normalize_chunk(self.sample_chunks[0]), score=0.2, route_rank=1),
-            dict(self.service._normalize_chunk(self.sample_chunks[2]), score=0.1, route_rank=2),
+            dict(self.service.retrieval_rules.normalize_chunk(self.sample_chunks[0]), score=0.2, route_rank=1),
+            dict(self.service.retrieval_rules.normalize_chunk(self.sample_chunks[2]), score=0.1, route_rank=2),
         ]
         self.service.llm_rerank_provider = "local"
         self.service._llm_reranker_error = "offline"
 
-        with mock.patch.object(self.service, "_load_llm_reranker", return_value=None):
+        with mock.patch.object(self.service.rerank_service, "load_llm_reranker", return_value=None):
             result = self.service.rerank_service.llm_rerank(
                 "method evidence",
                 chunks,
@@ -132,15 +132,15 @@ class RerankServiceTests(unittest.TestCase):
     def test_noisy_section_penalty_penalizes_appendix_and_references(self) -> None:
         chunks_by_id = {}
         for chunk in self.sample_chunks:
-            normalized_chunk = self.service._normalize_chunk(chunk)
+            normalized_chunk = self.service.retrieval_rules.normalize_chunk(chunk)
             chunks_by_id[normalized_chunk["chunk_id"]] = normalized_chunk
         appendix_chunk = chunks_by_id["chunk-appendix"]
         references_chunk = chunks_by_id["chunk-references"]
         method_chunk = chunks_by_id["chunk-method"]
 
-        appendix_bonus = self.service._compute_structural_bonus(appendix_chunk, self.query_profile)
-        references_bonus = self.service._compute_structural_bonus(references_chunk, self.query_profile)
-        method_bonus = self.service._compute_structural_bonus(method_chunk, self.query_profile)
+        appendix_bonus = self.service.retrieval_rules.compute_structural_bonus(appendix_chunk, self.query_profile)
+        references_bonus = self.service.retrieval_rules.compute_structural_bonus(references_chunk, self.query_profile)
+        method_bonus = self.service.retrieval_rules.compute_structural_bonus(method_chunk, self.query_profile)
 
         self.assertLess(appendix_bonus, 0.0)
         self.assertLess(references_bonus, 0.0)

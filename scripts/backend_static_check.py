@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -15,6 +16,86 @@ from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_ROOT = REPO_ROOT / "backend"
+FRONTEND_SRC_ROOT = REPO_ROOT / "new_frontend" / "src"
+DOCS_ROOT = REPO_ROOT / "docs"
+STATIC_LEGACY_SCAN_ROOTS = (BACKEND_ROOT, REPO_ROOT / "scripts", FRONTEND_SRC_ROOT, DOCS_ROOT)
+STATIC_LEGACY_SCAN_SUFFIXES = {".py", ".ts", ".tsx", ".js", ".jsx", ".vue", ".md"}
+REMOVED_VECTOR_STORE_FILENAME = "vector_store_service_" + "langchain.py"
+REMOVED_LEGACY_PATHS = (
+    (
+        BACKEND_ROOT / "services" / "archive" / REMOVED_VECTOR_STORE_FILENAME,
+        "旧 LangChain/Milvus VectorStore 实现已删除；向量存储统一使用 services.storage.vector_store_service.VectorStoreService。",
+    ),
+)
+
+# 已删除的兼容入口不能重新出现在源码里；这些字符串用分段拼接保存，
+# 避免本检查脚本本身被普通文本搜索误判为旧入口残留。
+REMOVED_LEGACY_ENTRY_MARKERS = (
+    (
+        "build_" + "legacy_" + "pending_action",
+        "旧 pending_action 构造函数已经删除，请使用当前确认恢复链路。",
+    ),
+    (
+        "arxiv_search_agent" + ".compat",
+        "旧 compat 包路径已经退出主流程，请不要新增独立 legacy 映射入口。",
+    ),
+    (
+        "arxiv_search_agent" + ".compat" + ".legacy",
+        "旧 compat 模块路径已经删除，请不要新增独立 legacy 映射入口。",
+    ),
+    (
+        "agents." + "arxiv_search_agent" + ".compat" + ".legacy",
+        "旧 compat 导入路径已经删除，请不要绕过 service/graph 的出站投影。",
+    ),
+    (
+        "from agents." + "arxiv_search_agent" + ".compat import",
+        "compat 包不再导出确认展示构造器，请改用当前结构化确认链路。",
+    ),
+    (
+        "from backend.agents." + "arxiv_search_agent" + ".compat import",
+        "compat 包不再导出确认展示构造器，请改用当前结构化确认链路。",
+    ),
+    (
+        "vector_store_service_" + "langchain",
+        "旧 VectorStore 文件级实现已删除，请使用 services.storage.vector_store_service.VectorStoreService。",
+    ),
+    (
+        "services." + "archive" + ".vector_store",
+        "archive 下不再保留 VectorStore 入口，请通过 dependencies.get_vector_store_service() 或正式 storage 层获取服务。",
+    ),
+    (
+        "backend." + "services" + ".archive" + ".vector_store",
+        "archive 下不再保留 VectorStore 入口，请通过 dependencies.get_vector_store_service() 或正式 storage 层获取服务。",
+    ),
+)
+
+# 用户偏好读取已经收敛为 GET /user/preferences/{user_id}；这里用正则兜住常见回流形态，
+# 包括后端重新注册 POST 路由、前端重新调用 POST 读取、文档/测试重新声明旧兼容入口。
+REMOVED_USER_PREFERENCE_POST_PATTERNS = (
+    (
+        re.compile(r"legacy_" + r"post_" + r"user_" + r"preferences"),
+        "旧 POST 偏好读取函数已删除，请只保留 get_user_preferences() 作为读取入口。",
+    ),
+    (
+        re.compile(r"@\s*router\s*\.\s*post\s*\(\s*[\"']/" + r"preferences[\"']", re.MULTILINE),
+        "禁止恢复 /user/preferences 的 POST 路由；偏好读取必须使用 GET /user/preferences/{user_id}。",
+    ),
+    (
+        re.compile(r"\.\s*post\s*\(\s*[`\"'](?:/api)?/user/" + r"preferences[`\"']"),
+        "禁止前端或测试通过 POST 读取用户偏好；请调用 GET /user/preferences/{user_id}。",
+    ),
+    (
+        re.compile(r"POST\s+`?(?:/api)?/user/" + r"preferences`?"),
+        "文档和测试计划不应再声明旧 POST 偏好读取入口；请统一记录 GET 读取入口。",
+    ),
+    (
+        re.compile(
+            r"successor-" + r"version|Deprecated:\s*read\s+user\s+preferences|deprecated\s+POST\s+compatibility\s+endpoint",
+            re.IGNORECASE,
+        ),
+        "旧 deprecated 兼容入口的响应头和 successor 文案已删除，不应重新出现。",
+    ),
+)
 
 
 IMPORT_MODULES = [
@@ -76,6 +157,8 @@ def _prepare_environment() -> None:
     # 静态检查只验证导入边界，不允许借由 FastAPI preload 去实例化 Milvus、模型或远程客户端。
     os.environ.setdefault("RAG_QUALITY_GATE", "offline")
     os.environ.setdefault("BACKEND_SERVICE_LOAD_MODE", "lazy")
+    # import-smoke 只验证模块边界；强制使用内存 checkpoint，避免旧本地 SQLite schema 影响静态检查。
+    os.environ["AGENT_RUNTIME_CHECKPOINT_BACKEND"] = "memory"
     for path in (str(REPO_ROOT), str(BACKEND_ROOT)):
         if path not in sys.path:
             sys.path.insert(0, path)
@@ -245,6 +328,61 @@ def _check_imports() -> str:
     return f"已导入 {len(imported)} 个关键模块。"
 
 
+def _iter_static_legacy_scan_files() -> list[Path]:
+    files: list[Path] = []
+    for root in STATIC_LEGACY_SCAN_ROOTS:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if "__pycache__" in path.parts:
+                continue
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in STATIC_LEGACY_SCAN_SUFFIXES:
+                continue
+            files.append(path)
+    return sorted(files)
+
+
+def _check_removed_legacy_entry_markers() -> str:
+    """阻止已删除的 legacy 入口再次被接回源码。
+
+    当前确认恢复的执行真源是 pending_confirmation / runtime_state / resume；
+    pending_action 只允许由现有 service/graph 出站投影生成展示镜像。
+    VectorStore 只保留 storage 层正式实现，避免 archive 旧实现恢复后形成双入口。
+    用户偏好读取只允许 GET 入口，避免 POST 读取语义回流为伪 upsert。
+    """
+    hits: list[str] = []
+    for removed_path, guidance in REMOVED_LEGACY_PATHS:
+        if removed_path.exists():
+            relative_path = removed_path.relative_to(REPO_ROOT)
+            hits.append(f"{relative_path}: 禁止恢复已删除路径。{guidance}")
+
+    for path in _iter_static_legacy_scan_files():
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for marker, guidance in REMOVED_LEGACY_ENTRY_MARKERS:
+            if marker not in text:
+                continue
+            for line_number, line in enumerate(text.splitlines(), start=1):
+                if marker in line:
+                    relative_path = path.relative_to(REPO_ROOT)
+                    hits.append(f"{relative_path}:{line_number}: 禁止出现 `{marker}`。{guidance}")
+        for pattern, guidance in REMOVED_USER_PREFERENCE_POST_PATTERNS:
+            for match in pattern.finditer(text):
+                line_number = text.count("\n", 0, match.start()) + 1
+                relative_path = path.relative_to(REPO_ROOT)
+                snippet = " ".join(match.group(0).split())
+                hits.append(f"{relative_path}:{line_number}: 禁止恢复旧 POST 偏好读取入口 `{snippet}`。{guidance}")
+
+    if hits:
+        # 这里直接失败，避免旧兼容入口和当前正式服务链路并存后产生双入口维护成本。
+        raise RuntimeError(
+            "检测到已删除的 legacy 入口；请使用当前正式服务链路。\n"
+            + "\n".join(hits[:50])
+        )
+    return "未发现已删除的 legacy 入口；确认恢复、VectorStore 和用户偏好读取均保持当前正式入口。"
+
+
 def _check_ruff() -> str:
     ruff = shutil.which("ruff")
     if not ruff:
@@ -301,6 +439,7 @@ def main() -> int:
     print("运行模式: offline static")
 
     checks: list[tuple[str, Callable[[], str]]] = [
+        ("legacy-entry-guard", _check_removed_legacy_entry_markers),
         ("compileall", _check_compileall),
         ("import-smoke", _check_imports),
     ]

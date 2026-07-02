@@ -82,6 +82,7 @@ class RetrievalTraceBuilder:
             final_context_top15=final_context_top15,
             config=config,
         )
+        sparse_index_debug = self.build_sparse_index_debug(keyword_debug)
         return {
             "original_query": user_query,
             "original_question": user_query,
@@ -97,6 +98,7 @@ class RetrievalTraceBuilder:
             "collection_profile": collection_profile,
             "embedding_batch": embedding_batch,
             "route_metrics": route_metrics,
+            "sparse_index": sparse_index_debug,
             "keyword_search": keyword_debug,
             "table_structured": table_structured_debug,
             "memory": {
@@ -163,6 +165,7 @@ class RetrievalTraceBuilder:
         query_views: Dict[str, Any],
         hyde_debug: Dict[str, Any],
         table_structured_debug: Dict[str, Any],
+        keyword_debug: Dict[str, Any],
         collection_profile: Dict[str, Any],
         route_metrics: Dict[str, Any],
         embedding_batch: Dict[str, Any],
@@ -197,6 +200,7 @@ class RetrievalTraceBuilder:
                 final_context_top15=final_results,
                 config=options,
             )
+            sparse_index_debug = self.build_sparse_index_debug(keyword_debug)
             payload = {
                 "exported_at": datetime.now().isoformat(timespec="seconds"),
                 "arxiv_id": str(paper_context.get("arxiv_id", "") or ""),
@@ -212,6 +216,8 @@ class RetrievalTraceBuilder:
                 "collection_profile": self.normalize_trace_value(collection_profile),
                 "embedding_batch": self.normalize_trace_value(embedding_batch),
                 "route_metrics": self.normalize_trace_value(route_metrics),
+                "sparse_index": self.normalize_trace_value(sparse_index_debug),
+                "keyword_search": self.normalize_trace_value(keyword_debug),
                 "multi_index": self.normalize_trace_value(multi_index_debug),
                 "context_expansion": self.normalize_trace_value(context_expansion),
                 "context_budget": self.normalize_trace_value(context_budget),
@@ -223,6 +229,8 @@ class RetrievalTraceBuilder:
                     {"step": "rerank_query", "result": self.normalize_trace_value(rerank_query)},
                     {"step": "hyde", "result": self.normalize_trace_value(hyde_debug)},
                     {"step": "table_structured", "result": self.normalize_trace_value(table_structured_debug)},
+                    {"step": "keyword_search", "result": self.normalize_trace_value(keyword_debug)},
+                    {"step": "sparse_index", "result": self.normalize_trace_value(sparse_index_debug)},
                     {"step": "collection_profile", "result": self.normalize_trace_value(collection_profile)},
                     {"step": "embedding_batch", "result": self.normalize_trace_value(embedding_batch)},
                     {"step": "route_metrics", "result": self.normalize_trace_value(route_metrics)},
@@ -491,6 +499,33 @@ class RetrievalTraceBuilder:
             "route_counts": {route_name: len(route_results) for route_name, route_results in routes.items()},
             "final_count": len(fused_results),
             "dedupe_per_route": True,
+        }
+
+    @staticmethod
+    def build_sparse_index_debug(keyword_debug: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        keyword_debug = dict(keyword_debug or {})
+        sparse_index = dict(keyword_debug.get("sparse_index") or {})
+        if sparse_index:
+            return sparse_index
+        artifact = dict(keyword_debug.get("retrieval_index_artifact") or {})
+        nested_sparse = dict(artifact.get("sparse_index_artifact") or {})
+        load_source = str(keyword_debug.get("keyword_route_index_source") or artifact.get("keyword_route_index_source") or "")
+        if not load_source:
+            load_source = "keyword_route_disabled" if not keyword_debug.get("enabled", True) else "runtime_build_fallback"
+        # trace 只输出稳定摘要；完整 artifact/debug 仍保留在 keyword_search 里用于深挖。
+        return {
+            "load_source": load_source,
+            "build_id": str(nested_sparse.get("build_id") or artifact.get("build_id") or keyword_debug.get("keyword_index_build_id") or ""),
+            "index_version": str(nested_sparse.get("index_version") or artifact.get("index_version") or keyword_debug.get("keyword_index_version") or ""),
+            "source_type": str(nested_sparse.get("source_type") or artifact.get("source_type") or ""),
+            "backend": str(nested_sparse.get("backend") or artifact.get("backend") or ""),
+            "schema_version": str(nested_sparse.get("schema_version") or artifact.get("schema_version") or ""),
+            "manifest_file": str(nested_sparse.get("sparse_index_manifest_file") or artifact.get("sparse_index_manifest_file") or ""),
+            "document_count": int(keyword_debug.get("keyword_index_document_count") or 0),
+            "keyword_route_hit_count": int(keyword_debug.get("keyword_candidate_count") or 0),
+            "load_time_ms": round(float(keyword_debug.get("keyword_index_build_time") or 0.0) * 1000.0, 3) if load_source == "persistent_sparse_artifact" else 0.0,
+            "fallback_count": 1 if bool(keyword_debug.get("keyword_index_fallback_used")) else 0,
+            "artifact_stale_reason": str(nested_sparse.get("reason") or ""),
         }
 
     def build_multi_index_debug(

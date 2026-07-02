@@ -384,6 +384,21 @@ class RouteRetriever:
             "keywords": self.query_tools.build_query_keywords([item["query"] for item in keyword_query_views]),
             **keyword_result["debug"],
         }
+        if not enable_keyword_search:
+            # collection index 可能仍被 memory/table route 复用；这里标记的是 keyword route 本身没有消费 BM25。
+            keyword_debug["keyword_route_index_source"] = "keyword_route_disabled"
+            keyword_debug["keyword_index_fallback_used"] = False
+            sparse_index_debug = dict(keyword_debug.get("sparse_index") or {})
+            sparse_index_debug["load_source"] = "keyword_route_disabled"
+            sparse_index_debug["keyword_route_hit_count"] = 0
+            sparse_index_debug["fallback_count"] = 0
+            keyword_debug["sparse_index"] = sparse_index_debug
+        else:
+            sparse_index_debug = dict(keyword_debug.get("sparse_index") or {})
+            if sparse_index_debug and not sparse_index_debug.get("backend"):
+                # runtime fallback 的实际 backend 由 keyword route 执行后才知道，这里补齐到 sparse trace 摘要。
+                sparse_index_debug["backend"] = str(keyword_debug.get("keyword_backend") or "")
+                keyword_debug["sparse_index"] = sparse_index_debug
         table_structured_debug = {
             "enabled": bool(enable_table_structured_route and table_structured_debug.get("enabled", False)),
             **table_structured_debug,

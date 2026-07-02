@@ -108,6 +108,7 @@ def run_case(service: Any, collection_name: str, case: Dict[str, Any], top_k: in
     routes = debug.get("routes", {}) or {}
     stages = debug.get("stages", {}) or {}
     keyword_route = routes.get("keyword", []) or []
+    sparse_index = debug.get("sparse_index") or (debug.get("keyword_search", {}) or {}).get("sparse_index") or {}
     return {
         "id": case.get("id"),
         "category": case.get("category"),
@@ -119,6 +120,17 @@ def run_case(service: Any, collection_name: str, case: Dict[str, Any], top_k: in
         "reranked_top_k": [_chunk_brief(item) for item in stages.get("reranked_top30", [])[:top_k]],
         "final_context": [_chunk_brief(item) for item in stages.get("final_context_top15", [])[:top_k]],
         "keyword_base_route_confidence": (debug.get("keyword_search", {}) or {}).get("base_route_confidence"),
+        "sparse_index": {
+            "load_source": sparse_index.get("load_source"),
+            "build_id": sparse_index.get("build_id"),
+            "index_version": sparse_index.get("index_version"),
+            "source_type": sparse_index.get("source_type"),
+            "backend": sparse_index.get("backend"),
+            "document_count": sparse_index.get("document_count"),
+            "keyword_route_hit_count": sparse_index.get("keyword_route_hit_count", len(keyword_route)),
+            "fallback_count": sparse_index.get("fallback_count", 0),
+            "artifact_stale_reason": sparse_index.get("artifact_stale_reason", ""),
+        },
     }
 
 
@@ -129,6 +141,16 @@ def print_case(result: Dict[str, Any]) -> None:
     if expected:
         print(f"  expected_top_chunk: {expected}")
     print(f"  keyword base_route_confidence: {result.get('keyword_base_route_confidence')}")
+    sparse_index = result.get("sparse_index") or {}
+    print(
+        "  sparse index: "
+        f"source={sparse_index.get('load_source')} "
+        f"version={sparse_index.get('index_version')} "
+        f"backend={sparse_index.get('backend')} "
+        f"docs={sparse_index.get('document_count')} "
+        f"hits={sparse_index.get('keyword_route_hit_count')} "
+        f"fallbacks={sparse_index.get('fallback_count')}"
+    )
     print("\n  -- BM25 keyword route top-k --")
     if not result["bm25_top_k"]:
         print("     (no keyword hits)")

@@ -230,6 +230,7 @@ class RetrievalPipeline:
                 query_views=query_views,
                 hyde_debug=route_bundle["hyde_debug"],
                 table_structured_debug=table_structured_debug,
+                keyword_debug=route_bundle["keyword_debug"],
                 collection_profile=collection_profile_debug,
                 route_metrics=route_metrics,
                 embedding_batch=embedding_batch_debug,

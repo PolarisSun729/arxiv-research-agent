@@ -477,54 +477,6 @@ class PaperQAServiceComponentTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, ErrorCode.DATABASE_WRITE_FAILED)
         self.assertEqual(messages, [])
 
-    def test_build_generation_context_and_source_payload_cover_text_assets_and_fields(self) -> None:
-        long_content = "x" * 400
-        search_results = [
-            {
-                "content": long_content,
-                "chunk_type": "text",
-                "page_number": 1,
-                "source": "body",
-                "subchunk_label": "1.1",
-                "section_path": "Intro",
-                "parent_chunk_id": "p1",
-            },
-            {
-                "chunk_type": "figure",
-                "asset_kind": "image",
-                "asset_abs_path": "/tmp/figure.png",
-                "asset_path": "figure.png",
-                "asset_summary": "Figure summary",
-                "page_number": 2,
-                "section_path": "Method/Figure",
-                "source": "figure-source",
-            },
-            {
-                "chunk_type": "table",
-                "asset_kind": "table",
-                "asset_summary": "Table summary",
-                "asset_preview_text": "cell a | cell b",
-                "page_number": 3,
-                "section_path": "Results/Table",
-                "source": "table-source",
-            },
-        ]
-
-        text_context, image_inputs, asset_metadata = self.service.build_generation_context(search_results)
-        source_payload = self.service.build_source_payload(search_results)
-        truncated = self.service._truncate_text(long_content, 32)
-
-        self.assertIn(long_content, text_context)
-        self.assertIn("[Table 3]", text_context)
-        self.assertEqual(image_inputs[0]["image_path"], "/tmp/figure.png")
-        self.assertEqual(len(asset_metadata), 2)
-        self.assertEqual(source_payload[0]["source_id"], "p1")
-        self.assertEqual(image_inputs[0]["source_id"], source_payload[1]["source_id"])
-        self.assertEqual(source_payload[0]["parent_chunk_id"], "p1")
-        self.assertEqual(source_payload[1]["asset_summary"], "Figure summary")
-        self.assertIn("chunk_type", source_payload[2])
-        self.assertTrue(truncated.endswith("..."))
-
     def test_structured_table_evidence_enters_prompt_sources_and_numeric_verifier(self) -> None:
         table_result = {
             "chunk_id": "chunk-table-results",

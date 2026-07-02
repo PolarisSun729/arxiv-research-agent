@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -56,6 +57,19 @@ DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK = 3
 RETRIEVAL_INDEX_PREVIEW_CHARS = 360
 RETRIEVAL_INDEX_ARTIFACT_SCHEMA_VERSION = "retrieval_index_artifact_v1"
 DEFAULT_RETRIEVAL_INDEX_ARTIFACT_DIR = "02-retrieval-indexes"
+SPARSE_INDEX_ARTIFACT_SCHEMA_VERSION = "sparse_index_artifact_v1"
+BM25_SCHEMA_VERSION = "field_weighted_bm25_v1"
+KEYWORD_TOKENIZER_VERSION = "retrieval_rules_keyword_tokenizer_v1"
+KEYWORD_FIELD_WEIGHTS_VERSION = "keyword_field_weights_v1"
+DEFAULT_SPARSE_INDEX_ARTIFACT_DIR = "02-sparse-indexes"
+SPARSE_SOURCE_TYPES = {"chunk", "retrieval_index"}
+SPARSE_SOURCE_TYPE_ALIASES = {
+    "chunk_file": "chunk",
+    "chunk-level": "chunk",
+    "chunk_level": "chunk",
+    "retrieval_index_artifact": "retrieval_index",
+    "retrieval_index_file": "retrieval_index",
+}
 
 PAPER_CHUNK_METADATA_KEYS = {
     "source",
@@ -643,6 +657,14 @@ def _safe_artifact_slug(value: Any, fallback: str = "paper") -> str:
     return slug or fallback
 
 
+def normalize_sparse_source_type(source_type: Any) -> str:
+    normalized = str(source_type or "").strip().lower()
+    if not normalized:
+        return "chunk"
+    normalized = SPARSE_SOURCE_TYPE_ALIASES.get(normalized, normalized)
+    return normalized
+
+
 def normalize_retrieval_index_artifact_records(
     retrieval_indexes: Iterable[Dict[str, Any]],
     *,
@@ -841,7 +863,41 @@ class CollectionRetrievalIndex:
     fallback_reason: str = ""
     build_source: str = "lazy_chunk_scan"
 
+    def keyword_route_index_source(self) -> str:
+        # debug 对外只暴露迁移状态，不把内部 runtime build 的多种来源泄漏成新的前端契约。
+        if self.build_source == "sparse_index_artifact":
+            return "persistent_sparse_artifact"
+        return "runtime_build_fallback"
+
+    def sparse_index_debug_summary(self, candidate_count: int) -> Dict[str, Any]:
+        route_index_source = self.keyword_route_index_source()
+        artifact_debug = dict(self.retrieval_index_artifact_debug or {})
+        sparse_debug = artifact_debug if self.build_source == "sparse_index_artifact" else dict(artifact_debug.get("sparse_index_artifact") or {})
+        stale_reason = str(sparse_debug.get("reason") or "")
+        raw_source_type = str(sparse_debug.get("source_type") or artifact_debug.get("source_type") or "").strip()
+        if not raw_source_type:
+            source_hint = str(artifact_debug.get("source") or self.build_source or "").strip()
+            # runtime fallback 仍要暴露稀疏索引源类型，方便后续 chunk-level 到 retrieval-index-level 的迁移评估。
+            raw_source_type = "retrieval_index" if "retrieval_index" in source_hint else ("chunk" if source_hint else "")
+        source_type = normalize_sparse_source_type(raw_source_type) if raw_source_type else ""
+        return {
+            "load_source": route_index_source,
+            "build_id": str(sparse_debug.get("build_id") or self.build_id or ""),
+            "index_version": str(sparse_debug.get("index_version") or self.index_version or ""),
+            "source_type": source_type if source_type in SPARSE_SOURCE_TYPES else "",
+            "backend": str(sparse_debug.get("backend") or ""),
+            "schema_version": str(sparse_debug.get("schema_version") or ""),
+            "manifest_file": str(sparse_debug.get("sparse_index_manifest_file") or ""),
+            "document_count": len(self.documents),
+            "keyword_route_hit_count": int(candidate_count or 0),
+            "load_time_ms": round(float(self.build_time or 0.0) * 1000.0, 3) if route_index_source == "persistent_sparse_artifact" else 0.0,
+            "fallback_count": 1 if route_index_source == "runtime_build_fallback" and stale_reason else 0,
+            "artifact_stale_reason": stale_reason,
+        }
+
     def to_keyword_debug(self, candidate_count: int, *, full_scan_used: bool = False) -> Dict[str, Any]:
+        route_index_source = self.keyword_route_index_source()
+        sparse_summary = self.sparse_index_debug_summary(candidate_count)
         return {
             "keyword_index_hit": self.cache_hit,
             "keyword_index_version": self.index_version,
@@ -853,8 +909,11 @@ class CollectionRetrievalIndex:
             "keyword_index_build_time": self.build_time,
             "keyword_full_scan_used": full_scan_used,
             "keyword_index_build_source": self.build_source,
+            "keyword_route_index_source": route_index_source,
+            "keyword_index_fallback_used": route_index_source == "runtime_build_fallback",
             "keyword_index_fallback_reason": self.fallback_reason,
             "keyword_index_model": "retrieval_index_v1",
+            "sparse_index": sparse_summary,
             "retrieval_index_artifact": dict(self.retrieval_index_artifact_debug),
         }
 
@@ -879,6 +938,295 @@ class CollectionRetrievalIndex:
             "memory_index_fallback_reason": self.fallback_reason,
             "retrieval_index_artifact": dict(self.retrieval_index_artifact_debug),
         }
+
+
+def compute_artifact_file_hash(file_path: Any) -> str:
+    """计算 artifact 源文件 hash，用于判断 sparse index 是否仍对应当前 active build。"""
+    resolved = resolve_artifact_file_path(file_path)
+    if resolved is None:
+        raise FileNotFoundError(str(file_path or ""))
+    digest = hashlib.sha256()
+    with open(resolved, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _counter_to_json(counter: Counter) -> Dict[str, float]:
+    return {str(token): float(count) for token, count in dict(counter or {}).items()}
+
+
+def _counter_from_json(payload: Any) -> Counter:
+    if not isinstance(payload, dict):
+        return Counter()
+    values = Counter()
+    for token, count in payload.items():
+        try:
+            values[str(token)] = float(count)
+        except (TypeError, ValueError):
+            continue
+    return values
+
+
+def _keyword_document_to_sparse_record(document: KeywordDocument) -> Dict[str, Any]:
+    return {
+        "doc_id": int(document.doc_id),
+        "chunk": dict(document.chunk or {}),
+        "token_counts": _counter_to_json(document.token_counts),
+        "doc_length": int(document.doc_length or 0),
+        "content_prefix": str(document.content_prefix or ""),
+        "field_token_counts": {
+            str(field_name): _counter_to_json(field_counts)
+            for field_name, field_counts in (document.field_token_counts or {}).items()
+        },
+        "field_lengths": {str(field_name): int(length or 0) for field_name, length in (document.field_lengths or {}).items()},
+        "token_sources": {
+            str(token): [str(source) for source in (sources or [])]
+            for token, sources in (document.token_sources or {}).items()
+        },
+        "keyword_document_debug": dict(document.keyword_document_debug or {}),
+        "retrieval_index_id": str(document.retrieval_index_id or ""),
+        "retrieval_index_type": str(document.retrieval_index_type or "body"),
+        "retrieval_index_text": str(document.retrieval_index_text or ""),
+        "retrieval_index_weight": float(document.retrieval_index_weight or 1.0),
+        "retrieval_index_enabled_routes": list(document.retrieval_index_enabled_routes or []),
+    }
+
+
+def _keyword_document_from_sparse_record(record: Dict[str, Any], fallback_doc_id: int) -> KeywordDocument:
+    field_token_counts = {
+        str(field_name): _counter_from_json(field_counts)
+        for field_name, field_counts in (record.get("field_token_counts") or {}).items()
+        if isinstance(field_counts, dict)
+    }
+    return KeywordDocument(
+        doc_id=int(record.get("doc_id", fallback_doc_id) or fallback_doc_id),
+        chunk=dict(record.get("chunk") or {}),
+        token_counts=_counter_from_json(record.get("token_counts") or {}),
+        doc_length=int(record.get("doc_length", 0) or 0),
+        content_prefix=str(record.get("content_prefix") or ""),
+        field_token_counts=field_token_counts,
+        field_lengths={str(key): int(value or 0) for key, value in (record.get("field_lengths") or {}).items()},
+        token_sources={
+            str(token): [str(source) for source in (sources or [])]
+            for token, sources in (record.get("token_sources") or {}).items()
+        },
+        keyword_document_debug=dict(record.get("keyword_document_debug") or {}),
+        retrieval_index_id=str(record.get("retrieval_index_id") or ""),
+        retrieval_index_type=str(record.get("retrieval_index_type") or "body"),
+        retrieval_index_text=str(record.get("retrieval_index_text") or ""),
+        retrieval_index_weight=float(record.get("retrieval_index_weight", 1.0) or 1.0),
+        retrieval_index_enabled_routes=normalize_enabled_routes(record.get("retrieval_index_enabled_routes")),
+    )
+
+
+def _sparse_token_stats(index: CollectionRetrievalIndex) -> Dict[str, Any]:
+    """汇总 sparse artifact 的 token 统计，供 manifest/debug 直接解释 document_count 和 avgdl 来源。"""
+    field_stats: Dict[str, Dict[str, Any]] = {}
+    total_document_length = 0
+    for document in index.documents:
+        total_document_length += int(document.doc_length or 0)
+        for field_name, length in (document.field_lengths or {}).items():
+            stats = field_stats.setdefault(
+                str(field_name),
+                {"document_count": 0, "total_token_count": 0, "unique_token_count": 0},
+            )
+            stats["document_count"] += 1
+            stats["total_token_count"] += int(length or 0)
+            field_counts = (document.field_token_counts or {}).get(field_name) or Counter()
+            stats["unique_token_count"] += len([token for token in field_counts if str(token or "").strip()])
+    posting_token_count = len([token for token in (index.postings or {}) if str(token or "").strip()])
+    return {
+        "document_count": len(index.documents),
+        "avgdl": float(index.avgdl or 0.0),
+        "total_document_length": total_document_length,
+        "unique_token_count": len([token for token in (index.document_frequency or {}) if str(token or "").strip()]),
+        "posting_token_count": posting_token_count,
+        "field_stats": field_stats,
+        "field_weights": dict(KEYWORD_FIELD_WEIGHTS),
+        "field_weights_version": KEYWORD_FIELD_WEIGHTS_VERSION,
+        "bm25_schema_version": BM25_SCHEMA_VERSION,
+    }
+
+
+def save_sparse_index_artifact(
+    *,
+    index: CollectionRetrievalIndex,
+    paper_id: str,
+    build_id: str,
+    index_version: str,
+    source_type: str,
+    source_file: str,
+    source_hash: Optional[str] = None,
+    backend: str = "",
+    output_dir: str = DEFAULT_SPARSE_INDEX_ARTIFACT_DIR,
+) -> Dict[str, Any]:
+    """把 BM25/keyword route 需要的稀疏结构落成正式 artifact，避免重启后再临时扫描重建。"""
+    created_at = datetime.now().isoformat(timespec="seconds")
+    version = str(index_version or index.index_version or created_at.replace(":", "").replace("-", "")).strip()
+    source_hash_value = str(source_hash or compute_artifact_file_hash(source_file)).strip()
+    normalized_source_type = normalize_sparse_source_type(source_type)
+    if normalized_source_type not in SPARSE_SOURCE_TYPES:
+        raise ValueError(f"Unsupported sparse source_type: {source_type}")
+    artifact_dir = Path(output_dir) / _safe_artifact_slug(paper_id) / _safe_artifact_slug(version, fallback="version")
+    os.makedirs(artifact_dir, exist_ok=True)
+
+    documents_file = artifact_dir / "documents.jsonl"
+    postings_file = artifact_dir / "postings.json"
+    document_frequency_file = artifact_dir / "document_frequency.json"
+    token_stats_file = artifact_dir / "token_stats.json"
+    manifest_file = artifact_dir / "manifest.json"
+
+    with open(documents_file, "w", encoding="utf-8") as handle:
+        for document in index.documents:
+            handle.write(json.dumps(_keyword_document_to_sparse_record(document), ensure_ascii=False, default=str))
+            handle.write("\n")
+
+    with open(postings_file, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                str(token): sorted(int(doc_id) for doc_id in doc_ids)
+                for token, doc_ids in (index.postings or {}).items()
+                if str(token or "").strip()
+            },
+            handle,
+            ensure_ascii=False,
+            indent=2,
+        )
+    with open(document_frequency_file, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                str(token): int(freq or 0)
+                for token, freq in (index.document_frequency or {}).items()
+                if str(token or "").strip()
+            },
+            handle,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    token_stats = _sparse_token_stats(index)
+    with open(token_stats_file, "w", encoding="utf-8") as handle:
+        json.dump(token_stats, handle, ensure_ascii=False, indent=2, default=str)
+
+    manifest = {
+        "schema_version": SPARSE_INDEX_ARTIFACT_SCHEMA_VERSION,
+        "paper_id": str(paper_id or ""),
+        "build_id": str(build_id or index.build_id or ""),
+        "index_version": version,
+        "source_type": normalized_source_type,
+        "source_file": str(source_file or ""),
+        "source_hash": source_hash_value,
+        "backend": str(backend or "internal_bm25"),
+        "tokenizer_version": KEYWORD_TOKENIZER_VERSION,
+        "field_weights_version": KEYWORD_FIELD_WEIGHTS_VERSION,
+        "bm25_schema_version": BM25_SCHEMA_VERSION,
+        "document_count": len(index.documents),
+        "token_count": int(token_stats.get("total_document_length", 0) or 0),
+        "avgdl": float(index.avgdl or 0.0),
+        "created_at": created_at,
+        "files": {
+            "documents": documents_file.name,
+            "postings": postings_file.name,
+            "document_frequency": document_frequency_file.name,
+            "token_stats": token_stats_file.name,
+        },
+    }
+    with open(manifest_file, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, ensure_ascii=False, indent=2, default=str)
+
+    return {
+        "artifact_dir": str(artifact_dir),
+        "manifest_file": str(manifest_file),
+        "schema_version": SPARSE_INDEX_ARTIFACT_SCHEMA_VERSION,
+        "document_count": len(index.documents),
+        "token_count": int(token_stats.get("total_document_length", 0) or 0),
+        "backend": manifest["backend"],
+        "source_file": manifest["source_file"],
+        "source_hash": source_hash_value,
+        "avgdl": float(index.avgdl or 0.0),
+        "manifest": manifest,
+    }
+
+
+def _resolve_sparse_manifest_path(file_or_dir: Any) -> Optional[Path]:
+    raw_text = str(file_or_dir or "").strip()
+    if not raw_text:
+        return None
+    raw_path = Path(raw_text)
+    candidates = [raw_path]
+    backend_root = Path(__file__).resolve().parents[2]
+    repo_root = backend_root.parent
+    if not raw_path.is_absolute():
+        candidates.extend([Path(os.getcwd()) / raw_path, backend_root / raw_path, repo_root / raw_path])
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved.is_dir():
+            manifest = resolved / "manifest.json"
+            if manifest.is_file():
+                return manifest
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def load_sparse_index_artifact_files(file_or_dir: Any) -> Dict[str, Any]:
+    """读取 sparse artifact 的全部结构文件；调用方负责按 active build 做一致性判断。"""
+    manifest_path = _resolve_sparse_manifest_path(file_or_dir)
+    if manifest_path is None:
+        raise FileNotFoundError(str(file_or_dir or ""))
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Invalid sparse index manifest: {manifest_path}")
+    if manifest.get("schema_version") != SPARSE_INDEX_ARTIFACT_SCHEMA_VERSION:
+        raise ValueError(f"Unsupported sparse index schema: {manifest.get('schema_version')}")
+
+    artifact_dir = manifest_path.parent
+    files = dict(manifest.get("files") or {})
+    documents_path = artifact_dir / str(files.get("documents") or "documents.jsonl")
+    postings_path = artifact_dir / str(files.get("postings") or "postings.json")
+    document_frequency_path = artifact_dir / str(files.get("document_frequency") or "document_frequency.json")
+    token_stats_path = artifact_dir / str(files.get("token_stats") or "token_stats.json")
+
+    documents: List[KeywordDocument] = []
+    with open(documents_path, "r", encoding="utf-8") as handle:
+        for fallback_doc_id, line in enumerate(handle):
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if isinstance(record, dict):
+                documents.append(_keyword_document_from_sparse_record(record, fallback_doc_id))
+
+    with open(postings_path, "r", encoding="utf-8") as handle:
+        raw_postings = json.load(handle)
+    with open(document_frequency_path, "r", encoding="utf-8") as handle:
+        raw_document_frequency = json.load(handle)
+    with open(token_stats_path, "r", encoding="utf-8") as handle:
+        token_stats = json.load(handle)
+
+    postings = {
+        str(token): {int(doc_id) for doc_id in (doc_ids or [])}
+        for token, doc_ids in (raw_postings or {}).items()
+        if isinstance(doc_ids, list)
+    }
+    document_frequency = {
+        str(token): int(freq or 0)
+        for token, freq in (raw_document_frequency or {}).items()
+    }
+    return {
+        "manifest": manifest,
+        "manifest_file": str(manifest_path),
+        "artifact_dir": str(artifact_dir),
+        "documents": documents,
+        "postings": postings,
+        "document_frequency": document_frequency,
+        "token_stats": dict(token_stats or {}),
+    }
 
 
 class CollectionRetrievalIndexProvider:
@@ -945,6 +1293,23 @@ class CollectionRetrievalIndexProvider:
         if stale_reason:
             fallback_reasons.append(f"rebuilt_after_stale: {stale_reason}")
 
+        sparse_index, sparse_debug = self._load_sparse_index_artifact(
+            index_record,
+            collection_name=collection_name,
+            collection_profile=collection_profile,
+        )
+        if sparse_index is not None:
+            structured_tables, table_structure_debug = self._load_structured_tables(index_record)
+            sparse_index.structured_tables = [dict(item) for item in structured_tables]
+            sparse_index.table_structure_debug = dict(table_structure_debug)
+            sparse_index.build_time = perf_counter() - started
+            sparse_index.fallback_reason = "; ".join(
+                [reason for reason in fallback_reasons if reason]
+            )
+            return sparse_index
+        if sparse_debug.get("enabled") and sparse_debug.get("reason"):
+            fallback_reasons.append(f"sparse_index_artifact_unavailable:{sparse_debug.get('reason')}")
+
         use_index_level_bm25 = bool(ENHANCED_RETRIEVAL_CONFIG.get("enable_index_level_bm25", True))
         if use_index_level_bm25:
             raw_chunks, retrieval_index_artifact_debug = self._load_retrieval_index_chunks(index_record)
@@ -985,6 +1350,10 @@ class CollectionRetrievalIndexProvider:
                     logger.warning("Failed to build legacy collection retrieval index: collection=%s error=%s", collection_name, exc)
 
         retrieval_index_artifact_debug["index_level_bm25_enabled"] = use_index_level_bm25
+        retrieval_index_artifact_debug["keyword_route_index_source"] = "runtime_build_fallback"
+        if sparse_debug.get("enabled"):
+            # artifact 优先加载失败时，旧 runtime build 仍可继续，但必须把拒绝原因留给 trace 排查。
+            retrieval_index_artifact_debug["sparse_index_artifact"] = dict(sparse_debug)
 
         structured_tables, table_structure_debug = self._load_structured_tables(index_record)
         if structured_tables:
@@ -1123,6 +1492,40 @@ class CollectionRetrievalIndexProvider:
         expected_build_id = str((index_record or {}).get("active_build_id") or (index_record or {}).get("build_id") or "").strip()
         if expected_build_id and index.build_id and expected_build_id != index.build_id:
             return f"build_id_changed:{index.build_id}->{expected_build_id}"
+        expected_sparse_hash = str((index_record or {}).get("sparse_index_source_hash") or "").strip()
+        cached_sparse_hash = str((index.retrieval_index_artifact_debug or {}).get("source_hash") or "").strip()
+        if expected_sparse_hash and cached_sparse_hash and expected_sparse_hash != cached_sparse_hash:
+            # sparse artifact 的源 hash 是 active build 一致性边界；hash 变化时必须重读磁盘 artifact。
+            return f"sparse_source_hash_changed:{cached_sparse_hash}->{expected_sparse_hash}"
+        expected_sparse_manifest = str((index_record or {}).get("sparse_index_manifest_file") or "").strip()
+        cached_sparse_manifest = str((index.retrieval_index_artifact_debug or {}).get("sparse_index_manifest_file") or "").strip()
+        if expected_sparse_manifest and cached_sparse_manifest and expected_sparse_manifest != cached_sparse_manifest:
+            return "sparse_manifest_changed"
+        if index.build_source == "sparse_index_artifact":
+            sparse_debug = index.retrieval_index_artifact_debug or {}
+            for field_name, expected_value in (
+                ("tokenizer_version", KEYWORD_TOKENIZER_VERSION),
+                ("field_weights_version", KEYWORD_FIELD_WEIGHTS_VERSION),
+                ("bm25_schema_version", BM25_SCHEMA_VERSION),
+            ):
+                cached_value = str(sparse_debug.get(field_name) or "").strip()
+                if cached_value and cached_value != expected_value:
+                    # sparse artifact 的语义版本变化会改变 postings 解释方式，缓存必须失效后重新校验 manifest。
+                    return f"sparse_{field_name}_changed:{cached_value}->{expected_value}"
+        return ""
+
+    @staticmethod
+    def _validate_sparse_manifest_versions(manifest: Dict[str, Any]) -> str:
+        # 这些版本决定 token、字段权重和 BM25 结构的含义；任一不一致都不能复用持久化 postings。
+        expected_versions = {
+            "tokenizer_version": KEYWORD_TOKENIZER_VERSION,
+            "field_weights_version": KEYWORD_FIELD_WEIGHTS_VERSION,
+            "bm25_schema_version": BM25_SCHEMA_VERSION,
+        }
+        for field_name, expected_value in expected_versions.items():
+            actual_value = str(manifest.get(field_name) or "").strip()
+            if actual_value != expected_value:
+                return f"{field_name}_mismatch:{actual_value or 'missing'}->{expected_value}"
         return ""
 
     def _resolve_collection_name(self, collection_name: str) -> str:
@@ -1156,6 +1559,7 @@ class CollectionRetrievalIndexProvider:
             or metadata.get("index_text")
             or ""
         ).strip()
+        has_explicit_index = bool(index_id)
 
         if not index_id:
             # 旧 collection 没有 index 层时只合成 body index，保证现有问答链路仍可读取旧 chunk。
@@ -1183,6 +1587,7 @@ class CollectionRetrievalIndexProvider:
         normalized["index_type"] = normalized["retrieval_index_type"]
         normalized["index_text"] = normalized["retrieval_index_text"]
         normalized["index_weight"] = normalized["retrieval_index_weight"]
+        normalized["retrieval_index_synthetic"] = not has_explicit_index
         return normalized
 
     @staticmethod
@@ -1196,7 +1601,8 @@ class CollectionRetrievalIndexProvider:
         """构建字段化 keyword document，避免正文、结构字段和图表 OCR 噪声无差别混入索引。"""
         index_type = normalize_index_type(chunk.get("retrieval_index_type"))
         index_text = str(chunk.get("retrieval_index_text") or "").strip()
-        if index_text:
+        # 真正的 retrieval-index 文档只索引 index_text；合成 body 文档仍按 chunk 字段建索引，保留章节和图表字段权重。
+        if index_text and not bool(chunk.get("retrieval_index_synthetic", False)):
             return self._build_keyword_document_fields_from_retrieval_index(chunk, chunk_type, index_type, index_text)
 
         field_texts: Dict[str, List[str]] = {
@@ -1352,6 +1758,142 @@ class CollectionRetrievalIndexProvider:
         if not match_type:
             return True
         return bool(chunk.get("asset_section_match_allow_embedding", False))
+
+    def _load_sparse_index_artifact(
+        self,
+        index_record: Optional[Dict[str, Any]],
+        *,
+        collection_name: str,
+        collection_profile: Optional[CollectionRetrievalProfile],
+    ) -> tuple[Optional[CollectionRetrievalIndex], Dict[str, Any]]:
+        """优先从构建期 sparse artifact 恢复 BM25 结构；校验失败时只返回原因，由旧路径兜底。"""
+        fallback_record = self._fallback_index_record(index_record)
+        debug: Dict[str, Any] = {
+            "enabled": bool(fallback_record),
+            "source": "sparse_index_artifact",
+            "sparse_index_dir": "",
+            "sparse_index_manifest_file": "",
+            "document_count": 0,
+            "reason": "",
+        }
+        manifest_file = str((fallback_record or {}).get("sparse_index_manifest_file") or "").strip()
+        sparse_index_dir = str((fallback_record or {}).get("sparse_index_dir") or "").strip()
+        manifest_source = manifest_file or sparse_index_dir
+        if not manifest_source:
+            debug["reason"] = "missing_sparse_index_manifest"
+            return None, debug
+
+        try:
+            payload = load_sparse_index_artifact_files(manifest_source)
+        except Exception as exc:
+            logger.warning("Failed to load sparse index artifact %s: %s", manifest_source, exc)
+            debug["reason"] = f"sparse_index_read_failed:{exc}"
+            return None, debug
+
+        manifest = dict(payload.get("manifest") or {})
+        normalized_source_type = normalize_sparse_source_type(manifest.get("source_type"))
+        debug["sparse_index_dir"] = str(payload.get("artifact_dir") or sparse_index_dir)
+        debug["sparse_index_manifest_file"] = str(payload.get("manifest_file") or manifest_file)
+        debug["build_id"] = str(manifest.get("build_id") or "")
+        debug["index_version"] = str(manifest.get("index_version") or "")
+        debug["source_type"] = normalized_source_type
+        debug["source_file"] = str(manifest.get("source_file") or "")
+        debug["source_hash"] = str(manifest.get("source_hash") or "")
+        debug["backend"] = str(manifest.get("backend") or "")
+        debug["schema_version"] = str(manifest.get("schema_version") or "")
+        debug["tokenizer_version"] = str(manifest.get("tokenizer_version") or "")
+        debug["field_weights_version"] = str(manifest.get("field_weights_version") or "")
+        debug["bm25_schema_version"] = str(manifest.get("bm25_schema_version") or "")
+        debug["keyword_route_index_source"] = "persistent_sparse_artifact"
+        if normalized_source_type not in SPARSE_SOURCE_TYPES:
+            debug["reason"] = f"source_type_unsupported:{manifest.get('source_type')}"
+            return None, debug
+
+        expected_build_id = str((fallback_record or {}).get("active_build_id") or (fallback_record or {}).get("build_id") or "").strip()
+        if expected_build_id and expected_build_id != str(manifest.get("build_id") or "").strip():
+            debug["reason"] = "build_id_mismatch"
+            return None, debug
+        expected_index_version = str((fallback_record or {}).get("active_index_version") or (fallback_record or {}).get("index_version") or "").strip()
+        if expected_index_version and expected_index_version != str(manifest.get("index_version") or "").strip():
+            debug["reason"] = "index_version_mismatch"
+            return None, debug
+        expected_source_hash = str((fallback_record or {}).get("sparse_index_source_hash") or "").strip()
+        if expected_source_hash and expected_source_hash != str(manifest.get("source_hash") or "").strip():
+            debug["reason"] = "source_hash_mismatch"
+            return None, debug
+        version_mismatch = self._validate_sparse_manifest_versions(manifest)
+        if version_mismatch:
+            debug["reason"] = version_mismatch
+            return None, debug
+
+        documents = list(payload.get("documents") or [])
+        expected_document_count = int(manifest.get("document_count", 0) or 0)
+        debug["document_count"] = len(documents)
+        if expected_document_count != len(documents):
+            # manifest 是后续一致性判断的入口；数量不一致说明 artifact 不完整，必须退回旧构建链路。
+            debug["reason"] = "document_count_mismatch"
+            return None, debug
+
+        by_chunk_id: Dict[str, List[int]] = defaultdict(list)
+        by_parent_chunk_id: Dict[str, List[int]] = defaultdict(list)
+        by_original_chunk_id: Dict[str, List[int]] = defaultdict(list)
+        by_page_section: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+        by_page_number: Dict[str, List[int]] = defaultdict(list)
+        by_section_path: Dict[str, List[int]] = defaultdict(list)
+        by_section_title: Dict[str, List[int]] = defaultdict(list)
+        by_chunk_type: Dict[str, List[int]] = defaultdict(list)
+        by_subchunk_index: Dict[str, List[int]] = defaultdict(list)
+        by_parent_subchunk: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+        for doc_id, document in enumerate(documents):
+            # lookup 表不单独落盘，加载时按 document.chunk 复建，避免源 chunk 字段和二级索引字段出现两套真相。
+            document.doc_id = doc_id
+            self._add_lookup_entries(
+                doc_id=doc_id,
+                chunk=document.chunk,
+                by_chunk_id=by_chunk_id,
+                by_parent_chunk_id=by_parent_chunk_id,
+                by_original_chunk_id=by_original_chunk_id,
+                by_page_section=by_page_section,
+                by_page_number=by_page_number,
+                by_section_path=by_section_path,
+                by_section_title=by_section_title,
+                by_chunk_type=by_chunk_type,
+                by_subchunk_index=by_subchunk_index,
+                by_parent_subchunk=by_parent_subchunk,
+            )
+
+        token_stats = dict(payload.get("token_stats") or {})
+        avgdl = float(token_stats.get("avgdl", manifest.get("avgdl", 0.0)) or 0.0)
+        chunk_count = self._resolve_chunk_count(collection_profile, fallback_record, len(documents))
+        index = CollectionRetrievalIndex(
+            arxiv_id=str((fallback_record or {}).get("arxiv_id", "") or manifest.get("paper_id") or ""),
+            collection_name=collection_name,
+            index_version=str(manifest.get("index_version") or (fallback_record or {}).get("active_index_version") or ""),
+            chunk_count=chunk_count,
+            build_id=str(manifest.get("build_id") or (fallback_record or {}).get("active_build_id") or ""),
+            chunk_file_hash=str(manifest.get("source_hash") or ""),
+            created_at=str(manifest.get("created_at") or datetime.now().isoformat(timespec="seconds")),
+            documents=documents,
+            document_frequency=dict(payload.get("document_frequency") or {}),
+            postings={token: set(doc_ids) for token, doc_ids in (payload.get("postings") or {}).items()},
+            avgdl=avgdl,
+            by_chunk_id={key: list(value) for key, value in by_chunk_id.items()},
+            by_parent_chunk_id={key: list(value) for key, value in by_parent_chunk_id.items()},
+            by_original_chunk_id={key: list(value) for key, value in by_original_chunk_id.items()},
+            by_page_section={key: list(value) for key, value in by_page_section.items()},
+            by_page_number={key: list(value) for key, value in by_page_number.items()},
+            by_section_path={key: list(value) for key, value in by_section_path.items()},
+            by_section_title={key: list(value) for key, value in by_section_title.items()},
+            by_chunk_type={key: list(value) for key, value in by_chunk_type.items()},
+            by_subchunk_index={key: list(value) for key, value in by_subchunk_index.items()},
+            by_parent_subchunk={key: list(value) for key, value in by_parent_subchunk.items()},
+            retrieval_index_artifact_debug=debug,
+            cache_hit=False,
+            build_time=0.0,
+            fallback_reason="",
+            build_source="sparse_index_artifact",
+        )
+        return index, debug
 
     def _load_structured_tables(self, index_record: Optional[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """从 chunk 调试产物中恢复结构化表格索引。"""

@@ -205,6 +205,7 @@
   - 负责 SQLite 业务数据读写
 - `services/storage/vector_store_service.py`
   - 负责 Milvus collection 管理、向量写入、向量检索、QA chunk schema
+  - 当前唯一的 VectorStore 语义入口；业务模块应通过 `dependencies.get_vector_store_service()` 或正式 storage 层使用它，避免恢复 archive 旧实现造成双入口
 
 职责边界总结：
 

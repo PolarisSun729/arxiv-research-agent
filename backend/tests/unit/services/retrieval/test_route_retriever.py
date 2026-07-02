@@ -124,7 +124,16 @@ class RouteRetrieverTests(unittest.TestCase):
 
         self.assertTrue(enabled["routes"]["keyword"])
         self.assertIn("chunk-dataset", [item["chunk_id"] for item in enabled["routes"]["keyword"]])
+        self.assertEqual(enabled["keyword_debug"]["keyword_route_index_source"], "runtime_build_fallback")
+        self.assertEqual(enabled["keyword_debug"]["sparse_index"]["load_source"], "runtime_build_fallback")
+        self.assertIn(enabled["keyword_debug"]["sparse_index"]["source_type"], {"chunk", "retrieval_index"})
+        self.assertGreater(enabled["keyword_debug"]["sparse_index"]["keyword_route_hit_count"], 0)
+        self.assertIn(enabled["keyword_debug"]["sparse_index"]["backend"], {"internal_bm25", "bm25s"})
         self.assertEqual(disabled["routes"]["keyword"], [])
+        self.assertEqual(disabled["keyword_debug"]["keyword_route_index_source"], "keyword_route_disabled")
+        self.assertEqual(disabled["keyword_debug"]["sparse_index"]["load_source"], "keyword_route_disabled")
+        self.assertEqual(disabled["keyword_debug"]["sparse_index"]["keyword_route_hit_count"], 0)
+        self.assertFalse(disabled["keyword_debug"]["keyword_index_fallback_used"])
 
     def test_keyword_route_returns_fixed_chunks_for_figure_table_query(self) -> None:
         bundle = self._build_route_bundle("What does Figure 2 and Table 3 show?", enable_hyde=False)
@@ -239,8 +248,8 @@ class RouteRetrieverTests(unittest.TestCase):
 
         provider = CollectionRetrievalIndexProvider(
             vector_store_service=Store(),
-            chunk_normalizer=self.service._normalize_chunk,
-            tokenizer=self.service._tokenize_for_keyword_search,
+            chunk_normalizer=self.service.retrieval_rules.normalize_chunk,
+            tokenizer=self.service.retrieval_rules.tokenize_for_keyword_search,
         )
         retrieval_index = provider.get_index("paper_collection")
         query_bundle = self.service.query_planner.build_query_bundle(
@@ -250,8 +259,8 @@ class RouteRetrieverTests(unittest.TestCase):
         )
         backend = InternalBM25Backend(
             query_tools=self.service.query_planner,
-            route_confidence_builder=self.service._route_confidence,
-            structural_bonus_builder=self.service._compute_structural_bonus,
+            route_confidence_builder=self.service.retrieval_rules.route_confidence,
+            structural_bonus_builder=self.service.retrieval_rules.compute_structural_bonus,
             fusion_service=self.service.fusion_service,
         )
 
@@ -439,7 +448,7 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertLess(weak_hit["route_confidence"], full_hit["route_confidence"])
 
     def test_keyword_bm25_does_not_dominate_final_context_for_overview(self) -> None:
-        result = self.service.enhanced_retrieve(
+        result = self.service.retrieval_pipeline.retrieve(
             user_query="Give an overview and summary of the paper's main contributions.",
             collection_name=self.collection_name,
             options=self.modules["enhanced"].RetrievalOptions(debug=True, enable_llm_rerank=False),
@@ -507,7 +516,7 @@ class RouteRetrieverTests(unittest.TestCase):
             enable_table_structured_route=True,
         )
 
-        fused = self.service._fuse_routes(
+        fused = self.service.fusion_service.fuse_routes(
             bundle["routes"],
             top_k=6,
             query_profile=self.service.query_planner.build_query_bundle(
@@ -558,7 +567,7 @@ class RouteRetrieverTests(unittest.TestCase):
             ],
         }
 
-        fused = self.service._fuse_routes(routes, top_k=5, query_profile=profile)
+        fused = self.service.fusion_service.fuse_routes(routes, top_k=5, query_profile=profile)
 
         self.assertEqual(len(fused), 1)
         self.assertEqual(set(fused[0]["matched_routes"]), {"vector_original", "keyword"})
@@ -599,6 +608,7 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertTrue(first["routes"]["keyword"])
         self.assertTrue(second["keyword_debug"]["keyword_index_hit"])
         self.assertFalse(second["keyword_debug"]["keyword_full_scan_used"])
+        self.assertEqual(second["keyword_debug"]["keyword_route_index_source"], "runtime_build_fallback")
         self.assertEqual(len(full_chunk_reads), 2)
 
     def test_memory_route_exact_lookup_by_source_id_without_full_scan(self) -> None:

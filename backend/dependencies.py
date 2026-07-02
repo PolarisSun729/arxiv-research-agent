@@ -3,9 +3,25 @@ from __future__ import annotations
 import logging
 from functools import lru_cache
 from time import perf_counter
-from typing import Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from utils.config import CORE_CONFIG, get_recommendation_clustering_runtime_config
+
+if TYPE_CHECKING:
+    # 这些类型只服务静态检查和编辑器提示；运行时仍保持懒加载，避免启动阶段实例化重型服务。
+    from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
+    from services.arxiv.arxiv_search_service import ArxivSearchService
+    from services.arxiv.local_arxiv_service import LocalArxivService
+    from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
+    from services.llm.generation_service import GenerationService
+    from services.memory import MemoryService
+    from services.paper_qa.index_job_manager import IndexJobManager
+    from services.paper_qa.paper_qa_index_builder import PaperQAIndexBuilder
+    from services.paper_qa.paper_qa_service import PaperQAService
+    from services.recommendation.recommendation_service import RecommendationService
+    from services.retrieval.enhanced_retrieval_service import EnhancedRetrievalService
+    from services.storage.database_service import DatabaseService
+    from services.storage.vector_store_service import VectorStoreService
 
 DATA_SOURCE = CORE_CONFIG["arxiv_data_source"]
 ARXIV_PROXY_URL = CORE_CONFIG.get("arxiv_proxy_url", "")

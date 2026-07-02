@@ -190,6 +190,15 @@ class DatabaseService:
                     retrieval_index_count INTEGER DEFAULT 0,
                     retrieval_index_types TEXT,
                     retrieval_index_version TEXT,
+                    sparse_index_dir TEXT,
+                    sparse_index_manifest_file TEXT,
+                    sparse_index_document_count INTEGER DEFAULT 0,
+                    sparse_index_token_count INTEGER DEFAULT 0,
+                    sparse_index_backend TEXT,
+                    sparse_index_schema_version TEXT,
+                    sparse_index_source_file TEXT,
+                    sparse_index_source_hash TEXT,
+                    sparse_index_avgdl REAL DEFAULT 0,
                     embedding_file TEXT,
                     loading_method TEXT,
                     chunking_strategy TEXT,
@@ -219,6 +228,15 @@ class DatabaseService:
                     retrieval_index_count INTEGER DEFAULT 0,
                     retrieval_index_types TEXT,
                     retrieval_index_version TEXT,
+                    sparse_index_dir TEXT,
+                    sparse_index_manifest_file TEXT,
+                    sparse_index_document_count INTEGER DEFAULT 0,
+                    sparse_index_token_count INTEGER DEFAULT 0,
+                    sparse_index_backend TEXT,
+                    sparse_index_schema_version TEXT,
+                    sparse_index_source_file TEXT,
+                    sparse_index_source_hash TEXT,
+                    sparse_index_avgdl REAL DEFAULT 0,
                     embedding_file TEXT,
                     loading_method TEXT,
                     chunking_strategy TEXT,
@@ -707,6 +725,15 @@ class DatabaseService:
             "retrieval_index_count": "INTEGER DEFAULT 0",
             "retrieval_index_types": "TEXT",
             "retrieval_index_version": "TEXT",
+            "sparse_index_dir": "TEXT",
+            "sparse_index_manifest_file": "TEXT",
+            "sparse_index_document_count": "INTEGER DEFAULT 0",
+            "sparse_index_token_count": "INTEGER DEFAULT 0",
+            "sparse_index_backend": "TEXT",
+            "sparse_index_schema_version": "TEXT",
+            "sparse_index_source_file": "TEXT",
+            "sparse_index_source_hash": "TEXT",
+            "sparse_index_avgdl": "REAL DEFAULT 0",
             "embedding_file": "TEXT",
             "loading_method": "TEXT",
             "chunking_strategy": "TEXT",
@@ -736,6 +763,15 @@ class DatabaseService:
             "retrieval_index_count": "INTEGER DEFAULT 0",
             "retrieval_index_types": "TEXT",
             "retrieval_index_version": "TEXT",
+            "sparse_index_dir": "TEXT",
+            "sparse_index_manifest_file": "TEXT",
+            "sparse_index_document_count": "INTEGER DEFAULT 0",
+            "sparse_index_token_count": "INTEGER DEFAULT 0",
+            "sparse_index_backend": "TEXT",
+            "sparse_index_schema_version": "TEXT",
+            "sparse_index_source_file": "TEXT",
+            "sparse_index_source_hash": "TEXT",
+            "sparse_index_avgdl": "REAL DEFAULT 0",
         }
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(paper_qa_index_versions)")
@@ -756,6 +792,8 @@ class DatabaseService:
                 build_id, arxiv_id, index_version, status, is_active, collection_name,
                 chunk_count, embedding_model, pdf_path, chunk_file,
                 retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version,
+                sparse_index_dir, sparse_index_manifest_file, sparse_index_document_count, sparse_index_token_count, sparse_index_backend,
+                sparse_index_schema_version, sparse_index_source_file, sparse_index_source_hash, sparse_index_avgdl,
                 embedding_file,
                 loading_method, chunking_strategy, current_stage, failed_stage,
                 error_message, artifact_status, indexed_at, activated_at, created_at, updated_at
@@ -775,6 +813,15 @@ class DatabaseService:
                 COALESCE(retrieval_index_count, 0),
                 retrieval_index_types,
                 retrieval_index_version,
+                sparse_index_dir,
+                sparse_index_manifest_file,
+                COALESCE(sparse_index_document_count, 0),
+                COALESCE(sparse_index_token_count, 0),
+                sparse_index_backend,
+                sparse_index_schema_version,
+                sparse_index_source_file,
+                sparse_index_source_hash,
+                COALESCE(sparse_index_avgdl, 0),
                 embedding_file,
                 loading_method,
                 chunking_strategy,
@@ -3320,7 +3367,9 @@ class DatabaseService:
                            chunk_file, embedding_file, loading_method, chunking_strategy, current_stage,
                            failed_stage, error_message, artifact_status, indexed_at, created_at, updated_at,
                            active_index_version, active_build_id, previous_build_id,
-                           retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version
+                           retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version,
+                           sparse_index_dir, sparse_index_manifest_file, sparse_index_document_count, sparse_index_token_count, sparse_index_backend,
+                           sparse_index_schema_version, sparse_index_source_file, sparse_index_source_hash, sparse_index_avgdl
                     FROM paper_qa_index WHERE arxiv_id = ?
                 ''', (arxiv_id,))
 
@@ -3351,6 +3400,15 @@ class DatabaseService:
                         'retrieval_index_count': row[21] or 0,
                         'retrieval_index_types': row[22],
                         'retrieval_index_version': row[23],
+                        'sparse_index_dir': row[24],
+                        'sparse_index_manifest_file': row[25],
+                        'sparse_index_document_count': row[26] or 0,
+                        'sparse_index_token_count': row[27] or 0,
+                        'sparse_index_backend': row[28],
+                        'sparse_index_schema_version': row[29],
+                        'sparse_index_source_file': row[30],
+                        'sparse_index_source_hash': row[31],
+                        'sparse_index_avgdl': row[32] or 0,
                     }
                 return None
         except Exception as e:
@@ -3385,6 +3443,15 @@ class DatabaseService:
             "retrieval_index_count": (row[22] if len(row) > 22 else 0) or 0,
             "retrieval_index_types": row[23] if len(row) > 23 else "",
             "retrieval_index_version": row[24] if len(row) > 24 else "",
+            "sparse_index_dir": row[25] if len(row) > 25 else "",
+            "sparse_index_manifest_file": row[26] if len(row) > 26 else "",
+            "sparse_index_document_count": (row[27] if len(row) > 27 else 0) or 0,
+            "sparse_index_token_count": (row[28] if len(row) > 28 else 0) or 0,
+            "sparse_index_backend": row[29] if len(row) > 29 else "",
+            "sparse_index_schema_version": row[30] if len(row) > 30 else "",
+            "sparse_index_source_file": row[31] if len(row) > 31 else "",
+            "sparse_index_source_hash": row[32] if len(row) > 32 else "",
+            "sparse_index_avgdl": (row[33] if len(row) > 33 else 0) or 0,
         }
 
     @staticmethod
@@ -3394,7 +3461,9 @@ class DatabaseService:
                    chunk_count, embedding_model, pdf_path, chunk_file, embedding_file,
                    loading_method, chunking_strategy, current_stage, failed_stage,
                    error_message, artifact_status, indexed_at, activated_at, created_at, updated_at,
-                   retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version
+                   retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version,
+                   sparse_index_dir, sparse_index_manifest_file, sparse_index_document_count, sparse_index_token_count, sparse_index_backend,
+                   sparse_index_schema_version, sparse_index_source_file, sparse_index_source_hash, sparse_index_avgdl
             FROM paper_qa_index_versions
         """
 
@@ -3548,6 +3617,15 @@ class DatabaseService:
                 "retrieval_index_count",
                 "retrieval_index_types",
                 "retrieval_index_version",
+                "sparse_index_dir",
+                "sparse_index_manifest_file",
+                "sparse_index_document_count",
+                "sparse_index_token_count",
+                "sparse_index_backend",
+                "sparse_index_schema_version",
+                "sparse_index_source_file",
+                "sparse_index_source_hash",
+                "sparse_index_avgdl",
                 "embedding_file",
                 "loading_method",
                 "chunking_strategy",
@@ -3603,6 +3681,19 @@ class DatabaseService:
                         # 鍙湁宸茬粡瀹屾垚鍚戦噺鍐欏叆骞舵牎楠岃繃鐨勬柊鐗堟湰鎵嶈兘鍒?active锛岄伩鍏嶅崐鎴愬搧琚棶绛旈摼璺鍒般€?
                         conn.rollback()
                         return False
+                    required_sparse_fields = (
+                        "sparse_index_manifest_file",
+                        "sparse_index_source_hash",
+                        "sparse_index_backend",
+                        "sparse_index_schema_version",
+                    )
+                    if (
+                        any(not str(build.get(field_name) or "").strip() for field_name in required_sparse_fields)
+                        or int(build.get("sparse_index_document_count") or 0) <= 0
+                    ):
+                        # active 指针必须同时拥有 dense collection 和 sparse manifest；否则重启后 keyword route 会读到不完整版本。
+                        conn.rollback()
+                        return False
 
                     arxiv_id = build["arxiv_id"]
                     cursor.execute(
@@ -3648,11 +3739,13 @@ class DatabaseService:
                             arxiv_id, collection_name, status, chunk_count, embedding_model,
                             pdf_path, chunk_file,
                             retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version,
+                            sparse_index_dir, sparse_index_manifest_file, sparse_index_document_count, sparse_index_token_count, sparse_index_backend,
+                            sparse_index_schema_version, sparse_index_source_file, sparse_index_source_hash, sparse_index_avgdl,
                             embedding_file, loading_method, chunking_strategy,
                             current_stage, failed_stage, error_message, artifact_status, indexed_at,
                             active_index_version, active_build_id, previous_build_id
                         )
-                        VALUES (?, ?, 'indexed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'activate_index', '', '', 'active', ?, ?, ?, ?)
+                        VALUES (?, ?, 'indexed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'activate_index', '', '', 'active', ?, ?, ?, ?)
                         ON CONFLICT(arxiv_id) DO UPDATE SET
                             collection_name = excluded.collection_name,
                             status = excluded.status,
@@ -3664,6 +3757,15 @@ class DatabaseService:
                             retrieval_index_count = excluded.retrieval_index_count,
                             retrieval_index_types = excluded.retrieval_index_types,
                             retrieval_index_version = excluded.retrieval_index_version,
+                            sparse_index_dir = excluded.sparse_index_dir,
+                            sparse_index_manifest_file = excluded.sparse_index_manifest_file,
+                            sparse_index_document_count = excluded.sparse_index_document_count,
+                            sparse_index_token_count = excluded.sparse_index_token_count,
+                            sparse_index_backend = excluded.sparse_index_backend,
+                            sparse_index_schema_version = excluded.sparse_index_schema_version,
+                            sparse_index_source_file = excluded.sparse_index_source_file,
+                            sparse_index_source_hash = excluded.sparse_index_source_hash,
+                            sparse_index_avgdl = excluded.sparse_index_avgdl,
                             embedding_file = excluded.embedding_file,
                             loading_method = excluded.loading_method,
                             chunking_strategy = excluded.chunking_strategy,
@@ -3688,6 +3790,15 @@ class DatabaseService:
                             build.get("retrieval_index_count") or 0,
                             build.get("retrieval_index_types"),
                             build.get("retrieval_index_version"),
+                            build.get("sparse_index_dir"),
+                            build.get("sparse_index_manifest_file"),
+                            build.get("sparse_index_document_count") or 0,
+                            build.get("sparse_index_token_count") or 0,
+                            build.get("sparse_index_backend"),
+                            build.get("sparse_index_schema_version"),
+                            build.get("sparse_index_source_file"),
+                            build.get("sparse_index_source_hash"),
+                            build.get("sparse_index_avgdl") or 0,
                             build.get("embedding_file"),
                             build.get("loading_method"),
                             build.get("chunking_strategy"),
@@ -4077,6 +4188,15 @@ class DatabaseService:
                     'retrieval_index_count',
                     'retrieval_index_types',
                     'retrieval_index_version',
+                    'sparse_index_dir',
+                    'sparse_index_manifest_file',
+                    'sparse_index_document_count',
+                    'sparse_index_token_count',
+                    'sparse_index_backend',
+                    'sparse_index_schema_version',
+                    'sparse_index_source_file',
+                    'sparse_index_source_hash',
+                    'sparse_index_avgdl',
                     'embedding_file',
                     'loading_method',
                     'chunking_strategy',
@@ -4113,7 +4233,9 @@ class DatabaseService:
                                chunk_file, embedding_file, loading_method, chunking_strategy, current_stage,
                                failed_stage, error_message, artifact_status, indexed_at,
                                active_index_version, active_build_id,
-                               retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version
+                               retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version,
+                               sparse_index_dir, sparse_index_manifest_file, sparse_index_document_count, sparse_index_token_count, sparse_index_backend,
+                               sparse_index_schema_version, sparse_index_source_file, sparse_index_source_hash, sparse_index_avgdl
                         FROM paper_qa_index
                         WHERE arxiv_id = ?
                         """,
@@ -4130,11 +4252,13 @@ class DatabaseService:
                                 build_id, arxiv_id, index_version, status, is_active, collection_name,
                                 chunk_count, embedding_model, pdf_path, chunk_file,
                                 retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version,
+                                sparse_index_dir, sparse_index_manifest_file, sparse_index_document_count, sparse_index_token_count, sparse_index_backend,
+                                sparse_index_schema_version, sparse_index_source_file, sparse_index_source_hash, sparse_index_avgdl,
                                 embedding_file,
                                 loading_method, chunking_strategy, current_stage, failed_stage,
                                 error_message, artifact_status, indexed_at, activated_at
                             )
-                            VALUES (?, ?, ?, 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, CURRENT_TIMESTAMP)
+                            VALUES (?, ?, ?, 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, CURRENT_TIMESTAMP)
                             """,
                             (
                                 legacy_build_id,
@@ -4149,6 +4273,15 @@ class DatabaseService:
                                 active_row[18] or 0,
                                 active_row[19],
                                 active_row[20],
+                                active_row[21],
+                                active_row[22],
+                                active_row[23] or 0,
+                                active_row[24],
+                                active_row[25],
+                                active_row[26],
+                                active_row[27],
+                                active_row[28],
+                                active_row[29] or 0,
                                 active_row[7],
                                 active_row[8],
                                 active_row[9],
@@ -4193,6 +4326,15 @@ class DatabaseService:
                     'retrieval_index_count',
                     'retrieval_index_types',
                     'retrieval_index_version',
+                    'sparse_index_dir',
+                    'sparse_index_manifest_file',
+                    'sparse_index_document_count',
+                    'sparse_index_token_count',
+                    'sparse_index_backend',
+                    'sparse_index_schema_version',
+                    'sparse_index_source_file',
+                    'sparse_index_source_hash',
+                    'sparse_index_avgdl',
                     'embedding_file',
                     'loading_method',
                     'chunking_strategy',
@@ -4234,11 +4376,13 @@ class DatabaseService:
                             build_id, arxiv_id, index_version, status, is_active, collection_name,
                             chunk_count, embedding_model, pdf_path, chunk_file,
                             retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version,
+                            sparse_index_dir, sparse_index_manifest_file, sparse_index_document_count, sparse_index_token_count, sparse_index_backend,
+                            sparse_index_schema_version, sparse_index_source_file, sparse_index_source_hash, sparse_index_avgdl,
                             embedding_file,
                             loading_method, chunking_strategy, current_stage, failed_stage,
                             error_message, artifact_status, indexed_at, activated_at
                         )
-                        VALUES (?, ?, ?, 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, CURRENT_TIMESTAMP)
+                        VALUES (?, ?, ?, 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, CURRENT_TIMESTAMP)
                         """,
                         (
                             legacy_build_id,
@@ -4253,6 +4397,15 @@ class DatabaseService:
                             kwargs.get("retrieval_index_count") or 0,
                             kwargs.get("retrieval_index_types"),
                             kwargs.get("retrieval_index_version"),
+                            kwargs.get("sparse_index_dir"),
+                            kwargs.get("sparse_index_manifest_file"),
+                            kwargs.get("sparse_index_document_count") or 0,
+                            kwargs.get("sparse_index_token_count") or 0,
+                            kwargs.get("sparse_index_backend"),
+                            kwargs.get("sparse_index_schema_version"),
+                            kwargs.get("sparse_index_source_file"),
+                            kwargs.get("sparse_index_source_hash"),
+                            kwargs.get("sparse_index_avgdl") or 0,
                             kwargs.get("embedding_file"),
                             kwargs.get("loading_method"),
                             kwargs.get("chunking_strategy"),

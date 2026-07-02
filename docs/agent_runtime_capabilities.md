@@ -100,11 +100,12 @@ planner 层常见 code 包括 `llm_planner_validation_failed`、`tool_aware_plan
 
 ## 6. Compat / Legacy 边界
 
-旧前端或旧测试仍可能依赖历史字段，例如 `pending_action`。这类兼容逻辑已经收敛到 `compat/legacy` 层：
+旧前端或旧测试仍可能依赖历史字段，例如 `pending_action`。旧 compat 构造器已经删除，仓库不再保留独立的展示镜像入口；仍需要保留的 `pending_action` 响应字段由主图和 service 出站投影生成：
 
-- 兼容层只做镜像与桥接
+- 主图 `_build_pending_action_mirror()` 只做非流式响应展示镜像
+- service `_build_pending_action_from_confirmation()` 只做流式 interrupt 展示镜像
 - 正式状态流以结构化 `pending_confirmation` / `resume` 为准
-- 新功能不要继续向 legacy 入口扩展
+- 新功能不要继续向 legacy compat 包扩展，也不要把展示镜像重新接成执行真源
 
 ### 6.1 论文目标解析边界
 

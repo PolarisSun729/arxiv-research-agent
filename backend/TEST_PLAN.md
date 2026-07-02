@@ -184,7 +184,7 @@
    - endpoint：`get_paper_qa_status`、`diagnose_paper_qa`、`download_latest_qa_trace`、`create_paper_qa_index`、`get_latest_paper_qa_index_job`、`get_paper_qa_index_job`、`list_paper_chat_sessions`、`get_recent_paper_chat_session`、`create_paper_chat_session`、`get_paper_chat_session`、`get_paper_chat_messages`、`clear_paper_chat_session`、`delete_paper_chat_session`、`list_paper_notes`、`create_paper_note`、`update_paper_note`、`delete_paper_note`、`export_paper_notes_markdown`、`qa_paper`、`qa_paper_stream`
  - `user_router.py`
    - 请求模型：`PaperActionRequest`、`ResearchProfileRequest`
-   - endpoint：`legacy_post_user_preferences`、`get_user_preferences`、`like_paper`、`dislike_paper`、`record_paper_action`、`remove_paper_action`、`get_user_paper_actions`、`get_user_research_profile`、`upsert_user_research_profile`、`patch_user_research_profile`、`remove_like`、`remove_dislike`、`generate_user_interest_vector`、`get_user_interest_vector`、`recommend_papers`
+   - endpoint：`get_user_preferences`、`like_paper`、`dislike_paper`、`record_paper_action`、`remove_paper_action`、`get_user_paper_actions`、`get_user_research_profile`、`upsert_user_research_profile`、`patch_user_research_profile`、`remove_like`、`remove_dislike`、`generate_user_interest_vector`、`get_user_interest_vector`、`recommend_papers`
  - `chunk_router.py`
    - `list_chunk_files`
    - `get_chunk_file`
@@ -245,10 +245,13 @@
    - `RouteRetriever`
  - `rerank_service.py`
    - `RerankService`
+ - `retrieval_pipeline.py`
+   - `RetrievalPipeline`
+ - `result_fusion_service.py`
+   - `ResultFusionService`
  - `enhanced_retrieval_service.py`
    - `RetrievalOptions`
-   - `QueryProfile`
-   - `EnhancedRetrievalService`
+   - `EnhancedRetrievalService`（只验证 facade 委托、依赖装配和 trace 目录等兼容面）
 
  ### 2.7 Paper QA
 
@@ -703,13 +706,9 @@
 
  ### 5.5 user endpoints
 
- #### `POST /api/user/preferences`
- - Deprecated 兼容读取入口，返回 `deprecated=true` 和 successor
- - 响应头包含 `Deprecation: true`
- - DB 异常
-
  #### `GET /api/user/preferences/{user_id}`
  - 返回用户偏好
+ - 保持 `liked_papers`、`disliked_papers`、`paper_actions`、`research_profile` 结构稳定
  - DB 异常
 
 #### `POST /api/user/like-paper`
@@ -856,7 +855,8 @@
 
  ## 7. RAG 检索链路的专项测试清单
 
- RAG 专项测试聚焦 `PaperQAService + EnhancedRetrievalService + GenerationService + VectorStoreService`。
+RAG 专项测试聚焦 `PaperQAService + RetrievalPipeline + QueryPlanner + RouteRetriever + ResultFusionService + RerankService + GenerationService + VectorStoreService`。
+`EnhancedRetrievalService` 只保留 public facade smoke test，避免测试重新依赖私有转发 wrapper。
 
  ### 7.1 查询理解与改写
 
@@ -868,11 +868,11 @@
 
  ### 7.2 召回路径
 
- - semantic recall
- - keyword recall
- - 多 route fusion
- - top_k 边界
- - 空召回
+- semantic recall
+- keyword recall
+- 多 route fusion（直接覆盖 `ResultFusionService` 或 `RetrievalPipeline` 行为）
+- top_k 边界
+- 空召回
 
  ### 7.3 rerank 与上下文裁剪
 
@@ -1002,7 +1002,8 @@
  - `EmbeddingService`
  - `RecommendationService`
  - `PaperQAService`
- - `EnhancedRetrievalService`
+- `EnhancedRetrievalService`（只作为 facade / 依赖装配对象）
+- `RetrievalPipeline`
  - `ArxivSearchService`
  - `IndexJobManager`
 
@@ -1108,7 +1109,8 @@
  - `VectorStoreService` 的 collection name / search / insert 适配层
  - `PaperQAService` 基本问答链路
  - `PaperQAIndexBuilder` 阶段推进
- - `EnhancedRetrievalService` 基础 recall+rereank 选择逻辑
+- `RetrievalPipeline` 基础 recall + rerank 选择逻辑
+- `EnhancedRetrievalService` public 入口委托 smoke
  - `Agent` 的搜索主分支、工具主分支、流式输出主分支
 
  ### P1：第二阶段补齐
@@ -1271,7 +1273,7 @@
  ### 15.2 可以使用临时 SQLite，但仍需 mock 其它外部依赖的测试
 
  - `PaperQAIndexBuilder`：DB 真实、Milvus/Embedding/LLM/PDF 下载 mock
- - `EnhancedRetrievalService`：DB 真实、向量检索与生成 mock
+- `RetrievalPipeline` / 检索组件：DB 真实、向量检索与生成 mock
  - `qa_router.qa` / `qa_router.qa/stream`：DB 真实、QA service 或 generation mock
  - `recommend-papers`：DB 真实、candidate recall / vector / embedding mock
 
@@ -1293,7 +1295,7 @@
  1. 先补 `unit/` 中的 query builder、qa_utils、tool_registry、agent utils
  2. 再补 `api/` 中的 paper / qa / user 三大主业务 router
  3. 再补 `DatabaseService` 与 `PaperQAService` 的临时 SQLite 组件测试
- 4. 再补 `EnhancedRetrievalService` 与 `PaperQAIndexBuilder` 的 fake 集成测试
+4. 再补 `RetrievalPipeline`、检索组件与 `PaperQAIndexBuilder` 的 fake 集成测试，并保留 `EnhancedRetrievalService` facade smoke
  5. 最后建立 smoke golden set 与主 golden set
 
  这样可以最快把最容易出事故的链路纳入回归。
