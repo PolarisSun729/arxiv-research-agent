@@ -130,16 +130,21 @@ def validate_arxiv_search_request(
     normalized_search_query = normalize_text_value(search_query)
     normalized_id_list = normalize_id_list(id_list)
 
+    # 当 require_query 为 True 时，search_query 和 id_list 至少需要提供一个
     if require_query and not normalized_search_query and not normalized_id_list:
         raise ArxivSearchValidationError("arxiv_invalid_query: search_query and id_list cannot both be empty")
+    # max_results 必须在 [1, MAX_ALLOWED_RESULTS] 范围内
     if not (1 <= int(max_results) <= MAX_ALLOWED_RESULTS):
         raise ArxivSearchValidationError(f"arxiv_invalid_query: max_results must be between 1 and {MAX_ALLOWED_RESULTS}")
+    # start 不能为负数
     if int(start) < 0:
         raise ArxivSearchValidationError("arxiv_invalid_query: start must be greater than or equal to 0")
+    # sort_by 必须是有效的排序字段之一
     if sort_by not in VALID_SORT_BY:
         raise ArxivSearchValidationError(
             f"arxiv_invalid_query: sort_by must be one of {sorted(VALID_SORT_BY)}"
         )
+    # sort_order 必须是有效的排序方向之一
     if sort_order not in VALID_SORT_ORDER:
         raise ArxivSearchValidationError(
             f"arxiv_invalid_query: sort_order must be one of {sorted(VALID_SORT_ORDER)}"
