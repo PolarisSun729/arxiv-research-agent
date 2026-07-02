@@ -115,24 +115,28 @@ def _run_search(
         sort_order=sort_order,
     )
     papers = result.get("papers", []) if isinstance(result, dict) else []
+    query_capability = result.get("query_capability") if isinstance(result, dict) else None
+    trace = _build_search_trace(
+        tool_name=tool_name,
+        raw_inputs=raw_inputs,
+        normalized_inputs=normalized_inputs,
+        final_search_query=search_query,
+        id_list=id_list,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        start=start,
+        max_results=max_results,
+        returned_count=len(papers),
+        submitted_days_ago_applied=submitted_days_ago_applied,
+    )
+    if isinstance(query_capability, dict):
+        trace["query_capability"] = query_capability
     return make_tool_result(
         ok=True,
         tool_name=tool_name,
         summary=f"找到 {len(papers)} 篇 arXiv 论文",
         data=result if isinstance(result, dict) else {"result": result},
-        trace=_build_search_trace(
-            tool_name=tool_name,
-            raw_inputs=raw_inputs,
-            normalized_inputs=normalized_inputs,
-            final_search_query=search_query,
-            id_list=id_list,
-            sort_by=sort_by,
-            sort_order=sort_order,
-            start=start,
-            max_results=max_results,
-            returned_count=len(papers),
-            submitted_days_ago_applied=submitted_days_ago_applied,
-        ),
+        trace=trace,
     )
 
 
@@ -215,25 +219,30 @@ def search_arxiv_raw(
             error=make_tool_error("arxiv_invalid_query", str(exc)),
         )
     except Exception as exc:
+        error_code = str(getattr(exc, "code", "") or "arxiv_search_failed")
+        query_capability = getattr(exc, "query_capability", None)
+        trace = _build_search_trace(
+            tool_name=tool_name,
+            raw_inputs=raw_inputs,
+            normalized_inputs={"search_query": search_query, "id_list": id_list},
+            final_search_query=None,
+            id_list=id_list,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            start=start,
+            max_results=max_results,
+            returned_count=0,
+            submitted_days_ago_applied=False,
+        )
+        if isinstance(query_capability, dict):
+            trace["query_capability"] = query_capability
         return make_tool_result(
             ok=False,
             tool_name=tool_name,
-            summary="arXiv 论文搜索失败",
+            summary="本地 arXiv 检索能力不支持该查询" if error_code != "arxiv_search_failed" else "arXiv 论文搜索失败",
             data=None,
-            trace=_build_search_trace(
-                tool_name=tool_name,
-                raw_inputs=raw_inputs,
-                normalized_inputs={"search_query": search_query, "id_list": id_list},
-                final_search_query=None,
-                id_list=id_list,
-                sort_by=sort_by,
-                sort_order=sort_order,
-                start=start,
-                max_results=max_results,
-                returned_count=0,
-                submitted_days_ago_applied=False,
-            ),
-            error=make_tool_error("arxiv_search_failed", str(exc)),
+            trace=trace,
+            error=make_tool_error(error_code, str(exc), getattr(exc, "to_error_detail", lambda: None)()),
         )
 
 
@@ -338,24 +347,29 @@ def search_arxiv_structured(
             error=make_tool_error("arxiv_invalid_query", str(exc)),
         )
     except Exception as exc:
+        error_code = str(getattr(exc, "code", "") or "arxiv_search_failed")
+        query_capability = getattr(exc, "query_capability", None)
+        trace = _build_search_trace(
+            tool_name=tool_name,
+            raw_inputs=raw_inputs,
+            normalized_inputs={"query": query, "id_list": id_list},
+            final_search_query=None,
+            id_list=id_list,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            start=start,
+            max_results=max_results,
+            submitted_days_ago_applied=False,
+        )
+        if isinstance(query_capability, dict):
+            trace["query_capability"] = query_capability
         return make_tool_result(
             ok=False,
             tool_name=tool_name,
-            summary="arXiv 论文搜索失败",
+            summary="本地 arXiv 检索能力不支持该查询" if error_code != "arxiv_search_failed" else "arXiv 论文搜索失败",
             data=None,
-            trace=_build_search_trace(
-                tool_name=tool_name,
-                raw_inputs=raw_inputs,
-                normalized_inputs={"query": query, "id_list": id_list},
-                final_search_query=None,
-                id_list=id_list,
-                sort_by=sort_by,
-                sort_order=sort_order,
-                start=start,
-                max_results=max_results,
-                submitted_days_ago_applied=False,
-            ),
-            error=make_tool_error("arxiv_search_failed", str(exc)),
+            trace=trace,
+            error=make_tool_error(error_code, str(exc), getattr(exc, "to_error_detail", lambda: None)()),
         )
 
 

@@ -31,6 +31,88 @@ OAI_EMBEDDING_BATCH_SIZE = ARXIV_OAI_CONFIG["embedding_batch_size"]
 OAI_VECTOR_QUERY_BATCH_SIZE = ARXIV_OAI_CONFIG["vector_query_batch_size"]
 OAI_DASHSCOPE_TEXT_TOKEN_PRICE_PER_1K = ARXIV_OAI_CONFIG["dashscope_text_token_price_per_1k"]
 
+LOCAL_OAI_SUPPORTED_QUERY_SUBSET = [
+    "id",
+    "cat",
+    "submittedDate",
+    "ti",
+    "abs",
+    "au",
+    "all",
+    "AND",
+    "OR",
+    "ANDNOT",
+    "phrase",
+]
+
+
+class LocalArxivSearchError(ValueError):
+    """本地 OAI 检索的稳定错误基类，用于向工具层和前端暴露可解释失败。"""
+
+    code = "local_arxiv_search_error"
+    status_code = 400
+
+    def __init__(self, message: str, *, query: str = "", reason: str = ""):
+        super().__init__(message)
+        self.query = query
+        self.reason = reason or message
+        self.query_capability = build_local_oai_query_capability(
+            mode="unsupported",
+            unsupported_reason=self.reason,
+            suggested_action="切换远程 arXiv API 后重试，或改写为本地 OAI 镜像支持的高精度查询子集。",
+        )
+
+    def to_error_detail(self) -> Dict[str, Any]:
+        return {
+            "code": self.code,
+            "message": str(self),
+            "details": {
+                "query": self.query,
+                "source": "local_oai",
+                "reason": self.reason,
+                "query_capability": self.query_capability,
+                "suggested_action": self.query_capability.get("suggested_action"),
+            },
+        }
+
+
+class UnsupportedLocalArxivQuery(LocalArxivSearchError):
+    """查询语法超出本地 OAI 可数据库下推子集时抛出，避免静默误召回。"""
+
+    code = "unsupported_local_arxiv_query"
+
+
+class LocalArxivSearchIndexUnavailable(LocalArxivSearchError):
+    """FTS5 不可用或索引未就绪时抛出，禁止退回低精度 LIKE 兜底。"""
+
+    code = "local_search_index_unavailable"
+
+
+def build_local_oai_query_capability(
+    *,
+    mode: str = "local_oai_sqlite_fts",
+    unsupported_reason: Optional[str] = None,
+    suggested_action: Optional[str] = None,
+    fts5_available: Optional[bool] = None,
+    search_index_status: Optional[str] = None,
+) -> Dict[str, Any]:
+    """构造后端和前端共享的本地检索能力契约，避免 UI 解析日志字符串。"""
+
+    capability = {
+        "source": "local_oai",
+        "mode": mode,
+        "supported_subset": list(LOCAL_OAI_SUPPORTED_QUERY_SUBSET),
+        "precision_policy": "strict_token_or_phrase",
+        "full_arxiv_syntax_supported": False,
+        "unsupported_reason": unsupported_reason,
+        "suggested_action": suggested_action,
+    }
+    if fts5_available is not None:
+        capability["fts5_available"] = bool(fts5_available)
+    if search_index_status:
+        capability["search_index_status"] = search_index_status
+    return capability
+
 
 @dataclass
 class ArxivOaiSyncStats:
@@ -91,6 +173,171 @@ class ArxivOaiDatabaseService:
     def _get_connection(self) -> sqlite3.Connection:
         """创建一个 SQLite 连接。"""
         return sqlite3.connect(self.db_path, check_same_thread=self.check_same_thread)
+
+    def _is_fts5_available(self, cursor: sqlite3.Cursor) -> bool:
+        """检测当前 SQLite 是否支持 FTS5；本地文本检索依赖它来保证精确且可下推。"""
+        try:
+            cursor.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.__oai_fts5_probe USING fts5(value)")
+            cursor.execute("DROP TABLE IF EXISTS temp.__oai_fts5_probe")
+            return True
+        except sqlite3.Error as exc:
+            logger.warning("SQLite FTS5 is unavailable for local OAI search: %s", exc)
+            return False
+
+    def _normalize_categories_for_index(self, paper: Dict[str, Any]) -> List[str]:
+        """提取规范化分类列表，用独立表做精确过滤，避免 JSON 文本 LIKE 误命中。"""
+        raw_categories = paper.get("categories_list")
+        if not raw_categories:
+            raw_categories = self._parse_list_field(paper.get("categories", ""))
+
+        if isinstance(raw_categories, (list, tuple)):
+            categories = [str(item).strip() for item in raw_categories if str(item).strip()]
+        else:
+            categories = [
+                item.strip()
+                for item in re.split(r"[\s,]+", str(raw_categories or "").strip())
+                if item.strip()
+            ]
+
+        primary_category = str(paper.get("primary_category") or "").strip()
+        if primary_category and primary_category not in categories:
+            categories.append(primary_category)
+        return categories
+
+    def _normalize_authors_for_index(self, paper: Dict[str, Any]) -> str:
+        """把作者字段整理成 FTS 可索引文本，兼容历史 JSON 字符串和列表两种形态。"""
+        authors = self._parse_list_field(paper.get("authors", ""))
+        if isinstance(authors, (list, tuple)):
+            return " ".join(str(item).strip() for item in authors if str(item).strip())
+        return str(authors or "").strip()
+
+    def _sync_search_index_for_papers(
+        self,
+        cursor: sqlite3.Cursor,
+        papers: Sequence[Dict[str, Any]],
+        *,
+        fts5_available: Optional[bool] = None,
+    ) -> None:
+        """同步分类映射表和 FTS 表，保证新增/更新论文不再依赖内存过滤。"""
+        if not papers:
+            return
+        if fts5_available is None:
+            fts5_available = self._is_fts5_available(cursor)
+
+        for paper in papers:
+            arxiv_id = str(paper.get("arxiv_id") or "").strip()
+            if not arxiv_id:
+                continue
+
+            categories = self._normalize_categories_for_index(paper)
+            primary_category = str(paper.get("primary_category") or "").strip()
+            cursor.execute("DELETE FROM arxiv_oai_paper_categories WHERE arxiv_id = ?", (arxiv_id,))
+            cursor.executemany(
+                """
+                INSERT OR REPLACE INTO arxiv_oai_paper_categories (arxiv_id, category, is_primary)
+                VALUES (?, ?, ?)
+                """,
+                [(arxiv_id, category, 1 if category == primary_category else 0) for category in categories],
+            )
+
+            if not fts5_available:
+                continue
+
+            authors_text = self._normalize_authors_for_index(paper)
+            categories_text = " ".join(categories)
+            title = str(paper.get("title", "") or "").strip()
+            abstract = str(paper.get("abstract", "") or "").strip()
+            all_text = " ".join(
+                item
+                for item in [title, abstract, authors_text, categories_text, primary_category]
+                if item
+            )
+            cursor.execute("DELETE FROM arxiv_oai_papers_fts WHERE arxiv_id = ?", (arxiv_id,))
+            cursor.execute(
+                """
+                INSERT INTO arxiv_oai_papers_fts (arxiv_id, title, abstract, authors, categories, all_text)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (arxiv_id, title, abstract, authors_text, categories_text, all_text),
+            )
+
+    def _backfill_search_indexes(self, cursor: sqlite3.Cursor, *, fts5_available: bool) -> None:
+        """启动时从旧主表回填新索引；该逻辑幂等，避免用户必须重新同步 OAI。"""
+        cursor.execute("SELECT COUNT(*) FROM arxiv_oai_papers")
+        total_papers = int((cursor.fetchone() or [0])[0] or 0)
+        if total_papers <= 0:
+            return
+
+        cursor.execute("SELECT COUNT(*) FROM arxiv_oai_paper_categories")
+        category_count = int((cursor.fetchone() or [0])[0] or 0)
+        fts_count = 0
+        if fts5_available:
+            cursor.execute("SELECT COUNT(*) FROM arxiv_oai_papers_fts")
+            fts_count = int((cursor.fetchone() or [0])[0] or 0)
+
+        if category_count > 0 and (not fts5_available or fts_count > 0):
+            return
+
+        logger.info(
+            "Backfilling local OAI search indexes: papers=%s categories=%s fts=%s",
+            total_papers,
+            category_count,
+            fts_count,
+        )
+        cursor.execute(
+            """
+            SELECT
+                arxiv_id,
+                title,
+                abstract,
+                authors,
+                categories,
+                primary_category,
+                created,
+                updated,
+                abs_url,
+                pdf_url,
+                oai_datestamp,
+                fetched_at,
+                created_at,
+                updated_at
+            FROM arxiv_oai_papers
+            """
+        )
+        rows = cursor.fetchall()
+        self._sync_search_index_for_papers(
+            cursor,
+            [self._parse_row(row) for row in rows],
+            fts5_available=fts5_available,
+        )
+
+    def rebuild_oai_search_index(self) -> Dict[str, Any]:
+        """手动重建本地搜索索引；用于 FTS schema 变化或历史索引损坏后的修复。"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            fts5_available = self._is_fts5_available(cursor)
+            cursor.execute("DELETE FROM arxiv_oai_paper_categories")
+            if fts5_available:
+                cursor.execute("DELETE FROM arxiv_oai_papers_fts")
+            self._backfill_search_indexes(cursor, fts5_available=fts5_available)
+            cursor.execute("SELECT COUNT(*) FROM arxiv_oai_paper_categories")
+            category_rows = int((cursor.fetchone() or [0])[0] or 0)
+            fts_rows = 0
+            if fts5_available:
+                cursor.execute("SELECT COUNT(*) FROM arxiv_oai_papers_fts")
+                fts_rows = int((cursor.fetchone() or [0])[0] or 0)
+            conn.commit()
+        return {
+            "source": "local_oai",
+            "fts5_available": fts5_available,
+            "category_rows": category_rows,
+            "fts_rows": fts_rows,
+            "query_capability": build_local_oai_query_capability(
+                mode="local_oai_sqlite_fts" if fts5_available else "local_oai_sqlite_index",
+                fts5_available=fts5_available,
+                search_index_status="ready" if fts5_available else "text_index_unavailable",
+            ),
+        }
 
     def _parse_list_field(self, value: Any) -> Any:
         """把数据库中的列表字段还原成更自然的 Python 结构。"""
@@ -222,8 +469,13 @@ class ArxivOaiDatabaseService:
             if normalized_categories:
                 category_filters = []
                 for category in normalized_categories:
-                    category_filters.append("categories LIKE ? OR primary_category = ?")
-                    params.extend([f'%"{category}"%', category])
+                    category_filters.append(
+                        "primary_category = ? OR EXISTS ("
+                        "SELECT 1 FROM arxiv_oai_paper_categories c "
+                        "WHERE c.arxiv_id = arxiv_oai_papers.arxiv_id AND c.category = ?"
+                        ")"
+                    )
+                    params.extend([category, category])
                 where_clauses.append(f"({' OR '.join(f'({item})' for item in category_filters)})")
 
             if where_clauses:
@@ -572,6 +824,261 @@ class ArxivOaiDatabaseService:
             rows = cursor.fetchall()
         return [self._parse_row(row) for row in rows]
 
+    def _strip_query_outer_parentheses(self, query: str) -> str:
+        """移除查询最外层成对括号；解析阶段需要尊重引号，避免 phrase 被误拆。"""
+        text = query.strip()
+        while text.startswith("(") and text.endswith(")"):
+            depth = 0
+            in_quote = False
+            escaped = False
+            balanced = True
+            for index, char in enumerate(text):
+                if escaped:
+                    escaped = False
+                    continue
+                if char == "\\":
+                    escaped = True
+                    continue
+                if char == '"':
+                    in_quote = not in_quote
+                    continue
+                if in_quote:
+                    continue
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                    if depth == 0 and index != len(text) - 1:
+                        balanced = False
+                        break
+            if balanced and depth == 0 and not in_quote:
+                text = text[1:-1].strip()
+            else:
+                break
+        return text
+
+    def _split_query_top_level(self, query: str, token: str) -> List[str]:
+        """按顶层布尔操作符切分查询；引号和括号内的操作符只作为普通文本处理。"""
+        text = query.strip()
+        parts: List[str] = []
+        depth = 0
+        in_quote = False
+        escaped = False
+        start = 0
+        index = 0
+        token_length = len(token)
+        while index < len(text):
+            char = text[index]
+            if escaped:
+                escaped = False
+                index += 1
+                continue
+            if char == "\\":
+                escaped = True
+                index += 1
+                continue
+            if char == '"':
+                in_quote = not in_quote
+                index += 1
+                continue
+            if not in_quote:
+                if char == "(":
+                    depth += 1
+                    index += 1
+                    continue
+                if char == ")":
+                    depth = max(depth - 1, 0)
+                    index += 1
+                    continue
+                if depth == 0 and text.startswith(token, index):
+                    parts.append(text[start:index].strip())
+                    index += token_length
+                    start = index
+                    continue
+            index += 1
+        parts.append(text[start:].strip())
+        return [part for part in parts if part]
+
+    def _parse_submitted_date_range(self, text: str, *, original_query: str) -> Dict[str, Any]:
+        match = re.fullmatch(r"submittedDate:\[(\d{12})\s+TO\s+(\d{12})\]", text.strip())
+        if not match:
+            raise UnsupportedLocalArxivQuery(
+                "本地 OAI 镜像只支持 submittedDate:[YYYYMMDDHHMM TO YYYYMMDDHHMM] 日期范围。",
+                query=original_query,
+                reason="unsupported_submitted_date_syntax",
+            )
+        start_raw, end_raw = match.groups()
+        start_dt = datetime.strptime(start_raw, "%Y%m%d%H%M").strftime("%Y-%m-%d %H:%M:%S")
+        end_dt = datetime.strptime(end_raw, "%Y%m%d%H%M").strftime("%Y-%m-%d %H:%M:%S")
+        return {"type": "date", "start": start_dt, "end": end_dt}
+
+    def _parse_local_oai_atomic_query(self, text: str, *, original_query: str) -> Dict[str, Any]:
+        text = self._strip_query_outer_parentheses(text.strip())
+        if not text:
+            return {"type": "empty"}
+        if text.startswith("submittedDate:"):
+            return self._parse_submitted_date_range(text, original_query=original_query)
+
+        field = "all"
+        raw_value = text
+        if ":" in text:
+            field, raw_value = text.split(":", 1)
+            field = field.strip().lower()
+            raw_value = raw_value.strip()
+
+        aliases = {
+            "title": "ti",
+            "abstract": "abs",
+            "authors": "au",
+            "author": "au",
+            "category": "cat",
+        }
+        field = aliases.get(field, field)
+        supported_fields = {"id", "cat", "ti", "abs", "au", "all"}
+        if field not in supported_fields:
+            raise UnsupportedLocalArxivQuery(
+                f"本地 OAI 镜像不支持字段 `{field}`，请改用支持的查询子集。",
+                query=original_query,
+                reason=f"unsupported_field:{field}",
+            )
+
+        if not raw_value:
+            raise UnsupportedLocalArxivQuery(
+                "本地 OAI 镜像不支持空字段查询。",
+                query=original_query,
+                reason="empty_field_query",
+            )
+        if "*" in raw_value or "?" in raw_value:
+            raise UnsupportedLocalArxivQuery(
+                "本地 OAI 镜像不支持通配符查询，避免低精度误召回。",
+                query=original_query,
+                reason="unsupported_wildcard_query",
+            )
+
+        phrase = raw_value.startswith('"') and raw_value.endswith('"') and len(raw_value) >= 2
+        value = raw_value[1:-1] if phrase else raw_value
+        value = value.replace('\\"', '"').replace("\\\\", "\\").strip()
+
+        if field == "id":
+            return {"type": "id", "value": value}
+        if field == "cat":
+            return {"type": "category", "value": value}
+        return {"type": "text", "field": field, "value": value, "phrase": phrase}
+
+    def _parse_local_oai_query(self, query: str) -> Optional[Dict[str, Any]]:
+        """解析本地支持的 arXiv 查询子集；超出子集时显式失败而不是 Python 兜底。"""
+        text = self._strip_query_outer_parentheses(str(query or "").strip())
+        if not text:
+            return None
+        for operator, node_type in ((" ANDNOT ", "andnot"), (" AND ", "and"), (" OR ", "or")):
+            if operator in text:
+                parts = self._split_query_top_level(text, operator)
+                if len(parts) > 1:
+                    return {
+                        "type": node_type,
+                        "children": [self._parse_local_oai_query(part) for part in parts],
+                    }
+        return self._parse_local_oai_atomic_query(text, original_query=query)
+
+    def _fts_query_for_text(self, value: str, *, phrase: bool, original_query: str) -> str:
+        """把文本查询编译成 FTS5 语法；只使用 token/phrase，禁止子串模糊匹配。"""
+        tokens = re.findall(r"[A-Za-z0-9]+", str(value or "").lower())
+        if not tokens:
+            raise UnsupportedLocalArxivQuery(
+                "本地 OAI 镜像文本检索需要至少一个英文/数字 token。",
+                query=original_query,
+                reason="empty_fts_tokens",
+            )
+        if phrase:
+            return '"' + " ".join(tokens) + '"'
+        return " AND ".join(tokens)
+
+    def _compile_local_oai_query(
+        self,
+        node: Optional[Dict[str, Any]],
+        *,
+        fts5_available: bool,
+        original_query: str,
+    ) -> Tuple[str, List[Any], bool]:
+        """把查询 AST 编译成 SQL WHERE 片段，返回是否消费了 FTS 文本索引。"""
+        if not node or node.get("type") == "empty":
+            return "", [], False
+
+        node_type = node.get("type")
+        if node_type in {"and", "or"}:
+            compiled = [
+                self._compile_local_oai_query(child, fts5_available=fts5_available, original_query=original_query)
+                for child in node.get("children") or []
+                if child
+            ]
+            clauses = [item[0] for item in compiled if item[0]]
+            params = [param for item in compiled for param in item[1]]
+            uses_fts = any(item[2] for item in compiled)
+            if not clauses:
+                return "", [], uses_fts
+            joiner = " AND " if node_type == "and" else " OR "
+            return "(" + joiner.join(clauses) + ")", params, uses_fts
+
+        if node_type == "andnot":
+            children = [child for child in node.get("children") or [] if child]
+            if not children:
+                return "", [], False
+            left_sql, left_params, left_fts = self._compile_local_oai_query(
+                children[0],
+                fts5_available=fts5_available,
+                original_query=original_query,
+            )
+            negative_parts = [
+                self._compile_local_oai_query(child, fts5_available=fts5_available, original_query=original_query)
+                for child in children[1:]
+            ]
+            clauses = [left_sql] if left_sql else []
+            params = list(left_params)
+            uses_fts = left_fts
+            for sql, item_params, item_fts in negative_parts:
+                if sql:
+                    clauses.append(f"NOT ({sql})")
+                    params.extend(item_params)
+                uses_fts = uses_fts or item_fts
+            return "(" + " AND ".join(clauses) + ")", params, uses_fts
+
+        if node_type == "id":
+            return "p.arxiv_id = ?", [node.get("value")], False
+        if node_type == "category":
+            return (
+                "EXISTS (SELECT 1 FROM arxiv_oai_paper_categories c "
+                "WHERE c.arxiv_id = p.arxiv_id AND c.category = ?)"
+            ), [node.get("value")], False
+        if node_type == "date":
+            return (
+                "datetime(COALESCE(p.updated, p.created, p.oai_datestamp, p.fetched_at)) "
+                "BETWEEN datetime(?) AND datetime(?)"
+            ), [node.get("start"), node.get("end")], False
+        if node_type == "text":
+            if not fts5_available:
+                raise LocalArxivSearchIndexUnavailable(
+                    "本地 OAI 镜像文本索引不可用，无法执行 ti/abs/au/all 文本检索。",
+                    query=original_query,
+                    reason="fts5_unavailable",
+                )
+            field_map = {"ti": "title", "abs": "abstract", "au": "authors", "all": "all_text"}
+            fts_field = field_map.get(str(node.get("field") or "all"), "all_text")
+            fts_query = self._fts_query_for_text(
+                str(node.get("value") or ""),
+                phrase=bool(node.get("phrase")),
+                original_query=original_query,
+            )
+            return (
+                "p.arxiv_id IN (SELECT arxiv_id FROM arxiv_oai_papers_fts "
+                "WHERE arxiv_oai_papers_fts MATCH ?)"
+            ), [f"{fts_field}:({fts_query})"], True
+
+        raise UnsupportedLocalArxivQuery(
+            "本地 OAI 镜像无法识别该查询节点。",
+            query=original_query,
+            reason=f"unsupported_node:{node_type}",
+        )
+
     def search(
         self,
         search_query: str = "",
@@ -583,24 +1090,85 @@ class ArxivOaiDatabaseService:
     ) -> Dict[str, Any]:
         normalized_query = str(search_query or "").strip()
         normalized_id_list = [str(item).strip() for item in (id_list or []) if str(item).strip()]
-        rows = self._fetch_all_searchable_papers(normalized_id_list or None)
+        query_node = self._parse_local_oai_query(normalized_query) if normalized_query else None
 
-        if normalized_query:
-            rows = [paper for paper in rows if self._matches_query(paper, normalized_query)]
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            fts5_available = self._is_fts5_available(cursor)
+            where_clauses: List[str] = []
+            params: List[Any] = []
+            uses_fts = False
 
-        reverse = sort_order == "descending"
-        if sort_by == "relevance" and normalized_query:
-            # 本地数据源没有 arXiv API 的相关性排序，这里用轻量字段权重把主题命中更强的论文排到前面。
-            rows.sort(key=lambda p: (self._score_relevance_query(p, normalized_query), p.get("updated") or p.get("created") or ""), reverse=reverse)
-        elif sort_by in {"submittedDate", "lastUpdatedDate"}:
-            rows.sort(key=lambda p: p.get("updated") or p.get("created") or "", reverse=reverse)
+            if normalized_id_list:
+                placeholders = ",".join("?" for _ in normalized_id_list)
+                where_clauses.append(f"p.arxiv_id IN ({placeholders})")
+                params.extend(normalized_id_list)
 
-        paginated_rows = rows[start:start + max_results]
-        papers = [self._build_paper_response(paper) for paper in paginated_rows]
+            query_sql, query_params, uses_fts = self._compile_local_oai_query(
+                query_node,
+                fts5_available=fts5_available,
+                original_query=normalized_query,
+            )
+            if query_sql:
+                where_clauses.append(query_sql)
+                params.extend(query_params)
+
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            count_query = f"SELECT COUNT(*) FROM arxiv_oai_papers p {where_sql}"
+            cursor.execute(count_query, params)
+            total_results = int((cursor.fetchone() or [0])[0] or 0)
+
+            direction = "DESC" if sort_order == "descending" else "ASC"
+            order_sql = (
+                "ORDER BY datetime(COALESCE(p.updated, p.created, p.oai_datestamp, p.fetched_at)) "
+                f"{direction}, p.arxiv_id {direction}"
+            )
+            if sort_by not in {"relevance", "submittedDate", "lastUpdatedDate"}:
+                order_sql = "ORDER BY p.arxiv_id ASC"
+
+            columns = """
+                p.arxiv_id,
+                p.title,
+                p.abstract,
+                p.authors,
+                p.categories,
+                p.primary_category,
+                p.created,
+                p.updated,
+                p.abs_url,
+                p.pdf_url,
+                p.oai_datestamp,
+                p.fetched_at,
+                p.created_at,
+                p.updated_at
+            """
+            select_query = f"""
+                SELECT {columns}
+                FROM arxiv_oai_papers p
+                {where_sql}
+                {order_sql}
+                LIMIT ? OFFSET ?
+            """
+            cursor.execute(select_query, params + [max(1, int(max_results)), max(0, int(start))])
+            papers = [self._build_paper_response(self._parse_row(row)) for row in cursor.fetchall()]
+
+        query_capability = build_local_oai_query_capability(
+            mode="local_oai_sqlite_fts" if uses_fts else "local_oai_sqlite_index",
+            fts5_available=fts5_available,
+            search_index_status="ready" if fts5_available or not uses_fts else "text_index_unavailable",
+        )
+        warnings = [
+            "当前使用本地 OAI 镜像库，仅支持高精度可下推查询子集，不等价完整 arXiv API 语法。"
+        ]
+        if sort_by == "relevance" and uses_fts:
+            warnings.append("本地 relevance 当前使用 FTS 命中过滤和日期排序，不等价 arXiv API relevance。")
         return {
             "query": normalized_query,
             "id_list": normalized_id_list,
-            "total_results": len(rows),
+            "source": "local_oai",
+            "query_capability": query_capability,
+            "warnings": warnings,
+            "total_results": total_results,
             "start_index": start,
             "items_per_page": len(papers),
             "papers": papers,
@@ -679,6 +1247,7 @@ class ArxivOaiDatabaseService:
     def _initialize_database(self) -> None:
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            fts5_available = self._is_fts5_available(cursor)
             cursor.execute(
                 '''
                 CREATE TABLE IF NOT EXISTS arxiv_oai_papers (
@@ -700,6 +1269,48 @@ class ArxivOaiDatabaseService:
                 )
                 '''
             )
+            cursor.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS arxiv_oai_paper_categories (
+                    arxiv_id TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    is_primary INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (arxiv_id, category),
+                    FOREIGN KEY (arxiv_id) REFERENCES arxiv_oai_papers(arxiv_id) ON DELETE CASCADE
+                )
+                '''
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_arxiv_oai_papers_arxiv_id ON arxiv_oai_papers(arxiv_id)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_arxiv_oai_papers_created ON arxiv_oai_papers(created)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_arxiv_oai_papers_updated ON arxiv_oai_papers(updated)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_arxiv_oai_categories_category ON arxiv_oai_paper_categories(category)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_arxiv_oai_categories_arxiv_id ON arxiv_oai_paper_categories(arxiv_id)"
+            )
+            if fts5_available:
+                # FTS5 是本地文本检索的硬依赖；不可用时只保留 id/category/date 等精确过滤能力。
+                cursor.execute(
+                    '''
+                    CREATE VIRTUAL TABLE IF NOT EXISTS arxiv_oai_papers_fts USING fts5(
+                        arxiv_id UNINDEXED,
+                        title,
+                        abstract,
+                        authors,
+                        categories,
+                        all_text,
+                        tokenize = 'unicode61'
+                    )
+                    '''
+                )
+            self._backfill_search_indexes(cursor, fts5_available=fts5_available)
             conn.commit()
             logger.info("OAI database tables initialized successfully: %s", self.db_path)
 
@@ -752,6 +1363,7 @@ class ArxivOaiDatabaseService:
                         paper.get("oai_datestamp"),
                     ),
                 )
+                self._sync_search_index_for_papers(cursor, [paper])
                 conn.commit()
                 logger.info("OAI paper upserted: %s", paper.get("arxiv_id"))
                 return True
@@ -815,6 +1427,7 @@ class ArxivOaiDatabaseService:
                         for paper in normalized_papers
                     ],
                 )
+                self._sync_search_index_for_papers(cursor, normalized_papers)
                 conn.commit()
                 logger.info("OAI paper batch upserted: %s", len(normalized_papers))
                 return len(normalized_papers)

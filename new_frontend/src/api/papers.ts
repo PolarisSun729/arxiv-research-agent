@@ -7,6 +7,7 @@ import type {
   SearchParams,
   LabelParams,
   PaginatedResponse,
+  ArxivSearchResult,
   ArxivSearchParams,
   PaperMaterializationPayload,
   PaperPreferenceRequest,
@@ -632,7 +633,7 @@ export async function getStats(userId?: string): Promise<DashboardStats> {
   return normalizeDashboardStats(response)
 }
 
-export async function searchArxiv(params: ArxivSearchParams): Promise<PaginatedResponse<Paper>> {
+export async function searchArxiv(params: ArxivSearchParams): Promise<ArxivSearchResult> {
   const defaultParams: ArxivSearchParams = {
     submitted_days_ago: 30,
     ...params
@@ -642,9 +643,13 @@ export async function searchArxiv(params: ArxivSearchParams): Promise<PaginatedR
   const items = papers.map(normalizePaper)
   const maxResults = defaultParams.max_results || 10
   const actualTotal = Math.min(response.total_results || items.length, maxResults)
+  // 本地 OAI 搜索会返回能力边界契约；API 层必须保留它，避免页面误把语法受限解释为“无结果”。
   return {
     total: actualTotal,
-    items
+    items,
+    source: response.source || null,
+    queryCapability: response.query_capability || null,
+    warnings: Array.isArray(response.warnings) ? response.warnings : []
   }
 }
 

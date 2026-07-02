@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { getErrorMessage } from '@/api/errors'
 import { usePaperStore } from '@/stores/paperStore'
 import SearchBar from '@/components/SearchBar.vue'
 import PaperCard from '@/components/PaperCard.vue'
+import ArxivQueryCapabilityBanner from '@/components/arxiv/ArxivQueryCapabilityBanner.vue'
 
 const router = useRouter()
 const store = usePaperStore()
@@ -27,6 +29,7 @@ const searchForm = ref({
 
 const currentPage = ref(1)
 const pageSize = ref(10)
+const hasCapabilityError = computed(() => store.arxivSearchCapability?.status === 'error')
 
 async function handleSearch() {
   currentPage.value = 1
@@ -40,22 +43,27 @@ async function handleSearch() {
     submittedDaysAgo = Math.floor(timeDiff / (1000 * 60 * 60 * 24))
   }
   
-  await store.fetchArxivPapers({
-    search_query: searchForm.value.searchQuery || undefined,
-    title: searchForm.value.title || undefined,
-    author: searchForm.value.author || undefined,
-    abstract: searchForm.value.abstract || undefined,
-    category: searchForm.value.category || undefined,
-    comment: searchForm.value.comment || undefined,
-    journal_ref: searchForm.value.journalRef || undefined,
-    report_number: searchForm.value.reportNumber || undefined,
-    operator: searchForm.value.operator || undefined,
-    max_results: searchForm.value.maxResults,
-    start: 0,
-    sort_by: searchForm.value.sortBy,
-    sort_order: searchForm.value.sortOrder,
-    submitted_days_ago: submittedDaysAgo > 0 ? submittedDaysAgo : undefined
-  }, 1, pageSize.value)
+  try {
+    await store.fetchArxivPapers({
+      search_query: searchForm.value.searchQuery || undefined,
+      title: searchForm.value.title || undefined,
+      author: searchForm.value.author || undefined,
+      abstract: searchForm.value.abstract || undefined,
+      category: searchForm.value.category || undefined,
+      comment: searchForm.value.comment || undefined,
+      journal_ref: searchForm.value.journalRef || undefined,
+      report_number: searchForm.value.reportNumber || undefined,
+      operator: searchForm.value.operator || undefined,
+      max_results: searchForm.value.maxResults,
+      start: 0,
+      sort_by: searchForm.value.sortBy,
+      sort_order: searchForm.value.sortOrder,
+      submitted_days_ago: submittedDaysAgo > 0 ? submittedDaysAgo : undefined
+    }, 1, pageSize.value)
+  } catch (error) {
+    // 本地 OAI 契约错误已在 store 内转成页面级 banner；这里只兜底未知请求失败。
+    ElMessage.error(getErrorMessage(error, 'arXiv 搜索失败，请稍后重试'))
+  }
 }
 
 function handleViewDetail(id: string) {
@@ -95,9 +103,20 @@ function handlePageChange(page: number) {
         </span>
       </div>
 
+      <ArxivQueryCapabilityBanner
+        v-if="store.arxivSearchCapability"
+        :capability="store.arxivSearchCapability"
+        class="results-capability-banner"
+      />
+
       <div v-if="store.loading" class="loading">
         <div class="el-loading-spinner"></div>
         <p>加载中...</p>
+      </div>
+
+      <div v-else-if="hasCapabilityError" class="search-state-panel">
+        <div class="search-state-panel__title">本次查询未执行</div>
+        <p>{{ store.arxivSearchError || '请按本地 OAI 镜像库支持的字段与布尔语法调整后重试。' }}</p>
       </div>
 
       <div v-else-if="store.papers.length === 0" class="empty-results">
@@ -148,11 +167,37 @@ function handlePageChange(page: number) {
   color: #6b7280;
 }
 
+.results-capability-banner {
+  margin-bottom: 16px;
+}
+
 .loading {
   display: flex;
   flex-direction: column;
   align-items: center;
   padding: 40px;
+}
+
+.search-state-panel {
+  padding: 18px 20px;
+  border-radius: 18px;
+  border: 1px solid rgba(220, 38, 38, 0.12);
+  background:
+    radial-gradient(circle at top left, rgba(239, 68, 68, 0.1), transparent 32%),
+    linear-gradient(135deg, #fff7f7 0%, #ffffff 70%);
+  color: #475569;
+}
+
+.search-state-panel__title {
+  margin-bottom: 8px;
+  color: #991b1b;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.search-state-panel p {
+  margin: 0;
+  line-height: 1.7;
 }
 
 .empty-results {

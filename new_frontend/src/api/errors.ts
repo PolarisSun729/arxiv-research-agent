@@ -13,6 +13,9 @@ const ERROR_MESSAGES: Record<string, string> = {
   resume_checkpoint_not_found: '原执行现场已失效，请重新发起请求。',
   agent_runtime_error: 'Agent 运行失败，请稍后重试。',
   database_write_failed: '答案保存失败。',
+  local_arxiv_search_error: '本地 arXiv 检索失败，请检查查询后重试。',
+  unsupported_local_arxiv_query: '本地 OAI 镜像库不支持该查询语法，请按支持字段改写。',
+  local_search_index_unavailable: '本地 arXiv 搜索索引不可用，请先重建索引。',
   unknown_error: '请求失败，请稍后重试。'
 }
 
@@ -35,6 +38,38 @@ export function isApiErrorPayload(value: unknown): value is ApiErrorPayload {
   )
 }
 
+function isRecord(value: unknown): value is Record<string, any> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
+}
+
+function normalizeDetails(value: unknown): Record<string, any> | null {
+  return isRecord(value) ? value : null
+}
+
+function normalizeFastApiDetail(value: unknown, fallback: string): ApiErrorPayload | null {
+  if (!isRecord(value)) return null
+  const detail = isRecord(value.detail) ? value.detail : value
+  if (typeof detail.code !== 'string') return null
+
+  const code = String(detail.code || 'unknown_error')
+  const message = typeof detail.message === 'string' && detail.message
+    ? detail.message
+    : fallback
+  const rawDetail = typeof detail.detail === 'string'
+    ? detail.detail
+    : typeof detail.message === 'string' ? detail.message : null
+
+  return {
+    status: 'failed',
+    code,
+    message: getApiErrorMessage(code, message),
+    detail: rawDetail,
+    // FastAPI 业务错误会把可展示契约放在 detail.details，前端需要保留给页面级 banner。
+    details: normalizeDetails(detail.details),
+    recoverable: typeof detail.recoverable === 'boolean' ? detail.recoverable : true
+  }
+}
+
 export function normalizeApiError(value: unknown, fallback = '请求失败，请稍后重试。'): ApiErrorPayload {
   if (isApiErrorPayload(value)) {
     const code = String(value.code || 'unknown_error')
@@ -43,14 +78,24 @@ export function normalizeApiError(value: unknown, fallback = '请求失败，请
       code,
       message: getApiErrorMessage(code, value.message || fallback),
       detail: typeof value.detail === 'string' ? value.detail : null,
+      details: normalizeDetails(value.details),
       recoverable: Boolean(value.recoverable)
     }
+  }
+
+  const fastApiDetail = normalizeFastApiDetail(value, fallback)
+  if (fastApiDetail) {
+    return fastApiDetail
   }
 
   if (value && typeof value === 'object' && 'response' in value) {
     const data = (value as { response?: { data?: unknown } }).response?.data
     if (isApiErrorPayload(data)) {
       return normalizeApiError(data, fallback)
+    }
+    const normalizedFastApiError = normalizeFastApiDetail(data, fallback)
+    if (normalizedFastApiError) {
+      return normalizedFastApiError
     }
     if (data && typeof data === 'object' && isApiErrorPayload((data as { detail?: unknown }).detail)) {
       return normalizeApiError((data as { detail: unknown }).detail, fallback)
@@ -59,6 +104,11 @@ export function normalizeApiError(value: unknown, fallback = '请求失败，请
 
   if (value && typeof value === 'object' && isApiErrorPayload((value as { detail?: unknown }).detail)) {
     return normalizeApiError((value as { detail: unknown }).detail, fallback)
+  }
+
+  const nestedFastApiDetail = isRecord(value) ? normalizeFastApiDetail(value.detail, fallback) : null
+  if (nestedFastApiDetail) {
+    return nestedFastApiDetail
   }
 
   if (value instanceof Error && value.message) {

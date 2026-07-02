@@ -1,3 +1,5 @@
+import type { BackendArxivQueryCapability } from './arxivCapability'
+
 export type PaperLabel = 'liked' | 'disliked'
 
 // 显式喜欢/不喜欢由 PaperLabel 与专用偏好接口维护；paper-action 只表达弱行为。
@@ -277,6 +279,12 @@ export interface LabelParams {
 export interface PaginatedResponse<T> {
   total: number
   items: T[]
+}
+
+export interface ArxivSearchResult extends PaginatedResponse<Paper> {
+  source?: string | null
+  queryCapability?: BackendArxivQueryCapability | null
+  warnings: string[]
 }
 
 export interface InterestClusterSummary {

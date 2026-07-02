@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import PaperCard from '@/components/PaperCard.vue'
+import ArxivQueryCapabilityBanner from '@/components/arxiv/ArxivQueryCapabilityBanner.vue'
 import type { AgentPaper, AgentPreferenceActionResult, ArxivSearchResponse } from '@/types/agent'
 import type { Paper } from '@/types/paper'
+import { normalizeArxivQueryCapability, normalizeArxivQueryCapabilityFromToolCalls } from '@/utils/arxivQueryCapability'
 
 const props = defineProps<{
   response: ArxivSearchResponse | null | undefined
@@ -109,6 +111,12 @@ const responseDebug = computed(() => (responseData.value.debug || {}) as Record<
 const plannerSummary = computed(() => (responseDebug.value.planner_summary || {}) as Record<string, any>)
 const clarificationSummary = computed(() => (responseDebug.value.clarification_summary || {}) as Record<string, any>)
 const recommendationSummary = computed(() => (responseDebug.value.recommendation_summary || {}) as Record<string, any>)
+const queryCapability = computed(() =>
+  normalizeArxivQueryCapability({
+    capability: responseData.value.query_capability,
+    warnings: warnings.value
+  }) || normalizeArxivQueryCapabilityFromToolCalls(toolCalls.value, warnings.value)
+)
 const capabilityBoundaryCount = computed(() =>
   [plannerSummary.value, clarificationSummary.value, recommendationSummary.value].filter(item => Object.keys(item).length > 0).length
 )
@@ -364,6 +372,13 @@ function formatBoolLabel(value: unknown) {
       </ul>
     </details>
 
+    <ArxivQueryCapabilityBanner
+      v-if="queryCapability"
+      :capability="queryCapability"
+      :compact="true"
+      class="agent-response-panel__search-capability"
+    />
+
     <section class="agent-response-panel__papers">
       <div class="section-label">Papers 结果展示</div>
       <div v-if="!papers.length" class="empty-state">暂无论文结果</div>
@@ -432,6 +447,7 @@ function formatBoolLabel(value: unknown) {
 
 .summary-chip,
 .agent-collapse,
+.agent-response-panel__search-capability,
 .tool-call-item,
 .timeline-item,
 .agent-response-panel__papers {
@@ -588,6 +604,10 @@ function formatBoolLabel(value: unknown) {
 
 .agent-response-panel__papers {
   padding: 16px;
+}
+
+.agent-response-panel__search-capability {
+  overflow: hidden;
 }
 
 .paper-list {

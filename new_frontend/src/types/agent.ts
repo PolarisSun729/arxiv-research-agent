@@ -1,3 +1,4 @@
+import type { BackendArxivQueryCapability } from '@/types/arxivCapability'
 import type { UserResearchProfile } from '@/types/paper'
 
 export interface ArxivSearchRequest {
@@ -182,6 +183,7 @@ export interface ArxivSearchResponse {
   session_id?: string | null
   intent: string
   answer: string
+  query_capability?: BackendArxivQueryCapability | null
   search_spec?: ArxivSearchSpec | null
   pending_action?: AgentPendingAction | null
   paper_qa_result?: Record<string, any> | null

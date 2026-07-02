@@ -16,6 +16,7 @@ import type {
   UserResearchProfileDetail,
   UserProfileBuildJob
 } from '@/types/paper'
+import type { NormalizedArxivQueryCapability } from '@/types/arxivCapability'
 import {
   searchPapers,
   getPaperById,
@@ -47,6 +48,10 @@ import {
   getPaperNotesExportUrl
 } from '@/api/papers'
 import { useUserContext } from '@/composables/useUserContext'
+import {
+  normalizeArxivQueryCapability,
+  normalizeArxivQueryCapabilityFromError
+} from '@/utils/arxivQueryCapability'
 
 export const usePaperStore = defineStore('paper', () => {
   const userContext = useUserContext()
@@ -78,6 +83,8 @@ export const usePaperStore = defineStore('paper', () => {
   const researchProfile = ref<UserResearchProfile | null>(null)
   const paperActionMap = ref<UserPaperActionMap>({})
   const paperNotes = ref<PaperNote[]>([])
+  const arxivSearchCapability = ref<NormalizedArxivQueryCapability | null>(null)
+  const arxivSearchError = ref<string | null>(null)
 
   function resetUserScopedState() {
     // userId 切换后清理本地用户态缓存，避免偏好、画像、笔记和推荐结果短暂串到新用户视图。
@@ -91,6 +98,8 @@ export const usePaperStore = defineStore('paper', () => {
     paperActionMap.value = {}
     paperNotes.value = []
     lastInterestVector.value = null
+    arxivSearchCapability.value = null
+    arxivSearchError.value = null
     if (currentPaper.value) {
       currentPaper.value.label = null
       currentPaper.value.paperActions = {}
@@ -286,8 +295,14 @@ export const usePaperStore = defineStore('paper', () => {
 
   async function fetchArxivPapers(params: ArxivSearchParams, page: number = 1, pageSize: number = 10) {
     loading.value = true
+    arxivSearchCapability.value = null
+    arxivSearchError.value = null
     try {
       const result = await searchArxiv(params)
+      arxivSearchCapability.value = normalizeArxivQueryCapability({
+        capability: result.queryCapability,
+        warnings: result.warnings
+      })
       allPapers.value = [...result.items]
       const preferences = await getUserPreferences()
       paperActionMap.value = preferences.paper_actions || {}
@@ -298,6 +313,18 @@ export const usePaperStore = defineStore('paper', () => {
       const start = (page - 1) * pageSize
       const end = start + pageSize
       papers.value = allPapers.value.slice(start, end)
+    } catch (error) {
+      const capabilityFromError = normalizeArxivQueryCapabilityFromError(error)
+      if (capabilityFromError) {
+        // 本地查询契约错误是可解释的业务失败：页面展示能力边界，不再伪装成普通“无结果”。
+        arxivSearchCapability.value = capabilityFromError
+        arxivSearchError.value = capabilityFromError.errorMessage || capabilityFromError.summary
+        allPapers.value = []
+        papers.value = []
+        totalPapers.value = 0
+        return
+      }
+      throw error
     } finally {
       loading.value = false
     }
@@ -492,6 +519,8 @@ export const usePaperStore = defineStore('paper', () => {
     latestProfileBuildJob,
     paperActionMap,
     paperNotes,
+    arxivSearchCapability,
+    arxivSearchError,
     recommendationsGenerating,
     fetchPapers,
     fetchPaperById,

@@ -116,6 +116,12 @@ async def arxiv_search(
         logger.error("Invalid arXiv search query: %s", str(exc))
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
+        error_code = str(getattr(exc, "code", "") or "")
+        if error_code:
+            logger.error("Local arXiv search capability error: %s", str(exc))
+            detail_factory = getattr(exc, "to_error_detail", None)
+            detail = detail_factory() if callable(detail_factory) else {"code": error_code, "message": str(exc)}
+            raise HTTPException(status_code=int(getattr(exc, "status_code", 400)), detail=detail)
         logger.error("Error searching arXiv: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
 

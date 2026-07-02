@@ -11,6 +11,9 @@ export type ApiErrorCode =
   | 'resume_checkpoint_not_found'
   | 'agent_runtime_error'
   | 'database_write_failed'
+  | 'local_arxiv_search_error'
+  | 'unsupported_local_arxiv_query'
+  | 'local_search_index_unavailable'
   | 'unknown_error'
 
 export interface ApiErrorPayload {
@@ -18,5 +21,6 @@ export interface ApiErrorPayload {
   code: ApiErrorCode | string
   message: string
   detail?: string | null
+  details?: Record<string, any> | null
   recoverable: boolean
 }
