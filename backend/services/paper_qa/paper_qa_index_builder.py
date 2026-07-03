@@ -36,6 +36,7 @@ from services.retrieval.retrieval_index import (
 from services.retrieval.retrieval_rules import RetrievalRules
 from services.storage.vector_store_service import VectorDBConfig, VectorStoreService
 from utils.config import get_enhanced_retrieval_runtime_config
+from utils.logging_utils import info_event
 
 logger = logging.getLogger(__name__)
 
@@ -423,23 +424,19 @@ class PaperQAIndexBuilder:
             for key, value in extra.items()
             if value not in (None, "", [], {})
         )
+        info_event(
+            logger,
+            "qa.index_stage_done",
+            stage=stage,
+            arxiv_id=arxiv_id,
+            loading_method=loading_method,
+            message=message,
+            **extra,
+        )
         if extra_parts:
-            logger.debug(
-                "QA index stage=%s arxiv_id=%s loading_method=%s %s | %s",
-                stage,
-                arxiv_id,
-                loading_method,
-                message,
-                extra_parts,
-            )
+            logger.debug("QA index stage=%s arxiv_id=%s loading_method=%s %s | %s", stage, arxiv_id, loading_method, message, extra_parts)
         else:
-            logger.debug(
-                "QA index stage=%s arxiv_id=%s loading_method=%s %s",
-                stage,
-                arxiv_id,
-                loading_method,
-                message,
-            )
+            logger.debug("QA index stage=%s arxiv_id=%s loading_method=%s %s", stage, arxiv_id, loading_method, message)
 
     def _tag_exception(
         self,
@@ -595,9 +592,9 @@ class PaperQAIndexBuilder:
             raise RuntimeError("arxiv_service_factory is required")
         arxiv_service = self.arxiv_service_factory()
         pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
-        logger.info("Downloading PDF from: %s", pdf_url)
+        logger.debug("Downloading PDF from: %s", pdf_url)
         pdf_path = arxiv_service.download_pdf(pdf_url, arxiv_id)
-        logger.info("PDF downloaded to: %s", pdf_path)
+        logger.debug("PDF downloaded to: %s", pdf_path)
         return pdf_path
 
     def load_pdf_document(self, pdf_path: str, loading_method: str) -> Tuple[LoadingService, Dict[str, Any], List[Dict[str, Any]]]:
@@ -605,10 +602,10 @@ class PaperQAIndexBuilder:
         if self.loading_service_factory is None:
             raise RuntimeError("loading_service_factory is required")
         loading_service = self.loading_service_factory()
-        logger.info("Loading PDF content...")
+        logger.debug("Loading PDF content...")
         document = loading_service.load_pdf(pdf_path, method=loading_method)
         page_map = loading_service.get_page_map()
-        logger.info("Loaded %s pages from PDF", len(page_map))
+        logger.debug("Loaded %s pages from PDF", len(page_map))
         return loading_service, document, page_map
 
     def chunk_document(
@@ -622,7 +619,7 @@ class PaperQAIndexBuilder:
         if self.chunking_service_factory is None:
             raise RuntimeError("chunking_service_factory is required")
         chunking_service = self.chunking_service_factory()
-        logger.info("Chunking text...")
+        logger.debug("Chunking text...")
         metadata = {"filename": f"{arxiv_id}.pdf", "loading_method": loading_method, "source": f"{arxiv_id}.pdf"}
         if loading_method == "docling":
             # Docling 结构更强，优先按章节语义切块，保留表格/图片等结构信息。
@@ -634,9 +631,9 @@ class PaperQAIndexBuilder:
             chunking_strategy = "pymupdf_by_titles"
 
         chunks = chunked_data["chunks"]
-        logger.info("Created %s chunks", len(chunks))
+        logger.debug("Created %s chunks", len(chunks))
         text_count, figure_count, table_count = self._chunk_type_counts(chunks)
-        logger.info(
+        logger.debug(
             "Chunk composition: text=%d figure=%d table=%d",
             text_count,
             figure_count,
@@ -711,16 +708,16 @@ class PaperQAIndexBuilder:
             chunking_strategy=chunking_strategy,
             document_data=document_for_save,
         )
-        logger.info("Chunked document saved to: %s", chunk_file)
+        logger.debug("Chunked document saved to: %s", chunk_file)
         return chunk_file
 
     def compress_chunks_for_rerank(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        logger.info("Compressing chunk text for rerank with Qwen...")
+        logger.debug("Compressing chunk text for rerank with Qwen...")
         compressed_chunks = self.generation_service.compress_chunks_for_rerank(
             chunks=chunks,
             model_name=QWEN_RERANK_COMPRESS_MODEL_NAME,
         )
-        logger.info("Generated rerank_text for %d chunks", len(compressed_chunks))
+        logger.debug("Generated rerank_text for %d chunks", len(compressed_chunks))
         return compressed_chunks
 
     def build_retrieval_indexes(self, chunks: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -737,7 +734,7 @@ class PaperQAIndexBuilder:
             max_questions_per_chunk=max_questions_per_chunk,
         )
         retrieval_index_debug["generated_question_index_enabled"] = enable_generated_question_index
-        logger.info(
+        logger.debug(
             "Built retrieval indexes: count=%s type_counts=%s generation_errors=%s",
             retrieval_index_debug.get("index_count"),
             retrieval_index_debug.get("index_type_counts"),
@@ -762,7 +759,7 @@ class PaperQAIndexBuilder:
             chunks=chunks,
             index_version=index_version,
         )
-        logger.info("Retrieval index artifact saved to: %s", artifact_file)
+        logger.debug("Retrieval index artifact saved to: %s", artifact_file)
         return artifact_file
 
     def save_sparse_index_artifact(
@@ -831,7 +828,7 @@ class PaperQAIndexBuilder:
             source_hash=source_hash,
             backend="internal_bm25",
         )
-        logger.info(
+        logger.debug(
             "Chunk-level sparse index artifact saved to: %s document_count=%s token_count=%s source_hash=%s",
             artifact.get("manifest_file"),
             artifact.get("document_count"),
@@ -894,7 +891,7 @@ class PaperQAIndexBuilder:
         index_version: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], EmbeddingConfig]:
         embedding_config = self.get_embedding_config()
-        logger.info(
+        logger.debug(
             "Creating embeddings with %s / %s...",
             embedding_config.provider,
             embedding_config.model_name,
@@ -929,13 +926,13 @@ class PaperQAIndexBuilder:
             raise RuntimeError("No valid retrieval indexes produced embeddings")
 
         # 一个 PaperChunk 会派生多个 RetrievalIndex，因此 embedding 数量现在表示可检索入口数。
-        logger.info(
+        logger.debug(
             "Created %d retrieval-index embeddings: %s",
             len(embeddings),
             retrieval_index_debug,
         )
         text_count, figure_count, table_count = self._chunk_type_counts(embeddings)
-        logger.info(
+        logger.debug(
             "Embedding composition: text=%d figure=%d table=%d",
             text_count,
             figure_count,
@@ -946,14 +943,14 @@ class PaperQAIndexBuilder:
     def save_embeddings(self, arxiv_id: str, embeddings: List[Dict[str, Any]], index_version: Optional[str] = None) -> str:
         filename = f"{arxiv_id}_{index_version}.pdf" if index_version else f"{arxiv_id}.pdf"
         embedding_file = self.embedding_service.save_embeddings(filename, embeddings)
-        logger.info("Embeddings saved to: %s", embedding_file)
+        logger.debug("Embeddings saved to: %s", embedding_file)
         return embedding_file
 
     def index_embeddings_to_vector_store(self, embedding_file: str) -> Dict[str, Any]:
         vector_db_config = VectorDBConfig(provider="milvus", index_mode="default")
         index_result = self.vector_store_service.index_embeddings(embedding_file, vector_db_config)
         collection_name = index_result.get("collection_name", "")
-        logger.info("Index created in collection: %s", collection_name)
+        logger.debug("Index created in collection: %s", collection_name)
         return index_result
 
     def validate_new_collection(self, collection_name: str, expected_count: int) -> None:
@@ -1174,8 +1171,9 @@ class PaperQAIndexBuilder:
         arxiv_id: str,
         loading_method: str = "docling",
         progress_callback: Optional[Callable[..., Any]] = None,
+        run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        logger.info("Creating QA index for paper: %s", arxiv_id)
+        info_event(logger, "qa.index_start", run_id=run_id, arxiv_id=arxiv_id, loading_method=loading_method)
         requested_loading_method = str(loading_method or "docling").strip().lower()
         current_stage = "validate_loading_method"
         artifact_state: Dict[str, Any] = {}
@@ -1591,6 +1589,19 @@ class PaperQAIndexBuilder:
                 embedding_model=embedding_config.model_name,
             )
 
+            info_event(
+                logger,
+                "qa.index_done",
+                run_id=run_id,
+                arxiv_id=arxiv_id,
+                build_id=build_id,
+                status="success",
+                loading_method=loading_method,
+                collection_name=collection_name,
+                chunk_count=len(chunks),
+                embedding_model=embedding_config.model_name,
+                retrieval_index_count=retrieval_index_debug.get("index_count"),
+            )
             return {
                 "status": "success",
                 "message": "QA index created successfully",
@@ -1634,6 +1645,18 @@ class PaperQAIndexBuilder:
                 effective_loading_method,
                 exc.detail,
             )
+            info_event(
+                logger,
+                "qa.index_done",
+                run_id=run_id,
+                arxiv_id=arxiv_id,
+                build_id=build_id,
+                status="error",
+                code=exc.code,
+                failed_stage=str(exc.context.get("stage") or current_stage),
+                loading_method=effective_loading_method,
+                message=exc.message,
+            )
             self.mark_index_failed(
                 arxiv_id,
                 failed_stage=str(exc.context.get("stage") or current_stage),
@@ -1657,6 +1680,18 @@ class PaperQAIndexBuilder:
                 requested_loading_method,
                 type(exc).__name__,
                 detail,
+            )
+            info_event(
+                logger,
+                "qa.index_done",
+                run_id=run_id,
+                arxiv_id=arxiv_id,
+                build_id=build_id,
+                status="error",
+                failed_stage=current_stage,
+                loading_method=effective_loading_method,
+                error_type=type(exc).__name__,
+                message=detail,
             )
             self.mark_index_failed(
                 arxiv_id,
@@ -1686,6 +1721,18 @@ class PaperQAIndexBuilder:
                 requested_loading_method,
                 type(exc).__name__,
                 detail,
+            )
+            info_event(
+                logger,
+                "qa.index_done",
+                run_id=run_id,
+                arxiv_id=arxiv_id,
+                build_id=build_id,
+                status="error",
+                failed_stage=current_stage,
+                loading_method=effective_loading_method,
+                error_type=type(exc).__name__,
+                message=detail,
             )
             self.mark_index_failed(
                 arxiv_id,

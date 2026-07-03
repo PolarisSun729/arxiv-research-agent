@@ -23,9 +23,10 @@ def _get_paper_qa_service():
     return get_dependency_paper_qa_service()
 
 
-def check_paper_qa_index(arxiv_id: str) -> Dict[str, Any]:
+def check_paper_qa_index(arxiv_id: str, run_id: Optional[str] = None) -> Dict[str, Any]:
     tool_name = "check_paper_qa_index"
-    trace_inputs = {"arxiv_id": arxiv_id}
+    # run_id 只进入工具 trace，方便把 Agent 工具调用和后端状态检查串联。
+    trace_inputs = {"arxiv_id": arxiv_id, "run_id": run_id}
     try:
         data = _get_paper_qa_service().get_qa_status(arxiv_id)
         return make_tool_result(
@@ -46,11 +47,15 @@ def check_paper_qa_index(arxiv_id: str) -> Dict[str, Any]:
         )
 
 
-def build_paper_qa_index(arxiv_id: str, loading_method: str = "docling") -> Dict[str, Any]:
+def build_paper_qa_index(arxiv_id: str, loading_method: str = "docling", run_id: Optional[str] = None) -> Dict[str, Any]:
     tool_name = "build_paper_qa_index"
-    trace_inputs = {"arxiv_id": arxiv_id, "loading_method": loading_method}
+    # run_id 只进入工具 trace 和索引构建日志，不影响加载方式或索引内容。
+    trace_inputs = {"arxiv_id": arxiv_id, "loading_method": loading_method, "run_id": run_id}
     try:
-        data = _get_paper_qa_service().build_qa_index(arxiv_id, loading_method=loading_method)
+        service_kwargs: Dict[str, Any] = {"loading_method": loading_method}
+        if run_id:
+            service_kwargs["run_id"] = run_id
+        data = _get_paper_qa_service().build_qa_index(arxiv_id, **service_kwargs)
         return make_tool_result(
             ok=True,
             tool_name=tool_name,
@@ -113,6 +118,7 @@ def answer_paper_question(
     debug: Optional[bool] = None,
     qa_recovery_strategy: Optional[Dict[str, Any]] = None,
     index_strategy: Optional[Dict[str, Any]] = None,
+    run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     tool_name = "answer_paper_question"
     trace_inputs = {
@@ -128,6 +134,7 @@ def answer_paper_question(
         "debug": debug,
         "qa_recovery_strategy": qa_recovery_strategy,
         "index_strategy": index_strategy,
+        "run_id": run_id,
     }
     payload = {
         "question": question,
@@ -140,6 +147,8 @@ def answer_paper_question(
         "enable_llm_rerank": enable_llm_rerank,
         "enable_context_expansion": enable_context_expansion,
         "debug": debug,
+        # Agent 工具调用传入的 run_id 只用于日志/trace 串联，不改变 QA 参数语义。
+        "run_id": run_id,
     }
     _apply_qa_recovery_strategy(payload, qa_recovery_strategy)
     if index_strategy:

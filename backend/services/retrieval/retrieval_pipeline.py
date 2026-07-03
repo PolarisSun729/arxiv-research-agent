@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from typing import Any, Dict, Optional
 
 from services.retrieval.contracts import RetrievalOptions, RetrievalPipelineResult, RerankResult
 from services.retrieval.context_expansion import ContextBudgetSelector, ContextExpansionPreparer
 from services.retrieval.execution import RouteExecutionSupport
+from utils.logging_utils import info_event
 logger = logging.getLogger(__name__)
 
 
@@ -57,6 +59,7 @@ class RetrievalPipeline:
         paper_context: Optional[Dict[str, Any]] = None,
         options: Optional[RetrievalOptions] = None,
     ) -> Dict[str, Any]:
+        started = perf_counter()
         options = options or RetrievalOptions()
         runtime = self._resolve_runtime_options(options)
         normalized_collection_name = self.collection_resolver(collection_name)
@@ -243,6 +246,25 @@ class RetrievalPipeline:
                 context_budget=context_budget,
             )
 
+        trace_path = trace_export.get("json") if isinstance(trace_export, dict) else None
+        rerank_debug = rerank_result.rerank_debug if isinstance(rerank_result.rerank_debug, dict) else {}
+        info_event(
+            logger,
+            "retrieval.done",
+            run_id=(paper_context or {}).get("run_id") if isinstance(paper_context, dict) else None,
+            arxiv_id=(paper_context or {}).get("arxiv_id") if isinstance(paper_context, dict) else None,
+            collection_name=normalized_collection_name,
+            input=user_query,
+            raw_count=len(fusion_result.raw_retrieval_top_n),
+            fused_count=len(fusion_result.fused_top_n),
+            reranked_count=len(rerank_result.reranked_results),
+            final_count=len(final_context_top15),
+            rerank_enabled=runtime["enable_llm_rerank"],
+            rerank_mode=rerank_debug.get("mode"),
+            fallback_reason=rerank_debug.get("reason") if not bool(rerank_debug.get("applied")) else None,
+            elapsed_ms=round((perf_counter() - started) * 1000, 1),
+            trace_path=trace_path,
+        )
         return RetrievalPipelineResult(
             chunks=final_context_top15,
             debug=debug,

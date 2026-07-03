@@ -18,8 +18,15 @@ from routers.paper_router import router as paper_router
 from routers.qa_router import router as qa_router
 from routers.user_router import router as user_router
 from utils.config import get_debug_routes_runtime_config
+from utils.logging_utils import configure_backend_logging, info_event
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+LOGGING_RUNTIME_CONFIG = configure_backend_logging()
+logger = logging.getLogger(__name__)
+
+
+def _uvicorn_log_level(level_name: str | None) -> str:
+    normalized = str(level_name or "INFO").lower()
+    return normalized if normalized in {"critical", "error", "warning", "info", "debug", "trace"} else "info"
 
 
 def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None = None) -> FastAPI:
@@ -35,7 +42,7 @@ def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None
     async def lifespan(app: FastAPI):
         # 使用 lifespan 替代 on_event，避免 FastAPI 的弃用警告。
         # 同时保持预加载行为不变。
-        logging.getLogger(__name__).info("Backend service load mode: %s", resolved_load_mode)
+        info_event(logger, "backend.startup", load_mode=resolved_load_mode)
         try:
             # 上下文生命周期清理只处理 checkpoint/debug/trace 边界，不触碰原始聊天历史和 session summary。
             from services.context_lifecycle import ContextLifecycleService
@@ -44,9 +51,9 @@ def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None
             cleanup_result = ContextLifecycleService().run_startup_cleanup(
                 trace_export_dir=get_enhanced_retrieval_runtime_config().get("trace_export_dir"),
             )
-            logging.getLogger(__name__).info("Context lifecycle startup cleanup: %s", cleanup_result)
+            info_event(logger, "backend.startup_cleanup_done", output=cleanup_result)
         except Exception as exc:
-            logging.getLogger(__name__).warning("Context lifecycle startup cleanup skipped: %s", exc)
+            logger.warning("Context lifecycle startup cleanup skipped: %s", exc)
         if resolved_load_mode == "preload":
             warm_up_services(resolved_load_mode)
 
@@ -120,9 +127,9 @@ def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None
         from routers.chunk_router import router as chunk_debug_router
 
         app.include_router(chunk_debug_router, prefix="/api")
-        logging.getLogger(__name__).info("Debug routes enabled: /api/debug/chunks")
+        info_event(logger, "backend.debug_routes", enabled=True, route="/api/debug/chunks")
     else:
-        logging.getLogger(__name__).info("Debug routes disabled")
+        info_event(logger, "backend.debug_routes", enabled=False)
 
     return app
 
@@ -147,5 +154,7 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8001,
         reload=False,
-        log_level="debug",
+        # uvicorn 自身跟随后端日志级别；access log 单独可控，避免 HTTP 访问行淹没业务事件。
+        log_level=_uvicorn_log_level(str(LOGGING_RUNTIME_CONFIG.get("level") or "INFO")),
+        access_log=bool(LOGGING_RUNTIME_CONFIG.get("access_log", False)),
     )

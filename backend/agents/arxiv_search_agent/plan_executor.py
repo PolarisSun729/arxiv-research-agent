@@ -9,6 +9,7 @@ from langgraph.types import interrupt
 from pydantic import ValidationError
 from services.storage import database_service as database_service_module
 from utils.config import get_agent_runtime_checkpoint_config
+from utils.logging_utils import info_event
 
 from . import tool_registry as agent_tool_registry
 from .fallbacks import build_fallback_record
@@ -40,6 +41,44 @@ invoke_backend_tool = agent_tool_registry.invoke_backend_tool
 DatabaseService = database_service_module.DatabaseService
 _DEFAULT_CHECKPOINT_USER_ID = str(getattr(database_service_module, "DEFAULT_USER_ID", "") or "").strip()
 DEFAULT_USER_ID = _DEFAULT_CHECKPOINT_USER_ID or "default"
+
+
+def _state_run_id(state: AgentState) -> Optional[str]:
+    """从 AgentState 内部上下文取日志关联 ID；缺失时回退 session_id，保证 INFO 可串联。"""
+    context = state.context if isinstance(state.context, Mapping) else {}
+    debug = state.debug if isinstance(state.debug, Mapping) else {}
+    value = context.get("run_id") or debug.get("run_id") or state.session_id
+    text = str(value or "").strip()
+    return text or None
+
+
+def _tool_result_count(result: ToolExecutionResult) -> Optional[int]:
+    data = result.data
+    if isinstance(data, Mapping):
+        for key in ("papers", "sources", "chunks", "results", "items"):
+            value = data.get(key)
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+                return len(value)
+    return None
+
+
+def _log_plan_done(state: AgentState, goal: Goal, plan: ExecutablePlan, planning_debug: Mapping[str, Any]) -> None:
+    planner_summary = dict(planning_debug.get("planner_summary") or {}) if isinstance(planning_debug, Mapping) else {}
+    info_event(
+        logger,
+        "arxiv_agent.plan_done",
+        run_id=_state_run_id(state),
+        session_id=state.session_id,
+        goal_type=getattr(goal, "goal_type", None),
+        step_count=len(list(getattr(plan, "steps", []) or [])),
+        requested_path=planner_summary.get("requested_path"),
+        selected_path=planner_summary.get("selected_path"),
+        final_path=planner_summary.get("final_path"),
+        llm_attempted=planner_summary.get("llm_draft_attempted"),
+        llm_valid=planner_summary.get("llm_draft_valid"),
+        fallback=planner_summary.get("fallback_used"),
+        fallback_reason=planner_summary.get("fallback_reason"),
+    )
 
 
 def _utcnow() -> str:
@@ -183,7 +222,7 @@ def _approved_step_ids_from_checkpoint(
     checkpoint_plan_id = _plan_id_from_value(runtime_state.get("plan") if isinstance(runtime_state, Mapping) else None)
     current_plan_id = _current_plan_id(runtime, state)
     if checkpoint_plan_id and current_plan_id and checkpoint_plan_id != current_plan_id:
-        logger.info(
+        logger.debug(
             "arxiv_agent checkpoint approval ignored: step_id=%s checkpoint_plan_id=%s current_plan_id=%s",
             step.step_id,
             checkpoint_plan_id,
@@ -195,7 +234,7 @@ def _approved_step_ids_from_checkpoint(
     checkpoint_goal_type = _checkpoint_goal_type_from_runtime_state(runtime_state)
     current_goal_type = _current_goal_type(runtime, state)
     if checkpoint_goal_type and current_goal_type and checkpoint_goal_type != current_goal_type:
-        logger.info(
+        logger.debug(
             "arxiv_agent checkpoint approval ignored: step_id=%s checkpoint_goal_type=%s current_goal_type=%s",
             step.step_id,
             checkpoint_goal_type,
@@ -254,7 +293,7 @@ def _checkpoint_approved_step_ids_for_state(
             if fallback_approved_step_ids and isinstance(fallback_checkpoint, Mapping):
                 valid_fallbacks.append((fallback_checkpoint, fallback_approved_step_ids))
         if len(valid_fallbacks) > 1:
-            logger.info(
+            logger.debug(
                 "arxiv_agent checkpoint approval ignored: step_id=%s tool_name=%s reason=ambiguous_thread_fallback candidate_count=%s",
                 step.step_id,
                 step.tool_name,
@@ -263,7 +302,7 @@ def _checkpoint_approved_step_ids_for_state(
             return []
         if valid_fallbacks:
             fallback_checkpoint, fallback_approved_step_ids = valid_fallbacks[0]
-            logger.info(
+            logger.debug(
                 "arxiv_agent checkpoint approval recovered by thread: step_id=%s tool_name=%s state_user_id=%s checkpoint_user_id=%s",
                 step.step_id,
                 step.tool_name,
@@ -1521,7 +1560,8 @@ class PlanExecutor:
             tool_error = tool_input.error
             error_detail = dict(tool_error.detail or {}) if tool_error is not None and isinstance(tool_error.detail, Mapping) else {}
             logger.warning(
-                "arxiv_agent tool input validation failed: step_id=%s tool_name=%s backend_tool=%s adapter=%s input_model=%s error_code=%s failed_stage=%s suggested_recovery=%s input_keys=%s input_types=%s errors=%s raw_input=%s",
+                "arxiv_agent tool input validation failed: run_id=%s step_id=%s tool_name=%s backend_tool=%s adapter=%s input_model=%s error_code=%s failed_stage=%s suggested_recovery=%s input_keys=%s input_types=%s errors=%s raw_input=%s",
+                _state_run_id(state),
                 step.step_id,
                 tool_name,
                 getattr(contract, "backend_tool_name", None),
@@ -1537,19 +1577,23 @@ class PlanExecutor:
             )
             return tool_input
         started = perf_counter()
-        logger.info(
-            "arxiv_agent tool_started: step_id=%s tool_name=%s backend_tool=%s adapter=%s input=%s",
-            step.step_id,
-            tool_name,
-            getattr(contract, "backend_tool_name", None),
-            contract.adapter.__class__.__name__,
-            _safe_compact(tool_input.model_dump() if hasattr(tool_input, "model_dump") else tool_input),
+        info_event(
+            logger,
+            "arxiv_agent.tool_started",
+            run_id=_state_run_id(state),
+            session_id=state.session_id,
+            step_id=step.step_id,
+            tool_name=tool_name,
+            backend_tool=getattr(contract, "backend_tool_name", None),
+            adapter=contract.adapter.__class__.__name__,
+            input=tool_input.model_dump() if hasattr(tool_input, "model_dump") else tool_input,
         )
         try:
             result = contract.adapter.execute(tool_input)
         except Exception:
             logger.exception(
-                "arxiv_agent tool_finished: step_id=%s tool_name=%s backend_tool=%s ok=false error=exception elapsed_ms=%.1f",
+                "arxiv_agent tool_finished: run_id=%s step_id=%s tool_name=%s backend_tool=%s ok=false error=exception elapsed_ms=%.1f",
+                _state_run_id(state),
                 step.step_id,
                 tool_name,
                 getattr(contract, "backend_tool_name", None),
@@ -1558,7 +1602,8 @@ class PlanExecutor:
             raise
         if not isinstance(result, ToolExecutionResult):
             logger.error(
-                "arxiv_agent tool_finished: step_id=%s tool_name=%s ok=false error=adapter_contract_violation returned_type=%s elapsed_ms=%.1f",
+                "arxiv_agent tool_finished: run_id=%s step_id=%s tool_name=%s ok=false error=adapter_contract_violation returned_type=%s elapsed_ms=%.1f",
+                _state_run_id(state),
                 step.step_id,
                 tool_name,
                 type(result).__name__,
@@ -1578,24 +1623,32 @@ class PlanExecutor:
                 tool_name=tool_name,
             )
         if not result.ok:
-            logger.info(
-                "arxiv_agent tool_finished: step_id=%s tool_name=%s backend_tool=%s ok=false error_code=%s message=%s elapsed_ms=%.1f",
-                step.step_id,
-                tool_name,
-                getattr(contract, "backend_tool_name", None),
-                result.error.error_code if result.error else None,
-                result.error.message if result.error else None,
-                (perf_counter() - started) * 1000,
+            info_event(
+                logger,
+                "arxiv_agent.tool_done",
+                run_id=_state_run_id(state),
+                session_id=state.session_id,
+                step_id=step.step_id,
+                tool_name=tool_name,
+                backend_tool=getattr(contract, "backend_tool_name", None),
+                ok=False,
+                error_code=result.error.error_code if result.error else None,
+                message=result.error.message if result.error else None,
+                elapsed_ms=round((perf_counter() - started) * 1000, 1),
             )
             return result
         validated_result = self._validate_tool_output(contract, result)
-        logger.info(
-            "arxiv_agent tool_finished: step_id=%s tool_name=%s backend_tool=%s ok=%s elapsed_ms=%.1f",
-            step.step_id,
-            tool_name,
-            getattr(contract, "backend_tool_name", None),
-            getattr(validated_result, "ok", None),
-            (perf_counter() - started) * 1000,
+        info_event(
+            logger,
+            "arxiv_agent.tool_done",
+            run_id=_state_run_id(state),
+            session_id=state.session_id,
+            step_id=step.step_id,
+            tool_name=tool_name,
+            backend_tool=getattr(contract, "backend_tool_name", None),
+            ok=getattr(validated_result, "ok", None),
+            result_count=_tool_result_count(validated_result),
+            elapsed_ms=round((perf_counter() - started) * 1000, 1),
         )
         return validated_result
 
@@ -1675,6 +1728,9 @@ class PlanExecutor:
             payload.setdefault("user_id", state.user_id)
         if tool_name in {"load_user_profile", "generate_recommendations", "answer_paper_question"}:
             payload.setdefault("message", state.message)
+        if tool_name in {"answer_paper_question", "check_paper_index", "parse_and_index_paper"}:
+            # QA 子链路需要沿用 Agent 请求 ID，才能把 tool、索引、检索和最终回答串成同一条 INFO 时间线。
+            payload.setdefault("run_id", _state_run_id(state))
         if tool_name == "analyze_ambiguity":
             # 结构化澄清要根据现有上下文判断“缺的到底是什么”，而不是回退成只看 message 的占位逻辑。
             payload.setdefault("context", dict(state.context or {}) if isinstance(state.context, Mapping) else {})
@@ -2107,18 +2163,26 @@ class PlanExecutor:
         if state.runtime_state is not None:
             runtime_approved_step_ids.extend(list(state.runtime_state.approved_step_ids or []))
         if step.step_id in runtime_approved_step_ids:
-            logger.info(
-                "arxiv_agent confirmation bypassed: step_id=%s tool_name=%s source=runtime_approved_step_ids",
-                step.step_id,
-                step.tool_name,
+            info_event(
+                logger,
+                "arxiv_agent.confirmation_bypassed",
+                run_id=_state_run_id(state),
+                session_id=state.session_id,
+                step_id=step.step_id,
+                tool_name=step.tool_name,
+                source="runtime_approved_step_ids",
             )
             return False
         approved_step_ids = context.get("approved_step_ids")
         if isinstance(approved_step_ids, list) and step.step_id in approved_step_ids:
-            logger.info(
-                "arxiv_agent confirmation bypassed: step_id=%s tool_name=%s source=context_approved_step_ids",
-                step.step_id,
-                step.tool_name,
+            info_event(
+                logger,
+                "arxiv_agent.confirmation_bypassed",
+                run_id=_state_run_id(state),
+                session_id=state.session_id,
+                step_id=step.step_id,
+                tool_name=step.tool_name,
+                source="context_approved_step_ids",
             )
             return False
         checkpoint_approved_step_ids = _checkpoint_approved_step_ids_for_state(
@@ -2134,22 +2198,29 @@ class PlanExecutor:
                 runtime=runtime,
                 approved_step_ids=checkpoint_approved_step_ids,
             )
-            logger.info(
-                "arxiv_agent confirmation bypassed: step_id=%s tool_name=%s source=runtime_checkpoint_approved_step_ids",
-                step.step_id,
-                step.tool_name,
+            info_event(
+                logger,
+                "arxiv_agent.confirmation_bypassed",
+                run_id=_state_run_id(state),
+                session_id=state.session_id,
+                step_id=step.step_id,
+                tool_name=step.tool_name,
+                source="runtime_checkpoint_approved_step_ids",
             )
             return False
         pending_action = state.pending_action if isinstance(state.pending_action, Mapping) else {}
         # pending_action 是前端展示镜像，不能作为批准真源；只保留日志摘要辅助排查展示态残留。
-        logger.info(
-            "arxiv_agent confirmation required: step_id=%s tool_name=%s runtime_approved=%s context_approved=%s checkpoint_approved=%s pending_status=%s",
-            step.step_id,
-            step.tool_name,
-            runtime_approved_step_ids,
-            approved_step_ids if isinstance(approved_step_ids, list) else [],
-            checkpoint_approved_step_ids,
-            pending_action.get("status"),
+        info_event(
+            logger,
+            "arxiv_agent.confirmation_required",
+            run_id=_state_run_id(state),
+            session_id=state.session_id,
+            step_id=step.step_id,
+            tool_name=step.tool_name,
+            runtime_approved_count=len(runtime_approved_step_ids),
+            context_approved_count=len(approved_step_ids) if isinstance(approved_step_ids, list) else 0,
+            checkpoint_approved_count=len(checkpoint_approved_step_ids),
+            pending_status=pending_action.get("status"),
         )
         return True
 
@@ -2424,16 +2495,19 @@ class PlanExecutor:
         }
         self._append_trace(runtime, step, event="confirmation_approved", status=trace_status or next_step_status, detail=trace_detail)
         self._append_trace(runtime, step, event="confirmation_consumed", status=trace_status or next_step_status, detail={**trace_detail, "decision": "approve"})
-        logger.info(
-            "arxiv_agent confirmation_approved: step_id=%s tool_name=%s request_type=%s pending_action_id=%s source=%s next_status=%s",
-            target_step_id,
-            target_tool_name,
-            confirmation_request.request_type,
-            confirmation_request.pending_action_id,
-            source,
-            current_step_status,
+        info_event(
+            logger,
+            "arxiv_agent.confirmation_approved",
+            run_id=_state_run_id(state),
+            session_id=state.session_id,
+            step_id=target_step_id,
+            tool_name=target_tool_name,
+            request_type=confirmation_request.request_type,
+            pending_action_id=confirmation_request.pending_action_id,
+            source=source,
+            next_status=current_step_status,
         )
-        logger.info(
+        logger.debug(
             "arxiv_agent confirmation_consumed: step_id=%s tool_name=%s decision=approve pending_action_id=%s source=%s",
             target_step_id,
             target_tool_name,
@@ -2489,15 +2563,18 @@ class PlanExecutor:
         }
         self._append_trace(runtime, step, event="confirmation_rejected", status="skipped", detail=trace_detail)
         self._append_trace(runtime, step, event="confirmation_consumed", status="skipped", detail={**trace_detail, "decision": "reject"})
-        logger.info(
-            "arxiv_agent confirmation_rejected: step_id=%s tool_name=%s request_type=%s pending_action_id=%s source=%s",
-            step.step_id,
-            step.tool_name,
-            confirmation_request.request_type,
-            confirmation_request.pending_action_id,
-            source,
+        info_event(
+            logger,
+            "arxiv_agent.confirmation_rejected",
+            run_id=_state_run_id(state),
+            session_id=state.session_id,
+            step_id=step.step_id,
+            tool_name=step.tool_name,
+            request_type=confirmation_request.request_type,
+            pending_action_id=confirmation_request.pending_action_id,
+            source=source,
         )
-        logger.info(
+        logger.debug(
             "arxiv_agent confirmation_consumed: step_id=%s tool_name=%s decision=reject pending_action_id=%s source=%s",
             step.step_id,
             step.tool_name,
@@ -2604,14 +2681,17 @@ class PlanExecutor:
                 "finished_at": runtime.last_step_output.get("finished_at"),
             },
         )
-        logger.info(
-            "arxiv_agent paper target confirmed: step_id=%s tool_name=%s pending_action_id=%s paper_id=%s arxiv_id=%s source=%s",
-            step.step_id,
-            step.tool_name,
-            confirmation_request.pending_action_id,
-            confirmed_output.get("confirmed_paper_id"),
-            confirmed_output.get("confirmed_arxiv_id"),
-            candidate.get("source_label") or candidate.get("source") or candidate.get("source_type"),
+        info_event(
+            logger,
+            "arxiv_agent.paper_target_confirmed",
+            run_id=_state_run_id(state),
+            session_id=state.session_id,
+            step_id=step.step_id,
+            tool_name=step.tool_name,
+            pending_action_id=confirmation_request.pending_action_id,
+            paper_id=confirmed_output.get("confirmed_paper_id"),
+            arxiv_id=confirmed_output.get("confirmed_arxiv_id"),
+            source=candidate.get("source_label") or candidate.get("source") or candidate.get("source_type"),
         )
         return True
 
@@ -2750,19 +2830,22 @@ class PlanExecutor:
                 "started_at": started_at,
             },
         )
-        logger.info(
-            "arxiv_agent confirmation_created: step_id=%s tool_name=%s request_type=%s pending_action_id=%s side_effect_level=%s allowed_decisions=%s candidate_count=%s default_candidate_id=%s candidate_sources=%s reference_hint=%s original_message=%r",
-            confirmation_request.step_id,
-            confirmation_request.tool_name,
-            confirmation_request.request_type,
-            confirmation_request.pending_action_id,
-            confirmation_request.side_effect_level,
-            [item.code for item in list(confirmation_request.allowed_decisions or [])],
-            len(confirmation_request.candidates or []),
-            confirmation_request.default_candidate_id,
-            candidate_sources,
-            _safe_compact(confirmation_request.reference_hint),
-            confirmation_request.original_message or confirmation_request.original_question,
+        info_event(
+            logger,
+            "arxiv_agent.confirmation_created",
+            run_id=_state_run_id(state),
+            session_id=state.session_id,
+            step_id=confirmation_request.step_id,
+            tool_name=confirmation_request.tool_name,
+            request_type=confirmation_request.request_type,
+            pending_action_id=confirmation_request.pending_action_id,
+            side_effect_level=confirmation_request.side_effect_level,
+            allowed_decisions=[item.code for item in list(confirmation_request.allowed_decisions or [])],
+            candidate_count=len(confirmation_request.candidates or []),
+            default_candidate_id=confirmation_request.default_candidate_id,
+            candidate_sources=candidate_sources,
+            reference_hint=_safe_compact(confirmation_request.reference_hint),
+            input=confirmation_request.original_message or confirmation_request.original_question,
         )
 
         if not allow_interrupt:
@@ -2770,12 +2853,15 @@ class PlanExecutor:
 
         resume_payload = interrupt(confirmation_request.model_dump())
         decision = self._normalize_confirmation_resume_payload(resume_payload)
-        logger.info(
-            "arxiv_agent confirmation resume received: step_id=%s tool_name=%s decision=%s raw_type=%s",
-            step.step_id,
-            step.tool_name,
-            decision,
-            type(resume_payload).__name__,
+        info_event(
+            logger,
+            "arxiv_agent.confirmation_resume_received",
+            run_id=_state_run_id(state),
+            session_id=state.session_id,
+            step_id=step.step_id,
+            tool_name=step.tool_name,
+            decision=decision,
+            raw_type=type(resume_payload).__name__,
         )
         if decision == "approve":
             if confirmation_request.request_type == "paper_target_confirmation":
@@ -2822,12 +2908,16 @@ class PlanExecutor:
         confirmation_request = runtime.pending_confirmation
         resume_payload = interrupt(confirmation_request.model_dump() if confirmation_request is not None else {})
         decision = self._normalize_confirmation_resume_payload(resume_payload)
-        logger.info(
-            "arxiv_agent confirmation resume received: step_id=%s tool_name=%s decision=%s raw_type=%s source=pending_confirmation",
-            step.step_id,
-            step.tool_name,
-            decision,
-            type(resume_payload).__name__,
+        info_event(
+            logger,
+            "arxiv_agent.confirmation_resume_received",
+            run_id=_state_run_id(state),
+            session_id=state.session_id,
+            step_id=step.step_id,
+            tool_name=step.tool_name,
+            decision=decision,
+            raw_type=type(resume_payload).__name__,
+            source="pending_confirmation",
         )
         if decision != "approve":
             return decision
@@ -2897,6 +2987,7 @@ def run_agent_turn(state: AgentState, tool_registry: ToolRegistry = PLANNER_TOOL
     state.execution_plan = plan
     state.debug = dict(state.debug or {})
     state.debug["planner"] = planning_debug
+    _log_plan_done(state, goal, plan, planning_debug)
     result = PlanExecutor(tool_registry=tool_registry).execute(plan, state)
     if result.runtime is not None:
         state.plan_runtime = result.runtime
@@ -2910,6 +3001,7 @@ def run_agent_turn_in_graph(state: AgentState, tool_registry: ToolRegistry = PLA
     state.execution_plan = plan
     state.debug = dict(state.debug or {})
     state.debug["planner"] = planning_debug
+    _log_plan_done(state, goal, plan, planning_debug)
     runtime = build_plan_runtime(state, goal=plan.goal, plan=plan, turn_status="success")
     runtime.step_status = {step.step_id: "pending" for step in list(plan.steps or [])}
     runtime.outputs = {}

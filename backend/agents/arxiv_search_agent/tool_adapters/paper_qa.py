@@ -76,6 +76,7 @@ class CheckPaperIndexInput(BaseModel):
 
     paper_ref: Optional[Dict[str, Any]] = None
     paper_reference: Optional[Dict[str, Any]] = None
+    run_id: Optional[str] = None
 
     @property
     def arxiv_id(self) -> str:
@@ -104,6 +105,7 @@ class ParseAndIndexPaperInput(BaseModel):
 
     paper_reference: Optional[Dict[str, Any]] = None
     paper_ref: Optional[Dict[str, Any]] = None
+    run_id: Optional[str] = None
 
     @model_validator(mode="after")
     def _require_arxiv_id(self) -> "ParseAndIndexPaperInput":
@@ -132,6 +134,7 @@ class AnswerPaperQuestionInput(BaseModel):
     paper_reference: Optional[Dict[str, Any]] = None
     message: Optional[str] = None
     question: Optional[str] = None
+    run_id: Optional[str] = None
     qa_recovery_strategy: Optional[Dict[str, Any]] = None
     index_strategy: Optional[Dict[str, Any]] = None
 
@@ -316,9 +319,13 @@ class CheckPaperIndexAdapter(BaseToolAdapter[CheckPaperIndexInput, PaperIndexSta
                 )
             return PaperIndexStatusOutput(status="missing", has_index=False)
         started = perf_counter()
-        logger.info("arxiv_agent paper qa index check started: arxiv_id=%s", tool_input.arxiv_id)
-        tool_result = self.invoke_backend_tool("check_paper_qa_index", arxiv_id=tool_input.arxiv_id)
-        logger.info(
+        logger.debug("arxiv_agent paper qa index check started: arxiv_id=%s", tool_input.arxiv_id)
+        tool_kwargs: Dict[str, Any] = {"arxiv_id": tool_input.arxiv_id}
+        if tool_input.run_id:
+            # run_id 只用于工具 trace 关联，索引状态检查本身不依赖它做业务判断。
+            tool_kwargs["run_id"] = tool_input.run_id
+        tool_result = self.invoke_backend_tool("check_paper_qa_index", **tool_kwargs)
+        logger.debug(
             "arxiv_agent paper qa index check finished: arxiv_id=%s ok=%s elapsed_ms=%.1f",
             tool_input.arxiv_id,
             (tool_result or {}).get("ok") if isinstance(tool_result, Mapping) else None,
@@ -357,11 +364,15 @@ class ParseAndIndexPaperAdapter(BaseToolAdapter[ParseAndIndexPaperInput, IndexBu
         return result
 
     def _run(self, tool_input: ParseAndIndexPaperInput) -> IndexBuildOutput:
-        # 解析和索引构建通常耗时最长，adapter 层日志能直接证明后端工具是否已经真正开始执行。
+        # adapter 层只保留 DEBUG 边界日志；INFO 由 executor 和 index builder 统一输出，避免主时间线重复。
         started = perf_counter()
-        logger.info("arxiv_agent paper qa index build started: arxiv_id=%s", tool_input.arxiv_id)
-        tool_result = self.invoke_backend_tool("build_paper_qa_index", arxiv_id=tool_input.arxiv_id)
-        logger.info(
+        logger.debug("arxiv_agent paper qa index build started: arxiv_id=%s", tool_input.arxiv_id)
+        tool_kwargs: Dict[str, Any] = {"arxiv_id": tool_input.arxiv_id}
+        if tool_input.run_id:
+            # 构建链路耗时较长，run_id 需要继续传到 index builder 才能串起 Agent 和 QA 索引日志。
+            tool_kwargs["run_id"] = tool_input.run_id
+        tool_result = self.invoke_backend_tool("build_paper_qa_index", **tool_kwargs)
+        logger.debug(
             "arxiv_agent paper qa index build finished: arxiv_id=%s ok=%s elapsed_ms=%.1f",
             tool_input.arxiv_id,
             (tool_result or {}).get("ok") if isinstance(tool_result, Mapping) else None,
@@ -396,6 +407,9 @@ class AnswerPaperQuestionAdapter(BaseToolAdapter[AnswerPaperQuestionInput, Paper
 
     def _run(self, tool_input: AnswerPaperQuestionInput) -> PaperQAAnswerOutput:
         tool_kwargs: Dict[str, Any] = {"arxiv_id": tool_input.arxiv_id, "question": tool_input.resolved_question}
+        if tool_input.run_id:
+            # run_id 只用于日志/trace 关联，不参与 QA 业务判断。
+            tool_kwargs["run_id"] = tool_input.run_id
         # recovery 策略只以结构化 payload 传递给 PaperQAService，避免在 adapter 里散落临时参数。
         if tool_input.qa_recovery_strategy:
             tool_kwargs["qa_recovery_strategy"] = dict(tool_input.qa_recovery_strategy)

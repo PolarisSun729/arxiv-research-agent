@@ -5,6 +5,7 @@ import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Dict, Mapping, Optional
 from uuid import uuid4
 
@@ -21,6 +22,7 @@ from services.context_lifecycle import ContextLifecycleService
 from services.memory import MemoryService
 from services.storage.database_service import DatabaseService
 from utils.config import get_memory_runtime_config
+from utils.logging_utils import RequestTrace, info_event
 
 try:  # pragma: no cover - optional runtime dependency for LLM parsing
     from dependencies import get_generation_service as _get_generation_service
@@ -77,6 +79,18 @@ def _ensure_session_id(session_id: Optional[str]) -> str:
     """
     normalized = str(session_id or "").strip()
     return normalized or str(uuid4())
+
+
+def _write_request_trace(trace: RequestTrace, *, reason: str) -> Optional[str]:
+    """请求 trace 是日志预览的补充；写入失败不能影响真实业务响应。"""
+    try:
+        trace_path = trace.write(reason=reason)
+    except Exception as exc:  # pragma: no cover - trace 写入失败不应阻断主链路
+        logger.warning("request trace write failed: run_id=%s reason=%s error=%s", trace.run_id, reason, exc)
+        return None
+    if trace_path:
+        info_event(logger, "request.trace_written", run_id=trace.run_id, reason=reason, trace_path=trace_path)
+    return trace_path
 
 
 def _build_langgraph_config(thread_id: str) -> Dict[str, Any]:
@@ -490,17 +504,23 @@ def _build_initial_agent_state(
     request_context: Dict[str, Any],
     agent_memory_payload: Optional[Dict[str, Any]],
     user_memory_debug: Dict[str, Any],
+    run_id: str,
 ) -> AgentState:
     """统一构造同步与流式入口共享的初始 AgentState。"""
+    # run_id 只作为日志/trace 关联键进入内部上下文，不改变对外请求和响应契约。
+    state_context = dict(request_context or {})
+    state_context["run_id"] = run_id
+    state_debug = dict(user_memory_debug or {})
+    state_debug["run_id"] = run_id
     return AgentState(
         user_id=normalized_request.user_id,
         session_id=resolved_session_id,
         message=normalized_request.message,
         # 保留业务 memory 的上下文增强职责，但执行现场恢复改由 LangGraph checkpoint 承担。
-        context=request_context,
+        context=state_context,
         pending_action=_backend_context_value(agent_memory_payload, "pending_action"),
         paper_qa_result=_backend_context_value(agent_memory_payload, "paper_qa_result"),
-        debug=dict(user_memory_debug or {}),
+        debug=state_debug,
     )
 
 
@@ -517,25 +537,34 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
 
     这里不直接暴露 LangGraph 细节给上层调用方，而是统一收口成 `ArxivSearchResponse`。
     """
+    run_id = str(uuid4())
+    started = perf_counter()
+    trace = RequestTrace(run_id=run_id, route="arxiv_agent.run", input=request)
+    normalized_request: Optional[ArxivSearchRequest] = None
     try:
         # 第 1 步：先把入参统一规整成 ArxivSearchRequest，避免上层传 dict 时各处重复判断。
         normalized_request = _coerce_request(request)
+        trace.input = normalized_request.message
+        trace.user_id = normalized_request.user_id
 
         # 第 2 步：把前端 context 与后端 Agent session memory 合并。
         request_context, agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(normalized_request)
         resolved_session_id = _ensure_session_id(resolved_session_id)
+        trace.session_id = resolved_session_id
         graph_config = _build_langgraph_config(resolved_session_id)
-        # 入口日志只记录状态摘要，便于排查“前端传了但后端没识别到”的问题，不直接打出完整上下文内容。
-        logger.debug(
-            "arxiv_agent request received: session_id=%s thread_id=%s message=%s context_keys=%s pending_action_status=%s paper_qa_status=%s selected_arxiv_id=%s",
-            resolved_session_id,
-            resolved_session_id,
-            normalized_request.message,
-            sorted(request_context.keys()),
-            _safe_status(request_context.get("pending_action")),
-            _safe_status(request_context.get("paper_qa_result")),
-            _safe_selected_arxiv_id(request_context),
+        info_event(
+            logger,
+            "arxiv_agent.request_start",
+            run_id=run_id,
+            session_id=resolved_session_id,
+            user_id=normalized_request.user_id,
+            input=normalized_request.message,
+            context_keys=sorted(request_context.keys()),
+            pending_action_status=_safe_status(request_context.get("pending_action")),
+            paper_qa_status=_safe_status(request_context.get("paper_qa_result")),
+            selected_arxiv_id=_safe_selected_arxiv_id(request_context),
         )
+        trace.add_event("arxiv_agent.request_start", session_id=resolved_session_id, user_id=normalized_request.user_id)
         # 第 3 步：解析生成服务，并统一构造图对象。
         database_service = DatabaseService()
         checkpoint_manager = _build_runtime_checkpoint_manager(database_service)
@@ -553,16 +582,18 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
             # resume 路径必须复用同一个 thread_id，并直接从 interrupt 位置恢复，
             # 不能重新构造一轮完整业务初始状态，否则会把确认恢复退化回“伪恢复”。
             resume_payload = _build_resume_payload(normalized_request.resume)
-            logger.info(
-                "arxiv_agent resume received: session_id=%s thread_id=%s decision=%s step_id=%s tool_name=%s pending_action_id=%s interrupt_id=%s",
-                resolved_session_id,
-                resolved_session_id,
-                resume_payload.get("decision"),
-                resume_payload.get("step_id"),
-                resume_payload.get("tool_name"),
-                resume_payload.get("pending_action_id"),
-                resume_payload.get("interrupt_id"),
+            info_event(
+                logger,
+                "arxiv_agent.resume_received",
+                run_id=run_id,
+                session_id=resolved_session_id,
+                decision=resume_payload.get("decision"),
+                step_id=resume_payload.get("step_id"),
+                tool_name=resume_payload.get("tool_name"),
+                pending_action_id=resume_payload.get("pending_action_id"),
+                interrupt_id=resume_payload.get("interrupt_id"),
             )
+            trace.add_event("arxiv_agent.resume_received", decision=resume_payload.get("decision"), step_id=resume_payload.get("step_id"))
             _ensure_resume_checkpoint(
                 graph,
                 resolved_session_id,
@@ -571,12 +602,14 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
                 session_id=resolved_session_id,
                 resume_payload=resume_payload,
             )
-            logger.info(
-                "arxiv_agent resume checkpoint validated: session_id=%s step_id=%s tool_name=%s pending_action_id=%s",
-                resolved_session_id,
-                resume_payload.get("step_id"),
-                resume_payload.get("tool_name"),
-                resume_payload.get("pending_action_id"),
+            info_event(
+                logger,
+                "arxiv_agent.resume_checkpoint_validated",
+                run_id=run_id,
+                session_id=resolved_session_id,
+                step_id=resume_payload.get("step_id"),
+                tool_name=resume_payload.get("tool_name"),
+                pending_action_id=resume_payload.get("pending_action_id"),
             )
             final_state = _coerce_state(graph.invoke(Command(resume=resume_payload), config=graph_config))
         else:
@@ -586,6 +619,7 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
                 request_context=request_context,
                 agent_memory_payload=agent_memory_payload,
                 user_memory_debug=user_memory_debug,
+                run_id=run_id,
             )
             # 普通请求仍从完整初始状态进入主图，保持搜索/推荐/QA 等非确认链路行为不变。
             final_state = _coerce_state(graph.invoke(initial_state.model_dump(), config=graph_config))
@@ -595,14 +629,54 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
         _persist_agent_session_memory(final_state)
 
         # 第 6 步：把内部状态转换成对外响应模型。
-        return _state_to_response(final_state)
+        final_response = _state_to_response(final_state)
+        if final_state.fallback_reason:
+            trace.mark_fallback()
+        trace.set_output(final_response.model_dump())
+        trace.add_event(
+            "arxiv_agent.request_done",
+            status="success",
+            intent=final_response.intent,
+            paper_count=len(final_response.papers or []),
+        )
+        trace_path = _write_request_trace(trace, reason="auto")
+        info_event(
+            logger,
+            "arxiv_agent.request_done",
+            run_id=run_id,
+            session_id=resolved_session_id,
+            user_id=normalized_request.user_id,
+            status="success",
+            intent=final_response.intent,
+            paper_count=len(final_response.papers or []),
+            output=final_response.answer,
+            elapsed_ms=round((perf_counter() - started) * 1000, 1),
+            trace_path=trace_path,
+        )
+        return final_response
     except ValidationError as exc:
-        logger.exception("arxiv_agent request validation failed: message=%s", normalized_request.message)
-        return _build_error_response(
+        message = normalized_request.message if normalized_request is not None else ""
+        logger.exception("arxiv_agent request validation failed: run_id=%s message=%s", run_id, message)
+        error_response = _build_error_response(
             message="请求参数校验失败",
             detail=str(exc),
             code=ErrorCode.REQUEST_VALIDATION_ERROR,
         )
+        trace.mark_failed()
+        trace.set_output(error_response.model_dump())
+        trace.add_event("arxiv_agent.request_done", status="error", code=ErrorCode.REQUEST_VALIDATION_ERROR)
+        trace_path = _write_request_trace(trace, reason="validation_error")
+        info_event(
+            logger,
+            "arxiv_agent.request_done",
+            run_id=run_id,
+            status="error",
+            code=ErrorCode.REQUEST_VALIDATION_ERROR,
+            output=error_response.answer,
+            elapsed_ms=round((perf_counter() - started) * 1000, 1),
+            trace_path=trace_path,
+        )
+        return error_response
     except ResumeCheckpointNotFoundError as exc:
         _log_resume_checkpoint_not_found(
             session_id=resolved_session_id if "resolved_session_id" in locals() else None,
@@ -610,12 +684,29 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
             is_resume=_is_resume_request(normalized_request) if "normalized_request" in locals() else True,
             reason=exc.reason,
         )
-        return _build_resume_checkpoint_not_found_response(
+        error_response = _build_resume_checkpoint_not_found_response(
             session_id=resolved_session_id if "resolved_session_id" in locals() else None,
             detail=str(exc),
         )
+        trace.mark_failed()
+        trace.set_output(error_response.model_dump())
+        trace.add_event("arxiv_agent.request_done", status="error", code=RESUME_CHECKPOINT_NOT_FOUND_CODE)
+        trace_path = _write_request_trace(trace, reason="resume_checkpoint_not_found")
+        info_event(
+            logger,
+            "arxiv_agent.request_done",
+            run_id=run_id,
+            session_id=resolved_session_id if "resolved_session_id" in locals() else None,
+            status="error",
+            code=RESUME_CHECKPOINT_NOT_FOUND_CODE,
+            output=error_response.answer,
+            elapsed_ms=round((perf_counter() - started) * 1000, 1),
+            trace_path=trace_path,
+        )
+        return error_response
     except Exception as exc:
-        logger.exception("arxiv_agent runtime failed: session_id=%s message=%s", resolved_session_id if 'resolved_session_id' in locals() else None, normalized_request.message)
+        message = normalized_request.message if normalized_request is not None else ""
+        logger.exception("arxiv_agent runtime failed: run_id=%s session_id=%s message=%s", run_id, resolved_session_id if 'resolved_session_id' in locals() else None, message)
         if "checkpoint_manager" in locals():
             _mark_runtime_checkpoint_failed(
                 checkpoint_manager,
@@ -623,11 +714,28 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
                 session_id=resolved_session_id if "resolved_session_id" in locals() else None,
                 detail=str(exc),
             )
-        return _build_error_response(
+        error_response = _build_error_response(
             message="arXiv 搜索 Agent 运行失败",
             detail=str(exc),
             code=ErrorCode.AGENT_RUNTIME_ERROR,
         )
+        trace.mark_failed()
+        trace.set_output(error_response.model_dump())
+        trace.add_event("arxiv_agent.request_done", status="error", code=ErrorCode.AGENT_RUNTIME_ERROR)
+        trace_path = _write_request_trace(trace, reason="runtime_error")
+        info_event(
+            logger,
+            "arxiv_agent.request_done",
+            run_id=run_id,
+            session_id=resolved_session_id if "resolved_session_id" in locals() else None,
+            user_id=normalized_request.user_id if normalized_request is not None else None,
+            status="error",
+            code=ErrorCode.AGENT_RUNTIME_ERROR,
+            output=error_response.answer,
+            elapsed_ms=round((perf_counter() - started) * 1000, 1),
+            trace_path=trace_path,
+        )
+        return error_response
 
 
 def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
@@ -650,24 +758,33 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
         # run_id 和 sequence 一起构成了一次流式执行的事件主线。
         run_id = str(uuid4())
         sequence = 1
+        started = perf_counter()
+        trace = RequestTrace(run_id=run_id, route="arxiv_agent.stream", input=normalized_request.message)
+        event_count = 0
+        tool_count = 0
+        confirmation_count = 0
         current_state: Optional[AgentState] = None
 
         try:
             # 阶段 B：构造与同步入口一致的初始上下文和状态，保证两条路径行为一致。
             request_context, agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(normalized_request)
             resolved_session_id = _ensure_session_id(resolved_session_id)
+            trace.session_id = resolved_session_id
+            trace.user_id = normalized_request.user_id
             graph_config = _build_langgraph_config(resolved_session_id)
-            logger.info(
-                "arxiv_agent stream start: run_id=%s session_id=%s thread_id=%s message=%s context_keys=%s pending_action_status=%s paper_qa_status=%s selected_arxiv_id=%s",
-                run_id,
-                resolved_session_id,
-                resolved_session_id,
-                normalized_request.message,
-                sorted(request_context.keys()),
-                _safe_status(request_context.get("pending_action")),
-                _safe_status(request_context.get("paper_qa_result")),
-                _safe_selected_arxiv_id(request_context),
+            info_event(
+                logger,
+                "arxiv_agent.stream_start",
+                run_id=run_id,
+                session_id=resolved_session_id,
+                user_id=normalized_request.user_id,
+                input=normalized_request.message,
+                context_keys=sorted(request_context.keys()),
+                pending_action_status=_safe_status(request_context.get("pending_action")),
+                paper_qa_status=_safe_status(request_context.get("paper_qa_result")),
+                selected_arxiv_id=_safe_selected_arxiv_id(request_context),
             )
+            trace.add_event("arxiv_agent.stream_start", session_id=resolved_session_id, user_id=normalized_request.user_id)
             database_service = DatabaseService()
             checkpoint_manager = _build_runtime_checkpoint_manager(database_service)
             checkpoint_manager.expire_and_cleanup()
@@ -685,17 +802,18 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
             resume_approved_step_id: Optional[str] = None
             if _is_resume_request(normalized_request):
                 resume_payload = _build_resume_payload(normalized_request.resume)
-                logger.info(
-                    "arxiv_agent stream resume received: run_id=%s session_id=%s thread_id=%s decision=%s step_id=%s tool_name=%s pending_action_id=%s interrupt_id=%s",
-                    run_id,
-                    resolved_session_id,
-                    resolved_session_id,
-                    resume_payload.get("decision"),
-                    resume_payload.get("step_id"),
-                    resume_payload.get("tool_name"),
-                    resume_payload.get("pending_action_id"),
-                    resume_payload.get("interrupt_id"),
+                info_event(
+                    logger,
+                    "arxiv_agent.stream_resume_received",
+                    run_id=run_id,
+                    session_id=resolved_session_id,
+                    decision=resume_payload.get("decision"),
+                    step_id=resume_payload.get("step_id"),
+                    tool_name=resume_payload.get("tool_name"),
+                    pending_action_id=resume_payload.get("pending_action_id"),
+                    interrupt_id=resume_payload.get("interrupt_id"),
                 )
+                trace.add_event("arxiv_agent.stream_resume_received", decision=resume_payload.get("decision"), step_id=resume_payload.get("step_id"))
                 _ensure_resume_checkpoint(
                     graph,
                     resolved_session_id,
@@ -704,13 +822,14 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     session_id=resolved_session_id,
                     resume_payload=resume_payload,
                 )
-                logger.info(
-                    "arxiv_agent stream resume checkpoint validated: run_id=%s session_id=%s step_id=%s tool_name=%s pending_action_id=%s",
-                    run_id,
-                    resolved_session_id,
-                    resume_payload.get("step_id"),
-                    resume_payload.get("tool_name"),
-                    resume_payload.get("pending_action_id"),
+                info_event(
+                    logger,
+                    "arxiv_agent.stream_resume_checkpoint_validated",
+                    run_id=run_id,
+                    session_id=resolved_session_id,
+                    step_id=resume_payload.get("step_id"),
+                    tool_name=resume_payload.get("tool_name"),
+                    pending_action_id=resume_payload.get("pending_action_id"),
                 )
                 if str(resume_payload.get("decision") or "").strip().lower() == "approve":
                     resume_approved_step_id = str(resume_payload.get("step_id") or "").strip() or None
@@ -723,6 +842,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     request_context=request_context,
                     agent_memory_payload=agent_memory_payload,
                     user_memory_debug=user_memory_debug,
+                    run_id=run_id,
                 )
                 graph_input = current_state.model_dump()
 
@@ -742,6 +862,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     },
                 )
             )
+            event_count += 1
             sequence += 1
 
             # 阶段 D：逐步消费 LangGraph 的 updates 流，并把节点生命周期翻译成 SSE 事件。
@@ -764,12 +885,14 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                         },
                     )
                 )
+                event_count += 1
                 sequence += 1
 
                 active_tool_call = _active_runtime_tool_call(previous_state, approved_step_id=resume_approved_step_id)
                 tool_call_started = False
                 if active_tool_call is not None and (step_name == "execute_step" or _should_emit_tool_call(previous_state)):
                     tool_call_started = True
+                    tool_count += 1
                     # 子阶段 D-2：如果当前节点会触发工具调用，则补发工具开始事件。
                     yield _sse_event(
                         _make_stream_event(
@@ -783,6 +906,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                             },
                         )
                     )
+                    event_count += 1
                     sequence += 1
 
                 # __interrupt__ 是正常的确认暂停信号，不是 AgentState。
@@ -791,6 +915,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     confirmation_payload = _extract_interrupt_payload(step_payload)
                     if not confirmation_payload:
                         raise ValueError("interrupt payload missing confirmation request")
+                    confirmation_count += 1
                     current_state = _apply_stream_interrupt_state(previous_state, confirmation_payload)
                 else:
                     current_state = _coerce_state(step_payload)
@@ -811,6 +936,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                         },
                     )
                 )
+                event_count += 1
                 sequence += 1
 
                 if tool_call_started:
@@ -828,6 +954,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                             },
                         )
                     )
+                    event_count += 1
                     sequence += 1
 
             # 阶段 E：整张图执行完成后，输出最终聚合响应和结束事件。
@@ -835,6 +962,29 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 _persist_runtime_checkpoint_after_turn(checkpoint_manager, current_state, is_resume=_is_resume_request(normalized_request))
                 _persist_agent_session_memory(current_state)
             final_response = _state_to_response(current_state)
+            trace.set_output(final_response.model_dump())
+            trace.add_event(
+                "arxiv_agent.stream_done",
+                status="success",
+                event_count=event_count,
+                tool_count=tool_count,
+                confirmation_count=confirmation_count,
+            )
+            trace_path = _write_request_trace(trace, reason="auto")
+            info_event(
+                logger,
+                "arxiv_agent.stream_done",
+                run_id=run_id,
+                session_id=resolved_session_id,
+                user_id=normalized_request.user_id,
+                status="success",
+                event_count=event_count,
+                tool_count=tool_count,
+                confirmation_count=confirmation_count,
+                output=final_response.answer,
+                elapsed_ms=round((perf_counter() - started) * 1000, 1),
+                trace_path=trace_path,
+            )
             yield _sse_event(
                 _make_stream_event(
                     event_type="final_response",
@@ -846,6 +996,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     },
                 )
             )
+            event_count += 1
             sequence += 1
             yield _sse_event(
                 _make_stream_event(
@@ -858,6 +1009,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     },
                 )
             )
+            event_count += 1
         except ResumeCheckpointNotFoundError as exc:
             # resume checkpoint 缺失要作为明确业务失败返回，避免前端继续保留失效确认卡片。
             _log_resume_checkpoint_not_found(
@@ -869,6 +1021,25 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
             error_response = _build_resume_checkpoint_not_found_response(
                 session_id=resolved_session_id if "resolved_session_id" in locals() else None,
                 detail=str(exc),
+            )
+            trace.mark_failed()
+            trace.set_output(error_response.model_dump())
+            trace.add_event("arxiv_agent.stream_done", status="error", code=RESUME_CHECKPOINT_NOT_FOUND_CODE)
+            trace_path = _write_request_trace(trace, reason="resume_checkpoint_not_found")
+            info_event(
+                logger,
+                "arxiv_agent.stream_done",
+                run_id=run_id,
+                session_id=resolved_session_id if "resolved_session_id" in locals() else None,
+                user_id=normalized_request.user_id,
+                status="error",
+                code=RESUME_CHECKPOINT_NOT_FOUND_CODE,
+                event_count=event_count,
+                tool_count=tool_count,
+                confirmation_count=confirmation_count,
+                output=error_response.answer,
+                elapsed_ms=round((perf_counter() - started) * 1000, 1),
+                trace_path=trace_path,
             )
             yield _sse_event(
                 _make_stream_event(
@@ -889,6 +1060,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     },
                 )
             )
+            event_count += 1
             sequence += 1
             yield _sse_event(
                 _make_stream_event(
@@ -900,6 +1072,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     },
                 )
             )
+            event_count += 1
             sequence += 1
             yield _sse_event(
                 _make_stream_event(
@@ -913,6 +1086,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     },
                 )
             )
+            event_count += 1
         except Exception as exc:
             # 阶段 F：流式过程中任何异常都转成结构化事件，而不是让连接直接中断。
             # 同时写入 traceback；前端为了稳定体验会展示泛化错误，后端日志必须保留真实失败点。
@@ -935,6 +1109,25 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 detail=str(exc),
                 code=ErrorCode.AGENT_RUNTIME_ERROR,
             )
+            trace.mark_failed()
+            trace.set_output(error_response.model_dump())
+            trace.add_event("arxiv_agent.stream_done", status="error", code=ErrorCode.AGENT_RUNTIME_ERROR)
+            trace_path = _write_request_trace(trace, reason="runtime_error")
+            info_event(
+                logger,
+                "arxiv_agent.stream_done",
+                run_id=run_id,
+                session_id=resolved_session_id if "resolved_session_id" in locals() else None,
+                user_id=normalized_request.user_id,
+                status="error",
+                code=ErrorCode.AGENT_RUNTIME_ERROR,
+                event_count=event_count,
+                tool_count=tool_count,
+                confirmation_count=confirmation_count,
+                output=error_response.answer,
+                elapsed_ms=round((perf_counter() - started) * 1000, 1),
+                trace_path=trace_path,
+            )
             yield _sse_event(
                 _make_stream_event(
                     event_type="exception",
@@ -954,6 +1147,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     },
                 )
             )
+            event_count += 1
             sequence += 1
             yield _sse_event(
                 _make_stream_event(
@@ -965,6 +1159,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     },
                 )
             )
+            event_count += 1
             sequence += 1
             yield _sse_event(
                 _make_stream_event(
@@ -977,6 +1172,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     },
                 )
             )
+            event_count += 1
 
     # 返回真正的 SSE 响应对象，交给 FastAPI 持续推送 event_stream 生成的事件。
     return StreamingResponse(

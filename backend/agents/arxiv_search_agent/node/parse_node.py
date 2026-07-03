@@ -18,6 +18,7 @@ import logging
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from pydantic import ValidationError
+from utils.logging_utils import info_event
 
 from .intent_support import (
     HARD_RULE_PATTERNS,
@@ -48,6 +49,20 @@ from ..utils.state_utils import _append_step, _coerce_state, _compact_search_spe
 from ..utils.text_utils import _extract_json_block, _matches_any, _normalize_optional_str, _normalize_text
 
 logger = logging.getLogger(__name__)
+
+
+def _state_run_id(state: Union[AgentState, Mapping[str, Any]]) -> Optional[str]:
+    """parse 节点兼容旧测试里的 dict state，缺少 run_id 时回退 session_id。"""
+    if isinstance(state, Mapping):
+        context = state.get("context") if isinstance(state.get("context"), Mapping) else {}
+        debug = state.get("debug") if isinstance(state.get("debug"), Mapping) else {}
+        value = context.get("run_id") or debug.get("run_id") or state.get("session_id")
+    else:
+        context = state.context if isinstance(state.context, Mapping) else {}
+        debug = state.debug if isinstance(state.debug, Mapping) else {}
+        value = context.get("run_id") or debug.get("run_id") or state.session_id
+    text = str(value or "").strip()
+    return text or None
 
 
 def _prepare_parse_search_request_input(state: Union[AgentState, Mapping[str, Any]]) -> Dict[str, Any]:
@@ -724,16 +739,19 @@ def parse_search_request(
 
     # 解析阶段单独输出一条轻量日志，方便直接判断是规则命中、LLM 覆盖，还是最终又被兜底降级。
     # 这里只记录意图决策链路和精简后的 search spec，避免把整份 debug 上下文打进日志导致排查噪声过大。
-    logger.info(
-        "arxiv_agent parse decision: message=%s llm_intent=%s llm_confidence=%s rule_intent=%s final_intent=%s intent_source=%s fallback_reason=%s final_search_spec=%s",
-        message,
-        (llm_result or {}).get("intent"),
-        (llm_result or {}).get("confidence"),
-        (rule_result or {}).get("intent"),
-        finalized["intent"],
-        decision["intent_source"],
-        finalized["fallback_reason"],
-        _compact_search_spec(finalized["search_spec"]),
+    info_event(
+        logger,
+        "arxiv_agent.parse_done",
+        run_id=_state_run_id(current_state),
+        session_id=current_state.session_id,
+        input=message,
+        llm_intent=(llm_result or {}).get("intent"),
+        llm_confidence=(llm_result or {}).get("confidence"),
+        rule_intent=(rule_result or {}).get("intent"),
+        final_intent=finalized["intent"],
+        intent_source=decision["intent_source"],
+        fallback_reason=finalized["fallback_reason"],
+        search_spec=_compact_search_spec(finalized["search_spec"]),
     )
 
     return _write_parse_search_request_state(

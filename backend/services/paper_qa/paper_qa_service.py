@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from typing import Any, Callable, Dict, List, Optional
+from uuid import uuid4
 
 from core.errors import AppError, ErrorCode
 from services.arxiv.arxiv_search_service import ArxivSearchService
@@ -23,8 +25,21 @@ from services.paper_qa.question_contextualizer import QuestionContextualizer
 from services.paper_qa.session_service import PaperQASessionService
 from services.storage.vector_store_service import VectorStoreService
 from utils.config import get_memory_runtime_config
+from utils.logging_utils import RequestTrace, info_event
 
 logger = logging.getLogger(__name__)
+
+
+def _write_qa_trace(trace: RequestTrace, *, reason: str) -> Optional[str]:
+    """QA trace 只辅助排查完整输入输出；失败时不能影响问答主链路。"""
+    try:
+        trace_path = trace.write(reason=reason)
+    except Exception as exc:  # pragma: no cover
+        logger.warning("paper QA trace write failed: run_id=%s reason=%s error=%s", trace.run_id, reason, exc)
+        return None
+    if trace_path:
+        info_event(logger, "request.trace_written", run_id=trace.run_id, reason=reason, trace_path=trace_path)
+    return trace_path
 
 class PaperQAService:
     """论文 QA 主流程编排服务。
@@ -211,8 +226,9 @@ class PaperQAService:
             "cleanup_pending_count": cleanup_pending_count,
         }
 
-    def build_qa_index(self, arxiv_id: str, loading_method: str = "docling") -> Dict[str, Any]:
-        return self.qa_index_builder.build_qa_index(arxiv_id, loading_method=loading_method)
+    def build_qa_index(self, arxiv_id: str, loading_method: str = "docling", *, run_id: Optional[str] = None) -> Dict[str, Any]:
+        # run_id 只透传给索引构建日志，保证 Agent 触发的长任务能和主请求关联。
+        return self.qa_index_builder.build_qa_index(arxiv_id, loading_method=loading_method, run_id=run_id)
 
     def delete_qa_index(self, arxiv_id: str) -> Dict[str, Any]:
         """删除论文 QA 索引时先清理外部 artifact，再把数据库记录标记为不可检索。"""
@@ -246,7 +262,7 @@ class PaperQAService:
         # 兼容旧调用点；source_id 与资产字段由 ContextPackBuilder 统一分配，避免会话记忆和前端证据不一致。
         return self.context_pack_builder.build_source_payload(search_results)
 
-    def build_qa_context(self, arxiv_id: str, payload: Any):
+    def build_qa_context(self, arxiv_id: str, payload: Any, *, run_id: Optional[str] = None):
         qa_index = self.db_service.get_paper_qa_index(arxiv_id)
         if not qa_index or qa_index["status"] != "indexed":
             # 未建索引属于前置检索失败，也要生成观察结构，便于 Agent 直接决定是否重建索引。
@@ -269,6 +285,7 @@ class PaperQAService:
 
         question = str(self._payload_get(payload, "question", "") or "").strip()
         user_id = self._resolve_user_id(self._payload_get(payload, "user_id"))
+        resolved_run_id = str(run_id or self._payload_get(payload, "run_id", "") or "").strip() or str(uuid4())
         chat_session = self._resolve_chat_session(arxiv_id, payload)
         memory_runtime = self._build_memory_runtime_debug()
         collection_name = qa_index["collection_name"]
@@ -300,6 +317,8 @@ class PaperQAService:
             "sparse_index_avgdl": qa_index.get("sparse_index_avgdl", 0),
             "active_build_id": qa_index.get("active_build_id"),
             "active_index_version": qa_index.get("active_index_version"),
+            # run_id 只向下游检索链路传递日志关联键，不参与排序、召回或生成决策。
+            "run_id": resolved_run_id,
         }
         session_state = self.session_service.load_conversation_state(
             arxiv_id=arxiv_id,
@@ -422,6 +441,19 @@ class PaperQAService:
                 context={"arxiv_id": arxiv_id, "user_id": user_id, "stage": "enhanced_retrieve", "qa_observation": qa_observation},
             )
 
+        info_event(
+            logger,
+            "qa.retrieval_done",
+            run_id=resolved_run_id,
+            session_id=chat_session.get("session_id"),
+            user_id=user_id,
+            arxiv_id=arxiv_id,
+            collection_name=collection_name,
+            input=question,
+            contextualized_question=retrieval_question,
+            result_count=len(search_results),
+            trace_path=(retrieval_result.get("trace_export") or {}).get("json") if isinstance(retrieval_result.get("trace_export"), dict) else None,
+        )
         context_pack = self.context_pack_builder.build(search_results)
         retrieval_debug["original_question"] = question
         retrieval_debug["contextualized_question"] = retrieval_question
@@ -478,8 +510,48 @@ class PaperQAService:
 
     def answer_question(self, arxiv_id: str, payload: Any) -> Dict[str, Any]:
         question = str(self._payload_get(payload, "question", "") or "").strip()
-        logger.debug("QA request for paper: %s, question: %s", arxiv_id, question)
-        _, _search_results, qa_context, retrieval_debug = self.build_qa_context(arxiv_id, payload)
+        run_id = str(self._payload_get(payload, "run_id", "") or "").strip() or str(uuid4())
+        started = perf_counter()
+        user_id = self._resolve_user_id(self._payload_get(payload, "user_id"))
+        trace = RequestTrace(
+            run_id=run_id,
+            route="paper_qa.answer",
+            session_id=str(self._payload_get(payload, "session_id", "") or "") or None,
+            user_id=user_id,
+            input=question,
+        )
+        info_event(
+            logger,
+            "qa.request_start",
+            run_id=run_id,
+            session_id=trace.session_id,
+            user_id=user_id,
+            arxiv_id=arxiv_id,
+            input=question,
+        )
+        trace.add_event("qa.request_start", arxiv_id=arxiv_id, user_id=user_id)
+        try:
+            _, _search_results, qa_context, retrieval_debug = self.build_qa_context(arxiv_id, payload, run_id=run_id)
+        except Exception as exc:
+            trace.mark_failed()
+            error_payload_builder = getattr(exc, "to_payload", None)
+            trace.set_output(error_payload_builder() if callable(error_payload_builder) else {"error": str(exc)})
+            trace.add_event("qa.request_done", status="error", error_type=type(exc).__name__)
+            trace_path = _write_qa_trace(trace, reason="qa_context_error")
+            info_event(
+                logger,
+                "qa.request_done",
+                run_id=run_id,
+                session_id=trace.session_id,
+                user_id=user_id,
+                arxiv_id=arxiv_id,
+                status="error",
+                error_type=type(exc).__name__,
+                output=str(exc),
+                elapsed_ms=round((perf_counter() - started) * 1000, 1),
+                trace_path=trace_path,
+            )
+            raise
         context_pack = qa_context.get("context_pack") or self.context_pack_builder.build(_search_results)
         source_payload = list(qa_context.get("source_payload") or context_pack.get("source_payload") or [])
         generation_question = str(qa_context.get("generation_question", question) or question).strip() or question
@@ -520,6 +592,23 @@ class PaperQAService:
                 arxiv_id,
                 chat_session.get("session_id"),
                 "paper_qa_final_answer",
+            )
+            trace.mark_failed()
+            trace.set_output({"error": str(exc), "qa_observation": qa_observation})
+            trace.add_event("qa.request_done", status="error", code=ErrorCode.LLM_GENERATION_FAILED)
+            trace_path = _write_qa_trace(trace, reason="generation_error")
+            info_event(
+                logger,
+                "qa.request_done",
+                run_id=run_id,
+                session_id=chat_session.get("session_id") or trace.session_id,
+                user_id=user_id,
+                arxiv_id=arxiv_id,
+                status="error",
+                code=ErrorCode.LLM_GENERATION_FAILED,
+                output=str(exc),
+                elapsed_ms=round((perf_counter() - started) * 1000, 1),
+                trace_path=trace_path,
             )
             raise AppError(
                 ErrorCode.LLM_GENERATION_FAILED,
@@ -577,6 +666,23 @@ class PaperQAService:
                 question_contextualization=question_contextualization,
             )
         except AppError as exc:
+            trace.mark_failed()
+            trace.set_output({"error": exc.to_payload() if hasattr(exc, "to_payload") else str(exc), "qa_observation": qa_observation})
+            trace.add_event("qa.request_done", status="error", code=exc.code)
+            trace_path = _write_qa_trace(trace, reason="persist_error")
+            info_event(
+                logger,
+                "qa.request_done",
+                run_id=run_id,
+                session_id=chat_session.get("session_id") or trace.session_id,
+                user_id=user_id,
+                arxiv_id=arxiv_id,
+                status="error",
+                code=exc.code,
+                output=str(exc.detail or exc.message),
+                elapsed_ms=round((perf_counter() - started) * 1000, 1),
+                trace_path=trace_path,
+            )
             raise AppError(
                 exc.code,
                 message=exc.message,
@@ -586,7 +692,7 @@ class PaperQAService:
                 context={**exc.context, "qa_observation": qa_observation},
             ) from exc
 
-        return {
+        result = {
             "status": "success",
             "arxiv_id": arxiv_id,
             "question": question,
@@ -606,3 +712,26 @@ class PaperQAService:
             "qa_observation": qa_observation,
             "retrieval_debug": retrieval_debug,
         }
+        trace.session_id = str(chat_session.get("session_id") or trace.session_id or "") or None
+        trace.set_output(result)
+        trace.add_event(
+            "qa.request_done",
+            status="success",
+            source_count=len(source_payload),
+            answer_chars=len(str(verified_answer or "")),
+        )
+        trace_path = _write_qa_trace(trace, reason="auto")
+        info_event(
+            logger,
+            "qa.request_done",
+            run_id=run_id,
+            session_id=trace.session_id,
+            user_id=user_id,
+            arxiv_id=arxiv_id,
+            status="success",
+            source_count=len(source_payload),
+            output=verified_answer,
+            elapsed_ms=round((perf_counter() - started) * 1000, 1),
+            trace_path=trace_path,
+        )
+        return result

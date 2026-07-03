@@ -54,6 +54,28 @@ DEBUG_ROUTES_CONFIG: Dict[str, Any] = {
     "chunk_content_preview_chars": _env_int("DEBUG_CHUNK_CONTENT_PREVIEW_CHARS", 4000),
 }
 
+BACKEND_LOGGING_CONFIG: Dict[str, Any] = {
+    # CMD 默认展示请求主时间线；需要深挖时再按模块打开 DEBUG，避免全后端日志一起刷屏。
+    "level": (_env_str("BACKEND_LOG_LEVEL", "INFO") or "INFO").upper(),
+    "debug_loggers": [
+        item.strip()
+        for item in _env_str("BACKEND_DEBUG_LOGGERS", "").split(",")
+        if item.strip()
+    ],
+    # access log 与业务事件分开控制，避免前端轮询/静态请求淹没真正的 Agent/QA 进度。
+    "access_log": _env_bool("BACKEND_ACCESS_LOG", False),
+    # INFO 只放可读预览；完整输入输出按请求 trace 策略落盘。
+    "io_preview_chars": _env_int("BACKEND_LOG_IO_PREVIEW_CHARS", 1200),
+    "full_io": _env_bool("BACKEND_LOG_FULL_IO", False),
+    "request_trace": (_env_str("BACKEND_REQUEST_TRACE", "auto") or "auto").lower(),
+    "request_trace_dir": _env_str(
+        "BACKEND_REQUEST_TRACE_DIR",
+        str(REPO_ROOT / "temp" / "backend-request-traces"),
+    ),
+    # 日志和 trace 共用脱敏策略，避免 CMD 安全但本地 trace 泄漏密钥类字段。
+    "redact_secrets": _env_bool("BACKEND_LOG_REDACT_SECRETS", True),
+}
+
 DOCLING_CONFIG: Dict[str, Any] = {
     "do_ocr_enabled": _env_bool("DOCLING_OCR_ENABLED", False),
     "annotated_pdf_export_enabled": _env_bool("DOCLING_ANNOTATED_PDF_EXPORT_ENABLED", True),
@@ -664,6 +686,10 @@ def get_chunking_runtime_config() -> Dict[str, Any]:
 
 def get_debug_routes_runtime_config() -> Dict[str, Any]:
     return dict(DEBUG_ROUTES_CONFIG)
+
+
+def get_backend_logging_runtime_config() -> Dict[str, Any]:
+    return dict(BACKEND_LOGGING_CONFIG)
 
 
 def get_arxiv_search_runtime_config() -> Dict[str, Any]:

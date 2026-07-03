@@ -230,7 +230,7 @@ def _finalize_plan_debug_and_metadata(
             planner_summary["fallback_record"].get("code"),
         )
     else:
-        logger.info(
+        logger.debug(
             "agent planner selected path goal_type=%s requested=%s final=%s llm_attempted=%s llm_valid=%s fallback=%s",
             goal.goal_type,
             planner_summary["requested_path"],

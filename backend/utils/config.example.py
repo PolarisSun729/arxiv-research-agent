@@ -34,6 +34,21 @@ DEBUG_ROUTES_CONFIG = {
 }
 
 
+BACKEND_LOGGING_CONFIG = {
+    # 默认 INFO 作为 CMD 主时间线；需要细节时通过 debug_loggers 局部放大模块。
+    "level": "INFO",
+    "debug_loggers": [],
+    # access log 与业务日志分离，避免前端轮询请求淹没 Agent/QA 事件。
+    "access_log": False,
+    # INFO 中只展示输入输出预览，完整内容按 request_trace 策略写入本地 trace。
+    "io_preview_chars": 1200,
+    "full_io": False,
+    "request_trace": "auto",
+    "request_trace_dir": str(REPO_ROOT / "temp" / "backend-request-traces"),
+    "redact_secrets": True,
+}
+
+
 DOCLING_CONFIG = {
     "do_ocr_enabled": False,
     "annotated_pdf_export_enabled": True,
