@@ -249,7 +249,7 @@ class ArxivSearchService:
 
         normalized_search_query = _normalize_text_value(search_query)
         normalized_id_list = _normalize_id_list(id_list)
-        logger.debug(
+        logger.info(
             "Searching arXiv with query: '%s', id_list: %s, max_results: %s",
             normalized_search_query,
             normalized_id_list,
@@ -319,7 +319,7 @@ class ArxivSearchService:
             requests.exceptions.RequestException: 其他网络请求错误。
         """
         self._wait_for_rate_limit()
-        logger.debug(
+        logger.info(
             "arXiv request prepared: url=%s, proxy_http=%s, proxy_https=%s",
             url,
             self.session.proxies.get("http", ""),
@@ -357,43 +357,152 @@ class ArxivSearchService:
             logger.error(f"Request error: {str(e)}")
             raise
     
-    def download_pdf(self, pdf_url: str, arxiv_id: str) -> str:
+    def _is_valid_pdf(self, filepath: str, min_size_kb: int = 0) -> bool:
         """
-        下载arXiv论文PDF
-        
+        严格验证 PDF 文件是否有效并可解析
+
         Args:
-            pdf_url (str): PDF文件的URL
-            arxiv_id (str): arXiv论文ID，用于命名文件
-            
+            filepath: PDF 文件路径
+            min_size_kb: 最小文件大小（KB），默认 0（不检查大小，依赖 pypdf 验证）
+
         Returns:
-            str: 保存的文件路径
-            
+            True 如果是有效的 PDF
+
         Raises:
-            Exception: 下载失败时
+            不抛出异常，验证失败返回 False
         """
         try:
-            filename = f"{arxiv_id}.pdf"
-            filepath = os.path.join(self.papers_dir, filename)
-            
-            if os.path.exists(filepath):
-                logger.debug(f"PDF already exists: {filepath}")
+            # 第一步：检查文件大小（如果设置了最小值）
+            file_size = os.path.getsize(filepath)
+            if min_size_kb > 0 and file_size < min_size_kb * 1024:
+                logger.warning(f"PDF file too small: {file_size} bytes at {filepath}")
+                return False
+
+            # 第二步：检查 PDF 魔数（magic number）
+            with open(filepath, "rb") as f:
+                header = f.read(5)
+                if not header.startswith(b'%PDF-'):
+                    logger.warning(f"File does not start with PDF header: {header[:10]} at {filepath}")
+                    return False
+
+                # 检查文件末尾是否有 EOF 标记
+                # 避免文件过小时 seek 出错
+                if file_size > 1024:
+                    f.seek(-1024, os.SEEK_END)
+                    tail = f.read()
+                else:
+                    f.seek(0)
+                    tail = f.read()
+
+                if b'%%EOF' not in tail:
+                    logger.warning(f"PDF file missing %%EOF marker at {filepath}")
+                    return False
+
+            # 第三步：尝试用 pypdf 解析 PDF 结构（最严格的验证）
+            try:
+                try:
+                    from pypdf import PdfReader
+                except ImportError:
+                    # 如果 pypdf 不可用，降级为只检查魔数和 EOF
+                    logger.debug(f"pypdf not available, skipping strict validation for {filepath}")
+                    return True
+
+                reader = PdfReader(filepath)
+                # 尝试读取页数，确保 PDF 结构完整
+                num_pages = len(reader.pages)
+                if num_pages == 0:
+                    logger.warning(f"PDF has 0 pages at {filepath}")
+                    return False
+                logger.debug(f"PDF validation passed: {num_pages} pages at {filepath}")
+                return True
+            except ImportError:
+                # pypdf 不可用，已经在上面处理
+                return True
+            except Exception as parse_error:
+                logger.warning(f"PDF structure validation failed at {filepath}: {parse_error}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error validating PDF at {filepath}: {e}")
+            return False
+
+    def download_pdf(self, pdf_url: str, arxiv_id: str) -> str:
+        """
+        下载 arXiv 论文 PDF 并验证完整性
+
+        Args:
+            pdf_url: PDF 文件的 URL
+            arxiv_id: arXiv 论文 ID，用于命名文件
+
+        Returns:
+            保存的文件路径
+
+        Raises:
+            ValueError: PDF 验证失败
+            requests.exceptions.RequestException: 下载失败
+        """
+        filename = f"{arxiv_id}.pdf"
+        filepath = os.path.join(self.papers_dir, filename)
+
+        # 如果文件已存在，先验证
+        if os.path.exists(filepath):
+            if self._is_valid_pdf(filepath):
+                logger.debug(f"Valid PDF already exists: {filepath}")
                 return filepath
-            
+            else:
+                logger.warning(f"Existing PDF is invalid, re-downloading: {filepath}")
+                try:
+                    os.remove(filepath)
+                except OSError as e:
+                    logger.error(f"Failed to remove invalid PDF: {e}")
+
+        # 下载到临时文件
+        temp_filepath = f"{filepath}.tmp"
+
+        try:
             logger.info(f"Downloading PDF from: {pdf_url}")
-            
             response = self._make_request_with_retry(pdf_url)
-            
-            with open(filepath, "wb") as f:
+
+            # 检查 HTTP 状态码
+            response.raise_for_status()
+
+            # 检查 Content-Type
+            content_type = response.headers.get('Content-Type', '').lower()
+            if 'application/pdf' not in content_type and 'application/octet-stream' not in content_type:
+                raise ValueError(
+                    f"Response is not a PDF, got Content-Type: {content_type} for {arxiv_id}"
+                )
+
+            # 写入临时文件
+            with open(temp_filepath, "wb") as f:
                 f.write(response.content)
-            
-            logger.info(f"Successfully downloaded PDF to: {filepath}")
+
+            # 验证下载的 PDF
+            if not self._is_valid_pdf(temp_filepath):
+                os.remove(temp_filepath)
+                raise ValueError(f"Downloaded file is not a valid PDF: {arxiv_id}")
+
+            # 原子性地移动到最终位置
+            os.replace(temp_filepath, filepath)
+
+            logger.info(f"Successfully downloaded and verified PDF: {filepath}")
             return filepath
-            
+
         except requests.exceptions.RequestException as e:
-            logger.error(f"Request error when downloading PDF: {str(e)}")
+            logger.error(f"Request error when downloading PDF for {arxiv_id}: {e}")
+            if os.path.exists(temp_filepath):
+                try:
+                    os.remove(temp_filepath)
+                except OSError:
+                    pass
             raise
         except Exception as e:
-            logger.error(f"Error downloading PDF: {str(e)}")
+            logger.error(f"Error downloading PDF for {arxiv_id}: {e}")
+            if os.path.exists(temp_filepath):
+                try:
+                    os.remove(temp_filepath)
+                except OSError:
+                    pass
             raise
     
     def save_search_results(self, search_result: Dict[str, Any]) -> str:
@@ -419,67 +528,6 @@ class ArxivSearchService:
             
         except Exception as e:
             logger.error(f"Error saving search results: {str(e)}")
-            raise
-    
-    async def search_and_save(self, 
-                             search_query: str = "",
-                             id_list: Optional[List[str]] = None,
-                             max_results: int = 10,
-                             start: int = 0,
-                             sort_by: str = "relevance",
-                             sort_order: str = "descending",
-                             download_pdfs: bool = False,
-                             ) -> Dict[str, Any]:
-        """
-        搜索论文并保存结果，可选择下载PDF
-        
-        Args:
-            search_query (str): 搜索查询字符串
-            id_list (Optional[List[str]]): arXiv论文ID列表
-            max_results (int): 返回结果的最大数量
-            start (int): 分页起始位置
-            sort_by (str): 排序字段
-            sort_order (str): 排序方向
-            download_pdfs (bool): 是否下载PDF文件
-            
-        Returns:
-            Dict[str, Any]: 搜索结果，包含保存的文件路径
-        """
-        try:
-            # search_and_save 是 remote-only 工作流，输入归一化必须由 router/tool 先完成。
-            search_result = self.search(
-                search_query=search_query,
-                id_list=id_list,
-                max_results=max_results,
-                start=start,
-                sort_by=sort_by,
-                sort_order=sort_order,
-            )
-            
-            search_filepath = self.save_search_results(search_result)
-            
-            downloaded_files = []
-            if download_pdfs:
-                for paper in search_result["papers"]:
-                    if paper.get("pdf_url"):
-                        try:
-                            filepath = self.download_pdf(paper["pdf_url"], paper["arxiv_id"])
-                            downloaded_files.append({
-                                "arxiv_id": paper["arxiv_id"],
-                                "title": paper["title"],
-                                "filepath": filepath
-                            })
-                        except Exception as e:
-                            logger.error(f"Failed to download {paper['arxiv_id']}: {str(e)}")
-            
-            return {
-                "search_result": search_result,
-                "search_filepath": search_filepath,
-                "downloaded_files": downloaded_files
-            }
-            
-        except Exception as e:
-            logger.error(f"Error in search_and_save: {str(e)}")
             raise
     
     @staticmethod

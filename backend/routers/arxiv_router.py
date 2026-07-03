@@ -45,13 +45,6 @@ class ArxivSearchRequest(BaseModel):
     sort_order: str = Field("descending", description="排序方向")
     submitted_days_ago: Optional[int] = Field(None, description="搜索提交日期在多少天内的文章")
 
-
-class ArxivSearchAndSaveRequest(ArxivSearchRequest):
-    """远程搜索并保存的请求体。"""
-
-    download_pdfs: bool = Field(False, description="是否同时下载 PDF")
-
-
 def _prepare_search_request(request: ArxivSearchRequest, *, append_date_when_query_missing: bool) -> Dict[str, Any]:
     """把 HTTP 请求模型转换成统一搜索后端能执行的参数。"""
     return prepare_arxiv_search_request(
@@ -143,29 +136,3 @@ async def arxiv_download(
         return {"status": "success", "filepath": filepath}
     except Exception as exc:
         _raise_arxiv_http_error(exc, operation="download")
-
-
-@router.post("/search-and-save")
-async def arxiv_search_and_save(
-    request: Optional[ArxivSearchAndSaveRequest] = Body(None),
-    arxiv_api_service=Depends(get_arxiv_api_service),
-):
-    """检索论文并按需保存元数据/下载 PDF。
-
-    保存和下载仍是远程 API 专属工作流，但搜索参数必须先走同一个 query_builder
-    入口，避免它绕过 `/search` 的校验与归一化规则。
-    """
-    try:
-        normalized_request = request or ArxivSearchAndSaveRequest()
-        prepared = _prepare_search_request(normalized_request, append_date_when_query_missing=False)
-        return await arxiv_api_service.search_and_save(
-            search_query=prepared["final_search_query"] or "",
-            id_list=prepared["id_list"],
-            max_results=prepared["max_results"],
-            start=prepared["start"],
-            sort_by=prepared["sort_by"],
-            sort_order=prepared["sort_order"],
-            download_pdfs=normalized_request.download_pdfs,
-        )
-    except Exception as exc:
-        _raise_arxiv_http_error(exc, operation="search and save")

@@ -18,6 +18,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
 
+from services.arxiv.arxiv_embedding_handler import ArxivEmbeddingHandler, EmbeddingStats
+from services.arxiv.arxiv_oai_xml_parser import ArxivOaiXmlParser
+from services.arxiv.arxiv_query_compiler import ArxivQueryCompiler
+from services.arxiv.arxiv_query_parser import ArxivQueryParser, LOCAL_OAI_SUPPORTED_QUERY_SUBSET
 from services.arxiv.contracts import ArxivSearchError
 from services.embedding.embedding_service import EmbeddingService
 from services.storage.vector_store_service import VectorStoreService
@@ -32,19 +36,6 @@ OAI_EMBEDDING_BATCH_SIZE = ARXIV_OAI_CONFIG["embedding_batch_size"]
 OAI_VECTOR_QUERY_BATCH_SIZE = ARXIV_OAI_CONFIG["vector_query_batch_size"]
 OAI_DASHSCOPE_TEXT_TOKEN_PRICE_PER_1K = ARXIV_OAI_CONFIG["dashscope_text_token_price_per_1k"]
 
-LOCAL_OAI_SUPPORTED_QUERY_SUBSET = [
-    "id",
-    "cat",
-    "submittedDate",
-    "ti",
-    "abs",
-    "au",
-    "all",
-    "AND",
-    "OR",
-    "ANDNOT",
-    "phrase",
-]
 
 
 class LocalArxivSearchError(ArxivSearchError):
@@ -176,6 +167,9 @@ class ArxivOaiDatabaseService:
         self.check_same_thread = (
             OAI_SQLITE_CONFIG["check_same_thread"] if check_same_thread is None else bool(check_same_thread)
         )
+        # 初始化辅助组件
+        self.query_parser = ArxivQueryParser()
+        self.query_compiler = ArxivQueryCompiler()
         # 目录和表结构在构造时就确保到位，调用方无需感知“第一次使用”的初始化细节。
         self._ensure_database_directory()
         self._initialize_database()
@@ -902,277 +896,6 @@ class ArxivOaiDatabaseService:
             rows = cursor.fetchall()
         return [self._parse_row(row) for row in rows]
 
-    def _strip_query_outer_parentheses(self, query: str) -> str:
-        """移除查询最外层成对括号；解析阶段需要尊重引号，避免 phrase 被误拆。"""
-        text = query.strip()
-        while text.startswith("(") and text.endswith(")"):
-            depth = 0
-            in_quote = False
-            escaped = False
-            balanced = True
-            for index, char in enumerate(text):
-                if escaped:
-                    escaped = False
-                    continue
-                if char == "\\":
-                    escaped = True
-                    continue
-                if char == '"':
-                    # 解析本地子集时需要保留 phrase 内部原样内容，不能把引号里的括号当结构符。
-                    in_quote = not in_quote
-                    continue
-                if in_quote:
-                    continue
-                if char == "(":
-                    depth += 1
-                elif char == ")":
-                    depth -= 1
-                    if depth == 0 and index != len(text) - 1:
-                        balanced = False
-                        break
-            if balanced and depth == 0 and not in_quote:
-                text = text[1:-1].strip()
-            else:
-                break
-        return text
-
-    def _split_query_top_level(self, query: str, token: str) -> List[str]:
-        """按顶层布尔操作符切分查询；引号和括号内的操作符只作为普通文本处理。"""
-        text = query.strip()
-        parts: List[str] = []
-        depth = 0
-        in_quote = False
-        escaped = False
-        start = 0
-        index = 0
-        token_length = len(token)
-        while index < len(text):
-            char = text[index]
-            if escaped:
-                escaped = False
-                index += 1
-                continue
-            if char == "\\":
-                escaped = True
-                index += 1
-                continue
-            if char == '"':
-                in_quote = not in_quote
-                index += 1
-                continue
-            if not in_quote:
-                if char == "(":
-                    depth += 1
-                    index += 1
-                    continue
-                if char == ")":
-                    depth = max(depth - 1, 0)
-                    index += 1
-                    continue
-                if depth == 0 and text.startswith(token, index):
-                    # 只有真正位于顶层的布尔操作符，才允许成为 AST 的拆分边界。
-                    parts.append(text[start:index].strip())
-                    index += token_length
-                    start = index
-                    continue
-            index += 1
-        parts.append(text[start:].strip())
-        return [part for part in parts if part]
-
-    def _parse_submitted_date_range(self, text: str, *, original_query: str) -> Dict[str, Any]:
-        """把 submittedDate 范围子句解析成标准日期节点。"""
-        match = re.fullmatch(r"submittedDate:\[(\d{12})\s+TO\s+(\d{12})\]", text.strip())
-        if not match:
-            raise UnsupportedLocalArxivQuery(
-                "本地 OAI 镜像只支持 submittedDate:[YYYYMMDDHHMM TO YYYYMMDDHHMM] 日期范围。",
-                query=original_query,
-                reason="unsupported_submitted_date_syntax",
-            )
-        start_raw, end_raw = match.groups()
-        # 统一编译成 SQLite 可直接比较的 datetime 字符串，减少后续节点类型分支复杂度。
-        start_dt = datetime.strptime(start_raw, "%Y%m%d%H%M").strftime("%Y-%m-%d %H:%M:%S")
-        end_dt = datetime.strptime(end_raw, "%Y%m%d%H%M").strftime("%Y-%m-%d %H:%M:%S")
-        return {"type": "date", "start": start_dt, "end": end_dt}
-
-    def _parse_local_oai_atomic_query(self, text: str, *, original_query: str) -> Dict[str, Any]:
-        """解析单个不可再拆分的本地 OAI 查询子句。"""
-        text = self._strip_query_outer_parentheses(text.strip())
-        if not text:
-            return {"type": "empty"}
-        if text.startswith("submittedDate:"):
-            return self._parse_submitted_date_range(text, original_query=original_query)
-
-        field = "all"
-        raw_value = text
-        if ":" in text:
-            field, raw_value = text.split(":", 1)
-            field = field.strip().lower()
-            raw_value = raw_value.strip()
-
-        aliases = {
-            "title": "ti",
-            "abstract": "abs",
-            "authors": "au",
-            "author": "au",
-            "category": "cat",
-        }
-        # 兼容常见字段别名，但最终仍收敛到本地 OAI 明确支持的最小字段集合。
-        field = aliases.get(field, field)
-        supported_fields = {"id", "cat", "ti", "abs", "au", "all"}
-        if field not in supported_fields:
-            raise UnsupportedLocalArxivQuery(
-                f"本地 OAI 镜像不支持字段 `{field}`，请改用支持的查询子集。",
-                query=original_query,
-                reason=f"unsupported_field:{field}",
-            )
-
-        if not raw_value:
-            raise UnsupportedLocalArxivQuery(
-                "本地 OAI 镜像不支持空字段查询。",
-                query=original_query,
-                reason="empty_field_query",
-            )
-        if "*" in raw_value or "?" in raw_value:
-            raise UnsupportedLocalArxivQuery(
-                "本地 OAI 镜像不支持通配符查询，避免低精度误召回。",
-                query=original_query,
-                reason="unsupported_wildcard_query",
-            )
-
-        # phrase 和普通 token 查询在 FTS 编译阶段有不同语义，这里先把标记保留下来。
-        phrase = raw_value.startswith('"') and raw_value.endswith('"') and len(raw_value) >= 2
-        value = raw_value[1:-1] if phrase else raw_value
-        value = value.replace('\\"', '"').replace("\\\\", "\\").strip()
-
-        if field == "id":
-            return {"type": "id", "value": value}
-        if field == "cat":
-            return {"type": "category", "value": value}
-        return {"type": "text", "field": field, "value": value, "phrase": phrase}
-
-    def _parse_local_oai_query(self, query: str) -> Optional[Dict[str, Any]]:
-        """解析本地支持的 arXiv 查询子集；超出子集时显式失败而不是 Python 兜底。"""
-        text = self._strip_query_outer_parentheses(str(query or "").strip())
-        if not text:
-            return None
-        for operator, node_type in ((" ANDNOT ", "andnot"), (" AND ", "and"), (" OR ", "or")):
-            if operator in text:
-                parts = self._split_query_top_level(text, operator)
-                if len(parts) > 1:
-                    # 只有顶层真正发生拆分时才递归构树，避免括号内操作符造成死递归。
-                    return {
-                        "type": node_type,
-                        "children": [self._parse_local_oai_query(part) for part in parts],
-                    }
-        return self._parse_local_oai_atomic_query(text, original_query=query)
-
-    def _fts_query_for_text(self, value: str, *, phrase: bool, original_query: str) -> str:
-        """把文本查询编译成 FTS5 语法；只使用 token/phrase，禁止子串模糊匹配。"""
-        # 只抽取英文和数字 token，主动拒绝“空 token / 纯符号”输入，避免 MATCH 语法漂移。
-        tokens = re.findall(r"[A-Za-z0-9]+", str(value or "").lower())
-        if not tokens:
-            raise UnsupportedLocalArxivQuery(
-                "本地 OAI 镜像文本检索需要至少一个英文/数字 token。",
-                query=original_query,
-                reason="empty_fts_tokens",
-            )
-        if phrase:
-            # phrase 查询保持原始顺序，适合 title/abstract 中的连续短语检索。
-            return '"' + " ".join(tokens) + '"'
-        # 非短语查询按 AND 拼接，显式要求所有 token 命中，保证高精度。
-        return " AND ".join(tokens)
-
-    def _compile_local_oai_query(
-        self,
-        node: Optional[Dict[str, Any]],
-        *,
-        fts5_available: bool,
-        original_query: str,
-    ) -> Tuple[str, List[Any], bool]:
-        """把查询 AST 编译成 SQL WHERE 片段，返回是否消费了 FTS 文本索引。"""
-        if not node or node.get("type") == "empty":
-            return "", [], False
-
-        node_type = node.get("type")
-        if node_type in {"and", "or"}:
-            # 复合节点先递归编译子节点，再在 SQL 层按原布尔关系拼接。
-            compiled = [
-                self._compile_local_oai_query(child, fts5_available=fts5_available, original_query=original_query)
-                for child in node.get("children") or []
-                if child
-            ]
-            clauses = [item[0] for item in compiled if item[0]]
-            params = [param for item in compiled for param in item[1]]
-            uses_fts = any(item[2] for item in compiled)
-            if not clauses:
-                return "", [], uses_fts
-            joiner = " AND " if node_type == "and" else " OR "
-            return "(" + joiner.join(clauses) + ")", params, uses_fts
-
-        if node_type == "andnot":
-            children = [child for child in node.get("children") or [] if child]
-            if not children:
-                return "", [], False
-            # ANDNOT 只把第一个子句当正条件，后续子句全部编译成 NOT (...)。
-            left_sql, left_params, left_fts = self._compile_local_oai_query(
-                children[0],
-                fts5_available=fts5_available,
-                original_query=original_query,
-            )
-            negative_parts = [
-                self._compile_local_oai_query(child, fts5_available=fts5_available, original_query=original_query)
-                for child in children[1:]
-            ]
-            clauses = [left_sql] if left_sql else []
-            params = list(left_params)
-            uses_fts = left_fts
-            for sql, item_params, item_fts in negative_parts:
-                if sql:
-                    clauses.append(f"NOT ({sql})")
-                    params.extend(item_params)
-                uses_fts = uses_fts or item_fts
-            return "(" + " AND ".join(clauses) + ")", params, uses_fts
-
-        if node_type == "id":
-            # arXiv ID 本身就是主键级过滤条件，直接等值命中最精确。
-            return "p.arxiv_id = ?", [node.get("value")], False
-        if node_type == "category":
-            return (
-                "EXISTS (SELECT 1 FROM arxiv_oai_paper_categories c "
-                "WHERE c.arxiv_id = p.arxiv_id AND c.category = ?)"
-            ), [node.get("value")], False
-        if node_type == "date":
-            # 日期查询在多种时间字段之间做一致兜底，尽量贴近实际可用时间语义。
-            return (
-                "datetime(COALESCE(p.updated, p.created, p.oai_datestamp, p.fetched_at)) "
-                "BETWEEN datetime(?) AND datetime(?)"
-            ), [node.get("start"), node.get("end")], False
-        if node_type == "text":
-            if not fts5_available:
-                raise LocalArxivSearchIndexUnavailable(
-                    "本地 OAI 镜像文本索引不可用，无法执行 ti/abs/au/all 文本检索。",
-                    query=original_query,
-                    reason="fts5_unavailable",
-                )
-            field_map = {"ti": "title", "abs": "abstract", "au": "authors", "all": "all_text"}
-            fts_field = field_map.get(str(node.get("field") or "all"), "all_text")
-            # MATCH 语句始终只打到 FTS 表，避免退回 LIKE 造成语义和性能不可控。
-            fts_query = self._fts_query_for_text(
-                str(node.get("value") or ""),
-                phrase=bool(node.get("phrase")),
-                original_query=original_query,
-            )
-            return (
-                "p.arxiv_id IN (SELECT arxiv_id FROM arxiv_oai_papers_fts "
-                "WHERE arxiv_oai_papers_fts MATCH ?)"
-            ), [f"{fts_field}:({fts_query})"], True
-
-        raise UnsupportedLocalArxivQuery(
-            "本地 OAI 镜像无法识别该查询节点。",
-            query=original_query,
-            reason=f"unsupported_node:{node_type}",
-        )
-
     def search(
         self,
         search_query: str = "",
@@ -1186,7 +909,7 @@ class ArxivOaiDatabaseService:
         normalized_query = str(search_query or "").strip()
         normalized_id_list = [str(item).strip() for item in (id_list or []) if str(item).strip()]
         # 查询字符串先解析成 AST，后续过滤、错误提示和能力说明都围绕这份结构展开。
-        query_node = self._parse_local_oai_query(normalized_query) if normalized_query else None
+        query_node = self.query_parser.parse(normalized_query) if normalized_query else None
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -1201,7 +924,7 @@ class ArxivOaiDatabaseService:
                 where_clauses.append(f"p.arxiv_id IN ({placeholders})")
                 params.extend(normalized_id_list)
 
-            query_sql, query_params, uses_fts = self._compile_local_oai_query(
+            query_sql, query_params, uses_fts = self.query_compiler.compile(
                 query_node,
                 fts5_available=fts5_available,
                 original_query=normalized_query,
@@ -1564,10 +1287,19 @@ class ArxivOaiSyncService:
         self.max_retries = max(1, int(max_retries))
         # database_service 支持惰性注入，便于测试或只做 dry-run 时减少副作用。
         self.database_service = database_service
-        self.embedding_service = embedding_service or EmbeddingService()
-        self.vector_store_service = vector_store_service or VectorStoreService()
-        self.embedding_collection_name = embedding_collection_name
-        self.embedding_config = self.embedding_service.get_default_embedding_config()
+        # 初始化 XML 解析器
+        self.xml_parser = ArxivOaiXmlParser()
+        # 初始化 embedding 处理器
+        self.embedding_handler = None
+        if embedding_service or vector_store_service:
+            self.embedding_handler = ArxivEmbeddingHandler(
+                embedding_service=embedding_service or EmbeddingService(),
+                vector_store_service=vector_store_service or VectorStoreService(),
+                embedding_collection_name=embedding_collection_name,
+                embedding_batch_size=OAI_EMBEDDING_BATCH_SIZE,
+                vector_query_batch_size=OAI_VECTOR_QUERY_BATCH_SIZE,
+                token_price_per_1k=OAI_DASHSCOPE_TEXT_TOKEN_PRICE_PER_1K,
+            )
         # 复用 Session，统一携带 User-Agent 并减少多页抓取的连接开销。
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": user_agent})
@@ -1613,7 +1345,7 @@ class ArxivOaiSyncService:
                 logger.error("Failed to parse OAI-PMH XML response: %s", exc)
                 break
 
-            page_error = self._extract_oai_error(root)
+            page_error = self.xml_parser.extract_oai_error(root)
             if page_error:
                 stats.errors += 1
                 logger.error("OAI-PMH error response: %s", page_error)
@@ -1645,7 +1377,7 @@ class ArxivOaiSyncService:
                 # 只对真正需要落库的命中结果做批量持久化，保持 dry-run/count-only 无副作用。
                 self._persist_matched_papers(matched_papers, stats)
 
-            resumption_token = self._extract_resumption_token(root)
+            resumption_token = self.xml_parser.extract_resumption_token(root)
             if not resumption_token:
                 logger.info("OAI-PMH resumptionToken exhausted; sync complete.")
                 break
@@ -1763,14 +1495,14 @@ class ArxivOaiSyncService:
     def _process_record(self, record: ET.Element, stats: ArxivOaiSyncStats, dry_run: bool, count_only: bool) -> Optional[Dict[str, Any]]:
         """解析并过滤单条 OAI record，返回通过筛选的论文字典。"""
         stats.records_seen += 1
-        metadata = self._find_first_child(record, "metadata")
+        metadata = self.xml_parser.find_first_child(record, "metadata")
         if metadata is None:
             stats.skipped_no_metadata += 1
             stats.records_skipped += 1
             logger.debug("Skipping record without metadata")
             return None
 
-        paper_elem = self._find_first_element_child(metadata)
+        paper_elem = self.xml_parser.find_first_element_child(metadata)
         if paper_elem is None:
             stats.skipped_no_metadata += 1
             stats.records_skipped += 1
@@ -1779,7 +1511,7 @@ class ArxivOaiSyncService:
 
         stats.records_with_metadata += 1
         # 元数据解析失败与业务过滤是两类问题，统计上需要分开记录。
-        paper = self._parse_paper_metadata(record, paper_elem)
+        paper = self.xml_parser.parse_paper_metadata(record, paper_elem)
         if paper is None:
             stats.skipped_parse_errors += 1
             stats.records_skipped += 1
@@ -1850,303 +1582,27 @@ class ArxivOaiSyncService:
                 logger.info("OAI paper upserted: %s", paper.get("arxiv_id"))
 
         # 只对真正落库成功的论文生成 embedding，避免向量库和主库出现悬空记录。
-        self._store_paper_embeddings_batch(persisted_papers, stats)
-
-    def _build_oai_embedding_metadata(self, paper: Dict[str, Any]) -> Dict[str, Any]:
-        """构造写入向量库的 OAI embedding 元数据。"""
-        # metadata 保持与检索侧常用字段一致，方便后续按 arxiv_id / title / date 回查。
-        return {
-            "content": str(paper.get("abstract", "") or "").strip(),
-            "arxiv_id": str(paper.get("arxiv_id", "") or "").strip(),
-            "title": str(paper.get("title", "") or "").strip(),
-            "authors": paper.get("authors", ""),
-            "categories": paper.get("categories", ""),
-            "published_date": str(
-                paper.get("created")
-                or paper.get("updated")
-                or paper.get("oai_datestamp")
-                or ""
-            ).strip(),
-            "url": str(paper.get("abs_url") or paper.get("pdf_url") or "").strip(),
-            "embedding_model": self.embedding_config.model_name,
-        }
-
-    def _store_paper_embeddings_batch(self, papers: Sequence[Dict[str, Any]], stats: ArxivOaiSyncStats) -> None:
-        """批量为已落库论文生成 embedding，并写入向量库。"""
-        eligible_papers = []
-        eligible_ids = []
-        for paper in papers:
-            arxiv_id = str(paper.get("arxiv_id", "") or "").strip()
-            title = str(paper.get("title", "") or "").strip()
-            abstract = str(paper.get("abstract", "") or "").strip()
-            if not arxiv_id or not title or not abstract:
-                # 没有标题或摘要时 embedding 质量不可控，直接跳过比写入噪声向量更安全。
-                logger.debug(
-                    "Skipping embedding for OAI paper %s because title or abstract is missing",
-                    arxiv_id or "<unknown>",
-                )
-                continue
-            eligible_papers.append(paper)
-            eligible_ids.append(arxiv_id)
-
-        if not eligible_papers:
-            return
-
-        existing_ids = set()
-        try:
-            for start in range(0, len(eligible_ids), OAI_VECTOR_QUERY_BATCH_SIZE):
-                batch_ids = eligible_ids[start : start + OAI_VECTOR_QUERY_BATCH_SIZE]
-                # 先批量探测已存在向量，避免重复生成 embedding 造成额外成本。
-                existing_embeddings = self.vector_store_service.get_paper_embeddings_by_arxiv_ids(
-                    collection_name=self.embedding_collection_name,
-                    arxiv_ids=batch_ids,
-                )
-                for item in existing_embeddings:
-                    arxiv_id = str(item.get("arxiv_id", "") or "").strip()
-                    if arxiv_id:
-                        existing_ids.add(arxiv_id)
-        except Exception as exc:  # pragma: no cover - vector store runtime dependent
-            logger.warning("Failed to inspect existing embeddings for OAI papers: %s", exc)
-        if existing_ids:
-            stats.embeddings_skipped_existing += len(existing_ids)
-
-        missing_papers = [paper for paper in eligible_papers if str(paper.get("arxiv_id", "") or "").strip() not in existing_ids]
-        if not missing_papers:
-            return
-
-        stats.embeddings_attempted += len(missing_papers)
-        texts = [
-            self.embedding_service.build_paper_embedding_text(
-                str(paper.get("title", "") or "").strip(),
-                str(paper.get("abstract", "") or "").strip(),
+        if persisted_papers and self.embedding_handler:
+            embedding_stats = EmbeddingStats(
+                embeddings_attempted=stats.embeddings_attempted,
+                embeddings_written=stats.embeddings_written,
+                embeddings_skipped_existing=stats.embeddings_skipped_existing,
+                embedding_errors=stats.embedding_errors,
+                embedding_input_tokens=stats.embedding_input_tokens,
+                embedding_output_tokens=stats.embedding_output_tokens,
+                embedding_total_tokens=stats.embedding_total_tokens,
+                embedding_cost_yuan=stats.embedding_cost_yuan,
             )
-            for paper in missing_papers
-        ]
-
-        try:
-            # 批量 embedding 优先追求成本和吞吐；失败时再回退到单篇粒度定位问题。
-            embeddings, usage = self.embedding_service.create_text_embeddings_with_usage(
-                texts,
-                provider=self.embedding_config.provider,
-                model=self.embedding_config.model_name,
-                api_key=self.embedding_config.api_key,
-                base_url=self.embedding_config.base_url,
-                dimension=self.embedding_config.dimension,
-                batch_size=OAI_EMBEDDING_BATCH_SIZE,
-            )
-            self._accumulate_embedding_usage(stats, usage, len(missing_papers))
-            if len(embeddings) != len(missing_papers):
-                raise ValueError(
-                    f"Embedding batch returned {len(embeddings)} vectors for {len(missing_papers)} papers"
-                )
-
-            items = [
-                {
-                    "embedding": embedding,
-                    "metadata": self._build_oai_embedding_metadata(paper),
-                }
-                for paper, embedding in zip(missing_papers, embeddings)
-                if embedding
-            ]
-            if not items:
-                return
-
-            inserted_count = self.vector_store_service.insert_embeddings(self.embedding_collection_name, items)
-            stats.embeddings_written += int(inserted_count)
-            # 批量写入后逐条记日志，便于后续按 arxiv_id 追踪 embedding 生命周期。
-            for paper in missing_papers:
-                logger.info("Embedded OAI paper into vector store: %s", paper.get("arxiv_id"))
-        except Exception as exc:  # pragma: no cover - vector store/runtime dependent
-            logger.warning("Batch embedding for OAI papers failed, falling back to single-item processing: %s", exc)
-            for paper in missing_papers:
-                self._maybe_store_paper_embedding(paper, stats)
-
-    def _accumulate_embedding_usage(self, stats: ArxivOaiSyncStats, usage: Dict[str, Any], item_count: int) -> None:
-        """把 embedding 调用的 token 用量和估算成本累计到同步统计中。"""
-        if not usage:
-            return
-
-        input_tokens = int(usage.get("input_tokens", 0) or 0)
-        output_tokens = int(usage.get("output_tokens", 0) or 0)
-        total_tokens = int(usage.get("total_tokens", input_tokens + output_tokens) or (input_tokens + output_tokens))
-
-        # 统计统一在这里收口，避免批量和单篇写入两条路径各自维护计费逻辑。
-        stats.embedding_input_tokens += input_tokens
-        stats.embedding_output_tokens += output_tokens
-        stats.embedding_total_tokens += total_tokens
-
-        if input_tokens > 0:
-            # 当前成本估算只按输入 token 计价，和现有 DashScope 文本 embedding 计费规则保持一致。
-            stats.embedding_cost_yuan += (input_tokens / 1000.0) * OAI_DASHSCOPE_TEXT_TOKEN_PRICE_PER_1K
-
-        logger.info(
-            "OAI embedding batch usage: items=%s input_tokens=%s output_tokens=%s total_tokens=%s estimated_cost=%.6f yuan",
-            item_count,
-            input_tokens,
-            output_tokens,
-            total_tokens,
-            (input_tokens / 1000.0) * OAI_DASHSCOPE_TEXT_TOKEN_PRICE_PER_1K if input_tokens > 0 else 0.0,
-        )
-
-    def _maybe_store_paper_embedding(self, paper: Dict[str, Any], stats: ArxivOaiSyncStats) -> None:
-        """为单篇论文生成并写入 embedding，作为批量失败时的兜底路径。"""
-        arxiv_id = str(paper.get("arxiv_id", "") or "").strip()
-        title = str(paper.get("title", "") or "").strip()
-        abstract = str(paper.get("abstract", "") or "").strip()
-        if not arxiv_id or not title or not abstract:
-            logger.debug("Skipping embedding for OAI paper %s because title or abstract is missing", arxiv_id or "<unknown>")
-            return
-
-        try:
-            # 单篇兜底前先检查是否已有向量，避免批量失败后重复写入。
-            existing_embeddings = self.vector_store_service.get_paper_embeddings_by_arxiv_ids(
-                collection_name=self.embedding_collection_name,
-                arxiv_ids=[arxiv_id],
-            )
-        except Exception as exc:  # pragma: no cover - vector store runtime dependent
-            logger.warning("Failed to inspect existing embedding for OAI paper %s: %s", arxiv_id, exc)
-            existing_embeddings = []
-
-        if existing_embeddings:
-            stats.embeddings_skipped_existing += 1
-            return
-
-        stats.embeddings_attempted += 1
-        text_to_embed = self.embedding_service.build_paper_embedding_text(title, abstract)
-        if not text_to_embed:
-            stats.embedding_errors += 1
-            logger.warning("Skipping OAI embedding for %s because embedding text is empty", arxiv_id)
-            return
-
-        try:
-            embedding, usage = self.embedding_service.create_single_embedding_with_usage(
-                text_to_embed,
-                provider=self.embedding_config.provider,
-                model=self.embedding_config.model_name,
-                api_key=self.embedding_config.api_key,
-                base_url=self.embedding_config.base_url,
-                dimension=self.embedding_config.dimension,
-            )
-            self._accumulate_embedding_usage(stats, usage, 1)
-            # 单篇兜底沿用和批量路径一致的 metadata 结构，方便后续统一检索与排查。
-            metadata = {
-                "content": abstract,
-                "arxiv_id": arxiv_id,
-                "title": title,
-                "authors": paper.get("authors", ""),
-                "categories": paper.get("categories", ""),
-                "published_date": str(
-                    paper.get("created")
-                    or paper.get("updated")
-                    or paper.get("oai_datestamp")
-                    or ""
-                ).strip(),
-                "url": str(paper.get("abs_url") or paper.get("pdf_url") or "").strip(),
-                "embedding_model": self.embedding_config.model_name,
-            }
-            self.vector_store_service.insert_single_embedding(
-                self.embedding_collection_name,
-                embedding,
-                metadata,
-            )
-            stats.embeddings_written += 1
-            logger.info("Embedded OAI paper into vector store: %s", arxiv_id)
-        except Exception as exc:  # pragma: no cover - embedding/vector store runtime dependent
-            stats.embedding_errors += 1
-            logger.warning("Failed to embed OAI paper %s into vector store: %s", arxiv_id, exc)
-
-    def _parse_paper_metadata(self, record: ET.Element, paper_elem: ET.Element) -> Optional[Dict[str, Any]]:
-        """把单条 OAI-PMH record 解析成内部统一论文结构。"""
-        try:
-            raw_arxiv_id = self._extract_text(paper_elem, "id")
-            arxiv_id = self._normalize_arxiv_id(raw_arxiv_id)
-            title = self._normalize_whitespace(self._extract_text(paper_elem, "title"))
-            abstract = self._normalize_whitespace(self._extract_text(paper_elem, "abstract"))
-            created = self._normalize_whitespace(self._extract_text(paper_elem, "created"))
-            updated = self._normalize_whitespace(self._extract_text(paper_elem, "updated") or self._extract_text(paper_elem, "updateDate"))
-            categories_text = self._normalize_whitespace(self._extract_text(paper_elem, "categories"))
-            categories = self._split_categories(categories_text)
-            primary_category = self._extract_primary_category(paper_elem)
-            authors = self._extract_authors(paper_elem)
-            oai_datestamp = self._normalize_whitespace(self._extract_text(record, "datestamp"))
-
-            # authors/categories 继续存成 JSON 字符串，兼容现有数据库结构和旧调用方读取习惯。
-            return {
-                "arxiv_id": arxiv_id,
-                "title": title,
-                "abstract": abstract,
-                "authors": json.dumps(authors, ensure_ascii=False),
-                "categories": json.dumps(categories, ensure_ascii=False),
-                "categories_list": categories,
-                "primary_category": primary_category,
-                "created": created,
-                "updated": updated,
-                "abs_url": f"https://arxiv.org/abs/{arxiv_id}",
-                "pdf_url": f"https://arxiv.org/pdf/{arxiv_id}",
-                "oai_datestamp": oai_datestamp,
-            }
-        except Exception as exc:
-            logger.error("Failed to parse OAI-PMH record: %s", exc)
-            return None
-
-    def _extract_authors(self, paper_elem: ET.Element) -> List[str]:
-        """从 OAI 元数据中提取作者列表，兼容多种 author 结构。"""
-        authors_parent = self._find_first_child(paper_elem, "authors")
-        # 优先限定在 authors 节点下遍历；缺失时再退回整棵 paper 子树，兼容历史 XML 变体。
-        search_root = authors_parent if authors_parent is not None else paper_elem
-        authors: List[str] = []
-        for node in search_root.iter():
-            if self._local_name(node.tag) != "author":
-                continue
-            name_parts: List[str] = []
-            forenames = self._normalize_whitespace(self._extract_text(node, "forenames"))
-            keyname = self._normalize_whitespace(self._extract_text(node, "keyname"))
-            full_name = self._normalize_whitespace(self._extract_text(node, "name"))
-            if full_name:
-                # 某些 XML 直接提供完整姓名；优先使用它，避免再拼接出重复空格或错序。
-                authors.append(full_name)
-                continue
-            if forenames:
-                name_parts.append(forenames)
-            if keyname:
-                name_parts.append(keyname)
-            if name_parts:
-                authors.append(" ".join(name_parts))
-        return [author for author in authors if author]
-
-    def _extract_primary_category(self, paper_elem: ET.Element) -> str:
-        """提取主分类，兼容不同 OAI 扩展字段命名。"""
-        primary_category = self._find_first_descendant(paper_elem, "primary_category")
-        if primary_category is None:
-            # 不同 arXiv/OAI 元数据版本里字段名可能不同，这里同时兼容 snake/camel 两种写法。
-            primary_category = self._find_first_descendant(paper_elem, "primaryCategory")
-        if primary_category is None:
-            return ""
-        term = primary_category.attrib.get("term", "").strip()
-        if term:
-            # term 属性通常比节点文本更规范，优先使用它作为主分类真值。
-            return term
-        return self._normalize_whitespace(primary_category.text or "")
-
-    def _extract_resumption_token(self, root: ET.Element) -> str:
-        """从 OAI-PMH 响应中提取翻页续传 token。"""
-        token_elem = self._find_first_descendant(root, "resumptionToken")
-        if token_elem is None or token_elem.text is None:
-            return ""
-        # 空串由上层统一解释为“没有下一页”，避免把 XML 细节暴露到同步主循环。
-        return token_elem.text.strip()
-
-    def _extract_oai_error(self, root: ET.Element) -> str:
-        """提取 OAI-PMH 错误节点，拼成可直接记录的错误文本。"""
-        error_elem = self._find_first_descendant(root, "error")
-        if error_elem is None:
-            return ""
-        code = error_elem.attrib.get("code", "").strip()
-        text = self._normalize_whitespace(error_elem.text or "")
-        if code and text:
-            # 把 code 和文本合并成单行字符串，方便日志与告警直接展示。
-            return f"{code}: {text}"
-        return code or text
+            embedding_stats = self.embedding_handler.store_paper_embeddings_batch(persisted_papers, embedding_stats)
+            # 同步回主统计对象
+            stats.embeddings_attempted = embedding_stats.embeddings_attempted
+            stats.embeddings_written = embedding_stats.embeddings_written
+            stats.embeddings_skipped_existing = embedding_stats.embeddings_skipped_existing
+            stats.embedding_errors = embedding_stats.embedding_errors
+            stats.embedding_input_tokens = embedding_stats.embedding_input_tokens
+            stats.embedding_output_tokens = embedding_stats.embedding_output_tokens
+            stats.embedding_total_tokens = embedding_stats.embedding_total_tokens
+            stats.embedding_cost_yuan = embedding_stats.embedding_cost_yuan
 
     def _is_allowed_categories(self, categories: Sequence[str]) -> bool:
         """判断论文分类是否命中允许同步的目标分类集合。"""
@@ -2159,29 +1615,6 @@ class ArxivOaiSyncService:
         # 避免把主业务相关论文仅因额外挂了非白名单分类而整体过滤掉。
         return any(category in TARGET_CATEGORIES for category in normalized)
 
-    def _split_categories(self, categories_text: str) -> List[str]:
-        """把分类字符串拆成分类列表。"""
-        if not categories_text:
-            return []
-        # OAI categories 常见为空格分隔，但也兼容逗号分隔的历史数据。
-        raw_items = re.split(r"[\s,]+", categories_text.strip())
-        return [item for item in (part.strip() for part in raw_items) if item]
-
-    def _normalize_arxiv_id(self, raw_value: str) -> str:
-        """把 OAI / URL / 带版本号的原始 ID 规整成统一 arXiv ID。"""
-        value = self._normalize_whitespace(raw_value)
-        if not value:
-            return ""
-        # 去掉常见前缀和 URL 包装，保证后续主键、链接和查询都基于同一 ID 形态。
-        value = re.sub(r"^oai:arXiv\.org:", "", value, flags=re.IGNORECASE)
-        value = re.sub(r"^arxiv:", "", value, flags=re.IGNORECASE)
-        if "arxiv.org/abs/" in value.lower():
-            value = value.rsplit("/", 1)[-1]
-        value = value.split("?", 1)[0].strip()
-        # 版本号不参与主键归一化，避免同一论文不同版本重复入库。
-        value = re.sub(r"v\d+$", "", value)
-        return value
-
     def _parse_retry_after(self, retry_after: Optional[str]) -> float:
         """把 Retry-After 头解析成秒数；解析失败时返回 0。"""
         if not retry_after:
@@ -2191,51 +1624,3 @@ class ArxivOaiSyncService:
         except ValueError:
             # 这里只支持秒级数值；无法解析时交给上层退避策略自行兜底。
             return 0.0
-
-    def _find_first_child(self, parent: ET.Element, local_name: str) -> Optional[ET.Element]:
-        """在直接子节点里查找第一个指定本地名的元素。"""
-        for child in list(parent):
-            if self._local_name(child.tag) == local_name:
-                return child
-        # 返回 None 让上层自行决定是“字段可缺省”还是“解析失败”。
-        return None
-
-    def _find_first_element_child(self, parent: ET.Element) -> Optional[ET.Element]:
-        """返回第一个真正的元素子节点，跳过注释等非元素节点。"""
-        for child in list(parent):
-            if isinstance(child.tag, str):
-                return child
-        # metadata 节点可能为空；这里显式返回 None 供上层统计缺失原因。
-        return None
-
-    def _find_first_descendant(self, parent: ET.Element, local_name: str) -> Optional[ET.Element]:
-        """在整棵子树里查找第一个指定本地名的元素。"""
-        for node in parent.iter():
-            if self._local_name(node.tag) == local_name:
-                return node
-        # 统一使用 None 表示未命中，减少辅助函数之间的异常分支。
-        return None
-
-    def _extract_text(self, parent: ET.Element, local_name: str) -> str:
-        """提取第一个命中节点的文本内容；缺失时返回空串。"""
-        element = self._find_first_descendant(parent, local_name)
-        if element is None or element.text is None:
-            return ""
-        # 解析阶段直接做 strip，避免调用方反复处理首尾空白。
-        return element.text.strip()
-
-    def _local_name(self, tag: Any) -> str:
-        """剥离 XML 命名空间前缀，返回纯本地标签名。"""
-        if not isinstance(tag, str):
-            return ""
-        if "}" in tag:
-            # ElementTree 会把命名空间编码进 `{namespace}tag` 形式，这里统一去掉前缀。
-            return tag.rsplit("}", 1)[-1]
-        return tag
-
-    def _normalize_whitespace(self, value: str) -> str:
-        """折叠连续空白字符，得到稳定的展示和入库文本。"""
-        if not value:
-            return ""
-        # 标题、摘要、作者名都可能带换行或多空格，统一规整后更利于检索和比较。
-        return " ".join(value.split()).strip()
