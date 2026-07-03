@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     # 这些类型只服务静态检查和编辑器提示；运行时仍保持懒加载，避免启动阶段实例化重型服务。
     from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
     from services.arxiv.arxiv_search_service import ArxivSearchService
-    from services.arxiv.local_arxiv_service import LocalArxivService
+    from services.arxiv.contracts import ArxivSearchBackend
     from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
     from services.llm.generation_service import GenerationService
     from services.memory import MemoryService
@@ -84,13 +84,6 @@ def get_enhanced_retrieval_service() -> EnhancedRetrievalService:
 
 
 @lru_cache(maxsize=1)
-def get_local_arxiv_service() -> LocalArxivService:
-    from services.arxiv.local_arxiv_service import LocalArxivService
-
-    return LocalArxivService()
-
-
-@lru_cache(maxsize=1)
 def get_arxiv_api_service() -> ArxivSearchService:
     from services.arxiv.arxiv_search_service import ArxivSearchService
 
@@ -98,10 +91,15 @@ def get_arxiv_api_service() -> ArxivSearchService:
 
 
 @lru_cache(maxsize=1)
-def get_arxiv_service():
+def get_arxiv_search_backend() -> ArxivSearchBackend:
+    """返回当前配置选中的 arXiv 搜索后端。
+
+    后端选择只允许出现在依赖注入层：业务代码拿到的是统一搜索协议，
+    不再感知本地兼容封装或远程 API 的具体类名。
+    """
     if DATA_SOURCE == "api":
         return get_arxiv_api_service()
-    return get_local_arxiv_service()
+    return get_oai_database_service()
 
 
 def get_current_embedding_config() -> EmbeddingConfig:
@@ -152,7 +150,7 @@ def get_recommendation_service() -> RecommendationService:
         vector_store_service=get_vector_store_service(),
         get_embedding_config=get_current_embedding_config,
         get_clustering_config=get_current_recommendation_clustering_config,
-        arxiv_service_factory=lambda: get_arxiv_service(),
+        arxiv_service_factory=lambda: get_arxiv_search_backend(),
         oai_db_service=get_oai_database_service(),
     )
 
@@ -190,9 +188,8 @@ def iter_service_getters() -> list[tuple[str, Callable[[], Any]]]:
         ("generation_service", get_generation_service),
         ("memory_service", get_memory_service),
         ("enhanced_retrieval_service", get_enhanced_retrieval_service),
-        ("local_arxiv_service", get_local_arxiv_service),
         ("arxiv_api_service", get_arxiv_api_service),
-        ("arxiv_service", get_arxiv_service),
+        ("arxiv_search_backend", get_arxiv_search_backend),
         ("paper_qa_index_builder", get_paper_qa_index_builder),
         ("index_job_manager", get_index_job_manager),
         ("recommendation_service", get_recommendation_service),

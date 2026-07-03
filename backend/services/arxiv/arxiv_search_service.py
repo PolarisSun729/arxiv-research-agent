@@ -5,36 +5,22 @@
 本地 OAI 数据库检索服务形成互补。
 """
 
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 import requests
 import feedparser
 import os
 import json
 import urllib.parse
-from enum import Enum
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
 import random
 
+from services.arxiv.contracts import ArxivRemoteSearchError
 from services.arxiv.arxiv_query_builder import (
-    ARXIV_SEARCH_CONFIG,
-    MAX_ALLOWED_RESULTS,
-    VALID_CATEGORY_OPERATORS,
-    VALID_FIELD_OPERATORS,
-    VALID_SORT_BY,
-    VALID_SORT_ORDER,
-    ArxivSearchValidationError,
-    build_arxiv_field_clause as _build_arxiv_field_clause,
-    build_arxiv_query_from_structured_params,
-    build_arxiv_raw_query,
-    build_arxiv_submitted_date_query,
-    combine_arxiv_clauses as _combine_arxiv_clauses,
     normalize_id_list as _normalize_id_list,
     normalize_text_value as _normalize_text_value,
-    quote_arxiv_text as _quote_arxiv_text,
     validate_arxiv_search_request as _validate_arxiv_search_request,
-    validate_arxiv_search_request,
 )
 logger = logging.getLogger(__name__)
 
@@ -43,23 +29,6 @@ class RateLimitError(Exception):
     自定义异常：API 请求被限流。
     """
     pass
-
-class SearchField(str, Enum):
-    """
-    arXiv API 搜索字段前缀枚举。
-
-    这些前缀用于把用户输入映射到 arXiv 查询语法中的具体字段。
-    参考: https://info.arxiv.org/help/api/user-manual.html
-    """
-    TITLE = "ti"
-    AUTHOR = "au"
-    ABSTRACT = "abs"
-    COMMENT = "co"
-    JOURNAL_REFERENCE = "jr"
-    SUBJECT_CATEGORY = "cat"
-    REPORT_NUMBER = "rn"
-    ID = "id"
-    ALL = "all"
 
 class ArxivSearchService:
     """
@@ -169,37 +138,6 @@ class ArxivSearchService:
         
         ArxivSearchService._last_request_time = time.time()
     
-    def build_field_query(self, field: Union[SearchField, str], query: str) -> str:
-        """
-        构建字段限定查询。
-
-        参数:
-            field (Union[SearchField, str]): 搜索字段。
-            query (str): 查询词。
-
-        返回:
-            str: 格式化为 ``field:query`` 的查询字符串。
-        """
-        field_prefix = field.value if isinstance(field, SearchField) else field
-        return f"{field_prefix}:{query}"
-    
-    def combine_queries(self, queries: List[str], operator: str = "AND") -> str:
-        """
-        组合多个查询条件。
-
-        参数:
-            queries (List[str]): 查询条件列表。
-            operator (str): 逻辑操作符，通常为 AND 或 OR。
-
-        返回:
-            str: 组合后的查询字符串。
-        """
-        if not queries:
-            return ""
-        if len(queries) == 1:
-            return queries[0]
-        return f" {operator} ".join(queries)
-    
     def build_query_url(self, 
                        search_query: str = "",
                        id_list: Optional[List[str]] = None,
@@ -278,18 +216,6 @@ class ArxivSearchService:
         
         return paper
     
-    def build_submitted_date_query(self, days_ago: Optional[int] = 30) -> str:
-        """
-        构建提交日期范围查询字符串。
-
-        参数:
-            days_ago (Optional[int]): 距今天数，用作起始日期。
-
-        返回:
-            str: 格式化后的 submittedDate 查询字符串。
-        """
-        return build_arxiv_submitted_date_query(days_ago)
-
     def search(
         self,
         search_query: Optional[str] = None,
@@ -339,13 +265,35 @@ class ArxivSearchService:
             sort_order,
         )
 
-        response = self._make_request_with_retry(url)
+        try:
+            response = self._make_request_with_retry(url)
+        except requests.exceptions.RequestException as exc:
+            raise ArxivRemoteSearchError(
+                "远程 arXiv API 请求失败。",
+                query=normalized_search_query,
+                reason=str(exc),
+            ) from exc
+        except RateLimitError as exc:
+            raise ArxivRemoteSearchError(
+                "远程 arXiv API 请求被限流。",
+                query=normalized_search_query,
+                reason=str(exc),
+            ) from exc
+
         feed = feedparser.parse(response.content)
 
         papers = [self.parse_arxiv_entry(entry) for entry in feed.entries]
         result = {
             "query": normalized_search_query,
             "id_list": normalized_id_list,
+            "source": "api",
+            "query_capability": {
+                "source": "api",
+                "mode": "remote_arxiv_api",
+                "full_arxiv_syntax_supported": True,
+                "supported_subset": None,
+            },
+            "warnings": [],
             "total_results": int(feed.feed.get("opensearch_totalresults", 0)),
             "start_index": int(feed.feed.get("opensearch_startindex", 0)),
             "items_per_page": int(feed.feed.get("opensearch_itemsperpage", 0)),
@@ -408,173 +356,6 @@ class ArxivSearchService:
         except requests.exceptions.RequestException as e:
             logger.error(f"Request error: {str(e)}")
             raise
-    
-    def search_papers(self, 
-                     search_query: str = "",
-                     id_list: Optional[List[str]] = None,
-                     max_results: int = 10, 
-                     start: int = 0,
-                     sort_by: str = "relevance",
-                     sort_order: str = "descending",
-                     submitted_days_ago: Optional[int] = 30) -> Dict[str, Any]:
-        """
-        搜索arXiv论文
-        
-        Args:
-            search_query (str): 搜索查询字符串，支持字段前缀语法
-                              例如: "ti:deep learning", "au:John+Doe", "cat:cs.AI"
-            id_list (Optional[List[str]]): arXiv论文ID列表，用于精确匹配
-            max_results (int): 返回结果的最大数量，默认为10
-            start (int): 起始索引，用于分页，默认为0
-            sort_by (str): 排序方式："relevance", "lastUpdatedDate", "submittedDate"
-            sort_order (str): 排序顺序："ascending", "descending"
-            submitted_days_ago (Optional[int]): 搜索提交日期在多少天内的文章，默认为30天（一个月）
-                                              设置为None或0可搜索所有日期
-            
-        Returns:
-            Dict[str, Any]: 搜索结果，包含论文列表和元信息
-            
-        Raises:
-            Exception: 请求或解析失败时
-        """
-        try:
-            raw_query = build_arxiv_raw_query(
-                search_query=search_query,
-                id_list=id_list,
-                submitted_days_ago=submitted_days_ago,
-                append_date_when_query_missing=True,
-            )
-            return self.search(
-                search_query=raw_query["final_search_query"],
-                id_list=raw_query["id_list"],
-                max_results=max_results,
-                start=start,
-                sort_by=sort_by,
-                sort_order=sort_order,
-            )
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error when searching arXiv: {str(e)}")
-            raise
-        except Exception as e:
-            logger.error(f"Error searching arXiv: {str(e)}")
-            raise
-    
-    def search_by_author(self, author: str, **kwargs) -> Dict[str, Any]:
-        """
-        按作者搜索论文
-        
-        Args:
-            author (str): 作者姓名
-            **kwargs: 其他搜索参数（max_results, start, sort_by, sort_order）
-            
-        Returns:
-            Dict[str, Any]: 搜索结果
-        """
-        query = self.build_field_query(SearchField.AUTHOR, author)
-        return self.search_papers(query, **kwargs)
-    
-    def search_by_title(self, title: str, **kwargs) -> Dict[str, Any]:
-        """
-        按标题搜索论文
-        
-        Args:
-            title (str): 标题关键词
-            **kwargs: 其他搜索参数（max_results, start, sort_by, sort_order）
-            
-        Returns:
-            Dict[str, Any]: 搜索结果
-        """
-        query = self.build_field_query(SearchField.TITLE, title)
-        return self.search_papers(query, **kwargs)
-    
-    def search_by_category(self, category: str, **kwargs) -> Dict[str, Any]:
-        """
-        按学科分类搜索论文
-        
-        Args:
-            category (str): 学科分类代码，如 "cs.AI", "physics.quant-ph"
-            **kwargs: 其他搜索参数（max_results, start, sort_by, sort_order）
-            
-        Returns:
-            Dict[str, Any]: 搜索结果
-        """
-        query = self.build_field_query(SearchField.SUBJECT_CATEGORY, category)
-        return self.search_papers(query, **kwargs)
-    
-    def search_by_abstract(self, abstract: str, **kwargs) -> Dict[str, Any]:
-        """
-        按摘要搜索论文
-        
-        Args:
-            abstract (str): 摘要关键词
-            **kwargs: 其他搜索参数（max_results, start, sort_by, sort_order）
-            
-        Returns:
-            Dict[str, Any]: 搜索结果
-        """
-        query = self.build_field_query(SearchField.ABSTRACT, abstract)
-        return self.search_papers(query, **kwargs)
-    
-    def search_advanced(self, 
-                       title: Optional[str] = None,
-                       author: Optional[str] = None,
-                       abstract: Optional[str] = None,
-                       category: Optional[str] = None,
-                       comment: Optional[str] = None,
-                       journal_ref: Optional[str] = None,
-                       report_number: Optional[str] = None,
-                       operator: str = "AND",
-                       id_list: Optional[List[str]] = None,
-                       max_results: int = 10,
-                       start: int = 0,
-                       sort_by: str = "relevance",
-                       sort_order: str = "descending",
-                       submitted_days_ago: Optional[int] = 30) -> Dict[str, Any]:
-        """
-        高级搜索，支持多条件组合
-        
-        Args:
-            title (Optional[str]): 标题关键词
-            author (Optional[str]): 作者姓名
-            abstract (Optional[str]): 摘要关键词
-            category (Optional[str]): 学科分类代码
-            comment (Optional[str]): 评论关键词
-            journal_ref (Optional[str]): 期刊引用关键词
-            report_number (Optional[str]): 报告编号关键词
-            operator (str): 逻辑操作符，"AND" 或 "OR"
-            id_list (Optional[List[str]]): arXiv论文ID列表
-            max_results (int): 返回结果的最大数量
-            start (int): 起始索引
-            sort_by (str): 排序方式
-            sort_order (str): 排序顺序
-            submitted_days_ago (Optional[int]): 搜索提交日期在多少天内的文章，默认为30天（一个月）
-                                              设置为None或0可搜索所有日期
-            
-        Returns:
-            Dict[str, Any]: 搜索结果
-        """
-        structured = build_arxiv_query_from_structured_params(
-            query=None,
-            title_query=title,
-            author_query=author,
-            abstract_query=abstract,
-            categories=[category] if category else None,
-            comment_query=comment,
-            journal_ref_query=journal_ref,
-            report_number_query=report_number,
-            id_list=id_list,
-            field_operator=operator,
-            category_operator="OR",
-            submitted_days_ago=submitted_days_ago,
-        )
-        return self.search(
-            search_query=structured["final_search_query"],
-            id_list=structured["id_list"],
-            max_results=max_results,
-            start=start,
-            sort_by=sort_by,
-            sort_order=sort_order,
-        )
     
     def download_pdf(self, pdf_url: str, arxiv_id: str) -> str:
         """
@@ -644,8 +425,11 @@ class ArxivSearchService:
                              search_query: str = "",
                              id_list: Optional[List[str]] = None,
                              max_results: int = 10,
+                             start: int = 0,
+                             sort_by: str = "relevance",
+                             sort_order: str = "descending",
                              download_pdfs: bool = False,
-                             **kwargs) -> Dict[str, Any]:
+                             ) -> Dict[str, Any]:
         """
         搜索论文并保存结果，可选择下载PDF
         
@@ -653,14 +437,24 @@ class ArxivSearchService:
             search_query (str): 搜索查询字符串
             id_list (Optional[List[str]]): arXiv论文ID列表
             max_results (int): 返回结果的最大数量
+            start (int): 分页起始位置
+            sort_by (str): 排序字段
+            sort_order (str): 排序方向
             download_pdfs (bool): 是否下载PDF文件
-            **kwargs: 其他搜索参数
             
         Returns:
             Dict[str, Any]: 搜索结果，包含保存的文件路径
         """
         try:
-            search_result = self.search_papers(search_query, id_list, max_results, **kwargs)
+            # search_and_save 是 remote-only 工作流，输入归一化必须由 router/tool 先完成。
+            search_result = self.search(
+                search_query=search_query,
+                id_list=id_list,
+                max_results=max_results,
+                start=start,
+                sort_by=sort_by,
+                sort_order=sort_order,
+            )
             
             search_filepath = self.save_search_results(search_result)
             

@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from services.arxiv.contracts import ArxivSearchRequestError, PreparedArxivSearchRequest
 from utils.config import get_arxiv_search_runtime_config
 
 ARXIV_SEARCH_CONFIG = get_arxiv_search_runtime_config()
@@ -20,8 +21,9 @@ VALID_CATEGORY_OPERATORS = {"AND", "OR"}
 MAX_ALLOWED_RESULTS = ARXIV_SEARCH_CONFIG["max_allowed_results"]
 
 
-class ArxivSearchValidationError(ValueError):
+class ArxivSearchValidationError(ArxivSearchRequestError):
     """arXiv 搜索请求校验失败异常。"""
+
     pass
 
 
@@ -306,7 +308,9 @@ def build_arxiv_query_from_structured_params(
 
     final_search_query = combine_arxiv_clauses(clauses, normalized_field_operator)
     submitted_date_query = None
+    submitted_days_ago_applied = False
     if submitted_days_ago is not None and submitted_days_ago >= 0:
+        submitted_days_ago_applied = True
         submitted_date_query = build_arxiv_submitted_date_query(submitted_days_ago)
         if final_search_query:
             final_search_query = f"{final_search_query} AND {submitted_date_query}"
@@ -340,8 +344,124 @@ def build_arxiv_query_from_structured_params(
             "category_operator": normalized_category_operator,
             "submitted_days_ago": submitted_days_ago,
             "submitted_date_query": submitted_date_query,
+            "submitted_days_ago_applied": submitted_days_ago_applied,
         },
         "final_search_query": final_search_query,
         "id_list": normalized_id_list,
         "submitted_date_query": submitted_date_query,
+        "submitted_days_ago_applied": submitted_days_ago_applied,
+    }
+
+
+def prepare_arxiv_search_request(
+    *,
+    search_query: Optional[str] = None,
+    id_list: Optional[List[str]] = None,
+    title_query: Optional[str] = None,
+    author_query: Optional[str] = None,
+    abstract_query: Optional[str] = None,
+    categories: Optional[List[str]] = None,
+    category: Optional[str] = None,
+    comment_query: Optional[str] = None,
+    journal_ref_query: Optional[str] = None,
+    report_number_query: Optional[str] = None,
+    field_operator: str = "AND",
+    category_operator: str = "OR",
+    submitted_days_ago: Optional[int] = None,
+    max_results: int = 10,
+    start: int = 0,
+    sort_by: str = "relevance",
+    sort_order: str = "descending",
+    append_date_when_query_missing: bool = False,
+    strict_submitted_days_ago: bool = False,
+) -> PreparedArxivSearchRequest:
+    """把原始/结构化 arXiv 输入统一归一化为后端可执行请求。
+
+    该函数是输入层唯一的搜索请求准备入口：router、tools 和 remote-only
+    workflow 都应先调用它，再把 final_search_query/id_list 交给 search()。
+    """
+    if strict_submitted_days_ago and submitted_days_ago is not None and int(submitted_days_ago) < 0:
+        # submitted_days_ago 是输入层便捷语义，必须在统一入口失败，避免结构化查询绕过 raw 查询的校验。
+        raise ArxivSearchValidationError(
+            "arxiv_invalid_query: submitted_days_ago must be greater than or equal to 0"
+        )
+
+    normalized_categories = [str(item).strip() for item in (categories or []) if str(item).strip()]
+    normalized_category = normalize_text_value(category)
+    if normalized_category:
+        # 单分类字段是 HTTP 表单的便捷形态，进入 builder 前统一转成 categories 列表。
+        normalized_categories.append(normalized_category)
+
+    structured_fields_present = any(
+        [
+            normalize_text_value(title_query),
+            normalize_text_value(author_query),
+            normalize_text_value(abstract_query),
+            normalized_categories,
+            normalize_text_value(comment_query),
+            normalize_text_value(journal_ref_query),
+            normalize_text_value(report_number_query),
+        ]
+    )
+
+    if structured_fields_present:
+        prepared = build_arxiv_query_from_structured_params(
+            query=search_query,
+            title_query=title_query,
+            author_query=author_query,
+            abstract_query=abstract_query,
+            categories=normalized_categories or None,
+            comment_query=comment_query,
+            journal_ref_query=journal_ref_query,
+            report_number_query=report_number_query,
+            id_list=id_list,
+            field_operator=field_operator,
+            category_operator=category_operator,
+            submitted_days_ago=submitted_days_ago,
+        )
+        mode = "structured"
+    else:
+        prepared = build_arxiv_raw_query(
+            search_query=search_query,
+            id_list=id_list,
+            submitted_days_ago=submitted_days_ago,
+            append_date_when_query_missing=append_date_when_query_missing,
+            strict_submitted_days_ago=strict_submitted_days_ago,
+        )
+        mode = "raw"
+
+    final_search_query = prepared["final_search_query"]
+    normalized_id_list = prepared["id_list"]
+    validate_arxiv_search_request(
+        search_query=final_search_query,
+        id_list=normalized_id_list,
+        max_results=max_results,
+        start=start,
+        sort_by=sort_by,
+        sort_order=sort_order,
+    )
+
+    normalized_inputs = dict(prepared["normalized_inputs"])
+    normalized_inputs.update(
+        {
+            "max_results": max_results,
+            "start": start,
+            "sort_by": sort_by,
+            "sort_order": sort_order,
+            "mode": mode,
+        }
+    )
+
+    return {
+        "mode": mode,
+        "raw_inputs": prepared["raw_inputs"],
+        "normalized_inputs": normalized_inputs,
+        "final_search_query": final_search_query,
+        "id_list": normalized_id_list,
+        "max_results": int(max_results),
+        "start": int(start),
+        "sort_by": sort_by,
+        "sort_order": sort_order,
+        "submitted_date_query": prepared.get("submitted_date_query"),
+        "submitted_days_ago_applied": bool(prepared.get("submitted_days_ago_applied")),
     }

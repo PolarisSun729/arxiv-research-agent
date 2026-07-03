@@ -95,7 +95,7 @@ class HelperInfrastructureTests(unittest.TestCase):
             ]
         )
 
-        result = service.search_papers(id_list=["2"], max_results=5)
+        result = service.search(id_list=["2"], max_results=5)
 
         self.assertEqual(len(result["papers"]), 1)
         self.assertEqual(result["papers"][0]["title"], "Paper 2")

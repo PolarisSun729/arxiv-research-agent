@@ -9,6 +9,7 @@ from services.arxiv.arxiv_query_builder import (
     combine_arxiv_clauses,
     normalize_id_list,
     normalize_text_value,
+    prepare_arxiv_search_request,
     quote_arxiv_text,
     validate_arxiv_search_request,
 )
@@ -166,6 +167,56 @@ def test_build_arxiv_raw_query_ignores_negative_submitted_days_when_not_strict()
 def test_build_arxiv_raw_query_rejects_negative_submitted_days_when_strict() -> None:
     with pytest.raises(ArxivSearchValidationError, match="submitted_days_ago must be greater than or equal to 0"):
         build_arxiv_raw_query(search_query="rag", submitted_days_ago=-3, strict_submitted_days_ago=True)
+
+
+def test_prepare_arxiv_search_request_normalizes_raw_query_once() -> None:
+    payload = prepare_arxiv_search_request(
+        search_query="  rag systems  ",
+        id_list=[" 2401.00001 "],
+        submitted_days_ago=7,
+        max_results=5,
+        start=2,
+        sort_by="submittedDate",
+        sort_order="ascending",
+        strict_submitted_days_ago=True,
+    )
+
+    assert payload["mode"] == "raw"
+    assert payload["final_search_query"].startswith("(rag systems) AND submittedDate:[")
+    assert payload["id_list"] == ["2401.00001"]
+    assert payload["max_results"] == 5
+    assert payload["start"] == 2
+    assert payload["normalized_inputs"]["mode"] == "raw"
+    assert payload["submitted_days_ago_applied"] is True
+
+
+def test_prepare_arxiv_search_request_normalizes_structured_query_once() -> None:
+    payload = prepare_arxiv_search_request(
+        search_query="retrieval",
+        title_query="graph rag",
+        categories=[" cs.IR "],
+        category="cs.CL",
+        field_operator="or",
+        category_operator="and",
+        max_results=3,
+    )
+
+    assert payload["mode"] == "structured"
+    assert "all:retrieval" in payload["final_search_query"]
+    assert 'ti:"graph rag"' in payload["final_search_query"]
+    assert "(cat:cs.IR AND cat:cs.CL)" in payload["final_search_query"]
+    assert payload["normalized_inputs"]["field_operator"] == "OR"
+    assert payload["normalized_inputs"]["category_operator"] == "AND"
+    assert payload["normalized_inputs"]["mode"] == "structured"
+
+
+def test_prepare_arxiv_search_request_rejects_negative_submitted_days_for_structured_query() -> None:
+    with pytest.raises(ArxivSearchValidationError, match="submitted_days_ago must be greater than or equal to 0"):
+        prepare_arxiv_search_request(
+            title_query="rag",
+            submitted_days_ago=-1,
+            strict_submitted_days_ago=True,
+        )
 
 
 def test_build_arxiv_query_from_structured_params_combines_core_fields() -> None:

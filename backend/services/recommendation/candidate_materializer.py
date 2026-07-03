@@ -335,7 +335,8 @@ class CandidateMaterializer:
             time.sleep(wait_seconds)
 
         arxiv_service = self.arxiv_service_factory()
-        search_result = arxiv_service.search_papers(id_list=[arxiv_id], max_results=1, submitted_days_ago=None)
+        # 补拉单篇论文只需要后端协议的精确 ID 查询；日期过滤属于输入层，不再进入搜索后端。
+        search_result = arxiv_service.search(id_list=[arxiv_id], max_results=1)
         papers = search_result.get("papers", []) if isinstance(search_result, dict) else []
         return papers[0] if papers else None
 

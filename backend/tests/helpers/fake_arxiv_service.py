@@ -30,10 +30,6 @@ class FakeArxivService:
         papers = self._select_papers(id_list=id_list, max_results=max_results)
         return {"papers": papers, "total_results": len(papers), "query": search_query}
 
-    def search_papers(self, search_query: str = "", id_list: Optional[Iterable[str]] = None, max_results: int = 10, **kwargs: Any) -> Dict[str, Any]:
-        self._record("search_papers", search_query=search_query, id_list=list(id_list or []), max_results=max_results, kwargs=kwargs)
-        return self.search(search_query=search_query, id_list=id_list, max_results=max_results, **kwargs)
-
     def download_pdf(self, pdf_url: str, arxiv_id: str, *_args: Any, **_kwargs: Any) -> str:
         self._record("download_pdf", pdf_url=pdf_url, arxiv_id=arxiv_id)
         return self.pdf_path

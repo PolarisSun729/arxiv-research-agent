@@ -164,7 +164,7 @@ def _ensure_dependency_stubs() -> None:
     dependencies_module.get_generation_service = lambda: DEPENDENCY_BAG.generation_service
     dependencies_module.get_recommendation_service = lambda: DEPENDENCY_BAG.recommendation_service
     dependencies_module.get_paper_qa_service = lambda: DEPENDENCY_BAG.paper_qa_service
-    dependencies_module.get_arxiv_service = lambda: DEPENDENCY_BAG.arxiv_service
+    dependencies_module.get_arxiv_search_backend = lambda: DEPENDENCY_BAG.arxiv_service
     dependencies_module.get_database_service = getattr(dependencies_module, "get_database_service", lambda: None)
     dependencies_module.get_memory_service = getattr(dependencies_module, "get_memory_service", lambda: None)
     sys.modules["dependencies"] = dependencies_module

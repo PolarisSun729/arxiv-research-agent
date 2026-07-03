@@ -66,6 +66,7 @@
  - `backend/services/arxiv/local_arxiv_service.py`
  - `backend/services/arxiv/arxiv_oai_service.py`
  - `backend/services/arxiv/arxiv_query_builder.py`
+ - `backend/services/arxiv/contracts.py`
 
  ### 1.4 文档处理服务
 
@@ -149,7 +150,7 @@
    - `get_generation_service`
    - `get_memory_service`
    - `get_enhanced_retrieval_service`
-   - `get_arxiv_service`
+   - `get_arxiv_search_backend`
    - `get_paper_qa_index_builder`
    - `get_index_job_manager`
    - `get_recommendation_service`
@@ -198,9 +199,9 @@
  - `arxiv_search_service.py`
    - `ArxivSearchService`
    - `RateLimitError`
-   - `SearchField`
- - `local_arxiv_service.py`
-   - `LocalArxivService`
+ - `contracts.py`
+   - `ArxivSearchBackend`
+   - `ArxivSearchError`
  - `arxiv_oai_service.py`
    - `ArxivOaiSyncStats`
    - `ArxivOaiDatabaseService`
@@ -214,6 +215,7 @@
    - `validate_arxiv_search_request`
    - `build_arxiv_raw_query`
    - `build_arxiv_query_from_structured_params`
+   - `prepare_arxiv_search_request`
 
  ### 2.4 文档处理服务
 

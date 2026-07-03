@@ -108,7 +108,7 @@ class BackendStartupSmokeTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.app = self.main.create_app(load_mode="lazy")
-        self.app.dependency_overrides[self.dependencies.get_arxiv_service] = lambda: _FakeArxivService()
+        self.app.dependency_overrides[self.dependencies.get_arxiv_search_backend] = lambda: _FakeArxivService()
         # arxiv 下载路由的请求体校验发生在依赖解析之后；这里也覆盖 API service，
         # 避免前序测试留下的 arXiv service 桩污染 smoke 测试的校验错误断言。
         self.app.dependency_overrides[self.dependencies.get_arxiv_api_service] = lambda: _FakeArxivService()
@@ -193,7 +193,7 @@ class BackendStartupSmokeTests(unittest.TestCase):
 
     def test_lazy_lifespan_does_not_preload_heavy_services(self) -> None:
         app = self.main.create_app(load_mode="lazy")
-        app.dependency_overrides[self.dependencies.get_arxiv_service] = lambda: _FakeArxivService()
+        app.dependency_overrides[self.dependencies.get_arxiv_search_backend] = lambda: _FakeArxivService()
 
         # 进入 TestClient 上下文才会真正触发 FastAPI lifespan；这里验证 lazy 启动不会走预热分支。
         with mock.patch.object(self.main, "warm_up_services", side_effect=AssertionError("should stay lazy")):

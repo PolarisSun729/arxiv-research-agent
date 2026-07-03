@@ -4,20 +4,18 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
-from dependencies import DATA_SOURCE, get_arxiv_service as get_dependency_arxiv_service
+from dependencies import DATA_SOURCE, get_arxiv_search_backend as get_dependency_arxiv_search_backend
 from dependencies import get_database_service, get_recommendation_service
 
 from services.arxiv.arxiv_query_builder import (
     ArxivSearchValidationError,
-    build_arxiv_query_from_structured_params,
-    build_arxiv_raw_query,
-    validate_arxiv_search_request,
+    prepare_arxiv_search_request,
 )
 from .tool_result import make_tool_error, make_tool_result, make_tool_trace
 
 
-def get_arxiv_service():
-    return get_dependency_arxiv_service()
+def get_arxiv_search_backend():
+    return get_dependency_arxiv_search_backend()
 
 
 def _normalize_source_paper(source_paper: Dict[str, Any], fallback_arxiv_id: str) -> Dict[str, Any]:
@@ -96,38 +94,31 @@ def _run_search(
     *,
     tool_name: str,
     raw_inputs: Dict[str, Any],
-    normalized_inputs: Dict[str, Any],
-    search_query: Optional[str],
-    id_list: Optional[List[str]],
-    max_results: int,
-    start: int,
-    sort_by: str,
-    sort_order: str,
-    submitted_days_ago_applied: Optional[bool] = None,
+    prepared_request: Dict[str, Any],
 ) -> Dict[str, Any]:
-    arxiv_service = get_arxiv_service()
-    result = arxiv_service.search(
-        search_query=search_query,
-        id_list=id_list,
-        max_results=max_results,
-        start=start,
-        sort_by=sort_by,
-        sort_order=sort_order,
+    arxiv_backend = get_arxiv_search_backend()
+    result = arxiv_backend.search(
+        search_query=prepared_request["final_search_query"],
+        id_list=prepared_request["id_list"],
+        max_results=prepared_request["max_results"],
+        start=prepared_request["start"],
+        sort_by=prepared_request["sort_by"],
+        sort_order=prepared_request["sort_order"],
     )
     papers = result.get("papers", []) if isinstance(result, dict) else []
     query_capability = result.get("query_capability") if isinstance(result, dict) else None
     trace = _build_search_trace(
         tool_name=tool_name,
         raw_inputs=raw_inputs,
-        normalized_inputs=normalized_inputs,
-        final_search_query=search_query,
-        id_list=id_list,
-        sort_by=sort_by,
-        sort_order=sort_order,
-        start=start,
-        max_results=max_results,
+        normalized_inputs=prepared_request["normalized_inputs"],
+        final_search_query=prepared_request["final_search_query"],
+        id_list=prepared_request["id_list"],
+        sort_by=prepared_request["sort_by"],
+        sort_order=prepared_request["sort_order"],
+        start=prepared_request["start"],
+        max_results=prepared_request["max_results"],
         returned_count=len(papers),
-        submitted_days_ago_applied=submitted_days_ago_applied,
+        submitted_days_ago_applied=prepared_request.get("submitted_days_ago_applied"),
     )
     if isinstance(query_capability, dict):
         trace["query_capability"] = query_capability
@@ -160,42 +151,21 @@ def search_arxiv_raw(
         "submitted_days_ago": submitted_days_ago,
     }
     try:
-        raw_query = build_arxiv_raw_query(
+        prepared = prepare_arxiv_search_request(
             search_query=search_query,
             id_list=id_list,
             submitted_days_ago=submitted_days_ago,
+            max_results=max_results,
+            start=start,
+            sort_by=sort_by,
+            sort_order=sort_order,
             append_date_when_query_missing=True,
             strict_submitted_days_ago=True,
         )
-        final_search_query = raw_query["final_search_query"]
-        normalized_id_list = raw_query["id_list"]
-
-        validate_arxiv_search_request(
-            search_query=final_search_query,
-            id_list=normalized_id_list,
-            max_results=max_results,
-            start=start,
-            sort_by=sort_by,
-            sort_order=sort_order,
-        )
-
-        normalized_inputs = {
-            "search_query": raw_query["normalized_inputs"]["search_query"],
-            "id_list": normalized_id_list,
-            "submitted_days_ago": submitted_days_ago,
-            "submitted_days_ago_applied": raw_query["submitted_days_ago_applied"],
-        }
         return _run_search(
             tool_name=tool_name,
             raw_inputs=raw_inputs,
-            normalized_inputs=normalized_inputs,
-            search_query=final_search_query,
-            id_list=normalized_id_list,
-            max_results=max_results,
-            start=start,
-            sort_by=sort_by,
-            sort_order=sort_order,
-            submitted_days_ago_applied=raw_query["submitted_days_ago_applied"],
+            prepared_request=prepared,
         )
     except ArxivSearchValidationError as exc:
         return make_tool_result(
@@ -284,8 +254,8 @@ def search_arxiv_structured(
         "sort_order": sort_order,
     }
     try:
-        structured = build_arxiv_query_from_structured_params(
-            query=query,
+        prepared = prepare_arxiv_search_request(
+            search_query=query,
             title_query=title_query,
             author_query=author_query,
             abstract_query=abstract_query,
@@ -297,34 +267,16 @@ def search_arxiv_structured(
             field_operator=field_operator,
             category_operator=category_operator,
             submitted_days_ago=submitted_days_ago,
-        )
-        validate_arxiv_search_request(
-            search_query=structured["final_search_query"],
-            id_list=structured["id_list"],
             max_results=max_results,
             start=start,
             sort_by=sort_by,
             sort_order=sort_order,
-        )
-        normalized_inputs = dict(structured["normalized_inputs"])
-        normalized_inputs.update(
-            {
-                "max_results": max_results,
-                "start": start,
-                "sort_by": sort_by,
-                "sort_order": sort_order,
-            }
+            strict_submitted_days_ago=True,
         )
         return _run_search(
             tool_name=tool_name,
             raw_inputs=raw_inputs,
-            normalized_inputs=normalized_inputs,
-            search_query=structured["final_search_query"],
-            id_list=structured["id_list"],
-            max_results=max_results,
-            start=start,
-            sort_by=sort_by,
-            sort_order=sort_order,
+            prepared_request=prepared,
         )
     except ArxivSearchValidationError as exc:
         return make_tool_result(

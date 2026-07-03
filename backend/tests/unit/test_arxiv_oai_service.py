@@ -24,6 +24,10 @@ def _reload_real_config_module() -> None:
     spec.loader.exec_module(module)
 
 
+_saved_embedding_module = sys.modules.get("services.embedding.embedding_service")
+_saved_vector_store_module = sys.modules.get("services.storage.vector_store_service")
+
+# OAI 单测只验证 SQLite 查询逻辑，导入阶段用轻量桩挡住 embedding/vector-store 的重型依赖。
 embedding_module = types.ModuleType("services.embedding.embedding_service")
 embedding_module.EmbeddingService = object
 sys.modules["services.embedding.embedding_service"] = embedding_module
@@ -40,7 +44,18 @@ _reload_real_config_module()
 # 因此导入前必须清理残留桩，避免拿到没有查询方法的占位类。
 sys.modules.pop("services.arxiv.arxiv_oai_service", None)
 
-from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
+try:
+    from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
+finally:
+    # 轻量桩只服务本模块导入；恢复公共模块，避免 pytest 混跑时污染后续真实服务测试。
+    if _saved_embedding_module is None:
+        sys.modules.pop("services.embedding.embedding_service", None)
+    else:
+        sys.modules["services.embedding.embedding_service"] = _saved_embedding_module
+    if _saved_vector_store_module is None:
+        sys.modules.pop("services.storage.vector_store_service", None)
+    else:
+        sys.modules["services.storage.vector_store_service"] = _saved_vector_store_module
 
 
 def _make_service_without_init() -> ArxivOaiDatabaseService:
