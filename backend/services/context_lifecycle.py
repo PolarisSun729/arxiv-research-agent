@@ -133,6 +133,36 @@ class ContextLifecycleService:
             result["trace_cleanup"] = self.cleanup_retrieval_traces(trace_export_dir)
         return result
 
+    def summarize_startup_cleanup_result(self, result: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+        """把启动清理结果压成适合 INFO 的摘要字段，避免整份策略快照把主日志刷成超长单行。"""
+        payload = dict(result or {})
+        deleted_langgraph = dict(payload.get("deleted_langgraph") or {})
+        trace_cleanup = dict(payload.get("trace_cleanup") or {})
+        errors = list(payload.get("errors") or [])
+        summary: Dict[str, Any] = {
+            "expired_runtime_checkpoints": int(payload.get("expired_runtime_checkpoints") or 0),
+            "deleted_runtime_checkpoints": int(payload.get("deleted_runtime_checkpoints") or 0),
+            "deleted_langgraph_threads": int(deleted_langgraph.get("threads") or 0),
+            "deleted_langgraph_checkpoints": int(deleted_langgraph.get("checkpoints") or 0),
+            "deleted_langgraph_writes": int(deleted_langgraph.get("writes") or 0),
+            "trace_cleanup_enabled": bool(trace_cleanup.get("enabled")),
+            "trace_cleanup_deleted_files": int(trace_cleanup.get("deleted_files") or 0),
+            "error_count": len(errors),
+        }
+        if trace_cleanup:
+            # trace 目录是否缺失只影响诊断，不需要把整份 trace_cleanup 结构塞进 INFO 日志。
+            summary["trace_cleanup_missing"] = bool(trace_cleanup.get("missing"))
+            summary["trace_cleanup_failed"] = bool(trace_cleanup.get("error"))
+        error_stages = [
+            str(item.get("stage")).strip()
+            for item in errors
+            if isinstance(item, Mapping) and str(item.get("stage") or "").strip()
+        ]
+        if error_stages:
+            # 只保留失败阶段名，既能快速判断卡在哪一段，也避免把完整异常文本重复打到主时间线。
+            summary["error_stages"] = error_stages
+        return summary
+
     def cleanup_retrieval_traces(self, trace_export_dir: Any) -> Dict[str, Any]:
         """按论文分桶保留最近 trace 文件，避免开发 trace 目录无限增长。"""
         result = {"enabled": True, "root": str(trace_export_dir), "deleted_files": 0, "kept_per_paper": self.max_trace_files_per_paper}

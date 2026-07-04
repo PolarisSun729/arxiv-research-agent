@@ -11,10 +11,11 @@ import os
 import re
 import time
 import sqlite3
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
 
@@ -23,9 +24,15 @@ from services.arxiv.arxiv_oai_xml_parser import ArxivOaiXmlParser
 from services.arxiv.arxiv_query_compiler import ArxivQueryCompiler
 from services.arxiv.arxiv_query_parser import ArxivQueryParser, LOCAL_OAI_SUPPORTED_QUERY_SUBSET
 from services.arxiv.contracts import ArxivSearchError
-from services.embedding.embedding_service import EmbeddingService
-from services.storage.vector_store_service import VectorStoreService
+from services.arxiv.local_oai_search_contract import (
+    LocalArxivSearchIndexUnavailable as SharedLocalArxivSearchIndexUnavailable,
+)
 from utils.config import OAI_SQLITE_CONFIG, get_arxiv_oai_runtime_config
+
+if TYPE_CHECKING:
+    # 这些重依赖只服务类型提示；运行时保持懒导入，避免只读 SQLite 统计时也要求安装向量库客户端。
+    from services.embedding.embedding_service import EmbeddingService
+    from services.storage.vector_store_service import VectorStoreService
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +42,11 @@ TARGET_CATEGORIES = set(ARXIV_OAI_CONFIG["target_categories"])
 OAI_EMBEDDING_BATCH_SIZE = ARXIV_OAI_CONFIG["embedding_batch_size"]
 OAI_VECTOR_QUERY_BATCH_SIZE = ARXIV_OAI_CONFIG["vector_query_batch_size"]
 OAI_DASHSCOPE_TEXT_TOKEN_PRICE_PER_1K = ARXIV_OAI_CONFIG["dashscope_text_token_price_per_1k"]
+OAI_SEARCH_REBUILD_COMMAND = r"07-arxiv-tools\rebuild_arxiv_oai_search_index.cmd"
+OAI_INDEX_REBUILD_BATCH_SIZE = 1000
+OAI_INDEX_REBUILD_STALE_SECONDS = 15 * 60
+OAI_INDEX_REBUILD_VERSION = "local_oai_search_index_rebuild_v2"
+OAI_REBUILD_STATE_ID = 1
 
 
 
@@ -86,6 +98,7 @@ class LocalArxivSearchIndexUnavailable(LocalArxivSearchError):
     """FTS5 不可用或索引未就绪时抛出，禁止退回低精度 LIKE 兜底。"""
 
     code = "local_search_index_unavailable"
+    status_code = 503
 
 
 def build_local_oai_query_capability(
@@ -201,6 +214,409 @@ class ArxivOaiDatabaseService:
             logger.warning("SQLite FTS5 is unavailable for local OAI search: %s", exc)
             return False
 
+    def _now_iso(self) -> str:
+        """生成状态表使用的时间戳，统一格式便于脚本和日志直接展示。"""
+        return datetime.now().isoformat(timespec="seconds")
+
+    def _ensure_search_rebuild_state_table(self, cursor: sqlite3.Cursor) -> None:
+        """创建单行重建状态表，用于续跑、防重入和查询侧状态解释。"""
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS arxiv_oai_search_rebuild_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                status TEXT NOT NULL,
+                rebuild_version TEXT NOT NULL,
+                owner TEXT,
+                heartbeat_at TEXT,
+                stale_after_seconds INTEGER NOT NULL DEFAULT 900,
+                batch_size INTEGER NOT NULL DEFAULT 1000,
+                total_papers INTEGER NOT NULL DEFAULT 0,
+                processed_count INTEGER NOT NULL DEFAULT 0,
+                last_arxiv_id TEXT,
+                fts5_available INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT,
+                updated_at TEXT,
+                finished_at TEXT,
+                error TEXT
+            )
+            """
+        )
+
+    def _read_search_rebuild_state(self, cursor: sqlite3.Cursor) -> Optional[Dict[str, Any]]:
+        """读取当前重建状态；无记录表示尚未由新流程接管过。"""
+        self._ensure_search_rebuild_state_table(cursor)
+        cursor.execute(
+            """
+            SELECT
+                id,
+                status,
+                rebuild_version,
+                owner,
+                heartbeat_at,
+                stale_after_seconds,
+                batch_size,
+                total_papers,
+                processed_count,
+                last_arxiv_id,
+                fts5_available,
+                started_at,
+                updated_at,
+                finished_at,
+                error
+            FROM arxiv_oai_search_rebuild_state
+            WHERE id = ?
+            """,
+            (OAI_REBUILD_STATE_ID,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        keys = [
+            "id",
+            "status",
+            "rebuild_version",
+            "owner",
+            "heartbeat_at",
+            "stale_after_seconds",
+            "batch_size",
+            "total_papers",
+            "processed_count",
+            "last_arxiv_id",
+            "fts5_available",
+            "started_at",
+            "updated_at",
+            "finished_at",
+            "error",
+        ]
+        return dict(zip(keys, row))
+
+    def _replace_search_rebuild_state(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        status: str,
+        owner: str,
+        heartbeat_at: str,
+        stale_after_seconds: int,
+        batch_size: int,
+        total_papers: int,
+        processed_count: int,
+        last_arxiv_id: Optional[str],
+        fts5_available: bool,
+        started_at: Optional[str],
+        updated_at: str,
+        finished_at: Optional[str],
+        error: Optional[str],
+        rebuild_version: str = OAI_INDEX_REBUILD_VERSION,
+    ) -> None:
+        """整行写入当前重建状态，新开一轮或接管失败状态时使用。"""
+        self._ensure_search_rebuild_state_table(cursor)
+        cursor.execute(
+            """
+            INSERT INTO arxiv_oai_search_rebuild_state (
+                id,
+                status,
+                rebuild_version,
+                owner,
+                heartbeat_at,
+                stale_after_seconds,
+                batch_size,
+                total_papers,
+                processed_count,
+                last_arxiv_id,
+                fts5_available,
+                started_at,
+                updated_at,
+                finished_at,
+                error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                rebuild_version = excluded.rebuild_version,
+                owner = excluded.owner,
+                heartbeat_at = excluded.heartbeat_at,
+                stale_after_seconds = excluded.stale_after_seconds,
+                batch_size = excluded.batch_size,
+                total_papers = excluded.total_papers,
+                processed_count = excluded.processed_count,
+                last_arxiv_id = excluded.last_arxiv_id,
+                fts5_available = excluded.fts5_available,
+                started_at = excluded.started_at,
+                updated_at = excluded.updated_at,
+                finished_at = excluded.finished_at,
+                error = excluded.error
+            """,
+            (
+                OAI_REBUILD_STATE_ID,
+                status,
+                rebuild_version,
+                owner,
+                heartbeat_at,
+                int(stale_after_seconds),
+                int(batch_size),
+                int(total_papers),
+                int(processed_count),
+                last_arxiv_id,
+                1 if fts5_available else 0,
+                started_at,
+                updated_at,
+                finished_at,
+                error,
+            ),
+        )
+
+    def _update_search_rebuild_state(self, cursor: sqlite3.Cursor, **fields: Any) -> None:
+        """按批次更新检查点；调用方负责把索引写入和状态更新放在同一事务内。"""
+        if not fields:
+            return
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        values = list(fields.values())
+        values.append(OAI_REBUILD_STATE_ID)
+        cursor.execute(
+            f"UPDATE arxiv_oai_search_rebuild_state SET {assignments} WHERE id = ?",
+            values,
+        )
+
+    def _is_search_rebuild_state_stale(
+        self,
+        state: Optional[Dict[str, Any]],
+        *,
+        stale_after_seconds: Optional[int] = None,
+    ) -> bool:
+        """判断正在重建的状态是否已经失去心跳，可被新进程接管。"""
+        if not state or str(state.get("status") or "") != "rebuilding":
+            return False
+        heartbeat_at = state.get("heartbeat_at")
+        if not heartbeat_at:
+            return True
+        threshold = int(stale_after_seconds or state.get("stale_after_seconds") or OAI_INDEX_REBUILD_STALE_SECONDS)
+        try:
+            heartbeat_time = datetime.fromisoformat(str(heartbeat_at))
+        except ValueError:
+            return True
+        return (datetime.now() - heartbeat_time).total_seconds() > threshold
+
+    def _is_rebuild_state_blocking_search(self, state: Optional[Dict[str, Any]]) -> bool:
+        """重建未完成或失败时，搜索接口应明确拒绝，避免读到半成品索引。"""
+        if not state:
+            return False
+        status = str(state.get("status") or "")
+        return status == "failed" or status == "rebuilding"
+
+    def _ensure_category_auxiliary_indexes(self, cursor: sqlite3.Cursor) -> None:
+        """恢复分类查询需要的辅助索引；全量重建完成前不维护这些写放大索引。"""
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_arxiv_oai_categories_category ON arxiv_oai_paper_categories(category)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_arxiv_oai_categories_arxiv_id ON arxiv_oai_paper_categories(arxiv_id)"
+        )
+
+    def _drop_category_auxiliary_indexes(self, cursor: sqlite3.Cursor) -> None:
+        """全量回填前临时移除分类辅助索引，避免每批插入都维护二级索引。"""
+        cursor.execute("DROP INDEX IF EXISTS idx_arxiv_oai_categories_category")
+        cursor.execute("DROP INDEX IF EXISTS idx_arxiv_oai_categories_arxiv_id")
+
+    def _apply_search_rebuild_pragmas(self, cursor: sqlite3.Cursor) -> None:
+        """只在手动重建连接上启用温和 PRAGMA，降低批量写入成本。"""
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA temp_store=MEMORY")
+
+    def _collect_required_search_indexes(self, node: Optional[Dict[str, Any]]) -> set[str]:
+        """递归分析 AST 依赖的索引类型，避免执行后才发现能力缺口。"""
+        if not node:
+            return set()
+
+        node_type = str(node.get("type") or "").strip().lower()
+        if node_type in {"and", "or", "andnot"}:
+            required_indexes: set[str] = set()
+            for child in node.get("children") or []:
+                required_indexes.update(self._collect_required_search_indexes(child))
+            return required_indexes
+        if node_type == "category":
+            return {"category"}
+        if node_type == "text":
+            return {"text"}
+        return set()
+
+    def _inspect_search_index_state(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        fts5_available: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """读取搜索索引现状，不在这里做任何修复。"""
+        if fts5_available is None:
+            fts5_available = self._is_fts5_available(cursor)
+
+        cursor.execute("SELECT COUNT(*) FROM arxiv_oai_papers")
+        total_papers = int((cursor.fetchone() or [0])[0] or 0)
+
+        cursor.execute("SELECT COUNT(*) FROM arxiv_oai_paper_categories")
+        category_rows = int((cursor.fetchone() or [0])[0] or 0)
+        cursor.execute("SELECT COUNT(DISTINCT arxiv_id) FROM arxiv_oai_paper_categories")
+        category_indexed_papers = int((cursor.fetchone() or [0])[0] or 0)
+
+        fts_rows = 0
+        fts_indexed_papers = 0
+        if fts5_available:
+            try:
+                cursor.execute("SELECT COUNT(*) FROM arxiv_oai_papers_fts")
+                fts_rows = int((cursor.fetchone() or [0])[0] or 0)
+                cursor.execute("SELECT COUNT(DISTINCT arxiv_id) FROM arxiv_oai_papers_fts")
+                fts_indexed_papers = int((cursor.fetchone() or [0])[0] or 0)
+            except sqlite3.Error:
+                # FTS 虚表缺失时也按未就绪处理，避免查询静默降级。
+                fts_rows = 0
+                fts_indexed_papers = 0
+
+        category_index_ready = total_papers <= 0 or category_indexed_papers >= total_papers
+        text_index_ready = total_papers <= 0 or (bool(fts5_available) and fts_indexed_papers >= total_papers)
+
+        search_index_status = "ready"
+        if not category_index_ready and not text_index_ready:
+            search_index_status = "category_and_text_index_missing"
+        elif not category_index_ready:
+            search_index_status = "category_index_missing"
+        elif not bool(fts5_available):
+            search_index_status = "text_index_unavailable"
+        elif not text_index_ready:
+            search_index_status = "text_index_missing"
+
+        rebuild_state = self._read_search_rebuild_state(cursor)
+        rebuild_state_stale = self._is_search_rebuild_state_stale(rebuild_state)
+        if rebuild_state:
+            rebuild_status = str(rebuild_state.get("status") or "")
+            if rebuild_status == "rebuilding":
+                search_index_status = "rebuild_failed" if rebuild_state_stale else "rebuilding"
+            elif rebuild_status == "failed":
+                search_index_status = "rebuild_failed"
+
+        return {
+            "total_papers": total_papers,
+            "fts5_available": bool(fts5_available),
+            "category_rows": category_rows,
+            "category_indexed_papers": category_indexed_papers,
+            "category_index_ready": category_index_ready,
+            "fts_rows": fts_rows,
+            "fts_indexed_papers": fts_indexed_papers,
+            "text_index_ready": text_index_ready,
+            "search_index_status": search_index_status,
+            "rebuild_state": rebuild_state,
+            "rebuild_state_stale": rebuild_state_stale,
+        }
+
+    def _warn_if_search_index_unready(self, state: Dict[str, Any]) -> None:
+        """启动阶段只告警不修复，让缺失索引成为显式运维动作。"""
+        if int(state.get("total_papers", 0) or 0) <= 0:
+            return
+        if str(state.get("search_index_status") or "ready") == "ready":
+            return
+        if not bool(state.get("fts5_available")) and bool(state.get("category_index_ready")):
+            logger.warning(
+                "Local OAI text search is unavailable because SQLite FTS5 is not enabled: papers=%s status=%s",
+                state.get("total_papers"),
+                state.get("search_index_status"),
+            )
+            return
+
+        logger.warning(
+            "Local OAI search index is not ready: status=%s papers=%s category_indexed=%s fts5_available=%s fts_indexed=%s rebuild_command=%s",
+            state.get("search_index_status"),
+            state.get("total_papers"),
+            state.get("category_indexed_papers"),
+            state.get("fts5_available"),
+            state.get("fts_indexed_papers"),
+            OAI_SEARCH_REBUILD_COMMAND,
+        )
+
+    def _build_search_index_unavailable_error(
+        self,
+        *,
+        query: str,
+        required_indexes: set[str],
+        state: Dict[str, Any],
+    ) -> SharedLocalArxivSearchIndexUnavailable:
+        """把索引缺口收敛成统一的 503 错误。"""
+        search_index_status = str(state.get("search_index_status") or "")
+        if search_index_status == "rebuilding":
+            return SharedLocalArxivSearchIndexUnavailable(
+                "本地 OAI 搜索索引正在重建，当前暂时不能执行本地检索。",
+                query=query,
+                reason="index_rebuilding",
+                fts5_available=bool(state.get("fts5_available")),
+                search_index_status="rebuilding",
+                suggested_action=f"请等待 {OAI_SEARCH_REBUILD_COMMAND} 完成，或使用 --status 查看当前进度。",
+            )
+        if search_index_status == "rebuild_failed":
+            return SharedLocalArxivSearchIndexUnavailable(
+                "本地 OAI 搜索索引上次重建未完成，当前不能执行本地检索。",
+                query=query,
+                reason="index_rebuild_failed",
+                fts5_available=bool(state.get("fts5_available")),
+                search_index_status="rebuild_failed",
+                suggested_action=f"请重新运行 {OAI_SEARCH_REBUILD_COMMAND} 续跑，必要时追加 --reset 从头重建。",
+            )
+        if "category" in required_indexes and not bool(state.get("category_index_ready")):
+            return SharedLocalArxivSearchIndexUnavailable(
+                "本地 OAI 镜像分类索引未就绪，当前无法执行 cat 分类检索。",
+                query=query,
+                reason="category_index_missing",
+                fts5_available=bool(state.get("fts5_available")),
+                search_index_status=str(state.get("search_index_status") or "category_index_missing"),
+                suggested_action=f"请先运行 {OAI_SEARCH_REBUILD_COMMAND} 重建本地搜索索引后重试。",
+            )
+        if "text" in required_indexes and not bool(state.get("fts5_available")):
+            return SharedLocalArxivSearchIndexUnavailable(
+                "本地 OAI 镜像文本索引不可用，当前无法执行 ti/abs/au/all 文本检索。",
+                query=query,
+                reason="fts5_unavailable",
+                fts5_available=False,
+                search_index_status="text_index_unavailable",
+                suggested_action="当前 Python/SQLite 运行时未启用 FTS5，请切换支持 FTS5 的运行环境或改用远程 arXiv API。",
+            )
+        return SharedLocalArxivSearchIndexUnavailable(
+            "本地 OAI 镜像文本索引未就绪，当前无法执行 ti/abs/au/all 文本检索。",
+            query=query,
+            reason="text_index_missing",
+            fts5_available=bool(state.get("fts5_available")),
+            search_index_status=str(state.get("search_index_status") or "text_index_missing"),
+            suggested_action=f"请先运行 {OAI_SEARCH_REBUILD_COMMAND} 重建本地搜索索引后重试。",
+        )
+
+    def _ensure_required_search_indexes_ready(
+        self,
+        *,
+        query: str,
+        query_node: Optional[Dict[str, Any]],
+        state: Dict[str, Any],
+    ) -> None:
+        """在执行查询前先校验索引就绪状态，禁止静默漏召回。"""
+        if str(state.get("search_index_status") or "") in {"rebuilding", "rebuild_failed"}:
+            raise self._build_search_index_unavailable_error(
+                query=query,
+                required_indexes=set(),
+                state=state,
+            )
+        required_indexes = self._collect_required_search_indexes(query_node)
+        if not required_indexes:
+            return
+        if "category" in required_indexes and not bool(state.get("category_index_ready")):
+            raise self._build_search_index_unavailable_error(
+                query=query,
+                required_indexes=required_indexes,
+                state=state,
+            )
+        if "text" in required_indexes and (
+            not bool(state.get("fts5_available")) or not bool(state.get("text_index_ready"))
+        ):
+            raise self._build_search_index_unavailable_error(
+                query=query,
+                required_indexes=required_indexes,
+                state=state,
+            )
+
     def _normalize_categories_for_index(self, paper: Dict[str, Any]) -> List[str]:
         """提取规范化分类列表，用独立表做精确过滤，避免 JSON 文本 LIKE 误命中。"""
         raw_categories = paper.get("categories_list")
@@ -285,6 +701,139 @@ class ArxivOaiDatabaseService:
                 (arxiv_id, title, abstract, authors_text, categories_text, all_text),
             )
 
+    def _insert_rebuild_search_index_batch(
+        self,
+        cursor: sqlite3.Cursor,
+        papers: Sequence[Dict[str, Any]],
+        *,
+        fts5_available: bool,
+    ) -> None:
+        """全量重建专用快路径：目标索引已按检查点保证追加顺序，因此不做逐篇删除。"""
+        category_rows: List[Tuple[str, str, int]] = []
+        fts_rows: List[Tuple[str, str, str, str, str, str]] = []
+        for paper in papers:
+            arxiv_id = str(paper.get("arxiv_id") or "").strip()
+            if not arxiv_id:
+                continue
+
+            categories = self._normalize_categories_for_index(paper)
+            primary_category = str(paper.get("primary_category") or "").strip()
+            category_rows.extend(
+                (arxiv_id, category, 1 if category == primary_category else 0)
+                for category in categories
+            )
+
+            authors_text = self._normalize_authors_for_index(paper)
+            categories_text = " ".join(categories)
+            title = str(paper.get("title", "") or "").strip()
+            abstract = str(paper.get("abstract", "") or "").strip()
+            # all_text 的构造规则必须和增量路径保持一致，否则重建后文本召回会漂移。
+            all_text = " ".join(
+                item
+                for item in [title, abstract, authors_text, categories_text, primary_category]
+                if item
+            )
+            fts_rows.append((arxiv_id, title, abstract, authors_text, categories_text, all_text))
+
+        if category_rows:
+            cursor.executemany(
+                """
+                INSERT OR REPLACE INTO arxiv_oai_paper_categories (arxiv_id, category, is_primary)
+                VALUES (?, ?, ?)
+                """,
+                category_rows,
+            )
+        if fts5_available and fts_rows:
+            cursor.executemany(
+                """
+                INSERT INTO arxiv_oai_papers_fts (arxiv_id, title, abstract, authors, categories, all_text)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                fts_rows,
+            )
+
+    def _fetch_rebuild_batch(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        last_arxiv_id: Optional[str],
+        batch_size: int,
+    ) -> List[Dict[str, Any]]:
+        """按 arxiv_id 做 keyset 分页，保证续跑检查点稳定且不依赖 OFFSET 扫描。"""
+        columns = """
+            arxiv_id,
+            title,
+            abstract,
+            authors,
+            categories,
+            primary_category,
+            created,
+            updated,
+            abs_url,
+            pdf_url,
+            oai_datestamp,
+            fetched_at,
+            created_at,
+            updated_at
+        """
+        if last_arxiv_id:
+            cursor.execute(
+                f"""
+                SELECT {columns}
+                FROM arxiv_oai_papers
+                WHERE arxiv_id > ?
+                ORDER BY arxiv_id
+                LIMIT ?
+                """,
+                (last_arxiv_id, batch_size),
+            )
+        else:
+            cursor.execute(
+                f"""
+                SELECT {columns}
+                FROM arxiv_oai_papers
+                ORDER BY arxiv_id
+                LIMIT ?
+                """,
+                (batch_size,),
+            )
+        return [self._parse_row(row) for row in cursor.fetchall()]
+
+    def _validate_rebuild_resume_state(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        state: Dict[str, Any],
+        batch_size: int,
+        total_papers: int,
+        fts5_available: bool,
+    ) -> None:
+        """续跑前校验状态表和部分索引一致，避免检查点领先于真实索引。"""
+        if str(state.get("rebuild_version") or "") != OAI_INDEX_REBUILD_VERSION:
+            raise RuntimeError("本地 OAI 搜索索引重建版本不一致，请使用 --reset 从头重建。")
+        if int(state.get("batch_size") or 0) != int(batch_size):
+            raise RuntimeError("本地 OAI 搜索索引重建批大小不一致，请使用原批大小续跑或使用 --reset。")
+        if int(state.get("total_papers") or 0) != int(total_papers):
+            raise RuntimeError("本地 OAI 主表数量已变化，请使用 --reset 从头重建。")
+        if bool(int(state.get("fts5_available") or 0)) != bool(fts5_available):
+            raise RuntimeError("本地 SQLite FTS5 能力已变化，请使用 --reset 从头重建。")
+
+        processed_count = int(state.get("processed_count") or 0)
+        last_arxiv_id = str(state.get("last_arxiv_id") or "").strip()
+        if processed_count <= 0:
+            if last_arxiv_id:
+                raise RuntimeError("重建检查点不一致：processed_count 为空但 last_arxiv_id 存在。")
+            return
+
+        cursor.execute("SELECT COUNT(DISTINCT arxiv_id), MAX(arxiv_id) FROM arxiv_oai_paper_categories")
+        category_count, category_last_id = cursor.fetchone() or (0, None)
+        cursor.execute("SELECT COUNT(DISTINCT arxiv_id), MAX(arxiv_id) FROM arxiv_oai_papers_fts")
+        fts_count, fts_last_id = cursor.fetchone() or (0, None)
+        if int(category_count or 0) != processed_count or str(category_last_id or "") != last_arxiv_id:
+            raise RuntimeError("分类索引和重建检查点不一致，请使用 --reset 从头重建。")
+        if int(fts_count or 0) != processed_count or str(fts_last_id or "") != last_arxiv_id:
+            raise RuntimeError("FTS 索引和重建检查点不一致，请使用 --reset 从头重建。")
+
     def _backfill_search_indexes(self, cursor: sqlite3.Cursor, *, fts5_available: bool) -> None:
         """启动时从旧主表回填新索引；该逻辑幂等，避免用户必须重新同步 OAI。"""
         cursor.execute("SELECT COUNT(*) FROM arxiv_oai_papers")
@@ -309,63 +858,343 @@ class ArxivOaiDatabaseService:
             category_count,
             fts_count,
         )
-        cursor.execute(
-            """
-            SELECT
-                arxiv_id,
-                title,
-                abstract,
-                authors,
-                categories,
-                primary_category,
-                created,
-                updated,
-                abs_url,
-                pdf_url,
-                oai_datestamp,
-                fetched_at,
-                created_at,
-                updated_at
-            FROM arxiv_oai_papers
-            """
-        )
-        rows = cursor.fetchall()
-        # 回填逻辑统一复用在线同步时的索引构建流程，减少两套实现漂移。
-        self._sync_search_index_for_papers(
-            cursor,
-            [self._parse_row(row) for row in rows],
-            fts5_available=fts5_available,
+        rebuild_started_at = time.perf_counter()
+        processed_papers = 0
+        read_cursor = cursor.connection.cursor()
+        last_arxiv_id: Optional[str] = None
+        try:
+            while True:
+                # 回填阶段会边读主表边写索引；这里改成 keyset 分页，避免同一游标的 SELECT
+                # 在 DELETE/INSERT 后被打断，导致只处理第一批数据。
+                if last_arxiv_id is None:
+                    read_cursor.execute(
+                        """
+                        SELECT
+                            arxiv_id,
+                            title,
+                            abstract,
+                            authors,
+                            categories,
+                            primary_category,
+                            created,
+                            updated,
+                            abs_url,
+                            pdf_url,
+                            oai_datestamp,
+                            fetched_at,
+                            created_at,
+                            updated_at
+                        FROM arxiv_oai_papers
+                        ORDER BY arxiv_id
+                        LIMIT ?
+                        """,
+                        (OAI_INDEX_REBUILD_BATCH_SIZE,),
+                    )
+                else:
+                    read_cursor.execute(
+                        """
+                        SELECT
+                            arxiv_id,
+                            title,
+                            abstract,
+                            authors,
+                            categories,
+                            primary_category,
+                            created,
+                            updated,
+                            abs_url,
+                            pdf_url,
+                            oai_datestamp,
+                            fetched_at,
+                            created_at,
+                            updated_at
+                        FROM arxiv_oai_papers
+                        WHERE arxiv_id > ?
+                        ORDER BY arxiv_id
+                        LIMIT ?
+                        """,
+                        (last_arxiv_id, OAI_INDEX_REBUILD_BATCH_SIZE),
+                    )
+                rows = read_cursor.fetchall()
+                if not rows:
+                    break
+
+                # 分批回填能持续输出进度，也避免大表一次性 fetchall 占用过多内存。
+                papers = [self._parse_row(row) for row in rows]
+                self._sync_search_index_for_papers(
+                    cursor,
+                    papers,
+                    fts5_available=fts5_available,
+                )
+                processed_papers += len(rows)
+                last_arxiv_id = str(papers[-1].get("arxiv_id") or "").strip() or last_arxiv_id
+                logger.info(
+                    "Backfill local OAI search indexes progress: processed=%s/%s batch_size=%s elapsed_seconds=%.2f",
+                    processed_papers,
+                    total_papers,
+                    len(rows),
+                    time.perf_counter() - rebuild_started_at,
+                )
+        finally:
+            read_cursor.close()
+
+        logger.info(
+            "Backfill local OAI search indexes completed: processed=%s/%s elapsed_seconds=%.2f",
+            processed_papers,
+            total_papers,
+            time.perf_counter() - rebuild_started_at,
         )
 
-    def rebuild_oai_search_index(self) -> Dict[str, Any]:
-        """手动重建本地搜索索引；用于 FTS schema 变化或历史索引损坏后的修复。"""
+    def rebuild_oai_search_index(
+        self,
+        *,
+        reset: bool = False,
+        batch_size: int = OAI_INDEX_REBUILD_BATCH_SIZE,
+        stale_after_seconds: int = OAI_INDEX_REBUILD_STALE_SECONDS,
+        owner: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """手动重建本地搜索索引；支持分批提交、默认续跑和严格完成校验。"""
+        normalized_batch_size = max(1, int(batch_size or OAI_INDEX_REBUILD_BATCH_SIZE))
+        normalized_stale_seconds = max(1, int(stale_after_seconds or OAI_INDEX_REBUILD_STALE_SECONDS))
+        rebuild_owner = owner or f"pid-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        owns_rebuild = False
+        started_at = self._now_iso()
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            self._apply_search_rebuild_pragmas(cursor)
+            self._ensure_search_rebuild_state_table(cursor)
+            conn.commit()
+
+            fts5_available = self._is_fts5_available(cursor)
+            cursor.execute("SELECT COUNT(*) FROM arxiv_oai_papers")
+            total_papers = int((cursor.fetchone() or [0])[0] or 0)
+            if not fts5_available:
+                now = self._now_iso()
+                self._replace_search_rebuild_state(
+                    cursor,
+                    status="failed",
+                    owner=rebuild_owner,
+                    heartbeat_at=now,
+                    stale_after_seconds=normalized_stale_seconds,
+                    batch_size=normalized_batch_size,
+                    total_papers=total_papers,
+                    processed_count=0,
+                    last_arxiv_id=None,
+                    fts5_available=False,
+                    started_at=now,
+                    updated_at=now,
+                    finished_at=now,
+                    error="SQLite FTS5 is unavailable; local text search index cannot be rebuilt.",
+                )
+                conn.commit()
+                raise RuntimeError("SQLite FTS5 不可用，无法重建本地 OAI 文本搜索索引。")
+
+            state = self._read_search_rebuild_state(cursor)
+            resume_existing = False
+            last_arxiv_id: Optional[str] = None
+            processed_papers = 0
+            if state and not reset and str(state.get("status") or "") in {"rebuilding", "failed"}:
+                if str(state.get("status") or "") == "rebuilding" and not self._is_search_rebuild_state_stale(
+                    state,
+                    stale_after_seconds=normalized_stale_seconds,
+                ):
+                    raise RuntimeError("已有本地 OAI 搜索索引重建任务正在运行，请使用 --status 查看进度。")
+                self._validate_rebuild_resume_state(
+                    cursor,
+                    state=state,
+                    batch_size=normalized_batch_size,
+                    total_papers=total_papers,
+                    fts5_available=fts5_available,
+                )
+                resume_existing = True
+                last_arxiv_id = str(state.get("last_arxiv_id") or "").strip() or None
+                processed_papers = int(state.get("processed_count") or 0)
+                now = self._now_iso()
+                # 接管 stale/failed 状态时只更新任务所有者，不清空已成功提交的批次。
+                self._drop_category_auxiliary_indexes(cursor)
+                self._update_search_rebuild_state(
+                    cursor,
+                    status="rebuilding",
+                    owner=rebuild_owner,
+                    heartbeat_at=now,
+                    stale_after_seconds=normalized_stale_seconds,
+                    updated_at=now,
+                    finished_at=None,
+                    error=None,
+                )
+                conn.commit()
+            else:
+                now = self._now_iso()
+                # 新开一轮才允许清空索引；普通启动优先续跑，避免长任务中断后从头白跑。
+                self._drop_category_auxiliary_indexes(cursor)
+                cursor.execute("DELETE FROM arxiv_oai_paper_categories")
+                cursor.execute("DELETE FROM arxiv_oai_papers_fts")
+                self._replace_search_rebuild_state(
+                    cursor,
+                    status="rebuilding",
+                    owner=rebuild_owner,
+                    heartbeat_at=now,
+                    stale_after_seconds=normalized_stale_seconds,
+                    batch_size=normalized_batch_size,
+                    total_papers=total_papers,
+                    processed_count=0,
+                    last_arxiv_id=None,
+                    fts5_available=True,
+                    started_at=now,
+                    updated_at=now,
+                    finished_at=None,
+                    error=None,
+                )
+                conn.commit()
+            owns_rebuild = True
+
+            rebuild_started_at = time.perf_counter()
+            logger.info(
+                "Rebuilding local OAI search indexes: mode=%s total=%s processed=%s batch_size=%s owner=%s",
+                "resume" if resume_existing else "reset" if reset else "new",
+                total_papers,
+                processed_papers,
+                normalized_batch_size,
+                rebuild_owner,
+            )
+            while True:
+                papers = self._fetch_rebuild_batch(
+                    cursor,
+                    last_arxiv_id=last_arxiv_id,
+                    batch_size=normalized_batch_size,
+                )
+                if not papers:
+                    break
+
+                self._insert_rebuild_search_index_batch(cursor, papers, fts5_available=True)
+                processed_papers += len(papers)
+                last_arxiv_id = str(papers[-1].get("arxiv_id") or "").strip() or last_arxiv_id
+                now = self._now_iso()
+                self._update_search_rebuild_state(
+                    cursor,
+                    processed_count=processed_papers,
+                    last_arxiv_id=last_arxiv_id,
+                    heartbeat_at=now,
+                    updated_at=now,
+                )
+                conn.commit()
+                logger.info(
+                    "Rebuild local OAI search indexes progress: processed=%s/%s batch_size=%s elapsed_seconds=%.2f",
+                    processed_papers,
+                    total_papers,
+                    len(papers),
+                    time.perf_counter() - rebuild_started_at,
+                )
+
+            self._ensure_category_auxiliary_indexes(cursor)
+            index_state = self._inspect_search_index_state(cursor, fts5_available=True)
+            if (
+                int(index_state.get("category_indexed_papers", 0) or 0) < total_papers
+                or int(index_state.get("fts_indexed_papers", 0) or 0) < total_papers
+            ):
+                now = self._now_iso()
+                self._update_search_rebuild_state(
+                    cursor,
+                    status="failed",
+                    heartbeat_at=now,
+                    updated_at=now,
+                    finished_at=now,
+                    error="Search index coverage check failed after rebuild.",
+                )
+                conn.commit()
+                raise RuntimeError("本地 OAI 搜索索引覆盖校验失败，请使用 --reset 重新构建。")
+
+            now = self._now_iso()
+            self._update_search_rebuild_state(
+                cursor,
+                status="completed",
+                heartbeat_at=now,
+                processed_count=processed_papers,
+                last_arxiv_id=last_arxiv_id,
+                updated_at=now,
+                finished_at=now,
+                error=None,
+            )
+            conn.commit()
+            index_state = self._inspect_search_index_state(cursor, fts5_available=True)
+            logger.info(
+                "Rebuild local OAI search indexes completed: processed=%s/%s elapsed_seconds=%.2f",
+                processed_papers,
+                total_papers,
+                time.perf_counter() - rebuild_started_at,
+            )
+            return {
+                "source": "local_oai",
+                "fts5_available": True,
+                "category_rows": int(index_state.get("category_rows", 0) or 0),
+                "fts_rows": int(index_state.get("fts_rows", 0) or 0),
+                "total_papers": total_papers,
+                "processed_count": processed_papers,
+                "batch_size": normalized_batch_size,
+                "resumed": resume_existing,
+                "rebuild_state": self._read_search_rebuild_state(cursor),
+                # 把重建后的能力状态一并返回，方便调用方立即更新 UI 提示。
+                "query_capability": build_local_oai_query_capability(
+                    mode="local_oai_sqlite_fts",
+                    fts5_available=True,
+                    search_index_status=str(index_state.get("search_index_status") or "ready"),
+                ),
+            }
+        except Exception as exc:
+            try:
+                conn.rollback()
+                if owns_rebuild:
+                    cursor = conn.cursor()
+                    now = self._now_iso()
+                    self._update_search_rebuild_state(
+                        cursor,
+                        status="failed",
+                        heartbeat_at=now,
+                        updated_at=now,
+                        finished_at=now,
+                        error=str(exc),
+                    )
+                    conn.commit()
+            except Exception:
+                logger.exception("Failed to mark local OAI search index rebuild as failed")
+            raise
+        finally:
+            conn.close()
+
+    def get_oai_search_index_rebuild_status(
+        self,
+        *,
+        stale_after_seconds: int = OAI_INDEX_REBUILD_STALE_SECONDS,
+    ) -> Dict[str, Any]:
+        """只读返回当前重建状态和索引覆盖情况，供运维脚本查询进度。"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             fts5_available = self._is_fts5_available(cursor)
-            # 手动重建的语义是“按主表真相重刷所有从索引”，因此先清空再回填。
-            cursor.execute("DELETE FROM arxiv_oai_paper_categories")
-            if fts5_available:
-                cursor.execute("DELETE FROM arxiv_oai_papers_fts")
-            self._backfill_search_indexes(cursor, fts5_available=fts5_available)
-            cursor.execute("SELECT COUNT(*) FROM arxiv_oai_paper_categories")
-            category_rows = int((cursor.fetchone() or [0])[0] or 0)
-            fts_rows = 0
-            if fts5_available:
-                cursor.execute("SELECT COUNT(*) FROM arxiv_oai_papers_fts")
-                fts_rows = int((cursor.fetchone() or [0])[0] or 0)
-            conn.commit()
-        return {
-            "source": "local_oai",
-            "fts5_available": fts5_available,
-            "category_rows": category_rows,
-            "fts_rows": fts_rows,
-            # 把重建后的能力状态一并返回，方便调用方立即更新 UI 提示。
-            "query_capability": build_local_oai_query_capability(
-                mode="local_oai_sqlite_fts" if fts5_available else "local_oai_sqlite_index",
-                fts5_available=fts5_available,
-                search_index_status="ready" if fts5_available else "text_index_unavailable",
-            ),
-        }
+            state = self._inspect_search_index_state(cursor, fts5_available=fts5_available)
+            rebuild_state = state.get("rebuild_state")
+            stale = self._is_search_rebuild_state_stale(
+                rebuild_state if isinstance(rebuild_state, dict) else None,
+                stale_after_seconds=stale_after_seconds,
+            )
+            search_index_status = str(state.get("search_index_status") or "ready")
+            return {
+                "source": "local_oai",
+                "fts5_available": fts5_available,
+                "total_papers": int(state.get("total_papers", 0) or 0),
+                "category_rows": int(state.get("category_rows", 0) or 0),
+                "category_indexed_papers": int(state.get("category_indexed_papers", 0) or 0),
+                "fts_rows": int(state.get("fts_rows", 0) or 0),
+                "fts_indexed_papers": int(state.get("fts_indexed_papers", 0) or 0),
+                "search_index_status": search_index_status,
+                "rebuild_state": rebuild_state,
+                "rebuild_state_stale": stale,
+                "query_capability": build_local_oai_query_capability(
+                    mode="local_oai_sqlite_fts" if fts5_available else "local_oai_sqlite_index",
+                    fts5_available=fts5_available,
+                    search_index_status=search_index_status,
+                ),
+            }
 
     def _parse_list_field(self, value: Any) -> Any:
         """把数据库中的列表字段还原成更自然的 Python 结构。"""
@@ -914,6 +1743,13 @@ class ArxivOaiDatabaseService:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             fts5_available = self._is_fts5_available(cursor)
+            index_state = self._inspect_search_index_state(cursor, fts5_available=fts5_available)
+            # 查询真正执行前先校验索引状态，避免因为分类表或 FTS 表缺失而返回“看起来成功但结果不完整”的响应。
+            self._ensure_required_search_indexes_ready(
+                query=normalized_query,
+                query_node=query_node,
+                state=index_state,
+            )
             where_clauses: List[str] = []
             params: List[Any] = []
             uses_fts = False
@@ -978,7 +1814,7 @@ class ArxivOaiDatabaseService:
         query_capability = build_local_oai_query_capability(
             mode="local_oai_sqlite_fts" if uses_fts else "local_oai_sqlite_index",
             fts5_available=fts5_available,
-            search_index_status="ready" if fts5_available or not uses_fts else "text_index_unavailable",
+            search_index_status=str(index_state.get("search_index_status") or "ready"),
         )
         warnings = [
             "当前使用本地 OAI 镜像库，仅支持高精度可下推查询子集，不等价完整 arXiv API 语法。"
@@ -1108,12 +1944,6 @@ class ArxivOaiDatabaseService:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_arxiv_oai_papers_updated ON arxiv_oai_papers(updated)"
             )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_arxiv_oai_categories_category ON arxiv_oai_paper_categories(category)"
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_arxiv_oai_categories_arxiv_id ON arxiv_oai_paper_categories(arxiv_id)"
-            )
             if fts5_available:
                 # FTS5 是本地文本检索的硬依赖；不可用时只保留 id/category/date 等精确过滤能力。
                 cursor.execute(
@@ -1129,10 +1959,15 @@ class ArxivOaiDatabaseService:
                     )
                     '''
                 )
+            rebuild_state = self._read_search_rebuild_state(cursor)
+            if not self._is_rebuild_state_blocking_search(rebuild_state):
+                self._ensure_category_auxiliary_indexes(cursor)
             # 旧库升级后无需重新全量同步，初始化阶段自动把缺失索引补齐。
-            self._backfill_search_indexes(cursor, fts5_available=fts5_available)
+            # 启动阶段只做轻量探测，不在这里触发全量回填，避免服务长时间卡在 startup。
+            index_state = self._inspect_search_index_state(cursor, fts5_available=fts5_available)
             conn.commit()
             logger.info("OAI database tables initialized successfully: %s", self.db_path)
+            self._warn_if_search_index_unready(index_state)
 
     def upsert_arxiv_oai_paper(self, paper: Dict[str, Any]) -> bool:
         """写入或更新单篇 OAI 论文，并同步相关检索索引。"""
@@ -1270,8 +2105,8 @@ class ArxivOaiSyncService:
         request_timeout_seconds: float = 60.0,
         max_retries: int = 5,
         database_service: Optional[ArxivOaiDatabaseService] = None,
-        embedding_service: Optional[EmbeddingService] = None,
-        vector_store_service: Optional[VectorStoreService] = None,
+        embedding_service: Optional["EmbeddingService"] = None,
+        vector_store_service: Optional["VectorStoreService"] = None,
         embedding_collection_name: str = "arxiv_paper_embeddings",
         user_agent: str = "rag-project01-framework-oai-sync/1.0",
     ):
@@ -1292,9 +2127,18 @@ class ArxivOaiSyncService:
         # 初始化 embedding 处理器
         self.embedding_handler = None
         if embedding_service or vector_store_service:
+            # 首页统计、普通本地检索只依赖 OAI SQLite；只有真的要做同步向量化时才导入 Milvus 相关依赖。
+            if embedding_service is None:
+                from services.embedding.embedding_service import EmbeddingService
+
+                embedding_service = EmbeddingService()
+            if vector_store_service is None:
+                from services.storage.vector_store_service import VectorStoreService
+
+                vector_store_service = VectorStoreService()
             self.embedding_handler = ArxivEmbeddingHandler(
-                embedding_service=embedding_service or EmbeddingService(),
-                vector_store_service=vector_store_service or VectorStoreService(),
+                embedding_service=embedding_service,
+                vector_store_service=vector_store_service,
                 embedding_collection_name=embedding_collection_name,
                 embedding_batch_size=OAI_EMBEDDING_BATCH_SIZE,
                 vector_query_batch_size=OAI_VECTOR_QUERY_BATCH_SIZE,

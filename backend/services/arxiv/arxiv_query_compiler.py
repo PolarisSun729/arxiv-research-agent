@@ -8,60 +8,12 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from services.arxiv.local_oai_search_contract import (
+    LocalArxivSearchIndexUnavailable,
+    UnsupportedLocalArxivQuery,
+)
+
 logger = logging.getLogger(__name__)
-
-
-def build_local_oai_query_capability(
-    *,
-    mode: str = "local_oai_sqlite_fts",
-    unsupported_reason: Optional[str] = None,
-    suggested_action: Optional[str] = None,
-    fts5_available: Optional[bool] = None,
-    search_index_status: Optional[str] = None,
-) -> Dict[str, Any]:
-    """构造后端和前端共享的本地检索能力契约。"""
-    from services.arxiv.arxiv_query_parser import LOCAL_OAI_SUPPORTED_QUERY_SUBSET
-
-    capability = {
-        "source": "local_oai",
-        "mode": mode,
-        "supported_subset": list(LOCAL_OAI_SUPPORTED_QUERY_SUBSET),
-        "precision_policy": "strict_token_or_phrase",
-        "full_arxiv_syntax_supported": False,
-        "unsupported_reason": unsupported_reason,
-        "suggested_action": suggested_action,
-    }
-    if fts5_available is not None:
-        capability["fts5_available"] = bool(fts5_available)
-    if search_index_status:
-        capability["search_index_status"] = search_index_status
-    return capability
-
-
-class LocalArxivSearchIndexUnavailable(Exception):
-    """FTS5 不可用或索引未就绪时抛出。"""
-
-    code = "local_search_index_unavailable"
-
-    def __init__(self, message: str, *, query: str = "", reason: str = ""):
-        super().__init__(message)
-        self.query = query
-        self.reason = reason or message
-        # 错误对象内直接挂能力描述
-        self.query_capability = build_local_oai_query_capability(
-            mode="unsupported",
-            unsupported_reason=self.reason,
-            suggested_action="切换远程 arXiv API 后重试，或改写为本地 OAI 镜像支持的高精度查询子集。",
-        )
-
-
-class UnsupportedLocalArxivQuery(Exception):
-    """查询编译失败时抛出。"""
-
-    def __init__(self, message: str, *, query: str = "", reason: str = ""):
-        super().__init__(message)
-        self.query = query
-        self.reason = reason or message
 
 
 class ArxivQueryCompiler:

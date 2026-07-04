@@ -48,10 +48,16 @@ def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None
             from services.context_lifecycle import ContextLifecycleService
             from utils.config import get_enhanced_retrieval_runtime_config
 
-            cleanup_result = ContextLifecycleService().run_startup_cleanup(
+            context_lifecycle_service = ContextLifecycleService()
+            cleanup_result = context_lifecycle_service.run_startup_cleanup(
                 trace_export_dir=get_enhanced_retrieval_runtime_config().get("trace_export_dir"),
             )
-            info_event(logger, "backend.startup_cleanup_done", output=cleanup_result)
+            # 启动主日志只保留清理摘要，避免把整份 retention policy 打成超长单行后在控制台视觉换行。
+            info_event(
+                logger,
+                "backend.startup_cleanup_done",
+                **context_lifecycle_service.summarize_startup_cleanup_result(cleanup_result),
+            )
         except Exception as exc:
             logger.warning("Context lifecycle startup cleanup skipped: %s", exc)
         if resolved_load_mode == "preload":

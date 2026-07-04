@@ -3,6 +3,7 @@ import json
 import sys
 import types
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -45,7 +46,11 @@ _reload_real_config_module()
 sys.modules.pop("services.arxiv.arxiv_oai_service", None)
 
 try:
-    from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
+    from services.arxiv.arxiv_oai_service import (
+        OAI_INDEX_REBUILD_BATCH_SIZE,
+        OAI_INDEX_REBUILD_STALE_SECONDS,
+        ArxivOaiDatabaseService,
+    )
 finally:
     # 轻量桩只服务本模块导入；恢复公共模块，避免 pytest 混跑时污染后续真实服务测试。
     if _saved_embedding_module is None:
@@ -72,6 +77,39 @@ def _skip_if_fts5_unavailable(service: ArxivOaiDatabaseService) -> None:
     with service._get_connection() as conn:
         if not service._is_fts5_available(conn.cursor()):
             pytest.skip("SQLite FTS5 is not available in this Python runtime")
+
+
+def _write_rebuild_state(
+    service: ArxivOaiDatabaseService,
+    *,
+    status: str,
+    total_papers: int = 0,
+    processed_count: int = 0,
+    last_arxiv_id: str | None = None,
+    heartbeat_at: str | None = None,
+    batch_size: int = OAI_INDEX_REBUILD_BATCH_SIZE,
+    error: str | None = None,
+) -> None:
+    with service._get_connection() as conn:
+        cursor = conn.cursor()
+        now = service._now_iso()
+        service._replace_search_rebuild_state(
+            cursor,
+            status=status,
+            owner="test-owner",
+            heartbeat_at=heartbeat_at or now,
+            stale_after_seconds=OAI_INDEX_REBUILD_STALE_SECONDS,
+            batch_size=batch_size,
+            total_papers=total_papers,
+            processed_count=processed_count,
+            last_arxiv_id=last_arxiv_id,
+            fts5_available=True,
+            started_at=now,
+            updated_at=now,
+            finished_at=now if status in {"completed", "failed"} else None,
+            error=error,
+        )
+        conn.commit()
 
 
 def _paper(
@@ -205,6 +243,153 @@ def test_rebuild_oai_search_index_rehydrates_mapping_and_fts() -> None:
     assert service.search(search_query="all:RAG", max_results=10)["papers"][0]["arxiv_id"] == "2401.00009"
 
 
+def test_rebuild_oai_search_index_processes_multiple_batches() -> None:
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    paper_count = OAI_INDEX_REBUILD_BATCH_SIZE + 5
+    papers = [
+        _paper(
+            f"2401.{index:05d}",
+            title=f"Rebuild Batch Paper {index}",
+            abstract="RAG",
+            categories=["cs.CL"],
+        )
+        for index in range(paper_count)
+    ]
+    assert service.upsert_arxiv_oai_papers(papers) == paper_count
+    with service._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM arxiv_oai_paper_categories")
+        cursor.execute("DELETE FROM arxiv_oai_papers_fts")
+        conn.commit()
+
+    result = service.rebuild_oai_search_index()
+
+    # 这个回归用例专门卡“只回填第一批 1000 条”的问题，确保重建会跨批次跑完整个主表。
+    assert result["category_rows"] == paper_count
+    assert result["fts_rows"] == paper_count
+    assert result["query_capability"]["search_index_status"] == "ready"
+    assert service.search(search_query="all:RAG", max_results=10)["total_results"] == paper_count
+
+
+def test_rebuild_oai_search_index_resumes_failed_checkpoint() -> None:
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    batch_size = 2
+    paper_count = 5
+    papers = [
+        _paper(
+            f"2401.{index:05d}",
+            title=f"Resume Batch Paper {index}",
+            abstract="RAG",
+            categories=["cs.CL"],
+        )
+        for index in range(paper_count)
+    ]
+    assert service.upsert_arxiv_oai_papers(papers) == paper_count
+    with service._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM arxiv_oai_paper_categories")
+        cursor.execute("DELETE FROM arxiv_oai_papers_fts")
+        first_batch = service._fetch_rebuild_batch(cursor, last_arxiv_id=None, batch_size=batch_size)
+        service._insert_rebuild_search_index_batch(cursor, first_batch, fts5_available=True)
+        last_arxiv_id = first_batch[-1]["arxiv_id"]
+        now = service._now_iso()
+        service._replace_search_rebuild_state(
+            cursor,
+            status="failed",
+            owner="interrupted-test",
+            heartbeat_at=now,
+            stale_after_seconds=OAI_INDEX_REBUILD_STALE_SECONDS,
+            batch_size=batch_size,
+            total_papers=paper_count,
+            processed_count=len(first_batch),
+            last_arxiv_id=last_arxiv_id,
+            fts5_available=True,
+            started_at=now,
+            updated_at=now,
+            finished_at=now,
+            error="interrupted",
+        )
+        conn.commit()
+
+    result = service.rebuild_oai_search_index(batch_size=batch_size)
+
+    assert result["resumed"] is True
+    assert result["processed_count"] == paper_count
+    assert result["query_capability"]["search_index_status"] == "ready"
+    assert service.search(search_query="all:RAG", max_results=10)["total_results"] == paper_count
+
+
+def test_local_search_fails_while_rebuild_is_active() -> None:
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    service.upsert_arxiv_oai_paper(
+        _paper("2401.00013", title="Active Rebuild", abstract="RAG", categories=["cs.CL"])
+    )
+    _write_rebuild_state(service, status="rebuilding", total_papers=1, processed_count=0)
+
+    with pytest.raises(Exception) as exc_info:
+        service.search(search_query="all:RAG", max_results=10)
+
+    assert getattr(exc_info.value, "code", None) == "local_search_index_unavailable"
+    assert getattr(exc_info.value, "status_code", None) == 503
+    assert exc_info.value.query_capability["unsupported_reason"] == "index_rebuilding"
+    assert exc_info.value.query_capability["search_index_status"] == "rebuilding"
+
+
+def test_local_search_treats_stale_rebuild_as_failed() -> None:
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    service.upsert_arxiv_oai_paper(
+        _paper("2401.00014", title="Stale Rebuild", abstract="RAG", categories=["cs.CL"])
+    )
+    stale_heartbeat = (datetime.now() - timedelta(seconds=OAI_INDEX_REBUILD_STALE_SECONDS + 1)).isoformat(
+        timespec="seconds"
+    )
+    _write_rebuild_state(
+        service,
+        status="rebuilding",
+        total_papers=1,
+        processed_count=0,
+        heartbeat_at=stale_heartbeat,
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        service.search(search_query="all:RAG", max_results=10)
+
+    assert getattr(exc_info.value, "status_code", None) == 503
+    assert exc_info.value.query_capability["unsupported_reason"] == "index_rebuild_failed"
+    assert exc_info.value.query_capability["search_index_status"] == "rebuild_failed"
+
+
+def test_rebuild_oai_search_index_rejects_active_owner() -> None:
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    service.upsert_arxiv_oai_paper(
+        _paper("2401.00015", title="Active Owner", abstract="RAG", categories=["cs.CL"])
+    )
+    _write_rebuild_state(service, status="rebuilding", total_papers=1, processed_count=0)
+
+    with pytest.raises(RuntimeError, match="正在运行"):
+        service.rebuild_oai_search_index(batch_size=2)
+
+    status = service.get_oai_search_index_rebuild_status()
+    assert status["rebuild_state"]["status"] == "rebuilding"
+
+
+def test_rebuild_oai_search_index_marks_failed_when_fts5_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _make_temp_service()
+    monkeypatch.setattr(service, "_is_fts5_available", lambda _cursor: False)
+
+    with pytest.raises(RuntimeError, match="FTS5"):
+        service.rebuild_oai_search_index(batch_size=2)
+
+    status = service.get_oai_search_index_rebuild_status()
+    assert status["rebuild_state"]["status"] == "failed"
+    assert status["query_capability"]["search_index_status"] == "rebuild_failed"
+
+
 def test_local_search_rejects_unsupported_wildcard_query() -> None:
     service = _make_temp_service()
 
@@ -223,4 +408,70 @@ def test_local_text_search_fails_when_fts5_is_unavailable(monkeypatch: pytest.Mo
         service.search(search_query="all:RAG", max_results=10)
 
     assert getattr(exc_info.value, "code", None) == "local_search_index_unavailable"
+    assert getattr(exc_info.value, "status_code", None) == 503
     assert exc_info.value.query_capability["unsupported_reason"] == "fts5_unavailable"
+
+
+def test_initialize_database_warns_when_indexes_are_missing_instead_of_backfilling(caplog: pytest.LogCaptureFixture) -> None:
+    service = _make_temp_service()
+    db_path = service.db_path
+    service.upsert_arxiv_oai_paper(
+        _paper("2401.00010", title="Startup Warning Paper", abstract="RAG", categories=["cs.CL"])
+    )
+    with service._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM arxiv_oai_paper_categories")
+        if service._is_fts5_available(cursor):
+            cursor.execute("DELETE FROM arxiv_oai_papers_fts")
+        conn.commit()
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        reloaded_service = ArxivOaiDatabaseService(db_path=db_path, check_same_thread=False)
+
+    with reloaded_service._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM arxiv_oai_paper_categories")
+        assert int((cursor.fetchone() or [0])[0] or 0) == 0
+
+    assert any("Local OAI search index is not ready" in record.message for record in caplog.records)
+    assert any("rebuild_arxiv_oai_search_index.cmd" in record.message for record in caplog.records)
+
+
+def test_local_category_search_fails_when_category_index_is_missing() -> None:
+    service = _make_temp_service()
+    service.upsert_arxiv_oai_paper(
+        _paper("2401.00011", title="Category Index Missing", abstract="RAG", categories=["cs.CL"])
+    )
+    with service._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM arxiv_oai_paper_categories")
+        conn.commit()
+
+    with pytest.raises(Exception) as exc_info:
+        service.search(search_query="cat:cs.CL", max_results=10)
+
+    assert getattr(exc_info.value, "code", None) == "local_search_index_unavailable"
+    assert getattr(exc_info.value, "status_code", None) == 503
+    assert exc_info.value.query_capability["unsupported_reason"] == "category_index_missing"
+    assert exc_info.value.query_capability["search_index_status"] == "category_index_missing"
+
+
+def test_local_text_search_fails_when_text_index_rows_are_missing() -> None:
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    service.upsert_arxiv_oai_paper(
+        _paper("2401.00012", title="Text Index Missing", abstract="RAG", categories=["cs.CL"])
+    )
+    with service._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM arxiv_oai_papers_fts")
+        conn.commit()
+
+    with pytest.raises(Exception) as exc_info:
+        service.search(search_query="all:RAG", max_results=10)
+
+    assert getattr(exc_info.value, "code", None) == "local_search_index_unavailable"
+    assert getattr(exc_info.value, "status_code", None) == 503
+    assert exc_info.value.query_capability["unsupported_reason"] == "text_index_missing"
+    assert exc_info.value.query_capability["search_index_status"] == "text_index_missing"

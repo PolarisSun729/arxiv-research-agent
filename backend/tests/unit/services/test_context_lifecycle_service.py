@@ -96,6 +96,38 @@ class ContextLifecycleServiceTests(unittest.TestCase):
         self.assertEqual(debug["prompt_budget"]["used_chars"], 1200)
         self.assertEqual(debug["policy"]["paper_chat_messages"]["retention"], "long_term")
 
+    def test_summarize_startup_cleanup_result_keeps_info_log_compact(self) -> None:
+        summary = self.service.summarize_startup_cleanup_result(
+            {
+                "policy": {
+                    "paper_chat_messages": {"retention": "long_term"},
+                    "session_summary": {"bounded": True},
+                },
+                "expired_runtime_checkpoints": 2,
+                "deleted_runtime_checkpoints": 3,
+                "deleted_langgraph": {"threads": 4, "checkpoints": 5, "writes": 6},
+                "trace_cleanup": {"enabled": True, "deleted_files": 7, "missing": False},
+                "errors": [
+                    {"stage": "cleanup_runtime_checkpoints", "error": "db locked"},
+                    {"stage": "cleanup_langgraph_checkpoints", "error": "sqlite busy"},
+                ],
+            }
+        )
+
+        # INFO 主时间线只需要摘要计数和失败阶段；完整策略快照继续保留在返回结果里供别处使用。
+        self.assertEqual(summary["expired_runtime_checkpoints"], 2)
+        self.assertEqual(summary["deleted_runtime_checkpoints"], 3)
+        self.assertEqual(summary["deleted_langgraph_threads"], 4)
+        self.assertEqual(summary["deleted_langgraph_checkpoints"], 5)
+        self.assertEqual(summary["deleted_langgraph_writes"], 6)
+        self.assertEqual(summary["trace_cleanup_deleted_files"], 7)
+        self.assertEqual(summary["error_count"], 2)
+        self.assertEqual(
+            summary["error_stages"],
+            ["cleanup_runtime_checkpoints", "cleanup_langgraph_checkpoints"],
+        )
+        self.assertNotIn("policy", summary)
+
 
 if __name__ == "__main__":
     unittest.main()
