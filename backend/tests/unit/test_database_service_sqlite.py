@@ -668,6 +668,71 @@ class DatabaseServiceSqliteTests(unittest.TestCase):
             )
         )
 
+    def test_consumed_pending_confirmation_replay_cannot_restore_waiting_checkpoint(self) -> None:
+        session_id = "agent-confirm-replay"
+        pending_confirmation = {
+            "step_id": "parse_and_index_paper",
+            "tool_name": "parse_and_index_paper",
+            "pending_action_id": "pending:parse_and_index_paper",
+        }
+        waiting_runtime_state = {
+            "plan": {"plan_id": "paper_qa:test"},
+            "pending_confirmation": dict(pending_confirmation),
+            "step_status": {"parse_and_index_paper": "waiting_confirmation"},
+            "turn_status": "waiting_confirmation",
+            "recovery_strategy": {"type": "request_confirmation", "reason": "paper_index_missing"},
+            "approved_step_ids": [],
+        }
+        self.service.upsert_agent_runtime_checkpoint(
+            user_id=self.user_id,
+            session_id=session_id,
+            thread_id=session_id,
+            runtime_state=waiting_runtime_state,
+            pending_confirmation=pending_confirmation,
+            status="waiting_confirmation",
+            expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+        )
+
+        self.assertTrue(
+            self.service.consume_agent_runtime_pending_confirmation(
+                user_id=self.user_id,
+                session_id=session_id,
+                thread_id=session_id,
+                decision="approve",
+                step_id="parse_and_index_paper",
+                tool_name="parse_and_index_paper",
+                pending_action_id="pending:parse_and_index_paper",
+            )
+        )
+
+        # 模拟 LangGraph resume 后重放中断前 waiting 快照；DB 层必须保留已消费的批准态。
+        replayed = self.service.upsert_agent_runtime_checkpoint(
+            user_id=self.user_id,
+            session_id=session_id,
+            thread_id=session_id,
+            runtime_state=waiting_runtime_state,
+            pending_confirmation=pending_confirmation,
+            status="waiting_confirmation",
+            expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+        )
+        self.assertEqual(replayed["status"], "running")
+        self.assertIsNone(replayed["pending_confirmation"])
+        self.assertIsNone(replayed["runtime_state"]["pending_confirmation"])
+        self.assertEqual(replayed["runtime_state"]["approved_step_ids"], ["parse_and_index_paper"])
+
+        # 后续 running 快照如果丢了批准集合，也不能把恢复执行所需的 approved_step_ids 擦掉。
+        merged = self.service.upsert_agent_runtime_checkpoint(
+            user_id=self.user_id,
+            session_id=session_id,
+            thread_id=session_id,
+            runtime_state={"plan": {"plan_id": "paper_qa:test"}, "approved_step_ids": []},
+            pending_confirmation=None,
+            status="running",
+        )
+        self.assertEqual(merged["status"], "running")
+        self.assertIsNone(merged["pending_confirmation"])
+        self.assertEqual(merged["runtime_state"]["approved_step_ids"], ["parse_and_index_paper"])
+
     def test_paper_notes_support_create_update_list_and_delete(self) -> None:
         session = self._create_session(arxiv_id="2401.00008", session_id="session-note")
         message = self.service.append_paper_chat_message(session["session_id"], "assistant", "answer", user_id=self.user_id)
