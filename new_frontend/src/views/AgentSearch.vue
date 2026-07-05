@@ -1,20 +1,26 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { dislikePaper, likePaper, removePaperPreference } from '@/api/papers'
 import { useAgentSearchChat } from '@/composables/useAgentSearchChat'
-import AgentResponsePanel from '@/components/agent-search/AgentResponsePanel.vue'
+import AgentUserResultAttachments from '@/components/agent-search/AgentUserResultAttachments.vue'
 import RagChatPanel from '@/components/rag-chat/RagChatPanel.vue'
-import type { PaperTargetCandidate } from '@/types/agent'
+import type { AgentPendingAction, ArxivSearchResponse } from '@/types/agent'
 import type { Paper } from '@/types/paper'
 import { usePaperStore } from '@/stores/paperStore'
+import {
+  getAgentPendingActionKey,
+  getPaperTargetCandidateId,
+  isPaperTargetConfirmation,
+  toAgentUserResult,
+  type AgentUserResult
+} from '@/utils/agentUserResult'
 
 const router = useRouter()
 const store = usePaperStore()
 const agentPaperLabels = new Map<string, 'liked' | 'disliked'>()
 const profileTopicPreview = computed(() => (store.researchProfile?.positive_topics || []).slice(0, 4))
-const selectedPendingCandidateId = ref('')
 
 const {
   inputMessage,
@@ -22,7 +28,6 @@ const {
   messages,
   latestResponse,
   pendingAction,
-  activeSessionId,
   setInputMessage,
   submitMessage,
   submitResume,
@@ -47,55 +52,25 @@ function handleClear() {
   clearConversation()
 }
 
-const isPaperTargetConfirmation = computed(() => {
+function selectedPendingCandidate(candidateId?: string) {
+  const candidates = Array.isArray(pendingAction.value?.candidates) ? pendingAction.value.candidates : []
+  return candidates.find((candidate, index) => getPaperTargetCandidateId(candidate, index) === candidateId) || null
+}
+
+function handleConfirmPendingAction(candidateId?: string) {
   const action = pendingAction.value
-  return action?.request_type === 'paper_target_confirmation' || action?.type === 'paper_target_confirmation'
-})
+  if (!action) return
 
-const isPendingActionConfirming = computed(() => pendingAction.value?.status === 'confirming')
-
-const pendingTargetCandidates = computed<PaperTargetCandidate[]>(() => {
-  const candidates = pendingAction.value?.candidates
-  return Array.isArray(candidates) ? candidates : []
-})
-
-function paperCandidateId(candidate: PaperTargetCandidate, index = 0) {
-  return String(
-    candidate.candidate_id ||
-    candidate.paper_id ||
-    candidate.arxiv_id ||
-    candidate.arxivId ||
-    candidate.id ||
-    candidate.title ||
-    `candidate-${index}`
-  )
-}
-
-function paperCandidateAuthors(candidate: PaperTargetCandidate) {
-  if (candidate.authors_summary) return candidate.authors_summary
-  if (Array.isArray(candidate.authors)) return candidate.authors.slice(0, 3).join(', ')
-  return candidate.authors || ''
-}
-
-function paperCandidateSource(candidate: PaperTargetCandidate) {
-  return candidate.source_label || candidate.list_name || candidate.source_type || candidate.source || '上下文候选'
-}
-
-function selectedPendingCandidate() {
-  return pendingTargetCandidates.value.find((candidate, index) => paperCandidateId(candidate, index) === selectedPendingCandidateId.value) || null
-}
-
-function handleConfirmPendingAction() {
-  if (isPaperTargetConfirmation.value) {
-    const candidate = selectedPendingCandidate()
+  if (isPaperTargetConfirmation(action)) {
+    const candidate = selectedPendingCandidate(candidateId)
     if (!candidate) {
       ElMessage.warning('请先选择一篇论文')
       return
     }
     // 确认目标论文只提交稳定身份字段，后端会在 pending confirmation 候选集合内再次校验。
     submitResume('approve', '用户确认目标论文', {
-      pending_action_id: pendingAction.value?.pending_action_id,
-      confirmed_paper_id: selectedPendingCandidateId.value,
+      pending_action_id: action.pending_action_id,
+      confirmed_paper_id: candidateId,
       confirmed_arxiv_id: candidate.arxiv_id || candidate.arxivId || candidate.id || null
     })
     return
@@ -143,8 +118,23 @@ async function handleLabel(paper: Paper, label: 'liked' | 'disliked' | null) {
   }
 }
 
-function toAgentResponse(response: unknown): import('@/types/agent').ArxivSearchResponse | null {
-  return response as import('@/types/agent').ArxivSearchResponse | null
+function toAgentResponse(response: unknown): ArxivSearchResponse | null {
+  return response as ArxivSearchResponse | null
+}
+
+function visiblePendingActionForResponse(response: ArxivSearchResponse | null): AgentPendingAction | null {
+  if (!response?.pending_action || !pendingAction.value) return null
+  const responseKey = getAgentPendingActionKey(response.pending_action)
+  const activeKey = getAgentPendingActionKey(pendingAction.value)
+  // pending action 是可消费状态，必须和当前活跃确认匹配，避免旧消息残留可点击确认卡。
+  return responseKey && activeKey && responseKey === activeKey ? pendingAction.value : null
+}
+
+function toAgentUserResultForMessage(response: unknown): AgentUserResult {
+  const agentResponse = toAgentResponse(response)
+  return toAgentUserResult(agentResponse, {
+    pendingAction: visiblePendingActionForResponse(agentResponse)
+  })
 }
 
 function syncAgentPreferenceState() {
@@ -185,17 +175,6 @@ watch(latestResponse, () => {
   syncAgentPreferenceState()
 }, { deep: true })
 
-watch(pendingAction, action => {
-  if (!action || !(action.request_type === 'paper_target_confirmation' || action.type === 'paper_target_confirmation')) {
-    selectedPendingCandidateId.value = ''
-    return
-  }
-
-  const candidates = Array.isArray(action.candidates) ? action.candidates : []
-  const recommended = action.recommended_candidate || action.target_paper || candidates[0]
-  selectedPendingCandidateId.value = action.default_candidate_id
-    || (recommended ? paperCandidateId(recommended) : '')
-}, { immediate: true })
 </script>
 
 <template>
@@ -205,7 +184,7 @@ watch(pendingAction, action => {
         <p class="eyebrow">Agent Search</p>
         <h1 class="title">自然语言 arXiv 搜索入口</h1>
         <p class="subtitle">
-          直接说出你的检索需求，系统会先理解意图、生成搜索计划、调用工具，再把完整响应嵌回到对应的助手消息里。
+          直接说出你的检索需求，Agent 会返回回答、必要提示和可查看的论文结果。
         </p>
       </div>
 
@@ -232,102 +211,13 @@ watch(pendingAction, action => {
     </section>
 
     <section class="conversation-shell">
-      <div v-if="pendingAction" class="pending-action-banner">
-        <div class="pending-action-banner__copy">
-          <div v-if="isPendingActionConfirming" class="pending-action-banner__status">
-            确认请求已提交，正在等待后端消费并继续执行。
-          </div>
-          <div class="pending-action-banner__label">待确认任务</div>
-          <div class="pending-action-banner__title">
-            {{ pendingAction.title || '当前论文' }}
-          </div>
-          <div class="pending-action-banner__desc">
-            {{ pendingAction.qa_question || pendingAction.original_question || '需要先确认是否解析 PDF 并建立全文索引。' }}
-          </div>
-          <div v-if="isPaperTargetConfirmation" class="paper-target-candidates">
-            <el-radio-group v-model="selectedPendingCandidateId" class="paper-target-candidates__group">
-              <el-radio
-                v-for="(candidate, index) in pendingTargetCandidates"
-                :key="paperCandidateId(candidate, index)"
-                :label="paperCandidateId(candidate, index)"
-                class="paper-target-candidate"
-                border
-              >
-                <div class="paper-target-candidate__main">
-                  <div class="paper-target-candidate__title">
-                    {{ candidate.title || candidate.arxiv_id || candidate.arxivId || paperCandidateId(candidate, index) }}
-                  </div>
-                  <div class="paper-target-candidate__meta">
-                    <span v-if="candidate.arxiv_id || candidate.arxivId">arXiv: {{ candidate.arxiv_id || candidate.arxivId }}</span>
-                    <span v-if="paperCandidateAuthors(candidate)">作者: {{ paperCandidateAuthors(candidate) }}</span>
-                    <span v-if="candidate.rank">排名: #{{ candidate.rank }}</span>
-                    <span>来源: {{ paperCandidateSource(candidate) }}</span>
-                  </div>
-                </div>
-                <el-tag
-                  v-if="pendingAction.default_candidate_id === paperCandidateId(candidate, index)"
-                  size="small"
-                  type="success"
-                  effect="plain"
-                >
-                  默认
-                </el-tag>
-              </el-radio>
-            </el-radio-group>
-            <el-empty
-              v-if="pendingTargetCandidates.length === 0"
-              description="No candidate papers. Cancel and start again."
-              :image-size="72"
-            />
-          </div>
-          <div class="pending-action-banner__meta">
-            <span v-if="pendingAction.pending_action_id">pending: {{ pendingAction.pending_action_id }}</span>
-            <span>tool: {{ pendingAction.tool_name || '-' }}</span>
-            <span>step: {{ pendingAction.step_id || '-' }}</span>
-            <span>session: {{ activeSessionId || pendingAction.session_id || '-' }}</span>
-            <span v-if="pendingAction.expires_at">expires: {{ pendingAction.expires_at }}</span>
-          </div>
-        </div>
-        <div class="pending-action-banner__actions">
-          <el-button
-            type="primary"
-            :loading="isPendingActionConfirming"
-            :disabled="loading || isPendingActionConfirming || (isPaperTargetConfirmation && !selectedPendingCandidateId)"
-            @click="handleConfirmPendingAction"
-          >
-            <span v-if="isPaperTargetConfirmation">&#30830;&#35748;&#24182;&#32487;&#32493;</span>
-            <span v-else>&#30830;&#35748;&#25191;&#34892;</span>
-            <span v-pre class="legacy-hidden">
-            {{ isPaperTargetConfirmation ? '确认并继续' : '确认执行' }}
-            </span>
-          </el-button>
-          <el-button
-            v-if="false"
-            type="primary"
-            :disabled="loading || (isPaperTargetConfirmation && !selectedPendingCandidateId)"
-            @click="handleConfirmPendingAction"
-          >
-            解析并回答
-          </el-button>
-          <el-button :disabled="loading || isPendingActionConfirming" @click="handleCancelPendingAction">
-            &#21462;&#28040;
-          </el-button>
-          <el-button v-if="false" :disabled="loading" @click="handleCancelPendingAction">
-            取消
-          </el-button>
-          <el-button v-if="false" :disabled="loading" @click="handleCancelPendingAction">
-            取消
-          </el-button>
-        </div>
-      </div>
-
       <RagChatPanel
         v-model:sender-text="inputMessage"
         :messages="messages"
         :loading="loading"
         :quick-prompts="quickPrompts"
         title="Agent 对话"
-        description="默认只展示最终回答和关键摘要，详细 timeline、tool trace、spec 和错误信息会收进可展开区域。"
+        description="默认只展示最终回答、必要确认、检索范围提示和论文结果。"
         prompt-title="搜索示例"
         assistant-label="Agent"
         sender-placeholder="请输入自然语言搜索需求，Enter 发送，Shift+Enter 换行"
@@ -335,11 +225,14 @@ watch(pendingAction, action => {
         @select-prompt="handlePromptSelect"
       >
         <template #message-footer="{ item }">
-          <AgentResponsePanel
+          <AgentUserResultAttachments
             v-if="item.role === 'assistant' && item.response"
-            :response="toAgentResponse(item.response)"
+            :result="toAgentUserResultForMessage(item.response)"
+            :loading="loading"
             @view-detail="handleViewDetail"
             @label="handleLabel"
+            @confirm-pending-action="handleConfirmPendingAction"
+            @cancel-pending-action="handleCancelPendingAction"
           />
         </template>
       </RagChatPanel>
@@ -426,121 +319,8 @@ watch(pendingAction, action => {
   line-height: 1.6;
 }
 
-.pending-action-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 16px 18px;
-  border-radius: 18px;
-  border: 1px solid rgba(14, 165, 233, 0.18);
-  background:
-    radial-gradient(circle at top right, rgba(14, 165, 233, 0.16), transparent 35%),
-    linear-gradient(135deg, rgba(240, 249, 255, 0.96), rgba(255, 255, 255, 0.98));
-}
-
-.pending-action-banner__copy {
-  min-width: 0;
-}
-
-.pending-action-banner__label {
-  color: #0284c7;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.pending-action-banner__status {
-  margin-bottom: 8px;
-  color: #0f766e;
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.pending-action-banner__title {
-  margin-top: 6px;
-  font-size: 16px;
-  font-weight: 700;
-  color: #0f172a;
-}
-
-.pending-action-banner__desc {
-  margin-top: 4px;
-  color: #475569;
-  line-height: 1.6;
-}
-
-.pending-action-banner__meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-top: 8px;
-  color: #64748b;
-  font-size: 12px;
-}
-
-.pending-action-banner__actions {
-  display: flex;
-  gap: 10px;
-  flex: none;
-}
-
-.paper-target-candidates {
-  margin-top: 12px;
-}
-
-.paper-target-candidates__group {
-  display: grid;
-  gap: 10px;
-}
-
-.paper-target-candidate {
-  height: auto;
-  margin-right: 0;
-  padding: 12px;
-  white-space: normal;
-}
-
-.paper-target-candidate :deep(.el-radio__label) {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  width: 100%;
-}
-
-.paper-target-candidate__main {
-  min-width: 0;
-}
-
-.paper-target-candidate__title {
-  color: #0f172a;
-  font-weight: 700;
-  line-height: 1.4;
-}
-
-.paper-target-candidate__meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 6px;
-  color: #64748b;
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.legacy-hidden {
-  display: none;
-}
-
 @media (max-width: 1024px) {
   .hero-card {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .pending-action-banner {
     flex-direction: column;
     align-items: stretch;
   }
