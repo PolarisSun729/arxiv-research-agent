@@ -317,7 +317,7 @@ def test_runtime_store_consume_approves_pending_confirmation_target_step() -> No
     assert cleaned["pending_confirmation"] is None
     assert cleaned["approved_step_ids"] == ["parse_and_index_paper"]
     assert cleaned["step_status"]["parse_and_index_paper"] == "pending"
-    assert cleaned["step_status"]["request_confirmation"] == "waiting_confirmation"
+    assert cleaned["step_status"]["request_confirmation"] == "success"
     assert cleaned["recovery_strategy"] is None
 
 

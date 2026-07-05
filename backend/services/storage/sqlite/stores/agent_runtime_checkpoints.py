@@ -339,8 +339,10 @@ class AgentRuntimeCheckpointStore(BaseSqliteStore):
             return self._serialize_json_field(payload)
 
         previous_pending = payload.get("pending_confirmation") if isinstance(payload.get("pending_confirmation"), dict) else {}
-        # 关键修复：优先使用 pending_confirmation 中记录的目标 step_id，而不是 resume_payload 传入的 step_id
-        # 因为在桥接确认场景（如 request_confirmation），真正需要批准的是目标工具，而不是桥接步骤本身
+        # 桥接确认场景里，resume payload 和 runtime pending_confirmation 都指向目标副作用 step；
+        # recovery_strategy.step_id 才能告诉我们哪个桥接 step 已经完成，避免它继续停在 waiting_confirmation。
+        recovery_strategy = payload.get("recovery_strategy") if isinstance(payload.get("recovery_strategy"), dict) else {}
+        bridge_step_id = str(recovery_strategy.get("step_id") or "").strip()
         pending_step_id = str(previous_pending.get("step_id") or "").strip()
         requested_step_id = str(step_id or "").strip()
         normalized_step_id = pending_step_id or requested_step_id
@@ -348,7 +350,6 @@ class AgentRuntimeCheckpointStore(BaseSqliteStore):
         payload["pending_confirmation"] = None
 
         # confirmation 已消费后，request_confirmation 恢复策略不再代表可恢复现场；拒绝分支保留 skip 语义。
-        recovery_strategy = payload.get("recovery_strategy") if isinstance(payload.get("recovery_strategy"), dict) else {}
         if normalized_decision == "reject":
             payload["recovery_strategy"] = {
                 "type": "skip_step",
@@ -367,6 +368,17 @@ class AgentRuntimeCheckpointStore(BaseSqliteStore):
         step_status = payload.get("step_status") if isinstance(payload.get("step_status"), dict) else None
         if step_status is not None and normalized_step_id and step_status.get(normalized_step_id) == "waiting_confirmation":
             step_status[normalized_step_id] = "skipped" if normalized_decision == "reject" else "pending"
+            payload["step_status"] = step_status
+        if (
+            step_status is not None
+            and normalized_decision == "approve"
+            and bridge_step_id
+            and bridge_step_id != normalized_step_id
+            and step_status.get(bridge_step_id) == "waiting_confirmation"
+        ):
+            # 批准的是目标副作用 step，桥接确认 step 的职责已经结束；如果继续保留 waiting，
+            # LangGraph resume 后会把旧确认现场重新持久化，进而再次触发同一个确认门。
+            step_status[bridge_step_id] = "success"
             payload["step_status"] = step_status
         if str(payload.get("turn_status") or "").strip() == "waiting_confirmation":
             payload["turn_status"] = None
