@@ -1,7 +1,8 @@
 import uuid
 from typing import Any, Dict, List, Optional
 
-from services.storage.database.shared import (
+from services.storage.sqlite.base import BaseSqliteStore
+from services.storage.sqlite.shared import (
     DEFAULT_USER_ID,
     PROFILE_BUILD_VERSION,
     PROFILE_EXTRACTOR_VERSION,
@@ -10,7 +11,7 @@ from services.storage.database.shared import (
 )
 
 
-class ProfileBuildJobMixin:
+class ProfileBuildJobStore(BaseSqliteStore):
     """维护画像构建 job 状态；具体快照生成和激活仍由 profile 主流程负责。"""
 
     def _ensure_user_profile_build_job_columns(self, conn):

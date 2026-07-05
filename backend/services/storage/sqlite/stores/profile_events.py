@@ -1,7 +1,8 @@
 import uuid
 from typing import Any, Dict, List, Optional
 
-from services.storage.database.shared import (
+from services.storage.sqlite.base import BaseSqliteStore
+from services.storage.sqlite.shared import (
     DEFAULT_USER_ID,
     PROFILE_EXTRACTOR_VERSION,
     PROFILE_NORMALIZER_VERSION,
@@ -39,7 +40,7 @@ PROFILE_EVENT_ACTION_ALIASES = {
 }
 
 
-class ProfileEventMixin:
+class ProfileEventStore(BaseSqliteStore):
     """维护画像事件流和用户信号水位；具体业务动作仍由调用方决定是否写事件。"""
 
     def _ensure_user_profile_event_columns(self, conn):
@@ -158,9 +159,7 @@ class ProfileEventMixin:
             source_id=resolved_source_id,
             metadata=normalized_metadata,
         )
-        owns_connection = conn is None
-        connection = conn or self._get_connection()
-        try:
+        def _write_event(connection) -> None:
             connection.execute(
                 '''
                 INSERT INTO user_profile_events (
@@ -203,13 +202,17 @@ class ProfileEventMixin:
                     PROFILE_NORMALIZER_VERSION,
                 ),
             )
-            if owns_connection:
-                connection.commit()
+
+        try:
+            if conn is not None:
+                # 调用方传入连接时说明外层正在维护事务；这里只追加事件，不抢先提交。
+                _write_event(conn)
+            else:
+                with self._get_connection() as connection:
+                    _write_event(connection)
+                    connection.commit()
         except Exception as e:
             logger.error(f"Error recording profile event: {str(e)}")
-        finally:
-            if owns_connection:
-                connection.close()
         return event_id
 
     @staticmethod

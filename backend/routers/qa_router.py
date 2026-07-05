@@ -24,11 +24,14 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from dependencies import (
-    get_database_service,
     get_enhanced_retrieval_service,
     get_generation_service,
     get_index_job_manager,
-    get_memory_service,
+    get_paper_catalog_store,
+    get_paper_chat_message_store,
+    get_paper_chat_session_store,
+    get_paper_note_store,
+    get_paper_qa_index_store,
     get_paper_qa_service,
     get_vector_store_service,
 )
@@ -163,24 +166,21 @@ def _serialize_qa_index_job(job: Optional[dict]) -> Optional[dict]:
     }
 
 
-def _recover_stale_qa_index_jobs(db_service: Any, *, arxiv_id: str, job_id: Optional[str] = None) -> None:
+def _recover_stale_qa_index_jobs(paper_qa_index_store: Any, *, arxiv_id: str, job_id: Optional[str] = None) -> None:
     """查询前轻量执行 stale 自愈，避免前端轮询时长期看到不可恢复的 pending/running。"""
-    marker = getattr(db_service, "mark_stale_paper_index_jobs", None)
-    if not callable(marker):
-        return
     timeout_seconds = int(get_qa_index_job_runtime_config().get("timeout_seconds") or 1800)
-    marker(arxiv_id=arxiv_id, job_id=job_id, timeout_seconds=timeout_seconds)
+    paper_qa_index_store.mark_stale_paper_index_jobs(arxiv_id=arxiv_id, job_id=job_id, timeout_seconds=timeout_seconds)
 
 
-def _serialize_paper_note(note: Optional[dict], db_service=None) -> Optional[dict]:
+def _serialize_paper_note(note: Optional[dict], paper_chat_message_store=None) -> Optional[dict]:
     """序列化论文笔记，并按需补齐其关联的对话来源信息。"""
     if not note:
         return None
     linked_message = None
-    if db_service and note.get("source_message_id"):
+    if paper_chat_message_store and note.get("source_message_id"):
         # 如果笔记来源于某条 assistant 回复，这里顺手把原消息取出来，
         # 用于补齐 turn_id 和 sources，方便前端回溯笔记出处。
-        linked_message = db_service.get_paper_chat_message(
+        linked_message = paper_chat_message_store.get_paper_chat_message(
             note.get("source_message_id"),
             user_id=note.get("user_id") or _normalize_user_id(None),
         )
@@ -254,13 +254,13 @@ async def get_paper_qa_status(arxiv_id: str, paper_qa_service=Depends(get_paper_
 async def diagnose_paper_qa(
     arxiv_id: str,
     sample_limit: int = Query(3, ge=0, le=20),
-    db_service=Depends(get_database_service),
+    paper_qa_index_store=Depends(get_paper_qa_index_store),
     vector_store_service=Depends(get_vector_store_service),
 ):
     """输出 QA 索引诊断信息，用于排查索引和向量库状态。"""
     try:
         return build_qa_diagnostic(
-            db_service=db_service,
+            paper_qa_index_store=paper_qa_index_store,
             vector_store_service=vector_store_service,
             arxiv_id=arxiv_id,
             sample_limit=sample_limit,
@@ -380,12 +380,12 @@ async def create_paper_qa_index(
 @router.get("/qa-index-jobs/latest")
 async def get_latest_paper_qa_index_job(
     arxiv_id: str,
-    db_service=Depends(get_database_service),
+    paper_qa_index_store=Depends(get_paper_qa_index_store),
 ):
     """获取指定论文最近一次 QA 索引任务。"""
     try:
-        _recover_stale_qa_index_jobs(db_service, arxiv_id=arxiv_id)
-        job = db_service.get_latest_paper_index_job(arxiv_id)
+        _recover_stale_qa_index_jobs(paper_qa_index_store, arxiv_id=arxiv_id)
+        job = paper_qa_index_store.get_latest_paper_index_job(arxiv_id)
         if not job:
             raise HTTPException(status_code=404, detail="QA index job not found")
         return _serialize_qa_index_job(job)
@@ -400,12 +400,12 @@ async def get_latest_paper_qa_index_job(
 async def get_paper_qa_index_job(
     arxiv_id: str,
     job_id: str,
-    db_service=Depends(get_database_service),
+    paper_qa_index_store=Depends(get_paper_qa_index_store),
 ):
     """按任务 ID 获取某次 QA 索引构建任务详情。"""
     try:
-        _recover_stale_qa_index_jobs(db_service, arxiv_id=arxiv_id, job_id=job_id)
-        job = db_service.get_paper_index_job(job_id)
+        _recover_stale_qa_index_jobs(paper_qa_index_store, arxiv_id=arxiv_id, job_id=job_id)
+        job = paper_qa_index_store.get_paper_index_job(job_id)
         if not job or job.get("arxiv_id") != arxiv_id:
             raise HTTPException(status_code=404, detail="QA index job not found")
         return _serialize_qa_index_job(job)
@@ -421,11 +421,11 @@ async def list_paper_chat_sessions(
     arxiv_id: str,
     user_id: Optional[str] = Query(None),
     limit: int = Query(20, ge=1, le=100),
-    db_service=Depends(get_database_service),
+    paper_chat_session_store=Depends(get_paper_chat_session_store),
 ):
     """列出某篇论文下、某个用户的聊天会话列表。"""
     try:
-        sessions = db_service.list_paper_chat_sessions(arxiv_id=arxiv_id, user_id=_normalize_user_id(user_id), limit=limit)
+        sessions = paper_chat_session_store.list_paper_chat_sessions(arxiv_id=arxiv_id, user_id=_normalize_user_id(user_id), limit=limit)
         return {"items": [_serialize_chat_session(item) for item in sessions]}
     except Exception as exc:
         logger.error("Error listing paper chat sessions: %s", str(exc))
@@ -436,11 +436,11 @@ async def list_paper_chat_sessions(
 async def get_recent_paper_chat_session(
     arxiv_id: str,
     user_id: Optional[str] = Query(None),
-    db_service=Depends(get_database_service),
+    paper_chat_session_store=Depends(get_paper_chat_session_store),
 ):
     """获取最近一次论文聊天会话，便于前端恢复上下文。"""
     try:
-        session = db_service.get_recent_paper_chat_session(arxiv_id=arxiv_id, user_id=_normalize_user_id(user_id))
+        session = paper_chat_session_store.get_recent_paper_chat_session(arxiv_id=arxiv_id, user_id=_normalize_user_id(user_id))
         return {"item": _serialize_chat_session(session)}
     except Exception as exc:
         logger.error("Error getting recent paper chat session: %s", str(exc))
@@ -451,11 +451,11 @@ async def get_recent_paper_chat_session(
 async def create_paper_chat_session(
     arxiv_id: str,
     payload: CreatePaperChatSessionRequest = Body(default=CreatePaperChatSessionRequest()),
-    db_service=Depends(get_database_service),
+    paper_chat_session_store=Depends(get_paper_chat_session_store),
 ):
     """创建一个新的论文聊天会话。"""
     try:
-        session = db_service.create_paper_chat_session(
+        session = paper_chat_session_store.create_paper_chat_session(
             arxiv_id=arxiv_id,
             user_id=_normalize_user_id(payload.user_id),
             # 标题允许为空；若前端不传，后续也可以由系统根据首轮问题自动生成。
@@ -476,11 +476,11 @@ async def get_paper_chat_session(
     arxiv_id: str,
     session_id: str,
     user_id: Optional[str] = Query(None),
-    db_service=Depends(get_database_service),
+    paper_chat_session_store=Depends(get_paper_chat_session_store),
 ):
     """获取单个聊天会话详情，并校验该会话确实属于当前论文。"""
     try:
-        session = db_service.get_paper_chat_session(session_id, user_id=_normalize_user_id(user_id))
+        session = paper_chat_session_store.get_paper_chat_session(session_id, user_id=_normalize_user_id(user_id))
         if not session or session.get("arxiv_id") != arxiv_id:
             raise HTTPException(status_code=404, detail="Chat session not found")
         return {"item": _serialize_chat_session(session)}
@@ -496,14 +496,15 @@ async def get_paper_chat_messages(
     arxiv_id: str,
     session_id: str,
     user_id: Optional[str] = Query(None),
-    db_service=Depends(get_database_service),
+    paper_chat_session_store=Depends(get_paper_chat_session_store),
+    paper_chat_message_store=Depends(get_paper_chat_message_store),
 ):
     """获取某个聊天会话下的全部消息。"""
     try:
-        session = db_service.get_paper_chat_session(session_id, user_id=_normalize_user_id(user_id))
+        session = paper_chat_session_store.get_paper_chat_session(session_id, user_id=_normalize_user_id(user_id))
         if not session or session.get("arxiv_id") != arxiv_id:
             raise HTTPException(status_code=404, detail="Chat session not found")
-        messages = db_service.list_paper_chat_messages(session_id, user_id=_normalize_user_id(user_id))
+        messages = paper_chat_message_store.list_paper_chat_messages(session_id, user_id=_normalize_user_id(user_id))
         return {
             "session": _serialize_chat_session(session),
             "items": [_serialize_chat_message(item) for item in messages],
@@ -520,17 +521,18 @@ async def clear_paper_chat_session(
     arxiv_id: str,
     session_id: str,
     payload: Optional[dict] = Body(default=None),
-    db_service=Depends(get_database_service),
+    paper_chat_session_store=Depends(get_paper_chat_session_store),
+    paper_chat_message_store=Depends(get_paper_chat_message_store),
 ):
     """清空指定聊天会话中的消息，但保留会话本身。"""
     try:
         user_id = _normalize_user_id((payload or {}).get("user_id"))
-        session = db_service.get_paper_chat_session(session_id, user_id=user_id)
+        session = paper_chat_session_store.get_paper_chat_session(session_id, user_id=user_id)
         if not session or session.get("arxiv_id") != arxiv_id:
             raise HTTPException(status_code=404, detail="Chat session not found")
         # clear 后再重新读取一次，保证返回给前端的是最新 message_count 等状态。
-        db_service.clear_paper_chat_session(session_id, user_id=user_id)
-        refreshed = db_service.get_paper_chat_session(session_id, user_id=user_id)
+        paper_chat_message_store.clear_paper_chat_session(session_id, user_id=user_id)
+        refreshed = paper_chat_session_store.get_paper_chat_session(session_id, user_id=user_id)
         return {"item": _serialize_chat_session(refreshed)}
     except HTTPException:
         raise
@@ -544,14 +546,15 @@ async def delete_paper_chat_session(
     arxiv_id: str,
     session_id: str,
     user_id: Optional[str] = Query(None),
-    db_service=Depends(get_database_service),
+    paper_chat_session_store=Depends(get_paper_chat_session_store),
+    paper_chat_message_store=Depends(get_paper_chat_message_store),
 ):
     """删除整个聊天会话。"""
     try:
-        session = db_service.get_paper_chat_session(session_id, user_id=_normalize_user_id(user_id))
+        session = paper_chat_session_store.get_paper_chat_session(session_id, user_id=_normalize_user_id(user_id))
         if not session or session.get("arxiv_id") != arxiv_id:
             raise HTTPException(status_code=404, detail="Chat session not found")
-        deleted = db_service.delete_paper_chat_session(session_id, user_id=_normalize_user_id(user_id))
+        deleted = paper_chat_message_store.delete_paper_chat_session(session_id, user_id=_normalize_user_id(user_id))
         return {"status": "success", "deleted": deleted}
     except HTTPException:
         raise
@@ -565,16 +568,17 @@ async def list_paper_notes(
     arxiv_id: str,
     user_id: Optional[str] = Query(None),
     note_type: Optional[str] = Query(None),
-    db_service=Depends(get_database_service),
+    paper_note_store=Depends(get_paper_note_store),
+    paper_chat_message_store=Depends(get_paper_chat_message_store),
 ):
     """列出某篇论文下的笔记，可按 note_type 过滤。"""
     try:
-        notes = db_service.list_paper_notes(
+        notes = paper_note_store.list_paper_notes(
             arxiv_id=arxiv_id,
             user_id=_normalize_user_id(user_id),
             note_type=note_type,
         )
-        return {"items": [_serialize_paper_note(item, db_service=db_service) for item in notes]}
+        return {"items": [_serialize_paper_note(item, paper_chat_message_store=paper_chat_message_store) for item in notes]}
     except Exception as exc:
         logger.error("Error listing paper notes: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
@@ -584,8 +588,8 @@ async def list_paper_notes(
 async def create_paper_note(
     arxiv_id: str,
     payload: PaperNoteRequest,
-    db_service=Depends(get_database_service),
-    memory_service=Depends(get_memory_service),
+    paper_note_store=Depends(get_paper_note_store),
+    paper_chat_message_store=Depends(get_paper_chat_message_store),
 ):
     """创建一条论文笔记，并可选同步更新用户研究画像。"""
     try:
@@ -594,7 +598,7 @@ async def create_paper_note(
         if not source_message_id and payload.session_id and payload.source_turn_id:
             # 如果前端没有直接传 message_id，但给了 session + turn，
             # 就回查对应的 assistant 消息，建立笔记与问答来源的关联。
-            linked_message = db_service.get_paper_chat_message_by_turn(
+            linked_message = paper_chat_message_store.get_paper_chat_message_by_turn(
                 payload.session_id,
                 payload.source_turn_id,
                 role="assistant",
@@ -602,7 +606,7 @@ async def create_paper_note(
             )
             source_message_id = linked_message.get("message_id") if linked_message else None
 
-        note = db_service.create_paper_note(
+        note = paper_note_store.create_paper_note(
             user_id=user_id,
             arxiv_id=arxiv_id,
             session_id=(payload.session_id or "").strip() or None,
@@ -617,7 +621,7 @@ async def create_paper_note(
         if not note:
             raise HTTPException(status_code=500, detail="Failed to create paper note")
 
-        return {"item": _serialize_paper_note(note, db_service=db_service)}
+        return {"item": _serialize_paper_note(note, paper_chat_message_store=paper_chat_message_store)}
     except HTTPException:
         raise
     except Exception as exc:
@@ -630,17 +634,17 @@ async def update_paper_note(
     arxiv_id: str,
     note_id: str,
     payload: UpdatePaperNoteRequest,
-    db_service=Depends(get_database_service),
-    memory_service=Depends(get_memory_service),
+    paper_note_store=Depends(get_paper_note_store),
+    paper_chat_message_store=Depends(get_paper_chat_message_store),
 ):
     """更新指定笔记，并在需要时重新同步用户画像。"""
     try:
         user_id = _normalize_user_id(payload.user_id)
-        current = db_service.get_paper_note(note_id, user_id=user_id)
+        current = paper_note_store.get_paper_note(note_id, user_id=user_id)
         if not current or current.get("arxiv_id") != arxiv_id:
             raise HTTPException(status_code=404, detail="Paper note not found")
 
-        note = db_service.update_paper_note(
+        note = paper_note_store.update_paper_note(
             note_id,
             user_id=user_id,
             title=payload.title,
@@ -653,7 +657,7 @@ async def update_paper_note(
         if not note:
             raise HTTPException(status_code=500, detail="Failed to update paper note")
 
-        return {"item": _serialize_paper_note(note, db_service=db_service)}
+        return {"item": _serialize_paper_note(note, paper_chat_message_store=paper_chat_message_store)}
     except HTTPException:
         raise
     except Exception as exc:
@@ -666,15 +670,15 @@ async def delete_paper_note(
     arxiv_id: str,
     note_id: str,
     user_id: Optional[str] = Query(None),
-    db_service=Depends(get_database_service),
+    paper_note_store=Depends(get_paper_note_store),
 ):
     """删除指定论文笔记。"""
     try:
         normalized_user_id = _normalize_user_id(user_id)
-        current = db_service.get_paper_note(note_id, user_id=normalized_user_id)
+        current = paper_note_store.get_paper_note(note_id, user_id=normalized_user_id)
         if not current or current.get("arxiv_id") != arxiv_id:
             raise HTTPException(status_code=404, detail="Paper note not found")
-        deleted = db_service.delete_paper_note(note_id, user_id=normalized_user_id)
+        deleted = paper_note_store.delete_paper_note(note_id, user_id=normalized_user_id)
         return {"status": "success", "deleted": deleted}
     except HTTPException:
         raise
@@ -687,14 +691,16 @@ async def delete_paper_note(
 async def export_paper_notes_markdown(
     arxiv_id: str,
     user_id: Optional[str] = Query(None),
-    db_service=Depends(get_database_service),
+    paper_note_store=Depends(get_paper_note_store),
+    paper_chat_message_store=Depends(get_paper_chat_message_store),
+    paper_catalog_store=Depends(get_paper_catalog_store),
 ):
     """把某篇论文的全部笔记导出为 Markdown 文件下载。"""
     try:
         normalized_user_id = _normalize_user_id(user_id)
-        notes = db_service.list_paper_notes(arxiv_id=arxiv_id, user_id=normalized_user_id)
-        serialized_notes = [_serialize_paper_note(item, db_service=db_service) for item in notes]
-        paper = db_service.get_paper(arxiv_id)
+        notes = paper_note_store.list_paper_notes(arxiv_id=arxiv_id, user_id=normalized_user_id)
+        serialized_notes = [_serialize_paper_note(item, paper_chat_message_store=paper_chat_message_store) for item in notes]
+        paper = paper_catalog_store.get_paper(arxiv_id)
         markdown = _build_notes_markdown(arxiv_id, serialized_notes, paper_title=(paper or {}).get("title"))
         filename = f"{sanitize_trace_slug(arxiv_id)}_notes.md"
         return StreamingResponse(

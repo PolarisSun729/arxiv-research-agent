@@ -20,7 +20,24 @@ if TYPE_CHECKING:
     from services.paper_qa.paper_qa_service import PaperQAService
     from services.recommendation.recommendation_service import RecommendationService
     from services.retrieval.enhanced_retrieval_service import EnhancedRetrievalService
-    from services.storage.database_service import DatabaseService
+    from services.storage.sqlite import StorageContainer
+    from services.storage.sqlite.stores import (
+        AgentRuntimeCheckpointStore,
+        AgentSessionStore,
+        InterestVectorStore,
+        LangGraphCheckpointStore,
+        PaperCatalogStore,
+        PaperChatMessageStore,
+        PaperChatSessionStore,
+        PaperNoteStore,
+        PaperProfileEvidenceStore,
+        PaperQAIndexStore,
+        PaperQATurnStore,
+        ProfileBuildJobStore,
+        ProfileEventStore,
+        ResearchProfileStore,
+        UserPreferenceStore,
+    )
     from services.storage.vector_store_service import VectorStoreService
 
 DATA_SOURCE = CORE_CONFIG["arxiv_data_source"]
@@ -31,10 +48,70 @@ logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
-def get_database_service() -> DatabaseService:
-    from services.storage.database_service import DatabaseService
+def get_storage_container() -> StorageContainer:
+    from services.storage.sqlite import StorageContainer
 
-    return DatabaseService()
+    return StorageContainer()
+
+
+def get_paper_catalog_store() -> PaperCatalogStore:
+    return get_storage_container().paper_catalog
+
+
+def get_user_preference_store() -> UserPreferenceStore:
+    return get_storage_container().user_preferences
+
+
+def get_interest_vector_store() -> InterestVectorStore:
+    return get_storage_container().interest_vectors
+
+
+def get_paper_profile_evidence_store() -> PaperProfileEvidenceStore:
+    return get_storage_container().paper_profile_evidence
+
+
+def get_paper_qa_index_store() -> PaperQAIndexStore:
+    return get_storage_container().paper_qa_index
+
+
+def get_paper_chat_session_store() -> PaperChatSessionStore:
+    return get_storage_container().paper_chat_sessions
+
+
+def get_paper_chat_message_store() -> PaperChatMessageStore:
+    return get_storage_container().paper_chat_messages
+
+
+def get_paper_qa_turn_store() -> PaperQATurnStore:
+    return get_storage_container().paper_qa_turns
+
+
+def get_paper_note_store() -> PaperNoteStore:
+    return get_storage_container().paper_notes
+
+
+def get_profile_event_store() -> ProfileEventStore:
+    return get_storage_container().profile_events
+
+
+def get_profile_build_job_store() -> ProfileBuildJobStore:
+    return get_storage_container().profile_build_jobs
+
+
+def get_research_profile_store() -> ResearchProfileStore:
+    return get_storage_container().research_profiles
+
+
+def get_agent_session_store() -> AgentSessionStore:
+    return get_storage_container().agent_sessions
+
+
+def get_agent_runtime_checkpoint_store() -> AgentRuntimeCheckpointStore:
+    return get_storage_container().agent_runtime_checkpoints
+
+
+def get_langgraph_checkpoint_store() -> LangGraphCheckpointStore:
+    return get_storage_container().langgraph_checkpoints
 
 
 @lru_cache(maxsize=1)
@@ -69,7 +146,20 @@ def get_generation_service() -> GenerationService:
 def get_memory_service() -> MemoryService:
     from services.memory import MemoryService
 
-    return MemoryService(db_service=get_database_service(), generation_service=get_generation_service())
+    return MemoryService(
+        paper_catalog_store=get_paper_catalog_store(),
+        user_preference_store=get_user_preference_store(),
+        interest_vector_store=get_interest_vector_store(),
+        paper_profile_evidence_store=get_paper_profile_evidence_store(),
+        paper_chat_session_store=get_paper_chat_session_store(),
+        paper_chat_message_store=get_paper_chat_message_store(),
+        paper_note_store=get_paper_note_store(),
+        profile_event_store=get_profile_event_store(),
+        profile_build_job_store=get_profile_build_job_store(),
+        research_profile_store=get_research_profile_store(),
+        agent_session_store=get_agent_session_store(),
+        generation_service=get_generation_service(),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -117,7 +207,8 @@ def get_paper_qa_index_builder() -> PaperQAIndexBuilder:
     from services.paper_qa.paper_qa_index_builder import PaperQAIndexBuilder
 
     return PaperQAIndexBuilder(
-        db_service=get_database_service(),
+        paper_qa_index_store=get_paper_qa_index_store(),
+        paper_catalog_store=get_paper_catalog_store(),
         embedding_service=get_embedding_service(),
         vector_store_service=get_vector_store_service(),
         generation_service=get_generation_service(),
@@ -134,7 +225,7 @@ def get_index_job_manager() -> IndexJobManager:
     from services.paper_qa.index_job_manager import IndexJobManager
 
     return IndexJobManager(
-        db_service=get_database_service(),
+        paper_qa_index_store=get_paper_qa_index_store(),
         qa_index_builder=get_paper_qa_index_builder(),
     )
 
@@ -144,7 +235,12 @@ def get_recommendation_service() -> RecommendationService:
     from services.recommendation.recommendation_service import RecommendationService
 
     return RecommendationService(
-        db_service=get_database_service(),
+        paper_catalog_store=get_paper_catalog_store(),
+        user_preference_store=get_user_preference_store(),
+        interest_vector_store=get_interest_vector_store(),
+        paper_profile_evidence_store=get_paper_profile_evidence_store(),
+        research_profile_store=get_research_profile_store(),
+        profile_event_store=get_profile_event_store(),
         memory_service=get_memory_service(),
         embedding_service=get_embedding_service(),
         vector_store_service=get_vector_store_service(),
@@ -160,7 +256,12 @@ def get_paper_qa_service() -> PaperQAService:
     from services.paper_qa.paper_qa_service import PaperQAService
 
     return PaperQAService(
-        db_service=get_database_service(),
+        paper_qa_index_store=get_paper_qa_index_store(),
+        paper_catalog_store=get_paper_catalog_store(),
+        paper_chat_session_store=get_paper_chat_session_store(),
+        paper_qa_turn_store=get_paper_qa_turn_store(),
+        research_profile_store=get_research_profile_store(),
+        agent_runtime_checkpoint_store=get_agent_runtime_checkpoint_store(),
         memory_service=get_memory_service(),
         embedding_service=get_embedding_service(),
         vector_store_service=get_vector_store_service(),
@@ -181,7 +282,7 @@ def normalize_service_load_mode(load_mode: str | None = None) -> str:
 
 def iter_service_getters() -> list[tuple[str, Callable[[], Any]]]:
     return [
-        ("database_service", get_database_service),
+        ("storage_container", get_storage_container),
         ("oai_database_service", get_oai_database_service),
         ("embedding_service", get_embedding_service),
         ("vector_store_service", get_vector_store_service),

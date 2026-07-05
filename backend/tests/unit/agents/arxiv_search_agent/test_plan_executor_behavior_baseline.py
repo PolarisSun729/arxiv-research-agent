@@ -150,7 +150,7 @@ def test_plan_executor_postcondition_failure_marks_step_failed(monkeypatch) -> N
 #    重新经过确认门，而不是直接放行副作用工具。
 # --------------------------------------------------------------------------------------
 def test_plan_executor_checkpoint_approval_ignored_when_plan_id_mismatch(monkeypatch) -> None:
-    class StalePlanCheckpointDatabase:
+    class StalePlanCheckpointStore:
         def get_agent_runtime_checkpoint(self, **kwargs):
             # checkpoint 记录的是另一轮（旧 plan）的批准态，plan_id 与当前 plan 不一致。
             return {
@@ -165,13 +165,12 @@ def test_plan_executor_checkpoint_approval_ignored_when_plan_id_mismatch(monkeyp
     def fail_if_called(*args, **kwargs):
         raise AssertionError("stale-plan checkpoint approval must not execute side effect tool")
 
-    monkeypatch.setattr(executor_module, "DatabaseService", StalePlanCheckpointDatabase)
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fail_if_called)
 
     goal, plan = _paper_index_confirmation_plan()  # 当前 plan_id = "paper_qa:test"
     state = AgentState(user_id="u1", session_id="s1", intent="paper_qa", message="build index")
 
-    result = PlanExecutor().execute(plan, state)
+    result = PlanExecutor(runtime_checkpoint_store=StalePlanCheckpointStore()).execute(plan, state)
 
     # 旧 plan 的批准态被忽略，本轮重新进入确认门并暂停，而不是误放行副作用工具。
     assert result.status == "waiting_confirmation"
@@ -433,7 +432,7 @@ def test_execution_path_summary_reports_fallback_as_failed() -> None:
 #    副作用工具，必须重新经过确认门。
 # --------------------------------------------------------------------------------------
 def test_plan_executor_checkpoint_approval_ignored_when_goal_type_mismatch(monkeypatch) -> None:
-    class StaleGoalCheckpointDatabase:
+    class StaleGoalCheckpointStore:
         def get_agent_runtime_checkpoint(self, **kwargs):
             # checkpoint 的 plan_id 与当前 plan 相同，但 goal 类型来自另一种意图（复用 session 切换意图）。
             return {
@@ -449,13 +448,12 @@ def test_plan_executor_checkpoint_approval_ignored_when_goal_type_mismatch(monke
     def fail_if_called(*args, **kwargs):
         raise AssertionError("stale-goal checkpoint approval must not execute side effect tool")
 
-    monkeypatch.setattr(executor_module, "DatabaseService", StaleGoalCheckpointDatabase)
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fail_if_called)
 
     goal, plan = _paper_index_confirmation_plan()  # 当前 goal_type = "paper_qa"
     state = AgentState(user_id="u1", session_id="s1", intent="paper_qa", message="build index")
 
-    result = PlanExecutor().execute(plan, state)
+    result = PlanExecutor(runtime_checkpoint_store=StaleGoalCheckpointStore()).execute(plan, state)
 
     # goal 类型不一致 -> 旧批准态被忽略 -> 重新进入确认门并暂停，而不是误放行副作用工具。
     assert result.status == "waiting_confirmation"
@@ -470,7 +468,7 @@ def test_plan_executor_checkpoint_approval_ignored_when_goal_type_mismatch(monke
 def test_plan_executor_checkpoint_approval_honored_when_goal_type_matches(monkeypatch) -> None:
     calls = []
 
-    class MatchingGoalCheckpointDatabase:
+    class MatchingGoalCheckpointStore:
         def get_agent_runtime_checkpoint(self, **kwargs):
             return {
                 "status": "running",
@@ -491,7 +489,6 @@ def test_plan_executor_checkpoint_approval_honored_when_goal_type_matches(monkey
     def fail_if_interrupted(*args, **kwargs):
         raise AssertionError("matching-goal checkpoint approval must not request confirmation again")
 
-    monkeypatch.setattr(executor_module, "DatabaseService", MatchingGoalCheckpointDatabase)
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
     monkeypatch.setattr(executor_module, "interrupt", fail_if_interrupted)
 
@@ -500,7 +497,11 @@ def test_plan_executor_checkpoint_approval_honored_when_goal_type_matches(monkey
     runtime = planner_module.build_plan_runtime(state, goal=goal, plan=plan, turn_status="success")
     runtime.step_status = {step.step_id: "pending" for step in list(plan.steps or [])}
 
-    result = PlanExecutor()._execute_runtime(runtime, state, allow_interrupt=True)
+    result = PlanExecutor(runtime_checkpoint_store=MatchingGoalCheckpointStore())._execute_runtime(
+        runtime,
+        state,
+        allow_interrupt=True,
+    )
 
     # goal 类型一致 -> 批准态正常放行 -> 副作用工具执行，不再二次确认。
     assert result.status == "success"
@@ -515,26 +516,28 @@ def test_plan_executor_checkpoint_approval_honored_when_goal_type_matches(monkey
 def test_plan_executor_checkpoint_approval_honored_when_resume_state_loses_user_id(monkeypatch) -> None:
     calls = []
 
-    class ResumeCheckpointDatabase:
+    class ResumeCheckpointStore:
         def get_agent_runtime_checkpoint(self, **kwargs):
             # 复现线上日志里的断点：LangGraph 恢复态没有带回真实 user_id，
             # 精确 user 查询会落到默认用户，因此读不到刚刚消费过的批准态。
             assert kwargs.get("user_id") == executor_module.DEFAULT_USER_ID
             return None
 
-        def get_agent_runtime_checkpoint_by_thread(self, **kwargs):
+        def list_agent_runtime_checkpoints_by_thread(self, **kwargs):
             assert kwargs.get("session_id") == "s1"
             assert kwargs.get("thread_id") == "s1"
-            return {
-                "user_id": "local_user",
-                "status": "running",
-                "pending_confirmation": None,
-                "runtime_state": {
-                    "approved_step_ids": ["parse_and_index_paper"],
-                    "plan": {"plan_id": "paper_qa:test"},
-                    "goal": {"goal_type": "paper_qa"},
+            return [
+                {
+                    "user_id": "local_user",
+                    "status": "running",
+                    "pending_confirmation": None,
+                    "runtime_state": {
+                        "approved_step_ids": ["parse_and_index_paper"],
+                        "plan": {"plan_id": "paper_qa:test"},
+                        "goal": {"goal_type": "paper_qa"},
+                    },
                 },
-            }
+            ]
 
     def fake_invoke_tool(tool_name: str, **kwargs):
         calls.append((tool_name, dict(kwargs)))
@@ -545,7 +548,6 @@ def test_plan_executor_checkpoint_approval_honored_when_resume_state_loses_user_
     def fail_if_interrupted(*args, **kwargs):
         raise AssertionError("consumed checkpoint approval must not request confirmation again")
 
-    monkeypatch.setattr(executor_module, "DatabaseService", ResumeCheckpointDatabase)
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
     monkeypatch.setattr(executor_module, "interrupt", fail_if_interrupted)
 
@@ -554,7 +556,11 @@ def test_plan_executor_checkpoint_approval_honored_when_resume_state_loses_user_
     runtime = planner_module.build_plan_runtime(state, goal=goal, plan=plan, turn_status="success")
     runtime.step_status = {step.step_id: "pending" for step in list(plan.steps or [])}
 
-    result = PlanExecutor()._execute_runtime(runtime, state, allow_interrupt=True)
+    result = PlanExecutor(runtime_checkpoint_store=ResumeCheckpointStore())._execute_runtime(
+        runtime,
+        state,
+        allow_interrupt=True,
+    )
 
     assert result.status == "success"
     assert calls and calls[0][0] == "build_paper_qa_index"
@@ -568,7 +574,7 @@ def test_plan_executor_checkpoint_approval_honored_when_resume_state_loses_user_
 def test_plan_executor_checkpoint_approval_recovers_single_valid_thread_candidate(monkeypatch) -> None:
     calls = []
 
-    class MultiCandidateCheckpointDatabase:
+    class MultiCandidateCheckpointStore:
         def get_agent_runtime_checkpoint(self, **kwargs):
             assert kwargs.get("user_id") == executor_module.DEFAULT_USER_ID
             return {
@@ -609,7 +615,6 @@ def test_plan_executor_checkpoint_approval_recovers_single_valid_thread_candidat
     def fail_if_interrupted(*args, **kwargs):
         raise AssertionError("single valid thread fallback candidate must not request confirmation again")
 
-    monkeypatch.setattr(executor_module, "DatabaseService", MultiCandidateCheckpointDatabase)
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
     monkeypatch.setattr(executor_module, "interrupt", fail_if_interrupted)
 
@@ -618,7 +623,11 @@ def test_plan_executor_checkpoint_approval_recovers_single_valid_thread_candidat
     runtime = planner_module.build_plan_runtime(state, goal=goal, plan=plan, turn_status="success")
     runtime.step_status = {step.step_id: "pending" for step in list(plan.steps or [])}
 
-    result = PlanExecutor()._execute_runtime(runtime, state, allow_interrupt=True)
+    result = PlanExecutor(runtime_checkpoint_store=MultiCandidateCheckpointStore())._execute_runtime(
+        runtime,
+        state,
+        allow_interrupt=True,
+    )
 
     assert result.status == "success"
     assert calls and calls[0][0] == "build_paper_qa_index"

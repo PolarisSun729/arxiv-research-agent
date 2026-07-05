@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from core.errors import AppError, ErrorCode, http_exception_to_app_error, make_error_payload
-from dependencies import SERVICE_LOAD_MODE, normalize_service_load_mode, warm_up_services
+from dependencies import SERVICE_LOAD_MODE, get_agent_runtime_checkpoint_store, normalize_service_load_mode, warm_up_services
 from routers.agent_router import router as agent_router
 from routers.arxiv_router import router as arxiv_router
 from routers.paper_router import router as paper_router
@@ -48,7 +48,9 @@ def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None
             from services.context_lifecycle import ContextLifecycleService
             from utils.config import get_enhanced_retrieval_runtime_config
 
-            context_lifecycle_service = ContextLifecycleService()
+            context_lifecycle_service = ContextLifecycleService(
+                agent_runtime_checkpoint_store=get_agent_runtime_checkpoint_store(),
+            )
             cleanup_result = context_lifecycle_service.run_startup_cleanup(
                 trace_export_dir=get_enhanced_retrieval_runtime_config().get("trace_export_dir"),
             )

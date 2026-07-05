@@ -34,7 +34,7 @@ def check_paper_qa_index(arxiv_id: str, run_id: Optional[str] = None) -> Dict[st
             tool_name=tool_name,
             summary=f"已检查论文 {arxiv_id} 的 QA 索引状态",
             data=data,
-            trace=make_tool_trace(tool_name, inputs=trace_inputs, source="database_service"),
+            trace=make_tool_trace(tool_name, inputs=trace_inputs, source="paper_qa_service"),
         )
     except Exception as exc:
         return make_tool_result(
@@ -42,7 +42,7 @@ def check_paper_qa_index(arxiv_id: str, run_id: Optional[str] = None) -> Dict[st
             tool_name=tool_name,
             summary="检查 QA 索引失败",
             data=None,
-            trace=make_tool_trace(tool_name, inputs=trace_inputs, source="database_service"),
+            trace=make_tool_trace(tool_name, inputs=trace_inputs, source="paper_qa_service"),
             error=make_tool_error("qa_status_failed", str(exc)),
         )
 

@@ -16,12 +16,13 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 from core.errors import AppError, ErrorCode, error_response
 from dependencies import (
-    get_database_service,
     get_embedding_service,
     get_current_embedding_config,
     get_oai_database_service,
+    get_paper_catalog_store,
     get_paper_qa_service,
     get_recommendation_service,
+    get_user_preference_store,
     get_vector_store_service,
 )
 from utils.config import get_default_user_id
@@ -76,7 +77,7 @@ def _get_sync_status_payload() -> Dict[str, Any]:
 @router.get("/stats")
 async def get_dashboard_stats(
     user_id: str = Query(default_factory=get_default_user_id),
-    db_service=Depends(get_database_service),
+    user_preference_store=Depends(get_user_preference_store),
     oai_db_service=Depends(get_oai_database_service),
 ):
     """返回首页看板所需的聚合统计数据。"""
@@ -84,7 +85,7 @@ async def get_dashboard_stats(
         sync_status = _get_sync_status_payload()
         return {
             "totalPapers": oai_db_service.get_total_paper_count(),
-            "labeledPapers": db_service.get_user_labeled_paper_count(user_id=user_id),
+            "labeledPapers": user_preference_store.get_user_labeled_paper_count(user_id=user_id),
             "todayNewPapers": sync_status["latestSyncNewPapers"],
             "latestSyncNewPapers": sync_status["latestSyncNewPapers"],
             "lastSyncedDate": sync_status["lastSyncedDate"],
@@ -120,7 +121,7 @@ async def add_paper(
     published_date: str = Body(...),
     url: str = Body(...),
     collection_name: str = Body("arxiv_abstracts"),
-    db_service=Depends(get_database_service),
+    paper_catalog_store=Depends(get_paper_catalog_store),
     embedding_service=Depends(get_embedding_service),
 ):
     """新增论文，并同步为其摘要生成 embedding。
@@ -188,7 +189,7 @@ async def add_paper(
         logger.debug("Adding paper to database: %s, embedding_id: %s", metadata, embedding_id)
 
         # 数据库中保留 embedding_id / embedding_model，方便后续追踪向量来源与重建。
-        success = db_service.add_paper(
+        success = paper_catalog_store.add_paper(
             {
                 "arxiv_id": arxiv_id,
                 "title": title,
@@ -222,7 +223,7 @@ async def add_paper(
         return error_response(
             AppError(
                 ErrorCode.DATABASE_WRITE_FAILED,
-                detail="db_service.add_paper returned False",
+                detail="paper_catalog_store.add_paper returned False",
                 context={"arxiv_id": arxiv_id, "stage": "add_paper"},
             )
         )
@@ -234,7 +235,7 @@ async def add_paper(
 @router.get("/paper/{arxiv_id}")
 async def get_paper(
     arxiv_id: str,
-    db_service=Depends(get_database_service),
+    paper_catalog_store=Depends(get_paper_catalog_store),
     recommendation_service=Depends(get_recommendation_service),
 ):
     """获取单篇论文详情。
@@ -243,7 +244,7 @@ async def get_paper(
     并将回源结果物化成系统内可用的论文对象后返回。
     """
     try:
-        paper = db_service.get_paper(arxiv_id)
+        paper = paper_catalog_store.get_paper(arxiv_id)
         if paper:
             return paper
         # 本地未命中时，尝试通过推荐服务做带限流的远端拉取，避免直接打爆上游接口。
@@ -262,14 +263,14 @@ async def get_paper(
 @router.delete("/paper/{arxiv_id}")
 async def delete_paper(
     arxiv_id: str,
-    db_service=Depends(get_database_service),
+    paper_catalog_store=Depends(get_paper_catalog_store),
     paper_qa_service=Depends(get_paper_qa_service),
 ):
     """删除指定论文，并同步清理该论文的 QA 索引 artifact。"""
     try:
         # 论文删除前先让 QA 索引不可检索，避免 SQLite 元数据消失后 Milvus 仍留下可命中的旧 chunk。
         qa_cleanup = paper_qa_service.delete_qa_index(arxiv_id)
-        success = db_service.delete_paper(arxiv_id)
+        success = paper_catalog_store.delete_paper(arxiv_id)
         if success:
             return {"status": "success", "message": "Paper deleted", "qa_cleanup": qa_cleanup}
         raise HTTPException(status_code=404, detail="Paper not found")
@@ -281,10 +282,10 @@ async def delete_paper(
 
 
 @router.get("/papers")
-async def get_all_papers(db_service=Depends(get_database_service)):
+async def get_all_papers(paper_catalog_store=Depends(get_paper_catalog_store)):
     """获取当前数据库中的全部论文列表。"""
     try:
-        papers = db_service.get_all_papers()
+        papers = paper_catalog_store.get_all_papers()
         return {"papers": papers}
     except Exception as exc:
         logger.error("Error getting all papers: %s", str(exc))
@@ -292,10 +293,10 @@ async def get_all_papers(db_service=Depends(get_database_service)):
 
 
 @router.get("/papers/category/{category}")
-async def search_papers_by_category(category: str, db_service=Depends(get_database_service)):
+async def search_papers_by_category(category: str, paper_catalog_store=Depends(get_paper_catalog_store)):
     """按 arXiv 分类查询论文。"""
     try:
-        papers = db_service.search_papers_by_category(category)
+        papers = paper_catalog_store.search_papers_by_category(category)
         return {"papers": papers}
     except Exception as exc:
         logger.error("Error searching papers by category: %s", str(exc))

@@ -50,7 +50,7 @@ def get_latest_retrieval_trace(
 
 def build_qa_diagnostic(
     *,
-    db_service: Any,
+    paper_qa_index_store: Any,
     vector_store_service: Any,
     arxiv_id: str,
     sample_limit: int = 3,
@@ -60,8 +60,8 @@ def build_qa_diagnostic(
     该函数会同时查看数据库中的 QA 索引元数据，以及向量库 Milvus 中的真实集合状态，
     帮助开发者快速判断“索引是否建成功”“库里是否真的有向量”“元数据和实际数量是否一致”。
     """
-    # 先读取数据库里的论文 QA 索引记录，这是系统认知中的“应该存在什么”。
-    qa_index = db_service.get_paper_qa_index(arxiv_id)
+    # 先读取 SQLite 中的论文 QA 索引记录，这是系统认知中的“应该存在什么”。
+    qa_index = paper_qa_index_store.get_paper_qa_index(arxiv_id)
     # 再读取 Milvus 当前的所有集合，这是向量库中的“实际存在什么”。
     all_collections = vector_store_service.list_collections(VectorDBProvider.MILVUS.value)
 

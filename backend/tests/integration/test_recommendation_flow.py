@@ -1,4 +1,4 @@
-import gc
+﻿import gc
 import importlib.util
 import json
 import sys
@@ -10,8 +10,7 @@ from unittest import mock
 
 from fastapi import HTTPException
 
-from services.storage.database_service import DatabaseService
-from tests.helpers import FakeEmbeddingService, build_database_service
+from tests.helpers import FakeEmbeddingService, build_storage_container
 
 
 class FakeEvidenceGenerationService:
@@ -61,6 +60,7 @@ class FakeEvidenceGenerationService:
 
 def _load_recommendation_service_class():
     backend_dir = Path(__file__).resolve().parents[2]
+    created_stub_modules = []
 
     packages = {
         "services": backend_dir / "services",
@@ -85,6 +85,7 @@ def _load_recommendation_service_class():
 
         module.VectorStoreService = _VectorStoreService
         sys.modules[module.__name__] = module
+        created_stub_modules.append(module.__name__)
 
     if "services.embedding.embedding_service" not in sys.modules:
         module = types.ModuleType("services.embedding.embedding_service")
@@ -103,6 +104,7 @@ def _load_recommendation_service_class():
         module.EmbeddingConfig = _EmbeddingConfig
         module.EmbeddingService = _EmbeddingService
         sys.modules[module.__name__] = module
+        created_stub_modules.append(module.__name__)
 
     if "services.arxiv.arxiv_search_service" not in sys.modules:
         module = types.ModuleType("services.arxiv.arxiv_search_service")
@@ -112,6 +114,7 @@ def _load_recommendation_service_class():
 
         module.ArxivSearchService = _ArxivSearchService
         sys.modules[module.__name__] = module
+        created_stub_modules.append(module.__name__)
 
     if "services.arxiv.arxiv_oai_service" not in sys.modules:
         module = types.ModuleType("services.arxiv.arxiv_oai_service")
@@ -121,6 +124,7 @@ def _load_recommendation_service_class():
 
         module.ArxivOaiDatabaseService = _ArxivOaiDatabaseService
         sys.modules[module.__name__] = module
+        created_stub_modules.append(module.__name__)
 
     if "services.memory" in sys.modules and not hasattr(sys.modules["services.memory"], "MemoryService"):
         spec = importlib.util.spec_from_file_location("services.memory", backend_dir / "services" / "memory" / "__init__.py")
@@ -137,6 +141,9 @@ def _load_recommendation_service_class():
         assert spec and spec.loader
         spec.loader.exec_module(module)
 
+    # RecommendationService 已加载完成；清理本 loader 创建的依赖 stub，避免污染后续真实单测。
+    for stub_name in created_stub_modules:
+        sys.modules.pop(stub_name, None)
     return sys.modules[module_name].RecommendationService
 
 
@@ -185,7 +192,7 @@ class _RecommendationVectorStore:
 
 class RecommendationFlowIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.db_service = build_database_service(DatabaseService)
+        self.storage = build_storage_container()
         self.embedding_service = FakeEmbeddingService(dimension=3)
         self.vector_store_service = _RecommendationVectorStore()
         self.user_id = "user-1"
@@ -212,33 +219,54 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         ]
         self.oai_db_service = _FakeOaiDbService(papers=self.recent_papers)
         self.fake_llm = FakeEvidenceGenerationService()
-        self.service = RecommendationService(
-            db_service=self.db_service,
-            embedding_service=self.embedding_service,
-            vector_store_service=self.vector_store_service,
-            get_embedding_config=self.embedding_service.get_default_embedding_config,
-            memory_service=sys.modules["services.memory"].MemoryService(
-                db_service=self.db_service,
-                generation_service=self.fake_llm,
-            ),
-            oai_db_service=self.oai_db_service,
-            arxiv_service_factory=lambda: types.SimpleNamespace(),
-            collection_name=self.collection_name,
-        )
+        self.service = self._make_recommendation_service(generation_service=self.fake_llm)
         self._add_paper("2401.00001", title="Liked Paper A", abstract="retrieval augmented generation", categories=["cs.CL"])
         self._add_paper("2401.00002", title="Liked Paper B", abstract="benchmark evaluation", categories=["cs.CL", "cs.IR"])
         self._add_paper("2401.00003", title="Disliked Paper", abstract="prompt engineering only", categories=["cs.AI"])
 
     def tearDown(self) -> None:
-        temp_db = getattr(self.db_service, "_test_temp_db", None)
+        temp_db = getattr(self.storage, "_test_temp_db", None)
         self.service = None
-        self.db_service = None
+        self.storage = None
         gc.collect()
         if temp_db is not None:
             temp_db.cleanup()
 
+    def _make_memory_service(self, *, generation_service):
+        return sys.modules["services.memory"].MemoryService(
+            paper_catalog_store=self.storage.paper_catalog,
+            user_preference_store=self.storage.user_preferences,
+            interest_vector_store=self.storage.interest_vectors,
+            paper_profile_evidence_store=self.storage.paper_profile_evidence,
+            paper_chat_session_store=self.storage.paper_chat_sessions,
+            paper_chat_message_store=self.storage.paper_chat_messages,
+            paper_note_store=self.storage.paper_notes,
+            profile_event_store=self.storage.profile_events,
+            profile_build_job_store=self.storage.profile_build_jobs,
+            research_profile_store=self.storage.research_profiles,
+            agent_session_store=self.storage.agent_sessions,
+            generation_service=generation_service,
+        )
+
+    def _make_recommendation_service(self, *, generation_service):
+        return RecommendationService(
+            paper_catalog_store=self.storage.paper_catalog,
+            user_preference_store=self.storage.user_preferences,
+            interest_vector_store=self.storage.interest_vectors,
+            paper_profile_evidence_store=self.storage.paper_profile_evidence,
+            research_profile_store=self.storage.research_profiles,
+            profile_event_store=self.storage.profile_events,
+            embedding_service=self.embedding_service,
+            vector_store_service=self.vector_store_service,
+            get_embedding_config=self.embedding_service.get_default_embedding_config,
+            memory_service=self._make_memory_service(generation_service=generation_service),
+            oai_db_service=self.oai_db_service,
+            arxiv_service_factory=lambda: types.SimpleNamespace(),
+            collection_name=self.collection_name,
+        )
+
     def _add_paper(self, arxiv_id: str, *, title: str, abstract: str, categories) -> None:
-        self.db_service.add_paper(
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": arxiv_id,
                 "title": title,
@@ -257,11 +285,11 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
 
     def test_generate_user_interest_vector_from_liked_papers(self) -> None:
         self._seed_interest_vectors()
-        self.db_service.add_liked_paper(self.user_id, "2401.00001")
-        self.db_service.add_liked_paper(self.user_id, "2401.00002")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00001")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00002")
 
         result = self.service.generate_user_interest_vector(self.user_id)
-        stored = self.db_service.get_user_interest_vector(self.user_id)
+        stored = self.storage.interest_vectors.get_user_interest_vector(self.user_id)
 
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["liked_count"], 2)
@@ -270,11 +298,11 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
 
     def test_generate_user_interest_vector_tracks_disliked_feedback(self) -> None:
         self._seed_interest_vectors()
-        self.db_service.add_liked_paper(self.user_id, "2401.00001")
-        self.db_service.add_disliked_paper(self.user_id, "2401.00003")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00001")
+        self.storage.user_preferences.add_disliked_paper(self.user_id, "2401.00003")
 
         result = self.service.generate_user_interest_vector(self.user_id)
-        stored = self.db_service.get_user_interest_vector(self.user_id)
+        stored = self.storage.interest_vectors.get_user_interest_vector(self.user_id)
 
         self.assertEqual(result["disliked_count"], 1)
         self.assertIsNotNone(stored["disliked_vector_data"])
@@ -296,7 +324,7 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
                 "vector_source": "milvus",
             }
         ]
-        self.db_service.save_user_interest_vector(
+        self.storage.interest_vectors.save_user_interest_vector(
             user_id=self.user_id,
             vector_data=[1.0, 0.0, 0.0],
             paper_count=1,
@@ -305,7 +333,7 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
             disliked_paper_examples=legacy_examples,
         )
 
-        stored = self.db_service.get_user_interest_vector(self.user_id)
+        stored = self.storage.interest_vectors.get_user_interest_vector(self.user_id)
 
         self.assertTrue(stored["negative_feedback_profile"]["enabled"])
         self.assertEqual(stored["negative_feedback_profile"]["mode"], "examples")
@@ -315,17 +343,17 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
 
     def test_generate_user_interest_vector_builds_negative_clusters(self) -> None:
         self._seed_interest_vectors()
-        self.db_service.add_liked_paper(self.user_id, "2401.00001")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00001")
         extra_disliked = [
             ("2401.00004", [0.0, 0.9, 0.1]),
             ("2401.00005", [0.0, 0.8, 0.2]),
             ("2401.00006", [0.0, 1.0, 0.1]),
         ]
-        self.db_service.add_disliked_paper(self.user_id, "2401.00003")
+        self.storage.user_preferences.add_disliked_paper(self.user_id, "2401.00003")
         for arxiv_id, vector in extra_disliked:
             self._add_paper(arxiv_id, title=f"Disliked {arxiv_id}", abstract="vision benchmark", categories=["cs.CV"])
             self.vector_store_service.seed_paper_embedding(arxiv_id, vector, title=f"Disliked {arxiv_id}", abstract="vision benchmark", categories=["cs.CV"])
-            self.db_service.add_disliked_paper(self.user_id, arxiv_id)
+            self.storage.user_preferences.add_disliked_paper(self.user_id, arxiv_id)
 
         cluster_payload = [
             {
@@ -339,7 +367,7 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         with mock.patch.object(self.service, "_cluster_negative_feedback_vectors", return_value=cluster_payload) as cluster_mock:
             result = self.service.generate_user_interest_vector(self.user_id)
 
-        stored = self.db_service.get_user_interest_vector(self.user_id)
+        stored = self.storage.interest_vectors.get_user_interest_vector(self.user_id)
         cluster_mock.assert_called_once()
         self.assertEqual(result["negative_cluster_count"], 1)
         self.assertEqual(stored["negative_feedback_profile"]["mode"], "clusters")
@@ -348,18 +376,18 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
 
     def test_generate_user_interest_vector_falls_back_to_negative_examples_when_clustering_fails(self) -> None:
         self._seed_interest_vectors()
-        self.db_service.add_liked_paper(self.user_id, "2401.00001")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00001")
         for index in range(4, 7):
             arxiv_id = f"2401.0000{index}"
             self._add_paper(arxiv_id, title=f"Disliked {index}", abstract="survey only", categories=["cs.AI"])
             self.vector_store_service.seed_paper_embedding(arxiv_id, [0.0, 1.0, float(index) / 10.0], title=f"Disliked {index}", abstract="survey only", categories=["cs.AI"])
-            self.db_service.add_disliked_paper(self.user_id, arxiv_id)
-        self.db_service.add_disliked_paper(self.user_id, "2401.00003")
+            self.storage.user_preferences.add_disliked_paper(self.user_id, arxiv_id)
+        self.storage.user_preferences.add_disliked_paper(self.user_id, "2401.00003")
 
         with mock.patch.object(self.service, "_cluster_negative_feedback_vectors", return_value=[]):
             self.service.generate_user_interest_vector(self.user_id)
 
-        stored = self.db_service.get_user_interest_vector(self.user_id)
+        stored = self.storage.interest_vectors.get_user_interest_vector(self.user_id)
         self.assertEqual(stored["negative_feedback_profile"]["mode"], "cluster_fallback_examples")
         self.assertEqual(stored["negative_feedback_stats"]["fallback_reason"], "no_stable_negative_clusters")
         self.assertGreaterEqual(len(stored["negative_feedback_profile"]["examples"]), 1)
@@ -371,7 +399,7 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         self.vector_store_service.seed_paper_embedding("2401.00004", [0.7, 0.3, 0.0], title="Liked Paper C", abstract="retrieval reranking", categories=["cs.IR"])
         self.vector_store_service.seed_paper_embedding("2401.00005", [0.9, 0.1, 0.0], title="Liked Paper D", abstract="rag evaluation", categories=["cs.CL"])
         for arxiv_id in ("2401.00001", "2401.00002", "2401.00004", "2401.00005"):
-            self.db_service.add_liked_paper(self.user_id, arxiv_id)
+            self.storage.user_preferences.add_liked_paper(self.user_id, arxiv_id)
 
         cluster_payload = [
             {
@@ -384,7 +412,7 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         with mock.patch.object(self.service, "_cluster_interest_vectors", return_value=(cluster_payload, None)) as cluster_mock:
             result = self.service.generate_user_interest_vector(self.user_id)
 
-        stored = self.db_service.get_user_interest_vector(self.user_id)
+        stored = self.storage.interest_vectors.get_user_interest_vector(self.user_id)
         cluster_mock.assert_called_once()
         self.assertEqual(result["profile_mode"], "clustered")
         self.assertEqual(stored["cluster_count"], 1)
@@ -604,9 +632,9 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         self.assertTrue(hard_scored["negative_hard_filter"])
 
     def test_recommend_papers_applies_top_n_and_stable_fields(self) -> None:
-        self.db_service.add_liked_paper(self.user_id, "2401.00001")
-        self.db_service.add_liked_paper(self.user_id, "2401.00002")
-        self.db_service.upsert_user_research_profile(self.user_id, {"positive_topics": ["retrieval"], "preferred_categories": ["cs.CL"]})
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00001")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00002")
+        self.storage.research_profiles.upsert_user_research_profile(self.user_id, {"positive_topics": ["retrieval"], "preferred_categories": ["cs.CL"]})
 
         candidate_pool = [
             {
@@ -656,8 +684,8 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         self.assertIn("score_breakdown", first)
 
     def test_recommendation_enriches_top_candidate_concepts_and_reuses_cache(self) -> None:
-        self.db_service.add_liked_paper(self.user_id, "2401.00001")
-        self.db_service.upsert_user_research_profile(
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00001")
+        self.storage.research_profiles.upsert_user_research_profile(
             self.user_id,
             {
                 "positive_topics": ["RAG retrieval optimization"],
@@ -709,31 +737,21 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         self.assertEqual(second["candidate_concept_source"], "title_abstract_fallback")
         self.assertEqual(repeated["ranking_debug"]["candidate_concept_enrichment"]["cache_hit_count"], 1)
         self.assertEqual(result["ranking_debug"]["candidate_concept_enrichment"]["selected_count"], 1)
-        cached = self.db_service.get_paper_profile_evidence("2401.11001")
+        cached = self.storage.paper_profile_evidence.get_paper_profile_evidence("2401.11001")
         self.assertTrue(cached["candidate_concepts"])
-        self.assertIsNone(self.db_service.get_paper_profile_evidence("2401.11002"))
+        self.assertIsNone(self.storage.paper_profile_evidence.get_paper_profile_evidence("2401.11002"))
 
     def test_recommendation_concept_enrichment_failure_falls_back_without_crashing(self) -> None:
-        self.db_service.add_liked_paper(self.user_id, "2401.00001")
-        self.db_service.upsert_user_research_profile(
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00001")
+        self.storage.research_profiles.upsert_user_research_profile(
             self.user_id,
             {
                 "positive_topics": ["question answering"],
                 "canonical_topics": [{"label": "question answering", "aliases": []}],
             },
         )
-        failing_service = RecommendationService(
-            db_service=self.db_service,
-            embedding_service=self.embedding_service,
-            vector_store_service=self.vector_store_service,
-            get_embedding_config=self.embedding_service.get_default_embedding_config,
-            memory_service=sys.modules["services.memory"].MemoryService(
-                db_service=self.db_service,
-                generation_service=FakeEvidenceGenerationService("not json"),
-            ),
-            oai_db_service=self.oai_db_service,
-            arxiv_service_factory=lambda: types.SimpleNamespace(),
-            collection_name=self.collection_name,
+        failing_service = self._make_recommendation_service(
+            generation_service=FakeEvidenceGenerationService("not json")
         )
         candidate_pool = [
             {
@@ -760,10 +778,10 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         self.assertEqual(result["ranking_debug"]["candidate_concept_enrichment"]["failed_count"], 1)
         self.assertEqual(result["recommendations"][0]["candidate_concept_source"], "title_abstract_fallback")
         self.assertEqual(result["recommendations"][0]["candidate_concept_debug"]["source_detail"], "generation_failed")
-        self.assertIsNotNone(self.db_service.get_paper_profile_evidence("2401.12001"))
+        self.assertIsNotNone(self.storage.paper_profile_evidence.get_paper_profile_evidence("2401.12001"))
 
     def test_recommendation_concept_enrichment_can_be_disabled(self) -> None:
-        self.db_service.add_liked_paper(self.user_id, "2401.00001")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00001")
         candidate_pool = [
             {
                 "arxiv_id": "2401.13001",
@@ -790,7 +808,7 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         self.assertEqual(result["recommendations"][0]["candidate_concept_source"], "title_abstract_fallback")
 
     def test_recommendation_concept_enrichment_respects_llm_budget(self) -> None:
-        self.db_service.add_liked_paper(self.user_id, "2401.00001")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00001")
         candidate_pool = [
             {
                 "arxiv_id": "2401.14001",
@@ -828,7 +846,7 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         self.assertEqual(result["ranking_debug"]["candidate_concept_enrichment"]["budget_skipped_count"], 1)
 
     def test_recommendation_concept_enrichment_supports_negative_profile_debug(self) -> None:
-        self.db_service.add_liked_paper(self.user_id, "2401.00001")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00001")
         negative_llm = FakeEvidenceGenerationService(
             json.dumps(
                 {
@@ -856,19 +874,7 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
                 ensure_ascii=False,
             )
         )
-        negative_service = RecommendationService(
-            db_service=self.db_service,
-            embedding_service=self.embedding_service,
-            vector_store_service=self.vector_store_service,
-            get_embedding_config=self.embedding_service.get_default_embedding_config,
-            memory_service=sys.modules["services.memory"].MemoryService(
-                db_service=self.db_service,
-                generation_service=negative_llm,
-            ),
-            oai_db_service=self.oai_db_service,
-            arxiv_service_factory=lambda: types.SimpleNamespace(),
-            collection_name=self.collection_name,
-        )
+        negative_service = self._make_recommendation_service(generation_service=negative_llm)
         candidate_pool = [
             {
                 "arxiv_id": "2401.15001",
@@ -1020,7 +1026,7 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         self.assertIn("recommendation_explanation", result["recommendations"][0])
 
     def test_search_rerank_hard_excludes_disliked_papers(self) -> None:
-        self.db_service.add_disliked_paper(self.user_id, "2401.00003")
+        self.storage.user_preferences.add_disliked_paper(self.user_id, "2401.00003")
         papers = [
             {
                 "arxiv_id": "2401.00003",

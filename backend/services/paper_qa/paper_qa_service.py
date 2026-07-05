@@ -11,7 +11,6 @@ from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
 from services.context_lifecycle import ContextLifecycleService
 from services.document.chunking_service import ChunkingService
 from services.memory import MemoryService
-from services.storage.database_service import DatabaseService
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
 from services.retrieval.enhanced_retrieval_service import EnhancedRetrievalService, RetrievalOptions
 from services.llm.generation_service import GenerationService
@@ -23,6 +22,14 @@ from services.paper_qa.paper_qa_index_builder import PaperQAIndexBuilder
 from services.paper_qa.qa_observation import build_error_qa_observation, build_qa_observation
 from services.paper_qa.question_contextualizer import QuestionContextualizer
 from services.paper_qa.session_service import PaperQASessionService
+from services.storage.sqlite.stores import (
+    AgentRuntimeCheckpointStore,
+    PaperCatalogStore,
+    PaperChatSessionStore,
+    PaperQAIndexStore,
+    PaperQATurnStore,
+    ResearchProfileStore,
+)
 from services.storage.vector_store_service import VectorStoreService
 from utils.config import get_memory_runtime_config
 from utils.logging_utils import RequestTrace, info_event
@@ -45,14 +52,19 @@ class PaperQAService:
     """论文 QA 主流程编排服务。
 
     该服务只保留 router、工具入口和 QA 主流程需要的高层入口；会话解析、上下文打包、
-    答案生成、证据校验等底层能力由专门组件负责，避免为了测试或兼容旧调用点继续新增透传 wrapper。
+    答案生成、证据校验等底层能力由专门组件负责，避免继续把底层 Store 能力堆回主服务。
     """
 
     def __init__(
         self,
         *,
-        db_service: Optional[DatabaseService] = None,
-        memory_service: Optional[MemoryService] = None,
+        paper_qa_index_store: PaperQAIndexStore,
+        paper_catalog_store: PaperCatalogStore,
+        paper_chat_session_store: PaperChatSessionStore,
+        paper_qa_turn_store: PaperQATurnStore,
+        research_profile_store: ResearchProfileStore,
+        agent_runtime_checkpoint_store: AgentRuntimeCheckpointStore,
+        memory_service: MemoryService,
         embedding_service: Optional[EmbeddingService] = None,
         vector_store_service: Optional[VectorStoreService] = None,
         generation_service: Optional[GenerationService] = None,
@@ -65,8 +77,13 @@ class PaperQAService:
         qa_index_builder: Optional[PaperQAIndexBuilder] = None,
     ):
         """初始化单篇论文问答服务，并组装问答、检索、记忆与索引构建依赖。"""
-        self.db_service = db_service or DatabaseService()
-        self.memory_service = memory_service or MemoryService(db_service=self.db_service)
+        self.paper_qa_index_store = paper_qa_index_store
+        self.paper_catalog_store = paper_catalog_store
+        self.paper_chat_session_store = paper_chat_session_store
+        self.paper_qa_turn_store = paper_qa_turn_store
+        self.research_profile_store = research_profile_store
+        self.agent_runtime_checkpoint_store = agent_runtime_checkpoint_store
+        self.memory_service = memory_service
         self.embedding_service = embedding_service or EmbeddingService()
         self.vector_store_service = vector_store_service or VectorStoreService()
         self.generation_service = generation_service or GenerationService()
@@ -81,7 +98,8 @@ class PaperQAService:
         self.loading_service_factory = loading_service_factory or LoadingService
         self.chunking_service_factory = chunking_service_factory or ChunkingService
         self.qa_index_builder = qa_index_builder or PaperQAIndexBuilder(
-            db_service=self.db_service,
+            paper_qa_index_store=self.paper_qa_index_store,
+            paper_catalog_store=self.paper_catalog_store,
             embedding_service=self.embedding_service,
             vector_store_service=self.vector_store_service,
             generation_service=self.generation_service,
@@ -93,7 +111,10 @@ class PaperQAService:
         )
         self.memory_runtime_config = get_memory_runtime_config()
         self.session_service = PaperQASessionService(
-            db_service=self.db_service,
+            paper_chat_session_store=self.paper_chat_session_store,
+            paper_qa_turn_store=self.paper_qa_turn_store,
+            research_profile_store=self.research_profile_store,
+            agent_runtime_checkpoint_store=self.agent_runtime_checkpoint_store,
             memory_service=self.memory_service,
             memory_runtime_config=self.memory_runtime_config,
         )
@@ -104,33 +125,35 @@ class PaperQAService:
         self.context_pack_builder = ContextPackBuilder()
         self.answer_generator = AnswerGenerator(generation_service=self.generation_service)
         self.evidence_verifier = EvidenceVerifier()
-        self.context_lifecycle_service = ContextLifecycleService(db_service=self.db_service)
+        self.context_lifecycle_service = ContextLifecycleService(
+            agent_runtime_checkpoint_store=self.agent_runtime_checkpoint_store,
+        )
 
     def _build_memory_runtime_debug(self) -> Dict[str, Any]:
-        """兼容旧调用点：记忆运行时 debug 由 session_service 负责构造。"""
+        """构造 QA 主流程需要的记忆运行时 debug 快照。"""
         return self.session_service.build_memory_runtime_debug()
 
     @staticmethod
     def _payload_get(payload: Any, key: str, default: Any = None) -> Any:
-        """兼容旧调用点：payload 读取规则由 session_service 固化。"""
+        """统一读取 dict 或对象风格 payload，避免主流程散落字段访问分支。"""
         return PaperQASessionService.payload_get(payload, key, default)
 
     @staticmethod
     def _resolve_user_id(value: Any = None) -> str:
-        """兼容旧调用点：用户 ID 兜底规则由 session_service 固化。"""
+        """统一 QA 主流程的用户 ID 兜底规则。"""
         return PaperQASessionService.resolve_user_id(value)
 
     def _get_preferred_answer_style(self, payload: Any) -> str:
-        """兼容旧调用点：回答风格从会话/记忆服务读取。"""
+        """从会话与长期画像中解析回答风格，主流程只消费解析结果。"""
         return self.session_service.get_preferred_answer_style(payload)
 
     @staticmethod
     def _apply_answer_style_to_question(question: str, preferred_answer_style: str) -> str:
-        """兼容旧调用点：回答风格提示拼接规则由 session_service 固化。"""
+        """把回答风格约束附加到生成问题，同时保持证据约束不被绕过。"""
         return PaperQASessionService.apply_answer_style_to_question(question, preferred_answer_style)
 
     def _resolve_chat_session(self, arxiv_id: str, payload: Any) -> Dict[str, Any]:
-        """兼容旧调用点：会话解析与创建由 session_service 负责。"""
+        """解析或创建当前论文的 QA 会话，主流程不直接操作会话表。"""
         return self.session_service.resolve_chat_session(arxiv_id, payload)
 
     def persist_completed_turn(
@@ -144,7 +167,7 @@ class PaperQAService:
         contextualized_question: str,
         question_contextualization: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """兼容路由和测试入口：turn 持久化由 session_service 原子处理。"""
+        """持久化一轮完整 QA turn；原子写入细节由 session_service 统一维护。"""
         return self.session_service.persist_completed_turn(
             chat_session=chat_session,
             question=question,
@@ -157,19 +180,14 @@ class PaperQAService:
 
     def get_qa_status(self, arxiv_id: str) -> Dict[str, Any]:
         """查询指定论文当前是否已完成 QA 索引构建，以及索引摘要信息。"""
-        qa_index = self.db_service.get_paper_qa_index(arxiv_id)
-        latest_build = None
-        building_build = None
-        last_failed_build = None
-        cleanup_pending_count = 0
-        latest_getter = getattr(self.db_service, "get_latest_paper_qa_index_build", None)
-        counter = getattr(self.db_service, "count_paper_qa_index_builds", None)
-        if callable(latest_getter):
-            latest_build = latest_getter(arxiv_id)
-            building_build = latest_getter(arxiv_id, statuses=["building"])
-            last_failed_build = latest_getter(arxiv_id, statuses=["build_failed", "orphaned"])
-        if callable(counter):
-            cleanup_pending_count = counter(arxiv_id, statuses=["cleanup_pending", "orphaned", "build_failed"])
+        qa_index = self.paper_qa_index_store.get_paper_qa_index(arxiv_id)
+        latest_build = self.paper_qa_index_store.get_latest_paper_qa_index_build(arxiv_id)
+        building_build = self.paper_qa_index_store.get_latest_paper_qa_index_build(arxiv_id, statuses=["building"])
+        last_failed_build = self.paper_qa_index_store.get_latest_paper_qa_index_build(arxiv_id, statuses=["build_failed", "orphaned"])
+        cleanup_pending_count = self.paper_qa_index_store.count_paper_qa_index_builds(
+            arxiv_id,
+            statuses=["cleanup_pending", "orphaned", "build_failed"],
+        )
         if qa_index:
             has_active_index = qa_index["status"] == "indexed" and bool(qa_index.get("collection_name"))
             return {
@@ -232,12 +250,12 @@ class PaperQAService:
 
     def delete_qa_index(self, arxiv_id: str) -> Dict[str, Any]:
         """删除论文 QA 索引时先清理外部 artifact，再把数据库记录标记为不可检索。"""
-        qa_index = self.db_service.get_paper_qa_index(arxiv_id)
+        qa_index = self.paper_qa_index_store.get_paper_qa_index(arxiv_id)
         if not qa_index:
             return {"status": "not_found", "arxiv_id": arxiv_id}
 
         cleanup_result = self.qa_index_builder.cleanup_qa_index_artifacts(arxiv_id, qa_index, allow_active=True)
-        updated = self.db_service.update_paper_qa_index(
+        updated = self.paper_qa_index_store.update_paper_qa_index(
             arxiv_id,
             status="deleted",
             current_stage="delete_qa_index",
@@ -248,9 +266,8 @@ class PaperQAService:
         if not updated:
             raise RuntimeError("QA index artifacts were cleaned, but SQLite failed to mark the index as deleted")
         active_build_id = qa_index.get("active_build_id")
-        marker = getattr(self.db_service, "mark_paper_qa_index_build_deleted", None)
-        if active_build_id and callable(marker):
-            marker(active_build_id)
+        if active_build_id:
+            self.paper_qa_index_store.mark_paper_qa_index_build_deleted(active_build_id)
         return {
             "status": "deleted",
             "arxiv_id": arxiv_id,
@@ -259,11 +276,11 @@ class PaperQAService:
 
     def build_source_payload(self, search_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """把检索结果整理成统一的来源载荷，供前端展示与会话持久化复用。"""
-        # 兼容旧调用点；source_id 与资产字段由 ContextPackBuilder 统一分配，避免会话记忆和前端证据不一致。
+        # source_id 与资产字段由 ContextPackBuilder 统一分配，避免会话记忆和前端证据不一致。
         return self.context_pack_builder.build_source_payload(search_results)
 
     def build_qa_context(self, arxiv_id: str, payload: Any, *, run_id: Optional[str] = None):
-        qa_index = self.db_service.get_paper_qa_index(arxiv_id)
+        qa_index = self.paper_qa_index_store.get_paper_qa_index(arxiv_id)
         if not qa_index or qa_index["status"] != "indexed":
             # 未建索引属于前置检索失败，也要生成观察结构，便于 Agent 直接决定是否重建索引。
             qa_observation = build_error_qa_observation(
@@ -289,7 +306,7 @@ class PaperQAService:
         chat_session = self._resolve_chat_session(arxiv_id, payload)
         memory_runtime = self._build_memory_runtime_debug()
         collection_name = qa_index["collection_name"]
-        paper = self.db_service.get_paper(arxiv_id) or {}
+        paper = self.paper_catalog_store.get_paper(arxiv_id) or {}
         paper_context = {
             "arxiv_id": arxiv_id,
             "title": paper.get("title", ""),

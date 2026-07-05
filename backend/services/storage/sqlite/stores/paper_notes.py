@@ -1,11 +1,20 @@
 import uuid
 from typing import Any, Dict, List, Optional
 
-from services.storage.database.shared import DEFAULT_USER_ID, PAPER_NOTE_TYPES, logger
+from services.storage.sqlite.base import BaseSqliteStore
+from services.storage.sqlite.shared import DEFAULT_USER_ID, PAPER_NOTE_TYPES, logger
+from services.storage.sqlite.stores.profile_events import ProfileEventStore
 
 
-class PaperNoteMixin:
-    """paper_notes 表的内部实现；对外仍由 DatabaseService 暴露兼容入口。"""
+class PaperNoteStore(BaseSqliteStore):
+    """paper_notes 存储；只有明确纳入画像的笔记才通过事件 store 进入长期证据流。"""
+
+    def __init__(self, connection_provider, profile_event_store: ProfileEventStore) -> None:
+        super().__init__(connection_provider)
+        self.profile_event_store = profile_event_store
+
+    def record_user_profile_event(self, *args, **kwargs):
+        return self.profile_event_store.record_user_profile_event(*args, **kwargs)
 
     def _row_to_paper_note(self, row: Any) -> Dict[str, Any]:
         return {

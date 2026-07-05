@@ -6,10 +6,10 @@ import sqlite3
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional, Type, TypeVar
+from typing import Optional
 
-
-T = TypeVar("T")
+from services.storage.sqlite import StorageContainer
+from services.storage.sqlite.connection import SqliteConnectionProvider
 
 
 class TemporarySqliteDatabase:
@@ -38,41 +38,30 @@ class TemporarySqliteDatabase:
         self.cleanup()
 
 
-def build_database_service(
-    service_cls: Type[T],
+def build_storage_container(
     *,
     db_path: Optional[str] = None,
     check_same_thread: bool = False,
-    initialize: bool = True,
-    **extra_attributes: Any,
-) -> T:
-    """Instantiate a database-like service against a temporary SQLite path.
+    initialize_schema: bool = True,
+) -> StorageContainer:
+    """创建指向临时 SQLite 文件的真实存储组合根。
 
-    This bypasses constructors that hard-code production config while still
-    reusing the service's own initialization hooks.
+    测试只负责提供隔离数据库路径，schema 初始化仍由生产 StorageContainer 执行；
+    这样可以验证真实 Store 行为，而不是继续依赖旧的统一存储入口。
     """
-
     temp_db: Optional[TemporarySqliteDatabase] = None
     resolved_path = db_path
     if not resolved_path:
         temp_db = TemporarySqliteDatabase()
         resolved_path = str(temp_db.db_path)
 
-    service = service_cls.__new__(service_cls)
-    setattr(service, "db_path", resolved_path)
-    setattr(service, "check_same_thread", check_same_thread)
-    setattr(service, "_test_temp_db", temp_db)
-
-    for key, value in extra_attributes.items():
-        setattr(service, key, value)
-
-    ensure_dir = getattr(service, "_ensure_database_directory", None)
-    if callable(ensure_dir):
-        ensure_dir()
-
-    if initialize:
-        initialize_db = getattr(service, "_initialize_database", None)
-        if callable(initialize_db):
-            initialize_db()
-
-    return service
+    connection_provider = SqliteConnectionProvider(
+        db_path=str(resolved_path),
+        check_same_thread=check_same_thread,
+    )
+    storage = StorageContainer(
+        connection_provider=connection_provider,
+        initialize_schema=initialize_schema,
+    )
+    setattr(storage, "_test_temp_db", temp_db)
+    return storage

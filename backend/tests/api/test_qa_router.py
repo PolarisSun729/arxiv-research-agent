@@ -114,7 +114,7 @@ class _FakeGenerationService:
         yield {"type": "completed", "answer": "hello", "usage": None}
 
 
-class _FakeDatabaseService:
+class _FakeQaStorage:
     def __init__(self) -> None:
         self.sessions = {}
         self.notes = {}
@@ -148,6 +148,9 @@ class _FakeDatabaseService:
         if arxiv_id != "2401.00001":
             return None
         return dict(self.latest_job)
+
+    def mark_stale_paper_index_jobs(self, **_kwargs):
+        return 0
 
     def list_paper_chat_sessions(self, arxiv_id: str, user_id: str, limit: int = 20):
         items = [item for item in self.sessions.values() if item["arxiv_id"] == arxiv_id and item["user_id"] == user_id]
@@ -213,7 +216,7 @@ class QaRouterApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.paper_qa_service = _FakePaperQAService()
-        self.db_service = _FakeDatabaseService()
+        self.qa_storage = _FakeQaStorage()
         self.vector_store_service = _FakeVectorStoreService()
         self.memory_service = _FakeMemoryService()
         self.index_job_manager = _FakeIndexJobManager()
@@ -222,13 +225,25 @@ class QaRouterApiTests(unittest.TestCase):
 
         app = FastAPI()
         app.include_router(qa_router.router, prefix="/api")
-        app.dependency_overrides[dependencies.get_paper_qa_service] = lambda: self.paper_qa_service
-        app.dependency_overrides[dependencies.get_database_service] = lambda: self.db_service
-        app.dependency_overrides[dependencies.get_vector_store_service] = lambda: self.vector_store_service
+        for dependency in (dependencies.get_paper_qa_service, qa_router.get_paper_qa_service):
+            app.dependency_overrides[dependency] = lambda: self.paper_qa_service
+        for dependency in (dependencies.get_paper_qa_index_store, qa_router.get_paper_qa_index_store):
+            app.dependency_overrides[dependency] = lambda: self.qa_storage
+        for dependency in (dependencies.get_paper_chat_session_store, qa_router.get_paper_chat_session_store):
+            app.dependency_overrides[dependency] = lambda: self.qa_storage
+        for dependency in (dependencies.get_paper_chat_message_store, qa_router.get_paper_chat_message_store):
+            app.dependency_overrides[dependency] = lambda: self.qa_storage
+        for dependency in (dependencies.get_paper_note_store, qa_router.get_paper_note_store):
+            app.dependency_overrides[dependency] = lambda: self.qa_storage
+        for dependency in (dependencies.get_vector_store_service, qa_router.get_vector_store_service):
+            app.dependency_overrides[dependency] = lambda: self.vector_store_service
         app.dependency_overrides[dependencies.get_memory_service] = lambda: self.memory_service
-        app.dependency_overrides[dependencies.get_index_job_manager] = lambda: self.index_job_manager
-        app.dependency_overrides[dependencies.get_enhanced_retrieval_service] = lambda: self.enhanced_retrieval_service
-        app.dependency_overrides[dependencies.get_generation_service] = lambda: self.generation_service
+        for dependency in (dependencies.get_index_job_manager, qa_router.get_index_job_manager):
+            app.dependency_overrides[dependency] = lambda: self.index_job_manager
+        for dependency in (dependencies.get_enhanced_retrieval_service, qa_router.get_enhanced_retrieval_service):
+            app.dependency_overrides[dependency] = lambda: self.enhanced_retrieval_service
+        for dependency in (dependencies.get_generation_service, qa_router.get_generation_service):
+            app.dependency_overrides[dependency] = lambda: self.generation_service
         self.client = TestClient(app)
         self.addCleanup(self.temp_dir.cleanup)
 

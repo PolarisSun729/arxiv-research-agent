@@ -7,26 +7,8 @@ from tests.helpers import (
     FakePaperQAService,
     FakeVectorStoreService,
     TemporarySqliteDatabase,
-    build_database_service,
+    build_storage_container,
 )
-
-
-class _DummyDatabaseService:
-    def _ensure_database_directory(self) -> None:
-        return None
-
-    def _initialize_database(self) -> None:
-        conn = self._get_connection()
-        try:
-            conn.execute("CREATE TABLE sample_table (id INTEGER PRIMARY KEY, value TEXT)")
-            conn.commit()
-        finally:
-            conn.close()
-
-    def _get_connection(self):
-        import sqlite3
-
-        return sqlite3.connect(self.db_path, check_same_thread=self.check_same_thread)
 
 
 class HelperInfrastructureTests(unittest.TestCase):
@@ -40,24 +22,22 @@ class HelperInfrastructureTests(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row[0], "ok")
 
-    def test_build_database_service_bootstraps_schema_on_temp_db(self) -> None:
-        service = build_database_service(_DummyDatabaseService)
+    def test_build_storage_container_bootstraps_schema_on_temp_db(self) -> None:
+        storage = build_storage_container()
         try:
-            conn = service._get_connection()
-            try:
+            with storage.connection_provider.connect() as conn:
                 table_names = {
                     row[0]
                     for row in conn.execute(
                         "SELECT name FROM sqlite_master WHERE type = 'table'"
                     ).fetchall()
                 }
-            finally:
-                conn.close()
         finally:
-            if getattr(service, "_test_temp_db", None) is not None:
-                service._test_temp_db.cleanup()
+            if getattr(storage, "_test_temp_db", None) is not None:
+                storage._test_temp_db.cleanup()
 
-        self.assertIn("sample_table", table_names)
+        self.assertIn("arxiv_papers", table_names)
+        self.assertIn("paper_qa_index", table_names)
 
     def test_fake_embedding_service_is_deterministic(self) -> None:
         service = FakeEmbeddingService(dimension=4)

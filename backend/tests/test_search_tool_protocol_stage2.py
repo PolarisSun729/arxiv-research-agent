@@ -35,9 +35,8 @@ def _load_modules():
     # 如果前一个测试已经导入过图模块，这里先清掉再按当前 stub 重新装载，避免复用旧的 LangGraph 适配对象。
     sys.modules.pop("backend.agents.arxiv_search_agent.graph", None)
 
-    # 这里不假设前一个测试留下的 dependencies 模块一定干净，直接补齐当前阶段要用的接口。
+    # 这里不假设前一个测试留下的 dependencies 模块一定干净，直接补齐当前阶段要用的当前接口。
     dependencies_module = sys.modules.get("dependencies", types.ModuleType("dependencies"))
-    dependencies_module.get_database_service = getattr(dependencies_module, "get_database_service", lambda: object())
     dependencies_module.get_oai_database_service = getattr(
         dependencies_module,
         "get_oai_database_service",
@@ -89,21 +88,6 @@ def _load_modules():
 
         memory_module.MemoryService = _MemoryService
         sys.modules["services.memory"] = memory_module
-
-    if "services.storage.database_service" not in sys.modules:
-        database_service_module = types.ModuleType("services.storage.database_service")
-
-        class _PaperQATurnPersistenceError(RuntimeError):
-            pass
-
-        class _DatabaseService:
-            def get_user_research_profile(self, **_kwargs):
-                return {}
-
-        database_service_module.DatabaseService = _DatabaseService
-        # 测试桩需要保留真实模块的异常导出，避免污染后续 pytest 收集到的数据库服务接口。
-        database_service_module.PaperQATurnPersistenceError = _PaperQATurnPersistenceError
-        sys.modules["services.storage.database_service"] = database_service_module
 
     config_module = sys.modules.get("utils.config", types.ModuleType("utils.config"))
     config_module.get_memory_runtime_config = lambda: {"enable_user_research_profile": False}

@@ -13,7 +13,7 @@ from .retrieval import (
     load_retrieval_modules,
     seed_collection,
 )
-from .sqlite import TemporarySqliteDatabase, build_database_service
+from .sqlite import TemporarySqliteDatabase, build_storage_container
 
 __all__ = [
     "FakeArxivService",
@@ -29,5 +29,5 @@ __all__ = [
     "load_retrieval_modules",
     "seed_collection",
     "TemporarySqliteDatabase",
-    "build_database_service",
+    "build_storage_container",
 ]

@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import HTTPException
 
 from dependencies import DATA_SOURCE, get_arxiv_search_backend as get_dependency_arxiv_search_backend
-from dependencies import get_database_service, get_recommendation_service
+from dependencies import get_paper_catalog_store, get_recommendation_service
 
 from services.arxiv.arxiv_query_builder import (
     ArxivSearchValidationError,
@@ -329,7 +329,7 @@ def get_paper_metadata(arxiv_id: str) -> Dict[str, Any]:
     tool_name = "get_paper_metadata"
     trace_inputs = {"arxiv_id": arxiv_id}
     try:
-        paper = get_database_service().get_paper(arxiv_id)
+        paper = get_paper_catalog_store().get_paper(arxiv_id)
         source = "database"
         if not paper:
             recommendation_service = get_recommendation_service()
@@ -367,7 +367,7 @@ def get_paper_metadata(arxiv_id: str) -> Dict[str, Any]:
 
 
 def get_paper_or_materialize(arxiv_id: str, paper_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    paper = get_database_service().get_paper(arxiv_id)
+    paper = get_paper_catalog_store().get_paper(arxiv_id)
     if paper:
         return paper
     if paper_payload:

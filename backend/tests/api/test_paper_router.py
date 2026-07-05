@@ -9,7 +9,7 @@ import dependencies
 from routers import paper_router
 
 
-class _FakeDatabaseService:
+class _FakePaperStorage:
     def __init__(self) -> None:
         self.papers = {}
 
@@ -72,7 +72,7 @@ class _FakePaperQAService:
 
 class PaperRouterApiTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.db_service = _FakeDatabaseService()
+        self.paper_storage = _FakePaperStorage()
         self.oai_db_service = _FakeOaiDatabaseService()
         self.embedding_service = _FakeEmbeddingService()
         self.vector_store_service = _FakeVectorStoreService()
@@ -81,11 +81,17 @@ class PaperRouterApiTests(unittest.TestCase):
 
         app = FastAPI()
         app.include_router(paper_router.router, prefix="/api")
-        app.dependency_overrides[dependencies.get_database_service] = lambda: self.db_service
-        app.dependency_overrides[dependencies.get_oai_database_service] = lambda: self.oai_db_service
+        for dependency in (dependencies.get_paper_catalog_store, paper_router.get_paper_catalog_store):
+            app.dependency_overrides[dependency] = lambda: self.paper_storage
+        for dependency in (dependencies.get_user_preference_store, paper_router.get_user_preference_store):
+            app.dependency_overrides[dependency] = lambda: self.paper_storage
+        for dependency in (dependencies.get_oai_database_service, paper_router.get_oai_database_service):
+            app.dependency_overrides[dependency] = lambda: self.oai_db_service
         app.dependency_overrides[dependencies.get_embedding_service] = lambda: self.embedding_service
-        app.dependency_overrides[dependencies.get_recommendation_service] = lambda: self.recommendation_service
-        app.dependency_overrides[dependencies.get_paper_qa_service] = lambda: self.paper_qa_service
+        for dependency in (dependencies.get_recommendation_service, paper_router.get_recommendation_service):
+            app.dependency_overrides[dependency] = lambda: self.recommendation_service
+        for dependency in (dependencies.get_paper_qa_service, paper_router.get_paper_qa_service):
+            app.dependency_overrides[dependency] = lambda: self.paper_qa_service
 
         self.sync_patch = mock.patch.object(
             paper_router,
@@ -180,7 +186,7 @@ class PaperRouterApiTests(unittest.TestCase):
         self.assertEqual(response.json()["detail"], "Paper not found")
 
     def test_get_paper_returns_local_paper_when_present(self) -> None:
-        self.db_service.add_paper({"arxiv_id": "2401.00002", "title": "Stored Paper"})
+        self.paper_storage.add_paper({"arxiv_id": "2401.00002", "title": "Stored Paper"})
 
         response = self.client.get("/api/paper/2401.00002")
 
@@ -188,7 +194,7 @@ class PaperRouterApiTests(unittest.TestCase):
         self.assertEqual(response.json()["title"], "Stored Paper")
 
     def test_delete_paper_returns_success_and_404(self) -> None:
-        self.db_service.add_paper({"arxiv_id": "2401.00003", "title": "Delete Me"})
+        self.paper_storage.add_paper({"arxiv_id": "2401.00003", "title": "Delete Me"})
 
         success = self.client.delete("/api/paper/2401.00003")
         missing = self.client.delete("/api/paper/2401.00003")
@@ -198,8 +204,8 @@ class PaperRouterApiTests(unittest.TestCase):
         self.assertEqual(missing.status_code, 404)
 
     def test_get_all_papers_and_category_filter_return_stable_shape(self) -> None:
-        self.db_service.add_paper({"arxiv_id": "2401.00004", "title": "CL Paper", "categories": "cs.CL"})
-        self.db_service.add_paper({"arxiv_id": "2401.00005", "title": "IR Paper", "categories": "cs.IR"})
+        self.paper_storage.add_paper({"arxiv_id": "2401.00004", "title": "CL Paper", "categories": "cs.CL"})
+        self.paper_storage.add_paper({"arxiv_id": "2401.00005", "title": "IR Paper", "categories": "cs.IR"})
 
         all_response = self.client.get("/api/papers")
         category_response = self.client.get("/api/papers/category/cs.CL")

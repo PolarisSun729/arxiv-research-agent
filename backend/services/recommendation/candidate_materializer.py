@@ -42,7 +42,7 @@ class CandidateMaterializer:
         if not paper:
             raise HTTPException(status_code=404, detail=f"Paper {normalized_arxiv_id} could not be materialized")
 
-        success = self.db_service.record_user_paper_action(
+        success = self.user_preference_store.record_user_paper_action(
             user_id=user_id,
             arxiv_id=normalized_arxiv_id,
             action_type=normalized_action,
@@ -77,10 +77,10 @@ class CandidateMaterializer:
             raise HTTPException(status_code=404, detail=f"Paper {normalized_arxiv_id} could not be materialized")
 
         if liked:
-            success = self.db_service.add_liked_paper(user_id=user_id, arxiv_id=normalized_arxiv_id)
+            success = self.user_preference_store.add_liked_paper(user_id=user_id, arxiv_id=normalized_arxiv_id)
             action = "liked"
         else:
-            success = self.db_service.add_disliked_paper(user_id=user_id, arxiv_id=normalized_arxiv_id)
+            success = self.user_preference_store.add_disliked_paper(user_id=user_id, arxiv_id=normalized_arxiv_id)
             action = "disliked"
 
         if not success:
@@ -117,7 +117,7 @@ class CandidateMaterializer:
                 stats["unresolved"] += 1
                 continue
             try:
-                existing_paper = self.db_service.get_paper(arxiv_id)
+                existing_paper = self.paper_catalog_store.get_paper(arxiv_id)
                 existing_embedding = candidate_embedding_map.get(arxiv_id)
             except Exception as exc:  # pragma: no cover
                 logger.warning("Failed to inspect candidate paper %s before materialization: %s", arxiv_id, exc)
@@ -132,12 +132,12 @@ class CandidateMaterializer:
 
             # 数据库有论文、向量库也有 embedding，但二者关联缺失时，只修复映射关系。
             if existing_paper and existing_embedding and not existing_paper.get("embedding_id"):
-                updated = self.db_service.update_paper_embedding(
+                updated = self.paper_catalog_store.update_paper_embedding(
                     arxiv_id=arxiv_id,
                     embedding_id=int(existing_embedding.get("embedding_id") or 0),
                     embedding_model=str(existing_embedding.get("embedding_model") or existing_paper.get("embedding_model") or embedding_config.model_name),
                 )
-                refreshed = self.db_service.get_paper(arxiv_id) if updated else None
+                refreshed = self.paper_catalog_store.get_paper(arxiv_id) if updated else None
                 materialized_by_id[arxiv_id] = refreshed or {**existing_paper, "embedding_id": existing_embedding.get("embedding_id")}
                 stats["db_only"] += 1
                 continue
@@ -155,8 +155,8 @@ class CandidateMaterializer:
                     "embedding_id": str(existing_embedding.get("embedding_id") or ""),
                     "embedding_model": str(existing_embedding.get("embedding_model") or embedding_config.model_name),
                 }
-                if self.db_service.add_paper(stored):
-                    materialized_by_id[arxiv_id] = self.db_service.get_paper(arxiv_id) or stored
+                if self.paper_catalog_store.add_paper(stored):
+                    materialized_by_id[arxiv_id] = self.paper_catalog_store.get_paper(arxiv_id) or stored
                     stats["db_only"] += 1
                 else:
                     stats["unresolved"] += 1
@@ -219,8 +219,8 @@ class CandidateMaterializer:
                         "embedding_id": "",
                         "embedding_model": job["normalized_paper"]["embedding_model"],
                     }
-                    if self.db_service.add_paper(stored):
-                        materialized_by_id[job["arxiv_id"]] = self.db_service.get_paper(job["arxiv_id"]) or stored
+                    if self.paper_catalog_store.add_paper(stored):
+                        materialized_by_id[job["arxiv_id"]] = self.paper_catalog_store.get_paper(job["arxiv_id"]) or stored
                     else:
                         stats["unresolved"] += 1
             except Exception as exc:  # pragma: no cover
@@ -241,7 +241,7 @@ class CandidateMaterializer:
 
     def _ensure_paper_materialized(self, arxiv_id: str, paper_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """确保单篇论文已经具备论文表记录和可用 embedding 的最小落库状态。"""
-        existing_paper = self.db_service.get_paper(arxiv_id)
+        existing_paper = self.paper_catalog_store.get_paper(arxiv_id)
         existing_embedding = self._get_existing_paper_embedding(arxiv_id)
 
         if existing_paper and existing_paper.get("embedding_id") and existing_embedding:
@@ -264,40 +264,40 @@ class CandidateMaterializer:
         }
 
         if existing_paper and existing_embedding and not existing_paper.get("embedding_id"):
-            updated = self.db_service.update_paper_embedding(
+            updated = self.paper_catalog_store.update_paper_embedding(
                 arxiv_id=arxiv_id,
                 embedding_id=int(existing_embedding.get("embedding_id") or 0),
                 embedding_model=str(existing_embedding.get("embedding_model") or normalized_paper["embedding_model"]),
             )
             if updated:
-                refreshed = self.db_service.get_paper(arxiv_id)
+                refreshed = self.paper_catalog_store.get_paper(arxiv_id)
                 if refreshed:
                     return refreshed
             return {**existing_paper, "embedding_id": existing_embedding.get("embedding_id")}
 
         if existing_paper and existing_paper.get("embedding_id") and not existing_embedding:
             embedding_id = self._insert_paper_embedding(normalized_paper)
-            self.db_service.update_paper_embedding(arxiv_id=arxiv_id, embedding_id=embedding_id, embedding_model=normalized_paper["embedding_model"])
-            refreshed = self.db_service.get_paper(arxiv_id)
+            self.paper_catalog_store.update_paper_embedding(arxiv_id=arxiv_id, embedding_id=embedding_id, embedding_model=normalized_paper["embedding_model"])
+            refreshed = self.paper_catalog_store.get_paper(arxiv_id)
             return refreshed or {**existing_paper, "embedding_id": embedding_id}
 
         if existing_embedding and not existing_paper:
             stored = dict(paper_payload)
             stored["embedding_id"] = str(existing_embedding.get("embedding_id") or "")
-            success = self.db_service.add_paper(stored)
+            success = self.paper_catalog_store.add_paper(stored)
             if not success:
                 raise HTTPException(status_code=500, detail=f"Failed to store paper {arxiv_id}")
-            refreshed = self.db_service.get_paper(arxiv_id)
+            refreshed = self.paper_catalog_store.get_paper(arxiv_id)
             return refreshed or stored
 
         embedding_id = self._insert_paper_embedding(normalized_paper)
         stored = dict(paper_payload)
         stored["embedding_id"] = str(embedding_id)
-        success = self.db_service.add_paper(stored)
+        success = self.paper_catalog_store.add_paper(stored)
         if not success:
             raise HTTPException(status_code=500, detail=f"Failed to store paper {arxiv_id}")
 
-        refreshed = self.db_service.get_paper(arxiv_id)
+        refreshed = self.paper_catalog_store.get_paper(arxiv_id)
         return refreshed or stored
 
     def _materialize_paper_from_source(self, source_paper: Dict[str, Any], fallback_arxiv_id: str) -> Dict[str, Any]:
@@ -315,10 +315,10 @@ class CandidateMaterializer:
             "embedding_id": str(embedding_id),
             "embedding_model": normalized_paper["embedding_model"],
         }
-        success = self.db_service.add_paper(stored)
+        success = self.paper_catalog_store.add_paper(stored)
         if not success:
             raise HTTPException(status_code=500, detail=f"Failed to store paper {normalized_paper['arxiv_id']}")
-        refreshed = self.db_service.get_paper(normalized_paper["arxiv_id"])
+        refreshed = self.paper_catalog_store.get_paper(normalized_paper["arxiv_id"])
         return refreshed or stored
 
     def _fetch_paper_from_arxiv_with_rate_limit(self, arxiv_id: str) -> Optional[Dict[str, Any]]:

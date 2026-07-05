@@ -1,10 +1,11 @@
 import uuid
 from typing import Any, Dict, List, Optional
 
-from services.storage.database.shared import DEFAULT_USER_ID, logger
+from services.storage.sqlite.base import BaseSqliteStore
+from services.storage.sqlite.shared import DEFAULT_USER_ID, logger
 
 
-class AgentSessionMixin:
+class AgentSessionStore(BaseSqliteStore):
     """维护 Agent 会话记忆的轻量 CRUD；运行时恢复 checkpoint 仍由主库服务中的状态机方法负责。"""
 
     def _row_to_agent_session(self, row: Any) -> Dict[str, Any]:

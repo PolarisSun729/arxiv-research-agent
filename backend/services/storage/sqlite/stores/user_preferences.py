@@ -1,6 +1,9 @@
 from typing import Any, Dict, List, Optional
 
-from services.storage.database.shared import DEFAULT_USER_ID, logger
+from services.storage.sqlite.base import BaseSqliteStore
+from services.storage.sqlite.shared import DEFAULT_USER_ID, logger
+from services.storage.sqlite.stores.profile_events import ProfileEventStore
+from services.storage.sqlite.stores.research_profiles import ResearchProfileStore
 from services.user_behavior_policy import (
     WEAK_PAPER_ACTION_TYPES,
     is_explicit_preference_action,
@@ -10,8 +13,36 @@ from services.user_behavior_policy import (
 PAPER_ACTION_TYPES = set(WEAK_PAPER_ACTION_TYPES)
 
 
-class UserPreferenceMixin:
-    """用户论文反馈状态的内部实现；暂时复用画像事件 helper 以保持旧行为不变。"""
+class UserPreferenceStore(BaseSqliteStore):
+    """用户论文反馈状态存储；画像事件写入通过显式依赖完成，避免重新形成万能存储对象。"""
+
+    def __init__(
+        self,
+        connection_provider,
+        profile_event_store: ProfileEventStore,
+        research_profile_store: ResearchProfileStore,
+    ) -> None:
+        super().__init__(connection_provider)
+        self.profile_event_store = profile_event_store
+        self.research_profile_store = research_profile_store
+
+    def _record_preference_profile_event(self, conn, user_id: str, arxiv_id: str, event_type: str) -> None:
+        self.profile_event_store._record_preference_profile_event(conn, user_id, arxiv_id, event_type)
+
+    def _deactivate_profile_events_for_paper(self, conn, user_id: str, arxiv_id: str, event_types: List[str]) -> None:
+        self.profile_event_store._deactivate_profile_events_for_paper(conn, user_id, arxiv_id, event_types)
+
+    def _record_profile_signal_removed_event(self, conn, user_id: str, arxiv_id: str, removed_event_type: str) -> None:
+        self.profile_event_store._record_profile_signal_removed_event(conn, user_id, arxiv_id, removed_event_type)
+
+    def record_user_profile_event(self, *args, **kwargs):
+        return self.profile_event_store.record_user_profile_event(*args, **kwargs)
+
+    def _normalize_profile_event_type(self, value: Any) -> str:
+        return self.profile_event_store._normalize_profile_event_type(value)
+
+    def get_user_research_profile(self, user_id: str = DEFAULT_USER_ID) -> Dict[str, Any]:
+        return self.research_profile_store.get_user_research_profile(user_id)
 
     @staticmethod
     def _normalize_action_type(action_type: Any) -> str:
@@ -417,3 +448,35 @@ class UserPreferenceMixin:
         except Exception as e:
             logger.error(f"Error getting user labeled paper count: {str(e)}")
             return 0
+
+    def get_unlabeled_papers(self, user_id: str = DEFAULT_USER_ID) -> List[Dict[str, Any]]:
+        """按用户强偏好排除已标注论文，供画像/推荐流程选择下一批候选。"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT p.arxiv_id, p.title, p.abstract, p.authors, p.categories, p.published_date, p.url
+                    FROM arxiv_papers p
+                    LEFT JOIN user_liked_papers ulp ON p.arxiv_id = ulp.arxiv_id AND ulp.user_id = ?
+                    LEFT JOIN user_disliked_papers udp ON p.arxiv_id = udp.arxiv_id AND udp.user_id = ?
+                    WHERE ulp.arxiv_id IS NULL AND udp.arxiv_id IS NULL AND p.embedding_id IS NOT NULL
+                    ORDER BY p.published_date DESC
+                    ''',
+                    (user_id, user_id),
+                )
+                return [
+                    {
+                        "arxiv_id": row[0],
+                        "title": row[1],
+                        "abstract": row[2],
+                        "authors": row[3],
+                        "categories": row[4],
+                        "published_date": row[5],
+                        "url": row[6],
+                    }
+                    for row in cursor.fetchall()
+                ]
+        except Exception as e:
+            logger.error(f"Error getting unlabeled papers: {str(e)}")
+            return []

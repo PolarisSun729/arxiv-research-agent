@@ -15,7 +15,6 @@ from services.arxiv.arxiv_search_service import ArxivSearchService
 from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
 from services.document.chunking_service import ChunkingService
 from services.document.table_structure_service import TableStructureService
-from services.storage.database_service import DatabaseService
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
 from services.llm.generation_service import GenerationService, QWEN_RERANK_COMPRESS_MODEL_NAME
 from services.document.loading_service import LoadingService
@@ -34,6 +33,8 @@ from services.retrieval.retrieval_index import (
     summarize_retrieval_indexes,
 )
 from services.retrieval.retrieval_rules import RetrievalRules
+from services.storage.sqlite.stores.paper_catalog import PaperCatalogStore
+from services.storage.sqlite.stores.paper_qa_index import PaperQAIndexStore
 from services.storage.vector_store_service import VectorDBConfig, VectorStoreService
 from utils.config import get_enhanced_retrieval_runtime_config
 from utils.logging_utils import info_event
@@ -77,7 +78,8 @@ class PaperQAIndexBuilder:
     def __init__(
         self,
         *,
-        db_service: DatabaseService,
+        paper_qa_index_store: PaperQAIndexStore,
+        paper_catalog_store: PaperCatalogStore,
         embedding_service: EmbeddingService,
         vector_store_service: VectorStoreService,
         generation_service: GenerationService,
@@ -88,7 +90,8 @@ class PaperQAIndexBuilder:
         chunking_service_factory: Optional[Callable[[], ChunkingService]] = None,
     ):
         """初始化论文问答索引构建器，并注入建索引链路所需依赖。"""
-        self.db_service = db_service
+        self.paper_qa_index_store = paper_qa_index_store
+        self.paper_catalog_store = paper_catalog_store
         self.embedding_service = embedding_service
         self.vector_store_service = vector_store_service
         self.generation_service = generation_service
@@ -122,7 +125,7 @@ class PaperQAIndexBuilder:
 
     def mark_index_processing(self, arxiv_id: str, *, loading_method: str) -> None:
         """把论文索引状态标记为处理中，供外部轮询和后台任务联动使用。"""
-        created = self.db_service.insert_paper_qa_index(
+        created = self.paper_qa_index_store.insert_paper_qa_index(
             arxiv_id,
             collection_name="",
             status="processing",
@@ -144,7 +147,7 @@ class PaperQAIndexBuilder:
 
     def mark_build_processing(self, build_id: str, *, loading_method: str) -> None:
         """把本次版本化构建标记为 building；active 指针保持不变，旧索引仍可服务问答。"""
-        updated = self.db_service.update_paper_qa_index_build(
+        updated = self.paper_qa_index_store.update_paper_qa_index_build(
             build_id,
             status="building",
             loading_method=loading_method,
@@ -157,7 +160,8 @@ class PaperQAIndexBuilder:
             raise RuntimeError("Failed to mark QA index build as processing")
 
     def _workspace_root(self) -> Path:
-        return Path(__file__).resolve().parents[3]
+        # QA artifact 目录（01-loaded-docs/02-retrieval-indexes 等）都落在 backend 下；清理相对路径时必须以 backend 为安全边界。
+        return Path(__file__).resolve().parents[2]
 
     def _safe_delete_file(self, file_path: Any) -> bool:
         path_text = str(file_path or "").strip()
@@ -223,7 +227,7 @@ class PaperQAIndexBuilder:
     def _active_artifact_guard(self, arxiv_id: str, *, allow_active: bool) -> Dict[str, Any]:
         if allow_active:
             return {"build_id": "", "collection_name": "", "paths": []}
-        active = self.db_service.get_active_paper_qa_index_build(arxiv_id) or {}
+        active = self.paper_qa_index_store.get_active_paper_qa_index_build(arxiv_id) or {}
         protected_paths = []
         for field_name in ("pdf_path", "chunk_file", "retrieval_index_file", "embedding_file", "sparse_index_dir", "sparse_index_manifest_file"):
             resolved = self._resolve_cleanup_path(active.get(field_name))
@@ -257,7 +261,7 @@ class PaperQAIndexBuilder:
         默认用于 cleanup_pending 旧版本清理，并防御性保护当前 active build；
         只有用户显式删除 QA 索引时，调用方才传入 allow_active=True。
         """
-        existing = qa_index if qa_index is not None else self.db_service.get_paper_qa_index(arxiv_id)
+        existing = qa_index if qa_index is not None else self.paper_qa_index_store.get_paper_qa_index(arxiv_id)
         result = {"collection_deleted": False, "collection_skipped_active": False, "files_deleted": [], "files_missing": [], "files_skipped_active": [], "skipped_active_build": False}
         if not existing:
             return result
@@ -312,9 +316,9 @@ class PaperQAIndexBuilder:
 
     def cleanup_pending_index_builds(self, arxiv_id: str, *, limit: int = 5) -> Dict[str, Any]:
         """延迟清理 cleanup_pending 版本；清理失败只进入结果，不影响 active 索引问答。"""
-        active = self.db_service.get_active_paper_qa_index_build(arxiv_id)
+        active = self.paper_qa_index_store.get_active_paper_qa_index_build(arxiv_id)
         active_build_id = active.get("build_id") if active else None
-        candidates = self.db_service.list_paper_qa_index_builds(
+        candidates = self.paper_qa_index_store.list_paper_qa_index_builds(
             arxiv_id,
             statuses=["cleanup_pending", "orphaned", "build_failed"],
             limit=limit,
@@ -328,7 +332,7 @@ class PaperQAIndexBuilder:
                 continue
             try:
                 cleanup_result = self.cleanup_qa_index_artifacts(arxiv_id, build)
-                marked = self.db_service.mark_paper_qa_index_build_deleted(build_id)
+                marked = self.paper_qa_index_store.mark_paper_qa_index_build_deleted(build_id)
                 result["cleaned"].append({"build_id": build_id, "cleanup": cleanup_result, "marked_deleted": marked})
             except Exception as exc:
                 logger.exception("Failed to cleanup QA index build: arxiv_id=%s build_id=%s", arxiv_id, build_id)
@@ -340,9 +344,9 @@ class PaperQAIndexBuilder:
 
         主构建链路不再在这里删除旧索引；旧 active 必须保留到新版本激活成功之后，后续由清理流程处理。
         """
-        existing = self.db_service.get_paper_qa_index(arxiv_id)
+        existing = self.paper_qa_index_store.get_paper_qa_index(arxiv_id)
         if existing:
-            self.db_service.update_paper_qa_index(
+            self.paper_qa_index_store.update_paper_qa_index(
                 arxiv_id,
                 loading_method=loading_method,
                 current_stage="prepare_versioned_rebuild",
@@ -376,7 +380,7 @@ class PaperQAIndexBuilder:
         }
         payload.update({key: value for key, value in artifacts.items() if key in QA_INDEX_ARTIFACT_FIELDS})
         if build_id:
-            updated = self.db_service.update_paper_qa_index_build(build_id, **payload)
+            updated = self.paper_qa_index_store.update_paper_qa_index_build(build_id, **payload)
             if not updated:
                 raise AppError(
                     ErrorCode.DATABASE_WRITE_FAILED,
@@ -384,9 +388,9 @@ class PaperQAIndexBuilder:
                     context={"arxiv_id": arxiv_id, "stage": current_stage, "build_id": build_id},
                 )
             return
-        updated = self.db_service.update_paper_qa_index(arxiv_id, **payload)
+        updated = self.paper_qa_index_store.update_paper_qa_index(arxiv_id, **payload)
         if not updated:
-            inserted = self.db_service.insert_paper_qa_index(arxiv_id, **payload)
+            inserted = self.paper_qa_index_store.insert_paper_qa_index(arxiv_id, **payload)
             if not inserted:
                 raise AppError(
                     ErrorCode.DATABASE_WRITE_FAILED,
@@ -490,7 +494,7 @@ class PaperQAIndexBuilder:
 
     def load_paper_metadata(self, arxiv_id: str) -> Dict[str, Any]:
         """加载论文元数据，优先查本地库，缺失时再逐级回源补齐。"""
-        paper = self.db_service.get_paper(arxiv_id)
+        paper = self.paper_catalog_store.get_paper(arxiv_id)
         if not paper:
             logger.debug("Paper metadata missing in primary database, trying local OAI database: %s", arxiv_id)
             paper = self._fetch_and_store_paper_metadata_from_oai(arxiv_id)
@@ -534,12 +538,12 @@ class PaperQAIndexBuilder:
             )
             return None
 
-        if not self.db_service.add_paper(paper):
+        if not self.paper_catalog_store.add_paper(paper):
             logger.error("Failed to persist %s metadata into database: %s", source, arxiv_id)
             return None
 
         logger.debug("%s metadata stored for: %s", source, arxiv_id)
-        return self.db_service.get_paper(arxiv_id) or paper
+        return self.paper_catalog_store.get_paper(arxiv_id) or paper
 
     def _fetch_and_store_paper_metadata_from_oai(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
         """从本地 OAI 数据库获取论文元数据，并在成功时写回主数据库。"""
@@ -1043,7 +1047,7 @@ class PaperQAIndexBuilder:
             raise RuntimeError("Sparse index artifact is required before activating QA index build")
         if build_id:
             indexed_at = datetime.now().isoformat(timespec="seconds")
-            updated = self.db_service.update_paper_qa_index_build(
+            updated = self.paper_qa_index_store.update_paper_qa_index_build(
                 build_id,
                 collection_name=collection_name,
                 status="build_success",
@@ -1075,8 +1079,8 @@ class PaperQAIndexBuilder:
             )
             if not updated:
                 return False
-            return self.db_service.activate_paper_qa_index_build(build_id)
-        return self.db_service.update_paper_qa_index(
+            return self.paper_qa_index_store.activate_paper_qa_index_build(build_id)
+        return self.paper_qa_index_store.update_paper_qa_index(
             arxiv_id,
             collection_name=collection_name,
             status="indexed",
@@ -1144,7 +1148,7 @@ class PaperQAIndexBuilder:
         }
         payload.update({key: value for key, value in artifacts.items() if key in QA_INDEX_ARTIFACT_FIELDS})
         if build_id:
-            updated = self.db_service.update_paper_qa_index_build(build_id, **payload)
+            updated = self.paper_qa_index_store.update_paper_qa_index_build(build_id, **payload)
             if not updated:
                 logger.error(
                     "Failed to persist QA index build failure record: arxiv_id=%s build_id=%s stage=%s collection_name=%s",
@@ -1154,9 +1158,9 @@ class PaperQAIndexBuilder:
                     artifacts.get("collection_name"),
                 )
             return updated
-        updated = self.db_service.update_paper_qa_index(arxiv_id, **payload)
+        updated = self.paper_qa_index_store.update_paper_qa_index(arxiv_id, **payload)
         if not updated:
-            updated = self.db_service.insert_paper_qa_index(arxiv_id, **payload)
+            updated = self.paper_qa_index_store.insert_paper_qa_index(arxiv_id, **payload)
         if not updated:
             logger.error(
                 "Failed to persist QA index failure record: arxiv_id=%s stage=%s collection_name=%s",
@@ -1198,7 +1202,7 @@ class PaperQAIndexBuilder:
                 progress=8,
                 message="Creating QA index build version",
             )
-            build = self.db_service.create_paper_qa_index_build(arxiv_id, loading_method)
+            build = self.paper_qa_index_store.create_paper_qa_index_build(arxiv_id, loading_method)
             if not build:
                 raise RuntimeError("Failed to create QA index build version")
             build_id = str(build.get("build_id") or "")
@@ -1570,7 +1574,7 @@ class PaperQAIndexBuilder:
             )
             if not success_marked:
                 # 新 collection 已经生成但未能激活时，不能覆盖旧 active，只把新版本留给后续清理。
-                self.db_service.update_paper_qa_index_build(
+                self.paper_qa_index_store.update_paper_qa_index_build(
                     build_id,
                     status="orphaned",
                     current_stage="activate_index",

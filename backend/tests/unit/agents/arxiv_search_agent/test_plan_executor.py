@@ -632,7 +632,7 @@ def test_plan_executor_runtime_approved_step_does_not_request_confirmation_again
 def test_plan_executor_checkpoint_approved_step_does_not_request_confirmation_again(monkeypatch) -> None:
     calls = []
 
-    class ApprovedCheckpointDatabase:
+    class ApprovedCheckpointStore:
         def get_agent_runtime_checkpoint(self, **kwargs):
             assert kwargs["user_id"] == "u1"
             assert kwargs["session_id"] == "s1"
@@ -654,7 +654,6 @@ def test_plan_executor_checkpoint_approved_step_does_not_request_confirmation_ag
     def fail_if_interrupted(*args, **kwargs):
         raise AssertionError("approved checkpoint step must not request confirmation again")
 
-    monkeypatch.setattr(executor_module, "DatabaseService", ApprovedCheckpointDatabase)
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
     monkeypatch.setattr(executor_module, "interrupt", fail_if_interrupted)
 
@@ -663,7 +662,11 @@ def test_plan_executor_checkpoint_approved_step_does_not_request_confirmation_ag
     runtime = planner_module.build_plan_runtime(state, goal=goal, plan=plan, turn_status="success")
     runtime.step_status = {step.step_id: "pending" for step in list(plan.steps or [])}
 
-    result = PlanExecutor()._execute_runtime(runtime, state, allow_interrupt=True)
+    result = PlanExecutor(runtime_checkpoint_store=ApprovedCheckpointStore())._execute_runtime(
+        runtime,
+        state,
+        allow_interrupt=True,
+    )
 
     assert result.status == "success"
     assert calls and calls[0][0] == "build_paper_qa_index"
@@ -675,7 +678,7 @@ def test_plan_executor_checkpoint_approved_step_does_not_request_confirmation_ag
 def test_plan_executor_checkpoint_approved_step_uses_default_user_id_when_state_user_missing(monkeypatch) -> None:
     calls = []
 
-    class ApprovedCheckpointDatabase:
+    class ApprovedCheckpointStore:
         def get_agent_runtime_checkpoint(self, **kwargs):
             # stream resume 可能不显式回填 user_id；executor 需要和数据库层保持同样的默认值归一。
             assert kwargs["user_id"] == executor_module.DEFAULT_USER_ID
@@ -698,7 +701,6 @@ def test_plan_executor_checkpoint_approved_step_uses_default_user_id_when_state_
     def fail_if_interrupted(*args, **kwargs):
         raise AssertionError("approved checkpoint step must not request confirmation again")
 
-    monkeypatch.setattr(executor_module, "DatabaseService", ApprovedCheckpointDatabase)
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
     monkeypatch.setattr(executor_module, "interrupt", fail_if_interrupted)
 
@@ -707,7 +709,11 @@ def test_plan_executor_checkpoint_approved_step_uses_default_user_id_when_state_
     runtime = planner_module.build_plan_runtime(state, goal=goal, plan=plan, turn_status="success")
     runtime.step_status = {step.step_id: "pending" for step in list(plan.steps or [])}
 
-    result = PlanExecutor()._execute_runtime(runtime, state, allow_interrupt=True)
+    result = PlanExecutor(runtime_checkpoint_store=ApprovedCheckpointStore())._execute_runtime(
+        runtime,
+        state,
+        allow_interrupt=True,
+    )
 
     assert result.status == "success"
     assert calls and calls[0][0] == "build_paper_qa_index"

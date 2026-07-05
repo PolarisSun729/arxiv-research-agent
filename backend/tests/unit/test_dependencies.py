@@ -20,7 +20,7 @@ class DependenciesUnitTests(unittest.TestCase):
 
         self.assertIsInstance(getters, list)
         self.assertGreaterEqual(len(getters), 10)
-        self.assertEqual(getters[0][0], "database_service")
+        self.assertEqual(getters[0][0], "storage_container")
         self.assertEqual(getters[-1][0], "paper_qa_service")
         self.assertTrue(all(isinstance(name, str) and callable(getter) for name, getter in getters))
 

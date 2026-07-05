@@ -1,12 +1,11 @@
-import gc
+﻿import gc
 import json
 import unittest
 from unittest import mock
 
 from services.memory.memory_debug import build_memory_debug_payload
 from services.memory.memory_service import MemoryService
-from services.storage.database_service import DatabaseService
-from tests.helpers import build_database_service
+from tests.helpers import build_storage_container
 
 
 class FakeEvidenceGenerationService:
@@ -61,22 +60,38 @@ class FakeEvidenceGenerationService:
 
 class MemoryServiceIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.db_service = build_database_service(DatabaseService)
-        self.memory_service = MemoryService(db_service=self.db_service, generation_service=FakeEvidenceGenerationService())
+        self.storage = build_storage_container()
+        self.memory_service = self._make_memory_service(generation_service=FakeEvidenceGenerationService())
         self.user_id = "user-1"
         self.arxiv_id = "2401.00001"
         self._add_paper(self.arxiv_id)
 
     def tearDown(self) -> None:
-        temp_db = getattr(self.db_service, "_test_temp_db", None)
+        temp_db = getattr(self.storage, "_test_temp_db", None)
         self.memory_service = None
-        self.db_service = None
+        self.storage = None
         gc.collect()
         if temp_db is not None:
             temp_db.cleanup()
 
+    def _make_memory_service(self, *, generation_service=None) -> MemoryService:
+        return MemoryService(
+            paper_catalog_store=self.storage.paper_catalog,
+            user_preference_store=self.storage.user_preferences,
+            interest_vector_store=self.storage.interest_vectors,
+            paper_profile_evidence_store=self.storage.paper_profile_evidence,
+            paper_chat_session_store=self.storage.paper_chat_sessions,
+            paper_chat_message_store=self.storage.paper_chat_messages,
+            paper_note_store=self.storage.paper_notes,
+            profile_event_store=self.storage.profile_events,
+            profile_build_job_store=self.storage.profile_build_jobs,
+            research_profile_store=self.storage.research_profiles,
+            agent_session_store=self.storage.agent_sessions,
+            generation_service=generation_service,
+        )
+
     def _add_paper(self, arxiv_id: str, *, title: str = "Test Paper", categories=None) -> None:
-        self.db_service.add_paper(
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": arxiv_id,
                 "title": title,
@@ -89,9 +104,9 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         )
 
     def test_load_preference_summary_returns_stable_counts(self) -> None:
-        self.db_service.add_liked_paper(self.user_id, self.arxiv_id)
-        self.db_service.record_user_paper_action(self.user_id, "2401.00002", "bookmark")
-        self.db_service.save_user_interest_vector(
+        self.storage.user_preferences.add_liked_paper(self.user_id, self.arxiv_id)
+        self.storage.user_preferences.record_user_paper_action(self.user_id, "2401.00002", "bookmark")
+        self.storage.interest_vectors.save_user_interest_vector(
             user_id=self.user_id,
             vector_data=[0.1, 0.2, 0.3],
             paper_count=1,
@@ -108,9 +123,9 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(summary["interest_vector"])
 
     def test_load_paper_chat_history_reads_recent_messages(self) -> None:
-        session = self.db_service.create_paper_chat_session(arxiv_id=self.arxiv_id, user_id=self.user_id, title="QA")
-        self.db_service.append_paper_chat_message(session["session_id"], "user", "What is the idea?", user_id=self.user_id, turn_id="turn-1")
-        self.db_service.append_paper_chat_message(
+        session = self.storage.paper_chat_sessions.create_paper_chat_session(arxiv_id=self.arxiv_id, user_id=self.user_id, title="QA")
+        self.storage.paper_chat_messages.append_paper_chat_message(session["session_id"], "user", "What is the idea?", user_id=self.user_id, turn_id="turn-1")
+        self.storage.paper_chat_messages.append_paper_chat_message(
             session["session_id"],
             "assistant",
             "The paper studies retrieval.",
@@ -129,9 +144,9 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(context["turns"][0]["turn_id"], "turn-1")
 
     def test_conversation_context_filters_incomplete_and_invalid_turns(self) -> None:
-        session = self.db_service.create_paper_chat_session(arxiv_id=self.arxiv_id, user_id=self.user_id, title="QA")
-        self.db_service.append_paper_chat_message(session["session_id"], "user", "Valid question?", user_id=self.user_id, turn_id="valid-turn")
-        self.db_service.append_paper_chat_message(
+        session = self.storage.paper_chat_sessions.create_paper_chat_session(arxiv_id=self.arxiv_id, user_id=self.user_id, title="QA")
+        self.storage.paper_chat_messages.append_paper_chat_message(session["session_id"], "user", "Valid question?", user_id=self.user_id, turn_id="valid-turn")
+        self.storage.paper_chat_messages.append_paper_chat_message(
             session["session_id"],
             "assistant",
             "Valid answer.",
@@ -139,17 +154,17 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
             turn_id="valid-turn",
             sources=[{"source_id": "s1"}],
         )
-        self.db_service.append_paper_chat_message(session["session_id"], "user", "Only user", user_id=self.user_id, turn_id="user-only")
-        self.db_service.append_paper_chat_message(
+        self.storage.paper_chat_messages.append_paper_chat_message(session["session_id"], "user", "Only user", user_id=self.user_id, turn_id="user-only")
+        self.storage.paper_chat_messages.append_paper_chat_message(
             session["session_id"],
             "assistant",
             "Only assistant",
             user_id=self.user_id,
             turn_id="assistant-only",
         )
-        self.db_service.append_paper_chat_message(session["session_id"], "user", "Duplicate one", user_id=self.user_id, turn_id="duplicate-role")
-        self.db_service.append_paper_chat_message(session["session_id"], "user", "Duplicate two", user_id=self.user_id, turn_id="duplicate-role")
-        self.db_service.append_paper_chat_message(
+        self.storage.paper_chat_messages.append_paper_chat_message(session["session_id"], "user", "Duplicate one", user_id=self.user_id, turn_id="duplicate-role")
+        self.storage.paper_chat_messages.append_paper_chat_message(session["session_id"], "user", "Duplicate two", user_id=self.user_id, turn_id="duplicate-role")
+        self.storage.paper_chat_messages.append_paper_chat_message(
             session["session_id"],
             "assistant",
             "Duplicate answer",
@@ -171,16 +186,16 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(context["filtered_turn_count"], 3)
 
     def test_conversation_context_reads_recent_message_window_instead_of_full_history(self) -> None:
-        session = self.db_service.create_paper_chat_session(arxiv_id=self.arxiv_id, user_id=self.user_id, title="Long QA")
+        session = self.storage.paper_chat_sessions.create_paper_chat_session(arxiv_id=self.arxiv_id, user_id=self.user_id, title="Long QA")
         for index in range(12):
-            self.db_service.append_paper_chat_message(
+            self.storage.paper_chat_messages.append_paper_chat_message(
                 session["session_id"],
                 "user",
                 f"Question {index}",
                 user_id=self.user_id,
                 turn_id=f"turn-{index}",
             )
-            self.db_service.append_paper_chat_message(
+            self.storage.paper_chat_messages.append_paper_chat_message(
                 session["session_id"],
                 "assistant",
                 f"Answer {index}",
@@ -202,7 +217,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual([turn["turn_id"] for turn in context["turns"]], ["turn-9", "turn-10", "turn-11"])
 
     def test_update_profile_from_note_merges_clean_note_tags_only(self) -> None:
-        note = self.db_service.create_paper_note(
+        note = self.storage.paper_notes.create_paper_note(
             user_id=self.user_id,
             arxiv_id=self.arxiv_id,
             title="Important finding about a single paper",
@@ -213,7 +228,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         )
 
         immediate_profile = self.memory_service.update_profile_from_note(self.user_id, note)
-        events = self.db_service.list_user_profile_events(self.user_id, event_types=["note_saved"])
+        events = self.storage.profile_events.list_user_profile_events(self.user_id, event_types=["note_saved"])
         profile = self.memory_service.rebuild_user_research_profile(self.user_id)
 
         self.assertEqual(immediate_profile["positive_topics"], [])
@@ -227,7 +242,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIn(self.arxiv_id, profile["representative_papers"])
 
     def test_note_and_qa_write_profile_events_without_sync_generation(self) -> None:
-        note = self.db_service.create_paper_note(
+        note = self.storage.paper_notes.create_paper_note(
             user_id=self.user_id,
             arxiv_id=self.arxiv_id,
             title="Profile note",
@@ -236,18 +251,18 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
             tags=["rag"],
             include_in_profile=True,
         )
-        session = self.db_service.create_paper_chat_session(arxiv_id=self.arxiv_id, user_id=self.user_id, title="QA")
-        self.db_service.append_paper_chat_message(session["session_id"], "user", "How does retrieval work?", user_id=self.user_id)
+        session = self.storage.paper_chat_sessions.create_paper_chat_session(arxiv_id=self.arxiv_id, user_id=self.user_id, title="QA")
+        self.storage.paper_chat_messages.append_paper_chat_message(session["session_id"], "user", "How does retrieval work?", user_id=self.user_id)
 
-        events = self.db_service.list_user_profile_events(self.user_id)
+        events = self.storage.profile_events.list_user_profile_events(self.user_id)
         event_types = {event["event_type"] for event in events}
 
         self.assertIsNotNone(note)
         self.assertIn("note_saved", event_types)
         self.assertIn("qa_asked", event_types)
-        self.assertEqual(self.db_service.get_user_generated_profile(self.user_id)["positive_topics"], [])
+        self.assertEqual(self.storage.research_profiles.get_user_generated_profile(self.user_id)["positive_topics"], [])
         self.memory_service.rebuild_user_research_profile(self.user_id)
-        self.assertIsNotNone(self.db_service.get_paper_profile_evidence(self.arxiv_id))
+        self.assertIsNotNone(self.storage.paper_profile_evidence.get_paper_profile_evidence(self.arxiv_id))
 
     def test_like_paper_keeps_categories_and_titles_out_of_topics(self) -> None:
         immediate_profile = self.memory_service.update_profile_from_preference(
@@ -262,7 +277,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "topics": ["RAG", "agent memory", "method", self.arxiv_id],
             },
         )
-        events = self.db_service.list_user_profile_events(self.user_id, event_types=["liked"])
+        events = self.storage.profile_events.list_user_profile_events(self.user_id, event_types=["liked"])
         profile = self.memory_service.rebuild_user_research_profile(self.user_id)
 
         self.assertEqual(immediate_profile["positive_topics"], [])
@@ -337,7 +352,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
             title="Diffusion Models for Image Generation",
             categories=["cs.CV"],
         )
-        self.db_service.add_paper(
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": "2401.00014",
                 "title": "Knowledge Graph Construction for Scientific QA",
@@ -349,7 +364,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
             }
         )
         # 用完整摘要作为证据输入，生成器应抽象出稳定主题，而不是保存这些标题。
-        self.db_service.add_paper(
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": "2401.00010",
                 "title": "RAG Retrieval Optimization for Long-Context Reasoning Agents",
@@ -360,7 +375,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00010",
             }
         )
-        self.db_service.add_paper(
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": "2401.00011",
                 "title": "Agent Memory for Tool-Using Language Models",
@@ -371,7 +386,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00011",
             }
         )
-        self.db_service.add_paper(
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": "2401.00012",
                 "title": "Memory-Augmented RAG Agents",
@@ -382,7 +397,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00012",
             }
         )
-        self.db_service.add_paper(
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": "2401.00013",
                 "title": "Diffusion Models for Image Generation",
@@ -393,15 +408,15 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00013",
             }
         )
-        self.db_service.upsert_user_research_profile(
+        self.storage.research_profiles.upsert_user_research_profile(
             self.user_id,
             {"preferred_answer_style": "concise", "common_question_types": ["summary"]},
         )
         for arxiv_id in ("2401.00010", "2401.00011", "2401.00012"):
-            self.db_service.add_liked_paper(self.user_id, arxiv_id)
-        self.db_service.add_disliked_paper(self.user_id, "2401.00013")
-        self.db_service.record_user_paper_action(self.user_id, "2401.00014", "favorite")
-        self.db_service.create_paper_note(
+            self.storage.user_preferences.add_liked_paper(self.user_id, arxiv_id)
+        self.storage.user_preferences.add_disliked_paper(self.user_id, "2401.00013")
+        self.storage.user_preferences.record_user_paper_action(self.user_id, "2401.00014", "favorite")
+        self.storage.paper_notes.create_paper_note(
             user_id=self.user_id,
             arxiv_id="2401.00014",
             title="Do not store this note title as a topic",
@@ -442,7 +457,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIn("RAG retrieval optimization", layers["effective_profile"]["positive_topics"])
 
     def test_read_only_recent_actions_do_not_pollute_recent_topics(self) -> None:
-        self.db_service.add_paper(
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": "2401.00021",
                 "title": "RAG Systems",
@@ -453,7 +468,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00021",
             }
         )
-        self.db_service.record_user_paper_action(self.user_id, "2401.00021", "read")
+        self.storage.user_preferences.record_user_paper_action(self.user_id, "2401.00021", "read")
 
         profile = self.memory_service.rebuild_user_research_profile(self.user_id)
 
@@ -462,7 +477,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIn("recent_topic_pollution", {issue["code"] for issue in profile["quality_report"]["issues"]})
 
     def test_rebuild_user_research_profile_cleans_existing_dirty_profile(self) -> None:
-        self.db_service.add_paper(
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": "2401.00110",
                 "title": "RAG Retrieval Optimization for Long-Context Reasoning Agents",
@@ -473,7 +488,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00110",
             }
         )
-        self.db_service.add_paper(
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": "2401.00111",
                 "title": "Diffusion Models for Image Generation",
@@ -484,7 +499,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00111",
             }
         )
-        self.db_service.upsert_user_research_profile(
+        self.storage.research_profiles.upsert_user_research_profile(
             self.user_id,
             {
                 "positive_topics": ["cs.CL", "RAG Retrieval Optimization for Long-Context Reasoning Agents", "manual retrieval topic"],
@@ -496,8 +511,8 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "representative_papers": ["RAG Retrieval Optimization for Long-Context Reasoning Agents"],
             },
         )
-        self.db_service.add_liked_paper(self.user_id, "2401.00110")
-        self.db_service.add_disliked_paper(self.user_id, "2401.00111")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00110")
+        self.storage.user_preferences.add_disliked_paper(self.user_id, "2401.00111")
 
         profile = self.memory_service.rebuild_user_research_profile(self.user_id)
         repeated = self.memory_service.rebuild_user_research_profile(self.user_id)
@@ -523,11 +538,11 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(layers["generated_profile"]["snapshot_id"])
 
     def test_manual_profile_is_not_overwritten_by_generated_rebuild(self) -> None:
-        self.db_service.upsert_user_manual_profile(
+        self.storage.research_profiles.upsert_user_manual_profile(
             self.user_id,
             {"positive_topics": ["manual retrieval topic"], "preferred_categories": ["cs.SE"]},
         )
-        self.db_service.add_paper(
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": "2401.00210",
                 "title": "RAG Retrieval Optimization for Long-Context Reasoning Agents",
@@ -538,7 +553,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00210",
             }
         )
-        self.db_service.add_liked_paper(self.user_id, "2401.00210")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00210")
 
         profile = self.memory_service.rebuild_user_research_profile(self.user_id)
         layers = self.memory_service.load_user_profile_layers(self.user_id)
@@ -549,7 +564,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIn("RAG retrieval optimization", profile["positive_topics"])
 
     def test_rebuild_consumes_profile_events_and_uses_event_stream(self) -> None:
-        self.db_service.add_paper(
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": "2401.00310",
                 "title": "RAG Retrieval Optimization for Long-Context Reasoning Agents",
@@ -560,30 +575,30 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00310",
             }
         )
-        self.db_service.add_liked_paper(self.user_id, "2401.00310")
-        self.db_service.add_liked_paper(self.user_id, "2401.00310")
-        self.db_service.record_user_paper_action(self.user_id, "2401.00310", "read")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00310")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00310")
+        self.storage.user_preferences.record_user_paper_action(self.user_id, "2401.00310", "read")
 
-        before_events = self.db_service.list_user_profile_events(self.user_id, include_consumed=True)
-        self.assertGreater(self.db_service.get_user_profile_dirty_event_count(self.user_id), 0)
+        before_events = self.storage.profile_events.list_user_profile_events(self.user_id, include_consumed=True)
+        self.assertGreater(self.storage.profile_events.get_user_profile_dirty_event_count(self.user_id), 0)
         profile = self.memory_service.rebuild_user_research_profile(self.user_id)
-        after_events = self.db_service.list_user_profile_events(self.user_id, include_consumed=True)
+        after_events = self.storage.profile_events.list_user_profile_events(self.user_id, include_consumed=True)
 
         self.assertEqual(len([event for event in before_events if event["event_type"] == "liked"]), 1)
         self.assertIn("RAG retrieval optimization", profile["positive_topics"])
         self.assertTrue(all(event["consumed_by_job_id"] for event in after_events))
-        self.assertEqual(self.db_service.get_user_profile_dirty_event_count(self.user_id), 0)
+        self.assertEqual(self.storage.profile_events.get_user_profile_dirty_event_count(self.user_id), 0)
         self.assertIn("read", {event["event_type"] for event in after_events})
 
     def test_manual_profile_updates_emit_manual_events(self) -> None:
-        self.db_service.upsert_user_manual_profile(
+        self.storage.research_profiles.upsert_user_manual_profile(
             self.user_id,
             {
                 "positive_topics": ["manual retrieval topic"],
                 "preferred_answer_style": "concise",
             },
         )
-        self.db_service.patch_user_manual_profile(
+        self.storage.research_profiles.patch_user_manual_profile(
             self.user_id,
             {
                 "positive_topics": [],
@@ -591,7 +606,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
             },
         )
 
-        events = self.db_service.list_user_profile_events(self.user_id)
+        events = self.storage.profile_events.list_user_profile_events(self.user_id)
         event_types = [event["event_type"] for event in events]
 
         self.assertIn("manual_topic_added", event_types)
@@ -599,8 +614,8 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIn("manual_style_updated", event_types)
 
     def test_legacy_dirty_topics_do_not_migrate_into_new_profile_layers(self) -> None:
-        with self.db_service._get_connection() as conn:
-            self.db_service._upsert_legacy_research_profile_cache(
+        with self.storage.connection_provider.connect() as conn:
+            self.storage.research_profiles._upsert_legacy_research_profile_cache(
                 conn,
                 "legacy-user",
                 {
@@ -611,9 +626,9 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 },
             )
             conn.commit()
-            self.db_service._migrate_legacy_research_profiles(conn)
+            self.storage.research_profiles._migrate_legacy_research_profiles(conn)
 
-        layers = self.db_service.get_user_profile_layers("legacy-user")
+        layers = self.storage.research_profiles.get_user_profile_layers("legacy-user")
 
         self.assertEqual(layers["manual_profile"]["positive_topics"], ["manual retrieval topic"])
         self.assertEqual(layers["manual_profile"]["negative_topics"], ["diffusion models"])
@@ -642,8 +657,8 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
             }
             """
         )
-        service = MemoryService(db_service=self.db_service, generation_service=fake_llm)
-        self.db_service.add_paper(
+        service = self._make_memory_service(generation_service=fake_llm)
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": "2401.00410",
                 "title": "RAG Retrieval Optimization for Long-Context Reasoning Agents",
@@ -654,11 +669,11 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00410",
             }
         )
-        self.db_service.add_liked_paper(self.user_id, "2401.00410")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00410")
 
         profile = service.rebuild_user_research_profile(self.user_id)
         repeated = service.rebuild_user_research_profile(self.user_id)
-        card = self.db_service.get_paper_profile_evidence("2401.00410")
+        card = self.storage.paper_profile_evidence.get_paper_profile_evidence("2401.00410")
 
         self.assertEqual(fake_llm.call_count, 1)
         self.assertTrue(card["schema_valid"])
@@ -669,8 +684,8 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
 
     def test_invalid_llm_evidence_card_records_error_and_does_not_use_title_ngrams(self) -> None:
         fake_llm = FakeEvidenceGenerationService("not json")
-        service = MemoryService(db_service=self.db_service, generation_service=fake_llm)
-        self.db_service.add_paper(
+        service = self._make_memory_service(generation_service=fake_llm)
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": "2401.00411",
                 "title": "A Complete Paper Title That Should Not Become Topic",
@@ -681,10 +696,10 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00411",
             }
         )
-        self.db_service.add_liked_paper(self.user_id, "2401.00411")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00411")
 
         profile = service.rebuild_user_research_profile(self.user_id)
-        card = self.db_service.get_paper_profile_evidence("2401.00411")
+        card = self.storage.paper_profile_evidence.get_paper_profile_evidence("2401.00411")
 
         self.assertFalse(card["schema_valid"])
         self.assertIn("llm_output_not_json", card["error_message"])
@@ -713,8 +728,8 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
             }
             """
         )
-        service = MemoryService(db_service=self.db_service, generation_service=fake_llm)
-        self.db_service.add_paper(
+        service = self._make_memory_service(generation_service=fake_llm)
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": "2401.00420",
                 "title": "Memory Systems for Agents",
@@ -725,7 +740,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00420",
             }
         )
-        self.db_service.add_liked_paper(self.user_id, "2401.00420")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00420")
 
         profile = service.rebuild_user_research_profile(self.user_id)
         canonical = profile["canonical_topics"][0]
@@ -740,14 +755,14 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(profile["normalizer_version"], "profile_normalizer_v1")
 
     def test_manual_hidden_and_pinned_topics_affect_effective_profile(self) -> None:
-        self.db_service.upsert_user_manual_profile(
+        self.storage.research_profiles.upsert_user_manual_profile(
             self.user_id,
             {
                 "pinned_topics": ["manual agent memory"],
                 "hidden_topics": ["RAG retrieval optimization"],
             },
         )
-        self.db_service.add_paper(
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": "2401.00430",
                 "title": "RAG Systems",
@@ -758,10 +773,10 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00430",
             }
         )
-        self.db_service.add_liked_paper(self.user_id, "2401.00430")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00430")
 
         profile = self.memory_service.rebuild_user_research_profile(self.user_id)
-        events = self.db_service.list_user_profile_events(self.user_id, include_consumed=True)
+        events = self.storage.profile_events.list_user_profile_events(self.user_id, include_consumed=True)
         event_types = {event["event_type"] for event in events}
 
         self.assertIn("manual agent memory", profile["positive_topics"])
@@ -790,8 +805,8 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIn("selected_paper", debug_payload["frontend_context_keys"])
         self.assertEqual(debug_payload["extra"]["source"], "test")
 
-    def test_db_exception_falls_back_to_safe_empty_memory_summary(self) -> None:
-        with mock.patch.object(self.db_service, "_get_connection", side_effect=RuntimeError("db boom")):
+    def test_storage_exception_falls_back_to_safe_empty_memory_summary(self) -> None:
+        with mock.patch.object(self.storage.connection_provider, "connect", side_effect=RuntimeError("db boom")):
             profile = self.memory_service.load_user_profile(self.user_id)
             summary = self.memory_service.load_preference_summary(self.user_id)
 

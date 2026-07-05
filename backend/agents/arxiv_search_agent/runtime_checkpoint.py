@@ -7,7 +7,7 @@ import pickle
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
-from services.storage.database_service import DatabaseService
+from services.storage.sqlite.stores import AgentRuntimeCheckpointStore, LangGraphCheckpointStore
 from utils.config import get_agent_runtime_checkpoint_config
 
 try:  # pragma: no cover - 真实 LangGraph 环境才会走到这些类型
@@ -173,18 +173,18 @@ class SqliteAgentCheckpointer(BaseCheckpointSaver):  # type: ignore[misc]
     过期和终态语义由 AgentRuntimeCheckpointManager 单独维护，避免把两类状态混在一起。
     """
 
-    def __init__(self, database_service: Optional[DatabaseService] = None) -> None:
+    def __init__(self, langgraph_checkpoint_store: LangGraphCheckpointStore) -> None:
         try:
             super().__init__()  # type: ignore[misc]
         except TypeError:
             pass
-        self.database_service = database_service or DatabaseService()
+        self.langgraph_checkpoint_store = langgraph_checkpoint_store
 
     def get_tuple(self, config: Mapping[str, Any]) -> Any:
         thread_id = _thread_id_from_config(config)
         if not thread_id:
             return None
-        row = self.database_service.get_langgraph_checkpoint(
+        row = self.langgraph_checkpoint_store.get_langgraph_checkpoint(
             thread_id=thread_id,
             checkpoint_ns=_checkpoint_ns_from_config(config),
             checkpoint_id=_checkpoint_id_from_config(config),
@@ -211,7 +211,7 @@ class SqliteAgentCheckpointer(BaseCheckpointSaver):  # type: ignore[misc]
         thread_id = _thread_id_from_config(config)
         if not thread_id:
             return iter(())
-        rows = self.database_service.list_langgraph_checkpoints(
+        rows = self.langgraph_checkpoint_store.list_langgraph_checkpoints(
             thread_id=thread_id,
             checkpoint_ns=_checkpoint_ns_from_config(config),
             limit=limit or 10,
@@ -232,7 +232,7 @@ class SqliteAgentCheckpointer(BaseCheckpointSaver):  # type: ignore[misc]
         if not thread_id or not checkpoint_id:
             return dict(config or {})
         parent_id = _checkpoint_id_from_config(config)
-        self.database_service.put_langgraph_checkpoint(
+        self.langgraph_checkpoint_store.put_langgraph_checkpoint(
             thread_id=thread_id,
             checkpoint_ns=checkpoint_ns,
             checkpoint_id=checkpoint_id,
@@ -258,7 +258,7 @@ class SqliteAgentCheckpointer(BaseCheckpointSaver):  # type: ignore[misc]
             {"channel": channel, "value": _pack_pickle(value)}
             for channel, value in list(writes or [])
         ]
-        self.database_service.put_langgraph_checkpoint_writes(
+        self.langgraph_checkpoint_store.put_langgraph_checkpoint_writes(
             thread_id=thread_id,
             checkpoint_ns=_checkpoint_ns_from_config(config),
             checkpoint_id=checkpoint_id,
@@ -301,8 +301,8 @@ class AgentRuntimeCheckpointManager:
     不读取 agent_sessions.pending_action/debug，避免展示态或排查快照反向驱动真实恢复。
     """
 
-    def __init__(self, database_service: Optional[DatabaseService] = None) -> None:
-        self.database_service = database_service or DatabaseService()
+    def __init__(self, runtime_checkpoint_store: AgentRuntimeCheckpointStore) -> None:
+        self.runtime_checkpoint_store = runtime_checkpoint_store
         self.config = get_agent_runtime_checkpoint_config()
 
     @property
@@ -314,11 +314,11 @@ class AgentRuntimeCheckpointManager:
         return max(int(self.config.get("cleanup_retention_days") or 0), 1)
 
     def expire_and_cleanup(self) -> None:
-        self.database_service.expire_agent_runtime_checkpoints(now=_iso(_utcnow()))
+        self.runtime_checkpoint_store.expire_agent_runtime_checkpoints(now=_iso(_utcnow()))
         # LangGraph 原始 checkpoint 跟随业务 runtime checkpoint 生命周期清理；
         # 先删 graph 记录，再删 runtime 记录，避免丢失 thread_id 对齐依据。
-        self.database_service.cleanup_langgraph_checkpoints_for_terminal_runtime(retention_days=self.cleanup_retention_days)
-        self.database_service.cleanup_agent_runtime_checkpoints(retention_days=self.cleanup_retention_days)
+        self.runtime_checkpoint_store.cleanup_langgraph_checkpoints_for_terminal_runtime(retention_days=self.cleanup_retention_days)
+        self.runtime_checkpoint_store.cleanup_agent_runtime_checkpoints(retention_days=self.cleanup_retention_days)
 
     def persist_state(self, state: Any, *, current_node: Optional[str] = None, next_route: Optional[str] = None) -> None:
         payload = _state_payload(state)
@@ -333,7 +333,7 @@ class AgentRuntimeCheckpointManager:
         expires_at = _iso(_utcnow() + timedelta(seconds=self.ttl_seconds)) if status == CHECKPOINT_STATUS_WAITING else None
         error_summary = _extract_error_summary(payload)
         if _is_consumed_confirmation_replay(
-            self.database_service,
+            self.runtime_checkpoint_store,
             user_id=user_id,
             session_id=session_id,
             thread_id=session_id,
@@ -341,7 +341,7 @@ class AgentRuntimeCheckpointManager:
             pending_confirmation=pending_confirmation,
         ):
             return
-        self.database_service.upsert_agent_runtime_checkpoint(
+        self.runtime_checkpoint_store.upsert_agent_runtime_checkpoint(
             user_id=user_id,
             session_id=session_id,
             thread_id=session_id,
@@ -367,8 +367,8 @@ class AgentRuntimeCheckpointManager:
         thread_id: str,
         resume_payload: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        self.database_service.expire_agent_runtime_checkpoints(now=_iso(_utcnow()))
-        checkpoint = self.database_service.get_agent_runtime_checkpoint(
+        self.runtime_checkpoint_store.expire_agent_runtime_checkpoints(now=_iso(_utcnow()))
+        checkpoint = self.runtime_checkpoint_store.get_agent_runtime_checkpoint(
             user_id=str(user_id or "").strip(),
             session_id=session_id,
             thread_id=thread_id,
@@ -409,31 +409,18 @@ class AgentRuntimeCheckpointManager:
         Command(resume) 前抢占同一条 pending_confirmation。抢占失败说明它已经被
         另一个请求消费，当前请求必须停止，不能再创建新的确认或重复执行工具。
         """
-        consume = getattr(self.database_service, "consume_agent_runtime_pending_confirmation", None)
-        if callable(consume):
-            consumed = bool(
-                consume(
-                    user_id=str(user_id or "").strip(),
-                    session_id=session_id,
-                    thread_id=thread_id,
-                    next_route=CHECKPOINT_STATUS_RUNNING,
-                    decision=str(resume_payload.get("decision") or "").strip().lower(),
-                    step_id=str(resume_payload.get("step_id") or "").strip(),
-                    tool_name=str(resume_payload.get("tool_name") or "").strip(),
-                    pending_action_id=str(resume_payload.get("pending_action_id") or "").strip(),
-                )
+        consumed = bool(
+            self.runtime_checkpoint_store.consume_agent_runtime_pending_confirmation(
+                user_id=str(user_id or "").strip(),
+                session_id=session_id,
+                thread_id=thread_id,
+                next_route=CHECKPOINT_STATUS_RUNNING,
+                decision=str(resume_payload.get("decision") or "").strip().lower(),
+                step_id=str(resume_payload.get("step_id") or "").strip(),
+                tool_name=str(resume_payload.get("tool_name") or "").strip(),
+                pending_action_id=str(resume_payload.get("pending_action_id") or "").strip(),
             )
-        else:  # pragma: no cover - 仅兼容极旧测试桩，真实 DatabaseService 走上面的原子更新。
-            consumed = bool(
-                self.database_service.mark_agent_runtime_checkpoint_status(
-                    user_id=str(user_id or "").strip(),
-                    session_id=session_id,
-                    thread_id=thread_id,
-                    status=CHECKPOINT_STATUS_RUNNING,
-                    error_summary="",
-                    clear_pending_confirmation=True,
-                )
-            )
+        )
         if not consumed:
             raise AgentRuntimeCheckpointError(thread_id=thread_id, reason="confirmation_already_consumed")
         logger.info(
@@ -451,7 +438,7 @@ class AgentRuntimeCheckpointManager:
         session_id = str(payload.get("session_id") or "").strip()
         if not session_id:
             return
-        updated = self.database_service.mark_agent_runtime_checkpoint_status(
+        updated = self.runtime_checkpoint_store.mark_agent_runtime_checkpoint_status(
             user_id=str(payload.get("user_id") or "").strip(),
             session_id=session_id,
             thread_id=session_id,
@@ -463,7 +450,7 @@ class AgentRuntimeCheckpointManager:
             return
         # 普通非确认请求可能此前没有等待现场；这里补一条终态 checkpoint，保证 completed/failed/cancelled
         # 都有可查询记录，同时不引入 pending_confirmation。
-        self.database_service.upsert_agent_runtime_checkpoint(
+        self.runtime_checkpoint_store.upsert_agent_runtime_checkpoint(
             user_id=str(payload.get("user_id") or "").strip(),
             session_id=session_id,
             thread_id=session_id,
@@ -487,7 +474,7 @@ class AgentRuntimeCheckpointError(RuntimeError):
         super().__init__(f"Agent runtime checkpoint 不可恢复，thread_id={thread_id}，reason={reason}")
 
 
-def build_agent_checkpointer(database_service: Optional[DatabaseService] = None) -> Any:
+def build_agent_checkpointer(*, langgraph_checkpoint_store: Optional[LangGraphCheckpointStore] = None) -> Any:
     config = get_agent_runtime_checkpoint_config()
     backend = str(config.get("backend") or "sqlite").strip().lower()
     if backend == "memory":
@@ -495,7 +482,9 @@ def build_agent_checkpointer(database_service: Optional[DatabaseService] = None)
             raise RuntimeError("AGENT_RUNTIME_CHECKPOINT_BACKEND=memory requires langgraph InMemorySaver")
         logger.warning("arxiv_agent 使用内存 checkpointer，仅适合开发环境；生产环境应使用 sqlite。")
         return InMemorySaver()
-    return SqliteAgentCheckpointer(database_service=database_service)
+    if langgraph_checkpoint_store is None:
+        raise RuntimeError("sqlite agent checkpointer requires langgraph_checkpoint_store")
+    return SqliteAgentCheckpointer(langgraph_checkpoint_store=langgraph_checkpoint_store)
 
 
 def _state_payload(state: Any) -> Dict[str, Any]:
@@ -541,7 +530,7 @@ def _status_from_state(payload: Mapping[str, Any], *, pending_confirmation: Opti
 
 
 def _is_consumed_confirmation_replay(
-    database_service: Any,
+    runtime_checkpoint_store: Any,
     *,
     user_id: str,
     session_id: str,
@@ -555,10 +544,11 @@ def _is_consumed_confirmation_replay(
     pending_step_id = str(pending_confirmation.get("step_id") or "").strip()
     if not pending_step_id:
         return False
-    get_checkpoint = getattr(database_service, "get_agent_runtime_checkpoint", None)
-    if not callable(get_checkpoint):
-        return False
-    existing = get_checkpoint(user_id=user_id, session_id=session_id, thread_id=thread_id)
+    existing = runtime_checkpoint_store.get_agent_runtime_checkpoint(
+        user_id=user_id,
+        session_id=session_id,
+        thread_id=thread_id,
+    )
     if not isinstance(existing, Mapping):
         return False
     if str(existing.get("status") or "").strip() != CHECKPOINT_STATUS_RUNNING:

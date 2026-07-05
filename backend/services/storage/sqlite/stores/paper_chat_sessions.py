@@ -2,10 +2,11 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from services.storage.database.shared import DEFAULT_USER_ID, logger
+from services.storage.sqlite.base import BaseSqliteStore
+from services.storage.sqlite.shared import DEFAULT_USER_ID, logger
 
 
-class PaperChatSessionMixin:
+class PaperChatSessionStore(BaseSqliteStore):
     """维护论文问答会话的基础 CRUD；消息写入和 QA turn 事务仍留在消息流程。"""
 
     def _ensure_paper_chat_session_summary_columns(self, conn):
@@ -164,3 +165,51 @@ class PaperChatSessionMixin:
             summary_last_turn_id=str(summary_last_turn_id or "").strip() or None,
             summary_updated_at=summary_updated_at or datetime.now(timezone.utc).isoformat(),
         )
+
+    def delete_paper_chat_session(self, session_id: str, user_id: str = DEFAULT_USER_ID) -> bool:
+        try:
+            normalized_session_id = str(session_id or "").strip()
+            normalized_user_id = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+            if not normalized_session_id:
+                return False
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT 1 FROM paper_chat_sessions
+                    WHERE session_id = ? AND user_id = ?
+                    ''',
+                    (normalized_session_id, normalized_user_id),
+                )
+                if not cursor.fetchone():
+                    return False
+
+                # 不依赖连接级 foreign_keys 开关：会话删除必须稳定清掉消息，并保留笔记内容本身。
+                cursor.execute(
+                    '''
+                    DELETE FROM paper_chat_messages
+                    WHERE session_id = ?
+                    ''',
+                    (normalized_session_id,),
+                )
+                cursor.execute(
+                    '''
+                    UPDATE paper_notes
+                    SET session_id = NULL
+                    WHERE session_id = ? AND user_id = ?
+                    ''',
+                    (normalized_session_id, normalized_user_id),
+                )
+                cursor.execute(
+                    '''
+                    DELETE FROM paper_chat_sessions
+                    WHERE session_id = ? AND user_id = ?
+                    ''',
+                    (normalized_session_id, normalized_user_id),
+                )
+                deleted = cursor.rowcount > 0
+                conn.commit()
+                return deleted
+        except Exception as e:
+            logger.error(f"Error deleting paper chat session: {str(e)}")
+            return False

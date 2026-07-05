@@ -20,7 +20,8 @@ from langgraph.types import Command
 from core.errors import ErrorCode, make_error_payload
 from services.context_lifecycle import ContextLifecycleService
 from services.memory import MemoryService
-from services.storage.database_service import DatabaseService
+from services.storage.sqlite import StorageContainer
+from services.storage.sqlite.stores import AgentRuntimeCheckpointStore, LangGraphCheckpointStore
 from utils.config import get_memory_runtime_config
 from utils.logging_utils import RequestTrace, info_event
 
@@ -93,6 +94,24 @@ def _write_request_trace(trace: RequestTrace, *, reason: str) -> Optional[str]:
     return trace_path
 
 
+def _build_memory_service(storage: StorageContainer) -> MemoryService:
+    """Agent 入口负责把存储容器拆成具体 Store，业务服务不接收万能数据库对象。"""
+    return MemoryService(
+        paper_catalog_store=storage.paper_catalog,
+        user_preference_store=storage.user_preferences,
+        interest_vector_store=storage.interest_vectors,
+        paper_profile_evidence_store=storage.paper_profile_evidence,
+        paper_chat_session_store=storage.paper_chat_sessions,
+        paper_chat_message_store=storage.paper_chat_messages,
+        paper_note_store=storage.paper_notes,
+        profile_event_store=storage.profile_events,
+        profile_build_job_store=storage.profile_build_jobs,
+        research_profile_store=storage.research_profiles,
+        agent_session_store=storage.agent_sessions,
+        generation_service=_resolve_generation_service(),
+    )
+
+
 def _build_langgraph_config(thread_id: str) -> Dict[str, Any]:
     """构建 LangGraph 运行配置。
 
@@ -127,25 +146,25 @@ def _build_resume_payload(resume: ResumeRequest) -> Dict[str, Any]:
     return payload
 
 
-def _build_runtime_checkpoint_manager(database_service: Optional[DatabaseService] = None) -> AgentRuntimeCheckpointManager:
+def _build_runtime_checkpoint_manager(runtime_checkpoint_store: AgentRuntimeCheckpointStore) -> AgentRuntimeCheckpointManager:
     """创建业务 runtime checkpoint 管理器。
 
     管理器只负责可恢复现场的持久化和校验，不读取 agent_sessions.pending_action，
     避免前端展示镜像反向驱动真实恢复。
     """
-    return AgentRuntimeCheckpointManager(database_service=database_service or DatabaseService())
+    return AgentRuntimeCheckpointManager(runtime_checkpoint_store=runtime_checkpoint_store)
 
 
 def _build_agent_context_lifecycle_debug(
     *,
-    database_service: DatabaseService,
+    runtime_checkpoint_store: AgentRuntimeCheckpointStore,
     user_id: Optional[str],
     session_id: str,
     user_memory_debug: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """构造 Agent 本轮上下文健康度，不读取完整 checkpoint 或消息正文。"""
     context_merge_debug = dict((user_memory_debug or {}).get("context_merge") or {})
-    return ContextLifecycleService(db_service=database_service).build_agent_health_debug(
+    return ContextLifecycleService(agent_runtime_checkpoint_store=runtime_checkpoint_store).build_agent_health_debug(
         user_id=str(user_id or "").strip(),
         session_id=session_id,
         context_merge_debug=context_merge_debug,
@@ -156,10 +175,19 @@ def _build_agent_context_lifecycle_debug(
     )
 
 
-def _build_agent_graph(generation_service: Optional[Any] = None, database_service: Optional[DatabaseService] = None) -> Any:
+def _build_agent_graph(
+    generation_service: Optional[Any] = None,
+    *,
+    langgraph_checkpoint_store: LangGraphCheckpointStore,
+    runtime_checkpoint_store: AgentRuntimeCheckpointStore,
+) -> Any:
     """构建带持久化 checkpointer 的 Agent 图。"""
-    checkpointer = build_agent_checkpointer(database_service=database_service or DatabaseService())
-    return build_arxiv_search_graph(generation_service=generation_service, checkpointer=checkpointer)
+    checkpointer = build_agent_checkpointer(langgraph_checkpoint_store=langgraph_checkpoint_store)
+    return build_arxiv_search_graph(
+        generation_service=generation_service,
+        checkpointer=checkpointer,
+        runtime_checkpoint_store=runtime_checkpoint_store,
+    )
 
 
 def _ensure_resume_checkpoint(
@@ -268,7 +296,12 @@ def _load_graph_snapshot_state(graph: Any, thread_id: str) -> Optional[AgentStat
         return None
 
 
-def _inject_user_memory_context(request_context: Dict[str, Any], user_id: Optional[str]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+def _inject_user_memory_context(
+    request_context: Dict[str, Any],
+    user_id: Optional[str],
+    *,
+    memory_service: MemoryService,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
     """加载统一的 user_memory_summary，并兼容保留 research_profile 字段。"""
     enriched_context = dict(request_context or {})
     normalized_user_id = str(user_id or "").strip()
@@ -282,7 +315,6 @@ def _inject_user_memory_context(request_context: Dict[str, Any], user_id: Option
         return enriched_context, debug_flags
 
     try:
-        memory_service = MemoryService()
         user_memory_summary = memory_service.build_user_memory_summary(normalized_user_id)
         enriched_context["user_memory_summary"] = user_memory_summary
         if not enriched_context.get("research_profile"):
@@ -300,7 +332,7 @@ def _inject_user_memory_context(request_context: Dict[str, Any], user_id: Option
         logger.warning("Failed to load user memory summary for agent context: user_id=%s error=%s", normalized_user_id, exc)
         if not enriched_context.get("research_profile") and bool(MEMORY_RUNTIME_CONFIG.get("enable_user_research_profile", False)):
             try:
-                profile = DatabaseService().get_user_research_profile(user_id=normalized_user_id)
+                profile = memory_service.load_user_profile(normalized_user_id)
             except Exception:
                 profile = {}
             if isinstance(profile, dict) and profile:
@@ -313,13 +345,16 @@ def _inject_user_memory_context(request_context: Dict[str, Any], user_id: Option
 
 def _load_agent_request_context(
     normalized_request: ArxivSearchRequest,
+    *,
+    memory_service: MemoryService,
 ) -> tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[str], Dict[str, Any]]:
     frontend_context, user_memory_debug = _inject_user_memory_context(
         dict(normalized_request.context or {}),
         normalized_request.user_id,
+        memory_service=memory_service,
     )
     try:
-        memory_payload = MemoryService().load_agent_memory(
+        memory_payload = memory_service.load_agent_memory(
             normalized_request.user_id,
             normalized_request.session_id,
             frontend_context=frontend_context,
@@ -344,10 +379,10 @@ def _backend_context_value(memory_payload: Optional[Mapping[str, Any]], key: str
     return backend_memory.get(key)
 
 
-def _persist_agent_session_memory(final_state: Any) -> None:
+def _persist_agent_session_memory(final_state: Any, *, memory_service: MemoryService) -> None:
     state = _coerce_state(final_state)
     try:
-        MemoryService().save_agent_memory(
+        memory_service.save_agent_memory(
             user_id=state.user_id,
             session_id=state.session_id,
             final_state=state,
@@ -485,7 +520,7 @@ def _mark_runtime_checkpoint_failed(
     if not normalized_session_id:
         return
     try:
-        checkpoint_manager.database_service.mark_agent_runtime_checkpoint_status(
+        checkpoint_manager.runtime_checkpoint_store.mark_agent_runtime_checkpoint_status(
             user_id=str(user_id or "").strip(),
             session_id=normalized_session_id,
             thread_id=normalized_session_id,
@@ -547,8 +582,13 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
         trace.input = normalized_request.message
         trace.user_id = normalized_request.user_id
 
+        storage = StorageContainer()
+        memory_service = _build_memory_service(storage)
         # 第 2 步：把前端 context 与后端 Agent session memory 合并。
-        request_context, agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(normalized_request)
+        request_context, agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(
+            normalized_request,
+            memory_service=memory_service,
+        )
         resolved_session_id = _ensure_session_id(resolved_session_id)
         trace.session_id = resolved_session_id
         graph_config = _build_langgraph_config(resolved_session_id)
@@ -566,17 +606,20 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
         )
         trace.add_event("arxiv_agent.request_start", session_id=resolved_session_id, user_id=normalized_request.user_id)
         # 第 3 步：解析生成服务，并统一构造图对象。
-        database_service = DatabaseService()
-        checkpoint_manager = _build_runtime_checkpoint_manager(database_service)
+        checkpoint_manager = _build_runtime_checkpoint_manager(storage.agent_runtime_checkpoints)
         checkpoint_manager.expire_and_cleanup()
         user_memory_debug["context_lifecycle"] = _build_agent_context_lifecycle_debug(
-            database_service=database_service,
+            runtime_checkpoint_store=storage.agent_runtime_checkpoints,
             user_id=normalized_request.user_id,
             session_id=resolved_session_id,
             user_memory_debug=user_memory_debug,
         )
         generation_service = _resolve_generation_service()
-        graph = _build_agent_graph(generation_service=generation_service, database_service=database_service)
+        graph = _build_agent_graph(
+            generation_service=generation_service,
+            langgraph_checkpoint_store=storage.langgraph_checkpoints,
+            runtime_checkpoint_store=storage.agent_runtime_checkpoints,
+        )
 
         if _is_resume_request(normalized_request):
             # resume 路径必须复用同一个 thread_id，并直接从 interrupt 位置恢复，
@@ -626,7 +669,7 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
 
         _persist_runtime_checkpoint_after_turn(checkpoint_manager, final_state, is_resume=_is_resume_request(normalized_request))
         # 第 5 步：把跨轮 Agent memory 回写到后端 session。
-        _persist_agent_session_memory(final_state)
+        _persist_agent_session_memory(final_state, memory_service=memory_service)
 
         # 第 6 步：把内部状态转换成对外响应模型。
         final_response = _state_to_response(final_state)
@@ -766,8 +809,13 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
         current_state: Optional[AgentState] = None
 
         try:
+            storage = StorageContainer()
+            memory_service = _build_memory_service(storage)
             # 阶段 B：构造与同步入口一致的初始上下文和状态，保证两条路径行为一致。
-            request_context, agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(normalized_request)
+            request_context, agent_memory_payload, resolved_session_id, user_memory_debug = _load_agent_request_context(
+                normalized_request,
+                memory_service=memory_service,
+            )
             resolved_session_id = _ensure_session_id(resolved_session_id)
             trace.session_id = resolved_session_id
             trace.user_id = normalized_request.user_id
@@ -785,17 +833,20 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 selected_arxiv_id=_safe_selected_arxiv_id(request_context),
             )
             trace.add_event("arxiv_agent.stream_start", session_id=resolved_session_id, user_id=normalized_request.user_id)
-            database_service = DatabaseService()
-            checkpoint_manager = _build_runtime_checkpoint_manager(database_service)
+            checkpoint_manager = _build_runtime_checkpoint_manager(storage.agent_runtime_checkpoints)
             checkpoint_manager.expire_and_cleanup()
             user_memory_debug["context_lifecycle"] = _build_agent_context_lifecycle_debug(
-                database_service=database_service,
+                runtime_checkpoint_store=storage.agent_runtime_checkpoints,
                 user_id=normalized_request.user_id,
                 session_id=resolved_session_id,
                 user_memory_debug=user_memory_debug,
             )
             generation_service = _resolve_generation_service()
-            graph = _build_agent_graph(generation_service=generation_service, database_service=database_service)
+            graph = _build_agent_graph(
+                generation_service=generation_service,
+                langgraph_checkpoint_store=storage.langgraph_checkpoints,
+                runtime_checkpoint_store=storage.agent_runtime_checkpoints,
+            )
             graph_input: Any
 
             resume_payload: Optional[Dict[str, Any]] = None
@@ -960,7 +1011,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
             # 阶段 E：整张图执行完成后，输出最终聚合响应和结束事件。
             if current_state is not None:
                 _persist_runtime_checkpoint_after_turn(checkpoint_manager, current_state, is_resume=_is_resume_request(normalized_request))
-                _persist_agent_session_memory(current_state)
+                _persist_agent_session_memory(current_state, memory_service=memory_service)
             final_response = _state_to_response(current_state)
             trace.set_output(final_response.model_dump())
             trace.add_event(

@@ -2,11 +2,26 @@ import sqlite3
 import uuid
 from typing import Any, Dict, List, Optional
 
-from services.storage.database.shared import DEFAULT_USER_ID, logger
+from services.storage.sqlite.base import BaseSqliteStore
+from services.storage.sqlite.shared import DEFAULT_USER_ID, logger
+from services.storage.sqlite.stores.paper_chat_sessions import PaperChatSessionStore
+from services.storage.sqlite.stores.profile_events import ProfileEventStore
 
 
-class PaperChatMessageMixin:
+class PaperChatMessageStore(BaseSqliteStore):
     """维护论文问答消息生命周期；双消息 QA turn 的原子写入仍由主流程单独处理。"""
+
+    def __init__(self, connection_provider, session_store: PaperChatSessionStore, profile_event_store: ProfileEventStore) -> None:
+        super().__init__(connection_provider)
+        self.session_store = session_store
+        self.profile_event_store = profile_event_store
+
+    def record_user_profile_event(self, *args, **kwargs):
+        """消息写入只负责记录弱信号，具体事件去重和状态流转交给画像事件 Store。"""
+        return self.profile_event_store.record_user_profile_event(*args, **kwargs)
+
+    def _row_to_paper_chat_session(self, row: Any) -> Dict[str, Any]:
+        return self.session_store._row_to_paper_chat_session(row)
 
     def _row_to_paper_chat_message(self, row: Any) -> Dict[str, Any]:
         return {

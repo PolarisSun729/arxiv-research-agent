@@ -1,10 +1,11 @@
 import json
 from typing import Any, Dict, List, Optional
 
-from services.storage.database.shared import logger
+from services.storage.sqlite.base import BaseSqliteStore
+from services.storage.sqlite.shared import logger
 
 
-class PaperCatalogMixin:
+class PaperCatalogStore(BaseSqliteStore):
     """arxiv_papers 表的内部实现；只负责论文目录和 embedding 元数据引用。"""
 
     def add_paper(self, paper: Dict[str, Any]) -> bool:

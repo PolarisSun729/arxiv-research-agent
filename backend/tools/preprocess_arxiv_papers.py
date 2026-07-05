@@ -8,8 +8,8 @@ logger = logging.getLogger(__name__)
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-from services.storage.database_service import DatabaseService
 from services.embedding.embedding_service import EmbeddingService
+from services.storage.sqlite import StorageContainer
 from services.storage.vector_store_service import VectorStoreService
 
 PAPER_EMBEDDING_COLLECTION = "arxiv_paper_embeddings"
@@ -45,7 +45,8 @@ def get_published_date(paper: dict) -> str:
 def main():
     logger.info("Starting arXiv papers preprocessing...")
     
-    db_service = DatabaseService()
+    storage = StorageContainer()
+    paper_catalog_store = storage.paper_catalog
     embedding_service = EmbeddingService()
     vector_store_service = VectorStoreService()
     
@@ -69,7 +70,7 @@ def main():
             skipped_count += 1
             continue
         
-        existing_paper = db_service.get_paper(arxiv_id)
+        existing_paper = paper_catalog_store.get_paper(arxiv_id)
         if existing_paper:
             logger.debug(f"Skipping existing paper: {arxiv_id}")
             skipped_count += 1
@@ -107,7 +108,7 @@ def main():
                 metadata
             )
             
-            success = db_service.add_paper({
+            success = paper_catalog_store.add_paper({
                 'arxiv_id': arxiv_id,
                 'title': title,
                 'authors': authors,

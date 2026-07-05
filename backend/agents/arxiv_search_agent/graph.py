@@ -5,20 +5,20 @@ from typing import Any, Dict, Mapping, Optional
 
 from langgraph.graph import END, START, StateGraph
 
+from services.storage.sqlite.stores import AgentRuntimeCheckpointStore
+
 from .node import parse_search_request
 from .planner import GoalBuilder, build_executable_plan_for_goal, build_plan_runtime
 from .plan_executor import PlanExecutor
 from .research_task_profile import build_research_task_profile, research_task_profile_debug
-from .runtime_checkpoint import build_agent_checkpointer
 from .schemas import AgentRuntimeState, AgentStep, AgentTurnResult, ExecutablePlan, PlanRuntime, StepExecutionResult
 from .state import AgentState
 from .tool_registry import PLANNER_TOOL_REGISTRY
 
 logger = logging.getLogger(__name__)
 
-# 默认 checkpointer 走项目数据库持久化；只有通过 AGENT_RUNTIME_CHECKPOINT_BACKEND=memory 显式切换时，
-# 才会退回进程内开发模式，避免生产路径把 resume 真源绑死在单进程内存里。
-DEFAULT_GRAPH_CHECKPOINTER = build_agent_checkpointer()
+# 持久化 checkpointer 只能由组合根注入；模块导入期不创建数据库连接，避免隐藏存储装配。
+DEFAULT_GRAPH_CHECKPOINTER = None
 
 _ARXIV_GRAPH_NODE_NAMES = (
     "parse_search_request",
@@ -43,9 +43,12 @@ def _coerce_state(state: Any) -> AgentState:
     return AgentState.model_validate(state)
 
 
-def _executor() -> PlanExecutor:
+def _executor(runtime_checkpoint_store: Optional[AgentRuntimeCheckpointStore] = None) -> PlanExecutor:
     """统一创建执行器，图节点只关心编排，不直接触碰工具注册细节。"""
-    return PlanExecutor(tool_registry=PLANNER_TOOL_REGISTRY)
+    return PlanExecutor(
+        tool_registry=PLANNER_TOOL_REGISTRY,
+        runtime_checkpoint_store=runtime_checkpoint_store,
+    )
 
 
 def build_goal_node(state: Any, generation_service: Optional[Any] = None) -> AgentState:
@@ -119,12 +122,16 @@ def build_plan_node(state: Any) -> AgentState:
     return next_state
 
 
-def select_next_step_node(state: Any) -> AgentState:
+def select_next_step_node(
+    state: Any,
+    *,
+    runtime_checkpoint_store: Optional[AgentRuntimeCheckpointStore] = None,
+) -> AgentState:
     """只负责选择下一可执行 step，不调用工具。"""
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
     runtime = _ensure_runtime(next_state)
-    step = _executor().select_next_step(runtime, next_state)
+    step = _executor(runtime_checkpoint_store).select_next_step(runtime, next_state)
     next_state.plan_runtime = runtime
     next_state.runtime_state = _runtime_state_from_runtime(next_state, runtime)
     next_state.debug = dict(next_state.debug or {})
@@ -146,7 +153,11 @@ def select_next_step_node(state: Any) -> AgentState:
     return next_state
 
 
-def execute_step_node(state: Any) -> AgentState:
+def execute_step_node(
+    state: Any,
+    *,
+    runtime_checkpoint_store: Optional[AgentRuntimeCheckpointStore] = None,
+) -> AgentState:
     """只负责执行当前 step 对应工具。
 
     这里关闭 executor 的 auto_replan，让低质量结果留给图上的 replan 节点处理；
@@ -155,19 +166,23 @@ def execute_step_node(state: Any) -> AgentState:
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
     runtime = _ensure_runtime(next_state)
-    result = _executor().execute_current_step_tool(runtime, next_state, allow_interrupt=True)
+    result = _executor(runtime_checkpoint_store).execute_current_step_tool(runtime, next_state, allow_interrupt=True)
     next_state.plan_runtime = runtime
     next_state.runtime_state = _runtime_state_from_runtime(next_state, runtime)
     _apply_step_result(next_state, result)
     return next_state
 
 
-def observe_step_node(state: Any) -> AgentState:
+def observe_step_node(
+    state: Any,
+    *,
+    runtime_checkpoint_store: Optional[AgentRuntimeCheckpointStore] = None,
+) -> AgentState:
     """只负责把最近 observation 投影到结构化 runtime/debug，供条件边路由。"""
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
     runtime = _ensure_runtime(next_state)
-    result = _executor().observe_current_step(runtime, next_state)
+    result = _executor(runtime_checkpoint_store).observe_current_step(runtime, next_state)
     observation = dict(runtime.last_observation or {}) if isinstance(runtime.last_observation, Mapping) else None
     next_state.debug = dict(next_state.debug or {})
     next_state.debug["last_observation"] = observation
@@ -219,12 +234,16 @@ def route_after_observation_node(state: Any) -> AgentState:
     return next_state
 
 
-def replan_node(state: Any) -> AgentState:
+def replan_node(
+    state: Any,
+    *,
+    runtime_checkpoint_store: Optional[AgentRuntimeCheckpointStore] = None,
+) -> AgentState:
     """只负责根据 observation 执行重规划或兜底。"""
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
     runtime = _ensure_runtime(next_state)
-    turn_result = _executor().replan_after_observation(runtime, next_state)
+    turn_result = _executor(runtime_checkpoint_store).replan_after_observation(runtime, next_state)
     next_state.plan_runtime = runtime
     next_state.execution_plan = runtime.plan
     next_state.runtime_state = _runtime_state_from_runtime(next_state, runtime)
@@ -243,12 +262,16 @@ def replan_node(state: Any) -> AgentState:
     return next_state
 
 
-def finalize_node(state: Any) -> AgentState:
+def finalize_node(
+    state: Any,
+    *,
+    runtime_checkpoint_store: Optional[AgentRuntimeCheckpointStore] = None,
+) -> AgentState:
     """只负责把 runtime 汇总成对外响应所需的 AgentState 字段。"""
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
     runtime = _ensure_runtime(next_state)
-    turn_result = _executor().finalize_runtime(runtime)
+    turn_result = _executor(runtime_checkpoint_store).finalize_runtime(runtime)
     _apply_turn_result(next_state, turn_result)
     next_state.runtime_state = _runtime_state_from_runtime(next_state, runtime)
     next_state.steps = list(next_state.steps or []) + [
@@ -355,6 +378,7 @@ def build_arxiv_search_graph(
     generation_service: Optional[Any] = None,
     *,
     checkpointer: Optional[Any] = None,
+    runtime_checkpoint_store: Optional[AgentRuntimeCheckpointStore] = None,
 ) -> Any:
     """构建显式 Agent 执行环。
 
@@ -366,12 +390,12 @@ def build_arxiv_search_graph(
     graph.add_node("parse_search_request", lambda state: parse_search_request(state, generation_service=generation_service))
     graph.add_node("build_goal", lambda state: build_goal_node(state, generation_service=generation_service))
     graph.add_node("build_plan", build_plan_node)
-    graph.add_node("select_next_step", select_next_step_node)
-    graph.add_node("execute_step", execute_step_node)
-    graph.add_node("observe_step", observe_step_node)
+    graph.add_node("select_next_step", lambda state: select_next_step_node(state, runtime_checkpoint_store=runtime_checkpoint_store))
+    graph.add_node("execute_step", lambda state: execute_step_node(state, runtime_checkpoint_store=runtime_checkpoint_store))
+    graph.add_node("observe_step", lambda state: observe_step_node(state, runtime_checkpoint_store=runtime_checkpoint_store))
     graph.add_node("route_after_observation", route_after_observation_node)
-    graph.add_node("replan", replan_node)
-    graph.add_node("finalize", finalize_node)
+    graph.add_node("replan", lambda state: replan_node(state, runtime_checkpoint_store=runtime_checkpoint_store))
+    graph.add_node("finalize", lambda state: finalize_node(state, runtime_checkpoint_store=runtime_checkpoint_store))
     graph.add_node("error_finalize", error_finalize_node)
 
     graph.add_edge(START, "parse_search_request")

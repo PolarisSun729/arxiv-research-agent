@@ -28,7 +28,6 @@ def _load_search_node_module():
         sys.modules[package_name] = module
 
     dependencies_module = sys.modules.get("dependencies", types.ModuleType("dependencies"))
-    dependencies_module.get_database_service = getattr(dependencies_module, "get_database_service", lambda: object())
     dependencies_module.get_oai_database_service = getattr(
         dependencies_module,
         "get_oai_database_service",

@@ -20,7 +20,6 @@ DEPENDENCY_BAG = _DependencyBag()
 PUBLIC_STUB_MODULES = [
     "dependencies",
     "services.memory",
-    "services.storage.database_service",
     "tools.arxiv_tools",
     "tools.paper_qa_tools",
     "tools.recommendation_tools",
@@ -28,7 +27,9 @@ PUBLIC_STUB_MODULES = [
 
 
 class FakeMemoryService:
-    def __init__(self) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Agent 流程测试只验证编排行为；Store 依赖由生产入口传入，但这个轻量桩不消费它们。
+        del args, kwargs
         self.saved_payloads = []
 
     def build_user_memory_summary(self, _user_id: str) -> Dict[str, Any]:
@@ -59,7 +60,7 @@ class FakeMemoryService:
         return payload
 
 
-class FakeDatabaseService:
+class FakeAgentStorageStore:
     def get_user_research_profile(self, **_kwargs: Any) -> Dict[str, Any]:
         return {}
 
@@ -116,6 +117,27 @@ class FakeDatabaseService:
         }
 
 
+class FakeStorageContainer:
+    def __init__(self, store: Optional[FakeAgentStorageStore] = None) -> None:
+        self._store = store or FakeAgentStorageStore()
+        # Agent 集成测试只关心编排层是否把 Store 显式传下去；具体业务 Store 行为由专门存储测试覆盖。
+        self.paper_catalog = self._store
+        self.user_preferences = self._store
+        self.interest_vectors = self._store
+        self.paper_profile_evidence = self._store
+        self.paper_chat_sessions = self._store
+        self.paper_chat_messages = self._store
+        self.paper_notes = self._store
+        self.profile_events = self._store
+        self.profile_build_jobs = self._store
+        self.research_profiles = self._store
+        self.agent_sessions = self._store
+        self.paper_qa_index = self._store
+        self.paper_qa_turns = self._store
+        self.agent_runtime_checkpoints = self._store
+        self.langgraph_checkpoints = self._store
+
+
 def _ensure_backend_packages() -> Path:
     repo_root = Path(__file__).resolve().parents[2]
     backend_dir = repo_root
@@ -146,7 +168,6 @@ def _ensure_backend_packages() -> Path:
 
 def _ensure_dependency_stubs() -> None:
     dependencies_module = sys.modules.get("dependencies", types.ModuleType("dependencies"))
-    dependencies_module.get_database_service = getattr(dependencies_module, "get_database_service", lambda: None)
     dependencies_module.get_oai_database_service = getattr(dependencies_module, "get_oai_database_service", lambda: None)
     dependencies_module.get_embedding_service = getattr(dependencies_module, "get_embedding_service", lambda: None)
     dependencies_module.get_vector_store_service = getattr(dependencies_module, "get_vector_store_service", lambda: None)
@@ -165,7 +186,6 @@ def _ensure_dependency_stubs() -> None:
     dependencies_module.get_recommendation_service = lambda: DEPENDENCY_BAG.recommendation_service
     dependencies_module.get_paper_qa_service = lambda: DEPENDENCY_BAG.paper_qa_service
     dependencies_module.get_arxiv_search_backend = lambda: DEPENDENCY_BAG.arxiv_service
-    dependencies_module.get_database_service = getattr(dependencies_module, "get_database_service", lambda: None)
     dependencies_module.get_memory_service = getattr(dependencies_module, "get_memory_service", lambda: None)
     sys.modules["dependencies"] = dependencies_module
 
@@ -173,17 +193,6 @@ def _ensure_dependency_stubs() -> None:
         memory_module = sys.modules.get("services.memory", types.ModuleType("services.memory"))
         memory_module.MemoryService = FakeMemoryService
         sys.modules["services.memory"] = memory_module
-
-    if "services.storage.database_service" not in sys.modules:
-        database_service_module = types.ModuleType("services.storage.database_service")
-
-        class _PaperQATurnPersistenceError(RuntimeError):
-            pass
-
-        # Agent 测试只需要轻量数据库桩，但导出形状必须跟真实模块一致，避免影响同进程里的 QA 测试收集。
-        database_service_module.PaperQATurnPersistenceError = _PaperQATurnPersistenceError
-        database_service_module.DatabaseService = FakeDatabaseService
-        sys.modules["services.storage.database_service"] = database_service_module
 
     config_module = sys.modules.get("utils.config", types.ModuleType("utils.config"))
     if not hasattr(config_module, "get_memory_runtime_config"):
@@ -480,7 +489,6 @@ def load_agent_test_modules() -> Dict[str, Any]:
         "langgraph",
         "langgraph.graph",
         "services.memory",
-        "services.storage.database_service",
         "tools.arxiv_tools",
         "tools.paper_qa_tools",
         "tools.recommendation_tools",
@@ -576,6 +584,7 @@ def load_agent_test_modules() -> Dict[str, Any]:
 
     graph_module = _load_module("backend.agents.arxiv_search_agent.graph", agent_dir / "graph.py")
     service_module = _load_module("backend.agents.arxiv_search_agent.service", agent_dir / "service.py")
+    service_module.StorageContainer = FakeStorageContainer
     router_module = _load_module("backend.routers.agent_router", routers_dir / "agent_router.py")
 
     package_module = sys.modules["backend.agents.arxiv_search_agent"]
@@ -602,7 +611,8 @@ def load_agent_test_modules() -> Dict[str, Any]:
 
 __all__ = [
     "DEPENDENCY_BAG",
-    "FakeDatabaseService",
+    "FakeAgentStorageStore",
+    "FakeStorageContainer",
     "FakeMemoryService",
     "load_agent_test_modules",
 ]

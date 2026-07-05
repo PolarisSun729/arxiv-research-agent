@@ -2,7 +2,7 @@ import logging
 
 from utils.config import get_default_user_id
 
-logger = logging.getLogger("services.storage.database_service")
+logger = logging.getLogger("services.storage.sqlite")
 
 DEFAULT_USER_ID = get_default_user_id()
 

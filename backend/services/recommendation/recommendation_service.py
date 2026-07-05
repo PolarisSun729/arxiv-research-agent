@@ -13,8 +13,15 @@ from services.arxiv.arxiv_search_service import ArxivSearchService
 from services.memory import MemoryService
 from services.memory.concept_normalizer import ConceptNormalizer
 from services.memory.paper_evidence_extractor import PAPER_EVIDENCE_EXTRACTOR_VERSION
-from services.storage.database_service import DatabaseService
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
+from services.storage.sqlite.stores import (
+    InterestVectorStore,
+    PaperCatalogStore,
+    PaperProfileEvidenceStore,
+    ProfileEventStore,
+    ResearchProfileStore,
+    UserPreferenceStore,
+)
 from services.storage.vector_store_service import VectorStoreService
 from utils.config import (
     get_memory_runtime_config,
@@ -44,19 +51,29 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
 
     def __init__(
         self,
-        db_service: DatabaseService,
+        paper_catalog_store: PaperCatalogStore,
+        user_preference_store: UserPreferenceStore,
+        interest_vector_store: InterestVectorStore,
+        paper_profile_evidence_store: PaperProfileEvidenceStore,
+        research_profile_store: ResearchProfileStore,
+        profile_event_store: ProfileEventStore,
         embedding_service: EmbeddingService,
         vector_store_service: VectorStoreService,
         get_embedding_config: Callable[[], EmbeddingConfig],
-        memory_service: Optional[MemoryService] = None,
+        memory_service: MemoryService,
         get_clustering_config: Optional[Callable[[], Dict[str, Any]]] = None,
         arxiv_service_factory: Optional[Callable[[], Any]] = None,
         oai_db_service: Optional[ArxivOaiDatabaseService] = None,
         collection_name: str = "arxiv_paper_embeddings",
     ):
         """组装推荐链路依赖，并初始化推荐与回填流程所需的运行时状态。"""
-        self.db_service = db_service
-        self.memory_service = memory_service or MemoryService(db_service=self.db_service)
+        self.paper_catalog_store = paper_catalog_store
+        self.user_preference_store = user_preference_store
+        self.interest_vector_store = interest_vector_store
+        self.paper_profile_evidence_store = paper_profile_evidence_store
+        self.research_profile_store = research_profile_store
+        self.profile_event_store = profile_event_store
+        self.memory_service = memory_service
         self.embedding_service = embedding_service
         self.vector_store_service = vector_store_service
         self.get_embedding_config = get_embedding_config
@@ -93,15 +110,15 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         if not bool(self._memory_flag("enable_user_research_profile", False)):
             return {
                 "profile": {},
-                "actions": self.db_service.get_user_paper_action_map(user_id),
+                "actions": self.user_preference_store.get_user_paper_action_map(user_id),
                 "excluded_ids": [],
                 "disabled": True,
             }
-        profile = self.db_service.get_user_research_profile(user_id)
-        actions = self.db_service.get_user_paper_action_map(user_id)
+        profile = self.research_profile_store.get_user_research_profile(user_id)
+        actions = self.user_preference_store.get_user_paper_action_map(user_id)
         explicit_preference_ids = [
-            *self.db_service.get_liked_papers(user_id),
-            *self.db_service.get_disliked_papers(user_id),
+            *self.user_preference_store.get_liked_papers(user_id),
+            *self.user_preference_store.get_disliked_papers(user_id),
         ]
         excluded_ids = list(
             dict.fromkeys(
@@ -235,8 +252,11 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             return attached_card
 
         arxiv_id = str(candidate.get("arxiv_id", "") or candidate.get("id", "") or "").strip()
-        if arxiv_id and hasattr(self.db_service, "get_paper_profile_evidence"):
-            cached_card = self.db_service.get_paper_profile_evidence(arxiv_id, extractor_version=PAPER_EVIDENCE_EXTRACTOR_VERSION)
+        if arxiv_id:
+            cached_card = self.paper_profile_evidence_store.get_paper_profile_evidence(
+                arxiv_id,
+                extractor_version=PAPER_EVIDENCE_EXTRACTOR_VERSION,
+            )
             if isinstance(cached_card, dict) and cached_card.get("candidate_concepts"):
                 # 命中缓存后写回候选，后续同一请求内的多次匹配都复用同一份 evidence。
                 cached_card["_concept_source"] = "cached_evidence_card"
@@ -355,8 +375,11 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         for candidate in candidates:
             arxiv_id = str(candidate.get("arxiv_id", "") or candidate.get("id", "") or "").strip()
             card = None
-            if arxiv_id and hasattr(self.db_service, "get_paper_profile_evidence"):
-                card = self.db_service.get_paper_profile_evidence(arxiv_id, extractor_version=config["cache_version"])
+            if arxiv_id:
+                card = self.paper_profile_evidence_store.get_paper_profile_evidence(
+                    arxiv_id,
+                    extractor_version=config["cache_version"],
+                )
             if isinstance(card, dict):
                 candidate["evidence_card"] = card
                 if card.get("candidate_concepts"):
@@ -406,10 +429,10 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                 )
                 card["_enrichment_attempted"] = True
 
-            if arxiv_id and hasattr(self.db_service, "upsert_paper_profile_evidence"):
+            if arxiv_id:
                 if isinstance(card, dict):
                     card["extractor_version"] = config["cache_version"]
-                self.db_service.upsert_paper_profile_evidence(arxiv_id, card)
+                self.paper_profile_evidence_store.upsert_paper_profile_evidence(arxiv_id, card)
 
             if isinstance(card, dict) and card.get("candidate_concepts"):
                 card["_concept_source"] = "runtime_enriched"
@@ -632,18 +655,18 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
 
     def _get_or_refresh_interest_vector(self, user_id: str) -> Dict[str, Any]:
         """读取用户兴趣向量；如果缺失或过期，则自动触发重建。"""
-        vector_data = self.db_service.get_user_interest_vector(user_id=user_id)
-        latest_preference_ts = self.db_service.get_latest_user_signal_timestamp(user_id=user_id)
+        vector_data = self.interest_vector_store.get_user_interest_vector(user_id=user_id)
+        latest_preference_ts = self.profile_event_store.get_latest_user_signal_timestamp(user_id=user_id)
 
         if vector_data and latest_preference_ts and self._is_vector_stale(vector_data.get("updated_at"), latest_preference_ts):
             logger.info("Interest vector is stale for user %s, rebuilding", user_id)
             self.generate_user_interest_vector(user_id=user_id)
-            vector_data = self.db_service.get_user_interest_vector(user_id=user_id)
+            vector_data = self.interest_vector_store.get_user_interest_vector(user_id=user_id)
 
         if not vector_data:
             logger.info("Interest vector missing for user %s, rebuilding", user_id)
             self.generate_user_interest_vector(user_id=user_id)
-            vector_data = self.db_service.get_user_interest_vector(user_id=user_id)
+            vector_data = self.interest_vector_store.get_user_interest_vector(user_id=user_id)
 
         if not vector_data:
             raise HTTPException(status_code=400, detail="User interest vector not found. Please generate it first.")
@@ -831,7 +854,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         """在不破坏旧接口的前提下，为 Agent 推荐链路提供真正消费上下文的推荐实现。"""
         logger.info("Starting context-aware recommendation for user %s with top_n=%s max_age_months=%s", user_id, top_n, max_age_months)
 
-        preferences = self.db_service.get_user_preferences(user_id=user_id)
+        preferences = self.user_preference_store.get_user_preferences(user_id=user_id)
         liked_ids = preferences.get("liked_papers", [])
         disliked_ids = preferences.get("disliked_papers", [])
         profile_bundle = self._build_profile_signal_bundle(user_id)
@@ -841,7 +864,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         )
         paper_actions = profile_bundle.get("actions", {})
         excluded_ids = list(dict.fromkeys([*liked_ids, *disliked_ids, *profile_bundle.get("excluded_ids", [])]))
-        liked_details = self.db_service.get_liked_papers_with_details(user_id=user_id)
+        liked_details = self.user_preference_store.get_liked_papers_with_details(user_id=user_id)
         liked_category_freq = self._build_liked_category_frequency(liked_details)
         context_bundle = self._build_recommendation_context_bundle(
             message=message,
@@ -1033,7 +1056,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
 
         logger.info("Starting paper recommendation for user %s with top_n=%s max_age_months=%s", user_id, top_n, max_age_months)
 
-        preferences = self.db_service.get_user_preferences(user_id=user_id)
+        preferences = self.user_preference_store.get_user_preferences(user_id=user_id)
         liked_ids = preferences.get("liked_papers", [])
         disliked_ids = preferences.get("disliked_papers", [])
         profile_bundle = self._build_profile_signal_bundle(user_id)
@@ -1041,7 +1064,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         paper_actions = profile_bundle.get("actions", {})
         excluded_ids = list(dict.fromkeys([*liked_ids, *disliked_ids, *profile_bundle.get("excluded_ids", [])]))
 
-        liked_details = self.db_service.get_liked_papers_with_details(user_id=user_id)
+        liked_details = self.user_preference_store.get_liked_papers_with_details(user_id=user_id)
         liked_category_freq = self._build_liked_category_frequency(liked_details)
 
         candidate_limit = max(top_n * 5, 50)
@@ -1261,10 +1284,10 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
             warnings.append(f"用户兴趣向量不可用，已退化为普通搜索排序: {exc}")
 
         try:
-            preferences = self.db_service.get_user_preferences(user_id=user_id)
+            preferences = self.user_preference_store.get_user_preferences(user_id=user_id)
             liked_ids = preferences.get("liked_papers", [])
             disliked_ids = preferences.get("disliked_papers", [])
-            liked_details = self.db_service.get_liked_papers_with_details(user_id=user_id)
+            liked_details = self.user_preference_store.get_liked_papers_with_details(user_id=user_id)
             liked_category_freq = self._build_liked_category_frequency(liked_details)
         except Exception as exc:
             warnings.append(f"读取用户偏好失败，已退化为普通搜索排序: {exc}")

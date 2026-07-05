@@ -71,7 +71,7 @@ class _FakeArxivService:
         return [{"id": "cs.CL", "name": "Computation and Language"}]
 
 
-class _FakeDatabaseService:
+class _FakePaperStorage:
     def get_user_labeled_paper_count(self, user_id: str = "") -> int:
         return 0
 
@@ -105,6 +105,8 @@ class BackendStartupSmokeTests(unittest.TestCase):
         _ensure_langgraph_stub()
         cls.dependencies = importlib.import_module("dependencies")
         cls.main = importlib.import_module("main")
+        cls.paper_router = importlib.import_module("routers.paper_router")
+        cls.qa_router = importlib.import_module("routers.qa_router")
 
     def setUp(self) -> None:
         self.app = self.main.create_app(load_mode="lazy")
@@ -112,10 +114,20 @@ class BackendStartupSmokeTests(unittest.TestCase):
         # arxiv 下载路由的请求体校验发生在依赖解析之后；这里也覆盖 API service，
         # 避免前序测试留下的 arXiv service 桩污染 smoke 测试的校验错误断言。
         self.app.dependency_overrides[self.dependencies.get_arxiv_api_service] = lambda: _FakeArxivService()
-        self.app.dependency_overrides[self.dependencies.get_database_service] = lambda: _FakeDatabaseService()
-        self.app.dependency_overrides[self.dependencies.get_oai_database_service] = lambda: _FakeOaiDatabaseService()
-        self.app.dependency_overrides[self.dependencies.get_paper_qa_service] = lambda: _FakePaperQAService()
-        self.app.dependency_overrides[self.dependencies.get_recommendation_service] = lambda: _FakeRecommendationService()
+        for dependency in (self.dependencies.get_paper_catalog_store, self.paper_router.get_paper_catalog_store):
+            self.app.dependency_overrides[dependency] = lambda: _FakePaperStorage()
+        for dependency in (self.dependencies.get_user_preference_store, self.paper_router.get_user_preference_store):
+            self.app.dependency_overrides[dependency] = lambda: _FakePaperStorage()
+        for dependency in (self.dependencies.get_oai_database_service, self.paper_router.get_oai_database_service):
+            self.app.dependency_overrides[dependency] = lambda: _FakeOaiDatabaseService()
+        for dependency in (
+            self.dependencies.get_paper_qa_service,
+            self.paper_router.get_paper_qa_service,
+            self.qa_router.get_paper_qa_service,
+        ):
+            self.app.dependency_overrides[dependency] = lambda: _FakePaperQAService()
+        for dependency in (self.dependencies.get_recommendation_service, self.paper_router.get_recommendation_service):
+            self.app.dependency_overrides[dependency] = lambda: _FakeRecommendationService()
         self.client = TestClient(self.app)
 
     def tearDown(self) -> None:

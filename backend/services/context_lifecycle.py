@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
-from services.storage.database_service import DatabaseService
+from services.storage.sqlite.stores.agent_runtime_checkpoints import AgentRuntimeCheckpointStore
 from utils.config import get_agent_runtime_checkpoint_config, get_context_lifecycle_config, get_default_user_id
 
 logger = logging.getLogger(__name__)
@@ -21,11 +21,11 @@ class ContextLifecycleService:
     def __init__(
         self,
         *,
-        db_service: Optional[DatabaseService] = None,
+        agent_runtime_checkpoint_store: AgentRuntimeCheckpointStore,
         lifecycle_config: Optional[Mapping[str, Any]] = None,
         checkpoint_config: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        self.db_service = db_service or DatabaseService()
+        self.agent_runtime_checkpoint_store = agent_runtime_checkpoint_store
         self.lifecycle_config = dict(lifecycle_config or get_context_lifecycle_config())
         self.checkpoint_config = dict(checkpoint_config or get_agent_runtime_checkpoint_config())
 
@@ -110,20 +110,20 @@ class ContextLifecycleService:
             "errors": [],
         }
         try:
-            result["expired_runtime_checkpoints"] = self.db_service.expire_agent_runtime_checkpoints()
+            result["expired_runtime_checkpoints"] = self.agent_runtime_checkpoint_store.expire_agent_runtime_checkpoints()
         except Exception as exc:
             logger.warning("Context lifecycle runtime checkpoint expiration failed: %s", exc)
             result["errors"].append({"stage": "expire_runtime_checkpoints", "error": str(exc)})
         try:
             # 先清理原始 LangGraph checkpoint，再删业务 runtime 记录，避免失去 thread_id 对齐依据。
-            result["deleted_langgraph"] = self.db_service.cleanup_langgraph_checkpoints_for_terminal_runtime(
+            result["deleted_langgraph"] = self.agent_runtime_checkpoint_store.cleanup_langgraph_checkpoints_for_terminal_runtime(
                 retention_days=checkpoint_retention_days,
             )
         except Exception as exc:
             logger.warning("Context lifecycle langgraph checkpoint cleanup failed: %s", exc)
             result["errors"].append({"stage": "cleanup_langgraph_checkpoints", "error": str(exc)})
         try:
-            result["deleted_runtime_checkpoints"] = self.db_service.cleanup_agent_runtime_checkpoints(
+            result["deleted_runtime_checkpoints"] = self.agent_runtime_checkpoint_store.cleanup_agent_runtime_checkpoints(
                 retention_days=checkpoint_retention_days,
             )
         except Exception as exc:
@@ -200,7 +200,7 @@ class ContextLifecycleService:
     ) -> Dict[str, Any]:
         """构造本轮 QA 上下文健康度，明确数据库读取规模和 prompt 使用规模。"""
         normalized_user_id = str(user_id or get_default_user_id()).strip() or get_default_user_id()
-        stats = self.db_service.get_context_lifecycle_stats(
+        stats = self.agent_runtime_checkpoint_store.get_context_lifecycle_stats(
             user_id=normalized_user_id,
             paper_session_id=str(session_id or "").strip() or None,
         )
@@ -239,7 +239,7 @@ class ContextLifecycleService:
         """构造 Agent 上下文健康度，聚焦 checkpoint 是否存在及前端 context 是否被降级。"""
         normalized_user_id = str(user_id or get_default_user_id()).strip() or get_default_user_id()
         normalized_session_id = str(session_id or "").strip()
-        stats = self.db_service.get_context_lifecycle_stats(
+        stats = self.agent_runtime_checkpoint_store.get_context_lifecycle_stats(
             user_id=normalized_user_id,
             agent_session_id=normalized_session_id or None,
         )

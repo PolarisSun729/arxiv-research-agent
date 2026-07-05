@@ -9,7 +9,7 @@ class _FakeEnhancedRetrievalService:
         self.trace_export_dir = trace_export_dir
 
 
-class _FakeDbService:
+class _FakePaperQAIndexStore:
     def __init__(self, qa_index):
         self.qa_index = qa_index
 
@@ -89,7 +89,7 @@ def test_get_latest_retrieval_trace_returns_none_when_directory_missing(tmp_path
 
 def test_build_qa_diagnostic_reports_collection_health() -> None:
     diagnostic = build_qa_diagnostic(
-        db_service=_FakeDbService({"collection_name": "paper_123", "status": "indexed", "chunk_count": 1}),
+        paper_qa_index_store=_FakePaperQAIndexStore({"collection_name": "paper_123", "status": "indexed", "chunk_count": 1}),
         vector_store_service=_FakeVectorStoreService(),
         arxiv_id="2401.00001",
         sample_limit=2,
@@ -103,7 +103,7 @@ def test_build_qa_diagnostic_reports_collection_health() -> None:
 
 def test_build_qa_diagnostic_handles_missing_index() -> None:
     diagnostic = build_qa_diagnostic(
-        db_service=_FakeDbService(None),
+        paper_qa_index_store=_FakePaperQAIndexStore(None),
         vector_store_service=_FakeVectorStoreService(),
         arxiv_id="2401.00001",
     )

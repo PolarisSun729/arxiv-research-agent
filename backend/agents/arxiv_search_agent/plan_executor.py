@@ -7,7 +7,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from langgraph.types import interrupt
 from pydantic import ValidationError
-from services.storage import database_service as database_service_module
+from services.storage.sqlite.shared import DEFAULT_USER_ID
+from services.storage.sqlite.stores import AgentRuntimeCheckpointStore
 from utils.config import get_agent_runtime_checkpoint_config
 from utils.logging_utils import info_event
 
@@ -38,9 +39,6 @@ from .tool_registry import PLANNER_TOOL_REGISTRY, ToolRegistry
 
 logger = logging.getLogger(__name__)
 invoke_backend_tool = agent_tool_registry.invoke_backend_tool
-DatabaseService = database_service_module.DatabaseService
-_DEFAULT_CHECKPOINT_USER_ID = str(getattr(database_service_module, "DEFAULT_USER_ID", "") or "").strip()
-DEFAULT_USER_ID = _DEFAULT_CHECKPOINT_USER_ID or "default"
 
 
 def _state_run_id(state: AgentState) -> Optional[str]:
@@ -249,19 +247,21 @@ def _checkpoint_approved_step_ids_for_state(
     state: AgentState,
     runtime: Optional[PlanRuntime],
     step: PlanStep,
+    runtime_checkpoint_store: Optional[AgentRuntimeCheckpointStore],
 ) -> List[str]:
     """从业务 checkpoint 读取已消费的批准态，作为 LangGraph 重入丢态时的兜底。
 
     这里仍以 runtime checkpoint 为真源，不读取 pending_action 展示镜像；并且只接受
     running、已清空 pending_confirmation、plan_id 匹配的记录，避免旧会话终态误放行副作用工具。
     """
+    if runtime_checkpoint_store is None:
+        return []
     session_id = str(state.session_id or "").strip()
     if not session_id:
         return []
     normalized_user_id = str(state.user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
     try:
-        database = DatabaseService()
-        checkpoint = database.get_agent_runtime_checkpoint(
+        checkpoint = runtime_checkpoint_store.get_agent_runtime_checkpoint(
             user_id=normalized_user_id,
             session_id=session_id,
             thread_id=session_id,
@@ -276,12 +276,10 @@ def _checkpoint_approved_step_ids_for_state(
             return approved_step_ids
         # LangGraph resume 的业务 state 可能只恢复了 session/thread，丢失真实 user_id；
         # 精确用户查询失败后，按同一 session/thread 取候选，再用同一套 plan/goal 校验收窄到唯一有效记录。
-        list_by_thread = getattr(database, "list_agent_runtime_checkpoints_by_thread", None)
-        if callable(list_by_thread):
-            fallback_candidates = list_by_thread(session_id=session_id, thread_id=session_id)
-        else:
-            get_by_thread = getattr(database, "get_agent_runtime_checkpoint_by_thread", None)
-            fallback_candidates = [get_by_thread(session_id=session_id, thread_id=session_id)] if callable(get_by_thread) else []
+        fallback_candidates = runtime_checkpoint_store.list_agent_runtime_checkpoints_by_thread(
+            session_id=session_id,
+            thread_id=session_id,
+        )
         valid_fallbacks: List[Tuple[Mapping[str, Any], List[str]]] = []
         for fallback_checkpoint in list(fallback_candidates or []):
             fallback_approved_step_ids = _approved_step_ids_from_checkpoint(
@@ -994,8 +992,13 @@ def _build_execution_path_summary(runtime: "PlanRuntime", *, current_step_id: Op
 class PlanExecutor:
     """按计划拓扑、输入绑定和策略约束执行 ExecutablePlan。"""
 
-    def __init__(self, tool_registry: ToolRegistry = PLANNER_TOOL_REGISTRY) -> None:
+    def __init__(
+        self,
+        tool_registry: ToolRegistry = PLANNER_TOOL_REGISTRY,
+        runtime_checkpoint_store: Optional[AgentRuntimeCheckpointStore] = None,
+    ) -> None:
         self.tool_registry = tool_registry
+        self.runtime_checkpoint_store = runtime_checkpoint_store
         self.observer = Observer()
         self.replanner = Replanner(tool_registry=tool_registry)
 
@@ -2189,6 +2192,7 @@ class PlanExecutor:
             state=state,
             runtime=runtime,
             step=step,
+            runtime_checkpoint_store=self.runtime_checkpoint_store,
         )
         if step.step_id in checkpoint_approved_step_ids:
             # resume 已经原子消费业务 checkpoint，但 LangGraph 可能从节点开头重跑；

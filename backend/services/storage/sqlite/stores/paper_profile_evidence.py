@@ -1,32 +1,34 @@
 import uuid
 from typing import Any, Dict, Optional
 
-from services.storage.database.shared import (
+from services.storage.sqlite.base import BaseSqliteStore
+from services.storage.sqlite.profile_normalization import normalize_profile_categories, normalize_profile_topics
+from services.storage.sqlite.shared import (
     PROFILE_EXTRACTOR_VERSION,
     PROFILE_NORMALIZER_VERSION,
     logger,
 )
 
 
-class PaperProfileEvidenceMixin:
+class PaperProfileEvidenceStore(BaseSqliteStore):
     """维护单篇论文的画像证据缓存；画像合并和 snapshot 激活仍留在 profile 主流程。"""
 
     def upsert_paper_profile_evidence(self, arxiv_id: str, evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = dict(evidence or {})
         # 这里复用现有 profile 归一化 helper，保持证据缓存与最终画像抽取的字段清洗规则一致。
         normalized = {
-            "concepts": self._normalize_profile_topics(
+            "concepts": normalize_profile_topics(
                 payload.get("technical_concepts")
                 or payload.get("concepts")
                 or payload.get("topics")
                 or [item.get("label") for item in payload.get("candidate_concepts") or [] if isinstance(item, dict)],
                 limit=20,
             ),
-            "methods": self._normalize_profile_topics(payload.get("methods"), limit=20),
-            "tasks": self._normalize_profile_topics(payload.get("tasks"), limit=20),
-            "objects": self._normalize_profile_topics(payload.get("research_objects") or payload.get("objects"), limit=20),
-            "applications": self._normalize_profile_topics(payload.get("application_domains") or payload.get("applications"), limit=20),
-            "categories": self._normalize_profile_categories(payload.get("categories"), limit=20),
+            "methods": normalize_profile_topics(payload.get("methods"), limit=20),
+            "tasks": normalize_profile_topics(payload.get("tasks"), limit=20),
+            "objects": normalize_profile_topics(payload.get("research_objects") or payload.get("objects"), limit=20),
+            "applications": normalize_profile_topics(payload.get("application_domains") or payload.get("applications"), limit=20),
+            "categories": normalize_profile_categories(payload.get("categories"), limit=20),
         }
         evidence_id = str(uuid.uuid4())
         try:

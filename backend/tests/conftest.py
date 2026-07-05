@@ -23,12 +23,12 @@ def _preload_real_module(module_name: str) -> None:
     importlib.import_module(module_name)
 
 
-for module_name in ("utils.config", "services.memory", "services.storage.database_service", "dependencies"):
+for module_name in ("utils.config", "services.memory", "services.storage.sqlite", "dependencies"):
     _preload_real_module(module_name)
 
 
 def pytest_collect_file(file_path, parent):
     _ = file_path, parent
-    for module_name in ("utils.config", "services.memory", "services.storage.database_service", "dependencies"):
+    for module_name in ("utils.config", "services.memory", "services.storage.sqlite", "dependencies"):
         _preload_real_module(module_name)
     return None

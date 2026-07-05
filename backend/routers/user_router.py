@@ -12,7 +12,12 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
-from dependencies import get_database_service, get_memory_service, get_recommendation_service
+from dependencies import (
+    get_interest_vector_store,
+    get_memory_service,
+    get_recommendation_service,
+    get_user_preference_store,
+)
 from services.user_behavior_policy import validate_weak_paper_action_type
 from utils.config import get_default_user_id
 
@@ -77,10 +82,10 @@ class ActivateProfileSnapshotRequest(BaseModel):
 
 
 @router.get("/preferences/{user_id}")
-async def get_user_preferences(user_id: str, db_service=Depends(get_database_service)):
+async def get_user_preferences(user_id: str, user_preference_store=Depends(get_user_preference_store)):
     """按路径参数获取用户偏好。"""
     try:
-        preferences = db_service.get_user_preferences(user_id=user_id)
+        preferences = user_preference_store.get_user_preferences(user_id=user_id)
         return preferences
     except Exception as exc:
         logger.error("Error getting user preferences: %s", str(exc))
@@ -158,7 +163,7 @@ async def remove_paper_action(
     arxiv_id: str = Body(...),
     action_type: str = Body(...),
     user_id: str = Body(default_factory=get_default_user_id),
-    db_service=Depends(get_database_service),
+    user_preference_store=Depends(get_user_preference_store),
 ):
     """删除某条已记录的弱论文行为。"""
     try:
@@ -169,7 +174,11 @@ async def remove_paper_action(
                 # 强偏好撤销必须走专用接口，避免调用方误以为 paper-action 能删除权威点赞状态。
                 raise HTTPException(status_code=400, detail="paper-action 不接受 like/dislike；请使用 DELETE /user/like-paper 或 DELETE /user/dislike-paper") from exc
             raise HTTPException(status_code=400, detail="unsupported paper action type") from exc
-        success = db_service.remove_user_paper_action(user_id=user_id, arxiv_id=arxiv_id, action_type=normalized_action)
+        success = user_preference_store.remove_user_paper_action(
+            user_id=user_id,
+            arxiv_id=arxiv_id,
+            action_type=normalized_action,
+        )
         if success:
             return {"status": "success", "message": "Paper action removed"}
         raise HTTPException(status_code=404, detail="Paper action not found")
@@ -184,18 +193,18 @@ async def remove_paper_action(
 async def get_user_paper_actions(
     user_id: str,
     action_type: Optional[str] = None,
-    db_service=Depends(get_database_service),
+    user_preference_store=Depends(get_user_preference_store),
 ):
     """获取用户的论文行为明细及聚合映射。"""
     try:
-        actions = db_service.get_user_paper_actions(user_id=user_id, action_type=action_type)
+        actions = user_preference_store.get_user_paper_actions(user_id=user_id, action_type=action_type)
         return {
             "status": "success",
             "user_id": user_id,
             "action_type": action_type,
             "actions": actions,
             # action_map 常用于前端快速判断某篇论文当前是否已被执行过某种动作。
-            "action_map": db_service.get_user_paper_action_map(user_id=user_id),
+            "action_map": user_preference_store.get_user_paper_action_map(user_id=user_id),
         }
     except Exception as exc:
         logger.error("Error getting paper actions: %s", str(exc))
@@ -355,11 +364,11 @@ async def rebuild_user_research_profile(
 async def remove_like(
     arxiv_id: str = Body(...),
     user_id: str = Body(default_factory=get_default_user_id),
-    db_service=Depends(get_database_service),
+    user_preference_store=Depends(get_user_preference_store),
 ):
     """撤销用户对论文的点赞记录。"""
     try:
-        success = db_service.remove_liked_paper(user_id=user_id, arxiv_id=arxiv_id)
+        success = user_preference_store.remove_liked_paper(user_id=user_id, arxiv_id=arxiv_id)
         if success:
             return {"status": "success", "message": "Paper removed from liked list"}
         raise HTTPException(status_code=500, detail="Failed to remove from liked list")
@@ -372,11 +381,11 @@ async def remove_like(
 async def remove_dislike(
     arxiv_id: str = Body(...),
     user_id: str = Body(default_factory=get_default_user_id),
-    db_service=Depends(get_database_service),
+    user_preference_store=Depends(get_user_preference_store),
 ):
     """撤销用户对论文的点踩记录。"""
     try:
-        success = db_service.remove_disliked_paper(user_id=user_id, arxiv_id=arxiv_id)
+        success = user_preference_store.remove_disliked_paper(user_id=user_id, arxiv_id=arxiv_id)
         if success:
             return {"status": "success", "message": "Paper removed from disliked list"}
         raise HTTPException(status_code=500, detail="Failed to remove from disliked list")
@@ -403,11 +412,11 @@ async def generate_user_interest_vector(
 @router.get("/interest-vector")
 async def get_user_interest_vector(
     user_id: str = Query(default_factory=get_default_user_id),
-    db_service=Depends(get_database_service),
+    interest_vector_store=Depends(get_interest_vector_store),
 ):
     """获取用户当前已保存的兴趣向量。"""
     try:
-        result = db_service.get_user_interest_vector(user_id=user_id)
+        result = interest_vector_store.get_user_interest_vector(user_id=user_id)
         if result:
             return result
         raise HTTPException(status_code=404, detail="User interest vector not found")

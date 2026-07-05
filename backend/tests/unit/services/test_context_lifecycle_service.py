@@ -4,16 +4,15 @@ import gc
 import unittest
 
 from services.context_lifecycle import ContextLifecycleService
-from services.storage.database_service import DatabaseService
-from tests.helpers import build_database_service
+from tests.helpers import build_storage_container
 
 
 class ContextLifecycleServiceTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.db_service = build_database_service(DatabaseService)
+        self.storage = build_storage_container()
         self.user_id = "user-1"
         self.service = ContextLifecycleService(
-            db_service=self.db_service,
+            agent_runtime_checkpoint_store=self.storage.agent_runtime_checkpoints,
             lifecycle_config={
                 "debug_snapshot_mode": "summary",
                 "max_debug_string_chars": 40,
@@ -25,15 +24,15 @@ class ContextLifecycleServiceTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
-        temp_db = getattr(self.db_service, "_test_temp_db", None)
+        temp_db = getattr(self.storage, "_test_temp_db", None)
         self.service = None
-        self.db_service = None
+        self.storage = None
         gc.collect()
         if temp_db is not None:
             temp_db.cleanup()
 
     def _create_paper_session(self) -> dict:
-        self.db_service.add_paper(
+        self.storage.paper_catalog.add_paper(
             {
                 "arxiv_id": "2401.00001",
                 "title": "Lifecycle Paper",
@@ -44,7 +43,7 @@ class ContextLifecycleServiceTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00001",
             }
         )
-        return self.db_service.create_paper_chat_session(
+        return self.storage.paper_chat_sessions.create_paper_chat_session(
             arxiv_id="2401.00001",
             user_id=self.user_id,
             session_id="paper-session-1",
@@ -68,7 +67,7 @@ class ContextLifecycleServiceTests(unittest.TestCase):
 
     def test_paper_qa_health_debug_reports_runtime_read_scale_and_policy(self) -> None:
         session = self._create_paper_session()
-        self.db_service.append_paper_qa_turn(
+        self.storage.paper_qa_turns.append_paper_qa_turn(
             session_id=session["session_id"],
             user_id=self.user_id,
             question="Q",

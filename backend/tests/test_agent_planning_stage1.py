@@ -35,9 +35,8 @@ def _load_stage1_modules():
     sys.modules.pop("backend.agents.arxiv_search_agent.graph", None)
     sys.modules.pop("backend.agents.arxiv_search_agent.service", None)
 
-    # 测试进程里如果已经存在 dependencies，就直接补齐缺失的 getter，避免旧 stub 干扰导入。
+    # 测试进程里如果已经存在 dependencies，就直接补齐缺失的当前入口，避免跨测试 stub 干扰导入。
     dependencies_module = sys.modules.get("dependencies", types.ModuleType("dependencies"))
-    dependencies_module.get_database_service = getattr(dependencies_module, "get_database_service", lambda: object())
     dependencies_module.get_oai_database_service = getattr(
         dependencies_module,
         "get_oai_database_service",
@@ -89,21 +88,6 @@ def _load_stage1_modules():
 
         memory_module.MemoryService = _MemoryService
         sys.modules["services.memory"] = memory_module
-
-    if "services.storage.database_service" not in sys.modules:
-        database_service_module = types.ModuleType("services.storage.database_service")
-
-        class _PaperQATurnPersistenceError(RuntimeError):
-            pass
-
-        class _DatabaseService:
-            def get_user_research_profile(self, **_kwargs):
-                return {}
-
-        database_service_module.DatabaseService = _DatabaseService
-        # 测试桩需要保留真实模块的异常导出，避免污染后续 pytest 收集到的数据库服务接口。
-        database_service_module.PaperQATurnPersistenceError = _PaperQATurnPersistenceError
-        sys.modules["services.storage.database_service"] = database_service_module
 
     config_module = sys.modules.get("utils.config", types.ModuleType("utils.config"))
     config_module.get_memory_runtime_config = lambda: {"enable_user_research_profile": False}

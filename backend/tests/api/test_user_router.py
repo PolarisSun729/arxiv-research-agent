@@ -7,7 +7,7 @@ import dependencies
 from routers import user_router
 
 
-class _FakeDatabaseService:
+class _FakeUserPreferenceStore:
     def __init__(self) -> None:
         self.preferences = {
             "user_id": "u1",
@@ -41,6 +41,15 @@ class _FakeDatabaseService:
 
     def get_user_paper_action_map(self, user_id: str):
         return {"favorite": ["2401.00001"]}
+
+    def remove_liked_paper(self, user_id: str, arxiv_id: str) -> bool:
+        return True
+
+    def remove_disliked_paper(self, user_id: str, arxiv_id: str) -> bool:
+        return True
+
+    def get_user_interest_vector(self, user_id: str):
+        return {"user_id": user_id, "interest_vector": [0.1, 0.2]}
 
 
 class _FakeMemoryService:
@@ -134,15 +143,20 @@ class _FakeRecommendationService:
 
 class UserRouterApiTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.db_service = _FakeDatabaseService()
+        self.user_preference_store = _FakeUserPreferenceStore()
         self.memory_service = _FakeMemoryService()
         self.recommendation_service = _FakeRecommendationService()
 
         app = FastAPI()
         app.include_router(user_router.router, prefix="/api")
-        app.dependency_overrides[dependencies.get_database_service] = lambda: self.db_service
-        app.dependency_overrides[dependencies.get_memory_service] = lambda: self.memory_service
-        app.dependency_overrides[dependencies.get_recommendation_service] = lambda: self.recommendation_service
+        for dependency in (dependencies.get_user_preference_store, user_router.get_user_preference_store):
+            app.dependency_overrides[dependency] = lambda: self.user_preference_store
+        for dependency in (dependencies.get_interest_vector_store, user_router.get_interest_vector_store):
+            app.dependency_overrides[dependency] = lambda: self.user_preference_store
+        for dependency in (dependencies.get_memory_service, user_router.get_memory_service):
+            app.dependency_overrides[dependency] = lambda: self.memory_service
+        for dependency in (dependencies.get_recommendation_service, user_router.get_recommendation_service):
+            app.dependency_overrides[dependency] = lambda: self.recommendation_service
         self.client = TestClient(app)
 
     def test_get_user_preferences_returns_stable_payload(self) -> None:
@@ -202,7 +216,7 @@ class UserRouterApiTests(unittest.TestCase):
             "/api/user/paper-action",
             json={"user_id": "u1", "arxiv_id": "2401.00001", "action_type": "favorite"},
         )
-        self.db_service.remove_action_result = False
+        self.user_preference_store.remove_action_result = False
         missing = self.client.request(
             "DELETE",
             "/api/user/paper-action",

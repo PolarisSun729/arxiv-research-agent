@@ -9,7 +9,7 @@ from fastapi import HTTPException
 
 from core.errors import AppError, ErrorCode
 from services.paper_qa.paper_qa_index_builder import PaperQAIndexBuilder
-from services.storage.database_service import DatabaseService
+from services.storage.sqlite.stores.paper_qa_index import PaperQAIndexStore
 from utils.config import get_qa_index_job_runtime_config
 
 logger = logging.getLogger(__name__)
@@ -30,9 +30,9 @@ RETRYABLE_JOB_STATUSES = {IndexJobStatus.FAILED.value, IndexJobStatus.STALE.valu
 
 
 class IndexJobManager:
-    def __init__(self, *, db_service: DatabaseService, qa_index_builder: PaperQAIndexBuilder, timeout_seconds: Optional[int] = None):
+    def __init__(self, *, paper_qa_index_store: PaperQAIndexStore, qa_index_builder: PaperQAIndexBuilder, timeout_seconds: Optional[int] = None):
         """初始化论文问答索引任务管理器，并持有任务提交所需依赖。"""
-        self.db_service = db_service
+        self.paper_qa_index_store = paper_qa_index_store
         self.qa_index_builder = qa_index_builder
         config = get_qa_index_job_runtime_config()
         self.timeout_seconds = max(1, int(timeout_seconds or config.get("timeout_seconds") or 1800))
@@ -51,7 +51,7 @@ class IndexJobManager:
 
     def _find_active_job(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
         """查找指定论文当前是否已经存在仍在执行中的建索引任务。"""
-        jobs = self.db_service.list_paper_index_jobs(arxiv_id=arxiv_id, limit=20)
+        jobs = self.paper_qa_index_store.list_paper_index_jobs(arxiv_id=arxiv_id, limit=20)
         for job in jobs:
             if str(job.get("status") or "").strip().lower() in ACTIVE_JOB_STATUSES:
                 return job
@@ -67,7 +67,7 @@ class IndexJobManager:
 
         with self._submission_lock:
             # 进程内锁只减少本 worker 的重复提交；真正的互斥由数据库写事务完成，覆盖多 worker 场景。
-            job = self.db_service.acquire_paper_index_job(
+            job = self.paper_qa_index_store.acquire_paper_index_job(
                 arxiv_id,
                 normalized_loading_method,
                 timeout_seconds=self.timeout_seconds,
@@ -102,7 +102,7 @@ class IndexJobManager:
     def run_job(self, job_id: str, arxiv_id: str, loading_method: str) -> None:
         """执行单个建索引任务，并持续把进度与最终结果写回数据库。"""
         logger.info("Starting QA index job: job_id=%s arxiv_id=%s", job_id, arxiv_id)
-        started = self.db_service.update_paper_index_job(
+        started = self.paper_qa_index_store.update_paper_index_job(
             job_id,
             status=IndexJobStatus.RUNNING.value,
             current_stage="starting",
@@ -117,7 +117,7 @@ class IndexJobManager:
 
         def progress_callback(*, current_stage: str, progress: int, message: str) -> None:
             """接收索引构建阶段回调，并把阶段进度同步到任务记录中。"""
-            updated = self.db_service.update_paper_index_job(
+            updated = self.paper_qa_index_store.update_paper_index_job(
                 job_id,
                 status=IndexJobStatus.RUNNING.value,
                 current_stage=current_stage,
@@ -148,7 +148,7 @@ class IndexJobManager:
                 loading_method=loading_method,
                 progress_callback=progress_callback,
             )
-            self.db_service.update_paper_index_job(
+            self.paper_qa_index_store.update_paper_index_job(
                 job_id,
                 status=IndexJobStatus.SUCCESS.value,
                 current_stage="mark_index_success",
@@ -161,7 +161,7 @@ class IndexJobManager:
             error_message = self._exception_message(exc)
             failed_stage = str(exc.context.get("stage") or getattr(exc, "error_stage", "failed") or "failed")
             # 后台任务失败时同时写入 code 和阶段，前端轮询 job 时能稳定识别失败类型。
-            self.db_service.update_paper_index_job(
+            self.paper_qa_index_store.update_paper_index_job(
                 job_id,
                 status=IndexJobStatus.FAILED.value,
                 current_stage=failed_stage,
@@ -181,7 +181,7 @@ class IndexJobManager:
             # 业务性失败通常已经带有明确阶段和错误描述，直接写回任务记录即可。
             error_message = self._exception_message(exc)
             failed_stage = str(getattr(exc, "error_stage", "failed") or "failed")
-            self.db_service.update_paper_index_job(
+            self.paper_qa_index_store.update_paper_index_job(
                 job_id,
                 status=IndexJobStatus.FAILED.value,
                 current_stage=failed_stage,
@@ -199,7 +199,7 @@ class IndexJobManager:
             # 非预期异常也会尽量落库，避免前端只能看到任务卡住而没有失败原因。
             error_message = self._exception_message(exc)
             failed_stage = str(getattr(exc, "error_stage", "failed") or "failed")
-            self.db_service.update_paper_index_job(
+            self.paper_qa_index_store.update_paper_index_job(
                 job_id,
                 status=IndexJobStatus.FAILED.value,
                 current_stage=failed_stage,

@@ -154,9 +154,9 @@ def remove_user_paper_preference(
         removed_liked = False
         removed_disliked = False
         if normalized_scope in {"both", "liked"}:
-            removed_liked = bool(service.db_service.remove_liked_paper(user_id=user_id, arxiv_id=arxiv_id))
+            removed_liked = bool(service.user_preference_store.remove_liked_paper(user_id=user_id, arxiv_id=arxiv_id))
         if normalized_scope in {"both", "disliked"}:
-            removed_disliked = bool(service.db_service.remove_disliked_paper(user_id=user_id, arxiv_id=arxiv_id))
+            removed_disliked = bool(service.user_preference_store.remove_disliked_paper(user_id=user_id, arxiv_id=arxiv_id))
 
         success = removed_liked or removed_disliked
         data = {

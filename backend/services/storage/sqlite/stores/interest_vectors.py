@@ -1,10 +1,11 @@
 import json
 from typing import Any, Dict, List, Optional
 
-from services.storage.database.shared import DEFAULT_USER_ID, logger
+from services.storage.sqlite.base import BaseSqliteStore
+from services.storage.sqlite.shared import DEFAULT_USER_ID, logger
 
 
-class InterestVectorMixin:
+class InterestVectorStore(BaseSqliteStore):
     """维护用户兴趣向量存取；推荐算法仍在上层服务中，避免存储层承担排序职责。"""
 
     def _ensure_user_interest_vector_columns(self, conn):

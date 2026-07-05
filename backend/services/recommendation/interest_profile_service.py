@@ -31,8 +31,8 @@ class InterestProfileService:
         negative_config = self._get_negative_profile_config()
         min_liked_for_vector = int(positive_config["min_liked_for_vector"])
         negative_enabled = bool(negative_config["enabled"])
-        liked_ids = self.db_service.get_liked_papers(user_id=user_id)
-        disliked_ids = self.db_service.get_disliked_papers(user_id=user_id)
+        liked_ids = self.user_preference_store.get_liked_papers(user_id=user_id)
+        disliked_ids = self.user_preference_store.get_disliked_papers(user_id=user_id)
 
         if len(liked_ids) < min_liked_for_vector:
             raise HTTPException(
@@ -136,7 +136,7 @@ class InterestProfileService:
         negative_clusters = list(negative_feedback_profile.get("clusters") or [])
         negative_feedback_stats = dict(negative_feedback_profile.get("stats") or {})
 
-        success = self.db_service.save_user_interest_vector(
+        success = self.interest_vector_store.save_user_interest_vector(
             user_id=user_id,
             vector_data=fallback_interest_vector,
             paper_count=used_count,
@@ -316,7 +316,7 @@ class InterestProfileService:
             raw_vector = record.get("vector") or []
             if not arxiv_id or not raw_vector:
                 continue
-            paper = self.db_service.get_paper(arxiv_id) or {}
+            paper = self.paper_catalog_store.get_paper(arxiv_id) or {}
             examples.append(
                 {
                     "arxiv_id": arxiv_id,
@@ -478,7 +478,7 @@ class InterestProfileService:
         remaining_missing = [arxiv_id for arxiv_id in missing_ids if arxiv_id not in recovered_vectors]
         if remaining_missing:
             # 第二优先级：如果本地数据库里已有论文文本，就直接临时补 embedding，避免整条链路失败。
-            fallback_papers = [paper for paper in (self.db_service.get_paper(arxiv_id) for arxiv_id in remaining_missing) if paper]
+            fallback_papers = [paper for paper in (self.paper_catalog_store.get_paper(arxiv_id) for arxiv_id in remaining_missing) if paper]
             embedded_fallbacks = self._embed_papers(fallback_papers, config)
             fallback_map = {item["arxiv_id"]: item["vector"] for item in embedded_fallbacks if item.get("arxiv_id") and item.get("vector")}
             for arxiv_id in [arxiv_id for arxiv_id in remaining_missing if arxiv_id in fallback_map]:
@@ -498,7 +498,7 @@ class InterestProfileService:
         unresolved_ids: List[str] = []
 
         for arxiv_id in missing_ids:
-            existing_paper = self.db_service.get_paper(arxiv_id)
+            existing_paper = self.paper_catalog_store.get_paper(arxiv_id)
             source_paper = existing_paper
             if source_paper is None:
                 try:
@@ -527,7 +527,7 @@ class InterestProfileService:
                     "embedding_id": str(embedding_id),
                     "embedding_model": normalized_paper["embedding_model"],
                 }
-                if not self.db_service.add_paper(stored):
+                if not self.paper_catalog_store.add_paper(stored):
                     raise HTTPException(status_code=500, detail=f"Failed to store paper {arxiv_id}")
                 recovered_vectors[arxiv_id] = embedding_vector
                 recovered_ids.append(arxiv_id)

@@ -26,7 +26,8 @@ def _load_agent_runtime_helper():
 
 
 load_agent_test_modules = _load_agent_runtime_helper().load_agent_test_modules
-FakeDatabaseService = _load_agent_runtime_helper().FakeDatabaseService
+FakeAgentStorageStore = _load_agent_runtime_helper().FakeAgentStorageStore
+FakeStorageContainer = _load_agent_runtime_helper().FakeStorageContainer
 
 
 _MODULES = load_agent_test_modules()
@@ -388,13 +389,17 @@ class AgentChatFlowIntegrationTests(unittest.TestCase):
         )
 
     def test_run_arxiv_search_agent_resume_already_consumed_does_not_invoke_graph(self) -> None:
-        class _ConsumedCheckpointDatabase(FakeDatabaseService):
+        class _ConsumedCheckpointStore(FakeAgentStorageStore):
             def consume_agent_runtime_pending_confirmation(self, **_kwargs):
                 return False
 
+        class _ConsumedStorageContainer(FakeStorageContainer):
+            def __init__(self) -> None:
+                super().__init__(store=_ConsumedCheckpointStore())
+
         fake_graph = _FakeCompiledGraph(final_state=AgentState(session_id="s1", answer="should not run").model_dump(), checkpoint_exists=True)
 
-        with mock.patch.object(service_module, "DatabaseService", _ConsumedCheckpointDatabase), mock.patch.object(
+        with mock.patch.object(service_module, "StorageContainer", _ConsumedStorageContainer), mock.patch.object(
             service_module,
             "build_arxiv_search_graph",
             return_value=fake_graph,

@@ -9,7 +9,13 @@ from fastapi import HTTPException
 from core.errors import AppError, ErrorCode
 from services.context_lifecycle import ContextLifecycleService
 from services.memory import MemoryService
-from services.storage.database_service import DatabaseService, PaperQATurnPersistenceError
+from services.storage.sqlite.shared import PaperQATurnPersistenceError
+from services.storage.sqlite.stores import (
+    AgentRuntimeCheckpointStore,
+    PaperChatSessionStore,
+    PaperQATurnStore,
+    ResearchProfileStore,
+)
 from utils.config import get_default_user_id
 
 logger = logging.getLogger(__name__)
@@ -29,14 +35,21 @@ class PaperQASessionService:
     def __init__(
         self,
         *,
-        db_service: DatabaseService,
+        paper_chat_session_store: PaperChatSessionStore,
+        paper_qa_turn_store: PaperQATurnStore,
+        research_profile_store: ResearchProfileStore,
+        agent_runtime_checkpoint_store: AgentRuntimeCheckpointStore,
         memory_service: MemoryService,
         memory_runtime_config: Dict[str, Any],
     ) -> None:
-        self.db_service = db_service
+        self.paper_chat_session_store = paper_chat_session_store
+        self.paper_qa_turn_store = paper_qa_turn_store
+        self.research_profile_store = research_profile_store
         self.memory_service = memory_service
         self.memory_runtime_config = memory_runtime_config
-        self.context_lifecycle_service = ContextLifecycleService(db_service=self.db_service)
+        self.context_lifecycle_service = ContextLifecycleService(
+            agent_runtime_checkpoint_store=agent_runtime_checkpoint_store,
+        )
 
     def memory_flag(self, key: str, default: Any = None) -> Any:
         """读取记忆相关运行时开关，统一约束 session 与短期记忆模块的行为。"""
@@ -91,7 +104,7 @@ class PaperQASessionService:
             return ""
         user_id = self.resolve_user_id(self.payload_get(payload, "user_id"))
         try:
-            profile = self.db_service.get_user_research_profile(user_id=user_id)
+            profile = self.research_profile_store.get_user_research_profile(user_id=user_id)
         except Exception:
             profile = {}
         return str((profile or {}).get("preferred_answer_style") or "").strip()
@@ -114,11 +127,11 @@ class PaperQASessionService:
         try:
             if requested_session_id:
                 # 显式 session_id 必须属于当前用户和论文，避免跨论文串用历史上下文。
-                existing_session = self.db_service.get_paper_chat_session(requested_session_id, user_id=user_id)
+                existing_session = self.paper_chat_session_store.get_paper_chat_session(requested_session_id, user_id=user_id)
                 if existing_session and existing_session.get("arxiv_id") == arxiv_id:
                     return existing_session
 
-            recent_sessions = self.db_service.list_paper_chat_sessions(arxiv_id=arxiv_id, user_id=user_id, limit=5)
+            recent_sessions = self.paper_chat_session_store.list_paper_chat_sessions(arxiv_id=arxiv_id, user_id=user_id, limit=5)
             for recent_session in recent_sessions:
                 recent_status = str(recent_session.get("status") or "active").strip().lower()
                 if recent_status == "active":
@@ -128,7 +141,7 @@ class PaperQASessionService:
 
             # 没有可复用会话时，按当前问题摘要创建一个新的论文对话会话。
             session_title = self.truncate_text(str(self.payload_get(payload, "question", "") or "").strip(), 80)
-            created_session = self.db_service.create_paper_chat_session(
+            created_session = self.paper_chat_session_store.create_paper_chat_session(
                 arxiv_id=arxiv_id,
                 user_id=user_id,
                 title=session_title,
@@ -512,7 +525,7 @@ class PaperQASessionService:
             # 原始答案和 sources 长期保留；debug 快照只保存压缩视图，避免开发 trace/候选列表写入消息表后无限增长。
             debug_snapshot = self.context_lifecycle_service.prepare_debug_snapshot(retrieval_debug)
             # 数据库层一次性写入完整 turn，避免用户消息成功、助手消息失败后污染短期记忆。
-            persisted_turn = self.db_service.append_paper_qa_turn(
+            persisted_turn = self.paper_qa_turn_store.append_paper_qa_turn(
                 session_id=session_id,
                 user_id=user_id,
                 question=question,
@@ -597,7 +610,7 @@ class PaperQASessionService:
                 answer=answer,
                 source_payload=source_payload,
             )
-            updated = self.db_service.update_paper_chat_session_summary(
+            updated = self.paper_chat_session_store.update_paper_chat_session_summary(
                 session_id,
                 user_id=user_id,
                 summary=merged_summary,
