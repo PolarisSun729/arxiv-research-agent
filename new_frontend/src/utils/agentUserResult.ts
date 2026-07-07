@@ -2,6 +2,7 @@ import type {
   AgentPaper,
   AgentPendingAction,
   AgentPreferenceActionResult,
+  AgentQaIndexJob,
   ArxivSearchResponse,
   PaperTargetCandidate
 } from '@/types/agent'
@@ -21,13 +22,19 @@ export interface AgentUserPendingActionCandidate {
 
 export interface AgentUserPendingAction {
   kind: 'paper_target_confirmation' | 'general_confirmation'
+  status: string
   title: string
   description: string
   confirmLabel: string
   cancelLabel: string
   isConfirming: boolean
+  isBuildingIndex: boolean
   defaultCandidateId: string
   candidates: AgentUserPendingActionCandidate[]
+  indexJob: AgentQaIndexJob | null
+  indexProgress: number
+  indexStageText: string
+  indexErrorMessage: string
 }
 
 export interface AgentUserPreferenceFeedback {
@@ -154,29 +161,103 @@ function normalizePreferenceFeedback(
   return { status: 'success', message: result.message || '偏好已更新' }
 }
 
+function clampProgress(value: unknown) {
+  const numeric = Number(value || 0)
+  if (!Number.isFinite(numeric)) return 0
+  return Math.max(0, Math.min(100, Math.round(numeric)))
+}
+
+function qaIndexStageText(stage: string) {
+  const normalized = String(stage || '').trim()
+  const labels: Record<string, string> = {
+    pending: '等待后台任务',
+    starting: '启动索引任务',
+    validate_loading_method: '校验解析方式',
+    create_build_version: '创建索引版本',
+    mark_index_processing: '标记处理中',
+    load_paper_metadata: '读取论文元数据',
+    download_pdf: '下载 PDF',
+    load_document: '解析 PDF',
+    chunk_document: '切分全文内容',
+    build_retrieval_indexes: '生成检索索引',
+    create_embeddings: '生成向量',
+    index_embeddings_to_vector_store: '写入向量库',
+    activate_index: '激活索引版本',
+    mark_index_success: '索引完成',
+    failed: '构建失败',
+    stale: '任务超时'
+  }
+  return labels[normalized] || normalized || '准备构建索引'
+}
+
+function isIndexBuildAction(action: AgentPendingAction) {
+  const toolName = String(action.tool_name || action.confirmation_request?.tool_name || '').trim()
+  return toolName === 'parse_and_index_paper'
+}
+
 function normalizePendingAction(action: AgentPendingAction | null | undefined): AgentUserPendingAction | null {
-  if (!action || (action.status !== 'waiting_confirmation' && action.status !== 'confirming')) return null
+  const status = String(action?.status || '').trim()
+  if (!action || !['waiting_confirmation', 'confirming', 'index_building', 'index_failed', 'ready_to_resume'].includes(status)) return null
 
   const isPaperTarget = isPaperTargetConfirmation(action)
   const rawCandidates = Array.isArray(action.candidates) ? action.candidates : []
   const recommended = action.recommended_candidate || action.target_paper || rawCandidates[0]
   const defaultCandidateId = action.default_candidate_id || (recommended ? getPaperTargetCandidateId(recommended) : '')
   const candidates = rawCandidates.map((candidate, index) => normalizeCandidate(candidate, index, defaultCandidateId))
+  const indexJob = action.index_job || action.index_continuation?.job || null
+  const isBuildingIndex = status === 'index_building'
+  const isIndexFailed = status === 'index_failed'
+  const isReadyToResume = status === 'ready_to_resume'
+  const indexProgress = clampProgress(indexJob?.progress)
+  const indexStageText = qaIndexStageText(String(indexJob?.current_stage || indexJob?.status || ''))
+  const indexErrorMessage = String(indexJob?.error_message || action.index_continuation?.error_message || '').trim()
+  const isIndexAction = isIndexBuildAction(action)
+  const baseTitle = action.title || action.title_text || '需要确认后继续'
+  const baseDescription = action.description || action.qa_question || action.original_question || '确认后会继续当前论文处理流程。'
+  const confirmLabel = isPaperTarget
+    ? '确认并继续'
+    : isBuildingIndex
+      ? '构建中'
+      : isIndexFailed
+        ? '重试构建索引'
+        : isReadyToResume
+          ? '继续回答'
+          : isIndexAction
+            ? '确认构建索引'
+            : '确认执行'
 
   // pending_action 是后端状态流转对象；这里只保留用户做决策所需的信息，避免泄露 tool/session/step 等运行细节。
   return {
     kind: isPaperTarget ? 'paper_target_confirmation' : 'general_confirmation',
+    status,
     title: isPaperTarget
       ? '请选择要继续处理的论文'
-      : action.title || action.title_text || '需要确认后继续',
+      : isBuildingIndex
+        ? '正在构建问答索引'
+        : isIndexFailed
+          ? '问答索引构建失败'
+          : isReadyToResume
+            ? '问答索引已完成'
+            : baseTitle,
     description: isPaperTarget
       ? '我找到了多个可能的目标论文，请选择你要继续处理的那一篇。'
-      : action.qa_question || action.original_question || action.description || '确认后会继续当前论文处理流程。',
-    confirmLabel: isPaperTarget ? '确认并继续' : '确认执行',
-    cancelLabel: '取消',
-    isConfirming: action.status === 'confirming',
+      : isBuildingIndex
+        ? '正在下载和解析 PDF，并创建全文检索索引；完成后会自动继续回答原问题。'
+        : isIndexFailed
+          ? (indexErrorMessage || '索引构建失败，可以重试构建或取消本次问答。')
+          : isReadyToResume
+            ? '索引已经建立，正在继续回答原问题。'
+            : baseDescription,
+    confirmLabel,
+    cancelLabel: isBuildingIndex || isIndexFailed || isReadyToResume ? '取消本次问答' : '取消',
+    isConfirming: status === 'confirming',
+    isBuildingIndex,
     defaultCandidateId,
-    candidates
+    candidates,
+    indexJob,
+    indexProgress,
+    indexStageText,
+    indexErrorMessage
   }
 }
 

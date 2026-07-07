@@ -22,6 +22,8 @@ try:
 except Exception:  # pragma: no cover - 测试轻量导入场景下允许缺失。
     _resolve_paper_reference = None
 
+from ..utils.paper_question_normalizer import normalize_single_paper_qa_question
+
 try:
     from ..utils.paper_target_resolver import resolve_paper_target as _resolve_paper_target
 except Exception:  # pragma: no cover - 测试轻量导入场景下允许缺失。
@@ -145,7 +147,10 @@ class AnswerPaperQuestionInput(BaseModel):
 
     @property
     def resolved_question(self) -> str:
-        return str(self.question or self.message or "").strip()
+        paper_ref = self.paper_ref or self.paper_reference or {}
+        # 目标论文已由 resolve_paper 落地后，进入 QA 前把“第二篇论文”等列表引用收敛成单篇语境；
+        # 原始 message 仍保留在 Agent trace 中，后端 QA 只消费归一化后的问题。
+        return normalize_single_paper_qa_question(self.question or self.message or "", paper_ref)
 
 
 class PaperQAAnswerOutput(BaseModel):

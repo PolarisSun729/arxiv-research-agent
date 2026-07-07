@@ -123,6 +123,18 @@ QA_INDEX_JOB_CONFIG: Dict[str, Any] = {
     "timeout_seconds": _env_int("QA_INDEX_JOB_TIMEOUT_SECONDS", 30 * 60),
 }
 
+PAPER_QA_BUILD_CACHE_CONFIG: Dict[str, Any] = {
+    # QA 建库里的 LLM 增强和 embedding 都是高成本外部调用；持久缓存用于失败重试和重复重建时复用确定性结果。
+    "enabled": _env_bool("PAPER_QA_BUILD_CACHE_ENABLED", True),
+    "root_dir": _env_str("PAPER_QA_BUILD_CACHE_DIR", str(BASE_DIR.parent / "06-database")),
+    "llm_cache_name": _env_str("PAPER_QA_LLM_CACHE_NAME", "paper_qa_llm_cache"),
+    "embedding_cache_name": _env_str("PAPER_QA_EMBEDDING_CACHE_NAME", "paper_qa_embedding_cache"),
+    "llm_size_limit": _env_int("PAPER_QA_LLM_CACHE_SIZE_LIMIT", 512 * 1024 * 1024),
+    "embedding_size_limit": _env_int("PAPER_QA_EMBEDDING_CACHE_SIZE_LIMIT", 2 * 1024 * 1024 * 1024),
+    # per-chunk LLM 调用互不依赖，默认小并发提速，同时避免把 provider 限流压力放大到不可控。
+    "llm_max_workers": _env_int("PAPER_QA_BUILD_LLM_MAX_WORKERS", 4),
+}
+
 PROFILE_EVIDENCE_CONFIG: Dict[str, Any] = {
     # evidence card 会调用外部 LLM；默认只开小并发，避免把限流和 SQLite 写入压力放大。
     "max_workers": _env_int("PROFILE_EVIDENCE_MAX_WORKERS", 2),
@@ -726,6 +738,10 @@ def get_user_runtime_config() -> Dict[str, Any]:
 
 def get_qa_index_job_runtime_config() -> Dict[str, Any]:
     return dict(QA_INDEX_JOB_CONFIG)
+
+
+def get_paper_qa_build_cache_config() -> Dict[str, Any]:
+    return dict(PAPER_QA_BUILD_CACHE_CONFIG)
 
 
 def get_agent_planner_runtime_config() -> Dict[str, Any]:

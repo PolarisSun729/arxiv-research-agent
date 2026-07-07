@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from services.retrieval.keyword_backend import InternalBM25Backend
+from services.paper_qa.build_cache import PaperQABuildCache
 from services.retrieval.retrieval_index import (
     CollectionRetrievalIndexProvider,
     build_retrieval_index_payload,
@@ -149,6 +150,53 @@ def test_generative_indexes_can_add_summary_and_questions() -> None:
     assert debug["generated_question_count"] == 2
     assert debug["generation_error_count"] == 0
     assert next(item for item in indexes if item["index_type"] == "summary")["index_text"].startswith("This chunk")
+
+
+def test_generative_indexes_reuse_cached_summary_and_questions(tmp_path: Path) -> None:
+    cache = PaperQABuildCache(
+        {
+            "enabled": True,
+            "root_dir": str(tmp_path),
+            "llm_cache_name": "llm",
+            "embedding_cache_name": "embedding",
+            "llm_size_limit": 1024 * 1024,
+            "embedding_size_limit": 1024 * 1024,
+        }
+    )
+    chunk = {
+        "content": "The retriever is trained with contrastive learning over positive and negative passages.",
+        "metadata": {
+            "chunk_id": "chunk-cache",
+            "chunk_type": "text",
+            "section_title": "Retriever Training",
+            "page_number": 4,
+        },
+    }
+    first_service = _JsonGenerationService()
+
+    first_indexes, first_debug = build_retrieval_index_payload(
+        [chunk],
+        generation_service=first_service,
+        enable_generative_indexes=True,
+        generation_cache=cache,
+        generation_model_name="fake-qwen",
+    )
+    second_service = _JsonGenerationService()
+    second_indexes, second_debug = build_retrieval_index_payload(
+        [chunk],
+        generation_service=second_service,
+        enable_generative_indexes=True,
+        generation_cache=cache,
+        generation_model_name="fake-qwen",
+    )
+
+    assert len(first_service.calls) == 2
+    assert second_service.calls == []
+    assert [item["index_text"] for item in second_indexes] == [item["index_text"] for item in first_indexes]
+    assert first_debug["generated_summary_count"] == 1
+    assert first_debug["generated_question_count"] == 2
+    assert second_debug["cached_summary_count"] == 1
+    assert second_debug["cached_question_count"] == 2
 
 
 def test_generated_question_indexes_can_be_disabled() -> None:

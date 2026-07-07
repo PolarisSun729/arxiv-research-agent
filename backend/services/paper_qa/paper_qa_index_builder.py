@@ -4,6 +4,7 @@ import json
 import hashlib
 import logging
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -17,6 +18,10 @@ from services.document.chunking_service import ChunkingService
 from services.document.table_structure_service import TableStructureService
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
 from services.llm.generation_service import GenerationService, QWEN_RERANK_COMPRESS_MODEL_NAME
+from services.paper_qa.build_cache import (
+    LLM_RERANK_TEXT_PROMPT_VERSION,
+    get_paper_qa_build_cache,
+)
 from services.document.loading_service import LoadingService
 from services.retrieval.retrieval_index import (
     RETRIEVAL_INDEX_ARTIFACT_SCHEMA_VERSION,
@@ -101,6 +106,9 @@ class PaperQAIndexBuilder:
         self.loading_service_factory = loading_service_factory
         self.chunking_service_factory = chunking_service_factory
         self.retrieval_runtime_config = get_enhanced_retrieval_runtime_config()
+        self.build_cache = get_paper_qa_build_cache()
+        cache_config = getattr(self.build_cache, "config", {}) or {}
+        self.llm_max_workers = max(1, int(cache_config.get("llm_max_workers") or 1))
 
     @staticmethod
     def _chunk_type_counts(chunks: List[Dict[str, Any]]) -> Tuple[int, int, int]:
@@ -716,11 +724,67 @@ class PaperQAIndexBuilder:
         return chunk_file
 
     def compress_chunks_for_rerank(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        logger.debug("Compressing chunk text for rerank with Qwen...")
-        compressed_chunks = self.generation_service.compress_chunks_for_rerank(
-            chunks=chunks,
-            model_name=QWEN_RERANK_COMPRESS_MODEL_NAME,
+        logger.debug(
+            "Compressing chunk text for rerank with Qwen: chunk_count=%s max_workers=%s cache_enabled=%s",
+            len(chunks),
+            self.llm_max_workers,
+            getattr(self.build_cache, "enabled", False),
         )
+
+        def compress_with_service(chunk: Dict[str, Any], raw_content: str, metadata: Dict[str, Any]) -> str:
+            single_compressor = getattr(self.generation_service, "compress_chunk_for_rerank", None)
+            if callable(single_compressor):
+                return single_compressor(
+                    chunk_text=raw_content,
+                    chunk_metadata=metadata,
+                    model_name=QWEN_RERANK_COMPRESS_MODEL_NAME,
+                )
+            batch_compressor = getattr(self.generation_service, "compress_chunks_for_rerank", None)
+            if callable(batch_compressor):
+                # 测试替身和旧调用方可能只实现批量接口；这里用单元素批量调用保留兼容性。
+                compressed = batch_compressor(chunks=[chunk], model_name=QWEN_RERANK_COMPRESS_MODEL_NAME)
+                if compressed:
+                    compressed_chunk = dict(compressed[0] or {})
+                    compressed_metadata = dict(compressed_chunk.get("metadata", {}) or {})
+                    return str(compressed_chunk.get("rerank_text") or compressed_metadata.get("rerank_text") or "").strip()
+            raise AttributeError("generation_service must provide compress_chunk_for_rerank or compress_chunks_for_rerank")
+
+        def compress_one(position: int, chunk: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+            updated_chunk = dict(chunk)
+            metadata = dict(updated_chunk.get("metadata", {}) or {})
+            raw_content = str(updated_chunk.get("content", "") or "")
+            cache_kwargs = {
+                "kind": "rerank_text",
+                "model_name": QWEN_RERANK_COMPRESS_MODEL_NAME,
+                "prompt_version": LLM_RERANK_TEXT_PROMPT_VERSION,
+                "chunk_text": raw_content,
+                "metadata": metadata,
+            }
+            cached = self.build_cache.get_llm_result(**cache_kwargs)
+            if isinstance(cached, str) and cached.strip():
+                rerank_text = cached.strip()
+                cache_hit = True
+            else:
+                # 每个 chunk 的压缩互不依赖，未命中缓存时才进入受限并发，避免重复重建反复消耗 LLM 调用。
+                rerank_text = compress_with_service(updated_chunk, raw_content, metadata)
+                self.build_cache.set_llm_result(rerank_text, **cache_kwargs)
+                cache_hit = False
+
+            metadata["rerank_text"] = rerank_text
+            metadata["rerank_text_model"] = QWEN_RERANK_COMPRESS_MODEL_NAME
+            metadata["rerank_text_generated_at"] = datetime.now().isoformat()
+            metadata["rerank_text_cache_hit"] = cache_hit
+            updated_chunk["metadata"] = metadata
+            updated_chunk["rerank_text"] = rerank_text
+            return position, updated_chunk
+
+        if self.llm_max_workers <= 1 or len(chunks) <= 1:
+            compressed_pairs = [compress_one(index, chunk) for index, chunk in enumerate(chunks)]
+        else:
+            with ThreadPoolExecutor(max_workers=self.llm_max_workers, thread_name_prefix="qa-rerank-compress") as executor:
+                compressed_pairs = list(executor.map(lambda item: compress_one(item[0], item[1]), enumerate(chunks)))
+
+        compressed_chunks = [chunk for _, chunk in sorted(compressed_pairs, key=lambda item: item[0])]
         logger.debug("Generated rerank_text for %d chunks", len(compressed_chunks))
         return compressed_chunks
 
@@ -730,12 +794,16 @@ class PaperQAIndexBuilder:
         max_questions_per_chunk = (
             DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK if enable_generated_question_index else 0
         )
+        generation_model_name = self._retrieval_index_generation_model_name()
         # 生成式 summary/question 只是召回增强；失败时 builder 会回落到规则索引，不能阻断整篇论文建库。
         retrieval_indexes, retrieval_index_debug = build_retrieval_index_payload(
             chunks,
             generation_service=self.generation_service,
             enable_generative_indexes=True,
             max_questions_per_chunk=max_questions_per_chunk,
+            max_workers=self.llm_max_workers,
+            generation_cache=self.build_cache,
+            generation_model_name=generation_model_name,
         )
         retrieval_index_debug["generated_question_index_enabled"] = enable_generated_question_index
         logger.debug(
@@ -745,6 +813,19 @@ class PaperQAIndexBuilder:
             retrieval_index_debug.get("generation_error_count"),
         )
         return retrieval_indexes, retrieval_index_debug
+
+    def _retrieval_index_generation_model_name(self) -> str:
+        resolver = getattr(self.generation_service, "_resolve_qwen_model_selection", None)
+        if not callable(resolver):
+            return "retrieval_index_generation"
+        try:
+            selection = resolver(task_type="retrieval_index_generation", default_role="large")
+            selected_model = str((selection or {}).get("selected_model") or "").strip()
+            return selected_model or "retrieval_index_generation"
+        except Exception as exc:
+            # 模型名只影响缓存隔离；解析失败时降级到任务名，不能阻断建库主流程。
+            logger.warning("Resolve retrieval index generation model for cache key failed: %s", exc)
+            return "retrieval_index_generation"
 
     def save_retrieval_index_artifact(
         self,

@@ -255,6 +255,28 @@ class StorageSchemaMigrator:
             ''')
 
             cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS agent_qa_index_continuations (
+                    job_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL DEFAULT '{default_user_id_sql}',
+                    session_id TEXT NOT NULL,
+                    arxiv_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'waiting_job',
+                    pending_action_id TEXT,
+                    step_id TEXT,
+                    tool_name TEXT,
+                    original_question TEXT,
+                    resume_payload_json TEXT,
+                    pending_action_json TEXT,
+                    job_snapshot_json TEXT,
+                    error_message TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TIMESTAMP,
+                    FOREIGN KEY(job_id) REFERENCES paper_index_jobs(job_id)
+                )
+            ''')
+
+            cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS paper_chat_sessions (
                     session_id TEXT PRIMARY KEY,
                     user_id TEXT NOT NULL DEFAULT '{default_user_id_sql}',
@@ -540,6 +562,16 @@ class StorageSchemaMigrator:
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_paper_index_jobs_status_updated
                 ON paper_index_jobs(status, updated_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_agent_qa_index_continuations_session
+                ON agent_qa_index_continuations(user_id, session_id, status, updated_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_agent_qa_index_continuations_arxiv
+                ON agent_qa_index_continuations(arxiv_id, status, updated_at DESC)
             ''')
 
             cursor.execute('''

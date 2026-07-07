@@ -3,8 +3,9 @@ import json
 import re
 import base64
 import mimetypes
+import io
 from datetime import datetime
-from typing import List, Dict, Optional, Iterator, Any
+from typing import List, Dict, Optional, Iterator, Any, Tuple
 import logging
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -33,6 +34,26 @@ HF_GENERATE_DO_SAMPLE = GENERATION_CONFIG["huggingface_generate_do_sample"]
 REWRITE_QUERY_MAX_QUERIES_DEFAULT = GENERATION_CONFIG["rewrite_query_max_queries_default"]
 PLAN_QUERY_MAX_QUERIES_DEFAULT = GENERATION_CONFIG["plan_query_max_queries_default"]
 QWEN_TASK_MODEL_ROLES = dict(GENERATION_CONFIG.get("task_model_roles", {}))
+
+# DashScope Responses API 会在入站阶段按请求体字节数拒绝超大请求；这里用软限制预留
+# JSON、模型名和 extra_body 的余量，避免图片 base64 后把最终 QA 请求撑爆。
+QWEN_RESPONSES_REQUEST_BODY_LIMIT_BYTES = int(
+    GENERATION_CONFIG.get("qwen_responses_request_body_limit_bytes") or 6_291_456
+)
+QWEN_RESPONSES_REQUEST_BODY_SOFT_LIMIT_BYTES = int(
+    GENERATION_CONFIG.get("qwen_responses_request_body_soft_limit_bytes") or 5_500_000
+)
+QWEN_RESPONSES_IMAGE_TARGET_BYTES = int(
+    GENERATION_CONFIG.get("qwen_responses_image_target_bytes") or 1_500_000
+)
+QWEN_RESPONSES_MAX_IMAGE_COUNT = int(
+    GENERATION_CONFIG.get("qwen_responses_max_image_count") or 2
+)
+QWEN_RESPONSES_IMAGE_COMPRESSION_STEPS = (
+    (1600, 85),
+    (1280, 75),
+    (1024, 65),
+)
 
 class GenerationService:
     """
@@ -356,6 +377,7 @@ Answer:"""
         enable_thinking: bool = QWEN_RERANK_COMPRESS_ENABLE_THINKING,
         image_inputs: Optional[List[Dict[str, Any]]] = None,
         asset_metadata: Optional[List[Dict[str, Any]]] = None,
+        request_debug: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         使用阿里云百炼兼容的 OpenAI Responses API 生成答案。
@@ -380,14 +402,18 @@ Answer:"""
                 base_url=QWEN_BASE_URL,
             )
 
+            qwen_input, input_debug = self._build_qwen_input_with_debug(
+                query=query,
+                context=context,
+                image_inputs=image_inputs,
+                asset_metadata=asset_metadata,
+            )
+            if request_debug is not None:
+                request_debug.update(input_debug)
+
             response = client.responses.create(
                 model=model_name,
-                input=self._build_qwen_input(
-                    query=query,
-                    context=context,
-                    image_inputs=image_inputs,
-                    asset_metadata=asset_metadata,
-                ),
+                input=qwen_input,
                 extra_body={"enable_thinking": enable_thinking},
             )
 
@@ -1070,10 +1096,33 @@ Answer:"""
         image_inputs: Optional[List[Dict[str, Any]]] = None,
         asset_metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> Any:
+        qwen_input, _ = self._build_qwen_input_with_debug(
+            query=query,
+            context=context,
+            image_inputs=image_inputs,
+            asset_metadata=asset_metadata,
+        )
+        return qwen_input
+
+    def _build_qwen_input_with_debug(
+        self,
+        query: str,
+        context: str,
+        image_inputs: Optional[List[Dict[str, Any]]] = None,
+        asset_metadata: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[Any, Dict[str, Any]]:
         image_inputs = image_inputs or []
         asset_metadata = asset_metadata or []
         if not image_inputs:
-            return self._build_qwen_prompt(query, context)
+            prompt = self._build_qwen_prompt(query, context)
+            return prompt, {
+                "qwen_multimodal_enabled": False,
+                "candidate_image_count": 0,
+                "sent_image_count": 0,
+                "dropped_image_count": 0,
+                "estimated_request_bytes": len(prompt.encode("utf-8")),
+                "images": [],
+            }
 
         evidence_lines = []
         for index, item in enumerate(asset_metadata, start=1):
@@ -1089,17 +1138,133 @@ Answer:"""
             f"Question: {query}"
         )
         content = [{"type": "input_text", "text": intro_text}]
+        image_parts, image_debug = self._prepare_qwen_image_content_parts(
+            image_inputs=image_inputs,
+            base_content=content,
+        )
+        content.extend(image_parts)
+        qwen_input = [{"role": "user", "content": content}]
+        image_debug["estimated_request_bytes"] = self._estimate_qwen_input_bytes(qwen_input)
+        return qwen_input, image_debug
+
+    def _prepare_qwen_image_content_parts(
+        self,
+        *,
+        image_inputs: List[Dict[str, Any]],
+        base_content: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        debug: Dict[str, Any] = {
+            "qwen_multimodal_enabled": True,
+            "request_body_limit_bytes": QWEN_RESPONSES_REQUEST_BODY_LIMIT_BYTES,
+            "request_body_soft_limit_bytes": QWEN_RESPONSES_REQUEST_BODY_SOFT_LIMIT_BYTES,
+            "image_target_bytes": QWEN_RESPONSES_IMAGE_TARGET_BYTES,
+            "max_image_count": QWEN_RESPONSES_MAX_IMAGE_COUNT,
+            "candidate_image_count": len(image_inputs),
+            "sent_image_count": 0,
+            "dropped_image_count": 0,
+            "base_request_bytes": self._estimate_qwen_input_bytes([{"role": "user", "content": base_content}]),
+            "estimated_request_bytes": 0,
+            "images": [],
+        }
+        selected_parts: List[Dict[str, Any]] = []
+
         for image in image_inputs:
+            item_debug = self._new_qwen_image_debug_item(image)
+            if debug["sent_image_count"] >= QWEN_RESPONSES_MAX_IMAGE_COUNT:
+                self._mark_qwen_image_skipped(item_debug, "max_image_count_exceeded")
+                debug["images"].append(item_debug)
+                continue
+
             image_path = str(image.get("image_path", "") or "").strip()
             if not image_path:
+                self._mark_qwen_image_skipped(item_debug, "missing_image_path")
+                debug["images"].append(item_debug)
                 continue
-            content.append(
-                {
-                    "type": "input_image",
-                    "image_url": self._image_path_to_data_url(image_path),
-                }
+
+            try:
+                prepared = self._prepare_qwen_image_data_url(
+                    image_path,
+                    target_bytes=QWEN_RESPONSES_IMAGE_TARGET_BYTES,
+                )
+                item_debug.update(prepared.get("debug", {}))
+                data_url = str(prepared.get("data_url") or "")
+            except Exception as exc:
+                # 图片处理失败不应中断 QA；文本证据和图片摘要仍可支撑一次降级回答。
+                item_debug["error"] = str(exc)
+                logger.warning(
+                    "Qwen image input skipped due to preparation error: source_id=%s image_path=%s error=%s",
+                    item_debug.get("source_id"),
+                    image_path,
+                    exc,
+                )
+                data_url = ""
+
+            if not data_url:
+                self._mark_qwen_image_skipped(
+                    item_debug,
+                    str(item_debug.get("skip_reason") or "image_preparation_failed"),
+                )
+                debug["images"].append(item_debug)
+                continue
+
+            label_part = {
+                "type": "input_text",
+                "text": self._build_qwen_image_label_text(image),
+            }
+            image_part = {"type": "input_image", "image_url": data_url}
+            candidate_parts = selected_parts + [label_part, image_part]
+            estimated_request_bytes = self._estimate_qwen_input_bytes(
+                [{"role": "user", "content": base_content + candidate_parts}]
             )
-        return [{"role": "user", "content": content}]
+            item_debug["estimated_request_bytes_if_sent"] = estimated_request_bytes
+            if estimated_request_bytes > QWEN_RESPONSES_REQUEST_BODY_SOFT_LIMIT_BYTES:
+                # 软限制兜底的是整包大小：即使单图压缩成功，也不能让最终 JSON 请求接近 DashScope 硬上限。
+                self._mark_qwen_image_skipped(item_debug, "request_body_soft_limit_exceeded")
+                debug["images"].append(item_debug)
+                continue
+
+            item_debug["sent"] = True
+            item_debug["skip_reason"] = ""
+            selected_parts.extend([label_part, image_part])
+            debug["sent_image_count"] += 1
+            debug["images"].append(item_debug)
+
+        debug["dropped_image_count"] = len([item for item in debug["images"] if not item.get("sent")])
+        if debug["dropped_image_count"]:
+            debug["fallback_to_asset_summary"] = True
+        return selected_parts, debug
+
+    @staticmethod
+    def _build_qwen_image_label_text(image: Dict[str, Any]) -> str:
+        return (
+            "[Attached Image Evidence] "
+            f"source_id={image.get('source_id', '')} "
+            f"page={image.get('page_number', '')} "
+            f"summary={image.get('asset_summary', '')} "
+            f"section={image.get('section_path', '')}"
+        )
+
+    @staticmethod
+    def _estimate_qwen_input_bytes(qwen_input: Any) -> int:
+        # 使用紧凑 JSON 估算 Responses API 入参体积；软限制会额外预留模型名和 extra_body 的空间。
+        return len(json.dumps(qwen_input, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+    @staticmethod
+    def _new_qwen_image_debug_item(image: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "source_id": str(image.get("source_id", "") or ""),
+            "image_path": str(image.get("image_path", "") or ""),
+            "page_number": image.get("page_number", ""),
+            "sent": False,
+            "skip_reason": "",
+            "fallback_to_asset_summary": False,
+        }
+
+    @staticmethod
+    def _mark_qwen_image_skipped(item_debug: Dict[str, Any], reason: str) -> None:
+        item_debug["sent"] = False
+        item_debug["skip_reason"] = reason
+        item_debug["fallback_to_asset_summary"] = True
 
     def stream_qwen_responses(
         self,
@@ -1127,14 +1292,15 @@ Answer:"""
             model_name = model_selection["selected_model"]
 
             client = OpenAI(api_key=api_key, base_url=QWEN_BASE_URL)
+            qwen_input, input_debug = self._build_qwen_input_with_debug(
+                query=query,
+                context=context,
+                image_inputs=image_inputs,
+                asset_metadata=asset_metadata,
+            )
             stream = client.responses.create(
                 model=model_name,
-                input=self._build_qwen_input(
-                    query=query,
-                    context=context,
-                    image_inputs=image_inputs,
-                    asset_metadata=asset_metadata,
-                ),
+                input=qwen_input,
                 stream=True,
                 extra_body={"enable_thinking": enable_thinking},
             )
@@ -1158,6 +1324,7 @@ Answer:"""
                             "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
                             "total_tokens": getattr(usage, "total_tokens", None) if usage else None,
                         },
+                        "qwen_request_debug": input_debug,
                     }
                     return
 
@@ -1165,6 +1332,7 @@ Answer:"""
                 "type": "completed",
                 "answer": "".join(answer_parts),
                 "usage": None,
+                "qwen_request_debug": input_debug,
             }
         except Exception as e:
             logger.error(f"Error streaming with Qwen Responses API: {str(e)}")
@@ -1259,6 +1427,7 @@ Answer:"""
                 model_name = model_selection["selected_model"]
 
             # 根据不同提供商生成回答
+            qwen_request_debug: Dict[str, Any] = {}
             if provider == "openai":
                 if not model_name:
                     raise ValueError("OpenAI model name is required")
@@ -1273,6 +1442,7 @@ Answer:"""
                     enable_thinking=QWEN_RERANK_COMPRESS_ENABLE_THINKING,
                     image_inputs=image_inputs,
                     asset_metadata=asset_metadata,
+                    request_debug=qwen_request_debug,
                 )
             elif provider == "deepseek":
                 if not model_name:
@@ -1298,6 +1468,7 @@ Answer:"""
                 "context": search_results,
                 "image_inputs": image_inputs or [],
                 "asset_metadata": asset_metadata or [],
+                "qwen_request_debug": qwen_request_debug,
             }
             
             # 生成文件名并保存
@@ -1310,7 +1481,8 @@ Answer:"""
                 
             return {
                 "response": response,
-                "saved_filepath": filepath
+                "saved_filepath": filepath,
+                "qwen_request_debug": qwen_request_debug,
             }
             
         except Exception as e:
@@ -1333,5 +1505,106 @@ Answer:"""
             raise ValueError(f"Image path does not exist: {image_path}")
         mime_type = mimetypes.guess_type(image_path)[0] or "image/png"
         with open(image_path, "rb") as image_file:
-            encoded = base64.b64encode(image_file.read()).decode("ascii")
+            return self._image_bytes_to_data_url(image_file.read(), mime_type)
+
+    def _prepare_qwen_image_data_url(self, image_path: str, *, target_bytes: int) -> Dict[str, Any]:
+        if not image_path:
+            raise ValueError("Image path is required for multimodal generation")
+        if not os.path.exists(image_path):
+            raise ValueError(f"Image path does not exist: {image_path}")
+
+        mime_type = mimetypes.guess_type(image_path)[0] or "image/png"
+        with open(image_path, "rb") as image_file:
+            original_bytes = image_file.read()
+        original_size = len(original_bytes)
+        debug: Dict[str, Any] = {
+            "original_bytes": original_size,
+            "original_mime_type": mime_type,
+            "compressed": False,
+            "compressed_bytes": original_size,
+            "output_mime_type": mime_type,
+            "compression_attempts": [],
+        }
+        if original_size <= target_bytes:
+            debug["data_url_bytes"] = len(self._image_bytes_to_data_url(original_bytes, mime_type).encode("utf-8"))
+            return {
+                "data_url": self._image_bytes_to_data_url(original_bytes, mime_type),
+                "debug": debug,
+            }
+
+        try:
+            from PIL import Image, ImageOps
+        except ImportError:
+            # Pillow 不可用时不能安全压缩大图，直接降级为图片摘要，避免原图 base64 触发 400。
+            debug["skip_reason"] = "pillow_unavailable_for_large_image"
+            return {"data_url": "", "debug": debug}
+
+        best_bytes: Optional[bytes] = None
+        best_attempt: Dict[str, Any] = {}
+        try:
+            with Image.open(io.BytesIO(original_bytes)) as opened:
+                normalized = ImageOps.exif_transpose(opened)
+                for max_side, quality in QWEN_RESPONSES_IMAGE_COMPRESSION_STEPS:
+                    candidate = self._resize_qwen_image_for_jpeg(normalized, max_side=max_side, image_module=Image)
+                    output = io.BytesIO()
+                    candidate.save(output, format="JPEG", quality=quality, optimize=True)
+                    compressed_bytes = output.getvalue()
+                    attempt = {
+                        "max_side": max_side,
+                        "quality": quality,
+                        "bytes": len(compressed_bytes),
+                    }
+                    debug["compression_attempts"].append(attempt)
+                    if best_bytes is None or len(compressed_bytes) < len(best_bytes):
+                        best_bytes = compressed_bytes
+                        best_attempt = attempt
+                    if len(compressed_bytes) <= target_bytes:
+                        debug.update(
+                            {
+                                "compressed": True,
+                                "compressed_bytes": len(compressed_bytes),
+                                "output_mime_type": "image/jpeg",
+                                "selected_compression": attempt,
+                                "data_url_bytes": len(
+                                    self._image_bytes_to_data_url(compressed_bytes, "image/jpeg").encode("utf-8")
+                                ),
+                            }
+                        )
+                        return {
+                            "data_url": self._image_bytes_to_data_url(compressed_bytes, "image/jpeg"),
+                            "debug": debug,
+                        }
+        except Exception as exc:
+            # 解析或转码异常只影响图片输入；调用方会继续使用文本和图片摘要回答。
+            debug["skip_reason"] = "image_compression_failed"
+            debug["error"] = str(exc)
+            return {"data_url": "", "debug": debug}
+
+        debug["compressed"] = bool(best_bytes)
+        debug["compressed_bytes"] = len(best_bytes or b"")
+        debug["output_mime_type"] = "image/jpeg" if best_bytes else mime_type
+        debug["selected_compression"] = best_attempt
+        debug["skip_reason"] = "compressed_image_too_large"
+        return {"data_url": "", "debug": debug}
+
+    @staticmethod
+    def _resize_qwen_image_for_jpeg(image: Any, *, max_side: int, image_module: Any) -> Any:
+        width, height = image.size
+        scale = min(1.0, float(max_side) / max(width, height))
+        if scale < 1.0:
+            resized_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+            resampling = getattr(getattr(image_module, "Resampling", image_module), "LANCZOS")
+            image = image.resize(resized_size, resampling)
+
+        # JPEG 没有透明通道；透明 PNG 使用白底合成，避免压缩后出现黑底或异常 alpha。
+        if image.mode in {"RGBA", "LA"} or (image.mode == "P" and image.info.get("transparency") is not None):
+            rgba = image.convert("RGBA")
+            background = image_module.new("RGBA", rgba.size, (255, 255, 255, 255))
+            background.alpha_composite(rgba)
+            return background.convert("RGB")
+        return image.convert("RGB")
+
+    @staticmethod
+    def _image_bytes_to_data_url(image_bytes: bytes, mime_type: str) -> str:
+        encoded = base64.b64encode(image_bytes).decode("ascii")
         return f"data:{mime_type};base64,{encoded}"

@@ -82,6 +82,8 @@ class AnswerGenerator:
                 "prompt_context": prompt_assembly.get("debug", {}),
                 "model": generation_result.get("model") if isinstance(generation_result, dict) else None,
                 "saved_filepath": generation_result.get("saved_filepath") if isinstance(generation_result, dict) else None,
+                # Qwen 请求体预算由生成层统一处理，这里只透传诊断结果，便于区分“图片降级”和“检索证据不足”。
+                "qwen_request_debug": generation_result.get("qwen_request_debug", {}) if isinstance(generation_result, dict) else {},
             },
         }
 

@@ -52,10 +52,28 @@ def build_paper_qa_index(arxiv_id: str, loading_method: str = "docling", run_id:
     # run_id 只进入工具 trace 和索引构建日志，不影响加载方式或索引内容。
     trace_inputs = {"arxiv_id": arxiv_id, "loading_method": loading_method, "run_id": run_id}
     try:
+        service = _get_paper_qa_service()
+        status = service.get_qa_status(arxiv_id)
+        if bool(status.get("has_index")):
+            # Agent 的可恢复构建链路会先异步建索引，job 成功后再 resume；
+            # 此时工具只需要确认索引已存在，避免重复解析 PDF 和重写向量库。
+            data = {
+                **status,
+                "status": "already_indexed",
+                "arxiv_id": arxiv_id,
+                "skipped_rebuild": True,
+            }
+            return make_tool_result(
+                ok=True,
+                tool_name=tool_name,
+                summary=f"论文 {arxiv_id} 已有 QA 索引，跳过重复构建",
+                data=data,
+                trace=make_tool_trace(tool_name, inputs=trace_inputs, source="paper_qa_service"),
+            )
         service_kwargs: Dict[str, Any] = {"loading_method": loading_method}
         if run_id:
             service_kwargs["run_id"] = run_id
-        data = _get_paper_qa_service().build_qa_index(arxiv_id, **service_kwargs)
+        data = service.build_qa_index(arxiv_id, **service_kwargs)
         return make_tool_result(
             ok=True,
             tool_name=tool_name,

@@ -4,6 +4,8 @@ import sys
 import types
 
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
+import services.embedding.embedding_service as embedding_service_module
+from services.paper_qa.build_cache import PaperQABuildCache
 
 
 if "pymilvus" not in sys.modules:
@@ -49,6 +51,16 @@ class _RecordingEmbeddingService(EmbeddingService):
         return [[float(index + 1), 0.0, 0.0] for index, _text in enumerate(texts)]
 
 
+class _DashScopeProviderRecordingService(EmbeddingService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recorded_inputs: list[list[dict]] = []
+
+    def _create_dashscope_embeddings_from_inputs(self, embedding_inputs: list, config: EmbeddingConfig) -> tuple[list, dict]:
+        self.recorded_inputs.append([dict(item) for item in embedding_inputs])
+        return [[float(len(self.recorded_inputs)), float(index), 0.0] for index, _item in enumerate(embedding_inputs)], {}
+
+
 def test_create_embeddings_uses_retrieval_index_text_and_preserves_chunk_content() -> None:
     service = _RecordingEmbeddingService()
     chunk = {
@@ -78,6 +90,32 @@ def test_create_embeddings_uses_retrieval_index_text_and_preserves_chunk_content
     assert metadata["index_id"] == "7:summary:1"
     assert metadata["retrieval_index_id"] == "7:summary:1"
     assert metadata["index_text"] == "Index-level summary text used for embedding."
+
+
+def test_dashscope_text_embeddings_reuse_persistent_build_cache(tmp_path, monkeypatch) -> None:
+    cache = PaperQABuildCache(
+        {
+            "enabled": True,
+            "root_dir": str(tmp_path),
+            "llm_cache_name": "llm",
+            "embedding_cache_name": "embedding",
+            "llm_size_limit": 1024 * 1024,
+            "embedding_size_limit": 1024 * 1024,
+        }
+    )
+    monkeypatch.setattr(embedding_service_module, "get_paper_qa_build_cache", lambda: cache)
+    service = _DashScopeProviderRecordingService()
+    config = EmbeddingConfig(provider="dashscope", model_name="fake", dimension=3, batch_size=8)
+
+    first = service._create_dashscope_embeddings(["alpha", "beta"], config)
+    second = service._create_dashscope_embeddings(["alpha", "beta", "gamma"], config)
+
+    assert service.recorded_inputs == [
+        [{"mode": "text", "text": "alpha"}, {"mode": "text", "text": "beta"}],
+        [{"mode": "text", "text": "gamma"}],
+    ]
+    assert second[:2] == first
+    assert second[2] == [2.0, 0.0, 0.0]
 
 
 def test_create_embeddings_can_fallback_to_legacy_chunk_level_mode() -> None:

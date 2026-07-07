@@ -26,6 +26,7 @@ from services.retrieval.retrieval_index import (
     iter_retrieval_indexes_for_embedding,
     normalize_chunk_id,
 )
+from services.paper_qa.build_cache import get_paper_qa_build_cache
 from utils.config import EMBEDDING_CONFIG, get_enhanced_retrieval_runtime_config
 
 logger = logging.getLogger(__name__)
@@ -357,8 +358,41 @@ class EmbeddingService:
     def _create_dashscope_embeddings(self, texts: list, config: EmbeddingConfig) -> list:
         """DashScope 文本批量 embedding 的轻量封装。"""
         embedding_inputs = [{"mode": "text", "text": text} for text in texts]
-        vectors, _ = self._create_dashscope_embeddings_from_inputs(embedding_inputs, config)
-        return vectors
+        build_cache = get_paper_qa_build_cache()
+        vectors: List[Optional[list]] = [None] * len(embedding_inputs)
+        pending_indexes: List[int] = []
+        pending_inputs: List[dict] = []
+
+        for index, embedding_input in enumerate(embedding_inputs):
+            cached = build_cache.get_embedding(
+                provider=EmbeddingProvider.DASHSCOPE.value,
+                model_name=config.model_name,
+                dimension=config.dimension,
+                embedding_input=embedding_input,
+            )
+            if cached is not None:
+                vectors[index] = cached
+                continue
+            pending_indexes.append(index)
+            pending_inputs.append(embedding_input)
+
+        if pending_inputs:
+            # 只把未命中的文本送到远程 provider，重复重建时能保留原有批量优势并跳过已缓存向量。
+            pending_vectors, _ = self._create_dashscope_embeddings_from_inputs(pending_inputs, config)
+            if len(pending_vectors) != len(pending_inputs):
+                raise ValueError(f"DashScope returned {len(pending_vectors)} embeddings for {len(pending_inputs)} texts")
+            for index, embedding_input, vector in zip(pending_indexes, pending_inputs, pending_vectors):
+                normalized_vector = self._normalize_vector_output(vector)
+                build_cache.set_embedding(
+                    normalized_vector,
+                    provider=EmbeddingProvider.DASHSCOPE.value,
+                    model_name=config.model_name,
+                    dimension=config.dimension,
+                    embedding_input=embedding_input,
+                )
+                vectors[index] = normalized_vector
+
+        return [vector if vector is not None else [] for vector in vectors]
 
     def _create_dashscope_embedding(self, text: str, config: EmbeddingConfig) -> list:
         """生成单条 DashScope 文本 embedding。"""
@@ -366,8 +400,26 @@ class EmbeddingService:
 
     def _create_dashscope_embedding_from_input(self, embedding_input: dict, config: EmbeddingConfig) -> list:
         """生成单条 DashScope 输入的 embedding，支持文本或多模态载荷。"""
+        build_cache = get_paper_qa_build_cache()
+        cached = build_cache.get_embedding(
+            provider=EmbeddingProvider.DASHSCOPE.value,
+            model_name=config.model_name,
+            dimension=config.dimension,
+            embedding_input=embedding_input,
+        )
+        if cached is not None:
+            return cached
         vectors, _ = self._create_dashscope_embeddings_from_inputs([embedding_input], config)
-        return vectors[0]
+        normalized_vector = self._normalize_vector_output(vectors[0])
+        # 多模态图片会把文件内容摘要纳入 key，避免同一路径图片更新后误用旧向量。
+        build_cache.set_embedding(
+            normalized_vector,
+            provider=EmbeddingProvider.DASHSCOPE.value,
+            model_name=config.model_name,
+            dimension=config.dimension,
+            embedding_input=embedding_input,
+        )
+        return normalized_vector
 
     def _create_dashscope_embeddings_with_usage(self, texts: list, config: EmbeddingConfig) -> tuple[list, dict]:
         """生成 DashScope 文本 embedding，并返回 usage 信息。"""

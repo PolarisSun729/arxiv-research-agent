@@ -22,6 +22,7 @@ from ..schemas import ToolCallRequest
 from ..state import AgentState
 from ..utils.result_utils import _extract_error_message, _result_mapping, _result_ok
 from ..utils.paper_reference_resolver import _normalize_context_paper, _resolve_paper_reference
+from ..utils.paper_question_normalizer import normalize_single_paper_qa_question
 from ..utils.state_utils import _append_step, _coerce_state, _get_execution_plan_step
 from ..utils.text_utils import _matches_any, _normalize_text
 from .tool_node import execute_tool
@@ -39,15 +40,14 @@ def _build_qa_question_for_paper(intent: str, message: str, paper: Mapping[str, 
     original_question = _normalize_text(message)
     title = _normalize_text(str(paper.get("title") or reference.get("title") or ""))
 
-    cleaned_question = original_question
-    # 依次剥离“问一下”“第一篇”“这篇论文”“arXiv ID”这类引用性噪声，只保留真正的问题主体。
+    cleaned_question = normalize_single_paper_qa_question(original_question, reference)
+    # 依次剥离“问一下”等动作噪声；目标论文引用已在已解析目标的前提下归一化，避免误删论文内部的“第二节”。
     cleaned_question = re.sub(r"^(问一下|请问一下|请问|问|帮我问一下|帮我问|想问一下)\s*", "", cleaned_question).strip()
     cleaned_question = re.sub(
         r"^(?:(?:最后一|最后1|最后|末一|末)\s*篇(?:论文|paper)?|第\s*[一二三四五六七八九十两0-9]+\s*篇(?:论文|paper)?|[1-9]|1[0-9]|20)\s*[:：,，]?\s*",
         "",
         cleaned_question,
     ).strip()
-    cleaned_question = re.sub(r"^(?:这篇论文|这篇|该论文|当前选中论文|当前论文|本文)\s*", "", cleaned_question).strip()
     cleaned_question = re.sub(r"^arxiv\s*id\s*[:：]?\s*\d{4}\.\d{4,5}(?:v\d+)?\s*", "", cleaned_question, flags=re.IGNORECASE).strip()
     cleaned_question = re.sub(r"^\d{4}\.\d{4,5}(?:v\d+)?\s*", "", cleaned_question).strip()
     cleaned_question = cleaned_question.lstrip("，,:：.。;； ")

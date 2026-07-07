@@ -31,6 +31,9 @@ const {
   setInputMessage,
   submitMessage,
   submitResume,
+  submitIndexBuildContinuation,
+  cancelIndexBuildContinuation,
+  restoreActiveIndexContinuations,
   clearConversation
 } = useAgentSearchChat()
 
@@ -42,6 +45,7 @@ const quickPrompts = [
 
 onMounted(() => {
   store.fetchResearchProfile()
+  restoreActiveIndexContinuations()
 })
 
 function handlePromptSelect(prompt: string) {
@@ -57,7 +61,7 @@ function selectedPendingCandidate(candidateId?: string) {
   return candidates.find((candidate, index) => getPaperTargetCandidateId(candidate, index) === candidateId) || null
 }
 
-function handleConfirmPendingAction(candidateId?: string) {
+async function handleConfirmPendingAction(candidateId?: string) {
   const action = pendingAction.value
   if (!action) return
 
@@ -76,10 +80,16 @@ function handleConfirmPendingAction(candidateId?: string) {
     return
   }
 
+  if (await submitIndexBuildContinuation()) {
+    return
+  }
   submitResume('approve', '用户在确认卡片中批准执行')
 }
 
-function handleCancelPendingAction() {
+async function handleCancelPendingAction() {
+  if (await cancelIndexBuildContinuation()) {
+    return
+  }
   submitResume('reject', '用户在确认卡片中拒绝执行')
 }
 

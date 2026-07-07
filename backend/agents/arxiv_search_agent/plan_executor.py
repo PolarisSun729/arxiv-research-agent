@@ -535,6 +535,42 @@ def _record_step_output(runtime: PlanRuntime, step: PlanStep, normalized_output:
         runtime.outputs["paper_qa_result"] = normalized_output
 
 
+def _extract_arxiv_id_from_paper_payload(payload: Mapping[str, Any]) -> str:
+    """从论文工具输入中提取最终 arXiv ID；确认兜底只能基于明确目标，避免误跳过用户确认。"""
+    candidate_values: List[Any] = [payload.get("arxiv_id")]
+    for key in ("paper_reference", "paper_ref", "target_paper", "paper"):
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            candidate_values.append(value.get("arxiv_id"))
+    for value in candidate_values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _build_existing_index_skip_output(arxiv_id: str, check_result: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """把索引状态检查结果归一成 parse_and_index_paper 的成功输出；未知或失败时不改变原确认流程。"""
+    if not bool(check_result.get("ok", False)):
+        return None
+    data = check_result.get("data")
+    status_data = dict(data or {}) if isinstance(data, Mapping) else {}
+    status = str(status_data.get("status") or "").strip().lower()
+    has_index = bool(status_data.get("has_index"))
+    if not has_index and status not in {"available", "indexed", "already_indexed", "ready"}:
+        return None
+    output = {
+        **status_data,
+        "status": "indexed",
+        "has_index": True,
+        "arxiv_id": arxiv_id,
+        "skipped_rebuild": True,
+        "skip_reason": "paper_qa_index_already_available",
+        "tool_result": dict(check_result),
+    }
+    return output
+
+
 def _should_preserve_non_success_observation_output(step: PlanStep, normalized_output: Any) -> bool:
     """保留“目标解析未完成”类输出，便于 fallback/debug 说明为何不能继续。
 
@@ -1172,6 +1208,59 @@ class PlanExecutor:
             return self._step_result_from_runtime(step=step, runtime=runtime, next_action="continue", output=reused_output)
 
         if self._needs_confirmation(step, state, runtime=runtime):
+            index_skip_output = self._maybe_build_existing_index_skip_output(
+                step=step,
+                state=state,
+                resolved_input=resolved_input,
+            )
+            if index_skip_output is not None:
+                # 已有 QA 索引时，构建确认不再代表真实副作用；直接落成功态，避免异步建索引后重复弹确认。
+                finished_at = _utcnow()
+                runtime.step_status[step.step_id] = "success"
+                runtime.pending_confirmation = None
+                runtime.recovery_strategy = None
+                runtime.turn_status = None
+                runtime.needs_replan = False
+                state.pending_action = None
+                if step.output_key:
+                    _record_step_output(runtime, step, index_skip_output)
+                runtime.last_step_output = {
+                    "step_id": step.step_id,
+                    "tool_contract": _json_safe(self.tool_registry.describe_contract(step.tool_name)),
+                    "tool_execution": None,
+                    "resolved_input": _json_safe(resolved_input),
+                    "raw_output": _json_safe(index_skip_output),
+                    "normalized_output": _json_safe(index_skip_output),
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                }
+                self._append_trace(
+                    runtime,
+                    step,
+                    event="confirmation_skipped",
+                    status="success",
+                    detail={
+                        "tool_name": step.tool_name,
+                        "reason": "paper_qa_index_already_available",
+                        "arxiv_id": index_skip_output.get("arxiv_id"),
+                        "output_key": step.output_key,
+                        "started_at": started_at,
+                        "finished_at": finished_at,
+                    },
+                )
+                info_event(
+                    logger,
+                    "arxiv_agent.confirmation_skipped",
+                    run_id=_state_run_id(state),
+                    session_id=state.session_id,
+                    step_id=step.step_id,
+                    tool_name=step.tool_name,
+                    reason="paper_qa_index_already_available",
+                    arxiv_id=index_skip_output.get("arxiv_id"),
+                )
+                self._sync_runtime_state(state, runtime, current_step=step)
+                return self._step_result_from_runtime(step=step, runtime=runtime, next_action="continue", output=index_skip_output)
+
             confirmation_request = self._build_confirmation_request(
                 step=step,
                 runtime=runtime,
@@ -1277,6 +1366,55 @@ class PlanExecutor:
         }
         self._sync_runtime_state(state, runtime, current_step=step)
         return self._step_result_from_runtime(step=step, runtime=runtime, next_action="continue", output=normalized_output)
+
+    def _maybe_build_existing_index_skip_output(
+        self,
+        *,
+        step: PlanStep,
+        state: AgentState,
+        resolved_input: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if step.tool_name != "parse_and_index_paper":
+            return None
+        arxiv_id = _extract_arxiv_id_from_paper_payload(resolved_input)
+        if not arxiv_id:
+            return None
+        try:
+            # 这里只做幂等状态检查：检查失败不能阻断用户确认，否则会把原本可手动批准的构建链路误伤。
+            check_result = invoke_backend_tool("check_paper_qa_index", arxiv_id=arxiv_id, run_id=_state_run_id(state))
+        except Exception as exc:  # pragma: no cover - 兜底路径依赖后端环境，失败时必须保持原确认行为。
+            info_event(
+                logger,
+                "arxiv_agent.confirmation_precheck_failed",
+                run_id=_state_run_id(state),
+                session_id=state.session_id,
+                step_id=step.step_id,
+                tool_name=step.tool_name,
+                arxiv_id=arxiv_id,
+                reason="check_paper_qa_index_exception",
+                error=str(exc),
+            )
+            return None
+        if not isinstance(check_result, Mapping):
+            return None
+        skip_output = _build_existing_index_skip_output(arxiv_id, check_result)
+        if skip_output is not None:
+            return skip_output
+        if not bool(check_result.get("ok", False)):
+            # 后端检查失败时只记录可观测日志，不把失败提升成执行错误，保证原来的确认/构建兜底仍可继续。
+            error_payload = check_result.get("error") if isinstance(check_result.get("error"), Mapping) else {}
+            info_event(
+                logger,
+                "arxiv_agent.confirmation_precheck_failed",
+                run_id=_state_run_id(state),
+                session_id=state.session_id,
+                step_id=step.step_id,
+                tool_name=step.tool_name,
+                arxiv_id=arxiv_id,
+                reason="check_paper_qa_index_not_ok",
+                error_code=error_payload.get("code"),
+            )
+        return None
 
     def observe_current_step(self, runtime: PlanRuntime, state: AgentState, *, allow_interrupt: bool = True) -> StepExecutionResult:
         """只观察当前 step 的工具输出质量，不执行工具、不重规划。"""

@@ -488,10 +488,15 @@ def test_plan_executor_skips_false_condition_and_continues_dag() -> None:
 
 
 def test_plan_executor_returns_waiting_confirmation_before_side_effect(monkeypatch) -> None:
-    def fail_if_called(*args, **kwargs):
+    calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        calls.append((tool_name, dict(kwargs)))
+        if tool_name == "check_paper_qa_index":
+            return {"ok": True, "tool_name": tool_name, "summary": "missing", "data": {"status": "missing", "has_index": False}, "trace": {}, "error": None}
         raise AssertionError("parse_and_index_paper should not run before confirmation")
 
-    monkeypatch.setattr(executor_module, "invoke_backend_tool", fail_if_called)
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
 
     goal = Goal(goal_id="paper_qa:test", goal_type="paper_qa", user_request="index paper")
     plan = ExecutablePlan(
@@ -529,6 +534,58 @@ def test_plan_executor_returns_waiting_confirmation_before_side_effect(monkeypat
     assert result.pending_confirmation.arguments_summary["paper_reference"]["arxiv_id"] == "2401.00001"
     assert result.plan is not None
     assert result.plan.steps[0].status == "waiting_confirmation"
+    assert [call[0] for call in calls] == ["check_paper_qa_index"]
+
+
+def test_plan_executor_skips_index_confirmation_when_index_already_exists(monkeypatch) -> None:
+    calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        calls.append((tool_name, dict(kwargs)))
+        if tool_name == "check_paper_qa_index":
+            return {"ok": True, "tool_name": tool_name, "summary": "available", "data": {"status": "available", "has_index": True}, "trace": {}, "error": None}
+        raise AssertionError("build_paper_qa_index should not run when index already exists")
+
+    def fail_if_interrupted(*args, **kwargs):
+        raise AssertionError("existing index should not request confirmation")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+    monkeypatch.setattr(executor_module, "interrupt", fail_if_interrupted)
+
+    goal, plan = _paper_index_confirmation_plan()
+    state = AgentState(intent="paper_qa", message="build index", session_id="s1")
+    result = PlanExecutor().execute(plan, state)
+
+    assert result.status == "success"
+    assert [call[0] for call in calls] == ["check_paper_qa_index"]
+    assert result.outputs["index_build_result"]["status"] == "indexed"
+    assert result.outputs["index_build_result"]["has_index"] is True
+    assert result.outputs["index_build_result"]["skipped_rebuild"] is True
+    assert result.pending_confirmation is None
+    assert result.plan is not None
+    assert result.plan.steps[0].status == "success"
+    assert any(trace.event == "confirmation_skipped" for trace in result.trace)
+    assert not any(trace.event == "confirmation_requested" for trace in result.trace)
+
+
+def test_plan_executor_keeps_confirmation_when_index_precheck_fails(monkeypatch) -> None:
+    calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        calls.append((tool_name, dict(kwargs)))
+        if tool_name == "check_paper_qa_index":
+            return {"ok": False, "tool_name": tool_name, "summary": "failed", "data": None, "trace": {}, "error": {"code": "qa_status_failed"}}
+        raise AssertionError("build_paper_qa_index should not run before confirmation")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    goal, plan = _paper_index_confirmation_plan()
+    result = PlanExecutor().execute(plan, AgentState(intent="paper_qa", message="build index"))
+
+    assert result.status == "waiting_confirmation"
+    assert result.pending_confirmation is not None
+    assert result.pending_confirmation.step_id == "parse_and_index_paper"
+    assert [call[0] for call in calls] == ["check_paper_qa_index"]
 
 
 def test_plan_executor_interrupt_approve_executes_side_effect_tool(monkeypatch) -> None:
@@ -536,6 +593,8 @@ def test_plan_executor_interrupt_approve_executes_side_effect_tool(monkeypatch) 
 
     def fake_invoke_tool(tool_name: str, **kwargs):
         calls.append((tool_name, dict(kwargs)))
+        if tool_name == "check_paper_qa_index":
+            return {"ok": True, "tool_name": tool_name, "summary": "missing", "data": {"status": "missing", "has_index": False}, "trace": {}, "error": None}
         if tool_name == "build_paper_qa_index":
             return {"ok": True, "tool_name": tool_name, "summary": "indexed", "data": {"status": "indexed", "has_index": True}, "trace": {}, "error": None}
         raise AssertionError(f"unexpected tool: {tool_name}")
@@ -572,8 +631,7 @@ def test_plan_executor_interrupt_approve_executes_side_effect_tool(monkeypatch) 
     result = PlanExecutor()._execute_runtime(runtime, AgentState(intent="paper_qa", message="build index"), allow_interrupt=True)
 
     assert result.status == "success"
-    assert calls and calls[0][0] == "build_paper_qa_index"
-    assert len(calls) == 1
+    assert [call[0] for call in calls] == ["check_paper_qa_index", "build_paper_qa_index"]
     assert any(trace.event == "confirmation_requested" for trace in result.trace)
     assert any(trace.event == "confirmation_approved" for trace in result.trace)
 
@@ -910,10 +968,15 @@ def test_plan_executor_resume_reentry_from_request_confirmation_consumes_target_
 
 
 def test_plan_executor_pending_action_approved_does_not_bypass_confirmation(monkeypatch) -> None:
-    def fail_if_called(*args, **kwargs):
+    calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        calls.append((tool_name, dict(kwargs)))
+        if tool_name == "check_paper_qa_index":
+            return {"ok": True, "tool_name": tool_name, "summary": "missing", "data": {"status": "missing", "has_index": False}, "trace": {}, "error": None}
         raise AssertionError("display-only pending_action approval must not execute side effect tool")
 
-    monkeypatch.setattr(executor_module, "invoke_backend_tool", fail_if_called)
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
     _goal, plan = _paper_index_confirmation_plan()
     state = AgentState(
         intent="paper_qa",
@@ -931,13 +994,19 @@ def test_plan_executor_pending_action_approved_does_not_bypass_confirmation(monk
     assert result.pending_confirmation is not None
     assert result.pending_confirmation.step_id == "parse_and_index_paper"
     assert any(trace.event == "confirmation_created" for trace in result.trace)
+    assert [call[0] for call in calls] == ["check_paper_qa_index"]
 
 
 def test_plan_executor_interrupt_reject_skips_side_effect_tool(monkeypatch) -> None:
-    def fail_if_called(*args, **kwargs):
+    calls = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        calls.append((tool_name, dict(kwargs)))
+        if tool_name == "check_paper_qa_index":
+            return {"ok": True, "tool_name": tool_name, "summary": "missing", "data": {"status": "missing", "has_index": False}, "trace": {}, "error": None}
         raise AssertionError("side effect tool must not run after reject")
 
-    monkeypatch.setattr(executor_module, "invoke_backend_tool", fail_if_called)
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
     monkeypatch.setattr(executor_module, "interrupt", lambda payload: {"decision": "reject", "note": "cancel"})
 
     goal = Goal(goal_id="paper_qa:test", goal_type="paper_qa", user_request="index paper")
@@ -974,6 +1043,7 @@ def test_plan_executor_interrupt_reject_skips_side_effect_tool(monkeypatch) -> N
     result = PlanExecutor()._execute_runtime(runtime, state, allow_interrupt=True)
 
     assert result.status in {"success", "waiting_confirmation", "fallback"}
+    assert [call[0] for call in calls] == ["check_paper_qa_index"]
     assert result.final_answer == "已取消解析 RAG Paper，因此无法继续基于全文回答。"
     assert any(trace.event == "confirmation_requested" for trace in result.trace)
     assert any(trace.event == "confirmation_rejected" for trace in result.trace)

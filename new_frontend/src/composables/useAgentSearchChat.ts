@@ -1,8 +1,24 @@
 import { ref, watch, type Ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { runAgentChat, streamAgentChat } from '@/api/agent'
+import {
+  createAgentQaIndexContinuation,
+  listActiveAgentQaIndexContinuations,
+  runAgentChat,
+  streamAgentChat,
+  updateAgentQaIndexContinuationStatus
+} from '@/api/agent'
 import { getErrorMessage } from '@/api/errors'
-import type { AgentPaper, AgentPendingAction, AgentStep, AgentStreamEvent, AgentToolCall, ArxivSearchResponse } from '@/types/agent'
+import { getPaperQaIndexJob } from '@/api/papers'
+import type {
+  AgentPaper,
+  AgentPendingAction,
+  AgentQaIndexContinuation,
+  AgentQaIndexJob,
+  AgentStep,
+  AgentStreamEvent,
+  AgentToolCall,
+  ArxivSearchResponse
+} from '@/types/agent'
 import type { AgentChatMessage } from '@/types/agentChat'
 import type { UserResearchProfile } from '@/types/paper'
 import { usePaperStore } from '@/stores/paperStore'
@@ -11,6 +27,13 @@ import { useUserContext } from '@/composables/useUserContext'
 type ResumeDecision = 'approve' | 'reject'
 const RESUME_CHECKPOINT_NOT_FOUND_CODE = 'resume_checkpoint_not_found'
 const RESUME_CHECKPOINT_NOT_FOUND_MESSAGE = '原执行现场已失效，请重新发起论文解析或问答请求。'
+const VISIBLE_PENDING_ACTION_STATUSES = new Set([
+  'waiting_confirmation',
+  'confirming',
+  'index_building',
+  'index_failed',
+  'ready_to_resume'
+])
 
 interface AgentResumePayload {
   decision: ResumeDecision
@@ -128,9 +151,9 @@ function upsertToolCall(response: ArxivSearchResponse, toolCall: AgentToolCall) 
 
 function normalizePendingActionForDisplay(action: AgentPendingAction | Record<string, any> | null | undefined): AgentPendingAction | null {
   if (!action || typeof action !== 'object') return null
-  // pending_action 只是后端确认请求的展示镜像；批准后的 approved/cancelled 中间态不能继续当待确认卡片展示。
-  if (!action || typeof action !== 'object') return null
-  return action.status === 'waiting_confirmation' || action.status === 'confirming'
+  // pending_action 只是后端确认请求的展示镜像；这里只额外保留前端接管的索引构建中间态。
+  const status = String(action.status || '').trim()
+  return VISIBLE_PENDING_ACTION_STATUSES.has(status)
     ? { ...action } as AgentPendingAction
     : null
 }
@@ -155,8 +178,58 @@ function getPendingActionKey(action: AgentPendingAction | Record<string, any> | 
   return [sessionId, stepId, toolName].some(Boolean) ? `step:${sessionId}:${stepId}:${toolName}` : ''
 }
 
+function isIndexBuildPendingAction(action: AgentPendingAction | null | undefined) {
+  const toolName = String(action?.tool_name || action?.confirmation_request?.tool_name || '').trim()
+  return toolName === 'parse_and_index_paper'
+}
+
+function resolveIndexBuildArxivId(action: AgentPendingAction | null | undefined) {
+  const targetPaper = action?.target_paper || action?.confirmation_request?.target_paper || {}
+  const args = action?.arguments_summary || action?.confirmation_request?.arguments_summary || {}
+  const paperReference = args.paper_reference || args.paper_ref || {}
+  return String(
+    action?.arxiv_id ||
+    targetPaper.arxiv_id ||
+    targetPaper.arxivId ||
+    paperReference.arxiv_id ||
+    paperReference.arxivId ||
+    paperReference.id ||
+    ''
+  ).trim()
+}
+
+function resolveIndexBuildLoadingMethod(action: AgentPendingAction | null | undefined) {
+  const args = action?.arguments_summary || action?.confirmation_request?.arguments_summary || {}
+  return String(args.loading_method || args.loadingMethod || 'docling').trim() || 'docling'
+}
+
+function normalizeIndexActionStatusFromJob(job: AgentQaIndexJob | null | undefined) {
+  const status = String(job?.status || '').trim().toLowerCase()
+  if (status === 'success') return 'ready_to_resume'
+  if (['failed', 'stale', 'cancelled'].includes(status)) return 'index_failed'
+  return 'index_building'
+}
+
+function withIndexBuildState(
+  action: AgentPendingAction,
+  job: AgentQaIndexJob,
+  continuation?: AgentQaIndexContinuation | null
+): AgentPendingAction {
+  return {
+    ...action,
+    status: normalizeIndexActionStatusFromJob(job),
+    index_job: { ...job },
+    index_continuation: continuation
+      ? {
+          ...continuation,
+          job: { ...job }
+        }
+      : action.index_continuation || null
+  }
+}
+
 function isPendingActionVisible(action: AgentPendingAction | Record<string, any> | null | undefined): action is AgentPendingAction {
-  return Boolean(action && typeof action === 'object' && (action.status === 'waiting_confirmation' || action.status === 'confirming'))
+  return Boolean(action && typeof action === 'object' && VISIBLE_PENDING_ACTION_STATUSES.has(String(action.status || '').trim()))
 }
 
 function normalizePendingActionForBanner(action: AgentPendingAction | Record<string, any> | null | undefined): AgentPendingAction | null {
@@ -410,6 +483,7 @@ export function useAgentSearchChat() {
   const paperQaResult = ref<Record<string, any> | null>(null)
   const activeSessionId = ref<string | null>(null)
   const activeSessionUserId = ref<string | null>(null)
+  const indexContinuationTimers = new Map<string, number>()
 
   function getUserId() {
     return userContext.getUserId()
@@ -423,7 +497,78 @@ export function useAgentSearchChat() {
     inputMessage.value = value
   }
 
+  function updateVisiblePendingAction(nextAction: AgentPendingAction | null) {
+    const nextKey = getPendingActionKey(nextAction)
+    pendingAction.value = nextAction ? { ...nextAction } : null
+    for (const message of messages.value) {
+      const response = message.response
+      if (!response?.pending_action) continue
+      const responseKey = getPendingActionKey(response.pending_action)
+      if (!nextKey || !responseKey || responseKey !== nextKey) continue
+      response.pending_action = nextAction ? { ...nextAction } : null
+    }
+    if (latestResponse.value?.pending_action && nextKey && getPendingActionKey(latestResponse.value.pending_action) === nextKey) {
+      latestResponse.value.pending_action = nextAction ? { ...nextAction } : null
+    }
+  }
+
+  function buildResumePayloadFromAction(
+    action: AgentPendingAction,
+    decision: ResumeDecision,
+    note?: string,
+    editedArguments?: Record<string, any>
+  ): AgentResumePayload {
+    const confirmationRequest = action.confirmation_request || {}
+    const mergedEditedArguments = {
+      ...(action.edited_arguments || {}),
+      ...(editedArguments || {})
+    }
+    const resumePayload: AgentResumePayload = {
+      decision,
+      note: note || null,
+      step_id: action.step_id || confirmationRequest.step_id || null,
+      interrupt_id: action.interrupt_id || confirmationRequest.interrupt_id || null,
+      tool_name: action.tool_name || confirmationRequest.tool_name || null,
+      pending_action_id: action.pending_action_id || confirmationRequest.pending_action_id || null
+    }
+    if (Object.keys(mergedEditedArguments).length) {
+      // 目标论文确认只通过 edited_arguments 传稳定 paper_id/arxiv_id；message 仍只是占位文本。
+      resumePayload.edited_arguments = mergedEditedArguments
+    }
+    return resumePayload
+  }
+
+  function ensureContinuationMessage(action: AgentPendingAction) {
+    const actionKey = getPendingActionKey(action)
+    if (messages.value.some(message => message.response?.pending_action && getPendingActionKey(message.response.pending_action) === actionKey)) {
+      return
+    }
+    const assistantId = createMessageId('assistant')
+    const response = createDraftResponse()
+    response.session_id = action.session_id || action.confirmation_request?.session_id || activeSessionId.value
+    response.answer = action.description || '索引构建完成后会继续回答原问题。'
+    response.pending_action = { ...action }
+    response.paper_qa_result = {
+      status: 'waiting_confirmation',
+      arxiv_id: resolveIndexBuildArxivId(action),
+      question: action.original_question || action.qa_question || action.confirmation_request?.original_question || ''
+    }
+    messages.value.push({
+      id: assistantId,
+      role: 'assistant',
+      content: response.answer,
+      loading: false,
+      createdAt: new Date().toISOString(),
+      response,
+      error: null
+    })
+  }
+
   function clearConversation() {
+    for (const timerId of indexContinuationTimers.values()) {
+      window.clearTimeout(timerId)
+    }
+    indexContinuationTimers.clear()
     messages.value = []
     latestResponse.value = null
     lastSearchPapers.value = []
@@ -512,6 +657,160 @@ export function useAgentSearchChat() {
     if (sessionId) {
       activeSessionId.value = sessionId
       activeSessionUserId.value = getUserId()
+    }
+  }
+
+  function scheduleIndexContinuationPolling(action: AgentPendingAction, delayMs = 1500) {
+    const jobId = String(action.index_job?.job_id || action.index_continuation?.job_id || '').trim()
+    if (!jobId) return
+    const previousTimer = indexContinuationTimers.get(jobId)
+    if (previousTimer) {
+      window.clearTimeout(previousTimer)
+    }
+    const timerId = window.setTimeout(() => {
+      indexContinuationTimers.delete(jobId)
+      pollIndexContinuation(action)
+    }, delayMs)
+    indexContinuationTimers.set(jobId, timerId)
+  }
+
+  async function pollIndexContinuation(action: AgentPendingAction) {
+    const jobId = String(action.index_job?.job_id || action.index_continuation?.job_id || '').trim()
+    const arxivId = String(action.index_job?.arxiv_id || action.index_continuation?.arxiv_id || resolveIndexBuildArxivId(action)).trim()
+    if (!jobId || !arxivId) return
+
+    try {
+      const job = await getPaperQaIndexJob(arxivId, jobId) as AgentQaIndexJob
+      const nextAction = withIndexBuildState(action, job, action.index_continuation || null)
+      updateVisiblePendingAction(nextAction)
+      const status = String(job.status || '').trim().toLowerCase()
+      if (['pending', 'running', 'retrying'].includes(status)) {
+        scheduleIndexContinuationPolling(nextAction, 1500)
+        return
+      }
+      if (status === 'success') {
+        await updateAgentQaIndexContinuationStatus(jobId, { user_id: getUserId(), status: 'ready_to_resume' })
+        // 异步 job 已完成后再消费原来的结构化确认，Agent 会复查索引并继续回答原问题。
+        await submitResume('approve', '索引构建完成，继续回答原问题')
+        await updateAgentQaIndexContinuationStatus(jobId, { user_id: getUserId(), status: 'resumed' })
+        return
+      }
+      await updateAgentQaIndexContinuationStatus(jobId, {
+        user_id: getUserId(),
+        status: 'failed',
+        error_message: job.error_message || '索引构建失败，请重试。'
+      })
+    } catch (error) {
+      const failedAction: AgentPendingAction = {
+        ...action,
+        status: 'index_failed',
+        index_job: {
+          ...(action.index_job || {}),
+          job_id: jobId,
+          arxiv_id: arxivId,
+          status: 'failed',
+          progress: action.index_job?.progress || 0,
+          current_stage: action.index_job?.current_stage || 'failed',
+          error_message: getErrorMessage(error, '查询索引任务状态失败')
+        }
+      }
+      updateVisiblePendingAction(failedAction)
+    }
+  }
+
+  async function submitIndexBuildContinuation() {
+    const action = pendingAction.value
+    if (!action || loading.value || action.status === 'confirming') return false
+    if (!isIndexBuildPendingAction(action)) return false
+    if (action.status === 'ready_to_resume') {
+      await submitResume('approve', '索引构建完成，继续回答原问题')
+      const jobId = String(action.index_job?.job_id || action.index_continuation?.job_id || '').trim()
+      if (jobId) {
+        await updateAgentQaIndexContinuationStatus(jobId, { user_id: getUserId(), status: 'resumed' }).catch(() => null)
+      }
+      return true
+    }
+    if (action.status === 'index_building') return true
+
+    const arxivId = resolveIndexBuildArxivId(action)
+    if (!arxivId) {
+      ElMessage.error('缺少论文 arXiv ID，无法创建索引任务')
+      return true
+    }
+    const resumePayload = buildResumePayloadFromAction(action, 'approve', '索引构建完成，继续回答原问题')
+    try {
+      const result = await createAgentQaIndexContinuation({
+        user_id: getUserId(),
+        session_id: activeSessionId.value || action.session_id || action.confirmation_request?.session_id || null,
+        arxiv_id: arxivId,
+        loading_method: resolveIndexBuildLoadingMethod(action),
+        original_question: action.original_question || action.qa_question || action.confirmation_request?.original_question || null,
+        pending_action: action,
+        resume_payload: resumePayload
+      })
+      const nextAction = withIndexBuildState(action, result.job, result.continuation)
+      updateVisiblePendingAction(nextAction)
+      ElMessage.success('问答索引任务已提交，正在后台构建')
+      scheduleIndexContinuationPolling(nextAction, 1200)
+      return true
+    } catch (error) {
+      ElMessage.error(getErrorMessage(error, '提交索引构建任务失败'))
+      return true
+    }
+  }
+
+  async function cancelIndexBuildContinuation() {
+    const action = pendingAction.value
+    const jobId = String(action?.index_job?.job_id || action?.index_continuation?.job_id || '').trim()
+    if (!action || !jobId) return false
+    const timerId = indexContinuationTimers.get(jobId)
+    if (timerId) {
+      window.clearTimeout(timerId)
+      indexContinuationTimers.delete(jobId)
+    }
+    await updateAgentQaIndexContinuationStatus(jobId, {
+      user_id: getUserId(),
+      status: 'cancelled',
+      error_message: '用户取消本次索引构建后的自动问答'
+    }).catch(() => null)
+    updateVisiblePendingAction(null)
+    return true
+  }
+
+  async function restoreActiveIndexContinuations() {
+    try {
+      const result = await listActiveAgentQaIndexContinuations({
+        user_id: getUserId(),
+        session_id: activeSessionId.value || undefined,
+        limit: 5
+      })
+      const continuation = (result.continuations || [])[0]
+      const pending = continuation?.pending_action as AgentPendingAction | null
+      const job = continuation?.job
+      if (!continuation || !pending || !job) return
+      activeSessionId.value = continuation.session_id
+      activeSessionUserId.value = getUserId()
+      const restoredAction = withIndexBuildState(
+        {
+          ...pending,
+          session_id: continuation.session_id,
+          pending_action_id: continuation.pending_action_id || pending.pending_action_id || null,
+          step_id: continuation.step_id || pending.step_id || null,
+          tool_name: continuation.tool_name || pending.tool_name || 'parse_and_index_paper'
+        },
+        job,
+        continuation
+      )
+      ensureContinuationMessage(restoredAction)
+      updateVisiblePendingAction(restoredAction)
+      if (String(job.status || '').toLowerCase() === 'success') {
+        await submitResume('approve', '索引构建完成，继续回答原问题')
+        await updateAgentQaIndexContinuationStatus(job.job_id, { user_id: getUserId(), status: 'resumed' })
+      } else if (!['failed', 'stale', 'cancelled'].includes(String(job.status || '').toLowerCase())) {
+        scheduleIndexContinuationPolling(restoredAction, 1200)
+      }
+    } catch {
+      // 恢复失败只影响刷新后的进度卡展示，不应该阻塞用户正常发起新的 Agent 对话。
     }
   }
 
@@ -722,24 +1021,8 @@ export function useAgentSearchChat() {
 
   async function submitResume(decision: ResumeDecision, note?: string, editedArguments?: Record<string, any>) {
     if (!pendingAction.value || loading.value || pendingAction.value.status === 'confirming') return
-    const confirmationRequest = pendingAction.value.confirmation_request || {}
     const currentPendingAction = { ...pendingAction.value }
-    const mergedEditedArguments = {
-      ...(currentPendingAction.edited_arguments || {}),
-      ...(editedArguments || {})
-    }
-    const resumePayload: AgentResumePayload = {
-      decision,
-      note: note || null,
-      step_id: currentPendingAction.step_id || confirmationRequest.step_id || null,
-      interrupt_id: currentPendingAction.interrupt_id || confirmationRequest.interrupt_id || null,
-      tool_name: currentPendingAction.tool_name || confirmationRequest.tool_name || null,
-      pending_action_id: currentPendingAction.pending_action_id || confirmationRequest.pending_action_id || null
-    }
-    if (Object.keys(mergedEditedArguments).length) {
-      // 目标论文确认只通过 edited_arguments 传稳定 paper_id/arxiv_id；message 仍只是占位文本。
-      resumePayload.edited_arguments = mergedEditedArguments
-    }
+    const resumePayload = buildResumePayloadFromAction(currentPendingAction, decision, note, editedArguments)
     const pendingActionKey = getPendingActionKey(currentPendingAction)
     activeConfirmationSubmission.value = pendingActionKey
       ? {
@@ -754,7 +1037,7 @@ export function useAgentSearchChat() {
       ...currentPendingAction,
       status: 'confirming',
       decision,
-      edited_arguments: Object.keys(mergedEditedArguments).length ? mergedEditedArguments : currentPendingAction.edited_arguments || null
+      edited_arguments: resumePayload.edited_arguments || currentPendingAction.edited_arguments || null
     }
     const isPaperTargetConfirmation = currentPendingAction.request_type === 'paper_target_confirmation'
       || currentPendingAction.type === 'paper_target_confirmation'
@@ -796,6 +1079,9 @@ export function useAgentSearchChat() {
     setInputMessage,
     submitMessage,
     submitResume,
+    submitIndexBuildContinuation,
+    cancelIndexBuildContinuation,
+    restoreActiveIndexContinuations,
     clearConversation
   }
 }

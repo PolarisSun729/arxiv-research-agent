@@ -33,6 +33,7 @@ debugpy
 decorator
 deepdiff
 Deprecated
+diskcache
 distro
 effdet
 emoji

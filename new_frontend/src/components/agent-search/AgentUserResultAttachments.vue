@@ -29,6 +29,7 @@ const canConfirm = computed(() =>
   Boolean(pendingAction.value) &&
   !props.loading &&
   !pendingAction.value?.isConfirming &&
+  !pendingAction.value?.isBuildingIndex &&
   (!shouldRequireCandidate.value || Boolean(selectedCandidateId.value))
 )
 
@@ -96,6 +97,21 @@ function handleConfirm() {
       <div class="agent-user-confirmation__copy">
         <h3>{{ pendingAction.title }}</h3>
         <p>{{ pendingAction.description }}</p>
+      </div>
+
+      <div v-if="pendingAction.indexJob" class="agent-user-index-progress">
+        <div class="agent-user-index-progress__meta">
+          <span>{{ pendingAction.indexStageText }}</span>
+          <strong>{{ pendingAction.indexProgress }}%</strong>
+        </div>
+        <el-progress
+          :percentage="pendingAction.indexProgress"
+          :status="pendingAction.status === 'index_failed' ? 'exception' : (pendingAction.status === 'ready_to_resume' ? 'success' : undefined)"
+          :stroke-width="8"
+        />
+        <p v-if="pendingAction.indexErrorMessage" class="agent-user-index-progress__error">
+          {{ pendingAction.indexErrorMessage }}
+        </p>
       </div>
 
       <div v-if="pendingAction.kind === 'paper_target_confirmation'" class="agent-user-candidates">
@@ -243,6 +259,33 @@ function handleConfirm() {
 .agent-user-confirmation__copy p {
   margin: 6px 0 0;
   color: #475569;
+  line-height: 1.6;
+}
+
+.agent-user-index-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.agent-user-index-progress__meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #475569;
+  font-size: 13px;
+}
+
+.agent-user-index-progress__meta strong {
+  color: #0f172a;
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-user-index-progress__error {
+  margin: 0;
+  color: #b91c1c;
+  font-size: 13px;
   line-height: 1.6;
 }
 

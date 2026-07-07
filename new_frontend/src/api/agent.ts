@@ -1,6 +1,14 @@
 import request from './request'
 import { ApiError, normalizeApiError, parseFetchErrorResponse } from './errors'
-import type { AgentGraphResponse, AgentStreamEvent, ArxivSearchRequest, ArxivSearchResponse } from '@/types/agent'
+import type {
+  AgentGraphResponse,
+  AgentPendingAction,
+  AgentQaIndexContinuation,
+  AgentQaIndexJob,
+  AgentStreamEvent,
+  ArxivSearchRequest,
+  ArxivSearchResponse
+} from '@/types/agent'
 import { getCurrentUserId } from '@/composables/useUserContext'
 
 export interface AgentStreamHandlers {
@@ -52,6 +60,54 @@ export async function runAgentChat(payload: ArxivSearchRequest): Promise<ArxivSe
 
 export async function fetchAgentGraph(): Promise<AgentGraphResponse> {
   return request.get('/agent/graph')
+}
+
+export interface CreateAgentQaIndexContinuationPayload {
+  user_id?: string | null
+  session_id?: string | null
+  arxiv_id?: string | null
+  loading_method?: string
+  original_question?: string | null
+  pending_action?: AgentPendingAction | Record<string, any> | null
+  resume_payload?: ArxivSearchRequest['resume'] | Record<string, any> | null
+}
+
+export interface AgentQaIndexContinuationResponse {
+  status?: string
+  job: AgentQaIndexJob
+  continuation: AgentQaIndexContinuation
+}
+
+export async function createAgentQaIndexContinuation(
+  payload: CreateAgentQaIndexContinuationPayload
+): Promise<AgentQaIndexContinuationResponse> {
+  return request.post('/agent/qa-index-continuations', {
+    ...payload,
+    user_id: payload.user_id || getCurrentUserId()
+  })
+}
+
+export async function listActiveAgentQaIndexContinuations(params?: {
+  user_id?: string | null
+  session_id?: string | null
+  limit?: number
+}): Promise<{ continuations: AgentQaIndexContinuation[] }> {
+  return request.get('/agent/qa-index-continuations/active', {
+    params: {
+      ...(params || {}),
+      user_id: params?.user_id || getCurrentUserId()
+    }
+  })
+}
+
+export async function updateAgentQaIndexContinuationStatus(
+  jobId: string,
+  payload: { user_id?: string | null; status: string; error_message?: string | null }
+): Promise<{ continuation: AgentQaIndexContinuation }> {
+  return request.post(`/agent/qa-index-continuations/${jobId}/status`, {
+    ...payload,
+    user_id: payload.user_id || getCurrentUserId()
+  })
 }
 
 export async function streamAgentChat(

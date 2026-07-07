@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -14,6 +15,10 @@ from time import perf_counter
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from services.retrieval.collection_profile import CollectionRetrievalProfile
+from services.paper_qa.build_cache import (
+    LLM_RETRIEVAL_QUESTIONS_PROMPT_VERSION,
+    LLM_RETRIEVAL_SUMMARY_PROMPT_VERSION,
+)
 from utils.config import get_enhanced_retrieval_runtime_config
 
 logger = logging.getLogger(__name__)
@@ -228,6 +233,9 @@ class RetrievalIndexBuilder:
         enable_generative_indexes: bool = False,
         max_indexes_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_PER_CHUNK,
         max_questions_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK,
+        max_workers: int = 1,
+        generation_cache: Any = None,
+        generation_model_name: str = "",
     ) -> None:
         self.generation_service = generation_service
         self.enable_generative_indexes = bool(enable_generative_indexes)
@@ -239,12 +247,22 @@ class RetrievalIndexBuilder:
             else max_questions_per_chunk
         )
         self.max_questions_per_chunk = max(0, min(3, int(question_limit)))
+        self.max_workers = max(1, int(max_workers or 1))
+        self.generation_cache = generation_cache
+        self.generation_model_name = str(generation_model_name or "retrieval_index_generation")
 
     def build(self, chunks: Iterable[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
         all_indexes: List[Dict[str, Any]] = []
         chunk_debug: List[Dict[str, Any]] = []
-        for fallback_index, chunk in enumerate(chunks or [], start=1):
-            indexes, debug = self.build_for_chunk(dict(chunk or {}), fallback_index=fallback_index)
+        chunk_items = [(fallback_index, dict(chunk or {})) for fallback_index, chunk in enumerate(chunks or [], start=1)]
+        if self.enable_generative_indexes and self.generation_service is not None and self.max_workers > 1 and len(chunk_items) > 1:
+            # 生成式 summary/question 只依赖单个 chunk；有界并发能缩短建库等待，同时保留顺序稳定性便于 artifact 对比。
+            with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="retrieval-index") as executor:
+                built_items = list(executor.map(lambda item: self.build_for_chunk(item[1], fallback_index=item[0]), chunk_items))
+        else:
+            built_items = [self.build_for_chunk(chunk, fallback_index=fallback_index) for fallback_index, chunk in chunk_items]
+
+        for indexes, debug in built_items:
             all_indexes.extend(index.to_dict() for index in indexes)
             chunk_debug.append(debug)
 
@@ -266,6 +284,8 @@ class RetrievalIndexBuilder:
                 ),
                 "generated_summary_count": sum(int(item.get("generated_summary_count", 0) or 0) for item in chunk_debug),
                 "generated_question_count": sum(int(item.get("generated_question_count", 0) or 0) for item in chunk_debug),
+                "cached_summary_count": sum(int(item.get("cached_summary_count", 0) or 0) for item in chunk_debug),
+                "cached_question_count": sum(int(item.get("cached_question_count", 0) or 0) for item in chunk_debug),
                 "generation_error_count": len(generation_errors),
                 "generation_errors": generation_errors[:20],
                 "per_chunk": chunk_debug[:50],
@@ -283,6 +303,8 @@ class RetrievalIndexBuilder:
         generation_errors: List[Dict[str, Any]] = []
         generated_summary_count = 0
         generated_question_count = 0
+        cached_summary_count = 0
+        cached_question_count = 0
 
         def add_index(
             index_type: str,
@@ -338,6 +360,8 @@ class RetrievalIndexBuilder:
             add_index("summary", summary_text, source_fields=["rerank_text", "asset_summary", "generated_summary"], generation_status=summary_status)
             if summary_status == "generated_llm":
                 generated_summary_count += 1
+            if summary_status == "cached_llm":
+                cached_summary_count += 1
 
         question_texts, question_status, question_errors = self._question_texts(chunk, paper_chunk, metadata)
         generation_errors.extend(question_errors)
@@ -345,6 +369,8 @@ class RetrievalIndexBuilder:
             add_index("question", question_text, source_fields=["retrieval_questions", "generated_questions"], generation_status=question_status)
             if question_status == "generated_llm":
                 generated_question_count += 1
+            if question_status == "cached_llm":
+                cached_question_count += 1
 
         debug = {
             "chunk_id": paper_chunk.chunk_id,
@@ -353,6 +379,8 @@ class RetrievalIndexBuilder:
             "index_types": [index.index_type for index in indexes],
             "generated_summary_count": generated_summary_count,
             "generated_question_count": generated_question_count,
+            "cached_summary_count": cached_summary_count,
+            "cached_question_count": cached_question_count,
             "generation_errors": generation_errors,
         }
         return indexes, debug
@@ -368,9 +396,21 @@ class RetrievalIndexBuilder:
             return existing, "reused_existing", []
         if not self.enable_generative_indexes:
             return "", "disabled", []
+        cache_kwargs = {
+            "kind": "retrieval_summary",
+            "model_name": self.generation_model_name,
+            "prompt_version": LLM_RETRIEVAL_SUMMARY_PROMPT_VERSION,
+            "chunk_text": self._asset_index_text(paper_chunk, metadata) or paper_chunk.content,
+            "metadata": metadata,
+            "extra": {"preview_chars": RETRIEVAL_INDEX_PREVIEW_CHARS},
+        }
+        cached = self._get_cached_generation(cache_kwargs)
+        if isinstance(cached, str) and cached.strip():
+            return cached.strip(), "cached_llm", []
         try:
             generated = self._generate_summary_with_service(paper_chunk, metadata)
             if generated:
+                self._set_cached_generation(cache_kwargs, generated)
                 return generated, "generated_llm", []
         except Exception as exc:
             # 生成失败只降级当前 chunk 的增强索引，规则索引已经足够维持后续 embedding/BM25 流程。
@@ -390,10 +430,23 @@ class RetrievalIndexBuilder:
             return self._dedupe_texts(existing_questions), "reused_existing", []
         if not self.enable_generative_indexes or self.max_questions_per_chunk <= 0:
             return [], "disabled", []
+        cache_kwargs = {
+            "kind": "retrieval_questions",
+            "model_name": self.generation_model_name,
+            "prompt_version": LLM_RETRIEVAL_QUESTIONS_PROMPT_VERSION,
+            "chunk_text": self._asset_index_text(paper_chunk, metadata) or paper_chunk.content,
+            "metadata": metadata,
+            "extra": {"max_questions": self.max_questions_per_chunk},
+        }
+        cached = self._get_cached_generation(cache_kwargs)
+        if isinstance(cached, list) and cached:
+            return self._dedupe_texts([str(item) for item in cached])[: self.max_questions_per_chunk], "cached_llm", []
         try:
             generated = self._generate_questions_with_service(paper_chunk, metadata)
             if generated:
-                return self._dedupe_texts(generated)[: self.max_questions_per_chunk], "generated_llm", []
+                normalized = self._dedupe_texts(generated)[: self.max_questions_per_chunk]
+                self._set_cached_generation(cache_kwargs, normalized)
+                return normalized, "generated_llm", []
         except Exception as exc:
             # 问题索引是可选召回视角；失败时用可解释模板问题兜底，并把错误写进 debug。
             fallback = self._fallback_questions(paper_chunk, metadata)
@@ -401,6 +454,17 @@ class RetrievalIndexBuilder:
                 {"chunk_id": paper_chunk.chunk_id, "index_type": "question", "error": str(exc)[:300]}
             ]
         return self._fallback_questions(paper_chunk, metadata), "generated_fallback", []
+
+    def _get_cached_generation(self, cache_kwargs: Dict[str, Any]) -> Any:
+        getter = getattr(self.generation_cache, "get_llm_result", None)
+        if not callable(getter):
+            return None
+        return getter(**cache_kwargs)
+
+    def _set_cached_generation(self, cache_kwargs: Dict[str, Any], value: Any) -> None:
+        setter = getattr(self.generation_cache, "set_llm_result", None)
+        if callable(setter):
+            setter(value, **cache_kwargs)
 
     def _generate_summary_with_service(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> str:
         if self.generation_service is None:
@@ -578,12 +642,18 @@ def build_retrieval_indexes_for_chunk(
     enable_generative_indexes: bool = False,
     max_indexes_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_PER_CHUNK,
     max_questions_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK,
+    max_workers: int = 1,
+    generation_cache: Any = None,
+    generation_model_name: str = "",
 ) -> List[RetrievalIndex]:
     builder = RetrievalIndexBuilder(
         generation_service=generation_service,
         enable_generative_indexes=enable_generative_indexes,
         max_indexes_per_chunk=max_indexes_per_chunk,
         max_questions_per_chunk=max_questions_per_chunk,
+        max_workers=max_workers,
+        generation_cache=generation_cache,
+        generation_model_name=generation_model_name,
     )
     indexes, _ = builder.build_for_chunk(chunk, fallback_index=fallback_index)
     return indexes
@@ -596,12 +666,18 @@ def build_retrieval_indexes(
     enable_generative_indexes: bool = False,
     max_indexes_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_PER_CHUNK,
     max_questions_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK,
+    max_workers: int = 1,
+    generation_cache: Any = None,
+    generation_model_name: str = "",
 ) -> List[Dict[str, Any]]:
     builder = RetrievalIndexBuilder(
         generation_service=generation_service,
         enable_generative_indexes=enable_generative_indexes,
         max_indexes_per_chunk=max_indexes_per_chunk,
         max_questions_per_chunk=max_questions_per_chunk,
+        max_workers=max_workers,
+        generation_cache=generation_cache,
+        generation_model_name=generation_model_name,
     )
     indexes, _ = builder.build(chunks)
     return indexes
@@ -614,12 +690,18 @@ def build_retrieval_index_payload(
     enable_generative_indexes: bool = False,
     max_indexes_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_PER_CHUNK,
     max_questions_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK,
+    max_workers: int = 1,
+    generation_cache: Any = None,
+    generation_model_name: str = "",
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     builder = RetrievalIndexBuilder(
         generation_service=generation_service,
         enable_generative_indexes=enable_generative_indexes,
         max_indexes_per_chunk=max_indexes_per_chunk,
         max_questions_per_chunk=max_questions_per_chunk,
+        max_workers=max_workers,
+        generation_cache=generation_cache,
+        generation_model_name=generation_model_name,
     )
     return builder.build(chunks)
 

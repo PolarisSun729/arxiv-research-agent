@@ -150,6 +150,7 @@ def test_run_agent_turn_paper_qa_ordinal_resolves_second_paper(monkeypatch) -> N
             return {"ok": True, "tool_name": tool_name, "summary": "indexed", "data": {"status": "indexed", "has_index": True}, "trace": {}, "error": None}
         if tool_name == "answer_paper_question":
             assert kwargs["arxiv_id"] == "2401.00002"
+            assert kwargs["question"] == "这篇论文的方法是什么？"
             return {
                 "ok": True,
                 "tool_name": tool_name,
@@ -183,6 +184,47 @@ def test_run_agent_turn_paper_qa_ordinal_resolves_second_paper(monkeypatch) -> N
     assert result.outputs["paper_ref"]["reference_hint"]["reference_type"] == "ordinal"
     assert result.outputs["paper_ref"]["reference_hint"]["value"] == 2
     assert [kwargs["arxiv_id"] for _, kwargs in called_tools] == ["2401.00002", "2401.00002"]
+
+
+def test_run_agent_turn_paper_qa_ordinal_normalizes_question_before_answer(monkeypatch) -> None:
+    called_tools = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        called_tools.append((tool_name, dict(kwargs)))
+        if tool_name == "check_paper_qa_index":
+            assert kwargs["arxiv_id"] == "2401.00002"
+            return {"ok": True, "tool_name": tool_name, "summary": "indexed", "data": {"status": "indexed", "has_index": True}, "trace": {}, "error": None}
+        if tool_name == "answer_paper_question":
+            assert kwargs["arxiv_id"] == "2401.00002"
+            assert kwargs["question"] == "给我讲一下这篇论文的核心内容"
+            return {
+                "ok": True,
+                "tool_name": tool_name,
+                "summary": "answered",
+                "data": {"answer": "core content", "sources": [{"chunk_id": "c2"}], "retrieval_debug": {}},
+                "trace": {},
+                "error": None,
+            }
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    result = run_agent_turn(
+        AgentState(
+            intent="paper_qa",
+            message="给我讲一下第二篇论文的核心内容",
+            context={
+                "last_papers": [
+                    {"arxiv_id": "2401.00001", "title": "First Paper"},
+                    {"arxiv_id": "2401.00002", "title": "Second Paper"},
+                ],
+            },
+        )
+    )
+
+    assert result.status == "success"
+    assert result.outputs["paper_ref"]["arxiv_id"] == "2401.00002"
+    assert result.outputs["paper_qa_result"]["question"] == "给我讲一下这篇论文的核心内容"
 
 
 def test_run_agent_turn_paper_qa_ambiguous_ordinal_returns_target_confirmation(monkeypatch) -> None:
@@ -379,7 +421,8 @@ def test_run_agent_turn_paper_qa_context_target_checks_index_then_requests_build
     assert result.pending_confirmation.tool_name == "parse_and_index_paper"
     assert result.pending_confirmation.target_paper["arxiv_id"] == "2401.00001"
     assert result.outputs["paper_ref"]["reference_hint"]["reference_type"] == "context_paper"
-    assert called_tools == ["check_paper_qa_index"]
+    # 缺索引链路会在 check step 和确认前预检查各查一次，保证确认卡弹出前能感知刚完成的异步索引。
+    assert called_tools == ["check_paper_qa_index", "check_paper_qa_index"]
     assert any(trace.event == "confirmation_requested" for trace in result.trace)
 
 
@@ -405,7 +448,8 @@ def test_run_agent_turn_in_graph_reject_skips_index_build(monkeypatch) -> None:
 
     assert result.status == "success"
     assert result.pending_confirmation is None
-    assert [tool_name for tool_name, _ in called_tools] == ["check_paper_qa_index"]
+    # 即使用户拒绝构建，确认前预检查仍会先保持幂等状态判断，真正的建索引工具不能被调用。
+    assert [tool_name for tool_name, _ in called_tools] == ["check_paper_qa_index", "check_paper_qa_index"]
     assert any(trace.event == "confirmation_requested" for trace in result.trace)
     assert any(trace.event == "confirmation_rejected" for trace in result.trace)
     assert not any(tool_name == "parse_and_index_paper" for tool_name, _ in called_tools)

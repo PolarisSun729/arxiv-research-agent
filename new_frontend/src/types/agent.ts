@@ -51,6 +51,38 @@ export interface AgentToolCall {
   error?: Record<string, any> | null
 }
 
+export interface AgentQaIndexJob {
+  job_id: string
+  arxiv_id: string
+  status: 'pending' | 'running' | 'success' | 'failed' | 'stale' | 'cancelled' | 'retrying' | string
+  current_stage?: string | null
+  progress?: number | null
+  error_message?: string | null
+  loading_method?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+  heartbeat_at?: string | null
+}
+
+export interface AgentQaIndexContinuation {
+  job_id: string
+  user_id?: string | null
+  session_id: string
+  arxiv_id: string
+  status: 'waiting_job' | 'ready_to_resume' | 'resumed' | 'failed' | 'cancelled' | string
+  pending_action_id?: string | null
+  step_id?: string | null
+  tool_name?: string | null
+  original_question?: string | null
+  resume_payload?: ArxivSearchRequest['resume'] | Record<string, any> | null
+  pending_action?: AgentPendingAction | Record<string, any> | null
+  job?: AgentQaIndexJob | null
+  error_message?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+  completed_at?: string | null
+}
+
 export interface AgentStep {
   step: string
   status: AgentStepStatus
@@ -166,6 +198,8 @@ export interface AgentPendingAction {
   plan_id?: string | null
   trace_id?: string | null
   edited_arguments?: Record<string, any> | null
+  index_job?: AgentQaIndexJob | null
+  index_continuation?: AgentQaIndexContinuation | null
 }
 
 export interface AgentPreferenceActionResult {
