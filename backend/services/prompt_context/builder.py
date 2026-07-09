@@ -83,7 +83,8 @@ class PromptContextBuilder:
                     "Use user memory, session summary, and recent turns only to understand the question, preferences, and continuity. "
                     "If RAG evidence is insufficient, say you cannot determine it from the provided evidence. "
                     "When the question asks about table values, rankings, increases, decreases, or differences, prefer structured Table Evidence blocks "
-                    "over table summaries or previews, and cite the table row, column, value, unit, operation, and source_id."
+                    "over table summaries or previews, and cite the table row, column, value, unit, operation, and source_id. "
+                    "If the block is Table Evidence Candidates, use it as candidate evidence only; do not present a candidate calculation as certain unless the evidence disambiguates it."
                 ),
                 priority=1,
             ),

@@ -858,8 +858,8 @@ class RetrievalRules:
         chunk["asset_section_match_reason"] = first_present("asset_section_match_reason", "")
         chunk["asset_section_match_is_heuristic"] = first_present("asset_section_match_is_heuristic", False)
         chunk["asset_section_match_allow_embedding"] = first_present("asset_section_match_allow_embedding", False)
-        chunk["table_structured_text"] = item.get("table_structured_text") or metadata.get("table_structured_text", "")
-        chunk["table_structured_evidence"] = item.get("table_structured_evidence") or metadata.get("table_structured_evidence", {})
+        # 结构化表格证据只接受 v2 单一入口；旧 table_structured_* 字段不再在归一化层续命。
+        chunk["table_evidence"] = item.get("table_evidence") or metadata.get("table_evidence", {})
         chunk["asset_rows"] = item.get("asset_rows") or metadata.get("asset_rows", 0)
         chunk["asset_columns"] = item.get("asset_columns") or metadata.get("asset_columns", 0)
         chunk["order_index"] = item.get("order_index") or metadata.get("order_index", 0)

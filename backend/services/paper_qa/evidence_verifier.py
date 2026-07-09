@@ -51,7 +51,7 @@ class EvidenceVerifier:
             insufficient_evidence = True
         if answer_has_specific_claims and not normalized_sources:
             insufficient_evidence = True
-        # 如果结构化表格证据已经进入上下文，答案中的具体小数/百分比必须能回溯到 cell 或 computed_value。
+        # 如果结构化表格证据已经进入上下文，答案中的具体小数/百分比必须能回溯到 v2 cell 或 calculation。
         if unsupported_numeric_values:
             insufficient_evidence = True
 
@@ -126,13 +126,15 @@ class EvidenceVerifier:
         for source in sources:
             if not isinstance(source, dict):
                 continue
-            evidence = source.get("table_structured_evidence")
+            evidence = source.get("table_evidence")
             if isinstance(evidence, dict):
-                for cell in evidence.get("matched_cells") or []:
+                for cell in cls.table_evidence_cells(evidence):
                     if isinstance(cell, dict):
                         values.update(cls.numeric_tokens_from_value(cell.get("raw_value")))
                         values.update(cls.numeric_tokens_from_value(cell.get("normalized_value")))
-                values.update(cls.numeric_tokens_from_value(evidence.get("computed_value")))
+                for calculation in cls.table_evidence_calculations(evidence):
+                    values.update(cls.numeric_tokens_from_value(calculation.get("value")))
+                    values.update(cls.numeric_tokens_from_value(calculation.get("display_value")))
             for citation in source.get("table_cell_citations") or []:
                 if isinstance(citation, dict):
                     values.update(cls.numeric_tokens_from_value(citation.get("raw_value")))
@@ -149,10 +151,37 @@ class EvidenceVerifier:
             if isinstance(citations, list):
                 count += len([item for item in citations if isinstance(item, dict)])
                 continue
-            evidence = source.get("table_structured_evidence")
+            evidence = source.get("table_evidence")
             if isinstance(evidence, dict):
-                count += len([item for item in (evidence.get("matched_cells") or []) if isinstance(item, dict)])
+                count += len(cls.table_evidence_cells(evidence))
         return count
+
+    @staticmethod
+    def table_evidence_cells(evidence: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """统一读取 v2 final/candidate 单元格，避免 verifier 继续依赖旧证据字段。"""
+        cells: List[Dict[str, Any]] = []
+        final = evidence.get("final_evidence") if isinstance(evidence.get("final_evidence"), dict) else {}
+        candidate = evidence.get("candidate_evidence") if isinstance(evidence.get("candidate_evidence"), dict) else {}
+        for cell in list(final.get("cells") or []) + list(candidate.get("candidate_cells") or []):
+            if isinstance(cell, dict):
+                cells.append(cell)
+        return cells
+
+    @staticmethod
+    def table_evidence_calculations(evidence: Dict[str, Any]) -> List[Dict[str, Any]]:
+        calculations: List[Dict[str, Any]] = []
+        final = evidence.get("final_evidence") if isinstance(evidence.get("final_evidence"), dict) else {}
+        final_calculation = final.get("calculation") if isinstance(final.get("calculation"), dict) else {}
+        if final_calculation:
+            calculations.append(final_calculation)
+        candidate = evidence.get("candidate_evidence") if isinstance(evidence.get("candidate_evidence"), dict) else {}
+        for item in candidate.get("candidate_calculations") or []:
+            if not isinstance(item, dict):
+                continue
+            calculation = item.get("calculation") if isinstance(item.get("calculation"), dict) else {}
+            if calculation:
+                calculations.append(calculation)
+        return calculations
 
     @classmethod
     def extract_answer_numeric_values(cls, answer: str) -> List[str]:

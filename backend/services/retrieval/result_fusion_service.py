@@ -78,16 +78,10 @@ class ResultFusionService:
                     item,
                     route_name=route_name,
                 )
-                # 融合结果如果命中了结构化表格证据，主路由应指向 table_structured，方便下游调试与断言看到真实证据来源。
-                if route_name == "table_structured" and item.get("table_structured_evidence"):
+                # 融合结果如果命中 v2 表格证据，主路由指向 table_structured，便于下游优先展开结构化证据。
+                if route_name == "table_structured" and item.get("table_evidence"):
                     entry["retrieval_route"] = "table_structured"
-                    entry["table_structured_text"] = item.get("table_structured_text", entry.get("table_structured_text", ""))
-                    entry["table_structured_evidence"] = item.get("table_structured_evidence", entry.get("table_structured_evidence", {}))
-                    entry["table_structured_reason"] = item.get("table_structured_reason", entry.get("table_structured_reason", ""))
-                    entry["table_structured_confidence"] = item.get(
-                        "table_structured_confidence",
-                        entry.get("table_structured_confidence", 0.0),
-                    )
+                    entry["table_evidence"] = item.get("table_evidence", entry.get("table_evidence", {}))
                 if item.get("source_query") and item["source_query"] not in entry["source_queries"]:
                     entry["source_queries"].append(item["source_query"])
 
@@ -280,14 +274,23 @@ class ResultFusionService:
         """结构化单元格证据更接近最终答案，融合时给一个有限提权。"""
         if route_name != "table_structured":
             return 1.0
-        evidence = item.get("table_structured_evidence") or {}
-        if not isinstance(evidence, dict) or not evidence.get("matched_cells"):
+        evidence = item.get("table_evidence") or {}
+        if not isinstance(evidence, dict):
             return 1.0
-        numeric_operation = str(evidence.get("numeric_operation", "") or "").strip().lower()
+        final_evidence = evidence.get("final_evidence") if isinstance(evidence.get("final_evidence"), dict) else {}
+        candidate_evidence = evidence.get("candidate_evidence") if isinstance(evidence.get("candidate_evidence"), dict) else {}
+        has_cells = bool(final_evidence.get("cells") or candidate_evidence.get("candidate_cells"))
+        if not has_cells:
+            return 1.0
+        numeric_operation = str(evidence.get("operation_hint", "") or "").strip().lower()
+        decision = str(evidence.get("decision", "") or "").strip().lower()
         confidence = float(evidence.get("confidence", 0.0) or 0.0)
         multiplier = 1.0 + min(0.3, confidence * 0.22)
-        if numeric_operation in {"max", "min", "difference"}:
+        if decision == "compute" and numeric_operation in {"max", "min", "difference"}:
             multiplier += 0.08
+        elif decision == "defer_to_llm":
+            # 候选证据能帮助 rerank，但还没有规则层最终答案，因此只给有限提权。
+            multiplier += 0.03
         return multiplier
 
     @staticmethod

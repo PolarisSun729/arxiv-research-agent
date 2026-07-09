@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
+from services.retrieval.table_evidence_formatter import render_table_evidence_prompt_block
+from services.retrieval.table_evidence_schema import validate_table_evidence_payload
+
 
 class ContextPackBuilder:
     """把检索结果统一打包成生成模型和前端都能复用的上下文载荷。"""
@@ -22,11 +25,11 @@ class ContextPackBuilder:
             source_id = self.build_source_id(result, index)
             chunk_type = self.normalize_chunk_type(result.get("chunk_type", "text"))
             chunk_type_counts[chunk_type] = chunk_type_counts.get(chunk_type, 0) + 1
-            table_evidence = self.normalize_table_structured_evidence(result)
+            table_evidence = self.normalize_table_evidence(result)
             if table_evidence:
                 table_evidence_count += 1
-                table_cell_evidence_count += len(table_evidence.get("matched_cells") or [])
-                operation = str(table_evidence.get("numeric_operation", "") or "").strip()
+                table_cell_evidence_count += self.count_table_evidence_cells(table_evidence)
+                operation = str(table_evidence.get("operation_hint", "") or "").strip()
                 if operation and operation not in table_numeric_operations:
                     table_numeric_operations.append(operation)
 
@@ -86,9 +89,8 @@ class ContextPackBuilder:
                     "asset_section_match_is_heuristic": result.get("asset_section_match_is_heuristic", False),
                     "asset_section_match_allow_embedding": result.get("asset_section_match_allow_embedding", False),
                     "table_id": result.get("table_id", ""),
-                    "table_structured_source_id": source_id if table_evidence else "",
-                    "table_structured_text": result.get("table_structured_text", ""),
-                    "table_structured_evidence": result.get("table_structured_evidence", {}),
+                    "table_evidence_source_id": source_id if table_evidence else "",
+                    "table_evidence": table_evidence,
                     "table_cell_citations": self.build_table_cell_citations(result, source_id=source_id),
                 }
             )
@@ -132,12 +134,13 @@ class ContextPackBuilder:
 
     @staticmethod
     def build_source_id(result: Dict[str, Any], index: int) -> str:
-        table_evidence = ContextPackBuilder.normalize_table_structured_evidence(result)
+        table_evidence = ContextPackBuilder.normalize_table_evidence(result)
         if table_evidence:
-            table_id = table_evidence.get("table_id") or result.get("table_id") or "table"
+            table = table_evidence.get("table") if isinstance(table_evidence.get("table"), dict) else {}
+            table_id = table.get("table_id") or result.get("table_id") or "table"
             chunk_id = result.get("chunk_id") or result.get("parent_chunk_id") or result.get("original_chunk_id") or index
-            # 结构化表格证据使用独立 source_id，避免和同一个 table chunk 的摘要/预览证据混淆。
-            return "table-structured-%s-%s" % (
+            # v2 表格证据使用独立 source_id，避免和同一个 table chunk 的摘要/预览证据混淆。
+            return "table-evidence-%s-%s" % (
                 ContextPackBuilder.safe_source_token(table_id),
                 ContextPackBuilder.safe_source_token(chunk_id),
             )
@@ -166,9 +169,8 @@ class ContextPackBuilder:
             "asset_summary": result.get("asset_summary", ""),
             "asset_preview_text": result.get("asset_preview_text", ""),
             "table_id": result.get("table_id", ""),
-            "table_structured_source_id": source_id if ContextPackBuilder.normalize_table_structured_evidence(result) else "",
-            "table_structured_text": result.get("table_structured_text", ""),
-            "table_structured_evidence": result.get("table_structured_evidence", {}),
+            "table_evidence_source_id": source_id if ContextPackBuilder.normalize_table_evidence(result) else "",
+            "table_evidence": ContextPackBuilder.normalize_table_evidence(result),
             "table_cell_citations": ContextPackBuilder.build_table_cell_citations(result, source_id=source_id),
             "page_number": result.get("page_number", ""),
             "page_range": result.get("page_range", ""),
@@ -219,9 +221,8 @@ class ContextPackBuilder:
             "asset_section_match_is_heuristic": result.get("asset_section_match_is_heuristic", False),
             "asset_section_match_allow_embedding": result.get("asset_section_match_allow_embedding", False),
             "table_id": result.get("table_id", ""),
-            "table_structured_source_id": source_id if ContextPackBuilder.normalize_table_structured_evidence(result) else "",
-            "table_structured_text": result.get("table_structured_text", ""),
-            "table_structured_evidence": result.get("table_structured_evidence", {}),
+            "table_evidence_source_id": source_id if ContextPackBuilder.normalize_table_evidence(result) else "",
+            "table_evidence": ContextPackBuilder.normalize_table_evidence(result),
             "table_cell_citations": ContextPackBuilder.build_table_cell_citations(result, source_id=source_id),
         }
 
@@ -292,15 +293,15 @@ class ContextPackBuilder:
         return bool(result.get("asset_section_match_allow_embedding", False))
 
     @staticmethod
-    def normalize_table_structured_evidence(result: Dict[str, Any]) -> Dict[str, Any]:
-        evidence = result.get("table_structured_evidence")
+    def normalize_table_evidence(result: Dict[str, Any]) -> Dict[str, Any]:
+        evidence = result.get("table_evidence")
         if not isinstance(evidence, dict):
             return {}
-        if not evidence.get("matched_cells") and not evidence.get("matched_columns") and not evidence.get("matched_rows"):
+        if not evidence:
             return {}
-        normalized = dict(evidence)
-        normalized.setdefault("table_id", result.get("table_id", ""))
-        return normalized
+        # 这里只接受 v2 schema；旧表格证据字段不做翻译，避免继续扩散兼容层。
+        validate_table_evidence_payload(evidence)
+        return dict(evidence)
 
     @staticmethod
     def build_table_evidence_block(
@@ -311,86 +312,54 @@ class ContextPackBuilder:
         page_number: str,
         section_path: str,
     ) -> str:
-        evidence = ContextPackBuilder.normalize_table_structured_evidence(result)
+        evidence = ContextPackBuilder.normalize_table_evidence(result)
         if not evidence:
-            return str(result.get("table_structured_text", "") or "").strip()
-
-        table_id = str(evidence.get("table_id") or result.get("table_id") or "").strip()
-        caption = str(result.get("asset_caption") or result.get("asset_summary") or result.get("content") or "").strip()
-        operation = str(evidence.get("numeric_operation") or evidence.get("evidence_type") or "lookup").strip()
-        matched_rows = [str(item) for item in (evidence.get("matched_rows") or []) if str(item).strip()]
-        matched_columns = [str(item) for item in (evidence.get("matched_columns") or []) if str(item).strip()]
-        matched_cells = [cell for cell in (evidence.get("matched_cells") or []) if isinstance(cell, dict)]
-        primary_cell = matched_cells[0] if matched_cells else {}
-
-        # prompt 中显式展开行、列、值和来源，避免模型只能从摘要或预览文本里猜测数值。
-        lines = [
-            "Table Evidence:",
-            f"- source_id: {source_id}",
-            f"- table_id: {table_id or f'table-{index}'}",
-            f"- caption: {caption}" if caption else "",
-            f"- page: {page_number}" if page_number else "",
-            f"- section: {section_path}" if section_path else "",
-            f"- matched row: {', '.join(matched_rows) if matched_rows else str(primary_cell.get('row_label') or '')}",
-            f"- matched column: {', '.join(matched_columns) if matched_columns else str(primary_cell.get('col_name') or '')}",
-            f"- value: {primary_cell.get('raw_value')}" if primary_cell.get("raw_value") not in (None, "") else "",
-            f"- normalized_value: {primary_cell.get('normalized_value')}" if primary_cell.get("normalized_value") not in (None, "") else "",
-            f"- unit: {primary_cell.get('unit')}" if primary_cell.get("unit") not in (None, "") else "",
-            f"- comparison / operation: {operation}",
-            f"- source chunk: {result.get('chunk_id') or result.get('parent_chunk_id') or result.get('original_chunk_id') or ''}",
-        ]
-        calculation_lines = ContextPackBuilder.build_table_calculation_lines(evidence)
-        if calculation_lines:
-            lines.append("Calculation Evidence:")
-            lines.extend(calculation_lines)
-        return "\n".join(line for line in lines if str(line).strip()).strip()
-
-    @staticmethod
-    def build_table_calculation_lines(evidence: Dict[str, Any]) -> List[str]:
-        operation = str(evidence.get("numeric_operation", "") or "").strip().lower()
-        cells = [cell for cell in (evidence.get("matched_cells") or []) if isinstance(cell, dict)]
-        lines: List[str] = []
-        if operation in {"max", "min", "lookup"}:
-            for cell in cells[:4]:
-                label = ContextPackBuilder.table_cell_label(cell)
-                value = ContextPackBuilder.table_cell_value(cell)
-                if label and value:
-                    lines.append(f"- {label} = {value}")
-        elif operation == "difference":
-            for cell in cells[:4]:
-                label = ContextPackBuilder.table_cell_label(cell)
-                value = ContextPackBuilder.table_cell_value(cell)
-                if label and value:
-                    lines.append(f"- {label} score = {value}")
-            if evidence.get("computed_value") not in (None, ""):
-                lines.append(f"- difference = {evidence.get('computed_value')}")
-        return lines
-
-    @staticmethod
-    def table_cell_label(cell: Dict[str, Any]) -> str:
-        row = str(cell.get("row_label", "") or "").strip()
-        column = str(cell.get("col_name", "") or "").strip()
-        return " / ".join(part for part in (row, column) if part)
-
-    @staticmethod
-    def table_cell_value(cell: Dict[str, Any]) -> str:
-        raw = str(cell.get("raw_value", "") or "").strip()
-        unit = str(cell.get("unit", "") or "").strip()
-        normalized = cell.get("normalized_value")
-        if raw:
-            return raw
-        if normalized in (None, ""):
             return ""
-        return f"{normalized}{unit}" if unit and unit not in str(normalized) else str(normalized)
+        return render_table_evidence_prompt_block(evidence, source_id=source_id).strip()
+
+    @staticmethod
+    def table_evidence_cells(evidence: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """从 v2 final/candidate evidence 中抽取单元格，供引用和统计共用同一口径。"""
+        cells: List[Dict[str, Any]] = []
+        final = evidence.get("final_evidence") if isinstance(evidence.get("final_evidence"), dict) else {}
+        candidate = evidence.get("candidate_evidence") if isinstance(evidence.get("candidate_evidence"), dict) else {}
+        for cell in list(final.get("cells") or []) + list(candidate.get("candidate_cells") or []):
+            if not isinstance(cell, dict):
+                continue
+            dedupe_key = (
+                cell.get("row_index"),
+                cell.get("row_label"),
+                cell.get("col_name"),
+                cell.get("raw_value"),
+            )
+            if any(
+                (
+                    existing.get("row_index"),
+                    existing.get("row_label"),
+                    existing.get("col_name"),
+                    existing.get("raw_value"),
+                ) == dedupe_key
+                for existing in cells
+            ):
+                continue
+            cells.append(cell)
+        return cells
+
+    @staticmethod
+    def count_table_evidence_cells(evidence: Dict[str, Any]) -> int:
+        return len(ContextPackBuilder.table_evidence_cells(evidence))
 
     @staticmethod
     def build_table_cell_citations(result: Dict[str, Any], *, source_id: str) -> List[Dict[str, Any]]:
-        evidence = ContextPackBuilder.normalize_table_structured_evidence(result)
+        evidence = ContextPackBuilder.normalize_table_evidence(result)
         if not evidence:
             return []
-        table_id = str(evidence.get("table_id") or result.get("table_id") or "").strip()
+        table = evidence.get("table") if isinstance(evidence.get("table"), dict) else {}
+        table_id = str(table.get("table_id") or result.get("table_id") or "").strip()
+        decision = str(evidence.get("decision") or "").strip()
+        operation = str(evidence.get("operation_hint") or "").strip()
         citations: List[Dict[str, Any]] = []
-        for offset, cell in enumerate(evidence.get("matched_cells") or [], start=1):
+        for offset, cell in enumerate(ContextPackBuilder.table_evidence_cells(evidence), start=1):
             if not isinstance(cell, dict):
                 continue
             # cell_source_id 绑定到 table/source/row/column，前端后续可直接定位到具体单元格。
@@ -404,6 +373,8 @@ class ContextPackBuilder:
                     ),
                     "source_id": source_id,
                     "table_id": table_id,
+                    "decision": decision,
+                    "operation": operation,
                     "page_number": result.get("page_number", ""),
                     "section_path": result.get("section_path", ""),
                     "source_chunk_id": result.get("chunk_id", ""),

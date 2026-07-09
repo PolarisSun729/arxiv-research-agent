@@ -272,6 +272,13 @@ ENHANCED_RETRIEVAL_CONFIG = {
     # 灰度开关：index-level 输入为空或旧 collection 未迁移时，是否允许回退 chunk-level 检索。
     "enable_chunk_level_retrieval_fallback": True,
     "context_budget_max_chars": 24000,
+    "enable_table_structured_route": True,
+    "table_structured_candidate_limit": 8,
+    "table_structured_match_score_floor": 0.22,
+    # 表格证据不确定时只交短表全量或长表局部上下文给 LLM，避免继续扩写硬规则。
+    "table_structured_context_short_table_cell_limit": 48,
+    "table_structured_context_max_rows": 12,
+    "table_structured_context_focus_window": 2,
     "sample_limit": 24,
     "merge_candidate_terms_limit": 24,
     "extract_paper_terms_limit": 10,

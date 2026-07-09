@@ -484,16 +484,22 @@ class RouteRetrieverTests(unittest.TestCase):
         top_hit = table_hits[0]
         self.assertEqual(top_hit["chunk_id"], "chunk-table-results")
         self.assertEqual(top_hit["retrieval_route"], "table_structured")
-        self.assertEqual(top_hit["table_structured_evidence"]["numeric_operation"], "max")
-        self.assertEqual(top_hit["table_structured_evidence"]["matched_rows"], ["Ours"])
-        self.assertEqual(top_hit["table_structured_evidence"]["matched_columns"], ["Accuracy"])
-        self.assertEqual(top_hit["table_structured_evidence"]["matched_cells"][0]["raw_value"], "89.2%")
+        self.assertNotIn("table_structured_evidence", top_hit)
+        evidence = top_hit["table_evidence"]
+        self.assertEqual(evidence["schema_version"], "table_evidence_v2")
+        self.assertEqual(evidence["decision"], "compute")
+        self.assertEqual(evidence["operation_hint"], "max")
+        self.assertEqual(evidence["final_evidence"]["operation"], "max")
+        self.assertEqual(evidence["final_evidence"]["rows"], ["Ours"])
+        self.assertEqual(evidence["final_evidence"]["columns"], ["Accuracy"])
+        self.assertEqual(evidence["final_evidence"]["cells"][0]["raw_value"], "89.2%")
+        self.assertEqual(evidence["final_evidence"]["calculation"]["display_value"], "89.2%")
         self.assertTrue(bundle["table_structured_debug"]["enabled"])
         self.assertEqual(bundle["table_structured_debug"]["matched_tables"][0]["table_id"], "paper-table-2")
 
-    def test_table_structured_route_computes_difference_for_ablation_question(self) -> None:
+    def test_table_structured_route_computes_difference_when_metric_is_explicit(self) -> None:
         bundle = self._build_route_bundle(
-            "ablation 里去掉 memory 后下降多少？",
+            "In the ablation table, how much does F1 drop without memory?",
             enable_hyde=False,
             enable_keyword_search=False,
             enable_table_structured_route=True,
@@ -501,12 +507,41 @@ class RouteRetrieverTests(unittest.TestCase):
 
         table_hits = bundle["routes"]["table_structured"]
         self.assertTrue(table_hits)
-        evidence = table_hits[0]["table_structured_evidence"]
-        self.assertEqual(evidence["numeric_operation"], "difference")
-        self.assertEqual(evidence["matched_rows"], ["w/o memory", "Ours"])
-        self.assertEqual(evidence["matched_columns"], ["Accuracy"])
-        self.assertAlmostEqual(float(evidence["computed_value"]), 0.031, places=6)
-        self.assertEqual(len(evidence["matched_cells"]), 2)
+        evidence = table_hits[0]["table_evidence"]
+        self.assertEqual(evidence["decision"], "compute")
+        self.assertEqual(evidence["operation_hint"], "difference")
+        final_evidence = evidence["final_evidence"]
+        self.assertEqual(final_evidence["operation"], "difference")
+        self.assertEqual(final_evidence["rows"], ["w/o memory", "Ours"])
+        self.assertEqual(final_evidence["columns"], ["F1"])
+        self.assertAlmostEqual(float(final_evidence["calculation"]["value"]), 0.03, places=6)
+        self.assertEqual(final_evidence["calculation"]["display_value"], "0.03")
+        self.assertEqual(len(final_evidence["cells"]), 2)
+        self.assertIsNone(evidence["candidate_evidence"])
+
+    def test_table_structured_route_defers_difference_when_metric_is_ambiguous(self) -> None:
+        bundle = self._build_route_bundle(
+            "In the ablation table, how much does it drop without memory?",
+            enable_hyde=False,
+            enable_keyword_search=False,
+            enable_table_structured_route=True,
+        )
+
+        table_hits = bundle["routes"]["table_structured"]
+        self.assertTrue(table_hits)
+        evidence = table_hits[0]["table_evidence"]
+        self.assertEqual(evidence["schema_version"], "table_evidence_v2")
+        self.assertEqual(evidence["decision"], "defer_to_llm")
+        self.assertIsNone(evidence["final_evidence"])
+        self.assertIn("metric_column_not_specified", evidence["reasons"]["ambiguity"])
+        self.assertEqual(evidence["candidate_evidence"]["candidate_rows"], ["w/o memory", "Ours"])
+        self.assertEqual(evidence["candidate_evidence"]["candidate_columns"], ["Accuracy", "F1"])
+        calculations = evidence["candidate_evidence"]["candidate_calculations"]
+        self.assertEqual([item["column"] for item in calculations], ["Accuracy", "F1"])
+        self.assertEqual(calculations[0]["calculation"]["display_value"], "3.1 percentage points")
+        self.assertEqual(calculations[1]["calculation"]["display_value"], "0.03")
+        self.assertTrue(evidence["table_context"]["columns"])
+        self.assertIn("truncated", evidence["table_context"])
 
     def test_table_structured_route_prefers_structured_evidence_in_fusion(self) -> None:
         bundle = self._build_route_bundle(

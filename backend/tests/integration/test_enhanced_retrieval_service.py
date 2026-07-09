@@ -469,10 +469,13 @@ class RetrievalPipelineIntegrationTests(unittest.TestCase):
         top_chunk = result["chunks"][0]
         self.assertEqual(top_chunk["chunk_id"], "chunk-table-results")
         self.assertEqual(top_chunk["retrieval_route"], "table_structured")
-        self.assertEqual(top_chunk["table_structured_evidence"]["numeric_operation"], "max")
-        self.assertEqual(top_chunk["table_structured_evidence"]["matched_rows"], ["Ours"])
-        self.assertEqual(top_chunk["table_structured_evidence"]["matched_columns"], ["Accuracy"])
-        self.assertEqual(top_chunk["table_structured_evidence"]["matched_cells"][0]["raw_value"], "89.2%")
+        evidence = top_chunk["table_evidence"]
+        self.assertEqual(evidence["schema_version"], "table_evidence_v2")
+        self.assertEqual(evidence["decision"], "compute")
+        self.assertEqual(evidence["operation_hint"], "max")
+        self.assertEqual(evidence["final_evidence"]["rows"], ["Ours"])
+        self.assertEqual(evidence["final_evidence"]["columns"], ["Accuracy"])
+        self.assertEqual(evidence["final_evidence"]["cells"][0]["raw_value"], "89.2%")
         self.assertIn("table_structured", result["debug"]["routes"])
         self.assertEqual(result["debug"]["route_metrics"]["table_structured"]["status"], "ok")
         self.assertEqual(result["debug"]["table_structured"]["matched_tables"][0]["table_id"], "paper-table-2")

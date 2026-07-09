@@ -55,7 +55,6 @@ class PaperQABuildCache:
             "asset_caption",
             "asset_summary",
             "asset_preview_text",
-            "table_structured_text",
         )
         return {key: metadata.get(key) for key in keys if metadata.get(key) not in (None, "", [], {})}
 

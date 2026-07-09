@@ -508,34 +508,63 @@ class PaperQAServiceComponentTests(unittest.TestCase):
             "page_number": 5,
             "section_path": "Results/Ablation",
             "source": "table-source",
-            "table_structured_evidence": {
-                "table_id": "paper-table-2",
-                "matched_rows": ["Full model", "w/o memory"],
-                "matched_columns": ["Accuracy"],
-                "matched_cells": [
-                    {
-                        "row_index": 0,
-                        "row_label": "Full model",
-                        "col_name": "Accuracy",
-                        "raw_value": "87.5",
-                        "normalized_value": 87.5,
-                        "unit": "%",
-                        "confidence": 0.94,
-                    },
-                    {
-                        "row_index": 1,
-                        "row_label": "w/o memory",
-                        "col_name": "Accuracy",
-                        "raw_value": "84.1",
-                        "normalized_value": 84.1,
-                        "unit": "%",
-                        "confidence": 0.92,
-                    },
-                ],
-                "evidence_type": "cell_comparison",
-                "numeric_operation": "difference",
-                "computed_value": 3.4,
+            "table_evidence": {
+                "schema_version": "table_evidence_v2",
+                "table": {
+                    "table_id": "paper-table-2",
+                    "caption": "Table 2 Main results on the benchmark.",
+                    "page_number": 5,
+                    "section_path": "Results/Ablation",
+                    "section_title": "Ablation",
+                    "source_chunk_id": "chunk-table-results",
+                    "original_chunk_id": "orig-table-results",
+                },
+                "decision": "compute",
+                "operation_hint": "difference",
                 "confidence": 0.91,
+                "final_evidence": {
+                    "operation": "difference",
+                    "rows": ["Full model", "w/o memory"],
+                    "columns": ["Accuracy"],
+                    "cells": [
+                        {
+                            "row_index": 0,
+                            "row_label": "Full model",
+                            "col_name": "Accuracy",
+                            "raw_value": "87.5",
+                            "normalized_value": 87.5,
+                            "unit": "%",
+                            "confidence": 0.94,
+                        },
+                        {
+                            "row_index": 1,
+                            "row_label": "w/o memory",
+                            "col_name": "Accuracy",
+                            "raw_value": "84.1",
+                            "normalized_value": 84.1,
+                            "unit": "%",
+                            "confidence": 0.92,
+                        },
+                    ],
+                    "calculation": {
+                        "operation": "difference",
+                        "value": 3.4,
+                        "display_value": "3.4",
+                        "unit": "percentage_points",
+                        "expression": "Full model / Accuracy - w/o memory / Accuracy",
+                    },
+                    "reason": "difference_between_reference_and_focus_row",
+                },
+                "candidate_evidence": None,
+                "table_context": {
+                    "columns": ["Model", "Accuracy"],
+                    "rows": [],
+                    "truncated": False,
+                    "row_count": 2,
+                    "column_count": 2,
+                },
+                "reasons": {"matched": ["explicit_metric_column_match"], "ambiguity": [], "fallback": []},
+                "debug": {},
             },
         }
 
@@ -543,13 +572,13 @@ class PaperQAServiceComponentTests(unittest.TestCase):
         source_payload = context_pack["source_payload"]
         text_context = context_pack["text_context"]
 
-        self.assertTrue(source_payload[0]["source_id"].startswith("table-structured-paper-table-2-chunk-table-results"))
+        self.assertTrue(source_payload[0]["source_id"].startswith("table-evidence-paper-table-2-chunk-table-results"))
         self.assertIn("Table Evidence:", text_context)
         self.assertIn("table_id: paper-table-2", text_context)
         self.assertIn("matched row: Full model, w/o memory", text_context)
         self.assertIn("matched column: Accuracy", text_context)
-        self.assertIn("value: 87.5", text_context)
-        self.assertIn("difference = 3.4", text_context)
+        self.assertIn("Full model / Accuracy = 87.5", text_context)
+        self.assertIn("Full model / Accuracy - w/o memory / Accuracy = 3.4", text_context)
         self.assertIn("source chunk: chunk-table-results", text_context)
         self.assertIn("Table Supplemental Context:", text_context)
         self.assertEqual(source_payload[0]["table_cell_citations"][1]["row_label"], "w/o memory")

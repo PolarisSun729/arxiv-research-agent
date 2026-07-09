@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover
     CrossEncoder = None  # type: ignore
 
 from services.retrieval.contracts import QueryProfile
+from services.retrieval.table_evidence_formatter import render_table_evidence_rerank_text
 from utils.config import get_enhanced_retrieval_runtime_config
 from utils.model_utils import get_huggingface_model_path
 
@@ -79,9 +80,15 @@ class RerankService:
             match_type = str(chunk.get("asset_section_match_type", "") or "").strip()
             allow_section_anchor = bool(chunk.get("asset_section_match_allow_embedding")) if match_type else True
             # 新 asset 会显式标记弱章节锚点是否可入文本；旧数据缺字段时继续沿用历史 rerank 行为。
+            table_evidence = chunk.get("table_evidence") if isinstance(chunk.get("table_evidence"), dict) else {}
+            # rerank 只消费 v2 formatter 的文本结果，避免重新引入旧表格摘要字段的不透明语义。
+            table_evidence_text = render_table_evidence_rerank_text(
+                table_evidence,
+                max_chars=self.config_owner.llm_rerank_max_doc_chars,
+            ) if table_evidence else ""
             parts = [
                 str(chunk.get("asset_summary", "") or "").strip(),
-                str(chunk.get("table_structured_text", "") or "").strip(),
+                table_evidence_text,
                 str(chunk.get("asset_preview_text", "") or "").strip(),
                 str(chunk.get("section_title", "") or "").strip() if allow_section_anchor else "",
                 str(chunk.get("section_path", "") or "").strip() if allow_section_anchor else "",

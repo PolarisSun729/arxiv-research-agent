@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from services.retrieval.contracts import QueryProfile
+from services.retrieval.table_evidence_formatter import summarize_table_evidence_debug
 from utils.config import get_enhanced_retrieval_runtime_config
 
 ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
@@ -362,8 +363,7 @@ class RetrievalTraceBuilder:
             "asset_section_match_is_heuristic": item.get("asset_section_match_is_heuristic", False),
             "asset_section_match_allow_embedding": item.get("asset_section_match_allow_embedding", False),
             "table_id": item.get("table_id", ""),
-            "table_structured_text": item.get("table_structured_text", ""),
-            "table_structured_evidence": item.get("table_structured_evidence", {}),
+            "table_evidence": self._table_evidence_debug(item.get("table_evidence")),
             "page_number": item.get("page_number"),
             "page_range": item.get("page_range"),
             "score": item.get("score"),
@@ -410,6 +410,16 @@ class RetrievalTraceBuilder:
             "content": item.get("content", ""),
             "preview": preview,
         }
+
+    @staticmethod
+    def _table_evidence_debug(evidence: Any) -> Dict[str, Any]:
+        if not isinstance(evidence, dict) or not evidence:
+            return {}
+        try:
+            return summarize_table_evidence_debug(evidence)
+        except Exception as exc:
+            # trace 只记录坏 payload，不在 debug 展示阶段吞掉上游证据问题。
+            return {"invalid_table_evidence": True, "error": str(exc)}
 
     @staticmethod
     def count_chunk_types(chunks: List[Dict[str, Any]]) -> Dict[str, int]:

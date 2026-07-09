@@ -455,6 +455,10 @@ ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     "enable_table_structured_route": _env_bool("ENHANCED_RETRIEVAL_ENABLE_TABLE_STRUCTURED_ROUTE", True),
     "table_structured_candidate_limit": _env_int("ENHANCED_RETRIEVAL_TABLE_STRUCTURED_CANDIDATE_LIMIT", 8),
     "table_structured_match_score_floor": float(_env_str("ENHANCED_RETRIEVAL_TABLE_STRUCTURED_MATCH_SCORE_FLOOR", "0.22")),
+    # 表格 route 在不确定时会把局部表格上下文交给 LLM；这些参数限制上下文体积，避免规则层为了覆盖长表继续膨胀。
+    "table_structured_context_short_table_cell_limit": _env_int("ENHANCED_RETRIEVAL_TABLE_STRUCTURED_CONTEXT_SHORT_TABLE_CELL_LIMIT", 48),
+    "table_structured_context_max_rows": _env_int("ENHANCED_RETRIEVAL_TABLE_STRUCTURED_CONTEXT_MAX_ROWS", 12),
+    "table_structured_context_focus_window": _env_int("ENHANCED_RETRIEVAL_TABLE_STRUCTURED_CONTEXT_FOCUS_WINDOW", 2),
     "route_focus_bonus": float(_env_str("ENHANCED_RETRIEVAL_ROUTE_FOCUS_BONUS", "0.08")),
     "route_summary_bonus": float(_env_str("ENHANCED_RETRIEVAL_ROUTE_SUMMARY_BONUS", "0.05")),
     "route_keyword_bonus": float(_env_str("ENHANCED_RETRIEVAL_ROUTE_KEYWORD_BONUS", "0.08")),
