@@ -1,9 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional
+
+from services.prompt_context.blocks import PromptBlock
+from services.prompt_context.budget_planner import PromptBudgetConfig, PromptBudgetPlanner
+from services.prompt_context.compactor import RuleCompactionConfig, RuleCompactor
+from services.prompt_context.llm_compactor import LLMCompactionConfig, LLMCompactor
+from services.prompt_context.renderer import PromptRenderer
+from services.prompt_context.token_counter import TokenCounter, build_token_counter
+from utils.config import PROMPT_CONTEXT_CONFIG
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_BUDGETS = {
@@ -54,7 +66,14 @@ class PromptContextBuilder:
     裁剪和诊断统一由本类输出，避免各入口继续散落拼接 prompt。
     """
 
-    def __init__(self, budgets: Optional[Mapping[str, int]] = None) -> None:
+    def __init__(
+        self,
+        budgets: Optional[Mapping[str, int]] = None,
+        *,
+        prompt_config: Optional[Mapping[str, Any]] = None,
+        token_counter: Optional[TokenCounter] = None,
+        llm_compaction_client: Any = None,
+    ) -> None:
         merged = dict(DEFAULT_BUDGETS)
         for key, value in dict(budgets or {}).items():
             try:
@@ -62,6 +81,9 @@ class PromptContextBuilder:
             except (TypeError, ValueError):
                 continue
         self.budgets = merged
+        self.prompt_config = {**dict(PROMPT_CONTEXT_CONFIG), **dict(prompt_config or {})}
+        self.token_counter = token_counter or build_token_counter(self.prompt_config)
+        self.llm_compaction_client = llm_compaction_client
 
     def build_paper_qa_final_answer_context(
         self,
@@ -74,18 +96,35 @@ class PromptContextBuilder:
         user_memory_summary: Optional[Mapping[str, Any]] = None,
         preferred_answer_style: str = "",
     ) -> Dict[str, Any]:
+        system_instruction = (
+            "You are a strict academic QA assistant. Answer only from RAG evidence in the RAG evidence section. "
+            "Use user memory, session summary, and recent turns only to understand the question, preferences, and continuity. "
+            "If RAG evidence is insufficient, say you cannot determine it from the provided evidence. "
+            "When the question asks about table values, rankings, increases, decreases, or differences, prefer structured Table Evidence blocks "
+            "over table summaries or previews, and cite the table row, column, value, unit, operation, and source_id. "
+            "If the block is Table Evidence Candidates, use it as candidate evidence only; do not present a candidate calculation as certain unless the evidence disambiguates it."
+        )
+        if self.prompt_config.get("enable_block_prompt_context", True):
+            try:
+                assembly = self._build_paper_qa_block_context(
+                    system_instruction=system_instruction,
+                    question=question,
+                    contextualized_question=contextualized_question,
+                    context_pack=context_pack,
+                    session_summary=session_summary,
+                    recent_turns=recent_turns,
+                    user_memory_summary=user_memory_summary,
+                    preferred_answer_style=preferred_answer_style,
+                )
+                self._attach_context_pack_debug(assembly, context_pack)
+                return assembly
+            except Exception as exc:  # pragma: no cover - 兜底只用于本地排查异常链路
+                logger.exception("Block prompt context failed, fallback to legacy assembly: %s", exc)
         sections = [
             self._section(
                 "system_instruction",
                 "paper_qa_policy",
-                (
-                    "You are a strict academic QA assistant. Answer only from RAG evidence in the RAG evidence section. "
-                    "Use user memory, session summary, and recent turns only to understand the question, preferences, and continuity. "
-                    "If RAG evidence is insufficient, say you cannot determine it from the provided evidence. "
-                    "When the question asks about table values, rankings, increases, decreases, or differences, prefer structured Table Evidence blocks "
-                    "over table summaries or previews, and cite the table row, column, value, unit, operation, and source_id. "
-                    "If the block is Table Evidence Candidates, use it as candidate evidence only; do not present a candidate calculation as certain unless the evidence disambiguates it."
-                ),
+                system_instruction,
                 priority=1,
             ),
             self._section("user_memory", "memory_service", self._format_user_memory(user_memory_summary, preferred_answer_style), priority=2),
@@ -100,13 +139,10 @@ class PromptContextBuilder:
             ),
         ]
         assembly = self._assemble(sections)
-        context_debug = context_pack.get("context_budget_debug") if isinstance(context_pack.get("context_budget_debug"), Mapping) else {}
-        if isinstance(context_debug, Mapping):
-            # prompt debug 只暴露结构化表格证据计数，不复制完整 cell，避免 debug 体积膨胀。
-            assembly["debug"]["table_evidence_count"] = int(context_debug.get("table_evidence_count") or 0)
-            assembly["debug"]["table_cell_evidence_count"] = int(context_debug.get("table_cell_evidence_count") or 0)
-            assembly["debug"]["table_numeric_operations"] = list(context_debug.get("table_numeric_operations") or [])
-            assembly["debug"]["table_numeric_calculation_used"] = bool(context_debug.get("table_numeric_calculation_used", False))
+        assembly["debug"]["prompt_context_mode"] = "legacy"
+        if self.prompt_config.get("enable_block_prompt_context", True):
+            assembly["debug"]["block_prompt_context_fallback"] = True
+        self._attach_context_pack_debug(assembly, context_pack)
         return assembly
 
     def build_question_contextualization_context(
@@ -176,6 +212,222 @@ class PromptContextBuilder:
                 },
             }
         ]
+
+    def _build_paper_qa_block_context(
+        self,
+        *,
+        system_instruction: str,
+        question: str,
+        contextualized_question: str,
+        context_pack: Mapping[str, Any],
+        session_summary: Optional[Mapping[str, Any]],
+        recent_turns: Optional[Iterable[Mapping[str, Any]]],
+        user_memory_summary: Optional[Mapping[str, Any]],
+        preferred_answer_style: str,
+    ) -> Dict[str, Any]:
+        blocks = [
+            self._prompt_block(
+                block_id="system_instruction",
+                section="system_instruction",
+                block_type="system_instruction",
+                source="paper_qa_policy",
+                text=system_instruction,
+                protected=True,
+                droppable=False,
+                compactable=False,
+                priority=0,
+            ),
+            self._prompt_block(
+                block_id="current_question",
+                section="current_question",
+                block_type="current_question",
+                source="request",
+                text=self._format_current_question(question=question, contextualized_question=contextualized_question),
+                protected=True,
+                droppable=False,
+                compactable=False,
+                priority=0,
+            ),
+            self._prompt_block(
+                block_id="user_memory",
+                section="user_memory",
+                block_type="user_memory",
+                source="memory_service",
+                text=self._format_user_memory(user_memory_summary, preferred_answer_style),
+                priority=5,
+                metadata={"payload": self._memory_payload(user_memory_summary, preferred_answer_style)},
+            ),
+            self._prompt_block(
+                block_id="session_summary",
+                section="session_summary",
+                block_type="session_summary",
+                source="paper_chat_sessions.summary",
+                text=self._format_session_summary(session_summary),
+                priority=4,
+                metadata={"payload": dict(session_summary or {})},
+            ),
+            *self._recent_turn_prompt_blocks(recent_turns),
+            *self._rag_prompt_blocks(context_pack),
+        ]
+        blocks = [block for block in blocks if str(block.text or "").strip()]
+        compactor = RuleCompactor(
+            token_counter=self.token_counter,
+            config=self._rule_compaction_config(),
+        )
+        planner = PromptBudgetPlanner(
+            token_counter=self.token_counter,
+            compactor=compactor,
+            llm_compactor=LLMCompactor(
+                token_counter=self.token_counter,
+                config=self._llm_compaction_config(),
+                client=self.llm_compaction_client,
+            ),
+            config=self._prompt_budget_config(),
+        )
+        plan = planner.plan(blocks)
+        assembly = PromptRenderer(token_counter=self.token_counter).render(plan)
+        assembly["debug"]["rule_compaction_enabled"] = bool(self.prompt_config.get("enable_rule_compaction", True))
+        assembly["debug"]["llm_compaction_enabled"] = bool(self.prompt_config.get("enable_llm_compaction", False))
+        return assembly
+
+    def _prompt_block(
+        self,
+        *,
+        block_id: str,
+        section: str,
+        block_type: str,
+        source: str,
+        text: str,
+        priority: int,
+        metadata: Optional[Dict[str, Any]] = None,
+        protected: bool = False,
+        droppable: bool = True,
+        compactable: bool = True,
+    ) -> PromptBlock:
+        return PromptBlock(
+            block_id=block_id,
+            section=section,
+            block_type=block_type,
+            source=source,
+            text=str(text or "").strip(),
+            priority=priority,
+            protected=protected,
+            droppable=droppable,
+            compactable=compactable,
+            metadata=dict(metadata or {}),
+        )
+
+    def _recent_turn_prompt_blocks(self, turns: Optional[Iterable[Mapping[str, Any]]]) -> List[PromptBlock]:
+        blocks: List[PromptBlock] = []
+        for index, turn in enumerate(list(turns or []), start=1):
+            if not isinstance(turn, Mapping):
+                continue
+            if turn.get("is_summary") or turn.get("context_type") == "session_summary":
+                continue
+            source_ids = [
+                str(source.get("source_id", "") or "").strip()
+                for source in list(turn.get("sources") or [])
+                if isinstance(source, Mapping) and str(source.get("source_id", "") or "").strip()
+            ]
+            text = (
+                f"turn_id: {turn.get('turn_id') or ''}\n"
+                f"question: {turn.get('question') or ''}\n"
+                f"answer_summary: {turn.get('answer_summary') or ''}"
+            ).strip()
+            blocks.append(
+                PromptBlock(
+                    block_id=f"recent_turn:{turn.get('turn_id') or index}",
+                    section="recent_turns",
+                    block_type="recent_turn",
+                    source="paper_chat_messages.recent_turns",
+                    text=text,
+                    priority=6 + index,
+                    original_rank=index,
+                    metadata={
+                        "turn_id": turn.get("turn_id") or "",
+                        "question": turn.get("question") or "",
+                        "answer_summary": turn.get("answer_summary") or "",
+                        "cited_source_ids": source_ids,
+                        "resolved_reference": turn.get("resolved_reference") or "",
+                    },
+                )
+            )
+        return blocks
+
+    def _rag_prompt_blocks(self, context_pack: Mapping[str, Any]) -> List[PromptBlock]:
+        raw_blocks = context_pack.get("prompt_blocks") if isinstance(context_pack.get("prompt_blocks"), list) else []
+        blocks: List[PromptBlock] = []
+        for item in raw_blocks:
+            if isinstance(item, Mapping):
+                blocks.append(PromptBlock.from_dict(dict(item)))
+        if blocks:
+            return blocks
+        text_context = str(context_pack.get("text_context") or "").strip()
+        if not text_context:
+            return []
+        # 旧 context_pack 没有 prompt_blocks 时退回单块 RAG，保证调用方迁移期间不丢证据。
+        return [
+            PromptBlock(
+                block_id="rag:legacy_text_context",
+                section="rag_evidence",
+                block_type="anchor_evidence",
+                source="context_pack_builder",
+                text=text_context,
+                priority=0,
+                context_role="anchor_evidence",
+                source_id="legacy_text_context",
+                original_source_id="legacy_text_context",
+                droppable=False,
+            )
+        ]
+
+    def _prompt_budget_config(self) -> PromptBudgetConfig:
+        return PromptBudgetConfig(
+            max_input_tokens=int(self.prompt_config.get("prompt_max_input_tokens", 64000)),
+            safety_margin_tokens=int(self.prompt_config.get("prompt_safety_margin_tokens", 2048)),
+            rag_target_ratio=float(self.prompt_config.get("rag_target_ratio", 0.78)),
+        )
+
+    def _rule_compaction_config(self) -> RuleCompactionConfig:
+        return RuleCompactionConfig(
+            enabled=bool(self.prompt_config.get("enable_rule_compaction", True)),
+            rag_max_block_tokens=int(self.prompt_config.get("rag_max_block_tokens", 4000)),
+            rag_sibling_context_target_tokens=int(self.prompt_config.get("rag_sibling_context_target_tokens", 350)),
+            rag_section_context_target_tokens=int(self.prompt_config.get("rag_section_context_target_tokens", 250)),
+            rag_fallback_preview_tokens=int(self.prompt_config.get("rag_fallback_preview_tokens", 160)),
+            table_candidate_cell_limit=int(self.prompt_config.get("table_candidate_cell_limit", 8)),
+            figure_preview_tokens=int(self.prompt_config.get("figure_preview_tokens", 220)),
+            recent_turns_recent_full_count=int(self.prompt_config.get("recent_turns_recent_full_count", 2)),
+            recent_turns_source_id_limit=int(self.prompt_config.get("recent_turns_source_id_limit", 6)),
+        )
+
+    def _llm_compaction_config(self) -> LLMCompactionConfig:
+        return LLMCompactionConfig(
+            enabled=bool(self.prompt_config.get("enable_llm_compaction", False)),
+            min_block_tokens=int(self.prompt_config.get("llm_compaction_min_block_tokens", 1200)),
+            target_block_tokens=int(self.prompt_config.get("llm_compaction_target_block_tokens", 700)),
+            max_blocks=int(self.prompt_config.get("llm_compaction_max_blocks", 8)),
+            model_name=str(self.prompt_config.get("llm_compaction_model_name", "") or ""),
+            task_type=str(self.prompt_config.get("llm_compaction_task_type", "prompt_context_compaction") or "prompt_context_compaction"),
+            enable_thinking=bool(self.prompt_config.get("llm_compaction_enable_thinking", False)),
+        )
+
+    def _attach_context_pack_debug(self, assembly: Dict[str, Any], context_pack: Mapping[str, Any]) -> None:
+        context_debug = context_pack.get("context_budget_debug") if isinstance(context_pack.get("context_budget_debug"), Mapping) else {}
+        if isinstance(context_debug, Mapping):
+            # prompt debug 只暴露结构化表格证据计数，不复制完整 cell，避免 debug 体积膨胀。
+            assembly["debug"]["table_evidence_count"] = int(context_debug.get("table_evidence_count") or 0)
+            assembly["debug"]["table_cell_evidence_count"] = int(context_debug.get("table_cell_evidence_count") or 0)
+            assembly["debug"]["table_numeric_operations"] = list(context_debug.get("table_numeric_operations") or [])
+            assembly["debug"]["table_numeric_calculation_used"] = bool(context_debug.get("table_numeric_calculation_used", False))
+
+    def _memory_payload(self, user_memory_summary: Any, preferred_answer_style: str) -> Dict[str, Any]:
+        payload = user_memory_summary if isinstance(user_memory_summary, Mapping) else {}
+        profile = payload.get("profile") if isinstance(payload.get("profile"), Mapping) else payload
+        result = dict(profile or {}) if isinstance(profile, Mapping) else {}
+        if preferred_answer_style:
+            result["preferred_answer_style"] = preferred_answer_style
+        return result
 
     def _section(self, name: str, source: str, content: str, *, priority: int) -> PromptSection:
         original = str(content or "").strip()

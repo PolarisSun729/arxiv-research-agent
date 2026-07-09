@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
+from services.prompt_context.blocks import PromptBlock
 from services.retrieval.table_evidence_formatter import render_table_evidence_prompt_block
 from services.retrieval.table_evidence_schema import validate_table_evidence_payload
 
@@ -15,6 +16,7 @@ class ContextPackBuilder:
         asset_metadata: List[Dict[str, Any]] = []
         source_payload: List[Dict[str, Any]] = []
         generation_search_results: List[Dict[str, Any]] = []
+        prompt_blocks: List[Dict[str, Any]] = []
         chunk_type_counts: Dict[str, int] = {}
         skipped_empty_content_count = 0
         table_evidence_count = 0
@@ -94,6 +96,16 @@ class ContextPackBuilder:
                     "table_cell_citations": self.build_table_cell_citations(result, source_id=source_id),
                 }
             )
+            prompt_blocks.append(
+                self.build_prompt_block(
+                    result,
+                    index=index,
+                    source_id=source_id,
+                    chunk_type=chunk_type,
+                    text_block=text_block,
+                    table_evidence=table_evidence,
+                ).to_dict()
+            )
 
         text_context = "\n\n".join(text_parts)
         context_budget_debug = {
@@ -114,6 +126,7 @@ class ContextPackBuilder:
             "asset_metadata": asset_metadata,
             "source_payload": source_payload,
             "generation_search_results": generation_search_results,
+            "prompt_blocks": prompt_blocks,
             "context_budget_debug": context_budget_debug,
         }
 
@@ -280,6 +293,100 @@ class ContextPackBuilder:
         if context_role:
             header_parts.append(f"role: {context_role}")
         return "\n".join(header_parts + [content]).strip()
+
+    @staticmethod
+    def build_prompt_block(
+        result: Dict[str, Any],
+        *,
+        index: int,
+        source_id: str,
+        chunk_type: str,
+        text_block: str,
+        table_evidence: Dict[str, Any],
+    ) -> PromptBlock:
+        context_role = str(result.get("context_role", "") or "").strip() or "fallback_context"
+        block_type = ContextPackBuilder.prompt_block_type(
+            chunk_type=chunk_type,
+            context_role=context_role,
+            table_evidence=table_evidence,
+        )
+        # priority 只表达粗粒度证据层级，相关性细排沿用检索/rerank 分数，避免在 prompt 层再做一套语义打分。
+        priority = ContextPackBuilder.prompt_block_priority(block_type=block_type, context_role=context_role)
+        score = ContextPackBuilder.optional_float(
+            result.get("context_budget_score", result.get("llm_rerank_score", result.get("fusion_score", result.get("score", 0.0))))
+        )
+        metadata = {
+            "page_number": result.get("page_number", ""),
+            "page_range": result.get("page_range", ""),
+            "section_path": result.get("section_path", ""),
+            "section_title": result.get("section_title", ""),
+            "chunk_id": result.get("chunk_id", ""),
+            "parent_chunk_id": result.get("parent_chunk_id", ""),
+            "original_chunk_id": result.get("original_chunk_id", ""),
+            "chunk_type": chunk_type,
+            "context_role": context_role,
+            "relationship_types": result.get("relationship_types", []),
+            "matched_routes": result.get("matched_routes", []),
+            "table_id": result.get("table_id", ""),
+            "table_evidence": table_evidence,
+            "asset_summary": result.get("asset_summary", ""),
+            "asset_preview_text": result.get("asset_preview_text", ""),
+            "asset_abs_path": result.get("asset_abs_path", ""),
+        }
+        return PromptBlock(
+            block_id=f"rag:{source_id}",
+            section="rag_evidence",
+            block_type=block_type,
+            source="context_pack_builder",
+            text=text_block or str(result.get("content", "") or "").strip(),
+            priority=priority,
+            score=score,
+            original_rank=index,
+            context_role=context_role,
+            budget_group="rag_core" if priority <= 1 else "rag_expansion",
+            protected=False,
+            droppable=priority > 0,
+            compactable=True,
+            evidence_origin="raw",
+            source_id=source_id,
+            original_source_id=source_id,
+            can_support_numeric_claim=block_type == "table_final_evidence",
+            can_support_direct_quote=chunk_type == "text",
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def prompt_block_type(*, chunk_type: str, context_role: str, table_evidence: Dict[str, Any]) -> str:
+        if chunk_type == "table":
+            final = table_evidence.get("final_evidence") if isinstance(table_evidence, dict) else {}
+            candidate = table_evidence.get("candidate_evidence") if isinstance(table_evidence, dict) else {}
+            if isinstance(final, dict) and final.get("cells"):
+                return "table_final_evidence"
+            if isinstance(candidate, dict) and candidate.get("candidate_cells"):
+                return "table_candidate_evidence"
+            return "plain_table_context"
+        if chunk_type == "figure":
+            return "figure_evidence"
+        return context_role or "fallback_context"
+
+    @staticmethod
+    def prompt_block_priority(*, block_type: str, context_role: str) -> int:
+        if block_type in {"anchor_evidence", "table_final_evidence"}:
+            return 0
+        if block_type in {"table_candidate_evidence", "figure_evidence", "memory_context"}:
+            return 1
+        if context_role in {"sibling_context", "section_context", "parent_context"}:
+            return 2
+        return 4
+
+    @staticmethod
+    def optional_float(value: Any) -> float:
+        try:
+            if value in (None, ""):
+                return 0.0
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
 
     @staticmethod
     def asset_section_anchor_allowed(result: Dict[str, Any], chunk_type: str) -> bool:

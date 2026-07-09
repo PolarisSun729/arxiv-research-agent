@@ -11,7 +11,8 @@ class AnswerGenerator:
 
     def __init__(self, *, generation_service: Any) -> None:
         self.generation_service = generation_service
-        self.prompt_context_builder = PromptContextBuilder()
+        # LLM prompt 压缩默认关闭；开启时复用生成服务，避免在 builder 内部隐式创建新的外部调用依赖。
+        self.prompt_context_builder = PromptContextBuilder(llm_compaction_client=generation_service)
 
     def generate(
         self,

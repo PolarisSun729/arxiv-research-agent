@@ -254,6 +254,34 @@ MEMORY_RUNTIME_CONFIG = {
 }
 
 
+PROMPT_CONTEXT_CONFIG = {
+    "enable_block_prompt_context": True,
+    "prompt_max_input_tokens": 64000,
+    "prompt_safety_margin_tokens": 2048,
+    "rag_target_ratio": 0.78,
+    "token_counter_provider": "auto",
+    "tokenizer_name_or_path": "",
+    "token_counter_fallback_chars_per_token": 3.0,
+    "enable_rule_compaction": True,
+    "enable_llm_compaction": False,
+    # LLM 压缩默认关闭；开启后只处理超过阈值的长文本块，表格/数值证据仍由规则层保护。
+    "llm_compaction_min_block_tokens": 1200,
+    "llm_compaction_target_block_tokens": 700,
+    "llm_compaction_max_blocks": 8,
+    "llm_compaction_model_name": "",
+    "llm_compaction_task_type": "prompt_context_compaction",
+    "llm_compaction_enable_thinking": False,
+    "recent_turns_recent_full_count": 2,
+    "recent_turns_source_id_limit": 6,
+    "rag_max_block_tokens": 4000,
+    "rag_sibling_context_target_tokens": 350,
+    "rag_section_context_target_tokens": 250,
+    "rag_fallback_preview_tokens": 160,
+    "table_candidate_cell_limit": 8,
+    "figure_preview_tokens": 220,
+}
+
+
 ENHANCED_RETRIEVAL_CONFIG = {
     "query_view_limit": 6,
     "query_plan_limit": 5,
@@ -272,6 +300,9 @@ ENHANCED_RETRIEVAL_CONFIG = {
     # 灰度开关：index-level 输入为空或旧 collection 未迁移时，是否允许回退 chunk-level 检索。
     "enable_chunk_level_retrieval_fallback": True,
     "context_budget_max_chars": 24000,
+    "retrieval_candidate_max_blocks": 60,
+    "retrieval_candidate_max_tokens_soft": 90000,
+    "retrieval_candidate_token_chars_per_token": 3.0,
     "enable_table_structured_route": True,
     "table_structured_candidate_limit": 8,
     "table_structured_match_score_floor": 0.22,

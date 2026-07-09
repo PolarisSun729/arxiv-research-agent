@@ -91,21 +91,34 @@ class ContextBudgetSelector:
         final_context_top_k: int,
         max_context_chars: int,
         enabled: bool,
+        candidate_max_blocks: Optional[int] = None,
+        candidate_max_tokens_soft: Optional[int] = None,
+        token_chars_per_token: float = 3.0,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        fallback_chunks = self.trace_builder.mark_final_context_chunks(reranked_chunks[: max(1, final_context_top_k)])
+        candidate_limit = max(1, int(candidate_max_blocks or final_context_top_k))
+        effective_max_context_chars = self._resolve_effective_char_budget(
+            max_context_chars=max_context_chars,
+            candidate_max_tokens_soft=candidate_max_tokens_soft,
+            token_chars_per_token=token_chars_per_token,
+        )
+        fallback_chunks = self.trace_builder.mark_final_context_chunks(reranked_chunks[:candidate_limit])
         if not enabled:
             return fallback_chunks, self._fallback_debug(
                 reason="context_expansion_disabled",
                 enabled=False,
                 fallback_chunks=fallback_chunks,
-                max_context_chars=max_context_chars,
+                max_context_chars=effective_max_context_chars,
+                candidate_max_blocks=candidate_limit,
+                candidate_max_tokens_soft=candidate_max_tokens_soft,
             )
         if not context_expansion.get("candidate_pool"):
             return fallback_chunks, self._fallback_debug(
                 reason="candidate_pool_empty",
                 enabled=True,
                 fallback_chunks=fallback_chunks,
-                max_context_chars=max_context_chars,
+                max_context_chars=effective_max_context_chars,
+                candidate_max_blocks=candidate_limit,
+                candidate_max_tokens_soft=candidate_max_tokens_soft,
             )
 
         try:
@@ -129,14 +142,16 @@ class ContextBudgetSelector:
                     reason="budget_candidates_empty",
                     enabled=True,
                     fallback_chunks=fallback_chunks,
-                    max_context_chars=max_context_chars,
+                    max_context_chars=effective_max_context_chars,
+                    candidate_max_blocks=candidate_limit,
+                    candidate_max_tokens_soft=candidate_max_tokens_soft,
                 )
 
             selected, decisions = self._select_with_budget(
                 candidates,
                 anchor_rank=anchor_rank,
-                final_context_top_k=max(1, final_context_top_k),
-                max_context_chars=max(1, max_context_chars),
+                final_context_top_k=candidate_limit,
+                max_context_chars=max(1, effective_max_context_chars),
                 policy_name=str(policy.get("name", "default") or "default"),
             )
             if not selected:
@@ -144,19 +159,23 @@ class ContextBudgetSelector:
                     reason="budget_selected_empty",
                     enabled=True,
                     fallback_chunks=fallback_chunks,
-                    max_context_chars=max_context_chars,
+                    max_context_chars=effective_max_context_chars,
+                    candidate_max_blocks=candidate_limit,
+                    candidate_max_tokens_soft=candidate_max_tokens_soft,
                 )
 
             ordered = self._order_final_context(selected, anchor_rank=anchor_rank, policy_name=policy_name)
             final_chunks = [self._annotate_final_chunk(item["chunk"], item) for item in ordered]
             debug = self._budget_debug(
-                original_top_chunks=reranked_chunks[:final_context_top_k],
+                original_top_chunks=reranked_chunks[:candidate_limit],
                 context_expansion=context_expansion,
                 candidates=candidates,
                 decisions=decisions,
                 final_chunks=final_chunks,
-                max_context_chars=max_context_chars,
+                max_context_chars=effective_max_context_chars,
                 policy_name=policy_name,
+                candidate_max_blocks=candidate_limit,
+                candidate_max_tokens_soft=candidate_max_tokens_soft,
             )
             return final_chunks, debug
         except Exception as exc:  # pragma: no cover - 预算层不能影响基础 QA 可用性
@@ -164,7 +183,9 @@ class ContextBudgetSelector:
                 reason=f"context_budget_error: {exc}",
                 enabled=True,
                 fallback_chunks=fallback_chunks,
-                max_context_chars=max_context_chars,
+                max_context_chars=effective_max_context_chars,
+                candidate_max_blocks=candidate_limit,
+                candidate_max_tokens_soft=candidate_max_tokens_soft,
             )
 
     def _score_budget_candidates(
@@ -349,6 +370,24 @@ class ContextBudgetSelector:
                     lookup[key] = dict(chunk)
         return lookup
 
+    @staticmethod
+    def _resolve_effective_char_budget(
+        *,
+        max_context_chars: int,
+        candidate_max_tokens_soft: Optional[int],
+        token_chars_per_token: float,
+    ) -> int:
+        legacy_chars = max(1, int(max_context_chars or 1))
+        if candidate_max_tokens_soft in (None, ""):
+            return legacy_chars
+        try:
+            token_budget = max(1, int(candidate_max_tokens_soft))
+            chars_per_token = max(1.0, float(token_chars_per_token or 3.0))
+        except (TypeError, ValueError):
+            return legacy_chars
+        # retrieval 阶段只是候选预筛，soft token 预算换算成字符上限供旧选择器复用，最终精确预算在 prompt planner 完成。
+        return max(legacy_chars, int(token_budget * chars_per_token))
+
     def _budget_debug(
         self,
         *,
@@ -359,6 +398,8 @@ class ContextBudgetSelector:
         final_chunks: List[Dict[str, Any]],
         max_context_chars: int,
         policy_name: str,
+        candidate_max_blocks: Optional[int] = None,
+        candidate_max_tokens_soft: Optional[int] = None,
     ) -> Dict[str, Any]:
         role_counts: Dict[str, int] = {}
         chunk_type_counts: Dict[str, int] = {}
@@ -375,7 +416,10 @@ class ContextBudgetSelector:
         return {
             "enabled": True,
             "applied": True,
+            "mode": "candidate_preselector",
             "policy_name": policy_name,
+            "candidate_max_blocks": candidate_max_blocks,
+            "candidate_max_tokens_soft": candidate_max_tokens_soft,
             "max_context_chars": max_context_chars,
             "used_context_chars": sum(self._estimate_chars(chunk) for chunk in final_chunks),
             "original_top_chunks": [self.trace_builder.debug_chunk_item(chunk) for chunk in original_top_chunks],
@@ -399,7 +443,16 @@ class ContextBudgetSelector:
             "included_chunk_ids": sorted(included_ids),
         }
 
-    def _fallback_debug(self, *, reason: str, enabled: bool, fallback_chunks: List[Dict[str, Any]], max_context_chars: int) -> Dict[str, Any]:
+    def _fallback_debug(
+        self,
+        *,
+        reason: str,
+        enabled: bool,
+        fallback_chunks: List[Dict[str, Any]],
+        max_context_chars: int,
+        candidate_max_blocks: Optional[int] = None,
+        candidate_max_tokens_soft: Optional[int] = None,
+    ) -> Dict[str, Any]:
         decisions = [
             {
                 "chunk_id": chunk.get("chunk_id"),
@@ -413,7 +466,10 @@ class ContextBudgetSelector:
             # enabled 表示运行期开关状态；applied 表示是否真正走了扩展预算，二者分开便于定位降级原因。
             "enabled": enabled,
             "applied": False,
+            "mode": "candidate_preselector",
             "fallback_reason": reason,
+            "candidate_max_blocks": candidate_max_blocks,
+            "candidate_max_tokens_soft": candidate_max_tokens_soft,
             "max_context_chars": max_context_chars,
             "used_context_chars": sum(self._estimate_chars(chunk) for chunk in fallback_chunks),
             "original_top_chunks": [self.trace_builder.debug_chunk_item(chunk) for chunk in fallback_chunks],

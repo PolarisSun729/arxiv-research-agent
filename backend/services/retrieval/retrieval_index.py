@@ -102,6 +102,7 @@ PAPER_CHUNK_METADATA_KEYS = {
     "asset_caption",
     "asset_rows",
     "asset_columns",
+    "table_structured_text",
     "table_id",
     "order_index",
     "subchunk_index",
@@ -343,13 +344,14 @@ class RetrievalIndexBuilder:
         add_index("section_anchor", section_anchor_text, source_fields=["section_path", "section_title", "page_number", "summary"])
 
         if is_asset:
-            # 图表/表格 chunk 优先使用 caption、summary 和 preview；运行时结构化证据不写回索引文本。
+            # 图表/表格 chunk 优先使用 caption、summary、preview 和建库期结构化表格文本；
+            # 不混入问答运行时生成的 table evidence，避免索引语料随单次问题变化。
             asset_text = self._asset_index_text(paper_chunk, metadata)
             if asset_text:
                 add_index(
                     "table_or_figure",
                     asset_text,
-                    source_fields=["asset_caption", "asset_summary", "asset_preview_text", "content"],
+                    source_fields=["asset_caption", "asset_summary", "asset_preview_text", "table_structured_text", "content"],
                 )
 
         # summary/question 是召回增强层；数量受上限约束，避免一个 chunk 扩张出过多向量。
@@ -572,6 +574,7 @@ class RetrievalIndexBuilder:
             str(metadata.get("asset_caption") or "").strip(),
             str(metadata.get("asset_summary") or "").strip(),
             str(metadata.get("asset_preview_text") or "").strip(),
+            str(metadata.get("table_structured_text") or "").strip(),
             paper_chunk.content.strip(),
         ]
         return "\n".join(self._dedupe_texts([part for part in parts if part]))

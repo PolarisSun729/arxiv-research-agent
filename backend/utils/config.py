@@ -392,6 +392,33 @@ MEMORY_RUNTIME_CONFIG: Dict[str, Any] = {
     "memory_context_debug": _env_bool("MEMORY_CONTEXT_DEBUG", True),
 }
 
+PROMPT_CONTEXT_CONFIG: Dict[str, Any] = {
+    "enable_block_prompt_context": _env_bool("ENABLE_BLOCK_PROMPT_CONTEXT", True),
+    "prompt_max_input_tokens": _env_int("PROMPT_MAX_INPUT_TOKENS", 64000),
+    "prompt_safety_margin_tokens": _env_int("PROMPT_SAFETY_MARGIN_TOKENS", 2048),
+    "rag_target_ratio": float(_env_str("PROMPT_RAG_TARGET_RATIO", "0.78")),
+    "token_counter_provider": _env_str("PROMPT_TOKEN_COUNTER_PROVIDER", "auto"),
+    "tokenizer_name_or_path": _env_str("PROMPT_TOKENIZER_NAME_OR_PATH", ""),
+    "token_counter_fallback_chars_per_token": float(_env_str("PROMPT_TOKEN_FALLBACK_CHARS_PER_TOKEN", "3.0")),
+    "enable_rule_compaction": _env_bool("ENABLE_PROMPT_RULE_COMPACTION", True),
+    "enable_llm_compaction": _env_bool("ENABLE_PROMPT_LLM_COMPACTION", False),
+    # LLM 压缩是规则压缩后的二级优化，默认关闭；阈值限制可控调用量，避免长证据批量触发外部模型。
+    "llm_compaction_min_block_tokens": _env_int("PROMPT_LLM_COMPACTION_MIN_BLOCK_TOKENS", 1200),
+    "llm_compaction_target_block_tokens": _env_int("PROMPT_LLM_COMPACTION_TARGET_BLOCK_TOKENS", 700),
+    "llm_compaction_max_blocks": _env_int("PROMPT_LLM_COMPACTION_MAX_BLOCKS", 8),
+    "llm_compaction_model_name": _env_str("PROMPT_LLM_COMPACTION_MODEL_NAME", ""),
+    "llm_compaction_task_type": _env_str("PROMPT_LLM_COMPACTION_TASK_TYPE", "prompt_context_compaction"),
+    "llm_compaction_enable_thinking": _env_bool("PROMPT_LLM_COMPACTION_ENABLE_THINKING", False),
+    "recent_turns_recent_full_count": _env_int("PROMPT_RECENT_TURNS_RECENT_FULL_COUNT", 2),
+    "recent_turns_source_id_limit": _env_int("PROMPT_RECENT_TURNS_SOURCE_ID_LIMIT", 6),
+    "rag_max_block_tokens": _env_int("PROMPT_RAG_MAX_BLOCK_TOKENS", 4000),
+    "rag_sibling_context_target_tokens": _env_int("PROMPT_RAG_SIBLING_CONTEXT_TARGET_TOKENS", 350),
+    "rag_section_context_target_tokens": _env_int("PROMPT_RAG_SECTION_CONTEXT_TARGET_TOKENS", 250),
+    "rag_fallback_preview_tokens": _env_int("PROMPT_RAG_FALLBACK_PREVIEW_TOKENS", 160),
+    "table_candidate_cell_limit": _env_int("PROMPT_TABLE_CANDIDATE_CELL_LIMIT", 8),
+    "figure_preview_tokens": _env_int("PROMPT_FIGURE_PREVIEW_TOKENS", 220),
+}
+
 ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     "query_view_limit": _env_int("ENHANCED_RETRIEVAL_QUERY_VIEW_LIMIT", 6),
     "query_plan_limit": _env_int("ENHANCED_RETRIEVAL_QUERY_PLAN_LIMIT", 5),
@@ -407,6 +434,9 @@ ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     "enable_generated_question_index": _env_bool("ENABLE_GENERATED_QUESTION_INDEX", True),
     "enable_chunk_level_retrieval_fallback": _env_bool("ENABLE_CHUNK_LEVEL_RETRIEVAL_FALLBACK", True),
     "context_budget_max_chars": _env_int("ENHANCED_RETRIEVAL_CONTEXT_BUDGET_MAX_CHARS", 24000),
+    "retrieval_candidate_max_blocks": _env_int("RETRIEVAL_CANDIDATE_MAX_BLOCKS", 60),
+    "retrieval_candidate_max_tokens_soft": _env_int("RETRIEVAL_CANDIDATE_MAX_TOKENS_SOFT", 90000),
+    "retrieval_candidate_token_chars_per_token": float(_env_str("RETRIEVAL_CANDIDATE_TOKEN_CHARS_PER_TOKEN", "3.0")),
     "sample_limit": _env_int("ENHANCED_RETRIEVAL_SAMPLE_LIMIT", 24),
     "merge_candidate_terms_limit": _env_int("ENHANCED_RETRIEVAL_MERGE_CANDIDATE_TERMS_LIMIT", 24),
     "extract_paper_terms_limit": _env_int("ENHANCED_RETRIEVAL_EXTRACT_PAPER_TERMS_LIMIT", 10),
@@ -681,6 +711,7 @@ GENERATION_CONFIG: Dict[str, Any] = {
         "query_planning": "small",  # 规划多步或多查询的检索策略
         "query_rewrite": "small",  # 重写或规范化查询以提升检索效果
         "rerank_query": "small",  # 为重排阶段生成或调整查询
+        "prompt_context_compaction": "small",  # 对长证据块做语义压缩，结果仍需最终回答模型基于证据使用
         "hyde_generation": "small",  # HYDE 风格的伪文档生成（用于查询扩展）
         "paper_qa_final_answer": "large",  # 为论文问答生成最终高质量答案
         "paper_summary": "large",  # 生成论文的综合性摘要

@@ -144,6 +144,9 @@ class RetrievalPipeline:
             final_context_top_k=runtime["effective_top_k"],
             max_context_chars=runtime["context_budget_max_chars"],
             enabled=runtime["enable_context_expansion"],
+            candidate_max_blocks=runtime["retrieval_candidate_max_blocks"],
+            candidate_max_tokens_soft=runtime["retrieval_candidate_max_tokens_soft"],
+            token_chars_per_token=runtime["retrieval_candidate_token_chars_per_token"],
         )
         route_metrics["rerank"] = rerank_result.route_metric or {}
         debug = None
@@ -191,6 +194,9 @@ class RetrievalPipeline:
                     "enable_generated_question_index": runtime["enable_generated_question_index"],
                     "enable_chunk_level_retrieval_fallback": runtime["enable_chunk_level_retrieval_fallback"],
                     "context_budget_max_chars": runtime["context_budget_max_chars"],
+                    "retrieval_candidate_max_blocks": runtime["retrieval_candidate_max_blocks"],
+                    "retrieval_candidate_max_tokens_soft": runtime["retrieval_candidate_max_tokens_soft"],
+                    "retrieval_candidate_token_chars_per_token": runtime["retrieval_candidate_token_chars_per_token"],
                     "memory_source_boost_weight": float(
                         self.memory_flag_reader(
                             "memory_source_boost_weight",
@@ -391,4 +397,16 @@ class RetrievalPipeline:
             "rrf_candidate_limit": self.enhanced_config["rrf_candidate_limit"],
             "rerank_candidate_limit": self.enhanced_config["rerank_candidate_limit"],
             "context_budget_max_chars": max(1, int(self.enhanced_config.get("context_budget_max_chars", 24000))),
+            "retrieval_candidate_max_blocks": max(
+                effective_top_k,
+                int(self.enhanced_config.get("retrieval_candidate_max_blocks", max_final_context_top_k)),
+            ),
+            "retrieval_candidate_max_tokens_soft": max(
+                1,
+                int(self.enhanced_config.get("retrieval_candidate_max_tokens_soft", 90000)),
+            ),
+            "retrieval_candidate_token_chars_per_token": max(
+                1.0,
+                float(self.enhanced_config.get("retrieval_candidate_token_chars_per_token", 3.0)),
+            ),
         }

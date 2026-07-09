@@ -1,17 +1,12 @@
 from __future__ import annotations
 
-from services.prompt_context import PromptContextBuilder
+from services.prompt_context import PromptContextBuilder, TokenCounter
 
 
 def test_paper_qa_context_assembly_keeps_stable_order_and_budget_debug() -> None:
     builder = PromptContextBuilder(
-        budgets={
-            "total": 1200,
-            "user_memory": 120,
-            "session_summary": 180,
-            "recent_turns": 220,
-            "rag_evidence": 260,
-        }
+        prompt_config={"prompt_max_input_tokens": 2200, "prompt_safety_margin_tokens": 0},
+        token_counter=TokenCounter(fallback_chars_per_token=1.0),
     )
 
     assembly = builder.build_paper_qa_final_answer_context(
@@ -35,7 +30,8 @@ def test_paper_qa_context_assembly_keeps_stable_order_and_budget_debug() -> None
     )
 
     debug = assembly["debug"]
-    assert debug["section_order"] == [
+    assert debug["prompt_context_mode"] == "block_token_budget"
+    assert debug["rendered_section_order"] == [
         "system_instruction",
         "user_memory",
         "session_summary",
@@ -43,10 +39,10 @@ def test_paper_qa_context_assembly_keeps_stable_order_and_budget_debug() -> None
         "rag_evidence",
         "current_question",
     ]
-    assert debug["total_budget_chars"] == 1200
-    assert debug["estimated_tokens"] > 0
-    assert "rag_evidence" in debug["truncated_sections"]
-    assert all("content" not in section for section in debug["sections"])
+    assert debug["total_input_budget_tokens"] == 2200
+    assert debug["used_input_tokens"] <= 2200
+    assert debug["rendered_tokens"] > 0
+    assert all("content" not in section for section in assembly["sections"])
     assert assembly["text"].index("## user_memory") < assembly["text"].index("## session_summary")
     assert assembly["text"].index("## rag_evidence") < assembly["text"].index("## current_question")
 
