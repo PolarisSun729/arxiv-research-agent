@@ -24,7 +24,9 @@ from services.paper_qa.build_cache import (
 )
 from services.document.loading_service import LoadingService
 from services.retrieval.retrieval_index import (
+    DEFAULT_RETRIEVAL_INDEX_ARTIFACT_DIR,
     RETRIEVAL_INDEX_ARTIFACT_SCHEMA_VERSION,
+    DEFAULT_SPARSE_INDEX_ARTIFACT_DIR,
     SPARSE_INDEX_ARTIFACT_SCHEMA_VERSION,
     CollectionRetrievalIndexProvider,
     DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK,
@@ -843,6 +845,8 @@ class PaperQAIndexBuilder:
             retrieval_index_debug=retrieval_index_debug,
             chunks=chunks,
             index_version=index_version,
+            # 显式锚定 backend，避免启动目录变化后生成位置与清理安全边界不一致。
+            output_dir=str(self._workspace_root() / DEFAULT_RETRIEVAL_INDEX_ARTIFACT_DIR),
         )
         logger.debug("Retrieval index artifact saved to: %s", artifact_file)
         return artifact_file
@@ -912,6 +916,8 @@ class PaperQAIndexBuilder:
             source_file=chunk_file,
             source_hash=source_hash,
             backend="internal_bm25",
+            # sparse artifact 与 retrieval artifact 使用同一稳定根目录，保证版本清理可定位。
+            output_dir=str(self._workspace_root() / DEFAULT_SPARSE_INDEX_ARTIFACT_DIR),
         )
         logger.debug(
             "Chunk-level sparse index artifact saved to: %s document_count=%s token_count=%s source_hash=%s",

@@ -441,7 +441,8 @@ class _BaseIndexTestCase(unittest.TestCase):
         for path_text in paths:
             path = Path(path_text)
             if not path.is_absolute():
-                path = Path.cwd() / path
+                # 构建器将相对 artifact 路径解释为 backend 相对路径，测试清理必须遵循同一契约。
+                path = Path(__file__).resolve().parents[2] / path
             try:
                 if path.is_file() and "02-retrieval-indexes" in path.parts:
                     path.unlink()
@@ -812,10 +813,13 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
 
     def test_cleanup_pending_builds_does_not_delete_active_collection(self) -> None:
         self.storage.paper_catalog.add_paper(self._paper_payload())
-        old_retrieval_index_file = Path("02-retrieval-indexes") / "old_active_retrieval_indexes.json"
+        backend_root = Path(__file__).resolve().parents[2]
+        old_retrieval_index_path = Path("02-retrieval-indexes") / "old_active_retrieval_indexes.json"
+        old_retrieval_index_file = backend_root / old_retrieval_index_path
         old_retrieval_index_file.parent.mkdir(exist_ok=True)
         old_retrieval_index_file.write_text('{"retrieval_indexes":[]}', encoding="utf-8")
-        old_sparse_dir = Path("02-sparse-indexes") / "old_active_sparse"
+        old_sparse_path = Path("02-sparse-indexes") / "old_active_sparse"
+        old_sparse_dir = backend_root / old_sparse_path
         old_sparse_dir.mkdir(parents=True, exist_ok=True)
         old_sparse_manifest = old_sparse_dir / "manifest.json"
         old_sparse_manifest.write_text("{}", encoding="utf-8")
@@ -825,12 +829,13 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
             status="indexed",
             chunk_count=2,
             embedding_model="old-model",
-            retrieval_index_file=str(old_retrieval_index_file),
+            # 旧记录可能仍是相对路径；清理流程应以 backend 为基准兼容这些记录。
+            retrieval_index_file=str(old_retrieval_index_path),
             retrieval_index_count=2,
             retrieval_index_types=json.dumps(["body"], ensure_ascii=False),
             retrieval_index_version="old-version",
-            sparse_index_dir=str(old_sparse_dir),
-            sparse_index_manifest_file=str(old_sparse_manifest),
+            sparse_index_dir=str(old_sparse_path),
+            sparse_index_manifest_file=str(old_sparse_path / "manifest.json"),
             sparse_index_document_count=2,
             sparse_index_token_count=12,
             sparse_index_backend="internal_bm25",

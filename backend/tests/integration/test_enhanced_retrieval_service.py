@@ -150,7 +150,7 @@ class RetrievalPipelineIntegrationTests(unittest.TestCase):
         self.sample_chunks = build_sample_chunks()
         self.options_cls = RetrievalOptions
 
-    def test_retrieve_top_k_boundaries_and_debug_snapshot(self) -> None:
+    def test_retrieve_candidate_preselector_boundaries_and_debug_snapshot(self) -> None:
         default_result = self.pipeline.retrieve(
             "What is the method of the paper?",
             self.collection_name,
@@ -167,9 +167,15 @@ class RetrievalPipelineIntegrationTests(unittest.TestCase):
             options=self.options_cls(top_k=99, debug=True, enable_llm_rerank=False),
         )
 
-        self.assertEqual(len(default_result["chunks"]), 3)
-        self.assertEqual(len(one_result["chunks"]), 1)
-        self.assertEqual(len(capped_result["chunks"]), 4)
+        # Context Budget V2 把 top_k 保留为原始 anchor 基线；retrieval 返回的是供 prompt planner 精确裁剪的有界候选池。
+        self.assertEqual(default_result["debug"]["config"]["effective_top_k"], 3)
+        self.assertEqual(one_result["debug"]["config"]["effective_top_k"], 1)
+        self.assertEqual(capped_result["debug"]["config"]["effective_top_k"], 4)
+        for result in (default_result, one_result, capped_result):
+            budget = result["debug"]["context_budget"]
+            reranked_count = len(result["debug"]["stages"]["reranked_top30"])
+            self.assertEqual(budget["mode"], "candidate_preselector")
+            self.assertEqual(len(result["chunks"]), min(reranked_count, budget["candidate_max_blocks"]))
         debug = default_result["debug"]
         self.assertIn("raw_retrieval_top30", debug["stages"])
         self.assertIn("fused_top30", debug["stages"])
@@ -324,8 +330,10 @@ class RetrievalPipelineIntegrationTests(unittest.TestCase):
             for candidate in relation["candidates"]
         ]
 
-        self.assertEqual(len(result["chunks"]), 1)
-        self.assertGreater(expansion["anchor_count"], len(result["chunks"]))
+        self.assertEqual(debug["context_budget"]["mode"], "candidate_preselector")
+        self.assertEqual(len(result["chunks"]), len(build_context_expansion_chunks()))
+        self.assertGreater(expansion["anchor_count"], debug["config"]["effective_top_k"])
+        self.assertLessEqual(len(result["chunks"]), debug["context_budget"]["candidate_max_blocks"])
         self.assertIn("method-parent-2", anchor_ids)
         self.assertEqual(expansion["policy"]["name"], "method_flow")
         self.assertIn(("method-parent-2", "method-parent-1", "sibling"), candidate_pairs)
@@ -426,15 +434,21 @@ class RetrievalPipelineIntegrationTests(unittest.TestCase):
 
         expanded_ids = [chunk["chunk_id"] for chunk in expanded["chunks"]]
         disabled_ids = [chunk["chunk_id"] for chunk in disabled["chunks"]]
-        reranked_ids = [chunk["chunk_id"] for chunk in expanded["debug"]["stages"]["reranked_top30"][:4]]
+        candidate_limit = disabled["debug"]["context_budget"]["candidate_max_blocks"]
+        reranked_ids = [
+            chunk["chunk_id"]
+            for chunk in expanded["debug"]["stages"]["reranked_top30"][:candidate_limit]
+        ]
 
         self.assertEqual(disabled_ids, reranked_ids)
         self.assertTrue(expanded["debug"]["context_budget"]["applied"])
         self.assertFalse(disabled["debug"]["context_budget"]["applied"])
         self.assertEqual(set(expanded_ids), set(expanded["debug"]["context_budget"]["included_chunk_ids"]))
-        self.assertIn("sibling_context", expanded["debug"]["context_budget"]["role_counts"])
+        self.assertIn("anchor_evidence", expanded["debug"]["context_budget"]["role_counts"])
         self.assertIn("figure_evidence", expanded["debug"]["context_budget"]["role_counts"])
         self.assertIn("method-parent-3", expanded["debug"]["context_budget"]["included_chunk_ids"])
+        related_chunk = next(chunk for chunk in expanded["chunks"] if chunk["chunk_id"] == "method-parent-3")
+        self.assertIn("sibling", related_chunk["relationship_types"])
         self.assertTrue(any(chunk.get("context_role") for chunk in expanded["chunks"]))
         self.assertFalse(any(chunk.get("context_role") for chunk in disabled["chunks"]))
 
@@ -450,13 +464,14 @@ class RetrievalPipelineIntegrationTests(unittest.TestCase):
         context_pack = ContextPackBuilder().build(result["chunks"])
         sources = context_pack["source_payload"]
 
-        sibling_source = next(source for source in sources if source["chunk_id"] == "method-parent-3")
+        related_source = next(source for source in sources if source["chunk_id"] == "method-parent-3")
         figure_source = next(source for source in sources if source["chunk_id"] == "method-figure")
-        self.assertEqual(sibling_source["context_role"], "sibling_context")
-        self.assertIn("sibling", sibling_source["relationship_types"])
+        # 原始命中继续承担 anchor 角色，同时保留 sibling 关系供 prompt planner 做结构化预算选择。
+        self.assertEqual(related_source["context_role"], "anchor_evidence")
+        self.assertIn("sibling", related_source["relationship_types"])
         self.assertEqual(figure_source["context_role"], "figure_evidence")
         self.assertIn("context_budget_score", figure_source)
-        self.assertIn("role: sibling_context", context_pack["text_context"])
+        self.assertIn("role: anchor_evidence", context_pack["text_context"])
 
     def test_table_structured_route_promotes_cell_level_evidence_for_table_question(self) -> None:
         result = self.pipeline.retrieve(

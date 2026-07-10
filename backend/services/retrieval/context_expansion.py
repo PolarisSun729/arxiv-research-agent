@@ -77,7 +77,7 @@ class ExpansionPolicy:
 
 
 class ContextBudgetSelector:
-    """统一裁剪 anchor 和扩展候选，输出真正进入生成上下文的 final context。"""
+    """在 retrieval 阶段预筛 anchor 和扩展候选；最终 token 预算由 PromptBudgetPlanner 负责。"""
 
     def __init__(self, *, trace_builder: RetrievalTraceBuilder) -> None:
         self.trace_builder = trace_builder
@@ -457,7 +457,7 @@ class ContextBudgetSelector:
             {
                 "chunk_id": chunk.get("chunk_id"),
                 "include": True,
-                "reason": "fallback_to_rerank_top_k",
+                "reason": "fallback_to_rerank_candidates",
                 "context_role": chunk.get("context_role", "fallback_context"),
             }
             for chunk in fallback_chunks

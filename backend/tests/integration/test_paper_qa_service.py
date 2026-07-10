@@ -202,6 +202,10 @@ class _FakeMemoryService:
     def update_profile_from_note(self, user_id: str, note):
         self.updated_notes.append((user_id, deepcopy(note)))
 
+    def build_user_memory_summary(self, _user_id: str):
+        # 该组件用例不关注长期记忆内容，但 fake 仍需与生产接口一致，避免误走异常兜底。
+        return {}
+
 
 class _FakeRetrievalService:
     def __init__(self, *, chunks=None, debug=None, raise_error: Exception | None = None) -> None:
@@ -646,7 +650,7 @@ class PaperQAServiceComponentTests(unittest.TestCase):
         self.assertIn("context_pack", result["retrieval_debug"])
         prompt_context_debug = result["retrieval_debug"]["generation"]["prompt_context"]
         self.assertEqual(
-            prompt_context_debug["section_order"],
+            prompt_context_debug["rendered_section_order"],
             ["system_instruction", "rag_evidence", "current_question"],
         )
         generate_call = next(call for call in generation_service.calls if call["method"] == "generate")

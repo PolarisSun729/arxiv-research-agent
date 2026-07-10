@@ -105,7 +105,8 @@ class RetrievalPipeline:
         route_metrics = dict(route_bundle.get("route_metrics") or {})
         embedding_batch_debug = route_bundle.get("embedding_batch") or {}
 
-        # 即使关闭 LLM rerank，也保留 rerank/fused top_n 作为扩展锚点池；最终返回仍由 effective_top_k 控制。
+        # 即使关闭 LLM rerank，也保留 rerank/fused top_n 作为候选池；effective_top_k 只定义原始 anchor 基线，
+        # retrieval 阶段的候选数量由 candidate preselector 控制，最终 token 裁剪交给 PromptBudgetPlanner。
         fused_limit = max(runtime["rrf_candidate_limit"], runtime["effective_top_k"])
         fusion_result = self.fusion_service.fuse(
             routes,
@@ -128,7 +129,7 @@ class RetrievalPipeline:
             original_question=user_query,
         )
 
-        # 先取原始 rerank top_k 作为 fallback 和 anchor 标记基线；真正返回上下文由预算层统一决定。
+        # 先取原始 rerank top_k 作为 anchor 标记基线；预算层输出有界候选池，最终 prompt 上下文由 V2 planner 决定。
         original_final_context_top15 = rerank_result.final_results[: runtime["effective_top_k"]]
         context_expansion = self.context_expansion_preparer.prepare(
             reranked_chunks=rerank_result.reranked_results,
