@@ -40,7 +40,7 @@ emoji
 environs
 exceptiongroup
 executing
-fastapi
+fastapi==0.136.1
 filelock
 filetype
 flatbuffers
