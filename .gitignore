@@ -1,26 +1,35 @@
 Archive/
 temp/*
+backend/temp/
+
+# 本地工具与环境配置
+.codex/*
+.claude/settings.local.json
+.env.*
+!.env.example
+.conda/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
-.codex/*
 
+# 本地数据库与运行锁
 *.db
+*.db.lock
+*.sqlite
+*.sqlite3
+
+# 前端依赖与构建产物
 frontend/node_modules/
 new_frontend/node_modules/
 new_frontend/dist/
+
+# 本地模型与论文数据
 00-models/
 07-local-arxiv/
-backend/01-loaded-docs/
-backend/01-chunked-docs/
-backend/02-embedded-docs/
-backend/03-vector-store/
-backend/04-search-results/
-backend/05-generation-results/
-backend/06-daily-arxiv-paper/
-03-docling-assets/
-backend/03-docling-assets/
+/03-docling-assets/
+/05-generation-results/
 
 
 # C extensions

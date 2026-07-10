@@ -54,6 +54,16 @@ class ConfigRuntimeUnitTests(unittest.TestCase):
         self.assertEqual(module.get_default_user_id(), "local_user")
         self.assertFalse(module.SQLITE_CONFIG["check_same_thread"])
 
+    def test_generation_provider_keys_do_not_reuse_aliyun_credentials(self) -> None:
+        module = _load_config_module(
+            "tests.unit._config_provider_credentials",
+            {"ALIYUN_API_KEY": "aliyun-key-for-test"},
+        )
+
+        self.assertEqual(module.GENERATION_CONFIG["qwen_api_key"], "aliyun-key-for-test")
+        self.assertEqual(module.GENERATION_CONFIG["openai_api_key"], "")
+        self.assertEqual(module.GENERATION_CONFIG["deepseek_api_key"], "")
+
     def test_runtime_config_accessors_return_copies(self) -> None:
         module = _load_config_module("tests.unit._config_copies", {"ARXIV_SEARCH_MAX_ALLOWED_RESULTS": "12"})
 

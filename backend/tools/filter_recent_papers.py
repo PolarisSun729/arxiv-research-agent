@@ -1,14 +1,19 @@
 import json
 import os
 from datetime import datetime
+from pathlib import Path
 
-def filter_papers_after_date(input_path: str, output_path: str, min_date: str = "2026-04-01"):
+def filter_papers_after_date(
+    input_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str],
+    min_date: str = "2026-04-01",
+):
     """
     从 arXiv 数据集中筛选出指定日期之后且分类包含 cs.AI 的论文
     
     Args:
-        input_path (str): 输入的 JSON 数据集路径
-        output_path (str): 输出的 JSON 文件路径
+        input_path (str | os.PathLike[str]): 输入的 JSON 数据集路径
+        output_path (str | os.PathLike[str]): 输出的 JSON 文件路径
         min_date (str): 最小日期，格式为 YYYY-MM-DD，默认为 2026-04-01
     """
     print(f"Loading dataset from: {input_path}")
@@ -57,7 +62,9 @@ def filter_papers_after_date(input_path: str, output_path: str, min_date: str = 
     print(f"\nFiltered papers saved to: {output_path}")
 
 if __name__ == "__main__":
-    input_file = r"D:\极客时间大模型RAG进阶实战营\rag-project01-framework\07-local-arxiv\arxiv-2026-papers.json"
-    output_file = r"D:\极客时间大模型RAG进阶实战营\rag-project01-framework\07-local-arxiv\arxiv-2026-04-papers.json"
+    # 默认数据目录相对仓库根目录解析，确保脚本在不同开发机上行为一致。
+    data_dir = Path(__file__).resolve().parents[2] / "07-local-arxiv"
+    input_file = data_dir / "arxiv-2026-papers.json"
+    output_file = data_dir / "arxiv-2026-04-papers.json"
     
     filter_papers_after_date(input_file, output_file, min_date="2026-04-01")

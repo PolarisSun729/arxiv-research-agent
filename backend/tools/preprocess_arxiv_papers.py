@@ -2,6 +2,7 @@ import os
 import json
 import logging
 from datetime import datetime
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -14,10 +15,12 @@ from services.storage.vector_store_service import VectorStoreService
 
 PAPER_EMBEDDING_COLLECTION = "arxiv_paper_embeddings"
 
-DATA_FILE_PATH = r"D:\极客时间大模型RAG进阶实战营\rag-project01-framework\07-local-arxiv\arxiv-2026-04-papers.json"
+# 从脚本位置解析仓库根目录，避免迁移后继续依赖开发机绝对路径。
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DATA_FILE_PATH = REPO_ROOT / "07-local-arxiv" / "arxiv-2026-04-papers.json"
 BATCH_SIZE = 10
 
-def load_arxiv_papers(file_path: str) -> list:
+def load_arxiv_papers(file_path: str | os.PathLike[str]) -> list:
     papers = []
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:

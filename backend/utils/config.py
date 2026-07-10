@@ -34,7 +34,8 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw not in {"0", "false", "no", "off", ""}
 
 
-ALIYUN_API_KEY = _env_str("ALIYUN_API_KEY", "<REMOVED_API_KEY>")
+# API 密钥只允许通过环境变量注入，避免任何代码兜底值再次进入 Git 历史。
+ALIYUN_API_KEY = _env_str("ALIYUN_API_KEY", "")
 
 
 CORE_CONFIG: Dict[str, Any] = {
@@ -115,6 +116,7 @@ SQLITE_CONFIG: Dict[str, Any] = {
 }
 
 USER_CONFIG: Dict[str, Any] = {
+    # 公共仓库使用非个人化的本地用户标识，部署时可通过环境变量覆盖。
     "default_user_id": _env_str("DEFAULT_USER_ID", "local_user"),
 }
 
@@ -690,8 +692,9 @@ GENERATION_CONFIG: Dict[str, Any] = {
     # 只保留生成链路的小/大模型配置，不再混用旧别名。
     "small_qwen_model_name": _env_str("QWEN_SMALL_MODEL_NAME", "qwen3.6-flash"),
     "large_qwen_model_name": _env_str("QWEN_LARGE_MODEL_NAME", "qwen3.6-plus"),
-    "openai_api_key": _env_str("OPENAI_API_KEY", ALIYUN_API_KEY),
-    "deepseek_api_key": _env_str("DEEPSEEK_API_KEY", ALIYUN_API_KEY),
+    # 跨厂商调用必须显式提供对应密钥，避免错误路由时把阿里云凭据发送给第三方端点。
+    "openai_api_key": _env_str("OPENAI_API_KEY", ""),
+    "deepseek_api_key": _env_str("DEEPSEEK_API_KEY", ""),
     # rerank 前的 chunk 压缩/摘要使用独立的生成模型配置。
     "qwen_rerank_compress_model_name": _env_str("QWEN_RERANK_COMPRESS_MODEL_NAME", "qwen3.6-flash"),
     "qwen_rerank_compress_enable_thinking": _env_bool("QWEN_RERANK_COMPRESS_ENABLE_THINKING", False),
