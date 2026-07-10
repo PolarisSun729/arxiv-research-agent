@@ -17,6 +17,10 @@ permissions:
 jobs:
   quality-gate:
     runs-on: windows-latest
+    env:
+      # 英文 Windows Runner 默认控制台可能使用 CP1252，显式启用 UTF-8 以安全输出中文诊断信息。
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
 
     steps:
       - name: Checkout
