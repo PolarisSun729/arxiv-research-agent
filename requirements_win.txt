@@ -161,6 +161,7 @@ pypdf
 pypdfium2
 PyPika
 pyproject_hooks
+pytest==7.4.4
 python-dateutil
 python-dotenv
 python-iso639

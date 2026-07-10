@@ -112,7 +112,8 @@ IMPORT_MODULES = [
     "routers.user_router",
     "services.arxiv.arxiv_query_builder",
     "services.arxiv.arxiv_search_service",
-    "services.arxiv.local_arxiv_service",
+    # 本地检索已经收敛到 OAI 正式服务，静态检查不得重新依赖已删除的兼容入口。
+    "services.arxiv.arxiv_oai_service",
     "services.document.chunking_service",
     "services.document.loading_service",
     "services.embedding.embedding_service",
@@ -127,7 +128,8 @@ IMPORT_MODULES = [
     "services.retrieval.query_planner",
     "services.retrieval.rerank_service",
     "services.retrieval.route_retriever",
-    "services.storage.database_service",
+    # SQLite 组合包是当前持久化公共入口，旧 DatabaseService 已按存储重构契约删除。
+    "services.storage.sqlite",
     "services.storage.vector_store_service",
     "tools.arxiv_tools",
     "tools.paper_qa_tools",
