@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 import fitz  # PyMuPDF
 
 from utils.config import DOCLING_CONFIG
+from utils.storage_paths import resolve_backend_artifact_path
 
 logger = logging.getLogger(__name__)
 
@@ -184,11 +185,16 @@ class LoadingService:
                 payload["document_metadata"]["saved_at"] = datetime.now().isoformat()
                 payload["document_metadata"]["source_filename"] = str(filename)
 
-            os.makedirs("01-loaded-docs", exist_ok=True)
-            filepath = os.path.join("01-loaded-docs", f"{doc_name}.json")
+            # 加载后的文档是后端流水线产物，路径固定在 backend 下，避免根目录启动时写错位置。
+            loaded_docs_dir = resolve_backend_artifact_path(
+                "01-loaded-docs",
+                option_name="LOADED_DOCS_DIR",
+            )
+            os.makedirs(loaded_docs_dir, exist_ok=True)
+            filepath = loaded_docs_dir / f"{doc_name}.json"
             with open(filepath, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
-            return filepath
+            return str(filepath)
         except Exception as e:
             logger.error(f"Error saving document: {str(e)}")
             raise

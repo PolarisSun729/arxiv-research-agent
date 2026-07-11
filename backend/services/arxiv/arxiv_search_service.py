@@ -22,6 +22,7 @@ from services.arxiv.arxiv_query_builder import (
     normalize_text_value as _normalize_text_value,
     validate_arxiv_search_request as _validate_arxiv_search_request,
 )
+from utils.storage_paths import resolve_backend_artifact_path
 logger = logging.getLogger(__name__)
 
 class RateLimitError(Exception):
@@ -72,7 +73,11 @@ class ArxivSearchService:
             None
         """
         self.api_base_url = "https://export.arxiv.org/api/query"
-        self.papers_dir = "06-daily-arxiv-paper"
+        # arXiv 下载产物属于后端运行资产，不能因启动目录不同散落到仓库根目录。
+        self.papers_dir = resolve_backend_artifact_path(
+            "06-daily-arxiv-paper",
+            option_name="ARXIV_PAPERS_DIR",
+        )
         os.makedirs(self.papers_dir, exist_ok=True)
         
         self.session = requests.Session()

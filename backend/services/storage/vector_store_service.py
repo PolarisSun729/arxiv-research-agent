@@ -11,6 +11,7 @@ from pymilvus import (
     MilvusClient,
 )
 from utils.config import VectorDBProvider, MILVUS_CONFIG, get_vector_store_runtime_config
+from utils.storage_paths import resolve_backend_artifact_path
 from pypinyin import lazy_pinyin, Style
 
 logger = logging.getLogger(__name__)
@@ -92,8 +93,12 @@ class VectorStoreService:
         初始化向量存储服务。
         """
         self.initialized_dbs = {}
-        # 确保存储目录存在
-        os.makedirs("03-vector-store", exist_ok=True)
+        # 向量库本地产物归属后端目录，避免从仓库根目录启动时重新生成根目录资产。
+        self.vector_store_dir = resolve_backend_artifact_path(
+            "03-vector-store",
+            option_name="VECTOR_STORE_DIR",
+        )
+        os.makedirs(self.vector_store_dir, exist_ok=True)
 
     def _get_client(self) -> MilvusClient:
         return MilvusClient(uri=MILVUS_CONFIG["uri"])

@@ -28,6 +28,7 @@ from services.retrieval.retrieval_index import (
 )
 from services.paper_qa.build_cache import get_paper_qa_build_cache
 from utils.config import EMBEDDING_CONFIG, get_enhanced_retrieval_runtime_config
+from utils.storage_paths import resolve_backend_artifact_path
 
 logger = logging.getLogger(__name__)
 ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
@@ -892,7 +893,12 @@ class EmbeddingService:
 
     def save_embeddings(self, doc_name: str, embeddings: list) -> str:
         """把 embedding 结果保存到磁盘，便于后续入库或调试复用。"""
-        os.makedirs("02-embedded-docs", exist_ok=True)
+        # embedding 文件同时服务入库和调试复查，必须固定到 backend 产物目录。
+        embedded_docs_dir = resolve_backend_artifact_path(
+            "02-embedded-docs",
+            option_name="EMBEDDED_DOCS_DIR",
+        )
+        os.makedirs(embedded_docs_dir, exist_ok=True)
 
         first_embedding = embeddings[0]
         provider = first_embedding["metadata"]["embedding_provider"]
@@ -915,7 +921,7 @@ class EmbeddingService:
             base_name += ".pdf"
 
         filename = f"{base_name.replace('.pdf', '')}_{provider}_{timestamp}.json"
-        filepath = os.path.join("02-embedded-docs", filename)
+        filepath = embedded_docs_dir / filename
 
         config_info = {
             # 顶层信息保留文档来源，便于之后从 embedding 文件追到原 PDF。
@@ -961,7 +967,7 @@ class EmbeddingService:
                 cls=CompactJSONEncoder,
             )
 
-        return filepath
+        return str(filepath)
 
     def create_single_embedding_local_input(self, embedding_input: dict) -> list:
         """使用本地模型处理单条文本或多模态输入。"""
@@ -1213,10 +1219,14 @@ class EmbeddingService:
         """根据已保存的 embedding 文件反查某个集合对应的向量配置。"""
         try:
             doc_name = collection_name.split("_")[0]
-            embedded_docs_dir = "02-embedded-docs"
+            # 读取路径必须和 save_embeddings 保持一致，否则根目录启动后会查错历史位置。
+            embedded_docs_dir = resolve_backend_artifact_path(
+                "02-embedded-docs",
+                option_name="EMBEDDED_DOCS_DIR",
+            )
             for filename in os.listdir(embedded_docs_dir):
                 if filename.endswith(".json"):
-                    with open(os.path.join(embedded_docs_dir, filename), "r", encoding="utf-8") as f:
+                    with open(embedded_docs_dir / filename, "r", encoding="utf-8") as f:
                         data = json.load(f)
                         if data.get("filename") == doc_name:
                             return EmbeddingConfig(

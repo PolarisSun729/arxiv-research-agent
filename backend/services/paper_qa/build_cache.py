@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from utils.config import get_paper_qa_build_cache_config
+from utils.storage_paths import BACKEND_DATA_ROOT, resolve_storage_path
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,14 @@ class PaperQABuildCache:
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         self.config = dict(config or get_paper_qa_build_cache_config())
         self.enabled = bool(self.config.get("enabled", True))
-        self.root_dir = Path(str(self.config.get("root_dir") or "06-database"))
+        # 自定义缓存目录和默认目录共用同一规则，避免昂贵的建库缓存散落到仓库根目录。
+        self.root_dir = Path(
+            resolve_storage_path(
+                self.config.get("root_dir"),
+                default_path=BACKEND_DATA_ROOT,
+                option_name="PAPER_QA_BUILD_CACHE_DIR",
+            )
+        )
         self.llm_cache_name = str(self.config.get("llm_cache_name") or "paper_qa_llm_cache")
         self.embedding_cache_name = str(self.config.get("embedding_cache_name") or "paper_qa_embedding_cache")
         self.llm_size_limit = int(self.config.get("llm_size_limit") or 512 * 1024 * 1024)

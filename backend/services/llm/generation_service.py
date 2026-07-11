@@ -14,6 +14,7 @@ from openai import OpenAI
 import requests
 from utils.model_utils import get_huggingface_model_path
 from utils.config import GENERATION_CONFIG
+from utils.storage_paths import resolve_backend_artifact_path
 # 启用 MPS 失败时自动回退到 CPU，避免 Apple Silicon 环境下推理直接报错。
 # 当前 PyTorch 对 MPS 的支持仍有边界场景，回退是更稳妥的默认行为。
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
@@ -81,8 +82,12 @@ class GenerationService:
             }
         }
         
-        # 确保输出目录存在
-        os.makedirs("05-generation-results", exist_ok=True)
+        # 生成结果是后端运行产物；路径固定到 backend 下，避免工作目录不同导致写入根目录。
+        self.generation_results_dir = resolve_backend_artifact_path(
+            "05-generation-results",
+            option_name="GENERATION_RESULTS_DIR",
+        )
+        os.makedirs(self.generation_results_dir, exist_ok=True)
 
     def _normalize_task_type(self, task_type: Optional[str]) -> str:
         # 任务类型只作为路由提示使用，统一做一次清洗，避免空字符串污染日志和配置查询。
@@ -1474,14 +1479,14 @@ Answer:"""
             # 生成文件名并保存
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             filename = f"generation_{provider}_{model_name or 'auto'}_{timestamp}.json"
-            filepath = os.path.join("05-generation-results", filename)
+            filepath = self.generation_results_dir / filename
             
             with open(filepath, "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
                 
             return {
                 "response": response,
-                "saved_filepath": filepath,
+                "saved_filepath": str(filepath),
                 "qwen_request_debug": qwen_request_debug,
             }
             

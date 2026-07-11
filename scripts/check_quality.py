@@ -59,6 +59,14 @@ def _npm_executable() -> str:
 NPM = _npm_executable()
 
 STAGES: dict[str, Stage] = {
+    "docs": Stage(
+        id="docs",
+        title="维护者文档链接检查",
+        command=_python_command(["scripts/check_docs.py"]),
+        cwd=REPO_ROOT,
+        display_command="python scripts/check_docs.py",
+        description="校验维护者文档中的相对 Markdown 链接和代码路径，且不访问网络。",
+    ),
     "backend-static": Stage(
         id="backend-static",
         title="后端静态检查",
@@ -135,13 +143,14 @@ STAGES: dict[str, Stage] = {
 
 TARGETS: dict[str, list[str]] = {
     # 默认入口先跑本地环境体检，再进入离线质量检查；full doctor 仍保持显式触发，避免默认流程访问真实外部服务。
-    "all": ["doctor-basic", "backend-static", "backend-tests", "backend-startup-smoke", "frontend-tests", "frontend-build"],
+    "all": ["docs", "doctor-basic", "backend-static", "backend-tests", "backend-startup-smoke", "frontend-tests", "frontend-build"],
     "backend": ["backend-static", "backend-tests", "backend-startup-smoke"],
     "frontend": ["frontend-tests", "frontend-build"],
     "compile": ["backend-compile"],
     "static": ["backend-static"],
-    "ci": ["doctor-basic", "backend-static", "backend-tests", "backend-startup-smoke", "frontend-tests", "frontend-build"],
+    "ci": ["docs", "doctor-basic", "backend-static", "backend-tests", "backend-startup-smoke", "frontend-tests", "frontend-build"],
     "doctor": ["doctor-basic"],
+    "docs": ["docs"],
     # smoke 保留为离线轻量入口，用于快速确认语法、后端测试入口和前端最小脚本仍可运行。
     "smoke": ["backend-compile", "backend-startup-smoke", "frontend-error-tests"],
 }
@@ -334,7 +343,7 @@ def _print_summary(results: list[StageResult]) -> None:
 def _parse_args() -> argparse.Namespace:
     choices = sorted(set(TARGETS) | set(STAGES))
     parser = argparse.ArgumentParser(
-        description="统一质量门禁入口：后端编译、后端测试、前端测试和前端构建。",
+        description="统一质量门禁入口：文档、后端编译、后端测试、前端测试和前端构建。",
     )
     parser.add_argument(
         "targets",

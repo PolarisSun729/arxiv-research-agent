@@ -27,6 +27,9 @@ for path in (REPO_ROOT, BACKEND_ROOT):
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
 
+# 必须先把 backend 加入模块搜索路径，Doctor 作为独立脚本运行时才能复用后端路径规则。
+from utils.storage_paths import LEGACY_BACKEND_ARTIFACT_ROOTS, LEGACY_DATABASE_ROOT, StoragePathConfigurationError  # noqa: E402
+
 
 @dataclass(frozen=True)
 class DoctorResult:
@@ -131,14 +134,6 @@ def _mask_state(env_names: list[str], configured_value: str = "") -> tuple[str, 
     if configured_value:
         return "WARN", f"未显式设置 {', '.join(env_names)}，当前配置存在默认值或代码内兜底值。"
     return "WARN", f"未设置 {', '.join(env_names)}。"
-
-
-def _path_from_config(raw_path: str) -> Path:
-    path = Path(raw_path)
-    if path.is_absolute():
-        return path
-    # 后端服务通常从 backend 目录启动；相对路径按 backend 根目录解释更贴近真实运行。
-    return BACKEND_ROOT / path
 
 
 def check_python_version() -> DoctorResult:
@@ -268,6 +263,7 @@ def check_local_directories() -> DoctorResult:
         BACKEND_ROOT / "03-docling-assets",
         BACKEND_ROOT / "04-search-results",
         BACKEND_ROOT / "05-generation-results",
+        BACKEND_ROOT / "06-daily-arxiv-paper",
         BACKEND_ROOT / "06-database",
         REPO_ROOT / "temp",
     ]
@@ -317,8 +313,78 @@ def check_local_directories() -> DoctorResult:
     )
 
 
+def check_legacy_database_directory() -> DoctorResult:
+    """识别已废弃根目录，避免被 Git 忽略的数据库文件长期掩盖路径错误。"""
+    if not LEGACY_DATABASE_ROOT.exists():
+        return _result(
+            "遗留根目录数据库",
+            "PASS",
+            "未发现仓库根目录 06-database。",
+            required=False,
+            affects_default_tests=False,
+            affects_real_runtime=True,
+            mode="basic",
+        )
+    return _result(
+        "遗留根目录数据库",
+        "WARN",
+        f"发现已废弃目录：{LEGACY_DATABASE_ROOT}。运行时不会再使用它，但其中可能保留误写数据。",
+        "确认服务停止后删除该目录；正确位置是 backend/06-database。",
+        required=False,
+        affects_default_tests=False,
+        affects_real_runtime=True,
+        mode="basic",
+    )
+
+
+def check_legacy_backend_artifact_directories() -> DoctorResult:
+    """提示误写到仓库根目录的后端产物目录，帮助维护者清理历史空壳或旧数据。"""
+    legacy_dirs = [
+        (REPO_ROOT / legacy_name, backend_path)
+        for legacy_name, backend_path in sorted(LEGACY_BACKEND_ARTIFACT_ROOTS.items())
+        if (REPO_ROOT / legacy_name).exists()
+    ]
+    if not legacy_dirs:
+        return _result(
+            "遗留根目录后端产物",
+            "PASS",
+            "未发现仓库根目录 01/02/03/05/06-daily 产物目录。",
+            required=False,
+            affects_default_tests=False,
+            affects_real_runtime=True,
+            mode="basic",
+        )
+
+    details = ", ".join(
+        f"{legacy_dir.name} -> {backend_path.relative_to(REPO_ROOT).as_posix()}"
+        for legacy_dir, backend_path in legacy_dirs
+    )
+    return _result(
+        "遗留根目录后端产物",
+        "WARN",
+        f"发现仓库根目录后端产物目录：{details}。运行时已改为写入 backend 下对应目录。",
+        "确认其中没有需要保留的数据后删除根目录残留；正确位置均在 backend 下。",
+        required=False,
+        affects_default_tests=False,
+        affects_real_runtime=True,
+        mode="basic",
+    )
+
+
 def check_backend_config_loads() -> DoctorResult:
-    import utils.config as config
+    try:
+        import utils.config as config
+    except StoragePathConfigurationError as exc:
+        return _result(
+            "后端配置加载",
+            "FAIL",
+            f"持久化路径配置无效：{exc}",
+            "移除指向仓库根目录 06-database 的配置，或改用 backend/06-database 与仓库外绝对路径。",
+            required=True,
+            affects_default_tests=True,
+            affects_real_runtime=True,
+            mode="basic",
+        )
 
     required_attrs = [
         "CORE_CONFIG",
@@ -353,9 +419,22 @@ def check_backend_config_loads() -> DoctorResult:
 
 
 def check_sqlite_temp_access() -> DoctorResult:
-    import utils.config as config
+    try:
+        import utils.config as config
+    except StoragePathConfigurationError as exc:
+        return _result(
+            "SQLite 目录与临时写入",
+            "FAIL",
+            f"SQLite 路径配置无效：{exc}",
+            "修正 SQLITE_DATABASE_PATH 后重试，不能指向仓库根目录 06-database。",
+            required=True,
+            affects_default_tests=False,
+            affects_real_runtime=True,
+            mode="basic",
+        )
 
-    db_path = _path_from_config(str(config.SQLITE_CONFIG["database_path"]))
+    # 配置层已经输出绝对路径，Doctor 与真实运行直接检查同一个文件位置。
+    db_path = Path(str(config.SQLITE_CONFIG["database_path"])).expanduser().resolve(strict=False)
     db_dir = db_path.parent
     if not db_dir.exists():
         return _result(
@@ -804,6 +883,8 @@ BASIC_CHECKS: list[tuple[str, Callable[[], DoctorResult], bool, bool, bool]] = [
     ("Node / npm", check_node_version, True, True, True),
     ("前端依赖", check_frontend_dependencies, True, True, True),
     ("本地数据目录", check_local_directories, True, False, True),
+    ("遗留根目录数据库", check_legacy_database_directory, False, False, True),
+    ("遗留根目录后端产物", check_legacy_backend_artifact_directories, False, False, True),
     ("后端配置加载", check_backend_config_loads, True, True, True),
     ("SQLite 目录与临时写入", check_sqlite_temp_access, True, False, True),
     ("API Key 环境变量", check_environment_variables, False, False, True),

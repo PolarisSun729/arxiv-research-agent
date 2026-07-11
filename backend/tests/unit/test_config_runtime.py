@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from utils.storage_paths import BACKEND_DATA_ROOT, LEGACY_DATABASE_ROOT, StoragePathConfigurationError
+
 
 def _load_config_module(module_name: str, env: dict[str, str] | None = None):
     backend_dir = Path(__file__).resolve().parents[2]
@@ -53,6 +55,45 @@ class ConfigRuntimeUnitTests(unittest.TestCase):
         self.assertEqual(module.CORE_CONFIG["service_load_mode"], "preload")
         self.assertEqual(module.get_default_user_id(), "local_user")
         self.assertFalse(module.SQLITE_CONFIG["check_same_thread"])
+        self.assertEqual(module.SQLITE_CONFIG["database_path"], str(BACKEND_DATA_ROOT / "recommendation.db"))
+        self.assertEqual(module.OAI_SQLITE_CONFIG["database_path"], str(BACKEND_DATA_ROOT / "arxiv_oai.db"))
+        self.assertEqual(module.PAPER_QA_BUILD_CACHE_CONFIG["root_dir"], str(BACKEND_DATA_ROOT))
+
+    def test_relative_storage_overrides_are_resolved_from_backend(self) -> None:
+        module = _load_config_module(
+            "tests.unit._config_storage_path_overrides",
+            {
+                "SQLITE_DATABASE_PATH": "custom-state/recommendation.db",
+                "OAI_SQLITE_DATABASE_PATH": "custom-state/arxiv_oai.db",
+                "PAPER_QA_BUILD_CACHE_DIR": "custom-cache",
+            },
+        )
+
+        self.assertEqual(
+            module.SQLITE_CONFIG["database_path"],
+            str((BACKEND_DATA_ROOT.parent / "custom-state" / "recommendation.db").resolve()),
+        )
+        self.assertEqual(
+            module.OAI_SQLITE_CONFIG["database_path"],
+            str((BACKEND_DATA_ROOT.parent / "custom-state" / "arxiv_oai.db").resolve()),
+        )
+        self.assertEqual(
+            module.PAPER_QA_BUILD_CACHE_CONFIG["root_dir"],
+            str((BACKEND_DATA_ROOT.parent / "custom-cache").resolve()),
+        )
+
+    def test_root_legacy_database_override_is_rejected(self) -> None:
+        overrides = {
+            "SQLITE_DATABASE_PATH": LEGACY_DATABASE_ROOT / "recommendation.db",
+            "OAI_SQLITE_DATABASE_PATH": LEGACY_DATABASE_ROOT / "arxiv_oai.db",
+            "PAPER_QA_BUILD_CACHE_DIR": LEGACY_DATABASE_ROOT,
+        }
+        for option_name, legacy_path in overrides.items():
+            with self.subTest(option_name=option_name), self.assertRaises(StoragePathConfigurationError):
+                _load_config_module(
+                    f"tests.unit._config_legacy_storage_path_{option_name.lower()}",
+                    {option_name: str(legacy_path)},
+                )
 
     def test_generation_provider_keys_do_not_reuse_aliyun_credentials(self) -> None:
         module = _load_config_module(

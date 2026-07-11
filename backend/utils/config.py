@@ -3,6 +3,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict
 
+from utils.storage_paths import BACKEND_DATA_ROOT, resolve_storage_path
+
 
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent.parent
@@ -111,7 +113,12 @@ MILVUS_CONFIG: Dict[str, Any] = {
 }
 
 SQLITE_CONFIG: Dict[str, Any] = {
-    "database_path": _env_str("SQLITE_DATABASE_PATH", "06-database/recommendation.db"),
+    # 持久化路径在配置加载时固定解析，避免启动目录不同导致状态库分裂。
+    "database_path": resolve_storage_path(
+        _env_str("SQLITE_DATABASE_PATH"),
+        default_path=BACKEND_DATA_ROOT / "recommendation.db",
+        option_name="SQLITE_DATABASE_PATH",
+    ),
     "check_same_thread": _env_bool("SQLITE_CHECK_SAME_THREAD", False),
 }
 
@@ -128,7 +135,11 @@ QA_INDEX_JOB_CONFIG: Dict[str, Any] = {
 PAPER_QA_BUILD_CACHE_CONFIG: Dict[str, Any] = {
     # QA 建库里的 LLM 增强和 embedding 都是高成本外部调用；持久缓存用于失败重试和重复重建时复用确定性结果。
     "enabled": _env_bool("PAPER_QA_BUILD_CACHE_ENABLED", True),
-    "root_dir": _env_str("PAPER_QA_BUILD_CACHE_DIR", str(BASE_DIR.parent / "06-database")),
+    "root_dir": resolve_storage_path(
+        _env_str("PAPER_QA_BUILD_CACHE_DIR"),
+        default_path=BACKEND_DATA_ROOT,
+        option_name="PAPER_QA_BUILD_CACHE_DIR",
+    ),
     "llm_cache_name": _env_str("PAPER_QA_LLM_CACHE_NAME", "paper_qa_llm_cache"),
     "embedding_cache_name": _env_str("PAPER_QA_EMBEDDING_CACHE_NAME", "paper_qa_embedding_cache"),
     "llm_size_limit": _env_int("PAPER_QA_LLM_CACHE_SIZE_LIMIT", 512 * 1024 * 1024),
@@ -191,8 +202,12 @@ CONTEXT_LIFECYCLE_CONFIG: Dict[str, Any] = {
 }
 
 OAI_SQLITE_CONFIG: Dict[str, Any] = {
-    # Keep the OAI database under backend/06-database so backend launches and tools share the same store.
-    "database_path": _env_str("OAI_SQLITE_DATABASE_PATH", str(BASE_DIR.parent / "06-database" / "arxiv_oai.db")),
+    # OAI 与推荐状态库共享同一条路径规则，避免工具脚本因 cwd 不同重建另一份索引库。
+    "database_path": resolve_storage_path(
+        _env_str("OAI_SQLITE_DATABASE_PATH"),
+        default_path=BACKEND_DATA_ROOT / "arxiv_oai.db",
+        option_name="OAI_SQLITE_DATABASE_PATH",
+    ),
     "check_same_thread": _env_bool("OAI_SQLITE_CHECK_SAME_THREAD", False),
 }
 

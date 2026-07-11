@@ -18,7 +18,8 @@ from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parent
-REPO_ROOT = BASE_DIR.parent.parent
+BACKEND_ROOT = BASE_DIR.parent
+REPO_ROOT = BACKEND_ROOT.parent
 
 
 CORE_CONFIG = {
@@ -86,7 +87,8 @@ MILVUS_CONFIG = {
 
 
 SQLITE_CONFIG = {
-    "database_path": "06-database/recommendation.db",
+    # 示例与运行时一致：数据库位置不能由启动目录决定。
+    "database_path": str(BACKEND_ROOT / "06-database" / "recommendation.db"),
     "check_same_thread": False,
 }
 
@@ -97,7 +99,7 @@ USER_CONFIG = {
 
 
 OAI_SQLITE_CONFIG = {
-    "database_path": str(BASE_DIR.parent / "06-database" / "arxiv_oai.db"),
+    "database_path": str(BACKEND_ROOT / "06-database" / "arxiv_oai.db"),
     "check_same_thread": False,
 }
 

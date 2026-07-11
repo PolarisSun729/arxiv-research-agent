@@ -10,9 +10,6 @@ backend/temp/
 /backend/*_FIX.md
 /backend/*_INTEGRATION.md
 /backend/agent_dialogue_flow_notes.md
-/backend/docs/*-plan.md
-/docs/*_refactor_plan.md
-/docs/plan_executor_flow.md
 
 # 本地工具与环境配置
 .codex/*

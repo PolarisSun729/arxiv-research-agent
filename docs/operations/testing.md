@@ -3,7 +3,8 @@
 ## 1. Environment
 
 - Python environment: `conda activate new_rag`
-- Working directory for all commands below: `cd backend`
+- Repository-level quality commands must run from the repository root.
+- Backend-only test commands must run from `backend/`.
 - Test framework: `unittest`
 
 Most automated tests in this repository are designed to run offline with fake services, stubs, or temporary SQLite files.
@@ -65,7 +66,7 @@ python scripts/check_quality.py
 
 The default gate runs basic doctor, backend static checks, backend automated tests, backend startup smoke tests, frontend tests, and frontend build checks, then prints a final summary. It is the preferred command before submitting code because it keeps the offline-safe backend and frontend checks in one place.
 
-CI uses the same staged gate through `python scripts/check_quality.py ci`. Codex changes should report the exact checks that were run, their pass/fail status, and any environment-related blockers; see `docs/codex_acceptance.md` from the repository root.
+CI uses the same staged gate through `python scripts/check_quality.py ci`. Codex changes should report the exact checks that were run, their pass/fail status, and any environment-related blockers; see [Maintenance and Quality](maintenance-quality.md).
 
 Backend static checks are not ordinary unit tests. They run `compileall`, import smoke checks for key app/router/service/agent/tool/config modules, and optional low-noise `ruff` rules before the heavier test suite starts.
 

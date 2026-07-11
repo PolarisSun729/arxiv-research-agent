@@ -28,6 +28,7 @@ from services.arxiv.local_oai_search_contract import (
     LocalArxivSearchIndexUnavailable as SharedLocalArxivSearchIndexUnavailable,
 )
 from utils.config import OAI_SQLITE_CONFIG, get_arxiv_oai_runtime_config
+from utils.storage_paths import BACKEND_DATA_ROOT, resolve_storage_path
 
 if TYPE_CHECKING:
     # 这些重依赖只服务类型提示；运行时保持懒导入，避免只读 SQLite 统计时也要求安装向量库客户端。
@@ -175,8 +176,13 @@ class ArxivOaiDatabaseService:
         返回:
             None
         """
-        # 优先复用运行时配置，避免数据库路径和线程策略在调用方各自散落。
-        self.db_path = db_path or OAI_SQLITE_CONFIG["database_path"]
+        # 显式传参也统一解析，保证服务、工具和测试不会因 cwd 不同产生第二份 OAI 数据库。
+        configured_path = db_path or OAI_SQLITE_CONFIG["database_path"]
+        self.db_path = resolve_storage_path(
+            configured_path,
+            default_path=BACKEND_DATA_ROOT / "arxiv_oai.db",
+            option_name="db_path" if db_path else "OAI_SQLITE_DATABASE_PATH",
+        )
         self.check_same_thread = (
             OAI_SQLITE_CONFIG["check_same_thread"] if check_same_thread is None else bool(check_same_thread)
         )
