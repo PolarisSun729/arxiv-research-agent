@@ -12,6 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 from openai import OpenAI
 import requests
+from services.intent.intent_service import EXPERIMENT_INTENTS, MAIN_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
 from utils.model_utils import get_huggingface_model_path
 from utils.config import GENERATION_CONFIG
 from utils.storage_paths import resolve_backend_artifact_path
@@ -575,7 +576,7 @@ Answer:"""
 
         prompt = (
             "You are a query planner for retrieval over a single academic paper.\n"
-            "Classify the user's question, infer the user's intent, and produce retrieval queries grounded in the paper context.\n"
+            "Use the provided intent profile and produce retrieval queries grounded in the paper context.\n"
             "Rules:\n"
             "1. Return JSON only.\n"
             "2. Do not invent paper-specific names, datasets, modules, or methods.\n"
@@ -583,9 +584,9 @@ Answer:"""
             "4. Keep each query short and retrieval-friendly.\n"
             "5. Generate 3 to 5 queries with different retrieval angles, not paraphrase duplicates.\n"
             "6. Prefer English retrieval queries unless the paper context is clearly Chinese.\n"
-            "7. Use one of these question types only: method_flow, experiment_setup, results_analysis, contribution, limitation, dataset, metric, figure_table, summary, other.\n"
+            "7. Do not classify or return another intent field.\n"
             "8. The JSON schema must be:\n"
-            "   {\"question_type\": \"...\", \"intent_summary\": \"...\", \"paper_terms\": [\"...\"], \"preferred_sections\": [\"...\"], \"rewrite_queries\": [{\"query\": \"...\", \"focus\": \"...\", \"channels\": [\"vector\", \"keyword\"]}]}\n"
+            "   {\"paper_terms\": [\"...\"], \"preferred_sections\": [\"...\"], \"rewrite_queries\": [{\"query\": \"...\", \"focus\": \"...\", \"channels\": [\"vector\", \"keyword\"]}]}\n"
             f"9. Return at most {max_queries} rewrite queries.\n\n"
             f"10. Current intent profile: main_intent={main_intent}, intent_summary={intent_summary or 'N/A'}, sub_intents={', '.join(sub_intents) or 'N/A'}, preferred_sections={', '.join(preferred_sections) or 'N/A'}.\n\n"
             f"User question: {question}\n\n"
@@ -601,7 +602,13 @@ Answer:"""
             task_type="query_planning",
         )
         data = json.loads(self._extract_json_block(response))
-        return self._normalize_query_plan(data, question, max_queries=max_queries, paper_context=paper_context)
+        return self._normalize_query_plan(
+            data,
+            question,
+            max_queries=max_queries,
+            paper_context=paper_context,
+            main_intent=main_intent,
+        )
 
     def generate_hyde_document(
         self,
@@ -641,46 +648,28 @@ Answer:"""
             return f"{base_query}{intent_clause}Original question: {normalized_question}"
         return f"{base_query}{intent_clause}".rstrip()
 
-    def _legacy_intent_bucket(self, intent: str) -> str:
-        intent = str(intent or "other").strip().lower() or "other"
-        aliases = {
-            "contribution": "summary",
-            "paper_overview": "summary",
-            "method_flow": "method",
-            "implementation_detail": "method",
-            "definition": "method",
-            "experiment_setup": "experiment",
-            "result_analysis": "experiment",
-            "results_analysis": "experiment",
-            "comparison": "comparison",
-            "dataset": "dataset",
-            "limitation": "limitation",
-            "figure_table": "figure_table",
-            "other": "other",
-            "summary": "summary",
-            "method": "method",
-            "experiment": "experiment",
-        }
-        return aliases.get(intent, intent)
-
     def _build_intent_rerank_clause(self, intent_profile: Optional[Dict[str, Any]]) -> str:
         if not intent_profile:
             return ""
 
-        main_intent = self._legacy_intent_bucket(intent_profile.get("main_intent", "other"))
+        main_intent = str(intent_profile.get("main_intent", "other") or "other").strip()
         preferred_sections = [str(item).strip() for item in (intent_profile.get("preferred_sections", []) or []) if str(item).strip()]
         sub_intents = [str(item).strip() for item in (intent_profile.get("sub_intents", []) or []) if str(item).strip()]
 
-        intent_clauses = {
-            "summary": "Prioritize abstract, introduction, and conclusion passages that state the paper's main contribution or findings. ",
-            "method": "Prioritize method, architecture, training, inference, and implementation details. ",
-            "experiment": "Prioritize experiment, evaluation, results, metric, baseline, and ablation evidence. ",
-            "comparison": "Prioritize direct baseline comparisons and ablation evidence. ",
-            "dataset": "Prioritize dataset, corpus, benchmark, split, and data description passages. ",
-            "limitation": "Prioritize limitations, failure cases, discussion, and future work. ",
-            "figure_table": "Prioritize figure captions, table captions, appendix references, and visual explanations. ",
-        }
-        parts = [intent_clauses.get(main_intent, "")]
+        if main_intent in OVERVIEW_INTENTS:
+            intent_clause = "Prioritize abstract, introduction, and conclusion passages that state the paper's main contribution or findings. "
+        elif main_intent in METHOD_INTENTS:
+            intent_clause = "Prioritize method, architecture, training, inference, and implementation details. "
+        elif main_intent in EXPERIMENT_INTENTS:
+            intent_clause = "Prioritize experiment, evaluation, results, metric, baseline, and ablation evidence. "
+        else:
+            intent_clause = {
+                "comparison": "Prioritize direct baseline comparisons and ablation evidence. ",
+                "dataset": "Prioritize dataset, corpus, benchmark, split, and data description passages. ",
+                "limitation": "Prioritize limitations, failure cases, discussion, and future work. ",
+                "figure_table": "Prioritize figure captions, table captions, appendix references, and visual explanations. ",
+            }.get(main_intent, "")
+        parts = [intent_clause]
         if "paper_overview" in sub_intents:
             parts.append("Prefer passages that summarize the paper at a high level. ")
         if "evidence_seeking" in sub_intents:
@@ -712,8 +701,12 @@ Answer:"""
         question: str,
         max_queries: int = 5,
         paper_context: Optional[Dict[str, Any]] = None,
+        main_intent: str = "other",
     ) -> Dict[str, Any]:
         paper_context = paper_context or {}
+        canonical_intent = str(main_intent or "other").strip() or "other"
+        if canonical_intent not in MAIN_INTENTS:
+            canonical_intent = "other"
         paper_terms = [str(item).strip() for item in (data.get("paper_terms", []) or []) if str(item).strip()]
         preferred_sections = [str(item).strip() for item in (data.get("preferred_sections", []) or []) if str(item).strip()]
         paper_terms = list(dict.fromkeys(paper_terms))
@@ -747,19 +740,6 @@ Answer:"""
                             "channels": ["vector", "keyword"],
                         }
                     )
-        else:
-            legacy_queries = data.get("queries", [])
-            if isinstance(legacy_queries, list):
-                for item in legacy_queries:
-                    if isinstance(item, str) and item.strip():
-                        rewrite_queries.append(
-                            {
-                                "query": item.strip(),
-                                "focus": "",
-                                "channels": ["vector", "keyword"],
-                            }
-                        )
-
         if len(rewrite_queries) > max_queries:
             rewrite_queries = rewrite_queries[:max_queries]
 
@@ -785,7 +765,6 @@ Answer:"""
                 }
             ]
         elif len(rewrite_queries) < 3:
-            question_type = self._legacy_intent_bucket(data.get("question_type", "other"))
             fallback_terms = paper_terms[:4]
             if not fallback_terms:
                 fallback_terms = self._extract_fallback_terms(
@@ -804,17 +783,18 @@ Answer:"""
                 return {"query": query, "focus": focus_label, "channels": ["vector", "keyword"]}
 
             fillers: List[Dict[str, Any]] = []
-            if question_type == "method_flow":
+            # Query planner 只消费入口已经确认的正式 intent，避免再次分类产生第二套 schema。
+            if canonical_intent in {"method_flow", "implementation_detail", "definition"}:
                 fillers = [
                     build_extra_query("method framework algorithm", "method"),
                     build_extra_query("training inference architecture", "implementation"),
                 ]
-            elif question_type == "experiment_setup":
+            elif canonical_intent == "experiment_setup":
                 fillers = [
                     build_extra_query("experiment dataset baseline", "setup"),
                     build_extra_query("evaluation metric implementation", "evaluation"),
                 ]
-            elif question_type == "results_analysis":
+            elif canonical_intent == "result_analysis":
                 fillers = [
                     build_extra_query("results performance comparison", "results"),
                     build_extra_query("ablation analysis effect", "analysis"),
@@ -832,8 +812,6 @@ Answer:"""
                     rewrite_queries.append(item)
 
         return {
-            "question_type": self._legacy_intent_bucket(data.get("question_type", "other")),
-            "intent_summary": str(data.get("intent_summary", "")).strip(),
             "paper_terms": paper_terms,
             "preferred_sections": preferred_sections,
             "rewrite_queries": rewrite_queries,

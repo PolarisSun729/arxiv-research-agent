@@ -293,8 +293,6 @@ class RetrievalTraceBuilder:
             "tokens": query_profile.tokens,
             "keywords": query_profile.keywords,
             "intent_tags": query_profile.intent_tags,
-            "question_type": query_profile.question_type,
-            "intent_summary": query_profile.intent_summary,
             "paper_terms": query_profile.paper_terms,
             "ambiguity_score": query_profile.ambiguity_score,
             "semantic_query": query_profile.semantic_query,

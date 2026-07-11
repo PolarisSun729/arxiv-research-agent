@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover
     CrossEncoder = None  # type: ignore
 
 from services.retrieval.contracts import QueryProfile
+from services.intent.intent_service import EXPERIMENT_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
 from services.retrieval.table_evidence_formatter import render_table_evidence_rerank_text
 from utils.config import get_enhanced_retrieval_runtime_config
 from utils.model_utils import get_huggingface_model_path
@@ -36,14 +37,12 @@ class RerankService:
         generation_service: Any,
         config_owner: Any,
         query_normalizer: Any,
-        intent_bucket: Any,
         query_profile_debugger: Any,
         trace_builder: Any,
     ) -> None:
         self.generation_service = generation_service
         self.config_owner = config_owner
         self.query_normalizer = query_normalizer
-        self.intent_bucket = intent_bucket
         self.query_profile_debugger = query_profile_debugger
         self.trace_builder = trace_builder
         self._llm_reranker = None
@@ -498,17 +497,20 @@ class RerankService:
         )
         intent_profile = query_profile.intent_profile
         if intent_profile is not None:
-            main_intent = self.intent_bucket(intent_profile.main_intent)
-            clauses = {
-                "summary": "Prioritize abstract, introduction, and conclusion passages that state the paper's main contribution or findings. ",
-                "method": "Prioritize method, architecture, training, inference, and implementation details. ",
-                "experiment": "Prioritize experiment, evaluation, results, metric, baseline, and ablation evidence. ",
-                "comparison": "Prioritize direct baseline comparisons and ablation evidence. ",
-                "dataset": "Prioritize dataset, corpus, benchmark, split, and data description passages. ",
-                "limitation": "Prioritize limitations, failure cases, discussion, and future work. ",
-                "figure_table": "Prioritize figure captions, table captions, appendix references, and visual explanations. ",
-            }
-            base_query += clauses.get(main_intent, "")
+            main_intent = intent_profile.main_intent
+            if main_intent in OVERVIEW_INTENTS:
+                base_query += "Prioritize abstract, introduction, and conclusion passages that state the paper's main contribution or findings. "
+            elif main_intent in METHOD_INTENTS:
+                base_query += "Prioritize method, architecture, training, inference, and implementation details. "
+            elif main_intent in EXPERIMENT_INTENTS:
+                base_query += "Prioritize experiment, evaluation, results, metric, baseline, and ablation evidence. "
+            else:
+                base_query += {
+                    "comparison": "Prioritize direct baseline comparisons and ablation evidence. ",
+                    "dataset": "Prioritize dataset, corpus, benchmark, split, and data description passages. ",
+                    "limitation": "Prioritize limitations, failure cases, discussion, and future work. ",
+                    "figure_table": "Prioritize figure captions, table captions, appendix references, and visual explanations. ",
+                }.get(main_intent, "")
             if intent_profile.preferred_sections:
                 base_query += f"Favor sections such as: {', '.join(intent_profile.preferred_sections[:4])}. "
         return f"{base_query}Original question: {normalized_question}" if normalized_question else base_query.rstrip()

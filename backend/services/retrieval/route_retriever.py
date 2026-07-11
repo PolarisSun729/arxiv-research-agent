@@ -4,8 +4,9 @@ import logging
 import math
 import re
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
+from services.intent.intent_service import EXPERIMENT_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
 from services.retrieval.collection_profile import CollectionRetrievalProfile
 from services.retrieval.contracts import QueryProfile, RetrievalOptions
 from services.retrieval.execution import QueryEmbeddingBatcher, RouteExecutionSupport
@@ -581,34 +582,36 @@ class RouteRetriever:
     LOW_IDF_THRESHOLD = 0.6
     ASSET_NOISE_FIELDS = {"asset_caption", "asset_aux"}
 
+    @classmethod
     def detect_keyword_noise_flags(
-        self,
+        cls,
         *,
         matched_terms: List[Dict[str, Any]],
         matched_fields: List[str],
         query_profile: QueryProfile,
         chunk: Dict[str, Any],
+        is_informative_token: Callable[[str], bool],
     ) -> List[str]:
-        """轻量噪声识别：标记低信息量命中、图表 OCR 误召回、与意图不符的字段命中。"""
+        """轻量识别关键词噪声，由调用方注入与自身分词规则一致的 token 检查器。"""
         flags: List[str] = []
         if not matched_terms:
             flags.append("no_informative_terms")
             return flags
 
-        informative_terms = [term for term in matched_terms if float(term.get("idf", 0.0)) >= self.LOW_IDF_THRESHOLD]
+        informative_terms = [term for term in matched_terms if float(term.get("idf", 0.0)) >= cls.LOW_IDF_THRESHOLD]
         if not informative_terms:
             # 全部命中词都是 collection 内泛词（低 IDF），BM25 高分多半是噪声堆出来的。
             flags.append("only_low_idf_terms")
 
-        non_garbled = [term for term in matched_terms if self._is_informative_token(term.get("token", ""))]
+        non_garbled = [term for term in matched_terms if is_informative_token(str(term.get("token", "") or ""))]
         if len(non_garbled) < len(matched_terms):
             flags.append("garbled_tokens")
 
-        is_figure_query = query_profile.question_type == "figure_table" or "figure_table" in (query_profile.intent_tags or [])
+        is_figure_query = cls.query_main_intent(query_profile) == "figure_table"
         asset_only_terms = [
             term
             for term in matched_terms
-            if term.get("fields") and all(field in self.ASSET_NOISE_FIELDS for field in term.get("fields", []))
+            if term.get("fields") and all(field in cls.ASSET_NOISE_FIELDS for field in term.get("fields", []))
         ]
         if asset_only_terms and not is_figure_query:
             # 非图表问题里命中词只来自图表 caption/OCR，通常是表格残片误召回。
@@ -617,19 +620,20 @@ class RouteRetriever:
         chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
         if chunk_type in {"figure", "table"} and not is_figure_query and informative_terms:
             top_term = informative_terms[0]
-            if top_term.get("fields") and all(field in self.ASSET_NOISE_FIELDS for field in top_term.get("fields", [])):
+            if top_term.get("fields") and all(field in cls.ASSET_NOISE_FIELDS for field in top_term.get("fields", [])):
                 flags.append("intent_field_mismatch")
 
-        section_path = self._normalize_field_text(str(chunk.get("section_path", "") or ""))
-        section_title = self._normalize_field_text(str(chunk.get("section_title", "") or ""))
+        section_path = cls._normalize_field_text(str(chunk.get("section_path", "") or ""))
+        section_title = cls._normalize_field_text(str(chunk.get("section_title", "") or ""))
         only_section_hit = matched_fields and all(field in {"section_title", "section_path"} for field in matched_fields)
         if only_section_hit and max(len(section_path), len(section_title)) <= 3:
             flags.append("short_section_header_only")
 
         return flags
 
+    @classmethod
     def adjust_keyword_route_confidence(
-        self,
+        cls,
         base_confidence: float,
         *,
         matched_terms: List[Dict[str, Any]],
@@ -638,22 +642,22 @@ class RouteRetriever:
     ) -> float:
         """结合实际 BM25 命中质量调节 keyword route confidence，而不是只看 query profile。
 
-        - overview/summary 问题降低 BM25 影响，避免泛词 chunk 压过向量召回；
-        - method/experiment/dataset/comparison/limitation 问题维持或略增，让精确术语补充向量；
+        - contribution/paper_overview 问题降低 BM25 影响，避免泛词 chunk 压过向量召回；
+        - 方法、实验、数据集、对比和局限类正式 intent 维持或略增，让精确术语补充向量；
         - 命中质量差（只命中低 IDF/噪声字段）时显著降权。
         """
-        main_intent = self.query_intent_bucket(query_profile)
+        main_intent = cls.query_main_intent(query_profile)
         factor = 1.0
-        if main_intent in {"summary", "other"}:
+        if main_intent in {*OVERVIEW_INTENTS, "other"}:
             factor *= 0.82
-        elif main_intent in {"method", "experiment", "dataset", "comparison", "limitation"}:
+        elif main_intent in {*METHOD_INTENTS, *EXPERIMENT_INTENTS, "dataset", "comparison", "limitation"}:
             factor *= 1.08
         elif main_intent == "figure_table":
             factor *= 1.0
 
         # 命中质量：以最高 IDF 命中词为代表，越是只命中泛词越要降权。
         max_idf = max((float(term.get("idf", 0.0) or 0.0) for term in matched_terms), default=0.0)
-        if max_idf < self.LOW_IDF_THRESHOLD:
+        if max_idf < cls.LOW_IDF_THRESHOLD:
             factor *= 0.55
         elif max_idf < 1.2:
             factor *= 0.85
@@ -672,15 +676,10 @@ class RouteRetriever:
         floor = float(ENHANCED_RETRIEVAL_CONFIG.get("route_default_floor", 0.2))
         return max(floor * 0.5, min(1.0, float(base_confidence) * factor))
 
-    def query_intent_bucket(self, query_profile: QueryProfile) -> str:
-        bucketizer = getattr(self.query_tools, "legacy_intent_bucket", None)
-        raw_intent = ""
-        if query_profile.intent_profile is not None:
-            raw_intent = str(getattr(query_profile.intent_profile, "main_intent", "") or "")
-        raw_intent = raw_intent or str(query_profile.question_type or "other")
-        if callable(bucketizer):
-            return bucketizer(raw_intent)
-        return str(raw_intent or "other").strip().lower()
+    @staticmethod
+    def query_main_intent(query_profile: QueryProfile) -> str:
+        intent_profile = query_profile.intent_profile
+        return str(getattr(intent_profile, "main_intent", "other") or "other").strip().lower()
 
     @staticmethod
     def _normalize_field_text(text: str) -> str:
@@ -845,11 +844,8 @@ class RouteRetriever:
     def keyword_field_weights_for_query(self, query_profile: QueryProfile) -> Dict[str, float]:
         """按问题类型动态调节字段权重，普通问题不让图表 OCR/caption 与正文等权竞争。"""
         weights = dict(KEYWORD_FIELD_WEIGHTS)
-        main_intent = "other"
-        if query_profile.intent_profile is not None:
-            main_intent = str(getattr(query_profile.intent_profile, "main_intent", "") or "other")
-        main_intent = str(query_profile.question_type or main_intent or "other").strip().lower()
-        if main_intent == "figure_table" or "figure_table" in (query_profile.intent_tags or []):
+        main_intent = self.query_main_intent(query_profile)
+        if main_intent == "figure_table":
             weights["asset_caption"] = 1.15
             weights["asset_aux"] = 0.72
         else:
@@ -867,7 +863,7 @@ class RouteRetriever:
         weights = dict(base_weights)
         chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
         is_asset_chunk = chunk_type in {"figure", "table"}
-        is_figure_query = query_profile.question_type == "figure_table" or "figure_table" in (query_profile.intent_tags or [])
+        is_figure_query = self.query_main_intent(query_profile) == "figure_table"
         if is_asset_chunk and not is_figure_query:
             weights["body"] = min(weights.get("body", 1.0), 0.38)
             weights["section_title"] = min(weights.get("section_title", 1.0), 0.35)

@@ -115,7 +115,6 @@ class EnhancedRetrievalService:
             generation_service=self.generation_service,
             config_owner=self,
             query_normalizer=self.retrieval_rules.normalize_query_text,
-            intent_bucket=self.retrieval_rules.legacy_intent_bucket,
             query_profile_debugger=self.trace_builder.debug_query_profile,
             trace_builder=self.trace_builder,
         )
@@ -124,7 +123,6 @@ class EnhancedRetrievalService:
             generation_service=self.generation_service,
             intent_service=self.intent_service,
             rerank_service=self.rerank_service,
-            route_weights=self.route_weights,
             enhanced_config=ENHANCED_RETRIEVAL_CONFIG,
             retrieval_rules=self.retrieval_rules,
         )

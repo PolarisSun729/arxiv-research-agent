@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
+from services.intent.intent_service import EXPERIMENT_INTENTS, MAIN_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
 from utils.config import get_enhanced_retrieval_runtime_config
 
 ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
@@ -119,225 +120,6 @@ EN_QUERY_EXPANSION = {
     "limitations": ["limitation", "weakness", "future", "work"],
     "contribution": ["contributions", "novelty", "innovation"],
     "contributions": ["contribution", "novelty", "innovation"],
-}
-
-INTENT_RULES = {
-    "summary": {
-        "keywords": [
-            "summary",
-            "summarize",
-            "summarise",
-            "overview",
-            "contribution",
-            "contributions",
-            "finding",
-            "findings",
-            "核心",
-            "总结",
-            "贡献",
-            "概述",
-            "要点",
-        ],
-        "preferred_sections": ["abstract", "introduction", "conclusion"],
-    },
-    "method": {
-        "keywords": [
-            "method",
-            "methods",
-            "approach",
-            "framework",
-            "architecture",
-            "model",
-            "training",
-            "implementation",
-            "方法",
-            "模型",
-            "框架",
-            "架构",
-            "训练",
-            "实现",
-        ],
-        "preferred_sections": ["method", "approach", "model", "architecture"],
-    },
-    "experiment": {
-        "keywords": [
-            "experiment",
-            "experiments",
-            "evaluation",
-            "result",
-            "results",
-            "benchmark",
-            "benchmarks",
-            "metric",
-            "metrics",
-            "实验",
-            "结果",
-            "评估",
-            "基准",
-        ],
-        "preferred_sections": ["experiment", "results", "evaluation", "ablation"],
-    },
-    "comparison": {
-        "keywords": [
-            "baseline",
-            "baselines",
-            "compare",
-            "comparison",
-            "ablation",
-            "compared",
-            "对比",
-            "比较",
-            "基线",
-            "消融",
-        ],
-        "preferred_sections": ["experiment", "results", "ablation"],
-    },
-    "limitation": {
-        "keywords": [
-            "limitation",
-            "limitations",
-            "weakness",
-            "future work",
-            "failure",
-            "局限",
-            "限制",
-            "不足",
-            "未来工作",
-        ],
-        "preferred_sections": ["conclusion", "discussion", "limitations", "appendix"],
-    },
-    "definition": {
-        "keywords": [
-            "definition",
-            "define",
-            "what is",
-            "problem setup",
-            "formulation",
-            "定义",
-            "概念",
-            "任务定义",
-            "问题设定",
-        ],
-        "preferred_sections": ["introduction", "background", "method"],
-    },
-    "dataset": {
-        "keywords": [
-            "dataset",
-            "datasets",
-            "corpus",
-            "data",
-            "training set",
-            "测试集",
-            "数据集",
-            "语料",
-        ],
-        "preferred_sections": ["experiment", "dataset", "data"],
-    },
-}
-
-QUESTION_TYPE_RULES = {
-    "method_flow": {
-        "keywords": [
-            "method",
-            "methods",
-            "approach",
-            "framework",
-            "workflow",
-            "pipeline",
-            "algorithm",
-            "model",
-            "architecture",
-            "training",
-            "inference",
-            "流程",
-            "方法",
-            "框架",
-            "模型",
-            "算法",
-        ],
-        "preferred_sections": ["method", "approach", "model", "architecture", "introduction"],
-    },
-    "experiment_setup": {
-        "keywords": [
-            "experiment",
-            "experiments",
-            "setup",
-            "evaluation",
-            "dataset",
-            "benchmark",
-            "baseline",
-            "metric",
-            "implementation",
-            "实验",
-            "设置",
-            "数据集",
-            "基准",
-            "评估",
-        ],
-        "preferred_sections": ["experiment", "evaluation", "dataset", "implementation"],
-    },
-    "results_analysis": {
-        "keywords": [
-            "result",
-            "results",
-            "performance",
-            "ablation",
-            "comparison",
-            "baseline",
-            "finding",
-            "结果",
-            "性能",
-            "消融",
-            "对比",
-        ],
-        "preferred_sections": ["results", "experiment", "evaluation", "ablation"],
-    },
-    "contribution": {
-        "keywords": [
-            "contribution",
-            "novelty",
-            "main idea",
-            "innovation",
-            "key idea",
-            "贡献",
-            "创新",
-            "核心思想",
-        ],
-        "preferred_sections": ["abstract", "introduction", "conclusion"],
-    },
-    "limitation": {
-        "keywords": [
-            "limitation",
-            "limitations",
-            "weakness",
-            "future work",
-            "failure",
-            "局限",
-            "不足",
-            "未来工作",
-        ],
-        "preferred_sections": ["discussion", "conclusion", "limitations", "appendix"],
-    },
-    "dataset": {
-        "keywords": ["dataset", "datasets", "corpus", "benchmark", "data", "数据集", "语料", "基准"],
-        "preferred_sections": ["dataset", "experiment", "data"],
-    },
-    "metric": {
-        "keywords": ["metric", "metrics", "score", "formula", "objective", "指标", "公式", "评价"],
-        "preferred_sections": ["experiment", "method", "evaluation"],
-    },
-    "figure_table": {
-        "keywords": ["figure", "fig.", "table", "chart", "diagram", "图", "表", "图表"],
-        "preferred_sections": ["figure", "table", "results", "appendix"],
-    },
-    "summary": {
-        "keywords": ["summary", "summarize", "overview", "main", "abstract", "总结", "概述", "主要"],
-        "preferred_sections": ["abstract", "introduction", "conclusion"],
-    },
-    "other": {
-        "keywords": [],
-        "preferred_sections": ["abstract", "introduction", "method", "results"],
-    },
 }
 
 SECTION_TAG_RULES = {
@@ -511,14 +293,6 @@ class RetrievalRules:
             return "en"
         return "unknown"
 
-    def detect_intent_tags(self, normalized_query: str, tokens: List[str]) -> List[str]:
-        query_text = " ".join(tokens + [normalized_query])
-        detected: List[str] = []
-        for intent, spec in INTENT_RULES.items():
-            if any(keyword.lower() in query_text for keyword in spec["keywords"]):
-                detected.append(intent)
-        return detected
-
     def estimate_ambiguity(self, keywords: List[str], intent_tags: List[str], language: str, user_query: str) -> float:
         content_weight = min(1.0, len(keywords) / self.config["extract_query_keywords_limit"])
         intent_weight = min(1.0, len(intent_tags) / 3.0)
@@ -533,81 +307,17 @@ class RetrievalRules:
         )
         return max(self.config["specificity_floor"], min(1.0, 1.0 - specificity))
 
-    @staticmethod
-    def legacy_intent_bucket(intent: str) -> str:
-        aliases = {
-            "contribution": "summary",
-            "paper_overview": "summary",
-            "method_flow": "method",
-            "implementation_detail": "method",
-            "definition": "method",
-            "experiment_setup": "experiment",
-            "result_analysis": "experiment",
-            "results_analysis": "experiment",
-            "comparison": "comparison",
-            "dataset": "dataset",
-            "limitation": "limitation",
-            "figure_table": "figure_table",
-            "other": "other",
-            "summary": "summary",
-            "method": "method",
-            "experiment": "experiment",
-        }
-        normalized = str(intent or "other").strip().lower() or "other"
-        return aliases.get(normalized, normalized)
+    def preferred_sections_for_main_intent(self, main_intent: str) -> List[str]:
+        spec = MAIN_INTENTS.get(main_intent, MAIN_INTENTS["other"])
+        return list(spec["preferred_sections"])
 
-    def preferred_section_tags(self, intent_tags: List[str]) -> List[str]:
-        preferred: List[str] = []
-        for intent in intent_tags:
-            preferred.extend(INTENT_RULES.get(intent, {}).get("preferred_sections", []))
-        return self.dedupe_terms(preferred).split()
+    def main_intent_terms(self, main_intent: str) -> List[str]:
+        spec = MAIN_INTENTS.get(main_intent, MAIN_INTENTS["other"])
+        return self.dedupe_list([str(item).strip() for item in spec["keywords"] if str(item).strip()])
 
-    def preferred_sections_for_question_type(self, question_type: str, intent_tags: List[str]) -> List[str]:
-        alias = {
-            "method": "method_flow",
-            "experiment": "experiment_setup",
-            "result_analysis": "results_analysis",
-            "comparison": "results_analysis",
-            "definition": "summary",
-            "implementation_detail": "method_flow",
-            "paper_overview": "summary",
-        }
-        preferred = list(
-            QUESTION_TYPE_RULES.get(alias.get(question_type, question_type), QUESTION_TYPE_RULES["other"]).get(
-                "preferred_sections",
-                [],
-            )
-        )
-        preferred.extend(self.preferred_section_tags(intent_tags))
-        return self.dedupe_list(preferred)[:6]
-
-    def classify_question_type(self, normalized_query: str, intent_tags: List[str]) -> str:
-        query_text = normalized_query.lower()
-        for question_type, spec in QUESTION_TYPE_RULES.items():
-            if question_type != "other" and any(keyword.lower() in query_text for keyword in spec.get("keywords", [])):
-                return question_type
-        if "summary" in intent_tags:
-            return "summary"
-        return "other"
-
-    def query_type_terms(self, question_type: str) -> List[str]:
-        alias = {
-            "paper_overview": "summary",
-            "method": "method_flow",
-            "experiment": "experiment_setup",
-            "result_analysis": "results_analysis",
-            "comparison": "results_analysis",
-            "definition": "summary",
-            "implementation_detail": "method_flow",
-        }
-        spec = QUESTION_TYPE_RULES.get(alias.get(question_type, question_type), QUESTION_TYPE_RULES["other"])
-        return self.dedupe_list([str(item).strip() for item in spec.get("keywords", []) if str(item).strip()])
-
-    def preferred_section_tags_from_plan(self, query_plan: Dict[str, Any], intent_tags: List[str]) -> List[str]:
+    def preferred_section_tags_from_plan(self, query_plan: Dict[str, Any], main_intent: str) -> List[str]:
         preferred = [str(item).strip() for item in (query_plan.get("preferred_sections", []) or []) if str(item).strip()]
-        question_type = self.legacy_intent_bucket(query_plan.get("question_type", "other"))
-        preferred.extend(QUESTION_TYPE_RULES.get(question_type, QUESTION_TYPE_RULES["other"]).get("preferred_sections", []))
-        preferred.extend(self.preferred_section_tags(intent_tags))
+        preferred.extend(self.preferred_sections_for_main_intent(main_intent))
         return self.dedupe_list(preferred)[:6]
 
     @staticmethod
@@ -621,73 +331,17 @@ class RetrievalRules:
                 break
         return compacted
 
-    def summarize_intent(self, question_type: str, intent_tags: List[str], paper_terms: List[str]) -> str:
-        summaries = {
-            "paper_overview": "understand the paper overview and key ideas",
-            "contribution": "understand the paper's main contribution and novelty",
-            "method_flow": "understand the method flow and paper-specific implementation details",
-            "experiment_setup": "understand the experimental setup, datasets, baselines, and evaluation details",
-            "results_analysis": "understand the results, comparison, and ablation analysis",
-            "limitation": "understand the limitations and future work",
-            "dataset": "understand the dataset or benchmark used in the paper",
-            "metric": "understand the metric, formula, or evaluation protocol",
-            "figure_table": "find the relevant figure or table and interpret it",
-            "summary": "summarize the paper around its main ideas and findings",
-            "definition": "understand the definition or concept being asked about",
-            "implementation_detail": "understand the implementation details and training settings",
-        }
-        normalized = {"method": "method_flow", "experiment": "experiment_setup", "comparison": "results_analysis"}.get(question_type, question_type)
-        if normalized in summaries:
-            return summaries[normalized]
-        if intent_tags:
-            return f"understand the paper with focus on {', '.join(intent_tags[:3])}"
-        if paper_terms:
-            return f"retrieve evidence around {', '.join(paper_terms[:3])}"
-        return "retrieve the most relevant paper evidence"
-
-    def intent_to_terms(self, intent_tags: List[str]) -> List[str]:
-        mapping = {
-            "summary": ["main", "contributions", "key", "findings", "summary"],
-            "method": ["proposed", "method", "approach", "architecture", "implementation"],
-            "experiment": ["experimental", "results", "evaluation", "benchmarks"],
-            "comparison": ["baseline", "comparison", "ablation", "competing"],
-            "limitation": ["limitations", "future", "work", "failure", "cases"],
-            "definition": ["definition", "formulation", "problem", "setup"],
-            "dataset": ["datasets", "corpus", "data", "splits"],
-        }
-        terms: List[str] = []
-        for intent in intent_tags:
-            terms.extend(mapping.get(intent, []))
-        return self.dedupe_terms(terms).split()
-
-    def intent_to_evidence_terms(self, intent_tags: List[str]) -> List[str]:
-        mapping = {
-            "summary": ["abstract", "introduction", "conclusion"],
-            "method": ["method", "approach", "architecture", "model"],
-            "experiment": ["experiment", "results", "evaluation", "ablation"],
-            "comparison": ["baseline", "comparison", "ablation", "results"],
-            "limitation": ["limitations", "discussion", "future work"],
-            "definition": ["background", "definition", "problem setup"],
-            "dataset": ["dataset", "corpus", "data"],
-        }
-        terms: List[str] = []
-        for intent in intent_tags:
-            terms.extend(mapping.get(intent, []))
-        return self.dedupe_terms(terms).split()
-
     def build_semantic_query(self, user_query: str, keywords: List[str], intent_tags: List[str], intent_profile: Optional[Any] = None) -> str:
         parts: List[str] = []
         if intent_profile and getattr(intent_profile, "rewrite_focus", None):
             parts.extend(intent_profile.rewrite_focus[:4])
-        if intent_tags:
-            parts.extend(self.intent_to_terms(intent_tags))
         parts.extend(keywords[:6])
         if not parts:
             parts.extend(self.tokenize_for_keyword_search(user_query)[:6])
         return self.dedupe_terms(parts) or self.normalize_query_text(user_query)
 
     def build_evidence_query(self, keywords: List[str], intent_tags: List[str], language: str, intent_profile: Optional[Any] = None) -> str:
-        parts = self.intent_to_evidence_terms(intent_tags)
+        parts: List[str] = []
         if intent_profile and getattr(intent_profile, "rerank_focus", None):
             parts.extend(intent_profile.rerank_focus[:4])
         parts.extend(keywords[:4])
@@ -695,7 +349,7 @@ class RetrievalRules:
         return self.dedupe_terms(parts)
 
     def build_keyword_query(self, keywords: List[str], intent_tags: List[str], intent_profile: Optional[Any] = None) -> str:
-        parts = keywords[: self.config["keyword_parts_limit"]] + self.intent_to_terms(intent_tags)
+        parts = keywords[: self.config["keyword_parts_limit"]]
         if intent_profile and getattr(intent_profile, "rewrite_focus", None):
             parts.extend(intent_profile.rewrite_focus[:4])
         if not parts:
@@ -731,34 +385,34 @@ class RetrievalRules:
         source_text = " ".join(route_queries) if route_queries else source_query
         similarity = self.query_similarity(query_profile.normalized_query, source_text)
         ambiguity = query_profile.ambiguity_score
-        main_intent = self.legacy_intent_bucket(intent_profile.main_intent if intent_profile else query_profile.question_type)
+        main_intent = str(intent_profile.main_intent if intent_profile else "other")
         if route_name == "vector_original":
-            base = self.config["query_weight_base_summary_other"] if main_intent in {"summary", "other"} else self.config["query_weight_base_default"]
+            base = self.config["query_weight_base_summary_other"] if main_intent in {*OVERVIEW_INTENTS, "other"} else self.config["query_weight_base_default"]
         elif route_name == "vector_rewrite":
             base = self.config["query_weight_base_ambiguous_keyword"] + 0.18 * ambiguity
-            if main_intent in {"method", "experiment", "comparison", "dataset"}:
+            if main_intent in {*METHOD_INTENTS, *EXPERIMENT_INTENTS, "comparison", "dataset"}:
                 base += self.config["route_focus_bonus"]
         elif route_name == "vector_hyde":
             base = self.config["query_weight_base_ambiguous_other"] + 0.25 * ambiguity
-            if main_intent == "summary":
+            if main_intent in OVERVIEW_INTENTS:
                 base += self.config["route_summary_bonus"]
         elif route_name == "keyword":
             base = self.config["query_weight_base_keyword"] + 0.18 * min(
                 1.0,
                 len(query_profile.keywords) / self.config["extract_query_keywords_limit"],
             )
-            if main_intent in {"method", "experiment", "figure_table"}:
+            if main_intent in {*METHOD_INTENTS, *EXPERIMENT_INTENTS, "figure_table"}:
                 base += self.config["route_keyword_bonus"]
         elif route_name == "table_structured":
             base = self.config["query_weight_base_keyword"] + 0.22 * min(
                 1.0,
                 len(query_profile.keywords) / self.config["extract_query_keywords_limit"],
             )
-            if main_intent in {"experiment", "comparison", "figure_table", "dataset"}:
+            if main_intent in {*EXPERIMENT_INTENTS, "comparison", "figure_table", "dataset"}:
                 base += self.config["route_keyword_bonus"] + 0.06
         elif route_name == "memory_context":
             base = 0.42 + 0.2 * ambiguity
-            if main_intent in {"method", "experiment", "comparison", "figure_table", "dataset"}:
+            if main_intent in {*METHOD_INTENTS, *EXPERIMENT_INTENTS, "comparison", "figure_table", "dataset"}:
                 base += 0.08
         else:
             base = self.config["query_weight_base_fallback"]
@@ -780,15 +434,15 @@ class RetrievalRules:
             bonus += self.config["section_bonus_weight"] * len(section_tags & preferred)
         chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
         noisy_tags = set(section_tags & NOISY_SECTION_TAGS)
-        main_intent = self.legacy_intent_bucket(query_profile.intent_profile.main_intent if query_profile.intent_profile else query_profile.question_type)
+        main_intent = str(query_profile.intent_profile.main_intent if query_profile.intent_profile else "other")
         if chunk_type in {"figure", "table"} and (main_intent == "figure_table" or "figure_table" in query_profile.intent_tags):
             noisy_tags -= {"figure", "table"}
             bonus += self.config["figure_table_bonus_weight"]
         if noisy_tags:
             bonus -= self.config["noisy_section_penalty_weight"] * len(noisy_tags)
-        if "abstract" in section_tags and (main_intent == "summary" or "paper_overview" in query_profile.intent_tags or "contribution" in query_profile.intent_tags):
+        if "abstract" in section_tags and main_intent in OVERVIEW_INTENTS:
             bonus += self.config["preferred_section_bonus_weight"]
-        if "conclusion" in section_tags and (main_intent == "summary" or "paper_overview" in query_profile.intent_tags or "contribution" in query_profile.intent_tags):
+        if "conclusion" in section_tags and main_intent in OVERVIEW_INTENTS:
             bonus += self.config["section_path_bonus_weight"]
         return max(-0.05, min(0.12, bonus))
 

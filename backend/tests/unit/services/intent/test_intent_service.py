@@ -1,7 +1,8 @@
 import json
 import unittest
 
-from services.intent.intent_service import IntentService
+from services.intent.intent_service import MAIN_INTENT_NAMES, IntentService
+from utils.config import INTENT_ROUTING_CONFIG
 
 
 class _FakeIntentGenerationService:
@@ -20,6 +21,9 @@ class _FakeIntentGenerationService:
 
 
 class IntentServiceTests(unittest.TestCase):
+    def test_route_weight_config_exactly_matches_canonical_main_intents(self) -> None:
+        self.assertEqual(set(INTENT_ROUTING_CONFIG["intent_route_weights"]), set(MAIN_INTENT_NAMES))
+
     def test_heuristic_intent_classification_for_method_question(self) -> None:
         service = IntentService()
 
@@ -80,6 +84,35 @@ class IntentServiceTests(unittest.TestCase):
         self.assertEqual(profile.main_intent, "limitation")
         self.assertEqual(profile.source, "heuristic")
         self.assertIn("intent llm unavailable", profile.fallback_reason)
+
+    def test_legacy_llm_intent_is_rejected_and_falls_back_to_heuristic_profile(self) -> None:
+        generation_service = _FakeIntentGenerationService(
+            payload={
+                "main_intent": "method",
+                "sub_intents": ["deep_method"],
+                "confidence": 0.92,
+                "preferred_sections": ["method"],
+            }
+        )
+        service = IntentService(generation_service=generation_service)
+
+        profile = service.build_intent_profile("How does the method pipeline work?")
+
+        self.assertEqual(profile.main_intent, "method_flow")
+        self.assertEqual(profile.source, "heuristic")
+        self.assertEqual(profile.fallback_reason, "invalid_main_intent")
+
+    def test_unknown_llm_intent_is_rejected_and_falls_back_to_heuristic_profile(self) -> None:
+        generation_service = _FakeIntentGenerationService(
+            payload={"main_intent": "future_unknown_intent", "confidence": 0.99}
+        )
+        service = IntentService(generation_service=generation_service)
+
+        profile = service.build_intent_profile("What limitations does the paper discuss?")
+
+        self.assertEqual(profile.main_intent, "limitation")
+        self.assertEqual(profile.source, "heuristic")
+        self.assertEqual(profile.fallback_reason, "invalid_main_intent")
 
 
 if __name__ == "__main__":

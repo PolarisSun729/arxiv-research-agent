@@ -10,7 +10,7 @@ def _source(section: str, text: str = "Detailed evidence " * 20):
 def test_section_mismatch_recommends_section_focused_repair() -> None:
     observation = build_qa_observation(
         retrieval_debug={
-            "query_profile": {"question_type": "method", "section_preferences": ["method"]},
+            "intent_profile": {"main_intent": "method_flow", "preferred_sections": ["method"]},
             "query_rewrite": {"enabled": True, "selected_queries": ["method pipeline"]},
         },
         sources=[_source("related work"), _source("background")],
@@ -25,7 +25,7 @@ def test_section_mismatch_recommends_section_focused_repair() -> None:
 
 def test_metric_question_recommends_keyword_emphasis() -> None:
     observation = build_qa_observation(
-        retrieval_debug={"query_profile": {"question_type": "metric", "section_preferences": ["results"]}},
+        retrieval_debug={"intent_profile": {"main_intent": "result_analysis", "preferred_sections": ["results"]}},
         sources=[_source("results"), _source("experiments")],
         generation_result={"answer": "answer"},
         verification_result={"status": "passed", "source_count": 2},
@@ -38,7 +38,7 @@ def test_weak_hyde_retrieval_recommends_retry_without_hyde() -> None:
     observation = build_qa_observation(
         retrieval_debug={
             "hyde": {"enabled": True, "text": "hypothetical noisy answer"},
-            "query_profile": {"question_type": "definition"},
+            "intent_profile": {"main_intent": "definition"},
         },
         sources=[_source("unknown", text="short")],
         generation_result={"answer": "answer"},
@@ -47,6 +47,25 @@ def test_weak_hyde_retrieval_recommends_retry_without_hyde() -> None:
 
     assert observation["retrieval_quality"] == "weak"
     assert "retry_without_hyde" in observation["recommended_repair_actions"]
+
+
+def test_result_analysis_uses_canonical_intent_for_missing_evidence() -> None:
+    observation = build_qa_observation(
+        retrieval_debug={
+            "intent_profile": {
+                "main_intent": "result_analysis",
+                "preferred_sections": ["results", "experiments"],
+            }
+        },
+        sources=[],
+        generation_result={"answer": "answer"},
+        verification_result={"status": "warning", "source_count": 0},
+    )
+
+    query_details = observation["retrieval_stage_status"]["query_planning"]["details"]
+    assert observation["missing_evidence_type"] == "result_table"
+    assert query_details["main_intent"] == "result_analysis"
+    assert "question_type" not in query_details
 
 
 def test_missing_index_recommends_confirmation_rebuild_action_only() -> None:

@@ -635,12 +635,9 @@ class InternalBM25Backend(KeywordBackend):
         from services.retrieval.retrieval_index import KEYWORD_FIELD_WEIGHTS
 
         weights = dict(KEYWORD_FIELD_WEIGHTS)
-        main_intent = "other"
-        if query_profile.intent_profile is not None:
-            main_intent = str(getattr(query_profile.intent_profile, "main_intent", "") or "other")
-        main_intent = str(query_profile.question_type or main_intent or "other").strip().lower()
+        main_intent = self._query_main_intent(query_profile)
 
-        if main_intent == "figure_table" or "figure_table" in (query_profile.intent_tags or []):
+        if main_intent == "figure_table":
             weights["asset_caption"] = 1.15
             weights["asset_aux"] = 0.72
         else:
@@ -657,9 +654,7 @@ class InternalBM25Backend(KeywordBackend):
         weights = dict(base_weights)
         chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
         is_asset_chunk = chunk_type in {"figure", "table"}
-        is_figure_query = query_profile.question_type == "figure_table" or "figure_table" in (
-            query_profile.intent_tags or []
-        )
+        is_figure_query = self._query_main_intent(query_profile) == "figure_table"
 
         if is_asset_chunk and not is_figure_query:
             weights["body"] = min(weights.get("body", 1.0), 0.38)
@@ -691,21 +686,12 @@ class InternalBM25Backend(KeywordBackend):
         """Detect noise flags in keyword matches."""
         from services.retrieval.route_retriever import RouteRetriever
 
-        # Use RouteRetriever's method with proper constants
-        retriever_instance = type('TempRetriever', (), {
-            'LOW_IDF_THRESHOLD': RouteRetriever.LOW_IDF_THRESHOLD,
-            'ASSET_NOISE_FIELDS': RouteRetriever.ASSET_NOISE_FIELDS,
-            '_normalize_field_text': staticmethod(RouteRetriever._normalize_field_text),
-            '_is_informative_token': lambda self, token: self._is_informative_token_impl(token),
-        })()
-        retriever_instance._is_informative_token_impl = lambda token: self._is_informative_token(token)
-
         return RouteRetriever.detect_keyword_noise_flags(
-            retriever_instance,
             matched_terms=matched_terms,
             matched_fields=matched_fields,
             query_profile=query_profile,
             chunk=chunk,
+            is_informative_token=self._is_informative_token,
         )
 
     def _adjust_keyword_route_confidence(
@@ -719,32 +705,18 @@ class InternalBM25Backend(KeywordBackend):
         """Adjust keyword route confidence based on match quality."""
         from services.retrieval.route_retriever import RouteRetriever
 
-        # Use RouteRetriever's method with proper constants
-        retriever_instance = type('TempRetriever', (), {
-            'LOW_IDF_THRESHOLD': RouteRetriever.LOW_IDF_THRESHOLD,
-            'query_intent_bucket': lambda self, qp: self._query_intent_bucket(qp),
-            'query_tools': self.query_tools,
-        })()
-        retriever_instance._query_intent_bucket = lambda qp: self._query_intent_bucket(qp)
-
         return RouteRetriever.adjust_keyword_route_confidence(
-            retriever_instance,
             base_confidence,
             matched_terms=matched_terms,
             noise_flags=noise_flags,
             query_profile=query_profile,
         )
 
-    def _query_intent_bucket(self, query_profile: Any) -> str:
-        """Get intent bucket for query profile."""
-        bucketizer = getattr(self.query_tools, "legacy_intent_bucket", None)
-        raw_intent = ""
-        if query_profile.intent_profile is not None:
-            raw_intent = str(getattr(query_profile.intent_profile, "main_intent", "") or "")
-        raw_intent = raw_intent or str(query_profile.question_type or "other")
-        if callable(bucketizer):
-            return bucketizer(raw_intent)
-        return str(raw_intent or "other").strip().lower()
+    @staticmethod
+    def _query_main_intent(query_profile: Any) -> str:
+        """返回意图服务已经确认的正式 intent。"""
+        intent_profile = query_profile.intent_profile
+        return str(getattr(intent_profile, "main_intent", "other") or "other").strip().lower()
 
     def _is_informative_token(self, token: str) -> bool:
         """Check if token is informative (not garbled)."""

@@ -688,21 +688,12 @@ class BM25sBackend(KeywordBackend):
         """Detect noise flags in keyword matches."""
         from services.retrieval.route_retriever import RouteRetriever
 
-        # Use RouteRetriever's method with proper constants
-        retriever_instance = type('TempRetriever', (), {
-            'LOW_IDF_THRESHOLD': RouteRetriever.LOW_IDF_THRESHOLD,
-            'ASSET_NOISE_FIELDS': RouteRetriever.ASSET_NOISE_FIELDS,
-            '_normalize_field_text': staticmethod(RouteRetriever._normalize_field_text),
-            '_is_informative_token': lambda self, token: self._is_informative_token_impl(token),
-        })()
-        retriever_instance._is_informative_token_impl = lambda token: self._is_informative_token(token)
-
         return RouteRetriever.detect_keyword_noise_flags(
-            retriever_instance,
             matched_terms=matched_terms,
             matched_fields=matched_fields,
             query_profile=query_profile,
             chunk=chunk,
+            is_informative_token=self._is_informative_token,
         )
 
     def _adjust_keyword_route_confidence(
@@ -715,36 +706,13 @@ class BM25sBackend(KeywordBackend):
     ) -> float:
         """Adjust keyword route confidence based on match quality."""
         from services.retrieval.route_retriever import RouteRetriever
-        from utils.config import get_enhanced_retrieval_runtime_config
-
-        ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
-
-        # Use RouteRetriever's method with proper constants
-        retriever_instance = type('TempRetriever', (), {
-            'LOW_IDF_THRESHOLD': RouteRetriever.LOW_IDF_THRESHOLD,
-            'query_intent_bucket': lambda self, qp: self._query_intent_bucket(qp),
-            'query_tools': self.query_tools,
-        })()
-        retriever_instance._query_intent_bucket = lambda qp: self._query_intent_bucket(qp)
 
         return RouteRetriever.adjust_keyword_route_confidence(
-            retriever_instance,
             base_confidence,
             matched_terms=matched_terms,
             noise_flags=noise_flags,
             query_profile=query_profile,
         )
-
-    def _query_intent_bucket(self, query_profile: Any) -> str:
-        """Get intent bucket for query profile."""
-        bucketizer = getattr(self.query_tools, "legacy_intent_bucket", None)
-        raw_intent = ""
-        if query_profile.intent_profile is not None:
-            raw_intent = str(getattr(query_profile.intent_profile, "main_intent", "") or "")
-        raw_intent = raw_intent or str(query_profile.question_type or "other")
-        if callable(bucketizer):
-            return bucketizer(raw_intent)
-        return str(raw_intent or "other").strip().lower()
 
     def _is_informative_token(self, token: str) -> bool:
         """Check if token is informative (not garbled)."""

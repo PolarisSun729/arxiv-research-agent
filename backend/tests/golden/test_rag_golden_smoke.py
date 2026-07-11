@@ -19,12 +19,12 @@ class _FakeGoldenSmokeRunner:
             for chunk in self._chunks
         }
         self._routing = {
-            "method": ["chunk-method", "chunk-results", "chunk-experiment"],
-            "experiment": ["chunk-experiment", "chunk-dataset", "chunk-results"],
+            "method_flow": ["chunk-method", "chunk-results", "chunk-experiment"],
+            "experiment_setup": ["chunk-experiment", "chunk-dataset", "chunk-results"],
             "comparison": ["chunk-results", "chunk-figure-table", "chunk-experiment"],
             "limitation": ["chunk-limitation", "chunk-method", "chunk-results"],
-            "factual": ["chunk-dataset", "chunk-experiment", "chunk-results"],
-            "citation / evidence locating": ["chunk-figure-table", "chunk-results", "chunk-experiment"],
+            "dataset": ["chunk-dataset", "chunk-experiment", "chunk-results"],
+            "figure_table": ["chunk-figure-table", "chunk-results", "chunk-experiment"],
         }
 
     @staticmethod
@@ -41,18 +41,18 @@ class _FakeGoldenSmokeRunner:
             "metadata": metadata,
         }
 
-    def retrieve(self, question_type: str, top_k: int = 3) -> List[Dict[str, Any]]:
-        chunk_ids = self._routing[question_type][: max(1, int(top_k or 3))]
+    def retrieve(self, main_intent: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        chunk_ids = self._routing[main_intent][: max(1, int(top_k or 3))]
         return [dict(self._chunk_map[chunk_id]) for chunk_id in chunk_ids]
 
-    def answer(self, question_type: str, language: str, sources: List[Mapping[str, Any]]) -> str:
+    def answer(self, main_intent: str, language: str, sources: List[Mapping[str, Any]]) -> str:
         source_text = " ".join(str(source.get("content", "")) for source in sources)
         summaries = {
-            "method": {
+            "method_flow": {
                 "en": "The method uses a retrieval pipeline with two encoder stages.",
                 "zh": "方法流程基于 retrieval pipeline，并且包含 two encoder stages。",
             },
-            "experiment": {
+            "experiment_setup": {
                 "en": "The experiments use the LongBench dataset and exact match metrics.",
                 "zh": "实验部分使用 LongBench dataset，并采用 exact match metrics 作为评估指标。",
             },
@@ -64,17 +64,17 @@ class _FakeGoldenSmokeRunner:
                 "en": "The paper struggles on noisy prompts and highlights future work.",
                 "zh": "论文提到的局限性包括 noisy prompts 下表现较差，并指出 future work。",
             },
-            "factual": {
+            "dataset": {
                 "en": "The dataset includes training, dev, and test splits.",
                 "zh": "数据集包含训练集、dev 和 test splits。",
             },
-            "citation / evidence locating": {
+            "figure_table": {
                 "en": "Figure 2 summarizes the experimental trend and Table 3 reports the best score.",
                 "zh": "图2总结了实验趋势，表3给出了 best score。",
             },
         }
         lang_key = "zh" if language == "zh" else "en"
-        return f"{summaries[question_type][lang_key]} Evidence: {source_text}"
+        return f"{summaries[main_intent][lang_key]} Evidence: {source_text}"
 
 
 def _load_golden_cases() -> List[Dict[str, Any]]:
@@ -159,7 +159,7 @@ class RagGoldenSmokeTests(unittest.TestCase):
             "case_id",
             "arxiv_id",
             "question",
-            "question_type",
+            "main_intent",
             "expected_answer_points",
             "expected_source_constraints",
             "difficulty",
@@ -174,14 +174,14 @@ class RagGoldenSmokeTests(unittest.TestCase):
         case_reports = []
         for case in self.cases:
             with self.subTest(case_id=case["case_id"]):
-                sources = self.runner.retrieve(case["question_type"], top_k=top_k)
-                answer = self.runner.answer(case["question_type"], case["language"], sources)
+                sources = self.runner.retrieve(case["main_intent"], top_k=top_k)
+                answer = self.runner.answer(case["main_intent"], case["language"], sources)
                 source_eval = _evaluate_source_constraints(sources, case["expected_source_constraints"], top_k=top_k)
                 answer_eval = _matches_answer_points(answer, list(case["expected_answer_points"] or []))
 
                 report = {
                     "case_id": case["case_id"],
-                    "question_type": case["question_type"],
+                    "main_intent": case["main_intent"],
                     "hit_at_k": source_eval["hit_at_k"],
                     "page_hit": source_eval["page_hit"],
                     "section_hit": source_eval["section_hit"],

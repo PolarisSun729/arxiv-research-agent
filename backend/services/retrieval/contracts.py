@@ -30,8 +30,6 @@ class QueryProfile:
     tokens: List[str]
     keywords: List[str]
     intent_tags: List[str]
-    question_type: str
-    intent_summary: str
     paper_terms: List[str]
     ambiguity_score: float
     semantic_query: str

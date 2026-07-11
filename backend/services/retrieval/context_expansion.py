@@ -4,6 +4,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+from services.intent.intent_service import METHOD_INTENTS, OVERVIEW_INTENTS
 from services.retrieval.retrieval_index import CollectionRetrievalIndex
 from services.retrieval.trace_builder import RetrievalTraceBuilder
 
@@ -739,7 +740,7 @@ class ContextExpansionPreparer:
         if chunk_type in {"figure", "table"}:
             reasons.append("asset_chunk_needs_visual_context")
         if self._query_needs_structural_context(query_profile):
-            reasons.append("question_type_needs_section_context")
+            reasons.append("main_intent_needs_section_context")
 
         return ExpansionAnchor(
             chunk_id=chunk.get("chunk_id"),
@@ -1119,9 +1120,8 @@ class ContextExpansionPreparer:
         }
 
     def _select_policy(self, query_profile: Any) -> ExpansionPolicy:
-        question_type = str(getattr(query_profile, "question_type", "") or "").strip().lower()
         intent_profile = getattr(query_profile, "intent_profile", None)
-        main_intent = str(getattr(intent_profile, "main_intent", "") or "").strip().lower()
+        main_intent = str(getattr(intent_profile, "main_intent", "other") or "other").strip().lower()
         query_text = " ".join(
             [
                 str(getattr(query_profile, "original_query", "") or ""),
@@ -1129,27 +1129,25 @@ class ContextExpansionPreparer:
                 " ".join(str(tag) for tag in (getattr(query_profile, "intent_tags", []) or [])),
             ]
         )
-        aliases = {
-            "method": "method_flow",
-            "implementation_detail": "method_flow",
-            "experiment": "experiment_setup",
-            "dataset": "experiment_setup",
-            "metric": "experiment_setup",
-            "comparison": "result_analysis",
-            "results_analysis": "result_analysis",
-            "contribution": "summary",
-            "paper_overview": "summary",
-            "figure": "figure_table",
-            "table": "figure_table",
-        }
-        policy_name = aliases.get(question_type, question_type) or aliases.get(main_intent, main_intent) or "default"
+        # definition 继续走原 default 扩展；只有原 method 行为覆盖的流程与实现类 intent 复用 method_flow。
+        if main_intent in {"method_flow", "implementation_detail"}:
+            template_name = "method_flow"
+        elif main_intent in OVERVIEW_INTENTS:
+            template_name = "paper_overview"
+        elif main_intent == "dataset":
+            template_name = "experiment_setup"
+        elif main_intent == "comparison":
+            template_name = "result_analysis"
+        else:
+            template_name = main_intent
         if self._looks_like_figure_table_question(query_text):
             # 显式 Figure/Table 编号或图表词是强结构信号，优先使用图表策略，避免被 method/result 等主题词吞掉。
-            policy_name = "figure_table"
-        if policy_name not in self._policy_templates():
-            policy_name = aliases.get(main_intent, main_intent) if aliases.get(main_intent, main_intent) in self._policy_templates() else "default"
+            template_name = "figure_table"
+            main_intent = "figure_table"
+        if template_name not in self._policy_templates():
+            template_name = "default"
 
-        base_policy = self._policy_templates()[policy_name]
+        base_policy = self._policy_templates()[template_name]
         preferred_terms = [
             *base_policy.preferred_section_terms,
             *[str(item).lower() for item in (getattr(query_profile, "section_preferences", []) or [])],
@@ -1158,6 +1156,7 @@ class ContextExpansionPreparer:
         return ExpansionPolicy(
             **{
                 **asdict(base_policy),
+                "name": main_intent if template_name != "default" else "default",
                 "preferred_section_terms": tuple(self._dedupe_strings(preferred_terms)),
             }
         )
@@ -1207,8 +1206,8 @@ class ContextExpansionPreparer:
                 per_anchor_limit=9,
                 preferred_section_terms=("figure", "table", "result", "experiment", "appendix", "caption"),
             ),
-            "summary": ExpansionPolicy(
-                name="summary",
+            "paper_overview": ExpansionPolicy(
+                name="paper_overview",
                 actions=("self", "section_header", "section_neighbors"),
                 sibling_window=0,
                 section_window=1,
@@ -1418,13 +1417,11 @@ class ContextExpansionPreparer:
 
     @staticmethod
     def _query_needs_structural_context(query_profile: Any) -> bool:
-        question_type = str(getattr(query_profile, "question_type", "") or "").lower()
         intent_profile = getattr(query_profile, "intent_profile", None)
-        main_intent = str(getattr(intent_profile, "main_intent", "") or "").lower()
+        main_intent = str(getattr(intent_profile, "main_intent", "other") or "other").lower()
         tags = {str(tag).lower() for tag in (getattr(query_profile, "intent_tags", []) or [])}
-        structural_types = {"method_flow", "experiment_setup", "result_analysis", "figure_table"}
-        structural_intents = {"method", "experiment", "comparison", "figure_table"}
-        return question_type in structural_types or main_intent in structural_intents or bool(tags & structural_types)
+        structural_intents = {*METHOD_INTENTS, "experiment_setup", "result_analysis", "comparison", "figure_table"}
+        return main_intent in structural_intents or bool(tags & structural_intents)
 
     @staticmethod
     def _chunk_type(chunk: Dict[str, Any]) -> str:

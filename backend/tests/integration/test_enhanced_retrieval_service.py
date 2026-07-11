@@ -359,7 +359,7 @@ class RetrievalPipelineIntegrationTests(unittest.TestCase):
         self.assertIn("section_header", merged["relationship_types"])
         self.assertGreater(merged["expansion_score"], 0)
 
-    def test_context_expansion_uses_question_type_specific_policies(self) -> None:
+    def test_context_expansion_uses_main_intent_specific_policies(self) -> None:
         service, collection_name, *_ = build_retrieval_service(chunks=build_context_expansion_chunks())
         options_cls = RetrievalOptions
 

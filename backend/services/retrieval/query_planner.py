@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from services.intent.intent_service import IntentProfile, IntentService
+from services.intent.intent_service import METHOD_INTENTS, IntentProfile, IntentService
 from services.retrieval.contracts import QueryProfile
 from services.retrieval.retrieval_rules import RetrievalRules
 from utils.config import get_enhanced_retrieval_runtime_config
@@ -22,7 +22,6 @@ class QueryPlanner:
         generation_service: Any,
         intent_service: IntentService,
         rerank_service: Any,
-        route_weights: Dict[str, float],
         enhanced_config: Dict[str, Any],
         retrieval_rules: Optional[RetrievalRules] = None,
     ) -> None:
@@ -30,7 +29,6 @@ class QueryPlanner:
         self.generation_service = generation_service
         self.intent_service = intent_service
         self.rerank_service = rerank_service
-        self.route_weights = route_weights
         self.config = enhanced_config
         # 规则模块集中提供 query type、stopwords 和 section 偏好，避免 planner 继续复制一份常量。
         self.retrieval_rules = retrieval_rules or RetrievalRules(config=enhanced_config)
@@ -52,11 +50,9 @@ class QueryPlanner:
         paper_context_payload = self.build_paper_context(collection_name, paper_context=paper_context)
         intent_profile = intent_profile or self.build_intent_profile(user_query, paper_context=paper_context)
         query_plan = self.build_query_plan(user_query, paper_context_payload, intent_profile=intent_profile)
-        question_type = str(intent_profile.main_intent or query_plan.get("question_type", "other")).strip() or "other"
         intent_tags = list(intent_profile.sub_intents)
-        intent_summary = str(intent_profile.intent_summary or query_plan.get("intent_summary", "")).strip()
         paper_terms = [str(item).strip() for item in query_plan.get("paper_terms", []) if str(item).strip()]
-        section_preferences = self.preferred_section_tags_from_plan(query_plan, intent_tags)
+        section_preferences = self.preferred_section_tags_from_plan(query_plan, intent_profile.main_intent)
         section_preferences = self.dedupe_list([*intent_profile.preferred_sections, *section_preferences])
         semantic_query, evidence_query, keyword_query = self.build_query_views_from_plan(
             user_query=user_query,
@@ -75,8 +71,6 @@ class QueryPlanner:
             tokens=tokens,
             keywords=keywords,
             intent_tags=intent_tags,
-            question_type=question_type,
-            intent_summary=intent_summary,
             paper_terms=paper_terms,
             ambiguity_score=intent_profile.ambiguity_score,
             semantic_query=semantic_query,
@@ -316,16 +310,12 @@ class QueryPlanner:
                         paper_context=paper_context,
                     )
                     query_plan = {
-                        "question_type": "other",
-                        "intent_summary": intent_profile.intent_summary if intent_profile else "",
                         "paper_terms": paper_context.get("candidate_terms", [])[: self.config["paper_terms_preview_limit"]],
                         "preferred_sections": intent_profile.preferred_sections if intent_profile else [],
                         "rewrite_queries": [
                             {"query": query, "focus": "retrieval", "channels": ["vector", "keyword"]}
                             for query in rewrites
                         ],
-                        "main_intent": intent_profile.main_intent if intent_profile else "other",
-                        "sub_intents": intent_profile.sub_intents if intent_profile else [],
                     }
             except Exception as exc:  # pragma: no cover
                 llm_error = str(exc)
@@ -346,14 +336,18 @@ class QueryPlanner:
         paper_context: Dict[str, Any],
         intent_profile: Optional[IntentProfile] = None,
     ) -> Dict[str, Any]:
-        normalized = dict(query_plan or {})
+        source_plan = query_plan if isinstance(query_plan, dict) else {}
+        # 外部 query planner 只能提供检索计划字段，IntentProfile 之外的数据不会进入运行时状态。
+        normalized = {
+            key: source_plan[key]
+            for key in ("paper_terms", "preferred_sections", "rewrite_queries")
+            if key in source_plan
+        }
         rewrite_queries = self.extract_plan_queries(normalized)
         if not rewrite_queries:
             normalized = self.heuristic_query_plan(user_query, paper_context, intent_profile=intent_profile)
             rewrite_queries = self.extract_plan_queries(normalized)
         normalized["rewrite_queries"] = rewrite_queries
-        normalized["question_type"] = str(normalized.get("question_type", "other")).strip() or "other"
-        normalized["intent_summary"] = str(normalized.get("intent_summary", "")).strip()
         normalized["paper_terms"] = self.dedupe_list(
             [str(item).strip() for item in (normalized.get("paper_terms", []) or []) if str(item).strip()]
         )
@@ -368,18 +362,9 @@ class QueryPlanner:
             if str(item).strip()
         ]
         if intent_profile is not None:
-            normalized["question_type"] = intent_profile.main_intent
-            normalized["main_intent"] = intent_profile.main_intent
-            normalized["sub_intents"] = list(intent_profile.sub_intents)
-            normalized["intent_confidence"] = intent_profile.confidence
-            normalized["intent_fallback_reason"] = intent_profile.fallback_reason
             normalized["preferred_sections"] = self.dedupe_list(
                 [*intent_profile.preferred_sections, *normalized.get("preferred_sections", [])]
             )
-            normalized["route_weights"] = dict(intent_profile.route_weights)
-            normalized["rewrite_count"] = intent_profile.rewrite_count
-            normalized["use_keyword_search"] = intent_profile.use_keyword_search
-            normalized["use_hyde"] = intent_profile.use_hyde
         return normalized
 
     def heuristic_query_plan(
@@ -388,37 +373,43 @@ class QueryPlanner:
         paper_context: Dict[str, Any],
         intent_profile: Optional[IntentProfile] = None,
     ) -> Dict[str, Any]:
-        normalized_query = self.normalize_query_text(user_query)
         if intent_profile is None:
             intent_profile = self.build_intent_profile(user_query, paper_context=paper_context)
         intent_tags = list(intent_profile.sub_intents)
-        question_type = self.legacy_intent_bucket(
-            intent_profile.main_intent or self.classify_question_type(normalized_query, intent_tags)
-        )
+        main_intent = intent_profile.main_intent
         paper_terms = [str(item).strip() for item in (paper_context.get("candidate_terms", []) or []) if str(item).strip()]
         section_titles = [str(item).strip() for item in (paper_context.get("section_titles", []) or []) if str(item).strip()]
-        preferred_sections = self.preferred_sections_for_question_type(question_type, intent_tags)
+        preferred_sections = self.preferred_sections_for_main_intent(main_intent)
         term_focus = self.compact_terms(paper_terms, limit=5)
         section_focus = self.compact_terms(section_titles, limit=4)
-        type_terms = self.query_type_terms(question_type)
+        type_terms = self.main_intent_terms(main_intent)
 
         def join_parts(parts: List[str]) -> str:
             return self.dedupe_terms([part for part in parts if part]).strip() or user_query.strip()
 
         templates_by_intent = {
-            "summary": [
+            "contribution": [
                 ([*term_focus[:3], "summary", "overview", "contribution"], "overview"),
                 ([*term_focus[:3], "abstract", "introduction", "conclusion"], "paper arc"),
             ],
-            "method": [
+            "paper_overview": [
+                ([*term_focus[:3], "summary", "overview", "contribution"], "overview"),
+                ([*term_focus[:3], "abstract", "introduction", "conclusion"], "paper arc"),
+            ],
+            "method_flow": [
                 ([*term_focus[:3], "method", "framework", "architecture"], "method overview"),
                 ([*term_focus[:3], "training", "inference", "implementation"], "technical details"),
                 ([*section_focus[:2], "approach", "model", "pipeline"], "paper structure"),
             ],
-            "experiment": [
+            "experiment_setup": [
                 ([*term_focus[:3], "experiment", "dataset", "baseline"], "setup"),
                 ([*term_focus[:3], "evaluation", "metric", "implementation"], "evaluation details"),
                 ([*section_focus[:2], "ablation", "results", "benchmark"], "experiment sections"),
+            ],
+            "result_analysis": [
+                ([*term_focus[:3], "results", "performance", "comparison"], "results"),
+                ([*term_focus[:3], "ablation", "analysis", "effect"], "analysis"),
+                ([*section_focus[:2], "table", "figure", "result"], "result evidence"),
             ],
             "comparison": [
                 ([*term_focus[:3], "results", "performance", "comparison"], "results"),
@@ -446,26 +437,20 @@ class QueryPlanner:
                 ([user_query, *term_focus[:2], *type_terms[:3]], "query expansion"),
             ],
         }
+        # 新 intent 只替换 schema 名称；同属方法类的 intent 继续复用原 method 策略，避免清理时顺带调参。
+        template_intent = "method_flow" if main_intent in METHOD_INTENTS else main_intent
         queries = [
             {"query": join_parts(parts), "focus": focus, "channels": ["vector", "keyword"]}
-            for parts, focus in templates_by_intent.get(question_type, templates_by_intent["other"])
+            for parts, focus in templates_by_intent.get(template_intent, templates_by_intent["other"])
         ]
         rewrite_limit = intent_profile.rewrite_count if intent_profile else QUERY_VIEW_LIMIT
         return {
-            "question_type": question_type,
-            "intent_summary": intent_profile.intent_summary if intent_profile else self.summarize_intent(question_type, intent_tags, term_focus),
             "paper_terms": term_focus,
             "preferred_sections": preferred_sections,
             "rewrite_queries": queries[:rewrite_limit],
             "paper_title": str(paper_context.get("title", "") or "").strip(),
             "paper_abstract": str(paper_context.get("abstract", "") or "").strip(),
             "section_titles": section_titles,
-            "main_intent": question_type,
-            "sub_intents": intent_tags,
-            "intent_confidence": intent_profile.confidence if intent_profile else None,
-            "intent_fallback_reason": intent_profile.fallback_reason if intent_profile else "",
-            "route_weights": intent_profile.route_weights if intent_profile else self.route_weights,
-            "rewrite_count": intent_profile.rewrite_count if intent_profile else len(queries),
         }
 
     def build_query_views_from_plan(
@@ -481,7 +466,7 @@ class QueryPlanner:
         plan_queries = self.extract_plan_queries(query_plan)
         paper_terms = [str(item).strip() for item in (query_plan.get("paper_terms", []) or []) if str(item).strip()]
         section_titles = [str(item).strip() for item in (query_plan.get("section_titles", []) or []) if str(item).strip()]
-        question_type = str((intent_profile.main_intent if intent_profile else query_plan.get("question_type", "other")) or "other").strip() or "other"
+        main_intent = str((intent_profile.main_intent if intent_profile else "other") or "other").strip() or "other"
         if not paper_terms:
             paper_terms = self.extract_paper_terms_from_text(
                 " ".join(
@@ -497,7 +482,7 @@ class QueryPlanner:
             semantic_query = plan_queries[0]
             evidence_query = plan_queries[1] if len(plan_queries) > 1 else plan_queries[0]
             keyword_query = plan_queries[2] if len(plan_queries) > 2 else " ".join(
-                self.dedupe_list([*paper_terms[:4], *keywords[:4], question_type])
+                self.dedupe_list([*paper_terms[:4], *keywords[:4], main_intent])
             ).strip()
         else:
             semantic_query = self.build_semantic_query(user_query, keywords + paper_terms, intent_tags, intent_profile=intent_profile)
@@ -517,29 +502,28 @@ class QueryPlanner:
             for item in [query_profile.semantic_query, query_profile.evidence_query, query_profile.keyword_query]
             if item
         ]
-        question_type = query_profile.question_type or "other"
+        main_intent = query_profile.intent_profile.main_intent if query_profile.intent_profile else "other"
         paper_terms = query_profile.paper_terms[:4]
         type_templates = {
             "method_flow": ["method framework algorithm training inference", "architecture component pipeline implementation"],
             "experiment_setup": ["experiment dataset baseline metric implementation", "evaluation setup data split benchmark"],
-            "results_analysis": ["results performance comparison ablation analysis", "result table figure effect improvement"],
+            "result_analysis": ["results performance comparison ablation analysis", "result table figure effect improvement"],
             "contribution": ["main contribution novel proposed method", "key idea summary contribution overview"],
             "limitation": ["limitations future work failure cases", "discussion constraints assumptions weaknesses"],
             "dataset": ["dataset corpus benchmark data split", "training data evaluation dataset"],
-            "metric": ["metric formula evaluation objective", "score measure evaluation protocol"],
             "figure_table": ["figure table diagram caption", "table figure result appendix"],
-            "summary": ["abstract introduction conclusion summary", "main findings key contribution overview"],
+            "paper_overview": ["abstract introduction conclusion summary", "main findings key contribution overview"],
             "other": ["paper evidence section relevant passages", "retrieval relevant chunks academic paper"],
         }
-        for template in type_templates.get(question_type, type_templates["other"]):
+        # 方法类正式 intent 共用原有 method rewrite，schema 拆分不改变启发式检索词。
+        template_intent = "method_flow" if main_intent in METHOD_INTENTS else main_intent
+        for template in type_templates.get(template_intent, type_templates["other"]):
             rewrites.append(" ".join(self.dedupe_list([*paper_terms, template])))
         return self.dedupe_list(rewrites)[:QUERY_VIEW_LIMIT]
 
     def extract_plan_queries(self, query_plan: Dict[str, Any]) -> List[str]:
         rewrites: List[str] = []
         raw_queries = query_plan.get("rewrite_queries", [])
-        if not isinstance(raw_queries, list):
-            raw_queries = query_plan.get("queries", [])
         if not isinstance(raw_queries, list):
             return rewrites
         for item in raw_queries:
@@ -567,28 +551,18 @@ class QueryPlanner:
     def extract_paper_terms_from_text(self, text: str, limit: Optional[int] = None) -> List[str]:
         return self.retrieval_rules.extract_paper_terms_from_text(text, limit=limit)
 
-    def preferred_sections_for_question_type(self, question_type: str, intent_tags: List[str]) -> List[str]:
-        return self.retrieval_rules.preferred_sections_for_question_type(question_type, intent_tags)
+    def preferred_sections_for_main_intent(self, main_intent: str) -> List[str]:
+        return self.retrieval_rules.preferred_sections_for_main_intent(main_intent)
 
-    def classify_question_type(self, normalized_query: str, intent_tags: List[str]) -> str:
-        return self.retrieval_rules.classify_question_type(normalized_query, intent_tags)
+    def main_intent_terms(self, main_intent: str) -> List[str]:
+        return self.retrieval_rules.main_intent_terms(main_intent)
 
-    def query_type_terms(self, question_type: str) -> List[str]:
-        return self.retrieval_rules.query_type_terms(question_type)
-
-    def preferred_section_tags_from_plan(self, query_plan: Dict[str, Any], intent_tags: List[str]) -> List[str]:
-        return self.retrieval_rules.preferred_section_tags_from_plan(query_plan, intent_tags)
-
-    @staticmethod
-    def legacy_intent_bucket(intent: str) -> str:
-        return RetrievalRules.legacy_intent_bucket(intent)
+    def preferred_section_tags_from_plan(self, query_plan: Dict[str, Any], main_intent: str) -> List[str]:
+        return self.retrieval_rules.preferred_section_tags_from_plan(query_plan, main_intent)
 
     @staticmethod
     def compact_terms(terms: List[str], limit: int) -> List[str]:
         return RetrievalRules.compact_terms(terms, limit)
-
-    def summarize_intent(self, question_type: str, intent_tags: List[str], paper_terms: List[str]) -> str:
-        return self.retrieval_rules.summarize_intent(question_type, intent_tags, paper_terms)
 
     def build_semantic_query(
         self,
@@ -619,15 +593,6 @@ class QueryPlanner:
     @staticmethod
     def detect_language(user_query: str, tokens: List[str]) -> str:
         return RetrievalRules.detect_language(user_query, tokens)
-
-    def preferred_section_tags(self, intent_tags: List[str]) -> List[str]:
-        return self.retrieval_rules.preferred_section_tags(intent_tags)
-
-    def intent_to_terms(self, intent_tags: List[str]) -> List[str]:
-        return self.retrieval_rules.intent_to_terms(intent_tags)
-
-    def intent_to_evidence_terms(self, intent_tags: List[str]) -> List[str]:
-        return self.retrieval_rules.intent_to_evidence_terms(intent_tags)
 
     def extract_query_keywords(self, tokens: List[str], limit: Optional[int] = None) -> List[str]:
         return self.retrieval_rules.extract_query_keywords(tokens, limit=limit)

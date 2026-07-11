@@ -10,50 +10,6 @@ from utils.config import RETRIEVAL_CONFIG, get_intent_routing_runtime_config
 logger = logging.getLogger(__name__)
 
 
-MAIN_INTENTS = {
-    "summary": {
-        "keywords": ["summary", "summarize", "summarise", "overview", "contribution", "findings", "main idea", "总结", "概述", "贡献"],
-        "preferred_sections": ["abstract", "introduction", "conclusion"],
-        "rewrite_count": 2,
-    },
-    "method": {
-        "keywords": ["method", "methods", "approach", "framework", "architecture", "model", "training", "inference", "方法", "框架", "模型"],
-        "preferred_sections": ["method", "approach", "model", "architecture"],
-        "rewrite_count": 3,
-    },
-    "experiment": {
-        "keywords": ["experiment", "experiments", "evaluation", "result", "results", "benchmark", "metric", "ablation", "实验", "结果", "评估"],
-        "preferred_sections": ["experiment", "results", "evaluation", "ablation"],
-        "rewrite_count": 3,
-    },
-    "comparison": {
-        "keywords": ["compare", "comparison", "baseline", "ablation", "compared", "versus", "比较", "对比", "基线"],
-        "preferred_sections": ["experiment", "results", "ablation"],
-        "rewrite_count": 3,
-    },
-    "dataset": {
-        "keywords": ["dataset", "datasets", "corpus", "data", "benchmark", "split", "数据集", "数据", "语料"],
-        "preferred_sections": ["experiment", "dataset", "data", "setup"],
-        "rewrite_count": 3,
-    },
-    "limitation": {
-        "keywords": ["limitation", "limitations", "weakness", "future work", "failure", "constraint", "局限", "不足", "未来工作"],
-        "preferred_sections": ["discussion", "conclusion", "limitations", "appendix"],
-        "rewrite_count": 2,
-    },
-    "figure_table": {
-        "keywords": ["figure", "fig.", "table", "chart", "diagram", "caption", "图", "表", "图表"],
-        "preferred_sections": ["figure", "table", "appendix", "results"],
-        "rewrite_count": 2,
-    },
-    "other": {
-        "keywords": [],
-        "preferred_sections": ["abstract", "introduction", "method", "experiment", "conclusion"],
-        "rewrite_count": 3,
-    },
-}
-
-
 SUB_INTENT_RULES = {
     "paper_overview": {
         "keywords": ["overview", "summary", "contribution", "main", "high level"],
@@ -78,8 +34,6 @@ DEFAULT_ROUTE_WEIGHTS = dict(RETRIEVAL_CONFIG["route_weights"])
 
 INTENT_ROUTE_WEIGHTS = get_intent_routing_runtime_config()["intent_route_weights"]
 
-# New schema used by the LLM router prompt. This overrides the legacy table above
-# while keeping the old definitions around for reference until all consumers are migrated.
 MAIN_INTENTS = {
     "contribution": {
         "keywords": ["contribution", "contributions", "novelty", "novel", "innovation", "main contribution", "propose", "proposed", "创新", "贡献", "提出"],
@@ -143,12 +97,12 @@ MAIN_INTENTS = {
     },
 }
 
-INTENT_ALIASES = {
-    "summary": "paper_overview",
-    "method": "method_flow",
-    "experiment": "experiment_setup",
-    "results_analysis": "result_analysis",
-}
+MAIN_INTENT_NAMES = tuple(MAIN_INTENTS)
+
+# 这些集合只表达共享检索策略，不产生新的运行时 intent 值。
+OVERVIEW_INTENTS = frozenset({"contribution", "paper_overview"})
+METHOD_INTENTS = frozenset({"method_flow", "implementation_detail", "definition"})
+EXPERIMENT_INTENTS = frozenset({"experiment_setup", "result_analysis"})
 
 
 def _normalize_text(text: str) -> str:
@@ -221,6 +175,11 @@ class IntentService:
                 llm_error = str(exc)
                 logger.debug("Intent LLM profile failed, falling back to heuristics: %s", exc)
 
+        if llm_profile and str(llm_profile.get("main_intent") or "").strip() not in MAIN_INTENTS:
+            # LLM 违反正式 schema 时整份画像都不可信，直接回退规则分类，避免错误偏好继续流入检索链。
+            llm_error = "invalid_main_intent"
+            llm_profile = None
+
         if llm_profile:
             return self._normalize_profile(llm_profile, question, paper_context, language, source="llm", fallback_reason="")
 
@@ -234,6 +193,8 @@ class IntentService:
         abstract = str(paper_context.get("abstract", "") or "").strip()
         section_titles = [str(item).strip() for item in (paper_context.get("section_titles", []) or []) if str(item).strip()]
         candidate_terms = [str(item).strip() for item in (paper_context.get("candidate_terms", []) or []) if str(item).strip()]
+        allowed_main_intents = ", ".join(MAIN_INTENT_NAMES)
+        main_intent_schema = "|".join(MAIN_INTENT_NAMES)
 
         prompt = (
             "You are an academic paper QA retrieval router.\n"
@@ -241,11 +202,10 @@ class IntentService:
             "Classify the user question into one main intent and optional sub intents.\n"
             "Return JSON only. Do not add commentary.\n\n"
             "Allowed main_intent values:\n"
-            "contribution, paper_overview, method_flow, experiment_setup, result_analysis, "
-            "comparison, dataset, limitation, definition, implementation_detail, figure_table, other\n\n"
+            f"{allowed_main_intents}\n\n"
             "Schema:\n"
             "{"
-            '"main_intent": "contribution|paper_overview|method_flow|experiment_setup|result_analysis|comparison|dataset|limitation|definition|implementation_detail|figure_table|other",'
+            f'"main_intent": "{main_intent_schema}",'
             '"sub_intents": ["paper_overview", "evidence_seeking", "result_check", "table_lookup", "deep_method"],'
             '"confidence": 0.0,'
             '"intent_summary": "short description of what the user wants",'
@@ -524,7 +484,6 @@ class IntentService:
 
     def _normalize_main_intent(self, value: Any) -> str:
         main_intent = str(value or "other").strip() or "other"
-        main_intent = INTENT_ALIASES.get(main_intent, main_intent)
         if main_intent not in MAIN_INTENTS:
             return "other"
         return main_intent

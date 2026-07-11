@@ -43,15 +43,12 @@ ROUTE_STAGE_NAMES = (
 MIN_RETRIEVAL_SOURCE_COUNT = 2
 MIN_FUSED_CHUNK_COUNT = 3
 
-MISSING_EVIDENCE_BY_QUESTION_TYPE = {
-    "method": "method_flow",
+MISSING_EVIDENCE_BY_MAIN_INTENT = {
     "method_flow": "method_flow",
-    "experiment": "experiment_setup",
     "experiment_setup": "experiment_setup",
     "dataset": "experiment_setup",
-    "results_analysis": "result_table",
+    "result_analysis": "result_table",
     "comparison": "result_table",
-    "metric": "formula_derivation",
     "definition": "definition",
     "limitation": "limitation",
     "figure_table": "figure_explanation",
@@ -237,7 +234,7 @@ def _mark_error_stage(stages: Dict[str, Dict[str, Any]], error_stage: str, error
 
 def _query_planning_stage(debug: Mapping[str, Any]) -> Dict[str, Any]:
     details = {
-        "question_type": _question_type(debug) or "unknown",
+        "main_intent": _main_intent(debug) or "unknown",
         "preferred_sections": _preferred_sections(debug),
         "rewrite_query_count": _rewrite_query_count(debug),
         "contextualized_question_changed": _question_was_contextualized(debug),
@@ -764,23 +761,18 @@ def _context_noise_ratio(sources: List[Dict[str, Any]]) -> float:
 def _missing_evidence_type(debug: Mapping[str, Any], answer_insufficient: str, weak_source_reason: str) -> str:
     if answer_insufficient != "yes" and weak_source_reason == "not_available":
         return "not_available"
-    question_type = _question_type(debug)
-    if question_type in MISSING_EVIDENCE_BY_QUESTION_TYPE:
-        return MISSING_EVIDENCE_BY_QUESTION_TYPE[question_type]
+    main_intent = _main_intent(debug)
+    if main_intent in MISSING_EVIDENCE_BY_MAIN_INTENT:
+        return MISSING_EVIDENCE_BY_MAIN_INTENT[main_intent]
     if weak_source_reason == "section_mismatch":
         return "cross_paragraph_evidence"
     return "unknown"
 
 
-def _question_type(debug: Mapping[str, Any]) -> str:
-    query_profile = debug.get("query_profile")
-    if isinstance(query_profile, Mapping):
-        value = str(query_profile.get("question_type") or "").strip().lower()
-        if value:
-            return value
+def _main_intent(debug: Mapping[str, Any]) -> str:
     intent = debug.get("intent_profile") or debug.get("intent")
     if isinstance(intent, Mapping):
-        value = str(intent.get("main_intent") or intent.get("intent") or "").strip().lower()
+        value = str(intent.get("main_intent") or "").strip().lower()
         if value:
             return value
     return ""
@@ -901,8 +893,8 @@ def _recommended_repair_actions(
 
 def _keyword_emphasis_needed(stage_status: Mapping[str, Mapping[str, Any]]) -> bool:
     query_details = (stage_status.get("query_planning") or {}).get("details") if isinstance(stage_status, Mapping) else {}
-    question_type = str((query_details or {}).get("question_type") or "").strip().lower() if isinstance(query_details, Mapping) else ""
-    if question_type in {"metric", "formula", "figure_table", "comparison", "results_analysis"}:
+    main_intent = str((query_details or {}).get("main_intent") or "").strip().lower() if isinstance(query_details, Mapping) else ""
+    if main_intent in {"figure_table", "comparison", "result_analysis"}:
         return True
     preferred_sections = (query_details or {}).get("preferred_sections") if isinstance(query_details, Mapping) else []
     return any(str(section).lower() in {"results", "experiments", "tables", "figures"} for section in (preferred_sections or []))

@@ -40,18 +40,12 @@ class _KeywordQueryTools:
     def is_informative_keyword_token(token: str) -> bool:
         return len(str(token or "").strip()) > 1
 
-    @staticmethod
-    def legacy_intent_bucket(raw_intent: str) -> str:
-        return str(raw_intent or "other").strip().lower()
-
-
 def _keyword_query_profile(query: str) -> SimpleNamespace:
     return SimpleNamespace(
         original_query=query,
         keyword_query=query,
-        question_type="other",
         intent_tags=[],
-        intent_profile=None,
+        intent_profile=SimpleNamespace(main_intent="other"),
     )
 
 
