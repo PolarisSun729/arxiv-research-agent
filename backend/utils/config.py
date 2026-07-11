@@ -264,6 +264,9 @@ RECOMMENDATION_PROFILE_CONFIG: Dict[str, Any] = {
             "RECOMMENDATION_PROFILE_POSITIVE_MAX_INTEREST_CLUSTERS",
             _env_int("RECOMMENDATION_MAX_INTEREST_CLUSTERS", 4),
         ),
+        # 自动行为画像必须比推荐主向量更保守：稳定簇和长期 topic 都要求跨论文重复出现。
+        "min_cluster_paper_count_for_profile": _env_int("RECOMMENDATION_PROFILE_POSITIVE_MIN_CLUSTER_PAPER_COUNT_FOR_PROFILE", 2),
+        "min_topic_source_papers_for_profile": _env_int("RECOMMENDATION_PROFILE_POSITIVE_MIN_TOPIC_SOURCE_PAPERS_FOR_PROFILE", 2),
         "clustering": {
             "min_cluster_size": _env_int(
                 "RECOMMENDATION_PROFILE_POSITIVE_CLUSTERING_MIN_CLUSTER_SIZE",
@@ -299,6 +302,9 @@ RECOMMENDATION_PROFILE_CONFIG: Dict[str, Any] = {
         "enable_negative_clustering": _env_bool("RECOMMENDATION_PROFILE_NEGATIVE_ENABLE_NEGATIVE_CLUSTERING", True),
         "min_disliked_for_clustering": _env_int("RECOMMENDATION_PROFILE_NEGATIVE_MIN_DISLIKED_FOR_CLUSTERING", 4),
         "max_negative_clusters": _env_int("RECOMMENDATION_PROFILE_NEGATIVE_MAX_NEGATIVE_CLUSTERS", 4),
+        # 负向长期画像会影响后续过滤/降权，默认同样要求稳定负向簇，避免单次误点踩污染画像。
+        "min_cluster_paper_count_for_profile": _env_int("RECOMMENDATION_PROFILE_NEGATIVE_MIN_CLUSTER_PAPER_COUNT_FOR_PROFILE", 2),
+        "min_topic_source_papers_for_profile": _env_int("RECOMMENDATION_PROFILE_NEGATIVE_MIN_TOPIC_SOURCE_PAPERS_FOR_PROFILE", 2),
         "clustering": {
             "min_cluster_size": _env_int("RECOMMENDATION_PROFILE_NEGATIVE_CLUSTERING_MIN_CLUSTER_SIZE", 2),
             "min_samples": _env_int("RECOMMENDATION_PROFILE_NEGATIVE_CLUSTERING_MIN_SAMPLES", 1),

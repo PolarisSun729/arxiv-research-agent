@@ -94,16 +94,17 @@ chunk debug router 只用于本地排查 PDF 解析、chunk 切分和 RAG 召回
 Agent Planner 当前需要特别注意的是“哪条路径是正式能力，哪条路径只是实验或兜底”。
 当前约定是：
 
-- **规则型 planner** 是默认开启的正式路径
-- **LLM draft planner** 是实验性能力，默认关闭
-- **legacy template fallback planner** 只在主 planner 关闭、失败或上下文异常时输出最小安全回复，不再承载业务规划
+- **默认主路径是 `llm_preferred`**：先尝试 LLM draft，再经过本地计划校验，失败时回退到规则型 planner。
+- **规则型 planner** 默认仍开启，承担稳定兜底和 `rule_only` 模式下的主规划职责。
+- **legacy template fallback planner** 只在 LLM draft 与规则型 planner 都无法产出合法计划时输出最小安全兜底，不承载完整业务规划。
 
 | 变量名 | 默认值 | 用途 |
 | --- | --- | --- |
+| `AGENT_PLANNER_MODE` / `PLANNER_RUNTIME_MODE` | `llm_preferred` | 统一控制 planner 主路径；支持 `llm_preferred`、`rule_only`、`llm_only_strict`、`demo_rule` |
 | `ENABLE_RULE_BASED_PLANNER` | `True` | 正式的规则型 planner 开关 |
 | `ENABLE_TOOL_AWARE_PLANNER` | `True` | 历史兼容名称，建议优先看 `ENABLE_RULE_BASED_PLANNER` |
-| `ENABLE_EXPERIMENTAL_LLM_PLANNER` | `False` | 实验性的 LLM draft planner 开关 |
-| `ENABLE_LLM_PLAN_DRAFT` | `False` | 历史兼容名称，与 `ENABLE_EXPERIMENTAL_LLM_PLANNER` 同义 |
+| `ENABLE_EXPERIMENTAL_LLM_PLANNER` | `True` | 实验性的 LLM draft planner 开关，最终是否作为主路径由 planner runtime mode 裁决 |
+| `ENABLE_LLM_PLAN_DRAFT` | `True` | 历史兼容名称，与 `ENABLE_EXPERIMENTAL_LLM_PLANNER` 同义 |
 | `ENABLE_RULE_FALLBACK_AFTER_LLM_PLANNER` | `True` | LLM draft 失败后是否回退到规则型 planner |
 | `ENABLE_TEMPLATE_FALLBACK_PLANNER` | `True` | 规划无法合法生成时是否允许 legacy 模板输出最小安全兜底 |
 | `EXPOSE_PLANNER_DEBUG` | `True` | 是否在 debug / trace 中暴露 planner 路径和兜底信息 |
@@ -111,8 +112,8 @@ Agent Planner 当前需要特别注意的是“哪条路径是正式能力，哪
 建议：
 
 - 排查行为时优先看 `debug.planner_summary.final_path`
-- 如果看到 `experimental_llm_draft_planner`，说明这轮走的是实验性 LLM draft，不是默认正式能力
-- 如果看到 `legacy_template_fallback_planner`，说明这轮没有走主规划路径；继续看 `fallback_record.code/raw_reason` 判断是 LLM 校验失败、tool-aware planner 失败、配置关闭还是缺少上下文
+- 如果需要稳定演示或规避 LLM 波动，可以设置 `AGENT_PLANNER_MODE=rule_only`
+- 如果看到 `legacy_template_fallback_planner`，说明 LLM draft 与规则型 planner 都没有形成合法计划；继续看 `fallback_record.code/raw_reason` 判断是 LLM 校验失败、tool-aware planner 失败、配置关闭还是缺少上下文
 
 ---
 

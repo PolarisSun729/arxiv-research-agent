@@ -2,6 +2,18 @@ Archive/
 temp/*
 backend/temp/
 
+# 本地协作上下文只服务于当前开发会话，避免把临时领域笔记误提交到公开仓库。
+/CONTEXT.md
+
+# 阶段性 Markdown 报告通常记录一次性修复、集成或测试过程；正式设计说明应沉淀到 docs/。
+/backend/*_REPORT.md
+/backend/*_FIX.md
+/backend/*_INTEGRATION.md
+/backend/agent_dialogue_flow_notes.md
+/backend/docs/*-plan.md
+/docs/*_refactor_plan.md
+/docs/plan_executor_flow.md
+
 # 本地工具与环境配置
 .codex/*
 .claude/settings.local.json

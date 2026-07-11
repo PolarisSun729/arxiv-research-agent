@@ -11,7 +11,7 @@
 
  ## 1. 项目定位
 
- `rag-project01-framework` 是一个面向 arXiv 论文场景的全栈 RAG 系统，当前覆盖以下主要能力：
+ `arxiv-research-agent` 是一个面向 arXiv 论文场景的全栈 Research Agent / RAG 系统，当前覆盖以下主要能力：
 
  - arXiv 论文检索
  - 单篇论文详情查看

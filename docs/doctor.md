@@ -57,10 +57,9 @@ doctor 也可以通过质量入口显式调用：
 
 ```bash
 python scripts/check_quality.py doctor
-python scripts/check_quality.py doctor-full
 ```
 
-注意：`python scripts/check_quality.py` 默认会运行 basic doctor，但不会自动运行 full doctor；真实外部服务连接检查必须显式执行 `doctor-full` 或 `python scripts/doctor.py full`。
+注意：`python scripts/check_quality.py` 默认会运行 basic doctor，但不会自动运行 full doctor；真实外部服务连接检查必须显式执行 `python scripts/doctor.py full`。质量门没有 `doctor-full` 目标，是为了避免默认入口或 CI 误触发真实外部连接。
 
 ## 输出含义
 

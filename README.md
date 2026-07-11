@@ -1,483 +1,374 @@
-# arXiv Paper RAG Framework
+# arXiv Research Agent
 
-一个面向 arXiv 论文检索、论文问答、个性化推荐与本地数据管理的全栈 RAG 系统。
+[![Quality Gate](https://github.com/PolarisSun729/arxiv-research-agent/actions/workflows/quality-gate.yml/badge.svg)](https://github.com/PolarisSun729/arxiv-research-agent/actions/workflows/quality-gate.yml)
+[![Secret Scan](https://github.com/PolarisSun729/arxiv-research-agent/actions/workflows/secret-scan.yml/badge.svg)](https://github.com/PolarisSun729/arxiv-research-agent/actions/workflows/secret-scan.yml)
 
-项目采用前后端分离架构：
+一个面向学术论文发现、研读与持续研究的工程化 Research Agent。系统围绕 arXiv 场景，将受约束的任务规划、工具调用、混合检索、论文级 RAG、研究记忆、个性化推荐、人工确认与可恢复执行整合为统一工作流。
 
-- 前端：`new_frontend/`，基于 Vue 3、TypeScript、Vite、Pinia、Element Plus
-- 后端：`backend/`，基于 FastAPI、Uvicorn
-- 本地开发代理：`/api -> http://127.0.0.1:8001`
+An engineering-oriented research agent for academic paper discovery, evidence-grounded question answering, personalized research assistance, and recoverable tool execution.
 
-![项目界面](images/RAG-fontend.png)
-
----
-
-## 1. 功能特性
-
-- arXiv 论文检索
-  - 原始关键词检索
-  - 结构化检索
-  - arXiv category 过滤
-  - 本地 OAI 元数据检索
-- 论文级 RAG 问答
-  - 单篇论文问答
-  - evidence chunk 检索
-  - 解析后论文上下文召回
-- 个性化推荐
-  - like / dislike 反馈
-  - 用户兴趣建模
-  - 基于聚类的兴趣表示
-- Agent 检索
-  - 自然语言论文检索
-  - tool-based search workflow
-- 本地数据管理
-  - SQLite 元数据存储
-  - Milvus 向量存储
-  - Docling 解析资产
-  - 检索与生成 trace 文件
+> 本仓库是 Zhiyuan Sun 的公开作品展示项目，重点展示 Agent Runtime、RAG 链路和大模型应用工程能力。项目已建立工程回归测试与 CI，但尚未发布系统性的 Agent/RAG 效果评测结果。
 
 ---
 
-## 2. 技术栈
+## 项目定位
 
-| 层级 | 技术选型 |
+传统论文检索通常只解决“找到论文”，但真实研究过程还需要理解用户意图、拆解任务、选择工具、处理缺失上下文、阅读论文证据、维护研究偏好，并在工具失败或高风险操作出现时安全恢复。
+
+本项目以 Research Agent 为主线，把检索、论文问答和推荐组织为同一套可观察、可恢复的任务执行系统：
+
+- **Agent 执行闭环**：目标建模、结构化规划、计划校验、工具执行、结果观察、失败恢复和最终响应。
+- **论文级 RAG**：文档解析、切分、混合召回、结果融合、rerank、上下文预算、证据校验和答案生成。
+- **研究记忆与推荐**：从用户反馈、论文证据和会话行为中构建研究画像，并将其用于检索和推荐。
+- **工程可靠性**：SSE 流式事件、trace/debug、人工确认、持久化 checkpoint、自动化测试和 CI 密钥扫描。
+
+Vue、FastAPI、Milvus 等技术组件是实现手段；项目重点是 Agent 在真实研究任务中的规划边界、失败恢复、证据约束和状态管理。
+
+---
+
+## Agent 执行架构
+
+~~~mermaid
+flowchart TD
+    U["用户研究请求"] --> API["FastAPI / SSE 接入层"]
+    API --> A["Agent Runtime"]
+
+    A --> P["理解目标并生成执行计划"]
+    P --> E["按计划调度研究工具"]
+
+    E --> T["研究能力层"]
+    T --> S1["arXiv 检索"]
+    T --> S2["论文解析与 RAG 问答"]
+    T --> S3["个性化推荐"]
+    T --> S4["研究记忆"]
+
+    S1 --> O["Observer"]
+    S2 --> O
+    S3 --> O
+    S4 --> O
+
+    O --> R["证据整理与最终回答"]
+    R --> OUT["同步响应 / SSE 流式事件"]
+
+    M[("SQLite 会话与研究记忆")] -. "支撑上下文" .-> A
+    D[("Milvus / 本地索引 / 论文资产")] -. "支撑检索与问答" .-> T
+    C[("checkpoint / trace / debug")] -. "支撑恢复与排查" .-> A
+~~~
+
+这张图刻意保留主链路，便于快速说明系统如何把研究请求转化为可执行计划、工具调用和证据化回答。规划校验、规则兜底、失败恢复与人工确认等工程细节在下文展开。
+
+默认 Planner 模式为 <code>llm_preferred</code>：系统优先请求 LLM 生成结构化计划草案，但 LLM 输出不能直接驱动工具。LLM Plan Draft 当前仍按实验性能力管理；计划必须通过工具存在性、参数 Schema、步骤依赖、危险动作和最大步数校验，校验或生成失败时回退到规则型 Tool-aware Planner。
+
+项目同时提供 <code>rule_only</code>、<code>llm_only_strict</code> 和 <code>demo_rule</code> 模式，用于稳定演示、严格实验或规划策略对比。
+
+---
+
+## 核心能力
+
+### 1. 可控、可恢复的 Agent Runtime
+
+- 将自然语言请求规范化为目标、上下文和可执行步骤。
+- 通过 Tool Registry 约束 Planner 可选择的工具及其参数。
+- 通过 Observer 把工具输出投影为结构化成功、低质量或失败信号。
+- 通过 Replanner 对可恢复问题生成候选动作，并在安全检查后修补计划。
+- 对副作用操作或需要用户判断的分支发起人工确认。
+- 使用 SQLite 与 LangGraph checkpoint 保存执行现场，支持中断后恢复。
+- 通过同步响应和 SSE 事件向前端暴露执行状态。
+
+### 2. 证据驱动的论文级 RAG
+
+- 使用 Docling、PyMuPDF 等组件加载并解析论文内容。
+- 构建 chunk、Embedding、稀疏索引和论文级检索资产。
+- 组合向量检索、BM25、关键词、结构化表格等召回路径。
+- 通过候选融合、rerank、上下文扩展和预算控制构造最终上下文。
+- 对回答使用的证据进行校验，并保留检索与生成 trace。
+- 支持论文级连续问答、会话记录和索引构建状态管理。
+
+### 3. 研究记忆与个性化推荐
+
+- 记录 like/dislike、论文标记、问答和近期交互等行为信号。
+- 从论文与用户行为中提取研究兴趣证据。
+- 聚合并审查长期研究画像，避免单次行为直接覆盖长期偏好。
+- 将长期画像、当前任务和负向偏好共同用于候选过滤、排序与推荐解释。
+
+### 4. 全栈交互与可观测性
+
+- Vue 3 前端覆盖论文检索、详情、问答、推荐、研究画像和 Agent 搜索。
+- FastAPI 后端统一承载业务 API、SSE 流式事件和错误结构。
+- debug/trace 记录 Planner 路径、fallback、工具执行和恢复过程。
+- 调试路由默认关闭，避免普通运行环境暴露内部论文资产和诊断数据。
+
+---
+
+## 关键设计与取舍
+
+### 受约束的混合规划
+
+LLM 适合根据自然语言和上下文提出计划草案，但自由生成的工具名、参数和依赖关系不应直接进入执行层。因此系统将“生成计划”和“批准执行”拆开：
+
+1. LLM 生成结构化 Plan Draft。
+2. Plan Draft 转换为内部计划模型。
+3. PlanValidator 校验工具、参数、步骤依赖、安全策略和计划长度。
+4. 校验失败时回退到规则型 Tool-aware Planner。
+5. 主规划路径都无法生成合法计划时，仅输出最小安全兜底。
+
+### 失败观察与有界重规划
+
+工具调用失败并不总意味着重新执行同一步。Observer 和 FailureClassifier 会区分缺少上下文、结果质量不足、目标解析失败、外部服务异常等情况，再由恢复策略生成候选动作。
+
+Replanner 只负责串联失败分类、候选生成、动作选择、安全检查和计划修补。系统对单原因、单步骤和整轮重规划设置上限，使恢复机制保持有界，避免 Agent 陷入无限重试。
+
+### 人工确认与可恢复执行
+
+需要用户选择或可能产生副作用的动作会触发 LangGraph interrupt。恢复时同时校验：
+
+- 业务 checkpoint 中的用户、会话、线程、待确认动作和生命周期；
+- LangGraph checkpoint 中是否仍存在可以 resume 的真实图执行现场。
+
+只有两层状态都有效时才允许继续执行；待确认动作会在恢复时被原子消费，降低重复点击造成重复执行的风险。
+
+### 证据驱动的论文问答
+
+论文问答不是“把若干 chunk 直接拼进 Prompt”。系统将查询规划、多路召回、候选融合、rerank、上下文预算、证据组织、答案生成和证据校验拆成独立模块，并通过 trace 记录每个阶段的输入、选择和降级路径。
+
+这种分层让检索质量、上下文裁剪和回答证据可以分别测试和调试，也为后续建立 RAG 效果评测提供可观测基础。
+
+---
+
+## 核心代码导航
+
+| 关注点 | 代码入口 |
 | --- | --- |
-| 前端 | Vue 3, TypeScript, Vite, Pinia, Element Plus |
-| 后端 | Python, FastAPI, Uvicorn |
-| 向量数据库 | Milvus |
-| 元数据存储 | SQLite |
-| 检索链路 | Embedding, Rerank, chunk retrieval |
-| 文档解析 | Docling, PyMuPDF, pandas |
+| Agent 图与运行入口 | [graph.py](backend/agents/arxiv_search_agent/graph.py)、[service.py](backend/agents/arxiv_search_agent/service.py) |
+| 规划与计划校验 | [planner.py](backend/agents/arxiv_search_agent/planner.py)、[tool_aware_planner.py](backend/agents/arxiv_search_agent/tool_aware_planner.py)、[plan_validator.py](backend/agents/arxiv_search_agent/plan_validator.py) |
+| 工具执行与人工确认 | [plan_executor.py](backend/agents/arxiv_search_agent/plan_executor.py)、[tool_registry.py](backend/agents/arxiv_search_agent/tool_registry.py) |
+| 失败观察与重规划 | [observer.py](backend/agents/arxiv_search_agent/observer.py)、[replanner.py](backend/agents/arxiv_search_agent/replanner.py)、[recovery_policy.py](backend/agents/arxiv_search_agent/recovery_policy.py) |
+| 恢复安全与 checkpoint | [recovery_safety.py](backend/agents/arxiv_search_agent/recovery_safety.py)、[runtime_checkpoint.py](backend/agents/arxiv_search_agent/runtime_checkpoint.py) |
+| 论文问答 | [paper_qa_service.py](backend/services/paper_qa/paper_qa_service.py)、[evidence_verifier.py](backend/services/paper_qa/evidence_verifier.py) |
+| 混合检索 | [retrieval_pipeline.py](backend/services/retrieval/retrieval_pipeline.py)、[result_fusion_service.py](backend/services/retrieval/result_fusion_service.py)、[rerank_service.py](backend/services/retrieval/rerank_service.py) |
+| 研究记忆 | [memory_service.py](backend/services/memory/memory_service.py)、[profile_aggregator.py](backend/services/memory/profile_aggregator.py)、[profile_reviewer.py](backend/services/memory/profile_reviewer.py) |
+| 配置入口 | [config.py](backend/utils/config.py)、[config.example.py](backend/utils/config.example.py) |
+| 统一质量门 | [check_quality.py](scripts/check_quality.py)、[doctor.py](scripts/doctor.py) |
 
 ---
 
-## 3. 运行环境
+## 数据与产物流水线
 
-### 3.1 基础环境
+仓库保留运行目录骨架，用来展示论文从加载到评测的主要数据路径：
+
+~~~text
+backend/
+  01-loaded-docs/          # 加载后的原始文档
+  01-chunked-docs/         # 文档切分结果
+  02-embedded-docs/        # Embedding 结果
+  02-retrieval-indexes/    # 检索索引
+  02-sparse-indexes/       # 稀疏索引
+  03-vector-store/         # 向量存储相关资产
+  03-docling-assets/       # Docling 解析资产
+  04-search-results/       # 检索结果与 trace
+  05-generation-results/   # 模型生成结果
+  06-evaluation-result/    # 评测产物
+  06-daily-arxiv-paper/    # arXiv 日常同步产物
+~~~
+
+这些目录只提交 <code>.gitignore</code> 占位文件。论文原文、数据库、向量索引、模型输出、用户数据和评测产物由本地运行生成，不进入 Git 历史，以控制仓库体积并降低隐私与数据泄露风险。
+
+---
+
+## 技术栈
+
+| 层级 | 主要组件 |
+| --- | --- |
+| Agent Runtime | LangGraph、Pydantic、结构化 Tool Registry |
+| 后端 | Python、FastAPI、Uvicorn |
+| RAG 与文档解析 | Docling、PyMuPDF、Embedding、BM25、Rerank |
+| 存储 | SQLite、Milvus、本地文件资产 |
+| 前端 | Vue 3、TypeScript、Vite、Pinia、Element Plus |
+| 工程质量 | pytest、Node.js 测试脚本、GitHub Actions、Gitleaks |
+
+---
+
+## 项目结构
+
+~~~text
+backend/
+  agents/arxiv_search_agent/  # Agent 规划、执行、观察、恢复与响应组装
+  routers/                     # FastAPI 路由
+  services/                    # 检索、QA、记忆、推荐、存储等业务模块
+  tools/                       # 后端工具与工具注册
+  tests/                       # 单元、集成与启动烟测
+  utils/                       # 配置、日志与通用工具
+
+new_frontend/
+  src/api/                     # API client 与流式请求
+  src/views/                   # 检索、论文、推荐、画像和 Agent 页面
+  src/stores/                  # Pinia 状态管理
+
+scripts/                       # doctor、静态检查和统一质量门
+docs/                          # 架构、运行时和质量门说明
+.github/workflows/             # CI 与全历史密钥扫描
+~~~
+
+---
+
+## 快速开始
+
+### 已验证环境
+
+当前版本主要在 Windows 环境开发和验证。GitHub Actions 使用 <code>windows-latest</code>、Python 3.12 和 Node.js 22。
 
 - Python 3.10+
 - Node.js 18+
 - npm 9+
 
-### 3.2 Python 依赖文件
+Linux 和 macOS 尚未完成完整兼容性验证，因此当前不将其列为正式支持环境。
 
-根据运行平台选择对应的 requirements 文件：
+### 1. 离线工程验证
 
-| 平台 | 依赖文件 |
-| --- | --- |
-| Windows | `requirements_win.txt` |
-| Ubuntu / Linux | `requirements_ubun.txt` |
-| macOS | `requirements_mac.txt` |
+以下流程不主动调用真实 arXiv、LLM、Embedding、Rerank 或 Milvus 写入：
 
-### 3.3 外部依赖
+~~~powershell
+git clone https://github.com/PolarisSun729/arxiv-research-agent.git
+cd arxiv-research-agent
 
-前后端基础联调不要求所有外部服务都可用。完整的检索、问答和推荐链路通常需要：
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements_win.txt
 
-- Milvus 服务
-- 可写的 SQLite 数据库路径
-- Embedding provider
-- Rerank provider
-- LLM provider API Key
-- arXiv / 模型服务网络代理
-
----
-
-## 4. 快速启动
-
-### 4.1 克隆仓库
-
-```bash
-git clone https://github.com/huangjia2019/rag-project01-framework.git
-cd rag-project01-framework
-```
-
-### 4.2 安装后端依赖
-
-Windows 示例：
-
-```bash
-pip install -r requirements_win.txt
-```
-
-Linux / macOS 请切换为对应 requirements 文件。
-
-### 4.3 安装前端依赖
-
-```bash
 cd new_frontend
-npm install
+npm ci
 cd ..
-```
 
-### 4.4 启动后端
-
-```bash
-cd backend
-python main.py
-```
-
-后端默认监听端口：`8001`。
-
-### 4.5 启动前端
-
-```bash
-cd new_frontend
-npm run dev
-```
-
-Vite dev server 会将 `/api` 请求代理到 `http://127.0.0.1:8001`。
-
-### 4.6 基础验证
-
-- 后端进程监听 `8001`
-- 前端开发服务可访问
-- `/api` 请求能够转发到 FastAPI 后端
-- 搜索页面能够发起后端请求
-
-### 4.7 一键质量检查
-
-修改代码后，推荐在仓库根目录运行统一质量门禁：
-
-```bash
-python scripts/check_quality.py
-```
-
-默认会按顺序执行 basic doctor、后端静态检查、后端测试、后端启动烟测、前端测试和前端构建，并在最后汇总每个阶段的 `PASS` / `FAIL`、耗时和失败复现命令。basic doctor 只检查本地环境，不访问真实外部服务；后端静态检查会覆盖 Python 编译、关键模块 import smoke 和可选低误伤 ruff 规则。默认检查只编排离线安全命令，不主动执行 arXiv 同步、真实 PDF 下载、真实 LLM / Embedding / rerank 调用或 Milvus 写入。
-
-常用分阶段入口：
-
-```bash
-python scripts/check_quality.py backend
-python scripts/check_quality.py frontend
-python scripts/check_quality.py static
 python scripts/check_quality.py smoke
-```
+~~~
 
-更多说明见 [`docs/quality_gate.md`](docs/quality_gate.md)。
+运行完整离线质量门：
 
-CI 使用同一个入口的 `ci` 目标：
+~~~powershell
+python scripts/check_quality.py
+~~~
 
-```bash
-python scripts/check_quality.py ci
-```
+完整入口会依次执行环境体检、后端静态检查、后端测试、后端启动烟测、前端测试和生产构建。
 
-该目标与默认入口一样会运行 basic doctor 和后端 lazy 启动烟测。GitHub Actions 配置见 `.github/workflows/quality-gate.yml`，说明见 [`docs/ci_quality_gate.md`](docs/ci_quality_gate.md)。
+### 2. 完整功能运行
 
-Codex 修改代码后的验收口径见 [`docs/codex_acceptance.md`](docs/codex_acceptance.md)：每次完成修改后需要说明实际运行的检查、通过/失败结果、失败是否与本次修改相关；无法运行完整门禁时必须说明原因。
+完整的论文检索、解析、问答和推荐链路需要：
 
-### 4.8 环境体检
+- 可用的 LLM、Embedding 和 Rerank 服务凭证；
+- 正在运行的 Milvus；
+- 可写的 SQLite 与运行产物目录；
+- arXiv 在线访问能力，或已经同步的本地 OAI 元数据；
+- 需要论文问答时，在本地下载并构建对应论文索引。
 
-如果要检查当前机器是否具备真实运行条件，使用 doctor：
+使用 DashScope 默认模型链路时，可在当前 PowerShell 会话中设置：
 
-```bash
-python scripts/doctor.py
-```
+~~~powershell
+$env:ALIYUN_API_KEY = Read-Host "DashScope API Key"
+$env:MILVUS_URI = "http://127.0.0.1:19530"
+$env:BACKEND_SERVICE_LOAD_MODE = "lazy"
 
-默认 `basic` 模式只检查本地环境、本地依赖、配置加载、目录和 SQLite 临时写入，不真实调用外部服务。真实连接检查需要显式运行：
+# 没有本地 OAI 数据时，可临时使用 arXiv 在线 API。
+$env:ARXIV_DATA_SOURCE = "api"
 
-```bash
-python scripts/doctor.py full
-```
+# 能够直连 arXiv 时设为空；否则填写本机可用代理。
+$env:ARXIV_PROXY_URL = ""
+~~~
 
-涉及可能计费的 Embedding / LLM / rerank 最小请求默认跳过；确认允许真实调用时再加 `--check-paid`。更多说明见 [`docs/doctor.md`](docs/doctor.md)。
+凭证只通过环境变量注入，不要写入源码或提交到 Git。OpenAI、DeepSeek 等其他服务必须显式配置各自的 API Key，不能复用阿里云凭证。
 
----
+启动后端：
 
-## 5. 后端加载模式
-
-后端支持两种服务加载模式：
-
-- `lazy`：延迟初始化，启动速度更快，首次请求延迟更高
-- `preload`：启动阶段预热服务，启动速度更慢，首次请求更稳定
-
-当前 `backend/utils/config.py` 中的默认值为 `preload`。
-
-命令行覆盖：
-
-```bash
+~~~powershell
 cd backend
 python main.py --load-mode lazy
-```
+~~~
 
-PowerShell：
+在另一个终端启动前端：
 
-```powershell
-$env:BACKEND_SERVICE_LOAD_MODE = "lazy"
-python main.py
-```
-
-CMD：
-
-```cmd
-set BACKEND_SERVICE_LOAD_MODE=lazy
-python main.py
-```
-
-bash / zsh：
-
-```bash
-BACKEND_SERVICE_LOAD_MODE=lazy python main.py
-```
-
----
-
-## 6. 配置说明
-
-运行时配置定义在：
-
-```text
-backend/utils/config.py
-```
-
-Python 配置示例：
-
-- [`backend/utils/config.example.py`](backend/utils/config.example.py)
-
-详细配置文档：
-
-- [`docs/configuration.md`](docs/configuration.md)
-
-核心环境变量：
-
-**本文默认使用qwen系列api-key，且由于arixv国内访问异常，默认arxiv请求走代理，代理端口默认为7897**
-
-| 环境变量 | 说明 | 默认值 / 示例 |
-| --- | --- | --- |
-| `BACKEND_SERVICE_LOAD_MODE` | 后端服务加载模式 | `preload` |
-| `ARXIV_DATA_SOURCE` | arXiv 数据源 | `local` |
-| `ARXIV_PROXY_URL` | arXiv 网络代理 | `http://127.0.0.1:7897` |
-| `MILVUS_URI` | Milvus 服务地址 | `http://localhost:19530` |
-| `SQLITE_DATABASE_PATH` | 推荐系统 SQLite 路径 | `06-database/recommendation.db` |
-| `OAI_SQLITE_DATABASE_PATH` | arXiv OAI SQLite 路径 | `backend/06-database/arxiv_oai.db` |
-| `EMBEDDING_PROVIDER` | Embedding 服务提供方 | `dashscope` |
-| `EMBEDDING_MODEL` | Embedding 模型 | `qwen3-vl-embedding` |
-| `RERANK_PROVIDER` | Rerank 服务提供方 | provider-specific |
-| `OPENAI_API_KEY` | OpenAI API Key | empty |
-| `DEEPSEEK_API_KEY` | DeepSeek API Key | empty |
-| `QWEN_API_KEY` | Qwen API Key | empty |
-
-配置约定：
-
-- 不要提交真实 API Key。
-- 优先通过环境变量覆盖运行时配置。
-- 检索或问答异常时，优先检查 Milvus、Embedding、Rerank、SQLite 路径和本地数据。
-- arXiv 请求异常时，优先检查代理配置。
-
----
-
-## 7. 项目结构
-
-```text
-backend/
-  main.py                 # FastAPI 应用入口
-  routers/                # API 路由
-  services/               # 业务服务层
-  tools/                  # 工具层与工具注册
-  agents/                 # Agent 工作流
-  utils/                  # 配置与通用工具
-  06-database/            # SQLite 数据库
-  03-vector-store/        # 向量存储相关文件
-  03-docling-assets/      # 文档解析资产
-  04-search-results/      # 检索输出
-  05-generation-results/  # 生成输出
-  06-daily-arxiv-paper/   # arXiv 日更数据
-  07-arxiv-tools/         # arXiv 同步脚本与工具
-
-new_frontend/
-  src/
-    api/                  # API client 封装
-    router/               # Vue Router 配置
-    stores/               # Pinia 状态管理
-    views/                # 页面视图
-    components/           # 通用组件
-```
-
-常用开发入口：
-
-- 后端入口：`backend/main.py`
-- 后端配置：`backend/utils/config.py`
-- 后端路由：`backend/routers/`
-- 后端服务：`backend/services/`
-- 前端页面：`new_frontend/src/views/`
-- 前端 API client：`new_frontend/src/api/`
-- 前端路由：`new_frontend/src/router/`
-
----
-
-## 8. 前后端联调
-
-本地开发请求链路：
-
-```text
-Browser -> Vite dev server -> /api proxy -> FastAPI backend -> routers -> services
-```
-
-代理配置：
-
-- 文件：`new_frontend/vite.config.ts`
-- target：`http://127.0.0.1:8001`
-
-后端路由前缀：
-
-- `/api`
-
----
-
-## 9. 前端路由
-
-- `/`：Dashboard
-- `/search`：论文检索
-- `/paper/:id`：论文详情与 RAG 问答
-- `/recommendations`：推荐列表
-- `/profile`：研究兴趣画像
-- `/agent-search`：Agent 检索
-- `/labeled`：已标注论文
-- `/chunks`：chunk 查看器
-
-`/agent-graph` 当前重定向到 `/`。
-
----
-
-## 10. API 概览
-
-后端路由统一挂载在 `/api` 前缀下。
-
-| 前缀 | 说明 |
-| --- | --- |
-| `/api/arxiv/*` | arXiv 检索、分类、下载 |
-| `/api/agent/*` | Agent 检索 |
-| `/api/user/*` | 用户反馈、兴趣向量、推荐 |
-| `/api/paper/*` | 论文管理与论文级问答 |
-| `/api/chunks/*` | chunk 文件查看 |
-
-路由文件：
-
-- `backend/routers/arxiv_router.py`
-- `backend/routers/agent_router.py`
-- `backend/routers/user_router.py`
-- `backend/routers/paper_router.py`
-- `backend/routers/qa_router.py`
-- `backend/routers/chunk_router.py`
-
----
-
-## 11. 数据目录
-
-| 路径 | 说明 |
-| --- | --- |
-| `backend/06-database/` | SQLite 数据库文件 |
-| `backend/03-vector-store/` | 向量存储相关文件 |
-| `backend/03-docling-assets/` | Docling 解析资产 |
-| `backend/04-search-results/` | 检索输出 |
-| `backend/05-generation-results/` | 生成输出 |
-| `backend/06-daily-arxiv-paper/` | arXiv 日更数据 |
-| `backend/07-arxiv-tools/` | arXiv 同步工具 |
-| `temp/` | 调试 trace 与临时文件 |
-
-部署或迁移时，应将数据库文件、向量存储文件和文档解析资产视为持久化数据，除非明确需要重建索引或重新解析。
-
----
-
-## 12. 构建与部署
-
-### 12.1 前端构建
-
-```bash
+~~~powershell
 cd new_frontend
-npm run build
-```
+npm run dev
+~~~
 
-预览构建产物：
+前端开发服务器会将 <code>/api</code> 请求代理到 <code>http://127.0.0.1:8001</code>。
 
-```bash
-npm run preview
-```
+运行真实连接体检：
 
-### 12.2 后端运行
+~~~powershell
+python scripts/doctor.py full
+~~~
 
-```bash
-cd backend
-python main.py
-```
-
-### 12.3 部署关注点
-
-- 前端静态资源托管
-- 后端进程管理
-- 反向代理、CORS、API 路由转发
-- Milvus 服务可用性
-- SQLite 与向量存储持久化
-- 模型服务凭证管理
-- 数据目录挂载与备份
-
-计划补充独立部署文档：`docs/deployment.md`。
+可能计费的模型检查默认跳过，只有明确添加 <code>--check-paid</code> 时才会发起最小真实调用。更多配置项以 [backend/utils/config.py](backend/utils/config.py) 为准。
 
 ---
 
-## 13. arXiv OAI 同步
+## 工程质量
 
-同步脚本位于：
+当前公开迁移基线（<code>28e264f</code>）已完成：
 
-```text
-backend/07-arxiv-tools/
-```
+- 后端测试：<code>734 passed</code>。
+- 后端静态检查：43 个关键模块成功导入。
+- 前端自动化测试：全部通过。
+- 前端生产构建：通过。
+- 后端 lazy 启动烟测：通过。
+- GitHub Actions Quality Gate：通过。
+- Gitleaks 全历史密钥扫描：通过。
 
-常用入口：
+CI 与本地使用同一个统一入口：
 
-- `backend/07-arxiv-tools/sync_arxiv_oai.py`
-- `backend/07-arxiv-tools/sync_arxiv_oai_last_day.ps1`
-- `backend/07-arxiv-tools/sync_arxiv_oai_last_day.cmd`
-- `backend/07-arxiv-tools/sync_arxiv_oai_last_6_months.cmd`
-- `backend/07-arxiv-tools/sync_arxiv_oai_since_last_run.cmd`
+~~~powershell
+python scripts/check_quality.py ci
+~~~
 
-默认 OAI 数据库：
-
-```text
-backend/06-database/arxiv_oai.db
-```
-
-OAI 同步用于构建和更新本地 arXiv 元数据，支撑检索、推荐和向量化工作流。
+工程测试用于验证代码契约、状态流转和构建稳定性，不代表 Agent 或 RAG 的算法效果指标。
 
 ---
 
-## 14. 故障排查
+## 评测状态
 
-### 14.1 前端请求失败
+当前仓库尚未发布系统性的 Agent/RAG 效果评测结果。后续计划至少覆盖：
 
-检查后端是否监听 `8001`，以及 `new_frontend/vite.config.ts` 是否仍将 `/api` 代理到 `http://127.0.0.1:8001`。
+- Agent 任务成功率、计划合法率、工具调用成功率和 fallback 率；
+- 重规划触发率、恢复成功率和人工确认后的继续执行成功率；
+- 检索 Recall、MRR/NDCG、rerank 收益和上下文命中率；
+- 回答忠实度、证据覆盖率、延迟和模型调用成本。
 
-### 14.2 后端启动慢
-
-`preload` 模式会在启动阶段执行服务预热。开发阶段可切换为 `lazy` 以缩短启动时间。
-
-### 14.3 检索、问答或推荐结果不完整
-
-检查：
-
-- Milvus 连接
-- Embedding provider 配置
-- Rerank provider 配置
-- SQLite / OAI 数据库路径
-- 本地数据完整性
-- 网络代理配置
+在这些实验完成前，README 不使用工程测试数量代替算法效果结论。
 
 ---
 
-## 15. 文档
+## 当前状态与限制
 
-已提供：
-
-- [`docs/configuration.md`](docs/configuration.md)
-- [`backend/utils/config.example.py`](backend/utils/config.example.py)
-
-计划补充：
-
-- `docs/api.md`
-- `docs/deployment.md`
-- `docs/faq.md`
+- 默认 Planner 为 <code>llm_preferred</code>，LLM 计划必须经过本地校验，失败时回退到规则型 Planner。
+- 完整链路依赖外部模型服务、Milvus、论文数据和 arXiv 网络条件。
+- 当前只正式验证 Windows；Linux 和 macOS 支持仍待补充。
+- 仓库不包含论文、索引、数据库、模型输出和用户运行数据。
+- 当前没有承诺持续可用的在线演示服务。
+- 项目用于研究与工程验证，尚未达到生产级 SLA。
+- 当前未附带开源 License；仓库公开可见不等同于授权复制、修改或再发布。
 
 ---
 
-## License
+## 界面概览
 
-如需开源发布，建议补充明确的 License 文件与说明。
+当前截图展示论文管理、检索、推荐和研究画像入口。后续将补充能够体现计划生成、工具执行、人工确认和恢复过程的 Agent 完整执行截图。
+
+![项目界面](images/RAG-fontend.png)
+
+---
+
+## Roadmap
+
+1. **建立 Agent/RAG 评测体系**：补充固定任务集、检索指标、回答忠实度、恢复收益、延迟与成本报告。
+2. **完善 LLM Planner 实验**：对比 <code>llm_preferred</code>、<code>rule_only</code> 和混合回退策略，评估计划合法率与实际任务成功率。
+3. **提高复现与演示能力**：补充跨平台依赖、容器化运行方案、演示数据和 Agent 执行截图或视频。
+
+---
+
+## Maintainer
+
+**Zhiyuan Sun**<br>
+Tongji University<br>
+Email: 2433274@tongji.edu.cn<br>
+GitHub: [@PolarisSun729](https://github.com/PolarisSun729)

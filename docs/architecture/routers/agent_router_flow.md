@@ -497,7 +497,7 @@ flowchart TD
 
 原因：
 
-- 主图只有两个业务节点：`parse_search_request -> run_agent_turn`
+- 主图已经拆成可观察的多节点链路：`parse_search_request -> build_goal -> build_plan -> select_next_step -> execute_step -> observe_step -> replan/finalize`
 - plan 生成主路径来自 LLM/规则型 Tool-Aware planner，legacy 模板只在失败时兜底
 - tool selection 不由 LLM 自由决定，而是先被 ToolRegistry contract 和候选筛选收敛
 - replan 是规则表驱动，不是自由推理

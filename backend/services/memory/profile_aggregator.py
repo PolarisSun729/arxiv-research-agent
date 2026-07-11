@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from services.memory.concept_normalizer import ConceptNormalizer, PROFILE_NORMALIZER_VERSION
 from services.memory.research_profile_generator import ResearchProfileGenerator
@@ -37,6 +37,9 @@ class ProfileAggregator:
 
     STRONG_RECENT_ACTIONS = {"liked", "like", "favorite", "later", "note_saved", "qa_asked"}
     POSITIVE_CATEGORY_ACTIONS = {"liked", "like", "favorite", "later", "note_saved", "qa_asked"}
+    PAPER_LEVEL_POSITIVE_ACTIONS = {"liked", "like", "favorite", "later"}
+    PAPER_LEVEL_NEGATIVE_ACTIONS = {"disliked", "dislike", "not_interested"}
+    EXPLICIT_PROFILE_SOURCES = {"manual_profile", "note_tag", "note_auxiliary_text"}
 
     def __init__(self, concept_normalizer: Optional[ConceptNormalizer] = None):
         self.concept_normalizer = concept_normalizer or ConceptNormalizer()
@@ -57,6 +60,7 @@ class ProfileAggregator:
         question_type_scores: Counter[str] = Counter()
         event_map = self._event_map(evidence.get("profile_events") or [])
         candidate_count_by_action: Counter[str] = Counter()
+        behavior_gate = self._build_behavior_gating_state(evidence)
 
         if preserve_existing_topics:
             # 旧画像没有可靠来源，只能作为低权重 legacy 候选，正式重建默认会关闭这条路径。
@@ -69,6 +73,10 @@ class ProfileAggregator:
         )
 
         for paper in evidence.get("liked_papers") or []:
+            paper_id = self._paper_id(paper)
+            allowed_signals = {"positive", "recent"} if self._allows_positive_behavior_paper(behavior_gate, paper_id) else {"recent"}
+            if "positive" not in allowed_signals:
+                self._record_behavior_gate_skip(behavior_gate, "positive", paper_id)
             self._add_paper_candidates(
                 paper,
                 action_type="liked",
@@ -76,10 +84,16 @@ class ProfileAggregator:
                 recent_candidates=recent_candidates,
                 negative_candidates=negative_candidates,
                 candidate_count_by_action=candidate_count_by_action,
+                allowed_signals=allowed_signals,
             )
-            self._add_categories(category_scores, paper.get("categories"), self.ACTION_WEIGHTS["liked"]["positive"])
+            if "positive" in allowed_signals:
+                self._add_categories(category_scores, paper.get("categories"), self.ACTION_WEIGHTS["liked"]["positive"])
 
         for paper in evidence.get("disliked_papers") or []:
+            paper_id = self._paper_id(paper)
+            allowed_signals = {"negative"} if self._allows_negative_behavior_paper(behavior_gate, paper_id) else set()
+            if "negative" not in allowed_signals:
+                self._record_behavior_gate_skip(behavior_gate, "negative", paper_id)
             self._add_paper_candidates(
                 paper,
                 action_type="disliked",
@@ -87,6 +101,7 @@ class ProfileAggregator:
                 recent_candidates=recent_candidates,
                 negative_candidates=negative_candidates,
                 candidate_count_by_action=candidate_count_by_action,
+                allowed_signals=allowed_signals,
             )
 
         for index, action in enumerate(evidence.get("recent_actions") or []):
@@ -96,6 +111,10 @@ class ProfileAggregator:
             if not paper:
                 continue
             action_type = str(action.get("action_type") or "").strip().lower()
+            paper_id = self._paper_id(paper) or str(action.get("arxiv_id") or "").strip()
+            allowed_signals = self._allowed_signals_for_recent_action(behavior_gate, action_type, paper_id)
+            if not allowed_signals:
+                continue
             recency_boost = max(0.2, 1.0 - index * 0.08)
             self._add_paper_candidates(
                 paper,
@@ -106,8 +125,9 @@ class ProfileAggregator:
                 candidate_count_by_action=candidate_count_by_action,
                 recency_boost=recency_boost,
                 source_event=action.get("_profile_event") if isinstance(action.get("_profile_event"), dict) else None,
+                allowed_signals=allowed_signals,
             )
-            if action_type in self.POSITIVE_CATEGORY_ACTIONS:
+            if action_type in self.POSITIVE_CATEGORY_ACTIONS and "positive" in allowed_signals:
                 self._add_categories(category_scores, paper.get("categories"), self.ACTION_WEIGHTS.get(action_type, {}).get("positive", 0.0))
 
         for note in evidence.get("notes") or []:
@@ -130,7 +150,8 @@ class ProfileAggregator:
         topic_evidence = self._build_topic_evidence(normalized_topics, event_map)
         self._enrich_canonical_topics(normalized_topics, topic_evidence)
         normalized_topics = self._apply_selection_rules(normalized_topics, topic_evidence)
-        representative_candidates = self._collect_representative_candidates(evidence)
+        normalized_topics = self._apply_behavior_topic_gates(normalized_topics, topic_evidence, behavior_gate)
+        representative_candidates = self._collect_representative_candidates(evidence, behavior_gate)
         representative_papers = self._select_representative_papers(normalized_topics, topic_evidence, current, representative_candidates)
 
         return {
@@ -151,6 +172,7 @@ class ProfileAggregator:
                 "recent_candidate_count": len(recent_candidates),
                 "candidate_count_by_action": dict(candidate_count_by_action),
                 "behavior_weight_schema": self.ACTION_WEIGHTS,
+                "behavior_profile_gating": self._behavior_gating_report(behavior_gate),
             },
             "preferred_categories": self._rank_counter_values(category_scores, self.FIELD_LIMITS["preferred_categories"]),
             "preferred_answer_style": str(current.get("preferred_answer_style") or "").strip(),
@@ -197,26 +219,30 @@ class ProfileAggregator:
         candidate_count_by_action: Counter[str],
         recency_boost: float = 1.0,
         source_event: Optional[Dict[str, Any]] = None,
+        allowed_signals: Optional[Set[str]] = None,
     ) -> None:
         weights = self.ACTION_WEIGHTS.get(action_type, {})
+        allowed = allowed_signals if allowed_signals is not None else {"positive", "negative", "recent"}
+        if not allowed:
+            return
         concepts = self._extract_card_candidate_concepts(paper.get("evidence_card") if isinstance(paper.get("evidence_card"), dict) else {})
         for concept in concepts:
             confidence = float(concept.get("confidence") or 0.0)
             if confidence <= 0:
                 continue
-            if weights.get("positive", 0.0) > 0:
+            if "positive" in allowed and weights.get("positive", 0.0) > 0:
                 score = weights["positive"] * confidence
                 positive_candidates.append(
                     self._concept_candidate(concept, paper, signal="positive", action_type=action_type, score=score, source_event=source_event)
                 )
                 candidate_count_by_action[action_type] += 1
-            if weights.get("negative", 0.0) > 0:
+            if "negative" in allowed and weights.get("negative", 0.0) > 0:
                 score = weights["negative"] * confidence
                 negative_candidates.append(
                     self._concept_candidate(concept, paper, signal="negative", action_type=action_type, score=score, source_event=source_event)
                 )
                 candidate_count_by_action[action_type] += 1
-            if weights.get("recent", 0.0) > 0 and action_type in self.STRONG_RECENT_ACTIONS | {"read"}:
+            if "recent" in allowed and weights.get("recent", 0.0) > 0 and action_type in self.STRONG_RECENT_ACTIONS | {"read"}:
                 score = weights["recent"] * recency_boost * confidence
                 recent_candidates.append(
                     self._concept_candidate(concept, paper, signal="recent", action_type=action_type, score=score, source_event=source_event)
@@ -411,6 +437,50 @@ class ProfileAggregator:
         normalized_topics["recent_topics"] = [item["label"] for item in normalized_topics["canonical_recent_topics"]]
         return normalized_topics
 
+    def _apply_behavior_topic_gates(
+        self,
+        normalized_topics: Dict[str, Any],
+        topic_evidence: Dict[str, Dict[str, Any]],
+        behavior_gate: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not behavior_gate.get("enabled"):
+            return normalized_topics
+
+        def _keep_topic(topic: Dict[str, Any], field_name: str, min_source_papers: int) -> bool:
+            if bool(topic.get("pinned")) or self._topic_has_explicit_profile_source(topic):
+                return True
+            label = str(topic.get("label") or "").strip()
+            source_paper_count = len(set((topic_evidence.get(label) or {}).get("source_papers") or []))
+            if source_paper_count >= min_source_papers:
+                return True
+            # 长期画像不是“有高分就收”，还要求跨论文重复出现；否则一篇误点论文会放大成方向偏好。
+            behavior_gate["filtered_topics"].append(
+                {
+                    "topic": label,
+                    "field": field_name,
+                    "source_paper_count": source_paper_count,
+                    "required_source_papers": min_source_papers,
+                    "reason": "insufficient_stable_topic_sources",
+                }
+            )
+            return False
+
+        positive_min_sources = int(behavior_gate.get("positive_min_topic_source_papers") or 1)
+        negative_min_sources = int(behavior_gate.get("negative_min_topic_source_papers") or 1)
+        normalized_topics["canonical_topics"] = [
+            topic
+            for topic in normalized_topics.get("canonical_topics") or []
+            if isinstance(topic, dict) and _keep_topic(topic, "positive_topics", positive_min_sources)
+        ]
+        normalized_topics["canonical_negative_topics"] = [
+            topic
+            for topic in normalized_topics.get("canonical_negative_topics") or []
+            if isinstance(topic, dict) and _keep_topic(topic, "negative_topics", negative_min_sources)
+        ]
+        normalized_topics["positive_topics"] = [item["label"] for item in normalized_topics["canonical_topics"]]
+        normalized_topics["negative_topics"] = [item["label"] for item in normalized_topics["canonical_negative_topics"]]
+        return normalized_topics
+
     def _select_representative_papers(
         self,
         normalized_topics: Dict[str, Any],
@@ -434,9 +504,11 @@ class ProfileAggregator:
                 ranked.append(paper_id)
         return ranked[: self.FIELD_LIMITS["representative_papers"]]
 
-    def _collect_representative_candidates(self, evidence: Dict[str, Any]) -> List[str]:
+    def _collect_representative_candidates(self, evidence: Dict[str, Any], behavior_gate: Optional[Dict[str, Any]] = None) -> List[str]:
         candidates: List[str] = []
         for paper in evidence.get("liked_papers") or []:
+            if behavior_gate and not self._allows_positive_behavior_paper(behavior_gate, self._paper_id(paper)):
+                continue
             candidates.extend(ResearchProfileGenerator.normalize_representative_papers([paper.get("arxiv_id")], limit=1))
         for action in evidence.get("recent_actions") or []:
             if not isinstance(action, dict):
@@ -445,11 +517,98 @@ class ProfileAggregator:
             if action_type not in self.STRONG_RECENT_ACTIONS:
                 continue
             paper = action.get("paper") if isinstance(action.get("paper"), dict) else {}
+            paper_id = self._paper_id(paper) or str(action.get("arxiv_id") or "").strip()
+            if behavior_gate and action_type in self.PAPER_LEVEL_POSITIVE_ACTIONS and not self._allows_positive_behavior_paper(behavior_gate, paper_id):
+                continue
             candidates.extend(ResearchProfileGenerator.normalize_representative_papers([paper.get("arxiv_id") or action.get("arxiv_id")], limit=1))
         for note in evidence.get("notes") or []:
             if isinstance(note, dict) and note.get("include_in_profile"):
                 candidates.extend(ResearchProfileGenerator.normalize_representative_papers([note.get("arxiv_id")], limit=1))
         return self._merge_unique(candidates)
+
+    def _build_behavior_gating_state(self, evidence: Dict[str, Any]) -> Dict[str, Any]:
+        interest_model = evidence.get("interest_model") if isinstance(evidence.get("interest_model"), dict) else None
+        gating = interest_model.get("profile_gating") if isinstance((interest_model or {}).get("profile_gating"), dict) else {}
+
+        def _id_set(values: Any) -> Set[str]:
+            return {str(item or "").strip() for item in values or [] if str(item or "").strip()}
+
+        return {
+            "enabled": interest_model is not None,
+            "status": str((interest_model or {}).get("status") or "not_provided").strip() or "not_provided",
+            "stable_positive_paper_ids": _id_set((interest_model or {}).get("stable_positive_paper_ids")),
+            "weak_positive_paper_ids": _id_set((interest_model or {}).get("weak_positive_paper_ids")),
+            "stable_negative_paper_ids": _id_set((interest_model or {}).get("stable_negative_paper_ids")),
+            "weak_negative_paper_ids": _id_set((interest_model or {}).get("weak_negative_paper_ids")),
+            "positive_min_topic_source_papers": self._coerce_positive_int(gating.get("positive_min_topic_source_papers"), default=1),
+            "negative_min_topic_source_papers": self._coerce_positive_int(gating.get("negative_min_topic_source_papers"), default=1),
+            "skipped_positive_papers": [],
+            "skipped_negative_papers": [],
+            "filtered_topics": [],
+        }
+
+    def _allowed_signals_for_recent_action(self, behavior_gate: Dict[str, Any], action_type: str, paper_id: str) -> Set[str]:
+        if action_type in self.PAPER_LEVEL_POSITIVE_ACTIONS:
+            if self._allows_positive_behavior_paper(behavior_gate, paper_id):
+                return {"positive", "recent"}
+            self._record_behavior_gate_skip(behavior_gate, "positive", paper_id)
+            return {"recent"}
+        if action_type in self.PAPER_LEVEL_NEGATIVE_ACTIONS:
+            if self._allows_negative_behavior_paper(behavior_gate, paper_id):
+                return {"negative"}
+            self._record_behavior_gate_skip(behavior_gate, "negative", paper_id)
+            return set()
+        if action_type in {"read", "qa_asked"}:
+            return {"recent"}
+        if action_type == "note_saved":
+            return {"positive", "recent"}
+        return {"positive", "negative", "recent"}
+
+    @staticmethod
+    def _allows_positive_behavior_paper(behavior_gate: Dict[str, Any], paper_id: str) -> bool:
+        if not behavior_gate.get("enabled"):
+            return True
+        return bool(paper_id and paper_id in behavior_gate.get("stable_positive_paper_ids", set()))
+
+    @staticmethod
+    def _allows_negative_behavior_paper(behavior_gate: Dict[str, Any], paper_id: str) -> bool:
+        if not behavior_gate.get("enabled"):
+            return True
+        return bool(paper_id and paper_id in behavior_gate.get("stable_negative_paper_ids", set()))
+
+    @staticmethod
+    def _record_behavior_gate_skip(behavior_gate: Dict[str, Any], signal: str, paper_id: str) -> None:
+        if not behavior_gate.get("enabled") or not paper_id:
+            return
+        field = "skipped_positive_papers" if signal == "positive" else "skipped_negative_papers"
+        skipped = behavior_gate.setdefault(field, [])
+        if paper_id not in skipped:
+            skipped.append(paper_id)
+
+    @classmethod
+    def _topic_has_explicit_profile_source(cls, topic: Dict[str, Any]) -> bool:
+        sources = {
+            str(concept.get("source") or "").strip()
+            for concept in topic.get("source_concepts") or []
+            if isinstance(concept, dict)
+        }
+        return bool(sources & cls.EXPLICIT_PROFILE_SOURCES)
+
+    @staticmethod
+    def _behavior_gating_report(behavior_gate: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "enabled": bool(behavior_gate.get("enabled")),
+            "status": behavior_gate.get("status"),
+            "stable_positive_paper_count": len(behavior_gate.get("stable_positive_paper_ids") or []),
+            "weak_positive_paper_count": len(behavior_gate.get("weak_positive_paper_ids") or []),
+            "stable_negative_paper_count": len(behavior_gate.get("stable_negative_paper_ids") or []),
+            "weak_negative_paper_count": len(behavior_gate.get("weak_negative_paper_ids") or []),
+            "positive_min_topic_source_papers": behavior_gate.get("positive_min_topic_source_papers"),
+            "negative_min_topic_source_papers": behavior_gate.get("negative_min_topic_source_papers"),
+            "skipped_positive_papers": list(behavior_gate.get("skipped_positive_papers") or []),
+            "skipped_negative_papers": list(behavior_gate.get("skipped_negative_papers") or []),
+            "filtered_topics": list(behavior_gate.get("filtered_topics") or []),
+        }
 
     @staticmethod
     def _empty_topic_evidence(label: str) -> Dict[str, Any]:
@@ -503,6 +662,18 @@ class ProfileAggregator:
             if text and text not in merged:
                 merged.append(text)
         return merged
+
+    @staticmethod
+    def _paper_id(paper: Dict[str, Any]) -> str:
+        return str((paper or {}).get("arxiv_id") or (paper or {}).get("id") or "").strip()
+
+    @staticmethod
+    def _coerce_positive_int(value: Any, *, default: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(1, parsed)
 
     @staticmethod
     def _add_categories(scores: Counter[str], values: Any, weight: float) -> None:

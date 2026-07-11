@@ -6,7 +6,7 @@ import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from services.context_merge import merge_backend_authoritative_context
 from services.memory.memory_debug import build_memory_debug_payload
@@ -34,7 +34,7 @@ from services.storage.sqlite.stores import (
     ResearchProfileStore,
     UserPreferenceStore,
 )
-from utils.config import PROFILE_EVIDENCE_CONFIG, get_default_user_id
+from utils.config import PROFILE_EVIDENCE_CONFIG, get_default_user_id, get_recommendation_runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +82,7 @@ class MemoryService:
         research_profile_store: ResearchProfileStore,
         agent_session_store: AgentSessionStore,
         generation_service: Optional[Any] = None,
+        interest_model_refresher: Optional[Callable[[str], Any]] = None,
     ):
         """初始化记忆服务，并注入底层数据库访问依赖。"""
         self.paper_catalog_store = paper_catalog_store
@@ -101,6 +102,8 @@ class MemoryService:
         self.profile_aggregator = ProfileAggregator(concept_normalizer=self.profile_generator.concept_normalizer)
         self.profile_reviewer = ProfileReviewer()
         self.paper_evidence_extractor = PaperEvidenceExtractor(generation_service=generation_service)
+        # 行为画像只消费推荐层兴趣模型；通过回调注入可避免 MemoryService 直接依赖推荐服务实例。
+        self.interest_model_refresher = interest_model_refresher
 
     @staticmethod
     def _resolve_user_id(user_id: Optional[str] = None) -> str:
@@ -1041,6 +1044,202 @@ class MemoryService:
             "profile_event_counts": event_counts,
         }
 
+    def _behavior_profile_gate_config(self) -> Dict[str, Any]:
+        recommendation_config = get_recommendation_runtime_config()
+        profile_config = recommendation_config.get("profile") if isinstance(recommendation_config.get("profile"), dict) else {}
+        positive_config = profile_config.get("positive") if isinstance(profile_config.get("positive"), dict) else {}
+        negative_config = profile_config.get("negative") if isinstance(profile_config.get("negative"), dict) else {}
+
+        def _int_config(source: Dict[str, Any], key: str, default: int) -> int:
+            try:
+                value = int(source.get(key, default))
+            except (TypeError, ValueError):
+                value = default
+            return max(1, value)
+
+        return {
+            # 这些阈值只约束自动行为画像，不回写推荐层 HDBSCAN 参数，避免第一阶段改变推荐召回语义。
+            "positive_min_cluster_paper_count": _int_config(positive_config, "min_cluster_paper_count_for_profile", 2),
+            "positive_min_topic_source_papers": _int_config(positive_config, "min_topic_source_papers_for_profile", 2),
+            "negative_min_cluster_paper_count": _int_config(negative_config, "min_cluster_paper_count_for_profile", 2),
+            "negative_min_topic_source_papers": _int_config(negative_config, "min_topic_source_papers_for_profile", 2),
+        }
+
+    def _refresh_behavior_interest_model(
+        self,
+        user_id: str,
+        evidence: Dict[str, Any],
+        metrics: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        gate_config = self._behavior_profile_gate_config()
+        refresh_status = "not_configured"
+        refresh_error = ""
+        refresh_result: Dict[str, Any] = {}
+        if callable(self.interest_model_refresher):
+            try:
+                # 画像构建前强制刷新推荐层兴趣模型，确保 HDBSCAN 离群点和向量回填结果先被物化。
+                raw_result = self.interest_model_refresher(user_id)
+                refresh_result = raw_result if isinstance(raw_result, dict) else {"result": raw_result}
+                refresh_status = "refreshed"
+            except Exception as exc:
+                refresh_status = "refresh_failed"
+                refresh_error = str(exc)
+                logger.exception("Behavior interest model refresh failed user_id=%s", user_id)
+
+        interest_vector = self.interest_vector_store.get_user_interest_vector(user_id=user_id) or {}
+        model = self._build_behavior_interest_model(
+            evidence=evidence,
+            interest_vector=interest_vector,
+            gate_config=gate_config,
+            refresh_status=refresh_status,
+            refresh_error=refresh_error,
+            refresh_result=refresh_result,
+        )
+        metrics["behavior_profile_gating"] = self._summarize_behavior_interest_model(model)
+        logger.info(
+            "Behavior profile gating user_id=%s status=%s stable_positive=%s weak_positive=%s stable_negative=%s weak_negative=%s refresh=%s",
+            user_id,
+            model.get("status"),
+            len(model.get("stable_positive_paper_ids") or []),
+            len(model.get("weak_positive_paper_ids") or []),
+            len(model.get("stable_negative_paper_ids") or []),
+            len(model.get("weak_negative_paper_ids") or []),
+            refresh_status,
+        )
+        return model
+
+    def _build_behavior_interest_model(
+        self,
+        *,
+        evidence: Dict[str, Any],
+        interest_vector: Dict[str, Any],
+        gate_config: Dict[str, Any],
+        refresh_status: str,
+        refresh_error: str,
+        refresh_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        liked_ids = self._paper_ids_from_items(evidence.get("liked_papers"))
+        disliked_ids = self._paper_ids_from_items(evidence.get("disliked_papers"))
+        stable_positive_clusters = self._stable_interest_clusters(
+            interest_vector.get("interest_clusters") or [],
+            min_paper_count=int(gate_config["positive_min_cluster_paper_count"]),
+        )
+        stable_negative_clusters = self._stable_interest_clusters(
+            ((interest_vector.get("negative_feedback_profile") or {}).get("clusters") or []),
+            min_paper_count=int(gate_config["negative_min_cluster_paper_count"]),
+        )
+        stable_positive_ids = self._merge_unique_ids([paper_id for cluster in stable_positive_clusters for paper_id in cluster.get("paper_ids") or []])
+        stable_negative_ids = self._merge_unique_ids([paper_id for cluster in stable_negative_clusters for paper_id in cluster.get("paper_ids") or []])
+        weak_pool_ids = self._paper_ids_from_items((interest_vector.get("weak_interest_pool") or {}).get("paper_ids") or [])
+        weak_positive_ids = self._merge_unique_ids([*weak_pool_ids, *[paper_id for paper_id in liked_ids if paper_id not in stable_positive_ids]])
+        weak_negative_ids = self._merge_unique_ids([paper_id for paper_id in disliked_ids if paper_id not in stable_negative_ids])
+
+        if not liked_ids and not disliked_ids:
+            status = "empty"
+        elif refresh_status == "refresh_failed":
+            status = "refresh_failed"
+        elif not interest_vector:
+            status = "unavailable"
+        elif stable_positive_ids or stable_negative_ids:
+            status = "stable"
+        elif weak_positive_ids or weak_negative_ids:
+            status = "weak_only"
+        else:
+            status = "insufficient"
+
+        return {
+            "status": status,
+            "refresh_status": refresh_status,
+            "refresh_error": refresh_error,
+            "refresh_result": refresh_result,
+            "profile_mode": str(interest_vector.get("profile_mode") or "").strip(),
+            "updated_at": interest_vector.get("updated_at"),
+            "stable_positive_clusters": stable_positive_clusters,
+            "stable_positive_paper_ids": stable_positive_ids,
+            "weak_positive_paper_ids": weak_positive_ids,
+            "unresolved_positive_paper_ids": [],
+            "stable_negative_clusters": stable_negative_clusters,
+            "stable_negative_paper_ids": stable_negative_ids,
+            "weak_negative_paper_ids": weak_negative_ids,
+            "unresolved_negative_paper_ids": [],
+            "profile_gating": gate_config,
+        }
+
+    def _stable_interest_clusters(self, clusters: Any, *, min_paper_count: int) -> List[Dict[str, Any]]:
+        stable_clusters: List[Dict[str, Any]] = []
+        for cluster in clusters or []:
+            if not isinstance(cluster, dict):
+                continue
+            paper_ids = self._paper_ids_from_items(cluster.get("paper_ids") or [])
+            if len(paper_ids) < min_paper_count:
+                continue
+            stable_clusters.append(
+                {
+                    "cluster_id": cluster.get("cluster_id"),
+                    "paper_count": len(paper_ids),
+                    "paper_ids": paper_ids,
+                    "labels": list(cluster.get("labels") or cluster.get("topics") or [])[:5],
+                }
+            )
+        return stable_clusters
+
+    @staticmethod
+    def _paper_ids_from_items(items: Any) -> List[str]:
+        ids: List[str] = []
+        for item in items or []:
+            if isinstance(item, dict):
+                paper_id = str(item.get("arxiv_id") or item.get("id") or item.get("paper_id") or "").strip()
+            else:
+                paper_id = str(item or "").strip()
+            if paper_id and paper_id not in ids:
+                ids.append(paper_id)
+        return ids
+
+    @staticmethod
+    def _merge_unique_ids(values: List[str]) -> List[str]:
+        merged: List[str] = []
+        for value in values:
+            text = str(value or "").strip()
+            if text and text not in merged:
+                merged.append(text)
+        return merged
+
+    @staticmethod
+    def _summarize_behavior_interest_model(model: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "status": model.get("status"),
+            "refresh_status": model.get("refresh_status"),
+            "refresh_error": model.get("refresh_error"),
+            "profile_mode": model.get("profile_mode"),
+            "updated_at": model.get("updated_at"),
+            "stable_positive_cluster_count": len(model.get("stable_positive_clusters") or []),
+            "stable_positive_paper_count": len(model.get("stable_positive_paper_ids") or []),
+            "weak_positive_paper_count": len(model.get("weak_positive_paper_ids") or []),
+            "unresolved_positive_paper_count": len(model.get("unresolved_positive_paper_ids") or []),
+            "stable_negative_cluster_count": len(model.get("stable_negative_clusters") or []),
+            "stable_negative_paper_count": len(model.get("stable_negative_paper_ids") or []),
+            "weak_negative_paper_count": len(model.get("weak_negative_paper_ids") or []),
+            "unresolved_negative_paper_count": len(model.get("unresolved_negative_paper_ids") or []),
+            "skipped_positive_papers": list(model.get("weak_positive_paper_ids") or []),
+            "skipped_negative_papers": list(model.get("weak_negative_paper_ids") or []),
+            "profile_gating": dict(model.get("profile_gating") or {}),
+        }
+
+    @staticmethod
+    def _behavior_gating_quality_issues(gating_summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+        weak_count = int(gating_summary.get("weak_positive_paper_count") or 0) + int(gating_summary.get("weak_negative_paper_count") or 0)
+        stable_count = int(gating_summary.get("stable_positive_paper_count") or 0) + int(gating_summary.get("stable_negative_paper_count") or 0)
+        if weak_count <= 0 or stable_count > 0:
+            return []
+        return [
+            {
+                "code": "insufficient_stable_interest_evidence",
+                "severity": "info",
+                "message": "行为信号尚未形成稳定兴趣簇，本次不会升级为长期画像主题。",
+                "weak_paper_count": weak_count,
+            }
+        ]
+
     def _build_profile_quality_report(self, profile: Dict[str, Any], evidence_summary: Dict[str, Any]) -> Dict[str, Any]:
         """记录重建质量的轻量报告，后续排查空画像或脏值过滤时能看到原因边界。"""
         return {
@@ -1055,6 +1254,7 @@ class MemoryService:
                 or evidence_summary.get("recent_action_count")
                 or evidence_summary.get("profile_note_count")
             ),
+            "behavior_profile_gating": evidence_summary.get("behavior_profile_gating") or {},
         }
 
     @staticmethod
@@ -1062,7 +1262,8 @@ class MemoryService:
         """按阶段映射粗粒度百分比，避免长时间停在 collect_evidence 造成前端误判卡死。"""
         stage_ranges = {
             "collect_evidence": (0, 10),
-            "prepare_papers": (10, 15),
+            "refresh_interest_model": (10, 12),
+            "prepare_papers": (12, 15),
             "extract_paper_evidence": (15, 75),
             "aggregate_profile": (75, 85),
             "normalize_topics": (85, 88),
@@ -1191,6 +1392,29 @@ class MemoryService:
         event = paper.get("_profile_event") if isinstance(paper.get("_profile_event"), dict) else {}
         return self._is_strong_profile_event(str(event.get("event_type") or event.get("action_type") or ""))
 
+    def _paper_allows_profile_evidence_generation(self, evidence: Dict[str, Any], paper: Dict[str, Any]) -> bool:
+        interest_model = evidence.get("interest_model") if isinstance(evidence.get("interest_model"), dict) else None
+        if not interest_model:
+            return self._paper_has_strong_profile_signal(paper)
+        arxiv_id = str(paper.get("arxiv_id") or paper.get("id") or "").strip()
+        action_types = {
+            str(item or "").strip().lower()
+            for item in paper.get("_profile_action_types") or []
+            if str(item or "").strip()
+        }
+        event = paper.get("_profile_event") if isinstance(paper.get("_profile_event"), dict) else {}
+        event_type = str(event.get("event_type") or event.get("action_type") or "").strip().lower()
+        if event_type:
+            action_types.add(event_type)
+        if action_types & {"note_saved", "qa_asked"}:
+            # 笔记和论文问答是用户额外投入的语义证据，可以补充 evidence card；是否进入长期 topic 仍由聚合门控决定。
+            return True
+        stable_ids = {
+            *[str(item or "").strip() for item in interest_model.get("stable_positive_paper_ids") or []],
+            *[str(item or "").strip() for item in interest_model.get("stable_negative_paper_ids") or []],
+        }
+        return bool(arxiv_id and arxiv_id in stable_ids)
+
     def _assign_profile_evidence_cards(self, evidence: Dict[str, Any], cards_by_id: Dict[str, Dict[str, Any]]) -> None:
         """把唯一论文生成出的 card 回填到所有证据引用，保证聚合器读取到一致的论文语义证据。"""
         for paper in self._iter_profile_evidence_paper_refs(evidence):
@@ -1275,6 +1499,7 @@ class MemoryService:
         generation_candidates: List[Dict[str, Any]] = []
         can_persist = True
         skipped_weak_papers = 0
+        skipped_weak_interest_papers = 0
         skipped_failed_cache_papers = 0
         repair_candidate_count = 0
 
@@ -1293,6 +1518,12 @@ class MemoryService:
             needs_repair = bool(cached and not cached.get("schema_valid"))
             if needs_repair:
                 repair_candidate_count += 1
+            if build_mode == "incremental" and not self._paper_allows_profile_evidence_generation(evidence, paper):
+                if cached:
+                    cards_by_id[arxiv_id] = cached
+                    paper["evidence_card"] = cached
+                skipped_weak_interest_papers += 1
+                continue
             if build_mode == "incremental" and needs_repair and not paper.get("_profile_dirty"):
                 # 失败卡本身就是缓存；普通增量构建不反复重试历史失败，repair/full 才负责集中修复。
                 cards_by_id[arxiv_id] = cached
@@ -1327,14 +1558,15 @@ class MemoryService:
                 "failed_papers": 0,
                 "successful_papers": cached_papers,
                 "repair_candidate_papers": repair_candidate_count,
-                "skipped_paper_count": skipped_weak_papers + skipped_limit_papers + skipped_failed_cache_papers,
+                "skipped_paper_count": skipped_weak_papers + skipped_weak_interest_papers + skipped_limit_papers + skipped_failed_cache_papers,
                 "skipped_read_only_papers": skipped_weak_papers,
+                "skipped_weak_interest_papers": skipped_weak_interest_papers,
                 "skipped_failed_cache_papers": skipped_failed_cache_papers,
                 "skipped_limit_papers": skipped_limit_papers,
                 "cache_hit_count": cached_papers,
                 "generated_count": 0,
                 "failed_count": 0,
-                "skipped_count": skipped_weak_papers + skipped_limit_papers + skipped_failed_cache_papers,
+                "skipped_count": skipped_weak_papers + skipped_weak_interest_papers + skipped_limit_papers + skipped_failed_cache_papers,
                 "evidence_concurrency": evidence_concurrency if uncached_count else 0,
                 "rate_limit_backoff_count": 0,
                 "total_evidence_extraction_seconds": 0,
@@ -1353,10 +1585,11 @@ class MemoryService:
             job_id,
         )
         logger.info(
-            "Profile rebuild paper limit mode=%s limit=%s skipped_read_only=%s skipped_limit=%s repair_candidates=%s",
+            "Profile rebuild paper limit mode=%s limit=%s skipped_read_only=%s skipped_weak_interest=%s skipped_limit=%s repair_candidates=%s",
             build_mode,
             paper_limit,
             skipped_weak_papers,
+            skipped_weak_interest_papers,
             skipped_limit_papers,
             repair_candidate_count,
         )
@@ -1639,6 +1872,19 @@ class MemoryService:
                     f"跳过 {metrics['evidence_counts']['skipped_events']} 条，行为 {metrics['evidence_counts']['recent_actions']} 条"
                 ),
             )
+            interest_model = self._refresh_behavior_interest_model(resolved_user_id, evidence, metrics)
+            evidence["interest_model"] = interest_model
+            self._update_profile_build_job(
+                job_id,
+                metrics,
+                stage="refresh_interest_model",
+                progress=12,
+                stage_message=(
+                    f"已刷新行为兴趣模型：状态 {interest_model.get('status')}，"
+                    f"稳定正向 {len(interest_model.get('stable_positive_paper_ids') or [])} 篇，"
+                    f"弱正向 {len(interest_model.get('weak_positive_paper_ids') or [])} 篇"
+                ),
+            )
             metrics = self._upsert_paper_evidence_cards(evidence, job_id=job_id, metrics=metrics)
             if metrics.get("systemic_evidence_failure"):
                 error_message = "paper_evidence_systemic_failure: LLM 证据卡生成疑似整体不可用"
@@ -1684,6 +1930,7 @@ class MemoryService:
             review_result = self.profile_reviewer.review(generated_draft)
             generated = review_result["revised_profile"]
             evidence_summary = self._summarize_profile_evidence(evidence)
+            evidence_summary["behavior_profile_gating"] = self._summarize_behavior_interest_model(evidence.get("interest_model") or {})
             # snapshot 中保留最终统计，便于构建完成后回看缓存命中、失败论文和阶段日志。
             evidence_summary["build_metrics"] = {
                 key: value
@@ -1699,6 +1946,7 @@ class MemoryService:
                     "successful_papers",
                     "skipped_paper_count",
                     "skipped_read_only_papers",
+                    "skipped_weak_interest_papers",
                     "skipped_failed_cache_papers",
                     "skipped_limit_papers",
                     "repair_candidate_papers",
@@ -1715,6 +1963,7 @@ class MemoryService:
                     "paper_evidence_failures",
                     "paper_evidence_failure_details",
                     "evidence_counts",
+                    "behavior_profile_gating",
                     "recent_logs",
                 }
             }
@@ -1722,6 +1971,9 @@ class MemoryService:
                 **self._build_profile_quality_report(generated, evidence_summary),
                 **(review_result.get("quality_report") or {}),
             }
+            quality_report["behavior_profile_gating"] = evidence_summary.get("behavior_profile_gating") or {}
+            quality_issues = quality_report.setdefault("issues", [])
+            quality_issues.extend(self._behavior_gating_quality_issues(quality_report["behavior_profile_gating"]))
             if any(str(action.get("action_type") or "").strip().lower() == "read" for action in evidence.get("recent_actions") or []):
                 issues = quality_report.setdefault("issues", [])
                 if not any(issue.get("code") == "recent_topic_pollution" for issue in issues if isinstance(issue, dict)):

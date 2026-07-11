@@ -2,9 +2,9 @@
 
 ## 1. 总体结论
 
-当前后端 HTTP 入口统一从 [backend/main.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/main.py) 进入。`FastAPI` 应用在 `create_app()` 中创建，所有对外 API 都先挂到同一个 `app` 上，然后通过 `app.include_router(..., prefix="/api")` 统一加上全局前缀 `/api`。
+当前后端 HTTP 入口统一从 [backend/main.py](../backend/main.py) 进入。`FastAPI` 应用在 `create_app()` 中创建，所有对外 API 都先挂到同一个 `app` 上，然后通过 `app.include_router(..., prefix="/api")` 统一加上全局前缀 `/api`。
 
-也就是说，前端请求进入后端后，并不是先进入某个 service，而是先进入 `FastAPI app`，随后由 URL 路径匹配到对应 router。当前默认注册的正式入口 router 有 5 个：
+也就是说，前端请求进入后端后，并不是先进入某个 service，而是先进入 `FastAPI app`，随后由 URL 路径匹配到对应 router。当前默认注册的正式入口 router 有 5 个，另有 1 个本地调试 router 只在显式开启时注册：
 
 - `arxiv_router.py`：arXiv 搜索、字段、分类、下载、搜索并保存
 - `agent_router.py`：Agent 对话、流式对话、Graph 导出
@@ -24,7 +24,7 @@
 
 ### 2.1 FastAPI app 在哪里创建
 
-`FastAPI` 应用在 [backend/main.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/main.py) 的 `create_app(load_mode: str | None = None)` 中创建：
+`FastAPI` 应用在 [backend/main.py](../backend/main.py) 的 `create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None = None)` 中创建：
 
 - `resolved_load_mode = normalize_service_load_mode(load_mode)` 先解析服务加载模式
 - `app = FastAPI(lifespan=lifespan)` 创建应用
@@ -96,7 +96,7 @@
 
 - 没有使用旧式 `@app.on_event("startup")`
 - 没有看到自定义全局 HTTP 中间件
-- 依赖注入主要集中在 [backend/dependencies.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/dependencies.py)，router 通过 `Depends(...)` 获取 service 单例
+- 依赖注入主要集中在 [backend/dependencies.py](../backend/dependencies.py)，router 通过 `Depends(...)` 获取 service 单例
 
 ## 3. Router 总览表
 
@@ -715,17 +715,12 @@
 实际调用链路：
 
 - router 层进入 `run_arxiv_search_agent()` 或 `stream_arxiv_search_agent()`
-- service 层调用 `build_arxiv_search_graph()`
+- service 层通过 `_build_agent_graph()` 装配 LangGraph checkpointer 与业务 runtime checkpoint store，再调用 `build_arxiv_search_graph()`
 - Graph 定义在 `backend/agents/arxiv_search_agent/graph.py`
-- 当前主图很清晰：`parse_search_request -> run_agent_turn -> END`
-- `run_agent_turn` 内部会继续走：
-  - planner
-  - `PlanValidator`
-  - `PlanExecutor`
-  - replanner
-  - planner tool registry
+- 当前主图已经拆成可观察的多节点链路：`parse_search_request -> build_goal -> build_plan -> select_next_step -> execute_step -> observe_step -> replan/finalize`
+- `build_plan` 负责 planner 与 `PlanValidator`，`execute_step` 负责 `PlanExecutor` 工具执行，`observe_step` 和 `replan` 负责观察、失败分类与有界重规划
 - 图执行框架是 `LangGraph`
-- Graph 的 checkpoint 默认用 `InMemorySaver`
+- 正式服务路径会注入 SQLite-backed LangGraph checkpoint，并同时维护业务 runtime checkpoint；只有测试桩或显式内存模式才会退回轻量实现
 
 是否会进入 `agents/arxiv_search_agent`：
 
@@ -998,25 +993,25 @@ flowchart TD
 
 如果你接下来想继续回答“请求进入 router 之后，真正怎么跑起来”，建议优先继续读下面这些 service：
 
-1. [backend/services/paper_qa/paper_qa_service.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/services/paper_qa/paper_qa_service.py)
+1. [backend/services/paper_qa/paper_qa_service.py](../backend/services/paper_qa/paper_qa_service.py)
    - 这是论文 QA 主入口
 
-2. [backend/services/retrieval/retrieval_pipeline.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/services/retrieval/retrieval_pipeline.py)
+2. [backend/services/retrieval/retrieval_pipeline.py](../backend/services/retrieval/retrieval_pipeline.py)
    - 这是 retrieval workflow 的关键编排实现
 
-3. [backend/services/retrieval/enhanced_retrieval_service.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/services/retrieval/enhanced_retrieval_service.py)
+3. [backend/services/retrieval/enhanced_retrieval_service.py](../backend/services/retrieval/enhanced_retrieval_service.py)
    - 这是检索依赖装配与 public facade，主逻辑不在这里扩展
 
-4. [backend/services/recommendation/recommendation_service.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/services/recommendation/recommendation_service.py)
+4. [backend/services/recommendation/recommendation_service.py](../backend/services/recommendation/recommendation_service.py)
    - 这是推荐链路主入口
 
-4. [backend/services/recommendation/candidate_materializer.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/services/recommendation/candidate_materializer.py)
+5. [backend/services/recommendation/candidate_materializer.py](../backend/services/recommendation/candidate_materializer.py)
    - 这里藏着论文物化、回源 arXiv、偏好动作落地等关键逻辑
 
-5. [backend/agents/arxiv_search_agent/service.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/agents/arxiv_search_agent/service.py)
+6. [backend/agents/arxiv_search_agent/service.py](../backend/agents/arxiv_search_agent/service.py)
    - 这是 Agent 的运行时入口
 
-6. [backend/agents/arxiv_search_agent/graph.py](/D:/极客时间大模型RAG进阶实战营/rag-project01-framework/backend/agents/arxiv_search_agent/graph.py)
+7. [backend/agents/arxiv_search_agent/graph.py](../backend/agents/arxiv_search_agent/graph.py)
    - 这是 Agent graph 主图入口
 
 ### 8.6 本轮阅读里的“待确认”点

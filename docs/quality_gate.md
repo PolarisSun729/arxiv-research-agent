@@ -127,7 +127,7 @@ python scripts/check_quality.py doctor
 显式运行环境体检 full：
 
 ```bash
-python scripts/check_quality.py doctor-full
+python scripts/doctor.py full
 ```
 
 只跑某个具体阶段：
@@ -141,7 +141,7 @@ python scripts/check_quality.py frontend-tests
 python scripts/check_quality.py frontend-build
 ```
 
-环境体检分为默认 basic 和显式 full 两层。`python scripts/check_quality.py` 会运行 basic doctor，但不会自动运行 full doctor，也不会因为 Milvus、arXiv、LLM、Embedding 或 rerank 服务不可用而失败。doctor 的完整说明见 [`docs/doctor.md`](doctor.md)，CI 说明见 [`docs/ci_quality_gate.md`](ci_quality_gate.md)。
+环境体检分为默认 basic 和显式 full 两层。`python scripts/check_quality.py` 会运行 basic doctor，但不会自动运行 full doctor，也不会因为 Milvus、arXiv、LLM、Embedding 或 rerank 服务不可用而失败。full doctor 请直接运行 `python scripts/doctor.py full`，避免质量门和 CI 误触发真实外部连接。doctor 的完整说明见 [`docs/doctor.md`](doctor.md)，CI 说明见 [`docs/ci_quality_gate.md`](ci_quality_gate.md)。
 
 Codex 修改代码后的统一验收口径见 [`docs/codex_acceptance.md`](codex_acceptance.md)。最终回复需要列出实际运行的检查、通过/失败结果，以及未运行完整门禁时的原因。
 

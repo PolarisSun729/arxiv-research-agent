@@ -24,7 +24,8 @@ REPO_ROOT = BASE_DIR.parent.parent
 CORE_CONFIG = {
     "arxiv_data_source": "local",
     "arxiv_proxy_url": "http://127.0.0.1:7897",
-    "service_load_mode": "lazy",  # lazy | preload
+    # 与真实运行默认值保持一致；本地开发想缩短启动时间时再通过环境变量改为 lazy。
+    "service_load_mode": "preload",  # lazy | preload
 }
 
 
@@ -157,6 +158,8 @@ RECOMMENDATION_PROFILE_CONFIG = {
         "min_liked_for_vector": 1,
         "min_liked_for_clustering": 4,
         "max_interest_clusters": 4,
+        "min_cluster_paper_count_for_profile": 2,
+        "min_topic_source_papers_for_profile": 2,
         "clustering": {
             "min_cluster_size": 2,
             "min_samples": 1,
@@ -173,6 +176,8 @@ RECOMMENDATION_PROFILE_CONFIG = {
         "enable_negative_clustering": True,
         "min_disliked_for_clustering": 4,
         "max_negative_clusters": 4,
+        "min_cluster_paper_count_for_profile": 2,
+        "min_topic_source_papers_for_profile": 2,
         "clustering": {
             "min_cluster_size": 2,
             "min_samples": 1,

@@ -58,6 +58,73 @@ class FakeEvidenceGenerationService:
         }, ensure_ascii=False)
 
 
+class FakeInterestModelRefresher:
+    def __init__(self, storage, *, stable_positive_ids=None, weak_positive_ids=None, stable_negative_ids=None, weak_negative_ids=None):
+        self.storage = storage
+        self.stable_positive_ids = stable_positive_ids
+        self.weak_positive_ids = weak_positive_ids
+        self.stable_negative_ids = stable_negative_ids
+        self.weak_negative_ids = weak_negative_ids
+        self.call_count = 0
+
+    def __call__(self, user_id: str):
+        self.call_count += 1
+        liked_ids = self.storage.user_preferences.get_liked_papers(user_id)
+        disliked_ids = self.storage.user_preferences.get_disliked_papers(user_id)
+        stable_positive_ids = list(self.stable_positive_ids) if self.stable_positive_ids is not None else (liked_ids if len(liked_ids) >= 2 else [])
+        weak_positive_ids = list(self.weak_positive_ids) if self.weak_positive_ids is not None else [item for item in liked_ids if item not in stable_positive_ids]
+        stable_negative_ids = list(self.stable_negative_ids) if self.stable_negative_ids is not None else (disliked_ids if len(disliked_ids) >= 2 else [])
+        weak_negative_ids = list(self.weak_negative_ids) if self.weak_negative_ids is not None else [item for item in disliked_ids if item not in stable_negative_ids]
+        interest_clusters = [
+            {
+                "cluster_id": "cluster_0",
+                "paper_count": len(stable_positive_ids),
+                "paper_ids": stable_positive_ids,
+                "centroid_vector": [1.0, 0.0, 0.0],
+            }
+        ] if stable_positive_ids else []
+        weak_interest_pool = {
+            "pool_id": "weak_interest_pool",
+            "paper_count": len(weak_positive_ids),
+            "paper_ids": weak_positive_ids,
+            "centroid_vector": [0.0, 1.0, 0.0],
+        } if weak_positive_ids else None
+        negative_feedback_profile = {
+            "version": "negative_feedback_profile_v1",
+            "enabled": True,
+            "mode": "clustered" if stable_negative_ids else ("examples" if weak_negative_ids else "none"),
+            "hard_exclude_ids": disliked_ids,
+            "examples": [{"arxiv_id": item} for item in disliked_ids],
+            "clusters": [
+                {
+                    "cluster_id": "negative_cluster_0",
+                    "paper_count": len(stable_negative_ids),
+                    "paper_ids": stable_negative_ids,
+                    "centroid_vector": [0.0, 0.0, 1.0],
+                }
+            ] if stable_negative_ids else [],
+            "stats": {
+                "total_disliked": len(disliked_ids),
+                "usable_disliked": len(disliked_ids),
+                "unresolved_disliked": 0,
+                "negative_cluster_count": 1 if stable_negative_ids else 0,
+            },
+        }
+        self.storage.interest_vectors.save_user_interest_vector(
+            user_id=user_id,
+            vector_data=[1.0, 0.0, 0.0],
+            paper_count=len(liked_ids),
+            embedding_model="fake-model",
+            vector_dimension=3,
+            cluster_count=len(interest_clusters),
+            profile_mode="clustered" if interest_clusters else ("mean_with_weak_pool" if weak_interest_pool else "mean"),
+            interest_clusters=interest_clusters,
+            weak_interest_pool=weak_interest_pool,
+            negative_feedback_profile=negative_feedback_profile,
+        )
+        return {"status": "success", "cluster_count": len(interest_clusters)}
+
+
 class MemoryServiceIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.storage = build_storage_container()
@@ -74,7 +141,9 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         if temp_db is not None:
             temp_db.cleanup()
 
-    def _make_memory_service(self, *, generation_service=None) -> MemoryService:
+    def _make_memory_service(self, *, generation_service=None, interest_model_refresher=None) -> MemoryService:
+        if interest_model_refresher is None:
+            interest_model_refresher = FakeInterestModelRefresher(self.storage)
         return MemoryService(
             paper_catalog_store=self.storage.paper_catalog,
             user_preference_store=self.storage.user_preferences,
@@ -88,6 +157,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
             research_profile_store=self.storage.research_profiles,
             agent_session_store=self.storage.agent_sessions,
             generation_service=generation_service,
+            interest_model_refresher=interest_model_refresher,
         )
 
     def _add_paper(self, arxiv_id: str, *, title: str = "Test Paper", categories=None) -> None:
@@ -282,15 +352,15 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
 
         self.assertEqual(immediate_profile["positive_topics"], [])
         self.assertEqual(len(events), 1)
-        self.assertIn("RAG retrieval optimization", profile["positive_topics"])
-        self.assertIn("agent memory", profile["recent_topics"])
+        self.assertEqual(profile["positive_topics"], [])
+        self.assertEqual(profile["recent_topics"], [])
         self.assertNotIn("cs.CL", profile["positive_topics"])
         self.assertNotIn("cs.AI", profile["recent_topics"])
         self.assertNotIn("A Complete Paper Title That Should Not Become A Topic", profile["positive_topics"])
         self.assertNotIn("method", profile["positive_topics"])
-        self.assertIn("cs.CL", profile["preferred_categories"])
-        self.assertIn("cs.AI", profile["preferred_categories"])
-        self.assertIn(self.arxiv_id, profile["representative_papers"])
+        self.assertEqual(profile["preferred_categories"], [])
+        self.assertNotIn(self.arxiv_id, profile["representative_papers"])
+        self.assertIn("insufficient_stable_interest_evidence", {issue["code"] for issue in profile["quality_report"]["issues"]})
 
     def test_like_paper_without_explicit_topics_only_updates_category_and_representative_paper(self) -> None:
         self.memory_service.update_profile_from_preference(
@@ -307,9 +377,52 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
 
         self.assertEqual(profile["positive_topics"], [])
         self.assertEqual(profile["recent_topics"], [])
-        self.assertIn("cs.CL", profile["preferred_categories"])
-        self.assertIn("cs.LG", profile["preferred_categories"])
-        self.assertIn("2401.00002", profile["representative_papers"])
+        self.assertEqual(profile["preferred_categories"], [])
+        self.assertNotIn("2401.00002", profile["representative_papers"])
+
+    def test_single_liked_paper_is_gated_as_weak_behavior_profile_evidence(self) -> None:
+        fake_llm = FakeEvidenceGenerationService()
+        refresher = FakeInterestModelRefresher(self.storage, stable_positive_ids=[], weak_positive_ids=[self.arxiv_id])
+        service = self._make_memory_service(generation_service=fake_llm, interest_model_refresher=refresher)
+        self.storage.user_preferences.add_liked_paper(self.user_id, self.arxiv_id)
+
+        profile = service.rebuild_user_research_profile(self.user_id)
+        latest_job = service.list_profile_build_jobs(self.user_id, limit=1)[0]
+        gating = profile["quality_report"]["behavior_profile_gating"]
+
+        self.assertEqual(refresher.call_count, 1)
+        self.assertEqual(fake_llm.call_count, 0)
+        self.assertEqual(profile["positive_topics"], [])
+        self.assertEqual(gating["weak_positive_paper_count"], 1)
+        self.assertIn(self.arxiv_id, gating["skipped_positive_papers"])
+        self.assertEqual(latest_job["metrics"]["behavior_profile_gating"]["weak_positive_paper_count"], 1)
+        self.assertIsNone(self.storage.paper_profile_evidence.get_paper_profile_evidence(self.arxiv_id))
+        self.assertIn("insufficient_stable_interest_evidence", {issue["code"] for issue in profile["quality_report"]["issues"]})
+
+    def test_stable_interest_cluster_triggers_evidence_and_profile_topics(self) -> None:
+        self._add_paper(
+            "2401.01001",
+            title="Hybrid Retrieval and Reranking for Long-Context Agents",
+            categories=["cs.CL"],
+        )
+        self._add_paper(
+            "2401.01002",
+            title="Hybrid Retrieval and Reranking for Research Agents",
+            categories=["cs.CL"],
+        )
+        fake_llm = FakeEvidenceGenerationService()
+        service = self._make_memory_service(generation_service=fake_llm)
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.01001")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.01002")
+
+        profile = service.rebuild_user_research_profile(self.user_id)
+        gating = profile["quality_report"]["behavior_profile_gating"]
+
+        self.assertEqual(fake_llm.call_count, 2)
+        self.assertIn("RAG retrieval optimization", profile["positive_topics"])
+        self.assertEqual(gating["stable_positive_paper_count"], 2)
+        self.assertEqual(gating["weak_positive_paper_count"], 0)
+        self.assertEqual(gating["skipped_positive_papers"], [])
 
     def test_dislike_paper_does_not_store_categories_or_titles_as_negative_topics(self) -> None:
         self.memory_service.update_profile_from_preference(
@@ -326,10 +439,11 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         )
         profile = self.memory_service.rebuild_user_research_profile(self.user_id)
 
-        self.assertIn("vision-only generation", profile["negative_topics"])
+        self.assertEqual(profile["negative_topics"], [])
         self.assertNotIn("cs.CL", profile["negative_topics"])
         self.assertNotIn("Another Full Paper Title That Should Stay Out", profile["negative_topics"])
         self.assertNotIn("framework", profile["negative_topics"])
+        self.assertEqual(profile["quality_report"]["behavior_profile_gating"]["weak_negative_paper_count"], 1)
 
     def test_generate_user_research_profile_summarizes_behavior_evidence(self) -> None:
         self._add_paper(
@@ -408,6 +522,17 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00013",
             }
         )
+        self.storage.paper_catalog.add_paper(
+            {
+                "arxiv_id": "2401.00015",
+                "title": "Diffusion Models for Visual Synthesis",
+                "authors": ["Alice"],
+                "abstract": "Diffusion models focus on text-to-image visual generation and image synthesis.",
+                "categories": ["cs.CV"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.00015",
+            }
+        )
         self.storage.research_profiles.upsert_user_research_profile(
             self.user_id,
             {"preferred_answer_style": "concise", "common_question_types": ["summary"]},
@@ -415,6 +540,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         for arxiv_id in ("2401.00010", "2401.00011", "2401.00012"):
             self.storage.user_preferences.add_liked_paper(self.user_id, arxiv_id)
         self.storage.user_preferences.add_disliked_paper(self.user_id, "2401.00013")
+        self.storage.user_preferences.add_disliked_paper(self.user_id, "2401.00015")
         self.storage.user_preferences.record_user_paper_action(self.user_id, "2401.00014", "favorite")
         self.storage.paper_notes.create_paper_note(
             user_id=self.user_id,
@@ -499,6 +625,28 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00111",
             }
         )
+        self.storage.paper_catalog.add_paper(
+            {
+                "arxiv_id": "2401.00112",
+                "title": "Hybrid Retrieval and Reranking for Research Agents",
+                "authors": ["Alice"],
+                "abstract": "Retrieval-augmented generation improves hybrid retrieval and long context reasoning for agents.",
+                "categories": ["cs.CL", "cs.AI"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.00112",
+            }
+        )
+        self.storage.paper_catalog.add_paper(
+            {
+                "arxiv_id": "2401.00113",
+                "title": "Diffusion Models for Visual Synthesis",
+                "authors": ["Alice"],
+                "abstract": "Diffusion models focus on text-to-image visual generation.",
+                "categories": ["cs.CV"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.00113",
+            }
+        )
         self.storage.research_profiles.upsert_user_research_profile(
             self.user_id,
             {
@@ -512,7 +660,9 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
             },
         )
         self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00110")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00112")
         self.storage.user_preferences.add_disliked_paper(self.user_id, "2401.00111")
+        self.storage.user_preferences.add_disliked_paper(self.user_id, "2401.00113")
 
         profile = self.memory_service.rebuild_user_research_profile(self.user_id)
         repeated = self.memory_service.rebuild_user_research_profile(self.user_id)
@@ -527,7 +677,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIn("cs.CL", profile["preferred_categories"])
         self.assertIn("cs.AI", profile["preferred_categories"])
         self.assertIn("cs.SE", profile["preferred_categories"])
-        self.assertEqual(profile["representative_papers"], ["2401.00110"])
+        self.assertIn("2401.00110", profile["representative_papers"])
         self.assertEqual(profile["preferred_answer_style"], "先结论后细节")
         self.assertEqual(profile["positive_topics"], repeated["positive_topics"])
         self.assertEqual(profile["representative_papers"], repeated["representative_papers"])
@@ -553,7 +703,19 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00210",
             }
         )
+        self.storage.paper_catalog.add_paper(
+            {
+                "arxiv_id": "2401.00211",
+                "title": "Hybrid Retrieval and Reranking for Research Agents",
+                "authors": ["Alice"],
+                "abstract": "Retrieval-augmented generation improves hybrid retrieval and reranking.",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.00211",
+            }
+        )
         self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00210")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00211")
 
         profile = self.memory_service.rebuild_user_research_profile(self.user_id)
         layers = self.memory_service.load_user_profile_layers(self.user_id)
@@ -575,8 +737,20 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00310",
             }
         )
+        self.storage.paper_catalog.add_paper(
+            {
+                "arxiv_id": "2401.00311",
+                "title": "Hybrid Retrieval and Reranking for Research Agents",
+                "authors": ["Alice"],
+                "abstract": "Retrieval-augmented generation improves hybrid retrieval and reranking.",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.00311",
+            }
+        )
         self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00310")
         self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00310")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00311")
         self.storage.user_preferences.record_user_paper_action(self.user_id, "2401.00310", "read")
 
         before_events = self.storage.profile_events.list_user_profile_events(self.user_id, include_consumed=True)
@@ -584,7 +758,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         profile = self.memory_service.rebuild_user_research_profile(self.user_id)
         after_events = self.storage.profile_events.list_user_profile_events(self.user_id, include_consumed=True)
 
-        self.assertEqual(len([event for event in before_events if event["event_type"] == "liked"]), 1)
+        self.assertEqual(len([event for event in before_events if event["event_type"] == "liked"]), 2)
         self.assertIn("RAG retrieval optimization", profile["positive_topics"])
         self.assertTrue(all(event["consumed_by_job_id"] for event in after_events))
         self.assertEqual(self.storage.profile_events.get_user_profile_dirty_event_count(self.user_id), 0)
@@ -669,13 +843,25 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00410",
             }
         )
+        self.storage.paper_catalog.add_paper(
+            {
+                "arxiv_id": "2401.00412",
+                "title": "Hybrid Retrieval and Reranking for Research Agents",
+                "authors": ["Alice"],
+                "abstract": "Retrieval-augmented generation improves hybrid retrieval and reranking.",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.00412",
+            }
+        )
         self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00410")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00412")
 
         profile = service.rebuild_user_research_profile(self.user_id)
         repeated = service.rebuild_user_research_profile(self.user_id)
         card = self.storage.paper_profile_evidence.get_paper_profile_evidence("2401.00410")
 
-        self.assertEqual(fake_llm.call_count, 1)
+        self.assertEqual(fake_llm.call_count, 2)
         self.assertTrue(card["schema_valid"])
         self.assertIn("RAG retrieval optimization", profile["positive_topics"])
         self.assertEqual(profile["positive_topics"], repeated["positive_topics"])
@@ -696,7 +882,19 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00411",
             }
         )
+        self.storage.paper_catalog.add_paper(
+            {
+                "arxiv_id": "2401.00413",
+                "title": "Hybrid Retrieval and Reranking Failure Case",
+                "authors": ["Alice"],
+                "abstract": "Retrieval augmented generation and hybrid retrieval are present but extractor output is invalid.",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.00413",
+            }
+        )
         self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00411")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00413")
 
         profile = service.rebuild_user_research_profile(self.user_id)
         card = self.storage.paper_profile_evidence.get_paper_profile_evidence("2401.00411")
@@ -740,7 +938,19 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "url": "https://arxiv.org/abs/2401.00420",
             }
         )
+        self.storage.paper_catalog.add_paper(
+            {
+                "arxiv_id": "2401.00421",
+                "title": "Memory-Augmented Agents",
+                "authors": ["Alice"],
+                "abstract": "LLM long-term memory and memory-augmented agents use graph-structured session memory.",
+                "categories": ["cs.AI"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.00421",
+            }
+        )
         self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00420")
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00421")
 
         profile = service.rebuild_user_research_profile(self.user_id)
         canonical = profile["canonical_topics"][0]

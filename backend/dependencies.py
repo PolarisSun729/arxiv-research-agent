@@ -164,6 +164,7 @@ def get_memory_service() -> MemoryService:
         research_profile_store=get_research_profile_store(),
         agent_session_store=get_agent_session_store(),
         generation_service=get_generation_service(),
+        interest_model_refresher=lambda user_id: get_recommendation_service().generate_user_interest_vector(user_id),
     )
 
 
