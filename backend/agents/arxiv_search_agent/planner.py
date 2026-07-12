@@ -313,8 +313,6 @@ def _build_context_refs(state: AgentState) -> List[str]:
         refs.append("selected_paper")
     if _get_user_memory_summary(context):
         refs.append("user_memory_summary")
-    if isinstance(state.pending_action, Mapping):
-        refs.append("pending_action")
     if isinstance(state.paper_qa_result, Mapping):
         refs.append("paper_qa_result")
     refs.extend(sorted(str(key) for key in context.keys()))
@@ -449,9 +447,7 @@ def build_plan_runtime(state: AgentState, *, goal: Goal, plan: ExecutablePlan, t
         trace=[],
         retry_counts={},
         replan_counts={},
-        # PlanRuntime.pending_confirmation 只保存标准 ConfirmationRequest。
-        # state.pending_action 是前端兼容展示镜像，不能反向当成可恢复的执行现场。
-        pending_confirmation=None,
+        interaction=None,
         final_answer=state.answer,
         turn_status=turn_status,  # type: ignore[arg-type]
     )

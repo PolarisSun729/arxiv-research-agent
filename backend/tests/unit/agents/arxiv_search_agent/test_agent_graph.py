@@ -7,8 +7,6 @@ from tests.helpers.agent_runtime import load_agent_test_modules
 _MODULES = load_agent_test_modules()
 AgentState = _MODULES["state_module"].AgentState
 schemas = _MODULES["schemas"]
-ConfirmationDecisionOption = schemas.ConfirmationDecisionOption
-ConfirmationRequest = schemas.ConfirmationRequest
 ExecutionTrace = schemas.ExecutionTrace
 ExecutablePlan = schemas.ExecutablePlan
 Goal = schemas.Goal
@@ -45,41 +43,6 @@ class AgentGraphFlowTests(unittest.TestCase):
         self.assertIn("finalize", graph._nodes)
         self.assertNotIn("run_agent_turn", graph._nodes)
         self.assertEqual(graph._conditional_edges["route_after_observation"][1]["replan"], "replan")
-
-    def test_confirmation_request_maps_to_tool_approval_pending_action(self) -> None:
-        confirmation = ConfirmationRequest(
-            step_id="parse_and_index_paper",
-            tool_name="parse_and_index_paper",
-            action_type="index",
-            side_effect_level="external_call",
-            reason="paper_index_missing",
-            title="确认是否解析论文",
-            description="需要先解析 PDF 并创建全文索引。",
-            arguments_summary={"paper_reference": {"arxiv_id": "2401.00001", "title": "RAG paper"}},
-            original_question="这篇论文的方法是什么？",
-            target_paper={"arxiv_id": "2401.00001", "title": "RAG paper"},
-            allowed_decisions=[
-                ConfirmationDecisionOption(code="approve", label="批准", description="继续执行当前工具操作"),
-                ConfirmationDecisionOption(code="reject", label="拒绝", description="取消当前工具操作"),
-            ],
-            session_id="s1",
-            thread_id="s1",
-            plan_id="plan-1",
-            trace_id="goal-1",
-        )
-        pending_action = graph_module._build_pending_action_mirror(
-            schemas.AgentTurnResult(
-                status="waiting_confirmation",
-                pending_confirmation=confirmation,
-                outputs={},
-                trace=[],
-            )
-        )
-
-        self.assertIsNotNone(pending_action)
-        self.assertEqual(pending_action["type"], "tool_approval")
-        self.assertEqual(pending_action["status"], "waiting_confirmation")
-        self.assertEqual(pending_action["allowed_decisions"], ["approve", "reject"])
 
     def test_running_plan_status_is_not_written_to_agent_step_status(self) -> None:
         state = AgentState(message="帮我找最近 7 天关于 RAG 的 5 篇论文")
@@ -251,105 +214,6 @@ class AgentGraphFlowTests(unittest.TestCase):
         graph_module._apply_turn_result(state, result)
 
         self.assertEqual([paper["arxiv_id"] for paper in state.papers], ["ranked-1", "ranked-2"])
-
-    def test_apply_turn_result_keeps_consumed_confirmation_result_but_clears_pending_snapshot(self) -> None:
-        state = AgentState(
-            intent="paper_qa",
-            message="approve",
-            pending_action={
-                "status": "approved",
-                "decision": "approve",
-                "step_id": "parse_and_index_paper",
-                "tool_name": "parse_and_index_paper",
-                "confirmation_consumed": True,
-            },
-            debug={
-                "pending_confirmation": {
-                    "step_id": "parse_and_index_paper",
-                    "tool_name": "parse_and_index_paper",
-                },
-                "confirmation_consumed": {
-                    "decision": "approve",
-                    "step_id": "parse_and_index_paper",
-                },
-            },
-            paper_qa_result={
-                "status": "waiting_confirmation",
-                "pending_confirmation": {
-                    "step_id": "parse_and_index_paper",
-                    "tool_name": "parse_and_index_paper",
-                },
-            },
-        )
-        runtime = PlanRuntime(
-            goal=Goal(goal_type="paper_qa"),
-            plan=ExecutablePlan(plan_id="paper_qa:test", goal=Goal(goal_type="paper_qa")),
-            trace=[ExecutionTrace(step_id="parse_and_index_paper", event="confirmation_consumed", status="pending")],
-        )
-        result = schemas.AgentTurnResult(
-            status="success",
-            final_answer="resume finished",
-            outputs={},
-            trace=list(runtime.trace),
-            runtime=runtime,
-        )
-
-        graph_module._apply_turn_result(state, result)
-
-        self.assertIsNotNone(state.pending_action)
-        self.assertEqual(state.pending_action["status"], "approved")
-        self.assertTrue(state.pending_action["confirmation_consumed"])
-        self.assertNotIn("pending_confirmation", state.debug)
-        self.assertEqual(state.debug["confirmation_consumed"]["decision"], "approve")
-        self.assertEqual(state.paper_qa_result["status"], "ready")
-        self.assertIsNone(state.paper_qa_result["pending_confirmation"])
-        self.assertTrue(state.paper_qa_result["confirmation_consumed"])
-
-    def test_apply_turn_result_marks_rejected_confirmation_snapshot_as_cancelled(self) -> None:
-        state = AgentState(
-            intent="paper_qa",
-            message="reject",
-            pending_action={
-                "status": "rejected",
-                "decision": "reject",
-                "step_id": "parse_and_index_paper",
-                "tool_name": "parse_and_index_paper",
-                "confirmation_consumed": True,
-            },
-            paper_qa_result={
-                "status": "waiting_confirmation",
-                "pending_confirmation": {
-                    "step_id": "parse_and_index_paper",
-                    "tool_name": "parse_and_index_paper",
-                },
-            },
-            debug={
-                "pending_confirmation": {
-                    "step_id": "parse_and_index_paper",
-                    "tool_name": "parse_and_index_paper",
-                },
-            },
-        )
-        runtime = PlanRuntime(
-            goal=Goal(goal_type="paper_qa"),
-            plan=ExecutablePlan(plan_id="paper_qa:test", goal=Goal(goal_type="paper_qa")),
-            trace=[ExecutionTrace(step_id="parse_and_index_paper", event="confirmation_consumed", status="skipped")],
-        )
-        result = schemas.AgentTurnResult(
-            status="success",
-            final_answer="cancelled",
-            outputs={},
-            trace=list(runtime.trace),
-            runtime=runtime,
-        )
-
-        graph_module._apply_turn_result(state, result)
-
-        self.assertEqual(state.paper_qa_result["status"], "cancelled")
-        self.assertIsNone(state.paper_qa_result["pending_confirmation"])
-        self.assertTrue(state.paper_qa_result["confirmation_consumed"])
-        self.assertEqual(state.paper_qa_result["confirmation_decision"], "reject")
-        self.assertNotIn("pending_confirmation", state.debug)
 
 
 if __name__ == "__main__":

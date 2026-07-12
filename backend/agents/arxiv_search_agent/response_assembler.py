@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
-from .schemas import ConfirmationRequest, PlanRuntime
+from .schemas import PlanRuntime
 
 
 def assemble_final_answer(runtime: PlanRuntime) -> Optional[str]:
@@ -25,26 +25,6 @@ def assemble_final_answer(runtime: PlanRuntime) -> Optional[str]:
     return _clean_text(runtime.final_answer)
 
 
-def record_confirmation_rejection(
-    runtime: PlanRuntime,
-    *,
-    confirmation_request: ConfirmationRequest,
-) -> None:
-    """把用户拒绝确认后的展示结果写入 outputs。
-
-    拒绝确认是调度状态流转，但面向用户的说明属于 response 装配职责；放在这里可以避免
-    PlanExecutor 根据具体工具名手写业务文案。
-    """
-    label = _target_label(confirmation_request)
-    if confirmation_request.tool_name == "parse_and_index_paper":
-        final_answer = f"已取消解析 {label}，因此无法继续基于全文回答。"
-    else:
-        action_label = _clean_text(confirmation_request.title) or _clean_text(confirmation_request.tool_name) or "当前操作"
-        final_answer = f"已取消{action_label}。"
-    runtime.outputs["final_answer"] = final_answer
-    runtime.final_answer = final_answer
-
-
 def record_recovery_fallback(
     runtime: PlanRuntime,
     *,
@@ -62,11 +42,6 @@ def record_recovery_fallback(
         runtime.outputs["fallback_record"] = dict(fallback_record)
     runtime.outputs["final_answer"] = _build_recovery_fallback_answer(runtime, reason)
     runtime.final_answer = runtime.outputs["final_answer"]
-
-
-def _target_label(confirmation_request: ConfirmationRequest) -> str:
-    target_paper = confirmation_request.target_paper if isinstance(confirmation_request.target_paper, Mapping) else {}
-    return _clean_text(target_paper.get("title")) or _clean_text(target_paper.get("arxiv_id")) or "该论文"
 
 
 def _clean_text(value: Any) -> Optional[str]:

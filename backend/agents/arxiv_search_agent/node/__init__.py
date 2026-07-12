@@ -34,8 +34,6 @@ from .intent_support import (
     _validation_error_summary,
 )
 from ..utils.state_utils import _coerce_state
-# 论文阅读类节点只保留兼容调用能力；主流程中的缺索引确认由 PlanExecutor + LangGraph interrupt 统一处理。
-from .paper_reading_node import handle_paper_reading_request
 # parse 节点：负责把自然语言请求收敛成结构化 intent 与 search_spec。
 from .parse_node import parse_search_request
 from .plan_node import plan_task
@@ -45,12 +43,10 @@ from .recommendation_node import (
     build_recommendation_tool_args,
     invoke_recommendation_tool,
 )
-# 偏好、回复、搜索等节点分别承担独立阶段的状态加工工作：
+# 偏好和搜索节点分别承担独立阶段的状态加工工作：
 # - preference_node 负责写入用户偏好；
-# - response_node 负责把状态收口成最终自然语言答复；
 # - search_node 负责真正的 arXiv 检索执行和结果重排。
 from .preference_node import apply_preference_action
-from .response_node import synthesize_response
 from .search_node import (
     SEARCH_TOOL_NAME,
     adapt_search_tool_result,
@@ -92,12 +88,10 @@ __all__ = [
     "build_search_tool_args",
     "check_search_result",
     "execute_tool",
-    "handle_paper_reading_request",
     "invoke_search_tool",
     "invoke_recommendation_tool",
     "parse_search_request",
     "plan_task",
     "personalized_rank_and_annotate_papers",
     "relax_search_for_retry",
-    "synthesize_response",
 ]

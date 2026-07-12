@@ -1,6 +1,6 @@
 from services.storage.sqlite.stores.agent_sessions import AgentSessionStore
 from services.storage.sqlite.stores.agent_runtime_checkpoints import AgentRuntimeCheckpointStore
-from services.storage.sqlite.stores.agent_qa_index_continuations import AgentQAIndexContinuationStore
+from services.storage.sqlite.stores.approval_grants import ApprovalGrantConflict, ApprovalGrantStore
 from services.storage.sqlite.stores.interest_vectors import InterestVectorStore
 from services.storage.sqlite.stores.langgraph_checkpoints import LangGraphCheckpointStore
 from services.storage.sqlite.stores.paper_catalog import PaperCatalogStore
@@ -18,7 +18,8 @@ from services.storage.sqlite.stores.user_preferences import UserPreferenceStore
 __all__ = [
     "AgentSessionStore",
     "AgentRuntimeCheckpointStore",
-    "AgentQAIndexContinuationStore",
+    "ApprovalGrantConflict",
+    "ApprovalGrantStore",
     "InterestVectorStore",
     "LangGraphCheckpointStore",
     "PaperCatalogStore",

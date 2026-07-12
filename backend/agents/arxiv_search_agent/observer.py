@@ -121,7 +121,7 @@ def _recovery_semantics(
 def _tool_recovery_types(suggested_recovery: Any, *, retryable: bool) -> List[RecoveryActionType]:
     """把 ToolError.suggested_recovery 映射到 Replanner 可识别的恢复动作。"""
     normalized = str(suggested_recovery or "").strip()
-    if normalized in {"ask_clarification", "request_confirmation", "fallback_answer", "abort_with_error", "retry_step"}:
+    if normalized in {"ask_clarification", "fallback_answer", "abort_with_error", "retry_step"}:
         return [normalized]  # type: ignore[list-item]
     if retryable:
         return ["retry_step"]
@@ -431,7 +431,7 @@ class Observer:
                 **_recovery_semantics(
                     failure_category="paper_index_stale",
                     severity="warning",
-                    suggested_recovery_types=["patch_plan", "request_confirmation", "fallback_answer"],
+                suggested_recovery_types=["patch_plan", "fallback_answer"],
                     evidence={
                         "index_status": status,
                         "has_last_good_index": bool(payload.get("last_good_index") or payload.get("last_good_index_id")),
@@ -445,10 +445,10 @@ class Observer:
                 status="need_confirmation",
                 reason="paper_index_missing",
                 confidence=0.9,
-                suggested_action="request_confirmation",
+                suggested_action="patch_plan",
                 **_recovery_semantics(
                     failure_category="paper_index_missing",
-                    suggested_recovery_types=["patch_plan", "request_confirmation"],
+                suggested_recovery_types=["patch_plan"],
                     evidence={"index_status": status, "has_index": has_index},
                     retryable=False,
                     requires_user_input=True,
@@ -463,19 +463,13 @@ class Observer:
                 **_recovery_semantics(
                     failure_category="paper_index_corrupted",
                     severity="error",
-                    suggested_recovery_types=["patch_plan", "request_confirmation"],
+                suggested_recovery_types=["patch_plan"],
                     evidence={"index_status": status},
                     retryable=False,
                     requires_user_input=True,
                 ),
             )
         return ObservationResult(status="partial_success", reason="paper_index_status_unknown", confidence=0.5)
-
-    def _observe_request_confirmation(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
-        del resolved_input, raw_output, normalized_output, runtime, state
-        # request_confirmation 在新的执行模型里只负责准备确认上下文；
-        # 真正的暂停点统一放在有副作用 step 的工具调用前，避免提前在“准备步骤”上打断并劫持恢复顺序。
-        return ObservationResult(status="success", reason="confirmation_already_available", confidence=1.0)
 
     def _observe_answer_paper_question(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
         del resolved_input, raw_output, state
@@ -604,7 +598,7 @@ class Observer:
                 failure_category = "paper_index_corrupted"
             recovery_types: List[RecoveryActionType] = ["retry_step", "fallback_answer"]
             if ASK_USER_TO_REBUILD_INDEX in repair_action_set:
-                recovery_types = ["patch_plan", "request_confirmation", "fallback_answer"]
+                recovery_types = ["patch_plan", "fallback_answer"]
             if ASK_CLARIFICATION in repair_action_set:
                 recovery_types.append("ask_clarification")
             return ObservationResult(

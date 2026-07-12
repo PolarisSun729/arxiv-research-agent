@@ -90,14 +90,26 @@ class FakeAgentStorageStore:
             "user_id": kwargs.get("user_id"),
             "session_id": session_id,
             "thread_id": kwargs.get("thread_id") or session_id,
-            "status": "waiting_confirmation",
-            "pending_confirmation": {"step_id": "parse_and_index_paper"},
+            "status": "waiting_interaction",
+            "interaction": {
+                "interaction_id": "interaction-1",
+                "kind": "side_effect_approval",
+                "status": "pending",
+                "plan_id": "plan-1",
+                "step_id": "parse_and_index_paper",
+                "payload": {
+                    "tool_name": "parse_and_index_paper",
+                    "action_type": "index",
+                    "reason": "paper_index_missing",
+                    "arguments_summary": {},
+                    "arguments_fingerprint": "fingerprint-1",
+                },
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "expires_at": "2026-01-01T00:10:00+00:00",
+            },
         }
 
     def mark_agent_runtime_checkpoint_status(self, **_kwargs: Any) -> bool:
-        return True
-
-    def consume_agent_runtime_pending_confirmation(self, **_kwargs: Any) -> bool:
         return True
 
     def expire_agent_runtime_checkpoints(self, **_kwargs: Any) -> int:
@@ -573,8 +585,6 @@ def load_agent_test_modules() -> Dict[str, Any]:
     search_node_module = _load_module("backend.agents.arxiv_search_agent.node.search_node", node_dir / "search_node.py")
     _load_module("backend.agents.arxiv_search_agent.node.recommendation_node", node_dir / "recommendation_node.py")
     _load_module("backend.agents.arxiv_search_agent.node.preference_node", node_dir / "preference_node.py")
-    _load_module("backend.agents.arxiv_search_agent.node.paper_reading_node", node_dir / "paper_reading_node.py")
-    _load_module("backend.agents.arxiv_search_agent.node.response_node", node_dir / "response_node.py")
     _load_module("backend.agents.arxiv_search_agent.runtime_checkpoint", agent_dir / "runtime_checkpoint.py")
 
     node_package = sys.modules["backend.agents.arxiv_search_agent.node"]
@@ -584,15 +594,11 @@ def load_agent_test_modules() -> Dict[str, Any]:
     node_package.build_search_tool_args = search_node_module.build_search_tool_args
     node_package.check_search_result = search_node_module.check_search_result
     node_package.execute_tool = sys.modules["backend.agents.arxiv_search_agent.node.tool_node"].execute_tool
-    node_package.handle_paper_reading_request = sys.modules[
-        "backend.agents.arxiv_search_agent.node.paper_reading_node"
-    ].handle_paper_reading_request
     node_package.invoke_search_tool = search_node_module.invoke_search_tool
     node_package.parse_search_request = sys.modules["backend.agents.arxiv_search_agent.node.parse_node"].parse_search_request
     node_package.plan_task = sys.modules["backend.agents.arxiv_search_agent.node.plan_node"].plan_task
     node_package.personalized_rank_and_annotate_papers = search_node_module.personalized_rank_and_annotate_papers
     node_package.relax_search_for_retry = search_node_module.relax_search_for_retry
-    node_package.synthesize_response = sys.modules["backend.agents.arxiv_search_agent.node.response_node"].synthesize_response
 
     graph_module = _load_module("backend.agents.arxiv_search_agent.graph", agent_dir / "graph.py")
     service_module = _load_module("backend.agents.arxiv_search_agent.service", agent_dir / "service.py")

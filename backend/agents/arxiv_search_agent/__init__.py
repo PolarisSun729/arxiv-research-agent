@@ -20,7 +20,6 @@ from .node import (
     parse_search_request,
     personalized_rank_and_annotate_papers,
     relax_search_for_retry,
-    synthesize_response,
 )
 from .graph import build_arxiv_search_graph, export_arxiv_search_graph_mermaid
 from .plan_executor import PlanExecutor, execute_executable_plan, run_agent_turn
@@ -69,6 +68,5 @@ __all__ = [
     "run_arxiv_search_agent",
     "run_agent_turn",
     "stream_arxiv_search_agent",
-    "synthesize_response",
     "execute_executable_plan",
 ]

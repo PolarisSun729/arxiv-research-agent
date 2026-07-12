@@ -15,7 +15,6 @@ class AnalyzeAmbiguityInput(BaseModel):
     context: Dict[str, Any] = Field(default_factory=dict)
     goal: Dict[str, Any] = Field(default_factory=dict)
     user_id: Optional[str] = None
-    pending_action: Dict[str, Any] = Field(default_factory=dict)
     search_spec: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -85,7 +84,6 @@ class AnalyzeAmbiguityAdapter(BaseToolAdapter[AnalyzeAmbiguityInput, MissingInfo
             context=tool_input.context,
             goal=tool_input.goal,
             user_id=tool_input.user_id,
-            pending_action=tool_input.pending_action,
             search_spec=tool_input.search_spec,
         )
         return MissingInformationOutput.model_validate(diagnostic)
@@ -162,27 +160,3 @@ class GenerateFallbackResponseAdapter(BaseToolAdapter[GenerateFallbackInput, Fin
         if message:
             return FinalAnswerOutput(final_answer=f"当前请求暂不在该 agent 的支持范围内：{message}。建议改成 arXiv 搜索、论文问答、推荐或偏好更新。")
         return FinalAnswerOutput(final_answer="当前请求暂不在该 agent 的支持范围内。")
-
-
-class RequestConfirmationInput(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    pending_action: Optional[Dict[str, Any]] = None
-    pending_state: Dict[str, Any] = Field(default_factory=dict)
-
-
-class ConfirmationStatusOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    status: str
-    pending_action: Optional[Dict[str, Any]] = None
-
-
-class RequestConfirmationAdapter(BaseToolAdapter[RequestConfirmationInput, ConfirmationStatusOutput]):
-    tool_name = "request_confirmation"
-    input_model = RequestConfirmationInput
-    output_model = ConfirmationStatusOutput
-
-    def _run(self, tool_input: RequestConfirmationInput) -> ConfirmationStatusOutput:
-        status = "approved" if tool_input.pending_state.get("status") == "approved" else "waiting_confirmation"
-        return ConfirmationStatusOutput(status=status, pending_action=tool_input.pending_action)

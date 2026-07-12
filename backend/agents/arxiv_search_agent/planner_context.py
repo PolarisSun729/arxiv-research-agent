@@ -39,7 +39,6 @@ def build_planner_context(
         selected_paper=_normalize_mapping(context.get("selected_paper")),
         last_papers=_normalize_paper_list(context.get("last_papers") or context.get("papers")),
         paper_qa_result=_normalize_mapping(state.paper_qa_result or context.get("paper_qa_result")),
-        pending_action=_normalize_mapping(state.pending_action or context.get("pending_action")),
         user_memory_summary=context.get("user_memory_summary", context.get("memory_summary")),
         research_profile=context.get("research_profile"),
         # research_task_profile 是科研任务语义层；planner 可选择消费其中间产物/证据需求，
@@ -93,9 +92,6 @@ def planner_context_debug(planner_context: PlannerContext) -> Dict[str, Any]:
         "paper_qa_result_status": (
             planner_context.paper_qa_result or {}
         ).get("status") if isinstance(planner_context.paper_qa_result, Mapping) else None,
-        "pending_action_type": (
-            planner_context.pending_action or {}
-        ).get("type") if isinstance(planner_context.pending_action, Mapping) else None,
         "session_state": dict(planner_context.session_state or {}),
         "intermediate_result_keys": sorted((planner_context.intermediate_results or {}).keys()),
         "reusable_output_keys": sorted((planner_context.reusable_outputs or {}).keys()),
@@ -204,12 +200,10 @@ def _build_context_refs(
     runtime_outputs: Mapping[str, Any],
 ) -> List[str]:
     refs: List[str] = []
-    for key in ("selected_paper", "last_papers", "user_memory_summary", "memory_summary", "research_profile", "pending_action", "paper_qa_result"):
+    for key in ("selected_paper", "last_papers", "user_memory_summary", "memory_summary", "research_profile", "paper_qa_result"):
         value = context.get(key)
         if value not in (None, "", [], {}):
             refs.append(key)
-    if isinstance(state.pending_action, Mapping):
-        refs.append("state.pending_action")
     if isinstance(state.paper_qa_result, Mapping):
         refs.append("state.paper_qa_result")
     if runtime_outputs:
@@ -226,8 +220,6 @@ def _used_context_fields(planner_context: PlannerContext) -> List[str]:
         fields.append("last_papers")
     if planner_context.paper_qa_result:
         fields.append("paper_qa_result")
-    if planner_context.pending_action:
-        fields.append("pending_action")
     if planner_context.user_memory_summary not in (None, "", [], {}):
         fields.append("user_memory_summary")
     if planner_context.research_profile not in (None, "", [], {}):

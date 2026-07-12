@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import PaperCard from '@/components/PaperCard.vue'
 import type { Paper } from '@/types/paper'
@@ -14,42 +14,40 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   (event: 'view-detail', id: string): void
   (event: 'label', paper: Paper, label: 'liked' | 'disliked' | null): void
-  (event: 'confirm-pending-action', candidateId?: string): void
-  (event: 'cancel-pending-action'): void
+  (event: 'confirm-interaction', candidateId?: string): void
+  (event: 'cancel-interaction'): void
 }>()
 
 const selectedCandidateId = ref('')
 
-const pendingAction = computed(() => props.result.pendingAction)
+const interaction = computed(() => props.result.interaction)
 const hasVisibleContent = computed(() => props.result.hasVisibleContent)
 const shouldRequireCandidate = computed(() =>
-  pendingAction.value?.kind === 'paper_target_confirmation' && pendingAction.value.candidates.length > 0
+  interaction.value?.kind === 'target_selection' && interaction.value.candidates.length > 0
 )
 const canConfirm = computed(() =>
-  Boolean(pendingAction.value) &&
+  Boolean(interaction.value) &&
   !props.loading &&
-  !pendingAction.value?.isConfirming &&
-  !pendingAction.value?.isBuildingIndex &&
   (!shouldRequireCandidate.value || Boolean(selectedCandidateId.value))
 )
 
 watch(
-  () => pendingAction.value?.defaultCandidateId,
+  () => interaction.value?.defaultCandidateId,
   value => {
-    selectedCandidateId.value = value || pendingAction.value?.candidates[0]?.id || ''
+    selectedCandidateId.value = value || interaction.value?.candidates[0]?.id || ''
   },
   { immediate: true }
 )
 
 watch(
-  () => pendingAction.value?.candidates.map(candidate => candidate.id).join('|') || '',
+  () => interaction.value?.candidates.map(candidate => candidate.id).join('|') || '',
   () => {
-    if (!pendingAction.value?.candidates.length) {
+    if (!interaction.value?.candidates.length) {
       selectedCandidateId.value = ''
       return
     }
-    if (!pendingAction.value.candidates.some(candidate => candidate.id === selectedCandidateId.value)) {
-      selectedCandidateId.value = pendingAction.value.defaultCandidateId || pendingAction.value.candidates[0].id
+    if (!interaction.value.candidates.some(candidate => candidate.id === selectedCandidateId.value)) {
+      selectedCandidateId.value = interaction.value.defaultCandidateId || interaction.value.candidates[0].id
     }
   }
 )
@@ -61,8 +59,8 @@ function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
 }
 
 function handleConfirm() {
-  if (!pendingAction.value || !canConfirm.value) return
-  emit('confirm-pending-action', selectedCandidateId.value || undefined)
+  if (!interaction.value || !canConfirm.value) return
+  emit('confirm-interaction', selectedCandidateId.value || undefined)
 }
 </script>
 
@@ -90,38 +88,20 @@ function handleConfirm() {
       {{ result.preferenceFeedback.message }}
     </section>
 
-    <section v-if="pendingAction" class="agent-user-confirmation">
-      <div v-if="pendingAction.isConfirming" class="agent-user-confirmation__status">
-        确认请求已提交，正在继续处理。
-      </div>
+    <section v-if="interaction" class="agent-user-confirmation">
       <div class="agent-user-confirmation__copy">
-        <h3>{{ pendingAction.title }}</h3>
-        <p>{{ pendingAction.description }}</p>
+        <h3>{{ interaction.title }}</h3>
+        <p>{{ interaction.description }}</p>
       </div>
 
-      <div v-if="pendingAction.indexJob" class="agent-user-index-progress">
-        <div class="agent-user-index-progress__meta">
-          <span>{{ pendingAction.indexStageText }}</span>
-          <strong>{{ pendingAction.indexProgress }}%</strong>
-        </div>
-        <el-progress
-          :percentage="pendingAction.indexProgress"
-          :status="pendingAction.status === 'index_failed' ? 'exception' : (pendingAction.status === 'ready_to_resume' ? 'success' : undefined)"
-          :stroke-width="8"
-        />
-        <p v-if="pendingAction.indexErrorMessage" class="agent-user-index-progress__error">
-          {{ pendingAction.indexErrorMessage }}
-        </p>
-      </div>
-
-      <div v-if="pendingAction.kind === 'paper_target_confirmation'" class="agent-user-candidates">
+      <div v-if="interaction.kind === 'target_selection'" class="agent-user-candidates">
         <el-radio-group
-          v-if="pendingAction.candidates.length"
+          v-if="interaction.candidates.length"
           v-model="selectedCandidateId"
           class="agent-user-candidates__group"
         >
           <el-radio
-            v-for="candidate in pendingAction.candidates"
+            v-for="candidate in interaction.candidates"
             :key="candidate.id"
             :label="candidate.id"
             class="agent-user-candidate"
@@ -151,14 +131,14 @@ function handleConfirm() {
       <div class="agent-user-confirmation__actions">
         <el-button
           type="primary"
-          :loading="pendingAction.isConfirming"
+          :loading="loading"
           :disabled="!canConfirm"
           @click="handleConfirm"
         >
-          {{ pendingAction.confirmLabel }}
+          {{ interaction.confirmLabel }}
         </el-button>
-        <el-button :disabled="loading || pendingAction.isConfirming" @click="emit('cancel-pending-action')">
-          {{ pendingAction.cancelLabel }}
+        <el-button :disabled="loading" @click="emit('cancel-interaction')">
+          {{ interaction.cancelLabel }}
         </el-button>
       </div>
     </section>

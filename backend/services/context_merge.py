@@ -7,7 +7,6 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Set
 BACKEND_AUTHORITY_FIELDS: Set[str] = {
     "user_memory_summary",
     "research_profile",
-    "pending_action",
     "paper_qa_result",
     "active_arxiv_id",
     "arxiv_id",
@@ -20,9 +19,7 @@ BACKEND_AUTHORITY_FIELDS: Set[str] = {
     "plan_runtime",
     "checkpoint",
     "runtime_checkpoint",
-    "pending_confirmation",
-    "confirmed_step_ids",
-    "approved_step_ids",
+    "interaction",
 }
 
 FRONTEND_CONTEXT_ALLOWLIST: Set[str] = {

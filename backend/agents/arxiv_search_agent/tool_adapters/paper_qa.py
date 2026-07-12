@@ -361,7 +361,7 @@ class ParseAndIndexPaperAdapter(BaseToolAdapter[ParseAndIndexPaperInput, IndexBu
                             message=str((backend_result.get("error") or {}).get("message") if isinstance(backend_result.get("error"), Mapping) else backend_result.get("summary") or "论文索引构建失败"),
                             detail={"backend_error": backend_result.get("error")},
                             retryable=False,
-                            suggested_recovery="request_confirmation",
+                            suggested_recovery="patch_plan",
                             safe_debug={"backend_tool_name": "build_paper_qa_index"},
                         ),
                     }

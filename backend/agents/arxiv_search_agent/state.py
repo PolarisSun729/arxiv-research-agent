@@ -19,6 +19,7 @@ from .schemas import (
     ToolObservation,
     ToolSpec,
 )
+from .execution.interactions import AgentInteraction
 
 
 _LEGACY_STEP_TOOL_NAMES = {
@@ -29,7 +30,6 @@ _LEGACY_STEP_TOOL_NAMES = {
     "response_synthesis": "synthesize_arxiv_response",
     "paper_resolution": "resolve_paper",
     "qa_index_check": "check_paper_index",
-    "confirmation_gate": "request_confirmation",
     "paper_response": "answer_paper_question",
     "preference_update": "update_preference_store",
     "profile_loading": "load_user_profile",
@@ -99,14 +99,14 @@ class AgentState(BaseModel):
     A. 执行真源（唯一可写的业务状态，所有判断都应只读这里）：
        - goal / execution_plan：本轮目标与结构化计划；
        - plan_runtime（PlanRuntime）：运行中执行现场，承载当前 step、工具输出
-         （runtime.outputs）、最近 observation、pending_confirmation、final_answer
+         （runtime.outputs）、最近 observation、interaction、final_answer
          与失败原因。用户是否等待确认、工具结果、最终回答都以它为准。
        - runtime_state（AgentRuntimeState）：plan_runtime 的可序列化 checkpoint
          投影，专供 resume 恢复；它是 plan_runtime 的快照镜像，业务逻辑不得
          把它当成与 plan_runtime 并列的第二份真源同时读写。
 
     B. 出站展示 / 响应投影（出站时从执行真源生成，输入侧不可信、不得反向驱动执行）：
-       - pending_action：ConfirmationRequest 的前端展示镜像；
+       - interaction：等待用户输入时的唯一结构化业务交互；
        - answer / papers / paper_qa_result / preference_action_result：最终响应
          适配字段，由 graph._apply_turn_result 从 runtime.outputs 投影得到。
 
@@ -135,13 +135,10 @@ class AgentState(BaseModel):
     # 例如 selected_paper、last_papers、research_profile、loading_method 等。
     context: Dict[str, Any] = Field(default_factory=dict)
 
-    # [B 出站展示] pending_action 是 ConfirmationRequest 的前端展示镜像，由出站投影生成。
-    # 业务真源是 plan_runtime.pending_confirmation；interrupt/resume 现场依赖 LangGraph
-    # checkpointer + runtime_state，不能只靠这个展示摘要恢复，也不得据它做执行判断。
-    pending_action: Optional[Dict[str, Any]] = None
+    interaction: Optional[AgentInteraction] = None
 
     # [B 出站响应投影] paper_qa_result 由 _apply_turn_result 从 runtime.outputs 投影得到，
-    # 可能是成功答案、失败信息或 waiting_confirmation 状态，仅供最终响应/前端消费。
+    # 可能是成功答案或失败信息；等待用户输入统一由 interaction 表达。
     paper_qa_result: Optional[Dict[str, Any]] = None
 
     # intent 系列字段由 parse_search_request 节点产出，决定图中后续路由方向。
@@ -153,7 +150,7 @@ class AgentState(BaseModel):
 
     # [A 执行真源] goal 表达用户本轮真实想完成的目标；execution_plan 表达结构化步骤规划。
     # plan_runtime（PlanRuntime）是运行中执行现场，承载当前 step、工具输出、observation
-    # 与 pending_confirmation，所有业务判断只读它。
+    # 与 interaction，所有业务判断只读它。
     # runtime_state（AgentRuntimeState）是 plan_runtime 的可序列化 checkpoint 投影，
     # 仅供 resume 恢复，不得与 plan_runtime 并列当成第二份真源同时读写。
     goal: Optional[Goal] = None

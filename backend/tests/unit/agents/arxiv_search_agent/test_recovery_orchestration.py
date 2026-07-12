@@ -220,8 +220,10 @@ def test_plan_patcher_inserts_index_confirmation_chain_and_validates_plan() -> N
     )
 
     assert result.updated_plan is not None
-    assert any(item.tool_name == "request_confirmation" for item in result.updated_plan.steps)
-    assert any(item.tool_name == "parse_and_index_paper" for item in result.updated_plan.steps)
+    assert not any(item.tool_name == "request_confirmation" for item in result.updated_plan.steps)
+    parse_step = next(item for item in result.updated_plan.steps if item.tool_name == "parse_and_index_paper")
+    assert parse_step.confirmation_policy is not None
+    assert parse_step.confirmation_policy.requires_confirmation is True
     PlanValidator().validate(result.updated_plan, PLANNER_TOOL_REGISTRY)
     assert result.updated_runtime.step_status[step.step_id] == "pending"
     assert result.updated_runtime.trace[-1].detail["patch_result"]["rule_name"] == "rule_missing_paper_index"

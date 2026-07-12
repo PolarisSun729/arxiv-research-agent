@@ -15,15 +15,14 @@ class AgentSessionStore(BaseSqliteStore):
             'status': row[2] or 'active',
             'selected_paper': self._deserialize_json_field(row[3]) or None,
             'last_papers': self._deserialize_json_field(row[4]) or [],
-            'pending_action': self._deserialize_json_field(row[5]) or None,
-            'paper_qa_result': self._deserialize_json_field(row[6]) or None,
-            'active_arxiv_id': row[7] or '',
-            'active_paper_session_id': row[8] or '',
-            'last_intent': row[9] or '',
-            'last_tool_calls_summary': self._deserialize_json_field(row[10]) or [],
-            'last_response_summary': row[11] or '',
-            'created_at': row[12],
-            'updated_at': row[13],
+            'paper_qa_result': self._deserialize_json_field(row[5]) or None,
+            'active_arxiv_id': row[6] or '',
+            'active_paper_session_id': row[7] or '',
+            'last_intent': row[8] or '',
+            'last_tool_calls_summary': self._deserialize_json_field(row[9]) or [],
+            'last_response_summary': row[10] or '',
+            'created_at': row[11],
+            'updated_at': row[12],
         }
 
     def create_or_get_agent_session(
@@ -60,7 +59,7 @@ class AgentSessionStore(BaseSqliteStore):
                 cursor.execute(
                     '''
                     SELECT session_id, user_id, status, selected_paper_json, last_papers_json,
-                           pending_action_json, paper_qa_result_json, active_arxiv_id,
+                           paper_qa_result_json, active_arxiv_id,
                            active_paper_session_id, last_intent, last_tool_calls_summary_json,
                            last_response_summary, created_at, updated_at
                     FROM agent_sessions
@@ -89,7 +88,6 @@ class AgentSessionStore(BaseSqliteStore):
                 'status': 'status',
                 'selected_paper': 'selected_paper_json',
                 'last_papers': 'last_papers_json',
-                'pending_action': 'pending_action_json',
                 'paper_qa_result': 'paper_qa_result_json',
                 'active_arxiv_id': 'active_arxiv_id',
                 'active_paper_session_id': 'active_paper_session_id',
@@ -100,7 +98,6 @@ class AgentSessionStore(BaseSqliteStore):
             json_fields = {
                 'selected_paper_json',
                 'last_papers_json',
-                'pending_action_json',
                 'paper_qa_result_json',
                 'last_tool_calls_summary_json',
             }
@@ -154,7 +151,6 @@ class AgentSessionStore(BaseSqliteStore):
                 'status': 'cleared',
                 'selected_paper': None,
                 'last_papers': None,
-                'pending_action': None,
                 'paper_qa_result': None,
                 'active_arxiv_id': None,
                 'active_paper_session_id': None,

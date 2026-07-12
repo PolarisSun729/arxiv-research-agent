@@ -6,18 +6,14 @@ export interface ArxivSearchRequest {
   session_id?: string | null
   message: string
   resume?: {
-    decision: 'approve' | 'reject'
+    interaction_id: string
+    decision: 'approve' | 'reject' | 'select' | 'cancel'
+    response?: Record<string, any>
     note?: string | null
-    step_id?: string | null
-    interrupt_id?: string | null
-    tool_name?: string | null
-    pending_action_id?: string | null
-    edited_arguments?: Record<string, any> | null
   } | null
   context?: {
     selected_paper?: AgentPaper | null
     last_papers?: AgentPaper[]
-    pending_action?: AgentPendingAction | Record<string, any> | null
     paper_qa_result?: Record<string, any> | null
     research_profile?: UserResearchProfile | null
     arxiv_id?: string | null
@@ -49,38 +45,6 @@ export interface AgentToolCall {
   summary?: string | null
   trace?: Record<string, any> | null
   error?: Record<string, any> | null
-}
-
-export interface AgentQaIndexJob {
-  job_id: string
-  arxiv_id: string
-  status: 'pending' | 'running' | 'success' | 'failed' | 'stale' | 'cancelled' | 'retrying' | string
-  current_stage?: string | null
-  progress?: number | null
-  error_message?: string | null
-  loading_method?: string | null
-  created_at?: string | null
-  updated_at?: string | null
-  heartbeat_at?: string | null
-}
-
-export interface AgentQaIndexContinuation {
-  job_id: string
-  user_id?: string | null
-  session_id: string
-  arxiv_id: string
-  status: 'waiting_job' | 'ready_to_resume' | 'resumed' | 'failed' | 'cancelled' | string
-  pending_action_id?: string | null
-  step_id?: string | null
-  tool_name?: string | null
-  original_question?: string | null
-  resume_payload?: ArxivSearchRequest['resume'] | Record<string, any> | null
-  pending_action?: AgentPendingAction | Record<string, any> | null
-  job?: AgentQaIndexJob | null
-  error_message?: string | null
-  created_at?: string | null
-  updated_at?: string | null
-  completed_at?: string | null
 }
 
 export interface AgentStep {
@@ -158,48 +122,29 @@ export interface PaperTargetCandidate extends AgentPaper {
   authors_summary?: string
 }
 
-export interface AgentPendingAction {
-  type?: string
-  request_type?: string
-  status?: string
-  decision?: 'approve' | 'reject' | null
-  confirmation_consumed?: boolean
-  pending_action_id?: string | null
-  step_id?: string | null
-  interrupt_id?: string | null
-  tool_name?: string | null
-  action_type?: string | null
-  side_effect_level?: string | null
-  reason?: string | null
-  title?: string | null
-  title_text?: string | null
-  description?: string | null
-  arxiv_id?: string | null
-  original_question?: string | null
-  original_message?: string | null
-  qa_question?: string | null
-  target_paper?: PaperTargetCandidate | null
-  candidates?: PaperTargetCandidate[]
-  recommended_candidate?: PaperTargetCandidate | null
-  default_candidate_id?: string | null
-  allowed_decisions?: string[]
-  allow_argument_edit?: boolean
-  allow_reject?: boolean
-  allow_note?: boolean
-  arguments_summary?: Record<string, any>
-  confirmation_request?: Record<string, any>
-  reference_hint?: Record<string, any>
-  target_resolution?: Record<string, any>
-  confirmation_fields?: Record<string, any>
-  created_at?: string | null
-  expires_at?: string | null
-  thread_id?: string | null
-  session_id?: string | null
-  plan_id?: string | null
-  trace_id?: string | null
-  edited_arguments?: Record<string, any> | null
-  index_job?: AgentQaIndexJob | null
-  index_continuation?: AgentQaIndexContinuation | null
+export interface TargetSelectionPayload {
+  candidates: PaperTargetCandidate[]
+  recommended_candidate_id?: string | null
+  reference_hint: Record<string, any>
+}
+
+export interface SideEffectApprovalPayload {
+  tool_name: string
+  action_type: string
+  reason: string
+  arguments_summary: Record<string, any>
+  arguments_fingerprint: string
+}
+
+export interface AgentInteraction {
+  interaction_id: string
+  kind: 'target_selection' | 'side_effect_approval'
+  status: 'pending' | 'resolved' | 'cancelled' | 'expired'
+  plan_id: string
+  step_id: string
+  payload: TargetSelectionPayload | SideEffectApprovalPayload
+  created_at: string
+  expires_at: string
 }
 
 export interface AgentPreferenceActionResult {
@@ -219,7 +164,7 @@ export interface ArxivSearchResponse {
   answer: string
   query_capability?: BackendArxivQueryCapability | null
   search_spec?: ArxivSearchSpec | null
-  pending_action?: AgentPendingAction | null
+  interaction?: AgentInteraction | null
   paper_qa_result?: Record<string, any> | null
   preference_action_result?: AgentPreferenceActionResult | null
   plan: string[]

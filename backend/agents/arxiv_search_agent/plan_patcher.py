@@ -318,43 +318,22 @@ class PlanPatcher:
 
     def patch_index_confirmation_chain(self, *, plan_copy: ExecutablePlan, runtime_copy: PlanRuntime, failed_step: PlanStep, action: RecoveryAction) -> Dict[str, Any]:
         del action
-        request_step_id = self._make_unique_step_id(plan_copy, "request_confirmation")
         parse_step_id = self._make_unique_step_id(plan_copy, "parse_and_index_paper")
-        request_step = self._build_step(
-            step_id=request_step_id,
-            action_type="clarify",
-            tool_name="request_confirmation",
-            output_key=self._make_unique_output_key(plan_copy, "confirmation_status"),
-            depends_on=[failed_step.step_id],
-            input_bindings=[
-                _binding(
-                    "pending_action",
-                    source_type="literal",
-                    value={
-                        "type": "tool_approval",
-                        "status": "waiting_confirmation",
-                        "step_id": parse_step_id,
-                        "tool_name": "parse_and_index_paper",
-                        "action_label": "解析并索引论文",
-                        "description": "目标论文还没有 QA 索引，需要先确认是否解析 PDF 并创建全文检索索引。",
-                    },
-                )
-            ],
-        )
         parse_step = self._build_step(
             step_id=parse_step_id,
             action_type="index",
             tool_name="parse_and_index_paper",
             output_key=self._make_unique_output_key(plan_copy, "index_build_result"),
-            depends_on=[request_step_id],
+            depends_on=[failed_step.step_id],
             confirmation_policy=StepPolicy(policy_type="confirmation", mode="explicit_user_confirmation_required", requires_confirmation=True),
             input_bindings=[_paper_reference_binding_from_index_step(failed_step)],
         )
-        self._insert_steps_after(plan_copy, failed_step.step_id, [request_step, parse_step])
+        # 确认是目标副作用 step 的执行守卫，不再向计划中插入没有业务产出的 bridge step。
+        self._insert_steps_after(plan_copy, failed_step.step_id, [parse_step])
         return {
             "ok": True,
             "rule_name": "rule_missing_paper_index",
-            "inserted_step_ids": [request_step_id, parse_step_id],
+            "inserted_step_ids": [parse_step_id],
             "patch_strategy": "inject_index_confirmation_chain",
         }
 
@@ -745,7 +724,7 @@ class PlanPatcher:
                 "inserted_step_ids": list(patch_result.get("inserted_step_ids") or []),
                 "fallback": bool(patch_result.get("fallback")),
             },
-            "confirmation_triggered": bool(action.requires_confirmation or patch_result.get("pending_confirmation")),
+        "interaction_required": bool(action.requires_confirmation),
             "fallback_used": bool(patch_result.get("fallback")),
             "fallback_reason": patch_result.get("fallback_reason"),
             "final_recovery_status": "fallback" if bool(patch_result.get("fallback")) else "patched",

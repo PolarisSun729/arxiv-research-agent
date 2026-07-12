@@ -55,13 +55,13 @@ def test_preference_action_without_target_reports_preference_target_gap() -> Non
     assert diagnostic["minimum_required_fields"] == ["preference_action", "preference_target", "user_identity"]
 
 
-def test_confirmation_without_pending_request_reports_missing_confirmation_request() -> None:
+def test_confirmation_message_requires_structured_interaction_resume() -> None:
     diagnostic = build_clarification_diagnostic(message="同意")
 
     assert diagnostic["inferred_intent"] == "confirmation"
     assert diagnostic["needs_clarification"] is True
-    assert diagnostic["missing_fields"] == ["confirmation_request"]
-    assert diagnostic["reason"] == "missing_confirmation_request"
+    assert diagnostic["missing_fields"] == ["interaction_resume"]
+    assert diagnostic["reason"] == "structured_interaction_resume_required"
 
 
 def test_recommendation_with_topic_can_use_default_identity() -> None:

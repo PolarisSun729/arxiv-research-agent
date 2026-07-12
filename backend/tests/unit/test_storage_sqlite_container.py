@@ -132,48 +132,6 @@ class StorageSqliteContainerTests(unittest.TestCase):
         self.assertEqual(qa_index["active_build_id"], build["build_id"])
         self.assertEqual(qa_index["previous_build_id"], old_active["build_id"])
 
-    def test_agent_runtime_checkpoint_store_consumes_confirmation_once(self) -> None:
-        checkpoint = self.storage.agent_runtime_checkpoints.upsert_agent_runtime_checkpoint(
-            user_id=self.user_id,
-            session_id="agent-session-1",
-            thread_id="thread-1",
-            runtime_state={
-                "pending_confirmation": {"step_id": "step-1", "tool_name": "search"},
-                "turn_status": "waiting_confirmation",
-            },
-            pending_confirmation={"step_id": "step-1", "tool_name": "search"},
-            status="waiting_confirmation",
-        )
-        self.assertEqual(checkpoint["status"], "waiting_confirmation")
-
-        first_consume = self.storage.agent_runtime_checkpoints.consume_agent_runtime_pending_confirmation(
-            user_id=self.user_id,
-            session_id="agent-session-1",
-            thread_id="thread-1",
-            decision="approve",
-            step_id="step-1",
-            tool_name="search",
-        )
-        second_consume = self.storage.agent_runtime_checkpoints.consume_agent_runtime_pending_confirmation(
-            user_id=self.user_id,
-            session_id="agent-session-1",
-            thread_id="thread-1",
-            decision="approve",
-            step_id="step-1",
-            tool_name="search",
-        )
-        stored = self.storage.agent_runtime_checkpoints.get_agent_runtime_checkpoint(
-            user_id=self.user_id,
-            session_id="agent-session-1",
-            thread_id="thread-1",
-        )
-
-        self.assertTrue(first_consume)
-        self.assertFalse(second_consume)
-        self.assertEqual(stored["status"], "running")
-        self.assertIsNone(stored["pending_confirmation"])
-        self.assertEqual(stored["runtime_state"]["approved_step_ids"], ["step-1"])
-
     def test_langgraph_checkpoint_store_round_trips_raw_checkpoint(self) -> None:
         self.assertTrue(
             self.storage.langgraph_checkpoints.put_langgraph_checkpoint(

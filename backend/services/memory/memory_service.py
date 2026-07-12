@@ -152,12 +152,6 @@ class MemoryService:
             # 保留最近论文列表，便于在多论文浏览场景下做上下文衔接。
             backend_context["last_papers"] = last_papers
 
-        pending_action = session.get("pending_action")
-        if isinstance(pending_action, dict) and pending_action:
-            # 这里只保存最近一次确认动作的业务摘要，方便前端展示、诊断和兼容旧会话。
-            # 真正的 LangGraph interrupt 执行现场依赖 checkpointer，不能只靠数据库里的摘要恢复。
-            backend_context["pending_action"] = pending_action
-
         paper_qa_result = session.get("paper_qa_result")
         if isinstance(paper_qa_result, dict) and paper_qa_result:
             # 最近一次论文问答结果可以作为短期显式记忆，方便下轮追问直接复用。
@@ -248,10 +242,7 @@ class MemoryService:
         """从 Agent 最终状态中提取一份可增量写入的会话记忆补丁。"""
         state = self._normalize_state_payload(final_state)
         context = dict(state.get("context") or {})
-        pending_action = state.get("pending_action") if "pending_action" in state else context.get("pending_action")
         paper_qa_result = state.get("paper_qa_result") if "paper_qa_result" in state else context.get("paper_qa_result")
-        # pending_action 会随会话记忆保存，但它只是确认卡片的业务镜像；
-        # resume 能否继续执行仍以 LangGraph checkpointer 中的现场为准。
 
         last_papers = context.get("last_papers") if "last_papers" in context else None
         if last_papers is None and isinstance(state.get("papers"), list) and state.get("papers"):
@@ -261,7 +252,6 @@ class MemoryService:
         active_arxiv_id = (
             # 当前轮次真实产物优先于旧 UI 选中态，防止“第 N 篇”解析成功后又被历史焦点覆盖。
             self._extract_arxiv_id(paper_qa_result)
-            or self._extract_arxiv_id(pending_action)
             or self._extract_arxiv_id(context.get("selected_paper"))
             or str(context.get("arxiv_id") or "").strip()
         )
@@ -275,7 +265,6 @@ class MemoryService:
 
         memory_patch: Dict[str, Any] = {
             "status": "active",
-            "pending_action": pending_action,
             "paper_qa_result": paper_qa_result,
             "active_arxiv_id": active_arxiv_id or None,
             "active_paper_session_id": active_paper_session_id or None,

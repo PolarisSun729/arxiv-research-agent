@@ -1,9 +1,12 @@
+
 from __future__ import annotations
 
 from functools import lru_cache
 from typing import Any, Dict, List, Literal, Optional, Set
 
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
+
+from .execution.interactions import AgentInteraction, InteractionResumeRequest
 
 
 @lru_cache(maxsize=1)
@@ -96,7 +99,7 @@ class ArxivSearchRequest(BaseModel):
     session_id: Optional[str] = None
     message: str
     context: Dict[str, Any] = Field(default_factory=dict)
-    resume: Optional["ResumeRequest"] = None
+    resume: Optional[InteractionResumeRequest] = None
 
     @field_validator("user_id", "session_id", "message", mode="before")
     @classmethod
@@ -295,6 +298,7 @@ class AgentToolCall(BaseModel):
 
 class ToolCallRequest(BaseModel):
     """定义 Agent 准备发起的一次内部工具调用请求。
+
 
     这个模型表达的不是“工具已经执行了什么”，而是“Agent 接下来打算怎么行动”。
     阶段 2 中它主要作为计划与行动之间的桥梁数据结构存在，便于后续把
@@ -596,6 +600,7 @@ ArtifactContributionType = Literal[
     "derive_artifact",
     "synthesize_artifact",
     "quality_gate",
+
     "context_reuse",
 ]
 ArtifactProgressStatus = Literal["pending", "partial", "completed", "degraded", "blocked"]
@@ -896,6 +901,7 @@ class PlanningDiagnostics(BaseModel):
     artifact_step_mapping: List[ArtifactStepMapping] = Field(default_factory=list)
     artifact_progress_reservations: List[ArtifactProgressReservation] = Field(default_factory=list)
     blocked_evidence_requirements: List[Dict[str, Any]] = Field(default_factory=list)
+
     diagnostic_events: List[PlanningDiagnostic] = Field(default_factory=list)
 
 
@@ -1084,7 +1090,6 @@ class PlannerContext(BaseModel):
     selected_paper: Optional[Dict[str, Any]] = None
     last_papers: List[Dict[str, Any]] = Field(default_factory=list)
     paper_qa_result: Optional[Dict[str, Any]] = None
-    pending_action: Optional[Dict[str, Any]] = None
     user_memory_summary: Any = None
     research_profile: Any = None
     # research_task_profile 是 intent 与工具计划之间的科研任务语义层；planner 可据此从
@@ -1173,11 +1178,9 @@ class ExecutionPlanStep(BaseModel):
     depends_on: List[str] = Field(default_factory=list)
 
 
-PlanStepStatus = Literal["pending", "running", "success", "failed", "skipped", "waiting_confirmation"]
-AgentTurnStatus = Literal["success", "waiting_confirmation", "need_clarification", "failed", "fallback"]
+PlanStepStatus = Literal["pending", "running", "success", "failed", "skipped", "waiting_confirmation", "waiting_interaction"]
+AgentTurnStatus = Literal["success", "waiting_confirmation", "waiting_interaction", "need_clarification", "failed", "fallback"]
 SideEffectLevel = Literal["none", "low", "high"]
-ConfirmationRequestType = Literal["tool_approval", "paper_target_confirmation"]
-ConfirmationDecision = Literal["approve", "reject"]
 
 
 class ToolSpec(BaseModel):
@@ -1196,6 +1199,7 @@ class ToolSpec(BaseModel):
     output_schema: Dict[str, Any] = Field(default_factory=dict)
     input_model: Optional[str] = None
     output_model: Optional[str] = None
+
     error_model: Optional[str] = None
     side_effect_level: Literal["none", "session_write", "persistent_write", "external_call"] = "none"
     requires_confirmation: bool = False
@@ -1279,108 +1283,6 @@ class ExecutionTrace(BaseModel):
         return StepResult._normalize_status(value)
 
 
-class ConfirmationDecisionOption(BaseModel):
-    """定义一次确认请求允许的稳定决策枚举。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    code: ConfirmationDecision
-    label: Optional[str] = None
-    description: Optional[str] = None
-
-
-class ConfirmationDecisionPayload(BaseModel):
-    """定义用户恢复执行时提交的标准化决策。
-
-    edited_arguments 用于“确认目标论文”这类显式改参场景；后端仍只接受 pending confirmation
-    中声明和校验过的字段，不能把它当作重新解析自然语言的入口。
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    decision: ConfirmationDecision
-    note: Optional[str] = None
-    edited_arguments: Optional[Dict[str, Any]] = None
-
-
-class ResumeRequest(BaseModel):
-    """定义前端发起 interrupt 恢复时使用的结构化请求。
-
-    step_id / interrupt_id / tool_name / pending_action_id 共同标识本次要消费的确认任务；
-    edited_arguments 只承载确认框中用户明确选择的 paper_id/arxiv_id 等字段，后端必须用
-    pending confirmation 里的候选集合再次校验。
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    decision: ConfirmationDecision
-    note: Optional[str] = None
-    step_id: Optional[str] = None
-    interrupt_id: Optional[str] = None
-    tool_name: Optional[str] = None
-    pending_action_id: Optional[str] = None
-    edited_arguments: Optional[Dict[str, Any]] = None
-
-    @field_validator("note", "step_id", "interrupt_id", "tool_name", "pending_action_id", mode="before")
-    @classmethod
-    def _strip_optional_text(cls, value: Any) -> Any:
-        if value is None:
-            return None
-        text = str(value).strip()
-        return text or None
-
-    @model_validator(mode="after")
-    def _validate_locator_fields(self) -> "ResumeRequest":
-        # resume 是结构化确认动作，不能再退回“只靠 message 文本猜当前待确认任务”。
-        # 至少要携带 pending_action_id 或 step_id/tool_name 这组稳定定位字段，后端才能可靠校验并发、旧 checkpoint 和重复点击。
-        has_pending_action_id = bool(self.pending_action_id)
-        has_step_and_tool = bool(self.step_id and self.tool_name)
-        if not has_pending_action_id and not has_step_and_tool:
-            raise ValueError("resume request must include pending_action_id or step_id plus tool_name")
-        return self
-
-
-class ConfirmationRequest(BaseModel):
-    """定义一次标准化的确认请求 payload。
-
-    这个结构会被用于 interrupt payload 和前后端交互，因此只保留可序列化、可展示的轻量字段，
-    不应塞入完整 runtime/state、原始 PDF、论文 chunk 或工具返回大对象。
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    request_type: ConfirmationRequestType = "tool_approval"
-    pending_action_id: Optional[str] = None
-    step_id: str
-    tool_name: str
-    action_type: str
-    side_effect_level: str
-    reason: Optional[str] = None
-    title: Optional[str] = None
-    description: Optional[str] = None
-    arguments_summary: Dict[str, Any] = Field(default_factory=dict)
-    original_question: Optional[str] = None
-    original_message: Optional[str] = None
-    target_paper: Optional[Dict[str, Any]] = None
-    # 目标论文确认需要把候选论文随 checkpoint 一起保存；resume 时只允许从这里匹配，不能重新解析自然语言。
-    candidates: List[Dict[str, Any]] = Field(default_factory=list)
-    recommended_candidate: Optional[Dict[str, Any]] = None
-    default_candidate_id: Optional[str] = None
-    reference_hint: Dict[str, Any] = Field(default_factory=dict)
-    target_resolution: Dict[str, Any] = Field(default_factory=dict)
-    confirmation_fields: Dict[str, Any] = Field(default_factory=dict)
-    created_at: Optional[str] = None
-    expires_at: Optional[str] = None
-    allowed_decisions: List[ConfirmationDecisionOption] = Field(default_factory=list)
-    allow_argument_edit: bool = False
-    allow_reject: bool = True
-    allow_note: bool = True
-    trace_id: Optional[str] = None
-    plan_id: Optional[str] = None
-    session_id: Optional[str] = None
-    thread_id: Optional[str] = None
-
-
 class PlanStep(BaseModel):
     """定义执行计划中的单个步骤。
 
@@ -1406,7 +1308,7 @@ class PlanStep(BaseModel):
     failure_policy: Optional["StepPolicy"] = None
     confirmation_policy: Optional["StepPolicy"] = None
     side_effect_level: Literal["none", "session_write", "persistent_write", "external_call"] = "none"
-    status: Literal["pending", "running", "success", "failed", "skipped", "waiting_confirmation"] = "pending"
+    status: Literal["pending", "running", "success", "failed", "skipped", "waiting_confirmation", "waiting_interaction"] = "pending"
 
     @field_validator("tool", mode="before")
     @classmethod
@@ -1475,7 +1377,6 @@ class PlanRuntime(BaseModel):
     retry_counts: Dict[str, int] = Field(default_factory=dict)
     replan_counts: Dict[str, int] = Field(default_factory=dict)
     step_replan_counts: Dict[str, int] = Field(default_factory=dict)
-    approved_step_ids: List[str] = Field(default_factory=list)
     current_step_id: Optional[str] = None
     current_step_index: Optional[int] = None
     last_observation: Optional[Dict[str, Any]] = None
@@ -1483,7 +1384,7 @@ class PlanRuntime(BaseModel):
     needs_replan: bool = False
     is_finished: bool = False
     recovery_strategy: Optional[Dict[str, Any]] = None
-    pending_confirmation: Optional[ConfirmationRequest] = None
+    interaction: Optional[AgentInteraction] = None
     final_answer: Optional[str] = None
     error: Optional[str] = None
     turn_status: Optional[AgentTurnStatus] = None
@@ -1498,6 +1399,7 @@ class AgentRuntimeState(BaseModel):
     """
     model_config = ConfigDict(extra="forbid")
 
+
     request_state: Dict[str, Any] = Field(default_factory=dict)
     goal: Optional[Goal] = None
     plan: Optional[ExecutablePlan] = None
@@ -1511,8 +1413,7 @@ class AgentRuntimeState(BaseModel):
     retry_counts: Dict[str, int] = Field(default_factory=dict)
     replan_counts: Dict[str, int] = Field(default_factory=dict)
     step_replan_counts: Dict[str, int] = Field(default_factory=dict)
-    approved_step_ids: List[str] = Field(default_factory=list)
-    pending_confirmation: Optional[ConfirmationRequest] = None
+    interaction: Optional[AgentInteraction] = None
     needs_replan: bool = False
     is_finished: bool = False
     failure_reason: Optional[str] = None
@@ -1520,7 +1421,7 @@ class AgentRuntimeState(BaseModel):
     turn_status: Optional[AgentTurnStatus] = None
     final_answer: Optional[str] = None
 
-    @field_validator("plan", "goal", "pending_confirmation", mode="before")
+    @field_validator("plan", "goal", "interaction", mode="before")
     @classmethod
     def _coerce_nested_models(cls, value: Any) -> Any:
         # 不同测试加载路径可能产生同形不同类的 Pydantic 对象，统一转 dict 再按当前 schema 校验。
@@ -1556,22 +1457,15 @@ class StepExecutionResult(BaseModel):
     next_action: Literal[
         "continue",
         "wait_for_confirmation",
+        "wait_for_interaction",
         "replan",
         "finish",
         "fail",
         "noop",
     ] = "continue"
-    pending_confirmation: Optional[ConfirmationRequest] = None
+    interaction: Optional[AgentInteraction] = None
     runtime_patch: Dict[str, Any] = Field(default_factory=dict)
     turn_result: Optional[Any] = None
-
-    @field_validator("pending_confirmation", mode="before")
-    @classmethod
-    def _coerce_result_models(cls, value: Any) -> Any:
-        # 确认请求需要进入 checkpoint；单轮结果保留模型实例，避免兼容执行入口丢失属性访问语义。
-        model_dump = getattr(value, "model_dump", None)
-        return model_dump() if callable(model_dump) else value
-
 
 class AgentTurnResult(BaseModel):
     """统一承载单轮计划执行结果，避免执行器把结果散落在多个临时结构中。"""
@@ -1582,11 +1476,11 @@ class AgentTurnResult(BaseModel):
     plan: Optional[ExecutablePlan] = None
     outputs: Dict[str, Any] = Field(default_factory=dict)
     trace: List[ExecutionTrace] = Field(default_factory=list)
-    pending_confirmation: Optional[ConfirmationRequest] = None
+    interaction: Optional[AgentInteraction] = None
     error: Optional[str] = None
     runtime: Optional[PlanRuntime] = None
 
-    @field_validator("plan", "runtime", "pending_confirmation", mode="before")
+    @field_validator("plan", "runtime", "interaction", mode="before")
     @classmethod
     def _coerce_runtime_models(cls, value: Any) -> Any:
         # 混合测试会重复导入 schema；这里仅把同形 Pydantic 对象转回原始 dict 重新校验。
@@ -1633,7 +1527,6 @@ RecoveryActionType = Literal[
     "patch_plan",
     "retry_step",
     "ask_clarification",
-    "request_confirmation",
     "skip_step",
     "fallback_answer",
     "abort_with_error",
@@ -1663,7 +1556,6 @@ RecoveryActionSemantic = Literal[
     "append_step_after_current",
     "replace_remaining_plan",
     "ask_clarification",
-    "request_confirmation",
     "fallback_answer",
     "terminate_success",
     "terminate_failed",
@@ -1802,10 +1694,11 @@ class ArxivSearchResponse(BaseModel):
     - 论文结果；
     - 工具调用轨迹；
     - 最终 answer 与 next_actions；
-    - 以及 pending_action / paper_qa_result / preference_action_result
+    - 以及 interaction / paper_qa_result / preference_action_result
     一并返回给上层。
     """
     model_config = ConfigDict(extra="forbid")
+
 
     session_id: Optional[str] = None
     intent: Literal[
@@ -1830,7 +1723,7 @@ class ArxivSearchResponse(BaseModel):
     execution_plan: Optional[ExecutablePlan] = None
     plan_runtime: Optional[PlanRuntime] = None
     runtime_state: Optional[AgentRuntimeState] = None
-    pending_action: Optional[Dict[str, Any]] = None
+    interaction: Optional[AgentInteraction] = None
     paper_qa_result: Optional[Dict[str, Any]] = None
     preference_action_result: Optional[Dict[str, Any]] = None
     plan: List[str] = Field(default_factory=list)

@@ -6,16 +6,10 @@ import { dislikePaper, likePaper, removePaperPreference } from '@/api/papers'
 import { useAgentSearchChat } from '@/composables/useAgentSearchChat'
 import AgentUserResultAttachments from '@/components/agent-search/AgentUserResultAttachments.vue'
 import RagChatPanel from '@/components/rag-chat/RagChatPanel.vue'
-import type { AgentPendingAction, ArxivSearchResponse } from '@/types/agent'
+import type { AgentInteraction, ArxivSearchResponse, TargetSelectionPayload } from '@/types/agent'
 import type { Paper } from '@/types/paper'
 import { usePaperStore } from '@/stores/paperStore'
-import {
-  getAgentPendingActionKey,
-  getPaperTargetCandidateId,
-  isPaperTargetConfirmation,
-  toAgentUserResult,
-  type AgentUserResult
-} from '@/utils/agentUserResult'
+import { getPaperTargetCandidateId, toAgentUserResult, type AgentUserResult } from '@/utils/agentUserResult'
 
 const router = useRouter()
 const store = usePaperStore()
@@ -27,13 +21,10 @@ const {
   loading,
   messages,
   latestResponse,
-  pendingAction,
+  currentInteraction,
   setInputMessage,
   submitMessage,
   submitResume,
-  submitIndexBuildContinuation,
-  cancelIndexBuildContinuation,
-  restoreActiveIndexContinuations,
   clearConversation
 } = useAgentSearchChat()
 
@@ -45,7 +36,6 @@ const quickPrompts = [
 
 onMounted(() => {
   store.fetchResearchProfile()
-  restoreActiveIndexContinuations()
 })
 
 function handlePromptSelect(prompt: string) {
@@ -56,41 +46,31 @@ function handleClear() {
   clearConversation()
 }
 
-function selectedPendingCandidate(candidateId?: string) {
-  const candidates = Array.isArray(pendingAction.value?.candidates) ? pendingAction.value.candidates : []
+function selectedInteractionCandidate(candidateId?: string) {
+  if (currentInteraction.value?.kind !== 'target_selection') return null
+  const candidates = (currentInteraction.value.payload as TargetSelectionPayload).candidates
   return candidates.find((candidate, index) => getPaperTargetCandidateId(candidate, index) === candidateId) || null
 }
 
-async function handleConfirmPendingAction(candidateId?: string) {
-  const action = pendingAction.value
-  if (!action) return
+function handleConfirmInteraction(candidateId?: string) {
+  const interaction = currentInteraction.value
+  if (!interaction) return
 
-  if (isPaperTargetConfirmation(action)) {
-    const candidate = selectedPendingCandidate(candidateId)
+  if (interaction.kind === 'target_selection') {
+    const candidate = selectedInteractionCandidate(candidateId)
     if (!candidate) {
       ElMessage.warning('请先选择一篇论文')
       return
     }
-    // 确认目标论文只提交稳定身份字段，后端会在 pending confirmation 候选集合内再次校验。
-    submitResume('approve', '用户确认目标论文', {
-      pending_action_id: action.pending_action_id,
-      confirmed_paper_id: candidateId,
-      confirmed_arxiv_id: candidate.arxiv_id || candidate.arxivId || candidate.id || null
-    })
+    // 客户端只提交候选身份，后端必须在 interaction 保存的候选集合内重新校验。
+    submitResume('select', '用户选择目标论文', { candidate_id: candidateId })
     return
   }
-
-  if (await submitIndexBuildContinuation()) {
-    return
-  }
-  submitResume('approve', '用户在确认卡片中批准执行')
+  submitResume('approve', '用户批准执行副作用操作')
 }
 
-async function handleCancelPendingAction() {
-  if (await cancelIndexBuildContinuation()) {
-    return
-  }
-  submitResume('reject', '用户在确认卡片中拒绝执行')
+function handleCancelInteraction() {
+  submitResume(currentInteraction.value?.kind === 'target_selection' ? 'cancel' : 'reject', '用户取消当前交互')
 }
 
 function handleViewDetail(id: string) {
@@ -132,18 +112,15 @@ function toAgentResponse(response: unknown): ArxivSearchResponse | null {
   return response as ArxivSearchResponse | null
 }
 
-function visiblePendingActionForResponse(response: ArxivSearchResponse | null): AgentPendingAction | null {
-  if (!response?.pending_action || !pendingAction.value) return null
-  const responseKey = getAgentPendingActionKey(response.pending_action)
-  const activeKey = getAgentPendingActionKey(pendingAction.value)
-  // pending action 是可消费状态，必须和当前活跃确认匹配，避免旧消息残留可点击确认卡。
-  return responseKey && activeKey && responseKey === activeKey ? pendingAction.value : null
+function visibleInteractionForResponse(response: ArxivSearchResponse | null): AgentInteraction | null {
+  if (!response?.interaction || !currentInteraction.value) return null
+  return response.interaction.interaction_id === currentInteraction.value.interaction_id ? currentInteraction.value : null
 }
 
 function toAgentUserResultForMessage(response: unknown): AgentUserResult {
   const agentResponse = toAgentResponse(response)
   return toAgentUserResult(agentResponse, {
-    pendingAction: visiblePendingActionForResponse(agentResponse)
+    interaction: visibleInteractionForResponse(agentResponse)
   })
 }
 
@@ -241,8 +218,8 @@ watch(latestResponse, () => {
             :loading="loading"
             @view-detail="handleViewDetail"
             @label="handleLabel"
-            @confirm-pending-action="handleConfirmPendingAction"
-            @cancel-pending-action="handleCancelPendingAction"
+            @confirm-interaction="handleConfirmInteraction"
+            @cancel-interaction="handleCancelInteraction"
           />
         </template>
       </RagChatPanel>

@@ -122,7 +122,7 @@ class PaperIndexMissingRecoveryPolicy(_BaseRecoveryPolicy):
                 confidence=0.95,
                 reason="论文 QA 索引缺失，需要先征得用户确认，再执行解析和建索引这类外部副作用步骤。",
                 target_step_id=step.step_id,
-                required_tools=["request_confirmation", "parse_and_index_paper"],
+                required_tools=["parse_and_index_paper"],
                 patch_strategy="inject_index_confirmation_chain",
                 strategy_payload=build_repair_strategy_payload(
                     actions=[ASK_USER_TO_REBUILD_INDEX],
@@ -297,14 +297,14 @@ class PaperIndexStaleOrCorruptedRecoveryPolicy(_BaseRecoveryPolicy):
             )
         candidates.append(
             RecoveryCandidate(
-                candidate_id=f"{step.step_id}:request_confirmation_to_rebuild_index",
+                candidate_id=f"{step.step_id}:guarded_rebuild_index",
                 action_type="patch_plan",
                 failure_category=observation.failure_category or "paper_index_corrupted",
                 priority=75,
                 confidence=0.8,
                 reason="重建索引是高成本 external_call，必须通过确认链路触发。",
                 target_step_id=step.step_id,
-                required_tools=["request_confirmation", "parse_and_index_paper"],
+                required_tools=["parse_and_index_paper"],
                 patch_strategy="inject_index_confirmation_chain",
                 risk_level="high",
                 requires_confirmation=True,
@@ -494,7 +494,7 @@ class RecoveryPolicyRegistry:
         tool_recovery_policy = self._step_tool_recovery_policy(step)
         allowed_modes = {str(item) for item in list(tool_recovery_policy.get("modes") or []) if str(item or "").strip()}
         # ToolContract 的 recovery_policy 是工具级安全边界；显式 fallback/clarification 仍保留，
-        # 但会静默过滤掉 contract 没声明过的主动 retry/patch/request_confirmation 候选。
+        # 但会静默过滤掉 contract 没声明过的主动 retry/patch 候选。
         if allowed_modes and candidate.action_type not in allowed_modes and candidate.action_type not in {"fallback_answer", "ask_clarification"}:
             return None
         return candidate.model_copy(

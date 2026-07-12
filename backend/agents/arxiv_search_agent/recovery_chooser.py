@@ -181,8 +181,6 @@ class RecoveryChooser:
             return "retry_same_step" if not candidate.patch_strategy else "patch_current_step_inputs"
         if candidate.action_type == "ask_clarification":
             return "ask_clarification"
-        if candidate.action_type == "request_confirmation":
-            return "request_confirmation"
         if candidate.action_type == "fallback_answer":
             return "fallback_answer"
         if candidate.action_type == "abort_with_error":

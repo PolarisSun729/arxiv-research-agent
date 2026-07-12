@@ -1068,13 +1068,14 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(loaded["backend_memory"]["selected_paper"]["arxiv_id"], self.arxiv_id)
         # 前端选中论文只能作为候选输入，不能覆盖后端持久化的会话焦点和待确认状态。
         self.assertEqual(loaded["merged_context"]["selected_paper"]["arxiv_id"], self.arxiv_id)
-        self.assertEqual(loaded["merged_context"]["pending_action"], loaded["backend_memory"]["pending_action"])
+        self.assertNotIn("pending_action", loaded["merged_context"])
+        self.assertNotIn("pending_action", loaded["backend_memory"])
         self.assertEqual(loaded["merged_context"]["frontend_visible_paper"]["arxiv_id"], "frontend-paper")
         self.assertEqual(loaded["merged_context"]["ui_tab"], "detail")
         self.assertNotIn("unknown_cache", loaded["merged_context"])
         merge_debug = loaded["context_merge_debug"]
         self.assertEqual(merge_debug["frontend_accepted_fields"]["selected_paper"], "frontend_visible_paper")
-        self.assertEqual(merge_debug["frontend_ignored_fields"]["pending_action"], "backend_authoritative")
+        self.assertEqual(merge_debug["frontend_ignored_fields"]["pending_action"], "not_allowlisted")
         self.assertEqual(merge_debug["frontend_ignored_fields"]["research_profile"], "backend_authoritative")
         self.assertEqual(merge_debug["frontend_ignored_fields"]["unknown_cache"], "not_allowlisted")
 

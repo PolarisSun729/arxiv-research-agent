@@ -22,7 +22,6 @@ if TYPE_CHECKING:
     from services.retrieval.enhanced_retrieval_service import EnhancedRetrievalService
     from services.storage.sqlite import StorageContainer
     from services.storage.sqlite.stores import (
-        AgentQAIndexContinuationStore,
         AgentRuntimeCheckpointStore,
         AgentSessionStore,
         InterestVectorStore,
@@ -105,10 +104,6 @@ def get_research_profile_store() -> ResearchProfileStore:
 
 def get_agent_session_store() -> AgentSessionStore:
     return get_storage_container().agent_sessions
-
-
-def get_agent_qa_index_continuation_store() -> AgentQAIndexContinuationStore:
-    return get_storage_container().agent_qa_index_continuations
 
 
 def get_agent_runtime_checkpoint_store() -> AgentRuntimeCheckpointStore:

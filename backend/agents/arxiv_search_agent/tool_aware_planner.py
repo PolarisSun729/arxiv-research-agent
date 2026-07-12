@@ -67,7 +67,6 @@ class ToolCandidateSelector:
             "check_paper_index",
             "answer_paper_question",
             "assess_paper_qa_quality",
-            "request_confirmation",
             "parse_and_index_paper",
         },
         "recommendation": {
@@ -198,7 +197,7 @@ class ToolCandidateSelector:
                 allowed_tool_names = {"resolve_paper", "analyze_ambiguity", "generate_clarification"}
                 notes.append("paper_target_missing_prefer_resolve_or_clarification")
             if qa_index_state in {"missing", "stale", "failed"}:
-                allowed_tool_names.update({"request_confirmation", "parse_and_index_paper"})
+                allowed_tool_names.add("parse_and_index_paper")
                 notes.append(f"qa_index_{qa_index_state}_include_index_candidates")
             elif not _planner_has_qa_result(planner_context):
                 notes.append("qa_index_unknown_check_before_answer")
@@ -354,7 +353,6 @@ class LLMPlanDraftGenerator:
                 "intent": planner_context.intent,
                 "selected_paper": planner_context.selected_paper,
                 "paper_qa_result": planner_context.paper_qa_result,
-                "pending_action": planner_context.pending_action,
                 "session_state": dict(planner_context.session_state or {}),
             },
         )
@@ -376,7 +374,6 @@ class LLMPlanDraftGenerator:
                 "has_selected_paper": bool(planner_context.selected_paper),
                 "last_papers_count": len(list(planner_context.last_papers or [])),
                 "paper_qa_result_status": (planner_context.paper_qa_result or {}).get("status") if isinstance(planner_context.paper_qa_result, Mapping) else None,
-                "pending_action_type": (planner_context.pending_action or {}).get("type") if isinstance(planner_context.pending_action, Mapping) else None,
             },
             "current_state_summary": {
                 "intent": state.intent,
@@ -1727,8 +1724,6 @@ def _context_mapping_from_planner_context(planner_context: PlannerContext, state
         merged["last_papers"] = planner_context.last_papers
     if planner_context.paper_qa_result:
         merged["paper_qa_result"] = planner_context.paper_qa_result
-    if planner_context.pending_action:
-        merged["pending_action"] = planner_context.pending_action
     if planner_context.user_memory_summary not in (None, "", [], {}):
         merged.setdefault("user_memory_summary", planner_context.user_memory_summary)
     if planner_context.research_profile not in (None, "", [], {}):
@@ -1744,8 +1739,6 @@ def _planner_context_used_fields(planner_context: PlannerContext) -> List[str]:
         fields.append("last_papers")
     if planner_context.paper_qa_result:
         fields.append("paper_qa_result")
-    if planner_context.pending_action:
-        fields.append("pending_action")
     if planner_context.user_memory_summary not in (None, "", [], {}):
         fields.append("user_memory_summary")
     if planner_context.research_profile not in (None, "", [], {}):
@@ -1790,7 +1783,6 @@ def _planner_qa_index_state(planner_context: PlannerContext) -> Optional[str]:
         result.get("qa_index_status"),
         result.get("index_status"),
         result.get("error"),
-        (planner_context.pending_action or {}).get("status") if isinstance(planner_context.pending_action, Mapping) else None,
     ]
     for item in candidates:
         text = str(item or "").strip().lower()

@@ -226,7 +226,6 @@ def build_clarification_diagnostic(
     context: Any = None,
     goal: Any = None,
     user_id: Any = None,
-    pending_action: Any = None,
     search_spec: Any = None,
 ) -> Dict[str, Any]:
     """构造稳定的澄清诊断结果。
@@ -240,9 +239,6 @@ def build_clarification_diagnostic(
     normalized_message = _normalize_text(message) or ""
     context_mapping = dict(context) if isinstance(context, Mapping) else {}
     goal_mapping = _coerce_mapping(goal)
-    pending_mapping = dict(pending_action) if isinstance(pending_action, Mapping) else {}
-    if not pending_mapping and isinstance(context_mapping.get("pending_action"), Mapping):
-        pending_mapping = dict(context_mapping.get("pending_action") or {})
     search_spec_mapping = _coerce_mapping(search_spec)
 
     selected_paper = _coerce_mapping(context_mapping.get("selected_paper"))
@@ -264,7 +260,6 @@ def build_clarification_diagnostic(
     inferred_intent, confidence = _infer_intent(
         normalized_message,
         preferred_intent=preferred_intent,
-        pending_action=pending_mapping,
     )
     if inferred_intent not in SUPPORTED_INTENTS:
         inferred_intent = "unclear"
@@ -276,8 +271,6 @@ def build_clarification_diagnostic(
     has_contextual_paper_reference = _message_has_contextual_paper_reference(normalized_message)
     has_question = _has_question_content(normalized_message)
     has_profile_context = user_memory_summary not in (None, "", [], {}) or research_profile not in (None, "", [], {})
-    has_pending_confirmation = _has_pending_confirmation(pending_mapping)
-    confirmation_decision = _extract_confirmation_decision(normalized_message)
     preference_action = _extract_preference_action_kind(normalized_message)
     scope_too_broad = _is_scope_too_broad(
         inferred_intent=inferred_intent,
@@ -306,27 +299,15 @@ def build_clarification_diagnostic(
             )
         )
     elif inferred_intent == "confirmation":
-        if not has_pending_confirmation:
-            details.append(
-                _missing_detail(
-                    "confirmation_request",
-                    "当前没有待确认的任务，系统无法判断你这句“同意/拒绝”对应哪一步。",
-                    "请先告诉我你要确认哪一步，或者重新发起需要确认的请求。",
-                )
+        # 批准和拒绝只能通过 interaction resume API 提交，普通消息不具备恢复权限。
+        details.append(
+            _missing_detail(
+                "interaction_resume",
+                "当前消息不是结构化交互恢复请求，不能作为批准或拒绝凭据。",
+                "请在待处理交互中提交选择、批准或取消操作。",
             )
-            reason = "missing_confirmation_request"
-        elif not confirmation_decision:
-            details.append(
-                _missing_detail(
-                    "confirmation_decision",
-                    "当前确实有待确认任务，但这条消息没有明确表达是批准还是拒绝。",
-                    "请直接回复“同意”或“拒绝”。",
-                )
-            )
-            reason = "missing_confirmation_decision"
-        else:
-            reason = "confirmation_ready"
-            resolution_strategy = "continue_without_clarification"
+        )
+        reason = "structured_interaction_resume_required"
     elif inferred_intent == "arxiv_search":
         if not has_search_constraints:
             details.append(
@@ -491,7 +472,6 @@ def build_clarification_diagnostic(
         "used_context_fields": _used_context_fields(
             selected_paper=selected_paper,
             last_papers=last_papers,
-            pending_action=pending_mapping,
             user_memory_summary=user_memory_summary,
             research_profile=research_profile,
             normalized_user_id=normalized_user_id,
@@ -516,15 +496,12 @@ def _infer_intent(
     message: str,
     *,
     preferred_intent: Optional[str],
-    pending_action: Mapping[str, Any],
 ) -> tuple[str, float]:
     normalized_preferred = _normalize_intent(preferred_intent)
     if normalized_preferred == "unsupported":
         return "unsupported", 0.92
     if normalized_preferred in SUPPORTED_INTENTS and normalized_preferred not in {"unclear", "unsupported"}:
         return normalized_preferred, 0.92
-    if _extract_confirmation_decision(message) and _has_pending_confirmation(pending_action):
-        return "confirmation", 0.9
     if _extract_confirmation_decision(message):
         return "confirmation", 0.82
 
@@ -709,19 +686,6 @@ def _target_paper_reason(resolved_target: Mapping[str, Any], has_contextual_pape
     return "当前没有可解析的目标论文，无法继续摘要、细节解释或论文问答。"
 
 
-def _has_pending_confirmation(pending_action: Mapping[str, Any]) -> bool:
-    if not isinstance(pending_action, Mapping) or not pending_action:
-        return False
-    status = str(pending_action.get("status") or "").strip().lower()
-    if status == "cancelled":
-        return False
-    return bool(
-        pending_action.get("step_id")
-        or pending_action.get("confirmation_request")
-        or str(pending_action.get("type") or "").strip()
-    )
-
-
 def _extract_confirmation_decision(message: str) -> Optional[str]:
     normalized = str(message or "").strip().lower()
     if not normalized:
@@ -779,7 +743,6 @@ def _used_context_fields(
     *,
     selected_paper: Mapping[str, Any],
     last_papers: Sequence[Mapping[str, Any]],
-    pending_action: Mapping[str, Any],
     user_memory_summary: Any,
     research_profile: Any,
     normalized_user_id: Optional[str],
@@ -790,8 +753,6 @@ def _used_context_fields(
         fields.append("selected_paper")
     if last_papers:
         fields.append("last_papers")
-    if pending_action:
-        fields.append("pending_action")
     if user_memory_summary not in (None, "", [], {}):
         fields.append("user_memory_summary")
     if research_profile not in (None, "", [], {}):

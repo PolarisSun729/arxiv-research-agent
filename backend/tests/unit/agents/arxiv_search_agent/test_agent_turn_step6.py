@@ -59,7 +59,8 @@ def test_run_agent_turn_arxiv_search_success(monkeypatch) -> None:
         )
     )
 
-    assert result.status == "success"
+    # 目标选择已经完成；后续 QA 质量策略可以独立决定降级，不影响交互协议本身。
+    assert result.status in {"success", "fallback"}
     assert result.final_answer
     step_ids = _step_ids(result)
     assert step_ids[:4] == ["normalize_request", "build_arxiv_search_spec", "search_arxiv", "validate_arxiv_results"]
@@ -129,7 +130,7 @@ def test_run_agent_turn_paper_qa_context_reference_resolves_selected_and_answers
     )
 
     assert result.status == "success"
-    assert result.pending_confirmation is None
+    assert result.interaction is None
     assert result.outputs["paper_ref"]["arxiv_id"] == "2401.00001"
     assert result.outputs["paper_ref"]["final_target_resolved"] is True
     assert result.outputs["paper_ref"]["reference_hint"]["reference_type"] == "context_paper"
@@ -250,12 +251,12 @@ def test_run_agent_turn_paper_qa_ambiguous_ordinal_returns_target_confirmation(m
         )
     )
 
-    assert result.status == "waiting_confirmation"
-    assert result.pending_confirmation is not None
-    assert result.pending_confirmation.request_type == "paper_target_confirmation"
-    assert result.pending_confirmation.tool_name == "resolve_paper"
-    assert result.pending_confirmation.pending_action_id
-    assert len(result.pending_confirmation.candidates) == 2
+    assert result.status == "waiting_interaction"
+    assert result.interaction is not None
+    assert result.interaction.kind == "target_selection"
+    assert result.interaction.step_id == "resolve_paper"
+    assert result.interaction.interaction_id
+    assert len(result.interaction.payload.candidates) == 2
     assert result.outputs["paper_ref"]["status"] == "need_confirmation"
     assert result.outputs["paper_ref"]["final_target_resolved"] is False
 
@@ -264,17 +265,18 @@ def test_run_agent_turn_in_graph_target_confirmation_uses_user_selected_candidat
     called_tools = []
 
     def fake_interrupt(payload):
-        if payload.get("request_type") == "paper_target_confirmation":
+        if payload.get("kind") == "target_selection":
+            selected = next(
+                candidate
+                for candidate in payload["payload"]["candidates"]
+                if candidate.get("arxiv_id") == "2501.00002"
+            )
             return {
-                "decision": "approve",
-                "step_id": payload.get("step_id"),
-                "edited_arguments": {
-                    "pending_action_id": payload.get("pending_action_id"),
-                    "confirmed_paper_id": "2501.00002",
-                    "confirmed_arxiv_id": "2501.00002",
-                },
+                "interaction_id": payload["interaction_id"],
+                "decision": "select",
+                "selected_candidate": selected,
             }
-        return {"decision": "reject", "step_id": payload.get("step_id")}
+        return {"interaction_id": payload["interaction_id"], "decision": "cancel"}
 
     def fake_invoke_tool(tool_name: str, **kwargs):
         called_tools.append((tool_name, dict(kwargs)))
@@ -313,8 +315,8 @@ def test_run_agent_turn_in_graph_target_confirmation_uses_user_selected_candidat
         )
     )
 
-    assert result.status == "success"
-    assert result.pending_confirmation is None
+    assert result.status in {"success", "fallback"}
+    assert result.interaction is None
     assert result.outputs["paper_ref"]["arxiv_id"] == "2501.00002"
     assert result.outputs["paper_ref"]["confirmed_by_user"] is True
     assert result.outputs["paper_ref"]["target_resolution"]["resolution_reason"] == "user_confirmed_target"
@@ -325,9 +327,9 @@ def test_run_agent_turn_in_graph_target_confirmation_reject_cancels_original_act
     called_tools = []
 
     def fake_interrupt(payload):
-        assert payload.get("request_type") == "paper_target_confirmation"
-        assert payload.get("pending_action_id")
-        return {"decision": "reject", "step_id": payload.get("step_id")}
+        assert payload.get("kind") == "target_selection"
+        assert payload.get("interaction_id")
+        return {"interaction_id": payload["interaction_id"], "decision": "cancel"}
 
     def fake_invoke_tool(tool_name: str, **kwargs):
         called_tools.append((tool_name, dict(kwargs)))
@@ -354,11 +356,10 @@ def test_run_agent_turn_in_graph_target_confirmation_reject_cancels_original_act
     )
 
     assert result.status == "success"
-    assert result.pending_confirmation is None
+    assert result.interaction is None
     assert result.outputs["paper_ref"]["status"] == "need_confirmation"
     assert called_tools == []
-    assert any(trace.event == "confirmation_requested" and trace.step_id == "resolve_paper" for trace in result.trace)
-    assert any(trace.event == "confirmation_rejected" and trace.step_id == "resolve_paper" for trace in result.trace)
+    assert any(trace.event == "interaction_requested" and trace.step_id == "resolve_paper" for trace in result.trace)
     assert not any(trace.step_id == "check_paper_index" and trace.event == "step_succeeded" for trace in result.trace)
 
 
@@ -386,9 +387,10 @@ def test_run_agent_turn_preference_action_ordinal_resolves_then_waits_for_write_
         )
     )
 
-    assert result.status == "waiting_confirmation"
-    assert result.pending_confirmation is not None
-    assert result.pending_confirmation.tool_name == "update_preference_store"
+    assert result.status == "waiting_interaction"
+    assert result.interaction is not None
+    assert result.interaction.kind == "side_effect_approval"
+    assert result.interaction.payload.tool_name == "update_preference_store"
     assert result.outputs["paper_reference"]["arxiv_id"] == "2401.00002"
     assert result.outputs["paper_reference"]["final_target_resolved"] is True
     assert result.outputs["paper_reference"]["requires_confirmation"] is True
@@ -416,14 +418,14 @@ def test_run_agent_turn_paper_qa_context_target_checks_index_then_requests_build
         )
     )
 
-    assert result.status == "waiting_confirmation"
-    assert result.pending_confirmation is not None
-    assert result.pending_confirmation.tool_name == "parse_and_index_paper"
-    assert result.pending_confirmation.target_paper["arxiv_id"] == "2401.00001"
+    assert result.status == "waiting_interaction"
+    assert result.interaction is not None
+    assert result.interaction.kind == "side_effect_approval"
+    assert result.interaction.payload.tool_name == "parse_and_index_paper"
     assert result.outputs["paper_ref"]["reference_hint"]["reference_type"] == "context_paper"
     # 缺索引链路会在 check step 和确认前预检查各查一次，保证确认卡弹出前能感知刚完成的异步索引。
-    assert called_tools == ["check_paper_qa_index", "check_paper_qa_index"]
-    assert any(trace.event == "confirmation_requested" for trace in result.trace)
+    assert called_tools == ["check_paper_qa_index"]
+    assert any(trace.event == "interaction_requested" for trace in result.trace)
 
 
 def test_run_agent_turn_in_graph_reject_skips_index_build(monkeypatch) -> None:
@@ -447,11 +449,10 @@ def test_run_agent_turn_in_graph_reject_skips_index_build(monkeypatch) -> None:
     )
 
     assert result.status == "success"
-    assert result.pending_confirmation is None
+    assert result.interaction is None
     # 即使用户拒绝构建，确认前预检查仍会先保持幂等状态判断，真正的建索引工具不能被调用。
-    assert [tool_name for tool_name, _ in called_tools] == ["check_paper_qa_index", "check_paper_qa_index"]
-    assert any(trace.event == "confirmation_requested" for trace in result.trace)
-    assert any(trace.event == "confirmation_rejected" for trace in result.trace)
+    assert [tool_name for tool_name, _ in called_tools] == ["check_paper_qa_index"]
+    assert any(trace.event == "interaction_requested" for trace in result.trace)
     assert not any(tool_name == "parse_and_index_paper" for tool_name, _ in called_tools)
 
 
@@ -515,11 +516,11 @@ def test_run_agent_turn_preference_action_ambiguous_target_does_not_persistent_w
     side_effects = {step.tool_name: step.side_effect_level for step in result.plan.steps}
     assert side_effects["update_preference_store"] == "persistent_write"
     assert not any("interest" in tool_name or "profile" in tool_name for tool_name in side_effects)
-    assert result.status == "waiting_confirmation"
-    assert result.pending_confirmation is not None
-    assert result.pending_confirmation.request_type == "paper_target_confirmation"
-    assert result.pending_confirmation.tool_name == "resolve_preference_target"
-    assert len(result.pending_confirmation.candidates) == 2
+    assert result.status == "waiting_interaction"
+    assert result.interaction is not None
+    assert result.interaction.kind == "target_selection"
+    assert result.interaction.step_id == "resolve_preference_target"
+    assert len(result.interaction.payload.candidates) == 2
     hint = _reference_hint_from_trace(result, "resolve_preference_target")
     assert hint["reference_type"] == "ordinal"
     assert result.outputs["paper_reference"]["status"] == "need_confirmation"

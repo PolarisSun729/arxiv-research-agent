@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import asyncio
@@ -24,7 +25,7 @@ except Exception:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 CHECKPOINT_STATUS_RUNNING = "running"
-CHECKPOINT_STATUS_WAITING = "waiting_confirmation"
+CHECKPOINT_STATUS_WAITING_INTERACTION = "waiting_interaction"
 CHECKPOINT_STATUS_COMPLETED = "completed"
 CHECKPOINT_STATUS_CANCELLED = "cancelled"
 CHECKPOINT_STATUS_FAILED = "failed"
@@ -248,6 +249,7 @@ class SqliteAgentCheckpointer(BaseCheckpointSaver):  # type: ignore[misc]
         writes: Iterable[Tuple[str, Any]],
         task_id: str,
         task_path: str = "",
+
     ) -> None:
         del task_path
         thread_id = _thread_id_from_config(config)
@@ -298,7 +300,7 @@ class AgentRuntimeCheckpointManager:
     """维护 Agent 业务级 runtime checkpoint。
 
     这里负责 session/thread/user 校验、pending confirmation 真源、终态标记和过期清理；
-    不读取 agent_sessions.pending_action/debug，避免展示态或排查快照反向驱动真实恢复。
+    不读取会话展示态或 debug，避免排查快照反向驱动真实恢复。
     """
 
     def __init__(self, runtime_checkpoint_store: AgentRuntimeCheckpointStore) -> None:
@@ -328,19 +330,10 @@ class AgentRuntimeCheckpointManager:
             return
         runtime_state = payload.get("runtime_state") if isinstance(payload.get("runtime_state"), Mapping) else None
         plan_runtime = payload.get("plan_runtime") if isinstance(payload.get("plan_runtime"), Mapping) else None
-        pending_confirmation = _extract_pending_confirmation(payload)
-        status = _status_from_state(payload, pending_confirmation=pending_confirmation)
-        expires_at = _iso(_utcnow() + timedelta(seconds=self.ttl_seconds)) if status == CHECKPOINT_STATUS_WAITING else None
+        interaction = _extract_interaction(payload)
+        status = _status_from_state(payload, interaction=interaction)
+        expires_at = _iso(_utcnow() + timedelta(seconds=self.ttl_seconds)) if status == CHECKPOINT_STATUS_WAITING_INTERACTION else None
         error_summary = _extract_error_summary(payload)
-        if _is_consumed_confirmation_replay(
-            self.runtime_checkpoint_store,
-            user_id=user_id,
-            session_id=session_id,
-            thread_id=session_id,
-            status=status,
-            pending_confirmation=pending_confirmation,
-        ):
-            return
         self.runtime_checkpoint_store.upsert_agent_runtime_checkpoint(
             user_id=user_id,
             session_id=session_id,
@@ -351,86 +344,13 @@ class AgentRuntimeCheckpointManager:
                 "intent": payload.get("intent"),
                 "steps": payload.get("steps") or [],
             },
-            pending_confirmation=pending_confirmation,
+            interaction=interaction,
+            schema_version=2,
             current_node=current_node or _extract_current_node(payload),
             next_route=next_route or _next_route_from_status(status),
             status=status,
             error_summary=error_summary,
             expires_at=expires_at,
-        )
-
-    def validate_resume(
-        self,
-        *,
-        user_id: Optional[str],
-        session_id: str,
-        thread_id: str,
-        resume_payload: Mapping[str, Any],
-    ) -> Dict[str, Any]:
-        self.runtime_checkpoint_store.expire_agent_runtime_checkpoints(now=_iso(_utcnow()))
-        checkpoint = self.runtime_checkpoint_store.get_agent_runtime_checkpoint(
-            user_id=str(user_id or "").strip(),
-            session_id=session_id,
-            thread_id=thread_id,
-        )
-        if not checkpoint:
-            raise AgentRuntimeCheckpointError(thread_id=thread_id, reason="checkpoint_missing")
-        status = str(checkpoint.get("status") or "").strip()
-        if status != CHECKPOINT_STATUS_WAITING:
-            raise AgentRuntimeCheckpointError(thread_id=thread_id, reason=f"checkpoint_not_waiting:{status or 'unknown'}")
-        pending_confirmation = checkpoint.get("pending_confirmation")
-        if not isinstance(pending_confirmation, Mapping) or not pending_confirmation:
-            raise AgentRuntimeCheckpointError(thread_id=thread_id, reason="pending_confirmation_missing")
-        expected_step_id = str(pending_confirmation.get("step_id") or "").strip()
-        requested_step_id = str(resume_payload.get("step_id") or "").strip()
-        if requested_step_id and expected_step_id and requested_step_id != expected_step_id:
-            raise AgentRuntimeCheckpointError(thread_id=thread_id, reason="step_id_mismatch")
-        expected_tool_name = str(pending_confirmation.get("tool_name") or "").strip()
-        requested_tool_name = str(resume_payload.get("tool_name") or "").strip()
-        if requested_tool_name and expected_tool_name and requested_tool_name != expected_tool_name:
-            raise AgentRuntimeCheckpointError(thread_id=thread_id, reason="tool_name_mismatch")
-        expected_pending_action_id = str(pending_confirmation.get("pending_action_id") or "").strip()
-        requested_pending_action_id = str(resume_payload.get("pending_action_id") or "").strip()
-        if requested_pending_action_id and expected_pending_action_id and requested_pending_action_id != expected_pending_action_id:
-            raise AgentRuntimeCheckpointError(thread_id=thread_id, reason="pending_action_id_mismatch")
-        return checkpoint
-
-    def consume_pending_confirmation(
-        self,
-        *,
-        user_id: Optional[str],
-        session_id: str,
-        thread_id: str,
-        resume_payload: Mapping[str, Any],
-    ) -> None:
-        """把待确认 checkpoint 从 waiting 原子切到 running。
-
-        validate_resume 只说明“当前存在可恢复确认”；真正防止连续点击要在进入
-        Command(resume) 前抢占同一条 pending_confirmation。抢占失败说明它已经被
-        另一个请求消费，当前请求必须停止，不能再创建新的确认或重复执行工具。
-        """
-        consumed = bool(
-            self.runtime_checkpoint_store.consume_agent_runtime_pending_confirmation(
-                user_id=str(user_id or "").strip(),
-                session_id=session_id,
-                thread_id=thread_id,
-                next_route=CHECKPOINT_STATUS_RUNNING,
-                decision=str(resume_payload.get("decision") or "").strip().lower(),
-                step_id=str(resume_payload.get("step_id") or "").strip(),
-                tool_name=str(resume_payload.get("tool_name") or "").strip(),
-                pending_action_id=str(resume_payload.get("pending_action_id") or "").strip(),
-            )
-        )
-        if not consumed:
-            raise AgentRuntimeCheckpointError(thread_id=thread_id, reason="confirmation_already_consumed")
-        logger.info(
-            "arxiv_agent confirmation_consumed: session_id=%s thread_id=%s step_id=%s tool_name=%s pending_action_id=%s decision=%s source=runtime_checkpoint",
-            session_id,
-            thread_id,
-            resume_payload.get("step_id"),
-            resume_payload.get("tool_name"),
-            resume_payload.get("pending_action_id"),
-            resume_payload.get("decision"),
         )
 
     def mark_terminal(self, state: Any, *, status: str, error_summary: Optional[str] = None) -> None:
@@ -444,19 +364,17 @@ class AgentRuntimeCheckpointManager:
             thread_id=session_id,
             status=status,
             error_summary=error_summary or _extract_error_summary(payload),
-            clear_pending_confirmation=True,
+            clear_interaction=True,
         )
         if updated:
             return
-        # 普通非确认请求可能此前没有等待现场；这里补一条终态 checkpoint，保证 completed/failed/cancelled
-        # 都有可查询记录，同时不引入 pending_confirmation。
+        # 普通请求可能此前没有等待现场；这里补一条终态 checkpoint，保证生命周期可查询。
         self.runtime_checkpoint_store.upsert_agent_runtime_checkpoint(
             user_id=str(payload.get("user_id") or "").strip(),
             session_id=session_id,
             thread_id=session_id,
             runtime_state=payload.get("runtime_state") if isinstance(payload.get("runtime_state"), Mapping) else None,
             graph_state={"session_id": session_id, "intent": payload.get("intent"), "steps": payload.get("steps") or []},
-            pending_confirmation=None,
             current_node=_extract_current_node(payload),
             next_route=_next_route_from_status(status),
             status=status,
@@ -501,21 +419,35 @@ def _state_payload(state: Any) -> Dict[str, Any]:
     return {}
 
 
-def _extract_pending_confirmation(payload: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    # pending_confirmation 是 resume 的业务真源，只允许来自 runtime_state/plan_runtime。
-    # debug.pending_confirmation 只是排查快照，可能在 approve 后残留，不能重新写成 waiting_confirmation。
-    runtime_state_present = isinstance(payload.get("runtime_state"), Mapping)
-    if runtime_state_present:
-        pending = dict(payload.get("runtime_state") or {}).get("pending_confirmation")
-        return _json_safe(pending) if isinstance(pending, Mapping) else None
+def _extract_interaction(payload: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """读取唯一 interaction 真源，不从 debug、context 或展示字段恢复业务状态。"""
+
+    runtime_state = payload.get("runtime_state") if isinstance(payload.get("runtime_state"), Mapping) else {}
+    interaction = runtime_state.get("interaction")
+    if isinstance(interaction, Mapping):
+        return _json_safe(interaction)
     plan_runtime = payload.get("plan_runtime") if isinstance(payload.get("plan_runtime"), Mapping) else {}
-    pending = plan_runtime.get("pending_confirmation")
-    return _json_safe(pending) if isinstance(pending, Mapping) else None
+    interaction = plan_runtime.get("interaction")
+    return _json_safe(interaction) if isinstance(interaction, Mapping) else None
 
 
-def _status_from_state(payload: Mapping[str, Any], *, pending_confirmation: Optional[Mapping[str, Any]]) -> str:
-    if pending_confirmation:
-        return CHECKPOINT_STATUS_WAITING
+def _extract_error_summary(payload: Mapping[str, Any]) -> Optional[str]:
+    """只从正式运行态提取终态错误，禁止 debug 或展示字段影响 checkpoint 生命周期。"""
+    runtime_state, plan_runtime = _business_runtime_payloads(payload)
+    for value in (runtime_state.get("error"), plan_runtime.get("error"), payload.get("error")):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _status_from_state(
+    payload: Mapping[str, Any],
+    *,
+    interaction: Optional[Mapping[str, Any]] = None,
+) -> str:
+    if interaction:
+        return CHECKPOINT_STATUS_WAITING_INTERACTION
     runtime_state, plan_runtime = _business_runtime_payloads(payload)
     turn_status = str(runtime_state.get("turn_status") or plan_runtime.get("turn_status") or "").strip()
     error = _extract_error_summary(payload)
@@ -529,64 +461,10 @@ def _status_from_state(payload: Mapping[str, Any], *, pending_confirmation: Opti
     return CHECKPOINT_STATUS_RUNNING
 
 
-def _is_consumed_confirmation_replay(
-    runtime_checkpoint_store: Any,
-    *,
-    user_id: str,
-    session_id: str,
-    thread_id: str,
-    status: str,
-    pending_confirmation: Optional[Mapping[str, Any]],
-) -> bool:
-    """判断当前 waiting 快照是否只是已消费确认的旧流式回放。"""
-    if status != CHECKPOINT_STATUS_WAITING or not isinstance(pending_confirmation, Mapping):
-        return False
-    pending_step_id = str(pending_confirmation.get("step_id") or "").strip()
-    if not pending_step_id:
-        return False
-    existing = runtime_checkpoint_store.get_agent_runtime_checkpoint(
-        user_id=user_id,
-        session_id=session_id,
-        thread_id=thread_id,
-    )
-    if not isinstance(existing, Mapping):
-        return False
-    if str(existing.get("status") or "").strip() != CHECKPOINT_STATUS_RUNNING:
-        return False
-    if existing.get("pending_confirmation"):
-        return False
-    runtime_state = existing.get("runtime_state") if isinstance(existing.get("runtime_state"), Mapping) else {}
-    approved_step_ids = {str(item).strip() for item in list(runtime_state.get("approved_step_ids") or []) if str(item).strip()}
-    # LangGraph resume 后可能先吐出中断前的旧状态；如果业务 checkpoint 已经记录同一 step 被批准，
-    # 这里必须保留 running 现场，避免旧 pending_confirmation 把恢复流程重新拉回等待确认。
-    return pending_step_id in approved_step_ids
-
-
-def _extract_error_summary(payload: Mapping[str, Any]) -> str:
-    runtime_state, plan_runtime = _business_runtime_payloads(payload)
-    errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
-    if runtime_state.get("failure_reason"):
-        return str(runtime_state.get("failure_reason"))
-    if plan_runtime.get("error"):
-        return str(plan_runtime.get("error"))
-    if errors:
-        return str((errors[-1] or {}).get("code") or (errors[-1] or {}).get("message") or "")
-    return ""
-
-
-def _extract_current_node(payload: Mapping[str, Any]) -> str:
-    steps = payload.get("steps") if isinstance(payload.get("steps"), list) else []
-    if not steps:
-        return ""
-    latest = steps[-1] if isinstance(steps[-1], Mapping) else {}
-    return str(latest.get("step") or "").strip()
-
-
 def _business_runtime_payloads(payload: Mapping[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
     """返回参与 checkpoint 判定的业务运行态。
 
-    runtime_state 是跨节点/跨请求恢复的序列化快照；只要它存在，就不能再用旧的
-    plan_runtime 或 debug 字段补出 pending_confirmation，避免 approve 后被旧快照反向污染。
+    runtime_state 是跨节点/跨请求恢复的序列化快照；存在时不再回退其他镜像。
     """
     if isinstance(payload.get("runtime_state"), Mapping):
         return dict(payload.get("runtime_state") or {}), {}
@@ -603,8 +481,8 @@ def _is_confirmation_rejected_recovery(value: Any) -> bool:
 def _next_route_from_status(status: str) -> str:
     """从 checkpoint 业务状态生成可观测 route，避免读取 debug.agent_route 的旧决策。"""
     normalized = str(status or "").strip()
-    if normalized == CHECKPOINT_STATUS_WAITING:
-        return "waiting_confirmation"
+    if normalized == CHECKPOINT_STATUS_WAITING_INTERACTION:
+        return CHECKPOINT_STATUS_WAITING_INTERACTION
     if normalized in {CHECKPOINT_STATUS_COMPLETED, CHECKPOINT_STATUS_FAILED, CHECKPOINT_STATUS_CANCELLED, CHECKPOINT_STATUS_EXPIRED}:
         return normalized
     return CHECKPOINT_STATUS_RUNNING
@@ -620,5 +498,5 @@ __all__ = [
     "CHECKPOINT_STATUS_EXPIRED",
     "CHECKPOINT_STATUS_FAILED",
     "CHECKPOINT_STATUS_RUNNING",
-    "CHECKPOINT_STATUS_WAITING",
+    "CHECKPOINT_STATUS_WAITING_INTERACTION",
 ]

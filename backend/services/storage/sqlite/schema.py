@@ -255,28 +255,6 @@ class StorageSchemaMigrator:
             ''')
 
             cursor.execute(f'''
-                CREATE TABLE IF NOT EXISTS agent_qa_index_continuations (
-                    job_id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL DEFAULT '{default_user_id_sql}',
-                    session_id TEXT NOT NULL,
-                    arxiv_id TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'waiting_job',
-                    pending_action_id TEXT,
-                    step_id TEXT,
-                    tool_name TEXT,
-                    original_question TEXT,
-                    resume_payload_json TEXT,
-                    pending_action_json TEXT,
-                    job_snapshot_json TEXT,
-                    error_message TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    completed_at TIMESTAMP,
-                    FOREIGN KEY(job_id) REFERENCES paper_index_jobs(job_id)
-                )
-            ''')
-
-            cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS paper_chat_sessions (
                     session_id TEXT PRIMARY KEY,
                     user_id TEXT NOT NULL DEFAULT '{default_user_id_sql}',
@@ -488,7 +466,6 @@ class StorageSchemaMigrator:
                     status TEXT DEFAULT 'active',
                     selected_paper_json TEXT,
                     last_papers_json TEXT,
-                    pending_action_json TEXT,
                     paper_qa_result_json TEXT,
                     active_arxiv_id TEXT,
                     active_paper_session_id TEXT,
@@ -503,12 +480,13 @@ class StorageSchemaMigrator:
             cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS agent_runtime_checkpoints (
                     checkpoint_id TEXT PRIMARY KEY,
+                    schema_version INTEGER NOT NULL DEFAULT 2,
                     user_id TEXT NOT NULL DEFAULT '{default_user_id_sql}',
                     session_id TEXT NOT NULL,
                     thread_id TEXT NOT NULL,
                     runtime_state_json TEXT,
                     graph_state_json TEXT,
-                    pending_confirmation_json TEXT,
+                    interaction_json TEXT,
                     current_node TEXT,
                     next_route TEXT,
                     status TEXT NOT NULL DEFAULT 'running',
@@ -550,6 +528,42 @@ class StorageSchemaMigrator:
             ''')
 
             cursor.execute('''
+                CREATE TABLE IF NOT EXISTS approval_grants (
+                    grant_id TEXT PRIMARY KEY,
+                    interaction_id TEXT NOT NULL UNIQUE,
+                    user_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    plan_id TEXT NOT NULL,
+                    step_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    arguments_fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    approved_at TEXT NOT NULL,
+                    consumed_at TEXT,
+                    revoked_at TEXT
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS side_effect_invocations (
+                    invocation_id TEXT PRIMARY KEY,
+                    grant_id TEXT NOT NULL UNIQUE,
+                    plan_id TEXT NOT NULL,
+                    step_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    arguments_fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    prepared_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    result_summary_json TEXT,
+                    error_code TEXT,
+                    FOREIGN KEY(grant_id) REFERENCES approval_grants(grant_id)
+                )
+            ''')
+
+            cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_paper_chat_sessions_user_paper_updated
                 ON paper_chat_sessions(user_id, arxiv_id, updated_at DESC)
             ''')
@@ -562,16 +576,6 @@ class StorageSchemaMigrator:
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_paper_index_jobs_status_updated
                 ON paper_index_jobs(status, updated_at DESC)
-            ''')
-
-            cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_agent_qa_index_continuations_session
-                ON agent_qa_index_continuations(user_id, session_id, status, updated_at DESC)
-            ''')
-
-            cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_agent_qa_index_continuations_arxiv
-                ON agent_qa_index_continuations(arxiv_id, status, updated_at DESC)
             ''')
 
             cursor.execute('''
@@ -681,6 +685,20 @@ class StorageSchemaMigrator:
             self._ensure_paper_qa_index_version_rows(conn)
             self._ensure_paper_index_job_columns(conn)
             self._ensure_paper_chat_session_summary_columns(conn)
+            self._ensure_agent_runtime_checkpoint_v2_columns(conn)
+
+    def _ensure_agent_runtime_checkpoint_v2_columns(self, conn):
+        """补齐新 runtime 列，但不迁移旧确认内容；旧 schema 现场必须由恢复入口明确拒绝。"""
+
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(agent_runtime_checkpoints)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if "schema_version" not in existing_columns:
+            # 历史行保持版本 1，防止缺少参数绑定授权的旧确认被新执行链错误恢复。
+            cursor.execute("ALTER TABLE agent_runtime_checkpoints ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1")
+        if "interaction_json" not in existing_columns:
+            cursor.execute("ALTER TABLE agent_runtime_checkpoints ADD COLUMN interaction_json TEXT")
+        conn.commit()
 
     def _ensure_paper_qa_index_columns(self, conn):
         # 旧环境可能已经创建过 paper_qa_index；这里补齐 artifact 字段，保留失败后的文件与 collection 追踪。

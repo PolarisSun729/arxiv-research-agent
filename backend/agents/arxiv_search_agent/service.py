@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import json
@@ -31,15 +32,16 @@ except Exception:  # pragma: no cover
     _get_generation_service = None
 
 from .graph import build_arxiv_search_graph
+from .execution.interaction_runtime import InteractionRuntimeError, InteractionRuntimeService
+from .execution.interactions import AgentInteraction, InteractionResumeRequest
 from .runtime_checkpoint import (
     CHECKPOINT_STATUS_CANCELLED,
     CHECKPOINT_STATUS_COMPLETED,
     CHECKPOINT_STATUS_FAILED,
-    AgentRuntimeCheckpointError,
     AgentRuntimeCheckpointManager,
     build_agent_checkpointer,
 )
-from .schemas import AgentRuntimeState, AgentStep, AgentStreamEvent, ArxivSearchRequest, ArxivSearchResponse, ConfirmationRequest, ResumeRequest
+from .schemas import AgentRuntimeState, AgentStep, AgentStreamEvent, ArxivSearchRequest, ArxivSearchResponse
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -125,31 +127,16 @@ def _is_resume_request(request: ArxivSearchRequest) -> bool:
     return request.resume is not None
 
 
-def _build_resume_payload(resume: ResumeRequest) -> Dict[str, Any]:
-    """把前端 resume 请求裁剪成传给 Command(resume=...) 的轻量 payload。
+def _build_resume_payload(resume: InteractionResumeRequest) -> Dict[str, Any]:
+    """只投影业务 interaction 响应，禁止把 LangGraph 或工具内部身份暴露给客户端。"""
 
-    这里只保留执行恢复真正需要的字段，避免把完整请求上下文重复写入 checkpoint 恢复链路。
-    """
-    payload: Dict[str, Any] = {"decision": resume.decision}
-    if resume.note:
-        payload["note"] = resume.note
-    if resume.step_id:
-        payload["step_id"] = resume.step_id
-    if resume.interrupt_id:
-        payload["interrupt_id"] = resume.interrupt_id
-    if resume.tool_name:
-        payload["tool_name"] = resume.tool_name
-    if resume.pending_action_id:
-        payload["pending_action_id"] = resume.pending_action_id
-    if resume.edited_arguments:
-        payload["edited_arguments"] = dict(resume.edited_arguments)
-    return payload
+    return resume.model_dump(mode="json", exclude_none=True)
 
 
 def _build_runtime_checkpoint_manager(runtime_checkpoint_store: AgentRuntimeCheckpointStore) -> AgentRuntimeCheckpointManager:
     """创建业务 runtime checkpoint 管理器。
 
-    管理器只负责可恢复现场的持久化和校验，不读取 agent_sessions.pending_action，
+    管理器只负责可恢复现场的持久化和校验，不读取普通会话展示状态，
     避免前端展示镜像反向驱动真实恢复。
     """
     return AgentRuntimeCheckpointManager(runtime_checkpoint_store=runtime_checkpoint_store)
@@ -180,6 +167,7 @@ def _build_agent_graph(
     *,
     langgraph_checkpoint_store: LangGraphCheckpointStore,
     runtime_checkpoint_store: AgentRuntimeCheckpointStore,
+    approval_store: Any,
 ) -> Any:
     """构建带持久化 checkpointer 的 Agent 图。"""
     checkpointer = build_agent_checkpointer(langgraph_checkpoint_store=langgraph_checkpoint_store)
@@ -187,6 +175,7 @@ def _build_agent_graph(
         generation_service=generation_service,
         checkpointer=checkpointer,
         runtime_checkpoint_store=runtime_checkpoint_store,
+        approval_store=approval_store,
     )
 
 
@@ -194,55 +183,40 @@ def _ensure_resume_checkpoint(
     graph: Any,
     thread_id: str,
     *,
-    checkpoint_manager: Optional[AgentRuntimeCheckpointManager] = None,
+    interaction_runtime: Optional[InteractionRuntimeService] = None,
     user_id: Optional[str] = None,
     session_id: Optional[str] = None,
-    resume_payload: Optional[Mapping[str, Any]] = None,
-) -> None:
+    resume_request: Optional[InteractionResumeRequest] = None,
+) -> Dict[str, Any]:
     """在恢复前同时校验业务 checkpoint 和 LangGraph checkpoint。
 
-    业务 checkpoint 负责 user/session/thread/pending_confirmation/status 校验；
-    LangGraph checkpoint 负责确认图本身有可 resume 的原始现场。两者都通过后才允许 Command(resume)。
+    先验证 LangGraph 现场存在，再原子解析业务 interaction；这样图现场缺失时不会误消费授权。
     """
     normalized_session_id = session_id or thread_id
-    if checkpoint_manager is not None:
-        try:
-            checkpoint_manager.validate_resume(
-                user_id=user_id,
-                session_id=normalized_session_id,
-                thread_id=thread_id,
-                resume_payload=dict(resume_payload or {}),
-            )
-        except AgentRuntimeCheckpointError as exc:
-            raise ResumeCheckpointNotFoundError(thread_id=exc.thread_id, reason=exc.reason) from exc
-
     get_state = getattr(graph, "get_state", None)
     if not callable(get_state):
-        return
+        graph_state = {"test_stub": True}
+    else:
+        try:
+            graph_state = get_state(config=_build_langgraph_config(thread_id))
+        except AttributeError:
+            graph_state = {"test_stub": True}
 
-    try:
-        graph_state = get_state(config=_build_langgraph_config(thread_id))
-    except AttributeError:
-        # 轻量测试桩可能没有完整 checkpointer 接口；业务 checkpoint 已校验通过时不因测试桩形状阻断。
-        if checkpoint_manager is not None:
-            return
-        raise
     if not _has_resume_checkpoint(graph_state):
         # checkpoint 缺失是可预期的恢复失败，不应进入通用 Agent runtime error 分支。
         raise ResumeCheckpointNotFoundError(thread_id=thread_id)
 
-    if checkpoint_manager is not None:
-        try:
-            # 两层 checkpoint 都确认可恢复后再抢占业务 pending；这样既避免 LangGraph 缺失时误清现场，
-            # 又能阻止快速连续点击确认导致同一 pending_confirmation 被消费两次。
-            checkpoint_manager.consume_pending_confirmation(
-                user_id=user_id,
-                session_id=normalized_session_id,
-                thread_id=thread_id,
-                resume_payload=dict(resume_payload or {}),
-            )
-        except AgentRuntimeCheckpointError as exc:
-            raise ResumeCheckpointNotFoundError(thread_id=exc.thread_id, reason=exc.reason) from exc
+    if interaction_runtime is None or resume_request is None:
+        raise ResumeCheckpointNotFoundError(thread_id=thread_id, reason="interaction_runtime_missing")
+    try:
+        return interaction_runtime.resolve(
+            user_id=str(user_id or "").strip(),
+            session_id=normalized_session_id,
+            thread_id=thread_id,
+            request=resume_request,
+        )
+    except InteractionRuntimeError as exc:
+        raise ResumeCheckpointNotFoundError(thread_id=thread_id, reason=exc.reason) from exc
 
 
 def _has_resume_checkpoint(graph_state: Any) -> bool:
@@ -325,6 +299,7 @@ def _inject_user_memory_context(
         debug_flags = {
             "user_memory_loaded": True,
             "profile_applied": bool((user_memory_summary or {}).get("profile")),
+
             "preference_memory_available": bool(memory_status.get("preference_memory_available")),
             "interest_vector_available": bool(memory_status.get("interest_vector_available")),
         }
@@ -404,7 +379,7 @@ def _persist_runtime_checkpoint_node(
 ) -> None:
     """把图节点执行后的现场落库。
 
-    这里保存的是 resume 真源；pending_action 仍只是展示镜像，因此不从它反推出可恢复状态。
+    这里保存的是 resume 真源，不从 context 或 debug 反推出可恢复状态。
     """
     if state is None:
         return
@@ -426,16 +401,15 @@ def _persist_runtime_checkpoint_after_turn(
 ) -> None:
     """在一次同步/流式执行结束后更新 runtime checkpoint 状态。
 
-    waiting_confirmation 会继续保留 pending_confirmation；completed/cancelled/failed 会清空确认真源，
-    避免同一确认被二次 approve 后重复执行副作用步骤。
+    waiting_interaction 会持久化唯一 interaction；终态会清空交互，避免重复解析。
     """
     if final_state is None:
         return
     try:
         state = _coerce_state(final_state)
-        pending_confirmation = _extract_state_pending_confirmation(state)
-        if pending_confirmation:
-            checkpoint_manager.persist_state(state, current_node="finalize", next_route="waiting_confirmation")
+        interaction = _extract_state_interaction(state)
+        if interaction:
+            checkpoint_manager.persist_state(state, current_node="execute_step", next_route="waiting_interaction")
             return
         terminal_status = _terminal_checkpoint_status(state, is_resume=is_resume)
         if terminal_status:
@@ -450,15 +424,13 @@ def _persist_runtime_checkpoint_after_turn(
         logger.warning("Failed to persist agent runtime checkpoint after turn: error=%s", exc)
 
 
-def _extract_state_pending_confirmation(state: AgentState) -> Optional[Dict[str, Any]]:
-    """读取结构化 pending_confirmation，不使用 pending_action/debug 作为恢复真源。"""
-    if state.runtime_state is not None:
-        # runtime_state 是跨节点/跨请求的业务快照；即使 debug 里残留旧确认，也不能回退读取。
-        if state.runtime_state.pending_confirmation is None:
-            return None
-        return state.runtime_state.pending_confirmation.model_dump(mode="json")
-    if state.plan_runtime is not None and state.plan_runtime.pending_confirmation is not None:
-        return state.plan_runtime.pending_confirmation.model_dump(mode="json")
+def _extract_state_interaction(state: AgentState) -> Optional[Dict[str, Any]]:
+    """读取唯一业务交互，不从 context 或 debug 猜测等待状态。"""
+
+    if state.runtime_state is not None and state.runtime_state.interaction is not None:
+        return state.runtime_state.interaction.model_dump(mode="json")
+    if state.plan_runtime is not None and state.plan_runtime.interaction is not None:
+        return state.plan_runtime.interaction.model_dump(mode="json")
     return None
 
 
@@ -483,10 +455,10 @@ def _terminal_checkpoint_status(state: AgentState, *, is_resume: bool) -> Option
 
 
 def _state_recovery_is_confirmation_rejected(state: AgentState) -> bool:
-    """从业务恢复策略识别用户拒绝确认，不再依赖 pending_action 展示镜像。"""
+    """从业务恢复策略识别用户拒绝交互。"""
     strategy: Any = None
     if state.runtime_state is not None:
-        # 与 pending_confirmation 一样，runtime_state 已存在时不回退旧 plan_runtime。
+    # runtime_state 已存在时不回退旧 plan_runtime，避免形成第二份恢复真源。
         strategy = state.runtime_state.recovery_strategy
     elif state.plan_runtime is not None:
         strategy = state.plan_runtime.recovery_strategy
@@ -526,7 +498,7 @@ def _mark_runtime_checkpoint_failed(
             thread_id=normalized_session_id,
             status=CHECKPOINT_STATUS_FAILED,
             error_summary=detail,
-            clear_pending_confirmation=True,
+            clear_interaction=True,
         )
     except Exception as exc:
         logger.warning("Failed to mark agent runtime checkpoint failed: session_id=%s error=%s", normalized_session_id, exc)
@@ -553,7 +525,6 @@ def _build_initial_agent_state(
         message=normalized_request.message,
         # 保留业务 memory 的上下文增强职责，但执行现场恢复改由 LangGraph checkpoint 承担。
         context=state_context,
-        pending_action=_backend_context_value(agent_memory_payload, "pending_action"),
         paper_qa_result=_backend_context_value(agent_memory_payload, "paper_qa_result"),
         debug=state_debug,
     )
@@ -600,7 +571,7 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
             user_id=normalized_request.user_id,
             input=normalized_request.message,
             context_keys=sorted(request_context.keys()),
-            pending_action_status=_safe_status(request_context.get("pending_action")),
+            interaction_kind=str(getattr(normalized_request.resume, "interaction_id", "") or "") or None,
             paper_qa_status=_safe_status(request_context.get("paper_qa_result")),
             selected_arxiv_id=_safe_selected_arxiv_id(request_context),
         )
@@ -610,7 +581,9 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
         checkpoint_manager.expire_and_cleanup()
         user_memory_debug["context_lifecycle"] = _build_agent_context_lifecycle_debug(
             runtime_checkpoint_store=storage.agent_runtime_checkpoints,
+            approval_store=storage.approval_grants,
             user_id=normalized_request.user_id,
+
             session_id=resolved_session_id,
             user_memory_debug=user_memory_debug,
         )
@@ -624,35 +597,39 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
         if _is_resume_request(normalized_request):
             # resume 路径必须复用同一个 thread_id，并直接从 interrupt 位置恢复，
             # 不能重新构造一轮完整业务初始状态，否则会把确认恢复退化回“伪恢复”。
-            resume_payload = _build_resume_payload(normalized_request.resume)
+            interaction_runtime = InteractionRuntimeService(
+                checkpoint_store=storage.agent_runtime_checkpoints,
+                approval_store=storage.approval_grants,
+            )
+            request_resume_payload = _build_resume_payload(normalized_request.resume)
             info_event(
                 logger,
                 "arxiv_agent.resume_received",
                 run_id=run_id,
                 session_id=resolved_session_id,
-                decision=resume_payload.get("decision"),
-                step_id=resume_payload.get("step_id"),
-                tool_name=resume_payload.get("tool_name"),
-                pending_action_id=resume_payload.get("pending_action_id"),
-                interrupt_id=resume_payload.get("interrupt_id"),
+                decision=request_resume_payload.get("decision"),
+                interaction_id=request_resume_payload.get("interaction_id"),
             )
-            trace.add_event("arxiv_agent.resume_received", decision=resume_payload.get("decision"), step_id=resume_payload.get("step_id"))
-            _ensure_resume_checkpoint(
+            trace.add_event(
+                "arxiv_agent.resume_received",
+                decision=request_resume_payload.get("decision"),
+                interaction_id=request_resume_payload.get("interaction_id"),
+            )
+            resume_payload = _ensure_resume_checkpoint(
                 graph,
                 resolved_session_id,
-                checkpoint_manager=checkpoint_manager,
+                interaction_runtime=interaction_runtime,
                 user_id=normalized_request.user_id,
                 session_id=resolved_session_id,
-                resume_payload=resume_payload,
+                resume_request=normalized_request.resume,
             )
             info_event(
                 logger,
                 "arxiv_agent.resume_checkpoint_validated",
                 run_id=run_id,
                 session_id=resolved_session_id,
-                step_id=resume_payload.get("step_id"),
-                tool_name=resume_payload.get("tool_name"),
-                pending_action_id=resume_payload.get("pending_action_id"),
+                interaction_id=resume_payload.get("interaction_id"),
+                decision=resume_payload.get("decision"),
             )
             final_state = _coerce_state(graph.invoke(Command(resume=resume_payload), config=graph_config))
         else:
@@ -828,7 +805,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 user_id=normalized_request.user_id,
                 input=normalized_request.message,
                 context_keys=sorted(request_context.keys()),
-                pending_action_status=_safe_status(request_context.get("pending_action")),
+                interaction_id=str(getattr(normalized_request.resume, "interaction_id", "") or "") or None,
                 paper_qa_status=_safe_status(request_context.get("paper_qa_result")),
                 selected_arxiv_id=_safe_selected_arxiv_id(request_context),
             )
@@ -837,6 +814,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
             checkpoint_manager.expire_and_cleanup()
             user_memory_debug["context_lifecycle"] = _build_agent_context_lifecycle_debug(
                 runtime_checkpoint_store=storage.agent_runtime_checkpoints,
+                approval_store=storage.approval_grants,
                 user_id=normalized_request.user_id,
                 session_id=resolved_session_id,
                 user_memory_debug=user_memory_debug,
@@ -850,40 +828,41 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
             graph_input: Any
 
             resume_payload: Optional[Dict[str, Any]] = None
-            resume_approved_step_id: Optional[str] = None
             if _is_resume_request(normalized_request):
-                resume_payload = _build_resume_payload(normalized_request.resume)
+                interaction_runtime = InteractionRuntimeService(
+                    checkpoint_store=storage.agent_runtime_checkpoints,
+                    approval_store=storage.approval_grants,
+                )
+                request_resume_payload = _build_resume_payload(normalized_request.resume)
                 info_event(
                     logger,
                     "arxiv_agent.stream_resume_received",
                     run_id=run_id,
                     session_id=resolved_session_id,
-                    decision=resume_payload.get("decision"),
-                    step_id=resume_payload.get("step_id"),
-                    tool_name=resume_payload.get("tool_name"),
-                    pending_action_id=resume_payload.get("pending_action_id"),
-                    interrupt_id=resume_payload.get("interrupt_id"),
+                    decision=request_resume_payload.get("decision"),
+                    interaction_id=request_resume_payload.get("interaction_id"),
                 )
-                trace.add_event("arxiv_agent.stream_resume_received", decision=resume_payload.get("decision"), step_id=resume_payload.get("step_id"))
-                _ensure_resume_checkpoint(
+                trace.add_event(
+                    "arxiv_agent.stream_resume_received",
+                    decision=request_resume_payload.get("decision"),
+                    interaction_id=request_resume_payload.get("interaction_id"),
+                )
+                resume_payload = _ensure_resume_checkpoint(
                     graph,
                     resolved_session_id,
-                    checkpoint_manager=checkpoint_manager,
+                    interaction_runtime=interaction_runtime,
                     user_id=normalized_request.user_id,
                     session_id=resolved_session_id,
-                    resume_payload=resume_payload,
+                    resume_request=normalized_request.resume,
                 )
                 info_event(
                     logger,
                     "arxiv_agent.stream_resume_checkpoint_validated",
                     run_id=run_id,
                     session_id=resolved_session_id,
-                    step_id=resume_payload.get("step_id"),
-                    tool_name=resume_payload.get("tool_name"),
-                    pending_action_id=resume_payload.get("pending_action_id"),
+                    interaction_id=resume_payload.get("interaction_id"),
+                    decision=resume_payload.get("decision"),
                 )
-                if str(resume_payload.get("decision") or "").strip().lower() == "approve":
-                    resume_approved_step_id = str(resume_payload.get("step_id") or "").strip() or None
                 current_state = _load_graph_snapshot_state(graph, resolved_session_id)
                 graph_input = Command(resume=resume_payload)
             else:
@@ -905,6 +884,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     run_id=run_id,
                     data={
                         "status": "started",
+
                         "request": {
                             "user_id": normalized_request.user_id,
                             "session_id": resolved_session_id,
@@ -939,7 +919,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 event_count += 1
                 sequence += 1
 
-                active_tool_call = _active_runtime_tool_call(previous_state, approved_step_id=resume_approved_step_id)
+                active_tool_call = _active_runtime_tool_call(previous_state, approved_step_id=None)
                 tool_call_started = False
                 if active_tool_call is not None and (step_name == "execute_step" or _should_emit_tool_call(previous_state)):
                     tool_call_started = True
@@ -1205,6 +1185,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     event_type="final_response",
                     sequence=_next_sequence(sequence),
                     run_id=run_id,
+
                     data={
                         "response": error_response.model_dump(),
                     },
@@ -1299,106 +1280,35 @@ def _extract_interrupt_payload(step_payload: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _build_pending_action_from_confirmation(confirmation_payload: Mapping[str, Any]) -> Dict[str, Any]:
-    """把确认请求载荷映射成前端沿用的 pending_action 展示结构。
+def _apply_stream_interrupt_state(previous_state: Optional[AgentState], payload: Mapping[str, Any]) -> AgentState:
+    """把 LangGraph interrupt 投影为唯一 interaction 状态，不生成兼容展示镜像。"""
 
-    这个结构只负责让前端继续显示确认卡片；实际恢复现场仍由 LangGraph checkpointer
-    和后续 Command(resume=...) 承担，避免把业务摘要误用成执行栈。
-    """
-    target_paper = dict(confirmation_payload.get("target_paper") or {}) if isinstance(confirmation_payload.get("target_paper"), Mapping) else {}
-    arguments_summary = dict(confirmation_payload.get("arguments_summary") or {}) if isinstance(confirmation_payload.get("arguments_summary"), Mapping) else {}
-    return {
-        "type": confirmation_payload.get("request_type") or "tool_approval",
-        "request_type": confirmation_payload.get("request_type") or "tool_approval",
-        "status": "waiting_confirmation",
-        "decision": None,
-        "pending_action_id": confirmation_payload.get("pending_action_id"),
-        "step_id": confirmation_payload.get("step_id"),
-        "tool_name": confirmation_payload.get("tool_name"),
-        "action_type": confirmation_payload.get("action_type"),
-        "side_effect_level": confirmation_payload.get("side_effect_level"),
-        "reason": confirmation_payload.get("reason"),
-        "title": target_paper.get("title") or confirmation_payload.get("title"),
-        "title_text": confirmation_payload.get("title"),
-        "description": confirmation_payload.get("description"),
-        "arxiv_id": target_paper.get("arxiv_id"),
-        "original_question": confirmation_payload.get("original_question"),
-        "original_message": confirmation_payload.get("original_message"),
-        "target_paper": target_paper or None,
-        "candidates": list(confirmation_payload.get("candidates") or []),
-        "recommended_candidate": confirmation_payload.get("recommended_candidate"),
-        "default_candidate_id": confirmation_payload.get("default_candidate_id"),
-        "reference_hint": confirmation_payload.get("reference_hint") or {},
-        "target_resolution": confirmation_payload.get("target_resolution") or {},
-        "confirmation_fields": confirmation_payload.get("confirmation_fields") or {},
-        "created_at": confirmation_payload.get("created_at"),
-        "expires_at": confirmation_payload.get("expires_at"),
-        "allowed_decisions": [item.get("code") for item in list(confirmation_payload.get("allowed_decisions") or []) if isinstance(item, Mapping) and item.get("code")],
-        "allow_argument_edit": bool(confirmation_payload.get("allow_argument_edit")),
-        "allow_reject": bool(confirmation_payload.get("allow_reject", True)),
-        "allow_note": bool(confirmation_payload.get("allow_note", True)),
-        "arguments_summary": arguments_summary,
-        "confirmation_request": dict(confirmation_payload),
-        "thread_id": confirmation_payload.get("thread_id"),
-        "session_id": confirmation_payload.get("session_id"),
-        "plan_id": confirmation_payload.get("plan_id"),
-        "trace_id": confirmation_payload.get("trace_id"),
-        "qa_question": arguments_summary.get("qa_question") or arguments_summary.get("question"),
-    }
-
-
-def _apply_stream_interrupt_state(previous_state: Optional[AgentState], confirmation_payload: Mapping[str, Any]) -> AgentState:
-    """把 interrupt 载荷还原成可对外返回的待确认 AgentState。"""
     next_state = previous_state.model_copy(deep=True) if isinstance(previous_state, AgentState) else AgentState()
-    confirmation_request = ConfirmationRequest.model_validate(dict(confirmation_payload))
-    pending_action = _build_pending_action_from_confirmation(confirmation_payload)
-    next_state.pending_action = pending_action
+    interaction = AgentInteraction.model_validate(dict(payload))
+    next_state.interaction = interaction
     next_state.paper_qa_result = {
-        "status": "waiting_confirmation",
-        "pending_confirmation": dict(confirmation_payload),
-        "arxiv_id": pending_action.get("arxiv_id"),
-        "title": pending_action.get("title"),
-        "original_question": pending_action.get("original_question"),
-        "qa_question": pending_action.get("qa_question"),
-        "question": pending_action.get("qa_question"),
+        "status": "waiting_interaction",
+        "interaction": interaction.model_dump(mode="json"),
     }
-    debug = dict(next_state.debug or {})
-    debug["pending_confirmation"] = dict(confirmation_payload)
-    debug["agent_turn"] = {
-        **dict(debug.get("agent_turn") or {}),
-        "status": "waiting_confirmation",
-    }
-    next_state.debug = debug
-
-    # 流式 __interrupt__ 事件只有展示载荷；checkpoint 判定不能再从 debug 反推，
-    # 所以这里必须同步写入 runtime_state/plan_runtime 的业务 pending 真源。
     runtime_state = next_state.runtime_state.model_copy(deep=True) if next_state.runtime_state is not None else AgentRuntimeState()
-    runtime_state.pending_confirmation = confirmation_request
-    runtime_state.turn_status = "waiting_confirmation"
-    runtime_state.recovery_strategy = {
-        "type": "request_confirmation",
-        "reason": confirmation_request.reason or "waiting_confirmation",
-    }
-    if confirmation_request.step_id:
-        runtime_state.current_step_id = runtime_state.current_step_id or confirmation_request.step_id
-        runtime_state.step_status = dict(runtime_state.step_status or {})
-        runtime_state.step_status[confirmation_request.step_id] = "waiting_confirmation"
+    runtime_state.interaction = interaction
+    runtime_state.turn_status = "waiting_interaction"
+    runtime_state.current_step_id = runtime_state.current_step_id or interaction.step_id
+    runtime_state.step_status = dict(runtime_state.step_status or {})
+    runtime_state.step_status[interaction.step_id] = "waiting_interaction"
     next_state.runtime_state = runtime_state
     if next_state.plan_runtime is not None:
-        next_state.plan_runtime.pending_confirmation = confirmation_request
-        next_state.plan_runtime.turn_status = "waiting_confirmation"
-        next_state.plan_runtime.recovery_strategy = dict(runtime_state.recovery_strategy or {})
-        if confirmation_request.step_id:
-            next_state.plan_runtime.step_status = dict(next_state.plan_runtime.step_status or {})
-            next_state.plan_runtime.step_status[confirmation_request.step_id] = "waiting_confirmation"
-
+        next_state.plan_runtime.interaction = interaction
+        next_state.plan_runtime.turn_status = "waiting_interaction"
+        next_state.plan_runtime.step_status = dict(next_state.plan_runtime.step_status or {})
+        next_state.plan_runtime.step_status[interaction.step_id] = "waiting_interaction"
     next_state.steps = list(next_state.steps or []) + [
         AgentStep(
-            step="run_agent_turn",
+            step="execute_step",
             status="success",
-            action="等待用户确认是否继续执行论文解析与索引构建",
-            inputs={"step_id": confirmation_payload.get("step_id"), "tool_name": confirmation_payload.get("tool_name")},
-            outputs={"status": "waiting_confirmation", "pending_action": pending_action},
+            action="等待用户完成结构化交互",
+            inputs={"interaction_id": interaction.interaction_id, "kind": interaction.kind},
+            outputs={"status": "waiting_interaction"},
             error=None,
         )
     ]
@@ -1432,7 +1342,7 @@ def _state_to_response(state: Any) -> ArxivSearchResponse:
         execution_plan=final_state.execution_plan,
         plan_runtime=final_state.plan_runtime,
         runtime_state=final_state.runtime_state,
-        pending_action=final_state.pending_action,
+        interaction=final_state.interaction,
         paper_qa_result=final_state.paper_qa_result,
         preference_action_result=final_state.preference_action_result,
         plan=list(final_state.plan or []),
@@ -1504,6 +1414,7 @@ def _tool_calls_from_runtime(state: AgentState) -> list[Dict[str, Any]]:
     if runtime is None and state.runtime_state is not None:
         runtime = getattr(state.runtime_state, "runtime", None)
     plan_steps = {
+
         step.step_id: step
         for step in list((runtime.plan.steps if runtime and runtime.plan else state.execution_plan.steps if state.execution_plan else []) or [])
     }
@@ -1566,7 +1477,6 @@ def _build_resume_checkpoint_not_found_response(*, session_id: Optional[str], de
         session_id=session_id,
         intent="unsupported",
         answer=RESUME_CHECKPOINT_NOT_FOUND_MESSAGE,
-        pending_action=None,
         paper_qa_result={
             "status": "failed",
             "error_code": RESUME_CHECKPOINT_NOT_FOUND_CODE,
@@ -1599,7 +1509,7 @@ def _build_resume_checkpoint_not_found_response(*, session_id: Optional[str], de
             status="failed",
             action="恢复执行现场失败，已清空待确认状态",
             inputs={"session_id": session_id, "code": RESUME_CHECKPOINT_NOT_FOUND_CODE},
-            outputs={"pending_action": None, "paper_qa_status": "failed"},
+            outputs={"interaction": None, "paper_qa_status": "failed"},
             error=RESUME_CHECKPOINT_NOT_FOUND_CODE,
         )
     ]
@@ -1717,7 +1627,7 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
         },
         # runtime_state 是新的执行现场真源；这里仅输出摘要，避免 SSE 事件携带完整工具输出和 trace。
         "runtime_state": _compact_runtime_state(state.runtime_state),
-        "pending_action": state.pending_action,
+        "interaction": state.interaction.model_dump(mode="json") if state.interaction is not None else None,
         "paper_qa_result": state.paper_qa_result,
         "preference_action_result": state.preference_action_result,
         "tool_name": state.tool_name,
@@ -1747,9 +1657,8 @@ def _compact_runtime_state(runtime_state: Any) -> Optional[Dict[str, Any]]:
         "output_keys": sorted((payload.get("outputs") or {}).keys()),
         "last_observation": payload.get("last_observation"),
         "last_step_output_keys": sorted((payload.get("last_step_output") or {}).keys()) if isinstance(payload.get("last_step_output"), Mapping) else [],
-        "approved_step_ids": list(payload.get("approved_step_ids") or []),
         "needs_replan": bool(payload.get("needs_replan")),
-        "pending_confirmation": payload.get("pending_confirmation"),
+        "interaction": payload.get("interaction"),
         "is_finished": bool(payload.get("is_finished")),
         "failure_reason": payload.get("failure_reason"),
         "recovery_strategy": payload.get("recovery_strategy"),
@@ -1797,13 +1706,14 @@ def _compact_tool_args(tool_args: Mapping[str, Any]) -> Dict[str, Any]:
 def _active_runtime_tool_call(state: Optional[AgentState], *, approved_step_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """从显式 runtime_state 里推断 execute_step 即将调用的工具。
 
-    需要用户确认的副作用 step 在批准前只应展示 pending_action，不能提前显示成
+        需要用户批准的副作用 step 在批准前只应展示 interaction，不能提前显示成
     running tool；批准恢复后再用 approved_step_id 放行，避免进度 UI 误导用户。
     """
     if state is None:
         return None
     planner_trace = _planner_trace_summary_from_state(state)
     if state.runtime_state is None or state.execution_plan is None:
+
         if state.tool_name and not state.tool_calls:
             # 兼容旧节点流式状态：没有显式 runtime_state 时，只把当前轻量 tool_name/tool_args 当作进度展示，
             # 不把它写回 checkpoint，也不参与真实恢复判断。

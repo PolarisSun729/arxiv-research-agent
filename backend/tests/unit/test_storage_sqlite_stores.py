@@ -550,8 +550,17 @@ class StorageContainerSqliteTests(unittest.TestCase):
             session_id="agent-session-waiting",
             thread_id="agent-session-waiting",
             runtime_state={"step": "wait"},
-            pending_confirmation={"step_id": "confirm"},
-            status="waiting_confirmation",
+            interaction={
+                "interaction_id": "interaction-waiting",
+                "kind": "target_selection",
+                "status": "pending",
+                "plan_id": "plan-waiting",
+                "step_id": "resolve_paper",
+                "payload": {"candidates": [], "reference_hint": {}},
+                "created_at": old_time,
+                "expires_at": "2999-01-01T00:00:00+00:00",
+            },
+            status="waiting_interaction",
         )
         with self.storage.connection_provider.connect() as conn:
             conn.execute(
@@ -599,143 +608,6 @@ class StorageContainerSqliteTests(unittest.TestCase):
                 thread_id="agent-session-old",
             )
         )
-
-    def test_consume_agent_runtime_pending_confirmation_clears_runtime_state_snapshot(self) -> None:
-        self.storage.agent_runtime_checkpoints.upsert_agent_runtime_checkpoint(
-            user_id=self.user_id,
-            session_id="agent-confirm-once",
-            thread_id="agent-confirm-once",
-            runtime_state={
-                "pending_confirmation": {
-                    "step_id": "parse_and_index_paper",
-                    "tool_name": "parse_and_index_paper",
-                    "pending_action_id": "pending:parse_and_index_paper",
-                },
-                "step_status": {"parse_and_index_paper": "waiting_confirmation"},
-                "turn_status": "waiting_confirmation",
-                "recovery_strategy": {"type": "request_confirmation", "reason": "paper_index_missing"},
-                "approved_step_ids": [],
-            },
-            pending_confirmation={
-                "step_id": "parse_and_index_paper",
-                "tool_name": "parse_and_index_paper",
-                "pending_action_id": "pending:parse_and_index_paper",
-            },
-            status="waiting_confirmation",
-            expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
-        )
-
-        self.assertFalse(
-            self.storage.agent_runtime_checkpoints.consume_agent_runtime_pending_confirmation(
-                user_id=self.user_id,
-                session_id="agent-confirm-once",
-                thread_id="agent-confirm-once",
-                decision="approve",
-                step_id="parse_and_index_paper",
-                tool_name="other_tool",
-                pending_action_id="pending:other-step",
-            )
-        )
-        consumed = self.storage.agent_runtime_checkpoints.consume_agent_runtime_pending_confirmation(
-            user_id=self.user_id,
-            session_id="agent-confirm-once",
-            thread_id="agent-confirm-once",
-            decision="approve",
-            step_id="parse_and_index_paper",
-            tool_name="parse_and_index_paper",
-            pending_action_id="pending:parse_and_index_paper",
-        )
-
-        self.assertTrue(consumed)
-        record = self.storage.agent_runtime_checkpoints.get_agent_runtime_checkpoint(
-            user_id=self.user_id,
-            session_id="agent-confirm-once",
-            thread_id="agent-confirm-once",
-        )
-        self.assertEqual(record["status"], "running")
-        self.assertIsNone(record["pending_confirmation"])
-        self.assertIsNone(record["expires_at"])
-        self.assertIsNone(record["runtime_state"]["pending_confirmation"])
-        self.assertIsNone(record["runtime_state"]["turn_status"])
-        self.assertIsNone(record["runtime_state"]["recovery_strategy"])
-        self.assertEqual(record["runtime_state"]["step_status"]["parse_and_index_paper"], "pending")
-        self.assertEqual(record["runtime_state"]["approved_step_ids"], ["parse_and_index_paper"])
-        self.assertFalse(
-            self.storage.agent_runtime_checkpoints.consume_agent_runtime_pending_confirmation(
-                user_id=self.user_id,
-                session_id="agent-confirm-once",
-                thread_id="agent-confirm-once",
-                decision="approve",
-                step_id="parse_and_index_paper",
-                tool_name="parse_and_index_paper",
-                pending_action_id="pending:parse_and_index_paper",
-            )
-        )
-
-    def test_consumed_pending_confirmation_replay_cannot_restore_waiting_checkpoint(self) -> None:
-        session_id = "agent-confirm-replay"
-        pending_confirmation = {
-            "step_id": "parse_and_index_paper",
-            "tool_name": "parse_and_index_paper",
-            "pending_action_id": "pending:parse_and_index_paper",
-        }
-        waiting_runtime_state = {
-            "plan": {"plan_id": "paper_qa:test"},
-            "pending_confirmation": dict(pending_confirmation),
-            "step_status": {"parse_and_index_paper": "waiting_confirmation"},
-            "turn_status": "waiting_confirmation",
-            "recovery_strategy": {"type": "request_confirmation", "reason": "paper_index_missing"},
-            "approved_step_ids": [],
-        }
-        self.storage.agent_runtime_checkpoints.upsert_agent_runtime_checkpoint(
-            user_id=self.user_id,
-            session_id=session_id,
-            thread_id=session_id,
-            runtime_state=waiting_runtime_state,
-            pending_confirmation=pending_confirmation,
-            status="waiting_confirmation",
-            expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
-        )
-
-        self.assertTrue(
-            self.storage.agent_runtime_checkpoints.consume_agent_runtime_pending_confirmation(
-                user_id=self.user_id,
-                session_id=session_id,
-                thread_id=session_id,
-                decision="approve",
-                step_id="parse_and_index_paper",
-                tool_name="parse_and_index_paper",
-                pending_action_id="pending:parse_and_index_paper",
-            )
-        )
-
-        # 模拟 LangGraph resume 后重放中断前 waiting 快照；DB 层必须保留已消费的批准态。
-        replayed = self.storage.agent_runtime_checkpoints.upsert_agent_runtime_checkpoint(
-            user_id=self.user_id,
-            session_id=session_id,
-            thread_id=session_id,
-            runtime_state=waiting_runtime_state,
-            pending_confirmation=pending_confirmation,
-            status="waiting_confirmation",
-            expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
-        )
-        self.assertEqual(replayed["status"], "running")
-        self.assertIsNone(replayed["pending_confirmation"])
-        self.assertIsNone(replayed["runtime_state"]["pending_confirmation"])
-        self.assertEqual(replayed["runtime_state"]["approved_step_ids"], ["parse_and_index_paper"])
-
-        # 后续 running 快照如果丢了批准集合，也不能把恢复执行所需的 approved_step_ids 擦掉。
-        merged = self.storage.agent_runtime_checkpoints.upsert_agent_runtime_checkpoint(
-            user_id=self.user_id,
-            session_id=session_id,
-            thread_id=session_id,
-            runtime_state={"plan": {"plan_id": "paper_qa:test"}, "approved_step_ids": []},
-            pending_confirmation=None,
-            status="running",
-        )
-        self.assertEqual(merged["status"], "running")
-        self.assertIsNone(merged["pending_confirmation"])
-        self.assertEqual(merged["runtime_state"]["approved_step_ids"], ["parse_and_index_paper"])
 
     def test_paper_notes_support_create_update_list_and_delete(self) -> None:
         session = self._create_session(arxiv_id="2401.00008", session_id="session-note")
