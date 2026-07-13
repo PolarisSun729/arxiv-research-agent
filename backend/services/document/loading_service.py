@@ -251,11 +251,19 @@ class LoadingService:
                 ) from exc
 
             pipeline_options = PdfPipelineOptions()
-            pipeline_options.generate_page_images = True
-            pipeline_options.generate_picture_images = True
+            # 页面/图片渲染是 Docling 转换里最重的部分之一；通过配置控制，避免普通 QA 建索引强制生成高倍率资产。
+            pipeline_options.generate_page_images = bool(DOCLING_CONFIG.get("generate_page_images", True))
+            pipeline_options.generate_picture_images = bool(DOCLING_CONFIG.get("generate_picture_images", True))
             pipeline_options.images_scale = float(DOCLING_CONFIG.get("images_scale", 2.0))
             pipeline_options.do_ocr = bool(DOCLING_CONFIG.get("do_ocr_enabled", False))
             pipeline_options.force_backend_text = True
+            logger.info(
+                "Docling PDF options: page_images=%s picture_images=%s images_scale=%s ocr=%s",
+                pipeline_options.generate_page_images,
+                pipeline_options.generate_picture_images,
+                pipeline_options.images_scale,
+                pipeline_options.do_ocr,
+            )
             if not pipeline_options.do_ocr:
                 logger.info("Docling OCR disabled; using backend text extraction for PDF parsing.")
             # Temporary debug mode: keep Docling on the basic parsing path only.

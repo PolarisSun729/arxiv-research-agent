@@ -1,14 +1,26 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
+import { User } from '@element-plus/icons-vue'
+import { useUserContext } from '@/composables/useUserContext'
 
 const router = useRouter()
 const route = useRoute()
+const userContext = useUserContext()
 const collapsed = ref(false)
 const debugRoutesEnabled = import.meta.env.VITE_ENABLE_DEBUG_ROUTES === 'true'
+const currentUserId = computed(() => userContext.userId.value)
 
 function handleMenuClick(path: string) {
   router.push(path)
+}
+
+function handleUserClick() {
+  // 保留当前路径作为切换身份后的回跳地址，避免用户在推荐或画像页切换账号后丢失上下文。
+  router.push({
+    path: '/login',
+    query: route.path === '/login' ? {} : { redirect: route.fullPath }
+  })
 }
 </script>
 
@@ -32,7 +44,7 @@ function handleMenuClick(path: string) {
         active-text-color="#fff"
         :collapse="collapsed"
       >
-        <el-menu-item index="/" class="menu-item-home" @click="handleMenuClick('/')">
+        <el-menu-item index="/dashboard" class="menu-item-home" @click="handleMenuClick('/dashboard')">
           <span class="menu-icon-badge badge-home">🏠</span>
           <span>首页</span>
         </el-menu-item>
@@ -75,6 +87,11 @@ function handleMenuClick(path: string) {
           <span :size="20">{{ collapsed ? '▶' : '◀' }}</span>
         </button>
         <span class="header-title">arXiv 计算机论文推荐系统</span>
+        <button class="user-switch" type="button" @click="handleUserClick">
+          <el-icon><User /></el-icon>
+          <span class="user-switch__label">当前用户</span>
+          <span class="user-switch__id">{{ currentUserId }}</span>
+        </button>
       </el-header>
 
       <el-main class="app-content">
@@ -318,6 +335,40 @@ function handleMenuClick(path: string) {
   font-size: 16px;
   font-weight: 700;
   color: #1f2937;
+}
+
+.user-switch {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(360px, 52vw);
+  padding: 8px 12px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 8px;
+  background: #fff;
+  color: #334155;
+  cursor: pointer;
+  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.06);
+}
+
+.user-switch:hover {
+  color: #2563eb;
+  border-color: rgba(37, 99, 235, 0.35);
+}
+
+.user-switch__label {
+  color: #64748b;
+  font-size: 13px;
+}
+
+.user-switch__id {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-weight: 700;
 }
 
 .app-content {

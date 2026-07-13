@@ -6,6 +6,10 @@ const debugRoutesEnabled = import.meta.env.VITE_ENABLE_DEBUG_ROUTES === 'true'
 const routes: RouteRecordRaw[] = [
   {
     path: '/',
+    redirect: '/login'
+  },
+  {
+    path: '/dashboard',
     name: 'Dashboard',
     component: () => import('@/views/Dashboard.vue')
   },
@@ -33,6 +37,11 @@ const routes: RouteRecordRaw[] = [
     path: '/agent-search',
     name: 'AgentSearch',
     component: () => import('@/views/AgentSearch.vue')
+  },
+  {
+    path: '/login',
+    name: 'Login',
+    component: () => import('@/views/Login.vue')
   },
   {
     path: '/agent-graph',

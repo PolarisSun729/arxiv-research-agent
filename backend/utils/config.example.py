@@ -54,6 +54,8 @@ BACKEND_LOGGING_CONFIG = {
 DOCLING_CONFIG = {
     "do_ocr_enabled": False,
     "annotated_pdf_export_enabled": True,
+    "generate_page_images": True,
+    "generate_picture_images": True,
     "images_scale": 2.0,
     "legend_padding": 8.0,
     "legend_width": 165.0,

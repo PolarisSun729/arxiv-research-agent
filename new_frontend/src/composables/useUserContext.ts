@@ -3,6 +3,20 @@ import { computed, ref, watch } from 'vue'
 const USER_ID_STORAGE_KEY = 'rag_demo_user_id'
 
 export const DEFAULT_DEMO_USER_ID = 'local_user'
+export const SEEDED_DEMO_USER_ID = '2433274'
+
+export const DEMO_USER_OPTIONS = [
+  {
+    id: SEEDED_DEMO_USER_ID,
+    label: '已有演示数据账号',
+    description: '读取当前本地库里已经生成的偏好、兴趣向量和研究画像'
+  },
+  {
+    id: DEFAULT_DEMO_USER_ID,
+    label: '空白本地账号',
+    description: '用于从零开始标记偏好和生成画像'
+  }
+]
 
 function normalizeUserId(value?: string | null): string {
   const normalized = String(value || '').trim()

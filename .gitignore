@@ -26,6 +26,8 @@ __pycache__/
 # 本地数据库与运行锁
 *.db
 *.db.lock
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 

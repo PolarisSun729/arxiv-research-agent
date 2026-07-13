@@ -82,7 +82,10 @@ BACKEND_LOGGING_CONFIG: Dict[str, Any] = {
 DOCLING_CONFIG: Dict[str, Any] = {
     "do_ocr_enabled": _env_bool("DOCLING_OCR_ENABLED", False),
     "annotated_pdf_export_enabled": _env_bool("DOCLING_ANNOTATED_PDF_EXPORT_ENABLED", True),
-    "images_scale": float(_env_str("DOCLING_IMAGES_SCALE", "13.9")),
+    # Docling 会按 images_scale 渲染页面/图片资产；默认保持低倍率，避免 30+ 页论文在建索引时生成超大图。
+    "generate_page_images": _env_bool("DOCLING_GENERATE_PAGE_IMAGES", True),
+    "generate_picture_images": _env_bool("DOCLING_GENERATE_PICTURE_IMAGES", True),
+    "images_scale": float(_env_str("DOCLING_IMAGES_SCALE", "2.0")),
     "legend_padding": float(_env_str("DOCLING_LEGEND_PADDING", "8.0")),
     "legend_width": float(_env_str("DOCLING_LEGEND_WIDTH", "165.0")),
     "legend_row_height": float(_env_str("DOCLING_LEGEND_ROW_HEIGHT", "13.0")),
