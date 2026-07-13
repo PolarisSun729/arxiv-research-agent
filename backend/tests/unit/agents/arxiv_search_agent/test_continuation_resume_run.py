@@ -6,8 +6,8 @@ from tests.helpers.agent_runtime import load_agent_test_modules
 from tests.helpers.sqlite import build_storage_container
 
 
-_MODULES = load_agent_test_modules()
-service_module = _MODULES["service_module"]
+# continuation 依赖 Agent 测试桩提供的轻量运行环境，必须先初始化再导入正式模块。
+load_agent_test_modules()
 
 from backend.agents.arxiv_search_agent.execution.continuations import AgentResumeRunManager
 
@@ -71,8 +71,11 @@ def test_missing_langgraph_checkpoint_fails_resume_without_replaying_original_qu
             invoked.append(True)
             raise AssertionError("缺失 checkpoint 时禁止把原问题作为新请求重放")
 
-    monkeypatch.setattr(service_module, "_build_agent_graph", lambda **_kwargs: _GraphWithoutCheckpoint())
-    monkeypatch.setattr(service_module, "_resolve_generation_service", lambda: object())
+    # pytest 全量收集会多次重载 Agent service；运行时按生产代码相同路径解析，避免 patch 到旧模块对象。
+    from backend.agents.arxiv_search_agent import service as runtime_service_module
+
+    monkeypatch.setattr(runtime_service_module, "_build_agent_graph", lambda **_kwargs: _GraphWithoutCheckpoint())
+    monkeypatch.setattr(runtime_service_module, "_resolve_generation_service", lambda: object())
     manager = AgentResumeRunManager(storage=storage, background_work_coordinator=object())
 
     claimed = manager.claim_and_start(
