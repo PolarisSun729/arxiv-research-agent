@@ -62,6 +62,11 @@ function handleConfirm() {
   if (!interaction.value || !canConfirm.value) return
   emit('confirm-interaction', selectedCandidateId.value || undefined)
 }
+
+function getInteractionSubmittingText() {
+  if (interaction.value?.kind === 'target_selection') return '选择已提交，正在继续处理。'
+  return '批准请求已提交，正在继续处理。'
+}
 </script>
 
 <template>
@@ -89,6 +94,10 @@ function handleConfirm() {
     </section>
 
     <section v-if="interaction" class="agent-user-confirmation">
+      <div v-if="loading" class="agent-user-confirmation__status">
+        {{ getInteractionSubmittingText() }}
+      </div>
+
       <div class="agent-user-confirmation__copy">
         <h3>{{ interaction.title }}</h3>
         <p>{{ interaction.description }}</p>
@@ -239,33 +248,6 @@ function handleConfirm() {
 .agent-user-confirmation__copy p {
   margin: 6px 0 0;
   color: #475569;
-  line-height: 1.6;
-}
-
-.agent-user-index-progress {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.agent-user-index-progress__meta {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  color: #475569;
-  font-size: 13px;
-}
-
-.agent-user-index-progress__meta strong {
-  color: #0f172a;
-  font-variant-numeric: tabular-nums;
-}
-
-.agent-user-index-progress__error {
-  margin: 0;
-  color: #b91c1c;
-  font-size: 13px;
   line-height: 1.6;
 }
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from functools import lru_cache
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Callable, Iterable
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
     from services.storage.sqlite.stores import (
         AgentRuntimeCheckpointStore,
         AgentSessionStore,
+        AgentWorkStore,
         InterestVectorStore,
         LangGraphCheckpointStore,
         PaperCatalogStore,
@@ -45,6 +47,20 @@ ARXIV_PROXY_URL = CORE_CONFIG.get("arxiv_proxy_url", "")
 SERVICE_LOAD_MODE = str(CORE_CONFIG.get("service_load_mode", "lazy")).strip().lower()
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RequestActor:
+    """当前 demo 用户命名空间；它提供业务隔离，但不等价于经过认证的身份。"""
+
+    user_id: str
+
+
+def get_request_actor(user_id: str | None = None) -> RequestActor:
+    from services.storage.sqlite.shared import DEFAULT_USER_ID
+
+    normalized = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+    return RequestActor(user_id=normalized)
 
 
 @lru_cache(maxsize=1)
@@ -108,6 +124,10 @@ def get_agent_session_store() -> AgentSessionStore:
 
 def get_agent_runtime_checkpoint_store() -> AgentRuntimeCheckpointStore:
     return get_storage_container().agent_runtime_checkpoints
+
+
+def get_agent_work_store() -> AgentWorkStore:
+    return get_storage_container().agent_work
 
 
 def get_langgraph_checkpoint_store() -> LangGraphCheckpointStore:
@@ -228,6 +248,72 @@ def get_index_job_manager() -> IndexJobManager:
     return IndexJobManager(
         paper_qa_index_store=get_paper_qa_index_store(),
         qa_index_builder=get_paper_qa_index_builder(),
+        # 使用服务层状态视图校验 active build/version；lambda 延迟求值，避免组合根初始化时形成循环依赖。
+        qa_status_reader=lambda arxiv_id: get_paper_qa_service().get_qa_status(arxiv_id),
+        on_job_succeeded=lambda job_id, result: get_agent_work_store().mark_job_ready(
+            job_id=job_id,
+            validated_result=result,
+        ),
+        on_job_failed=lambda job_id, code, message: get_agent_work_store().mark_job_failed(
+            job_id=job_id,
+            error_code=code,
+            error_message=message,
+        ),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_background_work_coordinator():
+    """装配通用后台协调器；业务 handler 注册集中在组合根，执行器不识别 QA 工具名。"""
+    from agents.arxiv_search_agent.execution.background_jobs import (
+        BackgroundJobHandlerRegistry,
+        PaperQAIndexBackgroundHandler,
+        PersistentBackgroundWorkCoordinator,
+    )
+
+    manager = get_index_job_manager()
+
+    def _active_job(arxiv_id: str):
+        for job in get_paper_qa_index_store().list_paper_index_jobs(arxiv_id=arxiv_id, limit=20):
+            if str(job.get("status") or "") in {"pending", "running", "retrying"}:
+                return job
+        return None
+
+    handlers = BackgroundJobHandlerRegistry()
+    handlers.register(
+        "paper_qa_index",
+        PaperQAIndexBackgroundHandler(
+            status_reader=lambda arxiv_id: get_paper_qa_service().get_qa_status(arxiv_id),
+            active_job_reader=_active_job,
+            job_submitter=lambda arxiv_id, loading_method: manager.submit_job(arxiv_id, loading_method),
+        ),
+    )
+    return PersistentBackgroundWorkCoordinator(
+        store=get_agent_work_store(),
+        approval_store=get_storage_container().approval_grants,
+        handlers=handlers,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_agent_work_continuation_service():
+    from agents.arxiv_search_agent.execution.continuations import AgentWorkContinuationService
+
+    coordinator = get_background_work_coordinator()
+    return AgentWorkContinuationService(
+        store=get_agent_work_store(),
+        paper_job_store=get_paper_qa_index_store(),
+        handlers=coordinator.handlers,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_agent_resume_run_manager():
+    from agents.arxiv_search_agent.execution.continuations import AgentResumeRunManager
+
+    return AgentResumeRunManager(
+        storage=get_storage_container(),
+        background_work_coordinator=get_background_work_coordinator(),
     )
 
 

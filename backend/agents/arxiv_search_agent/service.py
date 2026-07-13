@@ -31,6 +31,11 @@ try:  # pragma: no cover - optional runtime dependency for LLM parsing
 except Exception:  # pragma: no cover
     _get_generation_service = None
 
+try:  # pragma: no cover - 轻量测试可能只装配 Agent stub，不提供完整后台组合根
+    from dependencies import get_background_work_coordinator as _get_background_work_coordinator
+except Exception:  # pragma: no cover
+    _get_background_work_coordinator = None
+
 from .graph import build_arxiv_search_graph
 from .execution.interaction_runtime import InteractionRuntimeError, InteractionRuntimeService
 from .execution.interactions import AgentInteraction, InteractionResumeRequest
@@ -38,6 +43,7 @@ from .runtime_checkpoint import (
     CHECKPOINT_STATUS_CANCELLED,
     CHECKPOINT_STATUS_COMPLETED,
     CHECKPOINT_STATUS_FAILED,
+    CHECKPOINT_STATUS_WAITING_BACKGROUND_JOB,
     AgentRuntimeCheckpointManager,
     build_agent_checkpointer,
 )
@@ -145,12 +151,15 @@ def _build_runtime_checkpoint_manager(runtime_checkpoint_store: AgentRuntimeChec
 def _build_agent_context_lifecycle_debug(
     *,
     runtime_checkpoint_store: AgentRuntimeCheckpointStore,
+    approval_store: Any,
     user_id: Optional[str],
     session_id: str,
     user_memory_debug: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """构造 Agent 本轮上下文健康度，不读取完整 checkpoint 或消息正文。"""
     context_merge_debug = dict((user_memory_debug or {}).get("context_merge") or {})
+    # approval_store 只作为依赖接入健康度信号；这里不读取授权明细，避免 debug 路径反向消费交互状态。
+    approval_store_missing = approval_store is None
     return ContextLifecycleService(agent_runtime_checkpoint_store=runtime_checkpoint_store).build_agent_health_debug(
         user_id=str(user_id or "").strip(),
         session_id=session_id,
@@ -158,6 +167,7 @@ def _build_agent_context_lifecycle_debug(
         degraded={
             "memory_load_failed": not bool((user_memory_debug or {}).get("context_merge")),
             "frontend_rejected_fields": context_merge_debug.get("rejected_frontend_fields"),
+            "approval_store_missing": approval_store_missing,
         },
     )
 
@@ -168,6 +178,7 @@ def _build_agent_graph(
     langgraph_checkpoint_store: LangGraphCheckpointStore,
     runtime_checkpoint_store: AgentRuntimeCheckpointStore,
     approval_store: Any,
+    background_work_coordinator: Any = None,
 ) -> Any:
     """构建带持久化 checkpointer 的 Agent 图。"""
     checkpointer = build_agent_checkpointer(langgraph_checkpoint_store=langgraph_checkpoint_store)
@@ -176,7 +187,19 @@ def _build_agent_graph(
         checkpointer=checkpointer,
         runtime_checkpoint_store=runtime_checkpoint_store,
         approval_store=approval_store,
+        background_work_coordinator=background_work_coordinator,
     )
+
+
+def _resolve_background_work_coordinator() -> Any:
+    """从组合根取得后台协调器；不可用时返回 None，由批准入口显式拒绝而不是同步回退。"""
+    if not callable(_get_background_work_coordinator):
+        return None
+    try:
+        return _get_background_work_coordinator()
+    except Exception as exc:
+        logger.exception("Failed to resolve Agent background work coordinator: %s", exc)
+        return None
 
 
 def _ensure_resume_checkpoint(
@@ -217,6 +240,38 @@ def _ensure_resume_checkpoint(
         )
     except InteractionRuntimeError as exc:
         raise ResumeCheckpointNotFoundError(thread_id=thread_id, reason=exc.reason) from exc
+
+
+def _apply_background_work_started_state(state: Any, resume_payload: Mapping[str, Any]) -> AgentState:
+    """把批准事务的后台 ticket 投影成响应状态，不消费 LangGraph interrupt。"""
+    current_state = _coerce_state(state).model_copy(deep=True)
+    background_work = dict(resume_payload.get("background_work") or {})
+    step_id = str(resume_payload.get("step_id") or "").strip()
+    current_state.interaction = None
+    if current_state.plan_runtime is not None:
+        current_state.plan_runtime.interaction = None
+        current_state.plan_runtime.turn_status = "waiting_background_job"
+        if step_id:
+            current_state.plan_runtime.step_status[step_id] = "waiting_background_job"
+        current_state.plan_runtime.last_step_output = {
+            "step_id": step_id,
+            "background_work": background_work,
+        }
+    if current_state.runtime_state is not None:
+        current_state.runtime_state.interaction = None
+        current_state.runtime_state.turn_status = "waiting_background_job"
+        if step_id:
+            current_state.runtime_state.step_status[step_id] = "waiting_background_job"
+        current_state.runtime_state.last_step_output = {
+            "step_id": step_id,
+            "background_work": background_work,
+        }
+    current_state.paper_qa_result = {
+        "status": "waiting_background_job",
+        "background_work": background_work,
+    }
+    current_state.answer = "索引已转入后台构建，完成后会从原执行现场继续回答。"
+    return current_state
 
 
 def _has_resume_checkpoint(graph_state: Any) -> bool:
@@ -411,6 +466,18 @@ def _persist_runtime_checkpoint_after_turn(
         if interaction:
             checkpoint_manager.persist_state(state, current_node="execute_step", next_route="waiting_interaction")
             return
+        runtime_status = ""
+        if state.runtime_state is not None:
+            runtime_status = str(state.runtime_state.turn_status or "").strip()
+        elif state.plan_runtime is not None:
+            runtime_status = str(state.plan_runtime.turn_status or "").strip()
+        if runtime_status == CHECKPOINT_STATUS_WAITING_BACKGROUND_JOB:
+            checkpoint_manager.persist_state(
+                state,
+                current_node="execute_step",
+                next_route=CHECKPOINT_STATUS_WAITING_BACKGROUND_JOB,
+            )
+            return
         terminal_status = _terminal_checkpoint_status(state, is_resume=is_resume)
         if terminal_status:
             checkpoint_manager.mark_terminal(
@@ -446,6 +513,8 @@ def _terminal_checkpoint_status(state: AgentState, *, is_resume: bool) -> Option
         runtime_status = str(state.plan_runtime.turn_status or "").strip()
     if runtime_status == "failed" or _state_error_summary(state):
         return CHECKPOINT_STATUS_FAILED
+    if runtime_status == CHECKPOINT_STATUS_WAITING_BACKGROUND_JOB:
+        return None
     if runtime_status:
         return CHECKPOINT_STATUS_COMPLETED
     # resume 后即使 runtime_status 被旧路径漏写，也不能继续保留 waiting_confirmation 真源。
@@ -588,10 +657,13 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
             user_memory_debug=user_memory_debug,
         )
         generation_service = _resolve_generation_service()
+        background_work_coordinator = _resolve_background_work_coordinator()
         graph = _build_agent_graph(
             generation_service=generation_service,
             langgraph_checkpoint_store=storage.langgraph_checkpoints,
             runtime_checkpoint_store=storage.agent_runtime_checkpoints,
+            approval_store=storage.approval_grants,
+            background_work_coordinator=background_work_coordinator,
         )
 
         if _is_resume_request(normalized_request):
@@ -600,6 +672,7 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
             interaction_runtime = InteractionRuntimeService(
                 checkpoint_store=storage.agent_runtime_checkpoints,
                 approval_store=storage.approval_grants,
+                background_work_coordinator=background_work_coordinator,
             )
             request_resume_payload = _build_resume_payload(normalized_request.resume)
             info_event(
@@ -631,7 +704,13 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
                 interaction_id=resume_payload.get("interaction_id"),
                 decision=resume_payload.get("decision"),
             )
-            final_state = _coerce_state(graph.invoke(Command(resume=resume_payload), config=graph_config))
+            if str(resume_payload.get("decision") or "") == "background_work_started":
+                # 批准事务已经清除 interaction 并切换到 waiting_background_job；此请求在这里结束，
+                # 不能再消费 LangGraph interrupt，否则会把后台执行重新变成同步工具调用。
+                snapshot_state = _load_graph_snapshot_state(graph, resolved_session_id)
+                final_state = _apply_background_work_started_state(snapshot_state, resume_payload)
+            else:
+                final_state = _coerce_state(graph.invoke(Command(resume=resume_payload), config=graph_config))
         else:
             initial_state = _build_initial_agent_state(
                 normalized_request,
@@ -820,10 +899,13 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 user_memory_debug=user_memory_debug,
             )
             generation_service = _resolve_generation_service()
+            background_work_coordinator = _resolve_background_work_coordinator()
             graph = _build_agent_graph(
                 generation_service=generation_service,
                 langgraph_checkpoint_store=storage.langgraph_checkpoints,
                 runtime_checkpoint_store=storage.agent_runtime_checkpoints,
+                approval_store=storage.approval_grants,
+                background_work_coordinator=background_work_coordinator,
             )
             graph_input: Any
 
@@ -832,6 +914,7 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 interaction_runtime = InteractionRuntimeService(
                     checkpoint_store=storage.agent_runtime_checkpoints,
                     approval_store=storage.approval_grants,
+                    background_work_coordinator=background_work_coordinator,
                 )
                 request_resume_payload = _build_resume_payload(normalized_request.resume)
                 info_event(
@@ -864,7 +947,11 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     decision=resume_payload.get("decision"),
                 )
                 current_state = _load_graph_snapshot_state(graph, resolved_session_id)
-                graph_input = Command(resume=resume_payload)
+                if str(resume_payload.get("decision") or "") == "background_work_started":
+                    current_state = _apply_background_work_started_state(current_state, resume_payload)
+                    graph_input = None
+                else:
+                    graph_input = Command(resume=resume_payload)
             else:
                 current_state = _build_initial_agent_state(
                     normalized_request,
@@ -896,6 +983,61 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
             event_count += 1
             sequence += 1
 
+            if graph_input is None and resume_payload is not None:
+                # 后台批准只返回任务 ticket；专用 continuation API 会在 job 成功后建立新的恢复 SSE。
+                _persist_runtime_checkpoint_after_turn(checkpoint_manager, current_state, is_resume=True)
+                final_response = _state_to_response(current_state)
+                yield _sse_event(
+                    _make_stream_event(
+                        event_type="final_response",
+                        sequence=_next_sequence(sequence),
+                        run_id=run_id,
+                        data={"response": final_response.model_dump(), "state": _compact_state(current_state)},
+                    )
+                )
+                event_count += 1
+                sequence += 1
+                yield _sse_event(
+                    _make_stream_event(
+                        event_type="stream_end",
+                        sequence=_next_sequence(sequence),
+                        run_id=run_id,
+                        data={"status": "background_work_started", "final_sequence": sequence},
+                    )
+                )
+                return
+
+            # 批准恢复时，工具身份来自后端已校验的 interaction；只放行这一个 step 的运行中提示，
+            # 避免未获批的副作用工具在 UI 上被误显示为已经开始执行。
+            approved_step_id = (
+                str((resume_payload or {}).get("step_id") or "").strip()
+                if str((resume_payload or {}).get("decision") or "").strip() == "approve"
+                else None
+            )
+            preannounced_tool_call: Optional[Dict[str, Any]] = None
+            preannounced_tool_identity: Optional[tuple[str, str, str]] = None
+            if approved_step_id:
+                preannounced_tool_call = _active_runtime_tool_call(current_state, approved_step_id=approved_step_id)
+                if preannounced_tool_call is not None:
+                    preannounced_tool_identity = _tool_call_identity(preannounced_tool_call)
+                    tool_count += 1
+                    # LangGraph 的 updates 事件要等节点完成后才返回；批准恢复后如果马上进入 Docling
+                    # 这类长耗时工具，必须先从 checkpoint 快照预告工具开始，避免前端在转换期间只显示通用生成中。
+                    yield _sse_event(
+                        _make_stream_event(
+                            event_type="tool_call_start",
+                            sequence=_next_sequence(sequence),
+                            run_id=run_id,
+                            data={
+                                "step": "execute_step",
+                                "tool_call": preannounced_tool_call,
+                                "state": _compact_state(current_state),
+                            },
+                        )
+                    )
+                    event_count += 1
+                    sequence += 1
+
             # 阶段 D：逐步消费 LangGraph 的 updates 流，并把节点生命周期翻译成 SSE 事件。
             for update in graph.stream(graph_input, config=graph_config, stream_mode="updates"):
                 if not update:
@@ -919,26 +1061,35 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 event_count += 1
                 sequence += 1
 
-                active_tool_call = _active_runtime_tool_call(previous_state, approved_step_id=None)
+                active_tool_call = _active_runtime_tool_call(previous_state, approved_step_id=approved_step_id)
+                if active_tool_call is None and step_name == "execute_step" and preannounced_tool_call is not None:
+                    # select_next_step 等前置节点可能会改变 previous_state 的投影；已预告的工具仍应在
+                    # execute_step 结束时收到 tool_call_end，否则前端的 running 进度卡片无法收尾。
+                    active_tool_call = preannounced_tool_call
                 tool_call_started = False
                 if active_tool_call is not None and (step_name == "execute_step" or _should_emit_tool_call(previous_state)):
                     tool_call_started = True
-                    tool_count += 1
-                    # 子阶段 D-2：如果当前节点会触发工具调用，则补发工具开始事件。
-                    yield _sse_event(
-                        _make_stream_event(
-                            event_type="tool_call_start",
-                            sequence=_next_sequence(sequence),
-                            run_id=run_id,
-                            data={
-                                "step": step_name,
-                                "tool_call": active_tool_call,
-                                "state": _compact_state(previous_state),
-                            },
-                        )
+                    already_preannounced = (
+                        preannounced_tool_identity is not None
+                        and _tool_call_identity(active_tool_call) == preannounced_tool_identity
                     )
-                    event_count += 1
-                    sequence += 1
+                    if not already_preannounced:
+                        tool_count += 1
+                        # 子阶段 D-2：如果当前节点会触发工具调用，则补发工具开始事件。
+                        yield _sse_event(
+                            _make_stream_event(
+                                event_type="tool_call_start",
+                                sequence=_next_sequence(sequence),
+                                run_id=run_id,
+                                data={
+                                    "step": step_name,
+                                    "tool_call": active_tool_call,
+                                    "state": _compact_state(previous_state),
+                                },
+                            )
+                        )
+                        event_count += 1
+                        sequence += 1
 
                 # __interrupt__ 是正常的确认暂停信号，不是 AgentState。
                 # 流式模式下要把它还原成 waiting_confirmation 状态返回给前端，避免误报成运行时异常。
@@ -987,6 +1138,9 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     )
                     event_count += 1
                     sequence += 1
+                    if preannounced_tool_identity == _tool_call_identity(active_tool_call):
+                        preannounced_tool_call = None
+                        preannounced_tool_identity = None
 
             # 阶段 E：整张图执行完成后，输出最终聚合响应和结束事件。
             if current_state is not None:
@@ -1796,6 +1950,20 @@ def _merge_tool_call_end(active_tool_call: Mapping[str, Any], latest_tool_call: 
         **dict(merged.get("trace") or {}),
     }
     return merged
+
+
+def _tool_call_identity(tool_call: Optional[Mapping[str, Any]]) -> tuple[str, str, str]:
+    """生成流式工具事件的轻量身份，用于去重已预告的 tool_call_start。
+
+    这里不使用完整 arguments 比较，是因为批准恢复时的预告事件来自 checkpoint 快照，
+    execute_step 结束事件可能来自工具 trace；两者字段完整度不同，但 step/tool/action 身份稳定。
+    """
+    payload = dict(tool_call or {})
+    return (
+        str(payload.get("step_id") or "").strip(),
+        str(payload.get("tool_name") or "").strip(),
+        str(payload.get("action_type") or "").strip(),
+    )
 
 
 def _should_emit_tool_call(state: Optional[AgentState]) -> bool:

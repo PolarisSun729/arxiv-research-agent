@@ -7,6 +7,7 @@ from services.storage.sqlite.stores.agent_runtime_checkpoints import AgentRuntim
 
 from .approvals import ApprovalGrant
 from .interactions import AgentInteraction, InteractionResumeRequest, SideEffectApprovalPayload
+from .background_jobs import PersistentBackgroundWorkCoordinator
 
 
 RUNTIME_CHECKPOINT_SCHEMA_VERSION = 2
@@ -28,9 +29,11 @@ class InteractionRuntimeService:
         *,
         checkpoint_store: AgentRuntimeCheckpointStore,
         approval_store: ApprovalGrantStore,
+        background_work_coordinator: PersistentBackgroundWorkCoordinator | None = None,
     ) -> None:
         self.checkpoint_store = checkpoint_store
         self.approval_store = approval_store
+        self.background_work_coordinator = background_work_coordinator
 
     def resolve(
         self,
@@ -114,6 +117,39 @@ class InteractionRuntimeService:
         if request.decision != "approve":
             raise InteractionRuntimeError("interaction_decision_invalid")
         payload = SideEffectApprovalPayload.model_validate(interaction.payload)
+        # ToolContract 是执行模式唯一事实源；批准入口只按 policy 分流，不按 QA 工具名写特判。
+        from ..tool_registry import UNIFIED_TOOL_REGISTRY
+
+        contract = UNIFIED_TOOL_REGISTRY.get_contract(payload.tool_name)
+        execution_policy = getattr(contract, "execution_policy", None)
+        if execution_policy is not None and execution_policy.mode == "background_job":
+            if self.background_work_coordinator is None:
+                # 后台能力缺失时不能继续创建普通 grant，否则执行器可能退回同步 adapter。
+                raise InteractionRuntimeError("background_execution_unavailable")
+            ticket = self.background_work_coordinator.approve_interaction(
+                checkpoint=checkpoint,
+                interaction=interaction,
+                approval_payload=payload,
+                user_id=user_id,
+                session_id=session_id,
+                thread_id=thread_id,
+                handler_name=str(execution_policy.handler or ""),
+            )
+            if ticket.status != "already_satisfied":
+                return {
+                    "interaction_id": interaction.interaction_id,
+                    "kind": interaction.kind,
+                    "decision": "background_work_started",
+                    "step_id": interaction.step_id,
+                    "tool_name": payload.tool_name,
+                    "action_type": payload.action_type,
+                    "background_work": {
+                        "continuation_id": ticket.continuation_id,
+                        "job_id": ticket.job_id,
+                        "status": ticket.status,
+                    },
+                }
+
         grant = ApprovalGrant(
             grant_id=str(uuid4()),
             interaction_id=interaction.interaction_id,
@@ -136,4 +172,8 @@ class InteractionRuntimeService:
             "kind": interaction.kind,
             "decision": "approve",
             "grant_id": grant.grant_id,
+            # step/tool 身份只从后端 checkpoint 中投影，前端不能传入；流式层用它放行刚获批的工具进度事件。
+            "step_id": interaction.step_id,
+            "tool_name": payload.tool_name,
+            "action_type": payload.action_type,
         }

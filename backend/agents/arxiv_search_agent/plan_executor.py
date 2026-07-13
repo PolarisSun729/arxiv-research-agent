@@ -24,6 +24,7 @@ from .execution.execution_guard import ExecutionGuard
 from .execution.target_selection import TargetSelectionCoordinator
 from .execution.recovery import ExecutionRecoveryCoordinator
 from .execution.side_effects import SideEffectInvocationService
+from .execution.background_jobs import BackgroundWorkCoordinator
 from .observer import Observer
 from .planner import build_executable_plan, build_plan_runtime
 from .replanner import Replanner
@@ -75,10 +76,12 @@ class PlanExecutor:
         self,
         tool_registry: ToolRegistry = PLANNER_TOOL_REGISTRY,
         approval_store: Optional[ApprovalGrantStore] = None,
+        background_work_coordinator: Optional[BackgroundWorkCoordinator] = None,
     ) -> None:
         self.tool_registry = tool_registry
         self.execution_guard = ExecutionGuard(approval_store)
         self.side_effects = SideEffectInvocationService(approval_store)
+        self.background_work_coordinator = background_work_coordinator
         self.target_selection = TargetSelectionCoordinator()
         self.input_bindings = InputBindingResolver()
         self.tool_execution = ToolExecutionService(
@@ -267,6 +270,56 @@ class PlanExecutor:
                             next_action="fail",
                             error=runtime.error,
                         )
+                    if resume_decision == "background_completed":
+                        validated_result = (
+                            dict(resume_payload.get("validated_result") or {})
+                            if isinstance(resume_payload, Mapping)
+                            and isinstance(resume_payload.get("validated_result"), Mapping)
+                            else {}
+                        )
+                        continuation_id = str((resume_payload or {}).get("continuation_id") or "").strip()
+                        if not continuation_id or not validated_result:
+                            runtime.step_status[step.step_id] = "failed"
+                            runtime.turn_status = "failed"
+                            runtime.error = f"background_resume_payload_invalid:{step.step_id}"
+                            self._sync_runtime_state(state, runtime, current_step=step)
+                            return self._step_result_from_runtime(
+                                step=step,
+                                runtime=runtime,
+                                next_action="fail",
+                                error=runtime.error,
+                            )
+                        # job 已由 continuation 验证并完成原 invocation；这里仅投影输出，禁止再次调用 adapter。
+                        runtime.interaction = None
+                        runtime.turn_status = None
+                        runtime.step_status[step.step_id] = "running"
+                        runtime.last_step_output = {
+                            "step_id": step.step_id,
+                            "tool_contract": _json_safe(self.tool_registry.describe_contract(step.tool_name)),
+                            "resolved_input": _json_safe(resolved_input),
+                            "raw_output": _json_safe(validated_result),
+                            "normalized_output": _json_safe(validated_result),
+                            "background_work": {
+                                "continuation_id": continuation_id,
+                                "status": "completed",
+                            },
+                            "started_at": started_at,
+                            "finished_at": _utcnow(),
+                        }
+                        self._append_trace(
+                            runtime,
+                            step,
+                            event="background_job_result_projected",
+                            status="running",
+                            detail={"continuation_id": continuation_id},
+                        )
+                        self._sync_runtime_state(state, runtime, current_step=step)
+                        return self._step_result_from_runtime(
+                            step=step,
+                            runtime=runtime,
+                            next_action="continue",
+                            output=validated_result,
+                        )
 
                 return self._step_result_from_runtime(
                     step=step,
@@ -276,6 +329,129 @@ class PlanExecutor:
                 )
             runtime.interaction = None
             runtime.turn_status = None
+
+        contract = self.tool_registry.get_contract(step.tool_name)
+        execution_policy = getattr(contract, "execution_policy", None)
+        if execution_policy is not None and execution_policy.mode == "background_job":
+            # 后台工具在这里完成语义分流；无论协调器是否可用，都禁止落回 adapter 的同步执行路径。
+            if self.background_work_coordinator is None:
+                runtime.step_status[step.step_id] = "failed"
+                runtime.turn_status = "failed"
+                runtime.error = f"background_execution_unavailable:{step.step_id}"
+                runtime.recovery_strategy = {
+                    "type": "abort_with_error",
+                    "reason": "background_execution_unavailable",
+                }
+                self._append_trace(
+                    runtime,
+                    step,
+                    event="step_failed",
+                    status="failed",
+                    detail={"failure_reason": "background_execution_unavailable"},
+                )
+                self._sync_runtime_state(state, runtime, current_step=step)
+                return self._step_result_from_runtime(
+                    step=step,
+                    runtime=runtime,
+                    next_action="fail",
+                    error=runtime.error,
+                )
+
+            try:
+                ticket = self.background_work_coordinator.prepare(
+                    handler_name=str(execution_policy.handler or ""),
+                    step=step,
+                    runtime=runtime,
+                    state=state,
+                    arguments=resolved_input,
+                    grant_id=(guard_decision.grant_id if guard_decision is not None else None),
+                    arguments_fingerprint=(
+                        guard_decision.arguments_fingerprint if guard_decision is not None else ""
+                    ),
+                )
+            except Exception as exc:
+                # 后台提交/挂接失败必须显式失败；同步 fallback 会重新引入阻塞和不可恢复语义。
+                runtime.step_status[step.step_id] = "failed"
+                runtime.turn_status = "failed"
+                runtime.error = f"background_execution_failed:{step.step_id}:{exc}"
+                runtime.recovery_strategy = {
+                    "type": "abort_with_error",
+                    "reason": "background_execution_failed",
+                    "error": str(exc),
+                }
+                self._append_trace(
+                    runtime,
+                    step,
+                    event="step_failed",
+                    status="failed",
+                    detail={"failure_reason": "background_execution_failed", "error": str(exc)},
+                )
+                self._sync_runtime_state(state, runtime, current_step=step)
+                return self._step_result_from_runtime(
+                    step=step,
+                    runtime=runtime,
+                    next_action="fail",
+                    error=runtime.error,
+                )
+
+            if ticket.status == "already_satisfied" and ticket.projected_result is not None:
+                # 批准期间其他 job 可能已完成；等价成功输出直接交给 observe_step，不制造空后台任务。
+                normalized_output = dict(ticket.projected_result)
+                runtime.last_step_output = {
+                    "step_id": step.step_id,
+                    "tool_contract": _json_safe(self.tool_registry.describe_contract(step.tool_name)),
+                    "resolved_input": _json_safe(resolved_input),
+                    "raw_output": _json_safe(normalized_output),
+                    "normalized_output": _json_safe(normalized_output),
+                    "started_at": started_at,
+                    "finished_at": _utcnow(),
+                }
+                self._append_trace(
+                    runtime,
+                    step,
+                    event="background_work_already_satisfied",
+                    status="running",
+                    detail={"handler_name": execution_policy.handler},
+                )
+                self._sync_runtime_state(state, runtime, current_step=step)
+                return self._step_result_from_runtime(
+                    step=step,
+                    runtime=runtime,
+                    next_action="continue",
+                    output=normalized_output,
+                )
+
+            runtime.step_status[step.step_id] = "waiting_background_job"
+            runtime.turn_status = "waiting_background_job"
+            runtime.last_step_output = {
+                "step_id": step.step_id,
+                "tool_contract": _json_safe(self.tool_registry.describe_contract(step.tool_name)),
+                "resolved_input": _json_safe(resolved_input),
+                "background_work": {
+                    "continuation_id": ticket.continuation_id,
+                    "job_id": ticket.job_id,
+                    "status": ticket.status,
+                },
+                "started_at": started_at,
+                "finished_at": None,
+            }
+            self._append_trace(
+                runtime,
+                step,
+                event="background_work_prepared",
+                status="waiting_background_job",
+                detail={
+                    "handler_name": execution_policy.handler,
+                    "continuation_id": ticket.continuation_id,
+                    "job_id": ticket.job_id,
+                },
+            )
+            self._sync_runtime_state(state, runtime, current_step=step)
+            return self._step_result_from_runtime(
+                step=step,
+                runtime=runtime,
+                next_action="wait_for_background_job",
+            )
 
         invocation_id: Optional[str] = None
         if guard_decision is not None and guard_decision.grant_id:
@@ -820,6 +996,20 @@ class PlanExecutor:
                 outputs=dict(runtime.outputs),
                 trace=list(runtime.trace),
                 interaction=runtime.interaction,
+                error=runtime.error,
+                runtime=runtime,
+            )
+        if runtime.turn_status == "waiting_background_job" or any(
+            status == "waiting_background_job" for status in runtime.step_status.values()
+        ):
+            # interaction 已在批准事务中结束；后台等待是独立业务态，不能被普通成功收口覆盖。
+            runtime.turn_status = "waiting_background_job"
+            return AgentTurnResult(
+                status="waiting_background_job",
+                final_answer=runtime.final_answer,
+                plan=runtime.plan,
+                outputs=dict(runtime.outputs),
+                trace=list(runtime.trace),
                 error=runtime.error,
                 runtime=runtime,
             )

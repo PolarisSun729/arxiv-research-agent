@@ -11,6 +11,7 @@ from services.storage.sqlite.stores import AgentRuntimeCheckpointStore, Approval
 from .node import parse_search_request
 from .planner import GoalBuilder, build_executable_plan_for_goal, build_plan_runtime
 from .plan_executor import PlanExecutor
+from .execution.background_jobs import BackgroundWorkCoordinator
 from .research_task_profile import build_research_task_profile, research_task_profile_debug
 from .schemas import AgentRuntimeState, AgentStep, AgentTurnResult, ExecutablePlan, PlanRuntime, StepExecutionResult
 from .state import AgentState
@@ -46,11 +47,13 @@ def _coerce_state(state: Any) -> AgentState:
 
 def _executor(
     approval_store: Optional[ApprovalGrantStore] = None,
+    background_work_coordinator: Optional[BackgroundWorkCoordinator] = None,
 ) -> PlanExecutor:
     """统一创建执行器，图节点只关心编排，不直接触碰工具注册细节。"""
     return PlanExecutor(
         tool_registry=PLANNER_TOOL_REGISTRY,
         approval_store=approval_store,
+        background_work_coordinator=background_work_coordinator,
     )
 
 
@@ -161,6 +164,7 @@ def execute_step_node(
     *,
     runtime_checkpoint_store: Optional[AgentRuntimeCheckpointStore] = None,
     approval_store: Optional[ApprovalGrantStore] = None,
+    background_work_coordinator: Optional[BackgroundWorkCoordinator] = None,
 ) -> AgentState:
     """只负责执行当前 step 对应工具。
 
@@ -170,7 +174,11 @@ def execute_step_node(
     current_state = _coerce_state(state)
     next_state = current_state.model_copy(deep=True)
     runtime = _ensure_runtime(next_state)
-    result = _executor(approval_store).execute_current_step_tool(runtime, next_state, allow_interrupt=True)
+    result = _executor(approval_store, background_work_coordinator).execute_current_step_tool(
+        runtime,
+        next_state,
+        allow_interrupt=True,
+    )
     next_state.plan_runtime = runtime
     next_state.runtime_state = _runtime_state_from_runtime(next_state, runtime)
     _apply_step_result(next_state, result)
@@ -282,7 +290,9 @@ def finalize_node(
     next_state.steps = list(next_state.steps or []) + [
         AgentStep(
             step="finalize",
-            status="success" if turn_result.status in {"success", "waiting_interaction", "need_clarification", "fallback"} else "failed",
+            status="success" if turn_result.status in {
+                "success", "waiting_interaction", "waiting_background_job", "need_clarification", "fallback",
+            } else "failed",
             action="汇总 runtime 并生成最终响应状态",
             inputs={"turn_status": turn_result.status},
             outputs={"output_keys": sorted(turn_result.outputs.keys()), "interaction": bool(turn_result.interaction)},
@@ -339,6 +349,8 @@ def route_after_execution(state: Any) -> str:
         return "error"
     if runtime.interaction:
         return "finalize"
+    if runtime.turn_status == "waiting_background_job":
+        return "finalize"
     if runtime.error:
         return "error"
     if last_step_result.get("next_action") == "continue" and not runtime.last_step_output:
@@ -359,7 +371,9 @@ def route_after_observation(state: Any) -> str:
         return "error"
     if runtime.needs_replan:
         return "replan"
-    if runtime.turn_status in {"failed", "fallback", "need_clarification", "waiting_interaction"}:
+    if runtime.turn_status in {
+        "failed", "fallback", "need_clarification", "waiting_interaction", "waiting_background_job",
+    }:
         return "finalize"
     return "select_next_step"
 
@@ -374,7 +388,9 @@ def route_after_replan(state: Any) -> str:
         return "finalize"
     if runtime.error and runtime.turn_status not in {"fallback", "success"}:
         return "error"
-    if runtime.turn_status in {"fallback", "failed", "need_clarification", "waiting_interaction"}:
+    if runtime.turn_status in {
+        "fallback", "failed", "need_clarification", "waiting_interaction", "waiting_background_job",
+    }:
         return "finalize"
     return "select_next_step"
 
@@ -385,6 +401,7 @@ def build_arxiv_search_graph(
     checkpointer: Optional[Any] = None,
     runtime_checkpoint_store: Optional[AgentRuntimeCheckpointStore] = None,
     approval_store: Optional[ApprovalGrantStore] = None,
+    background_work_coordinator: Optional[BackgroundWorkCoordinator] = None,
 ) -> Any:
     """构建显式 Agent 执行环。
 
@@ -403,6 +420,7 @@ def build_arxiv_search_graph(
             state,
             runtime_checkpoint_store=runtime_checkpoint_store,
             approval_store=approval_store,
+            background_work_coordinator=background_work_coordinator,
         ),
     )
     graph.add_node("observe_step", lambda state: observe_step_node(state, runtime_checkpoint_store=runtime_checkpoint_store))

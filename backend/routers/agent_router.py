@@ -3,9 +3,20 @@ from __future__ import annotations
 """arXiv Agent 对话与图结构路由。"""
 
 import logging
+import asyncio
+import json
+from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
+
+from dependencies import (
+    RequestActor,
+    get_agent_resume_run_manager,
+    get_agent_work_continuation_service,
+    get_request_actor,
+)
+from services.storage.sqlite.stores.agent_work import AgentWorkConflict
 
 try:
     from agents.arxiv_search_agent import (
@@ -31,6 +42,19 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/agent", tags=["agent"])
 
 
+def _agent_work_http_error(exc: AgentWorkConflict) -> HTTPException:
+    reason = str(exc)
+    if "owner_mismatch" in reason:
+        return HTTPException(status_code=404, detail="Agent work item not found")
+    if "missing" in reason:
+        return HTTPException(status_code=404, detail=reason)
+    return HTTPException(status_code=409, detail=reason)
+
+
+def _resume_sse(event_name: str, payload: dict) -> str:
+    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 @router.post("/chat", response_model=ArxivSearchResponse)
 async def agent_chat_endpoint(request: ArxivSearchRequest):
     """执行一次完整 Agent 对话，并一次性返回结果。"""
@@ -49,3 +73,110 @@ async def agent_chat_stream_endpoint(request: ArxivSearchRequest) -> StreamingRe
 async def agent_graph_endpoint():
     """返回静态图结构，供调试和可视化使用。"""
     return export_arxiv_search_graph_mermaid()
+
+
+@router.get("/work-continuations/active")
+async def list_active_agent_work_continuations(
+    session_id: Optional[str] = Query(None),
+    actor: RequestActor = Depends(get_request_actor),
+    service=Depends(get_agent_work_continuation_service),
+):
+    """返回当前 demo actor 可见的后台任务卡；响应不暴露 checkpoint、grant 或工具参数。"""
+    return {"items": service.list_active(user_id=actor.user_id, session_id=session_id)}
+
+
+@router.get("/work-continuations/{continuation_id}")
+async def get_agent_work_continuation(
+    continuation_id: str,
+    session_id: str = Query(...),
+    actor: RequestActor = Depends(get_request_actor),
+    service=Depends(get_agent_work_continuation_service),
+):
+    try:
+        return service.get(continuation_id, user_id=actor.user_id, session_id=session_id)
+    except AgentWorkConflict as exc:
+        raise _agent_work_http_error(exc) from exc
+
+
+@router.post("/work-continuations/{continuation_id}/cancel")
+async def cancel_agent_work_continuation(
+    continuation_id: str,
+    session_id: str = Query(...),
+    actor: RequestActor = Depends(get_request_actor),
+    service=Depends(get_agent_work_continuation_service),
+):
+    try:
+        return service.cancel(continuation_id, user_id=actor.user_id, session_id=session_id)
+    except AgentWorkConflict as exc:
+        raise _agent_work_http_error(exc) from exc
+
+
+@router.post("/work-continuations/{continuation_id}/resume/stream")
+async def resume_agent_work_continuation_stream(
+    continuation_id: str,
+    session_id: str = Query(...),
+    actor: RequestActor = Depends(get_request_actor),
+    manager=Depends(get_agent_resume_run_manager),
+) -> StreamingResponse:
+    """创建或复用唯一 AgentResumeRun；传输断开不会停止后台恢复线程。"""
+    try:
+        claimed = manager.claim_and_start(
+            continuation_id,
+            user_id=actor.user_id,
+            session_id=session_id,
+        )
+    except AgentWorkConflict as exc:
+        raise _agent_work_http_error(exc) from exc
+
+    async def event_stream():
+        resume_run_id = str(claimed["resume_run_id"])
+        yield _resume_sse(
+            "run_start",
+            {"resume_run_id": resume_run_id, "status": claimed.get("status")},
+        )
+        while True:
+            run = manager.get(resume_run_id, user_id=actor.user_id, session_id=session_id)
+            status = str(run.get("status") or "")
+            if status == "completed":
+                # final_response 已在同一事务中持久化后才会进入 completed，SSE 断线可改走 GET 取回同一结果。
+                yield _resume_sse(
+                    "final_response",
+                    {"resume_run_id": resume_run_id, "response": run.get("final_response")},
+                )
+                # 只有 final_response 已经交给 ASGI 发送后才记录读取，避免发送前断线导致刷新时找不到持久结果。
+                manager.mark_result_retrieved(resume_run_id)
+                yield _resume_sse("stream_end", {"resume_run_id": resume_run_id, "status": "completed"})
+                return
+            if status in {"failed", "indeterminate"}:
+                yield _resume_sse(
+                    "exception",
+                    {
+                        "resume_run_id": resume_run_id,
+                        "status": status,
+                        "error_code": run.get("error_code"),
+                        "message": run.get("error_message"),
+                    },
+                )
+                yield _resume_sse("stream_end", {"resume_run_id": resume_run_id, "status": status})
+                return
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.get("/resume-runs/{resume_run_id}")
+async def get_agent_resume_run(
+    resume_run_id: str,
+    session_id: Optional[str] = Query(None),
+    actor: RequestActor = Depends(get_request_actor),
+    manager=Depends(get_agent_resume_run_manager),
+):
+    try:
+        return manager.get(
+            resume_run_id,
+            user_id=actor.user_id,
+            session_id=session_id,
+            mark_retrieved=True,
+        )
+    except AgentWorkConflict as exc:
+        raise _agent_work_http_error(exc) from exc

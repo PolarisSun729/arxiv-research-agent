@@ -184,3 +184,49 @@ export interface AgentGraphResponse {
   mermaid: string
   supports_png: boolean
 }
+
+export interface AgentIndexJobSnapshot {
+  status: string | null
+  current_stage: string | null
+  stage_label: string | null
+  progress: number | null
+  attempt_no: number | null
+  max_attempts: number | null
+  error_code: string | null
+  error_message: string | null
+}
+
+export interface AgentWorkContinuation {
+  continuation_id: string
+  session_id: string
+  status: 'submitting' | 'waiting_job' | 'ready_to_resume' | 'resuming' | 'resumed' | 'failed' | 'cancelled' | 'expired' | 'indeterminate'
+  display_summary: {
+    arxiv_id?: string | null
+    paper_title?: string | null
+    question_summary?: string | null
+  }
+  job_id: string | null
+  job: AgentIndexJobSnapshot | null
+  error_code: string | null
+  error_message: string | null
+  can_cancel: boolean
+  can_resume: boolean
+  ready_at: string | null
+  expires_at: string | null
+  resume_run_id: string | null
+}
+
+export interface AgentResumeRun {
+  resume_run_id: string
+  continuation_id: string
+  user_id: string
+  session_id: string
+  thread_id: string
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'indeterminate'
+  started_at: string | null
+  finished_at: string | null
+  final_response: ArxivSearchResponse | null
+  error_code: string | null
+  error_message: string | null
+  result_retrieved_at: string | null
+}

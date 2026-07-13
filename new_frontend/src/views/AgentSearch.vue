@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { dislikePaper, likePaper, removePaperPreference } from '@/api/papers'
 import { useAgentSearchChat } from '@/composables/useAgentSearchChat'
 import AgentUserResultAttachments from '@/components/agent-search/AgentUserResultAttachments.vue'
+import AgentWorkCard from '@/components/agent-search/AgentWorkCard.vue'
 import RagChatPanel from '@/components/rag-chat/RagChatPanel.vue'
 import type { AgentInteraction, ArxivSearchResponse, TargetSelectionPayload } from '@/types/agent'
 import type { Paper } from '@/types/paper'
@@ -22,9 +23,17 @@ const {
   messages,
   latestResponse,
   currentInteraction,
+  workContinuations,
+  resumingContinuationIds,
+  retryingContinuationIds,
   setInputMessage,
   submitMessage,
   submitResume,
+  startWorkContinuationPolling,
+  stopWorkContinuationPolling,
+  resumeWorkContinuation,
+  cancelWorkContinuation,
+  retryWorkContinuation,
   clearConversation
 } = useAgentSearchChat()
 
@@ -34,8 +43,14 @@ const quickPrompts = [
   '找一些关于多模态检索增强生成的论文'
 ]
 
-onMounted(() => {
-  store.fetchResearchProfile()
+onMounted(async () => {
+  void store.fetchResearchProfile()
+  // 后台任务独立于聊天气泡，进入页面时恢复所有可见 continuation 并启动持久轮询。
+  await startWorkContinuationPolling()
+})
+
+onBeforeUnmount(() => {
+  stopWorkContinuationPolling()
 })
 
 function handlePromptSelect(prompt: string) {
@@ -197,6 +212,25 @@ watch(latestResponse, () => {
       <el-button size="small" @click="handleGoProfile">编辑画像</el-button>
     </section>
 
+    <section v-if="workContinuations.length" class="agent-work-list" aria-label="后台 Agent 工作">
+      <div class="agent-work-list__header">
+        <div>
+          <h2>后台任务</h2>
+          <p>关闭或刷新页面不会丢失任务；只有唯一的当前会话任务会自动恢复。</p>
+        </div>
+      </div>
+      <AgentWorkCard
+        v-for="work in workContinuations"
+        :key="work.continuation_id"
+        :work="work"
+        :resuming="resumingContinuationIds.has(work.continuation_id)"
+        :retrying="retryingContinuationIds.has(work.continuation_id)"
+        @resume="resumeWorkContinuation"
+        @cancel="cancelWorkContinuation"
+        @retry="retryWorkContinuation"
+      />
+    </section>
+
     <section class="conversation-shell">
       <RagChatPanel
         v-model:sender-text="inputMessage"
@@ -281,6 +315,27 @@ watch(latestResponse, () => {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+.agent-work-list {
+  display: grid;
+  gap: 12px;
+}
+
+.agent-work-list__header h2,
+.agent-work-list__header p {
+  margin: 0;
+}
+
+.agent-work-list__header h2 {
+  color: #0f172a;
+  font-size: 18px;
+}
+
+.agent-work-list__header p {
+  margin-top: 4px;
+  color: #64748b;
+  font-size: 13px;
 }
 
 .profile-banner {

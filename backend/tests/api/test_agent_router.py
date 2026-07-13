@@ -104,6 +104,52 @@ class AgentRouterApiTests(unittest.TestCase):
         self.assertIn("node_names", payload)
         mocked.assert_called_once()
 
+    def test_active_work_continuations_are_scoped_to_request_actor(self) -> None:
+        service = mock.Mock()
+        service.list_active.return_value = [
+            {
+                "continuation_id": "continuation-1",
+                "session_id": "s1",
+                "status": "waiting_job",
+                "job": {"status": "running", "progress": 45, "current_stage": "chunk_document"},
+            }
+        ]
+        self.client.app.dependency_overrides[agent_router.get_agent_work_continuation_service] = lambda: service
+
+        response = self.client.get(
+            "/api/agent/work-continuations/active",
+            params={"user_id": "u1", "session_id": "s1"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["items"][0]["job"]["progress"], 45)
+        service.list_active.assert_called_once_with(user_id="u1", session_id="s1")
+
+    def test_resume_stream_returns_persisted_run_result(self) -> None:
+        manager = mock.Mock()
+        manager.claim_and_start.return_value = {
+            "resume_run_id": "run-1",
+            "status": "completed",
+            "created": False,
+        }
+        manager.get.return_value = {
+            "resume_run_id": "run-1",
+            "status": "completed",
+            "final_response": {"session_id": "s1", "intent": "paper_qa", "answer": "原问题答案"},
+        }
+        self.client.app.dependency_overrides[agent_router.get_agent_resume_run_manager] = lambda: manager
+
+        response = self.client.post(
+            "/api/agent/work-continuations/continuation-1/resume/stream",
+            params={"user_id": "u1", "session_id": "s1"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("event: final_response", response.text)
+        self.assertIn("原问题答案", response.text)
+        manager.claim_and_start.assert_called_once_with("continuation-1", user_id="u1", session_id="s1")
+        manager.mark_result_retrieved.assert_called_once_with("run-1")
+
     def test_chat_endpoint_maps_service_http_exception(self) -> None:
         with mock.patch.object(agent_router, "run_arxiv_search_agent", side_effect=HTTPException(status_code=409, detail="confirmation required")):
             response = self.client.post("/api/agent/chat", json={"user_id": "u1", "message": "approve this"})

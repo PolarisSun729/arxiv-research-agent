@@ -144,11 +144,13 @@ class FakeStorageContainer:
         self.profile_build_jobs = self._store
         self.research_profiles = self._store
         self.agent_sessions = self._store
-        self.agent_qa_index_continuations = self._store
+        self.agent_work = self._store
         self.paper_qa_index = self._store
         self.paper_qa_turns = self._store
         self.agent_runtime_checkpoints = self._store
         self.langgraph_checkpoints = self._store
+        # Agent service 构图会显式透传授权 store；测试桩也保留同名依赖，避免单测绕过生产入口契约。
+        self.approval_grants = self._store
 
 
 def _ensure_backend_packages() -> Path:
@@ -195,11 +197,32 @@ def _ensure_dependency_stubs() -> None:
         lambda: None,
     )
     dependencies_module.get_index_job_manager = getattr(dependencies_module, "get_index_job_manager", lambda: None)
-    # agent_router 新增 continuation 端点会在导入期解析这些依赖；轻量 Agent 单测只需要可注入对象存在。
-    dependencies_module.get_agent_qa_index_continuation_store = getattr(
+    # Agent 后台路由在导入期解析这些依赖；轻量单测只需要保留可覆盖的依赖入口。
+    if not hasattr(dependencies_module, "RequestActor"):
+        class _RequestActor:
+            def __init__(self, user_id: str = "default") -> None:
+                self.user_id = user_id
+
+        dependencies_module.RequestActor = _RequestActor
+    dependencies_module.get_request_actor = getattr(
         dependencies_module,
-        "get_agent_qa_index_continuation_store",
-        lambda: FakeStorageContainer().agent_qa_index_continuations,
+        "get_request_actor",
+        lambda user_id=None: dependencies_module.RequestActor(user_id or "default"),
+    )
+    dependencies_module.get_agent_work_continuation_service = getattr(
+        dependencies_module,
+        "get_agent_work_continuation_service",
+        lambda: None,
+    )
+    dependencies_module.get_agent_resume_run_manager = getattr(
+        dependencies_module,
+        "get_agent_resume_run_manager",
+        lambda: None,
+    )
+    dependencies_module.get_background_work_coordinator = getattr(
+        dependencies_module,
+        "get_background_work_coordinator",
+        lambda: None,
     )
     dependencies_module.get_paper_qa_index_store = getattr(
         dependencies_module,

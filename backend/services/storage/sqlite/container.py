@@ -3,6 +3,7 @@ from services.storage.sqlite.schema import StorageSchemaMigrator
 from services.storage.sqlite.stores import (
     AgentSessionStore,
     AgentRuntimeCheckpointStore,
+    AgentWorkStore,
     ApprovalGrantStore,
     InterestVectorStore,
     LangGraphCheckpointStore,
@@ -68,5 +69,6 @@ class StorageContainer:
         self.paper_notes = PaperNoteStore(self.connection_provider, self.profile_events)
         self.agent_sessions = AgentSessionStore(self.connection_provider)
         self.agent_runtime_checkpoints = AgentRuntimeCheckpointStore(self.connection_provider)
+        self.agent_work = AgentWorkStore(self.connection_provider)
         self.approval_grants = ApprovalGrantStore(self.connection_provider)
         self.langgraph_checkpoints = LangGraphCheckpointStore(self.connection_provider)

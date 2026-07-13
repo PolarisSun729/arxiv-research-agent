@@ -123,7 +123,11 @@ class _FakeQaStorage:
             "arxiv_id": "2401.00001",
             "status": "completed",
             "current_stage": "done",
+            "stage_message": "索引已激活",
             "progress": 100,
+            "attempt_count": 2,
+            "max_attempts": 3,
+            "failure_code": None,
             "error_message": None,
             "loading_method": "docling",
             "created_at": "2026-06-04T10:00:00",
@@ -295,6 +299,16 @@ class QaRouterApiTests(unittest.TestCase):
         response = self.client.get("/api/paper/missing/qa-index-jobs/latest")
 
         self.assertEqual(response.status_code, 404)
+
+    def test_get_latest_qa_index_job_exposes_attempt_and_stage_details(self) -> None:
+        response = self.client.get("/api/paper/2401.00001/qa-index-jobs/latest")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["attempt_no"], 2)
+        self.assertEqual(payload["max_attempts"], 3)
+        self.assertEqual(payload["stage_message"], "索引已激活")
+        self.assertIsNone(payload["failure_code"])
 
     def test_chat_sessions_list_and_create_return_stable_items(self) -> None:
         created = self.client.post("/api/paper/2401.00001/chat-sessions", json={"user_id": "u1", "title": "Session A"})

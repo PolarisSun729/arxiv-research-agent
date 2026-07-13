@@ -103,6 +103,17 @@ from .tool_adapters.search import (
 CONTRACT_SOURCE = "backend.agents.arxiv_search_agent.tool_registry.UNIFIED_TOOL_REGISTRY"
 
 
+@dataclass(frozen=True)
+class ExecutionPolicy:
+    """声明工具由当前执行器内联运行，还是交给可恢复的后台 job handler。"""
+
+    mode: str = "inline"
+    handler: Optional[str] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"mode": self.mode, "handler": self.handler}
+
+
 class ToolAdapter(Protocol):
     """统一执行入口。
 
@@ -135,6 +146,7 @@ class ToolContract:
     failure_modes: List[str] = field(default_factory=list)
     recovery_policy: Dict[str, Any] = field(default_factory=dict)
     confirmation_policy: Dict[str, Any] = field(default_factory=dict)
+    execution_policy: ExecutionPolicy = field(default_factory=ExecutionPolicy)
     contract_source: str = CONTRACT_SOURCE
 
     def to_tool_spec(self) -> ToolSpec:
@@ -157,6 +169,7 @@ class ToolContract:
             adapter=self.adapter.__class__.__name__ if self.adapter is not None else None,
             recovery_policy=dict(self.recovery_policy or {}),
             confirmation_policy=dict(self.confirmation_policy or {}),
+            execution_policy=self.execution_policy.as_dict(),
             contract_source=self.contract_source,
         )
 
@@ -175,6 +188,7 @@ class ToolContract:
             "can_retry": self.can_retry,
             "recovery_policy": dict(self.recovery_policy or {}),
             "confirmation_policy": dict(self.confirmation_policy or {}),
+            "execution_policy": self.execution_policy.as_dict(),
         }
 
 
@@ -245,6 +259,7 @@ class ToolRegistry:
                     "output_fields": list((contract.output_schema or {}).keys()),
                     "side_effect_level": contract.side_effect_level,
                     "requires_confirmation": contract.requires_confirmation,
+                    "execution_policy": contract.execution_policy.as_dict(),
                     "contract_source": contract.contract_source,
                 }
             )
@@ -274,6 +289,7 @@ def _contract(
     error_model: Optional[type] = None,
     recovery_policy: Optional[Dict[str, Any]] = None,
     confirmation_policy: Optional[Dict[str, Any]] = None,
+    execution_policy: Optional[ExecutionPolicy] = None,
 ) -> ToolContract:
     return ToolContract(
         tool_name=tool_name,
@@ -293,6 +309,7 @@ def _contract(
         adapter=adapter,
         recovery_policy=dict(recovery_policy or {}),
         confirmation_policy=dict(confirmation_policy or {}),
+        execution_policy=execution_policy or ExecutionPolicy(),
     )
 
 
@@ -312,7 +329,7 @@ for contract in [
     _contract("synthesize_arxiv_response", description="汇总 arXiv 检索结果并生成最终回复。", capability_tags=["answer"], input_schema={"ranked_papers": "list", "warnings": "list"}, output_schema={"final_answer": "str"}, implementation="search.SynthesizeArxivResponseAdapter", input_model=SynthesizeArxivResponseInput, output_model=SearchAnswerOutput, error_model=ToolError, adapter=SynthesizeArxivResponseAdapter()),
     _contract("resolve_paper", description="从消息中提取论文引用线索，并结合上下文生成目标候选或最终论文。", capability_tags=["retrieve"], input_schema={"message": "str", "context": "dict"}, output_schema={"reference_hint": "dict", "target_resolution": "dict", "paper_ref": "dict"}, implementation="paper_qa.ResolvePaperAdapter", input_model=ResolvePaperInput, output_model=PaperReferenceOutput, error_model=ToolError, recovery_policy=_default_recovery("ask_clarification"), adapter=ResolvePaperAdapter()),
     _contract("check_paper_index", description="检查目标论文是否已有 Paper QA 索引。", capability_tags=["retrieve", "validate"], input_schema={"paper_ref": "dict"}, output_schema={"status": "str", "has_index": "bool"}, implementation="paper_qa.CheckPaperIndexAdapter", backend_tool_name="check_paper_qa_index", input_model=CheckPaperIndexInput, output_model=PaperIndexStatusOutput, error_model=ToolError, recovery_policy=_default_recovery("patch_plan"), adapter=CheckPaperIndexAdapter(invoke_backend_tool)),
-    _contract("parse_and_index_paper", description="调用 Paper QA 索引构建工具解析并索引目标论文。", capability_tags=["retrieve", "index"], input_schema={"paper_reference": "dict"}, output_schema={"status": "str", "tool_result": "dict"}, side_effect_level="external_call", requires_confirmation=True, failure_modes=["paper_not_found", "index_build_failed"], implementation="paper_qa.ParseAndIndexPaperAdapter", backend_tool_name="build_paper_qa_index", input_model=ParseAndIndexPaperInput, output_model=IndexBuildOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step"), confirmation_policy={"mode": "explicit_user_confirmation_required", "reason": "external_index_build"}, adapter=ParseAndIndexPaperAdapter(invoke_backend_tool)),
+    _contract("parse_and_index_paper", description="调用 Paper QA 索引构建工具解析并索引目标论文。", capability_tags=["retrieve", "index"], input_schema={"paper_reference": "dict"}, output_schema={"status": "str", "tool_result": "dict"}, side_effect_level="external_call", requires_confirmation=True, failure_modes=["paper_not_found", "index_build_failed"], implementation="paper_qa.ParseAndIndexPaperAdapter", backend_tool_name="build_paper_qa_index", input_model=ParseAndIndexPaperInput, output_model=IndexBuildOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step"), confirmation_policy={"mode": "explicit_user_confirmation_required", "reason": "external_index_build"}, execution_policy=ExecutionPolicy(mode="background_job", handler="paper_qa_index"), adapter=ParseAndIndexPaperAdapter(invoke_backend_tool)),
     _contract("answer_paper_question", description="调用真实 PaperQAService 回答目标论文问题。", capability_tags=["answer"], input_schema={"paper_ref": "dict", "message": "str"}, output_schema={"paper_qa_result": "dict"}, side_effect_level="external_call", implementation="paper_qa.AnswerPaperQuestionAdapter", backend_tool_name="answer_paper_question", input_model=AnswerPaperQuestionInput, output_model=PaperQAAnswerOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step", "patch_plan", "fallback_answer"), adapter=AnswerPaperQuestionAdapter(invoke_backend_tool)),
     _contract("assess_paper_qa_quality", description="读取 Paper QA observation 并决定 finalize、repair 或降级完成。", capability_tags=["validate", "answer"], input_schema={"paper_qa_result": "dict"}, output_schema={"qa_quality_decision": "dict"}, implementation="paper_qa.AssessPaperQAQualityAdapter", input_model=AssessPaperQAQualityInput, output_model=PaperQAQualityDecisionOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step", "patch_plan", "fallback_answer"), adapter=AssessPaperQAQualityAdapter()),
     _contract("load_user_profile", description="从上下文读取用户画像与记忆摘要。", capability_tags=["retrieve", "profile"], input_schema={"context": "dict"}, output_schema={"recommendation_profile": "dict"}, implementation="recommendation.LoadUserProfileAdapter", input_model=LoadUserProfileInput, output_model=UserProfileOutput, error_model=ToolError, recovery_policy=_default_recovery("patch_plan"), adapter=LoadUserProfileAdapter()),

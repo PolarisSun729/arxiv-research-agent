@@ -1178,8 +1178,14 @@ class ExecutionPlanStep(BaseModel):
     depends_on: List[str] = Field(default_factory=list)
 
 
-PlanStepStatus = Literal["pending", "running", "success", "failed", "skipped", "waiting_confirmation", "waiting_interaction"]
-AgentTurnStatus = Literal["success", "waiting_confirmation", "waiting_interaction", "need_clarification", "failed", "fallback"]
+PlanStepStatus = Literal[
+    "pending", "running", "success", "failed", "skipped",
+    "waiting_confirmation", "waiting_interaction", "waiting_background_job",
+]
+AgentTurnStatus = Literal[
+    "success", "waiting_confirmation", "waiting_interaction", "waiting_background_job",
+    "need_clarification", "failed", "fallback",
+]
 SideEffectLevel = Literal["none", "low", "high"]
 
 
@@ -1210,6 +1216,7 @@ class ToolSpec(BaseModel):
     adapter: Optional[str] = None
     recovery_policy: Dict[str, Any] = Field(default_factory=dict)
     confirmation_policy: Dict[str, Any] = Field(default_factory=dict)
+    execution_policy: Dict[str, Any] = Field(default_factory=lambda: {"mode": "inline", "handler": None})
     contract_source: Optional[str] = None
 
 
@@ -1308,7 +1315,10 @@ class PlanStep(BaseModel):
     failure_policy: Optional["StepPolicy"] = None
     confirmation_policy: Optional["StepPolicy"] = None
     side_effect_level: Literal["none", "session_write", "persistent_write", "external_call"] = "none"
-    status: Literal["pending", "running", "success", "failed", "skipped", "waiting_confirmation", "waiting_interaction"] = "pending"
+    status: Literal[
+        "pending", "running", "success", "failed", "skipped",
+        "waiting_confirmation", "waiting_interaction", "waiting_background_job",
+    ] = "pending"
 
     @field_validator("tool", mode="before")
     @classmethod
@@ -1458,6 +1468,7 @@ class StepExecutionResult(BaseModel):
         "continue",
         "wait_for_confirmation",
         "wait_for_interaction",
+        "wait_for_background_job",
         "replan",
         "finish",
         "fail",

@@ -11,7 +11,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from core.errors import AppError, ErrorCode, http_exception_to_app_error, make_error_payload
-from dependencies import SERVICE_LOAD_MODE, get_agent_runtime_checkpoint_store, normalize_service_load_mode, warm_up_services
+from dependencies import (
+    SERVICE_LOAD_MODE,
+    get_agent_runtime_checkpoint_store,
+    get_agent_resume_run_manager,
+    get_index_job_manager,
+    normalize_service_load_mode,
+    warm_up_services,
+)
 from routers.agent_router import router as agent_router
 from routers.arxiv_router import router as arxiv_router
 from routers.paper_router import router as paper_router
@@ -72,7 +79,24 @@ def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None
             get_valid_arxiv_categories()
             get_default_agent_arxiv_categories()
 
-        yield
+        index_job_manager = None
+        try:
+            # worker 的待办与 lease 都在 SQLite 中；启动时无条件拉起，才能接管上个进程遗留的 pending/retrying job。
+            index_job_manager = get_index_job_manager()
+            index_job_manager.start()
+            info_event(logger, "qa_index_worker.started", worker_id=index_job_manager.worker_id)
+            # pending resume run 可以安全重领；上个进程已 running 的 run 标记 indeterminate，禁止重放 checkpoint。
+            get_agent_resume_run_manager().recover_incomplete_runs()
+        except Exception as exc:
+            # 后台能力启动失败必须显式记录，Agent 后续提交会返回失败，不能静默回退到同步建索引。
+            logger.exception("QA index lease worker failed to start: %s", exc)
+
+        try:
+            yield
+        finally:
+            if index_job_manager is not None:
+                index_job_manager.stop()
+                info_event(logger, "qa_index_worker.stopped", worker_id=index_job_manager.worker_id)
 
     app = FastAPI(lifespan=lifespan)
 

@@ -128,8 +128,14 @@ USER_CONFIG: Dict[str, Any] = {
 }
 
 QA_INDEX_JOB_CONFIG: Dict[str, Any] = {
-    # 后台线程在进程重启后会丢失，心跳超时用于把旧 pending/running 任务恢复成可重试状态。
+    # timeout_seconds 保留给旧查询兼容；真正的失联判定由 lease 与独立 heartbeat 驱动。
     "timeout_seconds": _env_int("QA_INDEX_JOB_TIMEOUT_SECONDS", 30 * 60),
+    "lease_seconds": _env_int("QA_INDEX_JOB_LEASE_SECONDS", 90),
+    "heartbeat_interval_seconds": _env_int("QA_INDEX_JOB_HEARTBEAT_INTERVAL_SECONDS", 15),
+    "poll_interval_seconds": _env_int("QA_INDEX_JOB_POLL_INTERVAL_SECONDS", 1),
+    # 自动 attempt 只覆盖 worker 崩溃等基础设施中断；明确业务失败仍要求新的用户授权。
+    "max_attempts": _env_int("QA_INDEX_JOB_MAX_ATTEMPTS", 3),
+    "recipe_version": _env_str("QA_INDEX_JOB_RECIPE_VERSION", "paper_qa_index_v1"),
 }
 
 PAPER_QA_BUILD_CACHE_CONFIG: Dict[str, Any] = {

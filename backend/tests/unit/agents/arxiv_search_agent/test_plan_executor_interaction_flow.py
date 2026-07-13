@@ -1,5 +1,6 @@
 from agents.arxiv_search_agent import plan_executor as executor_module
 from agents.arxiv_search_agent.execution.approvals import ApprovalGrant
+from agents.arxiv_search_agent.execution.background_jobs import BackgroundWorkTicket
 from agents.arxiv_search_agent.plan_executor import PlanExecutor
 from agents.arxiv_search_agent.schemas import (
     ExecutablePlan,
@@ -13,7 +14,7 @@ from agents.arxiv_search_agent.state import AgentState
 from tests.helpers.sqlite import build_storage_container
 
 
-def test_side_effect_step_uses_interaction_grant_and_invocation(tmp_path, monkeypatch) -> None:
+def test_background_side_effect_uses_approved_grant_without_inline_tool_fallback(tmp_path, monkeypatch) -> None:
     storage = build_storage_container(db_path=str(tmp_path / "executor.sqlite"))
     calls = []
 
@@ -67,7 +68,21 @@ def test_side_effect_step_uses_interaction_grant_and_invocation(tmp_path, monkey
         final_step_ids=["index"],
     )
     state = AgentState(user_id="u1", session_id="s1", intent="paper_qa", message="index")
-    executor = PlanExecutor(approval_store=storage.approval_grants)
+    prepared = []
+
+    class _Coordinator:
+        def prepare(self, **kwargs):
+            prepared.append(kwargs)
+            return BackgroundWorkTicket(
+                status="waiting_job",
+                continuation_id="continuation-1",
+                job_id="job-1",
+            )
+
+    executor = PlanExecutor(
+        approval_store=storage.approval_grants,
+        background_work_coordinator=_Coordinator(),
+    )
 
     waiting = executor.execute(plan, state)
 
@@ -96,9 +111,7 @@ def test_side_effect_step_uses_interaction_grant_and_invocation(tmp_path, monkey
     waiting.runtime.turn_status = None
     resumed = executor.execute_runtime(waiting.runtime, state)
 
-    assert resumed.status == "success"
-    assert [name for name, _ in calls] == ["build_paper_qa_index"]
-    assert storage.approval_grants.get_grant("grant-1")["status"] == "consumed"
-    with storage.connection_provider.connect() as conn:
-        invocation = conn.execute("SELECT status FROM side_effect_invocations WHERE grant_id = 'grant-1'").fetchone()
-    assert invocation == ("succeeded",)
+    assert resumed.status == "waiting_background_job"
+    assert calls == []
+    assert prepared[0]["grant_id"] == "grant-1"
+    assert prepared[0]["handler_name"] == "paper_qa_index"

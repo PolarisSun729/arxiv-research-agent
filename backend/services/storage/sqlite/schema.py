@@ -248,9 +248,38 @@ class StorageSchemaMigrator:
                     error_message TEXT,
                     loading_method TEXT,
                     idempotency_key TEXT,
+                    recipe_version TEXT NOT NULL DEFAULT 'paper_qa_index_v1',
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    worker_id TEXT,
+                    lease_acquired_at TIMESTAMP,
+                    lease_expires_at TIMESTAMP,
+                    last_heartbeat_at TIMESTAMP,
+                    result_json TEXT,
+                    failure_code TEXT,
+                    stage_message TEXT,
+                    completed_at TIMESTAMP,
                     heartbeat_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS paper_index_job_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    attempt_no INTEGER NOT NULL,
+                    worker_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TIMESTAMP NOT NULL,
+                    heartbeat_at TIMESTAMP,
+                    finished_at TIMESTAMP,
+                    failed_stage TEXT,
+                    error_code TEXT,
+                    error_message TEXT,
+                    UNIQUE(job_id, attempt_no),
+                    FOREIGN KEY(job_id) REFERENCES paper_index_jobs(job_id)
                 )
             ''')
 
@@ -564,6 +593,76 @@ class StorageSchemaMigrator:
             ''')
 
             cursor.execute('''
+                CREATE TABLE IF NOT EXISTS agent_work_continuations (
+                    continuation_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    runtime_checkpoint_id TEXT NOT NULL,
+                    interaction_id TEXT NOT NULL,
+                    grant_id TEXT NOT NULL,
+                    invocation_id TEXT NOT NULL UNIQUE,
+                    plan_id TEXT NOT NULL,
+                    step_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    arguments_fingerprint TEXT NOT NULL,
+                    handler_name TEXT NOT NULL,
+                    job_id TEXT,
+                    job_idempotency_key TEXT,
+                    status TEXT NOT NULL,
+                    handler_state_json TEXT,
+                    display_summary_json TEXT,
+                    validated_result_json TEXT,
+                    resume_run_id TEXT,
+                    error_code TEXT,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    ready_at TEXT,
+                    expires_at TEXT,
+                    terminal_at TEXT,
+                    FOREIGN KEY(grant_id) REFERENCES approval_grants(grant_id),
+                    FOREIGN KEY(invocation_id) REFERENCES side_effect_invocations(invocation_id)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS agent_resume_runs (
+                    resume_run_id TEXT PRIMARY KEY,
+                    continuation_id TEXT NOT NULL UNIQUE,
+                    user_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    final_response_json TEXT,
+                    error_code TEXT,
+                    error_message TEXT,
+                    result_retrieved_at TEXT,
+                    FOREIGN KEY(continuation_id) REFERENCES agent_work_continuations(continuation_id)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS agent_work_events (
+                    event_id TEXT PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    continuation_id TEXT,
+                    job_id TEXT,
+                    attempt_no INTEGER,
+                    invocation_id TEXT,
+                    resume_run_id TEXT,
+                    run_id TEXT,
+                    stage TEXT,
+                    progress INTEGER,
+                    error_code TEXT,
+                    safe_metadata_json TEXT
+                )
+            ''')
+
+            cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_paper_chat_sessions_user_paper_updated
                 ON paper_chat_sessions(user_id, arxiv_id, updated_at DESC)
             ''')
@@ -576,6 +675,16 @@ class StorageSchemaMigrator:
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_paper_index_jobs_status_updated
                 ON paper_index_jobs(status, updated_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_paper_index_jobs_claim
+                ON paper_index_jobs(status, lease_expires_at, created_at)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_paper_index_job_attempts_job
+                ON paper_index_job_attempts(job_id, attempt_no DESC)
             ''')
 
             cursor.execute('''
@@ -668,6 +777,31 @@ class StorageSchemaMigrator:
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_agent_runtime_checkpoints_expiry
                 ON agent_runtime_checkpoints(status, expires_at)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_agent_work_continuations_owner_status
+                ON agent_work_continuations(user_id, session_id, status, updated_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_agent_work_continuations_job
+                ON agent_work_continuations(job_id, status)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_agent_work_continuations_submitting
+                ON agent_work_continuations(status, job_idempotency_key, updated_at)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_agent_resume_runs_owner
+                ON agent_resume_runs(user_id, session_id, status)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_agent_work_events_continuation
+                ON agent_work_events(continuation_id, occurred_at)
             ''')
 
             cursor.execute('''
@@ -834,10 +968,21 @@ class StorageSchemaMigrator:
         conn.commit()
 
     def _ensure_paper_index_job_columns(self, conn):
-        # 旧库可能缺少心跳和幂等键，启动时补齐，避免用户为了恢复任务而手工删库。
+        # 旧库可能缺少 lease、attempt 与结果字段；启动时原位补齐，保留已有索引任务历史。
         required_columns = {
             "idempotency_key": "TEXT",
             "heartbeat_at": "TIMESTAMP",
+            "recipe_version": "TEXT NOT NULL DEFAULT 'paper_qa_index_v1'",
+            "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+            "max_attempts": "INTEGER NOT NULL DEFAULT 3",
+            "worker_id": "TEXT",
+            "lease_acquired_at": "TIMESTAMP",
+            "lease_expires_at": "TIMESTAMP",
+            "last_heartbeat_at": "TIMESTAMP",
+            "result_json": "TEXT",
+            "failure_code": "TEXT",
+            "stage_message": "TEXT",
+            "completed_at": "TIMESTAMP",
         }
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(paper_index_jobs)")
@@ -852,7 +997,9 @@ class StorageSchemaMigrator:
             """
             UPDATE paper_index_jobs
             SET idempotency_key = arxiv_id || ':' || COALESCE(NULLIF(loading_method, ''), 'docling')
+                                  || ':' || COALESCE(NULLIF(recipe_version, ''), 'paper_qa_index_v1')
             WHERE idempotency_key IS NULL OR idempotency_key = ''
+               OR idempotency_key NOT LIKE '%:' || COALESCE(NULLIF(recipe_version, ''), 'paper_qa_index_v1')
             """
         )
         cursor.execute(
@@ -864,8 +1011,46 @@ class StorageSchemaMigrator:
         )
         cursor.execute(
             """
+            UPDATE paper_index_jobs
+            SET last_heartbeat_at = COALESCE(last_heartbeat_at, heartbeat_at, updated_at, created_at, CURRENT_TIMESTAMP)
+            WHERE last_heartbeat_at IS NULL OR last_heartbeat_at = ''
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_index_job_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                attempt_no INTEGER NOT NULL,
+                worker_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TIMESTAMP NOT NULL,
+                heartbeat_at TIMESTAMP,
+                finished_at TIMESTAMP,
+                failed_stage TEXT,
+                error_code TEXT,
+                error_message TEXT,
+                UNIQUE(job_id, attempt_no),
+                FOREIGN KEY(job_id) REFERENCES paper_index_jobs(job_id)
+            )
+            """
+        )
+        cursor.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_paper_index_jobs_idempotency_status
             ON paper_index_jobs(idempotency_key, status, heartbeat_at)
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_paper_index_jobs_claim
+            ON paper_index_jobs(status, lease_expires_at, created_at)
+            """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_paper_index_job_attempts_job
+            ON paper_index_job_attempts(job_id, attempt_no DESC)
             """
         )
         conn.commit()

@@ -760,7 +760,11 @@ export interface CreateQaIndexResult {
   job_id?: string
   job_status?: string
   current_stage?: string
+  stage_message?: string | null
   progress?: number
+  attempt_no?: number | null
+  max_attempts?: number | null
+  failure_code?: string | null
   loading_method?: string
   pdf_path?: string
   document_path?: string
@@ -783,7 +787,11 @@ export interface QaIndexJobResult {
   arxiv_id: string
   status: 'pending' | 'running' | 'success' | 'failed' | string
   current_stage?: string | null
+  stage_message?: string | null
   progress?: number | null
+  attempt_no?: number | null
+  max_attempts?: number | null
+  failure_code?: string | null
   error_message?: string | null
   loading_method?: string | null
   created_at?: string | null

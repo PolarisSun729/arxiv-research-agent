@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 CHECKPOINT_STATUS_RUNNING = "running"
 CHECKPOINT_STATUS_WAITING_INTERACTION = "waiting_interaction"
+CHECKPOINT_STATUS_WAITING_BACKGROUND_JOB = "waiting_background_job"
 CHECKPOINT_STATUS_COMPLETED = "completed"
 CHECKPOINT_STATUS_CANCELLED = "cancelled"
 CHECKPOINT_STATUS_FAILED = "failed"
@@ -456,6 +457,9 @@ def _status_from_state(
         return CHECKPOINT_STATUS_CANCELLED
     if turn_status == "failed" or error:
         return CHECKPOINT_STATUS_FAILED
+    if turn_status == CHECKPOINT_STATUS_WAITING_BACKGROUND_JOB:
+        # 后台等待由 continuation 生命周期管理，不能套用普通 interaction TTL 或误判成 completed。
+        return CHECKPOINT_STATUS_WAITING_BACKGROUND_JOB
     if turn_status:
         return CHECKPOINT_STATUS_COMPLETED
     return CHECKPOINT_STATUS_RUNNING
@@ -483,6 +487,8 @@ def _next_route_from_status(status: str) -> str:
     normalized = str(status or "").strip()
     if normalized == CHECKPOINT_STATUS_WAITING_INTERACTION:
         return CHECKPOINT_STATUS_WAITING_INTERACTION
+    if normalized == CHECKPOINT_STATUS_WAITING_BACKGROUND_JOB:
+        return CHECKPOINT_STATUS_WAITING_BACKGROUND_JOB
     if normalized in {CHECKPOINT_STATUS_COMPLETED, CHECKPOINT_STATUS_FAILED, CHECKPOINT_STATUS_CANCELLED, CHECKPOINT_STATUS_EXPIRED}:
         return normalized
     return CHECKPOINT_STATUS_RUNNING
@@ -499,4 +505,5 @@ __all__ = [
     "CHECKPOINT_STATUS_FAILED",
     "CHECKPOINT_STATUS_RUNNING",
     "CHECKPOINT_STATUS_WAITING_INTERACTION",
+    "CHECKPOINT_STATUS_WAITING_BACKGROUND_JOB",
 ]

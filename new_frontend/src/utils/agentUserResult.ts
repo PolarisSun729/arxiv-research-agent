@@ -88,6 +88,29 @@ function normalizeCandidate(candidate: PaperTargetCandidate, index: number, defa
   }
 }
 
+function sideEffectApprovalTitle(payload: SideEffectApprovalPayload) {
+  if (payload.tool_name === 'parse_and_index_paper') return '需要确认构建问答索引'
+  return '需要批准后继续'
+}
+
+function sideEffectApprovalDescription(payload: SideEffectApprovalPayload) {
+  const reason = String(payload.reason || '').trim()
+  if (payload.tool_name === 'parse_and_index_paper') {
+    return '需要下载和解析论文 PDF，并建立全文问答索引；确认后会继续回答原问题。'
+  }
+  const reasonLabels: Record<string, string> = {
+    explicit_user_confirmation_required: '该操作会产生写入或外部调用，需要你确认后再继续。',
+    paper_index_missing: '当前论文还没有可用索引，需要确认后先构建索引。',
+    paper_index_stale: '当前论文索引可能已过期，需要确认后重新构建。'
+  }
+  return reasonLabels[reason] || reason || `即将执行 ${payload.tool_name}`
+}
+
+function sideEffectApprovalConfirmLabel(payload: SideEffectApprovalPayload) {
+  if (payload.tool_name === 'parse_and_index_paper') return '确认构建索引'
+  return '批准执行'
+}
+
 function normalizeInteraction(interaction: AgentInteraction | null | undefined): AgentUserInteraction | null {
   if (!interaction || interaction.status !== 'pending') return null
   if (interaction.kind === 'target_selection') {
@@ -107,9 +130,9 @@ function normalizeInteraction(interaction: AgentInteraction | null | undefined):
   return {
     id: interaction.interaction_id,
     kind: interaction.kind,
-    title: '需要批准后继续',
-    description: payload.reason || `即将执行 ${payload.tool_name}`,
-    confirmLabel: '批准执行',
+    title: sideEffectApprovalTitle(payload),
+    description: sideEffectApprovalDescription(payload),
+    confirmLabel: sideEffectApprovalConfirmLabel(payload),
     cancelLabel: '拒绝',
     defaultCandidateId: '',
     candidates: []

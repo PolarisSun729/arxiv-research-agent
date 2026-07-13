@@ -353,7 +353,10 @@ class StorageContainerSqliteTests(unittest.TestCase):
         self.assertEqual(stored["status"], "completed")
         self.assertEqual(stored["current_stage"], "finished")
         self.assertEqual(stored["progress"], 100)
-        self.assertEqual(stored["idempotency_key"], "2401.00005:docling")
+        self.assertEqual(stored["idempotency_key"], "2401.00005:docling:paper_qa_index_v1")
+        self.assertEqual(stored["recipe_version"], "paper_qa_index_v1")
+        self.assertEqual(stored["attempt_count"], 0)
+        self.assertEqual(stored["max_attempts"], 3)
         self.assertIsNotNone(stored["heartbeat_at"])
         self.assertEqual(latest["job_id"], job["job_id"])
 

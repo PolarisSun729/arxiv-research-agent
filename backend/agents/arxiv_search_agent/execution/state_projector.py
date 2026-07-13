@@ -33,7 +33,13 @@ class RuntimeStateProjector:
             )
         statuses = list((runtime.step_status or {}).values())
         is_finished = bool(runtime.turn_status) or bool(
-            statuses and all(status in {"success", "failed", "skipped", "waiting_confirmation", "waiting_interaction"} for status in statuses)
+            statuses and all(
+                status in {
+                    "success", "failed", "skipped", "waiting_confirmation",
+                    "waiting_interaction", "waiting_background_job",
+                }
+                for status in statuses
+            )
         )
         return AgentRuntimeState(
             request_state=_json_safe(runtime.state or {}),

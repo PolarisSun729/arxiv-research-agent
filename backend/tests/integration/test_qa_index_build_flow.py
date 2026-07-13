@@ -871,6 +871,115 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
 
 
 class IndexJobManagerFlowTests(_BaseIndexTestCase):
+    def test_submit_job_is_durable_and_only_one_worker_can_claim_it(self) -> None:
+        builder = _FakeJobBuilder()
+        manager = IndexJobManager(paper_qa_index_store=self.storage.paper_qa_index, qa_index_builder=builder)
+
+        first_job = manager.submit_job(self.arxiv_id, "docling")
+        second_job = manager.submit_job(self.arxiv_id, "docling")
+        claimed = self.storage.paper_qa_index.claim_next_paper_index_job(
+            worker_id="worker-a",
+            lease_seconds=60,
+        )
+        duplicate_claim = self.storage.paper_qa_index.claim_next_paper_index_job(
+            worker_id="worker-b",
+            lease_seconds=60,
+        )
+
+        self.assertEqual(first_job["job_id"], second_job["job_id"])
+        self.assertEqual(claimed["job_id"], first_job["job_id"])
+        self.assertEqual(claimed["worker_id"], "worker-a")
+        self.assertEqual(claimed["attempt_count"], 1)
+        self.assertIsNone(duplicate_claim)
+
+    def test_expired_worker_lease_reclaims_the_same_logical_job(self) -> None:
+        manager = IndexJobManager(
+            paper_qa_index_store=self.storage.paper_qa_index,
+            qa_index_builder=_FakeJobBuilder(),
+            max_attempts=3,
+        )
+        submitted = manager.submit_job(self.arxiv_id, "docling")
+
+        first_attempt = self.storage.paper_qa_index.claim_next_paper_index_job(
+            worker_id="worker-a",
+            lease_seconds=0,
+        )
+        recovered_attempt = self.storage.paper_qa_index.claim_next_paper_index_job(
+            worker_id="worker-b",
+            lease_seconds=60,
+        )
+
+        self.assertEqual(first_attempt["job_id"], submitted["job_id"])
+        self.assertEqual(recovered_attempt["job_id"], submitted["job_id"])
+        self.assertEqual(recovered_attempt["worker_id"], "worker-b")
+        self.assertEqual(recovered_attempt["attempt_count"], 2)
+        self.assertEqual(recovered_attempt["status"], "running")
+
+    def test_worker_persists_validated_result_and_attempt_audit(self) -> None:
+        build_result = {
+            "status": "success",
+            "build_id": "build-1",
+            "index_version": "version-1",
+            "collection_name": "qa_collection_1",
+            "chunk_count": 3,
+        }
+        status = {
+            "has_index": True,
+            "status": "indexed",
+            "active_build_id": "build-1",
+            "active_index_version": "version-1",
+            "active_collection_name": "qa_collection_1",
+            "active_chunk_count": 3,
+        }
+        manager = IndexJobManager(
+            paper_qa_index_store=self.storage.paper_qa_index,
+            qa_index_builder=_FakeJobBuilder(result=build_result),
+            qa_status_reader=lambda _arxiv_id: status,
+            worker_id="worker-a",
+        )
+        submitted = manager.submit_job(self.arxiv_id, "docling")
+
+        self.assertTrue(manager.run_next_job())
+
+        stored = self.storage.paper_qa_index.get_paper_index_job(submitted["job_id"])
+        attempts = self.storage.paper_qa_index.list_paper_index_job_attempts(submitted["job_id"])
+        self.assertEqual(stored["status"], "success")
+        self.assertEqual(stored["result"]["build_id"], "build-1")
+        self.assertEqual(attempts[0]["status"], "success")
+        self.assertEqual(attempts[0]["attempt_no"], 1)
+
+    def test_builder_result_without_matching_active_index_fails_completion(self) -> None:
+        manager = IndexJobManager(
+            paper_qa_index_store=self.storage.paper_qa_index,
+            qa_index_builder=_FakeJobBuilder(
+                result={
+                    "status": "success",
+                    "build_id": "build-1",
+                    "index_version": "version-1",
+                    "collection_name": "qa_collection_1",
+                    "chunk_count": 3,
+                }
+            ),
+            qa_status_reader=lambda _arxiv_id: {
+                "has_index": True,
+                "status": "indexed",
+                "active_build_id": "another-build",
+                "active_index_version": "version-1",
+                "active_collection_name": "qa_collection_1",
+                "active_chunk_count": 3,
+            },
+            worker_id="worker-a",
+        )
+        submitted = manager.submit_job(self.arxiv_id, "docling")
+
+        self.assertTrue(manager.run_next_job())
+
+        stored = self.storage.paper_qa_index.get_paper_index_job(submitted["job_id"])
+        self.assertEqual(stored["status"], "failed")
+        self.assertEqual(stored["failure_code"], "completion_validation_failed")
+        self.assertIn("active_index_mismatch:build_id", stored["error_message"])
+        self.assertIsNone(stored["result"])
+
     def test_submit_job_creates_pending_job_and_reuses_active_duplicate(self) -> None:
         _NoopThread.instances = []
         builder = _FakeJobBuilder()
@@ -885,10 +994,10 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
         self.assertEqual(first_job["status"], "pending")
         self.assertEqual(second_job["job_id"], first_job["job_id"])
         self.assertEqual(latest["job_id"], first_job["job_id"])
-        self.assertEqual(len(_NoopThread.instances), 1)
-        self.assertTrue(_NoopThread.instances[0].started)
+        # submit 只持久化并唤醒常驻 worker，不能创建随请求丢失的一次性线程。
+        self.assertEqual(len(_NoopThread.instances), 0)
 
-    def test_submit_job_marks_stale_running_job_and_creates_new_job(self) -> None:
+    def test_worker_reclaims_stale_running_job_without_creating_new_job(self) -> None:
         _NoopThread.instances = []
         builder = _FakeJobBuilder()
         manager = IndexJobManager(paper_qa_index_store=self.storage.paper_qa_index, qa_index_builder=builder, timeout_seconds=10)
@@ -904,13 +1013,18 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
 
         with mock.patch.object(manager_module.threading, "Thread", _NoopThread):
             new_job = manager.submit_job(self.arxiv_id, "docling")
+        claimed = self.storage.paper_qa_index.claim_next_paper_index_job(
+            worker_id="worker-recovery",
+            lease_seconds=10,
+            job_id=old_job["job_id"],
+        )
 
         stored_old = self.storage.paper_qa_index.get_paper_index_job(old_job["job_id"])
-        self.assertEqual(stored_old["status"], "stale")
-        self.assertNotEqual(new_job["job_id"], old_job["job_id"])
-        self.assertEqual(new_job["previous_job_id"], old_job["job_id"])
-        self.assertEqual(new_job["recovery_action"], "marked_stale_and_created")
-        self.assertEqual(len(_NoopThread.instances), 1)
+        self.assertEqual(new_job["job_id"], old_job["job_id"])
+        self.assertEqual(claimed["job_id"], old_job["job_id"])
+        self.assertEqual(stored_old["status"], "running")
+        self.assertEqual(stored_old["attempt_count"], 1)
+        self.assertEqual(len(_NoopThread.instances), 0)
 
     def test_submit_job_reuses_unexpired_running_job(self) -> None:
         _NoopThread.instances = []
@@ -931,7 +1045,7 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
         self.assertEqual(reused_job["recovery_action"], "reused_active")
         self.assertEqual(len(_NoopThread.instances), 0)
 
-    def test_submit_job_marks_stale_pending_job_and_creates_new_job(self) -> None:
+    def test_old_pending_job_remains_durable_and_is_reused(self) -> None:
         _NoopThread.instances = []
         builder = _FakeJobBuilder()
         manager = IndexJobManager(paper_qa_index_store=self.storage.paper_qa_index, qa_index_builder=builder, timeout_seconds=5)
@@ -943,8 +1057,8 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
             new_job = manager.submit_job(self.arxiv_id, "docling")
 
         stored_old = self.storage.paper_qa_index.get_paper_index_job(old_job["job_id"])
-        self.assertEqual(stored_old["status"], "stale")
-        self.assertNotEqual(new_job["job_id"], old_job["job_id"])
+        self.assertEqual(stored_old["status"], "pending")
+        self.assertEqual(new_job["job_id"], old_job["job_id"])
 
     def test_update_job_refreshes_heartbeat(self) -> None:
         job = self.storage.paper_qa_index.create_paper_index_job(self.arxiv_id, "docling")
@@ -974,12 +1088,31 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
 
         stored = self.storage.paper_qa_index.get_paper_index_job(job["job_id"])
         self.assertEqual(marked_count, 1)
-        self.assertEqual(stored["status"], "stale")
-        self.assertIn("heartbeat timed out", stored["error_message"])
+        self.assertEqual(stored["status"], "retrying")
+        self.assertEqual(stored["failure_code"], "worker_lease_expired")
+        self.assertIn("等待重新领取", stored["error_message"])
 
     def test_run_job_success_updates_job_status_and_latest_job(self) -> None:
-        builder = _FakeJobBuilder(result={"status": "success"})
-        manager = IndexJobManager(paper_qa_index_store=self.storage.paper_qa_index, qa_index_builder=builder)
+        result = {
+            "status": "success",
+            "build_id": "build-1",
+            "index_version": "version-1",
+            "collection_name": "qa_collection_1",
+            "chunk_count": 2,
+        }
+        builder = _FakeJobBuilder(result=result)
+        manager = IndexJobManager(
+            paper_qa_index_store=self.storage.paper_qa_index,
+            qa_index_builder=builder,
+            qa_status_reader=lambda _arxiv_id: {
+                "has_index": True,
+                "status": "indexed",
+                "active_build_id": "build-1",
+                "active_index_version": "version-1",
+                "active_collection_name": "qa_collection_1",
+                "active_chunk_count": 2,
+            },
+        )
         job = self.storage.paper_qa_index.create_paper_index_job(self.arxiv_id, "docling")
 
         manager.run_job(job["job_id"], self.arxiv_id, "docling")
@@ -987,7 +1120,7 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
         stored = self.storage.paper_qa_index.get_paper_index_job(job["job_id"])
         latest = self.storage.paper_qa_index.get_latest_paper_index_job(self.arxiv_id)
         self.assertEqual(stored["status"], "success")
-        self.assertEqual(stored["current_stage"], "mark_index_success")
+        self.assertEqual(stored["current_stage"], "activate_index")
         self.assertEqual(stored["progress"], 100)
         self.assertEqual(latest["job_id"], job["job_id"])
 
@@ -1030,7 +1163,7 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
         self.assertEqual(len(job_ids), 1)
         self.assertEqual(len(active_jobs), 1)
 
-    def test_submit_job_with_inline_thread_reaches_terminal_state(self) -> None:
+    def test_submit_job_does_not_execute_builder_in_request_thread(self) -> None:
         builder = _FakeJobBuilder(result={"status": "success"})
         manager = IndexJobManager(paper_qa_index_store=self.storage.paper_qa_index, qa_index_builder=builder)
 
@@ -1039,7 +1172,8 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
 
         latest = self.storage.paper_qa_index.get_latest_paper_index_job(self.arxiv_id)
         self.assertEqual(job["job_id"], latest["job_id"])
-        self.assertEqual(latest["status"], "success")
+        self.assertEqual(latest["status"], "pending")
+        self.assertEqual(builder.calls, [{"method": "validate_loading_method", "loading_method": "docling"}])
 
 
 if __name__ == "__main__":

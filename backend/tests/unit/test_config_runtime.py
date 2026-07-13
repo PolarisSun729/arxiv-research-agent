@@ -58,6 +58,9 @@ class ConfigRuntimeUnitTests(unittest.TestCase):
         self.assertEqual(module.SQLITE_CONFIG["database_path"], str(BACKEND_DATA_ROOT / "recommendation.db"))
         self.assertEqual(module.OAI_SQLITE_CONFIG["database_path"], str(BACKEND_DATA_ROOT / "arxiv_oai.db"))
         self.assertEqual(module.PAPER_QA_BUILD_CACHE_CONFIG["root_dir"], str(BACKEND_DATA_ROOT))
+        self.assertEqual(module.DOCLING_CONFIG["images_scale"], 2.0)
+        self.assertTrue(module.DOCLING_CONFIG["generate_page_images"])
+        self.assertTrue(module.DOCLING_CONFIG["generate_picture_images"])
 
     def test_relative_storage_overrides_are_resolved_from_backend(self) -> None:
         module = _load_config_module(
