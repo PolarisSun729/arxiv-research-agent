@@ -7,8 +7,11 @@ chunk、来源页码以及图片/表格等多模态资产，方便后续入库�
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import logging
+import random
+import time
 from enum import Enum
 from typing import Any, Dict, List, Optional
 import os
@@ -32,6 +35,8 @@ from utils.storage_paths import resolve_backend_artifact_path
 
 logger = logging.getLogger(__name__)
 ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
+DASHSCOPE_MAX_REQUEST_RETRIES = 3
+DASHSCOPE_MAX_RETRY_DELAY_SECONDS = 30.0
 
 class EmbeddingProvider(str, Enum):
     OPENAI = "openai"
@@ -52,6 +57,10 @@ class EmbeddingConfig:
         dimension: Optional[int] = None,
         batch_size: Optional[int] = None,
         enable_fusion: bool = False,
+        request_max_retries: Optional[int] = None,
+        backoff_base_seconds: Optional[float] = None,
+        backoff_max_seconds: Optional[float] = None,
+        jitter_ratio: Optional[float] = None,
     ):
         """保存一次 embedding 调用所需的配置参数。
 
@@ -63,6 +72,10 @@ class EmbeddingConfig:
             dimension (Optional[int]): 目标向量维度。
             batch_size (Optional[int]): 批量调用大小。
             enable_fusion (bool): 是否开启多模态融合能力。
+            request_max_retries (Optional[int]): 单次远程请求失败后的最大重试次数。
+            backoff_base_seconds (Optional[float]): 指数退避的基础秒数。
+            backoff_max_seconds (Optional[float]): 单次退避和 Retry-After 的等待上限。
+            jitter_ratio (Optional[float]): 退避随机抖动比例。
         """
         self.provider = provider
         self.model_name = model_name
@@ -71,6 +84,38 @@ class EmbeddingConfig:
         self.dimension = dimension
         self.batch_size = batch_size
         self.enable_fusion = enable_fusion
+        configured_max_retries = int(
+            EMBEDDING_CONFIG.get("request_max_retries", DASHSCOPE_MAX_REQUEST_RETRIES)
+            if request_max_retries is None
+            else request_max_retries
+        )
+        configured_backoff_base = float(
+            EMBEDDING_CONFIG.get("backoff_base_seconds", 1.0)
+            if backoff_base_seconds is None
+            else backoff_base_seconds
+        )
+        configured_backoff_max = float(
+            EMBEDDING_CONFIG.get("backoff_max_seconds", DASHSCOPE_MAX_RETRY_DELAY_SECONDS)
+            if backoff_max_seconds is None
+            else backoff_max_seconds
+        )
+        # 配置只允许向下收紧默认策略；硬上限防止误配置把单次请求放大成长时间阻塞或重试风暴。
+        self.request_max_retries = min(DASHSCOPE_MAX_REQUEST_RETRIES, max(0, configured_max_retries))
+        self.backoff_max_seconds = min(
+            DASHSCOPE_MAX_RETRY_DELAY_SECONDS,
+            max(0.0, configured_backoff_max),
+        )
+        self.backoff_base_seconds = min(
+            self.backoff_max_seconds,
+            max(0.0, configured_backoff_base),
+        )
+        self.jitter_ratio = min(
+            1.0,
+            max(
+                0.0,
+                float(EMBEDDING_CONFIG.get("jitter_ratio", 0.2) if jitter_ratio is None else jitter_ratio),
+            ),
+        )
         self.aws_region = "ap-southeast-1"
 
     @classmethod
@@ -102,6 +147,10 @@ class EmbeddingConfig:
                 base_url=EMBEDDING_CONFIG["base_url"],
                 dimension=int(EMBEDDING_CONFIG["dimension"]),
                 batch_size=int(EMBEDDING_CONFIG["batch_size"]) or 10,
+                request_max_retries=int(EMBEDDING_CONFIG["request_max_retries"]),
+                backoff_base_seconds=float(EMBEDDING_CONFIG["backoff_base_seconds"]),
+                backoff_max_seconds=float(EMBEDDING_CONFIG["backoff_max_seconds"]),
+                jitter_ratio=float(EMBEDDING_CONFIG["jitter_ratio"]),
             )
 
         if normalized_provider == EmbeddingProvider.LOCAL.value:
@@ -131,6 +180,12 @@ class EmbeddingService:
     DEFAULT_LOCAL_MODEL_NAME = EMBEDDING_CONFIG["model_name"]
     DEFAULT_DASHSCOPE_MODEL_NAME = EMBEDDING_CONFIG["model_name"]
     DEFAULT_DASHSCOPE_DIMENSION = int(EMBEDDING_CONFIG["dimension"])
+    DASHSCOPE_RETRYABLE_EXCEPTIONS = (
+        requests.exceptions.SSLError,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+    )
+    DASHSCOPE_RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 
     def __init__(self):
         """初始化 provider 工厂、本地模型句柄和进程内 embedding 缓存。
@@ -327,16 +382,16 @@ class EmbeddingService:
             # enable_fusion 交给后端做文本/图像融合，避免调用侧硬编码融合策略。
             payload["parameters"]["enable_fusion"] = True
 
-        response = requests.post(
-            url,
+        response = self._post_dashscope_embedding_request(
+            url=url,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
-            json=payload,
-            timeout=180,
+            payload=payload,
+            input_mode="multimodal" if any(item.get("mode") == "multimodal" for item in embedding_inputs) else "text",
+            config=config,
         )
-        response.raise_for_status()
         data = response.json()
 
         vectors = self._extract_dashscope_embeddings(data)
@@ -355,6 +410,132 @@ class EmbeddingService:
         # 个别情况下批量结果数可能异常，这里退化到逐条请求以保证结果完整性。
         fallback_vectors = [self._create_dashscope_embedding_from_input(item, config) for item in embedding_inputs]
         return fallback_vectors, usage
+
+    def _post_dashscope_embedding_request(
+        self,
+        *,
+        url: str,
+        headers: dict,
+        payload: dict,
+        input_mode: str,
+        config: EmbeddingConfig,
+    ):
+        """发送 DashScope embedding 请求，并重试临时网络异常或可恢复 HTTP 状态。"""
+        max_retries = min(
+            DASHSCOPE_MAX_REQUEST_RETRIES,
+            max(0, int(getattr(config, "request_max_retries", 0) or 0)),
+        )
+        max_attempts = max_retries + 1
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = requests.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=180,
+                )
+                response.raise_for_status()
+                return response
+            except requests.exceptions.HTTPError as exc:
+                status_code = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+                if status_code not in self.DASHSCOPE_RETRYABLE_STATUS_CODES or attempt >= max_attempts:
+                    # 永久 4xx 原样重试没有意义；次数耗尽也必须保留最后一次原始异常交给建库边界记录。
+                    raise
+
+                retry_after = str(
+                    (getattr(getattr(exc, "response", None), "headers", {}) or {}).get("Retry-After", "")
+                ).strip()
+                self._schedule_dashscope_retry(
+                    config=config,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    reason=f"HTTP_{status_code}",
+                    input_mode=input_mode,
+                    retry_after=retry_after,
+                )
+            except self.DASHSCOPE_RETRYABLE_EXCEPTIONS as exc:
+                if attempt >= max_attempts:
+                    # 连接类异常仅在当前请求内有限重试；耗尽后不吞错，避免上层误判建库成功。
+                    raise
+
+                self._schedule_dashscope_retry(
+                    config=config,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    reason=type(exc).__name__,
+                    input_mode=input_mode,
+                )
+
+        raise RuntimeError("DashScope embedding retry loop exited unexpectedly")
+
+    @staticmethod
+    def _calculate_dashscope_retry_delay(
+        *,
+        attempt: int,
+        backoff_base_seconds: float,
+        backoff_max_seconds: float,
+        jitter_ratio: float,
+        retry_after: str = "",
+    ) -> float:
+        """计算单次重试等待时间，并优先遵守服务端 Retry-After。"""
+        if retry_after:
+            try:
+                retry_after_seconds = float(retry_after)
+            except ValueError:
+                try:
+                    retry_at = parsedate_to_datetime(retry_after)
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=timezone.utc)
+                    retry_after_seconds = max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, ValueError, OverflowError):
+                    retry_after_seconds = -1.0
+            if retry_after_seconds >= 0:
+                # Retry-After 表示服务端允许再次请求的最早时间，不施加负向抖动，避免提前重试。
+                return min(backoff_max_seconds, retry_after_seconds)
+
+        # 没有有效服务端建议时使用指数退避，并加入抖动降低多个 worker 同时重试的概率。
+        base_delay = min(backoff_max_seconds, backoff_base_seconds * (2 ** (attempt - 1)))
+        jitter_multiplier = 1.0 + random.uniform(-jitter_ratio, jitter_ratio)
+        return max(0.0, min(backoff_max_seconds, base_delay * jitter_multiplier))
+
+    @staticmethod
+    def _schedule_dashscope_retry(
+        *,
+        config: EmbeddingConfig,
+        attempt: int,
+        max_attempts: int,
+        reason: str,
+        input_mode: str,
+        retry_after: str = "",
+    ) -> None:
+        """统一计算退避、记录脱敏摘要并等待，保证两类可恢复失败使用同一策略。"""
+        backoff_max_seconds = min(
+            DASHSCOPE_MAX_RETRY_DELAY_SECONDS,
+            max(0.0, float(getattr(config, "backoff_max_seconds", DASHSCOPE_MAX_RETRY_DELAY_SECONDS) or 0.0)),
+        )
+        backoff_base_seconds = min(
+            backoff_max_seconds,
+            max(0.0, float(getattr(config, "backoff_base_seconds", 1.0) or 0.0)),
+        )
+        jitter_ratio = min(1.0, max(0.0, float(getattr(config, "jitter_ratio", 0.2) or 0.0)))
+        delay_seconds = EmbeddingService._calculate_dashscope_retry_delay(
+            attempt=attempt,
+            backoff_base_seconds=backoff_base_seconds,
+            backoff_max_seconds=backoff_max_seconds,
+            jitter_ratio=jitter_ratio,
+            retry_after=retry_after,
+        )
+        logger.warning(
+            "DashScope embedding request retrying: model=%s attempt=%s/%s reason=%s input_mode=%s delay_seconds=%.2f",
+            config.model_name,
+            attempt + 1,
+            max_attempts,
+            reason,
+            input_mode,
+            delay_seconds,
+        )
+        time.sleep(delay_seconds)
 
     def _create_dashscope_embeddings(self, texts: list, config: EmbeddingConfig) -> list:
         """DashScope 文本批量 embedding 的轻量封装。"""

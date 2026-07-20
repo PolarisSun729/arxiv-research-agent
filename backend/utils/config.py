@@ -31,6 +31,15 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    """读取浮点环境变量；非法值回退默认配置，避免配置拼写错误阻断服务启动。"""
+    raw = _env_str(name, str(default))
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = _env_str(name, str(default)).lower()
     return raw not in {"0", "false", "no", "off", ""}
@@ -234,6 +243,11 @@ EMBEDDING_CONFIG: Dict[str, Any] = {
     ),
     "dimension": _env_int("EMBEDDING_DIMENSION", 2048),
     "batch_size": _env_int("EMBEDDING_BATCH_SIZE", 20),
+    # 远程 embedding 会连续执行大量请求；有限重试用于吸收 TLS 断连、限流和短暂 5xx，不能掩盖永久配置错误。
+    "request_max_retries": _env_int("EMBEDDING_REQUEST_MAX_RETRIES", 3),
+    "backoff_base_seconds": _env_float("EMBEDDING_REQUEST_BACKOFF_BASE_SECONDS", 1.0),
+    "backoff_max_seconds": _env_float("EMBEDDING_REQUEST_BACKOFF_MAX_SECONDS", 30.0),
+    "jitter_ratio": _env_float("EMBEDDING_REQUEST_JITTER_RATIO", 0.2),
     "local_model_path": _env_str("LOCAL_EMBEDDING_MODEL_PATH", str(REPO_ROOT / "00-models" / "Qwen3-VL-Embedding-2B")),
     "local_model_scripts_path": _env_str(
         "LOCAL_EMBEDDING_MODEL_SCRIPTS_PATH",
