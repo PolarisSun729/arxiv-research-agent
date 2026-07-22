@@ -35,6 +35,46 @@ class ScriptedQuestionAnalyzer:
         }
 
 
+class SupportingOnlyQuestionAnalyzer:
+    def analyze(self, request: Any) -> dict[str, Any]:
+        return {
+            "research_question": request.original_question,
+            "evidence_needs": [
+                {
+                    "need_id": "need-core",
+                    "description": "问题要求的核心结论",
+                    "importance": "core",
+                    "status": "open",
+                    "directly_required_by_question": True,
+                },
+                {
+                    "need_id": "need-background",
+                    "description": "背景定义",
+                    "importance": "supporting",
+                    "status": "open",
+                },
+            ],
+        }
+
+
+class PrematureSatisfiedQuestionAnalyzer:
+    def analyze(self, request: Any) -> dict[str, Any]:
+        return {
+            "research_question": request.original_question,
+            "evidence_needs": [
+                {
+                    "need_id": "need-core",
+                    "description": "尚未校验的核心结论",
+                    "importance": "core",
+                    "status": "satisfied",
+                    "directly_required_by_question": True,
+                    "supporting_claim_ids": ["fake-claim"],
+                    "verified_evidence_ids": ["fake-evidence"],
+                }
+            ],
+        }
+
+
 class ScriptedDecisionPolicy:
     def __init__(self) -> None:
         self._actions = iter(
@@ -147,6 +187,120 @@ class ContextBudgetRetriever:
         }
 
 
+class CoverageOrderRetriever:
+    def retrieve(self, action: Any, _state: Any) -> dict[str, Any]:
+        if action.target_need_id == "need-method":
+            candidates = [
+                {"content": "Method evidence A", "chunk_id": "method-a"},
+                {"content": "Method evidence B", "chunk_id": "method-b"},
+            ]
+        else:
+            candidates = [{"content": "Ablation evidence A", "chunk_id": "ablation-a"}]
+        return {"status": "completed", "candidates": candidates}
+
+
+class SupportingOnlyRetriever:
+    def retrieve(self, _action: Any, _state: Any) -> dict[str, Any]:
+        return {
+            "status": "completed",
+            "candidates": [
+                {
+                    "content": "The paper defines the reflection token in its background section.",
+                    "chunk_id": "chunk-method",
+                    "chunk_type": "text",
+                    "section_path": "Background",
+                }
+            ],
+        }
+
+
+class VisualEvidenceRetriever:
+    def retrieve(self, _action: Any, _state: Any) -> dict[str, Any]:
+        return {
+            "status": "completed",
+            "candidates": [
+                {
+                    "content": "Figure 2 contains two curves and a legend.",
+                    "chunk_id": "figure-2",
+                    "chunk_type": "image",
+                    "section_path": "Experiments",
+                }
+            ],
+        }
+
+
+class VisualDraftGenerator:
+    def generate(self, _request: Any) -> dict[str, Any]:
+        return {"answer": "图 2 中蓝色曲线始终高于红色曲线。", "used_candidate_ids": ["figure-2"]}
+
+
+class VisualClaimExtractor:
+    def extract(self, _request: Any) -> dict[str, Any]:
+        return {
+            "claims": [
+                {
+                    "claim_id": "claim-visual",
+                    "text": "图 2 中蓝色曲线始终高于红色曲线",
+                    "importance": "core",
+                    "addressed_need_ids": ["need-core"],
+                    "citation_ids": ["figure-2"],
+                    "requires_visual_verification": True,
+                }
+            ]
+        }
+
+
+class VisualClaimVerifier:
+    def verify(self, _request: Any) -> dict[str, Any]:
+        return {
+            "assessments": [
+                {
+                    "claim_id": "claim-visual",
+                    "verdict": "supported",
+                    "supporting_evidence_ids": ["figure-2"],
+                    "missing_facets": [],
+                }
+            ]
+        }
+
+
+class SupportingOnlyDraftGenerator:
+    def generate(self, _request: Any) -> dict[str, Any]:
+        return {
+            "answer": "论文在背景部分定义了反思 token。",
+            "used_candidate_ids": ["chunk-method"],
+        }
+
+
+class SupportingOnlyClaimExtractor:
+    def extract(self, _request: Any) -> dict[str, Any]:
+        return {
+            "claims": [
+                {
+                    "claim_id": "claim-background",
+                    "text": "论文在背景部分定义了反思 token",
+                    "importance": "background",
+                    "addressed_need_ids": ["need-background"],
+                    "citation_ids": ["chunk-method"],
+                }
+            ]
+        }
+
+
+class SupportingOnlyClaimVerifier:
+    def verify(self, _request: Any) -> dict[str, Any]:
+        return {
+            "assessments": [
+                {
+                    "claim_id": "claim-background",
+                    "verdict": "supported",
+                    "supporting_evidence_ids": ["chunk-method"],
+                    "missing_facets": [],
+                }
+            ]
+        }
+
+
 class ExplodingQuestionAnalyzer:
     def analyze(self, _request: Any) -> dict[str, Any]:
         raise RuntimeError("question analysis unavailable")
@@ -238,6 +392,57 @@ class NoEvidenceClaimVerifier(ScriptedClaimVerifier):
             assessment["verdict"] = "supported"
             assessment["supporting_evidence_ids"] = []
         return {"assessments": assessments}
+
+
+class MismatchedCitationVerifier:
+    def verify(self, request: Any) -> dict[str, Any]:
+        evidence_ids = ["chunk-ablation", "chunk-method"]
+        return {
+            "assessments": [
+                {
+                    "claim_id": claim.claim_id,
+                    "verdict": "supported",
+                    "supporting_evidence_ids": [evidence_ids[index]],
+                    "missing_facets": [],
+                }
+                for index, claim in enumerate(request.claims)
+            ]
+        }
+
+
+class DraftDropsCoreClaimGenerator(ScriptedDraftGenerator):
+    def generate(self, request: Any) -> dict[str, Any]:
+        if request.version == 1:
+            return super().generate(request)
+        return {
+            "answer": "反思 token 决定是否检索。",
+            "used_candidate_ids": ["chunk-method"],
+        }
+
+
+class DraftAwareClaimExtractor(ScriptedClaimExtractor):
+    def extract(self, request: Any) -> dict[str, Any]:
+        extracted = super().extract(request)
+        if request.draft_version == 2:
+            extracted["claims"] = [extracted["claims"][0]]
+        else:
+            extracted["claims"][1]["citation_ids"] = ["chunk-ablation"]
+        return extracted
+
+
+class AlwaysSupportingClaimVerifier:
+    def verify(self, request: Any) -> dict[str, Any]:
+        return {
+            "assessments": [
+                {
+                    "claim_id": claim.claim_id,
+                    "verdict": "supported",
+                    "supporting_evidence_ids": list(claim.citation_ids),
+                    "missing_facets": [],
+                }
+                for claim in request.claims
+            ]
+        }
 
 
 def test_research_repairs_an_unsupported_core_claim_before_completion() -> None:
@@ -347,6 +552,84 @@ def test_supported_claim_without_evidence_cannot_finalize() -> None:
     assert result.citations == []
 
 
+def test_citation_mismatch_cannot_finalize_from_another_candidate() -> None:
+    service = PaperEvidenceResearchService(
+        question_analyzer=ScriptedQuestionAnalyzer(),
+        decision_policy=ScriptedPolicyFromActions(
+            [
+                {
+                    "action": "search_paper",
+                    "target_need_id": "need-method",
+                    "objective": "discover",
+                    "retrieval_mode": "method",
+                    "query": "reflection token mechanism",
+                    "reason_code": "OPEN_EVIDENCE_NEED",
+                },
+                {
+                    "action": "search_paper",
+                    "target_need_id": "need-ablation",
+                    "objective": "discover",
+                    "retrieval_mode": "experiment",
+                    "query": "reflection token ablation",
+                    "reason_code": "OPEN_EVIDENCE_NEED",
+                },
+                {"action": "draft_answer", "reason_code": "DRAFT_NEEDED_TO_DISCOVER_GAPS"},
+                {"action": "finalize_answer", "reason_code": "CORE_CLAIMS_SUPPORTED"},
+                {"action": "abstain", "reason_code": "CITATION_MISMATCH"},
+            ]
+        ),
+        retriever=ScriptedRetriever(),
+        draft_generator=ScriptedDraftGenerator(),
+        claim_extractor=DraftAwareClaimExtractor(),
+        claim_verifier=MismatchedCitationVerifier(),
+    )
+
+    result = service.research(_request(run_id="research-run-citation-mismatch"))
+
+    assert result.outcome == "abstained"
+    assert result.research_summary.termination_reason == "CITATION_MISMATCH"
+
+
+def test_new_draft_cannot_reuse_coverage_from_a_removed_core_claim() -> None:
+    service = PaperEvidenceResearchService(
+        question_analyzer=ScriptedQuestionAnalyzer(),
+        decision_policy=ScriptedPolicyFromActions(
+            [
+                {
+                    "action": "search_paper",
+                    "target_need_id": "need-method",
+                    "objective": "discover",
+                    "retrieval_mode": "method",
+                    "query": "reflection token mechanism",
+                    "reason_code": "OPEN_EVIDENCE_NEED",
+                },
+                {
+                    "action": "search_paper",
+                    "target_need_id": "need-ablation",
+                    "objective": "discover",
+                    "retrieval_mode": "experiment",
+                    "query": "reflection token ablation",
+                    "reason_code": "OPEN_EVIDENCE_NEED",
+                },
+                {"action": "draft_answer", "reason_code": "INITIAL_DRAFT"},
+                {"action": "draft_answer", "reason_code": "REVISED_DRAFT"},
+                {"action": "finalize_answer", "reason_code": "CORE_CLAIMS_SUPPORTED"},
+                {"action": "abstain", "reason_code": "DROPPED_CORE_CLAIM"},
+            ]
+        ),
+        retriever=ScriptedRetriever(),
+        draft_generator=DraftDropsCoreClaimGenerator(),
+        claim_extractor=DraftAwareClaimExtractor(),
+        claim_verifier=AlwaysSupportingClaimVerifier(),
+    )
+
+    result = service.research(_request(run_id="research-run-coverage-rollback"))
+
+    assert result.outcome == "abstained"
+    assert result.research_summary.termination_reason == "DROPPED_CORE_CLAIM"
+    assert result.research_summary.satisfied_need_count == 1
+
+
 def test_budget_exhaustion_returns_only_verified_claims_as_partial_answer() -> None:
     service = _service(
         ScriptedPolicyFromActions(
@@ -387,6 +670,48 @@ def test_budget_exhaustion_returns_only_verified_claims_as_partial_answer() -> N
     assert result.research_summary.blocked_need_count == 1
 
 
+def test_supported_background_only_abstains_when_no_core_need_is_satisfied() -> None:
+    service = PaperEvidenceResearchService(
+        question_analyzer=SupportingOnlyQuestionAnalyzer(),
+        decision_policy=ScriptedPolicyFromActions(
+            [
+                {
+                    "action": "search_paper",
+                    "target_need_id": "need-background",
+                    "objective": "discover",
+                    "retrieval_mode": "definition",
+                    "query": "reflection token definition",
+                    "reason_code": "OPEN_EVIDENCE_NEED",
+                },
+                {"action": "draft_answer", "reason_code": "INITIAL_DRAFT"},
+                {
+                    "action": "search_paper",
+                    "target_need_id": "need-core",
+                    "objective": "verify_claim",
+                    "retrieval_mode": "method",
+                    "query": "core result",
+                    "reason_code": "CORE_EVIDENCE_MISSING",
+                },
+            ]
+        ),
+        retriever=SupportingOnlyRetriever(),
+        draft_generator=SupportingOnlyDraftGenerator(),
+        claim_extractor=SupportingOnlyClaimExtractor(),
+        claim_verifier=SupportingOnlyClaimVerifier(),
+    )
+
+    result = service.research(
+        _request(
+            run_id="research-run-background-only",
+            limits=ResearchLimits(max_retrievals=1),
+        )
+    )
+
+    assert result.outcome == "abstained"
+    assert result.citations == []
+    assert result.research_summary.supported_claim_count == 0
+
+
 def test_explicit_abstention_is_a_normal_research_result() -> None:
     service = _service(
         ScriptedPolicyFromActions(
@@ -409,6 +734,55 @@ def test_explicit_abstention_is_a_normal_research_result() -> None:
     assert result.outcome == "abstained"
     assert result.answer == "当前论文证据不足以支持问题中的核心结论。"
     assert result.research_summary.termination_reason == "PAPER_DOES_NOT_REPORT_ANSWER"
+
+
+def test_question_analyzer_cannot_pre_satisfy_an_evidence_need() -> None:
+    service = PaperEvidenceResearchService(
+        question_analyzer=PrematureSatisfiedQuestionAnalyzer(),
+        decision_policy=ScriptedPolicyFromActions(
+            [{"action": "abstain", "reason_code": "PAPER_DOES_NOT_REPORT_ANSWER"}]
+        ),
+        retriever=ScriptedRetriever(),
+        draft_generator=ScriptedDraftGenerator(),
+        claim_extractor=ScriptedClaimExtractor(),
+        claim_verifier=ScriptedClaimVerifier(),
+    )
+
+    result = service.research(_request(run_id="research-run-ledger-initialization"))
+
+    assert result.outcome == "abstained"
+    assert result.research_summary.satisfied_need_count == 0
+    assert result.research_summary.blocked_need_count == 1
+
+
+def test_pure_visual_claim_cannot_finalize_without_visual_verifier() -> None:
+    service = PaperEvidenceResearchService(
+        question_analyzer=PrematureSatisfiedQuestionAnalyzer(),
+        decision_policy=ScriptedPolicyFromActions(
+            [
+                {
+                    "action": "search_paper",
+                    "target_need_id": "need-core",
+                    "objective": "discover",
+                    "retrieval_mode": "experiment",
+                    "query": "figure 2 curve comparison",
+                    "reason_code": "OPEN_EVIDENCE_NEED",
+                },
+                {"action": "draft_answer", "reason_code": "INITIAL_DRAFT"},
+                {"action": "finalize_answer", "reason_code": "CORE_CLAIMS_SUPPORTED"},
+                {"action": "abstain", "reason_code": "PURE_VISUAL_CLAIM_UNVERIFIABLE"},
+            ]
+        ),
+        retriever=VisualEvidenceRetriever(),
+        draft_generator=VisualDraftGenerator(),
+        claim_extractor=VisualClaimExtractor(),
+        claim_verifier=VisualClaimVerifier(),
+    )
+
+    result = service.research(_request(run_id="research-run-pure-visual"))
+
+    assert result.outcome == "abstained"
+    assert result.research_summary.termination_reason == "PURE_VISUAL_CLAIM_UNVERIFIABLE"
 
 
 def test_duplicate_only_search_stops_with_no_progress_reason() -> None:
@@ -447,6 +821,29 @@ def test_duplicate_only_search_stops_with_no_progress_reason() -> None:
     assert result.research_summary.termination_reason == "NO_PROGRESS_LIMIT_REACHED"
 
 
+def test_malformed_model_action_consumes_invalid_action_budget() -> None:
+    service = _service(
+        ScriptedPolicyFromActions(
+            [
+                {
+                    "action": "search_paper",
+                    "target_need_id": "need-method",
+                }
+            ]
+        )
+    )
+
+    result = service.research(
+        _request(
+            run_id="research-run-invalid-action",
+            limits=ResearchLimits(max_invalid_actions=1),
+        )
+    )
+
+    assert result.outcome == "abstained"
+    assert result.research_summary.termination_reason == "ACTION_SCHEMA_INVALID"
+
+
 def test_research_does_not_send_candidates_beyond_context_budget_to_drafting() -> None:
     draft_generator = RecordingDraftGenerator()
     service = PaperEvidenceResearchService(
@@ -480,6 +877,47 @@ def test_research_does_not_send_candidates_beyond_context_budget_to_drafting() -
 
     assert draft_generator.received_candidate_ids == ["chunk-within-budget"]
     assert draft_generator.received_context_chars == 700
+
+
+def test_draft_context_round_robins_candidates_across_core_needs() -> None:
+    draft_generator = RecordingDraftGenerator()
+    service = PaperEvidenceResearchService(
+        question_analyzer=ScriptedQuestionAnalyzer(),
+        decision_policy=ScriptedPolicyFromActions(
+            [
+                {
+                    "action": "search_paper",
+                    "target_need_id": "need-method",
+                    "objective": "discover",
+                    "retrieval_mode": "method",
+                    "query": "method",
+                    "reason_code": "OPEN_EVIDENCE_NEED",
+                },
+                {
+                    "action": "search_paper",
+                    "target_need_id": "need-ablation",
+                    "objective": "discover",
+                    "retrieval_mode": "experiment",
+                    "query": "ablation",
+                    "reason_code": "OPEN_EVIDENCE_NEED",
+                },
+                {
+                    "action": "draft_answer",
+                    "addressed_need_ids": ["need-method", "need-ablation"],
+                    "reason_code": "INITIAL_DRAFT",
+                },
+                {"action": "abstain", "reason_code": "TEST_COMPLETE"},
+            ]
+        ),
+        retriever=CoverageOrderRetriever(),
+        draft_generator=draft_generator,
+        claim_extractor=ScriptedClaimExtractor(),
+        claim_verifier=ScriptedClaimVerifier(),
+    )
+
+    service.research(_request(run_id="research-run-coverage-order"))
+
+    assert draft_generator.received_candidate_ids == ["method-a", "ablation-a", "method-b"]
 
 
 def test_dependency_failure_is_exposed_as_a_structured_system_error() -> None:

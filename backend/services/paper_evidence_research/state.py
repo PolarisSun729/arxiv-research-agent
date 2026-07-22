@@ -34,6 +34,12 @@ class EvidenceCandidate(BaseModel):
     appearance_count: int = 1
 
 
+class EvidenceContextPack(BaseModel):
+    selected_need_ids: list[str] = Field(default_factory=list)
+    candidates: list[EvidenceCandidate] = Field(default_factory=list)
+    total_context_chars: int = 0
+
+
 class DraftAnswer(BaseModel):
     draft_id: str
     version: int
@@ -48,6 +54,8 @@ class AnswerClaim(BaseModel):
     importance: Literal["core", "supporting", "background"] = "supporting"
     addressed_need_ids: list[str] = Field(default_factory=list)
     citation_ids: list[str] = Field(default_factory=list)
+    # 一期没有 FigureVerifier；该标记阻止依赖图像本体读取的主张被文本校验结果误放行。
+    requires_visual_verification: bool = False
 
 
 class ClaimAssessment(BaseModel):
@@ -61,7 +69,13 @@ class DraftGenerationRequest(BaseModel):
     version: int
     research_question: str
     addressed_need_ids: list[str]
-    candidates: list[EvidenceCandidate]
+    context_pack: EvidenceContextPack
+
+    @property
+    def candidates(self) -> list[EvidenceCandidate]:
+        """兼容脚本适配器的候选读取方式，对外仍由上下文包持有选择结果。"""
+
+        return self.context_pack.candidates
 
 
 class ClaimExtractionRequest(BaseModel):
@@ -74,7 +88,13 @@ class ClaimVerificationRequest(BaseModel):
     research_question: str
     draft_version: int
     claims: list[AnswerClaim]
-    candidates: list[EvidenceCandidate]
+    context_pack: EvidenceContextPack
+
+    @property
+    def candidates(self) -> list[EvidenceCandidate]:
+        """校验器只读取本轮上下文包，不能绕过选择边界访问完整候选池。"""
+
+        return self.context_pack.candidates
 
 
 class ResearchDecisionContext(BaseModel):

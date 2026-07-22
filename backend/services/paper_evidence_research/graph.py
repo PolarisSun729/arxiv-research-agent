@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from langgraph.graph import END, START, StateGraph
+from pydantic import ValidationError
 
 from .action_gate import validate_action
 from .actions import AbstainAction, DraftAnswerAction, FinalizeAnswerAction, SearchPaperAction, parse_research_action
 from .completion_gate import can_finalize, has_verifiable_support
+from .context_pack import build_context_pack
 from .contracts import PaperEvidenceResearchResult, ResearchSummary, VerifiedCitation
 from .evidence_pool import merge_candidates
 from .state import (
@@ -42,6 +44,7 @@ def _coerce_state(state: Any) -> PaperEvidenceResearchState:
 
 
 def _trace(state: PaperEvidenceResearchState, event_type: str, **payload: Any) -> None:
+    # trace 只追加可审计事件，不反向驱动业务状态，也不记录模型隐藏推理文本。
     state.trace_events.append(
         {
             "sequence": len(state.trace_events) + 1,
@@ -51,13 +54,32 @@ def _trace(state: PaperEvidenceResearchState, event_type: str, **payload: Any) -
     )
 
 
+def _initialize_evidence_needs(raw_needs: Any) -> list[EvidenceNeed]:
+    needs = [EvidenceNeed.model_validate(item) for item in raw_needs or []]
+    if not needs or not any(need.importance == "core" for need in needs):
+        raise ValueError("question analyzer must produce at least one core evidence need")
+    need_ids = {need.need_id for need in needs}
+    if len(need_ids) != len(needs):
+        raise ValueError("question analyzer produced duplicate evidence need ids")
+    for need in needs:
+        if need.parent_need_id == need.need_id:
+            raise ValueError(f"evidence need cannot be its own parent: {need.need_id}")
+        if need.parent_need_id and need.parent_need_id not in need_ids:
+            raise ValueError(f"evidence need parent does not exist: {need.need_id}")
+        # 分析器只能提出待研究需求；满足、阻塞和证据归属必须由后续确定性投影产生。
+        need.status = "provisional"
+        need.supporting_claim_ids = []
+        need.verified_evidence_ids = []
+        need.blocking_reason = None
+    return needs
+
+
 def _prepare_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEvidenceResearchState:
     next_state = _coerce_state(state)
+    # 问题分析器负责提出研究问题和需求，账本初始化器负责清除模型无权写入的覆盖状态。
     analysis = dict(dependencies.question_analyzer.analyze(next_state.request) or {})
     next_state.research_question = str(analysis.get("research_question") or next_state.request.original_question).strip()
-    next_state.evidence_needs = [EvidenceNeed.model_validate(item) for item in analysis.get("evidence_needs") or []]
-    if not next_state.evidence_needs:
-        raise ValueError("question analyzer did not produce evidence needs")
+    next_state.evidence_needs = _initialize_evidence_needs(analysis.get("evidence_needs"))
     _trace(next_state, "research_started", research_question=next_state.research_question)
     return next_state
 
@@ -73,9 +95,23 @@ def _decide_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEv
         retrievals_remaining=max(0, next_state.request.limits.max_retrievals - next_state.retrieval_count),
         drafts_remaining=max(0, next_state.request.limits.max_draft_attempts - next_state.draft_attempt_count),
     )
-    next_state.pending_action = parse_research_action(dependencies.decision_policy.decide(context))
     next_state.action_accepted = False
     next_state.action_rejection_code = None
+    # 决策模型只提出一个语义动作；结构和状态合法性仍由确定性 Action Gate 判定。
+    raw_action = dependencies.decision_policy.decide(context)
+    try:
+        next_state.pending_action = parse_research_action(raw_action)
+    except ValidationError:
+        # 结构化输出失败仍属于可重试的动作错误，不能越过门禁直接升级成系统故障。
+        next_state.pending_action = None
+        next_state.action_rejection_code = "ACTION_SCHEMA_INVALID"
+        _trace(
+            next_state,
+            "action_proposed_invalid",
+            action=str(raw_action.get("action") or "unknown") if isinstance(raw_action, Mapping) else "unknown",
+            rejection_code="ACTION_SCHEMA_INVALID",
+        )
+        return next_state
     _trace(next_state, "action_proposed", action=next_state.pending_action.action)
     return next_state
 
@@ -84,7 +120,8 @@ def _validate_node(state: Any) -> PaperEvidenceResearchState:
     next_state = _coerce_state(state)
     if next_state.pending_action is None:
         next_state.invalid_action_count += 1
-        next_state.action_rejection_code = "ACTION_MISSING"
+        next_state.action_rejection_code = next_state.action_rejection_code or "ACTION_MISSING"
+        _trace(next_state, "action_rejected", action="unknown", rejection_code=next_state.action_rejection_code)
         return next_state
     validation = validate_action(next_state, next_state.pending_action)
     next_state.action_accepted = validation.accepted
@@ -173,13 +210,25 @@ def _draft_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEvi
     if not isinstance(action, DraftAnswerAction):
         raise ValueError("draft node received non-draft action")
     version = next_state.draft_attempt_count + 1
+    target_need_ids = action.addressed_need_ids or [
+        need.need_id for need in next_state.evidence_needs if need.importance == "core"
+    ]
+    context_pack = build_context_pack(next_state, target_need_ids=target_need_ids)
+    _trace(
+        next_state,
+        "context_pack_built",
+        stage="draft",
+        candidate_count=len(context_pack.candidates),
+        total_context_chars=context_pack.total_context_chars,
+    )
+    # 生成器只能看到覆盖优先的临时上下文包，不能直接读取或改写完整研究状态。
     generated = dict(
         dependencies.draft_generator.generate(
             DraftGenerationRequest(
                 version=version,
                 research_question=next_state.research_question,
                 addressed_need_ids=list(action.addressed_need_ids),
-                candidates=list(next_state.evidence_candidates.values()),
+                context_pack=context_pack,
             )
         )
         or {}
@@ -201,6 +250,7 @@ def _extract_claims_node(state: Any, dependencies: ResearchGraphDependencies) ->
     draft = next_state.current_draft
     if draft is None:
         raise ValueError("claim extraction requires a draft")
+    # 主张必须从用户实际可见文本重新提取，不能信任生成器自报的 declared_claims。
     extracted = dict(
         dependencies.claim_extractor.extract(
             ClaimExtractionRequest(
@@ -221,13 +271,28 @@ def _verify_claims_node(state: Any, dependencies: ResearchGraphDependencies) -> 
     draft = next_state.current_draft
     if draft is None:
         raise ValueError("claim verification requires a draft")
+    target_need_ids = [need_id for claim in next_state.claims for need_id in claim.addressed_need_ids]
+    cited_candidate_ids = [candidate_id for claim in next_state.claims for candidate_id in claim.citation_ids]
+    context_pack = build_context_pack(
+        next_state,
+        target_need_ids=target_need_ids,
+        pinned_candidate_ids=cited_candidate_ids,
+    )
+    _trace(
+        next_state,
+        "context_pack_built",
+        stage="verification",
+        candidate_count=len(context_pack.candidates),
+        total_context_chars=context_pack.total_context_chars,
+    )
+    # 校验器与生成器输入隔离，只接收可见主张和本轮证据包，降低自我确认偏差。
     verified = dict(
         dependencies.claim_verifier.verify(
             ClaimVerificationRequest(
                 research_question=next_state.research_question,
                 draft_version=draft.version,
                 claims=next_state.claims,
-                candidates=list(next_state.evidence_candidates.values()),
+                context_pack=context_pack,
             )
         )
         or {}
@@ -258,7 +323,10 @@ def _project_coverage_node(state: Any) -> PaperEvidenceResearchState:
         projected = need.model_copy(deep=True)
         related_claims = claims_by_need.get(need.need_id, [])
         related_assessments = [assessment_by_claim.get(claim.claim_id) for claim in related_claims]
-        if related_claims and all(has_verifiable_support(next_state, item) for item in related_assessments):
+        if related_claims and all(
+            has_verifiable_support(next_state, claim, assessment)
+            for claim, assessment in zip(related_claims, related_assessments)
+        ):
             # 需求满足权只来自已校验主张，检索候选本身永远不能直接修改覆盖状态。
             projected.status = "satisfied"
             projected.supporting_claim_ids = [claim.claim_id for claim in related_claims]
@@ -271,6 +339,11 @@ def _project_coverage_node(state: Any) -> PaperEvidenceResearchState:
                 }
             )
         elif related_claims:
+            projected.status = "open"
+            projected.supporting_claim_ids = []
+            projected.verified_evidence_ids = []
+        elif projected.status == "satisfied":
+            # 覆盖按当前可见草稿重新投影；主张被删除后必须撤销旧覆盖，不能沿用上一版完成状态。
             projected.status = "open"
             projected.supporting_claim_ids = []
             projected.verified_evidence_ids = []
@@ -354,7 +427,7 @@ def _finalize_node(state: Any) -> PaperEvidenceResearchState:
     supported_claim_ids = {
         claim.claim_id
         for claim in next_state.claims
-        if has_verifiable_support(next_state, assessment_by_claim.get(claim.claim_id))
+        if has_verifiable_support(next_state, claim, assessment_by_claim.get(claim.claim_id))
     }
     next_state.result = _build_result(
         next_state,
@@ -378,19 +451,25 @@ def _terminal_node(state: Any, *, requested_abstention: bool = False) -> PaperEv
     supported_claims = [
         claim
         for claim in next_state.claims
-        if has_verifiable_support(next_state, assessment_by_claim.get(claim.claim_id))
+        if has_verifiable_support(next_state, claim, assessment_by_claim.get(claim.claim_id))
     ]
     supported_claim_ids = {claim.claim_id for claim in supported_claims}
+    core_need_satisfied = any(
+        need.importance == "core" and need.status == "satisfied"
+        for need in next_state.evidence_needs
+    )
     for need in next_state.evidence_needs:
-        if need.importance == "core" and need.status == "open":
+        if need.importance == "core" and need.status in {"provisional", "open"}:
             need.status = "blocked"
             need.blocking_reason = next_state.action_rejection_code or "research_stopped_without_full_coverage"
-    if supported_claims and not requested_abstention:
+    if supported_claims and core_need_satisfied and not requested_abstention:
         # 有界终止只保留已验证主张，避免把初稿中的无支持内容带入有限回答。
         answer = "；".join(claim.text.rstrip("。；") for claim in supported_claims) + "。"
         outcome = "partial"
         termination_reason = next_state.action_rejection_code or "partial_answer_after_budget_exhaustion"
     else:
+        # 没有任何核心需求覆盖时，即使背景主张有证据也不能形成有限回答。
+        supported_claim_ids = set()
         answer = "当前论文证据不足以支持问题中的核心结论。"
         outcome = "abstained"
         termination_reason = abstention_reason or next_state.action_rejection_code or "no_supported_core_claim"
