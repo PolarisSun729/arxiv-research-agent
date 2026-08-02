@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any, Dict, List, Literal, Optional, Set
+from typing import Any, Dict, List, Literal, Mapping, Optional, Set
 
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
@@ -109,6 +109,23 @@ class ArxivSearchRequest(BaseModel):
             return None
         text = str(value).strip()
         return text
+
+    @field_validator("context")
+    @classmethod
+    def _validate_context_contract(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        """严格校验前端论文候选，避免请求层把标量 ID 混入上下文。"""
+        visible_paper = value.get("frontend_visible_paper")
+        if visible_paper is None and "frontend_visible_paper" not in value:
+            return value
+        if not isinstance(visible_paper, Mapping):
+            raise ValueError("context.frontend_visible_paper must be an object")
+        arxiv_id = visible_paper.get("arxiv_id")
+        if not isinstance(arxiv_id, str) or not arxiv_id.strip():
+            raise ValueError("context.frontend_visible_paper.arxiv_id is required")
+        title = visible_paper.get("title")
+        if title is not None and not isinstance(title, str):
+            raise ValueError("context.frontend_visible_paper.title must be a string")
+        return value
 
     @field_validator("resume", mode="before")
     @classmethod
@@ -1705,7 +1722,7 @@ class ArxivSearchResponse(BaseModel):
     - 论文结果；
     - 工具调用轨迹；
     - 最终 answer 与 next_actions；
-    - 以及 interaction / paper_qa_result / preference_action_result
+    - 以及 interaction / resolved_paper / paper_qa_result / preference_action_result
     一并返回给上层。
     """
     model_config = ConfigDict(extra="forbid")
@@ -1736,6 +1753,7 @@ class ArxivSearchResponse(BaseModel):
     runtime_state: Optional[AgentRuntimeState] = None
     interaction: Optional[AgentInteraction] = None
     paper_qa_result: Optional[Dict[str, Any]] = None
+    resolved_paper: Optional[Dict[str, Any]] = None
     preference_action_result: Optional[Dict[str, Any]] = None
     plan: List[str] = Field(default_factory=list)
     tool_calls: List[AgentToolCall] = Field(default_factory=list)

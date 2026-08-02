@@ -34,7 +34,8 @@ const {
   resumeWorkContinuation,
   cancelWorkContinuation,
   retryWorkContinuation,
-  clearConversation
+  clearConversation,
+  selectedPaper
 } = useAgentSearchChat()
 
 const quickPrompts = [
@@ -89,6 +90,8 @@ function handleCancelInteraction() {
 }
 
 function handleViewDetail(id: string) {
+  // 卡片点击是用户明确选择论文的动作，先更新现有焦点状态，再进入详情页。
+  selectedPaper.value = { arxiv_id: id }
   router.push(`/paper/${id}`)
 }
 

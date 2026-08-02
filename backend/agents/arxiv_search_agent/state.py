@@ -140,6 +140,8 @@ class AgentState(BaseModel):
     # [B 出站响应投影] paper_qa_result 由 _apply_turn_result 从 runtime.outputs 投影得到，
     # 可能是成功答案或失败信息；等待用户输入统一由 interaction 表达。
     paper_qa_result: Optional[Dict[str, Any]] = None
+    # [B 出站响应投影] 只记录本轮已经确定的最终目标，不包含尚未确认的候选论文。
+    resolved_paper: Optional[Dict[str, Any]] = None
 
     # intent 系列字段由 parse_search_request 节点产出，决定图中后续路由方向。
     intent: Optional[str] = None

@@ -1051,7 +1051,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
             self.user_id,
             "agent-session-1",
             frontend_context={
-                "selected_paper": {"arxiv_id": "frontend-paper"},
+                "frontend_visible_paper": {"arxiv_id": "frontend-paper"},
                 "pending_action": {"status": "waiting_confirmation", "step_id": "stale"},
                 "research_profile": {"positive_topics": ["stale"]},
                 "ui_tab": "detail",
@@ -1074,7 +1074,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(loaded["merged_context"]["ui_tab"], "detail")
         self.assertNotIn("unknown_cache", loaded["merged_context"])
         merge_debug = loaded["context_merge_debug"]
-        self.assertEqual(merge_debug["frontend_accepted_fields"]["selected_paper"], "frontend_visible_paper")
+        self.assertEqual(merge_debug["frontend_accepted_fields"]["frontend_visible_paper"], "frontend_visible_paper")
         self.assertEqual(merge_debug["frontend_ignored_fields"]["pending_action"], "not_allowlisted")
         self.assertEqual(merge_debug["frontend_ignored_fields"]["research_profile"], "backend_authoritative")
         self.assertEqual(merge_debug["frontend_ignored_fields"]["unknown_cache"], "not_allowlisted")
@@ -1096,6 +1096,10 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
                 "title": "Second Paper",
                 "answer": "grounded answer",
             },
+            "resolved_paper": {
+                "arxiv_id": "2401.00002",
+                "title": "Second Paper",
+            },
         }
 
         saved = self.memory_service.save_agent_memory(self.user_id, "agent-session-ordinal", final_state)
@@ -1103,6 +1107,28 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(saved["active_arxiv_id"], "2401.00002")
         self.assertEqual(saved["selected_paper"]["arxiv_id"], "2401.00002")
         self.assertEqual(saved["selected_paper"]["title"], "Second Paper")
+
+    def test_agent_memory_persists_resolved_target_without_paper_qa_result(self) -> None:
+        final_state = {
+            "intent": "paper_summary",
+            "context": {
+                "selected_paper": {"arxiv_id": "2401.00001", "title": "Stale Paper"},
+            },
+            "plan_runtime": {
+                "outputs": {
+                    "paper_ref": {
+                        "arxiv_id": "2401.00002",
+                        "title": "Resolved Paper",
+                        "final_target_resolved": True,
+                    }
+                }
+            },
+        }
+
+        saved = self.memory_service.save_agent_memory(self.user_id, "agent-session-resolved", final_state)
+
+        assert saved["active_arxiv_id"] == "2401.00002"
+        assert saved["selected_paper"] == {"arxiv_id": "2401.00002", "title": "Resolved Paper"}
 
 
 if __name__ == "__main__":

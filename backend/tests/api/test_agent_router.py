@@ -76,6 +76,18 @@ class AgentRouterApiTests(unittest.TestCase):
         self.assertEqual(response.json()["answer"], "agent answer")
         mocked.assert_called_once()
 
+    def test_chat_endpoint_rejects_scalar_frontend_visible_paper(self) -> None:
+        response = self.client.post(
+            "/api/agent/chat",
+            json={
+                "user_id": "u1",
+                "message": "这篇论文讲了什么",
+                "context": {"frontend_visible_paper": "2401.00001"},
+            },
+        )
+
+        self.assertEqual(response.status_code, 422)
+
     def test_stream_endpoint_returns_sse_response(self) -> None:
         stream_response = StreamingResponse(iter([b'data: {"event_type":"run_start"}\n\n']), media_type="text/event-stream")
 

@@ -385,28 +385,36 @@ export function useAgentSearchChat() {
       lastSearchPapers.value = response.papers.map(paper => ({ ...paper }))
       selectedPaper.value = null
     }
-    const qaArxivId = response.paper_qa_result?.arxiv_id
-    if (qaArxivId) {
+    const resolvedPaper = response.resolved_paper
+    const resolvedArxivId = resolvedPaper?.arxiv_id
+    if (resolvedArxivId) {
       selectedPaper.value = lastSearchPapers.value.find(paper =>
-        [paper.arxiv_id, paper.arxivId, paper.id].includes(qaArxivId)
-      ) || { arxiv_id: qaArxivId, title: response.paper_qa_result?.title || '' }
+        [paper.arxiv_id, paper.arxivId, paper.id].includes(resolvedArxivId)
+      ) || { arxiv_id: resolvedArxivId, title: resolvedPaper?.title || '' }
     }
   }
 
   function buildRequestContext(): ArxivSearchRequest['context'] {
     const context: {
-      selected_paper?: AgentPaper | null
+      frontend_visible_paper?: AgentPaper
       last_papers?: AgentPaper[]
       paper_qa_result?: Record<string, any> | null
       research_profile?: UserResearchProfile | null
-      arxiv_id?: string | null
       source?: 'chat'
     } = {}
     if (lastSearchPapers.value.length) context.last_papers = lastSearchPapers.value.map(paper => ({ ...paper }))
-    if (selectedPaper.value) context.selected_paper = { ...selectedPaper.value }
+    if (selectedPaper.value) {
+      // 前端只上报当前论文候选；后端负责判断它是否是本轮用户指代的最终目标。
+      const arxivId = selectedPaper.value.arxiv_id || selectedPaper.value.arxivId || selectedPaper.value.id
+      if (arxivId) {
+        context.frontend_visible_paper = {
+          ...selectedPaper.value,
+          arxiv_id: arxivId
+        }
+      }
+    }
     if (paperQaResult.value) context.paper_qa_result = { ...paperQaResult.value }
     if (paperStore.researchProfile) context.research_profile = { ...paperStore.researchProfile }
-    context.arxiv_id = selectedPaper.value?.arxiv_id || selectedPaper.value?.arxivId || selectedPaper.value?.id || null
     context.source = 'chat'
     return Object.keys(context).length ? context : undefined
   }

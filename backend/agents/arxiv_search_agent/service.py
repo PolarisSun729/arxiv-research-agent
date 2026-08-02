@@ -1498,6 +1498,7 @@ def _state_to_response(state: Any) -> ArxivSearchResponse:
         runtime_state=final_state.runtime_state,
         interaction=final_state.interaction,
         paper_qa_result=final_state.paper_qa_result,
+        resolved_paper=final_state.resolved_paper,
         preference_action_result=final_state.preference_action_result,
         plan=list(final_state.plan or []),
         tool_calls=tool_calls,
