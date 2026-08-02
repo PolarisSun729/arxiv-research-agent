@@ -78,6 +78,7 @@ class AgentGraphFlowTests(unittest.TestCase):
             outputs={
                 "paper_ref": {
                     "status": "success",
+                    "final_target_resolved": True,
                     "arxiv_id": "2401.00002",
                     "title": "Second Paper",
                     "paper": {"arxiv_id": "2401.00002", "title": "Second Paper"},
@@ -96,6 +97,10 @@ class AgentGraphFlowTests(unittest.TestCase):
 
         graph_module._apply_turn_result(state, result)
 
+        self.assertEqual(
+            state.resolved_paper,
+            {"arxiv_id": "2401.00002", "title": "Second Paper"},
+        )
         self.assertEqual(state.paper_qa_result["arxiv_id"], "2401.00002")
         self.assertEqual(state.paper_qa_result["title"], "Second Paper")
 

@@ -12,7 +12,10 @@ from fastapi.responses import StreamingResponse
 
 from dependencies import (
     RequestActor,
+    get_agent_runtime_checkpoint_store,
+    get_agent_session_store,
     get_agent_resume_run_manager,
+    get_agent_work_store,
     get_agent_work_continuation_service,
     get_request_actor,
 )
@@ -73,6 +76,38 @@ async def agent_chat_stream_endpoint(request: ArxivSearchRequest) -> StreamingRe
 async def agent_graph_endpoint():
     """返回静态图结构，供调试和可视化使用。"""
     return export_arxiv_search_graph_mermaid()
+
+
+@router.post("/sessions/{session_id}/clear")
+async def clear_agent_session(
+    session_id: str,
+    actor: RequestActor = Depends(get_request_actor),
+    session_store=Depends(get_agent_session_store),
+    checkpoint_store=Depends(get_agent_runtime_checkpoint_store),
+    work_store=Depends(get_agent_work_store),
+):
+    """清空当前 Agent 对话；历史任务记录保留，但不再允许旧状态驱动后续会话。"""
+    session = session_store.get_agent_session(session_id, user_id=actor.user_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Agent session not found")
+
+    # 先终止可取消的恢复链路，再清理轻量会话记忆，避免旧确认态在并发请求中重新写回。
+    cancelled_continuations = work_store.cancel_session_continuations(
+        user_id=actor.user_id,
+        session_id=session_id,
+    )
+    cancelled_checkpoints = checkpoint_store.cancel_agent_runtime_checkpoints_for_session(
+        user_id=actor.user_id,
+        session_id=session_id,
+    )
+    if not session_store.clear_agent_session(session_id, user_id=actor.user_id):
+        raise HTTPException(status_code=500, detail="Failed to clear agent session")
+    return {
+        "session_id": session_id,
+        "status": "cleared",
+        "cancelled_continuations": cancelled_continuations,
+        "cancelled_checkpoints": cancelled_checkpoints,
+    }
 
 
 @router.get("/work-continuations/active")

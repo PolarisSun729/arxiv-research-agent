@@ -40,7 +40,7 @@
 12. 已经启动的恢复由 AgentResumeRun 执行到底，SSE 只负责传输。
 13. 用户取消只终止自己的 continuation，不取消共享物理 job。
 14. 批准时必须再次检查索引，避免并发 job 已完成后仍制造空副作用。
-15. 页面恢复所有任务卡，但只自动运行当前或用户选中的 continuation。
+15. 页面只恢复当前会话的活动任务；新对话不加载旧会话 continuation。
 16. job success 必须同时满足 builder 成功和 active 索引后置条件。
 17. 使用短事务、持久中间状态和幂等 reconciliation，不使用长事务包住外部调用。
 18. job 运行期间 continuation 不过期；成功后默认提供 7 天恢复窗口。
@@ -497,7 +497,8 @@ display_summary_json 只能保存安全展示字段，例如论文标题和问�
 - 默认每 2.5 秒轮询 continuation。
 - 页面隐藏时可以降低频率，重新可见时立即刷新。
 - 进入终态后停止轮询。
-- 页面初始化时加载全部 active continuation。
+- 页面只有在已经拥有当前 session 时才加载该 session 的 active continuation；新对话保持空任务列表。
+- failed 和 indeterminate 属于审计终态，不得由 active 接口返回，也不得提示用户继续恢复。
 - 多个 continuation 共享一个 job 时，前端可以按 job_id 合并实际 job 查询，但每张卡仍保持独立状态。
 
 ### 14.3 自动恢复

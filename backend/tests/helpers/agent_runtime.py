@@ -219,6 +219,21 @@ def _ensure_dependency_stubs() -> None:
         "get_agent_resume_run_manager",
         lambda: None,
     )
+    dependencies_module.get_agent_session_store = getattr(
+        dependencies_module,
+        "get_agent_session_store",
+        lambda: None,
+    )
+    dependencies_module.get_agent_runtime_checkpoint_store = getattr(
+        dependencies_module,
+        "get_agent_runtime_checkpoint_store",
+        lambda: None,
+    )
+    dependencies_module.get_agent_work_store = getattr(
+        dependencies_module,
+        "get_agent_work_store",
+        lambda: None,
+    )
     dependencies_module.get_background_work_coordinator = getattr(
         dependencies_module,
         "get_background_work_coordinator",

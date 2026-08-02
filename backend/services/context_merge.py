@@ -36,24 +36,13 @@ FRONTEND_CONTEXT_ALLOWLIST: Set[str] = {
     "enable_keyword_search",
     "enable_llm_rerank",
     "enable_context_expansion",
-    "visible_paper_id",
-    "visible_arxiv_id",
-    "frontend_visible_paper_id",
-    "frontend_selected_paper",
+    "frontend_visible_paper",
     "recommendation_topic",
     "topic_hint",
     "top_n",
     "recommendation_top_n",
     "max_age_months",
     "recommendation_max_age_months",
-}
-
-FRONTEND_PAPER_CANDIDATE_ALIASES: Set[str] = {
-    "selected_paper",
-    "arxiv_id",
-    "active_arxiv_id",
-    "paper_id",
-    "arxivId",
 }
 
 
@@ -77,9 +66,9 @@ def merge_backend_authoritative_context(
 ) -> ContextMergeResult:
     """按“后端状态权威、前端只补充白名单”的规则合并上下文。
 
-    Agent 和 QA 入口都可能继续接收旧版 context，因此这里集中处理覆盖边界：
-    后端记忆字段先落入 merged_context，前端字段只有在白名单内才会补充；
-    对 selected_paper/arxiv_id 这类 UI 当前可见论文，只保留为候选值，避免回写成权威论文状态。
+    Agent 和 QA 入口都经过这里统一定义权威边界：后端记忆字段先落入 merged_context，
+    前端字段只有在白名单内才会补充；
+    前端论文状态只能通过 frontend_visible_paper 传入，避免和后端权威 selected_paper/arxiv_id 重名。
     """
 
     backend_payload = dict(backend_context or {})
@@ -91,11 +80,10 @@ def merge_backend_authoritative_context(
     ignored_frontend_fields: Dict[str, str] = {}
 
     for key, value in frontend_payload.items():
-        if key in FRONTEND_PAPER_CANDIDATE_ALIASES:
-            candidate_key = "frontend_visible_paper"
-            # 前端当前可见论文只能作为本轮解析候选，不能改写 active_arxiv_id / selected_paper 等后端权威状态。
-            merged_context[candidate_key] = value
-            accepted_frontend_fields[key] = candidate_key
+        if key == "frontend_visible_paper":
+            # 前端当前可见论文只作为本轮目标解析候选，不能改写后端已经确认的焦点。
+            merged_context[key] = _validate_frontend_visible_paper(value)
+            accepted_frontend_fields[key] = key
             continue
         if key in authority_fields:
             ignored_frontend_fields[key] = "backend_authoritative"
@@ -115,3 +103,16 @@ def merge_backend_authoritative_context(
         "backend_authority_fields": sorted(field for field in authority_fields if field in backend_payload),
     }
     return ContextMergeResult(merged_context=merged_context, debug=debug)
+
+
+def _validate_frontend_visible_paper(value: Any) -> Dict[str, Any]:
+    """校验前端论文候选的唯一结构，阻止标量 ID 再次覆盖论文对象。"""
+    if not isinstance(value, Mapping):
+        raise ValueError("frontend_visible_paper must be an object")
+    arxiv_id = value.get("arxiv_id")
+    if not isinstance(arxiv_id, str) or not arxiv_id.strip():
+        raise ValueError("frontend_visible_paper.arxiv_id is required")
+    title = value.get("title")
+    if title is not None and not isinstance(title, str):
+        raise ValueError("frontend_visible_paper.title must be a string")
+    return dict(value)

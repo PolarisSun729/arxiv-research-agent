@@ -675,6 +675,7 @@ def _apply_turn_result(state: AgentState, result: AgentTurnResult) -> None:
         "output_keys": sorted(result.outputs.keys()),
         "trace_events": [trace.event for trace in list(result.trace or [])],
     }
+    state.resolved_paper = _paper_identity_projection(_extract_final_resolved_paper_from_runtime(state))
     if result.interaction is not None:
         state.paper_qa_result = {
             "status": "waiting_interaction",
@@ -711,24 +712,45 @@ def _extract_resolved_paper_from_runtime(state: AgentState) -> Dict[str, Any]:
         # 嵌套 paper 字段通常更完整，但顶层字段代表最终解析结果，保留其优先级。
         return {
             **dict(nested_paper),
-            **{key: value for key, value in dict(paper_ref).items() if key in {"arxiv_id", "title"} and value not in (None, "", [], {})},
+            **{
+                key: value
+                for key, value in dict(paper_ref).items()
+                if key in {"arxiv_id", "title", "final_target_resolved"}
+                and value not in (None, "", [], {})
+            },
         }
     return dict(paper_ref)
+
+
+def _extract_final_resolved_paper_from_runtime(state: AgentState) -> Dict[str, Any]:
+    """只提取已完成解析或用户确认的 paper_ref，避免候选目标成为当前焦点。"""
+    paper_ref = _extract_resolved_paper_from_runtime(state)
+    return paper_ref if bool(paper_ref.get("final_target_resolved")) else {}
+
+
+def _paper_identity_projection(paper: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """把运行态目标压缩成前端同步焦点所需的最小论文身份。"""
+    arxiv_id = str(paper.get("arxiv_id") or "").strip()
+    if not arxiv_id:
+        return None
+    projection: Dict[str, Any] = {"arxiv_id": arxiv_id}
+    title = str(paper.get("title") or "").strip()
+    if title:
+        projection["title"] = title
+    return projection
 
 
 def _build_paper_qa_result(state: AgentState, payload: Any) -> Dict[str, Any]:
     """把真实 PaperQA 工具输出整理成前端沿用的 paper_qa_result。"""
     data = dict(payload) if isinstance(payload, Mapping) else {"value": payload}
-    context = state.context if isinstance(state.context, Mapping) else {}
-    selected_paper = context.get("selected_paper") if isinstance(context.get("selected_paper"), Mapping) else {}
     resolved_paper = _extract_resolved_paper_from_runtime(state)
     answer = str(data.get("answer") or "").strip()
     status = str(data.get("status") or ("success" if answer else "failed")).strip() or "failed"
     return {
         "status": status,
         # arxiv_id/title 优先取本轮 resolve_paper 的结果，避免“第二篇”被旧 selected_paper 覆盖。
-        "arxiv_id": data.get("arxiv_id") or resolved_paper.get("arxiv_id") or context.get("arxiv_id") or selected_paper.get("arxiv_id"),
-        "title": data.get("title") or resolved_paper.get("title") or selected_paper.get("title"),
+        "arxiv_id": data.get("arxiv_id") or resolved_paper.get("arxiv_id"),
+        "title": data.get("title") or resolved_paper.get("title"),
         "question": data.get("question") or state.message,
         "answer": answer,
         "sources": data.get("sources", []),

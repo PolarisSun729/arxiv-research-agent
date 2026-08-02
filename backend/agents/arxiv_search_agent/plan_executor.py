@@ -69,6 +69,24 @@ from .execution.traces import (
     _tool_error_to_text,
     _utcnow,
 )
+
+
+def _background_continuation_id_from_context() -> str:
+    """从 LangGraph 运行时 config 读取本次续跑绑定的 continuation_id。
+
+    仅 resume 管理器会写入 configurable.background_continuation_id；
+    普通请求或单测无 config 时返回空串，走 fallback 查找。
+    """
+    try:
+        from langgraph.config import get_config
+
+        config = get_config()
+    except Exception:
+        return ""
+    configurable = dict((config or {}).get("configurable") or {})
+    return str(configurable.get("background_continuation_id") or "").strip()
+
+
 class PlanExecutor:
     """按计划拓扑、输入绑定和策略约束执行 ExecutablePlan。"""
 
@@ -165,6 +183,55 @@ class PlanExecutor:
         self._sync_runtime_state(state, runtime, current_step=step)
         return step_result
 
+
+    def _project_background_job_result(
+        self,
+        *,
+        step: PlanStep,
+        runtime: PlanRuntime,
+        state: AgentState,
+        resolved_input: Mapping[str, Any],
+        validated_result: Mapping[str, Any],
+        continuation_id: str,
+        started_at: str,
+        source: str,
+    ) -> StepExecutionResult:
+        """把已验证的后台完成结果投影为当前 step 输出，禁止再次调用 adapter。"""
+        runtime.interaction = None
+        runtime.turn_status = None
+        runtime.step_status[step.step_id] = "running"
+        runtime.last_step_output = {
+            "step_id": step.step_id,
+            "tool_contract": _json_safe(self.tool_registry.describe_contract(step.tool_name)),
+            "resolved_input": _json_safe(resolved_input),
+            "raw_output": _json_safe(validated_result),
+            "normalized_output": _json_safe(validated_result),
+            "background_work": {
+                "continuation_id": continuation_id or None,
+                "status": "completed",
+                "projection_source": source,
+            },
+            "started_at": started_at,
+            "finished_at": _utcnow(),
+        }
+        self._append_trace(
+            runtime,
+            step,
+            event="background_job_result_projected",
+            status="running",
+            detail={
+                "continuation_id": continuation_id or None,
+                "projection_source": source,
+            },
+        )
+        self._sync_runtime_state(state, runtime, current_step=step)
+        return self._step_result_from_runtime(
+            step=step,
+            runtime=runtime,
+            next_action="continue",
+            output=dict(validated_result),
+        )
+
     def execute_current_step_tool(self, runtime: PlanRuntime, state: AgentState, *, allow_interrupt: bool = False) -> StepExecutionResult:
         """只执行当前 step 的工具调用，不做 observation / replan。
 
@@ -222,6 +289,38 @@ class PlanExecutor:
             )
             self._sync_runtime_state(state, runtime, current_step=step)
             return self._step_result_from_runtime(step=step, runtime=runtime, next_action="continue", output=reused_output)
+
+
+        # 后台 job 已完成时优先投影结果，避免 grant 已 consumed 后再次 interrupt 造成假完成。
+        contract = self.tool_registry.get_contract(step.tool_name)
+        execution_policy = getattr(contract, "execution_policy", None)
+        if (
+            execution_policy is not None
+            and str(getattr(execution_policy, "mode", "") or "").strip() == "background_job"
+            and self.background_work_coordinator is not None
+            and callable(getattr(self.background_work_coordinator, "find_projectable_result", None))
+        ):
+            projected = self.background_work_coordinator.find_projectable_result(
+                continuation_id=_background_continuation_id_from_context(),
+                user_id=str(state.user_id or "").strip(),
+                session_id=str(state.session_id or "").strip(),
+                thread_id=str(state.session_id or "").strip(),
+                step_id=step.step_id,
+                tool_name=step.tool_name,
+                arguments=resolved_input,
+                handler_name=str(getattr(execution_policy, "handler", "") or ""),
+            )
+            if isinstance(projected, Mapping) and projected:
+                return self._project_background_job_result(
+                    step=step,
+                    runtime=runtime,
+                    state=state,
+                    resolved_input=resolved_input,
+                    validated_result=dict(projected),
+                    continuation_id=_background_continuation_id_from_context(),
+                    started_at=started_at,
+                    source="pre_interrupt_short_circuit",
+                )
 
         guard_decision = None
         if step.confirmation_policy and step.confirmation_policy.requires_confirmation:
@@ -290,35 +389,15 @@ class PlanExecutor:
                                 error=runtime.error,
                             )
                         # job 已由 continuation 验证并完成原 invocation；这里仅投影输出，禁止再次调用 adapter。
-                        runtime.interaction = None
-                        runtime.turn_status = None
-                        runtime.step_status[step.step_id] = "running"
-                        runtime.last_step_output = {
-                            "step_id": step.step_id,
-                            "tool_contract": _json_safe(self.tool_registry.describe_contract(step.tool_name)),
-                            "resolved_input": _json_safe(resolved_input),
-                            "raw_output": _json_safe(validated_result),
-                            "normalized_output": _json_safe(validated_result),
-                            "background_work": {
-                                "continuation_id": continuation_id,
-                                "status": "completed",
-                            },
-                            "started_at": started_at,
-                            "finished_at": _utcnow(),
-                        }
-                        self._append_trace(
-                            runtime,
-                            step,
-                            event="background_job_result_projected",
-                            status="running",
-                            detail={"continuation_id": continuation_id},
-                        )
-                        self._sync_runtime_state(state, runtime, current_step=step)
-                        return self._step_result_from_runtime(
+                        return self._project_background_job_result(
                             step=step,
                             runtime=runtime,
-                            next_action="continue",
-                            output=validated_result,
+                            state=state,
+                            resolved_input=resolved_input,
+                            validated_result=validated_result,
+                            continuation_id=continuation_id,
+                            started_at=started_at,
+                            source="interrupt_background_completed",
                         )
 
                 return self._step_result_from_runtime(

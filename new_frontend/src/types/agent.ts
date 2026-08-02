@@ -12,11 +12,10 @@ export interface ArxivSearchRequest {
     note?: string | null
   } | null
   context?: {
-    selected_paper?: AgentPaper | null
+    frontend_visible_paper?: AgentPaper
     last_papers?: AgentPaper[]
     paper_qa_result?: Record<string, any> | null
     research_profile?: UserResearchProfile | null
-    arxiv_id?: string | null
     source?: 'button' | 'chat' | 'detail_page'
   } | null
 }
@@ -166,6 +165,7 @@ export interface ArxivSearchResponse {
   search_spec?: ArxivSearchSpec | null
   interaction?: AgentInteraction | null
   paper_qa_result?: Record<string, any> | null
+  resolved_paper?: AgentPaper | null
   preference_action_result?: AgentPreferenceActionResult | null
   plan: string[]
   tool_calls: AgentToolCall[]

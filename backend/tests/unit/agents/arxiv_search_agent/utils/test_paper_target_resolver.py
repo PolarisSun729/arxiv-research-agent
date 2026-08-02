@@ -134,6 +134,42 @@ def test_context_paper_uses_selected_or_recent_focus_not_first_list_item() -> No
     assert result["resolution_reason"] == "context_focus_unique_candidate"
 
 
+def test_context_paper_prefers_frontend_visible_paper_over_stale_backend_focus() -> None:
+    result = target_resolver.resolve_paper_target(
+        reference_hint=_hint("这篇论文的方法是什么"),
+        message="这篇论文的方法是什么",
+        context={
+            "selected_paper": _paper("2401.00001", "Stale backend focus"),
+            "frontend_visible_paper": _paper("2401.00002", "Currently visible"),
+        },
+        action_type="paper_qa",
+    )
+
+    assert result["status"] == "resolved"
+    assert result["arxiv_id"] == "2401.00002"
+    assert result["resolution_reason"] == "frontend_visible_paper_unique_candidate"
+
+
+def test_all_ordinal_references_use_the_ordered_paper_list() -> None:
+    papers = [
+        _paper("2401.00001", "First"),
+        _paper("2401.00002", "Second"),
+        _paper("2401.00003", "Third"),
+    ]
+
+    for message, expected_id in (("第一篇论文", "2401.00001"), ("第三篇论文", "2401.00003")):
+        result = target_resolver.resolve_paper_target(
+            reference_hint=_hint(message),
+            message=message,
+            context={"last_papers": papers},
+            action_type="paper_qa",
+        )
+
+        assert result["status"] == "resolved"
+        assert result["arxiv_id"] == expected_id
+        assert result["reference_hint"]["reference_type"] == "ordinal"
+
+
 def test_ordinal_without_candidate_list_needs_clarification() -> None:
     result = target_resolver.resolve_paper_target(
         reference_hint=_hint("讲一下第二篇论文"),

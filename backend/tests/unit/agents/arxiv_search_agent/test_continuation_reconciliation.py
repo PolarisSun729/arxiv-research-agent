@@ -44,6 +44,7 @@ class _Store:
         self.continuation = dict(continuation)
         self.ready_calls = []
         self.failed_calls = []
+        self.requested_statuses = []
 
     def expire_ready_continuation_if_needed(self, _continuation_id: str):
         return dict(self.continuation)
@@ -68,6 +69,13 @@ class _Store:
 
     def get_continuation(self, _continuation_id: str):
         return dict(self.continuation)
+
+    def list_continuations(self, *, user_id: str, session_id=None, statuses=None, limit: int = 100):
+        self.requested_statuses = list(statuses or [])
+        return [dict(self.continuation)] if self.continuation.get("status") in self.requested_statuses else []
+
+    def list_unretrieved_resume_continuations(self, **_kwargs):
+        return []
 
 
 class _PaperJobStore:
@@ -146,3 +154,18 @@ def test_reconcile_projects_validated_success_and_explicit_failure_from_persiste
 
     assert failed["status"] == "failed"
     assert failed_store.failed_calls == [("job-2", "pdf_download_failed", "PDF 下载失败")]
+
+
+def test_list_active_does_not_restore_failed_continuation() -> None:
+    store = _Store(_continuation(status="failed", job_id="job-1"))
+    service = AgentWorkContinuationService(
+        store=store,
+        paper_job_store=_PaperJobStore({"job_id": "job-1", "status": "failed"}),
+        handlers=_Registry(_Handler()),
+    )
+
+    items = service.list_active(user_id="user-1", session_id="session-1")
+
+    # 明确失败是终态，只保留审计记录，不能再作为新页面可恢复的活动任务返回。
+    assert items == []
+    assert "failed" not in store.requested_statuses

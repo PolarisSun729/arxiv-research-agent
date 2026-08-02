@@ -52,6 +52,11 @@ class BackgroundWorkCoordinator(Protocol):
         ...
 
 
+    def find_projectable_result(self, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        """若当前后台 step 已有可投影完成结果则返回，否则返回 None。"""
+        ...
+
+
 class BackgroundJobHandler(Protocol):
     """通用后台执行协议；协调器只依赖这三个能力，不依赖 Paper QA 业务细节。"""
 
@@ -294,6 +299,97 @@ class PersistentBackgroundWorkCoordinator:
             continuation_id=continuation_id,
             job_id=submission.job_id,
         )
+
+
+    # 仅这些状态允许把后台结果投影回执行链；waiting_job/submitting 绝不能短接成成功。
+    _PROJECTABLE_CONTINUATION_STATUSES = frozenset({"ready_to_resume", "resuming"})
+
+    def find_projectable_result(
+        self,
+        *,
+        continuation_id: Optional[str] = None,
+        user_id: str = "",
+        session_id: str = "",
+        thread_id: str = "",
+        step_id: str = "",
+        tool_name: str = "",
+        arguments: Optional[Mapping[str, Any]] = None,
+        handler_name: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """按锁定优先级查找可投影的后台完成结果。
+
+        1) continuation_id 精确命中
+        2) thread/step/tool fallback
+        3) handler preflight already_satisfied
+        未完成、无 validated_result、身份不匹配时一律返回 None，避免误短接。
+        """
+        normalized_step = str(step_id or "").strip()
+        normalized_tool = str(tool_name or "").strip()
+        normalized_thread = str(thread_id or "").strip()
+
+        def _match_identity(item: Mapping[str, Any]) -> bool:
+            if normalized_tool and str(item.get("tool_name") or "").strip() != normalized_tool:
+                return False
+            if normalized_step and str(item.get("step_id") or "").strip() != normalized_step:
+                return False
+            if normalized_thread and str(item.get("thread_id") or "").strip() != normalized_thread:
+                return False
+            return True
+
+        def _result_from_continuation(item: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+            if not isinstance(item, Mapping):
+                return None
+            status = str(item.get("status") or "").strip()
+            if status not in self._PROJECTABLE_CONTINUATION_STATUSES:
+                return None
+            if not _match_identity(item):
+                return None
+            validated = item.get("validated_result")
+            if not isinstance(validated, Mapping) or not validated:
+                return None
+            return dict(validated)
+
+        # 优先级 1：continuation_id 精确命中（自动续跑主路径）。
+        normalized_continuation_id = str(continuation_id or "").strip()
+        if normalized_continuation_id:
+            projected = _result_from_continuation(self.store.get_continuation(normalized_continuation_id))
+            if projected is not None:
+                return projected
+
+        # 优先级 2：同一会话/线程上匹配 step+tool 的最新可投影 continuation。
+        normalized_user = str(user_id or "").strip()
+        if normalized_user:
+            candidates = self.store.list_continuations(
+                user_id=normalized_user,
+                session_id=str(session_id or "").strip() or None,
+                statuses=list(self._PROJECTABLE_CONTINUATION_STATUSES),
+                limit=20,
+            )
+            for item in candidates:
+                projected = _result_from_continuation(item)
+                if projected is not None:
+                    return projected
+
+        # 优先级 3：物理副作用已满足（如索引已存在）时投影等价成功，避免再次确认。
+        normalized_handler = str(handler_name or "").strip()
+        if normalized_handler and isinstance(arguments, Mapping):
+            try:
+                handler = self.handlers.get(normalized_handler)
+                preflight = handler.preflight(arguments)
+            except Exception as exc:
+                logger.debug(
+                    "background preflight for projectable result failed: handler=%s error=%s",
+                    normalized_handler,
+                    exc,
+                )
+            else:
+                if (
+                    preflight.status == "already_satisfied"
+                    and isinstance(preflight.projected_result, Mapping)
+                    and preflight.projected_result
+                ):
+                    return dict(preflight.projected_result)
+        return None
 
     def prepare(self, **kwargs: Any) -> BackgroundWorkTicket:
         """兼容执行器重入；只有无副作用竞态可在此直接投影，真实提交必须走批准短事务。"""

@@ -58,6 +58,7 @@ _LIST_SOURCE_SPECS: Sequence[Dict[str, Any]] = (
 )
 
 _FOCUS_SOURCE_SPECS: Sequence[Dict[str, Any]] = (
+    {"path": "frontend_visible_paper", "source_type": "frontend_visible_paper", "label": "前端当前选中论文", "priority": 110},
     {"path": "selected_paper", "source_type": "selected_paper", "label": "当前选中论文", "priority": 100},
     {"path": "current_paper", "source_type": "current_paper", "label": "当前打开论文", "priority": 96},
     {"path": "active_paper", "source_type": "current_paper", "label": "当前激活论文", "priority": 94},
@@ -409,11 +410,19 @@ def _resolve_context_paper_hint(
     action_type: str,
     risk_level: str,
 ) -> Dict[str, Any]:
-    candidates = _dedupe_candidates(list(paper_context.get("focus_candidates") or []))
+    all_candidates = _dedupe_candidates(list(paper_context.get("focus_candidates") or []))
+    visible_candidates = [
+        candidate
+        for candidate in all_candidates
+        if candidate.get("source_key") == "frontend_visible_paper"
+    ]
+    # 前端刚刚明确选择的论文代表最新用户操作；只有它不存在时才回退到后端历史焦点。
+    candidates = visible_candidates or all_candidates
     debug = {
         "context_summary": _context_summary(paper_context),
         "message_source_hint": _infer_requested_list_source(message),
         "focus_candidate_count": len(candidates),
+        "all_focus_candidate_count": len(all_candidates),
     }
     if not candidates:
         return _build_resolution(
@@ -443,7 +452,7 @@ def _resolve_context_paper_hint(
         action_type=action_type,
         risk_level=risk_level,
         candidates=candidates,
-        reason="context_focus_unique_candidate",
+        reason="frontend_visible_paper_unique_candidate" if visible_candidates else "context_focus_unique_candidate",
         confidence=min(max(float(hint.get("confidence") or 0.0), 0.7), 0.86),
         debug=debug,
     )

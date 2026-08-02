@@ -44,6 +44,40 @@ class StorageSqliteContainerTests(unittest.TestCase):
         self.assertIn("agent_runtime_checkpoints", table_names)
         self.assertIn("langgraph_checkpoints", table_names)
 
+    def test_schema_initialization_migrates_legacy_paper_index_jobs_before_indexes(self) -> None:
+        with TemporarySqliteDatabase() as legacy_db:
+            with legacy_db.connect() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE paper_index_jobs (
+                        job_id TEXT PRIMARY KEY,
+                        arxiv_id TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        current_stage TEXT,
+                        progress INTEGER NOT NULL DEFAULT 0,
+                        error_message TEXT,
+                        loading_method TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+                conn.commit()
+
+            provider = SqliteConnectionProvider(db_path=str(legacy_db.db_path), check_same_thread=False)
+            # 回归覆盖旧库启动路径：索引依赖 lease_expires_at，必须先补列再建索引。
+            StorageContainer(connection_provider=provider)
+
+            with legacy_db.connect() as conn:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(paper_index_jobs)")}
+                indexes = {
+                    row[1]
+                    for row in conn.execute("PRAGMA index_list(paper_index_jobs)").fetchall()
+                }
+
+        self.assertIn("lease_expires_at", columns)
+        self.assertIn("idx_paper_index_jobs_claim", indexes)
+
     def test_paper_catalog_store_adds_reads_and_deletes_paper(self) -> None:
         self._add_sample_paper()
 

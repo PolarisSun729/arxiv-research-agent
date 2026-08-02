@@ -220,18 +220,18 @@ class MemoryService:
         context: Dict[str, Any],
         paper_qa_result: Optional[Dict[str, Any]],
         active_arxiv_id: str,
+        resolved_paper: Optional[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
         """从最终状态中推断当前选中的论文信息，供 Agent 会话记忆复用。"""
-        if isinstance(paper_qa_result, dict):
-            # 本轮 QA 的真实目标优先级高于旧 selected_paper；
-            # 否则用户问“第二篇”后，会话记忆仍可能停留在前端默认选中的第一篇。
-            inferred_id = self._extract_arxiv_id(paper_qa_result) or active_arxiv_id
-            inferred_title = str(paper_qa_result.get("title") or "").strip()
+        if isinstance(resolved_paper, dict):
+            # 只有 resolver 已标记 final_target_resolved 的结果才能覆盖旧焦点；
+            # paper_qa_result 只负责保存问答投影，不能单独承担目标确认职责。
+            inferred_id = self._extract_arxiv_id(resolved_paper) or active_arxiv_id
+            inferred_title = str(
+                resolved_paper.get("title") or ""
+            ).strip()
             if inferred_id or inferred_title:
-                return {
-                    "arxiv_id": inferred_id,
-                    "title": inferred_title,
-                }
+                return {"arxiv_id": inferred_id, "title": inferred_title}
 
         selected_paper = context.get("selected_paper")
         if isinstance(selected_paper, dict) and selected_paper:
@@ -243,6 +243,7 @@ class MemoryService:
         state = self._normalize_state_payload(final_state)
         context = dict(state.get("context") or {})
         paper_qa_result = state.get("paper_qa_result") if "paper_qa_result" in state else context.get("paper_qa_result")
+        resolved_paper = self._extract_final_resolved_paper_from_state(state)
 
         last_papers = context.get("last_papers") if "last_papers" in context else None
         if last_papers is None and isinstance(state.get("papers"), list) and state.get("papers"):
@@ -250,13 +251,18 @@ class MemoryService:
             last_papers = list(state.get("papers") or [])
 
         active_arxiv_id = (
-            # 当前轮次真实产物优先于旧 UI 选中态，防止“第 N 篇”解析成功后又被历史焦点覆盖。
-            self._extract_arxiv_id(paper_qa_result)
+            # 当前轮次只有最终解析目标可以更新焦点；没有新目标时保留后端已有会话焦点。
+            self._extract_arxiv_id(resolved_paper)
             or self._extract_arxiv_id(context.get("selected_paper"))
             or str(context.get("arxiv_id") or "").strip()
         )
         # active_arxiv_id 会作为当前会话聚焦论文的统一主键，后续恢复状态时优先依赖它。
-        selected_paper = self._build_selected_paper_from_state(context, paper_qa_result, active_arxiv_id)
+        selected_paper = self._build_selected_paper_from_state(
+            context,
+            paper_qa_result,
+            active_arxiv_id,
+            resolved_paper,
+        )
         active_paper_session_id = str(
             context.get("active_paper_session_id")
             or (paper_qa_result or {}).get("session_id")
@@ -279,6 +285,29 @@ class MemoryService:
             memory_patch["last_papers"] = last_papers
 
         return memory_patch
+
+    def _extract_final_resolved_paper_from_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """从最终 Agent 状态提取已确认的 paper_ref，供焦点持久化使用。"""
+        projected = state.get("resolved_paper")
+        if isinstance(projected, dict) and self._extract_arxiv_id(projected):
+            return {
+                "arxiv_id": self._extract_arxiv_id(projected),
+                "title": str(projected.get("title") or "").strip(),
+            }
+
+        runtime = state.get("plan_runtime")
+        outputs = runtime.get("outputs") if isinstance(runtime, dict) else None
+        paper_ref = outputs.get("paper_ref") if isinstance(outputs, dict) else None
+        if not isinstance(paper_ref, dict) or not bool(paper_ref.get("final_target_resolved")):
+            return {}
+        nested_paper = paper_ref.get("paper") if isinstance(paper_ref.get("paper"), dict) else {}
+        arxiv_id = self._extract_arxiv_id(paper_ref) or self._extract_arxiv_id(nested_paper)
+        if not arxiv_id:
+            return {}
+        return {
+            "arxiv_id": arxiv_id,
+            "title": str(paper_ref.get("title") or nested_paper.get("title") or "").strip(),
+        }
 
     @staticmethod
     def _normalize_conversation_turn_payload(raw_turn: Any) -> Optional[Dict[str, Any]]:

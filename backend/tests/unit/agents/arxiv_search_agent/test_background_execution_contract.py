@@ -208,3 +208,131 @@ def test_internal_background_resume_projects_result_without_reinvoking_tool(monk
     assert result.output["build_id"] == "build-1"
     assert runtime.last_step_output["normalized_output"]["build_id"] == "build-1"
     assert any(trace.event == "background_job_result_projected" for trace in runtime.trace)
+
+
+def test_background_job_short_circuits_before_interrupt_when_result_projectable(monkeypatch) -> None:
+    """后台结果已可投影时，必须在 guard/interrupt 前短接，避免再次确认造成假完成。"""
+    interrupt_calls = []
+
+    def _interrupt(payload):
+        interrupt_calls.append(payload)
+        raise AssertionError("projectable background result must not re-enter interrupt")
+
+    monkeypatch.setitem(PlanExecutor.execute_current_step_tool.__globals__, "interrupt", _interrupt)
+
+    class _Coordinator:
+        def find_projectable_result(self, **kwargs):
+            assert kwargs["tool_name"] == "parse_and_index_paper"
+            assert kwargs["step_id"] == "index"
+            return {
+                "status": "indexed",
+                "has_index": True,
+                "build_id": "build-ready",
+                "chunk_count": 4,
+            }
+
+        def prepare(self, **kwargs):
+            raise AssertionError("short-circuit must not submit/prepare background work again")
+
+    contract = UNIFIED_TOOL_REGISTRY.get_contract("parse_and_index_paper")
+    step = PlanStep(
+        step_id="index",
+        action_type="index",
+        tool_name=contract.tool_name,
+        tool=contract.to_tool_spec(),
+        input_bindings=[
+            StepInputBinding(
+                input_key="paper_reference",
+                source_type="literal",
+                value={"arxiv_id": "2401.00001"},
+            )
+        ],
+        output_key="index_result",
+        confirmation_policy=StepPolicy(
+            policy_type="confirmation",
+            mode="explicit_user_confirmation_required",
+            requires_confirmation=True,
+        ),
+        side_effect_level="external_call",
+    )
+    plan = ExecutablePlan(
+        plan_id="plan-1",
+        goal=Goal(goal_id="goal-1", goal_type="paper_qa", user_request="index"),
+        steps=[step],
+        entry_step_ids=["index"],
+        final_step_ids=["index"],
+    )
+    state = AgentState(user_id="user-1", session_id="session-1", intent="paper_qa", message="index")
+    runtime = build_plan_runtime(state, goal=plan.goal, plan=plan, turn_status="success")
+    runtime.step_status = {"index": "pending"}
+    runtime.current_step_id = "index"
+
+    result = PlanExecutor(background_work_coordinator=_Coordinator()).execute_current_step_tool(
+        runtime,
+        state,
+        allow_interrupt=True,
+    )
+
+    assert interrupt_calls == []
+    assert result.next_action == "continue"
+    assert result.output["build_id"] == "build-ready"
+    assert runtime.last_step_output["background_work"]["projection_source"] == "pre_interrupt_short_circuit"
+    assert any(trace.event == "background_job_result_projected" for trace in runtime.trace)
+
+
+def test_background_job_does_not_short_circuit_when_no_projectable_result(monkeypatch) -> None:
+    """未完成/无 validated_result 时不得短接，应继续走确认 interrupt。"""
+    monkeypatch.setitem(
+        PlanExecutor.execute_current_step_tool.__globals__,
+        "interrupt",
+        lambda _payload: {"decision": "reject"},
+    )
+
+    class _Coordinator:
+        def find_projectable_result(self, **kwargs):
+            return None
+
+        def prepare(self, **kwargs):
+            raise AssertionError("reject path must not prepare background work")
+
+    contract = UNIFIED_TOOL_REGISTRY.get_contract("parse_and_index_paper")
+    step = PlanStep(
+        step_id="index",
+        action_type="index",
+        tool_name=contract.tool_name,
+        tool=contract.to_tool_spec(),
+        input_bindings=[
+            StepInputBinding(
+                input_key="paper_reference",
+                source_type="literal",
+                value={"arxiv_id": "2401.00001"},
+            )
+        ],
+        output_key="index_result",
+        confirmation_policy=StepPolicy(
+            policy_type="confirmation",
+            mode="explicit_user_confirmation_required",
+            requires_confirmation=True,
+        ),
+        side_effect_level="external_call",
+    )
+    plan = ExecutablePlan(
+        plan_id="plan-1",
+        goal=Goal(goal_id="goal-1", goal_type="paper_qa", user_request="index"),
+        steps=[step],
+        entry_step_ids=["index"],
+        final_step_ids=["index"],
+    )
+    state = AgentState(user_id="user-1", session_id="session-1", intent="paper_qa", message="index")
+    runtime = build_plan_runtime(state, goal=plan.goal, plan=plan, turn_status="success")
+    runtime.step_status = {"index": "pending"}
+    runtime.current_step_id = "index"
+
+    result = PlanExecutor(background_work_coordinator=_Coordinator()).execute_current_step_tool(
+        runtime,
+        state,
+        allow_interrupt=True,
+    )
+
+    assert result.next_action == "fail"
+    assert runtime.step_status["index"] == "skipped"

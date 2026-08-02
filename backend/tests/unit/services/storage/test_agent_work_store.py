@@ -261,3 +261,72 @@ def test_ready_continuation_expiry_also_terminates_runtime_checkpoint(tmp_path) 
     assert expired["error_code"] == "continuation_ready_expired"
     assert stored_checkpoint["status"] == "expired"
     assert stored_checkpoint["next_route"] == "expired"
+
+
+def test_clear_session_cancels_recovery_state_but_keeps_audit_record(tmp_path) -> None:
+    storage = build_storage_container(db_path=str(tmp_path / "clear-agent-session.sqlite"))
+    interaction = _interaction()
+    storage.agent_sessions.create_or_get_agent_session(user_id="user-1", session_id="session-1")
+    storage.agent_sessions.update_agent_session(
+        session_id="session-1",
+        user_id="user-1",
+        memory_patch={
+            "selected_paper": {"arxiv_id": "2401.00001"},
+            "paper_qa_result": {"status": "waiting_interaction", "interaction": interaction},
+            "last_intent": "paper_qa",
+        },
+    )
+    checkpoint = storage.agent_runtime_checkpoints.upsert_agent_runtime_checkpoint(
+        user_id="user-1",
+        session_id="session-1",
+        thread_id="session-1",
+        runtime_state={"current_step_id": "index-step"},
+        interaction=interaction,
+        status="waiting_interaction",
+    )
+    storage.agent_work.prepare_background_work(
+        checkpoint_id=checkpoint["checkpoint_id"],
+        user_id="user-1",
+        session_id="session-1",
+        thread_id="session-1",
+        interaction_id="interaction-1",
+        grant_id="grant-1",
+        invocation_id="invocation-1",
+        continuation_id="continuation-1",
+        plan_id="plan-1",
+        step_id="index-step",
+        tool_name="parse_and_index_paper",
+        arguments_fingerprint="sha256:arguments",
+        handler_name="paper_qa_index",
+        job_id="job-1",
+        job_idempotency_key="2401.00001:docling:paper_qa_index_v1",
+    )
+
+    cancelled_continuations = storage.agent_work.cancel_session_continuations(
+        user_id="user-1",
+        session_id="session-1",
+    )
+    cancelled_checkpoints = storage.agent_runtime_checkpoints.cancel_agent_runtime_checkpoints_for_session(
+        user_id="user-1",
+        session_id="session-1",
+    )
+    assert storage.agent_sessions.clear_agent_session("session-1", user_id="user-1")
+
+    session = storage.agent_sessions.get_agent_session("session-1", user_id="user-1")
+    stored_checkpoint = storage.agent_runtime_checkpoints.get_agent_runtime_checkpoint(
+        user_id="user-1",
+        session_id="session-1",
+        thread_id="session-1",
+    )
+    continuation = storage.agent_work.get_continuation("continuation-1")
+
+    assert cancelled_continuations == 1
+    assert cancelled_checkpoints == 0
+    assert session["status"] == "cleared"
+    assert session["selected_paper"] is None
+    assert session["paper_qa_result"] is None
+    assert session["last_intent"] == ""
+    assert stored_checkpoint["status"] == "cancelled"
+    # 清空会话只关闭恢复入口，不删除 continuation/job 历史，排障信息仍然可审计。
+    assert continuation["status"] == "cancelled"
+    assert continuation["job_id"] == "job-1"

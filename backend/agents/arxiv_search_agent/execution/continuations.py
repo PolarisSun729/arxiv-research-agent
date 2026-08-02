@@ -163,7 +163,8 @@ class AgentWorkContinuationService:
         return self._safe_view(self.reconcile(continuation))
 
     def list_active(self, *, user_id: str, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        statuses = [*ACTIVE_CONTINUATION_STATUSES, "failed", "indeterminate"]
+        # failed/indeterminate 都是不可恢复终态，只保留审计记录，不能继续混入“活动任务”误导新会话。
+        statuses = list(ACTIVE_CONTINUATION_STATUSES)
         continuations = self.store.list_continuations(
             user_id=user_id,
             session_id=session_id,
@@ -187,6 +188,61 @@ class AgentWorkContinuationService:
             session_id=session_id,
         )
         return self._safe_view(continuation)
+
+
+
+
+def _invoke_result_has_interrupt(raw_result: Any) -> bool:
+    """识别 graph.invoke 在仍挂起 interrupt 时返回的假完成载荷。"""
+    if not isinstance(raw_result, Mapping):
+        return False
+    if raw_result.get("__interrupt__"):
+        return True
+    try:
+        from langgraph.constants import INTERRUPT
+
+        if raw_result.get(INTERRUPT):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _background_resume_failure_reason(
+    *,
+    raw_result: Any,
+    final_state: Any,
+    continuation: Mapping[str, Any],
+) -> Optional[str]:
+    """续跑成功判定：不得仍 interrupt，后台 step 必须完成，paper_qa 不得空答。"""
+    if _invoke_result_has_interrupt(raw_result):
+        return "background_resume_reinterrupted"
+
+    step_id = str(continuation.get("step_id") or "").strip()
+    runtime = getattr(final_state, "runtime_state", None)
+    if runtime is None:
+        runtime = getattr(final_state, "plan_runtime", None)
+
+    step_status = ""
+    turn_status = ""
+    if runtime is not None:
+        step_status_map = getattr(runtime, "step_status", None) or {}
+        if isinstance(step_status_map, Mapping):
+            step_status = str(step_status_map.get(step_id) or "").strip()
+        turn_status = str(getattr(runtime, "turn_status", None) or "").strip()
+
+    if turn_status in {"waiting_interaction", "waiting_background_job"}:
+        return f"background_resume_still_waiting:{turn_status}"
+    if step_id and step_status and step_status not in {"success", "skipped"}:
+        return f"background_step_not_completed:{step_status or 'missing'}"
+
+    intent = str(getattr(final_state, "intent", None) or "").strip()
+    if intent == "paper_qa":
+        answer = str(getattr(final_state, "answer", None) or "").strip()
+        paper_qa_result = getattr(final_state, "paper_qa_result", None)
+        if not answer and paper_qa_result is None:
+            return "background_resume_empty_answer"
+    return None
 
 
 class AgentResumeRunManager:
@@ -266,6 +322,8 @@ class AgentResumeRunManager:
         if not self.storage.agent_work.start_resume_run(resume_run_id):
             return
         graph_invocation_started = False
+        final_state_for_checkpoint = None
+        failure_reason: Optional[str] = None
         try:
             run = self.storage.agent_work.get_resume_run(resume_run_id)
             continuation = self.storage.agent_work.get_continuation(str((run or {}).get("continuation_id") or ""))
@@ -277,6 +335,7 @@ class AgentResumeRunManager:
 
             # 延迟导入避免 service -> graph -> executor 与本模块形成初始化循环。
             from .. import service as agent_service
+            from ..runtime_checkpoint import AgentRuntimeCheckpointManager, CHECKPOINT_STATUS_FAILED
 
             graph = agent_service._build_agent_graph(
                 generation_service=agent_service._resolve_generation_service(),
@@ -286,34 +345,81 @@ class AgentResumeRunManager:
                 background_work_coordinator=self.background_work_coordinator,
             )
             graph_config = agent_service._build_langgraph_config(str(continuation["thread_id"]))
+            # 把 continuation_id 注入运行时 config，供 execute 在 interrupt 前短接投影。
+            graph_config = dict(graph_config or {})
+            configurable = dict(graph_config.get("configurable") or {})
+            configurable["background_continuation_id"] = str(continuation["continuation_id"])
+            graph_config["configurable"] = configurable
+
             get_state = getattr(graph, "get_state", None)
             graph_state = get_state(graph_config) if callable(get_state) else None
             if not agent_service._has_resume_checkpoint(graph_state):
                 raise AgentWorkConflict("langgraph_checkpoint_missing")
 
             graph_invocation_started = True
-            final_state = agent_service._coerce_state(
-                graph.invoke(
-                    Command(
-                        resume={
-                            "decision": "background_completed",
-                            "continuation_id": continuation["continuation_id"],
-                            "validated_result": dict(validated_result),
-                        }
-                    ),
-                    config=graph_config,
-                )
+            raw_result = graph.invoke(
+                Command(
+                    resume={
+                        "decision": "background_completed",
+                        "continuation_id": continuation["continuation_id"],
+                        "validated_result": dict(validated_result),
+                    }
+                ),
+                config=graph_config,
             )
+            # 先检查原始返回值中的 interrupt，再 coerce；否则 __interrupt__ 会被状态模型丢弃。
+            final_state = agent_service._coerce_state(raw_result)
+            if not getattr(final_state, "user_id", None):
+                final_state.user_id = str(continuation.get("user_id") or "") or None
+            if not getattr(final_state, "session_id", None):
+                final_state.session_id = str(continuation.get("session_id") or "") or None
+            final_state_for_checkpoint = final_state
+
+            failure_reason = _background_resume_failure_reason(
+                raw_result=raw_result,
+                final_state=final_state,
+                continuation=continuation,
+            )
+            if failure_reason:
+                raise AgentWorkConflict(failure_reason)
+
             response = agent_service._state_to_response(final_state)
             self.storage.agent_work.complete_resume_run(
                 resume_run_id,
                 final_response=response.model_dump(mode="json"),
             )
+            # 成功后续跑必须收敛业务 checkpoint，避免 waiting_background_job 残影。
+            try:
+                checkpoint_manager = AgentRuntimeCheckpointManager(
+                    runtime_checkpoint_store=self.storage.agent_runtime_checkpoints
+                )
+                agent_service._persist_runtime_checkpoint_after_turn(
+                    checkpoint_manager,
+                    final_state,
+                    is_resume=True,
+                )
+            except Exception as checkpoint_exc:
+                logger.warning(
+                    "Failed to persist runtime checkpoint after successful resume: resume_run_id=%s error=%s",
+                    resume_run_id,
+                    checkpoint_exc,
+                )
         except Exception as exc:
+
             # graph.invoke 前的失败可安全标记 failed；一旦调用开始，就无法证明 checkpoint 是否已消费，
             # 必须进入 indeterminate 并禁止自动重放原问题。
-            status = "indeterminate" if graph_invocation_started else "failed"
-            error_code = "resume_execution_indeterminate" if graph_invocation_started else str(exc)
+            # 必须进入 indeterminate 并禁止自动重放原问题。
+            # 业务冲突（假完成/仍 interrupt）在 invoke 后也视为可诊断失败，error_code 保留具体原因。
+            conflict_code = str(exc) if isinstance(exc, AgentWorkConflict) else ""
+            if graph_invocation_started and not conflict_code:
+                status = "indeterminate"
+                error_code = "resume_execution_indeterminate"
+            elif graph_invocation_started and conflict_code:
+                status = "failed"
+                error_code = conflict_code
+            else:
+                status = "failed"
+                error_code = conflict_code or str(exc)
             logger.exception("Agent continuation resume failed: resume_run_id=%s", resume_run_id)
             self.storage.agent_work.fail_resume_run(
                 resume_run_id,
@@ -321,6 +427,40 @@ class AgentResumeRunManager:
                 error_code=error_code[:120],
                 error_message=str(exc),
             )
+            # 失败时也尽量收敛业务 checkpoint，避免 session 一直停在 waiting_background_job。
+            try:
+                from .. import service as agent_service
+                from ..runtime_checkpoint import AgentRuntimeCheckpointManager, CHECKPOINT_STATUS_FAILED
+
+                checkpoint_manager = AgentRuntimeCheckpointManager(
+                    runtime_checkpoint_store=self.storage.agent_runtime_checkpoints
+                )
+                if final_state_for_checkpoint is not None:
+                    if getattr(final_state_for_checkpoint, "runtime_state", None) is not None:
+                        final_state_for_checkpoint.runtime_state.failure_reason = error_code[:120]
+                        final_state_for_checkpoint.runtime_state.turn_status = "failed"
+                    if getattr(final_state_for_checkpoint, "plan_runtime", None) is not None:
+                        final_state_for_checkpoint.plan_runtime.error = error_code[:120]
+                        final_state_for_checkpoint.plan_runtime.turn_status = "failed"
+                    checkpoint_manager.mark_terminal(
+                        final_state_for_checkpoint,
+                        status=CHECKPOINT_STATUS_FAILED,
+                        error_summary=error_code[:120],
+                    )
+                else:
+                    run_meta = self.storage.agent_work.get_resume_run(resume_run_id) or {}
+                    agent_service._mark_runtime_checkpoint_failed(
+                        checkpoint_manager,
+                        user_id=str(run_meta.get("user_id") or ""),
+                        session_id=str(run_meta.get("session_id") or ""),
+                        detail=error_code[:120],
+                    )
+            except Exception as checkpoint_exc:
+                logger.warning(
+                    "Failed to persist runtime checkpoint after resume failure: resume_run_id=%s error=%s",
+                    resume_run_id,
+                    checkpoint_exc,
+                )
         finally:
             with self._lock:
                 self._threads.pop(resume_run_id, None)
