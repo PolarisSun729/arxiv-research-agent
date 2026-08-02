@@ -470,6 +470,51 @@ class AgentWorkStore(BaseSqliteStore):
             conn.commit()
         return self.get_continuation(continuation_id) or {}
 
+    def cancel_session_continuations(self, *, user_id: str, session_id: str) -> int:
+        """终止指定会话尚未开始恢复的 continuation，并保留任务历史用于审计。"""
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connection_provider.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT continuation_id, runtime_checkpoint_id, job_id, invocation_id
+                FROM agent_work_continuations
+                WHERE user_id = ? AND session_id = ?
+                  AND status IN ('submitting', 'waiting_job', 'ready_to_resume')
+                """,
+                (user_id, session_id),
+            ).fetchall()
+            for continuation_id, checkpoint_id, job_id, invocation_id in rows:
+                conn.execute(
+                    """
+                    UPDATE agent_work_continuations
+                    SET status = 'cancelled', terminal_at = ?, updated_at = ?
+                    WHERE continuation_id = ?
+                      AND status IN ('submitting', 'waiting_job', 'ready_to_resume')
+                    """,
+                    (now, now, continuation_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE agent_runtime_checkpoints
+                    SET status = 'cancelled', next_route = 'cancelled', interaction_json = '',
+                        expires_at = NULL, error_summary = '', updated_at = CURRENT_TIMESTAMP
+                    WHERE checkpoint_id = ?
+                      AND status IN ('waiting_interaction', 'waiting_background_job')
+                    """,
+                    (checkpoint_id,),
+                )
+                self._append_event(
+                    conn,
+                    event_type="continuation_cancelled",
+                    continuation_id=continuation_id,
+                    job_id=job_id,
+                    invocation_id=invocation_id,
+                    safe_metadata={"reason": "agent_session_cleared"},
+                )
+            conn.commit()
+        return len(rows)
+
     def expire_ready_continuation_if_needed(
         self,
         continuation_id: str,

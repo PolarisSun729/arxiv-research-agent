@@ -162,6 +162,12 @@ export async function listAgentWorkContinuations(sessionId?: string | null): Pro
   return Array.isArray(response?.items) ? response.items : []
 }
 
+export async function clearAgentSession(sessionId: string): Promise<void> {
+  await request.post(`/agent/sessions/${encodeURIComponent(sessionId)}/clear`, null, {
+    params: { user_id: getCurrentUserId() }
+  })
+}
+
 export async function getAgentWorkContinuation(
   continuationId: string,
   sessionId: string

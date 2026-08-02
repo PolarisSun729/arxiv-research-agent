@@ -2,6 +2,7 @@ import { reactive, ref, watch, type Ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
   cancelAgentWorkContinuation,
+  clearAgentSession,
   getAgentResumeRun,
   listAgentWorkContinuations,
   runAgentChat,
@@ -166,7 +167,9 @@ export function useAgentSearchChat() {
     inputMessage.value = value
   }
 
-  function clearConversation() {
+  async function clearConversation(options: { clearBackend?: boolean } = {}) {
+    const sessionIdToClear = activeSessionId.value
+    const sessionUserId = activeSessionUserId.value
     messages.value = []
     latestResponse.value = null
     lastSearchPapers.value = []
@@ -177,6 +180,16 @@ export function useAgentSearchChat() {
     activeSessionUserId.value = null
     interactionSubmitting.value = false
     inputMessage.value = ''
+    workContinuations.value = []
+    deliveredResumeRunIds.clear()
+
+    if (options.clearBackend === false || !sessionIdToClear || sessionUserId !== getUserId()) return
+    try {
+      // 新对话不继承旧 interaction 或后台恢复入口；历史任务仍由后端保留用于排障审计。
+      await clearAgentSession(sessionIdToClear)
+    } catch (error) {
+      ElMessage.error(getErrorMessage(error, '清空 Agent 对话失败'))
+    }
   }
 
   function replaceWorkContinuation(updated: AgentWorkContinuation) {
@@ -292,9 +305,19 @@ export function useAgentSearchChat() {
 
   async function refreshWorkContinuations(options: { allowAutoResume?: boolean } = {}) {
     if (continuationRefreshing.value) return
+    const sessionId = activeSessionId.value
+    if (!sessionId) {
+      // 页面首次进入代表一段新对话，没有当前 session 时禁止跨会话恢复旧任务。
+      workContinuations.value = []
+      return
+    }
     continuationRefreshing.value = true
     try {
-      const items = await listAgentWorkContinuations()
+      const items = await listAgentWorkContinuations(sessionId)
+      if (activeSessionId.value !== sessionId) {
+        // 清空对话期间旧轮询可能刚好返回；会话已切换时必须丢弃该响应，避免旧任务卡回流。
+        return
+      }
       workContinuations.value = items
 
       // resuming 或“已完成但尚未取回”的任务只查询同一个 run，页面刷新不会重放原问题。
@@ -303,8 +326,6 @@ export function useAgentSearchChat() {
         .map(item => recoverResumeRun(item)))
 
       if (options.allowAutoResume === false) return
-      const sessionId = activeSessionId.value
-      if (!sessionId) return
       const currentSessionItems = workContinuations.value.filter(item => item.session_id === sessionId)
       if (currentSessionItems.length !== 1) return
       const [onlyItem] = currentSessionItems
@@ -527,7 +548,8 @@ export function useAgentSearchChat() {
   }
 
   watch(() => getUserId(), () => {
-    clearConversation()
+    // 切换用户时当前 API actor 已经变化，只做本地清理，不能误删上一用户的后端会话。
+    void clearConversation({ clearBackend: false })
     // continuation 属于用户命名空间；切换用户后必须立即清空旧卡，再从新用户范围重新加载。
     workContinuations.value = []
     deliveredResumeRunIds.clear()

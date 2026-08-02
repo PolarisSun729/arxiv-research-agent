@@ -12,6 +12,9 @@ await build({
       import assert from 'node:assert/strict'
       import { nextTick, watchEffect } from 'vue'
       import {
+        getClearCalls,
+        getChatRequests,
+        getListCalls,
         getResumeCalls,
         releaseToolStream,
         resetContinuationStub,
@@ -57,6 +60,22 @@ await build({
       // 这个断言锁住前端真实症状：最终消息不仅数据变了，还必须触发响应式渲染更新。
       assert.equal(snapshots.at(-1), 'user:false:q|assistant:false:done')
 
+      chat.selectedPaper.value = { arxiv_id: '2401.00001', title: 'Visible paper' }
+      chat.setInputMessage('context')
+      await chat.submitMessage()
+      const contextRequest = getChatRequests().at(-1)
+      assert.deepEqual(contextRequest.context.frontend_visible_paper, {
+        arxiv_id: '2401.00001',
+        title: 'Visible paper'
+      })
+      assert.equal('selected_paper' in contextRequest.context, false)
+      assert.equal('arxiv_id' in contextRequest.context, false)
+
+      const resolvedChat = useAgentSearchChat()
+      resolvedChat.setInputMessage('resolved')
+      await resolvedChat.submitMessage()
+      assert.equal(resolvedChat.selectedPaper.value?.arxiv_id, '2401.00002')
+
       const progressChat = useAgentSearchChat()
       progressChat.setInputMessage('stream-progress')
       const pendingProgress = progressChat.submitMessage()
@@ -101,6 +120,7 @@ await build({
       await chat.refreshWorkContinuations({ allowAutoResume: false })
       // 任务卡只消费后端返回的真实里程碑，不在前端做插值或默认百分比。
       assert.equal(chat.workContinuations.value[0].job.progress, 45)
+      assert.deepEqual(getListCalls(), ['s1'])
 
       resetContinuationStub()
       setContinuations([{
@@ -156,14 +176,21 @@ await build({
           can_resume: false
         }])
         await pollingChat.startWorkContinuationPolling()
-        // 只有终态卡片时停止 2.5 秒轮询，避免失败记录保留期间永久请求。
+        // 新页面没有当前 session，不得跨会话加载或恢复任何历史任务。
         assert.equal(scheduledPolls, 0)
+        assert.equal(pollingChat.workContinuations.value.length, 0)
         pollingChat.stopWorkContinuationPolling()
 
+        pollingChat.setInputMessage('new-session')
+        await pollingChat.submitMessage()
         setContinuations([continuationsForTest('running')])
         await pollingChat.startWorkContinuationPolling()
         assert.equal(scheduledPolls, 1)
         pollingChat.stopWorkContinuationPolling()
+
+        await pollingChat.clearConversation()
+        assert.deepEqual(getClearCalls(), ['s1'])
+        assert.equal(pollingChat.workContinuations.value.length, 0)
       } finally {
         globalThis.setTimeout = originalSetTimeout
         globalThis.clearTimeout = originalClearTimeout
@@ -195,15 +222,22 @@ await build({
                 let releaseStream = null
                 let continuations = []
                 let resumeCalls = []
+                let clearCalls = []
+                let listCalls = []
+                let chatRequests = []
                 export function setContinuations(items) { continuations = items }
                 export function getResumeCalls() { return [...resumeCalls] }
-                export function resetContinuationStub() { continuations = []; resumeCalls = [] }
+                export function getClearCalls() { return [...clearCalls] }
+                export function getChatRequests() { return [...chatRequests] }
+                export function getListCalls() { return [...listCalls] }
+                export function resetContinuationStub() { continuations = []; resumeCalls = []; clearCalls = []; listCalls = []; chatRequests = [] }
                 export function releaseToolStream() {
                   releaseStream?.()
                   releaseStream = null
                 }
                 export async function runAgentChat() { throw new Error('sync fallback should not run') }
-                export async function listAgentWorkContinuations() { return continuations }
+                export async function listAgentWorkContinuations(sessionId) { listCalls.push(sessionId); return continuations }
+                export async function clearAgentSession(sessionId) { clearCalls.push(sessionId) }
                 export async function cancelAgentWorkContinuation() { throw new Error('not used') }
                 export async function getAgentResumeRun() { throw new Error('not used') }
                 export async function streamAgentWorkContinuationResume(continuationId, sessionId, handlers = {}) {
@@ -223,6 +257,7 @@ await build({
                   }
                 }
                 export async function streamAgentChat(request, handlers = {}) {
+                  chatRequests.push(request)
                   await Promise.resolve()
                   if (request.message === 'stream-progress') {
                     handlers.onEvent?.({
@@ -243,7 +278,19 @@ await build({
                     })
                     await new Promise(resolve => { releaseStream = resolve })
                   }
-                  const response = {
+                  const response = request.message === 'resolved' ? {
+                    session_id: 's-resolved',
+                    intent: 'paper_qa',
+                    answer: 'resolved answer',
+                    resolved_paper: { arxiv_id: '2401.00002', title: 'Resolved paper' },
+                    papers: [],
+                    plan: [],
+                    tool_calls: [],
+                    warnings: [],
+                    next_actions: [],
+                    steps: [],
+                    debug: {}
+                  } : {
                     session_id: 's1',
                     intent: 'arxiv_search',
                     answer: 'done',

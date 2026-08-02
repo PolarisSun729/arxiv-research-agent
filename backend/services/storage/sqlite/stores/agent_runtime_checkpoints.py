@@ -177,6 +177,34 @@ class AgentRuntimeCheckpointStore(BaseSqliteStore):
             conn.commit()
             return updated > 0
 
+    def cancel_agent_runtime_checkpoints_for_session(
+        self,
+        *,
+        user_id: str = DEFAULT_USER_ID,
+        session_id: str,
+    ) -> int:
+        """清空对话时终止未完成 checkpoint，防止旧 interaction 在新对话中再次恢复。"""
+        normalized_user = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+        with self._get_connection() as conn:
+            updated = conn.execute(
+                """
+                UPDATE agent_runtime_checkpoints
+                SET status = 'cancelled', next_route = 'cancelled', interaction_json = '',
+                    expires_at = NULL, error_summary = '', updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ? AND session_id = ?
+                  AND status IN ('running', 'waiting_interaction', 'waiting_background_job')
+                  AND checkpoint_id NOT IN (
+                      SELECT runtime_checkpoint_id
+                      FROM agent_work_continuations
+                      WHERE user_id = ? AND session_id = ? AND status = 'resuming'
+                  )
+                """,
+                (normalized_user, session_id, normalized_user, session_id),
+            ).rowcount
+            # 已经进入 resuming 的执行不能安全中断；它保留原历史归属，但不会注入新的会话。
+            conn.commit()
+            return int(updated or 0)
+
     def expire_agent_runtime_checkpoints(self, *, now: Optional[str] = None) -> int:
         now = now or datetime.now(timezone.utc).isoformat()
         with self._get_connection() as conn:

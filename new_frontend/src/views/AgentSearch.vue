@@ -46,7 +46,7 @@ const quickPrompts = [
 
 onMounted(async () => {
   void store.fetchResearchProfile()
-  // 后台任务独立于聊天气泡，进入页面时恢复所有可见 continuation 并启动持久轮询。
+  // 新页面从空会话开始；只有当前页面产生 session 后，才查询该会话自己的后台任务。
   await startWorkContinuationPolling()
 })
 
@@ -59,7 +59,7 @@ function handlePromptSelect(prompt: string) {
 }
 
 function handleClear() {
-  clearConversation()
+  void clearConversation()
 }
 
 function selectedInteractionCandidate(candidateId?: string) {

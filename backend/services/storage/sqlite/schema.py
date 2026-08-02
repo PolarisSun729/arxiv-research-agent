@@ -283,6 +283,10 @@ class StorageSchemaMigrator:
                 )
             ''')
 
+            # 旧版数据库可能已经存在 paper_index_jobs，但缺少 lease/attempt 等新列；
+            # 创建依赖这些列的索引前先原位补齐，避免启动迁移在索引阶段中断。
+            self._ensure_paper_index_job_columns(conn)
+
             cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS paper_chat_sessions (
                     session_id TEXT PRIMARY KEY,
@@ -817,7 +821,6 @@ class StorageSchemaMigrator:
             self._ensure_paper_qa_index_columns(conn)
             self._ensure_paper_qa_index_version_columns(conn)
             self._ensure_paper_qa_index_version_rows(conn)
-            self._ensure_paper_index_job_columns(conn)
             self._ensure_paper_chat_session_summary_columns(conn)
             self._ensure_agent_runtime_checkpoint_v2_columns(conn)
 

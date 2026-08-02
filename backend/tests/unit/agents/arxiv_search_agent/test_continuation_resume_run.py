@@ -94,3 +94,65 @@ def test_missing_langgraph_checkpoint_fails_resume_without_replaying_original_qu
     assert "langgraph_checkpoint_missing" in run["error_code"]
     assert invoked == []
     assert storage.agent_work.get_continuation("continuation-1")["status"] == "failed"
+
+
+def test_resume_run_fails_when_graph_returns_interrupt_without_answer(tmp_path, monkeypatch) -> None:
+    """假完成防护：invoke 后仍 interrupt / 空答时不得 complete_resume_run。"""
+    storage = build_storage_container(db_path=str(tmp_path / "false-complete.sqlite"))
+    _prepare_ready_continuation(storage)
+    invoked = []
+
+    class _GraphReinterrupt:
+        def get_state(self, _config):
+            return {"values": {"intent": "paper_qa"}, "next": ("execute_step",)}
+
+        def invoke(self, command, config=None):
+            invoked.append(
+                {
+                    "decision": getattr(command, "resume", None) if not isinstance(command, dict) else command,
+                    "continuation_id": ((config or {}).get("configurable") or {}).get("background_continuation_id"),
+                }
+            )
+            # 模拟线上故障：resume 后又停在新的确认 interrupt，且没有答案。
+            return {
+                "__interrupt__": (
+                    {
+                        "value": {
+                            "interaction_id": "new-interaction",
+                            "kind": "side_effect_approval",
+                            "step_id": "index-step",
+                        }
+                    },
+                ),
+                "user_id": "user-1",
+                "session_id": "session-1",
+                "intent": "paper_qa",
+                "answer": "",
+                "paper_qa_result": None,
+            }
+
+    from backend.agents.arxiv_search_agent import service as runtime_service_module
+
+    monkeypatch.setattr(runtime_service_module, "_build_agent_graph", lambda **_kwargs: _GraphReinterrupt())
+    monkeypatch.setattr(runtime_service_module, "_resolve_generation_service", lambda: object())
+    manager = AgentResumeRunManager(storage=storage, background_work_coordinator=object())
+
+    claimed = manager.claim_and_start(
+        "continuation-1",
+        user_id="user-1",
+        session_id="session-1",
+    )
+    deadline = time.monotonic() + 3
+    run = storage.agent_work.get_resume_run(claimed["resume_run_id"])
+    while run and run["status"] in {"pending", "running"} and time.monotonic() < deadline:
+        time.sleep(0.01)
+        run = storage.agent_work.get_resume_run(claimed["resume_run_id"])
+
+    assert run is not None
+    assert run["status"] == "failed"
+    assert "background_resume_reinterrupted" in str(run.get("error_code") or "")
+    assert run.get("final_response_json") in (None, "", {})
+    assert invoked and invoked[0]["continuation_id"] == "continuation-1"
+    # 不得被标成 completed 空答
+    cont = storage.agent_work.get_continuation("continuation-1")
+    assert cont["status"] != "resumed"
