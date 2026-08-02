@@ -738,6 +738,8 @@ async def qa_paper(arxiv_id: str, payload: QaRequest, paper_qa_service=Depends(g
             exc.recoverable,
             exc.detail,
         )
+
+
         return error_response(exc)
     except HTTPException:
         raise
@@ -750,6 +752,32 @@ async def qa_paper(arxiv_id: str, payload: QaRequest, paper_qa_service=Depends(g
                 context={"arxiv_id": arxiv_id, "user_id": payload.user_id, "session_id": payload.session_id, "stage": "qa_paper"},
             )
         )
+
+
+@router.get("/evidence-assets/{source_id}")
+async def get_evidence_asset(
+    arxiv_id: str,
+    source_id: str,
+    paper_qa_service=Depends(get_paper_qa_service),
+):
+    """按论文和稳定 source_id 返回图片，不允许客户端传入任意服务器路径。"""
+    try:
+        asset_path = paper_qa_service.resolve_evidence_asset_path(arxiv_id, source_id)
+        suffix = Path(asset_path).suffix.lower()
+        media_type = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+        }.get(suffix, "application/octet-stream")
+        return FileResponse(asset_path, media_type=media_type)
+    except FileNotFoundError:
+        # 对外统一返回 404，避免泄漏索引路径、资产路径或论文是否存在的内部细节。
+        raise HTTPException(status_code=404, detail="evidence asset not found")
+    except Exception as exc:
+        logger.warning("Evidence asset lookup failed: arxiv_id=%s source_id=%s error=%s", arxiv_id, source_id, exc)
+        raise HTTPException(status_code=404, detail="evidence asset not found")
 
 
 @router.post("/qa/stream")
@@ -804,15 +832,17 @@ async def qa_paper_stream(
                     "used_short_term_memory": bool(question_contextualization.get("used_short_term_memory", False)),
                     "question_contextualization": question_contextualization,
                     "sources": source_payload,
-                    "image_inputs": qa_context["image_inputs"],
-                    "asset_metadata": qa_context["asset_metadata"],
                     "qa_observation": qa_observation,
                     "retrieval_debug": retrieval_debug,
                 },
             )
 
             for chunk in generation_service.stream_qwen_responses(
-                query=contextualized_question,
+                query=(
+                    f"{contextualized_question}\n\n"
+                    "引用格式要求：每个证据引用必须单独写成 [source:{source_id}]；禁止把多个引用合并在一对方括号内，"
+                    "禁止裸 source:number/source-*、[Source 1]、[Image 1] 和其他数字引用。"
+                ),
                 context=qa_context["text_context"],
                 # 纸面 QA 的最终答案属于高质量生成任务，明确走大模型。
                 task_type="paper_qa_final_answer",
@@ -825,6 +855,25 @@ async def qa_paper_stream(
                     yield sse_event("delta", {"delta": chunk.get("delta", "")})
                 elif chunk.get("type") == "completed":
                     final_answer = chunk.get("answer", "") or ""
+                    answer_generator = getattr(paper_qa_service, "answer_generator", None)
+                    if answer_generator is not None and hasattr(answer_generator, "validate_and_repair_stream_answer"):
+                        citation_result = answer_generator.validate_and_repair_stream_answer(
+                            answer=final_answer,
+                            generation_question=contextualized_question,
+                            context_pack=qa_context.get("context_pack") or {},
+                        )
+                    else:
+                        # 仅用于旧测试替身或降级服务；真实 PaperQAService 始终走严格引用校验。
+                        citation_result = {
+                            "answer": final_answer,
+                            "cited_source_ids": [],
+                            "citation_debug": None,
+                            "citation_warning": None,
+                        }
+                    final_answer = citation_result["answer"]
+                    cited_source_ids = citation_result["cited_source_ids"]
+                    citation_debug = citation_result["citation_debug"]
+                    citation_warning = citation_result["citation_warning"]
                     verification_debug = {}
                     verifier = getattr(paper_qa_service, "evidence_verifier", None)
                     if verifier is not None:
@@ -832,7 +881,7 @@ async def qa_paper_stream(
                         verification_debug = verifier.verify(
                             answer=final_answer,
                             sources=source_payload,
-                            cited_source_ids=[],
+                            cited_source_ids=cited_source_ids,
                             claims=[],
                             generation_insufficient_evidence=False,
                         )
@@ -870,8 +919,9 @@ async def qa_paper_stream(
                             "used_short_term_memory": bool(question_contextualization.get("used_short_term_memory", False)),
                             "question_contextualization": question_contextualization,
                             "sources": source_payload,
-                            "image_inputs": qa_context["image_inputs"],
-                            "asset_metadata": qa_context["asset_metadata"],
+                            "cited_source_ids": cited_source_ids,
+                            "citation_debug": citation_debug,
+                            "citation_warning": citation_warning,
                             "verification_debug": verification_debug,
                             "qa_observation": qa_observation,
                             "retrieval_debug": retrieval_debug,
@@ -910,8 +960,6 @@ async def qa_paper_stream(
                     "used_short_term_memory": bool(question_contextualization.get("used_short_term_memory", False)),
                     "question_contextualization": question_contextualization,
                     "sources": source_payload,
-                    "image_inputs": qa_context["image_inputs"],
-                    "asset_metadata": qa_context["asset_metadata"],
                     "verification_debug": verification_debug,
                     "qa_observation": qa_observation,
                     "retrieval_debug": retrieval_debug,

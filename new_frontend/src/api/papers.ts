@@ -830,6 +830,9 @@ export interface QaResult {
   used_short_term_memory?: boolean
   question_contextualization?: Record<string, any> | null
   answer: string
+  cited_source_ids?: string[]
+  citation_debug?: Record<string, any> | null
+  citation_warning?: string | null
   partial?: boolean
   completed_at?: string | null
   interrupted_reason?: string | null
@@ -837,6 +840,7 @@ export interface QaResult {
   retrieval_debug?: RetrievalDebug | null
   qa_observation?: QaObservation | null
   sources: Array<{
+    source_id: string
     content: string
     page_number: string
     source?: string
@@ -853,6 +857,7 @@ export interface QaResult {
     final_context_reason?: string
     asset_summary?: string
     asset_preview_text?: string
+    asset_url?: string
   }>
 }
 
@@ -874,6 +879,7 @@ export interface PaperChatMessage {
   role: 'user' | 'assistant'
   content: string
   sources: Array<{
+    source_id?: string | number
     content?: string
     page_number?: string
     source?: string
@@ -889,10 +895,13 @@ export interface PaperChatMessage {
     final_context_reason?: string
     asset_summary?: string
     asset_preview_text?: string
+    asset_url?: string
   }>
   retrieval_debug_snapshot?: RetrievalDebug | null
   contextualized_question?: string
   question_contextualization?: Record<string, any> | null
+  cited_source_ids?: string[]
+  citation_warning?: string | null
   status?: string
   created_at: string
 }
@@ -1225,6 +1234,7 @@ export async function deletePaperChatSession(
 }
 
 type QaStreamSource = {
+  source_id: string
   content: string
   page_number: string
   source?: string
@@ -1233,6 +1243,7 @@ type QaStreamSource = {
   chunk_type?: string
   asset_summary?: string
   asset_preview_text?: string
+  asset_url?: string
 }
 
 type QaStreamMetaPayload = {
@@ -1248,6 +1259,9 @@ type QaStreamMetaPayload = {
   sources: QaStreamSource[]
   retrieval_debug?: RetrievalDebug | null
   qa_observation?: QaObservation | null
+  cited_source_ids?: string[]
+  citation_debug?: Record<string, any> | null
+  citation_warning?: string | null
 }
 
 type QaStreamDonePayload = QaStreamMetaPayload & {
@@ -1336,6 +1350,8 @@ function applyQaStreamPayload(
     contextualizedQuestion: string
     usedShortTermMemory: boolean
     questionContextualization: Record<string, any> | null
+    citedSourceIds: string[]
+    citationWarning: string | null
   }
 ) {
   if (Array.isArray(payload.sources)) {
@@ -1364,6 +1380,12 @@ function applyQaStreamPayload(
   }
   if (payload.question_contextualization) {
     target.questionContextualization = payload.question_contextualization
+  }
+  if (Array.isArray(payload.cited_source_ids)) {
+    target.citedSourceIds = payload.cited_source_ids.map(value => String(value))
+  }
+  if (typeof payload.citation_warning === 'string') {
+    target.citationWarning = payload.citation_warning
   }
 }
 
@@ -1415,7 +1437,9 @@ export async function qaPaperStream(
     originalQuestion: question,
     contextualizedQuestion: question,
     usedShortTermMemory: false,
-    questionContextualization: null as Record<string, any> | null
+    questionContextualization: null as Record<string, any> | null,
+    citedSourceIds: [] as string[],
+    citationWarning: null as string | null
   }
 
   const buildResult = (payload: QaStreamDonePayload): QaResult => {
@@ -1441,6 +1465,8 @@ export async function qaPaperStream(
       interrupted_reason: interruptedReason,
       persistence_status: persistenceStatus,
       sources: finalState.sources,
+      cited_source_ids: finalState.citedSourceIds,
+      citation_warning: finalState.citationWarning,
       qa_observation: finalState.qaObservation,
       retrieval_debug: finalState.retrievalDebug
     }

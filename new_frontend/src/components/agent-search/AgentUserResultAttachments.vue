@@ -16,6 +16,7 @@ const emit = defineEmits<{
   (event: 'label', paper: Paper, label: 'liked' | 'disliked' | null): void
   (event: 'confirm-interaction', candidateId?: string): void
   (event: 'cancel-interaction'): void
+  (event: 'view-evidence'): void
 }>()
 
 const selectedCandidateId = ref('')
@@ -91,6 +92,14 @@ function getInteractionSubmittingText() {
       :role="result.preferenceFeedback.status === 'failed' ? 'alert' : 'status'"
     >
       {{ result.preferenceFeedback.message }}
+    </section>
+
+    <section v-if="result.evidenceSources.length" class="agent-user-evidence">
+      <div class="agent-user-evidence__copy">
+        <strong>回答证据已就绪</strong>
+        <span>{{ result.evidenceSources.length }} 条来源{{ result.citationWarning ? ` · ${result.citationWarning}` : '' }}</span>
+      </div>
+      <el-button size="small" type="primary" plain @click="emit('view-evidence')">查看证据</el-button>
     </section>
 
     <section v-if="interaction" class="agent-user-confirmation">
@@ -230,6 +239,30 @@ function getInteractionSubmittingText() {
   gap: 12px;
   padding: 14px;
   background: #f8fafc;
+}
+
+.agent-user-evidence {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid rgba(37, 99, 235, 0.16);
+  border-radius: 12px;
+  background: rgba(239, 246, 255, 0.72);
+}
+
+.agent-user-evidence__copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: #1e3a8a;
+  font-size: 13px;
+}
+
+.agent-user-evidence__copy span {
+  color: #64748b;
+  font-size: 12px;
 }
 
 .agent-user-confirmation__status {

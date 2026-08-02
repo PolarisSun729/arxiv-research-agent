@@ -21,6 +21,7 @@ from langgraph.types import Command
 from core.errors import ErrorCode, make_error_payload
 from services.context_lifecycle import ContextLifecycleService
 from services.memory import MemoryService
+from services.paper_qa.citation_boundary import sanitize_agent_response_citations
 from services.storage.sqlite import StorageContainer
 from services.storage.sqlite.stores import AgentRuntimeCheckpointStore, LangGraphCheckpointStore
 from utils.config import get_memory_runtime_config
@@ -1483,13 +1484,19 @@ def _state_to_response(state: Any) -> ArxivSearchResponse:
         # 让前端调试面板不再误判为“没有发生工具调用”。
         tool_calls = _tool_calls_from_runtime(final_state)
 
+    # Agent 只有一个统一出站口；在这里做确定性清洗，避免其他路径把旧/混合引用直接返回前端。
+    citation_boundary = sanitize_agent_response_citations(
+        answer=final_state.answer or "",
+        paper_qa_result=final_state.paper_qa_result,
+    )
+
     return ArxivSearchResponse(
         session_id=final_state.session_id,
         intent=final_state.intent or "unsupported",
         intent_source=final_state.intent_source,
         fallback_reason=final_state.fallback_reason,
         llm_confidence=final_state.llm_confidence,
-        answer=final_state.answer or "",
+        answer=citation_boundary["answer"],
         search_spec=final_state.search_spec,
         goal=final_state.goal,
         research_task_profile=final_state.research_task_profile,
@@ -1497,7 +1504,10 @@ def _state_to_response(state: Any) -> ArxivSearchResponse:
         plan_runtime=final_state.plan_runtime,
         runtime_state=final_state.runtime_state,
         interaction=final_state.interaction,
-        paper_qa_result=final_state.paper_qa_result,
+        paper_qa_result=citation_boundary["paper_qa_result"],
+        cited_source_ids=citation_boundary["cited_source_ids"],
+        citation_debug=citation_boundary["citation_debug"],
+        citation_warning=citation_boundary["citation_warning"],
         resolved_paper=final_state.resolved_paper,
         preference_action_result=final_state.preference_action_result,
         plan=list(final_state.plan or []),

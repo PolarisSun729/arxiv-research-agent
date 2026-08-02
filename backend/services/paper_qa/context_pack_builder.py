@@ -284,7 +284,8 @@ class ContextPackBuilder:
 
         if not content:
             return ""
-        header_parts = [f"[Source {index}]", f"source_id: {source_id}"]
+        # 文本证据也使用稳定 ID 描述，避免把旧的序号标签暴露给模型后被误复制成不可定位引用。
+        header_parts = ["Evidence", f"source_id: {source_id}"]
         if page_number:
             header_parts.append(f"page: {page_number}")
         if section_path:

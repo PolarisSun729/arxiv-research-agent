@@ -3,8 +3,6 @@ import dollarmathPlugin from 'markdown-it-dollarmath'
 import { renderToString } from 'katex'
 import 'katex/dist/katex.min.css'
 
-// Centralize Markdown and LaTeX rendering so the chat UI can change without
-// duplicating formatting rules across pages and components.
 const markdownRenderer = new MarkdownIt({
   html: false,
   linkify: true,
@@ -28,5 +26,9 @@ export function renderMarkdownWithLatex(text: string, emptyText = '\u56de\u7b54\
   if (!content) {
     return `<p class="md-empty">${emptyText}</p>`
   }
-  return markdownRenderer.render(content)
+  // 稳定引用转成可点击链接，聊天面板再通过事件代理定位对应证据。
+  const withEvidenceLinks = content.replace(/\[source:([^\]\s]+)\]/g, (_match, sourceId: string) => {
+    return `[source:${sourceId}](#evidence-source-${encodeURIComponent(sourceId)})`
+  })
+  return markdownRenderer.render(withEvidenceLinks)
 }

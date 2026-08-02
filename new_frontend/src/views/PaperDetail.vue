@@ -43,6 +43,7 @@ const qaStatus = ref<QaStatusResult | null>(null)
 const qaDiagnostic = ref<QaDiagnosticResult | null>(null)
 const traceDownloading = ref(false)
 const isNarrowScreen = ref(false)
+const highlightedEvidenceSourceId = ref<string | null>(null)
 
 const modelBadge = 'Qwen 3.6 Plus'
 
@@ -220,6 +221,15 @@ function handlePanelOpenEvidence(turnId: string) {
   const turn = chatTurns.value.find(item => item.id === turnId)
   if (!turn) return
   activeEvidenceTurn.value = turn
+  highlightedEvidenceSourceId.value = null
+  evidenceDrawerOpen.value = isNarrowScreen.value
+}
+
+function handleCitationSelect(item: any, sourceId: string) {
+  const turn = item?.response && typeof item.response === 'object' ? item.response : null
+  if (!turn) return
+  activeEvidenceTurn.value = turn
+  highlightedEvidenceSourceId.value = sourceId
   evidenceDrawerOpen.value = isNarrowScreen.value
 }
 
@@ -666,6 +676,7 @@ watch(activeNoteTypeFilter, async () => {
               @submit-question="submitQuestion"
               @select-prompt="applyPrompt"
               @stop-generation="handleStopGeneration"
+              @select-source="handleCitationSelect"
             >
               <template #message-footer="{ item }">
                 <div v-if="item.role === 'assistant' && getTurnStatusHint(item)" class="turn-status-hint">
@@ -728,9 +739,13 @@ watch(activeNoteTypeFilter, async () => {
               <RagEvidencePanel
                 :question="activeEvidenceTurn?.question"
                 :sources="activeEvidenceTurn?.sources || []"
+                :cited-source-ids="activeEvidenceTurn?.citedSourceIds || []"
+                :citation-warning="activeEvidenceTurn?.citationWarning"
+                :highlighted-source-id="highlightedEvidenceSourceId"
                 :retrieval-debug="activeEvidenceTurn?.retrievalDebug || null"
                 :trace-downloading="traceDownloading"
                 @download-trace="downloadRetrievalTrace"
+                @select-source="highlightedEvidenceSourceId = $event"
               />
             </div>
 
@@ -888,11 +903,15 @@ watch(activeNoteTypeFilter, async () => {
             <RagEvidencePanel
               :question="activeEvidenceTurn?.question"
               :sources="activeEvidenceTurn?.sources || []"
+              :cited-source-ids="activeEvidenceTurn?.citedSourceIds || []"
+              :citation-warning="activeEvidenceTurn?.citationWarning"
+              :highlighted-source-id="highlightedEvidenceSourceId"
               :retrieval-debug="activeEvidenceTurn?.retrievalDebug || null"
               :trace-downloading="traceDownloading"
               :show-close="true"
               @download-trace="downloadRetrievalTrace"
               @close="closeEvidence"
+              @select-source="highlightedEvidenceSourceId = $event"
             />
           </div>
         </el-drawer>

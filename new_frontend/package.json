@@ -9,7 +9,8 @@
     "test:qa-stream": "node tests/qaPaperStream.test.mjs",
     "test:user-context": "node tests/userContext.test.mjs",
     "test:agent-chat": "node tests/agentSearchChat.test.mjs",
-    "test": "npm run test:errors && npm run test:user-context && npm run test:qa-stream && npm run test:agent-chat",
+    "test:evidence": "node tests/evidenceCitation.test.mjs",
+    "test": "npm run test:errors && npm run test:user-context && npm run test:qa-stream && npm run test:agent-chat && npm run test:evidence",
     "preview": "vite preview"
   },
   "dependencies": {

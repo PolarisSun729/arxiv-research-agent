@@ -159,6 +159,9 @@ class PaperQAAnswerOutput(BaseModel):
     status: str = "failed"
     answer: str = ""
     sources: List[Dict[str, Any]] = Field(default_factory=list)
+    cited_source_ids: List[str] = Field(default_factory=list)
+    citation_debug: Any = None
+    citation_warning: Optional[str] = None
     retrieval_debug: Any = None
     qa_observation: Any = None
     error: Any = None
@@ -424,6 +427,9 @@ class AnswerPaperQuestionAdapter(BaseToolAdapter[AnswerPaperQuestionInput, Paper
         tool_data = dict((tool_result or {}).get("data") or {})
         tool_data.setdefault("status", "success" if bool((tool_result or {}).get("ok", False)) and str(tool_data.get("answer") or "").strip() else "failed")
         tool_data.setdefault("sources", [])
+        tool_data.setdefault("cited_source_ids", [])
+        tool_data.setdefault("citation_debug", None)
+        tool_data.setdefault("citation_warning", None)
         tool_data.setdefault("retrieval_debug", None)
         tool_data.setdefault("qa_observation", None)
         if not bool((tool_result or {}).get("ok", False)):

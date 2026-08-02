@@ -17,6 +17,7 @@ from services.llm.generation_service import GenerationService
 from services.document.loading_service import LoadingService
 from services.paper_qa.answer_generator import AnswerGenerator
 from services.paper_qa.context_pack_builder import ContextPackBuilder
+from services.paper_qa.evidence_contract import build_public_source_payload, resolve_evidence_asset_path
 from services.paper_qa.evidence_verifier import EvidenceVerifier
 from services.paper_qa.paper_qa_index_builder import PaperQAIndexBuilder
 from services.paper_qa.qa_observation import build_error_qa_observation, build_qa_observation
@@ -277,7 +278,30 @@ class PaperQAService:
     def build_source_payload(self, search_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """把检索结果整理成统一的来源载荷，供前端展示与会话持久化复用。"""
         # source_id 与资产字段由 ContextPackBuilder 统一分配，避免会话记忆和前端证据不一致。
-        return self.context_pack_builder.build_source_payload(search_results)
+        return self._build_public_source_payload(search_results)
+
+    @staticmethod
+    def _build_public_source_payload(
+        search_results: List[Dict[str, Any]],
+        *,
+        arxiv_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        """生成前端可持久化的证据契约，并隔离本地文件路径。
+
+        检索和多模态生成仍然需要内部绝对路径，但路径不能进入 API、会话历史或
+        Agent 输出；图片只能通过受控的 ``asset_url`` 回放，避免把服务器文件系统
+        暴露给浏览器。
+        """
+        return build_public_source_payload(search_results, arxiv_id=arxiv_id)
+
+    def resolve_evidence_asset_path(self, arxiv_id: str, source_id: str) -> str:
+        """根据论文索引反查图片路径，不接受客户端提交的任意文件路径。"""
+        return resolve_evidence_asset_path(
+            arxiv_id=arxiv_id,
+            source_id=source_id,
+            paper_qa_index_store=self.paper_qa_index_store,
+            enhanced_retrieval_service=self.enhanced_retrieval_service,
+        )
 
     def build_qa_context(self, arxiv_id: str, payload: Any, *, run_id: Optional[str] = None):
         qa_index = self.paper_qa_index_store.get_paper_qa_index(arxiv_id)
@@ -472,6 +496,9 @@ class PaperQAService:
             trace_path=(retrieval_result.get("trace_export") or {}).get("json") if isinstance(retrieval_result.get("trace_export"), dict) else None,
         )
         context_pack = self.context_pack_builder.build(search_results)
+        # 统一把 source_payload 替换成无本地路径的公开契约；内部 image_inputs/asset_metadata
+        # 仍保留给生成器使用，但不会通过 API 或会话持久化泄漏出去。
+        context_pack["source_payload"] = self._build_public_source_payload(search_results, arxiv_id=arxiv_id)
         retrieval_debug["original_question"] = question
         retrieval_debug["contextualized_question"] = retrieval_question
         retrieval_debug["question_contextualization"] = question_contextualization
@@ -722,9 +749,10 @@ class PaperQAService:
             "question_contextualization": question_contextualization,
             "answer": verified_answer,
             "sources": source_payload,
-            "image_inputs": qa_context["image_inputs"],
-            "asset_metadata": qa_context["asset_metadata"],
             "generation_debug": generation_result.get("generation_debug", {}),
+            "cited_source_ids": generation_result.get("cited_source_ids", []),
+            "citation_debug": generation_result.get("citation_debug"),
+            "citation_warning": generation_result.get("citation_warning"),
             "verification_debug": verification_result,
             "qa_observation": qa_observation,
             "retrieval_debug": retrieval_debug,
