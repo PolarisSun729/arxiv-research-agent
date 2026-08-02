@@ -13,6 +13,7 @@ import torch
 from openai import OpenAI
 import requests
 from services.intent.intent_service import EXPERIMENT_INTENTS, MAIN_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
+from services.paper_qa.answer_language import CHINESE_FINAL_ANSWER_INSTRUCTION
 from utils.model_utils import get_huggingface_model_path
 from utils.config import GENERATION_CONFIG
 from utils.storage_paths import resolve_backend_artifact_path
@@ -1064,12 +1065,14 @@ Answer:"""
         return normalized[:limit].rstrip()
 
     def _build_qwen_prompt(self, query: str, context: str) -> str:
+        # 这是所有 Paper QA Qwen 请求的底层提示入口，必须在这里再次声明中文要求，避免业务层提示被英文证据稀释。
         return (
-            "You are a strict academic QA assistant. Answer only from the provided context.\n"
-            "If the context is insufficient, say you cannot determine it.\n\n"
-            f"Context:\n{context}\n\n"
-            f"Question: {query}\n\n"
-            "Answer:"
+            "你是严格的学术问答助手，只能根据提供的文本证据回答。\n"
+            "如果证据不足，请明确说明无法确定，不要编造结论。\n"
+            f"{CHINESE_FINAL_ANSWER_INSTRUCTION}\n\n"
+            f"证据上下文：\n{context}\n\n"
+            f"问题：{query}\n\n"
+            "请直接用中文回答："
         )
 
     def _build_qwen_input(
@@ -1109,16 +1112,19 @@ Answer:"""
 
         evidence_lines = []
         for index, item in enumerate(asset_metadata, start=1):
+            source_id = str(item.get("source_id") or f"image-{index}").strip()
             evidence_lines.append(
-                f"[Image {index}] page={item.get('page_number', '')} summary={item.get('asset_summary', '')} section={item.get('section_path', '')}"
+                f"[source:{source_id}] page={item.get('page_number', '')} summary={item.get('asset_summary', '')} section={item.get('section_path', '')}"
             )
 
         intro_text = (
-            "You are a strict academic QA assistant. Answer only from the provided context and image evidence.\n"
-            "If the context is insufficient, say you cannot determine it.\n\n"
-            f"Text Context:\n{context}\n\n"
-            f"Image Evidence Notes:\n{chr(10).join(evidence_lines) if evidence_lines else 'None'}\n\n"
-            f"Question: {query}"
+            "你是严格的学术问答助手，只能根据提供的文本和图片证据回答。\n"
+            "如果证据不足，请明确说明无法确定，不要编造结论。\n"
+            f"{CHINESE_FINAL_ANSWER_INSTRUCTION}\n\n"
+            f"文本证据：\n{context}\n\n"
+            f"图片证据说明：\n{chr(10).join(evidence_lines) if evidence_lines else '无'}\n\n"
+            f"问题：{query}\n\n"
+            "请直接用中文回答："
         )
         content = [{"type": "input_text", "text": intro_text}]
         image_parts, image_debug = self._prepare_qwen_image_content_parts(
@@ -1387,10 +1393,15 @@ Answer:"""
         """
         try:
             # 准备上下文
-            context = "\n\n".join([
-                f"[Source {i+1}]: {result['text']}"
+            # 生成上下文也使用稳定 source_id，避免模型从旧的 Source 序号提示中复制不可定位引用。
+            context = "\n\n".join(
+                (
+                    f"[source:{result.get('source_id')}]: {result.get('text', '')}"
+                    if str(result.get("source_id") or "").strip()
+                    else f"Evidence {i + 1}: {result.get('text', '')}"
+                )
                 for i, result in enumerate(search_results)
-            ])
+            )
 
             model_selection: Dict[str, str] = {
                 "task_type": self._normalize_task_type(task_type) or "default",

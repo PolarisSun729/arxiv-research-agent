@@ -38,6 +38,7 @@ from dependencies import (
 from core.errors import AppError, ErrorCode, error_response
 from routers.qa_utils import build_qa_diagnostic, get_latest_retrieval_trace, sanitize_trace_slug
 from services.paper_qa.qa_observation import build_error_qa_observation, build_qa_observation
+from services.paper_qa.answer_language import CHINESE_FINAL_ANSWER_INSTRUCTION
 from utils.config import get_default_user_id, get_qa_index_job_runtime_config
 
 logger = logging.getLogger(__name__)
@@ -840,6 +841,7 @@ async def qa_paper_stream(
             for chunk in generation_service.stream_qwen_responses(
                 query=(
                     f"{contextualized_question}\n\n"
+                    f"{CHINESE_FINAL_ANSWER_INSTRUCTION}\n"
                     "引用格式要求：每个证据引用必须单独写成 [source:{source_id}]；禁止把多个引用合并在一对方括号内，"
                     "禁止裸 source:number/source-*、[Source 1]、[Image 1] 和其他数字引用。"
                 ),

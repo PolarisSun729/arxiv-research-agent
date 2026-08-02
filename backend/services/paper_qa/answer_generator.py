@@ -9,6 +9,7 @@ from services.paper_qa.citation_contract import (
     strip_invalid_citations as strip_invalid_citations_contract,
     validate_citations as validate_citations_contract,
 )
+from services.paper_qa.answer_language import CHINESE_FINAL_ANSWER_INSTRUCTION
 from services.prompt_context import PromptContextBuilder
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,7 @@ class AnswerGenerator:
             task_type="paper_qa_final_answer",
             query=(
                 f"{generation_question}\n\n"
+                f"{CHINESE_FINAL_ANSWER_INSTRUCTION}\n"
                 "引用格式要求：每个证据引用必须单独写成 [source:{source_id}]；禁止把多个引用合并在一对方括号内，"
                 "禁止裸 source:number/source-*、[Source 1]、[Image 1] 和其他数字引用。"
             ),
@@ -77,6 +79,7 @@ class AnswerGenerator:
             # 引用格式是前端定位证据的协议；只允许一次修复，避免坏模型输出触发无限重试。
             repair_query = (
                 f"{generation_question}\n\n"
+                f"{CHINESE_FINAL_ANSWER_INSTRUCTION}\n"
                 "引用修复要求：重新回答同一个问题。所有证据引用必须严格写成 "
                 "[source:{source_id}]，source_id 必须来自证据块；每个引用单独占一对方括号，禁止合并引用或裸 source:number/source-*；"
                 "删除 [Source 1]、[Image 1] 及其他旧格式引用，不要解释修复过程。"
@@ -189,7 +192,8 @@ class AnswerGenerator:
                     provider="qwen",
                     task_type="paper_qa_final_answer_citation_repair",
                     query=(
-                        f"{generation_question}\n\n引用修复要求：所有证据引用必须严格写成 "
+                        f"{generation_question}\n\n{CHINESE_FINAL_ANSWER_INSTRUCTION}\n"
+                        "引用修复要求：所有证据引用必须严格写成 "
                         "[source:{source_id}]，source_id 必须来自证据块；每个引用单独占一对方括号，禁止合并引用或裸 source:number/source-*；"
                         "删除所有旧格式引用。"
                     ),

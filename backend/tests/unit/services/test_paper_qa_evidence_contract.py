@@ -200,3 +200,29 @@ def test_answer_generator_strips_invalid_repair_without_losing_answer_body() -> 
     assert result["answer"] == "结论"
     assert result["citation_warning"]
     assert result["citation_debug"]["repair_succeeded"] is False
+
+
+def test_answer_generator_requires_chinese_final_answer() -> None:
+    class Generation:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def generate(self, **kwargs):
+            self.requests.append(kwargs)
+            return {"response": "中文答案 [source:s1]"}
+
+    generation = Generation()
+    AnswerGenerator(generation_service=generation).generate(
+        generation_question="请解释论文方法",
+        context_pack={
+            "source_payload": [{"source_id": "s1", "content": "evidence"}],
+            "prompt_blocks": [],
+            "generation_search_results": [],
+            "image_inputs": [],
+            "asset_metadata": [],
+        },
+    )
+
+    query = generation.requests[0]["query"]
+    assert "必须使用中文回复" in query
+    assert "不要用英文整段回答" in query

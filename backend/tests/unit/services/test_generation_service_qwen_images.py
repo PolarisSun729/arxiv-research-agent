@@ -18,7 +18,8 @@ def test_qwen_input_without_images_keeps_plain_prompt_shape() -> None:
     )
 
     assert isinstance(qwen_input, str)
-    assert "Context:\nEvidence text" in qwen_input
+    assert "证据上下文：\nEvidence text" in qwen_input
+    assert "必须使用中文回复" in qwen_input
     assert debug["qwen_multimodal_enabled"] is False
     assert debug["sent_image_count"] == 0
 
@@ -53,6 +54,8 @@ def test_qwen_image_input_compresses_large_png_before_data_url(tmp_path: Path) -
     )
 
     content = qwen_input[0]["content"]
+    assert "必须使用中文回复" in content[0]["text"]
+    assert "[source:image-1]" in content[0]["text"]
     image_urls = [item["image_url"] for item in content if item["type"] == "input_image"]
     assert len(image_urls) == 1
     assert image_urls[0].startswith("data:image/jpeg;base64,")
