@@ -94,6 +94,14 @@ def _decide_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEv
         claim_assessments=next_state.claim_assessments,
         retrievals_remaining=max(0, next_state.request.limits.max_retrievals - next_state.retrieval_count),
         drafts_remaining=max(0, next_state.request.limits.max_draft_attempts - next_state.draft_attempt_count),
+        retrievals_used=next_state.retrieval_count,
+        candidate_need_ids=sorted(
+            {
+                need_id
+                for candidate in next_state.evidence_candidates.values()
+                for need_id in candidate.matched_need_ids
+            }
+        ),
     )
     next_state.action_accepted = False
     next_state.action_rejection_code = None
@@ -251,12 +259,17 @@ def _extract_claims_node(state: Any, dependencies: ResearchGraphDependencies) ->
     if draft is None:
         raise ValueError("claim extraction requires a draft")
     # 主张必须从用户实际可见文本重新提取，不能信任生成器自报的 declared_claims。
+    used_candidate_ids = [
+        candidate_id for candidate_id in draft.used_candidate_ids if candidate_id in next_state.evidence_candidates
+    ]
     extracted = dict(
         dependencies.claim_extractor.extract(
             ClaimExtractionRequest(
                 research_question=next_state.research_question,
                 answer=draft.answer,
                 draft_version=draft.version,
+                evidence_needs=list(next_state.evidence_needs),
+                candidates=[next_state.evidence_candidates[candidate_id] for candidate_id in used_candidate_ids],
             )
         )
         or {}
