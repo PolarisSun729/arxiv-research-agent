@@ -63,6 +63,11 @@ class _FakeRecommendationService:
         payload.setdefault("arxiv_id", arxiv_id)
         return payload
 
+    def _ensure_paper_materialized(self, arxiv_id: str, paper_payload=None):
+        payload = dict(paper_payload or {})
+        payload.setdefault("arxiv_id", arxiv_id)
+        return payload
+
 
 class _FakePaperQAService:
     def delete_qa_index(self, arxiv_id: str):
@@ -192,6 +197,27 @@ class PaperRouterApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["title"], "Stored Paper")
+
+    def test_get_paper_repairs_incomplete_local_metadata_from_source(self) -> None:
+        self.paper_storage.add_paper(
+            {
+                "arxiv_id": "2401.00004",
+                "title": "",
+                "abstract": "",
+                "embedding_id": "7",
+            }
+        )
+        self.recommendation_service.source_paper = {
+            "arxiv_id": "2401.00004",
+            "title": "Recovered Paper",
+            "abstract": "Recovered abstract",
+        }
+
+        response = self.client.get("/api/paper/2401.00004")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["title"], "Recovered Paper")
+        self.assertEqual(response.json()["abstract"], "Recovered abstract")
 
     def test_delete_paper_returns_success_and_404(self) -> None:
         self.paper_storage.add_paper({"arxiv_id": "2401.00003", "title": "Delete Me"})

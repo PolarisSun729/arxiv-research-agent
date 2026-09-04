@@ -1449,6 +1449,19 @@ def _validate_required_llm_sequence(goal: Goal, steps: Sequence[PlanDraftStep]) 
                 if tool_name not in tool_names:
                     reasons.append(f"preference_action plan missing required tool {tool_name}")
             reasons.extend(_validate_order(tool_names, required_tools, "preference_action"))
+        resolve_step = _find_step_by_tool(steps, "resolve_preference_target")
+        if resolve_step is not None:
+            context_bindings = [
+                binding
+                for binding in list(resolve_step.input_bindings or [])
+                if str(binding.input_key or "").strip() == "context"
+            ]
+            if context_bindings and not any(
+                binding.source_type == "state" and str(binding.source_key or "").strip() == "context"
+                for binding in context_bindings
+            ):
+                # resolver 需要完整的 state.context；若草稿显式绑定了其他来源，不能把其中的 last_papers 列表当成 context 参数。
+                reasons.append("resolve_preference_target.context must bind state.context")
 
     if len(step_ids) != len(set(step_ids)):
         reasons.append("LLM draft has duplicate step ids after normalization")

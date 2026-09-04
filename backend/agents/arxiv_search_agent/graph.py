@@ -666,7 +666,9 @@ def _apply_turn_result(state: AgentState, result: AgentTurnResult) -> None:
     state.goal = result.plan.goal if result.plan is not None else state.goal
     state.execution_plan = result.plan
     state.plan_runtime = result.runtime
-    state.answer = result.final_answer or state.answer
+    # AgentState 是本轮出站投影，不应在 final_answer 为空时继续沿用上一轮答案，
+    # 否则恢复确认后的新动作会被旧 QA 文本覆盖。
+    state.answer = result.final_answer or ""
     state.interaction = result.interaction
     state.debug = dict(state.debug or {})
     state.debug["agent_turn"] = {
@@ -681,15 +683,29 @@ def _apply_turn_result(state: AgentState, result: AgentTurnResult) -> None:
             "status": "waiting_interaction",
             "interaction": result.interaction.model_dump(mode="json"),
         }
-    if "preference_action_result" in result.outputs:
-        preference_result = result.outputs.get("preference_action_result")
-        state.preference_action_result = dict(preference_result) if isinstance(preference_result, Mapping) else {"value": preference_result}
+    preference_result = next(
+        (
+            result.outputs.get(key)
+            for key in ("preference_action_result", "preference_update_result")
+            if key in result.outputs and result.outputs.get(key) is not None
+        ),
+        None,
+    )
+    if preference_result is not None:
+        # 新版计划通常使用 preference_update_result，旧路径仍使用 preference_action_result；
+        # 出站统一投影到同一个字段，避免前端因 output_key 命名差异看不到已写入结果。
+        state.preference_action_result = (
+            dict(preference_result) if isinstance(preference_result, Mapping) else {"value": preference_result}
+        )
     if "paper_qa_result" in result.outputs:
         # answer_paper_question 的输出来自 PaperQAService 真实 RAG 链路，sources/retrieval_debug 必须原样带给前端。
         paper_qa_result = result.outputs.get("paper_qa_result")
         state.paper_qa_result = _build_paper_qa_result(state, paper_qa_result)
         if state.paper_qa_result.get("answer"):
             state.answer = str(state.paper_qa_result.get("answer") or "")
+    elif result.interaction is None:
+        # paper_qa_result 是当前轮的响应镜像，不是跨轮恢复真源；本轮没有生成 QA 时必须清掉旧镜像。
+        state.paper_qa_result = None
     arxiv_papers = _extract_arxiv_papers_from_outputs(result.outputs, plan=result.plan or state.execution_plan)
     if arxiv_papers:
         state.papers = arxiv_papers
@@ -703,7 +719,22 @@ def _extract_resolved_paper_from_runtime(state: AgentState) -> Dict[str, Any]:
     """从执行现场取出 resolve_paper 的结果，作为本轮 QA 真实目标论文。"""
     runtime = state.plan_runtime
     outputs = runtime.outputs if runtime is not None and isinstance(runtime.outputs, Mapping) else {}
-    paper_ref = outputs.get("paper_ref") if isinstance(outputs, Mapping) else None
+    target_output_keys = ["paper_ref", "paper_reference", "resolved_target_info", "resolved_paper"]
+    if runtime is not None and runtime.plan is not None:
+        # LLM planner 可自定义 output_key；按目标解析工具反查 key，保持目标投影与执行计划一致。
+        target_output_keys.extend(
+            step.output_key
+            for step in list(runtime.plan.steps or [])
+            if step.tool_name in {"resolve_paper", "resolve_preference_target"} and step.output_key
+        )
+    paper_ref = next(
+        (
+            outputs.get(key)
+            for key in dict.fromkeys(target_output_keys)
+            if isinstance(outputs.get(key), Mapping)
+        ),
+        None,
+    )
     if not isinstance(paper_ref, Mapping):
         return {}
     nested_paper = paper_ref.get("paper")

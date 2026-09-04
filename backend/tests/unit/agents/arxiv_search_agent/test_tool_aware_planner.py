@@ -689,6 +689,101 @@ def test_llm_persistent_write_without_target_falls_back_to_clarification() -> No
     assert _tool_names(plan) == ["analyze_ambiguity", "generate_clarification"]
 
 
+def test_llm_preference_target_context_binding_uses_full_state_context() -> None:
+    """候选论文列表只能放在完整 state.context 中，不能直接绑定给 context 参数。"""
+    preference_plan = {
+        "draft_id": "llm:preference:context-binding",
+        "plan_intent": "preference_action",
+        "selected_tools": [
+            "resolve_preference_target",
+            "update_preference_store",
+            "verify_preference_update",
+            "synthesize_preference_response",
+        ],
+        "steps": [
+            {
+                "step_id": "resolve_preference_target",
+                "action_type": "retrieve",
+                "tool_name": "resolve_preference_target",
+                "step_reason": "resolve the ordinal paper target",
+                "input_bindings": [
+                    {"input_key": "message", "source_type": "state", "source_key": "message"},
+                    # 复现线上故障：last_papers 是列表，不是 resolver 要求的完整 context 字典。
+                    {"input_key": "context", "source_type": "context", "source_key": "last_papers"},
+                ],
+                "depends_on": [],
+                "expected_output_key": "paper_reference",
+                "risk_level": "low",
+                "requires_confirmation": False,
+            },
+            {
+                "step_id": "update_preference_store",
+                "action_type": "write_state",
+                "tool_name": "update_preference_store",
+                "step_reason": "persist the resolved preference",
+                "input_bindings": [
+                    {"input_key": "paper_reference", "source_type": "step_output", "step_id": "resolve_preference_target"},
+                    {"input_key": "message", "source_type": "state", "source_key": "message"},
+                ],
+                "depends_on": ["resolve_preference_target"],
+                "expected_output_key": "preference_action_result",
+                "risk_level": "high",
+                "requires_confirmation": True,
+            },
+            {
+                "step_id": "verify_preference_update",
+                "action_type": "validate",
+                "tool_name": "verify_preference_update",
+                "step_reason": "verify the preference write",
+                "input_bindings": [
+                    {"input_key": "preference_action_result", "source_type": "step_output", "step_id": "update_preference_store"}
+                ],
+                "depends_on": ["update_preference_store"],
+                "expected_output_key": "verified_preference_update",
+                "risk_level": "low",
+                "requires_confirmation": False,
+            },
+            {
+                "step_id": "synthesize_preference_response",
+                "action_type": "answer",
+                "tool_name": "synthesize_preference_response",
+                "step_reason": "summarize the verified result",
+                "input_bindings": [
+                    {"input_key": "verified_preference_update", "source_type": "step_output", "step_id": "verify_preference_update"}
+                ],
+                "depends_on": ["verify_preference_update"],
+                "expected_output_key": "final_answer",
+                "risk_level": "low",
+                "requires_confirmation": False,
+            },
+        ],
+    }
+
+    _, plan, debug = _current_modules()[0].build_executable_plan(
+        AgentState(
+            intent="preference_action",
+            message="帮我把第二篇论文标记为喜欢",
+            context={
+                "last_papers": [
+                    {"arxiv_id": "2607.28580", "title": "DualG-MRAG"},
+                    {"arxiv_id": "2607.28397", "title": "GLM-RAG"},
+                ]
+            },
+        ),
+        enable_tool_aware_planner=True,
+        enable_llm_plan_draft=True,
+        llm_generation_service=_FakeLLMPlanService(json.dumps(preference_plan, ensure_ascii=False)),
+    )
+
+    assert debug["llm_plan_valid"] is False
+    assert any("resolve_preference_target.context must bind state.context" in reason for reason in debug["llm_plan_invalid_reasons"])
+    assert debug["selected_plan_source"] == "tool_aware_rule_based"
+    resolve_step = next(step for step in plan.steps if step.tool_name == "resolve_preference_target")
+    context_binding = next(binding for binding in resolve_step.input_bindings if binding.input_key == "context")
+    assert context_binding.source_type == "state"
+    assert context_binding.source_key == "context"
+
+
 def test_llm_high_risk_tool_missing_confirmation_is_auto_completed() -> None:
     preference_plan = json.loads(_llm_arxiv_plan_json(plan_intent="preference_action"))
     preference_plan["selected_tools"] = ["resolve_preference_target", "update_preference_store", "verify_preference_update", "synthesize_preference_response"]

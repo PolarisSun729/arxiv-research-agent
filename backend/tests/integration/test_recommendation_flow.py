@@ -1064,6 +1064,45 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         self.assertEqual(result["hard_excluded_count"], 1)
         self.assertEqual([paper["arxiv_id"] for paper in result["papers"]], ["2401.50001"])
 
+    def test_search_rerank_hard_excludes_liked_papers(self) -> None:
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00001")
+        papers = [
+            {
+                "arxiv_id": "2401.00001",
+                "title": "Liked Paper",
+                "abstract": "retrieval augmented generation",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+            },
+            {
+                "arxiv_id": "2401.50001",
+                "title": "Allowed Paper",
+                "abstract": "retrieval augmented generation",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-02",
+            },
+        ]
+        with mock.patch.object(
+            self.service,
+            "_get_or_refresh_interest_vector",
+            return_value={
+                "vector_data": [1.0, 0.0, 0.0],
+                "interest_clusters": [],
+                "negative_feedback_profile": {"version": "negative_feedback_profile_v1", "enabled": True, "mode": "none", "examples": [], "clusters": [], "stats": {}},
+                "profile_mode": "mean",
+                "cluster_count": 0,
+            },
+        ):
+            result = self.service.rerank_search_results_for_user(
+                user_id=self.user_id,
+                papers=papers,
+                query="retrieval",
+                top_n=2,
+            )
+
+        self.assertEqual(result["hard_excluded_count"], 1)
+        self.assertEqual([paper["arxiv_id"] for paper in result["papers"]], ["2401.50001"])
+
     def test_recommend_papers_raises_for_empty_liked_papers(self) -> None:
         with self.assertRaises(HTTPException) as ctx:
             self.service.generate_user_interest_vector(self.user_id)

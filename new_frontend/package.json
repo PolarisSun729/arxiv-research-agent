@@ -10,7 +10,8 @@
     "test:user-context": "node tests/userContext.test.mjs",
     "test:agent-chat": "node tests/agentSearchChat.test.mjs",
     "test:evidence": "node tests/evidenceCitation.test.mjs",
-    "test": "npm run test:errors && npm run test:user-context && npm run test:qa-stream && npm run test:agent-chat && npm run test:evidence",
+    "test:labeled-summary": "node tests/labeledPaperSummary.test.mjs",
+    "test": "npm run test:errors && npm run test:user-context && npm run test:qa-stream && npm run test:agent-chat && npm run test:evidence && npm run test:labeled-summary",
     "preview": "vite preview"
   },
   "dependencies": {

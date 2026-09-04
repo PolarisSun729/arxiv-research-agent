@@ -16,6 +16,15 @@ def assemble_final_answer(runtime: PlanRuntime) -> Optional[str]:
     if explicit_answer:
         return explicit_answer
 
+    # LLM planner 允许为步骤输出自定义 key，但回答工具的稳定契约仍是 final_answer 字段；
+    # 扫描结构化输出可以兼容 final_user_response 等命名，避免恢复后 runtime 找不到新答案。
+    for value in reversed(list(outputs.values())):
+        if not isinstance(value, Mapping):
+            continue
+        nested_answer = _clean_text(value.get("final_answer"))
+        if nested_answer:
+            return nested_answer
+
     paper_qa_result = outputs.get("paper_qa_result")
     if isinstance(paper_qa_result, Mapping):
         qa_answer = _clean_text(paper_qa_result.get("answer"))
