@@ -27,8 +27,13 @@ def build_paper_evidence_research_service(
     claim_verifier: Any,
     checkpointer: Any = None,
     degradation_listener: DegradationListener | None = None,
+    trace_sink: Any = None,
 ) -> PaperEvidenceResearchService:
-    """组装完整的证据研究服务；默认把降级事件收进进程内台账。"""
+    """组装完整的证据研究服务；默认把降级事件收进进程内台账。
+
+    ``trace_sink`` 保持显式注入：研究轨迹落盘是生产/评测侧的选择（见 ResearchTraceRecorder），
+    默认不写盘，避免单测顺手往仓库里生成轨迹文件。
+    """
 
     listener: DegradationListener = degradation_listener or DegradationLedger()
     return PaperEvidenceResearchService(
@@ -47,4 +52,5 @@ def build_paper_evidence_research_service(
         claim_extractor=RuleClaimExtractor(),
         claim_verifier=claim_verifier,
         checkpointer=checkpointer,
+        trace_sink=trace_sink,
     )

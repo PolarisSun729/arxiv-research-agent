@@ -11,7 +11,7 @@ from .actions import AbstainAction, DraftAnswerAction, FinalizeAnswerAction, Sea
 from .completion_gate import can_finalize, has_verifiable_support
 from .context_pack import build_context_pack
 from .contracts import PaperEvidenceResearchResult, ResearchSummary, VerifiedCitation
-from .evidence_pool import merge_candidates
+from .evidence_pool import candidate_identity, merge_candidates
 from .state import (
     AnswerClaim,
     ClaimAssessment,
@@ -23,6 +23,10 @@ from .state import (
     PaperEvidenceResearchState,
     ResearchDecisionContext,
 )
+
+
+# 研究轨迹是审计与评测数据源，不是第二份候选池；单轮召回记录数封顶防止轨迹被异常检索器撑爆。
+_MAX_TRACED_CANDIDATES = 50
 
 
 @dataclass(frozen=True)
@@ -167,6 +171,28 @@ def _route_after_validation(state: Any) -> str:
     return "terminal"
 
 
+def _trace_candidate_refs(candidates: Any) -> list[dict[str, Any]]:
+    """把本轮召回压成 (candidate_id, rank, score) 三元组写入研究轨迹。
+
+    评测的 Recall@k / MRR 只需要"这一轮召回了谁、排第几"，正文留在证据池里即可；
+    candidate_id 必须与 ``merge_candidates`` 的入池 ID 同源，否则轨迹无法和证据池对账。
+    """
+
+    refs: list[dict[str, Any]] = []
+    for position, raw_item in enumerate(list(candidates or [])[:_MAX_TRACED_CANDIDATES], start=1):
+        payload = dict(raw_item or {})
+        rank = payload.get("rank")
+        score = payload.get("score")
+        refs.append(
+            {
+                "candidate_id": candidate_identity(payload),
+                "rank": int(rank) if isinstance(rank, int) and not isinstance(rank, bool) else position,
+                "score": float(score) if isinstance(score, (int, float)) and not isinstance(score, bool) else None,
+            }
+        )
+    return refs
+
+
 def _search_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEvidenceResearchState:
     next_state = _coerce_state(state)
     action = next_state.pending_action
@@ -198,9 +224,12 @@ def _search_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEv
         next_state,
         "retrieval_completed",
         target_need_id=action.target_need_id,
+        # 轨迹记录适配器实际使用的检索查询；脚本化检索器不回传时退回动作自带的 query。
+        query=str(retrieval.get("query") or action.query),
         status=str(retrieval.get("status") or "completed"),
         new_candidate_count=new_count,
         duplicate_candidate_count=duplicate_count,
+        candidates=_trace_candidate_refs(candidates),
     )
     return next_state
 
