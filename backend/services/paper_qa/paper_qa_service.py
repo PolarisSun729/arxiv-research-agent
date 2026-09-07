@@ -10,8 +10,14 @@ from services.arxiv.arxiv_search_service import ArxivSearchService
 from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
 from services.context_lifecycle import ContextLifecycleService
 from services.document.chunking_service import ChunkingService
+from services.evaluation import write_eval_record
 from services.memory import MemoryService
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
+from services.paper_evidence_research import (
+    PaperEvidenceResearchRequest,
+    PaperEvidenceResearchService,
+    ResearchLimits,
+)
 from services.retrieval.enhanced_retrieval_service import EnhancedRetrievalService, RetrievalOptions
 from services.llm.generation_service import GenerationService
 from services.document.loading_service import LoadingService
@@ -70,6 +76,7 @@ class PaperQAService:
         vector_store_service: Optional[VectorStoreService] = None,
         generation_service: Optional[GenerationService] = None,
         enhanced_retrieval_service: Optional[EnhancedRetrievalService] = None,
+        research_service: Optional[PaperEvidenceResearchService] = None,
         arxiv_service_factory: Optional[Callable[[], Any]] = None,
         oai_db_service: Optional[ArxivOaiDatabaseService] = None,
         get_embedding_config: Optional[Callable[[], EmbeddingConfig]] = None,
@@ -93,6 +100,7 @@ class PaperQAService:
             vector_store_service=self.vector_store_service,
             generation_service=self.generation_service,
         )
+        self.research_service = research_service  # Phase 3: 新证据研究引擎
         self.arxiv_service_factory = arxiv_service_factory or (lambda: ArxivSearchService())
         self.oai_db_service = oai_db_service
         self.get_embedding_config = get_embedding_config or self.embedding_service.get_default_embedding_config
@@ -552,7 +560,224 @@ class PaperQAService:
             logger.warning("Failed to load user memory summary for prompt context: user_id=%s error=%s", user_id, exc)
             return {}
 
+    def answer_question_with_research(self, arxiv_id: str, payload: Any) -> Dict[str, Any]:
+        """使用新证据研究引擎回答问题（Phase 3 生产切换）。"""
+        question = str(self._payload_get(payload, "question", "") or "").strip()
+        run_id = str(self._payload_get(payload, "run_id", "") or "").strip() or str(uuid4())
+        started = perf_counter()
+        user_id = self._resolve_user_id(self._payload_get(payload, "user_id"))
+        trace = RequestTrace(
+            run_id=run_id,
+            route="paper_qa.answer_with_research",
+            session_id=str(self._payload_get(payload, "session_id", "") or "") or None,
+            user_id=user_id,
+            input=question,
+        )
+        info_event(
+            logger,
+            "qa.request_start",
+            run_id=run_id,
+            session_id=trace.session_id,
+            user_id=user_id,
+            arxiv_id=arxiv_id,
+            input=question,
+            engine="research",
+        )
+        trace.add_event("qa.request_start", arxiv_id=arxiv_id, user_id=user_id, engine="research")
+
+        # 会话与上下文准备（保留现有逻辑）
+        chat_session = self._resolve_chat_session(arxiv_id, payload)
+        session_id = chat_session.get("session_id", "")
+
+        # 问题上下文化（短期记忆）
+        conversation_context = self.session_service.get_conversation_context(
+            session_id=session_id,
+            user_id=user_id,
+        )
+        paper_context = {"arxiv_id": arxiv_id}
+        question_contextualization = self.question_contextualizer.contextualize(
+            question=question,
+            paper_context=paper_context,
+            conversation_context=conversation_context,
+        )
+        contextualized_question = question_contextualization.get("contextualized_question", question)
+
+        # 构造会话快照（供研究引擎使用）
+        conversation_snapshot = {
+            "recent_turns": conversation_context[:5],  # 最近 5 轮对话
+            "session_summary": self.session_service.get_session_summary(session_id, user_id),
+        }
+
+        # 构造研究请求
+        preferred_answer_style = self._get_preferred_answer_style(payload)
+        research_request = PaperEvidenceResearchRequest(
+            arxiv_id=arxiv_id,
+            original_question=contextualized_question,
+            user_id=user_id,
+            session_id=session_id,
+            research_run_id=run_id,
+            conversation_snapshot=conversation_snapshot,
+            preferred_answer_style=preferred_answer_style,
+            limits=ResearchLimits(),  # 使用默认限制
+        )
+
+        # 调用证据研究引擎
+        try:
+            research_result = self.research_service.research(research_request)
+        except Exception as exc:
+            trace.mark_failed()
+            error_payload = {"error": str(exc), "error_type": type(exc).__name__}
+            trace.set_output(error_payload)
+            trace.add_event("qa.request_done", status="error", error_type=type(exc).__name__)
+            trace_path = _write_qa_trace(trace, reason="research_error")
+            elapsed_ms = round((perf_counter() - started) * 1000, 1)
+            info_event(
+                logger,
+                "qa.request_done",
+                run_id=run_id,
+                session_id=session_id,
+                user_id=user_id,
+                arxiv_id=arxiv_id,
+                status="error",
+                error_type=type(exc).__name__,
+                output=str(exc),
+                elapsed_ms=elapsed_ms,
+                trace_path=trace_path,
+            )
+            raise
+
+        # 结果映射：PaperEvidenceResearchResult → QA API 响应格式
+        outcome = research_result.outcome
+        answer = research_result.answer
+        citations = research_result.citations
+        research_summary = research_result.research_summary
+
+        # 构造 sources（前端兼容格式）
+        sources = [
+            {
+                "source_id": citation.source_id,
+                "content": citation.content,
+                "chunk_type": citation.chunk_type,
+                "section_path": citation.section_path,
+                "page_number": citation.page_number,
+            }
+            for citation in citations
+        ]
+
+        # 构造 qa_observation（兼容层，映射 outcome 到 answer_quality）
+        qa_observation = {
+            "answer_quality": "sufficient" if outcome == "completed" else "partial" if outcome == "partial" else "insufficient",
+            "outcome": outcome,
+            "termination_reason": research_summary.termination_reason,
+            "research_summary": research_summary.model_dump(),
+        }
+
+        # 持久化 turn
+        try:
+            persisted_turn = self.persist_completed_turn(
+                chat_session=chat_session,
+                question=question,
+                answer=answer,
+                source_payload=sources,
+                retrieval_debug={"qa_observation": qa_observation, "research_summary": research_summary.model_dump()},
+                contextualized_question=contextualized_question,
+                question_contextualization=question_contextualization,
+            )
+        except Exception as exc:
+            trace.mark_failed()
+            trace.set_output({"error": str(exc), "qa_observation": qa_observation})
+            trace.add_event("qa.request_done", status="error", code="persist_failed")
+            trace_path = _write_qa_trace(trace, reason="persist_error")
+            elapsed_ms = round((perf_counter() - started) * 1000, 1)
+            info_event(
+                logger,
+                "qa.request_done",
+                run_id=run_id,
+                session_id=session_id,
+                user_id=user_id,
+                arxiv_id=arxiv_id,
+                status="error",
+                code="persist_failed",
+                output=str(exc),
+                elapsed_ms=elapsed_ms,
+                trace_path=trace_path,
+            )
+            raise
+
+        # 写入 eval record（Phase 3 新增）
+        elapsed_ms = round((perf_counter() - started) * 1000, 1)
+        write_eval_record(
+            result=research_result,
+            request=research_request,
+            turn_id=persisted_turn.get("turn_id"),
+            retrieval_debug=None,  # 研究引擎暂无 retrieval_debug
+            latency_ms=elapsed_ms,
+        )
+
+        # 构造返回结果
+        result = {
+            "status": "success",
+            "arxiv_id": arxiv_id,
+            "question": question,
+            "session_id": session_id,
+            "chat_session": chat_session,
+            "turn_id": persisted_turn.get("turn_id"),
+            "original_question": question,
+            "contextualized_question": contextualized_question,
+            "used_short_term_memory": question_contextualization.get("used_short_term_memory", False),
+            "question_contextualization": question_contextualization,
+            "answer": answer,
+            "sources": sources,
+            "outcome": outcome,
+            "research_summary": research_summary.model_dump(),
+            "citations": [
+                {
+                    "citation_id": getattr(c, "source_id", ""),
+                    "source_id": getattr(c, "source_id", ""),
+                    "claim_ids": getattr(c, "claim_ids", []),
+                }
+                for c in citations
+            ],
+            "qa_observation": qa_observation,
+        }
+
+        trace.session_id = session_id
+        trace.set_output(result)
+        trace.add_event(
+            "qa.request_done",
+            status="success",
+            outcome=outcome,
+            source_count=len(sources),
+            answer_chars=len(answer),
+        )
+        trace_path = _write_qa_trace(trace, reason="auto")
+        info_event(
+            logger,
+            "qa.request_done",
+            run_id=run_id,
+            session_id=session_id,
+            user_id=user_id,
+            arxiv_id=arxiv_id,
+            status="success",
+            outcome=outcome,
+            source_count=len(sources),
+            output=answer,
+            elapsed_ms=elapsed_ms,
+            trace_path=trace_path,
+        )
+        return result
+
     def answer_question(self, arxiv_id: str, payload: Any) -> Dict[str, Any]:
+        """回答论文问题的主入口。
+
+        Phase 3 切换：如果 research_service 已注入，路由到新证据研究引擎；
+        否则使用旧编排逻辑（向后兼容）。
+        """
+        # Phase 3 生产切换：优先使用证据研究引擎
+        if self.research_service is not None:
+            return self.answer_question_with_research(arxiv_id, payload)
+
+        # 旧编排逻辑（保持向后兼容）
         question = str(self._payload_get(payload, "question", "") or "").strip()
         run_id = str(self._payload_get(payload, "run_id", "") or "").strip() or str(uuid4())
         started = perf_counter()
