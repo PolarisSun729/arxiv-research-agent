@@ -164,7 +164,7 @@ def build_error_eval_record(
     Args:
         request: 研究请求
         error: 错误信息（dict或EvalError）
-        trace_events: 轨迹事件列表（至少1个事件）
+        trace_events: 轨迹事件列表（可能为空，早期失败时）
         latency_ms: 延迟毫秒数（非负）
         llm_usage: LLM使用统计（可选）
 
@@ -174,9 +174,7 @@ def build_error_eval_record(
     Raises:
         ValueError: 参数验证失败
     """
-    # 入口验证
-    if not trace_events:
-        raise ValueError("trace_events cannot be empty")
+    # 入口验证（错误场景允许空 trace）
     if latency_ms < 0:
         raise ValueError("latency_ms must be non-negative")
 
