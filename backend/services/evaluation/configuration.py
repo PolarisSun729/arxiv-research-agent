@@ -23,9 +23,9 @@ def _missing_configuration(run: dict[str, Any]) -> list[str]:
         missing.append("index_snapshot_missing_or_changed")
     else:
         index = indexes[0]
-        build_id = str(index.get("active_build_id") or "")
-        version = str(index.get("active_index_version") or "")
-        immutable_build = bool(build_id and version and not build_id.startswith("legacy") and version != "legacy")
+        build_id = index.get("active_build_id")
+        version = index.get("active_index_version")
+        immutable_build = bool(build_id and version)
         if not index.get("collection_name") or not (immutable_build or index.get("sparse_index_source_hash")):
             missing.append("index_version_or_source_hash")
         if not index.get("embedding_model"):

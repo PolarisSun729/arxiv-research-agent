@@ -18,15 +18,11 @@ from services.llm.call_metrics import LLMCallStats, use_call_stats
 from services.paper_evidence_research.contracts import PaperEvidenceResearchRequest
 from . import metrics_report
 from .contracts import GoldenCase
-from .eval_record import BACKEND_DIR, _get_git_commit_hash, build_eval_record
+from .eval_record import BACKEND_DIR, _get_git_commit_hash, build_success_eval_record, build_error_eval_record
 from .scoring import score_record
 
 logger = logging.getLogger(__name__)
 DEFAULT_REPORTS_DIR = BACKEND_DIR / "06-evaluation-result" / "reports"
-
-
-def _get_git_commit() -> str:
-    return _get_git_commit_hash()
 
 
 def load_golden_cases(jsonl_path: Path) -> list[dict[str, Any]]:
@@ -68,10 +64,24 @@ async def run_single_case(golden_case: dict[str, Any], research_service: Any) ->
         logger.warning("评测运行失败: case_id=%s error_type=%s", case.case_id, type(exc).__name__)
         error = {"code": getattr(exc, "code", "research_execution_failed"),
                  "stage": getattr(exc, "stage", "research"), "error_type": type(exc).__name__}
-    return build_eval_record(
-        request=request, result=result, error=error, trace_events=events,
-        latency_ms=(perf_counter() - started) * 1000, llm_usage=stats.to_dict(),
-    )
+
+    # 根据是否有错误选择对应的构造函数
+    if error is not None:
+        return build_error_eval_record(
+            request=request,
+            error=error,
+            trace_events=events,
+            latency_ms=(perf_counter() - started) * 1000,
+            llm_usage=stats.to_dict(),
+        )
+    else:
+        return build_success_eval_record(
+            request=request,
+            result=result,
+            trace_events=events,
+            latency_ms=(perf_counter() - started) * 1000,
+            llm_usage=stats.to_dict(),
+        )
 
 
 async def run_case_with_repeats(golden_case, research_service, repeat_count):
@@ -121,7 +131,7 @@ async def run_golden_evaluation(
         # 预算、模型与索引取自逐次运行记录，不能用当前默认值替代真实执行配置。
         metadata={"dataset_hash": dataset_hash, "repeat_count": repeat_count},
     )
-    commit = _get_git_commit()
+    commit = _get_git_commit_hash()
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     output_path = output_dir / f"{timestamp}_{commit}.json"
     metrics_report.save_report(report, output_path, commit)

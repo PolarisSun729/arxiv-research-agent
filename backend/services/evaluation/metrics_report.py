@@ -17,13 +17,18 @@ RED_FLAG_THRESHOLD = 0.05
 
 
 def _metric_values(records, metric_name):
+    """提取指标值；失败记录（raw_runs 全为 error）如果缺少该指标则计为 0.0"""
     values = []
     for rec in records:
-        metrics = rec.get("metrics") or {}
-        # 空指标是失败记录的旧占位形式；不能悄悄从分母删掉。明确的 None 则代表不可评。
-        value = metrics.get(metric_name) if metrics else 0.0
+        value = rec.get("metrics", {}).get(metric_name)
         if isinstance(value, (int, float)):
             values.append(float(value))
+        else:
+            # 检查该 case 的所有 runs 是否都失败了
+            raw_runs = rec.get("raw_runs", [])
+            if raw_runs and all(run.get("run_status") == "error" for run in raw_runs):
+                # 失败记录缺少该指标时计 0，而非从分母中排除
+                values.append(0.0)
     return values
 
 
