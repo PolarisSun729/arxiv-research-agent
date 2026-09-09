@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import unittest
 from tests.helpers.agent_runtime import load_agent_test_modules
 
@@ -14,6 +15,7 @@ PlanRuntime = schemas.PlanRuntime
 build_arxiv_search_graph = _MODULES["graph_module"].build_arxiv_search_graph
 DEFAULT_GRAPH_CHECKPOINTER = _MODULES["graph_module"].DEFAULT_GRAPH_CHECKPOINTER
 graph_module = _MODULES["graph_module"]
+assemble_final_answer = sys.modules["backend.agents.arxiv_search_agent.response_assembler"].assemble_final_answer
 
 
 class AgentGraphFlowTests(unittest.TestCase):
@@ -103,6 +105,76 @@ class AgentGraphFlowTests(unittest.TestCase):
         )
         self.assertEqual(state.paper_qa_result["arxiv_id"], "2401.00002")
         self.assertEqual(state.paper_qa_result["title"], "Second Paper")
+
+    def test_preference_resume_projects_current_result_instead_of_stale_paper_qa(self) -> None:
+        """确认恢复后的偏好结果不会被上一轮 QA 的响应镜像覆盖。"""
+        PlanStep = schemas.PlanStep
+        ToolSpec = schemas.ToolSpec
+        goal = Goal(goal_type="preference_action")
+        plan = ExecutablePlan(
+            plan_id="preference_action:resume",
+            goal=goal,
+            steps=[
+                PlanStep(
+                    step_id="resolve_target",
+                    action_type="retrieve",
+                    tool_name="resolve_preference_target",
+                    tool=ToolSpec(tool_name="resolve_preference_target"),
+                    output_key="resolved_target_info",
+                ),
+                PlanStep(
+                    step_id="update_store",
+                    action_type="write_state",
+                    tool_name="update_preference_store",
+                    tool=ToolSpec(tool_name="update_preference_store"),
+                    output_key="preference_update_result",
+                ),
+            ],
+        )
+        runtime = PlanRuntime(
+            goal=goal,
+            plan=plan,
+            outputs={
+                "resolved_target_info": {
+                    "status": "resolved",
+                    "final_target_resolved": True,
+                    "arxiv_id": "2607.28580",
+                    "title": "DualG-MRAG",
+                    "paper": {"arxiv_id": "2607.28580", "title": "DualG-MRAG"},
+                },
+                "preference_update_result": {
+                    "status": "success",
+                    "action": "like",
+                    "label": "liked",
+                    "arxiv_id": "2607.28580",
+                    "liked": True,
+                },
+                "final_user_response": {"final_answer": "已更新论文偏好：2607.28580。"},
+            },
+        )
+        state = AgentState(
+            intent="preference_action",
+            answer="上一轮 QA 的旧答案",
+            paper_qa_result={"status": "success", "answer": "上一轮 QA 的旧答案"},
+        )
+        result = schemas.AgentTurnResult(
+            status="success",
+            final_answer=assemble_final_answer(runtime),
+            plan=plan,
+            outputs=dict(runtime.outputs),
+            runtime=runtime,
+        )
+
+        graph_module._apply_turn_result(state, result)
+
+        self.assertEqual(state.answer, "已更新论文偏好：2607.28580。")
+        self.assertEqual(state.preference_action_result["action"], "like")
+        self.assertEqual(state.resolved_paper, {"arxiv_id": "2607.28580", "title": "DualG-MRAG"})
+        self.assertIsNone(state.paper_qa_result)
+        response = _MODULES["service_module"]._state_to_response(state)
+        self.assertEqual(response.answer, "已更新论文偏好：2607.28580。")
+        self.assertEqual(response.preference_action_result["arxiv_id"], "2607.28580")
+        self.assertIsNone(response.paper_qa_result)
 
     def test_apply_turn_result_projects_arxiv_results_to_visible_papers(self) -> None:
         state = AgentState(intent="arxiv_search", message="帮我找最近 7 天关于 RAG 的 5 篇论文")

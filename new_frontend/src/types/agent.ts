@@ -165,6 +165,9 @@ export interface ArxivSearchResponse {
   search_spec?: ArxivSearchSpec | null
   interaction?: AgentInteraction | null
   paper_qa_result?: Record<string, any> | null
+  cited_source_ids?: string[]
+  citation_debug?: Record<string, any> | null
+  citation_warning?: string | null
   resolved_paper?: AgentPaper | null
   preference_action_result?: AgentPreferenceActionResult | null
   plan: string[]

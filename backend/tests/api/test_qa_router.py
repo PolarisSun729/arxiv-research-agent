@@ -106,8 +106,10 @@ class _FakeVectorStoreService:
 class _FakeGenerationService:
     def __init__(self) -> None:
         self.raise_error = False
+        self.queries = []
 
     def stream_qwen_responses(self, **kwargs):
+        self.queries.append(kwargs.get("query", ""))
         if self.raise_error:
             raise RuntimeError("llm stream failed")
         yield {"type": "delta", "delta": "hello"}
@@ -411,6 +413,16 @@ class QaRouterApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("event: error", response.text)
         self.assertIn(f'"code": "{ErrorCode.QA_INDEX_NOT_FOUND}"', response.text)
+
+    def test_qa_stream_requires_chinese_final_answer(self) -> None:
+        response = self.client.post(
+            "/api/paper/2401.00001/qa/stream",
+            json={"question": "What is the contribution?", "user_id": "u1"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("必须使用中文回复", self.generation_service.queries[-1])
+        self.assertIn("不要用英文整段回答", self.generation_service.queries[-1])
 
     def test_qa_stream_llm_exception_maps_to_generation_code(self) -> None:
         self.generation_service.raise_error = True

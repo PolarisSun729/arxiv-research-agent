@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, Callable, Dict, List, Optional
@@ -71,7 +72,8 @@ class RouteExecutionSupport:
         try:
             # future.result(timeout=...) 只限制当前 route 等待时间；超时后不进入 executor
             # shutdown 等待路径，确保增强 route 的慢查询不会反向阻塞主检索链路。
-            future = self._executor.submit(callback)
+            # 检索增强阶段可能调用模型；把请求上下文复制到 worker，避免漏计 rerank/HyDE 成本。
+            future = self._executor.submit(copy_context().run, callback)
             results = future.result(timeout=timeout_seconds)
             latency_ms = (perf_counter() - started) * 1000
             return RouteExecutionResult(

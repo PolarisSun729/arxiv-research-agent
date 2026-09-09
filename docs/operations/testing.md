@@ -5,7 +5,7 @@
 - Python environment: `conda activate new_rag`
 - Repository-level quality commands must run from the repository root.
 - Backend-only test commands must run from `backend/`.
-- Test framework: `unittest`
+- Test entrypoint: `pytest`, collecting both pytest functions and `unittest.TestCase` tests.
 
 Most automated tests in this repository are designed to run offline with fake services, stubs, or temporary SQLite files.
 
@@ -95,31 +95,31 @@ cd backend
 ### 3.1 Run existing test suite discovery
 
 ```bash
-python -m unittest discover -s tests -p "test_*.py"
+python -m pytest tests --collect-only -q
 ```
 
 ### 3.2 Run unit tests
 
 ```bash
-python -m unittest discover -s tests/unit -p "test_*.py"
+python -m pytest tests/unit
 ```
 
 ### 3.3 Run API tests
 
 ```bash
-python -m unittest discover -s tests/api -p "test_*.py"
+python -m pytest tests/api
 ```
 
 ### 3.4 Run integration tests
 
 ```bash
-python -m unittest discover -s tests/integration -p "test_*.py"
+python -m pytest tests/integration
 ```
 
 ### 3.5 Run golden smoke tests
 
 ```bash
-python -m unittest tests.golden.test_rag_golden_smoke
+python -m pytest tests/golden/test_rag_golden_smoke.py
 ```
 
 ### 3.6 Run RAG golden pipeline tests
@@ -133,43 +133,51 @@ This suite exercises the real `EnhancedRetrievalService` orchestration with fake
 ### 3.7 Run full automated test suite
 
 ```bash
-python -m unittest discover -s tests -p "test_*.py"
+python -m pytest tests --ignore=tests/smoke
+python -m pytest tests/smoke
 ```
 
 This includes unit, api, integration, helper/infrastructure, and golden smoke tests that follow the `test_*.py` naming rule.
+
+`unittest discover` alone misses pytest functions, parametrization and fixtures, including the research/evaluation regression suite. It is not a substitute for the complete gate.
+
+### 3.8 Research QA and evaluation contracts
+
+```powershell
+python -m pytest tests/unit/services/evaluation tests/unit/services/paper_evidence_research tests/integration/test_research_qa_contract.py tests/unit/services/test_llm_call_metrics.py
+python smoke_test_research_stream.py
+python -m services.evaluation.golden_runner --cases tests/golden/data/smoke_golden_set.jsonl --validate-only --allow-unlabeled
+```
+
+These tests exercise real research request/result models, graph execution and temporary SQLite sessions, while replacing provider and index I/O. They cover sync/SSE equivalence, safe errors, rescoring persisted records, verified citations, retrieval failures, repair gains, run denominators and provider call accounting. Agent graph stubs must be restored after their own imports so these tests still run on real LangGraph.
+
+The 12 smoke cases currently lack manual answerability/evidence/reference-answer labels. `--validate-only` without `--allow-unlabeled` correctly exits nonzero; neither validation command calls a model. A golden runner invocation without `--validate-only` uses the real research engine and stays outside automated tests. See [Evaluation](../capabilities/evaluation.md) for labels, metrics and baseline requirements.
 
 ## 4. Frequently used targeted commands
 
 ### Agent tests
 
 ```bash
-python -m unittest discover -s tests -p "test_agent*.py"
-python -m unittest tests.api.test_agent_router
-python -m unittest tests.integration.test_agent_chat_flow
-python -m pytest tests/api/test_agent_router.py
+python -m pytest tests/unit/agents/arxiv_search_agent tests/api/test_agent_router.py
 ```
 
 ### Retrieval / RAG tests
 
 ```bash
-python -m unittest discover -s tests/unit/services/retrieval -p "test_*.py"
-python -m unittest tests.integration.test_enhanced_retrieval_service
+python -m pytest tests/unit/services/retrieval tests/integration/test_enhanced_retrieval_service.py
 python -m pytest tests/golden/test_rag_golden_pipeline.py
 ```
 
 ### Paper QA tests
 
 ```bash
-python -m unittest tests.integration.test_paper_qa_service
-python -m unittest tests.integration.test_qa_index_build_flow
+python -m pytest tests/integration/test_paper_qa_service.py tests/integration/test_qa_index_build_flow.py tests/integration/test_research_qa_contract.py
 ```
 
 ### Memory / Recommendation / Intent tests
 
 ```bash
-python -m unittest tests.unit.services.intent.test_intent_service
-python -m unittest tests.integration.test_memory_service
-python -m unittest tests.integration.test_recommendation_flow
+python -m pytest tests/unit/services/intent tests/integration/test_memory_service.py tests/integration/test_recommendation_flow.py
 ```
 
 The memory integration suite also covers the Agent session-memory read/write loop: final Agent state is reduced to a small persisted memory patch, then reloaded and merged with frontend context. This catches regressions where Agent state, selected paper context, or tool-call summaries stop surviving across turns.
@@ -177,7 +185,7 @@ The memory integration suite also covers the Agent session-memory read/write loo
 ### Database service tests
 
 ```bash
-python -m unittest discover -s tests -p "test_database*.py"
+python -m pytest tests/unit -k "sqlite or database"
 ```
 
 ## 5. Coverage commands
@@ -185,7 +193,7 @@ python -m unittest discover -s tests -p "test_database*.py"
 Run coverage across the automated test suite:
 
 ```bash
-python -m coverage run -m unittest discover -s tests -p "test_*.py"
+python -m coverage run -m pytest tests --ignore=tests/smoke
 python -m coverage report -m
 ```
 
@@ -201,7 +209,7 @@ Then open `htmlcov/index.html` locally.
 
 - Coverage is used as a regression visibility tool, not as permission to connect to external services.
 - A coverage run must remain offline-safe.
-- If a test requires real upstream services, move it to a separate manual script rather than adding it to default `unittest` discovery.
+- If a test requires real upstream services, move it to a separate manual script rather than adding it to default pytest collection.
 - Prefer focused fake-based tests over broad unstable integration coverage.
 
 ## 7. Existing helper locations
@@ -237,3 +245,20 @@ Use these helpers before introducing new heavy mocks.
 
 - Use temporary SQLite helpers from `tests/helpers/sqlite.py`
 - Do not reuse real repository DB files in automated tests
+
+### Windows temporary-directory permissions
+
+Use a new repository-local temporary directory when pytest or Ruff cannot write a stale cache. For example, from the repository root:
+
+```powershell
+$testTemp = Join-Path (Get-Location).Path 'temp/quality-local'
+New-Item -ItemType Directory -Path $testTemp -Force | Out-Null
+$env:TEMP = $testTemp
+$env:TMP = $testTemp
+$env:RUFF_CACHE_DIR = Join-Path $testTemp 'ruff'
+$env:PYTHONPYCACHEPREFIX = Join-Path $testTemp 'pycache'
+$env:PYTHONUTF8 = '1'
+$env:AGENT_RUNTIME_CHECKPOINT_BACKEND = 'memory'
+$env:PYTEST_ADDOPTS = '-p no:cacheprovider --basetemp=temp/quality-local/pytest'
+python scripts/check_quality.py backend
+```

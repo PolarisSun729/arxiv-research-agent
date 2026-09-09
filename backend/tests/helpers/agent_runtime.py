@@ -19,6 +19,12 @@ DEPENDENCY_BAG = _DependencyBag()
 
 PUBLIC_STUB_MODULES = [
     "dependencies",
+    # LangGraph 桩仅供 Agent 编排单测使用，不能污染后续真实研究图的 values 流契约。
+    "langgraph",
+    "langgraph.graph",
+    "langgraph.types",
+    "langgraph.checkpoint",
+    "langgraph.checkpoint.memory",
     "services.memory",
     "tools.arxiv_tools",
     "tools.paper_qa_tools",

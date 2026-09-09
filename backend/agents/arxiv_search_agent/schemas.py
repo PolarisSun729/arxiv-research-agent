@@ -1753,6 +1753,10 @@ class ArxivSearchResponse(BaseModel):
     runtime_state: Optional[AgentRuntimeState] = None
     interaction: Optional[AgentInteraction] = None
     paper_qa_result: Optional[Dict[str, Any]] = None
+    # 引用校验结果在顶层统一暴露，便于非 Paper QA 前端也能消费边界告警。
+    cited_source_ids: List[str] = Field(default_factory=list)
+    citation_debug: Optional[Dict[str, Any]] = None
+    citation_warning: Optional[str] = None
     resolved_paper: Optional[Dict[str, Any]] = None
     preference_action_result: Optional[Dict[str, Any]] = None
     plan: List[str] = Field(default_factory=list)

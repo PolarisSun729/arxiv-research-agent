@@ -7,12 +7,14 @@ import io
 from datetime import datetime
 from typing import List, Dict, Optional, Iterator, Any, Tuple
 import logging
+from services.llm.call_metrics import record_llm_call, record_llm_usage
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 from openai import OpenAI
 import requests
 from services.intent.intent_service import EXPERIMENT_INTENTS, MAIN_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
+from services.paper_qa.answer_language import CHINESE_FINAL_ANSWER_INSTRUCTION
 from utils.model_utils import get_huggingface_model_path
 from utils.config import GENERATION_CONFIG
 from utils.storage_paths import resolve_backend_artifact_path
@@ -148,6 +150,16 @@ class GenerationService:
             "selected_model": selected_model,
             "routing_source": routing_source,
             "fallback_reason": fallback_reason,
+        }
+
+    def evaluation_configuration(self) -> Dict[str, Any]:
+        """公开实际模型路由的配置快照；显式列出字段，避免密钥进入评测文件。"""
+        return {
+            "provider": "qwen",
+            "models": {"small": QWEN_SMALL_MODEL_NAME, "large": QWEN_LARGE_MODEL_NAME,
+                       "rerank_compression": QWEN_RERANK_COMPRESS_MODEL_NAME},
+            "task_model_roles": dict(QWEN_TASK_MODEL_ROLES),
+            "default_role": "large", "enable_thinking": QWEN_RERANK_COMPRESS_ENABLE_THINKING,
         }
 
     def compress_chunk_for_rerank(
@@ -360,12 +372,15 @@ Answer:"""
                 {"role": "user", "content": f"Context: {context}\n\nQuestion: {query}"}
             ]
             
+            # 只在 SDK 边界计数，避免上层 generate/重试包装重复统计同一次请求。
+            record_llm_call(model=self.models["openai"][model_name], task_type="generation")
             response = client.chat.completions.create(
                 model=self.models["openai"][model_name],
                 messages=messages,
                 temperature=GENERATION_CONFIG["openai_chat_temperature"],
                 max_tokens=GENERATION_CONFIG["openai_chat_max_tokens"]
             )
+            record_llm_usage(getattr(response, "usage", None))
             
             return response.choices[0].message.content.strip()
             
@@ -417,11 +432,13 @@ Answer:"""
             if request_debug is not None:
                 request_debug.update(input_debug)
 
+            record_llm_call(model=model_name, task_type=task_type or "generation")
             response = client.responses.create(
                 model=model_name,
                 input=qwen_input,
                 extra_body={"enable_thinking": enable_thinking},
             )
+            record_llm_usage(getattr(response, "usage", None))
 
             answer = getattr(response, "output_text", None)
             if answer:
@@ -469,11 +486,13 @@ Answer:"""
                 api_key=api_key,
                 base_url=QWEN_BASE_URL,
             )
+            record_llm_call(model=model_name, task_type=task_type or "completion")
             response = client.responses.create(
                 model=model_name,
                 input=prompt,
                 extra_body={"enable_thinking": enable_thinking},
             )
+            record_llm_usage(getattr(response, "usage", None))
 
             answer = getattr(response, "output_text", None)
             if answer:
@@ -1064,12 +1083,14 @@ Answer:"""
         return normalized[:limit].rstrip()
 
     def _build_qwen_prompt(self, query: str, context: str) -> str:
+        # 这是所有 Paper QA Qwen 请求的底层提示入口，必须在这里再次声明中文要求，避免业务层提示被英文证据稀释。
         return (
-            "You are a strict academic QA assistant. Answer only from the provided context.\n"
-            "If the context is insufficient, say you cannot determine it.\n\n"
-            f"Context:\n{context}\n\n"
-            f"Question: {query}\n\n"
-            "Answer:"
+            "你是严格的学术问答助手，只能根据提供的文本证据回答。\n"
+            "如果证据不足，请明确说明无法确定，不要编造结论。\n"
+            f"{CHINESE_FINAL_ANSWER_INSTRUCTION}\n\n"
+            f"证据上下文：\n{context}\n\n"
+            f"问题：{query}\n\n"
+            "请直接用中文回答："
         )
 
     def _build_qwen_input(
@@ -1109,16 +1130,19 @@ Answer:"""
 
         evidence_lines = []
         for index, item in enumerate(asset_metadata, start=1):
+            source_id = str(item.get("source_id") or f"image-{index}").strip()
             evidence_lines.append(
-                f"[Image {index}] page={item.get('page_number', '')} summary={item.get('asset_summary', '')} section={item.get('section_path', '')}"
+                f"[source:{source_id}] page={item.get('page_number', '')} summary={item.get('asset_summary', '')} section={item.get('section_path', '')}"
             )
 
         intro_text = (
-            "You are a strict academic QA assistant. Answer only from the provided context and image evidence.\n"
-            "If the context is insufficient, say you cannot determine it.\n\n"
-            f"Text Context:\n{context}\n\n"
-            f"Image Evidence Notes:\n{chr(10).join(evidence_lines) if evidence_lines else 'None'}\n\n"
-            f"Question: {query}"
+            "你是严格的学术问答助手，只能根据提供的文本和图片证据回答。\n"
+            "如果证据不足，请明确说明无法确定，不要编造结论。\n"
+            f"{CHINESE_FINAL_ANSWER_INSTRUCTION}\n\n"
+            f"文本证据：\n{context}\n\n"
+            f"图片证据说明：\n{chr(10).join(evidence_lines) if evidence_lines else '无'}\n\n"
+            f"问题：{query}\n\n"
+            "请直接用中文回答："
         )
         content = [{"type": "input_text", "text": intro_text}]
         image_parts, image_debug = self._prepare_qwen_image_content_parts(
@@ -1281,6 +1305,7 @@ Answer:"""
                 image_inputs=image_inputs,
                 asset_metadata=asset_metadata,
             )
+            record_llm_call(model=model_name, task_type=task_type or "generation")
             stream = client.responses.create(
                 model=model_name,
                 input=qwen_input,
@@ -1299,6 +1324,7 @@ Answer:"""
                 elif event_type == "response.completed":
                     response = getattr(event, "response", None)
                     usage = getattr(response, "usage", None) if response else None
+                    record_llm_usage(usage)
                     yield {
                         "type": "completed",
                         "answer": "".join(answer_parts),
@@ -1340,12 +1366,14 @@ Answer:"""
                 {"role": "system", "content": "You are a helpful assistant. Use the provided context to answer the question."},
                 {"role": "user", "content": f"Context: {context}\n\nQuestion: {query}"},
             ]
+            record_llm_call(model=self.models["deepseek"][model_name], task_type="generation")
             response = client.chat.completions.create(
                 model=self.models["deepseek"][model_name],
                 messages=messages,
                 max_tokens=512,
                 stream=False,
             )
+            record_llm_usage(getattr(response, "usage", None))
 
             if model_name == "deepseek-r1":
                 message = response.choices[0].message
@@ -1387,10 +1415,15 @@ Answer:"""
         """
         try:
             # 准备上下文
-            context = "\n\n".join([
-                f"[Source {i+1}]: {result['text']}"
+            # 生成上下文也使用稳定 source_id，避免模型从旧的 Source 序号提示中复制不可定位引用。
+            context = "\n\n".join(
+                (
+                    f"[source:{result.get('source_id')}]: {result.get('text', '')}"
+                    if str(result.get("source_id") or "").strip()
+                    else f"Evidence {i + 1}: {result.get('text', '')}"
+                )
                 for i, result in enumerate(search_results)
-            ])
+            )
 
             model_selection: Dict[str, str] = {
                 "task_type": self._normalize_task_type(task_type) or "default",

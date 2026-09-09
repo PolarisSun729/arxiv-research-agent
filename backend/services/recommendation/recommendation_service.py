@@ -1307,7 +1307,8 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         disliked_vector = user_vector_data.get("disliked_vector_data") if user_vector_data else None
         negative_feedback_profile = user_vector_data.get("negative_feedback_profile", {}) if user_vector_data else {}
         embedding_config = self.get_embedding_config() if personalized_available else None
-        hard_excluded_ids = set(self._normalize_text_terms(disliked_ids))
+        # 搜索结果进入个性化重排前，已明确反馈过的论文都不应再次作为推荐候选；liked 论文虽是正向信号，但它已经被用户处理过。
+        hard_excluded_ids = set(self._normalize_text_terms([*liked_ids, *disliked_ids]))
 
         candidate_ids = [str(paper.get("arxiv_id", "") or paper.get("id", "") or "").strip() for paper in normalized_papers if str(paper.get("arxiv_id", "") or paper.get("id", "") or "").strip()]
         stored_embeddings: Dict[str, List[float]] = {}

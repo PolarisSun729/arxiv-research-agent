@@ -16,14 +16,18 @@ export type QaTurnStatus =
 export type QaPersistenceStatus = 'unknown' | 'saved' | 'failed' | 'not_saved'
 
 export interface RagChatSource {
+  source_id: string
   content: string
   page_number: string
   source?: string
+  section_title?: string
   section_path?: string
   parent_chunk_id?: string | number
   chunk_type?: string
   asset_summary?: string
   asset_preview_text?: string
+  asset_url?: string
+  is_cited?: boolean
 }
 
 // This mirrors the current QA turn shape so existing page state can be
@@ -46,12 +50,16 @@ export interface QaTurnForRagChat {
   contextualizedQuestion?: string
   usedShortTermMemory?: boolean
   questionContextualization?: Record<string, any> | null
+  citedSourceIds?: string[]
+  citationWarning?: string | null
 }
 
 export interface RagChatMessage extends AgentChatMessage<QaTurnForRagChat> {
   turnId: string
   sources: RagChatSource[]
   retrievalDebug: RetrievalDebug | null
+  citedSourceIds: string[]
+  citationWarning: string | null
 }
 
 // Keep the transformation centralized so the future UI swap can reuse the same
@@ -67,7 +75,9 @@ export function qaTurnToRagMessages(turn: QaTurnForRagChat): RagChatMessage[] {
     response: null,
     error: null,
     sources: [],
-    retrievalDebug: null
+    retrievalDebug: null,
+    citedSourceIds: [],
+    citationWarning: null
   }
 
   const assistantMessage: RagChatMessage = {
@@ -80,7 +90,9 @@ export function qaTurnToRagMessages(turn: QaTurnForRagChat): RagChatMessage[] {
     response: turn,
     error: turn.error ?? null,
     sources: turn.sources,
-    retrievalDebug: turn.retrievalDebug ?? null
+    retrievalDebug: turn.retrievalDebug ?? null,
+    citedSourceIds: turn.citedSourceIds || [],
+    citationWarning: turn.citationWarning || null
   }
 
   return [userMessage, assistantMessage]

@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 import re
+import logging
 from typing import Any, Dict, List
 
+from services.paper_qa.citation_contract import (
+    extract_cited_source_ids as extract_cited_source_ids_contract,
+    strip_invalid_citations as strip_invalid_citations_contract,
+    validate_citations as validate_citations_contract,
+)
+from services.paper_qa.answer_language import CHINESE_FINAL_ANSWER_INSTRUCTION
 from services.prompt_context import PromptContextBuilder
+
+logger = logging.getLogger(__name__)
 
 
 class AnswerGenerator:
@@ -48,7 +57,12 @@ class AnswerGenerator:
         generation_result = self.generation_service.generate(
             provider="qwen",
             task_type="paper_qa_final_answer",
-            query=generation_question,
+            query=(
+                f"{generation_question}\n\n"
+                f"{CHINESE_FINAL_ANSWER_INSTRUCTION}\n"
+                "引用格式要求：每个证据引用必须单独写成 [source:{source_id}]；禁止把多个引用合并在一对方括号内，"
+                "禁止裸 source:number/source-*、[Source 1]、[Image 1] 和其他数字引用。"
+            ),
             search_results=generation_search_results,
             image_inputs=context_pack.get("image_inputs") or [],
             asset_metadata=figure_metadata,
@@ -59,6 +73,50 @@ class AnswerGenerator:
             for source in (context_pack.get("source_payload") or [])
             if str(source.get("source_id", "") or "").strip()
         ]
+        citation_debug = self.validate_citations(answer, source_ids)
+        citation_warning = None
+        if citation_debug["invalid_citations"]:
+            # 引用格式是前端定位证据的协议；只允许一次修复，避免坏模型输出触发无限重试。
+            repair_query = (
+                f"{generation_question}\n\n"
+                f"{CHINESE_FINAL_ANSWER_INSTRUCTION}\n"
+                "引用修复要求：重新回答同一个问题。所有证据引用必须严格写成 "
+                "[source:{source_id}]，source_id 必须来自证据块；每个引用单独占一对方括号，禁止合并引用或裸 source:number/source-*；"
+                "删除 [Source 1]、[Image 1] 及其他旧格式引用，不要解释修复过程。"
+            )
+            try:
+                repaired_generation_result = self.generation_service.generate(
+                    provider="qwen",
+                    task_type="paper_qa_final_answer_citation_repair",
+                    query=repair_query,
+                    search_results=generation_search_results,
+                    image_inputs=context_pack.get("image_inputs") or [],
+                    asset_metadata=figure_metadata,
+                )
+                repaired_answer = self.extract_answer(repaired_generation_result)
+                repaired_debug = self.validate_citations(repaired_answer, source_ids)
+                citation_debug["repair_attempted"] = True
+                citation_debug["repair_succeeded"] = not bool(repaired_debug["invalid_citations"])
+                if citation_debug["repair_succeeded"]:
+                    answer = repaired_answer
+                    generation_result = repaired_generation_result
+                    citation_debug = repaired_debug
+                    citation_debug["repair_attempted"] = True
+                    citation_debug["repair_succeeded"] = True
+                else:
+                    # 二次失败时只移除无法定位的标记，保留正文和证据面板，避免整段答案消失。
+                    answer = self.strip_invalid_citations(repaired_answer, source_ids)
+                    citation_warning = "部分引用未通过校验"
+                    citation_debug = repaired_debug
+                    citation_debug["repair_attempted"] = True
+                    citation_debug["repair_succeeded"] = False
+            except Exception as exc:
+                # 修复调用本身失败时保留首轮答案，避免引用协议问题放大成整次 QA 失败。
+                logger.warning("Citation repair generation failed; keep sanitized first answer: %s", exc)
+                answer = self.strip_invalid_citations(answer, source_ids)
+                citation_warning = "部分引用未通过校验"
+                citation_debug["repair_attempted"] = True
+                citation_debug["repair_succeeded"] = False
         cited_source_ids = self.extract_cited_source_ids(answer, source_ids)
         claims = self.extract_claims(answer)
         insufficient_evidence = self.detect_insufficient_evidence(answer)
@@ -68,6 +126,8 @@ class AnswerGenerator:
             "cited_source_ids": cited_source_ids,
             "claims": claims,
             "insufficient_evidence": insufficient_evidence,
+            "citation_debug": citation_debug,
+            "citation_warning": citation_warning,
             "raw_generation_result": generation_result,
             "generation_debug": {
                 "provider": "qwen",
@@ -79,6 +139,8 @@ class AnswerGenerator:
                 "figure_asset_metadata_count": len(figure_metadata),
                 "answer_chars": len(answer),
                 "cited_source_ids": cited_source_ids,
+                "citation_debug": citation_debug,
+                "citation_warning": citation_warning,
                 "claim_count": len(claims),
                 "prompt_context": prompt_assembly.get("debug", {}),
                 "model": generation_result.get("model") if isinstance(generation_result, dict) else None,
@@ -98,23 +160,84 @@ class AnswerGenerator:
                     return str(value).strip()
         return str(generation_result or "").strip()
 
+    def validate_and_repair_stream_answer(
+        self,
+        *,
+        answer: str,
+        generation_question: str,
+        context_pack: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """为流式输出补齐与同步问答相同的一次引用修复闭环。"""
+        source_ids = [
+            str(source.get("source_id") or "").strip()
+            for source in (context_pack.get("source_payload") or [])
+            if str(source.get("source_id") or "").strip()
+        ]
+        citation_debug = self.validate_citations(answer, source_ids)
+        citation_warning = None
+        final_answer = answer or ""
+        if citation_debug["invalid_citations"]:
+            assembly = self.prompt_context_builder.build_paper_qa_final_answer_context(
+                question=generation_question,
+                contextualized_question=generation_question,
+                context_pack=context_pack,
+            )
+            search_results = self.prompt_context_builder.generation_search_results_from_assembly(assembly, context_pack)
+            figure_metadata = [
+                item for item in (context_pack.get("asset_metadata") or [])
+                if str(item.get("chunk_type") or "").lower() == "figure"
+            ]
+            try:
+                repaired = self.generation_service.generate(
+                    provider="qwen",
+                    task_type="paper_qa_final_answer_citation_repair",
+                    query=(
+                        f"{generation_question}\n\n{CHINESE_FINAL_ANSWER_INSTRUCTION}\n"
+                        "引用修复要求：所有证据引用必须严格写成 "
+                        "[source:{source_id}]，source_id 必须来自证据块；每个引用单独占一对方括号，禁止合并引用或裸 source:number/source-*；"
+                        "删除所有旧格式引用。"
+                    ),
+                    search_results=search_results,
+                    image_inputs=context_pack.get("image_inputs") or [],
+                    asset_metadata=figure_metadata,
+                )
+                repaired_answer = self.extract_answer(repaired)
+                repaired_debug = self.validate_citations(repaired_answer, source_ids)
+                repaired_debug["repair_attempted"] = True
+                repaired_debug["repair_succeeded"] = not bool(repaired_debug["invalid_citations"])
+                if repaired_debug["repair_succeeded"]:
+                    final_answer = repaired_answer
+                    citation_debug = repaired_debug
+                else:
+                    final_answer = self.strip_invalid_citations(repaired_answer, source_ids)
+                    citation_debug = repaired_debug
+                    citation_warning = "部分引用未通过校验"
+            except Exception as exc:
+                logger.warning("Streaming citation repair generation failed; keep sanitized answer: %s", exc)
+                final_answer = self.strip_invalid_citations(final_answer, source_ids)
+                citation_debug["repair_attempted"] = True
+                citation_debug["repair_succeeded"] = False
+                citation_warning = "部分引用未通过校验"
+        return {
+            "answer": final_answer,
+            "cited_source_ids": self.extract_cited_source_ids(final_answer, source_ids),
+            "citation_debug": citation_debug,
+            "citation_warning": citation_warning,
+        }
+
     @staticmethod
     def extract_cited_source_ids(answer: str, source_ids: List[str]) -> List[str]:
-        if not answer or not source_ids:
-            return []
-        cited: List[str] = []
-        for source_id in source_ids:
-            if source_id and source_id in answer and source_id not in cited:
-                cited.append(source_id)
-        # 兼容模型按 Source 编号引用而没有直接写 source_id 的情况。
-        for match in re.findall(r"(?:Source|来源|证据)\s*\[?#?(\d+)\]?", answer, flags=re.IGNORECASE):
-            try:
-                index = int(match) - 1
-            except ValueError:
-                continue
-            if 0 <= index < len(source_ids) and source_ids[index] not in cited:
-                cited.append(source_ids[index])
-        return cited
+        return extract_cited_source_ids_contract(answer, source_ids)
+
+    @staticmethod
+    def validate_citations(answer: str, source_ids: List[str]) -> Dict[str, Any]:
+        """校验新引用协议，并显式拒绝历史 [Source 1]/[Image 1] 格式。"""
+        return validate_citations_contract(answer, source_ids)
+
+    @staticmethod
+    def strip_invalid_citations(answer: str, source_ids: List[str]) -> str:
+        """仅清理无法定位的引用标记，保留用户仍可阅读的回答文本。"""
+        return strip_invalid_citations_contract(answer, source_ids)
 
     @staticmethod
     def extract_claims(answer: str) -> List[Dict[str, Any]]:

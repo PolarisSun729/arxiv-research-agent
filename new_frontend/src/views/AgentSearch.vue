@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { dislikePaper, likePaper, removePaperPreference } from '@/api/papers'
@@ -7,15 +7,26 @@ import { useAgentSearchChat } from '@/composables/useAgentSearchChat'
 import AgentUserResultAttachments from '@/components/agent-search/AgentUserResultAttachments.vue'
 import AgentWorkCard from '@/components/agent-search/AgentWorkCard.vue'
 import RagChatPanel from '@/components/rag-chat/RagChatPanel.vue'
+import RagEvidencePanel from '@/components/rag-chat/RagEvidencePanel.vue'
 import type { AgentInteraction, ArxivSearchResponse, TargetSelectionPayload } from '@/types/agent'
 import type { Paper } from '@/types/paper'
 import { usePaperStore } from '@/stores/paperStore'
 import { getPaperTargetCandidateId, toAgentUserResult, type AgentUserResult } from '@/utils/agentUserResult'
+import { extractCitedSourceIds } from '@/utils/evidence'
+import type { RagChatSource } from '@/types/ragChat'
 
 const router = useRouter()
 const store = usePaperStore()
 const agentPaperLabels = new Map<string, 'liked' | 'disliked'>()
 const profileTopicPreview = computed(() => (store.researchProfile?.positive_topics || []).slice(0, 4))
+const agentEvidenceDrawerOpen = ref(false)
+const activeAgentEvidence = ref<{
+  question: string
+  sources: RagChatSource[]
+  citedSourceIds: string[]
+  citationWarning: string | null
+  highlightedSourceId: string | null
+} | null>(null)
 
 const {
   inputMessage,
@@ -142,6 +153,27 @@ function toAgentUserResultForMessage(response: unknown): AgentUserResult {
   })
 }
 
+function openAgentEvidence(response: unknown, sourceId?: string) {
+  const agentResponse = toAgentResponse(response)
+  const result = toAgentUserResultForMessage(response)
+  if (!result.evidenceSources.length) return
+  const citedSourceIds = result.citedSourceIds.length
+    ? result.citedSourceIds
+    : extractCitedSourceIds(agentResponse?.paper_qa_result?.answer || '', result.evidenceSources)
+  activeAgentEvidence.value = {
+    question: agentResponse?.paper_qa_result?.question || 'Agent 回答证据',
+    sources: result.evidenceSources,
+    citedSourceIds,
+    citationWarning: result.citationWarning,
+    highlightedSourceId: sourceId || null
+  }
+  agentEvidenceDrawerOpen.value = true
+}
+
+function handleAgentSourceSelect(item: any, sourceId: string) {
+  openAgentEvidence(item.response, sourceId)
+}
+
 function syncAgentPreferenceState() {
   const response = latestResponse.value
   const result = response?.preference_action_result
@@ -247,6 +279,7 @@ watch(latestResponse, () => {
         sender-placeholder="请输入自然语言搜索需求，Enter 发送，Shift+Enter 换行"
         @submit-question="submitMessage"
         @select-prompt="handlePromptSelect"
+        @select-source="handleAgentSourceSelect"
       >
         <template #message-footer="{ item }">
           <AgentUserResultAttachments
@@ -257,10 +290,24 @@ watch(latestResponse, () => {
             @label="handleLabel"
             @confirm-interaction="handleConfirmInteraction"
             @cancel-interaction="handleCancelInteraction"
+            @view-evidence="openAgentEvidence(item.response)"
           />
         </template>
       </RagChatPanel>
     </section>
+
+    <el-drawer v-model="agentEvidenceDrawerOpen" title="回答证据" size="min(560px, 92vw)">
+      <RagEvidencePanel
+        v-if="activeAgentEvidence"
+        :question="activeAgentEvidence.question"
+        :sources="activeAgentEvidence.sources"
+        :cited-source-ids="activeAgentEvidence.citedSourceIds"
+        :citation-warning="activeAgentEvidence.citationWarning"
+        :highlighted-source-id="activeAgentEvidence.highlightedSourceId"
+        :retrieval-debug="null"
+        @select-source="activeAgentEvidence.highlightedSourceId = $event"
+      />
+    </el-drawer>
   </div>
 </template>
 

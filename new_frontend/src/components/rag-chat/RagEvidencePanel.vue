@@ -8,6 +8,9 @@ import type { RagChatSource } from '@/types/ragChat'
 const props = defineProps<{
   question?: string
   sources: RagChatSource[]
+  citedSourceIds?: string[]
+  citationWarning?: string | null
+  highlightedSourceId?: string | null
   retrievalDebug: RetrievalDebug | null
   traceDownloading?: boolean
   showClose?: boolean
@@ -18,6 +21,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (event: 'download-trace', format: 'md' | 'json'): void
   (event: 'close'): void
+  (event: 'select-source', sourceId: string): void
 }>()
 
 function formatDebugNumber(value?: number | null) {
@@ -94,7 +98,19 @@ const hasEvidence = computed(() => Boolean(props.question || props.sources.lengt
 
       <section class="rag-evidence-panel__section">
         <div class="rag-evidence-panel__section-title">参考来源</div>
-        <RagCitationList :sources="sources" />
+        <el-alert
+          v-if="citationWarning"
+          class="rag-evidence-panel__citation-warning"
+          type="warning"
+          :closable="false"
+          :title="citationWarning"
+        />
+        <RagCitationList
+          :sources="sources"
+          :cited-source-ids="citedSourceIds || []"
+          :highlighted-source-id="highlightedSourceId"
+          @select-source="emit('select-source', $event)"
+        />
       </section>
 
       <section v-if="retrievalDebug" class="rag-evidence-panel__section">

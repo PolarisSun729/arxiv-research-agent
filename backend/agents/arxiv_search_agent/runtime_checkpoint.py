@@ -347,7 +347,8 @@ class AgentRuntimeCheckpointManager:
             },
             interaction=interaction,
             schema_version=2,
-            current_node=current_node or _extract_current_node(payload),
+            # 节点坐标由图调用方显式提供；缺失时保留未知，不能从展示 debug 伪造恢复位置。
+            current_node=current_node,
             next_route=next_route or _next_route_from_status(status),
             status=status,
             error_summary=error_summary,
@@ -376,7 +377,7 @@ class AgentRuntimeCheckpointManager:
             thread_id=session_id,
             runtime_state=payload.get("runtime_state") if isinstance(payload.get("runtime_state"), Mapping) else None,
             graph_state={"session_id": session_id, "intent": payload.get("intent"), "steps": payload.get("steps") or []},
-            current_node=_extract_current_node(payload),
+            current_node=None,
             next_route=_next_route_from_status(status),
             status=status,
             error_summary=error_summary or _extract_error_summary(payload),

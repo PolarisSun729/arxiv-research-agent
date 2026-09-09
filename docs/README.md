@@ -11,6 +11,7 @@
 | 应用如何分层、请求如何进入各能力 | [系统架构](architecture/system-overview.md) | [`backend/main.py`](../backend/main.py)、[`backend/dependencies.py`](../backend/dependencies.py) |
 | Agent 如何规划、执行、确认和恢复 | [Agent Runtime](capabilities/agent-runtime.md) | [`backend/agents/arxiv_search_agent/`](../backend/agents/arxiv_search_agent/) |
 | 单篇论文 QA、索引任务、会话与诊断如何协作 | [论文 QA](capabilities/paper-qa.md) | [`backend/services/paper_qa/`](../backend/services/paper_qa/) |
+| 生成质量、正确拒答、修复增益和成本如何评分 | [生成效果评测](capabilities/evaluation.md) | [`backend/services/evaluation/`](../backend/services/evaluation/) |
 | 检索、融合、rerank、上下文预算和索引资产归谁负责 | [检索与索引](capabilities/retrieval-and-indexing.md) | [`backend/services/retrieval/`](../backend/services/retrieval/) |
 | 画像、行为信号和推荐排序如何保持语义一致 | [研究画像与推荐](capabilities/research-profile-and-recommendations.md) | [`backend/services/memory/`](../backend/services/memory/)、[`backend/services/recommendation/`](../backend/services/recommendation/) |
 | 修改后应如何验证，以及何时必须同步文档 | [维护与质量](operations/maintenance-quality.md) | [`scripts/check_quality.py`](../scripts/check_quality.py) |
@@ -32,6 +33,7 @@
 | Router 注册、全局错误出口、依赖装配或持久化容器 | [系统架构](architecture/system-overview.md) |
 | Agent 图节点、计划/工具契约、确认或 checkpoint 语义 | [Agent Runtime](capabilities/agent-runtime.md) |
 | QA 索引阶段、异步任务状态、问答证据或修复信号 | [论文 QA](capabilities/paper-qa.md) |
+| 评测记录、指标定义、golden 格式、调用统计或基线比较 | [生成效果评测](capabilities/evaluation.md) |
 | 召回路由、融合、rerank 降级、预算或索引版本语义 | [检索与索引](capabilities/retrieval-and-indexing.md) |
 | 画像层次、行为信号、候选召回、排序或多样性策略 | [研究画像与推荐](capabilities/research-profile-and-recommendations.md) |
 | 校验脚本、CI 编排或验收口径 | [维护与质量](operations/maintenance-quality.md) |

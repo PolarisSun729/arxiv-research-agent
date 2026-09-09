@@ -239,13 +239,56 @@ class CandidateMaterializer:
             ordered_candidates.append(merged_candidate)
         return ordered_candidates, stats
 
+    @staticmethod
+    def _merge_non_empty_paper_fields(
+        primary: Optional[Dict[str, Any]],
+        fallback: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """合并论文元数据，避免一次不完整请求把已有的可展示字段覆盖为空。"""
+        merged = dict(fallback or {})
+        for key, value in (primary or {}).items():
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            if isinstance(value, (list, tuple, set)) and not any(str(item).strip() for item in value):
+                continue
+            merged[key] = value
+        return merged
+
     def _ensure_paper_materialized(self, arxiv_id: str, paper_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """确保单篇论文已经具备论文表记录和可用 embedding 的最小落库状态。"""
         existing_paper = self.paper_catalog_store.get_paper(arxiv_id)
         existing_embedding = self._get_existing_paper_embedding(arxiv_id)
 
         if existing_paper and existing_paper.get("embedding_id") and existing_embedding:
-            return existing_paper
+            if not paper_payload:
+                return existing_paper
+
+            # 已有向量只代表检索资产存在，不代表论文展示元数据完整；点赞请求携带的新字段需要回填旧记录。
+            normalized_paper = self._normalize_paper_record(
+                self._merge_non_empty_paper_fields(paper_payload, existing_paper),
+                arxiv_id,
+            )
+            refreshed_payload = {
+                "arxiv_id": normalized_paper["arxiv_id"],
+                "title": normalized_paper["title"],
+                "authors": normalized_paper["authors"],
+                "abstract": normalized_paper["abstract"],
+                "categories": normalized_paper["categories"],
+                "published_date": normalized_paper["published_date"],
+                "url": normalized_paper["url"],
+                # 只更新展示元数据，复用已验证存在的向量，避免重复调用 embedding 服务。
+                "embedding_id": str(existing_paper.get("embedding_id") or existing_embedding.get("embedding_id") or ""),
+                "embedding_model": str(
+                    existing_paper.get("embedding_model")
+                    or existing_embedding.get("embedding_model")
+                    or normalized_paper["embedding_model"]
+                ),
+            }
+            if not self.paper_catalog_store.add_paper(refreshed_payload):
+                raise HTTPException(status_code=500, detail=f"Failed to refresh paper metadata {arxiv_id}")
+            return self.paper_catalog_store.get_paper(arxiv_id) or refreshed_payload
 
         source_paper = paper_payload or existing_paper or existing_embedding
         if not source_paper:
@@ -264,22 +307,22 @@ class CandidateMaterializer:
         }
 
         if existing_paper and existing_embedding and not existing_paper.get("embedding_id"):
-            updated = self.paper_catalog_store.update_paper_embedding(
-                arxiv_id=arxiv_id,
-                embedding_id=int(existing_embedding.get("embedding_id") or 0),
-                embedding_model=str(existing_embedding.get("embedding_model") or normalized_paper["embedding_model"]),
-            )
-            if updated:
-                refreshed = self.paper_catalog_store.get_paper(arxiv_id)
-                if refreshed:
-                    return refreshed
-            return {**existing_paper, "embedding_id": existing_embedding.get("embedding_id")}
+            stored = dict(paper_payload)
+            stored["embedding_id"] = str(existing_embedding.get("embedding_id") or "")
+            stored["embedding_model"] = str(existing_embedding.get("embedding_model") or normalized_paper["embedding_model"])
+            if not self.paper_catalog_store.add_paper(stored):
+                raise HTTPException(status_code=500, detail=f"Failed to refresh paper metadata {arxiv_id}")
+            refreshed = self.paper_catalog_store.get_paper(arxiv_id)
+            return refreshed or {**existing_paper, **stored}
 
         if existing_paper and existing_paper.get("embedding_id") and not existing_embedding:
             embedding_id = self._insert_paper_embedding(normalized_paper)
-            self.paper_catalog_store.update_paper_embedding(arxiv_id=arxiv_id, embedding_id=embedding_id, embedding_model=normalized_paper["embedding_model"])
+            stored = dict(paper_payload)
+            stored["embedding_id"] = str(embedding_id)
+            if not self.paper_catalog_store.add_paper(stored):
+                raise HTTPException(status_code=500, detail=f"Failed to refresh paper metadata {arxiv_id}")
             refreshed = self.paper_catalog_store.get_paper(arxiv_id)
-            return refreshed or {**existing_paper, "embedding_id": embedding_id}
+            return refreshed or {**existing_paper, **stored}
 
         if existing_embedding and not existing_paper:
             stored = dict(paper_payload)

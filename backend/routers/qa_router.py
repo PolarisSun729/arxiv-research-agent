@@ -38,6 +38,7 @@ from dependencies import (
 from core.errors import AppError, ErrorCode, error_response
 from routers.qa_utils import build_qa_diagnostic, get_latest_retrieval_trace, sanitize_trace_slug
 from services.paper_qa.qa_observation import build_error_qa_observation, build_qa_observation
+from services.paper_qa.answer_language import CHINESE_FINAL_ANSWER_INSTRUCTION
 from utils.config import get_default_user_id, get_qa_index_job_runtime_config
 
 logger = logging.getLogger(__name__)
@@ -738,6 +739,8 @@ async def qa_paper(arxiv_id: str, payload: QaRequest, paper_qa_service=Depends(g
             exc.recoverable,
             exc.detail,
         )
+
+
         return error_response(exc)
     except HTTPException:
         raise
@@ -752,6 +755,32 @@ async def qa_paper(arxiv_id: str, payload: QaRequest, paper_qa_service=Depends(g
         )
 
 
+@router.get("/evidence-assets/{source_id}")
+async def get_evidence_asset(
+    arxiv_id: str,
+    source_id: str,
+    paper_qa_service=Depends(get_paper_qa_service),
+):
+    """按论文和稳定 source_id 返回图片，不允许客户端传入任意服务器路径。"""
+    try:
+        asset_path = paper_qa_service.resolve_evidence_asset_path(arxiv_id, source_id)
+        suffix = Path(asset_path).suffix.lower()
+        media_type = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+        }.get(suffix, "application/octet-stream")
+        return FileResponse(asset_path, media_type=media_type)
+    except FileNotFoundError:
+        # 对外统一返回 404，避免泄漏索引路径、资产路径或论文是否存在的内部细节。
+        raise HTTPException(status_code=404, detail="evidence asset not found")
+    except Exception as exc:
+        logger.warning("Evidence asset lookup failed: arxiv_id=%s source_id=%s error=%s", arxiv_id, source_id, exc)
+        raise HTTPException(status_code=404, detail="evidence asset not found")
+
+
 @router.post("/qa/stream")
 async def qa_paper_stream(
     arxiv_id: str,
@@ -759,13 +788,71 @@ async def qa_paper_stream(
     paper_qa_service=Depends(get_paper_qa_service),
     generation_service=Depends(get_generation_service),
 ):
-    """执行流式论文问答，并以 SSE 持续向前端推送事件。"""
+    """执行流式论文问答，并以 SSE 持续向前端推送事件。
+
+    Phase 3: 如果 paper_qa_service 有 research_service，使用证据研究引擎流式接口。
+    """
     question = payload.question.strip()
     logger.debug("QA stream request for paper: %s, question: %s", arxiv_id, question)
 
     def sse_event(event_name: str, data: dict) -> str:
         """格式化单条 SSE 消息。"""
         return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    def event_stream_with_research():
+        """使用证据研究引擎的流式事件生成器。"""
+        try:
+            for event in paper_qa_service.answer_question_with_research_stream(arxiv_id, payload):
+                event_type = event.get("event", "unknown")
+                event_data = event.get("data", {})
+
+                # 映射研究引擎事件到 SSE 事件
+                if event_type == "research_started":
+                    yield sse_event("meta", {
+                        "status": "started",
+                        "arxiv_id": event_data.get("arxiv_id"),
+                        "question": event_data.get("question"),
+                    })
+                elif event_type == "retrieval_completed":
+                    yield sse_event("progress", {
+                        "stage": "retrieval",
+                        "retrieval_count": event_data.get("retrieval_count", 0),
+                        "new_candidate_count": event_data.get("new_candidate_count", 0),
+                    })
+                elif event_type == "draft_created":
+                    yield sse_event("progress", {
+                        "stage": "draft",
+                        "draft_attempt": event_data.get("draft_attempt", 0),
+                        "claim_count": event_data.get("claim_count", 0),
+                    })
+                elif event_type == "claim_verification_completed":
+                    yield sse_event("progress", {
+                        "stage": "verification",
+                        "supported_count": event_data.get("supported_count", 0),
+                    })
+                elif event_type == "research_completed":
+                    yield sse_event("progress", {
+                        "stage": "completed",
+                        "outcome": event_data.get("outcome"),
+                    })
+                elif event_type == "done":
+                    event_data = dict(event_data)
+                    event_data["chat_session"] = _serialize_chat_session(event_data.get("chat_session") or {})
+                    yield sse_event("done", event_data)
+        except AppError as exc:
+            # 服务只抛结构化异常；路由是唯一 error 出口，避免一轮失败发送两次错误。
+            yield sse_event("error", exc.to_payload())
+        except Exception:
+            logger.exception("Error in research stream: arxiv_id=%s", arxiv_id)
+            observation = build_error_qa_observation(
+                error_code=ErrorCode.UNKNOWN_ERROR, error_stage="research_stream",
+                error_reason="research_execution_failed",
+            )
+            # 最后一道兜底也不能返回异常字符串，其中可能包含 provider 响应或服务器路径。
+            yield sse_event("error", AppError(
+                ErrorCode.UNKNOWN_ERROR, detail={"stage": "research_stream"},
+                context={"arxiv_id": arxiv_id, "qa_observation": observation},
+            ).to_payload())
 
     def event_stream():
         """生成 SSE 事件流。
@@ -804,15 +891,18 @@ async def qa_paper_stream(
                     "used_short_term_memory": bool(question_contextualization.get("used_short_term_memory", False)),
                     "question_contextualization": question_contextualization,
                     "sources": source_payload,
-                    "image_inputs": qa_context["image_inputs"],
-                    "asset_metadata": qa_context["asset_metadata"],
                     "qa_observation": qa_observation,
                     "retrieval_debug": retrieval_debug,
                 },
             )
 
             for chunk in generation_service.stream_qwen_responses(
-                query=contextualized_question,
+                query=(
+                    f"{contextualized_question}\n\n"
+                    f"{CHINESE_FINAL_ANSWER_INSTRUCTION}\n"
+                    "引用格式要求：每个证据引用必须单独写成 [source:{source_id}]；禁止把多个引用合并在一对方括号内，"
+                    "禁止裸 source:number/source-*、[Source 1]、[Image 1] 和其他数字引用。"
+                ),
                 context=qa_context["text_context"],
                 # 纸面 QA 的最终答案属于高质量生成任务，明确走大模型。
                 task_type="paper_qa_final_answer",
@@ -825,6 +915,25 @@ async def qa_paper_stream(
                     yield sse_event("delta", {"delta": chunk.get("delta", "")})
                 elif chunk.get("type") == "completed":
                     final_answer = chunk.get("answer", "") or ""
+                    answer_generator = getattr(paper_qa_service, "answer_generator", None)
+                    if answer_generator is not None and hasattr(answer_generator, "validate_and_repair_stream_answer"):
+                        citation_result = answer_generator.validate_and_repair_stream_answer(
+                            answer=final_answer,
+                            generation_question=contextualized_question,
+                            context_pack=qa_context.get("context_pack") or {},
+                        )
+                    else:
+                        # 仅用于旧测试替身或降级服务；真实 PaperQAService 始终走严格引用校验。
+                        citation_result = {
+                            "answer": final_answer,
+                            "cited_source_ids": [],
+                            "citation_debug": None,
+                            "citation_warning": None,
+                        }
+                    final_answer = citation_result["answer"]
+                    cited_source_ids = citation_result["cited_source_ids"]
+                    citation_debug = citation_result["citation_debug"]
+                    citation_warning = citation_result["citation_warning"]
                     verification_debug = {}
                     verifier = getattr(paper_qa_service, "evidence_verifier", None)
                     if verifier is not None:
@@ -832,7 +941,7 @@ async def qa_paper_stream(
                         verification_debug = verifier.verify(
                             answer=final_answer,
                             sources=source_payload,
-                            cited_source_ids=[],
+                            cited_source_ids=cited_source_ids,
                             claims=[],
                             generation_insufficient_evidence=False,
                         )
@@ -870,8 +979,9 @@ async def qa_paper_stream(
                             "used_short_term_memory": bool(question_contextualization.get("used_short_term_memory", False)),
                             "question_contextualization": question_contextualization,
                             "sources": source_payload,
-                            "image_inputs": qa_context["image_inputs"],
-                            "asset_metadata": qa_context["asset_metadata"],
+                            "cited_source_ids": cited_source_ids,
+                            "citation_debug": citation_debug,
+                            "citation_warning": citation_warning,
                             "verification_debug": verification_debug,
                             "qa_observation": qa_observation,
                             "retrieval_debug": retrieval_debug,
@@ -910,8 +1020,6 @@ async def qa_paper_stream(
                     "used_short_term_memory": bool(question_contextualization.get("used_short_term_memory", False)),
                     "question_contextualization": question_contextualization,
                     "sources": source_payload,
-                    "image_inputs": qa_context["image_inputs"],
-                    "asset_metadata": qa_context["asset_metadata"],
                     "verification_debug": verification_debug,
                     "qa_observation": qa_observation,
                     "retrieval_debug": retrieval_debug,
@@ -947,8 +1055,14 @@ async def qa_paper_stream(
             )
             yield sse_event("error", stream_error.to_payload())
 
+    # Phase 3: 路由到证据研究引擎流式接口或旧编排流式接口
+    if hasattr(paper_qa_service, "research_service") and paper_qa_service.research_service is not None:
+        selected_stream = event_stream_with_research()
+    else:
+        selected_stream = event_stream()
+
     return StreamingResponse(
-        event_stream(),
+        selected_stream,
         media_type="text/event-stream",
         headers={
             # SSE 需要禁用缓存和代理缓冲，否则前端可能收不到实时增量。

@@ -70,6 +70,7 @@ class DraftGenerationRequest(BaseModel):
     research_question: str
     addressed_need_ids: list[str]
     context_pack: EvidenceContextPack
+    preferred_answer_style: str = ""
 
     @property
     def candidates(self) -> list[EvidenceCandidate]:
@@ -82,6 +83,11 @@ class ClaimExtractionRequest(BaseModel):
     research_question: str
     answer: str
     draft_version: int
+    # 主张必须绑定证据需求账本才能参与覆盖投影；提取器读不到完整研究状态，由图显式传入。
+    evidence_needs: list[EvidenceNeed] = Field(default_factory=list)
+    # 草稿声明使用的候选及其 matched_need_ids 是主张归属的最强信号：为某需求检索回来的
+    # 证据被某句引用，该句大概率在回应这个需求。图只传草稿引用过的候选，不暴露整个池。
+    candidates: list[EvidenceCandidate] = Field(default_factory=list)
 
 
 class ClaimVerificationRequest(BaseModel):
@@ -105,6 +111,9 @@ class ResearchDecisionContext(BaseModel):
     claim_assessments: list[ClaimAssessment]
     retrievals_remaining: int
     drafts_remaining: int
+    # 规则兜底策略所需的最小进度信息：已消耗的检索轮数与已有候选覆盖到的需求集合。
+    retrievals_used: int = 0
+    candidate_need_ids: list[str] = Field(default_factory=list)
 
 
 class PaperEvidenceResearchState(BaseModel):
@@ -119,8 +128,11 @@ class PaperEvidenceResearchState(BaseModel):
     action_accepted: bool = False
     action_rejection_code: str | None = None
     retrieval_count: int = 0
+    # 按需求保存尚未恢复的技术故障；轨迹可以裁剪，终态判断仍必须可恢复且确定。
+    retrieval_failures: dict[str, str] = Field(default_factory=dict)
     draft_attempt_count: int = 0
     verification_count: int = 0
+    citation_repair_count: int = 0
     no_progress_count: int = 0
     invalid_action_count: int = 0
     trace_events: list[dict[str, Any]] = Field(default_factory=list)

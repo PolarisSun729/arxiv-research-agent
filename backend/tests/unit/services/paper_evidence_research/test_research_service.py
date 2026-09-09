@@ -148,7 +148,10 @@ class ScriptedRetriever:
                     "table_id": "table-3",
                 }
             ]
-        return {"status": "completed", "candidates": candidates}
+        return {"status": "completed", "candidates": candidates, "index_snapshot": {
+            "collection_name": "scripted-paper", "active_build_id": "fixture-v1", "active_index_version": "v1",
+            "embedding_model": "offline-embedding-v1", "sparse_index_source_hash": "fixture-source-v1",
+        }}
 
 
 class DuplicateContentRetriever:
@@ -485,7 +488,7 @@ def _request(*, run_id: str, limits: ResearchLimits | None = None) -> PaperEvide
     )
 
 
-def _service(policy: Any) -> PaperEvidenceResearchService:
+def _service(policy: Any, *, configuration_provider: Any = None) -> PaperEvidenceResearchService:
     return PaperEvidenceResearchService(
         question_analyzer=ScriptedQuestionAnalyzer(),
         decision_policy=policy,
@@ -493,6 +496,7 @@ def _service(policy: Any) -> PaperEvidenceResearchService:
         draft_generator=ScriptedDraftGenerator(),
         claim_extractor=ScriptedClaimExtractor(),
         claim_verifier=ScriptedClaimVerifier(),
+        configuration_provider=configuration_provider,
     )
 
 
@@ -664,7 +668,7 @@ def test_budget_exhaustion_returns_only_verified_claims_as_partial_answer() -> N
 
     assert result.outcome == "partial"
     assert result.research_summary.termination_reason == "RETRIEVAL_BUDGET_EXHAUSTED"
-    assert result.answer == "反思 token 决定是否检索。"
+    assert result.answer == "反思 token 决定是否检索 [source:chunk-method]。"
     assert {citation.source_id for citation in result.citations} == {"chunk-method"}
     assert result.research_summary.satisfied_need_count == 1
     assert result.research_summary.blocked_need_count == 1

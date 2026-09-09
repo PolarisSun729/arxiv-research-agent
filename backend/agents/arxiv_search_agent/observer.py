@@ -4,6 +4,7 @@ import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from services.paper_qa.repair_actions import ASK_CLARIFICATION, ASK_USER_TO_REBUILD_INDEX, RETRY_WITH_QUERY_REWRITE
+from services.paper_qa.qa_observation import research_outcome_from_result
 
 from .schemas import FailureCategory, ObservationResult, ObservationSignal, PlanRuntime, PlanStep, RecoveryActionType, RecoverySeverity
 from .state import AgentState
@@ -49,6 +50,9 @@ def _compact_qa_observation(value: Mapping[str, Any]) -> Dict[str, Any]:
     """压缩 Paper QA 观察，只把规划和恢复需要的质量字段写入 runtime evidence。"""
     compact: Dict[str, Any] = {}
     for key in (
+        "outcome",
+        "termination_reason",
+        "research_summary",
         "schema_version",
         "retrieval_quality",
         "retrieval_quality_reason",
@@ -479,6 +483,15 @@ class Observer:
         sources = payload.get("sources")
         qa_observation = payload.get("qa_observation") if isinstance(payload.get("qa_observation"), Mapping) else {}
         qa_observation_summary = _compact_qa_observation(qa_observation)
+        outcome = research_outcome_from_result(payload)
+        if outcome and answer:
+            # 与独立质量工具共享终态口径；没有下游 quality gate 时也不能重试合法拒答。
+            return ObservationResult(
+                status="partial_success" if outcome == "partial" else "success",
+                reason=f"research_{outcome}", confidence=0.8,
+                details={"outcome": outcome, "qa_observation": qa_observation_summary,
+                         "research_summary": payload.get("research_summary") or {}},
+            )
         if not answer:
             return ObservationResult(
                 status="low_confidence",

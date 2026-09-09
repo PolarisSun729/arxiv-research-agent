@@ -47,6 +47,7 @@ const emit = defineEmits<{
   (event: 'select-prompt', prompt: string): void
   (event: 'update:senderText', value: string): void
   (event: 'stop-generation'): void
+  (event: 'select-source', item: RagChatPanelMessage, sourceId: string): void
 }>()
 
 defineSlots<{
@@ -150,6 +151,15 @@ function getAssistantStatusType(item: RagChatPanelMessage) {
   if (status === 'failed') return 'danger'
   return 'info'
 }
+
+function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessage) {
+  const target = event.target instanceof Element ? event.target.closest('a[href^="#evidence-source-"]') : null
+  if (!(target instanceof HTMLAnchorElement)) return
+  event.preventDefault()
+  const prefix = '#evidence-source-'
+  const sourceId = decodeURIComponent(target.getAttribute('href')?.slice(prefix.length) || '')
+  if (sourceId) emit('select-source', item, sourceId)
+}
 </script>
 
 <template>
@@ -200,6 +210,7 @@ function getAssistantStatusType(item: RagChatPanelMessage) {
             v-else-if="item.role === 'assistant'"
             class="assistant-markdown"
             v-html="renderMarkdownWithLatex(item.content)"
+            @click="handleAssistantContentClick($event, item)"
           />
           <div v-else class="rag-chat-panel__user-content">
             {{ item.content }}

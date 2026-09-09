@@ -74,6 +74,13 @@ def _get_sync_status_payload() -> Dict[str, Any]:
     }
 
 
+def _paper_has_display_metadata(paper: Dict[str, Any]) -> bool:
+    """判断本地论文记录是否足以支撑列表卡片展示，缺字段时允许详情接口回源修复。"""
+    title = str(paper.get("title") or "").strip()
+    abstract = str(paper.get("abstract") or paper.get("summary") or "").strip()
+    return bool(title and abstract)
+
+
 @router.get("/stats")
 async def get_dashboard_stats(
     user_id: str = Query(default_factory=get_default_user_id),
@@ -245,13 +252,32 @@ async def get_paper(
     """
     try:
         paper = paper_catalog_store.get_paper(arxiv_id)
+        if paper and _paper_has_display_metadata(paper):
+            return paper
+
+        # 历史数据可能只落了 ID/向量；缺少标题或摘要时回源并修复本地记录，避免已标记页出现空卡片。
+        try:
+            source_paper = recommendation_service._fetch_paper_from_arxiv_with_rate_limit(arxiv_id)
+        except Exception as exc:
+            logger.warning("Failed to backfill incomplete paper %s: %s", arxiv_id, exc)
+            if paper:
+                return paper
+            raise
+        if source_paper:
+            try:
+                # 优先复用已有 embedding，只补齐标题/摘要等展示元数据，避免回源一次就重复生成向量。
+                ensure_materialized = getattr(recommendation_service, "_ensure_paper_materialized", None)
+                if callable(ensure_materialized):
+                    return ensure_materialized(arxiv_id, paper_payload=source_paper)
+                # 兼容尚未提供增量物化能力的旧实现。
+                return recommendation_service._materialize_paper_from_source(source_paper, arxiv_id)
+            except Exception as exc:
+                logger.warning("Failed to persist backfilled paper %s: %s", arxiv_id, exc)
+                if paper:
+                    return paper
+                raise
         if paper:
             return paper
-        # 本地未命中时，尝试通过推荐服务做带限流的远端拉取，避免直接打爆上游接口。
-        source_paper = recommendation_service._fetch_paper_from_arxiv_with_rate_limit(arxiv_id)
-        if source_paper:
-            # 将远端返回格式转换为系统内部统一的论文结构。
-            return recommendation_service._materialize_paper_from_source(source_paper, arxiv_id)
         raise HTTPException(status_code=404, detail="Paper not found")
     except HTTPException:
         raise

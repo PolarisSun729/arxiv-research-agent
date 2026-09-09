@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover
     CrossEncoder = None  # type: ignore
 
 from services.retrieval.contracts import QueryProfile
+from services.llm.call_metrics import record_llm_call, record_llm_usage
 from services.intent.intent_service import EXPERIMENT_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
 from services.retrieval.table_evidence_formatter import render_table_evidence_rerank_text
 from utils.config import get_enhanced_retrieval_runtime_config
@@ -323,6 +324,8 @@ class RerankService:
             rerank_limit=rerank_limit,
         )
         try:
+            # 远程 rerank 绕过 GenerationService，必须在实际 HTTP 边界单独计数，超时也计入。
+            record_llm_call(model=self.config_owner.llm_rerank_model_name, task_type="rerank")
             response = requests.post(
                 request_url,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -331,6 +334,7 @@ class RerankService:
             )
             response.raise_for_status()
             data = response.json()
+            record_llm_usage(data.get("usage"))
         except Exception as exc:
             self.config_owner._llm_reranker_error = f"dashscope_rerank_request_failed: {exc}"
             logger.warning(

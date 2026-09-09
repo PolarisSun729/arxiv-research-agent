@@ -448,7 +448,8 @@ def build_plan_runtime(state: AgentState, *, goal: Goal, plan: ExecutablePlan, t
         retry_counts={},
         replan_counts={},
         interaction=None,
-        final_answer=state.answer,
+        # 新计划只承载当前轮输出；上一轮的 answer 仅用于会话展示，不能作为本轮默认答案恢复。
+        final_answer=None,
         turn_status=turn_status,  # type: ignore[arg-type]
     )
 

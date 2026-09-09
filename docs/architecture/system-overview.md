@@ -17,6 +17,8 @@
 
 [`backend/dependencies.py`](../../backend/dependencies.py) 是服务组合根。它负责构造 `StorageContainer`、模型服务、检索服务、QA 服务、推荐服务和 Agent 所需的 checkpoint store。业务模块应请求具体依赖，例如 `get_paper_qa_service()`，而不是接收一个万能数据库对象。
 
+`get_paper_evidence_research_service()` 为生产 QA 与 golden runner 共用的研究引擎装配正式检索、生成和独立主张校验适配器。模型原始客户端不能直接充当研究图依赖；实际接口、预算和活动索引快照由这条装配链统一提供。
+
 ## 模块职责
 
 | 层 | 责任 | 主要位置 | 维护约束 |
@@ -39,7 +41,9 @@ flowchart LR
     AGENT --> TOOLS[Tool Registry]
     TOOLS --> QA
     TOOLS --> USER
-    QA --> RETRIEVAL[Retrieval Pipeline]
+    QA --> RESEARCH[Paper Evidence Research]
+    EVAL[Golden Runner] --> RESEARCH
+    RESEARCH --> RETRIEVAL[Retrieval Pipeline]
     QA --> INDEX[QA Index Builder]
     USER --> STORAGE[SQLite Stores]
     AGENT --> STORAGE
@@ -72,6 +76,12 @@ Agent 和直接 QA 入口会在不同位置进入系统，但都复用同一组�
 ### 用户画像
 
 研究画像存储区分人工层、生成层和 effective 投影。人工偏好与显式编辑不应被自动生成结果覆盖；推荐只能消费由存储层合成的 effective profile。具体约束见 [研究画像与推荐](../capabilities/research-profile-and-recommendations.md)。
+
+### 研究结果与评测
+
+研究状态中的需求、候选和校验结果驱动 completed/partial/abstained；技术故障单独记录为运行失败。追加式 trace 只供审计和评测，不能反向驱动业务终态。生产同步和 SSE 共用一次执行，公开进度与私有完整轨迹分别投影。
+
+[`EvaluationRecord`](../../backend/services/evaluation/contracts.py) 将答案、引用、逐稿校验、实际配置和成本统一落盘，以支持离线重新评分。默认记录和报告路径固定在 `backend/06-evaluation-result/`，写入失败不破坏问答；会话保存失败仍需向调用方返回统一错误。详细口径见 [生成效果评测](../capabilities/evaluation.md)。
 
 ### 本地持久化路径
 

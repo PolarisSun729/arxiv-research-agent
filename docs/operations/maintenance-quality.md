@@ -53,6 +53,7 @@ python scripts/check_quality.py docs
 | 画像与推荐 | 后端相关测试与 `backend` 目标 | manual/generated/effective 层、负反馈和多样性。 |
 | 本地持久化或产物路径 | 路径单元测试、`static`、`docs` 与 `backend` 目标 | 数据库、QA 缓存、向量库资产、生成结果和每日 arXiv 下载目录必须固定相对 `backend`；错误根目录数据库配置必须失败，根目录产物残留只允许 Doctor 警告。 |
 | 前后端响应契约 | `backend` 与 `frontend` 目标 | 错误结构、流事件和字段投影。 |
+| 研究与评测 | 真实模型契约的离线贯通测试、指标测试与 `backend` 目标 | 执行失败分母、引用 verdict、修复前后快照、token 缺失和配置不可比条件；真实付费 golden 不进入默认门禁。 |
 
 ## 评审规则
 

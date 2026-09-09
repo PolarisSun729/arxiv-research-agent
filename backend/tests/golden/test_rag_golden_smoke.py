@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
 from tests.helpers.retrieval import build_sample_chunks
+from services.evaluation.metrics_generation import get_point_aliases
 
 
 DATA_PATH = Path(__file__).resolve().parent / "data" / "smoke_golden_set.jsonl"
@@ -93,14 +94,8 @@ def _matches_answer_points(answer: str, expected_points: List[str]) -> Dict[str,
     point_results = []
     for point in expected_points:
         point_text = str(point or "")
-        aliases = {
-            "方法流程": ["方法流程", "retrieval pipeline"],
-            "评估指标": ["评估指标", "metrics"],
-            "主要结果": ["主要结果", "better performance"],
-            "局限性": ["局限性", "struggles"],
-            "训练集": ["训练集", "training"],
-            "趋势": ["趋势", "trend"],
-        }.get(point_text, [point_text])
+        # 冒烟与正式评测共用别名表，避免中文要点在两个入口采用不同口径。
+        aliases = get_point_aliases(point_text)
         matched = any(alias.lower() in lowered_answer for alias in aliases)
         point_results.append({"point": point_text, "matched": matched})
     matched_count = sum(1 for item in point_results if item["matched"])

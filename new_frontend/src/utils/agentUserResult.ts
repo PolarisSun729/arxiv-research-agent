@@ -10,6 +10,8 @@ import type {
 import type { NormalizedArxivQueryCapability } from '@/types/arxivCapability'
 import type { Paper } from '@/types/paper'
 import { normalizeArxivQueryCapability } from '@/utils/arxivQueryCapability'
+import { normalizeEvidenceSources } from '@/utils/evidence'
+import type { RagChatSource } from '@/types/ragChat'
 
 export interface AgentUserInteractionCandidate {
   id: string
@@ -37,6 +39,9 @@ export interface AgentUserResult {
   queryCapability: NormalizedArxivQueryCapability | null
   preferenceFeedback: { status: 'success' | 'failed'; message: string } | null
   interaction: AgentUserInteraction | null
+  evidenceSources: RagChatSource[]
+  citedSourceIds: string[]
+  citationWarning: string | null
   hasVisibleContent: boolean
 }
 
@@ -152,12 +157,29 @@ export function toAgentUserResult(response: ArxivSearchResponse | null | undefin
   const queryCapability = normalizeArxivQueryCapability({ capability: response?.query_capability, warnings: response?.warnings || [] })
   const preferenceFeedback = normalizePreferenceFeedback(response?.preference_action_result)
   const interaction = normalizeInteraction(Object.prototype.hasOwnProperty.call(options, 'interaction') ? options.interaction : response?.interaction)
+  const paperQaResult = response?.paper_qa_result && typeof response.paper_qa_result === 'object'
+    ? response.paper_qa_result
+    : null
+  const paperQaArxivId = String(paperQaResult?.arxiv_id || response?.resolved_paper?.arxiv_id || '').trim()
+  const evidenceSources = normalizeEvidenceSources(paperQaResult?.sources, paperQaArxivId)
+  // Paper QA 嵌套字段是主要契约；顶层字段用于统一 Agent 出站结果，不代表回退到旧格式。
+  const citedSourceIds = Array.isArray(paperQaResult?.cited_source_ids)
+    ? paperQaResult.cited_source_ids.map(value => String(value))
+    : Array.isArray(response?.cited_source_ids)
+      ? response.cited_source_ids.map(value => String(value))
+      : []
+  const citationWarning = typeof paperQaResult?.citation_warning === 'string'
+    ? paperQaResult.citation_warning
+    : typeof response?.citation_warning === 'string' ? response.citation_warning : null
   return {
     papers,
     queryCapability,
     preferenceFeedback,
     interaction,
-    hasVisibleContent: Boolean(papers.length || queryCapability || preferenceFeedback || interaction)
+    evidenceSources,
+    citedSourceIds,
+    citationWarning,
+    hasVisibleContent: Boolean(papers.length || queryCapability || preferenceFeedback || interaction || evidenceSources.length)
   }
 }
 

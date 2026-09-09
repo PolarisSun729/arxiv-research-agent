@@ -809,6 +809,43 @@ export async function getPaperQaIndexJob(arxivId: string, jobId: string): Promis
 }
 
 export type QaStreamPersistenceStatus = 'unknown' | 'saved' | 'failed' | 'not_saved'
+export type ResearchOutcome = 'completed' | 'partial' | 'abstained'
+
+export interface ResearchSummary {
+  research_run_id: string
+  outcome: ResearchOutcome
+  termination_reason: string
+  retrieval_count: number
+  draft_attempt_count: number
+  verification_count: number
+  confirmed_need_count: number
+  satisfied_need_count: number
+  blocked_need_count: number
+  supported_claim_count: number
+  removed_claim_count?: number
+  citation_repair_count: number
+  unresolved_topics: string[]
+}
+
+export interface ResearchCitation {
+  source_id: string
+  content: string
+  claim_ids: string[]
+  chunk_type?: string
+  section_path?: string
+  page_number?: number | null
+}
+
+export interface QaUsage {
+  llm_calls?: number | null
+  input_tokens?: number | null
+  output_tokens?: number | null
+  total_tokens?: number | null
+  usage_reported_calls?: number
+  models?: string[]
+  task_calls?: Record<string, number>
+}
+
 export type QaStreamClientStatus =
   | 'completed'
   | 'partial'
@@ -820,6 +857,11 @@ export type QaStreamClientStatus =
 
 export interface QaResult {
   status: string
+  // status 表示执行状态，outcome 表示证据完整程度；正常拒答同样是一次成功执行。
+  outcome?: ResearchOutcome
+  research_summary?: ResearchSummary | null
+  citations?: ResearchCitation[]
+  usage?: QaUsage | null
   arxiv_id: string
   question: string
   session_id?: string
@@ -830,6 +872,9 @@ export interface QaResult {
   used_short_term_memory?: boolean
   question_contextualization?: Record<string, any> | null
   answer: string
+  cited_source_ids?: string[]
+  citation_debug?: Record<string, any> | null
+  citation_warning?: string | null
   partial?: boolean
   completed_at?: string | null
   interrupted_reason?: string | null
@@ -837,6 +882,7 @@ export interface QaResult {
   retrieval_debug?: RetrievalDebug | null
   qa_observation?: QaObservation | null
   sources: Array<{
+    source_id: string
     content: string
     page_number: string
     source?: string
@@ -853,6 +899,7 @@ export interface QaResult {
     final_context_reason?: string
     asset_summary?: string
     asset_preview_text?: string
+    asset_url?: string
   }>
 }
 
@@ -874,6 +921,7 @@ export interface PaperChatMessage {
   role: 'user' | 'assistant'
   content: string
   sources: Array<{
+    source_id?: string | number
     content?: string
     page_number?: string
     source?: string
@@ -889,10 +937,13 @@ export interface PaperChatMessage {
     final_context_reason?: string
     asset_summary?: string
     asset_preview_text?: string
+    asset_url?: string
   }>
   retrieval_debug_snapshot?: RetrievalDebug | null
   contextualized_question?: string
   question_contextualization?: Record<string, any> | null
+  cited_source_ids?: string[]
+  citation_warning?: string | null
   status?: string
   created_at: string
 }
@@ -1132,6 +1183,10 @@ export interface QaObservationStageStatus {
 
 export interface QaObservation {
   schema_version: string
+  outcome?: ResearchOutcome
+  research_summary?: ResearchSummary | null
+  answer_quality?: string
+  answer_quality_reason?: string
   retrieval_quality: 'good' | 'partial' | 'weak' | 'failed' | 'unknown' | string
   retrieval_stage_status: Record<string, QaObservationStageStatus>
   missing_evidence_type: string
@@ -1225,6 +1280,7 @@ export async function deletePaperChatSession(
 }
 
 type QaStreamSource = {
+  source_id: string
   content: string
   page_number: string
   source?: string
@@ -1233,10 +1289,14 @@ type QaStreamSource = {
   chunk_type?: string
   asset_summary?: string
   asset_preview_text?: string
+  asset_url?: string
 }
 
 type QaStreamMetaPayload = {
   status: string
+  outcome?: ResearchOutcome
+  research_summary?: ResearchSummary | null
+  citations?: ResearchCitation[]
   arxiv_id: string
   question: string
   session_id?: string
@@ -1248,6 +1308,9 @@ type QaStreamMetaPayload = {
   sources: QaStreamSource[]
   retrieval_debug?: RetrievalDebug | null
   qa_observation?: QaObservation | null
+  cited_source_ids?: string[]
+  citation_debug?: Record<string, any> | null
+  citation_warning?: string | null
 }
 
 type QaStreamDonePayload = QaStreamMetaPayload & {
@@ -1259,15 +1322,21 @@ type QaStreamDonePayload = QaStreamMetaPayload & {
   interruptedReason?: string | null
   persistence_status?: QaStreamPersistenceStatus
   persistenceStatus?: QaStreamPersistenceStatus
-  usage?: {
-    input_tokens?: number | null
-    output_tokens?: number | null
-    total_tokens?: number | null
-  } | null
+  usage?: QaUsage | null
+}
+
+export interface QaStreamProgressPayload {
+  stage: 'retrieval' | 'draft' | 'verification' | 'completed'
+  retrieval_count?: number
+  new_candidate_count?: number
+  draft_attempt?: number
+  supported_count?: number
+  outcome?: ResearchOutcome
 }
 
 export interface QaStreamHandlers {
   onMeta?: (meta: QaStreamMetaPayload) => void
+  onProgress?: (progress: QaStreamProgressPayload) => void
   onDelta?: (delta: string) => void
   onDone?: (payload: QaStreamDonePayload) => void
   onError?: (detail: string) => void
@@ -1336,6 +1405,8 @@ function applyQaStreamPayload(
     contextualizedQuestion: string
     usedShortTermMemory: boolean
     questionContextualization: Record<string, any> | null
+    citedSourceIds: string[]
+    citationWarning: string | null
   }
 ) {
   if (Array.isArray(payload.sources)) {
@@ -1364,6 +1435,12 @@ function applyQaStreamPayload(
   }
   if (payload.question_contextualization) {
     target.questionContextualization = payload.question_contextualization
+  }
+  if (Array.isArray(payload.cited_source_ids)) {
+    target.citedSourceIds = payload.cited_source_ids.map(value => String(value))
+  }
+  if (typeof payload.citation_warning === 'string') {
+    target.citationWarning = payload.citation_warning
   }
 }
 
@@ -1415,7 +1492,9 @@ export async function qaPaperStream(
     originalQuestion: question,
     contextualizedQuestion: question,
     usedShortTermMemory: false,
-    questionContextualization: null as Record<string, any> | null
+    questionContextualization: null as Record<string, any> | null,
+    citedSourceIds: [] as string[],
+    citationWarning: null as string | null
   }
 
   const buildResult = (payload: QaStreamDonePayload): QaResult => {
@@ -1426,6 +1505,10 @@ export async function qaPaperStream(
 
     return {
       status,
+      outcome: payload.outcome,
+      research_summary: payload.research_summary,
+      citations: payload.citations,
+      usage: payload.usage,
       arxiv_id: arxivId,
       question,
       session_id: finalState.sessionId || undefined,
@@ -1441,6 +1524,8 @@ export async function qaPaperStream(
       interrupted_reason: interruptedReason,
       persistence_status: persistenceStatus,
       sources: finalState.sources,
+      cited_source_ids: finalState.citedSourceIds,
+      citation_warning: finalState.citationWarning,
       qa_observation: finalState.qaObservation,
       retrieval_debug: finalState.retrievalDebug
     }
@@ -1461,6 +1546,12 @@ export async function qaPaperStream(
       if (!delta) return null
       finalAnswer += delta
       handlers.onDelta?.(delta)
+      return null
+    }
+
+    if (parsed.event === 'progress' && parsed.data && typeof parsed.data === 'object') {
+      // 研究引擎先完成校验，再通过 done 交付最终答案；阶段进度不应混入可见答案。
+      handlers.onProgress?.(parsed.data as QaStreamProgressPayload)
       return null
     }
 

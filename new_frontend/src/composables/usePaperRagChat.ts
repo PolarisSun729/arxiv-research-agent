@@ -22,6 +22,7 @@ import type {
   QaTurnStatus
 } from '@/types/ragChat'
 import { useUserContext } from '@/composables/useUserContext'
+import { extractCitedSourceIds, normalizeEvidenceSources } from '@/utils/evidence'
 
 const MAX_CONVERSATION_TURNS = 5
 const MAX_ANSWER_SUMMARY_LENGTH = 280
@@ -79,7 +80,7 @@ function buildConversationContext(qaResults: QaTurn[], pendingTurnId?: string): 
       answer_summary: truncateText(turn.answer, memoryConfig.shortTermMemoryMaxChars),
       created_at: turn.createdAt,
       sources: (turn.sources || []).slice(0, MAX_SOURCES_PER_TURN).map(source => ({
-        source_id: source.parent_chunk_id,
+        source_id: source.source_id,
         content: truncateText(source.content || source.asset_summary || source.asset_preview_text || '', MAX_SOURCE_CONTENT_LENGTH),
         page_number: source.page_number,
         source: source.source,
@@ -114,7 +115,9 @@ function groupMessagesToTurns(messages: PaperChatMessage[]): QaTurn[] {
       originalQuestion: '',
       contextualizedQuestion: message.contextualized_question || '',
       usedShortTermMemory: Boolean(message.question_contextualization?.used_short_term_memory),
-      questionContextualization: message.question_contextualization ?? null
+      questionContextualization: message.question_contextualization ?? null,
+      citedSourceIds: [],
+      citationWarning: null
     }
 
     if (message.role === 'user') {
@@ -123,22 +126,20 @@ function groupMessagesToTurns(messages: PaperChatMessage[]): QaTurn[] {
       existing.createdAt = message.created_at || existing.createdAt
     } else {
       existing.answer = message.content || existing.answer
-      existing.sources = (message.sources || []).map(source => ({
-        content: source.content || source.asset_summary || source.asset_preview_text || '',
-        page_number: String(source.page_number || ''),
-        source: source.source,
-        section_path: source.section_path,
-        parent_chunk_id: source.parent_chunk_id,
-        chunk_type: source.chunk_type,
-        asset_summary: source.asset_summary,
-        asset_preview_text: source.asset_preview_text
-      }))
+      existing.sources = normalizeEvidenceSources(message.sources)
+      existing.citedSourceIds = extractCitedSourceIds(existing.answer, existing.sources)
       existing.retrievalDebug = message.retrieval_debug_snapshot ?? existing.retrievalDebug
       existing.contextualizedQuestion = message.contextualized_question || existing.contextualizedQuestion
       existing.questionContextualization = message.question_contextualization ?? existing.questionContextualization
       existing.usedShortTermMemory = Boolean(
         message.question_contextualization?.used_short_term_memory ?? existing.usedShortTermMemory
       )
+      existing.citedSourceIds = Array.isArray(message.cited_source_ids)
+        ? message.cited_source_ids.map(value => String(value))
+        : existing.citedSourceIds || []
+      existing.citationWarning = typeof message.citation_warning === 'string'
+        ? message.citation_warning
+        : existing.citationWarning || null
     }
 
     turnsById.set(turnId, existing)
@@ -398,7 +399,9 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
       originalQuestion: rawQuestion,
       contextualizedQuestion: rawQuestion,
       usedShortTermMemory: false,
-      questionContextualization: null
+      questionContextualization: null,
+      citedSourceIds: [],
+      citationWarning: null
     })
     qaResults.value.push(turn)
     question.value = ''
@@ -450,6 +453,12 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
             if (meta.question_contextualization) {
               turn.questionContextualization = meta.question_contextualization
             }
+            if (Array.isArray(meta.cited_source_ids)) {
+              turn.citedSourceIds = meta.cited_source_ids.map(value => String(value))
+            }
+            if (typeof meta.citation_warning === 'string') {
+              turn.citationWarning = meta.citation_warning
+            }
             scrollToBottom()
           },
           onDelta: delta => {
@@ -481,6 +490,12 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
             }
             if (payload.question_contextualization) {
               turn.questionContextualization = payload.question_contextualization
+            }
+            if (Array.isArray(payload.cited_source_ids)) {
+              turn.citedSourceIds = payload.cited_source_ids.map(value => String(value))
+            }
+            if (typeof payload.citation_warning === 'string') {
+              turn.citationWarning = payload.citation_warning
             }
             const persistenceStatus = (payload.persistence_status || payload.persistenceStatus || 'unknown') as QaPersistenceStatus
             const terminalStatus = mapResultToTurnStatus(payload.status, persistenceStatus)

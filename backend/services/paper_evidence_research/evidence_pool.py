@@ -6,7 +6,7 @@ from typing import Any, Iterable
 from .state import EvidenceCandidate
 
 
-def _candidate_id(payload: dict[str, Any]) -> str:
+def candidate_identity(payload: dict[str, Any]) -> str:
     for key in ("source_id", "chunk_id", "original_chunk_id", "parent_chunk_id", "id"):
         value = str(payload.get(key) or "").strip()
         if value:
@@ -37,7 +37,7 @@ def merge_candidates(
     duplicate_count = 0
     for raw_item in incoming:
         payload = dict(raw_item or {})
-        candidate_id = _candidate_id(payload)
+        candidate_id = candidate_identity(payload)
         existing = merged.get(candidate_id)
         if existing is not None:
             duplicate_count += 1

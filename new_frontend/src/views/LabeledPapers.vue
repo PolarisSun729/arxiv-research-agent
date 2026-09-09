@@ -58,6 +58,21 @@ function getLabelText(label: string) {
   return label === 'liked' ? '喜欢' : '不喜欢';
 }
 
+function formatPaperTitle(title: string, id: string) {
+  const normalizedTitle = String(title || '').trim()
+  // 回源失败时仍保留可识别的 arXiv ID，避免空标题让用户误以为卡片渲染坏了。
+  return normalizedTitle || `论文 ${id}`
+}
+
+function formatPaperSummary(summary: string) {
+  const normalizedSummary = String(summary || '').trim()
+  if (!normalizedSummary) {
+    return '摘要暂不可用'
+  }
+  // 摘要是用户判断论文是否值得继续阅读的核心信息，列表页不再静默截断原文。
+  return normalizedSummary
+}
+
 async function handleGenerateInterestVector() {
   try {
     const result = await store.generateUserInterestVector();
@@ -177,13 +192,13 @@ async function handleGenerateInterestVector() {
         class="labeled-card"
       >
         <div class="card-header">
-          <h3 class="paper-title">{{ paper.title }}</h3>
+          <h3 class="paper-title">{{ formatPaperTitle(paper.title, paper.id) }}</h3>
           <el-tag :class="getLabelClass(paper.label)" size="small">
             {{ getLabelText(paper.label) }}
           </el-tag>
         </div>
 
-        <p class="paper-summary">{{ paper.summary.slice(0, 100) }}...</p>
+        <p class="paper-summary">{{ formatPaperSummary(paper.summary) }}</p>
 
         <div class="card-footer">
           <span class="labeled-time">标记时间：{{ formatDate(paper.labeledAt) }}</span>
@@ -321,14 +336,28 @@ async function handleGenerateInterestVector() {
 }
 
 .labeled-card {
+  /* 固定卡片外框高度，让同一行卡片保持整齐；超长内容由内部区域自行处理。 */
+  height: 340px;
+  box-sizing: border-box;
+}
+
+.labeled-card :deep(.el-card__body) {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  box-sizing: border-box;
   padding: 16px;
+  min-height: 0;
 }
 
 .card-header {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
+  flex-shrink: 0;
+  height: 72px;
   margin-bottom: 12px;
+  overflow-y: auto;
 }
 
 .paper-title {
@@ -345,13 +374,22 @@ async function handleGenerateInterestVector() {
   font-size: 14px;
   color: #6b7280;
   line-height: 1.6;
-  margin: 0 0 12px 0;
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-y: auto;
+  padding-right: 8px;
+  scrollbar-gutter: stable;
 }
 
 .card-footer {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-shrink: 0;
+  margin-top: 12px;
   padding-top: 12px;
   border-top: 1px solid #e5e7eb;
 }
