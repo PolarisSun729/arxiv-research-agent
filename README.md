@@ -234,7 +234,7 @@ cd arxiv-research-agent
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -r requirements_win.txt
+python -m pip install -r requirements.txt
 
 cd new_frontend
 npm ci
