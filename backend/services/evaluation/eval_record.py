@@ -12,6 +12,7 @@ from typing import Any
 
 from services.paper_evidence_research.contracts import PaperEvidenceResearchRequest, PaperEvidenceResearchResult
 from .contracts import EvaluationRecord
+from .types import LLMUsage, EvalError
 
 logger = logging.getLogger(__name__)
 BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -70,14 +71,13 @@ def _extract_main_intent_from_trace(events: list[dict[str, Any]]) -> str:
         None
     )
     if config_event:
-        # 尝试从事件中直接获取 main_intent
         main_intent = config_event.get("main_intent")
         if main_intent:
-            return str(main_intent).strip().lower()
+            return main_intent.strip().lower()
 
     # Fallback: 从任意事件中查找
-    main_intent = next((str(e["main_intent"]) for e in events if e.get("main_intent")), "unknown")
-    return main_intent if main_intent else "unknown"
+    main_intent = next((e["main_intent"] for e in events if e.get("main_intent")), None)
+    return main_intent.strip().lower() if main_intent else "unknown"
 
 
 def build_success_eval_record(
@@ -87,11 +87,36 @@ def build_success_eval_record(
     trace_events: list[dict[str, Any]],
     turn_id: str = "",
     latency_ms: float,
-    llm_usage: dict[str, Any],
+    llm_usage: dict[str, Any] | LLMUsage,
 ) -> dict[str, Any]:
-    """构造成功执行的评测记录"""
-    events = list(trace_events)
-    configuration = _extract_configuration_from_trace(events, request)
+    """构造成功执行的评测记录
+
+    Args:
+        request: 研究请求
+        result: 研究结果
+        trace_events: 轨迹事件列表（至少1个事件）
+        turn_id: 对话轮次ID
+        latency_ms: 延迟毫秒数（非负）
+        llm_usage: LLM使用统计（dict或LLMUsage）
+
+    Returns:
+        评测记录字典
+
+    Raises:
+        ValueError: 参数验证失败
+    """
+    # 入口验证
+    if not trace_events:
+        raise ValueError("trace_events cannot be empty")
+    if latency_ms < 0:
+        raise ValueError("latency_ms must be non-negative")
+
+    # 归一化 llm_usage
+    usage = LLMUsage(**llm_usage) if isinstance(llm_usage, dict) else llm_usage
+    usage_dict = usage.model_dump()
+
+    # 提取数据（减少防御性代码）
+    configuration = _extract_configuration_from_trace(trace_events, request)
     summary = result.research_summary.model_dump(mode="json")
 
     return EvaluationRecord(
@@ -102,12 +127,12 @@ def build_success_eval_record(
         user_id=request.user_id,
         session_id=request.session_id,
         turn_id=turn_id,
-        paper_context=_build_paper_context_from_trace(events, request.arxiv_id),
+        paper_context=_build_paper_context_from_trace(trace_events, request.arxiv_id),
         configuration=configuration,
         query={
             "raw": request.original_question,
             "rewritten": request.original_question,
-            "main_intent": _extract_main_intent_from_trace(events),
+            "main_intent": _extract_main_intent_from_trace(trace_events),
         },
         outcome=result.outcome,
         answer=result.answer,
@@ -116,12 +141,12 @@ def build_success_eval_record(
         research_summary=summary,
         efficiency={
             "latency_ms": round(latency_ms, 1),
-            **llm_usage,
+            **usage_dict,
             "retrieval_count": summary.get("retrieval_count"),
             "draft_attempt_count": summary.get("draft_attempt_count"),
         },
         trace_ref=request.research_run_id,
-        trace_events=events,
+        trace_events=trace_events,
         error=None,
     ).model_dump(mode="json")
 
@@ -129,14 +154,37 @@ def build_success_eval_record(
 def build_error_eval_record(
     *,
     request: PaperEvidenceResearchRequest,
-    error: dict[str, Any],
+    error: dict[str, Any] | EvalError,
     trace_events: list[dict[str, Any]],
     latency_ms: float,
-    llm_usage: dict[str, Any] | None = None,
+    llm_usage: dict[str, Any] | LLMUsage | None = None,
 ) -> dict[str, Any]:
-    """构造失败执行的评测记录"""
-    events = list(trace_events)
-    configuration = _extract_configuration_from_trace(events, request)
+    """构造失败执行的评测记录
+
+    Args:
+        request: 研究请求
+        error: 错误信息（dict或EvalError）
+        trace_events: 轨迹事件列表（至少1个事件）
+        latency_ms: 延迟毫秒数（非负）
+        llm_usage: LLM使用统计（可选）
+
+    Returns:
+        评测记录字典
+
+    Raises:
+        ValueError: 参数验证失败
+    """
+    # 入口验证
+    if not trace_events:
+        raise ValueError("trace_events cannot be empty")
+    if latency_ms < 0:
+        raise ValueError("latency_ms must be non-negative")
+
+    # 归一化
+    error_obj = EvalError(**error) if isinstance(error, dict) else error
+    usage = LLMUsage(**llm_usage) if isinstance(llm_usage, dict) else llm_usage if llm_usage else None
+
+    configuration = _extract_configuration_from_trace(trace_events, request)
 
     return EvaluationRecord(
         record_id=f"eval-{request.research_run_id}",
@@ -146,12 +194,12 @@ def build_error_eval_record(
         user_id=request.user_id,
         session_id=request.session_id,
         turn_id="",
-        paper_context=_build_paper_context_from_trace(events, request.arxiv_id),
+        paper_context=_build_paper_context_from_trace(trace_events, request.arxiv_id),
         configuration=configuration,
         query={
             "raw": request.original_question,
             "rewritten": request.original_question,
-            "main_intent": _extract_main_intent_from_trace(events),
+            "main_intent": _extract_main_intent_from_trace(trace_events),
         },
         outcome=None,
         answer="",
@@ -160,11 +208,11 @@ def build_error_eval_record(
         research_summary={},
         efficiency={
             "latency_ms": round(latency_ms, 1),
-            **(llm_usage or {}),
+            **(usage.model_dump() if usage else {}),
         },
         trace_ref=request.research_run_id,
-        trace_events=events,
-        error=error,
+        trace_events=trace_events,
+        error=error_obj.model_dump(),
     ).model_dump(mode="json")
 
 
