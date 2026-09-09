@@ -164,6 +164,9 @@ def _should_preserve_non_success_observation_output(step: PlanStep, normalized_o
 
 
 _PAPER_QA_OBSERVATION_TRACE_KEYS = (
+    "outcome",
+    "termination_reason",
+    "research_summary",
     "schema_version",
     "retrieval_quality",
     "retrieval_quality_reason",
@@ -474,6 +477,5 @@ def _build_execution_path_summary(runtime: "PlanRuntime", *, current_step_id: Op
         "step_replan_counts": dict(runtime.step_replan_counts or {}),
         "steps": step_paths,
     }
-
 
 

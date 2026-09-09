@@ -35,23 +35,30 @@ flowchart LR
 
 ## 问答链路
 
-`PaperQAService.answer_question()` 是单篇 QA 入口。它先通过 `build_qa_context()` 组织会话、论文和用户记忆上下文，再调用检索服务、上下文包构建、答案生成和证据校验。各阶段责任如下：
+`PaperQAService.answer_question()` 是单篇 QA 入口。生产组合根始终注入 [`PaperEvidenceResearchService`](../../backend/services/paper_evidence_research/module.py)，同步和流式入口共用“准备会话 → 研究图 → 持久化结果”的执行流。旧组件仍供兼容调用和测试使用，生产入口不再使用旧的一次检索、一次生成编排。
 
 | 阶段 | 组件 | 责任 |
 | --- | --- | --- |
-| 会话与问题规范化 | [`question_contextualizer.py`](../../backend/services/paper_qa/question_contextualizer.py)、[`session_service.py`](../../backend/services/paper_qa/session_service.py) | 把多轮问题还原为可检索的当前问题。 |
-| 检索与上下文 | [`EnhancedRetrievalService`](../../backend/services/retrieval/enhanced_retrieval_service.py)、[`context_pack_builder.py`](../../backend/services/paper_qa/context_pack_builder.py) | 选择论文集合、获取候选证据并在预算内构造上下文。 |
-| 答案生成 | [`answer_generator.py`](../../backend/services/paper_qa/answer_generator.py) | 基于受限上下文生成回答，不拥有检索策略。 |
-| 证据校验 | [`evidence_verifier.py`](../../backend/services/paper_qa/evidence_verifier.py) | 评估回答与来源是否足以支撑结论。 |
+| 会话与问题规范化 | `_prepare_research_context()`、[`session_service.py`](../../backend/services/paper_qa/session_service.py) | 通过 `load_conversation_state()` 读取真实会话；消歧失败退回原问题。无状态运行使用内部临时 ID，不冒充已保存会话。 |
+| 取证决策与预算 | [`研究图`](../../backend/services/paper_evidence_research/graph.py)、[`action_gate.py`](../../backend/services/paper_evidence_research/action_gate.py) | LLM 提议动作，确定性门禁裁决预算、需求状态和完成条件。 |
+| 检索与上下文 | [`NeedOrchestratedRetriever`](../../backend/services/paper_evidence_research/dependencies/need_orchestrated_retriever.py)、[`context_pack.py`](../../backend/services/paper_evidence_research/context_pack.py) | 解析单篇活动索引，经 `RetrievalPipeline.retrieve()` 取候选并在预算内选择证据。末轮关闭查询改写与 LLM rerank。 |
+| 答案生成 | [`ResearchDraftGenerator`](../../backend/services/paper_evidence_research/dependencies/production_adapters.py) | 适配 `AnswerGenerator` 的真实请求接口，只消费选定证据。 |
+| 主张提取与校验 | [`RuleClaimExtractor`](../../backend/services/paper_evidence_research/dependencies/rule_claim_extractor.py)、[`ResearchClaimVerifier`](../../backend/services/paper_evidence_research/dependencies/production_adapters.py) | 从可见答案提取含无引用句在内的事实主张，独立验证引用与支持关系；校验故障是执行失败。 |
 | 持久化 | `persist_completed_turn()` 与 QA/chat stores | 原子地保留本轮消息、来源和调试快照。 |
 
 每次回答应保留来源、上下文化后的问题和必要诊断快照，便于复现检索结论；不要只保存最终答案文本。
 
+研究正常结束只有三种 `outcome`：`completed` 表示全部核心需求得到支持；`partial` 只保留可靠且有支持的部分核心回答；`abstained` 表示正常取证后仍无法支持核心结论。检索故障按需求保存在业务状态中；同一需求成功重试会清除故障。故障仍阻断取证且无法保留可靠有限回答时，返回运行错误，不能算作拒答。审计轨迹不驱动终态。
+
+`/qa/stream` 发送 `meta`、`progress`（retrieval/draft/verification/completed）及唯一的 `done` 或 `error`。研究答案经过校验后由 `done.answer` 一次交付，客户端不能假设一定收到 `delta`。`done` 保留会话、来源、`outcome`、`research_summary` 和 `usage`；`error` 使用 `AppError.to_payload()`，不返回底层异常文本。流式统计上下文在每次 `next()` 内绑定，避免工作线程切换导致 ContextVar 恢复失败。
+
 ## QA 观察与 Agent 修复
 
-[`qa_observation.py`](../../backend/services/paper_qa/qa_observation.py) 的 `build_qa_observation()` 将 query planning、各召回路由、融合、rerank、上下文、生成和验证结果压缩为结构化观察。它给 Agent 提供“为什么答案不足”的可消费原因，而不是让 Agent 重新解析原始日志。
+[`qa_observation.py`](../../backend/services/paper_qa/qa_observation.py) 的 `build_research_qa_observation()` 将研究三态映射为 `grounded`、`warning`、`insufficient_evidence`，保留终止原因和未解决主题。`build_qa_observation()` 仍用于兼容链的阶段诊断。
 
-[`repair_actions.py`](../../backend/services/paper_qa/repair_actions.py) 只描述可执行的 QA 修复动作。若修改观察 schema、质量阈值或修复动作，必须同步检查 Agent 的 failure/recovery 分支，保证低质量回答不会被当作成功终态。
+研究图已拥有有界修复预算，外层 Agent 不应因为 `partial` 或正常 `abstained` 再重跑整次 QA。正常拒答没有引用属于预期；有限回答即使有引用也不能投影成完整回答。技术错误继续进入原有 failure/recovery 边界。兼容路径的 [`repair_actions.py`](../../backend/services/paper_qa/repair_actions.py) 保留原语义，不能反向覆盖研究终态。
+
+生产与离线 runner 使用同一评测记录契约，记录完整答案、运行成败、研究轨迹和实际调用统计。格式、重新评分和基线口径见 [生成效果评测](evaluation.md)。
 
 ## 会话、笔记与画像
 

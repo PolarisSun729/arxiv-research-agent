@@ -1,9 +1,8 @@
 """研究引擎生产依赖的组装入口。
 
-三器官（question_analyzer / decision_policy / claim_extractor）按"LLM 优先 + 规则兜底"
-在此定型；retriever、draft_generator、claim_verifier 由调用方注入——retriever 在检索
-适配阶段由 NeedOrchestratedRetriever 提供，draft_generator / claim_verifier 在生产切换
-阶段包装 paper_qa 现有组件。
+问题分析与决策采用 LLM 优先、规则兜底，主张从可见答案独立提取。
+retriever、draft_generator、claim_verifier 由组合根注入生产适配器；校验器失败不能
+由词面规则代替 supported 结论。
 """
 
 from __future__ import annotations
@@ -28,6 +27,7 @@ def build_paper_evidence_research_service(
     checkpointer: Any = None,
     degradation_listener: DegradationListener | None = None,
     trace_sink: Any = None,
+    configuration_provider: Any = None,
 ) -> PaperEvidenceResearchService:
     """组装完整的证据研究服务；默认把降级事件收进进程内台账。
 
@@ -53,4 +53,5 @@ def build_paper_evidence_research_service(
         claim_verifier=claim_verifier,
         checkpointer=checkpointer,
         trace_sink=trace_sink,
+        configuration_provider=configuration_provider,
     )

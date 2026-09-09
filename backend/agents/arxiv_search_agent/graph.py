@@ -790,6 +790,8 @@ def _build_paper_qa_result(state: AgentState, payload: Any) -> Dict[str, Any]:
         "citation_warning": data.get("citation_warning"),
         "retrieval_debug": data.get("retrieval_debug"),
         "qa_observation": data.get("qa_observation"),
+        "outcome": data.get("outcome"),
+        "research_summary": data.get("research_summary"),
         "error": data.get("error"),
         "tool_result": data.get("tool_result"),
     }

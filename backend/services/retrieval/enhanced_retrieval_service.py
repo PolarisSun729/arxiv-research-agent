@@ -160,6 +160,21 @@ class EnhancedRetrievalService:
             enhanced_config=ENHANCED_RETRIEVAL_CONFIG,
         )
 
+    def evaluation_configuration(self) -> Dict[str, Any]:
+        """记录影响召回与重排的实际配置；凭据、调试目录等不参与版本比较。"""
+        pipeline = self.retrieval_pipeline
+        return {
+            "rrf_k": self.rrf_k, "route_weights": dict(self.route_weights),
+            "candidate_multiplier": self.candidate_multiplier,
+            "pipeline": pipeline.evaluation_configuration(),
+            "rerank": {
+                "provider": self.llm_rerank_provider, "model": self.llm_rerank_model_name,
+                "local_model": self.llm_rerank_local_model_name_or_path,
+                "fallback_local": self.llm_rerank_fallback_local, "prompt": self.llm_rerank_prompt,
+                "candidate_limit": self.llm_rerank_candidate_limit, "max_doc_chars": self.llm_rerank_max_doc_chars,
+            },
+        }
+
     def enhanced_retrieve(
         self,
         user_query: str,

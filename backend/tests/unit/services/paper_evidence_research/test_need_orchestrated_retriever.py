@@ -328,7 +328,9 @@ def test_mapping_target_is_accepted_by_the_adapter() -> None:
     _retriever(pipeline, target_resolver=_mapping).retrieve(_action(), _state())
 
     assert pipeline.calls[0]["collection_name"] == "paper_qa_mapping"
-    assert pipeline.calls[0]["paper_context"] == {"arxiv_id": "2401.00001"}
+    assert pipeline.calls[0]["paper_context"] == {
+        "arxiv_id": "2401.00001", "run_id": "research-run-retriever",
+    }
 
 
 def test_retrieval_failure_is_a_status_not_an_exception() -> None:

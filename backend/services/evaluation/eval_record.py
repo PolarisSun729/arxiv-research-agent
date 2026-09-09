@@ -1,190 +1,102 @@
-"""评测记录落盘：每轮问答自动记录评测数据到磁盘。
-
-落盘路径：backend/06-evaluation-result/records/YYYY-MM-DD/{research_run_id}.json
-
-记录字段（PRD Phase 3 D2）：
-- record_id, timestamp, app_version (git commit hash)
-- user_id, session_id, turn_id
-- paper_context {arxiv_id}
-- query {raw, rewritten, main_intent}
-- outcome, termination_reason
-- citations [{citation_id, chunk_id, claim_ids}]
-- research_summary {...}
-- efficiency {latency_ms, llm_calls, retrieval_count, draft_attempt_count}
-- trace_ref (research_run_id for trace file lookup)
-
-容错策略：写失败只告警，不影响问答主链路（与 _write_qa_trace 同策略）。
-"""
+"""构造可重算的评测记录，并按日期落盘；观测写入失败不影响问答。"""
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
+
+from services.paper_evidence_research.contracts import PaperEvidenceResearchRequest, PaperEvidenceResearchResult
+from .contracts import EvaluationRecord
 
 logger = logging.getLogger(__name__)
-
-# 评测记录根目录（相对 backend/）
-EVAL_RECORDS_DIR = Path(__file__).parent.parent.parent / "06-evaluation-result" / "records"
+BACKEND_DIR = Path(__file__).resolve().parents[2]
+EVAL_RECORDS_DIR = BACKEND_DIR / "06-evaluation-result" / "records"
 
 
 def _get_git_commit_hash() -> str:
-    """获取当前 git commit hash 作为 app_version。"""
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
+            ["git", "rev-parse", "--short", "HEAD"], cwd=BACKEND_DIR,
+            capture_output=True, text=True, timeout=5, check=False,
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except Exception as exc:  # pragma: no cover
-        logger.debug("Failed to get git commit hash: %s", exc)
+    except (OSError, subprocess.SubprocessError):
+        logger.debug("获取评测版本失败", exc_info=True)
     return "unknown"
 
 
-def _extract_main_intent(retrieval_debug: Optional[Dict[str, Any]]) -> str:
-    """从 retrieval_debug 提取 main_intent。"""
-    if not retrieval_debug:
-        return "other"
-    intent_profile = retrieval_debug.get("intent_profile", {})
-    if isinstance(intent_profile, dict):
-        return str(intent_profile.get("main_intent", "other") or "other").strip().lower()
-    return "other"
+def _extract_main_intent(retrieval_debug: dict[str, Any] | None) -> str:
+    profile = (retrieval_debug or {}).get("intent_profile")
+    return str(profile.get("main_intent") or "unknown").strip().lower() if isinstance(profile, dict) else "unknown"
 
 
-def _build_citations_payload(result: Any) -> List[Dict[str, Any]]:
-    """从 PaperEvidenceResearchResult 提取 citations。"""
-    citations = getattr(result, "citations", None) or []
-    return [
-        {
-            "citation_id": str(getattr(citation, "citation_id", "")),
-            "chunk_id": str(getattr(citation, "source_id", "")),
-            "claim_ids": list(getattr(citation, "claim_ids", [])),
-        }
-        for citation in citations
-    ]
+def _build_citations_payload(result: PaperEvidenceResearchResult) -> list[dict[str, Any]]:
+    # source_id 是图、答案标记和候选池共用的标识；不能读取不存在的 citation_id 属性。
+    return [dict(c.model_dump(mode="json"), citation_id=c.source_id, chunk_id=c.source_id) for c in result.citations]
 
 
-def _build_research_summary_payload(result: Any) -> Dict[str, Any]:
-    """从 PaperEvidenceResearchResult 提取 research_summary。"""
-    summary = getattr(result, "research_summary", None)
-    if not summary:
-        return {}
-    return {
-        "retrieval_count": getattr(summary, "retrieval_count", 0),
-        "draft_attempt_count": getattr(summary, "draft_attempt_count", 0),
-        "evidence_pool_size": getattr(summary, "evidence_pool_size", 0),
-        "supported_claim_count": getattr(summary, "supported_claim_count", 0),
-        "citation_repair_count": getattr(summary, "citation_repair_count", 0),
-        "unresolved_topics": list(getattr(summary, "unresolved_topics", [])),
-    }
+def _build_research_summary_payload(result: PaperEvidenceResearchResult) -> dict[str, Any]:
+    return result.research_summary.model_dump(mode="json")
 
 
-def write_eval_record(
-    *,
-    result: Any,  # PaperEvidenceResearchResult
-    request: Any,  # PaperEvidenceResearchRequest
-    turn_id: Optional[str] = None,
-    retrieval_debug: Optional[Dict[str, Any]] = None,
-    latency_ms: float = 0.0,
-) -> Optional[str]:
-    """记录一次问答的评测数据到磁盘。
-
-    Args:
-        result: PaperEvidenceResearchResult 研究结果
-        request: PaperEvidenceResearchRequest 研究请求
-        turn_id: QA turn ID（可选）
-        retrieval_debug: 检索 debug 信息（用于提取 main_intent）
-        latency_ms: 请求延迟（毫秒）
-
-    Returns:
-        写入的文件路径，失败返回 None
-    """
-    try:
-        # 提取字段
-        research_run_id = getattr(request, "research_run_id", "unknown")
-        record_id = f"eval-{research_run_id}"
-        timestamp = datetime.utcnow().isoformat() + "Z"
-        app_version = _get_git_commit_hash()
-
-        # 用户与会话
-        user_id = getattr(request, "user_id", "unknown")
-        session_id = getattr(request, "session_id", "unknown")
-
-        # 论文上下文
-        arxiv_id = getattr(request, "arxiv_id", "unknown")
-
-        # 查询信息
-        original_question = getattr(request, "original_question", "")
+def build_eval_record(
+    *, request: PaperEvidenceResearchRequest, result: PaperEvidenceResearchResult | None = None,
+    turn_id: str | None = None, retrieval_debug: dict[str, Any] | None = None,
+    trace_events: list[dict[str, Any]] | None = None, latency_ms: float = 0.0,
+    llm_usage: dict[str, Any] | None = None, raw_question: str | None = None,
+    main_intent: str | None = None, error: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """生产和评测共用构造器；缺少调用观测时写 null，不伪造零成本。"""
+    events = list(trace_events or [])
+    if main_intent is None:
         main_intent = _extract_main_intent(retrieval_debug)
+        if main_intent == "unknown":
+            main_intent = next((str(e["main_intent"]) for e in events if e.get("main_intent")), "unknown")
+    summary = _build_research_summary_payload(result) if result else {}
+    indexes = []
+    for event in events:
+        snapshot = event.get("index_snapshot")
+        if isinstance(snapshot, dict) and snapshot not in indexes:
+            indexes.append(snapshot)
+    configuration = next((event["configuration"] for event in events
+                          if event.get("event_type") == "research_started" and event.get("configuration")),
+                         {"research_limits": request.limits.model_dump(mode="json"), "engine": {}})
+    return EvaluationRecord(
+        record_id=f"eval-{request.research_run_id}", timestamp=datetime.now(timezone.utc).isoformat(),
+        app_version=_get_git_commit_hash(), run_status="error" if error is not None else "success",
+        user_id=request.user_id, session_id=request.session_id, turn_id=turn_id or "",
+        paper_context={"arxiv_id": request.arxiv_id, "indexes": indexes}, configuration=configuration,
+        query={"raw": request.original_question if raw_question is None else raw_question,
+               "rewritten": request.original_question, "main_intent": main_intent},
+        outcome=result.outcome if result and error is None else None,
+        answer=result.answer if result else "",
+        termination_reason=summary.get("termination_reason"),
+        citations=_build_citations_payload(result) if result else [], research_summary=summary,
+        efficiency={"latency_ms": round(latency_ms, 1), "llm_calls": None,
+                    "input_tokens": None, "output_tokens": None, "total_tokens": None,
+                    **(llm_usage or {}), "retrieval_count": summary.get("retrieval_count"),
+                    "draft_attempt_count": summary.get("draft_attempt_count")},
+        trace_ref=request.research_run_id, trace_events=events, error=error,
+    ).model_dump(mode="json")
 
-        # 结果状态
-        outcome = getattr(result, "outcome", "unknown")
-        termination_reason = getattr(result, "termination_reason", "UNKNOWN")
 
-        # 引用与摘要
-        citations = _build_citations_payload(result)
-        research_summary = _build_research_summary_payload(result)
-
-        # 效率指标（llm_calls 暂用占位符 0，Phase 4 补充）
-        efficiency = {
-            "latency_ms": round(latency_ms, 1),
-            "llm_calls": 0,  # TODO: Phase 4 补充 GenerationService 计数器
-            "retrieval_count": research_summary.get("retrieval_count", 0),
-            "draft_attempt_count": research_summary.get("draft_attempt_count", 0),
-        }
-
-        # 构造记录
-        record = {
-            "record_id": record_id,
-            "timestamp": timestamp,
-            "app_version": app_version,
-            "user_id": user_id,
-            "session_id": session_id,
-            "turn_id": turn_id or "",
-            "paper_context": {"arxiv_id": arxiv_id},
-            "query": {
-                "raw": original_question,
-                "rewritten": original_question,  # TODO: 暂无改写逻辑，后续补充
-                "main_intent": main_intent,
-            },
-            "outcome": outcome,
-            "termination_reason": termination_reason,
-            "citations": citations,
-            "research_summary": research_summary,
-            "efficiency": efficiency,
-            "trace_ref": research_run_id,
-        }
-
-        # 按日期分桶写入
-        date_str = datetime.utcnow().strftime("%Y-%m-%d")
-        output_dir = EVAL_RECORDS_DIR / date_str
+def write_eval_record(*, record: dict[str, Any] | None = None, **kwargs: Any) -> str | None:
+    """构造和写盘均在容错边界内，避免评测异常破坏已经完成的问答。"""
+    try:
+        payload = EvaluationRecord.model_validate(record).model_dump(mode="json") if record is not None else build_eval_record(**kwargs)
+        output_dir = EVAL_RECORDS_DIR / datetime.now(timezone.utc).strftime("%Y-%m-%d")
         output_dir.mkdir(parents=True, exist_ok=True)
-
-        output_path = output_dir / f"{research_run_id}.json"
-        output_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        logger.info(
-            "Eval record written: record_id=%s arxiv_id=%s outcome=%s path=%s",
-            record_id,
-            arxiv_id,
-            outcome,
-            output_path,
-        )
+        # run_id 允许由调用方提供，只用于文件名，不能改变评测产物目录。
+        safe_id = re.sub(r"[^0-9A-Za-z._-]+", "_", payload["trace_ref"]).strip(".") or "research"
+        output_path = output_dir / f"{safe_id}.json"
+        output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return str(output_path)
-
-    except Exception as exc:  # pragma: no cover
-        # 写失败只告警，不影响主链路
-        logger.warning(
-            "Failed to write eval record: research_run_id=%s error=%s",
-            getattr(request, "research_run_id", "unknown"),
-            exc,
-            exc_info=True,
-        )
+    except Exception:
+        logger.warning("评测记录写入失败，保留问答结果", exc_info=True)
         return None

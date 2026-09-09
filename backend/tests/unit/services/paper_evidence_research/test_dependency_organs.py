@@ -181,13 +181,15 @@ class TestRuleClaimExtractor:
             evidence_needs=needs or [],
         )
 
-    def test_only_citation_bearing_sentences_become_claims(self) -> None:
+    def test_uncited_sentences_remain_visible_to_verification(self) -> None:
         result = RuleClaimExtractor().extract(
-            self._request("没有引用的句子。[source:chunk-a]带引用的句子。又一句没有引用。")
+            self._request("第一句带引用。[source:chunk-a]第二句没有引用。又一句没有引用。")
         )
         claims = result["claims"]
-        assert len(claims) == 1
+        assert len(claims) == 3
         assert claims[0]["citation_ids"] == ["chunk-a"]
+        assert claims[1]["citation_ids"] == []
+        assert claims[2]["citation_ids"] == []
         assert "source:" not in claims[0]["text"]
 
     def test_binds_claim_to_needs_via_cited_candidates(self) -> None:

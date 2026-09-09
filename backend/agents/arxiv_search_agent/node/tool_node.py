@@ -29,6 +29,7 @@ except ModuleNotFoundError:  # pragma: no cover
     from backend.tools.tool_registry import invoke_tool
 
 from services.paper_qa.repair_actions import RETRY_WITH_EXPANDED_CONTEXT, RETRY_WITH_QUERY_REWRITE
+from services.paper_qa.qa_observation import research_outcome_from_result
 
 from ..schemas import AgentToolCall, ToolObservation
 from ..state import AgentState
@@ -42,7 +43,7 @@ def _build_result_ref(result: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     data = result.get("data")
     if isinstance(data, dict):
         compact: Dict[str, Any] = {}
-        for key in ("status", "message", "arxiv_id", "title", "has_index", "remove_scope", "interest_profile_mode", "interest_cluster_count", "recall_mode"):
+        for key in ("status", "message", "arxiv_id", "title", "has_index", "remove_scope", "interest_profile_mode", "interest_cluster_count", "recall_mode", "outcome", "research_summary"):
             value = data.get(key)
             if value not in (None, "", [], {}):
                 compact[key] = value
@@ -85,6 +86,9 @@ def _build_result_ref(result: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
                     "degraded_stages",
                     "observation_reason",
                     "recommended_repair_actions",
+                    "outcome",
+                    "termination_reason",
+                    "research_summary",
                 )
                 if qa_observation.get(key) not in (None, "", [], {})
             }
@@ -149,6 +153,13 @@ def _derive_observation_details(tool_name: Optional[str], result: Mapping[str, A
             return {
                 "is_sufficient": False,
                 "next_action_hint": "answer_with_available_context",
+            }
+        outcome = research_outcome_from_result(data)
+        if outcome:
+            # sufficient 表示该工具已交付可收口结果；有限回答的覆盖缺口通过 outcome 继续呈现。
+            return {
+                "is_sufficient": True,
+                "next_action_hint": "finalize_with_degradation" if outcome == "partial" else None,
             }
         if qa_observation:
             answer_quality = str(qa_observation.get("answer_quality") or "").strip()

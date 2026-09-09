@@ -788,13 +788,71 @@ async def qa_paper_stream(
     paper_qa_service=Depends(get_paper_qa_service),
     generation_service=Depends(get_generation_service),
 ):
-    """执行流式论文问答，并以 SSE 持续向前端推送事件。"""
+    """执行流式论文问答，并以 SSE 持续向前端推送事件。
+
+    Phase 3: 如果 paper_qa_service 有 research_service，使用证据研究引擎流式接口。
+    """
     question = payload.question.strip()
     logger.debug("QA stream request for paper: %s, question: %s", arxiv_id, question)
 
     def sse_event(event_name: str, data: dict) -> str:
         """格式化单条 SSE 消息。"""
         return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    def event_stream_with_research():
+        """使用证据研究引擎的流式事件生成器。"""
+        try:
+            for event in paper_qa_service.answer_question_with_research_stream(arxiv_id, payload):
+                event_type = event.get("event", "unknown")
+                event_data = event.get("data", {})
+
+                # 映射研究引擎事件到 SSE 事件
+                if event_type == "research_started":
+                    yield sse_event("meta", {
+                        "status": "started",
+                        "arxiv_id": event_data.get("arxiv_id"),
+                        "question": event_data.get("question"),
+                    })
+                elif event_type == "retrieval_completed":
+                    yield sse_event("progress", {
+                        "stage": "retrieval",
+                        "retrieval_count": event_data.get("retrieval_count", 0),
+                        "new_candidate_count": event_data.get("new_candidate_count", 0),
+                    })
+                elif event_type == "draft_created":
+                    yield sse_event("progress", {
+                        "stage": "draft",
+                        "draft_attempt": event_data.get("draft_attempt", 0),
+                        "claim_count": event_data.get("claim_count", 0),
+                    })
+                elif event_type == "claim_verification_completed":
+                    yield sse_event("progress", {
+                        "stage": "verification",
+                        "supported_count": event_data.get("supported_count", 0),
+                    })
+                elif event_type == "research_completed":
+                    yield sse_event("progress", {
+                        "stage": "completed",
+                        "outcome": event_data.get("outcome"),
+                    })
+                elif event_type == "done":
+                    event_data = dict(event_data)
+                    event_data["chat_session"] = _serialize_chat_session(event_data.get("chat_session") or {})
+                    yield sse_event("done", event_data)
+        except AppError as exc:
+            # 服务只抛结构化异常；路由是唯一 error 出口，避免一轮失败发送两次错误。
+            yield sse_event("error", exc.to_payload())
+        except Exception:
+            logger.exception("Error in research stream: arxiv_id=%s", arxiv_id)
+            observation = build_error_qa_observation(
+                error_code=ErrorCode.UNKNOWN_ERROR, error_stage="research_stream",
+                error_reason="research_execution_failed",
+            )
+            # 最后一道兜底也不能返回异常字符串，其中可能包含 provider 响应或服务器路径。
+            yield sse_event("error", AppError(
+                ErrorCode.UNKNOWN_ERROR, detail={"stage": "research_stream"},
+                context={"arxiv_id": arxiv_id, "qa_observation": observation},
+            ).to_payload())
 
     def event_stream():
         """生成 SSE 事件流。
@@ -997,8 +1055,14 @@ async def qa_paper_stream(
             )
             yield sse_event("error", stream_error.to_payload())
 
+    # Phase 3: 路由到证据研究引擎流式接口或旧编排流式接口
+    if hasattr(paper_qa_service, "research_service") and paper_qa_service.research_service is not None:
+        selected_stream = event_stream_with_research()
+    else:
+        selected_stream = event_stream()
+
     return StreamingResponse(
-        event_stream(),
+        selected_stream,
         media_type="text/event-stream",
         headers={
             # SSE 需要禁用缓存和代理缓冲，否则前端可能收不到实时增量。

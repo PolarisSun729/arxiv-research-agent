@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from time import perf_counter
 from typing import Any, Dict, Optional
 
@@ -12,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class RetrievalPipeline:
-    """串联完整检索链路，是 PaperQAService 未来可直接调用的检索入口。"""
+    """串联论文研究使用的单次检索；多轮取证决策与预算由研究图负责。"""
 
     def __init__(
         self,
@@ -51,6 +52,14 @@ class RetrievalPipeline:
             },
             max_workers=1,
         )
+
+    def evaluation_configuration(self, options: Optional[RetrievalOptions] = None) -> Dict[str, Any]:
+        """复用真实参数解析器导出有效预算，避免另一份配置清单与执行语义漂移。"""
+        return {
+            "runtime": self._resolve_runtime_options(options or RetrievalOptions()),
+            # enhanced_config 只包含检索策略参数；带 provider 凭据的 retrieval_config 不整体复制。
+            "strategy": deepcopy(self.enhanced_config),
+        }
 
     def retrieve(
         self,

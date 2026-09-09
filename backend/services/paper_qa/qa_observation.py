@@ -148,6 +148,50 @@ def build_qa_observation(
     }
 
 
+def research_outcome_from_result(result: Mapping[str, Any]) -> str | None:
+    """新图的业务终态优先；执行失败或旧结果仍走原质量判断，不能信任残留 outcome。"""
+    if result.get("status") in {"failed", "error"} or result.get("run_status") == "error":
+        return None
+    observation = result.get("qa_observation")
+    outcome = result.get("outcome") or (observation.get("outcome") if isinstance(observation, Mapping) else None)
+    return outcome if outcome in {"completed", "partial", "abstained"} else None
+
+
+def build_research_qa_observation(
+    *, outcome: str, research_summary: Mapping[str, Any], sources: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """把研究终态投影到原观察契约；有界研究已自行修复，外层不能再按来源数量重试。"""
+    qualities = {"completed": "grounded", "partial": "warning", "abstained": "insufficient_evidence"}
+    if outcome not in qualities:
+        raise ValueError("未知研究终态")
+    reason = f"research_{outcome}:{research_summary.get('termination_reason', 'unknown')}"
+    observation = build_qa_observation(sources=sources)
+    stages = observation["retrieval_stage_status"]
+    # 未逐轮观测的旧检索阶段保留 unknown，不把新图的通过状态伪装成每条旧路由都成功。
+    stages["generation"] = _stage(True, "completed" if outcome != "abstained" else "skipped", fallback=False, reason=reason)
+    stages["verification"] = _stage(True, "passed" if sources else "not_available", fallback=False, reason=reason)
+    stages["evidence_coverage"] = _stage(True, outcome, fallback=False, reason=reason, details=research_summary)
+    observation.update({
+        "outcome": outcome, "termination_reason": research_summary.get("termination_reason"),
+        "research_summary": dict(research_summary), "answer_quality": qualities[outcome],
+        "answer_quality_reason": reason,
+        "retrieval_quality": {"completed": "sufficient", "partial": "partial", "abstained": "weak"}[outcome],
+        "retrieval_quality_reason": reason,
+        "answer_insufficient_evidence": "yes" if outcome == "abstained" else "no",
+        "answer_insufficient_evidence_reason": reason if outcome == "abstained" else "not_available",
+        "degraded_stages": ["evidence_coverage"] if outcome == "partial" else [],
+        "weak_source_reason": "unresolved_core_needs" if outcome != "completed" else "not_available",
+        "missing_evidence_type": "unresolved_core_needs" if outcome != "completed" else "not_available",
+        "recommended_repair_actions": [], "repair_action_details": [], "observation_reason": reason,
+    })
+    observation["quality_signals"] = _build_quality_signals(
+        stage_status=stages, route_status=observation["route_status"],
+        retrieval_quality=observation["retrieval_quality"], retrieval_quality_reason=reason,
+        answer_quality=qualities[outcome], answer_quality_reason=reason,
+    )
+    return observation
+
+
 def build_error_qa_observation(
     *,
     error_code: str,

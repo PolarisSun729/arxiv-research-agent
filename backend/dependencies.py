@@ -339,6 +339,45 @@ def get_recommendation_service() -> RecommendationService:
 
 
 @lru_cache(maxsize=1)
+def get_paper_evidence_research_service():
+    from services.paper_evidence_research.dependencies.research_dependency_factory import (
+        build_paper_evidence_research_service,
+    )
+    from services.paper_evidence_research.dependencies.need_orchestrated_retriever import NeedOrchestratedRetriever
+    from services.paper_evidence_research.dependencies.production_adapters import (
+        PaperRetrievalTargetResolver, ResearchClaimVerifier, ResearchDraftGenerator,
+    )
+    from services.paper_evidence_research.dependencies.research_trace import ResearchTraceRecorder
+    from pathlib import Path
+
+    generation_service = get_generation_service()
+    retrieval_service = get_enhanced_retrieval_service()
+    retriever = NeedOrchestratedRetriever(
+        retrieval_pipeline=retrieval_service.retrieval_pipeline,
+        target_resolver=PaperRetrievalTargetResolver(
+            index_store=get_paper_qa_index_store(), catalog_store=get_paper_catalog_store(),
+        ),
+    )
+
+    def configuration_provider():
+        # 每次研究开始读取当前对象配置，避免热改模型或预算后仍沿用旧报告指纹。
+        return {
+            "generation": generation_service.evaluation_configuration(),
+            "retrieval": {**retrieval_service.evaluation_configuration(), **retriever.evaluation_configuration()},
+        }
+
+    # QA 与离线评测共用正式适配器；图只接收动作/请求协议，不直接调用底层客户端。
+    return build_paper_evidence_research_service(
+        generation_service=generation_service,
+        retriever=retriever,
+        draft_generator=ResearchDraftGenerator(generation_service),
+        claim_verifier=ResearchClaimVerifier(generation_service),
+        trace_sink=ResearchTraceRecorder(trace_dir=Path(__file__).resolve().parent / "temp" / "paper-evidence-research-traces"),
+        configuration_provider=configuration_provider,
+    )
+
+
+@lru_cache(maxsize=1)
 def get_paper_qa_service() -> PaperQAService:
     from services.paper_qa.paper_qa_service import PaperQAService
 
@@ -357,6 +396,7 @@ def get_paper_qa_service() -> PaperQAService:
         arxiv_service_factory=lambda: get_arxiv_api_service(),
         get_embedding_config=get_current_embedding_config,
         qa_index_builder=get_paper_qa_index_builder(),
+        research_service=get_paper_evidence_research_service(),
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any, Mapping
 
 from langgraph.graph import END, START, StateGraph
@@ -12,6 +13,7 @@ from .completion_gate import can_finalize, has_verifiable_support
 from .context_pack import build_context_pack
 from .contracts import PaperEvidenceResearchResult, ResearchSummary, VerifiedCitation
 from .evidence_pool import candidate_identity, merge_candidates
+from .errors import PaperEvidenceResearchError
 from .state import (
     AnswerClaim,
     ClaimAssessment,
@@ -27,6 +29,7 @@ from .state import (
 
 # 研究轨迹是审计与评测数据源，不是第二份候选池；单轮召回记录数封顶防止轨迹被异常检索器撑爆。
 _MAX_TRACED_CANDIDATES = 50
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -37,6 +40,7 @@ class ResearchGraphDependencies:
     draft_generator: Any
     claim_extractor: Any
     claim_verifier: Any
+    configuration_provider: Any = None
 
 
 def _coerce_state(state: Any) -> PaperEvidenceResearchState:
@@ -84,7 +88,16 @@ def _prepare_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperE
     analysis = dict(dependencies.question_analyzer.analyze(next_state.request) or {})
     next_state.research_question = str(analysis.get("research_question") or next_state.request.original_question).strip()
     next_state.evidence_needs = _initialize_evidence_needs(analysis.get("evidence_needs"))
-    _trace(next_state, "research_started", research_question=next_state.research_question)
+    engine_config = {}
+    try:
+        if dependencies.configuration_provider is not None:
+            engine_config = dict(dependencies.configuration_provider() or {})
+    except Exception:
+        # 观测失败不破坏问答，但缺配置的记录必须由报告禁止自动基线比较。
+        logger.warning("研究配置快照不可用", exc_info=True)
+    _trace(next_state, "research_started", research_question=next_state.research_question, configuration={
+        "research_limits": next_state.request.limits.model_dump(mode="json"), "engine": engine_config,
+    })
     return next_state
 
 
@@ -200,6 +213,12 @@ def _search_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEv
         raise ValueError("search node received non-search action")
     next_state.retrieval_count += 1
     retrieval = dict(dependencies.retriever.retrieve(action, next_state) or {})
+    retrieval_status = str(retrieval.get("status") or "completed")
+    if retrieval_status in {"target_unavailable", "retrieval_failed"}:
+        next_state.retrieval_failures[action.target_need_id] = retrieval_status
+    else:
+        # 同一需求成功重试（包括正常空召回）后故障已恢复，不能被历史失败永久污染。
+        next_state.retrieval_failures.pop(action.target_need_id, None)
     candidates = retrieval.get("candidates") or []
     merged, new_count, duplicate_count = merge_candidates(
         next_state.evidence_candidates,
@@ -226,10 +245,13 @@ def _search_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEv
         target_need_id=action.target_need_id,
         # 轨迹记录适配器实际使用的检索查询；脚本化检索器不回传时退回动作自带的 query。
         query=str(retrieval.get("query") or action.query),
-        status=str(retrieval.get("status") or "completed"),
+        status=retrieval_status,
+        retrieval_count=next_state.retrieval_count,
+        main_intent=retrieval.get("main_intent"),
         new_candidate_count=new_count,
         duplicate_candidate_count=duplicate_count,
-        candidates=_trace_candidate_refs(candidates),
+        candidates=_trace_candidate_refs(retrieval.get("retrieval_candidates", candidates)),
+        index_snapshot=retrieval.get("index_snapshot"),
     )
     return next_state
 
@@ -266,11 +288,13 @@ def _draft_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEvi
                 research_question=next_state.research_question,
                 addressed_need_ids=list(action.addressed_need_ids),
                 context_pack=context_pack,
+                preferred_answer_style=next_state.request.preferred_answer_style or "",
             )
         )
         or {}
     )
     next_state.draft_attempt_count = version
+    next_state.citation_repair_count += int(bool(generated.get("citation_repair_attempted")))
     next_state.current_draft = DraftAnswer(
         draft_id=str(generated.get("draft_id") or f"draft-{version}"),
         version=version,
@@ -348,6 +372,15 @@ def _verify_claims_node(state: Any, dependencies: ResearchGraphDependencies) -> 
         "claim_verification_completed",
         draft_version=draft.version,
         assessment_count=len(next_state.claim_assessments),
+        # 评测重放使用校验关系和实际证据 ID，不依赖前端进度流，也不记录隐藏推理。
+        candidate_ids=[candidate.candidate_id for candidate in context_pack.candidates],
+        claims=[claim.model_dump(mode="json") for claim in next_state.claims],
+        assessments=[assessment.model_dump(mode="json") for assessment in next_state.claim_assessments],
+        supported_claim_count=sum(
+            has_verifiable_support(next_state, claim, next(
+                (item for item in next_state.claim_assessments if item.claim_id == claim.claim_id), None
+            )) for claim in next_state.claims
+        ),
     )
     return next_state
 
@@ -394,6 +427,14 @@ def _project_coverage_node(state: Any) -> PaperEvidenceResearchState:
     _trace(
         next_state,
         "evidence_coverage_projected",
+        draft_version=next_state.current_draft.version if next_state.current_draft else 0,
+        # 保留每版草稿的可靠支持和核心覆盖，修复收益可以为负，不能用重试次数替代。
+        supported_claim_count=sum(
+            has_verifiable_support(next_state, claim, assessment_by_claim.get(claim.claim_id))
+            for claim in next_state.claims
+        ),
+        core_need_count=sum(need.importance == "core" and need.status not in {"abandoned", "superseded"} for need in projected_needs),
+        satisfied_core_need_count=sum(need.importance == "core" and need.status == "satisfied" for need in projected_needs),
         satisfied_need_ids=[need.need_id for need in projected_needs if need.status == "satisfied"],
     )
     return next_state
@@ -452,6 +493,7 @@ def _build_result(
             satisfied_need_count=len([need for need in state.evidence_needs if need.status == "satisfied"]),
             blocked_need_count=len([need for need in state.evidence_needs if need.status == "blocked"]),
             supported_claim_count=len(supported_claim_ids),
+            citation_repair_count=state.citation_repair_count,
             outcome=outcome,
             termination_reason=termination_reason,
             unresolved_topics=unresolved,
@@ -500,15 +542,34 @@ def _terminal_node(state: Any, *, requested_abstention: bool = False) -> PaperEv
         need.importance == "core" and need.status == "satisfied"
         for need in next_state.evidence_needs
     )
+    blocking_failures = {
+        need.need_id: next_state.retrieval_failures[need.need_id]
+        for need in next_state.evidence_needs
+        if need.need_id in next_state.retrieval_failures
+        and need.status not in {"satisfied", "superseded", "abandoned"}
+    }
+    can_keep_partial = bool(supported_claims and core_need_satisfied and not requested_abstention)
+    if blocking_failures and not can_keep_partial:
+        # 无关候选不是可靠证据。故障阻断取证且无法保留已验证核心回答时，必须记为运行失败。
+        raise PaperEvidenceResearchError(
+            code="research_retrieval_failed", stage="retrieval", message="未能取得可用的论文检索结果",
+            detail={"failed_need_ids": sorted(blocking_failures)},
+        )
     for need in next_state.evidence_needs:
         if need.importance == "core" and need.status in {"provisional", "open"}:
             need.status = "blocked"
             need.blocking_reason = next_state.action_rejection_code or "research_stopped_without_full_coverage"
-    if supported_claims and core_need_satisfied and not requested_abstention:
-        # 有界终止只保留已验证主张，避免把初稿中的无支持内容带入有限回答。
-        answer = "；".join(claim.text.rstrip("。；") for claim in supported_claims) + "。"
+    if can_keep_partial:
+        # 有界终止只保留已验证主张，并重建引用标记，使正文与证据面板仍能互相定位。
+        answer = "；".join(
+            claim.text.rstrip("。；") + " " + "".join(f"[source:{source_id}]" for source_id in claim.citation_ids)
+            for claim in supported_claims
+        ) + "。"
         outcome = "partial"
-        termination_reason = next_state.action_rejection_code or "partial_answer_after_budget_exhaustion"
+        termination_reason = (
+            "partial_answer_after_retrieval_failure" if blocking_failures
+            else next_state.action_rejection_code or "partial_answer_after_budget_exhaustion"
+        )
     else:
         # 没有任何核心需求覆盖时，即使背景主张有证据也不能形成有限回答。
         supported_claim_ids = set()

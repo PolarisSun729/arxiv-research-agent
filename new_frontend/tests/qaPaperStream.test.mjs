@@ -88,6 +88,25 @@ assert.equal(completed.answer, 'hello world')
 assert.equal(completed.partial, false)
 assert.equal(completed.persistence_status, 'saved')
 
+// 研究流可以没有 delta；有限回答、正常拒答及成本必须从 done 完整保留下来。
+for (const outcome of ['completed', 'partial', 'abstained']) {
+  const summary = { outcome, retrieval_count: 2, termination_reason: 'offline-test' }
+  const usage = { llm_calls: 4, total_tokens: null }
+  const stages = []
+  globalThis.__qaStreamChunks = [
+    sse('progress', { stage: 'retrieval', retrieval_count: 2 }),
+    sse('progress', { stage: 'verification', supported_count: 1 }),
+    sse('done', { status: 'success', outcome, research_summary: summary, usage, answer: '已校验的最终答案', sources: [] })
+  ]
+  const result = await qaPaperStream('1234.1', 'q', { onProgress: event => stages.push(event.stage) })
+  assert.equal(result.status, 'completed')
+  assert.equal(result.answer, '已校验的最终答案')
+  assert.equal(result.outcome, outcome)
+  assert.deepEqual(result.research_summary, summary)
+  assert.deepEqual(result.usage, usage)
+  assert.deepEqual(stages, ['retrieval', 'verification'])
+}
+
 globalThis.__qaStreamChunks = [
   sse('delta', { delta: 'partial answer' })
 ]

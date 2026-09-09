@@ -1,9 +1,11 @@
 # 001 定量评测体系与论文证据研究引擎扶正
 
-- 状态: Draft（待评审）
+- 状态: 生产接线与评测修复已实现；真实 golden 基线等待人工标注
 - 日期: 2026-09-04
 - 来源: 2026-09-04 grilling 会话共识 + 当日代码现状核对
 - 关联词汇: `backend/CONTEXT.md`（"自修复增益"、"评估单位"已定义）
+
+当前维护口径见 [论文 QA](../capabilities/paper-qa.md) 和 [生成效果评测](../capabilities/evaluation.md)。生产同步、流式与 runner 已共用正式研究依赖；旧组件仍保留给兼容入口与既有调用方，下面的整段删除计划尚不代表已完成。现有 12 条 smoke 仍缺三项人工标注，不能宣称已有真实效果基线。
 
 ## 1. 背景与目标
 
@@ -27,13 +29,13 @@
 | D1 | 数据 | 用户手工标注 20-30 条 golden（格式 = 现有 jsonl + 新增 `expected_chunk_ids` / `answerable` / `gold_answer` 三字段）；放量后走线上 query 回流 + LLM 生成抽检，本期不做 |
 | D2 | 埋点 | 补 eval record（outcome、citations、效率、app_version），终态不抹平 |
 | D3 | 架构 | `paper_evidence_research` 扶正为唯一生产 QA 引擎；旧 QA 编排链迁移完成后整段删除；arxiv_search_agent 的搜索/推荐/画像等其他意图不动 |
-| D4 | 依赖 | 三器官（question_analyzer / decision_policy / claim_extractor）全部 LLM 优先 + 规则兜底；两条铁律：①预算护栏硬编码在图骨架，LLM 只能在预算内选动作；②所有 LLM 输出过 schema 校验，不合法即降级到规则版 |
+| D4 | 依赖 | question_analyzer / decision_policy 采用 LLM 优先 + 规则兜底；首期 claim_extractor 使用独立规则提取可见主张。预算护栏在图骨架，LLM 输出过 schema；独立 claim_verifier 故障必须记运行错误，不能规则伪造 supported |
 | D5 | 检索集成 | 研究循环 3 次检索预算，末次降级轻量模式；候选池去重 |
 | D6 | 观测 | 检索候选（query + chunk_id + rank）走 trace 事件流（方案 A），`PaperEvidenceResearchResult` 对外契约不变 |
 | D7 | 评测运行 | 离线脚本跑 golden，报告落盘 `backend/06-evaluation-result/`，文件名带时间戳 + commit hash；每 case n=3 取中位数并记录离散度；关键指标跌 5pt 报告头部标红，暂不进 CI fail |
 | D8 | LLM 不确定性 | 不锁 temperature、不缓存固定输出（那是在测一个线上不存在的版本）；用 n=3 中位数 + 离散度上报消解 |
 
-## 3. 现状核对（2026-09-04 代码事实）
+## 3. 设计输入核对（2026-09-04 历史快照）
 
 与讨论时的认知有 3 处偏差，已按当前代码修正：
 
@@ -114,7 +116,7 @@
 - 新文件 `backend/services/paper_evidence_research/dependencies/need_orchestrated_retriever.py`：
   - 包装 `RetrievalPipeline.retrieve`；`SearchPaperAction.target_need_id` + need.description
     + research_question → 检索 query；collection 取该 arxiv_id 的 QA 索引 collection。
-  - **次数治理**：`state.retrieval_count >= limits.max_retrievals - 1` 的那一轮传轻量
+  - **次数治理**：图在调用前已自增，`state.retrieval_count >= limits.max_retrievals` 的那一轮传轻量
     `RetrievalOptions`（跳过 query rewrite 与 LLM rerank），前几轮走全管线。
   - **候选映射**：检索结果 chunk → `EvidenceCandidate`（candidate_id=chunk_id，
     content/section_path/page_number/chunk_type 对齐现有 QA 索引 chunk 字段）。
@@ -153,11 +155,13 @@ eval record（D2）：
   在 `persist_completed_turn` 旁边写一条 JSON 到
   `backend/06-evaluation-result/records/YYYY-MM-DD/{research_run_id}.json`：
   `record_id, timestamp, app_version(git commit hash), user_id, session_id, turn_id,
-  paper_context{arxiv_id}, query{raw, rewritten, main_intent}, outcome, termination_reason,
-  citations[citation_id, chunk_id, claim_ids], research_summary{…}, efficiency{latency_ms,
-  llm_calls, retrieval_count, draft_attempt_count}, trace_ref`。
+  run_status, paper_context{arxiv_id, indexes}, configuration{research_limits, engine},
+  query{raw, rewritten, main_intent}, outcome, answer, termination_reason,
+  citations[source_id, content, claim_ids], research_summary{…}, efficiency{latency_ms,
+  llm_calls, input_tokens, output_tokens, total_tokens, retrieval_count, draft_attempt_count}, trace_ref, trace_events, error`。
+  - 运行失败必须 `run_status=error, outcome=null`；拒答属于正常研究终态。
   - 写失败只告警，不影响问答主链路（与 `_write_qa_trace` 同策略）。
-- llm_calls/tokens：`GenerationService` 层补一个调用计数器（若无现成统计）。
+- llm_calls/tokens：在 `GenerationService` 的 SDK 边界与远程 rerank 的 HTTP 边界计数，包含失败请求；未报告用量记 null。线上和 runner 使用同一请求级统计上下文。
 
 删除（切换稳定后同一提交或紧随提交）：
 
@@ -181,22 +185,24 @@ eval record 每轮落盘；全量测试绿；旧编排代码无残留引用。
 | `metrics_generation.py` | ①要点覆盖率（0-1 连续值，中英文别名归一——把现 smoke 测试里硬编码的 alias 表抽成数据文件）；②引用忠诚度：每个 citation 的 claim 是否 verdict=supported 且 chunk 真实存在；③三态正确率：`answerable` × `outcome` 交叉矩阵（该拒没拒 / 不该拒乱拒分开计）；④自修复增益：按 CONTEXT.md 定义，用 draft_attempt 间 supported_claim_count 差值计算 |
 | `metrics_report.py` | 分桶报告（按 difficulty / main_intent），与上一份报告 diff，Recall@5 / 三态正确率 / 引用忠诚度跌幅 >5pt 在报告头部标红（D7） |
 | `golden_runner.py` | CLI：`python -m services.evaluation.golden_runner --cases <jsonl> --repeat 3`；每 case 跑 3 次取中位数 + 记录离散度（离散度本身是指标：同 case 三次 outcome 不一致要显式上报）；报告落盘 `06-evaluation-result/reports/{ts}_{commit}.json` |
+| `contracts.py` / `scoring.py` / `configuration.py` | 统一记录与重评分；运行失败不丢分母；基线比较校验实际预算、模型、索引与重复次数，版本缺失时禁止自动 diff |
 
-pytest 只保留轻量冒烟（指标纯函数正确性、runner 用 mock 引擎跑通 1 条 case、报告 schema
-合法）；完整 golden 评测不进 CI（LLM 链路慢且花钱）。
+pytest 使用真实请求/结果模型和研究图，仅替换外部 I/O，覆盖指标、runner、会话、SSE、失败统计与重新评分；完整真实 golden 评测不进 CI。
 
 指标 → 数据源对照（Q9 结论，全部可在新引擎上直接计算）：
 
 | 指标 | 来源 | 状态 |
 |------|------|------|
-| 三态正确率 / 终止原因分布 | result.outcome / termination_reason / unresolved_topics | 齐备 |
-| 自修复增益 | research_summary.draft_attempt_count / supported_claim_count / citation_repair_count | 齐备 |
-| 引用忠诚度 | citations[].source_id + claim_ids + claim_assessments | 齐备 |
-| 效率 / 成本 | research_summary 计数 + eval record efficiency（补 llm_calls/latency） | Phase 3 补 |
-| Recall@k / MRR | trace 检索候选（方案 A） | Phase 2 补 |
+| 三态正确率 / 终止原因分布 | 顶层 run_status/outcome + research_summary.termination_reason / unresolved_topics | 已接通；需人工 answerable |
+| 自修复增益 | 各版 evidence_coverage_projected 的 supported_claim_count 与核心覆盖差值 | 已接通；同时记录有害修复 |
+| 引用忠诚度 | citations[].source_id + claim_ids + 最终版 claims/assessments 的 verdict 和引用绑定 | 已接通；无引用不自动满分 |
+| 效率 / 成本 | research_summary 计数 + 请求级真实 provider 调用与 usage | 已接通；缺用量为 null |
+| Recall@k / MRR | event_type=retrieval_completed 的去重前排名候选 | 已接通；需人工 expected_chunk_ids |
 
 **验收**：12 条现有 golden + 新字段能跑出完整报告；重复跑两次报告可 diff；
  golden 标注完成后输出第一份"新基准"报告。
+
+补充口径：报告同时显示中位数和逐次均值，以及失败率、有效/缺测样本数。技术失败在适用指标中计 0；未标注指标为 null。只有标注和轨迹完整、配置稳定、每题至少三次且无运行失败的报告才是可用基线；自动 diff 还要求与上次基线的数据、指标、配置指纹一致。
 
 ## 5. 数据集任务（并行，人工，不阻塞 Phase 1-2）
 

@@ -6,6 +6,7 @@ from time import perf_counter
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from services.paper_qa.qa_observation import research_outcome_from_result
 
 from services.paper_qa.repair_actions import (
     ASK_USER_TO_REBUILD_INDEX,
@@ -164,6 +165,8 @@ class PaperQAAnswerOutput(BaseModel):
     citation_warning: Optional[str] = None
     retrieval_debug: Any = None
     qa_observation: Any = None
+    outcome: Optional[str] = None
+    research_summary: Dict[str, Any] = Field(default_factory=dict)
     error: Any = None
     arxiv_id: Optional[str] = None
     question: Optional[str] = None
@@ -466,6 +469,21 @@ class AssessPaperQAQualityAdapter(BaseToolAdapter[AssessPaperQAQualityInput, Pap
             for stage in (qa_observation.get("degraded_stages") if isinstance(qa_observation.get("degraded_stages"), list) else [])
             if str(stage).strip()
         ]
+
+        outcome = research_outcome_from_result(result)
+        if outcome and answer:
+            # 研究图已完成有界修复和逐主张校验；partial 保留不完整信号，abstained 是合法业务终态。
+            # 外层再次按来源数触发 QA，会绕过本次研究预算，并把正确拒答误判为故障。
+            partial = outcome == "partial"
+            return PaperQAQualityDecisionOutput(
+                status="degraded" if partial else "passed",
+                decision="finalize_with_degradation" if partial else "finalize",
+                reason=str(qa_observation.get("observation_reason") or f"research_{outcome}"),
+                answer_available=True, source_count=len(sources), retrieval_quality=retrieval_quality,
+                answer_quality=answer_quality, answer_insufficient_evidence=answer_insufficient,
+                degraded_stages=degraded_stages, qa_observation=dict(qa_observation),
+                outcome=outcome, research_summary=result.get("research_summary") or qa_observation.get("research_summary") or {},
+            )
 
         decision = "finalize"
         status = "passed"

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from time import perf_counter
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Generator, List, Optional
 from uuid import uuid4
 
 from core.errors import AppError, ErrorCode
@@ -11,10 +11,13 @@ from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
 from services.context_lifecycle import ContextLifecycleService
 from services.document.chunking_service import ChunkingService
 from services.evaluation import write_eval_record
+from services.llm.call_metrics import LLMCallStats, use_call_stats
 from services.memory import MemoryService
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
 from services.paper_evidence_research import (
     PaperEvidenceResearchRequest,
+    PaperEvidenceResearchResult,
+    PaperEvidenceResearchError,
     PaperEvidenceResearchService,
     ResearchLimits,
 )
@@ -26,7 +29,8 @@ from services.paper_qa.context_pack_builder import ContextPackBuilder
 from services.paper_qa.evidence_contract import build_public_source_payload, resolve_evidence_asset_path
 from services.paper_qa.evidence_verifier import EvidenceVerifier
 from services.paper_qa.paper_qa_index_builder import PaperQAIndexBuilder
-from services.paper_qa.qa_observation import build_error_qa_observation, build_qa_observation
+from services.paper_qa.qa_observation import build_error_qa_observation, build_qa_observation, build_research_qa_observation
+from services.paper_evidence_research.dependencies.production_adapters import PaperRetrievalTargetResolver
 from services.paper_qa.question_contextualizer import QuestionContextualizer
 from services.paper_qa.session_service import PaperQASessionService
 from services.storage.sqlite.stores import (
@@ -100,7 +104,10 @@ class PaperQAService:
             vector_store_service=self.vector_store_service,
             generation_service=self.generation_service,
         )
-        self.research_service = research_service  # Phase 3: 新证据研究引擎
+        self.research_service = research_service
+        self._research_target_resolver = PaperRetrievalTargetResolver(
+            index_store=paper_qa_index_store, catalog_store=paper_catalog_store,
+        )
         self.arxiv_service_factory = arxiv_service_factory or (lambda: ArxivSearchService())
         self.oai_db_service = oai_db_service
         self.get_embedding_config = get_embedding_config or self.embedding_service.get_default_embedding_config
@@ -560,211 +567,224 @@ class PaperQAService:
             logger.warning("Failed to load user memory summary for prompt context: user_id=%s error=%s", user_id, exc)
             return {}
 
+    def _prepare_research_context(
+        self, arxiv_id: str, payload: Any, request: PaperEvidenceResearchRequest,
+    ) -> Dict[str, Any]:
+        """会话消歧和索引前置检查共用真实服务接口，避免同步与流式入口发生漂移。"""
+        target = self._research_target_resolver(arxiv_id)
+        if target is None:
+            raise AppError(
+                ErrorCode.QA_INDEX_NOT_FOUND,
+                context={"arxiv_id": arxiv_id, "stage": "prepare_research"},
+            )
+        chat_session = self._resolve_chat_session(arxiv_id, payload)
+        state = self.session_service.load_conversation_state(
+            arxiv_id=arxiv_id, payload=payload, chat_session=chat_session,
+        )
+        question = request.original_question
+        try:
+            contextualization = self.question_contextualizer.contextualize(
+                question, target.paper_context, state["conversation_context"],
+            )
+        except Exception:
+            # 会话消歧只是增强能力；失败回到原问题，但不能把模型响应或底层异常带到 API。
+            logger.warning("Research question contextualization failed: run_id=%s", request.research_run_id, exc_info=True)
+            contextualization = {
+                "original_question": question, "contextualized_question": question,
+                "is_follow_up": False, "referenced_turn_ids": [], "referenced_source_ids": [],
+                "used_short_term_memory": False, "status": "fallback_original",
+                "memory_reason": "问题消歧不可用，本轮使用原始问题。", "error": "contextualization_failed",
+            }
+        rewritten = str(contextualization.get("contextualized_question") or question).strip() or question
+        state["short_term_debug"] = self.session_service.update_short_term_debug_with_contextualization(
+            state["short_term_debug"], contextualization,
+        )
+        # stateless 标识只满足图的运行隔离，不能写回 chat_session 冒充持久化会话。
+        request = request.model_copy(update={
+            "original_question": rewritten,
+            "session_id": chat_session.get("session_id") or f"stateless-{request.research_run_id}",
+            "conversation_snapshot": {
+                "recent_turns": state.get("recent_conversation_context") or [],
+                "session_summary": state.get("session_summary"),
+            },
+            "preferred_answer_style": self._get_preferred_answer_style(payload),
+        })
+        return {
+            "request": request, "chat_session": chat_session, "session_state": state,
+            "question_contextualization": contextualization, "paper_context": target.paper_context,
+        }
+
+    def _finalize_research_answer(
+        self, *, arxiv_id: str, question: str, prepared: Dict[str, Any],
+        research_result: PaperEvidenceResearchResult, trace_events: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """统一结果、观察与会话落盘；完成持久化后才允许对外发送 done。"""
+        request = prepared["request"]
+        summary = research_result.research_summary.model_dump(mode="json")
+        sources = self._build_public_source_payload(
+            [dict(c.model_dump(mode="json"), chunk_id=c.source_id) for c in research_result.citations],
+            arxiv_id=arxiv_id,
+        )
+        cited_ids = [citation.source_id for citation in research_result.citations]
+        observation = build_research_qa_observation(
+            outcome=research_result.outcome, research_summary=summary, sources=sources,
+        )
+        generation_debug = {"status": "completed", "draft_attempt_count": summary["draft_attempt_count"]}
+        verification_debug = {
+            "status": "passed" if sources else "insufficient_evidence",
+            "source_count": len(sources), "cited_source_count": len(cited_ids),
+            "supported_claim_count": summary["supported_claim_count"],
+            "insufficient_evidence": research_result.outcome == "abstained",
+        }
+        # API/debug 只返回可展示的摘要。完整候选和逐主张校验留在私有 eval record 中用于重评分。
+        retrieval_debug = {
+            "engine": "paper_evidence_research", "research_summary": summary, "qa_observation": observation,
+            "intent_profile": {"main_intent": next(
+                (e["main_intent"] for e in trace_events if e.get("main_intent")), "unknown",
+            )},
+            "short_term_memory": prepared["session_state"]["short_term_debug"],
+            "generation": generation_debug, "verification": verification_debug,
+        }
+        contextualization = prepared["question_contextualization"]
+        persisted = self.persist_completed_turn(
+            chat_session=prepared["chat_session"], question=question, answer=research_result.answer,
+            source_payload=sources, retrieval_debug=retrieval_debug,
+            contextualized_question=request.original_question, question_contextualization=contextualization,
+        )
+        chat_session = persisted.get("chat_session") or prepared["chat_session"]
+        return {
+            "status": "success", "arxiv_id": arxiv_id, "question": question,
+            "session_id": chat_session.get("session_id"), "chat_session": chat_session,
+            "turn_id": persisted.get("turn_id"), "original_question": question,
+            "persistence_status": "saved" if persisted.get("turn_id") else "not_saved",
+            "contextualized_question": request.original_question,
+            "used_short_term_memory": bool(contextualization.get("used_short_term_memory")),
+            "question_contextualization": contextualization, "answer": research_result.answer,
+            "sources": sources, "cited_source_ids": cited_ids,
+            "citation_debug": {"verified": True, "repair_attempt_count": summary["citation_repair_count"]},
+            "citation_warning": None, "generation_debug": generation_debug,
+            "verification_debug": verification_debug, "retrieval_debug": retrieval_debug,
+            "outcome": research_result.outcome, "research_summary": summary,
+            "citations": [dict(c.model_dump(mode="json"), citation_id=c.source_id) for c in research_result.citations],
+            "qa_observation": observation,
+        }
+
     def answer_question_with_research(self, arxiv_id: str, payload: Any) -> Dict[str, Any]:
-        """使用新证据研究引擎回答问题（Phase 3 生产切换）。"""
+        """同步入口消费同一执行流；显式捕获 return，避免 for 吞掉最终结果。"""
+        stream = self.answer_question_with_research_stream(arxiv_id, payload)
+        while True:
+            try:
+                next(stream)
+            except StopIteration as stop:
+                return stop.value
+
+    def answer_question_with_research_stream(
+        self, arxiv_id: str, payload: Any,
+    ) -> Generator[Dict[str, Any], None, Dict[str, Any]]:
+        """逐阶段 yield 进度及唯一 done；异常统一上抛，由 router 发出一次 error。"""
         question = str(self._payload_get(payload, "question", "") or "").strip()
         run_id = str(self._payload_get(payload, "run_id", "") or "").strip() or str(uuid4())
-        started = perf_counter()
         user_id = self._resolve_user_id(self._payload_get(payload, "user_id"))
+        started = perf_counter()
+        stats = LLMCallStats()
+        events: List[Dict[str, Any]] = []
+        request = None
+        research_result = None
+        research_stream = None
         trace = RequestTrace(
-            run_id=run_id,
-            route="paper_qa.answer_with_research",
+            run_id=run_id, route="paper_qa.research", user_id=user_id, input=question,
             session_id=str(self._payload_get(payload, "session_id", "") or "") or None,
-            user_id=user_id,
-            input=question,
         )
-        info_event(
-            logger,
-            "qa.request_start",
-            run_id=run_id,
-            session_id=trace.session_id,
-            user_id=user_id,
-            arxiv_id=arxiv_id,
-            input=question,
-            engine="research",
-        )
+        stage = "prepare_research"
         trace.add_event("qa.request_start", arxiv_id=arxiv_id, user_id=user_id, engine="research")
-
-        # 会话与上下文准备（保留现有逻辑）
-        chat_session = self._resolve_chat_session(arxiv_id, payload)
-        session_id = chat_session.get("session_id", "")
-
-        # 问题上下文化（短期记忆）
-        conversation_context = self.session_service.get_conversation_context(
-            session_id=session_id,
-            user_id=user_id,
-        )
-        paper_context = {"arxiv_id": arxiv_id}
-        question_contextualization = self.question_contextualizer.contextualize(
-            question=question,
-            paper_context=paper_context,
-            conversation_context=conversation_context,
-        )
-        contextualized_question = question_contextualization.get("contextualized_question", question)
-
-        # 构造会话快照（供研究引擎使用）
-        conversation_snapshot = {
-            "recent_turns": conversation_context[:5],  # 最近 5 轮对话
-            "session_summary": self.session_service.get_session_summary(session_id, user_id),
-        }
-
-        # 构造研究请求
-        preferred_answer_style = self._get_preferred_answer_style(payload)
-        research_request = PaperEvidenceResearchRequest(
-            arxiv_id=arxiv_id,
-            original_question=contextualized_question,
-            user_id=user_id,
-            session_id=session_id,
-            research_run_id=run_id,
-            conversation_snapshot=conversation_snapshot,
-            preferred_answer_style=preferred_answer_style,
-            limits=ResearchLimits(),  # 使用默认限制
-        )
-
-        # 调用证据研究引擎
+        info_event(logger, "qa.request_start", run_id=run_id, arxiv_id=arxiv_id, user_id=user_id, engine="research")
         try:
-            research_result = self.research_service.research(research_request)
+            if not question:
+                raise AppError(ErrorCode.REQUEST_VALIDATION_ERROR)
+            request = PaperEvidenceResearchRequest(
+                arxiv_id=arxiv_id, original_question=question, user_id=user_id,
+                session_id=f"stateless-{run_id}", research_run_id=run_id, limits=ResearchLimits(),
+            )
+            with use_call_stats(stats):
+                prepared = self._prepare_research_context(arxiv_id, payload, request)
+            request = prepared["request"]
+            trace.session_id = prepared["chat_session"].get("session_id")
+            stage = "research"
+            if self.research_service is None:
+                raise AppError(ErrorCode.UNKNOWN_ERROR)
+            research_stream = self.research_service.research_stream(
+                request, trace_listener=lambda _run_id, trace_events: events.extend(trace_events),
+            )
+            while True:
+                try:
+                    # Starlette 可以在不同工作线程恢复同步生成器；每次 next 单独绑定上下文，
+                    # 并在 yield 前退出，既不泄漏计数器，也不会跨 Context 重置 token。
+                    with use_call_stats(stats):
+                        event = next(research_stream)
+                except StopIteration as stop:
+                    research_result = stop.value
+                    break
+                yield {"event": event["event"], "data": event}
+            if research_result is None:
+                raise AppError(ErrorCode.UNKNOWN_ERROR, context={"stage": "research_result_missing"})
+            stage = "persist_completed_turn"
+            with use_call_stats(stats):
+                result = self._finalize_research_answer(
+                    arxiv_id=arxiv_id, question=question, prepared=prepared,
+                    research_result=research_result, trace_events=events,
+                )
+            elapsed_ms = (perf_counter() - started) * 1000
+            result["usage"] = stats.to_dict()
+            write_eval_record(
+                request=request, result=research_result, turn_id=result.get("turn_id"),
+                trace_events=events, raw_question=question, latency_ms=elapsed_ms, llm_usage=stats.to_dict(),
+            )
+            trace.set_output(result)
+            trace.add_event("qa.request_done", status="success", outcome=research_result.outcome)
+            trace_path = _write_qa_trace(trace, reason="auto")
+            info_event(
+                logger, "qa.request_done", run_id=run_id, arxiv_id=arxiv_id, status="success",
+                outcome=research_result.outcome, elapsed_ms=round(elapsed_ms, 1), trace_path=trace_path,
+            )
         except Exception as exc:
+            logger.exception("Research QA failed: arxiv_id=%s run_id=%s stage=%s", arxiv_id, run_id, stage)
+            code = ErrorCode.DATABASE_WRITE_FAILED if stage == "persist_completed_turn" else ErrorCode.UNKNOWN_ERROR
+            if isinstance(exc, AppError):
+                code = exc.code
+                stage = exc.context.get("stage") or stage
+            elif isinstance(exc, PaperEvidenceResearchError):
+                stage = exc.stage
+                if "retrieval" in exc.code or "target_unavailable" in exc.code:
+                    code = ErrorCode.VECTOR_STORE_ERROR
+                elif stage in {"draft_generation", "claim_verification", "claim_extraction"}:
+                    code = ErrorCode.LLM_GENERATION_FAILED
+            # 公开错误仅使用稳定 code/stage；原异常保留在服务器日志，不能绕过 AppError 暴露给 SSE。
+            observation = build_error_qa_observation(error_code=code, error_stage=stage, error_reason=code)
+            error = AppError(
+                code, detail={"stage": stage, "arxiv_id": arxiv_id},
+                context={"arxiv_id": arxiv_id, "run_id": run_id, "stage": stage, "qa_observation": observation},
+            )
+            elapsed_ms = (perf_counter() - started) * 1000
+            if request is not None:
+                write_eval_record(
+                    request=request, result=research_result, raw_question=question, trace_events=events,
+                    latency_ms=elapsed_ms, llm_usage=stats.to_dict(),
+                    error={"code": code, "stage": stage, "error_type": type(exc).__name__},
+                )
             trace.mark_failed()
-            error_payload = {"error": str(exc), "error_type": type(exc).__name__}
-            trace.set_output(error_payload)
-            trace.add_event("qa.request_done", status="error", error_type=type(exc).__name__)
+            trace.set_output(error.to_payload())
+            trace.add_event("qa.request_done", status="error", code=code)
             trace_path = _write_qa_trace(trace, reason="research_error")
-            elapsed_ms = round((perf_counter() - started) * 1000, 1)
             info_event(
-                logger,
-                "qa.request_done",
-                run_id=run_id,
-                session_id=session_id,
-                user_id=user_id,
-                arxiv_id=arxiv_id,
-                status="error",
-                error_type=type(exc).__name__,
-                output=str(exc),
-                elapsed_ms=elapsed_ms,
-                trace_path=trace_path,
+                logger, "qa.request_done", run_id=run_id, arxiv_id=arxiv_id,
+                status="error", code=code, elapsed_ms=round(elapsed_ms, 1), trace_path=trace_path,
             )
-            raise
+            raise error from exc
+        finally:
+            if research_stream is not None:
+                research_stream.close()
 
-        # 结果映射：PaperEvidenceResearchResult → QA API 响应格式
-        outcome = research_result.outcome
-        answer = research_result.answer
-        citations = research_result.citations
-        research_summary = research_result.research_summary
-
-        # 构造 sources（前端兼容格式）
-        sources = [
-            {
-                "source_id": citation.source_id,
-                "content": citation.content,
-                "chunk_type": citation.chunk_type,
-                "section_path": citation.section_path,
-                "page_number": citation.page_number,
-            }
-            for citation in citations
-        ]
-
-        # 构造 qa_observation（兼容层，映射 outcome 到 answer_quality）
-        qa_observation = {
-            "answer_quality": "sufficient" if outcome == "completed" else "partial" if outcome == "partial" else "insufficient",
-            "outcome": outcome,
-            "termination_reason": research_summary.termination_reason,
-            "research_summary": research_summary.model_dump(),
-        }
-
-        # 持久化 turn
-        try:
-            persisted_turn = self.persist_completed_turn(
-                chat_session=chat_session,
-                question=question,
-                answer=answer,
-                source_payload=sources,
-                retrieval_debug={"qa_observation": qa_observation, "research_summary": research_summary.model_dump()},
-                contextualized_question=contextualized_question,
-                question_contextualization=question_contextualization,
-            )
-        except Exception as exc:
-            trace.mark_failed()
-            trace.set_output({"error": str(exc), "qa_observation": qa_observation})
-            trace.add_event("qa.request_done", status="error", code="persist_failed")
-            trace_path = _write_qa_trace(trace, reason="persist_error")
-            elapsed_ms = round((perf_counter() - started) * 1000, 1)
-            info_event(
-                logger,
-                "qa.request_done",
-                run_id=run_id,
-                session_id=session_id,
-                user_id=user_id,
-                arxiv_id=arxiv_id,
-                status="error",
-                code="persist_failed",
-                output=str(exc),
-                elapsed_ms=elapsed_ms,
-                trace_path=trace_path,
-            )
-            raise
-
-        # 写入 eval record（Phase 3 新增）
-        elapsed_ms = round((perf_counter() - started) * 1000, 1)
-        write_eval_record(
-            result=research_result,
-            request=research_request,
-            turn_id=persisted_turn.get("turn_id"),
-            retrieval_debug=None,  # 研究引擎暂无 retrieval_debug
-            latency_ms=elapsed_ms,
-        )
-
-        # 构造返回结果
-        result = {
-            "status": "success",
-            "arxiv_id": arxiv_id,
-            "question": question,
-            "session_id": session_id,
-            "chat_session": chat_session,
-            "turn_id": persisted_turn.get("turn_id"),
-            "original_question": question,
-            "contextualized_question": contextualized_question,
-            "used_short_term_memory": question_contextualization.get("used_short_term_memory", False),
-            "question_contextualization": question_contextualization,
-            "answer": answer,
-            "sources": sources,
-            "outcome": outcome,
-            "research_summary": research_summary.model_dump(),
-            "citations": [
-                {
-                    "citation_id": getattr(c, "source_id", ""),
-                    "source_id": getattr(c, "source_id", ""),
-                    "claim_ids": getattr(c, "claim_ids", []),
-                }
-                for c in citations
-            ],
-            "qa_observation": qa_observation,
-        }
-
-        trace.session_id = session_id
-        trace.set_output(result)
-        trace.add_event(
-            "qa.request_done",
-            status="success",
-            outcome=outcome,
-            source_count=len(sources),
-            answer_chars=len(answer),
-        )
-        trace_path = _write_qa_trace(trace, reason="auto")
-        info_event(
-            logger,
-            "qa.request_done",
-            run_id=run_id,
-            session_id=session_id,
-            user_id=user_id,
-            arxiv_id=arxiv_id,
-            status="success",
-            outcome=outcome,
-            source_count=len(sources),
-            output=answer,
-            elapsed_ms=elapsed_ms,
-            trace_path=trace_path,
-        )
+        yield {"event": "done", "data": result}
         return result
 
     def answer_question(self, arxiv_id: str, payload: Any) -> Dict[str, Any]:

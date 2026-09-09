@@ -2,10 +2,9 @@
 
 三条契约必须与图的完成门禁对齐：
 
-1. 只有携带至少一个合法 ``[source:id]`` 引用标记的句子才构成可校验主张。门禁要求
-   主张的 citation_ids 与校验器的支撑证据完全一致，未挂引用的句子永远无法被支撑，
-   让它成为 claim 只会堵死 completed 终态。答案里的引用标记由草稿生成器负责写入，
-   格式与 services/paper_qa/citation_contract.py 的严格协议一致。
+1. 可见事实句都必须进入校验，包括没有引用的句子；否则生成器只需漏写引用即可绕过门禁。
+   无引用主张以空 citation_ids 进入修复或最终删减，不能凭空继承其他句子的支持。
+   句末标点后的 ``[source:id]`` 归属前一句，引用格式与 citation_contract.py 保持一致。
 2. 主张绑定需求走两级信号：优先"引用继承"——草稿声明使用的候选带着 matched_need_ids
    （它就是为那个需求检索回来的），主张引用哪个候选就继承其匹配需求；词面重叠作为
    无候选信息时的兜底。两级都匹配不到时保持不绑定——宁可让需求保持 open 触发继续
@@ -20,7 +19,14 @@ from typing import Any
 
 # 与 services/paper_qa/citation_contract.py 的 _STRICT_MARKER_RE 保持同构。
 _CITATION_MARKER_RE = re.compile(r"\[source:([^\]\s,]+)\]")
-_SEGMENT_SPLIT_RE = re.compile(r"(?<=[。！？!?；;\n])")
+_SEGMENT_SPLIT_RE = re.compile(r"(?<=[。！？!?；;\n])|(?<=\.)(?=\s|$)")
+_TRAILING_CITATIONS_RE = re.compile(
+    r"([。！？!?；;]|\.(?=\s*\[source:))([ \t]*(?:\[source:[^\]\s,]+\][ \t]*)+)"
+)
+_SECTION_LABEL_RE = re.compile(
+    r"^(?:#{1,6}\s*)?(?:概述|方法|实验|结果|结论|总结|局限性|回答|Overview|Method|Results|Conclusion)[:：]?$",
+    flags=re.IGNORECASE,
+)
 _LEADING_META_RE = re.compile(
     r"^(?:本文|该论文|这篇论文|作者们?|我们)\s*"
     r"(?:提出|认为|指出|发现|证明|介绍|给出|采用)\s*"
@@ -29,7 +35,6 @@ _LEADING_META_RE = re.compile(
     r"(?:propose|proposes|present|presents|show|shows|find|finds|introduce|introduces)\s+that\s+",
     flags=re.IGNORECASE,
 )
-_MIN_CLAIM_CHARS = 6
 _MIN_ZH_SHARED_BIGRAMS = 2
 _MIN_LATIN_TOKEN_LEN = 4
 
@@ -81,10 +86,12 @@ def _clean_claim_text(segment: str) -> str:
 
 
 class RuleClaimExtractor:
-    """确定性主张提取器；粗粒度是有意取舍——切粗只影响校验粒度，不引入误判。"""
+    """确定性地提取可见句子；倾向保留待核实文本，避免把漏提主张误当作全部受支持。"""
 
     def extract(self, request: Any) -> dict[str, Any]:
         answer = str(getattr(request, "answer", "") or "")
+        # 把紧随句末的引用移到该句的切分边界内；小数点和 source_id 内的点不会成为边界。
+        answer = _TRAILING_CITATIONS_RE.sub(lambda match: f" {match[2].strip()}{match[1]} ", answer)
         draft_version = int(getattr(request, "draft_version", 1) or 1)
         needs = list(getattr(request, "evidence_needs", []) or [])
         candidates = list(getattr(request, "candidates", []) or [])
@@ -104,10 +111,11 @@ class RuleClaimExtractor:
         claim_sequence = 0
         for segment in _SEGMENT_SPLIT_RE.split(answer):
             citation_ids = _CITATION_MARKER_RE.findall(segment)
-            if not citation_ids:
+            if _SECTION_LABEL_RE.fullmatch(segment.strip()):
                 continue
             text = _clean_claim_text(segment)
-            if len(text) < _MIN_CLAIM_CHARS:
+            # “下降5%”也是事实，不能因长度短而漏掉；只跳过空白、纯标记和常见章节标签。
+            if not text or not any(char.isalnum() for char in text):
                 continue
             # 引用继承优先：主张引用的候选曾为哪些需求检索回来，主张就先归属这些需求。
             bound_ids: list[str] = []

@@ -7,6 +7,7 @@ import io
 from datetime import datetime
 from typing import List, Dict, Optional, Iterator, Any, Tuple
 import logging
+from services.llm.call_metrics import record_llm_call, record_llm_usage
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
@@ -149,6 +150,16 @@ class GenerationService:
             "selected_model": selected_model,
             "routing_source": routing_source,
             "fallback_reason": fallback_reason,
+        }
+
+    def evaluation_configuration(self) -> Dict[str, Any]:
+        """公开实际模型路由的配置快照；显式列出字段，避免密钥进入评测文件。"""
+        return {
+            "provider": "qwen",
+            "models": {"small": QWEN_SMALL_MODEL_NAME, "large": QWEN_LARGE_MODEL_NAME,
+                       "rerank_compression": QWEN_RERANK_COMPRESS_MODEL_NAME},
+            "task_model_roles": dict(QWEN_TASK_MODEL_ROLES),
+            "default_role": "large", "enable_thinking": QWEN_RERANK_COMPRESS_ENABLE_THINKING,
         }
 
     def compress_chunk_for_rerank(
@@ -361,12 +372,15 @@ Answer:"""
                 {"role": "user", "content": f"Context: {context}\n\nQuestion: {query}"}
             ]
             
+            # 只在 SDK 边界计数，避免上层 generate/重试包装重复统计同一次请求。
+            record_llm_call(model=self.models["openai"][model_name], task_type="generation")
             response = client.chat.completions.create(
                 model=self.models["openai"][model_name],
                 messages=messages,
                 temperature=GENERATION_CONFIG["openai_chat_temperature"],
                 max_tokens=GENERATION_CONFIG["openai_chat_max_tokens"]
             )
+            record_llm_usage(getattr(response, "usage", None))
             
             return response.choices[0].message.content.strip()
             
@@ -418,11 +432,13 @@ Answer:"""
             if request_debug is not None:
                 request_debug.update(input_debug)
 
+            record_llm_call(model=model_name, task_type=task_type or "generation")
             response = client.responses.create(
                 model=model_name,
                 input=qwen_input,
                 extra_body={"enable_thinking": enable_thinking},
             )
+            record_llm_usage(getattr(response, "usage", None))
 
             answer = getattr(response, "output_text", None)
             if answer:
@@ -470,11 +486,13 @@ Answer:"""
                 api_key=api_key,
                 base_url=QWEN_BASE_URL,
             )
+            record_llm_call(model=model_name, task_type=task_type or "completion")
             response = client.responses.create(
                 model=model_name,
                 input=prompt,
                 extra_body={"enable_thinking": enable_thinking},
             )
+            record_llm_usage(getattr(response, "usage", None))
 
             answer = getattr(response, "output_text", None)
             if answer:
@@ -1287,6 +1305,7 @@ Answer:"""
                 image_inputs=image_inputs,
                 asset_metadata=asset_metadata,
             )
+            record_llm_call(model=model_name, task_type=task_type or "generation")
             stream = client.responses.create(
                 model=model_name,
                 input=qwen_input,
@@ -1305,6 +1324,7 @@ Answer:"""
                 elif event_type == "response.completed":
                     response = getattr(event, "response", None)
                     usage = getattr(response, "usage", None) if response else None
+                    record_llm_usage(usage)
                     yield {
                         "type": "completed",
                         "answer": "".join(answer_parts),
@@ -1346,12 +1366,14 @@ Answer:"""
                 {"role": "system", "content": "You are a helpful assistant. Use the provided context to answer the question."},
                 {"role": "user", "content": f"Context: {context}\n\nQuestion: {query}"},
             ]
+            record_llm_call(model=self.models["deepseek"][model_name], task_type="generation")
             response = client.chat.completions.create(
                 model=self.models["deepseek"][model_name],
                 messages=messages,
                 max_tokens=512,
                 stream=False,
             )
+            record_llm_usage(getattr(response, "usage", None))
 
             if model_name == "deepseek-r1":
                 message = response.choices[0].message

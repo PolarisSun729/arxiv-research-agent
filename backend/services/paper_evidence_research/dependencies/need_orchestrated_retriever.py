@@ -11,9 +11,8 @@
 3. **候选池去重**：已在池中且已归属本需求的 chunk 不再回传；同一 chunk 被另一个需求命中
    时仍然回传，让 ``evidence_pool.merge_candidates`` 补记 matched_need_ids——跨需求的证据
    归属是覆盖投影与证据包选择的输入，不能被去重顺手吞掉。
-4. **失败不上抛**：研究是有界循环，单轮检索故障回传空候选加失败状态，由图的 no_progress
-   计数收口成有界终止，并把 status 留在研究轨迹里；把它升级成系统异常会让已经攒到证据的
-   运行整体作废。
+4. **故障交给图裁决**：单轮故障回传空候选与失败状态，图按需求记录未恢复故障，允许
+   重试或保留已验证的有限回答；没有可靠核心支持时必须记运行失败，不能伪装成证据拒答。
 """
 
 from __future__ import annotations
@@ -40,6 +39,15 @@ class PaperRetrievalTarget:
 
     collection_name: str
     paper_context: dict[str, Any] = field(default_factory=dict)
+
+    def index_snapshot(self) -> dict[str, Any]:
+        """只记录活动索引身份，不把路径、正文或用户画像复制进评测配置。"""
+        return {"collection_name": self.collection_name, **{
+            key: self.paper_context.get(key) for key in (
+                "active_build_id", "active_index_version", "embedding_model", "chunk_count",
+                "retrieval_index_version", "sparse_index_schema_version", "sparse_index_source_hash",
+            )
+        }}
 
 
 def _coerce_target(raw: Any) -> PaperRetrievalTarget | None:
@@ -144,6 +152,12 @@ class NeedOrchestratedRetriever:
         self._target_resolver = target_resolver
         self._top_k = max(1, int(top_k))
 
+    def evaluation_configuration(self) -> dict[str, Any]:
+        # 普通轮次与末轮都通过管线的实际解析规则，包含 top_k 裁剪和覆盖开关后的有效预算。
+        return {name: self._retrieval_pipeline.evaluation_configuration(
+            self._build_options(lightweight=lightweight),
+        )["runtime"] for name, lightweight in (("normal_round", False), ("final_round", True))}
+
     def retrieve(self, action: Any, state: Any) -> dict[str, Any]:
         arxiv_id = str(getattr(getattr(state, "request", None), "arxiv_id", "") or "")
         query = _build_query(action, state)
@@ -156,7 +170,11 @@ class NeedOrchestratedRetriever:
             result = self._retrieval_pipeline.retrieve(
                 user_query=query,
                 collection_name=target.collection_name,
-                paper_context=target.paper_context,
+                paper_context={
+                    **target.paper_context,
+                    # 日志关联键按运行透传，不能修改缓存中的论文画像对象。
+                    "run_id": getattr(getattr(state, "request", None), "research_run_id", ""),
+                },
                 options=self._build_options(lightweight=lightweight),
             )
         except Exception as exc:
@@ -171,6 +189,7 @@ class NeedOrchestratedRetriever:
                 "candidates": [],
                 "query": query,
                 "error": str(exc)[:200],
+                "index_snapshot": target.index_snapshot(),
             }
 
         chunks = list((result or {}).get("chunks") or [])
@@ -201,10 +220,14 @@ class NeedOrchestratedRetriever:
         return {
             "status": status,
             "candidates": candidates,
+            # 入池去重与召回评价是不同职责；重复命中仍需保留本轮原始排名。
+            "retrieval_candidates": mapped,
             "query": query,
+            "main_intent": (((result or {}).get("debug") or {}).get("intent_profile") or {}).get("main_intent"),
             "retrieved_count": len(chunks),
             "pool_duplicate_count": len(mapped) - len(candidates),
             "lightweight": lightweight,
+            "index_snapshot": target.index_snapshot(),
         }
 
     def _resolve_target(self, arxiv_id: str) -> PaperRetrievalTarget | None:

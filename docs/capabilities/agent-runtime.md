@@ -50,6 +50,8 @@ flowchart TD
 
 恢复必须有上限：单步重试、单原因修复和整轮 replan 都不能无限循环。无法恢复时通过 `error_finalize_node()` 形成结构化终态，而不是吞掉错误后继续选择同一 step。
 
+论文 QA 工具消费研究引擎三态：completed 为完整回答，partial 为有可靠证据的有限回答，abstained 为正常证据拒答。[`paper_qa.py`](../../backend/agents/arxiv_search_agent/tool_adapters/paper_qa.py)、Observer、质量评估和最终投影必须保留这一含义。有引用不能把 partial 提升为完整通过，没有引用也不能使正常 abstained 进入修复循环；研究图已负责内部有界修复。执行失败即使携带残留 `outcome` 也不能被当作业务成功。
+
 ## 确认与恢复
 
 需要用户决定或可能产生副作用的步骤由 `plan_runtime.pending_confirmation` 进入 LangGraph interrupt。确认状态的真源不是前端显示对象：
@@ -63,6 +65,8 @@ flowchart TD
 | `LangGraphCheckpointStore` | 保存可 resume 的图执行现场 | 不能代替业务确认生命周期校验。 |
 
 恢复前，`_ensure_resume_checkpoint()` 必须同时验证业务 checkpoint 与 LangGraph checkpoint。两者都存在后，`AgentRuntimeCheckpointManager.consume_pending_confirmation()` 原子消费待确认动作，再执行 `Command(resume=...)`。这个顺序用于阻止图现场丢失时错误消费确认，以及快速重复点击导致重复副作用。
+
+业务 checkpoint 的 `current_node` 只接收图调用方显式传入的节点名，未提供时保留为空；首次补写终态记录也不从展示 debug 推测节点位置。
 
 ## 响应、流和可观测性
 

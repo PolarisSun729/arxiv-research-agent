@@ -70,6 +70,7 @@ class DraftGenerationRequest(BaseModel):
     research_question: str
     addressed_need_ids: list[str]
     context_pack: EvidenceContextPack
+    preferred_answer_style: str = ""
 
     @property
     def candidates(self) -> list[EvidenceCandidate]:
@@ -127,8 +128,11 @@ class PaperEvidenceResearchState(BaseModel):
     action_accepted: bool = False
     action_rejection_code: str | None = None
     retrieval_count: int = 0
+    # 按需求保存尚未恢复的技术故障；轨迹可以裁剪，终态判断仍必须可恢复且确定。
+    retrieval_failures: dict[str, str] = Field(default_factory=dict)
     draft_attempt_count: int = 0
     verification_count: int = 0
+    citation_repair_count: int = 0
     no_progress_count: int = 0
     invalid_action_count: int = 0
     trace_events: list[dict[str, Any]] = Field(default_factory=list)
