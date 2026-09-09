@@ -36,13 +36,136 @@ def _extract_main_intent(retrieval_debug: dict[str, Any] | None) -> str:
     return str(profile.get("main_intent") or "unknown").strip().lower() if isinstance(profile, dict) else "unknown"
 
 
-def _build_citations_payload(result: PaperEvidenceResearchResult) -> list[dict[str, Any]]:
-    # source_id 是图、答案标记和候选池共用的标识；不能读取不存在的 citation_id 属性。
-    return [dict(c.model_dump(mode="json"), citation_id=c.source_id, chunk_id=c.source_id) for c in result.citations]
+
+def _extract_configuration_from_trace(events: list[dict[str, Any]], request: PaperEvidenceResearchRequest) -> dict[str, Any]:
+    """从 trace 统一提取配置，失败时返回最小契约"""
+    config_event = next(
+        (e for e in events if e.get("event_type") == "research_started" and e.get("configuration")),
+        None
+    )
+    if config_event:
+        return config_event["configuration"]
+
+    # Fallback: 最小契约
+    return {
+        "research_limits": request.limits.model_dump(mode="json"),
+        "engine": {},
+    }
 
 
-def _build_research_summary_payload(result: PaperEvidenceResearchResult) -> dict[str, Any]:
-    return result.research_summary.model_dump(mode="json")
+def _build_paper_context_from_trace(events: list[dict[str, Any]], arxiv_id: str) -> dict[str, Any]:
+    """提取索引快照"""
+    indexes = []
+    for event in events:
+        snapshot = event.get("index_snapshot")
+        if isinstance(snapshot, dict) and snapshot not in indexes:
+            indexes.append(snapshot)
+    return {"arxiv_id": arxiv_id, "indexes": indexes}
+
+
+def _extract_main_intent_from_trace(events: list[dict[str, Any]]) -> str:
+    """从 trace 的 research_started 事件提取 main_intent"""
+    config_event = next(
+        (e for e in events if e.get("event_type") == "research_started"),
+        None
+    )
+    if config_event:
+        # 尝试从事件中直接获取 main_intent
+        main_intent = config_event.get("main_intent")
+        if main_intent:
+            return str(main_intent).strip().lower()
+
+    # Fallback: 从任意事件中查找
+    main_intent = next((str(e["main_intent"]) for e in events if e.get("main_intent")), "unknown")
+    return main_intent if main_intent else "unknown"
+
+
+def build_success_eval_record(
+    *,
+    request: PaperEvidenceResearchRequest,
+    result: PaperEvidenceResearchResult,
+    trace_events: list[dict[str, Any]],
+    turn_id: str = "",
+    latency_ms: float,
+    llm_usage: dict[str, Any],
+) -> dict[str, Any]:
+    """构造成功执行的评测记录"""
+    events = list(trace_events)
+    configuration = _extract_configuration_from_trace(events, request)
+    summary = result.research_summary.model_dump(mode="json")
+
+    return EvaluationRecord(
+        record_id=f"eval-{request.research_run_id}",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        app_version=_get_git_commit_hash(),
+        run_status="success",
+        user_id=request.user_id,
+        session_id=request.session_id,
+        turn_id=turn_id,
+        paper_context=_build_paper_context_from_trace(events, request.arxiv_id),
+        configuration=configuration,
+        query={
+            "raw": request.original_question,
+            "rewritten": request.original_question,
+            "main_intent": _extract_main_intent_from_trace(events),
+        },
+        outcome=result.outcome,
+        answer=result.answer,
+        termination_reason=result.research_summary.termination_reason,
+        citations=[c.model_dump(mode="json") for c in result.citations],
+        research_summary=summary,
+        efficiency={
+            "latency_ms": round(latency_ms, 1),
+            **llm_usage,
+            "retrieval_count": summary.get("retrieval_count"),
+            "draft_attempt_count": summary.get("draft_attempt_count"),
+        },
+        trace_ref=request.research_run_id,
+        trace_events=events,
+        error=None,
+    ).model_dump(mode="json")
+
+
+def build_error_eval_record(
+    *,
+    request: PaperEvidenceResearchRequest,
+    error: dict[str, Any],
+    trace_events: list[dict[str, Any]],
+    latency_ms: float,
+    llm_usage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """构造失败执行的评测记录"""
+    events = list(trace_events)
+    configuration = _extract_configuration_from_trace(events, request)
+
+    return EvaluationRecord(
+        record_id=f"eval-{request.research_run_id}",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        app_version=_get_git_commit_hash(),
+        run_status="error",
+        user_id=request.user_id,
+        session_id=request.session_id,
+        turn_id="",
+        paper_context=_build_paper_context_from_trace(events, request.arxiv_id),
+        configuration=configuration,
+        query={
+            "raw": request.original_question,
+            "rewritten": request.original_question,
+            "main_intent": _extract_main_intent_from_trace(events),
+        },
+        outcome=None,
+        answer="",
+        termination_reason=None,
+        citations=[],
+        research_summary={},
+        efficiency={
+            "latency_ms": round(latency_ms, 1),
+            **(llm_usage or {}),
+        },
+        trace_ref=request.research_run_id,
+        trace_events=events,
+        error=error,
+    ).model_dump(mode="json")
 
 
 def build_eval_record(
@@ -52,13 +175,13 @@ def build_eval_record(
     llm_usage: dict[str, Any] | None = None, raw_question: str | None = None,
     main_intent: str | None = None, error: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """生产和评测共用构造器；缺少调用观测时写 null，不伪造零成本。"""
+    """【已废弃】向后兼容的构造器；新代码应使用 build_success_eval_record 或 build_error_eval_record"""
     events = list(trace_events or [])
     if main_intent is None:
         main_intent = _extract_main_intent(retrieval_debug)
         if main_intent == "unknown":
             main_intent = next((str(e["main_intent"]) for e in events if e.get("main_intent")), "unknown")
-    summary = _build_research_summary_payload(result) if result else {}
+    summary = result.research_summary.model_dump(mode="json") if result else {}
     indexes = []
     for event in events:
         snapshot = event.get("index_snapshot")
@@ -77,7 +200,8 @@ def build_eval_record(
         outcome=result.outcome if result and error is None else None,
         answer=result.answer if result else "",
         termination_reason=summary.get("termination_reason"),
-        citations=_build_citations_payload(result) if result else [], research_summary=summary,
+        citations=[c.model_dump(mode="json") for c in result.citations] if result else [],
+        research_summary=summary,
         efficiency={"latency_ms": round(latency_ms, 1), "llm_calls": None,
                     "input_tokens": None, "output_tokens": None, "total_tokens": None,
                     **(llm_usage or {}), "retrieval_count": summary.get("retrieval_count"),

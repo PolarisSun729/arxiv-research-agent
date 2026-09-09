@@ -10,7 +10,7 @@ from services.arxiv.arxiv_search_service import ArxivSearchService
 from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
 from services.context_lifecycle import ContextLifecycleService
 from services.document.chunking_service import ChunkingService
-from services.evaluation import write_eval_record
+from services.evaluation import write_eval_record, build_success_eval_record, build_error_eval_record
 from services.llm.call_metrics import LLMCallStats, use_call_stats
 from services.memory import MemoryService
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
@@ -736,8 +736,14 @@ class PaperQAService:
             elapsed_ms = (perf_counter() - started) * 1000
             result["usage"] = stats.to_dict()
             write_eval_record(
-                request=request, result=research_result, turn_id=result.get("turn_id"),
-                trace_events=events, raw_question=question, latency_ms=elapsed_ms, llm_usage=stats.to_dict(),
+                record=build_success_eval_record(
+                    request=request,
+                    result=research_result,
+                    trace_events=events,
+                    turn_id=result.get("turn_id", ""),
+                    latency_ms=elapsed_ms,
+                    llm_usage=stats.to_dict(),
+                )
             )
             trace.set_output(result)
             trace.add_event("qa.request_done", status="success", outcome=research_result.outcome)
@@ -767,9 +773,13 @@ class PaperQAService:
             elapsed_ms = (perf_counter() - started) * 1000
             if request is not None:
                 write_eval_record(
-                    request=request, result=research_result, raw_question=question, trace_events=events,
-                    latency_ms=elapsed_ms, llm_usage=stats.to_dict(),
-                    error={"code": code, "stage": stage, "error_type": type(exc).__name__},
+                    record=build_error_eval_record(
+                        request=request,
+                        error={"code": code, "stage": stage, "error_type": type(exc).__name__},
+                        trace_events=events,
+                        latency_ms=elapsed_ms,
+                        llm_usage=stats.to_dict(),
+                    )
                 )
             trace.mark_failed()
             trace.set_output(error.to_payload())

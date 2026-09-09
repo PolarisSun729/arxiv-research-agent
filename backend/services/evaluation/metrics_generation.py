@@ -67,10 +67,6 @@ def _verification_view(trace_events: list[dict[str, Any]]) -> tuple[set[str], di
     return known_ids, assessments, claims, latest is not None and "claims" in latest
 
 
-def build_evidence_pool_from_trace(trace_events: list[dict[str, Any]]) -> set[str]:
-    """提取可定位的证据 ID；轨迹不复制正文，忠诚度由独立校验关系判定。"""
-    return _verification_view(trace_events)[0]
-
 
 def calculate_citation_fidelity(
     citations: list[dict[str, Any]], evidence_pool: set[str],
