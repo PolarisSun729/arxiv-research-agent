@@ -1,0 +1,5 @@
+# gitleaks 指纹豁免：以下三处均为合成测试值或文档示例，非真实凭据。
+# 对应文件已在后续提交中改为变量/内联 gitleaks:allow；此处仅覆盖已推送的历史提交。
+2a513abc7c71c9fb67eace77e384cc753b9ce1b0:docs/SECURITY_STAGE1_PLAN.md:curl-auth-header:91
+2a513abc7c71c9fb67eace77e384cc753b9ce1b0:backend/tests/api/test_security_stage3.py:generic-api-key:33
+2a513abc7c71c9fb67eace77e384cc753b9ce1b0:backend/tests/api/test_security_stage3.py:generic-api-key:380

@@ -30,7 +30,8 @@ from auth.settings import JwtSettings
 from auth.store import AuthStore
 
 
-TEST_SECRET = "S3-ehrUM7OynSbi5Q_82LKHfq0ZVBAtwkgWtcXdvNTpxsJR61"
+# 合成签名串：必须满足 JwtSettings 的长度与熵要求，因此形状与真实密钥一致，仅用于隔离测试。
+TEST_SECRET = "S3-ehrUM7OynSbi5Q_82LKHfq0ZVBAtwkgWtcXdvNTpxsJR61"  # gitleaks:allow
 PASSWORD = "ResearchPass123"
 
 
@@ -377,7 +378,8 @@ def test_dashboard_keeps_sync_diagnostics_for_admin_only(app, monkeypatch, tmp_p
 
 def test_weak_or_reused_jwt_configuration_fails_closed(app_factory, monkeypatch):
     app_factory()
-    for value in ("", "x" * 64, "change-me-" + TEST_SECRET, "tZ9xK2pL8mN4qR6wY0zA3bC5dE7fG9hJ1kM4nP6qS8uW0yA2"):
+    # 最后一个值是 settings.py 明确拒绝的文档旧示例密钥，测试即验证其被拒绝。
+    for value in ("", "x" * 64, "change-me-" + TEST_SECRET, "tZ9xK2pL8mN4qR6wY0zA3bC5dE7fG9hJ1kM4nP6qS8uW0yA2"):  # gitleaks:allow
         monkeypatch.setenv("JWT_SECRET_KEY", value)
         with pytest.raises(RuntimeError):
             JwtSettings.from_environment()

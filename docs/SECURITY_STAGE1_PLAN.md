@@ -94,8 +94,9 @@ Nginx 访问日志使用不包含查询参数或认证头的格式。新 trace �
 # 无密钥：401，code=missing_api_key
 curl.exe -i http://127.0.0.1:8001/api/auth/check
 
-# 错误密钥：403，code=invalid_api_key
-curl.exe -i -H "X-API-Key: wrong-key" http://127.0.0.1:8001/api/auth/check
+# 错误密钥：403，code=invalid_api_key（值放在变量里，避免命令行字面量被密钥扫描误报）
+$wrongKey = 'deliberately-invalid'
+curl.exe -i -H "X-API-Key: $wrongKey" http://127.0.0.1:8001/api/auth/check
 
 # 公开存活检查：200
 curl.exe -i http://127.0.0.1:8001/health
