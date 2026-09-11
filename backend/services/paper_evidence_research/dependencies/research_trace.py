@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from utils.secret_redaction import redact_sensitive_value
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_RESEARCH_TRACE_DIR = Path("temp/paper-evidence-research-traces")
@@ -46,7 +48,8 @@ class ResearchTraceRecorder:
         try:
             self.trace_dir.mkdir(parents=True, exist_ok=True)
             trace_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+                # 研究事件可能保留 provider 失败原因，完整落盘前仍需移除凭据。
+                json.dumps(redact_sensitive_value(payload), ensure_ascii=False, indent=2, default=str),
                 encoding="utf-8",
             )
         except Exception as exc:

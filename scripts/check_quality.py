@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -253,6 +254,10 @@ def _run_stage(stage: Stage, show_output: bool) -> StageResult:
     # 质量门禁只编排离线安全检查；该标记便于后续测试代码需要时显式识别当前运行模式。
     env.setdefault("RAG_QUALITY_GATE", "offline")
     env.setdefault("CI", "1")
+    # 离线门禁只验证应用能否创建，不监听端口；临时兼容凭据让无生产 JWT 的 CI 也能运行。
+    # 单独运行 doctor 仍验证真实部署配置，不能用门禁结果代替上线认证检查。
+    env.setdefault("AUTH_MODE", "api_key")
+    env.setdefault("BACKEND_API_KEYS", secrets.token_urlsafe(32))
     # Windows 本机临时目录偶尔会因权限或残留锁导致 pytest tmp_path 初始化失败；统一落到仓库内临时目录更适合本地和 CI 复现。
     QUALITY_TMP_ROOT.mkdir(parents=True, exist_ok=True)
     env.setdefault("TMP", str(QUALITY_TMP_ROOT))

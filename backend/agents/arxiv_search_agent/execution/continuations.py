@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from contextvars import copy_context
 from typing import Any, Dict, List, Mapping, Optional
 
 from langgraph.types import Command
@@ -275,8 +276,9 @@ class AgentResumeRunManager:
             if existing is not None and existing.is_alive():
                 return
             worker = threading.Thread(
-                target=self._execute,
-                args=(resume_run_id,),
+                # Python 原生线程不继承 ContextVar；显式复制身份，断线后续跑仍需实时授权。
+                target=copy_context().run,
+                args=(self._execute, resume_run_id),
                 daemon=True,
                 name=f"agent-resume-{resume_run_id}",
             )
@@ -284,7 +286,10 @@ class AgentResumeRunManager:
             worker.start()
 
     def recover_incomplete_runs(self) -> None:
-        """重启后只重领 pending；已经 running 的 run 无法证明是否消费 checkpoint，必须 indeterminate。"""
+        """重启后 JWT 续跑需重新授权；兼容模式可重领 pending，running 保留无法判定语义。"""
+        from auth.settings import auth_mode
+
+        jwt_mode = auth_mode() == "jwt"
         for run in self.storage.agent_work.list_resume_runs(statuses=["running"], limit=100):
             self.storage.agent_work.fail_resume_run(
                 str(run["resume_run_id"]),
@@ -293,7 +298,14 @@ class AgentResumeRunManager:
                 error_message="恢复进程重启，无法证明 LangGraph checkpoint 是否已经消费。",
             )
         for run in self.storage.agent_work.list_resume_runs(statuses=["pending"], limit=100):
-            self.start(str(run["resume_run_id"]))
+            if jwt_mode:
+                # 进程重启后没有可证明有效的登录会话，不凭存储中的 user_id 自行恢复权限。
+                self.storage.agent_work.fail_resume_run(
+                    str(run["resume_run_id"]), status="failed", error_code="authentication_context_lost",
+                    error_message="服务重启后登录授权上下文已失效，请重新登录并发起任务。",
+                )
+            else:
+                self.start(str(run["resume_run_id"]))
 
     def get(
         self,
@@ -329,6 +341,8 @@ class AgentResumeRunManager:
             continuation = self.storage.agent_work.get_continuation(str((run or {}).get("continuation_id") or ""))
             if run is None or continuation is None:
                 raise AgentWorkConflict("resume_context_missing")
+            from auth.tool_access import authorize_agent_step
+            authorize_agent_step(run.get("user_id"), {})
             validated_result = continuation.get("validated_result")
             if not isinstance(validated_result, Mapping):
                 raise AgentWorkConflict("continuation_result_missing")

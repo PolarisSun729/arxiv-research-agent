@@ -110,6 +110,12 @@ class ArxivSearchRequestError(ArxivSearchError):
     code = "arxiv_invalid_query"
 
 
+class ArxivDownloadRequestError(ArxivSearchError):
+    """下载目标校验失败应返回明确的 400，不能伪装成服务端或模型故障。"""
+
+    code = "arxiv_invalid_download"
+
+
 class ArxivRemoteSearchError(ArxivSearchError):
     """远程 arXiv API 搜索失败时抛出。"""
 

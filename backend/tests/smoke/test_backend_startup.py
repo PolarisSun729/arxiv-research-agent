@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 import types
 import unittest
@@ -102,6 +103,11 @@ class _FakeRecommendationService:
 class BackendStartupSmokeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        # 烟测使用独立假密钥，不读取开发者或生产环境的访问凭据。
+        cls.api_key = "startup-smoke-test-" + "a" * 40
+        env_patch = mock.patch.dict(os.environ, {"BACKEND_API_KEYS": cls.api_key, "AUTH_MODE": "api_key"})
+        env_patch.start()
+        cls.addClassCleanup(env_patch.stop)
         _ensure_langgraph_stub()
         cls.dependencies = importlib.import_module("dependencies")
         cls.main = importlib.import_module("main")
@@ -128,7 +134,7 @@ class BackendStartupSmokeTests(unittest.TestCase):
             self.app.dependency_overrides[dependency] = lambda: _FakePaperQAService()
         for dependency in (self.dependencies.get_recommendation_service, self.paper_router.get_recommendation_service):
             self.app.dependency_overrides[dependency] = lambda: _FakeRecommendationService()
-        self.client = TestClient(self.app)
+        self.client = TestClient(self.app, headers={"X-API-Key": self.api_key})
 
     def tearDown(self) -> None:
         self.app.dependency_overrides.clear()
@@ -158,7 +164,8 @@ class BackendStartupSmokeTests(unittest.TestCase):
         self.assertNotIn("/api/chunks/files", routes)
 
     def test_openapi_excludes_debug_routes_by_default(self) -> None:
-        paths = self.client.get("/openapi.json").json()["paths"]
+        # 公网不发布文档端点，仍可直接检查应用生成的内部 schema。
+        paths = self.app.openapi()["paths"]
 
         self.assertNotIn("/api/debug/chunks/files", paths)
         self.assertNotIn("/api/chunks/files", paths)
@@ -208,8 +215,15 @@ class BackendStartupSmokeTests(unittest.TestCase):
         app.dependency_overrides[self.dependencies.get_arxiv_search_backend] = lambda: _FakeArxivService()
 
         # 进入 TestClient 上下文才会真正触发 FastAPI lifespan；这里验证 lazy 启动不会走预热分支。
-        with mock.patch.object(self.main, "warm_up_services", side_effect=AssertionError("should stay lazy")):
-            with TestClient(app) as client:
+        # 烟测只验证生命周期装配，不能清理开发者的真实历史或启动数据库 worker。
+        with (
+            mock.patch.object(self.main, "warm_up_services", side_effect=AssertionError("should stay lazy")),
+            mock.patch.object(self.main, "get_index_job_manager"),
+            mock.patch.object(self.main, "get_agent_resume_run_manager"),
+            mock.patch("services.context_lifecycle.ContextLifecycleService") as lifecycle,
+        ):
+            lifecycle.return_value.summarize_startup_cleanup_result.return_value = {}
+            with TestClient(app, headers={"X-API-Key": self.api_key}) as client:
                 response = client.get("/api/arxiv/fields")
 
         app.dependency_overrides.clear()

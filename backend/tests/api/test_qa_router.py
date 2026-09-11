@@ -1,6 +1,10 @@
+import asyncio
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -435,6 +439,58 @@ class QaRouterApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("event: error", response.text)
         self.assertIn(f'"code": "{ErrorCode.LLM_GENERATION_FAILED}"', response.text)
+
+    def test_qa_stream_redacts_credentials_across_delta_boundaries(self) -> None:
+        secrets = ["sk-provider-" + "c" * 36, "a" * 32, "ab" * 16]
+        for secret in secrets:
+            for pieces in ([secret[:6], secret[6:]], list(secret), [secret]):
+                with self.subTest(secret_kind=secret[:3], chunk_count=len(pieces)), patch.dict(os.environ, {"ALIYUN_API_KEY": secret}):
+                    chunks = [{"type": "delta", "delta": text} for text in ["正常开头。", *pieces, "正常结尾。"]]
+                    chunks.append({"type": "completed", "answer": "正常开头。" + secret + "正常结尾。", "usage": None})
+                    with patch.object(self.generation_service, "stream_qwen_responses", return_value=iter(chunks)):
+                        response = self.client.post("/api/paper/2401.00001/qa/stream", json={"question": "测试跨分片保护"})
+                    events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+                    delta_text = "".join(event.get("delta", "") for event in events)
+                    self.assertEqual(delta_text, "正常开头。***REDACTED***正常结尾。")
+                    self.assertEqual(events[-1]["answer"], delta_text)
+                    self.assertNotIn(secret, response.text)
+
+    def test_qa_stream_flushes_normal_tail_when_provider_ends_without_completed(self) -> None:
+        chunks = [{"type": "delta", "delta": text} for text in ["正常回答 ", "dataset"]]
+        with patch.object(self.generation_service, "stream_qwen_responses", return_value=iter(chunks)):
+            response = self.client.post("/api/paper/2401.00001/qa/stream", json={"question": "测试正常结束"})
+        events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+        self.assertEqual("".join(event.get("delta", "") for event in events), "正常回答 dataset")
+        self.assertIn("event: done", response.text)
+
+    def test_qa_stream_discards_unresolved_secret_prefix_on_error(self) -> None:
+        secret = "sk-provider-" + "c" * 36
+        for error in (RuntimeError("stream interrupted"), AppError(ErrorCode.LLM_GENERATION_FAILED)):
+            def failing_stream(**_kwargs):
+                yield {"type": "delta", "delta": "已经完成。" + secret[:6]}
+                raise error
+
+            with self.subTest(error_type=type(error).__name__), patch.dict(os.environ, {"ALIYUN_API_KEY": secret}):
+                with patch.object(self.generation_service, "stream_qwen_responses", side_effect=failing_stream):
+                    response = self.client.post("/api/paper/2401.00001/qa/stream", json={"question": "测试异常清理"})
+                self.assertIn("已经完成。", response.text)
+                self.assertNotIn(secret[:6], response.text)
+                self.assertIn("event: error", response.text)
+                self.assertNotIn("event: done", response.text)
+
+    def test_qa_stream_cancellation_does_not_flush_secret_prefix(self) -> None:
+        secret = "sk-provider-" + "c" * 36
+        chunks = iter([{"type": "delta", "delta": "可见文字。" + secret[:6]}])
+        with patch.dict(os.environ, {"ALIYUN_API_KEY": secret}), patch.object(self.generation_service, "stream_qwen_responses", return_value=chunks):
+            # 直接关闭路由生成器模拟断开连接，避免 TestClient 预先耗尽整个 SSE 响应。
+            with patch.object(qa_router, "StreamingResponse", side_effect=lambda stream, **_kwargs: stream):
+                stream = asyncio.run(qa_router.qa_paper_stream("2401.00001", qa_router.QaRequest(question="测试取消"), self.paper_qa_service, self.generation_service))
+            next(stream)
+            delta = next(stream)
+            self.assertIn("可见文字。", delta)
+            self.assertNotIn(secret[:6], delta)
+            stream.close()
+            self.assertEqual(list(stream), [])
 
 
 if __name__ == "__main__":

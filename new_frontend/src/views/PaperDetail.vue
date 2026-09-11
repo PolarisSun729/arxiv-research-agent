@@ -14,8 +14,11 @@ import {
 import RagChatPanel from '@/components/rag-chat/RagChatPanel.vue'
 import RagEvidencePanel from '@/components/rag-chat/RagEvidencePanel.vue'
 import { usePaperRagChat } from '@/composables/usePaperRagChat'
+import { useUserContext } from '@/composables/useUserContext'
 import { usePaperStore } from '@/stores/paperStore'
 import { qaTurnToRagMessages } from '@/types/ragChat'
+import { downloadApiFile } from '@/api/auth'
+import { getErrorMessage } from '@/api/errors'
 import {
   createPaperQaIndex,
   getLatestPaperQaIndexJob,
@@ -31,6 +34,7 @@ import {
 const route = useRoute()
 const router = useRouter()
 const store = usePaperStore()
+const { isAdmin, canResearch } = useUserContext()
 
 const paperId = computed(() => route.params.id as string)
 const loading = ref(true)
@@ -190,7 +194,8 @@ function getTraceFileName(pathValue?: string) {
   return parts[parts.length - 1] || ''
 }
 
-function downloadRetrievalTrace(format: 'md' | 'json' = 'md') {
+async function downloadRetrievalTrace(format: 'md' | 'json' = 'md') {
+  if (!isAdmin.value) return
   if (traceDownloading.value || !paperId.value) return
 
   traceDownloading.value = true
@@ -199,7 +204,9 @@ function downloadRetrievalTrace(format: 'md' | 'json' = 'md') {
       ? getTraceFileName(activeEvidenceTurn.value.retrievalDebug.trace_export[format])
       : ''
     const url = getPaperRetrievalTraceDownloadUrl(paperId.value, format, traceName || undefined)
-    window.open(url, '_blank', 'noopener,noreferrer')
+    await downloadApiFile(url, traceName || `retrieval-trace.${format}`)
+  } catch (error) {
+    ElMessage.error(getErrorMessage(error, '下载失败'))
   } finally {
     traceDownloading.value = false
   }
@@ -253,10 +260,10 @@ async function fetchQaStatus() {
   try {
     const [statusResult, diagnosticResult] = await Promise.all([
       getPaperQaStatus(paperId.value),
-      getPaperQaDiagnostic(paperId.value).catch(error => {
+      isAdmin.value ? getPaperQaDiagnostic(paperId.value).catch(error => {
         console.error('Failed to fetch QA diagnostic:', error)
         return null
-      })
+      }) : Promise.resolve(null)
     ])
     qaStatus.value = statusResult
     qaDiagnostic.value = diagnosticResult
@@ -344,7 +351,7 @@ async function resumeLatestQaJobPolling() {
 }
 
 async function handleCreateIndex() {
-  if (creatingIndex.value) return
+  if (creatingIndex.value || !canResearch.value) return
 
   creatingIndex.value = true
   try {
@@ -375,6 +382,10 @@ async function handleCreateIndex() {
 
 async function handleAskPaper() {
   if (!hasQaIndex.value) {
+    if (!canResearch.value) {
+      ElMessage.info('这篇论文还没有问答索引，请联系研究者或管理员创建。')
+      return
+    }
     try {
       await ElMessageBox.confirm(
         '这篇论文还没有建立问答索引，需要先下载 PDF 并创建索引。这个过程可能需要几分钟，是否继续？',
@@ -575,7 +586,7 @@ watch(activeNoteTypeFilter, async () => {
                   {{ currentPaperActions.not_interested ? '已标记不感兴趣' : '不感兴趣' }}
                 </el-button>
               </div>
-              <div class="parser-card">
+              <div v-if="canResearch" class="parser-card">
                 <div class="parser-card-head">
                   <span class="parser-label">PDF 解析</span>
                   <span class="parser-hint">{{ loadingMethodHint }}</span>
@@ -594,7 +605,7 @@ watch(activeNoteTypeFilter, async () => {
             <div class="status-note" v-if="qaStatus">
               <el-icon><Compass /></el-icon>
               <span>
-                {{ qaStatus.has_index ? `索引已完成，${qaStatus.chunk_count || 0} 个 chunks 可供检索` : `先创建索引，默认解析方式：${loadingMethodLabel}` }}
+                {{ qaStatus.has_index ? `索引已完成，${qaStatus.chunk_count || 0} 个 chunks 可供检索` : canResearch ? `先创建索引，默认解析方式：${loadingMethodLabel}` : '请联系研究者或管理员创建问答索引' }}
               </span>
             </div>
             <div v-if="qaIndexJob" class="job-status-card">
@@ -783,7 +794,7 @@ watch(activeNoteTypeFilter, async () => {
               </div>
             </div>
 
-            <div class="side-card">
+            <div v-if="isAdmin" class="side-card">
               <div class="side-title">索引诊断</div>
               <div v-if="qaDiagnostic" class="diagnostic-block">
                 <div class="diagnostic-summary">

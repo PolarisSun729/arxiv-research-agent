@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
 import type { RagChatSource } from '@/types/ragChat'
+import AuthenticatedImage from '@/components/AuthenticatedImage.vue'
 
 const props = withDefaults(defineProps<{
   sources: RagChatSource[]
@@ -70,16 +71,14 @@ watch(() => props.highlightedSourceId, scrollToHighlightedSource, { immediate: t
       </summary>
       <div class="rag-citation-list__body">
         <p>{{ source.content || '-' }}</p>
-        <el-image
+        <AuthenticatedImage
           v-if="source.chunk_type === 'figure' && source.asset_url"
           class="rag-citation-list__asset"
           :src="source.asset_url"
           fit="contain"
-          :preview-src-list="[source.asset_url]"
-          preview-teleported
         >
           <template #error><div class="rag-citation-list__asset-missing">图片暂不可用，仍保留文字证据。</div></template>
-        </el-image>
+        </AuthenticatedImage>
         <div v-if="source.chunk_type === 'figure' && !source.asset_url" class="rag-citation-list__asset-missing">
           图片暂不可用，仍保留文字证据。
         </div>
@@ -110,16 +109,14 @@ watch(() => props.highlightedSourceId, scrollToHighlightedSource, { immediate: t
         </summary>
         <div class="rag-citation-list__body">
           <p>{{ source.content || '-' }}</p>
-          <el-image
+          <AuthenticatedImage
             v-if="source.chunk_type === 'figure' && source.asset_url"
             class="rag-citation-list__asset"
             :src="source.asset_url"
             fit="contain"
-            :preview-src-list="[source.asset_url]"
-            preview-teleported
           >
             <template #error><div class="rag-citation-list__asset-missing">图片暂不可用，仍保留文字证据。</div></template>
-          </el-image>
+          </AuthenticatedImage>
         </div>
       </details>
     </details>

@@ -11,7 +11,8 @@
     "test:agent-chat": "node tests/agentSearchChat.test.mjs",
     "test:evidence": "node tests/evidenceCitation.test.mjs",
     "test:labeled-summary": "node tests/labeledPaperSummary.test.mjs",
-    "test": "npm run test:errors && npm run test:user-context && npm run test:qa-stream && npm run test:agent-chat && npm run test:evidence && npm run test:labeled-summary",
+    "test:security": "node tests/security.test.mjs",
+    "test": "npm run test:errors && npm run test:user-context && npm run test:qa-stream && npm run test:agent-chat && npm run test:evidence && npm run test:labeled-summary && npm run test:security",
     "preview": "vite preview"
   },
   "dependencies": {

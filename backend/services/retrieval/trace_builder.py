@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from services.retrieval.contracts import QueryProfile
 from services.retrieval.table_evidence_formatter import summarize_table_evidence_debug
 from utils.config import get_enhanced_retrieval_runtime_config
+from utils.secret_redaction import redact_sensitive_value
 
 ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
 
@@ -273,6 +274,8 @@ class RetrievalTraceBuilder:
                 ],
             }
 
+            # JSON 与 Markdown 共用脱敏后的快照，避免下载 trace 时重新暴露模型密钥。
+            payload = redact_sensitive_value(payload)
             with json_path.open("w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
             with md_path.open("w", encoding="utf-8") as f:

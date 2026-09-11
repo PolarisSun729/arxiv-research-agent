@@ -1,42 +1,68 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { Check, Key, SwitchButton } from '@element-plus/icons-vue'
-import { DEMO_USER_OPTIONS, useUserContext } from '@/composables/useUserContext'
+import { useUserContext } from '@/composables/useUserContext'
+import { loadAuthConfiguration, loginWithPassword, registerAccount, setApiKey, verifyAccessKey } from '@/api/auth'
+import type { AuthMode } from '@/api/auth'
+import { getErrorMessage } from '@/api/errors'
 
 const router = useRouter()
 const route = useRoute()
 const userContext = useUserContext()
-const userIdInput = ref(userContext.userId.value)
+const mode = ref<AuthMode>('jwt')
+const configured = ref(false)
+const configError = ref('')
+const registrationEnabled = ref(false)
+const registering = ref(false)
+const username = ref('')
+const email = ref('')
+const password = ref('')
+const accessKey = ref('')
+const compatUserId = ref(userContext.userId.value)
+const submitting = ref(false)
+const canSubmit = computed(() => configured.value && !submitting.value && (mode.value === 'api_key'
+  ? Boolean(accessKey.value.trim()) : Boolean(username.value.trim() && password.value && (!registering.value || email.value.trim()))))
 
-const normalizedUserId = computed(() => userIdInput.value.trim())
-const canSubmit = computed(() => Boolean(normalizedUserId.value))
-
-function applyUserId(userId: string) {
-  userIdInput.value = userId
-}
-
-function handleSubmit() {
-  if (!canSubmit.value) {
-    ElMessage.warning('请输入用户 ID')
-    return
+async function loadConfig() {
+  configured.value = false
+  configError.value = ''
+  try {
+    const config = await loadAuthConfiguration()
+    mode.value = config.mode
+    registrationEnabled.value = config.registration_enabled
+    configured.value = true
+  } catch (error) {
+    configError.value = getErrorMessage(error, '无法读取登录配置，请重试')
   }
-
-  // 当前阶段没有真实认证服务，登录页只负责确定本地演示身份；
-  // 后续接入 token/session 时，替换 useUserContext 的来源即可保留调用方契约。
-  userContext.setUserId(normalizedUserId.value)
-  ElMessage.success(`已切换到用户 ${normalizedUserId.value}`)
-
-  const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/dashboard'
-  const safeRedirect = redirect.startsWith('/') && !['/', '/login'].includes(redirect) ? redirect : '/dashboard'
-  router.push(safeRedirect)
 }
+onMounted(loadConfig)
 
-function handleReset() {
-  userContext.resetUserId()
-  userIdInput.value = userContext.userId.value
-  ElMessage.success(`已重置为 ${userContext.userId.value}`)
+async function handleSubmit() {
+  if (!canSubmit.value) return
+  submitting.value = true
+  try {
+    if (mode.value === 'api_key') {
+      const key = accessKey.value.trim()
+      await verifyAccessKey(key)
+      setApiKey(key)
+      userContext.setUserId(compatUserId.value)
+    } else {
+      if (registering.value) await registerAccount(username.value.trim(), email.value.trim(), password.value)
+      await loginWithPassword(username.value.trim(), password.value)
+    }
+    ElMessage.success('登录成功')
+    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/dashboard'
+    // 回跳只能指向本站路由，不能让登录表单成为开放重定向入口。
+    const safeRedirect = redirect.startsWith('/') && !redirect.startsWith('//') && !redirect.includes(String.fromCharCode(92)) && !['/', '/login'].includes(redirect) ? redirect : '/dashboard'
+    await router.replace(safeRedirect)
+  } catch (error) {
+    ElMessage.error(getErrorMessage(error, '登录失败'))
+  } finally {
+    submitting.value = false
+    password.value = ''
+    accessKey.value = ''
+  }
 }
 </script>
 
@@ -44,47 +70,29 @@ function handleReset() {
   <div class="login-page">
     <section class="login-panel">
       <div class="login-copy">
-        <p class="kicker">用户身份</p>
-        <h1>选择本轮使用的用户 ID</h1>
-        <p class="description">
-          偏好、兴趣向量、研究画像和 Agent 会话都按用户 ID 隔离。请选择已有演示账号，或输入一个新的本地账号。
-        </p>
+        <p class="kicker">arXiv 研究助手</p>
+        <h1>{{ mode === 'api_key' ? '访问验证' : registering ? '创建账号' : '登录账号' }}</h1>
+        <p class="description" v-if="mode === 'jwt'">使用个人账号管理阅读笔记、问答历史和研究画像。登录仅保留在当前标签页。</p>
+        <p class="description" v-else>此服务使用团队访问密钥。用户 ID 用于选择团队内的数据，不提供个人账号隔离。</p>
+        <p class="description" v-if="registering">新注册账号为访客。研究者权限由管理员分配。</p>
       </div>
-
-      <div class="login-form">
-        <el-input
-          v-model="userIdInput"
-          size="large"
-          placeholder="请输入用户 ID"
-          clearable
-          @keyup.enter="handleSubmit"
-        >
-          <template #prefix>
-            <el-icon><Key /></el-icon>
-          </template>
-        </el-input>
-
-        <div class="quick-users">
-          <button
-            v-for="option in DEMO_USER_OPTIONS"
-            :key="option.id"
-            type="button"
-            :class="['quick-user', { active: normalizedUserId === option.id }]"
-            @click="applyUserId(option.id)"
-          >
-            <span class="quick-user__title">{{ option.label }}</span>
-            <span class="quick-user__id">{{ option.id }}</span>
-            <span class="quick-user__desc">{{ option.description }}</span>
-          </button>
-        </div>
-
-        <div class="form-actions">
-          <el-button :icon="SwitchButton" @click="handleReset">重置</el-button>
-          <el-button type="primary" :icon="Check" :disabled="!canSubmit" @click="handleSubmit">
-            使用该用户
-          </el-button>
-        </div>
-      </div>
+      <form class="login-form" @submit.prevent="handleSubmit">
+        <template v-if="mode === 'jwt'">
+          <el-input v-model="username" size="large" placeholder="用户名" aria-label="用户名" autocomplete="username" :maxlength="50" />
+          <el-input v-if="registering" v-model="email" size="large" type="email" placeholder="邮箱" aria-label="邮箱" autocomplete="email" :maxlength="254" />
+          <el-input v-model="password" size="large" type="password" placeholder="密码" aria-label="密码" :autocomplete="registering ? 'new-password' : 'current-password'" :maxlength="72" show-password />
+          <p v-if="registering" class="description">密码至少 8 个字符，包含大小写字母和数字，UTF-8 编码后最多 72 字节。</p>
+        </template>
+        <template v-else>
+          <el-input v-model="accessKey" size="large" type="password" placeholder="管理员提供的访问密钥" aria-label="访问密钥" autocomplete="off" :maxlength="256" />
+          <el-input v-model="compatUserId" size="large" placeholder="数据命名空间（可留空）" aria-label="数据命名空间" />
+        </template>
+        <el-alert v-if="configError" :title="configError" type="error" :closable="false" />
+        <el-button v-if="configError" @click="loadConfig">重试连接</el-button>
+        <el-button type="primary" native-type="submit" size="large" :disabled="!canSubmit" :loading="submitting">{{ registering ? '注册并登录' : '登录' }}</el-button>
+        <el-button v-if="mode === 'jwt' && registrationEnabled" text :disabled="submitting" @click="registering = !registering">{{ registering ? '已有账号，返回登录' : '创建访客账号' }}</el-button>
+        <p v-if="mode === 'jwt' && configured && !registrationEnabled" class="description">暂未开放注册，请联系管理员创建账号。</p>
+      </form>
     </section>
   </div>
 </template>

@@ -23,4 +23,5 @@ export interface ApiErrorPayload {
   detail?: string | null
   details?: Record<string, any> | null
   recoverable: boolean
+  retry_after?: number | null
 }

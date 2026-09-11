@@ -1,6 +1,26 @@
 import type { ApiErrorPayload } from '@/types/error'
 
 const ERROR_MESSAGES: Record<string, string> = {
+  missing_token: '请先登录。',
+  invalid_token: '登录已失效，请重新登录。',
+  invalid_credentials: '用户名或密码错误，或账号已停用。',
+  insufficient_permissions: '当前账号没有执行此操作的权限。',
+  identity_mismatch: '只能访问当前登录账号的数据。',
+  registration_disabled: '注册未开放，请联系管理员。',
+  account_conflict: '用户名或邮箱已被使用。',
+  private_resource_not_found: '请求的个人资源不存在。',
+  quota_exceeded: '今日配额已用完，请在重置后重试。',
+  last_admin_required: '必须保留至少一个启用的管理员账号。',
+  missing_api_key: '请先输入访问密钥。',
+  invalid_api_key: '访问密钥无效，请重新输入。',
+  api_key_disabled: '访问密钥已被禁用，请联系管理员。',
+  api_key_expired: '访问密钥已过期，请联系管理员。',
+  rate_limit_exceeded: '请求过于频繁，请稍后重试。',
+  daily_quota_exceeded: '此访问密钥今日配额已用尽。',
+  ip_blocked: '当前 IP 已被禁止访问。',
+  ip_not_allowed: '当前 IP 不在允许的访问范围内。',
+  ip_temporarily_blocked: '当前 IP 已被临时封禁，请稍后重试。',
+  security_storage_unavailable: '访问控制服务暂时不可用，请稍后重试。',
   request_validation_error: '请求参数不合法，请检查后重试。',
   paper_not_found: '未找到对应论文，请确认论文 ID 是否正确。',
   qa_index_not_found: '这篇论文还没有 QA 索引，请先构建索引。',
@@ -46,6 +66,11 @@ function normalizeDetails(value: unknown): Record<string, any> | null {
   return isRecord(value) ? value : null
 }
 
+
+function normalizeRetryAfter(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.ceil(value) : null
+}
+
 function normalizeFastApiDetail(value: unknown, fallback: string): ApiErrorPayload | null {
   if (!isRecord(value)) return null
   const detail = isRecord(value.detail) ? value.detail : value
@@ -66,7 +91,8 @@ function normalizeFastApiDetail(value: unknown, fallback: string): ApiErrorPaylo
     detail: rawDetail,
     // FastAPI 业务错误会把可展示契约放在 detail.details，前端需要保留给页面级 banner。
     details: normalizeDetails(detail.details),
-    recoverable: typeof detail.recoverable === 'boolean' ? detail.recoverable : true
+    recoverable: typeof detail.recoverable === 'boolean' ? detail.recoverable : true,
+    retry_after: normalizeRetryAfter(detail.retry_after)
   }
 }
 
@@ -79,7 +105,8 @@ export function normalizeApiError(value: unknown, fallback = '请求失败，请
       message: getApiErrorMessage(code, value.message || fallback),
       detail: typeof value.detail === 'string' ? value.detail : null,
       details: normalizeDetails(value.details),
-      recoverable: Boolean(value.recoverable)
+      recoverable: Boolean(value.recoverable),
+      retry_after: normalizeRetryAfter(value.retry_after)
     }
   }
 
@@ -135,16 +162,28 @@ export function getApiErrorMessage(code: string | null | undefined, fallback = '
   return ERROR_MESSAGES[code] || fallback
 }
 
+
+function payloadMessage(payload: ApiErrorPayload, fallback: string): string {
+  const message = getApiErrorMessage(payload.code, payload.message || fallback)
+  const seconds = normalizeRetryAfter(payload.retry_after)
+  // 超限保留当前登录态，只提示服务端给出的等待时间；不自动重试可能产生副作用的写请求。
+  if (seconds && ['rate_limit_exceeded', 'daily_quota_exceeded', 'ip_temporarily_blocked', 'security_storage_unavailable'].includes(payload.code)) {
+    const wait = seconds < 60 ? `${seconds} 秒` : `${Math.ceil(seconds / 60)} 分钟`
+    return `${message}（约 ${wait}后可重试）`
+  }
+  return message
+}
+
 export function getErrorMessage(error: unknown, fallback = '请求失败，请稍后重试。') {
   if (error instanceof ApiError) {
-    return getApiErrorMessage(error.payload.code, error.payload.message || fallback)
+    return payloadMessage(error.payload, fallback)
   }
   if (isApiErrorPayload(error)) {
-    return getApiErrorMessage(error.code, error.message || fallback)
+    return payloadMessage(error, fallback)
   }
   if (error && typeof error === 'object' && 'payload' in error && isApiErrorPayload((error as { payload?: unknown }).payload)) {
     const payload = (error as { payload: ApiErrorPayload }).payload
-    return getApiErrorMessage(payload.code, payload.message || fallback)
+    return payloadMessage(payload, fallback)
   }
   if (error && typeof error === 'object' && 'message' in error && typeof (error as { message?: unknown }).message === 'string') {
     return (error as { message: string }).message || fallback

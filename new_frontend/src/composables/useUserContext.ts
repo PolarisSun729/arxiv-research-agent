@@ -1,90 +1,48 @@
-import { computed, ref, watch } from 'vue'
+import { computed, ref } from 'vue'
+import { currentUser, getAuthMode, getCredential } from '../api/auth'
 
-const USER_ID_STORAGE_KEY = 'rag_demo_user_id'
+const COMPAT_USER_KEY = 'arxiv_compat_user_id'
+const DEFAULT_COMPAT_USER_ID = 'local_user'
 
-export const DEFAULT_DEMO_USER_ID = 'local_user'
-export const SEEDED_DEMO_USER_ID = '2433274'
-
-export const DEMO_USER_OPTIONS = [
-  {
-    id: SEEDED_DEMO_USER_ID,
-    label: '已有演示数据账号',
-    description: '读取当前本地库里已经生成的偏好、兴趣向量和研究画像'
-  },
-  {
-    id: DEFAULT_DEMO_USER_ID,
-    label: '空白本地账号',
-    description: '用于从零开始标记偏好和生成画像'
-  }
-]
-
-function normalizeUserId(value?: string | null): string {
-  const normalized = String(value || '').trim()
-  return normalized || DEFAULT_DEMO_USER_ID
-}
-
-function readStoredUserId(): string {
-  if (typeof window === 'undefined') {
-    return DEFAULT_DEMO_USER_ID
-  }
-
+function readCompatUserId(): string {
   try {
-    return normalizeUserId(window.localStorage.getItem(USER_ID_STORAGE_KEY))
+    return typeof window === 'undefined' ? DEFAULT_COMPAT_USER_ID : window.sessionStorage.getItem(COMPAT_USER_KEY) || DEFAULT_COMPAT_USER_ID
   } catch {
-    // localStorage 可能在隐私模式或服务端渲染场景不可用，保留 demo 用户兜底让单用户演示不中断。
-    return DEFAULT_DEMO_USER_ID
+    return DEFAULT_COMPAT_USER_ID
   }
 }
 
-const currentUserIdRef = ref(readStoredUserId())
-
-watch(currentUserIdRef, userId => {
-  if (typeof window === 'undefined') return
-
-  try {
-    // 统一持久化 demo 用户，后续接入 /me 或 token 时只需要替换这里的初始化来源。
-    window.localStorage.setItem(USER_ID_STORAGE_KEY, normalizeUserId(userId))
-  } catch {
-    // 持久化失败不应影响业务请求，内存态 userId 仍然可以继续支撑当前会话。
-  }
-})
+const compatUserId = ref(readCompatUserId())
 
 export function getCurrentUserId(): string {
-  return normalizeUserId(currentUserIdRef.value)
+  // JWT 身份只来自服务端 /me；旧 localStorage 演示用户绝不能自动认领真实账号的数据。
+  return getAuthMode() === 'api_key' ? compatUserId.value : currentUser.value?.user_id || ''
 }
 
 export function setCurrentUserId(userId: string): void {
-  currentUserIdRef.value = normalizeUserId(userId)
+  if (getAuthMode() !== 'api_key') throw new Error('登录账号的身份不能手动修改')
+  compatUserId.value = userId.trim() || DEFAULT_COMPAT_USER_ID
+  try {
+    if (typeof window !== 'undefined') window.sessionStorage.setItem(COMPAT_USER_KEY, compatUserId.value)
+  } catch {
+    // 显式兼容模式也只保留当前标签页内的命名空间，不写入持久 localStorage。
+  }
 }
 
-export function resetCurrentUserId(): void {
-  currentUserIdRef.value = DEFAULT_DEMO_USER_ID
-}
-
-export function isCurrentDemoUser(): boolean {
-  return getCurrentUserId() === DEFAULT_DEMO_USER_ID
-}
+export function resetCurrentUserId(): void { setCurrentUserId(DEFAULT_COMPAT_USER_ID) }
+export function isCurrentDemoUser(): boolean { return getAuthMode() === 'api_key' && compatUserId.value === DEFAULT_COMPAT_USER_ID }
 
 export function useUserContext() {
-  const userId = computed({
-    get: getCurrentUserId,
-    set: setCurrentUserId
-  })
-  const displayName = computed(() => (isCurrentDemoUser() ? 'Demo User' : `User ${userId.value}`))
-  const isDemoUser = computed(isCurrentDemoUser)
-  const isDemoMode = computed(() => true)
-  const isLoggedIn = computed(() => !isDemoUser.value)
-
+  const userId = computed(getCurrentUserId)
+  const isDemoMode = computed(() => getAuthMode() === 'api_key')
+  const isAdmin = computed(() => isDemoMode.value || currentUser.value?.role === 'admin')
+  const canResearch = computed(() => isAdmin.value || currentUser.value?.role === 'researcher')
   return {
-    defaultUserId: DEFAULT_DEMO_USER_ID,
-    userId,
-    currentUserId: userId,
-    displayName,
-    isDemoUser,
-    isDemoMode,
-    isLoggedIn,
-    getUserId: getCurrentUserId,
-    setUserId: setCurrentUserId,
-    resetUserId: resetCurrentUserId
+    get defaultUserId() { return getAuthMode() === 'api_key' ? DEFAULT_COMPAT_USER_ID : '' },
+    userId, currentUserId: userId, user: currentUser,
+    displayName: computed(() => currentUser.value?.username || (isDemoMode.value ? userId.value : '未登录')),
+    isDemoMode, isDemoUser: computed(isCurrentDemoUser), isAdmin, canResearch,
+    isLoggedIn: computed(() => Boolean(getCredential() && (isDemoMode.value || currentUser.value))),
+    getUserId: getCurrentUserId, setUserId: setCurrentUserId, resetUserId: resetCurrentUserId
   }
 }

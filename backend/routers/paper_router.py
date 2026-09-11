@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
+from auth.context import current_auth
 from core.errors import AppError, ErrorCode, error_response
 from dependencies import (
     get_embedding_service,
@@ -90,6 +91,11 @@ async def get_dashboard_stats(
     """返回首页看板所需的聚合统计数据。"""
     try:
         sync_status = _get_sync_status_payload()
+        identity = current_auth.get()
+        sync_error = sync_status["syncErrorMessage"]
+        if sync_error and (identity is None or identity.session.user.role != "admin"):
+            # 看板对所有账号开放；保留字段和失败状态，内部路径及诊断仅向已认证管理员展示。
+            sync_error = "最近一次同步失败，请联系管理员查看运行日志。"
         return {
             "totalPapers": oai_db_service.get_total_paper_count(),
             "labeledPapers": user_preference_store.get_user_labeled_paper_count(user_id=user_id),
@@ -101,7 +107,7 @@ async def get_dashboard_stats(
             "lastSyncMode": sync_status["mode"],
             "latestSyncMatchedPapers": sync_status["latestSyncMatchedPapers"],
             "syncErrors": sync_status["syncErrors"],
-            "syncErrorMessage": sync_status["syncErrorMessage"],
+            "syncErrorMessage": sync_error,
         }
     except Exception as exc:
         logger.error("Error getting dashboard stats: %s", str(exc))

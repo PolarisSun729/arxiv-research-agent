@@ -18,9 +18,10 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from dependencies import (
@@ -36,10 +37,13 @@ from dependencies import (
     get_vector_store_service,
 )
 from core.errors import AppError, ErrorCode, error_response
+from core.responses import RedactedJSONResponse
 from routers.qa_utils import build_qa_diagnostic, get_latest_retrieval_trace, sanitize_trace_slug
 from services.paper_qa.qa_observation import build_error_qa_observation, build_qa_observation
 from services.paper_qa.answer_language import CHINESE_FINAL_ANSWER_INSTRUCTION
 from utils.config import get_default_user_id, get_qa_index_job_runtime_config
+from utils.secret_redaction import StreamingSecretRedactor, redact_sensitive_value, redact_text
+from auth.ownership import prepare_paper_qa, validate_note_source
 
 logger = logging.getLogger(__name__)
 
@@ -308,11 +312,16 @@ async def download_latest_qa_trace(
         if trace_file is None:
             raise HTTPException(status_code=404, detail="No retrieval trace found for this paper")
 
-        return FileResponse(
-            path=str(trace_file),
-            filename=f"{arxiv_id}_retrieval_trace.{normalized_format}",
-            media_type="application/json" if normalized_format == "json" else "text/markdown",
-        )
+        if trace_file.suffix.lower() != f".{normalized_format}" or not trace_file.resolve().is_relative_to(paper_dir.resolve()):
+            raise HTTPException(status_code=400, detail="Invalid trace file")
+
+        # 历史 trace 可能在脱敏规则上线前生成；下载时再次处理，且不修改磁盘上的原文件。
+        filename = f"{sanitize_trace_slug(arxiv_id)}_retrieval_trace.{normalized_format}"
+        headers = {"Content-Disposition": f"attachment; filename*=utf-8''{quote(filename)}"}
+        text = trace_file.read_text(encoding="utf-8")
+        if normalized_format == "json":
+            return RedactedJSONResponse(content=json.loads(text), headers=headers)
+        return Response(content=redact_text(text), media_type="text/markdown", headers=headers)
     except HTTPException:
         raise
     except Exception as exc:
@@ -601,9 +610,11 @@ async def create_paper_note(
     paper_chat_message_store=Depends(get_paper_chat_message_store),
 ):
     """创建一条论文笔记，并可选同步更新用户研究画像。"""
+    # 在通用业务异常兜底之前检查归属，授权错误必须保持 404，而不是被包装成 500。
+    validated_source_id = validate_note_source(arxiv_id, payload, paper_chat_message_store)
     try:
         user_id = _normalize_user_id(payload.user_id)
-        source_message_id = (payload.source_message_id or "").strip() or None
+        source_message_id = (validated_source_id or "").strip() or None
         if not source_message_id and payload.session_id and payload.source_turn_id:
             # 如果前端没有直接传 message_id，但给了 session + turn，
             # 就回查对应的 assistant 消息，建立笔记与问答来源的关联。
@@ -711,6 +722,8 @@ async def export_paper_notes_markdown(
         serialized_notes = [_serialize_paper_note(item, paper_chat_message_store=paper_chat_message_store) for item in notes]
         paper = paper_catalog_store.get_paper(arxiv_id)
         markdown = _build_notes_markdown(arxiv_id, serialized_notes, paper_title=(paper or {}).get("title"))
+        # 附件绕过 JSON 响应类；拼装完标题、正文和关联来源后统一脱敏，覆盖历史存储中的凭据。
+        markdown = redact_text(markdown)
         filename = f"{sanitize_trace_slug(arxiv_id)}_notes.md"
         return StreamingResponse(
             # 这里直接把内存中的 markdown bytes 作为流返回，避免额外生成临时文件。
@@ -726,6 +739,7 @@ async def export_paper_notes_markdown(
 @router.post("/qa")
 async def qa_paper(arxiv_id: str, payload: QaRequest, paper_qa_service=Depends(get_paper_qa_service)):
     """执行一次非流式论文问答。"""
+    prepare_paper_qa(arxiv_id, payload)
     try:
         return paper_qa_service.answer_question(arxiv_id, payload)
     except AppError as exc:
@@ -792,12 +806,13 @@ async def qa_paper_stream(
 
     Phase 3: 如果 paper_qa_service 有 research_service，使用证据研究引擎流式接口。
     """
+    prepare_paper_qa(arxiv_id, payload)
     question = payload.question.strip()
     logger.debug("QA stream request for paper: %s, question: %s", arxiv_id, question)
 
     def sse_event(event_name: str, data: dict) -> str:
-        """格式化单条 SSE 消息。"""
-        return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+        """格式化并脱敏单条 SSE 消息，保护未经过 JSONResponse 的流式出口。"""
+        return f"event: {event_name}\ndata: {json.dumps(redact_sensitive_value(data), ensure_ascii=False)}\n\n"
 
     def event_stream_with_research():
         """使用证据研究引擎的流式事件生成器。"""
@@ -864,6 +879,7 @@ async def qa_paper_stream(
         """
         retrieval_debug = None
         source_payload: List[Dict[str, Any]] = []
+        stream_redactor = StreamingSecretRedactor()
         try:
             # 上下文构建也放在 SSE 生成器内，确保未建索引、检索异常等前置失败能返回统一 error 事件。
             _, search_results, qa_context, retrieval_debug = paper_qa_service.build_qa_context(arxiv_id, payload)
@@ -911,8 +927,10 @@ async def qa_paper_stream(
                 asset_metadata=[item for item in qa_context["asset_metadata"] if item.get("chunk_type") == "figure"],
             ):
                 if chunk.get("type") == "delta":
-                    # delta 事件只承载增量文本，适合前端逐字/逐段渲染。
-                    yield sse_event("delta", {"delta": chunk.get("delta", "")})
+                    # 单条 SSE 脱敏无法识别跨分片凭据；只有确认安全的增量才交给前端拼接。
+                    safe_delta = stream_redactor.feed(chunk.get("delta", "") or "")
+                    if safe_delta:
+                        yield sse_event("delta", {"delta": safe_delta})
                 elif chunk.get("type") == "completed":
                     final_answer = chunk.get("answer", "") or ""
                     answer_generator = getattr(paper_qa_service, "answer_generator", None)
@@ -966,6 +984,9 @@ async def qa_paper_stream(
                         contextualized_question=contextualized_question,
                         question_contextualization=question_contextualization,
                     )
+                    safe_tail = stream_redactor.finish()
+                    if safe_tail:
+                        yield sse_event("delta", {"delta": safe_tail})
                     yield sse_event(
                         "done",
                         {
@@ -1008,6 +1029,9 @@ async def qa_paper_stream(
             )
             if isinstance(retrieval_debug, dict):
                 retrieval_debug["qa_observation"] = qa_observation
+            safe_tail = stream_redactor.finish()
+            if safe_tail:
+                yield sse_event("delta", {"delta": safe_tail})
             yield sse_event(
                 "done",
                 {
@@ -1054,6 +1078,9 @@ async def qa_paper_stream(
                 context={"arxiv_id": arxiv_id, "user_id": payload.user_id, "session_id": payload.session_id, "stage": "qa_stream", "qa_observation": qa_observation},
             )
             yield sse_event("error", stream_error.to_payload())
+        finally:
+            # 异常和 GeneratorExit 都只丢弃未决尾部；不能在取消请求时补发可能属于密钥的片段。
+            stream_redactor.discard()
 
     # Phase 3: 路由到证据研究引擎流式接口或旧编排流式接口
     if hasattr(paper_qa_service, "research_service") and paper_qa_service.research_service is not None:

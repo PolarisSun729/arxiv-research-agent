@@ -160,6 +160,7 @@ class TestPdfDownload:
         mock_response = Mock()
         mock_response.content = create_minimal_valid_pdf()
         mock_response.headers = {'Content-Type': 'application/pdf'}
+        mock_response.iter_content.return_value = [mock_response.content]
         mock_response.raise_for_status = Mock()
 
         with patch.object(service, '_make_request_with_retry', return_value=mock_response):
@@ -195,6 +196,7 @@ class TestPdfDownload:
         mock_response = Mock()
         mock_response.content = create_minimal_valid_pdf()
         mock_response.headers = {'Content-Type': 'application/pdf'}
+        mock_response.iter_content.return_value = [mock_response.content]
         mock_response.raise_for_status = Mock()
 
         with patch.object(service, '_make_request_with_retry', return_value=mock_response):
@@ -222,6 +224,7 @@ class TestPdfDownload:
         mock_response = Mock()
         mock_response.content = b'<html>Error page</html>'
         mock_response.headers = {'Content-Type': 'application/pdf'}  # 声称是 PDF 但实际不是
+        mock_response.iter_content.return_value = [mock_response.content]
         mock_response.raise_for_status = Mock()
 
         with patch.object(service, '_make_request_with_retry', return_value=mock_response):
@@ -245,6 +248,7 @@ class TestPdfDownload:
         mock_response = Mock()
         mock_response.content = create_minimal_valid_pdf()
         mock_response.headers = {'Content-Type': 'application/pdf'}
+        mock_response.iter_content.return_value = [mock_response.content]
         mock_response.raise_for_status = Mock()
 
         with patch.object(service, '_make_request_with_retry', return_value=mock_response):
@@ -255,4 +259,84 @@ class TestPdfDownload:
                 mock_replace.assert_called_once()
                 args = mock_replace.call_args[0]
                 assert args[0].endswith('.tmp')
-                assert args[1].endswith('2301.00007.pdf')
+                assert str(args[1]).endswith('2301.00007.pdf')
+
+    @pytest.mark.parametrize("arxiv_id", ["../outside", "..\\outside", "/tmp/outside", "C:\\outside", "2301.00001/../../outside", "2301.00001\n"])
+    def test_invalid_id_cannot_touch_files_or_network(self, service, tmp_path, arxiv_id):
+        """恶意 ID 在缓存检查之前被拒绝，不能先删除服务器已有文件。"""
+        sentinel = tmp_path.parent / "outside.pdf"
+        sentinel.write_bytes(b"private data")
+        with patch.object(service, '_make_request_with_retry') as request:
+            with pytest.raises(ValueError, match="Invalid arXiv ID"):
+                service.download_pdf(f"https://arxiv.org/pdf/{arxiv_id}", arxiv_id)
+        request.assert_not_called()
+        assert sentinel.read_bytes() == b"private data"
+
+    @pytest.mark.parametrize("url", [
+        "http://127.0.0.1/private", "http://169.254.169.254/latest/meta-data", "file:///etc/passwd",
+        "https://arxiv.org.evil.test/pdf/2301.00001", "https://arxiv.org@evil.test/pdf/2301.00001",
+        "https://user:password@arxiv.org/pdf/2301.00001", "https://arxiv.org:8443/pdf/2301.00001",
+        "https://arxiv.org/pdf/2301.00002", "https://arxiv.org/pdf/2301.00001?redirect=http://127.0.0.1",
+        "https://arxiv.org/pdf/2301.00001#fragment", "https://arxiv.org/pdf/%32%33%30%31.00001",
+    ])
+    def test_untrusted_url_is_rejected_even_with_valid_cache(self, service, tmp_path, url):
+        (tmp_path / "2301.00001.pdf").write_bytes(create_minimal_valid_pdf())
+        with patch.object(service, '_make_request_with_retry') as request:
+            with pytest.raises(ValueError, match="PDF URL"):
+                service.download_pdf(url, "2301.00001")
+        request.assert_not_called()
+
+    def test_old_style_id_and_http_link_remain_supported(self, service, tmp_path):
+        response = Mock(headers={"Content-Type": "application/pdf"})
+        response.iter_content.return_value = [create_minimal_valid_pdf()]
+        with patch.object(service, '_make_request_with_retry', return_value=response) as request:
+            path = service.download_pdf("http://arxiv.org/pdf/hep-th/9901001.pdf", "hep-th/9901001")
+        assert path == str(tmp_path / "hep-th_9901001.pdf")
+        request.assert_called_once_with("https://arxiv.org/pdf/hep-th/9901001.pdf", pdf_arxiv_id="hep-th/9901001")
+        assert service._is_valid_pdf(path)
+
+    @pytest.mark.parametrize("location", ["http://127.0.0.1/admin", "https://evil.test/file", "http://arxiv.org/pdf/2301.00001", "/pdf/2301.00002"])
+    def test_redirect_is_checked_before_second_network_request(self, service, location):
+        response = Mock(status_code=302, headers={"Location": location})
+        with patch.object(service, '_wait_for_rate_limit'), patch.object(service.session, 'get', return_value=response) as request:
+            with pytest.raises(ValueError, match="PDF URL"):
+                service.download_pdf("https://arxiv.org/pdf/2301.00001", "2301.00001")
+        request.assert_called_once()
+        assert request.call_args.kwargs["allow_redirects"] is False
+        assert request.call_args.kwargs["stream"] is True
+        response.close.assert_called_once()
+
+    def test_official_same_paper_redirect_is_allowed(self, service):
+        redirect = Mock(status_code=302, headers={"Location": "/pdf/2301.00001"})
+        pdf = Mock(status_code=200, headers={"Content-Type": "application/pdf"})
+        pdf.iter_content.return_value = [create_minimal_valid_pdf()]
+        with patch.object(service, '_wait_for_rate_limit'), patch.object(service.session, 'get', side_effect=[redirect, pdf]) as request:
+            path = service.download_pdf("https://arxiv.org/pdf/2301.00001.pdf", "2301.00001")
+        assert request.call_count == 2
+        assert request.call_args.args[0] == "https://arxiv.org/pdf/2301.00001"
+        assert service._is_valid_pdf(path)
+
+    def test_redirect_loop_is_bounded(self, service):
+        response = Mock(status_code=302, headers={"Location": "/pdf/2301.00001"})
+        with patch.object(service, '_wait_for_rate_limit'), patch.object(service.session, 'get', return_value=response) as request:
+            with pytest.raises(ValueError, match="redirects"):
+                service.download_pdf("https://arxiv.org/pdf/2301.00001", "2301.00001")
+        assert request.call_count == service.MAX_PDF_REDIRECTS + 1
+
+    @pytest.mark.parametrize("declared_size", [None, "1", "1000000000"])
+    def test_oversized_download_is_closed_and_does_not_delete_cache(self, service, tmp_path, declared_size):
+        """长度头缺失、伪造或明确超限时都不能写入超额内容或损坏旧缓存。"""
+        service.MAX_PDF_BYTES = 10
+        cached = tmp_path / "2301.00001.pdf"
+        cached.write_bytes(b"old content")
+        headers = {"Content-Type": "application/pdf"}
+        if declared_size is not None:
+            headers["Content-Length"] = declared_size
+        response = Mock(headers=headers)
+        response.iter_content.return_value = [b"012345", b"678901"]
+        with patch.object(service, '_make_request_with_retry', return_value=response):
+            with pytest.raises(ValueError, match="download limit"):
+                service.download_pdf("https://arxiv.org/pdf/2301.00001", "2301.00001")
+        assert cached.read_bytes() == b"old content"
+        assert not list(tmp_path.glob("*.tmp"))
+        response.close.assert_called_once()

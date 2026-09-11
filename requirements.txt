@@ -10,7 +10,6 @@ asttokens
 async-timeout
 attrs
 backoff
-bcrypt
 beautifulsoup4
 boto3
 botocore
@@ -226,3 +225,12 @@ pypinyin
 feedparser
 modelscope
 bm25s
+slowapi>=0.1.9,<0.2
+limits>=4,<6
+redis>=5,<7
+# Redis 原子限流回归使用内存模拟服务，不连接开发者或生产 Redis。
+fakeredis[lua]>=2.38,<3
+# 用户认证直接使用维护中的 JWT 与 bcrypt 库，避免旧密码封装层的版本兼容问题。
+PyJWT>=2.10.1,<3
+bcrypt>=4.2,<6
+email-validator>=2.2,<3

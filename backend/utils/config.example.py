@@ -47,6 +47,7 @@ BACKEND_LOGGING_CONFIG = {
     "full_io": False,
     "request_trace": "auto",
     "request_trace_dir": str(REPO_ROOT / "temp" / "backend-request-traces"),
+    # 密钥脱敏不能通过环境变量或 DEBUG 配置关闭。
     "redact_secrets": True,
 }
 

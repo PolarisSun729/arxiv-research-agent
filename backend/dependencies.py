@@ -51,15 +51,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class RequestActor:
-    """当前 demo 用户命名空间；它提供业务隔离，但不等价于经过认证的身份。"""
+    """JWT 模式来自已验证账号；仅显式 API Key 兼容模式接受旧演示命名空间。"""
 
     user_id: str
 
 
 def get_request_actor(user_id: str | None = None) -> RequestActor:
+    from auth.context import bind_user_id
     from services.storage.sqlite.shared import DEFAULT_USER_ID
 
-    normalized = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+    normalized = bind_user_id(user_id, fallback=DEFAULT_USER_ID)
     return RequestActor(user_id=normalized)
 
 

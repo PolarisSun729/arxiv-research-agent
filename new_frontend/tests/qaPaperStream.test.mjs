@@ -9,6 +9,7 @@ const outfile = join(tmpdir(), `qa-paper-stream-${Date.now()}.mjs`)
 
 await mkdir(tmpdir(), { recursive: true })
 await build({
+  define: { 'import.meta.env.VITE_API_BASE_URL': '"/api"' },
   entryPoints: [fileURLToPath(new URL('../src/api/papers.ts', import.meta.url))],
   bundle: true,
   format: 'esm',

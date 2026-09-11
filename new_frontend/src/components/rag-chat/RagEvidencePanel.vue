@@ -4,6 +4,9 @@ import RagCitationList from '@/components/rag-chat/RagCitationList.vue'
 import RagThoughtChain from '@/components/rag-chat/RagThoughtChain.vue'
 import type { RetrievalDebug, RetrievalDebugChunk } from '@/api/papers'
 import type { RagChatSource } from '@/types/ragChat'
+import { useUserContext } from '@/composables/useUserContext'
+
+const { isAdmin } = useUserContext()
 
 const props = defineProps<{
   question?: string
@@ -76,6 +79,7 @@ const hasEvidence = computed(() => Boolean(props.question || props.sources.lengt
         </div>
         <div class="rag-evidence-panel__head-actions">
           <el-button
+            v-if="isAdmin"
             size="small"
             text
             :loading="traceDownloading"
@@ -84,7 +88,7 @@ const hasEvidence = computed(() => Boolean(props.question || props.sources.lengt
             下载 Trace
           </el-button>
           <el-button
-            v-if="retrievalDebug?.trace_export?.json"
+            v-if="isAdmin && retrievalDebug?.trace_export?.json"
             size="small"
             text
             :loading="traceDownloading"

@@ -53,6 +53,9 @@ class ToolExecutionService:
         self.backend_invoker = backend_invoker
 
     def execute(self, *, step: PlanStep, arguments: Dict[str, Any], state: AgentState) -> ToolExecutionResult:
+        from auth.tool_access import authorize_agent_step
+        # adapter 还可能直接读取画像或执行 LLM，必须在参数增强和任何 adapter 副作用之前校验。
+        authorize_agent_step(state.user_id, arguments)
         contract = self.registry.get_contract(step.tool_name)
         if contract is None or contract.adapter is None:
             raise ValueError(f"Unsupported tool contract adapter: {step.tool_name}")

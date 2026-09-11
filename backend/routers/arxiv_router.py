@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from dependencies import get_arxiv_api_service, get_arxiv_search_backend
 from services.arxiv.arxiv_query_builder import prepare_arxiv_search_request
@@ -94,7 +95,9 @@ async def arxiv_search(
     try:
         # 空请求体仍走统一校验，最终会得到明确的 400，而不是路由层 422。
         prepared = _prepare_search_request(request or ArxivSearchRequest(), append_date_when_query_missing=False)
-        return arxiv_backend.search(
+        # 搜索后端包含同步 HTTP/SQLite I/O；交给有界线程池，避免占用事件循环并保留请求身份上下文。
+        return await run_in_threadpool(
+            arxiv_backend.search,
             search_query=prepared["final_search_query"],
             id_list=prepared["id_list"],
             max_results=prepared["max_results"],
@@ -132,7 +135,8 @@ async def arxiv_download(
 ):
     """下载指定 arXiv 论文 PDF 到本地。"""
     try:
-        filepath = arxiv_api_service.download_pdf(pdf_url, arxiv_id)
+        # 下载含重试等待和 PDF 校验，期间仍需响应认证、限流与健康检查。
+        filepath = await run_in_threadpool(arxiv_api_service.download_pdf, pdf_url, arxiv_id)
         return {"status": "success", "filepath": filepath}
     except Exception as exc:
         _raise_arxiv_http_error(exc, operation="download")

@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Type
 
 from pydantic import BaseModel, ValidationError
+from auth.errors import AuthError
+from auth.tool_access import authorize_backend_tool
 
 from . import arxiv_tools, paper_qa_tools, recommendation_tools
 from .schemas import (
@@ -174,7 +176,12 @@ def invoke_tool(tool_name: str, **kwargs: Any) -> Dict[str, Any]:
         )
 
     try:
+        # 别名已归一化，权限和配额都按实际能力计数，不能换一个工具名称获得额外预算。
+        authorize_backend_tool(canonical_name, validated_arguments)
         return _normalize_tool_result(tool_name, spec, spec.func(**validated_arguments))
+    except AuthError as exc:
+        return make_tool_result(ok=False, tool_name=tool_name, summary=exc.message, data=None,
+                                trace={"tool_name": tool_name, "validated": True}, error=make_tool_error(exc.code, exc.message))
     except Exception as exc:
         return make_tool_result(
             ok=False,

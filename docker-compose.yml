@@ -1,0 +1,99 @@
+services:
+  redis:
+    image: redis:7.4-alpine
+    profiles: ["security"]
+    restart: unless-stopped
+    user: redis
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?Run scripts/init_security.py to configure REDIS_PASSWORD}
+    ports:
+      - "127.0.0.1:6379:6379"
+    # 计数不能因内存压力被淘汰，否则会重新发放配额；写入失败由应用拒绝准入。
+    # 从标准输入传配置，密码不进入进程参数；生成器使用无空白的 URL-safe 随机值。
+    command:
+      - sh
+      - -c
+      - 'printf "requirepass %s\nappendonly yes\nappendfsync always\nmaxmemory 128mb\nmaxmemory-policy noeviction\n" "$$REDISCLI_AUTH" | redis-server -'
+    volumes:
+      - security-redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -qx PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/etcd:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - milvus
+
+  minio:
+    container_name: milvus-minio
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Run scripts/init_security.py to configure MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Run scripts/init_security.py to configure MINIO_ROOT_PASSWORD}
+    ports:
+      # 对象存储只供本机后端使用，不能通过宿主机公网端口绕过 API 认证。
+      - "127.0.0.1:9001:9001"
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - milvus
+
+  standalone:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.4.5-gpu
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      # 对应 Milvus minio.accessKeyID / minio.secretAccessKey，必须与 MinIO 一起更新。
+      MINIO_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?Run scripts/init_security.py to configure MINIO_ROOT_USER}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?Run scripts/init_security.py to configure MINIO_ROOT_PASSWORD}
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    ports:
+      - "127.0.0.1:19530:19530"
+      - "127.0.0.1:19091:9091"
+    depends_on:
+      - "etcd"
+      - "minio"
+    networks:
+      - milvus
+
+networks:
+  milvus:
+    name: milvus
+
+volumes:
+  security-redis-data:

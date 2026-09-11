@@ -56,4 +56,12 @@ const detailWrapped = normalizeApiError({
 assert.equal(detailWrapped.code, 'llm_generation_failed')
 assert.equal(detailWrapped.message, '答案生成失败，请稍后重试。')
 
+const limited = normalizeApiError({ response: { data: { status: 'failed', code: 'rate_limit_exceeded', retry_after: 15, recoverable: true } } })
+assert.equal(limited.retry_after, 15)
+assert.match(getErrorMessage(new ApiError(limited)), /15 秒/)
+const exhausted = normalizeApiError({ detail: { status: 'failed', code: 'daily_quota_exceeded', retry_after: 120, recoverable: true } })
+assert.equal(exhausted.retry_after, 120)
+assert.match(getErrorMessage(exhausted), /2 分钟/)
+assert.equal(normalizeApiError({ status: 'failed', code: 'rate_limit_exceeded', retry_after: '60/minute' }).retry_after, null)
+
 console.log('error parser tests passed')

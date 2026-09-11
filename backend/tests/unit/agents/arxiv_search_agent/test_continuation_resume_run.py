@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from tests.helpers.agent_runtime import load_agent_test_modules
 from tests.helpers.sqlite import build_storage_container
 
@@ -156,3 +158,27 @@ def test_resume_run_fails_when_graph_returns_interrupt_without_answer(tmp_path, 
     # 不得被标成 completed 空答
     cont = storage.agent_work.get_continuation("continuation-1")
     assert cont["status"] != "resumed"
+
+
+@pytest.mark.parametrize("mode,status", [("jwt", "pending"), ("api_key", "pending"), ("jwt", "running")])
+def test_restart_recovery_never_recreates_jwt_authority_from_stored_user_id(tmp_path, monkeypatch, mode, status):
+    """真实持久化状态验证：JWT 待运行任务不能在重启后凭旧 user_id 自动恢复执行权限。"""
+    monkeypatch.setenv("AUTH_MODE", mode)
+    storage = build_storage_container(db_path=str(tmp_path / "restart.sqlite"))
+    _prepare_ready_continuation(storage)
+    run = storage.agent_work.claim_resume_run("continuation-1", user_id="user-1", session_id="session-1")
+    if status == "running":
+        storage.agent_work.start_resume_run(run["resume_run_id"])
+    manager = AgentResumeRunManager(storage=storage, background_work_coordinator=object())
+    started = []
+    monkeypatch.setattr(manager, "start", started.append)
+    manager.recover_incomplete_runs()
+    recovered = storage.agent_work.get_resume_run(run["resume_run_id"])
+    if status == "running":
+        assert recovered["status"] == "indeterminate" and recovered["error_code"] == "resume_process_restarted"
+        assert started == []
+    elif mode == "jwt":
+        assert recovered["status"] == "failed" and recovered["error_code"] == "authentication_context_lost"
+        assert started == []
+    else:
+        assert started == [run["resume_run_id"]]

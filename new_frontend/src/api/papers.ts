@@ -1,4 +1,5 @@
 import request from './request'
+import { apiFetch } from './auth'
 import { ApiError, normalizeApiError, parseFetchErrorResponse } from './errors'
 import type {
   Paper,
@@ -1578,7 +1579,7 @@ export async function qaPaperStream(
   }
 
   try {
-    const response = await fetch(`/api/paper/${arxivId}/qa/stream`, {
+    const response = await apiFetch(`/paper/${arxivId}/qa/stream`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

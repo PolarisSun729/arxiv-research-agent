@@ -9,6 +9,10 @@ An engineering-oriented research agent for academic paper discovery, evidence-gr
 
 > 本仓库是 Zhiyuan Sun 的公开作品展示项目，重点展示 Agent Runtime、RAG 链路和大模型应用工程能力。项目已建立工程回归测试与 CI，但尚未发布系统性的 Agent/RAG 效果评测结果。
 
+默认使用 JWT 账号登录，已实现角色权限、用户日配额、会话撤销、用户审计，以及本人会话、笔记、偏好和画像的访问隔离；论文与索引仍共享。启动前需配置独立签名密钥并创建初始管理员，公网继续使用 HTTPS、实际前端 Origin 和持久化 Redis。完整步骤与边界见 [第三阶段安全部署说明](docs/SECURITY_STAGE3_PLAN.md)。签名密钥不发给浏览器，也不能写入任何 `VITE_` 变量；仅显式 `AUTH_MODE=api_key` 时保留前两阶段的受信任团队兼容模式。
+
+新环境使用 [安全初始化脚本](scripts/init_security.py) 生成独立凭据：`--profile development` 写开发 `.env`，`--profile production` 写 `.env.production`。生产模板采用 `arxiv.001769.xyz`，域名解析、HTTPS 证书和存储启动步骤见 [部署指南](docs/DEPLOYMENT.md)。已有配置不会被覆盖。
+
 ---
 
 ## 项目定位
@@ -261,23 +265,22 @@ python scripts/check_quality.py
 - arXiv 在线访问能力，或已经同步的本地 OAI 元数据；
 - 需要论文问答时，在本地下载并构建对应论文索引。
 
-使用 DashScope 默认模型链路时，可在当前 PowerShell 会话中设置：
+使用 DashScope 默认模型链路时，先在新环境生成私有开发配置：
 
 ~~~powershell
-$env:ALIYUN_API_KEY = Read-Host "DashScope API Key"
-$env:MILVUS_URI = "http://127.0.0.1:19530"
-$env:BACKEND_SERVICE_LOAD_MODE = "lazy"
-
-# 没有本地 OAI 数据时，可临时使用 arXiv 在线 API。
-$env:ARXIV_DATA_SOURCE = "api"
-
-# 能够直连 arXiv 时设为空；否则填写本机可用代理。
-$env:ARXIV_PROXY_URL = ""
+conda activate new_rag
+python scripts/init_security.py --profile development
 ~~~
 
-凭证只通过环境变量注入，不要写入源码或提交到 Git。OpenAI、DeepSeek 等其他服务必须显式配置各自的 API Key，不能复用阿里云凭证。
+在生成的 `.env` 中填写 `ALIYUN_API_KEY`，按需调整 `MILVUS_URI` 和 `ARXIV_PROXY_URL`。已有 `.env` 或签名文件会保留；不要重新生成签名，也不要同时填写 `JWT_SECRET_KEY` 和 `JWT_SECRET_FILE`。配置由后端读取，任何真实凭据都不能提交到 Git 或写入前端。OpenAI、DeepSeek 等其他服务必须使用各自的 API Key。
 
-启动后端：
+首次运行先在仓库根目录创建管理员，密码通过隐藏输入读取。使用 `.env` 时可添加 `--env-file .env`；认证数据库配置必须与后端一致。
+
+~~~powershell
+python scripts/manage_users.py create-admin --username admin --email admin@example.com
+~~~
+
+随后启动后端：
 
 ~~~powershell
 cd backend
@@ -291,7 +294,7 @@ cd new_frontend
 npm run dev
 ~~~
 
-前端开发服务器会将 <code>/api</code> 请求代理到 <code>http://127.0.0.1:8001</code>。
+前端开发服务器会将 <code>/api</code> 请求代理到 <code>http://127.0.0.1:8001</code>。在登录页输入账号密码；管理员可在“用户管理”中创建账号、调整角色和配额，个人配额与修改密码位于“账号与配额”。
 
 运行真实连接体检：
 

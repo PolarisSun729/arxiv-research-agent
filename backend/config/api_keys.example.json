@@ -1,0 +1,13 @@
+{
+  "keys": [
+    {
+      "key_env": "RESEARCH_TEAM_ACCESS_KEY",
+      "name": "研究团队",
+      "rate_limit": "60/minute",
+      "daily_quota": 1000,
+      "enabled": true,
+      "created_at": "2026-09-11",
+      "expires_at": null
+    }
+  ]
+}

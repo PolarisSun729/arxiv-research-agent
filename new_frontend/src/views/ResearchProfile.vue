@@ -4,8 +4,10 @@ import { ElMessage } from 'element-plus'
 import { Refresh, Star, View, Plus, Check, Close } from '@element-plus/icons-vue'
 import { usePaperStore } from '@/stores/paperStore'
 import type { UserResearchProfile } from '@/types/paper'
+import { useUserContext } from '@/composables/useUserContext'
 
 const store = usePaperStore()
+const { canResearch } = useUserContext()
 const saving = ref(false)
 const rebuilding = ref(false)
 const selectedTopic = ref('')
@@ -168,7 +170,7 @@ onUnmounted(() => {
       </div>
       <div class="profile-toolbar__actions">
         <el-button :icon="Refresh" @click="loadDetail">刷新</el-button>
-        <el-button type="primary" :icon="Refresh" :loading="rebuilding" @click="handleRebuild">重新生成</el-button>
+        <el-button v-if="canResearch" type="primary" :icon="Refresh" :loading="rebuilding" @click="handleRebuild">重新生成</el-button>
       </div>
     </section>
 

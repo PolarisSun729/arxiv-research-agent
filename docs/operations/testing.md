@@ -153,6 +153,19 @@ These tests exercise real research request/result models, graph execution and te
 
 The 12 smoke cases currently lack manual answerability/evidence/reference-answer labels. `--validate-only` without `--allow-unlabeled` correctly exits nonzero; neither validation command calls a model. A golden runner invocation without `--validate-only` uses the real research engine and stays outside automated tests. See [Evaluation](../capabilities/evaluation.md) for labels, metrics and baseline requirements.
 
+### 3.9 三阶段安全与部署初始化
+
+使用 [隔离入口](../../scripts/test_security.py)，它为认证/业务 SQLite、审计、trace、缓存和合成凭据建立独立临时目录，阻止读取开发/生产 dotenv 和回退打开默认账号库。测试生成的临时 dotenv 仍允许读取，以覆盖用户管理 CLI。默认包含三阶段 API 测试与安全初始化测试；`--full` 包含全部后端离线回归。
+
+```powershell
+conda activate new_rag
+python scripts/test_security.py
+python scripts/test_security.py -k "redact or notes_markdown_export"
+python scripts/test_security.py --full
+```
+
+Linux/Git Bash 可用 `bash test_security.sh`，或通过 `SECURITY_TEST_PYTHON` 指定解释器。脱敏性能和匿名长字段回归使用有界子进程，避免错误正则挂死测试；SSE 回归验证跨分片凭据及普通文本完整性。默认回归使用模拟 Redis；实际容器持久化、TLS 和付费模型验收需要另行执行，不能用离线通过代替。
+
 ## 4. Frequently used targeted commands
 
 ### Agent tests

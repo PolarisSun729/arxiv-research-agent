@@ -2,25 +2,34 @@
 import { computed, ref } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { User } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 import { useUserContext } from '@/composables/useUserContext'
+import { currentUser, logout, ROLE_LABELS } from '@/api/auth'
+import { getErrorMessage } from '@/api/errors'
 
 const router = useRouter()
 const route = useRoute()
 const userContext = useUserContext()
 const collapsed = ref(false)
 const debugRoutesEnabled = import.meta.env.VITE_ENABLE_DEBUG_ROUTES === 'true'
-const currentUserId = computed(() => userContext.userId.value)
+const currentUserLabel = computed(() => currentUser.value ? `${currentUser.value.username} · ${ROLE_LABELS[currentUser.value.role]}` : userContext.displayName.value)
+
+async function handleLogout() {
+  try {
+    await logout()
+    // 撤销成功后重新加载，释放已有会话和页面缓存，后退也会重新经过登录守卫。
+    window.location.assign('/login')
+  } catch (error) {
+    ElMessage.error(getErrorMessage(error, '退出失败，请重试'))
+  }
+}
 
 function handleMenuClick(path: string) {
   router.push(path)
 }
 
 function handleUserClick() {
-  // 保留当前路径作为切换身份后的回跳地址，避免用户在推荐或画像页切换账号后丢失上下文。
-  router.push({
-    path: '/login',
-    query: route.path === '/login' ? {} : { redirect: route.fullPath }
-  })
+  router.push(userContext.isDemoMode.value || !currentUser.value ? '/login' : '/account')
 }
 </script>
 
@@ -54,7 +63,7 @@ function handleUserClick() {
           <span>论文搜索</span>
         </el-menu-item>
 
-        <el-menu-item index="/agent-search" class="menu-item-agent" @click="handleMenuClick('/agent-search')">
+        <el-menu-item v-if="userContext.canResearch.value" index="/agent-search" class="menu-item-agent" @click="handleMenuClick('/agent-search')">
           <span class="menu-icon-badge badge-agent">AI</span>
           <span>Agent 搜索</span>
         </el-menu-item>
@@ -74,7 +83,12 @@ function handleUserClick() {
           <span>已标记论文</span>
         </el-menu-item>
 
-        <el-menu-item v-if="debugRoutesEnabled" index="/chunks" class="menu-item-doc" @click="handleMenuClick('/chunks')">
+        <el-menu-item v-if="currentUser?.role === 'admin'" index="/admin/users" @click="handleMenuClick('/admin/users')">
+          <span class="menu-icon-badge badge-profile">👥</span>
+          <span>账号管理</span>
+        </el-menu-item>
+
+        <el-menu-item v-if="debugRoutesEnabled && userContext.isAdmin.value" index="/chunks" class="menu-item-doc" @click="handleMenuClick('/chunks')">
           <span class="menu-icon-badge badge-doc">📄</span>
           <span>调试切片</span>
         </el-menu-item>
@@ -90,12 +104,13 @@ function handleUserClick() {
         <button class="user-switch" type="button" @click="handleUserClick">
           <el-icon><User /></el-icon>
           <span class="user-switch__label">当前用户</span>
-          <span class="user-switch__id">{{ currentUserId }}</span>
+          <span class="user-switch__id">{{ currentUserLabel }}</span>
         </button>
+        <el-button v-if="route.path !== '/login'" text @click="handleLogout">退出</el-button>
       </el-header>
 
       <el-main class="app-content">
-        <router-view />
+        <router-view :key="userContext.userId.value" />
       </el-main>
     </el-container>
   </el-container>

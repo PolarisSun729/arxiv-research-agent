@@ -9,23 +9,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 from utils.config import get_backend_logging_runtime_config
+from utils.secret_redaction import install_log_redaction, is_secret_field, redact_sensitive_value, redact_text
 
 
-_SECRET_KEY_PARTS = (
-    "api_key",
-    "apikey",
-    "authorization",
-    "cookie",
-    "password",
-    "secret",
-    "token",
-)
 _SAFE_EVENT_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 def configure_backend_logging(config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """统一配置后端 CMD 日志层级，并允许按 logger 前缀局部打开 DEBUG。"""
     runtime = dict(config or get_backend_logging_runtime_config())
+    install_log_redaction()
     level_name = str(runtime.get("level") or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     logging.basicConfig(
@@ -44,25 +37,13 @@ def _runtime_config() -> Dict[str, Any]:
 
 
 def _should_redact_key(key: Any, *, config: Mapping[str, Any]) -> bool:
-    if not bool(config.get("redact_secrets", True)):
-        return False
-    normalized = str(key or "").lower()
-    return any(part in normalized for part in _SECRET_KEY_PARTS)
+    # 保留调用签名，但不允许旧的 redact_secrets=False 绕过部署后的密钥保护。
+    return is_secret_field(key)
 
 
 def redact_log_value(value: Any, *, config: Optional[Mapping[str, Any]] = None) -> Any:
-    """递归脱敏密钥类字段；用户问题和模型回答作为普通文本保留原意。"""
-    runtime = dict(config or _runtime_config())
-    if isinstance(value, Mapping):
-        redacted: Dict[str, Any] = {}
-        for key, item in value.items():
-            redacted[str(key)] = "***REDACTED***" if _should_redact_key(key, config=runtime) else redact_log_value(item, config=runtime)
-        return redacted
-    if isinstance(value, list):
-        return [redact_log_value(item, config=runtime) for item in value]
-    if isinstance(value, tuple):
-        return [redact_log_value(item, config=runtime) for item in value]
-    return value
+    """递归脱敏字段和文本中的凭据，完整 trace 与控制台使用相同规则。"""
+    return redact_sensitive_value(value)
 
 
 def _to_log_text(value: Any, *, config: Mapping[str, Any]) -> str:
@@ -74,7 +55,7 @@ def _to_log_text(value: Any, *, config: Mapping[str, Any]) -> str:
             text = json.dumps(safe_value, ensure_ascii=False, sort_keys=True, default=str)
         except Exception:
             text = str(safe_value)
-    return text.replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n")
+    return redact_text(text).replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n")
 
 
 def format_log_preview(value: Any, *, limit: Optional[int] = None, config: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
@@ -115,6 +96,8 @@ def format_log_kv(**fields: Any) -> str:
     for key, value in fields.items():
         if value in (None, "", [], {}):
             continue
+        if _should_redact_key(key, config=runtime):
+            value = "***REDACTED***"
         if key in {"input", "output"}:
             preview = format_log_preview(value, config=runtime)
             parts.append(f"{key}_preview={_format_scalar(preview['preview'], config=runtime)}")
