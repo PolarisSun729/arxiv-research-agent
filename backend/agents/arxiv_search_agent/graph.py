@@ -410,11 +410,17 @@ def build_arxiv_search_graph(
     """
     graph = StateGraph(AgentState)
 
-    graph.add_node("parse_search_request", lambda state: parse_search_request(state, generation_service=generation_service))
-    graph.add_node("build_goal", lambda state: build_goal_node(state, generation_service=generation_service))
-    graph.add_node("build_plan", build_plan_node)
-    graph.add_node("select_next_step", lambda state: select_next_step_node(state, runtime_checkpoint_store=runtime_checkpoint_store))
-    graph.add_node(
+    from auth.tool_access import bind_graph_node
+
+    def add_node(name, node):
+        # LangGraph 的节点可能在线程池中运行；闭包恢复身份后再执行节点，不能依赖隐式线程继承。
+        graph.add_node(name, bind_graph_node(node))
+
+    add_node("parse_search_request", lambda state: parse_search_request(state, generation_service=generation_service))
+    add_node("build_goal", lambda state: build_goal_node(state, generation_service=generation_service))
+    add_node("build_plan", build_plan_node)
+    add_node("select_next_step", lambda state: select_next_step_node(state, runtime_checkpoint_store=runtime_checkpoint_store))
+    add_node(
         "execute_step",
         lambda state: execute_step_node(
             state,
@@ -423,11 +429,11 @@ def build_arxiv_search_graph(
             background_work_coordinator=background_work_coordinator,
         ),
     )
-    graph.add_node("observe_step", lambda state: observe_step_node(state, runtime_checkpoint_store=runtime_checkpoint_store))
-    graph.add_node("route_after_observation", route_after_observation_node)
-    graph.add_node("replan", lambda state: replan_node(state, runtime_checkpoint_store=runtime_checkpoint_store))
-    graph.add_node("finalize", lambda state: finalize_node(state, runtime_checkpoint_store=runtime_checkpoint_store))
-    graph.add_node("error_finalize", error_finalize_node)
+    add_node("observe_step", lambda state: observe_step_node(state, runtime_checkpoint_store=runtime_checkpoint_store))
+    add_node("route_after_observation", route_after_observation_node)
+    add_node("replan", lambda state: replan_node(state, runtime_checkpoint_store=runtime_checkpoint_store))
+    add_node("finalize", lambda state: finalize_node(state, runtime_checkpoint_store=runtime_checkpoint_store))
+    add_node("error_finalize", error_finalize_node)
 
     graph.add_edge(START, "parse_search_request")
     graph.add_edge("parse_search_request", "build_goal")

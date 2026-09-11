@@ -164,6 +164,17 @@ celerybeat.pid
 
 # Environments
 .env
+# 安全审计和真实密钥配置仅保留在部署环境，示例配置可以提交。
+logs/
+/backend/config/api_keys.json
+# JWT 签名材料、账号库与 SQLite 旁路文件不得进入版本控制。
+/backend/data/auth/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-wal
+*.db-shm
+*.jwt-secret
 .venv
 env/
 venv/

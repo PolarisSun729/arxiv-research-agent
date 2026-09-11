@@ -1,0 +1,48 @@
+[Unit]
+Description=arXiv Research Agent Backend
+Documentation=https://github.com/PolarisSun729/arxiv-research-agent
+After=network.target
+
+[Service]
+Type=notify
+User=REPLACE_WITH_YOUR_USERNAME
+Group=REPLACE_WITH_YOUR_USERNAME
+WorkingDirectory=/opt/arxiv-research-agent/backend
+EnvironmentFile=/opt/arxiv-research-agent/.env.production
+
+# 默认单 worker 适合小型部署；公网限额使用持久化 Redis，扩展 worker 时审计改写 stdout。
+ExecStart=/opt/arxiv-research-agent/.venv/bin/gunicorn main:app \
+    -w 1 \
+    -k uvicorn.workers.UvicornWorker \
+    -b 127.0.0.1:8001 \
+    --forwarded-allow-ips "" \
+    --timeout 120 \
+    --access-logfile /dev/null \
+    --error-logfile - \
+    --log-level info
+
+# 禁止 Uvicorn 在入口防护之前改写 TCP 对端；来源 IP 和协议由应用的可信代理名单统一解释。
+Environment="FORWARDED_ALLOW_IPS="
+# 访问审计由应用中间件输出至 journal，避免额外记录含查询参数的原始访问行。
+
+# 自动重启配置
+Restart=always
+RestartSec=10
+
+# 资源限制（适配 2GB 内存服务器）
+MemoryMax=1.5G
+MemoryHigh=1.2G
+
+# 安全增强
+NoNewPrivileges=true
+PrivateTmp=true
+# 认证库、WAL、日志和后台产物继承私有权限；多个 worker 必须使用同一认证库和 Redis。
+UMask=0077
+
+# 日志配置
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arxiv-agent
+
+[Install]
+WantedBy=multi-user.target

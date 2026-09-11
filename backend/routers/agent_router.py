@@ -20,6 +20,8 @@ from dependencies import (
     get_request_actor,
 )
 from services.storage.sqlite.stores.agent_work import AgentWorkConflict
+from auth.ownership import prepare_agent_request
+from utils.secret_redaction import redact_sensitive_value
 
 try:
     from agents.arxiv_search_agent import (
@@ -55,12 +57,16 @@ def _agent_work_http_error(exc: AgentWorkConflict) -> HTTPException:
 
 
 def _resume_sse(event_name: str, payload: dict) -> str:
-    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    # SSE 绕过普通 JSONResponse，恢复事件必须在逐条序列化时使用相同的脱敏边界。
+    return f"event: {event_name}\ndata: {json.dumps(redact_sensitive_value(payload), ensure_ascii=False)}\n\n"
 
 
 @router.post("/chat", response_model=ArxivSearchResponse)
 async def agent_chat_endpoint(request: ArxivSearchRequest):
     """执行一次完整 Agent 对话，并一次性返回结果。"""
+    from auth.context import current_auth
+    if current_auth.get() is not None:
+        prepare_agent_request(request, get_agent_session_store())
     logger.debug("Running agent chat for user_id=%s session_id=%s", request.user_id, request.session_id)
     return run_arxiv_search_agent(request)
 
@@ -68,6 +74,9 @@ async def agent_chat_endpoint(request: ArxivSearchRequest):
 @router.post("/chat/stream")
 async def agent_chat_stream_endpoint(request: ArxivSearchRequest) -> StreamingResponse:
     """流式执行 Agent；交互恢复仍通过请求中的结构化 resume 字段完成。"""
+    from auth.context import current_auth
+    if current_auth.get() is not None:
+        prepare_agent_request(request, get_agent_session_store())
     logger.debug("Running agent chat stream for user_id=%s session_id=%s", request.user_id, request.session_id)
     return stream_arxiv_search_agent(request)
 
@@ -116,7 +125,7 @@ async def list_active_agent_work_continuations(
     actor: RequestActor = Depends(get_request_actor),
     service=Depends(get_agent_work_continuation_service),
 ):
-    """返回当前 demo actor 可见的后台任务卡；响应不暴露 checkpoint、grant 或工具参数。"""
+    """返回当前已认证用户可见的后台任务卡；响应不暴露 checkpoint、grant 或工具参数。"""
     return {"items": service.list_active(user_id=actor.user_id, session_id=session_id)}
 
 

@@ -12,6 +12,9 @@ import services.embedding.embedding_service as embedding_service_module
 from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
 
 
+_RETRY_TEST_NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
 class _DisabledBuildCache:
     def get_embedding(self, **_kwargs):
         return None
@@ -185,11 +188,18 @@ def test_create_embeddings_caps_retry_after_at_thirty_seconds(monkeypatch) -> No
 @pytest.mark.parametrize(
     ("retry_after", "expected_delay"),
     [
-        (format_datetime(datetime.now(timezone.utc) + timedelta(minutes=5), usegmt=True), 30.0),
+        (format_datetime(_RETRY_TEST_NOW + timedelta(minutes=5), usegmt=True), 30.0),
         ("invalid-retry-after", 1.0),
     ],
 )
 def test_create_embeddings_handles_retry_after_variants(monkeypatch, retry_after: str, expected_delay: float) -> None:
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _RETRY_TEST_NOW.astimezone(tz) if tz is not None else _RETRY_TEST_NOW.replace(tzinfo=None)
+
+    # 参数在收集阶段生成；固定服务时钟，避免全量测试耗时缩短 Retry-After 的剩余等待时间。
+    monkeypatch.setattr(embedding_service_module, "datetime", FixedDatetime)
     input_data, config = _build_public_embedding_request()
     post_results = [
         _ErrorResponse(503, {"Retry-After": retry_after}),

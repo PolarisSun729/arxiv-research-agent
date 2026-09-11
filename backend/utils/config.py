@@ -1,14 +1,27 @@
 ﻿import os
+import platform
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict
+
+from dotenv import load_dotenv
 
 from utils.storage_paths import BACKEND_DATA_ROOT, resolve_storage_path
 
 
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent.parent
+
+# 与启动目录无关地加载配置：进程环境优先，其次根目录 .env，最后 backend/.env。
+# 必须在各项配置首次读取之前完成，否则 API 认证与模型客户端可能拿到不同的环境值。
+load_dotenv(REPO_ROOT / ".env", override=False, encoding="utf-8-sig")
+load_dotenv(REPO_ROOT / "backend" / ".env", override=False, encoding="utf-8-sig")
+
 DEFAULT_RECOMMENDATION_CONCEPT_CACHE_VERSION = "llm_paper_evidence_v1"
+
+# 平台检测：自动适配 Milvus 配置
+IS_WINDOWS = platform.system() == "Windows"
+IS_LINUX = platform.system() == "Linux"
 
 
 class VectorDBProvider(str, Enum):
@@ -84,8 +97,8 @@ BACKEND_LOGGING_CONFIG: Dict[str, Any] = {
         "BACKEND_REQUEST_TRACE_DIR",
         str(REPO_ROOT / "temp" / "backend-request-traces"),
     ),
-    # 日志和 trace 共用脱敏策略，避免 CMD 安全但本地 trace 泄漏密钥类字段。
-    "redact_secrets": _env_bool("BACKEND_LOG_REDACT_SECRETS", True),
+    # 密钥脱敏是固定安全边界，调高日志级别或旧环境开关都不能关闭。
+    "redact_secrets": True,
 }
 
 DOCLING_CONFIG: Dict[str, Any] = {
@@ -108,8 +121,26 @@ DOCLING_CONFIG: Dict[str, Any] = {
     "same_column_tolerance": float(_env_str("DOCLING_SAME_COLUMN_TOLERANCE", "80.0")),
 }
 
+# Milvus 平台自适应配置
+# Windows: 使用完整 Milvus Standalone (Docker)
+# Linux: 使用轻量级 Milvus Lite (本地文件)
+def _get_default_milvus_uri() -> str:
+    """根据操作系统返回默认 Milvus URI"""
+    # 优先使用环境变量
+    env_uri = _env_str("MILVUS_URI", "")
+    if env_uri:
+        return env_uri
+
+    # Windows 默认使用完整 Milvus
+    if IS_WINDOWS:
+        return "http://localhost:19530"
+
+    # Linux 默认使用 Milvus Lite
+    milvus_lite_path = BACKEND_DATA_ROOT / "milvus_lite.db"
+    return str(milvus_lite_path)
+
 MILVUS_CONFIG: Dict[str, Any] = {
-    "uri": _env_str("MILVUS_URI", "http://localhost:19530"),
+    "uri": _get_default_milvus_uri(),
     "index_types": {
         "flat": "FLAT",
         "ivf_flat": "IVF_FLAT",
@@ -811,6 +842,17 @@ def get_memory_runtime_config() -> Dict[str, Any]:
 
 
 def get_default_user_id() -> str:
+    from auth.context import authenticated_user_id
+
+    # 请求上下文的身份先于演示配置，避免省略 user_id 时读写到共享的 local_user 数据。
+    actor_id = authenticated_user_id()
+    if actor_id:
+        return actor_id
+    return get_legacy_default_user_id()
+
+
+def get_legacy_default_user_id() -> str:
+    """仅供本地兼容常量使用，不能在模块导入时捕获第一个 JWT 请求的身份。"""
     return str(USER_CONFIG["default_user_id"] or "local_user").strip() or "local_user"
 
 

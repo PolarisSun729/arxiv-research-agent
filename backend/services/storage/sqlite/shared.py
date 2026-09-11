@@ -1,10 +1,10 @@
 import logging
 
-from utils.config import get_default_user_id
+from utils.config import get_legacy_default_user_id
 
 logger = logging.getLogger("services.storage.sqlite")
 
-DEFAULT_USER_ID = get_default_user_id()
+DEFAULT_USER_ID = get_legacy_default_user_id()
 
 PROFILE_BUILD_VERSION = "research_profile_v2"
 PROFILE_EXTRACTOR_VERSION = "llm_paper_evidence_v1"

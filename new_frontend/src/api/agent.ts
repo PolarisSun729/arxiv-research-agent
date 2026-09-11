@@ -1,4 +1,5 @@
 import request from './request'
+import { apiFetch } from './auth'
 import { ApiError, normalizeApiError, parseFetchErrorResponse } from './errors'
 import type {
   AgentGraphResponse,
@@ -71,7 +72,7 @@ export async function streamAgentChat(
   handlers: AgentStreamHandlers = {}
 ): Promise<ArxivSearchResponse> {
   const requestPayload = withResolvedUserId(payload)
-  const response = await fetch('/api/agent/chat/stream', {
+  const response = await apiFetch('/agent/chat/stream', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -201,8 +202,8 @@ export async function streamAgentWorkContinuationResume(
   handlers: AgentResumeStreamHandlers = {}
 ): Promise<ArxivSearchResponse> {
   const params = new URLSearchParams({ user_id: getCurrentUserId(), session_id: sessionId })
-  const response = await fetch(
-    `/api/agent/work-continuations/${encodeURIComponent(continuationId)}/resume/stream?${params.toString()}`,
+  const response = await apiFetch(
+    `/agent/work-continuations/${encodeURIComponent(continuationId)}/resume/stream?${params.toString()}`,
     { method: 'POST', headers: { Accept: 'text/event-stream' }, signal: handlers.signal }
   )
   if (!response.ok) throw await parseFetchErrorResponse(response, 'Agent 恢复失败')

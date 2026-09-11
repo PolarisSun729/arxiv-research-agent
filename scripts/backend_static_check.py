@@ -4,6 +4,7 @@ import argparse
 import importlib
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -159,6 +160,9 @@ def _prepare_environment() -> None:
     # 静态检查只验证导入边界，不允许借由 FastAPI preload 去实例化 Milvus、模型或远程客户端。
     os.environ.setdefault("RAG_QUALITY_GATE", "offline")
     os.environ.setdefault("BACKEND_SERVICE_LOAD_MODE", "lazy")
+    # 静态检查不会提供服务；只在当前进程生成临时凭据，保证无生产密钥的 CI 也能检查 main 导入。
+    os.environ.setdefault("AUTH_MODE", "api_key")
+    os.environ.setdefault("BACKEND_API_KEYS", secrets.token_urlsafe(32))
     # import-smoke 只验证模块边界；强制使用内存 checkpoint，避免旧本地 SQLite schema 影响静态检查。
     os.environ["AGENT_RUNTIME_CHECKPOINT_BACKEND"] = "memory"
     for path in (str(REPO_ROOT), str(BACKEND_ROOT)):

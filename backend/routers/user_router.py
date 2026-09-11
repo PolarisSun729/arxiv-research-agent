@@ -20,6 +20,8 @@ from dependencies import (
 )
 from services.user_behavior_policy import validate_weak_paper_action_type
 from utils.config import get_default_user_id
+from auth.context import bind_user_id, current_auth
+from auth.errors import AuthError
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,12 @@ class ResearchProfileRequest(BaseModel):
     preferred_answer_style: Optional[str] = None
     common_question_types: Optional[list[str]] = None
     representative_papers: Optional[list[str]] = None
+
+
+class InterestVectorRequest(BaseModel):
+    """前端使用对象形式传参，历史调用的单字符串形式在路由边界继续兼容。"""
+
+    user_id: Optional[str] = None
 
 
 class RebuildResearchProfileRequest(BaseModel):
@@ -250,10 +258,13 @@ async def get_user_research_profile_build_job(job_id: str, memory_service=Depend
     """查询画像构建任务状态，前端可据此轮询。"""
     try:
         job = memory_service.get_profile_build_job(job_id)
+        context = current_auth.get()
+        if context and job and job.get("user_id") != context.user_id:
+            raise AuthError("private_resource_not_found")
         if not job:
             raise HTTPException(status_code=404, detail="profile build job not found")
         return {"status": "success", "job": job}
-    except HTTPException:
+    except (HTTPException, AuthError):
         raise
     except Exception as exc:
         logger.error("Error getting profile build job: %s", str(exc))
@@ -396,12 +407,15 @@ async def remove_dislike(
 
 @router.post("/generate-interest-vector")
 async def generate_user_interest_vector(
-    user_id: str = Body(default_factory=get_default_user_id),
+    user_id: str | InterestVectorRequest = Body(default_factory=get_default_user_id),
     recommendation_service=Depends(get_recommendation_service),
 ):
     """根据用户行为与偏好数据重新生成兴趣向量。"""
+    # 两种传参形式都绑定可信身份，不能因兼容标量请求而落回其他用户的数据空间。
+    resolved_user_id = bind_user_id(user_id.user_id if isinstance(user_id, InterestVectorRequest) else user_id,
+                                    fallback=get_default_user_id())
     try:
-        return recommendation_service.generate_user_interest_vector(user_id=user_id)
+        return recommendation_service.generate_user_interest_vector(user_id=resolved_user_id)
     except HTTPException:
         raise
     except Exception as exc:

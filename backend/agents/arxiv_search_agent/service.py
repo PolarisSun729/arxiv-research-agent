@@ -26,6 +26,7 @@ from services.storage.sqlite import StorageContainer
 from services.storage.sqlite.stores import AgentRuntimeCheckpointStore, LangGraphCheckpointStore
 from utils.config import get_memory_runtime_config
 from utils.logging_utils import RequestTrace, info_event
+from utils.secret_redaction import redact_sensitive_value
 
 try:  # pragma: no cover - optional runtime dependency for LLM parsing
     from dependencies import get_generation_service as _get_generation_service
@@ -1375,9 +1376,12 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
 
 def _coerce_request(request: ArxivSearchRequest | Dict[str, Any]) -> ArxivSearchRequest:
     """把请求入参统一规整成 ArxivSearchRequest。"""
-    if isinstance(request, ArxivSearchRequest):
-        return request
-    return ArxivSearchRequest.model_validate(dict(request))
+    normalized = request if isinstance(request, ArxivSearchRequest) else ArxivSearchRequest.model_validate(dict(request))
+    from auth.context import bind_user_id, current_auth
+    if current_auth.get() is not None:
+        # 保留 HTTP 已验证的 session；服务入口再次绑定 user_id，防止内部调用误用演示默认值。
+        normalized.user_id = bind_user_id(normalized.user_id)
+    return normalized
 
 
 def _safe_status(value: Any) -> str:
@@ -1995,7 +1999,8 @@ def _make_stream_event(*, event_type: str, sequence: int, run_id: str, data: Dic
 
 def _sse_event(event: AgentStreamEvent) -> str:
     """把事件对象编码成符合 SSE 协议的字符串。"""
-    return f"event: {event.event_type}\ndata: {json.dumps(event.model_dump(), ensure_ascii=False)}\n\n"
+    # 工具错误和模型输出可能携带诊断信息，流式出口不能绕过普通响应的密钥脱敏。
+    return f"event: {event.event_type}\ndata: {json.dumps(redact_sensitive_value(event.model_dump()), ensure_ascii=False)}\n\n"
 
 
 def _next_sequence(sequence: int) -> int:

@@ -12,11 +12,14 @@ import requests
 import feedparser
 import os
 import json
+from pathlib import Path
+import re
+import tempfile
 import urllib.parse
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
 import random
 
-from services.arxiv.contracts import ArxivRemoteSearchError
+from services.arxiv.contracts import ArxivDownloadRequestError, ArxivRemoteSearchError
 from services.arxiv.arxiv_query_builder import (
     normalize_id_list as _normalize_id_list,
     normalize_text_value as _normalize_text_value,
@@ -24,6 +27,34 @@ from services.arxiv.arxiv_query_builder import (
 )
 from utils.storage_paths import resolve_backend_artifact_path
 logger = logging.getLogger(__name__)
+
+_ARXIV_ID = re.compile(r"(?:[0-9]{4}\.[0-9]{4,5}(?:v[0-9]+)?|[a-z-]+(?:\.[A-Z]{2})?/[0-9]{7}(?:v[0-9]+)?)")
+_PDF_HOSTS = frozenset({"arxiv.org", "www.arxiv.org", "export.arxiv.org"})
+
+
+def _validated_pdf_url(url: str, arxiv_id: str, *, allow_http: bool = False) -> str:
+    """仅接受同一论文的官方 PDF 地址；在联网和读写缓存前封闭 SSRF 与路径穿越入口。"""
+    if not isinstance(arxiv_id, str) or len(arxiv_id) > 100 or not _ARXIV_ID.fullmatch(arxiv_id):
+        raise ArxivDownloadRequestError("Invalid arXiv ID")
+    if not isinstance(url, str) or any(ord(char) <= 32 or ord(char) == 127 for char in url):
+        raise ArxivDownloadRequestError("Invalid arXiv PDF URL")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        valid = (
+            parsed.scheme in ({"http", "https"} if allow_http else {"https"})
+            and parsed.hostname in _PDF_HOSTS
+            and parsed.username is None and parsed.password is None
+            and parsed.port in {None, 443}
+            and parsed.path in {f"/pdf/{arxiv_id}", f"/pdf/{arxiv_id}.pdf"}
+            and not parsed.query and not parsed.fragment
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ArxivDownloadRequestError("PDF URL must reference the same paper on arxiv.org")
+    # 兼容旧 Atom 数据中的 HTTP 链接，但真实传输始终使用 HTTPS；重定向不得降级。
+    return urllib.parse.urlunsplit(("https", parsed.hostname, parsed.path, "", ""))
+
 
 class RateLimitError(Exception):
     """
@@ -60,6 +91,8 @@ class ArxivSearchService:
     }
     
     RATE_LIMIT_SECONDS = 15
+    MAX_PDF_BYTES = 50 * 1024 * 1024
+    MAX_PDF_REDIRECTS = 3
     _last_request_time = 0
     
     def __init__(self, proxy_url: Optional[str] = None):
@@ -309,12 +342,13 @@ class ArxivSearchService:
         logger.debug("Found %s papers out of %s total results", len(papers), result["total_results"])
         return result
     
-    def _make_request_with_retry(self, url: str) -> requests.Response:
+    def _make_request_with_retry(self, url: str, *, pdf_arxiv_id: Optional[str] = None) -> requests.Response:
         """
         带重试机制的 HTTP 请求方法。
 
         参数:
             url (str): 请求 URL。
+            pdf_arxiv_id: PDF 下载时绑定的论文 ID；启用逐跳校验和流式读取。
 
         返回:
             requests.Response: HTTP 响应对象。
@@ -340,9 +374,23 @@ class ArxivSearchService:
         def make_request():
             headers = {"User-Agent": self._get_random_user_agent()}
             
-            response = self.session.get(url, timeout=30, headers=headers)
+            if pdf_arxiv_id is None:
+                response = self.session.get(url, timeout=30, headers=headers)
+            else:
+                target = _validated_pdf_url(url, pdf_arxiv_id)
+                for redirect_count in range(self.MAX_PDF_REDIRECTS + 1):
+                    # requests 默认跟随重定向，会在调用方检查前触达任意目标，因此必须逐跳验证。
+                    response = self.session.get(target, timeout=30, headers=headers, allow_redirects=False, stream=True)
+                    if response.status_code not in {301, 302, 303, 307, 308}:
+                        break
+                    location = response.headers.get("Location", "")
+                    response.close()
+                    if not location or redirect_count == self.MAX_PDF_REDIRECTS:
+                        raise ValueError("Too many or invalid arXiv PDF redirects")
+                    target = _validated_pdf_url(urllib.parse.urljoin(target, location), pdf_arxiv_id)
             
             if response.status_code == 429:
+                response.close()
                 retry_after = int(response.headers.get("Retry-After", 15))
                 logger.warning(f"arXiv API rate limit exceeded. Retrying after {retry_after} seconds...")
                 
@@ -350,7 +398,11 @@ class ArxivSearchService:
                 time.sleep(retry_after)
                 raise RateLimitError(f"HTTP 429: Rate limit exceeded for {url}")
             
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except requests.exceptions.RequestException:
+                response.close()
+                raise
             return response
         
         try:
@@ -443,30 +495,32 @@ class ArxivSearchService:
             保存的文件路径
 
         Raises:
-            ValueError: PDF 验证失败
+            ValueError: ID、地址、大小或 PDF 完整性验证失败
             requests.exceptions.RequestException: 下载失败
         """
-        filename = f"{arxiv_id}.pdf"
-        filepath = os.path.join(self.papers_dir, filename)
+        pdf_url = _validated_pdf_url(pdf_url, arxiv_id, allow_http=True)
+        # 旧式 ID 中的斜杠属于论文标识，不是目录；所有下载统一保存为根目录下的单文件。
+        filename = f"{arxiv_id.replace('/', '_')}.pdf"
+        papers_root = Path(self.papers_dir).resolve()
+        filepath = papers_root / filename
+        if filepath.is_symlink() or filepath.resolve().parent != papers_root:
+            raise ValueError("PDF cache path is outside the configured directory")
 
         # 如果文件已存在，先验证
         if os.path.exists(filepath):
             if self._is_valid_pdf(filepath):
                 logger.debug(f"Valid PDF already exists: {filepath}")
-                return filepath
+                return str(filepath)
             else:
                 logger.warning(f"Existing PDF is invalid, re-downloading: {filepath}")
-                try:
-                    os.remove(filepath)
-                except OSError as e:
-                    logger.error(f"Failed to remove invalid PDF: {e}")
+                # 只有新文件验证成功后才替换缓存，网络失败不能先删除已有内容。
 
-        # 下载到临时文件
-        temp_filepath = f"{filepath}.tmp"
+        temp_filepath = None
+        response = None
 
         try:
             logger.info(f"Downloading PDF from: {pdf_url}")
-            response = self._make_request_with_retry(pdf_url)
+            response = self._make_request_with_retry(pdf_url, pdf_arxiv_id=arxiv_id)
 
             # 检查 HTTP 状态码
             response.raise_for_status()
@@ -478,37 +532,47 @@ class ArxivSearchService:
                     f"Response is not a PDF, got Content-Type: {content_type} for {arxiv_id}"
                 )
 
-            # 写入临时文件
-            with open(temp_filepath, "wb") as f:
-                f.write(response.content)
+            declared_size = response.headers.get("Content-Length")
+            if declared_size is not None and not 0 <= int(declared_size) <= self.MAX_PDF_BYTES:
+                raise ValueError("PDF exceeds the 50 MiB download limit")
+
+            # 独占临时文件避免同篇论文的并发请求互相覆盖；流式计数也覆盖缺失/伪造长度与压缩响应。
+            with tempfile.NamedTemporaryFile(dir=papers_root, prefix=f".{filename}.", suffix=".tmp", delete=False) as f:
+                temp_filepath = f.name
+                received_bytes = 0
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    received_bytes += len(chunk)
+                    if received_bytes > self.MAX_PDF_BYTES:
+                        raise ValueError("PDF exceeds the 50 MiB download limit")
+                    f.write(chunk)
 
             # 验证下载的 PDF
             if not self._is_valid_pdf(temp_filepath):
-                os.remove(temp_filepath)
                 raise ValueError(f"Downloaded file is not a valid PDF: {arxiv_id}")
 
             # 原子性地移动到最终位置
             os.replace(temp_filepath, filepath)
 
             logger.info(f"Successfully downloaded and verified PDF: {filepath}")
-            return filepath
+            return str(filepath)
 
         except requests.exceptions.RequestException as e:
             logger.error(f"Request error when downloading PDF for {arxiv_id}: {e}")
-            if os.path.exists(temp_filepath):
-                try:
-                    os.remove(temp_filepath)
-                except OSError:
-                    pass
             raise
         except Exception as e:
             logger.error(f"Error downloading PDF for {arxiv_id}: {e}")
-            if os.path.exists(temp_filepath):
+            raise
+        finally:
+            if response is not None:
+                response.close()
+            if temp_filepath is not None:
+                # 只清理本次独占创建的临时文件；成功替换后原路径已不存在。
                 try:
                     os.remove(temp_filepath)
-                except OSError:
+                except FileNotFoundError:
                     pass
-            raise
+                except OSError:
+                    logger.warning("Failed to remove temporary arXiv PDF")
     
     def save_search_results(self, search_result: Dict[str, Any]) -> str:
         """

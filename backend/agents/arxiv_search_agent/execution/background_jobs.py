@@ -171,6 +171,9 @@ class PaperQAIndexBackgroundHandler:
             return BackgroundJobSubmission(job_id=preflight.job_id, job=dict(preflight.job), attached=True)
         if preflight.status != "missing":
             raise RuntimeError(f"background_submit_not_allowed:{preflight.status}")
+        from auth.tool_access import authorize_backend_tool
+        # 后台索引走 job_submitter 而非普通工具注册表，同样要检查账号权限并预留论文额度。
+        authorize_backend_tool("build_paper_qa_index", {"arxiv_id": preflight.arxiv_id})
         job = dict(self.job_submitter(preflight.arxiv_id, preflight.loading_method) or {})
         job_id = str(job.get("job_id") or "").strip()
         if not job_id:
