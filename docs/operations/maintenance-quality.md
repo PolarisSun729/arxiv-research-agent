@@ -38,7 +38,8 @@ python scripts/check_quality.py docs
 | `backend` | 后端静态检查、测试和启动烟测 | 改动后端业务。 |
 | `frontend` | 前端测试与生产构建 | 改动前端接口消费或展示。 |
 | `smoke` | 编译、启动烟测和最小前端错误测试 | 快速本地确认。 |
-| 默认或 `ci` | 文档、环境体检、后端、前端的组合检查 | 提交前或 CI。 |
+| `deployment-tests` | 发布包、依赖锁、共享数据和失败回退的离线测试 | 修改部署脚本。 |
+| 默认或 `ci` | 文档、部署测试、环境体检、后端、前端的组合检查 | 提交前或 CI。 |
 
 `doctor-full` 会触及真实依赖，始终保持显式运行；默认门禁只执行离线安全检查。不要为了让质量门禁通过而把网络、模型、向量库或真实 arXiv 调用加回默认流程。
 
@@ -47,6 +48,7 @@ python scripts/check_quality.py docs
 | 修改范围 | 至少验证 | 额外关注 |
 | --- | --- | --- |
 | 文档 | `python scripts/check_docs.py` | 所有链接均指向当前文件或目录。 |
+| CI/CD 与发布脚本 | `python scripts/check_quality.py deployment-tests docs`、`bash -n deploy/publish_ssh.sh` | Linux 真实链接用例、同一 SHA 的构建与发布、持久化目录、失败回退和依赖缓存。 |
 | Router、依赖装配、错误出口 | `python scripts/check_quality.py backend` | 路由注册、错误 payload 和 lazy 启动烟测。 |
 | Agent、计划、确认、恢复 | 后端相关测试与 `backend` 目标 | 两层 checkpoint、确认一次性消费、SSE/projection。 |
 | QA 索引与检索 | 后端相关测试与 `backend` 目标 | 索引版本、任务状态、rerank 降级和上下文预算。 |
@@ -66,3 +68,5 @@ python scripts/check_quality.py docs
 ## CI 约束
 
 GitHub Actions 的质量工作流调用 `python scripts/check_quality.py ci`。因此文档校验与后端/前端质量检查使用同一入口，避免本地规则与 CI 规则漂移。变更质量门禁本身时，必须更新本页、[测试指南](testing.md) 和相关 workflow 的实际行为说明。
+
+质量工作流使用 Debian 12 / Python 3.11 容器、Node.js 22 和 CPU Torch。PR 和单独手动运行检查质量；main 推送由 [release 工作流](../../.github/workflows/deploy.yml) 复用质量门和密钥扫描，开启 `package_release` 后在检查通过时生成离线包。仅 main 且仓库变量 `DEPLOY_ENABLED=true` 才进入 production 部署，发布不取消正在进行的运行。服务器前置条件及开关顺序见 [CI/CD 部署手册](cicd-deployment.md)。不能用本地静态检查或健康接口通过代替完整 Debian 依赖安装和真实业务验收。

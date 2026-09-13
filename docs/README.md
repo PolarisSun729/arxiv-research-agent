@@ -16,6 +16,7 @@
 | 画像、行为信号和推荐排序如何保持语义一致 | [研究画像与推荐](capabilities/research-profile-and-recommendations.md) | [`backend/services/memory/`](../backend/services/memory/)、[`backend/services/recommendation/`](../backend/services/recommendation/) |
 | 修改后应如何验证，以及何时必须同步文档 | [维护与质量](operations/maintenance-quality.md) | [`scripts/check_quality.py`](../scripts/check_quality.py) |
 | 自动化测试的离线边界、分层命令和覆盖率如何维护 | [测试指南](operations/testing.md) | [`backend/tests/`](../backend/tests/) |
+| Debian 12 首次安装、自动发布与回退如何配置 | [CI/CD 部署手册](operations/cicd-deployment.md) | [`deploy/`](../deploy/) |
 
 ## 文档边界
 
@@ -38,5 +39,6 @@
 | 画像层次、行为信号、候选召回、排序或多样性策略 | [研究画像与推荐](capabilities/research-profile-and-recommendations.md) |
 | 校验脚本、CI 编排或验收口径 | [维护与质量](operations/maintenance-quality.md) |
 | 测试分层、离线约束、运行命令或覆盖率口径 | [测试指南](operations/testing.md) |
+| 发布包、服务器目录、运行环境、回退或部署变量 | [CI/CD 部署手册](operations/cicd-deployment.md) |
 
 提交前运行 `python scripts/check_docs.py`。该校验会验证本目录及维护入口文档中的相对 Markdown 链接和代码路径，不访问网络；统一质量门禁也会执行它。
