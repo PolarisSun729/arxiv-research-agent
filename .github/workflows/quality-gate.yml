@@ -1,14 +1,17 @@
 name: quality-gate
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      package_release:
+        description: "质量门通过后生成 Debian 12 离线发布包"
+        type: boolean
+        default: false
 
 concurrency:
-  group: quality-gate-${{ github.ref }}
+  group: quality-gate-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -16,24 +19,25 @@ permissions:
 
 jobs:
   quality-gate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    # 原生 wheel 必须在与目标服务器一致的 glibc/Python 环境中构建。
+    container: python:3.11-bookworm
+    timeout-minutes: 90
     env:
       # 确保 UTF-8 编码以安全输出中文诊断信息
       PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
+      VITE_API_BASE_URL: /api
 
     steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git libgl1 libglib2.0-0 libmagic1
+
       - name: Checkout
         # 固定到已核验的 v4 提交，避免可变标签引入未经审计的供应链变更。
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Set up Python
-        # Python 环境 Action 固定到 v5 当前提交，后续升级需显式审查。
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.12"
-          cache: 'pip'
-          cache-dependency-path: 'requirements.txt'
 
       - name: Set up Node
         # Node 环境 Action 固定到 v4 当前提交，避免标签漂移影响质量门。
@@ -44,7 +48,13 @@ jobs:
           cache-dependency-path: new_frontend/package-lock.json
 
       - name: Install backend dependencies
-        run: python -m pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          # 固定刚安装的 CPU 版本，后续依赖解析不能悄悄把 Torch 换回 CUDA 构建。
+          python -c "from importlib.metadata import version; from pathlib import Path; Path('/tmp/cpu-constraints.txt').write_text(''.join(name + '==' + version(name) + '\n' for name in ('torch', 'torchvision', 'torchaudio')))"
+          python -m pip install -c /tmp/cpu-constraints.txt -r requirements.txt gunicorn milvus-lite
+          python -m pip check
 
       - name: Install frontend dependencies
         working-directory: new_frontend
@@ -52,3 +62,22 @@ jobs:
 
       - name: Run unified quality gate
         run: python scripts/check_quality.py ci
+
+      - name: Build offline release
+        if: inputs.package_release
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: python deploy/package_release.py --commit "$RELEASE_COMMIT"
+
+      - name: Upload tested release
+        if: inputs.package_release
+        # 固定到 v4 提交；包内 wheel 已压缩，关闭二次压缩以减少打包开销。
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: arxiv-release-${{ github.sha }}
+          path: |
+            temp/ci-release/release.tar.gz
+            temp/ci-release/release.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3

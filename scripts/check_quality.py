@@ -60,6 +60,14 @@ def _npm_executable() -> str:
 NPM = _npm_executable()
 
 STAGES: dict[str, Stage] = {
+    "deployment-tests": Stage(
+        id="deployment-tests",
+        title="离线发布与回退测试",
+        command=_python_command(["-m", "unittest", "discover", "-s", "tests/deploy", "-v"]),
+        cwd=REPO_ROOT,
+        display_command="python -m unittest discover -s tests/deploy -v",
+        description="用临时文件和模拟服务验证发布包校验、共享数据、依赖缓存及失败回退，不连接服务器。",
+    ),
     "docs": Stage(
         id="docs",
         title="维护者文档链接检查",
@@ -143,13 +151,13 @@ STAGES: dict[str, Stage] = {
 }
 
 TARGETS: dict[str, list[str]] = {
-    # 默认入口先跑本地环境体检，再进入离线质量检查；full doctor 仍保持显式触发，避免默认流程访问真实外部服务。
-    "all": ["docs", "doctor-basic", "backend-static", "backend-tests", "backend-startup-smoke", "frontend-tests", "frontend-build"],
+    # 统一入口依次验证文档、部署与应用；full doctor 仍保持显式触发，避免默认流程访问真实外部服务。
+    "all": ["docs", "deployment-tests", "doctor-basic", "backend-static", "backend-tests", "backend-startup-smoke", "frontend-tests", "frontend-build"],
     "backend": ["backend-static", "backend-tests", "backend-startup-smoke"],
     "frontend": ["frontend-tests", "frontend-build"],
     "compile": ["backend-compile"],
     "static": ["backend-static"],
-    "ci": ["docs", "doctor-basic", "backend-static", "backend-tests", "backend-startup-smoke", "frontend-tests", "frontend-build"],
+    "ci": ["docs", "deployment-tests", "doctor-basic", "backend-static", "backend-tests", "backend-startup-smoke", "frontend-tests", "frontend-build"],
     "doctor": ["doctor-basic"],
     "docs": ["docs"],
     # smoke 保留为离线轻量入口，用于快速确认语法、后端测试入口和前端最小脚本仍可运行。

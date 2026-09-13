@@ -64,7 +64,7 @@ Recommended repository-level quality gate:
 python scripts/check_quality.py
 ```
 
-The default gate runs basic doctor, backend static checks, backend automated tests, backend startup smoke tests, frontend tests, and frontend build checks, then prints a final summary. It is the preferred command before submitting code because it keeps the offline-safe backend and frontend checks in one place.
+The default gate runs documentation checks, deployment tests, basic doctor, backend static checks, backend automated tests, backend startup smoke tests, frontend tests, and frontend build checks, then prints a final summary. It is the preferred command before submitting code because it keeps the offline-safe backend and frontend checks in one place.
 
 CI uses the same staged gate through `python scripts/check_quality.py ci`. Codex changes should report the exact checks that were run, their pass/fail status, and any environment-related blockers; see [Maintenance and Quality](maintenance-quality.md).
 
@@ -167,6 +167,19 @@ python scripts/test_security.py --full
 Linux/Git Bash 可用 `bash test_security.sh`，或通过 `SECURITY_TEST_PYTHON` 指定解释器。脱敏性能和匿名长字段回归使用有界子进程，避免错误正则挂死测试；SSE 回归验证跨分片凭据及普通文本完整性。默认回归使用模拟 Redis；实际容器持久化、TLS 和付费模型验收需要另行执行，不能用离线通过代替。
 
 ## 4. Frequently used targeted commands
+
+### 发布与回退脚本
+
+在仓库根目录执行：
+
+```bash
+python scripts/check_quality.py deployment-tests docs
+bash -n deploy/publish_ssh.sh
+```
+
+[`tests/deploy/test_release.py`](../../tests/deploy/test_release.py) 只使用标准库、临时文件和模拟 pip/systemd/HTTP，覆盖归档穿越、凭据及数据隔离、wheel 哈希与 CPU 约束、版本切换、缓存和失败回退。跨平台状态测试替换链接边界；真实符号链接测试在不具备相应权限的 Windows 上明确 skip，在 Debian CI 必须运行。该目录没有 pytest 专属用例，因此仅这个阶段使用 `unittest discover`，后端仍使用 pytest。
+
+质量工作流以 Debian 12 / Python 3.11 为构建目标。离线用例不证明实际 wheel 安装、systemd/Nginx/Redis 配置、模型访问或 2GB 容量已经通过；首次服务器验收见 [CI/CD 部署手册](cicd-deployment.md)。
 
 ### Agent tests
 

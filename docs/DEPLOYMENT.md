@@ -2,6 +2,8 @@
 
 本文档说明如何在 Windows 开发环境和 Linux 生产环境之间无缝切换。
 
+**Debian 12 全新服务器及 GitHub 自动发布请优先按 [CI/CD 部署手册](operations/cicd-deployment.md) 操作。** 新流程采用 `current/releases/shared` 目录和专用 systemd 模板；下文保留手工部署说明，不要把两种目录布局混用。
+
 首次启动前按 [第三阶段安全部署说明](SECURITY_STAGE3_PLAN.md) 配置 JWT 签名材料、认证数据库、初始管理员和 `ALLOWED_ORIGINS`。公网继续使用持久化 Redis、可信代理、脱敏审计与 HTTPS；前端使用账号密码登录，任何密钥都不能写入 `VITE_` 变量。会话、笔记、偏好和画像按账号隔离，论文与索引共享；旧 API Key 仅作为显式兼容模式保留。
 
 ---
@@ -160,7 +162,7 @@ python scripts/manage_users.py create-admin --username admin --email admin@00176
 
 后端优先使用进程环境，然后是根 `.env`、`backend/.env`。生产的 `.env.production` **不会由直接执行 `python backend/main.py` 自动加载**：systemd 通过 `EnvironmentFile` 注入它，用户管理命令必须传 `--env-file .env.production`。不要同时保留会覆盖生产配置的旧 shell 环境变量。
 
-初始化脚本拒绝覆盖已有文件，不能用它轮换现有部署。迁移既有配置时逐项补齐；已有 Redis/MinIO 凭据变化必须同步应用和存储服务。当前用户确认没有存量数据或账号，可直接按首次初始化流程部署。
+初始化脚本拒绝覆盖已有文件，不能用它轮换现有部署。迁移既有配置时逐项补齐；已有 Redis/MinIO 凭据变化必须同步应用和存储服务。若保留开发环境的账号与兴趣历史，还需迁移匹配的认证库、业务库及相关资产，不能只创建同名账号。
 
 Linux 默认采用 Milvus Lite，运行 Redis 不需要启动其他容器。若显式使用 Standalone，设置 `MILVUS_URI=http://127.0.0.1:19530`，并用相同 `.env.production` 启动完整 Compose 栈。
 

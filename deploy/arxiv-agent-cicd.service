@@ -1,0 +1,27 @@
+[Unit]
+Description=arXiv Research Agent (CI/CD releases)
+After=network.target redis-server.service
+
+[Service]
+Type=notify
+User=arxiv
+Group=arxiv
+WorkingDirectory=/opt/arxiv-research-agent/current/backend
+EnvironmentFile=/opt/arxiv-research-agent/shared/.env.production
+# 每个发布版本链接到已完成安装的依赖环境，代码回退时依赖也同步回退。
+ExecStart=/opt/arxiv-research-agent/current/.venv/bin/gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker -b 127.0.0.1:8001 --forwarded-allow-ips "" --timeout 120 --access-logfile /dev/null --error-logfile - --log-level info
+Environment="FORWARDED_ALLOW_IPS="
+Restart=on-failure
+RestartSec=5
+MemoryMax=1.5G
+MemoryHigh=1.2G
+NoNewPrivileges=true
+PrivateTmp=true
+# 新产生的账号库、日志和论文资产保持私有；前端静态文件由发布脚本单独赋予读取权限。
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arxiv-agent
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,66 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 发布切换和回退必须完整执行；后续提交排队，不能中断正在更新的服务器。
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    uses: ./.github/workflows/quality-gate.yml
+    with:
+      package_release: ${{ github.ref == 'refs/heads/main' }}
+
+  secrets:
+    uses: ./.github/workflows/secret-scan.yml
+
+  deploy:
+    needs: [quality, secrets]
+    # 首次初始化完成后显式开启；部署关闭时仍运行检查并生成可下载的发布包。
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    environment: production
+    timeout-minutes: 45
+    steps:
+      - name: Checkout tested revision
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Skip superseded revision
+        id: revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          current_head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [[ "$current_head" == "$GITHUB_SHA" ]]; then
+            echo 'current=true' >> "$GITHUB_OUTPUT"
+          else
+            echo '当前 main 已更新，本次只保留检查结果和发布包。' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Download tested release
+        if: steps.revision.outputs.current == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: arxiv-release-${{ github.sha }}
+          path: temp/ci-release
+
+      - name: Deploy over SSH
+        if: steps.revision.outputs.current == 'true'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+        run: bash deploy/publish_ssh.sh

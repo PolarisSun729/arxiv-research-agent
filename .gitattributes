@@ -1,0 +1,5 @@
+# Linux 发布入口和服务配置固定换行，避免 Windows checkout 的 CRLF 破坏远端 Bash 执行。
+deploy/*.sh text eol=lf
+deploy/*.py text eol=lf
+deploy/*.service text eol=lf
+.github/workflows/*.yml text eol=lf

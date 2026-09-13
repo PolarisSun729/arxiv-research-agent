@@ -13,6 +13,8 @@ An engineering-oriented research agent for academic paper discovery, evidence-gr
 
 新环境使用 [安全初始化脚本](scripts/init_security.py) 生成独立凭据：`--profile development` 写开发 `.env`，`--profile production` 写 `.env.production`。生产模板采用 `arxiv.001769.xyz`，域名解析、HTTPS 证书和存储启动步骤见 [部署指南](docs/DEPLOYMENT.md)。已有配置不会被覆盖。
 
+Debian 12 全新服务器的安装、发布目录、GitHub Secrets 和回退步骤见 [CI/CD 部署手册](docs/operations/cicd-deployment.md)。main 推送的自动部署默认关闭；启用前须完成服务器初始化与 Actions 验收。
+
 ---
 
 ## 项目定位
@@ -219,13 +221,13 @@ docs/                          # 架构、运行时和质量门说明
 
 ### 已验证环境
 
-当前版本主要在 Windows 环境开发和验证。GitHub Actions 使用 <code>windows-latest</code>、Python 3.12 和 Node.js 22。
+当前版本主要在 Windows 环境开发和验证。GitHub 质量工作流已配置为 Ubuntu runner 上的 Debian 12 容器（Python 3.11），前端使用 Node.js 22；这让原生 wheel 的构建环境与目标服务器保持一致。
 
 - Python 3.10+
 - Node.js 18+
 - npm 9+
 
-Linux 和 macOS 尚未完成完整兼容性验证，因此当前不将其列为正式支持环境。
+Debian 12 / Python 3.11 是当前 CI/CD 的目标环境，完整依赖安装、真实服务与 2GB 容量仍需在首轮发布中验收。macOS 尚未完成兼容性验证。
 
 ### 1. 离线工程验证
 
