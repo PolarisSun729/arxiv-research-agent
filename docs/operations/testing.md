@@ -181,6 +181,8 @@ bash -n deploy/publish_ssh.sh
 
 质量工作流以 Debian 12 / Python 3.11 为构建目标。离线用例不证明实际 wheel 安装、systemd/Nginx/Redis 配置、模型访问或 2GB 容量已经通过；首次服务器验收见 [CI/CD 部署手册](cicd-deployment.md)。
 
+容器工作流在 Checkout 后显式信任当前工作区，并提前验证 Git 可读取 HEAD。修改这一步时，应在隔离 Git 配置和临时仓库中复现属主不匹配，验证后续进程能读取提交、归档源码，同时确认其他仓库仍被拒绝；普通发布单元测试不能代替这项运行环境检查。
+
 ### Agent tests
 
 ```bash
