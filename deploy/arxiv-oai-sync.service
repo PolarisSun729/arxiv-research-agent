@@ -1,0 +1,18 @@
+[Unit]
+Description=arXiv OAI incremental synchronization
+After=network-online.target arxiv-agent.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=arxiv
+Group=arxiv
+WorkingDirectory=/opt/arxiv-research-agent/current/backend
+EnvironmentFile=-/opt/arxiv-research-agent/shared/.env.production
+ExecStart=/opt/arxiv-research-agent/current/backend/07-arxiv-tools/sync_arxiv_oai_since_last_run.sh
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arxiv-oai-sync

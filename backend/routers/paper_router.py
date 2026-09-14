@@ -27,32 +27,47 @@ from dependencies import (
     get_vector_store_service,
 )
 from utils.config import get_default_user_id
+from utils.storage_paths import ARXIV_OAI_SYNC_META_FILE, ARXIV_OAI_SYNC_STATE_FILE
 
 logger = logging.getLogger(__name__)
 
-TOOLS_DIR = Path(__file__).resolve().parent.parent / "07-arxiv-tools"
-SYNC_STATE_FILE = TOOLS_DIR / "sync_arxiv_oai_since_last_run.state"
-SYNC_META_FILE = TOOLS_DIR / "sync_arxiv_oai_since_last_run.meta.json"
+# 运行状态不随 release 版本切换；backend/data 在生产中由部署器接到 shared/backend/data。
+SYNC_STATE_FILE = ARXIV_OAI_SYNC_STATE_FILE
+SYNC_META_FILE = ARXIV_OAI_SYNC_META_FILE
 
 router = APIRouter(tags=["paper"])
 
 
 def _read_text_file(path: Path) -> Optional[str]:
-    if not path.exists() or not path.is_file():
+    try:
+        if not path.exists() or not path.is_file():
+            return None
+        text = path.read_text(encoding="utf-8").strip()
+        return text or None
+    except (OSError, UnicodeError) as exc:
+        # 状态文件是可选诊断数据；权限或编码异常不能阻断首页看板。
+        logger.warning("Unable to read sync state file %s: %s", path, exc)
         return None
-    text = path.read_text(encoding="utf-8").strip()
-    return text or None
 
 
 def _read_json_file(path: Path) -> Dict[str, Any]:
-    if not path.exists() or not path.is_file():
-        return {}
     try:
+        if not path.exists() or not path.is_file():
+            return {}
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        logger.warning("Invalid JSON in sync metadata file: %s", path)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        # 损坏或短暂不可读的摘要只影响展示，统一回退为空状态。
+        logger.warning("Unable to read sync metadata file %s: %s", path, exc)
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _safe_int(value: Any) -> int:
+    """把外部状态中的计数安全转换为非负整数，防止损坏文件触发 500。"""
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _get_sync_status_payload() -> Dict[str, Any]:
@@ -68,9 +83,9 @@ def _get_sync_status_payload() -> Dict[str, Any]:
         "until_date": meta.get("until_date"),
         "lastSyncRunAt": meta.get("finished_at"),
         "lastSyncedDate": meta_last_successful_until or state_date,
-        "latestSyncNewPapers": int(meta.get("records_written", summary.get("records_written", 0)) or 0),
-        "latestSyncMatchedPapers": int(meta.get("records_matched", summary.get("records_matched", 0)) or 0),
-        "syncErrors": int(meta.get("errors", summary.get("errors", 0)) or 0),
+        "latestSyncNewPapers": _safe_int(meta.get("records_written", summary.get("records_written", 0))),
+        "latestSyncMatchedPapers": _safe_int(meta.get("records_matched", summary.get("records_matched", 0))),
+        "syncErrors": _safe_int(meta.get("errors", summary.get("errors", 0))),
         "syncErrorMessage": meta.get("error_message"),
     }
 

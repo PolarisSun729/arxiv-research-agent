@@ -1,6 +1,7 @@
 import types
 import unittest
 from unittest import mock
+import json
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -152,6 +153,33 @@ class PaperRouterApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["lastSyncedDate"], "2026-06-03")
+
+    def test_sync_status_reads_persistent_files_and_degrades_on_corrupt_values(self) -> None:
+        # 本类的 API 测试默认替换聚合函数；这里恢复真实实现以覆盖文件读取边界。
+        self.sync_patch.stop()
+        self.addCleanup(self.sync_patch.start)
+        with mock.patch.object(paper_router, "SYNC_META_FILE") as meta, mock.patch.object(
+            paper_router, "SYNC_STATE_FILE"
+        ) as state:
+            meta.exists.return_value = True
+            meta.is_file.return_value = True
+            meta.read_text.return_value = json.dumps(
+                {
+                    "status": "success",
+                    "last_successful_until": "2026-09-12",
+                    "records_written": "not-a-number",
+                }
+            )
+            state.exists.return_value = False
+            state.is_file.return_value = False
+            payload = paper_router._get_sync_status_payload()
+
+        self.assertEqual(payload["lastSyncedDate"], "2026-09-12")
+        self.assertEqual(payload["latestSyncNewPapers"], 0)
+
+    def test_sync_status_defaults_live_under_backend_data(self) -> None:
+        self.assertEqual(paper_router.SYNC_STATE_FILE.parent.name, "arxiv-oai-sync")
+        self.assertEqual(paper_router.SYNC_STATE_FILE.parent.parent.name, "data")
 
     def test_add_paper_returns_embedding_metadata(self) -> None:
         response = self.client.post(

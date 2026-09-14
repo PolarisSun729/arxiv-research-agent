@@ -54,7 +54,13 @@ def _build_sync_metadata(
 def _write_sync_metadata(metadata_file: str, payload: Dict[str, Any]) -> None:
     path = Path(metadata_file)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 先写同目录临时文件再替换，避免首页恰好读取到半截 JSON。
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -7,6 +7,9 @@ from pathlib import Path
 
 from services.storage.sqlite import SqliteConnectionProvider
 from utils.storage_paths import (
+    ARXIV_OAI_SYNC_META_FILE,
+    ARXIV_OAI_SYNC_STATE_FILE,
+    BACKEND_ARXIV_OAI_SYNC_ROOT,
     BACKEND_DAILY_ARXIV_ROOT,
     BACKEND_DATA_ROOT,
     BACKEND_EMBEDDED_DOCS_ROOT,
@@ -24,6 +27,26 @@ from utils.storage_paths import (
 
 
 class StoragePathUnitTests(unittest.TestCase):
+    def test_arxiv_oai_sync_state_is_under_backend_runtime_data(self) -> None:
+        """增量同步游标属于运行时数据，生产部署时应随 backend/data 进入 shared。"""
+        self.assertEqual(BACKEND_ARXIV_OAI_SYNC_ROOT.parent, BACKEND_ROOT / "data")
+        self.assertEqual(ARXIV_OAI_SYNC_STATE_FILE.parent, BACKEND_ARXIV_OAI_SYNC_ROOT)
+        self.assertEqual(ARXIV_OAI_SYNC_META_FILE.parent, BACKEND_ARXIV_OAI_SYNC_ROOT)
+
+    def test_incremental_launchers_target_runtime_data_not_tools_directory(self) -> None:
+        tools_dir = BACKEND_ROOT / "07-arxiv-tools"
+        for name in ("sync_arxiv_oai_since_last_run.cmd", "sync_arxiv_oai_since_last_run_count_only.cmd", "sync_arxiv_oai_since_last_run.sh"):
+            content = (tools_dir / name).read_text(encoding="utf-8")
+            self.assertIn("arxiv-oai-sync", content)
+            self.assertNotIn("STATE_FILE=%PROJECT_ROOT%sync_arxiv_oai_since_last_run", content)
+
+    def test_linux_incremental_sync_has_systemd_timer_entrypoint(self) -> None:
+        deploy_dir = REPO_ROOT / "deploy"
+        service = (deploy_dir / "arxiv-oai-sync.service").read_text(encoding="utf-8")
+        timer = (deploy_dir / "arxiv-oai-sync.timer").read_text(encoding="utf-8")
+        self.assertIn("sync_arxiv_oai_since_last_run.sh", service)
+        self.assertIn("OnCalendar=", timer)
+
     def test_relative_path_is_independent_of_current_working_directory(self) -> None:
         original_cwd = Path.cwd()
         try:

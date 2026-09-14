@@ -167,6 +167,10 @@ celerybeat.pid
 # 安全审计和真实密钥配置仅保留在部署环境，示例配置可以提交。
 logs/
 /backend/config/api_keys.json
+# OAI 增量同步游标和摘要是部署运行时状态，统一保存在 backend/data，不进入版本库。
+/backend/data/arxiv-oai-sync/
+/backend/07-arxiv-tools/sync_arxiv_oai_since_last_run*.state
+/backend/07-arxiv-tools/sync_arxiv_oai_since_last_run*.meta.json
 # JWT 签名材料、账号库与 SQLite 旁路文件不得进入版本控制。
 /backend/data/auth/
 *.sqlite3

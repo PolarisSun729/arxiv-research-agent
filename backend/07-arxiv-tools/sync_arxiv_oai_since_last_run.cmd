@@ -5,8 +5,10 @@ rem Double-click launcher for incremental arXiv OAI-PMH sync.
 rem It remembers the last successfully synced full day in a local state file.
 set "PROJECT_ROOT=%~dp0"
 set "CONDA_ENV_NAME=new_rag"
-set "STATE_FILE=%PROJECT_ROOT%sync_arxiv_oai_since_last_run.state"
-set "META_FILE=%PROJECT_ROOT%sync_arxiv_oai_since_last_run.meta.json"
+rem backend/data 在生产 release 中是指向 shared/backend/data 的持久化链接；本地则是 backend/data 目录。
+set "STATE_DIR=%PROJECT_ROOT%..\data\arxiv-oai-sync"
+set "STATE_FILE=%STATE_DIR%\sync_arxiv_oai_since_last_run.state"
+set "META_FILE=%STATE_DIR%\sync_arxiv_oai_since_last_run.meta.json"
 set "INTERVAL_SECONDS=5"
 set "TIMEOUT_SECONDS=60"
 set "MAX_RETRIES=5"
@@ -16,6 +18,7 @@ if not exist "%PROJECT_ROOT%sync_arxiv_oai.py" (
     echo sync_arxiv_oai.py was not found in "%PROJECT_ROOT%".
     exit /b 1
 )
+if not exist "%STATE_DIR%" mkdir "%STATE_DIR%"
 
 for /f %%I in ('powershell -NoProfile -Command "(Get-Date).Date.AddDays(-1).ToString('yyyy-MM-dd')"') do set "YESTERDAY=%%I"
 for /f %%I in ('powershell -NoProfile -Command "(Get-Date).Date.AddDays(-2).ToString('yyyy-MM-dd')"') do set "TWO_DAYS_AGO=%%I"

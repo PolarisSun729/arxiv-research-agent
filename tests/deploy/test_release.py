@@ -136,6 +136,8 @@ class ArchiveTests(TemporaryReleaseTest):
             "backend/config/production.jwt-secret", "backend/config/api_keys.json",
             ".env.production", ".venv/bin/python", "logs/audit.log", "temp/report.json",
             "backend/01-loaded-docs/paper.json", "stray.sqlite3-shm",
+            "backend/07-arxiv-tools/sync_arxiv_oai_since_last_run.state",
+            "backend/07-arxiv-tools/sync_arxiv_oai_since_last_run.meta.json",
         ]
         archive = self.directory / "source.tar"
         with tarfile.open(archive, "w") as stream:
@@ -218,6 +220,7 @@ class DeploymentTests(TemporaryReleaseTest):
         self.assertEqual((self.root / "previous").resolve(), self.old)
         self.assertEqual((active / ".venv").resolve(), environment)
         self.assertEqual((active / "backend/06-database/recommendation.db").read_bytes(), b"existing user history")
+        self.assertEqual((active / "backend/data").resolve(), (self.root / "shared/backend/data").resolve())
         self.assertEqual((self.root / "shared/.env.production").read_text(), "private configuration")
         self.assertFalse((active / ".release/wheels").exists())
         self.assertEqual(json.loads((self.root / "last-deployment.json").read_text())["commit"], COMMIT)
@@ -225,6 +228,24 @@ class DeploymentTests(TemporaryReleaseTest):
         with patch.object(deploy, "install_environment") as install, patch.object(deploy, "SystemdRuntime", return_value=self.runtime):
             self.assertEqual(self.request(archive)["status"], "already_active")
             install.assert_not_called()
+
+    def test_first_new_layout_migrates_legacy_sync_state_without_overwriting_shared(self) -> None:
+        legacy_state = self.old / "backend/07-arxiv-tools"
+        legacy_state.mkdir(parents=True)
+        (legacy_state / "sync_arxiv_oai_since_last_run.state").write_text("2026-09-11\n")
+        (legacy_state / "sync_arxiv_oai_since_last_run.meta.json").write_text('{"records_written": 8}')
+        archive = self.make_archive(self.make_payload(), self.root / "incoming/release.tar.gz")
+        environment = self.root / "venvs/ready"
+        environment.mkdir(parents=True)
+        with patch.object(deploy, "install_environment", return_value=environment), patch.object(deploy, "SystemdRuntime", return_value=self.runtime):
+            self.request(archive)
+        shared_dir = self.root / "shared/backend/data/arxiv-oai-sync"
+        self.assertEqual((shared_dir / "sync_arxiv_oai_since_last_run.state").read_text(), "2026-09-11\n")
+        self.assertEqual(json.loads((shared_dir / "sync_arxiv_oai_since_last_run.meta.json").read_text())["records_written"], 8)
+
+        (shared_dir / "sync_arxiv_oai_since_last_run.state").write_text("2026-09-12\n")
+        deploy.migrate_legacy_sync_state(self.root, self.old)
+        self.assertEqual((shared_dir / "sync_arxiv_oai_since_last_run.state").read_text(), "2026-09-12\n")
 
     def test_failed_install_does_not_switch_or_restart(self) -> None:
         archive = self.make_archive(self.make_payload())

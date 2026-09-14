@@ -14,6 +14,11 @@ LEGACY_DATABASE_ROOT = REPO_ROOT / "06-database"
 BACKEND_VECTOR_STORE_ROOT = BACKEND_ROOT / "03-vector-store"
 BACKEND_GENERATION_RESULTS_ROOT = BACKEND_ROOT / "05-generation-results"
 BACKEND_DAILY_ARXIV_ROOT = BACKEND_ROOT / "06-daily-arxiv-paper"
+# OAI 增量游标和最近一次运行摘要是跨版本保留的运行时状态。
+# 目录位于 backend/data：生产发布时该目录会由 deploy/apply_release.py 链接到 shared/backend/data。
+BACKEND_ARXIV_OAI_SYNC_ROOT = BACKEND_ROOT / "data" / "arxiv-oai-sync"
+ARXIV_OAI_SYNC_STATE_FILE = BACKEND_ARXIV_OAI_SYNC_ROOT / "sync_arxiv_oai_since_last_run.state"
+ARXIV_OAI_SYNC_META_FILE = BACKEND_ARXIV_OAI_SYNC_ROOT / "sync_arxiv_oai_since_last_run.meta.json"
 
 LEGACY_BACKEND_ARTIFACT_ROOTS = {
     "01-loaded-docs": BACKEND_LOADED_DOCS_ROOT,
