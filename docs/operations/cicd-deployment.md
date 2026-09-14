@@ -36,6 +36,7 @@ GitHub 构建经过检查的确切提交，服务器安装同一个发布包。�
 | [SSH 发布入口](../../deploy/publish_ssh.sh) | 使用专用私钥与固定主机指纹上传并触发安装。 |
 | [服务器发布脚本](../../deploy/apply_release.py) | 校验、安装、关联共享数据、切换版本和失败回退。 |
 | [CI/CD systemd 模板](../../deploy/arxiv-agent-cicd.service) | 固定从 `current` 启动，并读取共享生产配置。 |
+| [OAI 同步 service/timer](../../deploy/arxiv-oai-sync.service) / [timer](../../deploy/arxiv-oai-sync.timer) | 每日调用 `current/backend/07-arxiv-tools/sync_arxiv_oai_since_last_run.sh`，状态写入 shared。 |
 | [发布回归测试](../../tests/deploy/test_release.py) | 离线验证归档、依赖、状态流转和持久数据边界。 |
 
 ## 1. 确认服务器与域名
@@ -214,8 +215,15 @@ redis-cli --askpass ping
 sudo install -o root -g root -m 644 \
   /home/arxiv/bootstrap/deploy/arxiv-agent-cicd.service \
   /etc/systemd/system/arxiv-agent.service
+sudo install -o root -g root -m 644 \
+  /home/arxiv/bootstrap/deploy/arxiv-oai-sync.service \
+  /etc/systemd/system/arxiv-oai-sync.service
+sudo install -o root -g root -m 644 \
+  /home/arxiv/bootstrap/deploy/arxiv-oai-sync.timer \
+  /etc/systemd/system/arxiv-oai-sync.timer
 sudo systemctl daemon-reload
 sudo systemctl enable arxiv-agent.service
+sudo systemctl enable --now arxiv-oai-sync.timer
 sudo visudo -f /etc/sudoers.d/arxiv-agent-deploy
 ```
 

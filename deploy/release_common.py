@@ -67,6 +67,9 @@ def is_runtime_path(name: str) -> bool:
         or path.name.endswith((".jwt-secret", ".db", ".sqlite", ".sqlite3",
                                ".db-wal", ".db-shm", ".db-journal", ".sqlite-wal", ".sqlite-shm",
                                ".sqlite3-wal", ".sqlite3-shm", ".sqlite3-journal"))
+        # 即使旧 release 中残留了游标文件，也不能把它重新打进发布包。
+        or (path.name.startswith("sync_arxiv_oai_since_last_run")
+            and path.suffix in {".state", ".json"})
     )
 
 

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily arXiv OAI incremental synchronization
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=15m
+Unit=arxiv-oai-sync.service
+
+[Install]
+WantedBy=timers.target

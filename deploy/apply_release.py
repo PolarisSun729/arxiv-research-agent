@@ -56,6 +56,29 @@ def attach_shared_data(root: Path, release: Path) -> None:
         link.symlink_to(shared, target_is_directory=True)
 
 
+def migrate_legacy_sync_state(root: Path, previous_release: Path | None) -> None:
+    """首次切换到新布局时，把旧 release 中的增量状态搬到 shared（不覆盖已有状态）。"""
+    if previous_release is None:
+        return
+    source_dir = previous_release / "backend/07-arxiv-tools"
+    target_dir = root / "shared/backend/data/arxiv-oai-sync"
+    target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    names = (
+        "sync_arxiv_oai_since_last_run.state",
+        "sync_arxiv_oai_since_last_run.meta.json",
+        "sync_arxiv_oai_since_last_run_count_only.state",
+        "sync_arxiv_oai_since_last_run_count_only.meta.json",
+    )
+    for name in names:
+        source, target = source_dir / name, target_dir / name
+        # shared 中已有人工/历史状态时，以它为准，防止回退；仅迁移普通文件，拒绝链接穿透。
+        if target.exists() or target.is_symlink() or not source.is_file() or source.is_symlink():
+            continue
+        temporary = target.with_name(f".{target.name}.migrate")
+        shutil.copy2(source, temporary)
+        os.replace(temporary, target)
+
+
 def install_environment(root: Path, release: Path, dependency_hash: str) -> Path:
     environments = root / "venvs"
     environments.mkdir(exist_ok=True)
@@ -158,7 +181,7 @@ def apply_release(root: Path, archive: Path, expected_hash: str, commit: str, re
         raise ReleaseError("缺少 shared/.env.production，请先完成服务器初始化。")
     if not (root / ".cicd-layout").is_file():
         raise ReleaseError("目录尚未初始化为 CI/CD 布局，不能覆盖旧部署。")
-    current_release(root)
+    previous_release = current_release(root)
     releases = root / "releases"
     releases.mkdir(exist_ok=True)
     release = releases / release_id
@@ -175,6 +198,7 @@ def apply_release(root: Path, archive: Path, expected_hash: str, commit: str, re
         if path.is_dir():
             path.chmod(0o755)
     environment = install_environment(root, release, manifest["dependency_hash"])
+    migrate_legacy_sync_state(root, previous_release)
     attach_shared_data(root, release)
     (release / ".venv").symlink_to(environment, target_is_directory=True)
     # wheel 只用于安装，删掉本次包内的副本以控制小服务器磁盘占用；运行和回退使用独立 venv。
