@@ -70,3 +70,5 @@ python scripts/check_quality.py docs
 GitHub Actions 的质量工作流调用 `python scripts/check_quality.py ci`。因此文档校验与后端/前端质量检查使用同一入口，避免本地规则与 CI 规则漂移。变更质量门禁本身时，必须更新本页、[测试指南](testing.md) 和相关 workflow 的实际行为说明。
 
 质量工作流使用 Debian 12 / Python 3.11 容器、Node.js 22 和 CPU Torch。PR 和单独手动运行检查质量；main 推送由 [release 工作流](../../.github/workflows/deploy.yml) 复用质量门和密钥扫描，开启 `package_release` 后在检查通过时生成离线包。仅 main 且仓库变量 `DEPLOY_ENABLED=true` 才进入 production 部署，发布不取消正在进行的运行。服务器前置条件及开关顺序见 [CI/CD 部署手册](cicd-deployment.md)。不能用本地静态检查或健康接口通过代替完整 Debian 依赖安装和真实业务验收。
+
+Checkout 后，工作流在后续 shell 步骤使用的 Git 全局配置中仅将 `$GITHUB_WORKSPACE` 加入 `safe.directory`，并立即执行 `rev-parse --verify HEAD`。这使容器用户与挂载目录属主不一致时，发布脚本仍可读取提交号并执行 `git archive`；信任配置有误会在安装依赖前失败。不要把信任范围扩大为 `*`。

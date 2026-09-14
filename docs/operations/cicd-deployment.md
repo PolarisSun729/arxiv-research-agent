@@ -372,6 +372,8 @@ HTTP 首页应跳转 HTTPS，`/health` 成功，匿名 `/api/auth/me` 为 401。
 
 SSH 失败先检查端口、公钥、known_hosts；安装失败查看 Actions 的 pip 输出及磁盘；启动失败查 journald。依赖哈希、环境或发布包有误时脚本会在切换前停止；当前支持环境是 Debian 12 / Python 3.11 / x86_64。
 
+如果 Actions 打包时出现 `fatal: detected dubious ownership`，表示 Git 拒绝访问属主与容器运行用户不一致的工作区。[质量工作流](../../.github/workflows/quality-gate.yml) 在 Checkout 后通过 `git config --global --add safe.directory "$GITHUB_WORKSPACE"` 仅信任本次构建目录，并提前验证 HEAD。修复工作流后，应将修复合入 main 并触发新运行；旧运行的 Re-run 仍使用旧提交，不能取得这次修复。
+
 手工切回上一版前，先把仓库 `DEPLOY_ENABLED` 改为 `false`，等待进行中的发布完成。下面复用同一套服务器锁和健康检查；没有 `previous` 时不能回退：
 
 ```bash
