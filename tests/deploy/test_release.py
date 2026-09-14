@@ -366,6 +366,27 @@ class WheelLockTests(TemporaryReleaseTest):
         with self.assertRaisesRegex(ReleaseError, "CPU Torch"):
             package.lock_wheels(self.directory / "wheels", self.directory / "lock")
 
+    def test_vendored_metadata_is_ignored(self) -> None:
+        """带 vendored 依赖元数据的 wheel 仍应按主包生成锁文件。"""
+        wheels = self.directory / "wheels"
+        wheels.mkdir()
+        path = wheels / "gunicorn-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(path, "w") as stream:
+            stream.writestr(
+                "gunicorn-1.0.dist-info/METADATA",
+                "Metadata-Version: 2.1\nName: gunicorn\nVersion: 1.0\n",
+            )
+            # setuptools 等包会把内部依赖打包进子目录；这些元数据不属于当前 wheel 主包。
+            stream.writestr(
+                "setuptools/_vendor/example-1.0.dist-info/METADATA",
+                "Metadata-Version: 2.1\nName: example\nVersion: 1.0\n",
+            )
+        self.wheel("milvus_lite")
+        self.wheel("torch", "2.9.0+cpu")
+        lock = self.directory / "requirements.lock"
+        self.assertEqual(package.lock_wheels(wheels, lock), 3)
+        self.assertIn("gunicorn==1.0", lock.read_text())
+
 
 class ActivationContractTests(TemporaryReleaseTest):
     """跨平台验证失败状态流转；真实符号链接和数据目录仍由 DeploymentTests 单独验证。"""

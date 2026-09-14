@@ -24,7 +24,12 @@ def lock_wheels(wheels: Path, lock_path: Path) -> int:
     entries = {}
     for wheel in sorted(wheels.glob("*.whl")):
         with zipfile.ZipFile(wheel) as archive:
-            metadata_files = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+            # wheel 可能把 vendored 依赖的 dist-info 放在子目录中（例如 setuptools/_vendor）。
+            # 这里只认归档根目录下的主包元数据，避免把内部依赖误当成多个主包元数据。
+            metadata_files = [
+                name for name in archive.namelist()
+                if name.count("/") == 1 and name.endswith(".dist-info/METADATA")
+            ]
             if len(metadata_files) != 1:
                 raise ReleaseError(f"wheel 元数据不完整：{wheel.name}")
             metadata = email.message_from_bytes(archive.read(metadata_files[0]))
