@@ -158,7 +158,6 @@ def check_python_packages() -> DoctorResult:
         "pydantic": "pydantic",
         "requests": "requests",
         "numpy": "numpy",
-        "pandas": "pandas",
         "langgraph": "langgraph",
         "pymilvus": "pymilvus",
         "openai": "openai",
@@ -554,7 +553,6 @@ def check_pdf_dependencies() -> DoctorResult:
         "PyMuPDF(fitz)": "fitz",
         "docling": "docling",
         "pypdf": "pypdf",
-        "pdfplumber": "pdfplumber",
     }
     missing = [label for label, module in modules.items() if not _importable(module)]
     if missing:
@@ -571,7 +569,7 @@ def check_pdf_dependencies() -> DoctorResult:
     return _result(
         "PDF 解析依赖",
         "PASS",
-        "PyMuPDF、Docling、pypdf、pdfplumber 均可导入。",
+        "PyMuPDF、Docling、pypdf 均可导入。",
         required=True,
         affects_default_tests=False,
         affects_real_runtime=True,
