@@ -1,3 +1,28 @@
+"""后端静态检查：不运行测试、不连外部服务，快速发现语法错误、导入断裂和已删除入口回流。
+
+用途：
+    check_quality.py 的 backend-static 阶段（也包含在 backend / all / ci 目标中），
+    在耗时较长的 pytest 之前运行，尽早暴露低级错误。
+
+用法（任意目录运行均可）：
+    python scripts/backend_static_check.py
+    python scripts/backend_static_check.py --skip-ruff     # 不运行 ruff
+
+依次执行的检查：
+    1. legacy-entry-guard  扫描 backend/、scripts/、frontend/src/、docs/，禁止已删除的旧入口
+                           （旧 VectorStore 实现、旧确认构造函数、旧偏好读取接口等）重新出现；
+    2. compileall          编译 backend 下所有 .py，发现语法错误；
+    3. import-smoke        在 lazy/offline 模式下逐个导入 IMPORT_MODULES 中的关键模块，
+                           发现模块缺失、改名遗漏、循环导入等问题；缺失的重型依赖用桩模块代替；
+    4. ruff-optional       已安装 ruff 时运行 E9/F821/F822/F823（语法错误与未定义名称），未安装则跳过。
+    某一项失败不会中断后续检查，最后统一汇总。
+
+注意：本文件也在扫描范围内，所以禁用字符串都用分段拼接保存；
+给 scripts/ 下文件写注释时同样不能原样写出这些字符串，否则检查会失败。
+
+退出码：全部通过返回 0，否则返回 1。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -19,9 +44,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_ROOT = REPO_ROOT / "backend"
 FRONTEND_SRC_ROOT = REPO_ROOT / "frontend" / "src"
 DOCS_ROOT = REPO_ROOT / "docs"
+# legacy-entry-guard 的扫描目录与文件类型。
 STATIC_LEGACY_SCAN_ROOTS = (BACKEND_ROOT, REPO_ROOT / "scripts", FRONTEND_SRC_ROOT, DOCS_ROOT)
 STATIC_LEGACY_SCAN_SUFFIXES = {".py", ".ts", ".tsx", ".js", ".jsx", ".vue", ".md"}
 REMOVED_VECTOR_STORE_FILENAME = "vector_store_service_" + "langchain.py"
+# 已删除且不允许恢复的文件：(路径, 提示信息)；文件一旦重新出现即判定失败。
 REMOVED_LEGACY_PATHS = (
     (
         BACKEND_ROOT / "services" / "archive" / REMOVED_VECTOR_STORE_FILENAME,
@@ -99,6 +126,8 @@ REMOVED_USER_PREFERENCE_POST_PATTERNS = (
 )
 
 
+# import-smoke 要导入的关键模块（以 backend/ 为根的模块名），覆盖配置、应用入口、路由、服务、工具和 Agent。
+# 新增或改名核心模块时同步更新这里。
 IMPORT_MODULES = [
     "utils.config",
     "core.errors",
@@ -150,6 +179,8 @@ IMPORT_MODULES = [
 
 @dataclass(frozen=True)
 class CheckResult:
+    """单项检查结果；detail 为通过时的说明或失败时的错误信息。"""
+
     name: str
     passed: bool
     duration_seconds: float
@@ -157,6 +188,7 @@ class CheckResult:
 
 
 def _prepare_environment() -> None:
+    """为导入检查准备进程环境：离线/lazy 模式、临时凭据、模块搜索路径和依赖桩。"""
     # 静态检查只验证导入边界，不允许借由 FastAPI preload 去实例化 Milvus、模型或远程客户端。
     os.environ.setdefault("RAG_QUALITY_GATE", "offline")
     os.environ.setdefault("BACKEND_SERVICE_LOAD_MODE", "lazy")
@@ -165,6 +197,7 @@ def _prepare_environment() -> None:
     os.environ.setdefault("BACKEND_API_KEYS", secrets.token_urlsafe(32))
     # import-smoke 只验证模块边界；强制使用内存 checkpoint，避免旧本地 SQLite schema 影响静态检查。
     os.environ["AGENT_RUNTIME_CHECKPOINT_BACKEND"] = "memory"
+    # 后端模块以 backend/ 为根导入（如 services.xxx），同时保留仓库根以支持 backend.xxx 形式。
     for path in (str(REPO_ROOT), str(BACKEND_ROOT)):
         if path not in sys.path:
             sys.path.insert(0, path)
@@ -176,6 +209,10 @@ def _install_optional_dependency_stubs() -> None:
 
     static 阶段的职责是验证本仓库模块能否在 lazy/offline 模式下完成导入，
     不是验证 Milvus、LangGraph、PDF 或本地模型运行时是否真的可用。
+
+    每个桩只在对应模块尚未导入时安装，只提供后端在导入阶段会用到的最小属性，
+    运行时调用这些桩不会有真实效果。注意判断条件是“尚未导入”而不是“未安装”，
+    因此即使本机装了这些依赖，静态检查中实际导入的也是桩。
     """
 
     if "langgraph.graph" not in sys.modules:
@@ -286,6 +323,7 @@ def _install_optional_dependency_stubs() -> None:
 
 
 def _run_named_check(name: str, fn: Callable[[], str]) -> CheckResult:
+    """执行一项检查并计时：fn 正常返回即通过（返回值作为说明），抛出任何异常即失败。"""
     print(f"\n--- {name} ---")
     started_at = time.perf_counter()
     try:
@@ -304,6 +342,7 @@ def _run_named_check(name: str, fn: Callable[[], str]) -> CheckResult:
 
 
 def _check_compileall() -> str:
+    """在子进程中运行 compileall 编译 backend，任何语法错误都会让它以非 0 退出。"""
     completed = subprocess.run(
         [sys.executable, "-m", "compileall", "-q", str(BACKEND_ROOT)],
         cwd=REPO_ROOT,
@@ -319,6 +358,7 @@ def _check_compileall() -> str:
 
 
 def _check_imports() -> str:
+    """逐个导入 IMPORT_MODULES；单个模块失败不中断，收集全部失败后一次性报告。"""
     imported: list[str] = []
     failures: list[str] = []
     for module_name in IMPORT_MODULES:
@@ -335,6 +375,7 @@ def _check_imports() -> str:
 
 
 def _iter_static_legacy_scan_files() -> list[Path]:
+    """列出扫描目录下所有指定后缀的源码与文档文件（跳过 __pycache__），按路径排序。"""
     files: list[Path] = []
     for root in STATIC_LEGACY_SCAN_ROOTS:
         if not root.exists():
@@ -359,11 +400,13 @@ def _check_removed_legacy_entry_markers() -> str:
     用户偏好读取只允许 GET 入口，避免 POST 读取语义回流为伪 upsert。
     """
     hits: list[str] = []
+    # 第一步：已删除的文件不能重新出现。
     for removed_path, guidance in REMOVED_LEGACY_PATHS:
         if removed_path.exists():
             relative_path = removed_path.relative_to(REPO_ROOT)
             hits.append(f"{relative_path}: 禁止恢复已删除路径。{guidance}")
 
+    # 第二步：逐个文件做纯文本匹配（含注释和文档），命中即记录“文件:行号”。
     for path in _iter_static_legacy_scan_files():
         text = path.read_text(encoding="utf-8", errors="replace")
         for marker, guidance in REMOVED_LEGACY_ENTRY_MARKERS:
@@ -390,6 +433,7 @@ def _check_removed_legacy_entry_markers() -> str:
 
 
 def _check_ruff() -> str:
+    """运行 ruff 的少量高价值规则：E9 语法/IO 错误，F821 未定义名称，F822 __all__ 中列出了不存在的名称，F823 局部变量在赋值前被引用。"""
     ruff = shutil.which("ruff")
     if not ruff:
         return "未检测到 ruff，跳过可选 lint 扩展。安装 ruff 后会启用 E9/F821/F822/F823。"
@@ -417,6 +461,7 @@ def _check_ruff() -> str:
 
 
 def _print_summary(results: list[CheckResult]) -> None:
+    """打印汇总表：每项一行，失败项附带错误信息的第一行。"""
     print("\n=== 后端静态检查汇总 ===")
     for result in results:
         status = "PASS" if result.passed else "FAIL"
@@ -433,17 +478,20 @@ def _print_summary(results: list[CheckResult]) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
+    """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="后端静态检查：编译、关键模块导入和可选 ruff lint。")
     parser.add_argument("--skip-ruff", action="store_true", help="跳过可选 ruff lint 检查。")
     return parser.parse_args()
 
 
 def main() -> int:
+    """命令行入口：全部检查通过返回 0，否则返回 1。"""
     args = _parse_args()
     _prepare_environment()
     print(f"仓库根目录: {REPO_ROOT}")
     print("运行模式: offline static")
 
+    # legacy 扫描最快，放在最前。
     checks: list[tuple[str, Callable[[], str]]] = [
         ("legacy-entry-guard", _check_removed_legacy_entry_markers),
         ("compileall", _check_compileall),

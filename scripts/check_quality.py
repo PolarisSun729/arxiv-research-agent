@@ -1,3 +1,30 @@
+"""统一质量门禁入口：按阶段依次运行文档、部署、后端、前端检查，最后打印汇总表。
+
+用途：
+    提交代码前在本地运行一次，CI 中通过 `python scripts/check_quality.py ci` 运行同一套阶段。
+    每个阶段都在独立子进程中执行，失败时打印精简的失败摘要和单独复现该阶段的命令。
+
+用法（任意目录运行均可，各阶段会切换到自己的工作目录）：
+    python scripts/check_quality.py                 # 默认目标 all
+    python scripts/check_quality.py backend         # 只跑后端：静态检查 + 测试 + 启动烟测
+    python scripts/check_quality.py frontend        # 只跑前端：测试 + 构建
+    python scripts/check_quality.py smoke           # 最快的离线冒烟
+    python scripts/check_quality.py docs backend    # 可同时指定多个目标或阶段，重复阶段只运行一次
+    python scripts/check_quality.py --list          # 列出所有目标和阶段
+    python scripts/check_quality.py backend --fail-fast --show-output
+
+两个概念：
+    阶段（STAGES）：一条具体命令，如 backend-tests = pytest backend/tests。
+    目标（TARGETS）：若干阶段的组合，如 backend = backend-static + backend-tests + backend-startup-smoke。
+    命令行参数既可以写目标名，也可以直接写阶段名。
+
+离线约定：
+    默认目标不会访问真实模型、Milvus 或 arXiv；doctor-full 会检查真实连接，只能显式指定运行。
+    子进程环境会补上 RAG_QUALITY_GATE=offline、CI=1、临时 API Key 和仓库内临时目录（见 _run_stage）。
+
+退出码：所有选中阶段通过返回 0，否则返回 1。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -15,12 +42,20 @@ from typing import Iterable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_ROOT = REPO_ROOT / "frontend"
+# 各阶段子进程使用的临时目录（TMP/TEMP/TMPDIR），放在仓库内便于排查和清理。
 QUALITY_TMP_ROOT = REPO_ROOT / "temp" / "quality-gate-tmp"
+# 匹配终端颜色等 ANSI 控制序列，提取失败摘要前先去掉，避免汇总里出现乱码。
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 @dataclass(frozen=True)
 class Stage:
+    """一个质量检查阶段。
+
+    id：命令行使用的阶段名；title：输出中的中文标题；command：实际执行的参数列表；
+    cwd：执行目录；display_command：展示给用户的简写命令；description：该阶段的职责说明。
+    """
+
     id: str
     title: str
     command: list[str]
@@ -30,6 +65,7 @@ class Stage:
 
     @property
     def reproduce_command(self) -> str:
+        """失败时提示用户的复现命令；工作目录不是仓库根时自动加上 cd 前缀。"""
         if self.cwd == REPO_ROOT:
             return self.display_command
         relative_cwd = self.cwd.relative_to(REPO_ROOT).as_posix()
@@ -38,6 +74,8 @@ class Stage:
 
 @dataclass(frozen=True)
 class StageResult:
+    """单个阶段的执行结果；return_code 为 None 表示命令本身无法启动（如未安装 npm）。"""
+
     stage: Stage
     passed: bool
     duration_seconds: float
@@ -48,6 +86,7 @@ class StageResult:
 
 
 def _python_command(args: Iterable[str]) -> list[str]:
+    """用当前解释器拼出命令，保证子进程与运行本脚本的是同一个 Python 环境。"""
     return [sys.executable, *args]
 
 
@@ -59,6 +98,7 @@ def _npm_executable() -> str:
 
 NPM = _npm_executable()
 
+# 全部可用阶段；键与 Stage.id 相同。新增检查时在这里登记，再按需加入 TARGETS。
 STAGES: dict[str, Stage] = {
     "deployment-tests": Stage(
         id="deployment-tests",
@@ -150,6 +190,7 @@ STAGES: dict[str, Stage] = {
     ),
 }
 
+# 目标名 -> 按顺序执行的阶段列表。all 与 ci 内容相同：本地与 CI 使用同一套门禁。
 TARGETS: dict[str, list[str]] = {
     # 统一入口依次验证文档、部署与应用；full doctor 仍保持显式触发，避免默认流程访问真实外部服务。
     "all": ["docs", "deployment-tests", "doctor-basic", "backend-static", "backend-tests", "backend-startup-smoke", "frontend-tests", "frontend-build"],
@@ -166,15 +207,18 @@ TARGETS: dict[str, list[str]] = {
 
 
 def _strip_ansi(text: str) -> str:
+    """去掉文本中的 ANSI 颜色控制序列。"""
     return ANSI_RE.sub("", text)
 
 
 def _tail_non_empty_lines(text: str, limit: int = 18) -> list[str]:
+    """返回最后 limit 行非空输出；找不到明确错误行时作为兜底摘要。"""
     lines = [line.rstrip() for line in _strip_ansi(text).splitlines() if line.strip()]
     return lines[-limit:]
 
 
 def _failure_context_lines(text: str, limit: int = 18) -> list[str]:
+    """从完整输出中挑出失败相关行：命中失败标题或异常关键字的行，以及其后 3 行上下文，最多 limit 行。"""
     raw_lines = _strip_ansi(text).splitlines()
     focused: list[str] = []
     capture_after = 0
@@ -212,6 +256,7 @@ def _failure_context_lines(text: str, limit: int = 18) -> list[str]:
 
 
 def _summarize_failure(stdout: str, stderr: str, return_code: int | None) -> str:
+    """生成阶段失败摘要：优先用关键错误行，其次用输出末尾，都没有时说明退出码。"""
     combined = "\n".join(part for part in (stderr, stdout) if part.strip())
     focused = _failure_context_lines(combined)
     if focused:
@@ -223,6 +268,10 @@ def _summarize_failure(stdout: str, stderr: str, return_code: int | None) -> str
 
 
 def _first_failure_line(summary: str) -> str:
+    """从失败摘要中挑出最能说明问题的一行，用于最终汇总表。
+
+    优先级：doctor 的 "[n] FAIL" 行（附带“原因:”行）> 常见异常关键字 > 含 error/failed 的行 > 第一行。
+    """
     # 汇总表只放一行，优先挑出真正的异常/编译错误，避免被测试框架启动信息淹没。
     lines = [line.strip() for line in summary.splitlines() if line.strip()]
     for index, line in enumerate(lines):
@@ -254,6 +303,11 @@ def _first_failure_line(summary: str) -> str:
 
 
 def _run_stage(stage: Stage, show_output: bool) -> StageResult:
+    """在子进程中运行一个阶段并收集结果。
+
+    输出默认只在失败时打印，--show-output 时通过阶段也打印。
+    下面的环境变量都用 setdefault 设置：调用方已显式设置的值优先，不会被覆盖。
+    """
     print(f"\n=== {stage.title} [{stage.id}] ===")
     print(f"职责: {stage.description}")
     print(f"命令: {stage.reproduce_command}")
@@ -273,6 +327,7 @@ def _run_stage(stage: Stage, show_output: bool) -> StageResult:
     env.setdefault("TMPDIR", str(QUALITY_TMP_ROOT))
 
     try:
+        # errors="replace"：子进程输出里偶尔混有非 UTF-8 字节（如 Windows GBK），替换掉而不是让门禁本身崩溃。
         completed = subprocess.run(
             stage.command,
             cwd=stage.cwd,
@@ -327,6 +382,7 @@ def _run_stage(stage: Stage, show_output: bool) -> StageResult:
 
 
 def _expand_targets(targets: list[str]) -> list[Stage]:
+    """把命令行目标展开成阶段列表：目标名查 TARGETS，阶段名原样保留；按首次出现顺序去重。"""
     selected_ids: list[str] = []
     for target in targets:
         ids = TARGETS.get(target, [target])
@@ -337,6 +393,7 @@ def _expand_targets(targets: list[str]) -> list[Stage]:
 
 
 def _print_summary(results: list[StageResult]) -> None:
+    """打印汇总表：每个阶段一行，失败阶段额外给出复现命令和一行摘要。"""
     print("\n=== 质量门禁汇总 ===")
     for result in results:
         status = "PASS" if result.passed else "FAIL"
@@ -354,6 +411,7 @@ def _print_summary(results: list[StageResult]) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
+    """解析命令行参数；位置参数可以是任意目标名或阶段名。"""
     choices = sorted(set(TARGETS) | set(STAGES))
     parser = argparse.ArgumentParser(
         description="统一质量门禁入口：文档、后端编译、后端测试、前端测试和前端构建。",
@@ -371,6 +429,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _print_available_targets() -> None:
+    """--list 的输出：所有目标及其阶段，以及每个阶段的复现命令。"""
     print("可用目标:")
     for name, stage_ids in TARGETS.items():
         print(f"  {name:10} -> {', '.join(stage_ids)}")
@@ -380,6 +439,7 @@ def _print_available_targets() -> None:
 
 
 def main() -> int:
+    """命令行入口：所有选中阶段通过返回 0，否则返回 1。"""
     args = _parse_args()
     if args.list:
         _print_available_targets()

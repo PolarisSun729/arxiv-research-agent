@@ -163,7 +163,7 @@ python scripts/test_security.py -k "redact or notes_markdown_export"
 python scripts/test_security.py --full
 ```
 
-Linux/Git Bash 可用 `bash test_security.sh`，或通过 `SECURITY_TEST_PYTHON` 指定解释器。脱敏性能和匿名长字段回归使用有界子进程，避免错误正则挂死测试；SSE 回归验证跨分片凭据及普通文本完整性。默认回归使用模拟 Redis；实际容器持久化、TLS 和付费模型验收需要另行执行，不能用离线通过代替。
+Linux/Git Bash 下命令相同，用哪个 Python 解释器运行就使用哪个环境。脱敏性能和匿名长字段回归使用有界子进程，避免错误正则挂死测试；SSE 回归验证跨分片凭据及普通文本完整性。默认回归使用模拟 Redis；实际容器持久化、TLS 和付费模型验收需要另行执行，不能用离线通过代替。
 
 ## 4. Frequently used targeted commands
 

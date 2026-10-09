@@ -1,5 +1,28 @@
 """三阶段安全测试入口：仅使用合成凭据、临时数据库及测试提供的业务替身。"""
 
+# 用途：
+#     在与开发/生产配置完全隔离的环境里运行安全相关的后端回归，结果不受本机 .env 影响，
+#     也绝不会读写真实账号库、业务库或审计日志。
+#     三个阶段对应 backend/tests/api/test_security_stage1~3.py：
+#         stage1  API Key 认证
+#         stage2  限流、IP 过滤、审计日志
+#         stage3  JWT 账号、用户管理、配额
+#     另外包含 init_security.py 的初始化测试。
+#
+# 用法（在任意目录运行均可，脚本会切换到仓库根目录）：
+#     python scripts/test_security.py                       # 只跑上面四个安全测试文件
+#     python scripts/test_security.py -k "redact"           # 按 pytest -k 表达式筛选用例
+#     python scripts/test_security.py --full                # 跑全部 backend/tests，同样隔离
+#
+# 隔离手段（见 main）：
+#     1. 清空进程环境变量，只保留系统运行必需的白名单，再写入一套合成配置和随机凭据；
+#     2. 所有数据库、缓存、trace、审计日志都指向 temp/security-tests/run-*/ 下的新目录；
+#     3. 拦截 python-dotenv 与 Starlette Config 读取文件，只允许读取本次运行目录内的 dotenv；
+#     4. 注册审计钩子，一旦有代码试图打开默认账号库就立即报错。
+#
+# 退出码与 pytest 一致：0 表示全部通过；缺少 pytest/dotenv 时返回 2。
+# 运行目录不会自动删除，其中保留 results.xml（JUnit 报告）和审计日志，便于事后排查。
+
 from __future__ import annotations
 
 import argparse
@@ -11,6 +34,7 @@ import tempfile
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# 默认模式下运行的测试文件（相对仓库根目录）；--full 时改为整个 backend/tests。
 SECURITY_TESTS = [
     "backend/tests/api/test_security_stage1.py",
     "backend/tests/api/test_security_stage2.py",
@@ -20,7 +44,11 @@ SECURITY_TESTS = [
 
 
 def isolate_configuration_reads(runtime: Path) -> None:
-    """允许本次测试生成的配置，阻止 dotenv 和 SlowAPI/Starlette 隐式读取真实部署文件。"""
+    """允许本次测试生成的配置，阻止 dotenv 和 SlowAPI/Starlette 隐式读取真实部署文件。
+
+    做法是给两个读取入口打猴子补丁：路径位于 runtime 目录内才放行，否则当作文件不存在。
+    补丁作用于当前进程，pytest.main 在同一进程内运行，因此对全部测试生效。
+    """
     import dotenv
     from starlette.config import Config
 
@@ -29,6 +57,7 @@ def isolate_configuration_reads(runtime: Path) -> None:
 
     def load_test_dotenv(dotenv_path=None, *extra_args, **kwargs):
         # CLI 回归有自己的临时部署文件，不能一概禁用 dotenv 而落到默认账号库。
+        # dotenv_path 为 None 时 python-dotenv 会自动向上查找 .env，这里一律拒绝；返回 False 等同于“未找到文件”。
         if dotenv_path is None or not Path(dotenv_path).resolve().is_relative_to(runtime):
             return False
         return original_load_dotenv(dotenv_path, *extra_args, **kwargs)
@@ -44,11 +73,13 @@ def isolate_configuration_reads(runtime: Path) -> None:
 
 
 def main() -> int:
+    """命令行入口：搭建隔离环境后在当前进程内调用 pytest，返回 pytest 的退出码。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--full", action="store_true", help="运行全部后端离线回归，包含三个安全阶段。")
     parser.add_argument("-k", "--filter", default="", help="按 pytest 表达式选择回归，沿用相同的凭据和数据库隔离。")
     args = parser.parse_args()
 
+    # 提前确认依赖可用，给出明确的安装提示，而不是在测试中途报 ImportError。
     try:
         import dotenv
         import pytest
@@ -56,6 +87,7 @@ def main() -> int:
         print(f"缺少测试依赖 {exc.name}，请在项目 Python 环境中安装 requirements-dev.txt。", file=sys.stderr)
         return 2
 
+    # SECURITY_TESTS 是相对路径，pytest 也要从仓库根目录收集 conftest。
     os.chdir(REPO_ROOT)
     scratch = REPO_ROOT / "temp" / "security-tests"
     scratch.mkdir(parents=True, exist_ok=True)
@@ -70,6 +102,11 @@ def main() -> int:
         "LANG", "LC_ALL", "TERM", "TZ", "VIRTUAL_ENV", "CONDA_PREFIX",
     }
     environment = {name: value for name, value in os.environ.items() if name.upper() in system_names}
+    # 在白名单基础上写入测试专用配置：
+    #   - 认证用 api_key 模式，访问密钥与 JWT 密钥每次随机生成，测试结束即作废；
+    #   - 所有 SQLite、缓存、trace、审计日志都放进本次 runtime 目录；
+    #   - 模型密钥置空、HuggingFace 离线、限流用内存存储，保证不访问任何外部服务；
+    #   - RAG_QUALITY_GATE=offline / CI=1 让后端测试按离线质量门禁的约定运行。
     environment.update({
         "PYTHONUTF8": "1", "PYTHONDONTWRITEBYTECODE": "1", "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
         "RAG_QUALITY_GATE": "offline", "CI": "1",
@@ -98,6 +135,8 @@ def main() -> int:
         "RATE_LIMIT_READ", "RATE_LIMIT_WRITE", "RATE_LIMIT_EXPENSIVE", "AUTH_FAILURE_LIMIT", "RATE_LIMIT_VIOLATION_LIMIT",
     ):
         environment[name] = "10000/minute"
+    # 用隔离后的环境整体替换当前进程环境；tempfile 的默认目录也指向 runtime，
+    # 测试里创建的临时文件都会留在本次运行目录中。
     os.environ.clear()
     os.environ.update(environment)
     sys.dont_write_bytecode = True
@@ -111,10 +150,13 @@ def main() -> int:
             if Path(audit_args[0]).resolve() == REPO_ROOT / "backend/data/auth/auth.sqlite3":
                 raise RuntimeError("安全测试不能打开默认账号库，请使用临时 AUTH_DATABASE_PATH。")
 
+    # Python 审计钩子一经注册无法移除，覆盖本进程后续所有 sqlite3.connect 调用。
     sys.addaudithook(guard_default_auth_database)
     paths = ["backend/tests"] if args.full else SECURITY_TESTS
     print("运行全部后端回归。" if args.full else "运行 API Key、限流/IP/审计、JWT/用户/配额三阶段安全回归。", flush=True)
     print(f"测试证据目录：{runtime}", flush=True)
+    # --basetemp / cache_dir 让 pytest 自身的临时文件和缓存也落在 runtime 中，
+    # --junitxml 把结果保存为证据文件。
     result = int(pytest.main([
         *paths, "-q", "--basetemp", str(runtime / "pytest"),
         "--junitxml", str(runtime / "results.xml"), "-o", f"cache_dir={runtime / 'pytest-cache'}",
