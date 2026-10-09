@@ -27,7 +27,6 @@ if TYPE_CHECKING:
         AgentSessionStore,
         AgentWorkStore,
         InterestVectorStore,
-        LangGraphCheckpointStore,
         PaperCatalogStore,
         PaperChatMessageStore,
         PaperChatSessionStore,
@@ -129,10 +128,6 @@ def get_agent_runtime_checkpoint_store() -> AgentRuntimeCheckpointStore:
 
 def get_agent_work_store() -> AgentWorkStore:
     return get_storage_container().agent_work
-
-
-def get_langgraph_checkpoint_store() -> LangGraphCheckpointStore:
-    return get_storage_container().langgraph_checkpoints
 
 
 @lru_cache(maxsize=1)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -79,17 +79,6 @@ class CandidateRecallService:
             }
             for paper in papers
         ]
-
-    def _build_category_query(
-        self,
-        liked_category_freq: Counter,
-        max_categories: Optional[int] = None,
-    ) -> str:
-        """构造分类检索表达式，便于文本检索或接口查询复用统一分类范围。"""
-        if max_categories is None:
-            max_categories = self.RECOMMENDATION_CONFIG["category_query_max_categories"]
-        categories = self.RECOMMEND_CANDIDATE_CATEGORIES[:max_categories] if max_categories > 0 else self.RECOMMEND_CANDIDATE_CATEGORIES
-        return " OR ".join(f"cat:{category}" for category in categories)
 
     def _fetch_cluster_recall_candidates(
         self,

@@ -293,20 +293,6 @@ class RetrievalRules:
             return "en"
         return "unknown"
 
-    def estimate_ambiguity(self, keywords: List[str], intent_tags: List[str], language: str, user_query: str) -> float:
-        content_weight = min(1.0, len(keywords) / self.config["extract_query_keywords_limit"])
-        intent_weight = min(1.0, len(intent_tags) / 3.0)
-        length_weight = min(1.0, len(user_query.strip()) / 50.0)
-        language_weight = self.config["language_weight_zh_mixed"] if language in {"zh", "mixed"} else 0.0
-        specificity = min(
-            1.0,
-            self.config["specificity_content_weight"] * content_weight
-            + self.config["specificity_intent_weight"] * intent_weight
-            + self.config["specificity_length_weight"] * length_weight
-            + language_weight,
-        )
-        return max(self.config["specificity_floor"], min(1.0, 1.0 - specificity))
-
     def preferred_sections_for_main_intent(self, main_intent: str) -> List[str]:
         spec = MAIN_INTENTS.get(main_intent, MAIN_INTENTS["other"])
         return list(spec["preferred_sections"])

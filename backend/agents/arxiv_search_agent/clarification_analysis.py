@@ -484,14 +484,6 @@ def build_clarification_diagnostic(
     }
 
 
-def request_requires_clarification(diagnostic: Mapping[str, Any]) -> bool:
-    return bool(diagnostic.get("needs_clarification"))
-
-
-def request_allows_default_continuation(diagnostic: Mapping[str, Any]) -> bool:
-    return bool(diagnostic.get("allow_default_continuation"))
-
-
 def _infer_intent(
     message: str,
     *,

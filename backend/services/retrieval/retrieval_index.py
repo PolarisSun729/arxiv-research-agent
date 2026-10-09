@@ -635,31 +635,6 @@ class RetrievalIndexBuilder:
         return deduped
 
 
-def build_retrieval_indexes_for_chunk(
-    chunk: Dict[str, Any],
-    fallback_index: int = 0,
-    *,
-    generation_service: Any = None,
-    enable_generative_indexes: bool = False,
-    max_indexes_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_PER_CHUNK,
-    max_questions_per_chunk: int = DEFAULT_RETRIEVAL_INDEX_MAX_QUESTIONS_PER_CHUNK,
-    max_workers: int = 1,
-    generation_cache: Any = None,
-    generation_model_name: str = "",
-) -> List[RetrievalIndex]:
-    builder = RetrievalIndexBuilder(
-        generation_service=generation_service,
-        enable_generative_indexes=enable_generative_indexes,
-        max_indexes_per_chunk=max_indexes_per_chunk,
-        max_questions_per_chunk=max_questions_per_chunk,
-        max_workers=max_workers,
-        generation_cache=generation_cache,
-        generation_model_name=generation_model_name,
-    )
-    indexes, _ = builder.build_for_chunk(chunk, fallback_index=fallback_index)
-    return indexes
-
-
 def build_retrieval_indexes(
     chunks: Iterable[Dict[str, Any]],
     *,
@@ -1357,11 +1332,6 @@ class CollectionRetrievalIndexProvider:
             )
             self._cache[resolved_name] = self._clone_index(index)
             return index
-
-    def invalidate_index(self, collection_name: str) -> None:
-        """索引重建或 collection 删除后可主动清理本地 retrieval index。"""
-        with self._lock:
-            self._cache.pop(self._resolve_collection_name(collection_name), None)
 
     def _build_index(
         self,

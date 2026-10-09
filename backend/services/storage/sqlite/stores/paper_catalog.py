@@ -188,23 +188,6 @@ class PaperCatalogStore(BaseSqliteStore):
             logger.error(f"Error getting total paper count: {str(e)}")
             return 0
 
-    def get_today_new_paper_count(self) -> int:
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    '''
-                    SELECT COUNT(*)
-                    FROM arxiv_papers
-                    WHERE date(created_at, 'localtime') = date('now', 'localtime')
-                    '''
-                )
-                row = cursor.fetchone()
-                return int(row[0] or 0) if row else 0
-        except Exception as e:
-            logger.error(f"Error getting today's new paper count: {str(e)}")
-            return 0
-
     def delete_paper(self, arxiv_id: str) -> bool:
         try:
             with self._get_connection() as conn:

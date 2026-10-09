@@ -172,9 +172,3 @@ def build_fallback_record(
         "resolution": _normalize_text(resolution) or "fallback",
         "detail": dict(detail or {}),
     }
-
-
-def fallback_reason_text(record: Optional[Mapping[str, Any]], default: Any = None) -> Optional[str]:
-    if isinstance(record, Mapping):
-        return _normalize_text(record.get("raw_reason")) or _normalize_text(record.get("code")) or _normalize_text(default)
-    return _normalize_text(default)

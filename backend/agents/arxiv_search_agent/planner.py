@@ -656,15 +656,6 @@ def _confirmation_required_step_ids(plan: ExecutablePlan) -> List[str]:
     ]
 
 
-def _paper_qa_answer_shape(intent: Optional[str]) -> Dict[str, str]:
-    normalized_intent = str(intent or "").strip()
-    if normalized_intent == "paper_summary":
-        return {"step_id": "summarize_paper", "action_type": "summarize", "qa_mode": "summary"}
-    if normalized_intent == "paper_detail":
-        return {"step_id": "inspect_paper_detail", "action_type": "inspect_detail", "qa_mode": "detail"}
-    return {"step_id": "answer_paper_question", "action_type": "answer", "qa_mode": "qa"}
-
-
 def _select_candidate_tools(selector: ToolCandidateSelector, goal: Goal, state: AgentState, planner_context: Any) -> Any:
     select_signature = signature(selector.select)
     if "planner_context" in select_signature.parameters:

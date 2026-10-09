@@ -11,7 +11,7 @@ from services.retrieval.collection_profile import CollectionRetrievalProfile
 from services.retrieval.contracts import QueryProfile, RetrievalOptions
 from services.retrieval.execution import QueryEmbeddingBatcher, RouteExecutionSupport
 from services.retrieval.index_hit_aggregator import IndexHitAggregator
-from services.retrieval.retrieval_index import CollectionRetrievalIndex, KEYWORD_FIELD_WEIGHTS, VECTOR_ROUTE_NAMES
+from services.retrieval.retrieval_index import CollectionRetrievalIndex, VECTOR_ROUTE_NAMES
 from utils.config import get_enhanced_retrieval_runtime_config
 
 ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
@@ -840,37 +840,6 @@ class RouteRetriever:
         if callable(extractor):
             return extractor(tokens, limit=max(len(tokens), 1))
         return tokens
-
-    def keyword_field_weights_for_query(self, query_profile: QueryProfile) -> Dict[str, float]:
-        """按问题类型动态调节字段权重，普通问题不让图表 OCR/caption 与正文等权竞争。"""
-        weights = dict(KEYWORD_FIELD_WEIGHTS)
-        main_intent = self.query_main_intent(query_profile)
-        if main_intent == "figure_table":
-            weights["asset_caption"] = 1.15
-            weights["asset_aux"] = 0.72
-        else:
-            weights["asset_caption"] = min(weights.get("asset_caption", 0.0), 0.12)
-            weights["asset_aux"] = min(weights.get("asset_aux", 0.0), 0.05)
-        return weights
-
-    def keyword_field_weights_for_document(
-        self,
-        base_weights: Dict[str, float],
-        chunk: Dict[str, Any],
-        query_profile: QueryProfile,
-    ) -> Dict[str, float]:
-        """按 chunk 类型二次调权，非图表问题下表格/图片 chunk 只作为弱补充候选。"""
-        weights = dict(base_weights)
-        chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
-        is_asset_chunk = chunk_type in {"figure", "table"}
-        is_figure_query = self.query_main_intent(query_profile) == "figure_table"
-        if is_asset_chunk and not is_figure_query:
-            weights["body"] = min(weights.get("body", 1.0), 0.38)
-            weights["section_title"] = min(weights.get("section_title", 1.0), 0.35)
-            weights["section_path"] = min(weights.get("section_path", 1.0), 0.25)
-            weights["asset_caption"] = min(weights.get("asset_caption", 0.0), 0.08)
-            weights["asset_aux"] = min(weights.get("asset_aux", 0.0), 0.03)
-        return weights
 
     @staticmethod
     def weight_keyword_document_fields(

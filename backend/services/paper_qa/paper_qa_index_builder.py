@@ -349,28 +349,6 @@ class PaperQAIndexBuilder:
                 result["failed"].append({"build_id": build_id, "error": str(exc)})
         return result
 
-    def prepare_rebuild(self, arxiv_id: str, *, loading_method: str) -> None:
-        """兼容旧调用的重建准备步骤。
-
-        主构建链路不再在这里删除旧索引；旧 active 必须保留到新版本激活成功之后，后续由清理流程处理。
-        """
-        existing = self.paper_qa_index_store.get_paper_qa_index(arxiv_id)
-        if existing:
-            self.paper_qa_index_store.update_paper_qa_index(
-                arxiv_id,
-                loading_method=loading_method,
-                current_stage="prepare_versioned_rebuild",
-                error_message="",
-                failed_stage="",
-            )
-            self._log_stage(
-                "prepare_versioned_rebuild",
-                arxiv_id,
-                loading_method,
-                "old QA artifacts kept until new version is activated",
-                active_collection=existing.get("collection_name"),
-            )
-
     def record_index_stage(
         self,
         arxiv_id: str,

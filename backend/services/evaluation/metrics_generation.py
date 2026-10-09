@@ -95,26 +95,12 @@ def calculate_citation_fidelity(
     return faithful / len(citations)
 
 
-def classify_expected_state(answerable: bool | None) -> str:
-    return "unknown" if answerable is None else "answered_or_partial" if answerable else "abstained"
-
-
-def classify_actual_state(outcome: str | None) -> str:
-    return {"completed": "answered", "partial": "partial", "abstained": "abstained"}.get(outcome, "error")
-
-
 def calculate_three_state_accuracy(answerable: bool | None, outcome: str | None) -> float | None:
     if answerable is None:
         return None
     if outcome not in {"completed", "partial", "abstained"}:
         return 0.0
     return float(outcome in {"completed", "partial"} if answerable else outcome == "abstained")
-
-
-def batch_three_state_accuracy(cases) -> float | None:
-    scores = [calculate_three_state_accuracy(a, o) for a, o in cases]
-    valid = [score for score in scores if score is not None]
-    return sum(valid) / len(valid) if valid else None
 
 
 def _draft_snapshots(trace_events) -> list[dict[str, Any]]:

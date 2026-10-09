@@ -72,14 +72,6 @@ class LoadingService:
             return self._load_with_docling(file_path)
         raise ValueError(f"Unsupported PDF loading method: {method}")
 
-    def get_total_pages(self) -> int:
-        """返回当前已加载文档的总页数。
-
-        返回:
-            int: 当前缓存文档的总页数。
-        """
-        return self.total_pages or (max(page_data["page"] for page_data in self.current_page_map) if self.current_page_map else 0)
-
     def get_page_map(self) -> list:
         """返回当前缓存的页级结构数据。
 

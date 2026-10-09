@@ -5,7 +5,7 @@ import logging
 import math
 import re
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -744,24 +744,6 @@ class RecommendationRanker:
             return 0.0
         cosine = dot_product / (norm_a * norm_b)
         return max(0.0, min(1.0, (cosine + 1.0) / 2.0))
-
-    def _is_within_max_age(self, published_date: Any, max_age_months: int) -> bool:
-        parsed_date = self._parse_datetime(str(published_date or ""))
-        if not parsed_date:
-            return False
-        if max_age_months <= 0:
-            return True
-        cutoff_days = max_age_months * 30
-        cutoff_date = datetime.now(timezone.utc) - timedelta(days=cutoff_days)
-        return parsed_date >= cutoff_date
-
-    def _calculate_diversity_score(self, categories: List[str], selected_category_counts: Counter) -> float:
-        if not categories:
-            return 1.0
-        if not selected_category_counts:
-            return 1.0
-        max_overlap = max((selected_category_counts.get(category, 0) for category in categories), default=0)
-        return 1.0 / (1.0 + max_overlap)
 
     def _split_categories(self, categories: Any) -> List[str]:
         values: List[Any] = []

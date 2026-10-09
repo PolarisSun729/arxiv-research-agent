@@ -28,10 +28,6 @@ class VectorDBProvider(str, Enum):
     MILVUS = "milvus"
 
 
-class DatabaseType(str, Enum):
-    SQLITE = "sqlite"
-
-
 def _env_str(name: str, default: str = "") -> str:
     return str(os.getenv(name, default)).strip()
 
@@ -773,9 +769,6 @@ GENERATION_CONFIG: Dict[str, Any] = {
     # rerank 前的 chunk 压缩/摘要使用独立的生成模型配置。
     "qwen_rerank_compress_model_name": _env_str("QWEN_RERANK_COMPRESS_MODEL_NAME", "qwen3.6-flash"),
     "qwen_rerank_compress_enable_thinking": _env_bool("QWEN_RERANK_COMPRESS_ENABLE_THINKING", False),
-    "huggingface_generate_max_length": _env_int("HF_GENERATE_MAX_LENGTH", 512),
-    "huggingface_generate_temperature": float(_env_str("HF_GENERATE_TEMPERATURE", "0.7")),
-    "huggingface_generate_do_sample": _env_bool("HF_GENERATE_DO_SAMPLE", True),
     "openai_chat_temperature": float(_env_str("OPENAI_CHAT_TEMPERATURE", "0.7")),
     "openai_chat_max_tokens": _env_int("OPENAI_CHAT_MAX_TOKENS", 512),
     "rewrite_query_max_queries_default": _env_int("REWRITE_QUERY_MAX_QUERIES_DEFAULT", 3),
@@ -800,9 +793,6 @@ GENERATION_CONFIG: Dict[str, Any] = {
         "default": "large",  # 当无特定任务映射时的默认模型角色
     },
 }
-
-def get_embedding_runtime_config() -> Dict[str, Any]:
-    return dict(EMBEDDING_CONFIG)
 
 
 def get_chunking_runtime_config() -> Dict[str, Any]:
@@ -856,10 +846,6 @@ def get_legacy_default_user_id() -> str:
     return str(USER_CONFIG["default_user_id"] or "local_user").strip() or "local_user"
 
 
-def get_user_runtime_config() -> Dict[str, Any]:
-    return dict(USER_CONFIG)
-
-
 def get_qa_index_job_runtime_config() -> Dict[str, Any]:
     return dict(QA_INDEX_JOB_CONFIG)
 
@@ -888,9 +874,3 @@ def get_intent_routing_runtime_config() -> Dict[str, Any]:
     return dict(INTENT_ROUTING_CONFIG)
 
 
-def get_rerank_runtime_config() -> Dict[str, Any]:
-    return dict(RERANK_CONFIG)
-
-
-def get_generation_runtime_config() -> Dict[str, Any]:
-    return dict(GENERATION_CONFIG)

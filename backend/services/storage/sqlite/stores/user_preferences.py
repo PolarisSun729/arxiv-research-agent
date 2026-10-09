@@ -151,22 +151,6 @@ class UserPreferenceStore(BaseSqliteStore):
             logger.error(f"Error getting liked papers with details: {str(e)}")
             return []
 
-    def is_liked_paper(self, user_id: str = DEFAULT_USER_ID, arxiv_id: str = None) -> bool:
-        try:
-            if arxiv_id is None:
-                return False
-
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT COUNT(*) FROM user_liked_papers WHERE user_id = ? AND arxiv_id = ?
-                ''', (user_id, arxiv_id))
-
-                return cursor.fetchone()[0] > 0
-        except Exception as e:
-            logger.error(f"Error checking liked paper: {str(e)}")
-            return False
-
     def add_disliked_paper(self, user_id: str = DEFAULT_USER_ID, arxiv_id: str = None) -> bool:
         try:
             if arxiv_id is None:
@@ -242,22 +226,6 @@ class UserPreferenceStore(BaseSqliteStore):
         except Exception as e:
             logger.error(f"Error getting disliked papers: {str(e)}")
             return []
-
-    def is_disliked_paper(self, user_id: str = DEFAULT_USER_ID, arxiv_id: str = None) -> bool:
-        try:
-            if arxiv_id is None:
-                return False
-
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT COUNT(*) FROM user_disliked_papers WHERE user_id = ? AND arxiv_id = ?
-                ''', (user_id, arxiv_id))
-
-                return cursor.fetchone()[0] > 0
-        except Exception as e:
-            logger.error(f"Error checking disliked paper: {str(e)}")
-            return False
 
     def get_user_preferences(self, user_id: str = DEFAULT_USER_ID) -> Dict[str, Any]:
         try:
@@ -413,22 +381,6 @@ class UserPreferenceStore(BaseSqliteStore):
             action_map.setdefault(action_key, []).append(arxiv_id)
         return action_map
 
-    def get_user_paper_action_state(self, user_id: str = DEFAULT_USER_ID, arxiv_id: str = None) -> Dict[str, Any]:
-        state = {action_type: False for action_type in PAPER_ACTION_TYPES}
-        state["metadata"] = {}
-        if not arxiv_id:
-            return state
-
-        for item in self.get_user_paper_actions(user_id=user_id):
-            if str(item.get("arxiv_id") or "").strip() != str(arxiv_id or "").strip():
-                continue
-            action_key = str(item.get("action_type") or "").strip()
-            if action_key:
-                state[action_key] = True
-                if item.get("metadata"):
-                    state["metadata"][action_key] = item.get("metadata")
-        return state
-
     def get_user_labeled_paper_count(self, user_id: str = DEFAULT_USER_ID) -> int:
         try:
             with self._get_connection() as conn:
@@ -448,35 +400,3 @@ class UserPreferenceStore(BaseSqliteStore):
         except Exception as e:
             logger.error(f"Error getting user labeled paper count: {str(e)}")
             return 0
-
-    def get_unlabeled_papers(self, user_id: str = DEFAULT_USER_ID) -> List[Dict[str, Any]]:
-        """按用户强偏好排除已标注论文，供画像/推荐流程选择下一批候选。"""
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    '''
-                    SELECT p.arxiv_id, p.title, p.abstract, p.authors, p.categories, p.published_date, p.url
-                    FROM arxiv_papers p
-                    LEFT JOIN user_liked_papers ulp ON p.arxiv_id = ulp.arxiv_id AND ulp.user_id = ?
-                    LEFT JOIN user_disliked_papers udp ON p.arxiv_id = udp.arxiv_id AND udp.user_id = ?
-                    WHERE ulp.arxiv_id IS NULL AND udp.arxiv_id IS NULL AND p.embedding_id IS NOT NULL
-                    ORDER BY p.published_date DESC
-                    ''',
-                    (user_id, user_id),
-                )
-                return [
-                    {
-                        "arxiv_id": row[0],
-                        "title": row[1],
-                        "abstract": row[2],
-                        "authors": row[3],
-                        "categories": row[4],
-                        "published_date": row[5],
-                        "url": row[6],
-                    }
-                    for row in cursor.fetchall()
-                ]
-        except Exception as e:
-            logger.error(f"Error getting unlabeled papers: {str(e)}")
-            return []

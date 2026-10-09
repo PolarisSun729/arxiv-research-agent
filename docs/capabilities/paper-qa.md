@@ -19,7 +19,7 @@ flowchart LR
     G --> H[校验并激活索引版本]
 ```
 
-`PaperQAIndexBuilder.build_qa_index()` 负责上述生命周期以及失败标记和清理。构建前的 `prepare_rebuild()`、执行中的阶段记录、完成后的 `mark_index_success()` 与失败后的 `mark_index_failed()` 必须使用同一条索引版本语义；不要在 Router 中拼接这些阶段。
+`PaperQAIndexBuilder.build_qa_index()` 负责上述生命周期以及失败标记和清理。执行中的阶段记录、完成后的 `mark_index_success()` 与失败后的 `mark_index_failed()` 必须使用同一条索引版本语义；不要在 Router 中拼接这些阶段。
 
 构建产物包括 chunk、检索索引、稀疏索引、Embedding 与向量集合。文件或集合存在不等于索引可用，真源是 `PaperQAIndexStore` 的活动构建版本和状态。删除或重建资产时必须经过 Builder 的 active-artifact guard，避免误删正在被问答使用的版本。
 

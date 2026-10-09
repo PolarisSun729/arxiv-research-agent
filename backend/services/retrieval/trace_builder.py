@@ -498,20 +498,6 @@ class RetrievalTraceBuilder:
             ]
         )
 
-    def build_fusion_trace(
-        self,
-        routes: Dict[str, List[Dict[str, Any]]],
-        fused_results: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        return {
-            "algorithm": "pure_rrf",
-            "rrf_k": self.rrf_k,
-            "route_weights": self.route_weights,
-            "route_counts": {route_name: len(route_results) for route_name, route_results in routes.items()},
-            "final_count": len(fused_results),
-            "dedupe_per_route": True,
-        }
-
     @staticmethod
     def build_sparse_index_debug(keyword_debug: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         keyword_debug = dict(keyword_debug or {})

@@ -31,7 +31,6 @@ from .replanner import Replanner
 from .response_assembler import assemble_final_answer
 from .schemas import (
     AgentTurnResult,
-    AgentRuntimeState,
     ExecutablePlan,
     ExecutionTrace,
     Goal,
@@ -1047,9 +1046,6 @@ class PlanExecutor:
 
     def _build_runtime_patch(self, runtime: PlanRuntime, *, current_step: Optional[PlanStep]) -> Dict[str, Any]:
         return self.state_projector.build_patch(runtime, current_step=current_step)
-
-    def _build_agent_runtime_state(self, runtime: PlanRuntime, *, current_step: Optional[PlanStep]) -> AgentRuntimeState:
-        return self.state_projector.build_runtime_state(runtime, current_step=current_step)
 
     def _sync_runtime_state(self, state: AgentState, runtime: PlanRuntime, *, current_step: Optional[PlanStep]) -> None:
         self.state_projector.apply(state, runtime, current_step=current_step)

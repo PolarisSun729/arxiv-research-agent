@@ -9,10 +9,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from services.context_merge import merge_backend_authoritative_context
-from services.memory.memory_debug import build_memory_debug_payload
 from services.memory.memory_models import (
     AgentSessionMemory,
-    BackendMemorySnapshot,
     PaperChatHistory,
     PreferenceSummary,
 )
@@ -455,11 +453,6 @@ class MemoryService:
             if normalized_turn
         ]
         return normalized_turns, debug
-
-    def _messages_to_conversation_context(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """把消息级聊天记录重组为按轮次组织的对话上下文。"""
-        turns, _debug = self._messages_to_conversation_context_with_debug(messages)
-        return turns
 
     def load_paper_conversation_context(
         self,
@@ -2112,23 +2105,6 @@ class MemoryService:
             max_papers=max_papers,
         )
 
-    def _extract_paper_profile_signals(
-        self,
-        arxiv_id: str,
-        paper_payload: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, List[str]]:
-        """从论文元数据中提取分类、代表论文和可清洗的显式主题信号。"""
-        paper = self._resolve_paper_payload(arxiv_id, paper_payload=paper_payload)
-        categories = self._normalize_preferred_categories(paper.get("categories"), limit=12)
-        # 论文标题和 arXiv 分类都不是抽象研究主题：分类进入专属字段，标题只作为论文元数据保留。
-        positive_topics = self._normalize_system_topics(self._extract_candidate_topic_values(paper), limit=12)
-        representative_papers = self._normalize_representative_papers([arxiv_id], limit=1)
-        return {
-            "categories": categories,
-            "positive_topics": positive_topics,
-            "representative_papers": representative_papers,
-        }
-
     def patch_user_profile(
         self,
         user_id: Optional[str],
@@ -2229,46 +2205,6 @@ class MemoryService:
         )
         return self.load_user_profile(resolved_user_id)
 
-    def update_profile_from_paper_action(
-        self,
-        user_id: Optional[str],
-        arxiv_id: str,
-        action_type: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """根据通用论文动作分发到对应画像更新逻辑。"""
-        normalized_action = str(action_type or "").strip().lower()
-        if normalized_action in {"like", "liked", "dislike", "disliked", "not_interested"}:
-            return self.update_profile_from_preference(user_id, arxiv_id, normalized_action)
-
-        if normalized_action == "note_saved" and isinstance(metadata, dict) and metadata.get("include_in_profile"):
-            # note_saved 本身不是显式偏好，但如果笔记允许入画像，就作为笔记证据参与重生成。
-            note_like_payload = {
-                "arxiv_id": arxiv_id,
-                "note_type": metadata.get("note_type"),
-                "title": metadata.get("title"),
-                "content": metadata.get("content"),
-                "tags": metadata.get("tags") or [],
-                "include_in_profile": True,
-            }
-            return self.update_profile_from_note(user_id, note_like_payload)
-
-        if normalized_action in {"favorite", "later", "read"}:
-            resolved_user_id = self._resolve_user_id(user_id)
-            self.profile_event_store.record_user_profile_event(
-                user_id=resolved_user_id,
-                event_type=normalized_action,
-                source_type="paper_action",
-                source_id=arxiv_id,
-                action_type=normalized_action,
-                arxiv_id=arxiv_id,
-                metadata=metadata or {},
-                include_in_profile=True,
-            )
-            return self.load_user_profile(resolved_user_id)
-
-        return self.load_user_profile(user_id)
-
     def load_preference_summary(self, user_id: Optional[str]) -> Dict[str, Any]:
         """加载用户偏好摘要，包括点赞/点踩、动作映射与兴趣向量。"""
         resolved_user_id = self._resolve_user_id(user_id)
@@ -2359,11 +2295,6 @@ class MemoryService:
             },
         }
 
-    def load_paper_notes(self, user_id: Optional[str], arxiv_id: str) -> List[Dict[str, Any]]:
-        """读取指定用户在某篇论文下保存的笔记列表。"""
-        resolved_user_id = self._resolve_user_id(user_id)
-        return self.paper_note_store.list_paper_notes(arxiv_id=arxiv_id, user_id=resolved_user_id)
-
     def load_paper_chat_history(
         self,
         user_id: Optional[str],
@@ -2425,37 +2356,6 @@ class MemoryService:
         )
         return history.to_dict()
 
-    def build_memory_snapshot(
-        self,
-        *,
-        user_id: Optional[str],
-        arxiv_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-        include_profile: bool = True,
-        include_preferences: bool = True,
-        include_notes: bool = True,
-        include_chat_history: bool = True,
-        chat_limit: int = 5,
-    ) -> Dict[str, Any]:
-        """按需聚合用户画像、偏好、笔记与聊天历史，构造统一后端记忆快照。"""
-        resolved_user_id = self._resolve_user_id(user_id)
-        snapshot = BackendMemorySnapshot(
-            user_profile=self.load_user_profile(resolved_user_id) if include_profile else None,
-            preference_summary=self.load_preference_summary(resolved_user_id) if include_preferences else None,
-            paper_notes=self.load_paper_notes(resolved_user_id, arxiv_id) if include_notes and arxiv_id else [],
-            paper_chat_history=(
-                self.load_paper_chat_history(
-                    resolved_user_id,
-                    arxiv_id,
-                    session_id=session_id,
-                    limit=chat_limit,
-                )
-                if include_chat_history and arxiv_id
-                else None
-            ),
-        )
-        return snapshot.to_dict()
-
     def load_agent_memory(
         self,
         user_id: Optional[str],
@@ -2514,42 +2414,3 @@ class MemoryService:
         )
         return self.agent_session_store.get_agent_session(resolved_session_id, user_id=resolved_user_id)
 
-    def build_memory_debug(
-        self,
-        *,
-        user_id: Optional[str],
-        arxiv_id: Optional[str] = None,
-        user_profile: Optional[Dict[str, Any]] = None,
-        preference_summary: Optional[Dict[str, Any]] = None,
-        paper_notes: Optional[List[Dict[str, Any]]] = None,
-        paper_chat_history: Optional[Dict[str, Any]] = None,
-        frontend_context: Optional[Dict[str, Any]] = None,
-        extra: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """构造统一的记忆调试结果，供前端观测或问题排查使用。"""
-        resolved_user_id = self._resolve_user_id(user_id)
-        return build_memory_debug_payload(
-            user_id=resolved_user_id,
-            arxiv_id=arxiv_id,
-            user_profile=user_profile,
-            preference_summary=preference_summary,
-            paper_notes=paper_notes,
-            paper_chat_history=paper_chat_history,
-            frontend_context=frontend_context,
-            extra=extra,
-        )
-
-    def merge_frontend_context_with_memory(
-        self,
-        frontend_context: Optional[Dict[str, Any]],
-        backend_memory: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """把前端上下文与后端记忆块合并为一个可直接下发的上下文结构。"""
-        merged_context = dict(frontend_context or {})
-        existing_memory = merged_context.get("backend_memory")
-        if isinstance(existing_memory, dict) and isinstance(backend_memory, dict):
-            merged_context["backend_memory"] = {**existing_memory, **backend_memory}
-            return merged_context
-
-        merged_context["backend_memory"] = dict(backend_memory or {})
-        return merged_context

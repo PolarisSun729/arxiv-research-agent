@@ -443,12 +443,6 @@ class ResearchProfileGenerator:
     def _paper_text(paper: Dict[str, Any]) -> str:
         return " ".join([str(paper.get("title") or ""), str(paper.get("abstract") or ""), str(paper.get("summary") or "")])
 
-    def _extract_explicit_topic_terms(self, payload: Dict[str, Any]) -> List[str]:
-        terms: List[str] = []
-        for field_name in ("topics", "topic", "keywords", "keyword", "tags", "labels"):
-            terms.extend(self.normalize_profile_list(payload.get(field_name), limit=20))
-        return terms
-
     def extract_topics(self, text: str, explicit_terms: Optional[Iterable[str]] = None) -> List[str]:
         """从辅助文本中提取弱主题，主路径仍以 evidence card 和显式 tags 为准。"""
         candidates: List[str] = []
@@ -485,10 +479,6 @@ class ResearchProfileGenerator:
                 negative_scores.pop(topic, None)
             else:
                 positive_scores.pop(topic, None)
-
-    def _rank_topics(self, scores: Counter[str], limit: int) -> List[str]:
-        ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0].lower()))
-        return self.normalize_system_topics([topic for topic, _score in ranked], limit=limit)
 
     @staticmethod
     def _rank_counter_values(scores: Counter[str], limit: int) -> List[str]:

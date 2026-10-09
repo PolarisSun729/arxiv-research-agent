@@ -18,44 +18,6 @@ def get_arxiv_search_backend():
     return get_dependency_arxiv_search_backend()
 
 
-def _normalize_source_paper(source_paper: Dict[str, Any], fallback_arxiv_id: str) -> Dict[str, Any]:
-    authors = source_paper.get("authors", "")
-    categories = source_paper.get("categories", "")
-    if isinstance(authors, (list, tuple)):
-        authors_value = ", ".join([str(item).strip() for item in authors if str(item).strip()])
-    else:
-        authors_value = str(authors or "").strip()
-    if isinstance(categories, (list, tuple)):
-        categories_value = ", ".join([str(item).strip() for item in categories if str(item).strip()])
-    else:
-        categories_value = str(categories or "").strip()
-
-    title = str(source_paper.get("title", "") or "").strip()
-    abstract = str(source_paper.get("abstract", "") or source_paper.get("summary", "") or "").strip()
-    published_date = str(
-        source_paper.get("published_date")
-        or source_paper.get("published")
-        or source_paper.get("updated")
-        or source_paper.get("update_date")
-        or source_paper.get("publishedAt")
-        or ""
-    ).strip()
-    url = str(source_paper.get("url") or source_paper.get("abs_url") or source_paper.get("pdf_url") or "").strip()
-    arxiv_identifier = str(source_paper.get("arxiv_id") or source_paper.get("id") or fallback_arxiv_id or "").strip()
-    if arxiv_identifier.startswith("http"):
-        arxiv_identifier = arxiv_identifier.rsplit("/", 1)[-1]
-
-    return {
-        "arxiv_id": arxiv_identifier,
-        "title": title,
-        "authors": authors_value,
-        "abstract": abstract,
-        "categories": categories_value,
-        "published_date": published_date,
-        "url": url,
-    }
-
-
 def _build_search_trace(
     *,
     tool_name: str,
@@ -364,17 +326,3 @@ def get_paper_metadata(arxiv_id: str) -> Dict[str, Any]:
             trace=make_tool_trace(tool_name, inputs=trace_inputs),
             error=make_tool_error("paper_metadata_failed", str(exc)),
         )
-
-
-def get_paper_or_materialize(arxiv_id: str, paper_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    paper = get_paper_catalog_store().get_paper(arxiv_id)
-    if paper:
-        return paper
-    if paper_payload:
-        normalized = _normalize_source_paper(paper_payload, arxiv_id)
-        return get_recommendation_service()._materialize_paper_from_source(normalized, arxiv_id)
-    recommendation_service = get_recommendation_service()
-    source_paper = recommendation_service._fetch_paper_from_arxiv_with_rate_limit(arxiv_id)
-    if not source_paper:
-        raise HTTPException(status_code=404, detail="Paper not found")
-    return recommendation_service._materialize_paper_from_source(source_paper, arxiv_id)

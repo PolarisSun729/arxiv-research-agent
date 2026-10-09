@@ -22,16 +22,6 @@ def _state_run_id(state: AgentState) -> Optional[str]:
     return text or None
 
 
-def _tool_result_count(result: ToolExecutionResult) -> Optional[int]:
-    data = result.data
-    if isinstance(data, Mapping):
-        for key in ("papers", "sources", "chunks", "results", "items"):
-            value = data.get(key)
-            if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-                return len(value)
-    return None
-
-
 def _log_plan_done(state: AgentState, goal: Goal, plan: ExecutablePlan, planning_debug: Mapping[str, Any]) -> None:
     planner_summary = dict(planning_debug.get("planner_summary") or {}) if isinstance(planning_debug, Mapping) else {}
     info_event(
@@ -374,22 +364,6 @@ def _model_to_plain(value: Any) -> Any:
     if callable(model_dump):
         return model_dump()
     return value
-
-
-def _compact_validation_errors(errors: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    """压缩 Pydantic errors()，保留字段路径和原因，避免日志被完整输入对象淹没。"""
-    compact: List[Dict[str, Any]] = []
-    for item in list(errors or []):
-        detail = dict(item or {})
-        loc = detail.get("loc")
-        if isinstance(loc, (list, tuple)):
-            detail["loc"] = ".".join(str(part) for part in loc)
-        if "input" in detail:
-            detail["input"] = _safe_compact(_model_to_plain(detail.get("input")), limit=400)
-        if isinstance(detail.get("ctx"), Mapping):
-            detail["ctx"] = _safe_compact(dict(detail.get("ctx") or {}), limit=400)
-        compact.append(detail)
-    return compact
 
 
 _EXECUTION_PATH_TURN_STATUS_TO_FINAL = {

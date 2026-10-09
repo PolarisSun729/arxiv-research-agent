@@ -16,7 +16,7 @@ try:  # pragma: no cover - import path differs between backend cwd and package i
 except ModuleNotFoundError:  # pragma: no cover
     from backend.dependencies import get_recommendation_service
 
-from ..schemas import AgentToolCall, ArxivSearchSpec
+from ..schemas import AgentToolCall
 from ..state import AgentState
 from ..utils.result_utils import (
     _extract_error_message,
@@ -191,31 +191,6 @@ def _papers_are_significantly_fewer_than_requested(actual_count: int, max_result
     return actual_count <= max(1, max_results // 2)
 
 
-def _summarize_search_spec(spec: Optional[ArxivSearchSpec]) -> str:
-    """把 search spec 压缩成可读的中文摘要，用于最终回复。
-    
-    会按 query、title_query、abstract_query、categories、时间范围、排序方式和数量上限依次拼接，
-    输出适合直接放进 answer 的一句中文说明。
-    """
-    if spec is None:
-        return "当前搜索条件"
-
-    parts: List[str] = []
-    if spec.query:
-        parts.append(f"主题 {spec.query}")
-    if spec.title_query:
-        parts.append(f"标题 {spec.title_query}")
-    if spec.abstract_query:
-        parts.append(f"摘要 {spec.abstract_query}")
-    if spec.categories:
-        parts.append(f"类别 {', '.join(spec.categories)}")
-    if spec.submitted_days_ago is not None:
-        parts.append(f"最近 {spec.submitted_days_ago} 天")
-    parts.append(f"排序 {spec.sort_by} / {spec.sort_order}")
-    parts.append(f"最多 {spec.max_results} 篇")
-    return "，".join(parts)
-
-
 def _determine_requested_max_results(state: AgentState) -> int:
     """统一计算本轮搜索真正期望返回的最大论文数。
     
@@ -231,30 +206,6 @@ def _determine_requested_max_results(state: AgentState) -> int:
     if isinstance(state.tool_args, dict) and state.tool_args.get("max_results") is not None:
         return max(1, int(state.tool_args.get("max_results") or 10))
     return 10
-
-
-def _collect_priority_titles(papers: List[Dict[str, Any]], limit: int = 3) -> List[str]:
-    """从结果集中挑出最值得优先展示的论文标题。
-    
-    排序时会综合 priority、final_score、query_match_score 和 arxiv_id，
-    尽量让真正被推荐或匹配度更高的论文排在前面，最后只返回标题列表供回复层使用。
-    """
-    prioritized = sorted(
-        [paper for paper in papers if isinstance(paper, dict)],
-        key=lambda paper: (
-            float(paper.get("priority", 0) or 0) if float(paper.get("priority", 0) or 0) > 0 else 10_000.0,
-            -float(paper.get("final_score", 0.0) or 0.0),
-            -float(paper.get("query_match_score", 0.0) or 0.0),
-            str(paper.get("arxiv_id", "") or paper.get("id", "") or ""),
-        ),
-    )
-    titles: List[str] = []
-    for paper in prioritized[: max(1, int(limit or 3))]:
-        title = str(paper.get("title", "") or "").strip()
-        if not title:
-            continue
-        titles.append(title)
-    return titles
 
 
 def build_search_tool_args(state: Union[AgentState, Mapping[str, Any]]) -> AgentState:

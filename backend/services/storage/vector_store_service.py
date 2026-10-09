@@ -24,8 +24,6 @@ ASSET_PATH_MAX_LENGTH = VECTOR_STORE_CONFIG["asset_path_max_length"]
 ASSET_SUMMARY_MAX_LENGTH = VECTOR_STORE_CONFIG["asset_summary_max_length"]
 ASSET_PREVIEW_MAX_LENGTH = VECTOR_STORE_CONFIG["asset_preview_max_length"]
 
-COLLECTION_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
 
 def normalize_collection_name(collection_name: str) -> str:
     name = (collection_name or "").strip()
@@ -40,9 +38,6 @@ def normalize_collection_name(collection_name: str) -> str:
         name = f"_{name}"
     return name
 
-
-def is_valid_collection_name(collection_name: str) -> bool:
-    return bool(COLLECTION_NAME_PATTERN.match(collection_name or ""))
 
 class VectorDBConfig:
     """
