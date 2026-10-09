@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { categories } from '@/mock/papers'
+import { arxivCategories as categories } from '@/constants/arxivCategories'
 
 const props = defineProps<{
   modelValue?: {

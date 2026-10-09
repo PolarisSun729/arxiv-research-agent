@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 
 def _load_tool_node_modules():
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[5]
     backend_dir = repo_root / "backend"
     agent_dir = backend_dir / "agents" / "arxiv_search_agent"
     utils_dir = agent_dir / "utils"

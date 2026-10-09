@@ -58,7 +58,9 @@ def test_extracts_position_hints_without_resolving_last_papers(message: str, exp
             _paper("2401.00001", "Paper A"),
             _paper("2401.00002", "Paper B"),
             _paper("2401.00003", "Paper C"),
-        ]
+        ],
+        # 已选论文存在时，位置指代仍只能产出提示，不能回退绑定到 selected_paper。
+        "selected_paper": _paper("2401.00001", "Paper A"),
     }
 
     result = resolver._resolve_paper_reference(message, context)

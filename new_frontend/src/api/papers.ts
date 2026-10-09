@@ -24,10 +24,7 @@ import type {
   UserResearchProfileDetail,
   UserProfileBuildJob
 } from '@/types/paper'
-import { mockPapers, mockRecommendedPapers, mockLabeledPapers, mockStats } from '@/mock/papers'
 import { getCurrentUserId } from '@/composables/useUserContext'
-
-const isMockMode = false
 
 function resolveUserId(userId?: string | null): string {
   const normalized = String(userId || '').trim()
@@ -484,63 +481,14 @@ export async function activateUserResearchProfileSnapshot(snapshotId: string, us
 }
 
 export async function searchPapers(params: SearchParams): Promise<PaginatedResponse<Paper>> {
-  if (isMockMode) {
-    let filtered = [...mockPapers]
-    
-    if (params.keyword) {
-      const keyword = params.keyword.toLowerCase()
-      filtered = filtered.filter(p => 
-        p.title.toLowerCase().includes(keyword) ||
-        p.authors.some(a => a.toLowerCase().includes(keyword)) ||
-        p.summary.toLowerCase().includes(keyword)
-      )
-    }
-    
-    if (params.category) {
-      const category = params.category
-      filtered = filtered.filter(p => p.categories.includes(category))
-    }
-    
-    if (params.sortBy === 'newest') {
-      filtered.sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime())
-    } else if (params.sortBy === 'oldest') {
-      filtered.sort((a, b) => new Date(a.publishedAt).getTime() - new Date(b.publishedAt).getTime())
-    }
-    
-    const start = (params.page - 1) * params.pageSize
-    const end = start + params.pageSize
-    
-    return {
-      total: filtered.length,
-      items: filtered.slice(start, end)
-    }
-  }
-  
   return request.get('/papers/search', { params })
 }
 
 export async function getPaperById(id: string): Promise<Paper> {
-  if (isMockMode) {
-    const paper = mockPapers.find(p => p.id === id)
-    if (!paper) {
-      throw new Error('Paper not found')
-    }
-    return paper
-  }
-  
   return normalizePaper(await request.get(`/paper/${id}`))
 }
 
 export async function getRecommendations(params: { page: number; pageSize: number }): Promise<PaginatedResponse<RecommendedPaper>> {
-  if (isMockMode) {
-    const start = (params.page - 1) * params.pageSize
-    const end = start + params.pageSize
-    return {
-      total: mockRecommendedPapers.length,
-      items: mockRecommendedPapers.slice(start, end)
-    }
-  }
-
   const response: any = await request.get('/papers/recommendations', { params })
   const items = Array.isArray(response?.items)
     ? response.items.map(normalizeRecommendedPaper)
@@ -551,46 +499,11 @@ export async function getRecommendations(params: { page: number; pageSize: numbe
   }
 }
 
-export async function labelPaper(id: string, data: LabelParams): Promise<void> {
-  if (isMockMode) {
-    const paper = mockPapers.find(p => p.id === id)
-    if (paper) {
-      paper.label = data.label
-    }
-    return
-  }
-  
-  const paper = mockPapers.find(p => p.id === id)
-  if (!paper) {
-    throw new Error('Paper not found')
-  }
-  if (data.label === 'liked') {
-    return likePaper(paper)
-  }
-  return dislikePaper(paper)
-}
-
 export async function getLabeledPapers(params: { 
   label?: 'liked' | 'disliked'
   page: number
   pageSize: number
 }): Promise<PaginatedResponse<LabeledPaper>> {
-  if (isMockMode) {
-    let filtered = [...mockLabeledPapers]
-    
-    if (params.label) {
-      filtered = filtered.filter(p => p.label === params.label)
-    }
-    
-    const start = (params.page - 1) * params.pageSize
-    const end = start + params.pageSize
-    
-    return {
-      total: filtered.length,
-      items: filtered.slice(start, end)
-    }
-  }
-  
   const preferences = await getUserPreferences()
   const liked = preferences.liked_papers || []
   const disliked = preferences.disliked_papers || []
@@ -620,11 +533,6 @@ export async function getLabeledPapers(params: {
 }
 
 export async function getStats(userId?: string): Promise<DashboardStats> {
-  if (isMockMode) {
-    const { recommendedPapers, ...stats } = mockStats
-    return normalizeDashboardStats(stats)
-  }
-
   const effectiveUserId = resolveUserId(userId)
   const response = await request.get('/stats', {
     params: {

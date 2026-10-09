@@ -7,7 +7,7 @@ from unittest import mock
 
 
 def _load_search_node_module():
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[5]
     agent_dir = repo_root / "backend" / "agents" / "arxiv_search_agent"
     utils_dir = agent_dir / "utils"
     node_dir = agent_dir / "node"
