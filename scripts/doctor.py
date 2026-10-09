@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_ROOT = REPO_ROOT / "backend"
-FRONTEND_ROOT = REPO_ROOT / "new_frontend"
+FRONTEND_ROOT = REPO_ROOT / "frontend"
 
 for path in (REPO_ROOT, BACKEND_ROOT):
     path_str = str(path)
@@ -236,7 +236,7 @@ def check_frontend_dependencies() -> DoctorResult:
         return _result(
             "前端依赖",
             "PASS",
-            "new_frontend/node_modules 存在，Vite 本地依赖可见。",
+            "frontend/node_modules 存在，Vite 本地依赖可见。",
             required=True,
             affects_default_tests=True,
             affects_real_runtime=True,
@@ -245,8 +245,8 @@ def check_frontend_dependencies() -> DoctorResult:
     return _result(
         "前端依赖",
         "FAIL",
-        "new_frontend/node_modules 或 Vite 本地可执行文件不存在。",
-        "进入 new_frontend 后执行 npm install。",
+        "frontend/node_modules 或 Vite 本地可执行文件不存在。",
+        "进入 frontend 后执行 npm install。",
         required=True,
         affects_default_tests=True,
         affects_real_runtime=True,

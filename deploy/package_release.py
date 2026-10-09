@@ -58,7 +58,7 @@ def package_release(output: Path, commit: str, runtime_freeze: Path) -> dict:
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     if head != commit:
         raise ReleaseError("工作区不是本次通过 CI 的提交。")
-    if not (ROOT / "new_frontend/dist/index.html").is_file():
+    if not (ROOT / "frontend/dist/index.html").is_file():
         raise ReleaseError("请先通过包含前端构建的统一质量门禁。")
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="release-build-", dir=output) as temporary:
@@ -67,7 +67,7 @@ def package_release(output: Path, commit: str, runtime_freeze: Path) -> dict:
         subprocess.run(["git", "archive", "--format=tar", "-o", str(source_tar), commit], cwd=ROOT, check=True)
         payload = staging / "payload"
         extract_checked(source_tar, payload, source_archive=True)
-        shutil.copytree(ROOT / "new_frontend/dist", payload / "new_frontend/dist", symlinks=True)
+        shutil.copytree(ROOT / "frontend/dist", payload / "frontend/dist", symlinks=True)
         metadata_dir = payload / ".release"
         metadata_dir.mkdir(exist_ok=False)
         # 只打包安装测试依赖之前的运行时快照，pytest/fakeredis 等不进入生产环境。

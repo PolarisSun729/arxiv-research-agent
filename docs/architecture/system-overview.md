@@ -23,7 +23,7 @@
 
 | 层 | 责任 | 主要位置 | 维护约束 |
 | --- | --- | --- | --- |
-| 前端 | 交互、请求发起、流式事件消费和展示状态 | [`new_frontend/src/`](../../new_frontend/src/) | 不把后端执行真源复制为可驱动业务的前端状态。 |
+| 前端 | 交互、请求发起、流式事件消费和展示状态 | [`frontend/src/`](../../frontend/src/) | 不把后端执行真源复制为可驱动业务的前端状态。 |
 | Router | 参数校验、依赖注入、响应序列化和协议错误转换 | [`backend/routers/`](../../backend/routers/) | 不编排检索、画像或 Agent 状态机。 |
 | Agent Runtime | 将研究请求转换成受校验计划，并完成执行、观察和恢复 | [`backend/agents/arxiv_search_agent/`](../../backend/agents/arxiv_search_agent/) | 计划和运行状态必须使用统一 schema。 |
 | Tools | 以明确输入 schema 调用搜索、QA、推荐和偏好能力 | [`backend/tools/`](../../backend/tools/) | 工具注册表是可执行能力的唯一清单。 |

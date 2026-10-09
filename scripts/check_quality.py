@@ -14,7 +14,7 @@ from typing import Iterable
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-FRONTEND_ROOT = REPO_ROOT / "new_frontend"
+FRONTEND_ROOT = REPO_ROOT / "frontend"
 QUALITY_TMP_ROOT = REPO_ROOT / "temp" / "quality-gate-tmp"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 

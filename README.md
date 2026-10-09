@@ -205,7 +205,7 @@ backend/
   tests/                       # 单元、集成与启动烟测
   utils/                       # 配置、日志与通用工具
 
-new_frontend/
+frontend/
   src/api/                     # API client 与流式请求
   src/views/                   # 检索、论文、推荐、画像和 Agent 页面
   src/stores/                  # Pinia 状态管理
@@ -242,7 +242,7 @@ python -m venv .venv
 python -m pip install --upgrade pip
 python -m pip install -r requirements-dev.txt
 
-cd new_frontend
+cd frontend
 npm ci
 cd ..
 
@@ -299,7 +299,7 @@ python main.py --load-mode lazy
 在另一个终端启动前端：
 
 ~~~powershell
-cd new_frontend
+cd frontend
 npm run dev
 ~~~
 

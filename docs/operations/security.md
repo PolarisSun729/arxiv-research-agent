@@ -205,7 +205,7 @@ AUDIT_LOG_BACKUP_COUNT=5
 python scripts/test_security.py          # 三个安全阶段 + 初始化脚本，凭据与数据库全部隔离
 python scripts/test_security.py --full   # 同样隔离下运行全部后端离线回归
 python -m pytest backend/tests/unit/test_arxiv_pdf_download.py -q
-cd new_frontend; npm run test
+cd frontend; npm run test
 ```
 
 上线后在真实 HTTPS 域名确认：管理员登录与建号；viewer 无法建索引、启动 Agent 或读全局 trace；两个账号看不到对方私人数据；问答、SSE、图片、导出正常；退出或停用后旧令牌失效；Redis/认证库故障时业务拒绝执行。不要用真实昂贵请求做循环压测，可用不调用模型的接口验证限流。
@@ -216,5 +216,5 @@ cd new_frontend; npm run test
 - [认证与角色模块](../../backend/auth/)、[认证路由](../../backend/routers/auth_router.py)
 - [限流、配额与自动封禁](../../backend/middleware/rate_limit.py)、[IP 与可信代理](../../backend/middleware/ip_filter.py)、[审计](../../backend/middleware/audit_log.py)
 - [用户管理脚本](../../scripts/manage_users.py)
-- [前端认证传输](../../new_frontend/src/api/auth.ts)、[前端错误契约](../../new_frontend/src/api/errors.ts)
-- 回归：[stage1](../../backend/tests/api/test_security_stage1.py)、[stage2](../../backend/tests/api/test_security_stage2.py)、[stage3](../../backend/tests/api/test_security_stage3.py)、[前端](../../new_frontend/tests/security.test.mjs)
+- [前端认证传输](../../frontend/src/api/auth.ts)、[前端错误契约](../../frontend/src/api/errors.ts)
+- 回归：[stage1](../../backend/tests/api/test_security_stage1.py)、[stage2](../../backend/tests/api/test_security_stage2.py)、[stage3](../../backend/tests/api/test_security_stage3.py)、[前端](../../frontend/tests/security.test.mjs)

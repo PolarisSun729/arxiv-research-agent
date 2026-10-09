@@ -52,7 +52,7 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: new_frontend/package-lock.json
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Install backend dependencies
         run: |
@@ -68,7 +68,7 @@ jobs:
           python -m pip check
 
       - name: Install frontend dependencies
-        working-directory: new_frontend
+        working-directory: frontend
         run: npm ci
 
       - name: Run unified quality gate
