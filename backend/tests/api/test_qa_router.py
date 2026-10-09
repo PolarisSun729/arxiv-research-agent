@@ -81,11 +81,7 @@ class _FakeIndexJobManager:
 
 
 class _FakeMemoryService:
-    def __init__(self) -> None:
-        self.updated_notes = []
-
-    def update_profile_from_note(self, user_id: str, note):
-        self.updated_notes.append((user_id, dict(note)))
+    pass
 
 
 class _FakeEnhancedRetrievalService:

@@ -811,64 +811,6 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
         self.assertEqual(active["collection_name"], "qa_old_collection")
         self.assertEqual(failed_build["failed_stage"], "create_chunk_embeddings")
 
-    def test_cleanup_pending_builds_does_not_delete_active_collection(self) -> None:
-        self.storage.paper_catalog.add_paper(self._paper_payload())
-        backend_root = Path(__file__).resolve().parents[2]
-        old_retrieval_index_path = Path("02-retrieval-indexes") / "old_active_retrieval_indexes.json"
-        old_retrieval_index_file = backend_root / old_retrieval_index_path
-        old_retrieval_index_file.parent.mkdir(exist_ok=True)
-        old_retrieval_index_file.write_text('{"retrieval_indexes":[]}', encoding="utf-8")
-        old_sparse_path = Path("02-sparse-indexes") / "old_active_sparse"
-        old_sparse_dir = backend_root / old_sparse_path
-        old_sparse_dir.mkdir(parents=True, exist_ok=True)
-        old_sparse_manifest = old_sparse_dir / "manifest.json"
-        old_sparse_manifest.write_text("{}", encoding="utf-8")
-        self.storage.paper_qa_index.insert_paper_qa_index(
-            self.arxiv_id,
-            collection_name="qa_old_collection",
-            status="indexed",
-            chunk_count=2,
-            embedding_model="old-model",
-            # 旧记录可能仍是相对路径；清理流程应以 backend 为基准兼容这些记录。
-            retrieval_index_file=str(old_retrieval_index_path),
-            retrieval_index_count=2,
-            retrieval_index_types=json.dumps(["body"], ensure_ascii=False),
-            retrieval_index_version="old-version",
-            sparse_index_dir=str(old_sparse_path),
-            sparse_index_manifest_file=str(old_sparse_path / "manifest.json"),
-            sparse_index_document_count=2,
-            sparse_index_token_count=12,
-            sparse_index_backend="internal_bm25",
-            sparse_index_schema_version="sparse_index_artifact_v1",
-            sparse_index_source_file="old-chunks.json",
-            sparse_index_source_hash="old-sparse-hash",
-        )
-        builder, *_services, vector_store_service = self._make_builder()
-        builder.build_qa_index(self.arxiv_id, loading_method="docling")
-        active = self.storage.paper_qa_index.get_paper_qa_index(self.arxiv_id)
-        active_retrieval_index_file = Path(active["retrieval_index_file"])
-        active_sparse_dir = Path(active["sparse_index_dir"])
-        self.assertTrue(active_retrieval_index_file.is_file())
-        self.assertTrue(active_sparse_dir.is_dir())
-
-        cleanup_result = builder.cleanup_pending_index_builds(self.arxiv_id)
-
-        deleted_collections = [
-            call["collection_name"]
-            for call in vector_store_service.calls
-            if call["method"] == "delete_collection"
-        ]
-        self.assertIn("qa_old_collection", deleted_collections)
-        self.assertNotIn(active["collection_name"], deleted_collections)
-        self.assertFalse(old_retrieval_index_file.exists())
-        self.assertFalse(old_sparse_dir.exists())
-        self.assertTrue(active_retrieval_index_file.exists())
-        self.assertTrue(active_sparse_dir.exists())
-        active_cleanup = builder.cleanup_qa_index_artifacts(self.arxiv_id, active)
-        self.assertTrue(active_cleanup["skipped_active_build"])
-        self.assertTrue(active_sparse_dir.exists())
-        self.assertEqual(len(cleanup_result["failed"]), 0)
-
 
 class IndexJobManagerFlowTests(_BaseIndexTestCase):
     def test_submit_job_is_durable_and_only_one_worker_can_claim_it(self) -> None:
@@ -1115,7 +1057,7 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
         )
         job = self.storage.paper_qa_index.create_paper_index_job(self.arxiv_id, "docling")
 
-        manager.run_job(job["job_id"], self.arxiv_id, "docling")
+        self.assertTrue(manager.run_next_job())
 
         stored = self.storage.paper_qa_index.get_paper_index_job(job["job_id"])
         latest = self.storage.paper_qa_index.get_latest_paper_index_job(self.arxiv_id)
@@ -1131,7 +1073,7 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
         manager = IndexJobManager(paper_qa_index_store=self.storage.paper_qa_index, qa_index_builder=builder)
         job = self.storage.paper_qa_index.create_paper_index_job(self.arxiv_id, "docling")
 
-        manager.run_job(job["job_id"], self.arxiv_id, "docling")
+        self.assertTrue(manager.run_next_job())
 
         stored = self.storage.paper_qa_index.get_paper_index_job(job["job_id"])
         self.assertEqual(stored["status"], "failed")
@@ -1147,12 +1089,11 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
         def _submit_once() -> None:
             results.append(manager.submit_job(self.arxiv_id, "docling"))
 
-        with mock.patch.object(manager, "run_job", lambda *_args, **_kwargs: None):
-            threads = [threading.Thread(target=_submit_once) for _ in range(4)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join()
+        threads = [threading.Thread(target=_submit_once) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
 
         job_ids = {item["job_id"] for item in results}
         active_jobs = [

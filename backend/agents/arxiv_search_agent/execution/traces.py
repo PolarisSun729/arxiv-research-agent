@@ -102,42 +102,6 @@ def _record_step_output(runtime: PlanRuntime, step: PlanStep, normalized_output:
         runtime.outputs["paper_qa_result"] = normalized_output
 
 
-def _extract_arxiv_id_from_paper_payload(payload: Mapping[str, Any]) -> str:
-    """从论文工具输入中提取最终 arXiv ID；确认兜底只能基于明确目标，避免误跳过用户确认。"""
-    candidate_values: List[Any] = [payload.get("arxiv_id")]
-    for key in ("paper_reference", "paper_ref", "target_paper", "paper"):
-        value = payload.get(key)
-        if isinstance(value, Mapping):
-            candidate_values.append(value.get("arxiv_id"))
-    for value in candidate_values:
-        text = str(value or "").strip()
-        if text:
-            return text
-    return ""
-
-
-def _build_existing_index_skip_output(arxiv_id: str, check_result: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    """把索引状态检查结果归一成 parse_and_index_paper 的成功输出；未知或失败时不改变原确认流程。"""
-    if not bool(check_result.get("ok", False)):
-        return None
-    data = check_result.get("data")
-    status_data = dict(data or {}) if isinstance(data, Mapping) else {}
-    status = str(status_data.get("status") or "").strip().lower()
-    has_index = bool(status_data.get("has_index"))
-    if not has_index and status not in {"available", "indexed", "already_indexed", "ready"}:
-        return None
-    output = {
-        **status_data,
-        "status": "indexed",
-        "has_index": True,
-        "arxiv_id": arxiv_id,
-        "skipped_rebuild": True,
-        "skip_reason": "paper_qa_index_already_available",
-        "tool_result": dict(check_result),
-    }
-    return output
-
-
 def _should_preserve_non_success_observation_output(step: PlanStep, normalized_output: Any) -> bool:
     """保留“目标解析未完成”类输出，便于 fallback/debug 说明为何不能继续。
 

@@ -324,31 +324,6 @@ class PaperQAIndexBuilder:
                 result["files_missing"].append({"field": "sparse_index_manifest_file", "path": manifest_path})
         return result
 
-    def cleanup_pending_index_builds(self, arxiv_id: str, *, limit: int = 5) -> Dict[str, Any]:
-        """延迟清理 cleanup_pending 版本；清理失败只进入结果，不影响 active 索引问答。"""
-        active = self.paper_qa_index_store.get_active_paper_qa_index_build(arxiv_id)
-        active_build_id = active.get("build_id") if active else None
-        candidates = self.paper_qa_index_store.list_paper_qa_index_builds(
-            arxiv_id,
-            statuses=["cleanup_pending", "orphaned", "build_failed"],
-            limit=limit,
-        )
-        result = {"cleaned": [], "failed": [], "skipped_active": []}
-        for build in candidates:
-            build_id = build.get("build_id")
-            if build_id == active_build_id:
-                # 防御性跳过：清理流程绝不能误删当前线上 collection。
-                result["skipped_active"].append(build_id)
-                continue
-            try:
-                cleanup_result = self.cleanup_qa_index_artifacts(arxiv_id, build)
-                marked = self.paper_qa_index_store.mark_paper_qa_index_build_deleted(build_id)
-                result["cleaned"].append({"build_id": build_id, "cleanup": cleanup_result, "marked_deleted": marked})
-            except Exception as exc:
-                logger.exception("Failed to cleanup QA index build: arxiv_id=%s build_id=%s", arxiv_id, build_id)
-                result["failed"].append({"build_id": build_id, "error": str(exc)})
-        return result
-
     def record_index_stage(
         self,
         arxiv_id: str,

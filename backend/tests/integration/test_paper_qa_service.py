@@ -179,7 +179,6 @@ PaperQAService = _load_paper_qa_service_class()
 
 class _FakeMemoryService:
     def __init__(self) -> None:
-        self.updated_notes = []
         self.paper_conversation_turns = []
 
     def load_paper_conversation_context(self, *, user_id: str, arxiv_id: str, session_id=None, limit: int = 5):
@@ -198,9 +197,6 @@ class _FakeMemoryService:
     def merge_conversation_context(self, db_turns, payload_turns, limit: int = 5):
         merged = list(db_turns or []) + list(payload_turns or [])
         return merged[-limit:]
-
-    def update_profile_from_note(self, user_id: str, note):
-        self.updated_notes.append((user_id, deepcopy(note)))
 
     def build_user_memory_summary(self, _user_id: str):
         # 该组件用例不关注长期记忆内容，但 fake 仍需与生产接口一致，避免误走异常兜底。

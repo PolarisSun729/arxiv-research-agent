@@ -11,7 +11,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from services.context_merge import merge_backend_authoritative_context
 from services.memory.memory_models import (
     AgentSessionMemory,
-    PaperChatHistory,
     PreferenceSummary,
 )
 from services.memory.concept_normalizer import ConceptNormalizer
@@ -2154,57 +2153,6 @@ class MemoryService:
             return self.load_user_profile(resolved_user_id)
         return self.research_profile_store.patch_user_manual_profile(user_id=resolved_user_id, profile=merged_patch, source=normalized_source)
 
-    def update_profile_from_note(self, user_id: Optional[str], note: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        """根据用户保存并允许入画像的笔记内容更新长期研究画像。"""
-        normalized_note = dict(note or {})
-        if not normalized_note or not normalized_note.get("include_in_profile"):
-            # 只有显式标记 include_in_profile 的笔记，才会参与长期画像学习。
-            return self.load_user_profile(user_id)
-
-        resolved_user_id = self._resolve_user_id(user_id)
-        note_id = str(normalized_note.get("note_id") or normalized_note.get("id") or "").strip()
-        arxiv_id = str(normalized_note.get("arxiv_id") or "").strip()
-        # 笔记保存只追加画像事件，不在请求链路同步跑完整画像生成。
-        self.profile_event_store.record_user_profile_event(
-            user_id=resolved_user_id,
-            event_type="note_saved",
-            source_type="paper_note",
-            source_id=note_id or arxiv_id,
-            action_type="note_saved",
-            arxiv_id=arxiv_id,
-            note_id=note_id or None,
-            metadata=normalized_note,
-            include_in_profile=True,
-        )
-        return self.load_user_profile(resolved_user_id)
-
-    def update_profile_from_preference(
-        self,
-        user_id: Optional[str],
-        arxiv_id: str,
-        action_type: str,
-        paper_payload: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """根据喜欢/不喜欢等显式偏好动作更新用户长期画像。"""
-        normalized_action = str(action_type or "").strip().lower()
-        if normalized_action not in {"like", "liked", "dislike", "disliked", "not_interested"}:
-            return self.load_user_profile(user_id)
-
-        paper = self._resolve_paper_payload(arxiv_id, paper_payload=paper_payload)
-        resolved_user_id = self._resolve_user_id(user_id)
-        # 偏好动作只落事件流；生成器在构建任务中统一决定权重和正负向归因。
-        self.profile_event_store.record_user_profile_event(
-            user_id=resolved_user_id,
-            event_type="liked" if normalized_action in {"like", "liked"} else "disliked",
-            source_type="paper_action",
-            source_id=arxiv_id,
-            action_type=normalized_action,
-            arxiv_id=arxiv_id,
-            metadata={"paper": paper},
-            include_in_profile=True,
-        )
-        return self.load_user_profile(resolved_user_id)
-
     def load_preference_summary(self, user_id: Optional[str]) -> Dict[str, Any]:
         """加载用户偏好摘要，包括点赞/点踩、动作映射与兴趣向量。"""
         resolved_user_id = self._resolve_user_id(user_id)
@@ -2294,67 +2242,6 @@ class MemoryService:
                 "last_signal_timestamp": self.profile_event_store.get_latest_user_signal_timestamp(user_id=resolved_user_id),
             },
         }
-
-    def load_paper_chat_history(
-        self,
-        user_id: Optional[str],
-        arxiv_id: str,
-        session_id: Optional[str] = None,
-        limit: int = 5,
-    ) -> Dict[str, Any]:
-        """读取单篇论文的对话历史，并选择一个最合适的会话作为当前会话。"""
-        resolved_user_id = self._resolve_user_id(user_id)
-        message_limit = self._coerce_limit(limit)
-        requested_session_id = str(session_id or "").strip() or None
-
-        sessions: List[Dict[str, Any]] = []
-        selected_session: Optional[Dict[str, Any]] = None
-
-        if requested_session_id:
-            candidate_session = self.paper_chat_session_store.get_paper_chat_session(requested_session_id, user_id=resolved_user_id)
-            if candidate_session and candidate_session.get("arxiv_id") == arxiv_id:
-                # 调用方显式指定 session_id 时，优先使用该会话，但前提是论文归属匹配。
-                selected_session = candidate_session
-                sessions = [candidate_session]
-            else:
-                logger.warning(
-                    "Skipping paper chat session %s for user %s and arxiv_id %s due to mismatch or absence",
-                    requested_session_id,
-                    resolved_user_id,
-                    arxiv_id,
-                )
-
-        if selected_session is None:
-            # 未指定或指定失败时，退化为按论文读取最近会话，并默认取第一条作为当前会话。
-            sessions = self.paper_chat_session_store.list_paper_chat_sessions(
-                arxiv_id=arxiv_id,
-                user_id=resolved_user_id,
-                limit=message_limit,
-            )
-            selected_session = sessions[0] if sessions else None
-
-        messages: List[Dict[str, Any]] = []
-        total_messages = 0
-        if selected_session:
-            all_messages = self.paper_chat_message_store.list_paper_chat_messages(
-                selected_session["session_id"],
-                user_id=resolved_user_id,
-            )
-            total_messages = len(all_messages)
-            # 返回给调用方的是最近若干条消息，但 total_messages 会保留完整规模信息。
-            messages = all_messages[-message_limit:]
-
-        history = PaperChatHistory(
-            user_id=resolved_user_id,
-            arxiv_id=arxiv_id,
-            requested_session_id=requested_session_id,
-            selected_session=selected_session,
-            sessions=sessions,
-            messages=messages,
-            message_limit=message_limit,
-            total_messages=total_messages,
-        )
-        return history.to_dict()
 
     def load_agent_memory(
         self,

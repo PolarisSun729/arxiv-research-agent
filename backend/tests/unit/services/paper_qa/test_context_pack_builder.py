@@ -38,7 +38,10 @@ def test_context_pack_builder_covers_text_assets_and_source_payload_fields() -> 
     ]
 
     context_pack_builder = ContextPackBuilder()
-    text_context, image_inputs, asset_metadata = context_pack_builder.build_generation_context(search_results)
+    context_pack = context_pack_builder.build(search_results)
+    text_context = context_pack["text_context"]
+    image_inputs = context_pack["image_inputs"]
+    asset_metadata = context_pack["asset_metadata"]
     source_payload = context_pack_builder.build_source_payload(search_results)
 
     assert long_content in text_context

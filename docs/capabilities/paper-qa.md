@@ -25,7 +25,7 @@ flowchart LR
 
 ## 异步索引任务
 
-`IndexJobManager.submit_job()` 为常规入口创建或复用任务，`run_job()` 负责占用和执行。QA Router 在查询任务前调用 stale 自愈逻辑，避免前端永远看到 pending/running。
+`IndexJobManager.submit_job()` 为常规入口创建或复用任务，后台 worker 通过 `run_next_job()` 以数据库 lease 领取并执行。QA Router 在查询任务前调用 stale 自愈逻辑，避免前端永远看到 pending/running。
 
 维护任务状态时应遵守：
 

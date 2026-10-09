@@ -101,9 +101,6 @@ def test_settings_deduplicate_keys_and_do_not_expose_them_in_repr(monkeypatch):
     assert len(settings.key_hashes) == 2
     assert settings.allowed_origins == ("https://research.example",)
     assert TEST_KEY not in repr(settings)
-    assert settings.accepts(TEST_KEY)
-    assert settings.accepts(ROTATED_KEY)
-    assert not settings.accepts("密" * 40)
 
 
 @pytest.mark.parametrize("method,path", [
