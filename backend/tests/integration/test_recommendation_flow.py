@@ -1,4 +1,4 @@
-﻿import gc
+import gc
 import importlib.util
 import json
 import sys

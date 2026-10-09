@@ -42,7 +42,7 @@ class TemporaryReleaseTest(unittest.TestCase):
         payload = self.directory / "payload"
         for name, content in {
             "backend/main.py": "app = None\n",
-            "new_frontend/dist/index.html": "<html>release</html>",
+            "frontend/dist/index.html": "<html>release</html>",
             ".release/requirements.lock": "example==1.0 --hash=sha256:" + "0" * 64,
             ".release/wheels/example.whl": "wheel placeholder",
         }.items():
@@ -96,7 +96,7 @@ class ArchiveTests(TemporaryReleaseTest):
         destination = self.directory / "extracted"
         extract_checked(self.make_archive(payload), destination)
         self.assertEqual(validate_release(destination, COMMIT)["commit"], COMMIT)
-        self.assertEqual((destination / "new_frontend/dist/index.html").read_text(), "<html>release</html>")
+        self.assertEqual((destination / "frontend/dist/index.html").read_text(), "<html>release</html>")
 
     def test_unsafe_members_rejected_before_any_extraction(self) -> None:
         cases = [
@@ -162,7 +162,7 @@ class ArchiveTests(TemporaryReleaseTest):
 
     def test_missing_frontend_rejected(self) -> None:
         payload = self.make_payload()
-        (payload / "new_frontend/dist/index.html").unlink()
+        (payload / "frontend/dist/index.html").unlink()
         with self.assertRaisesRegex(ReleaseError, "必要文件"):
             validate_release(payload, COMMIT)
 

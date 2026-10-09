@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest>=9.1,<10
+fakeredis[lua]>=2.38,<3
+# FastAPI TestClient 依赖 httpx；测试直接导入它，不能依赖 openai 的间接安装。
+httpx>=0.28,<1

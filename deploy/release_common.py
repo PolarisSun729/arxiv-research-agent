@@ -122,7 +122,7 @@ def validate_release(directory: Path, commit: str) -> dict:
     lock = directory / ".release/requirements.lock"
     if manifest.get("dependency_hash") != sha256_file(lock):
         raise ReleaseError("依赖锁文件校验失败。")
-    for name in ("backend/main.py", "new_frontend/dist/index.html"):
+    for name in ("backend/main.py", "frontend/dist/index.html"):
         if not (directory / name).is_file():
             raise ReleaseError(f"发布包缺少必要文件：{name}")
     if not (directory / ".release/wheels").is_dir():

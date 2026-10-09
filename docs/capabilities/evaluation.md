@@ -6,6 +6,14 @@
 
 研究图的独立主张校验属于生产能力。评测中的引用忠诚度是对该校验关系的确定性复核，不是额外的 LLM-as-Judge，也不能代替人工校准校验器的准确性。
 
+## 设计取舍
+
+- **先换引擎，再建评测**：旧 QA 链把完整回答、有限回答、证据拒答压成同一段文本，没有结构化 outcome、修复轮次或主张—引用绑定可供计分。在它上面建基线只会把错误语义固化成标准，所以先让研究引擎成为唯一生产 QA 路径，再在它的结构化输出上计分，不做新旧 A/B。
+- **不锁 temperature，也不缓存输出**：锁定后测到的是线上并不存在的版本。改为每题重复 3 次，取中位数并报告离散度，离散度本身也是指标。
+- **确定性指标优先**：当前不做 LLM-as-Judge，也不做参考答案语义相似度；这两项留作后续的可选层。
+- **退化只告警**：关键指标下降超过 5 个百分点时标红，但不让 CI 失败，因为真实 golden 评测依赖模型与索引环境，不进 CI。
+- **暂不包含**：LLM 扩充评测集、线上 query 回流与点击/反馈信号，需要时另行立项。
+
 ## Golden 标注
 
 JSONL 每行一个 [`GoldenCase`](../../backend/services/evaluation/contracts.py)。`case_id` 必须唯一，`arxiv_id` 指向已建立 QA 索引的论文，`question` 非空。以下示意中的文本和 ID 必须替换为人工核实的内容：
@@ -91,7 +99,6 @@ print(json.dumps(scored, ensure_ascii=False, indent=2))
 
 ```powershell
 python -m pytest tests/unit/services/evaluation tests/unit/services/paper_evidence_research tests/integration/test_research_qa_contract.py tests/unit/services/test_llm_call_metrics.py
-python smoke_test_research_stream.py
 ```
 
 这些测试使用真实请求/结果模型、研究图、临时会话存储与受控外部 I/O，验证同步、SSE、记录重评分、引用支持、故障分母和成本统计，不生成真实 golden 基线。完整测试入口见 [测试指南](../operations/testing.md)。

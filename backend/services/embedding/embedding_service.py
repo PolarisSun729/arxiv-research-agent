@@ -19,10 +19,10 @@ import base64
 import mimetypes
 import threading
 import torch
-from utils.model_utils import get_huggingface_model_path
 import numpy as np
 import sys
 import requests
+from openai import OpenAI
 from services.retrieval.retrieval_index import (
     RetrievalIndex,
     build_retrieval_indexes,
@@ -40,9 +40,6 @@ DASHSCOPE_MAX_RETRY_DELAY_SECONDS = 30.0
 
 class EmbeddingProvider(str, Enum):
     OPENAI = "openai"
-    BEDROCK = "bedrock"
-    HUGGINGFACE = "huggingface"
-    MODELSCOPE = "modelscope"
     DASHSCOPE = "dashscope"
     LOCAL = "local"
 
@@ -188,15 +185,21 @@ class EmbeddingService:
     DASHSCOPE_RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 
     def __init__(self):
-        """初始化 provider 工厂、本地模型句柄和进程内 embedding 缓存。
+        """初始化本地模型句柄和进程内 embedding 缓存。
 
         返回:
             None
         """
-        self.embedding_factory = EmbeddingFactory()
         self._local_embedder = None
         self._embedding_cache: dict[str, list] = {}
         self._embedding_cache_lock = threading.Lock()
+
+    @staticmethod
+    def _create_openai_embeddings(texts: list, config: EmbeddingConfig) -> list:
+        """通过 OpenAI 兼容接口批量生成文本向量。"""
+        client = OpenAI(api_key=config.api_key or None, base_url=config.base_url or None)
+        response = client.embeddings.create(model=config.model_name, input=texts)
+        return [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
 
     def get_default_embedding_config(self) -> EmbeddingConfig:
         """返回当前环境下的默认 embedding 配置。
@@ -791,58 +794,33 @@ class EmbeddingService:
                         )
             return results, {}
 
-        embedding_function = self.embedding_factory.create_embedding_function(config)
+        if provider_key != EmbeddingProvider.OPENAI.value:
+            raise ValueError(f"Unsupported embedding provider: {config.provider}")
         if any(item["embedding_input"].get("mode") == "multimodal" for item in prepared_inputs):
-            unsupported = provider_key not in {EmbeddingProvider.MODELSCOPE.value}
-            if unsupported:
-                raise ValueError(
-                    f"Embedding provider/model does not support multimodal figure embedding: provider={config.provider}, model={config.model_name}"
-                )
+            raise ValueError(
+                f"Embedding provider/model does not support multimodal figure embedding: provider={config.provider}, model={config.model_name}"
+            )
 
-        if provider_key == EmbeddingProvider.OPENAI.value:
-            for i in range(0, len(prepared_inputs), batch_size):
-                batch = prepared_inputs[i : i + batch_size]
-                texts = [item["embedding_input"]["text"] for item in batch]
-                embedding_vectors = embedding_function.embed_documents(texts)
+        for i in range(0, len(prepared_inputs), batch_size):
+            batch = prepared_inputs[i : i + batch_size]
+            texts = [item["embedding_input"]["text"] for item in batch]
+            embedding_vectors = self._create_openai_embeddings(texts, config)
 
-                for prepared, embedding_vector in zip(batch, embedding_vectors):
-                    chunk = prepared["chunk"]
-                    results.append(
-                        {
-                            "embedding": embedding_vector,
-                            "metadata": self._build_embedding_metadata(
-                                chunk=chunk,
-                                chunk_count=len(chunks),
-                                embedding_vector=embedding_vector,
-                                provider=provider_key,
-                                model=config.model_name,
-                                filename=filename,
-                                retrieval_index=prepared["retrieval_index"],
-                            ),
-                        }
-                    )
-        else:
-            for prepared in prepared_inputs:
+            for prepared, embedding_vector in zip(batch, embedding_vectors):
                 chunk = prepared["chunk"]
-                embedding_input = prepared["embedding_input"]
-                if embedding_input.get("mode") == "multimodal":
-                    # ModelScope 等 provider 在多模态场景直接接收结构化 payload。
-                    embedding_vector = embedding_function.embed_query(embedding_input)
-                else:
-                    embedding_vector = embedding_function.embed_query(embedding_input["text"])
                 results.append(
                     {
                         "embedding": embedding_vector,
-                            "metadata": self._build_embedding_metadata(
-                                chunk=chunk,
-                                chunk_count=len(chunks),
-                                embedding_vector=embedding_vector,
-                                provider=provider_key,
-                                model=config.model_name,
-                                filename=filename,
-                                retrieval_index=prepared["retrieval_index"],
-                            ),
-                        }
+                        "metadata": self._build_embedding_metadata(
+                            chunk=chunk,
+                            chunk_count=len(chunks),
+                            embedding_vector=embedding_vector,
+                            provider=provider_key,
+                            model=config.model_name,
+                            filename=filename,
+                            retrieval_index=prepared["retrieval_index"],
+                        ),
+                    }
                 )
 
         return results, {}
@@ -935,7 +913,6 @@ class EmbeddingService:
             if provider_key not in {
                 EmbeddingProvider.DASHSCOPE.value,
                 EmbeddingProvider.LOCAL.value,
-                EmbeddingProvider.MODELSCOPE.value,
             }:
                 raise ValueError(
                     f"Embedding provider/model does not support multimodal figure embedding: provider={provider_key}"
@@ -1207,9 +1184,9 @@ class EmbeddingService:
             self._set_cached_embedding(cache_key, embedding)
             return embedding
 
-        # 其余 provider 通过统一工厂创建具体 embedding function。
-        embedding_function = self.embedding_factory.create_embedding_function(config)
-        embedding = embedding_function.embed_query(text)
+        if normalized_provider != EmbeddingProvider.OPENAI.value:
+            raise ValueError(f"Unsupported embedding provider: {config.provider}")
+        embedding = self._create_openai_embeddings([text], config)[0]
         normalized_embedding = self._normalize_vector_output(embedding)
         self._set_cached_embedding(cache_key, normalized_embedding)
         return normalized_embedding
@@ -1313,12 +1290,11 @@ class EmbeddingService:
                         self._set_cached_embedding(cache_key, normalized_embedding)
                         results[index] = normalized_embedding
             elif normalized_provider == EmbeddingProvider.OPENAI.value:
-                embedding_function = self.embedding_factory.create_embedding_function(config)
                 effective_batch_size = max(1, int(batch_size or config.batch_size or 20))
                 for start in range(0, len(pending_texts), effective_batch_size):
                     batch_indexes = pending_indexes[start : start + effective_batch_size]
                     batch_texts = pending_texts[start : start + effective_batch_size]
-                    batch_embeddings = embedding_function.embed_documents(batch_texts)
+                    batch_embeddings = self._create_openai_embeddings(batch_texts, config)
                     if len(batch_embeddings) != len(batch_texts):
                         raise ValueError(
                             f"OpenAI-compatible embedder returned {len(batch_embeddings)} embeddings for {len(batch_texts)} texts"
@@ -1371,31 +1347,6 @@ class EmbeddingService:
         """使用本地模型生成单条纯文本 embedding。"""
         return self.create_single_embedding_local_input({"mode": "text", "text": text})
 
-    def create_single_embedding_modelscope(self, text: str, model: str = "Qwen/Qwen3-VL-Embedding-2B") -> list:
-        """直接调用 ModelScope pipeline 生成 embedding。"""
-        try:
-            from modelscope.pipelines import pipeline
-            from modelscope.utils.constant import Tasks
-            pipe = pipeline(Tasks.multi_modal_embedding, model=model)
-            payload = text if isinstance(text, dict) else {"text": text}
-            result = pipe(payload)
-            if isinstance(result, dict) and "text_embedding" in result:
-                embedding = result["text_embedding"]
-            elif isinstance(result, list) and len(result) > 0:
-                embedding = result[0]
-            else:
-                embedding = result
-
-            if isinstance(embedding, np.ndarray):
-                embedding = embedding.tolist()
-            elif not isinstance(embedding, list):
-                embedding = [float(x) for x in embedding]
-
-            return embedding
-        except Exception as e:
-            logger.error(f"Error creating embedding with ModelScope: {str(e)}")
-            raise
-
     def get_document_embedding_config(self, collection_name: str) -> EmbeddingConfig:
         """根据已保存的 embedding 文件反查某个集合对应的向量配置。"""
         try:
@@ -1426,61 +1377,3 @@ class EmbeddingService:
             encoded = base64.b64encode(image_file.read()).decode("ascii")
         return f"data:{mime_type};base64,{encoded}"
 
-
-class EmbeddingFactory:
-    @staticmethod
-    def create_embedding_function(config: EmbeddingConfig):
-        """根据 provider 创建对应的 embedding function 适配器。"""
-        if config.provider == EmbeddingProvider.BEDROCK:
-            import boto3
-            from langchain_community.embeddings import BedrockEmbeddings
-            bedrock_client = boto3.client(
-                service_name="bedrock-runtime",
-                region_name=config.aws_region,
-                aws_access_key_id=EMBEDDING_CONFIG["aws_access_key_id"] or None,
-                aws_secret_access_key=EMBEDDING_CONFIG["aws_secret_access_key"] or None,
-            )
-            return BedrockEmbeddings(client=bedrock_client, model_id=config.model_name)
-
-        if config.provider == EmbeddingProvider.OPENAI:
-            from langchain_community.embeddings import OpenAIEmbeddings
-            return OpenAIEmbeddings(model=config.model_name, openai_api_key=EMBEDDING_CONFIG["openai_api_key"] or None)
-
-        if config.provider == EmbeddingProvider.HUGGINGFACE:
-            from langchain_community.embeddings import HuggingFaceEmbeddings
-            model_name = get_huggingface_model_path(config.model_name)
-            return HuggingFaceEmbeddings(model_name=model_name)
-
-        if config.provider == EmbeddingProvider.MODELSCOPE:
-            class ModelScopeEmbedding:
-                def __init__(self, model_name):
-                    """初始化 ModelScope 多模态 embedding pipeline。"""
-                    from modelscope.pipelines import pipeline
-                    from modelscope.utils.constant import Tasks
-                    self.model_name = model_name
-                    self.pipe = pipeline(Tasks.multi_modal_embedding, model=model_name)
-
-                def embed_query(self, text):
-                    """生成单条查询向量，兼容文本和结构化多模态载荷。"""
-                    payload = text if isinstance(text, dict) else {"text": text}
-                    result = self.pipe(payload)
-                    if isinstance(result, dict) and "text_embedding" in result:
-                        embedding = result["text_embedding"]
-                    elif isinstance(result, list) and len(result) > 0:
-                        embedding = result[0]
-                    else:
-                        embedding = result
-
-                    if isinstance(embedding, np.ndarray):
-                        return embedding.tolist()
-                    if not isinstance(embedding, list):
-                        return [float(x) for x in embedding]
-                    return embedding
-
-                def embed_documents(self, texts):
-                    """逐条生成文档向量，保持与 LangChain 风格接口兼容。"""
-                    return [self.embed_query(text) for text in texts]
-
-            return ModelScopeEmbedding(config.model_name)
-
-        raise ValueError(f"Unsupported embedding provider: {config.provider}")

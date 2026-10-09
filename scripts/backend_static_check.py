@@ -17,7 +17,7 @@ from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_ROOT = REPO_ROOT / "backend"
-FRONTEND_SRC_ROOT = REPO_ROOT / "new_frontend" / "src"
+FRONTEND_SRC_ROOT = REPO_ROOT / "frontend" / "src"
 DOCS_ROOT = REPO_ROOT / "docs"
 STATIC_LEGACY_SCAN_ROOTS = (BACKEND_ROOT, REPO_ROOT / "scripts", FRONTEND_SRC_ROOT, DOCS_ROOT)
 STATIC_LEGACY_SCAN_SUFFIXES = {".py", ".ts", ".tsx", ".js", ".jsx", ".vue", ".md"}

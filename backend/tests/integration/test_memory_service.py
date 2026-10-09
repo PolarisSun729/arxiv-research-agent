@@ -1,4 +1,4 @@
-﻿import gc
+import gc
 import json
 import unittest
 from unittest import mock

@@ -17,13 +17,15 @@
 | 修改后应如何验证，以及何时必须同步文档 | [维护与质量](operations/maintenance-quality.md) | [`scripts/check_quality.py`](../scripts/check_quality.py) |
 | 自动化测试的离线边界、分层命令和覆盖率如何维护 | [测试指南](operations/testing.md) | [`backend/tests/`](../backend/tests/) |
 | Debian 12 首次安装、自动发布与回退如何配置 | [CI/CD 部署手册](operations/cicd-deployment.md) | [`deploy/`](../deploy/) |
+| 认证、角色、限流、配额、审计与脱敏的边界 | [安全与访问控制](operations/security.md) | [`backend/auth/`](../backend/auth/)、[`backend/middleware/`](../backend/middleware/) |
+| 论文证据研究引擎为什么这样设计 | [架构决策记录](adr/) | [`backend/services/paper_evidence_research/`](../backend/services/paper_evidence_research/) |
 
 ## 文档边界
 
 - 每个业务能力只有一份说明，不按 Router 逐接口复制调用链。
 - 文档记录稳定的职责、状态真源、失败边界和代码锚点，不复制容易变动的局部实现细节。
 - 调试路由、trace 和内部状态可以在架构文档中说明边界，但不能被写成稳定对外接口。
-- 历史改造计划、已完成的迁移基准和逐文件阅读笔记不放在仓库文档中；需要追溯时使用 Git 历史。
+- 历史改造计划、已完成的迁移基准和逐文件阅读笔记不放在仓库文档中；需要追溯时使用 Git 历史。长期有效的设计决策写成 [ADR](adr/)，每条只记录决策与理由。
 
 ## 同步规则
 
@@ -40,5 +42,6 @@
 | 校验脚本、CI 编排或验收口径 | [维护与质量](operations/maintenance-quality.md) |
 | 测试分层、离线约束、运行命令或覆盖率口径 | [测试指南](operations/testing.md) |
 | 发布包、服务器目录、运行环境、回退或部署变量 | [CI/CD 部署手册](operations/cicd-deployment.md) |
+| 认证模式、角色权限、限流/配额、IP 策略、审计或脱敏 | [安全与访问控制](operations/security.md) |
 
 提交前运行 `python scripts/check_docs.py`。该校验会验证本目录及维护入口文档中的相对 Markdown 链接和代码路径，不访问网络；统一质量门禁也会执行它。
