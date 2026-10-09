@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Iterable
 
 
 class FakeGenerationService:
@@ -27,11 +27,6 @@ class FakeGenerationService:
             "answer": self.response_text,
             "model": kwargs.get("model_name", "fake-generation-model"),
         }
-
-    def stream_qwen_responses(self, prompt: str, **kwargs: Any) -> Iterator[str]:
-        self._record("stream_qwen_responses", prompt=prompt, kwargs=kwargs)
-        for chunk in self.response_text.split():
-            yield chunk
 
     def rewrite_query_for_retrieval(self, query: str, **kwargs: Any) -> list[str]:
         self._record("rewrite_query_for_retrieval", query=query, kwargs=kwargs)

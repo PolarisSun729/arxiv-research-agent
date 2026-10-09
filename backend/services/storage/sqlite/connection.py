@@ -20,7 +20,6 @@ class SqliteConnectionProvider:
         self.db_path = resolve_storage_path(
             configured_path,
             default_path=BACKEND_DATA_ROOT / "recommendation.db",
-            option_name="db_path" if db_path else "SQLITE_DATABASE_PATH",
         )
         self.check_same_thread = (
             SQLITE_CONFIG["check_same_thread"] if check_same_thread is None else check_same_thread

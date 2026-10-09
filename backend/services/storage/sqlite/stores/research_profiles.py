@@ -3,9 +3,6 @@ from typing import Any, Dict, List, Optional
 
 from services.storage.sqlite.base import BaseSqliteStore
 from services.storage.sqlite.profile_normalization import (
-    looks_like_profile_arxiv_category,
-    looks_like_profile_arxiv_id,
-    looks_like_profile_paper_title,
     normalize_profile_categories,
     normalize_profile_list_value,
     normalize_profile_papers,
@@ -23,7 +20,7 @@ from services.storage.sqlite.stores.profile_events import ProfileEventStore
 
 
 class ResearchProfileStore(BaseSqliteStore):
-    """维护 manual/generated/effective 研究画像、快照和 legacy 画像迁移。"""
+    """维护 manual/generated/effective 研究画像与快照。"""
 
     def __init__(
         self,
@@ -40,10 +37,6 @@ class ResearchProfileStore(BaseSqliteStore):
 
     def update_user_profile_build_job(self, *args, **kwargs):
         return self.profile_build_job_store.update_user_profile_build_job(*args, **kwargs)
-
-    def migrate_legacy_profiles(self) -> None:
-        with self._get_connection() as conn:
-            self._migrate_legacy_research_profiles(conn)
 
     @staticmethod
     def _empty_user_research_profile(user_id: str) -> Dict[str, Any]:
@@ -67,18 +60,6 @@ class ResearchProfileStore(BaseSqliteStore):
     @staticmethod
     def _normalize_profile_list_value(values: Any, limit: int = 30) -> List[str]:
         return normalize_profile_list_value(values, limit=limit)
-
-    @staticmethod
-    def _looks_like_profile_arxiv_id(value: str) -> bool:
-        return looks_like_profile_arxiv_id(value)
-
-    @staticmethod
-    def _looks_like_profile_arxiv_category(value: str) -> bool:
-        return looks_like_profile_arxiv_category(value)
-
-    @staticmethod
-    def _looks_like_profile_paper_title(value: str) -> bool:
-        return looks_like_profile_paper_title(value)
 
     @classmethod
     def _normalize_profile_topics(cls, values: Any, limit: int = 30) -> List[str]:
@@ -287,114 +268,13 @@ class ResearchProfileStore(BaseSqliteStore):
                 }
             )
         return canonical_topics
-    def _upsert_legacy_research_profile_cache(self, conn, user_id: str, profile: Dict[str, Any]) -> None:
-        normalized = self._normalize_profile_projection(user_id, profile)
-        cursor = conn.cursor()
-        cursor.execute(
-            '''
-            INSERT INTO user_research_profiles (
-                user_id, positive_topics, negative_topics, recent_topics, preferred_categories,
-                preferred_answer_style, common_question_types, representative_papers, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(user_id) DO UPDATE SET
-                positive_topics = excluded.positive_topics,
-                negative_topics = excluded.negative_topics,
-                recent_topics = excluded.recent_topics,
-                preferred_categories = excluded.preferred_categories,
-                preferred_answer_style = excluded.preferred_answer_style,
-                common_question_types = excluded.common_question_types,
-                representative_papers = excluded.representative_papers,
-                updated_at = CURRENT_TIMESTAMP
-            ''',
-            (
-                user_id,
-                self._serialize_json_field(normalized["positive_topics"]),
-                self._serialize_json_field(normalized["negative_topics"]),
-                self._serialize_json_field(normalized["recent_topics"]),
-                self._serialize_json_field(normalized["preferred_categories"]),
-                normalized["preferred_answer_style"],
-                self._serialize_json_field(normalized["common_question_types"]),
-                self._serialize_json_field(normalized["representative_papers"]),
-            ),
-        )
-
-    def _migrate_legacy_research_profiles(self, conn) -> None:
-        cursor = conn.cursor()
-        cursor.execute(
-            '''
-            SELECT user_id, positive_topics, negative_topics, recent_topics, preferred_categories,
-                   preferred_answer_style, common_question_types, representative_papers
-            FROM user_research_profiles
-            '''
-        )
-        rows = cursor.fetchall()
-        for row in rows:
-            user_id = str(row[0] or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
-            cursor.execute("SELECT 1 FROM user_manual_profiles WHERE user_id = ?", (user_id,))
-            manual_exists = cursor.fetchone() is not None
-            cursor.execute("SELECT 1 FROM user_generated_profiles WHERE user_id = ?", (user_id,))
-            generated_exists = cursor.fetchone() is not None
-            if manual_exists or generated_exists:
-                continue
-
-            legacy_profile = {
-                "positive_topics": self._deserialize_json_field(row[1]) or [],
-                "negative_topics": self._deserialize_json_field(row[2]) or [],
-                "recent_topics": self._deserialize_json_field(row[3]) or [],
-                "preferred_categories": self._deserialize_json_field(row[4]) or [],
-                "preferred_answer_style": row[5] or "",
-                "common_question_types": self._deserialize_json_field(row[6]) or [],
-                "representative_papers": self._deserialize_json_field(row[7]) or [],
-            }
-            manual_profile = self._normalize_profile_projection(
-                user_id,
-                {
-                    "positive_topics": legacy_profile.get("positive_topics"),
-                    "negative_topics": legacy_profile.get("negative_topics"),
-                    "preferred_categories": legacy_profile.get("preferred_categories"),
-                    "preferred_answer_style": legacy_profile.get("preferred_answer_style"),
-                    "common_question_types": legacy_profile.get("common_question_types"),
-                },
-            )
-            # 旧 topic 没有来源标记，只能以低置信度候选进入 manual；标题、URL、分类和 arXiv ID 会被清洗丢弃。
-            cursor.execute(
-                '''
-                INSERT OR IGNORE INTO user_manual_profiles (
-                    user_id, profile_json, pinned_items_json, blocked_items_json, deleted_items_json, source
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                ''',
-                (
-                    user_id,
-                    self._serialize_json_field(manual_profile),
-                    self._serialize_json_field([]),
-                    self._serialize_json_field([]),
-                    self._serialize_json_field([]),
-                    "legacy_migration_low_confidence",
-                ),
-            )
-            effective = self._merge_profile_projection(user_id, {}, manual_profile)
-            cursor.execute(
-                '''
-                INSERT OR IGNORE INTO user_effective_profiles (user_id, profile_json, merge_report_json)
-                VALUES (?, ?, ?)
-                ''',
-                (
-                    user_id,
-                    self._serialize_json_field(effective),
-                    self._serialize_json_field({"source": "legacy_migration", "legacy_fields": list(legacy_profile.keys())}),
-                ),
-            )
-            self._upsert_legacy_research_profile_cache(conn, user_id, effective)
-        conn.commit()
 
     def upsert_user_research_profile(self, user_id: str = DEFAULT_USER_ID, profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         normalized = self._normalize_profile_projection(user_id, profile)
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                # 鏃?upsert 鍏ュ彛鐜板湪鍙啓 manual profile锛沞ffective 鐢?manual/generated 鍚堝苟寰楀埌锛岄伩鍏嶆墜鍔ㄤ繚瀛樿鐩栬嚜鍔ㄧ敾鍍忋€?
+                # upsert 入口只写 manual profile；effective 由 manual/generated 合并得到，避免手动保存覆盖自动画像。
                 cursor.execute(
                     '''
                     INSERT INTO user_manual_profiles (
@@ -415,10 +295,10 @@ class ResearchProfileStore(BaseSqliteStore):
                         self._serialize_json_field([]),
                         self._serialize_json_field([]),
                         self._serialize_json_field([]),
-                        "legacy_manual_upsert",
+                        "manual_upsert",
                     ),
                 )
-                effective = self._refresh_effective_profile(conn, user_id)
+                self._refresh_effective_profile(conn, user_id)
                 conn.commit()
         except Exception as e:
             logger.error(f"Error upserting research profile: {str(e)}")
@@ -447,30 +327,6 @@ class ResearchProfileStore(BaseSqliteStore):
                     profile["created_at"] = row[1]
                     profile["updated_at"] = row[2]
                     return profile
-
-                cursor.execute(
-                    '''
-                    SELECT user_id, positive_topics, negative_topics, recent_topics, preferred_categories,
-                           preferred_answer_style, common_question_types, representative_papers, created_at, updated_at
-                    FROM user_research_profiles WHERE user_id = ?
-                    ''',
-                    (user_id,),
-                )
-                legacy_row = cursor.fetchone()
-                if legacy_row:
-                    legacy_profile = {
-                        "user_id": legacy_row[0],
-                        "positive_topics": self._deserialize_json_field(legacy_row[1]) or [],
-                        "negative_topics": self._deserialize_json_field(legacy_row[2]) or [],
-                        "recent_topics": self._deserialize_json_field(legacy_row[3]) or [],
-                        "preferred_categories": self._deserialize_json_field(legacy_row[4]) or [],
-                        "preferred_answer_style": str(legacy_row[5] or ""),
-                        "common_question_types": self._deserialize_json_field(legacy_row[6]) or [],
-                        "representative_papers": self._deserialize_json_field(legacy_row[7]) or [],
-                        "created_at": legacy_row[8],
-                        "updated_at": legacy_row[9],
-                    }
-                    return self._normalize_profile_projection(user_id, legacy_profile)
                 return self._empty_user_research_profile(user_id)
         except Exception as e:
             logger.error(f"Error getting research profile: {str(e)}")
@@ -683,7 +539,6 @@ class ResearchProfileStore(BaseSqliteStore):
                 self._serialize_json_field(merge_report),
             ),
         )
-        self._upsert_legacy_research_profile_cache(conn, user_id, effective)
         return effective
 
     def upsert_user_manual_profile(

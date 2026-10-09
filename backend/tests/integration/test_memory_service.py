@@ -3,7 +3,6 @@ import json
 import unittest
 from unittest import mock
 
-from services.memory.memory_debug import build_memory_debug_payload
 from services.memory.memory_service import MemoryService
 from tests.helpers import build_storage_container
 
@@ -173,6 +172,19 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
             }
         )
 
+    def _record_preference_event(self, arxiv_id: str, action_type: str, *, paper_payload: dict) -> None:
+        # 偏好动作在生产中只落画像事件，这里直接写入事件来准备画像重建的输入。
+        self.storage.profile_events.record_user_profile_event(
+            user_id=self.user_id,
+            event_type="liked" if action_type == "like" else "disliked",
+            source_type="paper_action",
+            source_id=arxiv_id,
+            action_type=action_type,
+            arxiv_id=arxiv_id,
+            metadata={"paper": paper_payload},
+            include_in_profile=True,
+        )
+
     def test_load_preference_summary_returns_stable_counts(self) -> None:
         self.storage.user_preferences.add_liked_paper(self.user_id, self.arxiv_id)
         self.storage.user_preferences.record_user_paper_action(self.user_id, "2401.00002", "bookmark")
@@ -192,7 +204,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIn("favorite", summary["paper_actions"])
         self.assertIsNotNone(summary["interest_vector"])
 
-    def test_load_paper_chat_history_reads_recent_messages(self) -> None:
+    def test_load_paper_conversation_context_reads_recent_turns(self) -> None:
         session = self.storage.paper_chat_sessions.create_paper_chat_session(arxiv_id=self.arxiv_id, user_id=self.user_id, title="QA")
         self.storage.paper_chat_messages.append_paper_chat_message(session["session_id"], "user", "What is the idea?", user_id=self.user_id, turn_id="turn-1")
         self.storage.paper_chat_messages.append_paper_chat_message(
@@ -204,12 +216,8 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
             sources=[{"source_id": "s1"}],
         )
 
-        history = self.memory_service.load_paper_chat_history(self.user_id, self.arxiv_id, session_id=session["session_id"], limit=5)
         context = self.memory_service.load_paper_conversation_context(self.user_id, self.arxiv_id, session_id=session["session_id"], limit=5)
 
-        self.assertEqual(history["selected_session"]["session_id"], session["session_id"])
-        self.assertEqual(history["total_messages"], 2)
-        self.assertEqual(len(history["messages"]), 2)
         self.assertEqual(context["turn_count"], 1)
         self.assertEqual(context["turns"][0]["turn_id"], "turn-1")
 
@@ -286,7 +294,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(context["turn_count"], 3)
         self.assertEqual([turn["turn_id"] for turn in context["turns"]], ["turn-9", "turn-10", "turn-11"])
 
-    def test_update_profile_from_note_merges_clean_note_tags_only(self) -> None:
+    def test_profile_note_merges_clean_note_tags_only(self) -> None:
         note = self.storage.paper_notes.create_paper_note(
             user_id=self.user_id,
             arxiv_id=self.arxiv_id,
@@ -297,11 +305,10 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
             include_in_profile=True,
         )
 
-        immediate_profile = self.memory_service.update_profile_from_note(self.user_id, note)
+        self.assertIsNotNone(note)
         events = self.storage.profile_events.list_user_profile_events(self.user_id, event_types=["note_saved"])
         profile = self.memory_service.rebuild_user_research_profile(self.user_id)
 
-        self.assertEqual(immediate_profile["positive_topics"], [])
         self.assertEqual(len(events), 1)
         self.assertIn("RAG retrieval optimization", profile["positive_topics"])
         self.assertEqual(profile["canonical_topics"][0]["label"], "RAG retrieval optimization")
@@ -335,8 +342,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(self.storage.paper_profile_evidence.get_paper_profile_evidence(self.arxiv_id))
 
     def test_like_paper_keeps_categories_and_titles_out_of_topics(self) -> None:
-        immediate_profile = self.memory_service.update_profile_from_preference(
-            self.user_id,
+        self._record_preference_event(
             self.arxiv_id,
             "like",
             paper_payload={
@@ -350,7 +356,6 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         events = self.storage.profile_events.list_user_profile_events(self.user_id, event_types=["liked"])
         profile = self.memory_service.rebuild_user_research_profile(self.user_id)
 
-        self.assertEqual(immediate_profile["positive_topics"], [])
         self.assertEqual(len(events), 1)
         self.assertEqual(profile["positive_topics"], [])
         self.assertEqual(profile["recent_topics"], [])
@@ -363,8 +368,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIn("insufficient_stable_interest_evidence", {issue["code"] for issue in profile["quality_report"]["issues"]})
 
     def test_like_paper_without_explicit_topics_only_updates_category_and_representative_paper(self) -> None:
-        self.memory_service.update_profile_from_preference(
-            self.user_id,
+        self._record_preference_event(
             "2401.00002",
             "like",
             paper_payload={
@@ -425,8 +429,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(gating["skipped_positive_papers"], [])
 
     def test_dislike_paper_does_not_store_categories_or_titles_as_negative_topics(self) -> None:
-        self.memory_service.update_profile_from_preference(
-            self.user_id,
+        self._record_preference_event(
             self.arxiv_id,
             "dislike",
             paper_payload={
@@ -787,28 +790,6 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIn("manual_topic_removed", event_types)
         self.assertIn("manual_style_updated", event_types)
 
-    def test_legacy_dirty_topics_do_not_migrate_into_new_profile_layers(self) -> None:
-        with self.storage.connection_provider.connect() as conn:
-            self.storage.research_profiles._upsert_legacy_research_profile_cache(
-                conn,
-                "legacy-user",
-                {
-                    "positive_topics": ["cs.CL", "A Complete Paper Title That Should Be Removed", "manual retrieval topic"],
-                    "negative_topics": ["https://arxiv.org/abs/2401.00001", "diffusion models"],
-                    "preferred_categories": ["cs.AI"],
-                    "representative_papers": ["A Complete Paper Title That Should Be Removed"],
-                },
-            )
-            conn.commit()
-            self.storage.research_profiles._migrate_legacy_research_profiles(conn)
-
-        layers = self.storage.research_profiles.get_user_profile_layers("legacy-user")
-
-        self.assertEqual(layers["manual_profile"]["positive_topics"], ["manual retrieval topic"])
-        self.assertEqual(layers["manual_profile"]["negative_topics"], ["diffusion models"])
-        self.assertEqual(layers["manual_profile"]["preferred_categories"], ["cs.AI"])
-        self.assertEqual(layers["manual_profile"]["representative_papers"], [])
-
     def test_llm_evidence_card_drives_profile_topics_and_reuses_cache(self) -> None:
         fake_llm = FakeEvidenceGenerationService(
             """
@@ -995,25 +976,6 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertTrue(profile["canonical_topics"][0]["pinned"])
         self.assertIn("manual_topic_pinned", event_types)
         self.assertIn("manual_topic_hidden", event_types)
-
-    def test_build_memory_debug_payload_has_stable_fields(self) -> None:
-        debug_payload = build_memory_debug_payload(
-            user_id=self.user_id,
-            arxiv_id=self.arxiv_id,
-            user_profile={"positive_topics": ["rag"], "negative_topics": [], "recent_topics": [], "preferred_categories": ["cs.CL"]},
-            preference_summary={"liked_papers": [self.arxiv_id], "disliked_papers": [], "paper_actions": {"favorite": [self.arxiv_id]}, "interest_vector": {"vector_data": [0.1]} , "counts": {"liked_papers": 1, "disliked_papers": 0}},
-            paper_notes=[{"note_type": "summary"}],
-            paper_chat_history={"sessions": [{"session_id": "s1"}], "messages": [{"message_id": "m1"}], "total_messages": 1, "selected_session": {"session_id": "s1"}},
-            frontend_context={"selected_paper": {"arxiv_id": self.arxiv_id}},
-            extra={"source": "test"},
-        )
-
-        self.assertEqual(debug_payload["user_id"], self.user_id)
-        self.assertIn("loaded_sources", debug_payload)
-        self.assertIn("preference_summary", debug_payload["loaded_sources"])
-        self.assertEqual(debug_payload["loaded_sources"]["paper_chat_history"]["selected_session_id"], "s1")
-        self.assertIn("selected_paper", debug_payload["frontend_context_keys"])
-        self.assertEqual(debug_payload["extra"]["source"], "test")
 
     def test_storage_exception_falls_back_to_safe_empty_memory_summary(self) -> None:
         with mock.patch.object(self.storage.connection_provider, "connect", side_effect=RuntimeError("db boom")):

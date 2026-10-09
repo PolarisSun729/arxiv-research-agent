@@ -1891,15 +1891,6 @@ def _tool_requires_human_confirmation(tool: ToolSpec) -> bool:
     return bool(tool.requires_confirmation or tool.side_effect_level == "persistent_write")
 
 
-def _side_effect_rank(side_effect_level: str) -> int:
-    return {
-        "none": 0,
-        "session_write": 1,
-        "external_call": 2,
-        "persistent_write": 3,
-    }.get(str(side_effect_level or ""), 4)
-
-
 __all__ = [
     "PlanDraftConversionError",
     "PlanDraftPlanningError",

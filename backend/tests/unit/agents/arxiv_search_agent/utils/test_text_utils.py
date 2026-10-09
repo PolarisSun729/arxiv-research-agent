@@ -61,16 +61,3 @@ def test_extract_json_block_prefers_fenced_json_then_raw_object() -> None:
     assert text_utils._extract_json_block(fenced) == '{"answer": 1}'
     assert text_utils._extract_json_block(raw) == '{"answer": 2, "ok": true}'
     assert text_utils._extract_json_block("no json here") == "no json here"
-
-
-def test_extract_json_object_parses_fenced_and_embedded_objects() -> None:
-    assert text_utils._extract_json_object('```json\n{"answer": 1}\n```') == {"answer": 1}
-    assert text_utils._extract_json_object('analysis: {"answer": 2, "items": [1, 2]} done') == {
-        "answer": 2,
-        "items": [1, 2],
-    }
-
-
-@pytest.mark.parametrize("text", ["", "not json", "[1, 2, 3]", '{"answer": }'])
-def test_extract_json_object_returns_none_for_invalid_or_non_object_json(text: str) -> None:
-    assert text_utils._extract_json_object(text) is None

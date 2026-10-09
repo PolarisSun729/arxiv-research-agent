@@ -11,7 +11,6 @@ from datetime import datetime
 import requests
 import feedparser
 import os
-import json
 from pathlib import Path
 import re
 import tempfile
@@ -109,7 +108,6 @@ class ArxivSearchService:
         # arXiv 下载产物属于后端运行资产，不能因启动目录不同散落到仓库根目录。
         self.papers_dir = resolve_backend_artifact_path(
             "06-daily-arxiv-paper",
-            option_name="ARXIV_PAPERS_DIR",
         )
         os.makedirs(self.papers_dir, exist_ok=True)
         
@@ -573,31 +571,6 @@ class ArxivSearchService:
                     pass
                 except OSError:
                     logger.warning("Failed to remove temporary arXiv PDF")
-    
-    def save_search_results(self, search_result: Dict[str, Any]) -> str:
-        """
-        保存搜索结果到JSON文件
-        
-        Args:
-            search_result (Dict[str, Any]): 搜索结果
-            
-        Returns:
-            str: 保存文件的路径
-        """
-        try:
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            filename = f"arxiv_search_{timestamp}.json"
-            filepath = os.path.join(self.papers_dir, filename)
-            
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(search_result, f, ensure_ascii=False, indent=2)
-            
-            logger.debug(f"Search results saved to: {filepath}")
-            return filepath
-            
-        except Exception as e:
-            logger.error(f"Error saving search results: {str(e)}")
-            raise
     
     @staticmethod
     def get_available_fields() -> List[Dict[str, str]]:

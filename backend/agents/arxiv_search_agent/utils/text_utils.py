@@ -10,9 +10,8 @@
 
 from __future__ import annotations
 
-import json
 import re
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Iterable, Optional
 
 
 CHINESE_NUMBER_MAP = {
@@ -107,32 +106,3 @@ def _extract_json_block(text: str) -> str:
     if raw_match:
         return raw_match.group(1)
     return text
-
-
-def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    """从任意文本中尽量恢复一个 JSON 对象。
-
-    与 _extract_json_block 相比，这个函数更偏向“最终解析”：
-    它会剥离代码块围栏、截取最外层花括号，并尝试直接 loads。
-    适合处理要求严格 JSON 输出的模型返回值。
-    """
-    candidate = _normalize_text(text)
-    if not candidate:
-        return None
-
-    if candidate.startswith("```"):
-        # 先剥离 Markdown fenced code block，避免 ```json 这类前缀影响解析。
-        candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE).strip()
-        candidate = re.sub(r"\s*```$", "", candidate).strip()
-
-    start = candidate.find("{")
-    end = candidate.rfind("}")
-    if start >= 0 and end > start:
-        # 只保留最外层对象片段，尽量忽略前后残留解释文本。
-        candidate = candidate[start : end + 1]
-
-    try:
-        parsed = json.loads(candidate)
-    except Exception:
-        return None
-    return parsed if isinstance(parsed, dict) else None

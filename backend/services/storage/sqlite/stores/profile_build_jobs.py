@@ -14,21 +14,6 @@ from services.storage.sqlite.shared import (
 class ProfileBuildJobStore(BaseSqliteStore):
     """维护画像构建 job 状态；具体快照生成和激活仍由 profile 主流程负责。"""
 
-    def _ensure_user_profile_build_job_columns(self, conn):
-        # build job 是前端轮询的状态源；旧库补齐 metrics_json 后即可承载细粒度进度，不需要破坏现有列结构。
-        required_columns = {
-            "metrics_json": "TEXT",
-        }
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(user_profile_build_jobs)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
-        for column_name, column_definition in required_columns.items():
-            if column_name not in existing_columns:
-                cursor.execute(
-                    f"ALTER TABLE user_profile_build_jobs ADD COLUMN {column_name} {column_definition}"
-                )
-        conn.commit()
-
     def list_user_profile_build_jobs(self, user_id: str = DEFAULT_USER_ID, limit: int = 20) -> List[Dict[str, Any]]:
         """返回画像构建任务历史，供前端轮询和排查慢速构建状态。"""
         try:

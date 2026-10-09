@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 import tempfile
@@ -18,7 +17,8 @@ class _FakePaperQAService:
     def __init__(self) -> None:
         self.raise_error = False
         self.answer_error_code = None
-        self.context_error_code = None
+        self.stream_error = None
+        self.stream_answer = "stream answer"
 
     def get_qa_status(self, arxiv_id: str):
         if self.raise_error:
@@ -37,25 +37,15 @@ class _FakePaperQAService:
             "sources": [{"source_id": "s1"}],
         }
 
-    def build_qa_context(self, arxiv_id: str, payload):
-        if self.context_error_code:
-            raise AppError(self.context_error_code, detail="context failed in fake service")
-        return (
-            {"status": "indexed", "collection_name": "paper_2401"},
-            [{"content": "chunk", "page_number": "1", "source": "paper.pdf"}],
-            {
-                "text_context": "chunk",
-                "image_inputs": [],
-                "asset_metadata": [],
-                "generation_question": payload.question,
-                "question_contextualization": {},
-                "chat_session": {"session_id": "session-1", "user_id": "u1", "arxiv_id": arxiv_id},
-            },
-            {"trace": "ok"},
-        )
-
-    def build_source_payload(self, search_results):
-        return search_results
+    def answer_question_with_research_stream(self, arxiv_id: str, payload):
+        if self.stream_error is not None:
+            raise self.stream_error
+        yield {"event": "research_started", "data": {"event": "research_started", "arxiv_id": arxiv_id, "question": payload.question}}
+        yield {"event": "retrieval_completed", "data": {"event": "retrieval_completed", "retrieval_count": 3, "new_candidate_count": 2}}
+        yield {"event": "done", "data": {
+            "answer": self.stream_answer,
+            "chat_session": {"session_id": "session-1", "user_id": "u1", "arxiv_id": arxiv_id},
+        }}
 
     def persist_completed_turn(self, **kwargs):
         return {"turn_id": "turn-1", "chat_session": kwargs.get("chat_session")}
@@ -81,11 +71,7 @@ class _FakeIndexJobManager:
 
 
 class _FakeMemoryService:
-    def __init__(self) -> None:
-        self.updated_notes = []
-
-    def update_profile_from_note(self, user_id: str, note):
-        self.updated_notes.append((user_id, dict(note)))
+    pass
 
 
 class _FakeEnhancedRetrievalService:
@@ -105,19 +91,6 @@ class _FakeVectorStoreService:
 
     def get_all_chunks(self, collection_name: str, limit: int = 1):
         return [{"chunk_id": "c1", "content": "chunk"}][:limit]
-
-
-class _FakeGenerationService:
-    def __init__(self) -> None:
-        self.raise_error = False
-        self.queries = []
-
-    def stream_qwen_responses(self, **kwargs):
-        self.queries.append(kwargs.get("query", ""))
-        if self.raise_error:
-            raise RuntimeError("llm stream failed")
-        yield {"type": "delta", "delta": "hello"}
-        yield {"type": "completed", "answer": "hello", "usage": None}
 
 
 class _FakeQaStorage:
@@ -230,7 +203,6 @@ class QaRouterApiTests(unittest.TestCase):
         self.vector_store_service = _FakeVectorStoreService()
         self.memory_service = _FakeMemoryService()
         self.index_job_manager = _FakeIndexJobManager()
-        self.generation_service = _FakeGenerationService()
         self.enhanced_retrieval_service = _FakeEnhancedRetrievalService(self.temp_dir.name)
 
         app = FastAPI()
@@ -252,8 +224,6 @@ class QaRouterApiTests(unittest.TestCase):
             app.dependency_overrides[dependency] = lambda: self.index_job_manager
         for dependency in (dependencies.get_enhanced_retrieval_service, qa_router.get_enhanced_retrieval_service):
             app.dependency_overrides[dependency] = lambda: self.enhanced_retrieval_service
-        for dependency in (dependencies.get_generation_service, qa_router.get_generation_service):
-            app.dependency_overrides[dependency] = lambda: self.generation_service
         self.client = TestClient(app)
         self.addCleanup(self.temp_dir.cleanup)
 
@@ -406,8 +376,28 @@ class QaRouterApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.json()["code"], ErrorCode.DATABASE_WRITE_FAILED)
 
+    def _stream_events(self, response):
+        lines = response.text.splitlines()
+        names = [line[7:] for line in lines if line.startswith("event: ")]
+        payloads = [json.loads(line[6:]) for line in lines if line.startswith("data: ")]
+        return list(zip(names, payloads))
+
+    def test_qa_stream_maps_research_events_to_sse(self) -> None:
+        response = self.client.post(
+            "/api/paper/2401.00001/qa/stream",
+            json={"question": "What is the contribution?", "user_id": "u1"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        events = self._stream_events(response)
+        self.assertEqual([name for name, _ in events], ["meta", "progress", "done"])
+        self.assertEqual(events[0][1]["question"], "What is the contribution?")
+        self.assertEqual(events[1][1], {"stage": "retrieval", "retrieval_count": 3, "new_candidate_count": 2})
+        self.assertEqual(events[2][1]["answer"], "stream answer")
+        self.assertEqual(events[2][1]["chat_session"]["session_id"], "session-1")
+
     def test_qa_stream_error_event_contains_code(self) -> None:
-        self.paper_qa_service.context_error_code = ErrorCode.QA_INDEX_NOT_FOUND
+        self.paper_qa_service.stream_error = AppError(ErrorCode.QA_INDEX_NOT_FOUND)
 
         response = self.client.post(
             "/api/paper/2401.00001/qa/stream",
@@ -418,79 +408,25 @@ class QaRouterApiTests(unittest.TestCase):
         self.assertIn("event: error", response.text)
         self.assertIn(f'"code": "{ErrorCode.QA_INDEX_NOT_FOUND}"', response.text)
 
-    def test_qa_stream_requires_chinese_final_answer(self) -> None:
-        response = self.client.post(
-            "/api/paper/2401.00001/qa/stream",
-            json={"question": "What is the contribution?", "user_id": "u1"},
-        )
+    def test_qa_stream_unexpected_error_does_not_leak_exception_text(self) -> None:
+        self.paper_qa_service.stream_error = RuntimeError("provider response with /srv/private/path")
 
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("必须使用中文回复", self.generation_service.queries[-1])
-        self.assertIn("不要用英文整段回答", self.generation_service.queries[-1])
+        response = self.client.post("/api/paper/2401.00001/qa/stream", json={"question": "测试异常"})
 
-    def test_qa_stream_llm_exception_maps_to_generation_code(self) -> None:
-        self.generation_service.raise_error = True
-
-        response = self.client.post(
-            "/api/paper/2401.00001/qa/stream",
-            json={"question": "What is the contribution?", "user_id": "u1"},
-        )
-
-        self.assertEqual(response.status_code, 200)
         self.assertIn("event: error", response.text)
-        self.assertIn(f'"code": "{ErrorCode.LLM_GENERATION_FAILED}"', response.text)
+        self.assertIn(f'"code": "{ErrorCode.UNKNOWN_ERROR}"', response.text)
+        self.assertNotIn("/srv/private/path", response.text)
+        self.assertNotIn("event: done", response.text)
 
-    def test_qa_stream_redacts_credentials_across_delta_boundaries(self) -> None:
-        secrets = ["sk-provider-" + "c" * 36, "a" * 32, "ab" * 16]
-        for secret in secrets:
-            for pieces in ([secret[:6], secret[6:]], list(secret), [secret]):
-                with self.subTest(secret_kind=secret[:3], chunk_count=len(pieces)), patch.dict(os.environ, {"ALIYUN_API_KEY": secret}):
-                    chunks = [{"type": "delta", "delta": text} for text in ["正常开头。", *pieces, "正常结尾。"]]
-                    chunks.append({"type": "completed", "answer": "正常开头。" + secret + "正常结尾。", "usage": None})
-                    with patch.object(self.generation_service, "stream_qwen_responses", return_value=iter(chunks)):
-                        response = self.client.post("/api/paper/2401.00001/qa/stream", json={"question": "测试跨分片保护"})
-                    events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
-                    delta_text = "".join(event.get("delta", "") for event in events)
-                    self.assertEqual(delta_text, "正常开头。***REDACTED***正常结尾。")
-                    self.assertEqual(events[-1]["answer"], delta_text)
-                    self.assertNotIn(secret, response.text)
-
-    def test_qa_stream_flushes_normal_tail_when_provider_ends_without_completed(self) -> None:
-        chunks = [{"type": "delta", "delta": text} for text in ["正常回答 ", "dataset"]]
-        with patch.object(self.generation_service, "stream_qwen_responses", return_value=iter(chunks)):
-            response = self.client.post("/api/paper/2401.00001/qa/stream", json={"question": "测试正常结束"})
-        events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
-        self.assertEqual("".join(event.get("delta", "") for event in events), "正常回答 dataset")
-        self.assertIn("event: done", response.text)
-
-    def test_qa_stream_discards_unresolved_secret_prefix_on_error(self) -> None:
+    def test_qa_stream_redacts_configured_secret_in_done_payload(self) -> None:
         secret = "sk-provider-" + "c" * 36
-        for error in (RuntimeError("stream interrupted"), AppError(ErrorCode.LLM_GENERATION_FAILED)):
-            def failing_stream(**_kwargs):
-                yield {"type": "delta", "delta": "已经完成。" + secret[:6]}
-                raise error
+        self.paper_qa_service.stream_answer = f"答案里混入了 {secret}。"
 
-            with self.subTest(error_type=type(error).__name__), patch.dict(os.environ, {"ALIYUN_API_KEY": secret}):
-                with patch.object(self.generation_service, "stream_qwen_responses", side_effect=failing_stream):
-                    response = self.client.post("/api/paper/2401.00001/qa/stream", json={"question": "测试异常清理"})
-                self.assertIn("已经完成。", response.text)
-                self.assertNotIn(secret[:6], response.text)
-                self.assertIn("event: error", response.text)
-                self.assertNotIn("event: done", response.text)
+        with patch.dict(os.environ, {"ALIYUN_API_KEY": secret}):
+            response = self.client.post("/api/paper/2401.00001/qa/stream", json={"question": "测试脱敏"})
 
-    def test_qa_stream_cancellation_does_not_flush_secret_prefix(self) -> None:
-        secret = "sk-provider-" + "c" * 36
-        chunks = iter([{"type": "delta", "delta": "可见文字。" + secret[:6]}])
-        with patch.dict(os.environ, {"ALIYUN_API_KEY": secret}), patch.object(self.generation_service, "stream_qwen_responses", return_value=chunks):
-            # 直接关闭路由生成器模拟断开连接，避免 TestClient 预先耗尽整个 SSE 响应。
-            with patch.object(qa_router, "StreamingResponse", side_effect=lambda stream, **_kwargs: stream):
-                stream = asyncio.run(qa_router.qa_paper_stream("2401.00001", qa_router.QaRequest(question="测试取消"), self.paper_qa_service, self.generation_service))
-            next(stream)
-            delta = next(stream)
-            self.assertIn("可见文字。", delta)
-            self.assertNotIn(secret[:6], delta)
-            stream.close()
-            self.assertEqual(list(stream), [])
+        self.assertNotIn(secret, response.text)
+        self.assertIn("***REDACTED***", response.text)
 
 
 if __name__ == "__main__":

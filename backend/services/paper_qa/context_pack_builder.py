@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 from services.prompt_context.blocks import PromptBlock
 from services.retrieval.table_evidence_formatter import render_table_evidence_prompt_block
@@ -129,13 +129,6 @@ class ContextPackBuilder:
             "prompt_blocks": prompt_blocks,
             "context_budget_debug": context_budget_debug,
         }
-
-    def build_generation_context(
-        self,
-        search_results: List[Dict[str, Any]],
-    ) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
-        context_pack = self.build(search_results)
-        return context_pack["text_context"], context_pack["image_inputs"], context_pack["asset_metadata"]
 
     def build_source_payload(self, search_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return self.build(search_results)["source_payload"]

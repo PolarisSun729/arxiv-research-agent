@@ -5,17 +5,12 @@ import base64
 import mimetypes
 import io
 from datetime import datetime
-from typing import List, Dict, Optional, Iterator, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple
 import logging
 from services.llm.call_metrics import record_llm_call, record_llm_usage
-from pathlib import Path
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch
 from openai import OpenAI
-import requests
 from services.intent.intent_service import EXPERIMENT_INTENTS, MAIN_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
 from services.paper_qa.answer_language import CHINESE_FINAL_ANSWER_INSTRUCTION
-from utils.model_utils import get_huggingface_model_path
 from utils.config import GENERATION_CONFIG
 from utils.storage_paths import resolve_backend_artifact_path
 # 启用 MPS 失败时自动回退到 CPU，避免 Apple Silicon 环境下推理直接报错。
@@ -32,9 +27,6 @@ QWEN_SMALL_MODEL_NAME = GENERATION_CONFIG["small_qwen_model_name"]
 QWEN_LARGE_MODEL_NAME = GENERATION_CONFIG["large_qwen_model_name"]
 QWEN_RERANK_COMPRESS_MODEL_NAME = GENERATION_CONFIG["qwen_rerank_compress_model_name"]
 QWEN_RERANK_COMPRESS_ENABLE_THINKING = GENERATION_CONFIG["qwen_rerank_compress_enable_thinking"]
-HF_GENERATE_MAX_LENGTH = GENERATION_CONFIG["huggingface_generate_max_length"]
-HF_GENERATE_TEMPERATURE = GENERATION_CONFIG["huggingface_generate_temperature"]
-HF_GENERATE_DO_SAMPLE = GENERATION_CONFIG["huggingface_generate_do_sample"]
 REWRITE_QUERY_MAX_QUERIES_DEFAULT = GENERATION_CONFIG["rewrite_query_max_queries_default"]
 PLAN_QUERY_MAX_QUERIES_DEFAULT = GENERATION_CONFIG["plan_query_max_queries_default"]
 QWEN_TASK_MODEL_ROLES = dict(GENERATION_CONFIG.get("task_model_roles", {}))
@@ -88,7 +80,6 @@ class GenerationService:
         # 生成结果是后端运行产物；路径固定到 backend 下，避免工作目录不同导致写入根目录。
         self.generation_results_dir = resolve_backend_artifact_path(
             "05-generation-results",
-            option_name="GENERATION_RESULTS_DIR",
         )
         os.makedirs(self.generation_results_dir, exist_ok=True)
 
@@ -265,81 +256,6 @@ class GenerationService:
         ]
         return "\n".join(part for part in parts if part).strip()
         
-    def _load_huggingface_model(self, model_name: str):
-        """
-        加载 HuggingFace 模型。
-        
-        参数:
-            model_name: 模型名称，对应 self.models["huggingface"] 中的键。
-            
-        返回:
-            model: 加载后的模型。
-            tokenizer: 对应的分词器。
-        """
-        try:
-            model_name = self.models["huggingface"][model_name]
-            model_name = get_huggingface_model_path(model_name)
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16,
-                device_map="auto"
-            )
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_name,
-            )
-            return model, tokenizer
-        except Exception as e:
-            logger.error(f"Error loading HuggingFace model: {str(e)}")
-            raise
-
-    def _generate_with_huggingface(
-        self,
-        model_name: str,
-        query: str,
-        context: str,
-        max_length: int = HF_GENERATE_MAX_LENGTH
-    ) -> str:
-        """
-        使用 HuggingFace 模型生成回答。
-        
-        参数:
-            model_name: 模型名称。
-            query: 用户查询。
-            context: 上下文信息。
-            max_length: 生成文本的最大长度。
-            
-        返回:
-            生成的回答文本。
-        """
-        try:
-            model, tokenizer = self._load_huggingface_model(model_name)
-            
-            prompt = f"""Answer the question strictly based on the provided context.
-If the context does not contain enough information, say you cannot determine it.
-
-Question: {query}
-
-Context:
-{context}
-
-Answer:"""
-        
-            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-            outputs = model.generate(
-                **inputs,
-                max_length=max_length,
-                num_return_sequences=1,
-                temperature=HF_GENERATE_TEMPERATURE,
-                do_sample=HF_GENERATE_DO_SAMPLE
-            )
-            
-            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            return response.split("Answer:")[-1].strip()
-            
-        except Exception as e:
-            logger.error(f"Error generating with HuggingFace: {str(e)}")
-            raise
-
     def _generate_with_openai(
         self,
         model_name: str,
@@ -539,21 +455,6 @@ Answer:"""
                 normalized_queries.append(item.strip())
         return normalized_queries
 
-    def rewrite_query_for_rerank(
-        self,
-        question: str,
-        paper_context: Optional[Dict[str, Any]] = None,
-        api_key: Optional[str] = None,
-        model_name: Optional[str] = None,
-        intent_profile: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        return self.build_rerank_query(
-            question,
-            api_key=api_key,
-            model_name=model_name,
-            intent_profile=intent_profile,
-        )
-
     def build_rerank_query(
         self,
         original_question: str,
@@ -651,9 +552,6 @@ Answer:"""
             model_name=model_name,
             task_type="hyde_generation",
         ).strip()
-
-    def _fallback_rerank_query(self, question: str, intent_profile: Optional[Dict[str, Any]] = None) -> str:
-        return self._build_evidence_selection_rerank_query(question, intent_profile=intent_profile)
 
     def _build_evidence_selection_rerank_query(self, original_question: str, intent_profile: Optional[Dict[str, Any]] = None) -> str:
         normalized_question = re.sub(r"\s+", " ", (original_question or "")).strip()
@@ -1093,21 +991,6 @@ Answer:"""
             "请直接用中文回答："
         )
 
-    def _build_qwen_input(
-        self,
-        query: str,
-        context: str,
-        image_inputs: Optional[List[Dict[str, Any]]] = None,
-        asset_metadata: Optional[List[Dict[str, Any]]] = None,
-    ) -> Any:
-        qwen_input, _ = self._build_qwen_input_with_debug(
-            query=query,
-            context=context,
-            image_inputs=image_inputs,
-            asset_metadata=asset_metadata,
-        )
-        return qwen_input
-
     def _build_qwen_input_with_debug(
         self,
         query: str,
@@ -1273,80 +1156,6 @@ Answer:"""
         item_debug["skip_reason"] = reason
         item_debug["fallback_to_asset_summary"] = True
 
-    def stream_qwen_responses(
-        self,
-        query: str,
-        context: str,
-        api_key: Optional[str] = None,
-        model_name: Optional[str] = None,
-        task_type: Optional[str] = None,
-        enable_thinking: bool = QWEN_RERANK_COMPRESS_ENABLE_THINKING,
-        image_inputs: Optional[List[Dict[str, Any]]] = None,
-        asset_metadata: Optional[List[Dict[str, Any]]] = None,
-    ) -> Iterator[Dict[str, Any]]:
-        """Stream a Qwen Responses API answer chunk by chunk."""
-        try:
-            if not api_key:
-                api_key = QWEN_API_KEY
-            if not api_key:
-                raise ValueError("Qwen API key not provided")
-
-            model_selection = self._resolve_qwen_model_selection(
-                task_type=task_type,
-                model_name=model_name,
-                default_role="large",
-            )
-            model_name = model_selection["selected_model"]
-
-            client = OpenAI(api_key=api_key, base_url=QWEN_BASE_URL)
-            qwen_input, input_debug = self._build_qwen_input_with_debug(
-                query=query,
-                context=context,
-                image_inputs=image_inputs,
-                asset_metadata=asset_metadata,
-            )
-            record_llm_call(model=model_name, task_type=task_type or "generation")
-            stream = client.responses.create(
-                model=model_name,
-                input=qwen_input,
-                stream=True,
-                extra_body={"enable_thinking": enable_thinking},
-            )
-
-            answer_parts: List[str] = []
-            for event in stream:
-                event_type = getattr(event, "type", "")
-                if event_type == "response.output_text.delta":
-                    delta = getattr(event, "delta", "") or ""
-                    if delta:
-                        answer_parts.append(delta)
-                        yield {"type": "delta", "delta": delta}
-                elif event_type == "response.completed":
-                    response = getattr(event, "response", None)
-                    usage = getattr(response, "usage", None) if response else None
-                    record_llm_usage(usage)
-                    yield {
-                        "type": "completed",
-                        "answer": "".join(answer_parts),
-                        "usage": {
-                            "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
-                            "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
-                            "total_tokens": getattr(usage, "total_tokens", None) if usage else None,
-                        },
-                        "qwen_request_debug": input_debug,
-                    }
-                    return
-
-            yield {
-                "type": "completed",
-                "answer": "".join(answer_parts),
-                "usage": None,
-                "qwen_request_debug": input_debug,
-            }
-        except Exception as e:
-            logger.error(f"Error streaming with Qwen Responses API: {str(e)}")
-            raise
-
     def _generate_with_deepseek(
         self,
         model_name: str,
@@ -1504,15 +1313,6 @@ Answer:"""
         except Exception as e:
             logger.error(f"Error in generation: {str(e)}")
             raise
-
-    def get_available_models(self) -> Dict:
-        """
-        获取可用模型列表。
-        
-        返回:
-            包含所有支持模型的字典。
-        """
-        return self.models 
 
     def _image_path_to_data_url(self, image_path: str) -> str:
         if not image_path:

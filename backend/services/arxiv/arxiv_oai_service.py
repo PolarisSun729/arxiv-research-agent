@@ -14,8 +14,8 @@ import sqlite3
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
 
@@ -181,7 +181,6 @@ class ArxivOaiDatabaseService:
         self.db_path = resolve_storage_path(
             configured_path,
             default_path=BACKEND_DATA_ROOT / "arxiv_oai.db",
-            option_name="db_path" if db_path else "OAI_SQLITE_DATABASE_PATH",
         )
         self.check_same_thread = (
             OAI_SQLITE_CONFIG["check_same_thread"] if check_same_thread is None else bool(check_same_thread)
@@ -839,117 +838,6 @@ class ArxivOaiDatabaseService:
             raise RuntimeError("分类索引和重建检查点不一致，请使用 --reset 从头重建。")
         if int(fts_count or 0) != processed_count or str(fts_last_id or "") != last_arxiv_id:
             raise RuntimeError("FTS 索引和重建检查点不一致，请使用 --reset 从头重建。")
-
-    def _backfill_search_indexes(self, cursor: sqlite3.Cursor, *, fts5_available: bool) -> None:
-        """启动时从旧主表回填新索引；该逻辑幂等，避免用户必须重新同步 OAI。"""
-        cursor.execute("SELECT COUNT(*) FROM arxiv_oai_papers")
-        total_papers = int((cursor.fetchone() or [0])[0] or 0)
-        if total_papers <= 0:
-            return
-
-        cursor.execute("SELECT COUNT(*) FROM arxiv_oai_paper_categories")
-        category_count = int((cursor.fetchone() or [0])[0] or 0)
-        fts_count = 0
-        if fts5_available:
-            cursor.execute("SELECT COUNT(*) FROM arxiv_oai_papers_fts")
-            fts_count = int((cursor.fetchone() or [0])[0] or 0)
-
-        if category_count > 0 and (not fts5_available or fts_count > 0):
-            # 分类索引和 FTS 索引都已存在时直接跳过，避免每次启动都重刷大表。
-            return
-
-        logger.info(
-            "Backfilling local OAI search indexes: papers=%s categories=%s fts=%s",
-            total_papers,
-            category_count,
-            fts_count,
-        )
-        rebuild_started_at = time.perf_counter()
-        processed_papers = 0
-        read_cursor = cursor.connection.cursor()
-        last_arxiv_id: Optional[str] = None
-        try:
-            while True:
-                # 回填阶段会边读主表边写索引；这里改成 keyset 分页，避免同一游标的 SELECT
-                # 在 DELETE/INSERT 后被打断，导致只处理第一批数据。
-                if last_arxiv_id is None:
-                    read_cursor.execute(
-                        """
-                        SELECT
-                            arxiv_id,
-                            title,
-                            abstract,
-                            authors,
-                            categories,
-                            primary_category,
-                            created,
-                            updated,
-                            abs_url,
-                            pdf_url,
-                            oai_datestamp,
-                            fetched_at,
-                            created_at,
-                            updated_at
-                        FROM arxiv_oai_papers
-                        ORDER BY arxiv_id
-                        LIMIT ?
-                        """,
-                        (OAI_INDEX_REBUILD_BATCH_SIZE,),
-                    )
-                else:
-                    read_cursor.execute(
-                        """
-                        SELECT
-                            arxiv_id,
-                            title,
-                            abstract,
-                            authors,
-                            categories,
-                            primary_category,
-                            created,
-                            updated,
-                            abs_url,
-                            pdf_url,
-                            oai_datestamp,
-                            fetched_at,
-                            created_at,
-                            updated_at
-                        FROM arxiv_oai_papers
-                        WHERE arxiv_id > ?
-                        ORDER BY arxiv_id
-                        LIMIT ?
-                        """,
-                        (last_arxiv_id, OAI_INDEX_REBUILD_BATCH_SIZE),
-                    )
-                rows = read_cursor.fetchall()
-                if not rows:
-                    break
-
-                # 分批回填能持续输出进度，也避免大表一次性 fetchall 占用过多内存。
-                papers = [self._parse_row(row) for row in rows]
-                self._sync_search_index_for_papers(
-                    cursor,
-                    papers,
-                    fts5_available=fts5_available,
-                )
-                processed_papers += len(rows)
-                last_arxiv_id = str(papers[-1].get("arxiv_id") or "").strip() or last_arxiv_id
-                logger.info(
-                    "Backfill local OAI search indexes progress: processed=%s/%s batch_size=%s elapsed_seconds=%.2f",
-                    processed_papers,
-                    total_papers,
-                    len(rows),
-                    time.perf_counter() - rebuild_started_at,
-                )
-        finally:
-            read_cursor.close()
-
-        logger.info(
-            "Backfill local OAI search indexes completed: processed=%s/%s elapsed_seconds=%.2f",
-            processed_papers,
-            total_papers,
-            time.perf_counter() - rebuild_started_at,
-        )
 
     def rebuild_oai_search_index(
         self,
@@ -1696,40 +1584,6 @@ class ArxivOaiDatabaseService:
             "versions": [],
             "authors_parsed": [],
         }
-
-    def _fetch_all_searchable_papers(self, id_list: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
-        """拉取可供旧版内存检索使用的论文集合。"""
-        columns = """
-            arxiv_id,
-            title,
-            abstract,
-            authors,
-            categories,
-            primary_category,
-            created,
-            updated,
-            abs_url,
-            pdf_url,
-            oai_datestamp,
-            fetched_at,
-            created_at,
-            updated_at
-        """
-        query = f"SELECT {columns} FROM arxiv_oai_papers"
-        params: List[Any] = []
-        normalized_ids = [str(item).strip() for item in (id_list or []) if str(item).strip()]
-        if normalized_ids:
-            # 只在显式给出 id_list 时收窄范围，避免旧逻辑误扫全表。
-            placeholders = ",".join("?" for _ in normalized_ids)
-            query += f" WHERE arxiv_id IN ({placeholders})"
-            params.extend(normalized_ids)
-        query += " ORDER BY COALESCE(created, updated, oai_datestamp, fetched_at) DESC, arxiv_id DESC"
-
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            rows = cursor.fetchall()
-        return [self._parse_row(row) for row in rows]
 
     def search(
         self,

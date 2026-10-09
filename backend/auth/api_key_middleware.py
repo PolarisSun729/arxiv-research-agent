@@ -66,10 +66,6 @@ class ApiKeySettings:
             allowed_origins=get_allowed_origins(),
         )
 
-    def accepts(self, candidate: str) -> bool:
-        policy = self.match(candidate)
-        return policy is not None and policy.rejection_code() is None
-
     def match(self, candidate: str) -> ApiKeyPolicy | None:
         if not candidate or len(candidate) > 256:
             return None

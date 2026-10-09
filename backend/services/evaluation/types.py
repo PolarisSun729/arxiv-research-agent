@@ -1,6 +1,5 @@
 """评测系统类型定义"""
 
-from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 

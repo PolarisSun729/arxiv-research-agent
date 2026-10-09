@@ -8,6 +8,8 @@ python-dotenv>=1.2,<2
 slowapi>=0.1.9,<0.2
 limits>=5.8,<6
 redis>=6.4,<7
+# 服务器是 Debian 12 自带的 Python 3.11.2，redis 在 < 3.11.3 时依赖 async-timeout；CI 镜像版本更新会跳过它，必须显式声明。
+async-timeout>=4.0.3,<6
 PyJWT>=2.13,<3
 bcrypt>=5.0,<6
 email-validator>=2.3,<3

@@ -113,14 +113,6 @@ class AgentRuntimeCheckpointStore(BaseSqliteStore):
             ).fetchone()
         return self._row(row) if row else None
 
-    def list_agent_runtime_checkpoints_by_thread(self, *, session_id: str, thread_id: str, limit: int = 20) -> List[Dict[str, Any]]:
-        with self._get_connection() as conn:
-            rows = conn.execute(
-                f"SELECT {self._SELECT_COLUMNS} FROM agent_runtime_checkpoints WHERE session_id = ? AND thread_id = ? ORDER BY updated_at DESC LIMIT ?",
-                (session_id, thread_id, max(int(limit), 1)),
-            ).fetchall()
-        return [self._row(row) for row in rows]
-
     def resolve_agent_interaction(
         self,
         *,

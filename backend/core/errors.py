@@ -179,9 +179,6 @@ class AppError(Exception):
     def to_response(self) -> JSONResponse:
         return JSONResponse(status_code=self.status_code, content=self.to_payload())
 
-    def to_http_exception(self) -> HTTPException:
-        return HTTPException(status_code=self.status_code, detail=self.to_payload())
-
 
 def error_response(error: AppError) -> JSONResponse:
     return error.to_response()

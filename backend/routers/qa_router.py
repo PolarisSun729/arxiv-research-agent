@@ -17,7 +17,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
@@ -26,7 +26,6 @@ from pydantic import BaseModel
 
 from dependencies import (
     get_enhanced_retrieval_service,
-    get_generation_service,
     get_index_job_manager,
     get_paper_catalog_store,
     get_paper_chat_message_store,
@@ -39,10 +38,9 @@ from dependencies import (
 from core.errors import AppError, ErrorCode, error_response
 from core.responses import RedactedJSONResponse
 from routers.qa_utils import build_qa_diagnostic, get_latest_retrieval_trace, sanitize_trace_slug
-from services.paper_qa.qa_observation import build_error_qa_observation, build_qa_observation
-from services.paper_qa.answer_language import CHINESE_FINAL_ANSWER_INSTRUCTION
+from services.paper_qa.qa_observation import build_error_qa_observation
 from utils.config import get_default_user_id, get_qa_index_job_runtime_config
-from utils.secret_redaction import StreamingSecretRedactor, redact_sensitive_value, redact_text
+from utils.secret_redaction import redact_sensitive_value, redact_text
 from auth.ownership import prepare_paper_qa, validate_note_source
 
 logger = logging.getLogger(__name__)
@@ -800,12 +798,8 @@ async def qa_paper_stream(
     arxiv_id: str,
     payload: QaRequest,
     paper_qa_service=Depends(get_paper_qa_service),
-    generation_service=Depends(get_generation_service),
 ):
-    """执行流式论文问答，并以 SSE 持续向前端推送事件。
-
-    Phase 3: 如果 paper_qa_service 有 research_service，使用证据研究引擎流式接口。
-    """
+    """执行流式论文问答，把证据研究引擎的阶段事件转换为 SSE 推送给前端。"""
     prepare_paper_qa(arxiv_id, payload)
     question = payload.question.strip()
     logger.debug("QA stream request for paper: %s, question: %s", arxiv_id, question)
@@ -814,8 +808,8 @@ async def qa_paper_stream(
         """格式化并脱敏单条 SSE 消息，保护未经过 JSONResponse 的流式出口。"""
         return f"event: {event_name}\ndata: {json.dumps(redact_sensitive_value(data), ensure_ascii=False)}\n\n"
 
-    def event_stream_with_research():
-        """使用证据研究引擎的流式事件生成器。"""
+    def event_stream():
+        """把证据研究引擎的事件映射为前端约定的 SSE 事件。"""
         try:
             for event in paper_qa_service.answer_question_with_research_stream(arxiv_id, payload):
                 event_type = event.get("event", "unknown")
@@ -869,227 +863,8 @@ async def qa_paper_stream(
                 context={"arxiv_id": arxiv_id, "qa_observation": observation},
             ).to_payload())
 
-    def event_stream():
-        """生成 SSE 事件流。
-
-        事件大致分为三类：
-        1. meta：流开始时发送上下文与调试信息；
-        2. delta：模型逐段生成答案；
-        3. done / error：结束态事件。
-        """
-        retrieval_debug = None
-        source_payload: List[Dict[str, Any]] = []
-        stream_redactor = StreamingSecretRedactor()
-        try:
-            # 上下文构建也放在 SSE 生成器内，确保未建索引、检索异常等前置失败能返回统一 error 事件。
-            _, search_results, qa_context, retrieval_debug = paper_qa_service.build_qa_context(arxiv_id, payload)
-            # 优先复用 ContextPackBuilder 产出的 source_payload，旧服务或测试替身没有该字段时再走兼容包装。
-            source_payload = qa_context.get("source_payload") or paper_qa_service.build_source_payload(search_results)
-            contextualized_question = str(qa_context.get("generation_question", question) or question).strip() or question
-            question_contextualization = qa_context.get("question_contextualization", {}) or {}
-            chat_session = qa_context.get("chat_session", {}) or {}
-            # meta 阶段尚未生成答案，因此观察结构只代表当前检索/证据候选状态。
-            qa_observation = build_qa_observation(
-                retrieval_debug=retrieval_debug if isinstance(retrieval_debug, dict) else None,
-                sources=source_payload,
-            )
-
-            yield sse_event(
-                "meta",
-                {
-                    "status": "started",
-                    "arxiv_id": arxiv_id,
-                    "question": question,
-                    "session_id": chat_session.get("session_id"),
-                    "chat_session": _serialize_chat_session(chat_session),
-                    "original_question": question,
-                    "contextualized_question": contextualized_question,
-                    "used_short_term_memory": bool(question_contextualization.get("used_short_term_memory", False)),
-                    "question_contextualization": question_contextualization,
-                    "sources": source_payload,
-                    "qa_observation": qa_observation,
-                    "retrieval_debug": retrieval_debug,
-                },
-            )
-
-            for chunk in generation_service.stream_qwen_responses(
-                query=(
-                    f"{contextualized_question}\n\n"
-                    f"{CHINESE_FINAL_ANSWER_INSTRUCTION}\n"
-                    "引用格式要求：每个证据引用必须单独写成 [source:{source_id}]；禁止把多个引用合并在一对方括号内，"
-                    "禁止裸 source:number/source-*、[Source 1]、[Image 1] 和其他数字引用。"
-                ),
-                context=qa_context["text_context"],
-                # 纸面 QA 的最终答案属于高质量生成任务，明确走大模型。
-                task_type="paper_qa_final_answer",
-                image_inputs=qa_context["image_inputs"],
-                # 仅把 figure 类型的资源元信息传给多模态生成层，避免无关资产干扰回答。
-                asset_metadata=[item for item in qa_context["asset_metadata"] if item.get("chunk_type") == "figure"],
-            ):
-                if chunk.get("type") == "delta":
-                    # 单条 SSE 脱敏无法识别跨分片凭据；只有确认安全的增量才交给前端拼接。
-                    safe_delta = stream_redactor.feed(chunk.get("delta", "") or "")
-                    if safe_delta:
-                        yield sse_event("delta", {"delta": safe_delta})
-                elif chunk.get("type") == "completed":
-                    final_answer = chunk.get("answer", "") or ""
-                    answer_generator = getattr(paper_qa_service, "answer_generator", None)
-                    if answer_generator is not None and hasattr(answer_generator, "validate_and_repair_stream_answer"):
-                        citation_result = answer_generator.validate_and_repair_stream_answer(
-                            answer=final_answer,
-                            generation_question=contextualized_question,
-                            context_pack=qa_context.get("context_pack") or {},
-                        )
-                    else:
-                        # 仅用于旧测试替身或降级服务；真实 PaperQAService 始终走严格引用校验。
-                        citation_result = {
-                            "answer": final_answer,
-                            "cited_source_ids": [],
-                            "citation_debug": None,
-                            "citation_warning": None,
-                        }
-                    final_answer = citation_result["answer"]
-                    cited_source_ids = citation_result["cited_source_ids"]
-                    citation_debug = citation_result["citation_debug"]
-                    citation_warning = citation_result["citation_warning"]
-                    verification_debug = {}
-                    verifier = getattr(paper_qa_service, "evidence_verifier", None)
-                    if verifier is not None:
-                        # 流式生成结束后做同一套轻量校验，避免 SSE 路径绕过证据闭环。
-                        verification_debug = verifier.verify(
-                            answer=final_answer,
-                            sources=source_payload,
-                            cited_source_ids=cited_source_ids,
-                            claims=[],
-                            generation_insufficient_evidence=False,
-                        )
-                        final_answer = verifier.apply_answer_guardrail(final_answer, verification_debug)
-                    if isinstance(retrieval_debug, dict):
-                        retrieval_debug["verification"] = verification_debug
-                    qa_observation = build_qa_observation(
-                        retrieval_debug=retrieval_debug if isinstance(retrieval_debug, dict) else None,
-                        sources=source_payload,
-                        verification_result=verification_debug,
-                    )
-                    if isinstance(retrieval_debug, dict):
-                        retrieval_debug["qa_observation"] = qa_observation
-                    # 回答生成结束后，把本轮问答、来源和调试快照统一持久化，
-                    # 这样后续会话恢复、笔记关联、问题追踪都有完整上下文。
-                    persisted_turn = paper_qa_service.persist_completed_turn(
-                        chat_session=chat_session,
-                        question=question,
-                        answer=final_answer,
-                        source_payload=source_payload,
-                        retrieval_debug=retrieval_debug if isinstance(retrieval_debug, dict) else None,
-                        contextualized_question=contextualized_question,
-                        question_contextualization=question_contextualization,
-                    )
-                    safe_tail = stream_redactor.finish()
-                    if safe_tail:
-                        yield sse_event("delta", {"delta": safe_tail})
-                    yield sse_event(
-                        "done",
-                        {
-                            "status": "success",
-                            "answer": final_answer,
-                            "session_id": chat_session.get("session_id"),
-                            "chat_session": _serialize_chat_session(persisted_turn.get("chat_session", chat_session)),
-                            "turn_id": persisted_turn.get("turn_id"),
-                            "original_question": question,
-                            "contextualized_question": contextualized_question,
-                            "used_short_term_memory": bool(question_contextualization.get("used_short_term_memory", False)),
-                            "question_contextualization": question_contextualization,
-                            "sources": source_payload,
-                            "cited_source_ids": cited_source_ids,
-                            "citation_debug": citation_debug,
-                            "citation_warning": citation_warning,
-                            "verification_debug": verification_debug,
-                            "qa_observation": qa_observation,
-                            "retrieval_debug": retrieval_debug,
-                            "usage": chunk.get("usage"),
-                        },
-                    )
-                    return
-
-            # 极端情况下模型流没有显式 completed 事件，仍返回一个空答案的 done，
-            # 保证前端能收到结束信号，不会一直处于 loading 状态。
-            verification_debug = {}
-            verifier = getattr(paper_qa_service, "evidence_verifier", None)
-            fallback_answer = ""
-            if verifier is not None:
-                # 没有 completed 事件意味着答案为空，仍记录校验结果，便于前端区分生成失败和证据不足。
-                verification_debug = verifier.verify(answer="", sources=source_payload, cited_source_ids=[], claims=[])
-                fallback_answer = verifier.apply_answer_guardrail("", verification_debug)
-                if isinstance(retrieval_debug, dict):
-                    retrieval_debug["verification"] = verification_debug
-            qa_observation = build_qa_observation(
-                retrieval_debug=retrieval_debug if isinstance(retrieval_debug, dict) else None,
-                sources=source_payload,
-                verification_result=verification_debug,
-            )
-            if isinstance(retrieval_debug, dict):
-                retrieval_debug["qa_observation"] = qa_observation
-            safe_tail = stream_redactor.finish()
-            if safe_tail:
-                yield sse_event("delta", {"delta": safe_tail})
-            yield sse_event(
-                "done",
-                {
-                    "status": "success",
-                    "answer": fallback_answer,
-                    "session_id": chat_session.get("session_id"),
-                    "chat_session": _serialize_chat_session(chat_session),
-                    "original_question": question,
-                    "contextualized_question": contextualized_question,
-                    "used_short_term_memory": bool(question_contextualization.get("used_short_term_memory", False)),
-                    "question_contextualization": question_contextualization,
-                    "sources": source_payload,
-                    "verification_debug": verification_debug,
-                    "qa_observation": qa_observation,
-                    "retrieval_debug": retrieval_debug,
-                    "usage": None,
-                },
-            )
-        except AppError as exc:
-            logger.warning(
-                "Paper QA stream failed: code=%s arxiv_id=%s user_id=%s session_id=%s stage=%s recoverable=%s detail=%s",
-                exc.code,
-                arxiv_id,
-                payload.user_id,
-                payload.session_id,
-                exc.context.get("stage"),
-                exc.recoverable,
-                exc.detail,
-            )
-            yield sse_event("error", exc.to_payload())
-        except Exception as exc:
-            logger.exception("Error in QA stream: arxiv_id=%s code=%s", arxiv_id, ErrorCode.LLM_GENERATION_FAILED)
-            qa_observation = build_error_qa_observation(
-                error_code=ErrorCode.LLM_GENERATION_FAILED,
-                error_stage="qa_stream",
-                error_reason=str(exc),
-                retrieval_debug=retrieval_debug if isinstance(retrieval_debug, dict) else None,
-                sources=source_payload,
-            )
-            # SSE 场景下不能直接抛异常中断连接，因此把错误包装成统一 error 事件返回。
-            stream_error = AppError(
-                ErrorCode.LLM_GENERATION_FAILED,
-                detail={"detail": exc, "qa_observation": qa_observation},
-                context={"arxiv_id": arxiv_id, "user_id": payload.user_id, "session_id": payload.session_id, "stage": "qa_stream", "qa_observation": qa_observation},
-            )
-            yield sse_event("error", stream_error.to_payload())
-        finally:
-            # 异常和 GeneratorExit 都只丢弃未决尾部；不能在取消请求时补发可能属于密钥的片段。
-            stream_redactor.discard()
-
-    # Phase 3: 路由到证据研究引擎流式接口或旧编排流式接口
-    if hasattr(paper_qa_service, "research_service") and paper_qa_service.research_service is not None:
-        selected_stream = event_stream_with_research()
-    else:
-        selected_stream = event_stream()
-
     return StreamingResponse(
-        selected_stream,
+        event_stream(),
         media_type="text/event-stream",
         headers={
             # SSE 需要禁用缓存和代理缓冲，否则前端可能收不到实时增量。

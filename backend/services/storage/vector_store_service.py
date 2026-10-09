@@ -5,7 +5,6 @@ import json
 import re
 from typing import List, Dict, Any, Optional
 import logging
-from pathlib import Path
 from pymilvus import (
     DataType,
     MilvusClient,
@@ -24,8 +23,6 @@ ASSET_PATH_MAX_LENGTH = VECTOR_STORE_CONFIG["asset_path_max_length"]
 ASSET_SUMMARY_MAX_LENGTH = VECTOR_STORE_CONFIG["asset_summary_max_length"]
 ASSET_PREVIEW_MAX_LENGTH = VECTOR_STORE_CONFIG["asset_preview_max_length"]
 
-COLLECTION_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
 
 def normalize_collection_name(collection_name: str) -> str:
     name = (collection_name or "").strip()
@@ -40,9 +37,6 @@ def normalize_collection_name(collection_name: str) -> str:
         name = f"_{name}"
     return name
 
-
-def is_valid_collection_name(collection_name: str) -> bool:
-    return bool(COLLECTION_NAME_PATTERN.match(collection_name or ""))
 
 class VectorDBConfig:
     """
@@ -96,7 +90,6 @@ class VectorStoreService:
         # 向量库本地产物归属后端目录，避免从仓库根目录启动时重新生成根目录资产。
         self.vector_store_dir = resolve_backend_artifact_path(
             "03-vector-store",
-            option_name="VECTOR_STORE_DIR",
         )
         os.makedirs(self.vector_store_dir, exist_ok=True)
 

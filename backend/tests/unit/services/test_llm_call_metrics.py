@@ -18,11 +18,6 @@ def provider(monkeypatch):
     )
 
     def create(**kwargs):
-        if kwargs.get("stream"):
-            return iter([
-                SimpleNamespace(type="response.output_text.delta", delta="离线答案"),
-                SimpleNamespace(type="response.completed", response=response),
-            ])
         return response
 
     sdk = SimpleNamespace(responses=SimpleNamespace(create=create),
@@ -34,7 +29,7 @@ def provider(monkeypatch):
     return service, sdk
 
 
-@pytest.mark.parametrize("method", ["complete", "qwen", "stream", "openai", "deepseek"])
+@pytest.mark.parametrize("method", ["complete", "qwen", "openai", "deepseek"])
 def test_each_sdk_call_is_counted_once_with_usage(provider, method):
     service, _ = provider
     stats = LLMCallStats()
@@ -43,8 +38,6 @@ def test_each_sdk_call_is_counted_once_with_usage(provider, method):
             service.complete_with_qwen("问题", api_key="offline", task_type="verification")
         elif method == "qwen":
             service._generate_with_qwen_responses("问题", "证据", api_key="offline")
-        elif method == "stream":
-            assert list(service.stream_qwen_responses("问题", "证据", api_key="offline"))[-1]["type"] == "completed"
         elif method == "openai":
             service._generate_with_openai("test", "问题", "证据", api_key="offline")
         else:

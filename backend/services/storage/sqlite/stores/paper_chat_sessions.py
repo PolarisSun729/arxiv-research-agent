@@ -9,24 +9,6 @@ from services.storage.sqlite.shared import DEFAULT_USER_ID, logger
 class PaperChatSessionStore(BaseSqliteStore):
     """维护论文问答会话的基础 CRUD；消息写入和 QA turn 事务仍留在消息流程。"""
 
-    def _ensure_paper_chat_session_summary_columns(self, conn):
-        # 会话摘要是运行时压缩视图，旧库启动时补列；完整消息仍保留在 paper_chat_messages。
-        required_columns = {
-            "summary_json": "TEXT",
-            "summary_updated_at": "TIMESTAMP",
-            "summary_turn_count": "INTEGER DEFAULT 0",
-            "summary_last_turn_id": "TEXT",
-        }
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(paper_chat_sessions)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
-        for column_name, column_definition in required_columns.items():
-            if column_name not in existing_columns:
-                cursor.execute(
-                    f"ALTER TABLE paper_chat_sessions ADD COLUMN {column_name} {column_definition}"
-                )
-        conn.commit()
-
     def _row_to_paper_chat_session(self, row: Any) -> Dict[str, Any]:
         return {
             'session_id': row[0],

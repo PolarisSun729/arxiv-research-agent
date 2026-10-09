@@ -66,9 +66,6 @@ class ArtifactTemplateRegistry:
             raise KeyError(f"Artifact template not registered: {research_task_type}")
         return template.model_copy(deep=True)
 
-    def task_types(self) -> List[str]:
-        return sorted(self._templates.keys())
-
     @classmethod
     def build_default(cls) -> "ArtifactTemplateRegistry":
         return cls(

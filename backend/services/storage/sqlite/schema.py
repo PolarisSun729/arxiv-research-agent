@@ -3,100 +3,11 @@ from services.storage.sqlite.shared import DEFAULT_USER_ID, logger
 
 
 class StorageSchemaMigrator:
-    """集中负责 SQLite schema 初始化和旧库补列，业务 store 不再隐式建表。"""
+    """集中负责 SQLite schema 初始化，业务 store 不再隐式建表。"""
 
     def __init__(self, connection_provider: SqliteConnectionProvider) -> None:
         self.connection_provider = connection_provider
 
-    def _ensure_user_interest_vector_columns(self, conn):
-        # 旧库可能缺少聚类和负反馈字段；启动时补列，保证推荐画像读写兼容历史 SQLite 文件。
-        required_columns = {
-            "cluster_count": "INTEGER DEFAULT 0",
-            "profile_mode": "TEXT DEFAULT 'mean'",
-            "interest_clusters": "TEXT",
-            "weak_interest_pool": "TEXT",
-            "disliked_vector_data": "TEXT",
-            "disliked_paper_examples": "TEXT",
-            "negative_feedback_stats": "TEXT",
-            "negative_feedback_profile": "TEXT",
-        }
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(user_interest_vectors)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
-        for column_name, column_definition in required_columns.items():
-            if column_name not in existing_columns:
-                cursor.execute(
-                    f"ALTER TABLE user_interest_vectors ADD COLUMN {column_name} {column_definition}"
-                )
-        conn.commit()
-    def _ensure_user_profile_event_columns(self, conn):
-        # 画像事件表从辅助审计升级为主证据流；旧库启动时补齐新列，避免手工迁移数据库。
-        required_columns = {
-            "event_type": "TEXT",
-            "action_strength": "REAL DEFAULT 0",
-            "source": "TEXT",
-            "note_id": "TEXT",
-            "session_id": "TEXT",
-            "metadata_json": "TEXT",
-            "include_in_profile": "INTEGER DEFAULT 1",
-            "consumed_by_job_id": "TEXT",
-            "consumed_at": "TIMESTAMP",
-            "dedupe_key": "TEXT",
-            "profile_dirty": "INTEGER DEFAULT 1",
-        }
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(user_profile_events)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
-        for column_name, column_definition in required_columns.items():
-            if column_name not in existing_columns:
-                cursor.execute(
-                    f"ALTER TABLE user_profile_events ADD COLUMN {column_name} {column_definition}"
-                )
-        cursor.execute(
-            '''
-            UPDATE user_profile_events
-            SET event_type = COALESCE(event_type, action_type),
-                source = COALESCE(source, source_type),
-                metadata_json = COALESCE(metadata_json, payload_json),
-                include_in_profile = COALESCE(include_in_profile, 1),
-                profile_dirty = COALESCE(profile_dirty, 1)
-            WHERE event_type IS NULL OR source IS NULL OR metadata_json IS NULL
-            '''
-        )
-        conn.commit()
-
-    def _ensure_user_profile_build_job_columns(self, conn):
-        # build job 是前端轮询的状态源；旧库补齐 metrics_json 后即可承载细粒度进度，不需要破坏现有列结构。
-        required_columns = {
-            "metrics_json": "TEXT",
-        }
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(user_profile_build_jobs)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
-        for column_name, column_definition in required_columns.items():
-            if column_name not in existing_columns:
-                cursor.execute(
-                    f"ALTER TABLE user_profile_build_jobs ADD COLUMN {column_name} {column_definition}"
-                )
-        conn.commit()
-
-    def _ensure_paper_chat_session_summary_columns(self, conn):
-        # 会话摘要是运行时压缩视图，旧库启动时补列；完整消息仍保留在 paper_chat_messages。
-        required_columns = {
-            "summary_json": "TEXT",
-            "summary_updated_at": "TIMESTAMP",
-            "summary_turn_count": "INTEGER DEFAULT 0",
-            "summary_last_turn_id": "TEXT",
-        }
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(paper_chat_sessions)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
-        for column_name, column_definition in required_columns.items():
-            if column_name not in existing_columns:
-                cursor.execute(
-                    f"ALTER TABLE paper_chat_sessions ADD COLUMN {column_name} {column_definition}"
-                )
-        conn.commit()
 
     def ensure_schema(self) -> None:
         with self.connection_provider.connect() as conn:
@@ -193,6 +104,9 @@ class StorageSchemaMigrator:
                     error_message TEXT,
                     artifact_status TEXT DEFAULT 'active',
                     indexed_at TIMESTAMP,
+                    active_index_version TEXT,
+                    active_build_id TEXT,
+                    previous_build_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -283,10 +197,6 @@ class StorageSchemaMigrator:
                 )
             ''')
 
-            # 旧版数据库可能已经存在 paper_index_jobs，但缺少 lease/attempt 等新列；
-            # 创建依赖这些列的索引前先原位补齐，避免启动迁移在索引阶段中断。
-            self._ensure_paper_index_job_columns(conn)
-
             cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS paper_chat_sessions (
                     session_id TEXT PRIMARY KEY,
@@ -333,21 +243,6 @@ class StorageSchemaMigrator:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(user_id, arxiv_id, action_type),
                     FOREIGN KEY(arxiv_id) REFERENCES arxiv_papers(arxiv_id)
-                )
-            ''')
-
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS user_research_profiles (
-                    user_id TEXT PRIMARY KEY,
-                    positive_topics TEXT,
-                    negative_topics TEXT,
-                    recent_topics TEXT,
-                    preferred_categories TEXT,
-                    preferred_answer_style TEXT,
-                    common_question_types TEXT,
-                    representative_papers TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
 
@@ -682,6 +577,11 @@ class StorageSchemaMigrator:
             ''')
 
             cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_paper_index_jobs_idempotency_status
+                ON paper_index_jobs(idempotency_key, status, heartbeat_at)
+            ''')
+
+            cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_paper_index_jobs_claim
                 ON paper_index_jobs(status, lease_expires_at, created_at)
             ''')
@@ -815,245 +715,4 @@ class StorageSchemaMigrator:
 
             conn.commit()
             logger.info("Database tables initialized successfully")
-            self._ensure_user_interest_vector_columns(conn)
-            self._ensure_user_profile_event_columns(conn)
-            self._ensure_user_profile_build_job_columns(conn)
-            self._ensure_paper_qa_index_columns(conn)
-            self._ensure_paper_qa_index_version_columns(conn)
-            self._ensure_paper_qa_index_version_rows(conn)
-            self._ensure_paper_chat_session_summary_columns(conn)
-            self._ensure_agent_runtime_checkpoint_v2_columns(conn)
 
-    def _ensure_agent_runtime_checkpoint_v2_columns(self, conn):
-        """补齐新 runtime 列，但不迁移旧确认内容；旧 schema 现场必须由恢复入口明确拒绝。"""
-
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(agent_runtime_checkpoints)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
-        if "schema_version" not in existing_columns:
-            # 历史行保持版本 1，防止缺少参数绑定授权的旧确认被新执行链错误恢复。
-            cursor.execute("ALTER TABLE agent_runtime_checkpoints ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1")
-        if "interaction_json" not in existing_columns:
-            cursor.execute("ALTER TABLE agent_runtime_checkpoints ADD COLUMN interaction_json TEXT")
-        conn.commit()
-
-    def _ensure_paper_qa_index_columns(self, conn):
-        # 旧环境可能已经创建过 paper_qa_index；这里补齐 artifact 字段，保留失败后的文件与 collection 追踪。
-        required_columns = {
-            "chunk_file": "TEXT",
-            "retrieval_index_file": "TEXT",
-            "retrieval_index_count": "INTEGER DEFAULT 0",
-            "retrieval_index_types": "TEXT",
-            "retrieval_index_version": "TEXT",
-            "sparse_index_dir": "TEXT",
-            "sparse_index_manifest_file": "TEXT",
-            "sparse_index_document_count": "INTEGER DEFAULT 0",
-            "sparse_index_token_count": "INTEGER DEFAULT 0",
-            "sparse_index_backend": "TEXT",
-            "sparse_index_schema_version": "TEXT",
-            "sparse_index_source_file": "TEXT",
-            "sparse_index_source_hash": "TEXT",
-            "sparse_index_avgdl": "REAL DEFAULT 0",
-            "embedding_file": "TEXT",
-            "loading_method": "TEXT",
-            "chunking_strategy": "TEXT",
-            "current_stage": "TEXT",
-            "failed_stage": "TEXT",
-            "error_message": "TEXT",
-            "artifact_status": "TEXT DEFAULT 'active'",
-            "indexed_at": "TIMESTAMP",
-            "active_index_version": "TEXT",
-            "active_build_id": "TEXT",
-            "previous_build_id": "TEXT",
-        }
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(paper_qa_index)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
-        for column_name, column_definition in required_columns.items():
-            if column_name not in existing_columns:
-                cursor.execute(
-                    f"ALTER TABLE paper_qa_index ADD COLUMN {column_name} {column_definition}"
-                )
-        conn.commit()
-
-    def _ensure_paper_qa_index_version_columns(self, conn):
-        # 版本表和 active 表必须拥有同一组 artifact 字段，否则激活/回滚时会丢失 retrieval index 产物定位。
-        required_columns = {
-            "retrieval_index_file": "TEXT",
-            "retrieval_index_count": "INTEGER DEFAULT 0",
-            "retrieval_index_types": "TEXT",
-            "retrieval_index_version": "TEXT",
-            "sparse_index_dir": "TEXT",
-            "sparse_index_manifest_file": "TEXT",
-            "sparse_index_document_count": "INTEGER DEFAULT 0",
-            "sparse_index_token_count": "INTEGER DEFAULT 0",
-            "sparse_index_backend": "TEXT",
-            "sparse_index_schema_version": "TEXT",
-            "sparse_index_source_file": "TEXT",
-            "sparse_index_source_hash": "TEXT",
-            "sparse_index_avgdl": "REAL DEFAULT 0",
-        }
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(paper_qa_index_versions)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
-        for column_name, column_definition in required_columns.items():
-            if column_name not in existing_columns:
-                cursor.execute(
-                    f"ALTER TABLE paper_qa_index_versions ADD COLUMN {column_name} {column_definition}"
-                )
-        conn.commit()
-
-    def _ensure_paper_qa_index_version_rows(self, conn):
-        # 旧库只有 paper_qa_index 单行记录；启动时补 active version，避免升级后丢失可问答状态。
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT OR IGNORE INTO paper_qa_index_versions (
-                build_id, arxiv_id, index_version, status, is_active, collection_name,
-                chunk_count, embedding_model, pdf_path, chunk_file,
-                retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version,
-                sparse_index_dir, sparse_index_manifest_file, sparse_index_document_count, sparse_index_token_count, sparse_index_backend,
-                sparse_index_schema_version, sparse_index_source_file, sparse_index_source_hash, sparse_index_avgdl,
-                embedding_file,
-                loading_method, chunking_strategy, current_stage, failed_stage,
-                error_message, artifact_status, indexed_at, activated_at, created_at, updated_at
-            )
-            SELECT
-                'legacy-' || replace(replace(arxiv_id, '.', '_'), '/', '_'),
-                arxiv_id,
-                'legacy',
-                CASE WHEN status = 'indexed' THEN 'active' ELSE status END,
-                CASE WHEN status = 'indexed' THEN 1 ELSE 0 END,
-                collection_name,
-                chunk_count,
-                embedding_model,
-                pdf_path,
-                chunk_file,
-                retrieval_index_file,
-                COALESCE(retrieval_index_count, 0),
-                retrieval_index_types,
-                retrieval_index_version,
-                sparse_index_dir,
-                sparse_index_manifest_file,
-                COALESCE(sparse_index_document_count, 0),
-                COALESCE(sparse_index_token_count, 0),
-                sparse_index_backend,
-                sparse_index_schema_version,
-                sparse_index_source_file,
-                sparse_index_source_hash,
-                COALESCE(sparse_index_avgdl, 0),
-                embedding_file,
-                loading_method,
-                chunking_strategy,
-                current_stage,
-                failed_stage,
-                error_message,
-                artifact_status,
-                indexed_at,
-                CASE WHEN status = 'indexed' THEN COALESCE(indexed_at, updated_at, created_at, CURRENT_TIMESTAMP) ELSE NULL END,
-                created_at,
-                updated_at
-            FROM paper_qa_index
-            WHERE collection_name IS NOT NULL
-              AND collection_name != ''
-            """
-        )
-        cursor.execute(
-            """
-            UPDATE paper_qa_index
-            SET active_index_version = COALESCE(active_index_version, 'legacy'),
-                active_build_id = COALESCE(active_build_id, 'legacy-' || replace(replace(arxiv_id, '.', '_'), '/', '_'))
-            WHERE status = 'indexed'
-              AND collection_name IS NOT NULL
-              AND collection_name != ''
-            """
-        )
-        conn.commit()
-
-    def _ensure_paper_index_job_columns(self, conn):
-        # 旧库可能缺少 lease、attempt 与结果字段；启动时原位补齐，保留已有索引任务历史。
-        required_columns = {
-            "idempotency_key": "TEXT",
-            "heartbeat_at": "TIMESTAMP",
-            "recipe_version": "TEXT NOT NULL DEFAULT 'paper_qa_index_v1'",
-            "attempt_count": "INTEGER NOT NULL DEFAULT 0",
-            "max_attempts": "INTEGER NOT NULL DEFAULT 3",
-            "worker_id": "TEXT",
-            "lease_acquired_at": "TIMESTAMP",
-            "lease_expires_at": "TIMESTAMP",
-            "last_heartbeat_at": "TIMESTAMP",
-            "result_json": "TEXT",
-            "failure_code": "TEXT",
-            "stage_message": "TEXT",
-            "completed_at": "TIMESTAMP",
-        }
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(paper_index_jobs)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
-        for column_name, column_definition in required_columns.items():
-            if column_name not in existing_columns:
-                cursor.execute(
-                    f"ALTER TABLE paper_index_jobs ADD COLUMN {column_name} {column_definition}"
-                )
-
-        cursor.execute(
-            """
-            UPDATE paper_index_jobs
-            SET idempotency_key = arxiv_id || ':' || COALESCE(NULLIF(loading_method, ''), 'docling')
-                                  || ':' || COALESCE(NULLIF(recipe_version, ''), 'paper_qa_index_v1')
-            WHERE idempotency_key IS NULL OR idempotency_key = ''
-               OR idempotency_key NOT LIKE '%:' || COALESCE(NULLIF(recipe_version, ''), 'paper_qa_index_v1')
-            """
-        )
-        cursor.execute(
-            """
-            UPDATE paper_index_jobs
-            SET heartbeat_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
-            WHERE heartbeat_at IS NULL OR heartbeat_at = ''
-            """
-        )
-        cursor.execute(
-            """
-            UPDATE paper_index_jobs
-            SET last_heartbeat_at = COALESCE(last_heartbeat_at, heartbeat_at, updated_at, created_at, CURRENT_TIMESTAMP)
-            WHERE last_heartbeat_at IS NULL OR last_heartbeat_at = ''
-            """
-        )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS paper_index_job_attempts (
-                attempt_id TEXT PRIMARY KEY,
-                job_id TEXT NOT NULL,
-                attempt_no INTEGER NOT NULL,
-                worker_id TEXT NOT NULL,
-                status TEXT NOT NULL,
-                started_at TIMESTAMP NOT NULL,
-                heartbeat_at TIMESTAMP,
-                finished_at TIMESTAMP,
-                failed_stage TEXT,
-                error_code TEXT,
-                error_message TEXT,
-                UNIQUE(job_id, attempt_no),
-                FOREIGN KEY(job_id) REFERENCES paper_index_jobs(job_id)
-            )
-            """
-        )
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_paper_index_jobs_idempotency_status
-            ON paper_index_jobs(idempotency_key, status, heartbeat_at)
-            """
-        )
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_paper_index_jobs_claim
-            ON paper_index_jobs(status, lease_expires_at, created_at)
-            """
-        )
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_paper_index_job_attempts_job
-            ON paper_index_job_attempts(job_id, attempt_no DESC)
-            """
-        )
-        conn.commit()

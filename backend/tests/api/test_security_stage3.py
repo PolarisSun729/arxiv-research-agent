@@ -583,12 +583,10 @@ def test_quota_and_auth_store_failures_prevent_business(app, monkeypatch):
     assert calls == []
 
 
-def test_bare_jwt_redaction_across_stream_fragments(app):
-    from utils.secret_redaction import StreamingSecretRedactor, redact_text
+def test_bare_jwt_redaction_in_diagnostics(app):
+    from utils.secret_redaction import redact_text
     _, token = account(app)
-    assert token not in redact_text(f"copied {token} into diagnostics")
-    redactor = StreamingSecretRedactor()
-    output = "".join(redactor.feed(char) for char in f"copied {token} done") + redactor.finish()
+    output = redact_text(f"copied {token} into diagnostics")
     assert token not in output and "REDACTED" in output
 
 

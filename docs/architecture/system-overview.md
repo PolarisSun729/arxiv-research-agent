@@ -87,11 +87,11 @@ Agent 和直接 QA 入口会在不同位置进入系统，但都复用同一组�
 
 [`backend/utils/storage_paths.py`](../../backend/utils/storage_paths.py) 是 SQLite 数据库、Paper QA 建库缓存与后端本地产物目录的路径真源。默认推荐数据库、OAI 索引库和 QA 缓存均位于 `backend/06-database`；`SQLITE_DATABASE_PATH`、`OAI_SQLITE_DATABASE_PATH` 与 `PAPER_QA_BUILD_CACHE_DIR` 的相对值也始终相对 `backend` 解析，不依赖服务从哪个目录启动。
 
-这些配置可以使用仓库外的绝对路径，以支持部署时挂载独立持久卷；但不能指向仓库根目录 `06-database`，该目录会在配置加载阶段明确报错。`SqliteConnectionProvider`、`ArxivOaiDatabaseService` 和 `PaperQABuildCache` 对直接注入的路径复用相同规则，新增调用方不得自行按当前工作目录解释路径。
+这些配置可以使用仓库外的绝对路径，以支持部署时挂载独立持久卷。`SqliteConnectionProvider`、`ArxivOaiDatabaseService` 和 `PaperQABuildCache` 对直接注入的路径复用相同规则，新增调用方不得自行按当前工作目录解释路径。
 
 加载后的文档、Embedding 结果、向量库本地资产、LLM 生成结果和每日 arXiv 下载产物分别固定在 `backend/01-loaded-docs`、`backend/02-embedded-docs`、`backend/03-vector-store`、`backend/05-generation-results` 与 `backend/06-daily-arxiv-paper`。服务代码应通过 `resolve_backend_artifact_path()` 获取这些目录，不能再直接 `os.makedirs("01-loaded-docs")` 或按当前工作目录拼接路径。
 
-[`scripts/doctor.py`](../../scripts/doctor.py) 发现根目录遗留 `06-database`、`01-loaded-docs`、`02-embedded-docs`、`03-vector-store`、`05-generation-results` 或 `06-daily-arxiv-paper` 时只报告清理警告，不阻塞已修复的服务；显式配置到根目录 `06-database` 则是失败项。自动化测试必须使用临时 SQLite 文件，不能复用任何项目持久化库。
+自动化测试必须使用临时 SQLite 文件，不能复用任何项目持久化库。
 
 ## 常用维护定位
 

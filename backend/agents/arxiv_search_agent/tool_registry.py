@@ -225,21 +225,8 @@ class ToolRegistry:
             raise ValueError(f"Unknown planner tool: {tool_name}")
         return normalized_tool_name
 
-    def list_contracts(self) -> List[ToolContract]:
-        return list(self._contracts.values())
-
     def list_tools(self) -> List[ToolSpec]:
         return [contract.to_tool_spec() for contract in self._contracts.values()]
-
-    def list_by_capability(self, tag: str) -> List[ToolSpec]:
-        normalized_tag = str(tag or "").strip()
-        if not normalized_tag:
-            return []
-        return [
-            contract.to_tool_spec()
-            for contract in self._contracts.values()
-            if normalized_tag in list(contract.capability_tags or [])
-        ]
 
     def describe_contract(self, tool_name: str) -> Dict[str, Any]:
         contract = self.get_contract(tool_name)

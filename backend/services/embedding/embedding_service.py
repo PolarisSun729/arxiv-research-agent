@@ -175,7 +175,6 @@ class EmbeddingService:
     LOCAL_EMBEDDING_MODEL_SCRIPTS_PATH = EMBEDDING_CONFIG["local_model_scripts_path"]
     DASHSCOPE_EMBEDDING_URL = EMBEDDING_CONFIG["base_url"]
     DEFAULT_LOCAL_MODEL_NAME = EMBEDDING_CONFIG["model_name"]
-    DEFAULT_DASHSCOPE_MODEL_NAME = EMBEDDING_CONFIG["model_name"]
     DEFAULT_DASHSCOPE_DIMENSION = int(EMBEDDING_CONFIG["dimension"])
     DASHSCOPE_RETRYABLE_EXCEPTIONS = (
         requests.exceptions.SSLError,
@@ -1054,7 +1053,6 @@ class EmbeddingService:
         # embedding 文件同时服务入库和调试复查，必须固定到 backend 产物目录。
         embedded_docs_dir = resolve_backend_artifact_path(
             "02-embedded-docs",
-            option_name="EMBEDDED_DOCS_DIR",
         )
         os.makedirs(embedded_docs_dir, exist_ok=True)
 
@@ -1191,28 +1189,6 @@ class EmbeddingService:
         self._set_cached_embedding(cache_key, normalized_embedding)
         return normalized_embedding
 
-    def create_text_embeddings(
-        self,
-        texts: List[str],
-        provider: str,
-        model: str,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-        dimension: Optional[int] = None,
-        batch_size: Optional[int] = None,
-    ) -> List[list]:
-        """批量生成文本 embedding，不关心 usage 统计时使用该封装。"""
-        embeddings, _ = self.create_text_embeddings_with_usage(
-            texts=texts,
-            provider=provider,
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            dimension=dimension,
-            batch_size=batch_size,
-        )
-        return embeddings
-
     def create_text_embeddings_with_usage(
         self,
         texts: List[str],
@@ -1325,50 +1301,9 @@ class EmbeddingService:
 
         return [embedding if embedding is not None else [] for embedding in results], usage
 
-    def create_single_embedding_dashscope(
-        self,
-        text: str,
-        model: str = None,
-        dimension: Optional[int] = None,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-    ) -> list:
-        """使用 DashScope 配置生成单条文本 embedding。"""
-        config = EmbeddingConfig(
-            provider=EmbeddingProvider.DASHSCOPE.value,
-            model_name=model or self.DEFAULT_DASHSCOPE_MODEL_NAME,
-            api_key=api_key or EMBEDDING_CONFIG["dashscope_api_key"] or EMBEDDING_CONFIG["api_key"],
-            base_url=base_url,
-            dimension=dimension or self.DEFAULT_DASHSCOPE_DIMENSION,
-        )
-        return self._create_dashscope_embedding(text, config)
-
     def create_single_embedding_local(self, text: str) -> list:
         """使用本地模型生成单条纯文本 embedding。"""
         return self.create_single_embedding_local_input({"mode": "text", "text": text})
-
-    def get_document_embedding_config(self, collection_name: str) -> EmbeddingConfig:
-        """根据已保存的 embedding 文件反查某个集合对应的向量配置。"""
-        try:
-            doc_name = collection_name.split("_")[0]
-            # 读取路径必须和 save_embeddings 保持一致，否则根目录启动后会查错历史位置。
-            embedded_docs_dir = resolve_backend_artifact_path(
-                "02-embedded-docs",
-                option_name="EMBEDDED_DOCS_DIR",
-            )
-            for filename in os.listdir(embedded_docs_dir):
-                if filename.endswith(".json"):
-                    with open(embedded_docs_dir / filename, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                        if data.get("filename") == doc_name:
-                            return EmbeddingConfig(
-                                provider=data.get("embedding_provider"),
-                                model_name=data.get("embedding_model"),
-                                dimension=int(data.get("vector_dimension")) if data.get("vector_dimension") else None,
-                            )
-            raise ValueError(f"No matching embedding configuration found for collection: {collection_name}")
-        except Exception as e:
-            raise ValueError(f"Error getting embedding config: {str(e)}")
 
     def _image_path_to_data_url(self, image_path: str) -> str:
         """把本地图片文件转换为 provider 可直接提交的 data URL。"""

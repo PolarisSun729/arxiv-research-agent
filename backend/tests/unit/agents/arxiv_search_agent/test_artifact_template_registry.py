@@ -23,14 +23,15 @@ def _profile(task_type: str) -> dict:
 
 
 def test_default_registry_covers_all_research_task_types() -> None:
-    assert set(DEFAULT_ARTIFACT_TEMPLATE_REGISTRY.task_types()) == {
+    for task_type in (
         "direction_exploration",
         "multi_paper_comparison",
         "single_paper_deep_read",
         "reading_planning",
         "research_gap_analysis",
         "personalized_recommendation",
-    }
+    ):
+        assert DEFAULT_ARTIFACT_TEMPLATE_REGISTRY.get(task_type).research_task_type == task_type
 
 
 def test_skeleton_builder_is_deterministic_and_exports_budget() -> None:

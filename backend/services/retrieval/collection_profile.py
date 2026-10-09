@@ -103,14 +103,6 @@ class CollectionRetrievalProfileProvider:
             self._cache[resolved_name] = self._clone_profile(profile)
             return profile
 
-    def refresh_profile(self, collection_name: str, *, index_record: Optional[Dict[str, Any]] = None) -> CollectionRetrievalProfile:
-        return self.get_profile(collection_name, index_record=index_record, force_refresh=True)
-
-    def invalidate_profile(self, collection_name: str) -> None:
-        """索引重建或外部删除 collection 后可主动失效，避免继续复用旧画像。"""
-        with self._lock:
-            self._cache.pop(self._resolve_collection_name(collection_name), None)
-
     def _build_profile(
         self,
         collection_name: str,

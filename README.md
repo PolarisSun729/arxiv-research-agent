@@ -150,7 +150,7 @@ Replanner 只负责串联失败分类、候选生成、动作选择、安全检�
 | 工具执行与人工确认 | [plan_executor.py](backend/agents/arxiv_search_agent/plan_executor.py)、[tool_registry.py](backend/agents/arxiv_search_agent/tool_registry.py) |
 | 失败观察与重规划 | [observer.py](backend/agents/arxiv_search_agent/observer.py)、[replanner.py](backend/agents/arxiv_search_agent/replanner.py)、[recovery_policy.py](backend/agents/arxiv_search_agent/recovery_policy.py) |
 | 恢复安全与 checkpoint | [recovery_safety.py](backend/agents/arxiv_search_agent/recovery_safety.py)、[runtime_checkpoint.py](backend/agents/arxiv_search_agent/runtime_checkpoint.py) |
-| 论文问答 | [paper_qa_service.py](backend/services/paper_qa/paper_qa_service.py)、[evidence_verifier.py](backend/services/paper_qa/evidence_verifier.py) |
+| 论文问答 | [paper_qa_service.py](backend/services/paper_qa/paper_qa_service.py)、[paper_evidence_research/module.py](backend/services/paper_evidence_research/module.py) |
 | 混合检索 | [retrieval_pipeline.py](backend/services/retrieval/retrieval_pipeline.py)、[result_fusion_service.py](backend/services/retrieval/result_fusion_service.py)、[rerank_service.py](backend/services/retrieval/rerank_service.py) |
 | 研究记忆 | [memory_service.py](backend/services/memory/memory_service.py)、[profile_aggregator.py](backend/services/memory/profile_aggregator.py)、[profile_reviewer.py](backend/services/memory/profile_reviewer.py) |
 | 配置入口 | [config.py](backend/utils/config.py)、[.env.example](.env.example) |

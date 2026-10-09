@@ -26,7 +26,6 @@ _JWT_SHAPE_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(?P<header>[A-Za-z0-9_-]+)\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
 )
 _JWT_START_RE = re.compile(r"\beyJ[A-Za-z0-9_-]")
-_TRAILING_BEARER_RE = re.compile(r"\bBearer\Z", re.IGNORECASE)
 _VALUE_DELIMITERS = frozenset(",;}]&")
 
 
@@ -145,9 +144,6 @@ class _AssignmentRedactor:
         self.__init__()
         return tail
 
-    def discard(self) -> None:
-        self.__init__()
-
 
 def _redact_bare_credentials(text: str) -> str:
     text = _BEARER_RE.sub("Bearer " + REDACTED, text)
@@ -164,82 +160,6 @@ def _redact_bare_credentials(text: str) -> str:
             position = match.end("header") + 1
     parts.append(text[cursor:])
     return _PROVIDER_KEY_RE.sub(REDACTED, "".join(parts))
-
-
-class _CredentialTokenRedactor:
-    """完整普通词只扫描一次；Bearer 的空白前缀最多与后一个词合并。"""
-
-    def __init__(self) -> None:
-        self._pending: list[str] = []
-        self._in_token = False
-        self._awaiting_token = False
-        self._joined_bearer = False
-
-    def feed(self, text: str) -> str:
-        output: list[str] = []
-        for char in text:
-            if char.isalnum() or char in "._~+/=-":
-                if self._awaiting_token:
-                    self._awaiting_token = False
-                    self._joined_bearer = True
-                self._pending.append(char)
-                self._in_token = True
-                continue
-            if self._in_token:
-                token = "".join(self._pending)
-                if char.isspace() and not self._joined_bearer and _TRAILING_BEARER_RE.search(token):
-                    self._pending = [token, char]
-                    self._in_token = False
-                    self._awaiting_token = True
-                    continue
-                output.append(_redact_bare_credentials(token))
-                self.__init__()
-            elif self._awaiting_token:
-                if char.isspace():
-                    self._pending.append(char)
-                    continue
-                output.append(_redact_bare_credentials("".join(self._pending)))
-                self.__init__()
-            output.append(char)
-        return "".join(output)
-
-    def finish(self) -> str:
-        tail = _redact_bare_credentials("".join(self._pending))
-        self.__init__()
-        return tail
-
-    def discard(self) -> None:
-        self.__init__()
-
-
-class _LiteralRedactor:
-    """只保留已配置密钥的有限长度前缀，不随普通长词增长反复扫描整个尾部。"""
-
-    def __init__(self, variants: tuple[str, ...]) -> None:
-        self._pattern = re.compile("|".join(re.escape(secret) for secret in variants)) if variants else None
-        self._prefixes = {secret[:size] for secret in variants for size in range(1, len(secret))}
-        self._max_prefix_length = max(map(len, self._prefixes), default=0)
-        self._pending = ""
-
-    def feed(self, delta: str) -> str:
-        text = self._pending + delta
-        if self._pattern is not None:
-            # 先消除完整匹配，避免重复前缀的密钥被拆分成已发送的原文与未决尾部。
-            text = self._pattern.sub(lambda _match: REDACTED, text)
-        safe_end = len(text)
-        for size in range(min(len(text), self._max_prefix_length), 0, -1):
-            if text[-size:] in self._prefixes:
-                safe_end -= size
-                break
-        self._pending = text[safe_end:]
-        return text[:safe_end]
-
-    def finish(self) -> str:
-        tail, self._pending = self._pending, ""
-        return tail
-
-    def discard(self) -> None:
-        self._pending = ""
 
 
 def is_secret_field(name: Any) -> bool:
@@ -299,35 +219,6 @@ def redact_sensitive_value(value: Any, *, _parent_field: str | None = None) -> A
     if value is None or isinstance(value, (int, float, bool)):
         return value
     return redact_text(str(value))
-
-
-class StreamingSecretRedactor:
-    """每条答案流独享未决尾部，避免逐事件脱敏后仍能拼出完整凭据。"""
-
-    def __init__(self) -> None:
-        self._stages = (_LiteralRedactor(_configured_secret_variants()), _AssignmentRedactor(), _CredentialTokenRedactor())
-
-    def feed(self, delta: str) -> str:
-        # 已确定的文本单向通过各层，未决词采用列表追加；不会随 SSE 分片重复扫描或复制增长中的长词。
-        for stage in self._stages:
-            delta = stage.feed(delta)
-        return delta
-
-    def finish(self) -> str:
-        """仅在正常结束时发送已脱敏的尾部，保证普通答案不会丢字。"""
-        output: list[str] = []
-        for index, stage in enumerate(self._stages):
-            tail = stage.finish()
-            # 上游普通尾部仍必须经过下游凭据识别，不能在正常结束时旁路脱敏。
-            for remaining in self._stages[index + 1:]:
-                tail = remaining.feed(tail)
-            output.append(tail)
-        return "".join(output)
-
-    def discard(self) -> None:
-        """异常或断开连接时放弃未决片段，清理阶段不得重新向客户端发送原文。"""
-        for stage in self._stages:
-            stage.discard()
 
 
 class _RedactedLogRecord(logging.LogRecord):

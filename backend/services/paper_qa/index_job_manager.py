@@ -152,17 +152,6 @@ class IndexJobManager:
         self._execute_claimed_job(job)
         return True
 
-    def run_job(self, job_id: str, arxiv_id: str = "", loading_method: str = "") -> None:
-        """兼容管理脚本的定向执行入口；仍必须先通过数据库 lease 领取。"""
-        del arxiv_id, loading_method
-        job = self.paper_qa_index_store.claim_next_paper_index_job(
-            worker_id=self.worker_id,
-            lease_seconds=self.lease_seconds,
-            job_id=job_id,
-        )
-        if job:
-            self._execute_claimed_job(job)
-
     def _execute_claimed_job(self, job: Mapping[str, Any]) -> None:
         """执行已经领取的 attempt，并把 builder 输出先验证再写成 job 成功。"""
         job_id = str(job.get("job_id") or "")

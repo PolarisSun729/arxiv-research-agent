@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Union
+from typing import Any, Dict, Mapping, Optional, Union
 
 _BACKEND_DIR = str(Path(__file__).resolve().parents[3])
 if _BACKEND_DIR not in sys.path:

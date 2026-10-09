@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any, Dict, List, Mapping, Optional
 
 
@@ -45,43 +44,6 @@ def _extract_error_message(result: Mapping[str, Any]) -> Optional[str]:
     if message and detail:
         return f"{message}: {detail}"
     return message or None
-
-
-def _extract_exception_detail(exc: Exception) -> str:
-    """从异常对象中提取更稳定的 detail 文本，兼容 HTTPException 等结构。
-
-    这个函数优先读取结构化 detail，再回退到异常字符串本身，
-    目的是尽量保留真实错误上下文，同时避免把异常对象原样泄漏成难读内容。
-    """
-    detail = getattr(exc, "detail", None)
-    if isinstance(detail, dict):
-        message = str(detail.get("message") or detail.get("detail") or detail.get("error") or "").strip()
-        if message:
-            return message
-        return json.dumps(detail, ensure_ascii=False)
-    if detail is not None:
-        text = str(detail).strip()
-        if text:
-            return text
-    text = str(exc).strip()
-    return text or exc.__class__.__name__
-
-
-def _extract_exception_stage(exc: Exception, default_stage: str) -> str:
-    """尽量从异常对象中恢复失败阶段名；恢复不到时返回默认阶段。
-
-    有些服务层异常会显式带上 stage / failed_stage 字段，
-    这里把它们恢复出来，便于工作流节点判断失败发生在哪一段执行路径。
-    """
-    stage = str(getattr(exc, "error_stage", "") or getattr(exc, "failed_stage", "") or "").strip()
-    if stage:
-        return stage
-    detail = getattr(exc, "detail", None)
-    if isinstance(detail, dict):
-        stage = str(detail.get("stage") or detail.get("failed_stage") or "").strip()
-        if stage:
-            return stage
-    return default_stage
 
 
 def _to_plain_dict(value: Any) -> Dict[str, Any]:

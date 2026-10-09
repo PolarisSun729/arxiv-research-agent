@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from services.retrieval.retrieval_index import RETRIEVAL_INDEX_WEIGHTS
 
