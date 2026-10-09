@@ -4,8 +4,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from langgraph.types import interrupt
 from services.storage.sqlite.stores import ApprovalGrantStore
@@ -16,7 +15,6 @@ from .execution.bindings import (
     can_reuse_side_effect_output,
     evaluate_condition,
     existing_step_output,
-    step_output,
 )
 from .execution.tool_execution import ToolExecutionService
 from .execution.state_projector import RuntimeStateProjector
@@ -33,15 +31,13 @@ from .schemas import (
     AgentTurnResult,
     ExecutablePlan,
     ExecutionTrace,
-    Goal,
     ObservationResult,
     PlanRuntime,
     PlanStep,
     StepExecutionResult,
-    StepCondition,
 )
 from .state import AgentState
-from .tool_adapters.models import ToolError, ToolExecutionResult
+from .tool_adapters.models import ToolExecutionResult
 from .tool_result_projector import project_tool_result
 from .tool_registry import PLANNER_TOOL_REGISTRY, ToolRegistry
 
@@ -51,11 +47,8 @@ invoke_backend_tool = agent_tool_registry.invoke_backend_tool
 
 from .execution.traces import (
     _build_execution_path_summary,
-    _build_existing_index_skip_output,
-    _build_paper_qa_quality_trace,
     _compact_step_output_for_trace,
     _compact_tool_execution_for_trace,
-    _extract_arxiv_id_from_paper_payload,
     _json_safe,
     _is_paper_target_resolution_step,
     _log_plan_done,
@@ -64,7 +57,6 @@ from .execution.traces import (
     _record_step_output,
     _safe_compact,
     _should_preserve_non_success_observation_output,
-    _state_run_id,
     _tool_error_to_text,
     _utcnow,
 )

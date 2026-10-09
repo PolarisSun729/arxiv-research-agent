@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
 
 try:  # pragma: no cover - import path differs between backend cwd and package import
     from dependencies import get_recommendation_service
@@ -33,7 +33,6 @@ from ..utils.state_utils import (
     _compact_paper_summaries,
     _compact_search_spec,
     _compact_tool_args,
-    _get_execution_plan_step,
     _update_execution_plan_step,
 )
 from ..utils.text_utils import _contains_chinese, _normalize_text

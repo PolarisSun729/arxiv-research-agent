@@ -14,8 +14,8 @@ import sqlite3
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
 

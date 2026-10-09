@@ -12,10 +12,10 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ..schemas import ArxivSearchSpec, get_default_agent_arxiv_categories
-from .text_utils import CHINESE_NUMBER_MAP, _matches_any, _normalize_optional_str, _normalize_text, _parse_small_chinese_number
+from .text_utils import _normalize_optional_str, _normalize_text, _parse_small_chinese_number
 from ..intent_definitions import PARSE_SUPPORTED_INTENTS
 
 # intent 名单不再本地维护：单一事实来源在 ..intent_definitions。

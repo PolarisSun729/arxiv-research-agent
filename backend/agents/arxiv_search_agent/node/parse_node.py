@@ -15,15 +15,13 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from pydantic import ValidationError
 from utils.logging_utils import info_event
 
 from .intent_support import (
     HARD_RULE_PATTERNS,
-    LLM_CONFIDENCE_THRESHOLD,
-    SEARCH_TRIGGER_PATTERNS,
     SUPPORTED_INTENTS,
     _build_intent_guidance,
     _build_llm_prompt_with_profile,

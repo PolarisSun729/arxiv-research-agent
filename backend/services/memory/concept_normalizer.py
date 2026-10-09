@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from collections import Counter
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 

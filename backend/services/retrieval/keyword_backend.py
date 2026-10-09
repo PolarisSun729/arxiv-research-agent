@@ -9,7 +9,7 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +243,6 @@ class InternalBM25Backend(KeywordBackend):
     ) -> KeywordBackendResult:
         """Use existing internal BM25 implementation from route_retriever."""
         # Import locally to avoid circular dependency
-        from services.retrieval.route_retriever import RouteRetriever
 
         # This is the existing keyword_retrieve logic extracted
         payload = self._internal_keyword_retrieve(
@@ -267,7 +266,6 @@ class InternalBM25Backend(KeywordBackend):
         retrieval_index: Any,
     ) -> Dict[str, Any]:
         """Internal BM25 retrieval logic (extracted from RouteRetriever.keyword_retrieve)."""
-        from services.retrieval.retrieval_index import KEYWORD_FIELD_WEIGHTS
         from services.retrieval.route_retriever import RouteRetriever
 
         if not retrieval_index.documents:

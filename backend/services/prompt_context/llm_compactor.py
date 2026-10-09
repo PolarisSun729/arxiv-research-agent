@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 from services.prompt_context.blocks import PromptBlock
 from services.prompt_context.token_counter import TokenCounter

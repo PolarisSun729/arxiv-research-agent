@@ -8,9 +8,7 @@ from datetime import datetime
 from typing import List, Dict, Optional, Iterator, Any, Tuple
 import logging
 from services.llm.call_metrics import record_llm_call, record_llm_usage
-from pathlib import Path
 from openai import OpenAI
-import requests
 from services.intent.intent_service import EXPERIMENT_INTENTS, MAIN_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
 from services.paper_qa.answer_language import CHINESE_FINAL_ANSWER_INSTRUCTION
 from utils.config import GENERATION_CONFIG

@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable
 
 from utils.config import CORE_CONFIG, get_recommendation_clustering_runtime_config
 

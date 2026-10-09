@@ -5,7 +5,6 @@ import json
 import re
 from typing import List, Dict, Any, Optional
 import logging
-from pathlib import Path
 from pymilvus import (
     DataType,
     MilvusClient,
