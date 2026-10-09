@@ -180,7 +180,6 @@ class LoadingService:
             # 加载后的文档是后端流水线产物，路径固定在 backend 下，避免根目录启动时写错位置。
             loaded_docs_dir = resolve_backend_artifact_path(
                 "01-loaded-docs",
-                option_name="LOADED_DOCS_DIR",
             )
             os.makedirs(loaded_docs_dir, exist_ok=True)
             filepath = loaded_docs_dir / f"{doc_name}.json"

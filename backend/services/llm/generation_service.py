@@ -80,7 +80,6 @@ class GenerationService:
         # 生成结果是后端运行产物；路径固定到 backend 下，避免工作目录不同导致写入根目录。
         self.generation_results_dir = resolve_backend_artifact_path(
             "05-generation-results",
-            option_name="GENERATION_RESULTS_DIR",
         )
         os.makedirs(self.generation_results_dir, exist_ok=True)
 

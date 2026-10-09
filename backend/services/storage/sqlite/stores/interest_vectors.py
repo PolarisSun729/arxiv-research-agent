@@ -8,28 +8,6 @@ from services.storage.sqlite.shared import DEFAULT_USER_ID, logger
 class InterestVectorStore(BaseSqliteStore):
     """维护用户兴趣向量存取；推荐算法仍在上层服务中，避免存储层承担排序职责。"""
 
-    def _ensure_user_interest_vector_columns(self, conn):
-        # 旧库可能缺少聚类和负反馈字段；启动时补列，保证推荐画像读写兼容历史 SQLite 文件。
-        required_columns = {
-            "cluster_count": "INTEGER DEFAULT 0",
-            "profile_mode": "TEXT DEFAULT 'mean'",
-            "interest_clusters": "TEXT",
-            "weak_interest_pool": "TEXT",
-            "disliked_vector_data": "TEXT",
-            "disliked_paper_examples": "TEXT",
-            "negative_feedback_stats": "TEXT",
-            "negative_feedback_profile": "TEXT",
-        }
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(user_interest_vectors)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
-        for column_name, column_definition in required_columns.items():
-            if column_name not in existing_columns:
-                cursor.execute(
-                    f"ALTER TABLE user_interest_vectors ADD COLUMN {column_name} {column_definition}"
-                )
-        conn.commit()
-
     def save_user_interest_vector(
         self,
         user_id: str,

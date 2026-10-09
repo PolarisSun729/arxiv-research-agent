@@ -790,28 +790,6 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIn("manual_topic_removed", event_types)
         self.assertIn("manual_style_updated", event_types)
 
-    def test_legacy_dirty_topics_do_not_migrate_into_new_profile_layers(self) -> None:
-        with self.storage.connection_provider.connect() as conn:
-            self.storage.research_profiles._upsert_legacy_research_profile_cache(
-                conn,
-                "legacy-user",
-                {
-                    "positive_topics": ["cs.CL", "A Complete Paper Title That Should Be Removed", "manual retrieval topic"],
-                    "negative_topics": ["https://arxiv.org/abs/2401.00001", "diffusion models"],
-                    "preferred_categories": ["cs.AI"],
-                    "representative_papers": ["A Complete Paper Title That Should Be Removed"],
-                },
-            )
-            conn.commit()
-            self.storage.research_profiles._migrate_legacy_research_profiles(conn)
-
-        layers = self.storage.research_profiles.get_user_profile_layers("legacy-user")
-
-        self.assertEqual(layers["manual_profile"]["positive_topics"], ["manual retrieval topic"])
-        self.assertEqual(layers["manual_profile"]["negative_topics"], ["diffusion models"])
-        self.assertEqual(layers["manual_profile"]["preferred_categories"], ["cs.AI"])
-        self.assertEqual(layers["manual_profile"]["representative_papers"], [])
-
     def test_llm_evidence_card_drives_profile_topics_and_reuses_cache(self) -> None:
         fake_llm = FakeEvidenceGenerationService(
             """

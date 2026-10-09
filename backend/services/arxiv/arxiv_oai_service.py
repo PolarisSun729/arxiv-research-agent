@@ -181,7 +181,6 @@ class ArxivOaiDatabaseService:
         self.db_path = resolve_storage_path(
             configured_path,
             default_path=BACKEND_DATA_ROOT / "arxiv_oai.db",
-            option_name="db_path" if db_path else "OAI_SQLITE_DATABASE_PATH",
         )
         self.check_same_thread = (
             OAI_SQLITE_CONFIG["check_same_thread"] if check_same_thread is None else bool(check_same_thread)

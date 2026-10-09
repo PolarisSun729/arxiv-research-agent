@@ -156,7 +156,6 @@ SQLITE_CONFIG: Dict[str, Any] = {
     "database_path": resolve_storage_path(
         _env_str("SQLITE_DATABASE_PATH"),
         default_path=BACKEND_DATA_ROOT / "recommendation.db",
-        option_name="SQLITE_DATABASE_PATH",
     ),
     "check_same_thread": _env_bool("SQLITE_CHECK_SAME_THREAD", False),
 }
@@ -183,7 +182,6 @@ PAPER_QA_BUILD_CACHE_CONFIG: Dict[str, Any] = {
     "root_dir": resolve_storage_path(
         _env_str("PAPER_QA_BUILD_CACHE_DIR"),
         default_path=BACKEND_DATA_ROOT,
-        option_name="PAPER_QA_BUILD_CACHE_DIR",
     ),
     "llm_cache_name": _env_str("PAPER_QA_LLM_CACHE_NAME", "paper_qa_llm_cache"),
     "embedding_cache_name": _env_str("PAPER_QA_EMBEDDING_CACHE_NAME", "paper_qa_embedding_cache"),
@@ -251,7 +249,6 @@ OAI_SQLITE_CONFIG: Dict[str, Any] = {
     "database_path": resolve_storage_path(
         _env_str("OAI_SQLITE_DATABASE_PATH"),
         default_path=BACKEND_DATA_ROOT / "arxiv_oai.db",
-        option_name="OAI_SQLITE_DATABASE_PATH",
     ),
     "check_same_thread": _env_bool("OAI_SQLITE_CHECK_SAME_THREAD", False),
 }

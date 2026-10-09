@@ -43,42 +43,6 @@ PROFILE_EVENT_ACTION_ALIASES = {
 class ProfileEventStore(BaseSqliteStore):
     """维护画像事件流和用户信号水位；具体业务动作仍由调用方决定是否写事件。"""
 
-    def _ensure_user_profile_event_columns(self, conn):
-        # 画像事件表从辅助审计升级为主证据流；旧库启动时补齐新列，避免手工迁移数据库。
-        required_columns = {
-            "event_type": "TEXT",
-            "action_strength": "REAL DEFAULT 0",
-            "source": "TEXT",
-            "note_id": "TEXT",
-            "session_id": "TEXT",
-            "metadata_json": "TEXT",
-            "include_in_profile": "INTEGER DEFAULT 1",
-            "consumed_by_job_id": "TEXT",
-            "consumed_at": "TIMESTAMP",
-            "dedupe_key": "TEXT",
-            "profile_dirty": "INTEGER DEFAULT 1",
-        }
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(user_profile_events)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
-        for column_name, column_definition in required_columns.items():
-            if column_name not in existing_columns:
-                cursor.execute(
-                    f"ALTER TABLE user_profile_events ADD COLUMN {column_name} {column_definition}"
-                )
-        cursor.execute(
-            '''
-            UPDATE user_profile_events
-            SET event_type = COALESCE(event_type, action_type),
-                source = COALESCE(source, source_type),
-                metadata_json = COALESCE(metadata_json, payload_json),
-                include_in_profile = COALESCE(include_in_profile, 1),
-                profile_dirty = COALESCE(profile_dirty, 1)
-            WHERE event_type IS NULL OR source IS NULL OR metadata_json IS NULL
-            '''
-        )
-        conn.commit()
-
     def _record_preference_profile_event(self, conn, user_id: str, arxiv_id: str, event_type: str) -> None:
         """强偏好不再写入 paper-action 表；画像只通过独立事件流消费这类显式信号。"""
         self.record_user_profile_event(
@@ -392,8 +356,6 @@ class ProfileEventStore(BaseSqliteStore):
                         UNION ALL
                         SELECT updated_at AS latest_at FROM user_paper_actions WHERE user_id = ?
                         UNION ALL
-                        SELECT updated_at AS latest_at FROM user_research_profiles WHERE user_id = ?
-                        UNION ALL
                         SELECT updated_at AS latest_at FROM user_manual_profiles WHERE user_id = ?
                         UNION ALL
                         SELECT updated_at AS latest_at FROM user_generated_profiles WHERE user_id = ?
@@ -403,7 +365,7 @@ class ProfileEventStore(BaseSqliteStore):
                         SELECT created_at AS latest_at FROM user_profile_events WHERE user_id = ?
                     )
                     ''',
-                    (user_id, user_id, user_id, user_id, user_id, user_id, user_id, user_id),
+                    (user_id, user_id, user_id, user_id, user_id, user_id, user_id),
                 )
                 row = cursor.fetchone()
                 return row[0] if row and row[0] else None

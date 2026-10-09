@@ -108,7 +108,6 @@ class ArxivSearchService:
         # arXiv 下载产物属于后端运行资产，不能因启动目录不同散落到仓库根目录。
         self.papers_dir = resolve_backend_artifact_path(
             "06-daily-arxiv-paper",
-            option_name="ARXIV_PAPERS_DIR",
         )
         os.makedirs(self.papers_dir, exist_ok=True)
         

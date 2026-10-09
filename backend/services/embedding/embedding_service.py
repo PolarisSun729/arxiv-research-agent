@@ -1053,7 +1053,6 @@ class EmbeddingService:
         # embedding 文件同时服务入库和调试复查，必须固定到 backend 产物目录。
         embedded_docs_dir = resolve_backend_artifact_path(
             "02-embedded-docs",
-            option_name="EMBEDDED_DOCS_DIR",
         )
         os.makedirs(embedded_docs_dir, exist_ok=True)
 

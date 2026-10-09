@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from utils.storage_paths import BACKEND_DATA_ROOT, LEGACY_DATABASE_ROOT, StoragePathConfigurationError
+from utils.storage_paths import BACKEND_DATA_ROOT
 
 
 def _load_config_module(module_name: str, env: dict[str, str] | None = None):
@@ -84,19 +84,6 @@ class ConfigRuntimeUnitTests(unittest.TestCase):
             module.PAPER_QA_BUILD_CACHE_CONFIG["root_dir"],
             str((BACKEND_DATA_ROOT.parent / "custom-cache").resolve()),
         )
-
-    def test_root_legacy_database_override_is_rejected(self) -> None:
-        overrides = {
-            "SQLITE_DATABASE_PATH": LEGACY_DATABASE_ROOT / "recommendation.db",
-            "OAI_SQLITE_DATABASE_PATH": LEGACY_DATABASE_ROOT / "arxiv_oai.db",
-            "PAPER_QA_BUILD_CACHE_DIR": LEGACY_DATABASE_ROOT,
-        }
-        for option_name, legacy_path in overrides.items():
-            with self.subTest(option_name=option_name), self.assertRaises(StoragePathConfigurationError):
-                _load_config_module(
-                    f"tests.unit._config_legacy_storage_path_{option_name.lower()}",
-                    {option_name: str(legacy_path)},
-                )
 
     def test_generation_provider_keys_do_not_reuse_aliyun_credentials(self) -> None:
         module = _load_config_module(

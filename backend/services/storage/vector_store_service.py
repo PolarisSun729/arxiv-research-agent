@@ -90,7 +90,6 @@ class VectorStoreService:
         # 向量库本地产物归属后端目录，避免从仓库根目录启动时重新生成根目录资产。
         self.vector_store_dir = resolve_backend_artifact_path(
             "03-vector-store",
-            option_name="VECTOR_STORE_DIR",
         )
         os.makedirs(self.vector_store_dir, exist_ok=True)
 

@@ -43,9 +43,6 @@ class StorageContainer:
             self.profile_events,
             self.profile_build_jobs,
         )
-        if initialize_schema:
-            # legacy profile 数据迁移依赖画像 store 的标准化逻辑，schema 就绪后显式执行。
-            self.research_profiles.migrate_legacy_profiles()
         self.paper_catalog = PaperCatalogStore(self.connection_provider)
         self.user_preferences = UserPreferenceStore(
             self.connection_provider,

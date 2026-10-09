@@ -56,7 +56,6 @@ class StorageContainerSqliteTests(unittest.TestCase):
         self.assertIn("paper_chat_sessions", table_names)
         self.assertIn("paper_chat_messages", table_names)
         self.assertIn("paper_notes", table_names)
-        self.assertIn("user_research_profiles", table_names)
         self.assertIn("user_profile_events", table_names)
         self.assertIn("paper_profile_evidence", table_names)
         self.assertIn("user_manual_profiles", table_names)

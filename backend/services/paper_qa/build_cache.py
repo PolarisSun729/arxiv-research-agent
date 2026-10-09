@@ -30,7 +30,6 @@ class PaperQABuildCache:
             resolve_storage_path(
                 self.config.get("root_dir"),
                 default_path=BACKEND_DATA_ROOT,
-                option_name="PAPER_QA_BUILD_CACHE_DIR",
             )
         )
         self.llm_cache_name = str(self.config.get("llm_cache_name") or "paper_qa_llm_cache")
