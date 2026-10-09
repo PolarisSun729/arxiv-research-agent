@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import PaperCard from '@/components/PaperCard.vue'
 import type { Paper } from '@/types/paper'

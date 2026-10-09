@@ -21,7 +21,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-BACKEND_DIR = Path(__file__).resolve().parents[1]
+BACKEND_DIR = Path(__file__).resolve().parents[1] / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 

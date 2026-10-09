@@ -1,7 +1,7 @@
 """冒烟验证研究引擎流式事件路径。
 
 不走完整 PaperQAService → qa_router → SSE，只测 PaperEvidenceResearchService.research_stream()
-能产出预期的渐进事件和最终结果，验证 Phase 3 修改的正确性。
+能产出预期的渐进事件，并以经过校验的答案正常结束。
 """
 
 from __future__ import annotations
@@ -92,7 +92,7 @@ class NoopClaimVerifier:
         }
 
 
-def smoke_test_research_stream() -> None:
+def test_research_stream_yields_progress_events_and_verified_result() -> None:
     service = PaperEvidenceResearchService(
         question_analyzer=StaticQuestionAnalyzer(),
         decision_policy=ScriptedPolicy(
@@ -139,10 +139,8 @@ def smoke_test_research_stream() -> None:
         while True:
             event = next(gen)
             events.append(event)
-            print(f"[Event] {event['event']}")
     except StopIteration as stop:
         result = stop.value
-        print(f"[Result] outcome={result.outcome}, citations={len(result.citations)}")
 
     expected_events = {"research_started", "retrieval_completed", "draft_created", "claim_verification_completed", "research_completed"}
     observed_events = {event["event"] for event in events}
@@ -153,8 +151,4 @@ def smoke_test_research_stream() -> None:
     assert result.outcome == "completed"
     assert result.answer == "The method has three stages [source:chunk-1]."
     assert [citation.source_id for citation in result.citations] == ["chunk-1"]
-    print(f"[PASS] Smoke test passed: research_stream() yields events and returns result (outcome={result.outcome})")
 
-
-if __name__ == "__main__":
-    smoke_test_research_stream()

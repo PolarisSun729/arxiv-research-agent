@@ -145,7 +145,6 @@ This includes unit, api, integration, helper/infrastructure, and golden smoke te
 
 ```powershell
 python -m pytest tests/unit/services/evaluation tests/unit/services/paper_evidence_research tests/integration/test_research_qa_contract.py tests/unit/services/test_llm_call_metrics.py
-python smoke_test_research_stream.py
 python -m services.evaluation.golden_runner --cases tests/golden/data/smoke_golden_set.jsonl --validate-only --allow-unlabeled
 ```
 

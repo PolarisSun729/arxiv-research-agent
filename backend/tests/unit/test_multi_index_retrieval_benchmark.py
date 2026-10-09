@@ -1,11 +1,29 @@
 from __future__ import annotations
 
-from tools.multi_index_retrieval_benchmark import (
-    SCENARIOS,
-    evaluate_case,
-    load_cases,
-    run_scenario,
-)
+import importlib.util
+import sys
+from pathlib import Path
+
+
+BENCHMARK_PATH = Path(__file__).resolve().parents[3] / "scripts" / "multi_index_retrieval_benchmark.py"
+BENCHMARK_MODULE_NAME = "tests.unit._multi_index_retrieval_benchmark"
+
+
+def _load_benchmark_module():
+    # benchmark 是 scripts/ 下的独立 CLI，不属于任何包，按文件路径加载。
+    spec = importlib.util.spec_from_file_location(BENCHMARK_MODULE_NAME, BENCHMARK_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    sys.modules[BENCHMARK_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_benchmark = _load_benchmark_module()
+SCENARIOS = _benchmark.SCENARIOS
+evaluate_case = _benchmark.evaluate_case
+load_cases = _benchmark.load_cases
+run_scenario = _benchmark.run_scenario
 
 
 def test_evaluate_case_reports_recall_and_mrr() -> None:

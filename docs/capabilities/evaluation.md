@@ -99,7 +99,6 @@ print(json.dumps(scored, ensure_ascii=False, indent=2))
 
 ```powershell
 python -m pytest tests/unit/services/evaluation tests/unit/services/paper_evidence_research tests/integration/test_research_qa_contract.py tests/unit/services/test_llm_call_metrics.py
-python smoke_test_research_stream.py
 ```
 
 这些测试使用真实请求/结果模型、研究图、临时会话存储与受控外部 I/O，验证同步、SSE、记录重评分、引用支持、故障分母和成本统计，不生成真实 golden 基线。完整测试入口见 [测试指南](../operations/testing.md)。

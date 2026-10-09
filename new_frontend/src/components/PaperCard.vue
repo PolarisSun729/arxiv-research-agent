@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { ref, watch, computed } from 'vue'
 import type { Paper, RecommendedPaper } from '@/types/paper'
 import SimilarityTag from './SimilarityTag.vue'

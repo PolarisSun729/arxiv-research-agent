@@ -1,4 +1,4 @@
-﻿import gc
+import gc
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock

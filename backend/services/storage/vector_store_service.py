@@ -1,4 +1,4 @@
-﻿import os
+import os
 import ast
 from datetime import datetime
 import json
