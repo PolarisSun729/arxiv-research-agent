@@ -9,9 +9,9 @@ An engineering-oriented research agent for academic paper discovery, evidence-gr
 
 > 本仓库是 Zhiyuan Sun 的公开作品展示项目，重点展示 Agent Runtime、RAG 链路和大模型应用工程能力。项目已建立工程回归测试与 CI，但尚未发布系统性的 Agent/RAG 效果评测结果。
 
-默认使用 JWT 账号登录，已实现角色权限、用户日配额、会话撤销、用户审计，以及本人会话、笔记、偏好和画像的访问隔离；论文与索引仍共享。启动前需配置独立签名密钥并创建初始管理员，公网继续使用 HTTPS、实际前端 Origin 和持久化 Redis。完整步骤与边界见 [第三阶段安全部署说明](docs/SECURITY_STAGE3_PLAN.md)。签名密钥不发给浏览器，也不能写入任何 `VITE_` 变量；仅显式 `AUTH_MODE=api_key` 时保留前两阶段的受信任团队兼容模式。
+默认使用 JWT 账号登录，已实现角色权限、用户日配额、会话撤销、用户审计，以及本人会话、笔记、偏好和画像的访问隔离；论文与索引仍共享。启动前需配置独立签名密钥并创建初始管理员，公网继续使用 HTTPS、实际前端 Origin 和持久化 Redis。完整步骤与边界见 [安全与访问控制](docs/operations/security.md)。签名密钥不发给浏览器，也不能写入任何 `VITE_` 变量；仅显式 `AUTH_MODE=api_key` 时启用受信任团队的共享密钥兼容模式。
 
-新环境使用 [安全初始化脚本](scripts/init_security.py) 生成独立凭据：`--profile development` 写开发 `.env`，`--profile production` 写 `.env.production`。生产模板采用 `arxiv.001769.xyz`，域名解析、HTTPS 证书和存储启动步骤见 [部署指南](docs/DEPLOYMENT.md)。已有配置不会被覆盖。
+新环境使用 [安全初始化脚本](scripts/init_security.py) 生成独立凭据：`--profile development` 写开发 `.env`，`--profile production` 写 `.env.production`。生产模板采用 `arxiv.001769.xyz`，域名解析、HTTPS 证书和存储启动步骤见 [CI/CD 部署手册](docs/operations/cicd-deployment.md)。已有配置不会被覆盖。
 
 Debian 12 全新服务器的安装、发布目录、GitHub Secrets 和回退步骤见 [CI/CD 部署手册](docs/operations/cicd-deployment.md)。main 推送的自动部署默认关闭；启用前须完成服务器初始化与 Actions 验收。
 
@@ -153,7 +153,7 @@ Replanner 只负责串联失败分类、候选生成、动作选择、安全检�
 | 论文问答 | [paper_qa_service.py](backend/services/paper_qa/paper_qa_service.py)、[evidence_verifier.py](backend/services/paper_qa/evidence_verifier.py) |
 | 混合检索 | [retrieval_pipeline.py](backend/services/retrieval/retrieval_pipeline.py)、[result_fusion_service.py](backend/services/retrieval/result_fusion_service.py)、[rerank_service.py](backend/services/retrieval/rerank_service.py) |
 | 研究记忆 | [memory_service.py](backend/services/memory/memory_service.py)、[profile_aggregator.py](backend/services/memory/profile_aggregator.py)、[profile_reviewer.py](backend/services/memory/profile_reviewer.py) |
-| 配置入口 | [config.py](backend/utils/config.py)、[config.example.py](backend/utils/config.example.py) |
+| 配置入口 | [config.py](backend/utils/config.py)、[.env.example](.env.example) |
 | 统一质量门 | [check_quality.py](scripts/check_quality.py)、[doctor.py](scripts/doctor.py) |
 
 ---
@@ -240,7 +240,7 @@ cd arxiv-research-agent
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
 
 cd new_frontend
 npm ci
@@ -275,6 +275,13 @@ python scripts/init_security.py --profile development
 ~~~
 
 在生成的 `.env` 中填写 `ALIYUN_API_KEY`，按需调整 `MILVUS_URI` 和 `ARXIV_PROXY_URL`。已有 `.env` 或签名文件会保留；不要重新生成签名，也不要同时填写 `JWT_SECRET_KEY` 和 `JWT_SECRET_FILE`。配置由后端读取，任何真实凭据都不能提交到 Git 或写入前端。OpenAI、DeepSeek 等其他服务必须使用各自的 API Key。
+
+Windows 本地开发使用 [docker-compose.yml](docker-compose.yml) 启动 Milvus Standalone，MinIO 与 Milvus 从同一 `.env` 读取凭据。校验时只用 `--quiet`，完整的 `docker compose config` 会展开真实密码：
+
+~~~powershell
+docker compose --env-file .env config --quiet
+docker compose --env-file .env up -d
+~~~
 
 首次运行先在仓库根目录创建管理员，密码通过隐藏输入读取。使用 `.env` 时可添加 `--env-file .env`；认证数据库配置必须与后端一致。
 
