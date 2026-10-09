@@ -124,7 +124,7 @@ def test_agent_respects_bounded_research_terminal_outcome(outcome, status, decis
 async def _consume_sse(service):
     from routers.qa_router import QaRequest, qa_paper_stream
 
-    response = await qa_paper_stream("2310.11511", QaRequest(**_payload()), paper_qa_service=service, generation_service=object())
+    response = await qa_paper_stream("2310.11511", QaRequest(**_payload()), paper_qa_service=service)
     chunks = [chunk async for chunk in response.body_iterator]
     events = []
     for chunk in chunks:

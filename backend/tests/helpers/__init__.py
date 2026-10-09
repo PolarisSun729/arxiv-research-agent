@@ -3,7 +3,6 @@
 from .fake_arxiv_service import FakeArxivService
 from .fake_embedding_service import FakeEmbeddingService, FakeEmbeddingConfig
 from .fake_generation_service import FakeGenerationService
-from .fake_paper_qa_service import FakePaperQAService
 from .fake_vector_store_service import FakeVectorStoreService
 from .retrieval import (
     ControlledFakeEmbeddingService,
@@ -20,7 +19,6 @@ __all__ = [
     "FakeEmbeddingConfig",
     "FakeEmbeddingService",
     "FakeGenerationService",
-    "FakePaperQAService",
     "FakeVectorStoreService",
     "ControlledFakeEmbeddingService",
     "ControlledFakeVectorStoreService",

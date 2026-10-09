@@ -268,7 +268,6 @@ def _mark_error_stage(stages: Dict[str, Dict[str, Any]], error_stage: str, error
     stage_name = {
         "enhanced_retrieve": "vector",
         "vector_store": "vector",
-        "build_qa_context": "vector",
         "paper_qa_final_answer": "generation",
         "qa_stream": "generation",
     }.get(normalized, normalized)

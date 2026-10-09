@@ -10,7 +10,6 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
-from urllib.parse import quote
 
 import pytest
 from fastapi import Depends, HTTPException
@@ -20,7 +19,7 @@ from pydantic import BaseModel
 from auth.api_key_middleware import ApiKeySettings, get_allowed_origins, get_valid_api_keys
 from core.errors import AppError, ErrorCode, sanitize_detail
 from utils import logging_utils
-from utils.secret_redaction import StreamingSecretRedactor, install_log_redaction, redact_sensitive_value, redact_text
+from utils.secret_redaction import install_log_redaction, redact_sensitive_value, redact_text
 
 
 TEST_KEY = "stage1-test-" + "a" * 40
@@ -269,65 +268,25 @@ def test_bm25_matched_words_survive_response_and_trace_redaction(tmp_path, monke
 
 
 @pytest.mark.parametrize("text", [
-    "Normal words and 中文回答。",
-    "Provider: sk-unconfigured-provider-value; finished.",
-    "Bearer unknown.header/payload+signature==; finished.",
-    "Authorization: Bearer unknown.header.signature; finished.",
-    "MY_API_KEY = \"unknown credential with spaces\"; finished.",
-    "{'refresh_token': 'unknown token value'}; finished.",
-    "password=unknown-value&next=public",
-])
-def test_streaming_redaction_covers_unknown_credential_syntax_at_every_boundary(text):
-    # 穷举二分边界并测试逐字符分片，验证凭据语法与值分开到达时仍与整段脱敏一致。
-    chunkings = [[text[:index], text[index:]] for index in range(1, len(text))]
-    chunkings.append(list(text))
-    for chunks in chunkings:
-        redactor = StreamingSecretRedactor()
-        actual = "".join(redactor.feed(chunk) for chunk in chunks) + redactor.finish()
-        assert actual == redact_text(text)
-
-
-def test_streaming_redaction_handles_encoded_keys_and_preserves_live_text(monkeypatch):
-    secret = "provider+/=" + "z" * 32
-    monkeypatch.setenv("ALIYUN_API_KEY", secret)
-    redactor = StreamingSecretRedactor()
-    assert redactor.feed("这段普通回答应立即显示。") == "这段普通回答应立即显示。"
-    encoded = quote(secret, safe="")
-    actual = "".join(redactor.feed(char) for char in encoded) + redactor.finish()
-    assert actual == "***REDACTED***"
-
-
-@pytest.mark.parametrize("text", [
     r'password="unknown \"quoted\" credential"; done',
     r"password='unknown \'quoted\' credential'; done",
 ])
 def test_quoted_credentials_remain_hidden_when_the_value_contains_escaped_quotes(text):
     expected = "password=***REDACTED***; done"
     assert redact_text(text) == expected
-    # 转义符和引号可能处在相邻 SSE 事件中，不能把后半段凭据当作普通答案提前发送。
-    redactor = StreamingSecretRedactor()
-    assert "".join(redactor.feed(char) for char in text) + redactor.finish() == expected
 
 
-@pytest.mark.parametrize("case", ["plain", "repeated_field", "jwt_prefixes", "stream", "stream_quoted", "stream_spaces"])
+@pytest.mark.parametrize("case", ["plain", "repeated_field", "jwt_prefixes"])
 def test_redaction_long_input_has_bounded_processing_cost(case):
     # 在子进程中重放攻击形状；即使重新引入灾难性回溯，也只失败当前用例而不挂住整套回归。
     probe = """
 import sys
 sys.path.insert(0, 'backend')
-from utils.secret_redaction import StreamingSecretRedactor, redact_text
+from utils.secret_redaction import redact_text
 case = sys.argv[1]
-text = {'repeated_field': 'password' * 8192, 'jwt_prefixes': 'eyJa-' * 13107,
-        'stream_quoted': 'password="' + ('quoted value ' * 5462) + '"; done',
-        'stream_spaces': 'password' + (' ' * 65536) + '=hidden-value; done'}.get(case, 'a' * 65536)
-if case.startswith('stream'):
-    redactor = StreamingSecretRedactor()
-    result = ''.join(redactor.feed(text[pos:pos + 64]) for pos in range(0, len(text), 64)) + redactor.finish()
-else:
-    result = redact_text(text)
-assert result == redact_text(text)
-if case not in {'stream_quoted', 'stream_spaces'}:
-    assert result == text
+text = {'repeated_field': 'password' * 8192, 'jwt_prefixes': 'eyJa-' * 13107}.get(case, 'a' * 65536)
+result = redact_text(text)
+assert result == text
 assert 'hidden-value' not in redact_text(text + '_api_key=hidden-value; done')
 """
     try:
@@ -336,7 +295,7 @@ assert 'hidden-value' not in redact_text(text + '_api_key=hidden-value; done')
             cwd=Path(__file__).resolve().parents[3], capture_output=True, text=True, timeout=8,
         )
     except subprocess.TimeoutExpired:
-        pytest.fail(f"{case}: 64 KiB 文本脱敏超过 8 秒，疑似回溯或重复扫描未决分片。")
+        pytest.fail(f"{case}: 64 KiB 文本脱敏超过 8 秒，疑似正则回溯。")
     assert result.returncode == 0, result.stderr
 
 

@@ -5,7 +5,7 @@ import base64
 import mimetypes
 import io
 from datetime import datetime
-from typing import List, Dict, Optional, Iterator, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple
 import logging
 from services.llm.call_metrics import record_llm_call, record_llm_usage
 from openai import OpenAI
@@ -1156,80 +1156,6 @@ class GenerationService:
         item_debug["sent"] = False
         item_debug["skip_reason"] = reason
         item_debug["fallback_to_asset_summary"] = True
-
-    def stream_qwen_responses(
-        self,
-        query: str,
-        context: str,
-        api_key: Optional[str] = None,
-        model_name: Optional[str] = None,
-        task_type: Optional[str] = None,
-        enable_thinking: bool = QWEN_RERANK_COMPRESS_ENABLE_THINKING,
-        image_inputs: Optional[List[Dict[str, Any]]] = None,
-        asset_metadata: Optional[List[Dict[str, Any]]] = None,
-    ) -> Iterator[Dict[str, Any]]:
-        """Stream a Qwen Responses API answer chunk by chunk."""
-        try:
-            if not api_key:
-                api_key = QWEN_API_KEY
-            if not api_key:
-                raise ValueError("Qwen API key not provided")
-
-            model_selection = self._resolve_qwen_model_selection(
-                task_type=task_type,
-                model_name=model_name,
-                default_role="large",
-            )
-            model_name = model_selection["selected_model"]
-
-            client = OpenAI(api_key=api_key, base_url=QWEN_BASE_URL)
-            qwen_input, input_debug = self._build_qwen_input_with_debug(
-                query=query,
-                context=context,
-                image_inputs=image_inputs,
-                asset_metadata=asset_metadata,
-            )
-            record_llm_call(model=model_name, task_type=task_type or "generation")
-            stream = client.responses.create(
-                model=model_name,
-                input=qwen_input,
-                stream=True,
-                extra_body={"enable_thinking": enable_thinking},
-            )
-
-            answer_parts: List[str] = []
-            for event in stream:
-                event_type = getattr(event, "type", "")
-                if event_type == "response.output_text.delta":
-                    delta = getattr(event, "delta", "") or ""
-                    if delta:
-                        answer_parts.append(delta)
-                        yield {"type": "delta", "delta": delta}
-                elif event_type == "response.completed":
-                    response = getattr(event, "response", None)
-                    usage = getattr(response, "usage", None) if response else None
-                    record_llm_usage(usage)
-                    yield {
-                        "type": "completed",
-                        "answer": "".join(answer_parts),
-                        "usage": {
-                            "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
-                            "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
-                            "total_tokens": getattr(usage, "total_tokens", None) if usage else None,
-                        },
-                        "qwen_request_debug": input_debug,
-                    }
-                    return
-
-            yield {
-                "type": "completed",
-                "answer": "".join(answer_parts),
-                "usage": None,
-                "qwen_request_debug": input_debug,
-            }
-        except Exception as e:
-            logger.error(f"Error streaming with Qwen Responses API: {str(e)}")
-            raise
 
     def _generate_with_deepseek(
         self,

@@ -188,46 +188,6 @@ class ContextLifecycleService:
             result["error"] = str(exc)
             return result
 
-    def build_paper_qa_health_debug(
-        self,
-        *,
-        user_id: str = "",
-        session_id: str = "",
-        short_term_debug: Optional[Mapping[str, Any]] = None,
-        session_summary: Optional[Mapping[str, Any]] = None,
-        prompt_context_debug: Optional[Mapping[str, Any]] = None,
-        degraded: Optional[Mapping[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """构造本轮 QA 上下文健康度，明确数据库读取规模和 prompt 使用规模。"""
-        normalized_user_id = str(user_id or get_default_user_id()).strip() or get_default_user_id()
-        stats = self.agent_runtime_checkpoint_store.get_context_lifecycle_stats(
-            user_id=normalized_user_id,
-            paper_session_id=str(session_id or "").strip() or None,
-        )
-        short_term = dict(short_term_debug or {})
-        prompt_debug = dict(prompt_context_debug or {})
-        return {
-            "policy": self.retention_policy(),
-            "paper_chat": stats.get("paper_chat", {}),
-            "runtime_context": {
-                "db_message_read_count": short_term.get("db_message_read_count"),
-                "db_message_read_limit": short_term.get("db_message_read_limit"),
-                "total_message_count": short_term.get("total_message_count"),
-                "used_turn_count": short_term.get("merged_turn_count") or short_term.get("turn_count"),
-                "summary_loaded": bool(session_summary),
-                "summary_turn_count": (session_summary or {}).get("summary_turn_count") if isinstance(session_summary, Mapping) else None,
-                "filtered_incomplete_turn_count": short_term.get("filtered_incomplete_turn_count"),
-            },
-            "prompt_budget": {
-                "section_order": prompt_debug.get("section_order"),
-                "used_chars": prompt_debug.get("used_chars"),
-                "total_budget_chars": prompt_debug.get("total_budget_chars"),
-                "estimated_tokens": prompt_debug.get("estimated_tokens"),
-                "truncated_sections": prompt_debug.get("truncated_sections"),
-            },
-            "degraded": dict(degraded or {}),
-        }
-
     def build_agent_health_debug(
         self,
         *,

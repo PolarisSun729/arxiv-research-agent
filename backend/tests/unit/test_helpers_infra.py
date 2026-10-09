@@ -4,7 +4,6 @@ from tests.helpers import (
     FakeArxivService,
     FakeEmbeddingService,
     FakeGenerationService,
-    FakePaperQAService,
     FakeVectorStoreService,
     TemporarySqliteDatabase,
     build_storage_container,
@@ -52,10 +51,8 @@ class HelperInfrastructureTests(unittest.TestCase):
         service = FakeGenerationService(response_text="hello world")
 
         response = service.generate("prompt")
-        streamed = list(service.stream_qwen_responses("prompt"))
 
         self.assertEqual(response["answer"], "hello world")
-        self.assertEqual(streamed, ["hello", "world"])
 
     def test_fake_vector_store_supports_basic_insert_and_search(self) -> None:
         service = FakeVectorStoreService()
@@ -79,14 +76,6 @@ class HelperInfrastructureTests(unittest.TestCase):
 
         self.assertEqual(len(result["papers"]), 1)
         self.assertEqual(result["papers"][0]["title"], "Paper 2")
-
-    def test_fake_paper_qa_service_returns_stubbed_answer(self) -> None:
-        service = FakePaperQAService(answer_text="stub answer", search_results=[{"title": "Paper A"}])
-
-        result = service.answer_question("1234.5678", {"question": "what?"})
-
-        self.assertEqual(result["answer"], "stub answer")
-        self.assertEqual(result["sources"][0]["title"], "Paper A")
 
 
 if __name__ == "__main__":

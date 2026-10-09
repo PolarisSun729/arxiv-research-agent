@@ -50,7 +50,7 @@ flowchart LR
 
 研究正常结束只有三种 `outcome`：`completed` 表示全部核心需求得到支持；`partial` 只保留可靠且有支持的部分核心回答；`abstained` 表示正常取证后仍无法支持核心结论。检索故障按需求保存在业务状态中；同一需求成功重试会清除故障。故障仍阻断取证且无法保留可靠有限回答时，返回运行错误，不能算作拒答。审计轨迹不驱动终态。
 
-`/qa/stream` 发送 `meta`、`progress`（retrieval/draft/verification/completed）及唯一的 `done` 或 `error`。研究答案经过校验后由 `done.answer` 一次交付，客户端不能假设一定收到 `delta`。`done` 保留会话、来源、`outcome`、`research_summary` 和 `usage`；`error` 使用 `AppError.to_payload()`，不返回底层异常文本。流式统计上下文在每次 `next()` 内绑定，避免工作线程切换导致 ContextVar 恢复失败。
+`/qa/stream` 发送 `meta`、`progress`（retrieval/draft/verification/completed）及唯一的 `done` 或 `error`。研究答案经过校验后由 `done.answer` 一次交付，不发送增量 `delta` 事件。`done` 保留会话、来源、`outcome`、`research_summary` 和 `usage`；`error` 使用 `AppError.to_payload()`，不返回底层异常文本。流式统计上下文在每次 `next()` 内绑定，避免工作线程切换导致 ContextVar 恢复失败。
 
 ## QA 观察与 Agent 修复
 

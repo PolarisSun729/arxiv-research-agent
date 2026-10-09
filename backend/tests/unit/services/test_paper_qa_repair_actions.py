@@ -71,7 +71,7 @@ def test_result_analysis_uses_canonical_intent_for_missing_evidence() -> None:
 def test_missing_index_recommends_confirmation_rebuild_action_only() -> None:
     observation = build_error_qa_observation(
         error_code="qa_index_not_found",
-        error_stage="build_qa_context",
+        error_stage="vector_store",
         error_reason="index_status:missing",
     )
 

@@ -65,36 +65,6 @@ class ContextLifecycleServiceTests(unittest.TestCase):
         self.assertTrue(snapshot["raw_retrieval_top30"][0]["content"]["truncated"])
         self.assertEqual(snapshot["generation"]["prompt_context"]["used_chars"], 100)
 
-    def test_paper_qa_health_debug_reports_runtime_read_scale_and_policy(self) -> None:
-        session = self._create_paper_session()
-        self.storage.paper_qa_turns.append_paper_qa_turn(
-            session_id=session["session_id"],
-            user_id=self.user_id,
-            question="Q",
-            answer="A",
-        )
-
-        debug = self.service.build_paper_qa_health_debug(
-            user_id=self.user_id,
-            session_id=session["session_id"],
-            short_term_debug={
-                "db_message_read_count": 2,
-                "db_message_read_limit": 8,
-                "total_message_count": 20,
-                "merged_turn_count": 1,
-                "filtered_incomplete_turn_count": 0,
-            },
-            session_summary={"topic": "method", "summary_turn_count": 3},
-            prompt_context_debug={"used_chars": 1200, "total_budget_chars": 28000, "estimated_tokens": 300},
-        )
-
-        self.assertEqual(debug["paper_chat"]["stored_message_count"], 2)
-        self.assertEqual(debug["runtime_context"]["db_message_read_count"], 2)
-        self.assertEqual(debug["runtime_context"]["total_message_count"], 20)
-        self.assertTrue(debug["runtime_context"]["summary_loaded"])
-        self.assertEqual(debug["prompt_budget"]["used_chars"], 1200)
-        self.assertEqual(debug["policy"]["paper_chat_messages"]["retention"], "long_term")
-
     def test_summarize_startup_cleanup_result_keeps_info_log_compact(self) -> None:
         summary = self.service.summarize_startup_cleanup_result(
             {

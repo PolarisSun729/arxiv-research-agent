@@ -22,7 +22,7 @@ from auth.api_key_middleware import ApiKeySettings
 from middleware.audit_log import AuditLogMiddleware, AuditSink
 from middleware.ip_filter import IPFilterSettings
 from middleware.rate_limit import RateLimitController, RateLimitSettings
-from utils.secret_redaction import StreamingSecretRedactor, redact_sensitive_value
+from utils.secret_redaction import redact_sensitive_value
 
 
 KEY_A = "stage2-shared-prefix-" + "a" * 40
@@ -506,11 +506,8 @@ def test_audit_does_not_mark_failed_final_send_as_complete(app_factory):
     assert records[0]["bytes_sent"] == len(b"partial")
 
 
-def test_file_only_keys_are_redacted_in_json_and_split_stream(app_factory, monkeypatch, tmp_path):
+def test_file_only_keys_are_redacted_in_json(app_factory, monkeypatch, tmp_path):
     secret = "only-in-private-file-" + "x" * 40
     write_keys(tmp_path, monkeypatch, [{"key": secret}])
     app_factory()
     assert redact_sensitive_value({"diagnostic": secret})["diagnostic"] == "***REDACTED***"
-    redactor = StreamingSecretRedactor()
-    actual = redactor.feed(secret[:10]) + redactor.feed(secret[10:]) + redactor.finish()
-    assert actual == "***REDACTED***"

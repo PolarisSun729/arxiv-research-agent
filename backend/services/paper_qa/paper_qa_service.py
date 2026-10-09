@@ -8,7 +8,6 @@ from uuid import uuid4
 from core.errors import AppError, ErrorCode
 from services.arxiv.arxiv_search_service import ArxivSearchService
 from services.arxiv.arxiv_oai_service import ArxivOaiDatabaseService
-from services.context_lifecycle import ContextLifecycleService
 from services.document.chunking_service import ChunkingService
 from services.evaluation import write_eval_record, build_success_eval_record, build_error_eval_record
 from services.llm.call_metrics import LLMCallStats, use_call_stats
@@ -21,15 +20,12 @@ from services.paper_evidence_research import (
     PaperEvidenceResearchService,
     ResearchLimits,
 )
-from services.retrieval.enhanced_retrieval_service import EnhancedRetrievalService, RetrievalOptions
+from services.retrieval.enhanced_retrieval_service import EnhancedRetrievalService
 from services.llm.generation_service import GenerationService
 from services.document.loading_service import LoadingService
-from services.paper_qa.answer_generator import AnswerGenerator
-from services.paper_qa.context_pack_builder import ContextPackBuilder
 from services.paper_qa.evidence_contract import build_public_source_payload, resolve_evidence_asset_path
-from services.paper_qa.evidence_verifier import EvidenceVerifier
 from services.paper_qa.paper_qa_index_builder import PaperQAIndexBuilder
-from services.paper_qa.qa_observation import build_error_qa_observation, build_qa_observation, build_research_qa_observation
+from services.paper_qa.qa_observation import build_error_qa_observation, build_research_qa_observation
 from services.paper_evidence_research.dependencies.production_adapters import PaperRetrievalTargetResolver
 from services.paper_qa.question_contextualizer import QuestionContextualizer
 from services.paper_qa.session_service import PaperQASessionService
@@ -62,8 +58,8 @@ def _write_qa_trace(trace: RequestTrace, *, reason: str) -> Optional[str]:
 class PaperQAService:
     """论文 QA 主流程编排服务。
 
-    该服务只保留 router、工具入口和 QA 主流程需要的高层入口；会话解析、上下文打包、
-    答案生成、证据校验等底层能力由专门组件负责，避免继续把底层 Store 能力堆回主服务。
+    该服务只保留 router、工具入口和 QA 主流程需要的高层入口；会话解析由 session_service 负责，
+    检索、作答与证据校验统一交给 PaperEvidenceResearchService，避免继续把底层 Store 能力堆回主服务。
     """
 
     def __init__(
@@ -76,11 +72,11 @@ class PaperQAService:
         research_profile_store: ResearchProfileStore,
         agent_runtime_checkpoint_store: AgentRuntimeCheckpointStore,
         memory_service: MemoryService,
+        research_service: PaperEvidenceResearchService,
         embedding_service: Optional[EmbeddingService] = None,
         vector_store_service: Optional[VectorStoreService] = None,
         generation_service: Optional[GenerationService] = None,
         enhanced_retrieval_service: Optional[EnhancedRetrievalService] = None,
-        research_service: Optional[PaperEvidenceResearchService] = None,
         arxiv_service_factory: Optional[Callable[[], Any]] = None,
         oai_db_service: Optional[ArxivOaiDatabaseService] = None,
         get_embedding_config: Optional[Callable[[], EmbeddingConfig]] = None,
@@ -138,16 +134,6 @@ class PaperQAService:
             generation_service=self.generation_service,
             session_service=self.session_service,
         )
-        self.context_pack_builder = ContextPackBuilder()
-        self.answer_generator = AnswerGenerator(generation_service=self.generation_service)
-        self.evidence_verifier = EvidenceVerifier()
-        self.context_lifecycle_service = ContextLifecycleService(
-            agent_runtime_checkpoint_store=self.agent_runtime_checkpoint_store,
-        )
-
-    def _build_memory_runtime_debug(self) -> Dict[str, Any]:
-        """构造 QA 主流程需要的记忆运行时 debug 快照。"""
-        return self.session_service.build_memory_runtime_debug()
 
     @staticmethod
     def _payload_get(payload: Any, key: str, default: Any = None) -> Any:
@@ -162,11 +148,6 @@ class PaperQAService:
     def _get_preferred_answer_style(self, payload: Any) -> str:
         """从会话与长期画像中解析回答风格，主流程只消费解析结果。"""
         return self.session_service.get_preferred_answer_style(payload)
-
-    @staticmethod
-    def _apply_answer_style_to_question(question: str, preferred_answer_style: str) -> str:
-        """把回答风格约束附加到生成问题，同时保持证据约束不被绕过。"""
-        return PaperQASessionService.apply_answer_style_to_question(question, preferred_answer_style)
 
     def _resolve_chat_session(self, arxiv_id: str, payload: Any) -> Dict[str, Any]:
         """解析或创建当前论文的 QA 会话，主流程不直接操作会话表。"""
@@ -290,11 +271,6 @@ class PaperQAService:
             "cleanup": cleanup_result,
         }
 
-    def build_source_payload(self, search_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """把检索结果整理成统一的来源载荷，供前端展示与会话持久化复用。"""
-        # source_id 与资产字段由 ContextPackBuilder 统一分配，避免会话记忆和前端证据不一致。
-        return self._build_public_source_payload(search_results)
-
     @staticmethod
     def _build_public_source_payload(
         search_results: List[Dict[str, Any]],
@@ -317,255 +293,6 @@ class PaperQAService:
             paper_qa_index_store=self.paper_qa_index_store,
             enhanced_retrieval_service=self.enhanced_retrieval_service,
         )
-
-    def build_qa_context(self, arxiv_id: str, payload: Any, *, run_id: Optional[str] = None):
-        qa_index = self.paper_qa_index_store.get_paper_qa_index(arxiv_id)
-        if not qa_index or qa_index["status"] != "indexed":
-            # 未建索引属于前置检索失败，也要生成观察结构，便于 Agent 直接决定是否重建索引。
-            qa_observation = build_error_qa_observation(
-                error_code=ErrorCode.QA_INDEX_NOT_FOUND,
-                error_stage="build_qa_context",
-                error_reason=f"index_status:{(qa_index or {}).get('status', 'missing')}",
-            )
-            # 未建索引是可预期的业务状态，前端需要用稳定 code 引导用户先构建索引。
-            raise AppError(
-                ErrorCode.QA_INDEX_NOT_FOUND,
-                detail={
-                    "arxiv_id": arxiv_id,
-                    "stage": "build_qa_context",
-                    "index_status": (qa_index or {}).get("status", "missing"),
-                    "qa_observation": qa_observation,
-                },
-                context={"arxiv_id": arxiv_id, "stage": "build_qa_context", "qa_observation": qa_observation},
-            )
-
-        question = str(self._payload_get(payload, "question", "") or "").strip()
-        user_id = self._resolve_user_id(self._payload_get(payload, "user_id"))
-        resolved_run_id = str(run_id or self._payload_get(payload, "run_id", "") or "").strip() or str(uuid4())
-        chat_session = self._resolve_chat_session(arxiv_id, payload)
-        memory_runtime = self._build_memory_runtime_debug()
-        collection_name = qa_index["collection_name"]
-        paper = self.paper_catalog_store.get_paper(arxiv_id) or {}
-        paper_context = {
-            "arxiv_id": arxiv_id,
-            "title": paper.get("title", ""),
-            "abstract": paper.get("abstract", ""),
-            "authors": paper.get("authors", ""),
-            "categories": paper.get("categories", ""),
-            "published_date": paper.get("published_date", ""),
-            "url": paper.get("url", ""),
-            # 检索画像用 DB index record 校验缓存是否还匹配当前 active collection。
-            "chunk_count": qa_index.get("chunk_count", 0),
-            "embedding_model": qa_index.get("embedding_model", ""),
-            "chunk_file": qa_index.get("chunk_file", ""),
-            "retrieval_index_file": qa_index.get("retrieval_index_file", ""),
-            "retrieval_index_count": qa_index.get("retrieval_index_count", 0),
-            "retrieval_index_types": qa_index.get("retrieval_index_types", ""),
-            "retrieval_index_version": qa_index.get("retrieval_index_version", ""),
-            "sparse_index_dir": qa_index.get("sparse_index_dir", ""),
-            "sparse_index_manifest_file": qa_index.get("sparse_index_manifest_file", ""),
-            "sparse_index_document_count": qa_index.get("sparse_index_document_count", 0),
-            "sparse_index_token_count": qa_index.get("sparse_index_token_count", 0),
-            "sparse_index_backend": qa_index.get("sparse_index_backend", ""),
-            "sparse_index_schema_version": qa_index.get("sparse_index_schema_version", ""),
-            "sparse_index_source_file": qa_index.get("sparse_index_source_file", ""),
-            "sparse_index_source_hash": qa_index.get("sparse_index_source_hash", ""),
-            "sparse_index_avgdl": qa_index.get("sparse_index_avgdl", 0),
-            "active_build_id": qa_index.get("active_build_id"),
-            "active_index_version": qa_index.get("active_index_version"),
-            # run_id 只向下游检索链路传递日志关联键，不参与排序、召回或生成决策。
-            "run_id": resolved_run_id,
-        }
-        session_state = self.session_service.load_conversation_state(
-            arxiv_id=arxiv_id,
-            payload=payload,
-            chat_session=chat_session,
-        )
-        conversation_context = session_state["conversation_context"]
-        recent_conversation_context = session_state.get("recent_conversation_context", conversation_context)
-        session_summary = session_state.get("session_summary")
-        short_term_debug = session_state["short_term_debug"]
-
-        try:
-            question_contextualization = self.question_contextualizer.contextualize(question, paper_context, conversation_context)
-        except Exception as exc:
-            logger.warning("Question contextualization raised unexpectedly, fallback to original question: %s", exc)
-            question_contextualization = {
-                "original_question": question,
-                "contextualized_question": question,
-                "is_follow_up": False,
-                "referenced_turn_ids": [],
-                "referenced_source_ids": [],
-                "memory_reason": "Contextualization raised unexpectedly, so the original question was used.",
-                "used_short_term_memory": False,
-                "status": "fallback_original",
-                "error": str(exc),
-            }
-
-        retrieval_question = str(question_contextualization.get("contextualized_question", question) or question).strip() or question
-        short_term_debug = self.session_service.update_short_term_debug_with_contextualization(
-            short_term_debug,
-            question_contextualization,
-        )
-
-        try:
-            memory_context = self.session_service.build_memory_context(
-                conversation_context,
-                question_contextualization,
-                retrieval_question,
-            )
-        except Exception as exc:
-            logger.warning("Memory context construction failed, skip memory-aware retrieval: %s", exc)
-            memory_context = {
-                "enabled": False,
-                "reason": "Memory context construction failed.",
-                "query_keywords": [],
-                "referenced_turn_ids": [],
-                "referenced_source_ids": [],
-                "candidates": [],
-                "fallback_reason": str(exc),
-            }
-
-        session_debug = self.session_service.build_session_debug(chat_session)
-        try:
-            retrieval_result = self.enhanced_retrieval_service.enhanced_retrieve(
-                collection_name=collection_name,
-                user_query=retrieval_question,
-                paper_context=paper_context,
-                options=RetrievalOptions(
-                    top_k=self._payload_get(payload, "top_k", None) or 15,
-                    enable_query_rewrite=self._payload_get(payload, "enable_query_rewrite", None),
-                    enable_hyde=self._payload_get(payload, "enable_hyde", None),
-                    enable_keyword_search=self._payload_get(payload, "enable_keyword_search", None),
-                    enable_table_structured_route=self._payload_get(payload, "enable_table_structured_route", None),
-                    enable_llm_rerank=self._payload_get(payload, "enable_llm_rerank", None),
-                    enable_context_expansion=self._payload_get(payload, "enable_context_expansion", None),
-                    debug=self._payload_get(payload, "debug", None),
-                    memory_context=memory_context,
-                ),
-            )
-        except AppError:
-            raise
-        except Exception as exc:
-            # 检索异常时没有 sources，但仍要把失败阶段和建议动作结构化暴露给 Agent。
-            qa_observation = build_error_qa_observation(
-                error_code=ErrorCode.VECTOR_STORE_ERROR,
-                error_stage="enhanced_retrieve",
-                error_reason=str(exc),
-            )
-            # 检索链路异常不能降级成“没有相关 chunk”，否则前端无法区分数据为空和服务故障。
-            logger.exception(
-                "QA retrieval failed: code=%s arxiv_id=%s collection_name=%s user_id=%s stage=%s",
-                ErrorCode.VECTOR_STORE_ERROR,
-                arxiv_id,
-                collection_name,
-                user_id,
-                "enhanced_retrieve",
-            )
-            raise AppError(
-                ErrorCode.VECTOR_STORE_ERROR,
-                detail={"detail": exc, "qa_observation": qa_observation},
-                context={
-                    "arxiv_id": arxiv_id,
-                    "user_id": user_id,
-                    "stage": "enhanced_retrieve",
-                    "collection_name": collection_name,
-                    "qa_observation": qa_observation,
-                },
-            ) from exc
-
-        retrieval_debug = retrieval_result.get("debug")
-        if retrieval_debug is None:
-            retrieval_debug = {}
-        elif not isinstance(retrieval_debug, dict):
-            retrieval_debug = {"raw_debug": retrieval_debug}
-        final_context_results = retrieval_result["chunks"]
-        search_results = final_context_results
-        if not search_results:
-            # 空召回和检索服务异常都需要可观察状态；这里保留 debug 以区分 route 空、rerank 失败或预算层兜底。
-            qa_observation = build_error_qa_observation(
-                error_code=ErrorCode.VECTOR_STORE_ERROR,
-                error_stage="enhanced_retrieve",
-                error_reason="empty_retrieval_chunks",
-                retrieval_debug=retrieval_debug,
-                sources=[],
-            )
-            raise AppError(
-                ErrorCode.VECTOR_STORE_ERROR,
-                message="检索服务没有返回可用的论文片段，请检查索引后重试。",
-                detail={"arxiv_id": arxiv_id, "stage": "enhanced_retrieve", "collection_name": collection_name, "qa_observation": qa_observation},
-                context={"arxiv_id": arxiv_id, "user_id": user_id, "stage": "enhanced_retrieve", "qa_observation": qa_observation},
-            )
-
-        info_event(
-            logger,
-            "qa.retrieval_done",
-            run_id=resolved_run_id,
-            session_id=chat_session.get("session_id"),
-            user_id=user_id,
-            arxiv_id=arxiv_id,
-            collection_name=collection_name,
-            input=question,
-            contextualized_question=retrieval_question,
-            result_count=len(search_results),
-            trace_path=(retrieval_result.get("trace_export") or {}).get("json") if isinstance(retrieval_result.get("trace_export"), dict) else None,
-        )
-        context_pack = self.context_pack_builder.build(search_results)
-        # 统一把 source_payload 替换成无本地路径的公开契约；内部 image_inputs/asset_metadata
-        # 仍保留给生成器使用，但不会通过 API 或会话持久化泄漏出去。
-        context_pack["source_payload"] = self._build_public_source_payload(search_results, arxiv_id=arxiv_id)
-        retrieval_debug["original_question"] = question
-        retrieval_debug["contextualized_question"] = retrieval_question
-        retrieval_debug["question_contextualization"] = question_contextualization
-        retrieval_debug["memory_context"] = memory_context
-        retrieval_debug["memory_runtime"] = memory_runtime
-        retrieval_debug["memory_modules"] = self.session_service.build_memory_modules_debug(
-            short_term_debug=short_term_debug,
-            session_debug=session_debug,
-            memory_context=memory_context,
-        )
-        # context_pack debug 只记录预算和类型分布，不重复塞入完整 chunk，避免 retrieval_debug 过大。
-        retrieval_debug["context_pack"] = {
-            "context_budget_debug": context_pack.get("context_budget_debug", {}),
-        }
-        retrieval_debug["context_lifecycle"] = self.context_lifecycle_service.build_paper_qa_health_debug(
-            user_id=user_id,
-            session_id=str(chat_session.get("session_id") or ""),
-            short_term_debug=short_term_debug,
-            session_summary=session_summary,
-            degraded={
-                "memory_context_fallback": bool(memory_context.get("fallback_reason")) if isinstance(memory_context, dict) else False,
-                "question_contextualization_status": question_contextualization.get("status") if isinstance(question_contextualization, dict) else None,
-            },
-        )
-
-        return qa_index, search_results, {
-            "text_context": context_pack["text_context"],
-            "image_inputs": context_pack["image_inputs"],
-            "asset_metadata": context_pack["asset_metadata"],
-            "source_payload": context_pack["source_payload"],
-            "context_pack": context_pack,
-            "context_budget_debug": context_pack.get("context_budget_debug", {}),
-            "generation_question": retrieval_question,
-            "original_question": question,
-            "question_contextualization": question_contextualization,
-            "conversation_context": conversation_context,
-            "recent_conversation_context": recent_conversation_context,
-            "session_summary": session_summary,
-            "memory_context": memory_context,
-            "chat_session": chat_session,
-            "memory_runtime": memory_runtime,
-        }, retrieval_debug
-
-    def _load_user_memory_summary_for_prompt(self, payload: Any) -> Dict[str, Any]:
-        """为 PromptContextBuilder 加载用户长期记忆；失败不影响本轮 QA。"""
-        user_id = self._resolve_user_id(self._payload_get(payload, "user_id"))
-        try:
-            summary = self.memory_service.build_user_memory_summary(user_id)
-            return summary if isinstance(summary, dict) else {}
-        except Exception as exc:
-            logger.warning("Failed to load user memory summary for prompt context: user_id=%s error=%s", user_id, exc)
-            return {}
 
     def _prepare_research_context(
         self, arxiv_id: str, payload: Any, request: PaperEvidenceResearchRequest,
@@ -669,7 +396,7 @@ class PaperQAService:
             "qa_observation": observation,
         }
 
-    def answer_question_with_research(self, arxiv_id: str, payload: Any) -> Dict[str, Any]:
+    def answer_question(self, arxiv_id: str, payload: Any) -> Dict[str, Any]:
         """同步入口消费同一执行流；显式捕获 return，避免 for 吞掉最终结果。"""
         stream = self.answer_question_with_research_stream(arxiv_id, payload)
         while True:
@@ -710,8 +437,6 @@ class PaperQAService:
             request = prepared["request"]
             trace.session_id = prepared["chat_session"].get("session_id")
             stage = "research"
-            if self.research_service is None:
-                raise AppError(ErrorCode.UNKNOWN_ERROR)
             research_stream = self.research_service.research_stream(
                 request, trace_listener=lambda _run_id, trace_events: events.extend(trace_events),
             )
@@ -795,243 +520,4 @@ class PaperQAService:
                 research_stream.close()
 
         yield {"event": "done", "data": result}
-        return result
-
-    def answer_question(self, arxiv_id: str, payload: Any) -> Dict[str, Any]:
-        """回答论文问题的主入口。
-
-        Phase 3 切换：如果 research_service 已注入，路由到新证据研究引擎；
-        否则使用旧编排逻辑（向后兼容）。
-        """
-        # Phase 3 生产切换：优先使用证据研究引擎
-        if self.research_service is not None:
-            return self.answer_question_with_research(arxiv_id, payload)
-
-        # 旧编排逻辑（保持向后兼容）
-        question = str(self._payload_get(payload, "question", "") or "").strip()
-        run_id = str(self._payload_get(payload, "run_id", "") or "").strip() or str(uuid4())
-        started = perf_counter()
-        user_id = self._resolve_user_id(self._payload_get(payload, "user_id"))
-        trace = RequestTrace(
-            run_id=run_id,
-            route="paper_qa.answer",
-            session_id=str(self._payload_get(payload, "session_id", "") or "") or None,
-            user_id=user_id,
-            input=question,
-        )
-        info_event(
-            logger,
-            "qa.request_start",
-            run_id=run_id,
-            session_id=trace.session_id,
-            user_id=user_id,
-            arxiv_id=arxiv_id,
-            input=question,
-        )
-        trace.add_event("qa.request_start", arxiv_id=arxiv_id, user_id=user_id)
-        try:
-            _, _search_results, qa_context, retrieval_debug = self.build_qa_context(arxiv_id, payload, run_id=run_id)
-        except Exception as exc:
-            trace.mark_failed()
-            error_payload_builder = getattr(exc, "to_payload", None)
-            trace.set_output(error_payload_builder() if callable(error_payload_builder) else {"error": str(exc)})
-            trace.add_event("qa.request_done", status="error", error_type=type(exc).__name__)
-            trace_path = _write_qa_trace(trace, reason="qa_context_error")
-            info_event(
-                logger,
-                "qa.request_done",
-                run_id=run_id,
-                session_id=trace.session_id,
-                user_id=user_id,
-                arxiv_id=arxiv_id,
-                status="error",
-                error_type=type(exc).__name__,
-                output=str(exc),
-                elapsed_ms=round((perf_counter() - started) * 1000, 1),
-                trace_path=trace_path,
-            )
-            raise
-        context_pack = qa_context.get("context_pack") or self.context_pack_builder.build(_search_results)
-        source_payload = list(qa_context.get("source_payload") or context_pack.get("source_payload") or [])
-        generation_question = str(qa_context.get("generation_question", question) or question).strip() or question
-        question_contextualization = qa_context.get("question_contextualization", {}) or {}
-        chat_session = qa_context.get("chat_session", {}) or {}
-        preferred_answer_style = self._get_preferred_answer_style(payload)
-        user_memory_summary = self._load_user_memory_summary_for_prompt(payload)
-        styled_generation_question = self._apply_answer_style_to_question(generation_question, preferred_answer_style)
-        if isinstance(retrieval_debug, dict) and preferred_answer_style:
-            retrieval_debug["preferred_answer_style"] = preferred_answer_style
-
-        logger.debug("Generating answer...")
-        try:
-            generation_result = self.answer_generator.generate(
-                generation_question=styled_generation_question,
-                context_pack=context_pack,
-                preferred_answer_style=preferred_answer_style,
-                style_already_applied=bool(preferred_answer_style),
-                original_question=question,
-                session_summary=qa_context.get("session_summary"),
-                recent_turns=qa_context.get("recent_conversation_context") or qa_context.get("conversation_context") or [],
-                user_memory_summary=user_memory_summary,
-            )
-            answer = generation_result["answer"]
-        except Exception as exc:
-            # 生成失败发生在检索之后，因此观察结构要保留已有 sources/debug，方便区分“检索弱”和“LLM 失败”。
-            qa_observation = build_error_qa_observation(
-                error_code=ErrorCode.LLM_GENERATION_FAILED,
-                error_stage="paper_qa_final_answer",
-                error_reason=str(exc),
-                retrieval_debug=retrieval_debug if isinstance(retrieval_debug, dict) else None,
-                sources=source_payload,
-            )
-            # LLM 失败时保留明确错误码，避免把检索结果拼成成功答案误导用户。
-            logger.exception(
-                "QA generation failed: code=%s arxiv_id=%s session_id=%s stage=%s",
-                ErrorCode.LLM_GENERATION_FAILED,
-                arxiv_id,
-                chat_session.get("session_id"),
-                "paper_qa_final_answer",
-            )
-            trace.mark_failed()
-            trace.set_output({"error": str(exc), "qa_observation": qa_observation})
-            trace.add_event("qa.request_done", status="error", code=ErrorCode.LLM_GENERATION_FAILED)
-            trace_path = _write_qa_trace(trace, reason="generation_error")
-            info_event(
-                logger,
-                "qa.request_done",
-                run_id=run_id,
-                session_id=chat_session.get("session_id") or trace.session_id,
-                user_id=user_id,
-                arxiv_id=arxiv_id,
-                status="error",
-                code=ErrorCode.LLM_GENERATION_FAILED,
-                output=str(exc),
-                elapsed_ms=round((perf_counter() - started) * 1000, 1),
-                trace_path=trace_path,
-            )
-            raise AppError(
-                ErrorCode.LLM_GENERATION_FAILED,
-                detail={"detail": exc, "qa_observation": qa_observation},
-                context={
-                    "arxiv_id": arxiv_id,
-                    "session_id": chat_session.get("session_id"),
-                    "stage": "paper_qa_final_answer",
-                    "qa_observation": qa_observation,
-                },
-            ) from exc
-
-        verification_result = self.evidence_verifier.verify(
-            answer=answer,
-            sources=source_payload,
-            cited_source_ids=generation_result.get("cited_source_ids", []),
-            claims=generation_result.get("claims", []),
-            generation_insufficient_evidence=bool(generation_result.get("insufficient_evidence", False)),
-        )
-        verified_answer = self.evidence_verifier.apply_answer_guardrail(answer, verification_result)
-        if isinstance(retrieval_debug, dict):
-            # debug 按模块分组，方便回放：检索 -> 上下文打包 -> 生成 -> 证据校验。
-            retrieval_debug["generation"] = generation_result.get("generation_debug", {})
-            retrieval_debug["verification"] = verification_result
-            retrieval_debug["context_lifecycle"] = self.context_lifecycle_service.build_paper_qa_health_debug(
-                user_id=self._resolve_user_id(self._payload_get(payload, "user_id")),
-                session_id=str(chat_session.get("session_id") or ""),
-                short_term_debug=((retrieval_debug.get("memory_modules") or {}).get("short_term_memory") or {}),
-                session_summary=qa_context.get("session_summary"),
-                prompt_context_debug=(generation_result.get("generation_debug", {}) or {}).get("prompt_context"),
-                degraded={
-                    "verification_status": verification_result.get("status") if isinstance(verification_result, dict) else None,
-                    "generation_insufficient_evidence": bool(generation_result.get("insufficient_evidence", False)),
-                },
-            )
-
-        qa_observation = build_qa_observation(
-            retrieval_debug=retrieval_debug if isinstance(retrieval_debug, dict) else None,
-            sources=source_payload,
-            verification_result=verification_result,
-            generation_result=generation_result,
-        )
-        if isinstance(retrieval_debug, dict):
-            # 顶层 qa_observation 是 Agent 稳定读取入口；debug 内副本用于历史快照和人工排查。
-            retrieval_debug["qa_observation"] = qa_observation
-
-        try:
-            persisted_turn = self.persist_completed_turn(
-                chat_session=chat_session,
-                question=question,
-                answer=verified_answer,
-                source_payload=source_payload,
-                retrieval_debug=self.context_lifecycle_service.prepare_debug_snapshot(retrieval_debug) if isinstance(retrieval_debug, dict) else None,
-                contextualized_question=generation_question,
-                question_contextualization=question_contextualization,
-            )
-        except AppError as exc:
-            trace.mark_failed()
-            trace.set_output({"error": exc.to_payload() if hasattr(exc, "to_payload") else str(exc), "qa_observation": qa_observation})
-            trace.add_event("qa.request_done", status="error", code=exc.code)
-            trace_path = _write_qa_trace(trace, reason="persist_error")
-            info_event(
-                logger,
-                "qa.request_done",
-                run_id=run_id,
-                session_id=chat_session.get("session_id") or trace.session_id,
-                user_id=user_id,
-                arxiv_id=arxiv_id,
-                status="error",
-                code=exc.code,
-                output=str(exc.detail or exc.message),
-                elapsed_ms=round((perf_counter() - started) * 1000, 1),
-                trace_path=trace_path,
-            )
-            raise AppError(
-                exc.code,
-                message=exc.message,
-                detail={"detail": exc.detail, "qa_observation": qa_observation},
-                recoverable=exc.recoverable,
-                status_code=exc.status_code,
-                context={**exc.context, "qa_observation": qa_observation},
-            ) from exc
-
-        result = {
-            "status": "success",
-            "arxiv_id": arxiv_id,
-            "question": question,
-            "session_id": chat_session.get("session_id"),
-            "chat_session": persisted_turn.get("chat_session", chat_session),
-            "turn_id": persisted_turn.get("turn_id"),
-            "original_question": question,
-            "contextualized_question": generation_question,
-            "used_short_term_memory": bool(question_contextualization.get("used_short_term_memory", False)),
-            "question_contextualization": question_contextualization,
-            "answer": verified_answer,
-            "sources": source_payload,
-            "generation_debug": generation_result.get("generation_debug", {}),
-            "cited_source_ids": generation_result.get("cited_source_ids", []),
-            "citation_debug": generation_result.get("citation_debug"),
-            "citation_warning": generation_result.get("citation_warning"),
-            "verification_debug": verification_result,
-            "qa_observation": qa_observation,
-            "retrieval_debug": retrieval_debug,
-        }
-        trace.session_id = str(chat_session.get("session_id") or trace.session_id or "") or None
-        trace.set_output(result)
-        trace.add_event(
-            "qa.request_done",
-            status="success",
-            source_count=len(source_payload),
-            answer_chars=len(str(verified_answer or "")),
-        )
-        trace_path = _write_qa_trace(trace, reason="auto")
-        info_event(
-            logger,
-            "qa.request_done",
-            run_id=run_id,
-            session_id=trace.session_id,
-            user_id=user_id,
-            arxiv_id=arxiv_id,
-            status="success",
-            source_count=len(source_payload),
-            output=verified_answer,
-            elapsed_ms=round((perf_counter() - started) * 1000, 1),
-            trace_path=trace_path,
-        )
         return result
