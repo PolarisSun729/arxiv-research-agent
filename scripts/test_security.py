@@ -53,7 +53,7 @@ def main() -> int:
         import dotenv
         import pytest
     except ImportError as exc:
-        print(f"缺少测试依赖 {exc.name}，请在项目 Python 环境中安装 requirements.txt。", file=sys.stderr)
+        print(f"缺少测试依赖 {exc.name}，请在项目 Python 环境中安装 requirements-dev.txt。", file=sys.stderr)
         return 2
 
     os.chdir(REPO_ROOT)

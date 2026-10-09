@@ -52,7 +52,7 @@ def lock_wheels(wheels: Path, lock_path: Path) -> int:
     return len(entries)
 
 
-def package_release(output: Path, commit: str) -> dict:
+def package_release(output: Path, commit: str, runtime_freeze: Path) -> dict:
     verify_runtime()
     validate_commit(commit)
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
@@ -70,8 +70,9 @@ def package_release(output: Path, commit: str) -> dict:
         shutil.copytree(ROOT / "new_frontend/dist", payload / "new_frontend/dist", symlinks=True)
         metadata_dir = payload / ".release"
         metadata_dir.mkdir(exist_ok=False)
+        # 只打包安装测试依赖之前的运行时快照，pytest/fakeredis 等不进入生产环境。
         frozen = staging / "installed.txt"
-        frozen.write_text(subprocess.check_output([sys.executable, "-m", "pip", "freeze", "--all"], text=True), encoding="utf-8")
+        shutil.copyfile(runtime_freeze, frozen)
         wheels = metadata_dir / "wheels"
         wheels.mkdir()
         # 原生扩展在与生产一致的 Debian 12 中构建；CPU Torch 的本地版本号由 freeze 原样保留。
@@ -98,8 +99,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--output", type=Path, default=ROOT / "temp/ci-release")
+    parser.add_argument("--runtime-freeze", type=Path, required=True)
     args = parser.parse_args()
-    print(json.dumps(package_release(args.output.resolve(), args.commit), ensure_ascii=False))
+    print(json.dumps(package_release(args.output.resolve(), args.commit, args.runtime_freeze.resolve()), ensure_ascii=False))
 
 
 if __name__ == "__main__":
