@@ -104,8 +104,8 @@ side_effect_approval 被批准
 | 组件 | 真源 | 不负责 |
 | --- | --- | --- |
 | `paper_index_jobs` / `paper_index_job_attempts` | 物理 job 的 lease、attempt、阶段、百分比、结果 | 用户问题与 checkpoint |
-| `AgentWorkContinuation`（[`continuations.py`](../../backend/agents/arxiv_search_agent/execution/continuations.py)） | 物理 job 与某个 Agent checkpoint 的恢复绑定 | job 阶段真值 |
-| `AgentResumeRun` | 一次恢复执行及其完整最终响应 | 原始批准 |
+| `agent_work_continuations` 表与 `AgentWorkContinuationService`（[`continuations.py`](../../backend/agents/arxiv_search_agent/execution/continuations.py)） | 物理 job 与某个 Agent checkpoint 的恢复绑定 | job 阶段真值 |
+| `agent_resume_runs` 表与 `AgentResumeRunManager` | 一次恢复执行及其完整最终响应 | 原始批准 |
 | `agent_work_events` | 排障与审计时间线 | 任何恢复判断 |
 
 关键约束：

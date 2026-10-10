@@ -35,7 +35,7 @@ flowchart LR
 
 ## 问答链路
 
-`PaperQAService.answer_question()` 是单篇 QA 入口。生产组合根始终注入 [`PaperEvidenceResearchService`](../../backend/services/paper_evidence_research/module.py)，同步和流式入口共用“准备会话 → 研究图 → 持久化结果”的执行流。旧组件仍供兼容调用和测试使用，生产入口不再使用旧的一次检索、一次生成编排。
+`PaperQAService.answer_question()` 是单篇 QA 入口。生产组合根始终注入 [`PaperEvidenceResearchService`](../../backend/services/paper_evidence_research/module.py)，同步和流式入口共用“准备会话 → 研究图 → 持久化结果”的执行流；研究引擎是唯一的问答路径，不再保留一次检索、一次生成的旧编排。
 
 | 阶段 | 组件 | 责任 |
 | --- | --- | --- |
@@ -54,9 +54,9 @@ flowchart LR
 
 ## QA 观察与 Agent 修复
 
-[`qa_observation.py`](../../backend/services/paper_qa/qa_observation.py) 的 `build_research_qa_observation()` 将研究三态映射为 `grounded`、`warning`、`insufficient_evidence`，保留终止原因和未解决主题。`build_qa_observation()` 仍用于兼容链的阶段诊断。
+[`qa_observation.py`](../../backend/services/paper_qa/qa_observation.py) 的 `build_research_qa_observation()` 将研究三态映射为 `grounded`、`warning`、`insufficient_evidence`，保留终止原因和未解决主题；`build_qa_observation()` 是它内部复用的来源与阶段诊断构建函数。
 
-研究图已拥有有界修复预算，外层 Agent 不应因为 `partial` 或正常 `abstained` 再重跑整次 QA。正常拒答没有引用属于预期；有限回答即使有引用也不能投影成完整回答。技术错误继续进入原有 failure/recovery 边界。兼容路径的 [`repair_actions.py`](../../backend/services/paper_qa/repair_actions.py) 保留原语义，不能反向覆盖研究终态。
+研究图已拥有有界修复预算，外层 Agent 不应因为 `partial` 或正常 `abstained` 再重跑整次 QA。正常拒答没有引用属于预期；有限回答即使有引用也不能投影成完整回答。技术错误继续进入原有 failure/recovery 边界。[`repair_actions.py`](../../backend/services/paper_qa/repair_actions.py) 只为 Agent 的 Observer 与工具节点提供修复动作常量，不能反向覆盖研究终态。
 
 生产与离线 runner 使用同一评测记录契约，记录完整答案、运行成败、研究轨迹和实际调用统计。格式、重新评分和基线口径见 [生成效果评测](evaluation.md)。
 

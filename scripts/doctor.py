@@ -310,11 +310,9 @@ def check_local_directories() -> DoctorResult:
     """
     dirs = [
         BACKEND_ROOT / "01-loaded-docs",
-        BACKEND_ROOT / "01-chunked-docs",
         BACKEND_ROOT / "02-embedded-docs",
         BACKEND_ROOT / "03-vector-store",
         BACKEND_ROOT / "03-docling-assets",
-        BACKEND_ROOT / "04-search-results",
         BACKEND_ROOT / "05-generation-results",
         BACKEND_ROOT / "06-daily-arxiv-paper",
         BACKEND_ROOT / "06-database",

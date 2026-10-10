@@ -165,13 +165,11 @@ Replanner 只负责串联失败分类、候选生成、动作选择、安全检�
 ~~~text
 backend/
   01-loaded-docs/          # 加载后的原始文档
-  01-chunked-docs/         # 文档切分结果
   02-embedded-docs/        # Embedding 结果
   02-retrieval-indexes/    # 检索索引
   02-sparse-indexes/       # 稀疏索引
   03-vector-store/         # 向量存储相关资产
   03-docling-assets/       # Docling 解析资产
-  04-search-results/       # 检索结果与 trace
   05-generation-results/   # 模型生成结果
   06-evaluation-result/    # 评测产物
   06-daily-arxiv-paper/    # arXiv 日常同步产物

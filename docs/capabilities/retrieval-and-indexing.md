@@ -57,7 +57,7 @@ flowchart LR
 
 ## Trace 与调试
 
-`TraceBuilder` 只在 debug 模式导出检索阶段、候选、rerank 和预算信息。普通 QA 响应不应包含本地文件路径、完整调试内容或外部提供者的原始响应。trace 下载由 QA Router 做 arxiv slug 和文件名限制，新增 trace 入口必须保留同等路径安全检查。
+[`RetrievalTraceBuilder`](../../backend/services/retrieval/trace_builder.py) 只在 debug 模式导出检索阶段、候选、rerank 和预算信息。普通 QA 响应不应包含本地文件路径、完整调试内容或外部提供者的原始响应。trace 下载由 QA Router 做 arxiv slug 和文件名限制，新增 trace 入口必须保留同等路径安全检查。
 
 ## 修改检查表
 
