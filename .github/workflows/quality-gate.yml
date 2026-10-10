@@ -56,7 +56,8 @@ jobs:
 
       - name: Install backend dependencies
         run: |
-          python -m pip install --upgrade pip
+          # pip、wheel 也会被 freeze --all 记入发布锁，先按锁定版本安装，避免镜像或 pip 新版本改变发布锁哈希。
+          python -m pip install --require-hashes -r requirements-bootstrap.lock.txt
           # 只按仓库中提交的锁文件安装：精确版本加哈希，CI 不再现场解析 requirements.txt 的版本范围。
           # PyTorch CPU 源只提供 +cpu 版 torch/torchvision；其余包的哈希来自 PyPI，不匹配的文件会被拒绝。
           python -m pip install --require-hashes --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.lock.txt

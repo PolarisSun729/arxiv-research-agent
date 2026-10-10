@@ -62,6 +62,16 @@ def test_dev_lock_keeps_runtime_versions_and_satisfies_dev_requirements() -> Non
     _assert_lock_satisfies(_direct_requirements(REPO_ROOT / "requirements-dev.txt"), development)
 
 
+def test_bootstrap_lock_pins_install_tools_without_changing_runtime_versions() -> None:
+    runtime = _locked_versions(REPO_ROOT / "requirements.lock.txt")
+    bootstrap = _locked_versions(REPO_ROOT / "requirements-bootstrap.lock.txt")
+    # 发布锁来自 pip freeze --all，pip 与 wheel 不锁定时，镜像更新就会改变发布锁哈希并使服务器 venv 缓存失效。
+    assert {"pip", "wheel"} <= bootstrap.keys()
+    shared = bootstrap.keys() & runtime.keys()
+    assert {name: bootstrap[name] for name in shared} == {name: runtime[name] for name in shared}
+    _assert_lock_satisfies(_direct_requirements(REPO_ROOT / "requirements-bootstrap.txt"), bootstrap)
+
+
 def test_runtime_lock_uses_cpu_torch_only() -> None:
     locked = _locked_versions(REPO_ROOT / "requirements.lock.txt")
     # 服务器没有 GPU，package_release.py 也会拒绝 CUDA 运行库；在锁文件阶段提前发现。

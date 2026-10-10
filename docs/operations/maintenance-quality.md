@@ -83,6 +83,7 @@ Checkout 后，工作流在后续 shell 步骤使用的 Git 全局配置中仅�
 # 修改 requirements*.txt 后：已有锁中的版本会被保留，只为新增或范围变化的包重新选择
 uv pip compile requirements.txt --no-config --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-first-match --python-version 3.11.2 --python-platform x86_64-manylinux_2_36 --generate-hashes -o requirements.lock.txt
 uv pip compile requirements-dev.txt -c requirements.lock.txt --no-config --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-first-match --python-version 3.11.2 --python-platform x86_64-manylinux_2_36 --generate-hashes -o requirements-dev.lock.txt
+uv pip compile requirements-bootstrap.txt -c requirements.lock.txt --no-config --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-first-match --python-version 3.11.2 --python-platform x86_64-manylinux_2_36 --generate-hashes -o requirements-bootstrap.lock.txt
 
 # 主动升级：在第一条命令末尾加 --upgrade-package <包名>（或 --upgrade 升级全部），再重新生成测试锁
 ~~~
@@ -90,8 +91,9 @@ uv pip compile requirements-dev.txt -c requirements.lock.txt --no-config --index
 - `--no-config` 忽略本机 uv 全局配置（如国内镜像），锁中的哈希统一以官方 PyPI 和 PyTorch CPU 源为准。
 - 索引顺序为 PyPI 优先，PyTorch CPU 源只在 PyPI 没有兼容版本时使用，实际只提供 `+cpu` 版 torch/torchvision。
 - 测试锁以运行时锁为约束，两者共有的包版本必须一致。
+- [requirements-bootstrap.lock.txt](../../requirements-bootstrap.lock.txt) 锁定 CI 最先安装的 pip 与 wheel（setuptools 已在运行时锁中）。发布锁由 `pip freeze --all` 生成，会包含这些安装工具；不锁定时，基础镜像或 pip 新版本就会改变发布锁哈希，使服务器 venv 缓存失效。它同样以运行时锁为约束。
 - 依赖升级单独提交，不与功能改动混在一起。升级 torch、transformers、sentence-transformers 等会影响 Embedding 输出的包时，要评估已有向量库是否需要重建。
 
-[依赖约定测试](../../backend/tests/unit/test_ci_dependency_contract.py)会检查锁文件满足 requirements 范围、测试锁未改动运行时版本，以及只包含 CPU Torch。新增依赖或收紧版本范围后忘记重新生成锁时，`backend-tests` 会失败。
+[依赖约定测试](../../backend/tests/unit/test_ci_dependency_contract.py)会检查锁文件满足 requirements 范围、测试锁与 bootstrap 锁未改动运行时版本，以及只包含 CPU Torch。新增依赖或收紧版本范围后忘记重新生成锁时，`backend-tests` 会失败。
 
 锁文件只适用于 Linux 服务器环境。本地 Windows 开发环境仍按 [README](../../README.md) 用 `requirements-dev.txt` 安装，版本可能与锁不同，最终以 CI 在锁定版本上的结果为准。
