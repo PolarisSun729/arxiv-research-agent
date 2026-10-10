@@ -164,15 +164,6 @@ export async function clearAgentSession(sessionId: string): Promise<void> {
   })
 }
 
-export async function getAgentWorkContinuation(
-  continuationId: string,
-  sessionId: string
-): Promise<AgentWorkContinuation> {
-  return request.get(`/agent/work-continuations/${encodeURIComponent(continuationId)}`, {
-    params: { user_id: getCurrentUserId(), session_id: sessionId }
-  }) as unknown as Promise<AgentWorkContinuation>
-}
-
 export async function cancelAgentWorkContinuation(
   continuationId: string,
   sessionId: string

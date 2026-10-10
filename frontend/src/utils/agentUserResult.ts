@@ -183,6 +183,3 @@ export function toAgentUserResult(response: ArxivSearchResponse | null | undefin
   }
 }
 
-export function hasVisibleAgentUserResult(result: AgentUserResult | null | undefined) {
-  return Boolean(result?.hasVisibleContent)
-}

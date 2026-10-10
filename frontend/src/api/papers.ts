@@ -418,15 +418,6 @@ export async function getUserResearchProfileDetail(userId?: string): Promise<Use
   return normalizeResearchProfileDetail(response?.detail || response, effectiveUserId)
 }
 
-export async function upsertUserResearchProfile(profile: Partial<UserResearchProfile>, userId?: string): Promise<UserResearchProfile> {
-  const effectiveUserId = resolveUserId(userId || profile.user_id)
-  const response: any = await request.put('/user/research-profile', {
-    ...profile,
-    user_id: effectiveUserId
-  })
-  return normalizeResearchProfile(response?.profile || response, effectiveUserId)
-}
-
 export async function patchUserResearchProfile(profile: Partial<UserResearchProfile>, userId?: string): Promise<UserResearchProfile> {
   const effectiveUserId = resolveUserId(userId || profile.user_id)
   const response: any = await request.patch('/user/research-profile', {
@@ -459,16 +450,6 @@ export async function rebuildUserResearchProfile(
 export async function getUserResearchProfileBuildJob(jobId: string): Promise<UserProfileBuildJob> {
   const response: any = await request.get(`/user/research-profile/build-jobs/${jobId}`)
   return normalizeProfileBuildJob(response?.job || response)
-}
-
-export async function getUserResearchProfileTopicEvidence(topic: string, userId?: string): Promise<{ found: boolean; evidence: Record<string, any>; topic: string }> {
-  const effectiveUserId = resolveUserId(userId)
-  const response: any = await request.get(`/user/research-profile/${effectiveUserId}/topic-evidence`, { params: { topic } })
-  return {
-    found: Boolean(response?.found),
-    evidence: response?.evidence || {},
-    topic: response?.topic || topic
-  }
 }
 
 export async function activateUserResearchProfileSnapshot(snapshotId: string, userId?: string): Promise<UserResearchProfile> {
@@ -1109,14 +1090,6 @@ export interface QaObservation {
   observation_reason?: string
 }
 
-export async function qaPaper(arxivId: string, question: string, options: QaRequestOptions = {}): Promise<QaResult> {
-  return request.post(`/paper/${arxivId}/qa`, {
-    question,
-    ...options,
-    user_id: resolveUserId(options.user_id)
-  })
-}
-
 export async function listPaperChatSessions(
   arxivId: string,
   params: { user_id?: string; limit?: number } = {}
@@ -1148,16 +1121,6 @@ export async function createPaperChatSession(
   })
 }
 
-export async function getPaperChatSession(
-  arxivId: string,
-  sessionId: string,
-  userId?: string
-): Promise<{ item: PaperChatSession | null }> {
-  return request.get(`/paper/${arxivId}/chat-sessions/${sessionId}`, {
-    params: { user_id: resolveUserId(userId) }
-  })
-}
-
 export async function getPaperChatMessages(
   arxivId: string,
   sessionId: string,
@@ -1175,16 +1138,6 @@ export async function clearPaperChatSession(
 ): Promise<{ item: PaperChatSession | null }> {
   return request.post(`/paper/${arxivId}/chat-sessions/${sessionId}/clear`, {
     user_id: resolveUserId(userId)
-  })
-}
-
-export async function deletePaperChatSession(
-  arxivId: string,
-  sessionId: string,
-  userId?: string
-): Promise<{ status: string; deleted: boolean }> {
-  return request.delete(`/paper/${arxivId}/chat-sessions/${sessionId}`, {
-    params: { user_id: resolveUserId(userId) }
   })
 }
 
