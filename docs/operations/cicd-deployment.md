@@ -22,7 +22,7 @@ flowchart LR
     H -->|失败| J[切回上一版程序]
 ```
 
-GitHub 构建经过检查的确切提交，服务器安装同一个发布包。前端构建和 Python 原生依赖编译不会占用这台 2GB 服务器；服务器安装 wheel 时不访问 PyPI。依赖来自当前 `requirements.txt`，每次构建后会锁定完整版本和 wheel 哈希；完整依赖仍较大，建议为上传包、新旧依赖环境和论文数据预留至少 20GB 可用磁盘。
+GitHub 构建经过检查的确切提交，服务器安装同一个发布包。前端构建和 Python 原生依赖编译不会占用这台 2GB 服务器；服务器安装 wheel 时不访问 PyPI。依赖版本来自仓库中提交的 [requirements.lock.txt](../../requirements.lock.txt)（精确版本加哈希，升级方式见[依赖锁](maintenance-quality.md#依赖锁)），CI 只按它安装，打包时再为实际 wheel 生成发布锁；完整依赖仍较大，建议为上传包、新旧依赖环境和论文数据预留至少 20GB 可用磁盘。
 
 单 Gunicorn worker 配合云端 LLM/Embedding；这只是小规模使用的起点。Torch 导入、Docling 解析和建索引仍会消耗内存，2GB 的完整业务容量尚需实际测量。Swap 能缓解峰值，但不能代替足够的物理内存；首次应只处理一篇论文，观察内存后再提高并发。自动健康检查只验证进程、HTTP 存活和认证边界，不能证明模型、Redis 和向量索引都可用。
 

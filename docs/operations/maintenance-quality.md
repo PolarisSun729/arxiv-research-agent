@@ -72,3 +72,26 @@ GitHub Actions 的质量工作流调用 `python scripts/check_quality.py ci`。�
 质量工作流使用 Debian 12 / Python 3.11 容器、Node.js 22 和 CPU Torch。PR 和单独手动运行检查质量；main 推送由 [release 工作流](../../.github/workflows/deploy.yml) 复用质量门和密钥扫描，开启 `package_release` 后在检查通过时生成离线包。仅 main 且仓库变量 `DEPLOY_ENABLED=true` 才进入 production 部署，发布不取消正在进行的运行。服务器前置条件及开关顺序见 [CI/CD 部署手册](cicd-deployment.md)。不能用本地静态检查或健康接口通过代替完整 Debian 依赖安装和真实业务验收。
 
 Checkout 后，工作流在后续 shell 步骤使用的 Git 全局配置中仅将 `$GITHUB_WORKSPACE` 加入 `safe.directory`，并立即执行 `rev-parse --verify HEAD`。这使容器用户与挂载目录属主不一致时，发布脚本仍可读取提交号并执行 `git archive`；信任配置有误会在安装依赖前失败。不要把信任范围扩大为 `*`。
+
+## 依赖锁
+
+[requirements.txt](../../requirements.txt) 和 [requirements-dev.txt](../../requirements-dev.txt) 只声明兼容范围；CI 实际安装的是提交在仓库中的 [requirements.lock.txt](../../requirements.lock.txt) 与 [requirements-dev.lock.txt](../../requirements-dev.lock.txt)。两份锁按服务器环境（Debian 12 glibc 2.36、Python 3.11.2、x86_64、CPU Torch）解析，带全部传递依赖的精确版本和哈希。同一提交无论何时构建都得到同一套依赖，依赖不变时服务器的 venv 缓存也能稳定命中。
+
+锁文件不会自动变化，只在维护者主动重新生成时更新。生成命令写在各锁文件头部，需要安装 [uv](https://docs.astral.sh/uv/)：
+
+~~~powershell
+# 修改 requirements*.txt 后：已有锁中的版本会被保留，只为新增或范围变化的包重新选择
+uv pip compile requirements.txt --no-config --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-first-match --python-version 3.11.2 --python-platform x86_64-manylinux_2_36 --generate-hashes -o requirements.lock.txt
+uv pip compile requirements-dev.txt -c requirements.lock.txt --no-config --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-first-match --python-version 3.11.2 --python-platform x86_64-manylinux_2_36 --generate-hashes -o requirements-dev.lock.txt
+
+# 主动升级：在第一条命令末尾加 --upgrade-package <包名>（或 --upgrade 升级全部），再重新生成测试锁
+~~~
+
+- `--no-config` 忽略本机 uv 全局配置（如国内镜像），锁中的哈希统一以官方 PyPI 和 PyTorch CPU 源为准。
+- 索引顺序为 PyPI 优先，PyTorch CPU 源只在 PyPI 没有兼容版本时使用，实际只提供 `+cpu` 版 torch/torchvision。
+- 测试锁以运行时锁为约束，两者共有的包版本必须一致。
+- 依赖升级单独提交，不与功能改动混在一起。升级 torch、transformers、sentence-transformers 等会影响 Embedding 输出的包时，要评估已有向量库是否需要重建。
+
+[依赖约定测试](../../backend/tests/unit/test_ci_dependency_contract.py)会检查锁文件满足 requirements 范围、测试锁未改动运行时版本，以及只包含 CPU Torch。新增依赖或收紧版本范围后忘记重新生成锁时，`backend-tests` 会失败。
+
+锁文件只适用于 Linux 服务器环境。本地 Windows 开发环境仍按 [README](../../README.md) 用 `requirements-dev.txt` 安装，版本可能与锁不同，最终以 CI 在锁定版本上的结果为准。
