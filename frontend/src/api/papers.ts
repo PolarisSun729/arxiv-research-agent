@@ -5,7 +5,6 @@ import type {
   Paper,
   RecommendedPaper,
   LabeledPaper,
-  SearchParams,
   LabelParams,
   PaginatedResponse,
   ArxivSearchResult,
@@ -461,23 +460,8 @@ export async function activateUserResearchProfileSnapshot(snapshotId: string, us
   return normalizeResearchProfile(response?.profile || response, effectiveUserId)
 }
 
-export async function searchPapers(params: SearchParams): Promise<PaginatedResponse<Paper>> {
-  return request.get('/papers/search', { params })
-}
-
 export async function getPaperById(id: string): Promise<Paper> {
   return normalizePaper(await request.get(`/paper/${id}`))
-}
-
-export async function getRecommendations(params: { page: number; pageSize: number }): Promise<PaginatedResponse<RecommendedPaper>> {
-  const response: any = await request.get('/papers/recommendations', { params })
-  const items = Array.isArray(response?.items)
-    ? response.items.map(normalizeRecommendedPaper)
-    : []
-  return {
-    total: Number(response?.total ?? items.length),
-    items
-  }
 }
 
 export async function getLabeledPapers(params: { 
@@ -879,38 +863,6 @@ export async function createPaperNote(
   return {
     item: response?.item ? normalizePaperNote(response.item, effectiveUserId) : null
   }
-}
-
-export async function updatePaperNote(
-  arxivId: string,
-  noteId: string,
-  payload: Partial<PaperNotePayload>
-): Promise<{ item: PaperNote | null }> {
-  const effectiveUserId = resolveUserId(payload.user_id)
-  const response: any = await request.patch(`/paper/${arxivId}/notes/${noteId}`, {
-    ...payload,
-    user_id: effectiveUserId
-  })
-  return {
-    item: response?.item ? normalizePaperNote(response.item, effectiveUserId) : null
-  }
-}
-
-export async function deletePaperNote(
-  arxivId: string,
-  noteId: string,
-  userId?: string
-): Promise<{ status: string; deleted: boolean }> {
-  return request.delete(`/paper/${arxivId}/notes/${noteId}`, {
-    params: { user_id: resolveUserId(userId) }
-  })
-}
-
-export function getPaperNotesExportUrl(arxivId: string, userId?: string): string {
-  const params = new URLSearchParams()
-  params.set('user_id', resolveUserId(userId))
-  const query = params.toString()
-  return `/api/paper/${arxivId}/notes/export${query ? `?${query}` : ''}`
 }
 
 export interface QaConversationContextTurn {

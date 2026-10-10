@@ -9,7 +9,6 @@ import type {
   InterestVectorResult,
   RecommendationResult,
   PaperActionType,
-  PaperNote,
   PaperNoteType,
   UserPaperActionMap,
   UserResearchProfile,
@@ -18,9 +17,7 @@ import type {
 } from '@/types/paper'
 import type { NormalizedArxivQueryCapability } from '@/types/arxivCapability'
 import {
-  searchPapers,
   getPaperById,
-  getRecommendations,
   getLabeledPapers,
   getStats,
   type DashboardStats,
@@ -42,10 +39,7 @@ import {
   recordPaperAction,
   removePaperAction,
   listPaperNotes,
-  createPaperNote,
-  updatePaperNote,
-  deletePaperNote,
-  getPaperNotesExportUrl
+  createPaperNote
 } from '@/api/papers'
 import { useUserContext } from '@/composables/useUserContext'
 import {
@@ -60,7 +54,6 @@ export const usePaperStore = defineStore('paper', () => {
   const totalPapers = ref(0)
   const currentPaper = ref<Paper | null>(null)
   const recommendations = ref<RecommendedPaper[]>([])
-  const totalRecommendations = ref(0)
   const labeledPapers = ref<LabeledPaper[]>([])
   const totalLabeledPapers = ref(0)
   const stats = ref<DashboardStats>({
@@ -82,21 +75,18 @@ export const usePaperStore = defineStore('paper', () => {
   const latestProfileBuildJob = ref<UserProfileBuildJob | null>(null)
   const researchProfile = ref<UserResearchProfile | null>(null)
   const paperActionMap = ref<UserPaperActionMap>({})
-  const paperNotes = ref<PaperNote[]>([])
   const arxivSearchCapability = ref<NormalizedArxivQueryCapability | null>(null)
   const arxivSearchError = ref<string | null>(null)
 
   function resetUserScopedState() {
-    // userId 切换后清理本地用户态缓存，避免偏好、画像、笔记和推荐结果短暂串到新用户视图。
+    // userId 切换后清理本地用户态缓存，避免偏好、画像和推荐结果短暂串到新用户视图。
     recommendations.value = []
-    totalRecommendations.value = 0
     labeledPapers.value = []
     totalLabeledPapers.value = 0
     researchProfile.value = null
     researchProfileDetail.value = null
     latestProfileBuildJob.value = null
     paperActionMap.value = {}
-    paperNotes.value = []
     lastInterestVector.value = null
     arxivSearchCapability.value = null
     arxivSearchError.value = null
@@ -179,23 +169,6 @@ export const usePaperStore = defineStore('paper', () => {
     }
   }
 
-  async function fetchPapers(params: {
-    keyword?: string
-    category?: string
-    page: number
-    pageSize: number
-    sortBy?: string
-  }) {
-    loading.value = true
-    try {
-      const result = await searchPapers(params)
-      papers.value = result.items
-      totalPapers.value = result.total
-    } finally {
-      loading.value = false
-    }
-  }
-
   async function fetchPaperById(id: string) {
     loading.value = true
     try {
@@ -204,22 +177,6 @@ export const usePaperStore = defineStore('paper', () => {
         currentPaper.value.paperActions = buildPaperActions(currentPaper.value.arxivId || currentPaper.value.id)
       }
       return currentPaper.value
-    } finally {
-      loading.value = false
-    }
-  }
-
-  async function fetchRecommendations(params: { page: number; pageSize: number }) {
-    loading.value = true
-    try {
-      const result = await getRecommendations(params)
-      recommendations.value = result.items.map((p: any) => ({
-        ...p,
-        summary: p.summary || '',
-        label: p.label || null
-      }))
-      applyPaperActions(recommendations.value)
-      totalRecommendations.value = result.total
     } finally {
       loading.value = false
     }
@@ -434,7 +391,6 @@ export const usePaperStore = defineStore('paper', () => {
           label: null
         }))
         applyPaperActions(recommendations.value)
-        totalRecommendations.value = result.total_found
       }
       return result
     } finally {
@@ -444,7 +400,6 @@ export const usePaperStore = defineStore('paper', () => {
 
   async function fetchPaperNotes(arxivId: string, noteType?: PaperNoteType) {
     const result = await listPaperNotes(arxivId, noteType ? { note_type: noteType } : {})
-    paperNotes.value = result.items
     return result.items
   }
 
@@ -463,51 +418,14 @@ export const usePaperStore = defineStore('paper', () => {
     }
   ) {
     const result = await createPaperNote(arxivId, payload)
-    if (result.item) {
-      const next = [result.item, ...paperNotes.value.filter(item => item.note_id !== result.item?.note_id)]
-      paperNotes.value = next
-    }
     return result.item
-  }
-
-  async function editPaperNote(
-    arxivId: string,
-    noteId: string,
-    payload: {
-      title?: string
-      content?: string
-      note_type?: PaperNoteType
-      source_chunk_ids?: string[]
-      tags?: string[]
-      include_in_profile?: boolean
-    }
-  ) {
-    const result = await updatePaperNote(arxivId, noteId, payload)
-    if (result.item) {
-      paperNotes.value = paperNotes.value.map(item => item.note_id === noteId ? result.item as PaperNote : item)
-    }
-    return result.item
-  }
-
-  async function removeExistingPaperNote(arxivId: string, noteId: string) {
-    const result = await deletePaperNote(arxivId, noteId)
-    if (result.deleted) {
-      paperNotes.value = paperNotes.value.filter(item => item.note_id !== noteId)
-    }
-    return result.deleted
-  }
-
-  function getPaperNotesExportLink(arxivId: string) {
-    return getPaperNotesExportUrl(arxivId)
   }
 
   return {
     papers,
-    allPapers,
     totalPapers,
     currentPaper,
     recommendations,
-    totalRecommendations,
     labeledPapers,
     totalLabeledPapers,
     stats,
@@ -517,14 +435,10 @@ export const usePaperStore = defineStore('paper', () => {
     researchProfile,
     researchProfileDetail,
     latestProfileBuildJob,
-    paperActionMap,
-    paperNotes,
     arxivSearchCapability,
     arxivSearchError,
     recommendationsGenerating,
-    fetchPapers,
     fetchPaperById,
-    fetchRecommendations,
     fetchLabeledPapers,
     updateLabel,
     fetchStats,
@@ -542,9 +456,6 @@ export const usePaperStore = defineStore('paper', () => {
     togglePaperAction,
     fetchPaperNotes,
     savePaperNote,
-    editPaperNote,
-    removeExistingPaperNote,
-    getPaperNotesExportLink,
     generateRecommendations
   }
 })
