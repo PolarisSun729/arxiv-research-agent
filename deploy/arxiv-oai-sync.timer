@@ -1,11 +1,23 @@
+# 每日定时触发 arxiv-oai-sync.service 的 systemd 定时器。
+#
+# 安装与启用：
+#   sudo install -o root -g root -m 644 deploy/arxiv-oai-sync.timer /etc/systemd/system/arxiv-oai-sync.timer
+#   sudo systemctl daemon-reload && sudo systemctl enable --now arxiv-oai-sync.timer
+# 查看下次触发时间：systemctl list-timers arxiv-oai-sync.timer
+
 [Unit]
 Description=Daily arXiv OAI incremental synchronization
 
 [Timer]
+# 每天 03:30（服务器本地时区）触发。
 OnCalendar=*-*-* 03:30:00
+# 如果服务器在计划时间处于关机状态，开机后立即补跑一次错过的任务。
 Persistent=true
+# 在计划时间基础上随机延迟 0~15 分钟，避免整点集中请求 arXiv 服务。
 RandomizedDelaySec=15m
+# 要触发的服务单元。
 Unit=arxiv-oai-sync.service
 
 [Install]
+# enable 后挂到 timers.target，随系统启动自动开始计时。
 WantedBy=timers.target
