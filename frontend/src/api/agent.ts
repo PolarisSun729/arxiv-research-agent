@@ -2,7 +2,6 @@ import request from './request'
 import { apiFetch } from './auth'
 import { ApiError, normalizeApiError, parseFetchErrorResponse } from './errors'
 import type {
-  AgentGraphResponse,
   AgentResumeRun,
   AgentStreamEvent,
   AgentWorkContinuation,
@@ -61,10 +60,6 @@ function withResolvedUserId(payload: ArxivSearchRequest): ArxivSearchRequest {
 
 export async function runAgentChat(payload: ArxivSearchRequest): Promise<ArxivSearchResponse> {
   return request.post('/agent/chat', withResolvedUserId(payload))
-}
-
-export async function fetchAgentGraph(): Promise<AgentGraphResponse> {
-  return request.get('/agent/graph')
 }
 
 export async function streamAgentChat(

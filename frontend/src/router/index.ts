@@ -58,11 +58,6 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/AdminUsers.vue')
   },
   {
-    path: '/agent-graph',
-    name: 'AgentGraph',
-    redirect: '/'
-  },
-  {
     path: '/labeled',
     name: 'LabeledPapers',
     component: () => import('@/views/LabeledPapers.vue')

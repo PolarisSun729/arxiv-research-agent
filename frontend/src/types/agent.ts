@@ -180,14 +180,6 @@ export interface ArxivSearchResponse {
   streaming_state?: AgentStreamingState | null
 }
 
-export interface AgentGraphResponse {
-  graph_name: string
-  render_source: string
-  node_names: string[]
-  mermaid: string
-  supports_png: boolean
-}
-
 export interface AgentIndexJobSnapshot {
   status: string | null
   current_stage: string | null
