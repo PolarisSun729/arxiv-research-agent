@@ -770,6 +770,9 @@ GENERATION_CONFIG: Dict[str, Any] = {
     "openai_chat_max_tokens": _env_int("OPENAI_CHAT_MAX_TOKENS", 512),
     "rewrite_query_max_queries_default": _env_int("REWRITE_QUERY_MAX_QUERIES_DEFAULT", 3),
     "plan_query_max_queries_default": _env_int("PLAN_QUERY_MAX_QUERIES_DEFAULT", 5),
+    # 每次生成的完整上下文与回答落盘到 05-generation-results，仅供调试复盘；
+    # 文件含用户问题和回答原文且没有清理机制，默认关闭，排查时再临时打开。
+    "save_generation_results": _env_bool("SAVE_GENERATION_RESULTS", False),
     # 任务到模型角色的路由表只保留在配置层，业务代码只负责读取，不再硬编码模型名。
     "task_model_roles": {
         "intent_recognition": "small",  # 解析用户原始输入以识别高层意图

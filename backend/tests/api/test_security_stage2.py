@@ -18,7 +18,10 @@ from fastapi import Depends
 from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 
+from auth import key_config
 from auth.api_key_middleware import ApiKeySettings
+from auth.charging import charge
+from auth.permissions import ALL_ROLES, AccessPolicy, ROUTE_POLICIES
 from middleware.audit_log import AuditLogMiddleware, AuditSink
 from middleware.ip_filter import IPFilterSettings
 from middleware.rate_limit import RateLimitController, RateLimitSettings
@@ -27,10 +30,14 @@ from utils.secret_redaction import redact_sensitive_value
 
 KEY_A = "stage2-shared-prefix-" + "a" * 40
 KEY_B = "stage2-shared-prefix-" + "b" * 40
+# 权限清单里带配额的真实路由；控制器级测试用它模拟付费请求。
+PAID_SCOPE = {"method": "POST", "security_route": "/api/arxiv/search"}
 
 
 @pytest.fixture
 def app_factory(monkeypatch, tmp_path):
+    # 探针路由：/api/security-paid 由权限清单标记为付费，/api/security-charge 在业务内部按需扣费。
+    monkeypatch.setitem(ROUTE_POLICIES, ("GET", "/api/security-paid"), AccessPolicy(ALL_ROLES, "papers"))
     settings = {
         "AUTH_MODE": "api_key",
         "BACKEND_API_KEYS": f"{KEY_A},{KEY_B}", "API_KEY_CONFIG_FILE": "", "ALLOWED_ORIGINS": "https://research.example",
@@ -55,6 +62,16 @@ def app_factory(monkeypatch, tmp_path):
 
         @app.post("/api/security-probe", dependencies=[Depends(costly_dependency)])
         async def probe(body: dict):
+            return {"ok": True}
+
+        @app.get("/api/security-paid")
+        async def paid():
+            return {"ok": True}
+
+        @app.get("/api/security-charge")
+        async def charged(paid: bool = False):
+            if paid:
+                await charge("papers")
             return {"ok": True}
 
         @app.get("/api/security-failure")
@@ -229,15 +246,18 @@ def test_daily_quota_is_atomic_and_resets_on_utc_day(app_factory, monkeypatch, t
     app = app_factory()
     http = client(app)
     for _ in range(3):
-        assert http.get("/api/auth/check").status_code == 200
-    exhausted = http.get("/api/auth/check")
+        assert http.get("/api/security-paid").status_code == 200
+    exhausted = http.get("/api/security-paid")
     assert exhausted.status_code == 429
     assert exhausted.json()["code"] == "daily_quota_exceeded"
     assert 0 < exhausted.json()["retry_after"] <= 86400
+    # 免费请求不受已耗尽的日配额影响，仍回显剩余额度。
+    free = http.get("/api/auth/check")
+    assert free.status_code == 200 and free.headers["X-DailyQuota-Remaining"] == "0"
     controller = app.state.rate_limit_controller
     now = controller.clock()
     controller.clock = lambda: now + 86400
-    assert http.get("/api/auth/check").status_code == 200
+    assert http.get("/api/security-paid").status_code == 200
 
 
 def test_concurrent_requests_do_not_overspend_daily_quota(app_factory, monkeypatch, tmp_path):
@@ -246,7 +266,7 @@ def test_concurrent_requests_do_not_overspend_daily_quota(app_factory, monkeypat
     controller = app.state.rate_limit_controller
     policy = app.state.api_key_settings.match(KEY_A)
     with ThreadPoolExecutor(max_workers=12) as pool:
-        results = list(pool.map(lambda _: controller.after_auth(policy, {"method": "GET", "security_route": "/api/auth/check"}), range(40)))
+        results = list(pool.map(lambda _: controller.after_auth(policy, PAID_SCOPE), range(40)))
     assert sum(result.code is None for result in results) == 7
 
 
@@ -260,9 +280,8 @@ def test_redis_shares_key_quota_and_abuse_blocks_across_controllers(app_factory,
     first = RateLimitController(settings, storage_options={"connection_pool": pool})
     second = RateLimitController(settings, storage_options={"connection_pool": pool})
     policy = ApiKeySettings.from_environment().match(KEY_A)
-    scope = {"method": "GET", "security_route": "/api/auth/check"}
-    assert first.after_auth(policy, scope).code is None
-    assert second.after_auth(policy, scope).code == "daily_quota_exceeded"
+    assert first.after_auth(policy, PAID_SCOPE).code is None
+    assert second.after_auth(policy, PAID_SCOPE).code == "daily_quota_exceeded"
     first.observe_rejection("198.51.100.10", "invalid_api_key")
     first.observe_rejection("198.51.100.10", "invalid_api_key")
     assert second.before_auth("198.51.100.10").code == "ip_temporarily_blocked"
@@ -342,7 +361,9 @@ def test_invalid_trusted_proxy_scheme_is_rejected(app_factory, values):
 
 @pytest.mark.parametrize("cause", ["auth", "rate"])
 def test_abnormal_requests_temporarily_block_only_the_source_ip(app_factory, cause):
-    app = app_factory(AUTH_FAILURE_LIMIT="1/minute", RATE_LIMIT_VIOLATION_LIMIT="1/minute", RATE_LIMIT_KEY="1/minute")
+    # 认证失败和认证前的 IP 洪水才计入来源违规；IP 预算按来源统计，另一个 IP 不受影响。
+    app = app_factory(AUTH_FAILURE_LIMIT="1/minute", RATE_LIMIT_VIOLATION_LIMIT="1/minute",
+                      **({} if cause == "auth" else {"RATE_LIMIT_IP": "1/minute"}))
     http = client(app, key=None if cause == "auth" else KEY_A)
     count = 2 if cause == "auth" else 3
     for _ in range(count):
@@ -511,3 +532,121 @@ def test_file_only_keys_are_redacted_in_json(app_factory, monkeypatch, tmp_path)
     write_keys(tmp_path, monkeypatch, [{"key": secret}])
     app_factory()
     assert redact_sensitive_value({"diagnostic": secret})["diagnostic"] == "***REDACTED***"
+
+
+@pytest.mark.parametrize("record,field", [({"enable": False}, "enable"), ({"daily_qouta": 3}, "daily_qouta")])
+def test_misspelled_key_fields_fail_startup_instead_of_loosening_policy(app_factory, monkeypatch, tmp_path, record, field):
+    write_keys(tmp_path, monkeypatch, [{"key": KEY_A, **record}])
+    with pytest.raises(RuntimeError, match=field) as error:
+        app_factory()
+    assert KEY_A not in str(error.value)
+
+
+def test_unknown_top_level_and_overlong_field_names_are_reported_without_values(app_factory, monkeypatch, tmp_path):
+    path = tmp_path / "top-level.json"
+    path.write_text(json.dumps({"keys": [{"key": KEY_A}], "default_quota": 3}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="default_quota"):
+        app_factory(API_KEY_CONFIG_FILE=path)
+    # 误把密钥粘贴成字段名时，报错只提示存在过长字段，不回显内容。
+    write_keys(tmp_path, monkeypatch, [{"key": KEY_A, KEY_B: True}])
+    with pytest.raises(RuntimeError) as error:
+        app_factory()
+    assert KEY_A not in str(error.value) and KEY_B not in str(error.value)
+
+
+def test_date_only_expiry_keeps_key_valid_for_the_whole_utc_day(app_factory, monkeypatch, tmp_path):
+    assert key_config._parse_date("2030-01-01", end_of_day=True) == datetime(2030, 1, 2, tzinfo=timezone.utc)
+    assert key_config._parse_date("2030-01-01") == datetime(2030, 1, 1, tzinfo=timezone.utc)
+    assert key_config._parse_date("2030-01-01T12:00:00", end_of_day=True) == datetime(2030, 1, 1, 12, tzinfo=timezone.utc)
+    today = datetime.now(timezone.utc).date()
+    write_keys(tmp_path, monkeypatch, [{"key": KEY_A, "expires_at": today.isoformat()}])
+    app = app_factory()
+    assert client(app).get("/api/auth/check").status_code == 200
+    next_day = datetime.combine(today + timedelta(days=1), datetime.min.time(), timezone.utc)
+    monkeypatch.setattr(key_config, "datetime", SimpleNamespace(now=lambda _tz: next_day))
+    assert client(app).get("/api/auth/check").json()["code"] == "api_key_expired"
+
+
+@pytest.mark.parametrize("env_name", ["TEAM_ACCESS_KEY", "1BAD_NAME"])
+def test_key_env_errors_name_the_variable_without_values(app_factory, monkeypatch, tmp_path, env_name):
+    monkeypatch.delenv("TEAM_ACCESS_KEY", raising=False)
+    write_keys(tmp_path, monkeypatch, [{"key_env": env_name}])
+    with pytest.raises(RuntimeError) as error:
+        app_factory()
+    message = str(error.value)
+    assert ("TEAM_ACCESS_KEY" in message) if env_name == "TEAM_ACCESS_KEY" else ("合法的环境变量名" in message)
+    assert KEY_A not in message
+
+
+@pytest.mark.parametrize("source", ["environment", "file"])
+@pytest.mark.parametrize("name", ["OPENAI_API_KEY", "ALIYUN_API_KEY", "STORAGE_ACCESS_KEY"])
+def test_access_keys_cannot_reuse_external_secrets(app_factory, monkeypatch, tmp_path, source, name):
+    monkeypatch.setenv(name, KEY_A)
+    if source == "file":
+        write_keys(tmp_path, monkeypatch, [{"key": KEY_A}])
+    with pytest.raises(RuntimeError, match=name) as error:
+        app_factory()
+    assert KEY_A not in str(error.value)
+
+
+def test_api_key_mode_bounds_request_body_before_business(app_factory):
+    app = app_factory(AUTH_MAX_REQUEST_BYTES="64")
+    http = client(app)
+    assert http.post("/api/security-probe", json={"note": "x" * 16}).status_code == 200
+    app.state.probe_calls.clear()
+    response = http.post("/api/security-probe", json={"note": "x" * 200})
+    assert response.status_code == 413 and response.json()["code"] == "request_too_large"
+    assert app.state.probe_calls == []
+
+
+def test_authenticated_rate_limit_does_not_block_the_shared_ip(app_factory):
+    app = app_factory(RATE_LIMIT_KEY="1/minute", RATE_LIMIT_VIOLATION_LIMIT="1/minute")
+    http = client(app)
+    assert http.get("/api/auth/check").status_code == 200
+    for _ in range(4):
+        assert http.get("/api/auth/check").json()["code"] == "rate_limit_exceeded"
+    # 同一出口 IP 下的其他密钥不受某个密钥自身超限的牵连。
+    assert client(app, key=KEY_B).get("/api/auth/check").status_code == 200
+
+
+def test_free_requests_do_not_consume_daily_quota(app_factory, monkeypatch, tmp_path):
+    write_keys(tmp_path, monkeypatch, [{"key": KEY_A, "daily_quota": 1}])
+    http = client(app_factory())
+    for path in ("/api/auth/check", "/api/security-charge", "/api/auth/check"):
+        response = http.get(path)
+        assert response.status_code == 200 and response.headers["X-DailyQuota-Remaining"] == "1"
+    assert http.get("/api/security-charge", params={"paid": "true"}).status_code == 200
+    denied = http.get("/api/security-charge", params={"paid": "true"})
+    assert denied.status_code == 429 and denied.json()["code"] == "daily_quota_exceeded"
+    assert int(denied.headers["Retry-After"]) > 0
+    assert http.get("/api/auth/check").status_code == 200
+
+
+def test_paper_detail_charges_only_when_backfilling_from_arxiv(app_factory, monkeypatch, tmp_path):
+    # 按路由模块持有的依赖对象覆盖；其他测试可能替换 dependencies 模块属性，不能以它为准。
+    import routers.paper_router as paper_router
+    write_keys(tmp_path, monkeypatch, [{"key": KEY_A, "daily_quota": 1}])
+    app = app_factory()
+    local = {"p-local": {"arxiv_id": "p-local", "title": "Local", "abstract": "Stored"},
+             "p-partial": {"arxiv_id": "p-partial", "title": "", "abstract": ""}}
+    fetched = []
+
+    def fetch(arxiv_id):
+        fetched.append(arxiv_id)
+        return {"arxiv_id": arxiv_id, "title": "Remote", "abstract": "Fetched"}
+
+    app.dependency_overrides[paper_router.get_paper_catalog_store] = lambda: SimpleNamespace(get_paper=local.get)
+    app.dependency_overrides[paper_router.get_recommendation_service] = lambda: SimpleNamespace(
+        _fetch_paper_from_arxiv_with_rate_limit=fetch, _ensure_paper_materialized=lambda arxiv_id, paper_payload: paper_payload,
+    )
+    http = client(app)
+    for _ in range(3):
+        assert http.get("/api/paper/p-local").json()["title"] == "Local"
+    assert fetched == []
+    assert http.get("/api/paper/p-remote").json()["title"] == "Remote"
+    assert fetched == ["p-remote"]
+    # 额度用尽后不再回源：缺字段的本地记录原样返回，本地完全没有的论文返回日配额错误。
+    assert http.get("/api/paper/p-partial").json() == local["p-partial"]
+    denied = http.get("/api/paper/p-missing")
+    assert denied.status_code == 429 and denied.json()["code"] == "daily_quota_exceeded"
+    assert fetched == ["p-remote"]

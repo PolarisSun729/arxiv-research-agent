@@ -23,6 +23,19 @@ class ErrorCode:
     IP_TEMPORARILY_BLOCKED = "ip_temporarily_blocked"
     SECURITY_STORAGE_UNAVAILABLE = "security_storage_unavailable"
     REQUEST_VALIDATION_ERROR = "request_validation_error"
+    REQUEST_TOO_LARGE = "request_too_large"
+    REQUEST_TIMEOUT = "request_timeout"
+    MISSING_TOKEN = "missing_token"
+    INVALID_TOKEN = "invalid_token"
+    INVALID_CREDENTIALS = "invalid_credentials"
+    INSUFFICIENT_PERMISSIONS = "insufficient_permissions"
+    IDENTITY_MISMATCH = "identity_mismatch"
+    REGISTRATION_DISABLED = "registration_disabled"
+    ACCOUNT_CONFLICT = "account_conflict"
+    USER_NOT_FOUND = "user_not_found"
+    PRIVATE_RESOURCE_NOT_FOUND = "private_resource_not_found"
+    LAST_ADMIN_REQUIRED = "last_admin_required"
+    QUOTA_EXCEEDED = "quota_exceeded"
     PAPER_NOT_FOUND = "paper_not_found"
     QA_INDEX_NOT_FOUND = "qa_index_not_found"
     QA_INDEX_BUILD_FAILED = "qa_index_build_failed"
@@ -46,6 +59,19 @@ ERROR_MESSAGES: Dict[str, str] = {
     ErrorCode.IP_TEMPORARILY_BLOCKED: "检测到过多失败或超限请求，当前 IP 已被临时封禁。",
     ErrorCode.SECURITY_STORAGE_UNAVAILABLE: "访问控制服务暂时不可用，请稍后重试。",
     ErrorCode.REQUEST_VALIDATION_ERROR: "请求参数不合法，请检查后重试。",
+    ErrorCode.REQUEST_TOO_LARGE: "请求体超过允许的大小。",
+    ErrorCode.REQUEST_TIMEOUT: "读取请求超时，请重试。",
+    ErrorCode.MISSING_TOKEN: "请先登录。",
+    ErrorCode.INVALID_TOKEN: "登录已失效，请重新登录。",
+    ErrorCode.INVALID_CREDENTIALS: "用户名或密码错误，或账号已停用。",
+    ErrorCode.INSUFFICIENT_PERMISSIONS: "当前账号没有执行此操作的权限。",
+    ErrorCode.IDENTITY_MISMATCH: "只能访问当前登录账号的数据。",
+    ErrorCode.REGISTRATION_DISABLED: "当前服务未开放注册，请联系管理员创建账号。",
+    ErrorCode.ACCOUNT_CONFLICT: "无法创建账号，请检查用户名和邮箱是否已被使用。",
+    ErrorCode.USER_NOT_FOUND: "账号不存在。",
+    ErrorCode.PRIVATE_RESOURCE_NOT_FOUND: "请求的个人资源不存在。",
+    ErrorCode.LAST_ADMIN_REQUIRED: "必须保留至少一个启用的管理员账号。",
+    ErrorCode.QUOTA_EXCEEDED: "今日配额已用完，请在重置后重试。",
     ErrorCode.PAPER_NOT_FOUND: "未找到对应论文，请确认论文 ID 是否正确。",
     ErrorCode.QA_INDEX_NOT_FOUND: "这篇论文还没有 QA 索引，请先构建索引。",
     ErrorCode.QA_INDEX_BUILD_FAILED: "论文 QA 索引构建失败，可以稍后重新构建。",
@@ -69,6 +95,19 @@ ERROR_HTTP_STATUS: Dict[str, int] = {
     ErrorCode.IP_TEMPORARILY_BLOCKED: 403,
     ErrorCode.SECURITY_STORAGE_UNAVAILABLE: 503,
     ErrorCode.REQUEST_VALIDATION_ERROR: 422,
+    ErrorCode.REQUEST_TOO_LARGE: 413,
+    ErrorCode.REQUEST_TIMEOUT: 408,
+    ErrorCode.MISSING_TOKEN: 401,
+    ErrorCode.INVALID_TOKEN: 401,
+    ErrorCode.INVALID_CREDENTIALS: 401,
+    ErrorCode.INSUFFICIENT_PERMISSIONS: 403,
+    ErrorCode.IDENTITY_MISMATCH: 403,
+    ErrorCode.REGISTRATION_DISABLED: 403,
+    ErrorCode.ACCOUNT_CONFLICT: 409,
+    ErrorCode.USER_NOT_FOUND: 404,
+    ErrorCode.PRIVATE_RESOURCE_NOT_FOUND: 404,
+    ErrorCode.LAST_ADMIN_REQUIRED: 409,
+    ErrorCode.QUOTA_EXCEEDED: 429,
     ErrorCode.PAPER_NOT_FOUND: 404,
     ErrorCode.QA_INDEX_NOT_FOUND: 404,
     ErrorCode.QA_INDEX_BUILD_FAILED: 500,
@@ -88,6 +127,17 @@ RECOVERABLE_DEFAULTS: Dict[str, bool] = {
     ErrorCode.IP_BLOCKED: False,
     ErrorCode.IP_NOT_ALLOWED: False,
     ErrorCode.REQUEST_VALIDATION_ERROR: True,
+    ErrorCode.REQUEST_TOO_LARGE: False,
+    ErrorCode.MISSING_TOKEN: False,
+    ErrorCode.INVALID_TOKEN: False,
+    ErrorCode.INVALID_CREDENTIALS: False,
+    ErrorCode.INSUFFICIENT_PERMISSIONS: False,
+    ErrorCode.IDENTITY_MISMATCH: False,
+    ErrorCode.REGISTRATION_DISABLED: False,
+    ErrorCode.ACCOUNT_CONFLICT: False,
+    ErrorCode.USER_NOT_FOUND: False,
+    ErrorCode.PRIVATE_RESOURCE_NOT_FOUND: False,
+    ErrorCode.LAST_ADMIN_REQUIRED: False,
     ErrorCode.PAPER_NOT_FOUND: False,
     ErrorCode.QA_INDEX_NOT_FOUND: True,
     ErrorCode.QA_INDEX_BUILD_FAILED: True,
@@ -98,6 +148,19 @@ RECOVERABLE_DEFAULTS: Dict[str, bool] = {
     ErrorCode.DATABASE_WRITE_FAILED: True,
     ErrorCode.UNKNOWN_ERROR: True,
 }
+
+# 凭据本身无效的拒绝才计入 IP 违规；已认证身份的超限只限流该身份，不能连坐同一出口 IP。
+AUTHENTICATION_FAILURE_CODES = frozenset(
+    {
+        ErrorCode.MISSING_API_KEY,
+        ErrorCode.INVALID_API_KEY,
+        ErrorCode.API_KEY_DISABLED,
+        ErrorCode.API_KEY_EXPIRED,
+        ErrorCode.MISSING_TOKEN,
+        ErrorCode.INVALID_TOKEN,
+        ErrorCode.INVALID_CREDENTIALS,
+    }
+)
 
 
 def sanitize_detail(detail: Any, *, max_length: int = 500) -> Optional[str]:

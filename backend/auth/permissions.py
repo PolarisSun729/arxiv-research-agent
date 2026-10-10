@@ -1,4 +1,8 @@
-"""真实路由与工具的权限清单；新接口默认拒绝，评审后才能加入对应权限组。"""
+"""真实路由与工具的权限清单；新接口默认拒绝，评审后才能加入对应权限组。
+
+quota 标记的是会产生外部成本（LLM、embedding、arXiv 回源）的操作：账号模式扣对应类型的配额，
+密钥模式计入该密钥的 daily_quota。纯本地读取不标记配额，只受入口速率限制。
+"""
 
 from dataclasses import dataclass
 
@@ -45,10 +49,12 @@ _register(ALL_ROLES, None, [
     ("GET", "/api/paper/{arxiv_id}/notes"), ("POST", "/api/paper/{arxiv_id}/notes"),
     ("PATCH", "/api/paper/{arxiv_id}/notes/{note_id}"), ("DELETE", "/api/paper/{arxiv_id}/notes/{note_id}"),
     ("GET", "/api/paper/{arxiv_id}/notes/export"),
+    # 本地目录读取不产生外部成本；论文详情只在回源 arXiv 时由路由内部扣减 papers 配额。
+    ("GET", "/api/papers"), ("GET", "/api/papers/category/{category}"), ("GET", "/api/paper/{arxiv_id}"),
+    ("GET", "/api/user/labeled-papers/{user_id}"),
 ])
 _register(ALL_ROLES, "papers", [
-    ("POST", "/api/arxiv/search"), ("GET", "/api/papers"), ("GET", "/api/papers/category/{category}"),
-    ("GET", "/api/paper/{arxiv_id}"), ("POST", "/api/user/like-paper"), ("POST", "/api/user/dislike-paper"),
+    ("POST", "/api/arxiv/search"), ("POST", "/api/user/like-paper"), ("POST", "/api/user/dislike-paper"),
     ("POST", "/api/user/paper-action"), ("POST", "/api/user/recommend-papers"),
 ])
 _register(ALL_ROLES, "qa_queries", [("POST", "/api/paper/{arxiv_id}/qa"), ("POST", "/api/paper/{arxiv_id}/qa/stream")])

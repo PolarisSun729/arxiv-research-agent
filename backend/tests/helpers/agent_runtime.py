@@ -6,6 +6,8 @@ import types
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
+from tests.helpers.module_isolation import isolated_project_modules
+
 
 class _DependencyBag:
     def __init__(self) -> None:
@@ -16,21 +18,6 @@ class _DependencyBag:
 
 
 DEPENDENCY_BAG = _DependencyBag()
-
-PUBLIC_STUB_MODULES = [
-    "dependencies",
-    # LangGraph 桩仅供 Agent 编排单测使用，不能污染后续真实研究图的 values 流契约。
-    "langgraph",
-    "langgraph.graph",
-    "langgraph.types",
-    "langgraph.checkpoint",
-    "langgraph.checkpoint.memory",
-    "services.memory",
-    "tools.arxiv_tools",
-    "tools.paper_qa_tools",
-    "tools.recommendation_tools",
-]
-
 
 class FakeMemoryService:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -538,18 +525,14 @@ def _load_module(module_name: str, file_path: Path):
     return module
 
 
-def _restore_public_stub_modules(saved_modules: Dict[str, Any]) -> None:
-    # Agent 测试桩只服务当前加载过程；恢复公共模块可避免 pytest 混跑时污染后续 service/router 测试。
-    for module_name in PUBLIC_STUB_MODULES:
-        original = saved_modules.get(module_name)
-        if original is None:
-            sys.modules.pop(module_name, None)
-        else:
-            sys.modules[module_name] = original
-
-
 def load_agent_test_modules() -> Dict[str, Any]:
-    saved_public_modules = {module_name: sys.modules.get(module_name) for module_name in PUBLIC_STUB_MODULES}
+    # Agent 测试桩只服务当前加载过程；dependencies、tools.*、LangGraph 等公共模块加载后全部恢复，
+    # 避免 pytest 混跑时污染后续 service/router 测试和真实研究图的 values 流契约。
+    with isolated_project_modules():
+        return _load_agent_test_modules()
+
+
+def _load_agent_test_modules() -> Dict[str, Any]:
     # 测试进程里可能已经残留过上一轮导入的同名模块；先清理再按当前源码重建，
     # 可以避免拿到旧版对象而出现“属性存在但实际实现已变”的隐蔽问题。
     for module_name in [
@@ -667,7 +650,6 @@ def load_agent_test_modules() -> Dict[str, Any]:
         "tool_node_module": sys.modules["backend.agents.arxiv_search_agent.node.tool_node"],
         "tool_registry_module": sys.modules["tools.tool_registry"],
     }
-    _restore_public_stub_modules(saved_public_modules)
     return modules
 
 

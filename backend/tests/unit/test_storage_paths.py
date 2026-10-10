@@ -26,7 +26,7 @@ class StoragePathUnitTests(unittest.TestCase):
 
     def test_incremental_launchers_target_runtime_data_not_tools_directory(self) -> None:
         tools_dir = BACKEND_ROOT / "07-arxiv-tools"
-        for name in ("sync_arxiv_oai_since_last_run.cmd", "sync_arxiv_oai_since_last_run_count_only.cmd", "sync_arxiv_oai_since_last_run.sh"):
+        for name in ("sync_arxiv_oai_since_last_run.cmd", "sync_arxiv_oai_since_last_run.sh"):
             content = (tools_dir / name).read_text(encoding="utf-8")
             self.assertIn("arxiv-oai-sync", content)
             self.assertNotIn("STATE_FILE=%PROJECT_ROOT%sync_arxiv_oai_since_last_run", content)

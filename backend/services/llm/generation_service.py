@@ -78,10 +78,11 @@ class GenerationService:
         }
         
         # 生成结果是后端运行产物；路径固定到 backend 下，避免工作目录不同导致写入根目录。
+        # 目录在首次落盘时才创建，开关关闭时不产生空目录。
         self.generation_results_dir = resolve_backend_artifact_path(
             "05-generation-results",
         )
-        os.makedirs(self.generation_results_dir, exist_ok=True)
+        self.save_generation_results = bool(GENERATION_CONFIG["save_generation_results"])
 
     def _normalize_task_type(self, task_type: Optional[str]) -> str:
         # 任务类型只作为路由提示使用，统一做一次清洗，避免空字符串污染日志和配置查询。
@@ -1278,35 +1279,39 @@ class GenerationService:
             else:
                 raise ValueError(f"Unsupported provider: {provider}")
                 
-            # 准备保存结果
-            result = {
-                "query": query,
-                "timestamp": datetime.now().isoformat(),
-                "provider": provider,
-                "model": model_name,
-                "task_type": model_selection.get("task_type", "default"),
-                "selected_model": model_selection.get("selected_model", model_name or ""),
-                "model_role": model_selection.get("model_role", ""),
-                "routing_source": model_selection.get("routing_source", ""),
-                "fallback_reason": model_selection.get("fallback_reason", ""),
-                "response": response,
-                "context": search_results,
-                "image_inputs": image_inputs or [],
-                "asset_metadata": asset_metadata or [],
-                "qwen_request_debug": qwen_request_debug,
-            }
-            
-            # 生成文件名并保存
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            filename = f"generation_{provider}_{model_name or 'auto'}_{timestamp}.json"
-            filepath = self.generation_results_dir / filename
-            
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
-                
+            # 落盘只服务调试复盘，开关关闭时不写文件，saved_filepath 返回 None。
+            saved_filepath: Optional[str] = None
+            if self.save_generation_results:
+                result = {
+                    "query": query,
+                    "timestamp": datetime.now().isoformat(),
+                    "provider": provider,
+                    "model": model_name,
+                    "task_type": model_selection.get("task_type", "default"),
+                    "selected_model": model_selection.get("selected_model", model_name or ""),
+                    "model_role": model_selection.get("model_role", ""),
+                    "routing_source": model_selection.get("routing_source", ""),
+                    "fallback_reason": model_selection.get("fallback_reason", ""),
+                    "response": response,
+                    "context": search_results,
+                    "image_inputs": image_inputs or [],
+                    "asset_metadata": asset_metadata or [],
+                    "qwen_request_debug": qwen_request_debug,
+                }
+
+                # 生成文件名并保存
+                timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                filename = f"generation_{provider}_{model_name or 'auto'}_{timestamp}.json"
+                os.makedirs(self.generation_results_dir, exist_ok=True)
+                filepath = self.generation_results_dir / filename
+
+                with open(filepath, "w", encoding="utf-8") as f:
+                    json.dump(result, f, ensure_ascii=False, indent=2)
+                saved_filepath = str(filepath)
+
             return {
                 "response": response,
-                "saved_filepath": str(filepath),
+                "saved_filepath": saved_filepath,
                 "qwen_request_debug": qwen_request_debug,
             }
             

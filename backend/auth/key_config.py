@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from limits import parse_many
@@ -15,6 +16,22 @@ from utils.secret_redaction import register_sensitive_values
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+_RECORD_FIELDS = frozenset({"key", "key_env", "name", "rate_limit", "daily_quota", "enabled", "created_at", "expires_at"})
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+
+
+def external_secret_values(*, exclude: frozenset[str] | set[str] = frozenset()) -> dict[str, str]:
+    """收集已交给第三方或其他用途的环境变量凭据，返回 值 → 变量名，供各类本地密钥做复用检查。"""
+    excluded = {name.upper() for name in exclude}
+    secrets_by_value = {}
+    for name, raw in os.environ.items():
+        upper = name.upper()
+        if upper in excluded or not upper.endswith(("_API_KEY", "_API_KEYS", "_ACCESS_KEY")):
+            continue
+        for value in raw.split(","):
+            if value.strip():
+                secrets_by_value.setdefault(value.strip(), name)
+    return secrets_by_value
 
 
 def validate_rate(value: str) -> str:
@@ -27,11 +44,12 @@ def validate_rate(value: str) -> str:
     return value
 
 
-def _validate_secret(key: str) -> str:
+def _validate_secret(key: str, external_secrets: dict[str, str]) -> str:
     if not isinstance(key, str) or not 32 <= len(key) <= 256 or any(ord(char) < 33 or ord(char) > 126 for char in key):
         raise RuntimeError("每个访问密钥必须包含 32 至 256 个无空白的可打印 ASCII 字符。")
-    if key == os.getenv("ALIYUN_API_KEY", "").strip():
-        raise RuntimeError("访问密钥必须与 ALIYUN_API_KEY 分开生成，模型供应商密钥不能交给浏览器。")
+    if key in external_secrets:
+        # 只报告变量名，不回显密钥值。
+        raise RuntimeError(f"访问密钥不能与环境变量 {external_secrets[key]} 相同，模型供应商等第三方密钥不能交给浏览器。")
     return key
 
 
@@ -39,20 +57,34 @@ def get_valid_api_keys() -> set[str]:
     keys = {key.strip() for key in os.getenv("BACKEND_API_KEYS", "").split(",") if key.strip()}
     if not keys:
         raise RuntimeError("必须配置 BACKEND_API_KEYS 或 API_KEY_CONFIG_FILE，不能以匿名模式启动。")
-    return {_validate_secret(key) for key in keys}
+    external = external_secret_values(exclude={"BACKEND_API_KEYS"})
+    return {_validate_secret(key, external) for key in keys}
 
 
-def _parse_date(value: object) -> datetime | None:
+def _parse_date(value: object, *, end_of_day: bool = False) -> datetime | None:
     if value is None:
         return None
     try:
-        parsed = datetime.fromisoformat(value) if isinstance(value, str) else None
-        if parsed is None:
+        if not isinstance(value, str):
             raise ValueError
-        # 不带时区的 ISO 时间和日期统一按 UTC 解释，避免服务器时区改变密钥有效期。
+        try:
+            day = date.fromisoformat(value)
+        except ValueError:
+            day = None
+        if day is not None:
+            # 只写日期的失效时间表示当天 UTC 全天有效，次日 00:00 UTC 才失效；生效时间仍取当天 0 点。
+            start = datetime.combine(day, datetime.min.time(), timezone.utc)
+            return start + timedelta(days=1) if end_of_day else start
+        parsed = datetime.fromisoformat(value)
+        # 不带时区的 ISO 时间统一按 UTC 解释，避免服务器时区改变密钥有效期。
         return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
     except ValueError:
         raise RuntimeError("密钥日期必须是合法 ISO 日期或时间，建议明确使用 UTC 时区。") from None
+
+
+def _field_names(names) -> str:
+    # 字段名来自配置文件；过长的名字可能是误粘贴的密钥，只提示存在而不回显。
+    return ", ".join(sorted(name if isinstance(name, str) and len(name) <= 40 else "<过长字段名>" for name in names))
 
 
 @dataclass(frozen=True)
@@ -95,19 +127,32 @@ def load_key_policies() -> tuple[ApiKeyPolicy, ...]:
         records = data.get("keys") if isinstance(data, dict) else None
         if not isinstance(records, list) or not records:
             raise RuntimeError("密钥配置文件必须包含非空 keys 列表。")
+        if set(data) - {"keys"}:
+            raise RuntimeError(f"密钥配置文件顶层只允许 keys，发现未知字段：{_field_names(set(data) - {'keys'})}。")
+
+    for index, record in enumerate(records, start=1):
+        if not isinstance(record, dict):
+            raise RuntimeError("每项密钥配置必须是对象。")
+        unknown = set(record) - _RECORD_FIELDS
+        if unknown:
+            # 拼错的 enabled/daily_quota 会被当成默认值（启用、无限额），必须启动失败而不是静默放宽。
+            raise RuntimeError(f"第 {index} 项密钥配置包含未知字段：{_field_names(unknown)}；允许的字段：{_field_names(_RECORD_FIELDS)}。")
+    # 本文件引用的变量本来就是访问密钥，不参与第三方密钥复用检查；重复密钥由摘要去重拦截。
+    referenced_envs = {record["key_env"] for record in records if isinstance(record.get("key_env"), str)}
+    external = external_secret_values(exclude={"BACKEND_API_KEYS", *referenced_envs})
 
     policies = []
     digests = set()
     for record in records:
-        if not isinstance(record, dict):
-            raise RuntimeError("每项密钥配置必须是对象。")
         # 示例使用环境变量引用；私有文件也兼容 key 字段，但不能同时配置两个来源。
         if "key" in record and "key_env" in record:
             raise RuntimeError("密钥配置只能选择 key 或 key_env 中的一项。")
         env_name = record.get("key_env")
-        if env_name is not None and (not isinstance(env_name, str) or not env_name):
-            raise RuntimeError("key_env 必须是非空环境变量名。")
-        secret = _validate_secret(os.getenv(env_name, "") if env_name else record.get("key"))
+        if env_name is not None and (not isinstance(env_name, str) or not _ENV_NAME.fullmatch(env_name)):
+            raise RuntimeError("key_env 必须是合法的环境变量名（字母、数字和下划线，不能以数字开头）。")
+        if env_name and not os.getenv(env_name, ""):
+            raise RuntimeError(f"key_env 引用的环境变量 {env_name} 未设置或为空。")
+        secret = _validate_secret(os.getenv(env_name, "") if env_name else record.get("key"), external)
         digest = hashlib.sha256(secret.encode("ascii")).digest()
         if digest in digests:
             raise RuntimeError("密钥配置存在重复项，不能为同一密钥设置冲突的策略。")
@@ -120,7 +165,7 @@ def load_key_policies() -> tuple[ApiKeyPolicy, ...]:
             raise RuntimeError("enabled 必须是布尔值，daily_quota 必须是正整数或 null。")
         policies.append(ApiKeyPolicy(
             digest=digest, name=name.strip(), rate_limit=validate_rate(record.get("rate_limit", default_rate)),
-            daily_quota=quota, enabled=enabled, expires_at=_parse_date(record.get("expires_at")),
+            daily_quota=quota, enabled=enabled, expires_at=_parse_date(record.get("expires_at"), end_of_day=True),
             created_at=_parse_date(record.get("created_at")),
         ))
         digests.add(digest)
