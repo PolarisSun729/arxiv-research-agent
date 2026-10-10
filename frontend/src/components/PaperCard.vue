@@ -2,6 +2,8 @@
 import { ref, watch, computed } from 'vue'
 import type { Paper, RecommendedPaper } from '@/types/paper'
 import SimilarityTag from './SimilarityTag.vue'
+import { toPercent } from '@/utils/format'
+import { getLabelClass, getLabelText } from '@/utils/paperLabel'
 
 const props = defineProps<{
   paper: Paper | RecommendedPaper
@@ -171,11 +173,6 @@ const showAgentMetrics = computed(() => {
   return Boolean(hasAgentRerankData.value || agentScoreBreakdown.value)
 })
 
-function toPercent(value?: number) {
-  if (typeof value !== 'number' || Number.isNaN(value)) return 0
-  return Math.max(0, Math.min(100, Math.round(value * 100)))
-}
-
 const authorsDisplay = computed(() => {
   if (Array.isArray(props.paper.authors)) {
     return props.paper.authors.join(', ')
@@ -194,18 +191,6 @@ function handleLabelChange(value: string) {
 
 function formatDate(dateStr: string) {
   return new Date(dateStr).toLocaleDateString('zh-CN')
-}
-
-function getLabelClass(label?: 'liked' | 'disliked' | null) {
-  if (label === 'liked') return 'el-tag--success'
-  if (label === 'disliked') return 'el-tag--danger'
-  return ''
-}
-
-function getLabelText(label?: 'liked' | 'disliked' | null) {
-  if (label === 'liked') return '感兴趣'
-  if (label === 'disliked') return '不感兴趣'
-  return ''
 }
 
 const labelOptions = [

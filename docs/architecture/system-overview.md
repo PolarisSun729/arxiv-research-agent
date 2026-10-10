@@ -11,9 +11,10 @@
 [`backend/main.py`](../../backend/main.py) 的 `create_app()` 是 FastAPI 装配真源：
 
 1. 创建带 lifespan 的应用，在启动时执行上下文生命周期清理；`preload` 模式才主动预热服务。
-2. 注册 `arxiv`、`agent`、`user`、`paper`、`qa` 五个业务 Router，统一挂在 `/api` 下。
+2. 注册 `arxiv`、`agent`、`user`、`paper`、`qa` 五个业务 Router，统一挂在 `/api` 下并附加认证依赖；JWT 模式额外注册 `auth` Router。`/api/auth/check`、`/api/auth/config` 与 `/health` 直接定义在 `create_app()` 中。
 3. 根据 `get_debug_routes_runtime_config()` 决定是否注册 chunk 调试 Router。该 Router 会暴露本地解析产物，只能视为受开关保护的内部能力。
-4. 将 `AppError`、`HTTPException` 和 `RequestValidationError` 收敛成稳定错误响应；Router 不应自行构造与此冲突的错误格式。
+4. 将 `AppError`、`HTTPException` 和 `RequestValidationError` 收敛成稳定错误响应，并由兜底 `Exception` 处理器把未识别异常转为不含堆栈和 provider 原文的 500；Router 不应自行构造与此冲突的错误格式。
+5. 按“审计 → CORS → IP 过滤 → 认证前限流 → 认证（API Key 或 JWT）→ 用户限流 → 用户日配额 → 业务”装配中间件，响应统一经 `RedactedJSONResponse` 脱敏，并关闭 OpenAPI 文档入口。认证模式、角色、限流和审计的具体规则见 [安全与访问控制](../operations/security.md)。
 
 [`backend/dependencies.py`](../../backend/dependencies.py) 是服务组合根。它负责构造 `StorageContainer`、模型服务、检索服务、QA 服务、推荐服务和 Agent 所需的 checkpoint store。业务模块应请求具体依赖，例如 `get_paper_qa_service()`，而不是接收一个万能数据库对象。
 
@@ -24,6 +25,7 @@
 | 层 | 责任 | 主要位置 | 维护约束 |
 | --- | --- | --- | --- |
 | 前端 | 交互、请求发起、流式事件消费和展示状态 | [`frontend/src/`](../../frontend/src/) | 不把后端执行真源复制为可驱动业务的前端状态。 |
+| 安全中间件 | 认证、角色与归属、限流、配额、IP 过滤和审计 | [`backend/auth/`](../../backend/auth/)、[`backend/middleware/`](../../backend/middleware/) | 在 Router 之前统一拦截，业务代码不自行实现鉴权或限流。 |
 | Router | 参数校验、依赖注入、响应序列化和协议错误转换 | [`backend/routers/`](../../backend/routers/) | 不编排检索、画像或 Agent 状态机。 |
 | Agent Runtime | 将研究请求转换成受校验计划，并完成执行、观察和恢复 | [`backend/agents/arxiv_search_agent/`](../../backend/agents/arxiv_search_agent/) | 计划和运行状态必须使用统一 schema。 |
 | Tools | 以明确输入 schema 调用搜索、QA、推荐和偏好能力 | [`backend/tools/`](../../backend/tools/) | 工具注册表是可执行能力的唯一清单。 |
@@ -62,7 +64,8 @@ Agent 和直接 QA 入口会在不同位置进入系统，但都复用同一组�
 
 - `goal`、`execution_plan`、`plan_runtime` 是执行真源；当前 step、工具输出、observation、确认请求和最终答案都以 `plan_runtime` 为准。
 - `runtime_state` 是 `plan_runtime` 的可序列化 checkpoint 投影，用于恢复，不能与 `plan_runtime` 并列写入业务判断。
-- `pending_action`、`papers`、`answer`、`paper_qa_result`、`preference_action_result` 是出站展示投影，前端回传它们不能改变执行现场。
+- `interaction` 是等待用户选择论文或批准副作用时的唯一交互状态，恢复时只信任服务端保存的内容。
+- `papers`、`answer`、`paper_qa_result`、`preference_action_result` 是出站展示投影，前端回传它们不能改变执行现场。
 - 旧的单步工具字段只服务兼容路径，新增主流程不得依赖它们。
 
 详细状态机见 [Agent Runtime](../capabilities/agent-runtime.md)。
@@ -89,7 +92,9 @@ Agent 和直接 QA 入口会在不同位置进入系统，但都复用同一组�
 
 这些配置可以使用仓库外的绝对路径，以支持部署时挂载独立持久卷。`SqliteConnectionProvider`、`ArxivOaiDatabaseService` 和 `PaperQABuildCache` 对直接注入的路径复用相同规则，新增调用方不得自行按当前工作目录解释路径。
 
-加载后的文档、Embedding 结果、向量库本地资产、LLM 生成结果和每日 arXiv 下载产物分别固定在 `backend/01-loaded-docs`、`backend/02-embedded-docs`、`backend/03-vector-store`、`backend/05-generation-results` 与 `backend/06-daily-arxiv-paper`。服务代码应通过 `resolve_backend_artifact_path()` 获取这些目录，不能再直接 `os.makedirs("01-loaded-docs")` 或按当前工作目录拼接路径。
+加载后的文档、Embedding 结果、检索索引、稀疏索引、Docling 解析资产、向量库本地资产、LLM 生成结果和每日 arXiv 下载产物分别固定在 `backend/01-loaded-docs`、`backend/02-embedded-docs`、`backend/02-retrieval-indexes`、`backend/02-sparse-indexes`、`backend/03-docling-assets`、`backend/03-vector-store`、`backend/05-generation-results` 与 `backend/06-daily-arxiv-paper`。服务代码应通过 `resolve_backend_artifact_path()` 获取这些目录，不能再直接 `os.makedirs("01-loaded-docs")` 或按当前工作目录拼接路径。
+
+OAI 增量同步游标位于 `backend/data/arxiv-oai-sync`，发布时随 `backend/data` 链接到服务器共享目录，跨版本保留。本地 Embedding 与 Reranker 模型默认位于仓库根目录的 `00-models`。
 
 自动化测试必须使用临时 SQLite 文件，不能复用任何项目持久化库。
 

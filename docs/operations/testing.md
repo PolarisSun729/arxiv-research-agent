@@ -1,78 +1,78 @@
-# Backend Testing Guide
+# 后端测试指南
 
-## 1. Environment
+## 1. 环境
 
-- Python environment: `conda activate new_rag`
-- Repository-level quality commands must run from the repository root.
-- Backend-only test commands must run from `backend/`.
-- Test entrypoint: `pytest`, collecting both pytest functions and `unittest.TestCase` tests.
+- Python 环境：`conda activate new_rag`
+- 仓库级质量命令必须在仓库根目录执行。
+- 仅后端的测试命令必须在 `backend/` 下执行。
+- 测试入口：`pytest`，同时收集 pytest 函数和 `unittest.TestCase` 用例。
 
-Most automated tests in this repository are designed to run offline with fake services, stubs, or temporary SQLite files.
+本仓库的绝大多数自动化测试都设计为离线运行，依赖假服务、桩或临时 SQLite 文件。
 
-## 2. Core testing rules
+## 2. 核心测试规则
 
-### 2.1 Tests that must not connect to real external services
+### 2.1 不得连接真实外部服务的测试
 
-The following automated tests must not call real external services:
+以下自动化测试不得调用真实外部服务：
 
-- unit tests under `tests/unit/`
-- api tests under `tests/api/`
-- integration tests under `tests/integration/`
-- golden smoke tests under `tests/golden/`
-- agent-related tests under `tests/test_agent_*.py`
+- `tests/unit/` 下的单元测试
+- `tests/api/` 下的 API 测试
+- `tests/integration/` 下的集成测试
+- `tests/golden/` 下的 golden 烟测
+- `tests/unit/agents/` 下的 Agent 相关测试
 
-In automated test runs, do not connect to:
+自动化测试运行时，不得连接：
 
-- real arXiv API
-- real arXiv OAI network endpoints
-- real LLM providers
-- real embedding providers
-- real rerank providers
-- real Milvus / vector DB services
-- real PDF download / Docling / PyMuPDF parsing backends
+- 真实 arXiv API
+- 真实 arXiv OAI 网络端点
+- 真实 LLM provider
+- 真实 embedding provider
+- 真实 rerank provider
+- 真实 Milvus / 向量数据库服务
+- 真实 PDF 下载 / Docling / PyMuPDF 解析后端
 
-These tests should use existing fake helpers in `tests/helpers/`, mock objects, dynamic import stubs, or in-memory fake services.
+这些测试应使用 `tests/helpers/` 中已有的假服务、mock 对象、动态导入桩或内存假服务。
 
-### 2.2 Tests that may use temporary SQLite
+### 2.2 允许使用临时 SQLite 的测试
 
-The following tests are allowed to use temporary SQLite only:
+以下测试只允许使用临时 SQLite：
 
-- database service tests
-- memory / recommendation integration tests
-- paper QA integration tests
-- QA index job flow tests
-- any router or service test that explicitly uses `tests/helpers/sqlite.py`
+- 数据库服务测试
+- 记忆 / 推荐集成测试
+- 论文 QA 集成测试
+- QA 索引任务流程测试
+- 任何显式使用 `tests/helpers/sqlite.py` 的 Router 或服务测试
 
-Do not point automated tests at real project databases such as persisted recommendation or OAI DB files.
+不要让自动化测试指向真实项目数据库，例如持久化的推荐库或 OAI 库文件。
 
-### 2.3 Manual-only external integration
+### 2.3 仅限手动执行的外部集成
 
-Manual-only external integration checks are not part of automated tests and should not enter default CI, including:
+仅限手动执行的外部集成检查不属于自动化测试，不得进入默认 CI，包括：
 
-- real arXiv search and download verification
-- real model provider calls
-- real embedding / rerank provider validation
-- real Milvus integration
-- end-to-end PDF parsing with external/runtime-heavy dependencies
-- production-like environment smoke checks
+- 真实 arXiv 搜索与下载验证
+- 真实模型 provider 调用
+- 真实 embedding / rerank provider 验证
+- 真实 Milvus 集成
+- 依赖外部或重型运行时的端到端 PDF 解析
+- 类生产环境烟测
 
-## 3. How to run tests
+## 3. 如何运行测试
 
-Recommended repository-level quality gate:
+推荐的仓库级质量门禁：
 
 ```bash
 python scripts/check_quality.py
 ```
 
-The default gate runs documentation checks, deployment tests, basic doctor, backend static checks, backend automated tests, backend startup smoke tests, frontend tests, and frontend build checks, then prints a final summary. It is the preferred command before submitting code because it keeps the offline-safe backend and frontend checks in one place.
+默认门禁依次运行文档校验、部署测试、基础环境体检、后端静态检查、后端自动化测试、后端启动烟测、前端测试和前端构建检查，最后输出汇总。它把离线安全的前后端检查集中在一处，是提交代码前的首选命令。
 
-CI uses the same staged gate through `python scripts/check_quality.py ci`. Codex changes should report the exact checks that were run, their pass/fail status, and any environment-related blockers; see [Maintenance and Quality](maintenance-quality.md).
+CI 通过 `python scripts/check_quality.py ci` 使用同一套分阶段门禁。提交变更时应说明实际运行了哪些检查、通过/失败结果以及环境导致的阻塞，见 [维护与质量](maintenance-quality.md)。
 
-Backend static checks are not ordinary unit tests. They run `compileall`, import smoke checks for key app/router/service/agent/tool/config modules, and optional low-noise `ruff` rules before the heavier test suite starts.
+后端静态检查不是普通单元测试。它在较重的测试套件之前运行 `compileall`、对关键的 app/router/service/agent/tool/config 模块做导入烟测，并可选执行低误伤的 `ruff` 规则。
 
-Backend startup smoke tests are also separate from full integration tests. They create the FastAPI app in lazy mode, enter the lifespan through `TestClient`, assert core routers and stable error payloads, and use fake services so no real LLM, Embedding, Milvus, arXiv, rerank, or PDF parsing backend is contacted.
+后端启动烟测也独立于完整集成测试。它以 lazy 模式创建 FastAPI 应用，通过 `TestClient` 进入 lifespan，断言核心路由和稳定的错误 payload，并使用假服务，因此不会连接真实的 LLM、Embedding、Milvus、arXiv、rerank 或 PDF 解析后端。
 
-Useful staged entrypoints from the repository root:
+在仓库根目录可用的分阶段入口：
 
 ```bash
 python scripts/check_quality.py backend
@@ -83,74 +83,74 @@ python scripts/check_quality.py compile
 python scripts/check_quality.py backend-startup-smoke
 ```
 
-`static` is the recommended backend static layer. `compile` only runs the narrower Python compilation check.
+`static` 是推荐的后端静态检查层；`compile` 只运行范围更窄的 Python 编译检查。
 
-Backend-only commands below assume:
+下面仅后端的命令默认已执行：
 
 ```bash
 conda activate new_rag
 cd backend
 ```
 
-### 3.1 Run existing test suite discovery
+### 3.1 查看现有测试收集结果
 
 ```bash
 python -m pytest tests --collect-only -q
 ```
 
-### 3.2 Run unit tests
+### 3.2 运行单元测试
 
 ```bash
 python -m pytest tests/unit
 ```
 
-### 3.3 Run API tests
+### 3.3 运行 API 测试
 
 ```bash
 python -m pytest tests/api
 ```
 
-### 3.4 Run integration tests
+### 3.4 运行集成测试
 
 ```bash
 python -m pytest tests/integration
 ```
 
-### 3.5 Run golden smoke tests
+### 3.5 运行 golden 烟测
 
 ```bash
 python -m pytest tests/golden/test_rag_golden_smoke.py
 ```
 
-### 3.6 Run RAG golden pipeline tests
+### 3.6 运行 RAG golden 流水线测试
 
 ```bash
 python -m pytest tests/golden/test_rag_golden_pipeline.py
 ```
 
-This suite exercises the real `EnhancedRetrievalService` orchestration with fake embeddings, an in-memory vector store, fixed chunks, and temporary trace output. It validates evidence hit-at-k, key retrieval debug stages, trace export, and figure/table evidence flow without calling a real model or Milvus.
+该套件使用假 embedding、内存向量库、固定 chunk 和临时 trace 输出，驱动真实的 `EnhancedRetrievalService` 编排。它验证证据 hit@k、关键检索调试阶段、trace 导出以及图表证据流转，不调用真实模型或 Milvus。
 
-### 3.7 Run full automated test suite
+### 3.7 运行完整自动化测试套件
 
 ```bash
 python -m pytest tests --ignore=tests/smoke
 python -m pytest tests/smoke
 ```
 
-This includes unit, api, integration, helper/infrastructure, and golden smoke tests that follow the `test_*.py` naming rule.
+这包括遵循 `test_*.py` 命名规则的单元、API、集成、辅助/基础设施和 golden 烟测。
 
-`unittest discover` alone misses pytest functions, parametrization and fixtures, including the research/evaluation regression suite. It is not a substitute for the complete gate.
+单独使用 `unittest discover` 会漏掉 pytest 函数、参数化和 fixture，包括研究/评测回归套件，不能代替完整门禁。
 
-### 3.8 Research QA and evaluation contracts
+### 3.8 研究问答与评测契约
 
 ```powershell
 python -m pytest tests/unit/services/evaluation tests/unit/services/paper_evidence_research tests/integration/test_research_qa_contract.py tests/unit/services/test_llm_call_metrics.py
 python -m services.evaluation.golden_runner --cases tests/golden/data/smoke_golden_set.jsonl --validate-only --allow-unlabeled
 ```
 
-These tests exercise real research request/result models, graph execution and temporary SQLite sessions, while replacing provider and index I/O. They cover sync/SSE equivalence, safe errors, rescoring persisted records, verified citations, retrieval failures, repair gains, run denominators and provider call accounting. Agent graph stubs must be restored after their own imports so these tests still run on real LangGraph.
+这些测试使用真实的研究请求/结果模型、图执行和临时 SQLite 会话，只替换 provider 和索引 I/O。覆盖范围包括同步与 SSE 等价、安全错误、持久化记录重评分、已验证引用、检索失败、修复增益、运行分母和 provider 调用计数。Agent 图的桩必须在其自身导入后恢复，确保这些测试仍运行在真实 LangGraph 上。
 
-The 12 smoke cases currently lack manual answerability/evidence/reference-answer labels. `--validate-only` without `--allow-unlabeled` correctly exits nonzero; neither validation command calls a model. A golden runner invocation without `--validate-only` uses the real research engine and stays outside automated tests. See [Evaluation](../capabilities/evaluation.md) for labels, metrics and baseline requirements.
+当前 12 条烟测用例尚缺人工标注的可回答性、证据和参考答案。不带 `--allow-unlabeled` 的 `--validate-only` 会按预期以非零码退出；两条校验命令都不调用模型。不带 `--validate-only` 的 golden runner 会使用真实研究引擎，不属于自动化测试。标注、指标和基线要求见 [生成效果评测](../capabilities/evaluation.md)。
 
 ### 3.9 三阶段安全与部署初始化
 
@@ -163,9 +163,9 @@ python scripts/test_security.py -k "redact or notes_markdown_export"
 python scripts/test_security.py --full
 ```
 
-Linux/Git Bash 可用 `bash test_security.sh`，或通过 `SECURITY_TEST_PYTHON` 指定解释器。脱敏性能和匿名长字段回归使用有界子进程，避免错误正则挂死测试；SSE 回归验证跨分片凭据及普通文本完整性。默认回归使用模拟 Redis；实际容器持久化、TLS 和付费模型验收需要另行执行，不能用离线通过代替。
+Linux/Git Bash 下命令相同，用哪个 Python 解释器运行就使用哪个环境。脱敏性能和匿名长字段回归使用有界子进程，避免错误正则挂死测试；SSE 回归验证跨分片凭据及普通文本完整性。默认回归使用模拟 Redis；实际容器持久化、TLS 和付费模型验收需要另行执行，不能用离线通过代替。
 
-## 4. Frequently used targeted commands
+## 4. 常用定向命令
 
 ### 发布与回退脚本
 
@@ -182,100 +182,99 @@ bash -n deploy/publish_ssh.sh
 
 容器工作流在 Checkout 后显式信任当前工作区，并提前验证 Git 可读取 HEAD。修改这一步时，应在隔离 Git 配置和临时仓库中复现属主不匹配，验证后续进程能读取提交、归档源码，同时确认其他仓库仍被拒绝；普通发布单元测试不能代替这项运行环境检查。
 
-### Agent tests
+### Agent 测试
 
 ```bash
 python -m pytest tests/unit/agents/arxiv_search_agent tests/api/test_agent_router.py
 ```
 
-### Retrieval / RAG tests
+### 检索 / RAG 测试
 
 ```bash
 python -m pytest tests/unit/services/retrieval tests/integration/test_enhanced_retrieval_service.py
 python -m pytest tests/golden/test_rag_golden_pipeline.py
 ```
 
-### Paper QA tests
+### 论文 QA 测试
 
 ```bash
 python -m pytest tests/integration/test_paper_qa_service.py tests/integration/test_qa_index_build_flow.py tests/integration/test_research_qa_contract.py
 ```
 
-### Memory / Recommendation / Intent tests
+### 记忆 / 推荐 / 意图测试
 
 ```bash
 python -m pytest tests/unit/services/intent tests/integration/test_memory_service.py tests/integration/test_recommendation_flow.py
 ```
 
-The memory integration suite also covers the Agent session-memory read/write loop: final Agent state is reduced to a small persisted memory patch, then reloaded and merged with frontend context. This catches regressions where Agent state, selected paper context, or tool-call summaries stop surviving across turns.
+记忆集成套件同时覆盖 Agent 会话记忆的读写闭环：Agent 最终状态被归约为一个很小的持久化记忆 patch，随后重新加载并与前端上下文合并。它能发现 Agent 状态、已选论文上下文或工具调用摘要无法跨轮保留的回归。
 
-### Database service tests
+### 数据库服务测试
 
 ```bash
 python -m pytest tests/unit -k "sqlite or database"
 ```
 
-## 5. Coverage commands
+## 5. 覆盖率命令
 
-Run coverage across the automated test suite:
+在自动化测试套件上统计覆盖率：
 
 ```bash
 python -m coverage run -m pytest tests --ignore=tests/smoke
 python -m coverage report -m
 ```
 
-Optional HTML output:
+可选的 HTML 输出：
 
 ```bash
 python -m coverage html
 ```
 
-Then open `htmlcov/index.html` locally.
+然后在本地打开 `htmlcov/index.html`。
 
-## 6. Coverage acceptance notes
+## 6. 覆盖率验收说明
 
-- Coverage is used as a regression visibility tool, not as permission to connect to external services.
-- A coverage run must remain offline-safe.
-- If a test requires real upstream services, move it to a separate manual script rather than adding it to default pytest collection.
-- Prefer focused fake-based tests over broad unstable integration coverage.
+- 覆盖率用于观察回归，不是连接外部服务的许可。
+- 覆盖率运行必须保持离线安全。
+- 如果某个测试需要真实上游服务，应移到单独的手动脚本，而不是加入默认 pytest 收集。
+- 优先编写聚焦的、基于假服务的测试，而不是宽泛但不稳定的集成覆盖。
 
-## 7. Existing helper locations
+## 7. 现有辅助工具位置
 
-Common reusable test helpers live under:
+常用的可复用测试辅助工具位于：
 
 - `tests/helpers/sqlite.py`
 - `tests/helpers/fake_embedding_service.py`
 - `tests/helpers/fake_generation_service.py`
 - `tests/helpers/fake_vector_store_service.py`
 - `tests/helpers/fake_arxiv_service.py`
-- `tests/helpers/fake_paper_qa_service.py`
 - `tests/helpers/retrieval.py`
 - `tests/helpers/agent_runtime.py`
 
-Use these helpers before introducing new heavy mocks.
+引入新的重型 mock 之前，先使用这些辅助工具。
 
-## 8. Troubleshooting
+## 8. 问题排查
 
-### Import or dependency errors
+### 导入或依赖错误
 
-- Confirm the environment is `conda activate new_rag`
-- Run commands from `backend/`
-- Prefer existing test helpers that stub optional runtime dependencies
+- 确认环境为 `conda activate new_rag`
+- 在 `backend/` 下执行命令
+- 优先使用已有的、会为可选运行时依赖打桩的测试辅助工具
 
-### Unexpected real network or model calls
+### 意外的真实网络或模型调用
 
-- Check whether a test forgot to override dependencies
-- Verify fake service injection or `sys.modules` stubs are active
-- Do not accept a fix that passes only because real external services happen to be reachable
+- 检查测试是否忘记覆盖依赖
+- 确认假服务注入或 `sys.modules` 桩已生效
+- 不要接受只因真实外部服务恰好可达才通过的修复
 
-### SQLite pollution concerns
+### 担心 SQLite 污染
 
-- Use temporary SQLite helpers from `tests/helpers/sqlite.py`
-- Do not reuse real repository DB files in automated tests
+- 使用 `tests/helpers/sqlite.py` 中的临时 SQLite 辅助工具
+- 不要在自动化测试中复用仓库里的真实数据库文件
 
-### Windows temporary-directory permissions
+### Windows 临时目录权限
 
-Use a new repository-local temporary directory when pytest or Ruff cannot write a stale cache. For example, from the repository root:
+当 pytest 或 Ruff 无法写入陈旧缓存时，使用一个新的仓库内临时目录。例如在仓库根目录执行：
 
 ```powershell
 $testTemp = Join-Path (Get-Location).Path 'temp/quality-local'

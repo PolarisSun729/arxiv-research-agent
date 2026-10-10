@@ -3,6 +3,7 @@ import { ref, onMounted, watch, computed } from 'vue';
 import { useRouter } from 'vue-router';
 import { usePaperStore } from '@/stores/paperStore';
 import { ElMessage } from 'element-plus';
+import { getLabelClass, getLabelText } from '@/utils/paperLabel';
 
 const router = useRouter();
 const store = usePaperStore();
@@ -48,14 +49,6 @@ function handlePageChange(page: number) {
 
 function formatDate(dateStr: string) {
   return new Date(dateStr).toLocaleString('zh-CN');
-}
-
-function getLabelClass(label: string) {
-  return label === 'liked' ? 'el-tag--success' : 'el-tag--danger';
-}
-
-function getLabelText(label: string) {
-  return label === 'liked' ? '喜欢' : '不喜欢';
 }
 
 function formatPaperTitle(title: string, id: string) {

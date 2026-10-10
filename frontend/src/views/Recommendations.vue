@@ -5,6 +5,7 @@ import { useRouter } from 'vue-router'
 import { usePaperStore } from '@/stores/paperStore'
 import PaperCard from '@/components/PaperCard.vue'
 import SimilarityTag from '@/components/SimilarityTag.vue'
+import { toPercent } from '@/utils/format'
 
 const router = useRouter()
 const store = usePaperStore()
@@ -74,11 +75,6 @@ function handleViewDetail(id: string) {
 
 function goToProfile() {
   router.push('/profile')
-}
-
-function toPercent(value?: number) {
-  if (typeof value !== 'number' || Number.isNaN(value)) return 0
-  return Math.max(0, Math.min(100, Math.round(value * 100)))
 }
 
 async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {

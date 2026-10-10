@@ -246,14 +246,6 @@ export interface PaperPreferenceRequest {
   paper: PaperMaterializationPayload
 }
 
-export interface SearchParams {
-  keyword?: string
-  category?: string
-  page: number
-  pageSize: number
-  sortBy?: string
-}
-
 export interface ArxivSearchParams {
   search_query?: string
   id_list?: string[]

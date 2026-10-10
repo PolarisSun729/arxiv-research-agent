@@ -5,7 +5,6 @@ import type {
   Paper,
   RecommendedPaper,
   LabeledPaper,
-  SearchParams,
   LabelParams,
   PaginatedResponse,
   ArxivSearchResult,
@@ -25,6 +24,7 @@ import type {
   UserProfileBuildJob
 } from '@/types/paper'
 import { getCurrentUserId } from '@/composables/useUserContext'
+import { parseSseBlock, readSseBlocks } from '@/utils/sse'
 
 function resolveUserId(userId?: string | null): string {
   const normalized = String(userId || '').trim()
@@ -418,15 +418,6 @@ export async function getUserResearchProfileDetail(userId?: string): Promise<Use
   return normalizeResearchProfileDetail(response?.detail || response, effectiveUserId)
 }
 
-export async function upsertUserResearchProfile(profile: Partial<UserResearchProfile>, userId?: string): Promise<UserResearchProfile> {
-  const effectiveUserId = resolveUserId(userId || profile.user_id)
-  const response: any = await request.put('/user/research-profile', {
-    ...profile,
-    user_id: effectiveUserId
-  })
-  return normalizeResearchProfile(response?.profile || response, effectiveUserId)
-}
-
 export async function patchUserResearchProfile(profile: Partial<UserResearchProfile>, userId?: string): Promise<UserResearchProfile> {
   const effectiveUserId = resolveUserId(userId || profile.user_id)
   const response: any = await request.patch('/user/research-profile', {
@@ -461,16 +452,6 @@ export async function getUserResearchProfileBuildJob(jobId: string): Promise<Use
   return normalizeProfileBuildJob(response?.job || response)
 }
 
-export async function getUserResearchProfileTopicEvidence(topic: string, userId?: string): Promise<{ found: boolean; evidence: Record<string, any>; topic: string }> {
-  const effectiveUserId = resolveUserId(userId)
-  const response: any = await request.get(`/user/research-profile/${effectiveUserId}/topic-evidence`, { params: { topic } })
-  return {
-    found: Boolean(response?.found),
-    evidence: response?.evidence || {},
-    topic: response?.topic || topic
-  }
-}
-
 export async function activateUserResearchProfileSnapshot(snapshotId: string, userId?: string): Promise<UserResearchProfile> {
   const effectiveUserId = resolveUserId(userId)
   const response: any = await request.post('/user/research-profile/snapshots/activate', {
@@ -480,23 +461,8 @@ export async function activateUserResearchProfileSnapshot(snapshotId: string, us
   return normalizeResearchProfile(response?.profile || response, effectiveUserId)
 }
 
-export async function searchPapers(params: SearchParams): Promise<PaginatedResponse<Paper>> {
-  return request.get('/papers/search', { params })
-}
-
 export async function getPaperById(id: string): Promise<Paper> {
   return normalizePaper(await request.get(`/paper/${id}`))
-}
-
-export async function getRecommendations(params: { page: number; pageSize: number }): Promise<PaginatedResponse<RecommendedPaper>> {
-  const response: any = await request.get('/papers/recommendations', { params })
-  const items = Array.isArray(response?.items)
-    ? response.items.map(normalizeRecommendedPaper)
-    : []
-  return {
-    total: Number(response?.total ?? items.length),
-    items
-  }
 }
 
 export async function getLabeledPapers(params: { 
@@ -900,38 +866,6 @@ export async function createPaperNote(
   }
 }
 
-export async function updatePaperNote(
-  arxivId: string,
-  noteId: string,
-  payload: Partial<PaperNotePayload>
-): Promise<{ item: PaperNote | null }> {
-  const effectiveUserId = resolveUserId(payload.user_id)
-  const response: any = await request.patch(`/paper/${arxivId}/notes/${noteId}`, {
-    ...payload,
-    user_id: effectiveUserId
-  })
-  return {
-    item: response?.item ? normalizePaperNote(response.item, effectiveUserId) : null
-  }
-}
-
-export async function deletePaperNote(
-  arxivId: string,
-  noteId: string,
-  userId?: string
-): Promise<{ status: string; deleted: boolean }> {
-  return request.delete(`/paper/${arxivId}/notes/${noteId}`, {
-    params: { user_id: resolveUserId(userId) }
-  })
-}
-
-export function getPaperNotesExportUrl(arxivId: string, userId?: string): string {
-  const params = new URLSearchParams()
-  params.set('user_id', resolveUserId(userId))
-  const query = params.toString()
-  return `/api/paper/${arxivId}/notes/export${query ? `?${query}` : ''}`
-}
-
 export interface QaConversationContextTurn {
   turn_id: string
   question: string
@@ -1109,14 +1043,6 @@ export interface QaObservation {
   observation_reason?: string
 }
 
-export async function qaPaper(arxivId: string, question: string, options: QaRequestOptions = {}): Promise<QaResult> {
-  return request.post(`/paper/${arxivId}/qa`, {
-    question,
-    ...options,
-    user_id: resolveUserId(options.user_id)
-  })
-}
-
 export async function listPaperChatSessions(
   arxivId: string,
   params: { user_id?: string; limit?: number } = {}
@@ -1148,16 +1074,6 @@ export async function createPaperChatSession(
   })
 }
 
-export async function getPaperChatSession(
-  arxivId: string,
-  sessionId: string,
-  userId?: string
-): Promise<{ item: PaperChatSession | null }> {
-  return request.get(`/paper/${arxivId}/chat-sessions/${sessionId}`, {
-    params: { user_id: resolveUserId(userId) }
-  })
-}
-
 export async function getPaperChatMessages(
   arxivId: string,
   sessionId: string,
@@ -1175,16 +1091,6 @@ export async function clearPaperChatSession(
 ): Promise<{ item: PaperChatSession | null }> {
   return request.post(`/paper/${arxivId}/chat-sessions/${sessionId}/clear`, {
     user_id: resolveUserId(userId)
-  })
-}
-
-export async function deletePaperChatSession(
-  arxivId: string,
-  sessionId: string,
-  userId?: string
-): Promise<{ status: string; deleted: boolean }> {
-  return request.delete(`/paper/${arxivId}/chat-sessions/${sessionId}`, {
-    params: { user_id: resolveUserId(userId) }
   })
 }
 
@@ -1353,25 +1259,11 @@ function applyQaStreamPayload(
   }
 }
 
-function parseSseEvent(rawEvent: string): { event: string; data: any } | null {
-  const lines = rawEvent
-    .split(/\r?\n/)
-    .filter(Boolean)
-
-  if (!lines.length) return null
-
-  let event = 'message'
-  const dataLines: string[] = []
-
-  for (const line of lines) {
-    if (line.startsWith('event:')) {
-      event = line.slice(6).trim()
-    } else if (line.startsWith('data:')) {
-      dataLines.push(line.slice(5).replace(/^ /, ''))
-    }
-  }
-
-  const dataText = dataLines.join('\n')
+// QA 流按 SSE 规范缺省 event 为 message；data 不是合法 JSON 时保留原始文本。
+function parseQaStreamEvent(raw: string): { event: string; data: any } {
+  const parsed = parseSseBlock(raw)
+  const event = parsed.event ?? 'message'
+  const dataText = parsed.dataText
   if (!dataText) return { event, data: null }
 
   try {
@@ -1387,9 +1279,6 @@ export async function qaPaperStream(
   handlers: QaStreamHandlers = {},
   options: QaRequestOptions = {}
 ): Promise<QaResult> {
-  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
-  const decoder = new TextDecoder('utf-8')
-  let buffer = ''
   let finalAnswer = ''
   let hasDone = false
   const finalState = {
@@ -1441,8 +1330,7 @@ export async function qaPaperStream(
   }
 
   const processEvent = (part: string): QaResult | null => {
-    const parsed = parseSseEvent(part)
-    if (!parsed) return null
+    const parsed = parseQaStreamEvent(part)
 
     if (parsed.event === 'meta' && parsed.data && typeof parsed.data === 'object') {
       handlers.onMeta?.(parsed.data)
@@ -1509,26 +1397,8 @@ export async function qaPaperStream(
       throw createQaStreamError('stream_incomplete', '回答中断，请重试。', 'Streaming response body is empty')
     }
 
-    reader = response.body.getReader()
-
-    while (true) {
-      const { value, done } = await reader.read()
-      if (done) break
-
-      buffer += decoder.decode(value, { stream: true })
-
-      const parts = buffer.split(/\r?\n\r?\n/)
-      buffer = parts.pop() || ''
-
-      for (const part of parts) {
-        const result = processEvent(part)
-        if (result) return result
-      }
-    }
-
-    const tail = `${buffer}${decoder.decode()}`
-    if (tail.trim()) {
-      const result = processEvent(tail)
+    for await (const block of readSseBlocks(response.body)) {
+      const result = processEvent(block)
       if (result) return result
     }
 
@@ -1547,8 +1417,6 @@ export async function qaPaperStream(
       throw abortedError
     }
     throw error
-  } finally {
-    reader?.releaseLock()
   }
 
   throw createQaStreamError('stream_incomplete', '回答中断，请重试。', 'Stream finished without a completed result.')

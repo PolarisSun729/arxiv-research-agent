@@ -24,11 +24,6 @@ interface ArxivCapabilityInput {
   errorDetails?: unknown
 }
 
-interface AgentToolCallLike {
-  trace?: Record<string, unknown> | null
-  error?: Record<string, unknown> | null
-}
-
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
@@ -191,37 +186,3 @@ export function normalizeArxivQueryCapabilityFromError(error: unknown): Normaliz
   })
 }
 
-export function normalizeArxivQueryCapabilityFromToolCalls(
-  toolCalls: AgentToolCallLike[],
-  warnings: unknown = []
-): NormalizedArxivQueryCapability | null {
-  for (let index = toolCalls.length - 1; index >= 0; index -= 1) {
-    const call = toolCalls[index]
-    const traceCapability = asRecord(call.trace?.query_capability)
-    if (traceCapability) {
-      return normalizeArxivQueryCapability({
-        capability: traceCapability,
-        warnings
-      })
-    }
-
-    const error = asRecord(call.error)
-    const detail = asRecord(error?.detail)
-    const details = asRecord(detail?.details)
-    const errorCapability = asRecord(details?.query_capability)
-    const errorCode = readString(error?.code) || readString(detail?.code)
-
-    if (errorCapability || (errorCode && LOCAL_ARXIV_ERROR_CODES.has(errorCode))) {
-      return normalizeArxivQueryCapability({
-        capability: errorCapability,
-        warnings,
-        status: 'error',
-        errorCode,
-        errorMessage: readString(error?.message) || readString(detail?.message),
-        errorDetails: details
-      })
-    }
-  }
-
-  return normalizeArxivQueryCapability({ warnings })
-}

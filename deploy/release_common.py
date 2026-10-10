@@ -13,9 +13,9 @@ from pathlib import Path, PurePosixPath
 
 
 SHARED_DIRECTORIES = (
-    "backend/01-loaded-docs", "backend/01-chunked-docs",
+    "backend/01-loaded-docs",
     "backend/02-embedded-docs", "backend/02-retrieval-indexes", "backend/02-sparse-indexes",
-    "backend/03-docling-assets", "backend/03-vector-store", "backend/04-search-results",
+    "backend/03-docling-assets", "backend/03-vector-store",
     "backend/05-generation-results", "backend/06-daily-arxiv-paper", "backend/06-database",
     "backend/06-evaluation-result", "backend/data", "backend/temp", "temp", "logs",
 )

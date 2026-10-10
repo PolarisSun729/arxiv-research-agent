@@ -18,7 +18,6 @@ const credentialRef = shallowRef<Credential | null | undefined>(undefined)
 const userRef = shallowRef<AuthUser | null>(null)
 const configurationRef = shallowRef<AuthConfiguration | null>(null)
 export const currentUser = shallowReadonly(userRef)
-export const authConfiguration = shallowReadonly(configurationRef)
 export const ROLE_LABELS: Record<UserRole, string> = { admin: '管理员', researcher: '研究者', viewer: '阅读者', guest: '访客' }
 export const QUOTA_LABELS: Record<QuotaType, string> = { papers: '论文操作', qa_queries: '论文问答', agent_runs: 'Agent 运行' }
 let sessionRevision = 0

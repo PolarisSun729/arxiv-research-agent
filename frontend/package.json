@@ -12,10 +12,12 @@
     "test:evidence": "node tests/evidenceCitation.test.mjs",
     "test:labeled-summary": "node tests/labeledPaperSummary.test.mjs",
     "test:security": "node tests/security.test.mjs",
-    "test": "npm run test:errors && npm run test:user-context && npm run test:qa-stream && npm run test:agent-chat && npm run test:evidence && npm run test:labeled-summary && npm run test:security",
+    "test:sse": "node tests/sse.test.mjs",
+    "test": "npm run test:errors && npm run test:user-context && npm run test:qa-stream && npm run test:agent-chat && npm run test:evidence && npm run test:labeled-summary && npm run test:security && npm run test:sse",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
     "axios": "^1.6.0",
     "element-plus": "^2.4.4",
     "katex": "^0.16.46",
@@ -27,7 +29,6 @@
     "vue-router": "^4.2.5"
   },
   "devDependencies": {
-    "@element-plus/icons-vue": "^2.3.2",
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^20.10.0",
     "@vitejs/plugin-vue": "^6.0.6",

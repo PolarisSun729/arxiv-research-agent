@@ -1,7 +1,6 @@
 import type { RetrievalDebug } from '@/api/papers'
 import type { AgentChatMessage } from '@/types/agentChat'
 
-export type RagChatRole = 'user' | 'assistant'
 export type QaTurnStatus =
   | 'idle'
   | 'preparing'

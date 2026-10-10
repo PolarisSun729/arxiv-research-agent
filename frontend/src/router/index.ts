@@ -58,11 +58,6 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/AdminUsers.vue')
   },
   {
-    path: '/agent-graph',
-    name: 'AgentGraph',
-    redirect: '/'
-  },
-  {
     path: '/labeled',
     name: 'LabeledPapers',
     component: () => import('@/views/LabeledPapers.vue')
@@ -78,6 +73,13 @@ if (debugRoutesEnabled) {
     component: () => import('@/views/Chunks.vue')
   })
 }
+
+// 兜底路由必须最后注册；它同样经过登录守卫，未登录访问未知地址会先去登录页。
+routes.push({
+  path: '/:pathMatch(.*)*',
+  name: 'NotFound',
+  component: () => import('@/views/NotFound.vue')
+})
 
 const router = createRouter({
   history: createWebHistory(),
