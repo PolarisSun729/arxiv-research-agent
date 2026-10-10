@@ -74,6 +74,13 @@ if (debugRoutesEnabled) {
   })
 }
 
+// 兜底路由必须最后注册；它同样经过登录守卫，未登录访问未知地址会先去登录页。
+routes.push({
+  path: '/:pathMatch(.*)*',
+  name: 'NotFound',
+  component: () => import('@/views/NotFound.vue')
+})
+
 const router = createRouter({
   history: createWebHistory(),
   routes
