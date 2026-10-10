@@ -22,7 +22,6 @@ await build({
       name: 'qa-stream-test-stubs',
       setup(buildApi) {
         buildApi.onResolve({ filter: /^\.\/request$/ }, () => ({ path: 'request-stub', namespace: 'qa-stub' }))
-        buildApi.onResolve({ filter: /^@\/mock\/papers$/ }, () => ({ path: 'mock-papers-stub', namespace: 'qa-stub' }))
         buildApi.onResolve({ filter: /^@\/composables\/useUserContext$/ }, () => ({
           path: 'user-context-stub',
           namespace: 'qa-stub'
@@ -30,12 +29,6 @@ await build({
         buildApi.onLoad({ filter: /.*/, namespace: 'qa-stub' }, args => {
           if (args.path === 'request-stub') {
             return { contents: 'export default {}', loader: 'js' }
-          }
-          if (args.path === 'mock-papers-stub') {
-            return {
-              contents: 'export const mockPapers = []; export const mockRecommendedPapers = []; export const mockLabeledPapers = []; export const mockStats = {};',
-              loader: 'js'
-            }
           }
           return { contents: 'export function getCurrentUserId() { return "test-user"; }', loader: 'js' }
         })
