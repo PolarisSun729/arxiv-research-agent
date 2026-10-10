@@ -1,4 +1,5 @@
 import type { ApiErrorPayload } from '@/types/error'
+import { isRecord } from '@/utils/guards'
 
 const ERROR_MESSAGES: Record<string, string> = {
   missing_token: '请先登录。',
@@ -56,10 +57,6 @@ export function isApiErrorPayload(value: unknown): value is ApiErrorPayload {
       (value as { status?: unknown }).status === 'failed' &&
       typeof (value as { code?: unknown }).code === 'string'
   )
-}
-
-function isRecord(value: unknown): value is Record<string, any> {
-  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
 }
 
 function normalizeDetails(value: unknown): Record<string, any> | null {

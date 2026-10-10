@@ -10,6 +10,7 @@ import {
   streamAgentWorkContinuationResume
 } from '@/api/agent'
 import { getApiErrorMessage, getErrorMessage } from '@/api/errors'
+import { isRecord } from '@/utils/guards'
 import type {
   AgentInteraction,
   AgentPaper,
@@ -63,10 +64,6 @@ function buildConfirmationPlaceholder(interaction: AgentInteraction | null) {
   if (interaction?.kind === 'target_selection') return '正在提交论文选择并恢复 Agent…'
   if (interaction?.kind === 'side_effect_approval') return '正在保存授权并创建后台任务…'
   return ''
-}
-
-function isRecord(value: unknown): value is Record<string, any> {
-  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
 }
 
 function getAgentRuntimeErrorMessage(response: ArxivSearchResponse | null | undefined) {

@@ -5,6 +5,7 @@ import RagThoughtChain from '@/components/rag-chat/RagThoughtChain.vue'
 import type { RetrievalDebug, RetrievalDebugChunk } from '@/api/papers'
 import type { RagChatSource } from '@/types/ragChat'
 import { useUserContext } from '@/composables/useUserContext'
+import { formatQueryList } from '@/utils/format'
 
 const { isAdmin } = useUserContext()
 
@@ -29,13 +30,6 @@ const emit = defineEmits<{
 
 function formatDebugNumber(value?: number | null) {
   return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(4) : '-'
-}
-
-function formatQueryList(values?: string[]) {
-  if (!values || values.length === 0) {
-    return '无'
-  }
-  return values.join(' | ')
 }
 
 function formatRouteScores(routeScores?: Record<string, number>) {

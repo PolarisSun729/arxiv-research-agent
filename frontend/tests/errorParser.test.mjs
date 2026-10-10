@@ -1,16 +1,17 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
-import { transform } from 'esbuild'
+import { fileURLToPath } from 'node:url'
+import { build } from 'esbuild'
 
-const sourceUrl = new URL('../src/api/errors.ts', import.meta.url)
-const source = await readFile(sourceUrl, 'utf8')
-const compiled = await transform(source, {
-  loader: 'ts',
+// 打包而不是单文件转译：errors.ts 依赖 @/utils 下的工具函数，esbuild 按 tsconfig paths 解析别名。
+const compiled = await build({
+  entryPoints: [fileURLToPath(new URL('../src/api/errors.ts', import.meta.url))],
+  bundle: true,
   format: 'esm',
-  sourcemap: 'inline'
+  sourcemap: 'inline',
+  write: false
 })
 
-const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.code).toString('base64')}`
+const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString('base64')}`
 const { ApiError, getErrorMessage, normalizeApiError } = await import(moduleUrl)
 
 const qaIndexError = normalizeApiError({

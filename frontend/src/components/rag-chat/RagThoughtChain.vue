@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { RetrievalDebug, RetrievalDebugChunk } from '@/api/papers'
+import { formatQueryList } from '@/utils/format'
 
 const props = defineProps<{
   question: string
@@ -9,13 +10,6 @@ const props = defineProps<{
 
 function getChunkCount(chunks?: RetrievalDebugChunk[]) {
   return Array.isArray(chunks) ? chunks.length : 0
-}
-
-function formatQueryList(values?: string[]) {
-  if (!values || values.length === 0) {
-    return '无'
-  }
-  return values.join(' | ')
 }
 
 function formatRouteSummary() {
