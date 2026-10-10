@@ -12,7 +12,8 @@
     "test:evidence": "node tests/evidenceCitation.test.mjs",
     "test:labeled-summary": "node tests/labeledPaperSummary.test.mjs",
     "test:security": "node tests/security.test.mjs",
-    "test": "npm run test:errors && npm run test:user-context && npm run test:qa-stream && npm run test:agent-chat && npm run test:evidence && npm run test:labeled-summary && npm run test:security",
+    "test:sse": "node tests/sse.test.mjs",
+    "test": "npm run test:errors && npm run test:user-context && npm run test:qa-stream && npm run test:agent-chat && npm run test:evidence && npm run test:labeled-summary && npm run test:security && npm run test:sse",
     "preview": "vite preview"
   },
   "dependencies": {

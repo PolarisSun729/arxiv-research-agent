@@ -24,6 +24,7 @@ import type {
   UserProfileBuildJob
 } from '@/types/paper'
 import { getCurrentUserId } from '@/composables/useUserContext'
+import { parseSseBlock, readSseBlocks } from '@/utils/sse'
 
 function resolveUserId(userId?: string | null): string {
   const normalized = String(userId || '').trim()
@@ -1258,25 +1259,11 @@ function applyQaStreamPayload(
   }
 }
 
-function parseSseEvent(rawEvent: string): { event: string; data: any } | null {
-  const lines = rawEvent
-    .split(/\r?\n/)
-    .filter(Boolean)
-
-  if (!lines.length) return null
-
-  let event = 'message'
-  const dataLines: string[] = []
-
-  for (const line of lines) {
-    if (line.startsWith('event:')) {
-      event = line.slice(6).trim()
-    } else if (line.startsWith('data:')) {
-      dataLines.push(line.slice(5).replace(/^ /, ''))
-    }
-  }
-
-  const dataText = dataLines.join('\n')
+// QA 流按 SSE 规范缺省 event 为 message；data 不是合法 JSON 时保留原始文本。
+function parseQaStreamEvent(raw: string): { event: string; data: any } {
+  const parsed = parseSseBlock(raw)
+  const event = parsed.event ?? 'message'
+  const dataText = parsed.dataText
   if (!dataText) return { event, data: null }
 
   try {
@@ -1292,9 +1279,6 @@ export async function qaPaperStream(
   handlers: QaStreamHandlers = {},
   options: QaRequestOptions = {}
 ): Promise<QaResult> {
-  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
-  const decoder = new TextDecoder('utf-8')
-  let buffer = ''
   let finalAnswer = ''
   let hasDone = false
   const finalState = {
@@ -1346,8 +1330,7 @@ export async function qaPaperStream(
   }
 
   const processEvent = (part: string): QaResult | null => {
-    const parsed = parseSseEvent(part)
-    if (!parsed) return null
+    const parsed = parseQaStreamEvent(part)
 
     if (parsed.event === 'meta' && parsed.data && typeof parsed.data === 'object') {
       handlers.onMeta?.(parsed.data)
@@ -1414,26 +1397,8 @@ export async function qaPaperStream(
       throw createQaStreamError('stream_incomplete', '回答中断，请重试。', 'Streaming response body is empty')
     }
 
-    reader = response.body.getReader()
-
-    while (true) {
-      const { value, done } = await reader.read()
-      if (done) break
-
-      buffer += decoder.decode(value, { stream: true })
-
-      const parts = buffer.split(/\r?\n\r?\n/)
-      buffer = parts.pop() || ''
-
-      for (const part of parts) {
-        const result = processEvent(part)
-        if (result) return result
-      }
-    }
-
-    const tail = `${buffer}${decoder.decode()}`
-    if (tail.trim()) {
-      const result = processEvent(tail)
+    for await (const block of readSseBlocks(response.body)) {
+      const result = processEvent(block)
       if (result) return result
     }
 
@@ -1452,8 +1417,6 @@ export async function qaPaperStream(
       throw abortedError
     }
     throw error
-  } finally {
-    reader?.releaseLock()
   }
 
   throw createQaStreamError('stream_incomplete', '回答中断，请重试。', 'Stream finished without a completed result.')
