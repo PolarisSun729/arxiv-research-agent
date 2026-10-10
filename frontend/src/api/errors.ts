@@ -50,7 +50,7 @@ export class ApiError extends Error {
   }
 }
 
-export function isApiErrorPayload(value: unknown): value is ApiErrorPayload {
+function isApiErrorPayload(value: unknown): value is ApiErrorPayload {
   return Boolean(
     value &&
       typeof value === 'object' &&
