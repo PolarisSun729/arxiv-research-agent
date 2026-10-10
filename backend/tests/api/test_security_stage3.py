@@ -709,3 +709,85 @@ def test_quota_waiting_for_write_lock_uses_the_day_when_lock_is_acquired(tmp_pat
     with pytest.raises(AuthError) as rejected:
         store.consume(**arguments)
     assert rejected.value.code == "quota_exceeded"
+
+
+def _papers_used(app, user):
+    return next(q for q in app.state.authenticator.store.quotas(user.user_id) if q["quota_type"] == "papers")["used_today"]
+
+
+def test_local_paper_reads_are_free_and_only_arxiv_backfill_spends_papers_quota(app, business):
+    import routers.paper_router as paper_router
+    user, token = account(app)
+    app.state.authenticator.store.set_quota(user.user_id, quota_type="papers", daily_limit=1)
+    business.paper_catalog.add_paper({"arxiv_id": "p-local", "title": "Local", "abstract": "Stored", "categories": ["cs.AI"]})
+    business.paper_catalog.add_paper({"arxiv_id": "p-partial"})
+    fetched = []
+
+    def fetch(arxiv_id):
+        fetched.append(arxiv_id)
+        return {"arxiv_id": arxiv_id, "title": "Remote", "abstract": "Fetched"}
+
+    app.dependency_overrides[paper_router.get_paper_catalog_store] = lambda: business.paper_catalog
+    app.dependency_overrides[paper_router.get_recommendation_service] = lambda: SimpleNamespace(
+        _fetch_paper_from_arxiv_with_rate_limit=fetch, _ensure_paper_materialized=lambda arxiv_id, paper_payload: paper_payload,
+    )
+    client = http(app, token)
+    for _ in range(3):
+        assert client.get("/api/papers").status_code == 200
+        assert client.get("/api/papers/category/cs.AI").status_code == 200
+        assert client.get("/api/paper/p-local").json()["title"] == "Local"
+        assert client.get(f"/api/user/labeled-papers/{user.user_id}").status_code == 200
+    assert _papers_used(app, user) == 0 and fetched == []
+    assert client.get("/api/paper/p-remote").json()["title"] == "Remote"
+    assert _papers_used(app, user) == 1
+    # 额度用尽：不完整的本地记录原样返回，本地没有的论文返回配额错误，都不再回源。
+    assert client.get("/api/paper/p-partial").json()["arxiv_id"] == "p-partial"
+    denied = client.get("/api/paper/p-missing")
+    assert denied.status_code == 429 and denied.json()["code"] == "quota_exceeded" and denied.json()["quota_type"] == "papers"
+    assert fetched == ["p-remote"]
+
+
+def test_labeled_papers_are_paginated_owner_only_and_flag_incomplete(app, business):
+    alice, alice_token = account(app, username="alice")
+    bob, _ = account(app, username="bob")
+    catalog, preferences = business.paper_catalog, business.user_preferences
+    for index in range(4):
+        catalog.add_paper({"arxiv_id": f"p{index}", "title": f"Title {index}", "abstract": "Abstract"})
+    catalog.add_paper({"arxiv_id": "p-partial"})
+    for arxiv_id in ("p0", "p1", "p-partial"):
+        assert preferences.add_liked_paper(alice.user_id, arxiv_id)
+    for arxiv_id in ("p2", "p3"):
+        assert preferences.add_disliked_paper(alice.user_id, arxiv_id)
+    assert preferences.add_liked_paper(bob.user_id, "p0")
+    client = http(app, alice_token)
+    path = f"/api/user/labeled-papers/{alice.user_id}"
+    first = client.get(path, params={"page_size": 3}).json()
+    second = client.get(path, params={"page": 2, "page_size": 3}).json()
+    assert first["total"] == second["total"] == 5
+    assert len(first["items"]) == 3 and len(second["items"]) == 2
+    items = first["items"] + second["items"]
+    by_id = {item["arxiv_id"]: item for item in items}
+    assert set(by_id) == {"p0", "p1", "p2", "p3", "p-partial"}
+    # 与前端原有顺序一致：喜欢的在前，不喜欢的在后。
+    assert [item["label"] for item in items] == ["liked"] * 3 + ["disliked"] * 2
+    assert by_id["p0"]["title"] == "Title 0" and by_id["p0"]["incomplete"] is False
+    assert by_id["p-partial"]["incomplete"] is True
+    assert {item["arxiv_id"] for item in client.get(path, params={"label": "disliked"}).json()["items"]} == {"p2", "p3"}
+    assert client.get(path, params={"page": 3, "page_size": 3}).json()["items"] == []
+    assert client.get(path, params={"page_size": 101}).status_code == 422
+    denied = client.get(f"/api/user/labeled-papers/{bob.user_id}")
+    assert denied.status_code == 403 and denied.json()["code"] == "identity_mismatch"
+
+
+def test_anonymous_login_flood_blocks_ip_but_user_rate_limit_does_not(app_factory):
+    app = app_factory(RATE_LIMIT_AUTH="1/minute", RATE_LIMIT_USER="1/minute", RATE_LIMIT_VIOLATION_LIMIT="1/minute")
+    _, token = account(app)  # 登录本身用掉该 IP 唯一一次认证入口额度
+    # 已登录用户自身超限只拒绝该用户，同一出口 IP 不会被封。
+    assert http(app, token).get("/api/auth/check").status_code == 200
+    for _ in range(3):
+        assert http(app, token).get("/api/auth/check").json()["code"] == "rate_limit_exceeded"
+    assert http(app).post("/api/auth/register", json={}).json()["code"] == "rate_limit_exceeded"
+    # 匿名认证入口超限仍计入来源 IP 违规并触发临时封禁。
+    for _ in range(2):
+        http(app).post("/api/auth/login", json={"username": "x", "password": "y"})
+    assert http(app).get("/api/auth/config").json()["code"] == "ip_temporarily_blocked"

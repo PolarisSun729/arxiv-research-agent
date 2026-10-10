@@ -7,7 +7,7 @@ from __future__ import annotations
 """
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
@@ -15,9 +15,11 @@ from pydantic import BaseModel, Field, field_validator
 from dependencies import (
     get_interest_vector_store,
     get_memory_service,
+    get_paper_catalog_store,
     get_recommendation_service,
     get_user_preference_store,
 )
+from services.storage.sqlite.stores.paper_catalog import paper_has_display_metadata
 from services.user_behavior_policy import validate_weak_paper_action_type
 from utils.config import get_default_user_id
 from auth.context import bind_user_id, current_auth
@@ -97,6 +99,42 @@ async def get_user_preferences(user_id: str, user_preference_store=Depends(get_u
         return preferences
     except Exception as exc:
         logger.error("Error getting user preferences: %s", str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/labeled-papers/{user_id}")
+async def get_labeled_papers(
+    user_id: str,
+    label: Literal["liked", "disliked", "all"] = Query("all"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    user_preference_store=Depends(get_user_preference_store),
+    paper_catalog_store=Depends(get_paper_catalog_store),
+):
+    """已标记论文的分页列表。
+
+    只读偏好表和本地论文目录，不回源 arXiv、不扣配额；本地缺展示字段的条目标记 incomplete，
+    由前端按需调用论文详情接口修复，避免整页逐篇请求详情耗尽速率预算。
+    """
+    try:
+        liked = user_preference_store.get_liked_papers(user_id) if label != "disliked" else []
+        disliked = user_preference_store.get_disliked_papers(user_id) if label != "liked" else []
+        labeled = list(dict.fromkeys([*liked, *disliked]))
+        liked_ids = set(liked)
+        start = (page - 1) * page_size
+        page_ids = labeled[start:start + page_size]
+        papers = paper_catalog_store.get_papers_by_ids(page_ids)
+        items = []
+        for arxiv_id in page_ids:
+            paper = papers.get(arxiv_id) or {"arxiv_id": arxiv_id}
+            items.append({
+                **paper,
+                "label": "liked" if arxiv_id in liked_ids else "disliked",
+                "incomplete": not paper_has_display_metadata(paper),
+            })
+        return {"total": len(labeled), "page": page, "page_size": page_size, "items": items}
+    except Exception as exc:
+        logger.error("Error getting labeled papers: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
 
 

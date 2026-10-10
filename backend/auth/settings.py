@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from auth.key_config import REPO_ROOT
+from auth.key_config import REPO_ROOT, external_secret_values
 from middleware.common import env_bool, positive_env_int
 from utils.secret_redaction import register_sensitive_values
 
@@ -53,11 +53,7 @@ class JwtSettings:
             except (OSError, UnicodeError):
                 raise RuntimeError("无法读取 JWT 私有密钥文件，请检查路径、编码和权限（0600）。") from None
         # 覆盖各模型供应商及兼容访问密钥，禁止将已交给第三方的凭据复用为 JWT 签名材料。
-        external_secrets = {
-            value.strip() for name, raw in os.environ.items()
-            if name.upper().endswith(("_API_KEY", "_API_KEYS", "_ACCESS_KEY"))
-            for value in raw.split(",") if value.strip()
-        }
+        external_secrets = external_secret_values()
         # 长度校验不能证明随机性，但应拒绝明显占位值、重复字符和文档中的旧示例密钥。
         invalid = (
             not 43 <= len(secret) <= 512 or len(set(secret)) < 16

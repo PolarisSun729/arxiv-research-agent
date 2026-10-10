@@ -5,6 +5,13 @@ from services.storage.sqlite.base import BaseSqliteStore
 from services.storage.sqlite.shared import logger
 
 
+def paper_has_display_metadata(paper: Dict[str, Any]) -> bool:
+    """判断本地论文记录是否足以支撑列表卡片展示，缺字段时允许详情接口回源修复。"""
+    title = str(paper.get("title") or "").strip()
+    abstract = str(paper.get("abstract") or paper.get("summary") or "").strip()
+    return bool(title and abstract)
+
+
 class PaperCatalogStore(BaseSqliteStore):
     """arxiv_papers 表的内部实现；只负责论文目录和 embedding 元数据引用。"""
 
@@ -106,22 +113,44 @@ class PaperCatalogStore(BaseSqliteStore):
 
                 row = cursor.fetchone()
                 if row:
-                    return {
-                        'arxiv_id': row[0],
-                        'title': row[1],
-                        'authors': self._deserialize_paper_db_value(row[2]),
-                        'abstract': row[3],
-                        'categories': self._deserialize_paper_db_value(row[4]),
-                        'published_date': row[5],
-                        'url': row[6],
-                        'embedding_id': row[7],
-                        'embedding_model': row[8],
-                        'created_at': row[9]
-                    }
+                    return self._paper_from_row(row)
                 return None
         except Exception as e:
             logger.error(f"Error getting paper: {str(e)}")
             return None
+
+    def get_papers_by_ids(self, arxiv_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """批量读取本地论文，返回 arxiv_id → 论文；本地没有的 ID 不出现在结果中，排序由调用方决定。"""
+        unique_ids = list(dict.fromkeys(arxiv_id for arxiv_id in arxiv_ids if arxiv_id))
+        papers: Dict[str, Dict[str, Any]] = {}
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            # SQLite 旧版本最多 999 个绑定参数；分批查询，调用方传入较多 ID 也不会触发上限。
+            for start in range(0, len(unique_ids), 500):
+                batch = unique_ids[start:start + 500]
+                placeholders = ", ".join("?" for _ in batch)
+                cursor.execute(
+                    "SELECT arxiv_id, title, authors, abstract, categories, published_date, url, embedding_id, embedding_model, created_at "
+                    f"FROM arxiv_papers WHERE arxiv_id IN ({placeholders})",
+                    batch,
+                )
+                for row in cursor.fetchall():
+                    papers[row[0]] = self._paper_from_row(row)
+        return papers
+
+    def _paper_from_row(self, row) -> Dict[str, Any]:
+        return {
+            'arxiv_id': row[0],
+            'title': row[1],
+            'authors': self._deserialize_paper_db_value(row[2]),
+            'abstract': row[3],
+            'categories': self._deserialize_paper_db_value(row[4]),
+            'published_date': row[5],
+            'url': row[6],
+            'embedding_id': row[7],
+            'embedding_model': row[8],
+            'created_at': row[9]
+        }
 
     def search_papers_by_category(self, category: str) -> List[Dict[str, Any]]:
         try:

@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import secrets
 from dataclasses import dataclass
-from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request, Security
 from fastapi.responses import JSONResponse
@@ -15,45 +13,20 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from core.errors import ErrorCode, make_error_payload
-from auth.key_config import ApiKeyPolicy, get_valid_api_keys as get_valid_api_keys, load_key_policies
+from auth.errors import AuthError
+from auth.key_config import ApiKeyPolicy, load_key_policies
+from auth.request_body import read_bounded_body, replay_receive
+from middleware.common import SECURITY_HEADERS, get_allowed_origins, positive_env_int, public_health
 
 
-_DEFAULT_ORIGINS = "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173"
 _KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False, description="管理员分配的后端访问密钥")
-SECURITY_HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"}
-
-
-def get_allowed_origins() -> tuple[str, ...]:
-    origins = tuple(dict.fromkeys(origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", _DEFAULT_ORIGINS).split(",") if origin.strip()))
-    if not origins:
-        raise RuntimeError("ALLOWED_ORIGINS 不能为空，请配置明确的前端 Origin。")
-    for origin in origins:
-        try:
-            parsed = urlsplit(origin)
-            _ = parsed.port
-            valid = (
-                parsed.scheme in {"http", "https"}
-                and parsed.hostname
-                and "*" not in origin
-                and not parsed.username
-                and not parsed.password
-                and not parsed.path
-                and not parsed.query
-                and not parsed.fragment
-                and not any(char.isspace() for char in origin)
-            )
-        except ValueError:
-            valid = False
-        if not valid:
-            # 不回显错误配置，防止误把带凭据的 URL 写入启动日志。
-            raise RuntimeError("ALLOWED_ORIGINS 仅允许完整的 http/https Origin，不能含通配符、路径或凭据。")
-    return origins
 
 
 @dataclass(frozen=True)
 class ApiKeySettings:
     policies: tuple[ApiKeyPolicy, ...]
     allowed_origins: tuple[str, ...]
+    max_body_bytes: int = 1048576
 
     @property
     def key_hashes(self) -> tuple[bytes, ...]:
@@ -64,6 +37,7 @@ class ApiKeySettings:
         return cls(
             policies=load_key_policies(),
             allowed_origins=get_allowed_origins(),
+            max_body_bytes=positive_env_int("AUTH_MAX_REQUEST_BYTES", 1048576),
         )
 
     def match(self, candidate: str) -> ApiKeyPolicy | None:
@@ -126,11 +100,11 @@ class ApiKeyMiddleware:
             await send(message)
 
         # 仅健康检查与登录模式公开；OPTIONS 预检由外层 CORS 处理，不整体豁免其他路径。
-        public_health = scope["type"] == "http" and scope.get("path") == "/health" and scope.get("method") in {"GET", "HEAD"}
+        health = scope["type"] == "http" and public_health(scope)
         public_config = scope["type"] == "http" and scope.get("path") == "/api/auth/config" and scope.get("method") == "GET"
         if public_config:
             scope["security_auth_public"] = True
-        if not public_health and not public_config:
+        if not health and not public_config:
             error = _authentication_error(Headers(scope=scope), self.settings, scope)
             if error:
                 scope["security_error_code"] = error.detail["code"]
@@ -141,5 +115,14 @@ class ApiKeyMiddleware:
                     await response(scope, receive, send_secure)
                 return
             scope["api_key_authenticated"] = True
+            if scope["type"] == "http" and scope.get("method") in {"POST", "PUT", "PATCH", "DELETE"}:
+                # 与 JWT 模式相同：认证通过后先有界读取请求体，慢速或超大上传不能长期占用 worker。
+                try:
+                    body = await read_bounded_body(receive, self.settings.max_body_bytes)
+                except AuthError as exc:
+                    scope["security_error_code"] = exc.code
+                    await exc.to_response()(scope, receive, send_secure)
+                    return
+                receive = replay_receive(body, receive)
 
         await self.app(scope, receive, send_secure)

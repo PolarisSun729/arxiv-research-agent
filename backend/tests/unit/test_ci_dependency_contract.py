@@ -100,21 +100,34 @@ def _doctor_required_modules() -> set[str]:
     return modules
 
 
+# 导入名与发行版名不同的包。本机未安装时 packages_distributions() 查不到，必须静态映射，
+# 否则测试结果取决于本机装了哪些包，而不是 requirements 是否声明。
+_IMPORT_NAME_DISTRIBUTIONS = {"fitz": {"pymupdf"}}
+
+
+def _undeclared_modules(modules: set[str], declared: set[str], installed: dict[str, list[str]]) -> list[str]:
+    def candidates(module: str) -> set[str]:
+        names = {module, *_IMPORT_NAME_DISTRIBUTIONS.get(module, set()), *installed.get(module, [])}
+        # 已安装时以实际发行版为准（如 docling 在部分环境由 docling-slim 提供）；未安装时按导入名与静态映射判断。
+        return {name.lower().replace("_", "-") for name in names}
+
+    return sorted(module for module in modules if not candidates(module) & declared)
+
+
 def test_doctor_required_modules_are_declared_in_requirements() -> None:
     # 本机环境往往装了比 requirements 更多的包；doctor 若检查未声明的依赖，只会在 CI 全新安装时暴露。
     declared = _requirement_names(REPO_ROOT / "requirements.txt")
-    distributions = packages_distributions()
     modules = _doctor_required_modules()
     assert modules, "未能从 doctor.py 解析出依赖检查列表"
+    assert _undeclared_modules(modules, declared, packages_distributions()) == []
 
-    undeclared = sorted(
-        module
-        for module in modules
-        if not any(dist.lower().replace("_", "-") in declared for dist in distributions.get(module, []))
-        # docling 在部分本地环境以 docling-slim 发行版提供，requirements 中声明的是 docling。
-        and not (module == "docling" and "docling" in declared)
-    )
-    assert undeclared == []
+
+def test_undeclared_module_check_does_not_depend_on_local_installs() -> None:
+    declared = {"pymupdf", "pypdf", "docling"}
+    # 本机什么都没装时，按导入名和静态映射判断。
+    assert _undeclared_modules({"fitz", "pypdf", "docling", "yaml"}, declared, {}) == ["yaml"]
+    # 已安装的实际发行版也能匹配声明。
+    assert _undeclared_modules({"docling"}, {"docling-slim"}, {"docling": ["docling-slim"]}) == []
 
 
 def _marker_env(python_full_version: str) -> dict[str, str]:

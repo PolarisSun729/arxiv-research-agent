@@ -16,7 +16,9 @@ from fastapi import Depends, HTTPException
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
-from auth.api_key_middleware import ApiKeySettings, get_allowed_origins, get_valid_api_keys
+from auth.api_key_middleware import ApiKeySettings
+from auth.key_config import get_valid_api_keys
+from middleware.common import get_allowed_origins
 from core.errors import AppError, ErrorCode, sanitize_detail
 from utils import logging_utils
 from utils.secret_redaction import install_log_redaction, redact_sensitive_value, redact_text

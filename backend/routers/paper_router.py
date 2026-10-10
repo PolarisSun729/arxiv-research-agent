@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
+from auth.charging import charge
 from auth.context import current_auth
 from core.errors import AppError, ErrorCode, error_response
 from dependencies import (
@@ -26,6 +27,7 @@ from dependencies import (
     get_user_preference_store,
     get_vector_store_service,
 )
+from services.storage.sqlite.stores.paper_catalog import paper_has_display_metadata
 from utils.config import get_default_user_id
 from utils.storage_paths import ARXIV_OAI_SYNC_META_FILE, ARXIV_OAI_SYNC_STATE_FILE
 
@@ -88,13 +90,6 @@ def _get_sync_status_payload() -> Dict[str, Any]:
         "syncErrors": _safe_int(meta.get("errors", summary.get("errors", 0))),
         "syncErrorMessage": meta.get("error_message"),
     }
-
-
-def _paper_has_display_metadata(paper: Dict[str, Any]) -> bool:
-    """判断本地论文记录是否足以支撑列表卡片展示，缺字段时允许详情接口回源修复。"""
-    title = str(paper.get("title") or "").strip()
-    abstract = str(paper.get("abstract") or paper.get("summary") or "").strip()
-    return bool(title and abstract)
 
 
 @router.get("/stats")
@@ -273,8 +268,16 @@ async def get_paper(
     """
     try:
         paper = paper_catalog_store.get_paper(arxiv_id)
-        if paper and _paper_has_display_metadata(paper):
+        if paper and paper_has_display_metadata(paper):
             return paper
+
+        # 本地命中是免费读取；只有回源 arXiv 才消耗 papers 配额。额度用尽时仍可返回本地的不完整记录。
+        try:
+            await charge("papers")
+        except AppError:
+            if paper:
+                return paper
+            raise
 
         # 历史数据可能只落了 ID/向量；缺少标题或摘要时回源并修复本地记录，避免已标记页出现空卡片。
         try:
@@ -300,7 +303,7 @@ async def get_paper(
         if paper:
             return paper
         raise HTTPException(status_code=404, detail="Paper not found")
-    except HTTPException:
+    except (HTTPException, AppError):
         raise
     except Exception as exc:
         logger.error("Error getting paper: %s", str(exc))

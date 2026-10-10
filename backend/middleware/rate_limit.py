@@ -17,7 +17,11 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from auth.charging import api_key_charger
+from auth.errors import AuthError
 from auth.key_config import ApiKeyPolicy, validate_rate
+from auth.permissions import ROUTE_POLICIES
+from core.errors import AUTHENTICATION_FAILURE_CODES
 from middleware.common import policy_error, positive_env_int, public_health
 
 
@@ -40,7 +44,6 @@ _EXPENSIVE_OPERATIONS = {
     ("POST", "/api/user/dislike-paper"),
     ("POST", "/api/user/paper-action"),
 }
-_AUTH_ERRORS = {"missing_api_key", "invalid_api_key", "api_key_disabled", "api_key_expired", "missing_token", "invalid_token", "invalid_credentials"}
 
 
 @dataclass(frozen=True)
@@ -72,7 +75,8 @@ class RateLimitSettings:
             # URL 可能包含 Redis 密码，格式错误只能返回固定说明，不能回显原值或解析异常。
             raise RuntimeError("RATE_LIMIT_STORAGE 只支持 memory://、redis:// 或 rediss://。")
         return cls(
-            uri, validate_rate(os.getenv("RATE_LIMIT_IP", "60/minute;10/second")),
+            # 认证前的 IP 预算只防洪水与暴力破解；NAT 后的多个已登录用户由各自的身份预算区分，不能被它卡住。
+            uri, validate_rate(os.getenv("RATE_LIMIT_IP", "300/minute;30/second")),
             validate_rate(os.getenv("RATE_LIMIT_READ", "60/minute")), validate_rate(os.getenv("RATE_LIMIT_WRITE", "20/minute")),
             validate_rate(os.getenv("RATE_LIMIT_EXPENSIVE", "5/minute")),
             validate_rate(os.getenv("AUTH_FAILURE_LIMIT", "20/minute")),
@@ -134,7 +138,19 @@ class RateLimitController:
         return self._consume(self.settings.ip, "ip", client_ip)
 
     def after_auth(self, policy: ApiKeyPolicy, scope: Scope) -> LimitDecision:
-        return self._after_identity(policy.identifier, policy.rate_limit, scope, daily_quota=policy.daily_quota)
+        decision = self._after_identity(policy.identifier, policy.rate_limit, scope)
+        if decision.code or policy.daily_quota is None:
+            return decision
+        # 日配额只计入权限清单中标记了配额的付费操作；登录校验、列表轮询等免费请求只回显剩余额度。
+        route_policy = ROUTE_POLICIES.get((scope.get("method", ""), scope.get("security_route", "")))
+        daily = self._daily_quota(policy, consume=bool(route_policy and route_policy.quota))
+        return LimitDecision(daily.code, daily.retry_after, {**decision.headers, **daily.headers})
+
+    def charge_key(self, policy: ApiKeyPolicy) -> LimitDecision:
+        """业务层在真正回源或调用模型时扣减密钥日配额，例如论文详情只在本地缺失时计费。"""
+        if policy.daily_quota is None:
+            return LimitDecision()
+        return self._daily_quota(policy, consume=True)
 
     def after_user_auth(self, user_id: str, scope: Scope) -> LimitDecision:
         # JWT 可重复登录和轮换；计数永远绑定稳定 user_id，不按 token 或来源 IP 拆分。
@@ -147,7 +163,7 @@ class RateLimitController:
         identifier = hashlib.sha256(username.casefold().encode("utf-8")).hexdigest()
         return self._consume(self.settings.login_account, "login-account", identifier)
 
-    def _after_identity(self, identifier: str, rate_limit: str, scope: Scope, *, daily_quota: int | None = None, identity_label: str = "key") -> LimitDecision:
+    def _after_identity(self, identifier: str, rate_limit: str, scope: Scope, *, identity_label: str = "key") -> LimitDecision:
         headers = {}
         route = scope.get("security_route", "")
         method = scope.get("method", "")
@@ -164,21 +180,23 @@ class RateLimitController:
                 return decision
             if not headers or int(decision.headers["X-RateLimit-Remaining"]) < int(headers["X-RateLimit-Remaining"]):
                 headers = decision.headers
-        if daily_quota is not None:
-            now = datetime.fromtimestamp(self.clock(), timezone.utc)
-            reset = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), timezone.utc).timestamp()
-            item = RateLimitItemPerDay(daily_quota)
-            identity = ("arxiv-stage2", "daily", identifier, now.date().isoformat())
-            # 日期加入计数键，按 UTC 自然日切换；存储原子递增确保并发和多 worker 无法超发。
-            allowed = self.backend.hit(item, *identity)
-            _, remaining = self.backend.get_window_stats(item, *identity)
-            headers.update({"X-DailyQuota-Limit": str(daily_quota), "X-DailyQuota-Remaining": str(remaining), "X-DailyQuota-Reset": str(int(reset))})
-            if not allowed:
-                return LimitDecision("daily_quota_exceeded", max(1, math.ceil(reset - self.clock())), headers)
+        return LimitDecision(headers=headers)
+
+    def _daily_quota(self, policy: ApiKeyPolicy, *, consume: bool) -> LimitDecision:
+        now = datetime.fromtimestamp(self.clock(), timezone.utc)
+        reset = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), timezone.utc).timestamp()
+        item = RateLimitItemPerDay(policy.daily_quota)
+        identity = ("arxiv-stage2", "daily", policy.identifier, now.date().isoformat())
+        # 日期加入计数键，按 UTC 自然日切换；存储原子递增确保并发和多 worker 无法超发。
+        allowed = self.backend.hit(item, *identity) if consume else True
+        _, remaining = self.backend.get_window_stats(item, *identity)
+        headers = {"X-DailyQuota-Limit": str(policy.daily_quota), "X-DailyQuota-Remaining": str(remaining), "X-DailyQuota-Reset": str(int(reset))}
+        if not allowed:
+            return LimitDecision("daily_quota_exceeded", max(1, math.ceil(reset - self.clock())), headers)
         return LimitDecision(headers=headers)
 
     def observe_rejection(self, client_ip: str, code: str | None) -> None:
-        if code in _AUTH_ERRORS:
+        if code in AUTHENTICATION_FAILURE_CODES:
             rule, label = self.settings.auth_failures, "auth-failures"
         elif code == "rate_limit_exceeded":
             rule, label = self.settings.violations, "rate-violations"
@@ -193,11 +211,20 @@ class RateLimitMiddleware:
     def __init__(self, app: ASGIApp, *, controller: RateLimitController, before_auth: bool = False) -> None:
         self.app, self.controller, self.before_auth = app, controller, before_auth
 
+    def _key_charger(self, policy: ApiKeyPolicy):
+        def charge() -> None:
+            decision = self.controller.charge_key(policy)
+            if decision.code:
+                raise AuthError(decision.code, retry_after=decision.retry_after)
+
+        return charge
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or public_health(scope):
             await self.app(scope, receive, send)
             return
         client_ip = scope.get("security_client_ip", "unknown")
+        key_policy = None
         try:
             if self.before_auth:
                 decision = await run_in_threadpool(self.controller.before_auth, client_ip)
@@ -206,11 +233,11 @@ class RateLimitMiddleware:
             elif scope.get("auth_session"):
                 decision = await run_in_threadpool(self.controller.after_user_auth, scope["auth_session"].user.user_id, scope)
             else:
-                policy = scope.get("api_key_policy")
-                if policy is None or not scope.get("api_key_authenticated"):
+                key_policy = scope.get("api_key_policy")
+                if key_policy is None or not scope.get("api_key_authenticated"):
                     await policy_error(scope, "missing_api_key", 401)(scope, receive, send)
                     return
-                decision = await run_in_threadpool(self.controller.after_auth, policy, scope)
+                decision = await run_in_threadpool(self.controller.after_auth, key_policy, scope)
             if decision.code:
                 if self.before_auth:
                     await run_in_threadpool(self.controller.observe_rejection, client_ip, decision.code)
@@ -229,12 +256,21 @@ class RateLimitMiddleware:
                 for name, value in decision.headers.items():
                     if name not in headers:
                         headers[name] = value
-                if self.before_auth:
+                code = scope.get("security_error_code")
+                # 凭据无效、匿名登录/注册入口超限才计入 IP 违规；已认证身份的超限由该身份承担，不能封掉同一出口的其他用户。
+                anonymous_over_limit = code == "rate_limit_exceeded" and scope.get("security_auth_public")
+                if self.before_auth and (code in AUTHENTICATION_FAILURE_CODES or anonymous_over_limit):
                     # 在认证拒绝的响应头发出前记录失败，不等待读取攻击者可能永不发送的请求体。
                     try:
-                        await run_in_threadpool(self.controller.observe_rejection, client_ip, scope.get("security_error_code"))
+                        await run_in_threadpool(self.controller.observe_rejection, client_ip, code)
                     except Exception:
                         logger.error("security_abuse_tracking_unavailable")
             await send(message)
 
-        await self.app(scope, receive, send_limited)
+        # 密钥模式没有账号上下文；业务层通过 auth.charging 在真正付费的位置扣减该密钥的日配额。
+        charger_token = api_key_charger.set(self._key_charger(key_policy)) if key_policy is not None else None
+        try:
+            await self.app(scope, receive, send_limited)
+        finally:
+            if charger_token is not None:
+                api_key_charger.reset(charger_token)

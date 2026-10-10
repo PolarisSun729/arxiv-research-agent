@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import json
 
-import anyio
 from fastapi import Request
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers, MutableHeaders, QueryParams
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from auth.api_key_middleware import SECURITY_HEADERS
 from auth.context import AuthContext, bind_identity_fields, bind_user_id, current_auth
 from auth.errors import AuthError
 from auth.jwt_handler import JwtAuthenticator
 from auth.permissions import PUBLIC_AUTH_ROUTES, ROUTE_POLICIES
-from middleware.common import public_health
+from auth.request_body import read_bounded_body, replay_receive
+from middleware.common import SECURITY_HEADERS, public_health
 
 
 async def require_jwt_identity(request: Request) -> None:
@@ -24,23 +23,7 @@ async def require_jwt_identity(request: Request) -> None:
 
 
 async def _validated_body(scope: Scope, receive: Receive, max_bytes: int) -> Receive:
-    chunks, size = [], 0
-    try:
-        with anyio.fail_after(30):
-            while True:
-                message = await receive()
-                if message["type"] == "http.disconnect":
-                    raise AuthError("request_timeout")
-                chunk = message.get("body", b"")
-                size += len(chunk)
-                if size > max_bytes:
-                    raise AuthError("request_too_large")
-                chunks.append(chunk)
-                if not message.get("more_body", False):
-                    break
-    except TimeoutError:
-        raise AuthError("request_timeout") from None
-    body = b"".join(chunks)
+    body = await read_bounded_body(receive, max_bytes)
     if body:
         try:
             decoded = json.loads(body)
@@ -54,17 +37,7 @@ async def _validated_body(scope: Scope, receive: Receive, max_bytes: int) -> Rec
                 MutableHeaders(scope=scope)["content-length"] = str(len(body))
         except (ValueError, UnicodeError, RecursionError):
             raise AuthError("request_validation_error") from None
-    consumed = False
-
-    async def replay() -> Message:
-        nonlocal consumed
-        if not consumed:
-            consumed = True
-            return {"type": "http.request", "body": body, "more_body": False}
-        # 后续仍读取真实 disconnect，不能用重复的空 body 让 SSE 的断线观察陷入忙循环。
-        return await receive()
-
-    return replay
+    return replay_receive(body, receive)
 
 
 class JwtAuthMiddleware:

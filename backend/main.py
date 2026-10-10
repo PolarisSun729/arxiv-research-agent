@@ -11,7 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from auth.api_key_middleware import ApiKeyMiddleware, ApiKeySettings, SECURITY_HEADERS, get_allowed_origins, verify_api_key
+from auth.api_key_middleware import ApiKeyMiddleware, ApiKeySettings, verify_api_key
 from auth.jwt_handler import JwtAuthenticator
 from auth.jwt_middleware import JwtAuthMiddleware, UserQuotaMiddleware, require_jwt_identity
 from auth.settings import JwtSettings, auth_mode
@@ -34,6 +34,7 @@ from routers.user_router import router as user_router
 from utils.config import get_debug_routes_runtime_config
 from utils.logging_utils import configure_backend_logging, info_event
 from middleware.audit_log import AuditLogMiddleware, AuditSink
+from middleware.common import SECURITY_HEADERS, get_allowed_origins
 from middleware.ip_filter import IPFilterMiddleware, IPFilterSettings
 from middleware.rate_limit import RateLimitController, RateLimitMiddleware, RateLimitSettings
 

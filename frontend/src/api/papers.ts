@@ -465,36 +465,37 @@ export async function getPaperById(id: string): Promise<Paper> {
   return normalizePaper(await request.get(`/paper/${id}`))
 }
 
-export async function getLabeledPapers(params: { 
+export async function getLabeledPapers(params: {
   label?: 'liked' | 'disliked'
   page: number
   pageSize: number
+  userId?: string
 }): Promise<PaginatedResponse<LabeledPaper>> {
-  const preferences = await getUserPreferences()
-  const liked = preferences.liked_papers || []
-  const disliked = preferences.disliked_papers || []
-  const targetIds = params.label === 'liked'
-    ? liked
-    : params.label === 'disliked'
-      ? disliked
-      : [...liked, ...disliked]
-
-  const papers = await Promise.all(
-    targetIds.map(async id => {
-      const paper = normalizePaper(await request.get(`/paper/${id}`))
-      return {
-        ...paper,
-        label: liked.includes(id) ? 'liked' as const : 'disliked' as const,
-        labeledAt: new Date().toISOString()
-      }
-    })
+  // 服务端一次返回本地已有的整页论文，不再逐篇请求详情，免得一页就耗尽速率预算和论文配额。
+  const response: any = await request.get(`/user/labeled-papers/${resolveUserId(params.userId)}`, {
+    params: {
+      label: params.label || 'all',
+      page: params.page,
+      page_size: params.pageSize
+    }
+  })
+  const rawItems: any[] = Array.isArray(response?.items) ? response.items : []
+  // 只有本地缺标题或摘要的条目才走详情接口回源修复；修复失败时保留基础卡片，不影响整页展示。
+  const repaired = await Promise.allSettled(
+    rawItems.map(item => (item?.incomplete ? getPaperById(item.arxiv_id) : Promise.resolve(null)))
   )
-
-  const start = (params.page - 1) * params.pageSize
-  const end = start + params.pageSize
+  const items = rawItems.map((item, index) => {
+    const result = repaired[index]
+    const paper = result.status === 'fulfilled' && result.value ? result.value : normalizePaper(item)
+    return {
+      ...paper,
+      label: item?.label === 'disliked' ? 'disliked' as const : 'liked' as const,
+      labeledAt: new Date().toISOString()
+    }
+  })
   return {
-    total: papers.length,
-    items: papers.slice(start, end)
+    total: Number(response?.total || 0),
+    items
   }
 }
 

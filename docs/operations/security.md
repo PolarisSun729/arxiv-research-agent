@@ -5,11 +5,11 @@
 ## 1. 入口顺序与公开路径
 
 ```text
-审计 → CORS → IP 过滤 → IP 限流 → 认证（JWT 或 API Key）/角色/身份 → 用户（或密钥）速率 → 日配额 → 业务
+审计 → CORS → IP 过滤 → IP 限流 → 认证（JWT 或 API Key）/角色/身份 → 用户（或密钥）速率 → 日配额 → 业务（按需回源时再扣配额）
 ```
 
 - 全部是纯 ASGI 中间件，不缓冲 SSE。角色拒绝发生在业务依赖初始化前；日配额不足在 SSE 响应头发出前返回 429。
-- JSON 请求体默认最多 1 MiB（`AUTH_MAX_REQUEST_BYTES`），读取超时 30 秒；修改时同步检查 Nginx 限制。
+- JSON 请求体默认最多 1 MiB（`AUTH_MAX_REQUEST_BYTES`），读取超时 30 秒，JWT 与 API Key 模式都生效（超限 413 `request_too_large`，超时 408 `request_timeout`）；修改时同步检查 Nginx 限制。
 - 公开入口只有精确的 `GET /health`、`GET /api/auth/config`、`POST /api/auth/login`、`POST /api/auth/register`（注册默认 403）。`/health` 只证明进程存活，不验证 Redis 或认证库。
 - CORS 预检由外层处理，普通 `OPTIONS` 不绕过认证。CORS 只约束浏览器，真正的授权来自认证层。
 - 不发布 `/docs`、`/redoc`、`/openapi.json`；API 响应带 `Cache-Control: no-store`；422 只返回字段位置与校验类型，不回显请求体。
@@ -105,14 +105,14 @@ python scripts/manage_users.py set-password --username admin --env-file .env.pro
 | guest | 10 | 5 | 0 |
 
 - `-1` 不限，`0` 无额度；权限先于配额判断，给 guest 加 Agent 配额不会授予 Agent 权限。
-- `papers` 覆盖论文列表/搜索/详情/推荐、收藏与行为记录、导入/下载/建索引、画像重建；`qa_queries` 覆盖普通与流式问答；`agent_runs` 覆盖 Agent 对话与续跑，内部论文与 QA 工具另扣对应类别。
-- 在认证 SQLite 中用 `BEGIN IMMEDIATE` 原子校验并扣减，UTC 00:00 重置。配额记录丢失或存储故障返回 503，不补发额度。角色变更应用新默认限额但保留今日用量。
+- 配额只在真正产生外部成本的地方扣（模型调用、embedding、回源 arXiv）。`papers` 覆盖 arXiv 搜索、推荐、收藏与行为记录、导入/下载/建索引、画像重建；本地论文列表、分类列表、已标记论文列表（`GET /api/user/labeled-papers/{user_id}`）和本地已有的论文详情不扣配额，论文详情只在本地缺失或缺标题/摘要、需要回源 arXiv 时扣 1 次（额度用尽时返回本地不完整记录，本地也没有才返回 429）；`qa_queries` 覆盖普通与流式问答；`agent_runs` 覆盖 Agent 对话与续跑，内部论文与 QA 工具另扣对应类别。
+- 在认证 SQLite 中用 `BEGIN IMMEDIATE` 原子校验并扣减，UTC 00:00 重置。配额记录丢失或存储故障返回 503，不补发额度。角色变更会把三类限额重置为新角色的默认值（之前为该用户单独调整的限额不保留），今日已用量保留。
 
 ### 速率
 
 ```dotenv
 RATE_LIMIT_STORAGE=memory://
-RATE_LIMIT_IP="60/minute;10/second"
+RATE_LIMIT_IP="300/minute;30/second"
 RATE_LIMIT_USER=60/minute
 RATE_LIMIT_READ=60/minute
 RATE_LIMIT_WRITE=20/minute
@@ -124,10 +124,11 @@ RATE_LIMIT_VIOLATION_LIMIT=30/minute
 ABUSE_BLOCK_SECONDS=900
 ```
 
+- `RATE_LIMIT_IP` 在认证前按来源 IP 计数，只用于防洪水和扫描；同一 NAT 下的已登录用户共用它，所以默认值较宽，单个用户的用量由 `RATE_LIMIT_USER`（兼容模式为 `RATE_LIMIT_KEY`）约束。
 - 固定窗口，可用分号组合；所有层必须同时通过。`RATE_LIMIT_USER` 绑定稳定用户 ID，换 token 或 IP 不重置；`RATE_LIMIT_AUTH` 按 IP 约束公开认证入口，`RATE_LIMIT_LOGIN_ACCOUNT` 按规范化用户名约束跨 IP 猜密码。
 - 昂贵操作：Agent 对话与续跑、论文下载/创建、建 QA 索引、普通/流式 QA、画像重建、兴趣向量生成、推荐；论文详情 GET、点赞/点踩、行为 POST 可能回源并生成 embedding，也按昂贵计。准入阶段不读业务库，缓存命中也计数。
 - 准入语义：通过后业务失败、断线或缓存命中都不退还；前一层的计数不因后一层拒绝而回滚。配额统计请求/工具调用次数，**不是 token、篇数或费用**。
-- 同一 IP 一分钟内第 21 次认证失败或第 31 次速率拒绝，触发 900 秒临时封禁；封禁期间请求不延长封禁。日配额耗尽不算速率违规。
+- 同一 IP 一分钟内第 21 次认证失败或第 31 次速率拒绝，触发 900 秒临时封禁；封禁期间请求不延长封禁。计入速率违规的只有认证前的 IP 限流和匿名登录/注册入口的超限；已认证用户或密钥自身的速率超限只拒绝该身份，不会封掉同一出口 IP 的其他用户。日配额耗尽不算速率违规。
 
 ### 公网必须用持久化 Redis
 
@@ -194,6 +195,10 @@ AUDIT_LOG_BACKUP_COUNT=5
 - `BACKEND_API_KEYS` 逗号分隔，每个 32–256 个无空白可打印 ASCII 字符（`python -c "import secrets; print(secrets.token_urlsafe(32))"`），与模型供应商密钥分开。请求头为 `X-API-Key`；比较使用摘要 + `secrets.compare_digest`。
 - 需要按密钥设置名称、速率、日配额、禁用或过期时，从 [api_keys.example.json](../../backend/config/api_keys.example.json) 创建私有 `backend/config/api_keys.json`（已忽略）或用 `API_KEY_CONFIG_FILE` 指定。优先级：显式 `API_KEY_CONFIG_FILE` > 默认 `api_keys.json` > `BACKEND_API_KEYS`；文件有误时拒绝启动，不回退到环境变量。条目用 `key` 或 `key_env` 二选一。
 - 密钥计数按完整 SHA-256 摘要，跨 IP 共享；`RATE_LIMIT_KEY` 为默认密钥速率。过期每次请求即时判断，禁用和策略修改需重启。
+- `daily_quota` 只统计付费操作（与上文 JWT 配额清单相同，所有类别共用一个计数），`/api/auth/check`、列表轮询、本地论文详情等免费请求不消耗，只在 `X-DailyQuota-*` 响应头中回显剩余额度。**这是语义变化**：旧版本统计全部请求，升级后同样的数值实际可用次数会变多，需要时请调低。
+- 策略文件字段严格校验：条目只允许 `key`、`key_env`、`name`、`rate_limit`、`daily_quota`、`enabled`、`created_at`、`expires_at`，顶层只允许 `keys`；拼错字段名（如 `enable`、`daily_qouta`）会拒绝启动并在报错中写出字段名，而不是按默认值静默放宽。`key_env` 指向的变量未设置时报错会写出变量名，但不回显任何密钥值。
+- `expires_at` 只写日期（如 `2026-12-31`）表示当天 UTC 全天有效，次日 00:00 UTC 起失效；写了时间则精确到该时刻，不带时区按 UTC 解释。
+- 访问密钥不能与任何以 `_API_KEY`、`_API_KEYS`、`_ACCESS_KEY` 结尾的环境变量（如模型供应商密钥）相同；`BACKEND_API_KEYS` 和策略文件中 `key_env` 引用的变量本身就是访问密钥，不参与此检查。
 - 轮换：先设 `BACKEND_API_KEYS=旧,新` 并重启，分发新密钥后移除旧密钥再重启。
 - JWT 模式忽略 `BACKEND_API_KEYS` 和密钥策略文件。
 

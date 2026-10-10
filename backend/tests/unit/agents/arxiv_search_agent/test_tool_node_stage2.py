@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.helpers.module_isolation import isolated_project_modules
+
 
 def _load_tool_node_modules():
     repo_root = Path(__file__).resolve().parents[5]
@@ -61,7 +63,9 @@ def _load_tool_node_modules():
     }
 
 
-_MODULES = _load_tool_node_modules()
+# tools.tool_registry / utils.config 桩只服务本文件加载，加载后恢复，避免污染后续测试。
+with isolated_project_modules():
+    _MODULES = _load_tool_node_modules()
 AgentState = _MODULES["state_module"].AgentState
 ToolCallRequest = _MODULES["schemas"].ToolCallRequest
 execute_tool = _MODULES["tool_node_module"].execute_tool

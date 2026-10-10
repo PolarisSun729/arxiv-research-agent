@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tests.helpers.module_isolation import isolated_project_modules
+
 
 def _load_search_node_module():
     repo_root = Path(__file__).resolve().parents[5]
@@ -53,7 +55,11 @@ def _load_search_node_module():
     dependencies_module.get_memory_service = getattr(dependencies_module, "get_memory_service", lambda: object())
     dependencies_module.get_generation_service = getattr(dependencies_module, "get_generation_service", lambda: object())
     dependencies_module.get_paper_qa_service = getattr(dependencies_module, "get_paper_qa_service", lambda: object())
-    dependencies_module.get_recommendation_service = lambda: object()
+    dependencies_module.get_recommendation_service = getattr(
+        dependencies_module,
+        "get_recommendation_service",
+        lambda: object(),
+    )
     sys.modules["dependencies"] = dependencies_module
 
     if "tools.tool_registry" not in sys.modules:
@@ -81,7 +87,9 @@ def _load_search_node_module():
     return search_node, state_module.AgentState, schemas.ArxivSearchSpec
 
 
-search_node, AgentState, ArxivSearchSpec = _load_search_node_module()
+# 加载用的 dependencies / tools.tool_registry 桩只服务本文件，加载后恢复，避免后续测试拿到缺少 TOOL_REGISTRY 的假模块。
+with isolated_project_modules():
+    search_node, AgentState, ArxivSearchSpec = _load_search_node_module()
 
 
 class _FailingRecommendationService:

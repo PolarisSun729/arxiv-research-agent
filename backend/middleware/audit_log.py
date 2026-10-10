@@ -19,8 +19,7 @@ from starlette.datastructures import MutableHeaders
 from starlette.routing import Match
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from auth.api_key_middleware import SECURITY_HEADERS
-from middleware.common import env_bool, positive_env_int
+from middleware.common import SECURITY_HEADERS, env_bool, positive_env_int
 from middleware.ip_filter import IPFilterSettings
 from utils.secret_redaction import redact_sensitive_value
 
