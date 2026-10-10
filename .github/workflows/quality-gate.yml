@@ -56,15 +56,15 @@ jobs:
 
       - name: Install backend dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          # 固定刚安装的 CPU 版本，后续依赖解析不能悄悄把 Torch 换回 CUDA 构建。
-          python -c "from importlib.metadata import version; from pathlib import Path; Path('/tmp/cpu-constraints.txt').write_text(''.join(name + '==' + version(name) + '\n' for name in ('torch', 'torchvision')))"
-          python -m pip install -c /tmp/cpu-constraints.txt -r requirements.txt
+          # pip、wheel 也会被 freeze --all 记入发布锁，先按锁定版本安装，避免镜像或 pip 新版本改变发布锁哈希。
+          python -m pip install --require-hashes -r requirements-bootstrap.lock.txt
+          # 只按仓库中提交的锁文件安装：精确版本加哈希，CI 不再现场解析 requirements.txt 的版本范围。
+          # PyTorch CPU 源只提供 +cpu 版 torch/torchvision；其余包的哈希来自 PyPI，不匹配的文件会被拒绝。
+          python -m pip install --require-hashes --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.lock.txt
           python -m pip check
-          # 发布锁只取运行时依赖；测试依赖在其后安装，并受此快照约束，不能改动运行时版本。
+          # 发布锁只取运行时依赖；测试依赖在其后安装，测试锁中的运行时版本与上面一致（由依赖约定测试保证）。
           python -m pip freeze --all > /tmp/runtime-freeze.txt
-          python -m pip install -c /tmp/runtime-freeze.txt -r requirements-dev.txt
+          python -m pip install --require-hashes --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-dev.lock.txt
           python -m pip check
 
       - name: Install frontend dependencies

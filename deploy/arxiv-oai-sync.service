@@ -1,15 +1,30 @@
+# arXiv OAI-PMH 增量同步任务（一次性运行的 systemd 单元），由 arxiv-oai-sync.timer 每天触发。
+#
+# 安装方式：
+#   sudo install -o root -g root -m 644 deploy/arxiv-oai-sync.service /etc/systemd/system/arxiv-oai-sync.service
+# 手动立即执行一次：sudo systemctl start arxiv-oai-sync.service
+# 查看日志：journalctl -u arxiv-oai-sync（或 -t arxiv-oai-sync）
+#
+# 同步脚本把"上次同步到哪里"的游标保存在 backend/data/arxiv-oai-sync/，
+# 该目录在发布时链接到 shared/backend/data，因此切换版本不会丢失进度。
+
 [Unit]
 Description=arXiv OAI incremental synchronization
+# 等待网络真正可用（而不只是网卡启动），并排在主服务之后启动。
 After=network-online.target arxiv-agent.service
 Wants=network-online.target
 
 [Service]
+# oneshot：脚本执行完即结束，不是常驻进程。
 Type=oneshot
 User=arxiv
 Group=arxiv
 WorkingDirectory=/opt/arxiv-research-agent/current/backend
+# 路径前的 "-" 表示文件不存在时忽略，而不是让任务启动失败。
 EnvironmentFile=-/opt/arxiv-research-agent/shared/.env.production
+# 始终执行当前版本中的同步脚本。
 ExecStart=/opt/arxiv-research-agent/current/backend/07-arxiv-tools/sync_arxiv_oai_since_last_run.sh
+# 安全加固与主服务一致：禁止提权、独立 /tmp、新文件仅属主可访问。
 NoNewPrivileges=true
 PrivateTmp=true
 UMask=0077

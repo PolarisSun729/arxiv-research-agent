@@ -1,27 +1,57 @@
+# arXiv Research Agent 后端主服务（CI/CD 发布布局专用的 systemd 单元模板）。
+#
+# 安装方式：复制为 /etc/systemd/system/arxiv-agent.service（注意改名，去掉 -cicd 后缀），
+# apply_release.py 中的 SERVICE 常量与 sudoers 规则都使用 arxiv-agent.service 这个名字。
+#   sudo install -o root -g root -m 644 deploy/arxiv-agent-cicd.service /etc/systemd/system/arxiv-agent.service
+#   sudo systemctl daemon-reload && sudo systemctl enable arxiv-agent.service
+#
+# 所有路径都经由 current 链接，发布脚本切换 current 后执行 restart 即可换到新版本。
+# 注意：systemd 不支持行尾注释，注释必须独占一行。
+
 [Unit]
 Description=arXiv Research Agent (CI/CD releases)
+# 网络和 Redis（限流计数存储）就绪后再启动。
 After=network.target redis-server.service
 
 [Service]
+# notify：等进程主动通知"已就绪"（gunicorn 支持 sd_notify）才视为启动完成。
 Type=notify
+# 以非特权的部署用户运行，与部署目录、shared 数据的属主一致。
 User=arxiv
 Group=arxiv
+# 工作目录指向当前版本的 backend；apply_release.py 健康检查会核对进程 cwd 是否等于新版本目录。
 WorkingDirectory=/opt/arxiv-research-agent/current/backend
+# 生产配置（密钥、数据库连接等）存放在 shared，跨版本保留，不随代码包分发。
 EnvironmentFile=/opt/arxiv-research-agent/shared/.env.production
 # 每个发布版本链接到已完成安装的依赖环境，代码回退时依赖也同步回退。
+# gunicorn 参数说明：
+#   main:app                         backend/main.py 中的 FastAPI 应用对象
+#   -w 1                             单 worker 进程（每个 worker 都是独立进程，多开会成倍占用内存）
+#   -k uvicorn.workers.UvicornWorker 以 ASGI 方式运行，支持异步与 SSE 流式响应
+#   -b 127.0.0.1:8001                只监听本机，外部流量必须经过 nginx
+#   --forwarded-allow-ips ""         不信任任何代理头，应用看到的是真实 TCP 对端
+#   --timeout 120                    worker 超过 120 秒无响应则重启
+#   --access-logfile /dev/null       访问日志交给 nginx（脱敏格式），这里不重复记录
+#   --error-logfile -                错误日志输出到 stderr，由 journald 收集
 ExecStart=/opt/arxiv-research-agent/current/.venv/bin/gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker -b 127.0.0.1:8001 --forwarded-allow-ips "" --timeout 120 --access-logfile /dev/null --error-logfile - --log-level info
+# 环境变量层面同样清空可信代理列表，防止 uvicorn 从环境变量读到其他值。
 Environment="FORWARDED_ALLOW_IPS="
+# 异常退出时 5 秒后自动重启；正常 stop 不会触发。
 Restart=on-failure
 RestartSec=5
+# 内存限制：超过 1.2G 开始被内核回收施压，超过 1.5G 直接被 OOM 终止，保护整台服务器。
 MemoryMax=1.5G
 MemoryHigh=1.2G
+# 安全加固：进程及子进程无法通过 setuid 等方式提权；使用独立的 /tmp。
 NoNewPrivileges=true
 PrivateTmp=true
 # 新产生的账号库、日志和论文资产保持私有；前端静态文件由发布脚本单独赋予读取权限。
 UMask=0077
+# 标准输出/错误进入 journald，用 journalctl -u arxiv-agent 或 -t arxiv-agent 查看。
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=arxiv-agent
 
 [Install]
+# systemctl enable 后随系统启动（多用户模式）自动运行。
 WantedBy=multi-user.target

@@ -1,0 +1,5 @@
+# CI 安装工具本身的版本。发布打包使用 pip freeze --all，会把 pip、wheel 一并记入发布锁；
+# 不固定时，镜像更新或 pip 新版本发布都会改变发布锁哈希，使服务器 venv 缓存失效。
+# setuptools 已被运行时依赖引入并锁定在 requirements.lock.txt 中，这里不重复声明。
+pip>=26,<27
+wheel>=0.46,<1
