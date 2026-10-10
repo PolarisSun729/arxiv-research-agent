@@ -344,13 +344,7 @@ sudo cp /home/arxiv/bootstrap/deploy/nginx.conf /etc/nginx/sites-available/arxiv
 sudoedit /etc/nginx/sites-available/arxiv-agent
 ```
 
-替换域名及证书路径，并把静态目录的 `root` 行改为：
-
-```nginx
-root /opt/arxiv-research-agent/current/frontend/dist;
-```
-
-保留原模板的 SSE 设置、认证头转发和可信代理规则。然后：
+替换域名及证书路径。模板中静态目录已是 `root /opt/arxiv-research-agent/current/frontend/dist;`，部署根目录不同时才需要修改。保留原模板的 SSE 设置、认证头转发和可信代理规则。然后：
 
 ```bash
 sudo nginx -t
@@ -364,7 +358,7 @@ sudo systemctl enable --now certbot.timer
 
 前端已经以 `/api` 为地址构建，同域请求由 Nginx 转发。普通应用发布后 Nginx 会通过 `current` 读取新前端，不需要每次 reload。
 
-> **前端目录改名（一次性迁移）**：前端目录已由 `new_frontend` 改名为 `frontend`，发布包内的路径随之变为 `frontend/dist`。2026-10 之前完成初始化的服务器，需要在首次发布新版本**之后**，把 `/etc/nginx/sites-available/arxiv-agent` 中的 `root` 改为上面的 `frontend/dist`，再执行 `sudo nginx -t && sudo systemctl reload nginx`。如果这次发布失败并自动回退到旧版本，旧版本仍是 `new_frontend/dist`，此时 nginx 的 `root` 保持旧值即可。
+> **前端目录改名（一次性迁移）**：前端目录已由 `new_frontend` 改名为 `frontend`，发布包内的路径随之变为 `frontend/dist`。2026-10 之前完成初始化的服务器，需要在首次发布新版本**之后**，把 `/etc/nginx/sites-available/arxiv-agent` 中的 `root` 改为模板中的 `current/frontend/dist`，再执行 `sudo nginx -t && sudo systemctl reload nginx`。如果这次发布失败并自动回退到旧版本，旧版本仍是 `new_frontend/dist`，此时 nginx 的 `root` 保持旧值即可。
 
 ## 11. 验收、排障与回退
 
