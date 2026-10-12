@@ -5,7 +5,6 @@ import math
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
-from sklearn.cluster import HDBSCAN
 
 logger = logging.getLogger(__name__)
 
@@ -620,6 +619,9 @@ class InterestProfileService:
     @staticmethod
     def _run_hdbscan(vectors: List[List[float]], clustering_config: Dict[str, Any]) -> List[int]:
         """按配置运行 HDBSCAN，返回每个向量的簇标签（-1 表示噪声点）。"""
+        # sklearn 导入要好几秒，只在真正重建兴趣画像时才需要，不放在模块顶部拖慢服务初始化。
+        from sklearn.cluster import HDBSCAN
+
         clusterer = HDBSCAN(
             min_cluster_size=int(clustering_config["min_cluster_size"]),
             min_samples=int(clustering_config["min_samples"]),
