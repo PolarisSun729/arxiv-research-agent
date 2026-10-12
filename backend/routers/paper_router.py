@@ -121,7 +121,8 @@ async def get_dashboard_stats(
             # 看板对所有账号开放；保留字段和失败状态，内部路径及诊断仅向已认证管理员展示。
             sync_error = "最近一次同步失败，请联系管理员查看运行日志。"
         return {
-            # totalPapers 统计的是 OAI 同步镜像库，而不是本地论文目录 arxiv_papers。
+            # totalPapers 统计的是 OAI 同步镜像库，而不是本地论文目录 arxiv_papers；
+            # 读库失败时为 null，前端据此提示“暂时无法统计”，不能当成 0 篇展示。
             "totalPapers": oai_db_service.get_total_paper_count(),
             "labeledPapers": user_preference_store.get_user_labeled_paper_count(user_id=user_id),
             "latestSyncNewPapers": sync_status["latestSyncNewPapers"],

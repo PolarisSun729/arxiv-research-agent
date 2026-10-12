@@ -19,6 +19,9 @@ const syncStatusText = computed(() => {
       return '同步成功'
     case 'failed':
       return '最近同步失败'
+    // 同步脚本按天推进，运行中会持续刷新摘要；“已同步到”显示的是已完成的最后一天。
+    case 'running':
+      return '同步进行中'
     default:
       return '暂无同步记录'
   }
@@ -32,6 +35,19 @@ const syncHintText = computed(() => {
   parts.push(syncStatusText.value)
   return parts.join(' · ')
 })
+
+// 总数读取失败时后端返回 null；同步写库期间最常见，提示稍后刷新，而不是显示 0 篇误导用户。
+const totalPapersUnavailableText = computed(() => {
+  if (store.stats.totalPapers !== null) return ''
+  return store.stats.lastSyncStatus === 'running'
+    ? '同步写入中，暂时无法统计，请稍后刷新'
+    : '暂时无法统计，请稍后刷新'
+})
+
+function formatStatValue(key: StatKey) {
+  const value = store.stats[key]
+  return value === null ? '—' : value
+}
 
 const syncErrorText = computed(() => {
   if (store.stats.lastSyncStatus !== 'failed') return ''
@@ -94,7 +110,10 @@ onMounted(async () => {
         <div v-else class="stat-content">
           <div class="stat-label">{{ stat.label }}</div>
           <div class="stat-value" :style="{ color: stat.color }">
-            {{ store.stats[stat.key] }}
+            {{ formatStatValue(stat.key) }}
+          </div>
+          <div v-if="stat.key === 'totalPapers' && totalPapersUnavailableText" class="stat-hint">
+            {{ totalPapersUnavailableText }}
           </div>
           <div v-if="stat.key === 'latestSyncNewPapers'" class="stat-hint">
             {{ syncHintText }}

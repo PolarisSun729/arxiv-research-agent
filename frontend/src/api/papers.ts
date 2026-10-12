@@ -33,7 +33,8 @@ function resolveUserId(userId?: string | null): string {
 }
 
 export interface DashboardStats {
-  totalPapers: number
+  // null 表示后端这次没读到总数（如同步写库时被锁），不等于论文库为空。
+  totalPapers: number | null
   labeledPapers: number
   latestSyncNewPapers: number
   lastSyncedDate: string | null
@@ -47,7 +48,7 @@ export interface DashboardStats {
 
 function normalizeDashboardStats(raw: any): DashboardStats {
   return {
-    totalPapers: Number(raw?.totalPapers || 0),
+    totalPapers: raw?.totalPapers == null ? null : Number(raw.totalPapers),
     labeledPapers: Number(raw?.labeledPapers || 0),
     latestSyncNewPapers: Number(raw?.latestSyncNewPapers ?? 0),
     lastSyncedDate: raw?.lastSyncedDate ? String(raw.lastSyncedDate) : null,

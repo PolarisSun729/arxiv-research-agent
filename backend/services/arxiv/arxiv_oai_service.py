@@ -210,6 +210,22 @@ class ArxivOaiDatabaseService:
         # 每次按需创建连接，让上层通过上下文管理器控制事务边界。
         return sqlite3.connect(self.db_path, check_same_thread=self.check_same_thread)
 
+    def _enable_wal_mode(self, cursor: sqlite3.Cursor) -> None:
+        """把库切到 WAL 模式，让同步脚本写入期间后端仍能读库（首页统计、本地检索）。
+
+        journal_mode=WAL 会持久化到库文件里，切一次后所有进程的连接都生效；
+        默认的 delete 模式下大写事务会拿排它锁，读请求会等到超时报 database is locked。
+        """
+        try:
+            row = cursor.execute("PRAGMA journal_mode=WAL").fetchone()
+        except sqlite3.OperationalError as exc:
+            # 切换需要短暂独占；正好有其他进程在写时不阻断启动，下次初始化再切。
+            logger.warning("Unable to switch OAI database to WAL mode: %s", exc)
+            return
+        journal_mode = str(row[0] if row else "").lower()
+        if journal_mode != "wal":
+            logger.warning("OAI database journal_mode is %s instead of wal: %s", journal_mode, self.db_path)
+
     def _is_fts5_available(self, cursor: sqlite3.Cursor) -> bool:
         """检测当前 SQLite 是否支持 FTS5；本地文本检索依赖它来保证精确且可下推。"""
         try:
@@ -1096,8 +1112,8 @@ class ArxivOaiDatabaseService:
             return text
         return value
 
-    def get_total_paper_count(self) -> int:
-        """返回 OAI 本地镜像库中的论文总数。"""
+    def get_total_paper_count(self) -> Optional[int]:
+        """返回 OAI 本地镜像库中的论文总数；读取失败返回 None，而不是 0。"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -1106,8 +1122,9 @@ class ArxivOaiDatabaseService:
                 row = cursor.fetchone()
                 return int(row[0] or 0) if row else 0
         except Exception as exc:
+            # 读不到（如同步写入时库被锁）和“库是空的”必须区分开，否则首页会误显示 0 篇。
             logger.error("Error getting total OAI paper count: %s", exc)
-            return 0
+            return None
 
     def get_latest_oai_datestamp(self) -> Optional[date]:
         """返回库中最大的 OAI datestamp；空库返回 None。增量同步在缺少游标时用它推断起点。"""
@@ -1754,6 +1771,7 @@ class ArxivOaiDatabaseService:
         """初始化 OAI SQLite 主表、从表和全文索引。"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            self._enable_wal_mode(cursor)
             fts5_available = self._is_fts5_available(cursor)
             # 主表负责保存 OAI 元数据真相，从表和 FTS 都视为可重建索引。
             cursor.execute(

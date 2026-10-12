@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import sqlite3
 import sys
 import types
 import uuid
@@ -223,6 +224,39 @@ def test_recent_papers_filters_categories_with_mapping_table() -> None:
     papers = service.get_recent_papers(categories=["cs.CL"], max_age_months=120, max_results=10)
 
     assert [paper["arxiv_id"] for paper in papers] == ["2401.00007"]
+
+
+def test_initialize_database_enables_wal_so_reads_are_not_blocked_by_writer() -> None:
+    service = _make_temp_service()
+    service.upsert_arxiv_oai_papers(
+        [_paper("2401.00050", title="Committed Paper", abstract="RAG", categories=["cs.CL"])]
+    )
+    writer = service._get_connection()
+    try:
+        assert writer.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        # delete 模式下 EXCLUSIVE 写事务会挡住所有读；WAL 下读请求照常拿到已提交的数据。
+        writer.execute("BEGIN EXCLUSIVE")
+        writer.execute(
+            "INSERT INTO arxiv_oai_papers (arxiv_id, title) VALUES (?, ?)",
+            ("2401.00051", "Uncommitted Paper"),
+        )
+
+        assert service.get_total_paper_count() == 1
+    finally:
+        writer.rollback()
+        writer.close()
+
+
+def test_total_paper_count_returns_none_instead_of_zero_when_read_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _make_temp_service()
+
+    def locked_connection():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(service, "_get_connection", locked_connection)
+
+    # 读不到不等于库是空的；返回 0 会让首页误显示“论文库总量 0”。
+    assert service.get_total_paper_count() is None
 
 
 def _index_rows(service: ArxivOaiDatabaseService, arxiv_id: str) -> tuple[list[tuple], list[str]]:

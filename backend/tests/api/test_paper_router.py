@@ -148,6 +148,15 @@ class PaperRouterApiTests(unittest.TestCase):
         self.assertEqual(payload["latestSyncNewPapers"], 8)
         self.assertEqual(payload["lastSyncStatus"], "success")
 
+    def test_get_stats_returns_null_total_when_count_is_unavailable(self) -> None:
+        # 同步写库时计数可能读失败；必须透传 null 让前端提示“暂时无法统计”，不能变成 0。
+        self.oai_db_service.get_total_paper_count = lambda: None
+
+        response = self.client.get("/api/stats", params={"user_id": "u1"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()["totalPapers"])
+
     def test_get_sync_status_returns_latest_sync_payload(self) -> None:
         response = self.client.get("/api/sync-status")
 
