@@ -3,7 +3,7 @@ import ast
 from datetime import datetime
 import json
 import re
-from typing import List, Dict, Any, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import logging
 from pymilvus import (
     DataType,
@@ -24,7 +24,214 @@ ASSET_SUMMARY_MAX_LENGTH = VECTOR_STORE_CONFIG["asset_summary_max_length"]
 ASSET_PREVIEW_MAX_LENGTH = VECTOR_STORE_CONFIG["asset_preview_max_length"]
 
 
+# chunk 级 collection 检索/导出时希望带回的字段（按需与实际 schema 求交集，旧 collection 缺字段也能读）。
+# 顺序即 Milvus output_fields 顺序；get_all_chunks 会在最前面额外加上主键 id。
+CHUNK_OUTPUT_FIELDS = (
+    "content",
+    "rerank_text",
+    "index_id",
+    "index_type",
+    "index_text",
+    "index_weight",
+    "retrieval_index_id",
+    "retrieval_index_type",
+    "retrieval_index_text",
+    "retrieval_index_weight",
+    "retrieval_index_enabled_routes",
+    "chunk_type",
+    "asset_kind",
+    "asset_path",
+    "asset_abs_path",
+    "asset_summary",
+    "asset_preview_text",
+    "asset_caption",
+    "asset_section_match_type",
+    "asset_section_match_confidence",
+    "asset_section_match_reason",
+    "asset_section_match_is_heuristic",
+    "asset_section_match_allow_embedding",
+    "asset_rows",
+    "asset_columns",
+    "order_index",
+    "document_name",
+    "source",
+    "chunk_id",
+    "chunk_index",
+    "parent_chunk_id",
+    "original_chunk_id",
+    "total_chunks",
+    "word_count",
+    "page_number",
+    "page_start",
+    "page_end",
+    "page_range",
+    "subchunk_index",
+    "subchunk_count",
+    "subchunk_label",
+    "content_part_index",
+    "content_part_count",
+    "content_part_label",
+    "section_path",
+    "section_title",
+    "section_level",
+    "section_part_index",
+    "section_part_count",
+    "embedding_provider",
+    "embedding_model",
+    "embedding_timestamp",
+    "arxiv_id",
+    "title",
+    "authors",
+    "categories",
+    "published_date",
+    "url",
+)
+
+# 论文级 collection（如 arxiv_paper_embeddings）检索时带回的展示字段。
+PAPER_SEARCH_OUTPUT_FIELDS = (
+    "arxiv_id",
+    "title",
+    "authors",
+    "abstract",
+    "categories",
+    "published_date",
+    "url",
+    "embedding_model",
+    "content",
+)
+
+# 按 arxiv_id 复用论文向量时读取的字段（包含主键 id 与向量本身）。
+PAPER_EMBEDDING_OUTPUT_FIELDS = (
+    "id",
+    "arxiv_id",
+    "title",
+    "authors",
+    "categories",
+    "published_date",
+    "url",
+    "embedding_model",
+    "vector",
+)
+
+# _build_chunk_payload 返回值中，从 metadata 平铺到顶层的字段，分两段是为了保持原有的键顺序：
+# 第一段在 score/distance 之前，第二段在其之后。
+_CHUNK_PAYLOAD_KEYS_BEFORE_SCORE = (
+    "rerank_text",
+    "index_id",
+    "index_type",
+    "index_text",
+    "index_weight",
+    "retrieval_index_id",
+    "retrieval_index_type",
+    "retrieval_index_text",
+    "retrieval_index_weight",
+    "retrieval_index_enabled_routes",
+    "matched_index_id",
+    "matched_index_type",
+    "matched_index_text",
+    "matched_index_score",
+    "chunk_type",
+    "asset_kind",
+    "asset_path",
+    "asset_abs_path",
+    "asset_summary",
+    "asset_preview_text",
+    "asset_caption",
+    "asset_section_match_type",
+    "asset_section_match_confidence",
+    "asset_section_match_reason",
+    "asset_section_match_is_heuristic",
+    "asset_section_match_allow_embedding",
+    "asset_rows",
+    "asset_columns",
+    "order_index",
+)
+_CHUNK_PAYLOAD_KEYS_AFTER_SCORE = (
+    "source",
+    "document_name",
+    "chunk_id",
+    "chunk_index",
+    "parent_chunk_id",
+    "original_chunk_id",
+    "page_number",
+    "page_start",
+    "page_end",
+    "page_range",
+    "subchunk_index",
+    "subchunk_count",
+    "subchunk_label",
+    "content_part_index",
+    "content_part_count",
+    "content_part_label",
+    "section_path",
+    "section_title",
+    "section_level",
+    "section_part_index",
+    "section_part_count",
+)
+
+# 所有检索都使用余弦相似度，建索引与查询必须保持一致。
+_SEARCH_PARAMS = {"metric_type": "COSINE", "params": {}}
+
+
+def _entity_getter(entity: Any) -> Callable[..., Any]:
+    """为 Milvus 返回的实体生成统一取值函数：dict 用 .get，其它对象用 getattr。"""
+    if isinstance(entity, dict):
+        return lambda key, default=None: entity.get(key, default)
+    return lambda key, default=None: getattr(entity, key, default)
+
+
+def _hit_metric(hit: Dict[str, Any], key: str) -> Optional[float]:
+    """读取检索命中的 score / distance；字段缺失时返回 None，而不是伪造一个 0 分。"""
+    value = hit.get(key)
+    return float(value) if value is not None else None
+
+
+def _split_display_values(value: Any) -> List[str]:
+    """把作者、分类等多值字段统一拆成字符串列表。
+
+    兼容三种存储形态：真实列表、Python 列表字面量字符串（如 "['a', 'b']"）、
+    以逗号/分号/竖线/空白分隔的纯文本。
+    """
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if not value:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("[") or stripped.startswith("("):
+            try:
+                # literal_eval 只解析字面量，不会执行代码，可以安全处理历史数据中的 repr 字符串。
+                parsed = ast.literal_eval(stripped)
+                if isinstance(parsed, (list, tuple)):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            except (ValueError, SyntaxError):
+                pass
+    normalized = str(value).replace(";", ",").replace("|", ",")
+    parts = []
+    for token in normalized.replace("\n", " ").split():
+        if "," in token:
+            parts.extend(token.split(","))
+        else:
+            parts.append(token)
+    parts = [part.strip() for part in parts]
+    return [part for part in parts if part]
+
+
+def _build_arxiv_id_exclude_filter(filter_arxiv_ids: Optional[List[str]], field_names: Set[str]) -> str:
+    """生成排除指定 arxiv_id 的 Milvus 过滤表达式；collection 没有 arxiv_id 字段或列表为空时返回空串。"""
+    if not filter_arxiv_ids or "arxiv_id" not in field_names:
+        return ""
+    quoted_ids = ", ".join(f'"{arxiv_id}"' for arxiv_id in filter_arxiv_ids if arxiv_id)
+    return f"arxiv_id not in [{quoted_ids}]" if quoted_ids else ""
+
+
 def normalize_collection_name(collection_name: str) -> str:
+    """把任意字符串规范化为合法的 Milvus collection 名称。
+
+    规则：非字母数字下划线的字符替换为下划线，合并连续下划线并去掉首尾下划线；
+    首字符不是字母时补一个前导下划线；结果为空时回落为 "collection"。
+    """
     name = (collection_name or "").strip()
     if not name:
         return "collection"
@@ -94,6 +301,7 @@ class VectorStoreService:
         os.makedirs(self.vector_store_dir, exist_ok=True)
 
     def _get_client(self) -> MilvusClient:
+        """每次调用创建一个新的 Milvus 客户端；客户端不跨请求复用，避免连接状态在线程间共享。"""
         return MilvusClient(uri=MILVUS_CONFIG["uri"])
 
     def resolve_collection_name(self, collection_name: str) -> str:
@@ -103,16 +311,24 @@ class VectorStoreService:
         return normalize_collection_name(collection_name)
 
     def collection_exists(self, provider: str, collection_name: str) -> bool:
+        """判断 collection 是否存在；非 Milvus 提供商一律返回 False。"""
         if provider == VectorDBProvider.MILVUS:
-            client = None
-            try:
-                client = self._get_client()
-                resolved = self.resolve_collection_name(collection_name)
-                return client.has_collection(collection_name=resolved)
-            finally:
-                if client is not None:
-                    del client
+            client = self._get_client()
+            return client.has_collection(collection_name=self.resolve_collection_name(collection_name))
         return False
+
+    def _describe_existing_collection(self, client: MilvusClient, collection_name: str) -> Optional[Tuple[str, Set[str]]]:
+        """返回 (规范化后的 collection 名, schema 字段名集合)；collection 不存在时记录告警并返回 None。
+
+        读取前先查 schema，是为了让 output_fields 只请求实际存在的字段，兼容不同时期建的 collection。
+        """
+        resolved_name = self.resolve_collection_name(collection_name)
+        if not client.has_collection(collection_name=resolved_name):
+            logger.warning(f"Collection {collection_name} does not exist")
+            return None
+        collection_desc = client.describe_collection(collection_name=resolved_name)
+        field_names = {field.get("name") for field in collection_desc.get("fields", [])}
+        return resolved_name, field_names
     
     def _get_milvus_index_type(self, config: VectorDBConfig) -> str:
         """
@@ -150,8 +366,8 @@ class VectorStoreService:
             索引结果信息字典
         """
         start_time = datetime.now()
-        
-                # 读取 embedding 文件
+
+        # 读取 embedding 文件
         embeddings_data = self._load_embeddings(embedding_file)
         
         # 根据提供商选择索引方法
@@ -200,6 +416,10 @@ class VectorStoreService:
 
     @staticmethod
     def _serialize_json_list(value: Any) -> str:
+        """把列表或分隔字符串序列化为 JSON 数组字符串，用于在 VARCHAR 字段里保存列表。
+
+        已经是 JSON 数组的字符串原样返回；"a,b|c" 这类分隔文本会被拆分后再序列化。
+        """
         if isinstance(value, str):
             raw = value.strip()
             if not raw:
@@ -213,6 +433,7 @@ class VectorStoreService:
 
     @staticmethod
     def _parse_json_list(value: Any) -> List[str]:
+        """_serialize_json_list 的逆操作：解析 JSON 数组，失败时按逗号/竖线分隔兜底。"""
         if isinstance(value, (list, tuple, set)):
             return [str(item).strip() for item in value if str(item).strip()]
         raw = str(value or "").strip()
@@ -242,26 +463,20 @@ class VectorStoreService:
             filename = embeddings_data.get("filename", "")
             # 如果有 .pdf 后缀则去掉
             base_name = filename.replace('.pdf', '') if filename else "doc"
-            
+
             # 将中文文件名转换为拼音，避免 Milvus collection 名称非法
             base_name = ''.join(lazy_pinyin(base_name, style=Style.NORMAL))
-            
-            # 把连字符和点号替换为下划线
-            base_name = base_name.replace('-', '_').replace('.', '_')
-            
-            # 确保 collection 名称以字母或下划线开头
-            if not base_name[0].isalpha() and base_name[0] != '_':
-                base_name = f"_{base_name}"
-            
-            # 生成 collection 名称
+
+            # 生成 collection 名称；非法字符替换、首字符补下划线等规则统一交给 normalize_collection_name。
+            # （此前这里手工处理了一遍首字符，base_name 为空时会触发 IndexError，且结果与统一规则等价。）
             embedding_provider = embeddings_data.get("embedding_provider", "unknown")
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             collection_name = normalize_collection_name(f"{base_name}_{embedding_provider}_{timestamp}")
-            
+
             client = self._get_client()
-            
-            # 从配置中读取向量维度
-            vector_dim = int(embeddings_data.get("vector_dimension"))
+
+            # 从配置中读取向量维度；缺失时走下面的明确报错，而不是 int(None) 的 TypeError。
+            vector_dim = int(embeddings_data.get("vector_dimension") or 0)
             if not vector_dim:
                 raise ValueError("Missing vector_dimension in embedding file")
             
@@ -316,7 +531,6 @@ class VectorStoreService:
                 {"name": "content_part_index", "dtype": "INT64"},
                 {"name": "content_part_count", "dtype": "INT64"},
                 {"name": "content_part_label", "dtype": "VARCHAR", "max_length": 32},
-                # {"name": "chunking_method", "dtype": "VARCHAR", "max_length": 50},
                 {"name": "section_path", "dtype": "VARCHAR", "max_length": 1024},
                 {"name": "section_title", "dtype": "VARCHAR", "max_length": 512},
                 {"name": "section_level", "dtype": "INT64"},
@@ -410,7 +624,6 @@ class VectorStoreService:
                     "section_path": str(metadata.get("section_path", "")),
                     "section_title": str(metadata.get("section_title", "")),
                     "section_level": int(metadata.get("section_level", 0) or 0),
-                    # "chunking_method": str(metadata.get("chunking_method", "")),
                     "embedding_provider": embeddings_data.get("embedding_provider", ""),
                     "embedding_model": embeddings_data.get("embedding_model", ""),
                     "embedding_timestamp": str(metadata.get("embedding_timestamp", "")),
@@ -484,6 +697,11 @@ class VectorStoreService:
 
     @staticmethod
     def _is_varchar_field(field: Any) -> bool:
+        """判断字段是否为 VARCHAR。
+
+        字段既可能是建表时的 dict 定义（dtype 为字符串），也可能是 describe_collection 返回的
+        dict/对象（type 为 DataType 枚举或其整数值），这里统一兼容这些形态。
+        """
         dtype = (
             (field.get("dtype") or field.get("type"))
             if isinstance(field, dict)
@@ -497,6 +715,7 @@ class VectorStoreService:
 
     @staticmethod
     def _varchar_max_length(field: Any) -> Optional[int]:
+        """读取 VARCHAR 字段的 max_length（字节数）；可能在顶层或 params 中，取不到时返回 None。"""
         if isinstance(field, dict):
             raw_value = field.get("max_length") or (field.get("params", {}) or {}).get("max_length")
         else:
@@ -510,8 +729,9 @@ class VectorStoreService:
         except (TypeError, ValueError):
             return None
 
-    def _validate_varchar_lengths(self, entities: List[Dict[str, Any]], fields: List[Any]) -> None:
-        varchar_limits = {
+    def _varchar_limits(self, fields: List[Any]) -> Dict[str, Optional[int]]:
+        """从字段定义中提取 {VARCHAR 字段名: 最大字节数}，供截断与校验共用。"""
+        return {
             (field.get("name") if isinstance(field, dict) else getattr(field, "name", "")): (
                 self._varchar_max_length(field)
             )
@@ -519,12 +739,24 @@ class VectorStoreService:
             if self._is_varchar_field(field)
         }
 
+    @staticmethod
+    def _entity_chunk_ref(entity: Dict[str, Any]) -> Any:
+        """日志/报错中用于定位实体的 chunk 编号，按 parent → original → chunk_id → chunk_index 依次回退。"""
+        return entity.get(
+            "parent_chunk_id",
+            entity.get("original_chunk_id", entity.get("chunk_id", entity.get("chunk_index", 0))),
+        )
+
+    def _validate_varchar_lengths(self, entities: List[Dict[str, Any]], fields: List[Any]) -> None:
+        """插入前校验 VARCHAR 字节长度，超限时抛出 ValueError（最多列出 5 条违规）。
+
+        Milvus 的 max_length 按 UTF-8 字节计算，中文一个字占 3 字节，所以这里按字节而不是字符数比较。
+        """
+        varchar_limits = self._varchar_limits(fields)
+
         violations = []
         for entity in entities:
-            chunk_ref = entity.get(
-                "parent_chunk_id",
-                entity.get("original_chunk_id", entity.get("chunk_id", entity.get("chunk_index", 0))),
-            )
+            chunk_ref = self._entity_chunk_ref(entity)
             for field_name, max_length in varchar_limits.items():
                 if not max_length:
                     continue
@@ -540,6 +772,7 @@ class VectorStoreService:
             )
 
     def _truncate_utf8_text(self, value: str, max_bytes: Optional[int]) -> str:
+        """按 UTF-8 字节数截断字符串，并保证不会切断多字节字符（逐字节回退直到可以解码）。"""
         if not isinstance(value, str) or not max_bytes or max_bytes <= 0:
             return value
 
@@ -556,21 +789,16 @@ class VectorStoreService:
         return ""
 
     def _truncate_entities_to_varchar_limits(self, entities: List[Dict[str, Any]], fields: List[Any]) -> List[Dict[str, Any]]:
-        varchar_limits = {
-            (field.get("name") if isinstance(field, dict) else getattr(field, "name", "")): (
-                self._varchar_max_length(field)
-            )
-            for field in fields
-            if self._is_varchar_field(field)
-        }
+        """把超长 VARCHAR 字段截断到 schema 允许的字节数，返回新的实体列表（不修改入参）。
+
+        被截断的字段会记 warning，便于发现 preview 字段长度配置过小的问题。
+        """
+        varchar_limits = self._varchar_limits(fields)
 
         normalized_entities: List[Dict[str, Any]] = []
         for entity in entities:
             normalized_entity = dict(entity)
-            chunk_ref = entity.get(
-                "parent_chunk_id",
-                entity.get("original_chunk_id", entity.get("chunk_id", entity.get("chunk_index", 0))),
-            )
+            chunk_ref = self._entity_chunk_ref(entity)
             for field_name, max_length in varchar_limits.items():
                 value = normalized_entity.get(field_name)
                 if not max_length or not isinstance(value, str):
@@ -718,6 +946,7 @@ class VectorStoreService:
                 }
                 entities.append(entity)
 
+            # 以实际 schema 为准做截断/校验：collection 可能是旧版本建的，max_length 与上面的建表定义不一定相同。
             collection_desc = client.describe_collection(collection_name=resolved_name)
             normalized_entities = self._truncate_entities_to_varchar_limits(entities, collection_desc.get("fields", []))
             self._validate_varchar_lengths(normalized_entities, collection_desc.get("fields", []))
@@ -743,97 +972,28 @@ class VectorStoreService:
         """
         try:
             client = self._get_client()
-            resolved_name = self.resolve_collection_name(collection_name)
-
-            if not client.has_collection(collection_name=resolved_name):
-                logger.warning(f"Collection {collection_name} does not exist")
+            described = self._describe_existing_collection(client, collection_name)
+            if described is None:
                 return []
-
-            collection_desc = client.describe_collection(collection_name=resolved_name)
-            field_names = {field.get("name") for field in collection_desc.get("fields", [])}
-            candidate_fields = [
-                "content",
-                "rerank_text",
-                "index_id",
-                "index_type",
-                "index_text",
-                "index_weight",
-                "retrieval_index_id",
-                "retrieval_index_type",
-                "retrieval_index_text",
-                "retrieval_index_weight",
-                "retrieval_index_enabled_routes",
-                "chunk_type",
-                "asset_kind",
-                "asset_path",
-                "asset_abs_path",
-                "asset_summary",
-                "asset_preview_text",
-                "asset_caption",
-                "asset_section_match_type",
-                "asset_section_match_confidence",
-                "asset_section_match_reason",
-                "asset_section_match_is_heuristic",
-                "asset_section_match_allow_embedding",
-                "asset_rows",
-                "asset_columns",
-                "order_index",
-                "document_name",
-                "source",
-                "chunk_id",
-                "chunk_index",
-                "parent_chunk_id",
-                "original_chunk_id",
-                "total_chunks",
-                "word_count",
-                "page_number",
-                "page_start",
-                "page_end",
-                "page_range",
-                "subchunk_index",
-                "subchunk_count",
-                "subchunk_label",
-                "content_part_index",
-                "content_part_count",
-                "content_part_label",
-                "section_path",
-                "section_title",
-                "section_level",
-                "section_part_index",
-                "section_part_count",
-                "embedding_provider",
-                "embedding_model",
-                "embedding_timestamp",
-                "arxiv_id",
-                "title",
-                "authors",
-                "categories",
-                "published_date",
-                "url",
-            ]
-            output_fields = [field for field in candidate_fields if field in field_names]
-
-            expr = None
-            if filter_arxiv_ids and "arxiv_id" in field_names:
-                quoted_ids = ", ".join(f'"{arxiv_id}"' for arxiv_id in filter_arxiv_ids if arxiv_id)
-                if quoted_ids:
-                    expr = f"arxiv_id not in [{quoted_ids}]"
+            resolved_name, field_names = described
+            output_fields = [field for field in CHUNK_OUTPUT_FIELDS if field in field_names]
 
             results = client.search(
                 collection_name=resolved_name,
                 data=[query_vector],
-                filter=expr or "",
+                filter=_build_arxiv_id_exclude_filter(filter_arxiv_ids, field_names),
                 limit=top_k,
                 anns_field="vector",
                 output_fields=output_fields,
-                search_params={"metric_type": "COSINE", "params": {}},
+                search_params=_SEARCH_PARAMS,
             )
 
+            # 不同 pymilvus 版本的命中结构不同：有的把字段放在 hit["entity"]，有的直接平铺在 hit 上。
             similar_vectors = [
                 self._build_chunk_payload(
                     entity=hit.get("entity", hit),
-                    score=float(hit.get("score")) if hit.get("score") is not None else None,
-                    distance=float(hit.get("distance")) if hit.get("distance") is not None else None,
+                    score=_hit_metric(hit, "score"),
+                    distance=_hit_metric(hit, "distance"),
                 )
                 for hit in results[0]
             ]
@@ -857,48 +1017,27 @@ class VectorStoreService:
         """
         try:
             client = self._get_client()
-            resolved_name = self.resolve_collection_name(collection_name)
-
-            if not client.has_collection(collection_name=resolved_name):
-                logger.warning(f"Collection {collection_name} does not exist")
+            described = self._describe_existing_collection(client, collection_name)
+            if described is None:
                 return []
-
-            collection_desc = client.describe_collection(collection_name=resolved_name)
-            field_names = {field.get("name") for field in collection_desc.get("fields", [])}
-            candidate_fields = [
-                "arxiv_id",
-                "title",
-                "authors",
-                "abstract",
-                "categories",
-                "published_date",
-                "url",
-                "embedding_model",
-                "content",
-            ]
-            output_fields = [field for field in candidate_fields if field in field_names]
-
-            expr = None
-            if filter_arxiv_ids and "arxiv_id" in field_names:
-                quoted_ids = ", ".join(f'"{arxiv_id}"' for arxiv_id in filter_arxiv_ids if arxiv_id)
-                if quoted_ids:
-                    expr = f"arxiv_id not in [{quoted_ids}]"
+            resolved_name, field_names = described
+            output_fields = [field for field in PAPER_SEARCH_OUTPUT_FIELDS if field in field_names]
 
             results = client.search(
                 collection_name=resolved_name,
                 data=[query_vector],
-                filter=expr or "",
+                filter=_build_arxiv_id_exclude_filter(filter_arxiv_ids, field_names),
                 limit=top_k,
                 anns_field="vector",
                 output_fields=output_fields,
-                search_params={"metric_type": "COSINE", "params": {}},
+                search_params=_SEARCH_PARAMS,
             )
 
             return [
                 self._build_paper_payload(
                     entity=hit.get("entity", hit),
-                    score=float(hit.get("score")) if hit.get("score") is not None else None,
-                    distance=float(hit.get("distance")) if hit.get("distance") is not None else None,
+                    score=_hit_metric(hit, "score"),
+                    distance=_hit_metric(hit, "distance"),
                 )
                 for hit in results[0]
             ]
@@ -922,14 +1061,10 @@ class VectorStoreService:
                 return []
 
             client = self._get_client()
-            resolved_name = self.resolve_collection_name(collection_name)
-
-            if not client.has_collection(collection_name=resolved_name):
-                logger.warning(f"Collection {collection_name} does not exist")
+            described = self._describe_existing_collection(client, collection_name)
+            if described is None:
                 return []
-
-            collection_desc = client.describe_collection(collection_name=resolved_name)
-            field_names = {field.get("name") for field in collection_desc.get("fields", [])}
+            resolved_name, field_names = described
             if "arxiv_id" not in field_names or "vector" not in field_names:
                 logger.warning(
                     "Collection %s does not expose required fields arxiv_id/vector",
@@ -940,18 +1075,7 @@ class VectorStoreService:
             quoted_ids = ", ".join(f'"{arxiv_id}"' for arxiv_id in normalized_ids)
             expr = f"arxiv_id in [{quoted_ids}]"
 
-            candidate_fields = [
-                "id",
-                "arxiv_id",
-                "title",
-                "authors",
-                "categories",
-                "published_date",
-                "url",
-                "embedding_model",
-                "vector",
-            ]
-            output_fields = [field for field in candidate_fields if field in field_names]
+            output_fields = [field for field in PAPER_EMBEDDING_OUTPUT_FIELDS if field in field_names]
 
             results = client.query(
                 collection_name=resolved_name,
@@ -966,84 +1090,24 @@ class VectorStoreService:
             raise
 
     def get_all_chunks(self, collection_name: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """按主键扫描读取 collection 中的 chunk（默认最多 10000 条），返回结构与向量检索结果一致。
+
+        主要供关键词检索、上下文扩展等需要全量 chunk 的场景使用；score/distance 恒为 None。
+        """
         try:
             client = self._get_client()
-            resolved_name = self.resolve_collection_name(collection_name)
-
-            if not client.has_collection(collection_name=resolved_name):
-                logger.warning(f"Collection {collection_name} does not exist")
+            described = self._describe_existing_collection(client, collection_name)
+            if described is None:
                 return []
-
-            collection_desc = client.describe_collection(collection_name=resolved_name)
-            field_names = {field.get("name") for field in collection_desc.get("fields", [])}
-            candidate_fields = [
-                "id",
-                "content",
-                "rerank_text",
-                "index_id",
-                "index_type",
-                "index_text",
-                "index_weight",
-                "retrieval_index_id",
-                "retrieval_index_type",
-                "retrieval_index_text",
-                "retrieval_index_weight",
-                "retrieval_index_enabled_routes",
-                "chunk_type",
-                "asset_kind",
-                "asset_path",
-                "asset_abs_path",
-                "asset_summary",
-                "asset_preview_text",
-                "asset_caption",
-                "asset_section_match_type",
-                "asset_section_match_confidence",
-                "asset_section_match_reason",
-                "asset_section_match_is_heuristic",
-                "asset_section_match_allow_embedding",
-                "asset_rows",
-                "asset_columns",
-                "order_index",
-                "document_name",
-                "source",
-                "chunk_id",
-                "chunk_index",
-                "parent_chunk_id",
-                "original_chunk_id",
-                "total_chunks",
-                "word_count",
-                "page_number",
-                "page_start",
-                "page_end",
-                "page_range",
-                "subchunk_index",
-                "subchunk_count",
-                "subchunk_label",
-                "content_part_index",
-                "content_part_count",
-                "content_part_label",
-                "section_path",
-                "section_title",
-                "section_level",
-                "section_part_index",
-                "section_part_count",
-                "embedding_provider",
-                "embedding_model",
-                "embedding_timestamp",
-                "arxiv_id",
-                "title",
-                "authors",
-                "categories",
-                "published_date",
-                "url",
-            ]
-            output_fields = [field for field in candidate_fields if field in field_names]
+            resolved_name, field_names = described
+            output_fields = [field for field in ("id", *CHUNK_OUTPUT_FIELDS) if field in field_names]
             query_limit = limit if limit is not None else 10000
             if query_limit <= 0:
                 logger.warning(
                     f"Collection {collection_name} has no entities or requested limit is non-positive: {query_limit}"
                 )
                 return []
+            # Milvus query 必须带过滤条件，用恒真的主键条件表示“全部”。
             entities = client.query(
                 collection_name=resolved_name,
                 filter="id >= 0",
@@ -1056,6 +1120,12 @@ class VectorStoreService:
             raise
 
     def _build_chunk_payload(self, entity: Any, score: Optional[float], distance: Optional[float]) -> Dict[str, Any]:
+        """把 Milvus chunk 实体转换为检索层统一的 chunk 结构。
+
+        - 同一份字段既放在 metadata 中，也平铺到顶层，兼容按两种方式读取的调用方；
+        - index_* 与 retrieval_index_* 是新旧两套命名，值始终保持一致；
+        - 旧 collection 缺少 index 字段时，合成一个 body 类型的 legacy index，保证下游合约统一。
+        """
         if entity is None:
             return {
                 "text": "",
@@ -1065,8 +1135,7 @@ class VectorStoreService:
                 "metadata": {},
             }
 
-        reader = entity if isinstance(entity, dict) else None
-        getter = (lambda key, default=None: reader.get(key, default)) if reader is not None else (lambda key, default=None: getattr(entity, key, default))
+        getter = _entity_getter(entity)
 
         content = getter("content", "") or ""
         rerank_text = getter("rerank_text", "") or ""
@@ -1187,66 +1256,20 @@ class VectorStoreService:
             "embedding_timestamp": getter("embedding_timestamp", "") or "",
         }
 
+        # 顶层字段直接取自 metadata，保证两处取值永远一致；键顺序与历史响应保持不变。
         payload = {
             "text": content,
             "content": content,
-            "rerank_text": metadata["rerank_text"],
-            "index_id": metadata["index_id"],
-            "index_type": metadata["index_type"],
-            "index_text": metadata["index_text"],
-            "index_weight": metadata["index_weight"],
-            "retrieval_index_id": metadata["retrieval_index_id"],
-            "retrieval_index_type": metadata["retrieval_index_type"],
-            "retrieval_index_text": metadata["retrieval_index_text"],
-            "retrieval_index_weight": metadata["retrieval_index_weight"],
-            "retrieval_index_enabled_routes": metadata["retrieval_index_enabled_routes"],
-            "matched_index_id": metadata["matched_index_id"],
-            "matched_index_type": metadata["matched_index_type"],
-            "matched_index_text": metadata["matched_index_text"],
-            "matched_index_score": metadata["matched_index_score"],
-            "chunk_type": metadata["chunk_type"],
-            "asset_kind": metadata["asset_kind"],
-            "asset_path": metadata["asset_path"],
-            "asset_abs_path": metadata["asset_abs_path"],
-            "asset_summary": metadata["asset_summary"],
-            "asset_preview_text": metadata["asset_preview_text"],
-            "asset_caption": metadata["asset_caption"],
-            "asset_section_match_type": metadata["asset_section_match_type"],
-            "asset_section_match_confidence": metadata["asset_section_match_confidence"],
-            "asset_section_match_reason": metadata["asset_section_match_reason"],
-            "asset_section_match_is_heuristic": metadata["asset_section_match_is_heuristic"],
-            "asset_section_match_allow_embedding": metadata["asset_section_match_allow_embedding"],
-            "asset_rows": metadata["asset_rows"],
-            "asset_columns": metadata["asset_columns"],
-            "order_index": metadata["order_index"],
+            **{key: metadata[key] for key in _CHUNK_PAYLOAD_KEYS_BEFORE_SCORE},
             "score": score,
             "distance": distance,
-            "source": source,
-            "document_name": document_name or source,
-            "chunk_id": metadata["chunk_id"],
-            "chunk_index": metadata["chunk_index"],
-            "parent_chunk_id": metadata["parent_chunk_id"],
-            "original_chunk_id": metadata["original_chunk_id"],
-            "page_number": metadata["page_number"],
-            "page_start": metadata["page_start"],
-            "page_end": metadata["page_end"],
-            "page_range": metadata["page_range"],
-            "subchunk_index": metadata["subchunk_index"],
-            "subchunk_count": metadata["subchunk_count"],
-            "subchunk_label": metadata["subchunk_label"],
-            "content_part_index": metadata["content_part_index"],
-            "content_part_count": metadata["content_part_count"],
-            "content_part_label": metadata["content_part_label"],
-            "section_path": metadata["section_path"],
-            "section_title": metadata["section_title"],
-            "section_level": metadata["section_level"],
-            "section_part_index": metadata["section_part_index"],
-            "section_part_count": metadata["section_part_count"],
+            **{key: metadata[key] for key in _CHUNK_PAYLOAD_KEYS_AFTER_SCORE},
             "metadata": metadata,
         }
         return payload
 
     def _build_paper_payload(self, entity: Any, score: Optional[float], distance: Optional[float]) -> Dict[str, Any]:
+        """把论文级实体转换为论文卡片结构；摘要缺失时用 content 兜底，作者/分类拆成列表。"""
         if entity is None:
             return {
                 "arxiv_id": "",
@@ -1262,44 +1285,19 @@ class VectorStoreService:
                 "metadata": {},
             }
 
-        reader = entity if isinstance(entity, dict) else None
-        getter = (lambda key, default=None: reader.get(key, default)) if reader is not None else (lambda key, default=None: getattr(entity, key, default))
+        getter = _entity_getter(entity)
 
         authors_raw = getter("authors", "") or ""
         categories_raw = getter("categories", "") or ""
         abstract = getter("abstract", "") or getter("content", "") or ""
         published_date = getter("published_date", "") or ""
 
-        def _split_values(value: Any) -> List[str]:
-            if isinstance(value, list):
-                return [str(item).strip() for item in value if str(item).strip()]
-            if not value:
-                return []
-            if isinstance(value, str):
-                stripped = value.strip()
-                if stripped.startswith("[") or stripped.startswith("("):
-                    try:
-                        parsed = ast.literal_eval(stripped)
-                        if isinstance(parsed, (list, tuple)):
-                            return [str(item).strip() for item in parsed if str(item).strip()]
-                    except (ValueError, SyntaxError):
-                        pass
-            normalized = str(value).replace(";", ",").replace("|", ",")
-            parts = []
-            for token in normalized.replace("\n", " ").split():
-                if "," in token:
-                    parts.extend(token.split(","))
-                else:
-                    parts.append(token)
-            parts = [part.strip() for part in parts]
-            return [part for part in parts if part]
-
         payload = {
             "arxiv_id": str(getter("arxiv_id", "") or ""),
             "title": str(getter("title", "") or ""),
-            "authors": _split_values(authors_raw),
+            "authors": _split_display_values(authors_raw),
             "abstract": str(abstract),
-            "categories": _split_values(categories_raw),
+            "categories": _split_display_values(categories_raw),
             "published_date": str(published_date),
             "url": str(getter("url", "") or ""),
             "similarity_score": score,
@@ -1312,10 +1310,11 @@ class VectorStoreService:
         return payload
 
     def _build_paper_embedding_payload(self, entity: Any) -> Dict[str, Any]:
-        reader = entity if isinstance(entity, dict) else None
-        getter = (lambda key, default=None: reader.get(key, default)) if reader is not None else (lambda key, default=None: getattr(entity, key, default))
+        """把论文向量实体转换为可复用的 embedding 记录（含原始向量）。"""
+        getter = _entity_getter(entity)
 
         vector_value = getter("vector", []) or []
+        # 部分 pymilvus 版本会把向量包成二维 [[...]]，这里取第一行还原为一维向量。
         if vector_value and isinstance(vector_value[0], (list, tuple)):
             vector_value = vector_value[0]
 

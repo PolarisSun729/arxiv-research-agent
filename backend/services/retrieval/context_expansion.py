@@ -1,12 +1,27 @@
+"""检索后的上下文扩展与预算预筛。
+
+处理顺序：
+1. ``ContextExpansionPreparer``：以 rerank top-n 命中为 anchor，按问题类型选择扩展策略（policy），
+   沿 parent/subchunk、章节、页码、图表引用等结构关系找出可补充的候选 chunk，只产出关系和打分；
+2. ``ContextBudgetSelector``：在块数和字符预算内挑选最终上下文（anchor 证据优先，再补扩展上下文）。
+
+两层都是“增强”而非必需：任何一步不可用或出错，都退回 rerank 结果，保证基础 QA 可用。
+"""
+
 from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass, field
+from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from services.intent.intent_service import METHOD_INTENTS, OVERVIEW_INTENTS
+from services.retrieval.numeric_utils import optional_float, optional_int
 from services.retrieval.retrieval_index import CollectionRetrievalIndex
 from services.retrieval.trace_builder import RetrievalTraceBuilder
+
+# anchor 自身作为扩展候选时的说明文字（写入 debug，供排查“为什么这个 chunk 在候选池里”）。
+_SELF_CANDIDATE_REASON = "原始 rerank 命中 chunk 必须作为候选基线保留。"
 
 
 @dataclass
@@ -96,6 +111,12 @@ class ContextBudgetSelector:
         candidate_max_tokens_soft: Optional[int] = None,
         token_chars_per_token: float = 3.0,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """在预算内选出最终上下文块，返回 (final_chunks, debug)。
+
+        candidate_max_blocks 缺省时用 final_context_top_k 作为块数上限；字符预算取 max_context_chars
+        与 soft token 预算换算值中的较大者。开关关闭、候选为空、选择为空或出错时，
+        都退回 rerank 前 N 个结果，并在 debug.fallback_reason 中说明原因。
+        """
         candidate_limit = max(1, int(candidate_max_blocks or final_context_top_k))
         effective_max_context_chars = self._resolve_effective_char_budget(
             max_context_chars=max_context_chars,
@@ -103,24 +124,22 @@ class ContextBudgetSelector:
             token_chars_per_token=token_chars_per_token,
         )
         fallback_chunks = self.trace_builder.mark_final_context_chunks(reranked_chunks[:candidate_limit])
+
+        def fallback(reason: str, *, enabled_flag: bool = True) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+            """退回 rerank 结果；各降级分支只有 reason 不同，其余 debug 参数统一在这里填充。"""
+            return fallback_chunks, self._fallback_debug(
+                reason=reason,
+                enabled=enabled_flag,
+                fallback_chunks=fallback_chunks,
+                max_context_chars=effective_max_context_chars,
+                candidate_max_blocks=candidate_limit,
+                candidate_max_tokens_soft=candidate_max_tokens_soft,
+            )
+
         if not enabled:
-            return fallback_chunks, self._fallback_debug(
-                reason="context_expansion_disabled",
-                enabled=False,
-                fallback_chunks=fallback_chunks,
-                max_context_chars=effective_max_context_chars,
-                candidate_max_blocks=candidate_limit,
-                candidate_max_tokens_soft=candidate_max_tokens_soft,
-            )
+            return fallback("context_expansion_disabled", enabled_flag=False)
         if not context_expansion.get("candidate_pool"):
-            return fallback_chunks, self._fallback_debug(
-                reason="candidate_pool_empty",
-                enabled=True,
-                fallback_chunks=fallback_chunks,
-                max_context_chars=effective_max_context_chars,
-                candidate_max_blocks=candidate_limit,
-                candidate_max_tokens_soft=candidate_max_tokens_soft,
-            )
+            return fallback("candidate_pool_empty")
 
         try:
             chunk_lookup = self._build_chunk_lookup(reranked_chunks, retrieval_index)
@@ -129,6 +148,7 @@ class ContextBudgetSelector:
                 for anchor in (context_expansion.get("anchors") or [])
                 if str(anchor.get("chunk_id", "") or "").strip()
             ]
+            # anchor 在 rerank 中的先后顺序，用于给扩展候选分组排序。
             anchor_rank = {chunk_id: index for index, chunk_id in enumerate(anchor_order)}
             policy = context_expansion.get("policy") or {}
             policy_name = str(policy.get("name", "default") or "default")
@@ -139,31 +159,17 @@ class ContextBudgetSelector:
                 policy=policy,
             )
             if not candidates:
-                return fallback_chunks, self._fallback_debug(
-                    reason="budget_candidates_empty",
-                    enabled=True,
-                    fallback_chunks=fallback_chunks,
-                    max_context_chars=effective_max_context_chars,
-                    candidate_max_blocks=candidate_limit,
-                    candidate_max_tokens_soft=candidate_max_tokens_soft,
-                )
+                return fallback("budget_candidates_empty")
 
             selected, decisions = self._select_with_budget(
                 candidates,
                 anchor_rank=anchor_rank,
                 final_context_top_k=candidate_limit,
                 max_context_chars=max(1, effective_max_context_chars),
-                policy_name=str(policy.get("name", "default") or "default"),
+                policy_name=policy_name,
             )
             if not selected:
-                return fallback_chunks, self._fallback_debug(
-                    reason="budget_selected_empty",
-                    enabled=True,
-                    fallback_chunks=fallback_chunks,
-                    max_context_chars=effective_max_context_chars,
-                    candidate_max_blocks=candidate_limit,
-                    candidate_max_tokens_soft=candidate_max_tokens_soft,
-                )
+                return fallback("budget_selected_empty")
 
             ordered = self._order_final_context(selected, anchor_rank=anchor_rank, policy_name=policy_name)
             final_chunks = [self._annotate_final_chunk(item["chunk"], item) for item in ordered]
@@ -180,14 +186,7 @@ class ContextBudgetSelector:
             )
             return final_chunks, debug
         except Exception as exc:  # pragma: no cover - 预算层不能影响基础 QA 可用性
-            return fallback_chunks, self._fallback_debug(
-                reason=f"context_budget_error: {exc}",
-                enabled=True,
-                fallback_chunks=fallback_chunks,
-                max_context_chars=effective_max_context_chars,
-                candidate_max_blocks=candidate_limit,
-                candidate_max_tokens_soft=candidate_max_tokens_soft,
-            )
+            return fallback(f"context_budget_error: {exc}")
 
     def _score_budget_candidates(
         self,
@@ -197,6 +196,12 @@ class ContextBudgetSelector:
         anchor_rank: Dict[str, int],
         policy: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
+        """给候选池中的每个 chunk 打预算分并排序。
+
+        budget_score = 扩展分 + 角色分 + 多 anchor 加分 + 原始命中加分 - 关系距离惩罚；
+        排序先看 include_priority（硬优先级），再看 budget_score，最后偏好更短的块。
+        找不到原文的候选（chunk_lookup 中缺失）直接丢弃。
+        """
         scored: List[Dict[str, Any]] = []
         policy_name = str(policy.get("name", "default") or "default")
         for candidate in context_expansion.get("candidate_pool") or []:
@@ -242,10 +247,32 @@ class ContextBudgetSelector:
         max_context_chars: int,
         policy_name: str,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """三轮贪心选择，返回 (selected, decisions)。
+
+        1. 先为 anchor 证据预留约 65% 的槽位（图表问题至少 2 个），保证主证据不被扩展上下文挤掉；
+        2. 再按排序遍历全部候选，受块数、字符预算约束（受保护角色可超字符预算）；
+        3. 仍有空位时，用剩余 anchor 补齐。
+        每个候选的 include/drop 决定都写入 decisions，便于逐块复盘。
+        """
         selected: List[Dict[str, Any]] = []
         selected_ids: Set[str] = set()
         decisions: List[Dict[str, Any]] = []
         used_chars = 0
+
+        def record(item: Dict[str, Any], *, include: bool, reason: str) -> None:
+            decisions.append(
+                self._decision(item, include=include, reason=reason, used_chars=used_chars, max_context_chars=max_context_chars)
+            )
+
+        def take(item: Dict[str, Any], reason: str) -> None:
+            nonlocal used_chars
+            selected.append(item)
+            selected_ids.add(item["candidate_chunk_id"])
+            used_chars += item["estimated_chars"]
+            record(item, include=True, reason=reason)
+
+        def over_char_budget(item: Dict[str, Any]) -> bool:
+            return used_chars + item["estimated_chars"] > max_context_chars and not self._is_protected_role(item["context_role"], policy_name)
 
         anchor_slots = 1 if final_context_top_k <= 1 else max(1, min(len(anchor_rank), int(final_context_top_k * 0.65)))
         # figure/table 问题常同时需要正文解释和命中的图表证据，至少保留两个 anchor 槽位避免主证据被预算规则挤掉。
@@ -257,12 +284,8 @@ class ContextBudgetSelector:
         ]
         selected_anchor_count = 0
         for item in anchor_candidates[:anchor_slots]:
-            include_reason = "include_anchor_evidence"
-            selected.append(item)
-            selected_ids.add(item["candidate_chunk_id"])
-            used_chars += item["estimated_chars"]
             selected_anchor_count += 1
-            decisions.append(self._decision(item, include=True, reason=include_reason, used_chars=used_chars, max_context_chars=max_context_chars))
+            take(item, "include_anchor_evidence")
             if len(selected) >= final_context_top_k:
                 return selected, self._drop_unselected(candidates, selected_ids, decisions, reason="top_k_budget_exhausted")
 
@@ -275,43 +298,39 @@ class ContextBudgetSelector:
                 and "sibling" in item.get("relationship_types", [])
                 and final_context_top_k > 1
             ):
+                # 方法流程问题里，同 parent 的 sibling 命中按上下文处理，不占用 anchor 槽位。
                 item = {**item, "context_role": "sibling_context"}
             if (
                 item["context_role"] in {"anchor_evidence", "memory_context"}
                 and selected_anchor_count >= anchor_slots
                 and final_context_top_k > 1
             ):
-                decisions.append(self._decision(item, include=False, reason="anchor_slot_reserved_for_expansion", used_chars=used_chars, max_context_chars=max_context_chars))
+                record(item, include=False, reason="anchor_slot_reserved_for_expansion")
                 continue
             if len(selected) >= final_context_top_k:
-                decisions.append(self._decision(item, include=False, reason="top_k_budget_exhausted", used_chars=used_chars, max_context_chars=max_context_chars))
+                record(item, include=False, reason="top_k_budget_exhausted")
                 continue
-            if used_chars + item["estimated_chars"] > max_context_chars and not self._is_protected_role(item["context_role"], policy_name):
-                decisions.append(self._decision(item, include=False, reason="char_budget_exceeded", used_chars=used_chars, max_context_chars=max_context_chars))
+            if over_char_budget(item):
+                record(item, include=False, reason="char_budget_exceeded")
                 continue
-            selected.append(item)
-            selected_ids.add(item["candidate_chunk_id"])
-            used_chars += item["estimated_chars"]
             if item["context_role"] in {"anchor_evidence", "memory_context"}:
                 selected_anchor_count += 1
             # debug 需要能逐块复盘 include/drop，扩展上下文不能只在 final_context_after_budget 里隐式出现。
-            decisions.append(self._decision(item, include=True, reason=self._include_reason(item), used_chars=used_chars, max_context_chars=max_context_chars))
+            take(item, self._include_reason(item))
         if len(selected) < final_context_top_k:
             for item in anchor_candidates:
                 if item["candidate_chunk_id"] in selected_ids:
                     continue
                 if len(selected) >= final_context_top_k:
                     break
-                if used_chars + item["estimated_chars"] > max_context_chars and not self._is_protected_role(item["context_role"], policy_name):
+                if over_char_budget(item):
                     continue
                 # 扩展候选不足时用剩余高分 anchor 补齐，保证旧索引或稀疏结构不会因为预算层丢失基础证据。
-                selected.append(item)
-                selected_ids.add(item["candidate_chunk_id"])
-                used_chars += item["estimated_chars"]
-                decisions.append(self._decision(item, include=True, reason="include_anchor_to_fill_budget", used_chars=used_chars, max_context_chars=max_context_chars))
+                take(item, "include_anchor_to_fill_budget")
         return selected, decisions
 
     def _order_final_context(self, selected: List[Dict[str, Any]], *, anchor_rank: Dict[str, int], policy_name: str) -> List[Dict[str, Any]]:
+        """确定最终上下文的阅读顺序：策略优先级 → anchor 分组 → 角色顺序 → 页码/文档顺序/subchunk 顺序。"""
         return sorted(
             selected,
             key=lambda item: (
@@ -326,13 +345,14 @@ class ContextBudgetSelector:
         )
 
     def _final_context_priority(self, item: Dict[str, Any], policy_name: str) -> int:
+        """最终排序的第一关键字（越小越靠前）；目前只有 figure_table 策略区分优先级。"""
         # figure_table 场景里，结构化表格单元格证据要优先于旁边的正文解释段落，避免答案被“更像上下文”的文本挤下去。
         if policy_name == "figure_table":
-            chunk = item["chunk"]
+            chunk_type = str(item["chunk"].get("chunk_type", "") or "").lower()
             matched_routes = set(item["candidate"].get("matched_routes") or [])
-            if str(chunk.get("chunk_type", "") or "").lower() == "table" and "table_structured" in matched_routes:
+            if chunk_type == "table" and "table_structured" in matched_routes:
                 return 0
-            if str(chunk.get("chunk_type", "") or "").lower() == "figure":
+            if chunk_type == "figure":
                 return 1
             if item["context_role"] in {"anchor_evidence", "table_evidence", "figure_evidence"}:
                 return 2
@@ -340,6 +360,7 @@ class ContextBudgetSelector:
         return 0
 
     def _annotate_final_chunk(self, chunk: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
+        """复制最终入选的 chunk，并写入上下文角色、预算分和扩展来源等解释字段。"""
         annotated = dict(chunk)
         candidate = item["candidate"]
         annotated["final_context_uses_original_chunk"] = True
@@ -358,6 +379,10 @@ class ContextBudgetSelector:
         reranked_chunks: List[Dict[str, Any]],
         retrieval_index: Optional[CollectionRetrievalIndex],
     ) -> Dict[str, Dict[str, Any]]:
+        """建立 chunk_id → chunk 原文的查找表。
+
+        rerank 结果优先（带有 rerank 分等运行期字段）；其余扩展候选从检索索引中补齐原文。
+        """
         lookup: Dict[str, Dict[str, Any]] = {}
         for chunk in reranked_chunks:
             key = str(chunk.get("chunk_id", "") or "").strip()
@@ -378,6 +403,7 @@ class ContextBudgetSelector:
         candidate_max_tokens_soft: Optional[int],
         token_chars_per_token: float,
     ) -> int:
+        """把 soft token 预算换算成字符预算，并与旧的字符上限取较大值；配置非法时只用字符上限。"""
         legacy_chars = max(1, int(max_context_chars or 1))
         if candidate_max_tokens_soft in (None, ""):
             return legacy_chars
@@ -402,6 +428,7 @@ class ContextBudgetSelector:
         candidate_max_blocks: Optional[int] = None,
         candidate_max_tokens_soft: Optional[int] = None,
     ) -> Dict[str, Any]:
+        """预算选择成功时的 debug：预算前后的块列表、逐块决策、角色/类型分布以及 anchor → 扩展块映射。"""
         role_counts: Dict[str, int] = {}
         chunk_type_counts: Dict[str, int] = {}
         for chunk in final_chunks:
@@ -454,6 +481,7 @@ class ContextBudgetSelector:
         candidate_max_blocks: Optional[int] = None,
         candidate_max_tokens_soft: Optional[int] = None,
     ) -> Dict[str, Any]:
+        """降级到 rerank 结果时的 debug，字段结构与 _budget_debug 保持一致，方便前端统一展示。"""
         decisions = [
             {
                 "chunk_id": chunk.get("chunk_id"),
@@ -493,12 +521,14 @@ class ContextBudgetSelector:
         *,
         reason: str,
     ) -> List[Dict[str, Any]]:
+        """把所有未入选的候选以同一原因记为 drop（提前结束选择时使用），返回追加后的 decisions。"""
         for item in candidates:
             if item["candidate_chunk_id"] not in selected_ids:
                 decisions.append(self._decision(item, include=False, reason=reason, used_chars=0, max_context_chars=0))
         return decisions
 
     def _decision(self, item: Dict[str, Any], *, include: bool, reason: str, used_chars: int, max_context_chars: int) -> Dict[str, Any]:
+        """生成单个候选的 include/drop 决策记录（used_chars 为做出决定时已占用的字符数）。"""
         return {
             "chunk_id": item["candidate_chunk_id"],
             "include": include,
@@ -514,6 +544,7 @@ class ContextBudgetSelector:
 
     @staticmethod
     def _context_role(candidate: Dict[str, Any], chunk: Dict[str, Any], relationship_types: List[str]) -> str:
+        """根据命中路由、chunk 类型和结构关系判定候选在上下文中的角色（按优先级逐条匹配）。"""
         chunk_type = str(chunk.get("chunk_type", candidate.get("chunk_type", "text")) or "text").lower()
         matched_routes = set(candidate.get("matched_routes", []) or [])
         if "memory_context" in matched_routes:
@@ -537,6 +568,7 @@ class ContextBudgetSelector:
 
     @staticmethod
     def _role_score(role: str, policy_name: str) -> float:
+        """角色基础分，再按策略微调：图表/结果类问题加分图表证据，方法流程加分 sibling，摘要类压低 sibling。"""
         base = {
             "anchor_evidence": 0.42,
             "memory_context": 0.36,
@@ -559,6 +591,7 @@ class ContextBudgetSelector:
 
     @staticmethod
     def _include_priority(role: str, policy_name: str, candidate: Dict[str, Any]) -> float:
+        """排序用的硬优先级（量级远大于 budget_score），保证 anchor 证据和策略关键角色排在前面。"""
         priority = 0.0
         if role == "anchor_evidence":
             priority += 5.0
@@ -574,6 +607,7 @@ class ContextBudgetSelector:
 
     @staticmethod
     def _relationship_distance_penalty(candidate: Dict[str, Any]) -> float:
+        """非 anchor 自身的候选按关系种类数小幅扣分（每种 0.02），让直接命中略优先于间接扩展。"""
         relationships = candidate.get("relationship_types") or []
         if "self" in relationships:
             return 0.0
@@ -581,6 +615,7 @@ class ContextBudgetSelector:
 
     @staticmethod
     def _is_protected_role(role: str, policy_name: str) -> bool:
+        """受保护角色即使超出字符预算也允许入选（块数上限仍然生效）。"""
         if role == "anchor_evidence":
             return True
         if policy_name == "figure_table" and role in {"figure_evidence", "table_evidence"}:
@@ -591,6 +626,7 @@ class ContextBudgetSelector:
 
     @staticmethod
     def _include_reason(item: Dict[str, Any]) -> str:
+        """把上下文角色映射为 debug 中的入选原因。"""
         role = item["context_role"]
         if role == "anchor_evidence":
             return "include_high_score_anchor"
@@ -608,6 +644,7 @@ class ContextBudgetSelector:
 
     @staticmethod
     def _role_order(role: str) -> int:
+        """同一 anchor 分组内的阅读顺序：章节背景在前，anchor 证据居中，图表与记忆在后。"""
         return {
             "section_context": 0,
             "parent_context": 1,
@@ -621,6 +658,7 @@ class ContextBudgetSelector:
 
     @staticmethod
     def _estimate_chars(chunk: Dict[str, Any]) -> int:
+        """估算 chunk 进入 prompt 后的字符数：正文 + 图表摘要 + 图表预览文本。"""
         return len(
             "\n".join(
                 [
@@ -631,14 +669,8 @@ class ContextBudgetSelector:
             )
         )
 
-    @staticmethod
-    def _optional_int(value: Any) -> Optional[int]:
-        try:
-            if value in (None, ""):
-                return None
-            return int(value)
-        except (TypeError, ValueError):
-            return None
+    # 宽松整数转换，实现统一放在 numeric_utils；保留方法名以兼容类内 self._optional_int 调用。
+    _optional_int = staticmethod(optional_int)
 
 
 class ContextExpansionPreparer:
@@ -656,6 +688,10 @@ class ContextExpansionPreparer:
         query_profile: Any,
         anchor_limit: int,
     ) -> Dict[str, Any]:
+        """为 rerank 前 anchor_limit 个命中生成 anchor 与扩展候选，返回 debug 结构（含合并后的 candidate_pool）。
+
+        索引不可用时每个 anchor 只保留自身作为候选，并在 fallback_reason 中注明。
+        """
         final_keys = {self._chunk_key(chunk) for chunk in final_context_chunks}
         original_hit_map = {self._candidate_key(chunk): chunk for chunk in reranked_chunks}
         policy = self._select_policy(query_profile)
@@ -684,11 +720,21 @@ class ContextExpansionPreparer:
                 fallback_reason="retrieval_index_unavailable",
             )
 
+        # 每个 action 只处理一种结构关系，执行哪些由 policy.actions 决定；新增动作只需在此登记。
+        # 未登记的 action 名直接忽略。
+        structural_actions = {
+            "sibling": self._add_parent_siblings,
+            "section_neighbors": self._add_section_neighbors,
+            "section_header": self._add_section_header,
+            "parent_section": self._add_parent_section,
+            "asset_related": self._add_asset_related,
+            "page_neighbors": self._add_page_neighbors,
+            "cited_asset_context": partial(self._add_cited_asset_context, query_profile=query_profile),
+        }
         relations = []
         for anchor in anchors:
             candidate_map: Dict[str, ExpansionCandidate] = {}
             for action in policy.actions:
-                # 每个 action 只处理一种结构关系，策略选择由 policy 决定，后续新增动作不需要改主流程。
                 if action == "self":
                     self._add_candidate(
                         candidate_map,
@@ -699,22 +745,19 @@ class ContextExpansionPreparer:
                         final_keys=final_keys,
                         original_hit_map=original_hit_map,
                         policy=policy,
-                        reason="原始 rerank 命中 chunk 必须作为候选基线保留。",
+                        reason=_SELF_CANDIDATE_REASON,
                     )
-                elif action == "sibling":
-                    self._add_parent_siblings(candidate_map, anchor=anchor, retrieval_index=retrieval_index, final_keys=final_keys, original_hit_map=original_hit_map, policy=policy)
-                elif action == "section_neighbors":
-                    self._add_section_neighbors(candidate_map, anchor=anchor, retrieval_index=retrieval_index, final_keys=final_keys, original_hit_map=original_hit_map, policy=policy)
-                elif action == "section_header":
-                    self._add_section_header(candidate_map, anchor=anchor, retrieval_index=retrieval_index, final_keys=final_keys, original_hit_map=original_hit_map, policy=policy)
-                elif action == "parent_section":
-                    self._add_parent_section(candidate_map, anchor=anchor, retrieval_index=retrieval_index, final_keys=final_keys, original_hit_map=original_hit_map, policy=policy)
-                elif action == "asset_related":
-                    self._add_asset_related(candidate_map, anchor=anchor, retrieval_index=retrieval_index, final_keys=final_keys, original_hit_map=original_hit_map, policy=policy)
-                elif action == "page_neighbors":
-                    self._add_page_neighbors(candidate_map, anchor=anchor, retrieval_index=retrieval_index, final_keys=final_keys, original_hit_map=original_hit_map, policy=policy)
-                elif action == "cited_asset_context":
-                    self._add_cited_asset_context(candidate_map, anchor=anchor, retrieval_index=retrieval_index, final_keys=final_keys, original_hit_map=original_hit_map, policy=policy, query_profile=query_profile)
+                    continue
+                handler = structural_actions.get(action)
+                if handler is not None:
+                    handler(
+                        candidate_map,
+                        anchor=anchor,
+                        retrieval_index=retrieval_index,
+                        final_keys=final_keys,
+                        original_hit_map=original_hit_map,
+                        policy=policy,
+                    )
             relations.append(self._relation_payload(anchor, list(candidate_map.values()), policy=policy))
 
         candidate_pool = self._merge_candidate_pool(relations, original_hit_map=original_hit_map)
@@ -728,6 +771,7 @@ class ContextExpansionPreparer:
         final_keys: Set[str],
         query_profile: Any,
     ) -> ExpansionAnchor:
+        """把 rerank 命中 chunk 转成 anchor，并记录它需要扩展的原因（多路命中、被切分、图表、结构类意图等）。"""
         chunk_type = self._chunk_type(chunk)
         matched_routes = [str(item) for item in (chunk.get("matched_routes") or []) if str(item).strip()]
         reasons = [f"rerank_top_n_rank_{original_rank}"]
@@ -772,16 +816,28 @@ class ContextExpansionPreparer:
         original_hit_map: Dict[str, Dict[str, Any]],
         policy: ExpansionPolicy,
     ) -> None:
+        """sibling 动作：同 parent 下 subchunk 序号相差不超过 sibling_window 的块。"""
         parent_id = str(anchor.parent_chunk_id or "").strip()
         if not parent_id:
             return
-        doc_ids = retrieval_index.by_parent_chunk_id.get(parent_id, [])
-        added = 0
-        for doc_id in self._sort_doc_ids(doc_ids, retrieval_index):
+        sorted_doc_ids = self._sort_doc_ids(retrieval_index.by_parent_chunk_id.get(parent_id, []), retrieval_index)
+        # 一个 chunk 可能对应多条 index 文档（body/summary 等），按 chunk 去重后的阅读顺序才是 sibling 的真实先后。
+        chunk_order = list(dict.fromkeys(
+            self._candidate_key(retrieval_index.documents[doc_id].chunk) for doc_id in sorted_doc_ids
+        ))
+        anchor_key = str(anchor.chunk_id or "").strip()
+        anchor_position = chunk_order.index(anchor_key) if anchor_key in chunk_order else None
+        # 上限按不同 chunk 计数：按 index 文档计数会被同一 chunk 的多条文档占满，截掉 anchor 之后的 sibling。
+        added_keys: Set[str] = set()
+        for doc_id in sorted_doc_ids:
             chunk = retrieval_index.documents[doc_id].chunk
-            distance = self._subchunk_distance(anchor, chunk, fallback_doc_id=doc_id)
-            if abs(distance) > policy.sibling_window:
+            distance = self._subchunk_distance(anchor, chunk, chunk_order=chunk_order, anchor_position=anchor_position)
+            if distance is None or abs(distance) > policy.sibling_window:
                 continue
+            candidate_key = self._candidate_key(chunk)
+            if candidate_key not in added_keys and len(added_keys) >= policy.sibling_window * 2 + 1:
+                break
+            added_keys.add(candidate_key)
             self._add_candidate(
                 candidate_map,
                 anchor=anchor,
@@ -793,9 +849,6 @@ class ContextExpansionPreparer:
                 policy=policy,
                 reason="同 parent 的相邻 subchunk 可补足定义、步骤前后文或被切断的句段。",
             )
-            added += 1
-            if added >= policy.sibling_window * 2 + 1:
-                break
 
     def _add_section_neighbors(
         self,
@@ -807,6 +860,7 @@ class ContextExpansionPreparer:
         original_hit_map: Dict[str, Dict[str, Any]],
         policy: ExpansionPolicy,
     ) -> None:
+        """section_neighbors 动作：同 section_path 内文档顺序相差不超过 section_window 的块，最多 section_limit 个。"""
         section_path = str(anchor.section_path or "").strip()
         if not section_path:
             return
@@ -844,6 +898,7 @@ class ContextExpansionPreparer:
         original_hit_map: Dict[str, Dict[str, Any]],
         policy: ExpansionPolicy,
     ) -> None:
+        """section_header 动作：同 section_path 中排在最前的 2 个块（章节开头通常交代主题）。"""
         section_path = str(anchor.section_path or "").strip()
         if not section_path:
             return
@@ -872,6 +927,7 @@ class ContextExpansionPreparer:
         original_hit_map: Dict[str, Dict[str, Any]],
         policy: ExpansionPolicy,
     ) -> None:
+        """parent_section 动作：上一级章节路径下排在最前的 section_limit 个块。"""
         parent_path = self._parent_section_path(anchor.section_path)
         if not parent_path:
             return
@@ -900,6 +956,7 @@ class ContextExpansionPreparer:
         original_hit_map: Dict[str, Dict[str, Any]],
         policy: ExpansionPolicy,
     ) -> None:
+        """asset_related 动作：同章节或 ±page_window 页内的 figure/table 块，最多 asset_limit 个。"""
         added = 0
         section_path = str(anchor.section_path or "").strip()
         section_doc_ids = retrieval_index.by_section_path.get(section_path, []) if section_path else []
@@ -938,6 +995,7 @@ class ContextExpansionPreparer:
         original_hit_map: Dict[str, Dict[str, Any]],
         policy: ExpansionPolicy,
     ) -> None:
+        """page_neighbors 动作：同页及 ±page_window 页内的块（按页码先后），最多 page_limit 个。"""
         added = 0
         for page in self._nearby_pages(anchor.page_number, window=policy.page_window):
             for doc_id in self._sort_doc_ids(retrieval_index.by_page_number.get(page, []), retrieval_index):
@@ -968,6 +1026,7 @@ class ContextExpansionPreparer:
         policy: ExpansionPolicy,
         query_profile: Any,
     ) -> None:
+        """cited_asset_context 动作：问题或 anchor 正文显式提到 Figure/Table 编号时，全库查找对应的图表块。"""
         cited_labels = self._extract_cited_asset_labels(anchor, query_profile)
         if not cited_labels:
             return
@@ -1006,6 +1065,10 @@ class ContextExpansionPreparer:
         policy: ExpansionPolicy,
         reason: str,
     ) -> None:
+        """把一个结构关系候选写入 candidate_map。
+
+        同一 (关系类型, chunk) 只保留扩展分最高的一条；chunk 为空（anchor 在索引中查不到）时退回 anchor 自身。
+        """
         if chunk and policy.summary_section_only and expansion_type not in {"self", "section_header"} and not self._matches_preferred_section(chunk, policy):
             # 摘要/局限类问题只需要跨章节信号，避免被某个局部段落的邻近 chunk 过度占满候选池。
             return
@@ -1054,6 +1117,7 @@ class ContextExpansionPreparer:
             candidate_map[key] = candidate
 
     def _self_candidate(self, anchor: ExpansionAnchor, *, final_keys: Set[str], policy: ExpansionPolicy) -> ExpansionCandidate:
+        """只用 anchor 自身信息构造 self 候选（不依赖检索索引）。"""
         score = self._score_candidate(
             anchor=anchor,
             chunk={},
@@ -1083,12 +1147,13 @@ class ContextExpansionPreparer:
             fusion_score=anchor.fusion_score,
             rerank_score=anchor.rerank_score,
             expansion_score=score,
-            reason="原始 rerank 命中 chunk 必须作为候选基线保留。",
-            expansion_reason="原始 rerank 命中 chunk 必须作为候选基线保留。",
+            reason=_SELF_CANDIDATE_REASON,
+            expansion_reason=_SELF_CANDIDATE_REASON,
             matched_routes=list(anchor.matched_routes),
         )
 
     def _relation_payload(self, anchor: ExpansionAnchor, candidates: List[ExpansionCandidate], *, policy: ExpansionPolicy) -> Dict[str, Any]:
+        """把一个 anchor 的候选按扩展分排序、截断到 per_anchor_limit，并转成可序列化的 dict。"""
         ordered = sorted(candidates, key=lambda item: (item.expansion_score, -abs(item.distance), item.expansion_type), reverse=True)
         ordered = ordered[: policy.per_anchor_limit]
         return {
@@ -1105,6 +1170,7 @@ class ContextExpansionPreparer:
         policy: ExpansionPolicy,
         fallback_reason: str,
     ) -> Dict[str, Any]:
+        """组装 prepare 阶段的输出；candidate_count 为去重前总数，deduped_candidate_count 为合并后的候选池大小。"""
         candidate_count = sum(len(item.get("candidates", [])) for item in relations)
         return {
             "enabled": True,
@@ -1120,6 +1186,10 @@ class ContextExpansionPreparer:
         }
 
     def _select_policy(self, query_profile: Any) -> ExpansionPolicy:
+        """按主意图选择扩展策略模板；问题里出现图表信号时强制使用 figure_table，未知意图用 default。
+
+        返回的策略会合并模板、查询与意图中的偏好章节词，name 记录实际意图便于 debug。
+        """
         intent_profile = getattr(query_profile, "intent_profile", None)
         main_intent = str(getattr(intent_profile, "main_intent", "other") or "other").strip().lower()
         query_text = " ".join(
@@ -1144,10 +1214,11 @@ class ContextExpansionPreparer:
             # 显式 Figure/Table 编号或图表词是强结构信号，优先使用图表策略，避免被 method/result 等主题词吞掉。
             template_name = "figure_table"
             main_intent = "figure_table"
-        if template_name not in self._policy_templates():
+        templates = self._policy_templates()
+        if template_name not in templates:
             template_name = "default"
 
-        base_policy = self._policy_templates()[template_name]
+        base_policy = templates[template_name]
         preferred_terms = [
             *base_policy.preferred_section_terms,
             *[str(item).lower() for item in (getattr(query_profile, "section_preferences", []) or [])],
@@ -1163,6 +1234,7 @@ class ContextExpansionPreparer:
 
     @staticmethod
     def _policy_templates() -> Dict[str, ExpansionPolicy]:
+        """各问题类型的扩展策略模板：执行哪些结构动作、各动作的窗口与数量上限、偏好章节词。"""
         return {
             "method_flow": ExpansionPolicy(
                 name="method_flow",
@@ -1250,6 +1322,10 @@ class ContextExpansionPreparer:
         is_original_retrieval_hit: bool,
         policy: ExpansionPolicy,
     ) -> float:
+        """扩展分 = anchor 分 × 0.55 + 关系权重 − 距离惩罚 + 结构/命中加分，结果不小于 0。
+
+        anchor 分优先取 rerank 分，缺失时用融合分，都没有时按 0.5 中性处理。
+        """
         anchor_score = anchor.rerank_score if anchor.rerank_score is not None else anchor.fusion_score
         base = max(0.0, min(float(anchor_score if anchor_score is not None else 0.5), 1.0))
         relationship_weight = {
@@ -1289,6 +1365,7 @@ class ContextExpansionPreparer:
         *,
         original_hit_map: Dict[str, Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """把所有 anchor 的候选按 chunk 合并成候选池：累积来源 anchor/关系/原因/路由，扩展分取最大值再加多 anchor 奖励。"""
         merged: Dict[str, Dict[str, Any]] = {}
         for relation in relations:
             anchor = relation.get("anchor", {})
@@ -1352,6 +1429,7 @@ class ContextExpansionPreparer:
         anchor: ExpansionAnchor,
         retrieval_index: CollectionRetrievalIndex,
     ) -> Optional[Dict[str, Any]]:
+        """在检索索引中找到 anchor 对应的 chunk 原文；找不到返回 None。"""
         doc_ids = self._doc_ids_for_anchor(anchor, retrieval_index)
         if doc_ids:
             return retrieval_index.documents[doc_ids[0]].chunk
@@ -1362,6 +1440,7 @@ class ContextExpansionPreparer:
         anchor: ExpansionAnchor,
         retrieval_index: CollectionRetrievalIndex,
     ) -> List[int]:
+        """anchor 在索引中的文档下标：先按 chunk_id 查，查不到再按 parent_chunk_id 查。"""
         for key, mapping in (
             (anchor.chunk_id, retrieval_index.by_chunk_id),
             (anchor.parent_chunk_id, retrieval_index.by_parent_chunk_id),
@@ -1372,6 +1451,7 @@ class ContextExpansionPreparer:
         return []
 
     def _sort_doc_ids(self, doc_ids: Iterable[int], retrieval_index: CollectionRetrievalIndex) -> List[int]:
+        """去重、过滤越界下标，并按论文中的阅读顺序（order_index → subchunk_index → 下标）排序。"""
         return sorted(
             {int(doc_id) for doc_id in doc_ids if 0 <= int(doc_id) < len(retrieval_index.documents)},
             key=lambda doc_id: (
@@ -1381,11 +1461,26 @@ class ContextExpansionPreparer:
             ),
         )
 
-    def _subchunk_distance(self, anchor: ExpansionAnchor, chunk: Dict[str, Any], *, fallback_doc_id: int) -> int:
+    def _subchunk_distance(
+        self,
+        anchor: ExpansionAnchor,
+        chunk: Dict[str, Any],
+        *,
+        chunk_order: List[str],
+        anchor_position: Optional[int],
+    ) -> Optional[int]:
+        """候选相对 anchor 在同一 parent 下的距离。
+
+        双方都有 subchunk 序号时取序号差；否则退回 chunk_order（按 chunk 去重后的阅读顺序）中的位置差；
+        anchor 或候选不在 chunk_order 中、无法判断先后时返回 None，由调用方跳过该候选。
+        """
         candidate_index = self._optional_int(chunk.get("subchunk_index"))
         if anchor.subchunk_index is not None and candidate_index is not None:
             return candidate_index - anchor.subchunk_index
-        return fallback_doc_id
+        candidate_key = self._candidate_key(chunk)
+        if anchor_position is None or candidate_key not in chunk_order:
+            return None
+        return chunk_order.index(candidate_key) - anchor_position
 
     def _doc_distance(
         self,
@@ -1395,11 +1490,13 @@ class ContextExpansionPreparer:
         *,
         fallback_doc_id: int,
     ) -> int:
+        """候选文档下标相对 anchor 首个文档下标的差；anchor 不在索引中时视为 0。"""
         anchor_doc_ids = self._doc_ids_for_anchor(anchor, retrieval_index)
         return fallback_doc_id - anchor_doc_ids[0] if anchor_doc_ids else 0
 
     @staticmethod
     def _page_distance(anchor_page: Any, candidate_page: Any) -> int:
+        """候选页码减 anchor 页码；任一页码无法解析为整数时视为 0。"""
         anchor_int = ContextExpansionPreparer._optional_int(anchor_page)
         candidate_int = ContextExpansionPreparer._optional_int(candidate_page)
         if anchor_int is None or candidate_int is None:
@@ -1408,6 +1505,7 @@ class ContextExpansionPreparer:
 
     @staticmethod
     def _nearby_pages(page_number: Any, *, window: int = 1) -> List[str]:
+        """返回 [page-window, page+window] 内的正页码（字符串，与 by_page_number 的键一致）；非数字页码原样返回。"""
         page = ContextExpansionPreparer._optional_int(page_number)
         if page is None:
             normalized = str(page_number or "").strip()
@@ -1417,6 +1515,7 @@ class ContextExpansionPreparer:
 
     @staticmethod
     def _query_needs_structural_context(query_profile: Any) -> bool:
+        """方法、实验、结果、对比、图表类问题需要章节结构上下文（主意图或意图标签命中即可）。"""
         intent_profile = getattr(query_profile, "intent_profile", None)
         main_intent = str(getattr(intent_profile, "main_intent", "other") or "other").lower()
         tags = {str(tag).lower() for tag in (getattr(query_profile, "intent_tags", []) or [])}
@@ -1425,14 +1524,17 @@ class ContextExpansionPreparer:
 
     @staticmethod
     def _chunk_type(chunk: Dict[str, Any]) -> str:
+        """小写的 chunk 类型，缺失或空白时为 text。"""
         return str(chunk.get("chunk_type", "text") or "text").strip().lower() or "text"
 
     @staticmethod
     def _chunk_key(chunk: Dict[str, Any]) -> str:
+        """与 trace 一致的 chunk 唯一键，用于判断是否已在最终上下文中。"""
         return RetrievalTraceBuilder.chunk_unique_key(chunk)
 
     @staticmethod
     def _candidate_key(chunk: Dict[str, Any]) -> str:
+        """候选合并键：优先 chunk_id，缺失时退回 trace 唯一键。"""
         chunk_id = str(chunk.get("chunk_id", "") or "").strip()
         if chunk_id:
             return chunk_id
@@ -1440,10 +1542,12 @@ class ContextExpansionPreparer:
 
     @staticmethod
     def _section_key(chunk: Dict[str, Any]) -> str:
+        """小写的 section_path，用于判断是否与 anchor 同章节。"""
         return str(chunk.get("section_path", "") or "").strip().lower()
 
     @staticmethod
     def _matches_preferred_section(chunk: Dict[str, Any], policy: ExpansionPolicy) -> bool:
+        """章节路径/标题或正文开头（前 240 字）是否包含策略偏好的章节词。"""
         if not policy.preferred_section_terms:
             return False
         section_text = " ".join(
@@ -1458,6 +1562,7 @@ class ContextExpansionPreparer:
 
     @staticmethod
     def _parent_section_path(section_path: str) -> str:
+        """去掉章节路径的最后一级（支持 / > \\ 三种分隔符）；没有上级时返回空串。"""
         normalized = str(section_path or "").strip()
         if not normalized:
             return ""
@@ -1467,6 +1572,7 @@ class ContextExpansionPreparer:
         return ""
 
     def _extract_cited_asset_labels(self, anchor: ExpansionAnchor, query_profile: Any) -> List[str]:
+        """从问题和 anchor 文本中提取图表编号，统一成 "figure 3" / "table 2a" 形式。"""
         text = " ".join(
             [
                 str(getattr(query_profile, "original_query", "") or ""),
@@ -1484,12 +1590,14 @@ class ContextExpansionPreparer:
 
     @staticmethod
     def _looks_like_figure_table_question(text: str) -> bool:
+        """问题是否带图表信号：显式 Figure/Table 编号，或 figure/table/caption/图/表 等词。"""
         return bool(
             re.search(r"\b(fig(?:ure)?|table|tab)\.?\s*[0-9]+[a-zA-Z]?\b", text, flags=re.IGNORECASE)
             or re.search(r"\b(figure|table|diagram|caption|图|表格|表)\b", text, flags=re.IGNORECASE)
         )
 
     def _asset_matches_labels(self, chunk: Dict[str, Any], cited_labels: List[str]) -> bool:
+        """图表块的正文/摘要/caption/路径/章节中是否出现任一被引用的编号（下划线和连字符视为空格）。"""
         if not cited_labels:
             return False
         text = " ".join(
@@ -1507,6 +1615,7 @@ class ContextExpansionPreparer:
 
     @staticmethod
     def _append_unique(values: List[Any], value: Any) -> None:
+        """保序去重追加，忽略 None 和空串。"""
         if value in (None, ""):
             return
         if value not in values:
@@ -1514,6 +1623,7 @@ class ContextExpansionPreparer:
 
     @staticmethod
     def _dedupe_strings(values: Iterable[str]) -> List[str]:
+        """小写、去空白后保序去重，丢弃空值。"""
         deduped: List[str] = []
         for value in values:
             normalized = str(value or "").strip().lower()
@@ -1523,6 +1633,7 @@ class ContextExpansionPreparer:
 
     @classmethod
     def _max_optional(cls, left: Any, right: Any) -> Optional[float]:
+        """两个可能缺失的分数取最大值；只有一个有值时取该值，都缺失时为 None。"""
         left_value = cls._optional_float(left)
         right_value = cls._optional_float(right)
         if left_value is None:
@@ -1533,22 +1644,9 @@ class ContextExpansionPreparer:
 
     @staticmethod
     def _string_key(value: Any) -> str:
+        """把可能为 None/数字的 ID 规整成去空白字符串，便于比较。"""
         return str(value or "").strip()
 
-    @staticmethod
-    def _optional_int(value: Any) -> Optional[int]:
-        try:
-            if value in (None, ""):
-                return None
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _optional_float(value: Any) -> Optional[float]:
-        try:
-            if value in (None, ""):
-                return None
-            return float(value)
-        except (TypeError, ValueError):
-            return None
+    # 宽松数值转换，实现统一放在 numeric_utils；保留方法名以兼容 self./cls./类名 三种调用写法。
+    _optional_int = staticmethod(optional_int)
+    _optional_float = staticmethod(optional_float)

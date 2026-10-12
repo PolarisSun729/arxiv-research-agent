@@ -1,3 +1,10 @@
+"""单次检索的主流程编排。
+
+顺序：解析 collection 与检索索引 → 查询规划 → 多路召回 → RRF 融合 → （可选）LLM rerank
+→ 上下文扩展候选 → 预算预筛 → 组装 debug / 导出 trace。
+各阶段的具体逻辑都在各自的服务中，这里只负责串联、降级和记录。
+"""
+
 from __future__ import annotations
 
 import logging
@@ -9,7 +16,29 @@ from services.retrieval.contracts import RetrievalOptions, RetrievalPipelineResu
 from services.retrieval.context_expansion import ContextBudgetSelector, ContextExpansionPreparer
 from services.retrieval.execution import RouteExecutionSupport
 from utils.logging_utils import info_event
+
 logger = logging.getLogger(__name__)
+
+# 运行期功能开关；debug 配置与 trace 选项都按这个顺序原样透传。
+_FEATURE_FLAG_KEYS = (
+    "enable_query_rewrite",
+    "enable_hyde",
+    "enable_keyword_search",
+    "enable_table_structured_route",
+    "enable_llm_rerank",
+    "enable_context_expansion",
+    "enable_multi_index_embedding",
+    "enable_index_level_bm25",
+    "enable_generated_question_index",
+    "enable_chunk_level_retrieval_fallback",
+)
+# 索引构建相关开关：只来自 enhanced_config，不接受单次请求覆盖，缺省开启。
+_INDEX_FEATURE_KEYS = (
+    "enable_multi_index_embedding",
+    "enable_index_level_bm25",
+    "enable_generated_question_index",
+    "enable_chunk_level_retrieval_fallback",
+)
 
 
 class RetrievalPipeline:
@@ -68,6 +97,7 @@ class RetrievalPipeline:
         paper_context: Optional[Dict[str, Any]] = None,
         options: Optional[RetrievalOptions] = None,
     ) -> Dict[str, Any]:
+        """执行一次检索，返回最终上下文 chunk；debug 模式下附带 retrieval_debug 与 trace 文件路径。"""
         started = perf_counter()
         options = options or RetrievalOptions()
         runtime = self._resolve_runtime_options(options)
@@ -193,16 +223,7 @@ class RetrievalPipeline:
                     "rerank_candidate_limit": runtime["rerank_candidate_limit"],
                     "default_final_context_top_k": runtime["default_final_context_top_k"],
                     "max_final_context_top_k": runtime["max_final_context_top_k"],
-                    "enable_query_rewrite": runtime["enable_query_rewrite"],
-                    "enable_hyde": runtime["enable_hyde"],
-                    "enable_keyword_search": runtime["enable_keyword_search"],
-                    "enable_table_structured_route": runtime["enable_table_structured_route"],
-                    "enable_llm_rerank": runtime["enable_llm_rerank"],
-                    "enable_context_expansion": runtime["enable_context_expansion"],
-                    "enable_multi_index_embedding": runtime["enable_multi_index_embedding"],
-                    "enable_index_level_bm25": runtime["enable_index_level_bm25"],
-                    "enable_generated_question_index": runtime["enable_generated_question_index"],
-                    "enable_chunk_level_retrieval_fallback": runtime["enable_chunk_level_retrieval_fallback"],
+                    **self._feature_flags(runtime),
                     "context_budget_max_chars": runtime["context_budget_max_chars"],
                     "retrieval_candidate_max_blocks": runtime["retrieval_candidate_max_blocks"],
                     "retrieval_candidate_max_tokens_soft": runtime["retrieval_candidate_max_tokens_soft"],
@@ -231,16 +252,7 @@ class RetrievalPipeline:
                     "default_final_context_top_k": runtime["default_final_context_top_k"],
                     "max_final_context_top_k": runtime["max_final_context_top_k"],
                     "candidate_k": runtime["recall_candidate_limit"],
-                    "enable_query_rewrite": runtime["enable_query_rewrite"],
-                    "enable_hyde": runtime["enable_hyde"],
-                    "enable_keyword_search": runtime["enable_keyword_search"],
-                    "enable_table_structured_route": runtime["enable_table_structured_route"],
-                    "enable_llm_rerank": runtime["enable_llm_rerank"],
-                    "enable_context_expansion": runtime["enable_context_expansion"],
-                    "enable_multi_index_embedding": runtime["enable_multi_index_embedding"],
-                    "enable_index_level_bm25": runtime["enable_index_level_bm25"],
-                    "enable_generated_question_index": runtime["enable_generated_question_index"],
-                    "enable_chunk_level_retrieval_fallback": runtime["enable_chunk_level_retrieval_fallback"],
+                    **self._feature_flags(runtime),
                     "debug": runtime["debug_enabled"],
                 },
                 query_profile=query_profile,
@@ -264,11 +276,12 @@ class RetrievalPipeline:
 
         trace_path = trace_export.get("json") if isinstance(trace_export, dict) else None
         rerank_debug = rerank_result.rerank_debug if isinstance(rerank_result.rerank_debug, dict) else {}
+        context_meta = paper_context if isinstance(paper_context, dict) else {}
         info_event(
             logger,
             "retrieval.done",
-            run_id=(paper_context or {}).get("run_id") if isinstance(paper_context, dict) else None,
-            arxiv_id=(paper_context or {}).get("arxiv_id") if isinstance(paper_context, dict) else None,
+            run_id=context_meta.get("run_id"),
+            arxiv_id=context_meta.get("arxiv_id"),
             collection_name=normalized_collection_name,
             input=user_query,
             raw_count=len(fusion_result.raw_retrieval_top_n),
@@ -299,6 +312,11 @@ class RetrievalPipeline:
         query_profile: Any,
         original_question: str,
     ) -> RerankResult:
+        """执行 LLM rerank；关闭、失败或超时时直接沿用融合顺序（rerank 只是增强阶段）。
+
+        返回的 reranked_results 是完整重排列表，final_results 是取前 effective_top_k 个并打上
+        “使用原始 chunk 内容”标记的最终候选。
+        """
         reranked_results = fused_results
         final_results = fused_results
         rerank_debug: Dict[str, Any] = {
@@ -340,15 +358,11 @@ class RetrievalPipeline:
                 rerank_payload = rerank_exec.results[0]
                 reranked_results = rerank_payload.get("reranked_chunks", rerank_payload["chunks"])
                 final_results = self.trace_builder.mark_final_context_chunks(rerank_payload["chunks"])
-                self.trace_builder.log_retrieval_stage("reranked_top30", reranked_results[:rrf_candidate_limit])
-                self.trace_builder.log_retrieval_stage("final_context_top15", final_results[:effective_top_k])
                 rerank_debug = rerank_payload["debug"]
             else:
                 # rerank 是增强阶段，失败或超时时保持 fused 顺序，避免整条 QA 被外部 rerank 拖垮。
                 reranked_results = fused_results
                 final_results = self.trace_builder.mark_final_context_chunks(fused_results[:effective_top_k])
-                self.trace_builder.log_retrieval_stage("reranked_top30", reranked_results[:rrf_candidate_limit])
-                self.trace_builder.log_retrieval_stage("final_context_top15", final_results[:effective_top_k])
                 rerank_debug = {
                     **rerank_debug,
                     "mode": "fallback_fused",
@@ -362,10 +376,20 @@ class RetrievalPipeline:
             # 否则 debug 会误导排查者以为 rerank 只处理了 1 条候选。
             rerank_metric["candidate_count"] = len(reranked_results)
         else:
-            self.trace_builder.log_retrieval_stage("reranked_top30", reranked_results[:rrf_candidate_limit])
             final_results = self.trace_builder.mark_final_context_chunks(fused_results[:effective_top_k])
-            self.trace_builder.log_retrieval_stage("final_context_top15", final_results[:effective_top_k])
-            rerank_metric = {"enabled": False, "applied": False, "status": "disabled", "latency_ms": 0.0, "candidate_count": len(final_results), "error": "", "fallback_reason": "disabled", "cache_hit": None, "timeout": False}
+            rerank_metric = {
+                "enabled": False,
+                "applied": False,
+                "status": "disabled",
+                "latency_ms": 0.0,
+                "candidate_count": len(final_results),
+                "error": "",
+                "fallback_reason": "disabled",
+                "cache_hit": None,
+                "timeout": False,
+            }
+        self.trace_builder.log_retrieval_stage("reranked_top30", reranked_results[:rrf_candidate_limit])
+        self.trace_builder.log_retrieval_stage("final_context_top15", final_results[:effective_top_k])
         return RerankResult(
             final_results=final_results,
             reranked_results=reranked_results,
@@ -373,7 +397,17 @@ class RetrievalPipeline:
             route_metric=rerank_metric,
         )
 
+    @staticmethod
+    def _feature_flags(runtime: Dict[str, Any]) -> Dict[str, Any]:
+        """从运行期参数中按固定顺序取出全部功能开关。"""
+        return {key: runtime[key] for key in _FEATURE_FLAG_KEYS}
+
     def _resolve_runtime_options(self, options: RetrievalOptions) -> Dict[str, Any]:
+        """把单次请求选项与全局配置合并成本次检索的有效参数。
+
+        请求里显式给出的开关优先，否则用配置默认值；top_k 被夹在 [1, max_final_context_top_k] 内；
+        候选块数至少为 effective_top_k，字符/token 预算都保证为正数。
+        """
         default_final_context_top_k = max(1, int(self.enhanced_config["final_context_top_k"]))
         max_final_context_top_k = max(
             1,
@@ -397,12 +431,7 @@ class RetrievalPipeline:
             "enable_llm_rerank": self.option_resolver(options.enable_llm_rerank, self.retrieval_config.get("enable_llm_rerank", False)),
             "enable_context_expansion": self.option_resolver(options.enable_context_expansion, self.enhanced_config.get("enable_context_expansion", True)),
             "debug_enabled": self.option_resolver(options.debug, self.retrieval_config["debug"]),
-            "enable_multi_index_embedding": bool(self.enhanced_config.get("enable_multi_index_embedding", True)),
-            "enable_index_level_bm25": bool(self.enhanced_config.get("enable_index_level_bm25", True)),
-            "enable_generated_question_index": bool(self.enhanced_config.get("enable_generated_question_index", True)),
-            "enable_chunk_level_retrieval_fallback": bool(
-                self.enhanced_config.get("enable_chunk_level_retrieval_fallback", True)
-            ),
+            **{key: bool(self.enhanced_config.get(key, True)) for key in _INDEX_FEATURE_KEYS},
             "recall_candidate_limit": self.enhanced_config["recall_candidate_limit"],
             "rrf_candidate_limit": self.enhanced_config["rrf_candidate_limit"],
             "rerank_candidate_limit": self.enhanced_config["rerank_candidate_limit"],

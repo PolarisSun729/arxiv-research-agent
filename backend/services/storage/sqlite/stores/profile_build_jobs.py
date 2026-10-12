@@ -11,6 +11,45 @@ from services.storage.sqlite.shared import (
 )
 
 
+# 构建任务的标准读取列；_profile_build_job_row_to_dict 按这里的顺序取下标。
+_PROFILE_BUILD_JOB_COLUMNS = (
+    "job_id, user_id, status, snapshot_id, current_stage, progress, error_message, "
+    "metrics_json, build_config_json, extractor_version, normalizer_version, profile_build_version, "
+    "created_at, updated_at"
+)
+
+# metrics 中需要额外提升到返回字典顶层的字段，前端轮询进度条直接读取这些键。
+_PROFILE_BUILD_METRIC_FIELDS = (
+    "total_papers",
+    "candidate_papers",
+    "cached_papers",
+    "uncached_papers",
+    "processed_papers",
+    "failed_papers",
+    "skipped_paper_count",
+    "skipped_read_only_papers",
+    "skipped_failed_cache_papers",
+    "skipped_limit_papers",
+    "repair_candidate_papers",
+    "successful_papers",
+    "cache_hit_count",
+    "generated_count",
+    "failed_count",
+    "skipped_count",
+    "average_seconds_per_paper",
+    "total_evidence_extraction_seconds",
+    "evidence_concurrency",
+    "rate_limit_backoff_count",
+    "paper_evidence_failure_details",
+    "build_mode",
+    "paper_limit",
+    "evidence_counts",
+    "current_arxiv_id",
+    "stage_message",
+    "recent_logs",
+)
+
+
 class ProfileBuildJobStore(BaseSqliteStore):
     """维护画像构建 job 状态；具体快照生成和激活仍由 profile 主流程负责。"""
 
@@ -19,10 +58,8 @@ class ProfileBuildJobStore(BaseSqliteStore):
         try:
             with self._get_connection() as conn:
                 rows = conn.execute(
-                    '''
-                    SELECT job_id, user_id, status, snapshot_id, current_stage, progress, error_message,
-                           metrics_json, build_config_json, extractor_version, normalizer_version, profile_build_version,
-                           created_at, updated_at
+                    f'''
+                    SELECT {_PROFILE_BUILD_JOB_COLUMNS}
                     FROM user_profile_build_jobs
                     WHERE user_id = ?
                     ORDER BY updated_at DESC, created_at DESC
@@ -40,10 +77,8 @@ class ProfileBuildJobStore(BaseSqliteStore):
         try:
             with self._get_connection() as conn:
                 row = conn.execute(
-                    '''
-                    SELECT job_id, user_id, status, snapshot_id, current_stage, progress, error_message,
-                           metrics_json, build_config_json, extractor_version, normalizer_version, profile_build_version,
-                           created_at, updated_at
+                    f'''
+                    SELECT {_PROFILE_BUILD_JOB_COLUMNS}
                     FROM user_profile_build_jobs
                     WHERE job_id = ?
                     ''',
@@ -75,35 +110,8 @@ class ProfileBuildJobStore(BaseSqliteStore):
             "created_at": row[12],
             "updated_at": row[13],
         }
-        for field_name in (
-            "total_papers",
-            "candidate_papers",
-            "cached_papers",
-            "uncached_papers",
-            "processed_papers",
-            "failed_papers",
-            "skipped_paper_count",
-            "skipped_read_only_papers",
-            "skipped_failed_cache_papers",
-            "skipped_limit_papers",
-            "repair_candidate_papers",
-            "successful_papers",
-            "cache_hit_count",
-            "generated_count",
-            "failed_count",
-            "skipped_count",
-            "average_seconds_per_paper",
-            "total_evidence_extraction_seconds",
-            "evidence_concurrency",
-            "rate_limit_backoff_count",
-            "paper_evidence_failure_details",
-            "build_mode",
-            "paper_limit",
-            "evidence_counts",
-            "current_arxiv_id",
-            "stage_message",
-            "recent_logs",
-        ):
+        for field_name in _PROFILE_BUILD_METRIC_FIELDS:
+            # 只提升 metrics 中真实存在的键，缺失的键不补 None，避免前端误把“未上报”当作 0。
             if field_name in metrics:
                 payload[field_name] = metrics.get(field_name)
         return payload
@@ -115,6 +123,10 @@ class ProfileBuildJobStore(BaseSqliteStore):
         build_config: Optional[Dict[str, Any]] = None,
         status: str = "running",
     ) -> str:
+        """创建一个画像构建任务并返回 job_id，初始阶段为 collect_evidence、进度 0。
+
+        写库失败只记日志，仍返回生成的 job_id，调用方后续的 update 会静默失败而不会中断主流程。
+        """
         job_id = str(uuid.uuid4())
         config = dict(build_config or {})
         try:
@@ -162,6 +174,7 @@ class ProfileBuildJobStore(BaseSqliteStore):
         error_message: Optional[str] = None,
         metrics: Optional[Dict[str, Any]] = None,
     ) -> None:
+        """部分更新构建任务：只写入非 None 的参数；metrics 为整体覆盖而不是合并。"""
         updates: List[str] = []
         values: List[Any] = []
         for column, value in {

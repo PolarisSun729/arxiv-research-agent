@@ -1,3 +1,11 @@
+"""表格证据 v2 的数据结构与校验。
+
+表格结构化检索给出的证据有三种决策：
+- compute：规则已唯一确定行列并算出结果，放在 final_evidence；
+- defer_to_llm：存在歧义，只给 candidate_evidence，最终判断交给 LLM；
+- fallback_table_context：无法定位行列，只提供原表上下文。
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -9,8 +17,17 @@ TABLE_EVIDENCE_DECISIONS = {"compute", "defer_to_llm", "fallback_table_context"}
 TABLE_EVIDENCE_OPERATIONS = {"lookup", "max", "min", "difference"}
 
 
+class _AsDictMixin:
+    """dataclass 通用的 to_dict；asdict 会递归转换列表、字典里嵌套的 dataclass。"""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 @dataclass
-class TableEvidenceCell:
+class TableEvidenceCell(_AsDictMixin):
+    """单个表格单元格：原始值、归一化数值、单位以及抽取置信度。"""
+
     row_index: Any = None
     row_label: str = ""
     col_name: str = ""
@@ -21,6 +38,7 @@ class TableEvidenceCell:
 
     @classmethod
     def from_cell(cls, cell: Dict[str, Any]) -> "TableEvidenceCell":
+        """从检索索引中的单元格字典构造；行名和列名统一转成字符串。"""
         return cls(
             row_index=cell.get("row_index"),
             row_label=str(cell.get("row_label") or ""),
@@ -31,24 +49,22 @@ class TableEvidenceCell:
             confidence=cell.get("confidence"),
         )
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
 
 @dataclass
-class TableEvidenceCalculation:
+class TableEvidenceCalculation(_AsDictMixin):
+    """一次计算的结果；display_value 是给 LLM 引用的展示值，expression 是可读的算式。"""
+
     operation: str
     value: Any
     display_value: str
     unit: str = ""
     expression: str = ""
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
 
 @dataclass
-class TableEvidenceTable:
+class TableEvidenceTable(_AsDictMixin):
+    """证据所属表格的定位信息，用于引用和回溯到原始 chunk。"""
+
     table_id: str = ""
     caption: str = ""
     page_number: Any = None
@@ -57,12 +73,11 @@ class TableEvidenceTable:
     source_chunk_id: str = ""
     original_chunk_id: str = ""
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
 
 @dataclass
-class TableFinalEvidence:
+class TableFinalEvidence(_AsDictMixin):
+    """compute 决策的确定性证据：命中的行列、单元格以及可选的计算结果。"""
+
     operation: str
     rows: List[str]
     columns: List[str]
@@ -70,15 +85,11 @@ class TableFinalEvidence:
     calculation: Optional[TableEvidenceCalculation] = None
     reason: str = ""
 
-    def to_dict(self) -> Dict[str, Any]:
-        payload = asdict(self)
-        payload["cells"] = [cell.to_dict() for cell in self.cells]
-        payload["calculation"] = self.calculation.to_dict() if self.calculation else None
-        return payload
-
 
 @dataclass
-class TableCandidateCalculation:
+class TableCandidateCalculation(_AsDictMixin):
+    """defer_to_llm 决策下针对某一列预先算好的候选结果。"""
+
     operation: str
     column: str
     rows: List[str]
@@ -86,41 +97,32 @@ class TableCandidateCalculation:
     calculation: TableEvidenceCalculation
     reason: str = ""
 
-    def to_dict(self) -> Dict[str, Any]:
-        payload = asdict(self)
-        payload["cells"] = [cell.to_dict() for cell in self.cells]
-        payload["calculation"] = self.calculation.to_dict()
-        return payload
-
 
 @dataclass
-class TableCandidateEvidence:
+class TableCandidateEvidence(_AsDictMixin):
+    """defer_to_llm 决策的候选证据：候选行列、单元格与候选计算。"""
+
     candidate_rows: List[str] = field(default_factory=list)
     candidate_columns: List[str] = field(default_factory=list)
     candidate_cells: List[TableEvidenceCell] = field(default_factory=list)
     candidate_calculations: List[TableCandidateCalculation] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
-        payload = asdict(self)
-        payload["candidate_cells"] = [cell.to_dict() for cell in self.candidate_cells]
-        payload["candidate_calculations"] = [item.to_dict() for item in self.candidate_calculations]
-        return payload
-
 
 @dataclass
-class TableContext:
+class TableContext(_AsDictMixin):
+    """原表上下文（可能被截断）；row_count / column_count 记录原表规模。"""
+
     columns: List[str]
     rows: List[Dict[str, Any]]
     truncated: bool
     row_count: int = 0
     column_count: int = 0
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
 
 @dataclass
 class TableEvidencePayload:
+    """完整的表格证据；to_dict 输出前会做 schema 校验，保证不会流出不合法的 payload。"""
+
     table: TableEvidenceTable
     decision: str
     operation_hint: str
@@ -133,6 +135,7 @@ class TableEvidencePayload:
     schema_version: str = TABLE_EVIDENCE_SCHEMA_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
+        """转成字典：schema_version 放在最前，confidence 保留 4 位小数，reasons / debug 复制一份。"""
         payload = {
             "schema_version": self.schema_version,
             "table": self.table.to_dict(),

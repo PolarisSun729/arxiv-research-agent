@@ -1,3 +1,5 @@
+"""检索 route 的执行支撑：统一超时/异常降级与指标记录，以及查询 embedding 的批量生成。"""
+
 from __future__ import annotations
 
 import logging
@@ -8,6 +10,11 @@ from time import perf_counter
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _elapsed_ms(started: float) -> float:
+    """从 perf_counter 起点到现在经过的毫秒数。"""
+    return (perf_counter() - started) * 1000
 
 
 @dataclass
@@ -26,6 +33,7 @@ class RouteExecutionResult:
     cache_hit: Optional[bool] = None
 
     def to_metric(self) -> Dict[str, Any]:
+        """导出到 route_metrics 的统一结构（不含 route_name，调用方以它为键）。"""
         return {
             "enabled": self.enabled,
             "applied": self.applied,
@@ -58,6 +66,11 @@ class RouteExecutionSupport:
         enabled: bool = True,
         cache_hit: Optional[bool] = None,
     ) -> RouteExecutionResult:
+        """在 worker 线程中执行 callback 并包装结果。
+
+        超时时间按 route_name 查 timeouts，没有则用 "default"，再没有用 8 秒。
+        required=True 的 route 超时或出错时抛 RuntimeError；其余 route 只返回 timeout/error 状态，由调用方降级。
+        """
         if not enabled:
             return RouteExecutionResult(
                 route_name=route_name,
@@ -75,20 +88,19 @@ class RouteExecutionSupport:
             # 检索增强阶段可能调用模型；把请求上下文复制到 worker，避免漏计 rerank/HyDE 成本。
             future = self._executor.submit(copy_context().run, callback)
             results = future.result(timeout=timeout_seconds)
-            latency_ms = (perf_counter() - started) * 1000
             return RouteExecutionResult(
                 route_name=route_name,
                 results=list(results or []),
                 status="ok",
-                latency_ms=latency_ms,
-                enabled=True,
+                latency_ms=_elapsed_ms(started),
                 applied=bool(results),
                 cache_hit=cache_hit,
             )
         except TimeoutError as exc:
-            latency_ms = (perf_counter() - started) * 1000
+            latency_ms = _elapsed_ms(started)
             if required:
                 raise RuntimeError(f"Required route {route_name} timed out after {timeout_seconds:.2f}s") from exc
+            # 已在运行的任务无法被取消，cancel 只对仍在排队的任务生效。
             future.cancel()
             return RouteExecutionResult(
                 route_name=route_name,
@@ -97,12 +109,10 @@ class RouteExecutionSupport:
                 error=str(exc),
                 fallback_reason=f"{route_name} timed out after {timeout_seconds:.2f}s",
                 timeout=True,
-                enabled=True,
-                applied=False,
                 cache_hit=cache_hit,
             )
         except Exception as exc:
-            latency_ms = (perf_counter() - started) * 1000
+            latency_ms = _elapsed_ms(started)
             if required:
                 raise RuntimeError(f"Required route {route_name} failed: {exc}") from exc
             logger.warning("Route failed and will be skipped: route=%s error=%s", route_name, exc)
@@ -112,8 +122,6 @@ class RouteExecutionSupport:
                 latency_ms=latency_ms,
                 error=str(exc),
                 fallback_reason=f"{route_name} failed: {exc}",
-                enabled=True,
-                applied=False,
                 cache_hit=cache_hit,
             )
 
@@ -137,18 +145,21 @@ class QueryEmbeddingBatcher:
         dimension: Optional[int],
         batch_size: Optional[int] = None,
     ) -> Dict[str, Any]:
+        """对去重后的查询一次性生成 embedding。
+
+        返回 {"embeddings": {归一化查询: 向量}, "debug": {...}}；embedding 服务出错或返回数量不符时
+        embeddings 为空、debug.status 为 error，此时向量 route 查不到向量会各自报错并按 route 失败降级。
+        """
         started = perf_counter()
-        normalized_queries: List[str] = []
-        for query in queries:
-            normalized = self.normalize_query(query)
-            if normalized and normalized not in normalized_queries:
-                normalized_queries.append(normalized)
+        # 按空白归一化后保序去重，同一句话的不同空白写法只请求一次。
+        normalized_queries = list(dict.fromkeys(filter(None, map(self.normalize_query, queries))))
+        requested_count = len([query for query in queries if str(query or "").strip()])
 
         debug = {
-            "requested_count": len([query for query in queries if str(query or "").strip()]),
+            "requested_count": requested_count,
             "batch_size": len(normalized_queries),
             "deduped_count": len(normalized_queries),
-            "duplicate_removed_count": max(0, len([query for query in queries if str(query or "").strip()]) - len(normalized_queries)),
+            "duplicate_removed_count": max(0, requested_count - len(normalized_queries)),
             "latency_ms": 0.0,
             "status": "ok",
             "error": "",
@@ -173,12 +184,13 @@ class QueryEmbeddingBatcher:
                     query: [float(value) for value in embedding]
                     for query, embedding in zip(normalized_queries, embeddings)
                 },
-                "debug": {**debug, "latency_ms": (perf_counter() - started) * 1000},
+                "debug": {**debug, "latency_ms": _elapsed_ms(started)},
             }
         except Exception as exc:
-            debug.update({"status": "error", "error": str(exc), "latency_ms": (perf_counter() - started) * 1000})
+            debug.update({"status": "error", "error": str(exc), "latency_ms": _elapsed_ms(started)})
             return {"embeddings": {}, "debug": debug}
 
     @staticmethod
     def normalize_query(query: Any) -> str:
-        return " ".join(str(query or "").split()).strip()
+        """把连续空白压成单个空格并去掉首尾空白；向量 route 用同一规则查 embeddings 字典。"""
+        return " ".join(str(query or "").split())

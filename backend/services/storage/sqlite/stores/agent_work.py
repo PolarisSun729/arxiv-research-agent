@@ -5,9 +5,78 @@ from typing import Any, Dict, List, Mapping, Optional
 from uuid import uuid4
 
 from services.storage.sqlite.base import BaseSqliteStore
+from services.storage.sqlite.shared import sql_placeholders, utc_now_iso
 
 
+# 仍可能推进的 continuation 状态；同一身份下只允许存在一条处于这些状态的记录。
 ACTIVE_CONTINUATION_STATUSES = ("submitting", "waiting_job", "ready_to_resume", "resuming")
+
+# continuation 表的标准读取列；SELECT 字符串和行映射的键都从这里派生，避免两处列表漂移。
+_CONTINUATION_KEYS = (
+    "continuation_id", "user_id", "session_id", "thread_id", "runtime_checkpoint_id",
+    "interaction_id", "grant_id", "invocation_id", "plan_id", "step_id", "tool_name",
+    "arguments_fingerprint", "handler_name", "job_id", "job_idempotency_key", "status",
+    "handler_state_json", "display_summary_json", "validated_result_json", "resume_run_id", "error_code",
+    "error_message", "created_at", "updated_at", "ready_at", "expires_at", "terminal_at",
+)
+
+# resume run 表的标准读取列；get_resume_run / list_resume_runs 与 _resume_run_row 共用。
+_RESUME_RUN_KEYS = (
+    "resume_run_id", "continuation_id", "user_id", "session_id", "thread_id",
+    "status", "started_at", "finished_at", "final_response_json", "error_code",
+    "error_message", "result_retrieved_at",
+)
+_SELECT_RESUME_RUNS_SQL = f"SELECT {', '.join(_RESUME_RUN_KEYS)} FROM agent_resume_runs"
+
+
+def _ready_expires_at(now: datetime, ready_ttl_days: int) -> str:
+    """计算 ready_to_resume 状态的过期时间；TTL 至少 1 天，避免误配置让结果立刻过期。"""
+    return (now + timedelta(days=max(1, int(ready_ttl_days)))).isoformat()
+
+
+def _mark_continuation_ready(
+    conn: Any,
+    *,
+    continuation_id: str,
+    result_json: Optional[str],
+    now_text: str,
+    expires_at: str,
+) -> int:
+    """把仍在等待 job 的 continuation 推进到 ready_to_resume，返回受影响行数（CAS 结果）。
+
+    WHERE 中限定 submitting/waiting_job，确保已取消或已就绪的记录不会被重复推进。
+    """
+    return conn.execute(
+        """
+        UPDATE agent_work_continuations
+        SET status = 'ready_to_resume', validated_result_json = ?, ready_at = ?,
+            expires_at = ?, updated_at = ?
+        WHERE continuation_id = ? AND status IN ('submitting', 'waiting_job')
+        """,
+        (result_json, now_text, expires_at, now_text, continuation_id),
+    ).rowcount
+
+
+def _mark_invocation_succeeded(
+    conn: Any,
+    *,
+    invocation_id: str,
+    result_json: Optional[str],
+    now_text: str,
+) -> None:
+    """把仍未终结的副作用调用标为 succeeded，并记录结果摘要。
+
+    started_at 用 COALESCE 保留首次开始时间；只推进 prepared/invoking，已终结的记录不会被改写。
+    """
+    conn.execute(
+        """
+        UPDATE side_effect_invocations
+        SET status = 'succeeded', started_at = COALESCE(started_at, ?), finished_at = ?,
+            result_summary_json = ?, error_code = ''
+        WHERE invocation_id = ? AND status IN ('prepared', 'invoking')
+        """,
+        (now_text, now_text, result_json, invocation_id),
+    )
 
 
 class AgentWorkConflict(RuntimeError):
@@ -15,25 +84,20 @@ class AgentWorkConflict(RuntimeError):
 
 
 class AgentWorkStore(BaseSqliteStore):
-    """持久化 Agent 后台 continuation、resume run 与只读生命周期事件。"""
+    """持久化 Agent 后台 continuation、resume run 与只读生命周期事件。
 
-    _CONTINUATION_COLUMNS = """
-        continuation_id, user_id, session_id, thread_id, runtime_checkpoint_id,
-        interaction_id, grant_id, invocation_id, plan_id, step_id, tool_name,
-        arguments_fingerprint, handler_name, job_id, job_idempotency_key, status,
-        handler_state_json, display_summary_json, validated_result_json, resume_run_id, error_code,
-        error_message, created_at, updated_at, ready_at, expires_at, terminal_at
+    三类记录的职责：
+    - continuation：一次“批准后转后台执行”的完整身份与状态机（submitting → waiting_job →
+      ready_to_resume → resuming → 终态）；
+    - resume_run：后台结果就绪后恢复对话的那一次执行，保证只被领取一次；
+    - events：只用于解释时间线的追加日志，任何业务判断都不读取它。
     """
 
+    _CONTINUATION_COLUMNS = ", ".join(_CONTINUATION_KEYS)
+
     def _continuation_row(self, row: Any) -> Dict[str, Any]:
-        keys = (
-            "continuation_id", "user_id", "session_id", "thread_id", "runtime_checkpoint_id",
-            "interaction_id", "grant_id", "invocation_id", "plan_id", "step_id", "tool_name",
-            "arguments_fingerprint", "handler_name", "job_id", "job_idempotency_key", "status",
-            "handler_state_json", "display_summary_json", "validated_result_json", "resume_run_id", "error_code",
-            "error_message", "created_at", "updated_at", "ready_at", "expires_at", "terminal_at",
-        )
-        payload = dict(zip(keys, row))
+        """把 continuation 行转换为字典，三个 JSON 列反序列化后去掉 _json 后缀对外暴露。"""
+        payload = dict(zip(_CONTINUATION_KEYS, row))
         payload["handler_state"] = self._deserialize_json_field(payload.pop("handler_state_json", None)) or {}
         payload["display_summary"] = self._deserialize_json_field(payload.pop("display_summary_json", None)) or {}
         payload["validated_result"] = self._deserialize_json_field(payload.pop("validated_result_json", None))
@@ -53,6 +117,7 @@ class AgentWorkStore(BaseSqliteStore):
         error_code: Optional[str] = None,
         safe_metadata: Optional[Mapping[str, Any]] = None,
     ) -> None:
+        """在调用方的事务内追加一条生命周期事件；safe_metadata 只能放不含敏感数据的摘要。"""
         # 事件只解释时间线，业务判断始终读取 continuation/job/resume_run 当前状态表。
         conn.execute(
             """
@@ -64,7 +129,7 @@ class AgentWorkStore(BaseSqliteStore):
             (
                 str(uuid4()),
                 event_type,
-                datetime.now(timezone.utc).isoformat(),
+                utc_now_iso(),
                 continuation_id,
                 job_id,
                 invocation_id,
@@ -132,9 +197,9 @@ class AgentWorkStore(BaseSqliteStore):
         display_summary: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """原子消费批准并建立 continuation，事务内不提交 job、不调用外部服务。"""
-        now = datetime.now(timezone.utc).isoformat()
+        now = utc_now_iso()
         continuation_status = "waiting_job" if job_id else "submitting"
-        with self.connection_provider.connect() as conn:
+        with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
@@ -248,7 +313,8 @@ class AgentWorkStore(BaseSqliteStore):
         return continuation
 
     def get_continuation(self, continuation_id: str) -> Optional[Dict[str, Any]]:
-        with self.connection_provider.connect() as conn:
+        """按 continuation_id 读取一条 continuation，不存在时返回 None。"""
+        with self._get_connection() as conn:
             row = conn.execute(
                 f"SELECT {self._CONTINUATION_COLUMNS} FROM agent_work_continuations WHERE continuation_id = ?",
                 (continuation_id,),
@@ -263,6 +329,7 @@ class AgentWorkStore(BaseSqliteStore):
         statuses: Optional[List[str]] = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
+        """列出用户（可选限定会话、状态）的 continuation，按更新时间倒序。"""
         filters = ["user_id = ?"]
         values: List[Any] = [user_id]
         if session_id:
@@ -270,10 +337,10 @@ class AgentWorkStore(BaseSqliteStore):
             values.append(session_id)
         normalized_statuses = [str(item) for item in (statuses or []) if str(item).strip()]
         if normalized_statuses:
-            filters.append(f"status IN ({','.join('?' for _ in normalized_statuses)})")
+            filters.append(f"status IN ({sql_placeholders(normalized_statuses)})")
             values.extend(normalized_statuses)
         values.append(max(1, int(limit)))
-        with self.connection_provider.connect() as conn:
+        with self._get_connection() as conn:
             rows = conn.execute(
                 f"SELECT {self._CONTINUATION_COLUMNS} FROM agent_work_continuations "
                 f"WHERE {' AND '.join(filters)} ORDER BY updated_at DESC LIMIT ?",
@@ -300,10 +367,9 @@ class AgentWorkStore(BaseSqliteStore):
             filters.append("c.session_id = ?")
             values.append(session_id)
         values.append(max(1, int(limit)))
-        qualified_columns = ", ".join(
-            f"c.{column.strip()}" for column in self._CONTINUATION_COLUMNS.split(",")
-        )
-        with self.connection_provider.connect() as conn:
+        # JOIN 后两表都有 status 等同名列，必须给 continuation 列加表别名前缀。
+        qualified_columns = ", ".join(f"c.{column}" for column in _CONTINUATION_KEYS)
+        with self._get_connection() as conn:
             rows = conn.execute(
                 f"SELECT {qualified_columns} FROM agent_work_continuations c "
                 "JOIN agent_resume_runs r ON r.resume_run_id = c.resume_run_id "
@@ -320,8 +386,8 @@ class AgentWorkStore(BaseSqliteStore):
         attached: bool,
     ) -> Dict[str, Any]:
         """把事务外幂等提交得到的 job 绑定回 submitting continuation。"""
-        now = datetime.now(timezone.utc).isoformat()
-        with self.connection_provider.connect() as conn:
+        now = utc_now_iso()
+        with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT invocation_id, status, job_id FROM agent_work_continuations WHERE continuation_id = ?",
@@ -369,9 +435,9 @@ class AgentWorkStore(BaseSqliteStore):
     ) -> int:
         """把一个成功物理 job 原子投影到所有仍在等待的独立 continuation。"""
         now = datetime.now(timezone.utc)
-        expires_at = (now + timedelta(days=max(1, int(ready_ttl_days)))).isoformat()
+        expires_at = _ready_expires_at(now, ready_ttl_days)
         result_json = self._serialize_json_field(dict(validated_result))
-        with self.connection_provider.connect() as conn:
+        with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
@@ -381,26 +447,24 @@ class AgentWorkStore(BaseSqliteStore):
                 (job_id,),
             ).fetchall()
             ready_count = 0
+            now_text = now.isoformat()
             for continuation_id, invocation_id, continuation_status in rows:
                 if continuation_status in {"submitting", "waiting_job"}:
-                    conn.execute(
-                        """
-                        UPDATE agent_work_continuations
-                        SET status = 'ready_to_resume', validated_result_json = ?, ready_at = ?,
-                            expires_at = ?, updated_at = ?
-                        WHERE continuation_id = ? AND status IN ('submitting', 'waiting_job')
-                        """,
-                        (result_json, now.isoformat(), expires_at, now.isoformat(), continuation_id),
+                    _mark_continuation_ready(
+                        conn,
+                        continuation_id=continuation_id,
+                        result_json=result_json,
+                        now_text=now_text,
+                        expires_at=expires_at,
                     )
                     ready_count += 1
-                conn.execute(
-                    """
-                    UPDATE side_effect_invocations
-                    SET status = 'succeeded', started_at = COALESCE(started_at, ?), finished_at = ?,
-                        result_summary_json = ?, error_code = ''
-                    WHERE invocation_id = ? AND status IN ('prepared', 'invoking')
-                    """,
-                    (now.isoformat(), now.isoformat(), result_json, invocation_id),
+                # 已取消的 continuation 也要把副作用调用记为成功：物理 job 确实执行完了，
+                # 不能让 invocation 停在 invoking 而被误判为“结果未知”。
+                _mark_invocation_succeeded(
+                    conn,
+                    invocation_id=invocation_id,
+                    result_json=result_json,
+                    now_text=now_text,
                 )
                 if continuation_status in {"submitting", "waiting_job"}:
                     self._append_event(
@@ -421,8 +485,8 @@ class AgentWorkStore(BaseSqliteStore):
         session_id: str,
     ) -> Dict[str, Any]:
         """只终止当前 continuation 与原问题，不修改可能被共享的物理 job。"""
-        now = datetime.now(timezone.utc).isoformat()
-        with self.connection_provider.connect() as conn:
+        now = utc_now_iso()
+        with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
@@ -472,8 +536,8 @@ class AgentWorkStore(BaseSqliteStore):
 
     def cancel_session_continuations(self, *, user_id: str, session_id: str) -> int:
         """终止指定会话尚未开始恢复的 continuation，并保留任务历史用于审计。"""
-        now = datetime.now(timezone.utc).isoformat()
-        with self.connection_provider.connect() as conn:
+        now = utc_now_iso()
+        with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
@@ -523,7 +587,7 @@ class AgentWorkStore(BaseSqliteStore):
     ) -> Dict[str, Any]:
         """在查询或恢复前终结过期 ready continuation，并同步终结业务 checkpoint。"""
         current_time = now or datetime.now(timezone.utc)
-        with self.connection_provider.connect() as conn:
+        with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
@@ -557,45 +621,33 @@ class AgentWorkStore(BaseSqliteStore):
 
     @staticmethod
     def _resume_run_row(row: Any) -> Dict[str, Any]:
-        keys = (
-            "resume_run_id", "continuation_id", "user_id", "session_id", "thread_id",
-            "status", "started_at", "finished_at", "final_response_json", "error_code",
-            "error_message", "result_retrieved_at",
-        )
-        payload = dict(zip(keys, row))
+        """把 resume run 行转换为字典，final_response_json 反序列化为 final_response。"""
+        payload = dict(zip(_RESUME_RUN_KEYS, row))
         payload["final_response"] = BaseSqliteStore._deserialize_json_field(payload.pop("final_response_json", None))
         return payload
 
     def get_resume_run(self, resume_run_id: str) -> Optional[Dict[str, Any]]:
-        with self.connection_provider.connect() as conn:
+        """按 resume_run_id 读取一次恢复执行，不存在时返回 None。"""
+        with self._get_connection() as conn:
             row = conn.execute(
-                """
-                SELECT resume_run_id, continuation_id, user_id, session_id, thread_id,
-                       status, started_at, finished_at, final_response_json, error_code,
-                       error_message, result_retrieved_at
-                FROM agent_resume_runs WHERE resume_run_id = ?
-                """,
+                f"{_SELECT_RESUME_RUNS_SQL} WHERE resume_run_id = ?",
                 (resume_run_id,),
             ).fetchone()
         return self._resume_run_row(row) if row else None
 
     def list_resume_runs(self, *, statuses: Optional[List[str]] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """按状态列出 resume run，按开始时间升序（最早开始的排在前面，便于巡检超时任务）。"""
         filters: List[str] = []
         values: List[Any] = []
         normalized_statuses = [str(item) for item in (statuses or []) if str(item).strip()]
         if normalized_statuses:
-            filters.append(f"status IN ({','.join('?' for _ in normalized_statuses)})")
+            filters.append(f"status IN ({sql_placeholders(normalized_statuses)})")
             values.extend(normalized_statuses)
-        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        where = f" WHERE {' AND '.join(filters)}" if filters else ""
         values.append(max(1, int(limit)))
-        with self.connection_provider.connect() as conn:
+        with self._get_connection() as conn:
             rows = conn.execute(
-                """
-                SELECT resume_run_id, continuation_id, user_id, session_id, thread_id,
-                       status, started_at, finished_at, final_response_json, error_code,
-                       error_message, result_retrieved_at
-                FROM agent_resume_runs
-                """ + where + " ORDER BY COALESCE(started_at, '') ASC LIMIT ?",
+                f"{_SELECT_RESUME_RUNS_SQL}{where} ORDER BY COALESCE(started_at, '') ASC LIMIT ?",
                 values,
             ).fetchall()
         return [self._resume_run_row(row) for row in rows]
@@ -609,7 +661,7 @@ class AgentWorkStore(BaseSqliteStore):
     ) -> Dict[str, Any]:
         """CAS claim continuation；重复请求只返回同一个 run，绝不再次消费 LangGraph checkpoint。"""
         now = datetime.now(timezone.utc)
-        with self.connection_provider.connect() as conn:
+        with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
@@ -698,8 +750,8 @@ class AgentWorkStore(BaseSqliteStore):
 
     def start_resume_run(self, resume_run_id: str) -> bool:
         """只有后台 runner 能把 pending run 推进为 running，CAS 防止多个请求重复执行图恢复。"""
-        now = datetime.now(timezone.utc).isoformat()
-        with self.connection_provider.connect() as conn:
+        now = utc_now_iso()
+        with self._get_connection() as conn:
             updated = conn.execute(
                 """
                 UPDATE agent_resume_runs SET status = 'running', started_at = ?
@@ -717,9 +769,9 @@ class AgentWorkStore(BaseSqliteStore):
         final_response: Mapping[str, Any],
     ) -> Dict[str, Any]:
         """先持久化完整响应，再把 continuation/checkpoint 标记终态，供断线后安全取回。"""
-        now = datetime.now(timezone.utc).isoformat()
+        now = utc_now_iso()
         response_json = self._serialize_json_field(dict(final_response))
-        with self.connection_provider.connect() as conn:
+        with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
@@ -783,8 +835,8 @@ class AgentWorkStore(BaseSqliteStore):
         """终结失败或结果未知的 run；indeterminate 禁止任何自动重放。"""
         if status not in {"failed", "indeterminate"}:
             raise ValueError("resume run failure status must be failed or indeterminate")
-        now = datetime.now(timezone.utc).isoformat()
-        with self.connection_provider.connect() as conn:
+        now = utc_now_iso()
+        with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
@@ -836,7 +888,7 @@ class AgentWorkStore(BaseSqliteStore):
 
     def mark_resume_result_retrieved(self, resume_run_id: str) -> bool:
         """只记录结果读取审计时间，不改变 run/continuation 业务状态。"""
-        with self.connection_provider.connect() as conn:
+        with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT continuation_id FROM agent_resume_runs WHERE resume_run_id = ? AND status = 'completed'",
@@ -867,9 +919,9 @@ class AgentWorkStore(BaseSqliteStore):
     ) -> Dict[str, Any]:
         """修复 submitting 竞态：索引已由其他 job 满足时只推进指定 continuation。"""
         now = datetime.now(timezone.utc)
-        expires_at = (now + timedelta(days=max(1, int(ready_ttl_days)))).isoformat()
+        expires_at = _ready_expires_at(now, ready_ttl_days)
         result_json = self._serialize_json_field(dict(validated_result))
-        with self.connection_provider.connect() as conn:
+        with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT invocation_id, job_id FROM agent_work_continuations WHERE continuation_id = ?",
@@ -877,25 +929,21 @@ class AgentWorkStore(BaseSqliteStore):
             ).fetchone()
             if row is None:
                 raise AgentWorkConflict("continuation_missing")
-            updated = conn.execute(
-                """
-                UPDATE agent_work_continuations
-                SET status = 'ready_to_resume', validated_result_json = ?, ready_at = ?,
-                    expires_at = ?, updated_at = ?
-                WHERE continuation_id = ? AND status IN ('submitting', 'waiting_job')
-                """,
-                (result_json, now.isoformat(), expires_at, now.isoformat(), continuation_id),
-            ).rowcount
+            now_text = now.isoformat()
+            updated = _mark_continuation_ready(
+                conn,
+                continuation_id=continuation_id,
+                result_json=result_json,
+                now_text=now_text,
+                expires_at=expires_at,
+            )
             if updated != 1:
                 raise AgentWorkConflict("continuation_not_waiting")
-            conn.execute(
-                """
-                UPDATE side_effect_invocations
-                SET status = 'succeeded', started_at = COALESCE(started_at, ?), finished_at = ?,
-                    result_summary_json = ?, error_code = ''
-                WHERE invocation_id = ? AND status IN ('prepared', 'invoking')
-                """,
-                (now.isoformat(), now.isoformat(), result_json, row[0]),
+            _mark_invocation_succeeded(
+                conn,
+                invocation_id=row[0],
+                result_json=result_json,
+                now_text=now_text,
             )
             self._append_event(
                 conn,
@@ -910,8 +958,8 @@ class AgentWorkStore(BaseSqliteStore):
 
     def mark_job_failed(self, *, job_id: str, error_code: str, error_message: str) -> int:
         """明确业务失败终结所有关联 continuation，不触发自动同步或 Agent 恢复。"""
-        now = datetime.now(timezone.utc).isoformat()
-        with self.connection_provider.connect() as conn:
+        now = utc_now_iso()
+        with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """

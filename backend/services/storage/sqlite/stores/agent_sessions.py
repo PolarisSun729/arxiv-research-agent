@@ -2,13 +2,36 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from services.storage.sqlite.base import BaseSqliteStore
-from services.storage.sqlite.shared import DEFAULT_USER_ID, logger
+from services.storage.sqlite.shared import DEFAULT_USER_ID, logger, normalize_user_id
+
+
+# memory_patch 中允许落库的字段 → 实际列名；不在表中的键会被静默忽略。
+_AGENT_SESSION_PATCH_COLUMNS = {
+    'status': 'status',
+    'selected_paper': 'selected_paper_json',
+    'last_papers': 'last_papers_json',
+    'paper_qa_result': 'paper_qa_result_json',
+    'active_arxiv_id': 'active_arxiv_id',
+    'active_paper_session_id': 'active_paper_session_id',
+    'last_intent': 'last_intent',
+    'last_tool_calls_summary': 'last_tool_calls_summary_json',
+    'last_response_summary': 'last_response_summary',
+}
+
+# 需要 JSON 序列化后再写入的列；其余列按去空白字符串写入。
+_AGENT_SESSION_JSON_COLUMNS = {
+    'selected_paper_json',
+    'last_papers_json',
+    'paper_qa_result_json',
+    'last_tool_calls_summary_json',
+}
 
 
 class AgentSessionStore(BaseSqliteStore):
     """维护 Agent 会话记忆的轻量 CRUD；运行时恢复 checkpoint 仍由主库服务中的状态机方法负责。"""
 
     def _row_to_agent_session(self, row: Any) -> Dict[str, Any]:
+        """把 agent_sessions 行映射为对外字典；JSON 列反序列化，空值回落到各字段的默认形态。"""
         return {
             'session_id': row[0],
             'user_id': row[1],
@@ -30,8 +53,12 @@ class AgentSessionStore(BaseSqliteStore):
         user_id: str = DEFAULT_USER_ID,
         session_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
+        """按 (session_id, user_id) 读取会话，不存在则新建一条 active 会话；出错时返回 None。
+
+        session_id 为空时自动生成 UUID，供首次进入 Agent 对话的请求使用。
+        """
         try:
-            normalized_user_id = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+            normalized_user_id = normalize_user_id(user_id)
             normalized_session_id = str(session_id or uuid.uuid4()).strip()
             existing = self.get_agent_session(normalized_session_id, user_id=normalized_user_id)
             if existing:
@@ -53,6 +80,7 @@ class AgentSessionStore(BaseSqliteStore):
             return None
 
     def get_agent_session(self, session_id: str, user_id: str = DEFAULT_USER_ID) -> Optional[Dict[str, Any]]:
+        """按 (session_id, user_id) 读取会话；同时匹配 user_id，防止跨用户读取他人会话记忆。"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -79,38 +107,24 @@ class AgentSessionStore(BaseSqliteStore):
         user_id: str = DEFAULT_USER_ID,
         memory_patch: Optional[Dict[str, Any]] = None,
     ) -> bool:
+        """按 patch 语义更新会话记忆：只写入 memory_patch 中出现的白名单字段。
+
+        会话不存在时先补建再更新；patch 中没有可写字段时视为成功（无事可做）。
+        """
         try:
             if not session_id:
                 return False
 
             # Agent 记忆采用 patch 语义，只允许业务层显式声明的字段落库，避免临时运行态误写入长期会话。
-            allowed_fields = {
-                'status': 'status',
-                'selected_paper': 'selected_paper_json',
-                'last_papers': 'last_papers_json',
-                'paper_qa_result': 'paper_qa_result_json',
-                'active_arxiv_id': 'active_arxiv_id',
-                'active_paper_session_id': 'active_paper_session_id',
-                'last_intent': 'last_intent',
-                'last_tool_calls_summary': 'last_tool_calls_summary_json',
-                'last_response_summary': 'last_response_summary',
-            }
-            json_fields = {
-                'selected_paper_json',
-                'last_papers_json',
-                'paper_qa_result_json',
-                'last_tool_calls_summary_json',
-            }
-
             normalized_patch = dict(memory_patch or {})
             update_fields = []
             update_values: List[Any] = []
-            for patch_key, column_name in allowed_fields.items():
+            for patch_key, column_name in _AGENT_SESSION_PATCH_COLUMNS.items():
                 if patch_key not in normalized_patch:
                     continue
                 value = normalized_patch.get(patch_key)
                 update_fields.append(f'{column_name} = ?')
-                if column_name in json_fields:
+                if column_name in _AGENT_SESSION_JSON_COLUMNS:
                     update_values.append(self._serialize_json_field(value))
                 else:
                     update_values.append(None if value is None else str(value).strip())
@@ -144,18 +158,11 @@ class AgentSessionStore(BaseSqliteStore):
             return False
 
     def clear_agent_session(self, session_id: str, user_id: str = DEFAULT_USER_ID) -> bool:
+        """清空会话记忆：状态置为 cleared，其余可写字段全部置空（保留会话行本身）。"""
+        memory_patch: Dict[str, Any] = dict.fromkeys(_AGENT_SESSION_PATCH_COLUMNS, None)
+        memory_patch['status'] = 'cleared'
         return self.update_agent_session(
             session_id=session_id,
             user_id=user_id,
-            memory_patch={
-                'status': 'cleared',
-                'selected_paper': None,
-                'last_papers': None,
-                'paper_qa_result': None,
-                'active_arxiv_id': None,
-                'active_paper_session_id': None,
-                'last_intent': None,
-                'last_tool_calls_summary': None,
-                'last_response_summary': None,
-            },
+            memory_patch=memory_patch,
         )

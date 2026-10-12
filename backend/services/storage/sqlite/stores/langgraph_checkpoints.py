@@ -4,8 +4,34 @@ from services.storage.sqlite.base import BaseSqliteStore
 from services.storage.sqlite.shared import logger
 
 
+# checkpoint 的标准读取列；_row_to_checkpoint 按这里的顺序取下标。
+_CHECKPOINT_COLUMNS = "checkpoint_id, parent_checkpoint_id, checkpoint_json, metadata_json, created_at, updated_at"
+
+
 class LangGraphCheckpointStore(BaseSqliteStore):
-    """保存 LangGraph 原始 checkpoint blob，不承载业务确认语义。"""
+    """保存 LangGraph 原始 checkpoint blob，不承载业务确认语义。
+
+    主键为 (thread_id, checkpoint_ns, checkpoint_id)；checkpoint_ns 为空串表示根图命名空间，
+    因此所有入口都把 None 统一为 ''，保证读写落在同一主键上。
+    """
+
+    def _row_to_checkpoint(self, row: Any, *, thread_id: str, checkpoint_ns: str) -> Dict[str, Any]:
+        """把 checkpoint 行映射为 LangGraph saver 需要的字典，并附带该 checkpoint 的 pending writes。"""
+        return {
+            'thread_id': thread_id,
+            'checkpoint_ns': checkpoint_ns,
+            'checkpoint_id': row[0],
+            'parent_checkpoint_id': row[1],
+            'checkpoint': self._deserialize_json_field(row[2]) or {},
+            'metadata': self._deserialize_json_field(row[3]) or {},
+            'pending_writes': self.get_langgraph_checkpoint_writes(
+                thread_id=thread_id,
+                checkpoint_ns=checkpoint_ns,
+                checkpoint_id=row[0],
+            ),
+            'created_at': row[4],
+            'updated_at': row[5],
+        }
 
     def put_langgraph_checkpoint(
         self,
@@ -52,6 +78,7 @@ class LangGraphCheckpointStore(BaseSqliteStore):
         except Exception as e:
             logger.error(f"Error putting langgraph checkpoint: {str(e)}")
             return False
+
     def get_langgraph_checkpoint(
         self,
         *,
@@ -59,51 +86,38 @@ class LangGraphCheckpointStore(BaseSqliteStore):
         checkpoint_ns: str = '',
         checkpoint_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
+        """读取指定 checkpoint；未指定 checkpoint_id 时返回该线程命名空间下最新的一条。"""
         try:
             normalized_thread_id = str(thread_id or '').strip()
             if not normalized_thread_id:
                 return None
+            normalized_ns = str(checkpoint_ns or '')
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 if checkpoint_id:
                     cursor.execute(
-                        '''
-                        SELECT checkpoint_id, parent_checkpoint_id, checkpoint_json, metadata_json, created_at, updated_at
+                        f'''
+                        SELECT {_CHECKPOINT_COLUMNS}
                         FROM langgraph_checkpoints
                         WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?
                         ''',
-                        (normalized_thread_id, str(checkpoint_ns or ''), str(checkpoint_id)),
+                        (normalized_thread_id, normalized_ns, str(checkpoint_id)),
                     )
                 else:
                     cursor.execute(
-                        '''
-                        SELECT checkpoint_id, parent_checkpoint_id, checkpoint_json, metadata_json, created_at, updated_at
+                        f'''
+                        SELECT {_CHECKPOINT_COLUMNS}
                         FROM langgraph_checkpoints
                         WHERE thread_id = ? AND checkpoint_ns = ?
                         ORDER BY updated_at DESC, created_at DESC
                         LIMIT 1
                         ''',
-                        (normalized_thread_id, str(checkpoint_ns or '')),
+                        (normalized_thread_id, normalized_ns),
                     )
                 row = cursor.fetchone()
                 if not row:
                     return None
-                pending_writes = self.get_langgraph_checkpoint_writes(
-                    thread_id=normalized_thread_id,
-                    checkpoint_ns=str(checkpoint_ns or ''),
-                    checkpoint_id=row[0],
-                )
-                return {
-                    'thread_id': normalized_thread_id,
-                    'checkpoint_ns': str(checkpoint_ns or ''),
-                    'checkpoint_id': row[0],
-                    'parent_checkpoint_id': row[1],
-                    'checkpoint': self._deserialize_json_field(row[2]) or {},
-                    'metadata': self._deserialize_json_field(row[3]) or {},
-                    'pending_writes': pending_writes,
-                    'created_at': row[4],
-                    'updated_at': row[5],
-                }
+                return self._row_to_checkpoint(row, thread_id=normalized_thread_id, checkpoint_ns=normalized_ns)
         except Exception as e:
             logger.error(f"Error getting langgraph checkpoint: {str(e)}")
             return None
@@ -115,43 +129,29 @@ class LangGraphCheckpointStore(BaseSqliteStore):
         checkpoint_ns: str = '',
         limit: int = 10,
     ) -> List[Dict[str, Any]]:
+        """按更新时间倒序列出线程命名空间下的 checkpoint（含各自的 pending writes）。"""
         try:
             normalized_thread_id = str(thread_id or '').strip()
             if not normalized_thread_id:
                 return []
+            normalized_ns = str(checkpoint_ns or '')
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    '''
-                    SELECT checkpoint_id, parent_checkpoint_id, checkpoint_json, metadata_json, created_at, updated_at
+                    f'''
+                    SELECT {_CHECKPOINT_COLUMNS}
                     FROM langgraph_checkpoints
                     WHERE thread_id = ? AND checkpoint_ns = ?
                     ORDER BY updated_at DESC, created_at DESC
                     LIMIT ?
                     ''',
-                    (normalized_thread_id, str(checkpoint_ns or ''), max(int(limit or 1), 1)),
+                    (normalized_thread_id, normalized_ns, max(int(limit or 1), 1)),
                 )
                 rows = cursor.fetchall()
-                checkpoints: List[Dict[str, Any]] = []
-                for row in rows:
-                    checkpoints.append(
-                        {
-                            'thread_id': normalized_thread_id,
-                            'checkpoint_ns': str(checkpoint_ns or ''),
-                            'checkpoint_id': row[0],
-                            'parent_checkpoint_id': row[1],
-                            'checkpoint': self._deserialize_json_field(row[2]) or {},
-                            'metadata': self._deserialize_json_field(row[3]) or {},
-                            'pending_writes': self.get_langgraph_checkpoint_writes(
-                                thread_id=normalized_thread_id,
-                                checkpoint_ns=str(checkpoint_ns or ''),
-                                checkpoint_id=row[0],
-                            ),
-                            'created_at': row[4],
-                            'updated_at': row[5],
-                        }
-                    )
-                return checkpoints
+                return [
+                    self._row_to_checkpoint(row, thread_id=normalized_thread_id, checkpoint_ns=normalized_ns)
+                    for row in rows
+                ]
         except Exception as e:
             logger.error(f"Error listing langgraph checkpoints: {str(e)}")
             return []
@@ -163,6 +163,7 @@ class LangGraphCheckpointStore(BaseSqliteStore):
         checkpoint_ns: str,
         checkpoint_id: str,
     ) -> List[Dict[str, Any]]:
+        """读取某个 checkpoint 的 pending writes，按 (task_id, idx) 排序以还原写入顺序。"""
         try:
             normalized_thread_id = str(thread_id or '').strip()
             normalized_checkpoint_id = str(checkpoint_id or '').strip()
@@ -201,6 +202,7 @@ class LangGraphCheckpointStore(BaseSqliteStore):
         task_id: str,
         writes: List[Dict[str, Any]],
     ) -> bool:
+        """批量 upsert 某个任务的 pending writes；idx 取 writes 中的位置，重放同一任务时覆盖旧值。"""
         try:
             normalized_thread_id = str(thread_id or '').strip()
             normalized_checkpoint_id = str(checkpoint_id or '').strip()

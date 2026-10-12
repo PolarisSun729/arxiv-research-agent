@@ -1,3 +1,11 @@
+"""检索索引层：PaperChunk → 多视角 RetrievalIndex，以及 collection 级 BM25 / lookup 索引。
+
+- RetrievalIndexBuilder：建库期为每个 chunk 生成 body / section_anchor / table_or_figure / summary / question 索引；
+- save_* / load_*：retrieval index 与 sparse（BM25）artifact 的落盘和读取；
+- CollectionRetrievalIndexProvider：运行期优先加载 sparse artifact，失败时从 retrieval index artifact、
+  chunk 文件或向量库现场构建，并按 collection 缓存。
+"""
+
 from __future__ import annotations
 
 import json
@@ -8,11 +16,11 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from services.retrieval.collection_profile import CollectionRetrievalProfile
 from services.paper_qa.build_cache import (
@@ -25,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
 
+# BM25 各字段的权重：章节/标题加权，图表 caption 与 OCR 辅助文本大幅降权以压制噪声。
 KEYWORD_FIELD_WEIGHTS = {
     "body": 1.0,
     "title": 1.35,
@@ -41,6 +50,7 @@ RETRIEVAL_INDEX_TYPES = {"body", "section_anchor", "summary", "question", "table
 VECTOR_ROUTE_NAMES = {"vector", "vector_original", "vector_rewrite", "vector_hyde"}
 KEYWORD_ROUTE_NAMES = {"keyword"}
 
+# 各类索引默认参与的召回路线；section_anchor 只做关键词入口，不进向量库。
 RETRIEVAL_INDEX_ROUTE_DEFAULTS = {
     "body": ["vector_original", "vector_rewrite", "vector_hyde", "keyword"],
     "section_anchor": ["keyword"],
@@ -49,6 +59,7 @@ RETRIEVAL_INDEX_ROUTE_DEFAULTS = {
     "table_or_figure": ["vector_original", "vector_rewrite", "vector_hyde", "keyword", "table_structured"],
 }
 
+# 各类索引的默认权重：关键词后端用它缩放字段权重，index 级命中聚合回 chunk 时也会参考。
 RETRIEVAL_INDEX_WEIGHTS = {
     "body": 1.0,
     "section_anchor": 0.45,
@@ -75,7 +86,27 @@ SPARSE_SOURCE_TYPE_ALIASES = {
     "retrieval_index_artifact": "retrieval_index",
     "retrieval_index_file": "retrieval_index",
 }
+# 决定 token、字段权重与 BM25 结构含义的语义版本；任一不一致时持久化的 postings 都不能复用。
+_SPARSE_SEMANTIC_VERSIONS = (
+    ("tokenizer_version", KEYWORD_TOKENIZER_VERSION),
+    ("field_weights_version", KEYWORD_FIELD_WEIGHTS_VERSION),
+    ("bm25_schema_version", BM25_SCHEMA_VERSION),
+)
+# CollectionRetrievalIndex 上的 lookup 表（键 → doc_id 列表），构建、加载与复制时统一按这份清单处理。
+_LOOKUP_TABLE_NAMES = (
+    "by_chunk_id",
+    "by_parent_chunk_id",
+    "by_original_chunk_id",
+    "by_page_section",
+    "by_page_number",
+    "by_section_path",
+    "by_section_title",
+    "by_chunk_type",
+    "by_subchunk_index",
+    "by_parent_subchunk",
+)
 
+# PaperChunk 保留的稳定元数据字段（其余 payload 字段只留在 PaperChunk.payload 中）。
 PAPER_CHUNK_METADATA_KEYS = {
     "source",
     "document_name",
@@ -125,15 +156,16 @@ class PaperChunk:
 
     @classmethod
     def from_chunk(cls, chunk: Dict[str, Any], fallback_index: int = 0) -> "PaperChunk":
+        """从 chunk payload 构造；顶层字段优先于 metadata，空值字段不进入 metadata。"""
         metadata = dict(chunk.get("metadata", {}) or {})
         chunk_id = normalize_chunk_id(chunk, fallback_index=fallback_index)
         content = str(chunk.get("content") or chunk.get("text") or metadata.get("content") or metadata.get("text") or "")
         # 只补齐派生索引需要的稳定元数据，避免把 index 层字段混回 PaperChunk 的核心语义。
-        normalized_metadata = {
-            key: (chunk.get(key) if key in chunk else metadata.get(key))
-            for key in PAPER_CHUNK_METADATA_KEYS
-            if (chunk.get(key) if key in chunk else metadata.get(key)) not in (None, "")
-        }
+        normalized_metadata = {}
+        for key in PAPER_CHUNK_METADATA_KEYS:
+            value = _chunk_or_metadata_value(chunk, metadata, key)
+            if value not in (None, ""):
+                normalized_metadata[key] = value
         normalized_metadata.setdefault("chunk_id", chunk_id)
         return cls(chunk_id=chunk_id, content=content, metadata=normalized_metadata, payload=dict(chunk))
 
@@ -151,6 +183,7 @@ class RetrievalIndex:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
+        """转成可落盘的字典；列表和 metadata 复制一份，避免与实例共享。"""
         return {
             "index_id": self.index_id,
             "chunk_id": self.chunk_id,
@@ -163,6 +196,7 @@ class RetrievalIndex:
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "RetrievalIndex":
+        """兼容短字段名（index_*）和向量库 metadata 中的长字段名（retrieval_index_*）。"""
         index_type = normalize_index_type(payload.get("index_type") or payload.get("retrieval_index_type"))
         return cls(
             index_id=str(payload.get("index_id") or payload.get("retrieval_index_id") or ""),
@@ -181,22 +215,29 @@ class RetrievalIndex:
         )
 
 
+def _chunk_or_metadata_value(chunk: Dict[str, Any], metadata: Dict[str, Any], key: str) -> Any:
+    """chunk 顶层有这个键就用顶层值（即使为空），否则读 metadata。"""
+    return chunk.get(key) if key in chunk else metadata.get(key)
+
+
 def normalize_index_type(value: Any) -> str:
+    """规范化索引类型；未知类型一律视为 body。"""
     index_type = str(value or "body").strip().lower()
     return index_type if index_type in RETRIEVAL_INDEX_TYPES else "body"
 
 
 def normalize_chunk_id(chunk: Dict[str, Any], fallback_index: int = 0) -> str:
+    """按 chunk_id → chunk_index → parent_chunk_id → original_chunk_id 取第一个非空值，都没有时用 fallback_index。"""
     metadata = dict(chunk.get("metadata", {}) or {})
     for key in ("chunk_id", "chunk_index", "parent_chunk_id", "original_chunk_id"):
-        value = chunk.get(key) if key in chunk else metadata.get(key)
-        normalized = str(value or "").strip()
+        normalized = str(_chunk_or_metadata_value(chunk, metadata, key) or "").strip()
         if normalized:
             return normalized
     return str(fallback_index or 0)
 
 
 def normalize_enabled_routes(value: Any) -> List[str]:
+    """把 enabled_routes 统一成字符串列表；支持列表、JSON 数组字符串以及逗号/竖线分隔的字符串。"""
     if value is None:
         return []
     if isinstance(value, str):
@@ -216,11 +257,17 @@ def normalize_enabled_routes(value: Any) -> List[str]:
     return []
 
 
-def retrieval_index_enabled_for(index: RetrievalIndex | Dict[str, Any], route_names: Set[str]) -> bool:
-    routes = normalize_enabled_routes(index.enabled_routes if isinstance(index, RetrievalIndex) else index.get("enabled_routes"))
+def _routes_allow(raw_routes: Any, route_names: Set[str]) -> bool:
+    """未声明 enabled_routes 视为对所有路线开放；否则只要与 route_names 有交集即可。"""
+    routes = normalize_enabled_routes(raw_routes)
     if not routes:
         return True
     return bool(set(routes) & route_names)
+
+
+def retrieval_index_enabled_for(index: RetrievalIndex | Dict[str, Any], route_names: Set[str]) -> bool:
+    """判断索引是否参与给定路线（如向量路线集合 VECTOR_ROUTE_NAMES）。"""
+    return _routes_allow(index.enabled_routes if isinstance(index, RetrievalIndex) else index.get("enabled_routes"), route_names)
 
 
 class RetrievalIndexBuilder:
@@ -252,6 +299,7 @@ class RetrievalIndexBuilder:
         self.generation_model_name = str(generation_model_name or "retrieval_index_generation")
 
     def build(self, chunks: Iterable[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """为全部 chunk 建索引，返回 (索引字典列表, 汇总 debug)；输出顺序与输入 chunk 顺序一致。"""
         all_indexes: List[Dict[str, Any]] = []
         chunk_debug: List[Dict[str, Any]] = []
         chunk_items = [(fallback_index, dict(chunk or {})) for fallback_index, chunk in enumerate(chunks or [], start=1)]
@@ -294,10 +342,15 @@ class RetrievalIndexBuilder:
         return all_indexes, summary
 
     def build_for_chunk(self, chunk: Dict[str, Any], fallback_index: int = 0) -> tuple[List[RetrievalIndex], Dict[str, Any]]:
+        """为单个 chunk 生成索引，总数不超过 max_indexes_per_chunk。
+
+        顺序即优先级：body → section_anchor →（图表）table_or_figure → summary → question，
+        超出上限的索引直接丢弃，所以保底的规则索引总能保留下来。
+        """
         paper_chunk = PaperChunk.from_chunk(chunk, fallback_index=fallback_index)
         metadata = dict(paper_chunk.metadata)
-        metadata["chunk_type"] = str(metadata.get("chunk_type", chunk.get("chunk_type", "text")) or "text").strip().lower()
-        chunk_type = str(metadata.get("chunk_type", "text") or "text").strip().lower()
+        chunk_type = str(metadata.get("chunk_type", chunk.get("chunk_type", "text")) or "text").strip().lower()
+        metadata["chunk_type"] = chunk_type
         is_asset = chunk_type in {"figure", "table"}
         indexes: List[RetrievalIndex] = []
         generation_errors: List[Dict[str, Any]] = []
@@ -313,6 +366,7 @@ class RetrievalIndexBuilder:
             source_fields: List[str],
             generation_status: str = "rule",
         ) -> None:
+            """追加一个索引；已达上限时静默丢弃。"""
             if len(indexes) >= self.max_indexes_per_chunk:
                 return
             normalized_type = normalize_index_type(index_type)
@@ -343,16 +397,14 @@ class RetrievalIndexBuilder:
         section_anchor_text = self._section_anchor_text(paper_chunk, metadata)
         add_index("section_anchor", section_anchor_text, source_fields=["section_path", "section_title", "page_number", "summary"])
 
-        if is_asset:
-            # 图表/表格 chunk 优先使用 caption、summary、preview 和建库期结构化表格文本；
-            # 不混入问答运行时生成的 table evidence，避免索引语料随单次问题变化。
-            asset_text = self._asset_index_text(paper_chunk, metadata)
-            if asset_text:
-                add_index(
-                    "table_or_figure",
-                    asset_text,
-                    source_fields=["asset_caption", "asset_summary", "asset_preview_text", "table_structured_text", "content"],
-                )
+        # 图表/表格 chunk 的 body_text 就是 caption、summary、preview 和建库期结构化表格文本的合并；
+        # 不混入问答运行时生成的 table evidence，避免索引语料随单次问题变化。
+        if is_asset and body_text:
+            add_index(
+                "table_or_figure",
+                body_text,
+                source_fields=["asset_caption", "asset_summary", "asset_preview_text", "table_structured_text", "content"],
+            )
 
         # summary/question 是召回增强层；数量受上限约束，避免一个 chunk 扩张出过多向量。
         summary_text, summary_status, summary_errors = self._summary_text(chunk, paper_chunk, metadata)
@@ -392,6 +444,11 @@ class RetrievalIndexBuilder:
         paper_chunk: PaperChunk,
         metadata: Dict[str, Any],
     ) -> tuple[str, str, List[Dict[str, Any]]]:
+        """返回 (摘要文本, 来源状态, 生成错误)。
+
+        优先复用 chunk 已有的 rerank_text / asset_summary；否则在开启生成式索引时查缓存或调用 LLM，
+        LLM 无结果或失败时退回正文截断（generated_fallback）。
+        """
         existing = str(chunk.get("rerank_text") or metadata.get("rerank_text") or metadata.get("asset_summary") or "").strip()
         if existing:
             return existing, "reused_existing", []
@@ -401,7 +458,7 @@ class RetrievalIndexBuilder:
             "kind": "retrieval_summary",
             "model_name": self.generation_model_name,
             "prompt_version": LLM_RETRIEVAL_SUMMARY_PROMPT_VERSION,
-            "chunk_text": self._asset_index_text(paper_chunk, metadata) or paper_chunk.content,
+            "chunk_text": self._index_source_text(paper_chunk, metadata),
             "metadata": metadata,
             "extra": {"preview_chars": RETRIEVAL_INDEX_PREVIEW_CHARS},
         }
@@ -426,6 +483,7 @@ class RetrievalIndexBuilder:
         paper_chunk: PaperChunk,
         metadata: Dict[str, Any],
     ) -> tuple[List[str], str, List[Dict[str, Any]]]:
+        """返回 (问题列表, 来源状态, 生成错误)，策略同 _summary_text；失败时退回模板问题。"""
         existing_questions = extract_question_index_texts(chunk)
         if existing_questions:
             return self._dedupe_texts(existing_questions), "reused_existing", []
@@ -435,7 +493,7 @@ class RetrievalIndexBuilder:
             "kind": "retrieval_questions",
             "model_name": self.generation_model_name,
             "prompt_version": LLM_RETRIEVAL_QUESTIONS_PROMPT_VERSION,
-            "chunk_text": self._asset_index_text(paper_chunk, metadata) or paper_chunk.content,
+            "chunk_text": self._index_source_text(paper_chunk, metadata),
             "metadata": metadata,
             "extra": {"max_questions": self.max_questions_per_chunk},
         }
@@ -457,17 +515,20 @@ class RetrievalIndexBuilder:
         return self._fallback_questions(paper_chunk, metadata), "generated_fallback", []
 
     def _get_cached_generation(self, cache_kwargs: Dict[str, Any]) -> Any:
+        """读生成缓存；未配置缓存或缓存不支持读取时返回 None。"""
         getter = getattr(self.generation_cache, "get_llm_result", None)
         if not callable(getter):
             return None
         return getter(**cache_kwargs)
 
     def _set_cached_generation(self, cache_kwargs: Dict[str, Any], value: Any) -> None:
+        """写生成缓存；未配置缓存时什么也不做。"""
         setter = getattr(self.generation_cache, "set_llm_result", None)
         if callable(setter):
             setter(value, **cache_kwargs)
 
     def _generate_summary_with_service(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> str:
+        """优先调用生成服务的专用摘要接口，没有时用通用 complete_with_qwen + JSON prompt。"""
         if self.generation_service is None:
             return ""
         generator = getattr(self.generation_service, "generate_retrieval_index_summary", None)
@@ -484,6 +545,7 @@ class RetrievalIndexBuilder:
         return self._normalize_generated_text(parsed.get("summary", ""))
 
     def _generate_questions_with_service(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> List[str]:
+        """优先调用生成服务的专用问题接口，没有时用通用 complete_with_qwen + JSON prompt。"""
         if self.generation_service is None:
             return []
         generator = getattr(self.generation_service, "generate_retrieval_index_questions", None)
@@ -503,25 +565,27 @@ class RetrievalIndexBuilder:
         return self._normalize_generated_questions(parsed.get("questions", []))
 
     def _summary_prompt(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> str:
-        chunk_type = metadata.get("chunk_type", "text")
-        content = self._short_text(self._asset_index_text(paper_chunk, metadata) or paper_chunk.content, limit=900)
+        """摘要生成 prompt：任务说明 + chunk 上下文。"""
         return (
             "请为论文 QA 检索索引生成一个短摘要，必须只基于给定 chunk，不要补充外部信息。\n"
             "输出严格 JSON：{\"summary\":\"...\"}\n"
-            f"chunk_type: {chunk_type}\n"
-            f"section: {metadata.get('section_path') or metadata.get('section_title') or ''}\n"
-            f"page: {metadata.get('page_number') or metadata.get('page_range') or ''}\n"
-            f"content:\n{content}"
+            + self._prompt_context(paper_chunk, metadata)
         )
 
     def _question_prompt(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> str:
-        chunk_type = metadata.get("chunk_type", "text")
-        content = self._short_text(self._asset_index_text(paper_chunk, metadata) or paper_chunk.content, limit=900)
+        """问题生成 prompt：任务说明 + chunk 上下文。"""
         return (
             "请为论文 QA 检索索引生成 1-3 个这个 chunk 可以回答的问题。\n"
             "要求：问题必须具体、可由该 chunk 直接支持；不要生成无法从 chunk 证明的问题。\n"
             "输出严格 JSON：{\"questions\":[\"...\",\"...\"]}\n"
-            f"chunk_type: {chunk_type}\n"
+            + self._prompt_context(paper_chunk, metadata)
+        )
+
+    def _prompt_context(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> str:
+        """两种生成 prompt 共用的 chunk 上下文：类型、章节、页码和截断到 900 字符的内容。"""
+        content = self._short_text(self._index_source_text(paper_chunk, metadata), limit=900)
+        return (
+            f"chunk_type: {metadata.get('chunk_type', 'text')}\n"
             f"section: {metadata.get('section_path') or metadata.get('section_title') or ''}\n"
             f"page: {metadata.get('page_number') or metadata.get('page_range') or ''}\n"
             f"content:\n{content}"
@@ -529,6 +593,10 @@ class RetrievalIndexBuilder:
 
     @classmethod
     def _parse_generated_payload(cls, value: Any) -> Dict[str, Any]:
+        """解析 LLM 输出的 JSON：兼容 ```json 代码块和前后夹杂文字；顶层是数组时视为 questions。
+
+        JSON 不合法时直接抛出异常，由调用方记录为生成错误并降级。
+        """
         if isinstance(value, dict):
             return value
         raw = str(value or "").strip()
@@ -548,6 +616,7 @@ class RetrievalIndexBuilder:
 
     @staticmethod
     def _normalize_generated_text(value: Any) -> str:
+        """把生成结果（字符串 / 字典 / 列表）统一成单行文本。"""
         if isinstance(value, dict):
             value = value.get("summary") or value.get("text") or ""
         if isinstance(value, list):
@@ -556,6 +625,7 @@ class RetrievalIndexBuilder:
 
     @classmethod
     def _normalize_generated_questions(cls, value: Any) -> List[str]:
+        """把生成结果统一成去重后的问题列表，并去掉 "1." / "-" 之类的列表前缀。"""
         if isinstance(value, dict):
             value = value.get("questions") or value.get("question") or []
         if isinstance(value, str):
@@ -570,6 +640,7 @@ class RetrievalIndexBuilder:
         return cls._dedupe_texts(normalized)
 
     def _asset_index_text(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> str:
+        """图表类文本：caption、摘要、预览、结构化表格文本和正文去重后按行拼接。"""
         parts = [
             str(metadata.get("asset_caption") or "").strip(),
             str(metadata.get("asset_summary") or "").strip(),
@@ -579,10 +650,15 @@ class RetrievalIndexBuilder:
         ]
         return "\n".join(self._dedupe_texts([part for part in parts if part]))
 
+    def _index_source_text(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> str:
+        """生成摘要、问题和锚点时使用的源文本：图表字段与正文的合并，全部为空时退回原始正文。"""
+        return self._asset_index_text(paper_chunk, metadata) or paper_chunk.content
+
     def _section_anchor_text(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> str:
+        """章节锚点文本：章节、页码和一句摘要；三者都缺时退化为 "Chunk: <id>"。"""
         summary = str(metadata.get("rerank_text") or metadata.get("asset_summary") or "").strip()
         if not summary:
-            summary = self._short_text(self._asset_index_text(paper_chunk, metadata) or paper_chunk.content, limit=180)
+            summary = self._short_text(self._index_source_text(paper_chunk, metadata), limit=180)
         parts = [
             f"Section: {metadata.get('section_path') or metadata.get('section_title')}" if metadata.get("section_path") or metadata.get("section_title") else "",
             f"Page: {metadata.get('page_number') or metadata.get('page_range')}" if metadata.get("page_number") or metadata.get("page_range") else "",
@@ -592,17 +668,18 @@ class RetrievalIndexBuilder:
         return "\n".join([part for part in parts if part]).strip() or f"Chunk: {paper_chunk.chunk_id}"
 
     def _fallback_questions(self, paper_chunk: PaperChunk, metadata: Dict[str, Any]) -> List[str]:
+        """LLM 不可用时按 chunk 类型套用的模板问题，以章节名作为主题。"""
         chunk_type = str(metadata.get("chunk_type", "text") or "text").strip().lower()
         topic = str(metadata.get("section_title") or metadata.get("section_path") or "this evidence").strip()
         if chunk_type == "figure":
             questions = [
                 f"What does the figure show about {topic}?",
-                f"How should the figure evidence be interpreted in this paper?",
+                "How should the figure evidence be interpreted in this paper?",
             ]
         elif chunk_type == "table":
             questions = [
                 f"What results are reported in the table for {topic}?",
-                f"Which values or comparisons does the table support?",
+                "Which values or comparisons does the table support?",
             ]
         else:
             questions = [
@@ -613,6 +690,7 @@ class RetrievalIndexBuilder:
 
     @staticmethod
     def _short_text(text: str, limit: int = RETRIEVAL_INDEX_PREVIEW_CHARS) -> str:
+        """压缩空白后截断到 limit 个字符，尽量在单词边界处截断（不加省略号）。"""
         normalized = re.sub(r"\s+", " ", str(text or "")).strip()
         if len(normalized) <= limit:
             return normalized
@@ -620,10 +698,12 @@ class RetrievalIndexBuilder:
 
     @staticmethod
     def _normalized_text(text: str) -> str:
+        """去重比较用的归一化：小写并压缩空白。"""
         return re.sub(r"\s+", " ", str(text or "").strip().lower())
 
     @classmethod
     def _dedupe_texts(cls, texts: Iterable[str]) -> List[str]:
+        """按归一化结果保序去重，保留首次出现的原始写法（去首尾空白）。"""
         deduped: List[str] = []
         seen: Set[str] = set()
         for text in texts:
@@ -646,7 +726,9 @@ def build_retrieval_indexes(
     generation_cache: Any = None,
     generation_model_name: str = "",
 ) -> List[Dict[str, Any]]:
-    builder = RetrievalIndexBuilder(
+    """只要索引列表、不关心 debug 时的便捷入口，参数同 build_retrieval_index_payload。"""
+    indexes, _ = build_retrieval_index_payload(
+        chunks,
         generation_service=generation_service,
         enable_generative_indexes=enable_generative_indexes,
         max_indexes_per_chunk=max_indexes_per_chunk,
@@ -655,7 +737,6 @@ def build_retrieval_indexes(
         generation_cache=generation_cache,
         generation_model_name=generation_model_name,
     )
-    indexes, _ = builder.build(chunks)
     return indexes
 
 
@@ -670,6 +751,7 @@ def build_retrieval_index_payload(
     generation_cache: Any = None,
     generation_model_name: str = "",
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """用给定参数构造 RetrievalIndexBuilder 建索引，返回 (索引字典列表, 汇总 debug)。"""
     builder = RetrievalIndexBuilder(
         generation_service=generation_service,
         enable_generative_indexes=enable_generative_indexes,
@@ -683,6 +765,7 @@ def build_retrieval_index_payload(
 
 
 def iter_retrieval_indexes_for_embedding(retrieval_indexes: Iterable[Dict[str, Any]]) -> List[RetrievalIndex]:
+    """筛出需要写入向量库的索引：文本非空且参与至少一条向量路线。"""
     indexes: List[RetrievalIndex] = []
     for payload in retrieval_indexes or []:
         index = RetrievalIndex.from_dict(dict(payload or {}))
@@ -696,6 +779,7 @@ def iter_retrieval_indexes_for_embedding(retrieval_indexes: Iterable[Dict[str, A
 
 
 def summarize_retrieval_indexes(retrieval_indexes: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    """统计索引总数、各类型数量和空文本索引数量。"""
     counts: Dict[str, int] = defaultdict(int)
     empty_count = 0
     for payload in retrieval_indexes or []:
@@ -711,16 +795,39 @@ def summarize_retrieval_indexes(retrieval_indexes: Iterable[Dict[str, Any]]) -> 
 
 
 def _safe_artifact_slug(value: Any, fallback: str = "paper") -> str:
+    """把任意值转成可用作文件名/目录名的片段，只保留字母数字和 ._-；结果为空时用 fallback。"""
     slug = re.sub(r"[^0-9A-Za-z._-]+", "_", str(value or "").strip()).strip("._-")
     return slug or fallback
 
 
+def _default_artifact_version(created_at: str) -> str:
+    """未指定版本号时由创建时间生成，例如 2024-01-02T03:04:05 → 20240102T030405。"""
+    return created_at.replace(":", "").replace("-", "")
+
+
+def _write_json(path: Any, payload: Any) -> None:
+    """以 UTF-8、缩进 2 写出 JSON；无法序列化的值（如 datetime）转成字符串。"""
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+
+
+def _read_json(path: Any) -> Any:
+    """以 UTF-8 读取 JSON 文件。"""
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _count_nonblank(tokens: Iterable[Any]) -> int:
+    """统计非空白 token 的数量。"""
+    return sum(1 for token in tokens if str(token or "").strip())
+
+
 def normalize_sparse_source_type(source_type: Any) -> str:
+    """规范化 sparse artifact 的来源类型；为空时视为 chunk，并把历史别名映射到标准名。"""
     normalized = str(source_type or "").strip().lower()
     if not normalized:
         return "chunk"
-    normalized = SPARSE_SOURCE_TYPE_ALIASES.get(normalized, normalized)
-    return normalized
+    return SPARSE_SOURCE_TYPE_ALIASES.get(normalized, normalized)
 
 
 def normalize_retrieval_index_artifact_records(
@@ -730,6 +837,7 @@ def normalize_retrieval_index_artifact_records(
     index_version: str,
     created_at: str,
 ) -> List[Dict[str, Any]]:
+    """把索引转换成 artifact 中的记录格式，补上 paper_id、版本、创建时间和来源文档名。"""
     records: List[Dict[str, Any]] = []
     for payload in retrieval_indexes or []:
         index = RetrievalIndex.from_dict(dict(payload or {}))
@@ -767,8 +875,12 @@ def save_retrieval_index_artifact(
     index_version: Optional[str] = None,
     output_dir: str = DEFAULT_RETRIEVAL_INDEX_ARTIFACT_DIR,
 ) -> str:
+    """把 retrieval index 写成 JSON artifact，返回文件路径。
+
+    传入 chunks 时会记录 chunk_ids，并列出引用了不存在 chunk 的索引（missing_chunk_ids）。
+    """
     created_at = datetime.now().isoformat(timespec="seconds")
-    version = str(index_version or created_at.replace(":", "").replace("-", "")).strip()
+    version = str(index_version or _default_artifact_version(created_at)).strip()
     records = normalize_retrieval_index_artifact_records(
         retrieval_indexes,
         paper_id=str(paper_id or ""),
@@ -809,48 +921,49 @@ def save_retrieval_index_artifact(
         f"{_safe_artifact_slug(version, fallback='version')}_retrieval_indexes.json"
     )
     filepath = os.path.join(output_dir, filename)
-    with open(filepath, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+    _write_json(filepath, payload)
     return filepath
 
 
-def resolve_artifact_file_path(file_path: Any) -> Optional[Path]:
-    raw_path = Path(str(file_path or "").strip())
-    if not str(raw_path):
-        return None
+def _artifact_path_candidates(raw_text: str) -> Iterator[Path]:
+    """依次给出路径的候选绝对位置：原样、相对当前工作目录、相对 backend 目录、相对仓库根目录。
+
+    数据库里记录的 artifact 路径可能是相对路径，而服务可能从仓库根目录或 backend 目录启动，所以都要试。
+    无法解析的候选会被跳过。
+    """
+    raw_path = Path(raw_text)
     candidates = [raw_path]
-    backend_root = Path(__file__).resolve().parents[2]
-    repo_root = backend_root.parent
     if not raw_path.is_absolute():
-        candidates.extend(
-            [
-                Path(os.getcwd()) / raw_path,
-                backend_root / raw_path,
-                repo_root / raw_path,
-            ]
-        )
+        backend_root = Path(__file__).resolve().parents[2]
+        candidates.extend([Path(os.getcwd()) / raw_path, backend_root / raw_path, backend_root.parent / raw_path])
     for candidate in candidates:
         try:
-            resolved = candidate.resolve()
+            yield candidate.resolve()
         except OSError:
             continue
-        if resolved.is_file():
-            return resolved
-    return None
+
+
+def resolve_artifact_file_path(file_path: Any) -> Optional[Path]:
+    """在候选位置中找到第一个存在的文件；找不到时返回 None。"""
+    raw_text = str(file_path or "").strip()
+    if not raw_text:
+        return None
+    return next((path for path in _artifact_path_candidates(raw_text) if path.is_file()), None)
 
 
 def load_retrieval_index_artifact(file_path: Any) -> Dict[str, Any]:
+    """读取 retrieval index artifact；文件不存在时抛 FileNotFoundError，内容不是对象时抛 ValueError。"""
     resolved = resolve_artifact_file_path(file_path)
     if resolved is None:
         raise FileNotFoundError(str(file_path or ""))
-    with open(resolved, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
+    payload = _read_json(resolved)
     if not isinstance(payload, dict):
         raise ValueError(f"Invalid retrieval index artifact: {resolved}")
     return payload
 
 
 def extract_question_index_texts(chunk: Dict[str, Any]) -> List[str]:
+    """读取 chunk 自带的问题（retrieval_questions / questions，顶层优先）；字符串按换行或分号拆分。"""
     metadata = dict(chunk.get("metadata", {}) or {})
     raw_value = (
         chunk.get("retrieval_questions")
@@ -922,12 +1035,14 @@ class CollectionRetrievalIndex:
     build_source: str = "lazy_chunk_scan"
 
     def keyword_route_index_source(self) -> str:
+        """关键词路线索引来源：persistent_sparse_artifact 或 runtime_build_fallback。"""
         # debug 对外只暴露迁移状态，不把内部 runtime build 的多种来源泄漏成新的前端契约。
         if self.build_source == "sparse_index_artifact":
             return "persistent_sparse_artifact"
         return "runtime_build_fallback"
 
     def sparse_index_debug_summary(self, candidate_count: int) -> Dict[str, Any]:
+        """汇总 sparse 索引的加载情况：来源、版本、文档数、加载耗时，以及退回现场构建的原因。"""
         route_index_source = self.keyword_route_index_source()
         artifact_debug = dict(self.retrieval_index_artifact_debug or {})
         sparse_debug = artifact_debug if self.build_source == "sparse_index_artifact" else dict(artifact_debug.get("sparse_index_artifact") or {})
@@ -954,6 +1069,7 @@ class CollectionRetrievalIndex:
         }
 
     def to_keyword_debug(self, candidate_count: int, *, full_scan_used: bool = False) -> Dict[str, Any]:
+        """关键词路线 debug 中与索引相关的字段。"""
         route_index_source = self.keyword_route_index_source()
         sparse_summary = self.sparse_index_debug_summary(candidate_count)
         return {
@@ -984,6 +1100,7 @@ class CollectionRetrievalIndex:
         candidate_count: int,
         full_scan_used: bool = False,
     ) -> Dict[str, Any]:
+        """记忆路线 debug 中与索引相关的字段。"""
         return {
             "memory_lookup_mode": lookup_mode,
             "memory_exact_hit_count": exact_hit_count,
@@ -1011,10 +1128,12 @@ def compute_artifact_file_hash(file_path: Any) -> str:
 
 
 def _counter_to_json(counter: Counter) -> Dict[str, float]:
+    """Counter → JSON 对象；计数可能是加权后的小数，统一存成 float。"""
     return {str(token): float(count) for token, count in dict(counter or {}).items()}
 
 
 def _counter_from_json(payload: Any) -> Counter:
+    """JSON 对象 → Counter；无法转成数字的项直接跳过。"""
     if not isinstance(payload, dict):
         return Counter()
     values = Counter()
@@ -1027,6 +1146,7 @@ def _counter_from_json(payload: Any) -> Counter:
 
 
 def _keyword_document_to_sparse_record(document: KeywordDocument) -> Dict[str, Any]:
+    """KeywordDocument → documents.jsonl 中的一行记录。"""
     return {
         "doc_id": int(document.doc_id),
         "chunk": dict(document.chunk or {}),
@@ -1052,6 +1172,7 @@ def _keyword_document_to_sparse_record(document: KeywordDocument) -> Dict[str, A
 
 
 def _keyword_document_from_sparse_record(record: Dict[str, Any], fallback_doc_id: int) -> KeywordDocument:
+    """documents.jsonl 中的一行记录 → KeywordDocument；缺失字段按构建时的默认值补齐。"""
     field_token_counts = {
         str(field_name): _counter_from_json(field_counts)
         for field_name, field_counts in (record.get("field_token_counts") or {}).items()
@@ -1092,14 +1213,13 @@ def _sparse_token_stats(index: CollectionRetrievalIndex) -> Dict[str, Any]:
             stats["document_count"] += 1
             stats["total_token_count"] += int(length or 0)
             field_counts = (document.field_token_counts or {}).get(field_name) or Counter()
-            stats["unique_token_count"] += len([token for token in field_counts if str(token or "").strip()])
-    posting_token_count = len([token for token in (index.postings or {}) if str(token or "").strip()])
+            stats["unique_token_count"] += _count_nonblank(field_counts)
     return {
         "document_count": len(index.documents),
         "avgdl": float(index.avgdl or 0.0),
         "total_document_length": total_document_length,
-        "unique_token_count": len([token for token in (index.document_frequency or {}) if str(token or "").strip()]),
-        "posting_token_count": posting_token_count,
+        "unique_token_count": _count_nonblank(index.document_frequency or {}),
+        "posting_token_count": _count_nonblank(index.postings or {}),
         "field_stats": field_stats,
         "field_weights": dict(KEYWORD_FIELD_WEIGHTS),
         "field_weights_version": KEYWORD_FIELD_WEIGHTS_VERSION,
@@ -1121,7 +1241,7 @@ def save_sparse_index_artifact(
 ) -> Dict[str, Any]:
     """把 BM25/keyword route 需要的稀疏结构落成正式 artifact，避免重启后再临时扫描重建。"""
     created_at = datetime.now().isoformat(timespec="seconds")
-    version = str(index_version or index.index_version or created_at.replace(":", "").replace("-", "")).strip()
+    version = str(index_version or index.index_version or _default_artifact_version(created_at)).strip()
     source_hash_value = str(source_hash or compute_artifact_file_hash(source_file)).strip()
     normalized_source_type = normalize_sparse_source_type(source_type)
     if normalized_source_type not in SPARSE_SOURCE_TYPES:
@@ -1140,32 +1260,27 @@ def save_sparse_index_artifact(
             handle.write(json.dumps(_keyword_document_to_sparse_record(document), ensure_ascii=False, default=str))
             handle.write("\n")
 
-    with open(postings_file, "w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                str(token): sorted(int(doc_id) for doc_id in doc_ids)
-                for token, doc_ids in (index.postings or {}).items()
-                if str(token or "").strip()
-            },
-            handle,
-            ensure_ascii=False,
-            indent=2,
-        )
-    with open(document_frequency_file, "w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                str(token): int(freq or 0)
-                for token, freq in (index.document_frequency or {}).items()
-                if str(token or "").strip()
-            },
-            handle,
-            ensure_ascii=False,
-            indent=2,
-        )
+    # postings 的 doc_id 集合排序后落盘，保证同一索引多次导出的文件内容一致。
+    _write_json(
+        postings_file,
+        {
+            str(token): sorted(int(doc_id) for doc_id in doc_ids)
+            for token, doc_ids in (index.postings or {}).items()
+            if str(token or "").strip()
+        },
+    )
+    _write_json(
+        document_frequency_file,
+        {
+            str(token): int(freq or 0)
+            for token, freq in (index.document_frequency or {}).items()
+            if str(token or "").strip()
+        },
+    )
 
     token_stats = _sparse_token_stats(index)
-    with open(token_stats_file, "w", encoding="utf-8") as handle:
-        json.dump(token_stats, handle, ensure_ascii=False, indent=2, default=str)
+    _write_json(token_stats_file, token_stats)
+    token_count = int(token_stats.get("total_document_length", 0) or 0)
 
     manifest = {
         "schema_version": SPARSE_INDEX_ARTIFACT_SCHEMA_VERSION,
@@ -1180,7 +1295,7 @@ def save_sparse_index_artifact(
         "field_weights_version": KEYWORD_FIELD_WEIGHTS_VERSION,
         "bm25_schema_version": BM25_SCHEMA_VERSION,
         "document_count": len(index.documents),
-        "token_count": int(token_stats.get("total_document_length", 0) or 0),
+        "token_count": token_count,
         "avgdl": float(index.avgdl or 0.0),
         "created_at": created_at,
         "files": {
@@ -1190,15 +1305,15 @@ def save_sparse_index_artifact(
             "token_stats": token_stats_file.name,
         },
     }
-    with open(manifest_file, "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, ensure_ascii=False, indent=2, default=str)
+    # manifest 最后写入；读取方通过它定位其余文件，并用其中的 document_count 校验完整性。
+    _write_json(manifest_file, manifest)
 
     return {
         "artifact_dir": str(artifact_dir),
         "manifest_file": str(manifest_file),
         "schema_version": SPARSE_INDEX_ARTIFACT_SCHEMA_VERSION,
         "document_count": len(index.documents),
-        "token_count": int(token_stats.get("total_document_length", 0) or 0),
+        "token_count": token_count,
         "backend": manifest["backend"],
         "source_file": manifest["source_file"],
         "source_hash": source_hash_value,
@@ -1208,20 +1323,11 @@ def save_sparse_index_artifact(
 
 
 def _resolve_sparse_manifest_path(file_or_dir: Any) -> Optional[Path]:
+    """定位 sparse manifest：参数可以是 manifest 文件本身，也可以是包含 manifest.json 的目录。"""
     raw_text = str(file_or_dir or "").strip()
     if not raw_text:
         return None
-    raw_path = Path(raw_text)
-    candidates = [raw_path]
-    backend_root = Path(__file__).resolve().parents[2]
-    repo_root = backend_root.parent
-    if not raw_path.is_absolute():
-        candidates.extend([Path(os.getcwd()) / raw_path, backend_root / raw_path, repo_root / raw_path])
-    for candidate in candidates:
-        try:
-            resolved = candidate.resolve()
-        except OSError:
-            continue
+    for resolved in _artifact_path_candidates(raw_text):
         if resolved.is_dir():
             manifest = resolved / "manifest.json"
             if manifest.is_file():
@@ -1236,8 +1342,7 @@ def load_sparse_index_artifact_files(file_or_dir: Any) -> Dict[str, Any]:
     manifest_path = _resolve_sparse_manifest_path(file_or_dir)
     if manifest_path is None:
         raise FileNotFoundError(str(file_or_dir or ""))
-    with open(manifest_path, "r", encoding="utf-8") as handle:
-        manifest = json.load(handle)
+    manifest = _read_json(manifest_path)
     if not isinstance(manifest, dict):
         raise ValueError(f"Invalid sparse index manifest: {manifest_path}")
     if manifest.get("schema_version") != SPARSE_INDEX_ARTIFACT_SCHEMA_VERSION:
@@ -1260,12 +1365,9 @@ def load_sparse_index_artifact_files(file_or_dir: Any) -> Dict[str, Any]:
             if isinstance(record, dict):
                 documents.append(_keyword_document_from_sparse_record(record, fallback_doc_id))
 
-    with open(postings_path, "r", encoding="utf-8") as handle:
-        raw_postings = json.load(handle)
-    with open(document_frequency_path, "r", encoding="utf-8") as handle:
-        raw_document_frequency = json.load(handle)
-    with open(token_stats_path, "r", encoding="utf-8") as handle:
-        token_stats = json.load(handle)
+    raw_postings = _read_json(postings_path)
+    raw_document_frequency = _read_json(document_frequency_path)
+    token_stats = _read_json(token_stats_path)
 
     postings = {
         str(token): {int(doc_id) for doc_id in (doc_ids or [])}
@@ -1285,6 +1387,28 @@ def load_sparse_index_artifact_files(file_or_dir: Any) -> Dict[str, Any]:
         "document_frequency": document_frequency,
         "token_stats": dict(token_stats or {}),
     }
+
+
+def _record_index_version(record: Optional[Dict[str, Any]]) -> str:
+    """论文索引记录中的当前索引版本：active_index_version 优先，其次 index_version，都没有时为空串。"""
+    record = record or {}
+    return str(record.get("active_index_version") or record.get("index_version") or "")
+
+
+def _record_build_id(record: Optional[Dict[str, Any]]) -> str:
+    """论文索引记录中的当前构建 ID：active_build_id 优先，其次 build_id，都没有时为空串。"""
+    record = record or {}
+    return str(record.get("active_build_id") or record.get("build_id") or "")
+
+
+def _new_lookup_tables() -> Dict[str, Dict[Any, List[int]]]:
+    """为 _LOOKUP_TABLE_NAMES 中的每张表创建一个空的 defaultdict(list)。"""
+    return {name: defaultdict(list) for name in _LOOKUP_TABLE_NAMES}
+
+
+def _copy_lookup_tables(tables: Dict[str, Dict[Any, List[int]]]) -> Dict[str, Dict[Any, List[int]]]:
+    """复制 lookup 表：转成普通 dict（不再自动建键），每个 doc_id 列表也复制一份。"""
+    return {name: {key: list(value) for key, value in tables[name].items()} for name in _LOOKUP_TABLE_NAMES}
 
 
 class CollectionRetrievalIndexProvider:
@@ -1311,6 +1435,11 @@ class CollectionRetrievalIndexProvider:
         index_record: Optional[Dict[str, Any]] = None,
         force_refresh: bool = False,
     ) -> CollectionRetrievalIndex:
+        """取 collection 检索索引：缓存有效时返回副本，否则重建并写回缓存。
+
+        index_record 是数据库中的论文索引记录，用于定位 artifact 并判断缓存是否过期
+        （chunk 数、索引版本、构建 ID、sparse 源 hash 等任一变化都会触发重建）。
+        """
         resolved_name = self._resolve_collection_name(collection_name)
         with self._lock:
             cached = self._cache.get(resolved_name)
@@ -1341,6 +1470,13 @@ class CollectionRetrievalIndexProvider:
         index_record: Optional[Dict[str, Any]],
         stale_reason: str,
     ) -> CollectionRetrievalIndex:
+        """构建索引，按优先级尝试各数据源，每次降级都把原因记入 fallback_reason。
+
+        1. 构建期落盘的 sparse artifact（直接恢复 postings，最快）；
+        2. 开启 index 级 BM25 时：retrieval index artifact + chunk 文件，失败再全量读向量库；
+        3. 关闭 index 级 BM25 时：chunk 文件或向量库中折叠回 chunk 粒度的旧数据。
+        2、3 两种情况都在内存中现场分词并构建 postings 与 lookup 表。
+        """
         started = perf_counter()
         fallback_reasons: List[str] = []
         if stale_reason:
@@ -1418,16 +1554,7 @@ class CollectionRetrievalIndexProvider:
         documents: List[KeywordDocument] = []
         document_frequency: Dict[str, int] = defaultdict(int)
         postings: Dict[str, Set[int]] = defaultdict(set)
-        by_chunk_id: Dict[str, List[int]] = defaultdict(list)
-        by_parent_chunk_id: Dict[str, List[int]] = defaultdict(list)
-        by_original_chunk_id: Dict[str, List[int]] = defaultdict(list)
-        by_page_section: Dict[Tuple[str, str], List[int]] = defaultdict(list)
-        by_page_number: Dict[str, List[int]] = defaultdict(list)
-        by_section_path: Dict[str, List[int]] = defaultdict(list)
-        by_section_title: Dict[str, List[int]] = defaultdict(list)
-        by_chunk_type: Dict[str, List[int]] = defaultdict(list)
-        by_subchunk_index: Dict[str, List[int]] = defaultdict(list)
-        by_parent_subchunk: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+        lookup_tables = _new_lookup_tables()
 
         for raw_chunk in normalized_chunks:
             chunk = self._ensure_retrieval_index_fields(raw_chunk)
@@ -1473,44 +1600,23 @@ class CollectionRetrievalIndexProvider:
                     retrieval_index_enabled_routes=normalize_enabled_routes(chunk.get("retrieval_index_enabled_routes")),
                 )
             )
-            self._add_lookup_entries(
-                doc_id=doc_id,
-                chunk=chunk,
-                by_chunk_id=by_chunk_id,
-                by_parent_chunk_id=by_parent_chunk_id,
-                by_original_chunk_id=by_original_chunk_id,
-                by_page_section=by_page_section,
-                by_page_number=by_page_number,
-                by_section_path=by_section_path,
-                by_section_title=by_section_title,
-                by_chunk_type=by_chunk_type,
-                by_subchunk_index=by_subchunk_index,
-                by_parent_subchunk=by_parent_subchunk,
-            )
+            self._add_lookup_entries(doc_id, chunk, lookup_tables)
 
         chunk_count = self._resolve_chunk_count(collection_profile, index_record, len(normalized_chunks))
-        index = CollectionRetrievalIndex(
-            arxiv_id=str((index_record or {}).get("arxiv_id", "") or ""),
+        record = index_record or {}
+        return CollectionRetrievalIndex(
+            arxiv_id=str(record.get("arxiv_id", "") or ""),
             collection_name=collection_name,
-            index_version=str((index_record or {}).get("active_index_version") or (index_record or {}).get("index_version") or collection_name),
+            index_version=_record_index_version(record) or collection_name,
             chunk_count=chunk_count,
-            build_id=str((index_record or {}).get("active_build_id") or (index_record or {}).get("build_id") or ""),
-            chunk_file_hash=str((index_record or {}).get("chunk_file_hash") or (index_record or {}).get("chunk_file") or ""),
+            build_id=_record_build_id(record),
+            chunk_file_hash=str(record.get("chunk_file_hash") or record.get("chunk_file") or ""),
             created_at=datetime.now().isoformat(timespec="seconds"),
             documents=documents,
             document_frequency=dict(document_frequency),
             postings={token: set(doc_ids) for token, doc_ids in postings.items()},
             avgdl=sum(doc.doc_length for doc in documents) / max(len(documents), 1),
-            by_chunk_id={key: list(value) for key, value in by_chunk_id.items()},
-            by_parent_chunk_id={key: list(value) for key, value in by_parent_chunk_id.items()},
-            by_original_chunk_id={key: list(value) for key, value in by_original_chunk_id.items()},
-            by_page_section={key: list(value) for key, value in by_page_section.items()},
-            by_page_number={key: list(value) for key, value in by_page_number.items()},
-            by_section_path={key: list(value) for key, value in by_section_path.items()},
-            by_section_title={key: list(value) for key, value in by_section_title.items()},
-            by_chunk_type={key: list(value) for key, value in by_chunk_type.items()},
-            by_subchunk_index={key: list(value) for key, value in by_subchunk_index.items()},
-            by_parent_subchunk={key: list(value) for key, value in by_parent_subchunk.items()},
+            **_copy_lookup_tables(lookup_tables),
             structured_tables=[dict(item) for item in structured_tables],
             table_structure_debug=dict(table_structure_debug),
             retrieval_index_artifact_debug=dict(retrieval_index_artifact_debug),
@@ -1519,7 +1625,6 @@ class CollectionRetrievalIndexProvider:
             fallback_reason="; ".join(fallback_reasons),
             build_source=build_source,
         )
-        return index
 
     def _stale_reason(
         self,
@@ -1527,6 +1632,7 @@ class CollectionRetrievalIndexProvider:
         collection_profile: Optional[CollectionRetrievalProfile],
         index_record: Optional[Dict[str, Any]],
     ) -> str:
+        """返回缓存过期原因；没有缓存或缓存仍有效时返回空串。"""
         if index is None:
             return ""
         expected_index_level = bool(ENHANCED_RETRIEVAL_CONFIG.get("enable_index_level_bm25", True))
@@ -1538,11 +1644,11 @@ class CollectionRetrievalIndexProvider:
         if expected_count is not None and expected_count != index.chunk_count:
             return f"chunk_count_changed:{index.chunk_count}->{expected_count}"
 
-        expected_version = str((index_record or {}).get("active_index_version") or (index_record or {}).get("index_version") or "").strip()
+        expected_version = _record_index_version(index_record).strip()
         if expected_version and index.index_version and expected_version != index.index_version:
             return f"index_version_changed:{index.index_version}->{expected_version}"
 
-        expected_build_id = str((index_record or {}).get("active_build_id") or (index_record or {}).get("build_id") or "").strip()
+        expected_build_id = _record_build_id(index_record).strip()
         if expected_build_id and index.build_id and expected_build_id != index.build_id:
             return f"build_id_changed:{index.build_id}->{expected_build_id}"
         expected_sparse_hash = str((index_record or {}).get("sparse_index_source_hash") or "").strip()
@@ -1556,11 +1662,7 @@ class CollectionRetrievalIndexProvider:
             return "sparse_manifest_changed"
         if index.build_source == "sparse_index_artifact":
             sparse_debug = index.retrieval_index_artifact_debug or {}
-            for field_name, expected_value in (
-                ("tokenizer_version", KEYWORD_TOKENIZER_VERSION),
-                ("field_weights_version", KEYWORD_FIELD_WEIGHTS_VERSION),
-                ("bm25_schema_version", BM25_SCHEMA_VERSION),
-            ):
+            for field_name, expected_value in _SPARSE_SEMANTIC_VERSIONS:
                 cached_value = str(sparse_debug.get(field_name) or "").strip()
                 if cached_value and cached_value != expected_value:
                     # sparse artifact 的语义版本变化会改变 postings 解释方式，缓存必须失效后重新校验 manifest。
@@ -1569,19 +1671,16 @@ class CollectionRetrievalIndexProvider:
 
     @staticmethod
     def _validate_sparse_manifest_versions(manifest: Dict[str, Any]) -> str:
-        # 这些版本决定 token、字段权重和 BM25 结构的含义；任一不一致都不能复用持久化 postings。
-        expected_versions = {
-            "tokenizer_version": KEYWORD_TOKENIZER_VERSION,
-            "field_weights_version": KEYWORD_FIELD_WEIGHTS_VERSION,
-            "bm25_schema_version": BM25_SCHEMA_VERSION,
-        }
-        for field_name, expected_value in expected_versions.items():
+        """逐项比较 manifest 与当前代码的语义版本，返回第一处不一致的原因；全部一致时返回空串。"""
+        # 与 _stale_reason 不同，这里 manifest 缺版本字段也视为不一致，因为无法确认 postings 的含义。
+        for field_name, expected_value in _SPARSE_SEMANTIC_VERSIONS:
             actual_value = str(manifest.get(field_name) or "").strip()
             if actual_value != expected_value:
                 return f"{field_name}_mismatch:{actual_value or 'missing'}->{expected_value}"
         return ""
 
     def _resolve_collection_name(self, collection_name: str) -> str:
+        """向量库支持别名解析时用它规范化名称，保证缓存键与实际 collection 一致。"""
         resolver = getattr(self.vector_store_service, "resolve_collection_name", None)
         if callable(resolver):
             return resolver(collection_name)
@@ -1592,26 +1691,19 @@ class CollectionRetrievalIndexProvider:
         normalized = dict(chunk)
         metadata = dict(normalized.get("metadata", {}) or {})
         chunk_id = normalize_chunk_id(normalized)
-        index_id = str(
-            normalized.get("retrieval_index_id")
-            or normalized.get("index_id")
-            or metadata.get("retrieval_index_id")
-            or metadata.get("index_id")
-            or ""
-        ).strip()
-        index_type = normalize_index_type(
-            normalized.get("retrieval_index_type")
-            or normalized.get("index_type")
-            or metadata.get("retrieval_index_type")
-            or metadata.get("index_type")
-        )
-        index_text = str(
-            normalized.get("retrieval_index_text")
-            or normalized.get("index_text")
-            or metadata.get("retrieval_index_text")
-            or metadata.get("index_text")
-            or ""
-        ).strip()
+
+        def index_field(name: str) -> Any:
+            # 先查顶层的 retrieval_index_<name> / index_<name>，再查 metadata 中的同名字段。
+            return (
+                normalized.get(f"retrieval_index_{name}")
+                or normalized.get(f"index_{name}")
+                or metadata.get(f"retrieval_index_{name}")
+                or metadata.get(f"index_{name}")
+            )
+
+        index_id = str(index_field("id") or "").strip()
+        index_type = normalize_index_type(index_field("type"))
+        index_text = str(index_field("text") or "").strip()
         has_explicit_index = bool(index_id)
 
         if not index_id:
@@ -1623,13 +1715,7 @@ class CollectionRetrievalIndexProvider:
         normalized["retrieval_index_id"] = index_id
         normalized["retrieval_index_type"] = index_type
         normalized["retrieval_index_text"] = index_text
-        normalized["retrieval_index_weight"] = float(
-            normalized.get("retrieval_index_weight")
-            or normalized.get("index_weight")
-            or metadata.get("retrieval_index_weight")
-            or metadata.get("index_weight")
-            or RETRIEVAL_INDEX_WEIGHTS.get(index_type, 1.0)
-        )
+        normalized["retrieval_index_weight"] = float(index_field("weight") or RETRIEVAL_INDEX_WEIGHTS.get(index_type, 1.0))
         normalized["retrieval_index_enabled_routes"] = normalize_enabled_routes(
             normalized.get("retrieval_index_enabled_routes")
             or metadata.get("retrieval_index_enabled_routes")
@@ -1645,10 +1731,8 @@ class CollectionRetrievalIndexProvider:
 
     @staticmethod
     def _retrieval_index_enabled_for_keyword(chunk: Dict[str, Any]) -> bool:
-        routes = normalize_enabled_routes(chunk.get("retrieval_index_enabled_routes"))
-        if not routes:
-            return True
-        return bool(set(routes) & KEYWORD_ROUTE_NAMES)
+        """该索引行是否参与关键词路线（只看 retrieval_index_enabled_routes）。"""
+        return _routes_allow(chunk.get("retrieval_index_enabled_routes"), KEYWORD_ROUTE_NAMES)
 
     def _build_keyword_document_fields(self, chunk: Dict[str, Any], chunk_type: str) -> Dict[str, Any]:
         """构建字段化 keyword document，避免正文、结构字段和图表 OCR 噪声无差别混入索引。"""
@@ -1701,6 +1785,20 @@ class CollectionRetrievalIndexProvider:
                 continue
             field_texts[target_field].append(value)
 
+        document = self._tokenize_fields(field_texts)
+        document["debug"].update(
+            {
+                "skipped_fields": skipped_fields,
+                "has_asset_field": any(name in document["field_token_counts"] for name in ("asset_caption", "asset_aux")),
+            }
+        )
+        return document
+
+    def _tokenize_fields(self, field_texts: Dict[str, List[str]]) -> Dict[str, Any]:
+        """对各字段文本分词，返回字段词频、字段长度、token 来源字段，以及 debug 的公共部分。
+
+        没有任何 token 的字段不出现在结果中。
+        """
         field_token_counts: Dict[str, Counter] = {}
         field_lengths: Dict[str, int] = {}
         token_sources: Dict[str, List[str]] = defaultdict(list)
@@ -1715,7 +1813,6 @@ class CollectionRetrievalIndexProvider:
             field_lengths[field_name] = len(tokens)
             for token in counts:
                 token_sources[token].append(field_name)
-
         return {
             "field_token_counts": field_token_counts,
             "field_lengths": field_lengths,
@@ -1723,8 +1820,6 @@ class CollectionRetrievalIndexProvider:
             "debug": {
                 "field_lengths": dict(field_lengths),
                 "field_weights": dict(KEYWORD_FIELD_WEIGHTS),
-                "skipped_fields": skipped_fields,
-                "has_asset_field": any(field in field_token_counts for field in ("asset_caption", "asset_aux")),
             },
         }
 
@@ -1737,32 +1832,17 @@ class CollectionRetrievalIndexProvider:
     ) -> Dict[str, Any]:
         """把 RetrievalIndex 文本映射到 BM25 字段，命中后仍返回原 chunk payload。"""
         field_name = self._keyword_field_for_retrieval_index(index_type, chunk_type)
-        field_token_counts: Dict[str, Counter] = {}
-        field_lengths: Dict[str, int] = {}
-        token_sources: Dict[str, List[str]] = defaultdict(list)
-
-        tokens = self.tokenizer(index_text)
-        if tokens:
-            counts = Counter(tokens)
-            field_token_counts[field_name] = counts
-            field_lengths[field_name] = len(tokens)
-            for token in counts:
-                token_sources[token].append(field_name)
-
-        return {
-            "field_token_counts": field_token_counts,
-            "field_lengths": field_lengths,
-            "token_sources": {token: list(sources) for token, sources in token_sources.items()},
-            "debug": {
-                "field_lengths": dict(field_lengths),
-                "field_weights": dict(KEYWORD_FIELD_WEIGHTS),
+        document = self._tokenize_fields({field_name: [index_text]})
+        document["debug"].update(
+            {
                 "skipped_fields": {},
                 "has_asset_field": field_name in {"asset_caption", "asset_aux", "table_or_figure"},
                 "retrieval_index_id": str(chunk.get("retrieval_index_id") or ""),
                 "retrieval_index_type": index_type,
                 "retrieval_index_weight": float(chunk.get("retrieval_index_weight", 1.0) or 1.0),
-            },
-        }
+            }
+        )
+        return document
 
     @staticmethod
     def _keyword_field_for_retrieval_index(index_type: str, chunk_type: str) -> str:
@@ -1779,6 +1859,7 @@ class CollectionRetrievalIndexProvider:
 
     @staticmethod
     def _normalize_keyword_field_text(text: str) -> str:
+        """小写并压缩空白，用于字段去重和噪声判断。"""
         return " ".join(str(text or "").strip().lower().split())
 
     @classmethod
@@ -1790,7 +1871,8 @@ class CollectionRetrievalIndexProvider:
         alpha_cjk_count = len([char for char in normalized if char.isalnum() or "\u4e00" <= char <= "\u9fff"])
         if alpha_cjk_count < 3:
             return True
-        if re.search(r"[\ufffd�]", normalized):
+        # 出现 Unicode 替换字符（U+FFFD）说明文本在解码时已经损坏。
+        if "\ufffd" in normalized:
             return True
         symbol_count = len(re.findall(r"[^a-z0-9\u4e00-\u9fff\s_\-./:]", normalized))
         if symbol_count / max(len(normalized), 1) > 0.28:
@@ -1847,26 +1929,31 @@ class CollectionRetrievalIndexProvider:
         normalized_source_type = normalize_sparse_source_type(manifest.get("source_type"))
         debug["sparse_index_dir"] = str(payload.get("artifact_dir") or sparse_index_dir)
         debug["sparse_index_manifest_file"] = str(payload.get("manifest_file") or manifest_file)
-        debug["build_id"] = str(manifest.get("build_id") or "")
-        debug["index_version"] = str(manifest.get("index_version") or "")
+        for key in (
+            "build_id",
+            "index_version",
+            "source_type",
+            "source_file",
+            "source_hash",
+            "backend",
+            "schema_version",
+            "tokenizer_version",
+            "field_weights_version",
+            "bm25_schema_version",
+        ):
+            debug[key] = str(manifest.get(key) or "")
         debug["source_type"] = normalized_source_type
-        debug["source_file"] = str(manifest.get("source_file") or "")
-        debug["source_hash"] = str(manifest.get("source_hash") or "")
-        debug["backend"] = str(manifest.get("backend") or "")
-        debug["schema_version"] = str(manifest.get("schema_version") or "")
-        debug["tokenizer_version"] = str(manifest.get("tokenizer_version") or "")
-        debug["field_weights_version"] = str(manifest.get("field_weights_version") or "")
-        debug["bm25_schema_version"] = str(manifest.get("bm25_schema_version") or "")
         debug["keyword_route_index_source"] = "persistent_sparse_artifact"
         if normalized_source_type not in SPARSE_SOURCE_TYPES:
             debug["reason"] = f"source_type_unsupported:{manifest.get('source_type')}"
             return None, debug
 
-        expected_build_id = str((fallback_record or {}).get("active_build_id") or (fallback_record or {}).get("build_id") or "").strip()
+        # 以下任一校验失败都说明 artifact 不属于当前 active build，交给旧链路现场构建。
+        expected_build_id = _record_build_id(fallback_record).strip()
         if expected_build_id and expected_build_id != str(manifest.get("build_id") or "").strip():
             debug["reason"] = "build_id_mismatch"
             return None, debug
-        expected_index_version = str((fallback_record or {}).get("active_index_version") or (fallback_record or {}).get("index_version") or "").strip()
+        expected_index_version = _record_index_version(fallback_record).strip()
         if expected_index_version and expected_index_version != str(manifest.get("index_version") or "").strip():
             debug["reason"] = "index_version_mismatch"
             return None, debug
@@ -1887,33 +1974,11 @@ class CollectionRetrievalIndexProvider:
             debug["reason"] = "document_count_mismatch"
             return None, debug
 
-        by_chunk_id: Dict[str, List[int]] = defaultdict(list)
-        by_parent_chunk_id: Dict[str, List[int]] = defaultdict(list)
-        by_original_chunk_id: Dict[str, List[int]] = defaultdict(list)
-        by_page_section: Dict[Tuple[str, str], List[int]] = defaultdict(list)
-        by_page_number: Dict[str, List[int]] = defaultdict(list)
-        by_section_path: Dict[str, List[int]] = defaultdict(list)
-        by_section_title: Dict[str, List[int]] = defaultdict(list)
-        by_chunk_type: Dict[str, List[int]] = defaultdict(list)
-        by_subchunk_index: Dict[str, List[int]] = defaultdict(list)
-        by_parent_subchunk: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+        lookup_tables = _new_lookup_tables()
         for doc_id, document in enumerate(documents):
             # lookup 表不单独落盘，加载时按 document.chunk 复建，避免源 chunk 字段和二级索引字段出现两套真相。
             document.doc_id = doc_id
-            self._add_lookup_entries(
-                doc_id=doc_id,
-                chunk=document.chunk,
-                by_chunk_id=by_chunk_id,
-                by_parent_chunk_id=by_parent_chunk_id,
-                by_original_chunk_id=by_original_chunk_id,
-                by_page_section=by_page_section,
-                by_page_number=by_page_number,
-                by_section_path=by_section_path,
-                by_section_title=by_section_title,
-                by_chunk_type=by_chunk_type,
-                by_subchunk_index=by_subchunk_index,
-                by_parent_subchunk=by_parent_subchunk,
-            )
+            self._add_lookup_entries(doc_id, document.chunk, lookup_tables)
 
         token_stats = dict(payload.get("token_stats") or {})
         avgdl = float(token_stats.get("avgdl", manifest.get("avgdl", 0.0)) or 0.0)
@@ -1930,16 +1995,7 @@ class CollectionRetrievalIndexProvider:
             document_frequency=dict(payload.get("document_frequency") or {}),
             postings={token: set(doc_ids) for token, doc_ids in (payload.get("postings") or {}).items()},
             avgdl=avgdl,
-            by_chunk_id={key: list(value) for key, value in by_chunk_id.items()},
-            by_parent_chunk_id={key: list(value) for key, value in by_parent_chunk_id.items()},
-            by_original_chunk_id={key: list(value) for key, value in by_original_chunk_id.items()},
-            by_page_section={key: list(value) for key, value in by_page_section.items()},
-            by_page_number={key: list(value) for key, value in by_page_number.items()},
-            by_section_path={key: list(value) for key, value in by_section_path.items()},
-            by_section_title={key: list(value) for key, value in by_section_title.items()},
-            by_chunk_type={key: list(value) for key, value in by_chunk_type.items()},
-            by_subchunk_index={key: list(value) for key, value in by_subchunk_index.items()},
-            by_parent_subchunk={key: list(value) for key, value in by_parent_subchunk.items()},
+            **_copy_lookup_tables(lookup_tables),
             retrieval_index_artifact_debug=debug,
             cache_hit=False,
             build_time=0.0,
@@ -1957,17 +2013,9 @@ class CollectionRetrievalIndexProvider:
             debug["reason"] = "missing_chunk_file"
             return [], debug
 
-        chunk_path = self._resolve_chunk_file_path(chunk_file)
-        if chunk_path is None:
-            debug["reason"] = "chunk_file_not_found"
-            return [], debug
-
-        try:
-            with open(chunk_path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except Exception as exc:
-            logger.warning("Failed to load structured tables from chunk file %s: %s", chunk_path, exc)
-            debug["reason"] = f"chunk_file_read_failed:{exc}"
+        payload, read_error = self._read_chunk_file(chunk_file, purpose="structured tables")
+        if read_error:
+            debug["reason"] = read_error
             return [], debug
 
         structured_tables = [item for item in (payload.get("structured_tables") or []) if isinstance(item, dict)]
@@ -2015,19 +2063,12 @@ class CollectionRetrievalIndexProvider:
             debug["reason"] = "missing_chunk_file"
             return [], debug
         debug["chunk_file"] = chunk_file
-        chunk_path = self._resolve_chunk_file_path(chunk_file)
-        if chunk_path is None:
-            debug["reason"] = "chunk_file_not_found"
-            return [], debug
-        try:
-            with open(chunk_path, "r", encoding="utf-8") as handle:
-                chunk_payload = json.load(handle)
-        except Exception as exc:
-            logger.warning("Failed to load chunks for retrieval index artifact %s: %s", chunk_file, exc)
-            debug["reason"] = f"chunk_file_read_failed:{exc}"
+        chunk_payload, read_error = self._read_chunk_file(chunk_file, purpose="retrieval index rows")
+        if read_error:
+            debug["reason"] = read_error
             return [], debug
 
-        chunks = chunk_payload.get("chunks") if isinstance(chunk_payload, dict) else []
+        chunks = chunk_payload.get("chunks")
         if not isinstance(chunks, list):
             debug["reason"] = "chunk_file_missing_chunks"
             return [], debug
@@ -2097,20 +2138,12 @@ class CollectionRetrievalIndexProvider:
             return [], debug
         debug["chunk_file"] = chunk_file
 
-        chunk_path = self._resolve_chunk_file_path(chunk_file)
-        if chunk_path is None:
-            debug["reason"] = "chunk_file_not_found"
+        payload, read_error = self._read_chunk_file(chunk_file, purpose="legacy chunk rows")
+        if read_error:
+            debug["reason"] = read_error
             return [], debug
 
-        try:
-            with open(chunk_path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except Exception as exc:
-            logger.warning("Failed to load legacy chunks from chunk file %s: %s", chunk_path, exc)
-            debug["reason"] = f"chunk_file_read_failed:{exc}"
-            return [], debug
-
-        chunks = payload.get("chunks") if isinstance(payload, dict) else []
+        chunks = payload.get("chunks")
         if not isinstance(chunks, list):
             debug["reason"] = "chunk_file_missing_chunks"
             return [], debug
@@ -2178,14 +2211,32 @@ class CollectionRetrievalIndexProvider:
                     return record
         return None
 
-    def _resolve_chunk_file_path(self, chunk_file: str) -> Optional[Path]:
-        return resolve_artifact_file_path(chunk_file)
+    @staticmethod
+    def _read_chunk_file(chunk_file: str, *, purpose: str) -> Tuple[Any, str]:
+        """定位并读取 chunk 文件，返回 (JSON 对象, 失败原因)；成功时失败原因为空串。
+
+        顶层不是 JSON 对象时视为读取失败（chunk_file_not_object），调用方因此可以放心地对结果调用 .get。
+        purpose 只用于日志，说明是哪个加载步骤读取失败。
+        """
+        chunk_path = resolve_artifact_file_path(chunk_file)
+        if chunk_path is None:
+            return None, "chunk_file_not_found"
+        try:
+            payload = _read_json(chunk_path)
+        except Exception as exc:
+            logger.warning("Failed to read chunk file for %s: path=%s error=%s", purpose, chunk_path, exc)
+            return None, f"chunk_file_read_failed:{exc}"
+        if not isinstance(payload, dict):
+            logger.warning("Chunk file for %s is not a JSON object: path=%s", purpose, chunk_path)
+            return None, "chunk_file_not_object"
+        return payload, ""
 
     @staticmethod
     def _resolve_expected_count(
         collection_profile: Optional[CollectionRetrievalProfile],
         index_record: Optional[Dict[str, Any]],
     ) -> Optional[int]:
+        """期望的 chunk 数：数据库记录优先，其次 collection 画像；都没有时返回 None（不参与过期判断）。"""
         for key in ("chunk_count", "active_chunk_count"):
             if index_record and index_record.get(key) not in (None, ""):
                 try:
@@ -2203,81 +2254,50 @@ class CollectionRetrievalIndexProvider:
         index_record: Optional[Dict[str, Any]],
         fallback_count: int,
     ) -> int:
+        """记录的 chunk 数；没有可用记录时用实际读到的数量。"""
         expected = cls._resolve_expected_count(collection_profile, index_record)
         if expected is not None:
             return expected
         return fallback_count
 
     @staticmethod
-    def _add_lookup_entries(
-        *,
-        doc_id: int,
-        chunk: Dict[str, Any],
-        by_chunk_id: Dict[str, List[int]],
-        by_parent_chunk_id: Dict[str, List[int]],
-        by_original_chunk_id: Dict[str, List[int]],
-        by_page_section: Dict[Tuple[str, str], List[int]],
-        by_page_number: Dict[str, List[int]],
-        by_section_path: Dict[str, List[int]],
-        by_section_title: Dict[str, List[int]],
-        by_chunk_type: Dict[str, List[int]],
-        by_subchunk_index: Dict[str, List[int]],
-        by_parent_subchunk: Dict[Tuple[str, str], List[int]],
-    ) -> None:
-        def add(mapping: Dict[Any, List[int]], key: Any) -> None:
+    def _add_lookup_entries(doc_id: int, chunk: Dict[str, Any], tables: Dict[str, Dict[Any, List[int]]]) -> None:
+        """把文档登记到各 lookup 表；空值字段不建键，chunk_type 缺失时按 text 处理。"""
+
+        def add(table_name: str, key: Any) -> None:
             normalized = str(key or "").strip()
             if normalized:
-                mapping[normalized].append(doc_id)
+                tables[table_name][normalized].append(doc_id)
 
-        add(by_chunk_id, chunk.get("chunk_id"))
-        add(by_parent_chunk_id, chunk.get("parent_chunk_id"))
-        add(by_original_chunk_id, chunk.get("original_chunk_id"))
+        add("by_chunk_id", chunk.get("chunk_id"))
+        add("by_parent_chunk_id", chunk.get("parent_chunk_id"))
+        add("by_original_chunk_id", chunk.get("original_chunk_id"))
 
         page_number = str(chunk.get("page_number", "") or "").strip()
         section_path = str(chunk.get("section_path", "") or "").strip()
         section_title = str(chunk.get("section_title", "") or "").strip()
         chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
         subchunk_index = str(chunk.get("subchunk_index", "") or "").strip()
-        add(by_page_number, page_number)
-        add(by_section_path, section_path)
-        add(by_section_title, section_title)
-        add(by_chunk_type, chunk_type)
-        add(by_subchunk_index, subchunk_index)
+        add("by_page_number", page_number)
+        add("by_section_path", section_path)
+        add("by_section_title", section_title)
+        add("by_chunk_type", chunk_type)
+        add("by_subchunk_index", subchunk_index)
         if page_number and section_path:
-            by_page_section[(page_number, section_path.lower())].append(doc_id)
+            tables["by_page_section"][(page_number, section_path.lower())].append(doc_id)
         if chunk.get("parent_chunk_id") not in (None, "") and subchunk_index:
             # parent+subchunk 组合索引用于上下文扩展阶段快速定位 sibling，避免每个 anchor 再全量扫描。
-            by_parent_subchunk[(str(chunk.get("parent_chunk_id")).strip(), subchunk_index)].append(doc_id)
+            tables["by_parent_subchunk"][(str(chunk.get("parent_chunk_id")).strip(), subchunk_index)].append(doc_id)
 
     @staticmethod
     def _clone_index(index: CollectionRetrievalIndex) -> CollectionRetrievalIndex:
-        return CollectionRetrievalIndex(
-            arxiv_id=index.arxiv_id,
-            collection_name=index.collection_name,
-            index_version=index.index_version,
-            chunk_count=index.chunk_count,
-            build_id=index.build_id,
-            chunk_file_hash=index.chunk_file_hash,
-            created_at=index.created_at,
-            documents=index.documents,
+        """复制索引供调用方使用：各张表都复制一份；documents 体积较大，按引用共享（调用方不要修改其中的文档）。"""
+        return replace(
+            index,
             document_frequency=dict(index.document_frequency),
             postings={token: set(doc_ids) for token, doc_ids in index.postings.items()},
-            avgdl=index.avgdl,
-            by_chunk_id={key: list(value) for key, value in index.by_chunk_id.items()},
-            by_parent_chunk_id={key: list(value) for key, value in index.by_parent_chunk_id.items()},
-            by_original_chunk_id={key: list(value) for key, value in index.by_original_chunk_id.items()},
-            by_page_section={key: list(value) for key, value in index.by_page_section.items()},
-            by_page_number={key: list(value) for key, value in index.by_page_number.items()},
-            by_section_path={key: list(value) for key, value in index.by_section_path.items()},
-            by_section_title={key: list(value) for key, value in index.by_section_title.items()},
-            by_chunk_type={key: list(value) for key, value in index.by_chunk_type.items()},
-            by_subchunk_index={key: list(value) for key, value in index.by_subchunk_index.items()},
-            by_parent_subchunk={key: list(value) for key, value in index.by_parent_subchunk.items()},
+            **_copy_lookup_tables({name: getattr(index, name) for name in _LOOKUP_TABLE_NAMES}),
             structured_tables=[dict(item) for item in index.structured_tables],
             table_structure_debug=dict(index.table_structure_debug),
             retrieval_index_artifact_debug=dict(index.retrieval_index_artifact_debug),
-            cache_hit=index.cache_hit,
-            build_time=index.build_time,
-            fallback_reason=index.fallback_reason,
-            build_source=index.build_source,
         )

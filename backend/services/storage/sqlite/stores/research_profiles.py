@@ -33,13 +33,16 @@ class ResearchProfileStore(BaseSqliteStore):
         self.profile_build_job_store = profile_build_job_store
 
     def record_user_profile_event(self, *args, **kwargs):
+        """画像事件写入委托给 ProfileEventStore，本类不直接操作事件表。"""
         return self.profile_event_store.record_user_profile_event(*args, **kwargs)
 
     def update_user_profile_build_job(self, *args, **kwargs):
+        """构建 job 状态更新委托给 ProfileBuildJobStore。"""
         return self.profile_build_job_store.update_user_profile_build_job(*args, **kwargs)
 
     @staticmethod
     def _empty_user_research_profile(user_id: str) -> Dict[str, Any]:
+        """返回结构完整的空画像；读取失败或用户尚无画像时用它兜底，保证调用方无需判空。"""
         return {
             "user_id": user_id,
             "positive_topics": [],
@@ -53,9 +56,8 @@ class ResearchProfileStore(BaseSqliteStore):
             "updated_at": None,
         }
 
-    @classmethod
-    def _empty_profile_projection(cls, user_id: str) -> Dict[str, Any]:
-        return cls._empty_user_research_profile(user_id)
+    # ---- 以下几个方法是 profile_normalization 模块函数的薄封装 ----
+    # 保留成类方法是为了让子类/测试可以按需覆盖某一类字段的归一化规则；真正的实现只有一份。
 
     @staticmethod
     def _normalize_profile_list_value(values: Any, limit: int = 30) -> List[str]:
@@ -342,14 +344,14 @@ class ResearchProfileStore(BaseSqliteStore):
                 )
                 row = cursor.fetchone()
                 if not row:
-                    return self._empty_profile_projection(user_id)
+                    return self._empty_user_research_profile(user_id)
                 profile = self._normalize_profile_projection(user_id, self._deserialize_json_field(row[0]) or {})
                 profile["created_at"] = row[1]
                 profile["updated_at"] = row[2]
                 return profile
         except Exception as e:
             logger.error(f"Error getting manual research profile: {str(e)}")
-            return self._empty_profile_projection(user_id)
+            return self._empty_user_research_profile(user_id)
 
     def get_user_generated_profile(self, user_id: str = DEFAULT_USER_ID) -> Dict[str, Any]:
         try:
@@ -366,7 +368,7 @@ class ResearchProfileStore(BaseSqliteStore):
                 )
                 row = cursor.fetchone()
                 if not row:
-                    return self._empty_profile_projection(user_id)
+                    return self._empty_user_research_profile(user_id)
                 profile = self._normalize_profile_projection(user_id, self._deserialize_json_field(row[0]) or {})
                 profile.update(
                     {
@@ -384,7 +386,7 @@ class ResearchProfileStore(BaseSqliteStore):
                 return profile
         except Exception as e:
             logger.error(f"Error getting generated research profile: {str(e)}")
-            return self._empty_profile_projection(user_id)
+            return self._empty_user_research_profile(user_id)
 
     def get_user_profile_layers(self, user_id: str = DEFAULT_USER_ID) -> Dict[str, Any]:
         return {
@@ -553,7 +555,7 @@ class ResearchProfileStore(BaseSqliteStore):
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                # 鎵嬪姩鐢诲儚鏄敤鎴锋樉寮忔剰鍥剧殑鍞竴鍐欏叆杈圭晫锛屽悗缁噸寤轰笉浼氫慨鏀硅繖寮犺〃銆?
+                # 手动画像是用户显式意图的唯一写入边界，后续重建不会修改这张表。
                 cursor.execute(
                     '''
                     INSERT INTO user_manual_profiles (
@@ -620,7 +622,7 @@ class ResearchProfileStore(BaseSqliteStore):
             previous_values = set(self._normalize_profile_list_value(previous_profile.get(field_name), limit=100))
             next_values = set(self._normalize_profile_list_value(next_profile.get(field_name), limit=100))
             for topic in sorted(next_values - previous_values):
-                # 鎵嬪姩鏂板杩涘叆 manual event锛屽悗缁敱 manual/effective 鍚堝苟灞傚鐞嗭紝涓嶆薄鏌?generated profile銆?
+                # 手动新增进入 manual event，后续由 manual/effective 合并层处理，不污染 generated profile。
                 self.record_user_profile_event(
                     user_id=user_id,
                     event_type=added_event_type,

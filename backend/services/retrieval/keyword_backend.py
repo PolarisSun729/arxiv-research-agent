@@ -1,20 +1,65 @@
-"""Keyword backend abstraction for BM25 retrieval.
+"""关键词（BM25）召回后端。
 
-Provides a lightweight interface to switch between internal_bm25 and bm25s implementations.
+route_retriever 的 keyword 路由通过 ``KeywordBackend`` 抽象在两种实现之间切换：
+
+- ``InternalBM25Backend``：项目内置 BM25，逐候选文档按字段加权打分，能给出逐词得分明细；
+  同时是 bm25s 不可用或运行失败时的兜底实现。
+- ``BM25sBackend``（见 bm25s_backend.py）：基于 bm25s 库的 BM25，整库建索引后批量检索，速度更快。
+
+两种实现只在“单条 query view 怎么召回候选文档”上不同。token 预处理、跨 view 的加权 RRF 融合、
+把 index 级命中聚合回 chunk、结果字段回填和 debug 结构都放在基类 ``KeywordBackend`` 中共用，
+保证切换后端时下游（融合、rerank、trace）看到的输出契约完全一致。
 """
 
 from __future__ import annotations
 
-import logging
-import re
 from abc import ABC, abstractmethod
 from collections import Counter
-from typing import Any, Dict, List
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
-logger = logging.getLogger(__name__)
+from services.retrieval.numeric_utils import min_max_normalize
+from services.retrieval.retrieval_rules import RetrievalRules
+
+# 图表 caption / 图表辅助文本字段；命中这些字段说明证据来自图表而不是正文，下游会据此降权或加标记。
+_ASSET_FIELDS = frozenset({"asset_caption", "asset_aux"})
+
+
+def _route_retriever() -> Any:
+    """延迟导入 RouteRetriever，复用其中的 BM25 打分、噪声检测等静态方法。
+
+    不在模块顶层导入：一是避免 route_retriever ↔ keyword_backend 形成循环依赖；
+    二是测试会从 sys.modules 移除并重新导入 route_retriever，延迟导入能保证拿到的是当前生效的类。
+    """
+    from services.retrieval.route_retriever import RouteRetriever
+
+    return RouteRetriever
+
+
+def _append_unique(items: List[Any], value: Any) -> None:
+    """保持插入顺序地追加去重元素（列表很短，线性查找足够）。"""
+    if value not in items:
+        items.append(value)
+
+
+def _top_fields(matched_fields: Counter, limit: int = 4) -> List[str]:
+    """按命中权重取前 limit 个字段名；权重相同的字段保持首次出现顺序（most_common 是稳定排序）。"""
+    return [field for field, _ in matched_fields.most_common(limit)]
+
+
+def _sort_view_contributions(contributions: Any) -> List[Dict[str, Any]]:
+    """按 RRF 投票、原始 BM25 分降序排列各 query view 的贡献，让 debug 先展示主导命中的 view。"""
+    return sorted(
+        list(contributions or []),
+        key=lambda item: (
+            float(item.get("rrf_vote", 0.0) or 0.0),
+            float(item.get("raw_score", 0.0) or 0.0),
+        ),
+        reverse=True,
+    )
 
 
 def build_keyword_matched_terms(term_traces: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """把 term trace 字典展开成命中词列表，按单词得分降序、idf 次之，便于解释“哪些词贡献最大”。"""
     matched = [
         {
             "token": str(trace.get("token", "")),
@@ -30,7 +75,12 @@ def build_keyword_matched_terms(term_traces: Dict[str, Dict[str, Any]]) -> List[
 
 
 def aggregate_keyword_index_hits_to_chunks(ranked: List[tuple], retrieval_index: Any) -> List[tuple]:
-    """把 retrieval-index 级 BM25 命中聚合回 chunk，保留每个 chunk 的 top index 命中供 debug/rerank 使用。"""
+    """把 retrieval-index 级 BM25 命中聚合回 chunk，保留每个 chunk 的 top index 命中供 debug/rerank 使用。
+
+    BM25 的“文档”是 retrieval index（同一 chunk 可能有正文、标题、摘要等多个 index），
+    但 route 对外输出的是 chunk 候选；不聚合的话同一 chunk 会重复占用多个候选名额。
+    聚合规则：RRF 融合分相加、原始 BM25 分取最大、命中字段与 term trace 合并。
+    """
     grouped: Dict[str, Dict[str, Any]] = {}
     for doc_id, payload in ranked:
         if doc_id < 0 or doc_id >= len(retrieval_index.documents):
@@ -40,6 +90,7 @@ def aggregate_keyword_index_hits_to_chunks(ranked: List[tuple], retrieval_index:
         group = grouped.setdefault(
             chunk_key,
             {
+                # 以该 chunk 第一个（即融合分最高的）index 命中作为代表文档，后续回填 chunk 字段时使用。
                 "representative_doc_id": doc_id,
                 "fusion_score": 0.0,
                 "best_raw_score": 0.0,
@@ -57,11 +108,9 @@ def aggregate_keyword_index_hits_to_chunks(ranked: List[tuple], retrieval_index:
             float(payload.get("best_raw_score", 0.0) or 0.0),
         )
         group["matched_fields"].update(payload.get("matched_fields", Counter()))
-        if doc_id not in group["matched_doc_ids"]:
-            group["matched_doc_ids"].append(doc_id)
+        _append_unique(group["matched_doc_ids"], doc_id)
         for source in payload.get("query_sources", []) or []:
-            if source not in group["query_sources"]:
-                group["query_sources"].append(source)
+            _append_unique(group["query_sources"], source)
 
         for contribution in payload.get("view_contributions", []) or []:
             contribution_row = dict(contribution)
@@ -81,6 +130,7 @@ def aggregate_keyword_index_hits_to_chunks(ranked: List[tuple], retrieval_index:
             ),
             reverse=True,
         )
+        # 只透传最强的 3 个 index 命中，避免 debug/rerank 载荷随 index 数量膨胀。
         group["top_matched_indexes"] = group["top_matched_indexes"][:3]
         group["matched_index_count"] = len(group.get("matched_doc_ids", []) or [])
         representative_doc_id = int(group.pop("representative_doc_id"))
@@ -106,21 +156,19 @@ def keyword_chunk_key_for_document(document: Any, fallback_doc_id: int) -> str:
         normalized = str(value or "").strip()
         if normalized:
             return f"{key}:{normalized}"
+    # 没有任何稳定 ID 时把 doc_id 也拼进键里：宁可不合并，也不能把不同 chunk 误合并成一个。
     content = str(chunk.get("content") or metadata.get("content") or "")[:120]
     return f"doc:{fallback_doc_id}:{content}"
 
 
 def build_keyword_matched_index_entry(document: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """把单个 index 命中的 BM25 证据压成可透传的 debug/rerank 明细。"""
+    """把单个 index 命中的 BM25 证据压成可透传的 debug/rerank 明细。
+
+    ``index_*`` 与 ``matched_index_*`` 两组键取值相同：前者是 chunk 契约字段，
+    后者是 rerank / trace 读取的命中字段，两边都保留以兼容各自的读取方。
+    """
     terms = build_keyword_matched_terms(payload.get("term_traces", {}) or {})
-    contributions = sorted(
-        list(payload.get("view_contributions", []) or []),
-        key=lambda item: (
-            float(item.get("rrf_vote", 0.0) or 0.0),
-            float(item.get("raw_score", 0.0) or 0.0),
-        ),
-        reverse=True,
-    )[:4]
+    contributions = _sort_view_contributions(payload.get("view_contributions"))[:4]
     fusion_score = float(payload.get("fusion_score", 0.0) or 0.0)
     return {
         "index_id": str(getattr(document, "retrieval_index_id", "") or ""),
@@ -133,7 +181,7 @@ def build_keyword_matched_index_entry(document: Any, payload: Dict[str, Any]) ->
         "matched_index_score": fusion_score,
         "bm25_fusion_score": fusion_score,
         "best_raw_bm25_score": float(payload.get("best_raw_score", 0.0) or 0.0),
-        "matched_fields": [field for field, _ in payload.get("matched_fields", Counter()).most_common(4)],
+        "matched_fields": _top_fields(payload.get("matched_fields", Counter())),
         "matched_terms": terms[:8],
         "query_sources": list(payload.get("query_sources", []) or []),
         "view_contributions": contributions,
@@ -159,15 +207,202 @@ def _merge_keyword_term_traces(target: Dict[str, Dict[str, Any]], source: Dict[s
             float(term.get("best_term_score", 0.0) or 0.0),
         )
         for field_name in term.get("fields", []) or []:
-            if field_name not in trace["fields"]:
-                trace["fields"].append(field_name)
+            _append_unique(trace["fields"], field_name)
         for source_name in term.get("query_sources", []) or []:
-            if source_name not in trace["query_sources"]:
-                trace["query_sources"].append(source_name)
+            _append_unique(trace["query_sources"], source_name)
+
+
+def _record_term_trace(term_traces: Dict[str, Dict[str, Any]], term: Dict[str, Any], source: str) -> None:
+    """把单条 query view 的一个命中词记入 index 级 term trace（同词跨 view 取最大得分）。
+
+    term 来自后端的逐词明细：``{"token", "idf", "term_score", "fields"}``。
+    idf 恒为非负数，因此初值用 0.0 再取 max 即可得到真实 idf。
+    """
+    token = term["token"]
+    trace = term_traces.setdefault(
+        token,
+        {
+            "token": token,
+            "idf": 0.0,
+            "best_term_score": 0.0,
+            "fields": [],
+            "query_sources": [],
+        },
+    )
+    trace["idf"] = max(float(trace["idf"]), float(term.get("idf", 0.0)))
+    trace["best_term_score"] = max(float(trace["best_term_score"]), float(term.get("term_score", 0.0)))
+    for field in term.get("fields", []):
+        _append_unique(trace["fields"], field)
+    _append_unique(trace["query_sources"], source)
+
+
+class _PreparedQueryView(NamedTuple):
+    """预处理完成、确定要参与检索的 query view。"""
+
+    view_id: Any
+    source: Any
+    query: str
+    weight: float
+    # 过滤停用词后的原始 token（只用于 debug 展示）。
+    tokens: List[str]
+    # 同义词/缩写扩展后的 token，真正用于 BM25 检索。
+    expanded_tokens: List[str]
+
+
+class _KeywordRunState:
+    """一次关键词检索中跨 query view 累积的中间状态。
+
+    每条 query view 先各自召回候选，再用加权 RRF 投票融合：
+    ``rrf_vote = view_weight / (rrf_k + rank)``，同一 index 文档的投票累加为 fusion_score。
+    这样多条 view 都命中的文档排名靠前，而单条 view 的原始 BM25 分量纲不会互相干扰。
+    """
+
+    def __init__(self, *, rrf_k: int) -> None:
+        self.rrf_k = rrf_k
+        # doc_id（retrieval index 文档下标）-> 融合中的命中条目。
+        self.aggregated: Dict[int, Dict[str, Any]] = {}
+        self.per_query_debug: List[Dict[str, Any]] = []
+        self.original_query_tokens: List[str] = []
+        self.expanded_query_tokens: List[str] = []
+
+    def record_view(
+        self,
+        view: _PreparedQueryView,
+        rows: List[Dict[str, Any]],
+        *,
+        top_k: int,
+        retrieval_index: Any,
+        error: Optional[str] = None,
+    ) -> None:
+        """记录一条 query view 的召回结果，并把前 top_k 个候选投票进融合池。
+
+        rows 是后端统一格式的候选（按原始分降序）：
+        ``{"doc_id", "raw_score", "matched_fields": Counter, "term_details": [...]}``。
+        归一化分数基于该 view 的全部候选计算，只有前 top_k 个参与 RRF 投票。
+        """
+        for token in view.tokens:
+            _append_unique(self.original_query_tokens, token)
+        for token in view.expanded_tokens:
+            _append_unique(self.expanded_query_tokens, token)
+
+        if not rows:
+            self.per_query_debug.append(self._view_debug_row(view, candidate_count=0, top_hits=[], error=error))
+            return
+
+        normalized_scores = min_max_normalize([float(row["raw_score"]) for row in rows])
+        top_hits: List[Dict[str, Any]] = []
+        for rank, (row, normalized_score) in enumerate(zip(rows[:top_k], normalized_scores), start=1):
+            doc_id = row["doc_id"]
+            raw_score = float(row["raw_score"])
+            normalized_score = float(normalized_score)
+            rrf_vote = view.weight * (1.0 / (self.rrf_k + rank))
+            term_details = row.get("term_details", []) or []
+
+            entry = self.aggregated.setdefault(
+                doc_id,
+                {
+                    "fusion_score": 0.0,
+                    "best_raw_score": 0.0,
+                    "matched_fields": Counter(),
+                    "view_contributions": [],
+                    "term_traces": {},
+                    "query_sources": [],
+                },
+            )
+            entry["fusion_score"] += rrf_vote
+            entry["best_raw_score"] = max(float(entry["best_raw_score"]), raw_score)
+            entry["matched_fields"].update(row["matched_fields"])
+            _append_unique(entry["query_sources"], view.source)
+            for term in term_details:
+                _record_term_trace(entry["term_traces"], term, view.source)
+
+            entry["view_contributions"].append(
+                {
+                    "view_id": view.view_id,
+                    "source": view.source,
+                    "query": view.query,
+                    "rank": rank,
+                    "weight": view.weight,
+                    "raw_score": raw_score,
+                    "normalized_score": normalized_score,
+                    "rrf_vote": float(rrf_vote),
+                    # contribution_score 只用于 debug 对比“按归一化分加权”的效果，排序仍以 RRF 投票为准。
+                    "contribution_score": float(view.weight * normalized_score),
+                    "matched_fields": _top_fields(row["matched_fields"]),
+                    "matched_terms": [term["token"] for term in term_details[:6]],
+                }
+            )
+
+            document = retrieval_index.documents[doc_id]
+            top_hits.append(
+                {
+                    "chunk_id": str(document.chunk.get("chunk_id", "") or ""),
+                    "retrieval_index_id": document.retrieval_index_id,
+                    "retrieval_index_type": document.retrieval_index_type,
+                    "rank": rank,
+                    "raw_score": raw_score,
+                    "normalized_score": normalized_score,
+                    "rrf_vote": float(rrf_vote),
+                    "matched_fields": _top_fields(row["matched_fields"]),
+                }
+            )
+
+        self.per_query_debug.append(self._view_debug_row(view, candidate_count=len(rows), top_hits=top_hits))
+
+    @staticmethod
+    def _view_debug_row(
+        view: _PreparedQueryView,
+        *,
+        candidate_count: int,
+        top_hits: List[Dict[str, Any]],
+        error: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """生成单条 query view 的 debug 行；后端查询报错时额外带上 error。"""
+        row = {
+            "view_id": view.view_id,
+            "query": view.query,
+            "source": view.source,
+            "weight": view.weight,
+            "query_tokens": view.tokens,
+            "expanded_tokens": view.expanded_tokens,
+            "candidate_count": candidate_count,
+            "top_hits": top_hits,
+        }
+        if error is not None:
+            row["error"] = error
+        return row
+
+    def ranked_chunks(self, retrieval_index: Any) -> List[tuple]:
+        """按融合分（并列看最佳原始分）排序 index 命中，再聚合成 chunk 级候选。"""
+        ranked = [
+            (doc_id, payload)
+            for doc_id, payload in self.aggregated.items()
+            if float(payload.get("fusion_score", 0.0) or 0.0) > 0
+        ]
+        ranked.sort(
+            key=lambda item: (
+                float(item[1].get("fusion_score", 0.0) or 0.0),
+                float(item[1].get("best_raw_score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        return aggregate_keyword_index_hits_to_chunks(ranked, retrieval_index)
+
+    def token_debug(self) -> Dict[str, Any]:
+        """汇总所有 view 的 query token，并标记同义词扩展是否真正引入了新词。"""
+        return {
+            "query_tokens": self.original_query_tokens,
+            "expanded_tokens": self.expanded_query_tokens,
+            "query_expansion_applied": bool(set(self.expanded_query_tokens) - set(self.original_query_tokens)),
+        }
 
 
 class KeywordBackendResult:
-    """Standardized result from keyword backend."""
+    """关键词后端的标准化返回值。
+
+    fallback_reason 非空表示该后端无法给出可信结果（如 bm25s 未安装、执行异常），
+    route_retriever 会据此降级到 InternalBM25Backend 重新检索。
+    """
 
     def __init__(
         self,
@@ -184,38 +419,11 @@ class KeywordBackendResult:
 
 
 class KeywordBackend(ABC):
-    """Abstract base for keyword retrieval backends."""
+    """关键词召回后端基类。
 
-    @abstractmethod
-    def retrieve(
-        self,
-        *,
-        query_views: List[Dict[str, Any]],
-        top_k: int,
-        query_profile: Any,
-        retrieval_index: Any,
-    ) -> KeywordBackendResult:
-        """Execute keyword retrieval for given query views.
-
-        Args:
-            query_views: List of query view dicts with 'query', 'source', 'weight', etc.
-            top_k: Maximum number of results to return
-            query_profile: QueryProfile containing intent and query metadata
-            retrieval_index: CollectionRetrievalIndex with documents and postings
-
-        Returns:
-            KeywordBackendResult with retrieved chunks and debug info
-        """
-        pass
-
-    @abstractmethod
-    def backend_name(self) -> str:
-        """Return the backend identifier."""
-        pass
-
-
-class InternalBM25Backend(KeywordBackend):
-    """Internal BM25 implementation using project's existing tokenizer and scorer."""
+    子类只负责“单条 query view → 候选文档行”的召回，并在 ``retrieve`` 中按以下顺序调用共用流程：
+    ``_new_run_state`` → 逐条 ``_prepare_query_view`` 后召回并 ``record_view`` → ``_finalize_keyword_retrieval``。
+    """
 
     def __init__(
         self,
@@ -225,14 +433,17 @@ class InternalBM25Backend(KeywordBackend):
         structural_bonus_builder: Any,
         fusion_service: Any,
     ) -> None:
+        # 提供分词、停用词过滤、同义词扩展、乱码 token 判断（通常是 QueryPlanner）。
         self.query_tools = query_tools
+        # 计算 keyword 路由的基础置信度（通常是 RetrievalRules.route_confidence）。
         self.route_confidence_builder = route_confidence_builder
+        # 计算 chunk 的结构加分（通常是 RetrievalRules.compute_structural_bonus）。
         self.structural_bonus_builder = structural_bonus_builder
+        # 两个后端目前都不直接使用 fusion_service（跨路由融合在 route_retriever 之后完成），
+        # 保留该参数是为了与 RouteRetriever 的构造方式及现有调用方保持一致。
         self.fusion_service = fusion_service
 
-    def backend_name(self) -> str:
-        return "internal_bm25"
-
+    @abstractmethod
     def retrieve(
         self,
         *,
@@ -241,247 +452,100 @@ class InternalBM25Backend(KeywordBackend):
         query_profile: Any,
         retrieval_index: Any,
     ) -> KeywordBackendResult:
-        """Use existing internal BM25 implementation from route_retriever."""
-        # Import locally to avoid circular dependency
+        """对一组 query view 执行关键词检索。
 
-        # This is the existing keyword_retrieve logic extracted
-        payload = self._internal_keyword_retrieve(
-            query_views=query_views,
-            top_k=top_k,
-            query_profile=query_profile,
-            retrieval_index=retrieval_index,
+        Args:
+            query_views: query view 列表，每项包含 query / source / weight / view_id 等字段。
+            top_k: 每条 view 参与融合的候选数，同时也是最终返回的 chunk 数上限。
+            query_profile: QueryProfile，提供意图、原始查询等信息。
+            retrieval_index: CollectionRetrievalIndex，包含文档、倒排表和统计量。
+
+        Returns:
+            KeywordBackendResult：回填好路由字段的 chunk 列表和 debug 信息。
+        """
+
+    @abstractmethod
+    def backend_name(self) -> str:
+        """返回后端标识（写入 debug，并用于降级原因说明）。"""
+
+    def _new_run_state(self) -> _KeywordRunState:
+        """创建一次检索的累积状态；keyword 路由使用较小的 RRF 常数放大少量高质量 view 的区分度。"""
+        return _KeywordRunState(rrf_k=_route_retriever().keyword_rrf_k())
+
+    def _prepare_query_view(self, query_view: Dict[str, Any]) -> Optional[_PreparedQueryView]:
+        """分词、过滤并扩展一条 query view；没有有效 token 或权重不为正时返回 None（跳过该 view）。"""
+        query = str(query_view.get("query", "") or "")
+        raw_tokens = self.query_tools.tokenize_for_keyword_search(query)
+        tokens = self._filter_keyword_query_tokens(raw_tokens)
+        if not tokens:
+            return None
+        query_weight = float(query_view.get("weight", 0.0) or 0.0)
+        if query_weight <= 0:
+            return None
+        return _PreparedQueryView(
+            view_id=query_view["view_id"],
+            source=query_view["source"],
+            query=query,
+            weight=query_weight,
+            tokens=tokens,
+            expanded_tokens=self._expand_keyword_query_tokens(tokens),
         )
 
-        return KeywordBackendResult(
-            results=payload["results"],
-            debug=payload["debug"],
-            backend_name=self.backend_name(),
-        )
-
-    def _internal_keyword_retrieve(
+    def _finalize_keyword_retrieval(
         self,
+        state: _KeywordRunState,
+        *,
         query_views: List[Dict[str, Any]],
         top_k: int,
         query_profile: Any,
         retrieval_index: Any,
-    ) -> Dict[str, Any]:
-        """Internal BM25 retrieval logic (extracted from RouteRetriever.keyword_retrieve)."""
-        from services.retrieval.route_retriever import RouteRetriever
+        backend_debug: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """把融合池聚合成 chunk 候选，回填结果字段并组装 debug。
 
-        if not retrieval_index.documents:
-            return {"results": [], "debug": retrieval_index.to_keyword_debug(0, full_scan_used=False)}
-
-        aggregated: Dict[int, Dict[str, Any]] = {}
-        per_query_debug: List[Dict[str, Any]] = []
-        original_query_tokens: List[str] = []
-        expanded_query_tokens: List[str] = []
-        field_weights = self._keyword_field_weights_for_query(query_profile)
-
-        for query_view in query_views:
-            query = str(query_view.get("query", "") or "")
-            raw_tokens = self.query_tools.tokenize_for_keyword_search(query)
-            tokens = self._filter_keyword_query_tokens(raw_tokens)
-            if not tokens:
-                continue
-            query_weight = float(query_view.get("weight", 0.0) or 0.0)
-            if query_weight <= 0:
-                continue
-
-            expanded_tokens = self._expand_keyword_query_tokens(tokens)
-            for token in tokens:
-                if token not in original_query_tokens:
-                    original_query_tokens.append(token)
-            for token in expanded_tokens:
-                if token not in expanded_query_tokens:
-                    expanded_query_tokens.append(token)
-
-            token_counter = Counter(expanded_tokens)
-            candidate_doc_ids = set()
-            for token in token_counter:
-                candidate_doc_ids.update(retrieval_index.postings.get(token, set()))
-
-            query_candidate_rows: List[Dict[str, Any]] = []
-            for doc_id in candidate_doc_ids:
-                document = retrieval_index.documents[doc_id]
-                doc_field_weights = self._keyword_field_weights_for_document(
-                    field_weights, document.chunk, query_profile
-                )
-                doc_counts, doc_length, match_fields, token_field_hits = RouteRetriever.weight_keyword_document_fields(
-                    document.field_token_counts or {"body": document.token_counts},
-                    token_counter,
-                    doc_field_weights,
-                )
-                if not doc_counts:
-                    continue
-
-                bm25_detail = RouteRetriever.bm25_score_detailed(
-                    token_counter,
-                    doc_counts,
-                    retrieval_index.document_frequency,
-                    len(retrieval_index.documents),
-                    retrieval_index.avgdl,
-                    document.content_prefix,
-                    doc_length=doc_length or document.doc_length,
-                    token_field_hits=token_field_hits,
-                )
-                raw_score = bm25_detail["score"]
-                if raw_score <= 0:
-                    continue
-
-                query_candidate_rows.append(
-                    {
-                        "doc_id": doc_id,
-                        "raw_score": float(raw_score),
-                        "matched_fields": Counter(match_fields),
-                        "term_details": bm25_detail["term_details"],
-                    }
-                )
-
-            query_candidate_rows.sort(key=lambda item: item["raw_score"], reverse=True)
-            if not query_candidate_rows:
-                per_query_debug.append(
-                    {
-                        "view_id": query_view["view_id"],
-                        "query": query,
-                        "source": query_view["source"],
-                        "weight": query_weight,
-                        "query_tokens": tokens,
-                        "expanded_tokens": expanded_tokens,
-                        "candidate_count": 0,
-                        "top_hits": [],
-                    }
-                )
-                continue
-
-            normalized_scores = RouteRetriever.normalize_scores(
-                [float(item["raw_score"]) for item in query_candidate_rows]
-            )
-            per_query_top_rows: List[Dict[str, Any]] = []
-            keyword_rrf_k = RouteRetriever.keyword_rrf_k()
-
-            for rank, row in enumerate(query_candidate_rows[:top_k], start=1):
-                normalized_score = float(normalized_scores[rank - 1]) if rank - 1 < len(normalized_scores) else 0.0
-                rrf_vote = query_weight * (1.0 / (keyword_rrf_k + rank))
-                contribution_score = query_weight * normalized_score
-
-                entry = aggregated.setdefault(
-                    row["doc_id"],
-                    {
-                        "fusion_score": 0.0,
-                        "best_raw_score": 0.0,
-                        "matched_fields": Counter(),
-                        "view_contributions": [],
-                        "term_traces": {},
-                        "query_sources": [],
-                    },
-                )
-                entry["fusion_score"] += rrf_vote
-                entry["best_raw_score"] = max(float(entry["best_raw_score"]), float(row["raw_score"]))
-                entry["matched_fields"].update(row["matched_fields"])
-                if query_view["source"] not in entry["query_sources"]:
-                    entry["query_sources"].append(query_view["source"])
-
-                for term in row.get("term_details", []):
-                    token = term["token"]
-                    trace = entry["term_traces"].setdefault(
-                        token,
-                        {
-                            "token": token,
-                            "idf": float(term["idf"]),
-                            "best_term_score": 0.0,
-                            "fields": [],
-                            "query_sources": [],
-                        },
-                    )
-                    trace["idf"] = max(float(trace["idf"]), float(term["idf"]))
-                    trace["best_term_score"] = max(float(trace["best_term_score"]), float(term["term_score"]))
-                    for field in term.get("fields", []):
-                        if field not in trace["fields"]:
-                            trace["fields"].append(field)
-                    if query_view["source"] not in trace["query_sources"]:
-                        trace["query_sources"].append(query_view["source"])
-
-                entry["view_contributions"].append(
-                    {
-                        "view_id": query_view["view_id"],
-                        "source": query_view["source"],
-                        "query": query,
-                        "rank": rank,
-                        "weight": query_weight,
-                        "raw_score": float(row["raw_score"]),
-                        "normalized_score": normalized_score,
-                        "rrf_vote": float(rrf_vote),
-                        "contribution_score": float(contribution_score),
-                        "matched_fields": [field for field, _ in row["matched_fields"].most_common(4)],
-                        "matched_terms": [term["token"] for term in row.get("term_details", [])[:6]],
-                    }
-                )
-
-                per_query_top_rows.append(
-                    {
-                        "chunk_id": str(retrieval_index.documents[row["doc_id"]].chunk.get("chunk_id", "") or ""),
-                        "retrieval_index_id": retrieval_index.documents[row["doc_id"]].retrieval_index_id,
-                        "retrieval_index_type": retrieval_index.documents[row["doc_id"]].retrieval_index_type,
-                        "rank": rank,
-                        "raw_score": float(row["raw_score"]),
-                        "normalized_score": normalized_score,
-                        "rrf_vote": float(rrf_vote),
-                        "matched_fields": [field for field, _ in row["matched_fields"].most_common(4)],
-                    }
-                )
-
-            per_query_debug.append(
-                {
-                    "view_id": query_view["view_id"],
-                    "query": query,
-                    "source": query_view["source"],
-                    "weight": query_weight,
-                    "query_tokens": tokens,
-                    "expanded_tokens": expanded_tokens,
-                    "candidate_count": len(query_candidate_rows),
-                    "top_hits": per_query_top_rows,
-                }
-            )
-
-        ranked = [
-            (doc_id, payload)
-            for doc_id, payload in aggregated.items()
-            if float(payload.get("fusion_score", 0.0) or 0.0) > 0
-        ]
-        ranked.sort(
-            key=lambda item: (
-                float(item[1].get("fusion_score", 0.0) or 0.0),
-                float(item[1].get("best_raw_score", 0.0) or 0.0),
-            ),
-            reverse=True,
-        )
-        # BM25 文档是 retrieval index，但 route 对外仍输出 chunk；这里集中聚合，避免同一 chunk 重复进入候选集。
-        ranked = aggregate_keyword_index_hits_to_chunks(ranked, retrieval_index)
-
+        backend_debug 是后端特有的诊断字段（如 bm25s 的索引规模、内置 BM25 的字段权重），
+        紧跟在索引统计信息之后写入 debug。
+        """
+        ranked = state.ranked_chunks(retrieval_index)
+        debug: Dict[str, Any] = {
+            **retrieval_index.to_keyword_debug(len(ranked), full_scan_used=False),
+            **(backend_debug or {}),
+            **state.token_debug(),
+            "query_contributions": state.per_query_debug,
+            "keyword_fusion_strategy": "weighted_rrf",
+        }
         if not ranked:
-            return {
-                "results": [],
-                "debug": {
-                    **retrieval_index.to_keyword_debug(0, full_scan_used=False),
-                    "query_tokens": original_query_tokens,
-                    "expanded_tokens": expanded_query_tokens,
-                    "query_expansion_applied": bool(set(expanded_query_tokens) - set(original_query_tokens)),
-                    "matched_chunks": [],
-                    "field_weights": field_weights,
-                    "query_contributions": per_query_debug,
-                    "keyword_fusion_strategy": "weighted_rrf",
-                },
-            }
+            debug["matched_chunks"] = []
+            return [], debug
 
-        normalized_scores = RouteRetriever.normalize_scores(
-            [float(payload.get("fusion_score", 0.0) or 0.0) for _, payload in ranked]
+        base_route_confidence = self._compute_base_confidence(query_views, query_profile)
+        results = self._build_keyword_results(
+            ranked=ranked,
+            top_k=top_k,
+            base_route_confidence=base_route_confidence,
+            query_profile=query_profile,
+            retrieval_index=retrieval_index,
         )
-        base_route_confidence = self.route_confidence_builder(
-            "keyword",
-            query_profile,
-            " | ".join([row["query"] for row in query_views]) if query_views else query_profile.original_query,
-            route_queries=[row["query"] for row in query_views] or [query_profile.keyword_query],
-            intent_profile=query_profile.intent_profile,
+        debug["keyword_rrf_k"] = state.rrf_k
+        debug["base_route_confidence"] = float(base_route_confidence)
+        debug["matched_chunks"] = self._build_matched_chunks_debug(ranked[:top_k], retrieval_index, query_profile)
+        return results, debug
+
+    def _build_keyword_results(
+        self,
+        *,
+        ranked: List[tuple],
+        top_k: int,
+        base_route_confidence: float,
+        query_profile: Any,
+        retrieval_index: Any,
+    ) -> List[Dict[str, Any]]:
+        """把前 top_k 个 chunk 候选回填成 keyword 路由的标准 chunk 结果。
+
+        归一化分数基于全部候选计算再截断，保证 top_k 变化时同一 chunk 的归一化分不变。
+        """
+        normalized_scores = min_max_normalize(
+            [float(payload.get("fusion_score", 0.0) or 0.0) for _, payload in ranked]
         )
 
         results: List[Dict[str, Any]] = []
@@ -494,21 +558,10 @@ class InternalBM25Backend(KeywordBackend):
             best_raw_score = float(payload.get("best_raw_score", 0.0) or 0.0)
             top_matched_indexes = list(payload.get("top_matched_indexes", []) or [])
             top_index = top_matched_indexes[0] if top_matched_indexes else build_keyword_matched_index_entry(document, payload)
-            query_contributions = sorted(
-                list(payload.get("view_contributions", [])),
-                key=lambda item: (
-                    float(item.get("rrf_vote", 0.0) or 0.0),
-                    float(item.get("raw_score", 0.0) or 0.0),
-                ),
-                reverse=True,
-            )
-            match_fields = payload.get("matched_fields", Counter())
-            main_fields = [field for field, _ in match_fields.most_common(4)]
-            matched_terms = self._build_matched_terms(payload.get("term_traces", {}))
+            query_contributions = _sort_view_contributions(payload.get("view_contributions"))
+            main_fields = _top_fields(payload.get("matched_fields", Counter()))
+            matched_terms = build_keyword_matched_terms(payload.get("term_traces", {}))
             query_sources = list(payload.get("query_sources", []))
-
-            # Import locally to avoid circular dependency
-            from services.retrieval.route_retriever import RouteRetriever
 
             noise_flags = self._detect_keyword_noise_flags(
                 matched_terms=matched_terms,
@@ -531,9 +584,7 @@ class InternalBM25Backend(KeywordBackend):
             chunk["route_confidence"] = float(route_confidence)
             chunk["structural_bonus"] = float(self.structural_bonus_builder(chunk, query_profile))
             chunk["keyword_match_fields"] = main_fields
-            chunk["keyword_hit_asset_field"] = any(
-                field in {"asset_caption", "asset_aux"} for field in main_fields
-            )
+            chunk["keyword_hit_asset_field"] = any(field in _ASSET_FIELDS for field in main_fields)
             chunk["keyword_query_contributions"] = query_contributions
             chunk["keyword_best_raw_bm25_score"] = best_raw_score
             chunk["bm25_raw_score"] = best_raw_score
@@ -542,7 +593,7 @@ class InternalBM25Backend(KeywordBackend):
             chunk["keyword_query_sources"] = query_sources
             chunk["keyword_noise_flags"] = noise_flags
             chunk["keyword_base_route_confidence"] = float(base_route_confidence)
-            # keyword 命中的是 RetrievalIndex；聚合后把最强 index 作为主命中，同时保留 top 列表给 rerank/debug。
+            # 对外仍是 chunk 候选；index 字段只说明本次 BM25 最强的命中入口，top 列表留给 rerank/debug。
             chunk["retrieval_index_id"] = top_index.get("index_id", document.retrieval_index_id)
             chunk["retrieval_index_type"] = top_index.get("index_type", document.retrieval_index_type)
             chunk["retrieval_index_text"] = top_index.get("index_text", document.retrieval_index_text)
@@ -561,75 +612,245 @@ class InternalBM25Backend(KeywordBackend):
             chunk["keyword_matched_index_count"] = int(payload.get("matched_index_count", len(top_matched_indexes)) or 0)
             results.append(chunk)
 
-        return {
-            "results": results,
-            "debug": {
-                **retrieval_index.to_keyword_debug(len(ranked), full_scan_used=False),
-                "query_tokens": original_query_tokens,
-                "expanded_tokens": expanded_query_tokens,
-                "query_expansion_applied": bool(set(expanded_query_tokens) - set(original_query_tokens)),
-                "field_weights": field_weights,
-                "query_contributions": per_query_debug,
-                "keyword_fusion_strategy": "weighted_rrf",
-                "keyword_rrf_k": RouteRetriever.keyword_rrf_k(),
-                "base_route_confidence": float(base_route_confidence),
-                "matched_chunks": [
-                    {
-                        "chunk_id": str(retrieval_index.documents[doc_id].chunk.get("chunk_id", "") or ""),
-                        "retrieval_index_id": (payload.get("top_matched_indexes") or [{}])[0].get(
-                            "matched_index_id",
-                            retrieval_index.documents[doc_id].retrieval_index_id,
-                        ),
-                        "retrieval_index_type": (payload.get("top_matched_indexes") or [{}])[0].get(
-                            "matched_index_type",
-                            retrieval_index.documents[doc_id].retrieval_index_type,
-                        ),
-                        "keyword_fusion_score": float(payload.get("fusion_score", 0.0) or 0.0),
-                        "best_raw_bm25_score": float(payload.get("best_raw_score", 0.0) or 0.0),
-                        "matched_fields": [field for field, _ in payload.get("matched_fields", Counter()).most_common(4)],
-                        "matched_terms": self._build_matched_terms(payload.get("term_traces", {})),
-                        "query_sources": list(payload.get("query_sources", [])),
-                        "matched_index_count": int(payload.get("matched_index_count", 0) or 0),
-                        "top_matched_indexes": list(payload.get("top_matched_indexes", []) or []),
-                        "noise_flags": self._detect_keyword_noise_flags(
-                            matched_terms=self._build_matched_terms(payload.get("term_traces", {})),
-                            matched_fields=[
-                                field for field, _ in payload.get("matched_fields", Counter()).most_common(4)
-                            ],
-                            query_profile=query_profile,
-                            chunk=retrieval_index.documents[doc_id].chunk,
-                        ),
-                        "hit_asset_field": any(
-                            field in {"asset_caption", "asset_aux"}
-                            for field, _ in payload.get("matched_fields", Counter()).most_common(4)
-                        ),
-                        "view_contributions": sorted(
-                            list(payload.get("view_contributions", [])),
-                            key=lambda item: (
-                                float(item.get("rrf_vote", 0.0) or 0.0),
-                                float(item.get("raw_score", 0.0) or 0.0),
-                            ),
-                            reverse=True,
-                        )[:4],
-                    }
-                    for doc_id, payload in ranked[:top_k]
-                ],
-            },
-        }
+        return results
+
+    def _compute_base_confidence(self, query_views: List[Dict[str, Any]], query_profile: Any) -> float:
+        """计算 keyword 路由的基础置信度；没有 query view 时退回原始查询和关键词查询。"""
+        return self.route_confidence_builder(
+            "keyword",
+            query_profile,
+            " | ".join([row["query"] for row in query_views]) if query_views else query_profile.original_query,
+            route_queries=[row["query"] for row in query_views] or [query_profile.keyword_query],
+            intent_profile=query_profile.intent_profile,
+        )
+
+    def _build_matched_chunks_debug(
+        self, ranked: List[tuple], retrieval_index: Any, query_profile: Any
+    ) -> List[Dict[str, Any]]:
+        """生成 debug.matched_chunks：逐个 chunk 说明融合分、命中词/字段、噪声标记和主导 view。
+
+        这里重新构造命中词等对象而不复用结果 chunk 中的同名字段，
+        避免下游修改结果 chunk 时连带改掉 debug 快照。
+        """
+        matched_chunks = []
+        for doc_id, payload in ranked:
+            document = retrieval_index.documents[doc_id]
+            matched_terms = build_keyword_matched_terms(payload.get("term_traces", {}))
+            main_fields = _top_fields(payload.get("matched_fields", Counter()))
+            top_index = (payload.get("top_matched_indexes") or [{}])[0]
+
+            matched_chunks.append(
+                {
+                    "chunk_id": str(document.chunk.get("chunk_id", "") or ""),
+                    "retrieval_index_id": top_index.get("matched_index_id", document.retrieval_index_id),
+                    "retrieval_index_type": top_index.get("matched_index_type", document.retrieval_index_type),
+                    "keyword_fusion_score": float(payload.get("fusion_score", 0.0) or 0.0),
+                    "best_raw_bm25_score": float(payload.get("best_raw_score", 0.0) or 0.0),
+                    "matched_fields": main_fields,
+                    "matched_terms": matched_terms,
+                    "query_sources": list(payload.get("query_sources", [])),
+                    "matched_index_count": int(payload.get("matched_index_count", 0) or 0),
+                    "top_matched_indexes": list(payload.get("top_matched_indexes", []) or []),
+                    "noise_flags": self._detect_keyword_noise_flags(
+                        matched_terms=matched_terms,
+                        matched_fields=main_fields,
+                        query_profile=query_profile,
+                        chunk=document.chunk,
+                    ),
+                    "hit_asset_field": any(field in _ASSET_FIELDS for field in main_fields),
+                    "view_contributions": _sort_view_contributions(payload.get("view_contributions"))[:4],
+                }
+            )
+        return matched_chunks
+
+    @staticmethod
+    def _build_matched_terms(term_traces: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """兼容旧调用名，等价于模块函数 build_keyword_matched_terms。"""
+        return build_keyword_matched_terms(term_traces)
 
     def _expand_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
+        """调用 query_tools 做同义词/缩写扩展；query_tools 未提供该能力时原样返回。"""
         expander = getattr(self.query_tools, "expand_keyword_query_tokens", None)
         if callable(expander):
             return expander(tokens)
         return tokens
 
     def _filter_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
+        """调用 query_tools 过滤停用词、保留关键词（limit 设为 token 数，即只过滤不截断）。"""
         extractor = getattr(self.query_tools, "extract_query_keywords", None)
         if callable(extractor):
             return extractor(tokens, limit=max(len(tokens), 1))
         return tokens
 
+    def _detect_keyword_noise_flags(
+        self,
+        *,
+        matched_terms: List[Dict[str, Any]],
+        matched_fields: List[str],
+        query_profile: Any,
+        chunk: Dict[str, Any],
+    ) -> List[str]:
+        """检测关键词命中噪声（无有效命中词、只命中低 IDF 泛词、乱码词、只命中图表字段等），规则复用 RouteRetriever。"""
+        return _route_retriever().detect_keyword_noise_flags(
+            matched_terms=matched_terms,
+            matched_fields=matched_fields,
+            query_profile=query_profile,
+            chunk=chunk,
+            is_informative_token=self._is_informative_token,
+        )
+
+    def _adjust_keyword_route_confidence(
+        self,
+        base_confidence: float,
+        *,
+        matched_terms: List[Dict[str, Any]],
+        noise_flags: List[str],
+        query_profile: Any,
+    ) -> float:
+        """按意图、最高 IDF 和噪声标记调整基础置信度，规则复用 RouteRetriever。"""
+        return _route_retriever().adjust_keyword_route_confidence(
+            base_confidence,
+            matched_terms=matched_terms,
+            noise_flags=noise_flags,
+            query_profile=query_profile,
+        )
+
+    def _is_informative_token(self, token: str) -> bool:
+        """判断 token 是否有信息量；优先使用注入的 query_tools 规则，缺失时直接用 RetrievalRules 的同一套规则。"""
+        checker = getattr(self.query_tools, "is_informative_keyword_token", None)
+        if not callable(checker):
+            checker = RetrievalRules.is_informative_keyword_token
+        return bool(checker(token))
+
+
+class InternalBM25Backend(KeywordBackend):
+    """内置 BM25：用倒排表找候选，逐文档按字段加权计算 BM25 并给出逐词得分明细。
+
+    也是 bm25s 不可用或执行失败时 route_retriever 的兜底后端。
+    """
+
+    def backend_name(self) -> str:
+        """返回后端标识。"""
+        return "internal_bm25"
+
+    def retrieve(
+        self,
+        *,
+        query_views: List[Dict[str, Any]],
+        top_k: int,
+        query_profile: Any,
+        retrieval_index: Any,
+    ) -> KeywordBackendResult:
+        """执行内置 BM25 检索并包装成统一的后端结果。"""
+        payload = self._internal_keyword_retrieve(
+            query_views=query_views,
+            top_k=top_k,
+            query_profile=query_profile,
+            retrieval_index=retrieval_index,
+        )
+        return KeywordBackendResult(
+            results=payload["results"],
+            debug=payload["debug"],
+            backend_name=self.backend_name(),
+        )
+
+    def _internal_keyword_retrieve(
+        self,
+        query_views: List[Dict[str, Any]],
+        top_k: int,
+        query_profile: Any,
+        retrieval_index: Any,
+    ) -> Dict[str, Any]:
+        """内置 BM25 主流程：逐 view 打分召回 → 加权 RRF 融合 → 聚合回 chunk → 回填结果字段。
+
+        返回 ``{"results": [...], "debug": {...}}``（测试会直接调用本方法检查中间结构）。
+        """
+        if not retrieval_index.documents:
+            return {"results": [], "debug": retrieval_index.to_keyword_debug(0, full_scan_used=False)}
+
+        field_weights = self._keyword_field_weights_for_query(query_profile)
+        state = self._new_run_state()
+        for query_view in query_views:
+            view = self._prepare_query_view(query_view)
+            if view is None:
+                continue
+            rows = self._score_candidates(
+                view.expanded_tokens,
+                field_weights=field_weights,
+                query_profile=query_profile,
+                retrieval_index=retrieval_index,
+            )
+            state.record_view(view, rows, top_k=top_k, retrieval_index=retrieval_index)
+
+        results, debug = self._finalize_keyword_retrieval(
+            state,
+            query_views=query_views,
+            top_k=top_k,
+            query_profile=query_profile,
+            retrieval_index=retrieval_index,
+            backend_debug={"field_weights": field_weights},
+        )
+        return {"results": results, "debug": debug}
+
+    def _score_candidates(
+        self,
+        query_tokens: List[str],
+        *,
+        field_weights: Dict[str, float],
+        query_profile: Any,
+        retrieval_index: Any,
+    ) -> List[Dict[str, Any]]:
+        """用倒排表找出含任一 query token 的文档，逐个按字段加权计算 BM25，返回按原始分降序的候选。
+
+        只对倒排表命中的文档打分，不做全量扫描；BM25 分不为正的文档直接丢弃。
+        """
+        route_retriever = _route_retriever()
+        token_counter = Counter(query_tokens)
+        candidate_doc_ids = set()
+        for token in token_counter:
+            candidate_doc_ids.update(retrieval_index.postings.get(token, set()))
+
+        rows: List[Dict[str, Any]] = []
+        for doc_id in candidate_doc_ids:
+            document = retrieval_index.documents[doc_id]
+            doc_field_weights = self._keyword_field_weights_for_document(field_weights, document.chunk, query_profile)
+            doc_counts, doc_length, match_fields, token_field_hits = route_retriever.weight_keyword_document_fields(
+                document.field_token_counts or {"body": document.token_counts},
+                token_counter,
+                doc_field_weights,
+            )
+            if not doc_counts:
+                continue
+
+            bm25_detail = route_retriever.bm25_score_detailed(
+                token_counter,
+                doc_counts,
+                retrieval_index.document_frequency,
+                len(retrieval_index.documents),
+                retrieval_index.avgdl,
+                document.content_prefix,
+                doc_length=doc_length or document.doc_length,
+                token_field_hits=token_field_hits,
+            )
+            raw_score = bm25_detail["score"]
+            if raw_score <= 0:
+                continue
+
+            rows.append(
+                {
+                    "doc_id": doc_id,
+                    "raw_score": float(raw_score),
+                    "matched_fields": Counter(match_fields),
+                    "term_details": bm25_detail["term_details"],
+                }
+            )
+
+        rows.sort(key=lambda item: item["raw_score"], reverse=True)
+        return rows
+
     def _keyword_field_weights_for_query(self, query_profile: Any) -> Dict[str, float]:
+        """按查询意图调整字段权重：图表类问题放大图表 caption/辅助文本，其他问题压低以免图表噪声抢排名。"""
+        # 延迟导入：测试会重新导入 retrieval_index，这里需要读取当前生效的权重表。
         from services.retrieval.retrieval_index import KEYWORD_FIELD_WEIGHTS
 
         weights = dict(KEYWORD_FIELD_WEIGHTS)
@@ -649,6 +870,11 @@ class InternalBM25Backend(KeywordBackend):
         chunk: Dict[str, Any],
         query_profile: Any,
     ) -> Dict[str, float]:
+        """在查询级权重基础上做文档级调整。
+
+        - 非图表问题命中图表 chunk 时，整体压低各字段权重，避免图表 chunk 靠正文碰词挤进前排；
+        - 再乘以 retrieval index 自身的权重（如摘要 index 权重低于正文）。
+        """
         weights = dict(base_weights)
         chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
         is_asset_chunk = chunk_type in {"figure", "table"}
@@ -670,62 +896,6 @@ class InternalBM25Backend(KeywordBackend):
         return weights
 
     @staticmethod
-    def _build_matched_terms(term_traces: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return build_keyword_matched_terms(term_traces)
-
-    def _detect_keyword_noise_flags(
-        self,
-        *,
-        matched_terms: List[Dict[str, Any]],
-        matched_fields: List[str],
-        query_profile: Any,
-        chunk: Dict[str, Any],
-    ) -> List[str]:
-        """Detect noise flags in keyword matches."""
-        from services.retrieval.route_retriever import RouteRetriever
-
-        return RouteRetriever.detect_keyword_noise_flags(
-            matched_terms=matched_terms,
-            matched_fields=matched_fields,
-            query_profile=query_profile,
-            chunk=chunk,
-            is_informative_token=self._is_informative_token,
-        )
-
-    def _adjust_keyword_route_confidence(
-        self,
-        base_confidence: float,
-        *,
-        matched_terms: List[Dict[str, Any]],
-        noise_flags: List[str],
-        query_profile: Any,
-    ) -> float:
-        """Adjust keyword route confidence based on match quality."""
-        from services.retrieval.route_retriever import RouteRetriever
-
-        return RouteRetriever.adjust_keyword_route_confidence(
-            base_confidence,
-            matched_terms=matched_terms,
-            noise_flags=noise_flags,
-            query_profile=query_profile,
-        )
-
-    @staticmethod
     def _query_main_intent(query_profile: Any) -> str:
-        """返回意图服务已经确认的正式 intent。"""
-        intent_profile = query_profile.intent_profile
-        return str(getattr(intent_profile, "main_intent", "other") or "other").strip().lower()
-
-    def _is_informative_token(self, token: str) -> bool:
-        """Check if token is informative (not garbled)."""
-        checker = getattr(self.query_tools, "is_informative_keyword_token", None)
-        if callable(checker):
-            return bool(checker(token))
-        normalized = str(token or "").strip().lower()
-        if len(normalized) <= 1:
-            return False
-        if re.search(r"[��]", normalized):
-            return False
-        if re.search(r"(.)\1{4,}", normalized):
-            return False
-        return True
+        """返回意图服务已经确认的正式 intent（小写，缺失为 other），与 RouteRetriever 共用同一实现。"""
+        return _route_retriever().query_main_intent(query_profile)

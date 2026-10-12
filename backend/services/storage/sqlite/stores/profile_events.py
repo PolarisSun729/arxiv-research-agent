@@ -7,9 +7,12 @@ from services.storage.sqlite.shared import (
     PROFILE_EXTRACTOR_VERSION,
     PROFILE_NORMALIZER_VERSION,
     logger,
+    sql_placeholders,
 )
 
 
+# 各类事件对画像的默认影响强度：正数表示兴趣增强，负数表示排斥；
+# 调用方显式传入 action_strength 时以调用方为准。
 PROFILE_EVENT_STRENGTHS = {
     "liked": 1.0,
     "disliked": -0.7,
@@ -26,6 +29,7 @@ PROFILE_EVENT_STRENGTHS = {
     "manual_style_updated": 0.4,
 }
 
+# 历史/前端动作名到标准事件类型的映射，保证同一语义的事件共用一个 event_type 与去重键。
 PROFILE_EVENT_ACTION_ALIASES = {
     "like": "liked",
     "liked": "liked",
@@ -62,12 +66,11 @@ class ProfileEventStore(BaseSqliteStore):
         normalized_types = [self._normalize_profile_event_type(item) for item in event_types if str(item or "").strip()]
         if not normalized_types:
             return
-        placeholders = ", ".join("?" for _ in normalized_types)
         conn.execute(
             f'''
             UPDATE user_profile_events
             SET include_in_profile = 0, profile_dirty = 1
-            WHERE user_id = ? AND arxiv_id = ? AND event_type IN ({placeholders})
+            WHERE user_id = ? AND arxiv_id = ? AND event_type IN ({sql_placeholders(normalized_types)})
             ''',
             [user_id, arxiv_id, *normalized_types],
         )
@@ -83,6 +86,33 @@ class ProfileEventStore(BaseSqliteStore):
             action_type=f"{normalized_removed}_removed",
             arxiv_id=arxiv_id,
             metadata={"removed_event_type": normalized_removed},
+            include_in_profile=True,
+            conn=conn,
+        )
+
+    def _retract_note_profile_events(self, conn, user_id: str, note_id: str, arxiv_id: Optional[str]) -> None:
+        """笔记被删除或取消“纳入画像”时，停用它的 note_saved 事件并写入 note_saved_removed 事件。
+
+        按 note_id 而不是 arxiv_id 停用：同一论文下可能有多条笔记，按论文停用会误伤其他笔记。
+        停用后的事件不再计入 dirty 计数，因此需要额外写一条低权重删除事件来触发画像重建。
+        """
+        conn.execute(
+            '''
+            UPDATE user_profile_events
+            SET include_in_profile = 0, profile_dirty = 1
+            WHERE user_id = ? AND note_id = ? AND event_type = 'note_saved'
+            ''',
+            (user_id, note_id),
+        )
+        self.record_user_profile_event(
+            user_id=user_id,
+            event_type="note_saved_removed",
+            source_type="paper_note_removal",
+            source_id=note_id,
+            action_type="note_saved_removed",
+            arxiv_id=arxiv_id,
+            note_id=note_id,
+            metadata={"removed_event_type": "note_saved"},
             include_in_profile=True,
             conn=conn,
         )
@@ -106,6 +136,14 @@ class ProfileEventStore(BaseSqliteStore):
         dedupe_key: Optional[str] = None,
         conn=None,
     ) -> str:
+        """写入（或按去重键覆盖）一条画像事件，返回本次生成的 event_id。
+
+        - event_type 缺省时使用 action_type，并统一经过别名归一化；
+        - 同一 (user_id, dedupe_key) 已存在时覆盖强度、元数据并重新标记为 dirty，
+          使画像构建能重新消费它；
+        - 传入 conn 时复用外层事务且不提交；写入失败只记日志，不向业务动作抛出异常。
+        注意：发生去重覆盖时，表中保留的是旧行的 event_id，返回值仅代表本次尝试的 ID。
+        """
         event_id = str(uuid.uuid4())
         normalized_event_type = self._normalize_profile_event_type(event_type or action_type)
         normalized_source = str(source or source_type or "unknown").strip() or "unknown"
@@ -123,6 +161,7 @@ class ProfileEventStore(BaseSqliteStore):
             source_id=resolved_source_id,
             metadata=normalized_metadata,
         )
+
         def _write_event(connection) -> None:
             connection.execute(
                 '''
@@ -181,6 +220,7 @@ class ProfileEventStore(BaseSqliteStore):
 
     @staticmethod
     def _normalize_profile_event_type(value: Any) -> str:
+        """事件类型归一化：小写、连字符转下划线，再经别名表映射；空值回落为 unknown。"""
         normalized = str(value or "").strip().lower()
         normalized = normalized.replace("-", "_")
         return PROFILE_EVENT_ACTION_ALIASES.get(normalized, normalized or "unknown")
@@ -195,6 +235,11 @@ class ProfileEventStore(BaseSqliteStore):
         source_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
+        """生成事件去重键：同一对象上的同类事件只保留一条，重复操作只刷新而不累积。
+
+        优先级：手动主题按 topic 去重 → 风格设置全局唯一 → 笔记 → 论文 → 会话 → source_id；
+        都没有时使用随机 UUID，相当于不去重。
+        """
         if event_type.startswith("manual_topic_"):
             topic = str((metadata or {}).get("topic") or "").strip().lower()
             return f"{event_type}:topic:{topic}" if topic else f"{event_type}:{source_id or 'manual'}"
@@ -220,12 +265,12 @@ class ProfileEventStore(BaseSqliteStore):
         until: Optional[str] = None,
         limit: int = 500,
     ) -> List[Dict[str, Any]]:
+        """按条件列出用户画像事件（按创建时间倒序）；查询失败时返回空列表。"""
         filters = ["user_id = ?"]
         values: List[Any] = [user_id]
         normalized_types = [self._normalize_profile_event_type(item) for item in (event_types or []) if str(item or "").strip()]
         if normalized_types:
-            placeholders = ", ".join("?" for _ in normalized_types)
-            filters.append(f"event_type IN ({placeholders})")
+            filters.append(f"event_type IN ({sql_placeholders(normalized_types)})")
             values.extend(normalized_types)
         if not include_consumed:
             filters.append("consumed_by_job_id IS NULL")
@@ -284,17 +329,17 @@ class ProfileEventStore(BaseSqliteStore):
             return []
 
     def mark_user_profile_events_consumed(self, user_id: str, job_id: str, event_ids: List[str]) -> None:
+        """把画像构建已消费的事件标记为 consumed 并清除 dirty 标记；失败只记日志。"""
         normalized_event_ids = [str(item or "").strip() for item in event_ids if str(item or "").strip()]
         if not normalized_event_ids:
             return
-        placeholders = ", ".join("?" for _ in normalized_event_ids)
         try:
             with self._get_connection() as conn:
                 conn.execute(
                     f'''
                     UPDATE user_profile_events
                     SET consumed_by_job_id = ?, consumed_at = CURRENT_TIMESTAMP, profile_dirty = 0
-                    WHERE user_id = ? AND event_id IN ({placeholders})
+                    WHERE user_id = ? AND event_id IN ({sql_placeholders(normalized_event_ids)})
                     ''',
                     [job_id, user_id, *normalized_event_ids],
                 )
@@ -343,6 +388,7 @@ class ProfileEventStore(BaseSqliteStore):
             return None
 
     def get_latest_user_signal_timestamp(self, user_id: str = DEFAULT_USER_ID) -> Optional[str]:
+        """返回用户所有画像相关信号的最新时间；联合查询失败时退回只看显式偏好表。"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()

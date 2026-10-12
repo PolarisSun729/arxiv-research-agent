@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from services.retrieval.contracts import legacy_body_index_id
+from services.retrieval.numeric_utils import first_float, min_max_normalize
 from services.retrieval.retrieval_index import RETRIEVAL_INDEX_WEIGHTS
 
 
 class IndexHitAggregator:
-    """将 index-level 命中聚合为 chunk-level candidate，保持下游 RRF/rerank/context 仍按 chunk 工作。"""
+    """将 index-level 命中聚合为 chunk-level candidate，保持下游 RRF/rerank/context 仍按 chunk 工作。
+
+    一个 chunk 可能通过多个 index（正文、标题、表格摘要等）被同一路由命中多次；
+    聚合时取加权分最高的 index 作为代表，并保留前 max_matched_indexes 个命中供 trace 解释。
+    """
 
     def __init__(
         self,
@@ -26,6 +32,11 @@ class IndexHitAggregator:
         route_name: str,
         top_k: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        """把一条路由的 index 级命中聚合成 chunk 级候选，并按首次命中名次排序、截断、归一化分数。
+
+        排序以 best_rank（该 chunk 最早出现的命中名次）为主，保持路由原有的相对顺序；
+        同名次时再按路由分和原始 index 分倒序。
+        """
         if not hits:
             return []
 
@@ -54,6 +65,7 @@ class IndexHitAggregator:
             )
             for entry in index_entries:
                 index_id = str(entry.get("matched_index_id") or entry.get("index_id") or "")
+                # 同一 index 被多条子查询重复命中时只记一次，避免命中数虚高。
                 if index_id and index_id in group["matched_index_ids"]:
                     continue
                 if index_id:
@@ -68,6 +80,7 @@ class IndexHitAggregator:
                 source_query = str(entry.get("source_query") or hit.get("source_query") or "").strip()
                 if source_query and source_query not in group["source_queries"]:
                     group["source_queries"].append(source_query)
+                # 加权分更高者成为代表命中；分数相同时保留名次更靠前的那条。
                 if (
                     weighted_score > float(group["best_weighted_score"])
                     or (
@@ -125,13 +138,14 @@ class IndexHitAggregator:
             )
         )
         limited = candidates[:top_k] if top_k is not None and top_k > 0 else candidates
-        normalized_scores = self._normalize_scores([float(item.get("route_score", 0.0) or 0.0) for item in limited])
+        normalized_scores = min_max_normalize([float(item.get("route_score", 0.0) or 0.0) for item in limited])
         for rank, (item, normalized_score) in enumerate(zip(limited, normalized_scores), start=1):
             item["route_rank"] = rank
             item["normalized_route_score"] = float(normalized_score)
         return limited
 
     def _matched_indexes_for_hit(self, hit: Dict[str, Any], *, route_name: str) -> List[Dict[str, Any]]:
+        """取出命中里携带的 matched_indexes；没有时把命中本身视为一个 index 条目。"""
         raw_entries = [row for row in (hit.get("matched_indexes") or []) if isinstance(row, dict)]
         if raw_entries:
             return [self._normalize_index_entry(hit, row, route_name=route_name) for row in raw_entries]
@@ -144,6 +158,7 @@ class IndexHitAggregator:
         *,
         route_name: str,
     ) -> Dict[str, Any]:
+        """把 index 条目补齐为统一结构：entry 字段优先、hit 字段兜底，并计算 index 类型加权后的分数。"""
         index_id = str(
             entry.get("matched_index_id")
             or entry.get("index_id")
@@ -171,11 +186,12 @@ class IndexHitAggregator:
         if not index_id:
             chunk_ref = hit.get("chunk_id") or hit.get("parent_chunk_id") or hit.get("original_chunk_id") or "unknown"
             # 旧 chunk-level 命中没有 index 字段时合成 body index，保持聚合输出字段完整。
-            index_id = f"{chunk_ref}:body:legacy"
+            index_id = legacy_body_index_id(chunk_ref)
             index_type = "body"
             index_text = str(hit.get("content") or hit.get("text") or "")
 
-        raw_score = self._score_value(
+        # 不同路由把原始分写在不同字段里（向量分、BM25 融合分等），按优先级取第一个有效值。
+        raw_score = first_float(
             entry.get("matched_index_score"),
             entry.get("bm25_fusion_score"),
             entry.get("best_raw_bm25_score"),
@@ -216,6 +232,7 @@ class IndexHitAggregator:
 
     @staticmethod
     def _apply_best_index_aliases(candidate: Dict[str, Any], best_index: Dict[str, Any]) -> None:
+        """把代表 index 的字段同步写到候选顶层（index_* / retrieval_index_* / matched_index_* 三套别名）。"""
         candidate["index_id"] = best_index.get("index_id", "")
         candidate["index_type"] = best_index.get("index_type", "")
         candidate["index_text"] = best_index.get("index_text", "")
@@ -231,6 +248,7 @@ class IndexHitAggregator:
 
     @staticmethod
     def _chunk_key(hit: Dict[str, Any], *, fallback_index: int) -> str:
+        """生成 chunk 聚合键：优先用非 0 的 chunk 编号；都缺失时用来源+页码+顺序+命中名次拼出唯一键。"""
         for key in ("chunk_id", "parent_chunk_id", "original_chunk_id"):
             value = str(hit.get(key, "") or "").strip()
             if value and value != "0":
@@ -244,25 +262,3 @@ class IndexHitAggregator:
                 str(fallback_index),
             ]
         )
-
-    @staticmethod
-    def _score_value(*values: Any) -> float:
-        for value in values:
-            if value is None or value == "":
-                continue
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
-        return 0.0
-
-    @staticmethod
-    def _normalize_scores(scores: List[float]) -> List[float]:
-        if not scores:
-            return []
-        min_score = min(scores)
-        max_score = max(scores)
-        if min_score == max_score:
-            return [1.0 for _ in scores]
-        scale = max_score - min_score
-        return [(score - min_score) / scale for score in scores]

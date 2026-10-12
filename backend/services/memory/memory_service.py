@@ -970,10 +970,12 @@ class MemoryService:
                     recent_actions.append({"arxiv_id": arxiv_id, "action_type": event_type, "paper": enriched_paper, "_profile_event": event})
                 continue
             if event_type == "note_saved":
-                note_id = str(event.get("note_id") or event.get("source_id") or "").strip()
-                note = self.paper_note_store.get_paper_note(note_id, user_id=user_id) if note_id else None
-                if note:
-                    notes.append({**note, "_profile_event": event})
+                note_id = str(event.get("note_id") or "").strip()
+                if note_id:
+                    # 笔记已删除或已取消纳入画像时跳过：这类残留事件可能来自撤销逻辑上线前的历史数据。
+                    note = self.paper_note_store.get_paper_note(note_id, user_id=user_id)
+                    if note and note.get("include_in_profile"):
+                        notes.append({**note, "_profile_event": event})
                 elif paper:
                     recent_actions.append({"arxiv_id": arxiv_id, "action_type": "note_saved", "paper": enriched_paper, "_profile_event": event})
 

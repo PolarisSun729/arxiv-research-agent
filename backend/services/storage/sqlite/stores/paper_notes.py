@@ -6,6 +6,24 @@ from services.storage.sqlite.shared import DEFAULT_USER_ID, PAPER_NOTE_TYPES, lo
 from services.storage.sqlite.stores.profile_events import ProfileEventStore
 
 
+# 笔记的标准读取列；_row_to_paper_note 按这里的顺序取下标。
+_PAPER_NOTE_COLUMNS = (
+    "note_id, user_id, arxiv_id, session_id, source_message_id, title, content, "
+    "note_type, source_chunk_ids, tags, include_in_profile, created_at, updated_at"
+)
+
+
+def _normalize_note_type(note_type: Any) -> str:
+    """笔记类型归一化：小写去空白，不在 PAPER_NOTE_TYPES 白名单中的值一律回落为 custom。"""
+    normalized = str(note_type or "custom").strip().lower() or "custom"
+    return normalized if normalized in PAPER_NOTE_TYPES else "custom"
+
+
+def _clean_str_list(values: Optional[List[Any]]) -> List[str]:
+    """把列表元素转成去空白字符串并丢弃空串，用于 tags 与 source_chunk_ids。"""
+    return [str(item).strip() for item in (values or []) if str(item).strip()]
+
+
 class PaperNoteStore(BaseSqliteStore):
     """paper_notes 存储；只有明确纳入画像的笔记才通过事件 store 进入长期证据流。"""
 
@@ -14,9 +32,11 @@ class PaperNoteStore(BaseSqliteStore):
         self.profile_event_store = profile_event_store
 
     def record_user_profile_event(self, *args, **kwargs):
+        """转发到画像事件 store；保留该方法便于测试替换，也让调用点不必关心事件 store 的存在。"""
         return self.profile_event_store.record_user_profile_event(*args, **kwargs)
 
     def _row_to_paper_note(self, row: Any) -> Dict[str, Any]:
+        """把 paper_notes 行映射为对外字典；JSON 列反序列化，空值回落为空串/空列表。"""
         return {
             'note_id': row[0],
             'user_id': row[1],
@@ -48,16 +68,14 @@ class PaperNoteStore(BaseSqliteStore):
         include_in_profile: bool = False,
         note_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
+        """新建一条论文笔记并返回完整记录；include_in_profile=True 时在同一事务内写画像事件。"""
         try:
-            normalized_note_type = str(note_type or "custom").strip().lower() or "custom"
-            if normalized_note_type not in PAPER_NOTE_TYPES:
-                normalized_note_type = "custom"
-
+            normalized_note_type = _normalize_note_type(note_type)
             normalized_note_id = str(note_id or uuid.uuid4())
             normalized_title = str(title or "").strip()
             normalized_content = str(content or "").strip()
-            normalized_tags = [str(item).strip() for item in (tags or []) if str(item).strip()]
-            normalized_chunk_ids = [str(item).strip() for item in (source_chunk_ids or []) if str(item).strip()]
+            normalized_tags = _clean_str_list(tags)
+            normalized_chunk_ids = _clean_str_list(source_chunk_ids)
 
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -109,13 +127,13 @@ class PaperNoteStore(BaseSqliteStore):
             return None
 
     def get_paper_note(self, note_id: str, user_id: str = DEFAULT_USER_ID) -> Optional[Dict[str, Any]]:
+        """按 (note_id, user_id) 读取笔记；同时匹配 user_id，防止跨用户读取。"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    '''
-                    SELECT note_id, user_id, arxiv_id, session_id, source_message_id, title, content,
-                           note_type, source_chunk_ids, tags, include_in_profile, created_at, updated_at
+                    f'''
+                    SELECT {_PAPER_NOTE_COLUMNS}
                     FROM paper_notes
                     WHERE note_id = ? AND user_id = ?
                     ''',
@@ -134,32 +152,25 @@ class PaperNoteStore(BaseSqliteStore):
         user_id: str = DEFAULT_USER_ID,
         note_type: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        """列出用户在某篇论文下的笔记（可按类型过滤），按更新时间倒序。"""
+        filters = ["arxiv_id = ?", "user_id = ?"]
+        values: List[Any] = [arxiv_id, user_id]
+        if note_type:
+            # 过滤时只做大小写/空白归一化，不回落 custom：查询未知类型应返回空列表而不是全部 custom 笔记。
+            filters.append("note_type = ?")
+            values.append(str(note_type or "").strip().lower())
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                if note_type:
-                    normalized_note_type = str(note_type or "").strip().lower()
-                    cursor.execute(
-                        '''
-                        SELECT note_id, user_id, arxiv_id, session_id, source_message_id, title, content,
-                               note_type, source_chunk_ids, tags, include_in_profile, created_at, updated_at
-                        FROM paper_notes
-                        WHERE arxiv_id = ? AND user_id = ? AND note_type = ?
-                        ORDER BY updated_at DESC, created_at DESC
-                        ''',
-                        (arxiv_id, user_id, normalized_note_type),
-                    )
-                else:
-                    cursor.execute(
-                        '''
-                        SELECT note_id, user_id, arxiv_id, session_id, source_message_id, title, content,
-                               note_type, source_chunk_ids, tags, include_in_profile, created_at, updated_at
-                        FROM paper_notes
-                        WHERE arxiv_id = ? AND user_id = ?
-                        ORDER BY updated_at DESC, created_at DESC
-                        ''',
-                        (arxiv_id, user_id),
-                    )
+                cursor.execute(
+                    f'''
+                    SELECT {_PAPER_NOTE_COLUMNS}
+                    FROM paper_notes
+                    WHERE {' AND '.join(filters)}
+                    ORDER BY updated_at DESC, created_at DESC
+                    ''',
+                    values,
+                )
                 return [self._row_to_paper_note(row) for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"Error listing paper notes: {str(e)}")
@@ -171,9 +182,8 @@ class PaperNoteStore(BaseSqliteStore):
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    '''
-                    SELECT note_id, user_id, arxiv_id, session_id, source_message_id, title, content,
-                           note_type, source_chunk_ids, tags, include_in_profile, created_at, updated_at
+                    f'''
+                    SELECT {_PAPER_NOTE_COLUMNS}
                     FROM paper_notes
                     WHERE user_id = ? AND include_in_profile = 1
                     ORDER BY updated_at DESC, created_at DESC
@@ -197,6 +207,11 @@ class PaperNoteStore(BaseSqliteStore):
         tags: Optional[List[str]] = None,
         include_in_profile: Optional[bool] = None,
     ) -> Optional[Dict[str, Any]]:
+        """部分更新笔记：只写入非 None 的参数；笔记不存在或不属于该用户时返回 None。
+
+        更新后若笔记处于“纳入画像”状态，会重新记录 note_saved 事件，让画像重建看到最新内容；
+        若本次把笔记从“纳入画像”改为不纳入，则撤销它已有的 note_saved 事件。
+        """
         try:
             update_fields: List[str] = []
             update_values: List[Any] = []
@@ -208,19 +223,14 @@ class PaperNoteStore(BaseSqliteStore):
                 update_fields.append("content = ?")
                 update_values.append(str(content or "").strip())
             if note_type is not None:
-                normalized_note_type = str(note_type or "custom").strip().lower() or "custom"
-                if normalized_note_type not in PAPER_NOTE_TYPES:
-                    normalized_note_type = "custom"
                 update_fields.append("note_type = ?")
-                update_values.append(normalized_note_type)
+                update_values.append(_normalize_note_type(note_type))
             if source_chunk_ids is not None:
-                normalized_chunk_ids = [str(item).strip() for item in source_chunk_ids if str(item).strip()]
                 update_fields.append("source_chunk_ids = ?")
-                update_values.append(self._serialize_json_field(normalized_chunk_ids))
+                update_values.append(self._serialize_json_field(_clean_str_list(source_chunk_ids)))
             if tags is not None:
-                normalized_tags = [str(item).strip() for item in tags if str(item).strip()]
                 update_fields.append("tags = ?")
-                update_values.append(self._serialize_json_field(normalized_tags))
+                update_values.append(self._serialize_json_field(_clean_str_list(tags)))
             if include_in_profile is not None:
                 update_fields.append("include_in_profile = ?")
                 update_values.append(1 if include_in_profile else 0)
@@ -234,6 +244,11 @@ class PaperNoteStore(BaseSqliteStore):
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
+                    "SELECT arxiv_id, include_in_profile FROM paper_notes WHERE note_id = ? AND user_id = ?",
+                    (note_id, user_id),
+                )
+                previous = cursor.fetchone()
+                cursor.execute(
                     f'''
                     UPDATE paper_notes
                     SET {", ".join(update_fields)}
@@ -241,9 +256,12 @@ class PaperNoteStore(BaseSqliteStore):
                     ''',
                     update_values,
                 )
-                conn.commit()
                 if cursor.rowcount <= 0:
                     return None
+                if include_in_profile is False and previous and previous[1]:
+                    # 从“纳入画像”改为不纳入：与更新同一事务撤销已有事件，避免画像继续使用这条笔记。
+                    self.profile_event_store._retract_note_profile_events(conn, user_id, note_id, previous[0])
+                conn.commit()
 
             updated_note = self.get_paper_note(note_id, user_id=user_id)
             if updated_note and updated_note.get("include_in_profile"):
@@ -268,9 +286,21 @@ class PaperNoteStore(BaseSqliteStore):
             return None
 
     def delete_paper_note(self, note_id: str, user_id: str = DEFAULT_USER_ID) -> bool:
+        """删除属于该用户的笔记，返回是否真的删除了记录。
+
+        删除已纳入画像的笔记时，在同一事务内撤销它的 note_saved 画像事件，避免被删笔记继续影响画像重建。
+        未纳入画像的笔记没有生效中的事件，不写删除事件，以免无谓地触发画像重建。
+        """
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT arxiv_id, include_in_profile FROM paper_notes WHERE note_id = ? AND user_id = ?",
+                    (note_id, user_id),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return False
                 cursor.execute(
                     '''
                     DELETE FROM paper_notes
@@ -278,8 +308,11 @@ class PaperNoteStore(BaseSqliteStore):
                     ''',
                     (note_id, user_id),
                 )
+                deleted = cursor.rowcount > 0
+                if deleted and row[1]:
+                    self.profile_event_store._retract_note_profile_events(conn, user_id, note_id, row[0])
                 conn.commit()
-                return cursor.rowcount > 0
+                return deleted
         except Exception as e:
             logger.error(f"Error deleting paper note: {str(e)}")
             return False
