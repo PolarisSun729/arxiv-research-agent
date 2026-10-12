@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """论文 QA、会话与笔记相关路由。
 
 该模块是后端中最核心的论文问答入口之一，负责：
@@ -7,11 +5,29 @@ from __future__ import annotations
 2. 检索 trace 导出与诊断；
 3. 论文聊天会话及消息管理；
 4. 论文笔记的创建、编辑、导出；
-5. 同步问答与流式问答。
+5. 同步问答与流式问答；
+6. 证据图片资源读取。
 
 整体设计上，路由层尽量保持轻量，主要承担参数整理、对象序列化、
 错误码转换和响应结构统一，复杂业务则下沉到 service 层实现。
+
+关于 user_id：请求里的 user_id（查询参数或请求体）在 JWT 模式下由认证中间件
+强制改写/校验为当前登录用户，因此路由层只需做空值兜底（_normalize_user_id），
+无需再自行校验归属；单机无认证模式下缺省为配置中的默认用户。
+
+接口一览（均挂载在 /api/paper/{arxiv_id} 下）：
+- QA 索引：GET /qa-status、GET /qa-diagnose、POST /create-qa-index、
+  GET /qa-index-jobs/latest、GET /qa-index-jobs/{job_id}；
+- 检索 trace：GET /qa-trace/latest；
+- 聊天会话：GET/POST /chat-sessions、GET /chat-sessions/recent、
+  GET/DELETE /chat-sessions/{session_id}、GET /chat-sessions/{session_id}/messages、
+  POST /chat-sessions/{session_id}/clear；
+- 笔记：GET/POST /notes、PATCH/DELETE /notes/{note_id}、GET /notes/export；
+- 问答：POST /qa（非流式）、POST /qa/stream（SSE 流式）；
+- 证据资源：GET /evidence-assets/{source_id}。
 """
+
+from __future__ import annotations
 
 import json
 import logging
@@ -36,17 +52,21 @@ from dependencies import (
     get_vector_store_service,
 )
 from core.errors import AppError, ErrorCode, error_response
-from core.responses import RedactedJSONResponse
+from core.responses import RedactedJSONResponse, format_sse_event
 from routers.qa_utils import build_qa_diagnostic, get_latest_retrieval_trace, sanitize_trace_slug
 from services.paper_qa.qa_observation import build_error_qa_observation
 from utils.config import get_default_user_id, get_qa_index_job_runtime_config
-from utils.secret_redaction import redact_sensitive_value, redact_text
+from utils.secret_redaction import redact_text
 from auth.ownership import prepare_paper_qa, validate_note_source
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/paper/{arxiv_id}", tags=["paper-qa"])
+
+# 处于这些终态的索引任务允许用户重新提交；前端据此决定是否展示"重试"按钮。
 QA_INDEX_JOB_RETRYABLE_STATUSES = {"failed", "stale", "cancelled"}
+# 索引任务超时配置缺失时的兜底值（秒），与 IndexJobManager 的默认值保持一致。
+DEFAULT_QA_INDEX_JOB_TIMEOUT_SECONDS = 30 * 60
 
 
 class QaRequest(BaseModel):
@@ -144,12 +164,25 @@ def _serialize_chat_message(message: dict) -> dict:
     }
 
 
+def _qa_index_job_timeout_seconds() -> int:
+    """读取 QA 索引任务的超时秒数（配置项 QA_INDEX_JOB_CONFIG["timeout_seconds"]）。
+
+    状态查询时的 stale 判定与响应里回显的 timeout_seconds 必须使用同一个值，
+    否则前端看到的超时时间与后端实际判定不一致。
+    """
+    return int(get_qa_index_job_runtime_config().get("timeout_seconds") or DEFAULT_QA_INDEX_JOB_TIMEOUT_SECONDS)
+
+
 def _serialize_qa_index_job(job: Optional[dict]) -> Optional[dict]:
-    """序列化 QA 索引构建任务信息。"""
+    """序列化 QA 索引构建任务信息。
+
+    存储层字段 attempt_count 对外改名为 attempt_no；另外派生出 retryable / stale 两个布尔值，
+    前端无需了解状态枚举即可决定展示"重试"或"已失联"。
+    """
     if not job:
         return None
     normalized_status = str(job.get("status") or "").strip().lower()
-    timeout_seconds = int(get_qa_index_job_runtime_config().get("timeout_seconds") or 0)
+    timeout_seconds = _qa_index_job_timeout_seconds()
     return {
         "job_id": job.get("job_id"),
         "arxiv_id": job.get("arxiv_id"),
@@ -174,9 +207,14 @@ def _serialize_qa_index_job(job: Optional[dict]) -> Optional[dict]:
 
 
 def _recover_stale_qa_index_jobs(paper_qa_index_store: Any, *, arxiv_id: str, job_id: Optional[str] = None) -> None:
-    """查询前轻量执行 stale 自愈，避免前端轮询时长期看到不可恢复的 pending/running。"""
-    timeout_seconds = int(get_qa_index_job_runtime_config().get("timeout_seconds") or 1800)
-    paper_qa_index_store.mark_stale_paper_index_jobs(arxiv_id=arxiv_id, job_id=job_id, timeout_seconds=timeout_seconds)
+    """查询前轻量执行 stale 自愈，避免前端轮询时长期看到不可恢复的 pending/running。
+
+    worker 进程崩溃或重启后，任务状态会停留在 pending/running；这里把超时仍未更新的任务
+    标记为 stale（可重试）。传入 job_id 时只检查该任务。
+    """
+    paper_qa_index_store.mark_stale_paper_index_jobs(
+        arxiv_id=arxiv_id, job_id=job_id, timeout_seconds=_qa_index_job_timeout_seconds()
+    )
 
 
 def _serialize_paper_note(note: Optional[dict], paper_chat_message_store=None) -> Optional[dict]:
@@ -244,6 +282,11 @@ def _build_notes_markdown(arxiv_id: str, notes: List[dict], paper_title: Optiona
     return "\n".join(lines).strip() + "\n"
 
 
+# ---------------------------------------------------------------------------
+# QA 索引：状态、诊断、trace 下载与构建任务
+# ---------------------------------------------------------------------------
+
+
 @router.get("/qa-status")
 async def get_paper_qa_status(arxiv_id: str, paper_qa_service=Depends(get_paper_qa_service)):
     """获取指定论文的 QA 能力状态。
@@ -264,7 +307,11 @@ async def diagnose_paper_qa(
     paper_qa_index_store=Depends(get_paper_qa_index_store),
     vector_store_service=Depends(get_vector_store_service),
 ):
-    """输出 QA 索引诊断信息，用于排查索引和向量库状态。"""
+    """输出 QA 索引诊断信息，用于排查索引和向量库状态。
+
+    对比 SQLite 中记录的索引元数据与 Milvus 中的真实集合，并抽样返回最多 sample_limit 个 chunk，
+    具体字段见 qa_utils.build_qa_diagnostic。
+    """
     try:
         return build_qa_diagnostic(
             paper_qa_index_store=paper_qa_index_store,
@@ -284,7 +331,12 @@ async def download_latest_qa_trace(
     trace_name: Optional[str] = Query(None),
     enhanced_retrieval_service=Depends(get_enhanced_retrieval_service),
 ):
-    """下载最近一次或指定名称的检索 trace 文件。"""
+    """下载最近一次或指定名称的检索 trace 文件。
+
+    - format：md（人读报告）或 json（结构化数据），其他值返回 400；
+    - trace_name：指定 trace 文件名（只能是纯文件名），不传则取最近一次；
+    找不到文件返回 404。最终路径还会再校验一次必须位于该论文的 trace 目录内。
+    """
     try:
         normalized_format = str(format or "md").strip().lower()
         if normalized_format not in {"md", "json"}:
@@ -339,7 +391,10 @@ async def create_paper_qa_index(
 
     支持同步构建和异步提交两种模式：
     - sync=true 时直接阻塞到构建完成；
-    - 否则提交后台任务并立即返回 job 信息。
+    - 否则提交后台任务并立即返回 job 信息，前端随后轮询 /qa-index-jobs/{job_id}。
+
+    loading_method 指定 PDF 解析方式（默认 docling）。业务失败（AppError）不抛 HTTP 异常，
+    而是通过 error_response 返回统一的结构化错误体，便于前端展示失败阶段和是否可恢复。
     """
     try:
         if sync:
@@ -349,6 +404,7 @@ async def create_paper_qa_index(
         # 异步模式更适合生产环境，避免请求长时间阻塞。
         job = index_job_manager.submit_job(arxiv_id, loading_method)
         normalized_job_status = str(job.get("status") or "pending").strip().lower()
+        # 回显任务管理器实际使用的超时；没有该属性的实现（如测试替身）返回 None。
         timeout_seconds = getattr(index_job_manager, "timeout_seconds", None)
         # 兼容旧响应字段，同时附加可重试和恢复信息，前端无需改变轮询方式即可展示失败原因。
         return {
@@ -398,7 +454,7 @@ async def get_latest_paper_qa_index_job(
     arxiv_id: str,
     paper_qa_index_store=Depends(get_paper_qa_index_store),
 ):
-    """获取指定论文最近一次 QA 索引任务。"""
+    """获取指定论文最近一次 QA 索引任务；从未提交过任务时返回 404。"""
     try:
         _recover_stale_qa_index_jobs(paper_qa_index_store, arxiv_id=arxiv_id)
         job = paper_qa_index_store.get_latest_paper_index_job(arxiv_id)
@@ -418,7 +474,10 @@ async def get_paper_qa_index_job(
     job_id: str,
     paper_qa_index_store=Depends(get_paper_qa_index_store),
 ):
-    """按任务 ID 获取某次 QA 索引构建任务详情。"""
+    """按任务 ID 获取某次 QA 索引构建任务详情。
+
+    任务必须属于路径中的论文，否则同样返回 404，避免借用其他论文的 job_id 读取任务信息。
+    """
     try:
         _recover_stale_qa_index_jobs(paper_qa_index_store, arxiv_id=arxiv_id, job_id=job_id)
         job = paper_qa_index_store.get_paper_index_job(job_id)
@@ -432,6 +491,11 @@ async def get_paper_qa_index_job(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+# ---------------------------------------------------------------------------
+# 聊天会话
+# ---------------------------------------------------------------------------
+
+
 @router.get("/chat-sessions")
 async def list_paper_chat_sessions(
     arxiv_id: str,
@@ -439,7 +503,7 @@ async def list_paper_chat_sessions(
     limit: int = Query(20, ge=1, le=100),
     paper_chat_session_store=Depends(get_paper_chat_session_store),
 ):
-    """列出某篇论文下、某个用户的聊天会话列表。"""
+    """列出某篇论文下、某个用户的聊天会话列表（最多 limit 条）。"""
     try:
         sessions = paper_chat_session_store.list_paper_chat_sessions(arxiv_id=arxiv_id, user_id=_normalize_user_id(user_id), limit=limit)
         return {"items": [_serialize_chat_session(item) for item in sessions]}
@@ -454,7 +518,7 @@ async def get_recent_paper_chat_session(
     user_id: Optional[str] = Query(None),
     paper_chat_session_store=Depends(get_paper_chat_session_store),
 ):
-    """获取最近一次论文聊天会话，便于前端恢复上下文。"""
+    """获取最近一次论文聊天会话，便于前端恢复上下文；没有会话时 item 为 null。"""
     try:
         session = paper_chat_session_store.get_recent_paper_chat_session(arxiv_id=arxiv_id, user_id=_normalize_user_id(user_id))
         return {"item": _serialize_chat_session(session)}
@@ -540,7 +604,10 @@ async def clear_paper_chat_session(
     paper_chat_session_store=Depends(get_paper_chat_session_store),
     paper_chat_message_store=Depends(get_paper_chat_message_store),
 ):
-    """清空指定聊天会话中的消息，但保留会话本身。"""
+    """清空指定聊天会话中的消息，但保留会话本身。
+
+    注意 user_id 放在请求体中（而非查询参数），请求体可以为空。
+    """
     try:
         user_id = _normalize_user_id((payload or {}).get("user_id"))
         session = paper_chat_session_store.get_paper_chat_session(session_id, user_id=user_id)
@@ -565,7 +632,7 @@ async def delete_paper_chat_session(
     paper_chat_session_store=Depends(get_paper_chat_session_store),
     paper_chat_message_store=Depends(get_paper_chat_message_store),
 ):
-    """删除整个聊天会话。"""
+    """删除整个聊天会话（连同其中的全部消息）。"""
     try:
         session = paper_chat_session_store.get_paper_chat_session(session_id, user_id=_normalize_user_id(user_id))
         if not session or session.get("arxiv_id") != arxiv_id:
@@ -577,6 +644,11 @@ async def delete_paper_chat_session(
     except Exception as exc:
         logger.error("Error deleting paper chat session: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# 论文笔记
+# ---------------------------------------------------------------------------
 
 
 @router.get("/notes")
@@ -607,7 +679,11 @@ async def create_paper_note(
     paper_note_store=Depends(get_paper_note_store),
     paper_chat_message_store=Depends(get_paper_chat_message_store),
 ):
-    """创建一条论文笔记，并可选同步更新用户研究画像。"""
+    """创建一条论文笔记。
+
+    笔记可以关联一条 assistant 回复作为出处：直接传 source_message_id，或传 session_id + source_turn_id
+    由这里回查对应消息。include_in_profile=True 的笔记会作为研究画像构建的输入之一。
+    """
     # 在通用业务异常兜底之前检查归属，授权错误必须保持 404，而不是被包装成 500。
     validated_source_id = validate_note_source(arxiv_id, payload, paper_chat_message_store)
     try:
@@ -655,7 +731,7 @@ async def update_paper_note(
     paper_note_store=Depends(get_paper_note_store),
     paper_chat_message_store=Depends(get_paper_chat_message_store),
 ):
-    """更新指定笔记，并在需要时重新同步用户画像。"""
+    """局部更新指定笔记：请求体中为 None 的字段保持不变。笔记不存在或不属于该论文时返回 404。"""
     try:
         user_id = _normalize_user_id(payload.user_id)
         current = paper_note_store.get_paper_note(note_id, user_id=user_id)
@@ -690,7 +766,7 @@ async def delete_paper_note(
     user_id: Optional[str] = Query(None),
     paper_note_store=Depends(get_paper_note_store),
 ):
-    """删除指定论文笔记。"""
+    """删除指定论文笔记；笔记不存在或不属于该论文时返回 404。"""
     try:
         normalized_user_id = _normalize_user_id(user_id)
         current = paper_note_store.get_paper_note(note_id, user_id=normalized_user_id)
@@ -734,9 +810,19 @@ async def export_paper_notes_markdown(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+# ---------------------------------------------------------------------------
+# 问答与证据资源
+# ---------------------------------------------------------------------------
+
+
 @router.post("/qa")
 async def qa_paper(arxiv_id: str, payload: QaRequest, paper_qa_service=Depends(get_paper_qa_service)):
-    """执行一次非流式论文问答。"""
+    """执行一次非流式论文问答，返回完整答案。
+
+    prepare_paper_qa 放在 try 之外：它负责会话归属校验和配额扣减，
+    其抛出的 HTTP 错误（404/429 等）必须原样返回，不能被下面的兜底包装掉。
+    业务失败（AppError）通过 error_response 返回统一的结构化错误体。
+    """
     prepare_paper_qa(arxiv_id, payload)
     try:
         return paper_qa_service.answer_question(arxiv_id, payload)
@@ -751,8 +837,6 @@ async def qa_paper(arxiv_id: str, payload: QaRequest, paper_qa_service=Depends(g
             exc.recoverable,
             exc.detail,
         )
-
-
         return error_response(exc)
     except HTTPException:
         raise
@@ -804,12 +888,21 @@ async def qa_paper_stream(
     question = payload.question.strip()
     logger.debug("QA stream request for paper: %s, question: %s", arxiv_id, question)
 
-    def sse_event(event_name: str, data: dict) -> str:
-        """格式化并脱敏单条 SSE 消息，保护未经过 JSONResponse 的流式出口。"""
-        return f"event: {event_name}\ndata: {json.dumps(redact_sensitive_value(data), ensure_ascii=False)}\n\n"
-
     def event_stream():
-        """把证据研究引擎的事件映射为前端约定的 SSE 事件。"""
+        """把证据研究引擎的事件映射为前端约定的 SSE 事件。
+
+        映射关系：
+        - research_started             -> meta（status=started）
+        - retrieval_completed          -> progress（stage=retrieval）
+        - draft_created                -> progress（stage=draft）
+        - claim_verification_completed -> progress（stage=verification）
+        - research_completed           -> progress（stage=completed）
+        - done                         -> done（携带最终答案与序列化后的 chat_session）
+        其余内部事件不对外推送；出错时推送一条 error 事件后结束。
+
+        这是同步生成器，StreamingResponse 会放到线程池中迭代，不会阻塞事件循环。
+        流式响应不经过 JSONResponse 的脱敏，因此每一帧都通过 format_sse_event 脱敏。
+        """
         try:
             for event in paper_qa_service.answer_question_with_research_stream(arxiv_id, payload):
                 event_type = event.get("event", "unknown")
@@ -817,40 +910,40 @@ async def qa_paper_stream(
 
                 # 映射研究引擎事件到 SSE 事件
                 if event_type == "research_started":
-                    yield sse_event("meta", {
+                    yield format_sse_event("meta", {
                         "status": "started",
                         "arxiv_id": event_data.get("arxiv_id"),
                         "question": event_data.get("question"),
                     })
                 elif event_type == "retrieval_completed":
-                    yield sse_event("progress", {
+                    yield format_sse_event("progress", {
                         "stage": "retrieval",
                         "retrieval_count": event_data.get("retrieval_count", 0),
                         "new_candidate_count": event_data.get("new_candidate_count", 0),
                     })
                 elif event_type == "draft_created":
-                    yield sse_event("progress", {
+                    yield format_sse_event("progress", {
                         "stage": "draft",
                         "draft_attempt": event_data.get("draft_attempt", 0),
                         "claim_count": event_data.get("claim_count", 0),
                     })
                 elif event_type == "claim_verification_completed":
-                    yield sse_event("progress", {
+                    yield format_sse_event("progress", {
                         "stage": "verification",
                         "supported_count": event_data.get("supported_count", 0),
                     })
                 elif event_type == "research_completed":
-                    yield sse_event("progress", {
+                    yield format_sse_event("progress", {
                         "stage": "completed",
                         "outcome": event_data.get("outcome"),
                     })
                 elif event_type == "done":
                     event_data = dict(event_data)
                     event_data["chat_session"] = _serialize_chat_session(event_data.get("chat_session") or {})
-                    yield sse_event("done", event_data)
+                    yield format_sse_event("done", event_data)
         except AppError as exc:
             # 服务只抛结构化异常；路由是唯一 error 出口，避免一轮失败发送两次错误。
-            yield sse_event("error", exc.to_payload())
+            yield format_sse_event("error", exc.to_payload())
         except Exception:
             logger.exception("Error in research stream: arxiv_id=%s", arxiv_id)
             observation = build_error_qa_observation(
@@ -858,7 +951,7 @@ async def qa_paper_stream(
                 error_reason="research_execution_failed",
             )
             # 最后一道兜底也不能返回异常字符串，其中可能包含 provider 响应或服务器路径。
-            yield sse_event("error", AppError(
+            yield format_sse_event("error", AppError(
                 ErrorCode.UNKNOWN_ERROR, detail={"stage": "research_stream"},
                 context={"arxiv_id": arxiv_id, "qa_observation": observation},
             ).to_payload())

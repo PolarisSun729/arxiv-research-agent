@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -21,10 +22,10 @@ from fastapi.testclient import TestClient
 from auth import key_config
 from auth.api_key_middleware import ApiKeySettings
 from auth.charging import charge
-from auth.permissions import ALL_ROLES, AccessPolicy, ROUTE_POLICIES
+from auth.permissions import ALL_ROLES, AccessPolicy, ROUTE_POLICIES, rate_category
 from middleware.audit_log import AuditLogMiddleware, AuditSink
-from middleware.ip_filter import IPFilterSettings
-from middleware.rate_limit import RateLimitController, RateLimitSettings
+from middleware.ip_filter import IPFilterMiddleware, IPFilterSettings
+from middleware.rate_limit import RateLimitController, RateLimitMiddleware, RateLimitSettings
 from utils.secret_redaction import redact_sensitive_value
 
 
@@ -497,7 +498,7 @@ def test_audit_records_cancelled_stream_once(app_factory):
         return {"type": "http.disconnect"}
     async def send(message):
         pass
-    middleware = AuditLogMiddleware(stream, sink=SimpleNamespace(write=records.append), routes=[], ip_settings=IPFilterSettings.from_environment())
+    middleware = AuditLogMiddleware(stream, sink=SimpleNamespace(write=records.append))
     scope = {"type": "http", "method": "GET", "path": "/api/probe", "headers": [], "client": ("198.51.100.10", 1)}
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(middleware(scope, receive, send))
@@ -517,7 +518,7 @@ def test_audit_does_not_mark_failed_final_send_as_complete(app_factory):
     async def send(message):
         if message.get("body") == b"final":
             raise OSError("transport closed")
-    middleware = AuditLogMiddleware(stream, sink=SimpleNamespace(write=records.append), routes=[], ip_settings=IPFilterSettings.from_environment())
+    middleware = AuditLogMiddleware(stream, sink=SimpleNamespace(write=records.append))
     scope = {"type": "http", "method": "GET", "path": "/api/probe", "headers": [], "client": ("198.51.100.10", 1)}
     with pytest.raises(OSError):
         asyncio.run(middleware(scope, receive, send))
@@ -650,3 +651,70 @@ def test_paper_detail_charges_only_when_backfilling_from_arxiv(app_factory, monk
     denied = http.get("/api/paper/p-missing")
     assert denied.status_code == 429 and denied.json()["code"] == "daily_quota_exceeded"
     assert fetched == ["p-remote"]
+
+
+def test_rejected_category_does_not_consume_identity_budget(app_factory):
+    app = app_factory(RATE_LIMIT_KEY="2/minute", RATE_LIMIT_WRITE="1/minute")
+    http = client(app)
+    assert http.post("/api/security-probe", json={}).status_code == 200
+    denied = http.post("/api/security-probe", json={})
+    assert denied.status_code == 429 and denied.headers["X-RateLimit-Scope"] == "write"
+    # 被 write 预算拒绝的请求没有计入密钥总预算，密钥仍剩一次读取额度。
+    assert http.get("/api/auth/check").status_code == 200
+    assert http.get("/api/auth/check").headers["X-RateLimit-Scope"] == "key"
+
+
+def test_exhausted_daily_quota_does_not_consume_rate_budget(app_factory, monkeypatch, tmp_path):
+    write_keys(tmp_path, monkeypatch, [{"key": KEY_A, "daily_quota": 1}])
+    http = client(app_factory(RATE_LIMIT_KEY="3/minute"))
+    assert http.get("/api/security-paid").status_code == 200
+    for _ in range(3):
+        assert http.get("/api/security-paid").json()["code"] == "daily_quota_exceeded"
+    assert http.get("/api/auth/check").status_code == 200
+    assert http.get("/api/auth/check").status_code == 200
+    assert http.get("/api/auth/check").json()["code"] == "rate_limit_exceeded"
+
+
+def test_rate_categories_follow_route_policies():
+    expensive = {
+        ("POST", "/api/agent/chat"), ("POST", "/api/agent/chat/stream"),
+        ("POST", "/api/agent/work-continuations/{continuation_id}/resume/stream"), ("POST", "/api/paper"),
+        ("POST", "/api/arxiv/download"), ("POST", "/api/paper/{arxiv_id}/create-qa-index"),
+        ("POST", "/api/paper/{arxiv_id}/qa"), ("POST", "/api/paper/{arxiv_id}/qa/stream"),
+        ("POST", "/api/user/research-profile/rebuild"), ("POST", "/api/user/generate-interest-vector"),
+        ("POST", "/api/user/recommend-papers"), ("GET", "/api/paper/{arxiv_id}"), ("POST", "/api/user/like-paper"),
+        ("POST", "/api/user/dislike-paper"), ("POST", "/api/user/paper-action"),
+    }
+    assert expensive <= set(ROUTE_POLICIES)
+    for method, route in ROUTE_POLICIES:
+        if (method, route) in expensive:
+            expected = "expensive"
+        elif method in {"GET", "HEAD", "OPTIONS"} or (method, route) == ("POST", "/api/arxiv/search"):
+            expected = "read"
+        else:
+            expected = "write"
+        assert rate_category(method, route) == expected, (method, route)
+    assert rate_category("DELETE", "/api/unregistered") == "write"
+
+
+def test_security_middlewares_require_request_context(app_factory):
+    app = app_factory()
+    async def downstream(scope, receive, send):
+        raise AssertionError("不应到达业务层")
+    scope = {"type": "http", "method": "GET", "path": "/api/auth/check", "headers": [], "client": ("198.51.100.10", 1)}
+    for middleware in (
+        RateLimitMiddleware(downstream, controller=app.state.rate_limit_controller, before_auth=True),
+        IPFilterMiddleware(downstream, settings=IPFilterSettings.from_environment()),
+    ):
+        with pytest.raises(RuntimeError, match="RequestContextMiddleware"):
+            asyncio.run(middleware(dict(scope), None, None))
+
+
+def test_untrusted_loopback_proxy_is_reported_once(app_factory, caplog):
+    app = app_factory(TRUSTED_PROXY_IPS="")
+    http = client(app, "127.0.0.1")
+    with caplog.at_level(logging.WARNING, logger="middleware.request_context"):
+        for ip in ("203.0.113.5", "203.0.113.6"):
+            assert http.get("/api/auth/check", headers={"X-Forwarded-For": ip}).status_code == 200
+    warnings = [record for record in caplog.records if "loopback_proxy_untrusted" in record.getMessage()]
+    assert len(warnings) == 1

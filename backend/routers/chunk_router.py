@@ -1,10 +1,14 @@
-from __future__ import annotations
-
 """受控 chunk 调试路由。
 
 该模块只在 ENABLE_DEBUG_ROUTES 显式开启时注册，用于本地排查 PDF 解析、
 chunk 切分和 RAG 召回质量；它不是面向普通用户的正式业务 API。
+
+接口：
+- GET /debug/chunks/files            列出调试目录下的 chunk JSON 文件；
+- GET /debug/chunks/file/{filename}  读取单个文件的裁剪视图（去掉本地路径、原始页面与向量）。
 """
+
+from __future__ import annotations
 
 import json
 import logging
@@ -22,8 +26,11 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 # 约定分块后的调试产物保存在 backend/01-loaded-docs 目录中。
 CHUNK_DOCS_DIR = BASE_DIR / "01-loaded-docs"
 DEBUG_CONFIG = get_debug_routes_runtime_config()
+# 长文本字段在调试响应中最多保留的字符数，避免单个 chunk 文件把响应撑得过大。
 CONTENT_PREVIEW_CHARS = int(DEBUG_CONFIG.get("chunk_content_preview_chars") or 4000)
 
+# 以下字段集合驱动 _sanitize_debug_payload 的裁剪规则（字段名比较时不区分大小写）。
+# 路径类字段：只保留文件名，不暴露服务器目录结构。
 _PATH_FIELD_NAMES = {
     "path",
     "pdf_path",
@@ -35,12 +42,16 @@ _PATH_FIELD_NAMES = {
     "image_path",
     "source_path",
 }
+# 向量字段：只返回向量长度，不返回具体数值。
 _LARGE_VECTOR_FIELD_NAMES = {"embedding", "vector", "vector_data"}
+# 原始页面全文：整体省略。
 _RAW_PAGE_FIELD_NAMES = {"pages", "raw_pages"}
+# 长文本字段：按 CONTENT_PREVIEW_CHARS 截断。
 _LONG_TEXT_FIELD_NAMES = {"content", "text", "raw_text", "markdown"}
 
 
 def _basename(value: Any) -> str:
+    """取路径最后一段作为文件名，同时兼容 Windows 反斜杠与 POSIX 正斜杠。"""
     text = str(value or "")
     return text.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
 
@@ -48,6 +59,7 @@ def _basename(value: Any) -> str:
 def _resolve_chunk_debug_file(filename: str) -> Path:
     """只允许读取调试目录下的 JSON 文件，避免路径穿越读取任意本地文件。"""
     normalized_name = _basename(filename)
+    # 三重校验：必须是纯文件名（不含任何目录成分）、扩展名为 .json、解析后仍直接位于调试目录下。
     if not normalized_name or normalized_name != filename or Path(normalized_name).suffix.lower() != ".json":
         raise HTTPException(status_code=400, detail="Invalid debug chunk filename")
     base_dir = CHUNK_DOCS_DIR.resolve()
@@ -58,13 +70,18 @@ def _resolve_chunk_debug_file(filename: str) -> Path:
 
 
 def _truncate_debug_text(value: str) -> str:
+    """超过预览长度的文本截断，并追加截断标记，提示调用方内容不完整。"""
     if len(value) <= CONTENT_PREVIEW_CHARS:
         return value
     return value[:CONTENT_PREVIEW_CHARS] + "\n...[debug preview truncated]"
 
 
 def _sanitize_debug_payload(value: Any, *, key: str = "", depth: int = 0) -> Any:
-    """裁剪 chunk 调试响应，只保留定位问题所需字段，避免泄露本地路径和大体量向量。"""
+    """裁剪 chunk 调试响应，只保留定位问题所需字段，避免泄露本地路径和大体量向量。
+
+    按字段名递归处理 dict / list：key 表示当前值所在的字段名，列表元素继承父字段名；
+    depth 限制递归深度，防止异常嵌套的 JSON 导致栈溢出。
+    """
     key_lower = str(key or "").lower()
     if depth > 10:
         return "[debug payload depth limit]"
@@ -74,6 +91,7 @@ def _sanitize_debug_payload(value: Any, *, key: str = "", depth: int = 0) -> Any
         return {"redacted": True, "vector_length": len(value)}
     if key_lower in _PATH_FIELD_NAMES:
         return _basename(value)
+    # filename / source 既可能是纯文件名也可能是完整路径，统一只保留最后一段。
     if key_lower in {"filename", "source"} and isinstance(value, str):
         return _basename(value)
     if isinstance(value, dict):
@@ -86,6 +104,8 @@ def _sanitize_debug_payload(value: Any, *, key: str = "", depth: int = 0) -> Any
     if isinstance(value, str):
         if key_lower in _LONG_TEXT_FIELD_NAMES:
             return _truncate_debug_text(value)
+        # 兜底：任何看起来像绝对路径的字符串值（/xxx、\xxx、C:\xxx、C:/xxx）也只保留文件名。
+        # 注意 http:// 这类 URL 同样会命中 ":/"，在调试视图中被截成最后一段，属于可接受的损失。
         if value.startswith(("/", "\\")) or ":\\" in value or ":/" in value:
             return _basename(value)
     return value

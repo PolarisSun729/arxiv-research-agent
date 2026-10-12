@@ -1,29 +1,22 @@
-from __future__ import annotations
-
 """QA 路由辅助工具函数。
 
-这里放的是多个 QA 相关路由都会复用的小工具，
+这里放的是 qa_router 用到的几个无状态小工具（单独成模块便于单元测试），
 包括 trace 文件名清洗、检索 trace 定位，以及 QA 索引健康检查信息构建。
 """
 
-import re
+from __future__ import annotations
+
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from services.retrieval.trace_builder import RetrievalTraceBuilder
 from utils.config import VectorDBProvider
 
-
-def sanitize_trace_slug(text: str, max_length: int = 40) -> str:
-    """把任意输入文本转换成适合当作目录名/文件名前缀的安全字符串。"""
-    # 仅保留英文、数字、中文，其余字符统一替换为下划线，
-    # 这样既兼顾可读性，也避免路径中出现空格或特殊字符带来的兼容性问题。
-    slug = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "_", (text or "").strip())
-    # 连续下划线压缩成一个，避免生成过长且难读的名称。
-    slug = re.sub(r"_+", "_", slug).strip("_")
-    if not slug:
-        # 完全为空时给一个兜底值，避免出现空文件名。
-        slug = "query"
-    return slug[:max_length]
+# 把任意文本转换成可安全用作目录名/文件名前缀的 slug：只保留英文、数字、中文，
+# 其余字符替换为下划线并压缩，结果为空时回退为 "query"，长度上限来自检索配置。
+# 直接复用写 trace 时的同一实现：trace 目录名由检索服务生成、由这里的下载接口查找，
+# 两端规则（包括长度上限）一旦不一致就会找不到文件，因此不能各自维护一份拷贝。
+sanitize_trace_slug = RetrievalTraceBuilder.sanitize_trace_slug
 
 
 def get_latest_retrieval_trace(
@@ -31,7 +24,10 @@ def get_latest_retrieval_trace(
     arxiv_id: str,
     format_name: str = "md",
 ) -> Optional[Path]:
-    """返回指定论文最近一次导出的检索 trace 文件路径。"""
+    """返回指定论文最近一次导出的检索 trace 文件路径；目录不存在或没有对应格式的文件时返回 None。
+
+    trace 目录结构：<trace_export_dir>/<arxiv_id 的 slug>/<按查询生成的文件名>.{md,json}
+    """
     trace_root = Path(str(enhanced_retrieval_service.trace_export_dir))
     paper_dir = trace_root / sanitize_trace_slug(arxiv_id)
     if not paper_dir.exists() or not paper_dir.is_dir():

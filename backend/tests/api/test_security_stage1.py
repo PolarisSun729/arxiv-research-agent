@@ -95,6 +95,11 @@ def test_invalid_origins_fail_closed(monkeypatch, origin):
         get_allowed_origins()
 
 
+def test_origins_are_normalized_like_browser_origin_headers(monkeypatch):
+    monkeypatch.setenv("ALLOWED_ORIGINS", "HTTPS://Research.Example:443, https://research.example, http://LOCALHOST:80, http://localhost:5173")
+    assert get_allowed_origins() == ("https://research.example", "http://localhost", "http://localhost:5173")
+
+
 def test_settings_deduplicate_keys_and_do_not_expose_them_in_repr(monkeypatch):
     monkeypatch.setenv("BACKEND_API_KEYS", f" {TEST_KEY},,{TEST_KEY},{ROTATED_KEY} ")
     monkeypatch.setenv("ALLOWED_ORIGINS", "https://research.example, https://research.example")

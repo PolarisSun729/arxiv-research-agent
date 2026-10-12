@@ -44,7 +44,7 @@ SECURITY_TESTS = [
 
 
 def isolate_configuration_reads(runtime: Path) -> None:
-    """允许本次测试生成的配置，阻止 dotenv 和 SlowAPI/Starlette 隐式读取真实部署文件。
+    """允许本次测试生成的配置，阻止 dotenv 和 Starlette Config 隐式读取真实部署文件。
 
     做法是给两个读取入口打猴子补丁：路径位于 runtime 目录内才放行，否则当作文件不存在。
     补丁作用于当前进程，pytest.main 在同一进程内运行，因此对全部测试生效。
@@ -63,7 +63,7 @@ def isolate_configuration_reads(runtime: Path) -> None:
         return original_load_dotenv(dotenv_path, *extra_args, **kwargs)
 
     def read_test_config(self, file_name, encoding="utf-8"):
-        # SlowAPI 使用 Starlette Config 直接打开 .env；只拦 python-dotenv 并不能隔离这个入口。
+        # Starlette Config 直接打开 .env；只拦 python-dotenv 并不能隔离这个入口（防御性保留，当前无代码依赖它）。
         if not Path(file_name).resolve().is_relative_to(runtime):
             return {}
         return original_read_file(self, file_name, encoding)

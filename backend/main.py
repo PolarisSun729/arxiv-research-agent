@@ -37,6 +37,7 @@ from middleware.audit_log import AuditLogMiddleware, AuditSink
 from middleware.common import SECURITY_HEADERS, get_allowed_origins
 from middleware.ip_filter import IPFilterMiddleware, IPFilterSettings
 from middleware.rate_limit import RateLimitController, RateLimitMiddleware, RateLimitSettings
+from middleware.request_context import RequestContextMiddleware
 
 LOGGING_RUNTIME_CONFIG = configure_backend_logging()
 logger = logging.getLogger(__name__)
@@ -123,7 +124,6 @@ def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None
     app.state.api_key_settings = security_settings
     app.state.auth_mode = mode
     app.state.authenticator = authenticator
-    app.state.limiter = rate_controller.limiter
     app.state.rate_limit_controller = rate_controller
 
     @app.exception_handler(AppError)
@@ -183,7 +183,7 @@ def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None
             headers.update({"Access-Control-Allow-Origin": origin, "Vary": "Origin"})
         return JSONResponse(status_code=500, content=make_error_payload(code=ErrorCode.UNKNOWN_ERROR), headers=headers)
 
-    # 注册顺序与执行顺序相反：IP 防护 → 认证/角色/身份 → 用户速率 → 用户日配额 → 业务。
+    # 注册顺序与执行顺序相反：审计 → 请求上下文 → CORS → IP 防护 → 认证/角色/身份 → 用户速率 → 用户日配额 → 业务。
     if authenticator:
         app.add_middleware(UserQuotaMiddleware)
     app.add_middleware(RateLimitMiddleware, controller=rate_controller)
@@ -202,8 +202,10 @@ def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None
         allow_headers=["Content-Type", "Authorization", "X-API-Key", "Accept"],
         expose_headers=["Retry-After", "X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset", "X-RateLimit-Scope", "X-DailyQuota-Limit", "X-DailyQuota-Remaining", "X-DailyQuota-Reset"],
     )
-    # 审计位于 CORS 外层，覆盖预检、认证拒绝、限流拒绝和业务异常，并观察完整 SSE 生命周期。
-    app.add_middleware(AuditLogMiddleware, sink=audit_sink, routes=app.routes, ip_settings=ip_settings)
+    # 请求上下文（客户端 IP、协议、路由模板）在所有安全中间件之前解析一次；下游缺少它时直接失败。
+    app.add_middleware(RequestContextMiddleware, routes=app.routes, ip_settings=ip_settings)
+    # 审计位于最外层，覆盖预检、认证拒绝、限流拒绝和业务异常，并观察完整 SSE 生命周期。
+    app.add_middleware(AuditLogMiddleware, sink=audit_sink)
 
     # JWT 入口有默认拒绝的权限清单；API Key 模式保留旧的可信单团队语义。
     api_dependencies = [Depends(require_jwt_identity if authenticator else verify_api_key)]
