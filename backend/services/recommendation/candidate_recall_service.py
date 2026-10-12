@@ -8,6 +8,21 @@ logger = logging.getLogger(__name__)
 
 
 class CandidateRecallService:
+    """推荐链路的“候选召回”能力（mixin）。
+
+    本类不能单独实例化使用，而是作为 RecommendationService 的父类之一提供方法，
+    依赖宿主类在 __init__ 中注入的以下属性 / 方法：
+
+    - ``self.oai_db_service``：OAI 本地论文库，用于近期论文池召回；
+    - ``self.vector_store_service`` / ``self.collection_name``：向量库，用于兴趣簇向量召回；
+    - ``self.RECOMMEND_CANDIDATE_CATEGORIES``：近期论文池的固定分类范围；
+    - ``self._split_categories``：由 RecommendationRanker 提供的分类解析方法。
+
+    召回有两条路线：
+    1. 兴趣簇召回：每个兴趣簇中心向量各自做相似检索，再按 arXiv ID 合并；
+    2. 近期论文池：没有兴趣簇或簇召回为空时，从 OAI 库取固定分类下的近期论文兜底。
+    """
+
     def _build_liked_category_frequency(self, liked_papers: List[Dict[str, Any]]) -> Counter:
         """统计用户点赞论文中的分类频次，作为后续召回与打分的偏好信号。
 
@@ -26,7 +41,10 @@ class CandidateRecallService:
         candidates: List[Dict[str, Any]],
         excluded_ids: List[str],
     ) -> List[Dict[str, Any]]:
-        """按 arXiv ID 对候选论文去重，并过滤用户明确不应再次看到的论文。"""
+        """按 arXiv ID 对候选论文去重，并过滤用户明确不应再次看到的论文。
+
+        保留每个 ID 第一次出现的候选，因此调用方应把优先级更高的来源放在前面。
+        """
         seen = set(excluded_ids)
         deduped = []
         for candidate in candidates:
@@ -40,14 +58,16 @@ class CandidateRecallService:
 
     def _fetch_recent_db_candidates(
         self,
-        liked_category_freq: Counter,
         max_age_months: int,
         max_results: int,
     ) -> List[Dict[str, Any]]:
         """从 OAI 数据库读取近期论文，作为无兴趣簇召回时的基础候选池。
 
-        该方法优先使用系统预设的推荐分类范围，而不是动态拼接用户分类，
+        该方法固定使用系统预设的推荐分类范围，而不是动态拼接用户分类，
         以保证召回池稳定可控，并避免因用户历史过少导致召回范围过窄。
+        用户的分类偏好在排序阶段（category_score）再体现。
+
+        返回结构与簇召回结果对齐：统一字段名，score 置 0，等待排序阶段重新打分。
         """
         categories = self.RECOMMEND_CANDIDATE_CATEGORIES[:]
         logger.debug(
@@ -68,6 +88,7 @@ class CandidateRecallService:
                 "authors": paper.get("authors", []),
                 "abstract": str(paper.get("abstract", "") or "").strip(),
                 "categories": paper.get("categories", []),
+                # OAI 记录没有统一的发布日期字段，按 created → updated → datestamp 依次兜底。
                 "published_date": str(paper.get("created") or paper.get("updated") or paper.get("oai_datestamp") or "").strip(),
                 "url": str(paper.get("abs_url") or paper.get("pdf_url") or "").strip(),
                 "score": 0.0,
@@ -90,6 +111,12 @@ class CandidateRecallService:
 
         该方法会让每个兴趣簇独立召回一批论文，再按 arXiv ID 合并结果。
         这样既能保留不同兴趣子方向的覆盖度，也能记录论文同时命中多个兴趣簇的轨迹。
+
+        每个候选会带上以下召回字段（后续物化时会被保留）：
+        - recall_cluster_id / recall_cluster_similarity / recall_cluster_rank：主命中簇（相似度最高者）；
+        - recall_cluster_hits：所有命中簇的明细，按相似度降序。
+
+        单个簇检索失败只记日志并跳过，不影响其他簇。
         """
         normalized_excluded_ids = [str(arxiv_id).strip() for arxiv_id in excluded_ids if str(arxiv_id).strip()]
         candidates_by_id: Dict[str, Dict[str, Any]] = {}
@@ -140,6 +167,7 @@ class CandidateRecallService:
                     candidates_by_id[arxiv_id] = candidate
 
         candidates = list(candidates_by_id.values())
+        # 按主命中簇相似度降序；同分时排名靠前者优先，最后用 ID 保证结果确定。
         candidates.sort(
             key=lambda item: (
                 -float(item.get("recall_cluster_similarity", 0.0) or 0.0),
@@ -150,7 +178,10 @@ class CandidateRecallService:
         return candidates
 
     def _sort_recall_hits(self, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """对同一论文的多簇命中记录去重并排序，保留最有价值的召回轨迹。"""
+        """对同一论文的多簇命中记录去重并排序，保留最有价值的召回轨迹。
+
+        去重键为 (cluster_id, rank, similarity)；排序为相似度降序 → 排名升序 → 簇 ID。
+        """
         unique_hits: List[Dict[str, Any]] = []
         seen = set()
         for hit in hits:
@@ -166,7 +197,7 @@ class CandidateRecallService:
         return unique_hits
 
     def _is_better_cluster_recall_candidate(self, candidate: Dict[str, Any], existing_candidate: Dict[str, Any]) -> bool:
-        """比较两个同 ID 候选的主召回质量，并优先保留更强的簇命中结果。"""
+        """比较两个同 ID 候选的主召回质量：相似度更高者胜，相似度相同则簇内排名更靠前者胜。"""
         candidate_key = (float(candidate.get("recall_cluster_similarity", 0.0) or 0.0), -int(candidate.get("recall_cluster_rank", 0) or 0))
         existing_key = (float(existing_candidate.get("recall_cluster_similarity", 0.0) or 0.0), -int(existing_candidate.get("recall_cluster_rank", 0) or 0))
         return candidate_key > existing_key

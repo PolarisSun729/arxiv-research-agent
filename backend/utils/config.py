@@ -405,15 +405,17 @@ RECOMMENDATION_CLUSTERING_CONFIG: Dict[str, Any] = {
 RECOMMENDATION_RANKING_CONFIG: Dict[str, Any] = {
     "negative": {
         # 负向反馈只在排序阶段生效；默认不开 hard filter，避免一两次点踩误伤相近但可能有价值的论文。
+        # 相似度阈值都基于 max(0, cos) 口径（与 Milvus COSINE 分数一致）；
+        # 旧版 (cos+1)/2 口径下的 0.82 / 0.05 / 0.97 分别等价于这里的 0.64 / 0.10 / 0.94。
         "enabled": _env_bool("RECOMMENDATION_RANKING_NEGATIVE_ENABLED", True),
-        "similarity_threshold": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_SIMILARITY_THRESHOLD", "0.82")),
-        "margin": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_MARGIN", "0.05")),
+        "similarity_threshold": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_SIMILARITY_THRESHOLD", "0.64")),
+        "margin": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_MARGIN", "0.10")),
         "penalty_weight": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_PENALTY_WEIGHT", "0.15")),
         "confidence_min_count": _env_int("RECOMMENDATION_RANKING_NEGATIVE_CONFIDENCE_MIN_COUNT", 6),
         "max_penalty": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_MAX_PENALTY", "0.22")),
         "use_margin_penalty": _env_bool("RECOMMENDATION_RANKING_NEGATIVE_USE_MARGIN_PENALTY", True),
         "use_threshold_penalty": _env_bool("RECOMMENDATION_RANKING_NEGATIVE_USE_THRESHOLD_PENALTY", True),
-        "hard_filter_threshold": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_HARD_FILTER_THRESHOLD", "0.97")),
+        "hard_filter_threshold": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_HARD_FILTER_THRESHOLD", "0.94")),
         "enable_hard_filter": _env_bool("RECOMMENDATION_RANKING_NEGATIVE_ENABLE_HARD_FILTER", False),
         "debug_enabled": _env_bool("RECOMMENDATION_RANKING_NEGATIVE_DEBUG_ENABLED", True),
     },
@@ -435,10 +437,12 @@ RECOMMENDATION_CONFIG: Dict[str, Any] = {
         # 只对基础相关性靠前的候选补 evidence concepts，避免在大召回池上无差别调用 LLM。
         "enabled": _env_bool("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_ENABLED", True),
         "top_k": _env_int("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_TOP_K", 20),
+        # 单次请求最多发起（同步执行或提交后台）的概念抽取次数。
         "max_llm_calls": _env_int("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_MAX_LLM_CALLS", 5),
-        # 当前推荐接口优先保障稳定延迟；打开后只复用缓存，不在主链路同步等待新的概念抽取。
+        # 打开后主链路只复用缓存，缺失的概念抽取提交到后台线程执行并写回缓存，下次请求即可命中。
+        # 搜索重排链路无论该开关如何都走后台抽取，不在请求里同步等待 LLM。
         "allow_lazy_generation": _env_bool("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_ALLOW_LAZY_GENERATION", False),
-        # 预留异步开关；当前实现与 lazy 一致，都用于禁止主链路继续发起新的 LLM 调用。
+        # 与 allow_lazy_generation 等价（任一开启即走后台抽取），保留以兼容旧配置。
         "allow_async_generation": _env_bool("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_ALLOW_ASYNC_GENERATION", False),
         "cache_version": _env_str(
             "RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_CACHE_VERSION",
@@ -453,8 +457,9 @@ RECOMMENDATION_CONFIG: Dict[str, Any] = {
         # deprecated: 负向扣分已迁移到 recommendation.ranking.negative.penalty_weight / max_penalty。
         "disliked_penalty": float(_env_str("RECOMMENDATION_SCORE_WEIGHT_DISLIKED_PENALTY", "0.15")),
     },
+    # 多样性选择中“语义重复”的判定阈值，基于 max(0, cos) 口径（旧 (cos+1)/2 口径的 0.75 等价于 0.5）。
     "semantic_similarity_penalty_threshold": float(
-        _env_str("RECOMMENDATION_SEMANTIC_SIMILARITY_PENALTY_THRESHOLD", "0.75")
+        _env_str("RECOMMENDATION_SEMANTIC_SIMILARITY_PENALTY_THRESHOLD", "0.5")
     ),
     "cluster_diversity_component_weight": float(_env_str("RECOMMENDATION_CLUSTER_DIVERSITY_COMPONENT_WEIGHT", "0.3")),
     "semantic_diversity_component_weight": float(_env_str("RECOMMENDATION_SEMANTIC_DIVERSITY_COMPONENT_WEIGHT", "0.7")),
