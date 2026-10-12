@@ -5,8 +5,10 @@ import json
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pymilvus.exceptions import MilvusException
 
 import dependencies
+from core.errors import AppError
 from routers import paper_router
 
 
@@ -255,6 +257,20 @@ class PaperRouterApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["title"], "Recovered Paper")
         self.assertEqual(response.json()["abstract"], "Recovered abstract")
+
+    def test_get_paper_returns_503_when_vector_store_unavailable(self) -> None:
+        self.client.app.add_exception_handler(AppError, lambda _request, exc: exc.to_response())
+        self.recommendation_service.source_paper = {"arxiv_id": "2401.00005", "title": "Remote Paper"}
+
+        def _milvus_down(*_args, **_kwargs):
+            raise MilvusException(code=2, message="Fail connecting to server on localhost:19530")
+
+        self.recommendation_service._ensure_paper_materialized = _milvus_down
+
+        response = self.client.get("/api/paper/2401.00005")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["code"], "vector_store_error")
 
     def test_delete_paper_returns_success_and_404(self) -> None:
         self.paper_storage.add_paper({"arxiv_id": "2401.00003", "title": "Delete Me"})

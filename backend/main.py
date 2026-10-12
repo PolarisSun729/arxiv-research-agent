@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pymilvus.exceptions import MilvusException
 
 from auth.api_key_middleware import ApiKeyMiddleware, ApiKeySettings, verify_api_key
 from auth.jwt_handler import JwtAuthenticator
@@ -139,6 +140,11 @@ def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None
             exc.detail,
         )
         return exc.to_response()
+
+    @app.exception_handler(MilvusException)
+    async def vector_store_error_handler(request: Request, exc: MilvusException) -> JSONResponse:
+        # 业务层漏掉的向量库异常统一归为可重试的 503，避免 Milvus 宕机被报成 unknown_error。
+        return await app_error_handler(request, AppError(ErrorCode.VECTOR_STORE_ERROR, detail=exc))
 
     @app.exception_handler(HTTPException)
     async def http_error_handler(request: Request, exc: HTTPException) -> JSONResponse:

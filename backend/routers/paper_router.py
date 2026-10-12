@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from pymilvus.exceptions import MilvusException
 
 from auth.charging import charge
 from auth.context import current_auth
@@ -323,6 +324,14 @@ async def get_paper(
         raise HTTPException(status_code=404, detail="Paper not found")
     except (HTTPException, AppError):
         raise
+    except MilvusException as exc:
+        # 向量库不可达属于依赖服务故障，返回可重试的 503，而不是看起来像代码 bug 的 500。
+        logger.error("Vector store unavailable while getting paper %s: %s", arxiv_id, exc)
+        raise AppError(
+            ErrorCode.VECTOR_STORE_ERROR,
+            detail=exc,
+            context={"arxiv_id": arxiv_id, "stage": "get_paper"},
+        ) from exc
     except Exception as exc:
         logger.error("Error getting paper: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
