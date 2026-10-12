@@ -810,6 +810,15 @@ def test_duplicate_only_search_stops_with_no_progress_reason() -> None:
                     "query": "reflection token ablation",
                     "reason_code": "OPEN_EVIDENCE_NEED",
                 },
+                # 停滞后先兜底起草一次；起草后再提检索会被门禁拒绝并有界收口。
+                {
+                    "action": "search_paper",
+                    "target_need_id": "need-ablation",
+                    "objective": "verify_claim",
+                    "retrieval_mode": "experiment",
+                    "query": "reflection token ablation results",
+                    "reason_code": "UNSUPPORTED_CORE_CLAIM",
+                },
             ]
         ),
         retriever=DuplicateContentRetriever(),
@@ -823,6 +832,112 @@ def test_duplicate_only_search_stops_with_no_progress_reason() -> None:
     assert result.outcome == "abstained"
     assert result.research_summary.retrieval_count == 2
     assert result.research_summary.termination_reason == "NO_PROGRESS_LIMIT_REACHED"
+
+
+def test_no_progress_with_evidence_pool_drafts_before_stopping() -> None:
+    # 复现线上弃答：首轮召回已填满证据池，次轮新候选全部因池满落选，曾因"无进展"直接弃答而从未起草。
+    policy = ScriptedPolicyFromActions(
+        [
+            {
+                "action": "search_paper",
+                "target_need_id": "need-method",
+                "objective": "discover",
+                "retrieval_mode": "method",
+                "query": "reflection token mechanism",
+                "reason_code": "OPEN_EVIDENCE_NEED",
+            },
+            {
+                "action": "search_paper",
+                "target_need_id": "need-ablation",
+                "objective": "discover",
+                "retrieval_mode": "experiment",
+                "query": "reflection token ablation",
+                "reason_code": "OPEN_EVIDENCE_NEED",
+            },
+            {
+                "action": "search_paper",
+                "target_need_id": "need-ablation",
+                "objective": "verify_claim",
+                "retrieval_mode": "experiment",
+                "query": "reflection token ablation results",
+                "reason_code": "UNSUPPORTED_CORE_CLAIM",
+            },
+        ]
+    )
+    service = PaperEvidenceResearchService(
+        question_analyzer=ScriptedQuestionAnalyzer(),
+        decision_policy=policy,
+        retriever=ScriptedRetriever(),
+        draft_generator=ScriptedDraftGenerator(),
+        claim_extractor=ScriptedClaimExtractor(),
+        claim_verifier=ScriptedClaimVerifier(),
+    )
+
+    result = service.research(
+        _request(run_id="research-run-pool-full", limits=ResearchLimits(max_evidence_items=1, max_no_progress=1))
+    )
+
+    assert result.research_summary.retrieval_count == 2
+    assert result.research_summary.draft_attempt_count == 1
+    assert result.outcome == "partial"
+    assert [citation.source_id for citation in result.citations] == ["chunk-method"]
+    assert result.research_summary.termination_reason == "NO_PROGRESS_LIMIT_REACHED"
+
+
+class RecordingPolicy(ScriptedPolicyFromActions):
+    def __init__(self, actions: list[dict[str, Any]]) -> None:
+        super().__init__(actions)
+        self.contexts: list[Any] = []
+
+    def decide(self, context: Any) -> dict[str, Any]:
+        self.contexts.append(context)
+        return super().decide(context)
+
+
+def test_decision_context_exposes_pool_fullness_and_need_evidence() -> None:
+    # 决策器只看到计数时会把"需求状态未变"误读为"没找到证据"而反复检索；必须让它看到池满与证据摘要。
+    policy = RecordingPolicy(
+        [
+            {
+                "action": "search_paper",
+                "target_need_id": "need-method",
+                "objective": "discover",
+                "retrieval_mode": "method",
+                "query": "reflection token mechanism",
+                "reason_code": "OPEN_EVIDENCE_NEED",
+            },
+            {"action": "abstain", "reason_code": "TEST_STOP"},
+        ]
+    )
+    events: list[dict[str, Any]] = []
+    service = PaperEvidenceResearchService(
+        question_analyzer=ScriptedQuestionAnalyzer(),
+        decision_policy=policy,
+        retriever=ScriptedRetriever(),
+        draft_generator=ScriptedDraftGenerator(),
+        claim_extractor=ScriptedClaimExtractor(),
+        claim_verifier=ScriptedClaimVerifier(),
+    )
+
+    service.research(
+        _request(run_id="research-run-context", limits=ResearchLimits(max_evidence_items=1)),
+        trace_listener=lambda _run_id, trace: events.extend(trace),
+    )
+
+    first, second = policy.contexts
+    assert first.evidence_pool_full is False
+    assert second.evidence_pool_capacity == 1
+    assert second.evidence_pool_full is True
+    digest = {item.need_id: item for item in second.need_evidence}
+    assert digest["need-method"].candidate_count == 1
+    assert "reflection token decides" in digest["need-method"].previews[0]
+    assert "Method" in digest["need-method"].previews[0]
+    assert digest["need-ablation"].candidate_count == 0
+    proposed = [event for event in events if event["event_type"] == "action_proposed"]
+    assert proposed[0]["target_need_id"] == "need-method"
+    assert proposed[0]["reason_code"] == "OPEN_EVIDENCE_NEED"
+    assert proposed[0]["query"] == "reflection token mechanism"
+    assert proposed[1]["reason_code"] == "TEST_STOP"
 
 
 def test_malformed_model_action_consumes_invalid_action_budget() -> None:

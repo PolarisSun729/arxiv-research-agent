@@ -22,6 +22,7 @@ from .state import (
     DraftAnswer,
     DraftGenerationRequest,
     EvidenceNeed,
+    NeedEvidenceDigest,
     PaperEvidenceResearchState,
     ResearchDecisionContext,
 )
@@ -29,6 +30,9 @@ from .state import (
 
 # 研究轨迹是审计与评测数据源，不是第二份候选池；单轮召回记录数封顶防止轨迹被异常检索器撑爆。
 _MAX_TRACED_CANDIDATES = 50
+# 决策上下文只放每个需求的前几条证据摘要，足够判断"是否已对题"，又不把决策 prompt 撑成生成 prompt。
+_MAX_DECISION_PREVIEWS_PER_NEED = 3
+_DECISION_PREVIEW_CHARS = 160
 logger = logging.getLogger(__name__)
 
 
@@ -101,6 +105,47 @@ def _prepare_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperE
     return next_state
 
 
+def _evidence_pool_full(state: PaperEvidenceResearchState) -> bool:
+    limits = state.request.limits
+    total_chars = sum(len(candidate.content) for candidate in state.evidence_candidates.values())
+    # 与 merge_candidates 的入池上界保持一致：条数或字符任一触顶，新候选都进不了池。
+    return len(state.evidence_candidates) >= limits.max_evidence_items or total_chars >= limits.max_total_context_chars
+
+
+def _need_evidence_digest(state: PaperEvidenceResearchState) -> list[NeedEvidenceDigest]:
+    digests: list[NeedEvidenceDigest] = []
+    for need in state.evidence_needs:
+        # 候选按入池顺序排列，即首次召回的排名顺序；只给前几条摘要，让决策器判断证据是否已对题。
+        matched = [
+            candidate for candidate in state.evidence_candidates.values() if need.need_id in candidate.matched_need_ids
+        ]
+        previews = []
+        for candidate in matched[:_MAX_DECISION_PREVIEWS_PER_NEED]:
+            location = " ".join(
+                part
+                for part in (
+                    candidate.chunk_type,
+                    candidate.section_path,
+                    f"p{candidate.page_number}" if candidate.page_number is not None else "",
+                )
+                if part
+            )
+            snippet = " ".join(candidate.content.split())[:_DECISION_PREVIEW_CHARS]
+            previews.append(f"[{location}] {snippet}")
+        digests.append(NeedEvidenceDigest(need_id=need.need_id, candidate_count=len(matched), previews=previews))
+    return digests
+
+
+def _action_trace_fields(action: Any) -> dict[str, Any]:
+    # 轨迹记录动作的语义参数（目标需求、理由码、查询），事后才能解释决策器为什么这么选。
+    fields: dict[str, Any] = {"reason_code": action.reason_code}
+    if isinstance(action, SearchPaperAction):
+        fields.update(target_need_id=action.target_need_id, objective=action.objective, query=action.query)
+    elif isinstance(action, DraftAnswerAction):
+        fields["addressed_need_ids"] = list(action.addressed_need_ids)
+    return fields
+
+
 def _decide_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEvidenceResearchState:
     next_state = _coerce_state(state)
     context = ResearchDecisionContext(
@@ -109,7 +154,9 @@ def _decide_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEv
         candidate_count=len(next_state.evidence_candidates),
         current_draft_version=next_state.current_draft.version if next_state.current_draft else None,
         claim_assessments=next_state.claim_assessments,
-        retrievals_remaining=max(0, next_state.request.limits.max_retrievals - next_state.retrieval_count),
+        retrievals_remaining=0 if next_state.retrieval_stalled else max(
+            0, next_state.request.limits.max_retrievals - next_state.retrieval_count
+        ),
         drafts_remaining=max(0, next_state.request.limits.max_draft_attempts - next_state.draft_attempt_count),
         retrievals_used=next_state.retrieval_count,
         candidate_need_ids=sorted(
@@ -119,6 +166,9 @@ def _decide_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEv
                 for need_id in candidate.matched_need_ids
             }
         ),
+        evidence_pool_capacity=next_state.request.limits.max_evidence_items,
+        evidence_pool_full=_evidence_pool_full(next_state),
+        need_evidence=_need_evidence_digest(next_state),
     )
     next_state.action_accepted = False
     next_state.action_rejection_code = None
@@ -137,7 +187,12 @@ def _decide_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEv
             rejection_code="ACTION_SCHEMA_INVALID",
         )
         return next_state
-    _trace(next_state, "action_proposed", action=next_state.pending_action.action)
+    _trace(
+        next_state,
+        "action_proposed",
+        action=next_state.pending_action.action,
+        **_action_trace_fields(next_state.pending_action),
+    )
     return next_state
 
 
@@ -167,7 +222,11 @@ def _validate_node(state: Any) -> PaperEvidenceResearchState:
 def _route_after_validation(state: Any) -> str:
     current = _coerce_state(state)
     if not current.action_accepted:
-        if current.action_rejection_code in {"RETRIEVAL_BUDGET_EXHAUSTED", "DRAFT_BUDGET_EXHAUSTED"}:
+        if current.action_rejection_code in {
+            "RETRIEVAL_BUDGET_EXHAUSTED",
+            "DRAFT_BUDGET_EXHAUSTED",
+            "NO_PROGRESS_LIMIT_REACHED",
+        }:
             # 预算耗尽是有界研究的正常终止信号，不应继续消耗无效动作重试额度。
             return "terminal"
         if current.invalid_action_count >= current.request.limits.max_invalid_actions:
@@ -237,6 +296,7 @@ def _search_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEv
         ):
             # 连续检索没有扩充证据池时，将有界停止原因显式写入状态，供终态结果和审计信息复用。
             next_state.action_rejection_code = "NO_PROGRESS_LIMIT_REACHED"
+            next_state.retrieval_stalled = True
     else:
         next_state.no_progress_count = 0
     _trace(
@@ -253,13 +313,23 @@ def _search_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEv
         candidates=_trace_candidate_refs(retrieval.get("retrieval_candidates", candidates)),
         index_snapshot=retrieval.get("index_snapshot"),
     )
+    if (
+        next_state.retrieval_stalled
+        and next_state.current_draft is None
+        and next_state.evidence_candidates
+        and next_state.draft_attempt_count < next_state.request.limits.max_draft_attempts
+    ):
+        # 检索停滞不等于证据不足：池中已有候选却从未起草时，必须先基于现有证据起草校验，
+        # 否则首轮填满证据池后任何一次补检都会让整轮研究空手弃答。
+        next_state.pending_action = DraftAnswerAction(action="draft_answer", reason_code="NO_PROGRESS_FALLBACK_DRAFT")
+        _trace(next_state, "fallback_draft_scheduled", reason_code="NO_PROGRESS_FALLBACK_DRAFT")
     return next_state
 
 
 def _route_after_search(state: Any) -> str:
     current = _coerce_state(state)
     if current.action_rejection_code == "NO_PROGRESS_LIMIT_REACHED":
-        return "terminal"
+        return "draft" if isinstance(current.pending_action, DraftAnswerAction) else "terminal"
     return "decide"
 
 
@@ -620,7 +690,9 @@ def build_paper_evidence_research_graph(
             "terminal": "terminal",
         },
     )
-    graph.add_conditional_edges("search", _route_after_search, {"decide": "decide", "terminal": "terminal"})
+    graph.add_conditional_edges(
+        "search", _route_after_search, {"decide": "decide", "draft": "draft", "terminal": "terminal"}
+    )
     graph.add_edge("draft", "extract_claims")
     graph.add_edge("extract_claims", "verify_claims")
     graph.add_edge("verify_claims", "project_coverage")

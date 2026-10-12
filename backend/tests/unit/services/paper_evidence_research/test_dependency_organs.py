@@ -24,9 +24,11 @@ class FakeGenerationService:
         self.replies = list(replies or [])
         self.raise_on_call = raise_on_call
         self.call_count = 0
+        self.prompts: list[str] = []
 
     def complete_with_qwen(self, prompt: str, **kwargs: Any) -> str:
         self.call_count += 1
+        self.prompts.append(prompt)
         if self.raise_on_call:
             raise RuntimeError("llm unavailable")
         if not self.replies:
@@ -111,6 +113,19 @@ class TestRuleDecisionPolicy:
         )
         assert action["action"] == "draft_answer"
         assert set(action["addressed_need_ids"]) == {"need-a", "need-b"}
+
+    def test_full_evidence_pool_drafts_instead_of_searching_uncovered_need(self) -> None:
+        # 池满时新候选进不了池，给未覆盖需求再检索只会触发无进展终止。
+        action = RuleDecisionPolicy().decide(
+            self._context(
+                candidate_count=20,
+                candidate_need_ids=["need-a"],
+                retrievals_used=1,
+                evidence_pool_capacity=20,
+                evidence_pool_full=True,
+            )
+        )
+        assert action["action"] == "draft_answer"
 
     def test_draft_all_supported_finalizes(self) -> None:
         from services.paper_evidence_research.state import ClaimAssessment
@@ -353,6 +368,26 @@ class TestLlmDecisionPolicy:
         action = policy.decide(self._context())
         assert action["action"] == "search_paper"
         assert action["query"] == "核心需求检索词"
+
+    def test_prompt_carries_pool_fullness_and_need_evidence_previews(self) -> None:
+        service = FakeGenerationService([json.dumps({"action": "draft_answer", "reason_code": "POOL_FULL"})])
+        policy = LlmDecisionPolicy(service)
+        policy.decide(
+            self._context(
+                candidate_count=20,
+                candidate_need_ids=["need-a"],
+                evidence_pool_capacity=20,
+                evidence_pool_full=True,
+                need_evidence=[
+                    {"need_id": "need-a", "candidate_count": 20, "previews": ["[figure p4] Figure 2: Overall Architecture"]}
+                ],
+            )
+        )
+        state = json.loads(service.prompts[0].split("Research state:\n", 1)[1])
+        assert state["evidence_pool_full"] is True
+        assert state["evidence_pool_capacity"] == 20
+        assert state["need_evidence"][0]["previews"] == ["[figure p4] Figure 2: Overall Architecture"]
+        assert '"evidence_pool_full" is true' in service.prompts[0]
 
     @pytest.mark.parametrize(
         "reply",

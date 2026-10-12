@@ -19,6 +19,8 @@ def validate_action(state: PaperEvidenceResearchState, action: ResearchAction) -
         # 检索动作只能面向仍可推进的需求，并在调用昂贵依赖前执行确定性预算和参数检查。
         if state.retrieval_count >= limits.max_retrievals:
             return ActionValidationResult(False, "RETRIEVAL_BUDGET_EXHAUSTED")
+        if state.retrieval_stalled:
+            return ActionValidationResult(False, "NO_PROGRESS_LIMIT_REACHED")
         if not action.query.strip():
             return ActionValidationResult(False, "SEARCH_QUERY_EMPTY")
         if not any(need.need_id == action.target_need_id and need.status in {"provisional", "open"} for need in state.evidence_needs):

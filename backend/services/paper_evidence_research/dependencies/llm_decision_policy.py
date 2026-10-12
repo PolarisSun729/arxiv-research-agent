@@ -27,9 +27,12 @@ Rules:
 1. Return JSON only, no extra text before or after.
 2. Choose "finalize_answer" only when every claim assessment is "supported" and no core need is open.
 3. Choose "abstain" only when the paper clearly cannot answer the question and no further action would help.
-4. Use "search_paper" to gather evidence for an open core need; write a concrete retrieval query.
-5. Use "draft_answer" to (re)write the answer from current evidence; list the need ids it addresses.
-6. The action JSON schemas are:
+4. Need status stays "provisional"/"open" until a draft is verified; retrieval alone never changes it. Judge coverage from "need_evidence" (candidate counts and previews), not from status.
+5. Drafting is how coverage gets confirmed: the draft is verified claim by claim and the verdicts show exactly what is still missing. If there is no draft yet and any core need already has candidates whose previews look on-topic, choose "draft_answer" instead of searching again.
+6. Use "search_paper" only for a core need with no on-topic candidates, or for a gap named by an unsupported claim assessment; write a concrete retrieval query that differs from earlier ones.
+7. Never choose "search_paper" when "evidence_pool_full" is true or "retrievals_remaining" is 0: new candidates cannot enter the pool, so the search is wasted.
+8. Use "draft_answer" to (re)write the answer from current evidence; list the need ids it addresses.
+9. The action JSON schemas are:
    {{"action": "search_paper", "target_need_id": "...", "objective": "discover|verify_claim|resolve_conflict|check_absence", "retrieval_mode": "broad|definition|method|experiment|comparison|numeric", "query": "...", "section_hints": [], "reason_code": "..."}}
    {{"action": "draft_answer", "addressed_need_ids": ["..."], "reason_code": "..."}}
    {{"action": "finalize_answer", "reason_code": "..."}}
@@ -92,6 +95,16 @@ class LlmDecisionPolicy:
             ],
             "candidate_count": getattr(context, "candidate_count", 0),
             "candidate_need_ids": list(getattr(context, "candidate_need_ids", []) or []),
+            "evidence_pool_capacity": getattr(context, "evidence_pool_capacity", 0),
+            "evidence_pool_full": bool(getattr(context, "evidence_pool_full", False)),
+            "need_evidence": [
+                {
+                    "need_id": getattr(item, "need_id", ""),
+                    "candidate_count": getattr(item, "candidate_count", 0),
+                    "previews": list(getattr(item, "previews", []) or []),
+                }
+                for item in getattr(context, "need_evidence", []) or []
+            ],
             "current_draft_version": getattr(context, "current_draft_version", None),
             "claim_assessments": [
                 {"claim_id": getattr(item, "claim_id", ""), "verdict": getattr(item, "verdict", "")}

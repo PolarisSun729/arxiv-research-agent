@@ -103,6 +103,14 @@ class ClaimVerificationRequest(BaseModel):
         return self.context_pack.candidates
 
 
+class NeedEvidenceDigest(BaseModel):
+    """决策器看到的单个需求的证据概况：候选数加少量摘要，不暴露完整正文。"""
+
+    need_id: str
+    candidate_count: int = 0
+    previews: list[str] = Field(default_factory=list)
+
+
 class ResearchDecisionContext(BaseModel):
     research_question: str
     evidence_needs: list[EvidenceNeed]
@@ -114,6 +122,10 @@ class ResearchDecisionContext(BaseModel):
     # 规则兜底策略所需的最小进度信息：已消耗的检索轮数与已有候选覆盖到的需求集合。
     retrievals_used: int = 0
     candidate_need_ids: list[str] = Field(default_factory=list)
+    # 证据池满后新候选无法入池，继续检索必然无进展；决策器需要据此转向起草。
+    evidence_pool_capacity: int = 0
+    evidence_pool_full: bool = False
+    need_evidence: list[NeedEvidenceDigest] = Field(default_factory=list)
 
 
 class PaperEvidenceResearchState(BaseModel):
@@ -134,6 +146,8 @@ class PaperEvidenceResearchState(BaseModel):
     verification_count: int = 0
     citation_repair_count: int = 0
     no_progress_count: int = 0
+    # 连续无进展后检索通道关闭：后续只允许基于现有证据池起草、定稿或弃答。
+    retrieval_stalled: bool = False
     invalid_action_count: int = 0
     trace_events: list[dict[str, Any]] = Field(default_factory=list)
     result: PaperEvidenceResearchResult | None = None
