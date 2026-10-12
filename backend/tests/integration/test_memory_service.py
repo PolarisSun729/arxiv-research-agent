@@ -341,6 +341,23 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.memory_service.rebuild_user_research_profile(self.user_id)
         self.assertIsNotNone(self.storage.paper_profile_evidence.get_paper_profile_evidence(self.arxiv_id))
 
+    def test_stale_note_saved_event_without_note_is_ignored_in_profile_evidence(self) -> None:
+        note = self.storage.paper_notes.create_paper_note(
+            user_id=self.user_id,
+            arxiv_id=self.arxiv_id,
+            content="Deleted before event retraction existed",
+            include_in_profile=True,
+        )
+        # 绕过 store 直接删行，模拟撤销逻辑上线前删除笔记留下的 note_saved 事件。
+        with self.storage.paper_notes._get_connection() as conn:
+            conn.execute("DELETE FROM paper_notes WHERE note_id = ?", (note["note_id"],))
+            conn.commit()
+
+        evidence = self.memory_service._collect_research_profile_evidence(self.user_id)
+
+        self.assertEqual(evidence["notes"], [])
+        self.assertNotIn("note_saved", {action.get("action_type") for action in evidence["recent_actions"]})
+
     def test_like_paper_keeps_categories_and_titles_out_of_topics(self) -> None:
         self._record_preference_event(
             self.arxiv_id,

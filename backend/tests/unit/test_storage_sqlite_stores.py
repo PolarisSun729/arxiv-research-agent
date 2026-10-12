@@ -648,6 +648,47 @@ class StorageContainerSqliteTests(unittest.TestCase):
         self.assertTrue(self.storage.paper_notes.delete_paper_note(note["note_id"], user_id=self.user_id))
         self.assertIsNone(self.storage.paper_notes.get_paper_note(note["note_id"], user_id=self.user_id))
 
+    def _active_note_event_types(self, note_id: str) -> set:
+        return {
+            event["event_type"]
+            for event in self.storage.profile_events.list_user_profile_events(self.user_id)
+            if event["note_id"] == note_id
+        }
+
+    def test_deleting_profile_note_retracts_only_its_own_profile_event(self) -> None:
+        kept = self.storage.paper_notes.create_paper_note(
+            user_id=self.user_id, arxiv_id="2401.00008", content="keep", include_in_profile=True
+        )
+        removed = self.storage.paper_notes.create_paper_note(
+            user_id=self.user_id, arxiv_id="2401.00008", content="remove", include_in_profile=True
+        )
+
+        self.assertTrue(self.storage.paper_notes.delete_paper_note(removed["note_id"], user_id=self.user_id))
+
+        self.assertEqual(self._active_note_event_types(removed["note_id"]), {"note_saved_removed"})
+        self.assertEqual(self._active_note_event_types(kept["note_id"]), {"note_saved"})
+
+    def test_deleting_private_note_writes_no_profile_event(self) -> None:
+        note = self.storage.paper_notes.create_paper_note(
+            user_id=self.user_id, arxiv_id="2401.00008", content="private", include_in_profile=False
+        )
+
+        self.assertTrue(self.storage.paper_notes.delete_paper_note(note["note_id"], user_id=self.user_id))
+
+        self.assertEqual(self._active_note_event_types(note["note_id"]), set())
+        self.assertFalse(self.storage.paper_notes.delete_paper_note(note["note_id"], user_id=self.user_id))
+
+    def test_excluding_note_from_profile_retracts_event_and_reincluding_restores_it(self) -> None:
+        note = self.storage.paper_notes.create_paper_note(
+            user_id=self.user_id, arxiv_id="2401.00008", content="toggle", include_in_profile=True
+        )
+
+        self.storage.paper_notes.update_paper_note(note["note_id"], user_id=self.user_id, include_in_profile=False)
+        self.assertEqual(self._active_note_event_types(note["note_id"]), {"note_saved_removed"})
+
+        self.storage.paper_notes.update_paper_note(note["note_id"], user_id=self.user_id, include_in_profile=True)
+        self.assertEqual(self._active_note_event_types(note["note_id"]), {"note_saved", "note_saved_removed"})
+
     def test_list_user_profile_notes_returns_only_included_notes(self) -> None:
         self.storage.paper_notes.create_paper_note(
             user_id=self.user_id,

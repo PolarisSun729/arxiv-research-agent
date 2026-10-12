@@ -1,10 +1,17 @@
-from __future__ import annotations
-
-"""arXiv 论文检索与下载路由。
+"""arXiv 论文检索与下载路由（挂载在 /api/arxiv 下）。
 
 该模块只负责 HTTP 入参、搜索请求归一化和错误转换；真正的搜索能力由
-依赖注入层选择的统一后端协议提供，避免路由里重新长出本地/远程分支。
+依赖注入层选择的统一后端协议提供（本地 OAI 库或远程 arXiv API），
+避免路由里重新长出本地/远程分支。
+
+接口一览：
+- POST /search      结构化或自由文本检索；
+- GET  /fields      当前后端支持的查询字段前缀；
+- GET  /categories  当前后端支持展示的学科分类；
+- POST /download    把指定论文 PDF 下载到服务器本地（供后续解析与建索引）。
 """
+
+from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional
@@ -46,8 +53,17 @@ class ArxivSearchRequest(BaseModel):
     sort_order: str = Field("descending", description="排序方向")
     submitted_days_ago: Optional[int] = Field(None, description="搜索提交日期在多少天内的文章")
 
+
 def _prepare_search_request(request: ArxivSearchRequest, *, append_date_when_query_missing: bool) -> Dict[str, Any]:
-    """把 HTTP 请求模型转换成统一搜索后端能执行的参数。"""
+    """把 HTTP 请求模型转换成统一搜索后端能执行的参数。
+
+    query_builder 会把 title/author/category 等结构化字段与 search_query 合并成最终的
+    arXiv 查询串（final_search_query），并完成分页、排序参数的合法性校验；
+    参数不合法时抛出带 code / status_code 的结构化异常，由 _raise_arxiv_http_error 转换。
+
+    append_date_when_query_missing：没有任何查询词、只给了 submitted_days_ago 时，
+    是否仅用日期范围作为查询条件；HTTP 检索传 False，要求调用方至少给出一个查询条件。
+    """
     return prepare_arxiv_search_request(
         search_query=request.search_query,
         id_list=request.id_list,
@@ -73,7 +89,14 @@ def _prepare_search_request(request: ArxivSearchRequest, *, append_date_when_que
 
 
 def _raise_arxiv_http_error(exc: Exception, *, operation: str, default_status_code: int = 500) -> None:
-    """把搜索边界的结构化异常转换成 FastAPI HTTPException。"""
+    """把搜索边界的结构化异常转换成 FastAPI HTTPException（该函数总是抛出，不会正常返回）。
+
+    转换规则：
+    1. 已是 HTTPException：原样抛出；
+    2. 带 to_error_detail() 或 code 属性的结构化异常（如查询参数校验失败）：
+       使用异常自带的 status_code（默认 400）和结构化 detail；
+    3. 其他未知异常：按 default_status_code（默认 500）返回异常文本。
+    """
     if isinstance(exc, HTTPException):
         # 已经是 HTTP 边界异常时保持原状态码，避免二次包装成 500 掩盖真实输入错误。
         raise exc
@@ -81,6 +104,7 @@ def _raise_arxiv_http_error(exc: Exception, *, operation: str, default_status_co
     detail_factory = getattr(exc, "to_error_detail", None)
     error_code = str(getattr(exc, "code", "") or "")
     if callable(detail_factory) or error_code:
+        # 结构化异常优先使用自带的 detail，前端可以据此展示具体是哪个字段不合法。
         detail = detail_factory() if callable(detail_factory) else {"code": error_code, "message": str(exc)}
         raise HTTPException(status_code=int(getattr(exc, "status_code", 400)), detail=detail)
     raise HTTPException(status_code=default_status_code, detail=str(exc))
@@ -91,7 +115,7 @@ async def arxiv_search(
     request: Optional[ArxivSearchRequest] = Body(None),
     arxiv_backend=Depends(get_arxiv_search_backend),
 ):
-    """执行 arXiv 检索。"""
+    """执行 arXiv 检索，返回搜索后端的原始结果（论文列表与分页信息）。"""
     try:
         # 空请求体仍走统一校验，最终会得到明确的 400，而不是路由层 422。
         prepared = _prepare_search_request(request or ArxivSearchRequest(), append_date_when_query_missing=False)
@@ -133,7 +157,11 @@ async def arxiv_download(
     pdf_url: str = Body(...),
     arxiv_api_service=Depends(get_arxiv_api_service),
 ):
-    """下载指定 arXiv 论文 PDF 到本地。"""
+    """下载指定 arXiv 论文 PDF 到服务器本地，返回保存路径。
+
+    服务层只接受指向同一篇论文的 arxiv.org 官方 PDF 地址，防止被利用为任意 URL 下载（SSRF）
+    或通过 arxiv_id 进行路径穿越；校验失败时抛出结构化异常，在此转换为 4xx。
+    """
     try:
         # 下载含重试等待和 PDF 校验，期间仍需响应认证、限流与健康检查。
         filepath = await run_in_threadpool(arxiv_api_service.download_pdf, pdf_url, arxiv_id)

@@ -1,111 +1,32 @@
-import sqlite3
 import uuid
 from typing import Any, Dict, List, Optional
 
-from services.storage.sqlite.base import BaseSqliteStore
 from services.storage.sqlite.shared import DEFAULT_USER_ID, logger
-from services.storage.sqlite.stores.paper_chat_sessions import PaperChatSessionStore
-from services.storage.sqlite.stores.profile_events import ProfileEventStore
+from services.storage.sqlite.stores.paper_chat_common import (
+    PAPER_CHAT_MESSAGE_COLUMNS,
+    PaperChatStoreBase,
+    select_columns,
+)
+
+# 带 m. 前缀的消息列，用于和 paper_chat_sessions JOIN 校验会话归属的查询。
+_MESSAGE_COLUMNS_M = select_columns(PAPER_CHAT_MESSAGE_COLUMNS, "m")
 
 
-class PaperChatMessageStore(BaseSqliteStore):
-    """维护论文问答消息生命周期；双消息 QA turn 的原子写入仍由主流程单独处理。"""
+class PaperChatMessageStore(PaperChatStoreBase):
+    """维护论文问答消息生命周期；双消息 QA turn 的原子写入由 PaperQATurnStore 单独处理。
 
-    def __init__(self, connection_provider, session_store: PaperChatSessionStore, profile_event_store: ProfileEventStore) -> None:
-        super().__init__(connection_provider)
-        self.session_store = session_store
-        self.profile_event_store = profile_event_store
-
-    def record_user_profile_event(self, *args, **kwargs):
-        """消息写入只负责记录弱信号，具体事件去重和状态流转交给画像事件 Store。"""
-        return self.profile_event_store.record_user_profile_event(*args, **kwargs)
-
-    def _row_to_paper_chat_session(self, row: Any) -> Dict[str, Any]:
-        return self.session_store._row_to_paper_chat_session(row)
-
-    def _row_to_paper_chat_message(self, row: Any) -> Dict[str, Any]:
-        return {
-            'message_id': row[0],
-            'turn_id': row[1] or '',
-            'session_id': row[2],
-            'role': row[3],
-            'content': row[4] or '',
-            'sources': self._deserialize_json_field(row[5]) or [],
-            'retrieval_debug_snapshot': self._deserialize_json_field(row[6]),
-            'contextualized_question': row[7] or '',
-            'question_contextualization': self._deserialize_json_field(row[8]),
-            'status': row[9] or 'completed',
-            'created_at': row[10],
-        }
-
-    def _get_paper_chat_message_in_transaction(self, cursor: sqlite3.Cursor, message_id: str) -> Optional[Dict[str, Any]]:
-        cursor.execute(
-            '''
-            SELECT message_id, turn_id, session_id, role, content, sources,
-                   retrieval_debug_snapshot, contextualized_question, question_contextualization,
-                   status, created_at
-            FROM paper_chat_messages
-            WHERE message_id = ?
-            ''',
-            (message_id,),
-        )
-        row = cursor.fetchone()
-        return self._row_to_paper_chat_message(row) if row else None
-
-    def _get_paper_chat_session_in_transaction(self, cursor: sqlite3.Cursor, session_id: str) -> Optional[Dict[str, Any]]:
-        cursor.execute(
-            '''
-            SELECT session_id, user_id, arxiv_id, title, created_at, updated_at, message_count, status,
-                   summary_json, summary_updated_at, summary_turn_count, summary_last_turn_id
-            FROM paper_chat_sessions
-            WHERE session_id = ?
-            ''',
-            (session_id,),
-        )
-        row = cursor.fetchone()
-        return self._row_to_paper_chat_session(row) if row else None
-
-    def _refresh_paper_chat_session_stats(self, conn: sqlite3.Connection, session_id: str) -> None:
-        cursor = conn.cursor()
-        cursor.execute(
-            '''
-            SELECT COUNT(*), MAX(created_at)
-            FROM paper_chat_messages
-            WHERE session_id = ?
-            ''',
-            (session_id,),
-        )
-        row = cursor.fetchone() or (0, None)
-        message_count = int(row[0] or 0)
-        latest_created_at = row[1]
-        if latest_created_at:
-            cursor.execute(
-                '''
-                UPDATE paper_chat_sessions
-                SET message_count = ?, updated_at = ?, status = COALESCE(status, 'active')
-                WHERE session_id = ?
-                ''',
-                (message_count, latest_created_at, session_id),
-            )
-        else:
-            cursor.execute(
-                '''
-                UPDATE paper_chat_sessions
-                SET message_count = 0, updated_at = CURRENT_TIMESTAMP, status = COALESCE(status, 'active')
-                WHERE session_id = ?
-                ''',
-                (session_id,),
-            )
+    所有读取都 JOIN paper_chat_sessions 并带上 user_id 条件，
+    保证调用方即使拿到别人的 session_id/message_id 也读不到不属于自己的消息。
+    """
 
     def list_paper_chat_messages(self, session_id: str, user_id: str = DEFAULT_USER_ID) -> List[Dict[str, Any]]:
+        """按时间正序返回会话的全部消息，供前端展示完整历史。"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    '''
-                    SELECT m.message_id, m.turn_id, m.session_id, m.role, m.content, m.sources,
-                           m.retrieval_debug_snapshot, m.contextualized_question, m.question_contextualization,
-                           m.status, m.created_at
+                    f'''
+                    SELECT {_MESSAGE_COLUMNS_M}
                     FROM paper_chat_messages m
                     JOIN paper_chat_sessions s ON s.session_id = m.session_id
                     WHERE m.session_id = ? AND s.user_id = ?
@@ -154,16 +75,13 @@ class PaperChatMessageStore(BaseSqliteStore):
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                # 内层按时间倒序取最近 N 条，外层再按正序排回去；rowid 作为同一时间戳下的稳定次序。
                 cursor.execute(
-                    '''
-                    SELECT message_id, turn_id, session_id, role, content, sources,
-                           retrieval_debug_snapshot, contextualized_question, question_contextualization,
-                           status, created_at
+                    f'''
+                    SELECT {select_columns(PAPER_CHAT_MESSAGE_COLUMNS)}
                     FROM (
                         SELECT m.rowid AS message_rowid,
-                               m.message_id, m.turn_id, m.session_id, m.role, m.content, m.sources,
-                               m.retrieval_debug_snapshot, m.contextualized_question, m.question_contextualization,
-                               m.status, m.created_at
+                               {_MESSAGE_COLUMNS_M}
                         FROM paper_chat_messages m
                         JOIN paper_chat_sessions s ON s.session_id = m.session_id
                         WHERE m.session_id = ? AND s.user_id = ?
@@ -180,14 +98,13 @@ class PaperChatMessageStore(BaseSqliteStore):
             return []
 
     def get_paper_chat_message(self, message_id: str, user_id: str = DEFAULT_USER_ID) -> Optional[Dict[str, Any]]:
+        """按 message_id 读取单条消息；消息所属会话不属于该用户时返回 None。"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    '''
-                    SELECT m.message_id, m.turn_id, m.session_id, m.role, m.content, m.sources,
-                           m.retrieval_debug_snapshot, m.contextualized_question, m.question_contextualization,
-                           m.status, m.created_at
+                    f'''
+                    SELECT {_MESSAGE_COLUMNS_M}
                     FROM paper_chat_messages m
                     JOIN paper_chat_sessions s ON s.session_id = m.session_id
                     WHERE m.message_id = ? AND s.user_id = ?
@@ -208,14 +125,13 @@ class PaperChatMessageStore(BaseSqliteStore):
         role: str = 'assistant',
         user_id: str = DEFAULT_USER_ID,
     ) -> Optional[Dict[str, Any]]:
+        """读取某一轮对话中指定角色的最新一条消息（默认取助手回答），用于重试/续写场景定位。"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    '''
-                    SELECT m.message_id, m.turn_id, m.session_id, m.role, m.content, m.sources,
-                           m.retrieval_debug_snapshot, m.contextualized_question, m.question_contextualization,
-                           m.status, m.created_at
+                    f'''
+                    SELECT {_MESSAGE_COLUMNS_M}
                     FROM paper_chat_messages m
                     JOIN paper_chat_sessions s ON s.session_id = m.session_id
                     WHERE m.session_id = ? AND m.turn_id = ? AND m.role = ? AND s.user_id = ?
@@ -243,6 +159,11 @@ class PaperChatMessageStore(BaseSqliteStore):
         question_contextualization: Optional[Any] = None,
         status: str = 'completed',
     ) -> Optional[Dict[str, Any]]:
+        """追加单条消息并刷新会话统计；会话不存在或不属于该用户时返回 None。
+
+        这是单消息写入路径（流式输出、旧接口等）；一问一答必须同时成功的场景
+        请使用 PaperQATurnStore.append_paper_qa_turn。
+        """
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -282,6 +203,7 @@ class PaperChatMessageStore(BaseSqliteStore):
                 )
 
                 if role == 'user' and not str(session_row[1] or '').strip() and content:
+                    # 会话还没有标题时，用第一条用户问题的前 80 个字符作为标题。
                     cursor.execute(
                         '''
                         UPDATE paper_chat_sessions
@@ -315,6 +237,7 @@ class PaperChatMessageStore(BaseSqliteStore):
             return None
 
     def clear_paper_chat_session(self, session_id: str, user_id: str = DEFAULT_USER_ID) -> bool:
+        """清空会话内的全部消息但保留会话本身；子查询保证只能清空自己名下的会话。"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -336,25 +259,10 @@ class PaperChatMessageStore(BaseSqliteStore):
             return False
 
     def delete_paper_chat_session(self, session_id: str, user_id: str = DEFAULT_USER_ID) -> bool:
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    '''
-                    DELETE FROM paper_chat_messages
-                    WHERE session_id = ?
-                    ''',
-                    (session_id,),
-                )
-                cursor.execute(
-                    '''
-                    DELETE FROM paper_chat_sessions
-                    WHERE session_id = ? AND user_id = ?
-                    ''',
-                    (session_id, user_id),
-                )
-                conn.commit()
-                return cursor.rowcount > 0
-        except Exception as e:
-            logger.error(f"Error deleting paper chat session: {str(e)}")
-            return False
+        """删除整个会话（消息 + 会话记录），统一委托给会话 Store。
+
+        这里曾经有一份独立实现：先无条件按 session_id 删除消息、再按 user_id 删除会话，
+        既会误删他人会话下的消息，也没有把 paper_notes.session_id 置空。
+        会话 Store 的实现先校验归属、再在同一事务内完成三步清理，是唯一可信版本。
+        """
+        return self.session_store.delete_paper_chat_session(session_id, user_id=user_id)

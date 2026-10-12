@@ -119,9 +119,6 @@ def load_retrieval_modules() -> Dict[str, Any]:
             },
         }
     )
-    enhanced_module.MEMORY_RUNTIME_CONFIG.update({"enable_memory_aware_retrieval": False})
-    enhanced_module.QUERY_VIEW_LIMIT = 3
-    enhanced_module.QUERY_PLAN_LIMIT = 3
 
     return {
         "enhanced": enhanced_module,

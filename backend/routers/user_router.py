@@ -1,10 +1,23 @@
-from __future__ import annotations
-
 """用户画像与偏好相关路由。
 
 该模块负责用户偏好、喜欢/不喜欢论文、行为埋点、研究画像、兴趣向量
 以及个性化推荐等能力的接口编排，本身主要做参数接收、鉴权范围控制和服务转发。
+
+关于 user_id：路径参数、查询参数和请求体中的 user_id 在 JWT 模式下都由认证中间件
+统一校验/改写为当前登录用户（不一致时直接拒绝），因此各接口可以直接使用；
+无认证的本地模式下缺省为配置中的默认用户。
+
+接口一览（均挂载在 /api/user 下）：
+- 偏好与标记：GET /preferences/{user_id}、GET /labeled-papers/{user_id}；
+- 强偏好：POST/DELETE /like-paper、POST/DELETE /dislike-paper；
+- 弱行为：POST/DELETE /paper-action、GET /paper-actions/{user_id}；
+- 研究画像：GET /research-profile/{user_id}、GET .../detail、GET .../topic-evidence、
+  GET /research-profile/build-jobs/{job_id}、GET /research-profile/{user_id}/build-jobs、
+  POST /research-profile/snapshots/activate、PUT/PATCH /research-profile、POST /research-profile/rebuild；
+- 兴趣向量与推荐：POST /generate-interest-vector、GET /interest-vector、POST /recommend-papers。
 """
+
+from __future__ import annotations
 
 import logging
 from typing import Any, Dict, Literal, Optional
@@ -45,6 +58,7 @@ class PaperActionRequest(BaseModel):
     @field_validator("action_type", mode="before")
     @classmethod
     def _validate_action_type(cls, value: Any) -> str:
+        """归一化并校验行为类型；不支持的类型或 like/dislike 会在请求校验阶段被拒绝（统一的 request_validation_error）。"""
         try:
             return validate_weak_paper_action_type(value)
         except ValueError as exc:
@@ -58,6 +72,7 @@ class ResearchProfileRequest(BaseModel):
 
     该模型描述的是用户长期偏好信号，通常由人工编辑或系统总结后写入，
     用于后续推荐、问答风格调优和研究方向理解。
+    所有画像字段都是可选的：未传（None）的字段不会参与更新，传空列表才表示清空。
     """
     user_id: str = Field(default_factory=get_default_user_id)
     positive_topics: Optional[list[str]] = None
@@ -72,13 +87,22 @@ class ResearchProfileRequest(BaseModel):
 
 
 class InterestVectorRequest(BaseModel):
-    """前端使用对象形式传参，历史调用的单字符串形式在路由边界继续兼容。"""
+    """生成兴趣向量的请求体。
+
+    前端使用对象形式 {"user_id": "..."} 传参；历史调用直接发送 JSON 字符串 "user_id"，
+    这种标量形式在路由边界继续兼容（认证中间件对两种形式都做了身份绑定）。
+    """
 
     user_id: Optional[str] = None
 
 
 class RebuildResearchProfileRequest(BaseModel):
-    """研究画像重建请求；前端默认使用快速增量模式，全量/修复模式留给显式维护入口。"""
+    """研究画像重建请求；前端默认使用快速增量模式，全量/修复模式留给显式维护入口。
+
+    - async_build：True 时提交后台任务并立即返回 job；False 时同步构建（仅供测试与本地维护）；
+    - build_mode：incremental / full / repair，非法值在服务层回退为 incremental；
+    - max_papers：本次最多参考的论文数，None 时按 build_mode 取服务层默认值。
+    """
     user_id: str = Field(default_factory=get_default_user_id)
     async_build: bool = True
     build_mode: str = "incremental"
@@ -86,14 +110,19 @@ class RebuildResearchProfileRequest(BaseModel):
 
 
 class ActivateProfileSnapshotRequest(BaseModel):
-    """切换 active snapshot 的请求。"""
+    """切换 active snapshot 的请求；snapshot_id 来自画像详情接口返回的快照列表。"""
     user_id: str = Field(default_factory=get_default_user_id)
     snapshot_id: str
 
 
+# ---------------------------------------------------------------------------
+# 偏好与已标记论文
+# ---------------------------------------------------------------------------
+
+
 @router.get("/preferences/{user_id}")
 async def get_user_preferences(user_id: str, user_preference_store=Depends(get_user_preference_store)):
-    """按路径参数获取用户偏好。"""
+    """获取用户偏好汇总（喜欢/不喜欢的论文等），具体字段由偏好存储决定。"""
     try:
         preferences = user_preference_store.get_user_preferences(user_id=user_id)
         return preferences
@@ -117,6 +146,7 @@ async def get_labeled_papers(
     由前端按需调用论文详情接口修复，避免整页逐篇请求详情耗尽速率预算。
     """
     try:
+        # 按 label 只读取需要的列表；dict.fromkeys 去重并保持顺序（同一篇同时出现时以"喜欢"为准）。
         liked = user_preference_store.get_liked_papers(user_id) if label != "disliked" else []
         disliked = user_preference_store.get_disliked_papers(user_id) if label != "liked" else []
         labeled = list(dict.fromkeys([*liked, *disliked]))
@@ -138,6 +168,11 @@ async def get_labeled_papers(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+# ---------------------------------------------------------------------------
+# 强偏好（点赞 / 点踩）与弱行为
+# ---------------------------------------------------------------------------
+
+
 @router.post("/like-paper")
 async def like_paper(
     arxiv_id: str = Body(...),
@@ -145,7 +180,10 @@ async def like_paper(
     paper: Optional[Dict[str, Any]] = Body(None),
     recommendation_service=Depends(get_recommendation_service),
 ):
-    """记录用户“喜欢论文”的显式正反馈。"""
+    """记录用户“喜欢论文”的显式正反馈。
+
+    点赞与点踩互斥，由服务层负责切换状态；paper 为可选的论文元数据快照。
+    """
     try:
         return recommendation_service.record_user_paper_preference(
             user_id=user_id,
@@ -168,7 +206,7 @@ async def dislike_paper(
     paper: Optional[Dict[str, Any]] = Body(None),
     recommendation_service=Depends(get_recommendation_service),
 ):
-    """记录用户“不喜欢论文”的显式负反馈。"""
+    """记录用户“不喜欢论文”的显式负反馈；与 like_paper 共用同一服务方法，只是 liked=False。"""
     try:
         return recommendation_service.record_user_paper_preference(
             user_id=user_id,
@@ -188,7 +226,7 @@ async def record_paper_action(
     payload: PaperActionRequest,
     recommendation_service=Depends(get_recommendation_service),
 ):
-    """记录用户对论文执行的弱行为事件。"""
+    """记录用户对论文执行的弱行为事件（如收藏、阅读等，类型由 user_behavior_policy 定义）。"""
     try:
         return recommendation_service.record_user_paper_action(
             user_id=payload.user_id,
@@ -211,7 +249,7 @@ async def remove_paper_action(
     user_id: str = Body(default_factory=get_default_user_id),
     user_preference_store=Depends(get_user_preference_store),
 ):
-    """删除某条已记录的弱论文行为。"""
+    """删除某条已记录的弱论文行为；不存在时返回 404，like/dislike 返回 400。"""
     try:
         try:
             normalized_action = validate_weak_paper_action_type(action_type)
@@ -241,7 +279,7 @@ async def get_user_paper_actions(
     action_type: Optional[str] = None,
     user_preference_store=Depends(get_user_preference_store),
 ):
-    """获取用户的论文行为明细及聚合映射。"""
+    """获取用户的论文行为明细及聚合映射；action_type 为空时返回全部类型。"""
     try:
         actions = user_preference_store.get_user_paper_actions(user_id=user_id, action_type=action_type)
         return {
@@ -257,9 +295,14 @@ async def get_user_paper_actions(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+# ---------------------------------------------------------------------------
+# 研究画像
+# ---------------------------------------------------------------------------
+
+
 @router.get("/research-profile/{user_id}")
 async def get_user_research_profile(user_id: str, memory_service=Depends(get_memory_service)):
-    """读取用户研究画像。"""
+    """读取用户当前生效的研究画像。"""
     try:
         return memory_service.load_user_profile(user_id=user_id)
     except Exception as exc:
@@ -293,7 +336,11 @@ async def get_user_research_profile_topic_evidence(
 
 @router.get("/research-profile/build-jobs/{job_id}")
 async def get_user_research_profile_build_job(job_id: str, memory_service=Depends(get_memory_service)):
-    """查询画像构建任务状态，前端可据此轮询。"""
+    """查询画像构建任务状态，前端可据此轮询。
+
+    路径里只有 job_id、没有 user_id，认证中间件无法替我们做归属校验，因此在这里手动检查：
+    任务属于其他用户时与"不存在"返回同样的结果，不暴露他人任务是否存在。
+    """
     try:
         job = memory_service.get_profile_build_job(job_id)
         context = current_auth.get()
@@ -315,7 +362,7 @@ async def list_user_research_profile_build_jobs(
     limit: int = Query(20, ge=1, le=100),
     memory_service=Depends(get_memory_service),
 ):
-    """列出用户画像构建任务历史。"""
+    """列出用户画像构建任务历史（最多 limit 条）。"""
     try:
         return {"status": "success", "items": memory_service.list_profile_build_jobs(user_id=user_id, limit=limit)}
     except Exception as exc:
@@ -328,7 +375,10 @@ async def activate_user_research_profile_snapshot(
     payload: ActivateProfileSnapshotRequest,
     memory_service=Depends(get_memory_service),
 ):
-    """切换 active snapshot，用于低质量构建后的人工回滚或确认。"""
+    """切换 active snapshot，用于低质量构建后的人工回滚或确认。
+
+    快照不存在返回 404，其他参数错误（服务层抛出的 ValueError）返回 400。
+    """
     try:
         profile = memory_service.activate_profile_snapshot(user_id=payload.user_id, snapshot_id=payload.snapshot_id)
         return {"status": "success", "profile": profile}
@@ -346,7 +396,11 @@ async def upsert_user_research_profile(
     payload: ResearchProfileRequest,
     memory_service=Depends(get_memory_service),
 ):
-    """以“整体更新/补全”的语义写入研究画像。"""
+    """以“整体更新/补全”的语义写入研究画像。
+
+    注意：当前实现与 PATCH 完全相同（都只合并请求中非空的字段），区别仅在于记录的来源标记
+    source="manual_upsert"；前端只使用 PATCH，PUT 保留为 API 兼容入口。
+    """
     try:
         # user_id 单独作为主键传入，其他非空字段才会参与画像更新，避免把未传值误写成 null。
         profile_payload = payload.model_dump(exclude={"user_id"}, exclude_none=True)
@@ -362,7 +416,7 @@ async def patch_user_research_profile(
     payload: ResearchProfileRequest,
     memory_service=Depends(get_memory_service),
 ):
-    """以“局部补丁”的语义更新研究画像。"""
+    """以“局部补丁”的语义更新研究画像：只合并请求中非空的字段，来源标记为 source="manual"。"""
     try:
         profile_payload = payload.model_dump(exclude={"user_id"}, exclude_none=True)
         profile = memory_service.patch_user_profile(user_id=payload.user_id, patch=profile_payload, source="manual")
@@ -378,7 +432,12 @@ async def rebuild_user_research_profile(
     background_tasks: BackgroundTasks,
     memory_service=Depends(get_memory_service),
 ):
-    """根据用户行为证据重建画像；默认返回 build job，避免慢速构建阻塞前端。"""
+    """根据用户行为证据重建画像；默认返回 build job，避免慢速构建阻塞前端。
+
+    异步模式下先创建 job 记录，再通过 FastAPI BackgroundTasks 在响应发送后执行构建，
+    同时返回当前（重建前）的画像，前端可以先展示旧画像并轮询 job 状态。
+    注意 BackgroundTasks 运行在当前进程内，进程重启会中断未完成的构建。
+    """
     try:
         if not payload.async_build:
             # 同步模式仅保留给测试和本地维护；前端默认使用异步 job，避免慢速 LLM 构建阻塞请求。
@@ -409,18 +468,28 @@ async def rebuild_user_research_profile(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+# ---------------------------------------------------------------------------
+# 撤销强偏好
+# ---------------------------------------------------------------------------
+
+
 @router.delete("/like-paper")
 async def remove_like(
     arxiv_id: str = Body(...),
     user_id: str = Body(default_factory=get_default_user_id),
     user_preference_store=Depends(get_user_preference_store),
 ):
-    """撤销用户对论文的点赞记录。"""
+    """撤销用户对论文的点赞记录。
+
+    存储层在"本来就没点赞"和"数据库异常"时都返回 False，路由无法区分，因此统一返回 500。
+    """
     try:
         success = user_preference_store.remove_liked_paper(user_id=user_id, arxiv_id=arxiv_id)
         if success:
             return {"status": "success", "message": "Paper removed from liked list"}
         raise HTTPException(status_code=500, detail="Failed to remove from liked list")
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("Error removing liked paper: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
@@ -432,15 +501,22 @@ async def remove_dislike(
     user_id: str = Body(default_factory=get_default_user_id),
     user_preference_store=Depends(get_user_preference_store),
 ):
-    """撤销用户对论文的点踩记录。"""
+    """撤销用户对论文的点踩记录；返回值语义同 remove_like。"""
     try:
         success = user_preference_store.remove_disliked_paper(user_id=user_id, arxiv_id=arxiv_id)
         if success:
             return {"status": "success", "message": "Paper removed from disliked list"}
         raise HTTPException(status_code=500, detail="Failed to remove from disliked list")
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("Error removing disliked paper: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# 兴趣向量与个性化推荐
+# ---------------------------------------------------------------------------
 
 
 @router.post("/generate-interest-vector")
@@ -448,7 +524,10 @@ async def generate_user_interest_vector(
     user_id: str | InterestVectorRequest = Body(default_factory=get_default_user_id),
     recommendation_service=Depends(get_recommendation_service),
 ):
-    """根据用户行为与偏好数据重新生成兴趣向量。"""
+    """根据用户行为与偏好数据重新生成兴趣向量。
+
+    请求体可以是对象 {"user_id": ...}，也可以是 JSON 字符串（历史兼容）；缺省时使用默认用户。
+    """
     # 两种传参形式都绑定可信身份，不能因兼容标量请求而落回其他用户的数据空间。
     resolved_user_id = bind_user_id(user_id.user_id if isinstance(user_id, InterestVectorRequest) else user_id,
                                     fallback=get_default_user_id())
@@ -466,7 +545,7 @@ async def get_user_interest_vector(
     user_id: str = Query(default_factory=get_default_user_id),
     interest_vector_store=Depends(get_interest_vector_store),
 ):
-    """获取用户当前已保存的兴趣向量。"""
+    """获取用户当前已保存的兴趣向量；尚未生成过时返回 404。"""
     try:
         result = interest_vector_store.get_user_interest_vector(user_id=user_id)
         if result:
@@ -486,7 +565,11 @@ async def recommend_papers(
     max_age_months: int = Body(6),
     recommendation_service=Depends(get_recommendation_service),
 ):
-    """基于用户兴趣向量和近期论文池生成个性化推荐。"""
+    """基于用户兴趣向量和近期论文池生成个性化推荐。
+
+    - top_n：返回的推荐条数；
+    - max_age_months：只从最近 N 个月发表的论文中挑选。
+    """
     try:
         return recommendation_service.recommend_papers(user_id=user_id, top_n=top_n, max_age_months=max_age_months)
     except HTTPException:

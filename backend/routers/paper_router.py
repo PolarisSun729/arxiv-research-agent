@@ -1,11 +1,14 @@
-from __future__ import annotations
+"""论文基础信息管理与首页看板路由（直接挂载在 /api 下，无统一前缀）。
 
-"""论文基础信息管理路由。
+该模块负责：
+1. 首页看板：/stats 聚合统计、/sync-status 增量同步诊断（仅管理员）；
+2. 论文元数据的新增（/paper POST）、查询（/paper/{arxiv_id}、/papers）、删除以及按分类筛选。
 
-该模块负责论文元数据的新增、查询、删除以及按分类筛选。
 其中新增论文时还会同步创建摘要向量并写入向量库，
 因此它是“论文入库”和“论文可检索化”的关键入口之一。
 """
+
+from __future__ import annotations
 
 import logging
 import json
@@ -33,7 +36,11 @@ from utils.storage_paths import ARXIV_OAI_SYNC_META_FILE, ARXIV_OAI_SYNC_STATE_F
 
 logger = logging.getLogger(__name__)
 
+# arXiv OAI 增量同步脚本（07-arxiv-tools/sync_arxiv_oai.py）写出的两个状态文件：
+# - STATE：纯文本，记录最近一次成功同步到的日期，供下次增量同步作为起点；
+# - META：JSON，记录最近一次运行的状态、时间范围、写入/匹配条数和错误信息。
 # 运行状态不随 release 版本切换；backend/data 在生产中由部署器接到 shared/backend/data。
+# 在模块内保留别名，便于测试通过 monkeypatch 指向临时文件。
 SYNC_STATE_FILE = ARXIV_OAI_SYNC_STATE_FILE
 SYNC_META_FILE = ARXIV_OAI_SYNC_META_FILE
 
@@ -41,6 +48,7 @@ router = APIRouter(tags=["paper"])
 
 
 def _read_text_file(path: Path) -> Optional[str]:
+    """读取文本状态文件；文件不存在、为空或读取失败时返回 None。"""
     try:
         if not path.exists() or not path.is_file():
             return None
@@ -53,6 +61,7 @@ def _read_text_file(path: Path) -> Optional[str]:
 
 
 def _read_json_file(path: Path) -> Dict[str, Any]:
+    """读取 JSON 状态文件；文件不存在、损坏或顶层不是对象时返回空字典。"""
     try:
         if not path.exists() or not path.is_file():
             return {}
@@ -73,6 +82,11 @@ def _safe_int(value: Any) -> int:
 
 
 def _get_sync_status_payload() -> Dict[str, Any]:
+    """汇总两个同步状态文件，生成前端看板使用的同步状态（字段名为前端约定的驼峰形式）。
+
+    计数字段优先读 META 顶层，缺失时回退到 META.summary 中的同名字段（兼容不同版本的同步脚本输出）；
+    lastSyncedDate 优先使用 META 中的 last_successful_until，缺失时回退到 STATE 文件中的日期。
+    """
     meta = _read_json_file(SYNC_META_FILE)
     state_date = _read_text_file(SYNC_STATE_FILE)
     summary = meta.get("summary") if isinstance(meta.get("summary"), dict) else {}
@@ -98,7 +112,7 @@ async def get_dashboard_stats(
     user_preference_store=Depends(get_user_preference_store),
     oai_db_service=Depends(get_oai_database_service),
 ):
-    """返回首页看板所需的聚合统计数据。"""
+    """返回首页看板所需的聚合统计数据：论文总数、当前用户已标记论文数，以及最近一次同步的概况。"""
     try:
         sync_status = _get_sync_status_payload()
         identity = current_auth.get()
@@ -107,9 +121,9 @@ async def get_dashboard_stats(
             # 看板对所有账号开放；保留字段和失败状态，内部路径及诊断仅向已认证管理员展示。
             sync_error = "最近一次同步失败，请联系管理员查看运行日志。"
         return {
+            # totalPapers 统计的是 OAI 同步镜像库，而不是本地论文目录 arxiv_papers。
             "totalPapers": oai_db_service.get_total_paper_count(),
             "labeledPapers": user_preference_store.get_user_labeled_paper_count(user_id=user_id),
-            "todayNewPapers": sync_status["latestSyncNewPapers"],
             "latestSyncNewPapers": sync_status["latestSyncNewPapers"],
             "lastSyncedDate": sync_status["lastSyncedDate"],
             "lastSyncRunAt": sync_status["lastSyncRunAt"],
@@ -126,7 +140,7 @@ async def get_dashboard_stats(
 
 @router.get("/sync-status")
 async def get_sync_status():
-    """返回最近一次增量同步的状态信息，供前端看板使用。"""
+    """返回最近一次增量同步的完整状态（含原始错误信息），仅管理员可访问，用于排查同步故障。"""
     try:
         return _get_sync_status_payload()
     except Exception as exc:
@@ -151,6 +165,9 @@ async def add_paper(
 
     该流程会把论文摘要写入向量库，随后再把论文主记录写入数据库，
     从而让这篇论文既能被结构化查询，也能参与向量检索与推荐。
+
+    失败时不抛 HTTPException，而是通过 error_response 返回带错误码的统一错误结构：
+    VECTOR_STORE_ERROR（向量写入失败）、DATABASE_WRITE_FAILED（写库失败）、UNKNOWN_ERROR（其他异常）。
     """
     try:
         logger.debug("Adding paper with embedding: %s", arxiv_id)
@@ -208,10 +225,10 @@ async def add_paper(
                 )
             )
 
-        logger.debug("Embedding inserted with ID: %s", embedding_id)
-        logger.debug("Adding paper to database: %s, embedding_id: %s", metadata, embedding_id)
+        logger.debug("Embedding inserted with ID: %s, adding paper %s to database", embedding_id, arxiv_id)
 
         # 数据库中保留 embedding_id / embedding_model，方便后续追踪向量来源与重建。
+        # 注意：两步写入没有事务包裹，若这里写库失败，上一步写入的向量不会回滚。
         success = paper_catalog_store.add_paper(
             {
                 "arxiv_id": arxiv_id,
@@ -263,8 +280,11 @@ async def get_paper(
 ):
     """获取单篇论文详情。
 
-    读取顺序是：先查本地数据库；若本地没有，再尝试回源 arXiv，
-    并将回源结果物化成系统内可用的论文对象后返回。
+    读取顺序是：先查本地数据库；若本地没有，或本地记录缺少标题/摘要等展示字段，
+    再尝试回源 arXiv，并将回源结果物化成系统内可用的论文对象后返回。
+
+    降级策略：回源的任一环节（配额不足、网络失败、写库失败）出错时，
+    只要本地有不完整记录就返回它，前端仍能展示部分信息；本地也没有时才向上抛出错误。
     """
     try:
         paper = paper_catalog_store.get_paper(arxiv_id)
@@ -289,12 +309,9 @@ async def get_paper(
             raise
         if source_paper:
             try:
-                # 优先复用已有 embedding，只补齐标题/摘要等展示元数据，避免回源一次就重复生成向量。
-                ensure_materialized = getattr(recommendation_service, "_ensure_paper_materialized", None)
-                if callable(ensure_materialized):
-                    return ensure_materialized(arxiv_id, paper_payload=source_paper)
-                # 兼容尚未提供增量物化能力的旧实现。
-                return recommendation_service._materialize_paper_from_source(source_paper, arxiv_id)
+                # 把回源结果写回本地（物化）：优先复用已有 embedding，只补齐标题/摘要等展示元数据，
+                # 避免回源一次就重复生成向量。
+                return recommendation_service._ensure_paper_materialized(arxiv_id, paper_payload=source_paper)
             except Exception as exc:
                 logger.warning("Failed to persist backfilled paper %s: %s", arxiv_id, exc)
                 if paper:
@@ -316,7 +333,7 @@ async def delete_paper(
     paper_catalog_store=Depends(get_paper_catalog_store),
     paper_qa_service=Depends(get_paper_qa_service),
 ):
-    """删除指定论文，并同步清理该论文的 QA 索引 artifact。"""
+    """删除指定论文（仅管理员），并同步清理该论文的 QA 索引 artifact。"""
     try:
         # 论文删除前先让 QA 索引不可检索，避免 SQLite 元数据消失后 Milvus 仍留下可命中的旧 chunk。
         qa_cleanup = paper_qa_service.delete_qa_index(arxiv_id)
@@ -333,7 +350,10 @@ async def delete_paper(
 
 @router.get("/papers")
 async def get_all_papers(paper_catalog_store=Depends(get_paper_catalog_store)):
-    """获取当前数据库中的全部论文列表。"""
+    """获取本地论文目录（arxiv_papers 表）中的全部论文，按发布日期倒序。
+
+    这里只包含经新增或回源物化过的论文，不是 OAI 同步镜像库的全量数据；接口不分页。
+    """
     try:
         papers = paper_catalog_store.get_all_papers()
         return {"papers": papers}
@@ -344,7 +364,7 @@ async def get_all_papers(paper_catalog_store=Depends(get_paper_catalog_store)):
 
 @router.get("/papers/category/{category}")
 async def search_papers_by_category(category: str, paper_catalog_store=Depends(get_paper_catalog_store)):
-    """按 arXiv 分类查询论文。"""
+    """按 arXiv 分类（如 cs.AI）在本地论文目录中做模糊匹配查询。"""
     try:
         papers = paper_catalog_store.search_papers_by_category(category)
         return {"papers": papers}

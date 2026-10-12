@@ -14,6 +14,11 @@ class PaperProfileEvidenceStore(BaseSqliteStore):
     """维护单篇论文的画像证据缓存；画像合并和 snapshot 激活仍留在 profile 主流程。"""
 
     def upsert_paper_profile_evidence(self, arxiv_id: str, evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """归一化并缓存单篇论文的画像证据，返回归一化后的拆分字段。
+
+        唯一键为 (arxiv_id, extractor_version, normalizer_version)：抽取器或归一化规则升级后
+        会写入新行而不是覆盖旧缓存。写库失败只记日志，仍返回归一化结果供本次构建继续使用。
+        """
         payload = dict(evidence or {})
         # 这里复用现有 profile 归一化 helper，保持证据缓存与最终画像抽取的字段清洗规则一致。
         normalized = {
@@ -76,6 +81,7 @@ class PaperProfileEvidenceStore(BaseSqliteStore):
         extractor_version: str = PROFILE_EXTRACTOR_VERSION,
         normalizer_version: str = PROFILE_NORMALIZER_VERSION,
     ) -> Optional[Dict[str, Any]]:
+        """读取指定版本的论文画像证据；优先返回完整原始卡片，旧数据退化为拆分字段结构。"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()

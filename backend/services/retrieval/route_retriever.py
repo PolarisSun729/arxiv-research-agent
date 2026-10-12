@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import math
-import re
 from collections import Counter
 from typing import Any, Callable, Dict, List, Optional
 
@@ -11,6 +10,7 @@ from services.retrieval.collection_profile import CollectionRetrievalProfile
 from services.retrieval.contracts import QueryProfile, RetrievalOptions
 from services.retrieval.execution import QueryEmbeddingBatcher, RouteExecutionSupport
 from services.retrieval.index_hit_aggregator import IndexHitAggregator
+from services.retrieval.numeric_utils import min_max_normalize
 from services.retrieval.retrieval_index import CollectionRetrievalIndex, VECTOR_ROUTE_NAMES
 from utils.config import get_enhanced_retrieval_runtime_config
 
@@ -19,8 +19,37 @@ ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
 logger = logging.getLogger(__name__)
 
 
+def _inactive_route_metric(
+    *,
+    enabled: bool,
+    cache_hit: Any,
+    fallback_reason: str,
+    status: str = "disabled",
+    error: str = "",
+) -> Dict[str, Any]:
+    """生成“路由未执行”时的指标字典，字段结构与 RouteExecutionResult.to_metric() 保持一致。
+
+    未执行的原因可能是被关闭（disabled）、缺少输入（如没有 HyDE 文本）或执行前就出错（error）。
+    """
+    return {
+        "enabled": enabled,
+        "applied": False,
+        "status": status,
+        "latency_ms": 0.0,
+        "candidate_count": 0,
+        "error": error,
+        "fallback_reason": fallback_reason,
+        "cache_hit": cache_hit,
+        "timeout": False,
+    }
+
+
 class RouteRetriever:
-    """Run retrieval routes without fusion or rerank."""
+    """执行各路召回（向量原问、向量改写、HyDE、关键词、结构化表格、对话记忆），不负责融合与 rerank。
+
+    每条路由都通过 RouteExecutionSupport 运行，带独立超时与失败隔离；
+    只有 vector_original 是必需路由，其它路由失败时返回空结果并在 route_metrics 中记录原因。
+    """
 
     def __init__(
         self,
@@ -72,13 +101,14 @@ class RouteRetriever:
         self._keyword_backend = self._initialize_keyword_backend()
 
     def _initialize_keyword_backend(self) -> Any:
-        """Initialize keyword backend based on config, with fallback to internal_bm25."""
+        """按配置初始化关键词检索后端；bm25s 不可用或初始化失败时降级为内置 BM25。"""
+        # 在函数内导入：两个 backend 模块都会反向导入 RouteRetriever，放在模块顶部会形成循环导入。
         from services.retrieval.keyword_backend import InternalBM25Backend
         from services.retrieval.bm25s_backend import BM25sBackend
 
         backend_config = self._keyword_backend_config
 
-        # Always create internal backend as fallback
+        # 无论配置哪个后端，都先准备好内置 BM25 作为降级目标。
         internal_backend = InternalBM25Backend(
             query_tools=self.query_tools,
             route_confidence_builder=self.route_confidence_builder,
@@ -90,7 +120,7 @@ class RouteRetriever:
             logger.info("Using internal_bm25 keyword backend")
             return internal_backend
 
-        # Try to use bm25s backend
+        # 其余配置值都尝试使用 bm25s 后端。
         try:
             bm25s_backend = BM25sBackend(
                 query_tools=self.query_tools,
@@ -99,7 +129,7 @@ class RouteRetriever:
                 fusion_service=self.fusion_service,
             )
 
-            # Check if bm25s is actually available
+            # bm25s 是可选依赖，构造成功不代表能用，需要检查导入结果。
             if bm25s_backend._bm25s_available:
                 logger.info("Using bm25s keyword backend")
                 return bm25s_backend
@@ -126,7 +156,6 @@ class RouteRetriever:
             "keyword_backend_init_fallback_reason": self._keyword_backend_init_fallback_reason,
         }
 
-
     def build_route_bundle(
         self,
         *,
@@ -142,6 +171,11 @@ class RouteRetriever:
         collection_profile: Optional[CollectionRetrievalProfile] = None,
         collection_retrieval_index: Optional[CollectionRetrievalIndex] = None,
     ) -> Dict[str, Any]:
+        """执行全部召回路由，返回各路由结果、各路由 debug 与执行指标。
+
+        所有路由需要的 query embedding 先一次性批量计算（embedding_batch），各向量路由只查表复用。
+        返回字典的 routes 键固定包含六条路由，未启用的路由为空列表，便于下游统一处理。
+        """
         if collection_profile is None:
             # 兼容直接调用 route 层的测试入口；正常 pipeline 会提前构建一次并复用。
             collection_profile = self.collection_profile_provider.get_profile(collection_name)
@@ -242,7 +276,11 @@ class RouteRetriever:
             route_metrics["vector_rewrite"] = self.combine_route_metrics("vector_rewrite", rewrite_route_results, len(routes["vector_rewrite"]))
         else:
             routes["vector_rewrite"] = []
-            route_metrics["vector_rewrite"] = {"enabled": False, "applied": False, "status": "disabled", "latency_ms": 0.0, "candidate_count": 0, "error": "", "fallback_reason": "disabled", "cache_hit": bool(collection_profile.cache_hit), "timeout": False}
+            route_metrics["vector_rewrite"] = _inactive_route_metric(
+                enabled=False,
+                cache_hit=bool(collection_profile.cache_hit),
+                fallback_reason="disabled",
+            )
 
         if hyde_text:
             hyde_result = self.route_executor.run(
@@ -265,7 +303,11 @@ class RouteRetriever:
             route_metrics["vector_hyde"] = hyde_result.to_metric()
         else:
             routes["vector_hyde"] = []
-            route_metrics["vector_hyde"] = {"enabled": bool(enable_hyde), "applied": False, "status": "disabled", "latency_ms": 0.0, "candidate_count": 0, "error": "", "fallback_reason": "no_hyde_text", "cache_hit": bool(collection_profile.cache_hit), "timeout": False}
+            route_metrics["vector_hyde"] = _inactive_route_metric(
+                enabled=bool(enable_hyde),
+                cache_hit=bool(collection_profile.cache_hit),
+                fallback_reason="no_hyde_text",
+            )
 
         if enable_keyword_search:
             # keyword route 以用户原问和 planner 的 keyword_query 为主，rewrite/semantic/evidence 只做辅助召回；
@@ -301,7 +343,11 @@ class RouteRetriever:
             routes["keyword"] = []
             keyword_query_views = []
             keyword_result = {"debug": collection_retrieval_index.to_keyword_debug(0, full_scan_used=False)}
-            route_metrics["keyword"] = {"enabled": False, "applied": False, "status": "disabled", "latency_ms": 0.0, "candidate_count": 0, "error": "", "fallback_reason": "disabled", "cache_hit": bool(collection_retrieval_index.cache_hit), "timeout": False}
+            route_metrics["keyword"] = _inactive_route_metric(
+                enabled=False,
+                cache_hit=bool(collection_retrieval_index.cache_hit),
+                fallback_reason="disabled",
+            )
 
         if enable_table_structured_route:
             table_structured_debug_holder: Dict[str, Any] = {}
@@ -335,7 +381,11 @@ class RouteRetriever:
                 "matched_cells": [],
                 "reason": "disabled",
             }
-            route_metrics["table_structured"] = {"enabled": False, "applied": False, "status": "disabled", "latency_ms": 0.0, "candidate_count": 0, "error": "", "fallback_reason": "disabled", "cache_hit": bool(collection_retrieval_index.cache_hit), "timeout": False}
+            route_metrics["table_structured"] = _inactive_route_metric(
+                enabled=False,
+                cache_hit=bool(collection_retrieval_index.cache_hit),
+                fallback_reason="disabled",
+            )
 
         memory_context = options.memory_context or {}
         memory_retrieval_enabled = bool(self.memory_flag_reader("enable_memory_aware_retrieval", True))
@@ -369,12 +419,22 @@ class RouteRetriever:
                 routes["memory_context"] = []
                 memory_fallback_reason = str(exc)
                 memory_result = {"debug": collection_retrieval_index.to_memory_debug(lookup_mode="error", exact_hit_count=0, fallback_used=False, candidate_count=0)}
-                route_metrics["memory_context"] = {"enabled": True, "applied": False, "status": "error", "latency_ms": 0.0, "candidate_count": 0, "error": str(exc), "fallback_reason": str(exc), "cache_hit": bool(collection_retrieval_index.cache_hit), "timeout": False}
+                route_metrics["memory_context"] = _inactive_route_metric(
+                    enabled=True,
+                    cache_hit=bool(collection_retrieval_index.cache_hit),
+                    fallback_reason=str(exc),
+                    status="error",
+                    error=str(exc),
+                )
         else:
             routes["memory_context"] = []
             memory_fallback_reason = "disabled by runtime config"
             memory_result = {"debug": collection_retrieval_index.to_memory_debug(lookup_mode="disabled", exact_hit_count=0, fallback_used=False, candidate_count=0)}
-            route_metrics["memory_context"] = {"enabled": False, "applied": False, "status": "disabled", "latency_ms": 0.0, "candidate_count": 0, "error": "", "fallback_reason": "disabled by runtime config", "cache_hit": bool(collection_retrieval_index.cache_hit), "timeout": False}
+            route_metrics["memory_context"] = _inactive_route_metric(
+                enabled=False,
+                cache_hit=bool(collection_retrieval_index.cache_hit),
+                fallback_reason="disabled by runtime config",
+            )
 
         keyword_debug = {
             "enabled": enable_keyword_search,
@@ -521,6 +581,7 @@ class RouteRetriever:
         return kept
 
     def normalize_keyword_query_view(self, query: str) -> str:
+        """把 query 归一化为“过滤 + 扩展后的去重小写 token 串”，用于判断两个 query view 是否重复。"""
         tokens = self.filter_keyword_query_tokens(self.query_tools.tokenize_for_keyword_search(query))
         expanded_tokens = self.expand_keyword_query_tokens(tokens)
         seen: List[str] = []
@@ -531,6 +592,7 @@ class RouteRetriever:
         return " ".join(seen)
 
     def keyword_query_similarity(self, left: str, right: str) -> float:
+        """两个归一化 query 的 token 集合 Jaccard 相似度（交集 / 并集）。"""
         left_tokens = set(str(left or "").split())
         right_tokens = set(str(right or "").split())
         if not left_tokens or not right_tokens:
@@ -652,8 +714,7 @@ class RouteRetriever:
             factor *= 0.82
         elif main_intent in {*METHOD_INTENTS, *EXPERIMENT_INTENTS, "dataset", "comparison", "limitation"}:
             factor *= 1.08
-        elif main_intent == "figure_table":
-            factor *= 1.0
+        # figure_table 等其它意图保持 factor 不变（原先这里有一个 factor *= 1.0 的空操作分支，已删除）。
 
         # 命中质量：以最高 IDF 命中词为代表，越是只命中泛词越要降权。
         max_idf = max((float(term.get("idf", 0.0) or 0.0) for term in matched_terms), default=0.0)
@@ -678,28 +739,17 @@ class RouteRetriever:
 
     @staticmethod
     def query_main_intent(query_profile: QueryProfile) -> str:
+        """取查询的主意图（小写），缺失时为 other。"""
         intent_profile = query_profile.intent_profile
         return str(getattr(intent_profile, "main_intent", "other") or "other").strip().lower()
 
     @staticmethod
     def _normalize_field_text(text: str) -> str:
+        """小写并压缩空白，用于比较章节标题/路径的实际长度。"""
         return " ".join(str(text or "").strip().lower().split())
 
-    def _is_informative_token(self, token: str) -> bool:
-        """优先复用 query_tools 的 token 质量判断，缺失时退回本地最小乱码检测。"""
-        checker = getattr(self.query_tools, "is_informative_keyword_token", None)
-        if callable(checker):
-            return bool(checker(token))
-        normalized = str(token or "").strip().lower()
-        if len(normalized) <= 1:
-            return False
-        if re.search(r"[��]", normalized):
-            return False
-        if re.search(r"(.)\1{4,}", normalized):
-            return False
-        return True
-
     def generate_hyde_document(self, user_query: str, query_profile: QueryProfile, rewritten_queries: List[str]) -> str:
+        """生成 HyDE（假设性答案文档）文本：优先调用生成服务，失败或为空时使用规则模板。"""
         if self.generation_service is not None:
             try:
                 text = self.generation_service.generate_hyde_document(user_query)
@@ -711,8 +761,9 @@ class RouteRetriever:
 
     @staticmethod
     def combine_route_metrics(route_name: str, route_results: List[Any], candidate_count: int) -> Dict[str, Any]:
+        """把同一路由的多次执行（如多条改写 query）合并为一条指标：耗时累加，任一失败即为 partial。"""
         if not route_results:
-            return {"enabled": False, "applied": False, "status": "disabled", "latency_ms": 0.0, "candidate_count": 0, "error": "", "fallback_reason": "disabled", "cache_hit": None, "timeout": False}
+            return _inactive_route_metric(enabled=False, cache_hit=None, fallback_reason="disabled")
         statuses = [item.status for item in route_results]
         errors = [item.error for item in route_results if item.error]
         fallback_reasons = [item.fallback_reason for item in route_results if item.fallback_reason]
@@ -740,6 +791,7 @@ class RouteRetriever:
         collection_profile: CollectionRetrievalProfile,
         embedding_map: Dict[str, List[float]],
     ) -> List[Dict[str, Any]]:
+        """用预先批量计算好的 query 向量检索 Milvus，并把 index 级命中聚合成 chunk 级候选。"""
         normalized_query = QueryEmbeddingBatcher.normalize_query(query)
         embedding = embedding_map.get(normalized_query)
         if embedding is None:
@@ -754,11 +806,26 @@ class RouteRetriever:
         route_confidence = self.route_confidence_builder(route_name, query_profile, source_query, route_queries=route_queries, intent_profile=query_profile.intent_profile)
         return self.normalize_route_results(results, route_name, source_query, route_confidence, query_profile, top_k=top_k)
 
+    def _aggregate_keyword_hits(self, hits: List[Dict[str, Any]], debug: Dict[str, Any], *, top_k: int) -> Dict[str, Any]:
+        """把关键词后端返回的 index 级命中聚合成 chunk 级候选，并在 debug 中记录聚合前后数量。"""
+        aggregated_results = self.index_hit_aggregator.aggregate(
+            hits,
+            route_name="keyword",
+            top_k=top_k,
+        )
+        debug["index_hit_aggregation"] = {
+            "applied": True,
+            "input_count": len(hits),
+            "output_count": len(aggregated_results),
+            "max_matched_indexes": self.index_hit_aggregator.max_matched_indexes,
+        }
+        return {"results": aggregated_results, "debug": debug}
+
     def keyword_retrieve(self, collection_name: str, query_views: List[Dict[str, Any]], top_k: int, query_profile: QueryProfile, retrieval_index: CollectionRetrievalIndex) -> Dict[str, Any]:
-        """Keyword retrieval with backend selection and automatic fallback."""
+        """关键词召回：先用配置的后端，失败（返回 fallback_reason 或抛异常）时自动降级为内置 BM25。"""
         from services.retrieval.keyword_backend import InternalBM25Backend
 
-        # Try configured backend first
+        # 优先使用初始化时选定的后端。
         try:
             result = self._keyword_backend.retrieve(
                 query_views=query_views,
@@ -767,25 +834,14 @@ class RouteRetriever:
                 retrieval_index=retrieval_index,
             )
 
-            # If backend succeeded, return results with backend info
+            # 后端执行成功：附上后端运行状态后直接返回。
             if not result.fallback_reason:
                 debug = dict(result.debug)
                 debug.update(self._keyword_backend_debug(result.backend_name))
                 debug["keyword_backend_fallback"] = False
-                aggregated_results = self.index_hit_aggregator.aggregate(
-                    result.results,
-                    route_name="keyword",
-                    top_k=top_k,
-                )
-                debug["index_hit_aggregation"] = {
-                    "applied": True,
-                    "input_count": len(result.results),
-                    "output_count": len(aggregated_results),
-                    "max_matched_indexes": self.index_hit_aggregator.max_matched_indexes,
-                }
-                return {"results": aggregated_results, "debug": debug}
+                return self._aggregate_keyword_hits(result.results, debug, top_k=top_k)
 
-            # Backend returned with fallback reason - log and fallback
+            # 后端自身报告了降级原因（如 sparse 索引不可用），记录后走内置 BM25。
             logger.warning(
                 "Keyword backend %s failed, falling back to internal_bm25: %s",
                 result.backend_name,
@@ -795,7 +851,7 @@ class RouteRetriever:
         except Exception as exc:
             logger.warning("Keyword backend execution failed, falling back to internal_bm25: %s", exc, exc_info=True)
 
-        # Fallback to internal_bm25
+        # 运行期降级到内置 BM25。
         internal_backend = InternalBM25Backend(
             query_tools=self.query_tools,
             route_confidence_builder=self.route_confidence_builder,
@@ -809,11 +865,6 @@ class RouteRetriever:
             query_profile=query_profile,
             retrieval_index=retrieval_index,
         )
-        aggregated_results = self.index_hit_aggregator.aggregate(
-            fallback_result.results,
-            route_name="keyword",
-            top_k=top_k,
-        )
 
         debug = dict(fallback_result.debug)
         debug.update(self._keyword_backend_debug("internal_bm25"))
@@ -821,21 +872,17 @@ class RouteRetriever:
         debug["keyword_backend_fallback_reason"] = getattr(
             self._keyword_backend, "backend_name", lambda: "unknown"
         )() + " failed"
-        debug["index_hit_aggregation"] = {
-            "applied": True,
-            "input_count": len(fallback_result.results),
-            "output_count": len(aggregated_results),
-            "max_matched_indexes": self.index_hit_aggregator.max_matched_indexes,
-        }
-        return {"results": aggregated_results, "debug": debug}
+        return self._aggregate_keyword_hits(fallback_result.results, debug, top_k=top_k)
 
     def expand_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
+        """调用 query_tools 做同义词/缩写扩展；query_tools 未提供该能力时原样返回。"""
         expander = getattr(self.query_tools, "expand_keyword_query_tokens", None)
         if callable(expander):
             return expander(tokens)
         return tokens
 
     def filter_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
+        """调用 query_tools 过滤停用词、保留关键词（limit 设为 token 数，即只过滤不截断）。"""
         extractor = getattr(self.query_tools, "extract_query_keywords", None)
         if callable(extractor):
             return extractor(tokens, limit=max(len(tokens), 1))
@@ -872,6 +919,10 @@ class RouteRetriever:
         return doc_counts, max(int(round(doc_length)), 1), match_fields, token_field_hits
 
     def memory_retrieve(self, collection_name: str, memory_context: Dict[str, Any], top_k: int, query_profile: QueryProfile, retrieval_index: CollectionRetrievalIndex) -> Dict[str, Any]:
+        """对话记忆路由：把前几轮引用过的证据重新定位到当前 collection 的 chunk。
+
+        先按稳定 ID / 页码章节精确查找，找不到再用关键词倒排表做小范围兜底，不做全量扫描。
+        """
         if not memory_context or not bool(memory_context.get("enabled", False)):
             return {"results": [], "debug": retrieval_index.to_memory_debug(lookup_mode="disabled", exact_hit_count=0, fallback_used=False, candidate_count=0)}
         candidates = [item for item in (memory_context.get("candidates", []) or []) if isinstance(item, dict)]
@@ -915,7 +966,10 @@ class RouteRetriever:
         }
 
     def lookup_memory_candidate(self, candidate: Dict[str, Any], retrieval_index: CollectionRetrievalIndex) -> tuple[List[int], str]:
-        """Lookup memory candidate by stable source/chunk metadata."""
+        """按稳定的来源/chunk 元数据精确定位记忆候选，返回 (文档下标列表, 命中方式)。
+
+        查找顺序：source_id → chunk_id → parent_chunk_id → original_chunk_id → 页码+章节 → 页码 → 章节。
+        """
         for key, mapping, mode in (
             ("source_id", retrieval_index.by_chunk_id, "source_id"),
             ("chunk_id", retrieval_index.by_chunk_id, "chunk_id"),
@@ -946,6 +1000,7 @@ class RouteRetriever:
         *,
         top_k: int,
     ) -> List[int]:
+        """精确定位失败时，用问题关键词和候选摘要中的词在倒排表里找最多 top_k 个文档。"""
         # 兜底只使用倒排表上的小范围候选，不允许退回 collection 全量 chunk 扫描。
         fallback_terms = [
             *query_keywords[:8],
@@ -969,6 +1024,7 @@ class RouteRetriever:
         query_keywords: List[str],
         query_profile: QueryProfile,
     ) -> Dict[str, Any]:
+        """把定位到的 chunk 包装成 memory_context 路由结果；路由置信度上限 0.78，避免记忆证据压过新检索。"""
         memory_score = self.memory_candidate_score(candidate, chunk, query_keywords, query_profile)
         route_confidence = min(
             0.78,
@@ -1009,6 +1065,7 @@ class RouteRetriever:
         *,
         top_k: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        """为原始命中补齐路由字段（名次、原始分、归一化分、置信度、结构加分），向量路由再做 index 聚合。"""
         if not results:
             return []
         normalized_scores = self.normalize_scores([float(item.get("score", 0.0) or 0.0) for item in results])
@@ -1033,6 +1090,7 @@ class RouteRetriever:
         return normalized
 
     def heuristic_hyde_document(self, query_profile: QueryProfile, rewritten_queries: List[str]) -> str:
+        """无生成服务时的 HyDE 模板：把改写 query、偏好章节和原问题拼成一段“假想证据”。"""
         focus = ", ".join(rewritten_queries[:2]) if rewritten_queries else query_profile.keyword_query
         preferred_sections = ", ".join(query_profile.section_preferences[:3]) if query_profile.section_preferences else "relevant sections"
         return (
@@ -1042,36 +1100,11 @@ class RouteRetriever:
             f"{query_profile.original_query}"
         )
 
-    @staticmethod
-    def normalize_scores(scores: List[float]) -> List[float]:
-        if not scores:
-            return []
-        min_score = min(scores)
-        max_score = max(scores)
-        if math.isclose(min_score, max_score):
-            return [1.0 for _ in scores]
-        scale = max_score - min_score
-        return [(score - min_score) / scale for score in scores]
-
-    @staticmethod
-    def memory_candidate_matches(candidate: Dict[str, Any], chunk: Dict[str, Any]) -> bool:
-        candidate_ids = {str(candidate.get(key, "") or "").strip() for key in ("chunk_id", "parent_chunk_id", "original_chunk_id", "source_id")}
-        chunk_ids = {str(chunk.get(key, "") or "").strip() for key in ("chunk_id", "parent_chunk_id", "original_chunk_id")}
-        candidate_ids.discard("")
-        chunk_ids.discard("")
-        if candidate_ids and candidate_ids & chunk_ids:
-            return True
-        candidate_source = str(candidate.get("source", "") or "").strip().lower()
-        candidate_section = str(candidate.get("section_path", "") or "").strip().lower()
-        candidate_page = str(candidate.get("page_number", "") or "").strip()
-        chunk_source = str(chunk.get("source", "") or "").strip().lower()
-        chunk_section = str(chunk.get("section_path", "") or "").strip().lower()
-        chunk_page = str(chunk.get("page_number", "") or "").strip()
-        if candidate_source and candidate_section and candidate_source == chunk_source and candidate_section == chunk_section:
-            return True
-        return bool(candidate_source and candidate_page and candidate_source == chunk_source and candidate_page == chunk_page)
+    # min-max 归一化；实现统一放在 numeric_utils，这里保留方法名供本类（self.normalize_scores）及外部调用方使用。
+    normalize_scores = staticmethod(min_max_normalize)
 
     def memory_candidate_score(self, candidate: Dict[str, Any], chunk: Dict[str, Any], query_keywords: List[str], query_profile: QueryProfile) -> float:
+        """记忆候选打分（上限 1.4）：基础分 + 最近轮次 + 引用强度 + ID 精确匹配 + 关键词重合 + 结构加分。"""
         score = 0.25
         if bool(candidate.get("is_recent_turn", False)):
             score += 0.28
@@ -1116,27 +1149,6 @@ class RouteRetriever:
         }
 
     @staticmethod
-    def bm25_score(
-        token_counter: Counter,
-        doc_counts: Counter,
-        doc_freqs: Dict[str, int],
-        total_docs: int,
-        avg_doc_length: float,
-        content: str,
-        *,
-        doc_length: int,
-    ) -> float:
-        return RouteRetriever.bm25_score_detailed(
-            token_counter,
-            doc_counts,
-            doc_freqs,
-            total_docs,
-            avg_doc_length,
-            content,
-            doc_length=doc_length,
-        )["score"]
-
-    @staticmethod
     def bm25_score_detailed(
         token_counter: Counter,
         doc_counts: Counter,
@@ -1148,7 +1160,12 @@ class RouteRetriever:
         doc_length: int,
         token_field_hits: Optional[Dict[str, Counter]] = None,
     ) -> Dict[str, Any]:
-        """返回 BM25 分数及每个命中 token 的 idf/tf/贡献分，用于可解释 trace 与噪声识别。"""
+        """返回 BM25 分数及每个命中 token 的 idf/tf/贡献分，用于可解释 trace 与噪声识别。
+
+        单词得分 = qtf * idf * tf*(k1+1) / (tf + k1*(1 - b + b*doc_len/avgdl))，
+        其中 idf 使用 Lucene 的 log(1 + (N - df + 0.5)/(df + 0.5)) 形式，保证高频词的 idf 也不会为负。
+        方法/数据集/基线等少数结构词若出现在正文前 300 字，额外加一个固定 boost。
+        """
         doc_len = max(doc_length, 1)
         k1 = ENHANCED_RETRIEVAL_CONFIG["bm25_k1"]
         b = ENHANCED_RETRIEVAL_CONFIG["bm25_b"]

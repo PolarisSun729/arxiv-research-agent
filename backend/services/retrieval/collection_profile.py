@@ -1,9 +1,11 @@
+"""collection 级检索画像：embedding 配置、向量维度、chunk 类型/章节分布等元信息的构建与缓存。"""
+
 from __future__ import annotations
 
 import logging
 import threading
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from time import perf_counter
 from typing import Any, Dict, List, Optional
@@ -33,9 +35,11 @@ class CollectionRetrievalProfile:
     fallback_reason: str = ""
 
     def has_required_fields(self) -> bool:
+        """向量检索必需的四项（名称、provider、模型、维度）是否齐全；缺任意一项缓存都视为失效。"""
         return bool(self.collection_name and self.embedding_provider and self.embedding_model and self.vector_dimension)
 
     def to_debug(self) -> Dict[str, Any]:
+        """导出到 retrieval debug 的视图；cache_hit / build_time 加 profile_ 前缀以免与其他字段混淆。"""
         return {
             "collection_name": self.collection_name,
             "profile_cache_hit": self.cache_hit,
@@ -59,6 +63,7 @@ class CollectionRetrievalProfile:
 class CollectionRetrievalProfileProvider:
     """构建和缓存 collection 检索画像，避免每条 vector route 重复探测 schema/sample。"""
 
+    # 统计“是否有 chunk 带有该字段”的 metadata 字段清单，结果写入 metadata_availability。
     METADATA_FIELDS = [
         "chunk_type",
         "section_title",
@@ -85,6 +90,11 @@ class CollectionRetrievalProfileProvider:
         index_record: Optional[Dict[str, Any]] = None,
         force_refresh: bool = False,
     ) -> CollectionRetrievalProfile:
+        """取 collection 画像：缓存有效时返回副本，否则重建并写回缓存。
+
+        index_record 是数据库中的论文索引记录，chunk 数或 embedding 模型与缓存不一致时判定缓存过期。
+        返回值总是独立副本，调用方修改它不会污染缓存。
+        """
         resolved_name = self._resolve_collection_name(collection_name)
         with self._lock:
             cached = self._cache.get(resolved_name)
@@ -110,6 +120,7 @@ class CollectionRetrievalProfileProvider:
         index_record: Optional[Dict[str, Any]],
         stale_reason: str = "",
     ) -> CollectionRetrievalProfile:
+        """从向量库 schema、chunk 元数据和数据库记录拼出画像；每个来源失败都只降级并记录原因。"""
         started = perf_counter()
         now = datetime.now().isoformat(timespec="seconds")
         default_config = self.embedding_service.get_default_embedding_config()
@@ -158,7 +169,7 @@ class CollectionRetrievalProfileProvider:
         if not sample_metadata.get("embedding_model") and not expected_model:
             fallback_reasons.append("missing_embedding_model_fallback_to_default")
 
-        profile = CollectionRetrievalProfile(
+        return CollectionRetrievalProfile(
             collection_name=collection_name,
             vector_dimension=int(vector_dimension) if vector_dimension else None,
             embedding_provider=embedding_provider,
@@ -171,14 +182,14 @@ class CollectionRetrievalProfileProvider:
             created_at=now,
             updated_at=now,
             is_stale=False,
-            build_sources=self._dedupe_sources(sources),
+            build_sources=list(dict.fromkeys(sources)),
             cache_hit=False,
             build_time=perf_counter() - started,
             fallback_reason="; ".join(fallback_reasons),
         )
-        return profile
 
     def _stale_reason(self, profile: Optional[CollectionRetrievalProfile], index_record: Optional[Dict[str, Any]]) -> str:
+        """返回缓存过期原因；没有缓存或缓存仍有效时返回空串。"""
         if profile is None:
             return ""
         if not profile.has_required_fields():
@@ -194,6 +205,7 @@ class CollectionRetrievalProfileProvider:
         return ""
 
     def _resolve_collection_name(self, collection_name: str) -> str:
+        """向量库支持别名解析时用它规范化名称，保证缓存键与实际 collection 一致。"""
         resolver = getattr(self.vector_store_service, "resolve_collection_name", None)
         if callable(resolver):
             return resolver(collection_name)
@@ -201,39 +213,37 @@ class CollectionRetrievalProfileProvider:
 
     @staticmethod
     def _clone_profile(profile: CollectionRetrievalProfile) -> CollectionRetrievalProfile:
-        return CollectionRetrievalProfile(
-            collection_name=profile.collection_name,
-            vector_dimension=profile.vector_dimension,
-            embedding_provider=profile.embedding_provider,
-            embedding_model=profile.embedding_model,
-            chunk_count=profile.chunk_count,
+        """复制画像；字典和列表字段单独复制，避免缓存与返回值共享可变对象。"""
+        return replace(
+            profile,
             chunk_type_distribution=dict(profile.chunk_type_distribution),
             section_distribution=dict(profile.section_distribution),
-            has_figure_or_table_chunk=profile.has_figure_or_table_chunk,
             metadata_availability=dict(profile.metadata_availability),
-            created_at=profile.created_at,
-            updated_at=profile.updated_at,
-            is_stale=profile.is_stale,
             build_sources=list(profile.build_sources),
-            cache_hit=profile.cache_hit,
-            build_time=profile.build_time,
-            fallback_reason=profile.fallback_reason,
         )
 
     @staticmethod
     def _extract_vector_dimension(collection_info: Dict[str, Any]) -> Optional[int]:
+        """从向量库 schema 中名为 vector 的字段读取维度（兼容 dim 直接给出或放在 params 里）。"""
         schema = collection_info.get("schema", {}) if isinstance(collection_info, dict) else {}
         if not isinstance(schema, dict):
             return None
-        for field in schema.get("fields", []) if isinstance(schema.get("fields", []), list) else []:
-            if field.get("name") == "vector":
-                value = field.get("dim") or (field.get("params", {}) or {}).get("dim")
+        schema_fields = schema.get("fields", [])
+        for schema_field in schema_fields if isinstance(schema_fields, list) else []:
+            if schema_field.get("name") == "vector":
+                value = schema_field.get("dim") or (schema_field.get("params", {}) or {}).get("dim")
                 return int(value) if value else None
         return None
 
     @classmethod
+    def _chunk_field(cls, chunk: Dict[str, Any], name: str) -> Any:
+        """chunk 顶层字段优先，缺失或为空时再看 metadata。"""
+        return chunk.get(name) or cls._metadata(chunk).get(name)
+
+    @classmethod
     def _metadata_availability(cls, chunks: List[Dict[str, Any]]) -> Dict[str, bool]:
-        availability = {field: False for field in cls.METADATA_FIELDS}
+        """逐字段统计是否至少有一个 chunk 带值（只把 None 和空串视为缺失，0/False 算有值）。"""
+        availability = {field_name: False for field_name in cls.METADATA_FIELDS}
         for chunk in chunks:
             metadata = cls._metadata(chunk)
             for field_name in availability:
@@ -243,37 +253,38 @@ class CollectionRetrievalProfileProvider:
 
     @classmethod
     def _chunk_type_distribution(cls, chunks: List[Dict[str, Any]]) -> Dict[str, int]:
+        """按 chunk_type 计数；缺失时归为 text。"""
         counter: Counter[str] = Counter()
         for chunk in chunks:
-            metadata = cls._metadata(chunk)
-            chunk_type = str(chunk.get("chunk_type") or metadata.get("chunk_type") or "text").strip() or "text"
+            chunk_type = str(cls._chunk_field(chunk, "chunk_type") or "text").strip() or "text"
             counter[chunk_type] += 1
         return dict(counter)
 
     @classmethod
     def _section_distribution(cls, chunks: List[Dict[str, Any]]) -> Dict[str, int]:
+        """按章节计数：优先 section_title，没有再退到 section_path；两者都没有的 chunk 不计入。"""
         counter: Counter[str] = Counter()
         for chunk in chunks:
-            metadata = cls._metadata(chunk)
-            section = str(chunk.get("section_title") or metadata.get("section_title") or "").strip()
+            section = str(cls._chunk_field(chunk, "section_title") or "").strip()
             if not section:
-                section = str(chunk.get("section_path") or metadata.get("section_path") or "").strip()
+                section = str(cls._chunk_field(chunk, "section_path") or "").strip()
             if section:
                 counter[section] += 1
         return dict(counter)
 
     @classmethod
     def _has_figure_or_table_chunk(cls, chunks: List[Dict[str, Any]]) -> bool:
+        """是否存在图/表类 chunk（按 chunk_type 或 asset_kind 判断），决定后续是否值得走表格路线。"""
         for chunk in chunks:
-            metadata = cls._metadata(chunk)
-            chunk_type = str(chunk.get("chunk_type") or metadata.get("chunk_type") or "").lower()
-            asset_kind = str(chunk.get("asset_kind") or metadata.get("asset_kind") or "").lower()
+            chunk_type = str(cls._chunk_field(chunk, "chunk_type") or "").lower()
+            asset_kind = str(cls._chunk_field(chunk, "asset_kind") or "").lower()
             if chunk_type in {"figure", "table"} or asset_kind in {"image", "table"}:
                 return True
         return False
 
     @classmethod
     def _first_metadata(cls, chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """取第一个非空 metadata 作为 embedding provider / 模型的样本来源。"""
         for chunk in chunks:
             metadata = cls._metadata(chunk)
             if metadata:
@@ -282,6 +293,7 @@ class CollectionRetrievalProfileProvider:
 
     @staticmethod
     def _metadata(chunk: Dict[str, Any]) -> Dict[str, Any]:
+        """安全取 chunk.metadata；chunk 或 metadata 不是字典时返回空字典。"""
         metadata = chunk.get("metadata", {}) if isinstance(chunk, dict) else {}
         return metadata if isinstance(metadata, dict) else {}
 
@@ -291,6 +303,7 @@ class CollectionRetrievalProfileProvider:
         chunks: List[Dict[str, Any]],
         index_record: Optional[Dict[str, Any]],
     ) -> int:
+        """chunk 数优先信数据库记录，其次向量库统计，最后才用实际读到的 chunk 数。"""
         for key in ("chunk_count", "active_chunk_count"):
             value = CollectionRetrievalProfileProvider._index_int(index_record, key)
             if value is not None:
@@ -303,17 +316,10 @@ class CollectionRetrievalProfileProvider:
 
     @staticmethod
     def _index_int(index_record: Optional[Dict[str, Any]], key: str) -> Optional[int]:
+        """从索引记录读取整数字段；缺失、为空或无法转换时返回 None。"""
         if not index_record or index_record.get(key) in (None, ""):
             return None
         try:
             return int(index_record.get(key) or 0)
         except (TypeError, ValueError):
             return None
-
-    @staticmethod
-    def _dedupe_sources(sources: List[str]) -> List[str]:
-        deduped: List[str] = []
-        for source in sources:
-            if source not in deduped:
-                deduped.append(source)
-        return deduped

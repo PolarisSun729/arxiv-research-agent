@@ -1,3 +1,12 @@
+"""结构化表格路由：在解析好的表格（行 / 列 / 单元格）上直接定位证据。
+
+面向“某指标最高/最低是谁”“去掉某组件后下降多少”“某行某列是多少”这类问题：
+- 行列都能唯一确定时，由规则直接算出答案（decision = compute）；
+- 存在歧义（如没说清是哪个指标列）时，只给候选单元格与表格上下文，交给 LLM 判断（defer_to_llm）；
+- 完全定位不到时，退回提供整表上下文（fallback_table_context）。
+规则层宁可保守地交给 LLM，也不把不确定的值伪装成最终答案。
+"""
+
 from __future__ import annotations
 
 import re
@@ -15,6 +24,7 @@ from services.retrieval.table_evidence_schema import (
 )
 
 
+# 问题中出现任一词，就认为可能需要查表（触发本路由）。
 TABLE_TRIGGER_TERMS: Tuple[str, ...] = (
     "table",
     "tab.",
@@ -67,6 +77,7 @@ TABLE_TRIGGER_TERMS: Tuple[str, ...] = (
     "比较",
 )
 
+# 常见评测指标名，用于识别问题里点名的指标。
 METRIC_HINT_TERMS: Tuple[str, ...] = (
     "accuracy",
     "acc",
@@ -83,8 +94,11 @@ METRIC_HINT_TERMS: Tuple[str, ...] = (
     "精确率",
 )
 
+# 泛化的“分数/结果”类词：问题里出现它们并不能确定是哪一个指标列。
 GENERIC_METRIC_TERMS: Tuple[str, ...] = ("score", "scores", "metric", "metrics", "performance", "result", "results", "best", "指标", "分数", "性能", "结果")
+# 这类列名通常是行标签列（模型名、方法名等），不当作数值指标列。
 LABEL_COLUMN_TERMS: Tuple[str, ...] = ("model", "method", "approach", "dataset", "setting", "variant", "模型", "方法", "数据集", "设置")
+# 以下三组词决定运算类型（优先级：差值 > 最大 > 最小 > 查值）。
 MAX_TERMS: Tuple[str, ...] = ("highest", "best", "top", "max", "maximum", "最高", "最大", "最佳")
 MIN_TERMS: Tuple[str, ...] = ("lowest", "worst", "min", "minimum", "最低", "最小", "最差")
 DIFF_TERMS: Tuple[str, ...] = (
@@ -104,10 +118,15 @@ DIFF_TERMS: Tuple[str, ...] = (
     "差值",
     "相差",
 )
+# 消融行标记（w/o、去掉某组件……）：差值计算时作为被比较的 focus 行。
 NEGATIVE_ROW_TERMS: Tuple[str, ...] = ("w/o", "without", "remove", "removed", "no ", "drop ", "ablation", "去掉", "去除", "移除", "无")
-REFERENCE_ROW_TERMS: Tuple[str, ...] = ("full", "all", "base", "baseline", "ours", "our", "default", "complete", "完整", "全部", "原始")
+# 差值计算的参考行：完整模型/本文方法优先，其次是 baseline/默认设置。
+STRONG_REFERENCE_ROW_TERMS: Tuple[str, ...] = ("ours", "our", "proposed", "full", "complete", "完整")
+WEAK_REFERENCE_ROW_TERMS: Tuple[str, ...] = ("baseline", "base", "default", "原始")
+# 问 baseline 时需要排除的“本文方法”行。
 NON_BASELINE_ROW_TERMS: Tuple[str, ...] = ("ours", "our", "proposed", "full model", "本文", "我们")
 
+# 保守的指标别名表：只收录不会误配的同义写法，问题提到别名时才能确定对应指标列。
 CONSERVATIVE_METRIC_ALIASES: Dict[str, Tuple[str, ...]] = {
     "accuracy": ("accuracy", "acc", "准确率"),
     "f1": ("f1", "f1-score", "f1 score"),
@@ -117,6 +136,9 @@ CONSERVATIVE_METRIC_ALIASES: Dict[str, Tuple[str, ...]] = {
     "recall": ("recall", "召回率"),
     "em": ("em", "exact match"),
 }
+
+# 指标名比较前把非字母数字、非中文字符统一视为分隔符（"F1-score" 与 "f1 score" 视为相同）。
+_NON_WORD_RE = re.compile(r"[^a-z0-9一-鿿]+")
 
 
 class TableStructuredRetriever:
@@ -130,9 +152,13 @@ class TableStructuredRetriever:
         structural_bonus_builder: Any,
         config: Dict[str, Any],
     ) -> None:
+        # 提供文本归一化与分词（normalize_query_text / tokenize_for_keyword_search）。
         self.query_tools = query_tools
+        # 下面两个构建器当前未被本类使用（表格路由的置信度由 route_retriever 统一计算），
+        # 保留是为了与其它路由检索器的构造参数保持一致。
         self.route_confidence_builder = route_confidence_builder
         self.structural_bonus_builder = structural_bonus_builder
+        # 运行期配置：开关、候选表数量、匹配分下限、表格上下文裁剪参数等。
         self.config = config
 
     def retrieve(
@@ -227,6 +253,7 @@ class TableStructuredRetriever:
         return {"results": raw_results, "debug": debug}
 
     def _build_query_signal(self, user_query: str, query_profile: Any) -> Dict[str, Any]:
+        """从问题中提取表格信号：是否触发本路由、运算类型、表号引用、指标词、消融组件词等。"""
         raw_query = str(user_query or "")
         normalized_query = self._normalize_text(raw_query)
         profile_normalized = self._normalize_text(getattr(query_profile, "normalized_query", "") or "")
@@ -258,7 +285,12 @@ class TableStructuredRetriever:
         }
 
     def _score_table(self, table: Dict[str, Any], signal: Dict[str, Any], query_profile: Any) -> Dict[str, Any]:
-        columns = [str(item).strip() for item in (table.get("columns") or []) if str(item).strip()]
+        """给一张候选表打匹配分，并同时抽取该表的证据（table_evidence）。
+
+        分数由表号引用、caption/章节词重合、行列名命中、消融/数据集语境加分组成，
+        最后再叠加证据置信度：能抽出可靠单元格的表排名更靠前。
+        """
+        columns = self._table_columns(table)
         row_labels = self._collect_row_labels(table)
         matched_columns = self._match_named_items(signal, columns)
         matched_rows = self._match_named_items(signal, row_labels)
@@ -326,6 +358,7 @@ class TableStructuredRetriever:
         matched_columns: List[str],
         matched_rows: List[str],
     ) -> Dict[str, Any]:
+        """按运算类型分派到差值 / 极值 / 查值三种证据抽取逻辑。"""
         operation_hint = signal["operation_hint"]
         if operation_hint == "difference":
             return self._difference_evidence(table, signal, matched_columns, matched_rows)
@@ -340,6 +373,7 @@ class TableStructuredRetriever:
         matched_columns: List[str],
         matched_rows: List[str],
     ) -> Dict[str, Any]:
+        """最大/最小值问题：指标列唯一确定时直接取极值单元格，否则给出每个候选列的极值交给 LLM。"""
         metric_columns, metric_state, metric_reasons = self._resolve_metric_columns(table, signal, matched_columns)
         candidate_rows = matched_rows or self._collect_row_labels(table)
         candidate_columns = metric_columns or self._numeric_metric_columns(table)
@@ -373,19 +407,12 @@ class TableStructuredRetriever:
         reverse = signal["operation_hint"] == "max"
         ranked = sorted(numeric_cells, key=lambda item: float(item.get("normalized_value") or 0.0), reverse=reverse)
         best_cell = ranked[0]
-        calculation = TableEvidenceCalculation(
-            operation=signal["operation_hint"],
-            value=best_cell.get("normalized_value"),
-            display_value=self._display_cell_value(best_cell),
-            unit=str(best_cell.get("unit") or ""),
-            expression=self._cell_label(best_cell),
-        )
         final = TableFinalEvidence(
             operation=signal["operation_hint"],
             rows=[str(best_cell.get("row_label") or "").strip()],
             columns=[str(best_cell.get("col_name") or "").strip()],
             cells=[TableEvidenceCell.from_cell(best_cell)],
-            calculation=calculation,
+            calculation=self._single_cell_calculation(signal["operation_hint"], best_cell),
             reason="extreme_value_from_numeric_cells",
         )
         return self._build_payload(
@@ -407,6 +434,8 @@ class TableStructuredRetriever:
         matched_columns: List[str],
         matched_rows: List[str],
     ) -> Dict[str, Any]:
+        """差值问题（如“去掉 X 后下降多少”）：找到消融行（focus）和参考行（完整模型/baseline），
+        指标列唯一时计算 参考值 − 消融值，否则给出各候选列的差值交给 LLM。"""
         reasons = self._empty_reasons()
         metric_columns, metric_state, metric_reasons = self._resolve_metric_columns(table, signal, matched_columns)
         reasons["matched"].extend(metric_reasons)
@@ -486,6 +515,7 @@ class TableStructuredRetriever:
         matched_columns: List[str],
         matched_rows: List[str],
     ) -> Dict[str, Any]:
+        """查值问题：行、列各唯一命中一个时直接给出单元格，部分命中时给候选，都没命中则退回表格上下文。"""
         reasons = self._empty_reasons()
         table_context = self._build_table_context(table, focus_rows=matched_rows)
         matched_cells = self._collect_matching_cells(table, matched_columns, matched_rows)
@@ -497,13 +527,7 @@ class TableStructuredRetriever:
                 rows=[matched_rows[0]],
                 columns=[matched_columns[0]],
                 cells=[TableEvidenceCell.from_cell(primary_cell)],
-                calculation=TableEvidenceCalculation(
-                    operation="lookup",
-                    value=primary_cell.get("normalized_value"),
-                    display_value=self._display_cell_value(primary_cell),
-                    unit=str(primary_cell.get("unit") or ""),
-                    expression=self._cell_label(primary_cell),
-                ),
+                calculation=self._single_cell_calculation("lookup", primary_cell),
                 reason="unique_row_and_column_lookup",
             )
             return self._build_payload(
@@ -550,6 +574,7 @@ class TableStructuredRetriever:
         matched_columns: List[str],
         matched_rows: List[str],
     ) -> Dict[str, Any]:
+        """无法定位具体单元格时只提供表格上下文；置信度随命中的行列数小幅上调。"""
         return self._build_payload(
             table=table,
             decision="fallback_table_context",
@@ -575,6 +600,7 @@ class TableStructuredRetriever:
         reasons: Dict[str, List[str]],
         debug: Dict[str, Any],
     ) -> Dict[str, Any]:
+        """组装 table_evidence_v2 载荷并序列化为 dict（序列化时会校验 v2 不变量）。"""
         table_info = TableEvidenceTable(
             table_id=str(table.get("table_id") or ""),
             caption=str(table.get("caption") or ""),
@@ -603,6 +629,11 @@ class TableStructuredRetriever:
         signal: Dict[str, Any],
         matched_columns: List[str],
     ) -> Tuple[List[str], str, List[str]]:
+        """确定问题针对的数值指标列，返回 (列名列表, 状态, 判定原因)。
+
+        判定顺序由严到宽：列名被显式提及 → 保守别名命中 → 行列匹配阶段命中的数值列 → 表中只有一个数值列。
+        状态为 clear（唯一）、ambiguous（多个或无法确定）或 missing（表中没有数值列）。
+        """
         numeric_columns = self._numeric_metric_columns(table)
         if not numeric_columns:
             return [], "missing", ["numeric_metric_columns_missing"]
@@ -646,6 +677,7 @@ class TableStructuredRetriever:
         reference_row: str,
         candidate_columns: Sequence[str],
     ) -> List[TableCandidateCalculation]:
+        """对每个候选指标列计算 参考行 − focus 行 的差值（两格都有数值才计算）。"""
         calculations: List[TableCandidateCalculation] = []
         for column in candidate_columns:
             focus_cell = self._find_row_column_cell(table, focus_row, column)
@@ -672,6 +704,7 @@ class TableStructuredRetriever:
         candidate_columns: Sequence[str],
         candidate_rows: Sequence[str],
     ) -> TableCandidateEvidence:
+        """指标列不确定时，为每个候选列各找出极值单元格，作为候选证据交给 LLM 选择。"""
         calculations: List[TableCandidateCalculation] = []
         candidate_cells: List[TableEvidenceCell] = []
         reverse = operation_hint == "max"
@@ -688,13 +721,7 @@ class TableStructuredRetriever:
                     column=column,
                     rows=[str(best_cell.get("row_label") or "").strip()],
                     cells=[cell],
-                    calculation=TableEvidenceCalculation(
-                        operation=operation_hint,
-                        value=best_cell.get("normalized_value"),
-                        display_value=self._display_cell_value(best_cell),
-                        unit=str(best_cell.get("unit") or ""),
-                        expression=self._cell_label(best_cell),
-                    ),
+                    calculation=self._single_cell_calculation(operation_hint, best_cell),
                     reason="candidate_extreme_value_for_metric_column",
                 )
             )
@@ -706,11 +733,10 @@ class TableStructuredRetriever:
         )
 
     def _build_table_context(self, table: Dict[str, Any], *, focus_rows: Sequence[str]) -> TableContext:
-        columns = [str(item).strip() for item in (table.get("columns") or []) if str(item).strip()]
+        """按行重建表格作为 LLM 上下文；短表给全表，中长表只给命中行上下 focus_window 行（最多 max_rows 行）。"""
+        columns = self._table_columns(table)
         rows_by_index: Dict[Any, Dict[str, Any]] = {}
-        for cell in table.get("cells", []) or []:
-            if not isinstance(cell, dict):
-                continue
+        for cell in self._table_cells(table):
             row_index = cell.get("row_index")
             row_label = str(cell.get("row_label") or "").strip()
             row = rows_by_index.setdefault(row_index, {"row_index": row_index, "row_label": row_label, "cells": {}})
@@ -744,17 +770,16 @@ class TableStructuredRetriever:
         return TableContext(columns=columns, rows=selected_rows, truncated=True, row_count=len(rows), column_count=len(columns))
 
     def _numeric_metric_columns(self, table: Dict[str, Any]) -> List[str]:
-        columns = [str(item).strip() for item in (table.get("columns") or []) if str(item).strip()]
+        """返回至少有一个数值单元格、且不像行标签列（模型名、方法名等）的列。"""
+        cells = self._table_cells(table)
         numeric_columns: List[str] = []
-        for column in columns:
+        for column in self._table_columns(table):
             normalized = self._normalize_metric_name(column)
             if any(term == normalized or term in normalized.split() for term in LABEL_COLUMN_TERMS):
                 continue
             has_numeric = any(
-                isinstance(cell, dict)
-                and str(cell.get("col_name") or "").strip() == column
-                and cell.get("normalized_value") is not None
-                for cell in table.get("cells", []) or []
+                str(cell.get("col_name") or "").strip() == column and cell.get("normalized_value") is not None
+                for cell in cells
             )
             if has_numeric:
                 numeric_columns.append(column)
@@ -768,11 +793,12 @@ class TableStructuredRetriever:
         *,
         baseline_only: bool,
     ) -> List[Dict[str, Any]]:
-        row_set = {str(item).strip() for item in rows if str(item).strip()}
-        column_set = {str(item).strip() for item in columns if str(item).strip()}
+        """收集指定行列范围内的数值单元格（行/列集合为空表示不限）；baseline_only 时排除“本文方法”行。"""
+        row_set = self._label_set(rows)
+        column_set = self._label_set(columns)
         numeric_cells: List[Dict[str, Any]] = []
-        for cell in table.get("cells", []) or []:
-            if not isinstance(cell, dict) or cell.get("normalized_value") is None:
+        for cell in self._table_cells(table):
+            if cell.get("normalized_value") is None:
                 continue
             row_label = str(cell.get("row_label", "") or "").strip()
             col_name = str(cell.get("col_name", "") or "").strip()
@@ -786,12 +812,11 @@ class TableStructuredRetriever:
         return numeric_cells
 
     def _collect_matching_cells(self, table: Dict[str, Any], columns: Sequence[str], rows: Sequence[str]) -> List[Dict[str, Any]]:
-        row_set = {str(item).strip() for item in rows if str(item).strip()}
-        column_set = {str(item).strip() for item in columns if str(item).strip()}
+        """收集落在命中行/列上的单元格（不要求是数值）；行列都没命中时返回空。"""
+        row_set = self._label_set(rows)
+        column_set = self._label_set(columns)
         cells: List[Dict[str, Any]] = []
-        for cell in table.get("cells", []) or []:
-            if not isinstance(cell, dict):
-                continue
+        for cell in self._table_cells(table):
             row_label = str(cell.get("row_label", "") or "").strip()
             col_name = str(cell.get("col_name", "") or "").strip()
             if row_set and row_label not in row_set:
@@ -804,11 +829,12 @@ class TableStructuredRetriever:
         return cells
 
     def _find_focus_row_for_difference(self, table: Dict[str, Any], signal: Dict[str, Any], matched_rows: List[str]) -> Optional[str]:
+        """找差值计算的 focus 行（通常是消融行）：命中行里的消融行优先，否则按消融标记和组件词给全部行打分。"""
         if matched_rows:
             negative_rows = [row for row in matched_rows if any(term in self._normalize_text(row) for term in NEGATIVE_ROW_TERMS)]
             if negative_rows:
                 return negative_rows[0]
-            # 如果 query 明确写了 without/remove 的组件，优先找包含组件的消融行，而不是拿任意命中行计算。
+        # 如果 query 明确写了 without/remove 的组件，优先找包含组件的消融行，而不是拿任意命中行计算。
         component_terms = signal.get("component_terms", []) or []
         row_labels = self._collect_row_labels(table)
         scored: List[Tuple[float, str]] = []
@@ -830,23 +856,25 @@ class TableStructuredRetriever:
         signal: Dict[str, Any],
         matched_rows: List[str],
     ) -> Optional[str]:
+        """找差值计算的参考行：完整模型/本文方法 > baseline/默认设置，含被消融组件且非消融行、紧邻 focus 行上方者加分。"""
         if not focus_row:
             return None
-        row_labels = [row for row in self._collect_row_labels(table) if row != focus_row]
+        all_rows = self._collect_row_labels(table)
+        row_labels = [row for row in all_rows if row != focus_row]
         if matched_rows:
+            # 问题里点名的行排在前面，同分时优先被选中。
             preferred = [row for row in matched_rows if row != focus_row]
             if preferred:
                 row_labels = preferred + [row for row in row_labels if row not in preferred]
         component_terms = signal.get("component_terms", []) or []
-        all_rows = self._collect_row_labels(table)
         focus_index = all_rows.index(focus_row) if focus_row in all_rows else -1
         scored: List[Tuple[float, str]] = []
         for row in row_labels:
             normalized = self._normalize_text(row)
             score = 0.0
-            if any(term in normalized for term in ("ours", "our", "proposed", "full", "complete", "完整")):
+            if any(term in normalized for term in STRONG_REFERENCE_ROW_TERMS):
                 score += 0.58
-            elif any(term in normalized for term in ("baseline", "base", "default", "原始")):
+            elif any(term in normalized for term in WEAK_REFERENCE_ROW_TERMS):
                 score += 0.42
             if any(term in normalized for term in component_terms) and not any(term in normalized for term in NEGATIVE_ROW_TERMS):
                 score += 0.15
@@ -860,14 +888,16 @@ class TableStructuredRetriever:
         return scored[0][1] if scored else None
 
     def _find_row_column_cell(self, table: Dict[str, Any], row_label: str, col_name: str) -> Optional[Dict[str, Any]]:
-        for cell in table.get("cells", []) or []:
-            if not isinstance(cell, dict):
-                continue
-            if str(cell.get("row_label", "") or "").strip() == str(row_label or "").strip() and str(cell.get("col_name", "") or "").strip() == str(col_name or "").strip():
+        """按行标签和列名精确定位单元格，找不到返回 None。"""
+        target_row = str(row_label or "").strip()
+        target_column = str(col_name or "").strip()
+        for cell in self._table_cells(table):
+            if str(cell.get("row_label", "") or "").strip() == target_row and str(cell.get("col_name", "") or "").strip() == target_column:
                 return cell
         return None
 
     def _match_named_items(self, signal: Dict[str, Any], items: Sequence[str]) -> List[str]:
+        """在行标签或列名中找问题提到的项：整串出现、token 重合、含指标词分别加分，返回得分最高的 4 个。"""
         matches: List[Tuple[float, str]] = []
         query_text = signal["normalized_query"]
         query_tokens = signal["tokens"]
@@ -889,6 +919,7 @@ class TableStructuredRetriever:
         return [item for _, item in matches[:4]]
 
     def _resolve_source_chunk(self, table: Dict[str, Any], retrieval_index: Any) -> Optional[Dict[str, Any]]:
+        """找到表格所在的原始 chunk（先按 source_chunk_id，再按 original_chunk_id）；找不到时构造最小 table chunk。"""
         source_ids = [
             str(table.get("source_chunk_id", "") or "").strip(),
             str(table.get("original_chunk_id", "") or "").strip(),
@@ -900,11 +931,12 @@ class TableStructuredRetriever:
                 return dict(retrieval_index.documents[retrieval_index.by_original_chunk_id[source_id][0]].chunk)
 
         # 结构化表存在但找不到原 chunk 时构造最小 table chunk，保证调试仍能看到表格证据来源。
+        original_id = table.get("original_chunk_id") or table.get("source_chunk_id") or table.get("table_id")
         return {
             "content": str(table.get("caption", "") or "").strip(),
             "chunk_id": table.get("source_chunk_id") or table.get("table_id"),
-            "parent_chunk_id": table.get("original_chunk_id") or table.get("source_chunk_id") or table.get("table_id"),
-            "original_chunk_id": table.get("original_chunk_id") or table.get("source_chunk_id") or table.get("table_id"),
+            "parent_chunk_id": original_id,
+            "original_chunk_id": original_id,
             "chunk_type": "table",
             "page_number": table.get("page_number"),
             "section_path": table.get("section_path", ""),
@@ -923,25 +955,22 @@ class TableStructuredRetriever:
         }
 
     def _collect_row_labels(self, table: Dict[str, Any]) -> List[str]:
-        labels: List[str] = []
-        for cell in table.get("cells", []) or []:
-            if not isinstance(cell, dict):
-                continue
-            label = str(cell.get("row_label", "") or "").strip()
-            if label and label not in labels:
-                labels.append(label)
-        return labels
+        """按单元格出现顺序返回去重后的非空行标签。"""
+        labels = (str(cell.get("row_label", "") or "").strip() for cell in self._table_cells(table))
+        return list(dict.fromkeys(label for label in labels if label))
 
     def _candidate_debug_row(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        """候选表的 debug 摘要：匹配分、证据决策、命中行列/单元格以及章节锚点可信度。"""
         evidence = candidate.get("table_evidence") if isinstance(candidate.get("table_evidence"), dict) else {}
+        table = candidate["table"]
         return {
-            "table_id": candidate["table"].get("table_id"),
-            "caption": candidate["table"].get("caption", ""),
-            "section_path": candidate["table"].get("section_path", ""),
-            "asset_section_match_type": candidate["table"].get("asset_section_match_type", ""),
-            "asset_section_match_confidence": candidate["table"].get("asset_section_match_confidence", 0.0),
-            "asset_section_match_is_heuristic": candidate["table"].get("asset_section_match_is_heuristic", False),
-            "asset_section_match_allow_embedding": candidate["table"].get("asset_section_match_allow_embedding", False),
+            "table_id": table.get("table_id"),
+            "caption": table.get("caption", ""),
+            "section_path": table.get("section_path", ""),
+            "asset_section_match_type": table.get("asset_section_match_type", ""),
+            "asset_section_match_confidence": table.get("asset_section_match_confidence", 0.0),
+            "asset_section_match_is_heuristic": table.get("asset_section_match_is_heuristic", False),
+            "asset_section_match_allow_embedding": table.get("asset_section_match_allow_embedding", False),
             "score": round(float(candidate.get("score", 0.0) or 0.0), 4),
             "confidence": round(float(candidate.get("confidence", 0.0) or 0.0), 4),
             "decision": evidence.get("decision"),
@@ -963,21 +992,17 @@ class TableStructuredRetriever:
 
     @staticmethod
     def _extract_table_refs(text: str) -> List[str]:
+        """提取 "Table 3" / "表 3" 这类表号引用，展开成 "3"、"table 3"、"表 3" 三种写法便于与 caption 匹配。"""
         refs: List[str] = []
         for pattern in (r"\btable\s*([0-9]+[a-z]?)\b", r"表\s*([0-9]+[a-zA-Z]?)"):
             for match in re.findall(pattern, str(text or ""), flags=re.IGNORECASE):
                 label = str(match or "").strip().lower()
                 if label:
-                    refs.append(label)
-                    refs.append(f"table {label}")
-                    refs.append(f"表 {label}")
-        deduped: List[str] = []
-        for ref in refs:
-            if ref not in deduped:
-                deduped.append(ref)
-        return deduped
+                    refs.extend([label, f"table {label}", f"表 {label}"])
+        return list(dict.fromkeys(refs))
 
     def _extract_component_terms(self, text: str) -> List[str]:
+        """提取 without/w/o/去掉 等词后面的被消融组件名（最多 3 个）。"""
         normalized = self._normalize_text(text)
         patterns = (
             r"(?:without|w/o|remove|removed|drop)\s+([a-z0-9_\-]+)",
@@ -992,6 +1017,7 @@ class TableStructuredRetriever:
         return terms[:3]
 
     def _difference_calculation(self, reference_cell: Dict[str, Any], focus_cell: Dict[str, Any]) -> TableEvidenceCalculation:
+        """计算 参考值 − focus 值，并生成可读的表达式（如 "Full / F1 - w/o X / F1"）。"""
         difference = float(reference_cell["normalized_value"]) - float(focus_cell["normalized_value"])
         display_value, display_unit = self._display_difference(reference_cell, focus_cell, difference)
         column = str(reference_cell.get("col_name") or focus_cell.get("col_name") or "").strip()
@@ -1005,14 +1031,26 @@ class TableStructuredRetriever:
         )
 
     def _display_difference(self, reference_cell: Dict[str, Any], focus_cell: Dict[str, Any], difference: float) -> Tuple[str, str]:
+        """差值的展示文本与单位：百分比类指标的归一化值是小数，换算成“百分点”展示（0.012 → 1.2 percentage points）。"""
         units = {str(reference_cell.get("unit") or "").strip().lower(), str(focus_cell.get("unit") or "").strip().lower()}
         raw_joined = f"{reference_cell.get('raw_value') or ''} {focus_cell.get('raw_value') or ''}"
         if "percent" in units or "%" in raw_joined:
             return f"{self._format_number(difference * 100.0, decimals=1)} percentage points", "percentage_points"
         return self._format_number(difference, decimals=6), str(reference_cell.get("unit") or focus_cell.get("unit") or "")
 
+    def _single_cell_calculation(self, operation: str, cell: Dict[str, Any]) -> TableEvidenceCalculation:
+        """由单个单元格直接得出结果的计算记录（查值、极值共用）。"""
+        return TableEvidenceCalculation(
+            operation=operation,
+            value=cell.get("normalized_value"),
+            display_value=self._display_cell_value(cell),
+            unit=str(cell.get("unit") or ""),
+            expression=self._cell_label(cell),
+        )
+
     @staticmethod
     def _display_cell_value(cell: Dict[str, Any]) -> str:
+        """单元格展示值：优先用原文（保留 % 等写法），没有原文时格式化数值。"""
         raw = str(cell.get("raw_value") if cell.get("raw_value") is not None else "").strip()
         if raw:
             return raw
@@ -1020,6 +1058,7 @@ class TableStructuredRetriever:
 
     @staticmethod
     def _format_number(value: Any, *, decimals: int) -> str:
+        """四舍五入到指定小数位并去掉末尾多余的 0；非数值原样转成字符串。"""
         try:
             number = float(value)
         except (TypeError, ValueError):
@@ -1029,15 +1068,18 @@ class TableStructuredRetriever:
 
     @staticmethod
     def _cell_label(cell: Dict[str, Any]) -> str:
+        """单元格的可读位置 "行标签 / 列名"。"""
         row = str(cell.get("row_label") or "").strip()
         column = str(cell.get("col_name") or "").strip()
         return " / ".join(part for part in (row, column) if part)
 
     @staticmethod
     def _cell_has_numeric_value(cell: Optional[Dict[str, Any]]) -> bool:
+        """单元格存在且解析出了数值。"""
         return isinstance(cell, dict) and cell.get("normalized_value") is not None
 
     def _metric_name_explicitly_mentioned(self, normalized_column: str, raw_column: str, query_text: str, query_tokens: set[str]) -> bool:
+        """列名是否被问题显式提及：原列名子串、归一化后的整词 token，或去空格后的紧凑写法任一命中即可。"""
         if not normalized_column:
             return False
         raw_normalized = self._normalize_text(raw_column)
@@ -1049,6 +1091,7 @@ class TableStructuredRetriever:
         return bool(compact and compact in query_text.replace(" ", ""))
 
     def _is_generic_metric_column_match(self, column: str, signal: Dict[str, Any]) -> bool:
+        """列名是泛化词（score/result 等）或没有被问题显式提及时，不能凭它确定指标列。"""
         normalized_column = self._normalize_metric_name(column)
         query_text = signal["normalized_query"]
         return normalized_column in GENERIC_METRIC_TERMS or not self._metric_name_explicitly_mentioned(
@@ -1059,18 +1102,21 @@ class TableStructuredRetriever:
         )
 
     def _normalize_metric_name(self, text: Any) -> str:
+        """\u628a\u5217\u540d/\u6307\u6807\u540d\u5f52\u4e00\u6210\u4ee5\u5355\u4e2a\u7a7a\u683c\u5206\u9694\u7684\u5c0f\u5199\u8bcd\u4e32\uff0c\u4fbf\u4e8e\u8de8\u5199\u6cd5\u6bd4\u8f83\u3002"""
         normalized = self._normalize_text(text)
-        normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", normalized).strip()
+        normalized = _NON_WORD_RE.sub(" ", normalized).strip()
         return re.sub(r"\s+", " ", normalized)
 
     @staticmethod
     def _term_present(query_text: str, query_tokens: set[str], term: str) -> bool:
-        normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", str(term or "").lower()).strip()
+        """\u6307\u6807\u522b\u540d\uff08\u5f52\u4e00\u5316\u540e\uff09\u662f\u5426\u4f5c\u4e3a token \u6216\u5b50\u4e32\u51fa\u73b0\u5728\u95ee\u9898\u4e2d\u3002"""
+        normalized = _NON_WORD_RE.sub(" ", str(term or "").lower()).strip()
         if not normalized:
             return False
         return normalized in query_tokens or normalized in query_text
 
     def _normalize_text(self, text: Any) -> str:
+        """小写化文本；query_tools 提供 normalize_query_text 时先用它统一全半角、标点等写法。"""
         normalizer = getattr(self.query_tools, "normalize_query_text", None)
         value = str(text or "").strip()
         if callable(normalizer):
@@ -1078,6 +1124,7 @@ class TableStructuredRetriever:
         return value.lower()
 
     def _tokenize(self, text: str) -> List[str]:
+        """优先复用关键词检索的分词器，保证与 BM25 路由的切词一致；缺失时按非单词字符切分。"""
         tokenizer = getattr(self.query_tools, "tokenize_for_keyword_search", None)
         if callable(tokenizer):
             return [str(item).strip().lower() for item in tokenizer(text) if str(item).strip()]
@@ -1085,16 +1132,19 @@ class TableStructuredRetriever:
 
     @staticmethod
     def _matched_terms(text: str, terms: Sequence[str]) -> List[str]:
+        """返回在文本中以子串形式出现的词（保持词表顺序）。"""
         normalized = str(text or "").lower()
         return [term for term in terms if term and term in normalized]
 
     @staticmethod
     def _has_any(text: str, terms: Sequence[str]) -> bool:
+        """文本中是否出现任一词（子串匹配）。"""
         normalized = str(text or "").lower()
         return any(term in normalized for term in terms)
 
     @staticmethod
     def _overlap_score(left: Sequence[str], right: Sequence[str]) -> float:
+        """right 中有多大比例的 token 出现在 left 中（以 right 为分母，衡量目标文本被问题覆盖的程度）。"""
         left_set = {str(item).strip() for item in left if str(item).strip()}
         right_set = {str(item).strip() for item in right if str(item).strip()}
         if not left_set or not right_set:
@@ -1103,6 +1153,7 @@ class TableStructuredRetriever:
 
     @staticmethod
     def _dedupe(items: Sequence[str]) -> List[str]:
+        """去空白后保序去重，丢弃空值。"""
         deduped: List[str] = []
         for item in items:
             normalized = str(item or "").strip()
@@ -1112,10 +1163,27 @@ class TableStructuredRetriever:
 
     @staticmethod
     def _empty_reasons() -> Dict[str, List[str]]:
+        """证据判定原因的三个分类：命中依据、歧义来源、降级原因。"""
         return {"matched": [], "ambiguity": [], "fallback": []}
 
     @staticmethod
+    def _table_columns(table: Dict[str, Any]) -> List[str]:
+        """表头列名（去空白，丢弃空列名）。"""
+        return [str(item).strip() for item in (table.get("columns") or []) if str(item).strip()]
+
+    @staticmethod
+    def _table_cells(table: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """表格中结构合法（dict）的单元格；解析结果里偶有坏数据，统一在这里过滤。"""
+        return [cell for cell in table.get("cells", []) or [] if isinstance(cell, dict)]
+
+    @staticmethod
+    def _label_set(labels: Sequence[str]) -> set[str]:
+        """行标签/列名集合（去空白、丢弃空值），用于单元格过滤。"""
+        return {str(item).strip() for item in labels if str(item).strip()}
+
+    @staticmethod
     def _row_sort_key(value: Any) -> Tuple[int, Any]:
+        """行号排序键：数字行号按数值排在前面，非数字行号按字符串排在后面。"""
         try:
             return (0, int(value))
         except (TypeError, ValueError):
@@ -1123,6 +1191,7 @@ class TableStructuredRetriever:
 
     @staticmethod
     def _evidence_cells(evidence: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """证据中的单元格：有最终证据时取最终证据的单元格，否则取候选单元格。"""
         if not isinstance(evidence, dict):
             return []
         final = evidence.get("final_evidence") if isinstance(evidence.get("final_evidence"), dict) else {}

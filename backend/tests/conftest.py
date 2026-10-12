@@ -34,7 +34,7 @@ def _load_test_dotenv(dotenv_path=None, *args, **kwargs):
 
 
 def _read_test_config_file(self, file_name, encoding="utf-8"):
-    # SlowAPI 通过 Starlette Config 直接读取 .env，绕过 python-dotenv。
+    # Starlette Config 会直接读取 .env，绕过 python-dotenv；即使当前没有代码这样用，也一并拦截。
     if _is_developer_env_file(file_name):
         return {}
     return _original_read_file(self, file_name, encoding)

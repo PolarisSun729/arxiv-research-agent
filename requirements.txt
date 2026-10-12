@@ -5,7 +5,6 @@ gunicorn>=26,<27
 pydantic>=2.13,<3
 anyio>=4.13,<5
 python-dotenv>=1.2,<2
-slowapi>=0.1.9,<0.2
 limits>=5.8,<6
 redis>=6.4,<7
 # 服务器是 Debian 12 自带的 Python 3.11.2，redis 在 < 3.11.3 时依赖 async-timeout；CI 镜像版本更新会跳过它，必须显式声明。

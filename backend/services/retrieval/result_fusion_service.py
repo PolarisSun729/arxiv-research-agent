@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from services.retrieval.contracts import FusionResult, QueryProfile
+from services.retrieval.contracts import FusionResult, QueryProfile, legacy_body_index_id
 
 
 class ResultFusionService:
-    """负责 route 去重和 RRF 融合，不承担具体召回与 rerank。"""
+    """负责 route 去重和 RRF 融合，不承担具体召回与 rerank。
+
+    RRF（Reciprocal Rank Fusion）：每条路由按名次给候选投票 1/(k + rank)，
+    再乘以路由权重和路由置信度后累加；只看名次不看原始分，避免不同路由分数量纲不一致。
+    """
 
     def __init__(
         self,
@@ -46,6 +50,10 @@ class ResultFusionService:
         top_k: int,
         query_profile: QueryProfile,
     ) -> List[Dict[str, Any]]:
+        """对已去重的各路由结果做加权 RRF 融合，返回融合分最高的 top_k 个 chunk。
+
+        同分时依次比较各路由原始分的最大值、路由置信度的最大值。
+        """
         aggregated: Dict[str, Dict[str, Any]] = {}
         route_weights = self.route_weights_for_intent(query_profile.intent_profile)
         for route_name, route_results in routes.items():
@@ -97,6 +105,7 @@ class ResultFusionService:
         return fused[:top_k]
 
     def route_weights_for_intent(self, intent_profile: Any) -> Dict[str, float]:
+        """取当前意图下的路由权重（意图未配置时用服务默认值），并保证 memory_context 有默认权重。"""
         if intent_profile is None:
             weights = dict(self.route_weights)
         else:
@@ -105,25 +114,11 @@ class ResultFusionService:
         return weights
 
     def dedupe_preserve_order(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        deduped = []
-        seen: Dict[str, Dict[str, Any]] = {}
-        for item in items:
-            item = self.with_matched_index_fields(item)
-            key = self.chunk_unique_key(item)
-            if key in seen:
-                seen[key]["matched_indexes"] = self.merge_matched_indexes(
-                    seen[key].get("matched_indexes", []),
-                    item,
-                    route_name=item.get("retrieval_route"),
-                )
-                continue
-            normalized = dict(item)
-            normalized["matched_indexes"] = self.merge_matched_indexes([], normalized, route_name=normalized.get("retrieval_route"))
-            seen[key] = normalized
-            deduped.append(normalized)
-        return deduped
+        """与 dedupe_route_results 完全相同（历史上是两份复制的实现），保留该名字兼容已有调用方。"""
+        return self.dedupe_route_results(items)
 
     def dedupe_route_results(self, route_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """按 chunk 去重并保持首次出现的顺序；重复命中的 index 明细合并到首条记录的 matched_indexes。"""
         deduped: List[Dict[str, Any]] = []
         seen: Dict[str, Dict[str, Any]] = {}
         for item in route_results:
@@ -147,6 +142,7 @@ class ResultFusionService:
         routes: Dict[str, List[Dict[str, Any]]],
         limit: int = 10,
     ) -> List[Dict[str, Any]]:
+        """按路由顺序依次拼接各路由结果，取前 limit 条作为“融合前”的原始召回快照，供 trace 对比。"""
         raw_results: List[Dict[str, Any]] = []
         for route_results in routes.values():
             for item in route_results:
@@ -157,6 +153,10 @@ class ResultFusionService:
 
     @staticmethod
     def with_matched_index_fields(item: Dict[str, Any], route_name: Any = None) -> Dict[str, Any]:
+        """返回补齐了 index_* / retrieval_index_* / matched_index_* 三套字段的副本（不修改入参）。
+
+        matched_index_* 取值优先级：matched → retrieval → index；都缺失时合成 legacy body index。
+        """
         normalized = dict(item)
         matched_index_id = (
             normalized.get("matched_index_id")
@@ -179,7 +179,7 @@ class ResultFusionService:
         if not matched_index_id:
             chunk_ref = normalized.get("parent_chunk_id") or normalized.get("original_chunk_id") or normalized.get("chunk_id") or 0
             # 旧 chunk-level 结果没有 index 字段，融合层合成 body index，保证外部结果始终有命中入口。
-            matched_index_id = f"{chunk_ref}:body:legacy"
+            matched_index_id = legacy_body_index_id(chunk_ref)
             matched_index_type = "body"
             matched_index_text = str(normalized.get("content") or normalized.get("text") or "")
         matched_index_score = normalized.get("matched_index_score", normalized.get("route_score", normalized.get("score")))
@@ -207,6 +207,7 @@ class ResultFusionService:
         *,
         route_name: Any = None,
     ) -> List[Dict[str, Any]]:
+        """把 item 的命中 index（或其自带的 matched_indexes 明细）合并进 current，返回新列表。"""
         merged = [dict(row) for row in (current or []) if isinstance(row, dict)]
         normalized = cls.with_matched_index_fields(item, route_name=route_name)
         source_indexes = [
@@ -295,6 +296,7 @@ class ResultFusionService:
 
     @staticmethod
     def chunk_unique_key(item: Dict[str, Any]) -> str:
+        """生成跨路由的 chunk 唯一键：同一资产/来源/chunk/分片/页码/顺序视为同一个证据。"""
         return "|".join(
             [
                 str(item.get("chunk_type", "text")),

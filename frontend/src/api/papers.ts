@@ -49,7 +49,7 @@ function normalizeDashboardStats(raw: any): DashboardStats {
   return {
     totalPapers: Number(raw?.totalPapers || 0),
     labeledPapers: Number(raw?.labeledPapers || 0),
-    latestSyncNewPapers: Number(raw?.latestSyncNewPapers ?? raw?.todayNewPapers ?? 0),
+    latestSyncNewPapers: Number(raw?.latestSyncNewPapers ?? 0),
     lastSyncedDate: raw?.lastSyncedDate ? String(raw.lastSyncedDate) : null,
     lastSyncRunAt: raw?.lastSyncRunAt ? String(raw.lastSyncRunAt) : null,
     lastSyncStatus: String(raw?.lastSyncStatus || 'unknown'),

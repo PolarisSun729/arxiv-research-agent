@@ -2,7 +2,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from services.storage.sqlite.base import BaseSqliteStore
-from services.storage.sqlite.shared import DEFAULT_USER_ID, logger
+from services.storage.sqlite.shared import DEFAULT_USER_ID, logger, normalize_user_id, utc_now_iso
+
+# 已经结束、不会再被恢复的 checkpoint 状态；只有这些状态的记录允许按保留期清理。
+_TERMINAL_STATUSES_SQL = "('completed','cancelled','failed','expired')"
 
 
 class AgentRuntimeCheckpointStore(BaseSqliteStore):
@@ -15,7 +18,13 @@ class AgentRuntimeCheckpointStore(BaseSqliteStore):
         created_at, updated_at, expires_at
     """
 
+    @staticmethod
+    def _retention_cutoff(retention_days: int) -> str:
+        """计算保留期截止时间；保留天数至少为 1，防止误传 0 把刚结束的记录立即删掉。"""
+        return (datetime.now(timezone.utc) - timedelta(days=max(int(retention_days), 1))).isoformat()
+
     def _row(self, row: Any) -> Dict[str, Any]:
+        """把 _SELECT_COLUMNS 顺序的行转换为字典，JSON 状态列在这里反序列化。"""
         return {
             "checkpoint_id": row[0],
             "schema_version": int(row[1] or 1),
@@ -51,7 +60,11 @@ class AgentRuntimeCheckpointStore(BaseSqliteStore):
         expires_at: Optional[str] = None,
         **_ignored: Any,
     ) -> Optional[Dict[str, Any]]:
-        normalized_user = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+        """按 (user_id, session_id, thread_id) 写入或覆盖业务 checkpoint，并返回写入后的记录。
+
+        `**_ignored` 用于吞掉旧调用方仍在传的已废弃参数，避免升级期间直接 TypeError。
+        """
+        normalized_user = normalize_user_id(user_id)
         session_id = str(session_id or "").strip()
         thread_id = str(thread_id or session_id).strip()
         if not session_id or not thread_id:
@@ -104,7 +117,8 @@ class AgentRuntimeCheckpointStore(BaseSqliteStore):
         session_id: str,
         thread_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        normalized_user = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+        """读取单个 checkpoint；thread_id 缺省时与 session_id 相同（一会话一线程的默认约定）。"""
+        normalized_user = normalize_user_id(user_id)
         thread_id = str(thread_id or session_id).strip()
         with self._get_connection() as conn:
             row = conn.execute(
@@ -122,7 +136,12 @@ class AgentRuntimeCheckpointStore(BaseSqliteStore):
         interaction_id: str,
         terminal_status: str = "running",
     ) -> bool:
-        normalized_user = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+        """原子地消费一次待处理 interaction。
+
+        只有当前 checkpoint 正处于 waiting_interaction 且 interaction_id 完全一致时才会成功，
+        用 BEGIN IMMEDIATE 抢写锁，保证同一个 interaction 在并发请求下只能被处理一次。
+        """
+        normalized_user = normalize_user_id(user_id)
         with self._get_connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -155,11 +174,12 @@ class AgentRuntimeCheckpointStore(BaseSqliteStore):
         clear_interaction: bool = False,
         **_ignored: Any,
     ) -> bool:
+        """只更新 checkpoint 状态；clear_interaction=True 时顺带清掉待处理 interaction 和过期时间。"""
         assignments = ["status = ?", "error_summary = ?", "updated_at = CURRENT_TIMESTAMP"]
         values: List[Any] = [status, str(error_summary or "")]
         if clear_interaction:
             assignments.extend(["interaction_json = ''", "expires_at = NULL"])
-        normalized_user = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+        normalized_user = normalize_user_id(user_id)
         thread_id = str(thread_id or session_id).strip()
         with self._get_connection() as conn:
             updated = conn.execute(
@@ -176,7 +196,7 @@ class AgentRuntimeCheckpointStore(BaseSqliteStore):
         session_id: str,
     ) -> int:
         """清空对话时终止未完成 checkpoint，防止旧 interaction 在新对话中再次恢复。"""
-        normalized_user = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+        normalized_user = normalize_user_id(user_id)
         with self._get_connection() as conn:
             updated = conn.execute(
                 """
@@ -198,7 +218,8 @@ class AgentRuntimeCheckpointStore(BaseSqliteStore):
             return int(updated or 0)
 
     def expire_agent_runtime_checkpoints(self, *, now: Optional[str] = None) -> int:
-        now = now or datetime.now(timezone.utc).isoformat()
+        """把已过期仍在等待用户交互的 checkpoint 标记为 expired，返回受影响条数。"""
+        now = now or utc_now_iso()
         with self._get_connection() as conn:
             updated = conn.execute(
                 """UPDATE agent_runtime_checkpoints
@@ -212,21 +233,27 @@ class AgentRuntimeCheckpointStore(BaseSqliteStore):
             return int(updated or 0)
 
     def cleanup_agent_runtime_checkpoints(self, *, retention_days: int = 7) -> int:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(int(retention_days), 1))).isoformat()
+        """删除超过保留期的终态 checkpoint；运行中/等待中的记录永远不会被清理。"""
+        cutoff = self._retention_cutoff(retention_days)
         with self._get_connection() as conn:
             deleted = conn.execute(
-                "DELETE FROM agent_runtime_checkpoints WHERE status IN ('completed','cancelled','failed','expired') AND updated_at < ?",
+                f"DELETE FROM agent_runtime_checkpoints WHERE status IN {_TERMINAL_STATUSES_SQL} AND updated_at < ?",
                 (cutoff,),
             ).rowcount
             conn.commit()
             return int(deleted or 0)
 
     def cleanup_langgraph_checkpoints_for_terminal_runtime(self, *, retention_days: int = 7) -> Dict[str, int]:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(int(retention_days), 1))).isoformat()
+        """按业务 checkpoint 的终态清理对应线程的 LangGraph checkpoint/writes。
+
+        LangGraph 自身不知道业务何时结束，所以以业务表的终态 + 保留期作为清理依据；
+        返回清理的线程数、checkpoint 数和 writes 数，方便运维脚本输出统计。
+        """
+        cutoff = self._retention_cutoff(retention_days)
         with self._get_connection() as conn:
             thread_rows = conn.execute(
-                """SELECT DISTINCT thread_id FROM agent_runtime_checkpoints
-                   WHERE status IN ('completed','cancelled','failed','expired') AND updated_at < ?""",
+                f"""SELECT DISTINCT thread_id FROM agent_runtime_checkpoints
+                   WHERE status IN {_TERMINAL_STATUSES_SQL} AND updated_at < ?""",
                 (cutoff,),
             ).fetchall()
             thread_ids = [str(row[0]) for row in thread_rows if row and row[0]]
@@ -245,7 +272,7 @@ class AgentRuntimeCheckpointStore(BaseSqliteStore):
         agent_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """汇总上下文存储规模；只读取长度和计数，不加载正文或把 debug 当作恢复状态。"""
-        normalized_user = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+        normalized_user = normalize_user_id(user_id)
         stats: Dict[str, Any] = {
             "user_id": normalized_user,
             "paper_chat": {},

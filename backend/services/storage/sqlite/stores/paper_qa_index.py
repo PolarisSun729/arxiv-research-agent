@@ -1,17 +1,78 @@
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from services.storage.sqlite.base import BaseSqliteStore
-from services.storage.sqlite.shared import logger
+from services.storage.sqlite.shared import logger, sql_placeholders
 
+# 仍在排队或执行中的 job 状态；同一幂等键下存在这些状态的 job 时直接复用，不重复建 job。
 PAPER_INDEX_ACTIVE_JOB_STATUSES = ("pending", "running", "retrying")
+
+# 一次索引构建产出的全部 artifact/状态字段，版本表（paper_qa_index_versions）可直接更新这些列。
+_BUILD_WRITABLE_FIELDS = (
+    "status",
+    "collection_name",
+    "chunk_count",
+    "embedding_model",
+    "pdf_path",
+    "chunk_file",
+    "retrieval_index_file",
+    "retrieval_index_count",
+    "retrieval_index_types",
+    "retrieval_index_version",
+    "sparse_index_dir",
+    "sparse_index_manifest_file",
+    "sparse_index_document_count",
+    "sparse_index_token_count",
+    "sparse_index_backend",
+    "sparse_index_schema_version",
+    "sparse_index_source_file",
+    "sparse_index_source_hash",
+    "sparse_index_avgdl",
+    "embedding_file",
+    "loading_method",
+    "chunking_strategy",
+    "current_stage",
+    "failed_stage",
+    "error_message",
+    "artifact_status",
+    "indexed_at",
+)
+
+# 主表 paper_qa_index 除构建字段外，还维护 active/previous 指针。
+_PAPER_QA_INDEX_WRITABLE_FIELDS = _BUILD_WRITABLE_FIELDS + (
+    "active_index_version",
+    "active_build_id",
+    "previous_build_id",
+)
+
+# 旧式 update 补写 active version 时从主表回读的列；顺序与 _backfill_legacy_active_version 的取值无关（按列名取）。
+_LEGACY_ACTIVE_SOURCE_COLUMNS = (
+    "arxiv_id", "collection_name", "status", "chunk_count", "embedding_model", "pdf_path",
+    "chunk_file", "embedding_file", "loading_method", "chunking_strategy", "current_stage",
+    "failed_stage", "error_message", "artifact_status", "indexed_at",
+    "active_index_version", "active_build_id",
+    "retrieval_index_file", "retrieval_index_count", "retrieval_index_types", "retrieval_index_version",
+    "sparse_index_dir", "sparse_index_manifest_file", "sparse_index_document_count", "sparse_index_token_count",
+    "sparse_index_backend", "sparse_index_schema_version", "sparse_index_source_file", "sparse_index_source_hash",
+    "sparse_index_avgdl",
+)
+
+# 新建 pending job 的 INSERT；create 与 acquire 两条入口共用，保证初始状态一致。
+_INSERT_PENDING_JOB_SQL = """
+    INSERT INTO paper_index_jobs (
+        job_id, arxiv_id, status, current_stage, progress, error_message,
+        loading_method, idempotency_key, recipe_version, attempt_count,
+        max_attempts, heartbeat_at, last_heartbeat_at
+    ) VALUES (?, ?, 'pending', 'pending', 0, NULL, ?, ?, ?, 0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+"""
 
 
 class PaperQAIndexStore(BaseSqliteStore):
     """维护 Paper QA 索引版本、active 指针和后台构建任务的 SQLite 存储。"""
 
     def get_paper_qa_index(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
+        """读取论文在主表中的当前索引状态（含 active/previous 指针）；没有记录时返回 None。"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -70,6 +131,11 @@ class PaperQAIndexStore(BaseSqliteStore):
 
     @staticmethod
     def _row_to_paper_qa_index_version(row: Any) -> Dict[str, Any]:
+        """把版本表行转换为字典。
+
+        第 21 列之后是陆续新增的 retrieval/sparse artifact 字段；保留 len(row) 判断，
+        兼容只查询了前 21 列的旧 SQL 或测试桩，缺失时给出空值而不是 IndexError。
+        """
         return {
             "build_id": row[0],
             "arxiv_id": row[1],
@@ -109,6 +175,7 @@ class PaperQAIndexStore(BaseSqliteStore):
 
     @staticmethod
     def _paper_qa_index_version_select_sql() -> str:
+        """版本表的标准 SELECT 前缀，列顺序与 _row_to_paper_qa_index_version 一一对应。"""
         return """
             SELECT build_id, arxiv_id, index_version, status, is_active, collection_name,
                    chunk_count, embedding_model, pdf_path, chunk_file, embedding_file,
@@ -122,18 +189,40 @@ class PaperQAIndexStore(BaseSqliteStore):
 
     @staticmethod
     def _build_paper_qa_index_version_id(arxiv_id: str) -> str:
+        """生成人类可读且全局唯一的 index_version：<安全化 arxiv_id>_<UTC 微秒时间戳>_<随机后缀>。"""
         safe_arxiv_id = "".join(ch if ch.isalnum() else "_" for ch in str(arxiv_id or "").strip()).strip("_") or "paper"
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
         suffix = uuid.uuid4().hex[:8]
         return f"{safe_arxiv_id}_{timestamp}_{suffix}"
 
+    @staticmethod
+    def _legacy_build_id(arxiv_id: str) -> str:
+        """为没有 build_id 的旧式索引记录合成稳定的 build_id，同一论文多次补写结果一致。"""
+        return f"legacy-{str(arxiv_id).replace('.', '_').replace('/', '_')}"
+
+    @staticmethod
+    def _status_filter(arxiv_id: str, statuses: Optional[List[str]]) -> Tuple[List[str], List[Any]]:
+        """构造“按论文 + 可选状态集合”过滤的 WHERE 片段和绑定参数，供版本列表/计数查询复用。"""
+        status_values = [str(item) for item in (statuses or []) if str(item).strip()]
+        where_parts = ["arxiv_id = ?"]
+        values: List[Any] = [arxiv_id]
+        if status_values:
+            where_parts.append(f"status IN ({sql_placeholders(status_values)})")
+            values.extend(status_values)
+        return where_parts, values
+
     def create_paper_qa_index_build(self, arxiv_id: str, loading_method: str) -> Optional[Dict[str, Any]]:
+        """为论文开启一次新的索引构建，返回 status=building 的版本记录。
+
+        新版本先以非 active 状态写入版本表；主表只更新当前阶段，active 指针要等构建成功、
+        调用 activate_paper_qa_index_build 后才会切换，期间线上问答仍读旧版本。
+        """
         try:
             index_version = self._build_paper_qa_index_version_id(arxiv_id)
             build_id = str(uuid.uuid4())
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                # building version 鍙褰曟柊鏋勫缓鐨勪复鏃剁姸鎬侊紝涓嶈鐩?paper_qa_index 涓粛鍦ㄧ嚎鐨?active 鎸囬拡銆?
+                # building version 只记录新构建的临时状态，不覆盖 paper_qa_index 中仍在线的 active 指针。
                 cursor.execute(
                     """
                     INSERT INTO paper_qa_index_versions (
@@ -201,13 +290,9 @@ class PaperQAIndexStore(BaseSqliteStore):
         *,
         statuses: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
+        """返回论文最近更新的一条构建版本，可按状态过滤（如只看 succeeded/active）。"""
         try:
-            status_values = [str(item) for item in (statuses or []) if str(item).strip()]
-            where_parts = ["arxiv_id = ?"]
-            values: List[Any] = [arxiv_id]
-            if status_values:
-                where_parts.append(f"status IN ({','.join('?' for _ in status_values)})")
-                values.extend(status_values)
+            where_parts, values = self._status_filter(arxiv_id, statuses)
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -232,14 +317,10 @@ class PaperQAIndexStore(BaseSqliteStore):
         statuses: Optional[List[str]] = None,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
+        """按更新时间倒序列出论文的构建版本历史，可按状态过滤。"""
         try:
             normalized_limit = max(1, int(limit))
-            status_values = [str(item) for item in (statuses or []) if str(item).strip()]
-            where_parts = ["arxiv_id = ?"]
-            values: List[Any] = [arxiv_id]
-            if status_values:
-                where_parts.append(f"status IN ({','.join('?' for _ in status_values)})")
-                values.extend(status_values)
+            where_parts, values = self._status_filter(arxiv_id, statuses)
             values.append(normalized_limit)
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -258,39 +339,11 @@ class PaperQAIndexStore(BaseSqliteStore):
             return []
 
     def update_paper_qa_index_build(self, build_id: str, **kwargs) -> bool:
+        """按白名单字段部分更新某个构建版本；只改版本表，不影响主表的 active 指针。"""
         try:
-            allowed_fields = [
-                "status",
-                "collection_name",
-                "chunk_count",
-                "embedding_model",
-                "pdf_path",
-                "chunk_file",
-                "retrieval_index_file",
-                "retrieval_index_count",
-                "retrieval_index_types",
-                "retrieval_index_version",
-                "sparse_index_dir",
-                "sparse_index_manifest_file",
-                "sparse_index_document_count",
-                "sparse_index_token_count",
-                "sparse_index_backend",
-                "sparse_index_schema_version",
-                "sparse_index_source_file",
-                "sparse_index_source_hash",
-                "sparse_index_avgdl",
-                "embedding_file",
-                "loading_method",
-                "chunking_strategy",
-                "current_stage",
-                "failed_stage",
-                "error_message",
-                "artifact_status",
-                "indexed_at",
-            ]
             update_fields = []
             update_values = []
-            for field_name in allowed_fields:
+            for field_name in _BUILD_WRITABLE_FIELDS:
                 if field_name in kwargs:
                     update_fields.append(f"{field_name} = ?")
                     update_values.append(kwargs[field_name])
@@ -313,6 +366,7 @@ class PaperQAIndexStore(BaseSqliteStore):
         except Exception as e:
             logger.error(f"Error updating paper QA index build: {str(e)}")
             return False
+
     def activate_paper_qa_index_build(self, build_id: str) -> bool:
         try:
             with self._get_connection() as conn:
@@ -513,13 +567,9 @@ class PaperQAIndexStore(BaseSqliteStore):
             return False
 
     def count_paper_qa_index_builds(self, arxiv_id: str, *, statuses: Optional[List[str]] = None) -> int:
+        """统计论文的构建版本数，可按状态过滤；用于判断是否需要清理旧版本。"""
         try:
-            status_values = [str(item) for item in (statuses or []) if str(item).strip()]
-            where_parts = ["arxiv_id = ?"]
-            values: List[Any] = [arxiv_id]
-            if status_values:
-                where_parts.append(f"status IN ({','.join('?' for _ in status_values)})")
-                values.extend(status_values)
+            where_parts, values = self._status_filter(arxiv_id, statuses)
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -533,6 +583,7 @@ class PaperQAIndexStore(BaseSqliteStore):
             return 0
 
     def mark_paper_qa_index_build_deleted(self, build_id: str) -> bool:
+        """把版本标记为已删除（软删除），供旧 artifact 清理流程使用；不会物理删除行。"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -564,6 +615,7 @@ class PaperQAIndexStore(BaseSqliteStore):
         )
 
     def _row_to_paper_index_job(self, row: Any) -> Dict[str, Any]:
+        """把 job 行转换为字典，result_json 反序列化后以 result 字段对外暴露。"""
         keys = (
             "job_id", "arxiv_id", "status", "current_stage", "progress", "error_message",
             "loading_method", "idempotency_key", "recipe_version", "attempt_count", "max_attempts",
@@ -580,6 +632,7 @@ class PaperQAIndexStore(BaseSqliteStore):
         loading_method: str,
         recipe_version: str = "paper_qa_index_v1",
     ) -> str:
+        """幂等键 = arxiv_id + 解析方式 + 构建配方版本；三者都相同的活动 job 视为同一个任务。"""
         normalized_method = str(loading_method or "docling").strip().lower() or "docling"
         normalized_recipe = str(recipe_version or "paper_qa_index_v1").strip() or "paper_qa_index_v1"
         return f"{str(arxiv_id or '').strip()}:{normalized_method}:{normalized_recipe}"
@@ -598,13 +651,7 @@ class PaperQAIndexStore(BaseSqliteStore):
             idempotency_key = self._build_paper_index_job_idempotency_key(arxiv_id, loading_method, recipe_version)
             with self._get_connection() as conn:
                 conn.execute(
-                    """
-                    INSERT INTO paper_index_jobs (
-                        job_id, arxiv_id, status, current_stage, progress, error_message,
-                        loading_method, idempotency_key, recipe_version, attempt_count,
-                        max_attempts, heartbeat_at, last_heartbeat_at
-                    ) VALUES (?, ?, 'pending', 'pending', 0, NULL, ?, ?, ?, 0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    """,
+                    _INSERT_PENDING_JOB_SQL,
                     (job_id, arxiv_id, loading_method, idempotency_key, recipe_version, max(1, int(max_attempts))),
                 )
                 conn.commit()
@@ -627,7 +674,7 @@ class PaperQAIndexStore(BaseSqliteStore):
         job_id = str(uuid.uuid4())
         idempotency_key = self._build_paper_index_job_idempotency_key(arxiv_id, loading_method, recipe_version)
         active_statuses = tuple(PAPER_INDEX_ACTIVE_JOB_STATUSES)
-        placeholders = ",".join("?" for _ in active_statuses)
+        placeholders = sql_placeholders(active_statuses)
         try:
             with self._get_connection() as conn:
                 conn.isolation_level = None
@@ -647,13 +694,7 @@ class PaperQAIndexStore(BaseSqliteStore):
                     return job
 
                 cursor.execute(
-                    """
-                    INSERT INTO paper_index_jobs (
-                        job_id, arxiv_id, status, current_stage, progress, error_message,
-                        loading_method, idempotency_key, recipe_version, attempt_count,
-                        max_attempts, heartbeat_at, last_heartbeat_at
-                    ) VALUES (?, ?, 'pending', 'pending', 0, NULL, ?, ?, ?, 0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    """,
+                    _INSERT_PENDING_JOB_SQL,
                     (job_id, arxiv_id, loading_method, idempotency_key, recipe_version, max(1, int(max_attempts))),
                 )
                 cursor.execute(
@@ -1051,7 +1092,7 @@ class PaperQAIndexStore(BaseSqliteStore):
                 expected_clause = ""
                 if expected_status_values:
                     # 条件更新阻止旧 worker 在 lease 被回收后重新写活已经交给新 attempt 的任务。
-                    expected_clause = f" AND status IN ({','.join('?' for _ in expected_status_values)})"
+                    expected_clause = f" AND status IN ({sql_placeholders(expected_status_values)})"
                     update_values.extend(expected_status_values)
 
                 cursor.execute(f'''
@@ -1126,47 +1167,87 @@ class PaperQAIndexStore(BaseSqliteStore):
             logger.error(f"Error listing paper index jobs: {str(e)}")
             return []
 
+    def _backfill_legacy_active_version(self, cursor: Any, arxiv_id: str, source: Mapping[str, Any]) -> None:
+        """给旧式直写的 indexed 记录补一条 active version，并在主表指针为空时回填指针。
+
+        旧调用方（以及部分测试）会绕过“创建构建 → 激活”的版本化流程，直接把 indexed 状态写进主表。
+        为了让版本化读取、回滚等逻辑仍能工作，这里按主表字段合成一条 active 版本：
+        - build_id / index_version 优先沿用 source 中已有的 active 指针，否则使用稳定的 legacy 值；
+        - INSERT OR IGNORE 保证重复调用不会生成多条版本；
+        - 主表指针用 COALESCE 回填，已有指针时不会被覆盖。
+        source 可以是 kwargs，也可以是从主表回读的一行（按列名取值）。
+        """
+        if not str(source.get("collection_name") or "").strip():
+            # 没有 collection 的记录不可检索，补版本没有意义。
+            return
+        legacy_version = source.get("active_index_version") or "legacy"
+        legacy_build_id = source.get("active_build_id") or self._legacy_build_id(arxiv_id)
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO paper_qa_index_versions (
+                build_id, arxiv_id, index_version, status, is_active, collection_name,
+                chunk_count, embedding_model, pdf_path, chunk_file,
+                retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version,
+                sparse_index_dir, sparse_index_manifest_file, sparse_index_document_count, sparse_index_token_count, sparse_index_backend,
+                sparse_index_schema_version, sparse_index_source_file, sparse_index_source_hash, sparse_index_avgdl,
+                embedding_file,
+                loading_method, chunking_strategy, current_stage, failed_stage,
+                error_message, artifact_status, indexed_at, activated_at
+            )
+            VALUES (?, ?, ?, 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (
+                legacy_build_id,
+                arxiv_id,
+                legacy_version,
+                source.get("collection_name"),
+                source.get("chunk_count") or 0,
+                source.get("embedding_model"),
+                source.get("pdf_path"),
+                source.get("chunk_file"),
+                source.get("retrieval_index_file"),
+                source.get("retrieval_index_count") or 0,
+                source.get("retrieval_index_types"),
+                source.get("retrieval_index_version"),
+                source.get("sparse_index_dir"),
+                source.get("sparse_index_manifest_file"),
+                source.get("sparse_index_document_count") or 0,
+                source.get("sparse_index_token_count") or 0,
+                source.get("sparse_index_backend"),
+                source.get("sparse_index_schema_version"),
+                source.get("sparse_index_source_file"),
+                source.get("sparse_index_source_hash"),
+                source.get("sparse_index_avgdl") or 0,
+                source.get("embedding_file"),
+                source.get("loading_method"),
+                source.get("chunking_strategy"),
+                source.get("current_stage") or "legacy_active",
+                source.get("artifact_status") or "active",
+                source.get("indexed_at"),
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE paper_qa_index
+            SET active_index_version = COALESCE(active_index_version, ?),
+                active_build_id = COALESCE(active_build_id, ?)
+            WHERE arxiv_id = ?
+            """,
+            (legacy_version, legacy_build_id, arxiv_id),
+        )
+
     def update_paper_qa_index(self, arxiv_id: str, **kwargs) -> bool:
+        """旧式接口：按白名单字段直接更新主表；返回主表是否有记录被更新。
+
+        当本次把状态写成 indexed 时，会顺带补写 active version（见 _backfill_legacy_active_version）。
+        """
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
 
                 update_fields = []
                 update_values = []
-
-                allowed_fields = [
-                    'collection_name',
-                    'status',
-                    'chunk_count',
-                    'embedding_model',
-                    'pdf_path',
-                    'chunk_file',
-                    'retrieval_index_file',
-                    'retrieval_index_count',
-                    'retrieval_index_types',
-                    'retrieval_index_version',
-                    'sparse_index_dir',
-                    'sparse_index_manifest_file',
-                    'sparse_index_document_count',
-                    'sparse_index_token_count',
-                    'sparse_index_backend',
-                    'sparse_index_schema_version',
-                    'sparse_index_source_file',
-                    'sparse_index_source_hash',
-                    'sparse_index_avgdl',
-                    'embedding_file',
-                    'loading_method',
-                    'chunking_strategy',
-                    'current_stage',
-                    'failed_stage',
-                    'error_message',
-                    'artifact_status',
-                    'indexed_at',
-                    'active_index_version',
-                    'active_build_id',
-                    'previous_build_id',
-                ]
-                for field_name in allowed_fields:
+                for field_name in _PAPER_QA_INDEX_WRITABLE_FIELDS:
                     if field_name in kwargs:
                         update_fields.append(f'{field_name} = ?')
                         update_values.append(kwargs[field_name])
@@ -1182,89 +1263,36 @@ class PaperQAIndexStore(BaseSqliteStore):
                     SET {", ".join(update_fields)}
                     WHERE arxiv_id = ?
                 ''', update_values)
+                # 必须在执行后续 SELECT/补写语句之前记录 rowcount；
+                # 之前在函数末尾才读取，读到的是补写语句的结果，collection 为空时会误报失败。
+                updated = cursor.rowcount > 0
 
                 if kwargs.get("status") == "indexed":
                     cursor.execute(
-                        """
-                        SELECT arxiv_id, collection_name, status, chunk_count, embedding_model, pdf_path,
-                               chunk_file, embedding_file, loading_method, chunking_strategy, current_stage,
-                               failed_stage, error_message, artifact_status, indexed_at,
-                               active_index_version, active_build_id,
-                               retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version,
-                               sparse_index_dir, sparse_index_manifest_file, sparse_index_document_count, sparse_index_token_count, sparse_index_backend,
-                               sparse_index_schema_version, sparse_index_source_file, sparse_index_source_hash, sparse_index_avgdl
-                        FROM paper_qa_index
-                        WHERE arxiv_id = ?
-                        """,
+                        f"SELECT {', '.join(_LEGACY_ACTIVE_SOURCE_COLUMNS)} FROM paper_qa_index WHERE arxiv_id = ?",
                         (arxiv_id,),
                     )
                     active_row = cursor.fetchone()
-                    if active_row and str(active_row[1] or "").strip():
-                        legacy_version = active_row[15] or "legacy"
-                        legacy_build_id = active_row[16] or f"legacy-{str(arxiv_id).replace('.', '_').replace('/', '_')}"
-                        # 鏃у紡 update 鎴愬姛鍚庝篃琛?active version锛屼繚璇佺増鏈寲璇诲彇鍜屽洖婊氫俊鎭畬鏁淬€?
-                        cursor.execute(
-                            """
-                            INSERT OR IGNORE INTO paper_qa_index_versions (
-                                build_id, arxiv_id, index_version, status, is_active, collection_name,
-                                chunk_count, embedding_model, pdf_path, chunk_file,
-                                retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version,
-                                sparse_index_dir, sparse_index_manifest_file, sparse_index_document_count, sparse_index_token_count, sparse_index_backend,
-                                sparse_index_schema_version, sparse_index_source_file, sparse_index_source_hash, sparse_index_avgdl,
-                                embedding_file,
-                                loading_method, chunking_strategy, current_stage, failed_stage,
-                                error_message, artifact_status, indexed_at, activated_at
-                            )
-                            VALUES (?, ?, ?, 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, CURRENT_TIMESTAMP)
-                            """,
-                            (
-                                legacy_build_id,
-                                arxiv_id,
-                                legacy_version,
-                                active_row[1],
-                                active_row[3] or 0,
-                                active_row[4],
-                                active_row[5],
-                                active_row[6],
-                                active_row[17],
-                                active_row[18] or 0,
-                                active_row[19],
-                                active_row[20],
-                                active_row[21],
-                                active_row[22],
-                                active_row[23] or 0,
-                                active_row[24],
-                                active_row[25],
-                                active_row[26],
-                                active_row[27],
-                                active_row[28],
-                                active_row[29] or 0,
-                                active_row[7],
-                                active_row[8],
-                                active_row[9],
-                                active_row[10] or "legacy_active",
-                                active_row[13] or "active",
-                                active_row[14],
-                            ),
-                        )
-                        cursor.execute(
-                            """
-                            UPDATE paper_qa_index
-                            SET active_index_version = COALESCE(active_index_version, ?),
-                                active_build_id = COALESCE(active_build_id, ?)
-                            WHERE arxiv_id = ?
-                            """,
-                            (legacy_version, legacy_build_id, arxiv_id),
+                    if active_row:
+                        # 旧式 update 成功后也补 active version，保证版本化读取和回滚信息完整。
+                        self._backfill_legacy_active_version(
+                            cursor,
+                            arxiv_id,
+                            dict(zip(_LEGACY_ACTIVE_SOURCE_COLUMNS, active_row)),
                         )
 
                 conn.commit()
                 logger.info(f"Paper QA index updated for: {arxiv_id}")
-                return cursor.rowcount > 0
+                return updated
         except Exception as e:
             logger.error(f"Error updating paper QA index: {str(e)}")
             return False
 
     def insert_paper_qa_index(self, arxiv_id: str, **kwargs) -> bool:
+        """旧式接口：按白名单字段 upsert 主表（arxiv_id 冲突时只更新传入的字段）。
+
+        写入 indexed 且带 collection_name 的记录时，同样补写 active version。
+        """
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -1272,114 +1300,25 @@ class PaperQAIndexStore(BaseSqliteStore):
                 values = [arxiv_id]
                 update_fields = []
 
-                allowed_fields = [
-                    'collection_name',
-                    'status',
-                    'chunk_count',
-                    'embedding_model',
-                    'pdf_path',
-                    'chunk_file',
-                    'retrieval_index_file',
-                    'retrieval_index_count',
-                    'retrieval_index_types',
-                    'retrieval_index_version',
-                    'sparse_index_dir',
-                    'sparse_index_manifest_file',
-                    'sparse_index_document_count',
-                    'sparse_index_token_count',
-                    'sparse_index_backend',
-                    'sparse_index_schema_version',
-                    'sparse_index_source_file',
-                    'sparse_index_source_hash',
-                    'sparse_index_avgdl',
-                    'embedding_file',
-                    'loading_method',
-                    'chunking_strategy',
-                    'current_stage',
-                    'failed_stage',
-                    'error_message',
-                    'artifact_status',
-                    'indexed_at',
-                    'active_index_version',
-                    'active_build_id',
-                    'previous_build_id',
-                ]
-                for field_name in allowed_fields:
+                for field_name in _PAPER_QA_INDEX_WRITABLE_FIELDS:
                     if field_name in kwargs:
                         fields.append(field_name)
                         values.append(kwargs[field_name])
                         update_fields.append(f"{field_name} = excluded.{field_name}")
 
-                placeholders = ', '.join(['?' for _ in values])
-                if update_fields:
-                    update_fields.append('updated_at = CURRENT_TIMESTAMP')
-                else:
-                    update_fields = ['updated_at = CURRENT_TIMESTAMP']
+                # 冲突时至少刷新 updated_at，保证 ON CONFLICT DO UPDATE 子句永远合法。
+                update_fields.append('updated_at = CURRENT_TIMESTAMP')
 
                 cursor.execute(f'''
                     INSERT INTO paper_qa_index ({", ".join(fields)})
-                    VALUES ({placeholders})
+                    VALUES ({sql_placeholders(values)})
                     ON CONFLICT(arxiv_id) DO UPDATE SET
                         {", ".join(update_fields)}
                 ''', values)
 
-                if kwargs.get("status") == "indexed" and str(kwargs.get("collection_name") or "").strip():
-                    legacy_build_id = kwargs.get("active_build_id") or f"legacy-{str(arxiv_id).replace('.', '_').replace('/', '_')}"
-                    legacy_version = kwargs.get("active_index_version") or "legacy"
-                    # 鍏煎娴嬭瘯鍜屾棫璋冪敤锛氱洿鎺ュ啓鍏?paper_qa_index 鐨勫彲鐢ㄨ褰曚篃琛ユ垚 active version銆?
-                    cursor.execute(
-                        """
-                        INSERT OR IGNORE INTO paper_qa_index_versions (
-                            build_id, arxiv_id, index_version, status, is_active, collection_name,
-                            chunk_count, embedding_model, pdf_path, chunk_file,
-                            retrieval_index_file, retrieval_index_count, retrieval_index_types, retrieval_index_version,
-                            sparse_index_dir, sparse_index_manifest_file, sparse_index_document_count, sparse_index_token_count, sparse_index_backend,
-                            sparse_index_schema_version, sparse_index_source_file, sparse_index_source_hash, sparse_index_avgdl,
-                            embedding_file,
-                            loading_method, chunking_strategy, current_stage, failed_stage,
-                            error_message, artifact_status, indexed_at, activated_at
-                        )
-                        VALUES (?, ?, ?, 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, CURRENT_TIMESTAMP)
-                        """,
-                        (
-                            legacy_build_id,
-                            arxiv_id,
-                            legacy_version,
-                            kwargs.get("collection_name"),
-                            kwargs.get("chunk_count") or 0,
-                            kwargs.get("embedding_model"),
-                            kwargs.get("pdf_path"),
-                            kwargs.get("chunk_file"),
-                            kwargs.get("retrieval_index_file"),
-                            kwargs.get("retrieval_index_count") or 0,
-                            kwargs.get("retrieval_index_types"),
-                            kwargs.get("retrieval_index_version"),
-                            kwargs.get("sparse_index_dir"),
-                            kwargs.get("sparse_index_manifest_file"),
-                            kwargs.get("sparse_index_document_count") or 0,
-                            kwargs.get("sparse_index_token_count") or 0,
-                            kwargs.get("sparse_index_backend"),
-                            kwargs.get("sparse_index_schema_version"),
-                            kwargs.get("sparse_index_source_file"),
-                            kwargs.get("sparse_index_source_hash"),
-                            kwargs.get("sparse_index_avgdl") or 0,
-                            kwargs.get("embedding_file"),
-                            kwargs.get("loading_method"),
-                            kwargs.get("chunking_strategy"),
-                            kwargs.get("current_stage") or "legacy_active",
-                            kwargs.get("artifact_status") or "active",
-                            kwargs.get("indexed_at"),
-                        ),
-                    )
-                    cursor.execute(
-                        """
-                        UPDATE paper_qa_index
-                        SET active_index_version = COALESCE(active_index_version, ?),
-                            active_build_id = COALESCE(active_build_id, ?)
-                        WHERE arxiv_id = ?
-                        """,
-                        (legacy_version, legacy_build_id, arxiv_id),
-                    )
+                if kwargs.get("status") == "indexed":
+                    # 兼容测试和旧调用：直接写入 paper_qa_index 的可用记录也补成 active version。
+                    self._backfill_legacy_active_version(cursor, arxiv_id, kwargs)
 
                 conn.commit()
                 logger.info(f"Paper QA index inserted for: {arxiv_id}")

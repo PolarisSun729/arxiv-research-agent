@@ -4,6 +4,15 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 
+def legacy_body_index_id(chunk_ref: Any) -> str:
+    """为没有 index 字段的旧 chunk-level 数据合成 body index ID（格式 "<chunk_ref>:body:legacy"）。
+
+    各层对 chunk_ref 的取值优先级不同（parent/original/chunk_id 的顺序各有讲究），
+    因此这里只统一 ID 格式，chunk_ref 由调用方按自身语义选择后传入。
+    """
+    return f"{chunk_ref}:body:legacy"
+
+
 @dataclass
 class RetrievalOptions:
     """单次检索请求的运行时开关，保持对外 API 的轻量输入契约。"""
@@ -89,6 +98,7 @@ class RetrievalPipelineResult:
     trace_export: Optional[Dict[str, str]] = None
 
     def to_response(self) -> Dict[str, Any]:
+        """转换为接口响应字典；trace_export 同时挂到顶层和 debug 下，兼容两种读取方式。"""
         payload: Dict[str, Any] = {"chunks": self.chunks}
         if self.debug is not None:
             payload["debug"] = self.debug

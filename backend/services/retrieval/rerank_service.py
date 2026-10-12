@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover
 from services.retrieval.contracts import QueryProfile
 from services.llm.call_metrics import record_llm_call, record_llm_usage
 from services.intent.intent_service import EXPERIMENT_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
+from services.retrieval.numeric_utils import first_float
 from services.retrieval.table_evidence_formatter import render_table_evidence_rerank_text
 from utils.config import get_enhanced_retrieval_runtime_config
 from utils.model_utils import get_huggingface_model_path
@@ -30,7 +31,12 @@ logger = logging.getLogger(__name__)
 
 
 class RerankService:
-    """负责 rerank query、document 构造、远程/本地 rerank、fallback 和 debug。"""
+    """负责 rerank query、document 构造、远程/本地 rerank、fallback 和 debug。
+
+    执行顺序：provider 为 dashscope 时先走远程 rerank；远程失败且允许本地兜底时再加载本地
+    CrossEncoder；都不可用时原样返回融合顺序（passthrough）。只有前 rerank_limit 个候选参与
+    rerank，其余候选按融合顺序追加在尾部。
+    """
 
     def __init__(
         self,
@@ -56,6 +62,8 @@ class RerankService:
         raise AttributeError(name)
 
     def build_rerank_query(self, user_query: str, query_profile: QueryProfile) -> str:
+        """生成 rerank 使用的指令式查询：优先让生成服务改写，失败或为空时使用规则模板兜底。"""
+        actual_rerank_query = ""
         if self.generation_service is not None and hasattr(self.generation_service, "build_rerank_query"):
             try:
                 rerank_query = self.generation_service.build_rerank_query(
@@ -64,22 +72,37 @@ class RerankService:
                 )
                 if rerank_query and rerank_query.strip():
                     actual_rerank_query = rerank_query.strip()
-                    logger.debug("original_question=%s", user_query)
-                    logger.debug("actual_rerank_query=%s", actual_rerank_query)
-                    return actual_rerank_query
             except Exception as exc:  # pragma: no cover
                 logger.debug("Failed to rewrite rerank query with model: %s", exc)
-        actual_rerank_query = self.fallback_rerank_query(user_query, query_profile=query_profile)
+        if not actual_rerank_query:
+            actual_rerank_query = self.fallback_rerank_query(user_query, query_profile=query_profile)
         logger.debug("original_question=%s", user_query)
         logger.debug("actual_rerank_query=%s", actual_rerank_query)
         return actual_rerank_query
 
+    @staticmethod
+    def _allow_section_anchor(chunk: Dict[str, object]) -> bool:
+        """图表 chunk 的章节信息能否进入 rerank 文本。
+
+        新 asset 会显式标记弱章节锚点是否可入文本；旧数据没有 match_type 字段时沿用历史行为（允许）。
+        """
+        match_type = str(chunk.get("asset_section_match_type", "") or "").strip()
+        return bool(chunk.get("asset_section_match_allow_embedding")) if match_type else True
+
+    @staticmethod
+    def _fusion_rank(chunk: Dict[str, Any], fallback_rank: int) -> int:
+        """读取候选的融合名次；缺失时依次退回路由名次、当前输入位置。"""
+        return int(chunk.get("fusion_rank", chunk.get("route_rank", fallback_rank)) or fallback_rank)
+
     def build_rerank_document_text(self, chunk: Dict[str, object]) -> str:
+        """构造送入 reranker 的文档文本。
+
+        图表 chunk 用“摘要 + 表格证据 + 预览 + 章节 + 页码”拼成的描述文本；
+        普通 chunk 依次取 rerank_text → content → text，并在正文开头缺少章节标题时补上标题。
+        """
         chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
         if chunk_type in {"figure", "table"}:
-            match_type = str(chunk.get("asset_section_match_type", "") or "").strip()
-            allow_section_anchor = bool(chunk.get("asset_section_match_allow_embedding")) if match_type else True
-            # 新 asset 会显式标记弱章节锚点是否可入文本；旧数据缺字段时继续沿用历史 rerank 行为。
+            allow_section_anchor = self._allow_section_anchor(chunk)
             table_evidence = chunk.get("table_evidence") if isinstance(chunk.get("table_evidence"), dict) else {}
             # rerank 只消费 v2 formatter 的文本结果，避免重新引入旧表格摘要字段的不透明语义。
             table_evidence_text = render_table_evidence_rerank_text(
@@ -106,6 +129,7 @@ class RerankService:
         if section_title:
             normalized_title = self.query_normalizer(section_title)
             normalized_content = self.query_normalizer(content)
+            # 只检查正文开头附近（标题长度的两倍）是否已包含标题，避免重复前置标题。
             if normalized_title and normalized_title not in normalized_content[: max(len(normalized_title), 1) * 2]:
                 content = f"{section_title}\n{content}".strip()
         return self._build_multi_index_rerank_document(chunk, content)
@@ -117,8 +141,7 @@ class RerankService:
         section_path = str(chunk.get("section_path", "") or "").strip()
         section_title = str(chunk.get("section_title", "") or "").strip()
         chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
-        match_type = str(chunk.get("asset_section_match_type", "") or "").strip()
-        allow_section_anchor = bool(chunk.get("asset_section_match_allow_embedding")) if match_type else True
+        allow_section_anchor = self._allow_section_anchor(chunk)
         # 图表弱章节锚点已由上游判定不可入 embedding/rerank 时，摘要头也不能重新暴露该章节文本。
         if (section_path or section_title) and not (chunk_type in {"figure", "table"} and not allow_section_anchor):
             prefix_parts.append(f"Section: {section_path or section_title}")
@@ -136,6 +159,7 @@ class RerankService:
         return self.limit_rerank_text(f"{prefix}\n{evidence_header}\n{evidence}", max_chars)
 
     def _matched_indexes_rerank_summary(self, chunk: Dict[str, object], *, limit: int = 3) -> str:
+        """把分数最高的前 limit 个命中 index 渲染成多行摘要（类型、ID、分数、文本预览）。"""
         rows = self._matched_index_rows_for_rerank(chunk)
         if not rows:
             return ""
@@ -158,6 +182,7 @@ class RerankService:
         return "\n".join(line for line in lines if line)
 
     def _matched_index_rows_for_rerank(self, chunk: Dict[str, object]) -> List[Dict[str, Any]]:
+        """取出 chunk 的命中 index 明细，按 index_id 去重后按分数从高到低排序。"""
         raw_rows = [row for row in (chunk.get("matched_indexes") or []) if isinstance(row, dict)]
         if not raw_rows and (chunk.get("matched_index_id") or chunk.get("retrieval_index_id") or chunk.get("index_id")):
             # 旧路径只有主 index 字段时合成一行，保证 rerank/debug 仍能展示命中入口。
@@ -179,7 +204,7 @@ class RerankService:
                 seen_ids.add(index_id)
             deduped.append(dict(row))
         deduped.sort(
-            key=lambda row: self._score_value(
+            key=lambda row: first_float(
                 row.get("weighted_index_score"),
                 row.get("matched_index_score"),
                 row.get("bm25_fusion_score"),
@@ -198,8 +223,12 @@ class RerankService:
         original_question: Optional[str] = None,
         candidate_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
+        """对融合后的候选执行 rerank，返回 {"chunks": 前 top_k, "reranked_chunks": 全量, "debug": ...}。
+
+        任何一步失败都会走 _fallback_result，保持融合顺序返回，不会让检索整体失败。
+        """
+        # 参与 rerank 的候选数：不超过候选总数（chunks 为空时为 0），配置值至少按 1 计。
         rerank_limit = min(len(chunks), max(1, int(candidate_limit or self.config_owner.llm_rerank_candidate_limit)))
-        rerank_limit = max(0, rerank_limit)
         limited_chunks = chunks[: max(1, top_k)]
         original_question = original_question or rerank_query
         if not chunks:
@@ -257,6 +286,7 @@ class RerankService:
                 convert_to_numpy=True,
                 device=self.config_owner._llm_reranker_device,
             )
+            # CrossEncoder 输出的是 logits，经 sigmoid 映射到 (0, 1)，与远程 relevance_score 量纲一致。
             rerank_scores = torch.sigmoid(torch.as_tensor(raw_scores, dtype=torch.float32)).tolist()
             self.log_rerank_raw_scores(
                 "local",
@@ -313,6 +343,7 @@ class RerankService:
         top_k: int,
         query_profile: Optional[QueryProfile] = None,
     ) -> Optional[Dict[str, Any]]:
+        """调用 DashScope rerank 接口；任何失败都返回 None 并把原因写入 _llm_reranker_error，由调用方决定是否兜底。"""
         api_key = self.config_owner.llm_rerank_api_key
         if not api_key:
             self.config_owner._llm_reranker_error = "dashscope_api_key_not_set"
@@ -348,6 +379,7 @@ class RerankService:
             self.config_owner._llm_reranker_error = f"dashscope_rerank_invalid_response: {data}"
             return None
         self.log_rerank_raw_scores("dashscope", results)
+        # 不同接口版本的字段名不同（index/document_index、relevance_score/score），这里兼容两套。
         score_by_index: Dict[int, float] = {}
         for item in results:
             if not isinstance(item, dict):
@@ -399,6 +431,7 @@ class RerankService:
         }
 
     def load_llm_reranker(self) -> Optional[Any]:
+        """懒加载本地 CrossEncoder（线程安全，模型路径不变时复用）；不可用时返回 None 并记录原因。"""
         model_path = self.resolve_reranker_model_path()
         if not model_path:
             self.config_owner._llm_reranker_error = "llm_rerank_model_not_configured"
@@ -428,6 +461,7 @@ class RerankService:
                 return None
 
     def resolve_reranker_model_path(self) -> Optional[str]:
+        """解析本地 reranker 模型路径：优先本地专用配置，其次通用配置；都未配置时返回 None。"""
         configured_path = str(self.config_owner.llm_rerank_local_model_name_or_path or "").strip()
         if configured_path:
             resolved = get_huggingface_model_path(configured_path)
@@ -439,6 +473,7 @@ class RerankService:
         return None
 
     def is_dashscope_vl_rerank_model(self) -> bool:
+        """这些模型只能走 DashScope 原生接口（input/parameters 结构），不能用 OpenAI 兼容接口。"""
         model_name = (self.config_owner.llm_rerank_model_name or "").strip().lower()
         return model_name in {"qwen3-vl-rerank", "gte-rerank-v2"}
 
@@ -449,6 +484,7 @@ class RerankService:
         documents: List[str],
         rerank_limit: int,
     ) -> Tuple[str, Dict[str, Any]]:
+        """按模型类型返回 (请求 URL, 请求体)：原生接口与兼容接口的 URL 和 payload 结构不同。"""
         top_n = min(len(documents), max(1, rerank_limit))
         model_name = self.config_owner.llm_rerank_model_name or "qwen3-rerank"
         if self.is_dashscope_vl_rerank_model():
@@ -480,6 +516,7 @@ class RerankService:
 
     @staticmethod
     def extract_dashscope_rerank_results(data: Any) -> Optional[List[Dict[str, Any]]]:
+        """兼容接口把结果放在顶层 results，原生接口放在 output.results；都没有时返回 None。"""
         if not isinstance(data, dict):
             return None
         results = data.get("results")
@@ -493,6 +530,7 @@ class RerankService:
         return None
 
     def fallback_rerank_query(self, user_query: str, query_profile: QueryProfile) -> str:
+        """规则模板生成 rerank 指令：通用证据偏好 + 按意图追加的章节偏好 + 原始问题。"""
         normalized_question = re.sub(r"\s+", " ", (user_query or "")).strip()
         base_query = (
             "Select the passage that most directly supports an answer to the user's question. "
@@ -519,31 +557,56 @@ class RerankService:
                 base_query += f"Favor sections such as: {', '.join(intent_profile.preferred_sections[:4])}. "
         return f"{base_query}Original question: {normalized_question}" if normalized_question else base_query.rstrip()
 
+    def _apply_rerank_fields(
+        self,
+        chunk: Dict[str, Any],
+        *,
+        input_rank: int,
+        rerank_score: float,
+        model_name: Optional[str],
+        returned_index: Optional[int],
+        document_text: str,
+    ) -> Tuple[Dict[str, Any], float]:
+        """复制候选并写入 rerank 结果字段，返回 (新 chunk, 原融合分)。
+
+        原融合分保存在 fusion_score，score 字段改为 rerank 分，下游排序统一读 score 即可。
+        """
+        fused_score = float(chunk.get("score", 0.0) or 0.0)
+        reranked_chunk = dict(chunk)
+        reranked_chunk.update(
+            {
+                "fusion_score": fused_score,
+                "fusion_rank": self._fusion_rank(chunk, input_rank),
+                "llm_rerank_score": rerank_score,
+                "llm_rerank_model": model_name,
+                "llm_rerank_prompt": self.config_owner.llm_rerank_prompt,
+                "llm_rerank_input_rank": input_rank,
+                "llm_rerank_returned_index": returned_index,
+                "llm_rerank_document_preview": document_text[: ENHANCED_RETRIEVAL_CONFIG["rerank_document_preview_limit"]],
+                "llm_rerank_used_compressed_text": bool(reranked_chunk.get("rerank_text")),
+                "score": rerank_score,
+            }
+        )
+        return reranked_chunk, fused_score
+
     def _map_local_scores(
         self,
         candidate_chunks: List[Dict[str, Any]],
         rerank_scores: List[float],
         rerank_documents: List[str],
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """把本地 CrossEncoder 分数按输入顺序映射回候选（本地推理不会打乱顺序，returned_index 即输入位置）。"""
         mapped_candidates: List[Dict[str, Any]] = []
         candidate_debug: List[Dict[str, Any]] = []
         for idx, (chunk, score, document_text) in enumerate(zip(candidate_chunks, rerank_scores, rerank_documents), start=1):
             rerank_score = float(score)
-            fused_score = float(chunk.get("score", 0.0) or 0.0)
-            reranked_chunk = dict(chunk)
-            reranked_chunk.update(
-                {
-                    "fusion_score": fused_score,
-                    "fusion_rank": int(chunk.get("fusion_rank", chunk.get("route_rank", idx)) or idx),
-                    "llm_rerank_score": rerank_score,
-                    "llm_rerank_model": self.config_owner._llm_reranker_path,
-                    "llm_rerank_prompt": self.config_owner.llm_rerank_prompt,
-                    "llm_rerank_input_rank": idx,
-                    "llm_rerank_returned_index": idx,
-                    "llm_rerank_document_preview": document_text[: ENHANCED_RETRIEVAL_CONFIG["rerank_document_preview_limit"]],
-                    "llm_rerank_used_compressed_text": bool(reranked_chunk.get("rerank_text")),
-                    "score": rerank_score,
-                }
+            reranked_chunk, fused_score = self._apply_rerank_fields(
+                chunk,
+                input_rank=idx,
+                rerank_score=rerank_score,
+                model_name=self.config_owner._llm_reranker_path,
+                returned_index=idx,
+                document_text=document_text,
             )
             mapped_candidates.append(
                 {
@@ -567,27 +630,30 @@ class RerankService:
         rerank_documents: List[str],
         score_by_index: Dict[int, float],
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """把 DashScope 返回的 {文档下标: 分数} 映射回候选，返回 (候选, 候选 debug, 映射 debug)。
+
+        接口返回的下标是 0 基，所以优先按 idx-1 查找；为兼容个别 1 基实现，再退回按 idx 查找。
+        """
         ranked_candidates: List[Dict[str, Any]] = []
         candidate_debug: List[Dict[str, Any]] = []
         mapped_debug: List[Dict[str, Any]] = []
         for idx, (chunk, document_text) in enumerate(zip(candidate_chunks, rerank_documents), start=1):
-            returned_index = idx if idx in score_by_index else (idx - 1 if (idx - 1) in score_by_index else None)
+            # returned_index 与取分使用同一查找顺序；此前先查 idx 再查 idx-1，
+            # 在 0 基返回时 debug 中的下标会整体错位一位（分数本身不受影响）。
+            if (idx - 1) in score_by_index:
+                returned_index: Optional[int] = idx - 1
+            elif idx in score_by_index:
+                returned_index = idx
+            else:
+                returned_index = None
             rerank_score = float(score_by_index.get(idx - 1, score_by_index.get(idx, 0.0)))
-            fused_score = float(chunk.get("score", 0.0) or 0.0)
-            reranked_chunk = dict(chunk)
-            reranked_chunk.update(
-                {
-                    "fusion_score": fused_score,
-                    "fusion_rank": int(chunk.get("fusion_rank", chunk.get("route_rank", idx)) or idx),
-                    "llm_rerank_score": rerank_score,
-                    "llm_rerank_model": self.config_owner.llm_rerank_model_name,
-                    "llm_rerank_prompt": self.config_owner.llm_rerank_prompt,
-                    "llm_rerank_input_rank": idx,
-                    "llm_rerank_returned_index": returned_index,
-                    "llm_rerank_document_preview": document_text[: ENHANCED_RETRIEVAL_CONFIG["rerank_document_preview_limit"]],
-                    "llm_rerank_used_compressed_text": bool(reranked_chunk.get("rerank_text")),
-                    "score": rerank_score,
-                }
+            reranked_chunk, fused_score = self._apply_rerank_fields(
+                chunk,
+                input_rank=idx,
+                rerank_score=rerank_score,
+                model_name=self.config_owner.llm_rerank_model_name,
+                returned_index=returned_index,
+                document_text=document_text,
             )
             ranked_candidates.append(reranked_chunk)
             candidate_debug.append(self._candidate_debug_row(idx, reranked_chunk, fused_score, rerank_score))
@@ -606,6 +672,7 @@ class RerankService:
         return ranked_candidates, candidate_debug, mapped_debug
 
     def _candidate_debug_row(self, idx: int, chunk: Dict[str, Any], fused_score: float, rerank_score: float) -> Dict[str, Any]:
+        """生成单个候选的 rerank debug 行（融合分 vs rerank 分、输入预览、命中 index）。"""
         return {
             "input_rank": idx,
             "chunk_id": chunk.get("chunk_id"),
@@ -624,13 +691,14 @@ class RerankService:
         }
 
     def _build_tail_chunks(self, chunks: List[Dict[str, Any]], rerank_limit: int, *, model_name: Optional[str]) -> List[Dict[str, Any]]:
+        """未参与 rerank 的尾部候选：保留融合分与顺序，rerank 分和名次置为 None 以示区分。"""
         tail_chunks: List[Dict[str, Any]] = []
         for idx, chunk in enumerate(chunks[rerank_limit:], start=rerank_limit + 1):
             tail_chunk = dict(chunk)
             tail_chunk.update(
                 {
                     "fusion_score": float(tail_chunk.get("score", 0.0) or 0.0),
-                    "fusion_rank": int(tail_chunk.get("fusion_rank", tail_chunk.get("route_rank", idx)) or idx),
+                    "fusion_rank": self._fusion_rank(tail_chunk, idx),
                     "llm_rerank_score": None,
                     "llm_rerank_model": model_name,
                     "llm_rerank_prompt": self.config_owner.llm_rerank_prompt,
@@ -654,6 +722,7 @@ class RerankService:
         mode: str = "passthrough",
         provider: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """rerank 未执行或失败时的返回：chunks 原样透传，debug 中记录失败原因。"""
         debug = {
             "enabled": True,
             "applied": False,
@@ -688,6 +757,7 @@ class RerankService:
         candidate_debug: List[Dict[str, Any]],
         provider: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """rerank 成功时的 debug 信息；candidate_scores 按配置截断，避免 debug 体积过大。"""
         debug = {
             "enabled": True,
             "applied": True,
@@ -710,19 +780,9 @@ class RerankService:
 
     @staticmethod
     def limit_rerank_text(text: str, max_chars: int) -> str:
+        """压缩连续空白后按字符数截断，控制 reranker 输入长度。"""
         normalized = re.sub(r"\s+", " ", text or "").strip()
         return normalized if len(normalized) <= max_chars else normalized[:max_chars].rstrip()
-
-    @staticmethod
-    def _score_value(*values: Any) -> float:
-        for value in values:
-            if value is None or value == "":
-                continue
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
-        return 0.0
 
     def log_rerank_inputs(
         self,

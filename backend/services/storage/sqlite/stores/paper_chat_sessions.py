@@ -1,29 +1,25 @@
 import uuid
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from services.storage.sqlite.base import BaseSqliteStore
-from services.storage.sqlite.shared import DEFAULT_USER_ID, logger
+from services.storage.sqlite.shared import DEFAULT_USER_ID, logger, normalize_user_id, utc_now_iso
+from services.storage.sqlite.stores.paper_chat_common import (
+    PAPER_CHAT_SESSION_COLUMNS,
+    row_to_paper_chat_session,
+    select_columns,
+)
+
+_SESSION_COLUMNS = select_columns(PAPER_CHAT_SESSION_COLUMNS)
+
+# update_paper_chat_session 允许直接透传的列；summary 需要 JSON 序列化，单独处理。
+_UPDATABLE_SESSION_FIELDS = ('title', 'status', 'summary_updated_at', 'summary_turn_count', 'summary_last_turn_id')
 
 
 class PaperChatSessionStore(BaseSqliteStore):
     """维护论文问答会话的基础 CRUD；消息写入和 QA turn 事务仍留在消息流程。"""
 
     def _row_to_paper_chat_session(self, row: Any) -> Dict[str, Any]:
-        return {
-            'session_id': row[0],
-            'user_id': row[1],
-            'arxiv_id': row[2],
-            'title': row[3] or '',
-            'created_at': row[4],
-            'updated_at': row[5],
-            'message_count': row[6] or 0,
-            'status': row[7] or 'active',
-            'summary': (self._deserialize_json_field(row[8]) or None) if len(row) > 8 else None,
-            'summary_updated_at': row[9] if len(row) > 9 else None,
-            'summary_turn_count': (row[10] or 0) if len(row) > 10 else 0,
-            'summary_last_turn_id': (row[11] or '') if len(row) > 11 else '',
-        }
+        return row_to_paper_chat_session(row)
 
     def create_paper_chat_session(
         self,
@@ -33,6 +29,7 @@ class PaperChatSessionStore(BaseSqliteStore):
         status: str = 'active',
         session_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
+        """新建会话并返回完整会话结构；允许调用方指定 session_id 以便幂等重放。"""
         try:
             normalized_session_id = str(session_id or uuid.uuid4())
             normalized_title = str(title or '').strip()
@@ -52,13 +49,13 @@ class PaperChatSessionStore(BaseSqliteStore):
             return None
 
     def get_paper_chat_session(self, session_id: str, user_id: str = DEFAULT_USER_ID) -> Optional[Dict[str, Any]]:
+        """读取单个会话；带 user_id 条件，拿到别人的 session_id 也读不到。"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    '''
-                    SELECT session_id, user_id, arxiv_id, title, created_at, updated_at, message_count, status,
-                           summary_json, summary_updated_at, summary_turn_count, summary_last_turn_id
+                    f'''
+                    SELECT {_SESSION_COLUMNS}
                     FROM paper_chat_sessions
                     WHERE session_id = ? AND user_id = ?
                     ''',
@@ -76,13 +73,13 @@ class PaperChatSessionStore(BaseSqliteStore):
         user_id: str = DEFAULT_USER_ID,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
+        """列出用户在某篇论文下的会话，按最近活跃时间倒序。"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    '''
-                    SELECT session_id, user_id, arxiv_id, title, created_at, updated_at, message_count, status,
-                           summary_json, summary_updated_at, summary_turn_count, summary_last_turn_id
+                    f'''
+                    SELECT {_SESSION_COLUMNS}
                     FROM paper_chat_sessions
                     WHERE arxiv_id = ? AND user_id = ?
                     ORDER BY updated_at DESC, created_at DESC
@@ -96,16 +93,18 @@ class PaperChatSessionStore(BaseSqliteStore):
             return []
 
     def get_recent_paper_chat_session(self, arxiv_id: str, user_id: str = DEFAULT_USER_ID) -> Optional[Dict[str, Any]]:
+        """返回用户在该论文下最近活跃的会话，没有则为 None。"""
         sessions = self.list_paper_chat_sessions(arxiv_id=arxiv_id, user_id=user_id, limit=1)
         return sessions[0] if sessions else None
 
     def update_paper_chat_session(self, session_id: str, user_id: str = DEFAULT_USER_ID, **kwargs) -> bool:
+        """按白名单字段部分更新会话；未出现在 kwargs 中的字段保持不变，updated_at 总会刷新。"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 update_fields = []
                 update_values = []
-                for field_name in ('title', 'status', 'summary_updated_at', 'summary_turn_count', 'summary_last_turn_id'):
+                for field_name in _UPDATABLE_SESSION_FIELDS:
                     if field_name in kwargs:
                         update_fields.append(f'{field_name} = ?')
                         update_values.append(kwargs[field_name])
@@ -145,13 +144,17 @@ class PaperChatSessionStore(BaseSqliteStore):
             summary=dict(summary or {}),
             summary_turn_count=max(0, int(summary_turn_count or 0)),
             summary_last_turn_id=str(summary_last_turn_id or "").strip() or None,
-            summary_updated_at=summary_updated_at or datetime.now(timezone.utc).isoformat(),
+            summary_updated_at=summary_updated_at or utc_now_iso(),
         )
 
     def delete_paper_chat_session(self, session_id: str, user_id: str = DEFAULT_USER_ID) -> bool:
+        """删除会话及其全部消息，并把关联笔记的 session_id 置空（笔记内容本身保留）。
+
+        先校验会话归属再删除，非本人会话直接返回 False，不会触碰任何数据。
+        """
         try:
             normalized_session_id = str(session_id or "").strip()
-            normalized_user_id = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+            normalized_user_id = normalize_user_id(user_id)
             if not normalized_session_id:
                 return False
             with self._get_connection() as conn:

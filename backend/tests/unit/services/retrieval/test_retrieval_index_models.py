@@ -369,6 +369,23 @@ def test_collection_keyword_index_rebuilds_from_retrieval_index_artifact() -> No
         assert index.documents[0].retrieval_index_id == "chunk-1:question:1"
 
 
+def test_structured_tables_report_reason_when_chunk_file_is_not_object() -> None:
+    with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+        chunk_file = Path(temp_dir) / "chunks.json"
+        chunk_file.write_text(json.dumps([{"content": "top-level array"}]), encoding="utf-8")
+        provider = CollectionRetrievalIndexProvider(
+            vector_store_service=SimpleNamespace(),
+            chunk_normalizer=lambda chunk: dict(chunk),
+            tokenizer=_tokenize,
+        )
+
+        tables, debug = provider._load_structured_tables({"chunk_file": str(chunk_file)})
+
+        assert tables == []
+        assert debug["reason"] == "chunk_file_not_object"
+        assert debug["structured_table_count"] == 0
+
+
 def test_collection_keyword_index_loads_persisted_sparse_artifact() -> None:
     source_chunk = {
         "chunk_id": "chunk-sparse",

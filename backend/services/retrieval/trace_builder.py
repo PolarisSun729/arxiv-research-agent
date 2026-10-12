@@ -1,3 +1,10 @@
+"""检索调试信息（retrieval_debug）与 trace 导出。
+
+各检索阶段只产出自己的结果，由 ``RetrievalTraceBuilder`` 统一转换成：
+- 接口返回的 retrieval_debug（保持旧字段兼容，同时按阶段组织）；
+- 落盘的 JSON / Markdown trace（脱敏后导出，便于离线复盘一次检索的全过程）。
+"""
+
 from __future__ import annotations
 
 import json
@@ -112,17 +119,17 @@ class RetrievalTraceBuilder:
                 ],
             },
             "routes": {
-                route_name: [self.debug_chunk_item(item) for item in route_results]
+                route_name: self._debug_chunks(route_results)
                 for route_name, route_results in deduped_routes.items()
             },
             "multi_index": multi_index_debug,
             "stages": {
-                "raw_retrieval_top30": [self.debug_chunk_item(item) for item in raw_retrieval_top30],
-                "fused_top30": [self.debug_chunk_item(item) for item in fused_top30],
-                "reranked_top30": [self.debug_chunk_item(item) for item in reranked_top30],
-                "final_context_top15": [self.debug_chunk_item(item) for item in final_context_top15],
+                "raw_retrieval_top30": self._debug_chunks(raw_retrieval_top30),
+                "fused_top30": self._debug_chunks(fused_top30),
+                "reranked_top30": self._debug_chunks(reranked_top30),
+                "final_context_top15": self._debug_chunks(final_context_top15),
             },
-            "final_chunks": [self.debug_chunk_item(item) for item in final_results],
+            "final_chunks": self._debug_chunks(final_results),
             "config": {
                 **config,
                 "top_k": effective_top_k,
@@ -203,6 +210,19 @@ class RetrievalTraceBuilder:
                 config=options,
             )
             sparse_index_debug = self.build_sparse_index_debug(keyword_debug)
+            # 同一份数据既出现在顶层字段也出现在 steps 中，只做一次换行规整；
+            # 后续脱敏会生成新结构，共享引用不影响导出内容。
+            normalize = self.normalize_trace_value
+            query_profile_trace = normalize(self.debug_query_profile(query_profile))
+            intent_profile_trace = normalize(self.debug_intent_profile(intent_profile))
+            collection_profile_trace = normalize(collection_profile)
+            embedding_batch_trace = normalize(embedding_batch)
+            route_metrics_trace = normalize(route_metrics)
+            sparse_index_trace = normalize(sparse_index_debug)
+            keyword_search_trace = normalize(keyword_debug)
+            multi_index_trace = normalize(multi_index_debug)
+            context_expansion_trace = normalize(context_expansion)
+            context_budget_trace = normalize(context_budget)
             payload = {
                 "exported_at": datetime.now().isoformat(timespec="seconds"),
                 "arxiv_id": str(paper_context.get("arxiv_id", "") or ""),
@@ -210,67 +230,46 @@ class RetrievalTraceBuilder:
                 "original_question": original_question,
                 "user_query": user_query,
                 "rerank_query": rerank_query,
-                "intent_profile": self.normalize_trace_value(self.debug_intent_profile(intent_profile)),
-                "paper_context": self.normalize_trace_value(paper_context),
-                "options": self.normalize_trace_value(options),
-                "query_profile": self.normalize_trace_value(self.debug_query_profile(query_profile)),
-                "query_views": self.normalize_trace_value(query_views),
-                "collection_profile": self.normalize_trace_value(collection_profile),
-                "embedding_batch": self.normalize_trace_value(embedding_batch),
-                "route_metrics": self.normalize_trace_value(route_metrics),
-                "sparse_index": self.normalize_trace_value(sparse_index_debug),
-                "keyword_search": self.normalize_trace_value(keyword_debug),
-                "multi_index": self.normalize_trace_value(multi_index_debug),
-                "context_expansion": self.normalize_trace_value(context_expansion),
-                "context_budget": self.normalize_trace_value(context_budget),
+                "intent_profile": intent_profile_trace,
+                "paper_context": normalize(paper_context),
+                "options": normalize(options),
+                "query_profile": query_profile_trace,
+                "query_views": normalize(query_views),
+                "collection_profile": collection_profile_trace,
+                "embedding_batch": embedding_batch_trace,
+                "route_metrics": route_metrics_trace,
+                "sparse_index": sparse_index_trace,
+                "keyword_search": keyword_search_trace,
+                "multi_index": multi_index_trace,
+                "context_expansion": context_expansion_trace,
+                "context_budget": context_budget_trace,
                 "steps": [
-                    {"step": "query_profile", "result": self.normalize_trace_value(self.debug_query_profile(query_profile))},
-                    {"step": "intent_profile", "result": self.normalize_trace_value(self.debug_intent_profile(intent_profile))},
-                    {"step": "query_rewrite", "result": self.normalize_trace_value(query_views.get("rewrite_debug", {}))},
-                    {"step": "original_question", "result": self.normalize_trace_value(original_question)},
-                    {"step": "rerank_query", "result": self.normalize_trace_value(rerank_query)},
-                    {"step": "hyde", "result": self.normalize_trace_value(hyde_debug)},
-                    {"step": "table_structured", "result": self.normalize_trace_value(table_structured_debug)},
-                    {"step": "keyword_search", "result": self.normalize_trace_value(keyword_debug)},
-                    {"step": "sparse_index", "result": self.normalize_trace_value(sparse_index_debug)},
-                    {"step": "collection_profile", "result": self.normalize_trace_value(collection_profile)},
-                    {"step": "embedding_batch", "result": self.normalize_trace_value(embedding_batch)},
-                    {"step": "route_metrics", "result": self.normalize_trace_value(route_metrics)},
+                    {"step": "query_profile", "result": query_profile_trace},
+                    {"step": "intent_profile", "result": intent_profile_trace},
+                    {"step": "query_rewrite", "result": normalize(query_views.get("rewrite_debug", {}))},
+                    {"step": "original_question", "result": normalize(original_question)},
+                    {"step": "rerank_query", "result": normalize(rerank_query)},
+                    {"step": "hyde", "result": normalize(hyde_debug)},
+                    {"step": "table_structured", "result": normalize(table_structured_debug)},
+                    {"step": "keyword_search", "result": keyword_search_trace},
+                    {"step": "sparse_index", "result": sparse_index_trace},
+                    {"step": "collection_profile", "result": collection_profile_trace},
+                    {"step": "embedding_batch", "result": embedding_batch_trace},
+                    {"step": "route_metrics", "result": route_metrics_trace},
                     {
                         "step": "routes",
                         "result": {
-                            route_name: [self.normalize_trace_value(self.debug_chunk_item(item)) for item in route_results]
+                            route_name: self._trace_chunks(route_results)
                             for route_name, route_results in routes.items()
                         },
                     },
-                    {
-                        "step": "multi_index",
-                        "result": self.normalize_trace_value(multi_index_debug),
-                    },
-                    {
-                        "step": "raw_retrieval_top30",
-                        "result": [self.normalize_trace_value(self.debug_chunk_item(item)) for item in raw_retrieval_top30],
-                    },
-                    {
-                        "step": "fused_top30",
-                        "result": [self.normalize_trace_value(self.debug_chunk_item(item)) for item in fused_results[:30]],
-                    },
-                    {
-                        "step": "reranked_top30",
-                        "result": [self.normalize_trace_value(self.debug_chunk_item(item)) for item in reranked_results[:30]],
-                    },
-                    {
-                        "step": "context_expansion",
-                        "result": self.normalize_trace_value(context_expansion),
-                    },
-                    {
-                        "step": "context_budget",
-                        "result": self.normalize_trace_value(context_budget),
-                    },
-                    {
-                        "step": "final_context_top15",
-                        "result": [self.normalize_trace_value(self.debug_chunk_item(item)) for item in final_results],
-                    },
+                    {"step": "multi_index", "result": multi_index_trace},
+                    {"step": "raw_retrieval_top30", "result": self._trace_chunks(raw_retrieval_top30)},
+                    {"step": "fused_top30", "result": self._trace_chunks(fused_results[:30])},
+                    {"step": "reranked_top30", "result": self._trace_chunks(reranked_results[:30])},
+                    {"step": "context_expansion", "result": context_expansion_trace},
+                    {"step": "context_budget", "result": context_budget_trace},
+                    {"step": "final_context_top15", "result": self._trace_chunks(final_results)},
                 ],
             }
 
@@ -285,7 +284,16 @@ class RetrievalTraceBuilder:
             logger.warning("Failed to export retrieval trace: %s", exc)
             return None
 
+    def _debug_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把一组 chunk 转成 debug 摘要列表。"""
+        return [self.debug_chunk_item(item) for item in chunks]
+
+    def _trace_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把一组 chunk 转成 debug 摘要并规整换行，供 trace 导出使用。"""
+        return [self.normalize_trace_value(self.debug_chunk_item(item)) for item in chunks]
+
     def debug_query_profile(self, query_profile: Optional[QueryProfile]) -> Optional[Dict[str, Any]]:
+        """QueryProfile 的可序列化摘要（含嵌套的意图摘要）。"""
         if query_profile is None:
             return None
         return {
@@ -306,6 +314,7 @@ class RetrievalTraceBuilder:
         }
 
     def debug_intent_profile(self, intent_profile: Any) -> Optional[Dict[str, Any]]:
+        """意图识别结果的可序列化摘要。"""
         if intent_profile is None:
             return None
         return {
@@ -329,6 +338,7 @@ class RetrievalTraceBuilder:
         }
 
     def debug_chunk_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """单个 chunk 的 debug 视图：命中索引、路由打分、BM25 解释、记忆、上下文扩展等字段一次性展开。"""
         preview = item.get("content", "")[: ENHANCED_RETRIEVAL_CONFIG["rerank_document_preview_limit"]].replace("\n", " ").strip()
         return {
             "chunk_id": item.get("chunk_id"),
@@ -414,6 +424,7 @@ class RetrievalTraceBuilder:
 
     @staticmethod
     def _table_evidence_debug(evidence: Any) -> Dict[str, Any]:
+        """表格证据的 debug 摘要；载荷不合法时记录错误而不是抛出。"""
         if not isinstance(evidence, dict) or not evidence:
             return {}
         try:
@@ -424,6 +435,7 @@ class RetrievalTraceBuilder:
 
     @staticmethod
     def count_chunk_types(chunks: List[Dict[str, Any]]) -> Dict[str, int]:
+        """统计各 chunk 类型数量；text/figure/table 三项即使为 0 也输出，方便前端固定展示。"""
         counts: Dict[str, int] = {"text": 0, "figure": 0, "table": 0}
         for chunk in chunks:
             chunk_type = str(chunk.get("chunk_type", "text") or "text").strip().lower()
@@ -432,12 +444,8 @@ class RetrievalTraceBuilder:
 
     @staticmethod
     def mark_final_context_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        marked_chunks: List[Dict[str, Any]] = []
-        for chunk in chunks:
-            marked = dict(chunk)
-            marked["final_context_uses_original_chunk"] = True
-            marked_chunks.append(marked)
-        return marked_chunks
+        """复制 chunk 并标记“最终上下文使用原始 chunk 内容”（而非 rerank 用的改写文本）。"""
+        return [{**chunk, "final_context_uses_original_chunk": True} for chunk in chunks]
 
     def log_retrieval_stage(self, stage_name: str, chunks: List[Dict[str, Any]]) -> None:
         """统一记录阶段快照，避免 pipeline 和 rerank 各自输出不同格式。"""
@@ -478,6 +486,7 @@ class RetrievalTraceBuilder:
         fallback_queries: List[str],
         user_query: str,
     ) -> List[str]:
+        """某路由实际使用过的查询（取各结果的 source_query）；没有记录时退回改写查询或原问题。"""
         queries = [item.get("source_query", "") for item in route_results if item.get("source_query")]
         if queries:
             return queries
@@ -485,6 +494,7 @@ class RetrievalTraceBuilder:
 
     @staticmethod
     def chunk_unique_key(item: Dict[str, Any]) -> str:
+        """chunk 的稳定唯一键：由类型、资产路径、来源、原始 chunk ID、分片标签、页码和顺序拼成。"""
         return "|".join(
             [
                 str(item.get("chunk_type", "text")),
@@ -500,6 +510,10 @@ class RetrievalTraceBuilder:
 
     @staticmethod
     def build_sparse_index_debug(keyword_debug: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """稀疏（BM25）索引的加载摘要：从持久化 artifact 加载还是运行期重建、版本、文档数、耗时等。
+
+        keyword_debug 已带 sparse_index 摘要时直接使用，否则从 artifact 信息中推导。
+        """
         keyword_debug = dict(keyword_debug or {})
         sparse_index = dict(keyword_debug.get("sparse_index") or {})
         if sparse_index:
@@ -588,15 +602,13 @@ class RetrievalTraceBuilder:
         *,
         route_name: str,
     ) -> Dict[str, Any]:
+        """单条 index 级命中的 debug 行：命中的是哪个索引、索引级分数与聚合后的 chunk 分数。"""
         return {
             "retrieval_route": str(route_name or row.get("retrieval_route") or ""),
             "chunk_id": candidate.get("chunk_id"),
-            "matched_index_id": row.get("matched_index_id") or row.get("index_id"),
-            "matched_index_type": row.get("matched_index_type") or row.get("index_type"),
-            "matched_index_text_preview": self.short_text_preview(
-                row.get("matched_index_text") or row.get("index_text") or "",
-                180,
-            ),
+            "matched_index_id": self._matched_index_field(row, "id"),
+            "matched_index_type": self._matched_index_field(row, "type"),
+            "matched_index_text_preview": self.short_text_preview(self._matched_index_field(row, "text") or "", 180),
             "index_level_score": row.get("matched_index_score"),
             "weighted_index_score": row.get("weighted_index_score"),
             "chunk_level_aggregated_score": candidate.get("route_score"),
@@ -611,6 +623,7 @@ class RetrievalTraceBuilder:
         *,
         route_name: str,
     ) -> Dict[str, Any]:
+        """chunk 级聚合的 debug 行：聚合策略与加分、命中索引数量/类型以及最佳命中索引。"""
         best_index = candidate.get("best_matched_index") or {}
         if not isinstance(best_index, dict):
             best_index = {}
@@ -625,20 +638,23 @@ class RetrievalTraceBuilder:
             "matched_index_count": candidate.get("index_aggregation_hit_count", len(candidate.get("matched_indexes", []) or [])),
             "matched_index_types": candidate.get("matched_index_types", []),
             "best_matched_index": {
-                "matched_index_id": best_index.get("matched_index_id") or best_index.get("index_id"),
-                "matched_index_type": best_index.get("matched_index_type") or best_index.get("index_type"),
+                "matched_index_id": self._matched_index_field(best_index, "id"),
+                "matched_index_type": self._matched_index_field(best_index, "type"),
                 "matched_index_score": best_index.get("matched_index_score"),
                 "weighted_index_score": best_index.get("weighted_index_score"),
-                "matched_index_text_preview": self.short_text_preview(
-                    best_index.get("matched_index_text") or best_index.get("index_text") or "",
-                    180,
-                ),
+                "matched_index_text_preview": self.short_text_preview(self._matched_index_field(best_index, "text") or "", 180),
             },
             "source_queries": candidate.get("source_queries", []),
         }
 
+    @staticmethod
+    def _matched_index_field(row: Dict[str, Any], field_name: str) -> Any:
+        """读取命中索引字段：优先 matched_index_<field>，缺失时退回 index_<field>（两种写法的结果都存在）。"""
+        return row.get(f"matched_index_{field_name}") or row.get(f"index_{field_name}")
+
     def collect_matched_index_rows(self, item: Dict[str, Any]) -> List[Dict[str, Any]]:
-        rows = [row for row in (item.get("matched_indexes") or []) if isinstance(row, dict)]
+        """取 chunk 的全部 index 级命中行；只有主命中字段的旧结果也转换成一行。"""
+        rows =[row for row in (item.get("matched_indexes") or []) if isinstance(row, dict)]
         if rows:
             return [dict(row) for row in rows]
         if item.get("matched_index_id") or item.get("retrieval_index_id") or item.get("index_id"):
@@ -655,17 +671,19 @@ class RetrievalTraceBuilder:
         return []
 
     def count_matched_index_types(self, chunks: List[Dict[str, Any]]) -> Dict[str, int]:
+        """统计一组 chunk 的命中索引类型分布（缺失类型按 body 计）。"""
         counts: Counter[str] = Counter()
         for chunk in chunks or []:
             rows = self.collect_matched_index_rows(chunk)
             if rows:
                 for row in rows:
-                    counts[str(row.get("matched_index_type") or row.get("index_type") or "body")] += 1
-            elif chunk.get("matched_index_type") or chunk.get("index_type"):
-                counts[str(chunk.get("matched_index_type") or chunk.get("index_type") or "body")] += 1
+                    counts[str(self._matched_index_field(row, "type") or "body")] += 1
+            elif self._matched_index_field(chunk, "type"):
+                counts[str(self._matched_index_field(chunk, "type"))] += 1
         return dict(counts)
 
     def render_retrieval_trace_text(self, payload: Dict[str, Any]) -> str:
+        """把 trace 载荷渲染成 Markdown：先是查询与选项，再按 steps 逐段输出。"""
         lines: List[str] = []
         lines.append("# Retrieval Trace")
         lines.append("")
@@ -693,6 +711,7 @@ class RetrievalTraceBuilder:
         return "\n".join(lines).rstrip() + "\n"
 
     def format_trace_block(self, value: Any, indent: int = 0) -> str:
+        """递归地把 dict/list 渲染成缩进的 YAML 风格文本。"""
         pad = "  " * indent
         if isinstance(value, dict):
             if not value:
@@ -719,6 +738,7 @@ class RetrievalTraceBuilder:
         return f"{pad}{self.normalize_trace_newlines(str(value))}"
 
     def normalize_trace_value(self, value: Any) -> Any:
+        """递归复制结构，并把其中字符串的转义换行还原为真实换行。"""
         if isinstance(value, str):
             return self.normalize_trace_newlines(value)
         if isinstance(value, dict):
@@ -729,19 +749,19 @@ class RetrievalTraceBuilder:
 
     @staticmethod
     def normalize_trace_newlines(text: str) -> str:
+        """统一换行：CRLF 和字面量 "\\r\\n" / "\\n"（LLM 输出里常见的转义残留）都转成真实换行。"""
         if not text:
             return text
         return text.replace("\r\n", "\n").replace("\\r\\n", "\n").replace("\\n", "\n")
 
     @staticmethod
     def short_text_preview(text: Any, limit: int = ENHANCED_RETRIEVAL_CONFIG["short_text_preview_limit"]) -> str:
-        normalized = re.sub(r"\s+", " ", str(text or "")).strip()
-        if len(normalized) <= limit:
-            return normalized
-        return normalized[:limit]
+        """压缩空白后截取前 limit 个字符。"""
+        return re.sub(r"\s+", " ", str(text or "")).strip()[:limit]
 
     @staticmethod
     def sanitize_trace_slug(text: str, max_length: int = ENHANCED_RETRIEVAL_CONFIG["sanitize_trace_slug_max_length"]) -> str:
+        """把查询文本转成可用作文件名的 slug（仅保留字母数字和中文，空时为 query）。"""
         slug = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "_", (text or "").strip())
         slug = re.sub(r"_+", "_", slug).strip("_")
         if not slug:

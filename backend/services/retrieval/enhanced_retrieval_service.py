@@ -1,6 +1,7 @@
+"""增强检索的对外入口：按配置装配各检索子服务，并把检索请求委托给 RetrievalPipeline。"""
+
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
@@ -29,12 +30,8 @@ else:
         GenerationService = Any  # type: ignore
 
 
+# 各子服务共享同一份配置字典（引用传递），测试可以在实例化前统一改写。
 ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
-MEMORY_RUNTIME_CONFIG = get_memory_runtime_config()
-QUERY_VIEW_LIMIT = ENHANCED_RETRIEVAL_CONFIG["query_view_limit"]
-QUERY_PLAN_LIMIT = ENHANCED_RETRIEVAL_CONFIG["query_plan_limit"]
-
-logger = logging.getLogger(__name__)
 
 
 class EnhancedRetrievalService:
@@ -182,6 +179,7 @@ class EnhancedRetrievalService:
         paper_context: Optional[Dict[str, Any]] = None,
         options: Optional[RetrievalOptions] = None,
     ) -> Dict[str, Any]:
+        """对外检索入口，返回结构同 RetrievalPipeline.retrieve。"""
         # 对外兼容入口只负责委托，真正的 query planning / route / rerank / trace 编排都收口到 pipeline。
         return self.retrieval_pipeline.retrieve(
             user_query=user_query,
@@ -193,12 +191,15 @@ class EnhancedRetrievalService:
     # 以下私有方法是 facade 适配点：它们处理运行时状态、参数兜底和可选依赖能力，
     # 不承担 query planning / route / rerank / fusion 等检索编排职责。
     def _memory_flag(self, key: str, default: Any = None) -> Any:
+        """读取实例创建时快照的记忆相关运行配置。"""
         return self.memory_runtime_config.get(key, default)
 
     def _resolve_option(self, runtime_value: Optional[bool], default_value: bool) -> bool:
+        """请求显式传了开关就用请求值，否则用配置默认值。"""
         return default_value if runtime_value is None else bool(runtime_value)
 
     def _resolve_collection_name(self, collection_name: str) -> str:
+        """向量库支持别名解析时交给它规范化 collection 名，否则原样返回。"""
         if hasattr(self.vector_store_service, "resolve_collection_name"):
             return self.vector_store_service.resolve_collection_name(collection_name)
         return collection_name

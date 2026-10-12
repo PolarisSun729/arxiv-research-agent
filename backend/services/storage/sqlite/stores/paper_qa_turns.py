@@ -1,110 +1,31 @@
-import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-from services.storage.sqlite.base import BaseSqliteStore
-from services.storage.sqlite.shared import DEFAULT_USER_ID, PaperQATurnPersistenceError, logger
-from services.storage.sqlite.stores.paper_chat_sessions import PaperChatSessionStore
-from services.storage.sqlite.stores.profile_events import ProfileEventStore
+from services.storage.sqlite.shared import (
+    DEFAULT_USER_ID,
+    PaperQATurnPersistenceError,
+    logger,
+    normalize_user_id,
+)
+from services.storage.sqlite.stores.paper_chat_common import PaperChatStoreBase
+
+# user/assistant 两条消息共用的 INSERT；created_at 由调用方显式给出，保证同一轮内顺序稳定。
+_INSERT_TURN_MESSAGE_SQL = '''
+    INSERT INTO paper_chat_messages (
+        message_id, turn_id, session_id, role, content, sources,
+        retrieval_debug_snapshot, contextualized_question, question_contextualization,
+        status, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+'''
 
 
-class PaperQATurnStore(BaseSqliteStore):
-    """维护用户/助手双消息的原子 QA turn 写入，避免半轮对话污染短期记忆。"""
+class PaperQATurnStore(PaperChatStoreBase):
+    """维护用户/助手双消息的原子 QA turn 写入，避免半轮对话污染短期记忆。
 
-    def __init__(
-        self,
-        connection_provider,
-        session_store: PaperChatSessionStore,
-        profile_event_store: ProfileEventStore,
-    ) -> None:
-        super().__init__(connection_provider)
-        self.session_store = session_store
-        self.profile_event_store = profile_event_store
-
-    def record_user_profile_event(self, *args, **kwargs):
-        """原子 turn 写入只追加画像事件，事件归一化和消费状态由画像事件 Store 维护。"""
-        return self.profile_event_store.record_user_profile_event(*args, **kwargs)
-
-    def _row_to_paper_chat_session(self, row: Any) -> Dict[str, Any]:
-        return self.session_store._row_to_paper_chat_session(row)
-
-    def _row_to_paper_chat_message(self, row: Any) -> Dict[str, Any]:
-        return {
-            'message_id': row[0],
-            'turn_id': row[1] or '',
-            'session_id': row[2],
-            'role': row[3],
-            'content': row[4] or '',
-            'sources': self._deserialize_json_field(row[5]) or [],
-            'retrieval_debug_snapshot': self._deserialize_json_field(row[6]),
-            'contextualized_question': row[7] or '',
-            'question_contextualization': self._deserialize_json_field(row[8]),
-            'status': row[9] or 'completed',
-            'created_at': row[10],
-        }
-
-    def _get_paper_chat_message_in_transaction(self, cursor: sqlite3.Cursor, message_id: str) -> Optional[Dict[str, Any]]:
-        """在同一事务中回读刚写入的消息，确认原子 turn 没有半写成功。"""
-        cursor.execute(
-            '''
-            SELECT message_id, turn_id, session_id, role, content, sources,
-                   retrieval_debug_snapshot, contextualized_question, question_contextualization,
-                   status, created_at
-            FROM paper_chat_messages
-            WHERE message_id = ?
-            ''',
-            (message_id,),
-        )
-        row = cursor.fetchone()
-        return self._row_to_paper_chat_message(row) if row else None
-
-    def _get_paper_chat_session_in_transaction(self, cursor: sqlite3.Cursor, session_id: str) -> Optional[Dict[str, Any]]:
-        """在事务提交前回读会话统计，确保返回给上层的是本轮写入后的状态。"""
-        cursor.execute(
-            '''
-            SELECT session_id, user_id, arxiv_id, title, created_at, updated_at, message_count, status,
-                   summary_json, summary_updated_at, summary_turn_count, summary_last_turn_id
-            FROM paper_chat_sessions
-            WHERE session_id = ?
-            ''',
-            (session_id,),
-        )
-        row = cursor.fetchone()
-        return self._row_to_paper_chat_session(row) if row else None
-
-    def _refresh_paper_chat_session_stats(self, conn: sqlite3.Connection, session_id: str) -> None:
-        """根据消息表重算会话统计，避免双消息写入和会话计数出现不一致。"""
-        cursor = conn.cursor()
-        cursor.execute(
-            '''
-            SELECT COUNT(*), MAX(created_at)
-            FROM paper_chat_messages
-            WHERE session_id = ?
-            ''',
-            (session_id,),
-        )
-        row = cursor.fetchone() or (0, None)
-        message_count = int(row[0] or 0)
-        latest_created_at = row[1]
-        if latest_created_at:
-            cursor.execute(
-                '''
-                UPDATE paper_chat_sessions
-                SET message_count = ?, updated_at = ?, status = COALESCE(status, 'active')
-                WHERE session_id = ?
-                ''',
-                (message_count, latest_created_at, session_id),
-            )
-        else:
-            cursor.execute(
-                '''
-                UPDATE paper_chat_sessions
-                SET message_count = 0, updated_at = CURRENT_TIMESTAMP, status = COALESCE(status, 'active')
-                WHERE session_id = ?
-                ''',
-                (session_id,),
-            )
+    行映射、事务内回读和会话统计重算继承自 PaperChatStoreBase，与消息 Store 共用同一份实现。
+    """
 
     def append_paper_qa_turn(
         self,
@@ -121,12 +42,18 @@ class PaperQATurnStore(BaseSqliteStore):
         user_status: str = 'completed',
         assistant_status: str = 'completed',
     ) -> Dict[str, Any]:
+        """在一个事务内写入“用户问题 + 助手回答”两条消息，并刷新会话统计。
+
+        任一步失败都会整体回滚并抛出 PaperQATurnPersistenceError，
+        调用方不会看到只有问题没有回答的半轮对话。
+        """
         normalized_session_id = str(session_id or '').strip()
-        normalized_user_id = str(user_id or DEFAULT_USER_ID).strip() or DEFAULT_USER_ID
+        normalized_user_id = normalize_user_id(user_id)
         normalized_turn_id = str(turn_id or uuid.uuid4()).strip()
         user_message_id = str(uuid.uuid4())
         assistant_message_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
+        # 助手消息比用户消息晚 1 微秒，按 created_at 排序时问题一定排在回答前面。
         user_created_at = now.strftime("%Y-%m-%d %H:%M:%S.%f")
         assistant_created_at = (now + timedelta(microseconds=1)).strftime("%Y-%m-%d %H:%M:%S.%f")
         with self._get_connection() as conn:
@@ -147,15 +74,9 @@ class PaperQATurnStore(BaseSqliteStore):
                         f"paper chat session not found: session_id={normalized_session_id} user_id={normalized_user_id}"
                     )
 
+                # 用户消息不携带检索来源和 debug 快照，这两列写空串。
                 cursor.execute(
-                    '''
-                    INSERT INTO paper_chat_messages (
-                        message_id, turn_id, session_id, role, content, sources,
-                        retrieval_debug_snapshot, contextualized_question, question_contextualization,
-                        status, created_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''',
+                    _INSERT_TURN_MESSAGE_SQL,
                     (
                         user_message_id,
                         normalized_turn_id,
@@ -172,14 +93,7 @@ class PaperQATurnStore(BaseSqliteStore):
                 )
 
                 cursor.execute(
-                    '''
-                    INSERT INTO paper_chat_messages (
-                        message_id, turn_id, session_id, role, content, sources,
-                        retrieval_debug_snapshot, contextualized_question, question_contextualization,
-                        status, created_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''',
+                    _INSERT_TURN_MESSAGE_SQL,
                     (
                         assistant_message_id,
                         normalized_turn_id,
@@ -207,6 +121,7 @@ class PaperQATurnStore(BaseSqliteStore):
                     )
 
                 self._refresh_paper_chat_session_stats(conn, normalized_session_id)
+                # 提交前在同一事务里回读，确认两条消息和会话统计都已写入，否则视为失败回滚。
                 user_message = self._get_paper_chat_message_in_transaction(cursor, user_message_id)
                 assistant_message = self._get_paper_chat_message_in_transaction(cursor, assistant_message_id)
                 refreshed_session = self._get_paper_chat_session_in_transaction(cursor, normalized_session_id)
