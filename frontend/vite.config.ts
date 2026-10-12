@@ -1,6 +1,7 @@
 import { defineConfig, loadEnv } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { resolve } from 'path'
+import { Agent } from 'http'
 
 export default defineConfig(({ mode }) => {
   const publicEnv = loadEnv(mode, __dirname, 'VITE_')
@@ -21,6 +22,10 @@ export default defineConfig(({ mode }) => {
           target: 'http://127.0.0.1:8001',
           changeOrigin: true,
           // 后端已挂载 /api 前缀，代理必须保留原路径。
+          // http-proxy 默认每个请求都带 Connection: close；Windows 上 uvicorn 按 close 关连接时会截断响应
+          // （常卡在 64KiB 或 ECONNRESET），前端请求随之挂起。复用 keep-alive 连接可避开；
+          // 空闲超时 4s 短于 uvicorn 默认的 5s keep-alive，避免复用到后端已关闭的连接。
+          agent: new Agent({ keepAlive: true, timeout: 4000 })
         }
       }
     }
