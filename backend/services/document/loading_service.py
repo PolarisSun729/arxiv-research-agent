@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 import fitz  # PyMuPDF
 
 from utils.config import DOCLING_CONFIG
-from utils.storage_paths import resolve_backend_artifact_path
+from utils.storage_paths import BACKEND_DOCLING_ASSETS_ROOT, BACKEND_ROOT, resolve_backend_artifact_path
 
 logger = logging.getLogger(__name__)
 
@@ -1829,7 +1829,8 @@ class LoadingService:
         source_name = os.path.basename(source_path or "") or "document"
         paper_id = os.path.splitext(source_name)[0].split("_")[0]
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        asset_root = os.path.join("03-docling-assets", paper_id, timestamp)
+        # 固定到 backend/03-docling-assets，与证据资产读取端的越界校验根目录保持一致，不受启动目录影响。
+        asset_root = os.path.join(str(BACKEND_DOCLING_ASSETS_ROOT), paper_id, timestamp)
         os.makedirs(asset_root, exist_ok=True)
         return asset_root
 
@@ -1950,7 +1951,7 @@ class LoadingService:
         if isinstance(size, (list, tuple)) and len(size) >= 2:
             width, height = size[0], size[1]
 
-        rel_path = os.path.relpath(output_path, start=os.getcwd())
+        rel_path = os.path.relpath(output_path, start=str(BACKEND_ROOT))
         caption = picture_caption or self._stringify_docling_value(
             getattr(picture_item, "caption", None) or getattr(picture_item, "text", None) or getattr(picture_item, "orig", None)
         )
@@ -2028,7 +2029,7 @@ class LoadingService:
             return {
                 "asset_exported": True,
                 "asset_export_reason": "bbox_fallback",
-                "asset_path": os.path.relpath(output_path, start=os.getcwd()),
+                "asset_path": os.path.relpath(output_path, start=str(BACKEND_ROOT)),
                 "asset_abs_path": os.path.abspath(output_path),
                 "asset_summary": summary,
                 "asset_file_name": output_name,
@@ -2168,8 +2169,8 @@ class LoadingService:
                 "asset_file_name": f"{output_base}.csv",
             }
 
-        rel_csv_path = os.path.relpath(csv_path, start=os.getcwd())
-        rel_json_path = os.path.relpath(json_path, start=os.getcwd())
+        rel_csv_path = os.path.relpath(csv_path, start=str(BACKEND_ROOT))
+        rel_json_path = os.path.relpath(json_path, start=str(BACKEND_ROOT))
 
         row_count = None
         column_count = None

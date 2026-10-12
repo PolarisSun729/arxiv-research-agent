@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from services.paper_qa import evidence_contract as evidence_contract_module
 from services.paper_qa.answer_generator import AnswerGenerator
 from services.paper_qa.evidence_contract import build_public_source_payload, resolve_evidence_asset_path
 
@@ -69,7 +70,8 @@ def test_public_source_payload_does_not_expose_local_asset_paths() -> None:
 
 
 def test_evidence_asset_lookup_is_index_bound_and_rejects_traversal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.chdir(tmp_path)
+    # 资产根目录固定在 backend 下而不是当前工作目录；测试里把它替换为临时目录。
+    monkeypatch.setattr(evidence_contract_module, "BACKEND_DOCLING_ASSETS_ROOT", tmp_path / "03-docling-assets")
     asset_root = tmp_path / "03-docling-assets" / "2401.00001"
     asset_root.mkdir(parents=True)
     asset_path = asset_root / "figure-2.png"
@@ -111,6 +113,33 @@ def test_evidence_asset_lookup_is_index_bound_and_rejects_traversal(tmp_path: Pa
         resolve_evidence_asset_path(
             arxiv_id="2401.00001",
             source_id="figure-3",
+            paper_qa_index_store=Store(),
+            enhanced_retrieval_service=SimpleNamespace(collection_retrieval_index_provider=Provider()),
+        )
+
+
+def test_evidence_asset_root_does_not_follow_current_working_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 旧实现以 os.getcwd() 为根：只要切到某个目录启动，该目录下的同名资产就会被放行。
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(evidence_contract_module, "BACKEND_DOCLING_ASSETS_ROOT", tmp_path / "backend" / "03-docling-assets")
+    stray_asset = tmp_path / "03-docling-assets" / "2401.00001" / "figure-2.png"
+    stray_asset.parent.mkdir(parents=True)
+    stray_asset.write_bytes(b"png")
+
+    class Store:
+        def get_paper_qa_index(self, arxiv_id: str):
+            return {"status": "indexed", "collection_name": "paper_2401"}
+
+    class Provider:
+        def get_index(self, collection_name: str, *, index_record):
+            return SimpleNamespace(documents=[SimpleNamespace(chunk={
+                "chunk_id": "figure-2", "chunk_type": "figure", "asset_abs_path": str(stray_asset),
+            })])
+
+    with pytest.raises(FileNotFoundError):
+        resolve_evidence_asset_path(
+            arxiv_id="2401.00001",
+            source_id="figure-2",
             paper_qa_index_store=Store(),
             enhanced_retrieval_service=SimpleNamespace(collection_retrieval_index_provider=Provider()),
         )
