@@ -268,6 +268,38 @@ class TestRuleClaimExtractor:
         result = RuleClaimExtractor().extract(self._request("有效主张文本 [source:c]。", version=3))
         assert result["claims"][0]["claim_id"] == "claim-v3-0"
 
+    def test_markdown_structure_is_not_extracted_as_claims(self) -> None:
+        # 回归：编号加粗小标题被 "1." 切成 "**1" 和 "层名**"，引出句与小标题都成了无引用主张，
+        # 经词面重叠绑到核心需求后让所有核心需求无法满足。
+        needs = [{"need_id": "need-1", "description": "记忆生成与演化层的具体步骤", "importance": "core"}]
+        answer = (
+            "具体步骤如下：\n\n"
+            "**1. 记忆生成与演化层（顶层）**\n"
+            "*   **记忆化（Memorize）：** 系统将原始对话转化为图节点。[source:54]\n"
+            "2. 整合阶段合并重复事实。[source:5]\n\n"
+            "**核心架构特点：**\n"
+            "### 演化层\n"
+        )
+        claims = RuleClaimExtractor().extract(self._request(answer, needs=needs))["claims"]
+        assert [(claim["text"], claim["citation_ids"]) for claim in claims] == [
+            ("记忆化（Memorize）： 系统将原始对话转化为图节点", ["54"]),
+            ("整合阶段合并重复事实", ["5"]),
+        ]
+
+    def test_bold_line_with_numbers_or_citations_is_still_verified(self) -> None:
+        # 只有短、无引用、无数字的结构行才跳过，不能把结论写进加粗标题绕过校验。
+        claims = RuleClaimExtractor().extract(
+            self._request("**CogMem 准确率提升 30%**\n**记忆层负责建图** [source:c]\n")
+        )["claims"]
+        assert [(claim["text"], claim["citation_ids"]) for claim in claims] == [
+            ("CogMem 准确率提升 30%", []),
+            ("记忆层负责建图", ["c"]),
+        ]
+
+    def test_decimal_at_line_start_is_not_an_ordinal(self) -> None:
+        claims = RuleClaimExtractor().extract(self._request("3.5% 的提升来自检索模块 [source:c]。"))["claims"]
+        assert claims[0]["text"] == "3.5% 的提升来自检索模块"
+
 
 class TestLlmQuestionAnalyzer:
     def test_valid_llm_output_used_directly(self) -> None:

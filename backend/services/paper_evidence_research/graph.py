@@ -25,6 +25,7 @@ from .state import (
     NeedEvidenceDigest,
     PaperEvidenceResearchState,
     ResearchDecisionContext,
+    VerifiedDraftSnapshot,
 )
 
 
@@ -469,20 +470,26 @@ def _project_coverage_node(state: Any) -> PaperEvidenceResearchState:
     for need in next_state.evidence_needs:
         projected = need.model_copy(deep=True)
         related_claims = claims_by_need.get(need.need_id, [])
-        related_assessments = [assessment_by_claim.get(claim.claim_id) for claim in related_claims]
-        if related_claims and all(
-            has_verifiable_support(next_state, claim, assessment)
-            for claim, assessment in zip(related_claims, related_assessments)
-        ):
+        supported_claims = [
+            claim
+            for claim in related_claims
+            if has_verifiable_support(next_state, claim, assessment_by_claim.get(claim.claim_id))
+        ]
+        has_conflict = any(
+            (assessment := assessment_by_claim.get(claim.claim_id)) is not None and assessment.verdict == "conflicting"
+            for claim in related_claims
+        )
+        if supported_claims and not has_conflict:
             # 需求满足权只来自已校验主张，检索候选本身永远不能直接修改覆盖状态。
+            # 不要求"相关主张全部受支持"：一句无引用的概括或过渡句就会让整个需求永远 open；
+            # 未受支持的可见主张仍由完成门禁拦截定稿，这里只回答"该需求有没有被证据回应"。
             projected.status = "satisfied"
-            projected.supporting_claim_ids = [claim.claim_id for claim in related_claims]
+            projected.supporting_claim_ids = [claim.claim_id for claim in supported_claims]
             projected.verified_evidence_ids = sorted(
                 {
                     evidence_id
-                    for assessment in related_assessments
-                    if assessment is not None
-                    for evidence_id in assessment.supporting_evidence_ids
+                    for claim in supported_claims
+                    for evidence_id in assessment_by_claim[claim.claim_id].supporting_evidence_ids
                 }
             )
         elif related_claims:
@@ -496,19 +503,38 @@ def _project_coverage_node(state: Any) -> PaperEvidenceResearchState:
             projected.verified_evidence_ids = []
         projected_needs.append(projected)
     next_state.evidence_needs = projected_needs
+    supported_claim_count = sum(
+        has_verifiable_support(next_state, claim, assessment_by_claim.get(claim.claim_id))
+        for claim in next_state.claims
+    )
+    satisfied_core_need_count = sum(
+        need.importance == "core" and need.status == "satisfied" for need in projected_needs
+    )
     _trace(
         next_state,
         "evidence_coverage_projected",
         draft_version=next_state.current_draft.version if next_state.current_draft else 0,
         # 保留每版草稿的可靠支持和核心覆盖，修复收益可以为负，不能用重试次数替代。
-        supported_claim_count=sum(
-            has_verifiable_support(next_state, claim, assessment_by_claim.get(claim.claim_id))
-            for claim in next_state.claims
-        ),
+        supported_claim_count=supported_claim_count,
         core_need_count=sum(need.importance == "core" and need.status not in {"abandoned", "superseded"} for need in projected_needs),
-        satisfied_core_need_count=sum(need.importance == "core" and need.status == "satisfied" for need in projected_needs),
+        satisfied_core_need_count=satisfied_core_need_count,
         satisfied_need_ids=[need.need_id for need in projected_needs if need.status == "satisfied"],
     )
+    best = next_state.best_verified_draft
+    if next_state.current_draft is not None and (
+        best is None
+        or (satisfied_core_need_count, supported_claim_count)
+        > (best.satisfied_core_need_count, best.supported_claim_count)
+    ):
+        # 重写的草稿可能比上一版更差；记下核心覆盖与受支持主张最多的一版，供有界终止时退回。
+        next_state.best_verified_draft = VerifiedDraftSnapshot(
+            draft=next_state.current_draft.model_copy(deep=True),
+            claims=[claim.model_copy(deep=True) for claim in next_state.claims],
+            claim_assessments=[assessment.model_copy(deep=True) for assessment in next_state.claim_assessments],
+            evidence_needs=[need.model_copy(deep=True) for need in projected_needs],
+            satisfied_core_need_count=satisfied_core_need_count,
+            supported_claim_count=supported_claim_count,
+        )
     return next_state
 
 
@@ -596,6 +622,31 @@ def _finalize_node(state: Any) -> PaperEvidenceResearchState:
     return next_state
 
 
+def _restore_best_verified_draft(state: PaperEvidenceResearchState) -> None:
+    best = state.best_verified_draft
+    if best is None or state.current_draft is None or best.draft.version == state.current_draft.version:
+        return
+    assessment_by_claim = {item.claim_id: item for item in state.claim_assessments}
+    current_supported = sum(
+        has_verifiable_support(state, claim, assessment_by_claim.get(claim.claim_id)) for claim in state.claims
+    )
+    current_core = sum(need.importance == "core" and need.status == "satisfied" for need in state.evidence_needs)
+    if (best.satisfied_core_need_count, best.supported_claim_count) <= (current_core, current_supported):
+        return
+    # 有界终止只交付已验证内容；最后一版草稿更差时，退回校验结果最好的那一版。
+    state.current_draft = best.draft.model_copy(deep=True)
+    state.claims = [claim.model_copy(deep=True) for claim in best.claims]
+    state.claim_assessments = [assessment.model_copy(deep=True) for assessment in best.claim_assessments]
+    state.evidence_needs = [need.model_copy(deep=True) for need in best.evidence_needs]
+    _trace(
+        state,
+        "best_verified_draft_restored",
+        draft_version=best.draft.version,
+        supported_claim_count=best.supported_claim_count,
+        satisfied_core_need_count=best.satisfied_core_need_count,
+    )
+
+
 def _terminal_node(state: Any, *, requested_abstention: bool = False) -> PaperEvidenceResearchState:
     next_state = _coerce_state(state)
     abstention_reason = (
@@ -603,6 +654,7 @@ def _terminal_node(state: Any, *, requested_abstention: bool = False) -> PaperEv
         if requested_abstention and isinstance(next_state.pending_action, AbstainAction)
         else None
     )
+    _restore_best_verified_draft(next_state)
     assessment_by_claim = {item.claim_id: item for item in next_state.claim_assessments}
     supported_claims = [
         claim
@@ -620,7 +672,9 @@ def _terminal_node(state: Any, *, requested_abstention: bool = False) -> PaperEv
         if need.need_id in next_state.retrieval_failures
         and need.status not in {"satisfied", "superseded", "abandoned"}
     }
-    can_keep_partial = bool(supported_claims and core_need_satisfied and not requested_abstention)
+    # 决策器请求弃答只说明"无法继续推进"，不能抹掉已逐条校验通过的核心主张；
+    # 只要有核心需求被证据回应，就按有界部分回答交付，弃答只用于确实没有可用核心结论的情形。
+    can_keep_partial = bool(supported_claims and core_need_satisfied)
     if blocking_failures and not can_keep_partial:
         # 无关候选不是可靠证据。故障阻断取证且无法保留已验证核心回答时，必须记为运行失败。
         raise PaperEvidenceResearchError(
@@ -638,10 +692,12 @@ def _terminal_node(state: Any, *, requested_abstention: bool = False) -> PaperEv
             for claim in supported_claims
         ) + "。"
         outcome = "partial"
-        termination_reason = (
-            "partial_answer_after_retrieval_failure" if blocking_failures
-            else next_state.action_rejection_code or "partial_answer_after_budget_exhaustion"
-        )
+        if blocking_failures:
+            termination_reason = "partial_answer_after_retrieval_failure"
+        elif requested_abstention:
+            termination_reason = "partial_answer_after_abstention_request"
+        else:
+            termination_reason = next_state.action_rejection_code or "partial_answer_after_budget_exhaustion"
     else:
         # 没有任何核心需求覆盖时，即使背景主张有证据也不能形成有限回答。
         supported_claim_ids = set()

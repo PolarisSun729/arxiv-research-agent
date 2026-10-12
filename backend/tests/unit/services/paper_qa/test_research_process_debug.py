@@ -42,3 +42,14 @@ def test_projects_rounds_with_decision_reason_and_ordered_steps() -> None:
     assert debug["research_steps"][3]["detail"] == ""
     assert debug["research_steps"][4]["detail"] == "2/3 条主张有证据支持"
     assert debug["research_steps"][5]["detail"] == "NO_PROGRESS_LIMIT_REACHED"
+
+
+def test_restored_best_draft_is_shown_as_a_step():
+    debug = build_research_process_debug([
+        {"event_type": "best_verified_draft_restored", "draft_version": 1, "supported_claim_count": 10},
+        {"event_type": "research_completed", "outcome": "partial"},
+    ])
+
+    assert debug["research_steps"][0] == {
+        "kind": "restore", "title": "退回校验结果最好的第 1 版草稿", "detail": "10 条主张有证据支持",
+    }

@@ -128,6 +128,17 @@ class ResearchDecisionContext(BaseModel):
     need_evidence: list[NeedEvidenceDigest] = Field(default_factory=list)
 
 
+class VerifiedDraftSnapshot(BaseModel):
+    """某版草稿校验后的完整快照；重写草稿可能比上一版更差，终止时要能退回最好的那版。"""
+
+    draft: DraftAnswer
+    claims: list[AnswerClaim]
+    claim_assessments: list[ClaimAssessment]
+    evidence_needs: list[EvidenceNeed]
+    satisfied_core_need_count: int
+    supported_claim_count: int
+
+
 class PaperEvidenceResearchState(BaseModel):
     request: PaperEvidenceResearchRequest
     research_question: str = ""
@@ -148,6 +159,7 @@ class PaperEvidenceResearchState(BaseModel):
     no_progress_count: int = 0
     # 连续无进展后检索通道关闭：后续只允许基于现有证据池起草、定稿或弃答。
     retrieval_stalled: bool = False
+    best_verified_draft: VerifiedDraftSnapshot | None = None
     invalid_action_count: int = 0
     trace_events: list[dict[str, Any]] = Field(default_factory=list)
     result: PaperEvidenceResearchResult | None = None

@@ -521,8 +521,11 @@ def test_finalize_is_rejected_when_a_core_claim_is_unsupported() -> None:
 
     result = service.research(_request(run_id="research-run-finalize-rejected"))
 
-    assert result.outcome == "abstained"
-    assert result.research_summary.termination_reason == "BUDGET_EXHAUSTED_WITHOUT_CORE_SUPPORT"
+    # 定稿被拒；随后决策器请求弃答，但已校验的核心主张不能被抹掉，只交付受支持部分。
+    assert result.outcome == "partial"
+    assert result.research_summary.termination_reason == "partial_answer_after_abstention_request"
+    assert result.answer == "反思 token 决定是否检索 [source:chunk-method]。"
+    assert result.research_summary.unresolved_topics
 
 
 def test_supported_claim_without_evidence_cannot_finalize() -> None:
@@ -627,11 +630,160 @@ def test_new_draft_cannot_reuse_coverage_from_a_removed_core_claim() -> None:
         claim_verifier=AlwaysSupportingClaimVerifier(),
     )
 
-    result = service.research(_request(run_id="research-run-coverage-rollback"))
+    events: list[dict[str, Any]] = []
+    result = service.research(
+        _request(run_id="research-run-coverage-rollback"),
+        trace_listener=lambda _run_id, trace: events.extend(trace),
+    )
 
-    assert result.outcome == "abstained"
-    assert result.research_summary.termination_reason == "DROPPED_CORE_CLAIM"
-    assert result.research_summary.satisfied_need_count == 1
+    # 第二版删掉了消融主张，它的覆盖投影不能沿用第一版的满足状态。
+    projections = [event for event in events if event["event_type"] == "evidence_coverage_projected"]
+    assert projections[-1]["draft_version"] == 2
+    assert projections[-1]["satisfied_need_ids"] == ["need-method"]
+    restored = [event for event in events if event["event_type"] == "best_verified_draft_restored"]
+    assert restored and restored[0]["draft_version"] == 1
+    # 终止时退回校验结果更好的第一版，而不是交付更差的第二版或整轮弃答。
+    assert result.outcome == "partial"
+    assert result.research_summary.termination_reason == "partial_answer_after_abstention_request"
+    assert result.research_summary.satisfied_need_count == 2
+    assert {citation.source_id for citation in result.citations} == {"chunk-method", "chunk-ablation"}
+
+
+class UncitedIntroClaimExtractor:
+    """每个核心需求都有一条受支持主张，外加一句绑到方法需求上的无引用概括句。"""
+
+    def extract(self, request: Any) -> dict[str, Any]:
+        return {
+            "claims": [
+                {
+                    "claim_id": "claim-intro",
+                    "text": "根据证据，方法包含两个层面",
+                    "importance": "core",
+                    "addressed_need_ids": ["need-method", "need-ablation"],
+                    "citation_ids": [],
+                },
+                {
+                    "claim_id": "claim-method",
+                    "text": "反思 token 决定是否检索",
+                    "importance": "core",
+                    "addressed_need_ids": ["need-method"],
+                    "citation_ids": ["chunk-method"],
+                },
+                {
+                    "claim_id": "claim-ablation",
+                    "text": "移除该模块后分数从 54.1 降至 50.3",
+                    "importance": "core",
+                    "addressed_need_ids": ["need-ablation"],
+                    "citation_ids": ["chunk-ablation"],
+                },
+            ],
+            "extractor_source": "llm",
+        }
+
+
+class ConflictingAblationVerifier(AlwaysSupportingClaimVerifier):
+    def verify(self, request: Any) -> dict[str, Any]:
+        assessments = super().verify(request)["assessments"]
+        for assessment in assessments:
+            if assessment["claim_id"] == "claim-intro":
+                assessment.update(verdict="unsupported", supporting_evidence_ids=[])
+            elif assessment["claim_id"] == "claim-ablation-2":
+                assessment.update(verdict="conflicting", supporting_evidence_ids=[])
+        return {"assessments": assessments}
+
+
+def _two_need_search_then_draft_actions(*tail: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "action": "search_paper",
+            "target_need_id": "need-method",
+            "objective": "discover",
+            "retrieval_mode": "method",
+            "query": "reflection token mechanism",
+            "reason_code": "OPEN_EVIDENCE_NEED",
+        },
+        {
+            "action": "search_paper",
+            "target_need_id": "need-ablation",
+            "objective": "discover",
+            "retrieval_mode": "experiment",
+            "query": "reflection token ablation",
+            "reason_code": "OPEN_EVIDENCE_NEED",
+        },
+        {"action": "draft_answer", "reason_code": "INITIAL_DRAFT"},
+        *tail,
+    ]
+
+
+def test_uncited_intro_sentence_does_not_block_core_coverage() -> None:
+    # 回归：覆盖投影曾要求"绑到该需求的所有主张都受支持"，一句无引用的概括句就让全部核心需求
+    # 保持 open；随后决策器弃答，10 条已校验主张被整轮丢弃。
+    service = PaperEvidenceResearchService(
+        question_analyzer=ScriptedQuestionAnalyzer(),
+        decision_policy=ScriptedPolicyFromActions(
+            _two_need_search_then_draft_actions(
+                {"action": "finalize_answer", "reason_code": "CORE_CLAIMS_SUPPORTED"},
+                {"action": "abstain", "reason_code": "CANNOT_IMPROVE"},
+            )
+        ),
+        retriever=ScriptedRetriever(),
+        draft_generator=ScriptedDraftGenerator(),
+        claim_extractor=UncitedIntroClaimExtractor(),
+        claim_verifier=ConflictingAblationVerifier(),
+    )
+    events: list[dict[str, Any]] = []
+
+    result = service.research(
+        _request(run_id="research-run-uncited-intro"), trace_listener=lambda _run_id, trace: events.extend(trace)
+    )
+
+    extracted = next(event for event in events if event["event_type"] == "claims_extracted")
+    assert extracted["claim_count"] == 3
+    projection = next(event for event in events if event["event_type"] == "evidence_coverage_projected")
+    assert projection["satisfied_core_need_count"] == 2
+    # 未受支持的可见主张仍然拦截定稿，只交付受支持部分。
+    rejected = [event for event in events if event["event_type"] == "action_rejected"]
+    assert rejected[0]["rejection_code"] == "VISIBLE_CLAIM_NOT_SUPPORTED"
+    assert result.outcome == "partial"
+    assert "方法包含两个层面" not in result.answer
+    assert result.answer == (
+        "反思 token 决定是否检索 [source:chunk-method]；移除该模块后分数从 54.1 降至 50.3 [source:chunk-ablation]。"
+    )
+
+
+def test_conflicting_claim_keeps_need_open() -> None:
+    class ConflictingClaimExtractor(UncitedIntroClaimExtractor):
+        def extract(self, request: Any) -> dict[str, Any]:
+            claims = super().extract(request)["claims"]
+            claims.append(
+                {
+                    "claim_id": "claim-ablation-2",
+                    "text": "移除该模块后分数反而上升",
+                    "importance": "core",
+                    "addressed_need_ids": ["need-ablation"],
+                    "citation_ids": ["chunk-ablation"],
+                }
+            )
+            return {"claims": claims}
+
+    service = PaperEvidenceResearchService(
+        question_analyzer=ScriptedQuestionAnalyzer(),
+        decision_policy=ScriptedPolicyFromActions(
+            _two_need_search_then_draft_actions({"action": "abstain", "reason_code": "CONFLICTING_EVIDENCE"})
+        ),
+        retriever=ScriptedRetriever(),
+        draft_generator=ScriptedDraftGenerator(),
+        claim_extractor=ConflictingClaimExtractor(),
+        claim_verifier=ConflictingAblationVerifier(),
+    )
+    events: list[dict[str, Any]] = []
+
+    service.research(
+        _request(run_id="research-run-conflicting"), trace_listener=lambda _run_id, trace: events.extend(trace)
+    )
+
+    projection = next(event for event in events if event["event_type"] == "evidence_coverage_projected")
+    assert projection["satisfied_need_ids"] == ["need-method"]
 
 
 def test_budget_exhaustion_returns_only_verified_claims_as_partial_answer() -> None:
