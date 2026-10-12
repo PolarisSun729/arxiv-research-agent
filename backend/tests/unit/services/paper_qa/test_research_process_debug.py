@@ -53,3 +53,16 @@ def test_restored_best_draft_is_shown_as_a_step():
     assert debug["research_steps"][0] == {
         "kind": "restore", "title": "退回校验结果最好的第 1 版草稿", "detail": "10 条主张有证据支持",
     }
+
+
+def test_claim_extraction_step_shows_extractor_source():
+    debug = build_research_process_debug([
+        {"event_type": "claims_extracted", "draft_version": 1, "claim_count": 7, "extractor_source": "llm"},
+        {"event_type": "claims_extracted", "draft_version": 2, "claim_count": 9, "extractor_source": "rule"},
+        {"event_type": "claims_extracted", "draft_version": 3, "claim_count": 2},
+    ])
+
+    assert [step["detail"] for step in debug["research_steps"]] == [
+        "7 条主张 · LLM 拆解", "9 条主张 · 规则兜底", "2 条主张",
+    ]
+    assert debug["research_steps"][0]["title"] == "拆解第 1 版草稿的主张"

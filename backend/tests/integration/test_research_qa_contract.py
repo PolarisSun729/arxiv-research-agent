@@ -72,7 +72,7 @@ def test_research_debug_exposes_rounds_and_steps_for_the_panel(qa_service):
     assert [item["round"] for item in debug["research_rounds"]] == [1, 2]
     assert debug["research_rounds"][0]["target_need_id"] == "need-method"
     assert debug["research_rounds"][0]["decision_reason"] == "OPEN_EVIDENCE_NEED"
-    assert [step["kind"] for step in debug["research_steps"]][:3] == ["search", "draft", "verify"]
+    assert [step["kind"] for step in debug["research_steps"]][:4] == ["search", "draft", "extract", "verify"]
     assert debug["research_steps"][-1] == {"kind": "done", "title": "研究结束", "detail": "completed"}
     storage = build_storage_container(db_path=str(tmp_path / "qa.sqlite"))
     messages = storage.paper_chat_messages.list_paper_chat_messages(

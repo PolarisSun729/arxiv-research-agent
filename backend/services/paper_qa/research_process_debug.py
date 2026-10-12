@@ -4,7 +4,7 @@
 这里从轨迹事件中提取两份视图：
 
 - ``research_rounds``：每轮检索一条，带触发它的决策理由和该轮的检索阶段摘要；
-- ``research_steps``：按时间顺序的研究动作（检索、兜底起草、起草、校验、被拒动作、退回最佳草稿、结束）。
+- ``research_steps``：按时间顺序的研究动作（检索、兜底起草、起草、主张拆解、校验、被拒动作、退回最佳草稿、结束）。
 
 两份视图都是浅层的字符串与计数结构，随回答落库时的 debug 快照裁剪不会把它们截成形状标记。
 """
@@ -65,6 +65,13 @@ def build_research_process_debug(trace_events: Iterable[Mapping[str, Any]]) -> D
                 "kind": "draft",
                 "title": f"起草第 {event.get('version') or '-'} 版答案",
                 "detail": f"决策理由 {reason}" if reason else "",
+            })
+        elif kind == "claims_extracted":
+            source = {"llm": "LLM 拆解", "rule": "规则兜底"}.get(str(event.get("extractor_source") or ""), "")
+            steps.append({
+                "kind": "extract",
+                "title": f"拆解第 {event.get('draft_version') or '-'} 版草稿的主张",
+                "detail": f"{int(event.get('claim_count') or 0)} 条主张" + (f" · {source}" if source else ""),
             })
         elif kind == "claim_verification_completed":
             steps.append({

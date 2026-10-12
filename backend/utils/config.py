@@ -820,6 +820,7 @@ GENERATION_CONFIG: Dict[str, Any] = {
         "paper_qa": "large",  # 处理关于具体论文的问答
         "recommendation_generation": "large",  # 生成个性化推荐文本或推荐理由
         "general_generation": "large",  # 用于复杂自然语言输出的一般大模型生成
+        "research_claim_extraction": "large",  # 研究引擎把草稿拆成可校验主张并绑定证据需求
         "default": "large",  # 当无特定任务映射时的默认模型角色
     },
 }

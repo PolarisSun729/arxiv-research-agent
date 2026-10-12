@@ -738,7 +738,7 @@ def test_uncited_intro_sentence_does_not_block_core_coverage() -> None:
     )
 
     extracted = next(event for event in events if event["event_type"] == "claims_extracted")
-    assert extracted["claim_count"] == 3
+    assert extracted["extractor_source"] == "llm" and extracted["claim_count"] == 3
     projection = next(event for event in events if event["event_type"] == "evidence_coverage_projected")
     assert projection["satisfied_core_need_count"] == 2
     # 未受支持的可见主张仍然拦截定稿，只交付受支持部分。

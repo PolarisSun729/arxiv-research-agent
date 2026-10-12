@@ -1044,7 +1044,7 @@ export interface ResearchRoundDebug {
 }
 
 export interface ResearchStepDebug {
-  kind: 'search' | 'fallback' | 'draft' | 'verify' | 'rejected' | 'done' | string
+  kind: 'search' | 'fallback' | 'draft' | 'extract' | 'verify' | 'rejected' | 'restore' | 'done' | string
   title: string
   detail?: string
 }

@@ -401,7 +401,14 @@ def _extract_claims_node(state: Any, dependencies: ResearchGraphDependencies) ->
         or {}
     )
     next_state.claims = [AnswerClaim.model_validate(item) for item in extracted.get("claims") or []]
-    _trace(next_state, "claims_extracted", draft_version=draft.version, claim_count=len(next_state.claims))
+    _trace(
+        next_state,
+        "claims_extracted",
+        draft_version=draft.version,
+        claim_count=len(next_state.claims),
+        # 标明这一版主张出自 LLM 还是规则兜底，排查覆盖异常时先看提取是否降级。
+        extractor_source=extracted.get("extractor_source"),
+    )
     return next_state
 
 
