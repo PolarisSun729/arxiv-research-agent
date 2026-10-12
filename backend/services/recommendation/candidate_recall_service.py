@@ -143,7 +143,8 @@ class CandidateRecallService:
                 arxiv_id = str(paper.get("arxiv_id", "") or "").strip()
                 if not arxiv_id:
                     continue
-                similarity = float(paper.get("similarity_score", paper.get("score", 0.0)) or 0.0)
+                # 向量检索保证返回 similarity_score；缺失说明存储层合约被破坏，不能当成 0 相似度参与排序。
+                similarity = float(paper["similarity_score"])
                 # 保留每个簇的命中明细，方便后续解释推荐理由和调试召回行为。
                 recall_hit = {"cluster_id": cluster_id, "similarity": similarity, "rank": rank}
                 candidate = {

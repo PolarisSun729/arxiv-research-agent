@@ -196,7 +196,8 @@ class RerankService:
                     "matched_index_id": chunk.get("matched_index_id") or chunk.get("retrieval_index_id") or chunk.get("index_id"),
                     "matched_index_type": chunk.get("matched_index_type") or chunk.get("retrieval_index_type") or chunk.get("index_type"),
                     "matched_index_text": chunk.get("matched_index_text") or chunk.get("retrieval_index_text") or chunk.get("index_text"),
-                    "matched_index_score": chunk.get("matched_index_score") or chunk.get("route_score") or chunk.get("score"),
+                    # 不用 `or` 串联：合法的 0.0 分会被跳过；也不退回 chunk["score"]，那是融合/rerank 分而非 index 分。
+                    "matched_index_score": first_float(chunk.get("matched_index_score"), chunk.get("route_score")),
                 }
             ]
         deduped: List[Dict[str, Any]] = []
@@ -208,15 +209,17 @@ class RerankService:
             if index_id:
                 seen_ids.add(index_id)
             deduped.append(dict(row))
-        deduped.sort(
-            key=lambda row: first_float(
+        def row_score(row: Dict[str, Any]) -> float:
+            score = first_float(
                 row.get("weighted_index_score"),
                 row.get("matched_index_score"),
                 row.get("bm25_fusion_score"),
                 row.get("best_raw_bm25_score"),
-            ),
-            reverse=True,
-        )
+            )
+            # 仅用于展示排序：缺分的行排到最后，而不是冒充 0 分混在有分的行中间。
+            return score if score is not None else float("-inf")
+
+        deduped.sort(key=row_score, reverse=True)
         return deduped
 
     def llm_rerank(

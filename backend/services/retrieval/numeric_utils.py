@@ -8,10 +8,11 @@ import math
 from typing import Any, List, Optional
 
 
-def first_float(*values: Any) -> float:
-    """按顺序返回第一个能转成 float 的值；全部为空或无法转换时返回 0.0。
+def first_float(*values: Any) -> Optional[float]:
+    """按顺序返回第一个能转成 float 的值；全部为空或无法转换时返回 None。
 
     用于“优先取 A 分数，缺失时退回 B 分数”这类多来源取分场景，空字符串视同缺失。
+    全部缺失时不默认成 0.0，由调用方决定是报错还是按缺失处理，避免缺分被静默伪装成 0 分。
     """
     for value in values:
         if value is None or value == "":
@@ -20,7 +21,15 @@ def first_float(*values: Any) -> float:
             return float(value)
         except (TypeError, ValueError):
             continue
-    return 0.0
+    return None
+
+
+def require_float(value: Any, *, what: str) -> float:
+    """把必填分数转成 float；缺失或无法转换时抛 ValueError，what 用于说明是哪个分数缺失。"""
+    result = optional_float(value)
+    if result is None:
+        raise ValueError(f"Missing required score: {what} (got {value!r})")
+    return result
 
 
 def min_max_normalize(scores: List[float]) -> List[float]:
@@ -59,4 +68,4 @@ def optional_float(value: Any) -> Optional[float]:
         return None
 
 
-__all__ = ["first_float", "min_max_normalize", "optional_int", "optional_float"]
+__all__ = ["first_float", "min_max_normalize", "optional_int", "optional_float", "require_float"]
