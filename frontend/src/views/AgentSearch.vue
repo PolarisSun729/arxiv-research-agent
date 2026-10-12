@@ -12,7 +12,7 @@ import type { AgentInteraction, ArxivSearchResponse, TargetSelectionPayload } fr
 import type { Paper } from '@/types/paper'
 import { usePaperStore } from '@/stores/paperStore'
 import { getPaperTargetCandidateId, toAgentUserResult, type AgentUserResult } from '@/utils/agentUserResult'
-import { extractCitedSourceIds } from '@/utils/evidence'
+import { orderCitedSourceIds } from '@/utils/evidence'
 import type { RagChatSource } from '@/types/ragChat'
 
 const router = useRouter()
@@ -157,9 +157,12 @@ function openAgentEvidence(response: unknown, sourceId?: string) {
   const agentResponse = toAgentResponse(response)
   const result = toAgentUserResultForMessage(response)
   if (!result.evidenceSources.length) return
-  const citedSourceIds = result.citedSourceIds.length
-    ? result.citedSourceIds
-    : extractCitedSourceIds(agentResponse?.paper_qa_result?.answer || '', result.evidenceSources)
+  // 与正文角标同一套编号：先按回答中出现顺序，再补后端声明的引用。
+  const citedSourceIds = orderCitedSourceIds(
+    agentResponse?.paper_qa_result?.answer || '',
+    result.evidenceSources,
+    result.citedSourceIds
+  )
   activeAgentEvidence.value = {
     question: agentResponse?.paper_qa_result?.question || 'Agent 回答证据',
     sources: result.evidenceSources,

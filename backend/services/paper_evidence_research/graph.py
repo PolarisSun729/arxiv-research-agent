@@ -8,6 +8,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 
 from .action_gate import validate_action
+from .answer_pruning import prune_unsupported_claims
 from .actions import AbstainAction, DraftAnswerAction, FinalizeAnswerAction, SearchPaperAction, parse_research_action
 from .completion_gate import can_finalize, has_verifiable_support
 from .context_pack import build_context_pack
@@ -693,8 +694,21 @@ def _terminal_node(state: Any, *, requested_abstention: bool = False) -> PaperEv
             need.status = "blocked"
             need.blocking_reason = next_state.action_rejection_code or "research_stopped_without_full_coverage"
     if can_keep_partial:
-        # 有界终止只保留已验证主张，并重建引用标记，使正文与证据面板仍能互相定位。
-        answer = "；".join(
+        # 有界终止只保留已验证主张：优先在原草稿上原位删掉未受支持的主张，保留标题、列表与引用位置；
+        # 定位失败时退回拼接受支持主张并重建引用标记，正文与证据面板仍能互相定位。
+        pruned = (
+            prune_unsupported_claims(
+                next_state.current_draft.answer,
+                removed_claim_texts=[
+                    claim.text for claim in next_state.claims if claim.claim_id not in supported_claim_ids
+                ],
+                supported_claim_texts=[claim.text for claim in supported_claims],
+                allowed_citation_ids={source_id for claim in supported_claims for source_id in claim.citation_ids},
+            )
+            if next_state.current_draft is not None
+            else None
+        )
+        answer = pruned or "；".join(
             claim.text.rstrip("。；") + " " + "".join(f"[source:{source_id}]" for source_id in claim.citation_ids)
             for claim in supported_claims
         ) + "。"

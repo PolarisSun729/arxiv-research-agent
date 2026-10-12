@@ -751,6 +751,51 @@ def test_uncited_intro_sentence_does_not_block_core_coverage() -> None:
     )
 
 
+def test_partial_answer_prunes_unsupported_claims_in_place_and_keeps_markdown() -> None:
+    # 回归 696659ee：部分回答曾把受支持主张用"；"拼成一段，标题、列表全部丢失、引用挤在一起。
+    class MarkdownDraftGenerator:
+        def generate(self, request: Any) -> dict[str, Any]:
+            return {
+                "answer": (
+                    "根据证据，方法包含两个层面。\n\n"
+                    "**1. 检索控制**\n"
+                    "- 反思 token 决定是否检索 [source:chunk-method]。\n\n"
+                    "**2. 消融结果**\n"
+                    "- 移除该模块后分数从 54.1 降至 50.3 [source:chunk-ablation]。"
+                ),
+                "declared_claims": [],
+                "used_candidate_ids": ["chunk-method", "chunk-ablation"],
+            }
+
+    service = PaperEvidenceResearchService(
+        question_analyzer=ScriptedQuestionAnalyzer(),
+        decision_policy=ScriptedPolicyFromActions(
+            _two_need_search_then_draft_actions(
+                {"action": "finalize_answer", "reason_code": "CORE_CLAIMS_SUPPORTED"},
+                {"action": "abstain", "reason_code": "CANNOT_IMPROVE"},
+            )
+        ),
+        retriever=ScriptedRetriever(),
+        draft_generator=MarkdownDraftGenerator(),
+        claim_extractor=UncitedIntroClaimExtractor(),
+        claim_verifier=ConflictingAblationVerifier(),
+    )
+
+    events: list[dict[str, Any]] = []
+
+    result = service.research(
+        _request(run_id="research-run-markdown-partial"), trace_listener=lambda _run_id, trace: events.extend(trace)
+    )
+
+    assert result.outcome == "partial"
+    assert result.answer == (
+        "**1. 检索控制**\n"
+        "- 反思 token 决定是否检索 [source:chunk-method]。\n\n"
+        "**2. 消融结果**\n"
+        "- 移除该模块后分数从 54.1 降至 50.3 [source:chunk-ablation]。"
+    )
+
+
 def test_conflicting_claim_keeps_need_open() -> None:
     class ConflictingClaimExtractor(UncitedIntroClaimExtractor):
         def extract(self, request: Any) -> dict[str, Any]:

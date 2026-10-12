@@ -2,6 +2,8 @@ import MarkdownIt from 'markdown-it'
 import dollarmathPlugin from 'markdown-it-dollarmath'
 import { renderToString } from 'katex'
 import 'katex/dist/katex.min.css'
+import type { RagChatSource } from '@/types/ragChat'
+import { toCitationLinks } from '@/utils/evidence'
 
 const markdownRenderer = new MarkdownIt({
   html: false,
@@ -21,14 +23,15 @@ const markdownRenderer = new MarkdownIt({
   }
 })
 
-export function renderMarkdownWithLatex(text: string, emptyText = '\u56de\u7b54\u751f\u6210\u4e2d...') {
+export function renderMarkdownWithLatex(
+  text: string,
+  emptyText = '回答生成中...',
+  citation: { sources?: RagChatSource[], citedSourceIds?: string[] } = {}
+) {
   const content = (text || '').replace(/\r\n/g, '\n').trim()
   if (!content) {
     return `<p class="md-empty">${emptyText}</p>`
   }
-  // 稳定引用转成可点击链接，聊天面板再通过事件代理定位对应证据。
-  const withEvidenceLinks = content.replace(/\[source:([^\]\s]+)\]/g, (_match, sourceId: string) => {
-    return `[source:${sourceId}](#evidence-source-${encodeURIComponent(sourceId)})`
-  })
-  return markdownRenderer.render(withEvidenceLinks)
+  // 稳定引用转成编号链接，聊天面板再通过事件代理定位对应证据。
+  return markdownRenderer.render(toCitationLinks(content, citation))
 }

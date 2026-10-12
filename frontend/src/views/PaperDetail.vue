@@ -434,6 +434,10 @@ function getTurnStatusHint(item: { response?: any }) {
     return '答案已生成，但未保存到历史记录。'
   }
   if (turn.status === 'failed') return turn.error || '问答失败，请稍后重试。'
+  // 研究引擎的部分回答：执行成功，但有主张没找到论文证据支持，已从正文中删去。
+  if (turn.retrievalDebug?.qa_observation?.outcome === 'partial') {
+    return '部分内容未找到论文证据支持，已从回答中移除。'
+  }
   return ''
 }
 

@@ -44,3 +44,56 @@ export function extractCitedSourceIds(answer: string, sources: RagChatSource[]) 
   }
   return cited
 }
+
+/**
+ * 回答引用的展示顺序：先按正文中首次出现的顺序，再补上后端声明但正文未出现的引用。
+ * 正文角标编号与引用列表编号都用这一顺序，保证"[2]"点过去就是列表里的第 2 条。
+ */
+export function orderCitedSourceIds(answer: string, sources: RagChatSource[], citedSourceIds: string[] = []) {
+  const known = new Set(sources.map(source => source.source_id))
+  const ordered = extractCitedSourceIds(answer, sources)
+  for (const sourceId of citedSourceIds) {
+    if (known.has(sourceId) && !ordered.includes(sourceId)) ordered.push(sourceId)
+  }
+  return ordered
+}
+
+const CITATION_MARKER_RE = /\[source:([^\]\s]+)\]/g
+const CITATION_TITLE_PREVIEW_CHARS = 120
+
+function describeCitationSource(sourceId: string, source?: RagChatSource) {
+  if (!source) return `证据 ${sourceId}`
+  const parts: string[] = []
+  const pageNumber = String(source.page_number || '').trim()
+  if (pageNumber && pageNumber.toUpperCase() !== 'N/A') parts.push(`第 ${pageNumber} 页`)
+  const sectionTitle = String(source.section_title || '').trim()
+  if (sectionTitle) parts.push(sectionTitle)
+  const preview = String(source.content || '').replace(/\s+/g, ' ').trim()
+  if (preview) {
+    parts.push(preview.length > CITATION_TITLE_PREVIEW_CHARS ? `${preview.slice(0, CITATION_TITLE_PREVIEW_CHARS)}…` : preview)
+  }
+  return parts.join(' · ') || `证据 ${sourceId}`
+}
+
+/**
+ * 把正文里的 [source:id] 换成 Markdown 编号链接 "[1]"，悬停显示页码、章节与原文预览；
+ * 聊天面板通过 #evidence-source-{id} 事件代理定位证据。已知证据列表时，指向列表外证据的标记会被去掉，
+ * 免得渲染出点了没反应的角标；流式输出阶段还没有证据列表，就按出现顺序编号。
+ */
+export function toCitationLinks(text: string, options: { sources?: RagChatSource[], citedSourceIds?: string[] } = {}) {
+  const sources = options.sources || []
+  const sourceById = new Map(sources.map(source => [source.source_id, source]))
+  const order = sources.length ? orderCitedSourceIds(text, sources, options.citedSourceIds) : []
+  return text.replace(CITATION_MARKER_RE, (_match, sourceId: string) => {
+    if (sources.length && !sourceById.has(sourceId)) return ''
+    let index = order.indexOf(sourceId)
+    if (index < 0) {
+      order.push(sourceId)
+      index = order.length - 1
+    }
+    const title = describeCitationSource(sourceId, sourceById.get(sourceId))
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+    return `[\\[${index + 1}\\]](#evidence-source-${encodeURIComponent(sourceId)} "${title}")`
+  })
+}

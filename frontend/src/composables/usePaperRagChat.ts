@@ -22,7 +22,7 @@ import type {
   QaTurnStatus
 } from '@/types/ragChat'
 import { useUserContext } from '@/composables/useUserContext'
-import { extractCitedSourceIds, normalizeEvidenceSources } from '@/utils/evidence'
+import { normalizeEvidenceSources, orderCitedSourceIds } from '@/utils/evidence'
 
 const MAX_CONVERSATION_TURNS = 5
 const MAX_ANSWER_SUMMARY_LENGTH = 280
@@ -127,16 +127,20 @@ function groupMessagesToTurns(messages: PaperChatMessage[]): QaTurn[] {
     } else {
       existing.answer = message.content || existing.answer
       existing.sources = normalizeEvidenceSources(message.sources)
-      existing.citedSourceIds = extractCitedSourceIds(existing.answer, existing.sources)
       existing.retrievalDebug = message.retrieval_debug_snapshot ?? existing.retrievalDebug
       existing.contextualizedQuestion = message.contextualized_question || existing.contextualizedQuestion
       existing.questionContextualization = message.question_contextualization ?? existing.questionContextualization
       existing.usedShortTermMemory = Boolean(
         message.question_contextualization?.used_short_term_memory ?? existing.usedShortTermMemory
       )
-      existing.citedSourceIds = Array.isArray(message.cited_source_ids)
-        ? message.cited_source_ids.map(value => String(value))
-        : existing.citedSourceIds || []
+      // 引用列表编号与正文角标一致：先按回答中出现顺序，再补后端声明的引用。
+      existing.citedSourceIds = orderCitedSourceIds(
+        existing.answer,
+        existing.sources,
+        Array.isArray(message.cited_source_ids)
+          ? message.cited_source_ids.map(value => String(value))
+          : existing.citedSourceIds || []
+      )
       existing.citationWarning = typeof message.citation_warning === 'string'
         ? message.citation_warning
         : existing.citationWarning || null
@@ -491,9 +495,13 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
             if (payload.question_contextualization) {
               turn.questionContextualization = payload.question_contextualization
             }
-            if (Array.isArray(payload.cited_source_ids)) {
-              turn.citedSourceIds = payload.cited_source_ids.map(value => String(value))
-            }
+            turn.citedSourceIds = orderCitedSourceIds(
+              turn.answer,
+              turn.sources,
+              Array.isArray(payload.cited_source_ids)
+                ? payload.cited_source_ids.map(value => String(value))
+                : turn.citedSourceIds
+            )
             if (typeof payload.citation_warning === 'string') {
               turn.citationWarning = payload.citation_warning
             }

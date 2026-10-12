@@ -18,7 +18,12 @@ const emit = defineEmits<{
 }>()
 
 const sourceElements = ref<Record<string, HTMLElement | null>>({})
-const citedSources = computed(() => props.sources.filter(source => props.citedSourceIds.includes(source.source_id)))
+// 按 citedSourceIds 的顺序排列，编号与回答正文里的引用角标一一对应。
+const citedSources = computed(() =>
+  props.citedSourceIds
+    .map(sourceId => props.sources.find(source => source.source_id === sourceId))
+    .filter((source): source is RagChatSource => Boolean(source))
+)
 const otherSources = computed(() => props.sources.filter(source => !props.citedSourceIds.includes(source.source_id)))
 
 function getSourceLabel(source: RagChatSource, index: number) {

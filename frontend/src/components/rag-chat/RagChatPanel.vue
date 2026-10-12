@@ -14,6 +14,7 @@ type RagChatPanelMessage = AgentChatMessage & {
   maxWidth?: string
   turnId?: string
   sources?: RagChatSource[]
+  citedSourceIds?: string[]
   retrievalDebug?: RetrievalDebug | null
   response?: QaTurnForRagChat | unknown | null
 }
@@ -209,7 +210,7 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
           <div
             v-else-if="item.role === 'assistant'"
             class="assistant-markdown"
-            v-html="renderMarkdownWithLatex(item.content)"
+            v-html="renderMarkdownWithLatex(item.content, undefined, { sources: item.sources, citedSourceIds: item.citedSourceIds })"
             @click="handleAssistantContentClick($event, item)"
           />
           <div v-else class="rag-chat-panel__user-content">
@@ -501,6 +502,30 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 
 .assistant-markdown :deep(a:hover) {
   border-bottom-color: rgba(37, 99, 235, 0.65);
+}
+
+/* 引用角标：编号小圆角块，连续引用之间留间距，不再挤成一串链接文字。 */
+.assistant-markdown :deep(a[href^="#evidence-source-"]) {
+  display: inline-block;
+  min-width: 1.6em;
+  margin: 0 1px 0 2px;
+  padding: 0 4px;
+  border: none;
+  border-radius: 6px;
+  background: rgba(37, 99, 235, 0.1);
+  color: #2563eb;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.6;
+  text-align: center;
+  vertical-align: super;
+  cursor: pointer;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.assistant-markdown :deep(a[href^="#evidence-source-"]:hover) {
+  background: #2563eb;
+  color: #fff;
 }
 
 .assistant-markdown :deep(strong) {
