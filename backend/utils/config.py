@@ -54,6 +54,17 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw not in {"0", "false", "no", "off", ""}
 
 
+def _env_optional_int(name: str) -> Any:
+    """读取可选整数环境变量；未设置、为空或非法时返回 None，表示“沿用代码中的默认策略”。"""
+    raw = _env_str(name, "")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
 # API 密钥只允许通过环境变量注入，避免任何代码兜底值再次进入 Git 历史。
 ALIYUN_API_KEY = _env_str("ALIYUN_API_KEY", "")
 
@@ -479,8 +490,22 @@ PROMPT_CONTEXT_CONFIG: Dict[str, Any] = {
     "llm_compaction_model_name": _env_str("PROMPT_LLM_COMPACTION_MODEL_NAME", ""),
     "llm_compaction_task_type": _env_str("PROMPT_LLM_COMPACTION_TASK_TYPE", "prompt_context_compaction"),
     "llm_compaction_enable_thinking": _env_bool("PROMPT_LLM_COMPACTION_ENABLE_THINKING", False),
+    # 最近 N 轮历史对话保留全文，更早的轮次把回答摘要压缩到 recent_turns_older_answer_tokens 以内。
     "recent_turns_recent_full_count": _env_int("PROMPT_RECENT_TURNS_RECENT_FULL_COUNT", 2),
+    "recent_turns_older_answer_tokens": _env_int("PROMPT_RECENT_TURNS_OLDER_ANSWER_TOKENS", 120),
     "recent_turns_source_id_limit": _env_int("PROMPT_RECENT_TURNS_SOURCE_ID_LIMIT", 6),
+    # 各 section 第一轮软预算（token）的显式覆盖；未设置的 section 沿用按比例计算的默认值。
+    "section_targets": {
+        section: value
+        for section, value in {
+            "rag_evidence": _env_optional_int("PROMPT_SECTION_TARGET_RAG_EVIDENCE"),
+            "session_summary": _env_optional_int("PROMPT_SECTION_TARGET_SESSION_SUMMARY"),
+            "recent_turns": _env_optional_int("PROMPT_SECTION_TARGET_RECENT_TURNS"),
+            "user_memory": _env_optional_int("PROMPT_SECTION_TARGET_USER_MEMORY"),
+            "agent_state": _env_optional_int("PROMPT_SECTION_TARGET_AGENT_STATE"),
+        }.items()
+        if value is not None
+    },
     "rag_max_block_tokens": _env_int("PROMPT_RAG_MAX_BLOCK_TOKENS", 4000),
     "rag_sibling_context_target_tokens": _env_int("PROMPT_RAG_SIBLING_CONTEXT_TARGET_TOKENS", 350),
     "rag_section_context_target_tokens": _env_int("PROMPT_RAG_SECTION_CONTEXT_TARGET_TOKENS", 250),
