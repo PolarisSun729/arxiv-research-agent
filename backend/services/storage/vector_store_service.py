@@ -9,6 +9,7 @@ from pymilvus import (
     DataType,
     MilvusClient,
 )
+from pymilvus.client.types import LoadState
 from utils.config import VectorDBProvider, MILVUS_CONFIG, get_vector_store_runtime_config
 from utils.storage_paths import resolve_backend_artifact_path
 from pypinyin import lazy_pinyin, Style
@@ -321,11 +322,16 @@ class VectorStoreService:
         """返回 (规范化后的 collection 名, schema 字段名集合)；collection 不存在时记录告警并返回 None。
 
         读取前先查 schema，是为了让 output_fields 只请求实际存在的字段，兼容不同时期建的 collection。
+        Milvus Lite 进程重启后 collection 会回到 released 状态，未 load 时 search/query 直接报错，
+        所以读取前顺带确认已加载。
         """
         resolved_name = self.resolve_collection_name(collection_name)
         if not client.has_collection(collection_name=resolved_name):
             logger.warning(f"Collection {collection_name} does not exist")
             return None
+        if client.get_load_state(collection_name=resolved_name).get("state") != LoadState.Loaded:
+            logger.info("Collection %s is not loaded; loading before read", resolved_name)
+            client.load_collection(collection_name=resolved_name)
         collection_desc = client.describe_collection(collection_name=resolved_name)
         field_names = {field.get("name") for field in collection_desc.get("fields", [])}
         return resolved_name, field_names
