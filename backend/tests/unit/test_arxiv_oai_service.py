@@ -225,6 +225,95 @@ def test_recent_papers_filters_categories_with_mapping_table() -> None:
     assert [paper["arxiv_id"] for paper in papers] == ["2401.00007"]
 
 
+def _index_rows(service: ArxivOaiDatabaseService, arxiv_id: str) -> tuple[list[tuple], list[str]]:
+    with service._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT abstract FROM arxiv_oai_papers_fts WHERE arxiv_id = ?", (arxiv_id,))
+        fts_rows = cursor.fetchall()
+        cursor.execute(
+            "SELECT category FROM arxiv_oai_paper_categories WHERE arxiv_id = ? ORDER BY category",
+            (arxiv_id,),
+        )
+        categories = [row[0] for row in cursor.fetchall()]
+    return fts_rows, categories
+
+
+def test_upsert_existing_paper_replaces_index_rows_without_stale_text() -> None:
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    assert service.upsert_arxiv_oai_papers(
+        [_paper("2401.00020", title="Versioned Paper", abstract="alpha method", categories=["cs.CL"])]
+    ) == 1
+    assert service.upsert_arxiv_oai_papers(
+        [_paper("2401.00020", title="Versioned Paper", abstract="beta method", categories=["cs.LG"])]
+    ) == 1
+
+    fts_rows, categories = _index_rows(service, "2401.00020")
+
+    # FTS 表没有唯一约束，更新必须先删旧行；否则旧摘要会残留并继续被搜到。
+    assert fts_rows == [("beta method",)]
+    assert categories == ["cs.LG"]
+    assert service.search(search_query="abs:alpha", max_results=10)["papers"] == []
+    assert [p["arxiv_id"] for p in service.search(search_query="abs:beta", max_results=10)["papers"]] == ["2401.00020"]
+
+
+def test_upsert_batch_with_duplicate_ids_keeps_last_version_only() -> None:
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    service.upsert_arxiv_oai_papers(
+        [
+            _paper("2401.00021", title="Dup Paper", abstract="first version", categories=["cs.CL"]),
+            _paper("2401.00021", title="Dup Paper", abstract="second version", categories=["cs.AI"]),
+        ]
+    )
+
+    fts_rows, categories = _index_rows(service, "2401.00021")
+
+    assert fts_rows == [("second version",)]
+    assert categories == ["cs.AI"]
+
+
+def test_upsert_batch_across_delete_chunks_keeps_single_index_row_per_paper(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    monkeypatch.setattr(sys.modules[ArxivOaiDatabaseService.__module__], "OAI_INDEX_DELETE_CHUNK_SIZE", 2)
+    papers = [
+        _paper(f"2401.{index:05d}", title=f"Chunk Paper {index}", abstract="RAG", categories=["cs.CL"])
+        for index in range(30, 35)
+    ]
+    assert service.upsert_arxiv_oai_papers(papers) == 5
+    assert service.upsert_arxiv_oai_papers(papers) == 5
+
+    for paper in papers:
+        fts_rows, categories = _index_rows(service, paper["arxiv_id"])
+        assert len(fts_rows) == 1
+        assert categories == ["cs.CL"]
+
+
+def test_upsert_batch_deletes_fts_rows_once_per_chunk_not_per_paper(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    monkeypatch.setattr(sys.modules[ArxivOaiDatabaseService.__module__], "OAI_INDEX_DELETE_CHUNK_SIZE", 2)
+    papers = [
+        _paper(f"2401.{index:05d}", title=f"Trace Paper {index}", abstract="RAG", categories=["cs.CL"])
+        for index in range(40, 45)
+    ]
+    statements: list[str] = []
+    original_get_connection = service._get_connection
+
+    def traced_connection():
+        conn = original_get_connection()
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(service, "_get_connection", traced_connection)
+    assert service.upsert_arxiv_oai_papers(papers) == 5
+
+    fts_deletes = [sql for sql in statements if sql.lstrip().startswith("DELETE FROM arxiv_oai_papers_fts")]
+    # arxiv_id 在 FTS 里是 UNINDEXED 列，每条 DELETE 都是一次全表扫描；5 篇、每块 2 个 → 3 次，而不是 5 次。
+    assert len(fts_deletes) == 3
+
+
 def test_rebuild_oai_search_index_rehydrates_mapping_and_fts() -> None:
     service = _make_temp_service()
     _skip_if_fts5_unavailable(service)
@@ -293,7 +382,7 @@ def test_rebuild_oai_search_index_resumes_failed_checkpoint() -> None:
         cursor.execute("DELETE FROM arxiv_oai_paper_categories")
         cursor.execute("DELETE FROM arxiv_oai_papers_fts")
         first_batch = service._fetch_rebuild_batch(cursor, last_arxiv_id=None, batch_size=batch_size)
-        service._insert_rebuild_search_index_batch(cursor, first_batch, fts5_available=True)
+        service._insert_search_index_rows(cursor, first_batch, fts5_available=True)
         last_arxiv_id = first_batch[-1]["arxiv_id"]
         now = service._now_iso()
         service._replace_search_rebuild_state(

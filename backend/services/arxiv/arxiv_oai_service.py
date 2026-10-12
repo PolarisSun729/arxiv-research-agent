@@ -48,6 +48,8 @@ OAI_INDEX_REBUILD_BATCH_SIZE = 1000
 OAI_INDEX_REBUILD_STALE_SECONDS = 15 * 60
 OAI_INDEX_REBUILD_VERSION = "local_oai_search_index_rebuild_v2"
 OAI_REBUILD_STATE_ID = 1
+# 增量刷新索引时按块批量删除旧行；低于旧版 SQLite 999 个绑定变量的上限。
+OAI_INDEX_DELETE_CHUNK_SIZE = 500
 
 
 
@@ -665,55 +667,38 @@ class ArxivOaiDatabaseService:
         if fts5_available is None:
             fts5_available = self._is_fts5_available(cursor)
 
+        # 同一批内重复的 arxiv_id 只保留最后一次，避免“统一先删再插”时插出重复索引行。
+        latest_by_id: Dict[str, Dict[str, Any]] = {}
         for paper in papers:
             arxiv_id = str(paper.get("arxiv_id") or "").strip()
-            if not arxiv_id:
-                continue
+            if arxiv_id:
+                latest_by_id[arxiv_id] = paper
+        if not latest_by_id:
+            return
 
-            categories = self._normalize_categories_for_index(paper)
-            primary_category = str(paper.get("primary_category") or "").strip()
-            # 采用“先删后插”的方式刷新从表，避免分类变更后残留脏索引。
-            cursor.execute("DELETE FROM arxiv_oai_paper_categories WHERE arxiv_id = ?", (arxiv_id,))
-            cursor.executemany(
-                """
-                INSERT OR REPLACE INTO arxiv_oai_paper_categories (arxiv_id, category, is_primary)
-                VALUES (?, ?, ?)
-                """,
-                [(arxiv_id, category, 1 if category == primary_category else 0) for category in categories],
-            )
+        # 采用“先删后插”刷新从表，避免分类变更或摘要更新后残留旧索引。
+        # FTS 的 arxiv_id 是 UNINDEXED 列，按它删除必然全表扫描；按块批量删把扫描次数从每篇一次降到每块一次。
+        arxiv_ids = list(latest_by_id)
+        for start in range(0, len(arxiv_ids), OAI_INDEX_DELETE_CHUNK_SIZE):
+            chunk = arxiv_ids[start:start + OAI_INDEX_DELETE_CHUNK_SIZE]
+            placeholders = ",".join("?" * len(chunk))
+            cursor.execute(f"DELETE FROM arxiv_oai_paper_categories WHERE arxiv_id IN ({placeholders})", chunk)
+            if fts5_available:
+                cursor.execute(f"DELETE FROM arxiv_oai_papers_fts WHERE arxiv_id IN ({placeholders})", chunk)
 
-            if not fts5_available:
-                # 没有 FTS5 时仍要保留分类索引，让 id/category/date 查询继续可用。
-                continue
+        self._insert_search_index_rows(cursor, list(latest_by_id.values()), fts5_available=fts5_available)
 
-            authors_text = self._normalize_authors_for_index(paper)
-            categories_text = " ".join(categories)
-            title = str(paper.get("title", "") or "").strip()
-            abstract = str(paper.get("abstract", "") or "").strip()
-            # all_text 聚合多个文本字段，给 all: 查询提供统一检索入口。
-            all_text = " ".join(
-                item
-                for item in [title, abstract, authors_text, categories_text, primary_category]
-                if item
-            )
-            # FTS 表同样走全量重建，确保字段更新时不会保留旧文本。
-            cursor.execute("DELETE FROM arxiv_oai_papers_fts WHERE arxiv_id = ?", (arxiv_id,))
-            cursor.execute(
-                """
-                INSERT INTO arxiv_oai_papers_fts (arxiv_id, title, abstract, authors, categories, all_text)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (arxiv_id, title, abstract, authors_text, categories_text, all_text),
-            )
-
-    def _insert_rebuild_search_index_batch(
+    def _insert_search_index_rows(
         self,
         cursor: sqlite3.Cursor,
         papers: Sequence[Dict[str, Any]],
         *,
         fts5_available: bool,
     ) -> None:
-        """全量重建专用快路径：目标索引已按检查点保证追加顺序，因此不做逐篇删除。"""
+        """批量插入分类映射和 FTS 行；只负责插入，调用方需保证这些论文的旧索引行已清除。
+
+        全量重建和增量同步共用这一份构造逻辑，保证两条路径写出的 all_text 完全一致。
+        """
         category_rows: List[Tuple[str, str, int]] = []
         fts_rows: List[Tuple[str, str, str, str, str, str]] = []
         for paper in papers:
@@ -961,7 +946,7 @@ class ArxivOaiDatabaseService:
                 if not papers:
                     break
 
-                self._insert_rebuild_search_index_batch(cursor, papers, fts5_available=True)
+                self._insert_search_index_rows(cursor, papers, fts5_available=True)
                 processed_papers += len(papers)
                 last_arxiv_id = str(papers[-1].get("arxiv_id") or "").strip() or last_arxiv_id
                 now = self._now_iso()
@@ -1903,6 +1888,7 @@ class ArxivOaiDatabaseService:
         if not normalized_papers:
             return 0
 
+        started_at = time.perf_counter()
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -1958,7 +1944,12 @@ class ArxivOaiDatabaseService:
                 # 批量刷新从索引，确保分类和全文检索状态与主表提交点一致。
                 self._sync_search_index_for_papers(cursor, normalized_papers)
                 conn.commit()
-                logger.info("OAI paper batch upserted: %s", len(normalized_papers))
+                # 带上耗时，写库变慢时能直接从日志看出来，而不是只看到翻页日志后长时间沉默。
+                logger.info(
+                    "OAI paper batch upserted: %s elapsed_seconds=%.2f",
+                    len(normalized_papers),
+                    time.perf_counter() - started_at,
+                )
                 return len(normalized_papers)
         except Exception as exc:
             logger.error("Error upserting OAI papers batch: %s", exc)
