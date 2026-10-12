@@ -1,3 +1,13 @@
+"""论文 QA 主流程编排服务（router / Agent 工具的统一入口）。
+
+一次问答的执行顺序：
+  解析检索目标（必须已有 active 索引）→ 解析会话 → 加载短期记忆 → 追问消歧
+  → PaperEvidenceResearchService 流式研究（检索、起草、主张校验、引用修复）
+  → 生成对外来源/观察结构 → 持久化 turn → 写评估记录与请求 trace → 发出唯一的 done 事件。
+
+同步入口 answer_question 与流式入口 answer_question_with_research_stream 共用同一条执行流，避免两套逻辑漂移。
+"""
+
 from __future__ import annotations
 
 import logging
@@ -37,6 +47,7 @@ from services.storage.sqlite.stores import (
     PaperQATurnStore,
     ResearchProfileStore,
 )
+from services.storage.sqlite.stores.paper_qa_index import PAPER_INDEX_ACTIVE_JOB_STATUSES
 from services.storage.vector_store_service import VectorStoreService
 from utils.config import get_memory_runtime_config
 from utils.logging_utils import RequestTrace, info_event
@@ -101,6 +112,7 @@ class PaperQAService:
             generation_service=self.generation_service,
         )
         self.research_service = research_service
+        # 检索目标解析器：校验论文存在且有 active QA 索引，并给出 collection 与论文元数据上下文。
         self._research_target_resolver = PaperRetrievalTargetResolver(
             index_store=paper_qa_index_store, catalog_store=paper_catalog_store,
         )
@@ -135,23 +147,14 @@ class PaperQAService:
             session_service=self.session_service,
         )
 
-    @staticmethod
-    def _payload_get(payload: Any, key: str, default: Any = None) -> Any:
-        """统一读取 dict 或对象风格 payload，避免主流程散落字段访问分支。"""
-        return PaperQASessionService.payload_get(payload, key, default)
+    # ---- 以下两个方法是对 session_service 的转发，保留它们是因为测试会对其打桩（替换实现）；
+    # 其余逻辑直接调用 self.session_service，不再新增此类转发（见包级 __init__ 说明）。
+    def _resolve_chat_session(self, arxiv_id: str, payload: Any, create_if_missing: bool = True) -> Dict[str, Any]:
+        """解析（必要时创建）当前论文的 QA 会话，主流程不直接操作会话表。
 
-    @staticmethod
-    def _resolve_user_id(value: Any = None) -> str:
-        """统一 QA 主流程的用户 ID 兜底规则。"""
-        return PaperQASessionService.resolve_user_id(value)
-
-    def _get_preferred_answer_style(self, payload: Any) -> str:
-        """从会话与长期画像中解析回答风格，主流程只消费解析结果。"""
-        return self.session_service.get_preferred_answer_style(payload)
-
-    def _resolve_chat_session(self, arxiv_id: str, payload: Any) -> Dict[str, Any]:
-        """解析或创建当前论文的 QA 会话，主流程不直接操作会话表。"""
-        return self.session_service.resolve_chat_session(arxiv_id, payload)
+        create_if_missing 用位置参数传递，兼容测试中 ``lambda *args: {}`` 形式的打桩。
+        """
+        return self.session_service.resolve_chat_session(arxiv_id, payload, create_if_missing=create_if_missing)
 
     def persist_completed_turn(
         self,
@@ -176,7 +179,11 @@ class PaperQAService:
         )
 
     def get_qa_status(self, arxiv_id: str) -> Dict[str, Any]:
-        """查询指定论文当前是否已完成 QA 索引构建，以及索引摘要信息。"""
+        """查询指定论文当前是否已完成 QA 索引构建，以及索引摘要信息。
+
+        has_index 只有在主表 status=indexed 且存在 collection 时才为 True；
+        active_* 字段描述正在服务的版本，building_status / last_failed_build 描述后台重建情况。
+        """
         qa_index = self.paper_qa_index_store.get_paper_qa_index(arxiv_id)
         latest_build = self.paper_qa_index_store.get_latest_paper_qa_index_build(arxiv_id)
         building_build = self.paper_qa_index_store.get_latest_paper_qa_index_build(arxiv_id, statuses=["building"])
@@ -242,14 +249,18 @@ class PaperQAService:
         }
 
     def build_qa_index(self, arxiv_id: str, loading_method: str = "docling", *, run_id: Optional[str] = None) -> Dict[str, Any]:
+        """在当前线程同步构建 QA 索引（路由 sync=true 与 Agent 工具使用）；生产默认走 IndexJobManager 异步任务。"""
         # run_id 只透传给索引构建日志，保证 Agent 触发的长任务能和主请求关联。
         return self.qa_index_builder.build_qa_index(arxiv_id, loading_method=loading_method, run_id=run_id)
 
     def delete_qa_index(self, arxiv_id: str) -> Dict[str, Any]:
-        """删除论文 QA 索引时先清理外部 artifact，再把数据库记录标记为不可检索。"""
+        """删除论文 QA 索引：先终止进行中的构建任务，再清理外部 artifact，最后把数据库记录标记为不可检索。"""
+        # 先终止该论文所有进行中的构建任务，否则后台 build 可能在删除之后激活，让索引「复活」。
+        # 首次构建时主表可能还没有记录，所以这一步要放在 not_found 判断之前。
+        cancelled_job_ids = self._cancel_active_index_jobs(arxiv_id)
         qa_index = self.paper_qa_index_store.get_paper_qa_index(arxiv_id)
         if not qa_index:
-            return {"status": "not_found", "arxiv_id": arxiv_id}
+            return {"status": "not_found", "arxiv_id": arxiv_id, "cancelled_job_ids": cancelled_job_ids}
 
         cleanup_result = self.qa_index_builder.cleanup_qa_index_artifacts(arxiv_id, qa_index, allow_active=True)
         updated = self.paper_qa_index_store.update_paper_qa_index(
@@ -269,21 +280,38 @@ class PaperQAService:
             "status": "deleted",
             "arxiv_id": arxiv_id,
             "cleanup": cleanup_result,
+            "cancelled_job_ids": cancelled_job_ids,
         }
 
-    @staticmethod
-    def _build_public_source_payload(
-        search_results: List[Dict[str, Any]],
-        *,
-        arxiv_id: str | None = None,
-    ) -> List[Dict[str, Any]]:
-        """生成前端可持久化的证据契约，并隔离本地文件路径。
+    def _cancel_active_index_jobs(self, arxiv_id: str) -> List[str]:
+        """把论文下 pending / running / retrying 的索引任务直接置为 failed（failure_code=qa_index_deleted）。
 
-        检索和多模态生成仍然需要内部绝对路径，但路径不能进入 API、会话历史或
-        Agent 输出；图片只能通过受控的 ``asset_url`` 回放，避免把服务器文件系统
-        暴露给浏览器。
+        - pending / retrying 任务不会再被 worker 领取；
+        - running 任务的 worker 下次续租或阶段回调时 CAS 失败，读到 status 已变化即判定 lease 丢失，
+          在下一个阶段边界中止建库，并把自己的 build 标记为 build_failed + cleanup_pending。
+        仍有一个很小的竞态窗口：worker 正好处在最后的激活步骤中时，可能在删除之后完成激活。
         """
-        return build_public_source_payload(search_results, arxiv_id=arxiv_id)
+        cancelled: List[str] = []
+        for job in self.paper_qa_index_store.list_paper_index_jobs(arxiv_id=arxiv_id, limit=20):
+            if str(job.get("status") or "") not in PAPER_INDEX_ACTIVE_JOB_STATUSES:
+                continue
+            job_id = str(job.get("job_id") or "")
+            updated = self.paper_qa_index_store.update_paper_index_job(
+                job_id,
+                status="failed",
+                current_stage="delete_qa_index",
+                failure_code="qa_index_deleted",
+                error_message="QA index was deleted while the build job was in progress",
+                stage_message="索引已删除，构建任务已取消",
+                refresh_heartbeat=False,
+                # 条件更新：任务若刚好已结束则不覆盖其终态。
+                expected_statuses=list(PAPER_INDEX_ACTIVE_JOB_STATUSES),
+            )
+            if updated:
+                cancelled.append(job_id)
+        if cancelled:
+            logger.info("Cancelled in-progress QA index jobs before deletion: arxiv_id=%s job_ids=%s", arxiv_id, cancelled)
+        return cancelled
 
     def resolve_evidence_asset_path(self, arxiv_id: str, source_id: str) -> str:
         """根据论文索引反查图片路径，不接受客户端提交的任意文件路径。"""
@@ -297,14 +325,22 @@ class PaperQAService:
     def _prepare_research_context(
         self, arxiv_id: str, payload: Any, request: PaperEvidenceResearchRequest,
     ) -> Dict[str, Any]:
-        """会话消歧和索引前置检查共用真实服务接口，避免同步与流式入口发生漂移。"""
+        """会话消歧和索引前置检查共用真实服务接口，避免同步与流式入口发生漂移。
+
+        Returns:
+            request：已用消歧后问题、会话快照和回答风格更新过的研究请求（不可变模型的副本）；
+            chat_session / session_state / question_contextualization / paper_context：供收尾阶段持久化与 debug 使用。
+        """
+        # 先校验索引存在，避免为一篇没有索引的论文创建空会话。
         target = self._research_target_resolver(arxiv_id)
         if target is None:
             raise AppError(
                 ErrorCode.QA_INDEX_NOT_FOUND,
                 context={"arxiv_id": arxiv_id, "stage": "prepare_research"},
             )
-        chat_session = self._resolve_chat_session(arxiv_id, payload)
+        # 这里只复用已有会话、不新建：若后续研究失败，不会留下没有任何 turn 的空会话。
+        # 新会话推迟到 _finalize_research_answer 持久化前再创建（新会话本来就没有历史可加载）。
+        chat_session = self._resolve_chat_session(arxiv_id, payload, False)
         state = self.session_service.load_conversation_state(
             arxiv_id=arxiv_id, payload=payload, chat_session=chat_session,
         )
@@ -334,10 +370,10 @@ class PaperQAService:
                 "recent_turns": state.get("recent_conversation_context") or [],
                 "session_summary": state.get("session_summary"),
             },
-            "preferred_answer_style": self._get_preferred_answer_style(payload),
+            "preferred_answer_style": self.session_service.get_preferred_answer_style(payload),
         })
         return {
-            "request": request, "chat_session": chat_session, "session_state": state,
+            "request": request, "payload": payload, "chat_session": chat_session, "session_state": state,
             "question_contextualization": contextualization, "paper_context": target.paper_context,
         }
 
@@ -348,7 +384,9 @@ class PaperQAService:
         """统一结果、观察与会话落盘；完成持久化后才允许对外发送 done。"""
         request = prepared["request"]
         summary = research_result.research_summary.model_dump(mode="json")
-        sources = self._build_public_source_payload(
+        # 只有最终被引用的证据会成为对外 sources；chunk_id 用 source_id 回填，保证脱敏后 ID 不变。
+        # 生成前端可持久化的证据契约并隔离本地文件路径：图片只能通过受控的 asset_url 回放。
+        sources = build_public_source_payload(
             [dict(c.model_dump(mode="json"), chunk_id=c.source_id) for c in research_result.citations],
             arxiv_id=arxiv_id,
         )
@@ -357,8 +395,15 @@ class PaperQAService:
             outcome=research_result.outcome, research_summary=summary, sources=sources,
         )
         generation_debug = {"status": "completed", "draft_attempt_count": summary["draft_attempt_count"]}
+        # 校验状态以研究终态为准：abstained 即使带了部分引用也属于证据不足，partial 为 warning。
+        if research_result.outcome == "abstained" or not sources:
+            verification_status = "insufficient_evidence"
+        elif research_result.outcome == "partial":
+            verification_status = "warning"
+        else:
+            verification_status = "passed"
         verification_debug = {
-            "status": "passed" if sources else "insufficient_evidence",
+            "status": verification_status,
             "source_count": len(sources), "cited_source_count": len(cited_ids),
             "supported_claim_count": summary["supported_claim_count"],
             "insufficient_evidence": research_result.outcome == "abstained",
@@ -373,12 +418,14 @@ class PaperQAService:
             "generation": generation_debug, "verification": verification_debug,
         }
         contextualization = prepared["question_contextualization"]
+        # 研究成功后才创建新会话；会话功能关闭或创建失败时仍为 {}，本轮按无状态处理。
+        chat_session = prepared["chat_session"] or self._resolve_chat_session(arxiv_id, prepared["payload"])
         persisted = self.persist_completed_turn(
-            chat_session=prepared["chat_session"], question=question, answer=research_result.answer,
+            chat_session=chat_session, question=question, answer=research_result.answer,
             source_payload=sources, retrieval_debug=retrieval_debug,
             contextualized_question=request.original_question, question_contextualization=contextualization,
         )
-        chat_session = persisted.get("chat_session") or prepared["chat_session"]
+        chat_session = persisted.get("chat_session") or chat_session
         return {
             "status": "success", "arxiv_id": arxiv_id, "question": question,
             "session_id": chat_session.get("session_id"), "chat_session": chat_session,
@@ -409,9 +456,10 @@ class PaperQAService:
         self, arxiv_id: str, payload: Any,
     ) -> Generator[Dict[str, Any], None, Dict[str, Any]]:
         """逐阶段 yield 进度及唯一 done；异常统一上抛，由 router 发出一次 error。"""
-        question = str(self._payload_get(payload, "question", "") or "").strip()
-        run_id = str(self._payload_get(payload, "run_id", "") or "").strip() or str(uuid4())
-        user_id = self._resolve_user_id(self._payload_get(payload, "user_id"))
+        payload_get = PaperQASessionService.payload_get
+        question = str(payload_get(payload, "question", "") or "").strip()
+        run_id = str(payload_get(payload, "run_id", "") or "").strip() or str(uuid4())
+        user_id = PaperQASessionService.resolve_user_id(payload_get(payload, "user_id"))
         started = perf_counter()
         stats = LLMCallStats()
         events: List[Dict[str, Any]] = []
@@ -420,8 +468,9 @@ class PaperQAService:
         research_stream = None
         trace = RequestTrace(
             run_id=run_id, route="paper_qa.research", user_id=user_id, input=question,
-            session_id=str(self._payload_get(payload, "session_id", "") or "") or None,
+            session_id=str(payload_get(payload, "session_id", "") or "") or None,
         )
+        # stage 记录当前所处阶段，异常时用于映射错误码和公开的失败阶段。
         stage = "prepare_research"
         trace.add_event("qa.request_start", arxiv_id=arxiv_id, user_id=user_id, engine="research")
         info_event(logger, "qa.request_start", run_id=run_id, arxiv_id=arxiv_id, user_id=user_id, engine="research")
@@ -471,6 +520,8 @@ class PaperQAService:
                 )
             )
             trace.set_output(result)
+            # 新会话在收尾阶段才创建，这里用最终 session_id 回填 trace。
+            trace.session_id = result.get("session_id") or trace.session_id
             trace.add_event("qa.request_done", status="success", outcome=research_result.outcome)
             trace_path = _write_qa_trace(trace, reason="auto")
             info_event(
@@ -479,6 +530,7 @@ class PaperQAService:
             )
         except Exception as exc:
             logger.exception("Research QA failed: arxiv_id=%s run_id=%s stage=%s", arxiv_id, run_id, stage)
+            # 错误码映射优先级：AppError 自带 code > 研究图结构化异常按 code/stage 归类 > 按当前阶段兜底。
             code = ErrorCode.DATABASE_WRITE_FAILED if stage == "persist_completed_turn" else ErrorCode.UNKNOWN_ERROR
             if isinstance(exc, AppError):
                 code = exc.code
@@ -516,8 +568,10 @@ class PaperQAService:
             )
             raise error from exc
         finally:
+            # 客户端断开导致外层生成器被关闭时，也要关闭内层研究流，释放其持有的资源。
             if research_stream is not None:
                 research_stream.close()
 
+        # done 必须在持久化完成后才发出，前端收到 done 即可认为本轮已写入历史。
         yield {"event": "done", "data": result}
         return result

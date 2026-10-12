@@ -64,3 +64,56 @@ def test_paper_qa_build_cache_persists_embedding_vectors(tmp_path: Path) -> None
     reopened = PaperQABuildCache(_cache_config(tmp_path))
 
     assert reopened.get_embedding(**key_kwargs) == [1.0, 2.0, 3.0]
+
+
+def test_paper_qa_build_cache_failure_only_disables_the_broken_cache(tmp_path: Path) -> None:
+    # 让 LLM 缓存目录位置被同名普通文件占用，mkdir 必然失败；embedding 缓存不应被连带禁用。
+    (tmp_path / "llm").write_text("not a directory", encoding="utf-8")
+    cache = PaperQABuildCache(_cache_config(tmp_path))
+    llm_kwargs = {"kind": "rerank_text", "model_name": "qwen", "prompt_version": "v1", "chunk_text": "text"}
+    embedding_kwargs = {
+        "provider": "dashscope",
+        "model_name": "text-embedding",
+        "dimension": 2,
+        "embedding_input": {"mode": "text", "text": "Index text."},
+    }
+
+    cache.set_llm_result("compressed", **llm_kwargs)
+    cache.set_embedding([0.5, 0.25], **embedding_kwargs)
+
+    assert cache.get_llm_result(**llm_kwargs) is None
+    assert "_llm_cache" in cache._disabled_reasons
+    assert cache.enabled is True
+    assert cache.get_embedding(**embedding_kwargs) == [0.5, 0.25]
+
+
+def test_paper_qa_build_cache_hashes_unchanged_image_once(tmp_path: Path, monkeypatch) -> None:
+    image_path = tmp_path / "figure.png"
+    image_path.write_bytes(b"png-v1")
+    cache = PaperQABuildCache(_cache_config(tmp_path))
+    opened_paths = []
+    original_open = Path.open
+
+    def counting_open(self, mode="r", *args, **kwargs):
+        # 只统计哈希时的二进制读取；write_bytes 内部也会走 Path.open。
+        if self == image_path and mode == "rb":
+            opened_paths.append(self)
+        return original_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    key_kwargs = {
+        "provider": "dashscope",
+        "model_name": "multimodal-embedding",
+        "dimension": 2,
+        "embedding_input": {"mode": "multimodal", "text": "Figure 1", "image_path": str(image_path)},
+    }
+
+    assert cache.get_embedding(**key_kwargs) is None
+    cache.set_embedding([1, 0], **key_kwargs)
+    assert cache.get_embedding(**key_kwargs) == [1.0, 0.0]
+    assert len(opened_paths) == 1
+
+    # 图片内容变化（大小随之变化）后必须重新哈希，旧向量不能被命中。
+    image_path.write_bytes(b"png-v2-replaced")
+    assert cache.get_embedding(**key_kwargs) is None
+    assert len(opened_paths) == 2

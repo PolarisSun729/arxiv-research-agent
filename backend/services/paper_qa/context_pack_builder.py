@@ -1,3 +1,15 @@
+"""检索结果 → 生成上下文包（context pack）的统一打包器。
+
+一次 build() 同时产出多份视图，保证它们使用同一套 source_id：
+- text_context / prompt_blocks：给生成模型看的证据文本与结构化 prompt 块；
+- image_inputs / asset_metadata：多模态生成所需的图片输入与资产元数据（含服务器本地路径，仅限内部使用）；
+- source_payload：前端证据面板 / 会话持久化使用的来源列表（对外前需经 evidence_contract 脱敏）；
+- generation_search_results：生成服务需要的扁平证据列表；
+- context_budget_debug：本次打包的规模统计，供观测使用。
+
+source_id 是引用协议的核心：模型输出的 [source:{source_id}] 必须能回查到这里生成的来源。
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, List
@@ -11,6 +23,7 @@ class ContextPackBuilder:
     """把检索结果统一打包成生成模型和前端都能复用的上下文载荷。"""
 
     def build(self, search_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """把检索结果按原顺序打包成多份上下文视图；index 从 1 开始，同时作为缺省 source_id 的序号。"""
         text_parts: List[str] = []
         image_inputs: List[Dict[str, Any]] = []
         asset_metadata: List[Dict[str, Any]] = []
@@ -27,6 +40,7 @@ class ContextPackBuilder:
             source_id = self.build_source_id(result, index)
             chunk_type = self.normalize_chunk_type(result.get("chunk_type", "text"))
             chunk_type_counts[chunk_type] = chunk_type_counts.get(chunk_type, 0) + 1
+            # 表格证据（v2 schema）单独统计，用于观测「数值类问题是否用上了结构化表格」。
             table_evidence = self.normalize_table_evidence(result)
             if table_evidence:
                 table_evidence_count += 1
@@ -40,6 +54,7 @@ class ContextPackBuilder:
 
             asset_info = self.build_asset_metadata(result, source_id=source_id, chunk_type=chunk_type)
             text_block = self.build_text_block(result, index=index, source_id=source_id, chunk_type=chunk_type)
+            # 空文本块不进入 text_context，但来源仍保留在 source_payload / prompt_blocks 中，便于排查。
             if text_block:
                 text_parts.append(text_block)
             else:
@@ -108,6 +123,7 @@ class ContextPackBuilder:
             )
 
         text_context = "\n\n".join(text_parts)
+        # 这里只是打包规模统计；真正的 token 预算裁剪由 PromptContextBuilder 负责。
         context_budget_debug = {
             "source_count": len(source_payload),
             "chunk_type_counts": chunk_type_counts,
@@ -131,15 +147,22 @@ class ContextPackBuilder:
         }
 
     def build_source_payload(self, search_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """只取 source_payload 视图的便捷入口（内部仍会完整执行一次 build）。"""
         return self.build(search_results)["source_payload"]
 
     @staticmethod
     def normalize_chunk_type(value: Any) -> str:
+        """chunk_type 统一转小写，空值回退为 text。"""
         chunk_type = str(value or "text").strip().lower()
         return chunk_type or "text"
 
     @staticmethod
     def build_source_id(result: Dict[str, Any], index: int) -> str:
+        """为单条检索结果生成稳定的 source_id。
+
+        优先级：v2 表格证据专用 ID > 检索结果自带的稳定标识 > 基于序号/类型/页码的兜底 ID。
+        兜底 ID 依赖本次结果顺序，不具备跨轮次稳定性，只在上游缺少任何标识时使用。
+        """
         table_evidence = ContextPackBuilder.normalize_table_evidence(result)
         if table_evidence:
             table = table_evidence.get("table") if isinstance(table_evidence.get("table"), dict) else {}
@@ -163,6 +186,7 @@ class ContextPackBuilder:
 
     @staticmethod
     def build_asset_metadata(result: Dict[str, Any], *, source_id: str, chunk_type: str) -> Dict[str, Any]:
+        """构造图片/表格资产元数据；包含 asset_abs_path 等本地路径，只能留在生成链路内部。"""
         return {
             "source_id": source_id,
             "chunk_id": result.get("chunk_id", ""),
@@ -192,6 +216,7 @@ class ContextPackBuilder:
 
     @staticmethod
     def build_source_item(result: Dict[str, Any], *, source_id: str, chunk_type: str) -> Dict[str, Any]:
+        """构造前端证据面板使用的来源条目；对外输出前会由 evidence_contract 去掉 asset_path 等私有字段。"""
         return {
             "source_id": source_id,
             "content": result.get("content", ""),
@@ -221,11 +246,6 @@ class ContextPackBuilder:
             "asset_path": result.get("asset_path", ""),
             "asset_summary": result.get("asset_summary", ""),
             "asset_preview_text": result.get("asset_preview_text", ""),
-            "asset_section_match_type": result.get("asset_section_match_type", ""),
-            "asset_section_match_confidence": result.get("asset_section_match_confidence", 0.0),
-            "asset_section_match_reason": result.get("asset_section_match_reason", ""),
-            "asset_section_match_is_heuristic": result.get("asset_section_match_is_heuristic", False),
-            "asset_section_match_allow_embedding": result.get("asset_section_match_allow_embedding", False),
             "table_id": result.get("table_id", ""),
             "table_evidence_source_id": source_id if ContextPackBuilder.normalize_table_evidence(result) else "",
             "table_evidence": ContextPackBuilder.normalize_table_evidence(result),
@@ -234,6 +254,7 @@ class ContextPackBuilder:
 
     @staticmethod
     def build_text_block(result: Dict[str, Any], *, index: int, source_id: str, chunk_type: str) -> str:
+        """渲染单条证据的文本块：表格 / 图片 / 普通文本三种格式，每块都带 source_id 方便模型引用。"""
         content = str(result.get("content", "") or "").strip()
         asset_summary = str(result.get("asset_summary", "") or "").strip()
         asset_preview_text = str(result.get("asset_preview_text", "") or "").strip()
@@ -298,6 +319,7 @@ class ContextPackBuilder:
         text_block: str,
         table_evidence: Dict[str, Any],
     ) -> PromptBlock:
+        """把单条证据包装成 PromptBlock，供 PromptContextBuilder 做预算分配、压缩和丢弃决策。"""
         context_role = str(result.get("context_role", "") or "").strip() or "fallback_context"
         block_type = ContextPackBuilder.prompt_block_type(
             chunk_type=chunk_type,
@@ -337,6 +359,7 @@ class ContextPackBuilder:
             score=score,
             original_rank=index,
             context_role=context_role,
+            # priority 0（锚点证据/表格终证据）不可丢弃；其余在预算不足时可按优先级依次丢弃。
             budget_group="rag_core" if priority <= 1 else "rag_expansion",
             protected=False,
             droppable=priority > 0,
@@ -351,6 +374,7 @@ class ContextPackBuilder:
 
     @staticmethod
     def prompt_block_type(*, chunk_type: str, context_role: str, table_evidence: Dict[str, Any]) -> str:
+        """推断 prompt 块类型：表格按证据成熟度细分（终证据 > 候选单元格 > 普通表格上下文）。"""
         if chunk_type == "table":
             final = table_evidence.get("final_evidence") if isinstance(table_evidence, dict) else {}
             candidate = table_evidence.get("candidate_evidence") if isinstance(table_evidence, dict) else {}
@@ -365,6 +389,7 @@ class ContextPackBuilder:
 
     @staticmethod
     def prompt_block_priority(*, block_type: str, context_role: str) -> int:
+        """粗粒度优先级，数值越小越重要：0 核心证据，1 辅助证据，2 结构扩展上下文，4 其他兜底上下文。"""
         if block_type in {"anchor_evidence", "table_final_evidence"}:
             return 0
         if block_type in {"table_candidate_evidence", "figure_evidence", "memory_context"}:
@@ -375,6 +400,7 @@ class ContextPackBuilder:
 
     @staticmethod
     def optional_float(value: Any) -> float:
+        """宽松转 float，空值或非法值统一回退为 0.0。"""
         try:
             if value in (None, ""):
                 return 0.0
@@ -395,6 +421,11 @@ class ContextPackBuilder:
 
     @staticmethod
     def normalize_table_evidence(result: Dict[str, Any]) -> Dict[str, Any]:
+        """读取并校验 v2 表格证据；不是非空 dict 时返回 {}。
+
+        注意：schema 不合法时 validate_table_evidence_payload 会直接抛异常（不吞掉）；
+        另外 build() 中每条结果会多次调用本方法，存在重复校验，可在后续优化为每条结果只校验一次。
+        """
         evidence = result.get("table_evidence")
         if not isinstance(evidence, dict):
             return {}
@@ -413,6 +444,7 @@ class ContextPackBuilder:
         page_number: str,
         section_path: str,
     ) -> str:
+        """渲染 v2 表格证据块。index / page_number / section_path 目前未被使用，仅为保持调用签名兼容。"""
         evidence = ContextPackBuilder.normalize_table_evidence(result)
         if not evidence:
             return ""
@@ -448,10 +480,12 @@ class ContextPackBuilder:
 
     @staticmethod
     def count_table_evidence_cells(evidence: Dict[str, Any]) -> int:
+        """统计去重后的表格证据单元格数量。"""
         return len(ContextPackBuilder.table_evidence_cells(evidence))
 
     @staticmethod
     def build_table_cell_citations(result: Dict[str, Any], *, source_id: str) -> List[Dict[str, Any]]:
+        """为表格证据中的每个单元格生成可定位的单元格级引用（cell_source_id）。"""
         evidence = ContextPackBuilder.normalize_table_evidence(result)
         if not evidence:
             return []
@@ -493,6 +527,7 @@ class ContextPackBuilder:
 
     @staticmethod
     def safe_source_token(value: Any) -> str:
+        """把任意值转换成只含小写字母数字和单个连字符的 ID 片段，空结果回退为 unknown。"""
         normalized = str(value or "").strip()
         normalized = "".join(ch if ch.isalnum() else "-" for ch in normalized)
         normalized = "-".join(part for part in normalized.split("-") if part)

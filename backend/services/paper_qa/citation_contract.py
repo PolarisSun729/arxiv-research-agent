@@ -10,6 +10,7 @@ import re
 from typing import Any, Iterable, List, Match
 
 
+# 合法引用的唯一形态：[source:<source_id>]。
 # 一个方括号只能承载一个完整 source_id；逗号和空白都会让它失去合法性。
 _STRICT_MARKER_RE = re.compile(r"\[source:([^\]\s,]+)\]")
 
@@ -27,6 +28,7 @@ _BARE_CITATION_RE = re.compile(
 
 
 def _known_source_ids(source_ids: Iterable[str]) -> set[str]:
+    """把本轮可引用的 source_id 规范化成集合（去空白、去空值），便于 O(1) 判断合法性。"""
     return {str(source_id).strip() for source_id in source_ids if str(source_id).strip()}
 
 
@@ -42,6 +44,7 @@ def extract_cited_source_ids(answer: str, source_ids: Iterable[str]) -> List[str
 
 
 def _is_inside_match(position: int, matches: List[Match[str]]) -> bool:
+    """判断某个裸标记是否落在已识别的方括号引用内部，用于避免同一处错误被重复计数。"""
     return any(match.start() <= position < match.end() for match in matches)
 
 
@@ -82,8 +85,14 @@ def validate_citations(answer: str, source_ids: Iterable[str]) -> dict[str, Any]
 
 
 def _strip_citation_whitespace(answer: str) -> str:
-    # 清洗只移除协议噪声，不重写正文；这里仅合并由标记删除产生的空白。
-    cleaned = re.sub(r"[ \t]{2,}", " ", answer or "")
+    """合并删除引用标记后残留的空白。
+
+    清洗只移除协议噪声，不重写正文：
+    - 只合并「非空白字符之后」的连续空格，保留行首缩进；否则 Markdown 嵌套列表、
+      代码块的缩进会被压成单个空格，导致前端渲染错乱；
+    - 删除标点前多余的空格，例如 "结论 [source:x]。" 删除非法引用后会残留 "结论 。"。
+    """
+    cleaned = re.sub(r"(?<=\S)[ \t]{2,}", " ", answer or "")
     cleaned = re.sub(r"[ \t]+([，。！？；：、,.!?;:])", r"\1", cleaned)
     return cleaned.strip()
 
@@ -93,11 +102,14 @@ def strip_invalid_citations(answer: str, source_ids: Iterable[str]) -> str:
     known = _known_source_ids(source_ids)
 
     def replace_bracketed(match: Match[str]) -> str:
+        # 方括号整体是合法单引用时原样保留，其余（混合/旧格式/未知 ID）整块删除。
         strict_match = _STRICT_MARKER_RE.fullmatch(match.group(0))
         if strict_match and strict_match.group(1) in known:
             return match.group(0)
         return ""
 
+    # 先处理方括号引用，再删除方括号外的裸 source:xxx 标记；顺序不能反，
+    # 否则合法的 [source:1] 内部会先被裸标记规则误删（裸规则的负向后顾已排除 "[" 紧邻的情况，这里是双保险）。
     cleaned = _BRACKETED_CITATION_RE.sub(replace_bracketed, answer or "")
     cleaned = _BARE_CITATION_RE.sub("", cleaned)
     return _strip_citation_whitespace(cleaned)

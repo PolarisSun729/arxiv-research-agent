@@ -1,22 +1,35 @@
+"""Paper QA 质量观察契约（qa_observation）。
+
+把一次问答的内部状态压缩成形状固定的字典，供 Agent 恢复策略、前端与评估记录稳定消费：
+retrieval_quality / answer_quality / 各阶段状态 / 推荐修复动作等。
+
+生产调用方：
+- build_research_qa_observation：研究图（PaperEvidenceResearchService）成功收尾时，按 outcome 投影；
+- build_error_qa_observation：paper_qa_service、routers/qa_router.py、tools/paper_qa_tools.py 的失败分支；
+- research_outcome_from_result：Agent 侧读取结果里的研究终态。
+
+历史上这里还会解析旧检索链路的 retrieval_debug（rewrite / hyde / vector / memory / fusion / rerank /
+context_expansion 等阶段），但研究图上线后已没有调用方传入该 debug，相关解析逻辑已移除。
+为保证前端与 Agent 读取的字段形状不变，retrieval_stage_status / route_status 仍保留全部阶段键，
+没有观测数据的阶段统一为 unknown。
+"""
+
 from __future__ import annotations
 
-from collections import Counter
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional
 
 from services.paper_qa.repair_actions import (
     ASK_CLARIFICATION,
     ASK_USER_TO_REBUILD_INDEX,
     RETRY_WITH_EXPANDED_CONTEXT,
-    RETRY_WITH_KEYWORD_EMPHASIS,
     RETRY_WITH_QUERY_REWRITE,
-    RETRY_WITH_SECTION_FOCUS,
-    RETRY_WITHOUT_HYDE,
     describe_repair_actions,
     normalize_repair_actions,
 )
 
 QA_OBSERVATION_SCHEMA_VERSION = "paper_qa_observation_v1"
 
+# retrieval_stage_status 中固定存在的阶段键（保证输出形状稳定，缺数据时为 unknown）。
 RETRIEVAL_STAGE_NAMES = (
     "query_planning",
     "rewrite",
@@ -31,6 +44,7 @@ RETRIEVAL_STAGE_NAMES = (
     "verification",
 )
 
+# route_status 中固定存在的召回路由键。
 ROUTE_STAGE_NAMES = (
     "vector_original",
     "vector_rewrite",
@@ -40,24 +54,30 @@ ROUTE_STAGE_NAMES = (
     "memory_context",
 )
 
+# 最终来源少于该数量视为证据偏弱。
 MIN_RETRIEVAL_SOURCE_COUNT = 2
-MIN_FUSED_CHUNK_COUNT = 3
+# 来源平均文本长度低于该值视为证据过短。
+MIN_AVERAGE_SOURCE_TEXT_LENGTH = 80
+# 引用来源中参考文献 / 附录 / prompt 等噪声章节占比达到该值，视为上下文被污染。
+NOISY_SOURCE_RATIO_THRESHOLD = 0.5
+NOISY_SECTION_MARKERS = ("references", "bibliography", "appendix", "prompt")
 
-MISSING_EVIDENCE_BY_MAIN_INTENT = {
-    "method_flow": "method_flow",
-    "experiment_setup": "experiment_setup",
-    "dataset": "experiment_setup",
-    "result_analysis": "result_table",
-    "comparison": "result_table",
-    "definition": "definition",
-    "limitation": "limitation",
-    "figure_table": "figure_explanation",
+# 调用方错误阶段名 → 观察契约阶段键。
+# 前四项是旧检索链路的阶段名（仍可能出现在历史调用里）；后三项是研究图结构化异常实际使用的阶段名。
+# prepare_research / research / persist_completed_turn 等没有对应检索阶段，只体现在顶层 error_stage。
+ERROR_STAGE_ALIASES = {
+    "enhanced_retrieve": "vector",
+    "vector_store": "vector",
+    "paper_qa_final_answer": "generation",
+    "qa_stream": "generation",
+    "draft_generation": "generation",
+    "claim_extraction": "verification",
+    "claim_verification": "verification",
 }
 
 
 def build_qa_observation(
     *,
-    retrieval_debug: Optional[Mapping[str, Any]] = None,
     sources: Optional[List[Dict[str, Any]]] = None,
     verification_result: Optional[Mapping[str, Any]] = None,
     generation_result: Optional[Mapping[str, Any]] = None,
@@ -65,51 +85,39 @@ def build_qa_observation(
     error_stage: Optional[str] = None,
     error_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """把 Paper QA 内部 debug 压缩成 Agent 可稳定消费的质量观察契约。"""
-    debug = retrieval_debug if isinstance(retrieval_debug, Mapping) else {}
+    """把 Paper QA 的来源、生成、校验与错误信息压缩成 Agent 可稳定消费的质量观察契约。
+
+    所有入参都可缺省；缺失的部分对应字段为 unknown / not_available，输出键集合始终不变。
+    error_reason 若提供会直接作为 observation_reason 对外暴露，调用方必须传稳定的错误码类字符串，
+    不能传 str(exc)（可能包含 provider 响应、服务器路径等敏感信息）。
+    """
     normalized_sources = [dict(item) for item in (sources or []) if isinstance(item, Mapping)]
     verification = verification_result if isinstance(verification_result, Mapping) else {}
     generation = generation_result if isinstance(generation_result, Mapping) else {}
 
     stage_status = _build_stage_status(
-        debug,
-        sources=normalized_sources,
         verification_result=verification,
         generation_result=generation,
         error_stage=error_stage,
         error_reason=error_reason,
     )
-    route_status = _build_route_status(debug)
-    answer_insufficient = _answer_insufficient_evidence(verification, generation, error_code=error_code)
-    weak_source_reason = _weak_source_reason(debug, normalized_sources, verification)
-    missing_evidence_type = _missing_evidence_type(debug, answer_insufficient, weak_source_reason)
+    route_status = {route_name: _stage() for route_name in ROUTE_STAGE_NAMES}
+    answer_insufficient = _answer_insufficient_evidence(verification, generation)
+    weak_source_reason = _weak_source_reason(normalized_sources, verification)
+    missing_evidence_type = _missing_evidence_type(answer_insufficient, weak_source_reason)
     rerank_failed_reason = _rerank_failed_reason(stage_status)
     answer_quality = _answer_quality(stage_status, answer_insufficient, error_code=error_code)
     answer_quality_reason = _answer_quality_reason(stage_status, answer_insufficient, error_code=error_code)
-    retrieval_quality = _retrieval_quality(
+    retrieval_quality, retrieval_quality_reason = _retrieval_quality(
         stage_status=stage_status,
         route_status=route_status,
         sources=normalized_sources,
         answer_insufficient=answer_insufficient,
         weak_source_reason=weak_source_reason,
-        error_code=error_code,
-    )
-    retrieval_quality_reason = _retrieval_quality_reason(
-        stage_status=stage_status,
-        route_status=route_status,
-        sources=normalized_sources,
-        answer_insufficient=answer_insufficient,
-        weak_source_reason=weak_source_reason,
-        error_code=error_code,
-    )
-    answer_insufficient_reason = _answer_insufficient_evidence_reason(
-        verification,
-        generation,
         error_code=error_code,
     )
     repair_actions = _recommended_repair_actions(
         retrieval_quality=retrieval_quality,
-        stage_status=stage_status,
         missing_evidence_type=missing_evidence_type,
         weak_source_reason=weak_source_reason,
         rerank_failed_reason=rerank_failed_reason,
@@ -138,7 +146,11 @@ def build_qa_observation(
         "weak_source_reason": weak_source_reason,
         "rerank_failed_reason": rerank_failed_reason,
         "answer_insufficient_evidence": answer_insufficient,
-        "answer_insufficient_evidence_reason": answer_insufficient_reason,
+        "answer_insufficient_evidence_reason": _answer_insufficient_evidence_reason(
+            verification,
+            generation,
+            error_code=error_code,
+        ),
         "recommended_repair_actions": repair_actions,
         "repair_action_details": describe_repair_actions(repair_actions),
         "source_count": len(normalized_sources),
@@ -169,7 +181,8 @@ def build_research_qa_observation(
     stages = observation["retrieval_stage_status"]
     # 未逐轮观测的旧检索阶段保留 unknown，不把新图的通过状态伪装成每条旧路由都成功。
     stages["generation"] = _stage(True, "completed" if outcome != "abstained" else "skipped", fallback=False, reason=reason)
-    stages["verification"] = _stage(True, "passed" if sources else "not_available", fallback=False, reason=reason)
+    # 与 _verification_stage 保持同一套取值：通过统一用 success。
+    stages["verification"] = _stage(True, "success" if sources else "not_available", fallback=False, reason=reason)
     stages["evidence_coverage"] = _stage(True, outcome, fallback=False, reason=reason, details=research_summary)
     observation.update({
         "outcome": outcome, "termination_reason": research_summary.get("termination_reason"),
@@ -197,12 +210,14 @@ def build_error_qa_observation(
     error_code: str,
     error_stage: str,
     error_reason: Optional[str] = None,
-    retrieval_debug: Optional[Mapping[str, Any]] = None,
     sources: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """失败分支没有完整生成/校验结果时，仍返回同一形状的观察结构。"""
+    """失败分支没有完整生成/校验结果时，仍返回同一形状的观察结构。
+
+    error_stage 会经 ERROR_STAGE_ALIASES 映射到具体阶段并标记为 failed；
+    映射不到的阶段名只体现在顶层 error_stage 字段中。
+    """
     return build_qa_observation(
-        retrieval_debug=retrieval_debug,
         sources=sources,
         error_code=error_code,
         error_stage=error_stage,
@@ -218,6 +233,7 @@ def _stage(
     reason: str = "not_available",
     details: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """构造统一形状的阶段状态：enabled / status / fallback / reason（+ 可选 details）。"""
     result = {
         "enabled": enabled,
         "status": status,
@@ -230,272 +246,31 @@ def _stage(
 
 
 def _build_stage_status(
-    debug: Mapping[str, Any],
     *,
-    sources: List[Dict[str, Any]],
     verification_result: Mapping[str, Any],
     generation_result: Mapping[str, Any],
     error_stage: Optional[str],
     error_reason: Optional[str],
 ) -> Dict[str, Dict[str, Any]]:
+    """生成全部阶段的状态表：只有生成与校验两段有输入可解析，其余检索阶段保持 unknown。"""
     stages = {name: _stage() for name in RETRIEVAL_STAGE_NAMES}
-    if not debug:
-        stages["generation"] = _generation_stage(generation_result)
-        stages["verification"] = _verification_stage(verification_result)
-        if error_stage:
-            _mark_error_stage(stages, error_stage, error_reason)
-        return stages
-
-    stages["query_planning"] = _query_planning_stage(debug)
-    stages["rewrite"] = _rewrite_stage(debug.get("query_rewrite"))
-    stages["hyde"] = _hyde_stage(debug.get("hyde"))
-    stages["keyword"] = _metric_stage(_route_metric(debug, "keyword"))
-    stages["vector"] = _vector_stage(debug)
-    stages["memory"] = _memory_stage(debug)
-    stages["fusion"] = _fusion_stage(debug)
-    stages["rerank"] = _rerank_stage(debug.get("llm_rerank"))
-    stages["context_expansion"] = _context_expansion_stage(debug)
     stages["generation"] = _generation_stage(generation_result)
     stages["verification"] = _verification_stage(verification_result)
-    stages["fusion"] = _enrich_fusion_with_sources(stages["fusion"], debug, sources)
     if error_stage:
         _mark_error_stage(stages, error_stage, error_reason)
     return stages
 
 
 def _mark_error_stage(stages: Dict[str, Dict[str, Any]], error_stage: str, error_reason: Optional[str]) -> None:
+    """把调用方的错误阶段名映射到观察契约中的阶段键，并将该阶段标记为 failed。"""
     normalized = str(error_stage or "").strip()
-    stage_name = {
-        "enhanced_retrieve": "vector",
-        "vector_store": "vector",
-        "paper_qa_final_answer": "generation",
-        "qa_stream": "generation",
-    }.get(normalized, normalized)
+    stage_name = ERROR_STAGE_ALIASES.get(normalized, normalized)
     if stage_name in stages:
         stages[stage_name] = _stage(True, "failed", fallback=False, reason=error_reason or normalized)
 
 
-def _query_planning_stage(debug: Mapping[str, Any]) -> Dict[str, Any]:
-    details = {
-        "main_intent": _main_intent(debug) or "unknown",
-        "preferred_sections": _preferred_sections(debug),
-        "rewrite_query_count": _rewrite_query_count(debug),
-        "contextualized_question_changed": _question_was_contextualized(debug),
-    }
-    if debug.get("query_profile") or debug.get("query_plan") or debug.get("intent_profile"):
-        return _stage(True, "success", fallback=False, reason="query_profile_available", details=details)
-    if debug.get("original_question") or debug.get("contextualized_question"):
-        return _stage(True, "partial", fallback=False, reason="question_available_without_query_profile", details=details)
-    return _stage(details=details)
-
-
-def _rewrite_stage(value: Any) -> Dict[str, Any]:
-    selected = _selected_rewrite_queries(value)
-    details = {"rewrite_query_count": len(selected), "selected_queries": selected[:5]}
-    if not isinstance(value, Mapping):
-        if selected:
-            return _stage(True, "success", fallback=False, reason="selected_queries_available", details=details)
-        return _stage(details=details)
-    enabled = bool(value.get("enabled", False))
-    if not enabled:
-        return _stage(False, "disabled", fallback=False, reason="disabled", details=details)
-    if value.get("llm_error"):
-        return _stage(True, "fallback", fallback=True, reason=str(value.get("llm_error")), details=details)
-    if selected:
-        return _stage(True, "success", fallback=False, reason="selected_queries_available", details=details)
-    return _stage(True, "fallback", fallback=True, reason="selected_queries_empty", details=details)
-
-
-def _hyde_stage(value: Any) -> Dict[str, Any]:
-    if not isinstance(value, Mapping):
-        return _stage()
-    enabled = bool(value.get("enabled", False))
-    details = {
-        "hyde_text_generated": bool(str(value.get("text") or "").strip()),
-        "source_query_count": len(value.get("source_queries") or []) if isinstance(value.get("source_queries"), list) else 0,
-    }
-    if not enabled:
-        return _stage(False, "disabled", fallback=False, reason="disabled", details=details)
-    if str(value.get("text") or "").strip():
-        return _stage(True, "success", fallback=False, reason="hyde_text_available", details=details)
-    return _stage(True, "fallback", fallback=True, reason="hyde_text_empty", details=details)
-
-
-def _route_metric(debug: Mapping[str, Any], key: str) -> Any:
-    route_metrics = debug.get("route_metrics")
-    if isinstance(route_metrics, Mapping):
-        return route_metrics.get(key)
-    return None
-
-
-def _metric_stage(metric: Any) -> Dict[str, Any]:
-    if not isinstance(metric, Mapping):
-        return _stage()
-    enabled = bool(metric.get("enabled", False))
-    status = str(metric.get("status") or "").strip().lower()
-    candidate_count = _safe_int(metric.get("candidate_count"), default=0)
-    applied = bool(metric.get("applied", False))
-    reason = str(metric.get("fallback_reason") or metric.get("error") or status or "not_available")
-    details = {
-        "candidate_count": candidate_count,
-        "applied": applied,
-        "latency_ms": metric.get("latency_ms"),
-        "cache_hit": metric.get("cache_hit"),
-    }
-    if not enabled or status == "disabled":
-        return _stage(False, "disabled", fallback=False, reason=reason or "disabled", details=details)
-    if (status == "ok" or applied) and candidate_count > 0:
-        return _stage(True, "success", fallback=False, reason=f"candidate_count:{candidate_count}", details=details)
-    if status == "ok" or applied:
-        return _stage(True, "partial", fallback=False, reason="candidate_empty", details=details)
-    if status in {"timeout", "partial"} or bool(metric.get("timeout", False)):
-        return _stage(True, "fallback", fallback=True, reason=reason, details=details)
-    if status in {"error", "failed"}:
-        return _stage(True, "failed", fallback=False, reason=reason, details=details)
-    return _stage(True, "unknown", fallback="unknown", reason=reason, details=details)
-
-
-def _vector_stage(debug: Mapping[str, Any]) -> Dict[str, Any]:
-    metrics = [_route_metric(debug, name) for name in ("vector_original", "vector_rewrite", "vector_hyde")]
-    known = [metric for metric in metrics if isinstance(metric, Mapping)]
-    details = {
-        "route_count": len(known),
-        "candidate_count": sum(_safe_int(metric.get("candidate_count"), default=0) for metric in known),
-        "successful_routes": [
-            name
-            for name in ("vector_original", "vector_rewrite", "vector_hyde")
-            if _route_has_candidates(_route_metric(debug, name))
-        ],
-    }
-    if not known:
-        return _stage(details=details)
-    if any(_route_has_candidates(metric) for metric in known):
-        fallback = any(str(metric.get("status") or "").lower() in {"partial", "timeout", "error", "failed"} for metric in known)
-        return _stage(True, "partial" if fallback else "success", fallback=fallback, reason="vector_candidates_available", details=details)
-    if all(str(metric.get("status") or "").lower() == "disabled" for metric in known):
-        return _stage(False, "disabled", fallback=False, reason="disabled", details=details)
-    return _stage(True, "failed", fallback=False, reason="vector_candidates_empty", details=details)
-
-
-def _memory_stage(debug: Mapping[str, Any]) -> Dict[str, Any]:
-    metric = _route_metric(debug, "memory_context")
-    if isinstance(metric, Mapping):
-        return _metric_stage(metric)
-
-    memory_debug = debug.get("memory")
-    if not isinstance(memory_debug, Mapping):
-        return _stage()
-    enabled = bool(memory_debug.get("enabled", False))
-    candidate_count = _safe_int(memory_debug.get("candidate_count"), default=0)
-    details = {
-        "candidate_count": candidate_count,
-        "final_context_hit_count": len(memory_debug.get("final_context_hits") or []) if isinstance(memory_debug.get("final_context_hits"), list) else 0,
-        "lookup_mode": memory_debug.get("memory_lookup_mode"),
-    }
-    if not enabled:
-        return _stage(False, "disabled", fallback=False, reason=str(memory_debug.get("fallback_reason") or "disabled"), details=details)
-    if bool(memory_debug.get("applied", False)) or candidate_count > 0:
-        return _stage(True, "success", fallback=False, reason=f"candidate_count:{candidate_count}", details=details)
-    return _stage(True, "partial", fallback=False, reason=str(memory_debug.get("fallback_reason") or "candidate_empty"), details=details)
-
-
-def _fusion_stage(debug: Mapping[str, Any]) -> Dict[str, Any]:
-    fusion = debug.get("fusion")
-    stages = debug.get("stages") if isinstance(debug.get("stages"), Mapping) else {}
-    fused = stages.get("fused_top30") if isinstance(stages, Mapping) else None
-    final_chunks = debug.get("final_chunks")
-    fused_count = len(fused) if isinstance(fused, list) else 0
-    final_count = len(final_chunks) if isinstance(final_chunks, list) else 0
-    details = {
-        "fused_count": fused_count,
-        "final_chunk_count": final_count,
-    }
-    if isinstance(fused, list) and fused:
-        if fused_count < MIN_FUSED_CHUNK_COUNT:
-            return _stage(True, "partial", fallback=False, reason=f"fused_candidates_too_few:{fused_count}", details=details)
-        return _stage(True, "success", fallback=False, reason="fused_candidates_available", details=details)
-    if isinstance(fusion, Mapping):
-        return _stage(True, "partial", fallback=False, reason="fusion_debug_available_without_fused_candidates", details=details)
-    return _stage(details=details)
-
-
-def _enrich_fusion_with_sources(stage: Dict[str, Any], debug: Mapping[str, Any], sources: List[Dict[str, Any]]) -> Dict[str, Any]:
-    details = dict(stage.get("details") or {})
-    details.update(_section_distribution_details(debug, sources))
-    if not sources:
-        return _stage(True, "failed", fallback=False, reason="final_chunks_empty", details=details)
-    if len(sources) < MIN_RETRIEVAL_SOURCE_COUNT:
-        return _stage(True, "partial", fallback=False, reason=f"top_chunks_too_few:{len(sources)}", details=details)
-    preferred_sections = details.get("preferred_sections") or []
-    if preferred_sections and not details.get("matches_preferred_section"):
-        return _stage(True, "partial", fallback=False, reason="preferred_section_mismatch", details=details)
-    if float(details.get("noisy_section_ratio") or 0.0) >= 0.5:
-        return _stage(True, "partial", fallback=False, reason="context_noise_contamination", details=details)
-    return _stage(stage.get("enabled", True), stage.get("status", "success"), fallback=stage.get("fallback", False), reason=stage.get("reason", "ok"), details=details)
-
-
-def _rerank_stage(value: Any) -> Dict[str, Any]:
-    if not isinstance(value, Mapping):
-        return _stage()
-    enabled = bool(value.get("enabled", False))
-    reason = str(value.get("reason") or value.get("fallback_reason") or "not_available")
-    details = {
-        "executed": bool(value.get("applied", False)),
-        "mode": value.get("mode"),
-        "input_chunks": _safe_int(value.get("input_chunks"), default=0),
-        "output_chunks": _safe_int(value.get("output_chunks"), default=0),
-        "candidate_limit": value.get("candidate_limit"),
-    }
-    if not enabled:
-        return _stage(False, "disabled", fallback=False, reason=reason or "disabled", details=details)
-    if bool(value.get("applied", False)):
-        return _stage(True, "success", fallback=False, reason="ok", details=details)
-    mode = str(value.get("mode") or "").strip().lower()
-    if mode in {"fallback_fused", "passthrough", "remote_failed"} or reason not in {"", "disabled", "not_available"}:
-        return _stage(True, "fallback", fallback=True, reason=reason, details=details)
-    return _stage(True, "unknown", fallback="unknown", reason=reason, details=details)
-
-
-def _context_expansion_stage(debug: Mapping[str, Any]) -> Dict[str, Any]:
-    context_expansion = debug.get("context_expansion") if isinstance(debug.get("context_expansion"), Mapping) else {}
-    context_budget = debug.get("context_budget")
-    if not isinstance(context_budget, Mapping):
-        context_pack = debug.get("context_pack") if isinstance(debug.get("context_pack"), Mapping) else {}
-        context_budget = context_pack.get("context_budget_debug") if isinstance(context_pack, Mapping) else None
-    details = {
-        "anchor_count": len(context_expansion.get("anchors") or []) if isinstance(context_expansion, Mapping) else 0,
-        "expansion_candidate_count": len(context_expansion.get("candidate_pool") or []) if isinstance(context_expansion, Mapping) else 0,
-    }
-    if not isinstance(context_budget, Mapping):
-        return _stage(details=details)
-    # 兼容两类 debug：检索层 context_budget 有 enabled/applied，PaperQA context_pack 只有最终预算统计。
-    has_expansion_budget_flags = "enabled" in context_budget or "applied" in context_budget or "fallback_reason" in context_budget
-    enabled = bool(context_budget.get("enabled", False)) if has_expansion_budget_flags else bool(context_budget)
-    used_chars = _safe_int(context_budget.get("used_context_chars") or context_budget.get("text_context_chars"), default=0)
-    max_chars = _safe_int(context_budget.get("max_context_chars"), default=0)
-    details.update(
-        {
-            "applied": bool(context_budget.get("applied", False)),
-            "used_context_chars": used_chars,
-            "max_context_chars": max_chars,
-            "within_budget": True if not max_chars else used_chars <= max_chars,
-            "final_context_count": len(context_budget.get("final_context_after_budget") or []) if isinstance(context_budget.get("final_context_after_budget"), list) else context_budget.get("source_count"),
-        }
-    )
-    if not has_expansion_budget_flags:
-        if details["within_budget"]:
-            return _stage(True, "success", fallback=False, reason="context_pack_within_budget", details=details)
-        return _stage(True, "partial", fallback=False, reason="context_pack_budget_exceeded", details=details)
-    if not enabled:
-        return _stage(False, "disabled", fallback=False, reason=str(context_budget.get("fallback_reason") or "disabled"), details=details)
-    if bool(context_budget.get("applied", False)):
-        if details["within_budget"]:
-            return _stage(True, "success", fallback=False, reason="context_budget_applied", details=details)
-        return _stage(True, "partial", fallback=False, reason="context_budget_exceeded", details=details)
-    return _stage(True, "fallback", fallback=True, reason=str(context_budget.get("fallback_reason") or "context_expansion_not_applied"), details=details)
-
-
 def _generation_stage(generation: Mapping[str, Any]) -> Dict[str, Any]:
+    """根据生成结果判断生成阶段：空答案 failed，模型声明证据不足 insufficient_evidence，否则 success。"""
     if not isinstance(generation, Mapping) or not generation:
         return _stage()
     answer = str(generation.get("answer") or "").strip()
@@ -515,15 +290,16 @@ def _generation_stage(generation: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _verification_stage(verification: Mapping[str, Any]) -> Dict[str, Any]:
+    """把引用校验结果映射为阶段状态：passed→success，warning→partial，其余原样透传。"""
     if not isinstance(verification, Mapping) or not verification:
         return _stage()
     status = str(verification.get("status") or "unknown").strip() or "unknown"
     details = {
         "status": status,
         "source_count": _safe_int(verification.get("source_count"), default=0),
-        "citation_count": len(verification.get("cited_source_ids") or []) if isinstance(verification.get("cited_source_ids"), list) else 0,
-        "missing_citation_count": len(verification.get("missing_cited_source_ids") or []) if isinstance(verification.get("missing_cited_source_ids"), list) else 0,
-        "unsupported_claim_count": len(verification.get("unsupported_claims") or []) if isinstance(verification.get("unsupported_claims"), list) else 0,
+        "citation_count": _list_length(verification.get("cited_source_ids")),
+        "missing_citation_count": _list_length(verification.get("missing_cited_source_ids")),
+        "unsupported_claim_count": _list_length(verification.get("unsupported_claims")),
         "guardrail_triggered": bool(verification.get("insufficient_evidence", False)),
         "warnings": list(verification.get("warnings") or []) if isinstance(verification.get("warnings"), list) else [],
     }
@@ -536,21 +312,34 @@ def _verification_stage(verification: Mapping[str, Any]) -> Dict[str, Any]:
     return _stage(True, status, fallback=False, reason=status or "verification_unknown", details=details)
 
 
-def _answer_insufficient_evidence(verification: Mapping[str, Any], generation: Mapping[str, Any], *, error_code: Optional[str]) -> str:
+def _answer_insufficient_evidence(verification: Mapping[str, Any], generation: Mapping[str, Any]) -> str:
+    """答案是否证据不足：yes / no / unknown（没有校验结果时无法判断）。"""
     if bool(generation.get("insufficient_evidence", False)) or bool(verification.get("insufficient_evidence", False)):
         return "yes"
     if verification:
         return "no"
-    if error_code:
-        return "unknown"
     return "unknown"
 
 
+def _answer_insufficient_evidence_reason(verification: Mapping[str, Any], generation: Mapping[str, Any], *, error_code: Optional[str]) -> str:
+    """与 _answer_insufficient_evidence 一一对应的原因字符串。"""
+    if bool(generation.get("insufficient_evidence", False)):
+        return "generation_declared_insufficient_evidence"
+    if bool(verification.get("insufficient_evidence", False)):
+        return "verification_guardrail_triggered"
+    if verification:
+        return "verification_checked_no_insufficient_evidence"
+    if error_code:
+        return f"unknown_due_to_error:{error_code}"
+    return "verification_not_available"
+
+
 def _answer_quality(stage_status: Mapping[str, Mapping[str, Any]], answer_insufficient: str, *, error_code: Optional[str]) -> str:
+    """答案质量分级：generation_failed > insufficient_evidence > grounded / warning > unknown。"""
     if error_code == "llm_generation_failed":
         return "generation_failed"
-    generation = stage_status.get("generation") if isinstance(stage_status, Mapping) else {}
-    verification = stage_status.get("verification") if isinstance(stage_status, Mapping) else {}
+    generation = stage_status.get("generation") or {}
+    verification = stage_status.get("verification") or {}
     if str(generation.get("status") or "") == "failed":
         return "generation_failed"
     if answer_insufficient == "yes" or str(verification.get("status") or "") == "insufficient_evidence":
@@ -564,8 +353,8 @@ def _answer_quality_reason(stage_status: Mapping[str, Mapping[str, Any]], answer
     """给顶层 answer_quality 补充稳定 reason，避免 Agent 反查阶段 map。"""
     if error_code == "llm_generation_failed":
         return "llm_generation_failed"
-    generation = stage_status.get("generation") if isinstance(stage_status, Mapping) else {}
-    verification = stage_status.get("verification") if isinstance(stage_status, Mapping) else {}
+    generation = stage_status.get("generation") or {}
+    verification = stage_status.get("verification") or {}
     if str(generation.get("status") or "") == "failed":
         return str(generation.get("reason") or "answer_empty")
     if answer_insufficient == "yes":
@@ -573,18 +362,6 @@ def _answer_quality_reason(stage_status: Mapping[str, Mapping[str, Any]], answer
     verification_status = str(verification.get("status") or "")
     if verification_status in {"success", "partial"}:
         return str(verification.get("reason") or verification_status)
-    return "verification_not_available"
-
-
-def _answer_insufficient_evidence_reason(verification: Mapping[str, Any], generation: Mapping[str, Any], *, error_code: Optional[str]) -> str:
-    if bool(generation.get("insufficient_evidence", False)):
-        return "generation_declared_insufficient_evidence"
-    if bool(verification.get("insufficient_evidence", False)):
-        return "verification_guardrail_triggered"
-    if verification:
-        return "verification_checked_no_insufficient_evidence"
-    if error_code:
-        return f"unknown_due_to_error:{error_code}"
     return "verification_not_available"
 
 
@@ -597,7 +374,7 @@ def _build_quality_signals(
     answer_quality: str,
     answer_quality_reason: str,
 ) -> Dict[str, Dict[str, Any]]:
-    """把散落阶段状态收束为 Agent 易消费的七段质量信号。"""
+    """把散落阶段状态收束为 Agent 易消费的质量信号。"""
     route_candidate_counts = {
         route_name: (route.get("details") or {}).get("candidate_count")
         for route_name, route in (route_status or {}).items()
@@ -608,7 +385,7 @@ def _build_quality_signals(
         for route_name, route in (route_status or {}).items()
         if isinstance(route, Mapping) and str(route.get("status") or "") == "success"
     ]
-    signals = {
+    return {
         "query_planning": _quality_signal_from_stage(stage_status.get("query_planning")),
         "retrieval": _stage(
             True,
@@ -627,202 +404,68 @@ def _build_quality_signals(
         "verification": _quality_signal_from_stage(stage_status.get("verification")),
         "answer": _stage(True, answer_quality, fallback=False, reason=answer_quality_reason),
     }
-    return signals
 
 
 def _quality_signal_from_stage(stage: Any) -> Dict[str, Any]:
+    """从阶段状态表取一项作为质量信号（浅拷贝）；缺失时返回 unknown 阶段。"""
     if isinstance(stage, Mapping):
         # 复制一份，避免调用方误改 retrieval_stage_status 的完整阶段对象。
         return dict(stage)
     return _stage()
 
 
-def _build_route_status(debug: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """按 route 记录候选是否真正产出，避免 Agent 只看到整体 retrieval_quality。"""
-    routes = debug.get("routes") if isinstance(debug.get("routes"), Mapping) else {}
-    route_status: Dict[str, Dict[str, Any]] = {}
-    for route_name in ROUTE_STAGE_NAMES:
-        metric = _route_metric(debug, route_name)
-        stage = _metric_stage(metric)
-        details = dict(stage.get("details") or {})
-        route_results = routes.get(route_name) if isinstance(routes, Mapping) else None
-        if isinstance(route_results, list):
-            details["debug_candidate_count"] = len(route_results)
-            if stage.get("status") == "unknown" and route_results:
-                stage = _stage(True, "success", fallback=False, reason=f"debug_candidates:{len(route_results)}", details=details)
-            else:
-                stage["details"] = details
-        route_status[route_name] = stage
-    return route_status
-
-
 def _degraded_stages(stage_status: Mapping[str, Mapping[str, Any]]) -> List[str]:
-    degraded: List[str] = []
-    for stage_name, stage in (stage_status or {}).items():
-        status = str(stage.get("status") or "")
-        if status in {"partial", "weak", "fallback", "failed", "insufficient_evidence"}:
-            degraded.append(stage_name)
-    return degraded
+    """列出状态为降级类（partial / weak / fallback / failed / insufficient_evidence）的阶段名。"""
+    return [
+        stage_name
+        for stage_name, stage in (stage_status or {}).items()
+        if str(stage.get("status") or "") in {"partial", "weak", "fallback", "failed", "insufficient_evidence"}
+    ]
 
 
-def _weak_source_reason(debug: Mapping[str, Any], sources: List[Dict[str, Any]], verification: Mapping[str, Any]) -> str:
-    if not sources:
-        return "citation_source_insufficient"
-    if len(sources) < 2:
+def _weak_source_reason(sources: List[Dict[str, Any]], verification: Mapping[str, Any]) -> str:
+    """只依据最终来源本身判断证据是否偏弱，返回首要原因；证据正常时返回 not_available。"""
+    if len(sources) < MIN_RETRIEVAL_SOURCE_COUNT:
         return "citation_source_insufficient"
     if bool(verification.get("missing_cited_source_ids")):
         return "citation_source_insufficient"
-    if _average_source_text_length(sources) < 80:
+    if _average_source_text_length(sources) < MIN_AVERAGE_SOURCE_TEXT_LENGTH:
         return "evidence_too_short"
-    preferred_sections = _preferred_sections(debug)
-    if preferred_sections and not _sources_match_sections(sources, preferred_sections):
-        return "section_mismatch"
-    if _context_noise_ratio(sources) >= 0.5:
+    if _context_noise_ratio(sources) >= NOISY_SOURCE_RATIO_THRESHOLD:
         return "context_noise_contamination"
     return "not_available"
 
 
 def _average_source_text_length(sources: List[Dict[str, Any]]) -> float:
-    lengths = []
-    for source in sources:
-        text = str(source.get("content") or source.get("text") or source.get("asset_summary") or "").strip()
-        if text:
-            lengths.append(len(text))
-    if not lengths:
-        return 0.0
-    return sum(lengths) / len(lengths)
-
-
-def _preferred_sections(debug: Mapping[str, Any]) -> List[str]:
-    query_profile = debug.get("query_profile")
-    if isinstance(query_profile, Mapping):
-        sections = query_profile.get("section_preferences")
-        if isinstance(sections, list):
-            return [str(item).strip().lower() for item in sections if str(item).strip()]
-    intent = debug.get("intent_profile") or debug.get("intent")
-    if isinstance(intent, Mapping):
-        sections = intent.get("preferred_sections")
-        if isinstance(sections, list):
-            return [str(item).strip().lower() for item in sections if str(item).strip()]
-    return []
-
-
-def _rewrite_query_count(debug: Mapping[str, Any]) -> int:
-    return len(_selected_rewrite_queries(debug.get("query_rewrite") or debug.get("rewritten_queries")))
-
-
-def _selected_rewrite_queries(value: Any) -> List[str]:
-    if isinstance(value, Mapping):
-        selected = value.get("selected_queries")
-        if not selected:
-            selected = value.get("model_queries")
-    else:
-        selected = value
-    if not isinstance(selected, Sequence) or isinstance(selected, (str, bytes)):
-        return []
-    return [str(item).strip() for item in selected if str(item).strip()]
-
-
-def _question_was_contextualized(debug: Mapping[str, Any]) -> bool:
-    original = str(debug.get("original_question") or debug.get("original_query") or "").strip()
-    contextualized = str(debug.get("contextualized_question") or "").strip()
-    return bool(original and contextualized and original != contextualized)
-
-
-def _section_distribution_details(debug: Mapping[str, Any], sources: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """汇总 top chunks 的 section 分布，给 fusion 质量判断提供可解释依据。"""
-    preferred_sections = _preferred_sections(debug)
-    section_labels = [_source_section_label(source) for source in sources]
-    section_counts = Counter(label for label in section_labels if label)
-    source_count = len(sources)
-    dominant_section, dominant_count = section_counts.most_common(1)[0] if section_counts else ("not_available", 0)
-    noisy_count = sum(
-        count
-        for section, count in section_counts.items()
-        if any(marker in section for marker in ("references", "bibliography", "appendix", "prompt"))
-    )
-    matched_sections = [
-        section
-        for section in section_counts
-        if any(preferred in section for preferred in preferred_sections)
+    """来源正文（或资产摘要）的平均字符数；全部为空时返回 0。"""
+    lengths = [
+        len(text)
+        for text in (str(source.get("content") or source.get("text") or source.get("asset_summary") or "").strip() for source in sources)
+        if text
     ]
-    return {
-        "preferred_sections": preferred_sections,
-        "section_counts": dict(section_counts),
-        "section_count": len(section_counts),
-        "dominant_section": dominant_section,
-        "dominant_section_ratio": round(dominant_count / max(1, source_count), 4),
-        "noisy_section_ratio": round(noisy_count / max(1, source_count), 4),
-        "matches_preferred_section": True if not preferred_sections else bool(matched_sections),
-        "matched_preferred_sections": matched_sections,
-    }
-
-
-def _source_section_label(source: Mapping[str, Any]) -> str:
-    section = str(source.get("section_path") or source.get("section_title") or "").strip().lower()
-    if section:
-        return section
-    chunk_type = str(source.get("chunk_type") or source.get("asset_kind") or "").strip().lower()
-    return chunk_type or "unknown"
-
-
-def _safe_int(value: Any, *, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _route_has_candidates(metric: Any) -> bool:
-    if not isinstance(metric, Mapping):
-        return False
-    if _safe_int(metric.get("candidate_count"), default=0) > 0:
-        return True
-    return bool(metric.get("applied", False)) and str(metric.get("status") or "").lower() == "ok"
-
-
-def _sources_match_sections(sources: List[Dict[str, Any]], preferred_sections: List[str]) -> bool:
-    for source in sources:
-        haystack = " ".join(
-            str(source.get(key) or "").lower()
-            for key in ("section_path", "section_title", "chunk_type", "asset_kind")
-        )
-        if any(section in haystack for section in preferred_sections):
-            return True
-    return False
+    return sum(lengths) / len(lengths) if lengths else 0.0
 
 
 def _context_noise_ratio(sources: List[Dict[str, Any]]) -> float:
+    """来源中落在参考文献 / 附录 / prompt 等噪声章节的比例。"""
     noisy = 0
     for source in sources:
         haystack = " ".join(str(source.get(key) or "").lower() for key in ("section_path", "section_title", "chunk_type"))
-        if any(marker in haystack for marker in ("references", "bibliography", "appendix", "prompt")):
+        if any(marker in haystack for marker in NOISY_SECTION_MARKERS):
             noisy += 1
     return noisy / max(1, len(sources))
 
 
-def _missing_evidence_type(debug: Mapping[str, Any], answer_insufficient: str, weak_source_reason: str) -> str:
+def _missing_evidence_type(answer_insufficient: str, weak_source_reason: str) -> str:
+    """缺失证据类型：证据正常时 not_available；否则在没有问题意图信息的情况下只能给出 unknown。"""
     if answer_insufficient != "yes" and weak_source_reason == "not_available":
         return "not_available"
-    main_intent = _main_intent(debug)
-    if main_intent in MISSING_EVIDENCE_BY_MAIN_INTENT:
-        return MISSING_EVIDENCE_BY_MAIN_INTENT[main_intent]
-    if weak_source_reason == "section_mismatch":
-        return "cross_paragraph_evidence"
     return "unknown"
 
 
-def _main_intent(debug: Mapping[str, Any]) -> str:
-    intent = debug.get("intent_profile") or debug.get("intent")
-    if isinstance(intent, Mapping):
-        value = str(intent.get("main_intent") or "").strip().lower()
-        if value:
-            return value
-    return ""
-
-
 def _rerank_failed_reason(stage_status: Mapping[str, Mapping[str, Any]]) -> str:
-    rerank = stage_status.get("rerank") if isinstance(stage_status, Mapping) else None
+    """rerank 阶段失败 / 降级 / 关闭时返回原因，否则 not_available。"""
+    rerank = stage_status.get("rerank")
     if not isinstance(rerank, Mapping):
         return "unknown"
     status = str(rerank.get("status") or "").strip()
@@ -839,64 +482,34 @@ def _retrieval_quality(
     answer_insufficient: str,
     weak_source_reason: str,
     error_code: Optional[str],
-) -> str:
-    if error_code:
-        return "failed"
-    if not sources:
-        return "failed"
-    if len(sources) < MIN_RETRIEVAL_SOURCE_COUNT:
-        return "weak"
-    if answer_insufficient == "yes":
-        return "weak"
-    if weak_source_reason != "not_available":
-        return "partial"
-    if any(str(stage.get("status") or "") == "failed" for stage in stage_status.values()):
-        return "partial"
-    if any(str(route.get("status") or "") == "failed" for route in route_status.values()):
-        return "partial"
-    if any(str(stage.get("status") or "") == "fallback" for stage in stage_status.values()):
-        return "partial"
-    if any(str(route.get("status") or "") == "fallback" for route in route_status.values()):
-        return "partial"
-    return "good"
+) -> tuple[str, str]:
+    """检索质量分级及其首要原因（同一组规则按优先级短路，保证等级与原因永远一致）。
 
-
-def _retrieval_quality_reason(
-    *,
-    stage_status: Mapping[str, Mapping[str, Any]],
-    route_status: Mapping[str, Mapping[str, Any]],
-    sources: List[Dict[str, Any]],
-    answer_insufficient: str,
-    weak_source_reason: str,
-    error_code: Optional[str],
-) -> str:
-    """和 retrieval_quality 使用同一组规则，返回可复盘的首要原因。"""
+    有 error_code 或无来源 → failed；来源过少或答案证据不足 → weak；
+    存在弱来源原因、任一阶段/路由 failed 或 fallback → partial；否则 good。
+    """
     if error_code:
-        return f"error_code:{error_code}"
+        return "failed", f"error_code:{error_code}"
     if not sources:
-        return "source_chunks_empty"
+        return "failed", "source_chunks_empty"
     if len(sources) < MIN_RETRIEVAL_SOURCE_COUNT:
-        return f"source_chunks_too_few:{len(sources)}"
+        return "weak", f"source_chunks_too_few:{len(sources)}"
     if answer_insufficient == "yes":
-        return "answer_insufficient_evidence"
+        return "weak", "answer_insufficient_evidence"
     if weak_source_reason != "not_available":
-        return weak_source_reason
-    failed_stage = _first_stage_with_status(stage_status, "failed")
-    if failed_stage:
-        return f"stage_failed:{failed_stage}"
-    failed_route = _first_stage_with_status(route_status, "failed")
-    if failed_route:
-        return f"route_failed:{failed_route}"
-    fallback_stage = _first_stage_with_status(stage_status, "fallback")
-    if fallback_stage:
-        return f"stage_fallback:{fallback_stage}"
-    fallback_route = _first_stage_with_status(route_status, "fallback")
-    if fallback_route:
-        return f"route_fallback:{fallback_route}"
-    return "retrieval_and_evidence_passed"
+        return "partial", weak_source_reason
+    for status in ("failed", "fallback"):
+        stage_name = _first_stage_with_status(stage_status, status)
+        if stage_name:
+            return "partial", f"stage_{status}:{stage_name}"
+        route_name = _first_stage_with_status(route_status, status)
+        if route_name:
+            return "partial", f"route_{status}:{route_name}"
+    return "good", "retrieval_and_evidence_passed"
 
 
 def _first_stage_with_status(items: Mapping[str, Mapping[str, Any]], status: str) -> str:
+    """返回第一个处于指定状态的阶段 / 路由名，没有则返回空串。"""
     for name, value in (items or {}).items():
         if isinstance(value, Mapping) and str(value.get("status") or "") == status:
             return str(name)
@@ -906,56 +519,43 @@ def _first_stage_with_status(items: Mapping[str, Mapping[str, Any]], status: str
 def _recommended_repair_actions(
     *,
     retrieval_quality: str,
-    stage_status: Mapping[str, Mapping[str, Any]],
     missing_evidence_type: str,
     weak_source_reason: str,
     rerank_failed_reason: str,
     error_code: Optional[str],
 ) -> List[str]:
+    """根据质量信号推荐 Agent 可执行的修复动作（顺序、去重和别名归一由 normalize_repair_actions 统一处理）。"""
     actions: List[str] = []
     if error_code == "qa_index_not_found":
         actions.append(ASK_USER_TO_REBUILD_INDEX)
     if retrieval_quality in {"failed", "weak", "partial"}:
         actions.append(RETRY_WITH_QUERY_REWRITE)
-    if missing_evidence_type in {"method_flow", "experiment_setup", "result_table", "cross_paragraph_evidence"} or weak_source_reason in {"citation_source_insufficient", "evidence_too_short"}:
+    if weak_source_reason in {"citation_source_insufficient", "evidence_too_short"}:
         actions.append(RETRY_WITH_EXPANDED_CONTEXT)
-    if missing_evidence_type == "method_flow" or weak_source_reason == "section_mismatch":
-        actions.append(RETRY_WITH_SECTION_FOCUS)
-    if missing_evidence_type in {"formula_derivation", "result_table"} or _keyword_emphasis_needed(stage_status):
-        actions.append(RETRY_WITH_KEYWORD_EMPHASIS)
-    if stage_status.get("hyde", {}).get("status") == "fallback" or (stage_status.get("hyde", {}).get("status") == "success" and retrieval_quality in {"weak", "partial"}):
-        actions.append(RETRY_WITHOUT_HYDE)
     if rerank_failed_reason not in {"not_available", "disabled", "unknown"}:
         actions.append(RETRY_WITH_QUERY_REWRITE)
     if missing_evidence_type == "unknown" and retrieval_quality in {"failed", "weak"}:
         actions.append(ASK_CLARIFICATION)
-    if not actions and retrieval_quality == "good":
-        return []
-    return normalize_repair_actions(_dedupe(actions))
-
-
-def _keyword_emphasis_needed(stage_status: Mapping[str, Mapping[str, Any]]) -> bool:
-    query_details = (stage_status.get("query_planning") or {}).get("details") if isinstance(stage_status, Mapping) else {}
-    main_intent = str((query_details or {}).get("main_intent") or "").strip().lower() if isinstance(query_details, Mapping) else ""
-    if main_intent in {"figure_table", "comparison", "result_analysis"}:
-        return True
-    preferred_sections = (query_details or {}).get("preferred_sections") if isinstance(query_details, Mapping) else []
-    return any(str(section).lower() in {"results", "experiments", "tables", "figures"} for section in (preferred_sections or []))
-
-
-def _dedupe(values: List[str]) -> List[str]:
-    seen = set()
-    result: List[str] = []
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            result.append(value)
-    return result
+    return normalize_repair_actions(actions)
 
 
 def _observation_reason(retrieval_quality: str, weak_source_reason: str, answer_quality_reason: str) -> str:
+    """没有显式 error_reason 时的总体说明。"""
     if retrieval_quality == "good":
         return answer_quality_reason or "retrieval_and_evidence_passed"
     if weak_source_reason != "not_available":
         return weak_source_reason
     return f"retrieval_quality_{retrieval_quality}"
+
+
+def _safe_int(value: Any, *, default: int = 0) -> int:
+    """宽松整数转换，失败返回 default。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _list_length(value: Any) -> int:
+    """value 为 list 时返回长度，否则 0。"""
+    return len(value) if isinstance(value, list) else 0

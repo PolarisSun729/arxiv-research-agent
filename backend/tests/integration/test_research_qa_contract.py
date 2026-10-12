@@ -104,6 +104,38 @@ def test_persistence_failure_is_not_an_abstention(qa_service, monkeypatch):
     assert record["outcome"] is None
 
 
+def test_failed_research_does_not_leave_empty_session(qa_service):
+    service, _ = qa_service
+
+    class FailingResearch:
+        def research_stream(self, request, **kwargs):
+            raise RuntimeError("research failed")
+            yield  # pragma: no cover - 让函数成为生成器
+
+    service.research_service = FailingResearch()
+    with pytest.raises(AppError):
+        service.answer_question("2310.11511", _payload())
+    sessions = service.session_service.paper_chat_session_store.list_paper_chat_sessions(
+        arxiv_id="2310.11511", user_id="evaluation-user", limit=5,
+    )
+    assert sessions == []
+
+
+def test_abstained_outcome_reports_insufficient_verification(qa_service, monkeypatch):
+    service, _ = qa_service
+    original_finalize = service._finalize_research_answer
+
+    def finalize_as_abstained(**kwargs):
+        kwargs["research_result"] = kwargs["research_result"].model_copy(update={"outcome": "abstained"})
+        return original_finalize(**kwargs)
+
+    monkeypatch.setattr(service, "_finalize_research_answer", finalize_as_abstained)
+    result = service.answer_question("2310.11511", _payload())
+    assert result["sources"]
+    assert result["verification_debug"]["status"] == "insufficient_evidence"
+    assert result["verification_debug"]["insufficient_evidence"] is True
+
+
 @pytest.mark.parametrize("outcome,status,decision", [
     ("completed", "passed", "finalize"),
     ("partial", "degraded", "finalize_with_degradation"),

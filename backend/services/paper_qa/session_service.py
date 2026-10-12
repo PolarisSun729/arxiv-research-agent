@@ -1,10 +1,16 @@
+"""论文 QA 会话服务：会话解析、短期记忆加载、会话摘要维护与问答 turn 持久化。
+
+设计要点：
+- 短期记忆以数据库会话为准（db_authoritative），请求体里的 conversation_context 只作兼容补充；
+- 会话摘要（summary）是较早历史的确定性压缩视图，只用于问题消歧和检索线索，不能当作回答证据；
+- 记忆相关能力全部是「增强」：加载或更新失败时降级为单轮 QA，但 turn 持久化失败必须显式报错。
+"""
+
 from __future__ import annotations
 
 import logging
 import re
 from typing import Any, Dict, List, Optional
-
-from fastapi import HTTPException
 
 from core.errors import AppError, ErrorCode
 from services.context_lifecycle import ContextLifecycleService
@@ -20,13 +26,14 @@ from utils.config import get_default_user_id
 
 logger = logging.getLogger(__name__)
 
-MAX_CONVERSATION_TURNS = 5
-MAX_CONTEXT_ANSWER_CHARS = 280
-MAX_CONTEXT_SOURCE_CHARS = 180
-MAX_CONTEXT_SOURCES_PER_TURN = 3
-MAX_REFERENCED_SOURCE_IDS = 8
-MAX_SESSION_SUMMARY_CHARS = 1600
-MAX_SUMMARY_ITEMS = 8
+# ---- 短期记忆与会话摘要的规模上限（运行时配置缺省时使用） ----
+MAX_CONVERSATION_TURNS = 5  # 参与消歧的最近 turn 数
+MAX_CONTEXT_ANSWER_CHARS = 280  # 每个历史 turn 的答案摘要长度
+MAX_CONTEXT_SOURCE_CHARS = 180  # 每条历史来源的内容摘要长度
+MAX_CONTEXT_SOURCES_PER_TURN = 3  # 每个历史 turn 最多保留的来源数
+MAX_REFERENCED_SOURCE_IDS = 8  # 消歧结果中最多引用的 source_id 数
+MAX_SESSION_SUMMARY_CHARS = 1600  # 会话摘要渲染成文本后的总长度上限
+MAX_SUMMARY_ITEMS = 8  # 会话摘要中每个列表字段最多保留的条目数
 
 
 class PaperQASessionService:
@@ -89,21 +96,19 @@ class PaperQASessionService:
         user_id = self.resolve_user_id(self.payload_get(payload, "user_id"))
         try:
             profile = self.research_profile_store.get_user_research_profile(user_id=user_id)
-        except Exception:
+        except Exception as exc:
+            # 回答风格只是体验增强，读取画像失败时降级为无偏好，但要留下日志便于排查。
+            logger.warning("Load research profile for answer style failed: user_id=%s error=%s", user_id, exc)
             profile = {}
         return str((profile or {}).get("preferred_answer_style") or "").strip()
 
-    @staticmethod
-    def apply_answer_style_to_question(question: str, preferred_answer_style: str) -> str:
-        """把用户偏好的回答风格附加到问题提示中，但保持事实必须受证据约束。"""
-        style = str(preferred_answer_style or "").strip()
-        normalized_question = str(question or "").strip()
-        if not style:
-            return normalized_question
-        return f"请使用{style}风格回答，但事实必须严格基于本轮检索到的论文证据。问题：{normalized_question}"
+    def resolve_chat_session(self, arxiv_id: str, payload: Any, *, create_if_missing: bool = True) -> Dict[str, Any]:
+        """解析或创建论文问答会话，优先复用当前论文下的活动会话。
 
-    def resolve_chat_session(self, arxiv_id: str, payload: Any) -> Dict[str, Any]:
-        """解析或创建论文问答会话，优先复用当前论文下的活动会话。"""
+        解析顺序：显式 session_id（须属于当前用户且是同一篇论文）→ 最近 5 个会话中的 active 会话
+        → 最近一个会话 → 新建会话。任何一步失败都返回 {}，表示本轮以无状态（stateless）方式问答。
+        create_if_missing=False 时只复用已有会话、不新建（问答主流程用它避免失败请求留下空会话）。
+        """
         if not bool(self.memory_flag("enable_paper_chat_session", True)):
             return {}
         user_id = self.resolve_user_id(self.payload_get(payload, "user_id"))
@@ -122,6 +127,8 @@ class PaperQASessionService:
                     return recent_session
             if recent_sessions:
                 return recent_sessions[0]
+            if not create_if_missing:
+                return {}
 
             # 没有可复用会话时，按当前问题摘要创建一个新的论文对话会话。
             session_title = self.truncate_text(str(self.payload_get(payload, "question", "") or "").strip(), 80)
@@ -131,14 +138,24 @@ class PaperQASessionService:
                 title=session_title,
             )
             if not created_session:
-                raise HTTPException(status_code=500, detail="Failed to create paper chat session")
+                # 原实现在这里抛 HTTPException 又被下方 except 立即吞掉，等价于直接降级；
+                # 服务层也不应依赖 fastapi 的 HTTP 异常，因此改为显式记录并降级。
+                logger.warning("Create paper chat session returned empty result, fallback to stateless QA: arxiv_id=%s", arxiv_id)
+                return {}
             return created_session
         except Exception as exc:
             logger.warning("Chat session resolution failed, fallback to stateless QA: %s", exc)
             return {}
 
     def load_conversation_state(self, *, arxiv_id: str, payload: Any, chat_session: Dict[str, Any]) -> Dict[str, Any]:
-        """加载并合并 DB 与请求体里的短期记忆，失败时显式降级为单轮 QA。"""
+        """加载并合并 DB 与请求体里的短期记忆，失败时显式降级为单轮 QA。
+
+        返回值：
+        - conversation_context：会话摘要伪 turn + 最近 turn，供问题消歧使用；
+        - recent_conversation_context：仅最近 turn（不含摘要），供生成阶段的会话快照使用；
+        - session_summary：结构化会话摘要（可能为 None）；
+        - short_term_debug：记忆加载/合并过程的完整 debug，会随 retrieval_debug 一起落库（压缩后）。
+        """
         user_id = self.resolve_user_id(self.payload_get(payload, "user_id"))
         requested_session_id = str(self.payload_get(payload, "session_id", "") or "").strip() or None
         max_turns = max(1, int(self.memory_flag("short_term_memory_max_turns", MAX_CONVERSATION_TURNS)))
@@ -214,6 +231,7 @@ class PaperQASessionService:
         else:
             short_term_debug["reason"] = "disabled by runtime config"
 
+        # 摘要与短期记忆开关无关：即使短期记忆被禁用，只要会话里已有摘要仍会作为伪 turn 参与消歧。
         summary_state = self.build_session_summary_state(chat_session, recent_turns=conversation_context)
         combined_context = self.combine_summary_and_recent_turns(summary_state, conversation_context)
         short_term_debug["summary"] = summary_state["debug"]
@@ -341,7 +359,12 @@ class PaperQASessionService:
         contextualized_question: str,
         question_contextualization: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """把一次完整问答轮次作为原子业务单元写入会话消息表。"""
+        """把一次完整问答轮次作为原子业务单元写入会话消息表。
+
+        - 会话功能关闭或本轮是无状态会话（没有 session_id）时直接跳过，返回空 turn_id；
+        - turn 写入失败一律转换为 DATABASE_WRITE_FAILED 的 AppError 抛出，调用方据此告知前端「本轮未保存」；
+        - 会话摘要更新在 turn 写入成功后进行，失败只记录在 session_summary_update 中，不影响本轮结果。
+        """
         session_id = str(chat_session.get("session_id", "") or "").strip()
         user_id = self.resolve_user_id(chat_session.get("user_id"))
         if not bool(self.memory_flag("enable_paper_chat_session", True)) or not session_id:
@@ -371,6 +394,8 @@ class PaperQASessionService:
                     detail="paper qa turn append returned empty result",
                     context={"session_id": session_id, "user_id": user_id, "stage": "persist_completed_turn"},
                 )
+            # 用写入后刷新的会话记录做摘要合并，确保拿到的是最新 summary / summary_turn_count。
+            # 注意：摘要更新是「读-改-写」，同一会话并发提问时后写者会覆盖先写者的摘要增量。
             summary_update = self.update_session_summary_after_turn(
                 chat_session=persisted_turn.get("refreshed_session") or persisted_turn.get("chat_session") or chat_session,
                 turn_id=str(persisted_turn.get("turn_id") or ""),
@@ -488,6 +513,11 @@ class PaperQASessionService:
         return self.compact_session_summary(summary)
 
     def extract_user_preferences(self, question: str) -> List[str]:
+        """用关键词规则从问题中识别用户偏好（排除/关注/风格三类），命中时把整句问题作为偏好记录。
+
+        这是低成本启发式：例如英文 "only"、"detail" 在普通问题里也很常见，可能产生误判，
+        因此结果只进入会话摘要的 user_preferences，不直接改变回答策略。
+        """
         text = str(question or "").strip()
         lowered = text.lower()
         preferences: List[str] = []
@@ -500,6 +530,7 @@ class PaperQASessionService:
         return preferences
 
     def merge_summary_source_clues(self, existing: Any, source_payload: List[Dict[str, Any]], *, turn_id: str) -> List[Dict[str, Any]]:
+        """把本轮前 N 条来源追加为摘要来源线索：按 source_id 去重，只保留最近 MAX_SUMMARY_ITEMS 条。"""
         clues: List[Dict[str, Any]] = [dict(item) for item in list(existing or []) if isinstance(item, dict)]
         seen = {str(item.get("source_id") or item.get("chunk_id") or "").strip() for item in clues}
         for source in list(source_payload or [])[:MAX_CONTEXT_SOURCES_PER_TURN]:
@@ -522,6 +553,7 @@ class PaperQASessionService:
         return clues[-MAX_SUMMARY_ITEMS:]
 
     def compact_session_summary(self, summary: Dict[str, Any]) -> Dict[str, Any]:
+        """裁剪摘要各字段的条目数与单条长度；整体仍超长时再把事实和进展各砍到最近一半。"""
         compacted = {
             "topic": self.truncate_text(summary.get("topic"), 240),
             "confirmed_facts": self._trim_summary_list(summary.get("confirmed_facts"), 360),
@@ -536,9 +568,11 @@ class PaperQASessionService:
         return compacted
 
     def _append_unique_summary_item(self, existing: Any, item: str) -> List[str]:
+        """追加单条摘要条目（去重 + 保留最近 MAX_SUMMARY_ITEMS 条）。"""
         return self._merge_unique_summary_items(existing, [item])
 
     def _merge_unique_summary_items(self, existing: Any, new_items: List[str]) -> List[str]:
+        """按出现顺序合并去重，超出上限时丢弃最旧的条目。"""
         merged = [str(item).strip() for item in list(existing or []) if str(item).strip()]
         for item in new_items:
             normalized = str(item or "").strip()
@@ -547,6 +581,7 @@ class PaperQASessionService:
         return merged[-MAX_SUMMARY_ITEMS:]
 
     def _trim_summary_list(self, value: Any, max_chars: int) -> List[str]:
+        """截断每条文本长度并只保留最近 MAX_SUMMARY_ITEMS 条。"""
         return [self.truncate_text(item, max_chars) for item in list(value or []) if str(item).strip()][-MAX_SUMMARY_ITEMS:]
 
     def normalize_conversation_context(self, raw_context: Any) -> List[Dict[str, Any]]:
@@ -569,7 +604,11 @@ class PaperQASessionService:
                 max_chars,
             )
             sources: List[Dict[str, Any]] = []
-            for item in raw_turn.get("sources", [])[:MAX_CONTEXT_SOURCES_PER_TURN]:
+            # 旧客户端可能传 "sources": null 或非列表值；不能让一条脏数据导致整段短期记忆加载失败。
+            raw_sources = raw_turn.get("sources")
+            if not isinstance(raw_sources, list):
+                raw_sources = []
+            for item in raw_sources[:MAX_CONTEXT_SOURCES_PER_TURN]:
                 normalized_source = self._normalize_context_source(item)
                 if normalized_source:
                     sources.append(normalized_source)
@@ -617,15 +656,7 @@ class PaperQASessionService:
                 MAX_CONTEXT_SOURCE_CHARS,
             ),
         }
-        if not any(normalized.values()):
+        # chunk_type \u603b\u6709\u9ed8\u8ba4\u503c "text"\uff0c\u4e0d\u80fd\u53c2\u4e0e\u300c\u662f\u5426\u4e3a\u7a7a\u6765\u6e90\u300d\u7684\u5224\u65ad\uff0c\u5426\u5219\u7a7a dict \u4e5f\u4f1a\u88ab\u5f53\u4f5c\u6709\u6548\u6765\u6e90\u3002
+        if not any(normalized[key] for key in ("source_id", "page_number", "section_path", "content")):
             return None
         return normalized
-
-    @staticmethod
-    def _memory_query_keywords(question: str) -> List[str]:
-        tokens = re.findall(r"[a-z0-9][a-z0-9_\-]{1,}|[\u4e00-\u9fff]{2,}", str(question or "").lower())
-        seen: List[str] = []
-        for token in tokens:
-            if token not in seen:
-                seen.append(token)
-        return seen[:10]

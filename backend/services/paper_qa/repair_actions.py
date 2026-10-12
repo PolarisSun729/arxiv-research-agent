@@ -1,7 +1,15 @@
+"""Paper QA 受控修复动作（repair action）协议。
+
+质量观察（qa_observation）给出推荐动作后，Agent 的恢复策略只能从这里登记的动作中选择；
+每个动作声明了适用条件、执行参数、最大尝试次数和兜底策略，避免修复逻辑在各层自由发挥。
+本模块只做纯数据映射，不执行任何检索或生成。
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping
 
+# ---- 受控动作名（对外协议值，修改会影响 Agent trace 与前端展示） ----
 RETRY_WITH_QUERY_REWRITE = "retry_with_query_rewrite"
 RETRY_WITH_SECTION_FOCUS = "retry_with_section_focus"
 RETRY_WITH_EXPANDED_CONTEXT = "retry_with_expanded_context"
@@ -10,6 +18,8 @@ RETRY_WITH_KEYWORD_EMPHASIS = "retry_with_keyword_emphasis"
 ASK_USER_TO_REBUILD_INDEX = "ask_user_to_rebuild_index"
 ASK_CLARIFICATION = "ask_clarification"
 
+# 多个动作同时命中时的稳定输出顺序：先处理「必须用户介入」的索引问题，再做代价较低的检索重试，
+# 澄清问题放在最后，作为所有自动修复都无效时的退路。
 PAPER_QA_REPAIR_ACTION_ORDER = (
     ASK_USER_TO_REBUILD_INDEX,
     RETRY_WITH_SECTION_FOCUS,
@@ -20,6 +30,11 @@ PAPER_QA_REPAIR_ACTION_ORDER = (
     ASK_CLARIFICATION,
 )
 
+# 动作规格表：
+# - applicable_conditions：仅用于 trace 解释「为什么选它」，格式为 "<信号>:<取值>"，不参与程序判断；
+# - input_params：重试时下发给工具层的参数，top_k_min 在合并时取最大值；
+# - max_attempts：单个动作允许的最大尝试次数；
+# - fallback：重试仍失败时的兜底回答策略名。
 PAPER_QA_REPAIR_ACTIONS: Dict[str, Dict[str, Any]] = {
     RETRY_WITH_QUERY_REWRITE: {
         "applicable_conditions": ["retrieval_quality:failed", "retrieval_quality:weak", "rewrite_query_count:0"],
@@ -65,6 +80,7 @@ PAPER_QA_REPAIR_ACTIONS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# 历史版本使用过的动作名 → 当前协议名；仅用于兼容旧 checkpoint / trace 中残留的动作。
 _LEGACY_REPAIR_ACTION_ALIASES = {
     "retry_with_rewrite": RETRY_WITH_QUERY_REWRITE,
     "expand_context": RETRY_WITH_EXPANDED_CONTEXT,
@@ -84,6 +100,7 @@ def normalize_repair_action(value: Any) -> str:
 
 
 def normalize_repair_actions(values: Iterable[Any]) -> List[str]:
+    """批量归一化：丢弃未知动作、去重，并按 PAPER_QA_REPAIR_ACTION_ORDER 排序输出。"""
     seen = set()
     result: List[str] = []
     for value in values or []:
@@ -91,6 +108,7 @@ def normalize_repair_actions(values: Iterable[Any]) -> List[str]:
         if action and action not in seen:
             seen.add(action)
             result.append(action)
+    # 经过 normalize_repair_action 后动作一定在规格表中；999 只是防御新增动作忘记登记顺序时排到末尾。
     return sorted(result, key=lambda item: PAPER_QA_REPAIR_ACTION_ORDER.index(item) if item in PAPER_QA_REPAIR_ACTION_ORDER else 999)
 
 
@@ -116,6 +134,7 @@ def repair_action_input_params(actions: Iterable[Any]) -> Dict[str, Any]:
     params: Dict[str, Any] = {}
     for detail in describe_repair_actions(actions):
         action_params = dict(detail.get("input_params") or {})
+        # top_k_min 取各动作中的最大值；其余参数按动作顺序覆盖（当前各动作之间没有互相冲突的布尔开关）。
         top_k_min = action_params.pop("top_k_min", None)
         if top_k_min is not None:
             params["top_k_min"] = max(int(params.get("top_k_min") or 0), int(top_k_min))
@@ -139,6 +158,7 @@ def build_repair_strategy_payload(
         "input_params": repair_action_input_params(normalized_actions),
         "reason": reason or "paper_qa_repair",
         "max_attempts": max((int(item.get("max_attempts") or 1) for item in action_details), default=1),
+        # 兜底策略取排序后第一个动作的 fallback，即优先级最高的动作决定最终兜底方式。
         "fallback": next((str(item.get("fallback") or "") for item in action_details if item.get("fallback")), "fallback_answer"),
         "observation": dict(observation or {}),
     }

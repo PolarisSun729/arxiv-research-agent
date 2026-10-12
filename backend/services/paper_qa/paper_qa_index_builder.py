@@ -1,3 +1,15 @@
+"""单篇论文 QA 索引的版本化构建器。
+
+一次 build_qa_index 的阶段顺序（每个阶段前后都会把进度写入 build 记录，便于崩溃后追踪）：
+  校验加载方式 → 创建 build 版本 → 加载论文元数据 → 下载 PDF → 解析 PDF → 切块 → 结构化表格
+  → 保存 chunk 文件 → 生成 sparse(BM25) artifact → rerank 压缩文本 → 构建 retrieval index
+  → 保存 retrieval index artifact → 生成 embedding → 保存 embedding 文件 → 写入 Milvus
+  → 校验新 collection → 校验 sparse artifact → 原子激活新版本
+
+版本化原则：新版本构建期间旧 active 版本持续对外服务；只有全部产物校验通过后才在 SQLite 中
+原子切换 active 指针。任何阶段失败，新产物都会被标记为 cleanup_pending 等待清理，不影响旧版本。
+"""
+
 from __future__ import annotations
 
 import json
@@ -48,6 +60,10 @@ from utils.logging_utils import info_event
 
 logger = logging.getLogger(__name__)
 
+# 未指定 PDF 加载方式时的默认值（与路由层、IndexJobManager 保持一致）。
+DEFAULT_LOADING_METHOD = "docling"
+
+# 失败阶段 → 错误码的映射（见 _error_code_for_stage）；未列出的阶段统一归为 QA_INDEX_BUILD_FAILED。
 VECTOR_STORE_STAGES = {"index_embeddings_to_vector_store", "validate_new_collection", "cleanup_old_artifacts"}
 DATABASE_WRITE_STAGES = {
     "create_build_version",
@@ -56,6 +72,7 @@ DATABASE_WRITE_STAGES = {
     "activate_index",
 }
 
+# 允许随阶段进度写入 build 记录的产物字段白名单，防止把任意 kwargs 透传进数据库。
 QA_INDEX_ARTIFACT_FIELDS = {
     "pdf_path",
     "chunk_file",
@@ -82,6 +99,8 @@ QA_INDEX_ARTIFACT_FIELDS = {
 
 
 class PaperQAIndexBuilder:
+    """论文 QA 索引构建器：负责产物生成、版本激活、失败记录与旧版本 artifact 清理。"""
+
     def __init__(
         self,
         *,
@@ -110,6 +129,7 @@ class PaperQAIndexBuilder:
         self.retrieval_runtime_config = get_enhanced_retrieval_runtime_config()
         self.build_cache = get_paper_qa_build_cache()
         cache_config = getattr(self.build_cache, "config", {}) or {}
+        # 建库阶段 LLM 调用（rerank 压缩、生成式检索索引）的并发度，默认串行。
         self.llm_max_workers = max(1, int(cache_config.get("llm_max_workers") or 1))
 
     @staticmethod
@@ -127,33 +147,15 @@ class PaperQAIndexBuilder:
         return sorted(str(index_type) for index_type in type_counts if str(index_type).strip())
 
     def validate_loading_method(self, loading_method: str) -> str:
-        """校验并规范化 PDF 加载方式，只允许当前支持的方法。"""
-        normalized_method = str(loading_method or "pymupdf").strip().lower()
+        """校验并规范化 PDF 加载方式，只允许当前支持的方法；空值回退为 DEFAULT_LOADING_METHOD。
+
+        旧实现空值回退为 pymupdf，与 build_qa_index / 路由层 / IndexJobManager 的默认值 docling 不一致，
+        现统一为同一个常量。
+        """
+        normalized_method = str(loading_method or DEFAULT_LOADING_METHOD).strip().lower()
         if normalized_method not in {"pymupdf", "docling"}:
             raise HTTPException(status_code=400, detail="loading_method must be either pymupdf or docling")
         return normalized_method
-
-    def mark_index_processing(self, arxiv_id: str, *, loading_method: str) -> None:
-        """把论文索引状态标记为处理中，供外部轮询和后台任务联动使用。"""
-        created = self.paper_qa_index_store.insert_paper_qa_index(
-            arxiv_id,
-            collection_name="",
-            status="processing",
-            chunk_count=0,
-            embedding_model="",
-            pdf_path="",
-            chunk_file="",
-            embedding_file="",
-            loading_method=loading_method,
-            chunking_strategy="",
-            current_stage="mark_index_processing",
-            failed_stage="",
-            error_message="",
-            artifact_status="active",
-            indexed_at=None,
-        )
-        if not created:
-            raise RuntimeError("Failed to mark QA index as processing")
 
     def mark_build_processing(self, build_id: str, *, loading_method: str) -> None:
         """把本次版本化构建标记为 building；active 指针保持不变，旧索引仍可服务问答。"""
@@ -174,6 +176,10 @@ class PaperQAIndexBuilder:
         return Path(__file__).resolve().parents[2]
 
     def _safe_delete_file(self, file_path: Any) -> bool:
+        """删除单个 artifact 文件：相对路径以 backend 为基准，且解析后必须位于 backend 目录内。
+
+        返回 True 表示确实删除；路径为空/越界/不存在/不是文件时返回 False；删除时的 IO 异常会继续抛出。
+        """
         path_text = str(file_path or "").strip()
         if not path_text:
             return False
@@ -198,6 +204,7 @@ class PaperQAIndexBuilder:
             raise
 
     def _safe_delete_directory(self, dir_path: Any) -> bool:
+        """递归删除 artifact 目录，安全边界与 _safe_delete_file 相同（两者的路径校验逻辑重复，可后续抽公共函数）。"""
         path_text = str(dir_path or "").strip()
         if not path_text:
             return False
@@ -223,6 +230,7 @@ class PaperQAIndexBuilder:
             raise
 
     def _resolve_cleanup_path(self, path_text: Any) -> Optional[Path]:
+        """把 artifact 路径解析为绝对路径（相对路径以 backend 为基准），用于 active 产物保护比较。"""
         raw_text = str(path_text or "").strip()
         if not raw_text:
             return None
@@ -235,6 +243,10 @@ class PaperQAIndexBuilder:
             return None
 
     def _active_artifact_guard(self, arxiv_id: str, *, allow_active: bool) -> Dict[str, Any]:
+        """收集当前 active build 的 build_id、collection 和文件路径，清理旧版本时据此跳过 active 产物。
+
+        allow_active=True（用户显式删除索引）时返回空保护集合。
+        """
         if allow_active:
             return {"build_id": "", "collection_name": "", "paths": []}
         active = self.paper_qa_index_store.get_active_paper_qa_index_build(arxiv_id) or {}
@@ -250,6 +262,7 @@ class PaperQAIndexBuilder:
         }
 
     def _is_active_artifact_path(self, path_text: Any, active_guard: Dict[str, Any]) -> bool:
+        """判断待清理路径是否与 active 产物重合、是其父目录或位于其目录之下。"""
         candidate = self._resolve_cleanup_path(path_text)
         if candidate is None:
             return False
@@ -334,7 +347,12 @@ class PaperQAIndexBuilder:
         build_id: Optional[str] = None,
         **artifacts: Any,
     ) -> None:
-        # 每个关键阶段都同步数据库状态，避免进程在文件/向量库写入后崩溃却没有可追踪记录。
+        """记录当前构建阶段与已产生的 artifact。
+
+        每个关键阶段都同步数据库状态，避免进程在文件/向量库写入后崩溃却没有可追踪记录。
+        有 build_id 时写版本表（主流程总是如此）；无 build_id 的分支是旧的单版本模式，
+        主流程已不会走到，仅为兼容保留。
+        """
         payload = {
             "status": "building" if status == "processing" else status,
             "current_stage": current_stage,
@@ -438,7 +456,13 @@ class PaperQAIndexBuilder:
         progress: int,
         message: str,
     ) -> None:
-        """安全触发进度回调，避免回调异常打断主建索引流程。"""
+        """安全触发进度回调，避免回调异常打断主建索引流程；只有显式的中止请求会向上抛出。
+
+        回调抛出带 ``abort_build = True`` 属性的异常（如 IndexJobManager 在 lease 丢失时抛的
+        IndexBuildCancelledError）表示调用方要求中止建库：它会穿透到下方失败分支，
+        把本次 build 标记为 build_failed + cleanup_pending，避免新旧两个 attempt 同时激活。
+        用属性而不是异常类型判断，是为了不让 builder 反向依赖 job manager 模块。
+        """
         if progress_callback is None:
             return
         try:
@@ -448,6 +472,8 @@ class PaperQAIndexBuilder:
                 message=message,
             )
         except Exception as exc:
+            if getattr(exc, "abort_build", False):
+                raise
             logger.warning(
                 "Progress callback failed at stage=%s progress=%s: %s",
                 current_stage,
@@ -528,7 +554,7 @@ class PaperQAIndexBuilder:
     def _fetch_and_store_paper_metadata(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
         """从 arXiv 接口回源获取论文元数据，并在成功时写回主数据库。"""
         try:
-            search_service = ArxivSearchService()
+            search_service = self._arxiv_search_service()
             search_result = search_service.search(id_list=[arxiv_id], max_results=1)
             papers = list(search_result.get("papers") or [])
             paper = papers[0] if papers else None
@@ -552,6 +578,19 @@ class PaperQAIndexBuilder:
         except Exception as exc:
             logger.exception("Failed to fetch arXiv metadata for %s: %s", arxiv_id, exc)
             return None
+
+    def _arxiv_search_service(self) -> Any:
+        """获取用于元数据回源的 arXiv 搜索服务，优先复用注入的 arxiv_service_factory。
+
+        生产环境注入的是带代理配置的 ArxivSearchService(proxy_url=...)；旧实现直接 new 一个
+        不带代理的实例，在需要代理的网络下元数据回源会失败。注入对象没有 search 方法时
+        （例如只负责下载 PDF 的替身）才退回默认实例。
+        """
+        if self.arxiv_service_factory is not None:
+            service = self.arxiv_service_factory()
+            if callable(getattr(service, "search", None)):
+                return service
+        return ArxivSearchService()
 
     def download_pdf(self, arxiv_id: str) -> str:
         """下载指定论文的 PDF 文件，并返回本地保存路径。"""
@@ -661,6 +700,11 @@ class PaperQAIndexBuilder:
         chunking_strategy: str,
         index_version: Optional[str] = None,
     ) -> str:
+        """保存 chunk 文件（JSON），文件名带 index_version 以免不同版本互相覆盖。
+
+        注意：这里调用的是模块级函数 build_retrieval_indexes（纯规则索引，仅作调试产物），
+        与本类同名方法 self.build_retrieval_indexes（含 LLM 生成式索引，真正用于 embedding）不是同一个东西。
+        """
         filename = f"{arxiv_id}_{index_version}.pdf" if index_version else f"{arxiv_id}.pdf"
         retrieval_indexes = build_retrieval_indexes(chunks)
         document_for_save = dict(document or {})
@@ -679,6 +723,11 @@ class PaperQAIndexBuilder:
         return chunk_file
 
     def compress_chunks_for_rerank(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """为每个 chunk 生成供 rerank 使用的压缩文本（rerank_text），优先命中建库缓存。
+
+        单个 chunk 的 LLM 调用失败会直接抛出并终止本次建库（没有逐 chunk 降级）。
+        返回新的 chunk 列表，顺序与输入一致，不修改入参。
+        """
         logger.debug(
             "Compressing chunk text for rerank with Qwen: chunk_count=%s max_workers=%s cache_enabled=%s",
             len(chunks),
@@ -687,6 +736,7 @@ class PaperQAIndexBuilder:
         )
 
         def compress_with_service(chunk: Dict[str, Any], raw_content: str, metadata: Dict[str, Any]) -> str:
+            """调用生成服务压缩单个 chunk：优先单条接口，退而求其次用批量接口包一层。"""
             single_compressor = getattr(self.generation_service, "compress_chunk_for_rerank", None)
             if callable(single_compressor):
                 return single_compressor(
@@ -727,6 +777,7 @@ class PaperQAIndexBuilder:
 
             metadata["rerank_text"] = rerank_text
             metadata["rerank_text_model"] = QWEN_RERANK_COMPRESS_MODEL_NAME
+            # 缓存命中时这里记录的是「本次建库时间」而非文本实际生成时间，需结合 rerank_text_cache_hit 解读。
             metadata["rerank_text_generated_at"] = datetime.now().isoformat()
             metadata["rerank_text_cache_hit"] = cache_hit
             updated_chunk["metadata"] = metadata
@@ -739,6 +790,7 @@ class PaperQAIndexBuilder:
             with ThreadPoolExecutor(max_workers=self.llm_max_workers, thread_name_prefix="qa-rerank-compress") as executor:
                 compressed_pairs = list(executor.map(lambda item: compress_one(item[0], item[1]), enumerate(chunks)))
 
+        # executor.map 本身保序，这里按 position 再排一次是为了不依赖该实现细节。
         compressed_chunks = [chunk for _, chunk in sorted(compressed_pairs, key=lambda item: item[0])]
         logger.debug("Generated rerank_text for %d chunks", len(compressed_chunks))
         return compressed_chunks
@@ -770,6 +822,7 @@ class PaperQAIndexBuilder:
         return retrieval_indexes, retrieval_index_debug
 
     def _retrieval_index_generation_model_name(self) -> str:
+        """解析生成式检索索引实际使用的模型名，用于缓存 key 隔离（换模型后不复用旧结果）。"""
         resolver = getattr(self.generation_service, "_resolve_qwen_model_selection", None)
         if not callable(resolver):
             return "retrieval_index_generation"
@@ -817,6 +870,8 @@ class PaperQAIndexBuilder:
         """基于 chunk file 生成 chunk-level sparse index，作为第一版低风险 BM25 构建产物。"""
         sparse_rows = self._load_sparse_source_chunks(chunk_file, fallback_chunks=chunks)
 
+        # 复用线上检索的 CollectionRetrievalIndexProvider 来构建 BM25 索引，保证建库与查询使用同一套
+        # chunk 规范化和分词规则；这里用一个只读内存替身冒充向量库，让 provider 从 chunk 文件行构建索引。
         class _SparseBuildVectorStore:
             def __init__(self, rows: List[Dict[str, Any]]) -> None:
                 self.rows = [dict(row) for row in rows]
@@ -882,19 +937,37 @@ class PaperQAIndexBuilder:
         return artifact
 
     @staticmethod
-    def _compute_sparse_source_hash(chunk_file: str, sparse_rows: List[Dict[str, Any]]) -> str:
-        resolved = Path(str(chunk_file or "").strip())
+    def _resolve_existing_chunk_file(chunk_file: str) -> Optional[Path]:
+        """按「原样 → 当前工作目录 → backend 目录 → 仓库根目录」的顺序查找真实存在的 chunk 文件。
+
+        原实现只尝试了当前工作目录和仓库根目录（parents[3]），漏掉了 artifact 实际所在的 backend 目录
+        （parents[2]，与 _workspace_root 一致）；后端不从 backend 目录启动时会找不到文件，
+        进而静默退回内存 chunk，导致 sparse 索引的 source_hash 不再对应真实文件。
+        """
+        text = str(chunk_file or "").strip()
+        if not text:
+            return None
+        resolved = Path(text)
         candidates = [resolved]
         if not resolved.is_absolute():
-            workspace_root = Path(__file__).resolve().parents[3]
-            candidates.extend([Path.cwd() / resolved, workspace_root / resolved])
+            module_path = Path(__file__).resolve()
+            backend_root, repo_root = module_path.parents[2], module_path.parents[3]
+            candidates.extend([Path.cwd() / resolved, backend_root / resolved, repo_root / resolved])
         for candidate in candidates:
             try:
                 path = candidate.resolve()
             except OSError:
                 continue
             if path.is_file():
-                return compute_artifact_file_hash(str(path))
+                return path
+        return None
+
+    @staticmethod
+    def _compute_sparse_source_hash(chunk_file: str, sparse_rows: List[Dict[str, Any]]) -> str:
+        """计算 sparse 索引来源的哈希，写入 manifest 用于激活前校验 dense/sparse 是否来自同一份 chunk。"""
+        path = PaperQAIndexBuilder._resolve_existing_chunk_file(chunk_file)
+        if path is not None:
+            return compute_artifact_file_hash(str(path))
         # 生产路径必须以真实 chunk file 为 source；测试 stub 可能只返回文件名不落盘，
         # 此时用同一批 sparse 输入生成稳定 hash，避免把轻量测试误判为构建失败。
         payload = json.dumps({"chunks": sparse_rows}, ensure_ascii=False, sort_keys=True, default=str)
@@ -903,18 +976,8 @@ class PaperQAIndexBuilder:
     @staticmethod
     def _load_sparse_source_chunks(chunk_file: str, *, fallback_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """从 chunk file 恢复 sparse 输入；测试 stub 未落盘时才使用内存 chunk 兜底。"""
-        resolved = Path(str(chunk_file or "").strip())
-        candidates = [resolved]
-        if not resolved.is_absolute():
-            workspace_root = Path(__file__).resolve().parents[3]
-            candidates.extend([Path.cwd() / resolved, workspace_root / resolved])
-        for candidate in candidates:
-            try:
-                path = candidate.resolve()
-            except OSError:
-                continue
-            if not path.is_file():
-                continue
+        path = PaperQAIndexBuilder._resolve_existing_chunk_file(chunk_file)
+        if path is not None:
             with open(path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
             chunks = payload.get("chunks") if isinstance(payload, dict) else []
@@ -923,6 +986,7 @@ class PaperQAIndexBuilder:
             return [dict(chunk) for chunk in chunks if isinstance(chunk, dict)]
         if fallback_chunks:
             # 兼容旧测试和轻量 stub：生产环境应以真实 chunk file 为准，兜底只保证构建链路可验证。
+            logger.warning("Chunk file not found for sparse index, fallback to in-memory chunks: %s", chunk_file)
             return [dict(chunk) for chunk in fallback_chunks if isinstance(chunk, dict)]
         raise FileNotFoundError(str(chunk_file or ""))
 
@@ -934,6 +998,10 @@ class PaperQAIndexBuilder:
         retrieval_index_debug: Optional[Dict[str, Any]] = None,
         index_version: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], EmbeddingConfig]:
+        """为 retrieval index（而非原始 chunk）生成向量；一个 chunk 会派生多个可检索入口。
+
+        retrieval_indexes 为空时会退回规则索引（旧调用入口兼容），主流程总会显式传入。
+        """
         embedding_config = self.get_embedding_config()
         logger.debug(
             "Creating embeddings with %s / %s...",
@@ -985,20 +1053,32 @@ class PaperQAIndexBuilder:
         return embeddings, embedding_config
 
     def save_embeddings(self, arxiv_id: str, embeddings: List[Dict[str, Any]], index_version: Optional[str] = None) -> str:
+        """把向量落盘为 embedding 文件，供写入 Milvus 和后续重建使用。"""
         filename = f"{arxiv_id}_{index_version}.pdf" if index_version else f"{arxiv_id}.pdf"
         embedding_file = self.embedding_service.save_embeddings(filename, embeddings)
         logger.debug("Embeddings saved to: %s", embedding_file)
         return embedding_file
 
     def index_embeddings_to_vector_store(self, embedding_file: str) -> Dict[str, Any]:
+        """把 embedding 文件写入 Milvus 的新 collection（collection 名由向量服务生成）。"""
         vector_db_config = VectorDBConfig(provider="milvus", index_mode="default")
         index_result = self.vector_store_service.index_embeddings(embedding_file, vector_db_config)
         collection_name = index_result.get("collection_name", "")
         logger.debug("Index created in collection: %s", collection_name)
         return index_result
 
-    def validate_new_collection(self, collection_name: str, expected_count: int) -> None:
-        """激活前校验新 collection 至少存在；校验失败时旧 active 仍不会被切走。"""
+    def validate_new_collection(
+        self,
+        collection_name: str,
+        expected_count: int,
+        index_result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """激活前校验新 collection 存在、有 chunk，且向量写入数量完整；校验失败时旧 active 仍不会被切走。
+
+        写入完整性用 index_result 中 Milvus 返回的 insert_count（index_size）与 embedding 文件里的
+        向量数（total_vectors）比对，而不是查询 collection 的 row_count：后者在 flush 之前可能滞后，会误报。
+        向量数按 retrieval index 计（一个 chunk 可能对应多条），因此不与 chunk 数直接比较。
+        """
         normalized_collection = str(collection_name or "").strip()
         if not normalized_collection:
             raise RuntimeError("Vector store returned empty collection_name")
@@ -1007,6 +1087,14 @@ class PaperQAIndexBuilder:
             raise RuntimeError(f"New QA index collection does not exist: {normalized_collection}")
         if expected_count <= 0:
             raise RuntimeError("New QA index has no chunks to activate")
+        result = index_result or {}
+        inserted = result.get("index_size")
+        total = result.get("total_vectors")
+        # 两个值都是真实整数时才比较；部分实现返回 "N/A" 或不提供该字段，此时跳过数量校验。
+        if all(isinstance(value, int) and not isinstance(value, bool) for value in (inserted, total)) and inserted != total:
+            raise RuntimeError(
+                f"New QA index collection is incomplete: inserted={inserted} expected={total} collection={normalized_collection}"
+            )
 
     def validate_sparse_index_artifact(
         self,
@@ -1082,6 +1170,11 @@ class PaperQAIndexBuilder:
         sparse_index_source_hash: str = "",
         sparse_index_avgdl: float = 0.0,
     ) -> bool:
+        """写入构建成功的完整产物信息并原子激活该版本；返回 False 表示数据库写入/激活失败。
+
+        有 build_id 时：先把 build 记录更新为 build_success，再调用 activate 在同一事务内切换 active 指针。
+        无 build_id 的分支是旧的单版本模式（直接改主表为 indexed），主流程已不会走到，仅为兼容保留。
+        """
         if build_id and (not str(sparse_index_manifest_file or "").strip() or int(sparse_index_document_count or 0) <= 0):
             # 新版 QA index 必须 dense/sparse 同时完成；缺 sparse 时不能进入 active 事务。
             raise RuntimeError("Sparse index artifact is required before activating QA index build")
@@ -1161,7 +1254,11 @@ class PaperQAIndexBuilder:
         build_id: Optional[str] = None,
         **artifacts: Any,
     ) -> bool:
-        # 失败记录承担补偿线索职责：即使流程没完成，也要知道哪些文件或 collection 已经生成。
+        """记录构建失败及已产生的 artifact，返回失败记录是否写入成功。
+
+        失败记录承担补偿线索职责：即使流程没完成，也要知道哪些文件或 collection 已经生成，
+        以便后续清理任务按 cleanup_pending 回收。
+        """
         payload = {
             "status": "build_failed" if build_id else "failed",
             "current_stage": failed_stage,
@@ -1198,6 +1295,20 @@ class PaperQAIndexBuilder:
                     artifacts.get("collection_name"),
                 )
             return updated
+        # 走到这里说明 build 版本还没创建出来（加载方式非法、create_paper_qa_index_build 失败等）。
+        # 旧实现会无条件把主表改成 status=failed：如果论文已有正在服务的 active 索引，
+        # 一次失败的重建请求（例如 sync=true 且 loading_method 拼错）就会让问答直接不可用。
+        # 版本化语义要求「新构建失败不影响旧 active」，因此主表已是 indexed 时只记录日志，不覆盖。
+        existing = self.paper_qa_index_store.get_paper_qa_index(arxiv_id) or {}
+        if existing.get("status") == "indexed":
+            logger.warning(
+                "QA index build failed before a build version was created; keep active index untouched: "
+                "arxiv_id=%s stage=%s error=%s",
+                arxiv_id,
+                failed_stage,
+                payload["error_message"],
+            )
+            return False
         updated = self.paper_qa_index_store.update_paper_qa_index(arxiv_id, **payload)
         if not updated:
             updated = self.paper_qa_index_store.insert_paper_qa_index(arxiv_id, **payload)
@@ -1213,12 +1324,25 @@ class PaperQAIndexBuilder:
     def build_qa_index(
         self,
         arxiv_id: str,
-        loading_method: str = "docling",
+        loading_method: str = DEFAULT_LOADING_METHOD,
         progress_callback: Optional[Callable[..., Any]] = None,
         run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """执行一次完整的版本化建库，成功时返回新 active 版本的产物摘要。
+
+        Args:
+            loading_method: PDF 解析方式（docling / pymupdf）。
+            progress_callback: 可选进度回调，签名为 (*, current_stage, progress, message)；回调异常会被吞掉。
+            run_id: 仅用于日志关联（例如由 Agent 触发的长任务）。
+
+        Raises:
+            AppError: 任意阶段失败都会统一包装为 AppError，context.stage 为失败阶段，
+                错误码按阶段映射（向量库 / 数据库写入 / 其他建库失败）。
+        """
         info_event(logger, "qa.index_start", run_id=run_id, arxiv_id=arxiv_id, loading_method=loading_method)
-        requested_loading_method = str(loading_method or "docling").strip().lower()
+        # current_stage 随流程推进更新，异常处理时据此判断失败阶段；artifact_state 累积已产生的产物，
+        # 失败时整体写入失败记录，供清理任务回收。
+        requested_loading_method = str(loading_method or DEFAULT_LOADING_METHOD).strip().lower()
         current_stage = "validate_loading_method"
         artifact_state: Dict[str, Any] = {}
         effective_loading_method = requested_loading_method
@@ -1548,7 +1672,7 @@ class PaperQAIndexBuilder:
                 progress=98,
                 message="Validating new QA index collection",
             )
-            self.validate_new_collection(collection_name, len(chunks))
+            self.validate_new_collection(collection_name, len(chunks), index_result=index_result)
             self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
 
             current_stage = "validate_sparse_index_artifact"
@@ -1577,7 +1701,6 @@ class PaperQAIndexBuilder:
                 sparse_document_count=sparse_validation.get("document_count"),
                 sparse_token_count=sparse_validation.get("token_count"),
             )
-            self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
 
             current_stage = "activate_index"
             self._notify_progress(
@@ -1614,6 +1737,8 @@ class PaperQAIndexBuilder:
             )
             if not success_marked:
                 # 新 collection 已经生成但未能激活时，不能覆盖旧 active，只把新版本留给后续清理。
+                # 注意：随后抛出的 RuntimeError 会进入下方 except，mark_index_failed 会把这里写的
+                # status=orphaned 再覆盖为 build_failed（两者都会被 cleanup 统计到，但 orphaned 语义会丢失）。
                 self.paper_qa_index_store.update_paper_qa_index_build(
                     build_id,
                     status="orphaned",
@@ -1701,57 +1826,18 @@ class PaperQAIndexBuilder:
                 loading_method=effective_loading_method,
                 message=exc.message,
             )
-            self.mark_index_failed(
+            self._record_build_failure(
                 arxiv_id,
                 failed_stage=str(exc.context.get("stage") or current_stage),
                 error_message=f"{exc.code}: {exc.detail or exc.message}",
                 loading_method=effective_loading_method,
                 build_id=build_id,
-                **artifact_state,
+                artifact_state=artifact_state,
             )
             raise
-        except HTTPException as exc:
-            detail = self._tag_exception(
-                exc,
-                stage=current_stage,
-                arxiv_id=arxiv_id,
-                loading_method=requested_loading_method,
-            )
-            logger.exception(
-                "QA index build failed at stage=%s arxiv_id=%s loading_method=%s error_type=%s detail=%s",
-                current_stage,
-                arxiv_id,
-                requested_loading_method,
-                type(exc).__name__,
-                detail,
-            )
-            info_event(
-                logger,
-                "qa.index_done",
-                run_id=run_id,
-                arxiv_id=arxiv_id,
-                build_id=build_id,
-                status="error",
-                failed_stage=current_stage,
-                loading_method=effective_loading_method,
-                error_type=type(exc).__name__,
-                message=detail,
-            )
-            self.mark_index_failed(
-                arxiv_id,
-                failed_stage=current_stage,
-                error_message=detail,
-                loading_method=effective_loading_method,
-                build_id=build_id,
-                **artifact_state,
-            )
-            error_code = self._error_code_for_stage(current_stage)
-            raise AppError(
-                error_code,
-                detail={"stage": current_stage, "error": detail, "arxiv_id": arxiv_id},
-                context={"arxiv_id": arxiv_id, "stage": current_stage, "loading_method": effective_loading_method},
-            ) from exc
         except Exception as exc:
+            # HTTPException（如 load_paper_metadata 的 404、validate_loading_method 的 400）与其他异常
+            # 处理方式完全相同：原先单独的 except HTTPException 分支与本分支逐行一致，已合并。
             detail = self._tag_exception(
                 exc,
                 stage=current_stage,
@@ -1778,13 +1864,13 @@ class PaperQAIndexBuilder:
                 error_type=type(exc).__name__,
                 message=detail,
             )
-            self.mark_index_failed(
+            self._record_build_failure(
                 arxiv_id,
                 failed_stage=current_stage,
                 error_message=detail,
                 loading_method=effective_loading_method,
                 build_id=build_id,
-                **artifact_state,
+                artifact_state=artifact_state,
             )
             error_code = self._error_code_for_stage(current_stage)
             raise AppError(
@@ -1792,3 +1878,31 @@ class PaperQAIndexBuilder:
                 detail={"stage": current_stage, "error": detail, "arxiv_id": arxiv_id},
                 context={"arxiv_id": arxiv_id, "stage": current_stage, "loading_method": effective_loading_method},
             ) from exc
+
+    def _record_build_failure(
+        self,
+        arxiv_id: str,
+        *,
+        failed_stage: str,
+        error_message: str,
+        loading_method: str,
+        build_id: Optional[str],
+        artifact_state: Dict[str, Any],
+    ) -> None:
+        """在异常处理分支中写失败记录；写记录本身出错时只记日志，避免掩盖真正的建库失败原因。"""
+        try:
+            self.mark_index_failed(
+                arxiv_id,
+                failed_stage=failed_stage,
+                error_message=error_message,
+                loading_method=loading_method,
+                build_id=build_id,
+                **artifact_state,
+            )
+        except Exception:
+            logger.exception(
+                "Persist QA index failure record failed: arxiv_id=%s build_id=%s stage=%s",
+                arxiv_id,
+                build_id,
+                failed_stage,
+            )

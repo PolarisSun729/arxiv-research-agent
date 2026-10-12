@@ -1,3 +1,10 @@
+"""追问消歧（question contextualization）。
+
+把「它/这个方法/第二步」这类依赖上下文的追问，借助短期记忆改写成可独立检索的自包含问题。
+改写只解决指代，不允许引入会话中没有出现过的论文事实；事实仍由后续 RAG 检索决定。
+任何失败都降级为原问题（或基于最近一轮的启发式拼接），不阻断问答主链路。
+"""
+
 from __future__ import annotations
 
 import json
@@ -15,10 +22,22 @@ from services.prompt_context import PromptContextBuilder
 
 logger = logging.getLogger(__name__)
 
+# 追问的指代词 / 序数词特征（只作为启发式信号，最终改写仍以 LLM 结果为准）。
+# - 「它/他/她」用 (?<!其) 排除「其它/其他」；不再收录单字「其」，避免命中「尤其/极其/其次」；
+# - 不再收录 baseline 这类普通术语，「这篇论文用了哪些 baseline」并不是追问；
+# - 英文只收录明确的回指代词，用 \b 防止命中单词内部（如 "it" 命中 "with"）。
 FOLLOW_UP_PATTERN = re.compile(
-    r"(它|他|她|这个|这个方法|这个模块|这种方法|该方法|该模块|上述|上面|前面|这里|其中|其|这些|那些|第二步|第一步|第三步|这一步|上一步|下一步|baseline|上一轮|上一条|上一个)",
+    r"((?<!其)它|(?<!其)[他她]们?|这个|这种|这些|那个|那些|该方法|该模块|该模型|此方法|上述|上面|前面|刚才|其中|这里|这一步|上一步|下一步"
+    r"|第[一二三四五六七八九十\d]+步|上一轮|上一条|上一个|再详细|展开说|举个例子"
+    r"|\b(?:it|its|they|them|their|the above|previous answer|(?:this|that) (?:method|approach|model|module|step))\b)",
     re.IGNORECASE,
 )
+# 以「那/那么/然后/还有/另外/接着/继续/所以」开头，通常是在上一轮基础上继续发问。
+FOLLOW_UP_LEADING_PATTERN = re.compile(r"^(那么?|然后|还有|另外|接着|继续|所以)")
+# 以「呢」结尾（如「那实验部分呢？」）是中文追问的典型语气。
+FOLLOW_UP_ENDING_PATTERN = re.compile(r"呢\s*[?？。.!！]*$")
+# 去掉标点后不超过该长度的极短问题（如「为什么？」「然后呢」「具体怎么做」）基本无法独立检索，按追问处理。
+SHORT_FOLLOW_UP_MAX_CHARS = 8
 
 
 class QuestionContextualizer:
@@ -40,7 +59,12 @@ class QuestionContextualizer:
         paper_context: Dict[str, Any],
         conversation_context: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """结合短期记忆把追问改写成自包含问题，供检索阶段直接使用。"""
+        """结合短期记忆把追问改写成自包含问题，供检索阶段直接使用。
+
+        流程：短期记忆关闭 / 没有历史 → 直接返回原问题；否则调用 LLM 输出 JSON 改写结果，
+        并用历史中真实出现过的 turn_id / source_id 白名单过滤模型输出；LLM 失败时，
+        若启发式判断像追问则拼接最近一轮问答作为兜底，否则保留原问题。
+        """
         if not bool(self.session_service.memory_flag("enable_short_term_memory", True)):
             return {
                 "original_question": question,
@@ -83,10 +107,12 @@ class QuestionContextualizer:
             candidate_source_ids = [
                 str(item).strip() for item in (parsed.get("referenced_source_ids", []) or []) if str(item).strip()
             ]
+            # 模型可能编造 ID，只保留历史上下文里真实存在的 turn_id / source_id。
             allowed_turn_ids = set(referenced_turn_ids)
             allowed_source_ids = set(referenced_source_ids)
             filtered_turn_ids = [item for item in candidate_turn_ids if item in allowed_turn_ids][:MAX_CONVERSATION_TURNS]
             filtered_source_ids = [item for item in candidate_source_ids if item in allowed_source_ids][:MAX_REFERENCED_SOURCE_IDS]
+            # 模型判断与启发式取「或」：任一方认为是追问即标记；是否真正用了记忆看问题是否被改写。
             is_follow_up = bool(parsed.get("is_follow_up", False) or heuristic_follow_up)
             if not contextualized_question:
                 contextualized_question = question
@@ -122,7 +148,8 @@ class QuestionContextualizer:
                 "used_short_term_memory": False,
                 "status": "fallback_original",
                 "error": str(exc),
-                "prompt_context": prompt_context_debug if "prompt_context_debug" in locals() else {},
+                # prompt_context_debug 在 try 之前就已构建，这里一定存在（原先的 locals() 判断是多余的）。
+                "prompt_context": prompt_context_debug,
             }
 
     @staticmethod
@@ -135,22 +162,33 @@ class QuestionContextualizer:
         if fenced_match:
             normalized = fenced_match.group(1)
         else:
+            # 贪婪匹配第一个 "{" 到最后一个 "}"，兼容模型在 JSON 前后附带解释文字的情况。
             object_match = re.search(r"(\{.*\})", normalized, flags=re.DOTALL)
             if object_match:
                 normalized = object_match.group(1)
-        return json.loads(normalized)
+        parsed = json.loads(normalized)
+        # 模型偶尔返回 JSON 数组或字符串；显式报错，让调用方走统一的降级分支，而不是在 .get() 处抛 AttributeError。
+        if not isinstance(parsed, dict):
+            raise ValueError(f"contextualization output is not a JSON object: {type(parsed).__name__}")
+        return parsed
 
     @staticmethod
     def looks_like_follow_up(question: str) -> bool:
-        """基于代词、长度和语气特征，粗略判断问题是否像追问。"""
+        """基于指代词、承接语气和问题长度，判断问题是否像依赖上文的追问。
+
+        命中以下任一条件返回 True：回指代词 / 序数步骤、承接式开头、「呢」结尾、去标点后极短。
+        旧规则把「长度 ≤ 18」和「以问号结尾」也算作追问，几乎所有问题都会命中，
+        导致 LLM 失败时独立问题也被拼接上一轮内容、污染检索，因此已收紧。
+        """
         normalized = re.sub(r"\s+", " ", str(question or "")).strip()
         if not normalized:
             return False
         if FOLLOW_UP_PATTERN.search(normalized):
             return True
-        if len(normalized) <= 18:
+        if FOLLOW_UP_LEADING_PATTERN.search(normalized) or FOLLOW_UP_ENDING_PATTERN.search(normalized):
             return True
-        return normalized.endswith(("?", "？"))
+        compact = re.sub(r"[\s\W_]+", "", normalized)
+        return 0 < len(compact) <= SHORT_FOLLOW_UP_MAX_CHARS
 
     def build_contextualization_fallback(
         self,
@@ -192,6 +230,12 @@ class QuestionContextualizer:
         paper_context: Dict[str, Any],
         conversation_context: List[Dict[str, Any]],
     ) -> tuple[List[str], List[str], str, Dict[str, Any]]:
+        """构建消歧 prompt，并收集历史中出现过的 source_id / turn_id 白名单。
+
+        Returns:
+            (referenced_source_ids, referenced_turn_ids, prompt, prompt_context_debug)
+            其中 turn_id 白名单不包含会话摘要伪 turn，摘要只作为背景信息。
+        """
         referenced_source_ids: List[str] = []
         referenced_turn_ids: List[str] = []
         source_lines: List[str] = []
@@ -201,7 +245,7 @@ class QuestionContextualizer:
             is_summary = bool(turn.get("is_summary") or turn.get("context_type") == "session_summary")
             if turn_id and not is_summary:
                 referenced_turn_ids.append(turn_id)
-            for source in turn.get("sources", []):
+            for source in turn.get("sources") or []:
                 source_id = str(source.get("source_id", "") or "").strip()
                 if source_id and source_id not in referenced_source_ids:
                     referenced_source_ids.append(source_id)
@@ -215,6 +259,7 @@ class QuestionContextualizer:
                     f"summary={source.get('content', '') or 'N/A'}"
                 )
 
+        # 把会话摘要伪 turn 与普通 turn 拆开，交给 PromptContextBuilder 按各自预算渲染。
         session_summary = None
         recent_turns: List[Dict[str, Any]] = []
         for turn in conversation_context:

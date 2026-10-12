@@ -549,6 +549,33 @@ class PaperQAIndexBuilderFlowTests(_BaseIndexTestCase):
         self.assertEqual(loaded["title"], "arXiv Paper")
         self.assertEqual(persisted["abstract"], "Remote abstract")
 
+    def test_load_paper_metadata_uses_injected_arxiv_service_for_lookup(self) -> None:
+        searched = []
+        self_arxiv_id = self.arxiv_id
+
+        class _InjectedArxivService:
+            def search(self, **kwargs):
+                searched.append(kwargs)
+                return {"papers": [{"arxiv_id": self_arxiv_id, "title": "Injected Paper", "summary": "Injected abstract"}]}
+
+            def download_pdf(self, _url, _arxiv_id):
+                return "tmp/fake-paper.pdf"
+
+        builder, *_ = self._make_builder(
+            oai_db_service=_FakeOaiDbService(),
+            arxiv_service_factory=lambda: _InjectedArxivService(),
+        )
+
+        loaded = builder.load_paper_metadata(self.arxiv_id)
+
+        self.assertEqual(loaded["title"], "Injected Paper")
+        self.assertEqual(searched, [{"id_list": [self.arxiv_id], "max_results": 1}])
+
+    def test_empty_loading_method_defaults_to_docling(self) -> None:
+        builder, *_ = self._make_builder()
+
+        self.assertEqual(builder.validate_loading_method(""), "docling")
+
     def test_build_qa_index_success_updates_index_record_and_pipeline_metadata(self) -> None:
         self.storage.paper_catalog.add_paper(self._paper_payload())
         builder, loading_service, chunking_service, embedding_service, vector_store_service = self._make_builder()
@@ -1103,6 +1130,74 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
         ]
         self.assertEqual(len(job_ids), 1)
         self.assertEqual(len(active_jobs), 1)
+
+    def test_lease_loss_cancels_build_without_reporting_failure(self) -> None:
+        store = self.storage.paper_qa_index
+        failed_callbacks = []
+        outcomes = []
+
+        class _LeaseLosingBuilder(_FakeJobBuilder):
+            def build_qa_index(self, arxiv_id, loading_method="docling", progress_callback=None):
+                progress_callback(current_stage="load_pdf_document", progress=35, message="loading")
+                # 模拟 job 被其他流程接管 / 取消：当前 attempt 不再拥有 running 状态。
+                job = store.get_latest_paper_index_job(arxiv_id)
+                store.update_paper_index_job(job["job_id"], status="failed", failure_code="qa_index_deleted")
+                try:
+                    progress_callback(current_stage="chunk_document", progress=45, message="chunking")
+                except Exception as exc:
+                    outcomes.append(type(exc).__name__)
+                    raise
+                outcomes.append("continued")
+                return {"status": "success"}
+
+        manager = IndexJobManager(
+            paper_qa_index_store=store,
+            qa_index_builder=_LeaseLosingBuilder(),
+            on_job_failed=lambda *args: failed_callbacks.append(args),
+        )
+        job = manager.submit_job(self.arxiv_id, "docling")
+
+        self.assertTrue(manager.run_next_job())
+
+        stored = store.get_paper_index_job(job["job_id"])
+        self.assertEqual(outcomes, ["IndexBuildCancelledError"])
+        self.assertEqual(stored["status"], "failed")
+        self.assertEqual(stored["failure_code"], "qa_index_deleted")
+        self.assertEqual(failed_callbacks, [])
+
+    def test_builder_propagates_abort_request_from_progress_callback(self) -> None:
+        self.storage.paper_catalog.add_paper(self._paper_payload())
+        builder, *_ = self._make_builder()
+
+        def _cancel_at_chunking(*, current_stage, progress, message):
+            if current_stage == "chunk_document":
+                raise manager_module.IndexBuildCancelledError("lease lost")
+
+        with self.assertRaises(AppError) as ctx:
+            builder.build_qa_index(self.arxiv_id, progress_callback=_cancel_at_chunking)
+
+        failed_build = self.storage.paper_qa_index.get_latest_paper_qa_index_build(self.arxiv_id, statuses=["build_failed"])
+        self.assertIsInstance(ctx.exception.__cause__, manager_module.IndexBuildCancelledError)
+        self.assertEqual(failed_build["failed_stage"], "chunk_document")
+
+    def test_ordinary_progress_callback_errors_do_not_abort_build(self) -> None:
+        self.storage.paper_catalog.add_paper(self._paper_payload())
+        builder, *_ = self._make_builder()
+
+        def _broken_callback(**_kwargs):
+            raise RuntimeError("progress sink unavailable")
+
+        result = builder.build_qa_index(self.arxiv_id, progress_callback=_broken_callback)
+
+        self.assertEqual(result["status"], "success")
+
+    def test_validate_new_collection_rejects_incomplete_vector_insert(self) -> None:
+        builder, *_ = self._make_builder()
+
+        with self.assertRaises(RuntimeError):
+            builder.validate_new_collection("qa_collection", 3, index_result={"index_size": 2, "total_vectors": 5})
+        # 实现没有返回整数统计时跳过数量校验，保持兼容。
+        builder.validate_new_collection("qa_collection", 3, index_result={"index_size": "N/A", "total_vectors": 5})
 
     def test_submit_job_does_not_execute_builder_in_request_thread(self) -> None:
         builder = _FakeJobBuilder(result={"status": "success"})
