@@ -341,3 +341,66 @@ def test_retrieval_failure_is_a_status_not_an_exception() -> None:
     assert result["status"] == "retrieval_failed"
     assert result["candidates"] == []
     assert "vector store unavailable" in result["error"]
+
+
+class DebugPipeline(RecordingPipeline):
+    """返回带完整检索 debug 的结果，模拟 debug 模式下的生产管线。"""
+
+    def retrieve(self, **kwargs: Any) -> dict[str, Any]:
+        response = super().retrieve(**kwargs)
+        response["debug"] = {
+            "original_query": kwargs["user_query"],
+            "intent_profile": {"main_intent": "method_flow"},
+            "query_rewrite": {"enabled": True, "selected_queries": ["CogMem architecture", "  "]},
+            "hyde": {"enabled": False, "text": ""},
+            "keyword_search": {"enabled": True, "queries": ["CogMem workflow stages"]},
+            "routes": {"vector_original": [{"chunk_id": 1}, {"chunk_id": 2}], "keyword": [{"chunk_id": 3}]},
+            "fusion": {"algorithm": "pure_rrf", "rrf_k": 60},
+            "llm_rerank": {"applied": True, "mode": "dashscope", "input_chunks": 30, "output_chunks": 30},
+            "stages": {
+                "final_context_top15": [
+                    {
+                        "chunk_id": 54,
+                        "chunk_type": "figure",
+                        "page_number": 4,
+                        "score": 0.8786,
+                        "preview": "Figure 2: The Overall Architecture of CogMem.",
+                        "content": "x" * 5000,
+                    }
+                ]
+            },
+        }
+        return response
+
+
+def test_requests_in_memory_debug_without_exporting_trace_files() -> None:
+    # 面板要逐轮阶段数据，但每轮都落盘一份检索 trace 会平白增加 I/O 与文件数。
+    pipeline = RecordingPipeline()
+    _retriever(pipeline).retrieve(_action(), _state())
+
+    options = pipeline.calls[0]["options"]
+    assert options.debug is True
+    assert options.export_trace is False
+
+
+def test_stage_summary_compresses_pipeline_debug_for_the_panel() -> None:
+    pipeline = DebugPipeline([{"content": "Figure 2 evidence", "chunk_id": "54"}])
+    result = _retriever(pipeline).retrieve(_action(), _state())
+
+    summary = result["stage_summary"]
+    assert result["main_intent"] == "method_flow"
+    assert summary["rewritten_queries"] == ["CogMem architecture"]
+    assert summary["hyde_enabled"] is False
+    assert summary["keyword_queries"] == ["CogMem workflow stages"]
+    assert summary["route_counts"] == {"vector_original": 2, "keyword": 1}
+    assert summary["fusion"] == "pure_rrf · RRF k 60"
+    assert summary["rerank"] == "dashscope · 30 → 30 条"
+    assert summary["final_context"] == [
+        "chunk 54 · figure · p4 · 0.8786 · Figure 2: The Overall Architecture of CogMem."
+    ]
+
+
+def test_stage_summary_is_absent_when_pipeline_returns_no_debug() -> None:
+    result = _retriever(RecordingPipeline([{"content": "evidence", "chunk_id": "c1"}])).retrieve(_action(), _state())
+
+    assert result["stage_summary"] is None

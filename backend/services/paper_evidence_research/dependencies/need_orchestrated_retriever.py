@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 _MAX_QUERY_CHARS = 300
 _MAX_SECTION_HINTS = 3
 _DEFAULT_TOP_K = 8
+# 阶段摘要会进研究轨迹并随回答落库，只保留面板展示所需的文本与计数，不复制 chunk 正文。
+_MAX_SUMMARY_QUERIES = 6
+_MAX_SUMMARY_CHUNKS = 15
+_SUMMARY_PREVIEW_CHARS = 100
+_SUMMARY_HYDE_CHARS = 300
 
 
 @dataclass(frozen=True)
@@ -99,6 +104,62 @@ def _coerce_score(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
+
+
+def _text_list(values: Any) -> list[str]:
+    return [text for text in (str(item or "").strip() for item in values or []) if text][:_MAX_SUMMARY_QUERIES]
+
+
+def _describe_summary_chunk(chunk: Mapping[str, Any]) -> str:
+    page = chunk.get("page_number") or chunk.get("page_range")
+    score = _coerce_score(chunk.get("score"))
+    preview = " ".join(str(chunk.get("preview") or chunk.get("content") or "").split())[:_SUMMARY_PREVIEW_CHARS]
+    parts = [
+        f"chunk {chunk.get('chunk_id') if chunk.get('chunk_id') is not None else '-'}",
+        str(chunk.get("chunk_type") or "text"),
+        f"p{page}" if page else "",
+        f"{score:.4f}" if score is not None else "",
+        preview,
+    ]
+    return " · ".join(part for part in parts if part)
+
+
+def summarize_stage_debug(debug: Any) -> dict[str, Any] | None:
+    """把检索管线的完整 debug 压成一轮检索的阶段摘要（改写、HyDE、关键词、多路召回、融合、rerank、最终上下文）。
+
+    研究引擎会检索多轮，面板按轮展示；摘要保持浅层的字符串与计数结构，落库时的 debug 快照裁剪不会把它截成形状标记。
+    """
+
+    if not isinstance(debug, Mapping):
+        return None
+    rewrite = debug.get("query_rewrite") if isinstance(debug.get("query_rewrite"), Mapping) else {}
+    hyde = debug.get("hyde") if isinstance(debug.get("hyde"), Mapping) else {}
+    keyword = debug.get("keyword_search") if isinstance(debug.get("keyword_search"), Mapping) else {}
+    routes = debug.get("routes") if isinstance(debug.get("routes"), Mapping) else {}
+    fusion = debug.get("fusion") if isinstance(debug.get("fusion"), Mapping) else {}
+    rerank = debug.get("llm_rerank") if isinstance(debug.get("llm_rerank"), Mapping) else {}
+    stages = debug.get("stages") if isinstance(debug.get("stages"), Mapping) else {}
+    final_chunks = stages.get("final_context_top15") or debug.get("final_chunks") or []
+    if rerank.get("applied"):
+        rerank_text = f"{rerank.get('mode') or 'llm'} · {rerank.get('input_chunks', '-')} → {rerank.get('output_chunks', '-')} 条"
+    else:
+        rerank_text = f"未应用（{rerank.get('reason') or 'disabled'}）"
+    return {
+        "original_query": str(debug.get("original_query") or ""),
+        "rewrite_enabled": bool(rewrite.get("enabled")),
+        "rewritten_queries": _text_list(rewrite.get("selected_queries") or debug.get("rewritten_queries")),
+        "hyde_enabled": bool(hyde.get("enabled")),
+        "hyde_text": str(hyde.get("text") or debug.get("hyde_text") or "")[:_SUMMARY_HYDE_CHARS],
+        "keyword_queries": _text_list(keyword.get("queries")) if keyword.get("enabled", True) else [],
+        "route_counts": {str(name): len(chunks or []) for name, chunks in routes.items()},
+        "fusion": f"{fusion.get('algorithm') or 'pure_rrf'} · RRF k {fusion.get('rrf_k', '-')}",
+        "rerank": rerank_text,
+        "final_context": [
+            _describe_summary_chunk(chunk)
+            for chunk in list(final_chunks)[:_MAX_SUMMARY_CHUNKS]
+            if isinstance(chunk, Mapping)
+        ],
+    }
 
 
 def _find_need(state: Any, need_id: str) -> Any:
@@ -224,6 +285,8 @@ class NeedOrchestratedRetriever:
             "retrieval_candidates": mapped,
             "query": query,
             "main_intent": (((result or {}).get("debug") or {}).get("intent_profile") or {}).get("main_intent"),
+            # 每轮的阶段摘要进研究轨迹，问答面板据此按轮展示改写、召回、融合、rerank 与最终上下文。
+            "stage_summary": summarize_stage_debug((result or {}).get("debug")),
             "retrieved_count": len(chunks),
             "pool_duplicate_count": len(mapped) - len(candidates),
             "lightweight": lightweight,
@@ -247,11 +310,14 @@ class NeedOrchestratedRetriever:
         return max_retrievals > 0 and int(getattr(state, "retrieval_count", 0) or 0) >= max_retrievals
 
     def _build_options(self, *, lightweight: bool) -> RetrievalOptions:
-        # None 表示沿用全局配置；只有末轮显式关掉两个 LLM 阶段，其余开关不在这里改写。
+        # None 表示沿用全局配置；只有末轮显式关掉两个 LLM 阶段，召回相关开关不在这里改写。
         return RetrievalOptions(
             top_k=self._top_k,
             enable_query_rewrite=False if lightweight else None,
             enable_llm_rerank=False if lightweight else None,
+            # 面板需要每轮的阶段 debug；摘要只在内存中压缩，不为每轮额外落盘一份检索 trace。
+            debug=True,
+            export_trace=False,
         )
 
     def _map_chunk(self, chunk: Any, rank: int) -> dict[str, Any] | None:

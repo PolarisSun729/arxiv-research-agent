@@ -1017,6 +1017,36 @@ export interface RetrievalDebug {
   fusion?: Record<string, any>
   qa_observation?: QaObservation
   trace_export?: Record<string, string>
+  engine?: string
+  research_rounds?: ResearchRoundDebug[]
+  research_steps?: ResearchStepDebug[]
+}
+
+/** 研究引擎单轮检索的阶段摘要；字段均为可直接展示的文本与计数。 */
+export interface ResearchRoundDebug {
+  round: number
+  target_need_id: string
+  decision_reason?: string
+  query: string
+  status?: string
+  new_candidate_count?: number
+  duplicate_candidate_count?: number
+  original_query?: string
+  rewrite_enabled?: boolean
+  rewritten_queries?: string[]
+  hyde_enabled?: boolean
+  hyde_text?: string
+  keyword_queries?: string[]
+  route_counts?: Record<string, number>
+  fusion?: string
+  rerank?: string
+  final_context?: string[]
+}
+
+export interface ResearchStepDebug {
+  kind: 'search' | 'fallback' | 'draft' | 'verify' | 'rejected' | 'done' | string
+  title: string
+  detail?: string
 }
 
 export interface QaObservationStageStatus {

@@ -63,6 +63,26 @@ def test_research_qa_uses_real_session_and_persists_rescorable_record(qa_service
     assert any(e.get("candidates") for e in record["trace_events"])
 
 
+def test_research_debug_exposes_rounds_and_steps_for_the_panel(qa_service):
+    # 面板的"RAG 执行过程"读 retrieval_debug；研究引擎必须按轮给出检索与研究动作，且落库快照里同样可读。
+    service, tmp_path = qa_service
+    result = service.answer_question("2310.11511", _payload())
+
+    debug = result["retrieval_debug"]
+    assert [item["round"] for item in debug["research_rounds"]] == [1, 2]
+    assert debug["research_rounds"][0]["target_need_id"] == "need-method"
+    assert debug["research_rounds"][0]["decision_reason"] == "OPEN_EVIDENCE_NEED"
+    assert [step["kind"] for step in debug["research_steps"]][:3] == ["search", "draft", "verify"]
+    assert debug["research_steps"][-1] == {"kind": "done", "title": "研究结束", "detail": "completed"}
+    storage = build_storage_container(db_path=str(tmp_path / "qa.sqlite"))
+    messages = storage.paper_chat_messages.list_paper_chat_messages(
+        result["session_id"], user_id=result["chat_session"]["user_id"],
+    )
+    snapshot = messages[-1]["retrieval_debug_snapshot"]
+    assert snapshot["research_rounds"][0]["target_need_id"] == "need-method"
+    assert snapshot["research_steps"][0]["kind"] == "search"
+
+
 @pytest.mark.parametrize("streaming", [False, True])
 def test_missing_index_preserves_error_code(qa_service, streaming):
     service, tmp_path = qa_service

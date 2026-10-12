@@ -36,6 +36,7 @@ from services.document.loading_service import LoadingService
 from services.paper_qa.evidence_contract import build_public_source_payload, resolve_evidence_asset_path
 from services.paper_qa.paper_qa_index_builder import PaperQAIndexBuilder
 from services.paper_qa.qa_observation import build_error_qa_observation, build_research_qa_observation
+from services.paper_qa.research_process_debug import build_research_process_debug
 from services.paper_evidence_research.dependencies.production_adapters import PaperRetrievalTargetResolver
 from services.paper_qa.question_contextualizer import QuestionContextualizer
 from services.paper_qa.session_service import PaperQASessionService
@@ -410,7 +411,10 @@ class PaperQAService:
         }
         # API/debug 只返回可展示的摘要。完整候选和逐主张校验留在私有 eval record 中用于重评分。
         retrieval_debug = {
-            "engine": "paper_evidence_research", "research_summary": summary, "qa_observation": observation,
+            "engine": "paper_evidence_research", "original_query": request.original_question,
+            "research_summary": summary, "qa_observation": observation,
+            # 研究引擎多轮检索，面板按轮展示各阶段；单轮旧字段（routes/stages）不再适用。
+            **build_research_process_debug(trace_events),
             "intent_profile": {"main_intent": next(
                 (e["main_intent"] for e in trace_events if e.get("main_intent")), "unknown",
             )},

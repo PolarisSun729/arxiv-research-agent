@@ -312,6 +312,8 @@ def _search_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEv
         duplicate_candidate_count=duplicate_count,
         candidates=_trace_candidate_refs(retrieval.get("retrieval_candidates", candidates)),
         index_snapshot=retrieval.get("index_snapshot"),
+        # 适配器给出的本轮检索阶段摘要（改写/召回/融合/rerank/最终上下文），供问答面板按轮复盘。
+        stage_summary=retrieval.get("stage_summary"),
     )
     if (
         next_state.retrieval_stalled

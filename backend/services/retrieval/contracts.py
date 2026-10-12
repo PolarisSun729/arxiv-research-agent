@@ -25,6 +25,8 @@ class RetrievalOptions:
     enable_llm_rerank: Optional[bool] = None
     enable_context_expansion: Optional[bool] = None
     debug: Optional[bool] = None
+    # debug 模式默认还会把检索 trace 落盘；只需要内存中 debug 摘要的调用方显式传 False 跳过写盘。
+    export_trace: Optional[bool] = None
     memory_context: Optional[Dict[str, Any]] = None
 
 

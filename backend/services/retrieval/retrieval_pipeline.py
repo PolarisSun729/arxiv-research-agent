@@ -238,7 +238,7 @@ class RetrievalPipeline:
             )
 
         trace_export = None
-        if runtime["debug_enabled"]:
+        if runtime["debug_enabled"] and options.export_trace is not False:
             # 检索 trace 会落盘并把文件路径回传给调用方，只在 debug 模式下开启，
             # 避免正常问答接口泄露开发态诊断细节或引入额外 I/O。
             trace_export = self.trace_builder.export_trace(

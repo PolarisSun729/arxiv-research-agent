@@ -462,6 +462,22 @@ class RouteRetrieverTests(unittest.TestCase):
             sum(1 for route in final_routes if route == "keyword"),
         )
 
+    def test_debug_without_trace_export_keeps_debug_but_skips_writing_trace(self) -> None:
+        # 研究引擎每轮都要 debug 摘要，但不应为每轮检索各落盘一份 JSON/Markdown trace。
+        from unittest import mock
+
+        with mock.patch.object(self.service.retrieval_pipeline.trace_builder, "export_trace") as export_trace:
+            result = self.service.retrieval_pipeline.retrieve(
+                user_query="What is the method framework of the paper?",
+                collection_name=self.collection_name,
+                options=self.modules["enhanced"].RetrievalOptions(
+                    debug=True, export_trace=False, enable_llm_rerank=False
+                ),
+            )
+
+        export_trace.assert_not_called()
+        self.assertIn("stages", result["debug"])
+
     def test_keyword_method_question_supplements_vector_with_exact_term_chunk(self) -> None:
         bundle = self._build_route_bundle("What is the method pipeline and framework?", enable_hyde=False)
         keyword_ids = [hit["chunk_id"] for hit in bundle["routes"]["keyword"]]

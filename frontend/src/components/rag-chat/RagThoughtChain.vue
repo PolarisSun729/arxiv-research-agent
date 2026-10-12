@@ -2,6 +2,7 @@
 import { computed } from 'vue'
 import type { RetrievalDebug, RetrievalDebugChunk } from '@/api/papers'
 import { formatQueryList } from '@/utils/format'
+import { buildResearchRoundViews, buildResearchStepViews, hasResearchProcess } from '@/utils/researchProcess'
 
 const props = defineProps<{
   question: string
@@ -32,7 +33,8 @@ const steps = computed(() => {
   const debug = props.retrievalDebug
   const finalContextCount =
     getChunkCount(debug?.stages?.final_context_top15) || getChunkCount(debug?.final_chunks)
-  const rerankCount = getChunkCount(debug?.stages?.reranked_top15)
+  // 检索管线产出的阶段键是 reranked_top30；保留 top15 兼容旧快照。
+  const rerankCount = getChunkCount(debug?.stages?.reranked_top30) || getChunkCount(debug?.stages?.reranked_top15)
 
   return [
     {
@@ -86,10 +88,51 @@ const steps = computed(() => {
     }
   ]
 })
+
+// 研究引擎会多轮检索、起草和校验，单条检索时间线描述不了它：改为"研究动作 + 每轮检索阶段"两层展示。
+const isResearch = computed(() => hasResearchProcess(props.retrievalDebug))
+const researchSteps = computed(() => buildResearchStepViews(props.retrievalDebug?.research_steps))
+const researchRounds = computed(() => buildResearchRoundViews(props.retrievalDebug?.research_rounds))
 </script>
 
 <template>
-  <el-timeline class="rag-thought-chain">
+  <div v-if="isResearch" class="rag-thought-chain rag-thought-chain--research">
+    <div class="rag-thought-chain__question">
+      <div class="rag-thought-chain__title">原始问题</div>
+      <div class="rag-thought-chain__content">{{ retrievalDebug?.original_query || question || '无' }}</div>
+    </div>
+
+    <div class="rag-thought-chain__group-title">研究动作</div>
+    <el-timeline v-if="researchSteps.length">
+      <el-timeline-item v-for="step in researchSteps" :key="step.key" placement="top" type="primary">
+        <div class="rag-thought-chain__title">{{ step.title }}</div>
+        <div v-if="step.content" class="rag-thought-chain__content">{{ step.content }}</div>
+      </el-timeline-item>
+    </el-timeline>
+    <div v-else class="rag-thought-chain__content">无研究动作记录</div>
+
+    <div class="rag-thought-chain__group-title">每轮检索</div>
+    <details
+      v-for="(round, index) in researchRounds"
+      :key="round.key"
+      class="rag-thought-chain__round"
+      :open="index === researchRounds.length - 1"
+    >
+      <summary class="rag-thought-chain__round-summary">
+        <span class="rag-thought-chain__title">{{ round.title }}</span>
+        <span class="rag-thought-chain__round-subtitle">{{ round.subtitle }}</span>
+      </summary>
+      <el-timeline class="rag-thought-chain__round-body">
+        <el-timeline-item v-for="stage in round.stages" :key="stage.key" placement="top" type="primary">
+          <div class="rag-thought-chain__title">{{ stage.title }}</div>
+          <div class="rag-thought-chain__content">{{ stage.content }}</div>
+        </el-timeline-item>
+      </el-timeline>
+    </details>
+    <div v-if="!researchRounds.length" class="rag-thought-chain__content">本次研究没有执行检索</div>
+  </div>
+
+  <el-timeline v-else class="rag-thought-chain">
     <el-timeline-item v-for="step in steps" :key="step.key" placement="top" size="large" type="primary">
       <div class="rag-thought-chain__title">{{ step.title }}</div>
       <div class="rag-thought-chain__content">{{ step.content }}</div>
@@ -115,5 +158,46 @@ const steps = computed(() => {
   line-height: 1.7;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.rag-thought-chain--research {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.rag-thought-chain__group-title {
+  color: #0f172a;
+  font-size: 13px;
+  font-weight: 800;
+  margin-top: 4px;
+}
+
+.rag-thought-chain__round {
+  border-radius: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  background: linear-gradient(180deg, #f8fbff, #ffffff);
+  padding: 12px 14px;
+}
+
+.rag-thought-chain__round-summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rag-thought-chain__round-summary::-webkit-details-marker {
+  display: none;
+}
+
+.rag-thought-chain__round-subtitle {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.rag-thought-chain__round-body {
+  margin-top: 12px;
 }
 </style>
