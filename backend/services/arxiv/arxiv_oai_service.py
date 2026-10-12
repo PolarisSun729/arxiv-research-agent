@@ -14,7 +14,7 @@ import sqlite3
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
@@ -1124,6 +1124,14 @@ class ArxivOaiDatabaseService:
             logger.error("Error getting total OAI paper count: %s", exc)
             return 0
 
+    def get_latest_oai_datestamp(self) -> Optional[date]:
+        """返回库中最大的 OAI datestamp；空库返回 None。增量同步在缺少游标时用它推断起点。"""
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT MAX(oai_datestamp) FROM arxiv_oai_papers").fetchone()
+        value = str(row[0] or "").strip() if row else ""
+        # datestamp 可能带时间部分，只取日期；格式异常时宁可报错，也不能凭坏数据推断同步起点。
+        return date.fromisoformat(value[:10]) if value else None
+
     def get_paper(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
         """按 arXiv ID 获取单篇论文元数据。"""
         normalized_arxiv_id = str(arxiv_id or "").strip()
@@ -2047,6 +2055,11 @@ class ArxivOaiSyncService:
             except ET.ParseError as exc:
                 stats.errors += 1
                 logger.error("Failed to parse OAI-PMH XML response: %s", exc)
+                break
+
+            if self.xml_parser.extract_oai_error_code(root) == "noRecordsMatch":
+                # 区间内没有任何记录（如周末）是 OAI-PMH 规定的正常空结果，不能计为错误，否则游标永远卡在这一天。
+                logger.info("OAI-PMH noRecordsMatch for from=%s until=%s; nothing to sync.", from_date, until_date)
                 break
 
             page_error = self.xml_parser.extract_oai_error(root)

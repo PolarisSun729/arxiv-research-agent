@@ -3,7 +3,7 @@ import json
 import sys
 import types
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -50,6 +50,7 @@ try:
         OAI_INDEX_REBUILD_BATCH_SIZE,
         OAI_INDEX_REBUILD_STALE_SECONDS,
         ArxivOaiDatabaseService,
+        ArxivOaiSyncService,
     )
 finally:
     # 轻量桩只服务本模块导入；恢复公共模块，避免 pytest 混跑时污染后续真实服务测试。
@@ -475,3 +476,50 @@ def test_local_text_search_fails_when_text_index_rows_are_missing() -> None:
     assert getattr(exc_info.value, "status_code", None) == 503
     assert exc_info.value.query_capability["unsupported_reason"] == "text_index_missing"
     assert exc_info.value.query_capability["search_index_status"] == "text_index_missing"
+
+
+def _oai_error_page(code: str, message: str) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">'
+        '<responseDate>2026-10-12T00:00:00Z</responseDate>'
+        f'<request verb="ListRecords">https://oaipmh.arxiv.org/oai</request>'
+        f'<error code="{code}">{message}</error>'
+        "</OAI-PMH>"
+    )
+
+
+def test_sync_treats_no_records_match_as_empty_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 周末等日期没有任何 OAI 记录时，arXiv 返回 noRecordsMatch；这是“区间为空”，不是同步失败。
+    service = ArxivOaiSyncService()
+    page = _oai_error_page(
+        "noRecordsMatch",
+        "The combination of the values of the from, until, set and metadataPrefix arguments results in an empty list.",
+    )
+    monkeypatch.setattr(service, "_fetch_page", lambda params, stats: page)
+
+    stats = service.sync("2026-10-10", "2026-10-10")
+
+    assert stats.errors == 0
+    assert stats.records_written == 0
+    assert stats.pages_processed == 0
+
+
+def test_sync_still_counts_other_oai_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = ArxivOaiSyncService()
+    monkeypatch.setattr(service, "_fetch_page", lambda params, stats: _oai_error_page("badArgument", "Illegal date"))
+
+    stats = service.sync("2026-10-10", "2026-10-10")
+
+    assert stats.errors == 1
+
+
+def test_get_latest_oai_datestamp_returns_max_date_or_none() -> None:
+    service = _make_temp_service()
+    assert service.get_latest_oai_datestamp() is None
+
+    older = _paper("2609.00001", title="Older", abstract="a", categories=["cs.CL"], created="2026-09-09")
+    newer = _paper("2609.00002", title="Newer", abstract="b", categories=["cs.CL"], created="2026-09-11")
+    assert service.upsert_arxiv_oai_papers([older, newer]) == 2
+
+    assert service.get_latest_oai_datestamp() == date(2026, 9, 11)

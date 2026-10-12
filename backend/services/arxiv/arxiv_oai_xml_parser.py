@@ -99,6 +99,13 @@ class ArxivOaiXmlParser:
         # 空串由上层统一解释为"没有下一页"，避免把 XML 细节暴露到同步主循环。
         return token_elem.text.strip()
 
+    def extract_oai_error_code(self, root: ET.Element) -> str:
+        """提取 OAI-PMH 错误码（如 noRecordsMatch / badArgument），没有错误节点时返回空串。"""
+        error_elem = self._find_first_descendant(root, "error")
+        if error_elem is None:
+            return ""
+        return error_elem.attrib.get("code", "").strip()
+
     def extract_oai_error(self, root: ET.Element) -> str:
         """提取 OAI-PMH 错误节点，拼成可直接记录的错误文本。"""
         error_elem = self._find_first_descendant(root, "error")
