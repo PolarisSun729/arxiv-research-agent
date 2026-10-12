@@ -72,3 +72,63 @@ export function buildResearchRoundViews(rounds: ResearchRoundDebug[] | undefined
       }
     })
 }
+
+export interface RemovedClaimView {
+  key: string
+  text: string
+  reason: string
+  meta: string[]
+}
+
+export interface RemovedClaimsView {
+  items: RemovedClaimView[]
+  /** 历史快照裁剪掉、无法展示的条数。 */
+  omittedCount: number
+  /** 原草稿排版无法原位保留、正文改为拼接受支持句子时为 true。 */
+  joinedFallback: boolean
+}
+
+const IMPORTANCE_LABELS: Record<string, string> = { core: '核心主张', supporting: '辅助主张', background: '背景' }
+
+// 超长字符串在历史快照里会被压成 {preview, truncated}，这里取回可展示的预览。
+function displayText(value: unknown): string {
+  if (typeof value === 'string') return value.trim()
+  if (value && typeof value === 'object' && typeof (value as { preview?: unknown }).preview === 'string') {
+    return String((value as { preview: string }).preview).trim()
+  }
+  return ''
+}
+
+export function buildRemovedClaimsView(debug: RetrievalDebug | null | undefined): RemovedClaimsView {
+  const removed = debug?.removed_claims
+  const raw: unknown[] = Array.isArray(removed) ? removed : []
+  const items: RemovedClaimView[] = []
+  let omittedCount = 0
+  raw.forEach((entry, index) => {
+    if (!entry || typeof entry !== 'object') return
+    const record = entry as Record<string, unknown>
+    if (typeof record.truncated_items === 'number') {
+      omittedCount += record.truncated_items
+      return
+    }
+    const text = displayText(record.text)
+    if (!text) return
+    const citations = textList(record.citation_ids)
+    const supporting = textList(record.supporting_evidence_ids)
+    const missing = textList(record.missing_facets)
+    const meta = [
+      IMPORTANCE_LABELS[String(record.importance || '')] || '',
+      citations.length ? `引用 ${citations.join('、')}` : '无引用',
+      record.verdict ? `校验结论 ${String(record.verdict)}` : '',
+      supporting.length && supporting.join() !== citations.join() ? `校验器认定的支持证据 ${supporting.join('、')}` : '',
+      missing.length ? `缺少：${missing.join('；')}` : ''
+    ].filter(Boolean)
+    items.push({
+      key: String(record.claim_id || `removed-${index}`),
+      text,
+      reason: displayText(record.reason) || '校验未通过',
+      meta
+    })
+  })
+  return { items, omittedCount, joinedFallback: debug?.answer_pruning === 'joined_supported_claims' }
+}

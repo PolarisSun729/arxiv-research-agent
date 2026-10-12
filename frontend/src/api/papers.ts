@@ -1020,6 +1020,22 @@ export interface RetrievalDebug {
   engine?: string
   research_rounds?: ResearchRoundDebug[]
   research_steps?: ResearchStepDebug[]
+  removed_claims?: ResearchRemovedClaimDebug[]
+  /** 部分回答正文的生成方式：in_place 原位删除未受支持句子；joined_supported_claims 拼接受支持主张。 */
+  answer_pruning?: 'in_place' | 'joined_supported_claims' | string | null
+}
+
+/** 部分回答里因缺少证据支持而从正文删掉的句子，带校验结论与中文原因。 */
+export interface ResearchRemovedClaimDebug {
+  claim_id?: string
+  text: string
+  importance?: 'core' | 'supporting' | 'background' | string
+  citation_ids?: string[]
+  verdict?: string | null
+  supporting_evidence_ids?: string[]
+  missing_facets?: string[]
+  reason_code?: string
+  reason?: string
 }
 
 /** 研究引擎单轮检索的阶段摘要；字段均为可直接展示的文本与计数。 */

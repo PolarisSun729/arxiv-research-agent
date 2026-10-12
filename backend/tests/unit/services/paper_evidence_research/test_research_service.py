@@ -787,6 +787,11 @@ def test_partial_answer_prunes_unsupported_claims_in_place_and_keeps_markdown() 
         _request(run_id="research-run-markdown-partial"), trace_listener=lambda _run_id, trace: events.extend(trace)
     )
 
+    completed = next(event for event in events if event["event_type"] == "research_completed")
+    assert completed["answer_pruning"] == "in_place"
+    assert [(item["text"], item["reason_code"]) for item in completed["removed_claims"]] == [
+        ("根据证据，方法包含两个层面", "uncited"),
+    ]
     assert result.outcome == "partial"
     assert result.answer == (
         "**1. 检索控制**\n"

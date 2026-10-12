@@ -655,6 +655,57 @@ def _restore_best_verified_draft(state: PaperEvidenceResearchState) -> None:
     )
 
 
+_VERDICT_REMOVAL_REASONS = {
+    "unsupported": "引用的证据不支持这句话",
+    "partially_supported": "证据只支持其中一部分",
+    "conflicting": "与论文证据矛盾",
+    "citation_mismatch": "挂的引用不对，支持它的证据在别的片段里",
+}
+
+
+def _removal_reason(claim: AnswerClaim, assessment: ClaimAssessment | None) -> tuple[str, str]:
+    """未受支持主张被删的原因，顺序与 has_verifiable_support 的判定一致，取第一条不满足的。"""
+    if claim.requires_visual_verification:
+        return "visual_verification_required", "依赖图像内容，文本证据无法核对"
+    if not claim.citation_ids:
+        return "uncited", "没有挂引用，无法对照论文核对"
+    if assessment is None:
+        return "not_verified", "没有拿到校验结果"
+    if assessment.verdict != "supported":
+        return assessment.verdict, _VERDICT_REMOVAL_REASONS.get(assessment.verdict, "校验未通过")
+    if set(assessment.supporting_evidence_ids) != set(claim.citation_ids):
+        return "support_citation_mismatch", "校验器认定的支持证据与句子挂的引用不一致"
+    return "evidence_missing", "支持证据不在证据池中或原文为空"
+
+
+def _removed_claim_records(
+    state: PaperEvidenceResearchState,
+    assessment_by_claim: dict[str, ClaimAssessment],
+    supported_claim_ids: set[str],
+) -> list[dict[str, Any]]:
+    """部分回答里被删掉的主张：原句、引用、校验结论与中文原因，供问答面板排查。"""
+    records: list[dict[str, Any]] = []
+    for claim in state.claims:
+        if claim.claim_id in supported_claim_ids:
+            continue
+        assessment = assessment_by_claim.get(claim.claim_id)
+        reason_code, reason = _removal_reason(claim, assessment)
+        records.append(
+            {
+                "claim_id": claim.claim_id,
+                "text": claim.text,
+                "importance": claim.importance,
+                "citation_ids": list(claim.citation_ids),
+                "verdict": assessment.verdict if assessment is not None else None,
+                "supporting_evidence_ids": list(assessment.supporting_evidence_ids) if assessment is not None else [],
+                "missing_facets": list(assessment.missing_facets) if assessment is not None else [],
+                "reason_code": reason_code,
+                "reason": reason,
+            }
+        )
+    return records
+
+
 def _terminal_node(state: Any, *, requested_abstention: bool = False) -> PaperEvidenceResearchState:
     next_state = _coerce_state(state)
     abstention_reason = (
@@ -712,6 +763,8 @@ def _terminal_node(state: Any, *, requested_abstention: bool = False) -> PaperEv
             claim.text.rstrip("。；") + " " + "".join(f"[source:{source_id}]" for source_id in claim.citation_ids)
             for claim in supported_claims
         ) + "。"
+        removed_claims = _removed_claim_records(next_state, assessment_by_claim, supported_claim_ids)
+        answer_pruning = "in_place" if pruned else "joined_supported_claims"
         outcome = "partial"
         if blocking_failures:
             termination_reason = "partial_answer_after_retrieval_failure"
@@ -723,6 +776,8 @@ def _terminal_node(state: Any, *, requested_abstention: bool = False) -> PaperEv
         # 没有任何核心需求覆盖时，即使背景主张有证据也不能形成有限回答。
         supported_claim_ids = set()
         answer = "当前论文证据不足以支持问题中的核心结论。"
+        removed_claims = []
+        answer_pruning = None
         outcome = "abstained"
         termination_reason = abstention_reason or next_state.action_rejection_code or "no_supported_core_claim"
     next_state.result = _build_result(
@@ -732,7 +787,14 @@ def _terminal_node(state: Any, *, requested_abstention: bool = False) -> PaperEv
         termination_reason=termination_reason,
         supported_claim_ids=supported_claim_ids,
     )
-    _trace(next_state, "research_completed", outcome=outcome)
+    # 部分回答删了哪些句子、为什么删，是排查回答变短的唯一线索，随结束事件一起留在轨迹里。
+    _trace(
+        next_state,
+        "research_completed",
+        outcome=outcome,
+        removed_claims=removed_claims,
+        answer_pruning=answer_pruning,
+    )
     return next_state
 
 

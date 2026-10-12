@@ -13,6 +13,8 @@ import {
 } from '@element-plus/icons-vue'
 import RagChatPanel from '@/components/rag-chat/RagChatPanel.vue'
 import RagEvidencePanel from '@/components/rag-chat/RagEvidencePanel.vue'
+import RagRemovedClaims from '@/components/rag-chat/RagRemovedClaims.vue'
+import { buildRemovedClaimsView } from '@/utils/researchProcess'
 import { usePaperRagChat } from '@/composables/usePaperRagChat'
 import { useUserContext } from '@/composables/useUserContext'
 import { usePaperStore } from '@/stores/paperStore'
@@ -436,7 +438,11 @@ function getTurnStatusHint(item: { response?: any }) {
   if (turn.status === 'failed') return turn.error || '问答失败，请稍后重试。'
   // 研究引擎的部分回答：执行成功，但有主张没找到论文证据支持，已从正文中删去。
   if (turn.retrievalDebug?.qa_observation?.outcome === 'partial') {
-    return '部分内容未找到论文证据支持，已从回答中移除。'
+    // 旧记录没有 removed_claims，不能指引用户去看不存在的列表。
+    const removed = buildRemovedClaimsView(turn.retrievalDebug)
+    return removed.items.length || removed.omittedCount
+      ? '部分内容未找到论文证据支持，已从回答中移除，可在下方查看被移除的句子与原因。'
+      : '部分内容未找到论文证据支持，已从回答中移除。'
   }
   return ''
 }
@@ -706,6 +712,7 @@ watch(activeNoteTypeFilter, async () => {
                     重新生成
                   </el-button>
                 </div>
+                <RagRemovedClaims v-if="item.role === 'assistant'" :debug="item.retrievalDebug" />
                 <div
                   v-if="item.role === 'assistant' && ((item.sources?.length || 0) > 0 || item.retrievalDebug)"
                   class="assistant-actions"

@@ -4,7 +4,9 @@
 这里从轨迹事件中提取两份视图：
 
 - ``research_rounds``：每轮检索一条，带触发它的决策理由和该轮的检索阶段摘要；
-- ``research_steps``：按时间顺序的研究动作（检索、兜底起草、起草、主张拆解、校验、被拒动作、退回最佳草稿、结束）。
+- ``research_steps``：按时间顺序的研究动作（检索、兜底起草、起草、主张拆解、校验、被拒动作、退回最佳草稿、结束）；
+- ``removed_claims``：部分回答里因缺少证据支持而从正文删掉的句子，带引用、校验结论与中文原因；
+- ``answer_pruning``：部分回答的正文怎么来的（``in_place`` 原位删除 / ``joined_supported_claims`` 拼接受支持主张）。
 
 两份视图都是浅层的字符串与计数结构，随回答落库时的 debug 快照裁剪不会把它们截成形状标记。
 """
@@ -18,9 +20,17 @@ def _need_label(need_id: Any) -> str:
     return str(need_id or "").strip() or "-"
 
 
-def build_research_process_debug(trace_events: Iterable[Mapping[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+_REMOVED_CLAIM_FIELDS = (
+    "claim_id", "text", "importance", "citation_ids", "verdict",
+    "supporting_evidence_ids", "missing_facets", "reason_code", "reason",
+)
+
+
+def build_research_process_debug(trace_events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
     rounds: List[Dict[str, Any]] = []
     steps: List[Dict[str, Any]] = []
+    removed_claims: List[Dict[str, Any]] = []
+    answer_pruning: Any = None
     proposed: Mapping[str, Any] = {}
     for event in trace_events or []:
         kind = event.get("event_type")
@@ -86,5 +96,19 @@ def build_research_process_debug(trace_events: Iterable[Mapping[str, Any]]) -> D
                 "detail": f"{int(event.get('supported_claim_count') or 0)} 条主张有证据支持",
             })
         elif kind == "research_completed":
-            steps.append({"kind": "done", "title": "研究结束", "detail": str(event.get("outcome") or "")})
-    return {"research_rounds": rounds, "research_steps": steps}
+            removed_claims = [
+                {field: item.get(field) for field in _REMOVED_CLAIM_FIELDS}
+                for item in event.get("removed_claims") or []
+                if isinstance(item, Mapping)
+            ]
+            answer_pruning = event.get("answer_pruning")
+            detail = str(event.get("outcome") or "")
+            if removed_claims:
+                detail += f" · 移除 {len(removed_claims)} 条无证据支持的句子"
+            steps.append({"kind": "done", "title": "研究结束", "detail": detail})
+    return {
+        "research_rounds": rounds,
+        "research_steps": steps,
+        "removed_claims": removed_claims,
+        "answer_pruning": answer_pruning,
+    }

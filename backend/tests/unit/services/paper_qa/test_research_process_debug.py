@@ -66,3 +66,24 @@ def test_claim_extraction_step_shows_extractor_source():
         "7 条主张 · LLM 拆解", "9 条主张 · 规则兜底", "2 条主张",
     ]
     assert debug["research_steps"][0]["title"] == "拆解第 1 版草稿的主张"
+
+
+def test_removed_claims_are_exposed_for_partial_answers():
+    removed = {
+        "claim_id": "claim-v2-1", "text": "根据证据，方法包含两个层面。", "importance": "core",
+        "citation_ids": [], "verdict": "unsupported", "supporting_evidence_ids": [], "missing_facets": [],
+        "reason_code": "uncited", "reason": "没有挂引用，无法对照论文核对", "unexpected": "dropped",
+    }
+    debug = build_research_process_debug([
+        {"event_type": "research_completed", "outcome": "partial", "removed_claims": [removed], "answer_pruning": "in_place"},
+    ])
+
+    assert debug["answer_pruning"] == "in_place"
+    assert debug["removed_claims"] == [{key: value for key, value in removed.items() if key != "unexpected"}]
+    assert debug["research_steps"][-1]["detail"] == "partial · 移除 1 条无证据支持的句子"
+
+
+def test_completed_research_has_no_removed_claims():
+    debug = build_research_process_debug([{"event_type": "research_completed", "outcome": "completed"}])
+
+    assert debug["removed_claims"] == [] and debug["answer_pruning"] is None
