@@ -91,6 +91,14 @@ const hasQaIndex = computed(() => Boolean(qaStatus.value?.has_index))
 const hasActiveQaJob = computed(() => ['pending', 'running'].includes(String(qaIndexJob.value?.status || '')))
 const chatTurns = computed(() => qaResults.value)
 const ragChatMessages = computed(() => chatTurns.value.flatMap(qaTurnToRagMessages))
+// Milvus 存的是 RetrievalIndex 向量（非原始 chunk），核对基准是后端按入库规则算出的预期向量数。
+const vectorCountCheck = computed(() => {
+  const checks = qaDiagnostic.value?.checks
+  if (checks?.entity_count_matches_metadata == null) return { ok: false, text: '无法核对' }
+  if (checks.entity_count_matches_metadata) return { ok: true, text: '与预期一致' }
+  const diff = (checks.expected_vector_count ?? 0) - (checks.milvus_num_entities ?? 0)
+  return { ok: false, text: diff > 0 ? `缺 ${diff} 条` : `多 ${-diff} 条` }
+})
 const loadingMethodLabel = computed(() => (loadingMethod.value === 'docling' ? 'Docling' : 'PyMuPDF'))
 const loadingMethodHint = computed(() => (loadingMethod.value === 'docling' ? '更适合论文结构' : '保留传统解析'))
 const qaJobStatusText = computed(() => {
@@ -850,10 +858,8 @@ watch(activeNoteTypeFilter, async () => {
                     <strong>{{ qaDiagnostic.collection?.info?.num_entities ?? 0 }}</strong>
                   </div>
                   <div class="side-row">
-                    <span>一致性</span>
-                    <strong :class="qaDiagnostic.checks.entity_count_matches_metadata ? 'ok-text' : 'warn-text'">
-                      {{ qaDiagnostic.checks.entity_count_matches_metadata ? '一致' : '不一致' }}
-                    </strong>
+                    <span>向量数核对</span>
+                    <strong :class="vectorCountCheck.ok ? 'ok-text' : 'warn-text'">{{ vectorCountCheck.text }}</strong>
                   </div>
                   <div class="side-row">
                     <span>关键词检索</span>
@@ -869,6 +875,10 @@ watch(activeNoteTypeFilter, async () => {
                     <div class="diagnostic-line">
                       <span>DB chunk_count</span>
                       <strong>{{ qaDiagnostic.checks.qa_chunk_count ?? 0 }}</strong>
+                    </div>
+                    <div class="diagnostic-line">
+                      <span>预期向量数</span>
+                      <strong>{{ qaDiagnostic.checks.expected_vector_count ?? '-' }}</strong>
                     </div>
                     <div class="diagnostic-line">
                       <span>Milvus num_entities</span>

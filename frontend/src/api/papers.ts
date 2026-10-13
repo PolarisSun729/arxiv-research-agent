@@ -604,8 +604,10 @@ export interface QaDiagnosticResult {
     indexed_status?: boolean
     collection_exists?: boolean
     qa_chunk_count?: number
+    expected_vector_count?: number | null
     milvus_num_entities?: number
-    entity_count_matches_metadata?: boolean
+    // null 表示 retrieval index 文件读不到，无法核对。
+    entity_count_matches_metadata?: boolean | null
     milvus_has_entities?: boolean
     sample_chunks_returned?: number
     likely_keyword_search_will_work?: boolean
