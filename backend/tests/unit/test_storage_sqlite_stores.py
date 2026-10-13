@@ -798,6 +798,15 @@ class StorageContainerSqliteTests(unittest.TestCase):
         self.assertEqual(row[0], "needs_review")
         self.assertEqual(row[1], inactive_snapshot["snapshot_id"])
 
+        snapshots = self.storage.research_profiles.list_user_profile_snapshots(self.user_id)
+        by_id = {item["snapshot_id"]: item for item in snapshots}
+        self.assertEqual(sorted(item["build_number"] for item in snapshots), [1, 2])
+        self.assertTrue(by_id[active_snapshot["snapshot_id"]]["active"])
+        self.assertFalse(by_id[inactive_snapshot["snapshot_id"]]["active"])
+        self.assertEqual(by_id[active_snapshot["snapshot_id"]]["topics"]["positive_topics"], ["RAG retrieval optimization"])
+        self.assertEqual(by_id[active_snapshot["snapshot_id"]]["representative_paper_count"], 1)
+        self.assertFalse(by_id[inactive_snapshot["snapshot_id"]]["quality_report"]["approved"])
+
     def test_json_serialization_helpers_handle_boundary_values(self) -> None:
         self.assertEqual(self.storage.paper_catalog._serialize_json_field(None), "")
         self.assertEqual(self.storage.paper_catalog._deserialize_json_field(""), None)

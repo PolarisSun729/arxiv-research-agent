@@ -521,14 +521,19 @@ class ResearchProfileStore(BaseSqliteStore):
         }
 
     def list_user_profile_snapshots(self, user_id: str = DEFAULT_USER_ID, limit: int = 20) -> List[Dict[str, Any]]:
-        """列出画像快照摘要，避免前端列表一次性拉取完整 profile payload。"""
+        """列出画像快照摘要，只带各区主题列表供切换前预览，不返回 topic_evidence 等完整 payload。"""
         try:
             active_snapshot_id = (self.get_user_generated_profile(user_id) or {}).get("snapshot_id")
             with self._get_connection() as conn:
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM user_profile_snapshots WHERE user_id = ?",
+                    (user_id,),
+                ).fetchone()[0]
                 rows = conn.execute(
                     '''
                     SELECT snapshot_id, user_id, evidence_summary_json, quality_report_json, build_config_json,
-                           extractor_version, normalizer_version, profile_build_version, created_at
+                           extractor_version, normalizer_version, profile_build_version, created_at,
+                           generated_profile_json
                     FROM user_profile_snapshots
                     WHERE user_id = ?
                     ORDER BY created_at DESC
@@ -536,21 +541,32 @@ class ResearchProfileStore(BaseSqliteStore):
                     ''',
                     (user_id, max(1, int(limit or 20))),
                 ).fetchall()
-            return [
-                {
-                    "snapshot_id": row[0],
-                    "user_id": row[1],
-                    "evidence_summary": self._deserialize_json_field(row[2]) or {},
-                    "quality_report": self._deserialize_json_field(row[3]) or {},
-                    "build_config": self._deserialize_json_field(row[4]) or {},
-                    "extractor_version": row[5],
-                    "normalizer_version": row[6],
-                    "profile_build_version": row[7],
-                    "created_at": row[8],
-                    "active": row[0] == active_snapshot_id,
-                }
-                for row in rows
-            ]
+            snapshots = []
+            for index, row in enumerate(rows):
+                generated = self._normalize_profile_projection(row[1], self._deserialize_json_field(row[9]) or {})
+                snapshots.append(
+                    {
+                        "snapshot_id": row[0],
+                        "user_id": row[1],
+                        # 按时间倒序编号，给前端展示「第 N 次构建」，避免让用户辨认 UUID。
+                        "build_number": total - index,
+                        "evidence_summary": self._deserialize_json_field(row[2]) or {},
+                        "quality_report": self._deserialize_json_field(row[3]) or {},
+                        "build_config": self._deserialize_json_field(row[4]) or {},
+                        "extractor_version": row[5],
+                        "normalizer_version": row[6],
+                        "profile_build_version": row[7],
+                        "created_at": row[8],
+                        "active": row[0] == active_snapshot_id,
+                        "topics": {
+                            "positive_topics": list(generated.get("positive_topics") or []),
+                            "recent_topics": list(generated.get("recent_topics") or []),
+                            "negative_topics": list(generated.get("negative_topics") or []),
+                        },
+                        "representative_paper_count": len(generated.get("representative_papers") or []),
+                    }
+                )
+            return snapshots
         except Exception as e:
             logger.error(f"Error listing profile snapshots: {str(e)}")
             return []

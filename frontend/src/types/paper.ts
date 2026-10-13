@@ -120,6 +120,22 @@ export interface UserProfileBuildJob {
   updated_at?: string | null
 }
 
+export interface ProfileSnapshotSummary {
+  snapshot_id: string
+  build_number?: number
+  created_at?: string | null
+  active: boolean
+  topics?: {
+    positive_topics: string[]
+    recent_topics: string[]
+    negative_topics: string[]
+  }
+  representative_paper_count?: number
+  evidence_summary?: Record<string, any>
+  quality_report?: Record<string, any>
+  build_config?: Record<string, any>
+}
+
 export interface UserResearchProfileDetail {
   user_id: string
   manual_profile: UserResearchProfile
@@ -128,7 +144,7 @@ export interface UserResearchProfileDetail {
   evidence_summary?: Record<string, any>
   quality_report?: Record<string, any>
   build_jobs: UserProfileBuildJob[]
-  snapshots: Array<Record<string, any>>
+  snapshots: ProfileSnapshotSummary[]
   latest_build_job?: UserProfileBuildJob | null
 }
 
