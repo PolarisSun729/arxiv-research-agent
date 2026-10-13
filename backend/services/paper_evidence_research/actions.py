@@ -5,7 +5,13 @@ from typing import Annotated, Any, Literal, Union
 from pydantic import BaseModel, Field, TypeAdapter
 
 
-class SearchPaperAction(BaseModel):
+class _ResearchActionBase(BaseModel):
+    # 决策器读完已召回证据全文后标记的无关候选，动作通过门禁后移出证据池。
+    # 用"标记丢弃"而不是"列出保留"：模型漏写时证据仍在，不会因输出不全丢掉有用证据。
+    discard_evidence_ids: list[str] = Field(default_factory=list)
+
+
+class SearchPaperAction(_ResearchActionBase):
     action: Literal["search_paper"]
     target_need_id: str
     target_claim_id: str | None = None
@@ -16,19 +22,19 @@ class SearchPaperAction(BaseModel):
     reason_code: str
 
 
-class DraftAnswerAction(BaseModel):
+class DraftAnswerAction(_ResearchActionBase):
     action: Literal["draft_answer"]
     addressed_need_ids: list[str] = Field(default_factory=list)
     reason_code: str
 
 
-class FinalizeAnswerAction(BaseModel):
+class FinalizeAnswerAction(_ResearchActionBase):
     action: Literal["finalize_answer"]
     draft_id: str | None = None
     reason_code: str
 
 
-class AbstainAction(BaseModel):
+class AbstainAction(_ResearchActionBase):
     action: Literal["abstain"]
     reason_code: str
 

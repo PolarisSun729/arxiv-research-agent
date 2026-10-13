@@ -45,7 +45,7 @@ class PromptBudgetConfig:
         section_targets: 按 section 覆盖默认软预算（单位 token），优先级高于按比例计算的结果。
     """
 
-    max_input_tokens: int = 64000
+    max_input_tokens: int = 245760
     safety_margin_tokens: int = 2048
     rag_target_ratio: float = 0.78
     section_targets: Dict[str, int] = field(default_factory=dict)

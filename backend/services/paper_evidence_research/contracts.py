@@ -4,14 +4,21 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from utils.config import PAPER_EVIDENCE_RESEARCH_CONFIG
+
 
 class ResearchLimits(BaseModel):
     max_retrievals: int = Field(default=3, ge=1, le=10)
     max_draft_attempts: int = Field(default=2, ge=1, le=5)
     max_no_progress: int = Field(default=1, ge=0, le=5)
     max_invalid_actions: int = Field(default=2, ge=0, le=5)
-    max_evidence_items: int = Field(default=20, ge=1, le=100)
-    max_total_context_chars: int = Field(default=30_000, ge=1_000, le=200_000)
+    # 证据池上限按模型上下文推导，见 PAPER_EVIDENCE_RESEARCH_CONFIG。
+    max_evidence_items: int = Field(
+        default=PAPER_EVIDENCE_RESEARCH_CONFIG["max_evidence_items"], ge=1, le=1000
+    )
+    max_total_context_chars: int = Field(
+        default=PAPER_EVIDENCE_RESEARCH_CONFIG["max_total_context_chars"], ge=1_000, le=1_000_000
+    )
 
 
 class PaperEvidenceResearchRequest(BaseModel):

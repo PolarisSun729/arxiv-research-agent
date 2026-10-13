@@ -418,7 +418,7 @@ class PromptContextBuilder:
     def _prompt_budget_config(self) -> PromptBudgetConfig:
         """从 prompt_config 读取 token 预算参数，包括按 section 覆盖的软预算。"""
         return PromptBudgetConfig(
-            max_input_tokens=int(self.prompt_config.get("prompt_max_input_tokens", 64000)),
+            max_input_tokens=int(self.prompt_config.get("prompt_max_input_tokens", 245760)),
             safety_margin_tokens=int(self.prompt_config.get("prompt_safety_margin_tokens", 2048)),
             rag_target_ratio=float(self.prompt_config.get("rag_target_ratio", 0.78)),
             section_targets=self._section_targets_config(),

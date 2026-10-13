@@ -1096,8 +1096,8 @@ class RecordingPolicy(ScriptedPolicyFromActions):
         return super().decide(context)
 
 
-def test_decision_context_exposes_pool_fullness_and_need_evidence() -> None:
-    # 决策器只看到计数时会把"需求状态未变"误读为"没找到证据"而反复检索；必须让它看到池满与证据摘要。
+def test_decision_context_exposes_pool_fullness_and_full_evidence() -> None:
+    # 决策器只看摘要会把对题证据误判为无关而弃答（0a82ae71）；必须让它看到池满状态与证据全文。
     policy = RecordingPolicy(
         [
             {
@@ -1130,12 +1130,19 @@ def test_decision_context_exposes_pool_fullness_and_need_evidence() -> None:
     assert first.evidence_pool_full is False
     assert second.evidence_pool_capacity == 1
     assert second.evidence_pool_full is True
+    assert first.evidence == []
+    assert [(item.candidate_id, item.content, item.section_path) for item in second.evidence] == [
+        ("chunk-method", "The reflection token decides whether retrieval is required.", "Method"),
+    ]
     digest = {item.need_id: item for item in second.need_evidence}
     assert digest["need-method"].candidate_count == 1
-    assert "reflection token decides" in digest["need-method"].previews[0]
-    assert "Method" in digest["need-method"].previews[0]
-    assert digest["need-ablation"].candidate_count == 0
+    assert digest["need-method"].candidate_ids == ["chunk-method"]
+    assert digest["need-ablation"].candidate_ids == []
     proposed = [event for event in events if event["event_type"] == "action_proposed"]
+    assert proposed[0]["decision_evidence_count"] == 0
+    assert proposed[1]["decision_evidence_count"] == 1
+    assert proposed[1]["decision_evidence_chars"] == len("The reflection token decides whether retrieval is required.")
+    assert proposed[1]["decision_image_count"] == 0
     assert proposed[0]["target_need_id"] == "need-method"
     assert proposed[0]["reason_code"] == "OPEN_EVIDENCE_NEED"
     assert proposed[0]["query"] == "reflection token mechanism"
@@ -1257,3 +1264,152 @@ def test_dependency_failure_is_exposed_as_a_structured_system_error() -> None:
     assert captured.value.code == "paper_evidence_research_failed"
     assert captured.value.stage == "graph_invoke"
     assert captured.value.detail["research_run_id"] == "research-run-error"
+
+
+class NoisyRetriever:
+    """每个需求都召回一条对题证据，外加一条与问题无关的噪声片段。"""
+
+    def __init__(self, *, figure_path: str = "") -> None:
+        self._figure_path = figure_path
+
+    def retrieve(self, action: Any, _state: Any) -> dict[str, Any]:
+        noise = {"content": "Acknowledgements: we thank the reviewers.", "chunk_id": "chunk-noise", "section_path": "Acknowledgements"}
+        if action.target_need_id == "need-method":
+            relevant: dict[str, Any] = {
+                "content": "The reflection token decides whether retrieval is required.",
+                "chunk_id": "chunk-method",
+                "section_path": "Method",
+            }
+            if self._figure_path:
+                relevant.update(chunk_type="figure", asset_abs_path=self._figure_path, asset_summary="架构图")
+        else:
+            relevant = {
+                "content": "Without reflection tokens the score drops from 54.1 to 50.3.",
+                "chunk_id": "chunk-ablation",
+                "section_path": "Experiments/Ablation",
+            }
+        return {"status": "completed", "candidates": [relevant, noise]}
+
+
+def _noisy_service(actions: list[dict[str, Any]], **overrides: Any) -> PaperEvidenceResearchService:
+    dependencies: dict[str, Any] = {
+        "question_analyzer": ScriptedQuestionAnalyzer(),
+        "decision_policy": ScriptedPolicyFromActions(actions),
+        "retriever": NoisyRetriever(),
+        "draft_generator": ScriptedDraftGenerator(),
+        "claim_extractor": ScriptedClaimExtractor(),
+        "claim_verifier": AlwaysSupportingClaimVerifier(),
+    }
+    dependencies.update(overrides)
+    return PaperEvidenceResearchService(**dependencies)
+
+
+_SEARCH_METHOD = {
+    "action": "search_paper", "target_need_id": "need-method", "objective": "discover",
+    "retrieval_mode": "method", "query": "reflection token mechanism", "reason_code": "OPEN_EVIDENCE_NEED",
+}
+_SEARCH_ABLATION = {
+    "action": "search_paper", "target_need_id": "need-ablation", "objective": "discover",
+    "retrieval_mode": "experiment", "query": "reflection token ablation", "reason_code": "OPEN_EVIDENCE_NEED",
+}
+
+
+def test_discarded_evidence_leaves_the_pool_and_is_not_readmitted() -> None:
+    drafter = RecordingDraftGenerator()
+    service = _noisy_service(
+        [
+            _SEARCH_METHOD,
+            # 读完第一轮召回的全文后，决策器把致谢段落标为无关；未知 ID 忽略。
+            {**_SEARCH_ABLATION, "discard_evidence_ids": ["chunk-noise", "chunk-unknown"]},
+            {"action": "draft_answer", "reason_code": "INITIAL_DRAFT"},
+            {"action": "abstain", "reason_code": "TEST_STOP"},
+        ],
+        draft_generator=drafter,
+    )
+    events: list[dict[str, Any]] = []
+
+    service.research(_request(run_id="research-run-discard"), trace_listener=lambda _run_id, trace: events.extend(trace))
+
+    discarded = [event for event in events if event["event_type"] == "evidence_discarded"]
+    assert len(discarded) == 1
+    assert discarded[0]["discarded_candidate_ids"] == ["chunk-noise"]
+    assert discarded[0]["ignored_candidate_ids"] == ["chunk-unknown"]
+    assert discarded[0]["remaining_candidate_count"] == 1
+    retrievals = [event for event in events if event["event_type"] == "retrieval_completed"]
+    # 第二轮又召回了致谢段落：挡在池外、不算新增。
+    assert retrievals[1]["excluded_candidate_count"] == 1
+    assert retrievals[1]["new_candidate_count"] == 1
+    assert sorted(drafter.received_candidate_ids) == ["chunk-ablation", "chunk-method"]
+
+
+def test_cited_and_verified_evidence_cannot_be_discarded() -> None:
+    service = _noisy_service(
+        [
+            _SEARCH_METHOD,
+            {"action": "draft_answer", "reason_code": "INITIAL_DRAFT"},
+            {"action": "abstain", "discard_evidence_ids": ["chunk-method", "chunk-noise"], "reason_code": "TEST_STOP"},
+        ]
+    )
+    events: list[dict[str, Any]] = []
+
+    service.research(_request(run_id="research-run-protected"), trace_listener=lambda _run_id, trace: events.extend(trace))
+
+    discarded = next(event for event in events if event["event_type"] == "evidence_discarded")
+    assert discarded["discarded_candidate_ids"] == ["chunk-noise"]
+    assert discarded["protected_candidate_ids"] == ["chunk-method"]
+
+
+def test_rejected_action_does_not_discard_evidence() -> None:
+    policy = RecordingPolicy(
+        [
+            _SEARCH_METHOD,
+            # 还没有草稿，定稿必然被门禁拒绝；被拒动作附带的丢弃不生效。
+            {"action": "finalize_answer", "discard_evidence_ids": ["chunk-noise"], "reason_code": "TOO_EARLY"},
+            {"action": "abstain", "reason_code": "TEST_STOP"},
+        ]
+    )
+    events: list[dict[str, Any]] = []
+    service = _noisy_service([], decision_policy=policy)
+
+    service.research(_request(run_id="research-run-rejected-discard"), trace_listener=lambda _run_id, trace: events.extend(trace))
+
+    assert not [event for event in events if event["event_type"] == "evidence_discarded"]
+    assert {item.candidate_id for item in policy.contexts[-1].evidence} == {"chunk-method", "chunk-noise"}
+
+
+def test_figure_assets_reach_decision_and_draft_but_not_the_trace(tmp_path: Any) -> None:
+    import json
+
+    figure_path = str(tmp_path / "secret-assets" / "figure-2.png")
+    policy = RecordingPolicy(
+        [_SEARCH_METHOD, {"action": "draft_answer", "reason_code": "INITIAL_DRAFT"}, {"action": "abstain", "reason_code": "TEST_STOP"}]
+    )
+    drafter = RecordingDraftGenerator()
+
+    class AssetRecordingDrafter(RecordingDraftGenerator):
+        def generate(self, request: Any) -> dict[str, Any]:
+            drafter.received_candidate_ids = [candidate.asset_abs_path for candidate in request.candidates]
+            return super().generate(request)
+
+    service = _noisy_service(
+        [], decision_policy=policy, retriever=NoisyRetriever(figure_path=figure_path), draft_generator=AssetRecordingDrafter(),
+    )
+    events: list[dict[str, Any]] = []
+
+    result = service.research(_request(run_id="research-run-figure"), trace_listener=lambda _run_id, trace: events.extend(trace))
+
+    figure = next(item for item in policy.contexts[1].evidence if item.candidate_id == "chunk-method")
+    assert figure.chunk_type == "figure" and figure.asset_abs_path == figure_path
+    assert figure_path in drafter.received_candidate_ids
+    proposed = [event for event in events if event["event_type"] == "action_proposed"]
+    assert proposed[1]["decision_image_count"] == 1
+    # 资产本地路径只在研究链路内部流转，不能写进轨迹或对外结果。
+    assert "secret-assets" not in json.dumps(events, ensure_ascii=False, default=str)
+    assert "secret-assets" not in result.model_dump_json()
+
+
+def test_default_pool_limits_fit_a_whole_paper() -> None:
+    limits = ResearchLimits()
+    # 一篇论文约 68 个 chunk、8.3 万字符；池上限按 256K 上下文推导，整篇都能进池。
+    assert limits.max_evidence_items >= 68
+    assert limits.max_total_context_chars >= 83_000

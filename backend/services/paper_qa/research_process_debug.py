@@ -4,7 +4,7 @@
 这里从轨迹事件中提取两份视图：
 
 - ``research_rounds``：每轮检索一条，带触发它的决策理由和该轮的检索阶段摘要；
-- ``research_steps``：按时间顺序的研究动作（检索、兜底起草、起草、主张拆解、校验、被拒动作、退回最佳草稿、结束）；
+- ``research_steps``：按时间顺序的研究动作（检索、筛掉无关证据、兜底起草、起草、主张拆解、校验、被拒动作、退回最佳草稿、结束）；
 - ``removed_claims``：部分回答里因缺少证据支持而从正文删掉的句子，带引用、校验结论与中文原因；
 - ``answer_pruning``：部分回答的正文怎么来的（``in_place`` 原位删除 / ``joined_supported_claims`` 拼接受支持主张）。
 
@@ -18,6 +18,19 @@ from typing import Any, Dict, Iterable, List, Mapping
 
 def _need_label(need_id: Any) -> str:
     return str(need_id or "").strip() or "-"
+
+
+def _decision_reading(proposed: Mapping[str, Any]) -> str:
+    """决策时读了多少条证据全文、几张图；旧轨迹没有这些字段时不显示。"""
+    if "decision_evidence_count" not in proposed:
+        return ""
+    text = f"决策时阅读 {int(proposed.get('decision_evidence_count') or 0)} 条证据全文"
+    image_count = int(proposed.get("decision_image_count") or 0)
+    return text + (f"、{image_count} 张图" if image_count else "")
+
+
+def _join_detail(*parts: str) -> str:
+    return " · ".join(part for part in parts if part)
 
 
 _REMOVED_CLAIM_FIELDS = (
@@ -37,6 +50,14 @@ def build_research_process_debug(trace_events: Iterable[Mapping[str, Any]]) -> D
         if kind == "action_proposed":
             # 决策理由要挂到它触发的那一步上，单独列出会让面板把"提议"和"执行"重复展示。
             proposed = event
+        elif kind == "evidence_discarded":
+            discarded = list(event.get("discarded_candidate_ids") or [])
+            if discarded:
+                steps.append({
+                    "kind": "filter",
+                    "title": f"筛掉 {len(discarded)} 条无关证据",
+                    "detail": f"剩余 {int(event.get('remaining_candidate_count') or 0)} 条",
+                })
         elif kind == "action_rejected":
             steps.append({
                 "kind": "rejected",
@@ -47,7 +68,8 @@ def build_research_process_debug(trace_events: Iterable[Mapping[str, Any]]) -> D
             round_no = int(event.get("retrieval_count") or len(rounds) + 1)
             new_count = int(event.get("new_candidate_count") or 0)
             duplicate_count = int(event.get("duplicate_candidate_count") or 0)
-            reason = str(proposed.get("reason_code") or "") if proposed.get("action") == "search_paper" else ""
+            search_proposed = proposed if proposed.get("action") == "search_paper" else {}
+            reason = str(search_proposed.get("reason_code") or "")
             rounds.append({
                 "round": round_no,
                 "target_need_id": _need_label(event.get("target_need_id")),
@@ -61,7 +83,11 @@ def build_research_process_debug(trace_events: Iterable[Mapping[str, Any]]) -> D
             steps.append({
                 "kind": "search",
                 "title": f"第 {round_no} 轮检索（{_need_label(event.get('target_need_id'))}）",
-                "detail": f"新增 {new_count} 条候选，重复 {duplicate_count} 条" + (f" · 决策理由 {reason}" if reason else ""),
+                "detail": _join_detail(
+                    f"新增 {new_count} 条候选，重复 {duplicate_count} 条",
+                    f"决策理由 {reason}" if reason else "",
+                    _decision_reading(search_proposed),
+                ),
             })
         elif kind == "fallback_draft_scheduled":
             steps.append({
@@ -70,11 +96,12 @@ def build_research_process_debug(trace_events: Iterable[Mapping[str, Any]]) -> D
                 "detail": str(event.get("reason_code") or ""),
             })
         elif kind == "draft_created":
-            reason = str(proposed.get("reason_code") or "") if proposed.get("action") == "draft_answer" else ""
+            draft_proposed = proposed if proposed.get("action") == "draft_answer" else {}
+            reason = str(draft_proposed.get("reason_code") or "")
             steps.append({
                 "kind": "draft",
                 "title": f"起草第 {event.get('version') or '-'} 版答案",
-                "detail": f"决策理由 {reason}" if reason else "",
+                "detail": _join_detail(f"决策理由 {reason}" if reason else "", _decision_reading(draft_proposed)),
             })
         elif kind == "claims_extracted":
             source = {"llm": "LLM 拆解", "rule": "规则兜底"}.get(str(event.get("extractor_source") or ""), "")

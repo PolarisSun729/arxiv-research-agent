@@ -87,3 +87,33 @@ def test_completed_research_has_no_removed_claims():
     debug = build_research_process_debug([{"event_type": "research_completed", "outcome": "completed"}])
 
     assert debug["removed_claims"] == [] and debug["answer_pruning"] is None
+
+
+def test_discarded_evidence_and_decision_reading_are_shown():
+    debug = build_research_process_debug([
+        {"event_type": "action_proposed", "action": "search_paper", "reason_code": "OPEN_NEED",
+         "decision_evidence_count": 0, "decision_image_count": 0},
+        {"event_type": "retrieval_completed", "retrieval_count": 1, "target_need_id": "need-1",
+         "new_candidate_count": 20, "duplicate_candidate_count": 0},
+        {"event_type": "action_proposed", "action": "draft_answer", "reason_code": "ON_TOPIC",
+         "decision_evidence_count": 20, "decision_image_count": 2},
+        {"event_type": "evidence_discarded", "discarded_candidate_ids": ["7", "9"], "remaining_candidate_count": 18},
+        {"event_type": "evidence_discarded", "discarded_candidate_ids": [], "remaining_candidate_count": 18},
+        {"event_type": "draft_created", "version": 1},
+    ])
+
+    steps = debug["research_steps"]
+    assert steps[0]["detail"] == "新增 20 条候选，重复 0 条 · 决策理由 OPEN_NEED · 决策时阅读 0 条证据全文"
+    # 只有受保护或未知 ID 时没有真正丢弃，不单独列一步。
+    assert steps[1] == {"kind": "filter", "title": "筛掉 2 条无关证据", "detail": "剩余 18 条"}
+    assert steps[2]["detail"] == "决策理由 ON_TOPIC · 决策时阅读 20 条证据全文、2 张图"
+    assert len(steps) == 3
+
+
+def test_old_traces_without_decision_reading_keep_previous_detail():
+    debug = build_research_process_debug([
+        {"event_type": "action_proposed", "action": "draft_answer", "reason_code": "INITIAL_DRAFT"},
+        {"event_type": "draft_created", "version": 1},
+    ])
+
+    assert debug["research_steps"][0]["detail"] == "决策理由 INITIAL_DRAFT"

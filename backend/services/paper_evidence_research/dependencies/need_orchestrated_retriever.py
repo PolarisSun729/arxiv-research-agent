@@ -199,6 +199,23 @@ def _build_query(action: Any, state: Any) -> str:
     return joined[:_MAX_QUERY_CHARS].strip()
 
 
+def _asset_fields(payload: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        match_confidence = float(payload.get("asset_section_match_confidence") or 0.0)
+    except (TypeError, ValueError):
+        match_confidence = 0.0
+    return {
+        "asset_kind": str(payload.get("asset_kind") or "").strip(),
+        "asset_path": str(payload.get("asset_path") or "").strip(),
+        "asset_abs_path": str(payload.get("asset_abs_path") or "").strip(),
+        "asset_summary": str(payload.get("asset_summary") or "").strip(),
+        "asset_preview_text": str(payload.get("asset_preview_text") or "").strip(),
+        "asset_section_match_type": str(payload.get("asset_section_match_type") or "").strip(),
+        "asset_section_match_confidence": match_confidence,
+        "asset_section_match_allow_embedding": bool(payload.get("asset_section_match_allow_embedding", False)),
+    }
+
+
 class NeedOrchestratedRetriever:
     """把语义检索动作接到生产检索管线上的适配器。"""
 
@@ -335,6 +352,8 @@ class NeedOrchestratedRetriever:
             "section_path": str(payload.get("section_path") or "").strip(),
             "page_number": _coerce_page_number(payload.get("page_number")),
             "table_id": _identity_text(payload.get("table_id")),
+            # 图表资产随候选入池：起草与决策时据此附原图。
+            **_asset_fields(payload),
             # rank/score 不进 EvidenceCandidate，只供研究轨迹记录本轮召回排名。
             "rank": rank,
             "score": _coerce_score(payload.get("score")),

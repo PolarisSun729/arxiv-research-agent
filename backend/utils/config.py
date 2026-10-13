@@ -480,7 +480,8 @@ MEMORY_RUNTIME_CONFIG: Dict[str, Any] = {
 
 PROMPT_CONTEXT_CONFIG: Dict[str, Any] = {
     "enable_block_prompt_context": _env_bool("ENABLE_BLOCK_PROMPT_CONTEXT", True),
-    "prompt_max_input_tokens": _env_int("PROMPT_MAX_INPUT_TOKENS", 64000),
+    # 主力模型上下文 256K（262,144 token），扣 16K 给输出。
+    "prompt_max_input_tokens": _env_int("PROMPT_MAX_INPUT_TOKENS", 245760),
     "prompt_safety_margin_tokens": _env_int("PROMPT_SAFETY_MARGIN_TOKENS", 2048),
     "rag_target_ratio": float(_env_str("PROMPT_RAG_TARGET_RATIO", "0.78")),
     "token_counter_provider": _env_str("PROMPT_TOKEN_COUNTER_PROVIDER", "auto"),
@@ -517,6 +518,13 @@ PROMPT_CONTEXT_CONFIG: Dict[str, Any] = {
     "rag_fallback_preview_tokens": _env_int("PROMPT_RAG_FALLBACK_PREVIEW_TOKENS", 160),
     "table_candidate_cell_limit": _env_int("PROMPT_TABLE_CANDIDATE_CELL_LIMIT", 8),
     "figure_preview_tokens": _env_int("PROMPT_FIGURE_PREVIEW_TOKENS", 220),
+}
+
+PAPER_EVIDENCE_RESEARCH_CONFIG: Dict[str, Any] = {
+    # 证据池上限按 256K 上下文推导：输入预算 245,760 token，扣掉 30 张图（约 45K）与指令/状态（约 10K），
+    # 证据文本约 190K token，按 3 字符/token 折算约 57 万字符。一篇论文约 8 万字符，整篇都能进池。
+    "max_evidence_items": _env_int("RESEARCH_MAX_EVIDENCE_ITEMS", 300),
+    "max_total_context_chars": _env_int("RESEARCH_MAX_TOTAL_CONTEXT_CHARS", 560_000),
 }
 
 ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
@@ -803,6 +811,12 @@ GENERATION_CONFIG: Dict[str, Any] = {
     # 每次生成的完整上下文与回答落盘到 05-generation-results，仅供调试复盘；
     # 文件含用户问题和回答原文且没有清理机制，默认关闭，排查时再临时打开。
     "save_generation_results": _env_bool("SAVE_GENERATION_RESULTS", False),
+    # Responses API 多模态请求：请求体上限是 base64 图片的传输限制（DashScope 约 6MB），不是上下文限制；
+    # 图片数量按 256K 上下文放开，单图目标字节会按剩余请求体预算自适应压缩。
+    "qwen_responses_max_image_count": _env_int("QWEN_RESPONSES_MAX_IMAGE_COUNT", 30),
+    "qwen_responses_request_body_limit_bytes": _env_int("QWEN_RESPONSES_REQUEST_BODY_LIMIT_BYTES", 6_291_456),
+    "qwen_responses_request_body_soft_limit_bytes": _env_int("QWEN_RESPONSES_REQUEST_BODY_SOFT_LIMIT_BYTES", 5_500_000),
+    "qwen_responses_image_target_bytes": _env_int("QWEN_RESPONSES_IMAGE_TARGET_BYTES", 1_500_000),
     # 任务到模型角色的路由表只保留在配置层，业务代码只负责读取，不再硬编码模型名。
     "task_model_roles": {
         "intent_recognition": "small",  # 解析用户原始输入以识别高层意图

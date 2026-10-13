@@ -404,3 +404,37 @@ def test_stage_summary_is_absent_when_pipeline_returns_no_debug() -> None:
     result = _retriever(RecordingPipeline([{"content": "evidence", "chunk_id": "c1"}])).retrieve(_action(), _state())
 
     assert result["stage_summary"] is None
+
+
+def test_figure_asset_fields_survive_mapping_and_pool_merge() -> None:
+    # 资产字段丢了，起草和决策就拿不到原图；结构化表格不入池，避免 table-evidence-* 引用 ID 与候选 ID 对不上。
+    pipeline = RecordingPipeline(
+        [
+            {
+                "content": "Figure 2: Overall architecture.",
+                "chunk_id": "54",
+                "chunk_type": "figure",
+                "asset_kind": "figure",
+                "asset_path": "assets/figure-2.png",
+                "asset_abs_path": "/data/assets/figure-2.png",
+                "asset_summary": "总体架构图",
+                "asset_section_match_type": "caption",
+                "asset_section_match_confidence": "0.9",
+                "asset_section_match_allow_embedding": True,
+                "table_evidence": {"schema_version": "v2"},
+            }
+        ]
+    )
+
+    payload = _retriever(pipeline).retrieve(_action(), _state())["candidates"][0]
+    merged, new_count, _ = merge_candidates(
+        {}, [payload], target_need_id="need-method", max_items=10, max_total_context_chars=10_000
+    )
+
+    candidate = merged["54"]
+    assert new_count == 1
+    assert candidate.asset_abs_path == "/data/assets/figure-2.png"
+    assert candidate.asset_summary == "总体架构图"
+    assert candidate.asset_section_match_confidence == 0.9
+    assert candidate.asset_section_match_allow_embedding is True
+    assert "table_evidence" not in candidate.model_dump()

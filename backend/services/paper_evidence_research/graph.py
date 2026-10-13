@@ -32,9 +32,6 @@ from .state import (
 
 # 研究轨迹是审计与评测数据源，不是第二份候选池；单轮召回记录数封顶防止轨迹被异常检索器撑爆。
 _MAX_TRACED_CANDIDATES = 50
-# 决策上下文只放每个需求的前几条证据摘要，足够判断"是否已对题"，又不把决策 prompt 撑成生成 prompt。
-_MAX_DECISION_PREVIEWS_PER_NEED = 3
-_DECISION_PREVIEW_CHARS = 160
 logger = logging.getLogger(__name__)
 
 
@@ -115,27 +112,27 @@ def _evidence_pool_full(state: PaperEvidenceResearchState) -> bool:
 
 
 def _need_evidence_digest(state: PaperEvidenceResearchState) -> list[NeedEvidenceDigest]:
+    # 只给需求到候选的对应关系；正文放在决策上下文的 evidence 里，按入池顺序（即召回排名顺序）排列。
     digests: list[NeedEvidenceDigest] = []
     for need in state.evidence_needs:
-        # 候选按入池顺序排列，即首次召回的排名顺序；只给前几条摘要，让决策器判断证据是否已对题。
         matched = [
-            candidate for candidate in state.evidence_candidates.values() if need.need_id in candidate.matched_need_ids
+            candidate.candidate_id
+            for candidate in state.evidence_candidates.values()
+            if need.need_id in candidate.matched_need_ids
         ]
-        previews = []
-        for candidate in matched[:_MAX_DECISION_PREVIEWS_PER_NEED]:
-            location = " ".join(
-                part
-                for part in (
-                    candidate.chunk_type,
-                    candidate.section_path,
-                    f"p{candidate.page_number}" if candidate.page_number is not None else "",
-                )
-                if part
-            )
-            snippet = " ".join(candidate.content.split())[:_DECISION_PREVIEW_CHARS]
-            previews.append(f"[{location}] {snippet}")
-        digests.append(NeedEvidenceDigest(need_id=need.need_id, candidate_count=len(matched), previews=previews))
+        digests.append(NeedEvidenceDigest(need_id=need.need_id, candidate_count=len(matched), candidate_ids=matched))
     return digests
+
+
+def _decision_evidence_fields(context: ResearchDecisionContext) -> dict[str, Any]:
+    # 记录决策时读到了多少证据全文和多少张图，事后才能确认决策不是只凭摘要做出的。
+    return {
+        "decision_evidence_count": len(context.evidence),
+        "decision_evidence_chars": sum(len(candidate.content) for candidate in context.evidence),
+        "decision_image_count": sum(
+            1 for candidate in context.evidence if candidate.chunk_type == "figure" and candidate.asset_abs_path
+        ),
+    }
 
 
 def _action_trace_fields(action: Any) -> dict[str, Any]:
@@ -171,6 +168,7 @@ def _decide_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEv
         evidence_pool_capacity=next_state.request.limits.max_evidence_items,
         evidence_pool_full=_evidence_pool_full(next_state),
         need_evidence=_need_evidence_digest(next_state),
+        evidence=list(next_state.evidence_candidates.values()),
     )
     next_state.action_accepted = False
     next_state.action_rejection_code = None
@@ -194,6 +192,7 @@ def _decide_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEv
         "action_proposed",
         action=next_state.pending_action.action,
         **_action_trace_fields(next_state.pending_action),
+        **_decision_evidence_fields(context),
     )
     return next_state
 
@@ -210,6 +209,7 @@ def _validate_node(state: Any) -> PaperEvidenceResearchState:
     next_state.action_rejection_code = validation.rejection_code
     if validation.accepted:
         _trace(next_state, "action_accepted", action=next_state.pending_action.action)
+        _apply_evidence_discards(next_state)
     else:
         next_state.invalid_action_count += 1
         _trace(
@@ -219,6 +219,53 @@ def _validate_node(state: Any) -> PaperEvidenceResearchState:
             rejection_code=validation.rejection_code,
         )
     return next_state
+
+
+def _protected_evidence_ids(state: PaperEvidenceResearchState) -> set[str]:
+    """不能丢弃的候选：草稿引用与已验证证据。
+
+    完成门禁要求支持证据仍在池中且有原文，最佳草稿可能在终止时被退回，它的引用同样要保住。
+    """
+    protected: set[str] = set()
+    if state.current_draft is not None:
+        protected.update(state.current_draft.used_candidate_ids)
+    for claim in state.claims:
+        protected.update(claim.citation_ids)
+    for need in state.evidence_needs:
+        protected.update(need.verified_evidence_ids)
+    best = state.best_verified_draft
+    if best is not None:
+        protected.update(best.draft.used_candidate_ids)
+        for claim in best.claims:
+            protected.update(claim.citation_ids)
+        for need in best.evidence_needs:
+            protected.update(need.verified_evidence_ids)
+    return protected
+
+
+def _apply_evidence_discards(state: PaperEvidenceResearchState) -> None:
+    """把决策器标记为无关的候选移出证据池，之后不再进入起草和校验。"""
+    requested = list(dict.fromkeys(state.pending_action.discard_evidence_ids if state.pending_action else []))
+    if not requested:
+        return
+    protected = _protected_evidence_ids(state)
+    # 未知 ID（模型编造或早已丢弃）直接忽略，只处理池中确实存在的候选。
+    known = [candidate_id for candidate_id in requested if candidate_id in state.evidence_candidates]
+    kept_protected = [candidate_id for candidate_id in known if candidate_id in protected]
+    discarded = [candidate_id for candidate_id in known if candidate_id not in protected]
+    for candidate_id in discarded:
+        state.evidence_candidates.pop(candidate_id, None)
+        if candidate_id not in state.discarded_candidate_ids:
+            state.discarded_candidate_ids.append(candidate_id)
+    _trace(
+        state,
+        "evidence_discarded",
+        action=state.pending_action.action,
+        discarded_candidate_ids=discarded,
+        protected_candidate_ids=kept_protected,
+        ignored_candidate_ids=[candidate_id for candidate_id in requested if candidate_id not in known],
+        remaining_candidate_count=len(state.evidence_candidates),
+    )
 
 
 def _route_after_validation(state: Any) -> str:
@@ -281,9 +328,12 @@ def _search_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEv
         # 同一需求成功重试（包括正常空召回）后故障已恢复，不能被历史失败永久污染。
         next_state.retrieval_failures.pop(action.target_need_id, None)
     candidates = retrieval.get("candidates") or []
+    # 决策器丢弃过的候选再次被召回时挡在池外，不算新增，避免"丢了又回来"。
+    discarded_ids = set(next_state.discarded_candidate_ids)
+    admitted = [item for item in candidates if candidate_identity(dict(item or {})) not in discarded_ids]
     merged, new_count, duplicate_count = merge_candidates(
         next_state.evidence_candidates,
-        candidates,
+        admitted,
         target_need_id=action.target_need_id,
         max_items=next_state.request.limits.max_evidence_items,
         max_total_context_chars=next_state.request.limits.max_total_context_chars,
@@ -312,6 +362,7 @@ def _search_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEv
         main_intent=retrieval.get("main_intent"),
         new_candidate_count=new_count,
         duplicate_candidate_count=duplicate_count,
+        excluded_candidate_count=len(candidates) - len(admitted),
         candidates=_trace_candidate_refs(retrieval.get("retrieval_candidates", candidates)),
         index_snapshot=retrieval.get("index_snapshot"),
         # 适配器给出的本轮检索阶段摘要（改写/召回/融合/rerank/最终上下文），供问答面板按轮复盘。

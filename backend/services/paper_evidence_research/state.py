@@ -32,6 +32,17 @@ class EvidenceCandidate(BaseModel):
     table_id: str = ""
     matched_need_ids: list[str] = Field(default_factory=list)
     appearance_count: int = 1
+    # 图表资产：起草和决策时由 ContextPackBuilder 据此附原图、渲染图表摘要。
+    # asset_abs_path 是服务器本地路径，只在研究链路内部流转，不能写进轨迹或对外结果。
+    # 不带 table_evidence：ContextPackBuilder 会给结构化表格另起 table-evidence-* 引用 ID，与候选 ID 对不上。
+    asset_kind: str = ""
+    asset_path: str = ""
+    asset_abs_path: str = ""
+    asset_summary: str = ""
+    asset_preview_text: str = ""
+    asset_section_match_type: str = ""
+    asset_section_match_confidence: float = 0.0
+    asset_section_match_allow_embedding: bool = False
 
 
 class EvidenceContextPack(BaseModel):
@@ -104,11 +115,11 @@ class ClaimVerificationRequest(BaseModel):
 
 
 class NeedEvidenceDigest(BaseModel):
-    """决策器看到的单个需求的证据概况：候选数加少量摘要，不暴露完整正文。"""
+    """需求到已召回证据的对应关系；证据全文在 ResearchDecisionContext.evidence 里，这里不重复。"""
 
     need_id: str
     candidate_count: int = 0
-    previews: list[str] = Field(default_factory=list)
+    candidate_ids: list[str] = Field(default_factory=list)
 
 
 class ResearchDecisionContext(BaseModel):
@@ -126,6 +137,9 @@ class ResearchDecisionContext(BaseModel):
     evidence_pool_capacity: int = 0
     evidence_pool_full: bool = False
     need_evidence: list[NeedEvidenceDigest] = Field(default_factory=list)
+    # 池中全部候选的全文（按入池顺序，即召回排名顺序）。只看摘要的决策器会把对题证据误判为
+    # 无关而弃答（0a82ae71），所以决策时必须读原文；图片候选由策略层据资产字段附原图。
+    evidence: list[EvidenceCandidate] = Field(default_factory=list)
 
 
 class VerifiedDraftSnapshot(BaseModel):
@@ -160,6 +174,8 @@ class PaperEvidenceResearchState(BaseModel):
     # 连续无进展后检索通道关闭：后续只允许基于现有证据池起草、定稿或弃答。
     retrieval_stalled: bool = False
     best_verified_draft: VerifiedDraftSnapshot | None = None
+    # 决策器判定无关、已移出证据池的候选；后续检索再召回它们时不再入池。
+    discarded_candidate_ids: list[str] = Field(default_factory=list)
     invalid_action_count: int = 0
     trace_events: list[dict[str, Any]] = Field(default_factory=list)
     result: PaperEvidenceResearchResult | None = None
