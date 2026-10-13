@@ -284,7 +284,7 @@ function parseContextLines(content: string) {
 }
 
 .chain-label {
-  color: #64748b;
+  color: var(--color-text-3);
   font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -292,7 +292,7 @@ function parseContextLines(content: string) {
 
 .chain-question p {
   margin: 6px 0 0;
-  color: #0f172a;
+  color: var(--color-text);
   font-size: 13.5px;
   line-height: 1.65;
 }
@@ -303,32 +303,32 @@ function parseContextLines(content: string) {
   gap: 10px;
   padding: 12px 14px;
   border-radius: 14px;
-  background: #f8fafc;
-  border: 1px solid #eef2f7;
+  background: var(--color-surface-muted);
+  border: 1px solid var(--color-surface-sunken);
 }
 
 .chain-summary__outcome {
   align-self: flex-start;
   padding: 2px 10px;
   border-radius: 999px;
-  background: #e2e8f0;
-  color: #334155;
+  background: var(--color-border);
+  color: var(--color-text-2);
   font-size: 12px;
   font-weight: 600;
 }
 
 .chain-summary__outcome--completed {
-  background: #dcfce7;
+  background: var(--color-success-soft);
   color: #15803d;
 }
 
 .chain-summary__outcome--partial {
-  background: #fef3c7;
-  color: #b45309;
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
 }
 
 .chain-summary__outcome--abstained {
-  background: #fee2e2;
+  background: var(--color-danger-soft);
   color: #b91c1c;
 }
 
@@ -345,14 +345,14 @@ function parseContextLines(content: string) {
 }
 
 .chain-summary__stat strong {
-  color: #0f172a;
+  color: var(--color-text);
   font-size: 16px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
 
 .chain-summary__stat span {
-  color: #94a3b8;
+  color: var(--color-text-4);
   font-size: 12px;
 }
 
@@ -369,7 +369,7 @@ function parseContextLines(content: string) {
 }
 
 .chain-step {
-  --tone: #3b82f6;
+  --tone: var(--color-primary);
   position: relative;
   display: flex;
   gap: 12px;
@@ -383,7 +383,7 @@ function parseContextLines(content: string) {
   bottom: -2px;
   left: 4px;
   width: 1px;
-  background: #e2e8f0;
+  background: var(--color-border);
 }
 
 .chain-step:last-child {
@@ -394,11 +394,11 @@ function parseContextLines(content: string) {
   display: none;
 }
 
-.chain-step--slate { --tone: #94a3b8; }
+.chain-step--slate { --tone: var(--color-text-4); }
 .chain-step--violet { --tone: #8b5cf6; }
-.chain-step--green { --tone: #22c55e; }
+.chain-step--green { --tone: var(--color-success); }
 .chain-step--amber { --tone: #f59e0b; }
-.chain-step--red { --tone: #ef4444; }
+.chain-step--red { --tone: var(--color-danger); }
 
 .chain-step__dot {
   flex: none;
@@ -419,7 +419,7 @@ function parseContextLines(content: string) {
 }
 
 .chain-step__title {
-  color: #0f172a;
+  color: var(--color-text);
   font-size: 13.5px;
   font-weight: 600;
   line-height: 1.45;
@@ -434,8 +434,8 @@ function parseContextLines(content: string) {
 .chain-chip {
   padding: 2px 8px;
   border-radius: 6px;
-  background: #f1f5f9;
-  color: #475569;
+  background: var(--color-surface-sunken);
+  color: var(--color-text-2);
   font-size: 12px;
   line-height: 1.6;
 }
@@ -443,10 +443,10 @@ function parseContextLines(content: string) {
 .chain-step__reason {
   padding: 8px 10px;
   border: 0;
-  border-left: 2px solid #e2e8f0;
+  border-left: 2px solid var(--color-border);
   border-radius: 0 8px 8px 0;
-  background: #f8fafc;
-  color: #64748b;
+  background: var(--color-surface-muted);
+  color: var(--color-text-3);
   cursor: pointer;
   font-family: inherit;
   font-size: 12.5px;
@@ -463,8 +463,8 @@ function parseContextLines(content: string) {
 }
 
 .chain-step__reason:hover {
-  border-left-color: #cbd5e1;
-  color: #475569;
+  border-left-color: var(--color-border-strong);
+  color: var(--color-text-2);
 }
 
 .chain-step__reason--open .chain-step__reason-text {
@@ -473,7 +473,7 @@ function parseContextLines(content: string) {
 
 .chain-step__reason-label {
   margin-right: 6px;
-  color: #334155;
+  color: var(--color-text-2);
   font-weight: 600;
 }
 
@@ -484,9 +484,9 @@ function parseContextLines(content: string) {
 }
 
 .chain-round {
-  border: 1px solid #e8edf4;
+  border: 1px solid var(--color-border);
   border-radius: 14px;
-  background: #fff;
+  background: var(--color-surface);
 }
 
 .chain-round__head {
@@ -511,7 +511,7 @@ function parseContextLines(content: string) {
 }
 
 .chain-round__title {
-  color: #0f172a;
+  color: var(--color-text);
   font-size: 13.5px;
   font-weight: 600;
 }
@@ -519,7 +519,7 @@ function parseContextLines(content: string) {
 .chain-round__subtitle {
   display: -webkit-box;
   overflow: hidden;
-  color: #94a3b8;
+  color: var(--color-text-4);
   font-size: 12px;
   line-height: 1.55;
   -webkit-box-orient: vertical;
@@ -548,7 +548,7 @@ function parseContextLines(content: string) {
   width: 4px;
   height: 4px;
   border-radius: 50%;
-  background: #cbd5e1;
+  background: var(--color-border-strong);
 }
 
 .chain-chevron {
@@ -556,8 +556,8 @@ function parseContextLines(content: string) {
   width: 7px;
   height: 7px;
   margin: 0 4px;
-  border-right: 1.5px solid #94a3b8;
-  border-bottom: 1.5px solid #94a3b8;
+  border-right: 1.5px solid var(--color-text-4);
+  border-bottom: 1.5px solid var(--color-text-4);
   transform: rotate(-45deg);
   transition: transform 0.2s;
 }
@@ -572,7 +572,7 @@ function parseContextLines(content: string) {
   gap: 8px 12px;
   margin: 0;
   padding: 12px 14px 14px;
-  border-top: 1px solid #f1f5f9;
+  border-top: 1px solid var(--color-surface-sunken);
 }
 
 .chain-stages--flat {
@@ -581,14 +581,14 @@ function parseContextLines(content: string) {
 }
 
 .chain-stages dt {
-  color: #94a3b8;
+  color: var(--color-text-4);
   font-size: 12px;
   line-height: 1.65;
 }
 
 .chain-stages dd {
   margin: 0;
-  color: #334155;
+  color: var(--color-text-2);
   font-size: 12.5px;
   line-height: 1.65;
   white-space: pre-wrap;
@@ -614,25 +614,25 @@ function parseContextLines(content: string) {
   gap: 2px;
   padding: 6px 10px;
   border-radius: 8px;
-  background: #f8fafc;
+  background: var(--color-surface-muted);
 }
 
 .chain-context__head {
-  color: #64748b;
+  color: var(--color-text-3);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px;
 }
 
 .chain-context__text {
   overflow: hidden;
-  color: #334155;
+  color: var(--color-text-2);
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .chain-empty {
-  color: #94a3b8;
+  color: var(--color-text-4);
   font-size: 13px;
 }
 </style>

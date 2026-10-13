@@ -95,41 +95,40 @@ const statusLabel = computed(() => {
 
 <style scoped>
 .arxiv-query-capability-banner {
+  --tone: var(--color-primary);
+  --tone-soft: var(--color-primary-soft);
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 16px;
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  border-left: 5px solid #0f766e;
-  border-radius: 18px;
-  background:
-    radial-gradient(circle at top left, rgba(20, 184, 166, 0.16), transparent 34%),
-    linear-gradient(135deg, #f8fffd 0%, #ffffff 58%, #f8fafc 100%);
-  color: #0f172a;
+  gap: 10px;
+  padding: 14px 16px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  color: var(--color-text);
 }
 
 .arxiv-query-capability-banner--warning {
-  border-left-color: #d97706;
-  background:
-    radial-gradient(circle at top left, rgba(245, 158, 11, 0.18), transparent 34%),
-    linear-gradient(135deg, #fffbeb 0%, #ffffff 58%, #f8fafc 100%);
+  --tone: var(--color-warning);
+  --tone-soft: var(--color-warning-soft);
+  border-color: var(--color-warning-border);
+  background: var(--color-warning-soft);
 }
 
 .arxiv-query-capability-banner--error {
-  border-left-color: #dc2626;
-  background:
-    radial-gradient(circle at top left, rgba(239, 68, 68, 0.16), transparent 34%),
-    linear-gradient(135deg, #fff7f7 0%, #ffffff 58%, #f8fafc 100%);
+  --tone: var(--color-danger);
+  --tone-soft: var(--color-danger-soft);
+  border-color: var(--color-danger-border);
+  background: var(--color-danger-soft);
 }
 
 .arxiv-query-capability-banner--compact {
-  padding: 14px;
+  padding: 12px 14px;
 }
 
 .capability-main {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 
 .capability-title-row,
@@ -138,7 +137,7 @@ const statusLabel = computed(() => {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
 }
 
 .capability-badge,
@@ -146,75 +145,63 @@ const statusLabel = computed(() => {
 .capability-chip {
   display: inline-flex;
   align-items: center;
-  min-height: 24px;
-  padding: 3px 9px;
-  border-radius: 999px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: var(--radius-sm);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 550;
 }
 
 .capability-badge {
-  background: rgba(15, 118, 110, 0.12);
-  color: #0f766e;
-}
-
-.arxiv-query-capability-banner--warning .capability-badge {
-  background: rgba(217, 119, 6, 0.14);
-  color: #92400e;
-}
-
-.arxiv-query-capability-banner--error .capability-badge {
-  background: rgba(220, 38, 38, 0.12);
-  color: #991b1b;
+  background: var(--tone);
+  color: #fff;
 }
 
 .capability-source,
 .capability-chip {
-  background: rgba(15, 23, 42, 0.06);
-  color: #334155;
+  background: rgba(17, 24, 39, 0.06);
+  color: var(--color-text-2);
 }
 
 .capability-summary {
-  font-size: 15px;
-  font-weight: 700;
-  line-height: 1.55;
+  font-size: 14px;
+  font-weight: 550;
+  line-height: 1.6;
 }
 
 .capability-meta {
-  color: #64748b;
+  gap: 4px 14px;
+  color: var(--color-text-3);
   font-size: 12px;
-}
-
-.capability-details {
-  border-top: 1px solid rgba(15, 23, 42, 0.08);
-  padding-top: 10px;
 }
 
 .capability-details summary {
   cursor: pointer;
-  color: #0f172a;
-  font-size: 13px;
-  font-weight: 700;
+  color: var(--tone);
+  font-size: 12.5px;
+  font-weight: 550;
 }
 
 .capability-detail-body {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  margin-top: 12px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed rgba(17, 24, 39, 0.12);
 }
 
 .capability-warning-list,
 .capability-detail-lines {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 
 .capability-warning-list p,
 .capability-detail-lines p {
   margin: 0;
-  color: #475569;
+  color: var(--color-text-2);
   font-size: 13px;
   line-height: 1.6;
 }
@@ -228,20 +215,18 @@ const statusLabel = computed(() => {
 .capability-group {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 
 .capability-detail-label {
-  color: #64748b;
+  color: var(--color-text-3);
   font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-weight: 600;
 }
 
 .capability-chip--muted {
-  color: #64748b;
-  background: rgba(100, 116, 139, 0.1);
+  color: var(--color-text-4);
+  text-decoration: line-through;
 }
 
 @media (max-width: 760px) {

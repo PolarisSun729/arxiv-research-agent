@@ -346,9 +346,9 @@ watch(tabs, visibleTabs => {
   z-index: 2;
   margin: -6px calc(-1 * var(--evidence-inset, 20px)) 0;
   padding: 6px var(--evidence-inset, 20px) 10px;
-  background: rgba(255, 255, 255, 0.96);
+  background: var(--color-surface);
   backdrop-filter: blur(10px);
-  border-bottom: 1px solid #f1f5f9;
+  border-bottom: 1px solid var(--color-surface-sunken);
 }
 
 .evidence-head__row {
@@ -359,7 +359,7 @@ watch(tabs, visibleTabs => {
 }
 
 .evidence-head__eyebrow {
-  color: #0f172a;
+  color: var(--color-text);
   font-size: 15px;
   font-weight: 700;
 }
@@ -375,15 +375,15 @@ watch(tabs, visibleTabs => {
   border: 0;
   border-radius: 6px;
   background: none;
-  color: #64748b;
+  color: var(--color-text-3);
   cursor: pointer;
   font-family: inherit;
   font-size: 12px;
 }
 
 .evidence-link:hover:not(:disabled) {
-  background: #f1f5f9;
-  color: #2563eb;
+  background: var(--color-surface-sunken);
+  color: var(--color-primary);
 }
 
 .evidence-link:disabled {
@@ -395,7 +395,7 @@ watch(tabs, visibleTabs => {
   display: -webkit-box;
   margin: 6px 0 0;
   overflow: hidden;
-  color: #475569;
+  color: var(--color-text-2);
   font-size: 13px;
   line-height: 1.6;
   -webkit-box-orient: vertical;
@@ -407,7 +407,7 @@ watch(tabs, visibleTabs => {
   gap: 2px;
   padding: 3px;
   border-radius: 10px;
-  background: #f1f5f9;
+  background: var(--color-surface-sunken);
 }
 
 .evidence-tab {
@@ -420,7 +420,7 @@ watch(tabs, visibleTabs => {
   border: 0;
   border-radius: 8px;
   background: none;
-  color: #64748b;
+  color: var(--color-text-3);
   cursor: pointer;
   font-family: inherit;
   font-size: 13px;
@@ -429,12 +429,12 @@ watch(tabs, visibleTabs => {
 }
 
 .evidence-tab:hover {
-  color: #0f172a;
+  color: var(--color-text);
 }
 
 .evidence-tab--active {
-  background: #fff;
-  color: #0f172a;
+  background: var(--color-surface);
+  color: var(--color-text);
   font-weight: 600;
   box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
 }
@@ -442,15 +442,15 @@ watch(tabs, visibleTabs => {
 .evidence-tab__count {
   padding: 0 6px;
   border-radius: 999px;
-  background: #e2e8f0;
-  color: #475569;
+  background: var(--color-border);
+  color: var(--color-text-2);
   font-size: 11px;
   line-height: 17px;
 }
 
 .evidence-tab--active .evidence-tab__count {
-  background: #dbeafe;
-  color: #2563eb;
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
 }
 
 .evidence-pane {
@@ -462,9 +462,9 @@ watch(tabs, visibleTabs => {
 .evidence-warning {
   padding: 9px 12px;
   border-radius: 10px;
-  background: #fffbeb;
-  border: 1px solid #fde68a;
-  color: #92400e;
+  background: var(--color-warning-soft);
+  border: 1px solid var(--color-warning-border);
+  color: var(--color-warning);
   font-size: 12.5px;
   line-height: 1.6;
 }
@@ -474,7 +474,7 @@ watch(tabs, visibleTabs => {
   flex-direction: column;
   gap: 10px;
   padding-bottom: 14px;
-  border-bottom: 1px solid #f1f5f9;
+  border-bottom: 1px solid var(--color-surface-sunken);
 }
 
 .evidence-block:last-child {
@@ -486,7 +486,7 @@ watch(tabs, visibleTabs => {
   display: flex;
   align-items: center;
   gap: 8px;
-  color: #0f172a;
+  color: var(--color-text);
   font-size: 13.5px;
   font-weight: 600;
 }
@@ -494,8 +494,8 @@ watch(tabs, visibleTabs => {
 .evidence-block__count {
   padding: 0 7px;
   border-radius: 999px;
-  background: #f1f5f9;
-  color: #64748b;
+  background: var(--color-surface-sunken);
+  color: var(--color-text-3);
   font-size: 11px;
   font-weight: 600;
   line-height: 18px;
@@ -509,14 +509,14 @@ watch(tabs, visibleTabs => {
 }
 
 .evidence-dl dt {
-  color: #94a3b8;
+  color: var(--color-text-4);
   font-size: 12px;
   line-height: 1.65;
 }
 
 .evidence-dl dd {
   margin: 0;
-  color: #334155;
+  color: var(--color-text-2);
   font-size: 12.5px;
   line-height: 1.65;
   word-break: break-word;
@@ -528,25 +528,25 @@ watch(tabs, visibleTabs => {
   gap: 6px;
   padding: 10px 12px;
   border-radius: 10px;
-  background: #f8fafc;
+  background: var(--color-surface-muted);
 }
 
 .evidence-module__name {
-  color: #475569;
+  color: var(--color-text-2);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   font-weight: 600;
 }
 
 .evidence-chunk {
-  border: 1px solid #e8edf4;
+  border: 1px solid var(--color-border);
   border-radius: 10px;
-  background: #fff;
+  background: var(--color-surface);
 }
 
 .evidence-chunk--nested {
-  border-color: #f1f5f9;
-  background: #fbfcfe;
+  border-color: var(--color-surface-sunken);
+  background: var(--color-surface-muted);
 }
 
 .evidence-chunk summary {
@@ -554,7 +554,7 @@ watch(tabs, visibleTabs => {
   align-items: center;
   gap: 8px;
   padding: 8px 12px;
-  color: #334155;
+  color: var(--color-text-2);
   cursor: pointer;
   font-size: 12.5px;
   font-weight: 500;
@@ -566,7 +566,7 @@ watch(tabs, visibleTabs => {
 }
 
 .evidence-chunk[open] > summary {
-  color: #0f172a;
+  color: var(--color-text);
   font-weight: 600;
 }
 
@@ -578,13 +578,13 @@ watch(tabs, visibleTabs => {
 }
 
 .evidence-chunk__meta {
-  color: #94a3b8;
+  color: var(--color-text-4);
   font-size: 12px;
   line-height: 1.6;
 }
 
 .evidence-chunk__text {
-  color: #334155;
+  color: var(--color-text-2);
   font-size: 12.5px;
   line-height: 1.7;
   white-space: pre-wrap;
@@ -593,20 +593,20 @@ watch(tabs, visibleTabs => {
 
 .evidence-empty {
   padding: 22px 20px;
-  border-radius: 16px;
-  border: 1px dashed #d5deea;
-  background: #fbfcfe;
+  border-radius: var(--radius-lg);
+  border: 1px dashed var(--color-border-strong);
+  background: var(--color-surface-muted);
 }
 
 .evidence-empty__title {
-  color: #0f172a;
+  color: var(--color-text);
   font-size: 15px;
   font-weight: 700;
 }
 
 .evidence-empty__text {
   margin-top: 8px;
-  color: #64748b;
+  color: var(--color-text-3);
   font-size: 13px;
   line-height: 1.7;
 }

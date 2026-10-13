@@ -211,7 +211,7 @@ const groups = computed(() => [
   align-items: center;
   gap: 8px;
   padding: 0 2px;
-  color: #64748b;
+  color: var(--color-text-3);
   font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -226,14 +226,14 @@ const groups = computed(() => [
 }
 
 .cite-group__title--toggle:hover {
-  color: #334155;
+  color: var(--color-text-2);
 }
 
 .cite-group__count {
   padding: 1px 7px;
   border-radius: 999px;
-  background: #f1f5f9;
-  color: #64748b;
+  background: var(--color-surface-sunken);
+  color: var(--color-text-3);
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0;
@@ -252,25 +252,25 @@ const groups = computed(() => [
 .cite-item {
   /* 让出面板顶部吸附的分页栏，跳转定位时标题不被挡住。 */
   scroll-margin-top: 72px;
-  border: 1px solid #e8edf4;
+  border: 1px solid var(--color-border);
   border-radius: 14px;
-  background: #fff;
+  background: var(--color-surface);
   transition: border-color 0.2s, box-shadow 0.2s;
 }
 
 .cite-item:hover {
-  border-color: #d5deea;
+  border-color: var(--color-border-strong);
 }
 
 .cite-item--open {
-  border-color: #d5deea;
+  border-color: var(--color-border-strong);
   box-shadow: 0 6px 18px rgba(15, 23, 42, 0.05);
 }
 
 .cite-item--highlighted,
 .cite-item--highlighted:hover {
-  border-color: #3b82f6;
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.14);
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--color-primary-soft);
 }
 
 .cite-item__head {
@@ -295,16 +295,16 @@ const groups = computed(() => [
   height: 22px;
   padding: 0 6px;
   border-radius: 7px;
-  background: #eff6ff;
-  color: #2563eb;
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
   font-size: 12px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
 
 .cite-item--muted .cite-item__index {
-  background: #f1f5f9;
-  color: #64748b;
+  background: var(--color-surface-sunken);
+  color: var(--color-text-3);
 }
 
 .cite-item__heading {
@@ -317,7 +317,7 @@ const groups = computed(() => [
 
 .cite-item__title {
   overflow: hidden;
-  color: #0f172a;
+  color: var(--color-text);
   font-size: 13.5px;
   font-weight: 600;
   line-height: 1.4;
@@ -328,7 +328,7 @@ const groups = computed(() => [
 .cite-item__meta {
   display: flex;
   gap: 6px;
-  color: #94a3b8;
+  color: var(--color-text-4);
   font-size: 12px;
 }
 
@@ -342,8 +342,8 @@ const groups = computed(() => [
   width: 7px;
   height: 7px;
   margin: 0 4px;
-  border-right: 1.5px solid #94a3b8;
-  border-bottom: 1.5px solid #94a3b8;
+  border-right: 1.5px solid var(--color-text-4);
+  border-bottom: 1.5px solid var(--color-text-4);
   transform: rotate(-45deg);
   transition: transform 0.2s;
 }
@@ -356,7 +356,7 @@ const groups = computed(() => [
   display: -webkit-box;
   margin: 8px 14px 12px 46px;
   overflow: hidden;
-  color: #64748b;
+  color: var(--color-text-3);
   font-size: 12.5px;
   line-height: 1.65;
   -webkit-box-orient: vertical;
@@ -366,8 +366,8 @@ const groups = computed(() => [
 .cite-item__body {
   margin: 10px 14px 14px;
   padding-top: 10px;
-  border-top: 1px dashed #e2e8f0;
-  color: #334155;
+  border-top: 1px dashed var(--color-border);
+  color: var(--color-text-2);
   font-size: 13px;
   line-height: 1.75;
   white-space: pre-wrap;
@@ -384,21 +384,21 @@ const groups = computed(() => [
   max-height: 260px;
   margin-top: 12px;
   border-radius: 10px;
-  border: 1px solid #eef2f7;
-  background: #f8fafc;
+  border: 1px solid var(--color-surface-sunken);
+  background: var(--color-surface-muted);
 }
 
 .cite-item__asset-missing {
   margin-top: 8px;
-  color: #94a3b8;
+  color: var(--color-text-4);
   font-size: 12px;
 }
 
 .cite-empty {
   padding: 14px 16px;
   border-radius: 12px;
-  background: #f8fafc;
-  color: #64748b;
+  background: var(--color-surface-muted);
+  color: var(--color-text-3);
   font-size: 13px;
   line-height: 1.6;
 }

@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { ref, watch, computed } from 'vue'
 import type { Paper, RecommendedPaper } from '@/types/paper'
+import { ArrowRight, CircleCheck, CircleClose, Document } from '@element-plus/icons-vue'
 import SimilarityTag from './SimilarityTag.vue'
 import { toPercent } from '@/utils/format'
-import { getLabelClass, getLabelText } from '@/utils/paperLabel'
+import { getLabelText } from '@/utils/paperLabel'
 
 const props = defineProps<{
   paper: Paper | RecommendedPaper
@@ -184,413 +185,380 @@ function handleViewDetail() {
   emit('view-detail', props.paper.id)
 }
 
-function handleLabelChange(value: string) {
-  const label = value === 'liked' ? 'liked' : value === 'disliked' ? 'disliked' : null
-  emit('label', props.paper.id, label)
+const summaryExpanded = ref(false)
+const detailsOpen = ref(false)
+
+// 再次点击已选中的标记即取消标记。
+function toggleLabel(value: 'liked' | 'disliked') {
+  const next = selectedLabel.value === value ? '' : value
+  selectedLabel.value = next
+  emit('label', props.paper.id, next || null)
 }
 
 function formatDate(dateStr: string) {
   return new Date(dateStr).toLocaleDateString('zh-CN')
 }
-
-const labelOptions = [
-  { label: '未标记', value: '', emoji: '🫧' },
-  { label: '感兴趣', value: 'liked', emoji: '💚' },
-  { label: '不感兴趣', value: 'disliked', emoji: '💔' }
-]
 </script>
 
 <template>
-  <el-card class="paper-card">
-    <div class="paper-main">
-      <div class="paper-header">
-        <div class="paper-title">
-          <el-tooltip :content="paper.title" placement="top">
-            <h3 class="title-text">{{ paper.title }}</h3>
-          </el-tooltip>
-        </div>
-        <div class="paper-labels">
-          <el-tag
-            v-if="paper.label"
-            :class="getLabelClass(paper.label)"
-            size="small"
-          >
-            {{ getLabelText(paper.label) }}
-          </el-tag>
-        </div>
-      </div>
+  <article :class="['surface', 'paper-card', { 'is-liked': paper.label === 'liked', 'is-disliked': paper.label === 'disliked' }]">
+    <header class="paper-head">
+      <h3 class="paper-title" @click="handleViewDetail">{{ paper.title }}</h3>
+      <span v-if="paper.label" :class="['chip', paper.label === 'liked' ? 'chip--success' : 'chip--danger']">
+        {{ getLabelText(paper.label) }}
+      </span>
+    </header>
 
-      <div class="paper-authors">
-        <span class="authors-label">作者：</span>
-        <span class="authors-list">{{ authorsDisplay }}</span>
-      </div>
-
-      <div class="paper-summary">
-        <p class="summary-expanded">
-          {{ paper.summary }}
-        </p>
-      </div>
+    <div class="paper-meta">
+      <span class="meta-authors" :title="authorsDisplay">{{ authorsDisplay }}</span>
+      <span class="meta-sep">·</span>
+      <span class="meta-date">{{ formatDate(paper.publishedAt) }}</span>
+      <span v-for="cat in paper.categories" :key="cat" class="chip">{{ cat }}</span>
     </div>
 
-      <div class="paper-footer">
-        <div class="paper-meta">
-        <div class="meta-item">
-          <el-tag size="small">{{ formatDate(paper.publishedAt) }}</el-tag>
-        </div>
-        <div class="meta-item">
-          <el-tag
-            v-for="cat in paper.categories"
-            :key="cat"
-            size="small"
-            type="info"
-          >
-            {{ cat }}
-          </el-tag>
-        </div>
+    <p :class="['paper-summary', { 'clamp-3': !summaryExpanded }]">{{ paper.summary }}</p>
+    <button v-if="paper.summary && paper.summary.length > 240" type="button" class="link-btn" @click="summaryExpanded = !summaryExpanded">
+      {{ summaryExpanded ? '收起摘要' : '展开摘要' }}
+    </button>
+
+    <section v-if="showRecommendationMetrics || showAgentMetrics" class="match-panel">
+      <div class="match-top">
+        <span class="match-label">相似度</span>
+        <SimilarityTag :score="similarityDisplayScore" class="match-bar" />
+        <span v-if="finalScoreText" class="match-final">综合 <strong>{{ finalScoreText }}</strong></span>
       </div>
 
-      <div v-if="showRecommendationMetrics || showAgentMetrics" class="paper-similarity">
-        <span class="similarity-label">相似度：</span>
-        <SimilarityTag :score="similarityDisplayScore" />
-        <span v-if="finalScoreText" class="final-score-label">最终 {{ finalScoreText }}</span>
-        <template v-if="showRecommendationMetrics">
-          <el-tag v-if="bestMatchedClusterId" size="small" type="success" effect="plain">
-            命中簇 {{ bestMatchedClusterId }}
-          </el-tag>
-          <el-tag v-if="recallClusterId" size="small" type="warning" effect="plain">
-            召回来源 {{ recallClusterId }}
-          </el-tag>
-          <el-tag v-if="recallClusterId" size="small" type="info" effect="plain">
-            簇召回相似度 {{ toPercent(recallClusterSimilarity) }}%
-          </el-tag>
-          <el-tag v-if="recallClusterHitsCount > 1" size="small" type="info" effect="plain">
-            多簇命中 {{ recallClusterHitsCount }}
-          </el-tag>
-          <el-tag size="small" type="success" effect="plain">
-            多样性得分 {{ toPercent(diversityMatchScore) }}%
-          </el-tag>
-          <el-tag v-if="diversityReason" size="small" type="warning" effect="plain">
-            {{ diversityReason }}
-          </el-tag>
-          <p v-if="recommendationReason" class="recommendation-reason">
-            {{ recommendationReason }}
-          </p>
-        </template>
+      <template v-if="showRecommendationMetrics">
+        <p v-if="recommendationReason" class="match-reason">{{ recommendationReason }}</p>
+      </template>
+      <template v-if="showAgentMetrics">
+        <p v-if="agentMatchReason" class="match-reason">{{ agentMatchReason }}</p>
+        <p v-if="agentPersonalizedReason" class="match-reason">{{ agentPersonalizedReason }}</p>
+      </template>
 
-        <template v-if="showAgentMetrics">
-          <el-tag v-if="agentPriority" size="small" type="success" effect="plain">
-            优先级 #{{ agentPriority }}
-          </el-tag>
-          <el-tag v-if="agentQueryMatchScore" size="small" type="info" effect="plain">
-            查询 {{ toPercent(agentQueryMatchScore) }}%
-          </el-tag>
-          <el-tag v-if="agentPersonalizationScore" size="small" type="warning" effect="plain">
-            兴趣 {{ toPercent(agentPersonalizationScore) }}%
-          </el-tag>
-          <el-tag v-if="agentFinalScore" size="small" type="success" effect="plain">
-            综合 {{ toPercent(agentFinalScore) }}%
-          </el-tag>
-          <el-tag v-if="agentMatchedTerms.length" size="small" type="info" effect="plain">
-            命中词 {{ agentMatchedTerms.slice(0, 3).join(' / ') }}
-          </el-tag>
-          <p v-if="agentMatchReason" class="recommendation-reason">
-            {{ agentMatchReason }}
-          </p>
-          <p v-if="agentPersonalizedReason" class="recommendation-reason">
-            {{ agentPersonalizedReason }}
-          </p>
-        </template>
+      <button type="button" class="link-btn" @click="detailsOpen = !detailsOpen">
+        {{ detailsOpen ? '收起评分明细' : '查看评分明细' }}
+      </button>
 
-        <div v-if="showRecommendationMetrics && recommendationScoreBreakdown" class="score-breakdown">
-          <div class="score-breakdown-row">
-            <div class="score-breakdown-meta">
-              <span class="breakdown-label">语义</span>
-              <strong>{{ toPercent(recommendationScoreBreakdown.semantic_score) }}%</strong>
-            </div>
-            <el-progress :percentage="toPercent(recommendationScoreBreakdown.semantic_score)" :show-text="false" />
+      <div v-if="detailsOpen" class="match-details">
+        <div class="chip-row">
+          <template v-if="showRecommendationMetrics">
+            <span v-if="bestMatchedClusterId" class="chip chip--success">命中簇 {{ bestMatchedClusterId }}</span>
+            <span v-if="recallClusterId" class="chip chip--warning">召回来源 {{ recallClusterId }}</span>
+            <span v-if="recallClusterId" class="chip">簇召回相似度 {{ toPercent(recallClusterSimilarity) }}%</span>
+            <span v-if="recallClusterHitsCount > 1" class="chip">多簇命中 {{ recallClusterHitsCount }}</span>
+            <span class="chip">多样性 {{ toPercent(diversityMatchScore) }}%</span>
+            <span v-if="diversityReason" class="chip">{{ diversityReason }}</span>
+          </template>
+          <template v-if="showAgentMetrics">
+            <span v-if="agentPriority" class="chip chip--primary">优先级 #{{ agentPriority }}</span>
+            <span v-if="agentQueryMatchScore" class="chip">查询 {{ toPercent(agentQueryMatchScore) }}%</span>
+            <span v-if="agentPersonalizationScore" class="chip">兴趣 {{ toPercent(agentPersonalizationScore) }}%</span>
+            <span v-if="agentFinalScore" class="chip">综合 {{ toPercent(agentFinalScore) }}%</span>
+            <span v-if="agentMatchedTerms.length" class="chip">命中词 {{ agentMatchedTerms.slice(0, 3).join(' / ') }}</span>
+          </template>
+        </div>
+
+        <div v-if="showRecommendationMetrics && recommendationScoreBreakdown" class="score-bars">
+          <div class="score-bar">
+            <span>语义</span>
+            <el-progress :percentage="toPercent(recommendationScoreBreakdown.semantic_score)" :show-text="false" :stroke-width="6" color="var(--color-chart-1)" />
+            <strong>{{ toPercent(recommendationScoreBreakdown.semantic_score) }}%</strong>
           </div>
-          <div class="score-breakdown-row">
-            <div class="score-breakdown-meta">
-              <span class="breakdown-label">分类</span>
-              <strong>{{ toPercent(recommendationScoreBreakdown.category_score) }}%</strong>
-            </div>
-            <el-progress :percentage="toPercent(recommendationScoreBreakdown.category_score)" :show-text="false" color="#8b5cf6" />
+          <div class="score-bar">
+            <span>分类</span>
+            <el-progress :percentage="toPercent(recommendationScoreBreakdown.category_score)" :show-text="false" :stroke-width="6" color="var(--color-chart-2)" />
+            <strong>{{ toPercent(recommendationScoreBreakdown.category_score) }}%</strong>
           </div>
-          <div class="score-breakdown-row">
-            <div class="score-breakdown-meta">
-              <span class="breakdown-label">新鲜度</span>
-              <strong>{{ toPercent(recommendationScoreBreakdown.recency_score) }}%</strong>
-            </div>
-            <el-progress :percentage="toPercent(recommendationScoreBreakdown.recency_score)" :show-text="false" color="#0ea5e9" />
+          <div class="score-bar">
+            <span>新鲜度</span>
+            <el-progress :percentage="toPercent(recommendationScoreBreakdown.recency_score)" :show-text="false" :stroke-width="6" color="var(--color-chart-3)" />
+            <strong>{{ toPercent(recommendationScoreBreakdown.recency_score) }}%</strong>
           </div>
-          <div class="score-breakdown-row" v-if="typeof recommendationScoreBreakdown.diversity_score === 'number'">
-            <div class="score-breakdown-meta">
-              <span class="breakdown-label">多样性</span>
-              <strong>{{ toPercent(recommendationScoreBreakdown.diversity_score) }}%</strong>
-            </div>
-            <el-progress :percentage="toPercent(recommendationScoreBreakdown.diversity_score)" :show-text="false" color="#22c55e" />
+          <div v-if="typeof recommendationScoreBreakdown.diversity_score === 'number'" class="score-bar">
+            <span>多样性</span>
+            <el-progress :percentage="toPercent(recommendationScoreBreakdown.diversity_score)" :show-text="false" :stroke-width="6" color="var(--color-chart-4)" />
+            <strong>{{ toPercent(recommendationScoreBreakdown.diversity_score) }}%</strong>
           </div>
         </div>
-        <div v-if="showAgentMetrics && agentScoreBreakdown" class="score-breakdown">
-          <div class="score-breakdown-row">
-            <div class="score-breakdown-meta">
-              <span class="breakdown-label">查询</span>
-              <strong>{{ toPercent(agentScoreBreakdown.query_match_score) }}%</strong>
-            </div>
-            <el-progress :percentage="toPercent(agentScoreBreakdown.query_match_score)" :show-text="false" color="#0ea5e9" />
+
+        <div v-if="showAgentMetrics && agentScoreBreakdown" class="score-bars">
+          <div class="score-bar">
+            <span>查询</span>
+            <el-progress :percentage="toPercent(agentScoreBreakdown.query_match_score)" :show-text="false" :stroke-width="6" color="var(--color-chart-2)" />
+            <strong>{{ toPercent(agentScoreBreakdown.query_match_score) }}%</strong>
           </div>
-          <div class="score-breakdown-row">
-            <div class="score-breakdown-meta">
-              <span class="breakdown-label">兴趣</span>
-              <strong>{{ toPercent(agentScoreBreakdown.personalization_score) }}%</strong>
-            </div>
-            <el-progress :percentage="toPercent(agentScoreBreakdown.personalization_score)" :show-text="false" color="#f59e0b" />
+          <div class="score-bar">
+            <span>兴趣</span>
+            <el-progress :percentage="toPercent(agentScoreBreakdown.personalization_score)" :show-text="false" :stroke-width="6" color="var(--color-chart-3)" />
+            <strong>{{ toPercent(agentScoreBreakdown.personalization_score) }}%</strong>
           </div>
-          <div class="score-breakdown-row">
-            <div class="score-breakdown-meta">
-              <span class="breakdown-label">综合</span>
-              <strong>{{ toPercent(agentScoreBreakdown.final_score) }}%</strong>
-            </div>
-            <el-progress :percentage="toPercent(agentScoreBreakdown.final_score)" :show-text="false" color="#22c55e" />
+          <div class="score-bar">
+            <span>综合</span>
+            <el-progress :percentage="toPercent(agentScoreBreakdown.final_score)" :show-text="false" :stroke-width="6" color="var(--color-chart-4)" />
+            <strong>{{ toPercent(agentScoreBreakdown.final_score) }}%</strong>
           </div>
         </div>
       </div>
+    </section>
 
-      <div class="paper-actions">
-        <a
-          :href="paper.pdfUrl"
-          target="_blank"
-          class="pdf-link"
+    <footer class="paper-actions">
+      <div class="label-toggle" role="group" aria-label="兴趣标记">
+        <button
+          type="button"
+          :class="['label-btn', { 'is-on': selectedLabel === 'liked' }]"
+          :aria-pressed="selectedLabel === 'liked'"
+          @click="toggleLabel('liked')"
         >
-          <el-button size="small" type="default">
-            📘 打开 PDF
-          </el-button>
+          <el-icon><CircleCheck /></el-icon>感兴趣
+        </button>
+        <button
+          type="button"
+          :class="['label-btn', 'label-btn--neg', { 'is-on': selectedLabel === 'disliked' }]"
+          :aria-pressed="selectedLabel === 'disliked'"
+          @click="toggleLabel('disliked')"
+        >
+          <el-icon><CircleClose /></el-icon>不感兴趣
+        </button>
+      </div>
+      <div class="action-links">
+        <a :href="paper.pdfUrl" target="_blank" rel="noopener" class="pdf-link">
+          <el-button size="small" :icon="Document">PDF</el-button>
         </a>
-        <el-button
-          size="small"
-          type="primary"
-          @click="handleViewDetail"
-        >
-          🧾 查看详情
+        <el-button size="small" type="primary" plain @click="handleViewDetail">
+          查看详情
+          <el-icon class="el-icon--right"><ArrowRight /></el-icon>
         </el-button>
-        <el-select
-          v-model="selectedLabel"
-          placeholder="选择兴趣"
-          size="small"
-          :style="{ width: '120px' }"
-          @change="handleLabelChange"
-        >
-          <el-option
-            v-for="option in labelOptions"
-            :key="option.value"
-            :label="option.label"
-            :value="option.value"
-          >
-            <span class="option-row">
-              <span class="option-emoji">{{ option.emoji }}</span>
-              <span>{{ option.label }}</span>
-            </span>
-          </el-option>
-        </el-select>
       </div>
-    </div>
-  </el-card>
+    </footer>
+  </article>
 </template>
 
 <style scoped>
 .paper-card {
-  height: auto;
-  overflow: hidden;
-  margin-bottom: 0;
-}
-
-.paper-card :deep(.el-card__body) {
-  height: auto;
   display: flex;
   flex-direction: column;
+  padding: 18px 20px 14px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
-.paper-main {
-  height: 320px;
-  overflow: hidden;
+.paper-card:hover {
+  border-color: var(--color-border-strong);
+  box-shadow: var(--shadow-sm);
 }
 
-/* 上半部分固定，方便多张卡片对齐；内容超出时只在自身区域里截断。 */
-.paper-main :deep(.el-tooltip__trigger) {
-  display: block;
+.paper-card.is-liked {
+  border-left: 3px solid var(--color-success);
 }
 
-.paper-header {
+.paper-card.is-disliked {
+  border-left: 3px solid var(--color-border-strong);
+}
+
+.paper-head {
   display: flex;
-  justify-content: space-between;
   align-items: flex-start;
-  margin-bottom: 12px;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .paper-title {
-  flex: 1;
-  margin-right: 12px;
-}
-
-.title-text {
   font-size: 16px;
   font-weight: 600;
-  color: #1f2937;
-  margin: 0;
-  line-height: 1.4;
+  line-height: 1.45;
+  color: var(--color-text);
+  cursor: pointer;
   word-break: break-word;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
 }
 
-.paper-authors {
-  margin-bottom: 12px;
-  font-size: 14px;
-  color: #6b7280;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.authors-label {
-  font-weight: 500;
-}
-
-.authors-list {
-  color: #4b5563;
-}
-
-.paper-summary {
-  margin-bottom: 12px;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.paper-summary p {
-  font-size: 14px;
-  color: #4b5563;
-  line-height: 1.6;
-  margin: 0;
-  min-height: 0;
-}
-
-.summary-expanded {
-  max-height: 180px;
-  overflow-y: auto;
-  padding-right: 6px;
+.paper-title:hover {
+  color: var(--color-primary);
 }
 
 .paper-meta {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
-.meta-item {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-
-.paper-similarity {
-  margin-bottom: 12px;
-  padding: 12px;
-  background: #f8fafc;
-  border-radius: 8px;
-}
-
-.final-score-label {
-  display: inline-block;
-  margin-left: 8px;
-  font-size: 12px;
-  color: #111827;
-  font-weight: 600;
-}
-
-.similarity-label {
-  font-size: 13px;
-  color: #6b7280;
-  margin-right: 8px;
-}
-
-.recommendation-reason {
-  font-size: 13px;
-  color: #059669;
-  margin: 8px 0 0 0;
-  font-style: italic;
-}
-
-.score-breakdown {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 10px;
-  margin-top: 8px;
-}
-
-.breakdown-label {
-  font-weight: 600;
-  color: #374151;
-}
-
-.score-breakdown-row {
-  padding: 10px 12px;
-  background: rgba(255, 255, 255, 0.65);
-  border-radius: 12px;
-}
-
-.score-breakdown-meta {
-  display: flex;
-  justify-content: space-between;
   align-items: center;
-  margin-bottom: 8px;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--color-text-3);
+}
+
+.meta-authors {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-2);
+}
+
+.meta-sep {
+  color: var(--color-text-4);
+}
+
+.meta-date {
+  margin-right: 4px;
+  white-space: nowrap;
+}
+
+.paper-summary {
+  margin-top: 10px;
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: var(--color-text-2);
+}
+
+.link-btn {
+  align-self: flex-start;
+  margin-top: 4px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--color-primary);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.link-btn:hover {
+  text-decoration: underline;
+}
+
+.match-panel {
+  display: flex;
+  flex-direction: column;
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  background: var(--color-surface-muted);
+  border: 1px solid var(--color-border);
+}
+
+.match-top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.match-label {
+  font-size: 12.5px;
+  color: var(--color-text-3);
+  white-space: nowrap;
+}
+
+.match-bar {
+  flex: 1;
+  min-width: 0;
+}
+
+.match-final {
+  font-size: 12.5px;
+  color: var(--color-text-3);
+  white-space: nowrap;
+}
+
+.match-final strong {
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.match-reason {
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-text-2);
+}
+
+.match-details {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.score-bars {
+  display: grid;
+  gap: 6px;
+}
+
+.score-bar {
+  display: grid;
+  grid-template-columns: 48px 1fr 40px;
+  align-items: center;
+  gap: 10px;
   font-size: 12px;
-  color: #4b5563;
+  color: var(--color-text-3);
+}
+
+.score-bar strong {
+  text-align: right;
+  font-weight: 600;
+  color: var(--color-text-2);
+  font-variant-numeric: tabular-nums;
 }
 
 .paper-actions {
   display: flex;
-  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
   flex-wrap: wrap;
-  margin-top: 12px;
+  gap: 8px;
+  margin-top: 14px;
   padding-top: 12px;
-  border-top: 1px solid #e5e7eb;
+  border-top: 1px solid var(--color-border);
+}
+
+.label-toggle {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.label-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface);
+  color: var(--color-text-3);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.label-btn:hover {
+  color: var(--color-success);
+  border-color: var(--color-success-border);
+}
+
+.label-btn.is-on {
+  background: var(--color-success-soft);
+  border-color: var(--color-success-border);
+  color: var(--color-success);
+}
+
+.label-btn--neg:hover {
+  color: var(--color-danger);
+  border-color: var(--color-danger-border);
+}
+
+.label-btn--neg.is-on {
+  background: var(--color-danger-soft);
+  border-color: var(--color-danger-border);
+  color: var(--color-danger);
+}
+
+.action-links {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .pdf-link {
   text-decoration: none;
-}
-
-.option-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.option-emoji {
-  width: 18px;
-  text-align: center;
-}
-
-@media (max-width: 900px) {
-  .paper-card {
-    height: auto;
-    min-height: 0;
-    overflow: visible;
-  }
-
-  .paper-card :deep(.el-card__body) {
-    height: auto;
-  }
-
-  .paper-main {
-    height: auto;
-    overflow: visible;
-  }
 }
 </style>

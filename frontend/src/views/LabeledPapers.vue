@@ -3,7 +3,8 @@ import { ref, onMounted, watch, computed } from 'vue';
 import { useRouter } from 'vue-router';
 import { usePaperStore } from '@/stores/paperStore';
 import { ElMessage } from 'element-plus';
-import { getLabelClass, getLabelText } from '@/utils/paperLabel';
+import { MagicStick } from '@element-plus/icons-vue';
+import { getLabelText } from '@/utils/paperLabel';
 
 const router = useRouter();
 const store = usePaperStore();
@@ -14,9 +15,17 @@ const pageSize = ref(10);
 
 const filterOptions = [
   { value: '', label: '全部' },
-  { value: 'liked', label: '喜欢' },
-  { value: 'disliked', label: '不喜欢' }
+  { value: 'liked', label: '感兴趣' },
+  { value: 'disliked', label: '不感兴趣' }
 ];
+const expandedIds = ref(new Set<string>());
+
+function toggleExpanded(id: string) {
+  const next = new Set(expandedIds.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  expandedIds.value = next;
+}
 
 const interestVector = computed(() => store.lastInterestVector);
 const interestClusters = computed(() => interestVector.value?.interest_clusters || []);
@@ -25,6 +34,11 @@ const clusterModeText = computed(() => interestVector.value?.profile_mode || 'me
 onMounted(() => {
   fetchLabeledPapers();
   store.fetchUserInterestVector();
+});
+
+watch(filterLabel, () => {
+  // 切换筛选后从第一页开始；页码本就是 1 时由下方监听负责重新加载。
+  currentPage.value = 1;
 });
 
 watch([filterLabel, currentPage], () => {
@@ -95,312 +109,231 @@ async function handleGenerateInterestVector() {
 </script>
 
 <template>
-  <div class="labeled-papers-page">
-    <div class="page-header">
-      <div class="header-content">
-        <div>
-          <h1>已标记论文</h1>
-          <p class="description">查看和管理您标记过的论文</p>
-        </div>
+  <div class="page labeled-page">
+    <header class="page-header">
+      <div class="page-header__text">
+        <h1 class="page-title">已标记论文</h1>
+        <p class="page-desc">回顾标记过的论文。标记积累后可生成偏好向量，推荐会据此寻找相似论文。</p>
+      </div>
+      <div class="page-actions">
         <el-button
           type="primary"
+          :icon="MagicStick"
           :loading="store.interestVectorGenerating"
           :disabled="store.labeledPapers.length === 0"
           @click="handleGenerateInterestVector"
         >
-          生成用户偏好向量
+          生成偏好向量
         </el-button>
       </div>
-    </div>
+    </header>
 
-    <div class="filter-bar">
-      <el-select
-        v-model="filterLabel"
-        placeholder="筛选标记状态"
-        style="width: 180px"
-      >
-        <el-option
-          v-for="option in filterOptions"
-          :key="option.value"
-          :value="option.value"
-        >
-          {{ option.label }}
-        </el-option>
-      </el-select>
-    </div>
-
-    <div v-if="interestVector" class="interest-cluster-panel">
-      <div class="interest-cluster-panel__header">
+    <section v-if="interestVector" class="surface cluster-panel">
+      <div class="section-head">
         <div>
-          <h2>兴趣簇概览</h2>
-          <p>
-            当前画像模式：{{ clusterModeText }}，
-            聚类数：{{ interestVector.cluster_count || interestClusters.length || 0 }}
+          <h2 class="section-title">兴趣簇概览</h2>
+          <p class="section-desc">
+            画像模式 <span class="mono">{{ clusterModeText }}</span> ·
+            {{ interestVector.cluster_count || interestClusters.length || 0 }} 个簇
           </p>
         </div>
-        <el-tag type="success" effect="dark">
-          {{ interestClusters.length > 0 ? 'clustered' : 'mean fallback' }}
-        </el-tag>
+        <span :class="['chip', interestClusters.length > 0 ? 'chip--success' : '']">
+          {{ interestClusters.length > 0 ? '已聚类' : '均值回退' }}
+        </span>
       </div>
 
-      <div v-if="interestClusters.length > 0" class="interest-cluster-grid">
-        <el-card v-for="cluster in interestClusters" :key="cluster.cluster_id" class="interest-cluster-card">
-          <div class="cluster-card__top">
-            <strong>{{ cluster.cluster_id }}</strong>
-            <span>{{ cluster.paper_count }} papers</span>
+      <div v-if="interestClusters.length > 0" class="cluster-grid">
+        <div v-for="cluster in interestClusters" :key="cluster.cluster_id" class="surface-muted cluster-card">
+          <div class="cluster-top">
+            <strong class="mono">{{ cluster.cluster_id }}</strong>
+            <span class="muted">{{ cluster.paper_count }} 篇</span>
           </div>
-          <div class="cluster-paper-ids">
-            <el-tag
-              v-for="paperId in cluster.paper_ids.slice(0, 4)"
-              :key="paperId"
-              size="small"
-              type="info"
-            >
-              {{ paperId }}
-            </el-tag>
-            <span v-if="cluster.paper_ids.length > 4" class="more-ids">
-              +{{ cluster.paper_ids.length - 4 }} more
-            </span>
+          <div class="chip-row">
+            <span v-for="paperId in cluster.paper_ids.slice(0, 4)" :key="paperId" class="chip mono">{{ paperId }}</span>
+            <span v-if="cluster.paper_ids.length > 4" class="muted more">+{{ cluster.paper_ids.length - 4 }}</span>
           </div>
-        </el-card>
+        </div>
       </div>
-      <div v-else class="interest-cluster-empty">
-        当前 liked papers 数量不足或聚类回退到了单一均值向量。
+      <p v-else class="muted cluster-empty">感兴趣的论文数量不足，暂时回退为单一均值向量。</p>
+    </section>
+
+    <div class="toolbar">
+      <el-segmented v-model="filterLabel" :options="filterOptions" />
+      <span v-if="store.totalLabeledPapers > 0" class="muted">共 {{ store.totalLabeledPapers }} 篇</span>
+    </div>
+
+    <div v-if="store.loading" class="labeled-list">
+      <div v-for="n in 3" :key="n" class="surface skeleton-card">
+        <el-skeleton :rows="2" animated />
       </div>
     </div>
 
-    <div v-if="store.loading" class="loading">
-      <div class="el-loading-spinner"></div>
-      <p>加载中...</p>
-    </div>
-
-    <div v-else-if="store.labeledPapers.length === 0" class="empty-results">
-      <el-empty description="暂无已标记论文" />
+    <div v-else-if="store.labeledPapers.length === 0" class="surface empty">
+      <el-empty description="还没有标记过论文，去搜索页标记几篇感兴趣的论文吧" :image-size="96">
+        <el-button type="primary" plain @click="router.push('/search')">去搜索论文</el-button>
+      </el-empty>
     </div>
 
     <div v-else class="labeled-list">
-      <el-card
+      <article
         v-for="paper in store.labeledPapers"
         :key="paper.id"
-        class="labeled-card"
+        :class="['surface', 'labeled-card', paper.label === 'liked' ? 'is-liked' : 'is-disliked']"
       >
-        <div class="card-header">
-          <h3 class="paper-title">{{ formatPaperTitle(paper.title, paper.id) }}</h3>
-          <el-tag :class="getLabelClass(paper.label)" size="small">
+        <div class="card-head">
+          <h3 class="paper-title" @click="handleViewDetail(paper.id)">{{ formatPaperTitle(paper.title, paper.id) }}</h3>
+          <span :class="['chip', paper.label === 'liked' ? 'chip--success' : 'chip--danger']">
             {{ getLabelText(paper.label) }}
-          </el-tag>
+          </span>
         </div>
 
-        <p class="paper-summary">{{ formatPaperSummary(paper.summary) }}</p>
+        <p :class="['paper-summary', { 'clamp-3': !expandedIds.has(paper.id) }]">{{ formatPaperSummary(paper.summary) }}</p>
 
-        <div class="card-footer">
-          <span class="labeled-time">标记时间：{{ formatDate(paper.labeledAt) }}</span>
-          <el-button size="small" type="primary" @click="handleViewDetail(paper.id)">
-            查看详情
-          </el-button>
+        <div class="card-foot">
+          <span class="muted">标记于 {{ formatDate(paper.labeledAt) }}</span>
+          <div class="card-actions">
+            <el-button link type="primary" @click="toggleExpanded(paper.id)">
+              {{ expandedIds.has(paper.id) ? '收起摘要' : '展开摘要' }}
+            </el-button>
+            <el-button size="small" type="primary" plain @click="handleViewDetail(paper.id)">查看详情</el-button>
+          </div>
         </div>
-      </el-card>
+      </article>
     </div>
 
-    <div v-if="store.totalLabeledPapers > 0" class="pagination-wrapper">
+    <div v-if="store.totalLabeledPapers > pageSize" class="pagination">
       <el-pagination
         :current-page="currentPage"
         :page-size="pageSize"
         :total="store.totalLabeledPapers"
+        background
+        layout="prev, pager, next, jumper"
         @current-change="handlePageChange"
-        layout="total, prev, pager, next, jumper"
       />
     </div>
   </div>
 </template>
 
 <style scoped>
-.labeled-papers-page {
-  padding: 20px;
+.labeled-page {
+  max-width: 1080px;
 }
 
-.page-header {
-  margin-bottom: 20px;
-}
-
-.page-header h1 {
-  font-size: 24px;
-  font-weight: 700;
-  color: #1f2937;
-  margin: 0 0 8px 0;
-}
-
-.header-content {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-}
-
-.description {
-  font-size: 14px;
-  color: #6b7280;
-  margin: 0;
-}
-
-.filter-bar {
-  margin-bottom: 20px;
-}
-
-.interest-cluster-panel {
-  margin-bottom: 20px;
+.cluster-panel {
   padding: 18px 20px;
-  border-radius: 16px;
-  background: linear-gradient(135deg, rgba(17, 24, 39, 0.96), rgba(31, 41, 55, 0.92));
-  color: #f8fafc;
-  box-shadow: 0 16px 32px rgba(15, 23, 42, 0.18);
+  margin-bottom: 20px;
 }
 
-.interest-cluster-panel__header {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  align-items: flex-start;
-  margin-bottom: 16px;
-}
-
-.interest-cluster-panel__header h2 {
-  margin: 0 0 6px 0;
-  font-size: 18px;
-  color: #fff;
-}
-
-.interest-cluster-panel__header p {
-  margin: 0;
-  color: rgba(226, 232, 240, 0.84);
-  font-size: 13px;
-}
-
-.interest-cluster-grid {
+.cluster-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-  gap: 12px;
+  gap: 10px;
 }
 
-.interest-cluster-card {
-  border: 1px solid rgba(148, 163, 184, 0.18);
-  background: rgba(15, 23, 42, 0.45);
+.cluster-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
 }
 
-.cluster-card__top {
+.cluster-top {
   display: flex;
   justify-content: space-between;
-  align-items: center;
-  margin-bottom: 10px;
-  color: #e2e8f0;
-}
-
-.cluster-paper-ids {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
-}
-
-.more-ids {
-  font-size: 12px;
-  color: rgba(226, 232, 240, 0.76);
-}
-
-.interest-cluster-empty {
-  color: rgba(226, 232, 240, 0.84);
   font-size: 13px;
 }
 
-.loading {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  padding: 40px;
+.more {
+  font-size: 12px;
+  align-self: center;
 }
 
-.empty-results {
-  padding: 40px;
+.cluster-empty {
+  font-size: 13px;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  font-size: 13px;
 }
 
 .labeled-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
-  gap: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.skeleton-card {
+  padding: 20px;
+}
+
+.empty {
+  padding: 24px;
 }
 
 .labeled-card {
-  /* 固定卡片外框高度，让同一行卡片保持整齐；超长内容由内部区域自行处理。 */
-  height: 340px;
-  box-sizing: border-box;
+  padding: 16px 20px 12px;
 }
 
-.labeled-card :deep(.el-card__body) {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  box-sizing: border-box;
-  padding: 16px;
-  min-height: 0;
+.labeled-card.is-liked {
+  border-left: 3px solid var(--color-success);
 }
 
-.card-header {
+.labeled-card.is-disliked {
+  border-left: 3px solid var(--color-border-strong);
+}
+
+.card-head {
   display: flex;
-  justify-content: space-between;
   align-items: flex-start;
-  flex-shrink: 0;
-  height: 72px;
-  margin-bottom: 12px;
-  overflow-y: auto;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .paper-title {
-  font-size: 16px;
+  font-size: 15.5px;
   font-weight: 600;
-  color: #1f2937;
-  margin: 0;
-  flex: 1;
-  margin-right: 12px;
-  line-height: 1.4;
+  line-height: 1.45;
+  color: var(--color-text);
+  cursor: pointer;
+}
+
+.paper-title:hover {
+  color: var(--color-primary);
 }
 
 .paper-summary {
-  font-size: 14px;
-  color: #6b7280;
-  line-height: 1.6;
-  flex: 1 1 auto;
-  min-height: 0;
-  margin: 0;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  overflow-y: auto;
-  padding-right: 8px;
-  scrollbar-gutter: stable;
+  margin-top: 8px;
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: var(--color-text-2);
 }
 
-.card-footer {
+.card-foot {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  flex-shrink: 0;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
   margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid #e5e7eb;
+  padding-top: 10px;
+  border-top: 1px solid var(--color-border);
+  font-size: 12.5px;
 }
 
-.labeled-time {
-  font-size: 13px;
-  color: #9ca3af;
+.card-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 
-.pagination-wrapper {
+.pagination {
   display: flex;
   justify-content: center;
   margin-top: 24px;
-}
-
-@media (max-width: 900px) {
-  .labeled-list {
-    grid-template-columns: 1fr;
-  }
 }
 </style>

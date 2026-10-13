@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, useSlots, watch } from 'vue'
+import { VideoPause } from '@element-plus/icons-vue'
 import { BubbleList, Prompts, Thinking, Welcome, XSender } from 'vue-element-plus-x'
 import type { PromptsItemsProps } from 'vue-element-plus-x/types/Prompts'
 import type { RetrievalDebug } from '@/api/papers'
@@ -41,6 +42,7 @@ const props = defineProps<{
   promptTitle?: string
   assistantLabel?: string
   senderPlaceholder?: string
+  senderTip?: string
   senderText?: string
   canStop?: boolean
 }>()
@@ -337,7 +339,7 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
               <el-icon><VideoPause /></el-icon>
               停止生成
             </el-button>
-            先做语义解析，再生成结构化结果，适合 Agent 搜索场景
+            <span v-if="senderTip">{{ senderTip }}</span>
           </div>
         </template>
       </XSender>
@@ -349,7 +351,7 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 .rag-chat-panel {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
   min-height: 0;
 }
 
@@ -358,18 +360,52 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
   flex: 1 1 auto;
   min-height: 0;
   flex-direction: column;
-  gap: 14px;
+  gap: 12px;
 }
 
 .rag-chat-panel__welcome {
-  padding: 18px 20px;
-  border-radius: 24px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(248, 250, 252, 0.94));
-  border: 1px solid rgba(148, 163, 184, 0.18);
+  padding: 16px 18px;
+  border-radius: var(--radius);
+  background: var(--color-surface-muted);
+  border: 1px dashed var(--color-border-strong);
+}
+
+.rag-chat-panel__welcome :deep(.elx-welcome__title) {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.rag-chat-panel__welcome :deep(.elx-welcome__description) {
+  font-size: 13px;
+  color: var(--color-text-3);
 }
 
 .rag-chat-panel__prompts {
   flex: none;
+}
+
+.rag-chat-panel__prompts :deep(.elx-prompts__title) {
+  font-size: 12.5px;
+  font-weight: 550;
+  color: var(--color-text-3);
+}
+
+.rag-chat-panel__prompts :deep(.elx-prompts__item) {
+  border-radius: var(--radius-pill);
+  border-color: var(--color-border);
+  background: var(--color-surface);
+  padding: 4px 12px;
+}
+
+.rag-chat-panel__prompts :deep(.elx-prompts__item:hover) {
+  border-color: var(--color-primary-border);
+  background: var(--color-primary-soft);
+}
+
+.rag-chat-panel__prompts :deep(.elx-prompts__item-label) {
+  font-size: 13px;
+  color: var(--color-text-2);
 }
 
 .rag-chat-panel__prompts-toggle {
@@ -378,18 +414,18 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
   align-self: flex-start;
   gap: 8px;
   padding: 4px 10px;
-  border: 1px solid rgba(148, 163, 184, 0.24);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.9);
-  color: #64748b;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface);
+  color: var(--color-text-3);
   cursor: pointer;
   font-family: inherit;
   font-size: 12px;
 }
 
 .rag-chat-panel__prompts-toggle:hover {
-  color: #2563eb;
-  border-color: rgba(37, 99, 235, 0.3);
+  color: var(--color-primary);
+  border-color: var(--color-primary-border);
 }
 
 .rag-chat-panel__prompts-chevron {
@@ -410,6 +446,20 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
   min-height: 0;
 }
 
+.rag-chat-panel__bubble-list :deep(.elx-bubble__content--filled) {
+  --elx-bubble-bg: var(--color-primary-soft);
+  color: var(--color-text);
+}
+
+.rag-chat-panel__bubble-list :deep(.elx-bubble__content--outlined) {
+  --elx-bubble-border-color: var(--color-border);
+  background: var(--color-surface);
+}
+
+.rag-chat-panel__bubble-list :deep(.elx-bubble__content--round) {
+  border-radius: var(--radius-lg);
+}
+
 .rag-chat-panel__bubble-list :deep(.message-start),
 .rag-chat-panel__bubble-list :deep(.message-assistant),
 .rag-chat-panel__bubble-list :deep([data-placement='start']),
@@ -428,22 +478,22 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 }
 
 .rag-chat-panel__message-label {
-  margin-bottom: 8px;
+  margin-bottom: 6px;
   font-size: 12px;
-  font-weight: 700;
-  color: #64748b;
+  font-weight: 600;
+  color: var(--color-text-3);
 }
 
 .rag-chat-panel__user-content {
   white-space: pre-wrap;
-  line-height: 1.75;
+  line-height: 1.7;
 }
 
 .rag-chat-panel__message-footer {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  margin-top: 12px;
+  gap: 10px;
+  margin-top: 10px;
 }
 
 .rag-chat-panel__thinking {
@@ -453,21 +503,20 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 .assistant-markdown {
   width: 100%;
   max-width: 100%;
-  color: #1e293b;
-  line-height: 1.85;
-  font-size: 15px;
-  letter-spacing: 0.01em;
+  color: var(--color-text);
+  line-height: 1.8;
+  font-size: 14.5px;
   overflow-wrap: anywhere;
 }
 
 .assistant-markdown :deep(p) {
-  margin: 0 0 14px;
+  margin: 0 0 12px;
 }
 
 /* 有图片证据时正文按段切开；段内末尾元素的外边距由段间距接管，避免切段后行距变化。 */
 .assistant-markdown__segment + .assistant-markdown__segment,
 .answer-figure + .assistant-markdown__segment {
-  margin-top: 14px;
+  margin-top: 12px;
 }
 
 .assistant-markdown__segment > :deep(:last-child) {
@@ -475,18 +524,18 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 }
 
 .answer-figure {
-  margin: 14px 0 0;
+  margin: 12px 0 0;
   padding: 10px;
-  border: 1px solid #e2e8f0;
-  border-radius: 14px;
-  background: #f8fafc;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface-muted);
 }
 
 .answer-figure__image {
   display: block;
   width: 100%;
-  border-radius: 10px;
-  background: #ffffff;
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
   overflow: hidden;
 }
 
@@ -500,7 +549,7 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 
 .answer-figure__missing {
   padding: 18px 12px;
-  color: #94a3b8;
+  color: var(--color-text-4);
   font-size: 12px;
   text-align: center;
 }
@@ -510,7 +559,7 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
   align-items: baseline;
   gap: 6px;
   margin-top: 8px;
-  color: #475569;
+  color: var(--color-text-3);
   font-size: 12px;
   line-height: 1.6;
 }
@@ -522,7 +571,7 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 
 .answer-figure__page {
   flex: none;
-  color: #94a3b8;
+  color: var(--color-text-4);
 }
 
 .answer-figure__text {
@@ -540,7 +589,7 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 
 .assistant-markdown :deep(.md-empty) {
   margin: 0;
-  color: #64748b;
+  color: var(--color-text-3);
 }
 
 .assistant-markdown :deep(.katex-display) {
@@ -551,28 +600,29 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 .assistant-markdown :deep(table) {
   display: block;
   width: 100%;
-  margin: 14px 0;
+  margin: 12px 0;
   border-collapse: collapse;
   border-spacing: 0;
   overflow-x: auto;
-  border: 1px solid rgba(148, 163, 184, 0.24);
-  border-radius: 16px;
-  background: #ffffff;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  font-size: 13.5px;
 }
 
 .assistant-markdown :deep(th),
 .assistant-markdown :deep(td) {
-  padding: 10px 12px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
-  border-right: 1px solid rgba(148, 163, 184, 0.12);
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--color-border);
+  border-right: 1px solid var(--color-border);
   text-align: left;
   vertical-align: top;
 }
 
 .assistant-markdown :deep(th) {
-  background: #f8fafc;
-  color: #0f172a;
-  font-weight: 700;
+  background: var(--color-surface-muted);
+  color: var(--color-text);
+  font-weight: 600;
 }
 
 .assistant-markdown :deep(tr:last-child td) {
@@ -585,69 +635,66 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 .assistant-markdown :deep(h4),
 .assistant-markdown :deep(h5),
 .assistant-markdown :deep(h6) {
-  margin: 22px 0 10px;
-  line-height: 1.35;
-  color: #0f172a;
-  font-weight: 800;
-  letter-spacing: -0.02em;
+  margin: 18px 0 8px;
+  line-height: 1.4;
+  color: var(--color-text);
+  font-weight: 650;
 }
 
 .assistant-markdown :deep(h1) {
-  font-size: 24px;
+  font-size: 19px;
 }
 
 .assistant-markdown :deep(h2) {
-  font-size: 20px;
+  font-size: 17px;
 }
 
 .assistant-markdown :deep(h3) {
-  font-size: 18px;
+  font-size: 15.5px;
 }
 
 .assistant-markdown :deep(h4),
 .assistant-markdown :deep(h5),
 .assistant-markdown :deep(h6) {
-  font-size: 16px;
+  font-size: 14.5px;
 }
 
 .assistant-markdown :deep(blockquote) {
-  margin: 14px 0;
-  padding: 12px 14px;
-  border-left: 4px solid rgba(59, 130, 246, 0.4);
-  border-radius: 0 14px 14px 0;
-  background: rgba(59, 130, 246, 0.06);
-  color: #334155;
+  margin: 12px 0;
+  padding: 10px 14px;
+  border-left: 3px solid var(--color-primary-border);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--color-surface-muted);
+  color: var(--color-text-2);
 }
 
 .assistant-markdown :deep(ul),
 .assistant-markdown :deep(ol) {
-  margin: 10px 0 14px;
+  margin: 8px 0 12px;
   padding-left: 1.35em;
 }
 
 .assistant-markdown :deep(li) {
-  margin: 6px 0;
+  margin: 4px 0;
 }
 
 .assistant-markdown :deep(code) {
-  padding: 0.18em 0.48em;
-  border-radius: 8px;
-  background: rgba(37, 99, 235, 0.08);
-  color: #0f172a;
-  font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
-  font-size: 0.92em;
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
 }
 
 .assistant-markdown :deep(pre) {
-  margin: 14px 0;
-  padding: 16px 18px;
-  border-radius: 18px;
-  background: linear-gradient(180deg, #0f172a, #111827);
-  color: #e2e8f0;
+  margin: 12px 0;
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-muted);
+  color: var(--color-text);
   overflow-x: auto;
-  box-shadow:
-    inset 0 0 0 1px rgba(148, 163, 184, 0.08),
-    0 12px 28px rgba(15, 23, 42, 0.12);
 }
 
 .assistant-markdown :deep(pre code) {
@@ -657,17 +704,17 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
   color: inherit;
   white-space: pre;
   font-size: 13px;
-  line-height: 1.7;
+  line-height: 1.65;
 }
 
 .assistant-markdown :deep(a) {
-  color: #2563eb;
+  color: var(--color-primary);
   text-decoration: none;
-  border-bottom: 1px solid rgba(37, 99, 235, 0.22);
+  border-bottom: 1px solid var(--color-primary-border);
 }
 
 .assistant-markdown :deep(a:hover) {
-  border-bottom-color: rgba(37, 99, 235, 0.65);
+  border-bottom-color: var(--color-primary);
 }
 
 /* 引用角标：编号小圆角块，连续引用之间留间距，不再挤成一串链接文字。 */
@@ -677,11 +724,11 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
   margin: 0 1px 0 2px;
   padding: 0 4px;
   border: none;
-  border-radius: 6px;
-  background: rgba(37, 99, 235, 0.1);
-  color: #2563eb;
+  border-radius: 4px;
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
   font-size: 11px;
-  font-weight: 700;
+  font-weight: 650;
   line-height: 1.6;
   text-align: center;
   vertical-align: super;
@@ -690,17 +737,17 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 }
 
 .assistant-markdown :deep(a[href^="#evidence-source-"]:hover) {
-  background: #2563eb;
+  background: var(--color-primary);
   color: #fff;
 }
 
 .assistant-markdown :deep(strong) {
-  color: #0f172a;
-  font-weight: 800;
+  color: var(--color-text);
+  font-weight: 650;
 }
 
 .assistant-markdown :deep(em) {
-  color: #0f172a;
+  color: var(--color-text);
   font-style: italic;
 }
 
@@ -709,15 +756,14 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
   align-items: center;
   gap: 8px;
   font-size: 13px;
-  color: #64748b;
+  color: var(--color-text-3);
 }
 
 .rag-chat-panel__stream-dot {
   width: 8px;
   height: 8px;
   border-radius: 999px;
-  background: #2563eb;
-  box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.35);
+  background: var(--color-primary);
   animation: rag-chat-panel-pulse 1.4s infinite;
 }
 
@@ -726,11 +772,11 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
   flex-wrap: wrap;
   gap: 10px;
   font-size: 12px;
-  color: #94a3b8;
+  color: var(--color-text-4);
 }
 
 .answer-meta__error {
-  color: #dc2626;
+  color: var(--color-danger);
 }
 
 .answer-state-tag {
@@ -741,13 +787,26 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
   flex: none;
 }
 
+.rag-chat-panel__sender :deep(.elx-x-sender) {
+  background: var(--color-surface);
+  border-radius: var(--radius-lg);
+  border-color: var(--color-border-strong);
+  box-shadow: var(--shadow-xs);
+}
+
+.rag-chat-panel__sender :deep(.elx-x-sender:focus-within) {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--color-primary-soft);
+}
+
 .rag-chat-panel__sender-tip {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding-top: 6px;
+  min-height: 28px;
+  padding: 4px 14px 6px;
   font-size: 12px;
-  color: #64748b;
+  color: var(--color-text-4);
 }
 
 .rag-chat-panel__stop-button {
@@ -755,32 +814,18 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 }
 
 @keyframes rag-chat-panel-pulse {
-  0% {
-    box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.35);
+  0%, 100% {
+    opacity: 1;
   }
 
-  70% {
-    box-shadow: 0 0 0 10px rgba(37, 99, 235, 0);
-  }
-
-  100% {
-    box-shadow: 0 0 0 0 rgba(37, 99, 235, 0);
+  50% {
+    opacity: 0.35;
   }
 }
 
 @media (max-width: 900px) {
-  .rag-chat-panel__bubble-list :deep(.message-start .message-bubble),
-  .rag-chat-panel__bubble-list :deep(.message-assistant .message-bubble),
-  .rag-chat-panel__bubble-list :deep([data-placement='start'] .message-bubble),
-  .rag-chat-panel__bubble-list :deep([class*='placement-start'] .message-bubble),
-  .rag-chat-panel__bubble-list :deep([data-placement='start'] [class*='bubble']),
-  .rag-chat-panel__bubble-list :deep([class*='placement-start'] [class*='bubble']) {
-    max-width: 100% !important;
-    width: 100%;
-  }
-
   .rag-chat-panel__message-footer {
-    gap: 10px;
+    gap: 8px;
   }
 }
 

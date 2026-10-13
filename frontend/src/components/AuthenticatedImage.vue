@@ -47,7 +47,7 @@ onBeforeUnmount(releaseImage)
 <style scoped>
 .authenticated-image__loading {
   min-height: 120px;
-  background: linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 50%, #f1f5f9 75%) 0 0 / 200% 100%;
+  background: linear-gradient(90deg, var(--color-surface-sunken) 25%, var(--color-border) 50%, var(--color-surface-sunken) 75%) 0 0 / 200% 100%;
   animation: authenticated-image-shimmer 1.2s ease-in-out infinite;
 }
 

@@ -1,35 +1,420 @@
+/*
+ * 设计令牌：所有页面和组件的颜色、圆角、阴影、间距都从这里取值，
+ * 组件里不再写死 #xxxxxx，换主题时只改这一处。
+ */
+:root {
+  --color-bg: #f6f7f9;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f9fafb;
+  --color-surface-sunken: #f3f4f6;
+  --color-border: #e5e7eb;
+  --color-border-strong: #d1d5db;
+
+  --color-text: #111827;
+  --color-text-2: #374151;
+  --color-text-3: #6b7280;
+  --color-text-4: #9ca3af;
+
+  --color-primary: #4f46e5;
+  --color-primary-hover: #4338ca;
+  --color-primary-soft: #eef2ff;
+  --color-primary-border: #c7d2fe;
+
+  --color-success: #16a34a;
+  --color-success-soft: #f0fdf4;
+  --color-success-border: #bbf7d0;
+  --color-warning: #b45309;
+  --color-warning-soft: #fffbeb;
+  --color-warning-border: #fde68a;
+  --color-danger: #dc2626;
+  --color-danger-soft: #fef2f2;
+  --color-danger-border: #fecaca;
+
+  /* 分项得分条使用的辅助色，保持与主色同一明度区间 */
+  --color-chart-1: #4f46e5;
+  --color-chart-2: #0891b2;
+  --color-chart-3: #d97706;
+  --color-chart-4: #16a34a;
+
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --radius-pill: 999px;
+
+  --shadow-xs: 0 1px 2px rgba(16, 24, 40, 0.04);
+  --shadow-sm: 0 1px 3px rgba(16, 24, 40, 0.06), 0 1px 2px rgba(16, 24, 40, 0.04);
+  --shadow-md: 0 8px 24px rgba(16, 24, 40, 0.08);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', Menlo, Consolas, monospace;
+
+  --sidebar-width: 232px;
+  --sidebar-width-collapsed: 64px;
+  --content-max-width: 1280px;
+
+  /* Element Plus 主题变量：让组件库与设计令牌同色 */
+  --el-color-primary: #4f46e5;
+  --el-color-primary-light-3: #8480ed;
+  --el-color-primary-light-5: #a7a3f2;
+  --el-color-primary-light-7: #cac8f7;
+  --el-color-primary-light-8: #dcdafa;
+  --el-color-primary-light-9: #eeedfc;
+  --el-color-primary-dark-2: #3f38b7;
+  --el-color-success: #16a34a;
+  --el-color-warning: #d97706;
+  --el-color-danger: #dc2626;
+  --el-color-error: #dc2626;
+  --el-color-info: #6b7280;
+  --el-text-color-primary: #111827;
+  --el-text-color-regular: #374151;
+  --el-text-color-secondary: #6b7280;
+  --el-text-color-placeholder: #9ca3af;
+  --el-border-color: #e5e7eb;
+  --el-border-color-light: #e5e7eb;
+  --el-border-color-lighter: #eef0f3;
+  --el-border-radius-base: 8px;
+  --el-border-radius-small: 6px;
+  --el-fill-color-light: #f6f7f9;
+  --el-fill-color-blank: #ffffff;
+  --el-bg-color-page: #f6f7f9;
+  --el-font-family: var(--font-sans);
+  --el-box-shadow-light: var(--shadow-md);
+}
+
 * {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
 }
 
+html,
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-  font-size: 14px;
-  line-height: 1.5;
-  color: #303133;
-  background-color: #f5f7fa;
+  height: 100%;
 }
+
+body {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--color-text);
+  background-color: var(--color-bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  color: var(--color-primary);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--color-primary-hover);
+}
+
+code,
+kbd,
+pre {
+  font-family: var(--font-mono);
+}
+
+::selection {
+  background: var(--color-primary-border);
+}
+
+/* ---------- 页面骨架：每个视图统一使用 .page + .page-header ---------- */
+
+.page {
+  width: 100%;
+  max-width: var(--content-max-width);
+  margin: 0 auto;
+  padding: 28px 32px 48px;
+}
+
+.page--wide {
+  max-width: 1600px;
+}
+
+.page-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 24px;
+}
+
+.page-header__text {
+  min-width: 0;
+}
+
+.page-title {
+  font-size: 22px;
+  font-weight: 650;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  color: var(--color-text);
+}
+
+.page-desc {
+  margin-top: 6px;
+  max-width: 720px;
+  font-size: 14px;
+  color: var(--color-text-3);
+}
+
+.page-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* ---------- 卡片 / 区块 ---------- */
+
+.surface {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-xs);
+}
+
+.surface-pad {
+  padding: 20px;
+}
+
+.surface-muted {
+  background: var(--color-surface-muted);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+}
+
+.section {
+  margin-bottom: 24px;
+}
+
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.section-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.section-desc {
+  margin-top: 2px;
+  font-size: 13px;
+  color: var(--color-text-3);
+}
+
+.eyebrow {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--color-text-3);
+}
+
+.muted {
+  color: var(--color-text-3);
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+/* ---------- 提示条 ---------- */
+
+.notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-muted);
+  color: var(--color-text-2);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.notice--info {
+  border-color: var(--color-primary-border);
+  background: var(--color-primary-soft);
+  color: #3730a3;
+}
+
+.notice--warning {
+  border-color: var(--color-warning-border);
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+}
+
+.notice--danger {
+  border-color: var(--color-danger-border);
+  background: var(--color-danger-soft);
+  color: #b91c1c;
+}
+
+.notice--success {
+  border-color: var(--color-success-border);
+  background: var(--color-success-soft);
+  color: #15803d;
+}
+
+.notice__title {
+  font-weight: 600;
+}
+
+/* ---------- 键值行（侧栏状态、详情元信息） ---------- */
+
+.kv-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.kv-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  font-size: 13px;
+  border-bottom: 1px dashed var(--color-border);
+}
+
+.kv-row:last-child {
+  border-bottom: none;
+}
+
+.kv-row > span:first-child {
+  color: var(--color-text-3);
+  flex-shrink: 0;
+}
+
+.kv-row > strong {
+  font-weight: 550;
+  color: var(--color-text);
+  text-align: right;
+  word-break: break-all;
+}
+
+/* ---------- 小标签（替代大量 el-tag 平铺） ---------- */
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-2);
+  font-size: 12px;
+  line-height: 22px;
+  white-space: nowrap;
+}
+
+.chip--primary {
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+}
+
+.chip--success {
+  background: var(--color-success-soft);
+  color: var(--color-success);
+}
+
+.chip--warning {
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+}
+
+.chip--danger {
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* ---------- Element Plus 细节统一 ---------- */
 
 .el-card {
-  border-radius: 8px;
-  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+  border-radius: var(--radius-lg);
+  border-color: var(--color-border);
+  box-shadow: var(--shadow-xs) !important;
 }
 
-.el-menu {
-  border-right: none;
-}
-
-.el-menu-item.is-active {
-  background-color: #e6f7ff;
-  color: #1890ff;
+.el-button {
+  font-weight: 500;
 }
 
 .el-tag {
-  margin: 0 4px 4px 0;
+  border-radius: var(--radius-sm);
 }
 
+.el-input__wrapper,
+.el-select__wrapper,
+.el-textarea__inner {
+  box-shadow: 0 0 0 1px var(--color-border) inset;
+}
+
+/* 浏览器自动填充只给内部 input 上色，和外层圆角边框对不齐，统一盖成白底。 */
+.el-input__inner:-webkit-autofill {
+  -webkit-box-shadow: 0 0 0 1000px var(--color-surface) inset;
+  -webkit-text-fill-color: var(--color-text);
+}
+
+.el-dialog {
+  border-radius: var(--radius-lg);
+}
+
+.el-drawer__header {
+  margin-bottom: 8px;
+}
+
+.el-empty {
+  --el-empty-padding: 32px 0;
+}
+
+.el-empty__description p {
+  color: var(--color-text-3);
+}
+
+.el-progress-bar__outer {
+  background-color: var(--color-surface-sunken);
+}
+
+.el-pagination {
+  justify-content: center;
+}
+
+/* ---------- 文本截断 ---------- */
+
+.clamp-2,
+.clamp-3 {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.clamp-2 {
+  -webkit-line-clamp: 2;
+}
+
+.clamp-3 {
+  -webkit-line-clamp: 3;
+}
+
+/* 旧代码仍在使用的工具类 */
 .summary-text {
   display: -webkit-box;
   -webkit-line-clamp: 3;
@@ -37,26 +422,12 @@ body {
   overflow: hidden;
 }
 
-.similarity-bar {
-  height: 8px;
-  border-radius: 4px;
-  background-color: #e8f4fd;
-}
+@media (max-width: 768px) {
+  .page {
+    padding: 20px 16px 40px;
+  }
 
-.similarity-fill {
-  height: 100%;
-  border-radius: 4px;
-  transition: width 0.3s ease;
-}
-
-.similarity-high {
-  background-color: #52c41a;
-}
-
-.similarity-medium {
-  background-color: #faad14;
-}
-
-.similarity-low {
-  background-color: #f5222d;
+  .page-title {
+    font-size: 20px;
+  }
 }

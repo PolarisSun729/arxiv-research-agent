@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { AUTH_REQUIRED_EVENT, currentUser, getAuthMode, restoreSession } from '@/api/auth'
 
 const debugRoutesEnabled = import.meta.env.VITE_ENABLE_DEBUG_ROUTES === 'true'
@@ -12,54 +13,61 @@ const routes: RouteRecordRaw[] = [
   {
     path: '/dashboard',
     name: 'Dashboard',
+    meta: { title: '首页' },
     component: () => import('@/views/Dashboard.vue')
   },
   {
     path: '/search',
     name: 'Search',
+    meta: { title: '论文搜索' },
     component: () => import('@/views/Search.vue')
   },
   {
     path: '/paper/:id',
     name: 'PaperDetail',
+    meta: { title: '论文详情' },
     component: () => import('@/views/PaperDetail.vue')
   },
   {
     path: '/recommendations',
     name: 'Recommendations',
+    meta: { title: '推荐论文' },
     component: () => import('@/views/Recommendations.vue')
   },
   {
     path: '/profile',
     name: 'ResearchProfile',
+    meta: { title: '研究画像' },
     component: () => import('@/views/ResearchProfile.vue')
   },
   {
     path: '/agent-search',
     name: 'AgentSearch',
-    meta: { research: true },
+    meta: { title: 'Agent 搜索', research: true },
     component: () => import('@/views/AgentSearch.vue')
   },
   {
     path: '/login',
     name: 'Login',
+    meta: { title: '登录', bare: true },
     component: () => import('@/views/Login.vue')
   },
   {
     path: '/account',
     name: 'Account',
-    meta: { jwt: true },
+    meta: { title: '账号设置', jwt: true },
     component: () => import('@/views/Account.vue')
   },
   {
     path: '/admin/users',
     name: 'AdminUsers',
-    meta: { admin: true, jwt: true },
+    meta: { title: '账号管理', admin: true, jwt: true },
     component: () => import('@/views/AdminUsers.vue')
   },
   {
     path: '/labeled',
     name: 'LabeledPapers',
+    meta: { title: '已标记论文' },
     component: () => import('@/views/LabeledPapers.vue')
   }
 ]
@@ -69,7 +77,7 @@ if (debugRoutesEnabled) {
   routes.push({
     path: '/chunks',
     name: 'Chunks',
-    meta: { admin: true },
+    meta: { title: '调试切片', admin: true },
     component: () => import('@/views/Chunks.vue')
   })
 }
@@ -78,12 +86,18 @@ if (debugRoutesEnabled) {
 routes.push({
   path: '/:pathMatch(.*)*',
   name: 'NotFound',
+  meta: { title: '页面不存在' },
   component: () => import('@/views/NotFound.vue')
 })
 
 const router = createRouter({
   history: createWebHistory(),
   routes
+})
+
+router.afterEach(to => {
+  const title = typeof to.meta.title === 'string' ? to.meta.title : ''
+  document.title = title ? `${title} · arXiv 研究助手` : 'arXiv 研究助手'
 })
 
 router.beforeEach(async to => {
@@ -95,9 +109,16 @@ router.beforeEach(async to => {
     return { path: '/login', query: { redirect: to.fullPath } }
   }
   const mode = getAuthMode()
-  if (to.meta.jwt && mode !== 'jwt') return '/dashboard'
-  if (mode === 'jwt' && ((to.meta.admin && currentUser.value?.role !== 'admin')
-      || (to.meta.research && !['admin', 'researcher'].includes(currentUser.value?.role || '')))) return '/dashboard'
+  const role = currentUser.value?.role || ''
+  let deniedReason = ''
+  if (to.meta.jwt && mode !== 'jwt') deniedReason = '该页面仅在账号登录模式下可用'
+  else if (mode === 'jwt' && to.meta.admin && role !== 'admin') deniedReason = '该页面需要管理员权限'
+  else if (mode === 'jwt' && to.meta.research && !['admin', 'researcher'].includes(role)) deniedReason = '该页面需要研究员及以上权限'
+  if (deniedReason) {
+    // 只是界面提示；真正的权限校验在后端 ROUTE_POLICIES。
+    ElMessage.warning(deniedReason)
+    return '/dashboard'
+  }
 })
 
 window.addEventListener(AUTH_REQUIRED_EVENT, () => {

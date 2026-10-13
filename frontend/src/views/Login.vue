@@ -68,138 +68,235 @@ async function handleSubmit() {
 
 <template>
   <div class="login-page">
-    <section class="login-panel">
-      <div class="login-copy">
-        <p class="kicker">arXiv 研究助手</p>
-        <h1>{{ mode === 'api_key' ? '访问验证' : registering ? '创建账号' : '登录账号' }}</h1>
-        <p class="description" v-if="mode === 'jwt'">使用个人账号管理阅读笔记、问答历史和研究画像。登录仅保留在当前标签页。</p>
-        <p class="description" v-else>此服务使用团队访问密钥。用户 ID 用于选择团队内的数据，不提供个人账号隔离。</p>
-        <p class="description" v-if="registering">新注册账号为访客。研究者权限由管理员分配。</p>
+    <section class="login-brand">
+      <div class="brand-row">
+        <span class="brand-mark">A</span>
+        <span class="brand-name">arXiv 研究助手</span>
       </div>
-      <form class="login-form" @submit.prevent="handleSubmit">
-        <template v-if="mode === 'jwt'">
-          <el-input v-model="username" size="large" placeholder="用户名" aria-label="用户名" autocomplete="username" :maxlength="50" />
-          <el-input v-if="registering" v-model="email" size="large" type="email" placeholder="邮箱" aria-label="邮箱" autocomplete="email" :maxlength="254" />
-          <el-input v-model="password" size="large" type="password" placeholder="密码" aria-label="密码" :autocomplete="registering ? 'new-password' : 'current-password'" :maxlength="72" show-password />
-          <p v-if="registering" class="description">密码至少 8 个字符，包含大小写字母和数字，UTF-8 编码后最多 72 字节。</p>
-        </template>
-        <template v-else>
-          <el-input v-model="accessKey" size="large" type="password" placeholder="管理员提供的访问密钥" aria-label="访问密钥" autocomplete="off" :maxlength="256" />
-          <el-input v-model="compatUserId" size="large" placeholder="数据命名空间（可留空）" aria-label="数据命名空间" />
-        </template>
-        <el-alert v-if="configError" :title="configError" type="error" :closable="false" />
-        <el-button v-if="configError" @click="loadConfig">重试连接</el-button>
-        <el-button type="primary" native-type="submit" size="large" :disabled="!canSubmit" :loading="submitting">{{ registering ? '注册并登录' : '登录' }}</el-button>
-        <el-button v-if="mode === 'jwt' && registrationEnabled" text :disabled="submitting" @click="registering = !registering">{{ registering ? '已有账号，返回登录' : '创建访客账号' }}</el-button>
-        <p v-if="mode === 'jwt' && configured && !registrationEnabled" class="description">暂未开放注册，请联系管理员创建账号。</p>
-      </form>
+      <div class="brand-copy">
+        <h2>从海量论文里，找到真正与你相关的那几篇</h2>
+        <ul class="brand-points">
+          <li><span class="dot" />本地 OAI 镜像库检索，支持字段前缀与布尔语法</li>
+          <li><span class="dot" />根据你的标记与研究画像生成个性化推荐</li>
+          <li><span class="dot" />针对单篇论文的检索增强问答，回答附带原文证据</li>
+        </ul>
+      </div>
+      <p class="brand-foot">登录状态仅保留在当前标签页</p>
+    </section>
+
+    <section class="login-main">
+      <div class="login-card">
+        <div class="login-head">
+          <h1>{{ mode === 'api_key' ? '访问验证' : registering ? '创建账号' : '登录' }}</h1>
+          <p v-if="mode === 'jwt' && !registering" class="muted">使用个人账号管理阅读笔记、问答历史和研究画像。</p>
+          <p v-else-if="mode === 'jwt'" class="muted">新注册账号为访客，研究者权限由管理员分配。</p>
+          <p v-else class="muted">此服务使用团队访问密钥。数据命名空间用于选择团队内的数据，不提供个人账号隔离。</p>
+        </div>
+
+        <form class="login-form" @submit.prevent="handleSubmit">
+          <template v-if="mode === 'jwt'">
+            <label class="field">
+              <span class="field-label">用户名</span>
+              <el-input v-model="username" size="large" placeholder="请输入用户名" aria-label="用户名" autocomplete="username" :maxlength="50" />
+            </label>
+            <label v-if="registering" class="field">
+              <span class="field-label">邮箱</span>
+              <el-input v-model="email" size="large" type="email" placeholder="name@example.com" aria-label="邮箱" autocomplete="email" :maxlength="254" />
+            </label>
+            <label class="field">
+              <span class="field-label">密码</span>
+              <el-input v-model="password" size="large" type="password" placeholder="请输入密码" aria-label="密码" :autocomplete="registering ? 'new-password' : 'current-password'" :maxlength="72" show-password />
+              <span v-if="registering" class="field-hint">至少 8 个字符，包含大小写字母和数字，UTF-8 编码后最多 72 字节。</span>
+            </label>
+          </template>
+          <template v-else>
+            <label class="field">
+              <span class="field-label">访问密钥</span>
+              <el-input v-model="accessKey" size="large" type="password" placeholder="管理员提供的访问密钥" aria-label="访问密钥" autocomplete="off" :maxlength="256" />
+            </label>
+            <label class="field">
+              <span class="field-label">数据命名空间 <span class="optional">可选</span></span>
+              <el-input v-model="compatUserId" size="large" placeholder="留空使用默认命名空间" aria-label="数据命名空间" />
+            </label>
+          </template>
+
+          <div v-if="configError" class="notice notice--danger config-error">
+            <span>{{ configError }}</span>
+            <el-button size="small" @click="loadConfig">重试连接</el-button>
+          </div>
+
+          <el-button class="submit-btn" type="primary" native-type="submit" size="large" :disabled="!canSubmit" :loading="submitting">
+            {{ registering ? '注册并登录' : '登录' }}
+          </el-button>
+
+          <div class="login-alt">
+            <el-button v-if="mode === 'jwt' && registrationEnabled" link type="primary" :disabled="submitting" @click="registering = !registering">
+              {{ registering ? '已有账号，返回登录' : '没有账号？创建访客账号' }}
+            </el-button>
+            <span v-else-if="mode === 'jwt' && configured" class="muted">暂未开放注册，请联系管理员创建账号</span>
+          </div>
+        </form>
+      </div>
     </section>
   </div>
 </template>
 
 <style scoped>
 .login-page {
-  min-height: calc(100vh - 100px);
+  min-height: 100vh;
   display: grid;
-  place-items: center;
-  padding: 24px;
+  grid-template-columns: minmax(360px, 5fr) 7fr;
+  background: var(--color-bg);
 }
 
-.login-panel {
-  width: min(920px, 100%);
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(320px, 420px);
-  gap: 28px;
-  align-items: stretch;
-  padding: 28px;
-  border: 1px solid #dbe3ef;
-  border-radius: 8px;
-  background: #fff;
-  box-shadow: 0 16px 42px rgba(15, 23, 42, 0.08);
-}
-
-.login-copy {
+.login-brand {
   display: flex;
   flex-direction: column;
+  justify-content: space-between;
+  padding: 40px 48px;
+  background: #1e1b4b;
+  background-image:
+    radial-gradient(circle at 20% 0%, rgba(129, 140, 248, 0.35), transparent 50%),
+    radial-gradient(circle at 100% 100%, rgba(79, 70, 229, 0.4), transparent 45%);
+  color: #e0e7ff;
+}
+
+.brand-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.brand-mark {
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
   justify-content: center;
-}
-
-.kicker {
-  margin: 0 0 10px;
-  color: #2563eb;
-  font-size: 13px;
+  border-radius: 9px;
+  background: #fff;
+  color: var(--color-primary);
   font-weight: 700;
+  font-size: 17px;
 }
 
-.login-copy h1 {
-  margin: 0;
-  color: #111827;
+.brand-name {
+  font-size: 16px;
+  font-weight: 650;
+  color: #fff;
+}
+
+.brand-copy h2 {
+  max-width: 420px;
   font-size: 28px;
-  line-height: 1.25;
+  line-height: 1.35;
+  font-weight: 650;
+  color: #fff;
+  letter-spacing: -0.01em;
 }
 
-.description {
-  margin: 14px 0 0;
-  color: #475569;
+.brand-points {
+  list-style: none;
+  margin-top: 28px;
+  display: grid;
+  gap: 14px;
+  font-size: 14px;
+  color: #c7d2fe;
+}
+
+.brand-points li {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  margin-top: 8px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: #a5b4fc;
+}
+
+.brand-foot {
+  font-size: 12px;
+  color: #a5b4fc;
+}
+
+.login-main {
+  display: grid;
+  place-items: center;
+  padding: 40px 24px;
+}
+
+.login-card {
+  width: min(400px, 100%);
+}
+
+.login-head h1 {
+  font-size: 24px;
+  font-weight: 650;
+  color: var(--color-text);
+}
+
+.login-head p {
+  margin-top: 8px;
   line-height: 1.7;
 }
 
 .login-form {
+  margin-top: 28px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 18px;
 }
 
-.quick-users {
-  display: grid;
-  gap: 10px;
-}
-
-.quick-user {
-  display: grid;
-  gap: 5px;
-  width: 100%;
-  padding: 14px 16px;
-  border: 1px solid #dbe3ef;
-  border-radius: 8px;
-  background: #f8fafc;
-  color: #334155;
-  cursor: pointer;
-  text-align: left;
-  transition: border-color 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
-}
-
-.quick-user:hover,
-.quick-user.active {
-  border-color: #2563eb;
-  background: #eff6ff;
-  box-shadow: 0 8px 20px rgba(37, 99, 235, 0.12);
-}
-
-.quick-user__title {
-  font-weight: 700;
-  color: #0f172a;
-}
-
-.quick-user__id {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  color: #2563eb;
-}
-
-.quick-user__desc {
-  color: #64748b;
-  line-height: 1.5;
-}
-
-.form-actions {
+.field {
   display: flex;
-  justify-content: flex-end;
-  gap: 10px;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field-label {
+  font-size: 13px;
+  font-weight: 550;
+  color: var(--color-text-2);
+}
+
+.optional {
+  font-weight: 400;
+  color: var(--color-text-4);
+}
+
+.field-hint {
+  font-size: 12px;
+  color: var(--color-text-3);
+}
+
+.config-error {
+  align-items: center;
+  justify-content: space-between;
+}
+
+.submit-btn {
+  width: 100%;
+  margin-top: 4px;
+}
+
+.login-alt {
+  display: flex;
+  justify-content: center;
+  font-size: 13px;
 }
 
 @media (max-width: 900px) {
-  .login-panel {
+  .login-page {
     grid-template-columns: 1fr;
+  }
+
+  .login-brand {
+    display: none;
   }
 }
 </style>

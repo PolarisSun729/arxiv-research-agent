@@ -29,46 +29,63 @@ const scoreText = computed(() => {
 </script>
 
 <template>
-  <div class="similarity-tag">
-    <el-tag
-      v-if="showLabel !== false"
-      :type="scoreColor"
-      size="small"
-    >
-      {{ scoreText }}
-    </el-tag>
-    <div v-if="showProgress !== false" class="similarity-progress">
-      <el-progress
-        :percentage="scorePercent"
-        :stroke-color="{
-          '0%': '#10b981',
-          '70%': '#f59e0b',
-          '100%': '#ef4444'
-        }"
-        :show-text="false"
-        height="6"
-      />
-      <span class="score-text">{{ scorePercent }}%</span>
+  <div :class="['similarity-tag', `is-${scoreColor}`]">
+    <div v-if="showProgress !== false" class="similarity-track">
+      <div class="similarity-fill" :style="{ width: `${scorePercent}%` }" />
     </div>
+    <span class="score-text">{{ scorePercent }}%</span>
+    <span v-if="showLabel !== false" class="score-level">{{ scoreText }}</span>
   </div>
 </template>
 
 <style scoped>
 .similarity-tag {
+  --level-color: var(--color-text-4);
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-.similarity-progress {
+.is-success {
+  --level-color: var(--color-success);
+}
+
+.is-warning {
+  --level-color: #d97706;
+}
+
+.is-danger {
+  --level-color: var(--color-text-4);
+}
+
+.similarity-track {
   flex: 1;
-  min-width: 120px;
+  min-width: 80px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--color-surface-sunken);
+  overflow: hidden;
+}
+
+.similarity-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--level-color);
+  transition: width 0.3s ease;
 }
 
 .score-text {
-  font-size: 12px;
-  color: #666;
-  min-width: 36px;
+  min-width: 34px;
   text-align: right;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.score-level {
+  font-size: 12px;
+  color: var(--level-color);
+  white-space: nowrap;
 }
 </style>
