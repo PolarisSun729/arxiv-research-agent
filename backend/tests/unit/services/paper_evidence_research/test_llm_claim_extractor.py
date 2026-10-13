@@ -212,3 +212,45 @@ def test_heading_with_model_name_digit_stays_skipped() -> None:
 
     assert result["extractor_source"] == "llm"
     assert all("PEC 2 F" not in claim["text"] for claim in result["claims"])
+
+
+
+def test_bilingual_heading_and_model_claimed_lead_ins_stay_as_layout() -> None:
+    # bbd87754：中英双语标题按字符数超 40 被提升为主张；模型把"具体步骤如下："当成主张。
+    # 二者都没引用，校验必然失败，部分回答会把标题整行删掉。
+    heading = "### 1. 记忆生成与演化层 (Memory Generation & Evolution)"
+    lead_in = "* a) 记忆化 (Memorize)："
+    draft = heading + "\n" + lead_in + "\n" + _MARKDOWN_DRAFT
+    reply = _valid_reply()
+    reply["skipped"].append(heading)
+    reply["skipped"].remove("具体步骤如下：")
+    reply["claims"].append({"quote": lead_in, "citation_ids": [], "addressed_need_ids": ["need-1"]})
+    reply["claims"].append({"quote": "具体步骤如下：", "citation_ids": [], "addressed_need_ids": []})
+
+    result = LlmClaimExtractor(FakeGenerationService([reply])).extract(_request(answer=draft))
+
+    texts = [claim["text"] for claim in result["claims"]]
+    assert result["extractor_source"] == "llm"
+    assert not any("Memory Generation" in text or "Memorize)" in text or "具体步骤如下" in text for text in texts)
+
+
+def test_cited_lead_in_is_still_verified() -> None:
+    draft = "系统流程如下：[source:54]\n" + _MARKDOWN_DRAFT
+    reply = _valid_reply()
+    reply["claims"].append({"quote": "系统流程如下：", "citation_ids": ["54"], "addressed_need_ids": ["need-1"]})
+
+    result = LlmClaimExtractor(FakeGenerationService([reply])).extract(_request(answer=draft))
+
+    assert "系统流程如下：" in [claim["text"] for claim in result["claims"]]
+
+
+def test_claim_text_drops_leading_list_markers() -> None:
+    draft = _MARKDOWN_DRAFT + "*   它将情节痕迹转化为图中的节点。[source:54]\n"
+    reply = _valid_reply()
+    reply["claims"].append(
+        {"quote": "* 它将情节痕迹转化为图中的节点。", "citation_ids": ["54"], "addressed_need_ids": ["need-1"]}
+    )
+
+    result = LlmClaimExtractor(FakeGenerationService([reply])).extract(_request(answer=draft))
+
+    assert result["claims"][-1]["text"] == "它将情节痕迹转化为图中的节点。"

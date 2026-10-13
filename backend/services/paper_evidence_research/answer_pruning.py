@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from typing import Iterable
 
 _CITATION_MARKER_RE = re.compile(r"\[source:([^\]\s,]+)\]")
@@ -23,6 +24,9 @@ _LEADING_MARKUP_RE = re.compile(r"^(?:[-*+•]\s+|#{1,6}\s+|\d{1,2}(?:\.(?!\d)|[
 _MAX_STRUCTURAL_CHARS = 40
 _MAX_STRAY_LETTERS = 10
 _SENTENCE_END = ("。", "！", "？", ".", "!", "?")
+_LIST_MARKER_RE = re.compile(r"^(?:[-*+•]|\d{1,2}[.)、）])\s+")
+# CommonMark：比所属列表项内容列多缩进 4 格及以上的行会被渲染成代码块。
+_CODE_INDENT = 4
 
 
 def _normalize_with_index(raw: str) -> tuple[str, list[int]]:
@@ -110,20 +114,74 @@ def prune_unsupported_claims(
         for line in pruned.splitlines()
         if not line.strip() or not _EMPTY_MARKUP_LINE_RE.fullmatch(line)
     ]
+    lines = _reindent_orphaned_lines(lines)
     result = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
     if not result or not _only_structure_remains(result, supported_claim_texts):
         return None
     return result
 
 
+def _reindent_orphaned_lines(lines: list[str]) -> list[str]:
+    """父级列表项被删后，子项的缩进会让 Markdown 把它渲染成代码块；把这类行挪到最近保留的上级的内容列。
+
+    只调整会被渲染成代码块的行（以及跟着它的子项），排版正常的行保持原样。
+    """
+    # 栈中每项：(原缩进, 新缩进, 原内容列)；子项按父项的位移一起平移。
+    stack: list[tuple[int, int, int]] = []
+    result: list[str] = []
+    for line in lines:
+        body = line.lstrip(" ")
+        if not body:
+            result.append(line)
+            continue
+        indent = len(line) - len(body)
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        if stack:
+            parent_indent, parent_new_indent, parent_content = stack[-1]
+            content_column = parent_new_indent + parent_content - parent_indent
+            new_indent = indent + parent_new_indent - parent_indent
+            if new_indent >= content_column + _CODE_INDENT:
+                new_indent = content_column
+        else:
+            new_indent = 0 if indent >= _CODE_INDENT else indent
+        marker = _LIST_MARKER_RE.match(body)
+        if marker:
+            stack.append((indent, new_indent, indent + marker.end()))
+        result.append(" " * new_indent + body)
+    return result
+
+
+def strip_leading_markup(text: str) -> str:
+    """去掉行首的项目符号、标题井号与编号；它们是排版，不属于主张内容。"""
+    return _LEADING_MARKUP_RE.sub("", text)
+
+
 def _only_structure_remains(answer: str, supported_claim_texts: Iterable[str]) -> bool:
-    """剪裁结果除受支持主张外只能剩排版结构（短、无数字、不像完整句子），否则说明提取漏了句子，不能原位保留。"""
-    needles = sorted({_normalize(text).rstrip(_TRAILING_PUNCTUATION) for text in supported_claim_texts}, key=len, reverse=True)
-    for line in answer.splitlines():
-        rest = _LEADING_MARKUP_RE.sub("", _normalize(line))
-        for needle in needles:
-            if needle:
-                rest = rest.replace(needle, " ")
+    """剪裁结果除受支持主张外只能剩排版结构（短、无数字、不像完整句子），否则说明提取漏了句子，不能原位保留。
+
+    在整篇归一化文本上扣掉受支持主张，再按原文行检查残留：一条主张可以跨多个列表项，
+    摘录带不带行首的 "* "、"1." 也都能扣干净（逐行比对时二者都会让主张对不上，整篇被误判为漏句）。
+    """
+    normalized, positions = _normalize_with_index(answer)
+    covered = [False] * len(normalized)
+    needles = {
+        strip_leading_markup(_normalize(text)).rstrip(_TRAILING_PUNCTUATION) for text in supported_claim_texts
+    }
+    for needle in needles:
+        if not needle:
+            continue
+        found = normalized.find(needle)
+        while found >= 0:
+            covered[found:found + len(needle)] = [True] * len(needle)
+            found = normalized.find(needle, found + len(needle))
+    line_starts = [0] + [index + 1 for index, char in enumerate(answer) if char == "\n"]
+    leftovers: dict[int, list[str]] = {}
+    for index, char in enumerate(normalized):
+        if not covered[index]:
+            leftovers.setdefault(bisect_right(line_starts, positions[index]) - 1, []).append(char)
+    for chars in leftovers.values():
+        rest = strip_leading_markup("".join(chars).strip())
         letters = "".join(char for char in rest if char.isalnum())
         if len(letters) > _MAX_STRUCTURAL_CHARS:
             return False

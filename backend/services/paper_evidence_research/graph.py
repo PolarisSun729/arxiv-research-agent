@@ -22,6 +22,7 @@ from .state import (
     ClaimVerificationRequest,
     DraftAnswer,
     DraftGenerationRequest,
+    DraftRevisionNote,
     EvidenceNeed,
     NeedEvidenceDigest,
     PaperEvidenceResearchState,
@@ -405,6 +406,9 @@ def _draft_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEvi
         candidate_count=len(context_pack.candidates),
         total_context_chars=context_pack.total_context_chars,
     )
+    previous_answer, revision_notes = _draft_revision_feedback(
+        next_state, {candidate.candidate_id for candidate in context_pack.candidates}
+    )
     # 生成器只能看到覆盖优先的临时上下文包，不能直接读取或改写完整研究状态。
     generated = dict(
         dependencies.draft_generator.generate(
@@ -414,6 +418,8 @@ def _draft_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEvi
                 addressed_need_ids=list(action.addressed_need_ids),
                 context_pack=context_pack,
                 preferred_answer_style=next_state.request.preferred_answer_style or "",
+                previous_answer=previous_answer,
+                revision_notes=revision_notes,
             )
         )
         or {}
@@ -427,8 +433,45 @@ def _draft_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEvi
         declared_claims=list(generated.get("declared_claims") or []),
         used_candidate_ids=[str(item) for item in generated.get("used_candidate_ids") or []],
     )
-    _trace(next_state, "draft_created", draft_id=next_state.current_draft.draft_id, version=version)
+    _trace(
+        next_state,
+        "draft_created",
+        draft_id=next_state.current_draft.draft_id,
+        version=version,
+        revision_note_count=len(revision_notes),
+    )
     return next_state
+
+
+def _draft_revision_feedback(
+    state: PaperEvidenceResearchState, pack_candidate_ids: set[str]
+) -> tuple[str, list[DraftRevisionNote]]:
+    """上一版草稿及其未通过校验的句子；上一版没有完整校验结论时不给反馈，按首次起草处理。"""
+    draft = state.current_draft
+    if draft is None or not state.claims:
+        return "", []
+    assessment_by_claim = {item.claim_id: item for item in state.claim_assessments}
+    if any(claim.claim_id not in assessment_by_claim for claim in state.claims):
+        return "", []
+    notes: list[DraftRevisionNote] = []
+    for claim in state.claims:
+        assessment = assessment_by_claim[claim.claim_id]
+        if has_verifiable_support(state, claim, assessment):
+            continue
+        reason_code, reason = _removal_reason(claim, assessment)
+        notes.append(
+            DraftRevisionNote(
+                claim_text=claim.text,
+                reason_code=reason_code,
+                reason=reason,
+                # 只建议本轮证据包里仍有的证据，起草器引用不到的 ID 给了也没用。
+                suggested_citation_ids=[
+                    evidence_id for evidence_id in assessment.supporting_evidence_ids if evidence_id in pack_candidate_ids
+                ],
+                missing_facets=list(assessment.missing_facets),
+            )
+        )
+    return draft.answer, notes
 
 
 def _extract_claims_node(state: Any, dependencies: ResearchGraphDependencies) -> PaperEvidenceResearchState:

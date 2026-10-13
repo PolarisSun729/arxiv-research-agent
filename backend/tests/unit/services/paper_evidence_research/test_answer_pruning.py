@@ -89,3 +89,68 @@ def test_removing_claim_that_starts_inside_bold_leaves_no_dangling_markers() -> 
         allowed_citation_ids={"11"},
     )
     assert pruned == "- **记忆化：** 系统将对话转为节点 [source:11]。"
+
+
+# 复刻 bbd87754 第 1 版草稿：父级列表项是无引用标签，子项缩进 4 格；LLM 摘录带着行首的 "* " 和 "1."。
+_NESTED_DRAFT = (
+    "### 记忆生成\n"
+    "*   **a) 记忆化 (Memorize)**：\n"
+    "    *   系统处理原始对话，将其转换为初始的认知图。\n"
+    "    *   它将情节痕迹转化为图中的节点 [source:54]。\n\n"
+    "*   **c) 推理 (Reasoning)**：\n"
+    "    *   **工具集操作**：\n"
+    "        1.  **Anchoring（锚定）**：将查询映射到入口节点 [source:54]。\n"
+    "        2.  **Traversal（遍历）**：在图中进行多跳导航 [source:54]。"
+)
+
+
+def test_supported_claims_with_leading_list_markers_still_count_as_covered() -> None:
+    # bbd87754：残留检查逐行比对时先去掉了行首 "* "，带 "* " 的主张一条都对不上，整篇被误判为漏句。
+    pruned = prune_unsupported_claims(
+        _NESTED_DRAFT,
+        removed_claim_texts=["* 系统处理原始对话，将其转换为初始的认知图。"],
+        supported_claim_texts=[
+            "* 它将情节痕迹转化为图中的节点。",
+            "1. Anchoring（锚定）：将查询映射到入口节点。",
+            "2. Traversal（遍历）：在图中进行多跳导航。",
+        ],
+        allowed_citation_ids={"54"},
+    )
+    assert pruned is not None
+    assert "系统处理原始对话" not in pruned
+
+
+def test_claim_spanning_several_list_items_counts_as_covered() -> None:
+    draft = "*   **巩固**：\n    *   离线合并重复事实。\n    *   调和冲突主张 [source:54]。\n\n总结：流程有两层。"
+    pruned = prune_unsupported_claims(
+        draft,
+        removed_claim_texts=["总结：流程有两层。"],
+        supported_claim_texts=["* 巩固： * 离线合并重复事实。 * 调和冲突主张。"],
+        allowed_citation_ids={"54"},
+    )
+    assert pruned == "*   **巩固**：\n    *   离线合并重复事实。\n    *   调和冲突主张 [source:54]。"
+
+
+def test_children_of_removed_list_items_are_dedented_instead_of_becoming_code_blocks() -> None:
+    pruned = prune_unsupported_claims(
+        _NESTED_DRAFT,
+        removed_claim_texts=[
+            "a) 记忆化 (Memorize)：",
+            "系统处理原始对话，将其转换为初始的认知图。",
+            "工具集操作：",
+        ],
+        supported_claim_texts=[
+            "它将情节痕迹转化为图中的节点。",
+            "Anchoring（锚定）：将查询映射到入口节点。",
+            "Traversal（遍历）：在图中进行多跳导航。",
+        ],
+        allowed_citation_ids={"54"},
+    )
+    # 原父项被删，缩进 4 格的子项放在段首会被渲染成代码块；挪到最近保留的上级内容列。
+    assert pruned == (
+        "### 记忆生成\n"
+        "*   它将情节痕迹转化为图中的节点 [source:54]。\n\n"
+        "*   **c) 推理 (Reasoning)**：\n"
+        "    1.  **Anchoring（锚定）**：将查询映射到入口节点 [source:54]。\n"
+        "    2.  **Traversal（遍历）**：在图中进行多跳导航 [source:54]。"
+    )

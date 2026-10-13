@@ -76,12 +76,26 @@ class ClaimAssessment(BaseModel):
     missing_facets: list[str] = Field(default_factory=list)
 
 
+class DraftRevisionNote(BaseModel):
+    """上一版草稿里没通过校验的一句话，以及校验器给出的修改线索。"""
+
+    claim_text: str
+    reason_code: str
+    reason: str
+    # 校验器认为能支持这句话的证据；引用挂错时照此改挂即可。
+    suggested_citation_ids: list[str] = Field(default_factory=list)
+    missing_facets: list[str] = Field(default_factory=list)
+
+
 class DraftGenerationRequest(BaseModel):
     version: int
     research_question: str
     addressed_need_ids: list[str]
     context_pack: EvidenceContextPack
     preferred_answer_style: str = ""
+    # 重写时带上上一版草稿与逐句校验结论；为空表示首次起草。不带这些，重写只是同样输入再生成一遍。
+    previous_answer: str = ""
+    revision_notes: list[DraftRevisionNote] = Field(default_factory=list)
 
     @property
     def candidates(self) -> list[EvidenceCandidate]:

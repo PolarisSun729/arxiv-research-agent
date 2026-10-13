@@ -9,7 +9,10 @@
    既不进校验又出现在最终答案里。
 
 此外，被模型标成排版结构的条目若带引用、含数字或明显是长句，会被强制提升为主张送检，
-结论不能藏进"标题"绕过门禁。连续多次失败才降级到规则提取器，并留下降级事件。
+结论不能藏进"标题"绕过门禁；反过来，模型当成主张的 Markdown 标题和"……如下："式引出句，
+只要不带引用、不含数量、够短，就按排版留在正文，不送检（无引用必然校验失败，标题会被整行删掉）。
+排版判定与部分回答剪裁的残留检查用同一把尺子（字母数、句末标点），两边不会互相打架。
+连续多次失败才降级到规则提取器，并留下降级事件。
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import logging
 import re
 from typing import Any
 
+from ..answer_pruning import strip_leading_markup
 from .degradation import DependencyDegradation, DegradationListener, REASON_LLM_CALL_FAILED, REASON_LLM_OUTPUT_INVALID
 from .llm_question_analyzer import _extract_json_payload
 from .rule_claim_extractor import _CITATION_MARKER_RE, RuleClaimExtractor, _candidate_field, _need_field
@@ -33,7 +37,13 @@ _LEADING_ORDINAL_RE = re.compile(r"^\s*[(（]?\d{1,2}[.、)）]\s*")
 _QUANTITY_RE = re.compile(r"\d{2,}|\d[.,]\d|\d\s*(?:%|％|倍|×)")
 # 草稿去掉全部摘录后允许残留的文字数（字母、汉字），用来容忍零散的连接词与标点间碎片。
 _MAX_UNCOVERED_LETTERS = 10
-_MAX_STRUCTURAL_CHARS = 40
+# 排版条目的上限按字母数（字母、汉字、数字）计，不算空格与标点："### 1. 记忆生成与演化层 (Memory Generation & Evolution)"
+# 这类中英双语标题按字符数会超 40，按字母数只有 34。
+_MAX_STRUCTURAL_LETTERS = 40
+# 超过这个字母数且以句末标点收尾，就是一句完整陈述，不是标题。
+_MAX_STRAY_LETTERS = 10
+_SENTENCE_END = ("。", "！", "？", ".", "!", "?")
+_LEAD_IN_END = ("：", ":")
 _MAX_FEEDBACK_ITEMS = 5
 
 _EXTRACTION_PROMPT = """You are the claim extractor of an evidence-research engine for single-paper QA.
@@ -68,7 +78,17 @@ def _is_substantive(raw_item: str, normalized: str) -> bool:
         return True
     if _QUANTITY_RE.search(_LEADING_ORDINAL_RE.sub("", normalized)):
         return True
-    return len(normalized) > _MAX_STRUCTURAL_CHARS
+    letters = sum(char.isalnum() for char in normalized)
+    if letters > _MAX_STRUCTURAL_LETTERS:
+        return True
+    return letters > _MAX_STRAY_LETTERS and normalized.rstrip().endswith(_SENTENCE_END)
+
+
+def _is_layout_claim(raw_quote: str, normalized: str, citations: list[str]) -> bool:
+    """模型当成主张、但实为排版的条目：无引用的 Markdown 标题或以冒号收尾的引出句。"""
+    if citations or _is_substantive(raw_quote, normalized):
+        return False
+    return normalized.startswith("#") or normalized.rstrip().endswith(_LEAD_IN_END)
 
 
 class ClaimExtractionOutputError(ValueError):
@@ -165,6 +185,9 @@ class LlmClaimExtractor:
             raw_quote = str(item.get("quote") or "")
             citations = [str(value) for value in item.get("citation_ids") or [] if isinstance(value, (str, int))]
             need_ids = [str(value) for value in item.get("addressed_need_ids") or [] if isinstance(value, str)]
+            if _is_layout_claim(raw_quote, _normalize(raw_quote), citations):
+                structural.append(_normalize(raw_quote))
+                continue
             entries.append((raw_quote, _normalize(raw_quote), citations, need_ids))
         for item in raw_skipped:
             raw_item = str(item or "")
@@ -208,7 +231,8 @@ class LlmClaimExtractor:
             claims.append(
                 {
                     "claim_id": f"claim-v{draft_version}-{index}",
-                    "text": normalized,
+                    # 行首的项目符号与编号是排版：去掉后校验器和"被移除的句子"面板看到的是干净句子，剪裁仍能在草稿里定位。
+                    "text": strip_leading_markup(normalized),
                     "importance": "core" if any(need_id in core_need_ids for need_id in bound_ids) else "supporting",
                     "addressed_need_ids": bound_ids,
                     "citation_ids": citation_ids,

@@ -1413,3 +1413,37 @@ def test_default_pool_limits_fit_a_whole_paper() -> None:
     # 一篇论文约 68 个 chunk、8.3 万字符；池上限按 256K 上下文推导，整篇都能进池。
     assert limits.max_evidence_items >= 68
     assert limits.max_total_context_chars >= 83_000
+
+
+
+def test_redraft_receives_previous_answer_and_failed_claim_feedback() -> None:
+    # bbd87754：重写拿不到上一版的校验结论，等于同样输入再生成一遍，第 2 版反而更差。
+    class FeedbackRecordingDrafter(ScriptedDraftGenerator):
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        def generate(self, request: Any) -> dict[str, Any]:
+            self.requests.append(request)
+            return super().generate(request)
+
+    drafter = FeedbackRecordingDrafter()
+    service = PaperEvidenceResearchService(
+        question_analyzer=ScriptedQuestionAnalyzer(),
+        decision_policy=ScriptedDecisionPolicy(),
+        retriever=ScriptedRetriever(),
+        draft_generator=drafter,
+        claim_extractor=ScriptedClaimExtractor(),
+        claim_verifier=ScriptedClaimVerifier(),
+    )
+    events: list[dict[str, Any]] = []
+
+    service.research(_request(run_id="research-run-revision"), trace_listener=lambda _run_id, trace: events.extend(trace))
+
+    first, second = drafter.requests[:2]
+    assert first.previous_answer == "" and first.revision_notes == []
+    assert second.previous_answer == "反思 token 决定是否检索；消融实验证明该模块有效。"
+    assert [(note.claim_text, note.reason_code, note.missing_facets) for note in second.revision_notes] == [
+        ("消融实验支持反思模块有效", "uncited", ["缺少移除反思模块后的实验结果"]),
+    ]
+    created = [event["revision_note_count"] for event in events if event["event_type"] == "draft_created"]
+    assert created[:2] == [0, 1]
