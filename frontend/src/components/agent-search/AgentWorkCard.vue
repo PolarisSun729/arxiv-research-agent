@@ -128,17 +128,17 @@ const attemptText = computed(() => {
 .agent-work-card {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding: 16px;
-  border: 1px solid rgba(14, 116, 144, 0.18);
-  border-radius: 16px;
-  background: linear-gradient(135deg, rgba(240, 249, 255, 0.96), #fff);
-  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.06);
+  gap: 12px;
+  padding: 16px 18px;
+  border: 1px solid var(--color-border);
+  border-left: 3px solid var(--color-primary);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-xs);
 }
 
 .agent-work-card--failed {
-  border-color: rgba(220, 38, 38, 0.2);
-  background: linear-gradient(135deg, rgba(254, 242, 242, 0.96), #fff);
+  border-left-color: var(--color-danger);
 }
 
 .agent-work-card__header,
@@ -151,31 +151,32 @@ const attemptText = computed(() => {
 }
 
 .agent-work-card__eyebrow {
-  margin: 0 0 4px;
-  color: #0891b2;
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.1em;
+  margin: 0 0 2px;
+  color: var(--color-text-3);
+  font-size: 12px;
+  font-weight: 550;
 }
 
 .agent-work-card h3 {
   margin: 0;
-  color: #0f172a;
-  font-size: 16px;
+  color: var(--color-text);
+  font-size: 15px;
+  font-weight: 600;
 }
 
 .agent-work-card__summary {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px 12px;
-  color: #475569;
+  gap: 4px 12px;
+  color: var(--color-text-3);
   font-size: 13px;
 }
 
 .agent-work-card__summary strong {
   width: 100%;
-  color: #0f172a;
+  color: var(--color-text);
   font-size: 14px;
+  font-weight: 550;
 }
 
 .agent-work-card__summary p,
@@ -188,29 +189,30 @@ const attemptText = computed(() => {
 .agent-work-card__progress {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 
 .agent-work-card__progress-meta {
-  color: #475569;
+  color: var(--color-text-2);
   font-size: 13px;
 }
 
 .agent-work-card__progress-meta strong {
-  color: #0f172a;
+  color: var(--color-text);
   font-variant-numeric: tabular-nums;
 }
 
 .agent-work-card__hint {
-  color: #94a3b8;
+  color: var(--color-text-4);
   font-size: 12px;
 }
 
 .agent-work-card__error {
   padding: 10px 12px;
-  border-radius: 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--color-danger-border);
   color: #b91c1c;
-  background: rgba(254, 226, 226, 0.72);
+  background: var(--color-danger-soft);
   font-size: 13px;
   line-height: 1.6;
 }

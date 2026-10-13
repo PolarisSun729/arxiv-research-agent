@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
+import { MagicStick } from '@element-plus/icons-vue'
 import { usePaperStore } from '@/stores/paperStore'
 import PaperCard from '@/components/PaperCard.vue'
 import SimilarityTag from '@/components/SimilarityTag.vue'
@@ -92,145 +93,122 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
 </script>
 
 <template>
-  <div class="recommendations-page">
-    <div class="page-header">
-      <div>
-        <h1>推荐论文</h1>
-        <p class="description">
-          根据你已经标记过的论文，系统会从 CS.AI 论文中生成一批相似度较高的推荐结果。
-        </p>
+  <div class="page recs-page">
+    <header class="page-header">
+      <div class="page-header__text">
+        <h1 class="page-title">推荐论文</h1>
+        <p class="page-desc">根据你标记过的论文和研究画像，从 CS.AI 论文中挑选最相关的一批。</p>
       </div>
-
-      <div class="action-bar">
-        <el-select
-          v-model="recommendationCount"
-          placeholder="推荐数量"
-          style="width: 120px; margin-right: 12px"
-        >
-          <el-option
-            v-for="option in countOptions"
-            :key="option.value"
-            :value="option.value"
-            :label="option.label"
-          />
+      <div class="page-actions">
+        <el-select v-model="recommendationCount" style="width: 100px" aria-label="推荐数量">
+          <el-option v-for="option in countOptions" :key="option.value" :value="option.value" :label="option.label" />
         </el-select>
-        <el-select
-          v-model="recommendationAgeMonths"
-          placeholder="时间范围"
-          style="width: 140px; margin-right: 12px"
-        >
-          <el-option
-            v-for="option in ageOptions"
-            :key="option.value"
-            :value="option.value"
-            :label="option.label"
-          />
+        <el-select v-model="recommendationAgeMonths" style="width: 130px" aria-label="时间范围">
+          <el-option v-for="option in ageOptions" :key="option.value" :value="option.value" :label="option.label" />
         </el-select>
-        <el-button
-          type="primary"
-          :loading="store.recommendationsGenerating"
-          @click="handleGenerateRecommendations"
-        >
+        <el-button type="primary" :icon="MagicStick" :loading="store.recommendationsGenerating" @click="handleGenerateRecommendations">
           生成推荐
         </el-button>
       </div>
-    </div>
+    </header>
 
-    <div v-if="researchProfile" class="profile-summary-card">
-      <div class="profile-summary-card__head">
+    <section v-if="researchProfile" class="surface profile-strip">
+      <div class="profile-strip__head">
         <div>
-          <div class="profile-summary-card__kicker">显式长期画像</div>
-          <div class="profile-summary-card__title">推荐会轻量参考你的研究画像</div>
+          <div class="section-title">参考的研究画像</div>
+          <div class="section-desc">推荐会轻量参考你的长期画像</div>
         </div>
-        <el-button text type="primary" @click="goToProfile">编辑画像</el-button>
+        <el-button link type="primary" @click="goToProfile">编辑画像</el-button>
       </div>
-      <div class="profile-summary-card__body">
+      <div class="profile-strip__body">
         <div v-if="profileTopicPreview.length" class="profile-line">
-          <span class="profile-label">正向主题</span>
-          <el-tag v-for="item in profileTopicPreview" :key="item" size="small" effect="plain">{{ item }}</el-tag>
+          <span class="profile-label">关注主题</span>
+          <div class="chip-row">
+            <span v-for="item in profileTopicPreview" :key="item" class="chip chip--primary">{{ item }}</span>
+          </div>
         </div>
         <div v-if="profileCategoryPreview.length" class="profile-line">
           <span class="profile-label">偏好分类</span>
-          <el-tag v-for="item in profileCategoryPreview" :key="item" size="small" type="success" effect="plain">{{ item }}</el-tag>
+          <div class="chip-row">
+            <span v-for="item in profileCategoryPreview" :key="item" class="chip mono">{{ item }}</span>
+          </div>
         </div>
         <div v-if="profileNegativePreview.length" class="profile-line">
-          <span class="profile-label">负向主题</span>
-          <el-tag v-for="item in profileNegativePreview" :key="item" size="small" type="danger" effect="plain">{{ item }}</el-tag>
+          <span class="profile-label">排除主题</span>
+          <div class="chip-row">
+            <span v-for="item in profileNegativePreview" :key="item" class="chip chip--danger">{{ item }}</span>
+          </div>
         </div>
-        <div v-if="researchProfile.preferred_answer_style" class="profile-note">
-          偏好回答风格：{{ researchProfile.preferred_answer_style }}
+        <div v-if="researchProfile.preferred_answer_style" class="profile-line">
+          <span class="profile-label">回答风格</span>
+          <span class="profile-note">{{ researchProfile.preferred_answer_style }}</span>
         </div>
+      </div>
+    </section>
+
+    <div v-if="store.recommendationsGenerating" class="list">
+      <div v-for="n in 3" :key="n" class="surface skeleton-card">
+        <el-skeleton :rows="3" animated />
       </div>
     </div>
 
-    <div v-if="store.recommendations.length > 0" class="summary-panel">
-      <div class="summary-panel__lead">
-        <div class="summary-copy-wrap">
-          <div class="summary-kicker">为什么推荐这篇</div>
-          <h2 class="summary-title">{{ topRecommendation?.title }}</h2>
-          <p class="summary-copy">
-            这篇 CS.AI 论文在语义相似度、主题匹配上更符合你当前的兴趣画像，且限定在最近 {{ recommendationAgeMonths }} 个月内。
+    <div v-else-if="store.recommendations.length === 0" class="surface empty">
+      <el-empty description="还没有推荐结果。选择数量和时间范围后点击「生成推荐」" :image-size="96" />
+    </div>
+
+    <template v-else>
+      <section class="surface top-pick">
+        <div class="top-pick__main">
+          <span class="chip chip--primary">首推</span>
+          <h2 class="top-pick__title" @click="topRecommendation && handleViewDetail(topRecommendation.id)">
+            {{ topRecommendation?.title }}
+          </h2>
+          <p class="top-pick__copy">
+            在语义相似度和主题匹配上最符合你当前的兴趣画像，发表于最近 {{ recommendationAgeMonths }} 个月内。
           </p>
+          <p v-if="topRecommendation?.reason" class="top-pick__reason">{{ topRecommendation.reason }}</p>
+          <div v-if="interestVector" class="chip-row top-pick__meta">
+            <span class="chip">画像模式 {{ interestProfileMode }}</span>
+            <span class="chip">兴趣簇 {{ interestClusterCount }}</span>
+          </div>
         </div>
 
-        <div class="summary-score">
+        <div class="top-pick__score">
+          <div class="score-hero">
+            <span class="score-hero__value">{{ Math.round(topFinalScore * 100) }}<small>%</small></span>
+            <span class="score-hero__label">综合得分</span>
+          </div>
           <SimilarityTag :score="topRecommendation?.similarityScore || 0" />
-          <div class="summary-score__value">最终 {{ Math.round(topFinalScore * 100) }}%</div>
-        </div>
-      </div>
-
-      <div v-if="interestVector" class="summary-interest">
-        <span>兴趣画像模式：{{ interestProfileMode }}</span>
-        <span>兴趣簇数量：{{ interestClusterCount }}</span>
-      </div>
-
-      <div v-if="topBreakdown" class="summary-breakdown">
-        <div class="breakdown-row">
-          <div class="breakdown-meta">
-            <span>语义相似</span>
-            <strong>{{ toPercent(topBreakdown.semantic_score) }}%</strong>
+          <div v-if="topBreakdown" class="score-bars">
+            <div class="score-bar">
+              <span>语义相似</span>
+              <el-progress :percentage="toPercent(topBreakdown.semantic_score)" :show-text="false" :stroke-width="6" color="var(--color-chart-1)" />
+              <strong>{{ toPercent(topBreakdown.semantic_score) }}%</strong>
+            </div>
+            <div class="score-bar">
+              <span>分类匹配</span>
+              <el-progress :percentage="toPercent(topBreakdown.category_score)" :show-text="false" :stroke-width="6" color="var(--color-chart-2)" />
+              <strong>{{ toPercent(topBreakdown.category_score) }}%</strong>
+            </div>
+            <div class="score-bar">
+              <span>新鲜度</span>
+              <el-progress :percentage="toPercent(topBreakdown.recency_score)" :show-text="false" :stroke-width="6" color="var(--color-chart-3)" />
+              <strong>{{ toPercent(topBreakdown.recency_score) }}%</strong>
+            </div>
+            <div class="score-bar">
+              <span>多样性</span>
+              <el-progress :percentage="toPercent(topDiversityMatch)" :show-text="false" :stroke-width="6" color="var(--color-chart-4)" />
+              <strong>{{ toPercent(topDiversityMatch) }}%</strong>
+            </div>
           </div>
-          <el-progress :percentage="toPercent(topBreakdown.semantic_score)" :show-text="false" />
         </div>
-        <div class="breakdown-row">
-          <div class="breakdown-meta">
-            <span>分类匹配</span>
-            <strong>{{ toPercent(topBreakdown.category_score) }}%</strong>
-          </div>
-          <el-progress :percentage="toPercent(topBreakdown.category_score)" :show-text="false" color="#8b5cf6" />
-        </div>
-        <div class="breakdown-row">
-          <div class="breakdown-meta">
-            <span>新鲜度</span>
-            <strong>{{ toPercent(topBreakdown.recency_score) }}%</strong>
-          </div>
-          <el-progress :percentage="toPercent(topBreakdown.recency_score)" :show-text="false" color="#0ea5e9" />
-        </div>
-        <div class="breakdown-row">
-          <div class="breakdown-meta">
-            <span>多样性</span>
-            <strong>{{ toPercent(topDiversityMatch) }}%</strong>
-          </div>
-          <el-progress :percentage="toPercent(topDiversityMatch)" :show-text="false" color="#22c55e" />
-        </div>
+      </section>
+
+      <div class="list-head">
+        <h2 class="section-title">全部推荐 <span class="muted">{{ store.recommendations.length }}</span></h2>
+        <span class="muted">按相似度排序 · 候选范围仅限 CS.AI</span>
       </div>
-
-      <div v-if="topRecommendation?.reason" class="summary-reason">
-        {{ topRecommendation.reason }}
-      </div>
-    </div>
-
-    <div v-if="store.recommendationsGenerating" class="loading">
-      <el-skeleton :rows="4" animated />
-    </div>
-
-    <div v-else-if="store.recommendations.length === 0" class="empty-results">
-      <el-empty description="暂无推荐论文，请先生成推荐结果" />
-    </div>
-
-    <div v-else class="recommendations-list">
-      <div class="sort-info">按相似度排序，候选范围仅限 CS.AI</div>
-      <div class="paper-grid">
+      <div class="list">
         <PaperCard
           v-for="paper in store.recommendations"
           :key="paper.id"
@@ -240,239 +218,190 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
           @label="handleLabel"
         />
       </div>
-    </div>
+    </template>
   </div>
 </template>
 
 <style scoped>
-.recommendations-page {
-  padding: 20px;
+.recs-page {
+  max-width: 1080px;
 }
 
-.page-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  margin-bottom: 24px;
+.profile-strip {
+  padding: 16px 20px;
+  margin-bottom: 20px;
 }
 
-.page-header h1 {
-  font-size: 24px;
-  font-weight: 700;
-  color: #1f2937;
-  margin: 0 0 8px 0;
-}
-
-.description {
-  font-size: 14px;
-  color: #6b7280;
-  margin: 0;
-}
-
-.action-bar {
-  display: flex;
-  align-items: center;
-}
-
-.profile-summary-card {
-  margin-bottom: 24px;
-  padding: 18px 20px;
-  border-radius: 18px;
-  background: linear-gradient(135deg, rgba(239, 246, 255, 0.95), rgba(248, 250, 252, 0.98));
-  border: 1px solid rgba(125, 211, 252, 0.35);
-}
-
-.profile-summary-card__head {
+.profile-strip__head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
+  margin-bottom: 12px;
 }
 
-.profile-summary-card__kicker {
-  font-size: 12px;
-  color: #0284c7;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.profile-summary-card__title {
-  margin-top: 6px;
-  font-size: 18px;
-  font-weight: 700;
-  color: #0f172a;
-}
-
-.profile-summary-card__body {
+.profile-strip__body {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  margin-top: 14px;
+  gap: 8px;
 }
 
 .profile-line {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
+  align-items: flex-start;
+  gap: 12px;
 }
 
 .profile-label {
-  min-width: 72px;
-  color: #475569;
-  font-size: 13px;
+  flex-shrink: 0;
+  width: 64px;
+  font-size: 12.5px;
+  line-height: 22px;
+  color: var(--color-text-3);
 }
 
 .profile-note {
-  color: #334155;
   font-size: 13px;
+  line-height: 22px;
+  color: var(--color-text-2);
 }
 
-.summary-panel {
-  margin-bottom: 24px;
-  padding: 20px;
-  border-radius: 18px;
-  background:
-    linear-gradient(135deg, rgba(15, 23, 42, 0.96), rgba(30, 41, 59, 0.92)),
-    radial-gradient(circle at top right, rgba(56, 189, 248, 0.18), transparent 38%),
-    radial-gradient(circle at bottom left, rgba(16, 185, 129, 0.14), transparent 34%);
-  color: #f8fafc;
-  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.18);
+.top-pick {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 28px;
+  padding: 22px 24px;
+  margin-bottom: 28px;
+  border-color: var(--color-primary-border);
+  background: linear-gradient(180deg, var(--color-primary-soft) 0%, var(--color-surface) 70%);
 }
 
-.summary-panel__lead {
-  display: flex;
-  justify-content: space-between;
-  gap: 20px;
-  align-items: flex-start;
+.top-pick__title {
+  margin-top: 10px;
+  font-size: 19px;
+  font-weight: 650;
+  line-height: 1.4;
+  color: var(--color-text);
+  cursor: pointer;
 }
 
-.summary-copy-wrap {
-  min-width: 0;
+.top-pick__title:hover {
+  color: var(--color-primary);
 }
 
-.summary-kicker {
-  font-size: 12px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: #7dd3fc;
-  margin-bottom: 8px;
+.top-pick__copy {
+  margin-top: 8px;
+  font-size: 13.5px;
+  color: var(--color-text-3);
 }
 
-.summary-title {
-  margin: 0;
-  font-size: 22px;
-  line-height: 1.35;
-  color: #fff;
+.top-pick__reason {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: var(--color-text-2);
 }
 
-.summary-copy {
-  margin: 10px 0 0;
-  max-width: 760px;
-  color: rgba(226, 232, 240, 0.88);
-  line-height: 1.65;
+.top-pick__meta {
+  margin-top: 12px;
 }
 
-.summary-score {
-  min-width: 180px;
+.top-pick__score {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  align-items: flex-end;
+  gap: 12px;
+  padding-left: 24px;
+  border-left: 1px solid var(--color-border);
 }
 
-.summary-score__value {
-  font-size: 18px;
+.score-hero {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.score-hero__value {
+  font-size: 40px;
   font-weight: 700;
-  color: #fff;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  color: var(--color-primary);
+  font-variant-numeric: tabular-nums;
 }
 
-.summary-interest {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px 14px;
-  margin-top: 14px;
-  padding: 10px 12px;
-  border-radius: 12px;
-  background: rgba(15, 23, 42, 0.36);
-  color: rgba(226, 232, 240, 0.9);
+.score-hero__value small {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.score-hero__label {
   font-size: 13px;
+  color: var(--color-text-3);
 }
 
-.summary-breakdown {
+.score-bars {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px 18px;
-  margin-top: 18px;
+  gap: 8px;
 }
 
-.breakdown-row {
-  padding: 12px 14px;
-  border-radius: 14px;
-  background: rgba(15, 23, 42, 0.34);
-  border: 1px solid rgba(148, 163, 184, 0.16);
-}
-
-.breakdown-meta {
-  display: flex;
-  justify-content: space-between;
+.score-bar {
+  display: grid;
+  grid-template-columns: 60px 1fr 40px;
   align-items: center;
-  margin-bottom: 8px;
-  font-size: 13px;
-  color: rgba(226, 232, 240, 0.88);
+  gap: 10px;
+  font-size: 12.5px;
+  color: var(--color-text-3);
 }
 
-.summary-reason {
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid rgba(148, 163, 184, 0.16);
-  color: #e2e8f0;
-  line-height: 1.65;
-  font-size: 14px;
+.score-bar strong {
+  text-align: right;
+  font-weight: 600;
+  color: var(--color-text-2);
+  font-variant-numeric: tabular-nums;
 }
 
-.loading {
-  padding: 24px 0;
+.list-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  font-size: 12.5px;
 }
 
-.empty-results {
-  padding: 40px 0;
+.list-head .section-title .muted {
+  font-weight: 500;
+  margin-left: 4px;
 }
 
-.sort-info {
-  margin-bottom: 16px;
-  font-size: 14px;
-  color: #6b7280;
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
-.paper-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
-  gap: 16px;
+.skeleton-card {
+  padding: 20px;
 }
 
-@media (max-width: 900px) {
-  .page-header {
-    flex-direction: column;
-    gap: 16px;
-  }
+.empty {
+  padding: 24px;
+}
 
-  .summary-panel__lead {
-    flex-direction: column;
-  }
-
-  .summary-score {
-    align-items: flex-start;
-  }
-
-  .summary-breakdown {
+@media (max-width: 860px) {
+  .top-pick {
     grid-template-columns: 1fr;
   }
 
-  .paper-grid {
-    grid-template-columns: 1fr;
+  .top-pick__score {
+    padding-left: 0;
+    padding-top: 16px;
+    border-left: none;
+    border-top: 1px solid var(--color-border);
   }
 }
 </style>
-

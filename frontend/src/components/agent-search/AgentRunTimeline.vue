@@ -99,17 +99,17 @@ function toggle() {
 
 <style scoped>
 .run-timeline {
-  --tone: #3b82f6;
+  --tone: var(--color-primary);
   margin-bottom: 10px;
   padding: 10px 12px;
-  border: 1px solid #e8edf4;
+  border: 1px solid var(--color-border);
   border-radius: 12px;
-  background: #f8fafc;
+  background: var(--color-surface-muted);
   font-size: 13px;
 }
 
-.run-timeline--done { --tone: #22c55e; }
-.run-timeline--failed { --tone: #ef4444; }
+.run-timeline--done { --tone: var(--color-success); }
+.run-timeline--failed { --tone: var(--color-danger); }
 
 .run-timeline__head {
   display: flex;
@@ -147,7 +147,7 @@ function toggle() {
   min-width: 0;
   flex: 1;
   overflow: hidden;
-  color: #0f172a;
+  color: var(--color-text);
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -155,7 +155,7 @@ function toggle() {
 
 .run-timeline__meta {
   flex: none;
-  color: #94a3b8;
+  color: var(--color-text-4);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
@@ -165,8 +165,8 @@ function toggle() {
   width: 7px;
   height: 7px;
   margin: 0 4px 3px;
-  border-right: 1.5px solid #94a3b8;
-  border-bottom: 1.5px solid #94a3b8;
+  border-right: 1.5px solid var(--color-text-4);
+  border-bottom: 1.5px solid var(--color-text-4);
   transform: rotate(45deg);
   transition: transform 0.2s;
 }
@@ -179,12 +179,12 @@ function toggle() {
 .run-timeline__steps {
   margin: 10px 0 0;
   padding: 10px 0 0;
-  border-top: 1px solid #eef2f7;
+  border-top: 1px solid var(--color-surface-sunken);
   list-style: none;
 }
 
 .run-step {
-  --dot: #22c55e;
+  --dot: var(--color-success);
   position: relative;
   display: flex;
   gap: 10px;
@@ -198,7 +198,7 @@ function toggle() {
   bottom: -2px;
   left: 3px;
   width: 1px;
-  background: #e2e8f0;
+  background: var(--color-border);
 }
 
 .run-step:last-child {
@@ -209,9 +209,9 @@ function toggle() {
   display: none;
 }
 
-.run-step--running { --dot: #3b82f6; }
-.run-step--failed { --dot: #ef4444; }
-.run-step--skipped { --dot: #94a3b8; }
+.run-step--running { --dot: var(--color-primary); }
+.run-step--failed { --dot: var(--color-danger); }
+.run-step--skipped { --dot: var(--color-text-4); }
 
 .run-step__dot {
   flex: none;
@@ -242,12 +242,12 @@ function toggle() {
 }
 
 .run-step__label {
-  color: #334155;
+  color: var(--color-text-2);
   line-height: 1.5;
 }
 
 .run-step--running .run-step__label {
-  color: #1d4ed8;
+  color: var(--color-primary-hover);
   font-weight: 600;
 }
 
@@ -257,7 +257,7 @@ function toggle() {
 
 .run-step__time {
   flex: none;
-  color: #94a3b8;
+  color: var(--color-text-4);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
@@ -272,8 +272,8 @@ function toggle() {
   max-width: 100%;
   padding: 1px 8px;
   border-radius: 6px;
-  background: #eef2f7;
-  color: #475569;
+  background: var(--color-surface-sunken);
+  color: var(--color-text-2);
   font-size: 12px;
   line-height: 1.6;
   overflow-wrap: anywhere;
@@ -281,7 +281,7 @@ function toggle() {
 
 .run-timeline__hint {
   margin: 8px 0 0;
-  color: #64748b;
+  color: var(--color-text-3);
   font-size: 12px;
   line-height: 1.6;
 }

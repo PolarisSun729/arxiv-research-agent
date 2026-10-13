@@ -90,37 +90,42 @@ function handlePageChange(page: number) {
 </script>
 
 <template>
-  <div class="search-page">
-    <SearchBar
-      v-model="searchForm"
-      @search="handleSearch"
+  <div class="page search-page">
+    <header class="page-header">
+      <div class="page-header__text">
+        <h1 class="page-title">论文搜索</h1>
+        <p class="page-desc">检索本地 arXiv 镜像库，支持字段前缀与布尔语法；不选日期时默认查近 30 天。</p>
+      </div>
+    </header>
+
+    <SearchBar v-model="searchForm" @search="handleSearch" />
+
+    <ArxivQueryCapabilityBanner
+      v-if="store.arxivSearchCapability"
+      :capability="store.arxivSearchCapability"
+      class="capability-banner"
     />
 
-    <div class="search-results">
-      <div class="results-header">
-        <span class="results-count">
-          共 {{ store.totalPapers }} 篇论文
-        </span>
+    <section class="results">
+      <div v-if="store.totalPapers > 0 && !store.loading" class="results-header">
+        <span>共 <strong>{{ store.totalPapers }}</strong> 篇论文</span>
       </div>
 
-      <ArxivQueryCapabilityBanner
-        v-if="store.arxivSearchCapability"
-        :capability="store.arxivSearchCapability"
-        class="results-capability-banner"
-      />
-
-      <div v-if="store.loading" class="loading">
-        <div class="el-loading-spinner"></div>
-        <p>加载中...</p>
+      <div v-if="store.loading" class="paper-list">
+        <div v-for="n in 3" :key="n" class="surface skeleton-card">
+          <el-skeleton :rows="3" animated />
+        </div>
       </div>
 
-      <div v-else-if="hasCapabilityError" class="search-state-panel">
-        <div class="search-state-panel__title">本次查询未执行</div>
-        <p>{{ store.arxivSearchError || '请按本地 OAI 镜像库支持的字段与布尔语法调整后重试。' }}</p>
+      <div v-else-if="hasCapabilityError" class="notice notice--danger">
+        <div>
+          <div class="notice__title">本次查询未执行</div>
+          <p>{{ store.arxivSearchError || '请按本地 OAI 镜像库支持的字段与布尔语法调整后重试。' }}</p>
+        </div>
       </div>
 
-      <div v-else-if="store.papers.length === 0" class="empty-results">
-        <el-empty description="未找到符合条件的论文" />
+      <div v-else-if="store.papers.length === 0" class="surface empty">
+        <el-empty description="输入关键词开始搜索，或调整筛选条件" :image-size="96" />
       </div>
 
       <div v-else class="paper-list">
@@ -133,92 +138,64 @@ function handlePageChange(page: number) {
         />
       </div>
 
-      <div v-if="store.totalPapers > 0" class="pagination-wrapper">
+      <div v-if="store.totalPapers > pageSize" class="pagination">
         <el-pagination
           :current-page="currentPage"
           :page-size="pageSize"
           :total="store.totalPapers"
+          background
+          layout="prev, pager, next, jumper"
           @current-change="handlePageChange"
-          layout="total, prev, pager, next, jumper"
         />
       </div>
-    </div>
+    </section>
   </div>
 </template>
 
 <style scoped>
 .search-page {
-  padding: 20px;
+  max-width: 1080px;
 }
 
-.search-results {
+.capability-banner {
+  margin-top: 16px;
+}
+
+.results {
   margin-top: 20px;
 }
 
 .results-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 16px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: var(--color-text-3);
 }
 
-.results-count {
-  font-size: 14px;
-  color: #6b7280;
-}
-
-.results-capability-banner {
-  margin-bottom: 16px;
-}
-
-.loading {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  padding: 40px;
-}
-
-.search-state-panel {
-  padding: 18px 20px;
-  border-radius: 18px;
-  border: 1px solid rgba(220, 38, 38, 0.12);
-  background:
-    radial-gradient(circle at top left, rgba(239, 68, 68, 0.1), transparent 32%),
-    linear-gradient(135deg, #fff7f7 0%, #ffffff 70%);
-  color: #475569;
-}
-
-.search-state-panel__title {
-  margin-bottom: 8px;
-  color: #991b1b;
-  font-size: 15px;
-  font-weight: 700;
-}
-
-.search-state-panel p {
-  margin: 0;
-  line-height: 1.7;
-}
-
-.empty-results {
-  padding: 40px;
+.results-header strong {
+  color: var(--color-text);
 }
 
 .paper-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
-  gap: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
-.pagination-wrapper {
+.skeleton-card {
+  padding: 20px;
+}
+
+.empty {
+  padding: 24px;
+}
+
+.notice p {
+  margin-top: 4px;
+}
+
+.pagination {
   display: flex;
   justify-content: center;
   margin-top: 24px;
-}
-
-@media (max-width: 900px) {
-  .paper-list {
-    grid-template-columns: 1fr;
-  }
 }
 </style>

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
+import { Compass, Delete } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 import { dislikePaper, likePaper, removePaperPreference } from '@/api/papers'
 import { useAgentSearchChat } from '@/composables/useAgentSearchChat'
@@ -219,43 +220,35 @@ watch(latestResponse, () => {
 </script>
 
 <template>
-  <div class="agent-search-page">
-    <section class="hero-card">
-      <div class="hero-copy">
-        <p class="eyebrow">Agent Search</p>
-        <h1 class="title">自然语言 arXiv 搜索入口</h1>
-        <p class="subtitle">
-          直接说出你的检索需求，Agent 会返回回答、必要提示和可查看的论文结果。
-        </p>
+  <div class="page agent-page">
+    <header class="page-header">
+      <div class="page-header__text">
+        <h1 class="page-title">Agent 搜索</h1>
+        <p class="page-desc">用自然语言描述你想找的论文，Agent 会规划检索、整理结果并给出可查看的论文列表。</p>
       </div>
+      <div class="page-actions">
+        <el-button :icon="Delete" :disabled="loading || messages.length === 0" @click="handleClear">清空对话</el-button>
+      </div>
+    </header>
 
-      <div class="hero-actions">
-        <el-button text :disabled="loading || messages.length === 0" @click="handleClear">
-          清空对话
-        </el-button>
+    <section v-if="store.researchProfile" class="notice notice--info profile-hint">
+      <el-icon class="profile-hint__icon"><Compass /></el-icon>
+      <div class="profile-hint__copy">
+        <template v-if="profileTopicPreview.length">
+          Agent 会参考你的研究画像，当前重点：<strong>{{ profileTopicPreview.join('、') }}</strong>
+        </template>
+        <template v-else>
+          补充研究方向、偏好分类和回答风格，可以帮助 Agent 更好地理解模糊请求。
+        </template>
       </div>
+      <el-button link type="primary" @click="handleGoProfile">编辑画像</el-button>
     </section>
 
-    <section v-if="store.researchProfile" class="profile-banner">
-      <div class="profile-banner__copy">
-        <div class="profile-banner__title">Agent 会轻量参考你的长期研究画像</div>
-        <div class="profile-banner__desc">
-          <template v-if="profileTopicPreview.length">
-            当前重点：{{ profileTopicPreview.join('、') }}
-          </template>
-          <template v-else>
-            你可以补充研究方向、偏好分类和回答风格，帮助 Agent 更好理解模糊请求。
-          </template>
-        </div>
-      </div>
-      <el-button size="small" @click="handleGoProfile">编辑画像</el-button>
-    </section>
-
-    <section v-if="workContinuations.length" class="agent-work-list" aria-label="后台 Agent 工作">
-      <div class="agent-work-list__header">
+    <section v-if="workContinuations.length" class="work-list" aria-label="后台 Agent 工作">
+      <div class="section-head">
         <div>
-          <h2>后台任务</h2>
-          <p>关闭或刷新页面不会丢失任务；只有唯一的当前会话任务会自动恢复。</p>
+          <h2 class="section-title">后台任务</h2>
+          <p class="section-desc">关闭或刷新页面不会丢失任务；只有唯一的当前会话任务会自动恢复。</p>
         </div>
       </div>
       <AgentWorkCard
@@ -270,17 +263,18 @@ watch(latestResponse, () => {
       />
     </section>
 
-    <section class="conversation-shell">
+    <section class="surface conversation">
       <RagChatPanel
         v-model:sender-text="inputMessage"
         :messages="messages"
         :loading="loading"
         :quick-prompts="quickPrompts"
-        title="Agent 对话"
+        title="想找什么样的论文？"
         description="回答过程中会实时展示 Agent 的执行步骤，完成后可展开回看。"
-        prompt-title="搜索示例"
+        prompt-title="试试这些问题"
         assistant-label="Agent"
-        sender-placeholder="请输入自然语言搜索需求，Enter 发送，Shift+Enter 换行"
+        sender-placeholder="描述你的检索需求，Enter 发送，Shift+Enter 换行"
+        sender-tip="Agent 会先理解需求，再规划检索并整理结果"
         @submit-question="submitMessage"
         @select-prompt="handlePromptSelect"
         @select-source="handleAgentSourceSelect"
@@ -319,109 +313,36 @@ watch(latestResponse, () => {
 </template>
 
 <style scoped>
-.agent-search-page {
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
+.agent-page {
+  max-width: 1080px;
 }
 
-.hero-card {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 22px 24px;
-  border-radius: 22px;
-  background:
-    radial-gradient(circle at top right, rgba(56, 189, 248, 0.18), transparent 30%),
-    linear-gradient(135deg, rgba(15, 23, 42, 0.98), rgba(30, 41, 59, 0.94));
-  color: #fff;
-  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.18);
+.profile-hint {
+  align-items: center;
+  margin-bottom: 16px;
 }
 
-.hero-copy {
+.profile-hint__icon {
+  flex-shrink: 0;
+  font-size: 16px;
+}
+
+.profile-hint__copy {
+  flex: 1;
   min-width: 0;
 }
 
-.eyebrow {
-  margin: 0 0 8px;
-  color: #7dd3fc;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-}
-
-.title {
-  margin: 0;
-  font-size: 30px;
-  line-height: 1.15;
-}
-
-.subtitle {
-  margin: 10px 0 0;
-  max-width: 800px;
-  color: rgba(226, 232, 240, 0.88);
-}
-
-.hero-actions {
-  flex: none;
-}
-
-.conversation-shell {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-.agent-work-list {
+.work-list {
   display: grid;
-  gap: 12px;
+  gap: 10px;
+  margin-bottom: 16px;
 }
 
-.agent-work-list__header h2,
-.agent-work-list__header p {
-  margin: 0;
+.work-list .section-head {
+  margin-bottom: 0;
 }
 
-.agent-work-list__header h2 {
-  color: #0f172a;
-  font-size: 18px;
-}
-
-.agent-work-list__header p {
-  margin-top: 4px;
-  color: #64748b;
-  font-size: 13px;
-}
-
-.profile-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 14px 18px;
-  border-radius: 18px;
-  border: 1px solid rgba(125, 211, 252, 0.26);
-  background: linear-gradient(135deg, rgba(240, 249, 255, 0.96), rgba(248, 250, 252, 0.98));
-}
-
-.profile-banner__title {
-  font-size: 15px;
-  font-weight: 700;
-  color: #0f172a;
-}
-
-.profile-banner__desc {
-  margin-top: 4px;
-  color: #475569;
-  line-height: 1.6;
-}
-
-@media (max-width: 1024px) {
-  .hero-card {
-    flex-direction: column;
-    align-items: stretch;
-  }
+.conversation {
+  padding: 18px 20px;
 }
 </style>

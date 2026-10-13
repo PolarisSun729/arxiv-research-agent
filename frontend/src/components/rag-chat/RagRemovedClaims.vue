@@ -34,12 +34,12 @@ const totalCount = computed(() => view.value.items.length + view.value.omittedCo
 </template>
 
 <style scoped>
-.rag-removed-claims { margin-top: 8px; padding: 10px 12px; border: 1px solid rgba(251, 191, 36, .35); border-radius: 12px; background: rgba(255, 251, 235, .7); color: #78350f; font-size: 13px; }
+.rag-removed-claims { margin-top: 8px; padding: 10px 12px; border: 1px solid var(--color-warning-border); border-radius: var(--radius); background: var(--color-warning-soft); color: var(--color-warning); font-size: 13px; }
 .rag-removed-claims__summary { cursor: pointer; font-weight: 700; }
 .rag-removed-claims__list { margin: 10px 0 0; padding-left: 20px; display: flex; flex-direction: column; gap: 10px; }
-.rag-removed-claims__text { color: #1e293b; line-height: 1.7; white-space: pre-wrap; }
-.rag-removed-claims__reason { margin-top: 2px; color: #b45309; font-weight: 600; }
+.rag-removed-claims__text { color: var(--color-text); line-height: 1.7; white-space: pre-wrap; }
+.rag-removed-claims__reason { margin-top: 2px; color: var(--color-warning); font-weight: 600; }
 .rag-removed-claims__meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
-.rag-removed-claims__meta span { padding: 1px 8px; border-radius: 999px; background: rgba(148, 163, 184, .16); color: #475569; font-size: 12px; }
-.rag-removed-claims__note { margin: 8px 0 0; color: #92400e; font-size: 12px; }
+.rag-removed-claims__meta span { padding: 1px 8px; border-radius: 999px; background: rgba(17, 24, 39, .06); color: var(--color-text-2); font-size: 12px; }
+.rag-removed-claims__note { margin: 8px 0 0; color: var(--color-warning); font-size: 12px; }
 </style>

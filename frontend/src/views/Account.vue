@@ -2,6 +2,7 @@
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { Refresh } from '@element-plus/icons-vue'
 import { changePassword, currentUser, QUOTA_LABELS, refreshCurrentUser, ROLE_LABELS } from '@/api/auth'
 import { getErrorMessage } from '@/api/errors'
 
@@ -33,34 +34,155 @@ async function savePassword() {
 </script>
 
 <template>
-  <div class="account-page" v-if="currentUser">
-    <el-card>
-      <template #header><strong>账号与配额</strong><el-button text @click="refresh">刷新</el-button></template>
-      <p>{{ currentUser.username }} · {{ ROLE_LABELS[currentUser.role] }}</p>
-      <p>{{ currentUser.email }}</p>
-      <el-table :data="currentUser.quotas">
-        <el-table-column label="项目"><template #default="{ row }">{{ QUOTA_LABELS[row.quota_type as keyof typeof QUOTA_LABELS] }}</template></el-table-column>
-        <el-table-column prop="used_today" label="今日已用" />
-        <el-table-column label="每日限额"><template #default="{ row }">{{ row.daily_limit === -1 ? '不限' : row.daily_limit }}</template></el-table-column>
-        <el-table-column label="剩余"><template #default="{ row }">{{ row.remaining === -1 ? '不限' : row.remaining }}</template></el-table-column>
-      </el-table>
-      <p class="help">配额每天 UTC 00:00 重置。论文搜索、详情、推荐和索引等按请求计数；Agent 内部调用也计入对应的论文与问答额度。</p>
-    </el-card>
-    <el-card>
-      <template #header><strong>修改密码</strong></template>
+  <div v-if="currentUser" class="page account-page">
+    <header class="page-header">
+      <div class="page-header__text">
+        <h1 class="page-title">账号设置</h1>
+        <p class="page-desc">查看账号信息和每日配额，修改登录密码。</p>
+      </div>
+      <div class="page-actions">
+        <el-button :icon="Refresh" @click="refresh">刷新</el-button>
+      </div>
+    </header>
+
+    <section class="surface profile-card">
+      <span class="avatar">{{ currentUser.username.slice(0, 1).toUpperCase() }}</span>
+      <div class="profile-meta">
+        <div class="profile-name">
+          {{ currentUser.username }}
+          <span class="chip chip--primary">{{ ROLE_LABELS[currentUser.role] }}</span>
+        </div>
+        <div class="muted">{{ currentUser.email }}</div>
+      </div>
+    </section>
+
+    <section class="surface section-card">
+      <div class="section-head">
+        <div>
+          <h2 class="section-title">今日配额</h2>
+          <p class="section-desc">配额每天 UTC 00:00 重置。论文搜索、详情、推荐和索引等按请求计数；Agent 内部调用也计入对应额度。</p>
+        </div>
+      </div>
+      <div class="quota-grid">
+        <div v-for="quota in currentUser.quotas" :key="quota.quota_type" class="surface-muted quota-item">
+          <div class="quota-label">{{ QUOTA_LABELS[quota.quota_type as keyof typeof QUOTA_LABELS] }}</div>
+          <div class="quota-value">
+            {{ quota.used_today }}
+            <span class="quota-limit">/ {{ quota.daily_limit === -1 ? '不限' : quota.daily_limit }}</span>
+          </div>
+          <el-progress
+            v-if="quota.daily_limit > 0"
+            :percentage="Math.min(100, Math.round((quota.used_today / quota.daily_limit) * 100))"
+            :show-text="false"
+            :stroke-width="6"
+            :status="quota.remaining === 0 ? 'exception' : undefined"
+          />
+          <div class="quota-remaining muted">剩余 {{ quota.remaining === -1 ? '不限' : quota.remaining }}</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="surface section-card">
+      <div class="section-head">
+        <div>
+          <h2 class="section-title">修改密码</h2>
+          <p class="section-desc">修改后所有旧登录会话都会失效。</p>
+        </div>
+      </div>
       <form class="password-form" @submit.prevent="savePassword">
-        <el-input v-model="currentPassword" type="password" placeholder="当前密码" aria-label="当前密码" autocomplete="current-password" :maxlength="72" />
-        <el-input v-model="newPassword" type="password" placeholder="新密码" aria-label="新密码" autocomplete="new-password" :maxlength="72" />
-        <el-input v-model="confirmation" type="password" placeholder="确认新密码" aria-label="确认新密码" autocomplete="new-password" :maxlength="72" />
-        <p class="help">至少 8 个字符，包含大小写字母和数字，最多 72 个 UTF-8 字节。修改后所有旧登录会话失效。</p>
-        <el-button native-type="submit" type="primary" :loading="saving" :disabled="!currentPassword || !newPassword || !confirmation">更新密码</el-button>
+        <el-input v-model="currentPassword" type="password" placeholder="当前密码" aria-label="当前密码" autocomplete="current-password" :maxlength="72" show-password />
+        <el-input v-model="newPassword" type="password" placeholder="新密码" aria-label="新密码" autocomplete="new-password" :maxlength="72" show-password />
+        <el-input v-model="confirmation" type="password" placeholder="确认新密码" aria-label="确认新密码" autocomplete="new-password" :maxlength="72" show-password />
+        <p class="help">至少 8 个字符，包含大小写字母和数字，最多 72 个 UTF-8 字节。</p>
+        <div>
+          <el-button native-type="submit" type="primary" :loading="saving" :disabled="!currentPassword || !newPassword || !confirmation">更新密码</el-button>
+        </div>
       </form>
-    </el-card>
+    </section>
   </div>
 </template>
 
 <style scoped>
-.account-page { display: grid; gap: 20px; max-width: 960px; margin: 0 auto; }
-.password-form { display: grid; gap: 14px; max-width: 440px; }
-.help { color: #64748b; font-size: 13px; line-height: 1.7; }
+.account-page {
+  max-width: 880px;
+}
+
+.profile-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 20px;
+  margin-bottom: 16px;
+}
+
+.avatar {
+  width: 48px;
+  height: 48px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+  font-size: 20px;
+  font-weight: 650;
+}
+
+.profile-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.section-card {
+  padding: 20px;
+  margin-bottom: 16px;
+}
+
+.quota-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px;
+}
+
+.quota-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+}
+
+.quota-label {
+  font-size: 13px;
+  color: var(--color-text-3);
+}
+
+.quota-value {
+  font-size: 22px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.quota-limit {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-text-3);
+}
+
+.quota-remaining {
+  font-size: 12px;
+}
+
+.password-form {
+  display: grid;
+  gap: 12px;
+  max-width: 420px;
+}
+
+.help {
+  color: var(--color-text-3);
+  font-size: 12.5px;
+}
 </style>
