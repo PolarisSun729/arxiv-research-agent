@@ -116,7 +116,8 @@ def test_search_adapter_merges_levels_until_enough_papers() -> None:
         constraint_sources={"categories": "default", "submitted_days_ago": "user"},
     )
 
-    output = adapter._run(search_adapters.SearchArxivInput(search_spec=spec))
+    # 全量跑时其他测试文件会重载 schemas 模块，这里拿到的 ArxivSearchSpec 可能已不是适配器引用的那个类；传 dict 让适配器自己校验。
+    output = adapter._run(search_adapters.SearchArxivInput(search_spec=spec.model_dump()))
 
     assert len(calls) == 3
     # 时间窗是用户约束，每一级都原样保留。

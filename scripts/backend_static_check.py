@@ -290,7 +290,21 @@ def _install_optional_dependency_stubs() -> None:
         pymilvus_module.Collection = object
         pymilvus_module.connections = types.SimpleNamespace()
         pymilvus_module.utility = types.SimpleNamespace()
+        # 业务代码还直接导入 pymilvus.exceptions / pymilvus.client.types，桩必须是带子模块的包。
+        pymilvus_module.__path__ = []
+        exceptions_module = types.ModuleType("pymilvus.exceptions")
+        exceptions_module.MilvusException = type("MilvusException", (Exception,), {})
+        client_module = types.ModuleType("pymilvus.client")
+        client_module.__path__ = []
+        client_types_module = types.ModuleType("pymilvus.client.types")
+        client_types_module.LoadState = types.SimpleNamespace(NotExist="NotExist", NotLoad="NotLoad", Loading="Loading", Loaded="Loaded")
+        pymilvus_module.exceptions = exceptions_module
+        pymilvus_module.client = client_module
+        client_module.types = client_types_module
         sys.modules["pymilvus"] = pymilvus_module
+        sys.modules["pymilvus.exceptions"] = exceptions_module
+        sys.modules["pymilvus.client"] = client_module
+        sys.modules["pymilvus.client.types"] = client_types_module
 
     if "fitz" not in sys.modules:
         fitz_module = types.ModuleType("fitz")
