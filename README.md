@@ -9,7 +9,7 @@ An engineering-oriented research agent for academic paper discovery, evidence-gr
 
 > 本仓库是 Zhiyuan Sun 的公开作品展示项目，重点展示 Agent Runtime、RAG 链路和大模型应用工程能力。项目已建立工程回归测试与 CI，但尚未发布系统性的 Agent/RAG 效果评测结果。
 
-默认使用 JWT 账号登录，已实现角色权限、用户日配额、会话撤销、用户审计，以及本人会话、笔记、偏好和画像的访问隔离；论文与索引仍共享。启动前需配置独立签名密钥并创建初始管理员，公网继续使用 HTTPS、实际前端 Origin 和持久化 Redis。完整步骤与边界见 [安全与访问控制](docs/operations/security.md)。签名密钥不发给浏览器，也不能写入任何 `VITE_` 变量；仅显式 `AUTH_MODE=api_key` 时启用受信任团队的共享密钥兼容模式。
+默认使用 JWT 账号登录，已实现角色权限、用户日配额、会话撤销、用户审计，以及本人会话、偏好和画像的访问隔离；论文与索引仍共享。启动前需配置独立签名密钥并创建初始管理员，公网继续使用 HTTPS、实际前端 Origin 和持久化 Redis。完整步骤与边界见 [安全与访问控制](docs/operations/security.md)。签名密钥不发给浏览器，也不能写入任何 `VITE_` 变量；仅显式 `AUTH_MODE=api_key` 时启用受信任团队的共享密钥兼容模式。
 
 新环境使用 [安全初始化脚本](scripts/init_security.py) 生成独立凭据：`--profile development` 写开发 `.env`，`--profile production` 写 `.env.production`。生产模板采用 `arxiv.001769.xyz`，域名解析、HTTPS 证书和存储启动步骤见 [CI/CD 部署手册](docs/operations/cicd-deployment.md)。已有配置不会被覆盖。
 

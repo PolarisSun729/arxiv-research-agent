@@ -22,7 +22,6 @@
 - 聊天会话：GET/POST /chat-sessions、GET /chat-sessions/recent、
   GET/DELETE /chat-sessions/{session_id}、GET /chat-sessions/{session_id}/messages、
   POST /chat-sessions/{session_id}/clear；
-- 笔记：GET/POST /notes、PATCH/DELETE /notes/{note_id}、GET /notes/export；
 - 问答：POST /qa（非流式）、POST /qa/stream（SSE 流式）；
 - 证据资源：GET /evidence-assets/{source_id}。
 """
@@ -31,7 +30,6 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional
 from urllib.parse import quote
@@ -43,10 +41,8 @@ from pydantic import BaseModel
 from dependencies import (
     get_enhanced_retrieval_service,
     get_index_job_manager,
-    get_paper_catalog_store,
     get_paper_chat_message_store,
     get_paper_chat_session_store,
-    get_paper_note_store,
     get_paper_qa_index_store,
     get_paper_qa_service,
     get_vector_store_service,
@@ -57,7 +53,7 @@ from routers.qa_utils import build_qa_diagnostic, get_latest_retrieval_trace, sa
 from services.paper_qa.qa_observation import build_error_qa_observation
 from utils.config import get_default_user_id, get_qa_index_job_runtime_config
 from utils.secret_redaction import redact_text
-from auth.ownership import prepare_paper_qa, validate_note_source
+from auth.ownership import prepare_paper_qa
 
 logger = logging.getLogger(__name__)
 
@@ -93,34 +89,6 @@ class CreatePaperChatSessionRequest(BaseModel):
     """创建论文聊天会话的请求体。"""
     user_id: Optional[str] = None
     title: Optional[str] = None
-
-
-class PaperNoteRequest(BaseModel):
-    """创建论文笔记的请求体。"""
-    user_id: Optional[str] = None
-    session_id: Optional[str] = None
-    source_message_id: Optional[str] = None
-    source_turn_id: Optional[str] = None
-    title: Optional[str] = None
-    content: str
-    note_type: Optional[str] = None
-    source_chunk_ids: Optional[List[str]] = None
-    tags: Optional[List[str]] = None
-    include_in_profile: Optional[bool] = False
-
-
-class UpdatePaperNoteRequest(BaseModel):
-    """更新论文笔记的请求体。
-
-    与创建不同，这里大部分字段都允许为空，表示按需局部更新。
-    """
-    user_id: Optional[str] = None
-    title: Optional[str] = None
-    content: Optional[str] = None
-    note_type: Optional[str] = None
-    source_chunk_ids: Optional[List[str]] = None
-    tags: Optional[List[str]] = None
-    include_in_profile: Optional[bool] = None
 
 
 def _normalize_user_id(value: Optional[str]) -> str:
@@ -215,71 +183,6 @@ def _recover_stale_qa_index_jobs(paper_qa_index_store: Any, *, arxiv_id: str, jo
     paper_qa_index_store.mark_stale_paper_index_jobs(
         arxiv_id=arxiv_id, job_id=job_id, timeout_seconds=_qa_index_job_timeout_seconds()
     )
-
-
-def _serialize_paper_note(note: Optional[dict], paper_chat_message_store=None) -> Optional[dict]:
-    """序列化论文笔记，并按需补齐其关联的对话来源信息。"""
-    if not note:
-        return None
-    linked_message = None
-    if paper_chat_message_store and note.get("source_message_id"):
-        # 如果笔记来源于某条 assistant 回复，这里顺手把原消息取出来，
-        # 用于补齐 turn_id 和 sources，方便前端回溯笔记出处。
-        linked_message = paper_chat_message_store.get_paper_chat_message(
-            note.get("source_message_id"),
-            user_id=note.get("user_id") or _normalize_user_id(None),
-        )
-    return {
-        "note_id": note.get("note_id"),
-        "user_id": note.get("user_id"),
-        "arxiv_id": note.get("arxiv_id"),
-        "session_id": note.get("session_id"),
-        "source_message_id": note.get("source_message_id"),
-        "source_turn_id": linked_message.get("turn_id") if linked_message else None,
-        "title": note.get("title", ""),
-        "content": note.get("content", ""),
-        "note_type": note.get("note_type", "custom"),
-        "source_chunk_ids": note.get("source_chunk_ids") or [],
-        "tags": note.get("tags") or [],
-        "include_in_profile": bool(note.get("include_in_profile", False)),
-        "created_at": note.get("created_at"),
-        "updated_at": note.get("updated_at"),
-        "sources": linked_message.get("sources") if linked_message else [],
-    }
-
-
-def _build_notes_markdown(arxiv_id: str, notes: List[dict], paper_title: Optional[str] = None) -> str:
-    """把笔记列表导出为 Markdown 文本。
-
-    导出结果面向用户阅读，因此内容会按“标题 -> 元信息 -> 正文 -> 关联来源”的顺序组织。
-    """
-    lines = [f"# {paper_title or arxiv_id} 阅读笔记", "", f"- arXiv ID: {arxiv_id}", f"- 导出时间: {datetime.now().isoformat()}", ""]
-    for index, note in enumerate(notes, start=1):
-        lines.append(f"## {index}. {note.get('title') or '未命名笔记'}")
-        lines.append("")
-        lines.append(f"- 类型: {note.get('note_type') or 'custom'}")
-        lines.append(f"- 创建时间: {note.get('created_at') or '-'}")
-        if note.get("tags"):
-            lines.append(f"- 标签: {', '.join(note.get('tags') or [])}")
-        if note.get("source_chunk_ids"):
-            lines.append(f"- Source Chunk IDs: {', '.join(note.get('source_chunk_ids') or [])}")
-        lines.append("")
-        lines.append(note.get("content") or "")
-        lines.append("")
-        sources = note.get("sources") or []
-        if sources:
-            lines.append("### 关联 Sources")
-            lines.append("")
-            for source in sources:
-                # 这里保留页码、章节路径、父 chunk id，便于把笔记和原文片段重新对应起来。
-                lines.append(
-                    f"- page={source.get('page_number') or '-'} | section={source.get('section_path') or '-'} | chunk={source.get('parent_chunk_id') or '-'}"
-                )
-                preview = str(source.get("content") or "").strip()
-                if preview:
-                    lines.append(f"  - {preview}")
-            lines.append("")
-    return "\n".join(lines).strip() + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -643,170 +546,6 @@ async def delete_paper_chat_session(
         raise
     except Exception as exc:
         logger.error("Error deleting paper chat session: %s", str(exc))
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-# ---------------------------------------------------------------------------
-# 论文笔记
-# ---------------------------------------------------------------------------
-
-
-@router.get("/notes")
-async def list_paper_notes(
-    arxiv_id: str,
-    user_id: Optional[str] = Query(None),
-    note_type: Optional[str] = Query(None),
-    paper_note_store=Depends(get_paper_note_store),
-    paper_chat_message_store=Depends(get_paper_chat_message_store),
-):
-    """列出某篇论文下的笔记，可按 note_type 过滤。"""
-    try:
-        notes = paper_note_store.list_paper_notes(
-            arxiv_id=arxiv_id,
-            user_id=_normalize_user_id(user_id),
-            note_type=note_type,
-        )
-        return {"items": [_serialize_paper_note(item, paper_chat_message_store=paper_chat_message_store) for item in notes]}
-    except Exception as exc:
-        logger.error("Error listing paper notes: %s", str(exc))
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@router.post("/notes")
-async def create_paper_note(
-    arxiv_id: str,
-    payload: PaperNoteRequest,
-    paper_note_store=Depends(get_paper_note_store),
-    paper_chat_message_store=Depends(get_paper_chat_message_store),
-):
-    """创建一条论文笔记。
-
-    笔记可以关联一条 assistant 回复作为出处：直接传 source_message_id，或传 session_id + source_turn_id
-    由这里回查对应消息。include_in_profile=True 的笔记会作为研究画像构建的输入之一。
-    """
-    # 在通用业务异常兜底之前检查归属，授权错误必须保持 404，而不是被包装成 500。
-    validated_source_id = validate_note_source(arxiv_id, payload, paper_chat_message_store)
-    try:
-        user_id = _normalize_user_id(payload.user_id)
-        source_message_id = (validated_source_id or "").strip() or None
-        if not source_message_id and payload.session_id and payload.source_turn_id:
-            # 如果前端没有直接传 message_id，但给了 session + turn，
-            # 就回查对应的 assistant 消息，建立笔记与问答来源的关联。
-            linked_message = paper_chat_message_store.get_paper_chat_message_by_turn(
-                payload.session_id,
-                payload.source_turn_id,
-                role="assistant",
-                user_id=user_id,
-            )
-            source_message_id = linked_message.get("message_id") if linked_message else None
-
-        note = paper_note_store.create_paper_note(
-            user_id=user_id,
-            arxiv_id=arxiv_id,
-            session_id=(payload.session_id or "").strip() or None,
-            source_message_id=source_message_id,
-            title=(payload.title or "").strip() or None,
-            content=payload.content,
-            note_type=payload.note_type or "custom",
-            source_chunk_ids=payload.source_chunk_ids or [],
-            tags=payload.tags or [],
-            include_in_profile=bool(payload.include_in_profile),
-        )
-        if not note:
-            raise HTTPException(status_code=500, detail="Failed to create paper note")
-
-        return {"item": _serialize_paper_note(note, paper_chat_message_store=paper_chat_message_store)}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("Error creating paper note: %s", str(exc))
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@router.patch("/notes/{note_id}")
-async def update_paper_note(
-    arxiv_id: str,
-    note_id: str,
-    payload: UpdatePaperNoteRequest,
-    paper_note_store=Depends(get_paper_note_store),
-    paper_chat_message_store=Depends(get_paper_chat_message_store),
-):
-    """局部更新指定笔记：请求体中为 None 的字段保持不变。笔记不存在或不属于该论文时返回 404。"""
-    try:
-        user_id = _normalize_user_id(payload.user_id)
-        current = paper_note_store.get_paper_note(note_id, user_id=user_id)
-        if not current or current.get("arxiv_id") != arxiv_id:
-            raise HTTPException(status_code=404, detail="Paper note not found")
-
-        note = paper_note_store.update_paper_note(
-            note_id,
-            user_id=user_id,
-            title=payload.title,
-            content=payload.content,
-            note_type=payload.note_type,
-            source_chunk_ids=payload.source_chunk_ids,
-            tags=payload.tags,
-            include_in_profile=payload.include_in_profile,
-        )
-        if not note:
-            raise HTTPException(status_code=500, detail="Failed to update paper note")
-
-        return {"item": _serialize_paper_note(note, paper_chat_message_store=paper_chat_message_store)}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("Error updating paper note: %s", str(exc))
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@router.delete("/notes/{note_id}")
-async def delete_paper_note(
-    arxiv_id: str,
-    note_id: str,
-    user_id: Optional[str] = Query(None),
-    paper_note_store=Depends(get_paper_note_store),
-):
-    """删除指定论文笔记；笔记不存在或不属于该论文时返回 404。"""
-    try:
-        normalized_user_id = _normalize_user_id(user_id)
-        current = paper_note_store.get_paper_note(note_id, user_id=normalized_user_id)
-        if not current or current.get("arxiv_id") != arxiv_id:
-            raise HTTPException(status_code=404, detail="Paper note not found")
-        deleted = paper_note_store.delete_paper_note(note_id, user_id=normalized_user_id)
-        return {"status": "success", "deleted": deleted}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("Error deleting paper note: %s", str(exc))
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@router.get("/notes/export")
-async def export_paper_notes_markdown(
-    arxiv_id: str,
-    user_id: Optional[str] = Query(None),
-    paper_note_store=Depends(get_paper_note_store),
-    paper_chat_message_store=Depends(get_paper_chat_message_store),
-    paper_catalog_store=Depends(get_paper_catalog_store),
-):
-    """把某篇论文的全部笔记导出为 Markdown 文件下载。"""
-    try:
-        normalized_user_id = _normalize_user_id(user_id)
-        notes = paper_note_store.list_paper_notes(arxiv_id=arxiv_id, user_id=normalized_user_id)
-        serialized_notes = [_serialize_paper_note(item, paper_chat_message_store=paper_chat_message_store) for item in notes]
-        paper = paper_catalog_store.get_paper(arxiv_id)
-        markdown = _build_notes_markdown(arxiv_id, serialized_notes, paper_title=(paper or {}).get("title"))
-        # 附件绕过 JSON 响应类；拼装完标题、正文和关联来源后统一脱敏，覆盖历史存储中的凭据。
-        markdown = redact_text(markdown)
-        filename = f"{sanitize_trace_slug(arxiv_id)}_notes.md"
-        return StreamingResponse(
-            # 这里直接把内存中的 markdown bytes 作为流返回，避免额外生成临时文件。
-            iter([markdown.encode("utf-8")]),
-            media_type="text/markdown; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
-    except Exception as exc:
-        logger.error("Error exporting paper notes: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
 
 

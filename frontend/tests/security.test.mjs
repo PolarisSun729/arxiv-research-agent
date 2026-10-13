@@ -204,7 +204,7 @@ globalThis.fetch = async (url, options) => {
 await api.streamAgentChat({ message: 'hello' })
 await api.streamAgentWorkContinuationResume('continuation-1', 'session-1')
 await api.qaPaperStream('2401.00001', 'hello')
-await api.fetchApiBlob('/paper/2401.00001/notes/export')
+await api.fetchApiBlob('/paper/2401.00001/qa-trace/latest')
 for (const call of calls.slice(-4)) {
   assert.equal(call.options.headers.get('Authorization'), `Bearer ${jwtFirst}`)
   assert.equal(call.options.headers.has('X-API-Key'), false)
@@ -229,10 +229,10 @@ assert.equal(api.currentUser.value.user_id, 'user-two')
 // 旧账号成功响应也必须丢弃，不能在登录切换后写回共享页面缓存。
 let finishOldSuccess
 globalThis.fetch = () => new Promise(resolve => { finishOldSuccess = resolve })
-const staleSuccess = api.apiFetch('/paper/p1/notes')
+const staleSuccess = api.apiFetch('/paper/p1/chat-sessions')
 globalThis.fetch = loginFetch(jwtFirst)
 await api.loginWithPassword('reader', 'TestPassword123')
-finishOldSuccess(Response.json({ private_data: 'old-user-notes' }))
+finishOldSuccess(Response.json({ private_data: 'old-user-sessions' }))
 await assert.rejects(staleSuccess, error => error.name === 'AbortError')
 globalThis.fetch = loginFetch(jwtNext, { ...user, user_id: 'user-two' })
 await api.loginWithPassword('other', 'TestPassword123')

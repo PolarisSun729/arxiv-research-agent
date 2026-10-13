@@ -88,7 +88,7 @@ async function handleSubmit() {
       <div class="login-card">
         <div class="login-head">
           <h1>{{ mode === 'api_key' ? '访问验证' : registering ? '创建账号' : '登录' }}</h1>
-          <p v-if="mode === 'jwt' && !registering" class="muted">使用个人账号管理阅读笔记、问答历史和研究画像。</p>
+          <p v-if="mode === 'jwt' && !registering" class="muted">使用个人账号管理问答历史和研究画像。</p>
           <p v-else-if="mode === 'jwt'" class="muted">新注册账号为访客，研究者权限由管理员分配。</p>
           <p v-else class="muted">此服务使用团队访问密钥。数据命名空间用于选择团队内的数据，不提供个人账号隔离。</p>
         </div>

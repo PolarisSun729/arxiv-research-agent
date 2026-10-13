@@ -884,39 +884,6 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
         self.assertEqual(recovered_attempt["attempt_count"], 2)
         self.assertEqual(recovered_attempt["status"], "running")
 
-    def test_worker_persists_validated_result_and_attempt_audit(self) -> None:
-        build_result = {
-            "status": "success",
-            "build_id": "build-1",
-            "index_version": "version-1",
-            "collection_name": "qa_collection_1",
-            "chunk_count": 3,
-        }
-        status = {
-            "has_index": True,
-            "status": "indexed",
-            "active_build_id": "build-1",
-            "active_index_version": "version-1",
-            "active_collection_name": "qa_collection_1",
-            "active_chunk_count": 3,
-        }
-        manager = IndexJobManager(
-            paper_qa_index_store=self.storage.paper_qa_index,
-            qa_index_builder=_FakeJobBuilder(result=build_result),
-            qa_status_reader=lambda _arxiv_id: status,
-            worker_id="worker-a",
-        )
-        submitted = manager.submit_job(self.arxiv_id, "docling")
-
-        self.assertTrue(manager.run_next_job())
-
-        stored = self.storage.paper_qa_index.get_paper_index_job(submitted["job_id"])
-        attempts = self.storage.paper_qa_index.list_paper_index_job_attempts(submitted["job_id"])
-        self.assertEqual(stored["status"], "success")
-        self.assertEqual(stored["result"]["build_id"], "build-1")
-        self.assertEqual(attempts[0]["status"], "success")
-        self.assertEqual(attempts[0]["attempt_no"], 1)
-
     def test_builder_result_without_matching_active_index_fails_completion(self) -> None:
         manager = IndexJobManager(
             paper_qa_index_store=self.storage.paper_qa_index,
@@ -1067,7 +1034,7 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
             "build_id": "build-1",
             "index_version": "version-1",
             "collection_name": "qa_collection_1",
-            "chunk_count": 2,
+            "chunk_count": 3,
         }
         builder = _FakeJobBuilder(result=result)
         manager = IndexJobManager(
@@ -1079,7 +1046,7 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
                 "active_build_id": "build-1",
                 "active_index_version": "version-1",
                 "active_collection_name": "qa_collection_1",
-                "active_chunk_count": 2,
+                "active_chunk_count": 3,
             },
         )
         job = self.storage.paper_qa_index.create_paper_index_job(self.arxiv_id, "docling")
@@ -1088,9 +1055,14 @@ class IndexJobManagerFlowTests(_BaseIndexTestCase):
 
         stored = self.storage.paper_qa_index.get_paper_index_job(job["job_id"])
         latest = self.storage.paper_qa_index.get_latest_paper_index_job(self.arxiv_id)
+        attempts = self.storage.paper_qa_index.list_paper_index_job_attempts(job["job_id"])
+        # 成功路径同时验证任务状态、构建结果和 attempt 审计，避免同一执行分支拆成重复测试。
         self.assertEqual(stored["status"], "success")
         self.assertEqual(stored["current_stage"], "activate_index")
         self.assertEqual(stored["progress"], 100)
+        self.assertEqual(stored["result"]["build_id"], "build-1")
+        self.assertEqual(attempts[0]["status"], "success")
+        self.assertEqual(attempts[0]["attempt_no"], 1)
         self.assertEqual(latest["job_id"], job["job_id"])
 
     def test_run_job_failure_updates_failed_status_and_error_message(self) -> None:

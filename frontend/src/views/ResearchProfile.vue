@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Refresh, Star, View, Plus, Check, Close } from '@element-plus/icons-vue'
+import { Refresh, Star, View, Plus, Check, Close, ArrowRight, Loading } from '@element-plus/icons-vue'
 import { usePaperStore } from '@/stores/paperStore'
-import type { UserResearchProfile } from '@/types/paper'
+import type { ProfileSnapshotSummary, ProfileTopicEvidence, ProfileTopicZone, UserResearchProfile } from '@/types/paper'
 import { useUserContext } from '@/composables/useUserContext'
 
 const store = usePaperStore()
@@ -64,10 +64,52 @@ const latestJobFailureSummary = computed(() => {
     ? failures.slice(-3).map(item => `${item.arxiv_id || 'unknown'}：${item.error_type || 'failed'}`).join('；')
     : ''
 })
-const selectedEvidence = computed(() => {
+const selectedEvidence = computed<ProfileTopicEvidence | null>(() => {
   const topic = selectedTopic.value
   return topic ? effectiveProfile.value?.topic_evidence?.[topic] || generatedProfile.value?.topic_evidence?.[topic] || null : null
 })
+// 手动放置的主题本身没有打分，分数取自它附带的自动证据；自动条目直接用自身。
+const selectedScores = computed<ProfileTopicEvidence | null>(() => {
+  const evidence = selectedEvidence.value
+  if (!evidence) return null
+  return evidence.provenance === 'manual' ? evidence.generated_evidence || null : evidence
+})
+
+const ZONE_LABELS: Record<ProfileTopicZone, string> = {
+  focus: '关注',
+  recent: '近期关注',
+  exclude: '排除'
+}
+const MANUAL_ACTION_LABELS: Record<string, string> = {
+  focus: '手动关注',
+  exclude: '手动排除',
+  pinned: '手动固定'
+}
+const REJECTION_REASON_LABELS: Record<string, string> = {
+  net_not_positive: '净分不为正，不能成为关注',
+  mixed_positive_negative_evidence: '正负证据混杂，一致性不足',
+  insufficient_positive_papers: '点赞论文数不足',
+  not_persistent_enough: '正向证据持续时间不够长，暂不升为长期关注',
+  insufficient_negative_papers: '点踩论文数不足',
+  weak_recent_signal: '近期信号较弱',
+  read_only_recent_signal: '近期只有阅读行为',
+  insufficient_recent_papers: '近期只有一篇论文涉及，暂不算近期关注',
+  focus_limit_exceeded: '关注区已满，被更高分主题挤出',
+  exclude_limit_exceeded: '排除区已满，被更高分主题挤出',
+  recent_limit_exceeded: '近期区已满，被更高分主题挤出'
+}
+
+function zoneText(zones: ProfileTopicZone[] | undefined) {
+  return zones?.length ? zones.map(zone => ZONE_LABELS[zone] || zone).join('、') : '未进入任何区'
+}
+
+function reasonText(reason: string) {
+  return REJECTION_REASON_LABELS[reason] || reason
+}
+
+function formatScore(value: number | undefined, digits = 2) {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '-'
+}
 
 function listOf(profile: UserResearchProfile | null | undefined, key: keyof UserResearchProfile): string[] {
   const value = profile?.[key]
@@ -106,8 +148,22 @@ const jobTone = computed(() => {
   return 'primary'
 })
 
+const loadingDetail = ref(false)
+const loadError = ref('')
+
 async function loadDetail() {
-  await store.fetchResearchProfileDetail()
+  loadingDetail.value = true
+  loadError.value = ''
+  try {
+    await store.fetchResearchProfileDetail()
+  } catch {
+    loadError.value = '无法获取研究画像，请确认后端服务已启动后重试'
+    // 已有旧数据时保留页面内容，只提示刷新失败；首次加载失败由模板展示错误态。
+    if (detail.value) ElMessage.error('刷新研究画像失败')
+    return
+  } finally {
+    loadingDetail.value = false
+  }
   syncManualForm()
   // 构建中途离开或刷新页面后重新进入时，接上未结束 job 的轮询，避免进度停在加载时的快照。
   const job = store.latestProfileBuildJob
@@ -175,9 +231,148 @@ function startPolling(jobId: string) {
   }, 2000)
 }
 
-async function activateSnapshot(snapshotId: string) {
-  await store.activateProfileSnapshot(snapshotId)
-  ElMessage.success('已切换 active snapshot')
+type SnapshotZoneKey = 'positive_topics' | 'recent_topics' | 'negative_topics'
+type SnapshotTopicStatus = 'kept' | 'added' | 'moved'
+
+const SNAPSHOT_ZONES: Array<{ key: SnapshotZoneKey; label: string }> = [
+  { key: 'positive_topics', label: '关注主题' },
+  { key: 'recent_topics', label: '近期关注' },
+  { key: 'negative_topics', label: '排除主题' }
+]
+const BUILD_MODE_LABELS: Record<string, string> = {
+  incremental: '增量更新',
+  full: '完整重建',
+  repair: '修复重建'
+}
+
+const snapshots = computed<ProfileSnapshotSummary[]>(() => detail.value?.snapshots || [])
+const expandedSnapshotId = ref('')
+const activatingSnapshotId = ref('')
+
+function snapshotZoneTopics(snapshot: ProfileSnapshotSummary | null | undefined, key: SnapshotZoneKey): string[] {
+  return snapshot?.topics?.[key] || []
+}
+
+// 差异基准取 active 快照自身的主题，和其它快照走同一套归一化，避免和合并后的画像比出假差异。
+const currentZoneTopics = computed<Record<SnapshotZoneKey, string[]>>(() => {
+  const active = snapshots.value.find(item => item.active)
+  return {
+    positive_topics: active ? snapshotZoneTopics(active, 'positive_topics') : listOf(generatedProfile.value, 'positive_topics'),
+    recent_topics: active ? snapshotZoneTopics(active, 'recent_topics') : listOf(generatedProfile.value, 'recent_topics'),
+    negative_topics: active ? snapshotZoneTopics(active, 'negative_topics') : listOf(generatedProfile.value, 'negative_topics')
+  }
+})
+
+// 同一主题可以同时在关注和近期关注区，所以先看同区，同区没有才算从别的区换过来。
+function currentZoneOf(topic: string, preferred: SnapshotZoneKey): SnapshotZoneKey | null {
+  if (currentZoneTopics.value[preferred].includes(topic)) return preferred
+  return SNAPSHOT_ZONES.find(zone => currentZoneTopics.value[zone.key].includes(topic))?.key || null
+}
+
+function zoneLabel(key: SnapshotZoneKey | null) {
+  return SNAPSHOT_ZONES.find(zone => zone.key === key)?.label || ''
+}
+
+function snapshotDiff(snapshot: ProfileSnapshotSummary) {
+  const zones = SNAPSHOT_ZONES.map(zone => ({
+    ...zone,
+    topics: snapshotZoneTopics(snapshot, zone.key).map(topic => {
+      const currentZone = currentZoneOf(topic, zone.key)
+      const status: SnapshotTopicStatus = currentZone === zone.key ? 'kept' : currentZone ? 'moved' : 'added'
+      return { topic, status, from: zoneLabel(currentZone) }
+    })
+  }))
+  // 换区的主题已在新区标出，不再在原区重复标成移除。
+  const movedTopics = new Set(zones.flatMap(zone => zone.topics.filter(item => item.status === 'moved').map(item => item.topic)))
+  return zones.map(zone => {
+    const snapshotTopics = new Set(zone.topics.map(item => item.topic))
+    const removed = snapshot.active
+      ? []
+      : currentZoneTopics.value[zone.key].filter(topic => !snapshotTopics.has(topic) && !movedTopics.has(topic))
+    return { ...zone, removed }
+  })
+}
+
+function snapshotChangeCount(snapshot: ProfileSnapshotSummary) {
+  return snapshotDiff(snapshot).reduce(
+    (count, zone) => count + zone.topics.filter(item => item.status !== 'kept').length + zone.removed.length,
+    0
+  )
+}
+
+function snapshotTitle(snapshot: ProfileSnapshotSummary) {
+  return snapshot.build_number ? `第 ${snapshot.build_number} 次构建` : '画像版本'
+}
+
+function formatSnapshotTime(value: string | null | undefined) {
+  if (!value) return ''
+  // SQLite CURRENT_TIMESTAMP 是不带时区的 UTC 字符串，补上 Z 再按本地时区展示。
+  const normalized = /[zZ]|[+-]\d{2}:?\d{2}$/.test(value) ? value : `${value.replace(' ', 'T')}Z`
+  const parsed = new Date(normalized)
+  if (Number.isNaN(parsed.getTime())) return value
+  return parsed.toLocaleString('zh-CN', { hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function snapshotModeLabel(snapshot: ProfileSnapshotSummary) {
+  const mode = snapshot.build_config?.build_mode || snapshot.evidence_summary?.build_metrics?.build_mode || ''
+  return BUILD_MODE_LABELS[mode] || ''
+}
+
+function snapshotTopicSummary(snapshot: ProfileSnapshotSummary) {
+  const parts: string[] = []
+  for (const zone of SNAPSHOT_ZONES) {
+    const topics = snapshotZoneTopics(snapshot, zone.key)
+    if (!topics.length) continue
+    const head = topics.slice(0, 3).join('、')
+    parts.push(`${zone.label.replace('主题', '')}：${head}${topics.length > 3 ? ` 等 ${topics.length} 个` : ''}`)
+  }
+  return parts.join(' · ') || '该版本没有生成任何主题'
+}
+
+function snapshotStats(snapshot: ProfileSnapshotSummary) {
+  const parts: string[] = []
+  const score = Number(snapshot.quality_report?.quality_score)
+  if (snapshot.quality_report?.quality_score !== undefined && Number.isFinite(score)) parts.push(`质量分 ${score.toFixed(2)}`)
+  const metrics = snapshot.evidence_summary?.build_metrics || {}
+  const papers = Number(metrics.total_papers || 0)
+  if (papers) parts.push(`基于 ${papers} 篇论文`)
+  const counts = metrics.evidence_counts || {}
+  const events = Number(counts.used_events || counts.profile_events || 0)
+  if (events) parts.push(`${events} 条行为`)
+  if (!snapshot.active) {
+    const changes = snapshotChangeCount(snapshot)
+    parts.push(changes ? `与当前相比 ${changes} 处变化` : '与当前主题一致')
+  }
+  return parts.join(' · ')
+}
+
+function isPendingReview(snapshot: ProfileSnapshotSummary) {
+  return !snapshot.active && snapshot.quality_report?.approved === false
+}
+
+function snapshotIssues(snapshot: ProfileSnapshotSummary): string[] {
+  const issues = snapshot.quality_report?.issues
+  if (!Array.isArray(issues)) return []
+  return issues
+    .filter(issue => issue && typeof issue === 'object' && issue.severity !== 'info' && issue.message)
+    .map(issue => String(issue.message))
+    .slice(0, 4)
+}
+
+function toggleSnapshot(snapshotId: string) {
+  expandedSnapshotId.value = expandedSnapshotId.value === snapshotId ? '' : snapshotId
+}
+
+async function activateSnapshot(snapshot: ProfileSnapshotSummary) {
+  activatingSnapshotId.value = snapshot.snapshot_id
+  try {
+    await store.activateProfileSnapshot(snapshot.snapshot_id)
+    ElMessage.success(`已切换到${snapshotTitle(snapshot)}的画像`)
+  } catch {
+    ElMessage.error('切换画像版本失败')
+  } finally {
+    activatingSnapshotId.value = ''
+  }
 }
 
 onMounted(loadDetail)
@@ -194,7 +389,7 @@ onUnmounted(() => {
         <p class="page-desc">系统根据你的阅读与标记行为自动生成画像，你可以手动修正。推荐、Agent 和论文问答都读取「最终生效画像」。</p>
       </div>
       <div class="page-actions">
-        <el-button :icon="Refresh" @click="loadDetail">刷新</el-button>
+        <el-button :icon="Refresh" :loading="loadingDetail" @click="loadDetail">{{ loadingDetail ? '加载中' : '刷新' }}</el-button>
         <el-button v-if="canResearch" type="primary" :loading="rebuilding" @click="handleRebuild">重新生成画像</el-button>
       </div>
     </header>
@@ -236,6 +431,30 @@ onUnmounted(() => {
       <div v-if="latestJob.error_message" class="notice notice--danger">{{ latestJob.error_message }}</div>
     </section>
 
+    <!-- 首次加载还没有任何数据时用骨架屏占位，避免先闪出一整页「暂无」让人误以为画像是空的。 -->
+    <div v-if="!detail && loadingDetail" class="profile-loading" aria-busy="true">
+      <div class="grid grid--main">
+        <section class="surface panel">
+          <p class="loading-tip"><el-icon class="is-loading"><Loading /></el-icon>正在加载研究画像…</p>
+          <el-skeleton :rows="5" animated />
+        </section>
+        <section class="surface panel"><el-skeleton :rows="5" animated /></section>
+      </div>
+      <div class="grid grid--half">
+        <section class="surface panel"><el-skeleton :rows="6" animated /></section>
+        <section class="surface panel"><el-skeleton :rows="6" animated /></section>
+      </div>
+    </div>
+
+    <section v-else-if="!detail && loadError" class="surface panel load-error">
+      <el-result icon="error" title="研究画像加载失败" :sub-title="loadError">
+        <template #extra>
+          <el-button type="primary" :icon="Refresh" @click="loadDetail">重试</el-button>
+        </template>
+      </el-result>
+    </section>
+
+    <div v-else :class="['profile-content', { 'is-refreshing': loadingDetail }]" :aria-busy="loadingDetail">
     <div class="grid grid--main">
       <section class="surface panel">
         <header class="panel-head">
@@ -295,28 +514,65 @@ onUnmounted(() => {
           <el-icon class="muted"><View /></el-icon>
         </header>
         <template v-if="selectedTopic && selectedEvidence">
-          <div class="evidence-scores">
-            <div class="surface-muted evidence-score">
-              <span>净分</span>
-              <strong>{{ selectedEvidence.net_score ?? '-' }}</strong>
-            </div>
-            <div class="surface-muted evidence-score">
-              <span>置信度</span>
-              <strong>{{ selectedEvidence.confidence ?? '-' }}</strong>
-            </div>
+          <div class="chip-row">
+            <span v-if="selectedEvidence.provenance === 'manual'" class="chip chip--primary">
+              {{ MANUAL_ACTION_LABELS[selectedEvidence.manual_action || ''] || '手动设置' }}
+            </span>
+            <span v-else class="chip">自动生成</span>
+            <span class="chip">所在区：{{ zoneText(selectedEvidence.placement) }}</span>
           </div>
-          <div class="topic-group">
-            <h3>来源论文</h3>
-            <div class="chip-row">
-              <span v-for="paper in selectedEvidence.source_papers || []" :key="paper" class="chip mono">{{ paper }}</span>
-            </div>
+          <div v-if="selectedEvidence.overridden_by_manual" class="notice notice--warning">
+            已被手动设置覆盖，自动证据原本将其放在：{{ zoneText(selectedScores?.placement) }}
           </div>
-          <div class="topic-group">
-            <h3>来源行为</h3>
-            <div class="chip-row">
-              <span v-for="action in selectedEvidence.source_actions || []" :key="action" class="chip">{{ action }}</span>
+          <p v-else-if="selectedEvidence.provenance === 'manual' && !selectedScores" class="muted">该主题由手动设置，暂无自动证据。</p>
+          <template v-if="selectedScores">
+            <div class="evidence-scores">
+              <div class="surface-muted evidence-score">
+                <span>净分</span>
+                <strong>{{ formatScore(selectedScores.net_score) }}</strong>
+              </div>
+              <div class="surface-muted evidence-score">
+                <span>置信度</span>
+                <strong>{{ formatScore(selectedScores.confidence) }}</strong>
+              </div>
+              <div class="surface-muted evidence-score">
+                <span>长期正向 / 负向</span>
+                <strong>{{ formatScore(selectedScores.long_pos) }} / {{ formatScore(selectedScores.long_neg) }}</strong>
+              </div>
+              <div class="surface-muted evidence-score">
+                <span>近期分 / 近期论文</span>
+                <strong>{{ formatScore(selectedScores.recent_pos) }} / {{ selectedScores.recent_papers ?? '-' }}</strong>
+              </div>
+              <div class="surface-muted evidence-score">
+                <span>正负一致性</span>
+                <strong>{{ formatScore(selectedScores.consistency) }}</strong>
+              </div>
+              <div class="surface-muted evidence-score">
+                <span>点赞 / 点踩论文</span>
+                <strong>{{ selectedScores.liked_papers ?? '-' }} / {{ selectedScores.disliked_papers ?? '-' }}</strong>
+              </div>
             </div>
-          </div>
+            <div v-if="selectedScores.rejection_reasons?.length" class="topic-group">
+              <h3>未进入其它区的原因</h3>
+              <ul class="reason-list">
+                <li v-for="reason in selectedScores.rejection_reasons" :key="reason">{{ reasonText(reason) }}</li>
+              </ul>
+            </div>
+            <div class="topic-group">
+              <h3>来源论文</h3>
+              <div class="chip-row">
+                <span v-for="paper in selectedScores.source_papers || []" :key="paper" class="chip mono">{{ paper }}</span>
+                <span v-if="!selectedScores.source_papers?.length" class="empty-text">暂无</span>
+              </div>
+            </div>
+            <div class="topic-group">
+              <h3>来源行为</h3>
+              <div class="chip-row">
+                <span v-for="action in selectedScores.source_actions || []" :key="action" class="chip">{{ action }}</span>
+                <span v-if="!selectedScores.source_actions?.length" class="empty-text">暂无</span>
+              </div>
+            </div>
+          </template>
         </template>
         <el-empty v-else :image-size="72" :description="selectedTopic ? '该主题暂无证据记录' : '点击左侧主题查看证据'" />
       </section>
@@ -371,6 +627,19 @@ onUnmounted(() => {
               <el-input v-model="manualForm.positive_topic" placeholder="例如 retrieval-augmented generation" @keyup.enter="addManualTopic('positive_topics', manualForm.positive_topic)" />
               <el-button :icon="Plus" @click="addManualTopic('positive_topics', manualForm.positive_topic)" />
             </div>
+            <div v-if="listOf(manualProfile, 'positive_topics').length" class="chip-row">
+              <el-tag v-for="topic in listOf(manualProfile, 'positive_topics')" :key="topic" closable @close="removeManualTopic('positive_topics', topic)">{{ topic }}</el-tag>
+            </div>
+          </div>
+          <div class="field">
+            <span class="field-label">添加排除主题 <span class="muted">不再推荐相关论文</span></span>
+            <div class="input-row">
+              <el-input v-model="manualForm.negative_topic" placeholder="例如 diffusion models" @keyup.enter="addManualTopic('negative_topics', manualForm.negative_topic)" />
+              <el-button :icon="Plus" @click="addManualTopic('negative_topics', manualForm.negative_topic)" />
+            </div>
+            <div v-if="listOf(manualProfile, 'negative_topics').length" class="chip-row">
+              <el-tag v-for="topic in listOf(manualProfile, 'negative_topics')" :key="topic" type="warning" closable @close="removeManualTopic('negative_topics', topic)">{{ topic }}</el-tag>
+            </div>
           </div>
           <div class="field">
             <span class="field-label">固定主题 <span class="muted">始终保留</span></span>
@@ -411,21 +680,74 @@ onUnmounted(() => {
       <header class="panel-head">
         <div>
           <h2 class="section-title">构建记录</h2>
-          <p class="section-desc">每次重新生成都会保存快照，可切换到任一历史版本</p>
+          <p class="section-desc">每次重新生成都会保存一个版本。展开可预览该版本的兴趣主题，以及和当前版本相比有哪些变化</p>
         </div>
       </header>
-      <div v-if="detail?.snapshots?.length" class="snapshot-list">
-        <div v-for="snapshot in detail.snapshots" :key="snapshot.snapshot_id" :class="['snapshot-row', { 'is-active': snapshot.active }]">
-          <div class="snapshot-meta">
-            <strong class="mono">{{ snapshot.snapshot_id }}</strong>
-            <span class="muted">{{ snapshot.created_at }}</span>
+      <div v-if="snapshots.length" class="snapshot-list">
+        <div
+          v-for="snapshot in snapshots"
+          :key="snapshot.snapshot_id"
+          :class="['snapshot-item', { 'is-active': snapshot.active, 'is-open': expandedSnapshotId === snapshot.snapshot_id }]"
+        >
+          <button type="button" class="snapshot-row" :aria-expanded="expandedSnapshotId === snapshot.snapshot_id" @click="toggleSnapshot(snapshot.snapshot_id)">
+            <el-icon class="snapshot-arrow"><ArrowRight /></el-icon>
+            <div class="snapshot-meta">
+              <div class="snapshot-title">
+                <strong>{{ snapshotTitle(snapshot) }}</strong>
+                <span class="muted">{{ formatSnapshotTime(snapshot.created_at) }}</span>
+                <span v-if="snapshotModeLabel(snapshot)" class="muted">· {{ snapshotModeLabel(snapshot) }}</span>
+              </div>
+              <span class="snapshot-topics">{{ snapshotTopicSummary(snapshot) }}</span>
+              <span v-if="snapshotStats(snapshot)" class="snapshot-stats">{{ snapshotStats(snapshot) }}</span>
+            </div>
+            <span v-if="snapshot.active" class="chip chip--success">当前使用</span>
+            <span v-else-if="isPendingReview(snapshot)" class="chip chip--warning" title="质量审查未通过，构建后没有自动启用">待复核</span>
+          </button>
+
+          <div v-if="expandedSnapshotId === snapshot.snapshot_id" class="snapshot-preview">
+            <p v-if="!snapshot.active" class="diff-legend">
+              <span class="diff-chip diff-chip--added">+ 新增</span>
+              <span class="diff-chip diff-chip--moved">换区</span>
+              <span class="diff-chip diff-chip--removed">当前有、此版本没有</span>
+              <span class="muted">无标记的主题与当前版本相同</span>
+            </p>
+            <div v-for="zone in snapshotDiff(snapshot)" :key="zone.key" class="topic-group">
+              <h3>{{ zone.label }} <span class="muted">{{ zone.topics.length }}</span></h3>
+              <div class="chip-row">
+                <span
+                  v-for="item in zone.topics"
+                  :key="item.topic"
+                  :class="['diff-chip', `diff-chip--${snapshot.active ? 'kept' : item.status}`]"
+                  :title="item.status === 'moved' && !snapshot.active ? `当前版本在「${item.from}」` : undefined"
+                >
+                  <template v-if="item.status === 'added' && !snapshot.active">+ </template>{{ item.topic }}<small v-if="item.status === 'moved' && !snapshot.active">（原{{ item.from }}）</small>
+                </span>
+                <span v-for="topic in zone.removed" :key="`removed-${topic}`" class="diff-chip diff-chip--removed">{{ topic }}</span>
+                <span v-if="!zone.topics.length && !zone.removed.length" class="empty-text">暂无</span>
+              </div>
+            </div>
+            <div v-if="snapshotIssues(snapshot).length" class="notice notice--warning">
+              <strong>质量审查提示</strong>
+              <ul class="reason-list">
+                <li v-for="issue in snapshotIssues(snapshot)" :key="issue">{{ issue }}</li>
+              </ul>
+            </div>
+            <div class="preview-actions">
+              <span class="muted">{{ snapshot.active ? '这是当前正在使用的版本' : '只替换自动生成部分，你的手动修正会保留' }}</span>
+              <el-button
+                v-if="!snapshot.active"
+                type="primary"
+                size="small"
+                :loading="activatingSnapshotId === snapshot.snapshot_id"
+                @click="activateSnapshot(snapshot)"
+              >{{ isPendingReview(snapshot) ? '确认启用此版本' : '切换到此版本' }}</el-button>
+            </div>
           </div>
-          <span v-if="snapshot.active" class="chip chip--success">当前使用</span>
-          <el-button v-else size="small" @click="activateSnapshot(snapshot.snapshot_id)">切换到此版本</el-button>
         </div>
       </div>
       <p v-else class="empty-text">暂无构建记录</p>
     </section>
+    </div>
   </div>
 </template>
 
@@ -478,6 +800,29 @@ onUnmounted(() => {
   font-size: 12px;
   color: var(--color-text-3);
   font-family: var(--font-mono);
+}
+
+.loading-tip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 13px;
+  color: var(--color-text-3);
+}
+
+.load-error {
+  margin-bottom: 16px;
+}
+
+/* 刷新已有数据时保留内容，只降低透明度并屏蔽点击，避免操作到即将被替换的旧数据。 */
+.profile-content {
+  transition: opacity 0.15s ease;
+}
+
+.profile-content.is-refreshing {
+  opacity: 0.55;
+  pointer-events: none;
 }
 
 .grid {
@@ -581,10 +926,17 @@ onUnmounted(() => {
 }
 
 .evidence-score strong {
-  font-size: 20px;
+  font-size: 18px;
   font-weight: 650;
   color: var(--color-text);
   font-variant-numeric: tabular-nums;
+}
+
+.reason-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  color: var(--color-text-3);
 }
 
 .quality {
@@ -638,32 +990,138 @@ onUnmounted(() => {
   flex-direction: column;
 }
 
-.snapshot-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 0;
+.snapshot-item {
   border-top: 1px solid var(--color-border);
 }
 
-.snapshot-row:first-child {
+.snapshot-item:first-child {
   border-top: none;
 }
 
+.snapshot-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 12px 0;
+  border: none;
+  background: none;
+  font: inherit;
+  text-align: left;
+  color: inherit;
+  cursor: pointer;
+}
+
+.snapshot-row:hover .snapshot-title strong {
+  color: var(--color-primary);
+}
+
+.snapshot-arrow {
+  flex: none;
+  color: var(--color-text-4);
+  transition: transform 0.15s ease;
+}
+
+.snapshot-item.is-open .snapshot-arrow {
+  transform: rotate(90deg);
+}
+
 .snapshot-meta {
+  flex: 1;
   display: flex;
   flex-direction: column;
+  gap: 3px;
   min-width: 0;
   font-size: 12.5px;
 }
 
-.snapshot-meta strong {
-  font-weight: 550;
+.snapshot-title {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+
+.snapshot-title strong {
+  font-size: 13.5px;
+  font-weight: 600;
   color: var(--color-text);
+}
+
+.snapshot-topics {
+  color: var(--color-text-2);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.snapshot-stats {
+  color: var(--color-text-4);
+}
+
+.snapshot-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin: 0 0 14px 26px;
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  background: var(--color-surface-sunken);
+}
+
+.diff-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 12px;
+}
+
+.diff-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface);
+  color: var(--color-text-2);
+  font-size: 12.5px;
+}
+
+.diff-chip small {
+  margin-left: 2px;
+  font-size: 11px;
+  opacity: 0.8;
+}
+
+.diff-chip--added {
+  border-color: transparent;
+  background: var(--color-success-soft);
+  color: var(--color-success);
+}
+
+.diff-chip--moved {
+  border-color: transparent;
+  background: var(--color-primary-soft);
+  color: var(--color-primary);
+}
+
+.diff-chip--removed {
+  border-style: dashed;
+  background: transparent;
+  color: var(--color-text-4);
+  text-decoration: line-through;
+}
+
+.preview-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12.5px;
 }
 
 @media (max-width: 1100px) {

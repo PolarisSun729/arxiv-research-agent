@@ -53,6 +53,8 @@ _register(ALL_ROLES, None, [
     ("GET", "/api/auth/check"), ("GET", "/api/auth/me"), ("POST", "/api/auth/logout"), ("POST", "/api/auth/password"),
     # 公共元数据与统计
     ("GET", "/api/arxiv/fields"), ("GET", "/api/arxiv/categories"), ("GET", "/api/stats"),
+    # 搜索结果偏少时前端自动请求的放宽建议：本地只做 COUNT、远程后端不发请求，不应重复扣检索配额。
+    ("POST", "/api/arxiv/search/suggestions"),
     # 个人偏好、阅读记录与研究画像
     ("GET", "/api/user/preferences/{user_id}"), ("GET", "/api/user/paper-actions/{user_id}"),
     ("GET", "/api/user/research-profile/{user_id}"), ("GET", "/api/user/research-profile/{user_id}/detail"),
@@ -62,7 +64,7 @@ _register(ALL_ROLES, None, [
     ("DELETE", "/api/user/dislike-paper"), ("DELETE", "/api/user/paper-action"),
     ("PUT", "/api/user/research-profile"), ("PATCH", "/api/user/research-profile"),
     ("POST", "/api/user/research-profile/snapshots/activate"),
-    # 论文问答的状态查询、对话会话与笔记（问答本身在下方单独计费）
+    # 论文问答的状态查询与对话会话（问答本身在下方单独计费）
     ("GET", "/api/paper/{arxiv_id}/qa-status"), ("GET", "/api/paper/{arxiv_id}/qa-index-jobs/latest"),
     ("GET", "/api/paper/{arxiv_id}/qa-index-jobs/{job_id}"), ("GET", "/api/paper/{arxiv_id}/evidence-assets/{source_id}"),
     ("GET", "/api/paper/{arxiv_id}/chat-sessions"), ("GET", "/api/paper/{arxiv_id}/chat-sessions/recent"),
@@ -70,9 +72,6 @@ _register(ALL_ROLES, None, [
     ("GET", "/api/paper/{arxiv_id}/chat-sessions/{session_id}/messages"),
     ("POST", "/api/paper/{arxiv_id}/chat-sessions/{session_id}/clear"),
     ("DELETE", "/api/paper/{arxiv_id}/chat-sessions/{session_id}"),
-    ("GET", "/api/paper/{arxiv_id}/notes"), ("POST", "/api/paper/{arxiv_id}/notes"),
-    ("PATCH", "/api/paper/{arxiv_id}/notes/{note_id}"), ("DELETE", "/api/paper/{arxiv_id}/notes/{note_id}"),
-    ("GET", "/api/paper/{arxiv_id}/notes/export"),
     # 本地目录读取不产生外部成本；论文详情只在回源 arXiv 时由路由内部扣减 papers 配额。
     ("GET", "/api/papers"), ("GET", "/api/papers/category/{category}"), ("GET", "/api/paper/{arxiv_id}"),
     ("GET", "/api/user/labeled-papers/{user_id}"),
@@ -120,7 +119,7 @@ def _set_rate_category(category: str, routes) -> None:
 
 # ---- 速率类别的例外 ----
 # 检索虽然计 papers 配额，语义上是查询，与其他读取共用 read 预算。
-_set_rate_category("read", [("POST", "/api/arxiv/search")])
+_set_rate_category("read", [("POST", "/api/arxiv/search"), ("POST", "/api/arxiv/search/suggestions")])
 # 详情在本地缺失时会回源 arXiv、物化论文并生成 embedding（配额在路由内部按需扣减），
 # 不能因为是 GET 就降级为 read 预算。
 _set_rate_category("expensive", [("GET", "/api/paper/{arxiv_id}")])

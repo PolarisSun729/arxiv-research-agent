@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -180,70 +179,47 @@ class ConceptNormalizer:
     def __init__(self, generation_service: Optional[Any] = None, *, enable_llm_naming: bool = False):
         self.generation_service = generation_service
         self.enable_llm_naming = enable_llm_naming
-        self._cache: Dict[str, Dict[str, Any]] = {}
 
-    def normalize(
-        self,
-        *,
-        positive_candidates: Iterable[Dict[str, Any]],
-        negative_candidates: Iterable[Dict[str, Any]],
-        recent_candidates: Iterable[Dict[str, Any]],
-        hidden_topics: Optional[Iterable[str]] = None,
-        pinned_topics: Optional[Iterable[str]] = None,
-        positive_limit: int = 12,
-        negative_limit: int = 10,
-        recent_limit: int = 10,
-    ) -> Dict[str, Any]:
-        hidden_labels = {self._topic_key(item) for item in (hidden_topics or []) if self.clean_label(item)}
-        pinned_candidates = [
-            self._manual_candidate(topic, signal="positive", pinned=True)
-            for topic in (pinned_topics or [])
-            if self.clean_label(topic)
-        ]
-        buckets = {
-            "positive": [*self._normalize_candidates(positive_candidates, "positive"), *pinned_candidates],
-            "negative": self._normalize_candidates(negative_candidates, "negative"),
-            "recent": self._normalize_candidates(recent_candidates, "recent"),
-        }
-        signature = self._build_signature(buckets, hidden_labels)
-        if signature in self._cache:
-            return json.loads(json.dumps(self._cache[signature], ensure_ascii=False))
+    def cluster_signals(self, signals: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把正向、负向、近期信号放在同一次聚类里归并成 canonical topic。
 
-        normalized = {
-            "positive": self._canonicalize_bucket(buckets["positive"], hidden_labels, positive_limit),
-            "negative": self._canonicalize_bucket(buckets["negative"], hidden_labels, negative_limit),
-            "recent": self._canonicalize_bucket(buckets["recent"], hidden_labels, recent_limit),
-        }
-        result = {
-            "positive_topics": [topic["label"] for topic in normalized["positive"]],
-            "negative_topics": [topic["label"] for topic in normalized["negative"]],
-            "recent_topics": [topic["label"] for topic in normalized["recent"]],
-            "canonical_topics": normalized["positive"],
-            "canonical_negative_topics": normalized["negative"],
-            "canonical_recent_topics": normalized["recent"],
-            "normalizer_version": PROFILE_NORMALIZER_VERSION,
-            "normalization_signature": signature,
-        }
-        # 聚类结果可能被多次读取生成旧字段、snapshot 和 debug；进程内缓存避免同一批证据重复归一化。
-        self._cache[signature] = json.loads(json.dumps(result, ensure_ascii=False))
-        return result
+        旧实现按正/负/近期三个桶分别聚类，同一概念在不同桶里可能得到不同 label，
+        冲突只能事后修补；统一聚类后每个 topic 只有一份成员列表，立场由打分层根据成员极性决定。
+        返回值里的 members 保留原始信号，打分层需要它们的极性、权重和时间戳。
+        """
+        candidates = [item for item in (self._normalize_signal(signal) for signal in signals or []) if item]
+        topics: List[Dict[str, Any]] = []
+        for cluster in self._cluster_candidates(candidates):
+            topic = self._build_canonical_topic(cluster)
+            if topic:
+                topic["members"] = cluster
+                topics.append(topic)
+        return topics
 
-    def _canonicalize_bucket(self, candidates: List[Dict[str, Any]], hidden_labels: set[str], limit: int) -> List[Dict[str, Any]]:
-        clusters = self._cluster_candidates(candidates)
-        canonical_topics = [self._build_canonical_topic(cluster) for cluster in clusters]
-        canonical_topics = [topic for topic in canonical_topics if topic and self._topic_key(topic["label"]) not in hidden_labels]
-        canonical_topics.sort(
-            key=lambda item: (
-                not bool(item.get("pinned")),
-                -float(item.get("score") or 0.0),
-                item.get("label", "").lower(),
-            )
-        )
-        return canonical_topics[:limit]
+    def _normalize_signal(self, signal: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(signal, dict):
+            return None
+        label = self.clean_label(signal.get("label"))
+        if not label:
+            return None
+        confidence = self._coerce_float(signal.get("confidence"), default=0.55)
+        return {
+            **signal,
+            "label": label,
+            "type": str(signal.get("type") or "technical_concept").strip() or "technical_concept",
+            "confidence": confidence,
+            "score": self._coerce_float(signal.get("score"), default=confidence),
+            "source": str(signal.get("source") or "unknown").strip() or "unknown",
+            "source_papers": self._merge_unique(signal.get("source_papers") or []),
+            "source_events": self._merge_unique(signal.get("source_events") or []),
+            "evidence_text": str(signal.get("evidence_text") or "").strip()[:500],
+        }
+
+    LOOSE_CLUSTER_MIN_SIMILARITY = 0.55
 
     def _cluster_candidates(self, candidates: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
         clusters_by_rule: Dict[str, List[Dict[str, Any]]] = {}
-        loose_clusters: List[List[Dict[str, Any]]] = []
+        groups_by_key: Dict[str, List[Dict[str, Any]]] = {}
 
         for candidate in candidates:
             rule = self._match_rule(candidate["label"])
@@ -251,17 +227,35 @@ class ConceptNormalizer:
                 candidate = {**candidate, "canonical_label": rule["label"], "rule": rule}
                 clusters_by_rule.setdefault(rule["label"], []).append(candidate)
                 continue
+            # 同一概念（大小写、单复数不同）先精确归组，保证它们一定落在同一个 topic。
+            groups_by_key.setdefault(self._topic_key(candidate["label"]), []).append(candidate)
 
-            placed = False
-            for cluster in loose_clusters:
-                if self._cluster_similarity(candidate, cluster) >= 0.55:
-                    cluster.append(candidate)
-                    placed = True
-                    break
-            if not placed:
-                loose_clusters.append([candidate])
+        # 支持论文多的概念先成为簇种子；后来的概念只和种子比较并归入最相似的簇。
+        # 只比种子而不是比簇内任一成员，可以避免 A≈B、B≈C 把 A 与 C 串进同一簇。
+        ordered_groups = sorted(
+            groups_by_key.values(),
+            key=lambda group: (-self._group_support(group), len(str(group[0].get("label") or "")), str(group[0].get("label") or "").lower()),
+        )
+        seeded_clusters: List[tuple[set[str], List[Dict[str, Any]]]] = []
+        for group in ordered_groups:
+            tokens = self._topic_tokens(group[0].get("label"))
+            best_cluster: Optional[List[Dict[str, Any]]] = None
+            best_similarity = 0.0
+            for seed_tokens, cluster in seeded_clusters:
+                similarity = self._token_similarity(tokens, seed_tokens)
+                if similarity > best_similarity:
+                    best_cluster, best_similarity = cluster, similarity
+            if best_cluster is not None and best_similarity >= self.LOOSE_CLUSTER_MIN_SIMILARITY:
+                best_cluster.extend(group)
+            else:
+                seeded_clusters.append((tokens, list(group)))
 
-        return [*clusters_by_rule.values(), *loose_clusters]
+        return [*clusters_by_rule.values(), *[cluster for _, cluster in seeded_clusters]]
+
+    @staticmethod
+    def _group_support(group: List[Dict[str, Any]]) -> int:
+        papers = {paper for item in group for paper in item.get("source_papers") or []}
+        return len(papers) or len(group)
 
     def _build_canonical_topic(self, cluster: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not cluster:
@@ -341,70 +335,25 @@ class ConceptNormalizer:
         parsed = json.loads(raw)
         return parsed if isinstance(parsed, dict) else {}
 
-    def _normalize_candidates(self, candidates: Iterable[Dict[str, Any]], signal: str) -> List[Dict[str, Any]]:
-        normalized: List[Dict[str, Any]] = []
-        for item in candidates or []:
-            if not isinstance(item, dict):
-                continue
-            label = self.clean_label(item.get("label"))
-            if not label:
-                continue
-            confidence = self._coerce_float(item.get("confidence"), default=0.55)
-            weight = self._coerce_float(item.get("weight"), default=1.0)
-            normalized.append(
-                {
-                    "label": label,
-                    "type": str(item.get("type") or "technical_concept").strip() or "technical_concept",
-                    "confidence": confidence,
-                    "weight": weight,
-                    "score": self._coerce_float(item.get("score"), default=confidence * weight),
-                    "source": str(item.get("source") or "unknown").strip() or "unknown",
-                    "source_papers": self._merge_unique(item.get("source_papers") or []),
-                    "source_events": self._merge_unique(item.get("source_events") or []),
-                    "evidence_text": str(item.get("evidence_text") or "").strip()[:500],
-                    "signal": signal,
-                    "pinned": bool(item.get("pinned")),
-                }
-            )
-        return normalized
-
-    def _manual_candidate(self, topic: str, *, signal: str, pinned: bool = False) -> Dict[str, Any]:
-        label = self.clean_label(topic)
-        return {
-            "label": label,
-            "type": "manual_topic",
-            "confidence": 1.0,
-            "weight": 4.0 if pinned else 3.0,
-            "score": 4.0 if pinned else 3.0,
-            "source": "manual_profile",
-            "source_papers": [],
-            "source_events": [],
-            "signal": signal,
-            "pinned": pinned,
-        }
-
     def _match_rule(self, label: str) -> Optional[Dict[str, Any]]:
         normalized = self._normalize_text(label)
         for rule in CANONICAL_TOPIC_RULES:
             for pattern in rule["patterns"]:
-                normalized_pattern = self._normalize_text(pattern)
-                if normalized == normalized_pattern or normalized_pattern in normalized:
+                # 必须按词边界匹配：子串匹配会让 "rag" 命中 coverage/storage/average 这类无关词。
+                if self._rule_pattern_regex(pattern).search(normalized):
                     return rule
         return None
 
-    def _cluster_similarity(self, candidate: Dict[str, Any], cluster: List[Dict[str, Any]]) -> float:
-        candidate_tokens = self._topic_tokens(candidate.get("label"))
-        if not candidate_tokens:
+    @classmethod
+    def _rule_pattern_regex(cls, pattern: str) -> "re.Pattern[str]":
+        normalized_pattern = cls._normalize_text(pattern)
+        return re.compile(rf"(?<![a-z0-9]){re.escape(normalized_pattern)}(?:s|es)?(?![a-z0-9])")
+
+    @staticmethod
+    def _token_similarity(left: set[str], right: set[str]) -> float:
+        if not left or not right:
             return 0.0
-        best = 0.0
-        for item in cluster:
-            item_tokens = self._topic_tokens(item.get("label"))
-            if not item_tokens:
-                continue
-            overlap = len(candidate_tokens & item_tokens)
-            union = len(candidate_tokens | item_tokens)
-            best = max(best, overlap / union if union else 0.0)
-        return best
+        return len(left & right) / len(left | right)
 
     def _source_concepts(self, cluster: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         concepts: Dict[str, Dict[str, Any]] = {}
@@ -445,8 +394,15 @@ class ConceptNormalizer:
         return f"Canonical topic merged from related concepts: {', '.join(aliases[:4])}."
 
     def _fallback_cluster_label(self, cluster: List[Dict[str, Any]]) -> str:
-        ranked = sorted(cluster, key=lambda item: (-float(item.get("score") or 0.0), len(str(item.get("label") or ""))))
-        return str(ranked[0].get("label") or "").strip() if ranked else ""
+        """簇名取被最多论文支持的概念；单条信号置信度高不代表它能代表整个簇。"""
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for item in cluster:
+            groups.setdefault(self._topic_key(item.get("label")), []).append(item)
+        ranked = sorted(
+            groups.values(),
+            key=lambda group: (-self._group_support(group), -max(float(item.get("score") or 0.0) for item in group), len(str(group[0].get("label") or ""))),
+        )
+        return str(ranked[0][0].get("label") or "").strip() if ranked else ""
 
     @classmethod
     def clean_label(cls, value: Any) -> str:
@@ -508,8 +464,15 @@ class ConceptNormalizer:
 
     @classmethod
     def _topic_tokens(cls, value: Any) -> set[str]:
-        tokens = {token.lower() for token in TOKEN_PATTERN.findall(str(value or ""))}
+        tokens = {cls._singularize(token.lower()) for token in TOKEN_PATTERN.findall(str(value or ""))}
         return {token for token in tokens if token not in STOPWORDS and len(token) > 1}
+
+    @staticmethod
+    def _singularize(token: str) -> str:
+        # 只做最保守的复数折叠，让 "large language models" 与 "large language model" 共用同一个 key。
+        if len(token) > 3 and token.endswith("s") and not token.endswith(("ss", "us", "is")):
+            return token[:-1]
+        return token
 
     @classmethod
     def _topic_key(cls, value: Any) -> str:
@@ -531,26 +494,3 @@ class ConceptNormalizer:
             if text and text not in merged:
                 merged.append(text)
         return merged
-
-    @staticmethod
-    def _build_signature(buckets: Dict[str, List[Dict[str, Any]]], hidden_labels: set[str]) -> str:
-        payload = {
-            "hidden": sorted(hidden_labels),
-            "buckets": {
-                name: [
-                    {
-                        "label": item.get("label"),
-                        "type": item.get("type"),
-                        "score": round(float(item.get("score") or 0.0), 4),
-                        "papers": item.get("source_papers") or [],
-                        "events": item.get("source_events") or [],
-                        "pinned": bool(item.get("pinned")),
-                    }
-                    for item in items
-                ]
-                for name, items in sorted(buckets.items())
-            },
-            "normalizer_version": PROFILE_NORMALIZER_VERSION,
-        }
-        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

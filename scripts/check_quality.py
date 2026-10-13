@@ -148,14 +148,6 @@ STAGES: dict[str, Stage] = {
         display_command="python -m pytest backend/tests/smoke",
         description="在 lazy 模式下创建 FastAPI app，检查路由、基础响应和统一错误结构。",
     ),
-    "frontend-error-tests": Stage(
-        id="frontend-error-tests",
-        title="前端错误解析测试",
-        command=[NPM, "run", "test:errors"],
-        cwd=FRONTEND_ROOT,
-        display_command="npm run test:errors",
-        description="运行最轻量的前端错误解析回归检查。",
-    ),
     "frontend-tests": Stage(
         id="frontend-tests",
         title="前端自动化测试",
@@ -201,8 +193,8 @@ TARGETS: dict[str, list[str]] = {
     "ci": ["docs", "deployment-tests", "doctor-basic", "backend-static", "backend-tests", "backend-startup-smoke", "frontend-tests", "frontend-build"],
     "doctor": ["doctor-basic"],
     "docs": ["docs"],
-    # smoke 保留为离线轻量入口，用于快速确认语法、后端测试入口和前端最小脚本仍可运行。
-    "smoke": ["backend-compile", "backend-startup-smoke", "frontend-error-tests"],
+    # smoke 保留为离线轻量入口；前端错误解析已包含在 frontend-tests，避免同一脚本重复执行。
+    "smoke": ["backend-compile", "backend-startup-smoke"],
 }
 
 

@@ -2,7 +2,7 @@
 
 ## 目标
 
-该能力将用户的显式偏好、论文行为、阅读笔记和已验证的论文证据转化为长期研究画像，再用画像、当前查询和负反馈对候选论文进行召回、排序与解释。它不能把一次点击或一次模型生成直接当成用户稳定偏好。
+该能力将用户的显式偏好、论文行为和已验证的论文证据转化为长期研究画像，再用画像、当前查询和负反馈对候选论文进行召回、排序与解释。它不能把一次点击或一次模型生成直接当成用户稳定偏好。
 
 主服务是 [`MemoryService`](../../backend/services/memory/memory_service.py) 和 [`RecommendationService`](../../backend/services/recommendation/recommendation_service.py)，持久化真源在 [`backend/services/storage/sqlite/stores/`](../../backend/services/storage/sqlite/stores/)。
 
@@ -20,11 +20,11 @@
 
 ## 信号与重建
 
-like/dislike、论文动作、阅读笔记和 QA 记录会写入偏好或 profile event store。`MemoryService` 负责收集事件、论文详情和证据卡，随后通过 `ResearchProfileGenerator` 生成候选画像。高成本或需要重新聚合历史信号的操作使用 `create_profile_rebuild_job()` 与 `run_profile_rebuild_job()`，不能在普通读请求中偷偷触发全量重建。
+like/dislike、论文动作和 QA 记录会写入偏好或 profile event store。`MemoryService` 负责收集事件、论文详情和证据卡，随后通过 `ResearchProfileGenerator` 生成候选画像。高成本或需要重新聚合历史信号的操作使用 `create_profile_rebuild_job()` 与 `run_profile_rebuild_job()`，不能在普通读请求中偷偷触发全量重建。
 
 行为画像只消费满足最小论文数量等质量门槛的稳定兴趣簇。该约束用于避免单篇论文、短期噪声或未完成的聚类直接改变长期推荐；任何放宽门槛的改动都必须同时检查质量报告、debug 和回归样本。
 
-删除或撤销偏好、笔记时，关联 profile event 必须失效或生成反向事件，否则下次生成画像仍会包含已撤销信号。
+删除或撤销偏好时，关联 profile event 必须失效或生成反向事件，否则下次生成画像仍会包含已撤销信号。
 
 ## 推荐流水线
 

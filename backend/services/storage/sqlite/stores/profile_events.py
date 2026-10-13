@@ -16,11 +16,7 @@ from services.storage.sqlite.shared import (
 PROFILE_EVENT_STRENGTHS = {
     "liked": 1.0,
     "disliked": -0.7,
-    "favorite": 0.85,
-    "later": 0.35,
     "read": 0.15,
-    "not_interested": -0.45,
-    "note_saved": 0.9,
     "qa_asked": 0.25,
     "manual_topic_added": 1.0,
     "manual_topic_removed": -1.0,
@@ -35,12 +31,7 @@ PROFILE_EVENT_ACTION_ALIASES = {
     "liked": "liked",
     "dislike": "disliked",
     "disliked": "disliked",
-    "favorite": "favorite",
-    "later": "later",
     "read": "read",
-    "not_interested": "not_interested",
-    "note_included": "note_saved",
-    "note_updated_in_profile": "note_saved",
 }
 
 
@@ -90,33 +81,6 @@ class ProfileEventStore(BaseSqliteStore):
             conn=conn,
         )
 
-    def _retract_note_profile_events(self, conn, user_id: str, note_id: str, arxiv_id: Optional[str]) -> None:
-        """笔记被删除或取消“纳入画像”时，停用它的 note_saved 事件并写入 note_saved_removed 事件。
-
-        按 note_id 而不是 arxiv_id 停用：同一论文下可能有多条笔记，按论文停用会误伤其他笔记。
-        停用后的事件不再计入 dirty 计数，因此需要额外写一条低权重删除事件来触发画像重建。
-        """
-        conn.execute(
-            '''
-            UPDATE user_profile_events
-            SET include_in_profile = 0, profile_dirty = 1
-            WHERE user_id = ? AND note_id = ? AND event_type = 'note_saved'
-            ''',
-            (user_id, note_id),
-        )
-        self.record_user_profile_event(
-            user_id=user_id,
-            event_type="note_saved_removed",
-            source_type="paper_note_removal",
-            source_id=note_id,
-            action_type="note_saved_removed",
-            arxiv_id=arxiv_id,
-            note_id=note_id,
-            metadata={"removed_event_type": "note_saved"},
-            include_in_profile=True,
-            conn=conn,
-        )
-
     def record_user_profile_event(
         self,
         *,
@@ -126,7 +90,6 @@ class ProfileEventStore(BaseSqliteStore):
         action_type: str,
         source_id: Optional[str] = None,
         arxiv_id: Optional[str] = None,
-        note_id: Optional[str] = None,
         session_id: Optional[str] = None,
         action_strength: Optional[float] = None,
         source: Optional[str] = None,
@@ -148,15 +111,13 @@ class ProfileEventStore(BaseSqliteStore):
         normalized_event_type = self._normalize_profile_event_type(event_type or action_type)
         normalized_source = str(source or source_type or "unknown").strip() or "unknown"
         normalized_arxiv_id = str(arxiv_id or "").strip() or None
-        normalized_note_id = str(note_id or "").strip() or None
         normalized_session_id = str(session_id or "").strip() or None
-        resolved_source_id = str(source_id or normalized_arxiv_id or normalized_note_id or normalized_session_id or "").strip() or None
+        resolved_source_id = str(source_id or normalized_arxiv_id or normalized_session_id or "").strip() or None
         resolved_strength = float(action_strength if action_strength is not None else PROFILE_EVENT_STRENGTHS.get(normalized_event_type, 0.0))
         normalized_metadata = dict(metadata or payload or {})
         resolved_dedupe_key = dedupe_key or self._build_profile_event_dedupe_key(
             normalized_event_type,
             arxiv_id=normalized_arxiv_id,
-            note_id=normalized_note_id,
             session_id=normalized_session_id,
             source_id=resolved_source_id,
             metadata=normalized_metadata,
@@ -167,10 +128,10 @@ class ProfileEventStore(BaseSqliteStore):
                 '''
                 INSERT INTO user_profile_events (
                     event_id, user_id, event_type, source_type, source_id, action_type, action_strength,
-                    source, arxiv_id, note_id, session_id, payload_json, metadata_json, include_in_profile,
+                    source, arxiv_id, session_id, payload_json, metadata_json, include_in_profile,
                     consumed_by_job_id, consumed_at, dedupe_key, profile_dirty, extractor_version, normalizer_version
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
                 ON CONFLICT(user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO UPDATE SET
                     action_strength = excluded.action_strength,
                     source = excluded.source,
@@ -194,7 +155,6 @@ class ProfileEventStore(BaseSqliteStore):
                     resolved_strength,
                     normalized_source,
                     normalized_arxiv_id,
-                    normalized_note_id,
                     normalized_session_id,
                     self._serialize_json_field(payload or {}),
                     self._serialize_json_field(normalized_metadata),
@@ -230,14 +190,13 @@ class ProfileEventStore(BaseSqliteStore):
         event_type: str,
         *,
         arxiv_id: Optional[str] = None,
-        note_id: Optional[str] = None,
         session_id: Optional[str] = None,
         source_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """生成事件去重键：同一对象上的同类事件只保留一条，重复操作只刷新而不累积。
 
-        优先级：手动主题按 topic 去重 → 风格设置全局唯一 → 笔记 → 论文 → 会话 → source_id；
+        优先级：手动主题按 topic 去重 → 风格设置全局唯一 → 论文 → 会话 → source_id；
         都没有时使用随机 UUID，相当于不去重。
         """
         if event_type.startswith("manual_topic_"):
@@ -245,8 +204,6 @@ class ProfileEventStore(BaseSqliteStore):
             return f"{event_type}:topic:{topic}" if topic else f"{event_type}:{source_id or 'manual'}"
         if event_type == "manual_style_updated":
             return "manual_style_updated"
-        if note_id:
-            return f"{event_type}:note:{note_id}"
         if arxiv_id:
             return f"{event_type}:paper:{arxiv_id}"
         if session_id:
@@ -291,7 +248,7 @@ class ProfileEventStore(BaseSqliteStore):
                 cursor.execute(
                     f'''
                     SELECT event_id, user_id, event_type, source_type, source_id, action_type, action_strength,
-                           source, arxiv_id, note_id, session_id, payload_json, metadata_json, include_in_profile,
+                           source, arxiv_id, session_id, payload_json, metadata_json, include_in_profile,
                            consumed_by_job_id, consumed_at, dedupe_key, profile_dirty, created_at
                     FROM user_profile_events
                     WHERE {' AND '.join(filters)}
@@ -311,16 +268,15 @@ class ProfileEventStore(BaseSqliteStore):
                         "action_strength": float(row[6] or 0.0),
                         "source": row[7],
                         "arxiv_id": row[8],
-                        "note_id": row[9],
-                        "session_id": row[10],
-                        "payload": self._deserialize_json_field(row[11]) or {},
-                        "metadata": self._deserialize_json_field(row[12]) or {},
-                        "include_in_profile": bool(row[13]),
-                        "consumed_by_job_id": row[14],
-                        "consumed_at": row[15],
-                        "dedupe_key": row[16],
-                        "profile_dirty": bool(row[17]),
-                        "created_at": row[18],
+                        "session_id": row[9],
+                        "payload": self._deserialize_json_field(row[10]) or {},
+                        "metadata": self._deserialize_json_field(row[11]) or {},
+                        "include_in_profile": bool(row[12]),
+                        "consumed_by_job_id": row[13],
+                        "consumed_at": row[14],
+                        "dedupe_key": row[15],
+                        "profile_dirty": bool(row[16]),
+                        "created_at": row[17],
                     }
                     for row in cursor.fetchall()
                 ]

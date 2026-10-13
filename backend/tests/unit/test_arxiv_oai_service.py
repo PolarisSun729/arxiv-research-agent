@@ -217,6 +217,37 @@ def test_local_search_respects_phrase_quotes_and_does_not_split_boolean_inside_p
     assert [paper["arxiv_id"] for paper in result["papers"]] == ["2401.00003"]
 
 
+def test_count_results_executes_abbreviation_expansion_from_relaxation_suggestions() -> None:
+    from services.arxiv.search_relaxation import build_relaxation_candidates
+
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    service.upsert_arxiv_oai_papers(
+        [
+            _paper("2401.00021", title="Knowledge Graph RAG for Question Answering", abstract="A study.", categories=["cs.CL"]),
+            # 只写全称、不出现 rag 缩写的论文正是展开要找回来的。
+            _paper(
+                "2401.00022",
+                title="Knowledge Graph Enhanced Retrieval-Augmented Generation",
+                abstract="A study.",
+                categories=["cs.CL"],
+            ),
+            _paper("2401.00023", title="Retrieval-Augmented Generation without Graphs", abstract="A study.", categories=["cs.CL"]),
+        ]
+    )
+    [expansion] = [
+        item["search_query"]
+        for item in build_relaxation_candidates(
+            search_query="knowledge graph rag", submitted_days_ago=None, allow_query_rewrite=True
+        )
+        if item["kind"] == "expand_abbreviation"
+    ]
+
+    assert service.count_results(search_query="knowledge graph rag") == 1
+    # 改写后的查询必须能被本地解析器按布尔结构执行，而且连字符全称能按短语命中。
+    assert service.count_results(search_query=expansion) == 2
+
+
 def test_local_search_uses_category_table_for_exact_category_matching() -> None:
     service = _make_temp_service()
     service.upsert_arxiv_oai_papers(

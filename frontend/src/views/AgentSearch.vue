@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Compass, Delete } from '@element-plus/icons-vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { dislikePaper, likePaper, removePaperPreference } from '@/api/papers'
 import { useAgentSearchChat } from '@/composables/useAgentSearchChat'
 import AgentUserResultAttachments from '@/components/agent-search/AgentUserResultAttachments.vue'
@@ -18,6 +18,7 @@ import { orderCitedSourceIds } from '@/utils/evidence'
 import type { RagChatSource } from '@/types/ragChat'
 
 const router = useRouter()
+const route = useRoute()
 const store = usePaperStore()
 const agentPaperLabels = new Map<string, 'liked' | 'disliked'>()
 const profileTopicPreview = computed(() => (store.researchProfile?.positive_topics || []).slice(0, 4))
@@ -58,7 +59,15 @@ const quickPrompts = [
 ]
 
 onMounted(async () => {
+  // 从论文搜索页跳转过来时带着查询预填输入框；不自动发送，让用户先确认或改写。
+  const prefill = route.query.q
+  if (typeof prefill === 'string' && prefill.trim()) {
+    setInputMessage(prefill)
+    void router.replace({ query: { ...route.query, q: undefined } })
+  }
   void store.fetchResearchProfile()
+  // 结果卡片上的「已读」读取行为表，进入页面先加载一次。
+  store.fetchPaperActions().catch(() => undefined)
   // 新页面从空会话开始；只有当前页面产生 session 后，才查询该会话自己的后台任务。
   await startWorkContinuationPolling()
 })

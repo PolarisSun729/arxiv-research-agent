@@ -259,7 +259,6 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
             paper_profile_evidence_store=self.storage.paper_profile_evidence,
             paper_chat_session_store=self.storage.paper_chat_sessions,
             paper_chat_message_store=self.storage.paper_chat_messages,
-            paper_note_store=self.storage.paper_notes,
             profile_event_store=self.storage.profile_events,
             profile_build_job_store=self.storage.profile_build_jobs,
             research_profile_store=self.storage.research_profiles,
@@ -1238,18 +1237,6 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         first = result["recommendations"][0]
         self.assertIn("与兴趣向量语义相似度 100%", first["personalized_reason"])
         self.assertTrue(first["recommendation_explanation"])
-
-    def test_dismissed_papers_are_excluded_even_without_research_profile(self) -> None:
-        self._add_paper("2401.63001", title="Dismissed", abstract="retrieval", categories=["cs.CL"])
-        self._add_paper("2401.63002", title="Archived", abstract="retrieval", categories=["cs.CL"])
-        self.storage.user_preferences.record_user_paper_action(user_id=self.user_id, arxiv_id="2401.63001", action_type="not_interested")
-        self.storage.user_preferences.record_user_paper_action(user_id=self.user_id, arxiv_id="2401.63002", action_type="archived")
-
-        with mock.patch.dict(self.service.memory_runtime_config, {"enable_user_research_profile": False}):
-            bundle = self.service._build_profile_signal_bundle(self.user_id)
-
-        self.assertTrue(bundle["disabled"])
-        self.assertEqual(sorted(bundle["excluded_ids"]), ["2401.63001", "2401.63002"])
 
     def test_user_memory_summary_string_feeds_profile_and_recent_topics(self) -> None:
         summary = str({"profile": {"positive_topics": ["graph neural network"], "negative_topics": [], "recent_topics": ["knowledge graph"], "preferred_categories": []}})

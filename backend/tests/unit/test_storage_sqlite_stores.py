@@ -55,7 +55,7 @@ class StorageContainerSqliteTests(unittest.TestCase):
         self.assertIn("paper_index_jobs", table_names)
         self.assertIn("paper_chat_sessions", table_names)
         self.assertIn("paper_chat_messages", table_names)
-        self.assertIn("paper_notes", table_names)
+        self.assertNotIn("paper_notes", table_names)
         self.assertIn("user_profile_events", table_names)
         self.assertIn("paper_profile_evidence", table_names)
         self.assertIn("user_manual_profiles", table_names)
@@ -91,20 +91,36 @@ class StorageContainerSqliteTests(unittest.TestCase):
         self.assertEqual(self.storage.user_preferences.get_liked_papers(self.user_id), [paper["arxiv_id"]])
         self.assertEqual(self.storage.user_preferences.get_disliked_papers(self.user_id), [])
 
-    def test_record_user_paper_action_supports_aliases_and_rejects_invalid_values(self) -> None:
+    def test_strong_preference_times_return_labeled_at_for_requested_papers(self) -> None:
+        liked = self._add_sample_paper("2401.00011")
+        disliked = self._add_sample_paper("2401.00012")
+        self.storage.user_preferences.add_liked_paper(self.user_id, liked["arxiv_id"])
+        self.storage.user_preferences.add_disliked_paper(self.user_id, disliked["arxiv_id"])
+
+        liked_times = self.storage.user_preferences.get_strong_preference_times(
+            self.user_id, "liked", [liked["arxiv_id"], disliked["arxiv_id"]]
+        )
+        disliked_times = self.storage.user_preferences.get_strong_preference_times(self.user_id, "disliked", [disliked["arxiv_id"]])
+
+        self.assertEqual(set(liked_times), {liked["arxiv_id"]})
+        self.assertTrue(liked_times[liked["arxiv_id"]])
+        self.assertEqual(set(disliked_times), {disliked["arxiv_id"]})
+        self.assertEqual(self.storage.user_preferences.get_strong_preference_times(self.user_id, "liked", []), {})
+
+    def test_record_user_paper_action_only_accepts_read(self) -> None:
         paper = self._add_sample_paper("2401.00002")
 
         self.assertFalse(self.storage.user_preferences.record_user_paper_action(self.user_id, paper["arxiv_id"], "liked"))
-        self.assertTrue(self.storage.user_preferences.record_user_paper_action(self.user_id, paper["arxiv_id"], "bookmark"))
-        self.assertTrue(self.storage.user_preferences.record_user_paper_action(self.user_id, paper["arxiv_id"], "save_for_later"))
+        self.assertTrue(self.storage.user_preferences.record_user_paper_action(self.user_id, paper["arxiv_id"], " READ "))
+        for retired in ("favorite", "later", "archived", "not_interested", "bookmark"):
+            self.assertFalse(self.storage.user_preferences.record_user_paper_action(self.user_id, paper["arxiv_id"], retired))
         self.assertFalse(self.storage.user_preferences.record_user_paper_action(self.user_id, paper["arxiv_id"], "disliked"))
         self.assertFalse(self.storage.user_preferences.record_user_paper_action(self.user_id, paper["arxiv_id"], "invalid_action"))
 
         actions = self.storage.user_preferences.get_user_paper_actions(self.user_id)
         action_types = {item["action_type"] for item in actions}
 
-        self.assertIn("favorite", action_types)
-        self.assertIn("later", action_types)
+        self.assertEqual(action_types, {"read"})
         self.assertNotIn("dislike", action_types)
         self.assertNotIn("like", action_types)
 
@@ -611,109 +627,44 @@ class StorageContainerSqliteTests(unittest.TestCase):
             )
         )
 
-    def test_paper_notes_support_create_update_list_and_delete(self) -> None:
-        session = self._create_session(arxiv_id="2401.00008", session_id="session-note")
-        message = self.storage.paper_chat_messages.append_paper_chat_message(session["session_id"], "assistant", "answer", user_id=self.user_id)
+    def test_schema_migration_drops_retired_paper_signals(self) -> None:
+        # 模拟功能下线前的旧库：笔记表、事件表 note_id 列，以及 note_saved/favorite/not_interested 等已下线行为与画像事件都还在。
+        with self.storage.connection_provider.connect() as conn:
+            conn.execute("CREATE TABLE paper_notes (note_id TEXT PRIMARY KEY, content TEXT)")
+            conn.execute("ALTER TABLE user_profile_events ADD COLUMN note_id TEXT")
+            conn.executemany(
+                "INSERT INTO user_paper_actions (user_id, arxiv_id, action_type) VALUES (?, ?, ?)",
+                [
+                    (self.user_id, "2401.00008", "note_saved"),
+                    (self.user_id, "2401.00008", "favorite"),
+                    (self.user_id, "2401.00008", "not_interested"),
+                    (self.user_id, "2401.00008", "like"),
+                    (self.user_id, "2401.00008", "read"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO user_profile_events (event_id, user_id, event_type, source_type, action_type) VALUES (?, ?, ?, ?, ?)",
+                [
+                    ("e1", self.user_id, "note_saved", "paper_note", "note_saved"),
+                    ("e2", self.user_id, "note_saved_removed", "paper_note_removal", "note_saved_removed"),
+                    ("e3", self.user_id, "read", "paper_action", "read"),
+                    ("e4", self.user_id, "later", "paper_action", "later"),
+                    ("e5", self.user_id, "not_interested_removed", "paper_action_removal", "not_interested_removed"),
+                ],
+            )
+            conn.commit()
 
-        note = self.storage.paper_notes.create_paper_note(
-            user_id=self.user_id,
-            arxiv_id="2401.00008",
-            session_id=session["session_id"],
-            source_message_id=message["message_id"],
-            title="Method note",
-            content="Important detail",
-            note_type="method",
-            source_chunk_ids=[1, "2"],
-            tags=["rag", "method"],
-            include_in_profile=True,
-        )
-        updated = self.storage.paper_notes.update_paper_note(
-            note["note_id"],
-            user_id=self.user_id,
-            title="Updated title",
-            note_type="unknown-type",
-            tags=["updated"],
-            include_in_profile=False,
-        )
-        notes = self.storage.paper_notes.list_paper_notes(arxiv_id="2401.00008", user_id=self.user_id)
-        profile_notes = self.storage.paper_notes.list_user_profile_notes(user_id=self.user_id)
+        self.storage.schema_migrator.ensure_schema()
 
-        self.assertEqual(note["source_chunk_ids"], ["1", "2"])
-        self.assertEqual(updated["title"], "Updated title")
-        self.assertEqual(updated["note_type"], "custom")
-        self.assertEqual(updated["tags"], ["updated"])
-        self.assertFalse(updated["include_in_profile"])
-        self.assertEqual(len(notes), 1)
-        self.assertEqual(profile_notes, [])
-        self.assertTrue(self.storage.paper_notes.delete_paper_note(note["note_id"], user_id=self.user_id))
-        self.assertIsNone(self.storage.paper_notes.get_paper_note(note["note_id"], user_id=self.user_id))
-
-    def _active_note_event_types(self, note_id: str) -> set:
-        return {
-            event["event_type"]
-            for event in self.storage.profile_events.list_user_profile_events(self.user_id)
-            if event["note_id"] == note_id
-        }
-
-    def test_deleting_profile_note_retracts_only_its_own_profile_event(self) -> None:
-        kept = self.storage.paper_notes.create_paper_note(
-            user_id=self.user_id, arxiv_id="2401.00008", content="keep", include_in_profile=True
-        )
-        removed = self.storage.paper_notes.create_paper_note(
-            user_id=self.user_id, arxiv_id="2401.00008", content="remove", include_in_profile=True
-        )
-
-        self.assertTrue(self.storage.paper_notes.delete_paper_note(removed["note_id"], user_id=self.user_id))
-
-        self.assertEqual(self._active_note_event_types(removed["note_id"]), {"note_saved_removed"})
-        self.assertEqual(self._active_note_event_types(kept["note_id"]), {"note_saved"})
-
-    def test_deleting_private_note_writes_no_profile_event(self) -> None:
-        note = self.storage.paper_notes.create_paper_note(
-            user_id=self.user_id, arxiv_id="2401.00008", content="private", include_in_profile=False
-        )
-
-        self.assertTrue(self.storage.paper_notes.delete_paper_note(note["note_id"], user_id=self.user_id))
-
-        self.assertEqual(self._active_note_event_types(note["note_id"]), set())
-        self.assertFalse(self.storage.paper_notes.delete_paper_note(note["note_id"], user_id=self.user_id))
-
-    def test_excluding_note_from_profile_retracts_event_and_reincluding_restores_it(self) -> None:
-        note = self.storage.paper_notes.create_paper_note(
-            user_id=self.user_id, arxiv_id="2401.00008", content="toggle", include_in_profile=True
-        )
-
-        self.storage.paper_notes.update_paper_note(note["note_id"], user_id=self.user_id, include_in_profile=False)
-        self.assertEqual(self._active_note_event_types(note["note_id"]), {"note_saved_removed"})
-
-        self.storage.paper_notes.update_paper_note(note["note_id"], user_id=self.user_id, include_in_profile=True)
-        self.assertEqual(self._active_note_event_types(note["note_id"]), {"note_saved", "note_saved_removed"})
-
-    def test_list_user_profile_notes_returns_only_included_notes(self) -> None:
-        self.storage.paper_notes.create_paper_note(
-            user_id=self.user_id,
-            arxiv_id="2401.00008",
-            title="Profile note",
-            content="Important profile signal",
-            note_type="method",
-            tags=["rag"],
-            include_in_profile=True,
-        )
-        self.storage.paper_notes.create_paper_note(
-            user_id=self.user_id,
-            arxiv_id="2401.00009",
-            title="Private note",
-            content="Do not include",
-            note_type="summary",
-            tags=["private"],
-            include_in_profile=False,
-        )
-
-        notes = self.storage.paper_notes.list_user_profile_notes(user_id=self.user_id)
-
-        self.assertEqual(len(notes), 1)
-        self.assertEqual(notes[0]["title"], "Profile note")
-        self.assertTrue(notes[0]["include_in_profile"])
+        with self.storage.connection_provider.connect() as conn:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+            event_columns = {row[1] for row in conn.execute("PRAGMA table_info(user_profile_events)").fetchall()}
+            actions = {row[0] for row in conn.execute("SELECT action_type FROM user_paper_actions").fetchall()}
+            events = {row[0] for row in conn.execute("SELECT event_type FROM user_profile_events").fetchall()}
+        self.assertNotIn("paper_notes", tables)
+        self.assertNotIn("note_id", event_columns)
+        self.assertEqual(actions, {"read"})
+        self.assertEqual(events, {"read"})
 
     def test_user_research_profiles_support_upsert_patch_and_get(self) -> None:
         profile = self.storage.research_profiles.upsert_user_research_profile(
@@ -797,6 +748,15 @@ class StorageContainerSqliteTests(unittest.TestCase):
             row = conn.execute("SELECT status, snapshot_id FROM user_profile_build_jobs WHERE job_id = ?", (job_id,)).fetchone()
         self.assertEqual(row[0], "needs_review")
         self.assertEqual(row[1], inactive_snapshot["snapshot_id"])
+
+        snapshots = self.storage.research_profiles.list_user_profile_snapshots(self.user_id)
+        by_id = {item["snapshot_id"]: item for item in snapshots}
+        self.assertEqual(sorted(item["build_number"] for item in snapshots), [1, 2])
+        self.assertTrue(by_id[active_snapshot["snapshot_id"]]["active"])
+        self.assertFalse(by_id[inactive_snapshot["snapshot_id"]]["active"])
+        self.assertEqual(by_id[active_snapshot["snapshot_id"]]["topics"]["positive_topics"], ["RAG retrieval optimization"])
+        self.assertEqual(by_id[active_snapshot["snapshot_id"]]["representative_paper_count"], 1)
+        self.assertFalse(by_id[inactive_snapshot["snapshot_id"]]["quality_report"]["approved"])
 
     def test_json_serialization_helpers_handle_boundary_values(self) -> None:
         self.assertEqual(self.storage.paper_catalog._serialize_json_field(None), "")

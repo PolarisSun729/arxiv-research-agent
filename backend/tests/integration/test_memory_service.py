@@ -126,6 +126,10 @@ class FakeInterestModelRefresher:
 
 class MemoryServiceIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
+        # 测试数据里的点赞都在同一时刻写入；持续性规则由 test_topic_scorer 单独覆盖，这里关闭以聚焦其它链路。
+        scoring_patch = mock.patch.object(MemoryService, "_profile_topic_scoring_config", return_value={"focus_min_span_days": 0})
+        scoring_patch.start()
+        self.addCleanup(scoring_patch.stop)
         self.storage = build_storage_container()
         self.memory_service = self._make_memory_service(generation_service=FakeEvidenceGenerationService())
         self.user_id = "user-1"
@@ -150,7 +154,6 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
             paper_profile_evidence_store=self.storage.paper_profile_evidence,
             paper_chat_session_store=self.storage.paper_chat_sessions,
             paper_chat_message_store=self.storage.paper_chat_messages,
-            paper_note_store=self.storage.paper_notes,
             profile_event_store=self.storage.profile_events,
             profile_build_job_store=self.storage.profile_build_jobs,
             research_profile_store=self.storage.research_profiles,
@@ -187,7 +190,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
 
     def test_load_preference_summary_returns_stable_counts(self) -> None:
         self.storage.user_preferences.add_liked_paper(self.user_id, self.arxiv_id)
-        self.storage.user_preferences.record_user_paper_action(self.user_id, "2401.00002", "bookmark")
+        self.storage.user_preferences.record_user_paper_action(self.user_id, "2401.00002", "read")
         self.storage.interest_vectors.save_user_interest_vector(
             user_id=self.user_id,
             vector_data=[0.1, 0.2, 0.3],
@@ -201,7 +204,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(summary["user_id"], self.user_id)
         self.assertEqual(summary["counts"]["liked_papers"], 1)
         self.assertEqual(summary["counts"]["disliked_papers"], 0)
-        self.assertIn("favorite", summary["paper_actions"])
+        self.assertIn("read", summary["paper_actions"])
         self.assertIsNotNone(summary["interest_vector"])
 
     def test_load_paper_conversation_context_reads_recent_turns(self) -> None:
@@ -294,69 +297,17 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(context["turn_count"], 3)
         self.assertEqual([turn["turn_id"] for turn in context["turns"]], ["turn-9", "turn-10", "turn-11"])
 
-    def test_profile_note_merges_clean_note_tags_only(self) -> None:
-        note = self.storage.paper_notes.create_paper_note(
-            user_id=self.user_id,
-            arxiv_id=self.arxiv_id,
-            title="Important finding about a single paper",
-            content="Remember this paper.",
-            note_type="summary",
-            tags=["rag", "retrieval", "cs.CL", "paper", self.arxiv_id, "https://arxiv.org/abs/2401.00001"],
-            include_in_profile=True,
-        )
-
-        self.assertIsNotNone(note)
-        events = self.storage.profile_events.list_user_profile_events(self.user_id, event_types=["note_saved"])
-        profile = self.memory_service.rebuild_user_research_profile(self.user_id)
-
-        self.assertEqual(len(events), 1)
-        self.assertIn("RAG retrieval optimization", profile["positive_topics"])
-        self.assertEqual(profile["canonical_topics"][0]["label"], "RAG retrieval optimization")
-        self.assertIn("retrieval", profile["recent_topics"])
-        self.assertNotIn("Important finding about a single paper", profile["positive_topics"])
-        self.assertNotIn("cs.CL", profile["positive_topics"])
-        self.assertNotIn("paper", profile["positive_topics"])
-        self.assertIn(self.arxiv_id, profile["representative_papers"])
-
-    def test_note_and_qa_write_profile_events_without_sync_generation(self) -> None:
-        note = self.storage.paper_notes.create_paper_note(
-            user_id=self.user_id,
-            arxiv_id=self.arxiv_id,
-            title="Profile note",
-            content="Use retrieval signals",
-            note_type="summary",
-            tags=["rag"],
-            include_in_profile=True,
-        )
+    def test_qa_writes_profile_events_without_sync_generation(self) -> None:
         session = self.storage.paper_chat_sessions.create_paper_chat_session(arxiv_id=self.arxiv_id, user_id=self.user_id, title="QA")
         self.storage.paper_chat_messages.append_paper_chat_message(session["session_id"], "user", "How does retrieval work?", user_id=self.user_id)
 
         events = self.storage.profile_events.list_user_profile_events(self.user_id)
         event_types = {event["event_type"] for event in events}
 
-        self.assertIsNotNone(note)
-        self.assertIn("note_saved", event_types)
         self.assertIn("qa_asked", event_types)
         self.assertEqual(self.storage.research_profiles.get_user_generated_profile(self.user_id)["positive_topics"], [])
         self.memory_service.rebuild_user_research_profile(self.user_id)
         self.assertIsNotNone(self.storage.paper_profile_evidence.get_paper_profile_evidence(self.arxiv_id))
-
-    def test_stale_note_saved_event_without_note_is_ignored_in_profile_evidence(self) -> None:
-        note = self.storage.paper_notes.create_paper_note(
-            user_id=self.user_id,
-            arxiv_id=self.arxiv_id,
-            content="Deleted before event retraction existed",
-            include_in_profile=True,
-        )
-        # 绕过 store 直接删行，模拟撤销逻辑上线前删除笔记留下的 note_saved 事件。
-        with self.storage.paper_notes._get_connection() as conn:
-            conn.execute("DELETE FROM paper_notes WHERE note_id = ?", (note["note_id"],))
-            conn.commit()
-
-        evidence = self.memory_service._collect_research_profile_evidence(self.user_id)
-
-        self.assertEqual(evidence["notes"], [])
-        self.assertNotIn("note_saved", {action.get("action_type") for action in evidence["recent_actions"]})
 
     def test_like_paper_keeps_categories_and_titles_out_of_topics(self) -> None:
         self._record_preference_event(
@@ -561,16 +512,7 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
             self.storage.user_preferences.add_liked_paper(self.user_id, arxiv_id)
         self.storage.user_preferences.add_disliked_paper(self.user_id, "2401.00013")
         self.storage.user_preferences.add_disliked_paper(self.user_id, "2401.00015")
-        self.storage.user_preferences.record_user_paper_action(self.user_id, "2401.00014", "favorite")
-        self.storage.paper_notes.create_paper_note(
-            user_id=self.user_id,
-            arxiv_id="2401.00014",
-            title="Do not store this note title as a topic",
-            content="Use this note as supporting evidence for knowledge graph construction.",
-            note_type="method",
-            tags=["knowledge graph construction", "RAG", "paper"],
-            include_in_profile=True,
-        )
+        self.storage.user_preferences.record_user_paper_action(self.user_id, "2401.00014", "read")
 
         profile = self.memory_service.generate_user_research_profile(self.user_id)
         repeated = self.memory_service.generate_user_research_profile(self.user_id)
@@ -578,23 +520,20 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertIn("RAG retrieval optimization", profile["positive_topics"])
         self.assertIn("agent memory", profile["positive_topics"])
         self.assertIn("long-context reasoning", profile["positive_topics"])
-        self.assertIn("knowledge graph construction", profile["recent_topics"])
         self.assertIn("diffusion models", profile["negative_topics"])
         self.assertIn("cs.CL", profile["preferred_categories"])
         self.assertIn("cs.AI", profile["preferred_categories"])
         self.assertNotIn("cs.CL", profile["positive_topics"])
         self.assertNotIn("cs.CV", profile["negative_topics"])
-        self.assertNotIn("Do not store this note title as a topic", profile["positive_topics"])
         self.assertIn("2401.00010", profile["representative_papers"])
-        self.assertIn("method", profile["common_question_types"])
         self.assertEqual(profile["preferred_answer_style"], "concise")
         self.assertEqual(profile["positive_topics"], repeated["positive_topics"])
         self.assertEqual(profile["negative_topics"], repeated["negative_topics"])
         rag_evidence = profile["topic_evidence"]["RAG retrieval optimization"]
-        self.assertGreater(rag_evidence["positive_score"], rag_evidence["negative_score"])
+        self.assertGreater(rag_evidence["long_pos"], rag_evidence["long_neg"])
         self.assertIn("2401.00010", rag_evidence["source_papers"])
         self.assertIn("liked", rag_evidence["source_actions"])
-        self.assertEqual(profile["aggregation_report"]["aggregator_version"], "profile_aggregator_v1")
+        self.assertEqual(profile["aggregation_report"]["aggregator_version"], "profile_aggregator_v2")
         self.assertTrue(profile["review_status"]["approved"])
         self.assertTrue(profile["quality_report"]["approved"])
         self.assertIsNotNone(profile.get("snapshot_id"))

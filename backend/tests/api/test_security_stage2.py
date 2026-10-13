@@ -394,9 +394,12 @@ def test_rate_window_and_temporary_block_expire_without_extending_on_rejection(a
     assert http.get("/api/auth/check").status_code == 200
 
 
+# 每类 URL 解析失败只保留一个代表值；同一解析分支的多个拼写不会增加业务覆盖。
 @pytest.mark.parametrize("uri", [
-    "redis://user:private-redis-password@[invalid", "redis://localhost:bad", "redis://localhost:70000",
-    "redis://localhost:0", "redis://local host/0", "memory://ignored", "https://redis.example",
+    "redis://user:private-redis-password@[invalid",  # 非法 authority，同时验证凭据脱敏
+    "redis://localhost:bad",  # 非数字端口
+    "redis://localhost:70000",  # 超出端口范围
+    "memory://ignored",  # 不允许的存储协议
 ])
 def test_invalid_storage_uri_fails_startup_without_leaking_credentials(app_factory, uri):
     with pytest.raises(RuntimeError) as error:
@@ -579,8 +582,10 @@ def test_key_env_errors_name_the_variable_without_values(app_factory, monkeypatc
     assert KEY_A not in message
 
 
+# OPENAI_API_KEY 覆盖 *_API_KEY，STORAGE_ACCESS_KEY 覆盖 *_ACCESS_KEY；ALIYUN_API_KEY
+# 走同一个后缀匹配分支，不再重复展开。
 @pytest.mark.parametrize("source", ["environment", "file"])
-@pytest.mark.parametrize("name", ["OPENAI_API_KEY", "ALIYUN_API_KEY", "STORAGE_ACCESS_KEY"])
+@pytest.mark.parametrize("name", ["OPENAI_API_KEY", "STORAGE_ACCESS_KEY"])
 def test_access_keys_cannot_reuse_external_secrets(app_factory, monkeypatch, tmp_path, source, name):
     monkeypatch.setenv(name, KEY_A)
     if source == "file":
@@ -689,7 +694,10 @@ def test_rate_categories_follow_route_policies():
     for method, route in ROUTE_POLICIES:
         if (method, route) in expensive:
             expected = "expensive"
-        elif method in {"GET", "HEAD", "OPTIONS"} or (method, route) == ("POST", "/api/arxiv/search"):
+        elif method in {"GET", "HEAD", "OPTIONS"} or (method, route) in {
+            ("POST", "/api/arxiv/search"),
+            ("POST", "/api/arxiv/search/suggestions"),
+        }:
             expected = "read"
         else:
             expected = "write"

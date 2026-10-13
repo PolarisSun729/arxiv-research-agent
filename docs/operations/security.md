@@ -60,7 +60,7 @@ python scripts/manage_users.py set-password --username admin --env-file .env.pro
 | 能力 | admin | researcher | viewer | guest |
 | --- | --- | --- | --- | --- |
 | 共享论文查询、详情、推荐 | ✓ | ✓ | ✓ | ✓ |
-| 已有索引 QA；本人会话/笔记/偏好/画像 | ✓ | ✓ | ✓ | ✓ |
+| 已有索引 QA；本人会话/偏好/画像 | ✓ | ✓ | ✓ | ✓ |
 | 导入/下载论文、建索引、画像重建 | ✓ | ✓ | ✗ | ✗ |
 | Agent 对话与续跑 | ✓ | ✓ | ✗ | ✗ |
 | 删除共享论文、全局 trace/诊断、debug 路由 | ✓ | ✗ | ✗ | ✗ |
@@ -105,7 +105,7 @@ python scripts/manage_users.py set-password --username admin --env-file .env.pro
 | guest | 10 | 5 | 0 |
 
 - `-1` 不限，`0` 无额度；权限先于配额判断，给 guest 加 Agent 配额不会授予 Agent 权限。
-- 配额只在真正产生外部成本的地方扣（模型调用、embedding、回源 arXiv）。`papers` 覆盖 arXiv 搜索、推荐、收藏与行为记录、导入/下载/建索引、画像重建；本地论文列表、分类列表、已标记论文列表（`GET /api/user/labeled-papers/{user_id}`）和本地已有的论文详情不扣配额，论文详情只在本地缺失或缺标题/摘要、需要回源 arXiv 时扣 1 次（额度用尽时返回本地不完整记录，本地也没有才返回 429）；`qa_queries` 覆盖普通与流式问答；`agent_runs` 覆盖 Agent 对话与续跑，内部论文与 QA 工具另扣对应类别。
+- 配额只在真正产生外部成本的地方扣（模型调用、embedding、回源 arXiv）。`papers` 覆盖 arXiv 搜索、推荐、偏好标记与已读记录、导入/下载/建索引、画像重建；本地论文列表、分类列表、已标记论文列表（`GET /api/user/labeled-papers/{user_id}`）和本地已有的论文详情不扣配额，论文详情只在本地缺失或缺标题/摘要、需要回源 arXiv 时扣 1 次（额度用尽时返回本地不完整记录，本地也没有才返回 429）；`qa_queries` 覆盖普通与流式问答；`agent_runs` 覆盖 Agent 对话与续跑，内部论文与 QA 工具另扣对应类别。
 - 在认证 SQLite 中用 `BEGIN IMMEDIATE` 原子校验并扣减，UTC 00:00 重置。配额记录丢失或存储故障返回 503，不补发额度。角色变更会把三类限额重置为新角色的默认值（之前为该用户单独调整的限额不保留），今日已用量保留。
 
 ### 速率
@@ -177,7 +177,7 @@ AUDIT_LOG_BACKUP_COUNT=5
 - 每行一个 JSON：UTC 时间、服务端 `request_id`（响应头 `X-Request-ID`）、规范化 IP、方法、路由模板、状态码、耗时、认证状态、拒绝码、完成状态、发送字节数；JWT 模式另记 `auth_mode`、`user_id`、`username`、`role`、`target_user_id`。不记录请求体、查询参数、路径参数、请求头或凭据。
 - SSE 正常结束、异常、取消各只记一次，耗时覆盖完整周期。
 - POSIX 下目录 0700、文件 0600；单文件轮转只支持单进程。写入失败向 stderr 输出 `audit_log_write_failed` 和脱敏事件，不改变已执行的业务结果。
-- 日志、异常堆栈、JSON 响应、SSE（含跨分片）、笔记附件和 trace 统一经 [`secret_redaction.py`](../../backend/utils/secret_redaction.py) 脱敏，覆盖密码、签名材料、Bearer、裸 JWT 和已配置的访问密钥。只有登录专用响应可以返回新令牌。
+- 日志、异常堆栈、JSON 响应、SSE（含跨分片）和 trace 统一经 [`secret_redaction.py`](../../backend/utils/secret_redaction.py) 脱敏，覆盖密码、签名材料、Bearer、裸 JWT 和已配置的访问密钥。只有登录专用响应可以返回新令牌。
 - 历史日志和 trace 不会被自动重写，曾泄露的凭据必须轮换。
 
 ## 8. 持久化与后台任务

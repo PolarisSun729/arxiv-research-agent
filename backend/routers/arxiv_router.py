@@ -22,6 +22,7 @@ from starlette.concurrency import run_in_threadpool
 
 from dependencies import get_arxiv_api_service, get_arxiv_search_backend
 from services.arxiv.arxiv_query_builder import prepare_arxiv_search_request
+from services.arxiv.search_relaxation import suggest_search_relaxations
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,39 @@ async def arxiv_search(
         )
     except Exception as exc:
         _raise_arxiv_http_error(exc, operation="search")
+
+
+@router.post("/search/suggestions")
+async def arxiv_search_suggestions(
+    request: ArxivSearchRequest = Body(...),
+    arxiv_backend=Depends(get_arxiv_search_backend),
+):
+    """结果偏少时给出放宽建议（放宽时间 / 放宽写法），能便宜计数的后端会附上每个候选的命中数。"""
+    try:
+        # 先按原请求校验一遍，非法查询直接报错而不是返回空建议。
+        prepared = _prepare_search_request(request, append_date_when_query_missing=False)
+        # 只有本地 OAI 镜像提供 count_results；远程 API 有限流，不逐个计数。
+        count_results = getattr(arxiv_backend, "count_results", None)
+
+        def count(search_query: Optional[str], submitted_days_ago: Optional[int]) -> int:
+            candidate = request.model_copy(
+                update={"search_query": search_query, "submitted_days_ago": submitted_days_ago}
+            )
+            candidate_prepared = _prepare_search_request(candidate, append_date_when_query_missing=False)
+            return count_results(
+                search_query=candidate_prepared["final_search_query"],
+                id_list=candidate_prepared["id_list"],
+            )
+
+        return await run_in_threadpool(
+            suggest_search_relaxations,
+            search_query=request.search_query,
+            submitted_days_ago=request.submitted_days_ago,
+            allow_query_rewrite=prepared["mode"] == "raw",
+            count=count if callable(count_results) else None,
+        )
+    except Exception as exc:
+        _raise_arxiv_http_error(exc, operation="search suggestions")
 
 
 @router.get("/fields")

@@ -159,7 +159,7 @@ python -m services.evaluation.golden_runner --cases tests/golden/data/smoke_gold
 ```powershell
 conda activate new_rag
 python scripts/test_security.py
-python scripts/test_security.py -k "redact or notes_markdown_export"
+python scripts/test_security.py -k "redact"
 python scripts/test_security.py --full
 ```
 

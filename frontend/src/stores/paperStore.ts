@@ -9,7 +9,6 @@ import type {
   InterestVectorResult,
   RecommendationResult,
   PaperActionType,
-  PaperNoteType,
   UserPaperActionMap,
   UserResearchProfile,
   UserResearchProfileDetail,
@@ -37,21 +36,21 @@ import {
   activateUserResearchProfileSnapshot,
   getUserPaperActions,
   recordPaperAction,
-  removePaperAction,
-  listPaperNotes,
-  createPaperNote
+  removePaperAction
 } from '@/api/papers'
 import { useUserContext } from '@/composables/useUserContext'
 import {
   normalizeArxivQueryCapability,
   normalizeArxivQueryCapabilityFromError
 } from '@/utils/arxivQueryCapability'
+import { resolveSearchFetchSize } from '@/utils/searchResults'
 
 export const usePaperStore = defineStore('paper', () => {
   const userContext = useUserContext()
-  const papers = ref<Paper[]>([])
+  // 搜索页拿到的完整结果（可能为过滤已标记论文而多拉），展示哪些、怎么分页由页面决定。
   const allPapers = ref<Paper[]>([])
-  const totalPapers = ref(0)
+  // 搜索发起时已标记（感兴趣 / 不感兴趣 / 已读）的论文快照；搜索后新标记的不算，避免卡片点完就消失。
+  const searchMarkedIds = ref<string[]>([])
   const currentPaper = ref<Paper | null>(null)
   const recommendations = ref<RecommendedPaper[]>([])
   const labeledPapers = ref<LabeledPaper[]>([])
@@ -87,6 +86,9 @@ export const usePaperStore = defineStore('paper', () => {
     researchProfileDetail.value = null
     latestProfileBuildJob.value = null
     paperActionMap.value = {}
+    // 搜索结果上的标记和过滤快照都属于上一个用户，切换后需重新搜索。
+    allPapers.value = []
+    searchMarkedIds.value = []
     lastInterestVector.value = null
     arxivSearchCapability.value = null
     arxivSearchError.value = null
@@ -160,7 +162,6 @@ export const usePaperStore = defineStore('paper', () => {
   }
 
   function syncPaperCollections() {
-    applyPaperActions(papers.value)
     applyPaperActions(allPapers.value)
     applyPaperActions(recommendations.value)
     applyPaperActions(labeledPapers.value)
@@ -172,8 +173,13 @@ export const usePaperStore = defineStore('paper', () => {
   async function fetchPaperById(id: string) {
     loading.value = true
     try {
-      currentPaper.value = await getPaperById(id)
+      // 详情接口不带用户偏好，这里同时取偏好表，让详情页的感兴趣/不感兴趣与列表卡片显示一致。
+      const [paper, preferences] = await Promise.all([getPaperById(id), getUserPreferences().catch(() => null)])
+      currentPaper.value = paper
       if (currentPaper.value) {
+        if (preferences) {
+          applyPreferenceLabels([currentPaper.value], preferences.liked_papers || [], preferences.disliked_papers || [])
+        }
         currentPaper.value.paperActions = buildPaperActions(currentPaper.value.arxivId || currentPaper.value.id)
       }
       return currentPaper.value
@@ -184,6 +190,7 @@ export const usePaperStore = defineStore('paper', () => {
 
   async function fetchLabeledPapers(params: {
     label?: 'liked' | 'disliked'
+    cluster?: string
     page: number
     pageSize: number
   }) {
@@ -198,7 +205,8 @@ export const usePaperStore = defineStore('paper', () => {
   }
 
   async function updateLabel(id: string, label: 'liked' | 'disliked' | null) {
-    const paper = [...papers.value, ...recommendations.value, ...allPapers.value]
+    // 详情页的论文只在 currentPaper 里，也要能被找到，否则详情页无法标记偏好。
+    const paper = [...recommendations.value, ...allPapers.value, ...(currentPaper.value ? [currentPaper.value] : [])]
       .find(item => item.id === id || item.arxivId === id)
     if (!paper) {
       throw new Error('Paper not found')
@@ -217,18 +225,8 @@ export const usePaperStore = defineStore('paper', () => {
       await dislikePaper(paper)
     }
 
-    if (label === 'liked' || label === 'disliked') {
-      const targetPaperId = paper.arxivId || paper.id
-      // 显式偏好不再写入 paperActionMap；这里只同步清理与强偏好冲突的弱负反馈。
-      paperActionMap.value.not_interested = (paperActionMap.value.not_interested || []).filter((item: string) => item !== targetPaperId)
-    }
-
     if (currentPaper.value?.id === id) {
       currentPaper.value.label = label
-    }
-    const paperIndex = papers.value.findIndex(p => p.id === id)
-    if (paperIndex !== -1) {
-      papers.value[paperIndex].label = label
     }
     const recIndex = recommendations.value.findIndex(r => r.id === id)
     if (recIndex !== -1) {
@@ -250,26 +248,33 @@ export const usePaperStore = defineStore('paper', () => {
     }
   }
 
-  async function fetchArxivPapers(params: ArxivSearchParams, page: number = 1, pageSize: number = 10) {
+  async function fetchArxivPapers(params: ArxivSearchParams) {
     loading.value = true
     arxivSearchCapability.value = null
     arxivSearchError.value = null
     try {
-      const result = await searchArxiv(params)
+      // 先取偏好：要根据已标记数量决定多拉多少。偏好失败不影响搜索本身，只是不做多拉和过滤。
+      const preferences = await getUserPreferences().catch(() => null)
+      const likedIds = preferences?.liked_papers || []
+      const dislikedIds = preferences?.disliked_papers || []
+      if (preferences) {
+        paperActionMap.value = preferences.paper_actions || {}
+        researchProfile.value = preferences.research_profile || researchProfile.value
+      }
+      const markedIds = Array.from(new Set([...likedIds, ...dislikedIds, ...(paperActionMap.value.read || [])]))
+      const maxResults = params.max_results || 10
+      const result = await searchArxiv({
+        ...params,
+        max_results: resolveSearchFetchSize(maxResults, markedIds.length)
+      })
       arxivSearchCapability.value = normalizeArxivQueryCapability({
         capability: result.queryCapability,
         warnings: result.warnings
       })
       allPapers.value = [...result.items]
-      const preferences = await getUserPreferences()
-      paperActionMap.value = preferences.paper_actions || {}
-      researchProfile.value = preferences.research_profile || researchProfile.value
-      applyPreferenceLabels(allPapers.value, preferences.liked_papers || [], preferences.disliked_papers || [])
+      searchMarkedIds.value = markedIds
+      applyPreferenceLabels(allPapers.value, likedIds, dislikedIds)
       applyPaperActions(allPapers.value)
-      totalPapers.value = result.total
-      const start = (page - 1) * pageSize
-      const end = start + pageSize
-      papers.value = allPapers.value.slice(start, end)
     } catch (error) {
       const capabilityFromError = normalizeArxivQueryCapabilityFromError(error)
       if (capabilityFromError) {
@@ -277,20 +282,13 @@ export const usePaperStore = defineStore('paper', () => {
         arxivSearchCapability.value = capabilityFromError
         arxivSearchError.value = capabilityFromError.errorMessage || capabilityFromError.summary
         allPapers.value = []
-        papers.value = []
-        totalPapers.value = 0
+        searchMarkedIds.value = []
         return
       }
       throw error
     } finally {
       loading.value = false
     }
-  }
-
-  function paginatePapers(page: number, pageSize: number) {
-    const start = (page - 1) * pageSize
-    const end = start + pageSize
-    papers.value = allPapers.value.slice(start, end)
   }
 
   async function generateUserInterestVector(): Promise<InterestVectorResult> {
@@ -398,32 +396,9 @@ export const usePaperStore = defineStore('paper', () => {
     }
   }
 
-  async function fetchPaperNotes(arxivId: string, noteType?: PaperNoteType) {
-    const result = await listPaperNotes(arxivId, noteType ? { note_type: noteType } : {})
-    return result.items
-  }
-
-  async function savePaperNote(
-    arxivId: string,
-    payload: {
-      session_id?: string
-      source_message_id?: string
-      source_turn_id?: string
-      title?: string
-      content: string
-      note_type?: PaperNoteType
-      source_chunk_ids?: string[]
-      tags?: string[]
-      include_in_profile?: boolean
-    }
-  ) {
-    const result = await createPaperNote(arxivId, payload)
-    return result.item
-  }
-
   return {
-    papers,
-    totalPapers,
+    allPapers,
+    searchMarkedIds,
     currentPaper,
     recommendations,
     labeledPapers,
@@ -438,12 +413,12 @@ export const usePaperStore = defineStore('paper', () => {
     arxivSearchCapability,
     arxivSearchError,
     recommendationsGenerating,
+    paperActionMap,
     fetchPaperById,
     fetchLabeledPapers,
     updateLabel,
     fetchStats,
     fetchArxivPapers,
-    paginatePapers,
     generateUserInterestVector,
     fetchUserInterestVector,
     fetchResearchProfile,
@@ -454,8 +429,6 @@ export const usePaperStore = defineStore('paper', () => {
     activateProfileSnapshot,
     fetchPaperActions,
     togglePaperAction,
-    fetchPaperNotes,
-    savePaperNote,
     generateRecommendations
   }
 })

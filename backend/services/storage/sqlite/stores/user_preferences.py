@@ -18,14 +18,12 @@ _STRONG_PREFERENCES: Dict[str, Dict[str, Any]] = {
     "liked": {
         "table": "user_liked_papers",
         "opposite_table": "user_disliked_papers",
-        "action_type": "like",
-        "conflicting_events": ["disliked", "not_interested"],
+        "conflicting_events": ["disliked"],
     },
     "disliked": {
         "table": "user_disliked_papers",
         "opposite_table": "user_liked_papers",
-        "action_type": "dislike",
-        "conflicting_events": ["liked", "not_interested"],
+        "conflicting_events": ["liked"],
     },
 }
 
@@ -37,7 +35,7 @@ class UserPreferenceStore(BaseSqliteStore):
     """用户论文反馈状态存储；画像事件写入通过显式依赖完成，避免重新形成万能存储对象。
 
     - 强偏好（liked/disliked）落在独立的两张表里，是推荐和画像读取的唯一权威来源；
-    - 弱行为（收藏、阅读、不感兴趣等）落在 user_paper_actions；
+    - 弱行为（目前只有已读 read）落在 user_paper_actions；
     - 每次状态变化都会同步写入/停用画像事件，保证画像重建能解释每一条信号的来源。
     """
 
@@ -101,16 +99,6 @@ class UserPreferenceStore(BaseSqliteStore):
                     f"INSERT OR IGNORE INTO {config['table']} (user_id, arxiv_id) VALUES (?, ?)",
                     (user_id, arxiv_id),
                 )
-
-                # 强偏好表是 liked/disliked 状态的唯一权威来源；历史 action 残留要清掉，
-                # 避免推荐侧同时读到两套正/负反馈。
-                cursor.execute(
-                    '''
-                    DELETE FROM user_paper_actions
-                    WHERE user_id = ? AND arxiv_id = ? AND action_type IN ('like', 'dislike', 'not_interested')
-                    ''',
-                    (user_id, arxiv_id),
-                )
                 self._deactivate_profile_events_for_paper(conn, user_id, arxiv_id, list(config["conflicting_events"]))
                 self._record_preference_profile_event(conn, user_id, arxiv_id, preference)
                 conn.commit()
@@ -136,10 +124,6 @@ class UserPreferenceStore(BaseSqliteStore):
                 removed = cursor.rowcount > 0
 
                 if removed:
-                    cursor.execute(
-                        "DELETE FROM user_paper_actions WHERE user_id = ? AND arxiv_id = ? AND action_type = ?",
-                        (user_id, arxiv_id, config["action_type"]),
-                    )
                     self._deactivate_profile_events_for_paper(conn, user_id, arxiv_id, [preference])
                     self._record_profile_signal_removed_event(conn, user_id, arxiv_id, preference)
                 conn.commit()
@@ -164,6 +148,23 @@ class UserPreferenceStore(BaseSqliteStore):
             logger.error(f"Error getting {preference} papers: {str(e)}")
             return []
 
+    def get_strong_preference_times(self, user_id: str, preference: str, arxiv_ids: List[str]) -> Dict[str, str]:
+        """返回指定论文的强偏好标记时间 {arxiv_id: created_at}，供已标记列表按页展示。"""
+        if not arxiv_ids:
+            return {}
+        table = _STRONG_PREFERENCES[preference]["table"]
+        placeholders = ",".join("?" for _ in arxiv_ids)
+        try:
+            with self._get_connection() as conn:
+                rows = conn.execute(
+                    f"SELECT arxiv_id, created_at FROM {table} WHERE user_id = ? AND arxiv_id IN ({placeholders})",
+                    (user_id, *arxiv_ids),
+                ).fetchall()
+            return {row[0]: row[1] for row in rows if row[1]}
+        except Exception as e:
+            logger.error(f"Error getting {preference} paper times: {str(e)}")
+            return {}
+
     def add_liked_paper(self, user_id: str = DEFAULT_USER_ID, arxiv_id: Optional[str] = None) -> bool:
         """标记喜欢；会同时取消该论文的“不喜欢”状态。"""
         return self._add_strong_preference(user_id, arxiv_id, "liked")
@@ -178,15 +179,20 @@ class UserPreferenceStore(BaseSqliteStore):
 
     def get_liked_papers_with_details(self, user_id: str = DEFAULT_USER_ID) -> List[Dict[str, Any]]:
         """返回喜欢列表并 JOIN 论文目录补齐展示字段；目录中缺失的论文不会出现在结果里。"""
+        return self._list_strong_preference_papers_with_details(user_id, "liked")
+
+    def _list_strong_preference_papers_with_details(self, user_id: str, preference: str) -> List[Dict[str, Any]]:
+        """按标记时间倒序返回强偏好论文详情，并带上 `{preference}_at` 标记时间供画像做时间衰减。"""
+        table = _STRONG_PREFERENCES[preference]["table"]
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT p.arxiv_id, p.title, p.abstract, p.authors, p.categories, p.published_date
-                    FROM user_liked_papers ulp
-                    JOIN arxiv_papers p ON ulp.arxiv_id = p.arxiv_id
-                    WHERE ulp.user_id = ?
-                    ORDER BY ulp.created_at DESC
+                cursor.execute(f'''
+                    SELECT p.arxiv_id, p.title, p.abstract, p.authors, p.categories, p.published_date, pref.created_at
+                    FROM {table} pref
+                    JOIN arxiv_papers p ON pref.arxiv_id = p.arxiv_id
+                    WHERE pref.user_id = ?
+                    ORDER BY pref.created_at DESC
                 ''', (user_id,))
 
                 results = []
@@ -197,11 +203,12 @@ class UserPreferenceStore(BaseSqliteStore):
                         'abstract': row[2],
                         'authors': self._deserialize_paper_db_value(row[3]),
                         'categories': self._deserialize_paper_db_value(row[4]),
-                        'published_date': row[5]
+                        'published_date': row[5],
+                        f'{preference}_at': row[6],
                     })
                 return results
         except Exception as e:
-            logger.error(f"Error getting liked papers with details: {str(e)}")
+            logger.error(f"Error getting {preference} papers with details: {str(e)}")
             return []
 
     def add_disliked_paper(self, user_id: str = DEFAULT_USER_ID, arxiv_id: Optional[str] = None) -> bool:
@@ -215,6 +222,10 @@ class UserPreferenceStore(BaseSqliteStore):
     def get_disliked_papers(self, user_id: str = DEFAULT_USER_ID) -> List[str]:
         """按标记时间倒序返回用户不喜欢的论文 ID。"""
         return self._list_strong_preference_ids(user_id, "disliked")
+
+    def get_disliked_papers_with_details(self, user_id: str = DEFAULT_USER_ID) -> List[Dict[str, Any]]:
+        """返回不喜欢列表并 JOIN 论文目录补齐展示字段，带 `disliked_at` 标记时间。"""
+        return self._list_strong_preference_papers_with_details(user_id, "disliked")
 
     def get_user_preferences(self, user_id: str = DEFAULT_USER_ID) -> Dict[str, Any]:
         """聚合用户的强偏好、弱行为和研究画像；任一读取失败时返回结构完整的空结果。"""
@@ -246,7 +257,7 @@ class UserPreferenceStore(BaseSqliteStore):
         action_type: str = "",
         metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """记录一条弱行为（收藏、阅读等），同一 (用户, 论文, 行为) 重复写入只更新 metadata。
+        """记录一条弱行为（目前只有已读 read），同一 (用户, 论文, 行为) 重复写入只更新 metadata。
 
         like/dislike 这类显式偏好必须走 add_liked_paper/add_disliked_paper，这里会直接拒绝。
         """

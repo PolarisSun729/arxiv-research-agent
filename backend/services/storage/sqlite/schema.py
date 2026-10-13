@@ -1,5 +1,5 @@
 from services.storage.sqlite.connection import SqliteConnectionProvider
-from services.storage.sqlite.shared import DEFAULT_USER_ID, logger
+from services.storage.sqlite.shared import DEFAULT_USER_ID, logger, sql_placeholders
 
 
 class StorageSchemaMigrator:
@@ -257,7 +257,6 @@ class StorageSchemaMigrator:
                     action_strength REAL DEFAULT 0,
                     source TEXT,
                     arxiv_id TEXT,
-                    note_id TEXT,
                     session_id TEXT,
                     payload_json TEXT,
                     metadata_json TEXT,
@@ -364,26 +363,6 @@ class StorageSchemaMigrator:
                     profile_build_version TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            cursor.execute(f'''
-                CREATE TABLE IF NOT EXISTS paper_notes (
-                    note_id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL DEFAULT '{default_user_id_sql}',
-                    arxiv_id TEXT NOT NULL,
-                    session_id TEXT,
-                    source_message_id TEXT,
-                    title TEXT,
-                    content TEXT,
-                    note_type TEXT DEFAULT 'custom',
-                    source_chunk_ids TEXT,
-                    tags TEXT,
-                    include_in_profile INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(arxiv_id) REFERENCES arxiv_papers(arxiv_id),
-                    FOREIGN KEY(session_id) REFERENCES paper_chat_sessions(session_id) ON DELETE SET NULL
                 )
             ''')
 
@@ -654,16 +633,6 @@ class StorageSchemaMigrator:
             ''')
 
             cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_paper_notes_user_paper_updated
-                ON paper_notes(user_id, arxiv_id, updated_at DESC)
-            ''')
-
-            cursor.execute('''
-                CREATE INDEX IF NOT EXISTS idx_paper_notes_session_message
-                ON paper_notes(session_id, source_message_id)
-            ''')
-
-            cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_agent_sessions_user_updated
                 ON agent_sessions(user_id, updated_at DESC)
             ''')
@@ -713,6 +682,25 @@ class StorageSchemaMigrator:
                 ON langgraph_checkpoints(thread_id, checkpoint_ns, updated_at DESC)
             ''')
 
+            self._drop_retired_paper_signals(cursor)
+
             conn.commit()
             logger.info("Database tables initialized successfully")
+
+    @staticmethod
+    def _drop_retired_paper_signals(cursor) -> None:
+        """清理已下线信号在旧库里留下的表、列和数据；每条语句都幂等，可在每次启动时执行。
+
+        论文笔记功能整体下线；弱行为只保留 read，favorite/later/archived/not_interested 没有入口，
+        like/dislike 早已改由强偏好表维护，这些残留行会被推荐和画像误读成用户信号。
+        """
+        retired_actions = ("like", "dislike", "favorite", "later", "archived", "not_interested", "note_saved")
+        cursor.execute("DROP TABLE IF EXISTS paper_notes")
+        cursor.execute(f"DELETE FROM user_paper_actions WHERE action_type IN ({sql_placeholders(retired_actions)})", retired_actions)
+        retired_events = ("favorite", "later", "archived", "not_interested", "note_saved")
+        retired_event_types = (*retired_events, *(f"{item}_removed" for item in retired_events))
+        cursor.execute(f"DELETE FROM user_profile_events WHERE event_type IN ({sql_placeholders(retired_event_types)})", retired_event_types)
+        event_columns = {row[1] for row in cursor.execute("PRAGMA table_info(user_profile_events)").fetchall()}
+        if "note_id" in event_columns:
+            cursor.execute("ALTER TABLE user_profile_events DROP COLUMN note_id")
 

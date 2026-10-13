@@ -96,7 +96,6 @@ class _FakeVectorStoreService:
 class _FakeQaStorage:
     def __init__(self) -> None:
         self.sessions = {}
-        self.notes = {}
         self.latest_job = {
             "job_id": "job-1",
             "arxiv_id": "2401.00001",
@@ -154,46 +153,6 @@ class _FakeQaStorage:
         self.sessions[session_id] = item
         return dict(item)
 
-    def list_paper_notes(self, arxiv_id: str, user_id: str, note_type=None):
-        items = [item for item in self.notes.values() if item["arxiv_id"] == arxiv_id and item["user_id"] == user_id]
-        if note_type:
-            items = [item for item in items if item.get("note_type") == note_type]
-        return items
-
-    def create_paper_note(self, **kwargs):
-        note_id = f"note-{len(self.notes) + 1}"
-        item = {
-            "note_id": note_id,
-            "user_id": kwargs["user_id"],
-            "arxiv_id": kwargs["arxiv_id"],
-            "session_id": kwargs.get("session_id"),
-            "source_message_id": kwargs.get("source_message_id"),
-            "title": kwargs.get("title") or "",
-            "content": kwargs.get("content") or "",
-            "note_type": kwargs.get("note_type") or "custom",
-            "source_chunk_ids": list(kwargs.get("source_chunk_ids") or []),
-            "tags": list(kwargs.get("tags") or []),
-            "include_in_profile": bool(kwargs.get("include_in_profile", False)),
-            "created_at": "2026-06-04T11:05:00",
-            "updated_at": "2026-06-04T11:05:00",
-        }
-        self.notes[note_id] = item
-        return dict(item)
-
-    def get_paper_chat_message(self, message_id: str, user_id: str = ""):
-        if message_id == "msg-1":
-            return {
-                "message_id": "msg-1",
-                "turn_id": "turn-1",
-                "sources": [{"chunk_id": "c1"}],
-            }
-        return None
-
-    def get_paper_chat_message_by_turn(self, session_id: str, turn_id: str, role: str = "assistant", user_id: str = ""):
-        if turn_id == "turn-1":
-            return {"message_id": "msg-1", "turn_id": "turn-1", "sources": [{"chunk_id": "c1"}]}
-        return None
-
 
 class QaRouterApiTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -214,8 +173,6 @@ class QaRouterApiTests(unittest.TestCase):
         for dependency in (dependencies.get_paper_chat_session_store, qa_router.get_paper_chat_session_store):
             app.dependency_overrides[dependency] = lambda: self.qa_storage
         for dependency in (dependencies.get_paper_chat_message_store, qa_router.get_paper_chat_message_store):
-            app.dependency_overrides[dependency] = lambda: self.qa_storage
-        for dependency in (dependencies.get_paper_note_store, qa_router.get_paper_note_store):
             app.dependency_overrides[dependency] = lambda: self.qa_storage
         for dependency in (dependencies.get_vector_store_service, qa_router.get_vector_store_service):
             app.dependency_overrides[dependency] = lambda: self.vector_store_service
@@ -294,33 +251,6 @@ class QaRouterApiTests(unittest.TestCase):
         self.assertIn("item", created.json())
         self.assertEqual(listed.status_code, 200)
         self.assertEqual(len(listed.json()["items"]), 1)
-
-    def test_notes_list_and_create_return_stable_items(self) -> None:
-        created = self.client.post(
-            "/api/paper/2401.00001/notes",
-            json={
-                "user_id": "u1",
-                "source_message_id": "msg-1",
-                "title": "My note",
-                "content": "Useful detail",
-                "note_type": "method",
-                "tags": ["rag"],
-            },
-        )
-        listed = self.client.get("/api/paper/2401.00001/notes", params={"user_id": "u1"})
-
-        self.assertEqual(created.status_code, 200)
-        self.assertEqual(created.json()["item"]["source_turn_id"], "turn-1")
-        self.assertEqual(listed.status_code, 200)
-        self.assertEqual(len(listed.json()["items"]), 1)
-
-    def test_create_note_returns_422_when_content_missing(self) -> None:
-        response = self.client.post(
-            "/api/paper/2401.00001/notes",
-            json={"user_id": "u1", "title": "No content"},
-        )
-
-        self.assertEqual(response.status_code, 422)
 
     def test_qa_returns_answer_payload(self) -> None:
         response = self.client.post(

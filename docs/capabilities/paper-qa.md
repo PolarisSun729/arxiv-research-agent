@@ -4,7 +4,7 @@
 
 论文 QA 以单个 `arxiv_id` 为边界：先建立该论文可检索的资产，再依据当前论文的索引、会话和用户记忆回答问题。它不能把候选论文列表直接作为最终 QA 上下文；多论文选择属于 Agent 的目标解析阶段，完成目标解析后 QA 只处理已解析的一篇论文。
 
-Router 位于 [`backend/routers/qa_router.py`](../../backend/routers/qa_router.py)，负责协议转换、异步任务提交、会话/笔记序列化和 trace 下载。核心业务分别位于 [`PaperQAService`](../../backend/services/paper_qa/paper_qa_service.py)、[`PaperQAIndexBuilder`](../../backend/services/paper_qa/paper_qa_index_builder.py) 与 [`IndexJobManager`](../../backend/services/paper_qa/index_job_manager.py)。
+Router 位于 [`backend/routers/qa_router.py`](../../backend/routers/qa_router.py)，负责协议转换、异步任务提交、会话序列化和 trace 下载。核心业务分别位于 [`PaperQAService`](../../backend/services/paper_qa/paper_qa_service.py)、[`PaperQAIndexBuilder`](../../backend/services/paper_qa/paper_qa_index_builder.py) 与 [`IndexJobManager`](../../backend/services/paper_qa/index_job_manager.py)。
 
 ## 索引构建
 
@@ -60,9 +60,9 @@ flowchart LR
 
 生产与离线 runner 使用同一评测记录契约，记录完整答案、运行成败、研究轨迹和实际调用统计。格式、重新评分和基线口径见 [生成效果评测](evaluation.md)。
 
-## 会话、笔记与画像
+## 会话与画像
 
-QA 会话和消息由 `PaperChatSessionStore`、`PaperChatMessageStore` 与 `PaperQATurnStore` 持久化。阅读笔记由 `PaperNoteStore` 管理；当 `include_in_profile` 为真时，它会形成可被画像构建消费的信号。笔记更新或删除时应验证相应 profile event 是否同步失效，避免已删除信号持续影响推荐。
+QA 会话和消息由 `PaperChatSessionStore`、`PaperChatMessageStore` 与 `PaperQATurnStore` 持久化。用户提问会写入 `qa_asked` profile event，作为画像构建的近期信号。
 
 ## 排障顺序
 

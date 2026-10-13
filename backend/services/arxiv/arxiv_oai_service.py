@@ -1728,6 +1728,14 @@ class ArxivOaiDatabaseService:
             "timestamp": datetime.now().isoformat(),
         }
 
+    def count_results(self, search_query: str = "", id_list: Optional[List[str]] = None) -> int:
+        """只返回命中总数，供放宽建议对多条候选计数。
+
+        复用 search 的解析与索引校验；按日期排序取 1 条，避免 relevance 去拉整个候选池。
+        """
+        result = self.search(search_query=search_query, id_list=id_list, max_results=1, sort_by="submittedDate")
+        return int(result["total_results"])
+
     def get_available_fields(self) -> List[Dict[str, str]]:
         """返回本地 OAI 搜索后端支持展示的字段列表。"""
         # 本地 OAI 只承诺可下推的高精度字段，避免前端展示实际无法执行的远程 API 字段。

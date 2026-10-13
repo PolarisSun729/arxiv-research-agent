@@ -9,14 +9,13 @@ import type {
   PaginatedResponse,
   ArxivSearchResult,
   ArxivSearchParams,
+  ArxivSearchSuggestions,
   PaperMaterializationPayload,
   PaperPreferenceRequest,
   InterestVector,
   InterestVectorResult,
   RecommendationResult,
   PaperActionType,
-  PaperNote,
-  PaperNoteType,
   UserPaperAction,
   UserPaperActionMap,
   UserResearchProfile,
@@ -170,6 +169,7 @@ function normalizeResearchProfile(raw: any, fallbackUserId?: string): UserResear
     canonical_negative_topics: Array.isArray(raw?.canonical_negative_topics) ? raw.canonical_negative_topics : [],
     canonical_recent_topics: Array.isArray(raw?.canonical_recent_topics) ? raw.canonical_recent_topics : [],
     topic_evidence: raw?.topic_evidence && typeof raw.topic_evidence === 'object' ? raw.topic_evidence : {},
+    manual_overrides: Array.isArray(raw?.manual_overrides) ? raw.manual_overrides : [],
     aggregation_report: raw?.aggregation_report && typeof raw.aggregation_report === 'object' ? raw.aggregation_report : {},
     review_status: raw?.review_status && typeof raw.review_status === 'object' ? raw.review_status : {},
     quality_report: raw?.quality_report && typeof raw.quality_report === 'object' ? raw.quality_report : {},
@@ -261,26 +261,6 @@ function normalizeUserPaperAction(raw: any, fallbackUserId?: string): UserPaperA
     metadata: raw?.metadata || raw?.metadata_json || {},
     created_at: raw?.created_at,
     updated_at: raw?.updated_at
-  }
-}
-
-function normalizePaperNote(raw: any, fallbackUserId?: string): PaperNote {
-  return {
-    note_id: String(raw?.note_id || ''),
-    user_id: raw?.user_id || resolveUserId(fallbackUserId),
-    arxiv_id: String(raw?.arxiv_id || ''),
-    session_id: raw?.session_id || null,
-    source_message_id: raw?.source_message_id || null,
-    source_turn_id: raw?.source_turn_id || null,
-    title: String(raw?.title || ''),
-    content: String(raw?.content || ''),
-    note_type: (raw?.note_type || 'custom') as PaperNoteType,
-    source_chunk_ids: Array.isArray(raw?.source_chunk_ids) ? raw.source_chunk_ids.map((item: any) => String(item)) : [],
-    tags: Array.isArray(raw?.tags) ? raw.tags.map((item: any) => String(item)) : [],
-    include_in_profile: Boolean(raw?.include_in_profile),
-    created_at: raw?.created_at || null,
-    updated_at: raw?.updated_at || null,
-    sources: Array.isArray(raw?.sources) ? raw.sources : []
   }
 }
 
@@ -468,6 +448,7 @@ export async function getPaperById(id: string): Promise<Paper> {
 
 export async function getLabeledPapers(params: {
   label?: 'liked' | 'disliked'
+  cluster?: string
   page: number
   pageSize: number
   userId?: string
@@ -476,6 +457,7 @@ export async function getLabeledPapers(params: {
   const response: any = await request.get(`/user/labeled-papers/${resolveUserId(params.userId)}`, {
     params: {
       label: params.label || 'all',
+      cluster: params.cluster || undefined,
       page: params.page,
       page_size: params.pageSize
     }
@@ -491,7 +473,8 @@ export async function getLabeledPapers(params: {
     return {
       ...paper,
       label: item?.label === 'disliked' ? 'disliked' as const : 'liked' as const,
-      labeledAt: new Date().toISOString()
+      // 后端返回偏好表里的真实标记时间；旧数据缺失时为 null，由页面不展示时间。
+      labeledAt: typeof item?.labeled_at === 'string' && item.labeled_at ? item.labeled_at : null
     }
   })
   return {
@@ -527,6 +510,15 @@ export async function searchArxiv(params: ArxivSearchParams): Promise<ArxivSearc
     source: response.source || null,
     queryCapability: response.query_capability || null,
     warnings: Array.isArray(response.warnings) ? response.warnings : []
+  }
+}
+
+export async function getArxivSearchSuggestions(params: ArxivSearchParams): Promise<ArxivSearchSuggestions> {
+  // 与 searchArxiv 使用相同的默认时间窗口，候选的命中数才和页面上的结果可比。
+  const response: any = await request.post('/arxiv/search/suggestions', { submitted_days_ago: 30, ...params })
+  return {
+    baseline_total: typeof response?.baseline_total === 'number' ? response.baseline_total : null,
+    suggestions: Array.isArray(response?.suggestions) ? response.suggestions : []
   }
 }
 
@@ -825,49 +817,6 @@ export interface PaperChatMessage {
   citation_warning?: string | null
   status?: string
   created_at: string
-}
-
-export interface PaperNotePayload {
-  user_id?: string
-  session_id?: string
-  source_message_id?: string
-  source_turn_id?: string
-  title?: string
-  content: string
-  note_type?: PaperNoteType
-  source_chunk_ids?: string[]
-  tags?: string[]
-  include_in_profile?: boolean
-}
-
-export async function listPaperNotes(
-  arxivId: string,
-  params: { user_id?: string; note_type?: PaperNoteType } = {}
-): Promise<{ items: PaperNote[] }> {
-  const effectiveUserId = resolveUserId(params.user_id)
-  const response: any = await request.get(`/paper/${arxivId}/notes`, {
-    params: {
-      ...params,
-      user_id: effectiveUserId
-    }
-  })
-  return {
-    items: Array.isArray(response?.items) ? response.items.map((item: any) => normalizePaperNote(item, effectiveUserId)) : []
-  }
-}
-
-export async function createPaperNote(
-  arxivId: string,
-  payload: PaperNotePayload
-): Promise<{ item: PaperNote | null }> {
-  const effectiveUserId = resolveUserId(payload.user_id)
-  const response: any = await request.post(`/paper/${arxivId}/notes`, {
-    ...payload,
-    user_id: effectiveUserId
-  })
-  return {
-    item: response?.item ? normalizePaperNote(response.item, effectiveUserId) : null
-  }
 }
 
 export interface QaConversationContextTurn {
