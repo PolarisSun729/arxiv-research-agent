@@ -1860,7 +1860,7 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
         "planner_summary": dict(planner_debug.get("planner_summary") or {}),
         "clarification_summary": dict(planner_debug.get("clarification_summary") or {}),
         "recommendation_summary": dict(planner_debug.get("recommendation_summary") or {}),
-        "debug": dict(state.debug or {}),
+        # 不携带完整 debug：它含规划矩阵和工具输出，每条事件都要整体脱敏，体积会直接拖慢整次运行。
     }
 
 

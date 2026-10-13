@@ -1536,7 +1536,7 @@ class StepExecutionResult(BaseModel):
     """单步执行器返回给上层节点的结构化结果。
 
     Executor 的新边界只负责“执行一个待执行 step”，因此必须把本步状态、输出、错误、
-    observation、下一步动作和 runtime_patch 一次性说清楚，不能再让调用方去解析内部 trace。
+    observation 和下一步动作一次性说清楚，不能再让调用方去解析内部 trace。
     """
     model_config = ConfigDict(extra="forbid")
 
@@ -1557,7 +1557,6 @@ class StepExecutionResult(BaseModel):
         "noop",
     ] = "continue"
     interaction: Optional[AgentInteraction] = None
-    runtime_patch: Dict[str, Any] = Field(default_factory=dict)
     turn_result: Optional[Any] = None
 
 class AgentTurnResult(BaseModel):
