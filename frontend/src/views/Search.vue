@@ -7,6 +7,7 @@ import { usePaperStore } from '@/stores/paperStore'
 import SearchBar from '@/components/SearchBar.vue'
 import PaperCard from '@/components/PaperCard.vue'
 import ArxivQueryCapabilityBanner from '@/components/arxiv/ArxivQueryCapabilityBanner.vue'
+import { selectSearchResults } from '@/utils/searchResults'
 
 const router = useRouter()
 const store = usePaperStore()
@@ -31,9 +32,54 @@ const currentPage = ref(1)
 const pageSize = ref(10)
 const hasCapabilityError = computed(() => store.arxivSearchCapability?.status === 'error')
 
+const HIDE_MARKED_STORAGE_KEY = 'search.hideMarked'
+
+function loadHideMarked() {
+  try {
+    return localStorage.getItem(HIDE_MARKED_STORAGE_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+// 默认展示全部；用户选过「只看未标记」后记住，下次进来仍然生效。
+const hideMarked = ref(loadHideMarked())
+// 上一次搜索时用户要的条数；后端为了过滤会多拉，展示时按它截断。
+const searchedMaxResults = ref(searchForm.value.maxResults)
+const markedIdSet = computed(() => new Set(store.searchMarkedIds))
+const searchSelection = computed(() =>
+  selectSearchResults(store.allPapers, markedIdSet.value, searchedMaxResults.value, hideMarked.value)
+)
+const visiblePapers = computed(() => searchSelection.value.items)
+const pagedPapers = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value
+  return visiblePapers.value.slice(start, start + pageSize.value)
+})
+
+function setHideMarked(value: boolean) {
+  hideMarked.value = value
+  currentPage.value = 1
+  try {
+    localStorage.setItem(HIDE_MARKED_STORAGE_KEY, value ? '1' : '0')
+  } catch {
+    // 无法持久化时只影响下次进入页面的默认值。
+  }
+}
+
+const hideMarkedModel = computed({
+  get: () => hideMarked.value,
+  set: (value: boolean) => setHideMarked(value)
+})
+
+function isMarked(paper: { id: string; arxivId?: string; label?: string | null }) {
+  // 淡化看当前状态，搜索后新标记的论文也会立即变淡，只是不会从列表里消失。
+  return Boolean(paper.label) || (store.paperActionMap.read || []).includes(paper.arxivId || paper.id)
+}
+
 async function handleSearch() {
   currentPage.value = 1
-  
+  searchedMaxResults.value = searchForm.value.maxResults
+
   let submittedDaysAgo = 30
   
   if (searchForm.value.submittedDateBefore) {
@@ -59,7 +105,7 @@ async function handleSearch() {
       sort_by: searchForm.value.sortBy,
       sort_order: searchForm.value.sortOrder,
       submitted_days_ago: submittedDaysAgo > 0 ? submittedDaysAgo : undefined
-    }, 1, pageSize.value)
+    })
   } catch (error) {
     // 本地 OAI 契约错误已在 store 内转成页面级 banner；这里只兜底未知请求失败。
     ElMessage.error(getErrorMessage(error, 'arXiv 搜索失败，请稍后重试'))
@@ -90,7 +136,6 @@ async function handleLabel(id: string, label: 'liked' | 'disliked' | null) {
 
 function handlePageChange(page: number) {
   currentPage.value = page
-  store.paginatePapers(page, pageSize.value)
 }
 </script>
 
@@ -112,8 +157,18 @@ function handlePageChange(page: number) {
     />
 
     <section class="results">
-      <div v-if="store.totalPapers > 0 && !store.loading" class="results-header">
-        <span>共 <strong>{{ store.totalPapers }}</strong> 篇论文</span>
+      <div v-if="store.allPapers.length > 0 && !store.loading" class="results-header">
+        <span>
+          共 <strong>{{ visiblePapers.length }}</strong> 篇论文
+          <template v-if="searchSelection.hiddenCount > 0">
+            · 已隐藏 {{ searchSelection.hiddenCount }} 篇已标记论文
+            <el-button link type="primary" size="small" @click="setHideMarked(false)">显示</el-button>
+          </template>
+        </span>
+        <el-radio-group v-model="hideMarkedModel" size="small">
+          <el-radio-button :value="false">全部</el-radio-button>
+          <el-radio-button :value="true">只看未标记</el-radio-button>
+        </el-radio-group>
       </div>
 
       <div v-if="store.loading" class="paper-list">
@@ -129,25 +184,32 @@ function handlePageChange(page: number) {
         </div>
       </div>
 
-      <div v-else-if="store.papers.length === 0" class="surface empty">
+      <div v-else-if="store.allPapers.length === 0" class="surface empty">
         <el-empty description="输入关键词开始搜索，或调整筛选条件" :image-size="96" />
+      </div>
+
+      <div v-else-if="visiblePapers.length === 0" class="surface empty">
+        <el-empty description="这次搜到的论文都已标记过" :image-size="96">
+          <el-button @click="setHideMarked(false)">显示全部</el-button>
+        </el-empty>
       </div>
 
       <div v-else class="paper-list">
         <PaperCard
-          v-for="paper in store.papers"
+          v-for="paper in pagedPapers"
           :key="paper.id"
           :paper="paper"
+          :class="{ 'is-marked': isMarked(paper) }"
           @view-detail="handleViewDetail"
           @label="handleLabel"
         />
       </div>
 
-      <div v-if="store.totalPapers > pageSize" class="pagination">
+      <div v-if="visiblePapers.length > pageSize" class="pagination">
         <el-pagination
           :current-page="currentPage"
           :page-size="pageSize"
-          :total="store.totalPapers"
+          :total="visiblePapers.length"
           background
           layout="prev, pager, next, jumper"
           @current-change="handlePageChange"
@@ -171,6 +233,11 @@ function handlePageChange(page: number) {
 }
 
 .results-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
   margin-bottom: 12px;
   font-size: 13px;
   color: var(--color-text-3);
@@ -184,6 +251,17 @@ function handlePageChange(page: number) {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+/* 已标记的论文仍保留在结果里，只是淡化，方便扫过时跳过；悬停时恢复，避免影响阅读和操作。 */
+.paper-list .is-marked {
+  opacity: 0.6;
+  transition: opacity 0.15s ease;
+}
+
+.paper-list .is-marked:hover,
+.paper-list .is-marked:focus-within {
+  opacity: 1;
 }
 
 .skeleton-card {

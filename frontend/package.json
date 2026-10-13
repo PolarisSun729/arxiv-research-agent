@@ -16,7 +16,8 @@
     "test:sse": "node tests/sse.test.mjs",
     "test:research-process": "node tests/researchProcess.test.mjs",
     "test:agent-progress": "node tests/agentRunProgress.test.mjs",
-    "test": "npm run test:errors && npm run test:user-context && npm run test:qa-stream && npm run test:agent-chat && npm run test:evidence && npm run test:answer-figures && npm run test:labeled-summary && npm run test:security && npm run test:sse && npm run test:research-process && npm run test:agent-progress",
+    "test:search-results": "node tests/searchResults.test.mjs",
+    "test": "npm run test:errors && npm run test:user-context && npm run test:qa-stream && npm run test:agent-chat && npm run test:evidence && npm run test:answer-figures && npm run test:labeled-summary && npm run test:security && npm run test:sse && npm run test:research-process && npm run test:agent-progress && npm run test:search-results",
     "preview": "vite preview"
   },
   "dependencies": {
