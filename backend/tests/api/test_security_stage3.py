@@ -531,7 +531,8 @@ def test_bare_jwt_redaction_in_diagnostics(app):
     assert token not in output and "REDACTED" in output
 
 
-@pytest.mark.parametrize("name", ["OPENAI_API_KEY", "QWEN_API_KEY", "DEEPSEEK_API_KEY", "BACKEND_API_KEYS"])
+# provider 的 *_API_KEY 名称共用同一后缀匹配分支；保留一个 provider 和共享密钥各一例。
+@pytest.mark.parametrize("name", ["OPENAI_API_KEY", "BACKEND_API_KEYS"])
 def test_jwt_signing_secret_cannot_reuse_any_provider_or_shared_key(app_factory, monkeypatch, name):
     monkeypatch.setenv(name, f" {TEST_SECRET} " if name == "BACKEND_API_KEYS" else TEST_SECRET)
     with pytest.raises(RuntimeError):
