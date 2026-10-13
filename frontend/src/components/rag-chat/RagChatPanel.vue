@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { BubbleList, Prompts, Thinking, Welcome, XSender } from 'vue-element-plus-x'
 import type { PromptsItemsProps } from 'vue-element-plus-x/types/Prompts'
 import type { RetrievalDebug } from '@/api/papers'
@@ -83,6 +83,24 @@ const bubbleMessages = computed<RagChatPanelMessage[]>(() =>
 
 const hasMessages = computed(() => bubbleMessages.value.length > 0)
 
+// 矮屏下回答区按 100vh 扣掉固定区域后只剩一两行：已有对话时把快捷问题收成一行按钮，
+// 回答区再保底一个可读高度（页面整体滚动即可看到输入框）。
+const COMPACT_VIEWPORT_HEIGHT = 760
+const viewportHeight = ref(typeof window === 'undefined' ? 900 : window.innerHeight)
+const promptsExpanded = ref(false)
+const compactPrompts = computed(() => hasMessages.value && viewportHeight.value < COMPACT_VIEWPORT_HEIGHT)
+const bubbleListMaxHeight = computed(() => {
+  if (!hasMessages.value) return '420px'
+  return compactPrompts.value && !promptsExpanded.value ? 'max(calc(100vh - 300px), 300px)' : 'max(calc(100vh - 360px), 300px)'
+})
+
+function syncViewportHeight() {
+  viewportHeight.value = window.innerHeight
+}
+
+onMounted(() => window.addEventListener('resize', syncViewportHeight))
+onBeforeUnmount(() => window.removeEventListener('resize', syncViewportHeight))
+
 watch(
   () => props.senderText,
   value => {
@@ -128,6 +146,7 @@ function handlePromptSelect(item: PromptsItemsProps) {
   senderRef.value?.setText(prompt)
   emit('update:senderText', prompt)
   emit('select-prompt', prompt)
+  promptsExpanded.value = false
 }
 
 function getAssistantStatusLabel(item: RagChatPanelMessage) {
@@ -174,10 +193,21 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
         :description="description || '使用自然语言输入你的搜索需求，系统会在对话中返回结果。'"
       />
 
+      <button
+        v-if="promptItems.length && compactPrompts"
+        type="button"
+        class="rag-chat-panel__prompts-toggle"
+        :aria-expanded="promptsExpanded"
+        @click="promptsExpanded = !promptsExpanded"
+      >
+        {{ promptTitle || '快捷提示' }}
+        <span class="rag-chat-panel__prompts-chevron" :class="{ 'rag-chat-panel__prompts-chevron--open': promptsExpanded }" />
+      </button>
+
       <Prompts
-        v-if="promptItems.length"
+        v-if="promptItems.length && (!compactPrompts || promptsExpanded)"
         class="rag-chat-panel__prompts"
-        :title="promptTitle || '快捷提示'"
+        :title="compactPrompts ? undefined : promptTitle || '快捷提示'"
         :items="promptItems"
         :wrap="true"
         @itemClick="handlePromptSelect"
@@ -190,7 +220,7 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
         :always-show-scrollbar="true"
         :show-back-button="true"
         :item-key="'id'"
-        :max-height="hasMessages ? 'calc(100vh - 360px)' : '420px'"
+        :max-height="bubbleListMaxHeight"
       >
         <template #header="{ item }">
           <div class="rag-chat-panel__message-label">
@@ -303,6 +333,39 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 
 .rag-chat-panel__prompts {
   flex: none;
+}
+
+.rag-chat-panel__prompts-toggle {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 8px;
+  padding: 4px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.9);
+  color: #64748b;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.rag-chat-panel__prompts-toggle:hover {
+  color: #2563eb;
+  border-color: rgba(37, 99, 235, 0.3);
+}
+
+.rag-chat-panel__prompts-chevron {
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: translateY(-2px) rotate(45deg);
+  transition: transform 0.2s;
+}
+
+.rag-chat-panel__prompts-chevron--open {
+  transform: translateY(1px) rotate(-135deg);
 }
 
 .rag-chat-panel__bubble-list {
