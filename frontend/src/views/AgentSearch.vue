@@ -59,6 +59,8 @@ const quickPrompts = [
 
 onMounted(async () => {
   void store.fetchResearchProfile()
+  // 结果卡片上的「已读」读取行为表，进入页面先加载一次。
+  store.fetchPaperActions().catch(() => undefined)
   // 新页面从空会话开始；只有当前页面产生 session 后，才查询该会话自己的后台任务。
   await startWorkContinuationPolling()
 })

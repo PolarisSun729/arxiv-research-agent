@@ -9,7 +9,6 @@ import type {
   InterestVectorResult,
   RecommendationResult,
   PaperActionType,
-  PaperNoteType,
   UserPaperActionMap,
   UserResearchProfile,
   UserResearchProfileDetail,
@@ -37,9 +36,7 @@ import {
   activateUserResearchProfileSnapshot,
   getUserPaperActions,
   recordPaperAction,
-  removePaperAction,
-  listPaperNotes,
-  createPaperNote
+  removePaperAction
 } from '@/api/papers'
 import { useUserContext } from '@/composables/useUserContext'
 import {
@@ -172,8 +169,13 @@ export const usePaperStore = defineStore('paper', () => {
   async function fetchPaperById(id: string) {
     loading.value = true
     try {
-      currentPaper.value = await getPaperById(id)
+      // 详情接口不带用户偏好，这里同时取偏好表，让详情页的感兴趣/不感兴趣与列表卡片显示一致。
+      const [paper, preferences] = await Promise.all([getPaperById(id), getUserPreferences().catch(() => null)])
+      currentPaper.value = paper
       if (currentPaper.value) {
+        if (preferences) {
+          applyPreferenceLabels([currentPaper.value], preferences.liked_papers || [], preferences.disliked_papers || [])
+        }
         currentPaper.value.paperActions = buildPaperActions(currentPaper.value.arxivId || currentPaper.value.id)
       }
       return currentPaper.value
@@ -184,6 +186,7 @@ export const usePaperStore = defineStore('paper', () => {
 
   async function fetchLabeledPapers(params: {
     label?: 'liked' | 'disliked'
+    cluster?: string
     page: number
     pageSize: number
   }) {
@@ -198,7 +201,8 @@ export const usePaperStore = defineStore('paper', () => {
   }
 
   async function updateLabel(id: string, label: 'liked' | 'disliked' | null) {
-    const paper = [...papers.value, ...recommendations.value, ...allPapers.value]
+    // 详情页的论文只在 currentPaper 里，也要能被找到，否则详情页无法标记偏好。
+    const paper = [...papers.value, ...recommendations.value, ...allPapers.value, ...(currentPaper.value ? [currentPaper.value] : [])]
       .find(item => item.id === id || item.arxivId === id)
     if (!paper) {
       throw new Error('Paper not found')
@@ -215,12 +219,6 @@ export const usePaperStore = defineStore('paper', () => {
       await likePaper(paper)
     } else {
       await dislikePaper(paper)
-    }
-
-    if (label === 'liked' || label === 'disliked') {
-      const targetPaperId = paper.arxivId || paper.id
-      // 显式偏好不再写入 paperActionMap；这里只同步清理与强偏好冲突的弱负反馈。
-      paperActionMap.value.not_interested = (paperActionMap.value.not_interested || []).filter((item: string) => item !== targetPaperId)
     }
 
     if (currentPaper.value?.id === id) {
@@ -398,29 +396,6 @@ export const usePaperStore = defineStore('paper', () => {
     }
   }
 
-  async function fetchPaperNotes(arxivId: string, noteType?: PaperNoteType) {
-    const result = await listPaperNotes(arxivId, noteType ? { note_type: noteType } : {})
-    return result.items
-  }
-
-  async function savePaperNote(
-    arxivId: string,
-    payload: {
-      session_id?: string
-      source_message_id?: string
-      source_turn_id?: string
-      title?: string
-      content: string
-      note_type?: PaperNoteType
-      source_chunk_ids?: string[]
-      tags?: string[]
-      include_in_profile?: boolean
-    }
-  ) {
-    const result = await createPaperNote(arxivId, payload)
-    return result.item
-  }
-
   return {
     papers,
     totalPapers,
@@ -438,6 +413,7 @@ export const usePaperStore = defineStore('paper', () => {
     arxivSearchCapability,
     arxivSearchError,
     recommendationsGenerating,
+    paperActionMap,
     fetchPaperById,
     fetchLabeledPapers,
     updateLabel,
@@ -454,8 +430,6 @@ export const usePaperStore = defineStore('paper', () => {
     activateProfileSnapshot,
     fetchPaperActions,
     togglePaperAction,
-    fetchPaperNotes,
-    savePaperNote,
     generateRecommendations
   }
 })

@@ -2,7 +2,6 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { PaperNoteType } from '@/types/paper'
 import {
   ArrowLeft,
   ChatDotRound,
@@ -132,13 +131,6 @@ const qaStageText = computed(() => {
 })
 const currentPaperActions = computed(() => store.currentPaper?.paperActions || {})
 const preferredAnswerStyle = computed(() => store.researchProfile?.preferred_answer_style || '')
-const notesLoading = ref(false)
-const activeNoteTypeFilter = ref<PaperNoteType | 'all'>('all')
-
-const currentSessionId = computed(() => {
-  const session = currentSession.value as any
-  return String(session?.session_id || session?.sessionId || '').trim()
-})
 
 let qaJobPollTimer: number | null = null
 
@@ -148,57 +140,6 @@ function formatDate(dateStr: string) {
     month: 'long',
     day: 'numeric'
   })
-}
-
-function normalizeChunkIds(sources: Array<any> = []) {
-  return Array.from(
-    new Set(
-      sources
-        .map(source => String(source?.parent_chunk_id || '').trim())
-        .filter(Boolean)
-    )
-  )
-}
-
-async function fetchPaperNotes() {
-  if (!paperId.value) return []
-  notesLoading.value = true
-  try {
-    return await store.fetchPaperNotes(
-      paperId.value,
-      activeNoteTypeFilter.value === 'all' ? undefined : activeNoteTypeFilter.value
-    )
-  } finally {
-    notesLoading.value = false
-  }
-}
-
-async function openAssistantNoteDialog(item: { content?: string; turnId?: string; sources?: Array<any> }) {
-  if (!store.currentPaper || !paperId.value) return
-
-  const content = String(item.content || '').trim()
-  if (!content) {
-    ElMessage.warning('当前回答没有可保存的内容')
-    return
-  }
-
-  try {
-    await store.savePaperNote(paperId.value, {
-      title: content.slice(0, 24) || '对话笔记',
-      content,
-      note_type: 'summary',
-      include_in_profile: false,
-      source_chunk_ids: normalizeChunkIds(item.sources || []),
-      session_id: currentSessionId.value || undefined,
-      source_turn_id: item.turnId || undefined
-    })
-    if (store.currentPaper && !currentPaperActions.value.note_saved) {
-      await store.togglePaperAction(store.currentPaper, 'note_saved', true).catch(() => undefined)
-    }
-    ElMessage.success('笔记已保存')
-  } catch (error: any) {
-    ElMessage.error(error?.response?.data?.detail || '保存笔记失败')
-  }
 }
 
 function getTraceFileName(pathValue?: string) {
@@ -277,19 +218,26 @@ function handleCitationSelect(item: any, sourceId: string) {
   revealSideEvidence(false)
 }
 
-async function handleTogglePaperAction(actionType: 'read' | 'not_interested' | 'note_saved') {
+async function handleToggleRead() {
   if (!store.currentPaper) return
   try {
-    const enabled = !currentPaperActions.value[actionType]
-    await store.togglePaperAction(store.currentPaper, actionType, enabled)
-    const actionLabels: Record<string, string> = {
-      read: '已读',
-      not_interested: '不感兴趣',
-      note_saved: '已记笔记'
-    }
-    ElMessage.success(`${enabled ? '已添加' : '已取消'}${actionLabels[actionType]}`)
+    const enabled = !currentPaperActions.value.read
+    await store.togglePaperAction(store.currentPaper, 'read', enabled)
+    ElMessage.success(enabled ? '已标记已读' : '已取消已读')
   } catch (error: any) {
     ElMessage.error(error?.response?.data?.detail || '操作失败')
+  }
+}
+
+// 与列表卡片共用 like/dislike 偏好；再次点击已选中的标记即取消。
+async function handleToggleLabel(label: 'liked' | 'disliked') {
+  if (!store.currentPaper) return
+  const next = store.currentPaper.label === label ? null : label
+  try {
+    await store.updateLabel(store.currentPaper.id, next)
+    ElMessage.success(next === null ? '已取消标记' : `已标记为${next === 'liked' ? '感兴趣' : '不感兴趣'}`)
+  } catch {
+    ElMessage.error('偏好保存失败')
   }
 }
 
@@ -514,7 +462,6 @@ onMounted(async () => {
     await store.fetchPaperById(paperId.value)
     await fetchQaStatus()
     await resumeLatestQaJobPolling()
-    await fetchPaperNotes()
     await loadRecentSession()
   } catch (error) {
     console.error('Failed to fetch paper:', error)
@@ -538,7 +485,6 @@ watch(paperId, async () => {
     await store.fetchPaperById(paperId.value)
     await fetchQaStatus()
     await resumeLatestQaJobPolling()
-    await fetchPaperNotes()
     resetChat()
     await loadRecentSession()
   } catch (error) {
@@ -547,16 +493,6 @@ watch(paperId, async () => {
     loading.value = false
   }
 })
-
-watch(activeNoteTypeFilter, async () => {
-  if (loading.value) return
-  try {
-    await fetchPaperNotes()
-  } catch (error) {
-    console.error('Failed to filter paper notes:', error)
-  }
-})
-
 </script>
 
 <template>
@@ -656,14 +592,14 @@ watch(activeNoteTypeFilter, async () => {
           <div class="aside-block">
             <div class="aside-label"><span>我的标记</span></div>
             <div class="action-toggles">
-              <button type="button" :class="['toggle', { 'is-on': currentPaperActions.read, 'toggle--success': true }]" @click="handleTogglePaperAction('read')">
+              <button type="button" :class="['toggle', { 'is-on': store.currentPaper.label === 'liked', 'toggle--success': true }]" @click="handleToggleLabel('liked')">
+                感兴趣
+              </button>
+              <button type="button" :class="['toggle', { 'is-on': currentPaperActions.read, 'toggle--primary': true }]" @click="handleToggleRead">
                 {{ currentPaperActions.read ? '已读' : '标记已读' }}
               </button>
-              <button type="button" :class="['toggle', { 'is-on': currentPaperActions.note_saved, 'toggle--primary': true }]" @click="handleTogglePaperAction('note_saved')">
-                {{ currentPaperActions.note_saved ? '已记笔记' : '记录笔记' }}
-              </button>
-              <button type="button" :class="['toggle', { 'is-on': currentPaperActions.not_interested, 'toggle--danger': true }]" @click="handleTogglePaperAction('not_interested')">
-                {{ currentPaperActions.not_interested ? '已标记不感兴趣' : '不感兴趣' }}
+              <button type="button" :class="['toggle', { 'is-on': store.currentPaper.label === 'disliked', 'toggle--danger': true }]" @click="handleToggleLabel('disliked')">
+                不感兴趣
               </button>
             </div>
           </div>
@@ -751,7 +687,6 @@ watch(activeNoteTypeFilter, async () => {
                     查看来源与调试
                   </el-button>
                   <el-button size="small" text @click="copyAssistantAnswer(item)">复制回答</el-button>
-                  <el-button size="small" text type="success" @click="openAssistantNoteDialog(item)">保存为笔记</el-button>
                 </div>
               </div>
             </template>

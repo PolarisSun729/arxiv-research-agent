@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Refresh, Star, View, Plus, Check, Close, ArrowRight } from '@element-plus/icons-vue'
+import { Refresh, Star, View, Plus, Check, Close, ArrowRight, Loading } from '@element-plus/icons-vue'
 import { usePaperStore } from '@/stores/paperStore'
 import type { ProfileSnapshotSummary, ProfileTopicEvidence, ProfileTopicZone, UserResearchProfile } from '@/types/paper'
 import { useUserContext } from '@/composables/useUserContext'
@@ -148,8 +148,22 @@ const jobTone = computed(() => {
   return 'primary'
 })
 
+const loadingDetail = ref(false)
+const loadError = ref('')
+
 async function loadDetail() {
-  await store.fetchResearchProfileDetail()
+  loadingDetail.value = true
+  loadError.value = ''
+  try {
+    await store.fetchResearchProfileDetail()
+  } catch {
+    loadError.value = '无法获取研究画像，请确认后端服务已启动后重试'
+    // 已有旧数据时保留页面内容，只提示刷新失败；首次加载失败由模板展示错误态。
+    if (detail.value) ElMessage.error('刷新研究画像失败')
+    return
+  } finally {
+    loadingDetail.value = false
+  }
   syncManualForm()
   // 构建中途离开或刷新页面后重新进入时，接上未结束 job 的轮询，避免进度停在加载时的快照。
   const job = store.latestProfileBuildJob
@@ -375,7 +389,7 @@ onUnmounted(() => {
         <p class="page-desc">系统根据你的阅读与标记行为自动生成画像，你可以手动修正。推荐、Agent 和论文问答都读取「最终生效画像」。</p>
       </div>
       <div class="page-actions">
-        <el-button :icon="Refresh" @click="loadDetail">刷新</el-button>
+        <el-button :icon="Refresh" :loading="loadingDetail" @click="loadDetail">{{ loadingDetail ? '加载中' : '刷新' }}</el-button>
         <el-button v-if="canResearch" type="primary" :loading="rebuilding" @click="handleRebuild">重新生成画像</el-button>
       </div>
     </header>
@@ -417,6 +431,30 @@ onUnmounted(() => {
       <div v-if="latestJob.error_message" class="notice notice--danger">{{ latestJob.error_message }}</div>
     </section>
 
+    <!-- 首次加载还没有任何数据时用骨架屏占位，避免先闪出一整页「暂无」让人误以为画像是空的。 -->
+    <div v-if="!detail && loadingDetail" class="profile-loading" aria-busy="true">
+      <div class="grid grid--main">
+        <section class="surface panel">
+          <p class="loading-tip"><el-icon class="is-loading"><Loading /></el-icon>正在加载研究画像…</p>
+          <el-skeleton :rows="5" animated />
+        </section>
+        <section class="surface panel"><el-skeleton :rows="5" animated /></section>
+      </div>
+      <div class="grid grid--half">
+        <section class="surface panel"><el-skeleton :rows="6" animated /></section>
+        <section class="surface panel"><el-skeleton :rows="6" animated /></section>
+      </div>
+    </div>
+
+    <section v-else-if="!detail && loadError" class="surface panel load-error">
+      <el-result icon="error" title="研究画像加载失败" :sub-title="loadError">
+        <template #extra>
+          <el-button type="primary" :icon="Refresh" @click="loadDetail">重试</el-button>
+        </template>
+      </el-result>
+    </section>
+
+    <div v-else :class="['profile-content', { 'is-refreshing': loadingDetail }]" :aria-busy="loadingDetail">
     <div class="grid grid--main">
       <section class="surface panel">
         <header class="panel-head">
@@ -709,6 +747,7 @@ onUnmounted(() => {
       </div>
       <p v-else class="empty-text">暂无构建记录</p>
     </section>
+    </div>
   </div>
 </template>
 
@@ -761,6 +800,29 @@ onUnmounted(() => {
   font-size: 12px;
   color: var(--color-text-3);
   font-family: var(--font-mono);
+}
+
+.loading-tip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 13px;
+  color: var(--color-text-3);
+}
+
+.load-error {
+  margin-bottom: 16px;
+}
+
+/* 刷新已有数据时保留内容，只降低透明度并屏蔽点击，避免操作到即将被替换的旧数据。 */
+.profile-content {
+  transition: opacity 0.15s ease;
+}
+
+.profile-content.is-refreshing {
+  opacity: 0.55;
+  pointer-events: none;
 }
 
 .grid {

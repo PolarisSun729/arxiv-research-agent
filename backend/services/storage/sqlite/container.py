@@ -10,7 +10,6 @@ from services.storage.sqlite.stores import (
     PaperCatalogStore,
     PaperChatMessageStore,
     PaperChatSessionStore,
-    PaperNoteStore,
     PaperProfileEvidenceStore,
     PaperQAIndexStore,
     PaperQATurnStore,
@@ -63,7 +62,6 @@ class StorageContainer:
             self.paper_chat_sessions,
             self.profile_events,
         )
-        self.paper_notes = PaperNoteStore(self.connection_provider, self.profile_events)
         self.agent_sessions = AgentSessionStore(self.connection_provider)
         self.agent_runtime_checkpoints = AgentRuntimeCheckpointStore(self.connection_provider)
         self.agent_work = AgentWorkStore(self.connection_provider)

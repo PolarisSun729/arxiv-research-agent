@@ -24,7 +24,6 @@ from services.storage.sqlite.stores import (
     PaperCatalogStore,
     PaperChatMessageStore,
     PaperChatSessionStore,
-    PaperNoteStore,
     PaperProfileEvidenceStore,
     ProfileBuildJobStore,
     ProfileEventStore,
@@ -57,8 +56,8 @@ PROFILE_BUILD_DEFAULT_PAPER_LIMITS = {
     "full": 1000,
     "repair": 80,
 }
-PROFILE_STRONG_EVENT_TYPES = {"liked", "disliked", "favorite", "later", "note_saved", "qa_asked", "not_interested"}
-PROFILE_RECENT_CONTEXT_EVENT_TYPES = {"liked", "disliked", "favorite", "later", "note_saved", "qa_asked"}
+PROFILE_STRONG_EVENT_TYPES = {"liked", "disliked", "qa_asked"}
+PROFILE_RECENT_CONTEXT_EVENT_TYPES = {"liked", "disliked", "qa_asked"}
 
 
 class MemoryService:
@@ -73,7 +72,6 @@ class MemoryService:
         paper_profile_evidence_store: PaperProfileEvidenceStore,
         paper_chat_session_store: PaperChatSessionStore,
         paper_chat_message_store: PaperChatMessageStore,
-        paper_note_store: PaperNoteStore,
         profile_event_store: ProfileEventStore,
         profile_build_job_store: ProfileBuildJobStore,
         research_profile_store: ResearchProfileStore,
@@ -88,7 +86,6 @@ class MemoryService:
         self.paper_profile_evidence_store = paper_profile_evidence_store
         self.paper_chat_session_store = paper_chat_session_store
         self.paper_chat_message_store = paper_chat_message_store
-        self.paper_note_store = paper_note_store
         self.profile_event_store = profile_event_store
         self.profile_build_job_store = profile_build_job_store
         self.research_profile_store = research_profile_store
@@ -917,7 +914,6 @@ class MemoryService:
         extra_liked_papers: Optional[List[Dict[str, Any]]] = None,
         extra_disliked_papers: Optional[List[Dict[str, Any]]] = None,
         extra_recent_actions: Optional[List[Dict[str, Any]]] = None,
-        extra_notes: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """从画像事件流和当前强偏好表收集构建证据，避免已消费事件导致权威偏好丢失。"""
         build_mode = self._normalize_profile_build_mode(build_mode)
@@ -952,7 +948,6 @@ class MemoryService:
         liked_papers: List[Dict[str, Any]] = []
         disliked_papers: List[Dict[str, Any]] = []
         recent_actions: List[Dict[str, Any]] = []
-        notes: List[Dict[str, Any]] = []
         event_ids: List[str] = []
 
         for event in events:
@@ -983,25 +978,15 @@ class MemoryService:
                 disliked_papers.append(enriched_paper)
                 recent_actions.append({"arxiv_id": arxiv_id, "action_type": "disliked", "paper": enriched_paper, "_profile_event": event})
                 continue
-            if event_type in {"favorite", "later", "read", "not_interested", "qa_asked"}:
+            if event_type in {"read", "qa_asked"}:
                 if paper:
                     recent_actions.append({"arxiv_id": arxiv_id, "action_type": event_type, "paper": enriched_paper, "_profile_event": event})
                 continue
-            if event_type == "note_saved":
-                note_id = str(event.get("note_id") or "").strip()
-                if note_id:
-                    # 笔记已删除或已取消纳入画像时跳过：这类残留事件可能来自撤销逻辑上线前的历史数据。
-                    note = self.paper_note_store.get_paper_note(note_id, user_id=user_id)
-                    if note and note.get("include_in_profile"):
-                        notes.append({**note, "_profile_event": event, "_profile_card_candidate": is_selected})
-                elif paper:
-                    recent_actions.append({"arxiv_id": arxiv_id, "action_type": "note_saved", "paper": enriched_paper, "_profile_event": event})
 
         # 兼容单元测试或显式调用传入的即时证据，但正式重建仍以事件流为主证据。
         liked_papers = self._dedupe_papers([*liked_papers, *(extra_liked_papers or [])])
         disliked_papers = self._dedupe_papers([*disliked_papers, *(extra_disliked_papers or [])])
         recent_actions.extend(extra_recent_actions or [])
-        notes.extend(extra_notes or [])
 
         # liked/disliked 表是当前强偏好的权威状态；事件可能已被上次构建消费，但推荐和画像仍应看到当前偏好。
         # 偏好表论文带 liked_at/disliked_at，是没有事件时的时间来源；它们始终允许补生成证据卡，与旧行为一致。
@@ -1013,8 +998,7 @@ class MemoryService:
         )
 
         if not events:
-            # 仅作为旧数据兜底：没有任何事件时回退弱行为和笔记表，避免升级后空库导致画像突然清零。
-            notes.extend(self.paper_note_store.list_user_profile_notes(user_id=user_id))
+            # 仅作为旧数据兜底：没有任何事件时回退弱行为表，避免升级后空库导致画像突然清零。
             for action in self.user_preference_store.get_user_paper_actions(user_id=user_id):
                 if not isinstance(action, dict):
                     continue
@@ -1028,7 +1012,6 @@ class MemoryService:
             "liked_papers": liked_papers,
             "disliked_papers": disliked_papers,
             "recent_actions": recent_actions,
-            "notes": notes,
             "profile_events": events,
             "profile_event_ids": [event_id for event_id in event_ids if event_id],
             "build_mode": build_mode,
@@ -1070,7 +1053,6 @@ class MemoryService:
             "liked_paper_count": len(evidence.get("liked_papers") or []),
             "disliked_paper_count": len(evidence.get("disliked_papers") or []),
             "recent_action_count": len(evidence.get("recent_actions") or []),
-            "profile_note_count": len(evidence.get("notes") or []),
             "liked_paper_ids": _paper_ids(evidence.get("liked_papers")),
             "disliked_paper_ids": _paper_ids(evidence.get("disliked_papers")),
             "action_counts": action_counts,
@@ -1295,7 +1277,6 @@ class MemoryService:
                 evidence_summary.get("liked_paper_count")
                 or evidence_summary.get("disliked_paper_count")
                 or evidence_summary.get("recent_action_count")
-                or evidence_summary.get("profile_note_count")
             ),
             "behavior_profile_gating": evidence_summary.get("behavior_profile_gating") or {},
         }
@@ -1390,23 +1371,7 @@ class MemoryService:
                 for action in evidence.get("recent_actions") or []
                 if isinstance(action, dict) and isinstance(action.get("paper"), dict)
             ],
-            *[self._note_paper_ref(note) for note in evidence.get("notes") or [] if isinstance(note, dict)],
         ]
-
-    def _note_paper_ref(self, note: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """笔记对应论文只解析一次并挂在 note 上，保证回填的证据卡能被聚合器从同一个对象读到。"""
-        if isinstance(note.get("paper"), dict):
-            return note["paper"]
-        arxiv_id = str(note.get("arxiv_id") or "").strip()
-        if not arxiv_id:
-            return None
-        paper = self._resolve_paper_payload(arxiv_id)
-        if not paper:
-            return None
-        paper["_profile_action_types"] = ["note_saved"]
-        paper["_profile_card_candidate"] = bool(note.get("_profile_card_candidate", True))
-        note["paper"] = paper
-        return paper
 
     def _collect_profile_evidence_papers(self, evidence: Dict[str, Any]) -> List[Dict[str, Any]]:
         """收集本次构建实际涉及的唯一论文，后续缓存统计和逐篇进度都基于这个边界。"""
@@ -1425,7 +1390,7 @@ class MemoryService:
                 if str(item or "").strip()
             ]
             if arxiv_id in index_by_id:
-                # 同一论文可能同时出现在 liked/recent/note 引用中，合并行为类型后再判断是否允许触发 LLM。
+                # 同一论文可能同时出现在 liked/recent 引用中，合并行为类型后再判断是否允许触发 LLM。
                 existing = unique_papers[index_by_id[arxiv_id]]
                 merged_actions = set(existing.get("_profile_action_types") or [])
                 merged_actions.update(action_types)
@@ -1461,8 +1426,8 @@ class MemoryService:
         event_type = str(event.get("event_type") or event.get("action_type") or "").strip().lower()
         if event_type:
             action_types.add(event_type)
-        if action_types & {"note_saved", "qa_asked"}:
-            # 笔记和论文问答是用户额外投入的语义证据，可以补充 evidence card；是否进入长期 topic 仍由聚合门控决定。
+        if "qa_asked" in action_types:
+            # 论文问答是用户额外投入的语义证据，可以补充 evidence card；是否进入长期 topic 仍由聚合门控决定。
             return True
         stable_ids = {
             *[str(item or "").strip() for item in interest_model.get("stable_positive_paper_ids") or []],
@@ -1853,7 +1818,6 @@ class MemoryService:
         extra_liked_papers: Optional[List[Dict[str, Any]]] = None,
         extra_disliked_papers: Optional[List[Dict[str, Any]]] = None,
         extra_recent_actions: Optional[List[Dict[str, Any]]] = None,
-        extra_notes: Optional[List[Dict[str, Any]]] = None,
         existing_job_id: Optional[str] = None,
         build_mode: Optional[str] = "incremental",
         max_papers: Optional[int] = None,
@@ -1909,7 +1873,6 @@ class MemoryService:
                 extra_liked_papers=extra_liked_papers,
                 extra_disliked_papers=extra_disliked_papers,
                 extra_recent_actions=extra_recent_actions,
-                extra_notes=extra_notes,
             )
             metrics["evidence_counts"] = {
                 "total_events": int((evidence.get("event_selection") or {}).get("total_events") or 0),
@@ -1919,7 +1882,6 @@ class MemoryService:
                 "liked_papers": len(evidence.get("liked_papers") or []),
                 "disliked_papers": len(evidence.get("disliked_papers") or []),
                 "recent_actions": len(evidence.get("recent_actions") or []),
-                "notes": len(evidence.get("notes") or []),
                 "profile_events": len(evidence.get("profile_events") or []),
             }
             self._update_profile_build_job(
@@ -2063,9 +2025,9 @@ class MemoryService:
                     "representative_papers",
                 )
             )
-            no_reliable_generated_signal = successful_papers <= 0 and not has_structured_profile_signal and not (evidence.get("notes") or [])
+            no_reliable_generated_signal = successful_papers <= 0 and not has_structured_profile_signal
             if no_reliable_generated_signal:
-                # 没有任何有效 evidence card 或笔记信号时只保留 snapshot 供排查，不移动 active profile。
+                # 没有任何有效 evidence card 时只保留 snapshot 供排查，不移动 active profile。
                 quality_report["evidence_warning"] = "no_valid_paper_evidence"
                 quality_report["approved"] = False
             activate_snapshot = bool(review_result.get("approved", True)) and not no_reliable_generated_signal
@@ -2229,7 +2191,7 @@ class MemoryService:
         preference_summary = self.load_preference_summary(resolved_user_id)
         interest_vector = preference_summary.get("interest_vector") or {}
         recent_actions = self.user_preference_store.get_user_paper_actions(user_id=resolved_user_id)
-        recent_action_types = {"read", "favorite", "later", "note_saved", "not_interested"}
+        recent_action_types = {"read"}
         recent_actions_summary: Dict[str, List[str]] = {action_type: [] for action_type in sorted(recent_action_types)}
         for item in recent_actions:
             action_type = str(item.get("action_type") or "").strip()

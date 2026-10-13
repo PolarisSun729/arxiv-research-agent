@@ -113,7 +113,6 @@ def _build_memory_service(storage: StorageContainer) -> MemoryService:
         paper_profile_evidence_store=storage.paper_profile_evidence,
         paper_chat_session_store=storage.paper_chat_sessions,
         paper_chat_message_store=storage.paper_chat_messages,
-        paper_note_store=storage.paper_notes,
         profile_event_store=storage.profile_events,
         profile_build_job_store=storage.profile_build_jobs,
         research_profile_store=storage.research_profiles,

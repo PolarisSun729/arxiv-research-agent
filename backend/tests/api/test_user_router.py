@@ -13,14 +13,14 @@ class _FakeUserPreferenceStore:
             "user_id": "u1",
             "liked_papers": ["2401.00001"],
             "disliked_papers": [],
-            "paper_actions": {"favorite": ["2401.00001"]},
+            "paper_actions": {"read": ["2401.00001"]},
             "research_profile": {"preferred_answer_style": "concise"},
         }
         self.actions = [
             {
                 "user_id": "u1",
                 "arxiv_id": "2401.00001",
-                "action_type": "favorite",
+                "action_type": "read",
                 "metadata": {"source": "test"},
             }
         ]
@@ -40,7 +40,7 @@ class _FakeUserPreferenceStore:
         return list(self.actions)
 
     def get_user_paper_action_map(self, user_id: str):
-        return {"favorite": ["2401.00001"]}
+        return {"read": ["2401.00001"]}
 
     def remove_liked_paper(self, user_id: str, arxiv_id: str) -> bool:
         return True
@@ -171,7 +171,7 @@ class UserRouterApiTests(unittest.TestCase):
         self.assertEqual(payload["user_id"], "u1")
         self.assertEqual(payload["liked_papers"], ["2401.00001"])
         self.assertEqual(payload["disliked_papers"], [])
-        self.assertEqual(payload["paper_actions"], {"favorite": ["2401.00001"]})
+        self.assertEqual(payload["paper_actions"], {"read": ["2401.00001"]})
         self.assertEqual(payload["research_profile"]["preferred_answer_style"], "concise")
         self.assertNotIn("deprecated", payload)
         self.assertNotIn("preferences", payload)
@@ -196,7 +196,7 @@ class UserRouterApiTests(unittest.TestCase):
     def test_record_paper_action_and_validation_error(self) -> None:
         success = self.client.post(
             "/api/user/paper-action",
-            json={"user_id": "u1", "arxiv_id": "2401.00001", "action_type": "favorite", "metadata": {"source": "ui"}},
+            json={"user_id": "u1", "arxiv_id": "2401.00001", "action_type": "read", "metadata": {"source": "ui"}},
         )
         invalid = self.client.post("/api/user/paper-action", json={"user_id": "u1", "arxiv_id": "2401.00001"})
         explicit_preference = self.client.post(
@@ -205,7 +205,7 @@ class UserRouterApiTests(unittest.TestCase):
         )
 
         self.assertEqual(success.status_code, 200)
-        self.assertEqual(success.json()["action_type"], "favorite")
+        self.assertEqual(success.json()["action_type"], "read")
         self.assertEqual(invalid.status_code, 422)
         self.assertEqual(explicit_preference.status_code, 422)
         self.assertIn("like/dislike", str(explicit_preference.json()["detail"]))
@@ -214,13 +214,13 @@ class UserRouterApiTests(unittest.TestCase):
         success = self.client.request(
             "DELETE",
             "/api/user/paper-action",
-            json={"user_id": "u1", "arxiv_id": "2401.00001", "action_type": "favorite"},
+            json={"user_id": "u1", "arxiv_id": "2401.00001", "action_type": "read"},
         )
         self.user_preference_store.remove_action_result = False
         missing = self.client.request(
             "DELETE",
             "/api/user/paper-action",
-            json={"user_id": "u1", "arxiv_id": "2401.00001", "action_type": "favorite"},
+            json={"user_id": "u1", "arxiv_id": "2401.00001", "action_type": "read"},
         )
 
         self.assertEqual(success.status_code, 200)
@@ -280,6 +280,74 @@ class UserRouterApiTests(unittest.TestCase):
         self.assertEqual(success.json()["top_n"], 3)
         self.assertEqual(failure.status_code, 500)
         self.assertIn("recommend failed", failure.json()["detail"])
+
+
+class _FakeLabeledPreferenceStore:
+    def get_liked_papers(self, user_id: str):
+        return ["p1", "p2", "p3", "p4"]
+
+    def get_disliked_papers(self, user_id: str):
+        return ["p5"]
+
+    def get_strong_preference_times(self, user_id: str, preference: str, arxiv_ids):
+        times = {"liked": {"p1": "2026-10-01 08:00:00"}, "disliked": {"p5": "2026-10-02 09:30:00"}}[preference]
+        return {arxiv_id: times[arxiv_id] for arxiv_id in arxiv_ids if arxiv_id in times}
+
+
+class _FakeClusteredInterestVectorStore:
+    def get_user_interest_vector(self, user_id: str):
+        return {
+            "interest_clusters": [
+                {"cluster_id": "cluster_0", "paper_ids": ["p1", "p2"]},
+                {"cluster_id": "cluster_1", "paper_ids": ["p3"]},
+            ],
+            "weak_interest_pool": {"pool_id": "weak_interest_pool", "paper_ids": []},
+        }
+
+
+class _FakePaperCatalogStore:
+    def get_papers_by_ids(self, arxiv_ids):
+        return {arxiv_id: {"arxiv_id": arxiv_id, "title": f"title {arxiv_id}", "summary": "s"} for arxiv_id in arxiv_ids}
+
+
+class LabeledPapersClusterFilterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        app = FastAPI()
+        app.include_router(user_router.router, prefix="/api")
+        overrides = {
+            "get_user_preference_store": _FakeLabeledPreferenceStore(),
+            "get_interest_vector_store": _FakeClusteredInterestVectorStore(),
+            "get_paper_catalog_store": _FakePaperCatalogStore(),
+        }
+        for name, instance in overrides.items():
+            for dependency in (getattr(dependencies, name), getattr(user_router, name)):
+                app.dependency_overrides[dependency] = lambda instance=instance: instance
+        self.client = TestClient(app)
+
+    def _ids(self, **params):
+        response = self.client.get("/api/user/labeled-papers/u1", params=params)
+        self.assertEqual(response.status_code, 200, response.text)
+        return [item["arxiv_id"] for item in response.json()["items"]]
+
+    def test_cluster_filter_limits_labeled_papers_to_cluster_members(self) -> None:
+        self.assertEqual(self._ids(), ["p1", "p2", "p3", "p4", "p5"])
+        self.assertEqual(self._ids(cluster="cluster_0"), ["p1", "p2"])
+        self.assertEqual(self._ids(cluster="cluster_1"), ["p3"])
+        self.assertEqual(self._ids(cluster="weak_interest_pool"), [])
+
+    def test_unclustered_filter_returns_liked_papers_outside_all_clusters(self) -> None:
+        self.assertEqual(self._ids(cluster="unclustered"), ["p4"])
+
+    def test_items_carry_real_labeled_at_from_preference_tables(self) -> None:
+        response = self.client.get("/api/user/labeled-papers/u1")
+        labeled_at = {item["arxiv_id"]: item["labeled_at"] for item in response.json()["items"]}
+        self.assertEqual(labeled_at["p1"], "2026-10-01 08:00:00")
+        self.assertEqual(labeled_at["p5"], "2026-10-02 09:30:00")
+        self.assertIsNone(labeled_at["p2"])
+
+    def test_unknown_cluster_returns_404(self) -> None:
+        response = self.client.get("/api/user/labeled-papers/u1", params={"cluster": "cluster_9"})
+        self.assertEqual(response.status_code, 404)
 
 
 if __name__ == "__main__":

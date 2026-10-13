@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { getErrorMessage } from '@/api/errors'
@@ -65,6 +65,11 @@ async function handleSearch() {
     ElMessage.error(getErrorMessage(error, 'arXiv 搜索失败，请稍后重试'))
   }
 }
+
+onMounted(() => {
+  // 卡片上的「已读」读取行为表，进入页面先加载一次。
+  store.fetchPaperActions().catch(() => undefined)
+})
 
 function handleViewDetail(id: string) {
   router.push(`/paper/${id}`)

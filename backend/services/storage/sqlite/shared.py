@@ -46,16 +46,3 @@ def sql_placeholders(values: Sized) -> str:
     调用方需要自行保证 values 非空，空的 `IN ()` 在 SQLite 中是语法错误。
     """
     return ", ".join("?" for _ in range(len(values)))
-
-
-# 论文笔记允许的类型；不在集合内的类型在写入时统一回落为 custom。
-PAPER_NOTE_TYPES = {
-    "summary",
-    "method",
-    "experiment",
-    "result",
-    "limitation",
-    "idea",
-    "todo",
-    "custom",
-}

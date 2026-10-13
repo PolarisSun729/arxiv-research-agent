@@ -16,30 +16,13 @@ EXPLICIT_PREFERENCE_ACTION_TYPES = {
     "downvote",
 }
 
-# paper-action 只保留弱行为或非权威行为状态，推荐和画像可以按低权重消费这些信号。
-WEAK_PAPER_ACTION_TYPES = {
-    "favorite",
-    "read",
-    "later",
-    "archived",
-    "note_saved",
-    "not_interested",
-}
-
-PAPER_ACTION_ALIASES = {
-    "bookmark": "favorite",
-    "bookmarked": "favorite",
-    "saved": "later",
-    "save_for_later": "later",
-    "uninterested": "not_interested",
-    "note": "note_saved",
-}
+# paper-action 只承载「已读」这一弱行为；喜欢/不喜欢由专用偏好接口维护。
+WEAK_PAPER_ACTION_TYPES = {"read"}
 
 
 def normalize_paper_action_type(action_type: Any) -> str:
     """统一 action_type 的拼写归一化，让路由、服务和数据库共享同一个行为边界。"""
-    normalized = str(action_type or "").strip().lower().replace("-", "_")
-    return PAPER_ACTION_ALIASES.get(normalized, normalized)
+    return str(action_type or "").strip().lower().replace("-", "_")
 
 
 def is_explicit_preference_action(action_type: Any) -> bool:

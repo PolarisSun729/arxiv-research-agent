@@ -115,7 +115,7 @@ def test_settings_deduplicate_keys_and_do_not_expose_them_in_repr(monkeypatch):
     ("POST", "/api/agent/work-continuations/c1/resume/stream"),
     ("POST", "/api/paper/2401.00001/qa/stream"),
     ("GET", "/api/paper/2401.00001/evidence-assets/figure-1"),
-    ("GET", "/api/paper/2401.00001/notes/export"), ("GET", "/api/paper/2401.00001/qa-trace/latest"),
+    ("GET", "/api/paper/2401.00001/qa-trace/latest"),
     ("GET", "/api/debug/chunks/files"), ("GET", "/health/extra"),
 ])
 def test_all_api_entry_types_require_authentication(client, method, path):

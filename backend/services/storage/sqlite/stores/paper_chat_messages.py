@@ -262,7 +262,7 @@ class PaperChatMessageStore(PaperChatStoreBase):
         """删除整个会话（消息 + 会话记录），统一委托给会话 Store。
 
         这里曾经有一份独立实现：先无条件按 session_id 删除消息、再按 user_id 删除会话，
-        既会误删他人会话下的消息，也没有把 paper_notes.session_id 置空。
-        会话 Store 的实现先校验归属、再在同一事务内完成三步清理，是唯一可信版本。
+        会误删他人会话下的消息。
+        会话 Store 的实现先校验归属、再在同一事务内完成清理，是唯一可信版本。
         """
         return self.session_store.delete_paper_chat_session(session_id, user_id=user_id)

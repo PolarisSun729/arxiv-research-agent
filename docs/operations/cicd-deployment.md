@@ -320,7 +320,7 @@ sudo -u arxiv /opt/arxiv-research-agent/current/.venv/bin/python \
 | `backend/data/auth/auth.sqlite3` | `backend/data/auth/production.sqlite3` |
 | `backend/06-database/recommendation.db` | `backend/06-database/recommendation.db` |
 
-仅在服务器新建同名 admin 会生成不同 UUID，不能继承原有历史。先停写，或使用 SQLite backup API 取得一致快照；不要在程序运行时只复制 `.db` 而遗漏 WAL 中的数据。目标认证目录为 arxiv 所有、0700，认证库为 0600；生产签名材料保持独立并要求重新登录。需要保留笔记、文档和其他索引时，也要迁移对应共享资产。
+仅在服务器新建同名 admin 会生成不同 UUID，不能继承原有历史。先停写，或使用 SQLite backup API 取得一致快照；不要在程序运行时只复制 `.db` 而遗漏 WAL 中的数据。目标认证目录为 arxiv 所有、0700，认证库为 0600；生产签名材料保持独立并要求重新登录。需要保留文档和其他索引时，也要迁移对应共享资产。
 
 Windows Milvus Standalone 的 collection 需要按 collection/schema 导出、导入 Milvus Lite，不能用复制 SQLite 来迁移向量库。只迁移推荐/认证库可以保留账号及兴趣状态，不代表所有论文检索资产都已经迁移。
 
@@ -373,7 +373,7 @@ readlink -f /opt/arxiv-research-agent/current
 free -h
 ```
 
-HTTP 首页应跳转 HTTPS，`/health` 成功，匿名 `/api/auth/me` 为 401。继续在浏览器登录、读写个人笔记、查看兴趣状态、执行一次受控的模型调用和论文建索引，并检查 Redis 持久性及资源用量。验证真实付费模型调用需要使用自己的供应商预算，不属于自动质量门。
+HTTP 首页应跳转 HTTPS，`/health` 成功，匿名 `/api/auth/me` 为 401。继续在浏览器登录、读写个人问答会话、查看兴趣状态、执行一次受控的模型调用和论文建索引，并检查 Redis 持久性及资源用量。验证真实付费模型调用需要使用自己的供应商预算，不属于自动质量门。
 
 SSH 失败先检查端口、公钥、known_hosts；安装失败查看 Actions 的 pip 输出及磁盘；启动失败查 journald。依赖哈希、环境或发布包有误时脚本会在切换前停止；当前支持环境是 Debian 12 / Python 3.11 / x86_64。
 

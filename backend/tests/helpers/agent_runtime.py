@@ -132,7 +132,6 @@ class FakeStorageContainer:
         self.paper_profile_evidence = self._store
         self.paper_chat_sessions = self._store
         self.paper_chat_messages = self._store
-        self.paper_notes = self._store
         self.profile_events = self._store
         self.profile_build_jobs = self._store
         self.research_profiles = self._store

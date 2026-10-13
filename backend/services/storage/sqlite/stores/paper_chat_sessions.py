@@ -169,21 +169,13 @@ class PaperChatSessionStore(BaseSqliteStore):
                 if not cursor.fetchone():
                     return False
 
-                # 不依赖连接级 foreign_keys 开关：会话删除必须稳定清掉消息，并保留笔记内容本身。
+                # 不依赖连接级 foreign_keys 开关：会话删除必须稳定清掉消息。
                 cursor.execute(
                     '''
                     DELETE FROM paper_chat_messages
                     WHERE session_id = ?
                     ''',
                     (normalized_session_id,),
-                )
-                cursor.execute(
-                    '''
-                    UPDATE paper_notes
-                    SET session_id = NULL
-                    WHERE session_id = ? AND user_id = ?
-                    ''',
-                    (normalized_session_id, normalized_user_id),
                 )
                 cursor.execute(
                     '''

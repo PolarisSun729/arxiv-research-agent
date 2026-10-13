@@ -30,7 +30,6 @@ if TYPE_CHECKING:
         PaperCatalogStore,
         PaperChatMessageStore,
         PaperChatSessionStore,
-        PaperNoteStore,
         PaperProfileEvidenceStore,
         PaperQAIndexStore,
         PaperQATurnStore,
@@ -102,10 +101,6 @@ def get_paper_qa_turn_store() -> PaperQATurnStore:
     return get_storage_container().paper_qa_turns
 
 
-def get_paper_note_store() -> PaperNoteStore:
-    return get_storage_container().paper_notes
-
-
 def get_profile_event_store() -> ProfileEventStore:
     return get_storage_container().profile_events
 
@@ -169,7 +164,6 @@ def get_memory_service() -> MemoryService:
         paper_profile_evidence_store=get_paper_profile_evidence_store(),
         paper_chat_session_store=get_paper_chat_session_store(),
         paper_chat_message_store=get_paper_chat_message_store(),
-        paper_note_store=get_paper_note_store(),
         profile_event_store=get_profile_event_store(),
         profile_build_job_store=get_profile_build_job_store(),
         research_profile_store=get_research_profile_store(),

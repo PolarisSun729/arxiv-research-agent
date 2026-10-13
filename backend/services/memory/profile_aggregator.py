@@ -31,13 +31,9 @@ class ProfileAggregator:
     # long 进入长期分（120 天半衰期），recent 进入近期分（14 天半衰期）。
     ACTION_WEIGHTS = {
         "liked": {"long": 3.0, "recent": 1.7},
-        "favorite": {"long": 2.8, "recent": 1.5},
-        "later": {"long": 1.3, "recent": 0.7},
-        "note_saved": {"long": 3.2, "recent": 2.6},
         "qa_asked": {"long": 0.0, "recent": 2.2},
         "read": {"long": 0.0, "recent": 0.18},
         "disliked": {"long": 2.4, "recent": 1.2},
-        "not_interested": {"long": 1.5, "recent": 0.8},
     }
     ACTION_ALIASES = {"like": "liked", "dislike": "disliked"}
 
@@ -50,10 +46,10 @@ class ProfileAggregator:
         ("application_domains", "application_domain", 0.6),
     )
 
-    PAPER_LEVEL_POSITIVE_ACTIONS = {"liked", "favorite", "later"}
-    PAPER_LEVEL_NEGATIVE_ACTIONS = {"disliked", "not_interested"}
+    PAPER_LEVEL_POSITIVE_ACTIONS = {"liked"}
+    PAPER_LEVEL_NEGATIVE_ACTIONS = {"disliked"}
     RECENT_ONLY_ACTIONS = {"read", "qa_asked"}
-    STRONG_POSITIVE_ACTIONS = {"liked", "favorite", "later", "note_saved", "qa_asked"}
+    STRONG_POSITIVE_ACTIONS = {"liked", "qa_asked"}
 
     def __init__(self, concept_normalizer: Optional[ConceptNormalizer] = None):
         self.concept_normalizer = concept_normalizer or ConceptNormalizer()
@@ -68,7 +64,6 @@ class ProfileAggregator:
         now = now or datetime.now(timezone.utc)
         behavior_gate = self._build_behavior_gating_state(evidence)
         category_scores: Counter[str] = Counter()
-        question_type_scores: Counter[str] = Counter()
 
         records = self._collect_paper_records(evidence)
         signals: List[Dict[str, Any]] = []
@@ -80,17 +75,6 @@ class ProfileAggregator:
             if record_signals and record["action"] in self.STRONG_POSITIVE_ACTIONS - self.RECENT_ONLY_ACTIONS:
                 if any(signal["long_term_eligible"] for signal in record_signals):
                     self._add_categories(category_scores, record["paper"].get("categories"), self.ACTION_WEIGHTS[record["action"]]["long"])
-
-        for note in evidence.get("notes") or []:
-            if not isinstance(note, dict) or not note.get("include_in_profile"):
-                continue
-            note_signals = self._note_signals(note)
-            signals.extend(note_signals)
-            signal_count_by_action["note_saved"] += len(note_signals)
-            self._add_categories(category_scores, note.get("categories"), 1.0)
-            note_type = str(note.get("note_type") or "").strip().lower()
-            if note_type:
-                question_type_scores[note_type] += 2.0
 
         config = TopicScoringConfig.from_mapping(scoring_config)
         if behavior_gate.get("enabled"):
@@ -128,7 +112,7 @@ class ProfileAggregator:
             },
             "preferred_categories": self._rank_counter_values(category_scores, self.FIELD_LIMITS["preferred_categories"]),
             "preferred_answer_style": "",
-            "common_question_types": self._rank_counter_values(question_type_scores, self.FIELD_LIMITS["common_question_types"]),
+            "common_question_types": [],
             "representative_papers": representative_papers,
         }
 
@@ -207,36 +191,6 @@ class ProfileAggregator:
             )
         return signals
 
-    def _note_signals(self, note: Dict[str, Any]) -> List[Dict[str, Any]]:
-        event = note.get("_profile_event") if isinstance(note.get("_profile_event"), dict) else {}
-        timestamp = (
-            self.parse_profile_time(event.get("created_at"))
-            or self.parse_profile_time(note.get("updated_at"))
-            or self.parse_profile_time(note.get("created_at"))
-        )
-        paper_id = str(note.get("arxiv_id") or "").strip()
-        note_id = str(note.get("note_id") or note.get("id") or "").strip()
-        weights = self.ACTION_WEIGHTS["note_saved"]
-        common = {
-            "polarity": 1,
-            "action": "note_saved",
-            "weights": weights,
-            "long_term_eligible": True,
-            "timestamp": timestamp,
-            "paper_id": paper_id,
-            "event": event,
-            "note_id": note_id,
-        }
-        signals = []
-        for topic in ResearchProfileGenerator.normalize_system_topics(note.get("tags"), limit=10):
-            # 笔记标签是用户显式语义，置信度高，且在打分层豁免持续性条件。
-            concept = {"label": topic, "type": "manual_topic", "confidence": 0.95, "source": "note_tag", "evidence_text": str(note.get("title") or "")[:200]}
-            signals.append(self._signal(concept, **common))
-        paper = note.get("paper") if isinstance(note.get("paper"), dict) else {}
-        for concept in self._extract_card_candidate_concepts(self._card(paper)):
-            signals.append(self._signal(concept, **common))
-        return signals
-
     def _signal(
         self,
         concept: Dict[str, Any],
@@ -248,7 +202,6 @@ class ProfileAggregator:
         timestamp: Optional[datetime],
         paper_id: str,
         event: Dict[str, Any],
-        note_id: str = "",
     ) -> Dict[str, Any]:
         confidence = float(concept.get("confidence") or 0.0)
         event_id = str(event.get("event_id") or "").strip()
@@ -269,7 +222,6 @@ class ProfileAggregator:
             "timestamp": timestamp,
             "paper_id": paper_id,
             "event_id": event_id,
-            "note_id": note_id or str(event.get("note_id") or "").strip(),
             "question_ref": str(event.get("session_id") or event.get("source_id") or event_id).strip(),
         }
 
@@ -369,7 +321,6 @@ class ProfileAggregator:
                 "source_papers": list(topic.get("source_papers") or []),
                 "source_events": list(row.get("source_events") or []),
                 "source_actions": list(row.get("source_actions") or []),
-                "source_notes": list(row.get("source_notes") or []),
                 "source_questions": list(row.get("source_questions") or []),
                 "source_concepts": self._public_source_concepts(topic),
             }
@@ -408,9 +359,6 @@ class ProfileAggregator:
             if record["action"] in self.PAPER_LEVEL_POSITIVE_ACTIONS and not self._allows_behavior_paper(behavior_gate, "positive", record["paper_id"]):
                 continue
             candidates.extend(ResearchProfileGenerator.normalize_representative_papers([record["paper_id"]], limit=1))
-        for note in evidence.get("notes") or []:
-            if isinstance(note, dict) and note.get("include_in_profile"):
-                candidates.extend(ResearchProfileGenerator.normalize_representative_papers([note.get("arxiv_id")], limit=1))
         return self._merge_unique(candidates)
 
     # ---- 行为闸门 ----

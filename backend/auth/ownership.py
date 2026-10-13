@@ -65,32 +65,3 @@ def prepare_paper_qa(arxiv_id: str, payload) -> None:
         return
     payload.user_id = bind_user_id(payload.user_id)
     require_paper_session(arxiv_id, payload.session_id, user_id=payload.user_id)
-
-
-def validate_note_source(arxiv_id: str, payload, message_store) -> str | None:
-    """来源必须同属当前用户及论文，不能创建指向他人消息/turn 的悬挂关联。
-
-    笔记可以通过 source_message_id 或 source_turn_id（二选一，前者优先）关联到某条问答消息。
-    返回经过校验、应当保存的来源 message_id；没有来源时返回 None。
-    无 JWT 上下文时原样返回 payload.source_message_id，不做校验。
-    """
-    if current_auth.get() is None:
-        return payload.source_message_id
-    user_id = bind_user_id(payload.user_id)
-    # 笔记本身所在的会话（如有）必须属于本人和该论文。
-    require_paper_session(arxiv_id, payload.session_id, user_id=user_id)
-    linked = None
-    if payload.source_message_id:
-        linked = message_store.get_paper_chat_message(payload.source_message_id, user_id=user_id)
-    elif payload.source_turn_id:
-        # turn_id 只在会话内唯一，必须结合 session_id 才能定位到消息。
-        if not payload.session_id:
-            raise AuthError("private_resource_not_found")
-        linked = message_store.get_paper_chat_message_by_turn(payload.session_id, payload.source_turn_id, role="assistant", user_id=user_id)
-    if payload.source_message_id or payload.source_turn_id:
-        # 找到的消息必须与请求中声明的会话、turn 一致，且其所在会话同样属于本人和该论文。
-        if (not linked or (payload.session_id and linked.get("session_id") != payload.session_id)
-                or (payload.source_turn_id and linked.get("turn_id") != payload.source_turn_id)):
-            raise AuthError("private_resource_not_found")
-        require_paper_session(arxiv_id, linked["session_id"], user_id=user_id)
-    return linked["message_id"] if linked else None

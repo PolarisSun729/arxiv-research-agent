@@ -196,24 +196,19 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         Returns:
             {
                 "profile": 长期研究画像（未开启时为空），
-                "actions": 行为 action -> 论文 ID 列表（favorite / later / read / not_interested / archived 等），
-                "excluded_ids": 需要排除的论文 ID（不感兴趣、已归档；开启长期画像时还包含点赞、点踩），
+                "actions": 行为 action -> 论文 ID 列表（目前只有 read），
+                "excluded_ids": 需要排除的论文 ID（开启长期画像时为点赞、点踩），
                 "disabled": 是否未开启长期研究画像，
             }
 
-        “不感兴趣 / 已归档”是用户对单篇论文的显式处置，与是否开启长期画像无关，因此始终排除；
         未开启画像时点赞 / 点踩由调用方另行排除。
         """
         actions = self.user_preference_store.get_user_paper_action_map(user_id)
-        dismissed_ids = [
-            *self._normalize_id_list(actions.get("not_interested")),
-            *self._normalize_id_list(actions.get("archived")),
-        ]
         if not bool(self._memory_flag("enable_user_research_profile", False)):
             return {
                 "profile": {},
                 "actions": actions,
-                "excluded_ids": self._normalize_id_list(dismissed_ids),
+                "excluded_ids": [],
                 "disabled": True,
             }
         profile = self.research_profile_store.get_user_research_profile(user_id)
@@ -222,7 +217,6 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
                 # like/dislike 是强偏好权威状态，不再从弱行为 action_map 读取。
                 *self._normalize_id_list(self.user_preference_store.get_liked_papers(user_id)),
                 *self._normalize_id_list(self.user_preference_store.get_disliked_papers(user_id)),
-                *dismissed_ids,
             ]
         )
         return {
@@ -344,7 +338,7 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         profile_penalty = min(0.24, Σ负向主题匹配分 × 0.07)
         profile_adjustment = profile_score - profile_penalty
 
-        行为加成：收藏 +0.08，稍后读 +0.04，已读 -0.03。
+        行为加成：已读 -0.03（已读过的论文略微降权）。
         """
         profile = profile or {}
         actions = actions or {}
@@ -361,10 +355,6 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         matched_categories = sorted(categories & preferred_categories)
 
         action_boost = 0.0
-        if self._action_contains(actions, "favorite", arxiv_id):
-            action_boost += 0.08
-        if self._action_contains(actions, "later", arxiv_id):
-            action_boost += 0.04
         if self._action_contains(actions, "read", arxiv_id):
             action_boost -= 0.03
 
@@ -563,16 +553,15 @@ class RecommendationService(InterestProfileService, CandidateRecallService, Cand
         return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
 
     def _build_profile_match_reason(self, matches: List[Dict[str, Any]], profile: Dict[str, Any]) -> str:
-        """生成“匹配你的长期兴趣”文案；画像有 topic_evidence 时附带来源论文 / 笔记数量。"""
+        """生成“匹配你的长期兴趣”文案；画像有 topic_evidence 时附带来源论文数量。"""
         topics = [item["topic"] for item in matches if item.get("topic")]
         evidence = profile.get("topic_evidence") if isinstance(profile.get("topic_evidence"), dict) else {}
         evidence_parts: List[str] = []
         for topic in topics[:2]:
             item = evidence.get(topic) or {}
             paper_count = len(item.get("source_papers") or [])
-            note_count = len(item.get("source_notes") or [])
-            if paper_count or note_count:
-                evidence_parts.append(f"{topic}（{paper_count} 篇论文，{note_count} 条笔记）")
+            if paper_count:
+                evidence_parts.append(f"{topic}（{paper_count} 篇论文）")
         if evidence_parts:
             return f"匹配你的长期兴趣：{', '.join(evidence_parts)}"
         return f"匹配你的长期兴趣：{', '.join(topics[:3])}"

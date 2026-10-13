@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { ref, watch, computed } from 'vue'
 import type { Paper, RecommendedPaper } from '@/types/paper'
-import { ArrowRight, CircleCheck, CircleClose, Document } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import { ArrowRight, CircleCheck, CircleClose, Document, Reading } from '@element-plus/icons-vue'
 import SimilarityTag from './SimilarityTag.vue'
 import { toPercent } from '@/utils/format'
 import { getLabelText } from '@/utils/paperLabel'
+import { usePaperStore } from '@/stores/paperStore'
 
 const props = defineProps<{
   paper: Paper | RecommendedPaper
@@ -22,6 +24,10 @@ const selectedLabel = ref(props.paper.label === 'liked' ? 'liked' : props.paper.
 watch(() => props.paper.label, (newLabel) => {
   selectedLabel.value = newLabel === 'liked' ? 'liked' : newLabel === 'disliked' ? 'disliked' : ''
 })
+
+const store = usePaperStore()
+// 已读是弱行为，直接读 store 里的行为表，保证卡片与详情页显示同一份状态。
+const isRead = computed(() => (store.paperActionMap.read || []).includes(props.paper.arxivId || props.paper.id))
 
 const isRecommended = (p: Paper | RecommendedPaper): p is RecommendedPaper => {
   return 'similarityScore' in p
@@ -195,6 +201,16 @@ function toggleLabel(value: 'liked' | 'disliked') {
   emit('label', props.paper.id, next || null)
 }
 
+async function toggleRead() {
+  const enabled = !isRead.value
+  try {
+    await store.togglePaperAction(props.paper, 'read', enabled)
+    ElMessage.success(enabled ? '已标记已读' : '已取消已读')
+  } catch {
+    ElMessage.error('操作失败')
+  }
+}
+
 function formatDate(dateStr: string) {
   return new Date(dateStr).toLocaleDateString('zh-CN')
 }
@@ -311,6 +327,14 @@ function formatDate(dateStr: string) {
           @click="toggleLabel('liked')"
         >
           <el-icon><CircleCheck /></el-icon>感兴趣
+        </button>
+        <button
+          type="button"
+          :class="['label-btn', 'label-btn--read', { 'is-on': isRead }]"
+          :aria-pressed="isRead"
+          @click="toggleRead"
+        >
+          <el-icon><Reading /></el-icon>{{ isRead ? '已读' : '标记已读' }}
         </button>
         <button
           type="button"
@@ -539,6 +563,17 @@ function formatDate(dateStr: string) {
   background: var(--color-success-soft);
   border-color: var(--color-success-border);
   color: var(--color-success);
+}
+
+.label-btn--read:hover {
+  color: var(--color-primary);
+  border-color: var(--color-primary-border);
+}
+
+.label-btn--read.is-on {
+  background: var(--color-primary-soft);
+  border-color: var(--color-primary-border);
+  color: var(--color-primary);
 }
 
 .label-btn--neg:hover {

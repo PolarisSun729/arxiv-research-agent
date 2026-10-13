@@ -2,26 +2,10 @@ import type { BackendArxivQueryCapability } from './arxivCapability'
 
 export type PaperLabel = 'liked' | 'disliked'
 
-// 显式喜欢/不喜欢由 PaperLabel 与专用偏好接口维护；paper-action 只表达弱行为。
-export type PaperActionType =
-  | 'favorite'
-  | 'read'
-  | 'later'
-  | 'archived'
-  | 'note_saved'
-  | 'not_interested'
+// 显式喜欢/不喜欢由 PaperLabel 与专用偏好接口维护；paper-action 只记录「已读」这一弱行为。
+export type PaperActionType = 'read'
 
 export type UserPaperActionMap = Partial<Record<PaperActionType, string[]>>
-
-export type PaperNoteType =
-  | 'summary'
-  | 'method'
-  | 'experiment'
-  | 'result'
-  | 'limitation'
-  | 'idea'
-  | 'todo'
-  | 'custom'
 
 export type ProfileTopicZone = 'focus' | 'recent' | 'exclude'
 
@@ -48,7 +32,6 @@ export interface ProfileTopicEvidence {
   source_papers?: string[]
   source_events?: string[]
   source_actions?: string[]
-  source_notes?: string[]
   source_questions?: string[]
   source_concepts?: Array<Record<string, any>>
   manual_action?: 'focus' | 'exclude' | 'pinned'
@@ -158,33 +141,6 @@ export interface UserPaperAction {
   updated_at?: string
 }
 
-export interface PaperNote {
-  note_id: string
-  user_id: string
-  arxiv_id: string
-  session_id?: string | null
-  source_message_id?: string | null
-  source_turn_id?: string | null
-  title: string
-  content: string
-  note_type: PaperNoteType
-  source_chunk_ids: string[]
-  tags: string[]
-  include_in_profile: boolean
-  created_at?: string | null
-  updated_at?: string | null
-  sources?: Array<{
-    content?: string
-    page_number?: string
-    source?: string
-    section_path?: string
-    parent_chunk_id?: string | number
-    chunk_type?: string
-    asset_summary?: string
-    asset_preview_text?: string
-  }>
-}
-
 export interface Paper {
   id: string
   arxivId: string
@@ -274,7 +230,7 @@ export interface RecommendedPaper extends Paper {
 
 export interface LabeledPaper extends Paper {
   label: PaperLabel
-  labeledAt: string
+  labeledAt: string | null
 }
 
 export interface PaperMaterializationPayload {
@@ -386,6 +342,7 @@ export interface InterestVector {
   cluster_count?: number
   profile_mode?: string
   interest_clusters?: InterestClusterSummary[]
+  weak_interest_pool?: { pool_id: string; paper_count: number; paper_ids: string[] } | null
   disliked_vector_data?: number[] | null
   disliked_paper_examples?: DislikedPaperExample[]
   negative_feedback_stats?: NegativeFeedbackStats

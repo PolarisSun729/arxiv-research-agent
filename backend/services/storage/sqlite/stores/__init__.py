@@ -7,7 +7,6 @@ from services.storage.sqlite.stores.langgraph_checkpoints import LangGraphCheckp
 from services.storage.sqlite.stores.paper_catalog import PaperCatalogStore
 from services.storage.sqlite.stores.paper_chat_messages import PaperChatMessageStore
 from services.storage.sqlite.stores.paper_chat_sessions import PaperChatSessionStore
-from services.storage.sqlite.stores.paper_notes import PaperNoteStore
 from services.storage.sqlite.stores.paper_profile_evidence import PaperProfileEvidenceStore
 from services.storage.sqlite.stores.paper_qa_index import PaperQAIndexStore
 from services.storage.sqlite.stores.paper_qa_turns import PaperQATurnStore
@@ -28,7 +27,6 @@ __all__ = [
     "PaperCatalogStore",
     "PaperChatMessageStore",
     "PaperChatSessionStore",
-    "PaperNoteStore",
     "PaperProfileEvidenceStore",
     "PaperQAIndexStore",
     "PaperQATurnStore",

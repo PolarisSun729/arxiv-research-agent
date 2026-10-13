@@ -111,7 +111,7 @@ def test_password_policy_rejects_weak_and_overlong_bytes(app, password):
     assert password not in response.text
 
 
-@pytest.mark.parametrize("path", ["/api/papers", "/api/auth/me", "/api/paper/p1/evidence-assets/img", "/api/paper/p1/notes/export", "/api/debug/chunks/files"])
+@pytest.mark.parametrize("path", ["/api/papers", "/api/auth/me", "/api/paper/p1/evidence-assets/img", "/api/debug/chunks/files"])
 def test_api_key_cannot_bypass_jwt_for_any_transport(app, path):
     response = http(app).get(path, headers={"X-API-Key": "old-compatibility-key-" + "a" * 40})
     assert response.status_code == 401 and response.json()["code"] == "missing_token"
@@ -189,7 +189,7 @@ def test_roles_deny_sensitive_routes_before_invalid_body_or_dependencies(app, ro
 @pytest.mark.parametrize("method,path,body", [
     ("GET", "/api/user/preferences/someone-else", None),
     ("GET", "/api/stats?user_id=someone-else", None),
-    ("GET", "/api/paper/p1/notes?user_id=someone-else", None),
+    ("GET", "/api/paper/p1/chat-sessions?user_id=someone-else", None),
     ("POST", "/api/user/like-paper", {"arxiv_id": "p1", "user_id": "someone-else"}),
     ("POST", "/api/agent/chat", {"message": "test", "context": {"user_id": "someone-else"}}),
     ("POST", "/api/paper/p1/qa/stream", {"question": "test", "user_id": "someone-else"}),
@@ -402,7 +402,6 @@ def business(app, monkeypatch, tmp_path):
     for name, value in {
         "get_paper_chat_session_store": storage.paper_chat_sessions,
         "get_paper_chat_message_store": storage.paper_chat_messages,
-        "get_paper_note_store": storage.paper_notes,
         "get_paper_catalog_store": storage.paper_catalog,
         "get_user_preference_store": storage.user_preferences,
         "get_agent_session_store": storage.agent_sessions,
@@ -420,20 +419,13 @@ def business(app, monkeypatch, tmp_path):
     return storage
 
 
-def test_real_notes_sessions_and_qa_are_isolated(app, business):
+def test_real_sessions_and_qa_are_isolated(app, business):
     alice, alice_token = account(app, username="alice")
     bob, bob_token = account(app, username="bob")
     first, second = http(app, alice_token), http(app, bob_token)
     alice_session = first.post("/api/paper/p1/chat-sessions", json={}).json()["item"]
     bob_session = second.post("/api/paper/p1/chat-sessions", json={}).json()["item"]
     assert alice_session["user_id"] == alice.user_id and bob_session["user_id"] == bob.user_id
-    note = first.post("/api/paper/p1/notes", json={"content": "private-alice-note", "user_id": None}).json()["item"]
-    assert note["user_id"] == alice.user_id
-    assert second.get("/api/paper/p1/notes").json()["items"] == []
-    assert "private-alice-note" not in second.get("/api/paper/p1/notes/export").text
-    assert first.get("/api/paper/p1/notes/export").status_code == 200
-    assert second.patch(f"/api/paper/p1/notes/{note['note_id']}", json={"content": "overwrite"}).status_code == 404
-    assert second.delete(f"/api/paper/p1/notes/{note['note_id']}").status_code == 404
     path = f"/api/paper/p1/chat-sessions/{alice_session['session_id']}"
     assert second.get(path).status_code == 404
     assert second.get(path + "/messages").status_code == 404
@@ -444,57 +436,6 @@ def test_real_notes_sessions_and_qa_are_isolated(app, business):
     answer = second.post("/api/paper/p1/qa", json={"question": "test", "session_id": bob_session["session_id"]})
     assert answer.json()["user_id"] == bob.user_id
     assert second.post("/api/paper/p2/qa", json={"question": "test", "session_id": bob_session["session_id"]}).status_code == 404
-
-
-def test_note_sources_cannot_reference_other_user_or_paper(app, business):
-    alice, alice_token = account(app, username="alice")
-    bob, bob_token = account(app, username="bob")
-    alice_session = business.paper_chat_sessions.create_paper_chat_session(arxiv_id="p1", user_id=alice.user_id)
-    bob_other_paper = business.paper_chat_sessions.create_paper_chat_session(arxiv_id="p2", user_id=bob.user_id)
-    with business.connection_provider.connect() as conn:
-        conn.executemany("INSERT INTO paper_chat_messages(message_id,session_id,role,content,turn_id) VALUES(?,?,?,?,?)", [
-            ("alice-message", alice_session["session_id"], "assistant", "private-alice-message", "alice-turn"),
-            ("bob-other-paper", bob_other_paper["session_id"], "assistant", "other-paper", "bob-turn"),
-        ])
-        conn.commit()
-    client = http(app, bob_token)
-    for link in ({"session_id": alice_session["session_id"]}, {"source_message_id": "alice-message"},
-                 {"source_message_id": "bob-other-paper"}, {"source_turn_id": "alice-turn"}):
-        assert client.post("/api/paper/p1/notes", json={"content": "note", **link}).status_code == 404
-    own = http(app, alice_token).post("/api/paper/p1/notes", json={"content": "linked", "source_message_id": "alice-message"})
-    assert own.status_code == 200 and own.json()["item"]["source_turn_id"] == "alice-turn"
-
-
-def test_notes_markdown_export_redacts_credentials_from_all_sources(app, business, monkeypatch):
-    from utils.secret_redaction import register_sensitive_values
-
-    user, token = account(app, username="note_export")
-    client = http(app, token)
-    secret = "export-fixture-credential-" + "c" * 32
-    register_sensitive_values([secret])
-    session = business.paper_chat_sessions.create_paper_chat_session(arxiv_id="p1", user_id=user.user_id)
-    # 保留真实存储与所有权检查，模拟历史问答和用户笔记已经包含凭据的场景。
-    with business.connection_provider.connect() as conn:
-        conn.execute(
-            "INSERT INTO paper_chat_messages(message_id,session_id,role,content,turn_id,sources) VALUES(?,?,?,?,?,?)",
-            ("export-source", session["session_id"], "assistant", "来源回答", "export-turn",
-             json.dumps([{"content": f"关联来源 {secret}", "page_number": 1}], ensure_ascii=False)),
-        )
-        conn.commit()
-    monkeypatch.setattr(business.paper_catalog, "get_paper", lambda _arxiv_id: {"title": f"论文标题 {secret}"})
-    created = client.post("/api/paper/p1/notes", json={
-        "title": f"笔记标题 {secret}", "content": f"正常正文 {secret}\npassword=unknown-export-password",
-        "source_message_id": "export-source",
-    })
-    assert created.status_code == 200
-    response = client.get("/api/paper/p1/notes/export")
-    assert response.status_code == 200
-    assert "text/markdown" in response.headers["content-type"]
-    assert "attachment" in response.headers["content-disposition"]
-    assert secret not in response.text
-    assert "unknown-export-password" not in response.text
-    for preserved in ("论文标题", "笔记标题", "正常正文", "关联来源"):
-        assert preserved in response.text
 
 
 def test_agent_session_cannot_claim_legacy_or_foreign_thread(app, business, monkeypatch):

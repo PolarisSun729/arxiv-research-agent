@@ -97,14 +97,6 @@ def test_like_counted_once_even_when_present_in_events_and_preference_table():
     assert once["topic_evidence"]["graph retrieval"]["long_pos"] == twice["topic_evidence"]["graph retrieval"]["long_pos"]
 
 
-def test_note_tag_is_explicit_and_skips_persistence_requirement():
-    note = {"note_id": "n1", "arxiv_id": "2601.00009", "include_in_profile": True, "tags": ["sparse attention"], "created_at": "2026-09-30 00:00:00"}
-    result = _aggregate({"notes": [note]})
-
-    assert "sparse attention" in result["positive_topics"]
-    assert result["topic_evidence"]["sparse attention"]["source_notes"] == ["n1"]
-
-
 def test_single_paper_concepts_do_not_fill_recent_zone():
     # 一篇论文上的问答会带出一串专有概念；近期区要求至少两篇论文支撑，它们都不该进入。
     qa_paper = _paper("2601.00001", ["PEC2F Graph Schema", "Epistemic Separation", "graph retrieval"], at="2026-09-30 00:00:00")

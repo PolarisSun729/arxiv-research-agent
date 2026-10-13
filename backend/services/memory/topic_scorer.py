@@ -8,8 +8,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 TOPIC_SCORER_VERSION = "topic_scorer_v1"
 
-# 用户显式表达的语义（笔记标签等）不需要再用跨时间重复出现来证明自己是长期兴趣。
-EXPLICIT_TOPIC_SOURCES = {"manual_profile", "note_tag"}
+# 用户显式表达的语义不需要再用跨时间重复出现来证明自己是长期兴趣。
+EXPLICIT_TOPIC_SOURCES = {"manual_profile"}
 
 
 @dataclass
@@ -109,7 +109,6 @@ class TopicScorer:
         actions: List[str] = []
         sources: set[str] = set()
         events: List[str] = []
-        notes: List[str] = []
         questions: List[str] = []
 
         recent_papers: set[str] = set()
@@ -125,7 +124,7 @@ class TopicScorer:
             recent_decay = self._decay(age_days, self.config.recent_half_life_days)
             long_value = float(member.get("long_weight") or 0.0) * confidence * long_decay
             recent_value = float(member.get("recent_weight") or 0.0) * confidence * recent_decay
-            paper_key = str(member.get("paper_id") or member.get("note_id") or "").strip()
+            paper_key = str(member.get("paper_id") or "").strip()
             eligible = bool(member.get("long_term_eligible", True))
 
             if polarity > 0:
@@ -154,7 +153,6 @@ class TopicScorer:
                 sources.add(source)
             for value, bucket in (
                 (member.get("event_id"), events),
-                (member.get("note_id"), notes),
                 (member.get("question_ref") if action == "qa_asked" else None, questions),
             ):
                 text = str(value or "").strip()
@@ -186,7 +184,6 @@ class TopicScorer:
             "explicit": bool(sources & EXPLICIT_TOPIC_SOURCES),
             "source_actions": actions,
             "source_events": events,
-            "source_notes": notes,
             "source_questions": questions,
         }
 
@@ -241,7 +238,7 @@ class TopicScorer:
         """按 (论文, 行为, 极性) 去重，保留置信度最高的成员；没有论文标识的信号各自独立计分。"""
         best: Dict[Any, Dict[str, Any]] = {}
         for member in members:
-            paper_key = str(member.get("paper_id") or member.get("note_id") or "").strip()
+            paper_key = str(member.get("paper_id") or "").strip()
             if not paper_key:
                 best[id(member)] = member
                 continue

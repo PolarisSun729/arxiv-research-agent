@@ -137,8 +137,13 @@ async def get_labeled_papers(
     label: Literal["liked", "disliked", "all"] = Query("all"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    cluster: Optional[str] = Query(
+        None,
+        description="按兴趣簇筛选：cluster_N、weak_interest_pool（弱兴趣池）或 unclustered（未参与聚类的点赞论文）",
+    ),
     user_preference_store=Depends(get_user_preference_store),
     paper_catalog_store=Depends(get_paper_catalog_store),
+    interest_vector_store=Depends(get_interest_vector_store),
 ):
     """已标记论文的分页列表。
 
@@ -151,21 +156,57 @@ async def get_labeled_papers(
         disliked = user_preference_store.get_disliked_papers(user_id) if label != "liked" else []
         labeled = list(dict.fromkeys([*liked, *disliked]))
         liked_ids = set(liked)
+        if cluster:
+            cluster_ids = _resolve_interest_cluster_paper_ids(interest_vector_store, user_id, cluster)
+            if cluster_ids is None:
+                raise HTTPException(status_code=404, detail="interest_cluster_not_found")
+            # 未参与聚类 = 点赞了但不在任何簇和弱兴趣池里（通常是缺向量），便于排查聚类漏掉的论文。
+            if cluster == "unclustered":
+                liked_only = set(user_preference_store.get_liked_papers(user_id))
+                labeled = [arxiv_id for arxiv_id in labeled if arxiv_id in liked_only and arxiv_id not in cluster_ids]
+            else:
+                labeled = [arxiv_id for arxiv_id in labeled if arxiv_id in cluster_ids]
         start = (page - 1) * page_size
         page_ids = labeled[start:start + page_size]
         papers = paper_catalog_store.get_papers_by_ids(page_ids)
+        page_liked_ids = [arxiv_id for arxiv_id in page_ids if arxiv_id in liked_ids]
+        page_disliked_ids = [arxiv_id for arxiv_id in page_ids if arxiv_id not in liked_ids]
+        labeled_at = {
+            **user_preference_store.get_strong_preference_times(user_id, "disliked", page_disliked_ids),
+            **user_preference_store.get_strong_preference_times(user_id, "liked", page_liked_ids),
+        }
         items = []
         for arxiv_id in page_ids:
             paper = papers.get(arxiv_id) or {"arxiv_id": arxiv_id}
             items.append({
                 **paper,
                 "label": "liked" if arxiv_id in liked_ids else "disliked",
+                # SQLite CURRENT_TIMESTAMP 存的是 UTC，前端按本地时区展示。
+                "labeled_at": labeled_at.get(arxiv_id),
                 "incomplete": not paper_has_display_metadata(paper),
             })
         return {"total": len(labeled), "page": page, "page_size": page_size, "items": items}
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("Error getting labeled papers: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _resolve_interest_cluster_paper_ids(interest_vector_store, user_id: str, cluster: str) -> Optional[set]:
+    """把簇筛选值解析成论文 ID 集合；unclustered 返回所有已入簇/弱池的 ID，由调用方取补集。"""
+    vector = interest_vector_store.get_user_interest_vector(user_id=user_id) or {}
+    clusters = [item for item in vector.get("interest_clusters") or [] if isinstance(item, dict)]
+    weak_pool = vector.get("weak_interest_pool") if isinstance(vector.get("weak_interest_pool"), dict) else {}
+    if cluster == "unclustered":
+        grouped = [*clusters, weak_pool] if weak_pool else clusters
+        return {str(paper_id) for item in grouped for paper_id in item.get("paper_ids") or []}
+    if cluster == "weak_interest_pool":
+        return {str(paper_id) for paper_id in weak_pool.get("paper_ids") or []} if weak_pool else None
+    for item in clusters:
+        if item.get("cluster_id") == cluster:
+            return {str(paper_id) for paper_id in item.get("paper_ids") or []}
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +267,7 @@ async def record_paper_action(
     payload: PaperActionRequest,
     recommendation_service=Depends(get_recommendation_service),
 ):
-    """记录用户对论文执行的弱行为事件（如收藏、阅读等，类型由 user_behavior_policy 定义）。"""
+    """记录用户对论文执行的弱行为事件（目前只有「已读」read，类型由 user_behavior_policy 定义）。"""
     try:
         return recommendation_service.record_user_paper_action(
             user_id=payload.user_id,
