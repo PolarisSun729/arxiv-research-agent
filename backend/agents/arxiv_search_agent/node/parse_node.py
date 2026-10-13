@@ -40,6 +40,7 @@ from ..state import AgentState
 from ..utils.search_spec_builder import (
     _apply_rule_enrichment,
     _build_spec_from_rules,
+    _ground_search_spec,
     _normalize_and_validate_spec,
     _post_process_cleaned_spec,
 )
@@ -724,6 +725,20 @@ def parse_search_request(
         fallback_reason=detector_result["fallback_reason"],
         warnings=detector_result["warnings"],
     )
+    if decision["search_spec"] is not None:
+        # LLM 和规则两条路径都要经过同一道收口：主题落地到用户原话、标注约束来源。
+        grounded_spec, grounding_warnings = _ground_search_spec(
+            decision["search_spec"],
+            message,
+            raw_payload=(llm_result or {}).get("raw") if llm_result else None,
+            research_profile=research_profile,
+        )
+        decision = {
+            **decision,
+            "search_spec": grounded_spec,
+            "search_spec_after_enrichment": _compact_search_spec(grounded_spec),
+            "warnings": list(decision["warnings"]) + grounding_warnings,
+        }
     # 统一做最终降级和展示字段补齐，避免后续节点拿到半成品决策。
     finalized = _finalize_parse_search_request_decision(
         intent=decision["intent"],

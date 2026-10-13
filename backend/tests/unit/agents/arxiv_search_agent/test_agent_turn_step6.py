@@ -39,7 +39,7 @@ def _reference_hint_from_trace(result, step_id: str) -> dict:
 
 def test_run_agent_turn_arxiv_search_success(monkeypatch) -> None:
     def fake_invoke_tool(tool_name: str, **kwargs):
-        assert tool_name == "search_arxiv_structured"
+        assert tool_name == "search_arxiv_raw"
         return {
             "ok": True,
             "tool_name": tool_name,
@@ -69,14 +69,50 @@ def test_run_agent_turn_arxiv_search_success(monkeypatch) -> None:
     assert {"search_spec", "arxiv_results", "final_answer"}.issubset(result.outputs.keys())
 
 
-def test_run_agent_turn_arxiv_empty_result_replans(monkeypatch) -> None:
-    calls = {"search": 0}
+def test_run_agent_turn_arxiv_empty_after_ladder_returns_suggestion_without_replan(monkeypatch) -> None:
+    queries = []
 
     def fake_invoke_tool(tool_name: str, **kwargs):
-        assert tool_name == "search_arxiv_structured"
-        calls["search"] += 1
-        papers = [] if calls["search"] == 1 else [{"arxiv_id": "2401.00001", "title": "RAG retry"}]
-        return {"ok": True, "tool_name": tool_name, "summary": "searched", "data": {"papers": papers}, "trace": {}, "error": None}
+        assert tool_name == "search_arxiv_raw"
+        queries.append(kwargs["search_query"])
+        return {"ok": True, "tool_name": tool_name, "summary": "searched", "data": {"papers": [], "total_results": 0}, "trace": {}, "error": None}
+
+    monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
+
+    result = run_agent_turn(
+        AgentState(
+            intent="arxiv_search",
+            message="搜索最近 7 天的 RAG 论文",
+            search_spec=ArxivSearchSpec(
+                intent="arxiv_search",
+                concepts=[{"term": "RAG", "aliases": ["retrieval-augmented generation"]}],
+                categories=["cs.CL"],
+                submitted_days_ago=7,
+                constraint_sources={"categories": "default", "submitted_days_ago": "user"},
+                max_results=5,
+            ),
+        )
+    )
+
+    # 阶梯在一次工具调用里依次放宽：严格 → 短语改分词 → 放开默认分类；时间窗始终保留。
+    assert len(queries) == 3
+    assert "cat:cs.CL" in queries[0] and "cat:cs.CL" not in queries[-1]
+    assert not any(trace.event == "plan_replanned" for trace in result.trace)
+    assert not any(trace.step_id == "rewrite_arxiv_query" for trace in result.trace)
+    assert result.final_answer
+    assert "没有找到符合条件的论文" in result.final_answer
+    assert "我没有自动放宽" in result.final_answer
+    assert "replan_limit_exceeded" not in result.final_answer
+
+
+def test_run_agent_turn_arxiv_ladder_relaxes_inside_one_search_step(monkeypatch) -> None:
+    queries = []
+
+    def fake_invoke_tool(tool_name: str, **kwargs):
+        assert tool_name == "search_arxiv_raw"
+        queries.append(kwargs["search_query"])
+        papers = [] if len(queries) == 1 else [{"arxiv_id": "2401.00001", "title": "RAG retry"}]
+        return {"ok": True, "tool_name": tool_name, "summary": "searched", "data": {"papers": papers, "total_results": len(papers)}, "trace": {}, "error": None}
 
     monkeypatch.setattr(executor_module, "invoke_backend_tool", fake_invoke_tool)
 
@@ -84,16 +120,16 @@ def test_run_agent_turn_arxiv_empty_result_replans(monkeypatch) -> None:
         AgentState(
             intent="arxiv_search",
             message="搜索 RAG",
-            search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG", max_results=5),
+            search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG", categories=["cs.CL"], max_results=5),
         )
     )
 
     assert result.status == "success"
-    assert calls["search"] == 2
-    assert any(trace.event == "plan_replanned" for trace in result.trace)
-    assert any(trace.step_id == "rewrite_arxiv_query" and trace.event == "step_succeeded" for trace in result.trace)
-    assert result.runtime is not None
-    assert sum(result.runtime.replan_counts.values()) <= 5
+    assert len(queries) == 2
+    assert not any(trace.event == "plan_replanned" for trace in result.trace)
+    papers = result.outputs["arxiv_results"]["papers"]
+    assert papers[0]["match_level"] == "drop_inferred_categories"
+    assert "放宽" in result.final_answer
 
 
 def test_run_agent_turn_paper_qa_context_reference_resolves_selected_and_answers(monkeypatch) -> None:

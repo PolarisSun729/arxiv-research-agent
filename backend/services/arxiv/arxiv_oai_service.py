@@ -48,6 +48,8 @@ OAI_INDEX_REBUILD_BATCH_SIZE = 1000
 OAI_INDEX_REBUILD_STALE_SECONDS = 15 * 60
 OAI_INDEX_REBUILD_VERSION = "local_oai_search_index_rebuild_v2"
 OAI_REBUILD_STATE_ID = 1
+# relevance 排序时先按日期取出的候选上限；本地没有 IR 打分，只能在候选内用字段命中打分重排。
+OAI_RELEVANCE_CANDIDATE_POOL = 500
 # 增量刷新索引时按块批量删除旧行；低于旧版 SQLite 999 个绑定变量的上限。
 OAI_INDEX_DELETE_CHUNK_SIZE = 500
 
@@ -1449,6 +1451,12 @@ class ArxivOaiDatabaseService:
         if re.fullmatch(r"[a-z0-9]+", normalized_query):
             # 纯英文/数字短词按 token 边界匹配，避免 RAG 命中 Dragoi 这类子串。
             return re.search(rf"(?<![a-z0-9]){re.escape(normalized_query)}(?![a-z0-9])", normalized_haystack) is not None
+        if re.fullmatch(r"[a-z0-9\s\-_/.]+", normalized_query):
+            # 英文短语按 token 序列匹配，和 FTS 分词一致：retrieval augmented generation
+            # 也能命中 retrieval-augmented generation。
+            query_tokens = re.findall(r"[a-z0-9]+", normalized_query)
+            haystack_tokens = re.findall(r"[a-z0-9]+", normalized_haystack)
+            return f" {' '.join(query_tokens)} " in f" {' '.join(haystack_tokens)} "
         return normalized_query in normalized_haystack
 
     def _score_text_query(self, paper: Dict[str, Any], query_text: str) -> int:
@@ -1677,8 +1685,22 @@ class ArxivOaiDatabaseService:
                 {order_sql}
                 LIMIT ? OFFSET ?
             """
-            cursor.execute(select_query, params + [max(1, int(max_results)), max(0, int(start))])
-            papers = [self._build_paper_response(self._parse_row(row)) for row in cursor.fetchall()]
+            rerank_by_relevance = sort_by == "relevance" and uses_fts and bool(normalized_query)
+            if rerank_by_relevance:
+                # relevance 不能只取“最新的 N 篇”：先取一批候选，再按标题/摘要命中打分取 Top N，
+                # 同分时保持日期顺序。
+                window = max(OAI_RELEVANCE_CANDIDATE_POOL, max(0, int(start)) + max(1, int(max_results)))
+                cursor.execute(select_query, params + [window, 0])
+                candidates = [self._parse_row(row) for row in cursor.fetchall()]
+                ranked = sorted(
+                    enumerate(candidates),
+                    key=lambda item: (-self._score_relevance_query(item[1], normalized_query), item[0]),
+                )
+                page = ranked[max(0, int(start)) : max(0, int(start)) + max(1, int(max_results))]
+                papers = [self._build_paper_response(paper) for _, paper in page]
+            else:
+                cursor.execute(select_query, params + [max(1, int(max_results)), max(0, int(start))])
+                papers = [self._build_paper_response(self._parse_row(row)) for row in cursor.fetchall()]
 
         # 把本次查询到底使用了哪一层索引能力显式带回，方便前端解释“为什么和 arXiv API 不完全一样”。
         query_capability = build_local_oai_query_capability(
@@ -1690,7 +1712,9 @@ class ArxivOaiDatabaseService:
             "当前使用本地 OAI 镜像库，仅支持高精度可下推查询子集，不等价完整 arXiv API 语法。"
         ]
         if sort_by == "relevance" and uses_fts:
-            warnings.append("本地 relevance 当前使用 FTS 命中过滤和日期排序，不等价 arXiv API relevance。")
+            warnings.append(
+                f"本地 relevance 在最近 {OAI_RELEVANCE_CANDIDATE_POOL} 篇命中论文内按标题/摘要命中打分排序，不等价 arXiv API relevance。"
+            )
         return {
             "query": normalized_query,
             "id_list": normalized_id_list,

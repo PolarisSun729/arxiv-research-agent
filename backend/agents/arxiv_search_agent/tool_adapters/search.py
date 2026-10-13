@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..schemas import ArxivSearchSpec
+from ..utils.search_ladder import build_search_ladder, compose_search_query, paper_key, text_tokens
 from .base import BaseToolAdapter, backend_tool_error
 from .models import ToolExecutionResult
 
@@ -27,6 +28,9 @@ class NormalizedRequestOutput(BaseModel):
 
 _SEARCH_SPEC_FIELDS = {
     "intent",
+    "concepts",
+    "optional_terms",
+    "constraint_sources",
     "query",
     "title_query",
     "abstract_query",
@@ -148,6 +152,9 @@ class ArxivSearchSpecOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     intent: str
+    concepts: List[Dict[str, Any]] = Field(default_factory=list)
+    optional_terms: List[str] = Field(default_factory=list)
+    constraint_sources: Dict[str, str] = Field(default_factory=dict)
     query: Optional[str] = None
     title_query: Optional[str] = None
     abstract_query: Optional[str] = None
@@ -173,6 +180,38 @@ class SearchArxivOutput(BaseModel):
     papers: List[Dict[str, Any]] = Field(default_factory=list)
     tool_result: Dict[str, Any] = Field(default_factory=dict)
     search_spec: Dict[str, Any] = Field(default_factory=dict)
+    # 阶梯检索的执行记录：每级查询与命中数、是否用尽、被锁定不放宽的用户约束。
+    relaxation: Dict[str, Any] = Field(default_factory=dict)
+
+
+def _relaxation_summary(
+    spec: ArxivSearchSpec,
+    *,
+    attempts: List[Dict[str, Any]],
+    papers: List[Dict[str, Any]],
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    sources = dict(spec.constraint_sources or {})
+    locked: List[str] = []
+    if spec.submitted_days_ago is not None and sources.get("submitted_days_ago") == "user":
+        locked.append("submitted_days_ago")
+    if spec.categories and sources.get("categories") == "user":
+        locked.append("categories")
+    requested = int(spec.max_results or 10)
+    applied = next((item["level"] for item in reversed(attempts) if item.get("ok") and item.get("new_papers")), None)
+    summary: Dict[str, Any] = {
+        "attempts": attempts,
+        "requested": requested,
+        "returned": len(papers),
+        "applied_level": applied,
+        # 只要最终仍未凑够数量，就说明可自动放宽的条件已经用完。
+        "exhausted": len(papers) < requested,
+        "locked_constraints": locked,
+        "profile_concepts": [concept.term for concept in spec.concepts if concept.source == "profile"],
+    }
+    if note:
+        summary["note"] = note
+    return summary
 
 
 class ValidateArxivResultsInput(BaseModel):
@@ -199,6 +238,9 @@ class RewriteArxivQueryOutput(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     intent: str = "arxiv_search"
+    concepts: List[Dict[str, Any]] = Field(default_factory=list)
+    optional_terms: List[str] = Field(default_factory=list)
+    constraint_sources: Dict[str, str] = Field(default_factory=dict)
     query: Optional[str] = None
     title_query: Optional[str] = None
     abstract_query: Optional[str] = None
@@ -263,7 +305,7 @@ def extract_papers(search_result: Any) -> List[Dict[str, Any]]:
 def _looks_like_search_spec(value: Mapping[str, Any]) -> bool:
     # normalized_request 正常应包含 message/search_spec；若它本身已经带检索字段，
     # 说明 planner 直接绑定了结构化规格，adapter 应保留这些约束而不是退回 message 兜底。
-    return any(value.get(key) not in (None, "", [], {}) for key in ("query", "title_query", "abstract_query", "categories"))
+    return any(value.get(key) not in (None, "", [], {}) for key in ("concepts", "query", "title_query", "abstract_query", "categories"))
 
 
 class NormalizeRequestAdapter(BaseToolAdapter[NormalizeRequestInput, NormalizedRequestOutput]):
@@ -335,12 +377,83 @@ class SearchArxivAdapter(BaseToolAdapter[SearchArxivInput, SearchArxivOutput]):
         return result
 
     def _run(self, tool_input: SearchArxivInput) -> SearchArxivOutput:
-        tool_args = tool_input.search_spec.model_dump(exclude_none=True)
-        tool_result = self.invoke_backend_tool("search_arxiv_structured", **tool_args)
+        spec = tool_input.search_spec
+        tool_args = spec.model_dump(exclude_none=True)
+        levels = build_search_ladder(spec)
+        if not levels:
+            return SearchArxivOutput(
+                papers=[],
+                tool_result={"ok": True, "tool_name": "search_arxiv_raw", "summary": "没有可检索的英文主题词", "data": {"papers": []}},
+                search_spec=tool_args,
+                relaxation=_relaxation_summary(spec, attempts=[], papers=[], note="no_searchable_terms"),
+            )
+
+        requested = int(spec.max_results or 10)
+        collected: List[Dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        attempts: List[Dict[str, Any]] = []
+        last_result: Dict[str, Any] = {}
+        for level in levels:
+            search_query = compose_search_query(level)
+            tool_result = dict(
+                self.invoke_backend_tool(
+                    "search_arxiv_raw",
+                    search_query=search_query,
+                    max_results=requested,
+                    submitted_days_ago=spec.submitted_days_ago,
+                    sort_by=spec.sort_by,
+                    sort_order=spec.sort_order,
+                )
+                or {}
+            )
+            attempt = {
+                "level": level.level,
+                "label": level.label,
+                "query": level.query,
+                "categories": list(level.categories),
+                "submitted_days_ago": spec.submitted_days_ago,
+                "ok": bool(tool_result.get("ok", False)),
+            }
+            if not attempt["ok"]:
+                attempts.append(attempt)
+                if collected:
+                    # 已有更严格级别的结果时，后续放宽失败不应吞掉已拿到的论文。
+                    break
+                # 首次检索就失败属于工具故障，交给 execute() 转成可恢复错误。
+                return SearchArxivOutput(papers=[], tool_result=tool_result, search_spec=tool_args, relaxation=_relaxation_summary(spec, attempts=attempts, papers=[]))
+            last_result = tool_result
+            data = tool_result.get("data") if isinstance(tool_result.get("data"), Mapping) else {}
+            level_papers = extract_papers(data)
+            added = 0
+            for paper in level_papers:
+                key = paper_key(paper)
+                if key and key in seen_keys:
+                    continue
+                if key:
+                    seen_keys.add(key)
+                # 记录论文来自哪一级，越严格的级别排得越靠前，也方便回答里解释“这些是放宽后找到的”。
+                collected.append({**paper, "match_level": level.level})
+                added += 1
+            attempt["total_results"] = int(data.get("total_results") or len(level_papers))
+            attempt["new_papers"] = added
+            attempts.append(attempt)
+            if len(collected) >= requested:
+                break
+
+        papers = collected[:requested]
+        merged_result = dict(last_result)
+        merged_data = dict(last_result.get("data") or {}) if isinstance(last_result.get("data"), Mapping) else {}
+        merged_data["papers"] = papers
+        merged_result["data"] = merged_data
+        merged_result["summary"] = f"找到 {len(papers)} 篇 arXiv 论文"
+        merged_trace = dict(last_result.get("trace") or {}) if isinstance(last_result.get("trace"), Mapping) else {}
+        merged_trace["ladder_attempts"] = attempts
+        merged_result["trace"] = merged_trace
         return SearchArxivOutput(
-            papers=extract_papers((tool_result or {}).get("data") or {}),
-            tool_result=dict(tool_result or {}),
+            papers=papers,
+            tool_result=merged_result,
             search_spec=tool_args,
+            relaxation=_relaxation_summary(spec, attempts=attempts, papers=papers),
         )
 
 
@@ -384,15 +497,46 @@ class PersonalizePaperResultsAdapter(BaseToolAdapter[PersonalizePaperResultsInpu
 
     def _run(self, tool_input: PersonalizePaperResultsInput) -> RankedPapersOutput:
         papers = extract_papers(tool_input.arxiv_results)
-        personalized = bool(tool_input.user_memory_summary or tool_input.research_profile)
+        positive_topics, negative_topics = _profile_topic_lists(tool_input.research_profile, tool_input.user_memory_summary)
+        scored = []
+        for index, paper in enumerate(papers):
+            text = f"{paper.get('title') or ''} {paper.get('summary') or paper.get('abstract') or ''}"
+            matched = [topic for topic in positive_topics if _topic_matches(topic, text)]
+            avoided = [topic for topic in negative_topics if _topic_matches(topic, text)]
+            # 匹配级别（阶梯越严格越靠前）始终是第一排序键：画像只在同一检索级别内部调整先后，
+            # 不能把只是“符合画像”的放宽结果排到严格命中的论文前面。
+            level_rank = _LEVEL_ORDER.get(str(paper.get("match_level") or ""), 0)
+            scored.append(((level_rank, len(avoided) - len(matched), index), paper, matched))
         ranked: List[Dict[str, Any]] = []
-        for index, paper in enumerate(papers, start=1):
+        for rank, (_, paper, matched) in enumerate(sorted(scored, key=lambda item: item[0]), start=1):
             next_paper = dict(paper)
-            next_paper["rank"] = index
-            if personalized:
-                next_paper.setdefault("reason", "matched_profile_context")
+            next_paper["rank"] = rank
+            if matched:
+                next_paper.setdefault("reason", f"matched_profile_topics:{', '.join(matched[:3])}")
             ranked.append(next_paper)
         return RankedPapersOutput(ranked_papers=ranked)
+
+
+_LEVEL_ORDER = {"strict": 0, "drop_optional_terms": 1, "loosen_phrases": 2, "drop_inferred_categories": 3}
+
+
+def _profile_topic_lists(*sources: Any) -> tuple[List[str], List[str]]:
+    positive: List[str] = []
+    negative: List[str] = []
+    for source in sources:
+        source = _coerce_model_payload(source)
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("positive_topics", "recent_topics"):
+            positive.extend(str(item).strip() for item in source.get(key) or [] if str(item).strip())
+        negative.extend(str(item).strip() for item in source.get("negative_topics") or [] if str(item).strip())
+    return list(dict.fromkeys(positive)), list(dict.fromkeys(negative))
+
+
+def _topic_matches(topic: str, text: str) -> bool:
+    """画像主题的英文词全部出现在标题/摘要中才算命中，避免单个泛词把排序带偏。"""
+    topic_tokens = set(text_tokens(topic))
+    return bool(topic_tokens) and topic_tokens <= set(text_tokens(text))
 
 
 class SynthesizeArxivResponseAdapter(BaseToolAdapter[SynthesizeArxivResponseInput, FinalAnswerOutput]):
@@ -404,10 +548,68 @@ class SynthesizeArxivResponseAdapter(BaseToolAdapter[SynthesizeArxivResponseInpu
         ranked_papers = tool_input.ranked_papers or extract_papers(tool_input.arxiv_results)
         quality = tool_input.arxiv_result_quality or {}
         result_count = int(quality.get("result_count") or len(ranked_papers or []))
+        relaxation = _relaxation_from(tool_input.arxiv_results)
         if result_count <= 0:
-            return FinalAnswerOutput(final_answer="当前没有检索到合适的 arXiv 结果，建议收窄或改写查询后重试。")
+            return FinalAnswerOutput(final_answer=_empty_result_answer(relaxation))
         titles = [str((paper or {}).get("title") or "").strip() for paper in list(ranked_papers or [])[:3] if str((paper or {}).get("title") or "").strip()]
         title_summary = "；".join(titles) if titles else "已返回相关论文"
         if tool_input.personalized_rerank_applied:
-            return FinalAnswerOutput(final_answer=f"已检索到 {result_count} 篇相关 arXiv 论文，并结合用户上下文完成排序。优先关注：{title_summary}。")
-        return FinalAnswerOutput(final_answer=f"已检索到 {result_count} 篇相关 arXiv 论文。优先关注：{title_summary}。")
+            answer = f"已检索到 {result_count} 篇相关 arXiv 论文，并结合你的研究画像调整了排序。优先关注：{title_summary}。"
+        else:
+            answer = f"已检索到 {result_count} 篇相关 arXiv 论文。优先关注：{title_summary}。"
+        notes = _relaxation_notes(relaxation, result_count)
+        return FinalAnswerOutput(final_answer="\n\n".join([answer, *notes]) if notes else answer)
+
+
+def _relaxation_from(value: Any) -> Dict[str, Any]:
+    value = _coerce_model_payload(value)
+    relaxation = value.get("relaxation") if isinstance(value, Mapping) else None
+    return dict(relaxation) if isinstance(relaxation, Mapping) else {}
+
+
+def _describe_attempt(attempt: Mapping[str, Any]) -> str:
+    parts = [f"`{attempt.get('query')}`"]
+    categories = [str(item) for item in attempt.get("categories") or []]
+    parts.append(f"分类 {', '.join(categories)}" if categories else "不限分类")
+    if attempt.get("submitted_days_ago") is not None:
+        parts.append(f"最近 {attempt.get('submitted_days_ago')} 天")
+    result = f"{attempt.get('total_results', 0)} 篇" if attempt.get("ok") else "检索失败"
+    return f"{attempt.get('label') or attempt.get('level')}：{' · '.join(parts)} → {result}"
+
+
+def _empty_result_answer(relaxation: Mapping[str, Any]) -> str:
+    attempts = [item for item in relaxation.get("attempts") or [] if isinstance(item, Mapping)]
+    if relaxation.get("note") == "no_searchable_terms":
+        return "没能从你的描述里提取出可用于 arXiv 检索的英文关键词。可以直接给出英文术语（例如 retrieval-augmented generation），我再帮你检索。"
+    if not attempts:
+        return "没有检索到符合条件的 arXiv 论文。可以尝试放宽时间范围或换一个更通用的关键词。"
+    lines = ["没有找到符合条件的论文。已依次尝试以下检索："]
+    lines.extend(f"{index}. {_describe_attempt(attempt)}" for index, attempt in enumerate(attempts, start=1))
+    suggestions: List[str] = []
+    days = next((item.get("submitted_days_ago") for item in attempts if item.get("submitted_days_ago") is not None), None)
+    locked = set(relaxation.get("locked_constraints") or [])
+    if days is not None:
+        reason = "这是你指定的时间范围，我没有自动放宽" if "submitted_days_ago" in locked else "当前限定了时间范围"
+        suggestions.append(f"放宽时间范围（{reason}），例如改为最近 {max(int(days) * 4, 30)} 天")
+    if "categories" in locked:
+        suggestions.append("去掉你指定的分类限制")
+    suggestions.append("换一个更通用的关键词，或补充常见的英文写法")
+    lines.append("建议：" + "；".join(suggestions) + "。")
+    return "\n".join(lines)
+
+
+def _relaxation_notes(relaxation: Mapping[str, Any], result_count: int) -> List[str]:
+    notes: List[str] = []
+    profile_concepts = [str(item) for item in relaxation.get("profile_concepts") or [] if str(item).strip()]
+    if profile_concepts:
+        notes.append(f"你没有指定检索主题，我按研究画像补全为「{'、'.join(profile_concepts)}」。")
+    attempts = [item for item in relaxation.get("attempts") or [] if isinstance(item, Mapping) and item.get("ok")]
+    relaxed = [item for item in attempts[1:] if item.get("new_papers")]
+    if relaxed:
+        labels = "、".join(str(item.get("label") or item.get("level")) for item in relaxed)
+        strict_count = int(attempts[0].get("new_papers") or 0) if attempts else 0
+        notes.append(f"严格条件下只找到 {strict_count} 篇，其余结果来自放宽后的检索（{labels}）。")
+    requested = int(relaxation.get("requested") or 0)
+    if requested and result_count < requested and relaxation.get("attempts"):
+        notes.append(f"可自动放宽的条件已经用完，实际只找到 {result_count} 篇（你要的是 {requested} 篇）。")
+    return notes

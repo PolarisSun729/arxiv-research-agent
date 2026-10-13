@@ -169,6 +169,37 @@ def test_local_search_uses_fts_token_matching_without_substring_false_positive()
     assert result["query_capability"]["full_arxiv_syntax_supported"] is False
 
 
+def test_local_relevance_sort_ranks_title_hits_above_newer_abstract_mentions() -> None:
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    service.upsert_arxiv_oai_papers(
+        [
+            _paper(
+                "2401.00011",
+                title="Scaling Laws for Vision Transformers",
+                abstract="We briefly compare with retrieval-augmented generation baselines.",
+                categories=["cs.CV"],
+                updated="2024-03-01",
+            ),
+            _paper(
+                "2401.00012",
+                title="Retrieval-Augmented Generation with Graph Memory",
+                abstract="A RAG system with graph memory.",
+                categories=["cs.CL"],
+                updated="2024-01-15",
+            ),
+        ]
+    )
+
+    by_relevance = service.search(search_query='all:"retrieval augmented generation"', max_results=1, sort_by="relevance")
+    by_date = service.search(search_query='all:"retrieval augmented generation"', max_results=1, sort_by="submittedDate")
+
+    # relevance 不能只是“最新的 N 篇”：标题命中的论文应排在只在摘要里顺带提到的新论文前面。
+    assert [paper["arxiv_id"] for paper in by_relevance["papers"]] == ["2401.00012"]
+    assert [paper["arxiv_id"] for paper in by_date["papers"]] == ["2401.00011"]
+    assert by_relevance["total_results"] == 2
+
+
 def test_local_search_respects_phrase_quotes_and_does_not_split_boolean_inside_phrase() -> None:
     service = _make_temp_service()
     _skip_if_fts5_unavailable(service)

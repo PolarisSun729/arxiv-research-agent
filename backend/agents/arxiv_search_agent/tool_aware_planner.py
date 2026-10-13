@@ -705,7 +705,11 @@ class RuleBasedToolAwarePlanBuilder:
         personalize = self._optional_tool(tools_by_name, preferred_name="personalize_paper_results", required_tags={"personalize", "rerank"})
         has_profile_context = _has_any_context_key(state, {"user_memory_summary", "memory_summary", "research_profile"})
         synthesize_depends_on = ["validate_arxiv_results"]
-        synthesize_bindings = [_binding_dict("arxiv_result_quality", source_type="step_output", step_id="validate_arxiv_results")]
+        synthesize_bindings = [
+            _binding_dict("arxiv_result_quality", source_type="step_output", step_id="validate_arxiv_results"),
+            # 回答需要读取阶梯检索记录，才能说明放宽过程或在没结果时列出已尝试的查询。
+            _binding_dict("arxiv_results", source_type="step_output", step_id="search_arxiv", required=False),
+        ]
         if personalize and has_profile_context:
             steps.append(
                 self._draft_step(

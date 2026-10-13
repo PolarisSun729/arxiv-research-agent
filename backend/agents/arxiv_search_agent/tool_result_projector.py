@@ -38,6 +38,9 @@ _LEGACY_OUTPUT_PROJECTION = {
     "normalized_request": ["intent", "message", "search_spec"],
     "search_spec": [
         "intent",
+        "concepts",
+        "optional_terms",
+        "constraint_sources",
         "query",
         "title_query",
         "abstract_query",
