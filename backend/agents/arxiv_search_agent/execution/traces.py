@@ -74,8 +74,8 @@ def _safe_compact(value: Any, *, limit: int = 1200) -> Any:
 def _json_safe(value: Any) -> Any:
     """把跨节点运行现场裁剪成 JSON 友好的数据。
 
-    PlanRuntime 内部仍可能短暂持有 Pydantic 对象或工具返回的复杂对象；写入 runtime_state /
-    runtime_patch 时必须先降级成普通 dict/list/标量，避免 checkpoint 依赖不可序列化实例。
+    PlanRuntime 内部仍可能短暂持有 Pydantic 对象或工具返回的复杂对象；写入 runtime_state
+    时必须先降级成普通 dict/list/标量，避免 checkpoint 依赖不可序列化实例。
     """
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value

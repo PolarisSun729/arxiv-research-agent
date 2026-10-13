@@ -529,7 +529,8 @@ def _ensure_runtime(state: AgentState, *, allow_missing: bool = False) -> Option
 def _apply_step_result(state: AgentState, result: StepExecutionResult) -> None:
     """把单步执行结果写回 AgentState，供流式事件和调试面板消费。"""
     state.debug = dict(state.debug or {})
-    state.debug["last_step_result"] = result.model_dump(mode="json")
+    # turn_result 下面立即直接应用；debug 里只留本步摘要，避免完整运行现场随每个节点进入 checkpoint 和 SSE。
+    state.debug["last_step_result"] = result.model_dump(mode="json", exclude={"turn_result"})
     display_status = _display_step_status_from_plan_status(result.step_status, next_action=result.next_action)
     state.steps = list(state.steps or []) + [
         AgentStep(

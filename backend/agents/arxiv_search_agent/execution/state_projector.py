@@ -64,24 +64,6 @@ class RuntimeStateProjector:
             final_answer=runtime.final_answer,
         )
 
-    def build_patch(self, runtime: PlanRuntime, *, current_step: Optional[PlanStep]) -> Dict[str, Any]:
-        runtime_state = self.build_runtime_state(runtime, current_step=current_step)
-        return {
-            "runtime_state": _json_safe(runtime_state),
-            "plan_runtime": _json_safe(runtime),
-            "current_step_id": runtime_state.current_step_id,
-            "step_status": dict(runtime.step_status or {}),
-            "outputs": _json_safe(runtime.outputs or {}),
-            "last_observation": _json_safe(runtime.last_observation),
-            "last_step_output": _json_safe(runtime.last_step_output),
-            "interaction": _json_safe(runtime.interaction) if runtime.interaction else None,
-            "needs_replan": bool(runtime.needs_replan),
-            "is_finished": bool(runtime_state.is_finished),
-            "failure_reason": runtime.error,
-            "recovery_strategy": _json_safe(runtime.recovery_strategy or {}),
-            "execution_path": self.execution_path_builder(runtime, current_step_id=runtime_state.current_step_id),
-        }
-
     def apply(self, state: AgentState, runtime: PlanRuntime, *, current_step: Optional[PlanStep]) -> None:
         runtime.current_step_id = current_step.step_id if current_step else None
         runtime.current_step_index = None

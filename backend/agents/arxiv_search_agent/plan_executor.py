@@ -141,8 +141,8 @@ class PlanExecutor:
     ) -> StepExecutionResult:
         """只执行一个待执行 step，并返回结构化结果。
 
-        旧执行器的大循环会继续调用这个方法完成兼容路径；未来 LangGraph 节点可以直接消费
-        StepExecutionResult.runtime_patch，把单步输出、observation、确认态和恢复建议写入 checkpoint。
+        旧执行器的大循环会继续调用这个方法完成兼容路径；运行现场由 state_projector 同步到
+        AgentState.plan_runtime / runtime_state，这里只返回本步的结构化摘要。
         """
         step = self.select_next_step(runtime, state)
         if step is None:
@@ -155,7 +155,6 @@ class PlanExecutor:
                 next_action="finish" if turn_result.status not in {"failed", "fallback"} else "fail",
                 error=turn_result.error,
                 interaction=turn_result.interaction,
-                runtime_patch=self._build_runtime_patch(runtime, current_step=None),
                 turn_result=turn_result,
             )
 
@@ -940,7 +939,6 @@ class PlanExecutor:
             observation=observation,
             next_action=next_action,
             interaction=runtime.interaction,
-            runtime_patch=self._build_runtime_patch(runtime, current_step=step),
             turn_result=turn_result,
         )
 
@@ -966,7 +964,6 @@ class PlanExecutor:
             observation=dict(observation or {}) if observation else None,
             next_action=next_action,  # type: ignore[arg-type]
             interaction=interaction,
-            runtime_patch=self._build_runtime_patch(runtime, current_step=step),
             turn_result=turn_result,
         )
 
@@ -1035,9 +1032,6 @@ class PlanExecutor:
         if runtime.needs_replan or (observation and observation.get("status") not in {None, "success", "partial_success"}):
             return "replan"
         return "continue"
-
-    def _build_runtime_patch(self, runtime: PlanRuntime, *, current_step: Optional[PlanStep]) -> Dict[str, Any]:
-        return self.state_projector.build_patch(runtime, current_step=current_step)
 
     def _sync_runtime_state(self, state: AgentState, runtime: PlanRuntime, *, current_step: Optional[PlanStep]) -> None:
         self.state_projector.apply(state, runtime, current_step=current_step)
