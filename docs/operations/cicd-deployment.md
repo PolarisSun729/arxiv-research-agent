@@ -32,6 +32,7 @@ GitHub 构建经过检查的确切提交，服务器安装同一个发布包。�
 | --- | --- |
 | [发布工作流](../../.github/workflows/deploy.yml) | main 推送/手动运行的总入口，全部检查通过且显式开启后才部署。 |
 | [质量工作流](../../.github/workflows/quality-gate.yml) | 在 `python:3.11-bookworm` 中运行统一质量门，可生成离线发布包。 |
+| [Release 附件工作流](../../.github/workflows/release-assets.yml) | 发布 GitHub Release 时，把该 tag 对应提交的离线发布包、哈希和清单附到 Release。 |
 | [打包脚本](../../deploy/package_release.py) | 从确切 Git SHA 取源码，加入前端构建和带哈希的 CPU wheels。 |
 | [SSH 发布入口](../../deploy/publish_ssh.sh) | 使用专用私钥与固定主机指纹上传并触发安装。 |
 | [服务器发布脚本](../../deploy/apply_release.py) | 校验、安装、关联共享数据、切换版本和失败回退。 |
@@ -299,6 +300,20 @@ Settings → Secrets and variables → Actions → **Variables** 中配置仓库
 自动发布入口监听 main 的 push/手动运行，先通过复用质量门和密钥扫描；质量门以 `package_release: true` 上传当前 SHA 的 artifact；deploy 作业绑定 production，并从同一 run 下载 artifact 调用 SSH 脚本。发布串行执行，发送前检查当前 main 是否仍为本次 SHA，避免积压任务把已经淘汰的提交重新部署。所有第三方 Actions 固定到核验过的提交。
 
 确认首次配置完成后，推送 main，或在 Actions → release → Run workflow 选择 main。查看质量检查、发布包、SSH 安装和健康检查各阶段。一次普通更新的安装失败不会切换 `current`；新进程检查失败会切回旧版本。首次失败时没有旧版本，服务会保持停止。
+
+### 版本附件
+
+发布包 artifact 只保留 3 天。在 GitHub 上发布版本（`gh release create vX.Y.Z`）后，[Release 附件工作流](../../.github/workflows/release-assets.yml) 会把该 tag 对应提交的发布包长期附到 Release 上：
+
+| 附件 | 内容 |
+| --- | --- |
+| `arxiv-research-agent-vX.Y.Z-debian12-x86_64.tar.gz` | 离线发布包：源码、前端构建和全部依赖 wheel |
+| `arxiv-research-agent-vX.Y.Z-debian12-x86_64.tar.gz.sha256` | 发布包的 SHA-256，文件内只有哈希值 |
+| `arxiv-research-agent-vX.Y.Z-release.json` | 发布清单：提交、运行环境、依赖哈希和 wheel 数量 |
+
+工作流优先复用该提交在 3 天内已通过质量门的 artifact，部署过的版本附上的就是服务器实际安装的那一份；找不到时会在该 tag 上重新运行质量门并打包。工作流会校验哈希，并确认清单里的提交与 tag 一致，重复运行时覆盖同名附件。没有成功附上时，可以在 artifact 过期前用 Actions → release-assets → Run workflow 填入 tag 补传。
+
+要把某个历史版本原样重新部署到服务器，可以下载附件，改名为 `release.tar.gz` / `release.sha256` 放进同一个目录，用 `ARTIFACT_DIR` 指向该目录后运行 [SSH 发布入口](../../deploy/publish_ssh.sh)，所需环境变量见脚本开头的说明。
 
 ## 9. 创建管理员或迁移现有账号
 

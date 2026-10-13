@@ -1,0 +1,124 @@
+name: release-assets
+
+# 发布 GitHub Release 时，把该 tag 对应提交的离线发布包附到 Release 上。
+# Actions artifact 只保留 3 天；附到 Release 后，任意历史版本都能原样重装或回退。
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要补充附件的已发布版本 tag，如 v1.1.0"
+        required: true
+        type: string
+
+concurrency:
+  group: release-assets-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  locate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      tag: ${{ steps.find.outputs.tag }}
+      sha: ${{ steps.find.outputs.sha }}
+      run_id: ${{ steps.find.outputs.run_id }}
+    steps:
+      - name: Resolve tag and find tested release
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # tag 会进入 API 路径和附件文件名，先限定字符集。
+          [[ "$TAG" =~ ^v[0-9A-Za-z._-]+$ ]]
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)
+          # 优先复用该提交已通过质量门的发布包：部署过的话，它就是服务器上实际安装的那一份。
+          run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=arxiv-release-$sha&per_page=100" \
+            --jq '[.artifacts[] | select(.expired | not)] | sort_by(.created_at) | last | .workflow_run.id // empty')
+          if [[ -z "$run_id" && "$sha" != "$GITHUB_SHA" ]]; then
+            # 重新打包只能构建本次运行检出的提交；手动补历史版本时 artifact 过期就无法原样补充。
+            echo "::error::$TAG 的发布包 artifact 已过期，且该 tag 不是本次运行的提交，无法重新打包。"
+            exit 1
+          fi
+          {
+            echo "tag=$TAG"
+            echo "sha=$sha"
+            echo "run_id=$run_id"
+          } >> "$GITHUB_OUTPUT"
+          if [[ -n "$run_id" ]]; then
+            echo "复用 run $run_id 中已通过质量门的发布包。" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "没有可复用的发布包，重新运行质量门并打包。" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  package:
+    needs: locate
+    if: needs.locate.outputs.run_id == ''
+    uses: ./.github/workflows/quality-gate.yml
+    with:
+      package_release: true
+
+  upload:
+    needs: [locate, package]
+    # package 被跳过（复用已有发布包）也要继续上传。
+    if: always() && needs.locate.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download release built in this run
+        if: needs.locate.outputs.run_id == ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: arxiv-release-${{ needs.locate.outputs.sha }}
+          path: temp/ci-release
+
+      - name: Download release from earlier run
+        if: needs.locate.outputs.run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ needs.locate.outputs.run_id }}
+          SHA: ${{ needs.locate.outputs.sha }}
+        run: gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -n "arxiv-release-$SHA" -D temp/ci-release
+
+      - name: Verify and attach to release
+        working-directory: temp/ci-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.locate.outputs.tag }}
+          SHA: ${{ needs.locate.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest=$(tr -d '\r\n' < release.sha256)
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          echo "$digest  release.tar.gz" | sha256sum -c -
+          tar -xzf release.tar.gz release.json
+          # 清单里的提交必须就是 tag 指向的提交；平台名取自清单，避免文件名与实际构建环境不符。
+          platform=$(python3 - "$SHA" <<'PY'
+          import json, sys
+          manifest = json.load(open("release.json", encoding="utf-8"))
+          if manifest["commit"] != sys.argv[1]:
+              raise SystemExit(f"清单提交 {manifest['commit']} 与 tag 提交 {sys.argv[1]} 不一致")
+          runtime = manifest["runtime"]
+          print(f"{runtime['distribution']}{runtime['version']}-{runtime['machine']}")
+          PY
+          )
+          base="arxiv-research-agent-$TAG-$platform"
+          mv release.tar.gz "$base.tar.gz"
+          # 文件内容保持只有哈希值，改回 release.sha256 后可直接交给 publish_ssh.sh 使用。
+          mv release.sha256 "$base.tar.gz.sha256"
+          mv release.json "arxiv-research-agent-$TAG-release.json"
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber \
+            "$base.tar.gz" "$base.tar.gz.sha256" "arxiv-research-agent-$TAG-release.json"
+          echo "已将 $base.tar.gz 附到 $TAG。" >> "$GITHUB_STEP_SUMMARY"
