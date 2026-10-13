@@ -7,8 +7,10 @@
 
 import json
 import logging
+import multiprocessing
 import os
 import re
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -69,8 +71,29 @@ class LoadingService:
         if normalized_method == "pymupdf":
             return self._load_with_pymupdf(file_path)
         if normalized_method == "docling":
+            if DOCLING_CONFIG.get("subprocess_enabled", True):
+                return self._load_with_docling_in_subprocess(file_path)
             return self._load_with_docling(file_path)
         raise ValueError(f"Unsupported PDF loading method: {method}")
+
+    def _load_with_docling_in_subprocess(self, file_path: str) -> dict:
+        """在独立子进程中执行 Docling 解析，并把页数与页映射同步回当前实例。
+
+        Docling 的 C++/torch 扩展会长时间占住 GIL；若在 Web 进程的线程里解析，
+        事件循环拿不到执行机会，gunicorn 心跳超时后会直接杀掉整个 worker。
+        这里用 spawn 而不是 fork：父进程已有多个线程，fork 后子进程可能继承到被锁住的锁。
+        每次解析都新建子进程，结束即释放 Docling 模型占用的内存。
+        """
+        context = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=1,
+            mp_context=context,
+            initializer=_init_docling_subprocess,
+        ) as executor:
+            document, page_map, total_pages = executor.submit(_load_docling_document, file_path).result()
+        self.current_page_map = page_map
+        self.total_pages = total_pages
+        return document
 
     def get_page_map(self) -> list:
         """返回当前缓存的页级结构数据。
@@ -2750,3 +2773,26 @@ class LoadingService:
         if not font_name:
             return False
         return bool(re.search(r"(italic|oblique|ital)", font_name, re.IGNORECASE))
+
+
+def _init_docling_subprocess() -> None:
+    """spawn 出的子进程不继承父进程的日志配置，需要重新配置，Docling 日志才能进入 journald。
+
+    同时调低子进程的调度优先级：生产机只有 CPU，Docling 推理会占满所有核，
+    降低优先级后 Web 进程仍能及时拿到 CPU 处理请求和 gunicorn 心跳。
+    """
+    from utils.logging_utils import configure_backend_logging
+
+    configure_backend_logging()
+    if hasattr(os, "nice"):
+        os.nice(10)
+
+
+def _load_docling_document(file_path: str) -> tuple:
+    """子进程入口：返回 Docling 文档及父进程需要回填的页映射、页数。
+
+    page_map 与 document["pages"] 是同一个列表，放在同一个元组里返回，pickle 后仍保持同一引用。
+    """
+    service = LoadingService()
+    document = service._load_with_docling(file_path)
+    return document, service.current_page_map, service.total_pages

@@ -109,6 +109,8 @@ BACKEND_LOGGING_CONFIG: Dict[str, Any] = {
 }
 
 DOCLING_CONFIG: Dict[str, Any] = {
+    # Docling 解析放进独立子进程，避免长时间占住 Web 进程的 GIL 导致 gunicorn worker 心跳超时被杀。
+    "subprocess_enabled": _env_bool("DOCLING_SUBPROCESS_ENABLED", True),
     "do_ocr_enabled": _env_bool("DOCLING_OCR_ENABLED", False),
     "annotated_pdf_export_enabled": _env_bool("DOCLING_ANNOTATED_PDF_EXPORT_ENABLED", True),
     # Docling 会按 images_scale 渲染页面/图片资产；默认保持低倍率，避免 30+ 页论文在建索引时生成超大图。
