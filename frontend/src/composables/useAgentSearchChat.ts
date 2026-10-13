@@ -11,6 +11,7 @@ import {
 } from '@/api/agent'
 import { getApiErrorMessage, getErrorMessage } from '@/api/errors'
 import { isRecord } from '@/utils/guards'
+import { applyProgressEvent, createRunProgress, finishRunProgress } from '@/utils/agentRunProgress'
 import type {
   AgentInteraction,
   AgentPaper,
@@ -90,6 +91,8 @@ function getStreamEventErrorMessage(event: AgentStreamEvent, response: ArxivSear
 function applyStreamEvent(target: AgentChatMessage<ArxivSearchResponse>, event: AgentStreamEvent) {
   const response = target.response || createDraftResponse()
   const payload = event.data || {}
+  // 中间步骤时间线与最终响应并行维护：final_response 会替换 response，但进度要保留下来供用户回看。
+  target.progress = applyProgressEvent(target.progress || createRunProgress(Date.now()), event, Date.now())
   if (event.event_type === 'final_response' && payload.response) {
     target.response = payload.response as ArxivSearchResponse
     target.content = target.response.answer || ''
@@ -464,7 +467,8 @@ export function useAgentSearchChat() {
       loading: true,
       createdAt,
       response: createDraftResponse(),
-      error: null
+      error: null,
+      progress: createRunProgress(Date.now())
     })
     messages.value.push(assistantMessage)
     // 用户切换账号或清空对话后，旧请求可能仍会返回；此时只结束全局 loading，不再回写当前会话状态。
@@ -514,7 +518,17 @@ export function useAgentSearchChat() {
         ElMessage.error(messageText)
       }
     } finally {
-      if (isAssistantMessageActive()) assistantMessage.loading = false
+      if (isAssistantMessageActive()) {
+        assistantMessage.loading = false
+        // 同步 fallback 或网络中断时收不到结束事件，这里兜底收尾，避免时间线一直显示运行中。
+        if (assistantMessage.progress) {
+          assistantMessage.progress = finishRunProgress(
+            assistantMessage.progress,
+            Date.now(),
+            assistantMessage.error ? 'failed' : 'done'
+          )
+        }
+      }
       loading.value = false
     }
   }

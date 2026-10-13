@@ -63,6 +63,28 @@ export interface AgentStreamingState {
   active_tool_call?: AgentToolCall | null
 }
 
+export type AgentProgressStatus = 'running' | 'success' | 'failed' | 'skipped'
+
+/** 时间线上的一个用户可见步骤，由流式事件归约而来。 */
+export interface AgentProgressEntry {
+  key: string
+  node: string
+  label: string
+  status: AgentProgressStatus
+  facts: string[]
+  toolName?: string | null
+  startedAt: number
+  endedAt?: number | null
+}
+
+/** 一次 Agent 运行的实时进度；时间戳取前端收到事件的本地时间，避免与服务端时钟偏差。 */
+export interface AgentRunProgress {
+  status: 'running' | 'done' | 'failed'
+  startedAt: number
+  endedAt?: number | null
+  entries: AgentProgressEntry[]
+}
+
 export interface AgentStreamEvent {
   event_type:
     | 'run_start'

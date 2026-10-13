@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, useSlots, watch } from 'vue'
 import { BubbleList, Prompts, Thinking, Welcome, XSender } from 'vue-element-plus-x'
 import type { PromptsItemsProps } from 'vue-element-plus-x/types/Prompts'
 import type { RetrievalDebug } from '@/api/papers'
@@ -53,7 +53,12 @@ const emit = defineEmits<{
 
 defineSlots<{
   'message-footer'?(props: { item: RagChatPanelMessage }): any
+  'message-progress'?(props: { item: RagChatPanelMessage }): any
 }>()
+
+// 父组件提供了进度插槽时，由它展示实时执行过程，面板不再叠加通用的“正在生成”占位。
+const slots = useSlots()
+const hasProgressSlot = computed(() => Boolean(slots['message-progress']))
 
 const senderRef = ref<SenderExpose | null>(null)
 
@@ -228,15 +233,25 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
           </div>
         </template>
 
+        <!-- Bubble 在 loading 时会用 loading 插槽整体替换 content；有进度插槽时由它展示实时执行过程。 -->
+        <template v-if="hasProgressSlot" #loading="{ item }">
+          <div class="rag-chat-panel__progress-loading">
+            <slot name="message-progress" :item="item" />
+          </div>
+        </template>
+
         <template #content="{ item }">
-          <Thinking
-            v-if="item.role === 'assistant' && item.loading && !item.content"
-            class="rag-chat-panel__thinking"
-            :model-value="true"
-            status="thinking"
-            content="正在生成回复"
-            :auto-collapse="false"
-          />
+          <slot v-if="item.role === 'assistant' && hasProgressSlot" name="message-progress" :item="item" />
+          <template v-if="item.role === 'assistant' && item.loading && !item.content">
+            <Thinking
+              v-if="!hasProgressSlot"
+              class="rag-chat-panel__thinking"
+              :model-value="true"
+              status="thinking"
+              content="正在生成回复"
+              :auto-collapse="false"
+            />
+          </template>
           <div
             v-else-if="item.role === 'assistant'"
             class="assistant-markdown"
@@ -250,13 +265,13 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 
         <template #footer="{ item }">
           <div class="rag-chat-panel__message-footer">
-            <div v-if="item.role === 'assistant' && item.loading" class="streaming-indicator">
+            <div v-if="item.role === 'assistant' && item.loading && !hasProgressSlot" class="streaming-indicator">
               <span class="rag-chat-panel__stream-dot" />
               <span>正在生成中...</span>
             </div>
 
             <el-tag
-              v-if="item.role === 'assistant' && getAssistantStatusLabel(item)"
+              v-if="item.role === 'assistant' && getAssistantStatusLabel(item) && !(item.loading && hasProgressSlot)"
               class="answer-state-tag"
               size="small"
               effect="plain"
@@ -679,5 +694,18 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
   .rag-chat-panel__message-footer {
     gap: 10px;
   }
+}
+
+/* Bubble 的 loading 容器默认 fit-content 且居中排列三个点；放进度时间线时要撑满气泡宽度。 */
+:deep(.elx-bubble__content--loading:has(.rag-chat-panel__progress-loading)) {
+  width: 100%;
+}
+
+:deep(.elx-bubble__loading-wrap:has(.rag-chat-panel__progress-loading)) {
+  display: block;
+}
+
+.rag-chat-panel__progress-loading {
+  width: 100%;
 }
 </style>
