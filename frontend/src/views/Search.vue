@@ -8,9 +8,13 @@ import SearchBar from '@/components/SearchBar.vue'
 import PaperCard from '@/components/PaperCard.vue'
 import ArxivQueryCapabilityBanner from '@/components/arxiv/ArxivQueryCapabilityBanner.vue'
 import { selectSearchResults } from '@/utils/searchResults'
+import { getArxivSearchSuggestions } from '@/api/papers'
+import { useUserContext } from '@/composables/useUserContext'
+import type { ArxivSearchParams, ArxivSearchSuggestion } from '@/types/paper'
 
 const router = useRouter()
 const store = usePaperStore()
+const userContext = useUserContext()
 
 const searchForm = ref({
   searchQuery: '',
@@ -76,40 +80,102 @@ function isMarked(paper: { id: string; arxivId?: string; label?: string | null }
   return Boolean(paper.label) || (store.paperActionMap.read || []).includes(paper.arxivId || paper.id)
 }
 
+function resolveSubmittedDaysAgo() {
+  if (!searchForm.value.submittedDateBefore) return 30
+  const selectedDate = new Date(searchForm.value.submittedDateBefore)
+  const timeDiff = Date.now() - selectedDate.getTime()
+  return Math.floor(timeDiff / (1000 * 60 * 60 * 24))
+}
+
+function buildSearchParams(): ArxivSearchParams {
+  const submittedDaysAgo = resolveSubmittedDaysAgo()
+  return {
+    search_query: searchForm.value.searchQuery || undefined,
+    title: searchForm.value.title || undefined,
+    author: searchForm.value.author || undefined,
+    abstract: searchForm.value.abstract || undefined,
+    category: searchForm.value.category || undefined,
+    comment: searchForm.value.comment || undefined,
+    journal_ref: searchForm.value.journalRef || undefined,
+    report_number: searchForm.value.reportNumber || undefined,
+    operator: searchForm.value.operator || undefined,
+    max_results: searchForm.value.maxResults,
+    start: 0,
+    sort_by: searchForm.value.sortBy,
+    sort_order: searchForm.value.sortOrder,
+    submitted_days_ago: submittedDaysAgo > 0 ? submittedDaysAgo : undefined
+  }
+}
+
+// 至少搜过一次后，空结果才显示「没有找到」而不是「输入关键词开始搜索」。
+const hasSearched = ref(false)
+const searchedDaysAgo = ref<number | undefined>(30)
+const searchedQuery = ref('')
+const suggestions = ref<ArxivSearchSuggestion[]>([])
+let suggestionRequestId = 0
+
+const timeSuggestions = computed(() => suggestions.value.filter(item => item.kind === 'widen_time'))
+const querySuggestions = computed(() => suggestions.value.filter(item => item.kind !== 'widen_time'))
+// 普通搜索不接 LLM；想按语义找时引导到 Agent 搜索，只有能用 Agent 的角色才显示。
+const canAskAgent = computed(() => userContext.canResearch.value && Boolean(searchedQuery.value))
+// 后端返回的条数少于用户要的条数，说明当前条件下已经没有更多论文了（多拉不会让这个判断失真）。
+const resultsExhausted = computed(() =>
+  hasSearched.value && !store.loading && !hasCapabilityError.value && store.allPapers.length < searchedMaxResults.value
+)
+const showRelaxPanel = computed(() => resultsExhausted.value && (suggestions.value.length > 0 || canAskAgent.value))
+const relaxSummary = computed(() => {
+  const scope = searchedDaysAgo.value ? `近 ${searchedDaysAgo.value} 天内` : '当前条件下'
+  const count = store.allPapers.length
+  return count === 0 ? `${scope}没有命中论文，可以试试：` : `${scope}只命中 ${count} 篇，可以试试：`
+})
+
+async function loadSuggestions(params: ArxivSearchParams) {
+  const requestId = ++suggestionRequestId
+  try {
+    const result = await getArxivSearchSuggestions({ ...params, max_results: undefined })
+    if (requestId === suggestionRequestId) suggestions.value = result.suggestions
+  } catch {
+    // 建议只是辅助信息，取不到时不打扰用户。
+  }
+}
+
 async function handleSearch() {
   currentPage.value = 1
   searchedMaxResults.value = searchForm.value.maxResults
+  suggestions.value = []
+  suggestionRequestId += 1
+  const params = buildSearchParams()
 
-  let submittedDaysAgo = 30
-  
-  if (searchForm.value.submittedDateBefore) {
-    const selectedDate = new Date(searchForm.value.submittedDateBefore)
-    const today = new Date()
-    const timeDiff = today.getTime() - selectedDate.getTime()
-    submittedDaysAgo = Math.floor(timeDiff / (1000 * 60 * 60 * 24))
-  }
-  
   try {
-    await store.fetchArxivPapers({
-      search_query: searchForm.value.searchQuery || undefined,
-      title: searchForm.value.title || undefined,
-      author: searchForm.value.author || undefined,
-      abstract: searchForm.value.abstract || undefined,
-      category: searchForm.value.category || undefined,
-      comment: searchForm.value.comment || undefined,
-      journal_ref: searchForm.value.journalRef || undefined,
-      report_number: searchForm.value.reportNumber || undefined,
-      operator: searchForm.value.operator || undefined,
-      max_results: searchForm.value.maxResults,
-      start: 0,
-      sort_by: searchForm.value.sortBy,
-      sort_order: searchForm.value.sortOrder,
-      submitted_days_ago: submittedDaysAgo > 0 ? submittedDaysAgo : undefined
-    })
+    await store.fetchArxivPapers(params)
+    hasSearched.value = true
+    searchedDaysAgo.value = params.submitted_days_ago
+    searchedQuery.value = searchForm.value.searchQuery.trim()
+    if (resultsExhausted.value) void loadSuggestions(params)
   } catch (error) {
     // 本地 OAI 契约错误已在 store 内转成页面级 banner；这里只兜底未知请求失败。
     ElMessage.error(getErrorMessage(error, 'arXiv 搜索失败，请稍后重试'))
   }
+}
+
+function formatLocalDate(date: Date) {
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${date.getFullYear()}-${month}-${day}`
+}
+
+function applySuggestion(item: ArxivSearchSuggestion) {
+  if (item.kind === 'widen_time' && item.submitted_days_ago) {
+    // 表单按「从哪天起」记录时间窗口，这里换算回日期，重新搜索时会得到同样的天数。
+    searchForm.value.submittedDateBefore = formatLocalDate(new Date(Date.now() - item.submitted_days_ago * 86400000))
+  } else {
+    searchForm.value.searchQuery = item.search_query || ''
+  }
+  void handleSearch()
+}
+
+function askAgent() {
+  router.push({ path: '/agent-search', query: { q: `帮我找关于「${searchedQuery.value}」的论文` } })
 }
 
 onMounted(() => {
@@ -171,6 +237,26 @@ function handlePageChange(page: number) {
         </el-radio-group>
       </div>
 
+      <div v-if="showRelaxPanel" class="surface relax-panel">
+        <div class="relax-summary">{{ relaxSummary }}</div>
+        <div v-if="timeSuggestions.length" class="relax-row">
+          <span class="relax-label">放宽时间</span>
+          <el-button v-for="item in timeSuggestions" :key="item.label" size="small" @click="applySuggestion(item)">
+            {{ item.label }}<span v-if="item.total !== null" class="relax-count">· {{ item.total }} 篇</span>
+          </el-button>
+        </div>
+        <div v-if="querySuggestions.length" class="relax-row">
+          <span class="relax-label">放宽写法</span>
+          <el-button v-for="item in querySuggestions" :key="item.label" size="small" @click="applySuggestion(item)">
+            {{ item.label }}<span v-if="item.total !== null" class="relax-count">· {{ item.total }} 篇</span>
+          </el-button>
+        </div>
+        <div v-if="canAskAgent" class="relax-agent">
+          想按意思而不是关键词找？
+          <el-button link type="primary" @click="askAgent">用 Agent 搜索 →</el-button>
+        </div>
+      </div>
+
       <div v-if="store.loading" class="paper-list">
         <div v-for="n in 3" :key="n" class="surface skeleton-card">
           <el-skeleton :rows="3" animated />
@@ -185,7 +271,10 @@ function handlePageChange(page: number) {
       </div>
 
       <div v-else-if="store.allPapers.length === 0" class="surface empty">
-        <el-empty description="输入关键词开始搜索，或调整筛选条件" :image-size="96" />
+        <el-empty
+          :description="hasSearched ? '没有找到匹配的论文' : '输入关键词开始搜索，或调整筛选条件'"
+          :image-size="96"
+        />
       </div>
 
       <div v-else-if="visiblePapers.length === 0" class="surface empty">
@@ -251,6 +340,45 @@ function handlePageChange(page: number) {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.relax-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 20px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+
+.relax-summary {
+  color: var(--color-text);
+}
+
+.relax-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.relax-row .el-button {
+  margin-left: 0;
+}
+
+.relax-label {
+  flex: 0 0 auto;
+  min-width: 56px;
+  color: var(--color-text-3);
+}
+
+.relax-count {
+  margin-left: 4px;
+  color: var(--color-text-3);
+}
+
+.relax-agent {
+  color: var(--color-text-3);
 }
 
 /* 已标记的论文仍保留在结果里，只是淡化，方便扫过时跳过；悬停时恢复，避免影响阅读和操作。 */

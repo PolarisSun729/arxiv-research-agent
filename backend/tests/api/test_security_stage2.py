@@ -694,7 +694,10 @@ def test_rate_categories_follow_route_policies():
     for method, route in ROUTE_POLICIES:
         if (method, route) in expensive:
             expected = "expensive"
-        elif method in {"GET", "HEAD", "OPTIONS"} or (method, route) == ("POST", "/api/arxiv/search"):
+        elif method in {"GET", "HEAD", "OPTIONS"} or (method, route) in {
+            ("POST", "/api/arxiv/search"),
+            ("POST", "/api/arxiv/search/suggestions"),
+        }:
             expected = "read"
         else:
             expected = "write"

@@ -270,6 +270,23 @@ export interface ArxivSearchParams {
   submitted_days_ago?: number
 }
 
+export type ArxivSearchSuggestionKind = 'widen_time' | 'expand_abbreviation' | 'drop_term' | 'any_term'
+
+// 结果偏少时的放宽候选；search_query / submitted_days_ago 是应用后的完整取值。
+export interface ArxivSearchSuggestion {
+  kind: ArxivSearchSuggestionKind
+  label: string
+  search_query: string | null
+  submitted_days_ago: number | null
+  // 远程 arXiv API 后端不逐个计数，此时为 null。
+  total: number | null
+}
+
+export interface ArxivSearchSuggestions {
+  baseline_total: number | null
+  suggestions: ArxivSearchSuggestion[]
+}
+
 export interface LabelParams {
   label: PaperLabel
 }

@@ -53,6 +53,8 @@ _register(ALL_ROLES, None, [
     ("GET", "/api/auth/check"), ("GET", "/api/auth/me"), ("POST", "/api/auth/logout"), ("POST", "/api/auth/password"),
     # 公共元数据与统计
     ("GET", "/api/arxiv/fields"), ("GET", "/api/arxiv/categories"), ("GET", "/api/stats"),
+    # 搜索结果偏少时前端自动请求的放宽建议：本地只做 COUNT、远程后端不发请求，不应重复扣检索配额。
+    ("POST", "/api/arxiv/search/suggestions"),
     # 个人偏好、阅读记录与研究画像
     ("GET", "/api/user/preferences/{user_id}"), ("GET", "/api/user/paper-actions/{user_id}"),
     ("GET", "/api/user/research-profile/{user_id}"), ("GET", "/api/user/research-profile/{user_id}/detail"),
@@ -117,7 +119,7 @@ def _set_rate_category(category: str, routes) -> None:
 
 # ---- 速率类别的例外 ----
 # 检索虽然计 papers 配额，语义上是查询，与其他读取共用 read 预算。
-_set_rate_category("read", [("POST", "/api/arxiv/search")])
+_set_rate_category("read", [("POST", "/api/arxiv/search"), ("POST", "/api/arxiv/search/suggestions")])
 # 详情在本地缺失时会回源 arXiv、物化论文并生成 embedding（配额在路由内部按需扣减），
 # 不能因为是 GET 就降级为 read 预算。
 _set_rate_category("expensive", [("GET", "/api/paper/{arxiv_id}")])

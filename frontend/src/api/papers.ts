@@ -9,6 +9,7 @@ import type {
   PaginatedResponse,
   ArxivSearchResult,
   ArxivSearchParams,
+  ArxivSearchSuggestions,
   PaperMaterializationPayload,
   PaperPreferenceRequest,
   InterestVector,
@@ -509,6 +510,15 @@ export async function searchArxiv(params: ArxivSearchParams): Promise<ArxivSearc
     source: response.source || null,
     queryCapability: response.query_capability || null,
     warnings: Array.isArray(response.warnings) ? response.warnings : []
+  }
+}
+
+export async function getArxivSearchSuggestions(params: ArxivSearchParams): Promise<ArxivSearchSuggestions> {
+  // 与 searchArxiv 使用相同的默认时间窗口，候选的命中数才和页面上的结果可比。
+  const response: any = await request.post('/arxiv/search/suggestions', { submitted_days_ago: 30, ...params })
+  return {
+    baseline_total: typeof response?.baseline_total === 'number' ? response.baseline_total : null,
+    suggestions: Array.isArray(response?.suggestions) ? response.suggestions : []
   }
 }
 
