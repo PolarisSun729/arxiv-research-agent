@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh, Star, View, Plus, Check, Close } from '@element-plus/icons-vue'
 import { usePaperStore } from '@/stores/paperStore'
-import type { UserResearchProfile } from '@/types/paper'
+import type { ProfileTopicEvidence, ProfileTopicZone, UserResearchProfile } from '@/types/paper'
 import { useUserContext } from '@/composables/useUserContext'
 
 const store = usePaperStore()
@@ -64,10 +64,52 @@ const latestJobFailureSummary = computed(() => {
     ? failures.slice(-3).map(item => `${item.arxiv_id || 'unknown'}：${item.error_type || 'failed'}`).join('；')
     : ''
 })
-const selectedEvidence = computed(() => {
+const selectedEvidence = computed<ProfileTopicEvidence | null>(() => {
   const topic = selectedTopic.value
   return topic ? effectiveProfile.value?.topic_evidence?.[topic] || generatedProfile.value?.topic_evidence?.[topic] || null : null
 })
+// 手动放置的主题本身没有打分，分数取自它附带的自动证据；自动条目直接用自身。
+const selectedScores = computed<ProfileTopicEvidence | null>(() => {
+  const evidence = selectedEvidence.value
+  if (!evidence) return null
+  return evidence.provenance === 'manual' ? evidence.generated_evidence || null : evidence
+})
+
+const ZONE_LABELS: Record<ProfileTopicZone, string> = {
+  focus: '关注',
+  recent: '近期关注',
+  exclude: '排除'
+}
+const MANUAL_ACTION_LABELS: Record<string, string> = {
+  focus: '手动关注',
+  exclude: '手动排除',
+  pinned: '手动固定'
+}
+const REJECTION_REASON_LABELS: Record<string, string> = {
+  net_not_positive: '净分不为正，不能成为关注',
+  mixed_positive_negative_evidence: '正负证据混杂，一致性不足',
+  insufficient_positive_papers: '点赞论文数不足',
+  not_persistent_enough: '正向证据持续时间不够长，暂不升为长期关注',
+  insufficient_negative_papers: '点踩论文数不足',
+  weak_recent_signal: '近期信号较弱',
+  read_only_recent_signal: '近期只有阅读行为',
+  insufficient_recent_papers: '近期只有一篇论文涉及，暂不算近期关注',
+  focus_limit_exceeded: '关注区已满，被更高分主题挤出',
+  exclude_limit_exceeded: '排除区已满，被更高分主题挤出',
+  recent_limit_exceeded: '近期区已满，被更高分主题挤出'
+}
+
+function zoneText(zones: ProfileTopicZone[] | undefined) {
+  return zones?.length ? zones.map(zone => ZONE_LABELS[zone] || zone).join('、') : '未进入任何区'
+}
+
+function reasonText(reason: string) {
+  return REJECTION_REASON_LABELS[reason] || reason
+}
+
+function formatScore(value: number | undefined, digits = 2) {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '-'
+}
 
 function listOf(profile: UserResearchProfile | null | undefined, key: keyof UserResearchProfile): string[] {
   const value = profile?.[key]
@@ -295,28 +337,65 @@ onUnmounted(() => {
           <el-icon class="muted"><View /></el-icon>
         </header>
         <template v-if="selectedTopic && selectedEvidence">
-          <div class="evidence-scores">
-            <div class="surface-muted evidence-score">
-              <span>净分</span>
-              <strong>{{ selectedEvidence.net_score ?? '-' }}</strong>
-            </div>
-            <div class="surface-muted evidence-score">
-              <span>置信度</span>
-              <strong>{{ selectedEvidence.confidence ?? '-' }}</strong>
-            </div>
+          <div class="chip-row">
+            <span v-if="selectedEvidence.provenance === 'manual'" class="chip chip--primary">
+              {{ MANUAL_ACTION_LABELS[selectedEvidence.manual_action || ''] || '手动设置' }}
+            </span>
+            <span v-else class="chip">自动生成</span>
+            <span class="chip">所在区：{{ zoneText(selectedEvidence.placement) }}</span>
           </div>
-          <div class="topic-group">
-            <h3>来源论文</h3>
-            <div class="chip-row">
-              <span v-for="paper in selectedEvidence.source_papers || []" :key="paper" class="chip mono">{{ paper }}</span>
-            </div>
+          <div v-if="selectedEvidence.overridden_by_manual" class="notice notice--warning">
+            已被手动设置覆盖，自动证据原本将其放在：{{ zoneText(selectedScores?.placement) }}
           </div>
-          <div class="topic-group">
-            <h3>来源行为</h3>
-            <div class="chip-row">
-              <span v-for="action in selectedEvidence.source_actions || []" :key="action" class="chip">{{ action }}</span>
+          <p v-else-if="selectedEvidence.provenance === 'manual' && !selectedScores" class="muted">该主题由手动设置，暂无自动证据。</p>
+          <template v-if="selectedScores">
+            <div class="evidence-scores">
+              <div class="surface-muted evidence-score">
+                <span>净分</span>
+                <strong>{{ formatScore(selectedScores.net_score) }}</strong>
+              </div>
+              <div class="surface-muted evidence-score">
+                <span>置信度</span>
+                <strong>{{ formatScore(selectedScores.confidence) }}</strong>
+              </div>
+              <div class="surface-muted evidence-score">
+                <span>长期正向 / 负向</span>
+                <strong>{{ formatScore(selectedScores.long_pos) }} / {{ formatScore(selectedScores.long_neg) }}</strong>
+              </div>
+              <div class="surface-muted evidence-score">
+                <span>近期分 / 近期论文</span>
+                <strong>{{ formatScore(selectedScores.recent_pos) }} / {{ selectedScores.recent_papers ?? '-' }}</strong>
+              </div>
+              <div class="surface-muted evidence-score">
+                <span>正负一致性</span>
+                <strong>{{ formatScore(selectedScores.consistency) }}</strong>
+              </div>
+              <div class="surface-muted evidence-score">
+                <span>点赞 / 点踩论文</span>
+                <strong>{{ selectedScores.liked_papers ?? '-' }} / {{ selectedScores.disliked_papers ?? '-' }}</strong>
+              </div>
             </div>
-          </div>
+            <div v-if="selectedScores.rejection_reasons?.length" class="topic-group">
+              <h3>未进入其它区的原因</h3>
+              <ul class="reason-list">
+                <li v-for="reason in selectedScores.rejection_reasons" :key="reason">{{ reasonText(reason) }}</li>
+              </ul>
+            </div>
+            <div class="topic-group">
+              <h3>来源论文</h3>
+              <div class="chip-row">
+                <span v-for="paper in selectedScores.source_papers || []" :key="paper" class="chip mono">{{ paper }}</span>
+                <span v-if="!selectedScores.source_papers?.length" class="empty-text">暂无</span>
+              </div>
+            </div>
+            <div class="topic-group">
+              <h3>来源行为</h3>
+              <div class="chip-row">
+                <span v-for="action in selectedScores.source_actions || []" :key="action" class="chip">{{ action }}</span>
+                <span v-if="!selectedScores.source_actions?.length" class="empty-text">暂无</span>
+              </div>
+            </div>
+          </template>
         </template>
         <el-empty v-else :image-size="72" :description="selectedTopic ? '该主题暂无证据记录' : '点击左侧主题查看证据'" />
       </section>
@@ -370,6 +449,19 @@ onUnmounted(() => {
             <div class="input-row">
               <el-input v-model="manualForm.positive_topic" placeholder="例如 retrieval-augmented generation" @keyup.enter="addManualTopic('positive_topics', manualForm.positive_topic)" />
               <el-button :icon="Plus" @click="addManualTopic('positive_topics', manualForm.positive_topic)" />
+            </div>
+            <div v-if="listOf(manualProfile, 'positive_topics').length" class="chip-row">
+              <el-tag v-for="topic in listOf(manualProfile, 'positive_topics')" :key="topic" closable @close="removeManualTopic('positive_topics', topic)">{{ topic }}</el-tag>
+            </div>
+          </div>
+          <div class="field">
+            <span class="field-label">添加排除主题 <span class="muted">不再推荐相关论文</span></span>
+            <div class="input-row">
+              <el-input v-model="manualForm.negative_topic" placeholder="例如 diffusion models" @keyup.enter="addManualTopic('negative_topics', manualForm.negative_topic)" />
+              <el-button :icon="Plus" @click="addManualTopic('negative_topics', manualForm.negative_topic)" />
+            </div>
+            <div v-if="listOf(manualProfile, 'negative_topics').length" class="chip-row">
+              <el-tag v-for="topic in listOf(manualProfile, 'negative_topics')" :key="topic" type="warning" closable @close="removeManualTopic('negative_topics', topic)">{{ topic }}</el-tag>
             </div>
           </div>
           <div class="field">
@@ -581,10 +673,17 @@ onUnmounted(() => {
 }
 
 .evidence-score strong {
-  font-size: 20px;
+  font-size: 18px;
   font-weight: 650;
   color: var(--color-text);
   font-variant-numeric: tabular-nums;
+}
+
+.reason-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  color: var(--color-text-3);
 }
 
 .quality {

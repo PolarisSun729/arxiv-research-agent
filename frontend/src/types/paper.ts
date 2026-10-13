@@ -23,6 +23,39 @@ export type PaperNoteType =
   | 'todo'
   | 'custom'
 
+export type ProfileTopicZone = 'focus' | 'recent' | 'exclude'
+
+/** 单个主题的画像证据：自动生成条目带打分字段，手动放置条目带 manual_action，并可附上被覆盖的自动证据。 */
+export interface ProfileTopicEvidence {
+  label: string
+  provenance: 'generated' | 'manual'
+  placement?: ProfileTopicZone[]
+  rejection_reasons?: string[]
+  aliases?: string[]
+  long_pos?: number
+  long_neg?: number
+  recent_pos?: number
+  recent_neg?: number
+  net_score?: number
+  recent_net?: number
+  consistency?: number
+  confidence?: number
+  rank_score?: number
+  liked_papers?: number
+  disliked_papers?: number
+  positive_span_days?: number
+  recent_papers?: number
+  source_papers?: string[]
+  source_events?: string[]
+  source_actions?: string[]
+  source_notes?: string[]
+  source_questions?: string[]
+  source_concepts?: Array<Record<string, any>>
+  manual_action?: 'focus' | 'exclude' | 'pinned'
+  overridden_by_manual?: boolean
+  generated_evidence?: ProfileTopicEvidence
+}
+
 export interface UserResearchProfile {
   user_id: string
   positive_topics: string[]
@@ -37,7 +70,8 @@ export interface UserResearchProfile {
   canonical_topics?: Array<Record<string, any>>
   canonical_negative_topics?: Array<Record<string, any>>
   canonical_recent_topics?: Array<Record<string, any>>
-  topic_evidence?: Record<string, any>
+  topic_evidence?: Record<string, ProfileTopicEvidence>
+  manual_overrides?: Array<{ topic: string; manual_action: string; generated_placement: ProfileTopicZone[] }>
   aggregation_report?: Record<string, any>
   review_status?: Record<string, any>
   quality_report?: Record<string, any>

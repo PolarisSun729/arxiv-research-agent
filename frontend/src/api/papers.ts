@@ -170,6 +170,7 @@ function normalizeResearchProfile(raw: any, fallbackUserId?: string): UserResear
     canonical_negative_topics: Array.isArray(raw?.canonical_negative_topics) ? raw.canonical_negative_topics : [],
     canonical_recent_topics: Array.isArray(raw?.canonical_recent_topics) ? raw.canonical_recent_topics : [],
     topic_evidence: raw?.topic_evidence && typeof raw.topic_evidence === 'object' ? raw.topic_evidence : {},
+    manual_overrides: Array.isArray(raw?.manual_overrides) ? raw.manual_overrides : [],
     aggregation_report: raw?.aggregation_report && typeof raw.aggregation_report === 'object' ? raw.aggregation_report : {},
     review_status: raw?.review_status && typeof raw.review_status === 'object' ? raw.review_status : {},
     quality_report: raw?.quality_report && typeof raw.quality_report === 'object' ? raw.quality_report : {},

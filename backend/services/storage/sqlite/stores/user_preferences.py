@@ -178,15 +178,20 @@ class UserPreferenceStore(BaseSqliteStore):
 
     def get_liked_papers_with_details(self, user_id: str = DEFAULT_USER_ID) -> List[Dict[str, Any]]:
         """返回喜欢列表并 JOIN 论文目录补齐展示字段；目录中缺失的论文不会出现在结果里。"""
+        return self._list_strong_preference_papers_with_details(user_id, "liked")
+
+    def _list_strong_preference_papers_with_details(self, user_id: str, preference: str) -> List[Dict[str, Any]]:
+        """按标记时间倒序返回强偏好论文详情，并带上 `{preference}_at` 标记时间供画像做时间衰减。"""
+        table = _STRONG_PREFERENCES[preference]["table"]
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT p.arxiv_id, p.title, p.abstract, p.authors, p.categories, p.published_date
-                    FROM user_liked_papers ulp
-                    JOIN arxiv_papers p ON ulp.arxiv_id = p.arxiv_id
-                    WHERE ulp.user_id = ?
-                    ORDER BY ulp.created_at DESC
+                cursor.execute(f'''
+                    SELECT p.arxiv_id, p.title, p.abstract, p.authors, p.categories, p.published_date, pref.created_at
+                    FROM {table} pref
+                    JOIN arxiv_papers p ON pref.arxiv_id = p.arxiv_id
+                    WHERE pref.user_id = ?
+                    ORDER BY pref.created_at DESC
                 ''', (user_id,))
 
                 results = []
@@ -197,11 +202,12 @@ class UserPreferenceStore(BaseSqliteStore):
                         'abstract': row[2],
                         'authors': self._deserialize_paper_db_value(row[3]),
                         'categories': self._deserialize_paper_db_value(row[4]),
-                        'published_date': row[5]
+                        'published_date': row[5],
+                        f'{preference}_at': row[6],
                     })
                 return results
         except Exception as e:
-            logger.error(f"Error getting liked papers with details: {str(e)}")
+            logger.error(f"Error getting {preference} papers with details: {str(e)}")
             return []
 
     def add_disliked_paper(self, user_id: str = DEFAULT_USER_ID, arxiv_id: Optional[str] = None) -> bool:
@@ -215,6 +221,10 @@ class UserPreferenceStore(BaseSqliteStore):
     def get_disliked_papers(self, user_id: str = DEFAULT_USER_ID) -> List[str]:
         """按标记时间倒序返回用户不喜欢的论文 ID。"""
         return self._list_strong_preference_ids(user_id, "disliked")
+
+    def get_disliked_papers_with_details(self, user_id: str = DEFAULT_USER_ID) -> List[Dict[str, Any]]:
+        """返回不喜欢列表并 JOIN 论文目录补齐展示字段，带 `disliked_at` 标记时间。"""
+        return self._list_strong_preference_papers_with_details(user_id, "disliked")
 
     def get_user_preferences(self, user_id: str = DEFAULT_USER_ID) -> Dict[str, Any]:
         """聚合用户的强偏好、弱行为和研究画像；任一读取失败时返回结构完整的空结果。"""

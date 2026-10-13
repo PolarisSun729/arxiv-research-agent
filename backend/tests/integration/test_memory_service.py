@@ -126,6 +126,10 @@ class FakeInterestModelRefresher:
 
 class MemoryServiceIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
+        # 测试数据里的点赞都在同一时刻写入；持续性规则由 test_topic_scorer 单独覆盖，这里关闭以聚焦其它链路。
+        scoring_patch = mock.patch.object(MemoryService, "_profile_topic_scoring_config", return_value={"focus_min_span_days": 0})
+        scoring_patch.start()
+        self.addCleanup(scoring_patch.stop)
         self.storage = build_storage_container()
         self.memory_service = self._make_memory_service(generation_service=FakeEvidenceGenerationService())
         self.user_id = "user-1"
@@ -591,10 +595,10 @@ class MemoryServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(profile["positive_topics"], repeated["positive_topics"])
         self.assertEqual(profile["negative_topics"], repeated["negative_topics"])
         rag_evidence = profile["topic_evidence"]["RAG retrieval optimization"]
-        self.assertGreater(rag_evidence["positive_score"], rag_evidence["negative_score"])
+        self.assertGreater(rag_evidence["long_pos"], rag_evidence["long_neg"])
         self.assertIn("2401.00010", rag_evidence["source_papers"])
         self.assertIn("liked", rag_evidence["source_actions"])
-        self.assertEqual(profile["aggregation_report"]["aggregator_version"], "profile_aggregator_v1")
+        self.assertEqual(profile["aggregation_report"]["aggregator_version"], "profile_aggregator_v2")
         self.assertTrue(profile["review_status"]["approved"])
         self.assertTrue(profile["quality_report"]["approved"])
         self.assertIsNotNone(profile.get("snapshot_id"))

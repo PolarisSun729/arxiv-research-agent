@@ -19,6 +19,23 @@ from services.storage.sqlite.stores.profile_build_jobs import ProfileBuildJobSto
 from services.storage.sqlite.stores.profile_events import ProfileEventStore
 
 
+# 聚合器写在 canonical topic 上的打分字段；store 归一化时需要原样保留，供推荐和证据面板读取。
+CANONICAL_TOPIC_SCORE_FIELDS = (
+    "long_pos",
+    "long_neg",
+    "recent_pos",
+    "recent_neg",
+    "net_score",
+    "recent_net",
+    "consistency",
+    "confidence",
+    "rank_score",
+    "liked_papers",
+    "disliked_papers",
+    "positive_span_days",
+)
+
+
 class ResearchProfileStore(BaseSqliteStore):
     """维护 manual/generated/effective 研究画像与快照。"""
 
@@ -108,6 +125,7 @@ class ResearchProfileStore(BaseSqliteStore):
                     "source": str(item.get("source") or "").strip(),
                     "pinned": bool(item.get("pinned")),
                     "normalizer_version": str(item.get("normalizer_version") or PROFILE_NORMALIZER_VERSION).strip(),
+                    **{key: cls._coerce_float(item.get(key)) for key in CANONICAL_TOPIC_SCORE_FIELDS if key in item},
                 }
             )
             if len(normalized) >= limit:
@@ -147,20 +165,6 @@ class ResearchProfileStore(BaseSqliteStore):
             return default
 
     @classmethod
-    def _topic_keys(cls, values: Any) -> set[str]:
-        return {item.lower() for item in cls._normalize_profile_topics(values, limit=100)}
-
-    @classmethod
-    def _filter_hidden_topics(cls, values: List[str], hidden_topics: Any, limit: int = 30) -> List[str]:
-        hidden_keys = cls._topic_keys(hidden_topics)
-        return [item for item in cls._normalize_profile_topics(values, limit=limit * 2) if item.lower() not in hidden_keys][:limit]
-
-    @classmethod
-    def _filter_hidden_canonical_topics(cls, values: List[Dict[str, Any]], hidden_topics: Any, limit: int = 30) -> List[Dict[str, Any]]:
-        hidden_keys = cls._topic_keys(hidden_topics)
-        return [item for item in cls._normalize_canonical_topics(values, limit=limit * 2) if item["label"].lower() not in hidden_keys][:limit]
-
-    @classmethod
     def _normalize_profile_projection(cls, user_id: str, profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = dict(profile or {})
         normalized = {
@@ -186,12 +190,19 @@ class ResearchProfileStore(BaseSqliteStore):
                 "normalization_signature": str(payload.get("normalization_signature") or "").strip(),
             }
         )
-        for extra_field in ("topic_evidence", "aggregation_report", "review_status", "quality_report", "aggregator_version"):
+        for extra_field in ("topic_evidence", "aggregation_report", "review_status", "quality_report", "aggregator_version", "manual_overrides"):
             value = payload.get(extra_field)
             if value is not None:
                 # 解释性字段不参与旧字段归一化，但 snapshot/effective 需要保留它们供调试和前端解释来源。
                 normalized[extra_field] = value
         return normalized
+
+    @staticmethod
+    def _profile_topic_key(value: Any) -> str:
+        # 延迟导入：services.memory 包初始化会反向导入 storage，模块级导入会形成循环依赖。
+        from services.memory.concept_normalizer import ConceptNormalizer
+
+        return ConceptNormalizer._topic_key(value)
 
     @classmethod
     def _merge_profile_projection(
@@ -200,43 +211,157 @@ class ResearchProfileStore(BaseSqliteStore):
         generated_profile: Optional[Dict[str, Any]],
         manual_profile: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        """按主题合并 manual 覆盖与 generated 画像。
+
+        generated 层已经保证关注/排除互斥；manual 层只表达用户对单个主题的显式操作，
+        按「隐藏 > 手动关注/固定 > 手动排除 > 自动生成」的优先级覆盖，不再按列表取并集，
+        因此同一主题不会同时出现在关注和排除里。
+        """
         generated = cls._normalize_profile_projection(user_id, generated_profile)
         manual = cls._normalize_profile_projection(user_id, manual_profile)
+        key = cls._profile_topic_key
         hidden_topics = manual["hidden_topics"]
         pinned_topics = manual["pinned_topics"]
-        generated_positive_topics = cls._filter_hidden_topics(generated["positive_topics"], hidden_topics, limit=30)
-        generated_negative_topics = cls._filter_hidden_topics(generated["negative_topics"], hidden_topics, limit=30)
-        generated_recent_topics = cls._filter_hidden_topics(generated["recent_topics"], hidden_topics, limit=30)
-        manual_positive_topics = cls._filter_hidden_topics(manual["positive_topics"], hidden_topics, limit=30)
-        manual_negative_topics = cls._filter_hidden_topics(manual["negative_topics"], hidden_topics, limit=30)
-        manual_recent_topics = cls._filter_hidden_topics(manual["recent_topics"], hidden_topics, limit=30)
-        pinned_canonical = cls._canonical_topics_from_manual(pinned_topics)
-        generated_canonical = cls._filter_hidden_canonical_topics(generated["canonical_topics"], hidden_topics, limit=30)
-        generated_negative_canonical = cls._filter_hidden_canonical_topics(generated["canonical_negative_topics"], hidden_topics, limit=30)
-        generated_recent_canonical = cls._filter_hidden_canonical_topics(generated["canonical_recent_topics"], hidden_topics, limit=30)
-        # 手动隐藏是用户显式排除项，合并时必须先过滤；手动固定则作为高优先级 canonical topic 保留。
+        hidden_keys = {key(topic) for topic in hidden_topics}
+
+        # 手动主题按 key/别名对齐到自动主题的展示 label，"large language models" 能对上 "large language model"。
+        alias_to_label: Dict[str, str] = {}
+        for field in ("canonical_topics", "canonical_negative_topics", "canonical_recent_topics"):
+            for item in generated[field]:
+                for name in [item["label"], *(item.get("aliases") or [])]:
+                    alias_to_label.setdefault(key(name), item["label"])
+
+        def _resolve(topics: List[str]) -> List[str]:
+            return [alias_to_label.get(key(topic), topic) for topic in topics if key(topic) not in hidden_keys]
+
+        manual_focus = _resolve([*pinned_topics, *manual["positive_topics"]])
+        manual_exclude = _resolve(manual["negative_topics"])
+        focus_keys = {key(topic) for topic in manual_focus}
+        # 同一主题被用户同时设为关注和排除时，以关注（含固定）为准。
+        manual_exclude = [topic for topic in manual_exclude if key(topic) not in focus_keys]
+        exclude_override_keys = {key(topic) for topic in manual_exclude}
+
+        def _dedupe(topics: List[str], blocked: set[str]) -> List[str]:
+            result: List[str] = []
+            seen: set[str] = set()
+            for topic in topics:
+                topic_key = key(topic)
+                if topic_key in hidden_keys or topic_key in blocked or topic_key in seen:
+                    continue
+                seen.add(topic_key)
+                result.append(topic)
+            return result[:30]
+
+        positive_topics = _dedupe([*manual_focus, *generated["positive_topics"]], exclude_override_keys)
+        positive_keys = {key(topic) for topic in positive_topics}
+        negative_topics = _dedupe([*manual_exclude, *generated["negative_topics"]], positive_keys)
+        negative_keys = {key(topic) for topic in negative_topics}
+        recent_topics = _dedupe([*generated["recent_topics"], *_resolve(manual["recent_topics"])], negative_keys)
+
+        def _keep_canonical(items: List[Dict[str, Any]], allowed: List[str]) -> List[Dict[str, Any]]:
+            allowed_keys = {key(topic) for topic in allowed}
+            return [item for item in items if key(item["label"]) in allowed_keys]
+
+        generated_labels = {key(item["label"]) for field in ("canonical_topics", "canonical_negative_topics") for item in generated[field]}
+        pinned_keys = {key(topic) for topic in _resolve(pinned_topics)}
+        manual_focus_canonical = [
+            {
+                **item,
+                "pinned": key(item["label"]) in pinned_keys,
+                "description": "用户手动固定的研究主题。" if key(item["label"]) in pinned_keys else "用户手动添加的研究主题。",
+            }
+            for item in cls._canonical_topics_from_manual([topic for topic in manual_focus if key(topic) not in generated_labels or key(topic) in pinned_keys])
+        ]
+        manual_exclude_canonical = [
+            {**item, "pinned": False, "description": "用户手动排除的研究主题。"}
+            for item in cls._canonical_topics_from_manual([topic for topic in manual_exclude if key(topic) not in generated_labels])
+        ]
+
+        topic_evidence, manual_overrides = cls._merge_topic_evidence(
+            generated.get("topic_evidence") if isinstance(generated.get("topic_evidence"), dict) else {},
+            manual_focus=manual_focus,
+            manual_exclude=manual_exclude,
+            pinned_keys=pinned_keys,
+            positive_topics=positive_topics,
+            negative_topics=negative_topics,
+            recent_topics=recent_topics,
+        )
+
         effective = {
             "user_id": user_id,
-            "positive_topics": cls._normalize_profile_list_value([*pinned_topics, *manual_positive_topics, *generated_positive_topics], limit=30),
-            "negative_topics": cls._normalize_profile_list_value([*manual_negative_topics, *generated_negative_topics], limit=30),
-            "recent_topics": cls._normalize_profile_list_value([*generated_recent_topics, *manual_recent_topics], limit=30),
+            "positive_topics": positive_topics,
+            "negative_topics": negative_topics,
+            "recent_topics": recent_topics,
             "preferred_categories": cls._normalize_profile_list_value([*manual["preferred_categories"], *generated["preferred_categories"]], limit=20),
             "preferred_answer_style": manual["preferred_answer_style"] or generated["preferred_answer_style"],
             "common_question_types": cls._normalize_profile_list_value([*manual["common_question_types"], *generated["common_question_types"]], limit=20),
             "representative_papers": cls._normalize_profile_list_value([*generated["representative_papers"], *manual["representative_papers"]], limit=20),
-            "canonical_topics": cls._normalize_canonical_topics([*pinned_canonical, *generated_canonical], limit=30),
-            "canonical_negative_topics": generated_negative_canonical,
-            "canonical_recent_topics": generated_recent_canonical,
+            "canonical_topics": cls._normalize_canonical_topics(
+                [*manual_focus_canonical, *_keep_canonical(generated["canonical_topics"], positive_topics)], limit=30
+            ),
+            "canonical_negative_topics": cls._normalize_canonical_topics(
+                [*manual_exclude_canonical, *_keep_canonical(generated["canonical_negative_topics"], negative_topics)], limit=30
+            ),
+            "canonical_recent_topics": _keep_canonical(generated["canonical_recent_topics"], recent_topics),
             "pinned_topics": pinned_topics,
             "hidden_topics": hidden_topics,
             "normalizer_version": generated.get("normalizer_version") or PROFILE_NORMALIZER_VERSION,
             "normalization_signature": generated.get("normalization_signature") or "",
+            "topic_evidence": topic_evidence,
+            "manual_overrides": manual_overrides,
         }
-        for extra_field in ("topic_evidence", "aggregation_report", "review_status", "quality_report", "aggregator_version"):
+        for extra_field in ("aggregation_report", "review_status", "quality_report", "aggregator_version"):
             if extra_field in generated:
                 # effective profile 是推荐和 Agent 的读取边界，保留解释字段方便下游说明 topic 来源。
                 effective[extra_field] = generated[extra_field]
         return effective
+
+    @classmethod
+    def _merge_topic_evidence(
+        cls,
+        generated_evidence: Dict[str, Any],
+        *,
+        manual_focus: List[str],
+        manual_exclude: List[str],
+        pinned_keys: set[str],
+        positive_topics: List[str],
+        negative_topics: List[str],
+        recent_topics: List[str],
+    ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """为手动放置的主题生成 provenance=manual 的证据条目，并记录哪些自动结论被用户覆盖。"""
+        key = cls._profile_topic_key
+        evidence_by_key = {key(label): (label, value) for label, value in generated_evidence.items() if isinstance(value, dict)}
+        merged = {label: dict(value) for label, value in generated_evidence.items() if isinstance(value, dict)}
+        zone_keys = {
+            "focus": {key(topic) for topic in positive_topics},
+            "exclude": {key(topic) for topic in negative_topics},
+            "recent": {key(topic) for topic in recent_topics},
+        }
+        overrides: List[Dict[str, Any]] = []
+        for topic, action in [*[(topic, "focus") for topic in manual_focus], *[(topic, "exclude") for topic in manual_exclude]]:
+            topic_key = key(topic)
+            if topic_key not in zone_keys[action]:
+                continue
+            generated_label, generated_entry = evidence_by_key.get(topic_key, (None, None))
+            generated_placement = list((generated_entry or {}).get("placement") or [])
+            # 只有手动操作与自动结论方向相反时才算覆盖：手动关注一个被自动排除的主题，或手动排除一个自动关注/近期主题。
+            opposite_zones = {"exclude"} if action == "focus" else {"focus", "recent"}
+            overridden = bool(set(generated_placement) & opposite_zones)
+            entry = {
+                "label": topic,
+                "provenance": "manual",
+                "manual_action": "pinned" if topic_key in pinned_keys else action,
+                "placement": [zone for zone in ("focus", "exclude", "recent") if topic_key in zone_keys[zone]],
+                "overridden_by_manual": overridden,
+            }
+            if generated_entry:
+                entry["generated_evidence"] = generated_entry
+            if generated_label and generated_label != topic:
+                merged.pop(generated_label, None)
+            merged[topic] = entry
+            if overridden:
+                overrides.append({"topic": topic, "manual_action": action, "generated_placement": generated_placement})
+        return merged, overrides
 
     @classmethod
     def _canonical_topics_from_manual(cls, topics: Any) -> List[Dict[str, Any]]:
@@ -523,6 +648,7 @@ class ResearchProfileStore(BaseSqliteStore):
             "manual_available": bool(manual),
             "generated_available": bool(generated),
             "generated_snapshot_id": resolved_snapshot_id,
+            "manual_overrides": effective.get("manual_overrides") or [],
         }
         cursor.execute(
             '''

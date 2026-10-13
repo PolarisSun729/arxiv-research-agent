@@ -584,8 +584,17 @@ class MemoryService:
         normalized_topic = str(topic or "").strip()
         evidence = topic_evidence.get(normalized_topic)
         if evidence is None:
-            topic_key = normalized_topic.lower()
-            evidence = next((value for key, value in topic_evidence.items() if str(key).lower() == topic_key), None)
+            # 按归一化 key 和别名兜底，避免单复数或写法差异导致证据面板查不到。
+            topic_key = ConceptNormalizer._topic_key(normalized_topic)
+            evidence = next(
+                (
+                    value
+                    for key, value in topic_evidence.items()
+                    if isinstance(value, dict)
+                    and topic_key in {ConceptNormalizer._topic_key(item) for item in [key, *(value.get("aliases") or [])]}
+                ),
+                None,
+            )
         return {"user_id": resolved_user_id, "topic": normalized_topic, "evidence": evidence or {}, "found": bool(evidence)}
 
     def create_profile_rebuild_job(self, user_id: Optional[str], build_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -800,15 +809,6 @@ class MemoryService:
             deduped.append(item)
         return deduped
 
-    def _load_paper_details_for_ids(self, arxiv_ids: Any) -> List[Dict[str, Any]]:
-        """把行为表里的论文 ID 扩展为带 title/abstract/categories 的画像证据。"""
-        papers: List[Dict[str, Any]] = []
-        for arxiv_id in self._normalize_profile_list(arxiv_ids, limit=50):
-            paper = self._resolve_paper_payload(arxiv_id)
-            if paper:
-                papers.append(paper)
-        return self._dedupe_papers(papers)
-
     @staticmethod
     def _normalize_profile_build_mode(build_mode: Optional[str]) -> str:
         """统一画像构建模式，避免 API、调度器和测试传入大小写或未知值后分叉。"""
@@ -928,12 +928,26 @@ class MemoryService:
             event_limit = max(400, paper_limit * 5)
         else:
             event_limit = max(80, paper_limit * 4)
+        # build_mode 只决定「哪些论文可以新生成证据卡、哪些事件本次标记为已消费」；
+        # 聚合始终基于全部有效事件，否则增量构建从零聚合时会丢掉旧事件对应的主题。
         event_selection = self._select_profile_build_events(
             user_id,
             build_mode=build_mode,
             event_limit=event_limit,
         )
-        events = event_selection["events"]
+        selected_event_ids = {str(event.get("event_id") or "") for event in event_selection["events"] if isinstance(event, dict)}
+        if build_mode == "full":
+            events = event_selection["events"]
+        else:
+            events = self.profile_event_store.list_user_profile_events(
+                user_id=user_id,
+                include_consumed=True,
+                include_in_profile_only=True,
+                limit=10000,
+            )
+            known_ids = {str(event.get("event_id") or "") for event in events if isinstance(event, dict)}
+            # 选中事件理论上都在全量列表里，这里兜底合并，避免并发写入导致选中事件被漏掉。
+            events = [*events, *[event for event in event_selection["events"] if str(event.get("event_id") or "") not in known_ids]]
 
         liked_papers: List[Dict[str, Any]] = []
         disliked_papers: List[Dict[str, Any]] = []
@@ -944,7 +958,10 @@ class MemoryService:
         for event in events:
             if not isinstance(event, dict):
                 continue
-            event_ids.append(str(event.get("event_id") or ""))
+            event_id = str(event.get("event_id") or "")
+            is_selected = event_id in selected_event_ids
+            if is_selected:
+                event_ids.append(event_id)
             event_type = str(event.get("event_type") or event.get("action_type") or "").strip().lower()
             arxiv_id = str(event.get("arxiv_id") or "").strip()
             metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
@@ -955,6 +972,7 @@ class MemoryService:
                 "_profile_event": event,
                 "_profile_action_types": [event_type],
                 "_profile_dirty": bool(event.get("profile_dirty")),
+                "_profile_card_candidate": is_selected,
             } if paper else {}
             if event_type == "liked" and paper:
                 liked_papers.append(enriched_paper)
@@ -975,7 +993,7 @@ class MemoryService:
                     # 笔记已删除或已取消纳入画像时跳过：这类残留事件可能来自撤销逻辑上线前的历史数据。
                     note = self.paper_note_store.get_paper_note(note_id, user_id=user_id)
                     if note and note.get("include_in_profile"):
-                        notes.append({**note, "_profile_event": event})
+                        notes.append({**note, "_profile_event": event, "_profile_card_candidate": is_selected})
                 elif paper:
                     recent_actions.append({"arxiv_id": arxiv_id, "action_type": "note_saved", "paper": enriched_paper, "_profile_event": event})
 
@@ -986,8 +1004,13 @@ class MemoryService:
         notes.extend(extra_notes or [])
 
         # liked/disliked 表是当前强偏好的权威状态；事件可能已被上次构建消费，但推荐和画像仍应看到当前偏好。
-        liked_papers = self._dedupe_papers([*liked_papers, *self.user_preference_store.get_liked_papers_with_details(user_id=user_id)])
-        disliked_papers = self._dedupe_papers([*disliked_papers, *self._load_paper_details_for_ids(self.user_preference_store.get_disliked_papers(user_id=user_id))])
+        # 偏好表论文带 liked_at/disliked_at，是没有事件时的时间来源；它们始终允许补生成证据卡，与旧行为一致。
+        liked_papers = self._dedupe_papers(
+            [*liked_papers, *[{**paper, "_profile_card_candidate": True} for paper in self.user_preference_store.get_liked_papers_with_details(user_id=user_id)]]
+        )
+        disliked_papers = self._dedupe_papers(
+            [*disliked_papers, *[{**paper, "_profile_card_candidate": True} for paper in self.user_preference_store.get_disliked_papers_with_details(user_id=user_id)]]
+        )
 
         if not events:
             # 仅作为旧数据兜底：没有任何事件时回退弱行为和笔记表，避免升级后空库导致画像突然清零。
@@ -1000,7 +1023,7 @@ class MemoryService:
                 if not paper:
                     continue
                 action_type = str(action.get("action_type") or "").strip().lower()
-                recent_actions.append({**action, "paper": {**paper, "_profile_action_types": [action_type]}})
+                recent_actions.append({**action, "paper": {**paper, "_profile_action_types": [action_type], "_profile_card_candidate": True}})
         return {
             "liked_papers": liked_papers,
             "disliked_papers": disliked_papers,
@@ -1076,6 +1099,14 @@ class MemoryService:
             "negative_min_cluster_paper_count": _int_config(negative_config, "min_cluster_paper_count_for_profile", 2),
             "negative_min_topic_source_papers": _int_config(negative_config, "min_topic_source_papers_for_profile", 2),
         }
+
+    @staticmethod
+    def _profile_topic_scoring_config() -> Dict[str, Any]:
+        """读取 recommendation.profile.scoring 下的画像打分阈值覆盖；未配置时 TopicScorer 使用默认值。"""
+        recommendation_config = get_recommendation_runtime_config()
+        profile_config = recommendation_config.get("profile") if isinstance(recommendation_config.get("profile"), dict) else {}
+        scoring_config = profile_config.get("scoring") if isinstance(profile_config.get("scoring"), dict) else {}
+        return dict(scoring_config)
 
     def _refresh_behavior_interest_model(
         self,
@@ -1359,12 +1390,23 @@ class MemoryService:
                 for action in evidence.get("recent_actions") or []
                 if isinstance(action, dict) and isinstance(action.get("paper"), dict)
             ],
-            *[
-                self._resolve_paper_payload(str(note.get("arxiv_id") or "").strip())
-                for note in evidence.get("notes") or []
-                if isinstance(note, dict) and str(note.get("arxiv_id") or "").strip()
-            ],
+            *[self._note_paper_ref(note) for note in evidence.get("notes") or [] if isinstance(note, dict)],
         ]
+
+    def _note_paper_ref(self, note: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """笔记对应论文只解析一次并挂在 note 上，保证回填的证据卡能被聚合器从同一个对象读到。"""
+        if isinstance(note.get("paper"), dict):
+            return note["paper"]
+        arxiv_id = str(note.get("arxiv_id") or "").strip()
+        if not arxiv_id:
+            return None
+        paper = self._resolve_paper_payload(arxiv_id)
+        if not paper:
+            return None
+        paper["_profile_action_types"] = ["note_saved"]
+        paper["_profile_card_candidate"] = bool(note.get("_profile_card_candidate", True))
+        note["paper"] = paper
+        return paper
 
     def _collect_profile_evidence_papers(self, evidence: Dict[str, Any]) -> List[Dict[str, Any]]:
         """收集本次构建实际涉及的唯一论文，后续缓存统计和逐篇进度都基于这个边界。"""
@@ -1389,6 +1431,7 @@ class MemoryService:
                 merged_actions.update(action_types)
                 existing["_profile_action_types"] = sorted(merged_actions)
                 existing["_profile_dirty"] = bool(existing.get("_profile_dirty") or paper.get("_profile_dirty"))
+                existing["_profile_card_candidate"] = bool(existing.get("_profile_card_candidate") or paper.get("_profile_card_candidate"))
                 continue
             index_by_id[arxiv_id] = len(unique_papers)
             if action_types:
@@ -1513,6 +1556,7 @@ class MemoryService:
         skipped_weak_papers = 0
         skipped_weak_interest_papers = 0
         skipped_failed_cache_papers = 0
+        skipped_history_papers = 0
         repair_candidate_count = 0
 
         for paper in unique_papers:
@@ -1530,6 +1574,13 @@ class MemoryService:
             needs_repair = bool(cached and not cached.get("schema_valid"))
             if needs_repair:
                 repair_candidate_count += 1
+            if build_mode == "incremental" and not paper.get("_profile_card_candidate", True):
+                # 历史事件只参与聚合；增量构建不为它们补调 LLM，缺卡论文交给 full/repair 处理。
+                if cached:
+                    cards_by_id[arxiv_id] = cached
+                    paper["evidence_card"] = cached
+                skipped_history_papers += 1
+                continue
             if build_mode == "incremental" and not self._paper_allows_profile_evidence_generation(evidence, paper):
                 if cached:
                     cards_by_id[arxiv_id] = cached
@@ -1570,7 +1621,8 @@ class MemoryService:
                 "failed_papers": 0,
                 "successful_papers": cached_papers,
                 "repair_candidate_papers": repair_candidate_count,
-                "skipped_paper_count": skipped_weak_papers + skipped_weak_interest_papers + skipped_limit_papers + skipped_failed_cache_papers,
+                "skipped_paper_count": skipped_weak_papers + skipped_weak_interest_papers + skipped_limit_papers + skipped_failed_cache_papers + skipped_history_papers,
+                "skipped_history_papers": skipped_history_papers,
                 "skipped_read_only_papers": skipped_weak_papers,
                 "skipped_weak_interest_papers": skipped_weak_interest_papers,
                 "skipped_failed_cache_papers": skipped_failed_cache_papers,
@@ -1578,7 +1630,7 @@ class MemoryService:
                 "cache_hit_count": cached_papers,
                 "generated_count": 0,
                 "failed_count": 0,
-                "skipped_count": skipped_weak_papers + skipped_weak_interest_papers + skipped_limit_papers + skipped_failed_cache_papers,
+                "skipped_count": skipped_weak_papers + skipped_weak_interest_papers + skipped_limit_papers + skipped_failed_cache_papers + skipped_history_papers,
                 "evidence_concurrency": evidence_concurrency if uncached_count else 0,
                 "rate_limit_backoff_count": 0,
                 "total_evidence_extraction_seconds": 0,
@@ -1802,8 +1854,6 @@ class MemoryService:
         extra_disliked_papers: Optional[List[Dict[str, Any]]] = None,
         extra_recent_actions: Optional[List[Dict[str, Any]]] = None,
         extra_notes: Optional[List[Dict[str, Any]]] = None,
-        preserve_existing_topics: bool = True,
-        preserve_existing_representative_papers: bool = True,
         existing_job_id: Optional[str] = None,
         build_mode: Optional[str] = "incremental",
         max_papers: Optional[int] = None,
@@ -1813,8 +1863,6 @@ class MemoryService:
         resolved_build_mode = self._normalize_profile_build_mode(build_mode)
         resolved_paper_limit = self._resolve_profile_paper_limit(resolved_build_mode, max_papers)
         build_config = {
-            "preserve_existing_topics": False,
-            "preserve_existing_representative_papers": False,
             "legacy_output_projection": True,
             "build_mode": resolved_build_mode,
             "max_papers": resolved_paper_limit,
@@ -1918,12 +1966,10 @@ class MemoryService:
                 progress=75,
                 stage_message="开始聚合正向、负向和近期画像候选",
             )
+            # 自动画像只从事件和 evidence card 重建；旧画像不再作为系统层证据，避免脏 topic 被反复带回。
             generated_draft = self.profile_aggregator.aggregate(
                 evidence=evidence,
-                current_profile={},
-                # 自动画像只从事件和 evidence card 重建；旧画像不再作为系统层证据，避免脏 topic 被反复带回。
-                preserve_existing_topics=False,
-                preserve_existing_representative_papers=False,
+                scoring_config=self._profile_topic_scoring_config(),
             )
             self._update_profile_build_job(
                 job_id,
@@ -2100,8 +2146,6 @@ class MemoryService:
         # 新模型下重建只更新 generated/snapshot，不再读取旧 positive_topics 作为主证据。
         return self.generate_user_research_profile(
             user_id,
-            preserve_existing_topics=False,
-            preserve_existing_representative_papers=False,
             build_mode=build_mode,
             max_papers=max_papers,
         )
