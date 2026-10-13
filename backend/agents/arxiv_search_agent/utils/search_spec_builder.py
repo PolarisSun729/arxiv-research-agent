@@ -484,7 +484,9 @@ def _is_topic_token(token: str) -> bool:
 
 
 _CJK_PATTERN = re.compile(r"[一-鿿]")
+# 防画像词混入检索条件时三类主题都要识别；但用户没给主题时只能用正向主题补全，排除主题绝不能变成检索词。
 _PROFILE_TOPIC_KEYS = ("positive_topics", "recent_topics", "negative_topics")
+_PROFILE_FILL_TOPIC_KEYS = ("positive_topics", "recent_topics")
 
 
 def _string_list(value: Any) -> List[str]:
@@ -513,11 +515,11 @@ def _concepts_from_payload(value: Any) -> List[SearchConcept]:
     return concepts
 
 
-def _profile_topics(research_profile: Optional[Mapping[str, Any]]) -> List[str]:
+def _profile_topics(research_profile: Optional[Mapping[str, Any]], keys: Sequence[str] = _PROFILE_TOPIC_KEYS) -> List[str]:
     if not isinstance(research_profile, Mapping):
         return []
     topics: List[str] = []
-    for key in _PROFILE_TOPIC_KEYS:
+    for key in keys:
         topics.extend(_string_list(research_profile.get(key)))
     return _dedupe_preserve_order(topics)
 
@@ -658,9 +660,11 @@ def _ground_search_spec(
         rule_query = _extract_query_from_message(message)
         if rule_query and text_tokens(rule_query):
             concepts = [SearchConcept(term=rule_query, source="user")]
-        elif not rule_query and not spec.title_query and not spec.abstract_query and profile_topics:
-            concepts = [SearchConcept(term=profile_topics[0], source="profile")]
-            warnings.append(f'用户未给出检索主题，已按研究画像补全为 "{profile_topics[0]}"')
+        elif not rule_query and not spec.title_query and not spec.abstract_query:
+            fill_topics = _profile_topics(research_profile, _PROFILE_FILL_TOPIC_KEYS)
+            if fill_topics:
+                concepts = [SearchConcept(term=fill_topics[0], source="profile")]
+                warnings.append(f'用户未给出检索主题，已按研究画像补全为 "{fill_topics[0]}"')
 
     sources: dict[str, str] = {}
     explicit_categories = _extract_explicit_categories(message)

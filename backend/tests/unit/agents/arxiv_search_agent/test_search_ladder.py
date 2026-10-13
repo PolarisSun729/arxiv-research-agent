@@ -70,6 +70,20 @@ def test_profile_fills_topic_only_when_user_gave_none() -> None:
     assert any("研究画像" in item for item in warnings)
 
 
+def test_profile_fill_never_uses_excluded_topics() -> None:
+    # 排除主题排在列表前面也不能被拿来补全检索词；只有排除主题时就不补全。
+    only_negative = {"negative_topics": ["diffusion models"]}
+    spec, warnings = _ground({"intent": "arxiv_search", "concepts": []}, message="帮我找最近 7 天的论文", profile=only_negative)
+
+    assert spec.concepts == []
+    assert not any("研究画像" in item for item in warnings)
+
+    with_recent = {"negative_topics": ["diffusion models"], "recent_topics": ["graph retrieval"]}
+    spec, _ = _ground({"intent": "arxiv_search", "concepts": []}, message="帮我找最近 7 天的论文", profile=with_recent)
+
+    assert [(concept.term, concept.source) for concept in spec.concepts] == [("graph retrieval", "profile")]
+
+
 def test_user_named_categories_are_locked() -> None:
     spec, _ = _ground({"intent": "arxiv_search", "concepts": [{"term": "RAG", "evidence": "RAG"}]}, message="找 cs.IR 下的 RAG 论文")
 
