@@ -79,6 +79,9 @@ def _compact_search_spec(spec: Optional[ArxivSearchSpec]) -> Dict[str, Any]:
         return {}
     payload = {
         "intent": spec.intent,
+        "concepts": [concept.model_dump() for concept in spec.concepts or []],
+        "optional_terms": list(spec.optional_terms or []),
+        "constraint_sources": dict(spec.constraint_sources or {}),
         "query": spec.query,
         "title_query": spec.title_query,
         "abstract_query": spec.abstract_query,

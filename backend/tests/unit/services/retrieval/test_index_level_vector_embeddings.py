@@ -21,9 +21,18 @@ if "pymilvus" not in sys.modules:
     class _MilvusClient:
         pass
 
+    class _LoadState:
+        Loaded = "Loaded"
+
     pymilvus_stub.DataType = _DataType
     pymilvus_stub.MilvusClient = _MilvusClient
+    pymilvus_stub.__path__ = []
+    pymilvus_client_stub = types.ModuleType("pymilvus.client")
+    pymilvus_types_stub = types.ModuleType("pymilvus.client.types")
+    pymilvus_types_stub.LoadState = _LoadState
     sys.modules["pymilvus"] = pymilvus_stub
+    sys.modules["pymilvus.client"] = pymilvus_client_stub
+    sys.modules["pymilvus.client.types"] = pymilvus_types_stub
 
 if "pypinyin" not in sys.modules:
     pypinyin_stub = types.ModuleType("pypinyin")

@@ -54,6 +54,17 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw not in {"0", "false", "no", "off", ""}
 
 
+def _env_optional_int(name: str) -> Any:
+    """读取可选整数环境变量；未设置、为空或非法时返回 None，表示“沿用代码中的默认策略”。"""
+    raw = _env_str(name, "")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
 # API 密钥只允许通过环境变量注入，避免任何代码兜底值再次进入 Git 历史。
 ALIYUN_API_KEY = _env_str("ALIYUN_API_KEY", "")
 
@@ -394,15 +405,17 @@ RECOMMENDATION_CLUSTERING_CONFIG: Dict[str, Any] = {
 RECOMMENDATION_RANKING_CONFIG: Dict[str, Any] = {
     "negative": {
         # 负向反馈只在排序阶段生效；默认不开 hard filter，避免一两次点踩误伤相近但可能有价值的论文。
+        # 相似度阈值都基于 max(0, cos) 口径（与 Milvus COSINE 分数一致）；
+        # 旧版 (cos+1)/2 口径下的 0.82 / 0.05 / 0.97 分别等价于这里的 0.64 / 0.10 / 0.94。
         "enabled": _env_bool("RECOMMENDATION_RANKING_NEGATIVE_ENABLED", True),
-        "similarity_threshold": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_SIMILARITY_THRESHOLD", "0.82")),
-        "margin": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_MARGIN", "0.05")),
+        "similarity_threshold": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_SIMILARITY_THRESHOLD", "0.64")),
+        "margin": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_MARGIN", "0.10")),
         "penalty_weight": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_PENALTY_WEIGHT", "0.15")),
         "confidence_min_count": _env_int("RECOMMENDATION_RANKING_NEGATIVE_CONFIDENCE_MIN_COUNT", 6),
         "max_penalty": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_MAX_PENALTY", "0.22")),
         "use_margin_penalty": _env_bool("RECOMMENDATION_RANKING_NEGATIVE_USE_MARGIN_PENALTY", True),
         "use_threshold_penalty": _env_bool("RECOMMENDATION_RANKING_NEGATIVE_USE_THRESHOLD_PENALTY", True),
-        "hard_filter_threshold": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_HARD_FILTER_THRESHOLD", "0.97")),
+        "hard_filter_threshold": float(_env_str("RECOMMENDATION_RANKING_NEGATIVE_HARD_FILTER_THRESHOLD", "0.94")),
         "enable_hard_filter": _env_bool("RECOMMENDATION_RANKING_NEGATIVE_ENABLE_HARD_FILTER", False),
         "debug_enabled": _env_bool("RECOMMENDATION_RANKING_NEGATIVE_DEBUG_ENABLED", True),
     },
@@ -424,10 +437,12 @@ RECOMMENDATION_CONFIG: Dict[str, Any] = {
         # 只对基础相关性靠前的候选补 evidence concepts，避免在大召回池上无差别调用 LLM。
         "enabled": _env_bool("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_ENABLED", True),
         "top_k": _env_int("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_TOP_K", 20),
+        # 单次请求最多发起（同步执行或提交后台）的概念抽取次数。
         "max_llm_calls": _env_int("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_MAX_LLM_CALLS", 5),
-        # 当前推荐接口优先保障稳定延迟；打开后只复用缓存，不在主链路同步等待新的概念抽取。
+        # 打开后主链路只复用缓存，缺失的概念抽取提交到后台线程执行并写回缓存，下次请求即可命中。
+        # 搜索重排链路无论该开关如何都走后台抽取，不在请求里同步等待 LLM。
         "allow_lazy_generation": _env_bool("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_ALLOW_LAZY_GENERATION", False),
-        # 预留异步开关；当前实现与 lazy 一致，都用于禁止主链路继续发起新的 LLM 调用。
+        # 与 allow_lazy_generation 等价（任一开启即走后台抽取），保留以兼容旧配置。
         "allow_async_generation": _env_bool("RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_ALLOW_ASYNC_GENERATION", False),
         "cache_version": _env_str(
             "RECOMMENDATION_CANDIDATE_CONCEPT_ENRICHMENT_CACHE_VERSION",
@@ -442,8 +457,9 @@ RECOMMENDATION_CONFIG: Dict[str, Any] = {
         # deprecated: 负向扣分已迁移到 recommendation.ranking.negative.penalty_weight / max_penalty。
         "disliked_penalty": float(_env_str("RECOMMENDATION_SCORE_WEIGHT_DISLIKED_PENALTY", "0.15")),
     },
+    # 多样性选择中“语义重复”的判定阈值，基于 max(0, cos) 口径（旧 (cos+1)/2 口径的 0.75 等价于 0.5）。
     "semantic_similarity_penalty_threshold": float(
-        _env_str("RECOMMENDATION_SEMANTIC_SIMILARITY_PENALTY_THRESHOLD", "0.75")
+        _env_str("RECOMMENDATION_SEMANTIC_SIMILARITY_PENALTY_THRESHOLD", "0.5")
     ),
     "cluster_diversity_component_weight": float(_env_str("RECOMMENDATION_CLUSTER_DIVERSITY_COMPONENT_WEIGHT", "0.3")),
     "semantic_diversity_component_weight": float(_env_str("RECOMMENDATION_SEMANTIC_DIVERSITY_COMPONENT_WEIGHT", "0.7")),
@@ -464,7 +480,8 @@ MEMORY_RUNTIME_CONFIG: Dict[str, Any] = {
 
 PROMPT_CONTEXT_CONFIG: Dict[str, Any] = {
     "enable_block_prompt_context": _env_bool("ENABLE_BLOCK_PROMPT_CONTEXT", True),
-    "prompt_max_input_tokens": _env_int("PROMPT_MAX_INPUT_TOKENS", 64000),
+    # 主力模型上下文 256K（262,144 token），扣 16K 给输出。
+    "prompt_max_input_tokens": _env_int("PROMPT_MAX_INPUT_TOKENS", 245760),
     "prompt_safety_margin_tokens": _env_int("PROMPT_SAFETY_MARGIN_TOKENS", 2048),
     "rag_target_ratio": float(_env_str("PROMPT_RAG_TARGET_RATIO", "0.78")),
     "token_counter_provider": _env_str("PROMPT_TOKEN_COUNTER_PROVIDER", "auto"),
@@ -479,14 +496,35 @@ PROMPT_CONTEXT_CONFIG: Dict[str, Any] = {
     "llm_compaction_model_name": _env_str("PROMPT_LLM_COMPACTION_MODEL_NAME", ""),
     "llm_compaction_task_type": _env_str("PROMPT_LLM_COMPACTION_TASK_TYPE", "prompt_context_compaction"),
     "llm_compaction_enable_thinking": _env_bool("PROMPT_LLM_COMPACTION_ENABLE_THINKING", False),
+    # 最近 N 轮历史对话保留全文，更早的轮次把回答摘要压缩到 recent_turns_older_answer_tokens 以内。
     "recent_turns_recent_full_count": _env_int("PROMPT_RECENT_TURNS_RECENT_FULL_COUNT", 2),
+    "recent_turns_older_answer_tokens": _env_int("PROMPT_RECENT_TURNS_OLDER_ANSWER_TOKENS", 120),
     "recent_turns_source_id_limit": _env_int("PROMPT_RECENT_TURNS_SOURCE_ID_LIMIT", 6),
+    # 各 section 第一轮软预算（token）的显式覆盖；未设置的 section 沿用按比例计算的默认值。
+    "section_targets": {
+        section: value
+        for section, value in {
+            "rag_evidence": _env_optional_int("PROMPT_SECTION_TARGET_RAG_EVIDENCE"),
+            "session_summary": _env_optional_int("PROMPT_SECTION_TARGET_SESSION_SUMMARY"),
+            "recent_turns": _env_optional_int("PROMPT_SECTION_TARGET_RECENT_TURNS"),
+            "user_memory": _env_optional_int("PROMPT_SECTION_TARGET_USER_MEMORY"),
+            "agent_state": _env_optional_int("PROMPT_SECTION_TARGET_AGENT_STATE"),
+        }.items()
+        if value is not None
+    },
     "rag_max_block_tokens": _env_int("PROMPT_RAG_MAX_BLOCK_TOKENS", 4000),
     "rag_sibling_context_target_tokens": _env_int("PROMPT_RAG_SIBLING_CONTEXT_TARGET_TOKENS", 350),
     "rag_section_context_target_tokens": _env_int("PROMPT_RAG_SECTION_CONTEXT_TARGET_TOKENS", 250),
     "rag_fallback_preview_tokens": _env_int("PROMPT_RAG_FALLBACK_PREVIEW_TOKENS", 160),
     "table_candidate_cell_limit": _env_int("PROMPT_TABLE_CANDIDATE_CELL_LIMIT", 8),
     "figure_preview_tokens": _env_int("PROMPT_FIGURE_PREVIEW_TOKENS", 220),
+}
+
+PAPER_EVIDENCE_RESEARCH_CONFIG: Dict[str, Any] = {
+    # 证据池上限按 256K 上下文推导：输入预算 245,760 token，扣掉 30 张图（约 45K）与指令/状态（约 10K），
+    # 证据文本约 190K token，按 3 字符/token 折算约 57 万字符。一篇论文约 8 万字符，整篇都能进池。
+    "max_evidence_items": _env_int("RESEARCH_MAX_EVIDENCE_ITEMS", 300),
+    "max_total_context_chars": _env_int("RESEARCH_MAX_TOTAL_CONTEXT_CHARS", 560_000),
 }
 
 ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
@@ -773,6 +811,12 @@ GENERATION_CONFIG: Dict[str, Any] = {
     # 每次生成的完整上下文与回答落盘到 05-generation-results，仅供调试复盘；
     # 文件含用户问题和回答原文且没有清理机制，默认关闭，排查时再临时打开。
     "save_generation_results": _env_bool("SAVE_GENERATION_RESULTS", False),
+    # Responses API 多模态请求：请求体上限是 base64 图片的传输限制（DashScope 约 6MB），不是上下文限制；
+    # 图片数量按 256K 上下文放开，单图目标字节会按剩余请求体预算自适应压缩。
+    "qwen_responses_max_image_count": _env_int("QWEN_RESPONSES_MAX_IMAGE_COUNT", 30),
+    "qwen_responses_request_body_limit_bytes": _env_int("QWEN_RESPONSES_REQUEST_BODY_LIMIT_BYTES", 6_291_456),
+    "qwen_responses_request_body_soft_limit_bytes": _env_int("QWEN_RESPONSES_REQUEST_BODY_SOFT_LIMIT_BYTES", 5_500_000),
+    "qwen_responses_image_target_bytes": _env_int("QWEN_RESPONSES_IMAGE_TARGET_BYTES", 1_500_000),
     # 任务到模型角色的路由表只保留在配置层，业务代码只负责读取，不再硬编码模型名。
     "task_model_roles": {
         "intent_recognition": "small",  # 解析用户原始输入以识别高层意图
@@ -790,6 +834,7 @@ GENERATION_CONFIG: Dict[str, Any] = {
         "paper_qa": "large",  # 处理关于具体论文的问答
         "recommendation_generation": "large",  # 生成个性化推荐文本或推荐理由
         "general_generation": "large",  # 用于复杂自然语言输出的一般大模型生成
+        "research_claim_extraction": "large",  # 研究引擎把草稿拆成可校验主张并绑定证据需求
         "default": "large",  # 当无特定任务映射时的默认模型角色
     },
 }

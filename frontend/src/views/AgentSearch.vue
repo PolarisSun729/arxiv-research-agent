@@ -5,6 +5,7 @@ import { useRouter } from 'vue-router'
 import { dislikePaper, likePaper, removePaperPreference } from '@/api/papers'
 import { useAgentSearchChat } from '@/composables/useAgentSearchChat'
 import AgentUserResultAttachments from '@/components/agent-search/AgentUserResultAttachments.vue'
+import AgentRunTimeline from '@/components/agent-search/AgentRunTimeline.vue'
 import AgentWorkCard from '@/components/agent-search/AgentWorkCard.vue'
 import RagChatPanel from '@/components/rag-chat/RagChatPanel.vue'
 import RagEvidencePanel from '@/components/rag-chat/RagEvidencePanel.vue'
@@ -12,7 +13,7 @@ import type { AgentInteraction, ArxivSearchResponse, TargetSelectionPayload } fr
 import type { Paper } from '@/types/paper'
 import { usePaperStore } from '@/stores/paperStore'
 import { getPaperTargetCandidateId, toAgentUserResult, type AgentUserResult } from '@/utils/agentUserResult'
-import { extractCitedSourceIds } from '@/utils/evidence'
+import { orderCitedSourceIds } from '@/utils/evidence'
 import type { RagChatSource } from '@/types/ragChat'
 
 const router = useRouter()
@@ -157,9 +158,12 @@ function openAgentEvidence(response: unknown, sourceId?: string) {
   const agentResponse = toAgentResponse(response)
   const result = toAgentUserResultForMessage(response)
   if (!result.evidenceSources.length) return
-  const citedSourceIds = result.citedSourceIds.length
-    ? result.citedSourceIds
-    : extractCitedSourceIds(agentResponse?.paper_qa_result?.answer || '', result.evidenceSources)
+  // 与正文角标同一套编号：先按回答中出现顺序，再补后端声明的引用。
+  const citedSourceIds = orderCitedSourceIds(
+    agentResponse?.paper_qa_result?.answer || '',
+    result.evidenceSources,
+    result.citedSourceIds
+  )
   activeAgentEvidence.value = {
     question: agentResponse?.paper_qa_result?.question || 'Agent 回答证据',
     sources: result.evidenceSources,
@@ -273,7 +277,7 @@ watch(latestResponse, () => {
         :loading="loading"
         :quick-prompts="quickPrompts"
         title="Agent 对话"
-        description="默认只展示最终回答、必要确认、检索范围提示和论文结果。"
+        description="回答过程中会实时展示 Agent 的执行步骤，完成后可展开回看。"
         prompt-title="搜索示例"
         assistant-label="Agent"
         sender-placeholder="请输入自然语言搜索需求，Enter 发送，Shift+Enter 换行"
@@ -281,6 +285,9 @@ watch(latestResponse, () => {
         @select-prompt="handlePromptSelect"
         @select-source="handleAgentSourceSelect"
       >
+        <template #message-progress="{ item }">
+          <AgentRunTimeline v-if="item.progress" :progress="item.progress" />
+        </template>
         <template #message-footer="{ item }">
           <AgentUserResultAttachments
             v-if="item.role === 'assistant' && item.response"

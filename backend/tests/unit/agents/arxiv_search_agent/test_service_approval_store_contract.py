@@ -185,3 +185,73 @@ def test_stream_background_approval_ends_after_persisting_continuation_ticket(mo
         "status": "waiting_job",
     }
     assert events[2]["data"]["status"] == "background_work_started"
+
+
+def test_stream_announces_step_start_before_node_finishes(monkeypatch) -> None:
+    progress_log = []
+
+    class FakeGraph:
+        def stream(self, graph_input, config=None, stream_mode=None):
+            del config
+            # 真实 LangGraph 在多模式下产出 (mode, chunk)：tasks 的开始事件先于节点执行。
+            assert stream_mode == ["tasks", "updates"]
+            payload = dict(graph_input)
+            yield "tasks", {"id": "t1", "name": "parse_search_request", "input": payload, "triggers": ()}
+            progress_log.append("node_finished")
+            payload["intent"] = "unsupported"
+            payload["answer"] = "ok"
+            yield "updates", {"parse_search_request": payload}
+            yield "tasks", {"id": "t1", "name": "parse_search_request", "error": None, "result": payload, "interrupts": []}
+
+    monkeypatch.setattr(service_module, "_build_agent_graph", lambda **_kwargs: FakeGraph())
+    monkeypatch.setattr(service_module, "_write_request_trace", lambda *args, **kwargs: None)
+
+    response = service_module.stream_arxiv_search_agent(
+        schemas.ArxivSearchRequest(user_id="u1", session_id="s1", message="search rag")
+    )
+
+    async def collect():
+        events = []
+        async for chunk in response.body_iterator:
+            text = chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+            data_line = next((line for line in text.splitlines() if line.startswith("data: ")), "")
+            if not data_line:
+                continue
+            event = json.loads(data_line.removeprefix("data: "))
+            # 记录收到 step_start 时节点是否已经跑完：必须是“开始即推送”，而不是完成后补发。
+            event["node_finished_when_received"] = "node_finished" in progress_log
+            events.append(event)
+        return events
+
+    events = asyncio.run(collect())
+
+    assert [event["event_type"] for event in events] == [
+        "run_start",
+        "step_start",
+        "step_end",
+        "final_response",
+        "stream_end",
+    ]
+    assert events[1]["data"]["step"] == "parse_search_request"
+    assert events[1]["node_finished_when_received"] is False
+    assert events[2]["data"]["step"] == "parse_search_request"
+
+
+def test_tool_call_end_reports_step_output_counts() -> None:
+    # state.papers 要到收尾才回填；tool_call_end 必须直接给出本步输出的条目数，供前端展示“检索到几篇”。
+    state = state_module.AgentState(
+        message="search rag",
+        debug={
+            "last_step_result": {
+                "step_id": "search",
+                "step_status": "success",
+                "output_key": "search_result",
+                "output": {"papers": [{"arxiv_id": "1"}, {"arxiv_id": "2"}], "tool_result": {}, "search_spec": {}},
+                "next_action": "continue",
+            }
+        },
+    )
+
+    tool_call = service_module._latest_runtime_tool_call(state)
+
+    assert tool_call["result_counts"] == {"papers": 2}

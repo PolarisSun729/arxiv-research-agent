@@ -35,6 +35,12 @@ def _sanitize_answer(
     previous_debug: Any = None,
     previous_warning: Any = None,
 ) -> Dict[str, Any]:
+    """对单个答案文本做一次确定性的引用校验与清洗。
+
+    - 校验结果以「本次」校验为准，但会继承上游已记录的 repair 轨迹，避免 debug 丢失修复信息；
+    - 只要存在非法引用就给出统一 warning 并删除非法标记；没有非法引用时沿用上游 warning；
+    - cited_source_ids 只提取合法单引用，非法引用不会进入前端的证据高亮列表。
+    """
     text = str(answer or "")
     debug = validate_citations(text, source_ids)
     if isinstance(previous_debug, Mapping):
@@ -56,7 +62,14 @@ def _sanitize_answer(
 def sanitize_agent_response_citations(
     *, answer: Any, paper_qa_result: Any
 ) -> Dict[str, Any]:
-    """在 Agent 统一响应出口做确定性清洗，确保没有旧/混合引用漏到前端。"""
+    """在 Agent 统一响应出口做确定性清洗，确保没有旧/混合引用漏到前端。
+
+    处理两份答案：
+    1. paper_qa_result["answer"]：Paper QA 工具返回的嵌套答案，清洗后回写到 result 副本；
+    2. answer：Agent 最终展示给用户的答案，可能就是嵌套答案的投影，也可能是 Agent 自己改写过的文本。
+    两者使用同一组 source_id 白名单（来自 paper_qa_result.sources），保证前端证据面板与正文引用一致。
+    入参不会被原地修改，返回值中的 paper_qa_result 是浅拷贝。
+    """
     result = dict(paper_qa_result) if isinstance(paper_qa_result, Mapping) else None
     source_ids = _source_ids_from_result(result) if result is not None else []
 

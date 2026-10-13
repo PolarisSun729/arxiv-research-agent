@@ -1,6 +1,7 @@
 """研究引擎生产依赖的组装入口。
 
-问题分析与决策采用 LLM 优先、规则兜底，主张从可见答案独立提取。
+问题分析、决策与主张提取都采用 LLM 优先、规则兜底；主张从可见答案独立提取，
+LLM 提取器连续多次失败才降级到规则切句。
 retriever、draft_generator、claim_verifier 由组合根注入生产适配器；校验器失败不能
 由词面规则代替 supported 结论。
 """
@@ -11,6 +12,7 @@ from typing import Any
 
 from ..module import PaperEvidenceResearchService
 from .degradation import DegradationLedger, DegradationListener
+from .llm_claim_extractor import LlmClaimExtractor
 from .llm_decision_policy import LlmDecisionPolicy
 from .llm_question_analyzer import LlmQuestionAnalyzer
 from .rule_claim_extractor import RuleClaimExtractor
@@ -49,7 +51,11 @@ def build_paper_evidence_research_service(
         ),
         retriever=retriever,
         draft_generator=draft_generator,
-        claim_extractor=RuleClaimExtractor(),
+        claim_extractor=LlmClaimExtractor(
+            generation_service,
+            fallback=RuleClaimExtractor(),
+            degradation_listener=listener,
+        ),
         claim_verifier=claim_verifier,
         checkpointer=checkpointer,
         trace_sink=trace_sink,

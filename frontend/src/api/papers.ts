@@ -33,7 +33,8 @@ function resolveUserId(userId?: string | null): string {
 }
 
 export interface DashboardStats {
-  totalPapers: number
+  // null 表示后端这次没读到总数（如同步写库时被锁），不等于论文库为空。
+  totalPapers: number | null
   labeledPapers: number
   latestSyncNewPapers: number
   lastSyncedDate: string | null
@@ -47,7 +48,7 @@ export interface DashboardStats {
 
 function normalizeDashboardStats(raw: any): DashboardStats {
   return {
-    totalPapers: Number(raw?.totalPapers || 0),
+    totalPapers: raw?.totalPapers == null ? null : Number(raw.totalPapers),
     labeledPapers: Number(raw?.labeledPapers || 0),
     latestSyncNewPapers: Number(raw?.latestSyncNewPapers ?? 0),
     lastSyncedDate: raw?.lastSyncedDate ? String(raw.lastSyncedDate) : null,
@@ -603,8 +604,10 @@ export interface QaDiagnosticResult {
     indexed_status?: boolean
     collection_exists?: boolean
     qa_chunk_count?: number
+    expected_vector_count?: number | null
     milvus_num_entities?: number
-    entity_count_matches_metadata?: boolean
+    // null 表示 retrieval index 文件读不到，无法核对。
+    entity_count_matches_metadata?: boolean | null
     milvus_has_entities?: boolean
     sample_chunks_returned?: number
     likely_keyword_search_will_work?: boolean
@@ -1016,6 +1019,53 @@ export interface RetrievalDebug {
   fusion?: Record<string, any>
   qa_observation?: QaObservation
   trace_export?: Record<string, string>
+  engine?: string
+  research_rounds?: ResearchRoundDebug[]
+  research_steps?: ResearchStepDebug[]
+  research_summary?: ResearchSummary | null
+  removed_claims?: ResearchRemovedClaimDebug[]
+  /** 部分回答正文的生成方式：in_place 原位删除未受支持句子；joined_supported_claims 拼接受支持主张。 */
+  answer_pruning?: 'in_place' | 'joined_supported_claims' | string | null
+}
+
+/** 部分回答里因缺少证据支持而从正文删掉的句子，带校验结论与中文原因。 */
+export interface ResearchRemovedClaimDebug {
+  claim_id?: string
+  text: string
+  importance?: 'core' | 'supporting' | 'background' | string
+  citation_ids?: string[]
+  verdict?: string | null
+  supporting_evidence_ids?: string[]
+  missing_facets?: string[]
+  reason_code?: string
+  reason?: string
+}
+
+/** 研究引擎单轮检索的阶段摘要；字段均为可直接展示的文本与计数。 */
+export interface ResearchRoundDebug {
+  round: number
+  target_need_id: string
+  decision_reason?: string
+  query: string
+  status?: string
+  new_candidate_count?: number
+  duplicate_candidate_count?: number
+  original_query?: string
+  rewrite_enabled?: boolean
+  rewritten_queries?: string[]
+  hyde_enabled?: boolean
+  hyde_text?: string
+  keyword_queries?: string[]
+  route_counts?: Record<string, number>
+  fusion?: string
+  rerank?: string
+  final_context?: string[]
+}
+
+export interface ResearchStepDebug {
+  kind: 'search' | 'filter' | 'fallback' | 'draft' | 'extract' | 'verify' | 'rejected' | 'restore' | 'done' | string
+  title: string
+  detail?: string
 }
 
 export interface QaObservationStageStatus {

@@ -70,8 +70,8 @@ class IndexHitAggregator:
                     continue
                 if index_id:
                     group["matched_index_ids"].add(index_id)
-                weighted_score = float(entry.get("weighted_index_score", 0.0) or 0.0)
-                raw_score = float(entry.get("matched_index_score", 0.0) or 0.0)
+                weighted_score = float(entry["weighted_index_score"])
+                raw_score = float(entry["matched_index_score"])
                 entry["hit_rank"] = hit_rank
                 group["matched_indexes"].append(entry)
                 index_type = str(entry.get("matched_index_type") or entry.get("index_type") or "body")
@@ -98,8 +98,8 @@ class IndexHitAggregator:
             matched_indexes = sorted(
                 group["matched_indexes"],
                 key=lambda item: (
-                    float(item.get("weighted_index_score", 0.0) or 0.0),
-                    float(item.get("matched_index_score", 0.0) or 0.0),
+                    float(item["weighted_index_score"]),
+                    float(item["matched_index_score"]),
                     -int(item.get("hit_rank", 0) or 0),
                 ),
                 reverse=True,
@@ -133,12 +133,12 @@ class IndexHitAggregator:
         candidates.sort(
             key=lambda item: (
                 int(item.get("index_aggregation_best_rank", 0) or 0),
-                -float(item.get("route_score", 0.0) or 0.0),
-                -float((item.get("best_matched_index") or {}).get("matched_index_score", 0.0) or 0.0),
+                -float(item["route_score"]),
+                -float(item["best_matched_index"]["matched_index_score"]),
             )
         )
         limited = candidates[:top_k] if top_k is not None and top_k > 0 else candidates
-        normalized_scores = min_max_normalize([float(item.get("route_score", 0.0) or 0.0) for item in limited])
+        normalized_scores = min_max_normalize([float(item["route_score"]) for item in limited])
         for rank, (item, normalized_score) in enumerate(zip(limited, normalized_scores), start=1):
             item["route_rank"] = rank
             item["normalized_route_score"] = float(normalized_score)
@@ -199,6 +199,9 @@ class IndexHitAggregator:
             hit.get("route_score"),
             hit.get("score"),
         )
+        if raw_score is None:
+            # 所有来源都没有分数说明上游合约被破坏；当成 0 分会让该路由的分数全部失真且不易察觉。
+            raise ValueError(f"Missing index score for route={route_name} index_id={index_id}")
         try:
             index_type_weight = float(
                 entry.get("index_weight")

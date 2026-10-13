@@ -346,6 +346,27 @@ class PaperQAServiceComponentTests(unittest.TestCase):
         self.assertEqual(status["last_failed_build"]["failed_stage"], "chunk_document")
         self.assertGreaterEqual(status["cleanup_pending_count"], 1)
 
+    def test_delete_qa_index_cancels_in_progress_build_jobs(self) -> None:
+        # 首次构建尚未激活时主表没有记录，删除仍要先终止进行中的任务，避免删除后索引「复活」。
+        job = self.storage.paper_qa_index.create_paper_index_job(self.arxiv_id, "docling")
+
+        result = self.service.delete_qa_index(self.arxiv_id)
+
+        stored = self.storage.paper_qa_index.get_paper_index_job(job["job_id"])
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["cancelled_job_ids"], [job["job_id"]])
+        self.assertEqual(stored["status"], "failed")
+        self.assertEqual(stored["failure_code"], "qa_index_deleted")
+
+    def test_resolve_chat_session_without_create_does_not_create_session(self) -> None:
+        payload = {"user_id": self.user_id, "question": "first question"}
+
+        self.assertEqual(self.service._resolve_chat_session(self.arxiv_id, payload, False), {})
+        self.assertEqual(
+            self.storage.paper_chat_sessions.list_paper_chat_sessions(arxiv_id=self.arxiv_id, user_id=self.user_id, limit=5),
+            [],
+        )
+
     def test_resolve_chat_session_creates_or_reuses_sessions(self) -> None:
         created = self.service._resolve_chat_session(self.arxiv_id, {"user_id": self.user_id, "question": "What is this paper about?"})
         self.assertTrue(created["session_id"])

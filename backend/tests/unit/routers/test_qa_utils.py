@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -87,9 +88,31 @@ def test_get_latest_retrieval_trace_returns_none_when_directory_missing(tmp_path
     assert result is None
 
 
-def test_build_qa_diagnostic_reports_collection_health() -> None:
+def _write_retrieval_index_file(tmp_path: Path, indexes) -> str:
+    path = tmp_path / "retrieval_indexes.json"
+    path.write_text(json.dumps({"retrieval_indexes": indexes}), encoding="utf-8")
+    return str(path)
+
+
+def test_build_qa_diagnostic_reports_collection_health(tmp_path: Path) -> None:
+    # 一个 chunk 派生 body + section_anchor 两条索引，只有 body 走向量路线，所以 Milvus 预期 1 条。
+    retrieval_index_file = _write_retrieval_index_file(
+        tmp_path,
+        [
+            {"index_id": "i1", "chunk_id": "c1", "index_type": "body", "index_text": "chunk one",
+             "enabled_routes": ["vector_original", "keyword"]},
+            {"index_id": "i2", "chunk_id": "c1", "index_type": "section_anchor", "index_text": "Intro",
+             "enabled_routes": ["keyword"]},
+        ],
+    )
     diagnostic = build_qa_diagnostic(
-        paper_qa_index_store=_FakePaperQAIndexStore({"collection_name": "paper_123", "status": "indexed", "chunk_count": 1}),
+        paper_qa_index_store=_FakePaperQAIndexStore({
+            "collection_name": "paper_123",
+            "status": "indexed",
+            "chunk_count": 1,
+            "retrieval_index_count": 2,
+            "retrieval_index_file": retrieval_index_file,
+        }),
         vector_store_service=_FakeVectorStoreService(),
         arxiv_id="2401.00001",
         sample_limit=2,
@@ -97,8 +120,20 @@ def test_build_qa_diagnostic_reports_collection_health() -> None:
 
     assert diagnostic["checks"]["has_qa_index"] is True
     assert diagnostic["checks"]["collection_exists"] is True
+    assert diagnostic["checks"]["expected_vector_count"] == 1
     assert diagnostic["checks"]["entity_count_matches_metadata"] is True
     assert len(diagnostic["sample_chunks"]) == 1
+
+
+def test_build_qa_diagnostic_cannot_check_vector_count_without_retrieval_index_file() -> None:
+    diagnostic = build_qa_diagnostic(
+        paper_qa_index_store=_FakePaperQAIndexStore({"collection_name": "paper_123", "status": "indexed", "chunk_count": 1}),
+        vector_store_service=_FakeVectorStoreService(),
+        arxiv_id="2401.00001",
+    )
+
+    assert diagnostic["checks"]["expected_vector_count"] is None
+    assert diagnostic["checks"]["entity_count_matches_metadata"] is None
 
 
 def test_build_qa_diagnostic_handles_missing_index() -> None:

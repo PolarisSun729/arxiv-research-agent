@@ -24,9 +24,13 @@ class FakeGenerationService:
         self.replies = list(replies or [])
         self.raise_on_call = raise_on_call
         self.call_count = 0
+        self.prompts: list[str] = []
+        self.call_kwargs: list[dict[str, Any]] = []
 
     def complete_with_qwen(self, prompt: str, **kwargs: Any) -> str:
         self.call_count += 1
+        self.prompts.append(prompt)
+        self.call_kwargs.append(kwargs)
         if self.raise_on_call:
             raise RuntimeError("llm unavailable")
         if not self.replies:
@@ -111,6 +115,19 @@ class TestRuleDecisionPolicy:
         )
         assert action["action"] == "draft_answer"
         assert set(action["addressed_need_ids"]) == {"need-a", "need-b"}
+
+    def test_full_evidence_pool_drafts_instead_of_searching_uncovered_need(self) -> None:
+        # 池满时新候选进不了池，给未覆盖需求再检索只会触发无进展终止。
+        action = RuleDecisionPolicy().decide(
+            self._context(
+                candidate_count=20,
+                candidate_need_ids=["need-a"],
+                retrievals_used=1,
+                evidence_pool_capacity=20,
+                evidence_pool_full=True,
+            )
+        )
+        assert action["action"] == "draft_answer"
 
     def test_draft_all_supported_finalizes(self) -> None:
         from services.paper_evidence_research.state import ClaimAssessment
@@ -253,6 +270,38 @@ class TestRuleClaimExtractor:
         result = RuleClaimExtractor().extract(self._request("有效主张文本 [source:c]。", version=3))
         assert result["claims"][0]["claim_id"] == "claim-v3-0"
 
+    def test_markdown_structure_is_not_extracted_as_claims(self) -> None:
+        # 回归：编号加粗小标题被 "1." 切成 "**1" 和 "层名**"，引出句与小标题都成了无引用主张，
+        # 经词面重叠绑到核心需求后让所有核心需求无法满足。
+        needs = [{"need_id": "need-1", "description": "记忆生成与演化层的具体步骤", "importance": "core"}]
+        answer = (
+            "具体步骤如下：\n\n"
+            "**1. 记忆生成与演化层（顶层）**\n"
+            "*   **记忆化（Memorize）：** 系统将原始对话转化为图节点。[source:54]\n"
+            "2. 整合阶段合并重复事实。[source:5]\n\n"
+            "**核心架构特点：**\n"
+            "### 演化层\n"
+        )
+        claims = RuleClaimExtractor().extract(self._request(answer, needs=needs))["claims"]
+        assert [(claim["text"], claim["citation_ids"]) for claim in claims] == [
+            ("记忆化（Memorize）： 系统将原始对话转化为图节点", ["54"]),
+            ("整合阶段合并重复事实", ["5"]),
+        ]
+
+    def test_bold_line_with_numbers_or_citations_is_still_verified(self) -> None:
+        # 只有短、无引用、无数字的结构行才跳过，不能把结论写进加粗标题绕过校验。
+        claims = RuleClaimExtractor().extract(
+            self._request("**CogMem 准确率提升 30%**\n**记忆层负责建图** [source:c]\n")
+        )["claims"]
+        assert [(claim["text"], claim["citation_ids"]) for claim in claims] == [
+            ("CogMem 准确率提升 30%", []),
+            ("记忆层负责建图", ["c"]),
+        ]
+
+    def test_decimal_at_line_start_is_not_an_ordinal(self) -> None:
+        claims = RuleClaimExtractor().extract(self._request("3.5% 的提升来自检索模块 [source:c]。"))["claims"]
+        assert claims[0]["text"] == "3.5% 的提升来自检索模块"
+
 
 class TestLlmQuestionAnalyzer:
     def test_valid_llm_output_used_directly(self) -> None:
@@ -354,6 +403,76 @@ class TestLlmDecisionPolicy:
         assert action["action"] == "search_paper"
         assert action["query"] == "核心需求检索词"
 
+    @staticmethod
+    def _prompt_state(prompt: str) -> dict[str, Any]:
+        return json.loads(prompt.split("Research state:\n", 1)[1].split("\n\nRetrieved evidence", 1)[0])
+
+    def test_prompt_carries_pool_fullness_and_need_evidence_candidate_ids(self) -> None:
+        service = FakeGenerationService([json.dumps({"action": "draft_answer", "reason_code": "POOL_FULL"})])
+        policy = LlmDecisionPolicy(service)
+        policy.decide(
+            self._context(
+                candidate_count=1,
+                candidate_need_ids=["need-a"],
+                evidence_pool_capacity=1,
+                evidence_pool_full=True,
+                need_evidence=[{"need_id": "need-a", "candidate_count": 1, "candidate_ids": ["54"]}],
+                evidence=[{"candidate_id": "54", "content": "Figure 2: Overall Architecture", "matched_need_ids": ["need-a"]}],
+            )
+        )
+        state = self._prompt_state(service.prompts[0])
+        assert state["evidence_pool_full"] is True
+        assert state["evidence_pool_capacity"] == 1
+        assert state["need_evidence"][0]["candidate_ids"] == ["54"]
+        assert "previews" not in service.prompts[0]
+        assert '"evidence_pool_full" is true' in service.prompts[0]
+
+    def test_prompt_contains_full_text_of_every_retrieved_candidate(self) -> None:
+        # 回归 0a82ae71：决策器只看到每条 160 字摘要，把方法章节判成"无对题证据"后弃答。
+        long_method = "The pipeline first builds a cognitive graph. " * 10 + "FINAL-STAGE-MARKER consolidates memory."
+        service = FakeGenerationService([json.dumps({"action": "draft_answer", "reason_code": "ON_TOPIC"})])
+        LlmDecisionPolicy(service).decide(
+            self._context(
+                candidate_count=2,
+                evidence=[
+                    {"candidate_id": "12", "content": long_method, "section_path": "3 Method", "page_number": 4,
+                     "matched_need_ids": ["need-a"]},
+                    {"candidate_id": "13", "content": "Related work on retrieval.", "matched_need_ids": ["need-a"]},
+                ],
+            )
+        )
+        prompt = service.prompts[0]
+        assert "FINAL-STAGE-MARKER consolidates memory." in prompt
+        assert "source_id: 12" in prompt and "source_id: 13" in prompt
+        assert "Retrieved evidence (2 candidates" in prompt
+        assert "image_inputs" not in service.call_kwargs[0]
+
+    def test_figure_candidates_are_attached_as_images(self, tmp_path: Any) -> None:
+        image_path = tmp_path / "figure-2.png"
+        image_path.write_bytes(b"png")
+        service = FakeGenerationService([json.dumps({"action": "draft_answer", "reason_code": "ON_TOPIC"})])
+        LlmDecisionPolicy(service).decide(
+            self._context(
+                candidate_count=1,
+                evidence=[{
+                    "candidate_id": "54", "content": "Figure 2: Overall Architecture", "chunk_type": "figure",
+                    "asset_abs_path": str(image_path), "asset_summary": "架构图", "matched_need_ids": ["need-a"],
+                }],
+            )
+        )
+        images = service.call_kwargs[0]["image_inputs"]
+        assert [(item["source_id"], item["image_path"]) for item in images] == [("54", str(image_path))]
+
+    def test_discard_evidence_ids_are_passed_through(self) -> None:
+        reply = json.dumps({"action": "draft_answer", "discard_evidence_ids": ["13"], "reason_code": "ON_TOPIC"})
+        action = LlmDecisionPolicy(FakeGenerationService([reply])).decide(self._context())
+        assert action["discard_evidence_ids"] == ["13"]
+
+    def test_empty_pool_prompt_says_nothing_retrieved(self) -> None:
+        service = FakeGenerationService([json.dumps({"action": "abstain", "reason_code": "X"})])
+        LlmDecisionPolicy(service).decide(self._context())
+        assert "(none retrieved yet)" in service.prompts[0]
+
     @pytest.mark.parametrize(
         "reply",
         [
@@ -390,3 +509,35 @@ class TestRequestCompatibility:
         )
         result = TemplateQuestionAnalyzer().analyze(request)
         assert result["research_question"] == "方法流程是什么"
+
+
+class TestResearchDraftGeneratorImages:
+    def test_figure_candidates_become_image_inputs_for_the_drafter(self, tmp_path: Any) -> None:
+        from services.paper_evidence_research.dependencies.production_adapters import ResearchDraftGenerator
+        from services.paper_evidence_research.state import DraftGenerationRequest, EvidenceContextPack
+
+        image_path = tmp_path / "figure-2.png"
+        image_path.write_bytes(b"png")
+        captured: dict[str, Any] = {}
+
+        class CapturingAnswerGenerator:
+            def generate(self, **kwargs: Any) -> dict[str, Any]:
+                captured.update(kwargs)
+                return {"answer": "架构见图 [source:54]。", "cited_source_ids": ["54"], "citation_debug": {}}
+
+        drafter = ResearchDraftGenerator(FakeGenerationService())
+        drafter._generator = CapturingAnswerGenerator()
+        drafter.generate(
+            DraftGenerationRequest(
+                version=1,
+                research_question="方法流程是什么",
+                addressed_need_ids=["need-a"],
+                context_pack=EvidenceContextPack(candidates=[
+                    {"candidate_id": "54", "content": "Figure 2: Overall Architecture", "chunk_type": "figure",
+                     "asset_abs_path": str(image_path), "asset_summary": "架构图"},
+                ]),
+            )
+        )
+
+        images = captured["context_pack"]["image_inputs"]
+        assert [(item["source_id"], item["image_path"]) for item in images] == [("54", str(image_path))]

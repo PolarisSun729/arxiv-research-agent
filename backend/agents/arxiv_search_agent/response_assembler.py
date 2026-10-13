@@ -75,4 +75,10 @@ def _build_recovery_fallback_answer(runtime: PlanRuntime, reason: str) -> str:
         reason_bits = [item for item in [observation_reason, f"retrieval_quality={retrieval_quality}" if retrieval_quality else None, f"answer_insufficient_evidence={answer_insufficient}" if answer_insufficient else None] if item]
         reason_text = "；".join(reason_bits) or reason
         return f"当前无法给出足够可靠的论文回答：{reason_text}。我没有把低证据结果当作确定答案；请尝试重建索引、缩小问题范围或稍后重试。"
-    return f"当前步骤无法继续自动恢复：{reason}。请补充信息或稍后重试。"
+    # 内部原因码（如 replan_limit_exceeded:search_arxiv:empty_result）只写进 fallback_record，
+    # 面向用户的文案按大类翻译成人话。
+    if any(token in lower_reason for token in ("timeout", "timed out", "tool_error", "tool_runtime_error", "backend_tool_failed")):
+        return "检索服务暂时不可用，这次没能完成请求。请稍后重试。"
+    if any(token in lower_reason for token in ("search_arxiv", "search_empty", "empty_result", "validate_arxiv_results", "no_papers")):
+        return "自动调整检索条件后仍然没有找到合适的论文。可以尝试放宽时间范围，或换一个更通用的关键词后再试。"
+    return "这次请求没能顺利完成。可以换个说法、补充一些细节，或稍后重试。"

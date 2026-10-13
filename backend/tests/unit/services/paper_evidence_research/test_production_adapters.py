@@ -128,3 +128,47 @@ def test_sentence_final_citation_stays_with_the_preceding_claim():
     assert "检索提升准确率" in claims[0]["text"]
     assert claims[0]["citation_ids"] == ["chunk-1"]
     assert claims[1]["citation_ids"] == []
+
+
+
+def test_draft_generator_asks_for_per_sentence_citations_and_passes_revision_notes():
+    from services.paper_evidence_research.dependencies.production_adapters import ResearchDraftGenerator
+    from services.paper_evidence_research.state import DraftGenerationRequest, DraftRevisionNote, EvidenceContextPack
+
+    captured = {}
+
+    class CapturingAnswerGenerator:
+        def generate(self, **kwargs):
+            captured.update(kwargs)
+            return {"answer": "改挂后的句子 [source:54]。", "cited_source_ids": ["54"], "citation_debug": {}}
+
+    drafter = ResearchDraftGenerator(SimpleNamespace())
+    drafter._generator = CapturingAnswerGenerator()
+    base = dict(
+        research_question="方法流程是什么",
+        addressed_need_ids=["need-a"],
+        context_pack=EvidenceContextPack(candidates=[{"candidate_id": "54", "content": "Figure 2"}]),
+    )
+
+    drafter.generate(DraftGenerationRequest(version=1, **base))
+    assert captured["original_question"] == "方法流程是什么"
+    assert "句末单独挂上" in captured["generation_question"]
+    assert "修订要求" not in captured["generation_question"]
+
+    drafter.generate(
+        DraftGenerationRequest(
+            version=2,
+            previous_answer="上一版答案正文",
+            revision_notes=[
+                DraftRevisionNote(
+                    claim_text="系统处理原始对话", reason_code="citation_mismatch", reason="挂的引用不对",
+                    suggested_citation_ids=["54"], missing_facets=["具体步骤"],
+                )
+            ],
+            **base,
+        )
+    )
+    question = captured["generation_question"]
+    assert "修订要求" in question and "上一版答案正文" in question
+    assert "「系统处理原始对话」——挂的引用不对" in question
+    assert "[source:54]" in question and "具体步骤" in question

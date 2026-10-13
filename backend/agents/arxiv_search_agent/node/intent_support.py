@@ -442,12 +442,13 @@ def _build_llm_prompt_with_profile(message: str, research_profile: Optional[Mapp
     
     主要内容包括：
     1. 限定可选 intent，减少模型自由发挥空间；
-    2. 明确 search spec 的 JSON schema，约束字段名和取值；
-    3. 注入研究画像摘要和关键规则，帮助模型在搜索、阅读、偏好、推荐之间做更稳定的区分。
+    2. 要求把检索主题拆成 concepts（主术语 + 同义写法 + 原话依据）和 optional_terms；
+    3. 研究画像不再注入 prompt：画像只用于结果排序，避免模型把画像主题混进检索条件。
+       research_profile 参数保留只是为了兼容调用方签名。
     
     输出：返回完整 prompt 字符串，不直接触发调用。
     """
-    profile_hint = _compact_research_profile_for_prompt(research_profile)
+    del research_profile
     return (
         "You are an intent parser for a natural-language arXiv paper agent.\n"
         "Return JSON only.\n"
@@ -457,27 +458,32 @@ def _build_llm_prompt_with_profile(message: str, research_profile: Optional[Mapp
         "{"
         f'\"intent\":\"{"|".join(LLM_INTENT_CHOICES)}\",'
         '\"confidence\":0.0,'
-        '\"query\":null|string,'
+        '\"concepts\":[{\"term\":string,\"aliases\":[string],\"evidence\":string}],'
+        '\"optional_terms\":[string],'
         '\"title_query\":null|string,'
         '\"abstract_query\":null|string,'
         '\"submitted_days_ago\":null|int,'
-        '\"max_results\":10,'
-        '\"sort_by\":\"submittedDate|relevance|lastUpdatedDate\",'
-        '\"sort_order\":\"ascending|descending\",'
-        '\"field_operator\":\"AND|OR|ANDNOT\",'
-        '\"category_operator\":\"AND|OR\",'
+        '\"max_results\":null|int,'
         '\"reasoning_summary\":null|string,'
-        '\"cleaned_topic_cn\":null|string,'
-        '\"cleaned_topic_en\":null|string,'
         '\"missing_info\":[],'
         '\"warnings\":[],'
         '\"next_actions\":[]'
         "}\n"
+        "Search spec rules:\n"
+        "- concepts: the core topics the user explicitly asked for; papers must match every concept. "
+        "Write term in English as it appears in arXiv papers (translate Chinese). "
+        "Keep the user's granularity: never add words the user did not say "
+        "(user says 'RAG' -> term 'RAG', not 'RAG retrieval optimization').\n"
+        "- evidence: the exact words copied from the user message that this concept comes from.\n"
+        "- aliases: up to 3 English synonyms, abbreviations or expansions with the same meaning "
+        "(e.g. 'RAG' -> ['retrieval-augmented generation']). No narrower or broader subtopics.\n"
+        "- Put each distinct topic in its own concept. Put secondary qualifiers the user mentioned "
+        "(that could be dropped if results are scarce) in optional_terms; otherwise leave it empty.\n"
+        "- submitted_days_ago / max_results: null unless the user stated them.\n"
+        "- title_query / abstract_query: only when the user explicitly asks to search the title/abstract.\n"
         "Guidance:\n"
         + "".join(f"- {line}\n" for line in LLM_CLASSIFICATION_GUIDANCE)
-        +
-        f"Research profile hint: {profile_hint}\n"
-        f"User message: {message}\n"
+        + f"User message: {message}\n"
     )
 
 

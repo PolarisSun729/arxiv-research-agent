@@ -10,6 +10,10 @@
    无候选信息时的兜底。两级都匹配不到时保持不绑定——宁可让需求保持 open 触发继续
    检索，也不能把无关主张硬绑到需求上造成虚假满足。
 3. importance 按绑定到的需求定级：绑到 core 需求即 core，其余为 supporting。
+4. Markdown 排版结构不是主张：加粗小标题、编号/项目符号、"具体步骤如下："这类引出句
+   本身不陈述事实，若当作主张进入校验，必然因无引用判 unsupported，并经词面重叠绑到
+   核心需求上，使整轮核心覆盖全部落空。只有短、无引用、无数字的结构行才会被跳过，
+   带数字或引用的加粗行仍按事实校验，避免把结论藏进标题绕过门禁。
 """
 
 from __future__ import annotations
@@ -35,6 +39,12 @@ _LEADING_META_RE = re.compile(
     r"(?:propose|proposes|present|presents|show|shows|find|finds|introduce|introduces)\s+that\s+",
     flags=re.IGNORECASE,
 )
+# 行首排版标记：Markdown 标题井号、项目符号、"1." "1、" "(1)" 这类编号；"3.5%" 的小数点不算编号。
+_LEADING_MARKUP_RE = re.compile(
+    r"^(?:#{1,6}\s+|[-*+•]\s+|\d{1,2}(?:\.(?!\d)|[、)）])\s*|[（(]\d{1,2}[)）]\s*)+"
+)
+_EMPHASIS_RE = re.compile(r"\*\*|__")
+_MAX_STRUCTURAL_LINE_CHARS = 40
 _MIN_ZH_SHARED_BIGRAMS = 2
 _MIN_LATIN_TOKEN_LEN = 4
 
@@ -79,6 +89,41 @@ def _match_need_ids(claim_text: str, needs: list[Any]) -> list[str]:
     return [need_id for need_id in matched if need_id]
 
 
+def _strip_leading_markup(line: str) -> str:
+    stripped = line.strip()
+    # 编号可能包在加粗里（"**1. 方法**"），先剥项目符号，再剥加粗内的编号。
+    stripped = _LEADING_MARKUP_RE.sub("", stripped)
+    if stripped.startswith(("**", "__")):
+        stripped = stripped[:2] + _LEADING_MARKUP_RE.sub("", stripped[2:])
+    return stripped
+
+
+def _is_structural_line(raw_line: str, body: str) -> bool:
+    """判断一行是否只是排版结构（标题、编号小标题、列表引出句），而非可校验事实。"""
+    if _CITATION_MARKER_RE.search(body):
+        return False
+    plain = _EMPHASIS_RE.sub("", body).strip()
+    if not plain or len(plain) > _MAX_STRUCTURAL_LINE_CHARS or any(char.isdigit() for char in plain):
+        return False
+    if raw_line.lstrip().startswith("#"):
+        return True
+    # 整行加粗的小标题，如 "**记忆生成与演化层（顶层）**" 或 "**核心架构特点：**"。
+    if re.fullmatch(r"(\*\*|__).+?\1\s*[:：]?", body.strip()):
+        return True
+    # 以冒号收尾的引出句，如 "具体步骤如下："，事实在后续列表项里。
+    return plain.endswith(("：", ":"))
+
+
+def _normalize_markdown(answer: str) -> str:
+    lines: list[str] = []
+    for raw_line in answer.splitlines():
+        body = _strip_leading_markup(raw_line)
+        if _is_structural_line(raw_line, body):
+            continue
+        lines.append(_EMPHASIS_RE.sub("", body))
+    return "\n".join(lines)
+
+
 def _clean_claim_text(segment: str) -> str:
     text = _CITATION_MARKER_RE.sub("", segment)
     text = _LEADING_META_RE.sub("", text.strip())
@@ -89,7 +134,7 @@ class RuleClaimExtractor:
     """确定性地提取可见句子；倾向保留待核实文本，避免把漏提主张误当作全部受支持。"""
 
     def extract(self, request: Any) -> dict[str, Any]:
-        answer = str(getattr(request, "answer", "") or "")
+        answer = _normalize_markdown(str(getattr(request, "answer", "") or ""))
         # 把紧随句末的引用移到该句的切分边界内；小数点和 source_id 内的点不会成为边界。
         answer = _TRAILING_CITATIONS_RE.sub(lambda match: f" {match[2].strip()}{match[1]} ", answer)
         draft_version = int(getattr(request, "draft_version", 1) or 1)

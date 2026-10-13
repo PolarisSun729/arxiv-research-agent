@@ -58,6 +58,23 @@ class FakeEvidenceGenerationService:
         )
 
 
+class _DeferredExecutor:
+    """记录后台提交的任务，由测试显式执行，避免后台线程与 tearDown 删除临时数据库竞争。"""
+
+    def __init__(self):
+        self.pending = []
+        self.submitted_count = 0
+
+    def submit(self, fn, *args, **kwargs):
+        self.submitted_count += 1
+        self.pending.append((fn, args, kwargs))
+
+    def run_pending(self) -> None:
+        tasks, self.pending = self.pending, []
+        for fn, args, kwargs in tasks:
+            fn(*args, **kwargs)
+
+
 def _load_recommendation_service_class():
     backend_dir = Path(__file__).resolve().parents[2]
     created_stub_modules = []
@@ -226,6 +243,8 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         temp_db = getattr(self.storage, "_test_temp_db", None)
+        # 跑完残留的后台任务：既释放进程级的 in-flight 去重标记，也保证删库前不再有写入。
+        self.service.concept_enrichment_executor.run_pending()
         self.service = None
         self.storage = None
         gc.collect()
@@ -249,7 +268,7 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         )
 
     def _make_recommendation_service(self, *, generation_service):
-        return RecommendationService(
+        service = RecommendationService(
             paper_catalog_store=self.storage.paper_catalog,
             user_preference_store=self.storage.user_preferences,
             interest_vector_store=self.storage.interest_vectors,
@@ -264,6 +283,8 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
             arxiv_service_factory=lambda: types.SimpleNamespace(),
             collection_name=self.collection_name,
         )
+        service.concept_enrichment_executor = _DeferredExecutor()
+        return service
 
     def _add_paper(self, arxiv_id: str, *, title: str, abstract: str, categories) -> None:
         self.storage.paper_catalog.add_paper(
@@ -419,7 +440,7 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
         self.assertEqual(stored["interest_clusters"], cluster_payload)
 
     def test_candidate_recall_returns_fixed_candidates(self) -> None:
-        candidates = self.service._fetch_recent_db_candidates(Counter(), max_age_months=12, max_results=10)
+        candidates = self.service._fetch_recent_db_candidates(max_age_months=12, max_results=10)
 
         self.assertEqual([item["arxiv_id"] for item in candidates], ["2401.10001", "2401.10002"])
         self.assertEqual(candidates[0]["score"], 0.0)
@@ -1108,6 +1129,195 @@ class RecommendationFlowIntegrationTests(unittest.TestCase):
             self.service.generate_user_interest_vector(self.user_id)
 
         self.assertEqual(ctx.exception.status_code, 400)
+
+    def _rerank_vector_patch(self):
+        return mock.patch.object(
+            self.service,
+            "_get_or_refresh_interest_vector",
+            return_value={
+                "vector_data": [1.0, 0.0, 0.0],
+                "interest_clusters": [],
+                "negative_feedback_profile": {"version": "negative_feedback_profile_v1", "enabled": True, "mode": "none", "examples": [], "clusters": [], "stats": {}},
+                "profile_mode": "mean",
+                "cluster_count": 0,
+            },
+        )
+
+    def test_search_rerank_schedules_concept_extraction_instead_of_calling_llm_inline(self) -> None:
+        papers = [
+            {
+                "arxiv_id": "2401.60001",
+                "title": "Rerank Candidate",
+                "abstract": "retrieval augmented generation with reranking",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+            }
+        ]
+        with self._rerank_vector_patch():
+            first = self.service.rerank_search_results_for_user(user_id=self.user_id, papers=papers, query="retrieval", top_n=1)
+
+        enrichment = first["candidate_concept_enrichment"]
+        self.assertEqual(self.fake_llm.call_count, 0)
+        self.assertEqual(enrichment["generation_mode"], "background")
+        self.assertEqual(enrichment["llm_attempt_count"], 0)
+        self.assertEqual(enrichment["scheduled_count"], 1)
+        self.assertIsNone(self.storage.paper_profile_evidence.get_paper_profile_evidence("2401.60001"))
+
+        # 后台任务执行后写入缓存，下一次重排直接命中缓存且不再提交新任务。
+        self.service.concept_enrichment_executor.run_pending()
+        self.assertEqual(self.fake_llm.call_count, 1)
+        self.assertTrue(self.storage.paper_profile_evidence.get_paper_profile_evidence("2401.60001")["candidate_concepts"])
+        with self._rerank_vector_patch():
+            second = self.service.rerank_search_results_for_user(user_id=self.user_id, papers=papers, query="retrieval", top_n=1)
+        self.assertEqual(second["candidate_concept_enrichment"]["cache_hit_count"], 1)
+        self.assertEqual(second["candidate_concept_enrichment"]["scheduled_count"], 0)
+        self.assertEqual(second["papers"][0]["candidate_concept_source"], "cached_evidence_card")
+
+    def test_search_rerank_final_score_includes_category_context_adjustment(self) -> None:
+        papers = [
+            {
+                "arxiv_id": "2401.61001",
+                "title": "Matched Category",
+                "abstract": "retrieval augmented generation",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+            },
+            {
+                "arxiv_id": "2401.61002",
+                "title": "Mismatched Category",
+                "abstract": "retrieval augmented generation",
+                "categories": ["cs.CV"],
+                "published_date": "2024-01-01",
+            },
+        ]
+        with self._rerank_vector_patch():
+            result = self.service.rerank_search_results_for_user(
+                user_id=self.user_id,
+                papers=papers,
+                query="retrieval",
+                top_n=2,
+                search_spec={"categories": ["cs.CL"]},
+            )
+
+        by_id = {paper["arxiv_id"]: paper for paper in result["papers"]}
+        matched = by_id["2401.61001"]["score_breakdown"]
+        mismatched = by_id["2401.61002"]["score_breakdown"]
+        # request_score 不再包含查询匹配项，只剩分类命中的 0.03；全部未命中时扣 0.12。
+        self.assertAlmostEqual(matched["context_adjustment"], 0.03)
+        self.assertAlmostEqual(mismatched["context_adjustment"], -0.12)
+        expected_final = (
+            matched["query_match_score"] * 0.60
+            + matched["personalization_score"] * 0.30
+            + by_id["2401.61001"]["profile_score"]
+            - by_id["2401.61001"]["profile_penalty"]
+            + matched["context_adjustment"]
+        )
+        self.assertAlmostEqual(by_id["2401.61001"]["final_score"], expected_final)
+        self.assertEqual(result["papers"][0]["arxiv_id"], "2401.61001")
+
+    def test_recommend_papers_sets_personalized_reason_for_frontend(self) -> None:
+        self.storage.user_preferences.add_liked_paper(self.user_id, "2401.00001")
+        candidate_pool = [
+            {
+                "arxiv_id": "2401.62001",
+                "title": "Reason Candidate",
+                "authors": ["A"],
+                "abstract": "retrieval augmented generation",
+                "categories": ["cs.CL"],
+                "published_date": "2024-01-01",
+                "url": "https://arxiv.org/abs/2401.62001",
+                "score": 0.9,
+                "_stored_vector": [1.0, 0.0, 0.0],
+            }
+        ]
+        with mock.patch.object(self.service, "_get_or_refresh_interest_vector", return_value={"vector_data": [1.0, 0.0, 0.0], "interest_clusters": [], "disliked_vector_data": None, "negative_feedback_profile": {}, "profile_mode": "mean", "cluster_count": 0}), \
+             mock.patch.object(self.service, "_fetch_recent_db_candidates", return_value=list(candidate_pool)), \
+             mock.patch.object(self.service, "_materialize_candidate_papers_for_recommendation", return_value=(list(candidate_pool), {"total": 1, "reused_existing": 0, "db_only": 0, "batch_embedded": 0, "batch_inserted": 0, "unresolved": 0})):
+            result = self.service.recommend_papers(self.user_id, top_n=1)
+
+        first = result["recommendations"][0]
+        self.assertIn("与兴趣向量语义相似度 100%", first["personalized_reason"])
+        self.assertTrue(first["recommendation_explanation"])
+
+    def test_dismissed_papers_are_excluded_even_without_research_profile(self) -> None:
+        self._add_paper("2401.63001", title="Dismissed", abstract="retrieval", categories=["cs.CL"])
+        self._add_paper("2401.63002", title="Archived", abstract="retrieval", categories=["cs.CL"])
+        self.storage.user_preferences.record_user_paper_action(user_id=self.user_id, arxiv_id="2401.63001", action_type="not_interested")
+        self.storage.user_preferences.record_user_paper_action(user_id=self.user_id, arxiv_id="2401.63002", action_type="archived")
+
+        with mock.patch.dict(self.service.memory_runtime_config, {"enable_user_research_profile": False}):
+            bundle = self.service._build_profile_signal_bundle(self.user_id)
+
+        self.assertTrue(bundle["disabled"])
+        self.assertEqual(sorted(bundle["excluded_ids"]), ["2401.63001", "2401.63002"])
+
+    def test_user_memory_summary_string_feeds_profile_and_recent_topics(self) -> None:
+        summary = str({"profile": {"positive_topics": ["graph neural network"], "negative_topics": [], "recent_topics": ["knowledge graph"], "preferred_categories": []}})
+        signals = self.service._parse_user_memory_summary(summary)
+        self.assertEqual(signals, {"positive_topics": ["graph neural network"], "recent_topics": ["knowledge graph"]})
+        self.assertEqual(self.service._parse_user_memory_summary("用户最近关注 RAG"), {})
+
+        effective = self.service._resolve_effective_research_profile(
+            stored_profile={"positive_topics": [], "negative_topics": ["vision"]},
+            request_profile=None,
+            memory_profile={"positive_topics": ["graph neural network"], "negative_topics": ["speech"]},
+        )
+        # 记忆只填补空字段，不覆盖长期画像已有的值。
+        self.assertEqual(effective["positive_topics"], ["graph neural network"])
+        self.assertEqual(effective["negative_topics"], ["vision"])
+
+    def test_term_matching_uses_word_boundaries(self) -> None:
+        candidate = {
+            "title": "Efficient storage engines",
+            "abstract": "We study LLM agents for paragraph storage.",
+            "categories": ["cs.DB"],
+            # 显式提供 concepts，避免标题摘要兜底抽取引入额外主题词干扰断言。
+            "technical_concepts": ["agent planning"],
+        }
+        breakdown = self.service._build_query_match_score(candidate, query="rag agent cs.db")
+        self.assertNotIn("rag", breakdown["matched_terms"])
+        self.assertIn("agent", breakdown["matched_terms"])
+        self.assertIn("cs.db", breakdown["matched_terms"])
+
+        adjustment = self.service._compute_contextual_adjustment(
+            candidate,
+            context_bundle={"query_text": "", "positive_topics": ["rag"], "negative_topics": [], "recent_topics": [], "category_constraints": []},
+        )
+        self.assertEqual(adjustment["matched_request_topics"], [])
+
+    def test_cosine_similarity_clamps_negative_and_rejects_dimension_mismatch(self) -> None:
+        self.assertAlmostEqual(self.service._cosine_similarity([1.0, 0.0], [0.0, 1.0]), 0.0)
+        self.assertAlmostEqual(self.service._cosine_similarity([1.0, 0.0], [-1.0, 0.0]), 0.0)
+        self.assertAlmostEqual(self.service._cosine_similarity([1.0, 1.0], [1.0, 0.0]), 2 ** -0.5)
+        self.assertEqual(self.service._cosine_similarity([1.0, 0.0, 0.0], [1.0, 0.0]), 0.0)
+
+    def test_diverse_selection_prefers_semantically_different_candidate(self) -> None:
+        def candidate(arxiv_id, relevance, vector):
+            return {
+                "arxiv_id": arxiv_id,
+                "relevance_score": relevance,
+                "final_score": relevance,
+                "semantic_score": relevance,
+                "score_breakdown": {},
+                "_candidate_embedding": vector,
+                "_candidate_categories": ["cs.CL"],
+            }
+
+        candidates = [
+            candidate("top", 0.90, [1.0, 0.0, 0.0]),
+            candidate("near_duplicate", 0.89, [0.99, 0.01, 0.0]),
+            candidate("different", 0.88, [0.0, 1.0, 0.0]),
+            # 拉开相关性归一化区间，让前三者的归一化相关性接近，多样性才能起决定作用。
+            candidate("low", 0.0, [0.0, 0.0, 1.0]),
+        ]
+        selected = self.service._select_diverse_candidates(candidates, 2)
+
+        self.assertEqual([item["arxiv_id"] for item in selected], ["top", "different"])
+        self.assertAlmostEqual(selected[1]["diversity_score"], 1.0)
+        self.assertEqual(selected[1]["diversity_debug"]["diversity_reason"], "semantic_guidance")
+        self.assertNotIn("_candidate_embedding", selected[0])
+        # 未入选的近重复候选，与已选集合的相似度超过阈值。
+        self.assertGreater(self.service._cosine_similarity([1.0, 0.0, 0.0], [0.99, 0.01, 0.0]), self.service.RECOMMENDATION_CONFIG["semantic_similarity_penalty_threshold"])
 
 
 if __name__ == "__main__":

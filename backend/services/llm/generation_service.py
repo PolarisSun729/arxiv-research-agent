@@ -49,7 +49,14 @@ QWEN_RESPONSES_IMAGE_COMPRESSION_STEPS = (
     (1600, 85),
     (1280, 75),
     (1024, 65),
+    # 图片数量放开后单图预算会变小，补两档更小的尺寸，避免多图时整批因请求体超限被丢弃。
+    (800, 60),
+    (640, 55),
 )
+# base64 编码会把图片体积放大 4/3；自适应单图目标按剩余请求体预算反推原始字节。
+_BASE64_EXPANSION = 4 / 3
+# 每张图的 label 文本与 JSON 包装开销的保守估计。
+_QWEN_IMAGE_PART_OVERHEAD_BYTES = 1024
 
 class GenerationService:
     """
@@ -385,7 +392,10 @@ class GenerationService:
         model_name: Optional[str] = None,
         task_type: Optional[str] = None,
         enable_thinking: bool = QWEN_RERANK_COMPRESS_ENABLE_THINKING,
+        image_inputs: Optional[List[Dict[str, Any]]] = None,
+        request_debug: Optional[Dict[str, Any]] = None,
     ) -> str:
+        """单轮补全；传入 image_inputs 时把图片作为多模态输入附在 prompt 之后，prompt 原样保留不加问答模板。"""
         try:
             if not api_key:
                 api_key = QWEN_API_KEY
@@ -403,10 +413,21 @@ class GenerationService:
                 api_key=api_key,
                 base_url=QWEN_BASE_URL,
             )
+            qwen_input: Any = prompt
+            if image_inputs:
+                content = [{"type": "input_text", "text": prompt}]
+                image_parts, image_debug = self._prepare_qwen_image_content_parts(
+                    image_inputs=image_inputs,
+                    base_content=content,
+                )
+                qwen_input = [{"role": "user", "content": content + image_parts}]
+                image_debug["estimated_request_bytes"] = self._estimate_qwen_input_bytes(qwen_input)
+                if request_debug is not None:
+                    request_debug.update(image_debug)
             record_llm_call(model=model_name, task_type=task_type or "completion")
             response = client.responses.create(
                 model=model_name,
-                input=prompt,
+                input=qwen_input,
                 extra_body={"enable_thinking": enable_thinking},
             )
             record_llm_usage(getattr(response, "usage", None))
@@ -1059,7 +1080,7 @@ class GenerationService:
         }
         selected_parts: List[Dict[str, Any]] = []
 
-        for image in image_inputs:
+        for position, image in enumerate(image_inputs):
             item_debug = self._new_qwen_image_debug_item(image)
             if debug["sent_image_count"] >= QWEN_RESPONSES_MAX_IMAGE_COUNT:
                 self._mark_qwen_image_skipped(item_debug, "max_image_count_exceeded")
@@ -1073,9 +1094,18 @@ class GenerationService:
                 continue
 
             try:
+                target_bytes = self._adaptive_qwen_image_target_bytes(
+                    base_content=base_content,
+                    selected_parts=selected_parts,
+                    pending_image_count=min(
+                        len(image_inputs) - position,
+                        QWEN_RESPONSES_MAX_IMAGE_COUNT - debug["sent_image_count"],
+                    ),
+                )
+                item_debug["target_bytes"] = target_bytes
                 prepared = self._prepare_qwen_image_data_url(
                     image_path,
-                    target_bytes=QWEN_RESPONSES_IMAGE_TARGET_BYTES,
+                    target_bytes=target_bytes,
                 )
                 item_debug.update(prepared.get("debug", {}))
                 data_url = str(prepared.get("data_url") or "")
@@ -1124,6 +1154,22 @@ class GenerationService:
         if debug["dropped_image_count"]:
             debug["fallback_to_asset_summary"] = True
         return selected_parts, debug
+
+    def _adaptive_qwen_image_target_bytes(
+        self,
+        *,
+        base_content: List[Dict[str, Any]],
+        selected_parts: List[Dict[str, Any]],
+        pending_image_count: int,
+    ) -> int:
+        """单图目标字节：把剩余请求体预算平分给还要发的图，且不超过单图上限。
+
+        固定单图目标在多图时会让前几张占满请求体、后面的全部被丢弃；平分后每张图都压到能装下的尺寸。
+        """
+        used_bytes = self._estimate_qwen_input_bytes([{"role": "user", "content": base_content + selected_parts}])
+        remaining_bytes = QWEN_RESPONSES_REQUEST_BODY_SOFT_LIMIT_BYTES - used_bytes
+        per_image = remaining_bytes / max(1, pending_image_count) - _QWEN_IMAGE_PART_OVERHEAD_BYTES
+        return max(1, min(QWEN_RESPONSES_IMAGE_TARGET_BYTES, int(per_image / _BASE64_EXPANSION)))
 
     @staticmethod
     def _build_qwen_image_label_text(image: Dict[str, Any]) -> str:

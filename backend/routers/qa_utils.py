@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from services.retrieval.retrieval_index import iter_retrieval_indexes_for_embedding, load_retrieval_index_artifact
 from services.retrieval.trace_builder import RetrievalTraceBuilder
 from utils.config import VectorDBProvider
 
@@ -42,6 +43,22 @@ def get_latest_retrieval_trace(
         reverse=True,
     )
     return trace_files[0] if trace_files else None
+
+
+def _expected_vector_count(qa_index: Dict[str, Any]) -> Optional[int]:
+    """按建库时的同一筛选规则，从 retrieval index 文件算出应写入 Milvus 的条数；读不到时返回 None。
+
+    Milvus 里存的是 RetrievalIndex 向量而不是原始 chunk：一个 chunk 会派生 body/summary/question 等多条，
+    section_anchor 这类只走关键词路线的索引又不入向量库，所以既不能拿 chunk_count，也不能拿 retrieval_index_count 去比。
+    """
+    try:
+        artifact = load_retrieval_index_artifact(qa_index.get("retrieval_index_file"))
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    raw_indexes = artifact.get("retrieval_indexes") or artifact.get("indexes") or []
+    if not isinstance(raw_indexes, list):
+        return None
+    return len(iter_retrieval_indexes_for_embedding(raw_indexes))
 
 
 def build_qa_diagnostic(
@@ -78,7 +95,7 @@ def build_qa_diagnostic(
         diagnostic["checks"] = {
             "has_qa_index": False,
             "collection_exists": False,
-            "entity_count_matches_metadata": False,
+            "entity_count_matches_metadata": None,
         }
         return diagnostic
 
@@ -107,6 +124,7 @@ def build_qa_diagnostic(
 
     num_entities = int(collection_info.get("num_entities") or 0)
     chunk_count = int(qa_index.get("chunk_count") or 0)
+    expected_vector_count = _expected_vector_count(qa_index)
 
     diagnostic["collection"] = {
         "name": collection_name,
@@ -120,9 +138,10 @@ def build_qa_diagnostic(
         "indexed_status": qa_index.get("status") == "indexed",
         "collection_exists": collection_exists,
         "qa_chunk_count": chunk_count,
+        "expected_vector_count": expected_vector_count,
         "milvus_num_entities": num_entities,
-        # 最关键的核对项之一：数据库记录的 chunk 数是否与 Milvus 实体数一致。
-        "entity_count_matches_metadata": chunk_count == num_entities,
+        # 最关键的核对项之一：应入向量库的索引条数是否与 Milvus 实体数一致；索引文件读不到时为 None（无法判断）。
+        "entity_count_matches_metadata": None if expected_vector_count is None else expected_vector_count == num_entities,
         "milvus_has_entities": num_entities > 0,
         "sample_chunks_returned": len(sample_chunks),
         # 经验判断：有集合且至少有实体时，关键词/向量召回通常才具备正常工作基础。

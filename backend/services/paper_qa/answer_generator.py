@@ -1,3 +1,14 @@
+"""论文 QA 最终答案生成器。
+
+职责：把 ContextPackBuilder 打包好的证据交给生成服务（Qwen）作答，并保证输出满足引用协议
+（每个引用单独写成 [source:{source_id}]）。引用不合法时最多做一次「引用修复」重新生成，
+仍失败则只删除非法引用标记、保留正文，避免整段答案丢失。
+
+当前生产调用方是 paper_evidence_research 的 ResearchDraftGenerator，它只消费返回值中的
+answer / cited_source_ids / citation_debug；claims、insufficient_evidence 等字段是旧 QA 链路
+遗留的轻量信号，主张抽取与校验已由研究图（extract_claims / verify 节点）独立完成。
+"""
+
 from __future__ import annotations
 
 import re
@@ -35,6 +46,20 @@ class AnswerGenerator:
         recent_turns: List[Dict[str, Any]] | None = None,
         user_memory_summary: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
+        """生成最终答案并完成引用校验/修复。
+
+        Args:
+            generation_question: 实际用于生成的问题（可能已被会话消歧改写）。
+            context_pack: ContextPackBuilder.build() 的产物，包含证据块、图片输入和 source_payload。
+            preferred_answer_style: 用户偏好的回答风格，交给 prompt 组装层处理。
+            style_already_applied: 仅用于 debug 标记，表示风格提示是否已拼进问题。
+            original_question: 用户原始问题；为空时回退到 generation_question。
+            session_summary / recent_turns / user_memory_summary: 会话与用户记忆，只影响 prompt 上下文，不作为证据。
+
+        Returns:
+            包含 answer、cited_source_ids、citation_debug、citation_warning 以及 generation_debug 等字段的字典。
+        """
+        # 1. 组装 prompt 上下文（含预算裁剪），并得到真正送入模型的证据列表。
         prompt_assembly = self.prompt_context_builder.build_paper_qa_final_answer_context(
             question=original_question or generation_question,
             contextualized_question=generation_question,
@@ -48,6 +73,7 @@ class AnswerGenerator:
             prompt_assembly,
             context_pack,
         )
+        # 只把图片类资产元数据传给生成层，表格证据已经以文本形式进入证据块。
         figure_metadata = [
             item for item in (context_pack.get("asset_metadata") or [])
             if str(item.get("chunk_type", "") or "").lower() == "figure"
@@ -68,6 +94,7 @@ class AnswerGenerator:
             asset_metadata=figure_metadata,
         )
         answer = self.extract_answer(generation_result)
+        # 本轮可引用的 source_id 白名单，来自 context_pack 的 source_payload。
         source_ids = [
             str(source.get("source_id", "") or "").strip()
             for source in (context_pack.get("source_payload") or [])
@@ -75,6 +102,7 @@ class AnswerGenerator:
         ]
         citation_debug = self.validate_citations(answer, source_ids)
         citation_warning = None
+        task_type = "paper_qa_final_answer"
         if citation_debug["invalid_citations"]:
             # 引用格式是前端定位证据的协议；只允许一次修复，避免坏模型输出触发无限重试。
             repair_query = (
@@ -95,21 +123,18 @@ class AnswerGenerator:
                 )
                 repaired_answer = self.extract_answer(repaired_generation_result)
                 repaired_debug = self.validate_citations(repaired_answer, source_ids)
+                repair_succeeded = not repaired_debug["invalid_citations"]
+                # 无论修复成功与否都采用修复后的答案：修复轮已经按更严格的引用要求重答，
+                # 即使仍有少量非法引用，删除后的正文通常也比首轮更干净。
+                answer = repaired_answer if repair_succeeded else self.strip_invalid_citations(repaired_answer, source_ids)
+                generation_result = repaired_generation_result
+                task_type = "paper_qa_final_answer_citation_repair"
+                citation_debug = repaired_debug
                 citation_debug["repair_attempted"] = True
-                citation_debug["repair_succeeded"] = not bool(repaired_debug["invalid_citations"])
-                if citation_debug["repair_succeeded"]:
-                    answer = repaired_answer
-                    generation_result = repaired_generation_result
-                    citation_debug = repaired_debug
-                    citation_debug["repair_attempted"] = True
-                    citation_debug["repair_succeeded"] = True
-                else:
+                citation_debug["repair_succeeded"] = repair_succeeded
+                if not repair_succeeded:
                     # 二次失败时只移除无法定位的标记，保留正文和证据面板，避免整段答案消失。
-                    answer = self.strip_invalid_citations(repaired_answer, source_ids)
                     citation_warning = "部分引用未通过校验"
-                    citation_debug = repaired_debug
-                    citation_debug["repair_attempted"] = True
-                    citation_debug["repair_succeeded"] = False
             except Exception as exc:
                 # 修复调用本身失败时保留首轮答案，避免引用协议问题放大成整次 QA 失败。
                 logger.warning("Citation repair generation failed; keep sanitized first answer: %s", exc)
@@ -131,7 +156,8 @@ class AnswerGenerator:
             "raw_generation_result": generation_result,
             "generation_debug": {
                 "provider": "qwen",
-                "task_type": "paper_qa_final_answer",
+                # 发生引用修复时，最终答案来自修复调用，debug 中的 task_type/model 要与之对应。
+                "task_type": task_type,
                 "preferred_answer_style": preferred_answer_style,
                 "styled_question_applied": bool(style_already_applied),
                 "search_result_count": len(generation_search_results),
@@ -152,6 +178,7 @@ class AnswerGenerator:
 
     @staticmethod
     def extract_answer(generation_result: Any) -> str:
+        """从生成服务的返回值中取出答案文本，兼容 dict（多种键名）和纯字符串两种返回形态。"""
         if isinstance(generation_result, dict):
             for key in ("response", "answer", "text", "result"):
                 if key in generation_result and generation_result.get(key) is not None:
@@ -162,6 +189,7 @@ class AnswerGenerator:
 
     @staticmethod
     def extract_cited_source_ids(answer: str, source_ids: List[str]) -> List[str]:
+        """提取答案中合法且属于白名单的 source_id（按首次出现顺序去重）。"""
         return extract_cited_source_ids_contract(answer, source_ids)
 
     @staticmethod
@@ -176,8 +204,14 @@ class AnswerGenerator:
 
     @staticmethod
     def extract_claims(answer: str) -> List[Dict[str, Any]]:
+        """按句切分答案，粗筛出像「具体断言」的句子（最多 12 条），供 debug 与轻量校验使用。
+
+        切分规则：中文句末标点（。！？）后直接断句，中文排版通常不带空格；
+        英文句末标点（.!?）后必须跟空白才断句，避免把 "3.5"、"e.g." 之类拆开。
+        """
         claims: List[Dict[str, Any]] = []
-        for index, sentence in enumerate(re.split(r"(?<=[。！？.!?])\s+", answer or ""), start=1):
+        sentences = re.split(r"(?<=[。！？])\s*|(?<=[.!?])\s+", answer or "")
+        for index, sentence in enumerate(sentences, start=1):
             text = sentence.strip()
             if not text:
                 continue
@@ -197,6 +231,7 @@ class AnswerGenerator:
 
     @staticmethod
     def detect_insufficient_evidence(answer: str) -> bool:
+        """通过关键短语判断模型是否在答案中声明了「证据不足」。"""
         lowered = (answer or "").lower()
         return any(
             phrase in lowered

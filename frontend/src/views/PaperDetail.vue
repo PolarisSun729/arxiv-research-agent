@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { PaperNoteType } from '@/types/paper'
@@ -13,6 +13,8 @@ import {
 } from '@element-plus/icons-vue'
 import RagChatPanel from '@/components/rag-chat/RagChatPanel.vue'
 import RagEvidencePanel from '@/components/rag-chat/RagEvidencePanel.vue'
+import RagRemovedClaims from '@/components/rag-chat/RagRemovedClaims.vue'
+import { buildRemovedClaimsView } from '@/utils/researchProcess'
 import { usePaperRagChat } from '@/composables/usePaperRagChat'
 import { useUserContext } from '@/composables/useUserContext'
 import { usePaperStore } from '@/stores/paperStore'
@@ -48,6 +50,8 @@ const qaDiagnostic = ref<QaDiagnosticResult | null>(null)
 const traceDownloading = ref(false)
 const isNarrowScreen = ref(false)
 const highlightedEvidenceSourceId = ref<string | null>(null)
+const sideEvidenceCard = ref<HTMLElement | null>(null)
+const sideEvidenceFlash = ref(false)
 
 const modelBadge = 'Qwen 3.6 Plus'
 
@@ -87,6 +91,14 @@ const hasQaIndex = computed(() => Boolean(qaStatus.value?.has_index))
 const hasActiveQaJob = computed(() => ['pending', 'running'].includes(String(qaIndexJob.value?.status || '')))
 const chatTurns = computed(() => qaResults.value)
 const ragChatMessages = computed(() => chatTurns.value.flatMap(qaTurnToRagMessages))
+// Milvus 存的是 RetrievalIndex 向量（非原始 chunk），核对基准是后端按入库规则算出的预期向量数。
+const vectorCountCheck = computed(() => {
+  const checks = qaDiagnostic.value?.checks
+  if (checks?.entity_count_matches_metadata == null) return { ok: false, text: '无法核对' }
+  if (checks.entity_count_matches_metadata) return { ok: true, text: '与预期一致' }
+  const diff = (checks.expected_vector_count ?? 0) - (checks.milvus_num_entities ?? 0)
+  return { ok: false, text: diff > 0 ? `缺 ${diff} 条` : `多 ${-diff} 条` }
+})
 const loadingMethodLabel = computed(() => (loadingMethod.value === 'docling' ? 'Docling' : 'PyMuPDF'))
 const loadingMethodHint = computed(() => (loadingMethod.value === 'docling' ? '更适合论文结构' : '保留传统解析'))
 const qaJobStatusText = computed(() => {
@@ -224,20 +236,44 @@ function syncViewport() {
   }
 }
 
+// 宽屏下证据面板在右栏顶部，用户在回答底部点按钮时它多半在视口外：切换后把面板滚进视野并闪一下，否则看起来"点了没反应"。
+function revealSideEvidence(resetScroll: boolean) {
+  if (isNarrowScreen.value) return
+  sideEvidenceFlash.value = false
+  nextTick(() => {
+    const card = sideEvidenceCard.value
+    if (!card) return
+    if (resetScroll) {
+      card.scrollTop = 0
+      card.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    }
+    requestAnimationFrame(() => {
+      sideEvidenceFlash.value = true
+    })
+  })
+}
+
 function handlePanelOpenEvidence(turnId: string) {
   const turn = chatTurns.value.find(item => item.id === turnId)
   if (!turn) return
   activeEvidenceTurn.value = turn
   highlightedEvidenceSourceId.value = null
   evidenceDrawerOpen.value = isNarrowScreen.value
+  revealSideEvidence(true)
 }
 
 function handleCitationSelect(item: any, sourceId: string) {
   const turn = item?.response && typeof item.response === 'object' ? item.response : null
   if (!turn) return
   activeEvidenceTurn.value = turn
-  highlightedEvidenceSourceId.value = sourceId
+  // 先清空再设置：重复点同一个角标时高亮值不变，来源列表的 watch 不会再次滚动定位。
+  highlightedEvidenceSourceId.value = null
+  nextTick(() => {
+    highlightedEvidenceSourceId.value = sourceId
+  })
   evidenceDrawerOpen.value = isNarrowScreen.value
+  // 滚动由来源列表把被点的来源居中完成，这里只负责闪一下提示。
+  revealSideEvidence(false)
 }
 
 async function handleTogglePaperAction(actionType: 'read' | 'not_interested' | 'note_saved') {
@@ -434,6 +470,14 @@ function getTurnStatusHint(item: { response?: any }) {
     return '答案已生成，但未保存到历史记录。'
   }
   if (turn.status === 'failed') return turn.error || '问答失败，请稍后重试。'
+  // 研究引擎的部分回答：执行成功，但有主张没找到论文证据支持，已从正文中删去。
+  if (turn.retrievalDebug?.qa_observation?.outcome === 'partial') {
+    // 旧记录没有 removed_claims，不能指引用户去看不存在的列表。
+    const removed = buildRemovedClaimsView(turn.retrievalDebug)
+    return removed.items.length || removed.omittedCount
+      ? '部分内容未找到论文证据支持，已从回答中移除，可在下方查看被移除的句子与原因。'
+      : '部分内容未找到论文证据支持，已从回答中移除。'
+  }
   return ''
 }
 
@@ -702,6 +746,7 @@ watch(activeNoteTypeFilter, async () => {
                     重新生成
                   </el-button>
                 </div>
+                <RagRemovedClaims v-if="item.role === 'assistant'" :debug="item.retrievalDebug" />
                 <div
                   v-if="item.role === 'assistant' && ((item.sources?.length || 0) > 0 || item.retrievalDebug)"
                   class="assistant-actions"
@@ -746,7 +791,13 @@ watch(activeNoteTypeFilter, async () => {
           </div>
 
           <aside class="qa-side">
-            <div class="side-card qa-side-evidence" v-if="!isNarrowScreen">
+            <div
+              v-if="!isNarrowScreen"
+              ref="sideEvidenceCard"
+              class="side-card qa-side-evidence"
+              :class="{ 'qa-side-evidence--flash': sideEvidenceFlash }"
+              @animationend="sideEvidenceFlash = false"
+            >
               <RagEvidencePanel
                 :question="activeEvidenceTurn?.question"
                 :sources="activeEvidenceTurn?.sources || []"
@@ -807,10 +858,8 @@ watch(activeNoteTypeFilter, async () => {
                     <strong>{{ qaDiagnostic.collection?.info?.num_entities ?? 0 }}</strong>
                   </div>
                   <div class="side-row">
-                    <span>一致性</span>
-                    <strong :class="qaDiagnostic.checks.entity_count_matches_metadata ? 'ok-text' : 'warn-text'">
-                      {{ qaDiagnostic.checks.entity_count_matches_metadata ? '一致' : '不一致' }}
-                    </strong>
+                    <span>向量数核对</span>
+                    <strong :class="vectorCountCheck.ok ? 'ok-text' : 'warn-text'">{{ vectorCountCheck.text }}</strong>
                   </div>
                   <div class="side-row">
                     <span>关键词检索</span>
@@ -826,6 +875,10 @@ watch(activeNoteTypeFilter, async () => {
                     <div class="diagnostic-line">
                       <span>DB chunk_count</span>
                       <strong>{{ qaDiagnostic.checks.qa_chunk_count ?? 0 }}</strong>
+                    </div>
+                    <div class="diagnostic-line">
+                      <span>预期向量数</span>
+                      <strong>{{ qaDiagnostic.checks.expected_vector_count ?? '-' }}</strong>
                     </div>
                     <div class="diagnostic-line">
                       <span>Milvus num_entities</span>
@@ -937,7 +990,8 @@ watch(activeNoteTypeFilter, async () => {
 .paper-detail-shell {
   position: relative;
   min-height: 100vh;
-  overflow: hidden;
+  /* clip 而不是 hidden：hidden 的容器仍可被 scrollIntoView 横向滚动，定位证据面板时整页会左移。 */
+  overflow: clip;
   background:
     radial-gradient(circle at top left, rgba(118, 170, 255, 0.18), transparent 32%),
     radial-gradient(circle at top right, rgba(255, 181, 128, 0.18), transparent 30%),
@@ -1553,6 +1607,8 @@ watch(activeNoteTypeFilter, async () => {
   height: 100%;
   padding: 20px;
   overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
   background:
     radial-gradient(circle at top right, rgba(96, 165, 250, 0.08), transparent 30%),
     linear-gradient(180deg, #ffffff, #f8fbff);
@@ -2121,6 +2177,31 @@ watch(activeNoteTypeFilter, async () => {
 .side-card {
   border-radius: 24px;
   padding: 18px;
+}
+
+/* 证据面板展开后可达上万像素，不限高时标题和切换后的内容都在视口外；限高后在卡片内滚动。 */
+.qa-side-evidence {
+  --evidence-inset: 18px;
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+  overscroll-behavior: contain;
+  scroll-margin-top: 16px;
+}
+
+.qa-side-evidence--flash {
+  animation: side-evidence-flash 1.2s ease;
+}
+
+@keyframes side-evidence-flash {
+  0%,
+  100% {
+    box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
+  }
+  25% {
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.35), 0 18px 40px rgba(15, 23, 42, 0.08);
+  }
 }
 
 .diagnostic-block {

@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, useSlots, watch } from 'vue'
 import { BubbleList, Prompts, Thinking, Welcome, XSender } from 'vue-element-plus-x'
 import type { PromptsItemsProps } from 'vue-element-plus-x/types/Prompts'
 import type { RetrievalDebug } from '@/api/papers'
 import type { AgentChatMessage } from '@/types/agentChat'
 import type { QaTurnForRagChat, RagChatSource } from '@/types/ragChat'
-import { renderMarkdownWithLatex } from '@/utils/markdown'
+import AuthenticatedImage from '@/components/AuthenticatedImage.vue'
+import { getFigureCaption, EVIDENCE_LINK_PREFIX } from '@/utils/evidence'
+import { renderAnswerSegments } from '@/utils/markdown'
 
 type RagChatPanelMessage = AgentChatMessage & {
   placement: 'start' | 'end'
@@ -14,6 +16,7 @@ type RagChatPanelMessage = AgentChatMessage & {
   maxWidth?: string
   turnId?: string
   sources?: RagChatSource[]
+  citedSourceIds?: string[]
   retrievalDebug?: RetrievalDebug | null
   response?: QaTurnForRagChat | unknown | null
 }
@@ -52,7 +55,12 @@ const emit = defineEmits<{
 
 defineSlots<{
   'message-footer'?(props: { item: RagChatPanelMessage }): any
+  'message-progress'?(props: { item: RagChatPanelMessage }): any
 }>()
+
+// 父组件提供了进度插槽时，由它展示实时执行过程，面板不再叠加通用的“正在生成”占位。
+const slots = useSlots()
+const hasProgressSlot = computed(() => Boolean(slots['message-progress']))
 
 const senderRef = ref<SenderExpose | null>(null)
 
@@ -81,6 +89,24 @@ const bubbleMessages = computed<RagChatPanelMessage[]>(() =>
 )
 
 const hasMessages = computed(() => bubbleMessages.value.length > 0)
+
+// 矮屏下回答区按 100vh 扣掉固定区域后只剩一两行：已有对话时把快捷问题收成一行按钮，
+// 回答区再保底一个可读高度（页面整体滚动即可看到输入框）。
+const COMPACT_VIEWPORT_HEIGHT = 760
+const viewportHeight = ref(typeof window === 'undefined' ? 900 : window.innerHeight)
+const promptsExpanded = ref(false)
+const compactPrompts = computed(() => hasMessages.value && viewportHeight.value < COMPACT_VIEWPORT_HEIGHT)
+const bubbleListMaxHeight = computed(() => {
+  if (!hasMessages.value) return '420px'
+  return compactPrompts.value && !promptsExpanded.value ? 'max(calc(100vh - 300px), 300px)' : 'max(calc(100vh - 360px), 300px)'
+})
+
+function syncViewportHeight() {
+  viewportHeight.value = window.innerHeight
+}
+
+onMounted(() => window.addEventListener('resize', syncViewportHeight))
+onBeforeUnmount(() => window.removeEventListener('resize', syncViewportHeight))
 
 watch(
   () => props.senderText,
@@ -127,6 +153,7 @@ function handlePromptSelect(item: PromptsItemsProps) {
   senderRef.value?.setText(prompt)
   emit('update:senderText', prompt)
   emit('select-prompt', prompt)
+  promptsExpanded.value = false
 }
 
 function getAssistantStatusLabel(item: RagChatPanelMessage) {
@@ -156,8 +183,7 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
   const target = event.target instanceof Element ? event.target.closest('a[href^="#evidence-source-"]') : null
   if (!(target instanceof HTMLAnchorElement)) return
   event.preventDefault()
-  const prefix = '#evidence-source-'
-  const sourceId = decodeURIComponent(target.getAttribute('href')?.slice(prefix.length) || '')
+  const sourceId = decodeURIComponent(target.getAttribute('href')?.slice(EVIDENCE_LINK_PREFIX.length) || '')
   if (sourceId) emit('select-source', item, sourceId)
 }
 </script>
@@ -173,10 +199,21 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
         :description="description || '使用自然语言输入你的搜索需求，系统会在对话中返回结果。'"
       />
 
+      <button
+        v-if="promptItems.length && compactPrompts"
+        type="button"
+        class="rag-chat-panel__prompts-toggle"
+        :aria-expanded="promptsExpanded"
+        @click="promptsExpanded = !promptsExpanded"
+      >
+        {{ promptTitle || '快捷提示' }}
+        <span class="rag-chat-panel__prompts-chevron" :class="{ 'rag-chat-panel__prompts-chevron--open': promptsExpanded }" />
+      </button>
+
       <Prompts
-        v-if="promptItems.length"
+        v-if="promptItems.length && (!compactPrompts || promptsExpanded)"
         class="rag-chat-panel__prompts"
-        :title="promptTitle || '快捷提示'"
+        :title="compactPrompts ? undefined : promptTitle || '快捷提示'"
         :items="promptItems"
         :wrap="true"
         @itemClick="handlePromptSelect"
@@ -189,7 +226,7 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
         :always-show-scrollbar="true"
         :show-back-button="true"
         :item-key="'id'"
-        :max-height="hasMessages ? 'calc(100vh - 360px)' : '420px'"
+        :max-height="bubbleListMaxHeight"
       >
         <template #header="{ item }">
           <div class="rag-chat-panel__message-label">
@@ -197,21 +234,52 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
           </div>
         </template>
 
+        <!-- Bubble 在 loading 时会用 loading 插槽整体替换 content；有进度插槽时由它展示实时执行过程。 -->
+        <template v-if="hasProgressSlot" #loading="{ item }">
+          <div class="rag-chat-panel__progress-loading">
+            <slot name="message-progress" :item="item" />
+          </div>
+        </template>
+
         <template #content="{ item }">
-          <Thinking
-            v-if="item.role === 'assistant' && item.loading && !item.content"
-            class="rag-chat-panel__thinking"
-            :model-value="true"
-            status="thinking"
-            content="正在生成回复"
-            :auto-collapse="false"
-          />
+          <slot v-if="item.role === 'assistant' && hasProgressSlot" name="message-progress" :item="item" />
+          <template v-if="item.role === 'assistant' && item.loading && !item.content">
+            <Thinking
+              v-if="!hasProgressSlot"
+              class="rag-chat-panel__thinking"
+              :model-value="true"
+              status="thinking"
+              content="正在生成回复"
+              :auto-collapse="false"
+            />
+          </template>
           <div
             v-else-if="item.role === 'assistant'"
             class="assistant-markdown"
-            v-html="renderMarkdownWithLatex(item.content)"
             @click="handleAssistantContentClick($event, item)"
-          />
+          >
+            <template
+              v-for="(segment, index) in renderAnswerSegments(item.content, undefined, { sources: item.sources, citedSourceIds: item.citedSourceIds })"
+              :key="index"
+            >
+              <div class="assistant-markdown__segment" v-html="segment.html" />
+              <!-- 图卡跟在第一次引用这张图的段落后面；图注里的角标与正文共用同一套证据定位事件。 -->
+              <figure v-for="figure in segment.figures" :key="figure.source.source_id" class="answer-figure">
+                <AuthenticatedImage class="answer-figure__image" :src="figure.source.asset_url || ''" fit="contain">
+                  <template #error><div class="answer-figure__missing">图片暂不可用，可点击角标查看文字证据。</div></template>
+                </AuthenticatedImage>
+                <figcaption class="answer-figure__caption">
+                  <a
+                    :href="`${EVIDENCE_LINK_PREFIX}${encodeURIComponent(figure.source.source_id)}`"
+                    class="answer-figure__ref"
+                    title="查看这条证据"
+                  >[{{ figure.label }}]</a>
+                  <span v-if="figure.source.page_number" class="answer-figure__page">第 {{ figure.source.page_number }} 页</span>
+                  <span class="answer-figure__text">{{ getFigureCaption(figure.source) }}</span>
+                </figcaption>
+              </figure>
+            </template>
+          </div>
           <div v-else class="rag-chat-panel__user-content">
             {{ item.content }}
           </div>
@@ -219,13 +287,13 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 
         <template #footer="{ item }">
           <div class="rag-chat-panel__message-footer">
-            <div v-if="item.role === 'assistant' && item.loading" class="streaming-indicator">
+            <div v-if="item.role === 'assistant' && item.loading && !hasProgressSlot" class="streaming-indicator">
               <span class="rag-chat-panel__stream-dot" />
               <span>正在生成中...</span>
             </div>
 
             <el-tag
-              v-if="item.role === 'assistant' && getAssistantStatusLabel(item)"
+              v-if="item.role === 'assistant' && getAssistantStatusLabel(item) && !(item.loading && hasProgressSlot)"
               class="answer-state-tag"
               size="small"
               effect="plain"
@@ -304,6 +372,39 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
   flex: none;
 }
 
+.rag-chat-panel__prompts-toggle {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 8px;
+  padding: 4px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.9);
+  color: #64748b;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.rag-chat-panel__prompts-toggle:hover {
+  color: #2563eb;
+  border-color: rgba(37, 99, 235, 0.3);
+}
+
+.rag-chat-panel__prompts-chevron {
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: translateY(-2px) rotate(45deg);
+  transition: transform 0.2s;
+}
+
+.rag-chat-panel__prompts-chevron--open {
+  transform: translateY(1px) rotate(-135deg);
+}
+
 .rag-chat-panel__bubble-list {
   flex: 1 1 auto;
   min-height: 0;
@@ -361,6 +462,72 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 
 .assistant-markdown :deep(p) {
   margin: 0 0 14px;
+}
+
+/* 有图片证据时正文按段切开；段内末尾元素的外边距由段间距接管，避免切段后行距变化。 */
+.assistant-markdown__segment + .assistant-markdown__segment,
+.answer-figure + .assistant-markdown__segment {
+  margin-top: 14px;
+}
+
+.assistant-markdown__segment > :deep(:last-child) {
+  margin-bottom: 0;
+}
+
+.answer-figure {
+  margin: 14px 0 0;
+  padding: 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  background: #f8fafc;
+}
+
+.answer-figure__image {
+  display: block;
+  width: 100%;
+  border-radius: 10px;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.answer-figure__image :deep(img) {
+  display: block;
+  width: 100%;
+  max-height: 360px;
+  object-fit: contain;
+  cursor: zoom-in;
+}
+
+.answer-figure__missing {
+  padding: 18px 12px;
+  color: #94a3b8;
+  font-size: 12px;
+  text-align: center;
+}
+
+.answer-figure__caption {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 8px;
+  color: #475569;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.assistant-markdown .answer-figure__ref {
+  flex: none;
+  vertical-align: baseline;
+}
+
+.answer-figure__page {
+  flex: none;
+  color: #94a3b8;
+}
+
+.answer-figure__text {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .assistant-markdown :deep(p:last-child) {
@@ -503,6 +670,30 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
   border-bottom-color: rgba(37, 99, 235, 0.65);
 }
 
+/* 引用角标：编号小圆角块，连续引用之间留间距，不再挤成一串链接文字。 */
+.assistant-markdown :deep(a[href^="#evidence-source-"]) {
+  display: inline-block;
+  min-width: 1.6em;
+  margin: 0 1px 0 2px;
+  padding: 0 4px;
+  border: none;
+  border-radius: 6px;
+  background: rgba(37, 99, 235, 0.1);
+  color: #2563eb;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.6;
+  text-align: center;
+  vertical-align: super;
+  cursor: pointer;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.assistant-markdown :deep(a[href^="#evidence-source-"]:hover) {
+  background: #2563eb;
+  color: #fff;
+}
+
 .assistant-markdown :deep(strong) {
   color: #0f172a;
   font-weight: 800;
@@ -591,5 +782,18 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
   .rag-chat-panel__message-footer {
     gap: 10px;
   }
+}
+
+/* Bubble 的 loading 容器默认 fit-content 且居中排列三个点；放进度时间线时要撑满气泡宽度。 */
+:deep(.elx-bubble__content--loading:has(.rag-chat-panel__progress-loading)) {
+  width: 100%;
+}
+
+:deep(.elx-bubble__loading-wrap:has(.rag-chat-panel__progress-loading)) {
+  display: block;
+}
+
+.rag-chat-panel__progress-loading {
+  width: 100%;
 }
 </style>

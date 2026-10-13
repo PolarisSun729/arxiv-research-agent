@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pymilvus.exceptions import MilvusException
 
 from auth.api_key_middleware import ApiKeyMiddleware, ApiKeySettings, verify_api_key
 from auth.jwt_handler import JwtAuthenticator
@@ -33,6 +34,7 @@ from routers.qa_router import router as qa_router
 from routers.user_router import router as user_router
 from utils.config import get_debug_routes_runtime_config
 from utils.logging_utils import configure_backend_logging, info_event
+from utils.startup_report import log_startup_report
 from middleware.audit_log import AuditLogMiddleware, AuditSink
 from middleware.common import SECURITY_HEADERS, get_allowed_origins
 from middleware.ip_filter import IPFilterMiddleware, IPFilterSettings
@@ -53,11 +55,13 @@ def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None
     mode = auth_mode()
     security_settings = ApiKeySettings.from_environment() if mode == "api_key" else ApiKeySettings((), get_allowed_origins())
     authenticator = None
+    jwt_settings = None
     if mode == "jwt":
         jwt_settings = JwtSettings.from_environment()
         authenticator = JwtAuthenticator(jwt_settings, AuthStore(jwt_settings.database_path))
     ip_settings = IPFilterSettings.from_environment()
-    rate_controller = RateLimitController(RateLimitSettings.from_environment())
+    rate_limit_settings = RateLimitSettings.from_environment()
+    rate_controller = RateLimitController(rate_limit_settings)
     audit_sink = AuditSink()
     resolved_load_mode = normalize_service_load_mode(load_mode)
     debug_route_config = get_debug_routes_runtime_config()
@@ -72,6 +76,18 @@ def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None
         # 使用 lifespan 替代 on_event，避免 FastAPI 的弃用警告。
         # 同时保持预加载行为不变。
         info_event(logger, "backend.startup", load_mode=resolved_load_mode)
+        # 放在 lifespan 而非 create_app：`python main.py` 会构造两次 app，只有真正启动的那份才打印。
+        log_startup_report(
+            logger,
+            load_mode=resolved_load_mode,
+            auth_mode=mode,
+            debug_routes_enabled=resolved_enable_debug_routes,
+            jwt_settings=jwt_settings,
+            api_key_count=len(security_settings.key_hashes),
+            allowed_origins=security_settings.allowed_origins,
+            ip_settings=ip_settings,
+            rate_limit_settings=rate_limit_settings,
+        )
         try:
             # 上下文生命周期清理只处理 checkpoint/debug/trace 边界，不触碰原始聊天历史和 session summary。
             from services.context_lifecycle import ContextLifecycleService
@@ -139,6 +155,11 @@ def create_app(load_mode: str | None = None, *, enable_debug_routes: bool | None
             exc.detail,
         )
         return exc.to_response()
+
+    @app.exception_handler(MilvusException)
+    async def vector_store_error_handler(request: Request, exc: MilvusException) -> JSONResponse:
+        # 业务层漏掉的向量库异常统一归为可重试的 503，避免 Milvus 宕机被报成 unknown_error。
+        return await app_error_handler(request, AppError(ErrorCode.VECTOR_STORE_ERROR, detail=exc))
 
     @app.exception_handler(HTTPException)
     async def http_error_handler(request: Request, exc: HTTPException) -> JSONResponse:
@@ -260,13 +281,16 @@ if __name__ == "__main__":
 
     import uvicorn
 
+    # 公网入口交给 HTTPS 反向代理；容器部署需要外部监听时必须显式配置。
+    listen_host = os.getenv("BACKEND_HOST", "127.0.0.1")
+    listen_port = 8001
+    info_event(logger, "backend.listen", host=listen_host, port=listen_port)
     uvicorn.run(
         create_app(load_mode=args.load_mode),
-        # 公网入口交给 HTTPS 反向代理；容器部署需要外部监听时必须显式配置。
-        host=os.getenv("BACKEND_HOST", "127.0.0.1"),
+        host=listen_host,
         # 原始 TCP 对端必须保留，代理头只由 IPFilterMiddleware 按 TRUSTED_PROXY_IPS 解释。
         proxy_headers=False,
-        port=8001,
+        port=listen_port,
         reload=False,
         # uvicorn 自身跟随后端日志级别；access log 单独可控，避免 HTTP 访问行淹没业务事件。
         log_level=_uvicorn_log_level(str(LOGGING_RUNTIME_CONFIG.get("level") or "INFO")),

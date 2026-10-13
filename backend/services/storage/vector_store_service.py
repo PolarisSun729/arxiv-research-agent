@@ -9,6 +9,7 @@ from pymilvus import (
     DataType,
     MilvusClient,
 )
+from pymilvus.client.types import LoadState
 from utils.config import VectorDBProvider, MILVUS_CONFIG, get_vector_store_runtime_config
 from utils.storage_paths import resolve_backend_artifact_path
 from pypinyin import lazy_pinyin, Style
@@ -170,8 +171,19 @@ _CHUNK_PAYLOAD_KEYS_AFTER_SCORE = (
     "section_part_count",
 )
 
-# 所有检索都使用余弦相似度，建索引与查询必须保持一致。
-_SEARCH_PARAMS = {"metric_type": "COSINE", "params": {}}
+# 建索引与查询共用同一个度量类型，两处必须保持一致。
+_METRIC_TYPE = "COSINE"
+_SEARCH_PARAMS = {"metric_type": _METRIC_TYPE, "params": {}}
+
+# Milvus 命中里只有 "distance" 字段，其含义随度量类型变化；这里统一换算成“越大越相似”的 score。
+# Hit.score 只是 pymilvus 中即将废弃的属性别名，并不是 dict 键，不能用 hit.get("score") 读取。
+_DISTANCE_TO_SCORE: Dict[str, Callable[[float], float]] = {
+    "COSINE": lambda distance: distance,  # 余弦相似度，范围 [-1, 1]
+    "IP": lambda distance: distance,  # 内积，越大越相似
+    "L2": lambda distance: 1.0 / (1.0 + distance),  # 平方欧氏距离，越小越相似，映射到 (0, 1]
+}
+if _METRIC_TYPE not in _DISTANCE_TO_SCORE:
+    raise ValueError(f"Unsupported Milvus metric type: {_METRIC_TYPE}")
 
 
 def _entity_getter(entity: Any) -> Callable[..., Any]:
@@ -181,10 +193,13 @@ def _entity_getter(entity: Any) -> Callable[..., Any]:
     return lambda key, default=None: getattr(entity, key, default)
 
 
-def _hit_metric(hit: Dict[str, Any], key: str) -> Optional[float]:
-    """读取检索命中的 score / distance；字段缺失时返回 None，而不是伪造一个 0 分。"""
-    value = hit.get(key)
-    return float(value) if value is not None else None
+def _hit_score_and_distance(hit: Dict[str, Any], metric_type: str = _METRIC_TYPE) -> Tuple[float, float]:
+    """从检索命中读取 distance，并按度量类型换算出 score；缺少 distance 时直接报错，不伪造分数。"""
+    # 只看顶层键：Hit.get 找不到时会退到 entity 里查同名字段，可能误读到业务字段。
+    if "distance" not in hit or hit["distance"] is None:
+        raise ValueError(f"Milvus search hit has no distance field; hit keys={sorted(hit.keys())}")
+    distance = float(hit["distance"])
+    return _DISTANCE_TO_SCORE[metric_type](distance), distance
 
 
 def _split_display_values(value: Any) -> List[str]:
@@ -321,11 +336,16 @@ class VectorStoreService:
         """返回 (规范化后的 collection 名, schema 字段名集合)；collection 不存在时记录告警并返回 None。
 
         读取前先查 schema，是为了让 output_fields 只请求实际存在的字段，兼容不同时期建的 collection。
+        Milvus Lite 进程重启后 collection 会回到 released 状态，未 load 时 search/query 直接报错，
+        所以读取前顺带确认已加载。
         """
         resolved_name = self.resolve_collection_name(collection_name)
         if not client.has_collection(collection_name=resolved_name):
             logger.warning(f"Collection {collection_name} does not exist")
             return None
+        if client.get_load_state(collection_name=resolved_name).get("state") != LoadState.Loaded:
+            logger.info("Collection %s is not loaded; loading before read", resolved_name)
+            client.load_collection(collection_name=resolved_name)
         collection_desc = client.describe_collection(collection_name=resolved_name)
         field_names = {field.get("name") for field in collection_desc.get("fields", [])}
         return resolved_name, field_names
@@ -659,7 +679,7 @@ class VectorStoreService:
                 index_params = client.prepare_index_params()
                 index_params.add_index(
                     field_name="vector",
-                    metric_type="COSINE",
+                    metric_type=_METRIC_TYPE,
                     index_type=self._get_milvus_index_type(config),
                     params=self._get_milvus_index_params(config),
                 )
@@ -927,7 +947,7 @@ class VectorStoreService:
                 index_params.add_index(
                     field_name="vector",
                     index_type="FLAT",
-                    metric_type="COSINE",
+                    metric_type=_METRIC_TYPE,
                 )
                 client.create_index(collection_name=resolved_name, index_params=index_params)
 
@@ -989,14 +1009,10 @@ class VectorStoreService:
             )
 
             # 不同 pymilvus 版本的命中结构不同：有的把字段放在 hit["entity"]，有的直接平铺在 hit 上。
-            similar_vectors = [
-                self._build_chunk_payload(
-                    entity=hit.get("entity", hit),
-                    score=_hit_metric(hit, "score"),
-                    distance=_hit_metric(hit, "distance"),
-                )
-                for hit in results[0]
-            ]
+            similar_vectors = []
+            for hit in results[0]:
+                score, distance = _hit_score_and_distance(hit)
+                similar_vectors.append(self._build_chunk_payload(entity=hit.get("entity", hit), score=score, distance=distance))
 
             return similar_vectors
 
@@ -1033,14 +1049,11 @@ class VectorStoreService:
                 search_params=_SEARCH_PARAMS,
             )
 
-            return [
-                self._build_paper_payload(
-                    entity=hit.get("entity", hit),
-                    score=_hit_metric(hit, "score"),
-                    distance=_hit_metric(hit, "distance"),
-                )
-                for hit in results[0]
-            ]
+            similar_papers = []
+            for hit in results[0]:
+                score, distance = _hit_score_and_distance(hit)
+                similar_papers.append(self._build_paper_payload(entity=hit.get("entity", hit), score=score, distance=distance))
+            return similar_papers
 
         except Exception as e:
             logger.error(f"Error searching similar papers: {str(e)}")

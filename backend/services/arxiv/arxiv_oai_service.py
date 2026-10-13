@@ -14,7 +14,7 @@ import sqlite3
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
@@ -48,6 +48,10 @@ OAI_INDEX_REBUILD_BATCH_SIZE = 1000
 OAI_INDEX_REBUILD_STALE_SECONDS = 15 * 60
 OAI_INDEX_REBUILD_VERSION = "local_oai_search_index_rebuild_v2"
 OAI_REBUILD_STATE_ID = 1
+# relevance 排序时先按日期取出的候选上限；本地没有 IR 打分，只能在候选内用字段命中打分重排。
+OAI_RELEVANCE_CANDIDATE_POOL = 500
+# 增量刷新索引时按块批量删除旧行；低于旧版 SQLite 999 个绑定变量的上限。
+OAI_INDEX_DELETE_CHUNK_SIZE = 500
 
 
 
@@ -207,6 +211,22 @@ class ArxivOaiDatabaseService:
         """
         # 每次按需创建连接，让上层通过上下文管理器控制事务边界。
         return sqlite3.connect(self.db_path, check_same_thread=self.check_same_thread)
+
+    def _enable_wal_mode(self, cursor: sqlite3.Cursor) -> None:
+        """把库切到 WAL 模式，让同步脚本写入期间后端仍能读库（首页统计、本地检索）。
+
+        journal_mode=WAL 会持久化到库文件里，切一次后所有进程的连接都生效；
+        默认的 delete 模式下大写事务会拿排它锁，读请求会等到超时报 database is locked。
+        """
+        try:
+            row = cursor.execute("PRAGMA journal_mode=WAL").fetchone()
+        except sqlite3.OperationalError as exc:
+            # 切换需要短暂独占；正好有其他进程在写时不阻断启动，下次初始化再切。
+            logger.warning("Unable to switch OAI database to WAL mode: %s", exc)
+            return
+        journal_mode = str(row[0] if row else "").lower()
+        if journal_mode != "wal":
+            logger.warning("OAI database journal_mode is %s instead of wal: %s", journal_mode, self.db_path)
 
     def _is_fts5_available(self, cursor: sqlite3.Cursor) -> bool:
         """检测当前 SQLite 是否支持 FTS5；本地文本检索依赖它来保证精确且可下推。"""
@@ -665,55 +685,38 @@ class ArxivOaiDatabaseService:
         if fts5_available is None:
             fts5_available = self._is_fts5_available(cursor)
 
+        # 同一批内重复的 arxiv_id 只保留最后一次，避免“统一先删再插”时插出重复索引行。
+        latest_by_id: Dict[str, Dict[str, Any]] = {}
         for paper in papers:
             arxiv_id = str(paper.get("arxiv_id") or "").strip()
-            if not arxiv_id:
-                continue
+            if arxiv_id:
+                latest_by_id[arxiv_id] = paper
+        if not latest_by_id:
+            return
 
-            categories = self._normalize_categories_for_index(paper)
-            primary_category = str(paper.get("primary_category") or "").strip()
-            # 采用“先删后插”的方式刷新从表，避免分类变更后残留脏索引。
-            cursor.execute("DELETE FROM arxiv_oai_paper_categories WHERE arxiv_id = ?", (arxiv_id,))
-            cursor.executemany(
-                """
-                INSERT OR REPLACE INTO arxiv_oai_paper_categories (arxiv_id, category, is_primary)
-                VALUES (?, ?, ?)
-                """,
-                [(arxiv_id, category, 1 if category == primary_category else 0) for category in categories],
-            )
+        # 采用“先删后插”刷新从表，避免分类变更或摘要更新后残留旧索引。
+        # FTS 的 arxiv_id 是 UNINDEXED 列，按它删除必然全表扫描；按块批量删把扫描次数从每篇一次降到每块一次。
+        arxiv_ids = list(latest_by_id)
+        for start in range(0, len(arxiv_ids), OAI_INDEX_DELETE_CHUNK_SIZE):
+            chunk = arxiv_ids[start:start + OAI_INDEX_DELETE_CHUNK_SIZE]
+            placeholders = ",".join("?" * len(chunk))
+            cursor.execute(f"DELETE FROM arxiv_oai_paper_categories WHERE arxiv_id IN ({placeholders})", chunk)
+            if fts5_available:
+                cursor.execute(f"DELETE FROM arxiv_oai_papers_fts WHERE arxiv_id IN ({placeholders})", chunk)
 
-            if not fts5_available:
-                # 没有 FTS5 时仍要保留分类索引，让 id/category/date 查询继续可用。
-                continue
+        self._insert_search_index_rows(cursor, list(latest_by_id.values()), fts5_available=fts5_available)
 
-            authors_text = self._normalize_authors_for_index(paper)
-            categories_text = " ".join(categories)
-            title = str(paper.get("title", "") or "").strip()
-            abstract = str(paper.get("abstract", "") or "").strip()
-            # all_text 聚合多个文本字段，给 all: 查询提供统一检索入口。
-            all_text = " ".join(
-                item
-                for item in [title, abstract, authors_text, categories_text, primary_category]
-                if item
-            )
-            # FTS 表同样走全量重建，确保字段更新时不会保留旧文本。
-            cursor.execute("DELETE FROM arxiv_oai_papers_fts WHERE arxiv_id = ?", (arxiv_id,))
-            cursor.execute(
-                """
-                INSERT INTO arxiv_oai_papers_fts (arxiv_id, title, abstract, authors, categories, all_text)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (arxiv_id, title, abstract, authors_text, categories_text, all_text),
-            )
-
-    def _insert_rebuild_search_index_batch(
+    def _insert_search_index_rows(
         self,
         cursor: sqlite3.Cursor,
         papers: Sequence[Dict[str, Any]],
         *,
         fts5_available: bool,
     ) -> None:
-        """全量重建专用快路径：目标索引已按检查点保证追加顺序，因此不做逐篇删除。"""
+        """批量插入分类映射和 FTS 行；只负责插入，调用方需保证这些论文的旧索引行已清除。
+
+        全量重建和增量同步共用这一份构造逻辑，保证两条路径写出的 all_text 完全一致。
+        """
         category_rows: List[Tuple[str, str, int]] = []
         fts_rows: List[Tuple[str, str, str, str, str, str]] = []
         for paper in papers:
@@ -961,7 +964,7 @@ class ArxivOaiDatabaseService:
                 if not papers:
                     break
 
-                self._insert_rebuild_search_index_batch(cursor, papers, fts5_available=True)
+                self._insert_search_index_rows(cursor, papers, fts5_available=True)
                 processed_papers += len(papers)
                 last_arxiv_id = str(papers[-1].get("arxiv_id") or "").strip() or last_arxiv_id
                 now = self._now_iso()
@@ -1111,8 +1114,8 @@ class ArxivOaiDatabaseService:
             return text
         return value
 
-    def get_total_paper_count(self) -> int:
-        """返回 OAI 本地镜像库中的论文总数。"""
+    def get_total_paper_count(self) -> Optional[int]:
+        """返回 OAI 本地镜像库中的论文总数；读取失败返回 None，而不是 0。"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -1121,8 +1124,17 @@ class ArxivOaiDatabaseService:
                 row = cursor.fetchone()
                 return int(row[0] or 0) if row else 0
         except Exception as exc:
+            # 读不到（如同步写入时库被锁）和“库是空的”必须区分开，否则首页会误显示 0 篇。
             logger.error("Error getting total OAI paper count: %s", exc)
-            return 0
+            return None
+
+    def get_latest_oai_datestamp(self) -> Optional[date]:
+        """返回库中最大的 OAI datestamp；空库返回 None。增量同步在缺少游标时用它推断起点。"""
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT MAX(oai_datestamp) FROM arxiv_oai_papers").fetchone()
+        value = str(row[0] or "").strip() if row else ""
+        # datestamp 可能带时间部分，只取日期；格式异常时宁可报错，也不能凭坏数据推断同步起点。
+        return date.fromisoformat(value[:10]) if value else None
 
     def get_paper(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
         """按 arXiv ID 获取单篇论文元数据。"""
@@ -1439,6 +1451,12 @@ class ArxivOaiDatabaseService:
         if re.fullmatch(r"[a-z0-9]+", normalized_query):
             # 纯英文/数字短词按 token 边界匹配，避免 RAG 命中 Dragoi 这类子串。
             return re.search(rf"(?<![a-z0-9]){re.escape(normalized_query)}(?![a-z0-9])", normalized_haystack) is not None
+        if re.fullmatch(r"[a-z0-9\s\-_/.]+", normalized_query):
+            # 英文短语按 token 序列匹配，和 FTS 分词一致：retrieval augmented generation
+            # 也能命中 retrieval-augmented generation。
+            query_tokens = re.findall(r"[a-z0-9]+", normalized_query)
+            haystack_tokens = re.findall(r"[a-z0-9]+", normalized_haystack)
+            return f" {' '.join(query_tokens)} " in f" {' '.join(haystack_tokens)} "
         return normalized_query in normalized_haystack
 
     def _score_text_query(self, paper: Dict[str, Any], query_text: str) -> int:
@@ -1667,8 +1685,22 @@ class ArxivOaiDatabaseService:
                 {order_sql}
                 LIMIT ? OFFSET ?
             """
-            cursor.execute(select_query, params + [max(1, int(max_results)), max(0, int(start))])
-            papers = [self._build_paper_response(self._parse_row(row)) for row in cursor.fetchall()]
+            rerank_by_relevance = sort_by == "relevance" and uses_fts and bool(normalized_query)
+            if rerank_by_relevance:
+                # relevance 不能只取“最新的 N 篇”：先取一批候选，再按标题/摘要命中打分取 Top N，
+                # 同分时保持日期顺序。
+                window = max(OAI_RELEVANCE_CANDIDATE_POOL, max(0, int(start)) + max(1, int(max_results)))
+                cursor.execute(select_query, params + [window, 0])
+                candidates = [self._parse_row(row) for row in cursor.fetchall()]
+                ranked = sorted(
+                    enumerate(candidates),
+                    key=lambda item: (-self._score_relevance_query(item[1], normalized_query), item[0]),
+                )
+                page = ranked[max(0, int(start)) : max(0, int(start)) + max(1, int(max_results))]
+                papers = [self._build_paper_response(paper) for _, paper in page]
+            else:
+                cursor.execute(select_query, params + [max(1, int(max_results)), max(0, int(start))])
+                papers = [self._build_paper_response(self._parse_row(row)) for row in cursor.fetchall()]
 
         # 把本次查询到底使用了哪一层索引能力显式带回，方便前端解释“为什么和 arXiv API 不完全一样”。
         query_capability = build_local_oai_query_capability(
@@ -1680,7 +1712,9 @@ class ArxivOaiDatabaseService:
             "当前使用本地 OAI 镜像库，仅支持高精度可下推查询子集，不等价完整 arXiv API 语法。"
         ]
         if sort_by == "relevance" and uses_fts:
-            warnings.append("本地 relevance 当前使用 FTS 命中过滤和日期排序，不等价 arXiv API relevance。")
+            warnings.append(
+                f"本地 relevance 在最近 {OAI_RELEVANCE_CANDIDATE_POOL} 篇命中论文内按标题/摘要命中打分排序，不等价 arXiv API relevance。"
+            )
         return {
             "query": normalized_query,
             "id_list": normalized_id_list,
@@ -1761,6 +1795,7 @@ class ArxivOaiDatabaseService:
         """初始化 OAI SQLite 主表、从表和全文索引。"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            self._enable_wal_mode(cursor)
             fts5_available = self._is_fts5_available(cursor)
             # 主表负责保存 OAI 元数据真相，从表和 FTS 都视为可重建索引。
             cursor.execute(
@@ -1895,6 +1930,7 @@ class ArxivOaiDatabaseService:
         if not normalized_papers:
             return 0
 
+        started_at = time.perf_counter()
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -1950,7 +1986,12 @@ class ArxivOaiDatabaseService:
                 # 批量刷新从索引，确保分类和全文检索状态与主表提交点一致。
                 self._sync_search_index_for_papers(cursor, normalized_papers)
                 conn.commit()
-                logger.info("OAI paper batch upserted: %s", len(normalized_papers))
+                # 带上耗时，写库变慢时能直接从日志看出来，而不是只看到翻页日志后长时间沉默。
+                logger.info(
+                    "OAI paper batch upserted: %s elapsed_seconds=%.2f",
+                    len(normalized_papers),
+                    time.perf_counter() - started_at,
+                )
                 return len(normalized_papers)
         except Exception as exc:
             logger.error("Error upserting OAI papers batch: %s", exc)
@@ -2047,6 +2088,11 @@ class ArxivOaiSyncService:
             except ET.ParseError as exc:
                 stats.errors += 1
                 logger.error("Failed to parse OAI-PMH XML response: %s", exc)
+                break
+
+            if self.xml_parser.extract_oai_error_code(root) == "noRecordsMatch":
+                # 区间内没有任何记录（如周末）是 OAI-PMH 规定的正常空结果，不能计为错误，否则游标永远卡在这一天。
+                logger.info("OAI-PMH noRecordsMatch for from=%s until=%s; nothing to sync.", from_date, until_date)
                 break
 
             page_error = self.xml_parser.extract_oai_error(root)

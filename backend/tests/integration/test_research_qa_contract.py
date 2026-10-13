@@ -63,6 +63,26 @@ def test_research_qa_uses_real_session_and_persists_rescorable_record(qa_service
     assert any(e.get("candidates") for e in record["trace_events"])
 
 
+def test_research_debug_exposes_rounds_and_steps_for_the_panel(qa_service):
+    # 面板的"RAG 执行过程"读 retrieval_debug；研究引擎必须按轮给出检索与研究动作，且落库快照里同样可读。
+    service, tmp_path = qa_service
+    result = service.answer_question("2310.11511", _payload())
+
+    debug = result["retrieval_debug"]
+    assert [item["round"] for item in debug["research_rounds"]] == [1, 2]
+    assert debug["research_rounds"][0]["target_need_id"] == "need-method"
+    assert debug["research_rounds"][0]["decision_reason"] == "OPEN_EVIDENCE_NEED"
+    assert [step["kind"] for step in debug["research_steps"]][:4] == ["search", "draft", "extract", "verify"]
+    assert debug["research_steps"][-1] == {"kind": "done", "title": "研究结束", "detail": "completed"}
+    storage = build_storage_container(db_path=str(tmp_path / "qa.sqlite"))
+    messages = storage.paper_chat_messages.list_paper_chat_messages(
+        result["session_id"], user_id=result["chat_session"]["user_id"],
+    )
+    snapshot = messages[-1]["retrieval_debug_snapshot"]
+    assert snapshot["research_rounds"][0]["target_need_id"] == "need-method"
+    assert snapshot["research_steps"][0]["kind"] == "search"
+
+
 @pytest.mark.parametrize("streaming", [False, True])
 def test_missing_index_preserves_error_code(qa_service, streaming):
     service, tmp_path = qa_service
@@ -102,6 +122,38 @@ def test_persistence_failure_is_not_an_abstention(qa_service, monkeypatch):
     record = json.loads(next((tmp_path / "records").rglob("*.json")).read_text(encoding="utf-8"))
     assert record["run_status"] == "error"
     assert record["outcome"] is None
+
+
+def test_failed_research_does_not_leave_empty_session(qa_service):
+    service, _ = qa_service
+
+    class FailingResearch:
+        def research_stream(self, request, **kwargs):
+            raise RuntimeError("research failed")
+            yield  # pragma: no cover - 让函数成为生成器
+
+    service.research_service = FailingResearch()
+    with pytest.raises(AppError):
+        service.answer_question("2310.11511", _payload())
+    sessions = service.session_service.paper_chat_session_store.list_paper_chat_sessions(
+        arxiv_id="2310.11511", user_id="evaluation-user", limit=5,
+    )
+    assert sessions == []
+
+
+def test_abstained_outcome_reports_insufficient_verification(qa_service, monkeypatch):
+    service, _ = qa_service
+    original_finalize = service._finalize_research_answer
+
+    def finalize_as_abstained(**kwargs):
+        kwargs["research_result"] = kwargs["research_result"].model_copy(update={"outcome": "abstained"})
+        return original_finalize(**kwargs)
+
+    monkeypatch.setattr(service, "_finalize_research_answer", finalize_as_abstained)
+    result = service.answer_question("2310.11511", _payload())
+    assert result["sources"]
+    assert result["verification_debug"]["status"] == "insufficient_evidence"
+    assert result["verification_debug"]["insufficient_evidence"] is True
 
 
 @pytest.mark.parametrize("outcome,status,decision", [

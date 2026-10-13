@@ -22,7 +22,7 @@ import type {
   QaTurnStatus
 } from '@/types/ragChat'
 import { useUserContext } from '@/composables/useUserContext'
-import { extractCitedSourceIds, normalizeEvidenceSources } from '@/utils/evidence'
+import { normalizeEvidenceSources, orderCitedSourceIds } from '@/utils/evidence'
 
 const MAX_CONVERSATION_TURNS = 5
 const MAX_ANSWER_SUMMARY_LENGTH = 280
@@ -93,7 +93,7 @@ function buildConversationContext(qaResults: QaTurn[], pendingTurnId?: string): 
     .filter(turn => Boolean(turn.question || turn.answer_summary || turn.sources.length))
 }
 
-function groupMessagesToTurns(messages: PaperChatMessage[]): QaTurn[] {
+function groupMessagesToTurns(messages: PaperChatMessage[], paperId: string): QaTurn[] {
   const turnsById = new Map<string, QaTurn>()
 
   for (const message of messages) {
@@ -126,17 +126,21 @@ function groupMessagesToTurns(messages: PaperChatMessage[]): QaTurn[] {
       existing.createdAt = message.created_at || existing.createdAt
     } else {
       existing.answer = message.content || existing.answer
-      existing.sources = normalizeEvidenceSources(message.sources)
-      existing.citedSourceIds = extractCitedSourceIds(existing.answer, existing.sources)
+      existing.sources = normalizeEvidenceSources(message.sources, paperId)
       existing.retrievalDebug = message.retrieval_debug_snapshot ?? existing.retrievalDebug
       existing.contextualizedQuestion = message.contextualized_question || existing.contextualizedQuestion
       existing.questionContextualization = message.question_contextualization ?? existing.questionContextualization
       existing.usedShortTermMemory = Boolean(
         message.question_contextualization?.used_short_term_memory ?? existing.usedShortTermMemory
       )
-      existing.citedSourceIds = Array.isArray(message.cited_source_ids)
-        ? message.cited_source_ids.map(value => String(value))
-        : existing.citedSourceIds || []
+      // 引用列表编号与正文角标一致：先按回答中出现顺序，再补后端声明的引用。
+      existing.citedSourceIds = orderCitedSourceIds(
+        existing.answer,
+        existing.sources,
+        Array.isArray(message.cited_source_ids)
+          ? message.cited_source_ids.map(value => String(value))
+          : existing.citedSourceIds || []
+      )
       existing.citationWarning = typeof message.citation_warning === 'string'
         ? message.citation_warning
         : existing.citationWarning || null
@@ -289,7 +293,7 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
     try {
       const response = await getPaperChatMessages(currentPaperId, sessionId, getUserId())
       currentSession.value = response.session
-      qaResults.value = groupMessagesToTurns(response.items || [])
+      qaResults.value = groupMessagesToTurns(response.items || [], currentPaperId)
       if (qaResults.value.length > 0) {
         options.onEnterQaMode?.()
       }
@@ -433,7 +437,7 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
             // meta 到达表示后端已完成检索准备，后续 turn 可以展示来源和调试信息。
             turn.status = 'streaming'
             if (Array.isArray(meta.sources)) {
-              turn.sources = meta.sources
+              turn.sources = normalizeEvidenceSources(meta.sources, currentPaperId)
             }
             if (meta.retrieval_debug) {
               turn.retrievalDebug = meta.retrieval_debug
@@ -471,7 +475,7 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
               turn.answer = payload.answer
             }
             if (Array.isArray(payload.sources)) {
-              turn.sources = payload.sources
+              turn.sources = normalizeEvidenceSources(payload.sources, currentPaperId)
             }
             if (payload.retrieval_debug) {
               turn.retrievalDebug = payload.retrieval_debug
@@ -491,9 +495,13 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
             if (payload.question_contextualization) {
               turn.questionContextualization = payload.question_contextualization
             }
-            if (Array.isArray(payload.cited_source_ids)) {
-              turn.citedSourceIds = payload.cited_source_ids.map(value => String(value))
-            }
+            turn.citedSourceIds = orderCitedSourceIds(
+              turn.answer,
+              turn.sources,
+              Array.isArray(payload.cited_source_ids)
+                ? payload.cited_source_ids.map(value => String(value))
+                : turn.citedSourceIds
+            )
             if (typeof payload.citation_warning === 'string') {
               turn.citationWarning = payload.citation_warning
             }
@@ -519,7 +527,7 @@ export function usePaperRagChat(options: UsePaperRagChatOptions) {
         turn.answer = result.answer
       }
       if (Array.isArray(result.sources) && turn.sources.length === 0) {
-        turn.sources = result.sources
+        turn.sources = normalizeEvidenceSources(result.sources, currentPaperId)
       }
       if (result.retrieval_debug && !turn.retrievalDebug) {
         turn.retrievalDebug = result.retrieval_debug

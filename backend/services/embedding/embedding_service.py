@@ -18,7 +18,6 @@ import os
 import base64
 import mimetypes
 import threading
-import torch
 import numpy as np
 import sys
 import requests
@@ -33,10 +32,24 @@ from services.paper_qa.build_cache import get_paper_qa_build_cache
 from utils.config import EMBEDDING_CONFIG, get_enhanced_retrieval_runtime_config
 from utils.storage_paths import resolve_backend_artifact_path
 
+
 logger = logging.getLogger(__name__)
 ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
 DASHSCOPE_MAX_REQUEST_RETRIES = 3
 DASHSCOPE_MAX_RETRY_DELAY_SECONDS = 30.0
+
+
+def _torch_tensor_to_list(value: Any) -> Optional[list]:
+    """value 是 torch.Tensor 时转成 float32 列表，否则返回 None。
+
+    Tensor 只会来自本地模型，而本地模型加载时已经导入了 torch，所以这里只读取已导入的模块，不主动 import。
+    默认的远程 embedding 用不到 torch，模块加载时导入它会让后端冷启动多花约 5 秒。
+    """
+    torch = sys.modules.get("torch")
+    if torch is None or not isinstance(value, torch.Tensor):
+        return None
+    return value.to(dtype=torch.float32).cpu().tolist()
+
 
 class EmbeddingProvider(str, Enum):
     OPENAI = "openai"
@@ -220,8 +233,9 @@ class EmbeddingService:
         """
         if isinstance(embedding, np.ndarray):
             return embedding.tolist()
-        if isinstance(embedding, torch.Tensor):
-            return embedding.to(dtype=torch.float32).cpu().tolist()
+        tensor_values = _torch_tensor_to_list(embedding)
+        if tensor_values is not None:
+            return tensor_values
         if isinstance(embedding, list):
             return [float(x) for x in embedding]
         return [float(x) for x in np.asarray(embedding, dtype=np.float32).tolist()]
@@ -1136,8 +1150,9 @@ class EmbeddingService:
                 payload["image"] = embedding_input.get("image_path") or embedding_input.get("image")
             embeddings = self.local_embedder.process([payload])
             embedding_tensor = embeddings[0]
-            if isinstance(embedding_tensor, torch.Tensor):
-                return embedding_tensor.to(dtype=torch.float32).cpu().tolist()
+            tensor_values = _torch_tensor_to_list(embedding_tensor)
+            if tensor_values is not None:
+                return tensor_values
             return np.asarray(embedding_tensor, dtype=np.float32).tolist()
         except Exception as e:
             print(f"Error creating embedding with local model: {str(e)}")

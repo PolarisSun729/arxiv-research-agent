@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from services.retrieval.contracts import QueryProfile
+from services.retrieval.numeric_utils import first_float
 from services.retrieval.table_evidence_formatter import summarize_table_evidence_debug
 from utils.config import get_enhanced_retrieval_runtime_config
 from utils.secret_redaction import redact_sensitive_value
@@ -664,7 +665,8 @@ class RetrievalTraceBuilder:
                     "matched_index_id": item.get("matched_index_id") or item.get("retrieval_index_id") or item.get("index_id"),
                     "matched_index_type": item.get("matched_index_type") or item.get("retrieval_index_type") or item.get("index_type"),
                     "matched_index_text": item.get("matched_index_text") or item.get("retrieval_index_text") or item.get("index_text"),
-                    "matched_index_score": item.get("matched_index_score") or item.get("route_score") or item.get("score"),
+                    # 与 rerank 侧一致：合法的 0.0 不被跳过，也不拿融合分冒充 index 分。
+                    "matched_index_score": first_float(item.get("matched_index_score"), item.get("route_score")),
                     "source_query": item.get("source_query"),
                 }
             ]

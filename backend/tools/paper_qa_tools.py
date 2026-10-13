@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from typing import Any, Dict, Mapping, Optional
 
@@ -16,6 +17,11 @@ from services.paper_qa.repair_actions import (
 )
 from services.paper_qa.qa_observation import build_error_qa_observation
 from .tool_result import make_tool_error, make_tool_result, make_tool_trace
+
+logger = logging.getLogger(__name__)
+
+# 未知异常对 Agent 暴露的固定文案：异常字符串可能包含 provider 响应体或服务器路径，只写入服务端日志。
+PAPER_QA_ANSWER_FAILED_MESSAGE = "论文问答执行失败，请稍后重试"
 
 
 @lru_cache(maxsize=1)
@@ -185,12 +191,16 @@ def answer_paper_question(
         error_payload_builder = getattr(exc, "to_payload", None)
         error_payload = error_payload_builder() if callable(error_payload_builder) else {}
         qa_observation = error_payload.get("qa_observation") if isinstance(error_payload, dict) else None
+        # AppError 的 message 是面向用户的受控文案；其他异常一律使用固定文案，原始异常只进日志。
+        error_message = (error_payload.get("message") if isinstance(error_payload, dict) else None) or PAPER_QA_ANSWER_FAILED_MESSAGE
+        logger.exception("answer_paper_question failed: arxiv_id=%s run_id=%s", arxiv_id, run_id)
         if qa_observation is None:
             # 工具层是 Agent 的稳定边界；即使服务层抛出未知异常，也要补齐最小观察结构。
+            # error_reason 会原样进入 observation_reason，必须是稳定错误码而不是 str(exc)。
             qa_observation = build_error_qa_observation(
                 error_code="paper_qa_answer_failed",
                 error_stage="answer_paper_question",
-                error_reason=str(exc),
+                error_reason="paper_qa_answer_failed",
             )
         return make_tool_result(
             ok=False,
@@ -204,8 +214,8 @@ def answer_paper_question(
                 "sources": [],
                 "retrieval_debug": None,
                 "qa_observation": qa_observation,
-                "error": (error_payload.get("message") if isinstance(error_payload, dict) else None) or str(exc),
+                "error": error_message,
             },
             trace=make_tool_trace(tool_name, inputs=trace_inputs, source="paper_qa_service"),
-            error=make_tool_error("paper_qa_answer_failed", str(exc), detail={"qa_observation": qa_observation}),
+            error=make_tool_error("paper_qa_answer_failed", error_message, detail={"qa_observation": qa_observation}),
         )

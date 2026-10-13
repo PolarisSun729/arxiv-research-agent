@@ -1300,7 +1300,7 @@ def test_rule_based_plan_can_be_executed_by_existing_plan_executor(monkeypatch) 
     current_state_module = sys.modules.get("backend.agents.arxiv_search_agent.state") or state_module
 
     def fake_invoke_tool(tool_name: str, **kwargs):
-        assert tool_name == "search_arxiv_structured"
+        assert tool_name == "search_arxiv_raw"
         return {
             "ok": True,
             "tool_name": tool_name,

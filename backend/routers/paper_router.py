@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from pymilvus.exceptions import MilvusException
 
 from auth.charging import charge
 from auth.context import current_auth
@@ -121,7 +122,8 @@ async def get_dashboard_stats(
             # 看板对所有账号开放；保留字段和失败状态，内部路径及诊断仅向已认证管理员展示。
             sync_error = "最近一次同步失败，请联系管理员查看运行日志。"
         return {
-            # totalPapers 统计的是 OAI 同步镜像库，而不是本地论文目录 arxiv_papers。
+            # totalPapers 统计的是 OAI 同步镜像库，而不是本地论文目录 arxiv_papers；
+            # 读库失败时为 null，前端据此提示“暂时无法统计”，不能当成 0 篇展示。
             "totalPapers": oai_db_service.get_total_paper_count(),
             "labeledPapers": user_preference_store.get_user_labeled_paper_count(user_id=user_id),
             "latestSyncNewPapers": sync_status["latestSyncNewPapers"],
@@ -322,6 +324,14 @@ async def get_paper(
         raise HTTPException(status_code=404, detail="Paper not found")
     except (HTTPException, AppError):
         raise
+    except MilvusException as exc:
+        # 向量库不可达属于依赖服务故障，返回可重试的 503，而不是看起来像代码 bug 的 500。
+        logger.error("Vector store unavailable while getting paper %s: %s", arxiv_id, exc)
+        raise AppError(
+            ErrorCode.VECTOR_STORE_ERROR,
+            detail=exc,
+            context={"arxiv_id": arxiv_id, "stage": "get_paper"},
+        ) from exc
     except Exception as exc:
         logger.error("Error getting paper: %s", str(exc))
         raise HTTPException(status_code=500, detail=str(exc))

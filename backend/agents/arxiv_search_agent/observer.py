@@ -15,6 +15,29 @@ def _tokenize(text: Any) -> List[str]:
     return [token for token in re.findall(r"[a-zA-Z0-9\u4e00-\u9fff]+", str(text or "").lower()) if len(token) >= 2]
 
 
+def _search_relaxation(value: Any) -> Dict[str, Any]:
+    """读取 search_arxiv 输出里的阶梯检索记录；旧输出没有该字段时返回空字典。"""
+    payload = _unwrap_payload(value)
+    relaxation = payload.get("relaxation") if isinstance(payload, Mapping) else None
+    return dict(relaxation) if isinstance(relaxation, Mapping) else {}
+
+
+def _search_spec_tokens(search_spec: Any) -> List[str]:
+    """相关性抽查用的主题词：优先取概念主术语和同义写法，旧规格退回 query。"""
+    if hasattr(search_spec, "model_dump"):
+        search_spec = search_spec.model_dump()
+    if not isinstance(search_spec, Mapping):
+        return []
+    texts: List[str] = []
+    for concept in search_spec.get("concepts") or []:
+        if isinstance(concept, Mapping):
+            texts.append(str(concept.get("term") or ""))
+            texts.extend(str(alias or "") for alias in concept.get("aliases") or [])
+    if not texts:
+        texts.append(str(search_spec.get("query") or ""))
+    return [token for text in texts for token in _tokenize(text)]
+
+
 def _tool_result_payload(value: Any) -> Any:
     """兼容 ToolExecutionResult 实例和 checkpoint 后的 dict envelope。"""
     if isinstance(value, ToolExecutionResult):
@@ -240,6 +263,16 @@ class Observer:
     def _observe_search_arxiv(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
         del normalized_output, runtime, state
         papers = _extract_papers(raw_output)
+        relaxation = _search_relaxation(raw_output)
+        if not papers and relaxation.get("attempts"):
+            # 阶梯检索已经在工具内部把可放宽的条件都试过了；再走 rewrite→search 重规划只会重复同样的查询。
+            # 这里把“没找到”当成可解释的终态交给回答步骤，由它列出已尝试的查询并给出建议。
+            return ObservationResult(
+                status="partial_success",
+                reason="search_ladder_exhausted",
+                confidence=0.3,
+                details={"paper_count": 0, "attempt_count": len(relaxation.get("attempts") or [])},
+            )
         if not papers:
             return ObservationResult(
                 status="empty_result",
@@ -254,7 +287,7 @@ class Observer:
                     retryable=True,
                 ),
             )
-        query_tokens = _tokenize((resolved_input.get("search_spec") or {}).get("query") if isinstance(resolved_input.get("search_spec"), Mapping) else None)
+        query_tokens = _search_spec_tokens(resolved_input.get("search_spec"))
         if query_tokens:
             matched_titles = 0
             for paper in papers[:5]:
@@ -282,6 +315,14 @@ class Observer:
         del runtime, state
         quality = normalized_output if isinstance(normalized_output, Mapping) else raw_output if isinstance(raw_output, Mapping) else {}
         result_count = int(quality.get("result_count") or 0)
+        if result_count <= 0 and _search_relaxation(resolved_input.get("arxiv_results")).get("attempts"):
+            # 与 search_arxiv 的判断保持一致：阶梯已用尽时不再触发补检索重规划。
+            return ObservationResult(
+                status="partial_success",
+                reason="search_ladder_exhausted",
+                confidence=0.3,
+                details={"result_count": 0},
+            )
         if result_count <= 0:
             return ObservationResult(
                 status="empty_result",

@@ -1,7 +1,14 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import type { RetrievalDebug, RetrievalDebugChunk } from '@/api/papers'
 import { formatQueryList } from '@/utils/format'
+import {
+  buildResearchRoundViews,
+  buildResearchStepViews,
+  buildResearchSummaryView,
+  hasResearchProcess,
+  splitStepDetail
+} from '@/utils/researchProcess'
 
 const props = defineProps<{
   question: string
@@ -32,14 +39,10 @@ const steps = computed(() => {
   const debug = props.retrievalDebug
   const finalContextCount =
     getChunkCount(debug?.stages?.final_context_top15) || getChunkCount(debug?.final_chunks)
-  const rerankCount = getChunkCount(debug?.stages?.reranked_top15)
+  // 检索管线产出的阶段键是 reranked_top30；保留 top15 兼容旧快照。
+  const rerankCount = getChunkCount(debug?.stages?.reranked_top30) || getChunkCount(debug?.stages?.reranked_top15)
 
   return [
-    {
-      key: 'original',
-      title: '原始问题',
-      content: debug?.original_query || props.question || '无'
-    },
     {
       key: 'rewrite',
       title: 'Query Rewrite',
@@ -86,34 +89,550 @@ const steps = computed(() => {
     }
   ]
 })
+
+// 研究引擎会多轮检索、起草和校验，单条检索时间线描述不了它：改为"研究动作 + 每轮检索阶段"两层展示。
+const isResearch = computed(() => hasResearchProcess(props.retrievalDebug))
+const summary = computed(() => buildResearchSummaryView(props.retrievalDebug?.research_summary))
+const researchSteps = computed(() =>
+  buildResearchStepViews(props.retrievalDebug?.research_steps).map(step => ({ ...step, ...splitStepDetail(step.content) }))
+)
+const researchRounds = computed(() => buildResearchRoundViews(props.retrievalDebug?.research_rounds))
+
+// 决策理由是模型的长段英文说明，默认收成三行，点开再看全文。
+const expandedReasons = ref<Set<string>>(new Set())
+const openRounds = ref<Set<string>>(new Set())
+
+watch(
+  () => props.retrievalDebug,
+  () => {
+    expandedReasons.value = new Set()
+    const last = researchRounds.value[researchRounds.value.length - 1]
+    openRounds.value = new Set(last ? [last.key] : [])
+  },
+  { immediate: true }
+)
+
+function toggled(set: Set<string>, key: string) {
+  const next = new Set(set)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  return next
+}
+
+function toggleReason(key: string) {
+  expandedReasons.value = toggled(expandedReasons.value, key)
+}
+
+function toggleRound(key: string) {
+  openRounds.value = toggled(openRounds.value, key)
+}
+
+const STEP_TONES: Record<string, string> = {
+  search: 'blue',
+  filter: 'slate',
+  draft: 'violet',
+  extract: 'slate',
+  verify: 'green',
+  restore: 'amber',
+  fallback: 'amber',
+  rejected: 'red',
+  done: 'green'
+}
+
+function stepTone(kind?: string) {
+  return STEP_TONES[kind || ''] || 'blue'
+}
+
+// Final Context 每行形如 "chunk 20 · text · p9 · 0.7813 · 正文预览"（分数可能缺省）：
+// 开头连续的 chunk 号 / 类型 / 页码 / 分数是定位信息，其余是预览。
+const CONTEXT_HEAD_PART = /^(chunk \S+|[a-z_]+|p[\d-]+|\d+(\.\d+)?)$/
+
+function parseContextLines(content: string) {
+  return content
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => {
+      const parts = line.split(' · ')
+      let headCount = 0
+      while (headCount < Math.min(4, parts.length - 1) && CONTEXT_HEAD_PART.test(parts[headCount])) headCount += 1
+      return parts[0].startsWith('chunk ') && headCount >= 2
+        ? { head: parts.slice(0, headCount).join(' · '), text: parts.slice(headCount).join(' · ') }
+        : { head: '', text: line }
+    })
+}
 </script>
 
 <template>
-  <el-timeline class="rag-thought-chain">
-    <el-timeline-item v-for="step in steps" :key="step.key" placement="top" size="large" type="primary">
-      <div class="rag-thought-chain__title">{{ step.title }}</div>
-      <div class="rag-thought-chain__content">{{ step.content }}</div>
-    </el-timeline-item>
-  </el-timeline>
+  <div v-if="isResearch" class="chain">
+    <div class="chain-question">
+      <span class="chain-label">研究问题</span>
+      <p>{{ retrievalDebug?.original_query || question || '无' }}</p>
+    </div>
+
+    <div v-if="summary" class="chain-summary">
+      <div class="chain-summary__outcome" :class="`chain-summary__outcome--${summary.outcome}`">
+        {{ summary.outcomeLabel }}
+      </div>
+      <div class="chain-summary__stats">
+        <div v-for="stat in summary.stats" :key="stat.label" class="chain-summary__stat">
+          <strong>{{ stat.value }}</strong>
+          <span>{{ stat.label }}</span>
+        </div>
+      </div>
+    </div>
+
+    <section class="chain-section">
+      <div class="chain-label">研究动作</div>
+      <ol v-if="researchSteps.length" class="chain-steps">
+        <li v-for="step in researchSteps" :key="step.key" class="chain-step" :class="`chain-step--${stepTone(step.kind)}`">
+          <span class="chain-step__dot" aria-hidden="true" />
+          <div class="chain-step__body">
+            <div class="chain-step__title">{{ step.title }}</div>
+            <div v-if="step.facts.length" class="chain-step__facts">
+              <span v-for="fact in step.facts" :key="fact" class="chain-chip">{{ fact }}</span>
+            </div>
+            <button
+              v-if="step.reason"
+              type="button"
+              class="chain-step__reason"
+              :class="{ 'chain-step__reason--open': expandedReasons.has(step.key) }"
+              :title="expandedReasons.has(step.key) ? '收起' : '展开全文'"
+              @click="toggleReason(step.key)"
+            >
+              <span class="chain-step__reason-text">
+                <span class="chain-step__reason-label">决策理由</span>
+                {{ step.reason }}
+              </span>
+            </button>
+          </div>
+        </li>
+      </ol>
+      <div v-else class="chain-empty">无研究动作记录</div>
+    </section>
+
+    <section class="chain-section">
+      <div class="chain-label">每轮检索</div>
+      <div v-if="researchRounds.length" class="chain-rounds">
+        <div
+          v-for="round in researchRounds"
+          :key="round.key"
+          class="chain-round"
+          :class="{ 'chain-round--open': openRounds.has(round.key) }"
+        >
+          <button
+            type="button"
+            class="chain-round__head"
+            :aria-expanded="openRounds.has(round.key)"
+            @click="toggleRound(round.key)"
+          >
+            <span class="chain-round__titles">
+              <span class="chain-round__title">{{ round.title }}</span>
+              <span class="chain-round__subtitle" :title="round.subtitle">{{ round.subtitle }}</span>
+            </span>
+            <span class="chain-chevron" aria-hidden="true" />
+          </button>
+          <dl v-if="openRounds.has(round.key)" class="chain-stages">
+            <template v-for="stage in round.stages" :key="stage.key">
+              <template v-if="stage.key === 'final-context' && parseContextLines(stage.content).some(line => line.head)">
+                <dt class="chain-stages__wide">{{ stage.title }}</dt>
+                <dd class="chain-stages__wide">
+                  <ol class="chain-context">
+                    <li v-for="(line, index) in parseContextLines(stage.content)" :key="index">
+                      <span v-if="line.head" class="chain-context__head">{{ line.head }}</span>
+                      <span class="chain-context__text">{{ line.text }}</span>
+                    </li>
+                  </ol>
+                </dd>
+              </template>
+              <template v-else>
+                <dt>{{ stage.title }}</dt>
+                <dd v-if="stage.content.includes(' | ')">
+                  <ul class="chain-queries">
+                    <li v-for="query in stage.content.split(' | ')" :key="query">{{ query }}</li>
+                  </ul>
+                </dd>
+                <dd v-else>{{ stage.content }}</dd>
+              </template>
+            </template>
+          </dl>
+        </div>
+      </div>
+      <div v-else class="chain-empty">本次研究没有执行检索</div>
+    </section>
+  </div>
+
+  <div v-else class="chain">
+    <div class="chain-question">
+      <span class="chain-label">原始问题</span>
+      <p>{{ retrievalDebug?.original_query || question || '无' }}</p>
+    </div>
+    <dl class="chain-stages chain-stages--flat">
+      <template v-for="step in steps" :key="step.key">
+        <dt>{{ step.title }}</dt>
+        <dd>{{ step.content }}</dd>
+      </template>
+    </dl>
+  </div>
 </template>
 
 <style scoped>
-.rag-thought-chain {
-  padding: 6px 4px 0;
+.chain {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
 }
 
-.rag-thought-chain__title {
+.chain-label {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.chain-question p {
+  margin: 6px 0 0;
   color: #0f172a;
-  font-size: 14px;
-  font-weight: 700;
-  margin-bottom: 6px;
+  font-size: 13.5px;
+  line-height: 1.65;
 }
 
-.rag-thought-chain__content {
+.chain-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: #f8fafc;
+  border: 1px solid #eef2f7;
+}
+
+.chain-summary__outcome {
+  align-self: flex-start;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: #e2e8f0;
+  color: #334155;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.chain-summary__outcome--completed {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.chain-summary__outcome--partial {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.chain-summary__outcome--abstained {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.chain-summary__stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.chain-summary__stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chain-summary__stat strong {
+  color: #0f172a;
+  font-size: 16px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.chain-summary__stat span {
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.chain-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.chain-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chain-step {
+  --tone: #3b82f6;
+  position: relative;
+  display: flex;
+  gap: 12px;
+  padding-bottom: 14px;
+}
+
+.chain-step::before {
+  content: '';
+  position: absolute;
+  top: 14px;
+  bottom: -2px;
+  left: 4px;
+  width: 1px;
+  background: #e2e8f0;
+}
+
+.chain-step:last-child {
+  padding-bottom: 0;
+}
+
+.chain-step:last-child::before {
+  display: none;
+}
+
+.chain-step--slate { --tone: #94a3b8; }
+.chain-step--violet { --tone: #8b5cf6; }
+.chain-step--green { --tone: #22c55e; }
+.chain-step--amber { --tone: #f59e0b; }
+.chain-step--red { --tone: #ef4444; }
+
+.chain-step__dot {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--tone);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--tone) 18%, transparent);
+}
+
+.chain-step__body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+
+.chain-step__title {
+  color: #0f172a;
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.chain-step__facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chain-chip {
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: #f1f5f9;
   color: #475569;
-  font-size: 13px;
-  line-height: 1.7;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.chain-step__reason {
+  padding: 8px 10px;
+  border: 0;
+  border-left: 2px solid #e2e8f0;
+  border-radius: 0 8px 8px 0;
+  background: #f8fafc;
+  color: #64748b;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.65;
+  text-align: left;
+}
+
+/* 行数截断放在内层：外层的内边距会让第四行露出半截。 */
+.chain-step__reason-text {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.chain-step__reason:hover {
+  border-left-color: #cbd5e1;
+  color: #475569;
+}
+
+.chain-step__reason--open .chain-step__reason-text {
+  display: block;
+}
+
+.chain-step__reason-label {
+  margin-right: 6px;
+  color: #334155;
+  font-weight: 600;
+}
+
+.chain-rounds {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chain-round {
+  border: 1px solid #e8edf4;
+  border-radius: 14px;
+  background: #fff;
+}
+
+.chain-round__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 11px 14px;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+}
+
+.chain-round__titles {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.chain-round__title {
+  color: #0f172a;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.chain-round__subtitle {
+  display: -webkit-box;
+  overflow: hidden;
+  color: #94a3b8;
+  font-size: 12px;
+  line-height: 1.55;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.chain-queries {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chain-queries li {
+  position: relative;
+  padding-left: 12px;
+}
+
+.chain-queries li::before {
+  content: '';
+  position: absolute;
+  top: 0.75em;
+  left: 2px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #cbd5e1;
+}
+
+.chain-chevron {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin: 0 4px;
+  border-right: 1.5px solid #94a3b8;
+  border-bottom: 1.5px solid #94a3b8;
+  transform: rotate(-45deg);
+  transition: transform 0.2s;
+}
+
+.chain-round--open .chain-chevron {
+  transform: rotate(45deg);
+}
+
+.chain-stages {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 8px 12px;
+  margin: 0;
+  padding: 12px 14px 14px;
+  border-top: 1px solid #f1f5f9;
+}
+
+.chain-stages--flat {
+  padding: 0;
+  border-top: 0;
+}
+
+.chain-stages dt {
+  color: #94a3b8;
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.chain-stages dd {
+  margin: 0;
+  color: #334155;
+  font-size: 12.5px;
+  line-height: 1.65;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.chain-stages__wide {
+  grid-column: 1 / -1;
+}
+
+.chain-context {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chain-context li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.chain-context__head {
+  color: #64748b;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
+.chain-context__text {
+  overflow: hidden;
+  color: #334155;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chain-empty {
+  color: #94a3b8;
+  font-size: 13px;
 }
 </style>

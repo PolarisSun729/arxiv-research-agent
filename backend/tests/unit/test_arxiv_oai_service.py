@@ -1,9 +1,10 @@
 import importlib.util
 import json
+import sqlite3
 import sys
 import types
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -50,6 +51,7 @@ try:
         OAI_INDEX_REBUILD_BATCH_SIZE,
         OAI_INDEX_REBUILD_STALE_SECONDS,
         ArxivOaiDatabaseService,
+        ArxivOaiSyncService,
     )
 finally:
     # 轻量桩只服务本模块导入；恢复公共模块，避免 pytest 混跑时污染后续真实服务测试。
@@ -167,6 +169,37 @@ def test_local_search_uses_fts_token_matching_without_substring_false_positive()
     assert result["query_capability"]["full_arxiv_syntax_supported"] is False
 
 
+def test_local_relevance_sort_ranks_title_hits_above_newer_abstract_mentions() -> None:
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    service.upsert_arxiv_oai_papers(
+        [
+            _paper(
+                "2401.00011",
+                title="Scaling Laws for Vision Transformers",
+                abstract="We briefly compare with retrieval-augmented generation baselines.",
+                categories=["cs.CV"],
+                updated="2024-03-01",
+            ),
+            _paper(
+                "2401.00012",
+                title="Retrieval-Augmented Generation with Graph Memory",
+                abstract="A RAG system with graph memory.",
+                categories=["cs.CL"],
+                updated="2024-01-15",
+            ),
+        ]
+    )
+
+    by_relevance = service.search(search_query='all:"retrieval augmented generation"', max_results=1, sort_by="relevance")
+    by_date = service.search(search_query='all:"retrieval augmented generation"', max_results=1, sort_by="submittedDate")
+
+    # relevance 不能只是“最新的 N 篇”：标题命中的论文应排在只在摘要里顺带提到的新论文前面。
+    assert [paper["arxiv_id"] for paper in by_relevance["papers"]] == ["2401.00012"]
+    assert [paper["arxiv_id"] for paper in by_date["papers"]] == ["2401.00011"]
+    assert by_relevance["total_results"] == 2
+
+
 def test_local_search_respects_phrase_quotes_and_does_not_split_boolean_inside_phrase() -> None:
     service = _make_temp_service()
     _skip_if_fts5_unavailable(service)
@@ -222,6 +255,128 @@ def test_recent_papers_filters_categories_with_mapping_table() -> None:
     papers = service.get_recent_papers(categories=["cs.CL"], max_age_months=120, max_results=10)
 
     assert [paper["arxiv_id"] for paper in papers] == ["2401.00007"]
+
+
+def test_initialize_database_enables_wal_so_reads_are_not_blocked_by_writer() -> None:
+    service = _make_temp_service()
+    service.upsert_arxiv_oai_papers(
+        [_paper("2401.00050", title="Committed Paper", abstract="RAG", categories=["cs.CL"])]
+    )
+    writer = service._get_connection()
+    try:
+        assert writer.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        # delete 模式下 EXCLUSIVE 写事务会挡住所有读；WAL 下读请求照常拿到已提交的数据。
+        writer.execute("BEGIN EXCLUSIVE")
+        writer.execute(
+            "INSERT INTO arxiv_oai_papers (arxiv_id, title) VALUES (?, ?)",
+            ("2401.00051", "Uncommitted Paper"),
+        )
+
+        assert service.get_total_paper_count() == 1
+    finally:
+        writer.rollback()
+        writer.close()
+
+
+def test_total_paper_count_returns_none_instead_of_zero_when_read_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _make_temp_service()
+
+    def locked_connection():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(service, "_get_connection", locked_connection)
+
+    # 读不到不等于库是空的；返回 0 会让首页误显示“论文库总量 0”。
+    assert service.get_total_paper_count() is None
+
+
+def _index_rows(service: ArxivOaiDatabaseService, arxiv_id: str) -> tuple[list[tuple], list[str]]:
+    with service._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT abstract FROM arxiv_oai_papers_fts WHERE arxiv_id = ?", (arxiv_id,))
+        fts_rows = cursor.fetchall()
+        cursor.execute(
+            "SELECT category FROM arxiv_oai_paper_categories WHERE arxiv_id = ? ORDER BY category",
+            (arxiv_id,),
+        )
+        categories = [row[0] for row in cursor.fetchall()]
+    return fts_rows, categories
+
+
+def test_upsert_existing_paper_replaces_index_rows_without_stale_text() -> None:
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    assert service.upsert_arxiv_oai_papers(
+        [_paper("2401.00020", title="Versioned Paper", abstract="alpha method", categories=["cs.CL"])]
+    ) == 1
+    assert service.upsert_arxiv_oai_papers(
+        [_paper("2401.00020", title="Versioned Paper", abstract="beta method", categories=["cs.LG"])]
+    ) == 1
+
+    fts_rows, categories = _index_rows(service, "2401.00020")
+
+    # FTS 表没有唯一约束，更新必须先删旧行；否则旧摘要会残留并继续被搜到。
+    assert fts_rows == [("beta method",)]
+    assert categories == ["cs.LG"]
+    assert service.search(search_query="abs:alpha", max_results=10)["papers"] == []
+    assert [p["arxiv_id"] for p in service.search(search_query="abs:beta", max_results=10)["papers"]] == ["2401.00020"]
+
+
+def test_upsert_batch_with_duplicate_ids_keeps_last_version_only() -> None:
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    service.upsert_arxiv_oai_papers(
+        [
+            _paper("2401.00021", title="Dup Paper", abstract="first version", categories=["cs.CL"]),
+            _paper("2401.00021", title="Dup Paper", abstract="second version", categories=["cs.AI"]),
+        ]
+    )
+
+    fts_rows, categories = _index_rows(service, "2401.00021")
+
+    assert fts_rows == [("second version",)]
+    assert categories == ["cs.AI"]
+
+
+def test_upsert_batch_across_delete_chunks_keeps_single_index_row_per_paper(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    monkeypatch.setattr(sys.modules[ArxivOaiDatabaseService.__module__], "OAI_INDEX_DELETE_CHUNK_SIZE", 2)
+    papers = [
+        _paper(f"2401.{index:05d}", title=f"Chunk Paper {index}", abstract="RAG", categories=["cs.CL"])
+        for index in range(30, 35)
+    ]
+    assert service.upsert_arxiv_oai_papers(papers) == 5
+    assert service.upsert_arxiv_oai_papers(papers) == 5
+
+    for paper in papers:
+        fts_rows, categories = _index_rows(service, paper["arxiv_id"])
+        assert len(fts_rows) == 1
+        assert categories == ["cs.CL"]
+
+
+def test_upsert_batch_deletes_fts_rows_once_per_chunk_not_per_paper(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _make_temp_service()
+    _skip_if_fts5_unavailable(service)
+    monkeypatch.setattr(sys.modules[ArxivOaiDatabaseService.__module__], "OAI_INDEX_DELETE_CHUNK_SIZE", 2)
+    papers = [
+        _paper(f"2401.{index:05d}", title=f"Trace Paper {index}", abstract="RAG", categories=["cs.CL"])
+        for index in range(40, 45)
+    ]
+    statements: list[str] = []
+    original_get_connection = service._get_connection
+
+    def traced_connection():
+        conn = original_get_connection()
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(service, "_get_connection", traced_connection)
+    assert service.upsert_arxiv_oai_papers(papers) == 5
+
+    fts_deletes = [sql for sql in statements if sql.lstrip().startswith("DELETE FROM arxiv_oai_papers_fts")]
+    # arxiv_id 在 FTS 里是 UNINDEXED 列，每条 DELETE 都是一次全表扫描；5 篇、每块 2 个 → 3 次，而不是 5 次。
+    assert len(fts_deletes) == 3
 
 
 def test_rebuild_oai_search_index_rehydrates_mapping_and_fts() -> None:
@@ -292,7 +447,7 @@ def test_rebuild_oai_search_index_resumes_failed_checkpoint() -> None:
         cursor.execute("DELETE FROM arxiv_oai_paper_categories")
         cursor.execute("DELETE FROM arxiv_oai_papers_fts")
         first_batch = service._fetch_rebuild_batch(cursor, last_arxiv_id=None, batch_size=batch_size)
-        service._insert_rebuild_search_index_batch(cursor, first_batch, fts5_available=True)
+        service._insert_search_index_rows(cursor, first_batch, fts5_available=True)
         last_arxiv_id = first_batch[-1]["arxiv_id"]
         now = service._now_iso()
         service._replace_search_rebuild_state(
@@ -475,3 +630,50 @@ def test_local_text_search_fails_when_text_index_rows_are_missing() -> None:
     assert getattr(exc_info.value, "status_code", None) == 503
     assert exc_info.value.query_capability["unsupported_reason"] == "text_index_missing"
     assert exc_info.value.query_capability["search_index_status"] == "text_index_missing"
+
+
+def _oai_error_page(code: str, message: str) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">'
+        '<responseDate>2026-10-12T00:00:00Z</responseDate>'
+        f'<request verb="ListRecords">https://oaipmh.arxiv.org/oai</request>'
+        f'<error code="{code}">{message}</error>'
+        "</OAI-PMH>"
+    )
+
+
+def test_sync_treats_no_records_match_as_empty_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 周末等日期没有任何 OAI 记录时，arXiv 返回 noRecordsMatch；这是“区间为空”，不是同步失败。
+    service = ArxivOaiSyncService()
+    page = _oai_error_page(
+        "noRecordsMatch",
+        "The combination of the values of the from, until, set and metadataPrefix arguments results in an empty list.",
+    )
+    monkeypatch.setattr(service, "_fetch_page", lambda params, stats: page)
+
+    stats = service.sync("2026-10-10", "2026-10-10")
+
+    assert stats.errors == 0
+    assert stats.records_written == 0
+    assert stats.pages_processed == 0
+
+
+def test_sync_still_counts_other_oai_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = ArxivOaiSyncService()
+    monkeypatch.setattr(service, "_fetch_page", lambda params, stats: _oai_error_page("badArgument", "Illegal date"))
+
+    stats = service.sync("2026-10-10", "2026-10-10")
+
+    assert stats.errors == 1
+
+
+def test_get_latest_oai_datestamp_returns_max_date_or_none() -> None:
+    service = _make_temp_service()
+    assert service.get_latest_oai_datestamp() is None
+
+    older = _paper("2609.00001", title="Older", abstract="a", categories=["cs.CL"], created="2026-09-09")
+    newer = _paper("2609.00002", title="Newer", abstract="b", categories=["cs.CL"], created="2026-09-11")
+    assert service.upsert_arxiv_oai_papers([older, newer]) == 2
+
+    assert service.get_latest_oai_datestamp() == date(2026, 9, 11)

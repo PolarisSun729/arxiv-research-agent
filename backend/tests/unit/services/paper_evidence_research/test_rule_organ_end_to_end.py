@@ -147,4 +147,7 @@ def test_factory_llm_failure_degrades_and_still_completes() -> None:
     result = service.research(_request())
     assert result.outcome == "completed"
     assert ledger.events, "LLM 全程失败必须留下降级事件"
-    assert {event.organ for event in ledger.events} <= {"question_analyzer", "decision_policy"}
+    organs = {event.organ for event in ledger.events}
+    assert organs <= {"question_analyzer", "decision_policy", "claim_extractor"}
+    # 主张提取 LLM 连续失败后降级到规则切句，仍能走到 completed。
+    assert "claim_extractor" in organs

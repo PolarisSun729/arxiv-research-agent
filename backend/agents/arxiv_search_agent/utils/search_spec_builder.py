@@ -14,7 +14,8 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from ..schemas import ArxivSearchSpec, get_default_agent_arxiv_categories
+from ..schemas import ArxivSearchSpec, SearchConcept, get_default_agent_arxiv_categories, get_valid_arxiv_categories
+from .search_ladder import text_tokens
 from .text_utils import _normalize_optional_str, _normalize_text, _parse_small_chinese_number
 from ..intent_definitions import PARSE_SUPPORTED_INTENTS
 
@@ -178,9 +179,13 @@ def _normalize_and_validate_spec(payload: Mapping[str, Any]) -> Optional[ArxivSe
     if intent not in SUPPORTED_INTENTS or intent != "arxiv_search":
         return None
 
+    concepts = _concepts_from_payload(payload.get("concepts"))
+    legacy_query = _normalize_optional_str(payload.get("query"))
     return ArxivSearchSpec(
         intent="arxiv_search",
-        query=_normalize_optional_str(payload.get("query")),
+        concepts=concepts,
+        optional_terms=_string_list(payload.get("optional_terms")),
+        query=" ".join(concept.term for concept in concepts) if concepts else legacy_query,
         title_query=_normalize_optional_str(payload.get("title_query")),
         abstract_query=_normalize_optional_str(payload.get("abstract_query")),
         categories=get_default_agent_arxiv_categories(),
@@ -218,19 +223,21 @@ def _post_process_cleaned_spec(
     """
     warnings: List[str] = []
 
-    normalized_query = _normalize_topic_phrase(cleaned_topic_en or "") if cleaned_topic_en else None
-    if not normalized_query:
-        normalized_query = _normalize_topic_phrase(cleaned_topic_cn or "") if cleaned_topic_cn else None
-    if not normalized_query:
-        normalized_query = _normalize_topic_phrase(spec.query) if spec.query else None
-    if not normalized_query:
-        normalized_query = _extract_query_from_message(message)
-    if normalized_query:
-        if spec.query and normalized_query != spec.query:
-            warnings.append(f'LLM 输出的 query 已重新清洗: "{spec.query}" -> "{normalized_query}"')
-        spec.query = normalized_query
-    elif spec.query:
-        warnings.append(f'LLM 输出的 query 未能抽取出稳定主题: "{spec.query}"，将继续依赖后续规则兜底')
+    # 结构化概念已经是主题的唯一来源，query 只是其摘要，不再用 cleaned_topic_* 改写。
+    if not spec.concepts:
+        normalized_query = _normalize_topic_phrase(cleaned_topic_en or "") if cleaned_topic_en else None
+        if not normalized_query:
+            normalized_query = _normalize_topic_phrase(cleaned_topic_cn or "") if cleaned_topic_cn else None
+        if not normalized_query:
+            normalized_query = _normalize_topic_phrase(spec.query) if spec.query else None
+        if not normalized_query:
+            normalized_query = _extract_query_from_message(message)
+        if normalized_query:
+            if spec.query and normalized_query != spec.query:
+                warnings.append(f'LLM 输出的 query 已重新清洗: "{spec.query}" -> "{normalized_query}"')
+            spec.query = normalized_query
+        elif spec.query:
+            warnings.append(f'LLM 输出的 query 未能抽取出稳定主题: "{spec.query}"，将继续依赖后续规则兜底')
 
     if spec.query and spec.abstract_query and not _user_mentioned_abstract(message):
         warnings.append(f'用户未明确要求摘要搜索，已自动清空 abstract_query (原值: "{spec.abstract_query}")')
@@ -293,6 +300,9 @@ def _apply_rule_enrichment(message: str, spec: ArxivSearchSpec) -> Optional[Arxi
 
     return ArxivSearchSpec(
         intent="arxiv_search",
+        concepts=list(spec.concepts or []),
+        optional_terms=list(spec.optional_terms or []),
+        constraint_sources=dict(spec.constraint_sources or {}),
         query=query,
         title_query=title_query,
         abstract_query=abstract_query,
@@ -473,7 +483,227 @@ def _is_topic_token(token: str) -> bool:
     return True
 
 
+_CJK_PATTERN = re.compile(r"[一-鿿]")
+_PROFILE_TOPIC_KEYS = ("positive_topics", "recent_topics", "negative_topics")
+
+
+def _string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    items = [value] if isinstance(value, str) else list(value) if isinstance(value, (list, tuple, set)) else []
+    return [text for text in (_normalize_text(str(item or "")) for item in items) if text]
+
+
+def _concepts_from_payload(value: Any) -> List[SearchConcept]:
+    """把 LLM 的 concepts 载荷转成 SearchConcept；单个字符串也按一个概念处理。"""
+    if value is None:
+        return []
+    items = [value] if isinstance(value, (str, Mapping)) else list(value) if isinstance(value, (list, tuple)) else []
+    concepts: List[SearchConcept] = []
+    for item in items:
+        if isinstance(item, str):
+            term, aliases = item, []
+        elif isinstance(item, Mapping):
+            term, aliases = item.get("term"), item.get("aliases")
+        else:
+            continue
+        term_text = _normalize_text(str(term or ""))
+        if term_text:
+            concepts.append(SearchConcept(term=term_text, aliases=aliases or [], source="user"))
+    return concepts
+
+
+def _profile_topics(research_profile: Optional[Mapping[str, Any]]) -> List[str]:
+    if not isinstance(research_profile, Mapping):
+        return []
+    topics: List[str] = []
+    for key in _PROFILE_TOPIC_KEYS:
+        topics.extend(_string_list(research_profile.get(key)))
+    return _dedupe_preserve_order(topics)
+
+
+def _evidence_in_message(evidence: str, message: str) -> bool:
+    compact = lambda text: re.sub(r"\s+", "", text).lower()  # noqa: E731
+    return bool(evidence) and compact(evidence) in compact(message)
+
+
+def _strip_profile_tokens(text: str, allowed_tokens: set[str], profile_tokens: set[str]) -> str:
+    """去掉“用户没说过、但出现在画像主题里”的英文 token，其余写法（复数、连字符等）保留。"""
+    kept = [
+        token
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9+\-_/\.]*", text)
+        if not (set(text_tokens(token)) - allowed_tokens) or not (set(text_tokens(token)) & profile_tokens)
+    ]
+    return " ".join(kept)
+
+
+def _looks_like_profile_topic(text: str, profile_topics: Sequence[str]) -> bool:
+    tokens = set(text_tokens(text))
+    if len(tokens) < 2:
+        return False
+    for topic in profile_topics:
+        topic_tokens = set(text_tokens(topic))
+        if len(topic_tokens) >= 2 and (tokens <= topic_tokens or topic_tokens <= tokens):
+            return True
+    return False
+
+
+def _ground_concepts(
+    raw_concepts: Any,
+    fallback_concepts: Sequence[SearchConcept],
+    message: str,
+    profile_topics: Sequence[str],
+) -> Tuple[List[SearchConcept], List[str]]:
+    """只保留能在用户原话里找到依据的概念，防止画像主题混进检索条件。
+
+    规则：
+    - evidence（LLM 标注的原话片段）含中文时，信任其英文翻译；
+    - evidence 是英文时，term 里“原话没有、画像里有”的 token 会被剥掉；
+    - 没有可信 evidence 且 term 带画像独有词时，整个概念丢弃；
+    - 同义写法若本身就是一条画像主题，也丢弃，避免借 OR 把画像带回来。
+    """
+    warnings: List[str] = []
+    message_tokens = set(text_tokens(message))
+    profile_tokens = {token for topic in profile_topics for token in text_tokens(topic)}
+    raw_items = list(raw_concepts) if isinstance(raw_concepts, (list, tuple)) else []
+    evidence_by_term = {
+        _normalize_text(str(item.get("term") or "")).lower(): _normalize_text(str(item.get("evidence") or ""))
+        for item in raw_items
+        if isinstance(item, Mapping)
+    }
+
+    grounded: List[SearchConcept] = []
+    for concept in fallback_concepts:
+        term = concept.term
+        evidence = evidence_by_term.get(term.lower(), "")
+        aliases = [alias for alias in concept.aliases if not _looks_like_profile_topic(alias, profile_topics) or set(text_tokens(alias)) <= message_tokens]
+        term_tokens = set(text_tokens(term))
+        foreign_profile_tokens = (term_tokens - message_tokens) & profile_tokens
+        if foreign_profile_tokens:
+            evidence_ok = _evidence_in_message(evidence, message)
+            if evidence_ok and _CJK_PATTERN.search(evidence):
+                pass
+            elif evidence_ok:
+                allowed = message_tokens | set(text_tokens(evidence))
+                stripped = _strip_profile_tokens(term, allowed, profile_tokens)
+                if stripped and text_tokens(stripped):
+                    warnings.append(f'检索概念 "{term}" 中有用户未提及的画像词，已收敛为 "{stripped}"')
+                    term = stripped
+                else:
+                    warnings.append(f'检索概念 "{term}" 无法在用户原话中找到依据，已改用原话 "{evidence}"')
+                    term = evidence
+            else:
+                warnings.append(f'检索概念 "{term}" 来自画像而非用户原话，已丢弃')
+                continue
+        grounded.append(SearchConcept(term=term, aliases=[alias for alias in aliases if alias.lower() != term.lower()], source="user"))
+    return grounded, warnings
+
+
+def _ground_optional_terms(terms: Sequence[str], message: str, profile_topics: Sequence[str]) -> Tuple[List[str], List[str]]:
+    warnings: List[str] = []
+    message_tokens = set(text_tokens(message))
+    profile_tokens = {token for topic in profile_topics for token in text_tokens(topic)}
+    has_cjk = bool(_CJK_PATTERN.search(message))
+    kept: List[str] = []
+    for term in terms:
+        term_tokens = set(text_tokens(term))
+        foreign = (term_tokens - message_tokens) & profile_tokens
+        # 中文原话的翻译天然对不上英文 token，只在补充词整体就是画像主题时丢弃。
+        dropped = _looks_like_profile_topic(term, profile_topics) if has_cjk else bool(foreign)
+        if dropped and not term_tokens <= message_tokens:
+            warnings.append(f'补充检索词 "{term}" 来自画像而非用户原话，已丢弃')
+            continue
+        kept.append(term)
+    return kept, warnings
+
+
+def _extract_explicit_categories(message: str) -> List[str]:
+    """识别用户直接写出的 arXiv 分类代码，例如 cs.CL、stat.ML。"""
+    valid = {category.lower(): category for category in get_valid_arxiv_categories()}
+    found: List[str] = []
+    for candidate in re.findall(r"\b[a-zA-Z\-]+\.[a-zA-Z\-]+\b", message):
+        canonical = valid.get(candidate.lower())
+        if canonical and canonical not in found:
+            found.append(canonical)
+    return found
+
+
+def _ground_search_spec(
+    spec: ArxivSearchSpec,
+    message: str,
+    *,
+    raw_payload: Optional[Mapping[str, Any]] = None,
+    research_profile: Optional[Mapping[str, Any]] = None,
+) -> Tuple[ArxivSearchSpec, List[str]]:
+    """parse 阶段的最后一道收口：主题落地到用户原话，并标注每个约束的来源。
+
+    - concepts 只保留有原话依据的部分；全被剔除时回退到规则抽取的主题；
+    - 用户完全没给主题时才用画像补一个 source=profile 的概念，回答里会说明；
+    - 时间、数量、排序、分类按“原话里能否直接读出来”标注 user / inferred / default。
+    """
+    warnings: List[str] = []
+    profile_topics = _profile_topics(research_profile)
+    payload = raw_payload if isinstance(raw_payload, Mapping) else {}
+
+    # 旧格式只给 query 时同样要过一遍原话校验，否则画像词会从 query 这条路混进来。
+    candidate_concepts = list(spec.concepts or []) or (
+        [SearchConcept(term=spec.query, source="user")] if spec.query and text_tokens(spec.query) else []
+    )
+    concepts, concept_warnings = _ground_concepts(payload.get("concepts"), candidate_concepts, message, profile_topics)
+    warnings.extend(concept_warnings)
+    optional_terms, optional_warnings = _ground_optional_terms(list(spec.optional_terms or []), message, profile_topics)
+    warnings.extend(optional_warnings)
+
+    if not concepts:
+        rule_query = _extract_query_from_message(message)
+        if rule_query and text_tokens(rule_query):
+            concepts = [SearchConcept(term=rule_query, source="user")]
+        elif not rule_query and not spec.title_query and not spec.abstract_query and profile_topics:
+            concepts = [SearchConcept(term=profile_topics[0], source="profile")]
+            warnings.append(f'用户未给出检索主题，已按研究画像补全为 "{profile_topics[0]}"')
+
+    sources: dict[str, str] = {}
+    explicit_categories = _extract_explicit_categories(message)
+    categories = explicit_categories or list(spec.categories or [])
+    sources["categories"] = "user" if explicit_categories else "default"
+
+    rule_days = _extract_submitted_days_ago(message)
+    submitted_days_ago = rule_days if rule_days is not None else spec.submitted_days_ago
+    if submitted_days_ago is not None:
+        sources["submitted_days_ago"] = "user" if rule_days is not None else "inferred"
+
+    count_stated = any(re.search(pattern, message, flags=re.IGNORECASE) for pattern in COUNT_PATTERNS)
+    max_results = _extract_max_results(message) if count_stated else spec.max_results
+    sources["max_results"] = "user" if count_stated else "default"
+
+    # 排序以原话为准：只有用户说“最新/最相关”才算明确要求，否则默认按相关性。
+    sort_by, sort_order = _extract_sorting(message)
+    lowered = message.lower()
+    sort_stated = any(keyword in lowered for keyword in ("最相关", "相关度高", "most relevant", "relevance", "最新", "latest", "newest"))
+    sources["sort_by"] = "user" if sort_stated else "default"
+
+    grounded = ArxivSearchSpec(
+        intent="arxiv_search",
+        concepts=concepts,
+        optional_terms=optional_terms,
+        constraint_sources=sources,
+        query=" ".join(concept.term for concept in concepts) if concepts else spec.query,
+        title_query=spec.title_query,
+        abstract_query=spec.abstract_query,
+        categories=categories,
+        submitted_days_ago=submitted_days_ago,
+        max_results=max_results,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        field_operator=spec.field_operator,
+        category_operator=spec.category_operator,
+        reasoning_summary=spec.reasoning_summary,
+    )
+    return grounded, _dedupe_preserve_order(warnings)
+
+
 __all__ = [
+    "_ground_search_spec",
     "ABSTRACT_HINT_PATTERNS",
     "QUERY_HINT_PATTERNS",
     "TITLE_HINT_PATTERNS",

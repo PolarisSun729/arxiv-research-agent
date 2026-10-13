@@ -146,6 +146,45 @@ class ArxivSearchRequest(BaseModel):
         return self
 
 
+SearchConstraintSource = Literal["user", "inferred", "default", "profile"]
+
+
+class SearchConcept(BaseModel):
+    """一个必须命中的检索概念：主术语与同义写法之间是 OR，概念之间是 AND。
+
+    source 区分概念来源：user 表示来自用户原话（可能是翻译或缩写展开），
+    profile 只在用户完全没给主题时由画像补全，回答里需要向用户说明。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    term: str
+    aliases: List[str] = Field(default_factory=list)
+    source: Literal["user", "profile"] = "user"
+
+    @field_validator("term", mode="before")
+    @classmethod
+    def _normalize_term(cls, value: Any) -> str:
+        text = " ".join(str(value or "").split())
+        if not text:
+            raise ValueError("concept term cannot be empty")
+        return text
+
+    @field_validator("aliases", mode="before")
+    @classmethod
+    def _normalize_aliases(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        items = [value] if isinstance(value, str) else list(value) if isinstance(value, (list, tuple, set)) else []
+        aliases: List[str] = []
+        seen: Set[str] = set()
+        for item in items:
+            text = " ".join(str(item or "").split())
+            if text and text.lower() not in seen:
+                seen.add(text.lower())
+                aliases.append(text)
+        return aliases[:4]
+
+
 class ArxivSearchSpec(BaseModel):
     """定义一次 arXiv 结构化搜索的标准规格。
 
@@ -158,10 +197,19 @@ class ArxivSearchSpec(BaseModel):
     - 搜索范围在哪些分类中执行；
     - 时间范围、返回条数、排序方式是什么；
     - 以及一份面向调试/解释的 reasoning_summary。
+
+    concepts / optional_terms / constraint_sources 是阶梯检索的输入：
+    concepts 必须命中，optional_terms 可在结果不足时放宽；constraint_sources 记录
+    categories / submitted_days_ago / max_results / sort_by 是用户明确给出（user）
+    还是系统推断（inferred/default），用户明确给出的约束不会被自动放宽。
+    query 保留为 concepts 的可读摘要，兼容旧调用方。
     """
     model_config = ConfigDict(extra="forbid")
 
     intent: Literal["arxiv_search"]
+    concepts: List[SearchConcept] = Field(default_factory=list)
+    optional_terms: List[str] = Field(default_factory=list)
+    constraint_sources: Dict[str, SearchConstraintSource] = Field(default_factory=dict)
     query: Optional[str] = None
     title_query: Optional[str] = None
     abstract_query: Optional[str] = None
@@ -182,6 +230,21 @@ class ArxivSearchSpec(BaseModel):
             return None
         text = str(value).strip()
         return text or None
+
+    @field_validator("optional_terms", mode="before")
+    @classmethod
+    def _normalize_optional_terms(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        items = [value] if isinstance(value, str) else list(value) if isinstance(value, (list, tuple, set)) else []
+        terms: List[str] = []
+        seen: Set[str] = set()
+        for item in items:
+            text = " ".join(str(item or "").split())
+            if text and text.lower() not in seen:
+                seen.add(text.lower())
+                terms.append(text)
+        return terms[:4]
 
     @field_validator("categories", mode="before")
     @classmethod
@@ -287,6 +350,8 @@ class ArxivSearchSpec(BaseModel):
     @model_validator(mode="after")
     def _validate_search_fields(self) -> "ArxivSearchSpec":
         # 至少要有一个真实可用的检索入口，不能既没有 query，也没有 title/abstract/category 约束。
+        if not self.query and self.concepts:
+            self.query = " ".join(concept.term for concept in self.concepts)
         if not any([self.query, self.title_query, self.abstract_query, self.categories]):
             raise ValueError("at least one search field or category must be provided")
         return self

@@ -96,8 +96,9 @@ def test_qwen_image_input_skips_image_when_request_budget_would_be_exceeded(monk
     assert debug["images"][0]["fallback_to_asset_summary"] is True
 
 
-def test_qwen_image_input_sends_at_most_two_images(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_qwen_image_input_respects_max_image_count(monkeypatch: pytest.MonkeyPatch) -> None:
     service = GenerationService()
+    monkeypatch.setattr(generation_module, "QWEN_RESPONSES_MAX_IMAGE_COUNT", 2)
 
     def fake_prepare(image_path: str, *, target_bytes: int) -> dict[str, object]:
         return {
@@ -127,3 +128,100 @@ def test_qwen_image_input_sends_at_most_two_images(monkeypatch: pytest.MonkeyPat
     assert debug["sent_image_count"] == 2
     assert debug["dropped_image_count"] == 1
     assert debug["images"][2]["skip_reason"] == "max_image_count_exceeded"
+
+
+def test_image_limits_come_from_generation_config() -> None:
+    from utils.config import GENERATION_CONFIG
+
+    assert generation_module.QWEN_RESPONSES_MAX_IMAGE_COUNT == GENERATION_CONFIG["qwen_responses_max_image_count"]
+    assert generation_module.QWEN_RESPONSES_REQUEST_BODY_SOFT_LIMIT_BYTES == GENERATION_CONFIG[
+        "qwen_responses_request_body_soft_limit_bytes"
+    ]
+    # 图多时单图预算变小，压缩档位要有足够小的尺寸兜底。
+    assert generation_module.QWEN_RESPONSES_IMAGE_COMPRESSION_STEPS[-1] == (640, 55)
+
+
+def test_image_target_bytes_adapt_to_the_number_of_images(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = GenerationService()
+    targets: list[int] = []
+
+    def fake_prepare(image_path: str, *, target_bytes: int) -> dict[str, object]:
+        targets.append(target_bytes)
+        return {"data_url": "data:image/jpeg;base64,AA", "debug": {}}
+
+    monkeypatch.setattr(service, "_prepare_qwen_image_data_url", fake_prepare)
+    monkeypatch.setattr(generation_module, "QWEN_RESPONSES_MAX_IMAGE_COUNT", 30)
+    monkeypatch.setattr(generation_module, "QWEN_RESPONSES_REQUEST_BODY_SOFT_LIMIT_BYTES", 5_500_000)
+
+    service._build_qwen_input_with_debug(
+        query="q", context="c", image_inputs=[{"source_id": "only", "image_path": "one.png"}]
+    )
+    assert targets == [QWEN_RESPONSES_IMAGE_TARGET_BYTES]
+
+    targets.clear()
+    service._build_qwen_input_with_debug(
+        query="q",
+        context="c",
+        image_inputs=[{"source_id": f"figure-{index}", "image_path": f"{index}.png"} for index in range(20)],
+    )
+    # 第一张图按 20 张平分约 5.5MB 请求体，base64 膨胀后单图原始字节约 200KB，远小于单图上限；
+    # 前面的图实际用得少，省下的预算顺延给后面的图，单图目标只增不减、且不超过单图上限。
+    assert len(targets) == 20
+    assert 150_000 < targets[0] < 250_000
+    assert targets == sorted(targets)
+    assert targets[-1] <= QWEN_RESPONSES_IMAGE_TARGET_BYTES
+
+
+def test_complete_with_qwen_attaches_images_after_the_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeResponses:
+        def create(self, **kwargs: object) -> object:
+            captured.update(kwargs)
+            return type("Response", (), {"output_text": "{}", "usage": None})()
+
+    class FakeClient:
+        def __init__(self, **_kwargs: object) -> None:
+            self.responses = FakeResponses()
+
+    service = GenerationService()
+    monkeypatch.setattr(generation_module, "OpenAI", FakeClient)
+    monkeypatch.setattr(
+        service,
+        "_prepare_qwen_image_data_url",
+        lambda image_path, *, target_bytes: {"data_url": "data:image/jpeg;base64,AA", "debug": {}},
+    )
+    debug: dict[str, object] = {}
+
+    service.complete_with_qwen(
+        "DECISION PROMPT",
+        api_key="test-key",
+        task_type="research_decision",
+        image_inputs=[{"source_id": "54", "image_path": "figure.png"}],
+        request_debug=debug,
+    )
+
+    content = captured["input"][0]["content"]
+    # prompt 原样放在最前面，不套问答模板；图片带 source_id 标签附在后面。
+    assert content[0] == {"type": "input_text", "text": "DECISION PROMPT"}
+    assert "source_id=54" in content[1]["text"]
+    assert content[2]["type"] == "input_image"
+    assert debug["sent_image_count"] == 1
+
+
+def test_complete_with_qwen_without_images_keeps_plain_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeResponses:
+        def create(self, **kwargs: object) -> object:
+            captured.update(kwargs)
+            return type("Response", (), {"output_text": "ok", "usage": None})()
+
+    class FakeClient:
+        def __init__(self, **_kwargs: object) -> None:
+            self.responses = FakeResponses()
+
+    monkeypatch.setattr(generation_module, "OpenAI", FakeClient)
+    GenerationService().complete_with_qwen("PLAIN", api_key="test-key", task_type="research_decision")
+
+    assert captured["input"] == "PLAIN"

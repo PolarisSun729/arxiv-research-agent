@@ -5,6 +5,7 @@ from .degradation import (
     REASON_LLM_CALL_FAILED,
     REASON_LLM_OUTPUT_INVALID,
 )
+from .llm_claim_extractor import LlmClaimExtractor
 from .llm_decision_policy import LlmDecisionPolicy
 from .llm_question_analyzer import LlmQuestionAnalyzer
 from .need_orchestrated_retriever import NeedOrchestratedRetriever, PaperRetrievalTarget
@@ -19,6 +20,7 @@ __all__ = [
     "DegradationLedger",
     "DegradationListener",
     "DependencyDegradation",
+    "LlmClaimExtractor",
     "LlmDecisionPolicy",
     "LlmQuestionAnalyzer",
     "NeedOrchestratedRetriever",

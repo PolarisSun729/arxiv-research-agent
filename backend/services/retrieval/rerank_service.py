@@ -7,16 +7,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-try:  # pragma: no cover - optional heavy dependency, environment dependent
-    import torch
-except Exception:  # pragma: no cover
-    torch = None  # type: ignore
-
-try:  # pragma: no cover - optional dependency import is environment dependent
-    from sentence_transformers import CrossEncoder
-except Exception:  # pragma: no cover
-    CrossEncoder = None  # type: ignore
-
 from services.retrieval.contracts import QueryProfile
 from services.llm.call_metrics import record_llm_call, record_llm_usage
 from services.intent.intent_service import EXPERIMENT_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
@@ -28,6 +18,21 @@ from utils.model_utils import get_huggingface_model_path
 ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
 
 logger = logging.getLogger(__name__)
+
+
+def _import_local_reranker_dependencies() -> Tuple[Any, Any]:
+    """按需导入本地 rerank 依赖，返回 (torch, CrossEncoder)；任一不可用时返回 (None, None)。
+
+    sentence_transformers 会连带导入 torch 和 transformers，在 Windows 上要二三十秒。
+    默认走远程 rerank，只有回退到本地 CrossEncoder 时才需要它们，所以不在模块加载时导入，
+    避免拖慢后端冷启动和首个请求。
+    """
+    try:  # pragma: no cover - optional heavy dependency, environment dependent
+        import torch
+        from sentence_transformers import CrossEncoder
+    except Exception:  # pragma: no cover
+        return None, None
+    return torch, CrossEncoder
 
 
 class RerankService:
@@ -191,7 +196,8 @@ class RerankService:
                     "matched_index_id": chunk.get("matched_index_id") or chunk.get("retrieval_index_id") or chunk.get("index_id"),
                     "matched_index_type": chunk.get("matched_index_type") or chunk.get("retrieval_index_type") or chunk.get("index_type"),
                     "matched_index_text": chunk.get("matched_index_text") or chunk.get("retrieval_index_text") or chunk.get("index_text"),
-                    "matched_index_score": chunk.get("matched_index_score") or chunk.get("route_score") or chunk.get("score"),
+                    # 不用 `or` 串联：合法的 0.0 分会被跳过；也不退回 chunk["score"]，那是融合/rerank 分而非 index 分。
+                    "matched_index_score": first_float(chunk.get("matched_index_score"), chunk.get("route_score")),
                 }
             ]
         deduped: List[Dict[str, Any]] = []
@@ -203,15 +209,17 @@ class RerankService:
             if index_id:
                 seen_ids.add(index_id)
             deduped.append(dict(row))
-        deduped.sort(
-            key=lambda row: first_float(
+        def row_score(row: Dict[str, Any]) -> float:
+            score = first_float(
                 row.get("weighted_index_score"),
                 row.get("matched_index_score"),
                 row.get("bm25_fusion_score"),
                 row.get("best_raw_bm25_score"),
-            ),
-            reverse=True,
-        )
+            )
+            # 仅用于展示排序：缺分的行排到最后，而不是冒充 0 分混在有分的行中间。
+            return score if score is not None else float("-inf")
+
+        deduped.sort(key=row_score, reverse=True)
         return deduped
 
     def llm_rerank(
@@ -287,6 +295,8 @@ class RerankService:
                 device=self.config_owner._llm_reranker_device,
             )
             # CrossEncoder 输出的是 logits，经 sigmoid 映射到 (0, 1)，与远程 relevance_score 量纲一致。
+            import torch  # 能走到这里说明本地 CrossEncoder 已加载，torch 已在内存中。
+
             rerank_scores = torch.sigmoid(torch.as_tensor(raw_scores, dtype=torch.float32)).tolist()
             self.log_rerank_raw_scores(
                 "local",
@@ -439,6 +449,7 @@ class RerankService:
         with self._llm_reranker_lock:
             if self._llm_reranker is not None and self.config_owner._llm_reranker_path == model_path:
                 return self._llm_reranker
+            torch, CrossEncoder = _import_local_reranker_dependencies()
             if CrossEncoder is None or torch is None:
                 self.config_owner._llm_reranker_error = "sentence_transformers_or_torch_unavailable"
                 self._llm_reranker = None

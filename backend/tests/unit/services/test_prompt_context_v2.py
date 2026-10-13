@@ -11,6 +11,7 @@ from services.prompt_context import (
     PromptBlock,
     PromptBudgetConfig,
     PromptBudgetPlanner,
+    PromptContextBuilder,
     RuleCompactor,
     TokenCounter,
     build_token_counter,
@@ -311,7 +312,8 @@ def test_budget_planner_applies_optional_llm_compactor_before_selection() -> Non
     planner = PromptBudgetPlanner(
         token_counter=counter,
         llm_compactor=llm_compactor,
-        config=PromptBudgetConfig(max_input_tokens=200, safety_margin_tokens=0),
+        # 100 token 的证据放不进 60 token 的预算，必须先做 LLM 压缩。
+        config=PromptBudgetConfig(max_input_tokens=60, safety_margin_tokens=0),
     )
     plan = planner.plan(
         [
@@ -329,3 +331,110 @@ def test_budget_planner_applies_optional_llm_compactor_before_selection() -> Non
 
     assert plan.selected_blocks[0].evidence_origin == "llm_compacted"
     assert plan.debug["llm_compaction"]["applied"] is True
+    assert plan.debug["llm_compaction"]["required_savings_tokens"] == 40
+
+
+def test_budget_planner_skips_llm_compaction_when_budget_is_sufficient() -> None:
+    counter = TokenCounter(fallback_chars_per_token=1.0)
+
+    def fail_if_called(_: str) -> str:
+        raise AssertionError("LLM compaction must not run when the prompt already fits the budget")
+
+    planner = PromptBudgetPlanner(
+        token_counter=counter,
+        llm_compactor=LLMCompactor(
+            token_counter=counter,
+            config=LLMCompactionConfig(enabled=True, min_block_tokens=10),
+            client=fail_if_called,
+        ),
+        config=PromptBudgetConfig(max_input_tokens=200, safety_margin_tokens=0),
+    )
+    block = PromptBlock(
+        block_id="rag-1",
+        section="rag_evidence",
+        block_type="anchor_evidence",
+        source="test",
+        text="x" * 100,
+        token_count=100,
+        source_id="s1",
+    )
+
+    plan = planner.plan([block])
+
+    assert plan.selected_blocks[0].evidence_origin == block.evidence_origin
+    assert plan.debug["llm_compaction"]["applied"] is False
+    assert plan.debug["llm_compaction"]["reason"] == "budget_sufficient"
+
+
+def test_llm_compactor_stops_once_required_savings_is_met() -> None:
+    counter = TokenCounter(fallback_chars_per_token=1.0)
+    calls: list[str] = []
+
+    def client(prompt: str) -> dict:
+        calls.append(prompt)
+        return {"compressed_text": "short"}
+
+    blocks = [
+        PromptBlock(
+            block_id=f"rag-{size}",
+            section="rag_evidence",
+            block_type="anchor_evidence",
+            source="test",
+            text="x" * size,
+            token_count=size,
+            source_id=f"s{size}",
+        )
+        for size in (50, 300, 100)
+    ]
+
+    compacted, debug = LLMCompactor(
+        token_counter=counter,
+        config=LLMCompactionConfig(enabled=True, min_block_tokens=10),
+        client=client,
+    ).compact_blocks(blocks, required_savings=200)
+
+    # 最长的 300 token block 一次就能省下 295 token，其余 block 不再调用 LLM。
+    assert len(calls) == 1
+    assert [block.block_id for block in compacted] == ["rag-50", "rag-300", "rag-100"]
+    assert compacted[1].evidence_origin == "llm_compacted"
+    assert compacted[0].evidence_origin != "llm_compacted"
+    assert debug["saved_tokens"] >= 200
+    assert {item["reason"] for item in debug["skipped_blocks"]} == {"budget_satisfied"}
+
+
+def test_recent_turns_keep_latest_full_and_compact_older_turns() -> None:
+    counter = TokenCounter(fallback_chars_per_token=1.0)
+    builder = PromptContextBuilder(
+        prompt_config={
+            "recent_turns_recent_full_count": 1,
+            "recent_turns_older_answer_tokens": 10,
+        },
+        token_counter=counter,
+    )
+    turns = [
+        {"turn_id": "t1", "question": "old question", "answer_summary": "old answer " * 20},
+        {"turn_id": "t2", "question": "new question", "answer_summary": "new answer " * 20},
+    ]
+
+    blocks = builder._recent_turn_prompt_blocks(turns)
+    compactor = RuleCompactor(token_counter=counter, config=builder._rule_compaction_config())
+    old_block, new_block = (compactor.compact(block) for block in blocks)
+
+    # 最新一轮 priority 更小，预算紧张时更不容易被挤掉。
+    assert new_block.priority < old_block.priority
+    assert new_block.text == blocks[1].text
+    assert new_block.evidence_origin != "rule_compacted"
+    assert old_block.evidence_origin == "rule_compacted"
+    assert old_block.metadata["compaction_strategy"] == "recent_turn_older_summary"
+    assert len(old_block.text) < len(blocks[0].text)
+
+
+def test_section_targets_are_configurable_and_ignore_protected_sections() -> None:
+    builder = PromptContextBuilder(
+        prompt_config={
+            "section_targets": {"user_memory": 123, "current_question": 1, "recent_turns": "bad"},
+        },
+        token_counter=TokenCounter(fallback_chars_per_token=1.0),
+    )
+
+    assert builder._prompt_budget_config().section_targets == {"user_memory": 123}

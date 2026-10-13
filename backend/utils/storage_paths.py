@@ -7,6 +7,9 @@ from pathlib import Path
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_DATA_ROOT = BACKEND_ROOT / "06-database"
+# Docling 导出的图片/表格/文档资产根目录：写入端（LoadingService）与读取端（证据资产接口）必须共用同一个绝对路径，
+# 否则从非 backend 目录启动时，读取端的越界校验会拒绝合法资产或指向错误目录。
+BACKEND_DOCLING_ASSETS_ROOT = BACKEND_ROOT / "03-docling-assets"
 # OAI 增量游标和最近一次运行摘要是跨版本保留的运行时状态。
 # 目录位于 backend/data：生产发布时该目录会由 deploy/apply_release.py 链接到 shared/backend/data。
 BACKEND_ARXIV_OAI_SYNC_ROOT = BACKEND_ROOT / "data" / "arxiv-oai-sync"

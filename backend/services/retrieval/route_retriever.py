@@ -10,7 +10,7 @@ from services.retrieval.collection_profile import CollectionRetrievalProfile
 from services.retrieval.contracts import QueryProfile, RetrievalOptions
 from services.retrieval.execution import QueryEmbeddingBatcher, RouteExecutionSupport
 from services.retrieval.index_hit_aggregator import IndexHitAggregator
-from services.retrieval.numeric_utils import min_max_normalize
+from services.retrieval.numeric_utils import min_max_normalize, require_float
 from services.retrieval.retrieval_index import CollectionRetrievalIndex, VECTOR_ROUTE_NAMES
 from utils.config import get_enhanced_retrieval_runtime_config
 
@@ -1068,14 +1068,19 @@ class RouteRetriever:
         """为原始命中补齐路由字段（名次、原始分、归一化分、置信度、结构加分），向量路由再做 index 聚合。"""
         if not results:
             return []
-        normalized_scores = self.normalize_scores([float(item.get("score", 0.0) or 0.0) for item in results])
+        # 路由原始分是必填项：缺分说明上游返回结构变了，直接报错，不能当成 0 分继续排序。
+        raw_scores = [
+            require_float(item.get("score"), what=f"route={route_name} hit#{rank} score")
+            for rank, item in enumerate(results, start=1)
+        ]
+        normalized_scores = self.normalize_scores(raw_scores)
         normalized = []
-        for rank, (item, normalized_score) in enumerate(zip(results, normalized_scores), start=1):
+        for rank, (item, raw_score, normalized_score) in enumerate(zip(results, raw_scores, normalized_scores), start=1):
             chunk = self.chunk_normalizer(item)
             chunk["retrieval_route"] = route_name
             chunk["source_query"] = source_query
             chunk["route_rank"] = rank
-            chunk["route_score"] = float(item.get("score", 0.0) or 0.0)
+            chunk["route_score"] = raw_score
             chunk["normalized_route_score"] = float(normalized_score)
             chunk["route_confidence"] = float(route_confidence)
             chunk["structural_bonus"] = float(self.structural_bonus_builder(chunk, query_profile))

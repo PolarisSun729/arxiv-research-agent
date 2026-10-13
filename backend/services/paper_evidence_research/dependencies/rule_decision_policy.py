@@ -57,6 +57,9 @@ class RuleDecisionPolicy:
         )
         candidate_need_ids = set(getattr(context, "candidate_need_ids", []) or [])
         retrievals_remaining = int(getattr(context, "retrievals_remaining", 0) or 0)
+        if getattr(context, "evidence_pool_full", False):
+            # 证据池已满时新候选进不了池，检索必然无进展，等同于检索额度用尽。
+            retrievals_remaining = 0
         drafts_remaining = int(getattr(context, "drafts_remaining", 0) or 0)
         retrievals_used = int(getattr(context, "retrievals_used", 0) or 0)
         candidate_count = int(getattr(context, "candidate_count", 0) or 0)

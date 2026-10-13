@@ -290,6 +290,24 @@ class PaperEvidenceExtractor:
             deduped.append(concept)
         return deduped[:20]
 
+    def build_error_card(
+        self,
+        paper: Optional[Dict[str, Any]],
+        error_message: str,
+        *,
+        error_type: str = "transient",
+        retry_count: int = 0,
+        extraction_confidence: float = 0.2,
+    ) -> Dict[str, Any]:
+        """对外构造失败卡：调用方在 extract 之外捕获到异常时，用它生成与抽取失败同 schema 的卡片写入缓存。"""
+        return self._error_card(
+            self.normalize_paper(paper),
+            error_message,
+            error_type=error_type,
+            retry_count=retry_count,
+            extraction_confidence=extraction_confidence,
+        )
+
     def _error_card(
         self,
         paper: Dict[str, Any],

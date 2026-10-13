@@ -1040,26 +1040,25 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     event_count += 1
                     sequence += 1
 
-            # 阶段 D：逐步消费 LangGraph 的 updates 流，并把节点生命周期翻译成 SSE 事件。
-            for update in graph.stream(graph_input, config=graph_config, stream_mode="updates"):
-                if not update:
-                    continue
+            def announce_step_start(step_name: str, previous_state: Optional[AgentState]):
+                """发出节点开始事件；若该节点会调用工具，同时补发 tool_call_start。
 
-                step_name, step_payload = next(iter(update.items()))
-                previous_state = current_state
-
-                # 子阶段 D-1：先通知前端“某个节点开始执行”。
-                yield _sse_event(
-                    _make_stream_event(
-                        event_type="step_start",
-                        sequence=_next_sequence(sequence),
-                        run_id=run_id,
-                        data={
-                            "step": step_name,
-                            "state": _compact_state(previous_state),
-                        },
+                返回 (待 yield 的 SSE 文本列表, active_tool_call, tool_call_started)。
+                """
+                nonlocal sequence, event_count, tool_count
+                frames = [
+                    _sse_event(
+                        _make_stream_event(
+                            event_type="step_start",
+                            sequence=_next_sequence(sequence),
+                            run_id=run_id,
+                            data={
+                                "step": step_name,
+                                "state": _compact_state(previous_state),
+                            },
+                        )
                     )
-                )
+                ]
                 event_count += 1
                 sequence += 1
 
@@ -1077,21 +1076,73 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     )
                     if not already_preannounced:
                         tool_count += 1
-                        # 子阶段 D-2：如果当前节点会触发工具调用，则补发工具开始事件。
-                        yield _sse_event(
-                            _make_stream_event(
-                                event_type="tool_call_start",
-                                sequence=_next_sequence(sequence),
-                                run_id=run_id,
-                                data={
-                                    "step": step_name,
-                                    "tool_call": active_tool_call,
-                                    "state": _compact_state(previous_state),
-                                },
+                        # 如果当前节点会触发工具调用，则补发工具开始事件。
+                        frames.append(
+                            _sse_event(
+                                _make_stream_event(
+                                    event_type="tool_call_start",
+                                    sequence=_next_sequence(sequence),
+                                    run_id=run_id,
+                                    data={
+                                        "step": step_name,
+                                        "tool_call": active_tool_call,
+                                        "state": _compact_state(previous_state),
+                                    },
+                                )
                             )
                         )
                         event_count += 1
                         sequence += 1
+                return frames, active_tool_call, tool_call_started
+
+            # 已在 tasks 流里宣告开始、尚未收到 updates 的节点：节点名 -> (active_tool_call, tool_call_started)。
+            started_nodes: Dict[str, tuple[Optional[Dict[str, Any]], bool]] = {}
+
+            # 阶段 D：同时消费 LangGraph 的 tasks 与 updates 流。
+            # updates 只在节点执行完后才产出；tasks 会在节点开始前先产出一条任务事件，
+            # 借此把 step_start 提前到节点真正开始时，前端才能在 LLM/检索等长耗时节点期间看到进度。
+            for stream_item in graph.stream(graph_input, config=graph_config, stream_mode=["tasks", "updates"]):
+                # 测试替身可能只产出 updates 字典；真实图在多模式下产出 (mode, chunk) 元组。
+                if isinstance(stream_item, tuple) and len(stream_item) == 2 and isinstance(stream_item[0], str):
+                    stream_mode, chunk = stream_item
+                else:
+                    stream_mode, chunk = "updates", stream_item
+                if not chunk:
+                    continue
+
+                if stream_mode == "tasks":
+                    task_name = str(chunk.get("name") or "") if isinstance(chunk, Mapping) else ""
+                    # 只处理“任务开始”事件（带 input）；任务结果事件交给 updates 分支统一处理。
+                    if not task_name or task_name.startswith("__") or "input" not in chunk:
+                        continue
+                    # 子阶段 D-1：节点开始执行前就通知前端，避免长耗时节点期间界面像卡死。
+                    frames, active_tool_call, tool_call_started = announce_step_start(task_name, current_state)
+                    started_nodes[task_name] = (active_tool_call, tool_call_started)
+                    for frame in frames:
+                        yield frame
+                    continue
+                if stream_mode != "updates":
+                    continue
+                update = chunk
+
+                step_name, step_payload = next(iter(update.items()))
+                previous_state = current_state
+
+                if step_name in started_nodes:
+                    active_tool_call, tool_call_started = started_nodes.pop(step_name)
+                else:
+                    interrupted_node = None
+                    if step_name == "__interrupt__" and started_nodes:
+                        # interrupt 发生在某个已宣告开始的节点内部，该节点不会再有 updates；取出它的挂起记录，
+                        # 若它已发过 tool_call_start，就借本次 __interrupt__ 收尾，避免前端工具卡片一直 running。
+                        interrupted_node = list(started_nodes.values())[-1]
+                        started_nodes.clear()
+                    # 兼容只产出 updates 的图（以及 __interrupt__ 这类没有任务开始事件的伪节点）。
+                    frames, active_tool_call, tool_call_started = announce_step_start(step_name, previous_state)
+                    for frame in frames:
+                        yield frame
+                    if interrupted_node is not None and interrupted_node[1] and not tool_call_started:
+                        active_tool_call, tool_call_started = interrupted_node
 
                 # __interrupt__ 是正常的确认暂停信号，不是 AgentState。
                 # 流式模式下要把它还原成 waiting_confirmation 状态返回给前端，避免误报成运行时异常。
@@ -1934,11 +1985,28 @@ def _latest_runtime_tool_call(state: Optional[AgentState]) -> Optional[Dict[str,
     if not last_step_result:
         return None
     active_tool = _active_runtime_tool_call(state) or {}
+    step_output = last_step_result.get("output")
+    # 本步输出里各列表字段的条目数（如 papers=5）。state.papers 要到收尾阶段才回填，
+    # 前端展示“检索到几篇”必须以这里为准，不能读当时的 state.paper_count。
+    result_counts = (
+        {key: len(value) for key, value in step_output.items() if isinstance(value, list)}
+        if isinstance(step_output, Mapping)
+        else {}
+    )
+    # 阶梯检索每一级的查询与命中数，前端时间线据此展示“严格→放宽”的过程。
+    relaxation = step_output.get("relaxation") if isinstance(step_output, Mapping) else None
+    search_attempts = [
+        {key: attempt.get(key) for key in ("level", "label", "query", "categories", "submitted_days_ago", "total_results", "new_papers", "ok")}
+        for attempt in (relaxation.get("attempts") or [] if isinstance(relaxation, Mapping) else [])
+        if isinstance(attempt, Mapping)
+    ]
     return {
         "tool_name": active_tool.get("tool_name"),
         "step_id": last_step_result.get("step_id"),
         "status": last_step_result.get("step_status"),
         "summary": last_step_result.get("next_action"),
+        "result_counts": result_counts,
+        "search_attempts": search_attempts,
         "trace": {
             "output_key": last_step_result.get("output_key"),
             "has_observation": bool(last_step_result.get("observation")),
