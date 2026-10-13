@@ -188,10 +188,12 @@ def _recover_stale_qa_index_jobs(paper_qa_index_store: Any, *, arxiv_id: str, jo
 # ---------------------------------------------------------------------------
 # QA 索引：状态、诊断、trace 下载与构建任务
 # ---------------------------------------------------------------------------
+# 状态/轮询类接口内部全是同步 SQLite 和文件读写，声明为 def 让 FastAPI 放进线程池执行；
+# 写成 async def 会直接阻塞事件循环，建索引期间轮询变慢，严重时拖到 gunicorn 心跳超时。
 
 
 @router.get("/qa-status")
-async def get_paper_qa_status(arxiv_id: str, paper_qa_service=Depends(get_paper_qa_service)):
+def get_paper_qa_status(arxiv_id: str, paper_qa_service=Depends(get_paper_qa_service)):
     """获取指定论文的 QA 能力状态。
 
     常用于前端判断该论文是否已经完成索引构建、是否可以直接发起问答。
@@ -204,7 +206,7 @@ async def get_paper_qa_status(arxiv_id: str, paper_qa_service=Depends(get_paper_
 
 
 @router.get("/qa-diagnose")
-async def diagnose_paper_qa(
+def diagnose_paper_qa(
     arxiv_id: str,
     sample_limit: int = Query(3, ge=0, le=20),
     paper_qa_index_store=Depends(get_paper_qa_index_store),
@@ -283,7 +285,7 @@ async def download_latest_qa_trace(
 
 
 @router.post("/create-qa-index")
-async def create_paper_qa_index(
+def create_paper_qa_index(
     arxiv_id: str,
     loading_method: str = Query("docling"),
     sync: bool = Query(False),
@@ -353,7 +355,7 @@ async def create_paper_qa_index(
 
 
 @router.get("/qa-index-jobs/latest")
-async def get_latest_paper_qa_index_job(
+def get_latest_paper_qa_index_job(
     arxiv_id: str,
     paper_qa_index_store=Depends(get_paper_qa_index_store),
 ):
@@ -372,7 +374,7 @@ async def get_latest_paper_qa_index_job(
 
 
 @router.get("/qa-index-jobs/{job_id}")
-async def get_paper_qa_index_job(
+def get_paper_qa_index_job(
     arxiv_id: str,
     job_id: str,
     paper_qa_index_store=Depends(get_paper_qa_index_store),
