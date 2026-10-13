@@ -660,6 +660,7 @@ def _build_citations(state: PaperEvidenceResearchState, supported_claim_ids: set
                 chunk_type=candidate.chunk_type,
                 section_path=candidate.section_path,
                 page_number=candidate.page_number,
+                has_asset=bool(candidate.asset_path or candidate.asset_abs_path),
             )
         )
     return citations

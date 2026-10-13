@@ -39,6 +39,8 @@ class VerifiedCitation(BaseModel):
     chunk_type: str = "text"
     section_path: str = ""
     page_number: int | None = None
+    # 只标记该证据是否有图片资产，不携带服务器路径；对外契约据此生成受控的 asset_url。
+    has_asset: bool = False
 
 
 class ResearchSummary(BaseModel):

@@ -69,6 +69,21 @@ def test_public_source_payload_does_not_expose_local_asset_paths() -> None:
     assert "asset_abs_path" not in payload[0]
 
 
+def test_public_source_payload_uses_has_asset_flag_from_research_citations() -> None:
+    # 研究链路的引用不携带服务器路径，只用 has_asset 标记有图，仍需生成受控回放 URL。
+    payload = build_public_source_payload(
+        [
+            {"source_id": "52", "chunk_type": "figure", "content": "Figure 1", "has_asset": True},
+            {"source_id": "53", "chunk_type": "figure", "content": "Figure 2", "has_asset": False},
+        ],
+        arxiv_id="2610.11314",
+    )
+
+    assert payload[0]["asset_url"] == "/api/paper/2610.11314/evidence-assets/52"
+    assert "asset_url" not in payload[1]
+    assert "has_asset" not in payload[0]
+
+
 def test_evidence_asset_lookup_is_index_bound_and_rejects_traversal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # 资产根目录固定在 backend 下而不是当前工作目录；测试里把它替换为临时目录。
     monkeypatch.setattr(evidence_contract_module, "BACKEND_DOCLING_ASSETS_ROOT", tmp_path / "03-docling-assets")

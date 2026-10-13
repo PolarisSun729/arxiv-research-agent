@@ -27,9 +27,12 @@ def build_public_source_payload(
     raw_sources = ContextPackBuilder().build_source_payload(search_results)
     public_sources: List[Dict[str, Any]] = []
     paper_id = str(arxiv_id or "").strip()
-    for source in raw_sources:
+    # build_source_payload 与 search_results 一一对应；研究链路的引用不带路径，只用 has_asset 标记有图。
+    for result, source in zip(search_results, raw_sources):
         item = dict(source)
-        had_asset = any(str(item.get(key) or "").strip() for key in ("asset_path", "asset_abs_path"))
+        had_asset = bool(result.get("has_asset")) or any(
+            str(item.get(key) or "").strip() for key in ("asset_path", "asset_abs_path")
+        )
         # 绝对路径只允许留在生成器内部的 asset_metadata，不能进入前端或持久化消息。
         for private_key in ("asset_path", "asset_abs_path", "image_path", "asset_json_path"):
             item.pop(private_key, None)

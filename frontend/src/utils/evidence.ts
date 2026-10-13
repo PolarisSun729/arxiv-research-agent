@@ -60,6 +60,7 @@ export function orderCitedSourceIds(answer: string, sources: RagChatSource[], ci
 
 const CITATION_MARKER_RE = /\[source:([^\]\s]+)\]/g
 const CITATION_TITLE_PREVIEW_CHARS = 120
+export const EVIDENCE_LINK_PREFIX = '#evidence-source-'
 
 function describeCitationSource(sourceId: string, source?: RagChatSource) {
   if (!source) return `证据 ${sourceId}`
@@ -94,6 +95,16 @@ export function toCitationLinks(text: string, options: { sources?: RagChatSource
     const title = describeCitationSource(sourceId, sourceById.get(sourceId))
       .replace(/\\/g, '\\\\')
       .replace(/"/g, '\\"')
-    return `[\\[${index + 1}\\]](#evidence-source-${encodeURIComponent(sourceId)} "${title}")`
+    return `[\\[${index + 1}\\]](${EVIDENCE_LINK_PREFIX}${encodeURIComponent(sourceId)} "${title}")`
   })
+}
+
+/**
+ * 图片证据的图注：优先用资产摘要；否则取 chunk 正文，去掉 "Figure evidence" 类型行和末尾的 "(宽x高) page N"。
+ */
+export function getFigureCaption(source: RagChatSource) {
+  const summary = String(source.asset_summary || '').trim()
+  const lines = (summary || String(source.content || '')).split('\n').map(line => line.trim()).filter(Boolean)
+  if (lines.length > 1 && /^figure evidence$/i.test(lines[0])) lines.shift()
+  return lines.join(' ').replace(/\s*\(\d+\s*x\s*\d+\)\s*(page\s*\S+)?\s*$/i, '').trim()
 }

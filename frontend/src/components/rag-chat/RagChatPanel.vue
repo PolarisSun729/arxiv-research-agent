@@ -5,7 +5,9 @@ import type { PromptsItemsProps } from 'vue-element-plus-x/types/Prompts'
 import type { RetrievalDebug } from '@/api/papers'
 import type { AgentChatMessage } from '@/types/agentChat'
 import type { QaTurnForRagChat, RagChatSource } from '@/types/ragChat'
-import { renderMarkdownWithLatex } from '@/utils/markdown'
+import AuthenticatedImage from '@/components/AuthenticatedImage.vue'
+import { getFigureCaption, EVIDENCE_LINK_PREFIX } from '@/utils/evidence'
+import { renderAnswerSegments } from '@/utils/markdown'
 
 type RagChatPanelMessage = AgentChatMessage & {
   placement: 'start' | 'end'
@@ -181,8 +183,7 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
   const target = event.target instanceof Element ? event.target.closest('a[href^="#evidence-source-"]') : null
   if (!(target instanceof HTMLAnchorElement)) return
   event.preventDefault()
-  const prefix = '#evidence-source-'
-  const sourceId = decodeURIComponent(target.getAttribute('href')?.slice(prefix.length) || '')
+  const sourceId = decodeURIComponent(target.getAttribute('href')?.slice(EVIDENCE_LINK_PREFIX.length) || '')
   if (sourceId) emit('select-source', item, sourceId)
 }
 </script>
@@ -255,9 +256,30 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
           <div
             v-else-if="item.role === 'assistant'"
             class="assistant-markdown"
-            v-html="renderMarkdownWithLatex(item.content, undefined, { sources: item.sources, citedSourceIds: item.citedSourceIds })"
             @click="handleAssistantContentClick($event, item)"
-          />
+          >
+            <template
+              v-for="(segment, index) in renderAnswerSegments(item.content, undefined, { sources: item.sources, citedSourceIds: item.citedSourceIds })"
+              :key="index"
+            >
+              <div class="assistant-markdown__segment" v-html="segment.html" />
+              <!-- 图卡跟在第一次引用这张图的段落后面；图注里的角标与正文共用同一套证据定位事件。 -->
+              <figure v-for="figure in segment.figures" :key="figure.source.source_id" class="answer-figure">
+                <AuthenticatedImage class="answer-figure__image" :src="figure.source.asset_url || ''" fit="contain">
+                  <template #error><div class="answer-figure__missing">图片暂不可用，可点击角标查看文字证据。</div></template>
+                </AuthenticatedImage>
+                <figcaption class="answer-figure__caption">
+                  <a
+                    :href="`${EVIDENCE_LINK_PREFIX}${encodeURIComponent(figure.source.source_id)}`"
+                    class="answer-figure__ref"
+                    title="查看这条证据"
+                  >[{{ figure.label }}]</a>
+                  <span v-if="figure.source.page_number" class="answer-figure__page">第 {{ figure.source.page_number }} 页</span>
+                  <span class="answer-figure__text">{{ getFigureCaption(figure.source) }}</span>
+                </figcaption>
+              </figure>
+            </template>
+          </div>
           <div v-else class="rag-chat-panel__user-content">
             {{ item.content }}
           </div>
@@ -440,6 +462,72 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
 
 .assistant-markdown :deep(p) {
   margin: 0 0 14px;
+}
+
+/* 有图片证据时正文按段切开；段内末尾元素的外边距由段间距接管，避免切段后行距变化。 */
+.assistant-markdown__segment + .assistant-markdown__segment,
+.answer-figure + .assistant-markdown__segment {
+  margin-top: 14px;
+}
+
+.assistant-markdown__segment > :deep(:last-child) {
+  margin-bottom: 0;
+}
+
+.answer-figure {
+  margin: 14px 0 0;
+  padding: 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  background: #f8fafc;
+}
+
+.answer-figure__image {
+  display: block;
+  width: 100%;
+  border-radius: 10px;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.answer-figure__image :deep(img) {
+  display: block;
+  width: 100%;
+  max-height: 360px;
+  object-fit: contain;
+  cursor: zoom-in;
+}
+
+.answer-figure__missing {
+  padding: 18px 12px;
+  color: #94a3b8;
+  font-size: 12px;
+  text-align: center;
+}
+
+.answer-figure__caption {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 8px;
+  color: #475569;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.assistant-markdown .answer-figure__ref {
+  flex: none;
+  vertical-align: baseline;
+}
+
+.answer-figure__page {
+  flex: none;
+  color: #94a3b8;
+}
+
+.answer-figure__text {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .assistant-markdown :deep(p:last-child) {
