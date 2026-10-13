@@ -1020,6 +1020,7 @@ export interface RetrievalDebug {
   engine?: string
   research_rounds?: ResearchRoundDebug[]
   research_steps?: ResearchStepDebug[]
+  research_summary?: ResearchSummary | null
   removed_claims?: ResearchRemovedClaimDebug[]
   /** 部分回答正文的生成方式：in_place 原位删除未受支持句子；joined_supported_claims 拼接受支持主张。 */
   answer_pruning?: 'in_place' | 'joined_supported_claims' | string | null
@@ -1060,7 +1061,7 @@ export interface ResearchRoundDebug {
 }
 
 export interface ResearchStepDebug {
-  kind: 'search' | 'fallback' | 'draft' | 'extract' | 'verify' | 'rejected' | 'restore' | 'done' | string
+  kind: 'search' | 'filter' | 'fallback' | 'draft' | 'extract' | 'verify' | 'rejected' | 'restore' | 'done' | string
   title: string
   detail?: string
 }

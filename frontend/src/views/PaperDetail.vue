@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { PaperNoteType } from '@/types/paper'
@@ -50,6 +50,8 @@ const qaDiagnostic = ref<QaDiagnosticResult | null>(null)
 const traceDownloading = ref(false)
 const isNarrowScreen = ref(false)
 const highlightedEvidenceSourceId = ref<string | null>(null)
+const sideEvidenceCard = ref<HTMLElement | null>(null)
+const sideEvidenceFlash = ref(false)
 
 const modelBadge = 'Qwen 3.6 Plus'
 
@@ -226,20 +228,44 @@ function syncViewport() {
   }
 }
 
+// 宽屏下证据面板在右栏顶部，用户在回答底部点按钮时它多半在视口外：切换后把面板滚进视野并闪一下，否则看起来"点了没反应"。
+function revealSideEvidence(resetScroll: boolean) {
+  if (isNarrowScreen.value) return
+  sideEvidenceFlash.value = false
+  nextTick(() => {
+    const card = sideEvidenceCard.value
+    if (!card) return
+    if (resetScroll) {
+      card.scrollTop = 0
+      card.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    }
+    requestAnimationFrame(() => {
+      sideEvidenceFlash.value = true
+    })
+  })
+}
+
 function handlePanelOpenEvidence(turnId: string) {
   const turn = chatTurns.value.find(item => item.id === turnId)
   if (!turn) return
   activeEvidenceTurn.value = turn
   highlightedEvidenceSourceId.value = null
   evidenceDrawerOpen.value = isNarrowScreen.value
+  revealSideEvidence(true)
 }
 
 function handleCitationSelect(item: any, sourceId: string) {
   const turn = item?.response && typeof item.response === 'object' ? item.response : null
   if (!turn) return
   activeEvidenceTurn.value = turn
-  highlightedEvidenceSourceId.value = sourceId
+  // 先清空再设置：重复点同一个角标时高亮值不变，来源列表的 watch 不会再次滚动定位。
+  highlightedEvidenceSourceId.value = null
+  nextTick(() => {
+    highlightedEvidenceSourceId.value = sourceId
+  })
   evidenceDrawerOpen.value = isNarrowScreen.value
+  // 滚动由来源列表把被点的来源居中完成，这里只负责闪一下提示。
+  revealSideEvidence(false)
 }
 
 async function handleTogglePaperAction(actionType: 'read' | 'not_interested' | 'note_saved') {
@@ -757,7 +783,13 @@ watch(activeNoteTypeFilter, async () => {
           </div>
 
           <aside class="qa-side">
-            <div class="side-card qa-side-evidence" v-if="!isNarrowScreen">
+            <div
+              v-if="!isNarrowScreen"
+              ref="sideEvidenceCard"
+              class="side-card qa-side-evidence"
+              :class="{ 'qa-side-evidence--flash': sideEvidenceFlash }"
+              @animationend="sideEvidenceFlash = false"
+            >
               <RagEvidencePanel
                 :question="activeEvidenceTurn?.question"
                 :sources="activeEvidenceTurn?.sources || []"
@@ -948,7 +980,8 @@ watch(activeNoteTypeFilter, async () => {
 .paper-detail-shell {
   position: relative;
   min-height: 100vh;
-  overflow: hidden;
+  /* clip 而不是 hidden：hidden 的容器仍可被 scrollIntoView 横向滚动，定位证据面板时整页会左移。 */
+  overflow: clip;
   background:
     radial-gradient(circle at top left, rgba(118, 170, 255, 0.18), transparent 32%),
     radial-gradient(circle at top right, rgba(255, 181, 128, 0.18), transparent 30%),
@@ -1564,6 +1597,8 @@ watch(activeNoteTypeFilter, async () => {
   height: 100%;
   padding: 20px;
   overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
   background:
     radial-gradient(circle at top right, rgba(96, 165, 250, 0.08), transparent 30%),
     linear-gradient(180deg, #ffffff, #f8fbff);
@@ -2132,6 +2167,31 @@ watch(activeNoteTypeFilter, async () => {
 .side-card {
   border-radius: 24px;
   padding: 18px;
+}
+
+/* 证据面板展开后可达上万像素，不限高时标题和切换后的内容都在视口外；限高后在卡片内滚动。 */
+.qa-side-evidence {
+  --evidence-inset: 18px;
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+  overscroll-behavior: contain;
+  scroll-margin-top: 16px;
+}
+
+.qa-side-evidence--flash {
+  animation: side-evidence-flash 1.2s ease;
+}
+
+@keyframes side-evidence-flash {
+  0%,
+  100% {
+    box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
+  }
+  25% {
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.35), 0 18px 40px rgba(15, 23, 42, 0.08);
+  }
 }
 
 .diagnostic-block {

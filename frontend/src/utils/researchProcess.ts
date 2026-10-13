@@ -1,7 +1,8 @@
-import type { ResearchRoundDebug, ResearchStepDebug, RetrievalDebug } from '@/api/papers'
+import type { ResearchRoundDebug, ResearchStepDebug, ResearchSummary, RetrievalDebug } from '@/api/papers'
 
 export interface ProcessStepView {
   key: string
+  kind?: string
   title: string
   content: string
 }
@@ -39,7 +40,53 @@ export function buildResearchStepViews(steps: ResearchStepDebug[] | undefined): 
   if (!Array.isArray(steps)) return []
   return steps
     .filter(step => step && typeof step.title === 'string')
-    .map((step, index) => ({ key: `step-${index}`, title: step.title, content: step.detail || '' }))
+    .map((step, index) => ({
+      key: `step-${index}`,
+      kind: typeof step.kind === 'string' ? step.kind : '',
+      title: step.title,
+      content: step.detail || ''
+    }))
+}
+
+export interface StepDetailView {
+  facts: string[]
+  reason: string
+}
+
+// 研究动作的 detail 由后端用 " · " 拼接：短事实做成标签，"决策理由 …" 是模型的长段说明，单独成段展示。
+export function splitStepDetail(detail: string): StepDetailView {
+  const facts: string[] = []
+  let reason = ''
+  for (const part of (detail || '').split(' · ').map(item => item.trim()).filter(Boolean)) {
+    if (part.startsWith('决策理由')) reason = part.replace(/^决策理由[\s：:]*/, '')
+    else facts.push(part)
+  }
+  return { facts, reason }
+}
+
+export interface ResearchSummaryView {
+  outcome: string
+  outcomeLabel: string
+  stats: Array<{ label: string; value: string }>
+}
+
+const OUTCOME_LABELS: Record<string, string> = { completed: '完整回答', partial: '部分回答', abstained: '证据不足' }
+
+export function buildResearchSummaryView(summary: ResearchSummary | null | undefined): ResearchSummaryView | null {
+  if (!summary || typeof summary !== 'object') return null
+  const count = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? value : 0)
+  const supported = count(summary.supported_claim_count)
+  const removed = count(summary.removed_claim_count)
+  const outcome = String(summary.outcome || '')
+  return {
+    outcome,
+    outcomeLabel: OUTCOME_LABELS[outcome] || outcome || '-',
+    stats: [
+      { label: '检索', value: `${count(summary.retrieval_count)} 轮` },
+      { label: '起草', value: `${count(summary.draft_attempt_count)} 版` },
+      { label: '受支持主张', value: removed ? `${supported} / ${supported + removed}` : `${supported} 条` }
+    ]
+  }
 }
 
 export function buildResearchRoundViews(rounds: ResearchRoundDebug[] | undefined): ResearchRoundView[] {

@@ -15,7 +15,14 @@ await build({
   write: true
 })
 
-const { buildRemovedClaimsView, buildResearchRoundViews, buildResearchStepViews, hasResearchProcess } = await import(pathToFileURL(outfile))
+const {
+  buildRemovedClaimsView,
+  buildResearchRoundViews,
+  buildResearchStepViews,
+  buildResearchSummaryView,
+  hasResearchProcess,
+  splitStepDetail
+} = await import(pathToFileURL(outfile))
 
 assert.equal(hasResearchProcess({ research_rounds: [] }), true)
 assert.equal(hasResearchProcess({ routes: {} }), false)
@@ -58,9 +65,34 @@ assert.equal(disabled['final-context'], '无最终上下文数据')
 const steps = buildResearchStepViews([
   { kind: 'search', title: '第 1 轮检索（need-1）', detail: '新增 20 条候选' },
   { truncated_items: 2, original_count: 10 },
+  { kind: 'filter', title: '筛掉 2 条无关证据', detail: '剩余 18 条' },
   { kind: 'done', title: '研究结束', detail: 'partial' }
 ])
-assert.deepEqual(steps.map(step => step.title), ['第 1 轮检索（need-1）', '研究结束'])
+assert.deepEqual(steps.map(step => step.title), ['第 1 轮检索（need-1）', '筛掉 2 条无关证据', '研究结束'])
+assert.equal(steps[1].content, '剩余 18 条')
+assert.deepEqual(steps.map(step => step.kind), ['search', 'filter', 'done'])
+
+// 决策理由是模型的长段说明，单独成段；其余短事实做成标签。
+assert.deepEqual(splitStepDetail('新增 39 条候选，重复 0 条 · 决策理由 Need more evidence. · 决策时阅读 0 条证据全文'), {
+  facts: ['新增 39 条候选，重复 0 条', '决策时阅读 0 条证据全文'],
+  reason: 'Need more evidence.'
+})
+assert.deepEqual(splitStepDetail(''), { facts: [], reason: '' })
+
+assert.deepEqual(
+  buildResearchSummaryView({ outcome: 'partial', retrieval_count: 1, draft_attempt_count: 2, supported_claim_count: 10, removed_claim_count: 1 }),
+  {
+    outcome: 'partial',
+    outcomeLabel: '部分回答',
+    stats: [
+      { label: '检索', value: '1 轮' },
+      { label: '起草', value: '2 版' },
+      { label: '受支持主张', value: '10 / 11' }
+    ]
+  }
+)
+assert.equal(buildResearchSummaryView({ outcome: 'completed', supported_claim_count: 4 }).stats[2].value, '4 条')
+assert.equal(buildResearchSummaryView(null), null)
 
 // 部分回答被删的句子：原因、引用、校验结论都要可见；历史快照的截断标记与超长文本预览也要能展示。
 const removedView = buildRemovedClaimsView({
