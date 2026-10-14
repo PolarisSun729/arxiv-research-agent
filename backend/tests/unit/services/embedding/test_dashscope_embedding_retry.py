@@ -116,7 +116,7 @@ def test_create_embeddings_retries_network_error_then_returns_success(monkeypatc
         return result
 
     monkeypatch.setattr(embedding_service_module, "get_paper_qa_build_cache", lambda: _DisabledBuildCache())
-    monkeypatch.setattr(embedding_service_module.requests, "post", fake_post)
+    monkeypatch.setattr(EmbeddingService, "_dashscope_http_session", lambda _self: SimpleNamespace(post=fake_post))
     monkeypatch.setattr(
         embedding_service_module,
         "time",
@@ -146,7 +146,7 @@ def test_create_embeddings_honors_retry_after_for_retryable_http_status(monkeypa
         return post_results.pop(0)
 
     monkeypatch.setattr(embedding_service_module, "get_paper_qa_build_cache", lambda: _DisabledBuildCache())
-    monkeypatch.setattr(embedding_service_module.requests, "post", fake_post)
+    monkeypatch.setattr(EmbeddingService, "_dashscope_http_session", lambda _self: SimpleNamespace(post=fake_post))
     monkeypatch.setattr(
         embedding_service_module,
         "time",
@@ -173,7 +173,7 @@ def test_create_embeddings_caps_retry_after_at_thirty_seconds(monkeypatch) -> No
         return post_results.pop(0)
 
     monkeypatch.setattr(embedding_service_module, "get_paper_qa_build_cache", lambda: _DisabledBuildCache())
-    monkeypatch.setattr(embedding_service_module.requests, "post", fake_post)
+    monkeypatch.setattr(EmbeddingService, "_dashscope_http_session", lambda _self: SimpleNamespace(post=fake_post))
     monkeypatch.setattr(
         embedding_service_module,
         "time",
@@ -211,7 +211,7 @@ def test_create_embeddings_handles_retry_after_variants(monkeypatch, retry_after
         return post_results.pop(0)
 
     monkeypatch.setattr(embedding_service_module, "get_paper_qa_build_cache", lambda: _DisabledBuildCache())
-    monkeypatch.setattr(embedding_service_module.requests, "post", fake_post)
+    monkeypatch.setattr(EmbeddingService, "_dashscope_http_session", lambda _self: SimpleNamespace(post=fake_post))
     monkeypatch.setattr(
         embedding_service_module,
         "time",
@@ -236,7 +236,7 @@ def test_create_embeddings_applies_configured_jitter(monkeypatch) -> None:
         return result
 
     monkeypatch.setattr(embedding_service_module, "get_paper_qa_build_cache", lambda: _DisabledBuildCache())
-    monkeypatch.setattr(embedding_service_module.requests, "post", fake_post)
+    monkeypatch.setattr(EmbeddingService, "_dashscope_http_session", lambda _self: SimpleNamespace(post=fake_post))
     monkeypatch.setattr(embedding_service_module.random, "uniform", lambda _lower, _upper: 0.2)
     monkeypatch.setattr(
         embedding_service_module,
@@ -285,7 +285,7 @@ def test_create_embeddings_retries_only_temporary_http_statuses(monkeypatch, sta
         return post_results.pop(0)
 
     monkeypatch.setattr(embedding_service_module, "get_paper_qa_build_cache", lambda: _DisabledBuildCache())
-    monkeypatch.setattr(embedding_service_module.requests, "post", fake_post)
+    monkeypatch.setattr(EmbeddingService, "_dashscope_http_session", lambda _self: SimpleNamespace(post=fake_post))
     monkeypatch.setattr(
         embedding_service_module,
         "time",
@@ -311,7 +311,7 @@ def test_create_embeddings_does_not_retry_permanent_http_errors(monkeypatch, sta
         return _ErrorResponse(status_code)
 
     monkeypatch.setattr(embedding_service_module, "get_paper_qa_build_cache", lambda: _DisabledBuildCache())
-    monkeypatch.setattr(embedding_service_module.requests, "post", fake_post)
+    monkeypatch.setattr(EmbeddingService, "_dashscope_http_session", lambda _self: SimpleNamespace(post=fake_post))
     monkeypatch.setattr(
         embedding_service_module,
         "time",
@@ -335,7 +335,7 @@ def test_create_embeddings_raises_last_network_error_after_retry_exhaustion(monk
         raise errors.pop(0)
 
     monkeypatch.setattr(embedding_service_module, "get_paper_qa_build_cache", lambda: _DisabledBuildCache())
-    monkeypatch.setattr(embedding_service_module.requests, "post", fake_post)
+    monkeypatch.setattr(EmbeddingService, "_dashscope_http_session", lambda _self: SimpleNamespace(post=fake_post))
     monkeypatch.setattr(
         embedding_service_module,
         "time",
@@ -364,7 +364,7 @@ def test_retry_warning_contains_only_sanitized_request_metadata(monkeypatch, cap
         return result
 
     monkeypatch.setattr(embedding_service_module, "get_paper_qa_build_cache", lambda: _DisabledBuildCache())
-    monkeypatch.setattr(embedding_service_module.requests, "post", fake_post)
+    monkeypatch.setattr(EmbeddingService, "_dashscope_http_session", lambda _self: SimpleNamespace(post=fake_post))
     monkeypatch.setattr(embedding_service_module, "time", SimpleNamespace(sleep=lambda _seconds: None))
 
     with caplog.at_level(logging.WARNING, logger="services.embedding.embedding_service"):
@@ -397,3 +397,38 @@ def test_memory_embedding_cache_evicts_least_recently_used_entry() -> None:
     assert service._get_cached_embedding("b") is None
     assert service._get_cached_embedding("a") == [0.1, 0.2]
     assert service._get_cached_embedding("c") == [0.5, 0.6]
+
+
+def test_dashscope_prepared_inputs_batch_text_and_send_images_individually(monkeypatch) -> None:
+    monkeypatch.setitem(embedding_service_module.EMBEDDING_CONFIG, "request_max_workers", 3)
+    service = EmbeddingService()
+    text_batches: list[list[str]] = []
+    image_inputs: list[str] = []
+
+    def fake_text_batch(texts, _config):
+        text_batches.append(list(texts))
+        return [[float(text.split("-")[1])] for text in texts]
+
+    def fake_image_input(embedding_input, _config):
+        image_inputs.append(embedding_input["text"])
+        return [float(embedding_input["text"].split("-")[1])]
+
+    monkeypatch.setattr(service, "_create_dashscope_embeddings", fake_text_batch)
+    monkeypatch.setattr(service, "_create_dashscope_embedding_from_input", fake_image_input)
+    modes = ["text", "multimodal", "text", "text", "multimodal", "text", "text"]
+    prepared_inputs = [
+        {"embedding_input": {"mode": mode, "text": f"{mode}-{index}"}}
+        for index, mode in enumerate(modes)
+    ]
+
+    vectors = service._create_dashscope_embeddings_for_prepared_inputs(
+        prepared_inputs,
+        EmbeddingConfig(provider="dashscope", model_name="test-model"),
+        batch_size=2,
+        label="paper.pdf",
+    )
+
+    # 返回顺序与输入一致；文本两条一批，图片各自单独请求。
+    assert vectors == [[float(index)] for index in range(len(modes))]
+    assert sorted(text_batches) == [["text-0", "text-2"], ["text-3", "text-5"], ["text-6"]]
+    assert sorted(image_inputs) == ["multimodal-1", "multimodal-4"]
