@@ -14,7 +14,13 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from ..schemas import ArxivSearchSpec, SearchConcept, get_default_agent_arxiv_categories, get_valid_arxiv_categories
+from ..schemas import (
+    ArxivSearchSpec,
+    SearchConcept,
+    get_agent_max_search_results,
+    get_default_agent_arxiv_categories,
+    get_valid_arxiv_categories,
+)
 from .search_ladder import text_tokens
 from .text_utils import _normalize_optional_str, _normalize_text, _parse_small_chinese_number
 from ..intent_definitions import PARSE_SUPPORTED_INTENTS
@@ -190,7 +196,7 @@ def _normalize_and_validate_spec(payload: Mapping[str, Any]) -> Optional[ArxivSe
         abstract_query=_normalize_optional_str(payload.get("abstract_query")),
         categories=get_default_agent_arxiv_categories(),
         submitted_days_ago=_safe_optional_int(payload.get("submitted_days_ago")),
-        max_results=_clamp(_safe_int(payload.get("max_results"), default=10), 1, 20),
+        max_results=_clamp(_safe_int(payload.get("max_results"), default=10), 1, get_agent_max_search_results()),
         sort_by=_normalize_sort_by(payload.get("sort_by")),
         sort_order=_normalize_sort_order(payload.get("sort_order")),
         field_operator=_normalize_field_operator(payload.get("field_operator")),
@@ -292,7 +298,7 @@ def _apply_rule_enrichment(message: str, spec: ArxivSearchSpec) -> Optional[Arxi
     abstract_query = spec.abstract_query
     categories = get_default_agent_arxiv_categories()
     submitted_days_ago = spec.submitted_days_ago if spec.submitted_days_ago is not None else _extract_submitted_days_ago(message)
-    max_results = _clamp(spec.max_results or 10, 1, 20)
+    max_results = _clamp(spec.max_results or 10, 1, get_agent_max_search_results())
     sort_by, sort_order = _extract_sorting(message)
     if spec.sort_by in {"relevance", "submittedDate", "lastUpdatedDate"}:
         sort_by = spec.sort_by
@@ -366,17 +372,21 @@ def _extract_submitted_days_ago(message: str) -> Optional[int]:
     return None
 
 
-def _extract_max_results(message: str) -> int:
-    """从消息中提取期望返回的论文数量，并裁剪到允许范围。"""
+def _extract_requested_count(message: str) -> Optional[int]:
+    """从消息中读出用户要的论文数量（未裁剪）；没说数量时返回 None。"""
     for pattern in COUNT_PATTERNS:
         match = re.search(pattern, message, flags=re.IGNORECASE)
         if match:
             raw_value = match.group(1)
             value = _parse_small_chinese_number(raw_value)
-            if value is None:
-                value = _safe_int(raw_value, default=10)
-            return _clamp(value, 1, 20)
-    return 10
+            return value if value is not None else _safe_int(raw_value, default=10)
+    return None
+
+
+def _extract_max_results(message: str) -> int:
+    """从消息中提取期望返回的论文数量，并裁剪到允许范围。"""
+    requested = _extract_requested_count(message)
+    return 10 if requested is None else _clamp(requested, 1, get_agent_max_search_results())
 
 
 def _extract_sorting(message: str) -> Tuple[str, str]:
@@ -676,9 +686,13 @@ def _ground_search_spec(
     if submitted_days_ago is not None:
         sources["submitted_days_ago"] = "user" if rule_days is not None else "inferred"
 
-    count_stated = any(re.search(pattern, message, flags=re.IGNORECASE) for pattern in COUNT_PATTERNS)
-    max_results = _extract_max_results(message) if count_stated else spec.max_results
-    sources["max_results"] = "user" if count_stated else "default"
+    requested_count = _extract_requested_count(message)
+    max_results = _extract_max_results(message) if requested_count is not None else spec.max_results
+    if requested_count is None:
+        sources["max_results"] = "default"
+    else:
+        # 超过单次上限时不能静默截断，标成 user_capped 让回答说明实际按多少篇检索。
+        sources["max_results"] = "user_capped" if requested_count > max_results else "user"
 
     # 排序以原话为准：只有用户说“最新/最相关”才算明确要求，否则默认按相关性。
     sort_by, sort_order = _extract_sorting(message)

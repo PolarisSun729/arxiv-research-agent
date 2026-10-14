@@ -208,6 +208,7 @@ def _relaxation_summary(
         "exhausted": len(papers) < requested,
         "locked_constraints": locked,
         "profile_concepts": [concept.term for concept in spec.concepts if concept.source == "profile"],
+        "count_capped": sources.get("max_results") == "user_capped",
     }
     if note:
         summary["note"] = note
@@ -610,6 +611,8 @@ def _relaxation_notes(relaxation: Mapping[str, Any], result_count: int) -> List[
         strict_count = int(attempts[0].get("new_papers") or 0) if attempts else 0
         notes.append(f"严格条件下只找到 {strict_count} 篇，其余结果来自放宽后的检索（{labels}）。")
     requested = int(relaxation.get("requested") or 0)
+    if relaxation.get("count_capped") and requested:
+        notes.append(f"你要的数量超过了单次检索上限，本次最多返回 {requested} 篇。")
     if requested and result_count < requested and relaxation.get("attempts"):
         notes.append(f"可自动放宽的条件已经用完，实际只找到 {result_count} 篇（你要的是 {requested} 篇）。")
     return notes

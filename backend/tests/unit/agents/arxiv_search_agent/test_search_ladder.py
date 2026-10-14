@@ -141,6 +141,33 @@ def test_search_adapter_merges_levels_until_enough_papers() -> None:
     assert output.relaxation["locked_constraints"] == ["submitted_days_ago"]
 
 
+def test_requested_count_above_limit_is_capped_and_flagged() -> None:
+    limit = schemas.get_agent_max_search_results()
+    spec, _ = _ground(
+        {"intent": "arxiv_search", "concepts": [{"term": "RAG", "evidence": "RAG"}], "max_results": limit + 50},
+        message=f"帮我找关于 RAG 的 {limit + 50} 篇论文",
+    )
+
+    assert spec.max_results == limit
+    assert spec.constraint_sources["max_results"] == "user_capped"
+
+
+def test_requested_count_within_limit_is_kept() -> None:
+    spec, _ = _ground(
+        {"intent": "arxiv_search", "concepts": [{"term": "RAG", "evidence": "RAG"}], "max_results": 100},
+        message="帮我找最近2年内关于 RAG 的100篇论文",
+    )
+
+    assert spec.max_results == min(100, schemas.get_agent_max_search_results())
+    assert spec.constraint_sources["max_results"] == "user"
+
+
+def test_capped_count_is_explained_in_answer() -> None:
+    notes = search_adapters._relaxation_notes({"requested": 100, "count_capped": True, "attempts": []}, 100)
+
+    assert any("单次检索上限" in note and "100 篇" in note for note in notes)
+
+
 def test_empty_answer_lists_attempts_and_suggests_wider_time_window() -> None:
     relaxation = {
         "attempts": [

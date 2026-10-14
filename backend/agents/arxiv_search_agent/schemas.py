@@ -82,6 +82,17 @@ def get_default_agent_arxiv_categories() -> List[str]:
     return [category for category in ("cs.CL", "cs.LG", "cs.IR", "cs.AI") if category in valid_categories]
 
 
+@lru_cache(maxsize=1)
+def get_agent_max_search_results() -> int:
+    """Agent 单次检索的论文数上限，与 arXiv 检索服务的 max_allowed_results 保持一致。"""
+    try:
+        from utils.config import ARXIV_SEARCH_CONFIG
+
+        return max(1, int(ARXIV_SEARCH_CONFIG["max_allowed_results"]))
+    except Exception:
+        return 100
+
+
 class ArxivSearchRequest(BaseModel):
     """定义搜索 Agent 接口接收的一次原始请求。
 
@@ -146,7 +157,8 @@ class ArxivSearchRequest(BaseModel):
         return self
 
 
-SearchConstraintSource = Literal["user", "inferred", "default", "profile"]
+# user_capped：用户明确给了数量，但超过单次上限被截断，回答里需要说明。
+SearchConstraintSource = Literal["user", "user_capped", "inferred", "default", "profile"]
 
 
 class SearchConcept(BaseModel):
@@ -299,8 +311,9 @@ class ArxivSearchSpec(BaseModel):
         if value is None or value == "":
             return 10
         results = int(value)
-        if not (1 <= results <= 20):
-            raise ValueError("max_results must be between 1 and 20")
+        limit = get_agent_max_search_results()
+        if not (1 <= results <= limit):
+            raise ValueError(f"max_results must be between 1 and {limit}")
         return results
 
     @field_validator("sort_by", mode="before")
