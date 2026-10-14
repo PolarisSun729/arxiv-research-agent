@@ -267,7 +267,7 @@ class LoadingService:
 
             pipeline_options = PdfPipelineOptions()
             # 页面/图片渲染是 Docling 转换里最重的部分之一；通过配置控制，避免普通 QA 建索引强制生成高倍率资产。
-            pipeline_options.generate_page_images = bool(DOCLING_CONFIG.get("generate_page_images", True))
+            pipeline_options.generate_page_images = bool(DOCLING_CONFIG.get("generate_page_images", False))
             pipeline_options.generate_picture_images = bool(DOCLING_CONFIG.get("generate_picture_images", True))
             pipeline_options.images_scale = float(DOCLING_CONFIG.get("images_scale", 2.0))
             pipeline_options.do_ocr = bool(DOCLING_CONFIG.get("do_ocr_enabled", False))
