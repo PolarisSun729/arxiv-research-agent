@@ -44,6 +44,8 @@ const qaMode = ref(false)
 const creatingIndex = ref(false)
 const qaIndexJob = ref<QaIndexJobResult | null>(null)
 const qaJobPolling = ref(false)
+// 连续轮询失败次数，用于退避和提示“正在重试”。
+const qaJobPollFailures = ref(0)
 const loadingMethod = ref<'pymupdf' | 'docling'>('docling')
 const qaStatus = ref<QaStatusResult | null>(null)
 const qaDiagnostic = ref<QaDiagnosticResult | null>(null)
@@ -115,16 +117,24 @@ const qaStageText = computed(() => {
     pending: '等待开始',
     starting: '任务启动中',
     validate_loading_method: '校验解析方式',
+    create_build_version: '创建构建版本',
     mark_index_processing: '标记索引处理中',
     load_paper_metadata: '加载论文元数据',
     download_pdf: '下载 PDF',
     load_pdf_document: '解析 PDF 文档',
     chunk_document: '切分文档 chunks',
+    structure_table_chunks: '整理表格 chunks',
     save_chunk_file: '保存 chunk 文件',
+    save_sparse_index_artifact: '保存关键词索引',
     compress_chunks_for_rerank: '生成 rerank 文本',
+    build_retrieval_indexes: '生成检索索引',
+    save_retrieval_index_artifact: '保存检索索引',
     create_chunk_embeddings: '生成 embeddings',
     save_embeddings: '保存 embeddings',
     index_embeddings_to_vector_store: '写入向量库',
+    validate_new_collection: '校验新向量集合',
+    validate_sparse_index_artifact: '校验关键词索引',
+    activate_index: '启用新索引',
     mark_index_success: '索引完成'
   }
   return stageMap[stage] || stage || '-'
@@ -264,16 +274,21 @@ async function handleRefreshQaState() {
   await resumeLatestQaJobPolling()
 }
 
-function stopQaJobPolling() {
-  qaJobPolling.value = false
+function clearQaJobPollTimer() {
   if (qaJobPollTimer) {
     clearTimeout(qaJobPollTimer)
     qaJobPollTimer = null
   }
 }
 
+function stopQaJobPolling() {
+  qaJobPolling.value = false
+  qaJobPollFailures.value = 0
+  clearQaJobPollTimer()
+}
+
 function scheduleQaJobPolling(jobId: string, delayMs: number = 2500) {
-  stopQaJobPolling()
+  clearQaJobPollTimer()
   qaJobPolling.value = true
   qaJobPollTimer = window.setTimeout(() => {
     pollQaJobStatus(jobId).catch(error => {
@@ -285,36 +300,46 @@ function scheduleQaJobPolling(jobId: string, delayMs: number = 2500) {
 async function pollQaJobStatus(jobId: string) {
   if (!paperId.value || !jobId) return
 
+  let job: QaIndexJobResult
   try {
-    const job = await getPaperQaIndexJob(paperId.value, jobId)
-    qaIndexJob.value = job
-
-    if (job.status === 'success') {
-      stopQaJobPolling()
-      ElMessage.success('问答索引创建完成')
-      await fetchQaStatus()
-      return
-    }
-
-    if (job.status === 'failed') {
-      stopQaJobPolling()
-      await fetchQaStatus()
-      ElMessage.error(job.error_message || `索引创建失败：${qaStageText.value}`)
-      return
-    }
-
-    if (job.status === 'pending' || job.status === 'running') {
-      scheduleQaJobPolling(jobId)
-      return
-    }
-
-    stopQaJobPolling()
+    job = await getPaperQaIndexJob(paperId.value, jobId)
   } catch (error: any) {
-    stopQaJobPolling()
-    if (error?.response?.status !== 404) {
-      ElMessage.error(error?.response?.data?.detail || '查询索引任务状态失败')
+    const status = error?.httpStatus
+    // 任务不存在或无权查看时重试也没用，直接停止；登录失效由请求层统一处理。
+    if (status === 404 || status === 401 || status === 403) {
+      stopQaJobPolling()
+      return
     }
+    // 其余多为暂时性错误（服务重启时的 502、网络抖动、超时），任务仍在后台运行，退避后继续轮询。
+    qaJobPollFailures.value += 1
+    console.warn('QA index job poll failed, retrying:', error)
+    scheduleQaJobPolling(jobId, Math.min(2500 * 2 ** qaJobPollFailures.value, 15000))
+    return
   }
+
+  qaJobPollFailures.value = 0
+  qaIndexJob.value = job
+
+  if (job.status === 'success') {
+    stopQaJobPolling()
+    ElMessage.success('问答索引创建完成')
+    await fetchQaStatus()
+    return
+  }
+
+  if (job.status === 'failed') {
+    stopQaJobPolling()
+    await fetchQaStatus()
+    ElMessage.error(job.error_message || `索引创建失败：${qaStageText.value}`)
+    return
+  }
+
+  if (job.status === 'pending' || job.status === 'running') {
+    scheduleQaJobPolling(jobId)
+    return
+  }
+
+  stopQaJobPolling()
 }
 
 async function resumeLatestQaJobPolling() {
@@ -329,7 +354,7 @@ async function resumeLatestQaJobPolling() {
       scheduleQaJobPolling(job.job_id, 1500)
     }
   } catch (error: any) {
-    if (error?.response?.status !== 404) {
+    if (error?.httpStatus !== 404) {
       console.error('Failed to fetch latest QA index job:', error)
     }
   }
@@ -580,6 +605,7 @@ watch(paperId, async () => {
               :status="qaIndexJob.status === 'failed' ? 'exception' : (qaIndexJob.status === 'success' ? 'success' : undefined)"
             />
             <div v-if="qaIndexJob.error_message" class="job-error-text">{{ qaIndexJob.error_message }}</div>
+            <div v-else-if="qaJobPollFailures > 0" class="muted">暂时无法获取最新进度，正在重试…</div>
           </div>
 
           <div v-if="qaStatus" class="status-note">
