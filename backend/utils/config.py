@@ -297,6 +297,8 @@ EMBEDDING_CONFIG: Dict[str, Any] = {
     "backoff_base_seconds": _env_float("EMBEDDING_REQUEST_BACKOFF_BASE_SECONDS", 1.0),
     "backoff_max_seconds": _env_float("EMBEDDING_REQUEST_BACKOFF_MAX_SECONDS", 30.0),
     "jitter_ratio": _env_float("EMBEDDING_REQUEST_JITTER_RATIO", 0.2),
+    # 一次建索引里同时在途的远程 embedding 请求数；调大更快，但更容易触发供应商限流。
+    "request_max_workers": _env_int("EMBEDDING_REQUEST_MAX_WORKERS", 4),
     # 进程内 embedding 缓存的最大条数，超出后按最近最少使用淘汰；2048 维向量每条约 16KB。
     "memory_cache_max_entries": _env_int("EMBEDDING_MEMORY_CACHE_MAX_ENTRIES", 2048),
     "local_model_path": _env_str("LOCAL_EMBEDDING_MODEL_PATH", str(REPO_ROOT / "00-models" / "Qwen3-VL-Embedding-2B")),

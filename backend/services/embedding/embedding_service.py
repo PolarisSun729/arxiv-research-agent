@@ -9,11 +9,13 @@ import hashlib
 import json
 from array import array
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import logging
 import random
 import time
+from time import perf_counter
 from enum import Enum
 from typing import Any, Dict, List, Optional
 import os
@@ -23,6 +25,7 @@ import threading
 import numpy as np
 import sys
 import requests
+from requests.adapters import HTTPAdapter
 from openai import OpenAI
 from services.retrieval.retrieval_index import (
     RetrievalIndex,
@@ -209,6 +212,8 @@ class EmbeddingService:
         self._embedding_cache: "OrderedDict[str, array]" = OrderedDict()
         self._embedding_cache_max_entries = max(1, int(EMBEDDING_CONFIG.get("memory_cache_max_entries", 2048)))
         self._embedding_cache_lock = threading.Lock()
+        self._http_session: Optional[requests.Session] = None
+        self._http_session_lock = threading.Lock()
 
     @staticmethod
     def _create_openai_embeddings(texts: list, config: EmbeddingConfig) -> list:
@@ -435,6 +440,23 @@ class EmbeddingService:
         fallback_vectors = [self._create_dashscope_embedding_from_input(item, config) for item in embedding_inputs]
         return fallback_vectors, usage
 
+    def _dashscope_http_session(self) -> requests.Session:
+        """返回复用连接的 HTTP 会话。
+
+        每次 requests.post 都要重新建立 TCP 和 TLS 连接；服务器到 DashScope 的往返较慢时，
+        握手开销比请求本身还大。会话内的连接池在多个线程间共享，池大小覆盖并发请求数。
+        """
+        if self._http_session is None:
+            with self._http_session_lock:
+                if self._http_session is None:
+                    pool_size = max(4, int(EMBEDDING_CONFIG.get("request_max_workers", 4) or 1))
+                    session = requests.Session()
+                    adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+                    session.mount("https://", adapter)
+                    session.mount("http://", adapter)
+                    self._http_session = session
+        return self._http_session
+
     def _post_dashscope_embedding_request(
         self,
         *,
@@ -453,7 +475,7 @@ class EmbeddingService:
 
         for attempt in range(1, max_attempts + 1):
             try:
-                response = requests.post(
+                response = self._dashscope_http_session().post(
                     url,
                     headers=headers,
                     json=payload,
@@ -771,48 +793,27 @@ class EmbeddingService:
             return results, {}
 
         if provider_key == EmbeddingProvider.DASHSCOPE.value:
-            if any(item["embedding_input"].get("mode") == "multimodal" for item in prepared_inputs):
-                # DashScope 多模态输入目前按单条调用，避免图像载荷批量拼接复杂化。
-                for prepared in prepared_inputs:
-                    chunk = prepared["chunk"]
-                    embedding_vector = self._create_dashscope_embedding_from_input(prepared["embedding_input"], config)
-                    results.append(
-                        {
-                            "embedding": embedding_vector,
-                            "metadata": self._build_embedding_metadata(
-                                chunk=chunk,
-                                chunk_count=len(chunks),
-                                embedding_vector=embedding_vector,
-                                provider=provider_key,
-                                model=config.model_name,
-                                filename=filename,
-                                retrieval_index=prepared["retrieval_index"],
-                            ),
-                        }
-                    )
-            else:
-                for i in range(0, len(prepared_inputs), batch_size):
-                    batch = prepared_inputs[i : i + batch_size]
-                    texts = [item["embedding_input"]["text"] for item in batch]
-                    # 纯文本场景优先走批量调用，降低远程 provider 的请求成本。
-                    embedding_vectors = self._create_dashscope_embeddings(texts, config)
-
-                    for prepared, embedding_vector in zip(batch, embedding_vectors):
-                        chunk = prepared["chunk"]
-                        results.append(
-                            {
-                                "embedding": embedding_vector,
-                                "metadata": self._build_embedding_metadata(
-                                    chunk=chunk,
-                                    chunk_count=len(chunks),
-                                    embedding_vector=embedding_vector,
-                                    provider=provider_key,
-                                    model=config.model_name,
-                                    filename=filename,
-                                    retrieval_index=prepared["retrieval_index"],
-                                ),
-                            }
-                        )
+            embedding_vectors = self._create_dashscope_embeddings_for_prepared_inputs(
+                prepared_inputs,
+                config,
+                batch_size=batch_size,
+                label=filename,
+            )
+            for prepared, embedding_vector in zip(prepared_inputs, embedding_vectors):
+                results.append(
+                    {
+                        "embedding": embedding_vector,
+                        "metadata": self._build_embedding_metadata(
+                            chunk=prepared["chunk"],
+                            chunk_count=len(chunks),
+                            embedding_vector=embedding_vector,
+                            provider=provider_key,
+                            model=config.model_name,
+                            filename=filename,
+                            retrieval_index=prepared["retrieval_index"],
+                        ),
+                    }
+                )
             return results, {}
 
         if provider_key != EmbeddingProvider.OPENAI.value:
@@ -845,6 +846,91 @@ class EmbeddingService:
                 )
 
         return results, {}
+
+    def _create_dashscope_embeddings_for_prepared_inputs(
+        self,
+        prepared_inputs: list,
+        config: EmbeddingConfig,
+        *,
+        batch_size: int,
+        label: str = "",
+    ) -> list:
+        """按输入顺序返回 DashScope 向量：纯文本按批请求，带图片的逐条请求，多个请求并发执行。
+
+        图片载荷较大，仍然单条提交；文本即使与图片混在同一篇论文里，也照常按 batch_size 合并，
+        避免一篇论文几百条索引全部变成逐条往返。
+        """
+        text_positions = [
+            position
+            for position, prepared in enumerate(prepared_inputs)
+            if prepared["embedding_input"].get("mode") != "multimodal"
+        ]
+        multimodal_positions = [
+            position
+            for position, prepared in enumerate(prepared_inputs)
+            if prepared["embedding_input"].get("mode") == "multimodal"
+        ]
+        step = max(1, int(batch_size or 1))
+        # 每个请求单元是 (输入位置列表, 是否多模态)。
+        units = [(text_positions[i : i + step], False) for i in range(0, len(text_positions), step)]
+        units.extend(([position], True) for position in multimodal_positions)
+        if not units:
+            return []
+
+        def run_unit(positions: list, multimodal: bool) -> list:
+            if multimodal:
+                return [self._create_dashscope_embedding_from_input(prepared_inputs[positions[0]]["embedding_input"], config)]
+            texts = [prepared_inputs[position]["embedding_input"]["text"] for position in positions]
+            return self._create_dashscope_embeddings(texts, config)
+
+        vectors: List[Optional[list]] = [None] * len(prepared_inputs)
+        total_inputs = len(prepared_inputs)
+        done_inputs = 0
+        started_at = perf_counter()
+        max_workers = min(len(units), max(1, int(EMBEDDING_CONFIG.get("request_max_workers", 4) or 1)))
+        logger.info(
+            "DashScope embedding started: file=%s inputs=%s text_requests=%s image_requests=%s workers=%s",
+            label,
+            total_inputs,
+            len(units) - len(multimodal_positions),
+            len(multimodal_positions),
+            max_workers,
+        )
+
+        def record(positions: list, unit_vectors: list) -> None:
+            nonlocal done_inputs
+            if len(unit_vectors) != len(positions):
+                raise ValueError(f"DashScope returned {len(unit_vectors)} embeddings for {len(positions)} inputs")
+            for position, vector in zip(positions, unit_vectors):
+                vectors[position] = vector
+            done_inputs += len(positions)
+            logger.info(
+                "DashScope embedding progress: file=%s %s/%s elapsed=%.1fs",
+                label,
+                done_inputs,
+                total_inputs,
+                perf_counter() - started_at,
+            )
+
+        if max_workers == 1:
+            for positions, multimodal in units:
+                record(positions, run_unit(positions, multimodal))
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="dashscope-embedding") as executor:
+                futures = {
+                    executor.submit(run_unit, positions, multimodal): positions
+                    for positions, multimodal in units
+                }
+                try:
+                    for future in as_completed(futures):
+                        record(futures[future], future.result())
+                except BaseException:
+                    # 任一请求最终失败时整篇建库都会失败，取消尚未开始的请求，不再继续消耗配额。
+                    for future in futures:
+                        future.cancel()
+                    raise
+
+        return [vector if vector is not None else [] for vector in vectors]
 
     @staticmethod
     def _metadata_bool(value: Any, default: bool) -> bool:
