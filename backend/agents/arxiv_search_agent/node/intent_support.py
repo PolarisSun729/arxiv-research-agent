@@ -17,7 +17,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from pydantic import ValidationError
 
-from ..utils.search_spec_builder import ABSTRACT_HINT_PATTERNS
+from ..utils.search_spec_builder import ABSTRACT_HINT_PATTERNS, MAX_CORE_CONCEPTS
 from ..utils.text_utils import _extract_json_block, _matches_any, _normalize_text
 from ..intent_definitions import (
     LLM_CLASSIFICATION_GUIDANCE,
@@ -470,15 +470,19 @@ def _build_llm_prompt_with_profile(message: str, research_profile: Optional[Mapp
         '\"next_actions\":[]'
         "}\n"
         "Search spec rules:\n"
-        "- concepts: the core topics the user explicitly asked for; papers must match every concept. "
+        "- concepts: the core research objects the user asked about; papers must match every concept, "
+        f"so use as few as possible (usually 1-2, at most {MAX_CORE_CONCEPTS}). "
         "Write term in English as it appears in arXiv papers (translate Chinese). "
         "Keep the user's granularity: never add words the user did not say "
         "(user says 'RAG' -> term 'RAG', not 'RAG retrieval optimization').\n"
         "- evidence: the exact words copied from the user message that this concept comes from.\n"
-        "- aliases: up to 3 English synonyms, abbreviations or expansions with the same meaning "
-        "(e.g. 'RAG' -> ['retrieval-augmented generation']). No narrower or broader subtopics.\n"
-        "- Put each distinct topic in its own concept. Put secondary qualifiers the user mentioned "
-        "(that could be dropped if results are scarce) in optional_terms; otherwise leave it empty.\n"
+        "- aliases: up to 3 English synonyms, abbreviations or common alternative phrasings with the same meaning "
+        "(e.g. 'RAG' -> ['retrieval-augmented generation']; 'tool use' -> ['tool calling', 'function calling']). "
+        "No narrower or broader subtopics.\n"
+        "- optional_terms: aspects, angles or qualifiers of the core objects the user mentioned "
+        "(how it is done, what part of it is studied), which can be dropped if results are scarce. "
+        "Example: '调研 Agent 的工具怎么编排、怎样表达和生成' -> concepts 'agent', 'tool use'; "
+        "optional_terms 'orchestration', 'representation', 'generation'. Leave it empty if there are none.\n"
         "- submitted_days_ago / max_results: null unless the user stated them.\n"
         "- title_query / abstract_query: only when the user explicitly asks to search the title/abstract.\n"
         "Guidance:\n"

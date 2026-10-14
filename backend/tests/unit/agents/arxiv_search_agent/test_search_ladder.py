@@ -201,3 +201,40 @@ def test_personalize_reorders_only_within_same_match_level() -> None:
 
     assert [paper["arxiv_id"] for paper in output.ranked_papers] == ["b", "a", "c"]
     assert output.ranked_papers[0]["reason"].startswith("matched_profile_topics")
+
+
+def test_grounding_demotes_extra_concepts_to_optional_terms() -> None:
+    message = "调研最近2年 Agent 的工具怎么编排、怎样表达和生成"
+    spec, warnings = _ground(
+        {
+            "intent": "arxiv_search",
+            "concepts": [
+                {"term": "agent", "evidence": "Agent"},
+                {"term": "tool use", "aliases": ["tool calling", "function calling"], "evidence": "工具"},
+                {"term": "orchestration", "evidence": "编排"},
+                {"term": "representation", "evidence": "表达"},
+                {"term": "generation", "evidence": "生成"},
+            ],
+        },
+        message=message,
+        profile=None,
+    )
+
+    assert [concept.term for concept in spec.concepts] == ["agent", "tool use", "orchestration"]
+    assert spec.optional_terms == ["representation", "generation"]
+    assert any("降为补充词" in warning for warning in warnings)
+
+
+def test_answer_names_dropped_optional_terms() -> None:
+    relaxation = {
+        "attempts": [
+            {"level": "strict", "ok": True, "new_papers": 0},
+            {"level": "drop_optional_terms", "label": "去掉补充词", "ok": True, "new_papers": 12},
+        ],
+        "requested": 10,
+        "optional_terms": ["orchestration", "representation"],
+    }
+
+    notes = search_adapters._relaxation_notes(relaxation, 10)
+
+    assert any("orchestration、representation" in note for note in notes)

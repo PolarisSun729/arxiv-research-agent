@@ -209,6 +209,7 @@ def _relaxation_summary(
         "locked_constraints": locked,
         "profile_concepts": [concept.term for concept in spec.concepts if concept.source == "profile"],
         "count_capped": sources.get("max_results") == "user_capped",
+        "optional_terms": list(spec.optional_terms or []),
     }
     if note:
         summary["note"] = note
@@ -610,6 +611,10 @@ def _relaxation_notes(relaxation: Mapping[str, Any], result_count: int) -> List[
         labels = "、".join(str(item.get("label") or item.get("level")) for item in relaxed)
         strict_count = int(attempts[0].get("new_papers") or 0) if attempts else 0
         notes.append(f"严格条件下只找到 {strict_count} 篇，其余结果来自放宽后的检索（{labels}）。")
+        optional_terms = [str(item) for item in relaxation.get("optional_terms") or [] if str(item).strip()]
+        if optional_terms:
+            # 严格级别之后的每一级都不带补充词；讲清楚丢掉了哪些词，用户才能判断结果有没有偏离方向。
+            notes.append(f"放宽时去掉了补充词「{'、'.join(optional_terms)}」，这部分论文不一定涉及这些方面。")
     requested = int(relaxation.get("requested") or 0)
     if relaxation.get("count_capped") and requested:
         notes.append(f"你要的数量超过了单次检索上限，本次最多返回 {requested} 篇。")
