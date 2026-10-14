@@ -229,6 +229,35 @@ class DeploymentTests(TemporaryReleaseTest):
             self.assertEqual(self.request(archive)["status"], "already_active")
             install.assert_not_called()
 
+    def test_success_prunes_releases_and_environments_except_current_and_previous(self) -> None:
+        stale = self.root / "releases/stale"
+        stale.mkdir()
+        environments = self.root / "venvs"
+        for name in ("stale-env", "old-env", "half-installed"):
+            (environments / name).mkdir(parents=True)
+        deploy.atomic_link(environments / "stale-env", stale / ".venv")
+        deploy.atomic_link(environments / "old-env", self.old / ".venv")
+        deploy.atomic_link(environments / "stale-env", environments / "cache-stale")
+        deploy.atomic_link(environments / "old-env", environments / "cache-old")
+        # 旧版本目录里指向 shared 的链接只能删除链接本身，不能删到用户数据。
+        deploy.atomic_link(self.database.parent, stale / "database")
+        archive = self.make_archive(self.make_payload(), self.root / "incoming/release.tar.gz")
+        environment = environments / "ready"
+        environment.mkdir()
+        with patch.object(deploy, "install_environment", return_value=environment), patch.object(deploy, "SystemdRuntime", return_value=self.runtime):
+            result = self.request(archive)
+        self.assertEqual(sorted(result["pruned"]), ["releases/stale", "venvs/cache-stale", "venvs/half-installed", "venvs/stale-env"])
+        self.assertEqual(sorted(path.name for path in (self.root / "releases").iterdir()), sorted([RELEASE_ID, "old"]))
+        self.assertEqual(sorted(path.name for path in environments.iterdir()), ["cache-old", "old-env", "ready"])
+        self.assertEqual(self.database.read_bytes(), b"existing user history")
+
+    def test_prune_keeps_everything_when_current_is_missing(self) -> None:
+        (self.root / "current").unlink()
+        (self.root / "venvs/orphan").mkdir(parents=True)
+        self.assertEqual(deploy.prune_old_releases(self.root), [])
+        self.assertTrue(self.old.is_dir())
+        self.assertTrue((self.root / "venvs/orphan").is_dir())
+
     def test_failed_install_does_not_switch_or_restart(self) -> None:
         archive = self.make_archive(self.make_payload())
         with patch.object(deploy, "install_environment", side_effect=subprocess.CalledProcessError(1, "pip")), patch.object(deploy, "SystemdRuntime") as runtime:
