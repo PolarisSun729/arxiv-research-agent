@@ -36,6 +36,13 @@ def _step_output(runtime: PlanRuntime, plan: ExecutablePlan, step_id: Optional[s
     return None
 
 
+def _step_output_recorded(runtime: PlanRuntime, plan: ExecutablePlan, step_id: Optional[str]) -> bool:
+    for plan_step in list(plan.steps or []):
+        if plan_step.step_id == str(step_id or "").strip() and plan_step.output_key:
+            return plan_step.output_key in runtime.outputs
+    return False
+
+
 def step_output(runtime: PlanRuntime, plan: ExecutablePlan, step_id: Optional[str]) -> Any:
     """按计划步骤读取其声明的输出，供其他执行组件复用同一解析规则。"""
 
@@ -106,7 +113,13 @@ class InputBindingResolver:
                     else None
                 )
             elif binding.source_type == "step_output":
-                value = _step_output(runtime, runtime.plan or ExecutablePlan(goal=Goal(), plan_id="unknown"), binding.step_id)
+                plan = runtime.plan or ExecutablePlan(goal=Goal(), plan_id="unknown")
+                value = _step_output(runtime, plan, binding.step_id)
+                # 上游步骤已执行并产出空列表/空字典（例如检索 0 篇）是合法结果，不算缺少输入；
+                # 否则 LLM 草稿把这类绑定标成 required 时，0 篇会直接失败，回答步骤没机会解释“没找到”。
+                if binding.required and value in ([], {}) and _step_output_recorded(runtime, plan, binding.step_id):
+                    resolved[binding.input_key] = value
+                    continue
             else:
                 value = binding.value if binding.source_type == "literal" else None
             if value in (None, "", [], {}) and binding.required:
