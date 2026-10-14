@@ -39,7 +39,7 @@ request.interceptors.response.use(
     const key = String(error.config?.headers?.get?.('X-API-Key') || '')
     handleAuthFailure(payload.code, bearer.startsWith('Bearer ') ? { mode: 'jwt', value: bearer.slice(7) } : key ? { mode: 'api_key', value: key } : null)
     // API 层统一把后端错误契约转成 ApiError，页面只需要按 code 展示提示。
-    return Promise.reject(new ApiError(payload))
+    return Promise.reject(new ApiError(payload, error.response?.status))
   }
 )
 

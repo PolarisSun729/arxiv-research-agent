@@ -280,7 +280,7 @@ export async function getUserPreferences(userId?: string): Promise<{
       research_profile: response?.research_profile ? normalizeResearchProfile(response.research_profile, effectiveUserId) : null
     }
   } catch (error: any) {
-    if (error?.response?.status === 404) {
+    if (error?.httpStatus === 404) {
       return { liked_papers: [], disliked_papers: [], paper_actions: {}, research_profile: emptyResearchProfile(effectiveUserId) }
     }
     throw error
@@ -386,7 +386,7 @@ export async function getUserResearchProfile(userId?: string): Promise<UserResea
     const response: any = await request.get(`/user/research-profile/${effectiveUserId}`)
     return normalizeResearchProfile(response, effectiveUserId)
   } catch (error: any) {
-    if (error?.response?.status === 404) {
+    if (error?.httpStatus === 404) {
       return emptyResearchProfile(effectiveUserId)
     }
     throw error
@@ -676,7 +676,8 @@ export async function getLatestPaperQaIndexJob(arxivId: string): Promise<QaIndex
 }
 
 export async function getPaperQaIndexJob(arxivId: string, jobId: string): Promise<QaIndexJobResult> {
-  return request.get(`/paper/${arxivId}/qa-index-jobs/${jobId}`)
+  // 轮询请求只查一行任务状态，超时设短一些：卡住的请求尽快失败并进入下一轮，而不是让进度停住 10 分钟。
+  return request.get(`/paper/${arxivId}/qa-index-jobs/${jobId}`, { timeout: 15000 })
 }
 
 export type QaStreamPersistenceStatus = 'unknown' | 'saved' | 'failed' | 'not_saved'

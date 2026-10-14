@@ -42,11 +42,14 @@ const ERROR_MESSAGES: Record<string, string> = {
 
 export class ApiError extends Error {
   payload: ApiErrorPayload
+  // HTTP 状态码；网络中断、超时等没有响应的错误为 undefined。
+  httpStatus?: number
 
-  constructor(payload: ApiErrorPayload) {
+  constructor(payload: ApiErrorPayload, httpStatus?: number) {
     super(payload.message)
     this.name = 'ApiError'
     this.payload = payload
+    this.httpStatus = httpStatus
   }
 }
 
