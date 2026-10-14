@@ -118,9 +118,17 @@ DOCLING_CONFIG: Dict[str, Any] = {
     "do_ocr_enabled": _env_bool("DOCLING_OCR_ENABLED", False),
     "annotated_pdf_export_enabled": _env_bool("DOCLING_ANNOTATED_PDF_EXPORT_ENABLED", True),
     # Docling 会按 images_scale 渲染页面/图片资产；默认保持低倍率，避免 30+ 页论文在建索引时生成超大图。
-    "generate_page_images": _env_bool("DOCLING_GENERATE_PAGE_IMAGES", True),
+    # 整页截图默认关闭：表格资产由 PyMuPDF 从原 PDF 裁剪，图片资产只依赖 generate_picture_images。
+    "generate_page_images": _env_bool("DOCLING_GENERATE_PAGE_IMAGES", False),
     "generate_picture_images": _env_bool("DOCLING_GENERATE_PICTURE_IMAGES", True),
     "images_scale": float(_env_str("DOCLING_IMAGES_SCALE", "2.0")),
+    # Docling 流水线默认每批 4 页、阶段间最多缓存 100 页、4 个推理线程；
+    # 4G 机器上解析单篇论文时子进程曾超过 2.5G 被 OOM 杀掉，这里压到逐页处理以降低内存峰值。
+    "layout_batch_size": _env_int("DOCLING_LAYOUT_BATCH_SIZE", 1),
+    "table_batch_size": _env_int("DOCLING_TABLE_BATCH_SIZE", 1),
+    "ocr_batch_size": _env_int("DOCLING_OCR_BATCH_SIZE", 1),
+    "queue_max_size": _env_int("DOCLING_QUEUE_MAX_SIZE", 4),
+    "num_threads": _env_int("DOCLING_NUM_THREADS", 2),
     "legend_padding": float(_env_str("DOCLING_LEGEND_PADDING", "8.0")),
     "legend_width": float(_env_str("DOCLING_LEGEND_WIDTH", "165.0")),
     "legend_row_height": float(_env_str("DOCLING_LEGEND_ROW_HEIGHT", "13.0")),
@@ -289,6 +297,8 @@ EMBEDDING_CONFIG: Dict[str, Any] = {
     "backoff_base_seconds": _env_float("EMBEDDING_REQUEST_BACKOFF_BASE_SECONDS", 1.0),
     "backoff_max_seconds": _env_float("EMBEDDING_REQUEST_BACKOFF_MAX_SECONDS", 30.0),
     "jitter_ratio": _env_float("EMBEDDING_REQUEST_JITTER_RATIO", 0.2),
+    # 进程内 embedding 缓存的最大条数，超出后按最近最少使用淘汰；2048 维向量每条约 16KB。
+    "memory_cache_max_entries": _env_int("EMBEDDING_MEMORY_CACHE_MAX_ENTRIES", 2048),
     "local_model_path": _env_str("LOCAL_EMBEDDING_MODEL_PATH", str(REPO_ROOT / "00-models" / "Qwen3-VL-Embedding-2B")),
     "local_model_scripts_path": _env_str(
         "LOCAL_EMBEDDING_MODEL_SCRIPTS_PATH",
@@ -547,6 +557,8 @@ ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     "enable_index_level_bm25": _env_bool("ENABLE_INDEX_LEVEL_BM25", True),
     "enable_generated_question_index": _env_bool("ENABLE_GENERATED_QUESTION_INDEX", True),
     "enable_chunk_level_retrieval_fallback": _env_bool("ENABLE_CHUNK_LEVEL_RETRIEVAL_FALLBACK", True),
+    # 进程内最多缓存多少篇论文的关键词检索索引，超出后按最近最少使用淘汰，被淘汰的论文下次查询时重建。
+    "collection_index_cache_max_entries": _env_int("RETRIEVAL_INDEX_CACHE_MAX_ENTRIES", 16),
     "context_budget_max_chars": _env_int("ENHANCED_RETRIEVAL_CONTEXT_BUDGET_MAX_CHARS", 24000),
     "retrieval_candidate_max_blocks": _env_int("RETRIEVAL_CANDIDATE_MAX_BLOCKS", 60),
     "retrieval_candidate_max_tokens_soft": _env_int("RETRIEVAL_CANDIDATE_MAX_TOKENS_SOFT", 90000),

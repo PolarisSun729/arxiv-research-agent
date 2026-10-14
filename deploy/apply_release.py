@@ -199,6 +199,46 @@ def activate_release(root: Path, release: Path, runtime: SystemdRuntime, timeout
         atomic_link(previous, root / "previous")
 
 
+def prune_old_releases(root: Path) -> list[str]:
+    """部署成功后清理旧版本：只保留 current、previous 两个版本目录及它们使用的 venv。
+
+    每个 venv 约 2GB，不清理时依赖每变一次就多占一份磁盘。返回被删除项的相对路径。
+    解析不出 current 时不删除任何东西；rmtree 不跟随符号链接，版本目录里指向 shared/ 的链接只删链接本身。
+    """
+    releases = (root / "releases").resolve()
+    environments = (root / "venvs").resolve()
+    kept_releases = set()
+    for name in ("current", "previous"):
+        link = root / name
+        if link.is_symlink() and link.resolve(strict=False).parent == releases:
+            kept_releases.add(link.resolve(strict=False))
+    if current_release(root) not in kept_releases:
+        return []
+    kept_environments = set()
+    for release in kept_releases:
+        venv_link = release / ".venv"
+        if venv_link.is_symlink() and venv_link.resolve(strict=False).parent == environments:
+            kept_environments.add(venv_link.resolve(strict=False))
+
+    removed = []
+    for release in releases.iterdir():
+        if release.is_dir() and not release.is_symlink() and release.resolve() not in kept_releases:
+            shutil.rmtree(release)
+            removed.append(f"releases/{release.name}")
+    if environments.is_dir():
+        for entry in environments.iterdir():
+            if entry.is_symlink():
+                # cache-<哈希> 链接：目标环境被删除（或本就失效）时一并移除，下次同样依赖会重新安装。
+                if entry.resolve(strict=False) not in kept_environments:
+                    entry.unlink()
+                    removed.append(f"venvs/{entry.name}")
+            elif entry.is_dir() and entry.resolve() not in kept_environments:
+                # 也会清掉安装失败残留的半成品环境。
+                shutil.rmtree(entry)
+                removed.append(f"venvs/{entry.name}")
+    return removed
+
+
 def apply_release(root: Path, archive: Path, expected_hash: str, commit: str, release_id: str, timeout: int) -> dict:
     """完整执行一次部署，返回部署结果（同时写入 last-deployment.json）。"""
     # ---- 1. 参数与前置条件校验，全部通过前不修改任何运行状态 ----
@@ -240,6 +280,11 @@ def apply_release(root: Path, archive: Path, expected_hash: str, commit: str, re
     activate_release(root, release, SystemdRuntime(), timeout)
     result = {"status": "deployed", "commit": commit, "release": release_id,
               "dependency_hash": manifest["dependency_hash"]}
+    # ---- 5. 清理旧版本；新版本已上线，清理失败只记录原因，不影响部署结果 ----
+    try:
+        result["pruned"] = prune_old_releases(root)
+    except OSError as exc:
+        result["prune_error"] = str(exc)
     (root / "last-deployment.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
 

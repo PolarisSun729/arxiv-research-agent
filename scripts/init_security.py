@@ -118,7 +118,7 @@ def initialize_security_config(repo_root: Path, *, profile: str, domain: str = D
         values.update({
             "PAPER_QA_BUILD_LLM_MAX_WORKERS": "2", "PROFILE_EVIDENCE_MAX_WORKERS": "1",
             "RETRIEVAL_ROUTE_MAX_WORKERS": "2", "DOCLING_OCR_ENABLED": "true",
-            "DOCLING_GENERATE_PAGE_IMAGES": "true", "DOCLING_GENERATE_PICTURE_IMAGES": "true",
+            "DOCLING_GENERATE_PAGE_IMAGES": "false", "DOCLING_GENERATE_PICTURE_IMAGES": "true",
             "DOCLING_IMAGES_SCALE": "2.0",
         })
     # 逐行复制模板：遇到 values 中的变量就替换等号右边的值，注释和其他变量原样保留；

@@ -15,7 +15,7 @@ import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -1412,7 +1412,10 @@ def _copy_lookup_tables(tables: Dict[str, Dict[Any, List[int]]]) -> Dict[str, Di
 
 
 class CollectionRetrievalIndexProvider:
-    """缓存 collection 的 keyword postings 和 chunk lookup，避免 route 查询时全量扫 chunk。"""
+    """缓存 collection 的 keyword postings 和 chunk lookup，避免 route 查询时全量扫 chunk。
+
+    缓存按最近最少使用淘汰，最多保留 max_entries 篇论文；被淘汰的论文下次查询时重建。
+    """
 
     def __init__(
         self,
@@ -1420,11 +1423,15 @@ class CollectionRetrievalIndexProvider:
         vector_store_service: Any,
         chunk_normalizer: Callable[[Dict[str, Any]], Dict[str, Any]],
         tokenizer: Callable[[str], List[str]],
+        max_entries: Optional[int] = None,
     ) -> None:
         self.vector_store_service = vector_store_service
         self.chunk_normalizer = chunk_normalizer
         self.tokenizer = tokenizer
-        self._cache: Dict[str, CollectionRetrievalIndex] = {}
+        if max_entries is None:
+            max_entries = int(ENHANCED_RETRIEVAL_CONFIG.get("collection_index_cache_max_entries", 16))
+        self._max_entries = max(1, int(max_entries))
+        self._cache: "OrderedDict[str, CollectionRetrievalIndex]" = OrderedDict()
         self._lock = threading.RLock()
 
     def get_index(
@@ -1445,6 +1452,7 @@ class CollectionRetrievalIndexProvider:
             cached = self._cache.get(resolved_name)
             stale_reason = self._stale_reason(cached, collection_profile, index_record)
             if cached and not force_refresh and not stale_reason:
+                self._cache.move_to_end(resolved_name)
                 index = self._clone_index(cached)
                 index.cache_hit = True
                 index.build_time = 0.0
@@ -1460,6 +1468,10 @@ class CollectionRetrievalIndexProvider:
                 stale_reason=stale_reason,
             )
             self._cache[resolved_name] = self._clone_index(index)
+            self._cache.move_to_end(resolved_name)
+            while len(self._cache) > self._max_entries:
+                evicted_name, _ = self._cache.popitem(last=False)
+                logger.debug("Collection retrieval index evicted: collection=%s", evicted_name)
             return index
 
     def _build_index(
