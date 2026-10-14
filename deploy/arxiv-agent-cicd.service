@@ -39,9 +39,14 @@ Environment="FORWARDED_ALLOW_IPS="
 # 异常退出时 5 秒后自动重启；正常 stop 不会触发。
 Restart=on-failure
 RestartSec=5
-# 内存限制：超过 1.2G 开始被内核回收施压，超过 1.5G 直接被 OOM 终止，保护整台服务器。
-MemoryMax=1.5G
-MemoryHigh=1.2G
+# 内存限制：Web worker 与 Docling 解析子进程同属本服务的 cgroup，共用这一个上限。
+# 按机器内存调整，约为总内存减 1G（留给系统、nginx 等）：4G 机器用 3G，2G 机器用 1.2G。
+# 超限即由 OOM killer 结束进程；Docling 子进程把 oom_score_adj 调到了最大，会被优先选中，
+# 结果是当次建索引失败，Web worker 不受影响。
+MemoryMax=3G
+# 不设 MemoryHigh、不允许使用 swap：超过软上限或换页时内核只会限流而不杀进程，
+# 整个服务会卡在换页上长时间无响应（曾因此导致 /health 超时数小时），不如直接失败。
+MemorySwapMax=0
 # 安全加固：进程及子进程无法通过 setuid 等方式提权；使用独立的 /tmp。
 NoNewPrivileges=true
 PrivateTmp=true
