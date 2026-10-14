@@ -44,6 +44,9 @@ COUNT_PATTERNS: Sequence[str] = (
     r"([一二三四五六七八九十两]+)\s*(?:篇|paper(?:s)?|论文)",
 )
 
+# 必须同时命中的核心概念上限；概念之间是 AND，拆得越细越容易 0 命中，多出来的降为补充词。
+MAX_CORE_CONCEPTS = 3
+
 QUERY_HINT_PATTERNS: Sequence[str] = (
     r"(?:关于|围绕|面向|针对)\s*([^\n，。；;:]+)",
     r"(?:about|on|for)\s+([^\n,.;:]+)",
@@ -665,6 +668,12 @@ def _ground_search_spec(
     warnings.extend(concept_warnings)
     optional_terms, optional_warnings = _ground_optional_terms(list(spec.optional_terms or []), message, profile_topics)
     warnings.extend(optional_warnings)
+    if len(concepts) > MAX_CORE_CONCEPTS:
+        # LLM 偶尔仍会把研究角度也拆成概念；排在后面的降为补充词，阶梯检索才有放宽余地。
+        demoted = concepts[MAX_CORE_CONCEPTS:]
+        concepts = concepts[:MAX_CORE_CONCEPTS]
+        optional_terms = [concept.term for concept in demoted] + [term for term in optional_terms if term.lower() not in {c.term.lower() for c in demoted}]
+        warnings.append(f"检索概念过多，已把 {'、'.join(concept.term for concept in demoted)} 降为补充词")
 
     if not concepts:
         rule_query = _extract_query_from_message(message)
@@ -723,6 +732,7 @@ def _ground_search_spec(
 __all__ = [
     "_ground_search_spec",
     "ABSTRACT_HINT_PATTERNS",
+    "MAX_CORE_CONCEPTS",
     "QUERY_HINT_PATTERNS",
     "TITLE_HINT_PATTERNS",
     "TIME_PATTERNS",
