@@ -7,6 +7,8 @@ chunk、来源页码以及图片/表格等多模态资产，方便后续入库�
 
 import hashlib
 import json
+from array import array
+from collections import OrderedDict
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import logging
@@ -203,7 +205,9 @@ class EmbeddingService:
             None
         """
         self._local_embedder = None
-        self._embedding_cache: dict[str, list] = {}
+        # LRU：向量用 array('d') 存储，数值与 float 列表完全一致，但每个分量只占 8 字节而不是一个 Python float 对象。
+        self._embedding_cache: "OrderedDict[str, array]" = OrderedDict()
+        self._embedding_cache_max_entries = max(1, int(EMBEDDING_CONFIG.get("memory_cache_max_entries", 2048)))
         self._embedding_cache_lock = threading.Lock()
 
     @staticmethod
@@ -302,10 +306,11 @@ class EmbeddingService:
             cached = self._embedding_cache.get(cache_key)
             if cached is None:
                 return None
-            return [float(value) for value in cached]
+            self._embedding_cache.move_to_end(cache_key)
+            return cached.tolist()
 
     def _set_cached_embedding(self, cache_key: str, embedding: list) -> None:
-        """线程安全地写入 embedding 缓存。
+        """线程安全地写入 embedding 缓存，超过上限时淘汰最久未使用的条目。
 
         参数:
             cache_key (str): 缓存键。
@@ -315,7 +320,10 @@ class EmbeddingService:
             None
         """
         with self._embedding_cache_lock:
-            self._embedding_cache[cache_key] = [float(value) for value in embedding]
+            self._embedding_cache[cache_key] = array("d", (float(value) for value in embedding))
+            self._embedding_cache.move_to_end(cache_key)
+            while len(self._embedding_cache) > self._embedding_cache_max_entries:
+                self._embedding_cache.popitem(last=False)
 
     def _extract_dashscope_embeddings(self, payload: dict) -> list:
         """从 DashScope 的多种响应结构中提取并排序向量结果。"""

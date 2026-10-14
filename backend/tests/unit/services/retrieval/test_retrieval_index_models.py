@@ -791,3 +791,43 @@ def test_collection_keyword_index_can_disable_index_level_bm25_for_legacy_fallba
         assert "index_level_bm25_disabled" in index.fallback_reason
         assert index.documents[0].chunk["content"] == source_chunk["content"]
         assert index.retrieval_index_artifact_debug["row_count"] == 1
+
+
+def test_collection_index_cache_evicts_least_recently_used_collection() -> None:
+    row = {
+        "content": "Method details.",
+        "chunk_id": "chunk-1",
+        "chunk_type": "text",
+        "source": "paper.pdf",
+        "retrieval_index_id": "chunk-1:section_anchor:1",
+        "retrieval_index_type": "section_anchor",
+        "retrieval_index_text": "Method",
+        "retrieval_index_weight": 0.45,
+        "retrieval_index_enabled_routes": ["keyword"],
+    }
+
+    class Store:
+        def __init__(self) -> None:
+            self.loads: list[str] = []
+
+        def get_all_chunks(self, collection_name: str):
+            self.loads.append(collection_name)
+            return [dict(row)]
+
+    store = Store()
+    provider = CollectionRetrievalIndexProvider(
+        vector_store_service=store,
+        chunk_normalizer=lambda chunk: dict(chunk),
+        tokenizer=_tokenize,
+        max_entries=2,
+    )
+
+    provider.get_index("paper_a")
+    provider.get_index("paper_b")
+    # 命中 paper_a 后它变成最近使用，再放入 paper_c 时淘汰的是 paper_b。
+    assert provider.get_index("paper_a").cache_hit is True
+    provider.get_index("paper_c")
+
+    assert provider.get_index("paper_a").cache_hit is True
+    assert provider.get_index("paper_b").cache_hit is False
+    assert store.loads == ["paper_a", "paper_b", "paper_c", "paper_b"]
