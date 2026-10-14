@@ -10,3 +10,8 @@ export function formatQueryList(values?: string[]) {
   }
   return values.join(' | ')
 }
+
+// SQLite CURRENT_TIMESTAMP 是不带时区的 UTC 文本，直接 new Date 会被当成本地时间，这里补上 Z。
+export function normalizeServerTimestamp(value: string) {
+  return /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value) ? `${value.replace(' ', 'T')}Z` : value
+}

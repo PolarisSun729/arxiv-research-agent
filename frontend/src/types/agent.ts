@@ -247,3 +247,23 @@ export interface AgentResumeRun {
   error_message: string | null
   result_retrieved_at: string | null
 }
+
+// 后端持久化的对话流水，只用于刷新后还原聊天气泡。
+export interface AgentStoredChatMessage {
+  message_id: string
+  session_id: string
+  role: 'user' | 'assistant'
+  content: string
+  response: ArxivSearchResponse | null
+  status: 'completed' | 'error'
+  resume_run_id: string | null
+  created_at: string
+}
+
+export interface AgentChatSessionSummary {
+  session_id: string
+  title: string
+  message_count: number
+  created_at: string
+  updated_at: string
+}
