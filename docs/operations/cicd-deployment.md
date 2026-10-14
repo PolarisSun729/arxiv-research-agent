@@ -37,6 +37,8 @@ GitHub 构建经过检查的确切提交，服务器安装同一个发布包。�
 | [SSH 发布入口](../../deploy/publish_ssh.sh) | 使用专用私钥与固定主机指纹上传并触发安装。 |
 | [服务器发布脚本](../../deploy/apply_release.py) | 校验、安装、关联共享数据、切换版本和失败回退。 |
 | [CI/CD systemd 模板](../../deploy/arxiv-agent-cicd.service) | 固定从 `current` 启动，并读取共享生产配置。 |
+| [站点模板](../../deploy/nginx.conf) / [证书引导模板](../../deploy/nginx-bootstrap.conf) | 应用服务器上的 Nginx：接收线路机转来的 PROXY protocol，终止 TLS，提供前端并反代 API。 |
+| [线路机转发模板](../../deploy/nginx-relay-stream.conf) | 线路机只做四层转发，把 80/443 连同用户真实 IP 原样交给应用服务器。 |
 | [OAI 同步 service/timer](../../deploy/arxiv-oai-sync.service) / [timer](../../deploy/arxiv-oai-sync.timer) | 每日调用 `current/backend/07-arxiv-tools/sync_arxiv_oai_since_last_run.sh`，状态写入 shared。 |
 | [发布回归测试](../../tests/deploy/test_release.py) | 离线验证归档、依赖、状态流转和持久数据边界。 |
 
@@ -53,7 +55,7 @@ df -h /opt
 
 确认系统为 Debian 12、架构输出 `x86_64`。当前发布包不能直接装到 ARM64 或其他发行版。
 
-本文沿用示例域名 `arxiv.001769.xyz`；换域名时同步替换 Nginx 的主机名/跳转地址/证书路径、初始化参数和 `ALLOWED_ORIGINS`。先将域名 A 记录指向服务器公网 IP，仅在 IPv6 确实可用时设置 AAAA。云防火墙放行 HTTPS 443、证书验证 80 和所用 SSH 端口；应用 8001、Redis 6379、向量库端口保持回环监听。SSH 入站策略必须允许 GitHub runner 连接；只允许固定管理 IP 的规则需要配合有固定出口的 runner 或网络通道。
+本文沿用示例域名 `arxiv.001769.xyz`；换域名时同步替换 Nginx 的主机名/跳转地址/证书路径、初始化参数和 `ALLOWED_ORIGINS`。生产环境经线路机中转（见[第 10 节](#线路机中转)），域名 A 记录指向**线路机**公网 IP，而不是应用服务器；不经中转时才指向应用服务器。仅在 IPv6 确实可用时设置 AAAA。云防火墙放行 HTTPS 443、证书验证 80 和所用 SSH 端口；应用 8001、Redis 6379、向量库端口保持回环监听。SSH 入站策略必须允许 GitHub runner 连接；只允许固定管理 IP 的规则需要配合有固定出口的 runner 或网络通道。
 
 ## 2. 安装系统依赖
 
@@ -347,7 +349,47 @@ Windows Milvus Standalone 的 collection 需要按 collection/schema 导出、�
 
 ## 10. Nginx 与 HTTPS
 
-申请证书前可先用只提供 ACME 验证的 [HTTP 模板](../../deploy/nginx-bootstrap.conf)：
+### 线路机中转
+
+主要用户在中国大陆，而应用服务器回国线路较差（实测到电信约 320ms、联通约 190ms、移动约 130ms）。生产环境因此在前面加一台回国线路较好的线路机（三网约 30–40ms，与应用服务器同区域、互访约 1.5ms），布局如下：
+
+```text
+浏览器 --> 线路机 103.42.30.174（nginx stream，只转发 TCP 80/443）
+                 |  PROXY protocol 附带用户真实 IP
+                 v
+           应用服务器 160.236.111.192（证书、Nginx、应用、数据；GitHub 部署目标）
+```
+
+- 线路机不解密 TLS、不持有证书，也不运行应用；带宽小（20M）也够用，前端资源已开启 gzip 和长期缓存。
+- 应用服务器的 [站点模板](../../deploy/nginx.conf) 只信任线路机 IP 传来的 PROXY 头，`$remote_addr` 因此是用户真实 IP，访问日志、IP 白名单和限流都按真实 IP 生效。不带 PROXY 头直连应用服务器 80/443 的连接会被拒绝，也无法伪造 PROXY 头冒充白名单 IP。
+- 证书续期仍在应用服务器上走 HTTP-01，验证请求经线路机转发进来；线路机上不要再运行 certbot。
+- 不建议用 Cloudflare 免费版代理（橙云）代替线路机：免费版在大陆没有节点，大陆用户通常被调度到海外节点，且开启后需要另行还原真实 IP，否则 IP 白名单会拒绝所有人。
+
+在线路机上以 root 安装[转发模板](../../deploy/nginx-relay-stream.conf)，先把其中的应用服务器 IP 替换为实际值。线路机上原本监听 80/443 的 http 站点要先移出 `sites-enabled`：
+
+```bash
+apt-get install -y libnginx-mod-stream
+install -d /etc/nginx/stream.d
+install -m 644 nginx-relay-stream.conf /etc/nginx/stream.d/arxiv-relay.conf
+grep -q '^include /etc/nginx/stream.d/\*.conf;' /etc/nginx/nginx.conf || \
+  echo 'include /etc/nginx/stream.d/*.conf;' >> /etc/nginx/nginx.conf
+nginx -t && systemctl restart nginx
+```
+
+切换前可以在线路机上带 PROXY 头预检应用服务器。下面的请求来自线路机自己的 IP，启用 IP 白名单时返回 403 也说明 TLS 与 PROXY protocol 都已就绪：
+
+```bash
+curl -sk --haproxy-protocol -o /dev/null -w '%{http_code}\n' \
+  --resolve arxiv.001769.xyz:443:160.236.111.192 https://arxiv.001769.xyz/health
+```
+
+两个 Nginx 模板都按中转布局编写。不经中转、域名直接解析到应用服务器时，删除站点模板中的 `set_real_ip_from` / `real_ip_header`，去掉所有 `listen` 的 `proxy_protocol` 参数，并补回 `[::]` 的 IPv6 监听。
+
+站点模板不包含 IP 白名单。只允许固定 IP 访问整站时，在服务器上的站点文件 `root` 指令之前加入 `allow <你的 IP>;` 和 `deny all;`，不要把个人 IP 提交到仓库。
+
+### 申请证书
+
+申请证书前可先用只提供 ACME 验证的 [HTTP 模板](../../deploy/nginx-bootstrap.conf)。经中转时线路机需要先完成上面的转发配置，Let's Encrypt 的验证请求才能到达应用服务器：
 
 ```bash
 sudo install -d -m 755 /var/www/letsencrypt
@@ -394,7 +436,7 @@ readlink -f /opt/arxiv-research-agent/current
 free -h
 ```
 
-HTTP 首页应跳转 HTTPS，`/health` 成功，匿名 `/api/auth/me` 为 401。继续在浏览器登录、读写个人问答会话、查看兴趣状态、执行一次受控的模型调用和论文建索引，并检查 Redis 持久性及资源用量。验证真实付费模型调用需要使用自己的供应商预算，不属于自动质量门。
+HTTP 首页应跳转 HTTPS，`/health` 成功，匿名 `/api/auth/me` 为 401。经中转时这些请求走线路机；在应用服务器上直接访问本机 Nginx 需要带 `--haproxy-protocol`，绕过 Nginx 可直接请求 `http://127.0.0.1:8001/health`。确认 `/var/log/nginx/arxiv-agent-access.log` 中记录的是用户真实 IP，而不是线路机 IP。继续在浏览器登录、读写个人问答会话、查看兴趣状态、执行一次受控的模型调用和论文建索引，并检查 Redis 持久性及资源用量。验证真实付费模型调用需要使用自己的供应商预算，不属于自动质量门。
 
 SSH 失败先检查端口、公钥、known_hosts；安装失败查看 Actions 的 pip 输出及磁盘；启动失败查 journald。依赖哈希、环境或发布包有误时脚本会在切换前停止；当前支持环境是 Debian 12 / Python 3.11 / x86_64。
 
