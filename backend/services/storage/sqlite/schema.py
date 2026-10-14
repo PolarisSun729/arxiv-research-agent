@@ -385,6 +385,20 @@ class StorageSchemaMigrator:
             ''')
 
             cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS agent_chat_messages (
+                    message_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL DEFAULT '{default_user_id_sql}',
+                    role TEXT NOT NULL,
+                    content TEXT,
+                    response_json TEXT,
+                    status TEXT DEFAULT 'completed',
+                    resume_run_id TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS agent_runtime_checkpoints (
                     checkpoint_id TEXT PRIMARY KEY,
                     schema_version INTEGER NOT NULL DEFAULT 2,
@@ -635,6 +649,11 @@ class StorageSchemaMigrator:
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_agent_sessions_user_updated
                 ON agent_sessions(user_id, updated_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_agent_chat_messages_user_session_created
+                ON agent_chat_messages(user_id, session_id, created_at ASC)
             ''')
 
             cursor.execute('''

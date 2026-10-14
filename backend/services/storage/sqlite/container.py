@@ -1,6 +1,7 @@
 from services.storage.sqlite.connection import SqliteConnectionProvider
 from services.storage.sqlite.schema import StorageSchemaMigrator
 from services.storage.sqlite.stores import (
+    AgentChatMessageStore,
     AgentSessionStore,
     AgentRuntimeCheckpointStore,
     AgentWorkStore,
@@ -63,6 +64,7 @@ class StorageContainer:
             self.profile_events,
         )
         self.agent_sessions = AgentSessionStore(self.connection_provider)
+        self.agent_chat_messages = AgentChatMessageStore(self.connection_provider)
         self.agent_runtime_checkpoints = AgentRuntimeCheckpointStore(self.connection_provider)
         self.agent_work = AgentWorkStore(self.connection_provider)
         self.approval_grants = ApprovalGrantStore(self.connection_provider)

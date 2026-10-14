@@ -402,6 +402,16 @@ class AgentResumeRunManager:
                 resume_run_id,
                 final_response=response.model_dump(mode="json"),
             )
+            # 后台续跑的回答也进对话流水，带上 resume_run_id 供前端去重，避免回放后再补一条同样的气泡。
+            agent_service._record_agent_chat_message(
+                self.storage,
+                session_id=str(continuation.get("session_id") or ""),
+                user_id=str(continuation.get("user_id") or ""),
+                role="assistant",
+                content=response.answer,
+                response=response,
+                resume_run_id=resume_run_id,
+            )
             # 成功后续跑必须收敛业务 checkpoint，避免 waiting_background_job 残影。
             try:
                 checkpoint_manager = AgentRuntimeCheckpointManager(
