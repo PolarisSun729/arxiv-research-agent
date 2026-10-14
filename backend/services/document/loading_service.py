@@ -256,6 +256,7 @@ class LoadingService:
         pages: List[Dict[str, Any]] = []
         try:
             try:
+                from docling.datamodel.accelerator_options import AcceleratorOptions
                 from docling.datamodel.base_models import InputFormat
                 from docling.datamodel.pipeline_options import PdfPipelineOptions
                 from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -271,12 +272,26 @@ class LoadingService:
             pipeline_options.images_scale = float(DOCLING_CONFIG.get("images_scale", 2.0))
             pipeline_options.do_ocr = bool(DOCLING_CONFIG.get("do_ocr_enabled", False))
             pipeline_options.force_backend_text = True
+            # 批量、阶段间缓存页数和推理线程共同决定解析子进程的内存峰值，取值说明见 DOCLING_CONFIG。
+            pipeline_options.layout_batch_size = int(DOCLING_CONFIG.get("layout_batch_size", 1))
+            pipeline_options.table_batch_size = int(DOCLING_CONFIG.get("table_batch_size", 1))
+            pipeline_options.ocr_batch_size = int(DOCLING_CONFIG.get("ocr_batch_size", 1))
+            pipeline_options.queue_max_size = int(DOCLING_CONFIG.get("queue_max_size", 4))
+            pipeline_options.accelerator_options = AcceleratorOptions(
+                num_threads=int(DOCLING_CONFIG.get("num_threads", 2)),
+                device="cpu",
+            )
             logger.info(
-                "Docling PDF options: page_images=%s picture_images=%s images_scale=%s ocr=%s",
+                "Docling PDF options: page_images=%s picture_images=%s images_scale=%s ocr=%s "
+                "layout_batch=%s table_batch=%s queue_max=%s threads=%s",
                 pipeline_options.generate_page_images,
                 pipeline_options.generate_picture_images,
                 pipeline_options.images_scale,
                 pipeline_options.do_ocr,
+                pipeline_options.layout_batch_size,
+                pipeline_options.table_batch_size,
+                pipeline_options.queue_max_size,
+                pipeline_options.accelerator_options.num_threads,
             )
             if not pipeline_options.do_ocr:
                 logger.info("Docling OCR disabled; using backend text extraction for PDF parsing.")
