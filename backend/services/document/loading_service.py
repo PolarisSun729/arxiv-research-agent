@@ -7,15 +7,14 @@
 
 import json
 import logging
-import multiprocessing
 import os
 import re
-from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import fitz  # PyMuPDF
 
+from services.document.isolated_subprocess import run_in_isolated_subprocess
 from utils.config import DOCLING_CONFIG
 from utils.storage_paths import BACKEND_DOCLING_ASSETS_ROOT, BACKEND_ROOT, resolve_backend_artifact_path
 
@@ -81,16 +80,17 @@ class LoadingService:
 
         Docling 的 C++/torch 扩展会长时间占住 GIL；若在 Web 进程的线程里解析，
         事件循环拿不到执行机会，gunicorn 心跳超时后会直接杀掉整个 worker。
-        这里用 spawn 而不是 fork：父进程已有多个线程，fork 后子进程可能继承到被锁住的锁。
         每次解析都新建子进程，结束即释放 Docling 模型占用的内存。
+        超时强杀、父进程退出时子进程跟随退出、全局只跑一个解析等隔离措施见 isolated_subprocess。
         """
-        context = multiprocessing.get_context("spawn")
-        with ProcessPoolExecutor(
-            max_workers=1,
-            mp_context=context,
-            initializer=_init_docling_subprocess,
-        ) as executor:
-            document, page_map, total_pages = executor.submit(_load_docling_document, file_path).result()
+        document, page_map, total_pages = run_in_isolated_subprocess(
+            _load_docling_document,
+            file_path,
+            timeout_seconds=float(DOCLING_CONFIG["subprocess_timeout_seconds"]),
+            lock_path=str(BACKEND_DOCLING_ASSETS_ROOT / ".docling-subprocess.lock"),
+            lock_timeout_seconds=float(DOCLING_CONFIG["subprocess_lock_timeout_seconds"]),
+            task_label=f"Docling parse {os.path.basename(file_path)}",
+        )
         self.current_page_map = page_map
         self.total_pages = total_pages
         return document
@@ -2775,7 +2775,7 @@ class LoadingService:
         return bool(re.search(r"(italic|oblique|ital)", font_name, re.IGNORECASE))
 
 
-def _init_docling_subprocess() -> None:
+def _configure_docling_subprocess() -> None:
     """spawn 出的子进程不继承父进程的日志配置，需要重新配置，Docling 日志才能进入 journald。
 
     同时调低子进程的调度优先级：生产机只有 CPU，Docling 推理会占满所有核，
@@ -2793,6 +2793,7 @@ def _load_docling_document(file_path: str) -> tuple:
 
     page_map 与 document["pages"] 是同一个列表，放在同一个元组里返回，pickle 后仍保持同一引用。
     """
+    _configure_docling_subprocess()
     service = LoadingService()
     document = service._load_with_docling(file_path)
     return document, service.current_page_map, service.total_pages

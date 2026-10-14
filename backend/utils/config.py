@@ -111,6 +111,10 @@ BACKEND_LOGGING_CONFIG: Dict[str, Any] = {
 DOCLING_CONFIG: Dict[str, Any] = {
     # Docling 解析放进独立子进程，避免长时间占住 Web 进程的 GIL 导致 gunicorn worker 心跳超时被杀。
     "subprocess_enabled": _env_bool("DOCLING_SUBPROCESS_ENABLED", True),
+    # 单次解析的最长时间，超时强制结束子进程；内存不足时进程会卡在换页上，必须有上限才不会无限等待。
+    "subprocess_timeout_seconds": _env_int("DOCLING_SUBPROCESS_TIMEOUT_SECONDS", 15 * 60),
+    # 同一时间只允许一个 Docling 子进程；后来的解析最多排队等待这么久，超时则本次建索引失败。
+    "subprocess_lock_timeout_seconds": _env_int("DOCLING_SUBPROCESS_LOCK_TIMEOUT_SECONDS", 15 * 60),
     "do_ocr_enabled": _env_bool("DOCLING_OCR_ENABLED", False),
     "annotated_pdf_export_enabled": _env_bool("DOCLING_ANNOTATED_PDF_EXPORT_ENABLED", True),
     # Docling 会按 images_scale 渲染页面/图片资产；默认保持低倍率，避免 30+ 页论文在建索引时生成超大图。

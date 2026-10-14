@@ -240,7 +240,13 @@ sudo chmod 440 /etc/sudoers.d/arxiv-agent-deploy
 sudo visudo -cf /etc/sudoers.d/arxiv-agent-deploy
 ```
 
-此时还没有 `current`，**先不要 start 服务**。首次发布会自动创建版本、安装 venv 并启动。应用限制为一个 worker，内存软阈值 1.2GB、硬上限 1.5GB；超过上限可能被终止，需要处理真实业务内存峰值。
+此时还没有 `current`，**先不要 start 服务**。首次发布会自动创建版本、安装 venv 并启动。应用限制为一个 worker。
+
+内存上限 `MemoryMax` 按机器调整，约为总内存减 1G：4G 机器用模板默认的 3G，2G 机器改为 1.2G。Web worker 和 Docling 解析子进程共用这个上限。模板故意不设 `MemoryHigh`，并用 `MemorySwapMax=0` 禁止使用 swap：超过软上限或换页时内核只限流不杀进程，整个服务会卡在换页上，曾导致 `/health` 数小时超时。现在超限会直接触发 OOM，Docling 子进程会被优先杀掉，结果只是当次建索引失败。排查时可以看 `/sys/fs/cgroup/system.slice/arxiv-agent.service/memory.events`：`oom_kill` 增加说明 Docling 因内存不足被结束。
+
+Docling 子进程还受 `DOCLING_SUBPROCESS_TIMEOUT_SECONDS`（单次解析上限，默认 900 秒）和 `DOCLING_SUBPROCESS_LOCK_TIMEOUT_SECONDS`（排队等待上限，默认 900 秒）约束；同一时间只运行一个 Docling 子进程，gunicorn worker 被杀时子进程随之退出。
+
+发布脚本只重启服务，不会更新 systemd 单元。模板有变化时，需要由管理账号重新执行上面的 `install` 命令，再 `sudo systemctl daemon-reload && sudo systemctl restart arxiv-agent.service`。
 
 CI 账号只能无密码重启/停止这个服务。Nginx、systemd 模板和生产配置的更新由管理账号完成；普通代码更新由发布脚本完成。
 
