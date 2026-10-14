@@ -161,14 +161,14 @@ DOCLING_OCR_ENABLED=false
 DOCLING_GENERATE_PAGE_IMAGES=false
 DOCLING_GENERATE_PICTURE_IMAGES=true
 DOCLING_ANNOTATED_PDF_EXPORT_ENABLED=false
-DOCLING_IMAGES_SCALE=1.0
+DOCLING_IMAGES_SCALE=2.0
 OMP_NUM_THREADS=1
 MKL_NUM_THREADS=1
 OPENBLAS_NUM_THREADS=1
 TOKENIZERS_PARALLELISM=false
 ```
 
-JWT 文件和认证库使用共享目录的绝对路径，避免每个新版本产生新账号库或读不到签名文件。Linux 默认 Milvus Lite，不要从 Windows 复制 `MILVUS_URI=http://localhost:19530`。上述低内存配置关闭 OCR，扫描版 PDF 的识别能力会降低；页面渲染和图像质量也降低，需根据实际问答效果与内存余量调整。
+JWT 文件和认证库使用共享目录的绝对路径，避免每个新版本产生新账号库或读不到签名文件。Linux 默认 Milvus Lite，不要从 Windows 复制 `MILVUS_URI=http://localhost:19530`。上述低内存配置关闭 OCR，扫描版 PDF 的识别能力会降低，需根据实际问答效果与内存余量调整。
 
 `qwen3-vl-embedding` 的 2048 维与既有兴趣向量保持一致。即使维度相同，也不能随意替换成另一模型并继续使用旧向量。
 
@@ -246,7 +246,7 @@ sudo visudo -cf /etc/sudoers.d/arxiv-agent-deploy
 
 模板必须带 `OOMPolicy=continue`。systemd 默认的 `OOMPolicy=stop` 会在 cgroup 内任何进程被 OOM 杀掉后停掉整个服务（日志表现为 `Failed with result 'oom-kill'` 后自动重启），Docling 子进程被杀也会让网站中断。设为 `continue` 后结果只是当次建索引失败。排查时可以看 `/sys/fs/cgroup/system.slice/arxiv-agent.service/memory.events`：`oom_kill` 增加说明 Docling 因内存不足被结束；`journalctl -k | grep -iE "constraint|Killed process"` 能看到被杀进程的 `anon-rss`，`CONSTRAINT_MEMCG` 表示撞到的是本服务的 `MemoryMax`。
 
-Docling 解析的内存峰值主要由渲染倍率和流水线并发决定。默认 `DOCLING_IMAGES_SCALE=1.0`、关闭整页截图，版面/表格模型逐页推理（`DOCLING_LAYOUT_BATCH_SIZE`、`DOCLING_TABLE_BATCH_SIZE` 默认 1），阶段间最多缓存 4 页（`DOCLING_QUEUE_MAX_SIZE`），推理线程 2 个（`DOCLING_NUM_THREADS`）。Docling 自身默认是每批 4 页、缓存 100 页、4 线程；此前在 4G 机器上解析单篇论文时，子进程超过 2.5G 被 OOM 杀掉。
+Docling 解析的内存峰值主要由流水线并发决定。默认关闭整页截图，版面/表格模型逐页推理（`DOCLING_LAYOUT_BATCH_SIZE`、`DOCLING_TABLE_BATCH_SIZE` 默认 1），阶段间最多缓存 4 页（`DOCLING_QUEUE_MAX_SIZE`），推理线程 2 个（`DOCLING_NUM_THREADS`）。Docling 自身默认是每批 4 页、缓存 100 页、4 线程；此前在 4G 机器上解析单篇论文时，子进程超过 2.5G 被 OOM 杀掉。`DOCLING_IMAGES_SCALE` 保持 2.0（约 144dpi），降到 1.0 时插图里的坐标轴文字和图例基本无法辨认；逐页处理后同时在内存里的页面很少，倍率带来的额外内存只有几十 MB 量级。
 
 Docling 子进程还受 `DOCLING_SUBPROCESS_TIMEOUT_SECONDS`（单次解析上限，默认 900 秒）和 `DOCLING_SUBPROCESS_LOCK_TIMEOUT_SECONDS`（排队等待上限，默认 900 秒）约束；同一时间只运行一个 Docling 子进程，gunicorn worker 被杀时子进程随之退出。
 
