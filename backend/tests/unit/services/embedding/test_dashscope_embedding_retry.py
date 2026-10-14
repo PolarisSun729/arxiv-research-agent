@@ -382,3 +382,18 @@ def test_retry_warning_contains_only_sanitized_request_metadata(monkeypatch, cap
     assert "Text sent to DashScope" not in message
     assert "[0.1, 0.2, 0.3]" not in message
     assert caplog.records[0].exc_info is None
+
+
+def test_memory_embedding_cache_evicts_least_recently_used_entry() -> None:
+    service = EmbeddingService()
+    service._embedding_cache_max_entries = 2
+
+    service._set_cached_embedding("a", [0.1, 0.2])
+    service._set_cached_embedding("b", [0.3, 0.4])
+    # 读取 a 后它变成最近使用，写入 c 时淘汰的是 b。
+    assert service._get_cached_embedding("a") == [0.1, 0.2]
+    service._set_cached_embedding("c", [0.5, 0.6])
+
+    assert service._get_cached_embedding("b") is None
+    assert service._get_cached_embedding("a") == [0.1, 0.2]
+    assert service._get_cached_embedding("c") == [0.5, 0.6]

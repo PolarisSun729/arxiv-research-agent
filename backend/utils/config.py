@@ -289,6 +289,8 @@ EMBEDDING_CONFIG: Dict[str, Any] = {
     "backoff_base_seconds": _env_float("EMBEDDING_REQUEST_BACKOFF_BASE_SECONDS", 1.0),
     "backoff_max_seconds": _env_float("EMBEDDING_REQUEST_BACKOFF_MAX_SECONDS", 30.0),
     "jitter_ratio": _env_float("EMBEDDING_REQUEST_JITTER_RATIO", 0.2),
+    # 进程内 embedding 缓存的最大条数，超出后按最近最少使用淘汰；2048 维向量每条约 16KB。
+    "memory_cache_max_entries": _env_int("EMBEDDING_MEMORY_CACHE_MAX_ENTRIES", 2048),
     "local_model_path": _env_str("LOCAL_EMBEDDING_MODEL_PATH", str(REPO_ROOT / "00-models" / "Qwen3-VL-Embedding-2B")),
     "local_model_scripts_path": _env_str(
         "LOCAL_EMBEDDING_MODEL_SCRIPTS_PATH",
@@ -547,6 +549,8 @@ ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     "enable_index_level_bm25": _env_bool("ENABLE_INDEX_LEVEL_BM25", True),
     "enable_generated_question_index": _env_bool("ENABLE_GENERATED_QUESTION_INDEX", True),
     "enable_chunk_level_retrieval_fallback": _env_bool("ENABLE_CHUNK_LEVEL_RETRIEVAL_FALLBACK", True),
+    # 进程内最多缓存多少篇论文的关键词检索索引，超出后按最近最少使用淘汰，被淘汰的论文下次查询时重建。
+    "collection_index_cache_max_entries": _env_int("RETRIEVAL_INDEX_CACHE_MAX_ENTRIES", 16),
     "context_budget_max_chars": _env_int("ENHANCED_RETRIEVAL_CONTEXT_BUDGET_MAX_CHARS", 24000),
     "retrieval_candidate_max_blocks": _env_int("RETRIEVAL_CANDIDATE_MAX_BLOCKS", 60),
     "retrieval_candidate_max_tokens_soft": _env_int("RETRIEVAL_CANDIDATE_MAX_TOKENS_SOFT", 90000),
