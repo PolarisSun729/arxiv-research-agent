@@ -98,8 +98,18 @@ def test_missing_langgraph_checkpoint_fails_resume_without_replaying_original_qu
     assert storage.agent_work.get_continuation("continuation-1")["status"] == "failed"
 
 
+def _wait_for_terminal_run(storage, resume_run_id: str) -> dict:
+    deadline = time.monotonic() + 3
+    run = storage.agent_work.get_resume_run(resume_run_id)
+    while run and run["status"] in {"pending", "running"} and time.monotonic() < deadline:
+        time.sleep(0.01)
+        run = storage.agent_work.get_resume_run(resume_run_id)
+    assert run is not None
+    return run
+
+
 def test_resume_run_fails_when_graph_returns_interrupt_without_answer(tmp_path, monkeypatch) -> None:
-    """假完成防护：invoke 后仍 interrupt / 空答时不得 complete_resume_run。"""
+    """假完成防护：续跑后仍 interrupt / 空答时不得 complete_resume_run。"""
     storage = build_storage_container(db_path=str(tmp_path / "false-complete.sqlite"))
     _prepare_ready_continuation(storage)
     invoked = []
@@ -108,30 +118,28 @@ def test_resume_run_fails_when_graph_returns_interrupt_without_answer(tmp_path, 
         def get_state(self, _config):
             return {"values": {"intent": "paper_qa"}, "next": ("execute_step",)}
 
-        def invoke(self, command, config=None):
+        def stream(self, command, config=None, stream_mode=None):
             invoked.append(
                 {
                     "decision": getattr(command, "resume", None) if not isinstance(command, dict) else command,
                     "continuation_id": ((config or {}).get("configurable") or {}).get("background_continuation_id"),
                 }
             )
-            # 模拟线上故障：resume 后又停在新的确认 interrupt，且没有答案。
-            return {
-                "__interrupt__": (
-                    {
-                        "value": {
-                            "interaction_id": "new-interaction",
-                            "kind": "side_effect_approval",
-                            "step_id": "index-step",
-                        }
-                    },
-                ),
-                "user_id": "user-1",
-                "session_id": "session-1",
-                "intent": "paper_qa",
-                "answer": "",
-                "paper_qa_result": None,
-            }
+            # 模拟线上故障：resume 后又停在新的确认 interrupt，且载荷无法投影成交互。
+            yield (
+                "updates",
+                {
+                    "__interrupt__": (
+                        {
+                            "value": {
+                                "interaction_id": "new-interaction",
+                                "kind": "side_effect_approval",
+                                "step_id": "index-step",
+                            }
+                        },
+                    )
+                },
+            )
 
     from backend.agents.arxiv_search_agent import service as runtime_service_module
 
@@ -144,13 +152,8 @@ def test_resume_run_fails_when_graph_returns_interrupt_without_answer(tmp_path, 
         user_id="user-1",
         session_id="session-1",
     )
-    deadline = time.monotonic() + 3
-    run = storage.agent_work.get_resume_run(claimed["resume_run_id"])
-    while run and run["status"] in {"pending", "running"} and time.monotonic() < deadline:
-        time.sleep(0.01)
-        run = storage.agent_work.get_resume_run(claimed["resume_run_id"])
+    run = _wait_for_terminal_run(storage, claimed["resume_run_id"])
 
-    assert run is not None
     assert run["status"] == "failed"
     assert "background_resume_reinterrupted" in str(run.get("error_code") or "")
     assert run.get("final_response_json") in (None, "", {})
@@ -158,6 +161,54 @@ def test_resume_run_fails_when_graph_returns_interrupt_without_answer(tmp_path, 
     # 不得被标成 completed 空答
     cont = storage.agent_work.get_continuation("continuation-1")
     assert cont["status"] != "resumed"
+
+
+def test_resume_run_buffers_node_progress_before_completing(tmp_path, monkeypatch) -> None:
+    """续跑期间的节点事件要实时进缓存，且全部早于终态落库，SSE 才能先推进度再推最终回答。"""
+    storage = build_storage_container(db_path=str(tmp_path / "progress.sqlite"))
+    _prepare_ready_continuation(storage)
+    final_values = {
+        "user_id": "user-1",
+        "session_id": "session-1",
+        "intent": "paper_qa",
+        "answer": "续跑后的回答",
+    }
+    progress_seen_at_completion = []
+
+    class _GraphWithProgress:
+        def get_state(self, _config):
+            return {"values": {"intent": "paper_qa"}, "next": ("finalize",)}
+
+        def stream(self, command, config=None, stream_mode=None):
+            yield ("tasks", {"name": "finalize", "input": {}})
+            yield ("updates", {"finalize": final_values})
+
+    from backend.agents.arxiv_search_agent import service as runtime_service_module
+
+    monkeypatch.setattr(runtime_service_module, "_build_agent_graph", lambda **_kwargs: _GraphWithProgress())
+    monkeypatch.setattr(runtime_service_module, "_resolve_generation_service", lambda: object())
+    manager = AgentResumeRunManager(storage=storage, background_work_coordinator=object())
+    complete_resume_run = storage.agent_work.complete_resume_run
+
+    def _record_progress_then_complete(resume_run_id, **kwargs):
+        progress_seen_at_completion.extend(manager.progress_events(resume_run_id))
+        return complete_resume_run(resume_run_id, **kwargs)
+
+    monkeypatch.setattr(storage.agent_work, "complete_resume_run", _record_progress_then_complete)
+
+    claimed = manager.claim_and_start(
+        "continuation-1",
+        user_id="user-1",
+        session_id="session-1",
+    )
+    run = _wait_for_terminal_run(storage, claimed["resume_run_id"])
+
+    assert run["status"] == "completed"
+    assert [event["event_type"] for event in progress_seen_at_completion] == ["step_start", "step_end"]
+    assert all(event["run_id"] == claimed["resume_run_id"] for event in progress_seen_at_completion)
+    assert [event["sequence"] for event in progress_seen_at_completion] == [1, 2]
+    # 游标之后只返回新事件，SSE 轮询据此增量推送。
+    assert manager.progress_events(claimed["resume_run_id"], after=1) == progress_seen_at_completion[1:]
 
 
 @pytest.mark.parametrize("mode,status", [("jwt", "pending"), ("api_key", "pending"), ("jwt", "running")])

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections import OrderedDict
 from contextvars import copy_context
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -14,11 +15,15 @@ from services.storage.sqlite.stores.agent_work import (
     AgentWorkStore,
 )
 from services.storage.sqlite.stores.paper_qa_index import PaperQAIndexStore
+from utils.secret_redaction import redact_sensitive_value
 
 from .background_jobs import BackgroundJobHandlerRegistry, PersistentBackgroundWorkCoordinator
 
 
 logger = logging.getLogger(__name__)
+
+# 进度事件只为实时展示服务，按 run 缓存在内存里；超出上限时淘汰最早的 run，避免长期运行的进程无限增长。
+RESUME_PROGRESS_RUN_LIMIT = 32
 
 JOB_STAGE_LABELS = {
     "pending": "等待后台 worker",
@@ -193,30 +198,14 @@ class AgentWorkContinuationService:
 
 
 
-def _invoke_result_has_interrupt(raw_result: Any) -> bool:
-    """识别 graph.invoke 在仍挂起 interrupt 时返回的假完成载荷。"""
-    if not isinstance(raw_result, Mapping):
-        return False
-    if raw_result.get("__interrupt__"):
-        return True
-    try:
-        from langgraph.constants import INTERRUPT
-
-        if raw_result.get(INTERRUPT):
-            return True
-    except Exception:
-        pass
-    return False
-
-
 def _background_resume_failure_reason(
     *,
-    raw_result: Any,
+    interrupted: bool,
     final_state: Any,
     continuation: Mapping[str, Any],
 ) -> Optional[str]:
     """续跑成功判定：不得仍 interrupt，后台 step 必须完成，paper_qa 不得空答。"""
-    if _invoke_result_has_interrupt(raw_result):
+    if interrupted:
         return "background_resume_reinterrupted"
 
     step_id = str(continuation.get("step_id") or "").strip()
@@ -259,6 +248,7 @@ class AgentResumeRunManager:
         self.background_work_coordinator = background_work_coordinator
         self._lock = threading.Lock()
         self._threads: Dict[str, threading.Thread] = {}
+        self._progress: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
 
     def claim_and_start(self, continuation_id: str, *, user_id: str, session_id: str) -> Dict[str, Any]:
         run = self.storage.agent_work.claim_resume_run(
@@ -326,6 +316,25 @@ class AgentResumeRunManager:
             run = self.storage.agent_work.get_resume_run(resume_run_id) or run
         return run
 
+    def progress_events(self, resume_run_id: str, *, after: int = 0) -> List[Dict[str, Any]]:
+        """返回第 after 条之后的续跑进度事件。
+
+        进度只存在于执行该 run 的进程内存里：重启或被淘汰后为空，只影响过程展示，最终结果仍以持久 run 为准。
+        """
+        with self._lock:
+            return list(self._progress.get(resume_run_id, [])[after:])
+
+    def _publish_progress(self, resume_run_id: str, event: Any) -> None:
+        # 与 /chat/stream 的 SSE 出口一致：事件可能携带工具诊断信息，入缓存前先脱敏。
+        payload = redact_sensitive_value(event.model_dump())
+        with self._lock:
+            events = self._progress.get(resume_run_id)
+            if events is None:
+                events = self._progress[resume_run_id] = []
+                while len(self._progress) > RESUME_PROGRESS_RUN_LIMIT:
+                    self._progress.popitem(last=False)
+            events.append(payload)
+
     def mark_result_retrieved(self, resume_run_id: str) -> bool:
         """由传输层在完整 final_response 已开始交付后记录结果读取审计。"""
         return self.storage.agent_work.mark_resume_result_retrieved(resume_run_id)
@@ -370,19 +379,29 @@ class AgentResumeRunManager:
             if not agent_service._has_resume_checkpoint(graph_state):
                 raise AgentWorkConflict("langgraph_checkpoint_missing")
 
+            # 与 /chat/stream 共用同一套事件翻译，SSE 观察者据此实时展示续跑中的每个节点和工具。
+            events = agent_service._AgentEventEmitter(resume_run_id)
+            events.current_state = agent_service._state_from_graph_snapshot(graph_state)
             graph_invocation_started = True
-            raw_result = graph.invoke(
-                Command(
-                    resume={
-                        "decision": "background_completed",
-                        "continuation_id": continuation["continuation_id"],
-                        "validated_result": dict(validated_result),
-                    }
-                ),
-                config=graph_config,
-            )
-            # 先检查原始返回值中的 interrupt，再 coerce；否则 __interrupt__ 会被状态模型丢弃。
-            final_state = agent_service._coerce_state(raw_result)
+            try:
+                for event in events.stream_graph(
+                    graph,
+                    Command(
+                        resume={
+                            "decision": "background_completed",
+                            "continuation_id": continuation["continuation_id"],
+                            "validated_result": dict(validated_result),
+                        }
+                    ),
+                    graph_config,
+                ):
+                    self._publish_progress(resume_run_id, event)
+            except Exception as exc:
+                # 续跑后又停在新的 interrupt 时，载荷可能无法投影成交互；按“重新挂起”定性，而不是不确定。
+                if events.confirmation_count:
+                    raise AgentWorkConflict("background_resume_reinterrupted") from exc
+                raise
+            final_state = events.current_state if events.current_state is not None else agent_service._coerce_state({})
             if not getattr(final_state, "user_id", None):
                 final_state.user_id = str(continuation.get("user_id") or "") or None
             if not getattr(final_state, "session_id", None):
@@ -390,7 +409,7 @@ class AgentResumeRunManager:
             final_state_for_checkpoint = final_state
 
             failure_reason = _background_resume_failure_reason(
-                raw_result=raw_result,
+                interrupted=events.confirmation_count > 0,
                 final_state=final_state,
                 continuation=continuation,
             )
@@ -430,8 +449,7 @@ class AgentResumeRunManager:
                 )
         except Exception as exc:
 
-            # graph.invoke 前的失败可安全标记 failed；一旦调用开始，就无法证明 checkpoint 是否已消费，
-            # 必须进入 indeterminate 并禁止自动重放原问题。
+            # 图开始执行前的失败可安全标记 failed；一旦开始执行，就无法证明 checkpoint 是否已消费，
             # 必须进入 indeterminate 并禁止自动重放原问题。
             # 业务冲突（假完成/仍 interrupt）在 invoke 后也视为可诊断失败，error_code 保留具体原因。
             conflict_code = str(exc) if isinstance(exc, AgentWorkConflict) else ""
