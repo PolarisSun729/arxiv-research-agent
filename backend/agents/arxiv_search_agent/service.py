@@ -7,7 +7,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Iterator, Mapping, Optional
 from uuid import uuid4
 
 _BACKEND_DIR = str(Path(__file__).resolve().parents[2])
@@ -926,14 +926,11 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
 
     def event_stream():
         # 阶段 A：初始化流式执行上下文。
-        # run_id 和 sequence 一起构成了一次流式执行的事件主线。
+        # run_id 和 events 分配的递增序号一起构成了一次流式执行的事件主线。
         run_id = str(uuid4())
-        sequence = 1
+        events = _AgentEventEmitter(run_id)
         started = perf_counter()
         trace = RequestTrace(run_id=run_id, route="arxiv_agent.stream", input=normalized_request.message)
-        event_count = 0
-        tool_count = 0
-        confirmation_count = 0
         current_state: Optional[AgentState] = None
 
         try:
@@ -1045,11 +1042,9 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
 
             # 阶段 C：先发出 run_start 事件，让前端知道一次新的执行已经开始。
             yield _sse_event(
-                _make_stream_event(
-                    event_type="run_start",
-                    sequence=_next_sequence(sequence),
-                    run_id=run_id,
-                    data={
+                events.emit(
+                    "run_start",
+                    {
                         "status": "started",
 
                         "request": {
@@ -1060,8 +1055,6 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     },
                 )
             )
-            event_count += 1
-            sequence += 1
 
             if graph_input is None and resume_payload is not None:
                 # 后台批准只返回任务 ticket；专用 continuation API 会在 job 成功后建立新的恢复 SSE。
@@ -1076,21 +1069,15 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     response=final_response,
                 )
                 yield _sse_event(
-                    _make_stream_event(
-                        event_type="final_response",
-                        sequence=_next_sequence(sequence),
-                        run_id=run_id,
-                        data={"response": final_response.model_dump(), "state": _compact_state(current_state)},
+                    events.emit(
+                        "final_response",
+                        {"response": final_response.model_dump(), "state": _compact_state(current_state)},
                     )
                 )
-                event_count += 1
-                sequence += 1
                 yield _sse_event(
-                    _make_stream_event(
-                        event_type="stream_end",
-                        sequence=_next_sequence(sequence),
-                        run_id=run_id,
-                        data={"status": "background_work_started", "final_sequence": sequence},
+                    events.emit(
+                        "stream_end",
+                        {"status": "background_work_started", "final_sequence": events.sequence},
                     )
                 )
                 return
@@ -1102,184 +1089,17 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 if str((resume_payload or {}).get("decision") or "").strip() == "approve"
                 else None
             )
-            preannounced_tool_call: Optional[Dict[str, Any]] = None
-            preannounced_tool_identity: Optional[tuple[str, str, str]] = None
-            if approved_step_id:
-                preannounced_tool_call = _active_runtime_tool_call(current_state, approved_step_id=approved_step_id)
-                if preannounced_tool_call is not None:
-                    preannounced_tool_identity = _tool_call_identity(preannounced_tool_call)
-                    tool_count += 1
-                    # LangGraph 的 updates 事件要等节点完成后才返回；批准恢复后如果马上进入 Docling
-                    # 这类长耗时工具，必须先从 checkpoint 快照预告工具开始，避免前端在转换期间只显示通用生成中。
-                    yield _sse_event(
-                        _make_stream_event(
-                            event_type="tool_call_start",
-                            sequence=_next_sequence(sequence),
-                            run_id=run_id,
-                            data={
-                                "step": "execute_step",
-                                "tool_call": preannounced_tool_call,
-                                "state": _compact_state(current_state),
-                            },
-                        )
-                    )
-                    event_count += 1
-                    sequence += 1
-
-            def announce_step_start(step_name: str, previous_state: Optional[AgentState]):
-                """发出节点开始事件；若该节点会调用工具，同时补发 tool_call_start。
-
-                返回 (待 yield 的 SSE 文本列表, active_tool_call, tool_call_started)。
-                """
-                nonlocal sequence, event_count, tool_count
-                frames = [
-                    _sse_event(
-                        _make_stream_event(
-                            event_type="step_start",
-                            sequence=_next_sequence(sequence),
-                            run_id=run_id,
-                            data={
-                                "step": step_name,
-                                "state": _compact_state(previous_state),
-                            },
-                        )
-                    )
-                ]
-                event_count += 1
-                sequence += 1
-
-                active_tool_call = _active_runtime_tool_call(previous_state, approved_step_id=approved_step_id)
-                if active_tool_call is None and step_name == "execute_step" and preannounced_tool_call is not None:
-                    # select_next_step 等前置节点可能会改变 previous_state 的投影；已预告的工具仍应在
-                    # execute_step 结束时收到 tool_call_end，否则前端的 running 进度卡片无法收尾。
-                    active_tool_call = preannounced_tool_call
-                tool_call_started = False
-                if active_tool_call is not None and (step_name == "execute_step" or _should_emit_tool_call(previous_state)):
-                    tool_call_started = True
-                    already_preannounced = (
-                        preannounced_tool_identity is not None
-                        and _tool_call_identity(active_tool_call) == preannounced_tool_identity
-                    )
-                    if not already_preannounced:
-                        tool_count += 1
-                        # 如果当前节点会触发工具调用，则补发工具开始事件。
-                        frames.append(
-                            _sse_event(
-                                _make_stream_event(
-                                    event_type="tool_call_start",
-                                    sequence=_next_sequence(sequence),
-                                    run_id=run_id,
-                                    data={
-                                        "step": step_name,
-                                        "tool_call": active_tool_call,
-                                        "state": _compact_state(previous_state),
-                                    },
-                                )
-                            )
-                        )
-                        event_count += 1
-                        sequence += 1
-                return frames, active_tool_call, tool_call_started
-
-            # 已在 tasks 流里宣告开始、尚未收到 updates 的节点：节点名 -> (active_tool_call, tool_call_started)。
-            started_nodes: Dict[str, tuple[Optional[Dict[str, Any]], bool]] = {}
-
-            # 阶段 D：同时消费 LangGraph 的 tasks 与 updates 流。
-            # updates 只在节点执行完后才产出；tasks 会在节点开始前先产出一条任务事件，
-            # 借此把 step_start 提前到节点真正开始时，前端才能在 LLM/检索等长耗时节点期间看到进度。
-            for stream_item in graph.stream(graph_input, config=graph_config, stream_mode=["tasks", "updates"]):
-                # 测试替身可能只产出 updates 字典；真实图在多模式下产出 (mode, chunk) 元组。
-                if isinstance(stream_item, tuple) and len(stream_item) == 2 and isinstance(stream_item[0], str):
-                    stream_mode, chunk = stream_item
-                else:
-                    stream_mode, chunk = "updates", stream_item
-                if not chunk:
-                    continue
-
-                if stream_mode == "tasks":
-                    task_name = str(chunk.get("name") or "") if isinstance(chunk, Mapping) else ""
-                    # 只处理“任务开始”事件（带 input）；任务结果事件交给 updates 分支统一处理。
-                    if not task_name or task_name.startswith("__") or "input" not in chunk:
-                        continue
-                    # 子阶段 D-1：节点开始执行前就通知前端，避免长耗时节点期间界面像卡死。
-                    frames, active_tool_call, tool_call_started = announce_step_start(task_name, current_state)
-                    started_nodes[task_name] = (active_tool_call, tool_call_started)
-                    for frame in frames:
-                        yield frame
-                    continue
-                if stream_mode != "updates":
-                    continue
-                update = chunk
-
-                step_name, step_payload = next(iter(update.items()))
-                previous_state = current_state
-
-                if step_name in started_nodes:
-                    active_tool_call, tool_call_started = started_nodes.pop(step_name)
-                else:
-                    interrupted_node = None
-                    if step_name == "__interrupt__" and started_nodes:
-                        # interrupt 发生在某个已宣告开始的节点内部，该节点不会再有 updates；取出它的挂起记录，
-                        # 若它已发过 tool_call_start，就借本次 __interrupt__ 收尾，避免前端工具卡片一直 running。
-                        interrupted_node = list(started_nodes.values())[-1]
-                        started_nodes.clear()
-                    # 兼容只产出 updates 的图（以及 __interrupt__ 这类没有任务开始事件的伪节点）。
-                    frames, active_tool_call, tool_call_started = announce_step_start(step_name, previous_state)
-                    for frame in frames:
-                        yield frame
-                    if interrupted_node is not None and interrupted_node[1] and not tool_call_started:
-                        active_tool_call, tool_call_started = interrupted_node
-
-                # __interrupt__ 是正常的确认暂停信号，不是 AgentState。
-                # 流式模式下要把它还原成 waiting_confirmation 状态返回给前端，避免误报成运行时异常。
-                if step_name == "__interrupt__":
-                    confirmation_payload = _extract_interrupt_payload(step_payload)
-                    if not confirmation_payload:
-                        raise ValueError("interrupt payload missing confirmation request")
-                    confirmation_count += 1
-                    current_state = _apply_stream_interrupt_state(previous_state, confirmation_payload)
-                else:
-                    current_state = _coerce_state(step_payload)
-                _persist_runtime_checkpoint_node(checkpoint_manager, current_state, current_node=step_name)
-                latest_step = current_state.steps[-1].model_dump() if current_state.steps else None
-
-                # 子阶段 D-3：节点执行结束后，把最新 step 摘要和当前状态回传给前端。
-                yield _sse_event(
-                    _make_stream_event(
-                        event_type="step_end",
-                        sequence=_next_sequence(sequence),
-                        run_id=run_id,
-                        data={
-                            "step": step_name,
-                            "status": latest_step.get("status") if isinstance(latest_step, dict) else "success",
-                            "step_detail": latest_step,
-                            "state": _compact_state(current_state),
-                        },
-                    )
-                )
-                event_count += 1
-                sequence += 1
-
-                if tool_call_started:
-                    # 子阶段 D-4：若本节点触发了工具调用，则在节点结束后补发 tool_call_end。
-                    latest_tool_call = _merge_tool_call_end(active_tool_call, _latest_runtime_tool_call(current_state))
-                    yield _sse_event(
-                        _make_stream_event(
-                            event_type="tool_call_end",
-                            sequence=_next_sequence(sequence),
-                            run_id=run_id,
-                            data={
-                                "step": step_name,
-                                "tool_call": latest_tool_call,
-                                "state": _compact_state(current_state),
-                            },
-                        )
-                    )
-                    event_count += 1
-                    sequence += 1
-                    if preannounced_tool_identity == _tool_call_identity(active_tool_call):
-                        preannounced_tool_call = None
-                        preannounced_tool_identity = None
+            # 阶段 D：逐个推送节点与工具事件；中途异常时 events.current_state 停在最后一个已完成节点。
+            events.current_state = current_state
+            for event in events.stream_graph(
+                graph,
+                graph_input,
+                graph_config,
+                checkpoint_manager=checkpoint_manager,
+                approved_step_id=approved_step_id,
+            ):
+                yield _sse_event(event)
+            current_state = events.current_state
 
             # 阶段 E：整张图执行完成后，输出最终聚合响应和结束事件。
             if current_state is not None:
@@ -1299,9 +1119,9 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
             trace.add_event(
                 "arxiv_agent.stream_done",
                 status="success",
-                event_count=event_count,
-                tool_count=tool_count,
-                confirmation_count=confirmation_count,
+                event_count=events.event_count,
+                tool_count=events.tool_count,
+                confirmation_count=events.confirmation_count,
             )
             trace_path = _write_request_trace(trace, reason="auto")
             info_event(
@@ -1311,38 +1131,31 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 session_id=resolved_session_id,
                 user_id=normalized_request.user_id,
                 status="success",
-                event_count=event_count,
-                tool_count=tool_count,
-                confirmation_count=confirmation_count,
+                event_count=events.event_count,
+                tool_count=events.tool_count,
+                confirmation_count=events.confirmation_count,
                 output=final_response.answer,
                 elapsed_ms=round((perf_counter() - started) * 1000, 1),
                 trace_path=trace_path,
             )
             yield _sse_event(
-                _make_stream_event(
-                    event_type="final_response",
-                    sequence=_next_sequence(sequence),
-                    run_id=run_id,
-                    data={
+                events.emit(
+                    "final_response",
+                    {
                         "response": final_response.model_dump(),
                         "state": _compact_state(current_state),
                     },
                 )
             )
-            event_count += 1
-            sequence += 1
             yield _sse_event(
-                _make_stream_event(
-                    event_type="stream_end",
-                    sequence=_next_sequence(sequence),
-                    run_id=run_id,
-                    data={
+                events.emit(
+                    "stream_end",
+                    {
                         "status": "success",
-                        "final_sequence": sequence,
+                        "final_sequence": events.sequence,
                     },
                 )
             )
-            event_count += 1
         except ResumeCheckpointNotFoundError as exc:
             # resume checkpoint 缺失要作为明确业务失败返回，避免前端继续保留失效确认卡片。
             _log_resume_checkpoint_not_found(
@@ -1377,19 +1190,17 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 user_id=normalized_request.user_id,
                 status="error",
                 code=RESUME_CHECKPOINT_NOT_FOUND_CODE,
-                event_count=event_count,
-                tool_count=tool_count,
-                confirmation_count=confirmation_count,
+                event_count=events.event_count,
+                tool_count=events.tool_count,
+                confirmation_count=events.confirmation_count,
                 output=error_response.answer,
                 elapsed_ms=round((perf_counter() - started) * 1000, 1),
                 trace_path=trace_path,
             )
             yield _sse_event(
-                _make_stream_event(
-                    event_type="exception",
-                    sequence=_next_sequence(sequence),
-                    run_id=run_id,
-                    data={
+                events.emit(
+                    "exception",
+                    {
                         "message": RESUME_CHECKPOINT_NOT_FOUND_MESSAGE,
                         "detail": str(exc),
                         "code": RESUME_CHECKPOINT_NOT_FOUND_CODE,
@@ -1403,33 +1214,24 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     },
                 )
             )
-            event_count += 1
-            sequence += 1
             yield _sse_event(
-                _make_stream_event(
-                    event_type="final_response",
-                    sequence=_next_sequence(sequence),
-                    run_id=run_id,
-                    data={
+                events.emit(
+                    "final_response",
+                    {
                         "response": error_response.model_dump(),
                     },
                 )
             )
-            event_count += 1
-            sequence += 1
             yield _sse_event(
-                _make_stream_event(
-                    event_type="stream_end",
-                    sequence=_next_sequence(sequence),
-                    run_id=run_id,
-                    data={
+                events.emit(
+                    "stream_end",
+                    {
                         "status": "error",
                         "code": RESUME_CHECKPOINT_NOT_FOUND_CODE,
-                        "final_sequence": sequence,
+                        "final_sequence": events.sequence,
                     },
                 )
             )
-            event_count += 1
         except Exception as exc:
             # 阶段 F：流式过程中任何异常都转成结构化事件，而不是让连接直接中断。
             # 同时写入 traceback；前端为了稳定体验会展示泛化错误，后端日志必须保留真实失败点。
@@ -1447,7 +1249,8 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     detail=str(exc),
                 )
             error_response = _build_error_response_from_state(
-                current_state,
+                # 图执行中途失败时，最新状态只在 events 上（本地变量仍停在执行前）。
+                events.current_state if events.current_state is not None else current_state,
                 message="arXiv 搜索 Agent 运行失败",
                 detail=str(exc),
                 code=ErrorCode.AGENT_RUNTIME_ERROR,
@@ -1474,19 +1277,17 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 user_id=normalized_request.user_id,
                 status="error",
                 code=ErrorCode.AGENT_RUNTIME_ERROR,
-                event_count=event_count,
-                tool_count=tool_count,
-                confirmation_count=confirmation_count,
+                event_count=events.event_count,
+                tool_count=events.tool_count,
+                confirmation_count=events.confirmation_count,
                 output=error_response.answer,
                 elapsed_ms=round((perf_counter() - started) * 1000, 1),
                 trace_path=trace_path,
             )
             yield _sse_event(
-                _make_stream_event(
-                    event_type="exception",
-                    sequence=_next_sequence(sequence),
-                    run_id=run_id,
-                    data={
+                events.emit(
+                    "exception",
+                    {
                         "message": "Agent 流式执行异常",
                         "detail": str(exc),
                         "code": ErrorCode.AGENT_RUNTIME_ERROR,
@@ -1500,33 +1301,23 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     },
                 )
             )
-            event_count += 1
-            sequence += 1
             yield _sse_event(
-                _make_stream_event(
-                    event_type="final_response",
-                    sequence=_next_sequence(sequence),
-                    run_id=run_id,
-
-                    data={
+                events.emit(
+                    "final_response",
+                    {
                         "response": error_response.model_dump(),
                     },
                 )
             )
-            event_count += 1
-            sequence += 1
             yield _sse_event(
-                _make_stream_event(
-                    event_type="stream_end",
-                    sequence=_next_sequence(sequence),
-                    run_id=run_id,
-                    data={
+                events.emit(
+                    "stream_end",
+                    {
                         "status": "error",
-                        "final_sequence": sequence,
+                        "final_sequence": events.sequence,
                     },
                 )
             )
-            event_count += 1
 
     # 返回真正的 SSE 响应对象，交给 FastAPI 持续推送 event_stream 生成的事件。
     return StreamingResponse(
@@ -2167,6 +1958,185 @@ def _tool_call_identity(tool_call: Optional[Mapping[str, Any]]) -> tuple[str, st
 def _should_emit_tool_call(state: Optional[AgentState]) -> bool:
     """判断当前节点状态是否值得额外发出 tool_call_start/tool_call_end 事件。"""
     return bool(state and state.intent == "arxiv_search" and state.tool_name and state.tool_args)
+
+
+class _AgentEventEmitter:
+    """为一次执行分配事件序号，并把 LangGraph 的 tasks/updates 流翻译成前端协议事件。
+
+    同步 SSE 与后台续跑共用这套翻译：两条路径推给前端的步骤/工具事件一致，前端才能复用同一条执行时间线。
+    """
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        self.sequence = 1
+        self.event_count = 0
+        self.tool_count = 0
+        self.confirmation_count = 0
+        self.current_state: Optional[AgentState] = None
+
+    def emit(self, event_type: str, data: Dict[str, Any]) -> AgentStreamEvent:
+        event = _make_stream_event(
+            event_type=event_type,
+            sequence=_next_sequence(self.sequence),
+            run_id=self.run_id,
+            data=data,
+        )
+        self.sequence += 1
+        self.event_count += 1
+        return event
+
+    def stream_graph(
+        self,
+        graph: Any,
+        graph_input: Any,
+        graph_config: Any,
+        *,
+        checkpoint_manager: Any = None,
+        approved_step_id: Optional[str] = None,
+    ) -> Iterator[AgentStreamEvent]:
+        """同时消费 LangGraph 的 tasks 与 updates 流，逐个产出 step/tool 事件，最新状态写回 current_state。
+
+        updates 只在节点执行完后才产出；tasks 会在节点开始前先产出一条任务事件，
+        借此把 step_start 提前到节点真正开始时，前端才能在 LLM/检索等长耗时节点期间看到进度。
+        checkpoint_manager 为空时不写节点级业务 checkpoint，由调用方在整轮结束后统一收敛。
+        """
+        preannounced_tool_call: Optional[Dict[str, Any]] = None
+        preannounced_tool_identity: Optional[tuple[str, str, str]] = None
+        if approved_step_id:
+            preannounced_tool_call = _active_runtime_tool_call(self.current_state, approved_step_id=approved_step_id)
+            if preannounced_tool_call is not None:
+                preannounced_tool_identity = _tool_call_identity(preannounced_tool_call)
+                self.tool_count += 1
+                # LangGraph 的 updates 事件要等节点完成后才返回；批准恢复后如果马上进入 Docling
+                # 这类长耗时工具，必须先从 checkpoint 快照预告工具开始，避免前端在转换期间只显示通用生成中。
+                yield self.emit(
+                    "tool_call_start",
+                    {
+                        "step": "execute_step",
+                        "tool_call": preannounced_tool_call,
+                        "state": _compact_state(self.current_state),
+                    },
+                )
+
+        def announce_step_start(step_name: str, previous_state: Optional[AgentState]):
+            """产出节点开始事件；若该节点会调用工具，同时补发 tool_call_start。
+
+            返回 (待推送的事件列表, active_tool_call, tool_call_started)。
+            """
+            frames = [self.emit("step_start", {"step": step_name, "state": _compact_state(previous_state)})]
+
+            active_tool_call = _active_runtime_tool_call(previous_state, approved_step_id=approved_step_id)
+            if active_tool_call is None and step_name == "execute_step" and preannounced_tool_call is not None:
+                # select_next_step 等前置节点可能会改变 previous_state 的投影；已预告的工具仍应在
+                # execute_step 结束时收到 tool_call_end，否则前端的 running 进度卡片无法收尾。
+                active_tool_call = preannounced_tool_call
+            tool_call_started = False
+            if active_tool_call is not None and (step_name == "execute_step" or _should_emit_tool_call(previous_state)):
+                tool_call_started = True
+                already_preannounced = (
+                    preannounced_tool_identity is not None
+                    and _tool_call_identity(active_tool_call) == preannounced_tool_identity
+                )
+                if not already_preannounced:
+                    self.tool_count += 1
+                    # 如果当前节点会触发工具调用，则补发工具开始事件。
+                    frames.append(
+                        self.emit(
+                            "tool_call_start",
+                            {
+                                "step": step_name,
+                                "tool_call": active_tool_call,
+                                "state": _compact_state(previous_state),
+                            },
+                        )
+                    )
+            return frames, active_tool_call, tool_call_started
+
+        # 已在 tasks 流里宣告开始、尚未收到 updates 的节点：节点名 -> (active_tool_call, tool_call_started)。
+        started_nodes: Dict[str, tuple[Optional[Dict[str, Any]], bool]] = {}
+
+        for stream_item in graph.stream(graph_input, config=graph_config, stream_mode=["tasks", "updates"]):
+            # 测试替身可能只产出 updates 字典；真实图在多模式下产出 (mode, chunk) 元组。
+            if isinstance(stream_item, tuple) and len(stream_item) == 2 and isinstance(stream_item[0], str):
+                stream_mode, chunk = stream_item
+            else:
+                stream_mode, chunk = "updates", stream_item
+            if not chunk:
+                continue
+
+            if stream_mode == "tasks":
+                task_name = str(chunk.get("name") or "") if isinstance(chunk, Mapping) else ""
+                # 只处理“任务开始”事件（带 input）；任务结果事件交给 updates 分支统一处理。
+                if not task_name or task_name.startswith("__") or "input" not in chunk:
+                    continue
+                # 节点开始执行前就通知前端，避免长耗时节点期间界面像卡死。
+                frames, active_tool_call, tool_call_started = announce_step_start(task_name, self.current_state)
+                started_nodes[task_name] = (active_tool_call, tool_call_started)
+                yield from frames
+                continue
+            if stream_mode != "updates":
+                continue
+            update = chunk
+
+            step_name, step_payload = next(iter(update.items()))
+            previous_state = self.current_state
+
+            if step_name in started_nodes:
+                active_tool_call, tool_call_started = started_nodes.pop(step_name)
+            else:
+                interrupted_node = None
+                if step_name == "__interrupt__" and started_nodes:
+                    # interrupt 发生在某个已宣告开始的节点内部，该节点不会再有 updates；取出它的挂起记录，
+                    # 若它已发过 tool_call_start，就借本次 __interrupt__ 收尾，避免前端工具卡片一直 running。
+                    interrupted_node = list(started_nodes.values())[-1]
+                    started_nodes.clear()
+                # 兼容只产出 updates 的图（以及 __interrupt__ 这类没有任务开始事件的伪节点）。
+                frames, active_tool_call, tool_call_started = announce_step_start(step_name, previous_state)
+                yield from frames
+                if interrupted_node is not None and interrupted_node[1] and not tool_call_started:
+                    active_tool_call, tool_call_started = interrupted_node
+
+            # __interrupt__ 是正常的确认暂停信号，不是 AgentState。
+            # 流式模式下要把它还原成 waiting_confirmation 状态返回给前端，避免误报成运行时异常。
+            if step_name == "__interrupt__":
+                # 先计数再解析：载荷异常时调用方仍能识别出图曾经 interrupt（后台续跑据此判定重新挂起）。
+                self.confirmation_count += 1
+                confirmation_payload = _extract_interrupt_payload(step_payload)
+                if not confirmation_payload:
+                    raise ValueError("interrupt payload missing confirmation request")
+                self.current_state = _apply_stream_interrupt_state(previous_state, confirmation_payload)
+            else:
+                self.current_state = _coerce_state(step_payload)
+            current_state = self.current_state
+            if checkpoint_manager is not None:
+                _persist_runtime_checkpoint_node(checkpoint_manager, current_state, current_node=step_name)
+            latest_step = current_state.steps[-1].model_dump() if current_state.steps else None
+
+            # 节点执行结束后，把最新 step 摘要和当前状态回传给前端。
+            yield self.emit(
+                "step_end",
+                {
+                    "step": step_name,
+                    "status": latest_step.get("status") if isinstance(latest_step, dict) else "success",
+                    "step_detail": latest_step,
+                    "state": _compact_state(current_state),
+                },
+            )
+
+            if tool_call_started:
+                # 若本节点触发了工具调用，则在节点结束后补发 tool_call_end。
+                latest_tool_call = _merge_tool_call_end(active_tool_call, _latest_runtime_tool_call(current_state))
+                yield self.emit(
+                    "tool_call_end",
+                    {
+                        "step": step_name,
+                        "tool_call": latest_tool_call,
+                        "state": _compact_state(current_state),
+                    },
+                )
+                if preannounced_tool_identity == _tool_call_identity(active_tool_call):
+                    preannounced_tool_call = None
+                    preannounced_tool_identity = None
 
 
 def _make_stream_event(*, event_type: str, sequence: int, run_id: str, data: Dict[str, Any]) -> AgentStreamEvent:

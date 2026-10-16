@@ -204,6 +204,16 @@ function toAgentUserResultForMessage(response: unknown): AgentUserResult {
   })
 }
 
+// 回答气泡与论文页共用 RagChatPanel，它靠消息上的 sources / citedSourceIds 渲染正文角标和内嵌图卡；
+// Agent 消息只带完整 response，这里从中取出证据挂到消息上，与证据抽屉同源。
+const chatMessages = computed(() =>
+  messages.value.map(item => {
+    if (item.role !== 'assistant' || !item.response) return item
+    const result = toAgentUserResultForMessage(item.response)
+    return { ...item, sources: result.evidenceSources, citedSourceIds: result.citedSourceIds }
+  })
+)
+
 function openAgentEvidence(response: unknown, sourceId?: string) {
   const agentResponse = toAgentResponse(response)
   const result = toAgentUserResultForMessage(response)
@@ -344,7 +354,7 @@ watch(latestResponse, () => {
     <section v-loading="restoringConversation" class="surface conversation">
       <RagChatPanel
         v-model:sender-text="inputMessage"
-        :messages="messages"
+        :messages="chatMessages"
         :loading="loading"
         :quick-prompts="quickPrompts"
         title="想找什么样的论文？"

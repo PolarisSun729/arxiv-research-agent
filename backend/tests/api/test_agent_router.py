@@ -149,6 +149,9 @@ class AgentRouterApiTests(unittest.TestCase):
             "status": "completed",
             "final_response": {"session_id": "s1", "intent": "paper_qa", "answer": "原问题答案"},
         }
+        manager.progress_events.return_value = [
+            {"event_type": "step_start", "sequence": 1, "run_id": "run-1", "data": {"step": "finalize"}},
+        ]
         self.client.app.dependency_overrides[agent_router.get_agent_resume_run_manager] = lambda: manager
 
         response = self.client.post(
@@ -159,6 +162,9 @@ class AgentRouterApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("event: final_response", response.text)
         self.assertIn("原问题答案", response.text)
+        # 续跑过程中的节点事件必须先于最终回答推出。
+        self.assertLess(response.text.index("event: progress"), response.text.index("event: final_response"))
+        manager.progress_events.assert_called_once_with("run-1", after=0)
         manager.claim_and_start.assert_called_once_with("continuation-1", user_id="u1", session_id="s1")
         manager.mark_result_retrieved.assert_called_once_with("run-1")
 

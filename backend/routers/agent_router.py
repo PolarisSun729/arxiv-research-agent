@@ -235,7 +235,8 @@ async def resume_agent_work_continuation_stream(
     恢复在后台线程中进行，SSE 只是轮询观察者：客户端断开连接不会停止恢复，
     之后可以通过 GET /resume-runs/{resume_run_id} 取回同一份持久化结果。
 
-    事件序列：run_start -> final_response | exception -> stream_end。
+    事件序列：run_start -> progress* -> final_response | exception -> stream_end。
+    progress 的 data 与 /chat/stream 的 step/tool 事件结构一致，前端复用同一条执行时间线展示续跑过程。
     """
     try:
         claimed = manager.claim_and_start(
@@ -252,9 +253,14 @@ async def resume_agent_work_continuation_stream(
             "run_start",
             {"resume_run_id": resume_run_id, "status": claimed.get("status")},
         )
+        progress_cursor = 0
         while True:
             run = manager.get(resume_run_id, user_id=actor.user_id, session_id=session_id)
             status = str(run.get("status") or "")
+            # 先读状态再取进度：续跑线程总是先写完进度再落终态，这样终态之前的进度一条都不会漏发。
+            for progress_event in manager.progress_events(resume_run_id, after=progress_cursor):
+                progress_cursor += 1
+                yield format_sse_event("progress", progress_event)
             if status == "completed":
                 # final_response 与 completed 状态在同一事务中持久化，SSE 断线后可改走 GET 取回同一结果。
                 yield format_sse_event(
