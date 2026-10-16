@@ -65,3 +65,67 @@ def test_preference_action_requires_explicit_paper_target() -> None:
 def test_recommendation_topic_search_is_not_recommendation_intent() -> None:
     assert parse_module._detect_non_search_rule_intent("推荐系统相关论文") != "recommendation"
     assert intent_support._looks_search_like("推荐系统相关论文") is True
+
+
+class _ScriptedLLM:
+    """按调用顺序返回预设输出，并记录每次调用的 task_type 和 prompt。"""
+
+    def __init__(self, *responses: str) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict] = []
+
+    def complete_with_qwen(self, prompt: str, task_type: str | None = None, **_: object) -> str:
+        self.calls.append({"task_type": task_type, "prompt": prompt})
+        return self.responses.pop(0)
+
+
+FOLLOW_UP = "我感觉目前论文数量还是不够，请你扩大一下搜索范围，然后重新搜索一下"
+RECENT_TURNS = [
+    {"role": "user", "content": "帮我找 RAG 的论文"},
+    {"role": "assistant", "content": "找到 5 篇论文", "search": {"concepts": ["RAG"]}, "paper_count": 5},
+]
+
+
+def test_follow_up_is_rewritten_with_recent_turns_before_intent_recognition() -> None:
+    import json
+
+    llm = _ScriptedLLM(
+        json.dumps({"standalone_request": "扩大搜索范围，再多找一些 RAG 的论文"}, ensure_ascii=False),
+        json.dumps({"intent": "arxiv_search", "confidence": 0.9, "concepts": [{"term": "RAG", "evidence": "RAG"}]}),
+    )
+
+    state = parse_module.parse_search_request({"message": FOLLOW_UP, "context": {"recent_turns": RECENT_TURNS}}, generation_service=llm)
+
+    assert [call["task_type"] for call in llm.calls] == ["agent_request_contextualization", "intent_recognition"]
+    assert "帮我找 RAG 的论文" in llm.calls[0]["prompt"]
+    assert "User message: 扩大搜索范围，再多找一些 RAG 的论文" in llm.calls[1]["prompt"]
+    assert state.intent == "arxiv_search"
+    assert [concept.term for concept in state.search_spec.concepts] == ["RAG"]
+    # state.message 保留用户原话；改写结果只进 debug 供前端展示。
+    assert state.message == FOLLOW_UP
+    assert state.debug["contextualized_message"] == "扩大搜索范围，再多找一些 RAG 的论文"
+
+
+def test_contextualization_failure_keeps_original_message() -> None:
+    import json
+
+    llm = _ScriptedLLM("not json", json.dumps({"intent": "arxiv_search", "confidence": 0.8, "concepts": []}))
+
+    state = parse_module.parse_search_request({"message": FOLLOW_UP, "context": {"recent_turns": RECENT_TURNS}}, generation_service=llm)
+
+    assert f"User message: {FOLLOW_UP}" in llm.calls[1]["prompt"]
+    assert state.debug["contextualization"]["status"] == "failed"
+    assert "contextualized_message" not in state.debug
+
+
+def test_search_without_any_topic_asks_user_instead_of_using_the_sentence() -> None:
+    import json
+
+    # 没有历史就不改写；LLM 判定没主题、也没有画像可补时，降级为 unclear，而不是把整句话当关键词去搜。
+    llm = _ScriptedLLM(json.dumps({"intent": "arxiv_search", "confidence": 0.8, "concepts": []}))
+
+    state = parse_module.parse_search_request({"message": FOLLOW_UP}, generation_service=llm)
+
+    assert [call["task_type"] for call in llm.calls] == ["intent_recognition"]
+    assert state.intent == "unclear"
+    assert state.search_spec is None

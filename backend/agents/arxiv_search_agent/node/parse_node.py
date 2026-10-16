@@ -35,6 +35,7 @@ from .intent_support import (
     _looks_like_saved_paper_container_request,
     _validation_error_summary,
 )
+from ..request_contextualizer import contextualize_request
 from ..schemas import ArxivSearchSpec
 from ..state import AgentState
 from ..utils.search_spec_builder import (
@@ -70,18 +71,20 @@ def _prepare_parse_search_request_input(state: Union[AgentState, Mapping[str, An
     主要步骤：
     1. 统一把外部传入对象转成 AgentState；
     2. 归一化 message 文本，避免后续规则和 LLM 处理空白噪声；
-    3. 只提取 parse 阶段真正需要的 research_profile，减少后续函数耦合。
+    3. 只提取 parse 阶段真正需要的 research_profile 和最近对话 recent_turns，减少后续函数耦合。
     
-    输出：返回包含 current_state、message、research_profile 的轻量字典。
+    输出：返回包含 current_state、message、research_profile、recent_turns 的轻量字典。
     """
     current_state = _coerce_state(state)
     message = _normalize_text(current_state.message or "")
     context = current_state.context if isinstance(current_state.context, Mapping) else {}
     research_profile = context.get("research_profile") if isinstance(context.get("research_profile"), Mapping) else None
+    recent_turns = [turn for turn in (context.get("recent_turns") or []) if isinstance(turn, Mapping)]
     return {
         "current_state": current_state,
         "message": message,
         "research_profile": research_profile,
+        "recent_turns": recent_turns,
     }
 
 
@@ -308,6 +311,7 @@ def _build_debug_payload(
     warnings: Sequence[str],
     next_actions: Sequence[str],
     cleaning_debug: Optional[Dict[str, Any]] = None,
+    contextualization: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """汇总 parse 阶段的重要中间信息，方便调试和前端解释执行过程。
     
@@ -334,6 +338,11 @@ def _build_debug_payload(
         payload["final_query"] = cleaning_debug.get("final_query")
         payload["final_title_query"] = cleaning_debug.get("final_title_query")
         payload["final_abstract_query"] = cleaning_debug.get("final_abstract_query")
+    if contextualization:
+        payload["contextualization"] = {key: contextualization.get(key) for key in ("status", "rewritten", "error")}
+        if contextualization.get("rewritten"):
+            # 前端"理解你的问题"会展示这句，让用户看到追问被理解成了什么。
+            payload["contextualized_message"] = contextualization.get("message")
     return payload
 
 
@@ -626,6 +635,7 @@ def _write_parse_search_request_state(
     search_spec_before_enrichment: Optional[Dict[str, Any]],
     search_spec_after_enrichment: Optional[Dict[str, Any]],
     cleaning_debug: Optional[Dict[str, Any]] = None,
+    contextualization: Optional[Dict[str, Any]] = None,
 ) -> AgentState:
     """把 parse 决策结果落回 AgentState，并追加统一 step trace。
     
@@ -669,6 +679,7 @@ def _write_parse_search_request_state(
         warnings=normalized_state.warnings,
         next_actions=normalized_state.next_actions,
         cleaning_debug=cleaning_debug,
+        contextualization=contextualization,
     )
     return _append_step(
         normalized_state,
@@ -709,6 +720,12 @@ def parse_search_request(
     message = prepared["message"]
     research_profile = prepared["research_profile"]
 
+    # 追问先借最近对话改写成完整的一句；后面的识别、规则和原话依据校验都只面对这句话。
+    # state.message 保持用户原话，对话记录、论文指代解析等仍按原话工作。
+    contextualization = contextualize_request(message, prepared["recent_turns"], generation_service)
+    original_message = message
+    message = contextualization["message"]
+
     detector_result = _run_parse_search_request_detectors(
         message,
         generation_service=generation_service,
@@ -733,6 +750,10 @@ def parse_search_request(
             raw_payload=(llm_result or {}).get("raw") if llm_result else None,
             research_profile=research_profile,
         )
+        if not grounded_spec.concepts and not any([grounded_spec.query, grounded_spec.title_query, grounded_spec.abstract_query]):
+            # 原话和画像都给不出主题时不能带空条件去检索；交给 finalize 降级为 unclear，请用户补充主题。
+            grounded_spec = None
+            grounding_warnings = list(grounding_warnings) + ["没有可用的检索主题，需要用户补充"]
         decision = {
             **decision,
             "search_spec": grounded_spec,
@@ -757,7 +778,8 @@ def parse_search_request(
         "arxiv_agent.parse_done",
         run_id=_state_run_id(current_state),
         session_id=current_state.session_id,
-        input=message,
+        input=original_message,
+        contextualized_input=message if contextualization["rewritten"] else None,
         llm_intent=(llm_result or {}).get("intent"),
         llm_confidence=(llm_result or {}).get("confidence"),
         rule_intent=(rule_result or {}).get("intent"),
@@ -769,7 +791,7 @@ def parse_search_request(
 
     return _write_parse_search_request_state(
         current_state=current_state,
-        message=message,
+        message=original_message,
         intent=finalized["intent"],
         intent_source=decision["intent_source"],
         fallback_reason=finalized["fallback_reason"],
@@ -782,6 +804,7 @@ def parse_search_request(
         search_spec_before_enrichment=decision["search_spec_before_enrichment"],
         search_spec_after_enrichment=decision["search_spec_after_enrichment"],
         cleaning_debug=finalized["cleaning_debug"],
+        contextualization=contextualization,
     )
 
 

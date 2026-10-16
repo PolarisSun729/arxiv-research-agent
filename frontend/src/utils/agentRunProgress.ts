@@ -106,6 +106,10 @@ function normalizeStepStatus(value: unknown): AgentProgressStatus {
 function intentFacts(state: Record<string, any>) {
   const facts: string[] = []
   const intent = typeof state.intent === 'string' ? state.intent : ''
+  // 追问会先结合上文改写成完整的一句，展示出来让用户确认理解没有跑偏。
+  if (typeof state.contextualized_message === 'string' && state.contextualized_message.trim()) {
+    facts.push(`理解为：${truncate(state.contextualized_message.trim(), 80)}`)
+  }
   if (intent) facts.push(`意图：${INTENT_LABELS[intent] || intent}`)
   const spec = isRecord(state.search_spec) ? state.search_spec : null
   if (intent === 'arxiv_search' && spec) {

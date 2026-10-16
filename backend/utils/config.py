@@ -840,6 +840,7 @@ GENERATION_CONFIG: Dict[str, Any] = {
     # 任务到模型角色的路由表只保留在配置层，业务代码只负责读取，不再硬编码模型名。
     "task_model_roles": {
         "intent_recognition": "small",  # 解析用户原始输入以识别高层意图
+        "agent_request_contextualization": "small",  # 借最近对话把 Agent 追问改写成可独立理解的请求
         "intent_routing": "small",  # 决定将意图路由到哪个子 agent 或处理流水线
         "search_spec_parse": "small",  # 将自然语言搜索请求转换为结构化的搜索规范
         "preference_action_parse": "small",  # 解析用户的喜欢/不喜欢/收藏等偏好操作
