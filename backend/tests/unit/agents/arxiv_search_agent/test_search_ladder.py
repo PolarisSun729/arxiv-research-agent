@@ -84,6 +84,15 @@ def test_profile_fill_never_uses_excluded_topics() -> None:
     assert [(concept.term, concept.source) for concept in spec.concepts] == [("graph retrieval", "profile")]
 
 
+def test_sentence_without_topic_is_never_turned_into_keywords() -> None:
+    # LLM 判定本句没有主题时，不能再把"我感觉目前""扩大一下"之类的话切成检索词。
+    message = "我感觉目前论文数量还是不够，请你扩大一下搜索范围，然后重新搜索一下"
+    spec, _ = _ground({"intent": "arxiv_search", "concepts": []}, message=message, profile=None)
+
+    assert spec.concepts == []
+    assert not spec.query
+
+
 def test_user_named_categories_are_locked() -> None:
     spec, _ = _ground({"intent": "arxiv_search", "concepts": [{"term": "RAG", "evidence": "RAG"}]}, message="找 cs.IR 下的 RAG 论文")
 

@@ -144,3 +144,14 @@ assert.deepEqual(ladder.entries[0].facts, ['意图：论文检索', '关键词�
 assert.deepEqual(ladder.entries[1].facts, ['严格匹配：0 篇', '放开推断的分类范围：12 篇', '检索到 5 篇论文'])
 
 console.log('agent run progress tests passed')
+
+// 追问被结合上文改写时，“理解你的问题”先展示改写后的请求。
+const followUp = replay([
+  event('step_start', { step: 'parse_search_request' }),
+  event('step_end', {
+    step: 'parse_search_request',
+    status: 'success',
+    state: { intent: 'arxiv_search', contextualized_message: '再多找一些 RAG 的论文，不限时间', search_spec: { query: 'RAG' } }
+  })
+])
+assert.deepEqual(followUp.entries[0].facts, ['理解为：再多找一些 RAG 的论文，不限时间', '意图：论文检索', '关键词：RAG'])

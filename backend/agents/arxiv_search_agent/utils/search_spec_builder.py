@@ -239,14 +239,12 @@ def _post_process_cleaned_spec(
             normalized_query = _normalize_topic_phrase(cleaned_topic_cn or "") if cleaned_topic_cn else None
         if not normalized_query:
             normalized_query = _normalize_topic_phrase(spec.query) if spec.query else None
-        if not normalized_query:
-            normalized_query = _extract_query_from_message(message)
         if normalized_query:
             if spec.query and normalized_query != spec.query:
                 warnings.append(f'LLM 输出的 query 已重新清洗: "{spec.query}" -> "{normalized_query}"')
             spec.query = normalized_query
         elif spec.query:
-            warnings.append(f'LLM 输出的 query 未能抽取出稳定主题: "{spec.query}"，将继续依赖后续规则兜底')
+            warnings.append(f'LLM 输出的 query 未能抽取出稳定主题: "{spec.query}"，将继续依赖后续兜底')
 
     if spec.query and spec.abstract_query and not _user_mentioned_abstract(message):
         warnings.append(f'用户未明确要求摘要搜索，已自动清空 abstract_query (原值: "{spec.abstract_query}")')
@@ -296,7 +294,9 @@ def _apply_rule_enrichment(message: str, spec: ArxivSearchSpec) -> Optional[Arxi
 
     它不会推翻已有 spec 的核心语义，而是补齐时间范围、排序、默认类别、运算符等隐含字段。
     """
-    query = spec.query or _extract_query_from_message(message)
+    # 主题只来自 spec 本身：规则路径在 _build_spec_from_rules 里已经抽过一次；LLM 路径没给主题时
+    # 再按原话切词只会把"扩大一下范围"这类话当成关键词，交给 _ground_search_spec 决定画像补全或请用户补充。
+    query = spec.query
     title_query = spec.title_query
     abstract_query = spec.abstract_query
     categories = get_default_agent_arxiv_categories()
@@ -652,7 +652,8 @@ def _ground_search_spec(
 ) -> Tuple[ArxivSearchSpec, List[str]]:
     """parse 阶段的最后一道收口：主题落地到用户原话，并标注每个约束的来源。
 
-    - concepts 只保留有原话依据的部分；全被剔除时回退到规则抽取的主题；
+    - concepts 只保留有原话依据的部分；全被剔除时回退到规则抽取的主题，
+      但 LLM 判定本句没有主题时不再按原话切词，避免把整句话当成关键词；
     - 用户完全没给主题时才用画像补一个 source=profile 的概念，回答里会说明；
     - 时间、数量、排序、分类按“原话里能否直接读出来”标注 user / inferred / default。
     """
@@ -676,7 +677,9 @@ def _ground_search_spec(
         warnings.append(f"检索概念过多，已把 {'、'.join(concept.term for concept in demoted)} 降为补充词")
 
     if not concepts:
-        rule_query = _extract_query_from_message(message)
+        # LLM 给过主题、只是全被画像校验剔除时，原话里大概率真有主题，规则抽取仍可补救；
+        # LLM 判定本句没有主题时（如"扩大一下搜索范围重新搜"），按原话切词只会产出噪声关键词。
+        rule_query = _extract_query_from_message(message) if candidate_concepts or raw_payload is None else None
         if rule_query and text_tokens(rule_query):
             concepts = [SearchConcept(term=rule_query, source="user")]
         elif not rule_query and not spec.title_query and not spec.abstract_query:

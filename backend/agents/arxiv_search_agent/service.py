@@ -39,6 +39,7 @@ except Exception:  # pragma: no cover
     _get_background_work_coordinator = None
 
 from .graph import build_arxiv_search_graph
+from .request_contextualizer import build_recent_turns
 from .execution.interaction_runtime import InteractionRuntimeError, InteractionRuntimeService
 from .execution.interactions import AgentInteraction, InteractionResumeRequest
 from .runtime_checkpoint import (
@@ -427,6 +428,31 @@ def _persist_agent_session_memory(final_state: Any, *, memory_service: MemorySer
         )
 
 
+def _attach_recent_turns(
+    request_context: Dict[str, Any],
+    storage: Any,
+    *,
+    session_id: Optional[str],
+    user_id: Optional[str],
+) -> Dict[str, Any]:
+    """把本会话最近几轮对话放进 context，供 parse 改写追问；必须在本轮用户消息落库之前调用。
+
+    读取失败只是少了追问改写，不能影响本轮执行。前端传来的同名字段不在合并白名单里，这里写入的是唯一来源。
+    """
+    store = getattr(storage, "agent_chat_messages", None)
+    if store is None or not session_id:
+        return request_context
+    try:
+        messages = store.list_agent_chat_messages(session_id, user_id=user_id)
+    except Exception as exc:
+        logger.warning("Failed to load agent chat history: session_id=%s error=%s", session_id, exc)
+        return request_context
+    recent_turns = build_recent_turns(messages)
+    if recent_turns:
+        request_context = {**request_context, "recent_turns": recent_turns}
+    return request_context
+
+
 def _record_agent_chat_message(
     storage: Any,
     *,
@@ -665,6 +691,12 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
             memory_service=memory_service,
         )
         resolved_session_id = _ensure_session_id(resolved_session_id)
+        request_context = _attach_recent_turns(
+            request_context,
+            storage,
+            session_id=resolved_session_id,
+            user_id=normalized_request.user_id,
+        )
         trace.session_id = resolved_session_id
         graph_config = _build_langgraph_config(resolved_session_id)
         info_event(
@@ -942,6 +974,12 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 memory_service=memory_service,
             )
             resolved_session_id = _ensure_session_id(resolved_session_id)
+            request_context = _attach_recent_turns(
+                request_context,
+                storage,
+                session_id=resolved_session_id,
+                user_id=normalized_request.user_id,
+            )
             trace.session_id = resolved_session_id
             trace.user_id = normalized_request.user_id
             graph_config = _build_langgraph_config(resolved_session_id)
@@ -1730,6 +1768,8 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
         "intent_source": state.intent_source,
         "fallback_reason": state.fallback_reason,
         "llm_confidence": state.llm_confidence,
+        # 追问被改写时带上改写后的请求，前端在"理解你的问题"里展示，用户能看到追问被理解成了什么。
+        "contextualized_message": (state.debug or {}).get("contextualized_message"),
         "search_spec": state.search_spec.model_dump() if state.search_spec is not None else None,
         "goal": state.goal.model_dump() if state.goal is not None else None,
         # research_task_profile 是 intent 与计划之间的科研任务语义层；这里随状态快照一并暴露，
