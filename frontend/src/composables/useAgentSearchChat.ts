@@ -2,20 +2,24 @@ import { reactive, ref, watch, type Ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
   cancelAgentWorkContinuation,
-  clearAgentSession,
+  getAgentChatMessages,
   getAgentResumeRun,
+  listAgentChatSessions,
   listAgentWorkContinuations,
   runAgentChat,
   streamAgentChat,
   streamAgentWorkContinuationResume
 } from '@/api/agent'
 import { getApiErrorMessage, getErrorMessage } from '@/api/errors'
+import { normalizeServerTimestamp } from '@/utils/format'
 import { isRecord } from '@/utils/guards'
 import { applyProgressEvent, createRunProgress, finishRunProgress } from '@/utils/agentRunProgress'
 import type {
+  AgentChatSessionSummary,
   AgentInteraction,
   AgentPaper,
   AgentWorkContinuation,
+  AgentStoredChatMessage,
   AgentStreamEvent,
   AgentToolCall,
   ArxivSearchRequest,
@@ -30,6 +34,8 @@ type ResumeDecision = 'approve' | 'reject' | 'select' | 'cancel'
 
 const CONTINUATION_POLL_INTERVAL_MS = 2500
 const HIDDEN_CONTINUATION_POLL_INTERVAL_MS = 10000
+const LAST_SESSION_STORAGE_PREFIX = 'agent_search_last_session:'
+const INTERRUPTED_TURN_MESSAGE = '这一轮回答没有完成（页面刷新或连接中断），可以重新发送。'
 
 interface SubmitMessageOptions {
   resume?: NonNullable<ArxivSearchRequest['resume']>
@@ -61,6 +67,33 @@ function createDraftResponse(): ArxivSearchResponse {
   }
 }
 
+function lastSessionStorageKey(userId: string) {
+  return `${LAST_SESSION_STORAGE_PREFIX}${userId}`
+}
+
+// 只记一个指针：从菜单直接进入页面时回到上次对话；内容本身始终以后端流水为准。
+function readLastSessionId(userId: string) {
+  if (!userId) return null
+  try {
+    return typeof window === 'undefined' ? null : window.localStorage.getItem(lastSessionStorageKey(userId))
+  } catch {
+    return null
+  }
+}
+
+function writeLastSessionId(userId: string, sessionId: string | null) {
+  if (!userId || typeof window === 'undefined') return
+  try {
+    if (sessionId) {
+      window.localStorage.setItem(lastSessionStorageKey(userId), sessionId)
+    } else {
+      window.localStorage.removeItem(lastSessionStorageKey(userId))
+    }
+  } catch {
+    // 存储不可用只影响“进入页面回到上次对话”，URL 中的 session 仍可恢复。
+  }
+}
+
 function buildConfirmationPlaceholder(interaction: AgentInteraction | null) {
   if (interaction?.kind === 'target_selection') return '正在提交论文选择并恢复 Agent…'
   if (interaction?.kind === 'side_effect_approval') return '正在保存授权并创建后台任务…'
@@ -86,6 +119,52 @@ function getStreamEventErrorMessage(event: AgentStreamEvent, response: ArxivSear
     : typeof payload.error?.code === 'string' ? payload.error.code : 'agent_runtime_error'
   const fallback = typeof payload.message === 'string' && payload.message ? payload.message : 'Agent 调用失败'
   return getApiErrorMessage(code, fallback)
+}
+
+function toRestoredMessages(items: AgentStoredChatMessage[]): AgentChatMessage<ArxivSearchResponse>[] {
+  const restored: AgentChatMessage<ArxivSearchResponse>[] = []
+  let unansweredUser: AgentStoredChatMessage | null = null
+  const pushInterrupted = (userItem: AgentStoredChatMessage) => {
+    restored.push({
+      id: `interrupted-${userItem.message_id}`,
+      role: 'assistant',
+      content: INTERRUPTED_TURN_MESSAGE,
+      loading: false,
+      createdAt: normalizeServerTimestamp(userItem.created_at),
+      response: null,
+      error: INTERRUPTED_TURN_MESSAGE,
+      retryMessage: userItem.content
+    })
+  }
+  for (const item of items) {
+    if (item.role === 'user') {
+      // 用户消息在执行前就落库；后面紧跟的不是回答，说明那一轮中途断开、没有结果。
+      if (unansweredUser) pushInterrupted(unansweredUser)
+      unansweredUser = item
+      restored.push({
+        id: item.message_id,
+        role: 'user',
+        content: item.content,
+        loading: false,
+        createdAt: normalizeServerTimestamp(item.created_at),
+        response: null,
+        error: null
+      })
+      continue
+    }
+    unansweredUser = null
+    restored.push({
+      id: item.message_id,
+      role: 'assistant',
+      content: item.content,
+      loading: false,
+      createdAt: normalizeServerTimestamp(item.created_at),
+      response: item.response,
+      error: getAgentRuntimeErrorMessage(item.response) || (item.status === 'error' ? item.content || 'Agent 调用失败' : null)
+    })
+  }
+  if (unansweredUser) pushInterrupted(unansweredUser)
+  return restored
 }
 
 function applyStreamEvent(target: AgentChatMessage<ArxivSearchResponse>, event: AgentStreamEvent) {
@@ -151,6 +230,8 @@ export function useAgentSearchChat() {
   const activeSessionId = ref<string | null>(null)
   const activeSessionUserId = ref<string | null>(null)
   const workContinuations = ref<AgentWorkContinuation[]>([])
+  const chatSessions = ref<AgentChatSessionSummary[]>([])
+  const restoringConversation = ref(false)
   const continuationRefreshing = ref(false)
   const resumingContinuationIds = reactive(new Set<string>())
   const retryingContinuationIds = reactive(new Set<string>())
@@ -158,6 +239,8 @@ export function useAgentSearchChat() {
   let continuationPollTimer: ReturnType<typeof setTimeout> | null = null
   let continuationPollingActive = false
   let visibilityListenerAttached = false
+  // 每次清空或切换会话都会递增；历史加载返回时版本已变就丢弃，避免旧会话回流覆盖当前页面。
+  let conversationVersion = 0
 
   function getUserId() {
     return userContext.getUserId()
@@ -167,9 +250,8 @@ export function useAgentSearchChat() {
     inputMessage.value = value
   }
 
-  async function clearConversation(options: { clearBackend?: boolean } = {}) {
-    const sessionIdToClear = activeSessionId.value
-    const sessionUserId = activeSessionUserId.value
+  function clearConversation() {
+    conversationVersion += 1
     messages.value = []
     latestResponse.value = null
     lastSearchPapers.value = []
@@ -182,14 +264,67 @@ export function useAgentSearchChat() {
     inputMessage.value = ''
     workContinuations.value = []
     deliveredResumeRunIds.clear()
+  }
 
-    if (options.clearBackend === false || !sessionIdToClear || sessionUserId !== getUserId()) return
+  function startNewConversation() {
+    // 新对话只重置本页状态：旧会话的流水和已批准的后台任务都继续保留，可从历史对话切回查看。
+    clearConversation()
+    writeLastSessionId(getUserId(), null)
+  }
+
+  async function refreshChatSessions() {
     try {
-      // 新对话不继承旧 interaction 或后台恢复入口；历史任务仍由后端保留用于排障审计。
-      await clearAgentSession(sessionIdToClear)
+      chatSessions.value = await listAgentChatSessions()
     } catch (error) {
-      ElMessage.error(getErrorMessage(error, '清空 Agent 对话失败'))
+      ElMessage.error(getErrorMessage(error, '历史对话加载失败'))
     }
+  }
+
+  async function loadConversation(sessionId: string) {
+    const normalizedSessionId = sessionId.trim()
+    if (!normalizedSessionId || loading.value) return false
+    clearConversation()
+    const version = conversationVersion
+    const userId = getUserId()
+    restoringConversation.value = true
+    try {
+      const items = await getAgentChatMessages(normalizedSessionId)
+      if (version !== conversationVersion) return false
+      if (!items.length) {
+        // 他人会话、已不存在或从未产生消息的会话都按空处理；指针一并清掉，下次进入不再尝试。
+        if (readLastSessionId(userId) === normalizedSessionId) writeLastSessionId(userId, null)
+        return false
+      }
+      messages.value = toRestoredMessages(items)
+      // 按时间顺序重放每个回答，最终的论文候选、选中论文和待处理交互与实时对话时一致。
+      for (const item of items) {
+        if (item.role !== 'assistant' || !item.response) continue
+        rememberResponse(item.response)
+        if (item.resume_run_id) deliveredResumeRunIds.add(item.resume_run_id)
+      }
+      activeSessionId.value = normalizedSessionId
+      activeSessionUserId.value = userId
+      return true
+    } catch (error) {
+      if (version === conversationVersion) ElMessage.error(getErrorMessage(error, '对话历史加载失败'))
+      return false
+    } finally {
+      if (version === conversationVersion) restoringConversation.value = false
+    }
+  }
+
+  // 页面进入时：URL 指定的会话优先，否则回到该用户上次所在的会话；都没有就是新对话。
+  async function restoreConversation(preferredSessionId?: string | null) {
+    const candidate = preferredSessionId || readLastSessionId(getUserId())
+    if (!candidate) return false
+    return loadConversation(candidate)
+  }
+
+  async function switchConversation(sessionId: string) {
+    if (loading.value || sessionId === activeSessionId.value) return
+    if (!await loadConversation(sessionId)) return
+    await refreshWorkContinuations()
+    scheduleContinuationPoll()
   }
 
   function replaceWorkContinuation(updated: AgentWorkContinuation) {
@@ -558,9 +693,15 @@ export function useAgentSearchChat() {
     }
   }
 
+  watch(activeSessionId, sessionId => {
+    const userId = getUserId()
+    if (sessionId && activeSessionUserId.value === userId) writeLastSessionId(userId, sessionId)
+  })
+
   watch(() => getUserId(), () => {
-    // 切换用户时当前 API actor 已经变化，只做本地清理，不能误删上一用户的后端会话。
-    void clearConversation({ clearBackend: false })
+    // 切换用户时当前 API actor 已经变化，只做本地清理；上一用户的会话和指针都原样保留。
+    clearConversation()
+    chatSessions.value = []
     // continuation 属于用户命名空间；切换用户后必须立即清空旧卡，再从新用户范围重新加载。
     workContinuations.value = []
     deliveredResumeRunIds.clear()
@@ -579,6 +720,8 @@ export function useAgentSearchChat() {
     paperQaResult,
     activeSessionId,
     workContinuations,
+    chatSessions,
+    restoringConversation,
     continuationRefreshing,
     resumingContinuationIds,
     retryingContinuationIds,
@@ -591,6 +734,9 @@ export function useAgentSearchChat() {
     resumeWorkContinuation,
     cancelWorkContinuation,
     retryWorkContinuation,
-    clearConversation
+    startNewConversation,
+    refreshChatSessions,
+    restoreConversation,
+    switchConversation
   }
 }

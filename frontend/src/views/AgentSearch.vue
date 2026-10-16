@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Compass, Delete } from '@element-plus/icons-vue'
+import { Clock, Compass, Plus, RefreshRight } from '@element-plus/icons-vue'
 import { useRoute, useRouter } from 'vue-router'
 import { dislikePaper, likePaper, removePaperPreference } from '@/api/papers'
 import { useAgentSearchChat } from '@/composables/useAgentSearchChat'
@@ -15,6 +15,7 @@ import type { Paper } from '@/types/paper'
 import { usePaperStore } from '@/stores/paperStore'
 import { getPaperTargetCandidateId, toAgentUserResult, type AgentUserResult } from '@/utils/agentUserResult'
 import { orderCitedSourceIds } from '@/utils/evidence'
+import { normalizeServerTimestamp } from '@/utils/format'
 import type { RagChatSource } from '@/types/ragChat'
 
 const router = useRouter()
@@ -48,7 +49,13 @@ const {
   resumeWorkContinuation,
   cancelWorkContinuation,
   retryWorkContinuation,
-  clearConversation,
+  activeSessionId,
+  chatSessions,
+  restoringConversation,
+  startNewConversation,
+  refreshChatSessions,
+  restoreConversation,
+  switchConversation,
   selectedPaper
 } = useAgentSearchChat()
 
@@ -58,17 +65,29 @@ const quickPrompts = [
   '找一些关于多模态检索增强生成的论文'
 ]
 
+function routeSessionId() {
+  const value = route.query.session
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
 onMounted(async () => {
   // 从论文搜索页跳转过来时带着查询预填输入框；不自动发送，让用户先确认或改写。
   const prefill = route.query.q
-  if (typeof prefill === 'string' && prefill.trim()) {
+  const hasPrefill = typeof prefill === 'string' && Boolean(prefill.trim())
+  if (hasPrefill) {
     setInputMessage(prefill)
-    void router.replace({ query: { ...route.query, q: undefined } })
+    await router.replace({ query: { ...route.query, q: undefined } })
   }
   void store.fetchResearchProfile()
   // 结果卡片上的「已读」读取行为表，进入页面先加载一次。
   store.fetchPaperActions().catch(() => undefined)
-  // 新页面从空会话开始；只有当前页面产生 session 后，才查询该会话自己的后台任务。
+  // URL 指定会话时总是恢复它；带着新问题预填进来的视为开启新对话，不回到上次会话。
+  const requestedSessionId = routeSessionId()
+  if (requestedSessionId || !hasPrefill) {
+    const restored = await restoreConversation(requestedSessionId)
+    if (requestedSessionId && !restored) await router.replace({ query: { ...route.query, session: undefined } })
+  }
+  // 恢复出会话后再启动轮询，这样该会话里仍在跑或已完成待取回的后台任务会接着展示。
   await startWorkContinuationPolling()
 })
 
@@ -76,12 +95,33 @@ onBeforeUnmount(() => {
   stopWorkContinuationPolling()
 })
 
+// 当前会话写进 URL：刷新、复制链接或多标签页都能精确回到各自的对话。
+watch(activeSessionId, sessionId => {
+  const next = sessionId || undefined
+  if ((routeSessionId() || undefined) === next) return
+  void router.replace({ query: { ...route.query, session: next } })
+})
+
 function handlePromptSelect(prompt: string) {
   setInputMessage(prompt)
 }
 
-function handleClear() {
-  void clearConversation()
+function handleNewConversation() {
+  startNewConversation()
+}
+
+function handleHistoryVisible(visible: boolean) {
+  if (visible) void refreshChatSessions()
+}
+
+function handleHistorySelect(sessionId: string) {
+  void switchConversation(sessionId)
+}
+
+function formatSessionTime(value: string) {
+  const parsed = new Date(normalizeServerTimestamp(value))
+  if (Number.isNaN(parsed.getTime())) return value
+  return parsed.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
 function selectedInteractionCandidate(candidateId?: string) {
@@ -236,7 +276,36 @@ watch(latestResponse, () => {
         <p class="page-desc">用自然语言描述你想找的论文，Agent 会规划检索、整理结果并给出可查看的论文列表。</p>
       </div>
       <div class="page-actions">
-        <el-button :icon="Delete" :disabled="loading || messages.length === 0" @click="handleClear">清空对话</el-button>
+        <el-dropdown
+          trigger="click"
+          placement="bottom-end"
+          :disabled="loading || restoringConversation"
+          @visible-change="handleHistoryVisible"
+          @command="handleHistorySelect"
+        >
+          <el-button :icon="Clock" :disabled="loading || restoringConversation">历史对话</el-button>
+          <template #dropdown>
+            <el-dropdown-menu class="history-menu">
+              <el-dropdown-item v-if="chatSessions.length === 0" disabled>暂无历史对话</el-dropdown-item>
+              <el-dropdown-item
+                v-for="session in chatSessions"
+                :key="session.session_id"
+                :command="session.session_id"
+                :class="{ 'history-menu__item--active': session.session_id === activeSessionId }"
+              >
+                <div class="history-menu__item">
+                  <span class="history-menu__title">{{ session.title || '未命名对话' }}</span>
+                  <span class="history-menu__time">{{ formatSessionTime(session.updated_at) }}</span>
+                </div>
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+        <el-button
+          :icon="Plus"
+          :disabled="loading || restoringConversation || messages.length === 0"
+          @click="handleNewConversation"
+        >新对话</el-button>
       </div>
     </header>
 
@@ -272,7 +341,7 @@ watch(latestResponse, () => {
       />
     </section>
 
-    <section class="surface conversation">
+    <section v-loading="restoringConversation" class="surface conversation">
       <RagChatPanel
         v-model:sender-text="inputMessage"
         :messages="messages"
@@ -292,6 +361,13 @@ watch(latestResponse, () => {
           <AgentRunTimeline v-if="item.progress" :progress="item.progress" />
         </template>
         <template #message-footer="{ item }">
+          <el-button
+            v-if="item.retryMessage"
+            :icon="RefreshRight"
+            size="small"
+            :disabled="loading"
+            @click="submitMessage(item.retryMessage)"
+          >重新发送</el-button>
           <AgentUserResultAttachments
             v-if="item.role === 'assistant' && item.response"
             :result="toAgentUserResultForMessage(item.response)"
@@ -353,5 +429,37 @@ watch(latestResponse, () => {
 
 .conversation {
   padding: 18px 20px;
+}
+</style>
+
+<style>
+/* 下拉菜单渲染在 body 下，scoped 样式命中不到，这里用非 scoped 的独立类名。 */
+.history-menu {
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.history-menu__item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 280px;
+  padding: 2px 0;
+  line-height: 1.4;
+}
+
+.history-menu__title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-menu__time {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.history-menu__item--active {
+  color: var(--el-color-primary);
 }
 </style>

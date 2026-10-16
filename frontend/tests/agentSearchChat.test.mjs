@@ -12,13 +12,13 @@ await build({
       import assert from 'node:assert/strict'
       import { nextTick, watchEffect } from 'vue'
       import {
-        getClearCalls,
         getChatRequests,
         getListCalls,
         getResumeCalls,
         releaseToolStream,
         resetContinuationStub,
-        setContinuations
+        setContinuations,
+        setHistory
       } from '@/api/agent'
       import { useAgentSearchChat } from './src/composables/useAgentSearchChat.ts'
       import { toAgentUserResult } from './src/utils/agentUserResult.ts'
@@ -188,9 +188,35 @@ await build({
         assert.equal(scheduledPolls, 1)
         pollingChat.stopWorkContinuationPolling()
 
-        await pollingChat.clearConversation()
-        assert.deepEqual(getClearCalls(), ['s1'])
+        // 新对话只重置本页状态，不再作废旧会话；旧会话的后台任务继续跑，可从历史切回查看。
+        pollingChat.startNewConversation()
+        assert.equal(pollingChat.activeSessionId.value, null)
+        assert.equal(pollingChat.messages.value.length, 0)
         assert.equal(pollingChat.workContinuations.value.length, 0)
+
+        // 刷新后从后端流水回放：论文上下文按顺序重建，没有回答的一问补一个可重发的中断气泡。
+        setHistory([
+          { message_id: 'm1', session_id: 's-history', role: 'user', content: '找 RAG 论文', response: null, status: 'completed', resume_run_id: null, created_at: '2026-10-14 08:00:00' },
+          {
+            message_id: 'm2', session_id: 's-history', role: 'assistant', content: '找到 1 篇', status: 'completed', resume_run_id: 'resume-old', created_at: '2026-10-14 08:00:05',
+            response: { session_id: 's-history', intent: 'arxiv_search', answer: '找到 1 篇', interaction: null, papers: [{ arxiv_id: '2401.00001', title: 'RAG' }], plan: [], tool_calls: [], warnings: [], next_actions: [], steps: [], debug: {} }
+          },
+          { message_id: 'm3', session_id: 's-history', role: 'user', content: '再找 5 篇', response: null, status: 'completed', resume_run_id: null, created_at: '2026-10-14 08:01:00' }
+        ])
+        const restoredChat = useAgentSearchChat()
+        assert.equal(await restoredChat.restoreConversation('s-history'), true)
+        assert.equal(restoredChat.activeSessionId.value, 's-history')
+        assert.deepEqual(restoredChat.messages.value.map(message => message.role), ['user', 'assistant', 'user', 'assistant'])
+        assert.equal(restoredChat.messages.value[1].createdAt, '2026-10-14T08:00:05Z')
+        assert.equal(restoredChat.messages.value[3].retryMessage, '再找 5 篇')
+        assert.ok(restoredChat.messages.value[3].error)
+        assert.equal(restoredChat.lastSearchPapers.value[0].arxiv_id, '2401.00001')
+
+        // 没有流水的会话（他人会话或已不存在）不恢复，保持新对话。
+        setHistory([])
+        const emptyChat = useAgentSearchChat()
+        assert.equal(await emptyChat.restoreConversation('s-missing'), false)
+        assert.equal(emptyChat.activeSessionId.value, null)
       } finally {
         globalThis.setTimeout = originalSetTimeout
         globalThis.clearTimeout = originalClearTimeout
@@ -222,22 +248,23 @@ await build({
                 let releaseStream = null
                 let continuations = []
                 let resumeCalls = []
-                let clearCalls = []
+                let history = []
                 let listCalls = []
                 let chatRequests = []
                 export function setContinuations(items) { continuations = items }
                 export function getResumeCalls() { return [...resumeCalls] }
-                export function getClearCalls() { return [...clearCalls] }
+                export function setHistory(items) { history = items }
                 export function getChatRequests() { return [...chatRequests] }
                 export function getListCalls() { return [...listCalls] }
-                export function resetContinuationStub() { continuations = []; resumeCalls = []; clearCalls = []; listCalls = []; chatRequests = [] }
+                export function resetContinuationStub() { continuations = []; resumeCalls = []; history = []; listCalls = []; chatRequests = [] }
                 export function releaseToolStream() {
                   releaseStream?.()
                   releaseStream = null
                 }
                 export async function runAgentChat() { throw new Error('sync fallback should not run') }
                 export async function listAgentWorkContinuations(sessionId) { listCalls.push(sessionId); return continuations }
-                export async function clearAgentSession(sessionId) { clearCalls.push(sessionId) }
+                export async function getAgentChatMessages() { return history }
+                export async function listAgentChatSessions() { return [] }
                 export async function cancelAgentWorkContinuation() { throw new Error('not used') }
                 export async function getAgentResumeRun() { throw new Error('not used') }
                 export async function streamAgentWorkContinuationResume(continuationId, sessionId, handlers = {}) {

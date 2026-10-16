@@ -2,7 +2,8 @@
 
 本模块挂载在 /api/agent 下，分为三组接口：
 1. 对话：/chat（一次性返回）与 /chat/stream（SSE 流式返回），以及调试用的 /graph；
-2. 会话：/sessions/{session_id}/clear，清空一段 Agent 对话并作废其挂起的恢复链路；
+2. 会话：/sessions 与 /sessions/{session_id}/messages 读取对话历史，
+   /sessions/{session_id}/clear 清空一段 Agent 对话并作废其挂起的恢复链路；
 3. 后台任务卡（work continuation）与恢复运行（resume run）：
    Agent 遇到需要用户确认或耗时较长的工具调用时，会把执行状态持久化为一张"任务卡"，
    前端稍后可查询、取消，或发起恢复；恢复在后台线程中执行，由 AgentResumeRun 记录进度与最终结果。
@@ -32,6 +33,7 @@ from auth.ownership import prepare_agent_request
 from core.responses import format_sse_event
 from dependencies import (
     RequestActor,
+    get_agent_chat_message_store,
     get_agent_resume_run_manager,
     get_agent_runtime_checkpoint_store,
     get_agent_session_store,
@@ -105,6 +107,32 @@ async def agent_graph_endpoint():
 # ---------------------------------------------------------------------------
 # 会话管理
 # ---------------------------------------------------------------------------
+
+
+@router.get("/sessions")
+async def list_agent_chat_sessions(
+    limit: int = Query(30, ge=1, le=100),
+    actor: RequestActor = Depends(get_request_actor),
+    message_store=Depends(get_agent_chat_message_store),
+):
+    """列出当前用户有对话记录的 Agent 会话，按最近活动倒序，供"历史对话"切换使用。"""
+    return {"items": message_store.list_agent_chat_sessions(actor.user_id, limit=limit)}
+
+
+@router.get("/sessions/{session_id}/messages")
+async def list_agent_chat_messages(
+    session_id: str,
+    actor: RequestActor = Depends(get_request_actor),
+    message_store=Depends(get_agent_chat_message_store),
+):
+    """返回会话的完整对话流水，供页面刷新后还原聊天气泡。
+
+    查询按 user_id 隔离，他人会话与不存在的会话一样返回空列表，不暴露会话是否存在。
+    """
+    return {
+        "session_id": session_id,
+        "items": message_store.list_agent_chat_messages(session_id, user_id=actor.user_id),
+    }
 
 
 @router.post("/sessions/{session_id}/clear")

@@ -95,6 +95,7 @@ _register(RESEARCH_ROLES, "agent_runs", [
 ])
 # ---- 研究员及以上、不扣配额：Agent 会话与续跑任务的管理和查询 ----
 _register(RESEARCH_ROLES, None, [
+    ("GET", "/api/agent/sessions"), ("GET", "/api/agent/sessions/{session_id}/messages"),
     ("POST", "/api/agent/sessions/{session_id}/clear"), ("GET", "/api/agent/work-continuations/active"),
     ("GET", "/api/agent/work-continuations/{continuation_id}"),
     ("POST", "/api/agent/work-continuations/{continuation_id}/cancel"), ("GET", "/api/agent/resume-runs/{resume_run_id}"),

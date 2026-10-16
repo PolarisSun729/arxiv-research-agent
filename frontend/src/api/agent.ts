@@ -2,7 +2,9 @@ import request from './request'
 import { apiFetch } from './auth'
 import { ApiError, normalizeApiError, parseFetchErrorResponse } from './errors'
 import type {
+  AgentChatSessionSummary,
   AgentResumeRun,
+  AgentStoredChatMessage,
   AgentStreamEvent,
   AgentWorkContinuation,
   ArxivSearchRequest,
@@ -138,10 +140,18 @@ export async function listAgentWorkContinuations(sessionId?: string | null): Pro
   return Array.isArray(response?.items) ? response.items : []
 }
 
-export async function clearAgentSession(sessionId: string): Promise<void> {
-  await request.post(`/agent/sessions/${encodeURIComponent(sessionId)}/clear`, null, {
+export async function listAgentChatSessions(): Promise<AgentChatSessionSummary[]> {
+  const response = await request.get('/agent/sessions', {
     params: { user_id: getCurrentUserId() }
-  })
+  }) as unknown as { items?: AgentChatSessionSummary[] }
+  return Array.isArray(response?.items) ? response.items : []
+}
+
+export async function getAgentChatMessages(sessionId: string): Promise<AgentStoredChatMessage[]> {
+  const response = await request.get(`/agent/sessions/${encodeURIComponent(sessionId)}/messages`, {
+    params: { user_id: getCurrentUserId() }
+  }) as unknown as { items?: AgentStoredChatMessage[] }
+  return Array.isArray(response?.items) ? response.items : []
 }
 
 export async function cancelAgentWorkContinuation(

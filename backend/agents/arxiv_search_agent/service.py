@@ -427,6 +427,40 @@ def _persist_agent_session_memory(final_state: Any, *, memory_service: MemorySer
         )
 
 
+def _record_agent_chat_message(
+    storage: Any,
+    *,
+    session_id: Optional[str],
+    user_id: Optional[str],
+    role: str,
+    content: str,
+    response: Optional[ArxivSearchResponse] = None,
+    status: str = "completed",
+    resume_run_id: Optional[str] = None,
+) -> None:
+    """记录前端可回放的对话气泡；只服务刷新后恢复页面，写入失败不能影响本轮回复。"""
+    store = getattr(storage, "agent_chat_messages", None)
+    if store is None or not session_id:
+        return
+    try:
+        store.append_agent_chat_message(
+            session_id,
+            role,
+            content,
+            user_id=user_id,
+            response=response.model_dump(mode="json") if response is not None else None,
+            status=status,
+            resume_run_id=resume_run_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to record agent chat message: session_id=%s role=%s error=%s",
+            session_id,
+            role,
+            exc,
+        )
+
+
 def _persist_runtime_checkpoint_node(
     checkpoint_manager: AgentRuntimeCheckpointManager,
     state: Any,
@@ -646,6 +680,15 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
             selected_arxiv_id=_safe_selected_arxiv_id(request_context),
         )
         trace.add_event("arxiv_agent.request_start", session_id=resolved_session_id, user_id=normalized_request.user_id)
+        if not _is_resume_request(normalized_request):
+            # 用户消息在执行前落库：即使本轮中途失败，刷新后也能看到问过什么。resume 请求没有用户气泡。
+            _record_agent_chat_message(
+                storage,
+                session_id=resolved_session_id,
+                user_id=normalized_request.user_id,
+                role="user",
+                content=normalized_request.message,
+            )
         # 第 3 步：解析生成服务，并统一构造图对象。
         checkpoint_manager = _build_runtime_checkpoint_manager(storage.agent_runtime_checkpoints)
         checkpoint_manager.expire_and_cleanup()
@@ -730,6 +773,14 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
 
         # 第 6 步：把内部状态转换成对外响应模型。
         final_response = _state_to_response(final_state)
+        _record_agent_chat_message(
+            storage,
+            session_id=resolved_session_id,
+            user_id=normalized_request.user_id,
+            role="assistant",
+            content=final_response.answer,
+            response=final_response,
+        )
         if final_state.fallback_reason:
             trace.mark_fallback()
         trace.set_output(final_response.model_dump())
@@ -788,6 +839,16 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
             session_id=resolved_session_id if "resolved_session_id" in locals() else None,
             detail=str(exc),
         )
+        if "storage" in locals() and "resolved_session_id" in locals():
+            _record_agent_chat_message(
+                storage,
+                session_id=resolved_session_id,
+                user_id=normalized_request.user_id,
+                role="assistant",
+                content=error_response.answer,
+                response=error_response,
+                status="error",
+            )
         trace.mark_failed()
         trace.set_output(error_response.model_dump())
         trace.add_event("arxiv_agent.request_done", status="error", code=RESUME_CHECKPOINT_NOT_FOUND_CODE)
@@ -819,6 +880,16 @@ def run_arxiv_search_agent(request: ArxivSearchRequest) -> ArxivSearchResponse:
             detail=str(exc),
             code=ErrorCode.AGENT_RUNTIME_ERROR,
         )
+        if "storage" in locals() and "resolved_session_id" in locals():
+            _record_agent_chat_message(
+                storage,
+                session_id=resolved_session_id,
+                user_id=normalized_request.user_id,
+                role="assistant",
+                content=error_response.answer,
+                response=error_response,
+                status="error",
+            )
         trace.mark_failed()
         trace.set_output(error_response.model_dump())
         trace.add_event("arxiv_agent.request_done", status="error", code=ErrorCode.AGENT_RUNTIME_ERROR)
@@ -963,6 +1034,14 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                     run_id=run_id,
                 )
                 graph_input = current_state.model_dump()
+                # 用户消息在执行前落库：客户端中途断开会让本轮停在半路，刷新后至少能看到这一问。
+                _record_agent_chat_message(
+                    storage,
+                    session_id=resolved_session_id,
+                    user_id=normalized_request.user_id,
+                    role="user",
+                    content=normalized_request.message,
+                )
 
             # 阶段 C：先发出 run_start 事件，让前端知道一次新的执行已经开始。
             yield _sse_event(
@@ -988,6 +1067,14 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 # 后台批准只返回任务 ticket；专用 continuation API 会在 job 成功后建立新的恢复 SSE。
                 _persist_runtime_checkpoint_after_turn(checkpoint_manager, current_state, is_resume=True)
                 final_response = _state_to_response(current_state)
+                _record_agent_chat_message(
+                    storage,
+                    session_id=resolved_session_id,
+                    user_id=normalized_request.user_id,
+                    role="assistant",
+                    content=final_response.answer,
+                    response=final_response,
+                )
                 yield _sse_event(
                     _make_stream_event(
                         event_type="final_response",
@@ -1199,6 +1286,15 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 _persist_runtime_checkpoint_after_turn(checkpoint_manager, current_state, is_resume=_is_resume_request(normalized_request))
                 _persist_agent_session_memory(current_state, memory_service=memory_service)
             final_response = _state_to_response(current_state)
+            # 先落库再推送 final_response：最后一帧发送前断线时，刷新后仍能看到完整回答。
+            _record_agent_chat_message(
+                storage,
+                session_id=resolved_session_id,
+                user_id=normalized_request.user_id,
+                role="assistant",
+                content=final_response.answer,
+                response=final_response,
+            )
             trace.set_output(final_response.model_dump())
             trace.add_event(
                 "arxiv_agent.stream_done",
@@ -1259,6 +1355,16 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 session_id=resolved_session_id if "resolved_session_id" in locals() else None,
                 detail=str(exc),
             )
+            if "storage" in locals() and "resolved_session_id" in locals():
+                _record_agent_chat_message(
+                    storage,
+                    session_id=resolved_session_id,
+                    user_id=normalized_request.user_id,
+                    role="assistant",
+                    content=error_response.answer,
+                    response=error_response,
+                    status="error",
+                )
             trace.mark_failed()
             trace.set_output(error_response.model_dump())
             trace.add_event("arxiv_agent.stream_done", status="error", code=RESUME_CHECKPOINT_NOT_FOUND_CODE)
@@ -1346,6 +1452,16 @@ def stream_arxiv_search_agent(request: ArxivSearchRequest) -> StreamingResponse:
                 detail=str(exc),
                 code=ErrorCode.AGENT_RUNTIME_ERROR,
             )
+            if "storage" in locals() and "resolved_session_id" in locals():
+                _record_agent_chat_message(
+                    storage,
+                    session_id=resolved_session_id,
+                    user_id=normalized_request.user_id,
+                    role="assistant",
+                    content=error_response.answer,
+                    response=error_response,
+                    status="error",
+                )
             trace.mark_failed()
             trace.set_output(error_response.model_dump())
             trace.add_event("arxiv_agent.stream_done", status="error", code=ErrorCode.AGENT_RUNTIME_ERROR)

@@ -1,3 +1,4 @@
+from services.storage.sqlite.stores.agent_chat_messages import AgentChatMessageStore
 from services.storage.sqlite.stores.agent_sessions import AgentSessionStore
 from services.storage.sqlite.stores.agent_runtime_checkpoints import AgentRuntimeCheckpointStore
 from services.storage.sqlite.stores.agent_work import AgentWorkConflict, AgentWorkStore
@@ -16,6 +17,7 @@ from services.storage.sqlite.stores.research_profiles import ResearchProfileStor
 from services.storage.sqlite.stores.user_preferences import UserPreferenceStore
 
 __all__ = [
+    "AgentChatMessageStore",
     "AgentSessionStore",
     "AgentRuntimeCheckpointStore",
     "AgentWorkConflict",
