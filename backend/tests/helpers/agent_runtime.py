@@ -216,6 +216,11 @@ def _ensure_dependency_stubs() -> None:
         "get_agent_session_store",
         lambda: None,
     )
+    dependencies_module.get_agent_chat_message_store = getattr(
+        dependencies_module,
+        "get_agent_chat_message_store",
+        lambda: None,
+    )
     dependencies_module.get_agent_runtime_checkpoint_store = getattr(
         dependencies_module,
         "get_agent_runtime_checkpoint_store",
