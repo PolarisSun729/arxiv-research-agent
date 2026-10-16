@@ -17,12 +17,13 @@ const emit = defineEmits<{
   (event: 'retry', work: AgentWorkContinuation): void
 }>()
 
-const progress = computed(() => props.work.job?.progress ?? null)
 const errorMessage = computed(() => props.work.error_message || props.work.job?.error_message || '')
 const isFailed = computed(() => ['failed', 'indeterminate'].includes(props.work.status))
 const isReady = computed(() => props.work.status === 'ready_to_resume')
 const isResuming = computed(() => props.resuming || props.work.status === 'resuming')
 const isCompleted = computed(() => props.work.status === 'resumed')
+// 百分比只描述后台索引 job；进入续跑后 job 早已完成，继续显示 100% 会让人误以为卡住，改为不定进度。
+const progress = computed(() => isResuming.value ? null : props.work.job?.progress ?? null)
 
 const statusTitle = computed(() => {
   if (props.work.status === 'submitting') return '正在提交后台索引任务'
@@ -36,7 +37,7 @@ const statusTitle = computed(() => {
 })
 
 const stageText = computed(() => {
-  if (isResuming.value) return '正在从原 LangGraph checkpoint 继续执行'
+  if (isResuming.value) return '正在从中断处继续回答原问题'
   if (isReady.value) return '后台索引已经验证完成，等待恢复 Agent'
   if (props.work.status === 'submitting') return '已保存授权，正在创建或挂接持久任务'
   return props.work.job?.stage_label || props.work.job?.current_stage || '等待后台任务状态'
@@ -85,7 +86,7 @@ const attemptText = computed(() => {
         :duration="3"
         :stroke-width="8"
       />
-      <p class="agent-work-card__hint">
+      <p v-if="!isResuming" class="agent-work-card__hint">
         百分比来自后台 job 的实际阶段里程碑，不表示剩余耗时。
       </p>
     </div>

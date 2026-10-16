@@ -336,10 +336,17 @@ export function useAgentSearchChat() {
     workContinuations.value[index] = updated
   }
 
-  function appendResumeResponse(response: ArxivSearchResponse, resumeRunId?: string | null) {
+  // 返回 false 表示这次续跑的结果已经展示过（例如历史回放先一步取回），调用方不能再展示一次。
+  function markResumeDelivered(resumeRunId?: string | null) {
     const normalizedRunId = String(resumeRunId || '').trim()
-    if (normalizedRunId && deliveredResumeRunIds.has(normalizedRunId)) return
-    if (normalizedRunId) deliveredResumeRunIds.add(normalizedRunId)
+    if (!normalizedRunId) return true
+    if (deliveredResumeRunIds.has(normalizedRunId)) return false
+    deliveredResumeRunIds.add(normalizedRunId)
+    return true
+  }
+
+  function appendResumeResponse(response: ArxivSearchResponse, resumeRunId?: string | null) {
+    if (!markResumeDelivered(resumeRunId)) return
 
     rememberResponse(response)
     messages.value.push({
@@ -382,6 +389,21 @@ export function useAgentSearchChat() {
     resumingContinuationIds.add(continuationId)
     replaceWorkContinuation({ ...continuation, status: 'resuming', can_resume: false })
 
+    // 续跑要重新检索、调模型，可能持续一两分钟；先放一个运行中的回答气泡，后端推来的节点事件逐条落到它的执行时间线上。
+    const assistantMessage = reactive<AgentChatMessage<ArxivSearchResponse>>({
+      id: createMessageId('assistant'),
+      role: 'assistant',
+      content: '',
+      loading: true,
+      createdAt: new Date().toISOString(),
+      response: createDraftResponse(),
+      error: null,
+      progress: createRunProgress(Date.now())
+    })
+    messages.value.push(assistantMessage)
+    // 续跑期间切换会话或清空对话后，气泡已不在列表里，迟到的事件和结果都不能再回写。
+    const isAssistantMessageActive = () => messages.value.includes(assistantMessage)
+
     let resumeRunId = continuation.resume_run_id
     try {
       const response = await streamAgentWorkContinuationResume(
@@ -389,6 +411,10 @@ export function useAgentSearchChat() {
         continuation.session_id,
         {
           onEvent: (event, payload) => {
+            if (event === 'progress') {
+              if (isAssistantMessageActive()) applyStreamEvent(assistantMessage, payload as AgentStreamEvent)
+              return
+            }
             if (event !== 'run_start') return
             resumeRunId = String(payload.resume_run_id || '') || resumeRunId
             const current = workContinuations.value.find(item => item.continuation_id === continuationId)
@@ -398,12 +424,38 @@ export function useAgentSearchChat() {
           }
         }
       )
-      appendResumeResponse(response, resumeRunId)
+      if (isAssistantMessageActive()) {
+        if (markResumeDelivered(resumeRunId)) {
+          rememberResponse(response)
+          assistantMessage.response = response
+          assistantMessage.content = response.answer || ''
+          assistantMessage.error = getAgentRuntimeErrorMessage(response)
+        } else {
+          // 同一结果已经展示过，去掉占位气泡，避免出现两条一样的回答。
+          messages.value = messages.value.filter(item => item !== assistantMessage)
+        }
+      }
       workContinuations.value = workContinuations.value.filter(item => item.continuation_id !== continuationId)
     } catch (error) {
       // resume claim 可能已经消费；失败后只刷新持久状态，禁止自动再次 POST 导致语义不确定。
-      ElMessage.error(getErrorMessage(error, 'Agent 恢复失败'))
+      const messageText = getErrorMessage(error, 'Agent 恢复失败')
+      if (isAssistantMessageActive()) {
+        assistantMessage.error = messageText
+        assistantMessage.content = messageText
+      }
+      ElMessage.error(messageText)
     } finally {
+      if (isAssistantMessageActive()) {
+        assistantMessage.loading = false
+        // 断线时收不到结束事件，这里兜底收尾，避免时间线一直显示运行中。
+        if (assistantMessage.progress) {
+          assistantMessage.progress = finishRunProgress(
+            assistantMessage.progress,
+            Date.now(),
+            assistantMessage.error ? 'failed' : 'done'
+          )
+        }
+      }
       resumingContinuationIds.delete(continuationId)
       await refreshWorkContinuations({ allowAutoResume: false })
     }
