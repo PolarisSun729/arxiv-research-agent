@@ -304,6 +304,8 @@ class LLMPlanDraftGenerator:
             "invalid_reasons": [],
             "normalized_plan": None,
             "validation_summary": {},
+            # 走到哪一步：llm_call / parse / validate / done；失败时据此区分失败类型（planning_record）。
+            "stage": None,
         }
 
     def generate(
@@ -314,17 +316,21 @@ class LLMPlanDraftGenerator:
         tool_registry: ToolRegistry,
         planner_context: Optional[PlannerContext] = None,
     ) -> PlanDraft:
+        self.last_debug["stage"] = "llm_call"
         if self.generation_service is None:
             raise LLMPlanDraftError("generation service unavailable")
         planner_context = planner_context or _minimal_planner_context(goal, state, tool_registry)
         prompt = self._build_prompt(goal, state, candidate_tools, tool_registry, planner_context)
         raw_text = self._invoke_generation_service(prompt)
+        self.last_debug["stage"] = "parse"
         self.last_debug["raw_llm_plan"] = _safe_debug_text(raw_text)
         self.last_debug["raw_llm_plan_summary"] = _summarize_llm_raw_plan(raw_text)
         payload = self._parse_json_only(raw_text)
         draft = PlanDraft.model_validate(payload)
+        self.last_debug["stage"] = "validate"
         normalized = self._normalize_draft(draft, goal, state, candidate_tools, tool_registry)
         self.last_debug["normalized_plan"] = normalized.model_dump()
+        self.last_debug["stage"] = "done"
         return normalized
 
     def _build_prompt(
