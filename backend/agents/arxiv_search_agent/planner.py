@@ -19,6 +19,7 @@ from .profile_aware_planner import PROFILE_AWARE_TASK_PLANNER_SOURCE, ProfileAwa
 from .tool_aware_planner import LLMPlanDraftGenerator, PlanDraftConverter, PlanDraftPlanningError, RuleBasedToolAwarePlanBuilder, ToolCandidateSelector
 from .tool_registry import PLANNER_TOOL_REGISTRY, ToolRegistry
 from .utils.state_utils import _compact_search_spec
+from utils.agent_planner_limits import AGENT_PLANNER_LIMIT_DEFAULTS, planner_limit
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ def _get_agent_planner_runtime_config() -> Dict[str, Any]:
             "enable_experimental_llm_planner": False,
             "enable_llm_plan_draft": False,
             "llm_plan_timeout": 8,
-            "llm_plan_max_steps": 8,
+            **AGENT_PLANNER_LIMIT_DEFAULTS,
             "enable_artifact_refinement": False,
             "artifact_refinement_timeout": 6,
             "artifact_refinement_max_patches": 12,
@@ -68,6 +69,11 @@ def _get_agent_planner_runtime_config() -> Dict[str, Any]:
             "llm_plan_fallback_to_template": True,
             "expose_planner_debug": True,
         }
+
+
+def plan_step_budget(planner_config: Mapping[str, Any], goal_count: int) -> int:
+    """规划总步数上限 = 每目标步数 × 目标数（D4-3 I-6），总步数不单独配置。"""
+    return planner_limit(planner_config, "llm_plan_max_steps_per_goal") * max(1, int(goal_count or 0))
 
 
 def _normalized_planner_runtime_flags(planner_config: Mapping[str, Any]) -> Dict[str, Any]:
@@ -977,7 +983,10 @@ def build_executable_plan_for_goal(
         try:
             llm_generator = LLMPlanDraftGenerator(
                 llm_generation_service if llm_generation_service is not None else _resolve_generation_service(),
-                max_steps=int(planner_config.get("llm_plan_max_steps", 8) or 8),
+                # 目标列表还没接入（D4-2），一轮固定按 1 个目标算。
+                max_steps=plan_step_budget(planner_config, goal_count=1),
+                max_search_calls=planner_limit(planner_config, "llm_plan_max_search_calls"),
+                max_index_per_paper=planner_limit(planner_config, "llm_plan_max_index_per_paper"),
                 timeout_seconds=int(planner_config.get("llm_plan_timeout", 8) or 8),
             )
             draft = llm_generator.generate(goal, state, selection.candidate_tools, tool_registry, planner_context)
@@ -1167,4 +1176,5 @@ __all__ = [
     "build_executable_plan",
     "build_executable_plan_for_goal",
     "build_plan_runtime",
+    "plan_step_budget",
 ]

@@ -27,6 +27,7 @@ from .state import AgentState
 from .tool_registry import PLANNER_TOOL_REGISTRY, ToolRegistry
 from .planner_context import build_planner_context
 from services.prompt_context import PromptContextBuilder
+from utils.agent_planner_limits import AGENT_PLANNER_LIMIT_DEFAULTS
 
 
 class PlanDraftConversionError(ValueError):
@@ -281,9 +282,20 @@ class LLMPlanDraftGenerator:
     不允许 LLM 直接产生 ExecutablePlan 或触达 Executor。
     """
 
-    def __init__(self, generation_service: Optional[Any] = None, *, max_steps: int = 8, timeout_seconds: int = 8) -> None:
+    def __init__(
+        self,
+        generation_service: Optional[Any] = None,
+        *,
+        max_steps: int = AGENT_PLANNER_LIMIT_DEFAULTS["llm_plan_max_steps_per_goal"],
+        timeout_seconds: int = 8,
+        max_search_calls: int = AGENT_PLANNER_LIMIT_DEFAULTS["llm_plan_max_search_calls"],
+        max_index_per_paper: int = AGENT_PLANNER_LIMIT_DEFAULTS["llm_plan_max_index_per_paper"],
+    ) -> None:
         self.generation_service = generation_service
-        self.max_steps = max(1, int(max_steps or 8))
+        # 上限由调用方按 config 传入（planner.plan_step_budget / planner_limit），这里只防非法值。
+        self.max_steps = max(1, int(max_steps or 1))
+        self.max_search_calls = max(1, int(max_search_calls or 1))
+        self.max_index_per_paper = max(1, int(max_index_per_paper or 1))
         self.timeout_seconds = max(1, int(timeout_seconds or 8))
         self.prompt_context_builder = PromptContextBuilder()
         self.last_debug: Dict[str, Any] = {
@@ -388,6 +400,8 @@ class LLMPlanDraftGenerator:
             },
             "planner_limits": {
                 "max_steps": self.max_steps,
+                "max_search_arxiv_calls": self.max_search_calls,
+                "max_parse_and_index_per_paper": self.max_index_per_paper,
                 # 这里只暴露是否允许规划出 confirmation-required step，
                 # 真正的确认门禁仍由 converter / validator / executor 统一兜底。
                 "allow_human_confirmation": any(tool.requires_confirmation for tool in list(candidate_tools or [])),
@@ -491,6 +505,14 @@ class LLMPlanDraftGenerator:
             invalid_reasons.append("LLM draft has no steps")
         if len(steps) > self.max_steps:
             invalid_reasons.append(f"LLM draft exceeds max steps: {len(steps)} > {self.max_steps}")
+        invalid_reasons.extend(
+            _expensive_tool_budget_violations(
+                steps,
+                tool_registry,
+                max_search_calls=self.max_search_calls,
+                max_index_per_paper=self.max_index_per_paper,
+            )
+        )
 
         seen_step_ids: Set[str] = set()
         seen_outputs: Set[str] = set()
@@ -1375,6 +1397,60 @@ def _binding_dict(
         "value": value,
         "required": required,
     }
+
+
+def _expensive_tool_budget_violations(
+    steps: Sequence[PlanDraftStep],
+    tool_registry: ToolRegistry,
+    *,
+    max_search_calls: int,
+    max_index_per_paper: int,
+) -> List[str]:
+    """昂贵工具的次数上限（D4-3 I-6）：search_arxiv 每轮次数、parse_and_index_paper 每篇论文次数。"""
+    reasons: List[str] = []
+    search_calls = sum(1 for step in steps if str(step.tool_name or "").strip() == "search_arxiv")
+    if search_calls > max_search_calls:
+        reasons.append(f"LLM draft exceeds max search_arxiv calls: {search_calls} > {max_search_calls}")
+
+    index_contract = tool_registry.get_contract("parse_and_index_paper")
+    paper_keys = tuple(
+        key
+        for declaration in (index_contract.consumes if index_contract is not None else ())
+        if declaration.semantic_type == "ResolvedPaper"
+        for key in declaration.input_keys
+    ) or ("paper_reference",)
+    index_counts: Dict[str, int] = {}
+    for step in steps:
+        if str(step.tool_name or "").strip() != "parse_and_index_paper":
+            continue
+        paper = _static_paper_identity(step, paper_keys)
+        index_counts[paper] = index_counts.get(paper, 0) + 1
+    for paper, count in index_counts.items():
+        if count > max_index_per_paper:
+            reasons.append(f"LLM draft indexes the same paper ({paper}) {count} times > {max_index_per_paper}")
+    return reasons
+
+
+def _static_paper_identity(step: PlanDraftStep, paper_keys: Sequence[str]) -> str:
+    """不执行计划，只从输入绑定判断建索引的是哪篇论文。
+
+    - literal：取 arxiv_id（去掉版本号），同一 arxiv_id 视为同一篇；
+    - step_output：同一个源步骤产出的论文视为同一篇；
+    - state / context / goal / search_spec：同一个来源键视为同一篇；
+    - 认不出来（没绑定论文输入、literal 里没有 arxiv_id）：全部归为同一篇，宁可多拒绝也不放过重复建索引。
+    不同来源但实际是同一篇（例如 context.selected_paper 和 resolve_paper 解析出的同一篇）静态判断不了，按不同论文放行。
+    """
+    binding = next((item for item in list(step.input_bindings or []) if item.input_key in paper_keys), None)
+    if binding is None:
+        return "unidentified"
+    if binding.source_type == "literal":
+        value = binding.value
+        arxiv_id = value.get("arxiv_id") if isinstance(value, Mapping) else value
+        arxiv_id = re.sub(r"v\d+$", "", str(arxiv_id or "").strip())
+        return f"arxiv:{arxiv_id}" if arxiv_id else "unidentified"
+    if binding.source_type == "step_output":
+        return f"step_output:{str(binding.step_id or '').strip()}"
+    return f"{binding.source_type}:{str(binding.source_key or '').strip()}"
 
 
 def _validate_required_llm_sequence(goal: Goal, steps: Sequence[PlanDraftStep]) -> List[str]:

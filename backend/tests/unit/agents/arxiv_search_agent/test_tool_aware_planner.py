@@ -7,6 +7,7 @@ import sys
 import pytest
 
 from tests.helpers.agent_runtime import load_agent_test_modules
+from utils.agent_planner_limits import AGENT_PLANNER_LIMIT_DEFAULTS
 
 
 _MODULES = load_agent_test_modules()
@@ -1033,7 +1034,6 @@ def test_planner_runtime_mode_demo_rule_disables_llm_attempt(monkeypatch) -> Non
             "enable_rule_fallback_after_llm_planner": True,
             "enable_template_fallback_planner": True,
             "llm_plan_timeout": 8,
-            "llm_plan_max_steps": 8,
             "expose_planner_debug": True,
         },
     )
@@ -1063,7 +1063,6 @@ def test_planner_runtime_mode_llm_only_strict_raises_on_invalid_llm(monkeypatch)
             "enable_rule_fallback_after_llm_planner": False,
             "enable_template_fallback_planner": False,
             "llm_plan_timeout": 8,
-            "llm_plan_max_steps": 8,
             "expose_planner_debug": True,
         },
     )
@@ -1448,3 +1447,105 @@ def test_profile_aware_deep_read_without_target_degrades_to_clarification_route(
     assert debug["profile_aware_planning"]["skip_reason"] == "single_paper_deep_read_missing_target_paper"
     assert "answer_paper_question" not in _tool_names(plan)
     assert {"analyze_ambiguity", "generate_clarification"}.issubset(set(_tool_names(plan)))
+
+
+# ---- 规划预算（D4-3 I-6） ----
+
+
+def _search_state() -> AgentState:
+    return AgentState(intent="arxiv_search", message="search rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG"))
+
+
+def _search_step(step_id: str) -> dict:
+    return {
+        "step_id": step_id,
+        "action_type": "search",
+        "tool_name": "search_arxiv",
+        "step_reason": "search arxiv",
+        "input_bindings": [{"input_key": "search_spec", "source_type": "search_spec"}],
+        "expected_output_key": f"{step_id}_results",
+    }
+
+
+def _index_step(step_id: str, binding: dict | None) -> PlanDraftStep:
+    return PlanDraftStep(
+        step_id=step_id,
+        action_type="retrieve",
+        tool_name="parse_and_index_paper",
+        input_bindings=[{"input_key": "paper_reference", **binding}] if binding else [],
+    )
+
+
+def test_plan_step_budget_is_per_goal_times_goal_count() -> None:
+    plan_step_budget = _current_modules()[0].plan_step_budget
+    default_per_goal = AGENT_PLANNER_LIMIT_DEFAULTS["llm_plan_max_steps_per_goal"]
+
+    assert plan_step_budget({"llm_plan_max_steps_per_goal": 4}, 1) == 4
+    assert plan_step_budget({"llm_plan_max_steps_per_goal": 4}, 3) == 12
+    assert plan_step_budget({"llm_plan_max_steps_per_goal": 4}, 0) == 4
+    assert plan_step_budget({}, 2) == default_per_goal * 2
+    assert plan_step_budget({"llm_plan_max_steps_per_goal": 0}, 1) == default_per_goal
+
+
+def test_llm_draft_step_limit_comes_from_per_goal_budget(monkeypatch) -> None:
+    current_planner = _current_modules()[0]
+    config = dict(current_planner._get_agent_planner_runtime_config())
+    config.update({"enable_llm_plan_draft": True, "planner_runtime_mode": "llm_preferred", "llm_plan_max_steps_per_goal": 3})
+    monkeypatch.setattr(current_planner, "_get_agent_planner_runtime_config", lambda: config)
+
+    _, _, debug = current_planner.build_executable_plan(
+        _search_state(),
+        enable_tool_aware_planner=True,
+        enable_llm_plan_draft=True,
+        llm_generation_service=_FakeLLMPlanService(_llm_arxiv_plan_json()),
+    )
+
+    assert debug["llm_plan_valid"] is False
+    assert "LLM draft exceeds max steps: 4 > 3" in " ".join(debug["llm_plan_invalid_reasons"])
+
+
+def test_llm_draft_with_too_many_search_calls_is_rejected() -> None:
+    payload = json.loads(_llm_arxiv_plan_json())
+    synthesize = payload["steps"][-1]
+    searches = [_search_step(f"search_{index}") for index in range(1, 5)]
+    synthesize["input_bindings"] = [{"input_key": "arxiv_results", "source_type": "step_output", "step_id": "search_4"}]
+    synthesize["depends_on"] = ["search_4"]
+    payload["steps"] = searches + [synthesize]
+
+    _, _, debug = _current_modules()[0].build_executable_plan(
+        _search_state(),
+        enable_tool_aware_planner=True,
+        enable_llm_plan_draft=True,
+        llm_generation_service=_FakeLLMPlanService(json.dumps(payload, ensure_ascii=False)),
+    )
+
+    assert debug["llm_plan_valid"] is False
+    assert "LLM draft exceeds max search_arxiv calls: 4 > 3" in " ".join(debug["llm_plan_invalid_reasons"])
+
+
+def test_llm_draft_indexing_same_paper_twice_is_rejected() -> None:
+    _, current_tool_aware, current_registry = _current_modules()
+
+    def violations(*steps):
+        return current_tool_aware._expensive_tool_budget_violations(
+            list(steps), current_registry.PLANNER_TOOL_REGISTRY, max_search_calls=3, max_index_per_paper=1
+        )
+
+    from_resolve = {"source_type": "step_output", "step_id": "resolve_paper"}
+    assert violations(_index_step("a", from_resolve), _index_step("b", from_resolve)) == [
+        "LLM draft indexes the same paper (step_output:resolve_paper) 2 times > 1"
+    ]
+    # literal 按 arxiv_id 判断，版本号不算不同论文。
+    assert violations(
+        _index_step("a", {"source_type": "literal", "value": {"arxiv_id": "2401.00001"}}),
+        _index_step("b", {"source_type": "literal", "value": "2401.00001v2"}),
+    ) == ["LLM draft indexes the same paper (arxiv:2401.00001) 2 times > 1"]
+    # 认不出是哪篇的，归为同一篇，从严处理。
+    assert violations(_index_step("a", None), _index_step("b", {"source_type": "literal", "value": {}})) == [
+        "LLM draft indexes the same paper (unidentified) 2 times > 1"
+    ]
+    # 不同来源按不同论文放行。
+    assert violations(
+        _index_step("a", from_resolve),
+        _index_step("b", {"source_type": "context", "source_key": "selected_paper"}),
+    ) == []

@@ -95,6 +95,20 @@ class ConfigRuntimeUnitTests(unittest.TestCase):
         self.assertEqual(module.GENERATION_CONFIG["openai_api_key"], "")
         self.assertEqual(module.GENERATION_CONFIG["deepseek_api_key"], "")
 
+    def test_planner_budget_and_recovery_limits_defaults_and_env_overrides(self) -> None:
+        from utils.agent_planner_limits import AGENT_PLANNER_LIMIT_DEFAULTS, AGENT_PLANNER_LIMITS
+
+        default_config = _load_config_module("tests.unit._config_planner_defaults").get_agent_planner_runtime_config()
+        self.assertEqual({key: default_config[key] for key in AGENT_PLANNER_LIMITS}, AGENT_PLANNER_LIMIT_DEFAULTS)
+        self.assertNotIn("llm_plan_max_steps", default_config)
+
+        overrides = {env_name: str(default + 10) for env_name, default in AGENT_PLANNER_LIMITS.values()}
+        overridden = _load_config_module("tests.unit._config_planner_env", overrides).get_agent_planner_runtime_config()
+        self.assertEqual(
+            {key: overridden[key] for key in AGENT_PLANNER_LIMITS},
+            {key: default + 10 for key, default in AGENT_PLANNER_LIMIT_DEFAULTS.items()},
+        )
+
     def test_runtime_config_accessors_return_copies(self) -> None:
         module = _load_config_module("tests.unit._config_copies", {"ARXIV_SEARCH_MAX_ALLOWED_RESULTS": "12"})
 
