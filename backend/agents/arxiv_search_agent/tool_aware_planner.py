@@ -1206,17 +1206,6 @@ class PlanDraftConverter:
         if tool.side_effect_level in {"persistent_write", "external_call"} and not _draft_step_has_risk_strategy(draft_step, tool):
             raise PlanDraftConversionError(f"Draft step {draft_step.step_id} uses risky tool {tool_name} without risk strategy")
 
-        confirmation_policy = None
-        if _tool_requires_human_confirmation(tool):
-            # LLM 草稿不是真源：只有 contract 明确要求人工确认的工具才进入确认门，
-            # 避免普通 external_call 检索被模型错标 requires_confirmation 后卡住搜索链路。
-            confirmation_policy = StepPolicy(
-                policy_type="confirmation",
-                mode="explicit_user_confirmation_required",
-                requires_confirmation=True,
-                note=f"{tool_name} requires confirmation before execution",
-            )
-
         return PlanStep(
             step_id=str(draft_step.step_id).strip(),
             action_type=str(draft_step.action_type or "").strip(),
@@ -1227,7 +1216,6 @@ class PlanDraftConverter:
             depends_on=list(draft_step.depends_on or []),
             condition=StepCondition(condition_type="always"),
             retry_policy=draft_step.retry_policy,
-            confirmation_policy=confirmation_policy,
             side_effect_level=tool.side_effect_level,
             status="pending",
         )
@@ -1293,10 +1281,10 @@ def plan_to_draft(plan: ExecutablePlan, *, selected_tools: Sequence[str], fallba
                 risk_level="high" if step.side_effect_level == "persistent_write" else ("medium" if step.side_effect_level == "external_call" else "low"),
                 risk_notes=(
                     f"{step.side_effect_level} step projected from validated legacy template fallback"
-                    if step.side_effect_level in {"persistent_write", "external_call"} or bool(step.confirmation_policy and step.confirmation_policy.requires_confirmation)
+                    if step.side_effect_level in {"persistent_write", "external_call"} or PLANNER_TOOL_REGISTRY.needs_confirmation(step.tool_name)
                     else None
                 ),
-                requires_confirmation=bool(step.confirmation_policy and step.confirmation_policy.requires_confirmation),
+                requires_confirmation=PLANNER_TOOL_REGISTRY.needs_confirmation(step.tool_name),
                 failure_recovery_hint=step.failure_policy.mode if step.failure_policy is not None else None,
                 fallback_reason=fallback_reason,
             )
@@ -1922,15 +1910,6 @@ def _risk_level_for_tool(tool: ToolSpec) -> str:
     if tool.side_effect_level == "external_call" or tool.requires_confirmation:
         return "medium"
     return "low"
-
-
-def _tool_requires_human_confirmation(tool: ToolSpec) -> bool:
-    """判断工具 contract 是否真正需要人工确认。
-
-    PlanDraft 里的 requires_confirmation 可能来自 LLM 对“外部调用风险”的误读；
-    确认门只能由受控 ToolContract 决定，避免普通 arXiv 搜索被错误拦截。
-    """
-    return bool(tool.requires_confirmation or tool.side_effect_level == "persistent_write")
 
 
 __all__ = [

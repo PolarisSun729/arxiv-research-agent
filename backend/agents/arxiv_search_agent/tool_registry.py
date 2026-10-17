@@ -150,6 +150,11 @@ class ToolContract:
     answer_kind: Optional[str] = None
     contract_source: str = CONTRACT_SOURCE
 
+    @property
+    def needs_confirmation(self) -> bool:
+        """执行前是否要用户确认（I-8）：只看契约，计划里写没写 confirmation_policy 都不影响。"""
+        return bool(self.requires_confirmation or self.side_effect_level == "persistent_write")
+
     def to_tool_spec(self) -> ToolSpec:
         """生成 planner/debug 消费的只读投影，避免旧调用点直接持有 adapter 实例。"""
         return ToolSpec(
@@ -230,6 +235,10 @@ class ToolRegistry:
 
     def exists(self, tool_name: str) -> bool:
         return self.get_contract(tool_name) is not None
+
+    def needs_confirmation(self, tool_name: str) -> bool:
+        contract = self.get_contract(tool_name)
+        return contract is not None and contract.needs_confirmation
 
     def validate_tool_name(self, tool_name: str) -> str:
         normalized_tool_name = str(tool_name or "").strip()

@@ -313,7 +313,8 @@ class PlanExecutor:
                 )
 
         guard_decision = None
-        if step.confirmation_policy and step.confirmation_policy.requires_confirmation:
+        # 确认只看契约（I-8），不读计划里的 confirmation_policy：LLM 或补丁漏写也照样弹。
+        if contract is not None and contract.needs_confirmation:
             guard_decision = self.execution_guard.evaluate(
                 step=step,
                 runtime=runtime,

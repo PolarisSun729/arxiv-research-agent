@@ -1907,9 +1907,7 @@ def _active_runtime_tool_call(state: Optional[AgentState], *, approved_step_id: 
         return None
     for step in list(state.execution_plan.steps or []):
         if step.step_id == current_step_id:
-            requires_confirmation = bool(
-                step.confirmation_policy and step.confirmation_policy.requires_confirmation
-            )
+            requires_confirmation = UNIFIED_TOOL_REGISTRY.needs_confirmation(step.tool_name)
             if requires_confirmation and current_step_id != str(approved_step_id or "").strip():
                 return None
             return {

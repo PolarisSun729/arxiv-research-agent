@@ -163,7 +163,7 @@ def test_plan_draft_missing_dependency_conversion_fails() -> None:
         PlanDraftConverter(PLANNER_TOOL_REGISTRY).convert(draft, Goal(goal_type="arxiv_search"))
 
 
-def test_confirmation_required_tool_gets_confirmation_policy() -> None:
+def test_converter_leaves_confirmation_to_contract() -> None:
     draft = PlanDraft(
         draft_id="draft:test",
         plan_intent="paper_qa",
@@ -187,8 +187,9 @@ def test_confirmation_required_tool_gets_confirmation_policy() -> None:
 
     plan = PlanDraftConverter(PLANNER_TOOL_REGISTRY).convert(draft, Goal(goal_type="paper_qa"))
 
-    assert plan.steps[0].confirmation_policy is not None
-    assert plan.steps[0].confirmation_policy.requires_confirmation is True
+    # 计划里不再补 confirmation_policy；要不要确认由执行器按契约判断（I-8）。
+    assert plan.steps[0].confirmation_policy is None
+    assert PLANNER_TOOL_REGISTRY.needs_confirmation("parse_and_index_paper") is True
     assert plan.steps[0].side_effect_level == "external_call"
 
 
@@ -205,6 +206,7 @@ def test_external_search_draft_confirmation_flag_is_ignored() -> None:
     assert search_step.side_effect_level == "external_call"
     # 普通检索的确认策略以 ToolContract 为准；LLM 草稿错标不能把搜索链路拦进确认门。
     assert search_step.confirmation_policy is None
+    assert PLANNER_TOOL_REGISTRY.needs_confirmation("search_arxiv") is False
 
 
 def test_plan_draft_missing_input_bindings_conversion_fails() -> None:
@@ -801,7 +803,7 @@ def test_llm_high_risk_tool_missing_confirmation_is_auto_completed() -> None:
 
     update_step = next(step for step in plan.steps if step.step_id == "update_preference_store")
     assert debug["llm_plan_valid"] is True
-    assert update_step.confirmation_policy is not None
+    assert update_step.confirmation_policy is None
     assert "update_preference_store" in debug["confirmation_required_steps"]
 
 

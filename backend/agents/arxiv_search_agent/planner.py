@@ -645,7 +645,7 @@ def _debug_steps_from_plan(plan: ExecutablePlan) -> List[Dict[str, Any]]:
             "adapter": step.tool.adapter,
             "backend_tool_name": step.tool.backend_tool_name,
             "side_effect_level": step.side_effect_level,
-            "requires_confirmation": bool(step.confirmation_policy and step.confirmation_policy.requires_confirmation),
+            "requires_confirmation": PLANNER_TOOL_REGISTRY.needs_confirmation(step.tool_name),
         }
         for step in list(plan.steps or [])
     ]
@@ -664,10 +664,11 @@ def _tool_contract_source_summary(steps: Sequence[PlanStep]) -> Dict[str, Any]:
 
 
 def _confirmation_required_step_ids(plan: ExecutablePlan) -> List[str]:
+    # 和执行器同一口径：按契约判断（I-8），不看计划里的 confirmation_policy。
     return [
         step.step_id
         for step in list(plan.steps or [])
-        if bool(step.confirmation_policy and step.confirmation_policy.requires_confirmation)
+        if PLANNER_TOOL_REGISTRY.needs_confirmation(step.tool_name)
     ]
 
 
