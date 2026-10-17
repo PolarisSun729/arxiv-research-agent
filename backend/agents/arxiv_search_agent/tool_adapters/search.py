@@ -216,20 +216,6 @@ def _relaxation_summary(
     return summary
 
 
-class ValidateArxivResultsInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    arxiv_results: Dict[str, Any] = Field(default_factory=dict)
-
-
-class ValidateArxivResultsOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    ok: bool
-    result_count: int = 0
-    warnings: List[str] = Field(default_factory=list)
-
-
 class RewriteArxivQueryInput(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -274,7 +260,6 @@ class SynthesizeArxivResponseInput(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     ranked_papers: Optional[List[Dict[str, Any]]] = None
-    arxiv_result_quality: Optional[Dict[str, Any]] = None
     arxiv_results: Any = None
     personalized_rerank_applied: bool = False
 
@@ -459,22 +444,6 @@ class SearchArxivAdapter(BaseToolAdapter[SearchArxivInput, SearchArxivOutput]):
         )
 
 
-class ValidateArxivResultsAdapter(BaseToolAdapter[ValidateArxivResultsInput, ValidateArxivResultsOutput]):
-    tool_name = "validate_arxiv_results"
-    input_model = ValidateArxivResultsInput
-    output_model = ValidateArxivResultsOutput
-
-    def _run(self, tool_input: ValidateArxivResultsInput) -> ValidateArxivResultsOutput:
-        papers = extract_papers(tool_input.arxiv_results)
-        tool_result = tool_input.arxiv_results.get("tool_result") if isinstance(tool_input.arxiv_results, Mapping) else None
-        warnings: List[str] = []
-        if not papers:
-            warnings.append("no_results")
-        if isinstance(tool_result, Mapping) and not bool(tool_result.get("ok", False)):
-            warnings.append("tool_failed")
-        return ValidateArxivResultsOutput(ok=bool(papers) and "tool_failed" not in warnings, result_count=len(papers), warnings=warnings)
-
-
 class RewriteArxivQueryAdapter(BaseToolAdapter[RewriteArxivQueryInput, RewriteArxivQueryOutput]):
     tool_name = "rewrite_arxiv_query"
     input_model = RewriteArxivQueryInput
@@ -548,11 +517,11 @@ class SynthesizeArxivResponseAdapter(BaseToolAdapter[SynthesizeArxivResponseInpu
 
     def _run(self, tool_input: SynthesizeArxivResponseInput) -> FinalAnswerOutput:
         ranked_papers = tool_input.ranked_papers or extract_papers(tool_input.arxiv_results)
-        quality = tool_input.arxiv_result_quality or {}
-        result_count = int(quality.get("result_count") or len(ranked_papers or []))
+        result_count = len(ranked_papers or [])
         relaxation = _relaxation_from(tool_input.arxiv_results)
         if result_count <= 0:
-            return FinalAnswerOutput(final_answer=_empty_result_answer(relaxation))
+            # 正常走不到这里：search_arxiv 结果为空即失败（search_empty），由兜底回复解释已尝试的检索。
+            return FinalAnswerOutput(final_answer=empty_search_answer(relaxation))
         titles = [str((paper or {}).get("title") or "").strip() for paper in list(ranked_papers or [])[:3] if str((paper or {}).get("title") or "").strip()]
         title_summary = "；".join(titles) if titles else "已返回相关论文"
         if tool_input.personalized_rerank_applied:
@@ -579,7 +548,8 @@ def _describe_attempt(attempt: Mapping[str, Any]) -> str:
     return f"{attempt.get('label') or attempt.get('level')}：{' · '.join(parts)} → {result}"
 
 
-def _empty_result_answer(relaxation: Mapping[str, Any]) -> str:
+def empty_search_answer(relaxation: Mapping[str, Any]) -> str:
+    """检索为空时的回复：列出阶梯检索依次尝试过的查询，并给出放宽建议。"""
     attempts = [item for item in relaxation.get("attempts") or [] if isinstance(item, Mapping)]
     if relaxation.get("note") == "no_searchable_terms":
         return "没能从你的描述里提取出可用于 arXiv 检索的英文关键词。可以直接给出英文术语（例如 retrieval-augmented generation），我再帮你检索。"

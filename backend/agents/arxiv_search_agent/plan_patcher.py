@@ -263,9 +263,7 @@ class PlanPatcher:
     def patch_search_rewrite_chain(self, *, plan_copy: ExecutablePlan, runtime_copy: PlanRuntime, failed_step: PlanStep, action: RecoveryAction) -> Dict[str, Any]:
         rewrite_step_id = self._make_unique_step_id(plan_copy, "rewrite_arxiv_query")
         search_step_id = self._make_unique_step_id(plan_copy, "search_arxiv")
-        validate_step_id = self._make_unique_step_id(plan_copy, "validate_arxiv_results")
         existing_search_step_ids = list(dict.fromkeys([failed_step.step_id, "search_arxiv", *_step_ids_for_tool(plan_copy, "search_arxiv")]))
-        existing_validate_step_ids = list(dict.fromkeys(["validate_arxiv_results", *_step_ids_for_tool(plan_copy, "validate_arxiv_results")]))
         rewrite_step = self._build_step(
             step_id=rewrite_step_id,
             action_type="rewrite",
@@ -283,30 +281,15 @@ class PlanPatcher:
             retry_policy=StepPolicy(policy_type="retry", mode="allow_search_relaxation", max_attempts=2),
             input_bindings=[_binding("search_spec", source_type="step_output", step_id=rewrite_step_id)],
         )
-        validate_step = self._build_step(
-            step_id=validate_step_id,
-            action_type="validate",
-            tool_name="validate_arxiv_results",
-            output_key=self._make_unique_output_key(plan_copy, "arxiv_result_quality_retry"),
-            depends_on=[search_step_id],
-            input_bindings=[_binding("arxiv_results", source_type="step_output", step_id=search_step_id)],
-        )
-        inserted_step_ids = [rewrite_step_id, search_step_id, validate_step_id]
-        self._insert_steps_after(plan_copy, failed_step.step_id, [rewrite_step, search_step, validate_step])
+        # 空结果 / 低相关已经是 search_arxiv 自己的失败模式，重试搜索的观察结果同样由它判断，不再追加校验步骤。
+        inserted_step_ids = [rewrite_step_id, search_step_id]
+        self._insert_steps_after(plan_copy, failed_step.step_id, [rewrite_step, search_step])
         self._repoint_pending_bindings(
             plan_copy,
             runtime_copy,
             old_step_ids=existing_search_step_ids,
             new_step_id=search_step_id,
             input_keys=["arxiv_results"],
-            exclude_step_ids=inserted_step_ids,
-        )
-        self._repoint_pending_bindings(
-            plan_copy,
-            runtime_copy,
-            old_step_ids=existing_validate_step_ids,
-            new_step_id=validate_step_id,
-            input_keys=["arxiv_result_quality"],
             exclude_step_ids=inserted_step_ids,
         )
         return {

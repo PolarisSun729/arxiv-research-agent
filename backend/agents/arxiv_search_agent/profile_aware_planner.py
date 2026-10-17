@@ -175,7 +175,6 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
         profile: Mapping[str, Any],
         tools_by_name: Mapping[str, ToolSpec],
     ) -> PlanDraft:
-        validate = self._require_tool(tools_by_name, "validate_arxiv_results", required_tags={"validate"})
         synthesize = self._require_tool(tools_by_name, "synthesize_arxiv_response", required_tags={"answer"})
         task_type = str(profile.get("research_task_type") or "direction_exploration").strip()
         artifact_evidence_plan = build_artifact_evidence_plan(_profile_with_task_type(profile, task_type), planner_context)
@@ -193,25 +192,15 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
 
         if use_context_candidates:
             # Skeleton 已经确认候选集来自上下文，Tool Planner 不能再无脑触发外部检索；
-            # 这里把上下文论文包成 validate_arxiv_results 可消费的结构，保证后续质量门仍存在。
+            # 上下文论文非空才会走到这里，直接以 literal 交给后续步骤。
             for skipped_step in ("normalize_request", "build_arxiv_search_spec", "search_arxiv"):
                 self._skip_step(skipped_step, "candidate_paper_set_pruned_by_context")
             arxiv_results_binding = _binding_dict("arxiv_results", source_type="literal", value=context_arxiv_results)
-            steps.append(
-                self._draft_step(
-                    "validate_arxiv_results",
-                    validate,
-                    action_type="validate",
-                    output_key="candidate_evidence_quality",
-                    reason="已有候选论文上下文时只验证可用性，不重复触发外部 arXiv 检索。",
-                    input_bindings=[arxiv_results_binding],
-                )
-            )
         else:
             normalize = self._require_tool(tools_by_name, "normalize_request", required_tags={"search"})
             build_spec = self._require_tool(tools_by_name, "build_arxiv_search_spec", required_tags={"search"})
             search = self._require_tool(tools_by_name, "search_arxiv", required_tags={"search"})
-            arxiv_results_binding = _binding_dict("arxiv_results", source_type="step_output", step_id="search_arxiv", required=False)
+            arxiv_results_binding = _binding_dict("arxiv_results", source_type="step_output", step_id="search_arxiv")
             candidate_source_step_id = "search_arxiv"
             steps.extend(
                 [
@@ -241,29 +230,17 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
                         search,
                         action_type="search",
                         output_key="candidate_paper_set",
-                        reason="复杂科研任务先产生候选论文集合，而不是直接生成回答；后续比较、gap 或阅读顺序都依赖这个候选集。",
+                        reason="复杂科研任务先产生候选论文集合，而不是直接生成回答；后续比较、gap 或阅读顺序都依赖这个候选集。候选集为空即检索失败，交给 Observer/Replanner 补检索或兜底。",
                         depends_on=["build_arxiv_search_spec"],
                         input_bindings=[_binding_dict("search_spec", source_type="step_output", step_id="build_arxiv_search_spec")],
                         retry_policy=StepPolicy(policy_type="retry", mode="allow_search_relaxation", max_attempts=3) if search.can_retry else None,
-                    ),
-                    self._draft_step(
-                        "validate_arxiv_results",
-                        validate,
-                        action_type="validate",
-                        output_key="candidate_evidence_quality",
-                        reason="先评估候选集数量和可用性，给 Observer/Replanner 预留“证据不足也可补检索”的质量入口。",
-                        depends_on=["search_arxiv"],
-                        input_bindings=[_binding_dict("arxiv_results", source_type="step_output", step_id="search_arxiv")],
                     ),
                 ]
             )
 
         personalize = self._optional_tool(tools_by_name, preferred_name="personalize_paper_results", required_tags={"personalize", "rerank"})
-        synthesize_depends_on = ["validate_arxiv_results"]
-        synthesize_bindings = [
-            _binding_dict("arxiv_result_quality", source_type="step_output", step_id="validate_arxiv_results"),
-            arxiv_results_binding,
-        ]
+        synthesize_depends_on = [candidate_source_step_id] if candidate_source_step_id else []
+        synthesize_bindings = [arxiv_results_binding]
         if personalize and _planner_has_profile_context(planner_context):
             personalize_depends_on = [candidate_source_step_id] if candidate_source_step_id else []
             steps.append(
@@ -286,7 +263,7 @@ class ProfileAwareResearchTaskPlanBuilder(RuleBasedToolAwarePlanBuilder):
             synthesize_depends_on.append("personalize_paper_results")
             synthesize_bindings.insert(0, _binding_dict("ranked_papers", source_type="step_output", step_id="personalize_paper_results", required=False))
         else:
-            reason = "no user profile context; use validated candidate_paper_set as generic representative evidence"
+            reason = "no user profile context; use candidate_paper_set as generic representative evidence"
             self._skip_step("personalize_paper_results", reason)
             if artifact_plan_needs_evidence(artifact_evidence_plan, "user_profile"):
                 artifact_evidence_plan.diagnostics.unmet_evidence_requirements.append(

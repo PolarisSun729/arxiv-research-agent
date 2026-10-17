@@ -183,7 +183,8 @@ def test_plan_patcher_inserts_search_rewrite_chain_and_validates_plan() -> None:
 
     assert result.updated_plan is not None
     assert any(item.tool_name == "rewrite_arxiv_query" for item in result.updated_plan.steps)
-    assert any(item.tool_name == "validate_arxiv_results" for item in result.updated_plan.steps)
+    # 空结果 / 低相关由重试的 search_arxiv 自己判断，补丁不再追加校验步骤。
+    assert [item.tool_name for item in result.updated_plan.steps].count("search_arxiv") == 2
     PlanValidator().validate(result.updated_plan, PLANNER_TOOL_REGISTRY)
     assert result.updated_runtime.step_status[step.step_id] == "pending"
     assert any(trace.detail.get("selected_recovery_action") for trace in result.updated_runtime.trace)

@@ -384,11 +384,11 @@ class CapabilityAlignmentChecker:
         if evidence_type in {"metadata", "abstract"}:
             if _has_candidate_context(planner_context):
                 status = "supported"
-                acquisition_tools = ["planner_context.last_papers", "validate_arxiv_results"]
+                acquisition_tools = ["planner_context.last_papers"]
                 reason = "已有候选论文上下文可直接提供 metadata/abstract 级证据"
             elif "search_arxiv" in tool_names:
                 status = "supported"
-                acquisition_tools = ["build_arxiv_search_spec", "search_arxiv", "validate_arxiv_results"]
+                acquisition_tools = ["build_arxiv_search_spec", "search_arxiv"]
                 reason = "arXiv search 工具链可提供 metadata/abstract 级证据"
             elif artifact.target_scope == "paper" and "resolve_paper" in tool_names:
                 status = "supported"
@@ -581,9 +581,10 @@ def _tools_for_requirement(
         if artifact_type == "topic_term_set":
             return {"normalize_request", "build_arxiv_search_spec"}
         if artifact_type == "candidate_paper_set":
-            return {"search_arxiv", "validate_arxiv_results"} if has_search_step else {"validate_arxiv_results"}
+            # 没有检索步骤时候选集直接来自上下文 literal，由消费它的回答 / 个性化步骤承接。
+            return {"search_arxiv"} if has_search_step else {"personalize_paper_results", "synthesize_arxiv_response"}
         if artifact_type == "selected_paper_set":
-            return {"resolve_paper", "validate_arxiv_results", "personalize_paper_results", "synthesize_arxiv_response"}
+            return {"resolve_paper", "personalize_paper_results", "synthesize_arxiv_response"}
         if artifact_type == "user_profile_match":
             return {"personalize_paper_results", "generate_recommendations"}
         return {"synthesize_arxiv_response", "answer_paper_question", "explain_recommendations"}
@@ -597,7 +598,8 @@ def _tools_for_requirement(
 
 
 def _contribution_type(tool_name: str, status: CapabilityStatus, has_search_step: bool) -> str:
-    if tool_name == "validate_arxiv_results" and not has_search_step:
+    if tool_name in {"personalize_paper_results", "synthesize_arxiv_response"} and not has_search_step:
+        # 无检索步骤的搜索计划直接复用上下文论文。
         return "context_reuse"
     if tool_name.startswith("validate") or tool_name.startswith("assess") or tool_name == "check_paper_index":
         return "validate_evidence" if status == "supported" else "quality_gate"

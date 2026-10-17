@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional
 
 from .schemas import PlanRuntime
+from .tool_adapters.search import empty_search_answer
 
 
 def assemble_final_answer(runtime: PlanRuntime) -> Optional[str]:
@@ -75,10 +76,21 @@ def _build_recovery_fallback_answer(runtime: PlanRuntime, reason: str) -> str:
         reason_bits = [item for item in [observation_reason, f"retrieval_quality={retrieval_quality}" if retrieval_quality else None, f"answer_insufficient_evidence={answer_insufficient}" if answer_insufficient else None] if item]
         reason_text = "；".join(reason_bits) or reason
         return f"当前无法给出足够可靠的论文回答：{reason_text}。我没有把低证据结果当作确定答案；请尝试重建索引、缩小问题范围或稍后重试。"
+    last_observation = runtime.last_observation if isinstance(runtime.last_observation, Mapping) else {}
+    failure_category = str(last_observation.get("failure_category") or "")
+    evidence = last_observation.get("evidence") if isinstance(last_observation.get("evidence"), Mapping) else {}
+    if failure_category == "search_empty" and isinstance(evidence.get("relaxation"), Mapping):
+        # search_arxiv 结果为空即失败；用阶梯检索记录告诉用户试过哪些查询、可以怎么放宽。
+        return empty_search_answer(evidence["relaxation"])
+    if failure_category == "recommendation_empty":
+        return "当前没有生成可用的推荐结果，建议先补充偏好或改成明确主题搜索。"
     # 内部原因码（如 replan_limit_exceeded:search_arxiv:empty_result）只写进 fallback_record，
     # 面向用户的文案按大类翻译成人话。
+    if "update_preference_store" in lower_reason:
+        # 超时也会走到这里，此时写入状态不确定，文案不能断言「没有更改」。
+        return "这次没能确认偏好已经写入，请稍后查看论文的偏好标记，或重试一次。"
     if any(token in lower_reason for token in ("timeout", "timed out", "tool_error", "tool_runtime_error", "backend_tool_failed")):
         return "检索服务暂时不可用，这次没能完成请求。请稍后重试。"
-    if any(token in lower_reason for token in ("search_arxiv", "search_empty", "empty_result", "validate_arxiv_results", "no_papers")):
+    if any(token in lower_reason for token in ("search_arxiv", "search_empty", "empty_result", "no_papers")):
         return "自动调整检索条件后仍然没有找到合适的论文。可以尝试放宽时间范围，或换一个更通用的关键词后再试。"
     return "这次请求没能顺利完成。可以换个说法、补充一些细节，或稍后重试。"

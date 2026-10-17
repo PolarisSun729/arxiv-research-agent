@@ -261,30 +261,28 @@ class Observer:
         return _finalize_observation(step=step, observation=ObservationResult(status="success", reason="no_special_rule", confidence=1.0))
 
     def _observe_search_arxiv(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
+        """search_arxiv 成功时必须产出非空 PaperList；空结果、低相关、大量重复都是它自己的失败模式。
+
+        原来的 validate_arxiv_results 质量门已并入这里，不再单独占一步。
+        """
         del normalized_output, runtime, state
         papers = _extract_papers(raw_output)
         relaxation = _search_relaxation(raw_output)
-        if not papers and relaxation.get("attempts"):
-            # 阶梯检索已经在工具内部把可放宽的条件都试过了；再走 rewrite→search 重规划只会重复同样的查询。
-            # 这里把“没找到”当成可解释的终态交给回答步骤，由它列出已尝试的查询并给出建议。
-            return ObservationResult(
-                status="partial_success",
-                reason="search_ladder_exhausted",
-                confidence=0.3,
-                details={"paper_count": 0, "attempt_count": len(relaxation.get("attempts") or [])},
-            )
         if not papers:
+            # 阶梯检索已经在工具内部把可放宽的条件都试过了，再走 rewrite→search 只会重复同样的查询；
+            # 标记 ladder_exhausted，由恢复策略直接兜底，并用 relaxation 向用户列出已尝试的检索。
+            ladder_exhausted = bool(relaxation.get("attempts"))
             return ObservationResult(
                 status="empty_result",
-                reason="search_returned_no_papers",
+                reason="search_ladder_exhausted" if ladder_exhausted else "search_returned_no_papers",
                 confidence=0.1,
-                details={"paper_count": 0},
-                suggested_action="rewrite_arxiv_query",
+                details={"paper_count": 0, "attempt_count": len(relaxation.get("attempts") or [])},
+                suggested_action="fallback" if ladder_exhausted else "rewrite_arxiv_query",
                 **_recovery_semantics(
                     failure_category="search_empty",
-                    suggested_recovery_types=["patch_plan"],
-                    evidence={"paper_count": 0},
-                    retryable=True,
+                    suggested_recovery_types=["fallback_answer"] if ladder_exhausted else ["patch_plan"],
+                    evidence={"paper_count": 0, "ladder_exhausted": ladder_exhausted, "relaxation": relaxation},
+                    retryable=not ladder_exhausted,
                 ),
             )
         query_tokens = _search_spec_tokens(resolved_input.get("search_spec"))
@@ -309,55 +307,11 @@ class Observer:
                         retryable=True,
                     ),
                 )
-        return ObservationResult(status="success", reason="search_results_available", confidence=0.85, details={"paper_count": len(papers)})
-
-    def _observe_validate_arxiv_results(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
-        del runtime, state
-        quality = normalized_output if isinstance(normalized_output, Mapping) else raw_output if isinstance(raw_output, Mapping) else {}
-        result_count = int(quality.get("result_count") or 0)
-        if result_count <= 0 and _search_relaxation(resolved_input.get("arxiv_results")).get("attempts"):
-            # 与 search_arxiv 的判断保持一致：阶梯已用尽时不再触发补检索重规划。
-            return ObservationResult(
-                status="partial_success",
-                reason="search_ladder_exhausted",
-                confidence=0.3,
-                details={"result_count": 0},
-            )
-        if result_count <= 0:
-            return ObservationResult(
-                status="empty_result",
-                reason="validated_arxiv_results_empty",
-                confidence=0.1,
-                details={"result_count": result_count},
-                suggested_action="rewrite_arxiv_query",
-                **_recovery_semantics(
-                    failure_category="search_empty",
-                    suggested_recovery_types=["patch_plan"],
-                    evidence={"result_count": result_count},
-                    retryable=True,
-                ),
-            )
-        warnings = list(quality.get("warnings") or [])
-        if "tool_failed" in warnings or "no_results" in warnings:
-            return ObservationResult(
-                status="low_confidence",
-                reason="validated_arxiv_results_low_quality",
-                confidence=0.35,
-                details={"warnings": warnings},
-                suggested_action="rewrite_arxiv_query",
-                **_recovery_semantics(
-                    failure_category="search_low_confidence",
-                    suggested_recovery_types=["patch_plan"],
-                    evidence={"warnings": warnings},
-                    retryable=True,
-                ),
-            )
-        papers = _extract_papers(resolved_input.get("arxiv_results"))
         titles = [str(paper.get("title") or "").strip().lower() for paper in papers if str(paper.get("title") or "").strip()]
         if len(set(titles)) < max(1, len(titles) // 2):
             return ObservationResult(
                 status="low_confidence",
-                reason="validated_arxiv_results_too_many_duplicates",
+                reason="search_results_too_many_duplicates",
                 confidence=0.45,
                 details={"paper_count": len(papers)},
                 suggested_action="rewrite_arxiv_query",
@@ -368,7 +322,7 @@ class Observer:
                     retryable=True,
                 ),
             )
-        return ObservationResult(status="success", reason="validated_arxiv_results_ok", confidence=0.85, details={"result_count": result_count})
+        return ObservationResult(status="success", reason="search_results_available", confidence=0.85, details={"paper_count": len(papers)})
 
     def _observe_resolve_paper(self, *, resolved_input: Mapping[str, Any], raw_output: Any, normalized_output: Any, runtime: PlanRuntime, state: AgentState) -> ObservationResult:
         del resolved_input, raw_output, runtime, state
@@ -724,13 +678,14 @@ class Observer:
         payload = normalized_output if isinstance(normalized_output, Mapping) else {}
         recommendations = list(payload.get("recommendations") or [])
         if not recommendations:
+            # Recommendations 不变量是非空：推荐为空即 generate_recommendations 失败（原 validate_recommendations 已删除）。
             return ObservationResult(
                 status="empty_result",
                 reason="recommendations_empty",
                 confidence=0.1,
                 suggested_action="fallback",
                 **_recovery_semantics(
-                    failure_category="insufficient_context",
+                    failure_category="recommendation_empty",
                     suggested_recovery_types=["fallback_answer"],
                     evidence={"recommendation_count": 0},
                     retryable=False,

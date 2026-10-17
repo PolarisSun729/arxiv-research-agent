@@ -179,7 +179,7 @@ def test_artifact_step_mapping_and_progress_reservation_are_structured() -> None
     )
     steps = [
         SimpleNamespace(step_id="search_arxiv", tool_name="search_arxiv"),
-        SimpleNamespace(step_id="validate_arxiv_results", tool_name="validate_arxiv_results"),
+        SimpleNamespace(step_id="synthesize_arxiv_response", tool_name="synthesize_arxiv_response"),
     ]
 
     mapping = artifact_validation.build_artifact_step_mapping(plan, steps)
@@ -190,8 +190,8 @@ def test_artifact_step_mapping_and_progress_reservation_are_structured() -> None
         step_mapping=mapping,
     )
 
-    assert {item.step_id for item in mapping} == {"search_arxiv", "validate_arxiv_results"}
+    assert {item.step_id for item in mapping} == {"search_arxiv"}
     assert mapping[0].target_artifact_id == "candidate_papers"
     assert progress[0].artifact_id == "candidate_papers"
-    assert progress[0].mapped_step_ids == ["search_arxiv", "validate_arxiv_results"]
+    assert progress[0].mapped_step_ids == ["search_arxiv"]
     assert report.status == "passed"

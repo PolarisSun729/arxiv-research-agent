@@ -209,7 +209,7 @@ class PlanValidator:
         tool_by_name = {step.tool_name: step for step in steps}
         if "update_preference_store" not in tool_by_name:
             return
-        for tool_name in ("resolve_preference_target", "verify_preference_update", "synthesize_preference_response"):
+        for tool_name in ("resolve_preference_target", "synthesize_preference_response"):
             if tool_name not in tool_by_name:
                 raise PlanValidationError(f"preference_action plan missing required tool {tool_name}")
         update_step = tool_by_name["update_preference_store"]
@@ -218,8 +218,7 @@ class PlanValidator:
         if not self._step_has_binding_from_step(update_step, steps_by_id, "paper_reference", "resolve_preference_target") and not self._step_has_literal_target(update_step, "paper_reference"):
             raise PlanValidationError("preference_action update_preference_store requires explicit paper_reference target")
         self._assert_tool_precedes("resolve_preference_target", "update_preference_store", steps_by_id, steps)
-        self._assert_tool_precedes("update_preference_store", "verify_preference_update", steps_by_id, steps)
-        self._assert_tool_precedes("verify_preference_update", "synthesize_preference_response", steps_by_id, steps)
+        self._assert_tool_precedes("update_preference_store", "synthesize_preference_response", steps_by_id, steps)
 
     def _assert_tool_precedes(self, previous_tool: str, next_tool: str, steps_by_id: Dict[str, PlanStep], steps: List[PlanStep]) -> None:
         position = {step.step_id: index for index, step in enumerate(steps)}

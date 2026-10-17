@@ -1626,6 +1626,7 @@ FailureCategory = Literal[
     "insufficient_context",
     "ambiguous_user_request",
     "empty_user_profile",
+    "recommendation_empty",
 ]
 
 RecoveryActionType = Literal[

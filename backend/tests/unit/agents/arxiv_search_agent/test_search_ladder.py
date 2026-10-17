@@ -189,7 +189,7 @@ def test_empty_answer_lists_attempts_and_suggests_wider_time_window() -> None:
         "locked_constraints": ["submitted_days_ago"],
     }
 
-    answer = search_adapters._empty_result_answer(relaxation)
+    answer = search_adapters.empty_search_answer(relaxation)
 
     assert "1. 严格匹配" in answer and "2. 放开推断的分类范围" in answer
     assert "我没有自动放宽" in answer

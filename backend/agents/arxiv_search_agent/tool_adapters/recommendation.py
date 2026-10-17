@@ -57,23 +57,10 @@ class RecommendationResultOutput(BaseModel):
     candidate_papers: Optional[List[Dict[str, Any]]] = None
 
 
-class ValidateRecommendationsInput(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    recommendation_result: Dict[str, Any] = Field(default_factory=dict)
-
-
-class ValidatedRecommendationsOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    ok: bool
-    recommendations: List[Dict[str, Any]] = Field(default_factory=list)
-
-
 class ExplainRecommendationsInput(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    validated_recommendations: Dict[str, Any] = Field(default_factory=dict)
+    recommendation_result: Dict[str, Any] = Field(default_factory=dict)
 
 
 class RecommendationAnswerOutput(BaseModel):
@@ -222,26 +209,13 @@ class GenerateRecommendationsAdapter(BaseToolAdapter[GenerateRecommendationsInpu
         )
 
 
-class ValidateRecommendationsAdapter(BaseToolAdapter[ValidateRecommendationsInput, ValidatedRecommendationsOutput]):
-    tool_name = "validate_recommendations"
-    input_model = ValidateRecommendationsInput
-    output_model = ValidatedRecommendationsOutput
-
-    def _run(self, tool_input: ValidateRecommendationsInput) -> ValidatedRecommendationsOutput:
-        recommendations = tool_input.recommendation_result.get("recommendations")
-        return ValidatedRecommendationsOutput(
-            ok=isinstance(recommendations, list) and len(recommendations) > 0,
-            recommendations=list(recommendations or []),
-        )
-
-
 class ExplainRecommendationsAdapter(BaseToolAdapter[ExplainRecommendationsInput, RecommendationAnswerOutput]):
     tool_name = "explain_recommendations"
     input_model = ExplainRecommendationsInput
     output_model = RecommendationAnswerOutput
 
     def _run(self, tool_input: ExplainRecommendationsInput) -> RecommendationAnswerOutput:
-        recommendations = list((tool_input.validated_recommendations or {}).get("recommendations") or [])
+        recommendations = list((tool_input.recommendation_result or {}).get("recommendations") or [])
         if not recommendations:
             return RecommendationAnswerOutput(final_answer="当前没有生成可用的推荐结果，建议先补充偏好或改成明确主题搜索。")
 

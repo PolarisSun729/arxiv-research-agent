@@ -80,23 +80,10 @@ class PreferenceActionOutput(BaseModel):
     tool_result: Optional[Dict[str, Any]] = None
 
 
-class VerifyPreferenceUpdateInput(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    preference_action_result: Optional[Dict[str, Any]] = None
-
-
-class VerifiedPreferenceOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    ok: bool
-    detail: Optional[Dict[str, Any]] = None
-
-
 class SynthesizePreferenceResponseInput(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    verified_preference_update: Optional[Dict[str, Any]] = None
+    preference_action_result: Optional[Dict[str, Any]] = None
 
 
 class PreferenceResponseOutput(BaseModel):
@@ -146,16 +133,19 @@ class UpdatePreferenceStoreAdapter(BaseToolAdapter[UpdatePreferenceStoreInput, P
 
     def execute(self, tool_input: UpdatePreferenceStoreInput) -> ToolExecutionResult:
         result = super().execute(tool_input)
-        if result.ok and isinstance(result.data, PreferenceActionOutput) and result.data.tool_result and not bool(result.data.tool_result.get("ok", False)):
-            backend_result = result.data.tool_result
+        # 写入没有成功就是工具失败（原 verify_preference_update 质量门并入这里），不能让回复步骤
+        # 告诉用户「已更新」；后端没返回结果也算失败。失败归为 tool_runtime_error，走兜底回复。
+        if result.ok and isinstance(result.data, PreferenceActionOutput) and result.data.status != "success":
+            backend_result = result.data.tool_result or {}
+            backend_error = backend_result.get("error") if isinstance(backend_result.get("error"), Mapping) else {}
             return result.model_copy(
                 update={
                     "ok": False,
                     "error": backend_tool_error(
-                        error_code=((backend_result.get("error") or {}).get("code") if isinstance(backend_result.get("error"), Mapping) else None) or "preference_write_failed",
-                        message=str((backend_result.get("error") or {}).get("message") if isinstance(backend_result.get("error"), Mapping) else backend_result.get("summary") or "偏好写入失败"),
+                        error_code=backend_error.get("code") or "preference_write_failed",
+                        message=str(backend_error.get("message") or backend_result.get("summary") or "偏好写入失败"),
                         detail={"backend_error": backend_result.get("error")},
-                        suggested_recovery="ask_clarification",
+                        suggested_recovery="fallback_answer",
                         safe_debug={"backend_tool_name": "record/remove_paper_preference"},
                     ),
                 }
@@ -203,30 +193,15 @@ class UpdatePreferenceStoreAdapter(BaseToolAdapter[UpdatePreferenceStoreInput, P
         )
 
 
-class VerifyPreferenceUpdateAdapter(BaseToolAdapter[VerifyPreferenceUpdateInput, VerifiedPreferenceOutput]):
-    tool_name = "verify_preference_update"
-    input_model = VerifyPreferenceUpdateInput
-    output_model = VerifiedPreferenceOutput
-
-    def _run(self, tool_input: VerifyPreferenceUpdateInput) -> VerifiedPreferenceOutput:
-        action_result = tool_input.preference_action_result
-        return VerifiedPreferenceOutput(
-            ok=isinstance(action_result, Mapping)
-            and bool(action_result.get("arxiv_id"))
-            and str(action_result.get("status") or "success") == "success",
-            detail=dict(action_result or {}) if isinstance(action_result, Mapping) else None,
-        )
-
-
 class SynthesizePreferenceResponseAdapter(BaseToolAdapter[SynthesizePreferenceResponseInput, PreferenceResponseOutput]):
     tool_name = "synthesize_preference_response"
     input_model = SynthesizePreferenceResponseInput
     output_model = PreferenceResponseOutput
 
     def _run(self, tool_input: SynthesizePreferenceResponseInput) -> PreferenceResponseOutput:
-        verified = tool_input.verified_preference_update if isinstance(tool_input.verified_preference_update, Mapping) else {}
-        detail = verified.get("detail") if isinstance(verified.get("detail"), Mapping) else {}
-        if not verified.get("ok"):
+        detail = tool_input.preference_action_result if isinstance(tool_input.preference_action_result, Mapping) else {}
+        # 写入失败时 update_preference_store 本身就失败了，走不到这里；这里只防御上游绑错。
+        if str(detail.get("status") or "") != "success":
             return PreferenceResponseOutput(final_answer="偏好更新未成功，请确认目标论文后重试。")
         action = str(detail.get("action") or "").strip()
         if action == "remove":

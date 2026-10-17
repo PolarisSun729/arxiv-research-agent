@@ -63,7 +63,7 @@ def test_run_agent_turn_arxiv_search_success(monkeypatch) -> None:
     assert result.status in {"success", "fallback"}
     assert result.final_answer
     step_ids = _step_ids(result)
-    assert step_ids[:4] == ["normalize_request", "build_arxiv_search_spec", "search_arxiv", "validate_arxiv_results"]
+    assert step_ids[:3] == ["normalize_request", "build_arxiv_search_spec", "search_arxiv"]
     assert step_ids[-1] == "synthesize_arxiv_response"
     assert "personalize_paper_results" not in step_ids or step_ids.index("personalize_paper_results") < step_ids.index("synthesize_arxiv_response")
     assert {"search_spec", "arxiv_results", "final_answer"}.issubset(result.outputs.keys())
@@ -97,7 +97,10 @@ def test_run_agent_turn_arxiv_empty_after_ladder_returns_suggestion_without_repl
     # 阶梯在一次工具调用里依次放宽：严格 → 短语改分词 → 放开默认分类；时间窗始终保留。
     assert len(queries) == 3
     assert "cat:cs.CL" in queries[0] and "cat:cs.CL" not in queries[-1]
-    assert not any(trace.event == "plan_replanned" for trace in result.trace)
+    # 空结果即 search_arxiv 失败（search_empty）；阶梯已用尽，恢复层直接兜底，不再插入 rewrite→search。
+    assert result.status == "fallback"
+    replans = [trace for trace in result.trace if trace.event == "plan_replanned"]
+    assert [trace.detail["selected_recovery_action"]["action_type"] for trace in replans] == ["fallback_answer"]
     assert not any(trace.step_id == "rewrite_arxiv_query" for trace in result.trace)
     assert result.final_answer
     assert "没有找到符合条件的论文" in result.final_answer

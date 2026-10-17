@@ -57,7 +57,6 @@ class ToolCandidateSelector:
             "normalize_request",
             "build_arxiv_search_spec",
             "search_arxiv",
-            "validate_arxiv_results",
             "rewrite_arxiv_query",
             "personalize_paper_results",
             "synthesize_arxiv_response",
@@ -73,13 +72,11 @@ class ToolCandidateSelector:
             "load_user_profile",
             "load_candidate_papers",
             "generate_recommendations",
-            "validate_recommendations",
             "explain_recommendations",
         },
         "preference_action": {
             "resolve_preference_target",
             "update_preference_store",
-            "verify_preference_update",
             "synthesize_preference_response",
             "analyze_ambiguity",
             "generate_clarification",
@@ -436,7 +433,7 @@ class LLMPlanDraftGenerator:
             "只有 ToolContract.requires_confirmation=true 或 persistent_write 工具才必须标记 requires_confirmation=true；external_call 只写 risk_notes/recovery，不要仅因外部调用要求人工确认。\n"
             "persistent_write 工具只能在目标明确时使用；不确定时选择 clarification 工具。\n"
             "paper_qa 必须先 resolve_paper，再 check_paper_index，再 answer_paper_question。\n"
-            "preference_action 写入必须先 resolve_preference_target，再 update_preference_store，再 verify，再 answer。\n"
+            "preference_action 写入必须先 resolve_preference_target，再 update_preference_store，再 answer。\n"
             "unsupported 请求只能选择 fallback 工具。\n"
             "arxiv_search 的 build_arxiv_search_spec.normalized_request 必须来自 normalize_request 的 step_output；不要绑定 goal.constraints。\n"
             "arxiv_search 的 sort_by 和 sort_order 必须拆成两个字段，不要输出 submittedDate:descending 这类合并字符串。\n"
@@ -646,7 +643,6 @@ class RuleBasedToolAwarePlanBuilder:
         normalize = self._require_tool(tools_by_name, "normalize_request", required_tags={"search"})
         build_spec = self._require_tool(tools_by_name, "build_arxiv_search_spec", required_tags={"search"})
         search = self._require_tool(tools_by_name, "search_arxiv", required_tags={"search"})
-        validate = self._require_tool(tools_by_name, "validate_arxiv_results", required_tags={"validate"})
         synthesize = self._require_tool(tools_by_name, "synthesize_arxiv_response", required_tags={"answer"})
 
         steps.append(
@@ -680,7 +676,7 @@ class RuleBasedToolAwarePlanBuilder:
                 search,
                 action_type="search",
                 output_key="arxiv_results",
-                reason="search 工具是 arxiv_search 目标的必要外部检索步骤。",
+                reason="search 工具是 arxiv_search 目标的必要外部检索步骤；结果为空或质量低由它自己的失败模式交给恢复层。",
                 depends_on=["build_arxiv_search_spec"],
                 input_bindings=[_binding_dict("search_spec", source_type="step_output", step_id="build_arxiv_search_spec")],
                 retry_policy=(
@@ -690,25 +686,12 @@ class RuleBasedToolAwarePlanBuilder:
                 ),
             )
         )
-        steps.append(
-            self._draft_step(
-                "validate_arxiv_results",
-                validate,
-                action_type="validate",
-                output_key="arxiv_result_quality",
-                reason="用 validate 能力先检查检索质量，后续 response 和 replanner 都依赖这个判断。",
-                depends_on=["search_arxiv"],
-                input_bindings=[_binding_dict("arxiv_results", source_type="step_output", step_id="search_arxiv")],
-            )
-        )
-
         personalize = self._optional_tool(tools_by_name, preferred_name="personalize_paper_results", required_tags={"personalize", "rerank"})
         has_profile_context = _has_any_context_key(state, {"user_memory_summary", "memory_summary", "research_profile"})
-        synthesize_depends_on = ["validate_arxiv_results"]
+        synthesize_depends_on = ["search_arxiv"]
         synthesize_bindings = [
-            _binding_dict("arxiv_result_quality", source_type="step_output", step_id="validate_arxiv_results"),
-            # 回答需要读取阶梯检索记录，才能说明放宽过程或在没结果时列出已尝试的查询。
-            _binding_dict("arxiv_results", source_type="step_output", step_id="search_arxiv", required=False),
+            # 回答需要读取阶梯检索记录，才能说明放宽过程。
+            _binding_dict("arxiv_results", source_type="step_output", step_id="search_arxiv"),
         ]
         if personalize and has_profile_context:
             steps.append(
@@ -831,7 +814,6 @@ class RuleBasedToolAwarePlanBuilder:
         profile = self._require_tool(tools_by_name, "load_user_profile", required_tags={"profile"})
         candidate = self._optional_tool(tools_by_name, preferred_name="load_candidate_papers", required_tags={"recommendation", "retrieve"})
         recommend = self._require_tool(tools_by_name, "generate_recommendations", required_tags={"recommendation"})
-        validate = self._require_tool(tools_by_name, "validate_recommendations", required_tags={"validate", "recommendation"})
         explain = self._require_tool(tools_by_name, "explain_recommendations", required_tags={"answer", "recommendation"})
 
         steps = [
@@ -872,18 +854,9 @@ class RuleBasedToolAwarePlanBuilder:
                     recommend,
                     action_type="search",
                     output_key="recommendation_result",
-                    reason="recommendation 能力负责生成候选推荐，外部调用风险来自 ToolSpec。",
+                    reason="recommendation 能力负责生成候选推荐，外部调用风险来自 ToolSpec；推荐为空即失败，不会把空推荐交给解释步骤。",
                     depends_on=recommend_depends_on,
                     input_bindings=recommend_bindings,
-                ),
-                self._draft_step(
-                    "validate_recommendations",
-                    validate,
-                    action_type="validate",
-                    output_key="validated_recommendations",
-                    reason="推荐结果先校验再解释，避免把空推荐直接交给用户。",
-                    depends_on=["generate_recommendations"],
-                    input_bindings=[_binding_dict("recommendation_result", source_type="step_output", step_id="generate_recommendations")],
                 ),
                 self._draft_step(
                     "explain_recommendations",
@@ -891,8 +864,8 @@ class RuleBasedToolAwarePlanBuilder:
                     action_type="answer",
                     output_key="final_answer",
                     reason="explain 是最终用户回复步骤，缺失时必须 fallback。",
-                    depends_on=["validate_recommendations"],
-                    input_bindings=[_binding_dict("validated_recommendations", source_type="step_output", step_id="validate_recommendations")],
+                    depends_on=["generate_recommendations"],
+                    input_bindings=[_binding_dict("recommendation_result", source_type="step_output", step_id="generate_recommendations")],
                 ),
             ]
         )
@@ -911,7 +884,6 @@ class RuleBasedToolAwarePlanBuilder:
             self._skip_step("update_preference_store", "目标论文不明确，拒绝生成 persistent_write 步骤。")
             return self._build_unclear(goal, state, context, tools_by_name)
         update = self._require_tool(tools_by_name, "update_preference_store", required_tags={"memory_write", "preference"})
-        verify = self._require_tool(tools_by_name, "verify_preference_update", required_tags={"validate", "preference"})
         synthesize = self._require_tool(tools_by_name, "synthesize_preference_response", required_tags={"answer", "preference"})
         if update.side_effect_level != "persistent_write":
             return self._fallback_draft(goal, "preference_action", f"update tool side_effect_level must be persistent_write, got {update.side_effect_level}")
@@ -943,22 +915,13 @@ class RuleBasedToolAwarePlanBuilder:
                 ],
             ),
             self._draft_step(
-                "verify_preference_update",
-                verify,
-                action_type="validate",
-                output_key="verified_preference_update",
-                reason="持久化写入后必须校验结果，再生成用户回复。",
-                depends_on=["update_preference_store"],
-                input_bindings=[_binding_dict("preference_action_result", source_type="step_output", step_id="update_preference_store")],
-            ),
-            self._draft_step(
                 "synthesize_preference_response",
                 synthesize,
                 action_type="answer",
                 output_key="final_answer",
-                reason="把偏好写入结果转换为明确的用户可读反馈。",
-                depends_on=["verify_preference_update"],
-                input_bindings=[_binding_dict("verified_preference_update", source_type="step_output", step_id="verify_preference_update")],
+                reason="把偏好写入结果转换为明确的用户可读反馈；写入失败时 update_preference_store 本身失败，不会走到这里。",
+                depends_on=["update_preference_store"],
+                input_bindings=[_binding_dict("preference_action_result", source_type="step_output", step_id="update_preference_store")],
             ),
         ]
         return self._make_draft(goal, "preference_action", steps)
@@ -1446,7 +1409,6 @@ def _validate_required_llm_sequence(goal: Goal, steps: Sequence[PlanDraftStep]) 
             required_tools = [
                 "resolve_preference_target",
                 "update_preference_store",
-                "verify_preference_update",
                 "synthesize_preference_response",
             ]
             for tool_name in required_tools:
@@ -1538,7 +1500,7 @@ def _validate_required_executable_sequence(goal: Goal, steps: Sequence[PlanStep]
             if tool_name not in tool_names:
                 reasons.append(f"paper_qa plan missing required tool {tool_name}")
     if goal_type == "preference_action" and "update_preference_store" in tool_names:
-        for tool_name in ("resolve_preference_target", "verify_preference_update", "synthesize_preference_response"):
+        for tool_name in ("resolve_preference_target", "synthesize_preference_response"):
             if tool_name not in tool_names:
                 reasons.append(f"preference_action plan missing required tool {tool_name}")
     return reasons
@@ -1550,23 +1512,16 @@ def _validate_arxiv_search_executable_sequence(steps: Sequence[PlanStep]) -> Lis
     steps_by_id = {str(step.step_id or "").strip(): step for step in list(steps or []) if str(step.step_id or "").strip()}
     reasons: List[str] = []
     if _is_context_backed_arxiv_sequence(steps):
-        # Artifact skeleton 已经裁剪 candidate_paper_set 时，计划可以直接消费上下文论文；
-        # 但仍必须保留 validate -> synthesize 质量门，不能让回答步骤绕过证据检查。
-        required_tools = ["validate_arxiv_results", "synthesize_arxiv_response"]
-        for tool_name in required_tools:
-            if tool_name not in tool_names:
-                reasons.append(f"context-backed arxiv_search plan missing required tool {tool_name}")
-        reasons.extend(_validate_order(tool_names, required_tools, "context-backed arxiv_search"))
-        synthesize_step = _find_plan_step_by_tool(steps, "synthesize_arxiv_response")
-        if synthesize_step and not _depends_on_tool(synthesize_step, steps, "validate_arxiv_results"):
-            reasons.append("context-backed arxiv_search synthesize_arxiv_response must depend on validate_arxiv_results")
+        # Artifact skeleton 已经裁剪 candidate_paper_set 时，计划直接消费上下文里的非空论文列表，
+        # 不再触发外部检索；回答步骤仍必须存在。
+        if "synthesize_arxiv_response" not in tool_names:
+            reasons.append("context-backed arxiv_search plan missing required tool synthesize_arxiv_response")
         return reasons
 
     required_tools = [
         "normalize_request",
         "build_arxiv_search_spec",
         "search_arxiv",
-        "validate_arxiv_results",
         "synthesize_arxiv_response",
     ]
     for tool_name in required_tools:
@@ -1619,20 +1574,21 @@ def _validate_arxiv_search_executable_sequence(steps: Sequence[PlanStep]) -> Lis
 
 
 def _is_context_backed_arxiv_sequence(steps: Sequence[PlanStep]) -> bool:
+    """没有检索步骤、论文列表以 literal 形式直接来自上下文的搜索计划。"""
     tool_names = {str(step.tool_name or "").strip() for step in list(steps or [])}
     if {"normalize_request", "build_arxiv_search_spec", "search_arxiv"}.intersection(tool_names):
         return False
-    validate_step = _find_plan_step_by_tool(steps, "validate_arxiv_results")
-    if validate_step is None:
-        return False
-    for binding in list(validate_step.input_bindings or []):
-        if str(binding.input_key or "").strip() != "arxiv_results":
+    for step in list(steps or []):
+        if step.tool_name not in {"synthesize_arxiv_response", "personalize_paper_results"}:
             continue
-        if binding.source_type != "literal" or not isinstance(binding.value, Mapping):
-            continue
-        papers = binding.value.get("papers")
-        if isinstance(papers, list) and papers:
-            return True
+        for binding in list(step.input_bindings or []):
+            if str(binding.input_key or "").strip() != "arxiv_results":
+                continue
+            if binding.source_type != "literal" or not isinstance(binding.value, Mapping):
+                continue
+            papers = binding.value.get("papers")
+            if isinstance(papers, list) and papers:
+                return True
     return False
 
 

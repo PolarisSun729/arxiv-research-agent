@@ -23,7 +23,7 @@ class FailureClassifier:
         # 这里仅为旧 observation 做保守兜底；新增分类仍应优先由 Observer 显式写入。
         if tool_name == "search_arxiv" and status == "empty_result":
             return "search_empty"
-        if tool_name == "validate_arxiv_results" and status == "low_confidence":
+        if tool_name == "search_arxiv" and status == "low_confidence":
             return "search_low_confidence"
         if tool_name == "check_paper_index" and status == "need_confirmation":
             return "paper_index_missing"
@@ -31,6 +31,8 @@ class FailureClassifier:
             return "paper_index_stale"
         if tool_name == "load_user_profile" and status == "empty_result":
             return "empty_user_profile"
+        if tool_name == "generate_recommendations" and status == "empty_result":
+            return "recommendation_empty"
         if tool_name == "answer_paper_question" and status == "low_confidence":
             return "qa_no_answer"
         if tool_name in {"update_preference_store", "resolve_preference_target"} and status == "need_clarification":

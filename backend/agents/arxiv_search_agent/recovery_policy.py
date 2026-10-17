@@ -59,6 +59,26 @@ class SearchEmptyRecoveryPolicy(_BaseRecoveryPolicy):
 
     def build_candidates(self, *, step: PlanStep, observation: ObservationResult, runtime: PlanRuntime, state: Optional[AgentState] = None) -> List[RecoveryCandidate]:
         del runtime, state
+        if (observation.evidence or {}).get("ladder_exhausted"):
+            # 放宽阶梯已经在工具内部跑完，改写后再搜只会重复同样的查询；直接兜底，回复里列出已尝试的检索。
+            return [
+                RecoveryCandidate(
+                    candidate_id=f"{step.step_id}:explain_exhausted_search",
+                    action_type="fallback_answer",
+                    failure_category=observation.failure_category or "search_empty",
+                    priority=90,
+                    confidence=0.9,
+                    reason="放宽阶梯已用尽仍没有结果，告知用户尝试过的检索和放宽建议。",
+                    target_step_id=step.step_id,
+                    required_tools=[],
+                    patch_strategy="fallback_answer",
+                    risk_level="low",
+                    requires_confirmation=False,
+                    max_attempts=1,
+                    expected_effect="结束本轮，回复列出阶梯检索的每一级查询和命中数。",
+                    fallback_if_failed="fallback_answer",
+                )
+            ]
         return [
             RecoveryCandidate(
                 candidate_id=f"{step.step_id}:rewrite_query_for_empty_search",
@@ -68,12 +88,12 @@ class SearchEmptyRecoveryPolicy(_BaseRecoveryPolicy):
                 confidence=0.9,
                 reason="搜索没有返回可用论文，优先通过 query rewrite 放宽或改写检索条件。",
                 target_step_id=step.step_id,
-                required_tools=["rewrite_arxiv_query", "search_arxiv", "validate_arxiv_results"],
+                required_tools=["rewrite_arxiv_query", "search_arxiv"],
                 patch_strategy="rewrite_search_chain",
                 risk_level="low",
                 requires_confirmation=False,
                 max_attempts=2,
-                expected_effect="插入 rewrite -> search -> validate 链路，后续步骤改用重试搜索结果。",
+                expected_effect="插入 rewrite -> search 链路，后续步骤改用重试搜索结果。",
                 fallback_if_failed="fallback_answer",
             )
         ]
@@ -82,7 +102,7 @@ class SearchEmptyRecoveryPolicy(_BaseRecoveryPolicy):
 class SearchLowConfidenceRecoveryPolicy(_BaseRecoveryPolicy):
     policy_name = "search_low_confidence_recovery_policy"
     failure_categories = ("search_low_confidence",)
-    tool_names = ("validate_arxiv_results",)
+    tool_names = ("search_arxiv",)
 
     def build_candidates(self, *, step: PlanStep, observation: ObservationResult, runtime: PlanRuntime, state: Optional[AgentState] = None) -> List[RecoveryCandidate]:
         del runtime, state
@@ -95,7 +115,7 @@ class SearchLowConfidenceRecoveryPolicy(_BaseRecoveryPolicy):
                 confidence=0.85,
                 reason="搜索结果质量不足，使用改写后的查询重新检索以提升相关性。",
                 target_step_id=step.step_id,
-                required_tools=["rewrite_arxiv_query", "search_arxiv", "validate_arxiv_results"],
+                required_tools=["rewrite_arxiv_query", "search_arxiv"],
                 patch_strategy="rewrite_search_chain",
                 risk_level="low",
                 requires_confirmation=False,
@@ -160,6 +180,34 @@ class EmptyUserProfileRecoveryPolicy(_BaseRecoveryPolicy):
                 requires_confirmation=False,
                 max_attempts=1,
                 expected_effect="移除后续推荐步骤对空画像的强依赖，保留基于当前请求的推荐能力。",
+                fallback_if_failed="fallback_answer",
+            )
+        ]
+
+
+class RecommendationEmptyRecoveryPolicy(_BaseRecoveryPolicy):
+    policy_name = "recommendation_empty_recovery_policy"
+    failure_categories = ("recommendation_empty",)
+    tool_names = ("generate_recommendations",)
+
+    def build_candidates(self, *, step: PlanStep, observation: ObservationResult, runtime: PlanRuntime, state: Optional[AgentState] = None) -> List[RecoveryCandidate]:
+        del runtime, state
+        # 沿用推荐为空原来的处理（当时归为 insufficient_context，走澄清）：先问用户想看哪个方向。
+        return [
+            RecoveryCandidate(
+                candidate_id=f"{step.step_id}:ask_recommendation_direction",
+                action_type="ask_clarification",
+                failure_category=observation.failure_category or "recommendation_empty",
+                priority=70,
+                confidence=0.75,
+                reason="推荐结果为空，说明画像和请求不足以定位方向，先向用户确认想看的主题。",
+                target_step_id=step.step_id,
+                required_tools=["generate_clarification"],
+                patch_strategy="clarification_chain",
+                risk_level="low",
+                requires_confirmation=False,
+                max_attempts=1,
+                expected_effect="向用户提出可回答的澄清问题。",
                 fallback_if_failed="fallback_answer",
             )
         ]
@@ -516,6 +564,7 @@ DEFAULT_RECOVERY_POLICY_REGISTRY = RecoveryPolicyRegistry(
         SearchLowConfidenceRecoveryPolicy(),
         PaperIndexMissingRecoveryPolicy(),
         EmptyUserProfileRecoveryPolicy(),
+        RecommendationEmptyRecoveryPolicy(),
         QaNoAnswerRecoveryPolicy(),
         QaNoSourcesRecoveryPolicy(),
         PaperIndexStaleOrCorruptedRecoveryPolicy(),
@@ -534,6 +583,7 @@ __all__ = [
     "PreferenceTargetMissingRecoveryPolicy",
     "QaNoAnswerRecoveryPolicy",
     "QaNoSourcesRecoveryPolicy",
+    "RecommendationEmptyRecoveryPolicy",
     "RecoveryPolicy",
     "RecoveryPolicyRegistry",
     "SearchEmptyRecoveryPolicy",

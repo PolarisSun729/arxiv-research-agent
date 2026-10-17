@@ -54,7 +54,6 @@ _LIST_SOURCE_SPECS: Sequence[Dict[str, Any]] = (
     {"path": "recommendations", "source_type": "recommendations", "label": "推荐结果列表", "priority": 80},
     {"path": "candidate_papers", "source_type": "recommendations", "label": "推荐候选列表", "priority": 78},
     {"path": "recommendation_result.recommendations", "source_type": "recommendations", "label": "推荐结果列表", "priority": 76},
-    {"path": "validated_recommendations.recommendations", "source_type": "recommendations", "label": "已校验推荐结果", "priority": 74},
 )
 
 _FOCUS_SOURCE_SPECS: Sequence[Dict[str, Any]] = (
