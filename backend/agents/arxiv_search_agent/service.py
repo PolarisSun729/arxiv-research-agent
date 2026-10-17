@@ -52,6 +52,7 @@ from .runtime_checkpoint import (
 )
 from .schemas import AgentRuntimeState, AgentStep, AgentStreamEvent, ArxivSearchRequest, ArxivSearchResponse
 from .state import AgentState
+from .tool_registry import UNIFIED_TOOL_REGISTRY
 
 logger = logging.getLogger(__name__)
 RESUME_CHECKPOINT_NOT_FOUND_CODE = ErrorCode.RESUME_CHECKPOINT_NOT_FOUND
@@ -1832,12 +1833,19 @@ def _compact_runtime_state(runtime_state: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def _tool_display_label(tool_name: Any) -> Optional[str]:
+    """按工具契约取中文显示名；不在注册表里的工具返回 None，由前端兜底。"""
+    contract = UNIFIED_TOOL_REGISTRY.get_contract(str(tool_name or ""))
+    return contract.display_label if contract is not None else None
+
+
 def _compact_execution_plan_step(step: Any, runtime_step: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """压缩 execution_plan 单步信息，便于前端展示规划状态。"""
     payload = {
         "step_id": getattr(step, "step_id", None),
         "action_type": getattr(step, "action_type", None),
         "tool_name": getattr(step, "tool_name", None),
+        "display_label": _tool_display_label(getattr(step, "tool_name", None)),
         "output_key": getattr(step, "output_key", None),
         "status": getattr(step, "status", None),
         "depends_on": list(getattr(step, "depends_on", []) or []),
@@ -1906,6 +1914,7 @@ def _active_runtime_tool_call(state: Optional[AgentState], *, approved_step_id: 
                 return None
             return {
                 "tool_name": step.tool_name,
+                "display_label": _tool_display_label(step.tool_name),
                 "arguments": {},
                 "step_id": step.step_id,
                 "action_type": step.action_type,
@@ -1969,6 +1978,9 @@ def _merge_tool_call_end(active_tool_call: Mapping[str, Any], latest_tool_call: 
         **latest,
     }
     merged["tool_name"] = merged.get("tool_name") or active_tool_call.get("tool_name") or "unknown"
+    display_label = _tool_display_label(merged["tool_name"])
+    if display_label:
+        merged["display_label"] = display_label
     status = str(merged.get("status") or "").strip()
     if status in {"running", "pending", "waiting_confirmation"}:
         status = "success"

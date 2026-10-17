@@ -39,6 +39,8 @@ export interface ArxivSearchSpec {
 
 export interface AgentToolCall {
   tool_name: string
+  // 工具契约里的中文显示名，前端优先展示它
+  display_label?: string | null
   arguments: Record<string, any>
   status: string
   summary?: string | null

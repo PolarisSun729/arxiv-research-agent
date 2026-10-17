@@ -42,8 +42,8 @@ const searchState = {
   intent: 'arxiv_search',
   search_spec: { query: 'RAG', submitted_days_ago: 7, max_results: 5, categories: [] },
   execution_plan: [
-    { step_id: 's1', tool_name: 'search_arxiv_structured' },
-    { step_id: 's2', tool_name: 'validate_arxiv_results' }
+    { step_id: 's1', tool_name: 'search_arxiv' },
+    { step_id: 's2', tool_name: 'synthesize_arxiv_response' }
   ],
   // 真实运行中 state.papers 要到收尾才回填，检索步骤结束时快照里仍是 0。
   paper_count: 0
@@ -64,9 +64,9 @@ const done = replay([
   event('step_start', { step: 'select_next_step' }),
   event('step_end', { step: 'select_next_step', status: 'success', state: searchState }),
   event('step_start', { step: 'execute_step' }),
-  event('tool_call_start', { step: 'execute_step', tool_call: { tool_name: 'search_arxiv_structured', status: 'running' } }),
+  event('tool_call_start', { step: 'execute_step', tool_call: { tool_name: 'search_arxiv', status: 'running' } }),
   event('step_end', { step: 'execute_step', status: 'success', state: searchState }),
-  event('tool_call_end', { step: 'execute_step', tool_call: { tool_name: 'validate_arxiv_results', status: 'success', summary: 'continue', result_counts: { papers: 5 } }, state: searchState }),
+  event('tool_call_end', { step: 'execute_step', tool_call: { tool_name: 'synthesize_arxiv_response', status: 'success', summary: 'continue', result_counts: { papers: 5 } }, state: searchState }),
   event('step_start', { step: 'finalize' }),
   event('step_end', { step: 'finalize', status: 'success', state: searchState }),
   event('final_response', { response: { debug: {} } })
@@ -75,11 +75,11 @@ assert.equal(done.status, 'done')
 assert.deepEqual(done.entries.map(entry => entry.label), ['理解你的问题', '制定执行计划', '检索 arXiv 论文', '整理最终回答'])
 assert.ok(done.entries.every(entry => entry.status === 'success'))
 assert.deepEqual(done.entries[0].facts, ['意图：论文检索', '关键词：RAG', '最近 7 天', '最多 5 篇'])
-assert.deepEqual(done.entries[1].facts, ['计划：检索 arXiv 论文 → 校验检索结果'])
+assert.deepEqual(done.entries[1].facts, ['计划：检索 arXiv 论文 → 撰写检索结果摘要'])
 // 数量取自本步输出而不是 state.paper_count；结束事件里被推断成下一步的工具名不能覆盖开始时的工具名；
 // 英文内部摘要不展示。
 assert.deepEqual(done.entries[2].facts, ['检索到 5 篇论文'])
-assert.equal(done.entries[2].toolName, 'search_arxiv_structured')
+assert.equal(done.entries[2].toolName, 'search_arxiv')
 assert.equal(done.entries[2].endedAt - done.entries[2].startedAt, 2000)
 
 // 批准恢复时工具先被预告，随后的 step_start 不能再建一条重复步骤。
@@ -90,6 +90,29 @@ const resumed = replay([
 ])
 assert.equal(resumed.entries.length, 1)
 assert.equal(resumed.entries[0].label, '解析并索引论文全文')
+
+// 显示名优先用后端契约下发的 display_label，缺失时才查前端兜底表，都没有就显示“调用工具 X”。
+const labelled = replay([
+  event('step_start', { step: 'build_plan' }),
+  event('step_end', {
+    step: 'build_plan',
+    status: 'success',
+    state: {
+      execution_plan: [
+        { step_id: 's1', tool_name: 'search_arxiv', display_label: '检索论文（契约名）' },
+        { step_id: 's2', tool_name: 'brand_new_tool' }
+      ]
+    }
+  }),
+  event('step_start', { step: 'execute_step' }),
+  event('tool_call_start', { step: 'execute_step', tool_call: { tool_name: 'brand_new_tool', display_label: '新工具', status: 'running' } }),
+  event('step_end', { step: 'execute_step', status: 'success', state: {} }),
+  // 结束事件可能已指向下一步，它带的显示名不能覆盖开始时的。
+  event('tool_call_end', { step: 'execute_step', tool_call: { tool_name: 'other_tool', display_label: '下一步', status: 'success' } })
+])
+assert.deepEqual(labelled.entries[0].facts, ['计划：检索论文（契约名） → 调用工具 brand_new_tool'])
+assert.equal(labelled.entries[1].label, '新工具')
+assert.equal(labelled.entries[1].toolName, 'brand_new_tool')
 
 // interrupt 会结束当前步骤并提示用户确认。
 const interrupted = replay([

@@ -18,34 +18,29 @@ const NODE_LABELS: Record<string, string> = {
   __interrupt__: '等待你确认'
 }
 
-// 键是执行计划里的工具名（tool_registry 的 contract 名），部分旧名是后端实际工具名。
+// 显示名以后端工具契约下发的 display_label 为准；这里只在事件缺这个字段时兜底，键是 contract 名。
 const TOOL_LABELS: Record<string, string> = {
   normalize_request: '归一化请求',
   build_arxiv_search_spec: '生成检索条件',
   search_arxiv: '检索 arXiv 论文',
-  search_arxiv_structured: '检索 arXiv 论文',
   rewrite_arxiv_query: '改写检索关键词',
-  validate_arxiv_results: '校验检索结果',
   personalize_paper_results: '按研究画像排序',
   synthesize_arxiv_response: '撰写检索结果摘要',
-  recommend_papers: '生成个性化推荐',
   load_user_profile: '读取研究画像',
   load_candidate_papers: '读取候选论文',
   generate_recommendations: '生成个性化推荐',
-  validate_recommendations: '校验推荐结果',
   explain_recommendations: '整理推荐说明',
   resolve_paper: '定位目标论文',
   check_paper_index: '检查论文全文索引',
-  check_paper_qa_index: '检查论文全文索引',
   parse_and_index_paper: '解析并索引论文全文',
-  build_paper_qa_index: '构建论文问答索引',
   answer_paper_question: '基于论文全文回答',
   assess_paper_qa_quality: '评估回答质量',
   generate_fallback_response: '生成兜底回答',
   resolve_preference_target: '确认偏好目标论文',
   update_preference_store: '更新论文偏好',
-  verify_preference_update: '校验偏好写入',
-  synthesize_preference_response: '整理偏好操作结果'
+  synthesize_preference_response: '整理偏好操作结果',
+  analyze_ambiguity: '分析缺少的信息',
+  generate_clarification: '生成澄清问题'
 }
 
 const INTENT_LABELS: Record<string, string> = {
@@ -63,19 +58,18 @@ const INTENT_LABELS: Record<string, string> = {
 // 这些工具产出的条目数就是用户最关心的中间结果：工具名 -> [输出字段, 文案]。
 const RESULT_COUNT_FACTS: Record<string, [string, (count: number) => string]> = {
   search_arxiv: ['papers', count => `检索到 ${count} 篇论文`],
-  search_arxiv_structured: ['papers', count => `检索到 ${count} 篇论文`],
-  generate_recommendations: ['recommendations', count => `生成 ${count} 条推荐`],
-  recommend_papers: ['recommendations', count => `生成 ${count} 条推荐`]
+  generate_recommendations: ['recommendations', count => `生成 ${count} 条推荐`]
 }
 
-export function getToolLabel(toolName: string | null | undefined) {
+export function getToolLabel(toolName: string | null | undefined, displayLabel?: unknown) {
+  if (typeof displayLabel === 'string' && displayLabel.trim()) return displayLabel.trim()
   const name = String(toolName || '').trim()
   if (!name) return NODE_LABELS.execute_step
   return TOOL_LABELS[name] || `调用工具 ${name}`
 }
 
-function getStepLabel(node: string, toolName?: string | null) {
-  if (node === 'execute_step' && toolName) return getToolLabel(toolName)
+function getStepLabel(node: string, toolName?: string | null, displayLabel?: unknown) {
+  if (node === 'execute_step' && toolName) return getToolLabel(toolName, displayLabel)
   return NODE_LABELS[node] || node
 }
 
@@ -137,7 +131,7 @@ function planFacts(state: Record<string, any>) {
   const labels: string[] = []
   for (const step of steps) {
     if (!isRecord(step)) continue
-    const label = step.tool_name ? getToolLabel(step.tool_name) : String(step.action_type || '')
+    const label = step.tool_name ? getToolLabel(step.tool_name, step.display_label) : String(step.action_type || '')
     // 连续重复的步骤（如多次检索）只展示一次，避免计划链过长。
     if (label && labels[labels.length - 1] !== label) labels.push(label)
   }
@@ -225,14 +219,15 @@ export function applyProgressEvent(progress: AgentRunProgress, event: AgentStrea
       const toolCall = isRecord(data.tool_call) ? data.tool_call : null
       const toolName = typeof toolCall?.tool_name === 'string' ? toolCall.tool_name : null
       const targetNode = node || 'execute_step'
+      const label = getStepLabel(targetNode, toolName, toolCall?.display_label)
       const index = findLastEntryIndex(entries, targetNode, true)
       if (index >= 0) {
-        entries[index] = { ...entries[index], toolName, label: getStepLabel(targetNode, toolName) }
+        entries[index] = { ...entries[index], toolName, label }
       } else {
         entries.push({
           key: `${event.sequence}-${targetNode}`,
           node: targetNode,
-          label: getStepLabel(targetNode, toolName),
+          label,
           status: 'running',
           facts: [],
           toolName,
@@ -248,13 +243,13 @@ export function applyProgressEvent(progress: AgentRunProgress, event: AgentStrea
       const index = findLastEntryIndex(entries, targetNode, false)
       if (index < 0) return progress
       const entry = entries[index]
-      // 结束事件的工具名由执行后的状态推断，可能已指向下一步；优先沿用开始时确定的工具名。
+      // 结束事件的工具名由执行后的状态推断，可能已指向下一步；优先沿用开始时确定的工具名和显示名。
       const toolName = entry.toolName || (typeof toolCall?.tool_name === 'string' && toolCall.tool_name) || null
       const failed = toolCall?.status === 'failed'
       entries[index] = {
         ...entry,
         toolName,
-        label: getStepLabel(targetNode, toolName),
+        label: entry.toolName ? entry.label : getStepLabel(targetNode, toolName, toolCall?.display_label),
         status: failed ? 'failed' : entry.status,
         facts: mergeFacts(entry.facts, toolResultFacts(toolCall, toolName))
       }
