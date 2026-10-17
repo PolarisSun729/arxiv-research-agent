@@ -1414,6 +1414,9 @@ class PlanStep(BaseModel):
         "pending", "running", "success", "failed", "skipped",
         "waiting_confirmation", "waiting_interaction", "waiting_background_job",
     ] = "pending"
+    # 这一步交付哪个目标（PlanGoal.goal_id，见 plan_goals.py）。只标在交付步骤上，一个目标恰好一个；
+    # 中间步骤留空，它们服务哪些目标由数据依赖推出来。
+    goal_id: Optional[str] = None
 
     @field_validator("tool", mode="before")
     @classmethod
