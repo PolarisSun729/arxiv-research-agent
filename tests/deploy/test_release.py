@@ -20,7 +20,7 @@ sys.path.insert(0, str(REPO_ROOT / "deploy"))
 import apply_release as deploy
 import package_release as package
 from release_common import (
-    EXPECTED_RUNTIME, ReleaseError, extract_checked, is_runtime_path,
+    EXECUTABLE_ENTRYPOINTS, EXPECTED_RUNTIME, ReleaseError, extract_checked, is_runtime_path,
     sha256_file, validate_release, verify_runtime,
 )
 
@@ -49,6 +49,12 @@ class TemporaryReleaseTest(unittest.TestCase):
             path = payload / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
+        for name in EXECUTABLE_ENTRYPOINTS:
+            # 发布包必须带 systemd 入口脚本且可执行，归档时 tarfile 会把可执行位一起记下。
+            path = payload / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("#!/bin/sh\n", encoding="utf-8")
+            path.chmod(0o755)
         manifest = {
             "schema_version": 1, "commit": COMMIT, "runtime": EXPECTED_RUNTIME,
             "dependency_hash": sha256_file(payload / ".release/requirements.lock"), "wheel_count": 1,
@@ -158,6 +164,13 @@ class ArchiveTests(TemporaryReleaseTest):
         payload = self.make_payload()
         (payload / ".release/requirements.lock").write_text("tampered")
         with self.assertRaisesRegex(ReleaseError, "锁文件"):
+            validate_release(payload, COMMIT)
+
+    @unittest.skipIf(sys.platform == "win32", "Windows 文件系统不记录可执行位")
+    def test_entrypoint_without_executable_bit_rejected(self) -> None:
+        payload = self.make_payload()
+        (payload / EXECUTABLE_ENTRYPOINTS[0]).chmod(0o644)
+        with self.assertRaisesRegex(ReleaseError, "可执行权限"):
             validate_release(payload, COMMIT)
 
     def test_missing_frontend_rejected(self) -> None:
