@@ -28,7 +28,15 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from release_common import EXPECTED_RUNTIME, ReleaseError, extract_checked, sha256_file, validate_commit, verify_runtime
+from release_common import (
+    EXPECTED_RUNTIME,
+    ReleaseError,
+    check_executable_entrypoints,
+    extract_checked,
+    sha256_file,
+    validate_commit,
+    verify_runtime,
+)
 
 
 # 项目根目录（本文件位于 <root>/deploy/ 下）。
@@ -98,6 +106,8 @@ def package_release(output: Path, commit: str, runtime_freeze: Path) -> dict:
         # 2. 安全解压到 payload/，source_archive=True 会顺带剔除运行时目录和敏感配置。
         payload = staging / "payload"
         extract_checked(source_tar, payload, source_archive=True)
+        # 在 CI 就拦住丢了可执行位的入口脚本，不等到服务器上安装失败。
+        check_executable_entrypoints(payload)
         # 3. 前端构建产物不在 Git 中，单独从 CI 工作区复制进来。
         shutil.copytree(ROOT / "frontend/dist", payload / "frontend/dist", symlinks=True)
         # 4. .release/ 存放仅供安装使用的元数据：离线 wheel 和锁文件。

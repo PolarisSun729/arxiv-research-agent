@@ -3,3 +3,4 @@ deploy/*.sh text eol=lf
 deploy/*.py text eol=lf
 deploy/*.service text eol=lf
 .github/workflows/*.yml text eol=lf
+backend/07-arxiv-tools/*.sh text eol=lf
