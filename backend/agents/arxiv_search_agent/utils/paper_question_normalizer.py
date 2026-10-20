@@ -57,6 +57,11 @@ def normalize_single_paper_qa_question(message: Any, paper_reference: Any) -> st
         return _replace_target_reference(question, _LAST_TARGET_PATTERN)
     if reference_type == "context_paper":
         return _replace_target_reference(question, _CONTEXT_TARGET_PATTERN)
+    if reference_type == "llm_reference":
+        # 指代是 LLM 判断的，不知道原话用的哪种说法；只清理列表序号，代词在单篇语境里本来就对。
+        for pattern in (_ORDINAL_TARGET_PATTERN, _LAST_TARGET_PATTERN):
+            if pattern.search(question):
+                return _replace_target_reference(question, pattern)
     if reference_type == "arxiv_id" or _ARXIV_TARGET_PATTERN.search(question):
         return _replace_target_reference(question, _ARXIV_TARGET_PATTERN)
     return question

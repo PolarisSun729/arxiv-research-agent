@@ -18,17 +18,8 @@ from services.paper_qa.repair_actions import (
 from .base import BaseToolAdapter, backend_tool_error
 from .models import ToolExecutionResult
 
-try:
-    from ..utils.paper_reference_resolver import _resolve_paper_reference
-except Exception:  # pragma: no cover - 测试轻量导入场景下允许缺失。
-    _resolve_paper_reference = None
-
 from ..utils.paper_question_normalizer import normalize_single_paper_qa_question
-
-try:
-    from ..utils.paper_target_resolver import resolve_paper_target as _resolve_paper_target
-except Exception:  # pragma: no cover - 测试轻量导入场景下允许缺失。
-    _resolve_paper_target = None
+from ..utils.paper_target_resolver import resolve_paper_target, resolve_understood_reference
 
 
 logger = logging.getLogger(__name__)
@@ -41,6 +32,8 @@ class ResolvePaperInput(BaseModel):
     selected_paper: Optional[Dict[str, Any]] = None
     context: Dict[str, Any] = Field(default_factory=dict)
     action_type: Optional[str] = None
+    # 理解阶段 LLM 落地好的论文指代（见 AgentState.paper_reference），由执行器注入。
+    paper_reference: Optional[Dict[str, Any]] = None
 
 
 class PaperReferenceOutput(BaseModel):
@@ -72,6 +65,8 @@ class PaperReferenceOutput(BaseModel):
     query: Optional[str] = None
     matched_by: Optional[str] = None
     source: Optional[str] = None
+    # 指代有歧义但按最可能的一篇执行时，回答开头要带上的说明。
+    assumption_note: Optional[str] = None
 
 
 class CheckPaperIndexInput(BaseModel):
@@ -238,54 +233,44 @@ def _with_reference_hint_aliases(payload: Mapping[str, Any]) -> Dict[str, Any]:
         "arxiv_id": normalized.get("arxiv_id") if bool(normalized.get("final_target_resolved")) else None,
         "title": normalized.get("title") if bool(normalized.get("final_target_resolved")) else None,
         "matched_by": normalized.get("matched_by"),
+        "assumption_note": normalized.get("assumption_note"),
     }
     normalized["paper_ref"] = paper_payload
     normalized["paper_reference"] = dict(paper_payload)
     return normalized
 
 
-def _resolve_reference_then_target(message: str, context: Mapping[str, Any], *, action_type: str) -> Dict[str, Any]:
-    """先抽取引用线索，再由 Target Resolver 结合上下文生成候选或最终目标。"""
-    if callable(_resolve_paper_reference):
-        reference_hint = _resolve_paper_reference(message, context)
-    else:
-        reference_hint = _resolve_paper_reference_fallback(message, context)
-    if callable(_resolve_paper_target):
-        return _resolve_paper_target(
-            reference_hint=reference_hint if isinstance(reference_hint, Mapping) else {},
+_ARXIV_ID_PATTERN = re.compile(r"\b\d{4}\.\d{4,5}(?:v\d+)?\b")
+
+
+def _resolve_target(
+    message: str,
+    context: Mapping[str, Any],
+    *,
+    action_type: str,
+    paper_reference: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """用户写了 arXiv ID 就按 ID 定位；其余指代只用理解阶段 LLM 的结论，不对原话跑正则。"""
+    arxiv_id_match = _ARXIV_ID_PATTERN.search(message or "")
+    if arxiv_id_match:
+        return resolve_paper_target(
+            reference_hint={
+                "status": "hint_extracted",
+                "reference_type": "arxiv_id",
+                "value": arxiv_id_match.group(0),
+                "confidence": 0.95,
+                "source": "explicit_arxiv_id",
+                "requires_context": False,
+            },
             message=message,
             context=context,
             action_type=action_type,
         )
-    return dict(reference_hint or {})
-
-
-def _resolve_paper_reference_fallback(message: str, context: Mapping[str, Any]) -> Dict[str, Any]:
-    del context
-    arxiv_id_match = re.search(r"\b\d{4}\.\d{4,5}(?:v\d+)?\b", message or "")
-    if arxiv_id_match:
-        return _with_reference_hint_aliases(
-            {
-                "status": "hint_extracted",
-                "reference_type": "arxiv_id",
-                "value": arxiv_id_match.group(0),
-                "confidence": 0.9,
-                "source": "explicit_arxiv_id_fallback",
-                "requires_context": False,
-                "reason": None,
-            }
-        )
-    return _with_reference_hint_aliases(
-        {
-            "status": "unknown",
-            "reference_type": "unknown",
-            "value": None,
-            "confidence": 0.0,
-            "source": "fallback_no_reference",
-            "requires_context": False,
-            "reason": "无法提取论文引用线索。",
-            "query": message,
-        }
+    return resolve_understood_reference(
+        paper_reference=paper_reference,
+        message=message,
+        context=context,
+        action_type=action_type,
     )
 
 
@@ -301,10 +286,11 @@ class ResolvePaperAdapter(BaseToolAdapter[ResolvePaperInput, PaperReferenceOutpu
         if isinstance(selected_paper, Mapping) and "selected_paper" not in context:
             # selected_paper 是目标解析层的候选材料，不允许引用线索提取器直接消费。
             context["selected_paper"] = dict(selected_paper)
-        resolution = _resolve_reference_then_target(
+        resolution = _resolve_target(
             message,
             context,
             action_type=str(tool_input.action_type or "paper_qa"),
+            paper_reference=tool_input.paper_reference,
         )
         return PaperReferenceOutput.model_validate(_with_reference_hint_aliases(resolution))
 

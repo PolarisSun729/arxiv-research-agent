@@ -343,6 +343,11 @@ def _build_debug_payload(
         if contextualization.get("rewritten"):
             # 前端"理解你的问题"会展示这句，让用户看到追问被理解成了什么。
             payload["contextualized_message"] = contextualization.get("message")
+        if isinstance(contextualization.get("paper_reference"), Mapping):
+            payload["paper_reference"] = {
+                **_compact_paper_reference(contextualization["paper_reference"]),
+                "error": contextualization["paper_reference"].get("error"),
+            }
     return payload
 
 
@@ -655,6 +660,8 @@ def _write_parse_search_request_state(
     normalized_state.plan = list(plan)
     normalized_state.warnings = _dedupe_preserve_order([str(item) for item in warnings if str(item).strip()])
     normalized_state.next_actions = list(next_actions)
+    # 论文指代由改写 LLM 判断并落地；resolve_paper 只消费它，不再对原话跑正则。
+    normalized_state.paper_reference = (contextualization or {}).get("paper_reference")
     # parse 成功后要清空上一轮搜索执行遗留，确保后续节点只基于本轮决策工作。
     normalized_state.search_retry_count = 0
     normalized_state.fallback_specs = []
@@ -701,6 +708,13 @@ def _write_parse_search_request_state(
     )
 
 
+def _compact_paper_reference(reference: Any) -> Optional[Dict[str, Any]]:
+    """日志里只记指代判断的结论，不带论文记录。"""
+    if not isinstance(reference, Mapping):
+        return None
+    return {"status": reference.get("status"), "kind": reference.get("kind"), "keys": reference.get("keys")}
+
+
 def parse_search_request(
     state: Union[AgentState, Mapping[str, Any]],
     generation_service: Optional[Any] = None,
@@ -721,8 +735,13 @@ def parse_search_request(
     research_profile = prepared["research_profile"]
 
     # 追问先借最近对话改写成完整的一句；后面的识别、规则和原话依据校验都只面对这句话。
-    # state.message 保持用户原话，对话记录、论文指代解析等仍按原话工作。
-    contextualization = contextualize_request(message, prepared["recent_turns"], generation_service)
+    # 同一次调用顺带判断用户指的是上下文里哪篇论文。state.message 保持用户原话，对话记录仍按原话存。
+    contextualization = contextualize_request(
+        message,
+        prepared["recent_turns"],
+        generation_service,
+        context=current_state.context if isinstance(current_state.context, Mapping) else {},
+    )
     original_message = message
     message = contextualization["message"]
 
@@ -780,6 +799,7 @@ def parse_search_request(
         session_id=current_state.session_id,
         input=original_message,
         contextualized_input=message if contextualization["rewritten"] else None,
+        paper_reference=_compact_paper_reference(contextualization.get("paper_reference")),
         llm_intent=(llm_result or {}).get("intent"),
         llm_confidence=(llm_result or {}).get("confidence"),
         rule_intent=(rule_result or {}).get("intent"),

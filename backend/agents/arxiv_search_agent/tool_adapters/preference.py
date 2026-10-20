@@ -15,6 +15,8 @@ class ResolvePreferenceTargetInput(BaseModel):
     selected_paper: Optional[Dict[str, Any]] = None
     context: Dict[str, Any] = Field(default_factory=dict)
     action_type: Optional[str] = None
+    # 理解阶段 LLM 落地好的论文指代，原样交给 ResolvePaperAdapter。
+    paper_reference: Optional[Dict[str, Any]] = None
 
 
 class PreferenceTargetOutput(BaseModel):

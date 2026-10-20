@@ -135,6 +135,11 @@ class AgentState(BaseModel):
     # 例如 selected_paper、last_papers、research_profile、loading_method 等。
     context: Dict[str, Any] = Field(default_factory=dict)
 
+    # [A 执行真源-语义层] 追问改写 LLM 对论文指代的判断，已按候选清单落地成具体论文：
+    # {"status", "kind": none|single|multiple|ambiguous|outside, "keys", "papers", "error"}；
+    # 上下文里没有候选论文时为 None。由执行器注入 resolve_paper，不再从原话里用正则猜指代。
+    paper_reference: Optional[Dict[str, Any]] = None
+
     interaction: Optional[AgentInteraction] = None
 
     # [B 出站响应投影] paper_qa_result 由 _apply_turn_result 从 runtime.outputs 投影得到，

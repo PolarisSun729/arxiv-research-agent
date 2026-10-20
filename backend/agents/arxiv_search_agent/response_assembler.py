@@ -13,6 +13,10 @@ def assemble_final_answer(runtime: PlanRuntime) -> Optional[str]:
     用户答案”，避免调度器为了兼容不同业务工具继续散落回答拼接逻辑。
     """
     outputs = runtime.outputs if isinstance(runtime.outputs, Mapping) else {}
+    return _with_assumption_note(outputs, _select_answer(runtime, outputs))
+
+
+def _select_answer(runtime: PlanRuntime, outputs: Mapping[str, Any]) -> Optional[str]:
     explicit_answer = _clean_text(outputs.get("final_answer"))
     if explicit_answer:
         return explicit_answer
@@ -33,6 +37,17 @@ def assemble_final_answer(runtime: PlanRuntime) -> Optional[str]:
             return qa_answer
 
     return _clean_text(runtime.final_answer)
+
+
+def _with_assumption_note(outputs: Mapping[str, Any], answer: Optional[str]) -> Optional[str]:
+    """目标论文是按最可能的一篇假设出来的，回答开头要说明按哪篇理解，用户才能及时纠正。"""
+    if not answer:
+        return answer
+    for value in outputs.values():
+        note = _clean_text(value.get("assumption_note")) if isinstance(value, Mapping) else None
+        if note and not answer.startswith(note):
+            return f"{note}\n\n{answer}"
+    return answer
 
 
 def record_recovery_fallback(
@@ -65,6 +80,8 @@ def _build_recovery_fallback_answer(runtime: PlanRuntime, reason: str) -> str:
     paper_qa_result = outputs.get("paper_qa_result") if isinstance(outputs.get("paper_qa_result"), Mapping) else {}
     qa_observation = paper_qa_result.get("qa_observation") if isinstance(paper_qa_result.get("qa_observation"), Mapping) else {}
     lower_reason = reason.lower()
+    if lower_reason.startswith("clarification_required"):
+        return _build_clarification_answer(runtime, lower_reason)
     if qa_observation or any(token in lower_reason for token in ("qa_", "paper_qa", "paper_index", "answer_paper_question")):
         retrieval_quality = _clean_text(qa_observation.get("retrieval_quality"))
         answer_insufficient = _clean_text(qa_observation.get("answer_insufficient_evidence"))
@@ -94,3 +111,28 @@ def _build_recovery_fallback_answer(runtime: PlanRuntime, reason: str) -> str:
     if any(token in lower_reason for token in ("search_arxiv", "search_empty", "empty_result", "no_papers")):
         return "自动调整检索条件后仍然没有找到合适的论文。可以尝试放宽时间范围，或换一个更通用的关键词后再试。"
     return "这次请求没能顺利完成。可以换个说法、补充一些细节，或稍后重试。"
+
+
+# 追问里最多列几篇候选；再多用户也不会逐条看。
+_MAX_CLARIFICATION_CANDIDATES = 5
+
+
+def _build_clarification_answer(runtime: PlanRuntime, reason: str) -> str:
+    """目标论文没定下来时的追问：把能对上的候选列出来，让用户回一句就能继续。"""
+    last_observation = runtime.last_observation if isinstance(runtime.last_observation, Mapping) else {}
+    evidence = last_observation.get("evidence") if isinstance(last_observation.get("evidence"), Mapping) else {}
+    candidates = [item for item in list(evidence.get("candidates") or []) if isinstance(item, Mapping)]
+    lines = []
+    for index, candidate in enumerate(candidates[:_MAX_CLARIFICATION_CANDIDATES], start=1):
+        title = _clean_text(candidate.get("title")) or _clean_text(candidate.get("arxiv_id"))
+        if not title:
+            continue
+        arxiv_id = _clean_text(candidate.get("arxiv_id"))
+        lines.append(f"{index}. {title}" + (f"（arXiv {arxiv_id}）" if arxiv_id and arxiv_id != title else ""))
+    if "reference_multiple_targets" in reason and lines:
+        return "目前一次只能针对一篇论文回答，你想先看哪一篇？\n" + "\n".join(lines)
+    if "reference_outside_context" in reason:
+        return "你说的这篇论文不在当前对话的论文里。可以告诉我它的 arXiv ID，或者先搜索一下这篇论文。"
+    if lines:
+        return "我不确定你指的是哪篇论文，是下面这些里的哪一篇？回复序号或标题就可以。\n" + "\n".join(lines)
+    return "我不确定你指的是哪篇论文。可以告诉我论文标题或 arXiv ID，或者先搜索相关论文。"

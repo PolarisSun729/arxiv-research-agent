@@ -335,8 +335,14 @@ class PlanPatcher:
         return {"ok": True, "rule_name": "rule_empty_user_profile", "patch_strategy": "downgrade_recommendation_chain"}
 
     def patch_clarification_chain(self, *, plan_copy: ExecutablePlan, runtime_copy: PlanRuntime, failed_step: PlanStep, action: RecoveryAction) -> Dict[str, Any]:
-        del plan_copy, runtime_copy, failed_step
-        return {"ok": False, "fallback": True, "fallback_reason": action.fallback_reason or "clarification_required", "patch_strategy": "clarification_chain"}
+        del plan_copy, failed_step, action
+        # 追问是这一轮的正常结局：原因码固定以 clarification_required 开头，回答装配据此生成追问，
+        # 后面带上观察到的具体原因（如 reference_not_mentioned），排查时能看出为什么要问。
+        # 不能用候选的 fallback_if_failed，那是「追问也失败时」的备选，不是这一轮的结局。
+        observation = runtime_copy.last_observation if isinstance(runtime_copy.last_observation, dict) else {}
+        detail = str(observation.get("reason") or "").strip()
+        reason = f"clarification_required:{detail}" if detail else "clarification_required"
+        return {"ok": False, "fallback": True, "fallback_reason": reason, "patch_strategy": "clarification_chain"}
 
     def patch_fallback_answer(self, *, plan_copy: ExecutablePlan, runtime_copy: PlanRuntime, failed_step: PlanStep, action: RecoveryAction) -> Dict[str, Any]:
         del plan_copy, runtime_copy, failed_step

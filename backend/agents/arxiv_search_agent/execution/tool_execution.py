@@ -184,4 +184,7 @@ class ToolExecutionService:
         if tool_name == "analyze_ambiguity":
             payload.setdefault("search_spec", _plain(state.search_spec) if state.search_spec is not None else {})
             payload.setdefault("goal", {"intent": state.intent or "unclear", "goal_type": state.intent or "unclear"})
+        if tool_name in {"resolve_paper", "resolve_preference_target"} and state.paper_reference is not None:
+            # 指代由理解阶段的 LLM 判断并落地成论文，目标解析只消费这份结论。
+            payload.setdefault("paper_reference", dict(state.paper_reference))
         return payload

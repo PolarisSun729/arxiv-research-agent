@@ -4,6 +4,10 @@
 这里在意图识别之前，借最近几轮对话让小模型补全被省略的主题和条件，后续 parse
 仍然只面对一句完整的话，原话依据校验、规则兜底都不需要感知多轮。
 改写只补全省略，不替用户决定新的条件；任何失败都退回原句，不阻断主链路。
+
+同一次调用里还判断用户在指哪篇论文：代码把上下文里的论文排成带编号的候选清单，
+模型只挑编号，落地和校验见 utils/paper_reference。指代判断失败时不退回正则，交给
+resolve_paper 追问用户。
 """
 
 from __future__ import annotations
@@ -12,6 +16,12 @@ import json
 import logging
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from .utils.paper_reference import (
+    build_reference_candidates,
+    candidates_for_prompt,
+    ground_paper_reference,
+    unavailable_paper_reference,
+)
 from .utils.text_utils import _extract_json_block, _normalize_text
 
 logger = logging.getLogger(__name__)
@@ -67,24 +77,33 @@ def contextualize_request(
     message: str,
     recent_turns: Sequence[Mapping[str, Any]],
     generation_service: Optional[Any],
+    context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """返回 {message, original_message, rewritten, status, error}；message 是交给意图识别的那句话。"""
+    """返回 {message, original_message, rewritten, status, error, paper_reference}。
+
+    message 是交给意图识别的那句话；paper_reference 是落地后的论文指代，上下文里没有
+    候选论文时为 None（没有可指的论文，resolve_paper 直接追问）。
+    """
+    candidates = build_reference_candidates(context or {})
     result: Dict[str, Any] = {
         "message": message,
         "original_message": message,
         "rewritten": False,
         "status": "skipped",
         "error": None,
+        "paper_reference": None,
     }
-    if not recent_turns or not message:
+    if not message or not (recent_turns or candidates):
         return result
     if generation_service is None or not hasattr(generation_service, "complete_with_qwen"):
         result["status"] = "llm_unavailable"
+        if candidates:
+            result["paper_reference"] = unavailable_paper_reference("llm_unavailable")
         return result
 
     try:
         response = generation_service.complete_with_qwen(
-            _build_prompt(message, recent_turns),
+            _build_prompt(message, recent_turns, candidates),
             task_type="agent_request_contextualization",
         )
         payload = json.loads(_extract_json_block(str(response)))
@@ -93,8 +112,14 @@ def contextualize_request(
     except Exception as exc:
         logger.warning("Agent request contextualization failed, keeping original message: %s", exc)
         result.update(status="failed", error=str(exc))
+        if candidates:
+            result["paper_reference"] = unavailable_paper_reference("failed", str(exc))
         return result
 
+    if candidates:
+        result["paper_reference"] = ground_paper_reference(payload.get("paper_reference"), candidates)
+        if result["paper_reference"]["status"] != "success":
+            logger.warning("Agent paper reference output rejected: %s", result["paper_reference"]["error"])
     standalone = _normalize_text(str(payload.get("standalone_request") or ""))
     if not standalone or len(standalone) > MAX_STANDALONE_REQUEST_CHARS:
         result.update(status="invalid_output", error="standalone_request is empty or too long")
@@ -103,9 +128,13 @@ def contextualize_request(
     return result
 
 
-def _build_prompt(message: str, recent_turns: Sequence[Mapping[str, Any]]) -> str:
-    history = "\n".join(json.dumps(dict(turn), ensure_ascii=False) for turn in recent_turns)
-    return (
+def _build_prompt(
+    message: str,
+    recent_turns: Sequence[Mapping[str, Any]],
+    candidates: Sequence[Mapping[str, Any]] = (),
+) -> str:
+    history = "\n".join(json.dumps(dict(turn), ensure_ascii=False) for turn in recent_turns) or "（没有更早的对话）"
+    prompt = (
         "你在一个 arXiv 论文检索助手里负责理解多轮对话中的追问。\n"
         "把用户最新一句改写成脱离对话也能看懂的一句请求，交给后续的意图识别。只输出 JSON。\n"
         '格式：{"standalone_request": string}\n'
@@ -122,6 +151,23 @@ def _build_prompt(message: str, recent_turns: Sequence[Mapping[str, Any]]) -> st
         "最近的对话（role=assistant 的 search 是那一轮实际使用的检索条件，paper_count 是返回的论文数）：\n"
         f"{history}\n"
         f"用户最新一句：{message}\n"
+    )
+    if not candidates:
+        return prompt
+    candidate_lines = "\n".join(json.dumps(row, ensure_ascii=False) for row in candidates_for_prompt(candidates))
+    return prompt + (
+        "\n另外判断用户最新一句是不是在指某篇或某几篇具体论文，在同一个 JSON 里多输出一个字段：\n"
+        '{"standalone_request": string, "paper_reference": {"kind": "none|single|multiple|ambiguous|outside", "refs": [string]}}\n'
+        "候选论文（key 是编号；sources 说明它出现在哪：前端当前选中的论文、上一轮问答的目标、上一轮搜索结果第几篇等）：\n"
+        f"{candidate_lines}\n"
+        "判断规则：\n"
+        "- none：没有指向具体论文，例如新的检索、换了研究主题、泛泛的概念提问、设置偏好。refs 为空。\n"
+        "- single：指的是候选里的一篇，refs 填它的 key。代词（他、它、这篇、这个方法）、方法名、"
+        "序号（第二篇）、紧接着上一轮在聊的论文继续追问，都结合对话判断。\n"
+        "- multiple：同时指候选里的几篇（例如比较两篇），refs 按用户提到的顺序填。\n"
+        "- ambiguous：指的是候选里的论文，但对话里分不清是哪篇；refs 填可能的几篇，最可能的放第一个。\n"
+        "- outside：指的是某篇具体论文，但它不在候选里（例如说了候选里没有的标题）。refs 为空。\n"
+        "- refs 只能用上面出现过的 key，不要编造。\n"
     )
 
 
