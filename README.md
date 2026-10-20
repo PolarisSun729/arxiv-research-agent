@@ -291,7 +291,7 @@ python scripts/manage_users.py create-admin --username admin --email admin@examp
 
 ~~~powershell
 cd backend
-python main.py --load-mode lazy
+python main.py
 ~~~
 
 在另一个终端启动前端：
