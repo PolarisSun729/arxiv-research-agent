@@ -652,8 +652,8 @@ def _warn_if_answer_claims_unprojected_papers(state: AgentState, result: AgentTu
     这是“回答正常但 Paper 展示区为空”不一致的最后一道哨兵：正常情况下不应触发；
     若触发，日志会带上 output_keys 与 result_count，便于定位是哪种工具输出形态没被识别。
     """
-    quality = result.outputs.get("arxiv_result_quality") if isinstance(result.outputs, Mapping) else None
-    result_count = int(quality.get("result_count") or 0) if isinstance(quality, Mapping) else 0
+    outputs = result.outputs if isinstance(result.outputs, Mapping) else {}
+    result_count = len(_papers_from_value(outputs.get("arxiv_results")))
     if result_count <= 0 and not state.papers:
         return
     if state.papers:

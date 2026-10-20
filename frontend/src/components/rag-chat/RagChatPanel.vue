@@ -18,6 +18,8 @@ type RagChatPanelMessage = AgentChatMessage & {
   turnId?: string
   sources?: RagChatSource[]
   citedSourceIds?: string[]
+  // 没有正文时的说明，由调用方按这一轮停在哪里给出；缺省用通用文案。
+  emptyText?: string
   retrievalDebug?: RetrievalDebug | null
   response?: QaTurnForRagChat | unknown | null
 }
@@ -257,7 +259,7 @@ function handleAssistantContentClick(event: MouseEvent, item: RagChatPanelMessag
           </template>
           <!-- 走到这里说明已经结束：没有正文（例如这一轮停在确认卡片上）时不能再显示“回答生成中”。 -->
           <div v-else-if="item.role === 'assistant' && !item.content" class="assistant-markdown">
-            <p class="md-empty">本轮没有生成文字回答。</p>
+            <p class="md-empty">{{ item.emptyText || '本轮没有生成文字回答。' }}</p>
           </div>
           <div
             v-else-if="item.role === 'assistant'"

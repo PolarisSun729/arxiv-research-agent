@@ -8,6 +8,34 @@ _MESSAGE_COLUMNS = (
     'message_id, session_id, user_id, role, content, response_json, status, resume_run_id, created_at'
 )
 
+# 回放气泡和追问改写读得到的字段；runtime_state、plan_runtime、debug.planner 这类执行过程
+# 单条就有几百 KB 到 MB 级，整份落库会让进入会话时一次拉下几 MB，页面一直转圈。
+REPLAY_RESPONSE_FIELDS = (
+    'session_id',
+    'intent',
+    'answer',
+    'search_spec',
+    'interaction',
+    'paper_qa_result',
+    'cited_source_ids',
+    'citation_warning',
+    'resolved_paper',
+    'preference_action_result',
+    'papers',
+    'warnings',
+)
+
+
+def to_replay_response(response: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """把完整 Agent 响应裁成回放所需的子集；debug 只留前端用来标错误气泡的 runtime_error。"""
+    if not isinstance(response, dict):
+        return response
+    replay = {key: response[key] for key in REPLAY_RESPONSE_FIELDS if key in response}
+    debug = response.get('debug')
+    if isinstance(debug, dict) and debug.get('runtime_error'):
+        replay['debug'] = {'runtime_error': debug['runtime_error']}
+    return replay
+
 
 class AgentChatMessageStore(BaseSqliteStore):
     """Agent 搜索页的对话流水，只用于前端回放历史，不参与 Agent 规划上下文。
@@ -58,7 +86,7 @@ class AgentChatMessageStore(BaseSqliteStore):
                         normalize_user_id(user_id),
                         role,
                         content or '',
-                        self._serialize_json_field(response),
+                        self._serialize_json_field(to_replay_response(response)),
                         status,
                         resume_run_id,
                     ),

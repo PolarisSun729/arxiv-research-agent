@@ -12,11 +12,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple, get_args
 
 from tools.tool_registry import invoke_tool as invoke_backend_tool
 
 from .schemas import ToolSpec
+from .semantic_types import SEMANTIC_TYPES, AnswerDraft, TypeInput, accepts, needs
 from .tool_adapters.clarification import (
     AnalyzeAmbiguityAdapter,
     AnalyzeAmbiguityInput,
@@ -55,9 +56,6 @@ from .tool_adapters.preference import (
     SynthesizePreferenceResponseInput,
     UpdatePreferenceStoreAdapter,
     UpdatePreferenceStoreInput,
-    VerifiedPreferenceOutput,
-    VerifyPreferenceUpdateAdapter,
-    VerifyPreferenceUpdateInput,
 )
 from .tool_adapters.recommendation import (
     CandidatePapersOutput,
@@ -72,9 +70,6 @@ from .tool_adapters.recommendation import (
     RecommendationAnswerOutput,
     RecommendationResultOutput,
     UserProfileOutput,
-    ValidateRecommendationsAdapter,
-    ValidateRecommendationsInput,
-    ValidatedRecommendationsOutput,
 )
 from .tool_adapters.search import (
     ArxivSearchSpecOutput,
@@ -95,9 +90,6 @@ from .tool_adapters.search import (
     SearchArxivOutput,
     SynthesizeArxivResponseAdapter,
     SynthesizeArxivResponseInput,
-    ValidateArxivResultsAdapter,
-    ValidateArxivResultsInput,
-    ValidateArxivResultsOutput,
 )
 
 CONTRACT_SOURCE = "backend.agents.arxiv_search_agent.tool_registry.UNIFIED_TOOL_REGISTRY"
@@ -132,6 +124,8 @@ class ToolContract:
     tool_name: str
     description: str
     capability_tags: List[str]
+    # 给用户看的中文显示名，随 SSE 事件和计划投影下发，前端 TOOL_LABELS 只作兜底（D4-7 ③）。
+    display_label: str = ""
     side_effect_level: str = "none"
     requires_confirmation: bool = False
     can_retry: bool = False
@@ -147,7 +141,19 @@ class ToolContract:
     recovery_policy: Dict[str, Any] = field(default_factory=dict)
     confirmation_policy: Dict[str, Any] = field(default_factory=dict)
     execution_policy: ExecutionPolicy = field(default_factory=ExecutionPolicy)
+    # 语义类型声明（semantic_types.py）：consumes 是这一步要读的类型及承载它的输入键，
+    # produces 只写成功时的产出；产出不了就是 failure_modes 里的失败，不存在「可能产出」。
+    consumes: Tuple[TypeInput, ...] = ()
+    produces: Tuple[str, ...] = ()
+    # 产出 AnswerDraft 的工具必须声明产出哪种回复（AnswerDraft.kind），目标覆盖检查（plan_goals.py）
+    # 靠它区分检索回复、推荐回复和偏好回复；其他工具留空。
+    answer_kind: Optional[str] = None
     contract_source: str = CONTRACT_SOURCE
+
+    @property
+    def needs_confirmation(self) -> bool:
+        """执行前是否要用户确认（I-8）：只看契约，计划里写没写 confirmation_policy 都不影响。"""
+        return bool(self.requires_confirmation or self.side_effect_level == "persistent_write")
 
     def to_tool_spec(self) -> ToolSpec:
         """生成 planner/debug 消费的只读投影，避免旧调用点直接持有 adapter 实例。"""
@@ -202,6 +208,17 @@ class ToolRegistry:
     def register(self, contract: ToolContract) -> None:
         if contract.adapter is None:
             raise ValueError(f"Tool contract {contract.tool_name} must declare an adapter")
+        if not str(contract.display_label or "").strip():
+            raise ValueError(f"Tool contract {contract.tool_name} must declare a display_label")
+        unknown_types = sorted(
+            ({item.semantic_type for item in contract.consumes} | set(contract.produces)) - set(SEMANTIC_TYPES)
+        )
+        if unknown_types:
+            raise ValueError(f"Tool contract {contract.tool_name} declares unknown semantic types: {unknown_types}")
+        if ("AnswerDraft" in contract.produces) != (contract.answer_kind is not None):
+            raise ValueError(f"Tool contract {contract.tool_name} must declare answer_kind if and only if it produces AnswerDraft")
+        if contract.answer_kind is not None and contract.answer_kind not in _ANSWER_DRAFT_KINDS:
+            raise ValueError(f"Tool contract {contract.tool_name} declares unknown answer_kind: {contract.answer_kind}")
         self._contracts[contract.tool_name] = contract
         self._spec_cache.pop(contract.tool_name, None)
 
@@ -218,6 +235,10 @@ class ToolRegistry:
 
     def exists(self, tool_name: str) -> bool:
         return self.get_contract(tool_name) is not None
+
+    def needs_confirmation(self, tool_name: str) -> bool:
+        contract = self.get_contract(tool_name)
+        return contract is not None and contract.needs_confirmation
 
     def validate_tool_name(self, tool_name: str) -> str:
         normalized_tool_name = str(tool_name or "").strip()
@@ -239,6 +260,7 @@ class ToolRegistry:
             rows.append(
                 {
                     "tool_name": contract.tool_name,
+                    "display_label": contract.display_label,
                     "planner_spec": contract.to_tool_spec().model_dump(),
                     "executor_adapter": contract.adapter.__class__.__name__ if contract.adapter is not None else None,
                     "backend_tool_name": contract.backend_tool_name,
@@ -247,10 +269,19 @@ class ToolRegistry:
                     "side_effect_level": contract.side_effect_level,
                     "requires_confirmation": contract.requires_confirmation,
                     "execution_policy": contract.execution_policy.as_dict(),
+                    "consumes": [
+                        {"semantic_type": item.semantic_type, "input_keys": list(item.input_keys), "required": item.required}
+                        for item in contract.consumes
+                    ],
+                    "produces": list(contract.produces),
+                    "answer_kind": contract.answer_kind,
                     "contract_source": contract.contract_source,
                 }
             )
         return rows
+
+
+_ANSWER_DRAFT_KINDS = frozenset(get_args(AnswerDraft.model_fields["kind"].annotation))
 
 
 def _model_name(model: Optional[type]) -> Optional[str]:
@@ -261,6 +292,7 @@ def _contract(
     tool_name: str,
     *,
     description: str,
+    display_label: str,
     capability_tags: List[str],
     adapter: ToolAdapter,
     input_schema: Optional[Dict[str, object]] = None,
@@ -277,10 +309,14 @@ def _contract(
     recovery_policy: Optional[Dict[str, Any]] = None,
     confirmation_policy: Optional[Dict[str, Any]] = None,
     execution_policy: Optional[ExecutionPolicy] = None,
+    consumes: Sequence[TypeInput] = (),
+    produces: Sequence[str] = (),
+    answer_kind: Optional[str] = None,
 ) -> ToolContract:
     return ToolContract(
         tool_name=tool_name,
         description=description,
+        display_label=display_label,
         capability_tags=list(capability_tags or []),
         input_schema=dict(input_schema or {}),
         output_schema=dict(output_schema or {}),
@@ -297,6 +333,9 @@ def _contract(
         recovery_policy=dict(recovery_policy or {}),
         confirmation_policy=dict(confirmation_policy or {}),
         execution_policy=execution_policy or ExecutionPolicy(),
+        consumes=tuple(consumes),
+        produces=tuple(produces),
+        answer_kind=answer_kind,
     )
 
 
@@ -306,31 +345,30 @@ def _default_recovery(*modes: str) -> Dict[str, Any]:
 
 UNIFIED_TOOL_REGISTRY = ToolRegistry()
 
+# consumes / produces 按 notes/agent-redesign.md D4-1 类型表声明。normalize_request、build_arxiv_search_spec、
+# 澄清链和 resolve_preference_target 的去留还在讨论（D4-2 / B-5），这里只按它们现在的行为声明。
 for contract in [
-    _contract("normalize_request", description="归一化当前 Agent 请求，供后续计划步骤稳定读取。", capability_tags=["search", "clarify"], input_schema={"message": "str"}, output_schema={"normalized_request": "dict"}, side_effect_level="session_write", implementation="search.NormalizeRequestAdapter", input_model=NormalizeRequestInput, output_model=NormalizedRequestOutput, error_model=ToolError, adapter=NormalizeRequestAdapter()),
-    _contract("build_arxiv_search_spec", description="把归一化请求转换为 arXiv 结构化检索参数。", capability_tags=["search"], input_schema={"normalized_request": "dict", "search_spec": "ArxivSearchSpec"}, output_schema={"arxiv_search_spec": "dict"}, side_effect_level="session_write", implementation="search.BuildArxivSearchSpecAdapter", input_model=BuildArxivSearchSpecInput, output_model=ArxivSearchSpecOutput, error_model=ToolError, adapter=BuildArxivSearchSpecAdapter()),
-    _contract("search_arxiv", description="调用后端结构化 arXiv 检索工具并返回论文列表。", capability_tags=["search"], input_schema={"search_spec": "ArxivSearchSpec"}, output_schema={"papers": "list", "tool_result": "dict"}, side_effect_level="external_call", can_retry=True, failure_modes=["tool_argument_validation_failed", "tool_execution_failed", "empty_results"], implementation="tools.search_arxiv_structured", backend_tool_name="search_arxiv_structured", input_model=SearchArxivInput, output_model=SearchArxivOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step", "patch_plan"), adapter=SearchArxivAdapter(invoke_backend_tool)),
-    _contract("validate_arxiv_results", description="检查 arXiv 检索结果是否为空或工具失败。", capability_tags=["search", "validate"], input_schema={"arxiv_results": "dict"}, output_schema={"ok": "bool", "result_count": "int", "warnings": "list"}, implementation="search.ValidateArxivResultsAdapter", input_model=ValidateArxivResultsInput, output_model=ValidateArxivResultsOutput, error_model=ToolError, recovery_policy=_default_recovery("patch_plan", "fallback_answer"), adapter=ValidateArxivResultsAdapter()),
-    _contract("rewrite_arxiv_query", description="在检索结果为空或质量低时放宽 arXiv 查询条件。", capability_tags=["search", "rewrite"], input_schema={"search_spec": "ArxivSearchSpec"}, output_schema={"rewritten_search_spec": "dict"}, side_effect_level="session_write", can_retry=True, implementation="search.RewriteArxivQueryAdapter", input_model=RewriteArxivQueryInput, output_model=RewriteArxivQueryOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step"), adapter=RewriteArxivQueryAdapter()),
-    _contract("personalize_paper_results", description="根据用户上下文对检索结果做轻量排序标注。", capability_tags=["rerank", "personalize"], input_schema={"arxiv_results": "dict", "user_memory_summary": "dict"}, output_schema={"ranked_papers": "list"}, implementation="search.PersonalizePaperResultsAdapter", input_model=PersonalizePaperResultsInput, output_model=RankedPapersOutput, error_model=ToolError, adapter=PersonalizePaperResultsAdapter()),
-    _contract("synthesize_arxiv_response", description="汇总 arXiv 检索结果并生成最终回复。", capability_tags=["answer"], input_schema={"ranked_papers": "list", "warnings": "list"}, output_schema={"final_answer": "str"}, implementation="search.SynthesizeArxivResponseAdapter", input_model=SynthesizeArxivResponseInput, output_model=SearchAnswerOutput, error_model=ToolError, adapter=SynthesizeArxivResponseAdapter()),
-    _contract("resolve_paper", description="从消息中提取论文引用线索，并结合上下文生成目标候选或最终论文。", capability_tags=["retrieve"], input_schema={"message": "str", "context": "dict"}, output_schema={"reference_hint": "dict", "target_resolution": "dict", "paper_ref": "dict"}, implementation="paper_qa.ResolvePaperAdapter", input_model=ResolvePaperInput, output_model=PaperReferenceOutput, error_model=ToolError, recovery_policy=_default_recovery("ask_clarification"), adapter=ResolvePaperAdapter()),
-    _contract("check_paper_index", description="检查目标论文是否已有 Paper QA 索引。", capability_tags=["retrieve", "validate"], input_schema={"paper_ref": "dict"}, output_schema={"status": "str", "has_index": "bool"}, implementation="paper_qa.CheckPaperIndexAdapter", backend_tool_name="check_paper_qa_index", input_model=CheckPaperIndexInput, output_model=PaperIndexStatusOutput, error_model=ToolError, recovery_policy=_default_recovery("patch_plan"), adapter=CheckPaperIndexAdapter(invoke_backend_tool)),
-    _contract("parse_and_index_paper", description="调用 Paper QA 索引构建工具解析并索引目标论文。", capability_tags=["retrieve", "index"], input_schema={"paper_reference": "dict"}, output_schema={"status": "str", "tool_result": "dict"}, side_effect_level="external_call", requires_confirmation=True, failure_modes=["paper_not_found", "index_build_failed"], implementation="paper_qa.ParseAndIndexPaperAdapter", backend_tool_name="build_paper_qa_index", input_model=ParseAndIndexPaperInput, output_model=IndexBuildOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step"), confirmation_policy={"mode": "explicit_user_confirmation_required", "reason": "external_index_build"}, execution_policy=ExecutionPolicy(mode="background_job", handler="paper_qa_index"), adapter=ParseAndIndexPaperAdapter(invoke_backend_tool)),
-    _contract("answer_paper_question", description="调用真实 PaperQAService 回答目标论文问题。", capability_tags=["answer"], input_schema={"paper_ref": "dict", "message": "str"}, output_schema={"paper_qa_result": "dict"}, side_effect_level="external_call", implementation="paper_qa.AnswerPaperQuestionAdapter", backend_tool_name="answer_paper_question", input_model=AnswerPaperQuestionInput, output_model=PaperQAAnswerOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step", "patch_plan", "fallback_answer"), adapter=AnswerPaperQuestionAdapter(invoke_backend_tool)),
-    _contract("assess_paper_qa_quality", description="读取 Paper QA observation 并决定 finalize、repair 或降级完成。", capability_tags=["validate", "answer"], input_schema={"paper_qa_result": "dict"}, output_schema={"qa_quality_decision": "dict"}, implementation="paper_qa.AssessPaperQAQualityAdapter", input_model=AssessPaperQAQualityInput, output_model=PaperQAQualityDecisionOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step", "patch_plan", "fallback_answer"), adapter=AssessPaperQAQualityAdapter()),
-    _contract("load_user_profile", description="从上下文读取用户画像与记忆摘要。", capability_tags=["retrieve", "profile"], input_schema={"context": "dict"}, output_schema={"recommendation_profile": "dict"}, implementation="recommendation.LoadUserProfileAdapter", input_model=LoadUserProfileInput, output_model=UserProfileOutput, error_model=ToolError, recovery_policy=_default_recovery("patch_plan"), adapter=LoadUserProfileAdapter()),
-    _contract("load_candidate_papers", description="从上下文读取已有候选论文列表。", capability_tags=["retrieve", "recommendation"], input_schema={"context": "dict"}, output_schema={"candidate_papers": "list"}, implementation="recommendation.LoadCandidatePapersAdapter", input_model=LoadCandidatePapersInput, output_model=CandidatePapersOutput, error_model=ToolError, adapter=LoadCandidatePapersAdapter()),
-    _contract("generate_recommendations", description="调用后端推荐工具生成论文推荐。", capability_tags=["recommendation"], input_schema={"recommendation_profile": "dict", "candidate_papers": "list"}, output_schema={"recommendations": "list", "tool_result": "dict"}, side_effect_level="external_call", implementation="recommendation.GenerateRecommendationsAdapter", backend_tool_name="recommend_papers", input_model=GenerateRecommendationsInput, output_model=RecommendationResultOutput, error_model=ToolError, recovery_policy=_default_recovery("patch_plan", "fallback_answer"), adapter=GenerateRecommendationsAdapter(invoke_backend_tool)),
-    _contract("validate_recommendations", description="检查推荐结果是否包含可展示候选项。", capability_tags=["validate", "recommendation"], input_schema={"recommendation_result": "dict"}, output_schema={"ok": "bool", "recommendations": "list"}, implementation="recommendation.ValidateRecommendationsAdapter", input_model=ValidateRecommendationsInput, output_model=ValidatedRecommendationsOutput, error_model=ToolError, recovery_policy=_default_recovery("patch_plan"), adapter=ValidateRecommendationsAdapter()),
-    _contract("explain_recommendations", description="把推荐结果整理成用户可读回复。", capability_tags=["answer", "recommendation"], input_schema={"validated_recommendations": "dict"}, output_schema={"final_answer": "str"}, implementation="recommendation.ExplainRecommendationsAdapter", input_model=ExplainRecommendationsInput, output_model=RecommendationAnswerOutput, error_model=ToolError, adapter=ExplainRecommendationsAdapter()),
-    _contract("resolve_preference_target", description="为偏好更新解析论文目标候选；只有最终目标明确后才允许进入写入确认。", capability_tags=["retrieve", "preference"], input_schema={"message": "str", "context": "dict"}, output_schema={"reference_hint": "dict", "target_resolution": "dict", "paper_reference": "dict"}, implementation="preference.ResolvePreferenceTargetAdapter", input_model=ResolvePreferenceTargetInput, output_model=PreferenceTargetOutput, error_model=ToolError, recovery_policy=_default_recovery("ask_clarification"), adapter=ResolvePreferenceTargetAdapter(ResolvePaperAdapter())),
-    _contract("update_preference_store", description="写入或删除用户论文偏好。", capability_tags=["memory_write", "preference"], input_schema={"paper_reference": "dict", "message": "str"}, output_schema={"preference_action_result": "dict"}, side_effect_level="persistent_write", implementation="preference.UpdatePreferenceStoreAdapter", backend_tool_name="record_paper_preference/remove_paper_preference", input_model=UpdatePreferenceStoreInput, output_model=PreferenceActionOutput, error_model=ToolError, recovery_policy=_default_recovery("ask_clarification", "fallback_answer"), adapter=UpdatePreferenceStoreAdapter(invoke_backend_tool)),
-    _contract("verify_preference_update", description="校验偏好写入工具是否返回成功状态。", capability_tags=["validate", "preference"], input_schema={"preference_action_result": "dict"}, output_schema={"ok": "bool", "detail": "dict"}, implementation="preference.VerifyPreferenceUpdateAdapter", input_model=VerifyPreferenceUpdateInput, output_model=VerifiedPreferenceOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step"), adapter=VerifyPreferenceUpdateAdapter()),
-    _contract("synthesize_preference_response", description="把偏好更新结果整理成最终回复。", capability_tags=["answer", "preference"], input_schema={"verified_preference_update": "dict"}, output_schema={"final_answer": "str"}, implementation="preference.SynthesizePreferenceResponseAdapter", input_model=SynthesizePreferenceResponseInput, output_model=PreferenceResponseOutput, error_model=ToolError, adapter=SynthesizePreferenceResponseAdapter()),
-    _contract("analyze_ambiguity", description="分析模糊请求缺少的关键信息。", capability_tags=["clarify"], input_schema={"message": "str"}, output_schema={"missing_information": "dict"}, implementation="clarification.AnalyzeAmbiguityAdapter", input_model=AnalyzeAmbiguityInput, output_model=MissingInformationOutput, error_model=ToolError, adapter=AnalyzeAmbiguityAdapter()),
-    _contract("generate_clarification", description="根据缺失信息生成澄清问题。", capability_tags=["clarify", "answer"], input_schema={"missing_information": "dict"}, output_schema={"final_answer": "str"}, implementation="clarification.GenerateClarificationAdapter", input_model=GenerateClarificationInput, output_model=ClarificationAnswerOutput, error_model=ToolError, adapter=GenerateClarificationAdapter()),
-    _contract("generate_fallback_response", description="为不支持的请求生成兜底回复。", capability_tags=["fallback", "answer"], input_schema={"message": "str"}, output_schema={"final_answer": "str"}, implementation="clarification.GenerateFallbackResponseAdapter", input_model=GenerateFallbackInput, output_model=ClarificationAnswerOutput, error_model=ToolError, adapter=GenerateFallbackResponseAdapter()),
+    _contract("normalize_request", display_label="归一化请求", description="归一化当前 Agent 请求，供后续计划步骤稳定读取。", capability_tags=["search", "clarify"], input_schema={"message": "str"}, output_schema={"normalized_request": "dict"}, side_effect_level="session_write", implementation="search.NormalizeRequestAdapter", input_model=NormalizeRequestInput, output_model=NormalizedRequestOutput, error_model=ToolError, adapter=NormalizeRequestAdapter(), consumes=[accepts("SearchSpec", "search_spec")]),
+    _contract("build_arxiv_search_spec", display_label="生成检索条件", description="把归一化请求转换为 arXiv 结构化检索参数。", capability_tags=["search"], input_schema={"normalized_request": "dict", "search_spec": "ArxivSearchSpec"}, output_schema={"arxiv_search_spec": "dict"}, side_effect_level="session_write", implementation="search.BuildArxivSearchSpecAdapter", input_model=BuildArxivSearchSpecInput, output_model=ArxivSearchSpecOutput, error_model=ToolError, adapter=BuildArxivSearchSpecAdapter(), consumes=[accepts("SearchSpec", "search_spec")], produces=["SearchSpec"]),
+    _contract("search_arxiv", display_label="检索 arXiv 论文", description="调用后端结构化 arXiv 检索工具并返回论文列表；放宽阶梯用尽仍没有结果即失败（search_empty）。", capability_tags=["search"], input_schema={"search_spec": "ArxivSearchSpec"}, output_schema={"papers": "list", "tool_result": "dict", "search_spec": "dict", "relaxation": "dict"}, side_effect_level="external_call", can_retry=True, failure_modes=["tool_argument_validation_failed", "tool_execution_failed", "search_empty", "search_low_confidence"], implementation="tools.search_arxiv_structured", backend_tool_name="search_arxiv_structured", input_model=SearchArxivInput, output_model=SearchArxivOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step", "patch_plan"), adapter=SearchArxivAdapter(invoke_backend_tool), consumes=[needs("SearchSpec", "search_spec")], produces=["PaperList"]),
+    _contract("rewrite_arxiv_query", display_label="改写检索关键词", description="在检索结果为空或质量低时放宽 arXiv 查询条件。", capability_tags=["search", "rewrite"], input_schema={"search_spec": "ArxivSearchSpec"}, output_schema={"rewritten_search_spec": "dict"}, side_effect_level="session_write", can_retry=True, implementation="search.RewriteArxivQueryAdapter", input_model=RewriteArxivQueryInput, output_model=RewriteArxivQueryOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step"), adapter=RewriteArxivQueryAdapter(), consumes=[needs("SearchSpec", "search_spec")], produces=["SearchSpec"]),
+    _contract("personalize_paper_results", display_label="按研究画像排序", description="根据用户上下文对检索结果做轻量排序标注。", capability_tags=["rerank", "personalize"], input_schema={"arxiv_results": "dict", "user_memory_summary": "dict"}, output_schema={"ranked_papers": "list"}, implementation="search.PersonalizePaperResultsAdapter", input_model=PersonalizePaperResultsInput, output_model=RankedPapersOutput, error_model=ToolError, adapter=PersonalizePaperResultsAdapter(), consumes=[needs("PaperList", "arxiv_results"), needs("UserProfile", "user_memory_summary", "research_profile")], produces=["PaperList"]),
+    _contract("synthesize_arxiv_response", display_label="撰写检索结果摘要", description="汇总 arXiv 检索结果并生成最终回复。", capability_tags=["answer"], input_schema={"ranked_papers": "list", "arxiv_results": "dict"}, output_schema={"final_answer": "str"}, implementation="search.SynthesizeArxivResponseAdapter", input_model=SynthesizeArxivResponseInput, output_model=SearchAnswerOutput, error_model=ToolError, adapter=SynthesizeArxivResponseAdapter(), consumes=[needs("PaperList", "ranked_papers", "arxiv_results")], produces=["AnswerDraft"], answer_kind="search"),
+    _contract("resolve_paper", display_label="定位目标论文", description="按理解阶段判断的论文指代（或消息里的 arXiv ID）在上下文论文中定位目标；定不下来时追问用户。", capability_tags=["retrieve"], input_schema={"message": "str", "context": "dict"}, output_schema={"reference_hint": "dict", "target_resolution": "dict", "paper_ref": "dict"}, implementation="paper_qa.ResolvePaperAdapter", input_model=ResolvePaperInput, output_model=PaperReferenceOutput, error_model=ToolError, recovery_policy=_default_recovery("ask_clarification"), adapter=ResolvePaperAdapter(), produces=["ResolvedPaper"]),
+    _contract("check_paper_index", display_label="检查论文全文索引", description="检查目标论文是否已有 Paper QA 索引。", capability_tags=["retrieve", "validate"], input_schema={"paper_ref": "dict"}, output_schema={"status": "str", "has_index": "bool"}, implementation="paper_qa.CheckPaperIndexAdapter", backend_tool_name="check_paper_qa_index", input_model=CheckPaperIndexInput, output_model=PaperIndexStatusOutput, error_model=ToolError, recovery_policy=_default_recovery("patch_plan"), adapter=CheckPaperIndexAdapter(invoke_backend_tool), consumes=[needs("ResolvedPaper", "paper_ref")], produces=["IndexedPaper"]),
+    _contract("parse_and_index_paper", display_label="解析并索引论文全文", description="调用 Paper QA 索引构建工具解析并索引目标论文。", capability_tags=["retrieve", "index"], input_schema={"paper_reference": "dict"}, output_schema={"status": "str", "tool_result": "dict"}, side_effect_level="external_call", requires_confirmation=True, failure_modes=["paper_not_found", "index_build_failed"], implementation="paper_qa.ParseAndIndexPaperAdapter", backend_tool_name="build_paper_qa_index", input_model=ParseAndIndexPaperInput, output_model=IndexBuildOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step"), confirmation_policy={"mode": "explicit_user_confirmation_required", "reason": "external_index_build"}, execution_policy=ExecutionPolicy(mode="background_job", handler="paper_qa_index"), adapter=ParseAndIndexPaperAdapter(invoke_backend_tool), consumes=[needs("ResolvedPaper", "paper_reference")], produces=["IndexedPaper"]),
+    _contract("answer_paper_question", display_label="基于论文全文回答", description="调用真实 PaperQAService 回答目标论文问题。", capability_tags=["answer"], input_schema={"paper_ref": "dict", "message": "str"}, output_schema={"paper_qa_result": "dict"}, side_effect_level="external_call", implementation="paper_qa.AnswerPaperQuestionAdapter", backend_tool_name="answer_paper_question", input_model=AnswerPaperQuestionInput, output_model=PaperQAAnswerOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step", "patch_plan", "fallback_answer"), adapter=AnswerPaperQuestionAdapter(invoke_backend_tool), consumes=[needs("IndexedPaper", "paper_ref")], produces=["QAResult"]),
+    _contract("assess_paper_qa_quality", display_label="评估回答质量", description="读取 Paper QA observation 并决定 finalize、repair 或降级完成。", capability_tags=["validate", "answer"], input_schema={"paper_qa_result": "dict"}, output_schema={"qa_quality_decision": "dict"}, implementation="paper_qa.AssessPaperQAQualityAdapter", input_model=AssessPaperQAQualityInput, output_model=PaperQAQualityDecisionOutput, error_model=ToolError, recovery_policy=_default_recovery("retry_step", "patch_plan", "fallback_answer"), adapter=AssessPaperQAQualityAdapter(), consumes=[needs("QAResult", "paper_qa_result")], produces=["CheckedQAResult"]),
+    _contract("load_user_profile", display_label="读取研究画像", description="从上下文读取用户画像与记忆摘要。", capability_tags=["retrieve", "profile"], input_schema={"context": "dict"}, output_schema={"recommendation_profile": "dict"}, implementation="recommendation.LoadUserProfileAdapter", input_model=LoadUserProfileInput, output_model=UserProfileOutput, error_model=ToolError, recovery_policy=_default_recovery("patch_plan"), adapter=LoadUserProfileAdapter(), produces=["UserProfile"]),
+    _contract("load_candidate_papers", display_label="读取候选论文", description="从上下文读取已有候选论文列表。", capability_tags=["retrieve", "recommendation"], input_schema={"context": "dict"}, output_schema={"candidate_papers": "list"}, implementation="recommendation.LoadCandidatePapersAdapter", input_model=LoadCandidatePapersInput, output_model=CandidatePapersOutput, error_model=ToolError, adapter=LoadCandidatePapersAdapter(), produces=["PaperList"]),
+    _contract("generate_recommendations", display_label="生成个性化推荐", description="调用后端推荐工具生成论文推荐；推荐为空即失败（recommendation_empty）。", capability_tags=["recommendation"], input_schema={"recommendation_profile": "dict", "candidate_papers": "list"}, output_schema={"recommendations": "list", "tool_result": "dict"}, side_effect_level="external_call", failure_modes=["recommendation_empty"], implementation="recommendation.GenerateRecommendationsAdapter", backend_tool_name="recommend_papers", input_model=GenerateRecommendationsInput, output_model=RecommendationResultOutput, error_model=ToolError, recovery_policy=_default_recovery("patch_plan", "fallback_answer"), adapter=GenerateRecommendationsAdapter(invoke_backend_tool), consumes=[needs("UserProfile", "recommendation_profile"), accepts("PaperList", "candidate_papers")], produces=["Recommendations"]),
+    _contract("explain_recommendations", display_label="整理推荐说明", description="把推荐结果整理成用户可读回复。", capability_tags=["answer", "recommendation"], input_schema={"recommendation_result": "dict"}, output_schema={"final_answer": "str"}, implementation="recommendation.ExplainRecommendationsAdapter", input_model=ExplainRecommendationsInput, output_model=RecommendationAnswerOutput, error_model=ToolError, adapter=ExplainRecommendationsAdapter(), consumes=[needs("Recommendations", "recommendation_result")], produces=["AnswerDraft"], answer_kind="recommendation"),
+    _contract("resolve_preference_target", display_label="确认偏好目标论文", description="为偏好更新解析论文目标候选；只有最终目标明确后才允许进入写入确认。", capability_tags=["retrieve", "preference"], input_schema={"message": "str", "context": "dict"}, output_schema={"reference_hint": "dict", "target_resolution": "dict", "paper_reference": "dict"}, implementation="preference.ResolvePreferenceTargetAdapter", input_model=ResolvePreferenceTargetInput, output_model=PreferenceTargetOutput, error_model=ToolError, recovery_policy=_default_recovery("ask_clarification"), adapter=ResolvePreferenceTargetAdapter(ResolvePaperAdapter()), produces=["PreferenceTarget"]),
+    _contract("update_preference_store", display_label="更新论文偏好", description="写入或删除用户论文偏好；写入没有成功即工具失败。", capability_tags=["memory_write", "preference"], input_schema={"paper_reference": "dict", "message": "str"}, output_schema={"preference_action_result": "dict"}, side_effect_level="persistent_write", failure_modes=["tool_runtime_error"], implementation="preference.UpdatePreferenceStoreAdapter", backend_tool_name="record_paper_preference/remove_paper_preference", input_model=UpdatePreferenceStoreInput, output_model=PreferenceActionOutput, error_model=ToolError, recovery_policy=_default_recovery("ask_clarification", "fallback_answer"), adapter=UpdatePreferenceStoreAdapter(invoke_backend_tool), consumes=[needs("PreferenceTarget", "paper_reference")], produces=["PreferenceUpdate"]),
+    _contract("synthesize_preference_response", display_label="整理偏好操作结果", description="把偏好更新结果整理成最终回复。", capability_tags=["answer", "preference"], input_schema={"preference_action_result": "dict"}, output_schema={"final_answer": "str"}, implementation="preference.SynthesizePreferenceResponseAdapter", input_model=SynthesizePreferenceResponseInput, output_model=PreferenceResponseOutput, error_model=ToolError, adapter=SynthesizePreferenceResponseAdapter(), consumes=[needs("PreferenceUpdate", "preference_action_result")], produces=["AnswerDraft"], answer_kind="preference"),
+    _contract("analyze_ambiguity", display_label="分析缺少的信息", description="分析模糊请求缺少的关键信息。", capability_tags=["clarify"], input_schema={"message": "str"}, output_schema={"missing_information": "dict"}, implementation="clarification.AnalyzeAmbiguityAdapter", input_model=AnalyzeAmbiguityInput, output_model=MissingInformationOutput, error_model=ToolError, adapter=AnalyzeAmbiguityAdapter()),
+    _contract("generate_clarification", display_label="生成澄清问题", description="根据缺失信息生成澄清问题。", capability_tags=["clarify", "answer"], input_schema={"missing_information": "dict"}, output_schema={"final_answer": "str"}, implementation="clarification.GenerateClarificationAdapter", input_model=GenerateClarificationInput, output_model=ClarificationAnswerOutput, error_model=ToolError, adapter=GenerateClarificationAdapter(), produces=["AnswerDraft"], answer_kind="clarification"),
+    _contract("generate_fallback_response", display_label="生成兜底回答", description="为不支持的请求生成兜底回复。", capability_tags=["fallback", "answer"], input_schema={"message": "str"}, output_schema={"final_answer": "str"}, implementation="clarification.GenerateFallbackResponseAdapter", input_model=GenerateFallbackInput, output_model=ClarificationAnswerOutput, error_model=ToolError, adapter=GenerateFallbackResponseAdapter(), produces=["AnswerDraft"], answer_kind="fallback"),
 ]:
     UNIFIED_TOOL_REGISTRY.register(contract)
 

@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, Mapping, Optional
 
 from pydantic import ValidationError
 
+from tools.tool_progress import ToolProgressReporter, use_tool_progress_reporter
 from utils.logging_utils import info_event
 
 from .. import tool_registry as agent_tool_registry
@@ -13,6 +14,9 @@ from ..tool_adapters.models import ToolError, ToolExecutionResult
 from ..tool_registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+# custom 流里工具进度帧的标记，事件翻译器据此识别。
+TOOL_PROGRESS_KIND = "tool_progress"
 
 
 def _plain(value: Any) -> Any:
@@ -43,6 +47,24 @@ def _error(
         failed_stage=stage,
         suggested_recovery=suggested_recovery,
     )
+
+
+def _graph_progress_reporter(step: PlanStep) -> Optional[ToolProgressReporter]:
+    """把工具中途进度写进 LangGraph 的 custom 流，由事件翻译器转成 tool_progress 推给前端。
+
+    不在图里执行（同步调用、脚本、测试替身）时拿不到 writer，就不挂监听器，工具上报成为空操作。
+    """
+    try:
+        from langgraph.config import get_stream_writer
+
+        writer = get_stream_writer()
+    except Exception:
+        return None
+
+    def report(payload: Dict[str, Any]) -> None:
+        writer({"kind": TOOL_PROGRESS_KIND, "step_id": step.step_id, "tool_name": step.tool_name, **payload})
+
+    return report
 
 
 class ToolExecutionService:
@@ -80,7 +102,8 @@ class ToolExecutionService:
             input=_plain(tool_input),
         )
         try:
-            result = contract.adapter.execute(tool_input)
+            with use_tool_progress_reporter(_graph_progress_reporter(step)):
+                result = contract.adapter.execute(tool_input)
         except Exception:
             logger.exception(
                 "arxiv_agent tool invocation raised: step_id=%s tool_name=%s elapsed_ms=%.1f",
@@ -177,6 +200,8 @@ class ToolExecutionService:
             payload.setdefault("context", context)
         if tool_name in {"load_user_profile", "generate_recommendations", "update_preference_store", "analyze_ambiguity"}:
             payload.setdefault("user_id", state.user_id)
+        if tool_name == "update_preference_store" and state.preference_operation:
+            payload.setdefault("preference_operation", dict(state.preference_operation))
         if tool_name in {"load_user_profile", "generate_recommendations", "answer_paper_question"}:
             payload.setdefault("message", state.message)
         if tool_name in {"answer_paper_question", "check_paper_index", "parse_and_index_paper"}:
@@ -184,4 +209,7 @@ class ToolExecutionService:
         if tool_name == "analyze_ambiguity":
             payload.setdefault("search_spec", _plain(state.search_spec) if state.search_spec is not None else {})
             payload.setdefault("goal", {"intent": state.intent or "unclear", "goal_type": state.intent or "unclear"})
+        if tool_name in {"resolve_paper", "resolve_preference_target"} and state.paper_reference is not None:
+            # 指代由理解阶段的 LLM 判断并落地成论文，目标解析只消费这份结论。
+            payload.setdefault("paper_reference", dict(state.paper_reference))
         return payload

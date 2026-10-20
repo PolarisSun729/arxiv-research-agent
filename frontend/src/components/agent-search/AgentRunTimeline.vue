@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import type { AgentRunProgress } from '@/types/agent'
-import { formatElapsed, getActiveEntry } from '@/utils/agentRunProgress'
+import { formatElapsed, getActiveEntry, getActiveSubstep } from '@/utils/agentRunProgress'
 
 const props = defineProps<{
   progress: AgentRunProgress
@@ -38,8 +38,14 @@ onBeforeUnmount(() => {
 
 const totalElapsed = computed(() => (props.progress.endedAt ?? now.value) - props.progress.startedAt)
 
+// 工具内部有阶段进度时，标题和慢步骤提示都跟着当前阶段走，而不是停在笼统的工具名上。
+const activeSubstep = computed(() => getActiveSubstep(activeEntry.value))
+
 const headline = computed(() => {
-  if (running.value) return activeEntry.value ? `正在${activeEntry.value.label}…` : '正在连接 Agent…'
+  if (running.value) {
+    const current = activeSubstep.value || activeEntry.value
+    return current ? `正在${current.label}…` : '正在连接 Agent…'
+  }
   if (props.progress.status === 'failed') return '执行中断'
   return '执行完成'
 })
@@ -47,8 +53,8 @@ const headline = computed(() => {
 const stepCount = computed(() => props.progress.entries.length)
 
 const activeSlow = computed(() => {
-  const entry = activeEntry.value
-  return Boolean(entry && now.value - entry.startedAt > SLOW_STEP_MS)
+  const current = activeSubstep.value || activeEntry.value
+  return Boolean(current && now.value - current.startedAt > SLOW_STEP_MS)
 })
 
 function entryElapsed(entry: { startedAt: number, endedAt?: number | null }) {
@@ -57,6 +63,16 @@ function entryElapsed(entry: { startedAt: number, endedAt?: number | null }) {
 
 function toggle() {
   userExpanded.value = !expanded.value
+}
+
+// 子步骤的明细（如证据需求清单）默认折叠，点开后才铺开，避免时间线被长列表撑满。
+const openItemKeys = ref<Set<string>>(new Set())
+
+function toggleItems(key: string) {
+  const next = new Set(openItemKeys.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  openItemKeys.value = next
 }
 </script>
 
@@ -87,6 +103,31 @@ function toggle() {
           <div v-if="entry.facts.length" class="run-step__facts">
             <span v-for="fact in entry.facts" :key="fact" class="run-step__fact">{{ fact }}</span>
           </div>
+          <ol v-if="entry.substeps?.length" class="run-substeps">
+            <li
+              v-for="substep in entry.substeps"
+              :key="substep.key"
+              class="run-substep"
+              :class="`run-substep--${substep.status}`"
+            >
+              <span class="run-substep__mark" aria-hidden="true" />
+              <span class="run-substep__label">{{ substep.label }}</span>
+              <span v-for="fact in substep.facts" :key="fact" class="run-substep__fact">{{ fact }}</span>
+              <button
+                v-if="substep.items?.length"
+                type="button"
+                class="run-substep__toggle"
+                :aria-expanded="openItemKeys.has(substep.key)"
+                @click="toggleItems(substep.key)"
+              >
+                {{ openItemKeys.has(substep.key) ? '收起' : '查看' }}
+              </button>
+              <span class="run-substep__time">{{ entryElapsed(substep) }}</span>
+              <ul v-if="substep.items?.length && openItemKeys.has(substep.key)" class="run-substep__items">
+                <li v-for="item in substep.items" :key="item">{{ item }}</li>
+              </ul>
+            </li>
+          </ol>
         </div>
       </li>
     </ol>
@@ -279,6 +320,87 @@ function toggle() {
   overflow-wrap: anywhere;
 }
 
+.run-substeps {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.run-substep {
+  --mark: var(--color-success);
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.run-substep--running { --mark: var(--color-primary); }
+.run-substep--failed { --mark: var(--color-danger); }
+
+.run-substep__mark {
+  flex: none;
+  align-self: center;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--mark);
+}
+
+.run-substep--running .run-substep__mark {
+  animation: run-pulse 1.2s ease-in-out infinite;
+  --dot: var(--mark);
+}
+
+.run-substep__label {
+  color: var(--color-text-3);
+}
+
+.run-substep--running .run-substep__label {
+  color: var(--color-primary-hover);
+}
+
+.run-substep__fact {
+  color: var(--color-text-4);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.run-substep__toggle {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--color-primary);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.run-substep__toggle:hover {
+  text-decoration: underline;
+}
+
+.run-substep__items {
+  flex-basis: 100%;
+  margin: 0 0 2px 13px;
+  padding: 0 0 0 14px;
+  color: var(--color-text-3);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.run-substep__time {
+  margin-left: auto;
+  color: var(--color-text-4);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
 .run-timeline__hint {
   margin: 8px 0 0;
   color: var(--color-text-3);
@@ -297,7 +419,8 @@ function toggle() {
 
 @media (prefers-reduced-motion: reduce) {
   .run-timeline--running .run-timeline__icon,
-  .run-step--running .run-step__dot {
+  .run-step--running .run-step__dot,
+  .run-substep--running .run-substep__mark {
     animation: none;
   }
 }

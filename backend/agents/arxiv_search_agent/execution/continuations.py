@@ -394,6 +394,8 @@ class AgentResumeRunManager:
                         }
                     ),
                     graph_config,
+                    # 续跑的第一步是把已完成的后台任务结果交回原步骤；放行该步骤，时间线才显示具体工具名而不是笼统的"执行步骤"。
+                    approved_step_id=str(continuation.get("step_id") or "").strip() or None,
                 ):
                     self._publish_progress(resume_run_id, event)
             except Exception as exc:
@@ -416,6 +418,19 @@ class AgentResumeRunManager:
             if failure_reason:
                 raise AgentWorkConflict(failure_reason)
 
+            # 续跑的回答就是这一轮的结果，会话记忆要和普通请求一样回写，否则下一轮读到的 paper_qa_result
+            # 还停在挂起时的 waiting_interaction。必须在标记完成之前写：前端看到完成就可能立刻发下一轮。
+            try:
+                agent_service._persist_agent_session_memory(
+                    final_state,
+                    memory_service=agent_service._build_memory_service(self.storage),
+                )
+            except Exception as memory_exc:
+                logger.warning(
+                    "Failed to persist agent session memory after successful resume: resume_run_id=%s error=%s",
+                    resume_run_id,
+                    memory_exc,
+                )
             response = agent_service._state_to_response(final_state)
             self.storage.agent_work.complete_resume_run(
                 resume_run_id,

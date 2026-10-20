@@ -42,6 +42,7 @@ from .graph import build_arxiv_search_graph
 from .request_contextualizer import build_recent_turns
 from .execution.interaction_runtime import InteractionRuntimeError, InteractionRuntimeService
 from .execution.interactions import AgentInteraction, InteractionResumeRequest
+from .execution.tool_execution import TOOL_PROGRESS_KIND
 from .runtime_checkpoint import (
     CHECKPOINT_STATUS_CANCELLED,
     CHECKPOINT_STATUS_COMPLETED,
@@ -52,6 +53,7 @@ from .runtime_checkpoint import (
 )
 from .schemas import AgentRuntimeState, AgentStep, AgentStreamEvent, ArxivSearchRequest, ArxivSearchResponse
 from .state import AgentState
+from .tool_registry import UNIFIED_TOOL_REGISTRY
 
 logger = logging.getLogger(__name__)
 RESUME_CHECKPOINT_NOT_FOUND_CODE = ErrorCode.RESUME_CHECKPOINT_NOT_FOUND
@@ -1796,6 +1798,7 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
         "interaction": state.interaction.model_dump(mode="json") if state.interaction is not None else None,
         "paper_qa_result": state.paper_qa_result,
         "preference_action_result": state.preference_action_result,
+        "preference_operation": state.preference_operation,
         "tool_name": state.tool_name,
         "tool_args": _compact_tool_args(state.tool_args),
         "tool_call_count": len(state.tool_calls or []),
@@ -1832,12 +1835,19 @@ def _compact_runtime_state(runtime_state: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def _tool_display_label(tool_name: Any) -> Optional[str]:
+    """按工具契约取中文显示名；不在注册表里的工具返回 None，由前端兜底。"""
+    contract = UNIFIED_TOOL_REGISTRY.get_contract(str(tool_name or ""))
+    return contract.display_label if contract is not None else None
+
+
 def _compact_execution_plan_step(step: Any, runtime_step: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """压缩 execution_plan 单步信息，便于前端展示规划状态。"""
     payload = {
         "step_id": getattr(step, "step_id", None),
         "action_type": getattr(step, "action_type", None),
         "tool_name": getattr(step, "tool_name", None),
+        "display_label": _tool_display_label(getattr(step, "tool_name", None)),
         "output_key": getattr(step, "output_key", None),
         "status": getattr(step, "status", None),
         "depends_on": list(getattr(step, "depends_on", []) or []),
@@ -1899,13 +1909,12 @@ def _active_runtime_tool_call(state: Optional[AgentState], *, approved_step_id: 
         return None
     for step in list(state.execution_plan.steps or []):
         if step.step_id == current_step_id:
-            requires_confirmation = bool(
-                step.confirmation_policy and step.confirmation_policy.requires_confirmation
-            )
+            requires_confirmation = UNIFIED_TOOL_REGISTRY.needs_confirmation(step.tool_name)
             if requires_confirmation and current_step_id != str(approved_step_id or "").strip():
                 return None
             return {
                 "tool_name": step.tool_name,
+                "display_label": _tool_display_label(step.tool_name),
                 "arguments": {},
                 "step_id": step.step_id,
                 "action_type": step.action_type,
@@ -1969,6 +1978,9 @@ def _merge_tool_call_end(active_tool_call: Mapping[str, Any], latest_tool_call: 
         **latest,
     }
     merged["tool_name"] = merged.get("tool_name") or active_tool_call.get("tool_name") or "unknown"
+    display_label = _tool_display_label(merged["tool_name"])
+    if display_label:
+        merged["display_label"] = display_label
     status = str(merged.get("status") or "").strip()
     if status in {"running", "pending", "waiting_confirmation"}:
         status = "success"
@@ -2095,13 +2107,20 @@ class _AgentEventEmitter:
         # 已在 tasks 流里宣告开始、尚未收到 updates 的节点：节点名 -> (active_tool_call, tool_call_started)。
         started_nodes: Dict[str, tuple[Optional[Dict[str, Any]], bool]] = {}
 
-        for stream_item in graph.stream(graph_input, config=graph_config, stream_mode=["tasks", "updates"]):
+        # custom 承载工具执行中途的进度帧；开启后 LangGraph 会在节点运行期间就把这些帧吐出来。
+        for stream_item in graph.stream(graph_input, config=graph_config, stream_mode=["tasks", "updates", "custom"]):
             # 测试替身可能只产出 updates 字典；真实图在多模式下产出 (mode, chunk) 元组。
             if isinstance(stream_item, tuple) and len(stream_item) == 2 and isinstance(stream_item[0], str):
                 stream_mode, chunk = stream_item
             else:
                 stream_mode, chunk = "updates", stream_item
             if not chunk:
+                continue
+
+            if stream_mode == "custom":
+                if isinstance(chunk, Mapping) and chunk.get("kind") == TOOL_PROGRESS_KIND:
+                    progress = {key: value for key, value in chunk.items() if key != "kind"}
+                    yield self.emit("tool_progress", {"step": "execute_step", "progress": progress})
                 continue
 
             if stream_mode == "tasks":

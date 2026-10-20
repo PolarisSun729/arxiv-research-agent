@@ -183,7 +183,8 @@ def test_plan_patcher_inserts_search_rewrite_chain_and_validates_plan() -> None:
 
     assert result.updated_plan is not None
     assert any(item.tool_name == "rewrite_arxiv_query" for item in result.updated_plan.steps)
-    assert any(item.tool_name == "validate_arxiv_results" for item in result.updated_plan.steps)
+    # 空结果 / 低相关由重试的 search_arxiv 自己判断，补丁不再追加校验步骤。
+    assert [item.tool_name for item in result.updated_plan.steps].count("search_arxiv") == 2
     PlanValidator().validate(result.updated_plan, PLANNER_TOOL_REGISTRY)
     assert result.updated_runtime.step_status[step.step_id] == "pending"
     assert any(trace.detail.get("selected_recovery_action") for trace in result.updated_runtime.trace)
@@ -455,9 +456,10 @@ def test_replanner_records_trace_when_replan_limit_is_exceeded() -> None:
         AgentState(intent="arxiv_search", message="rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="rag")),
         "search_arxiv",
     )
-    runtime.replan_counts["search_arxiv:empty_result"] = Replanner.MAX_REASON_REPLANS
+    replanner = Replanner()
+    runtime.replan_counts["search_arxiv:empty_result"] = replanner.max_reason_replans
 
-    decision = Replanner().replan(
+    decision = replanner.replan(
         goal=goal,
         current_plan=plan,
         runtime=runtime,
@@ -476,4 +478,24 @@ def test_replanner_records_trace_when_replan_limit_is_exceeded() -> None:
     assert trace.event == "replan_limit_exceeded"
     assert trace.detail["fallback_used"] is True
     assert trace.detail["observation_signal"] == "success_but_empty_result"
-    assert trace.detail["reason_replan_count"] == Replanner.MAX_REASON_REPLANS
+    assert trace.detail["reason_replan_count"] == replanner.max_reason_replans
+
+
+def test_replanner_limits_come_from_config(monkeypatch) -> None:
+    config_module = importlib.import_module("utils.config")
+    monkeypatch.setattr(
+        config_module,
+        "get_agent_planner_runtime_config",
+        lambda: {"recovery_max_per_reason": 7, "recovery_max_per_step": 3, "recovery_max_per_turn": 9},
+    )
+    replanner = Replanner()
+    assert (replanner.max_reason_replans, replanner.max_step_replans, replanner.max_turn_replans) == (7, 3, 9)
+
+    monkeypatch.setattr(config_module, "get_agent_planner_runtime_config", lambda: {})
+    replanner = Replanner()
+    defaults = importlib.import_module("utils.agent_planner_limits").AGENT_PLANNER_LIMIT_DEFAULTS
+    assert (replanner.max_reason_replans, replanner.max_step_replans, replanner.max_turn_replans) == (
+        defaults["recovery_max_per_reason"],
+        defaults["recovery_max_per_step"],
+        defaults["recovery_max_per_turn"],
+    )

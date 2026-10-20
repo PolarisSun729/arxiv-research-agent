@@ -53,7 +53,6 @@ _LEGACY_OUTPUT_PROJECTION = {
         "category_operator",
         "reasoning_summary",
     ],
-    "arxiv_result_quality": ["ok", "result_count", "warnings"],
     "paper_ref": [
         "status",
         "reference_type",
@@ -85,7 +84,6 @@ _LEGACY_OUTPUT_PROJECTION = {
     "recommendation_profile": ["user_id", "research_profile", "user_memory_summary", "message", "request_context"],
     "candidate_papers": ["candidate_papers"],
     "recommendation_result": ["recommendations", "tool_result", "candidate_papers"],
-    "validated_recommendations": ["ok", "recommendations"],
     "paper_reference": [
         "status",
         "reference_type",
@@ -112,7 +110,6 @@ _LEGACY_OUTPUT_PROJECTION = {
         "matched_by",
     ],
     "preference_action_result": ["status", "action", "label", "arxiv_id", "liked", "title", "message", "paper", "error", "tool_result"],
-    "verified_preference_update": ["ok", "detail"],
     "missing_information": ["message", "missing_fields", "reason"],
     "final_answer": ["final_answer"],
 }

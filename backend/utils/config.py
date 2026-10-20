@@ -6,6 +6,7 @@ from typing import Any, Dict
 
 from dotenv import load_dotenv
 
+from utils.agent_planner_limits import AGENT_PLANNER_LIMITS
 from utils.storage_paths import BACKEND_DATA_ROOT, resolve_storage_path
 
 
@@ -239,7 +240,8 @@ AGENT_PLANNER_CONFIG: Dict[str, Any] = {
     "enable_llm_recovery_diagnosis": _env_bool("ENABLE_LLM_RECOVERY_DIAGNOSIS", False),
     "llm_recovery_timeout": _env_int("LLM_RECOVERY_TIMEOUT_SECONDS", 6),
     "llm_plan_timeout": _env_int("LLM_PLAN_TIMEOUT_SECONDS", 8),
-    "llm_plan_max_steps": _env_int("LLM_PLAN_MAX_STEPS", 8),
+    # 规划预算与恢复上限：配置项、环境变量和默认值统一定义在 utils/agent_planner_limits.py。
+    **{key: _env_int(env_name, default) for key, (env_name, default) in AGENT_PLANNER_LIMITS.items()},
     # Artifact refinement 只允许 LLM 输出受控 patch；默认关闭，避免 profile-aware 路径无意增加模型成本。
     "enable_artifact_refinement": _env_bool("ENABLE_ARTIFACT_REFINEMENT", _env_bool("ENABLE_LLM_ARTIFACT_REFINEMENT", False)),
     "artifact_refinement_timeout": _env_int("ARTIFACT_REFINEMENT_TIMEOUT_SECONDS", 6),
@@ -855,7 +857,8 @@ GENERATION_CONFIG: Dict[str, Any] = {
         "paper_qa": "large",  # 处理关于具体论文的问答
         "recommendation_generation": "large",  # 生成个性化推荐文本或推荐理由
         "general_generation": "large",  # 用于复杂自然语言输出的一般大模型生成
-        "research_claim_extraction": "large",  # 研究引擎把草稿拆成可校验主张并绑定证据需求
+        "research_claim_extraction": "small",  # 研究引擎把草稿拆成可校验主张并绑定证据需求（只回片段编号，小模型够用）
+        "research_claim_verification": "small",  # 研究引擎逐条对照引用证据核对主张
         "default": "large",  # 当无特定任务映射时的默认模型角色
     },
 }

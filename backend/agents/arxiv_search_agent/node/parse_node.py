@@ -45,6 +45,7 @@ from ..utils.search_spec_builder import (
     _normalize_and_validate_spec,
     _post_process_cleaned_spec,
 )
+from ..utils.preference_action import normalize_preference_operation
 from ..utils.state_utils import _append_step, _coerce_state, _compact_search_spec
 from ..utils.text_utils import _extract_json_block, _matches_any, _normalize_optional_str, _normalize_text
 
@@ -142,7 +143,8 @@ def _normalize_llm_intent_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     1. 归一化 intent，并把未知值降级为 unsupported；
     2. 尝试解析 confidence，失败时保留为 None；
     3. 仅在 arxiv_search 分支下校验 search_spec，其余 intent 只保留元信息；
-    4. 清洗 missing_info、warnings、next_actions 等列表字段。
+    4. 仅在 preference_action 分支下校验偏好方向（preference_operation）；
+    5. 清洗 missing_info、warnings、next_actions 等列表字段。
     
     输出：返回统一的 dict，便于后续决策层同时读取 intent、confidence 和结构化搜索条件。
     """
@@ -177,6 +179,8 @@ def _normalize_llm_intent_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
         "next_actions": next_actions,
         "search_spec": search_spec,
         "search_spec_payload": search_spec_payload,
+        # 偏好方向由 LLM 读整句话给出；取值不合法时为 None，写入工具会拒绝而不是默认写成"感兴趣"。
+        "preference_operation": normalize_preference_operation(payload.get("preference_operation")) if intent == "preference_action" else None,
         "raw": dict(payload),
     }
 
@@ -343,6 +347,11 @@ def _build_debug_payload(
         if contextualization.get("rewritten"):
             # 前端"理解你的问题"会展示这句，让用户看到追问被理解成了什么。
             payload["contextualized_message"] = contextualization.get("message")
+        if isinstance(contextualization.get("paper_reference"), Mapping):
+            payload["paper_reference"] = {
+                **_compact_paper_reference(contextualization["paper_reference"]),
+                "error": contextualization["paper_reference"].get("error"),
+            }
     return payload
 
 
@@ -655,6 +664,8 @@ def _write_parse_search_request_state(
     normalized_state.plan = list(plan)
     normalized_state.warnings = _dedupe_preserve_order([str(item) for item in warnings if str(item).strip()])
     normalized_state.next_actions = list(next_actions)
+    # 论文指代由改写 LLM 判断并落地；resolve_paper 只消费它，不再对原话跑正则。
+    normalized_state.paper_reference = (contextualization or {}).get("paper_reference")
     # parse 成功后要清空上一轮搜索执行遗留，确保后续节点只基于本轮决策工作。
     normalized_state.search_retry_count = 0
     normalized_state.fallback_specs = []
@@ -666,6 +677,8 @@ def _write_parse_search_request_state(
     normalized_state.answer = None
     normalized_state.errors = []
     normalized_state.preference_action_result = None
+    # 只有 LLM 判成偏好动作时才带方向；规则兜底给不出方向，交给写入工具拒绝。
+    normalized_state.preference_operation = (llm_result or {}).get("preference_operation") if intent == "preference_action" else None
     normalized_state.debug = _build_debug_payload(
         message=message,
         final_intent=intent,
@@ -693,12 +706,20 @@ def _write_parse_search_request_state(
             "llm_confidence": normalized_state.llm_confidence,
             "fallback_reason": fallback_reason,
             "search_spec": _compact_search_spec(search_spec),
+            "preference_operation": normalized_state.preference_operation,
             "plan": list(plan),
             "warnings": list(normalized_state.warnings),
             "next_actions": list(next_actions),
             "debug": normalized_state.debug,
         },
     )
+
+
+def _compact_paper_reference(reference: Any) -> Optional[Dict[str, Any]]:
+    """日志里只记指代判断的结论，不带论文记录。"""
+    if not isinstance(reference, Mapping):
+        return None
+    return {"status": reference.get("status"), "kind": reference.get("kind"), "keys": reference.get("keys")}
 
 
 def parse_search_request(
@@ -721,8 +742,13 @@ def parse_search_request(
     research_profile = prepared["research_profile"]
 
     # 追问先借最近对话改写成完整的一句；后面的识别、规则和原话依据校验都只面对这句话。
-    # state.message 保持用户原话，对话记录、论文指代解析等仍按原话工作。
-    contextualization = contextualize_request(message, prepared["recent_turns"], generation_service)
+    # 同一次调用顺带判断用户指的是上下文里哪篇论文。state.message 保持用户原话，对话记录仍按原话存。
+    contextualization = contextualize_request(
+        message,
+        prepared["recent_turns"],
+        generation_service,
+        context=current_state.context if isinstance(current_state.context, Mapping) else {},
+    )
     original_message = message
     message = contextualization["message"]
 
@@ -780,6 +806,7 @@ def parse_search_request(
         session_id=current_state.session_id,
         input=original_message,
         contextualized_input=message if contextualization["rewritten"] else None,
+        paper_reference=_compact_paper_reference(contextualization.get("paper_reference")),
         llm_intent=(llm_result or {}).get("intent"),
         llm_confidence=(llm_result or {}).get("confidence"),
         rule_intent=(rule_result or {}).get("intent"),
@@ -787,6 +814,7 @@ def parse_search_request(
         intent_source=decision["intent_source"],
         fallback_reason=finalized["fallback_reason"],
         search_spec=_compact_search_spec(finalized["search_spec"]),
+        preference_operation=(llm_result or {}).get("preference_operation"),
     )
 
     return _write_parse_search_request_state(

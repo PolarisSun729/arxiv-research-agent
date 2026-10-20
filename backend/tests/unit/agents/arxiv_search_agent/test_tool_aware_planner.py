@@ -7,6 +7,7 @@ import sys
 import pytest
 
 from tests.helpers.agent_runtime import load_agent_test_modules
+from utils.agent_planner_limits import AGENT_PLANNER_LIMIT_DEFAULTS
 
 
 _MODULES = load_agent_test_modules()
@@ -65,7 +66,8 @@ def _candidate_tool_names(goal_type: str) -> set[str]:
 def test_arxiv_search_goal_selects_search_related_candidate_tools() -> None:
     tool_names = _candidate_tool_names("arxiv_search")
 
-    assert {"build_arxiv_search_spec", "search_arxiv", "validate_arxiv_results", "personalize_paper_results", "synthesize_arxiv_response"}.issubset(tool_names)
+    assert {"build_arxiv_search_spec", "search_arxiv", "personalize_paper_results", "synthesize_arxiv_response"}.issubset(tool_names)
+    assert "validate_arxiv_results" not in tool_names
 
 
 def test_paper_qa_goal_selects_index_check_and_answer_tools() -> None:
@@ -161,7 +163,7 @@ def test_plan_draft_missing_dependency_conversion_fails() -> None:
         PlanDraftConverter(PLANNER_TOOL_REGISTRY).convert(draft, Goal(goal_type="arxiv_search"))
 
 
-def test_confirmation_required_tool_gets_confirmation_policy() -> None:
+def test_converter_leaves_confirmation_to_contract() -> None:
     draft = PlanDraft(
         draft_id="draft:test",
         plan_intent="paper_qa",
@@ -185,8 +187,9 @@ def test_confirmation_required_tool_gets_confirmation_policy() -> None:
 
     plan = PlanDraftConverter(PLANNER_TOOL_REGISTRY).convert(draft, Goal(goal_type="paper_qa"))
 
-    assert plan.steps[0].confirmation_policy is not None
-    assert plan.steps[0].confirmation_policy.requires_confirmation is True
+    # 计划里不再补 confirmation_policy；要不要确认由执行器按契约判断（I-8）。
+    assert plan.steps[0].confirmation_policy is None
+    assert PLANNER_TOOL_REGISTRY.needs_confirmation("parse_and_index_paper") is True
     assert plan.steps[0].side_effect_level == "external_call"
 
 
@@ -203,6 +206,7 @@ def test_external_search_draft_confirmation_flag_is_ignored() -> None:
     assert search_step.side_effect_level == "external_call"
     # 普通检索的确认策略以 ToolContract 为准；LLM 草稿错标不能把搜索链路拦进确认门。
     assert search_step.confirmation_policy is None
+    assert PLANNER_TOOL_REGISTRY.needs_confirmation("search_arxiv") is False
 
 
 def test_plan_draft_missing_input_bindings_conversion_fails() -> None:
@@ -319,7 +323,6 @@ def _llm_arxiv_plan_json(**overrides) -> str:
             "normalize_request",
             "build_arxiv_search_spec",
             "search_arxiv",
-            "validate_arxiv_results",
             "synthesize_arxiv_response",
         ],
         "steps": [
@@ -365,27 +368,14 @@ def _llm_arxiv_plan_json(**overrides) -> str:
                 "requires_confirmation": False,
             },
             {
-                "step_id": "validate_arxiv_results",
-                "action_type": "validate",
-                "tool_name": "validate_arxiv_results",
-                "step_reason": "validate search quality",
-                "input_bindings": [
-                    {"input_key": "arxiv_results", "source_type": "step_output", "step_id": "search_arxiv"}
-                ],
-                "depends_on": ["search_arxiv"],
-                "expected_output_key": "arxiv_result_quality",
-                "risk_level": "low",
-                "requires_confirmation": False,
-            },
-            {
                 "step_id": "synthesize_arxiv_response",
                 "action_type": "answer",
                 "tool_name": "synthesize_arxiv_response",
                 "step_reason": "produce final user answer",
                 "input_bindings": [
-                    {"input_key": "arxiv_result_quality", "source_type": "step_output", "step_id": "validate_arxiv_results"}
+                    {"input_key": "arxiv_results", "source_type": "step_output", "step_id": "search_arxiv"}
                 ],
-                "depends_on": ["validate_arxiv_results"],
+                "depends_on": ["search_arxiv"],
                 "expected_output_key": "final_answer",
                 "risk_level": "low",
                 "requires_confirmation": False,
@@ -421,7 +411,6 @@ def test_llm_valid_plan_draft_converts_to_executable_plan() -> None:
         "normalize_request",
         "build_arxiv_search_spec",
         "search_arxiv",
-        "validate_arxiv_results",
         "synthesize_arxiv_response",
     ]
     PlanValidator().validate(plan, PLANNER_TOOL_REGISTRY)
@@ -563,7 +552,7 @@ def test_llm_arxiv_bad_build_spec_binding_falls_back_to_rule_based() -> None:
     assert debug["llm_plan_valid"] is False
     assert "normalized_request must come from normalize_request" in debug["llm_plan_invalid_reasons"][0]
     assert debug["selected_plan_source"] == "tool_aware_rule_based"
-    assert _step_ids(plan)[:4] == ["normalize_request", "build_arxiv_search_spec", "search_arxiv", "validate_arxiv_results"]
+    assert _step_ids(plan)[:4] == ["normalize_request", "build_arxiv_search_spec", "search_arxiv", "synthesize_arxiv_response"]
 
 
 def test_llm_non_json_falls_back() -> None:
@@ -625,7 +614,7 @@ def test_llm_persistent_write_without_target_falls_back_to_clarification() -> No
     preference_plan = {
         "draft_id": "llm:preference:test",
         "plan_intent": "preference_action",
-        "selected_tools": ["resolve_preference_target", "update_preference_store", "verify_preference_update", "synthesize_preference_response"],
+        "selected_tools": ["resolve_preference_target", "update_preference_store", "synthesize_preference_response"],
         "steps": [
             {
                 "step_id": "resolve_preference_target",
@@ -653,23 +642,12 @@ def test_llm_persistent_write_without_target_falls_back_to_clarification() -> No
                 "requires_confirmation": False,
             },
             {
-                "step_id": "verify_preference_update",
-                "action_type": "validate",
-                "tool_name": "verify_preference_update",
-                "step_reason": "verify preference",
-                "input_bindings": [{"input_key": "preference_action_result", "source_type": "step_output", "step_id": "update_preference_store"}],
-                "depends_on": ["update_preference_store"],
-                "expected_output_key": "verified_preference_update",
-                "risk_level": "low",
-                "requires_confirmation": False,
-            },
-            {
                 "step_id": "synthesize_preference_response",
                 "action_type": "answer",
                 "tool_name": "synthesize_preference_response",
                 "step_reason": "answer user",
-                "input_bindings": [{"input_key": "verified_preference_update", "source_type": "step_output", "step_id": "verify_preference_update"}],
-                "depends_on": ["verify_preference_update"],
+                "input_bindings": [{"input_key": "preference_action_result", "source_type": "step_output", "step_id": "update_preference_store"}],
+                "depends_on": ["update_preference_store"],
                 "expected_output_key": "final_answer",
                 "risk_level": "low",
                 "requires_confirmation": False,
@@ -697,7 +675,6 @@ def test_llm_preference_target_context_binding_uses_full_state_context() -> None
         "selected_tools": [
             "resolve_preference_target",
             "update_preference_store",
-            "verify_preference_update",
             "synthesize_preference_response",
         ],
         "steps": [
@@ -731,27 +708,14 @@ def test_llm_preference_target_context_binding_uses_full_state_context() -> None
                 "requires_confirmation": True,
             },
             {
-                "step_id": "verify_preference_update",
-                "action_type": "validate",
-                "tool_name": "verify_preference_update",
-                "step_reason": "verify the preference write",
-                "input_bindings": [
-                    {"input_key": "preference_action_result", "source_type": "step_output", "step_id": "update_preference_store"}
-                ],
-                "depends_on": ["update_preference_store"],
-                "expected_output_key": "verified_preference_update",
-                "risk_level": "low",
-                "requires_confirmation": False,
-            },
-            {
                 "step_id": "synthesize_preference_response",
                 "action_type": "answer",
                 "tool_name": "synthesize_preference_response",
                 "step_reason": "summarize the verified result",
                 "input_bindings": [
-                    {"input_key": "verified_preference_update", "source_type": "step_output", "step_id": "verify_preference_update"}
+                    {"input_key": "preference_action_result", "source_type": "step_output", "step_id": "update_preference_store"}
                 ],
-                "depends_on": ["verify_preference_update"],
+                "depends_on": ["update_preference_store"],
                 "expected_output_key": "final_answer",
                 "risk_level": "low",
                 "requires_confirmation": False,
@@ -786,7 +750,7 @@ def test_llm_preference_target_context_binding_uses_full_state_context() -> None
 
 def test_llm_high_risk_tool_missing_confirmation_is_auto_completed() -> None:
     preference_plan = json.loads(_llm_arxiv_plan_json(plan_intent="preference_action"))
-    preference_plan["selected_tools"] = ["resolve_preference_target", "update_preference_store", "verify_preference_update", "synthesize_preference_response"]
+    preference_plan["selected_tools"] = ["resolve_preference_target", "update_preference_store", "synthesize_preference_response"]
     preference_plan["steps"] = [
         {
             "step_id": "resolve_preference_target",
@@ -814,23 +778,12 @@ def test_llm_high_risk_tool_missing_confirmation_is_auto_completed() -> None:
             "requires_confirmation": False,
         },
         {
-            "step_id": "verify_preference_update",
-            "action_type": "validate",
-            "tool_name": "verify_preference_update",
-            "step_reason": "verify write",
-            "input_bindings": [{"input_key": "preference_action_result", "source_type": "step_output", "step_id": "update_preference_store"}],
-            "depends_on": ["update_preference_store"],
-            "expected_output_key": "verified_preference_update",
-            "risk_level": "low",
-            "requires_confirmation": False,
-        },
-        {
             "step_id": "synthesize_preference_response",
             "action_type": "answer",
             "tool_name": "synthesize_preference_response",
             "step_reason": "answer user",
-            "input_bindings": [{"input_key": "verified_preference_update", "source_type": "step_output", "step_id": "verify_preference_update"}],
-            "depends_on": ["verify_preference_update"],
+            "input_bindings": [{"input_key": "preference_action_result", "source_type": "step_output", "step_id": "update_preference_store"}],
+            "depends_on": ["update_preference_store"],
             "expected_output_key": "final_answer",
             "risk_level": "low",
             "requires_confirmation": False,
@@ -850,7 +803,7 @@ def test_llm_high_risk_tool_missing_confirmation_is_auto_completed() -> None:
 
     update_step = next(step for step in plan.steps if step.step_id == "update_preference_store")
     assert debug["llm_plan_valid"] is True
-    assert update_step.confirmation_policy is not None
+    assert update_step.confirmation_policy is None
     assert "update_preference_store" in debug["confirmation_required_steps"]
 
 
@@ -902,7 +855,7 @@ def test_validator_rejects_preference_write_without_target_resolution() -> None:
                 step_id="synthesize_preference_response",
                 action_type="answer",
                 tool_name="synthesize_preference_response",
-                input_bindings=[{"input_key": "verified_preference_update", "source_type": "literal", "value": {"ok": True}}],
+                input_bindings=[{"input_key": "preference_action_result", "source_type": "literal", "value": {"status": "success"}}],
                 depends_on=["update_preference_store"],
                 expected_output_key="final_answer",
             ),
@@ -1025,7 +978,6 @@ def test_rule_based_arxiv_search_generates_valid_executable_plan() -> None:
         "normalize_request",
         "build_arxiv_search_spec",
         "search_arxiv",
-        "validate_arxiv_results",
         "personalize_paper_results",
         "synthesize_arxiv_response",
     ]
@@ -1084,7 +1036,6 @@ def test_planner_runtime_mode_demo_rule_disables_llm_attempt(monkeypatch) -> Non
             "enable_rule_fallback_after_llm_planner": True,
             "enable_template_fallback_planner": True,
             "llm_plan_timeout": 8,
-            "llm_plan_max_steps": 8,
             "expose_planner_debug": True,
         },
     )
@@ -1114,7 +1065,6 @@ def test_planner_runtime_mode_llm_only_strict_raises_on_invalid_llm(monkeypatch)
             "enable_rule_fallback_after_llm_planner": False,
             "enable_template_fallback_planner": False,
             "llm_plan_timeout": 8,
-            "llm_plan_max_steps": 8,
             "expose_planner_debug": True,
         },
     )
@@ -1162,7 +1112,6 @@ def test_rule_based_recommendation_generates_full_plan() -> None:
         "load_user_profile",
         "load_candidate_papers",
         "generate_recommendations",
-        "validate_recommendations",
         "explain_recommendations",
     ]
     assert debug["recommendation_summary"]["mode"] == "agent_orchestration_with_service_core"
@@ -1184,7 +1133,6 @@ def test_rule_based_preference_action_generates_persistent_write_plan() -> None:
     assert _step_ids(plan) == [
         "resolve_preference_target",
         "update_preference_store",
-        "verify_preference_update",
         "synthesize_preference_response",
     ]
     assert plan.steps[1].side_effect_level == "persistent_write"
@@ -1396,10 +1344,11 @@ def test_profile_aware_multi_paper_comparison_reuses_context_candidates_without_
 
     assert debug["selected_plan_source"] == "profile_aware_task_planner"
     assert "search_arxiv" not in _tool_names(plan)
-    assert _step_ids(plan)[:2] == ["validate_arxiv_results", "synthesize_arxiv_response"]
-    validate_step = next(step for step in plan.steps if step.tool_name == "validate_arxiv_results")
-    assert validate_step.input_bindings[0].source_type == "literal"
-    assert len(validate_step.input_bindings[0].value["papers"]) == 2
+    assert _step_ids(plan)[0] == "synthesize_arxiv_response"
+    synthesize_step = next(step for step in plan.steps if step.tool_name == "synthesize_arxiv_response")
+    papers_binding = next(binding for binding in synthesize_step.input_bindings if binding.input_key == "arxiv_results")
+    assert papers_binding.source_type == "literal"
+    assert len(papers_binding.value["papers"]) == 2
     profile_plan = plan.metadata["profile_aware_plan"]
     assert any(item["artifact_id"] == "candidate_papers" for item in profile_plan["planning_diagnostics"]["pruned_artifacts"])
     assert any(item["contribution_type"] == "context_reuse" for item in profile_plan["artifact_step_mapping"])
@@ -1425,7 +1374,7 @@ def test_profile_aware_direction_exploration_uses_enhanced_route_for_high_confid
     artifacts = {item.artifact_type for item in artifact_evidence_plan.artifacts}
     assert {"topic_term_set", "candidate_paper_set", "grounded_summary"}.issubset(artifacts)
     assert artifact_evidence_plan.diagnostics.dependency_order[:2] == ["topic_terms", "candidate_papers"]
-    assert _step_ids(plan)[:4] == ["normalize_request", "build_arxiv_search_spec", "search_arxiv", "validate_arxiv_results"]
+    assert _step_ids(plan)[:4] == ["normalize_request", "build_arxiv_search_spec", "search_arxiv", "synthesize_arxiv_response"]
 
 
 def test_profile_aware_single_paper_deep_read_builds_paper_qa_artifact_plan() -> None:
@@ -1500,3 +1449,105 @@ def test_profile_aware_deep_read_without_target_degrades_to_clarification_route(
     assert debug["profile_aware_planning"]["skip_reason"] == "single_paper_deep_read_missing_target_paper"
     assert "answer_paper_question" not in _tool_names(plan)
     assert {"analyze_ambiguity", "generate_clarification"}.issubset(set(_tool_names(plan)))
+
+
+# ---- 规划预算（D4-3 I-6） ----
+
+
+def _search_state() -> AgentState:
+    return AgentState(intent="arxiv_search", message="search rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="RAG"))
+
+
+def _search_step(step_id: str) -> dict:
+    return {
+        "step_id": step_id,
+        "action_type": "search",
+        "tool_name": "search_arxiv",
+        "step_reason": "search arxiv",
+        "input_bindings": [{"input_key": "search_spec", "source_type": "search_spec"}],
+        "expected_output_key": f"{step_id}_results",
+    }
+
+
+def _index_step(step_id: str, binding: dict | None) -> PlanDraftStep:
+    return PlanDraftStep(
+        step_id=step_id,
+        action_type="retrieve",
+        tool_name="parse_and_index_paper",
+        input_bindings=[{"input_key": "paper_reference", **binding}] if binding else [],
+    )
+
+
+def test_plan_step_budget_is_per_goal_times_goal_count() -> None:
+    plan_step_budget = _current_modules()[0].plan_step_budget
+    default_per_goal = AGENT_PLANNER_LIMIT_DEFAULTS["llm_plan_max_steps_per_goal"]
+
+    assert plan_step_budget({"llm_plan_max_steps_per_goal": 4}, 1) == 4
+    assert plan_step_budget({"llm_plan_max_steps_per_goal": 4}, 3) == 12
+    assert plan_step_budget({"llm_plan_max_steps_per_goal": 4}, 0) == 4
+    assert plan_step_budget({}, 2) == default_per_goal * 2
+    assert plan_step_budget({"llm_plan_max_steps_per_goal": 0}, 1) == default_per_goal
+
+
+def test_llm_draft_step_limit_comes_from_per_goal_budget(monkeypatch) -> None:
+    current_planner = _current_modules()[0]
+    config = dict(current_planner._get_agent_planner_runtime_config())
+    config.update({"enable_llm_plan_draft": True, "planner_runtime_mode": "llm_preferred", "llm_plan_max_steps_per_goal": 3})
+    monkeypatch.setattr(current_planner, "_get_agent_planner_runtime_config", lambda: config)
+
+    _, _, debug = current_planner.build_executable_plan(
+        _search_state(),
+        enable_tool_aware_planner=True,
+        enable_llm_plan_draft=True,
+        llm_generation_service=_FakeLLMPlanService(_llm_arxiv_plan_json()),
+    )
+
+    assert debug["llm_plan_valid"] is False
+    assert "LLM draft exceeds max steps: 4 > 3" in " ".join(debug["llm_plan_invalid_reasons"])
+
+
+def test_llm_draft_with_too_many_search_calls_is_rejected() -> None:
+    payload = json.loads(_llm_arxiv_plan_json())
+    synthesize = payload["steps"][-1]
+    searches = [_search_step(f"search_{index}") for index in range(1, 5)]
+    synthesize["input_bindings"] = [{"input_key": "arxiv_results", "source_type": "step_output", "step_id": "search_4"}]
+    synthesize["depends_on"] = ["search_4"]
+    payload["steps"] = searches + [synthesize]
+
+    _, _, debug = _current_modules()[0].build_executable_plan(
+        _search_state(),
+        enable_tool_aware_planner=True,
+        enable_llm_plan_draft=True,
+        llm_generation_service=_FakeLLMPlanService(json.dumps(payload, ensure_ascii=False)),
+    )
+
+    assert debug["llm_plan_valid"] is False
+    assert "LLM draft exceeds max search_arxiv calls: 4 > 3" in " ".join(debug["llm_plan_invalid_reasons"])
+
+
+def test_llm_draft_indexing_same_paper_twice_is_rejected() -> None:
+    _, current_tool_aware, current_registry = _current_modules()
+
+    def violations(*steps):
+        return current_tool_aware._expensive_tool_budget_violations(
+            list(steps), current_registry.PLANNER_TOOL_REGISTRY, max_search_calls=3, max_index_per_paper=1
+        )
+
+    from_resolve = {"source_type": "step_output", "step_id": "resolve_paper"}
+    assert violations(_index_step("a", from_resolve), _index_step("b", from_resolve)) == [
+        "LLM draft indexes the same paper (step_output:resolve_paper) 2 times > 1"
+    ]
+    # literal 按 arxiv_id 判断，版本号不算不同论文。
+    assert violations(
+        _index_step("a", {"source_type": "literal", "value": {"arxiv_id": "2401.00001"}}),
+        _index_step("b", {"source_type": "literal", "value": "2401.00001v2"}),
+    ) == ["LLM draft indexes the same paper (arxiv:2401.00001) 2 times > 1"]
+    # 认不出是哪篇的，归为同一篇，从严处理。
+    assert violations(_index_step("a", None), _index_step("b", {"source_type": "literal", "value": {}})) == [
+        "LLM draft indexes the same paper (unidentified) 2 times > 1"
+    ]
+    # 不同来源按不同论文放行。
+    assert violations(
+        _index_step("a", from_resolve),
+        _index_step("b", {"source_type": "context", "source_key": "selected_paper"}),
+    ) == []

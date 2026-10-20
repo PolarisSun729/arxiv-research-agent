@@ -199,12 +199,12 @@ await build({
           { message_id: 'm1', session_id: 's-history', role: 'user', content: '找 RAG 论文', response: null, status: 'completed', resume_run_id: null, created_at: '2026-10-14 08:00:00' },
           {
             message_id: 'm2', session_id: 's-history', role: 'assistant', content: '找到 1 篇', status: 'completed', resume_run_id: 'resume-old', created_at: '2026-10-14 08:00:05',
-            response: { session_id: 's-history', intent: 'arxiv_search', answer: '找到 1 篇', interaction: null, papers: [{ arxiv_id: '2401.00001', title: 'RAG' }], plan: [], tool_calls: [], warnings: [], next_actions: [], steps: [], debug: {} }
+            response: { session_id: 's-history', intent: 'arxiv_search', answer: '找到 1 篇', interaction: null, papers: [{ arxiv_id: '2401.00001', title: 'RAG' }], warnings: [] }
           },
           { message_id: 'm3', session_id: 's-history', role: 'user', content: '再找 5 篇', response: null, status: 'completed', resume_run_id: null, created_at: '2026-10-14 08:01:00' }
         ])
         const restoredChat = useAgentSearchChat()
-        assert.equal(await restoredChat.restoreConversation('s-history'), true)
+        assert.equal(await restoredChat.loadConversation('s-history'), true)
         assert.equal(restoredChat.activeSessionId.value, 's-history')
         assert.deepEqual(restoredChat.messages.value.map(message => message.role), ['user', 'assistant', 'user', 'assistant'])
         assert.equal(restoredChat.messages.value[1].createdAt, '2026-10-14T08:00:05Z')
@@ -215,7 +215,7 @@ await build({
         // 没有流水的会话（他人会话或已不存在）不恢复，保持新对话。
         setHistory([])
         const emptyChat = useAgentSearchChat()
-        assert.equal(await emptyChat.restoreConversation('s-missing'), false)
+        assert.equal(await emptyChat.loadConversation('s-missing'), false)
         assert.equal(emptyChat.activeSessionId.value, null)
       } finally {
         globalThis.setTimeout = originalSetTimeout

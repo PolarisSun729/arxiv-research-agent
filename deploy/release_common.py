@@ -36,6 +36,9 @@ SHARED_DIRECTORIES = (
 # 构建机与生产服务器必须完全一致的运行环境。发布包内含预编译 wheel（torch、milvus-lite 等原生扩展），
 # 操作系统、CPU 架构或 Python 小版本不同都会导致 wheel 无法安装或运行时崩溃。
 EXPECTED_RUNTIME = {"system": "Linux", "distribution": "debian", "version": "12", "python": "3.11", "machine": "x86_64"}
+# systemd 直接 exec 的脚本。解压只保留归档里的可执行位，Git 里记成 100644 时
+# 服务器上就是 644，定时任务会以 203/EXEC 失败，所以打包和安装时都要拦下来。
+EXECUTABLE_ENTRYPOINTS = ("backend/07-arxiv-tools/sync_arxiv_oai_since_last_run.sh",)
 
 
 class ReleaseError(RuntimeError):
@@ -151,6 +154,16 @@ def extract_checked(archive_path: Path, destination: Path, *, source_archive: bo
                 target.chmod(0o755 if member.mode & 0o111 else 0o644)
 
 
+def check_executable_entrypoints(directory: Path) -> None:
+    """确认 systemd 入口脚本存在且带可执行位；Windows 提交默认丢可执行位，需用 git update-index --chmod=+x 修正。"""
+    for name in EXECUTABLE_ENTRYPOINTS:
+        path = directory / name
+        if not path.is_file():
+            raise ReleaseError(f"发布包缺少必要文件：{name}")
+        if not path.stat().st_mode & 0o111:
+            raise ReleaseError(f"systemd 入口脚本缺少可执行权限：{name}")
+
+
 def validate_release(directory: Path, commit: str) -> dict:
     """校验解压后的发布目录：清单版本、提交、运行环境、依赖锁哈希和必要文件都必须匹配。
 
@@ -170,6 +183,7 @@ def validate_release(directory: Path, commit: str) -> dict:
     for name in ("backend/main.py", "frontend/dist/index.html"):
         if not (directory / name).is_file():
             raise ReleaseError(f"发布包缺少必要文件：{name}")
+    check_executable_entrypoints(directory)
     # 服务器不联网安装依赖，必须携带离线 wheel 目录。
     if not (directory / ".release/wheels").is_dir():
         raise ReleaseError("发布包缺少离线依赖。")

@@ -145,6 +145,22 @@ def test_research_stream_yields_progress_events_and_verified_result() -> None:
     expected_events = {"research_started", "retrieval_completed", "draft_created", "claim_verification_completed", "research_completed"}
     observed_events = {event["event"] for event in events}
     assert expected_events <= observed_events, f"Missing events: {expected_events - observed_events}"
+    # 时间线要说清做了什么：需求清单、每次决策的选择、检索词与核对后的需求覆盖。
+    analyzed = next(event for event in events if event["event"] == "question_analyzed")
+    assert analyzed["needs"] and analyzed["needs"][0]["number"] == 1
+    decided = [event for event in events if event["event"] == "action_decided"]
+    assert decided[0]["action"] == "search_paper" and decided[0]["need_number"] == 1
+    assert next(event for event in events if event["event"] == "retrieval_completed")["query"]
+    assert "coverage_projected" in observed_events
+    # 每个耗时阶段开始前先报 stage_started，调用方才能在 LLM 调用期间显示"正在做什么"；簿记节点不报。
+    started = [event for event in events if event["event"] == "stage_started"]
+    assert {"prepare", "decide", "search", "draft", "extract_claims", "verify_claims"} <= {event["stage"] for event in started}
+    assert not {"validate", "project_coverage", "finalize"} & {event["stage"] for event in started}
+    assert next(event for event in started if event["stage"] == "search")["retrieval_round"] == 1
+    assert next(event for event in started if event["stage"] == "draft")["draft_attempt"] == 1
+    # 阶段开始必须先于它的完成事件。
+    names = [event.get("stage") or event["event"] for event in events]
+    assert names.index("search") < names.index("retrieval_completed")
 
     assert result is not None, "Generator did not return result"
     # 只收到结束事件仍可能是协议错误触发的拒答，必须验证证据支持与最终答案一起完成。

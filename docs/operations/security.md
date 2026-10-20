@@ -23,7 +23,7 @@
 # 本机开发：生成 .env、开发签名文件、localhost Origin 与内存限流
 python scripts/init_security.py --profile development
 python scripts/manage_users.py create-admin --username admin --email <你的邮箱> --env-file .env
-python backend/main.py --load-mode lazy
+python backend/main.py
 ```
 
 ```bash

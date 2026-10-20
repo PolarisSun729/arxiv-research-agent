@@ -24,7 +24,11 @@ class GuardDecision(BaseModel):
 
 
 class ExecutionGuard:
-    """用参数绑定授权守卫副作用工具，不读取旧 step 批准列表或展示镜像。"""
+    """用参数绑定授权守卫副作用工具，不读取旧 step 批准列表或展示镜像。
+
+    是否需要确认由执行器按工具契约判断（I-8），这里只负责查授权或发起确认；
+    授权绑定参数指纹，参数变了就找不到旧授权，需要重新确认。
+    """
 
     def __init__(self, approval_store: Optional[ApprovalGrantStore]) -> None:
         self.approval_store = approval_store
@@ -39,8 +43,6 @@ class ExecutionGuard:
         reason: str,
     ) -> GuardDecision:
         fingerprint = arguments_fingerprint(arguments)
-        if not step.confirmation_policy or not step.confirmation_policy.requires_confirmation:
-            return GuardDecision(action="execute", arguments_fingerprint=fingerprint)
         plan_id = str((runtime.plan.plan_id if runtime.plan else "") or "").strip()
         user_id = str(state.user_id or "").strip()
         session_id = str(state.session_id or "").strip()

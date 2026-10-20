@@ -147,10 +147,10 @@ ALLOWED_ORIGINS=https://arxiv.001769.xyz
 ALLOW_PUBLIC_REGISTRATION=false
 TRUSTED_PROXY_IPS=127.0.0.1,::1
 AUDIT_LOG_FILE=-
-BACKEND_SERVICE_LOAD_MODE=lazy
+BACKEND_SERVICE_LOAD_MODE=preload
 ENABLE_DEBUG_ROUTES=false
 SAVE_GENERATION_RESULTS=false
-ARXIV_DATA_SOURCE=api
+ARXIV_DATA_SOURCE=local
 ARXIV_PROXY_URL=
 EMBEDDING_PROVIDER=dashscope
 EMBEDDING_MODEL=qwen3-vl-embedding
@@ -169,6 +169,8 @@ MKL_NUM_THREADS=1
 OPENBLAS_NUM_THREADS=1
 TOKENIZERS_PARALLELISM=false
 ```
+
+生产检索走本地 OAI 镜像（`ARXIV_DATA_SOURCE=local`），由每日 `arxiv-oai-sync.timer` 增量同步；设成 `api` 时后端完全不读这个库，定时同步等于白跑，且远程 API 报的命中总数可能多于实际返回条目。
 
 JWT 文件和认证库使用共享目录的绝对路径，避免每个新版本产生新账号库或读不到签名文件。Linux 默认 Milvus Lite，不要从 Windows 复制 `MILVUS_URI=http://localhost:19530`。上述低内存配置关闭 OCR，扫描版 PDF 的识别能力会降低，需根据实际问答效果与内存余量调整。
 

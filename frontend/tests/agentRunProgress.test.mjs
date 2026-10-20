@@ -20,7 +20,8 @@ const {
   createRunProgress,
   finishRunProgress,
   formatElapsed,
-  getActiveEntry
+  getActiveEntry,
+  getActiveSubstep
 } = await import(pathToFileURL(outfile))
 
 let sequence = 0
@@ -42,8 +43,8 @@ const searchState = {
   intent: 'arxiv_search',
   search_spec: { query: 'RAG', submitted_days_ago: 7, max_results: 5, categories: [] },
   execution_plan: [
-    { step_id: 's1', tool_name: 'search_arxiv_structured' },
-    { step_id: 's2', tool_name: 'validate_arxiv_results' }
+    { step_id: 's1', tool_name: 'search_arxiv' },
+    { step_id: 's2', tool_name: 'synthesize_arxiv_response' }
   ],
   // 真实运行中 state.papers 要到收尾才回填，检索步骤结束时快照里仍是 0。
   paper_count: 0
@@ -64,9 +65,9 @@ const done = replay([
   event('step_start', { step: 'select_next_step' }),
   event('step_end', { step: 'select_next_step', status: 'success', state: searchState }),
   event('step_start', { step: 'execute_step' }),
-  event('tool_call_start', { step: 'execute_step', tool_call: { tool_name: 'search_arxiv_structured', status: 'running' } }),
+  event('tool_call_start', { step: 'execute_step', tool_call: { tool_name: 'search_arxiv', status: 'running' } }),
   event('step_end', { step: 'execute_step', status: 'success', state: searchState }),
-  event('tool_call_end', { step: 'execute_step', tool_call: { tool_name: 'validate_arxiv_results', status: 'success', summary: 'continue', result_counts: { papers: 5 } }, state: searchState }),
+  event('tool_call_end', { step: 'execute_step', tool_call: { tool_name: 'synthesize_arxiv_response', status: 'success', summary: 'continue', result_counts: { papers: 5 } }, state: searchState }),
   event('step_start', { step: 'finalize' }),
   event('step_end', { step: 'finalize', status: 'success', state: searchState }),
   event('final_response', { response: { debug: {} } })
@@ -75,11 +76,11 @@ assert.equal(done.status, 'done')
 assert.deepEqual(done.entries.map(entry => entry.label), ['理解你的问题', '制定执行计划', '检索 arXiv 论文', '整理最终回答'])
 assert.ok(done.entries.every(entry => entry.status === 'success'))
 assert.deepEqual(done.entries[0].facts, ['意图：论文检索', '关键词：RAG', '最近 7 天', '最多 5 篇'])
-assert.deepEqual(done.entries[1].facts, ['计划：检索 arXiv 论文 → 校验检索结果'])
+assert.deepEqual(done.entries[1].facts, ['计划：检索 arXiv 论文 → 撰写检索结果摘要'])
 // 数量取自本步输出而不是 state.paper_count；结束事件里被推断成下一步的工具名不能覆盖开始时的工具名；
 // 英文内部摘要不展示。
 assert.deepEqual(done.entries[2].facts, ['检索到 5 篇论文'])
-assert.equal(done.entries[2].toolName, 'search_arxiv_structured')
+assert.equal(done.entries[2].toolName, 'search_arxiv')
 assert.equal(done.entries[2].endedAt - done.entries[2].startedAt, 2000)
 
 // 批准恢复时工具先被预告，随后的 step_start 不能再建一条重复步骤。
@@ -90,6 +91,29 @@ const resumed = replay([
 ])
 assert.equal(resumed.entries.length, 1)
 assert.equal(resumed.entries[0].label, '解析并索引论文全文')
+
+// 显示名优先用后端契约下发的 display_label，缺失时才查前端兜底表，都没有就显示“调用工具 X”。
+const labelled = replay([
+  event('step_start', { step: 'build_plan' }),
+  event('step_end', {
+    step: 'build_plan',
+    status: 'success',
+    state: {
+      execution_plan: [
+        { step_id: 's1', tool_name: 'search_arxiv', display_label: '检索论文（契约名）' },
+        { step_id: 's2', tool_name: 'brand_new_tool' }
+      ]
+    }
+  }),
+  event('step_start', { step: 'execute_step' }),
+  event('tool_call_start', { step: 'execute_step', tool_call: { tool_name: 'brand_new_tool', display_label: '新工具', status: 'running' } }),
+  event('step_end', { step: 'execute_step', status: 'success', state: {} }),
+  // 结束事件可能已指向下一步，它带的显示名不能覆盖开始时的。
+  event('tool_call_end', { step: 'execute_step', tool_call: { tool_name: 'other_tool', display_label: '下一步', status: 'success' } })
+])
+assert.deepEqual(labelled.entries[0].facts, ['计划：检索论文（契约名） → 调用工具 brand_new_tool'])
+assert.equal(labelled.entries[1].label, '新工具')
+assert.equal(labelled.entries[1].toolName, 'brand_new_tool')
 
 // interrupt 会结束当前步骤并提示用户确认。
 const interrupted = replay([
@@ -134,14 +158,15 @@ const ladder = replay([
       status: 'success',
       result_counts: { papers: 5 },
       search_attempts: [
-        { level: 'strict', label: '严格匹配', total_results: 0, ok: true },
-        { level: 'drop_inferred_categories', label: '放开推断的分类范围', total_results: 12, ok: true }
+        // arXiv API 报的命中总数可能多于实际返回条目，时间线按实际收进结果的 new_papers 展示，和回答一致。
+        { level: 'strict', label: '严格匹配', total_results: 4, new_papers: 2, ok: true },
+        { level: 'drop_inferred_categories', label: '放开推断的分类范围', total_results: 12, new_papers: 3, ok: true }
       ]
     }
   })
 ])
 assert.deepEqual(ladder.entries[0].facts, ['意图：论文检索', '关键词：RAG / retrieval-augmented generation', '最近 7 天'])
-assert.deepEqual(ladder.entries[1].facts, ['严格匹配：0 篇', '放开推断的分类范围：12 篇', '检索到 5 篇论文'])
+assert.deepEqual(ladder.entries[1].facts, ['严格匹配：2 篇', '放开推断的分类范围：新增 3 篇', '检索到 5 篇论文'])
 
 console.log('agent run progress tests passed')
 
@@ -155,3 +180,59 @@ const followUp = replay([
   })
 ])
 assert.deepEqual(followUp.entries[0].facts, ['理解为：再多找一些 RAG 的论文，不限时间', '意图：论文检索', '关键词：RAG'])
+
+// 论文问答这类长工具会在执行中途上报内部阶段：新阶段开始时收掉上一阶段，done 只补结果说明，
+// 时间线标题跟着当前阶段走；工具结束时还在跑的阶段一并收尾。
+const qaProgress = (stage, label, status = 'running', detail) => event('tool_progress', {
+  step: 'execute_step',
+  progress: { stage, label, status, ...(detail ? { detail } : {}), step_id: 's3', tool_name: 'answer_paper_question' }
+})
+const qaMidway = replay([
+  event('step_start', { step: 'execute_step' }),
+  event('tool_call_start', { step: 'execute_step', tool_call: { tool_name: 'answer_paper_question', display_label: '基于论文全文回答' } }),
+  qaProgress('prepare', '分析问题、拆分证据需求'),
+  qaProgress('prepare', '', 'done', '拆出 2 个证据需求'),
+  qaProgress('search', '检索论文片段（第 1 轮）', 'running', '查找：方法框架'),
+  qaProgress('search', '', 'done', '新增 8 段证据'),
+  qaProgress('draft', '撰写回答')
+])
+const qaEntry = getActiveEntry(qaMidway)
+assert.equal(qaEntry?.label, '基于论文全文回答')
+assert.deepEqual(qaEntry.substeps.map(item => [item.label, item.status, item.facts]), [
+  ['分析问题、拆分证据需求', 'success', ['拆出 2 个证据需求']],
+  ['检索论文片段（第 1 轮）', 'success', ['查找：方法框架', '新增 8 段证据']],
+  ['撰写回答', 'running', []]
+])
+assert.equal(getActiveSubstep(qaEntry)?.label, '撰写回答')
+
+const qaDone = applyProgressEvent(qaMidway, event('step_end', { step: 'execute_step', status: 'success' }), 99_000)
+assert.ok(qaDone.entries[0].substeps.every(item => item.status === 'success' && item.endedAt))
+assert.equal(getActiveSubstep(qaDone.entries[0]), null)
+
+// 阶段可以附带明细列表（如拆出的各个证据需求），挂在对应子步骤上，由时间线折叠展示。
+const qaWithNeeds = applyProgressEvent(
+  qaMidway,
+  event('tool_progress', {
+    step: 'execute_step',
+    progress: { stage: 'prepare', label: '', status: 'done', items: ['需求 1（核心）：方法框架', '', 3], step_id: 's3' }
+  }),
+  98_000
+)
+assert.deepEqual(getActiveEntry(qaWithNeeds).substeps[0].items, ['需求 1（核心）：方法框架'])
+assert.equal(getActiveEntry(qaWithNeeds).substeps[1].items, undefined)
+
+// 没有运行中的步骤可挂时，迟到的进度帧直接忽略。
+assert.equal(applyProgressEvent(qaDone, qaProgress('verify_claims', '逐条核对原文证据'), 100_000), qaDone)
+
+// 偏好操作的方向来自意图识别，“理解你的问题”直接展示，方向错了用户一眼能看出来。
+const dislike = replay([
+  event('step_start', { step: 'parse_search_request' }),
+  event('step_end', {
+    step: 'parse_search_request',
+    status: 'success',
+    state: { intent: 'preference_action', preference_operation: { action: 'dislike', remove_scope: 'none' } }
+  })
+])
+assert.deepEqual(dislike.entries[0].facts, ['意图：论文偏好操作', '操作：标记为不感兴趣'])
+
+console.log('agent tool progress tests passed')

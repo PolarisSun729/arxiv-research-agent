@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from services.paper_qa.answer_generator import AnswerGenerator
 from services.paper_qa.context_pack_builder import ContextPackBuilder
 from ..errors import PaperEvidenceResearchError
-from ..state import ClaimAssessment, ClaimVerificationRequest, DraftGenerationRequest
+from ..state import AnswerClaim, ClaimAssessment, ClaimVerificationRequest, DraftGenerationRequest
 from .llm_question_analyzer import _extract_json_payload
 from .need_orchestrated_retriever import PaperRetrievalTarget
 
@@ -107,15 +107,31 @@ class _VerificationOutput(BaseModel):
 class ResearchClaimVerifier:
     """独立调用校验可见主张；词面重叠和生成器自报内容都不能充当 supported 真值。"""
 
-    def __init__(self, generation_service: Any) -> None:
+    def __init__(self, generation_service: Any, *, max_attempts: int = 3) -> None:
         self._generation_service = generation_service
+        self._max_attempts = max(1, int(max_attempts))
 
     def verify(self, request: ClaimVerificationRequest) -> dict[str, Any]:
-        if not request.claims:
-            return {"assessments": []}
+        # 没挂引用、或要看图才能核对的主张，结论由规则直接给出（缺少引用不能判 supported、没有看图能力），
+        # 不占模型调用；只有挂了引用的文本主张才需要模型对照证据判断。
+        settled = {
+            claim.claim_id: ClaimAssessment(
+                claim_id=claim.claim_id, verdict="unsupported",
+                missing_facets=["visual_verification" if claim.requires_visual_verification else "citation_ids"],
+            )
+            for claim in request.claims
+            if claim.requires_visual_verification or not claim.citation_ids
+        }
+        claims = [claim for claim in request.claims if claim.claim_id not in settled]
+        judged = self._judge(request, claims) if claims else {}
+        return {"assessments": [
+            (settled.get(claim.claim_id) or judged[claim.claim_id]).model_dump(mode="json") for claim in request.claims
+        ]}
+
+    def _judge(self, request: ClaimVerificationRequest, claims: list[AnswerClaim]) -> dict[str, ClaimAssessment]:
         payload = {
             "question": request.research_question,
-            "claims": [claim.model_dump(mode="json") for claim in request.claims],
+            "claims": [claim.model_dump(mode="json") for claim in claims],
             "evidence": [{"source_id": candidate.candidate_id, "content": candidate.content,
                           "chunk_type": candidate.chunk_type} for candidate in request.candidates],
         }
@@ -131,30 +147,46 @@ class ResearchClaimVerifier:
             "纯视觉主张没有图像校验能力时返回 unsupported。因果推断不能仅凭相关性获支持。\n"
             + json.dumps(payload, ensure_ascii=False)
         )
-        try:
-            raw = self._generation_service.complete_with_qwen(prompt, task_type="research_claim_verification")
-            output = _VerificationOutput.model_validate(_extract_json_payload(raw))
-            known_claims = {claim.claim_id: claim for claim in request.claims}
-            known_evidence = {candidate.candidate_id for candidate in request.candidates}
-            ids = [item.claim_id for item in output.assessments]
-            if set(ids) != set(known_claims) or len(ids) != len(known_claims):
-                raise ValueError("校验响应没有一一覆盖可见主张")
-            for item in output.assessments:
-                if not set(item.supporting_evidence_ids) <= known_evidence:
-                    raise ValueError("校验响应引用了证据包之外的 ID")
-                claim = known_claims[item.claim_id]
-                if claim.requires_visual_verification:
-                    item.verdict = "unsupported"
-                    item.supporting_evidence_ids = []
-                elif item.verdict == "supported" and (
-                    not item.supporting_evidence_ids or set(item.supporting_evidence_ids) != set(claim.citation_ids)
-                ):
-                    # 结构可解析但原引用不匹配时，必须进入图的修复循环，不能直接放行。
-                    item.verdict = "citation_mismatch"
-            return output.model_dump(mode="json")
-        except Exception as exc:
-            # 校验服务不可用属于运行失败，不能伪装成“论文没有答案”并获得正确拒答分数。
-            raise PaperEvidenceResearchError(
-                code="research_verification_failed", stage="claim_verification", message="主张校验未能完成",
-                detail={"error_type": type(exc).__name__},
-            ) from exc
+        feedback = ""
+        error_type, last_error = "", ""
+        for _attempt in range(self._max_attempts):
+            attempt_prompt = prompt + (f"\n上一次输出被拒绝：{feedback}\n请重新返回完整 JSON。" if feedback else "")
+            try:
+                raw = self._generation_service.complete_with_qwen(attempt_prompt, task_type="research_claim_verification")
+            except Exception as exc:
+                # 调用失败不是模型输出的问题，重试时不附带输出反馈。
+                error_type, feedback, last_error = type(exc).__name__, "", str(exc)[:200]
+                continue
+            try:
+                return self._parse_assessments(raw, request, claims)
+            except Exception as exc:
+                error_type, feedback = type(exc).__name__, str(exc)[:600]
+                last_error = feedback
+        # 校验服务不可用属于运行失败，不能伪装成“论文没有答案”并获得正确拒答分数。
+        raise PaperEvidenceResearchError(
+            code="research_verification_failed", stage="claim_verification", message="主张校验未能完成",
+            detail={"error_type": error_type, "error": last_error, "attempts": self._max_attempts},
+        )
+
+    @staticmethod
+    def _parse_assessments(
+        raw: str, request: ClaimVerificationRequest, claims: list[AnswerClaim]
+    ) -> dict[str, ClaimAssessment]:
+        output = _VerificationOutput.model_validate(_extract_json_payload(raw))
+        known_claims = {claim.claim_id: claim for claim in claims}
+        known_evidence = {candidate.candidate_id for candidate in request.candidates}
+        ids = [item.claim_id for item in output.assessments]
+        if set(ids) != set(known_claims) or len(ids) != len(known_claims):
+            missing = sorted(set(known_claims) - set(ids))
+            raise ValueError(f"校验响应没有一一覆盖可见主张，缺少 {missing}" if missing else "校验响应有重复或多余的 claim_id")
+        for item in output.assessments:
+            unknown = sorted(set(item.supporting_evidence_ids) - known_evidence)
+            if unknown:
+                raise ValueError(f"校验响应引用了证据包之外的 ID：{unknown}")
+            claim = known_claims[item.claim_id]
+            if item.verdict == "supported" and (
+                not item.supporting_evidence_ids or set(item.supporting_evidence_ids) != set(claim.citation_ids)
+            ):
+                # 结构可解析但原引用不匹配时，必须进入图的修复循环，不能直接放行。
+                item.verdict = "citation_mismatch"
+        return {item.claim_id: item for item in output.assessments}

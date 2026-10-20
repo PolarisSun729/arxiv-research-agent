@@ -1,4 +1,4 @@
-import type { AgentProgressEntry, AgentProgressStatus, AgentRunProgress, AgentStreamEvent } from '@/types/agent'
+import type { AgentProgressEntry, AgentProgressStatus, AgentProgressSubstep, AgentRunProgress, AgentStreamEvent } from '@/types/agent'
 import { isRecord } from '@/utils/guards'
 
 // 纯簿记节点：耗时极短、对用户没有信息量，只有失败时才露出到时间线。
@@ -18,34 +18,29 @@ const NODE_LABELS: Record<string, string> = {
   __interrupt__: '等待你确认'
 }
 
-// 键是执行计划里的工具名（tool_registry 的 contract 名），部分旧名是后端实际工具名。
+// 显示名以后端工具契约下发的 display_label 为准；这里只在事件缺这个字段时兜底，键是 contract 名。
 const TOOL_LABELS: Record<string, string> = {
   normalize_request: '归一化请求',
   build_arxiv_search_spec: '生成检索条件',
   search_arxiv: '检索 arXiv 论文',
-  search_arxiv_structured: '检索 arXiv 论文',
   rewrite_arxiv_query: '改写检索关键词',
-  validate_arxiv_results: '校验检索结果',
   personalize_paper_results: '按研究画像排序',
   synthesize_arxiv_response: '撰写检索结果摘要',
-  recommend_papers: '生成个性化推荐',
   load_user_profile: '读取研究画像',
   load_candidate_papers: '读取候选论文',
   generate_recommendations: '生成个性化推荐',
-  validate_recommendations: '校验推荐结果',
   explain_recommendations: '整理推荐说明',
   resolve_paper: '定位目标论文',
   check_paper_index: '检查论文全文索引',
-  check_paper_qa_index: '检查论文全文索引',
   parse_and_index_paper: '解析并索引论文全文',
-  build_paper_qa_index: '构建论文问答索引',
   answer_paper_question: '基于论文全文回答',
   assess_paper_qa_quality: '评估回答质量',
   generate_fallback_response: '生成兜底回答',
   resolve_preference_target: '确认偏好目标论文',
   update_preference_store: '更新论文偏好',
-  verify_preference_update: '校验偏好写入',
-  synthesize_preference_response: '整理偏好操作结果'
+  synthesize_preference_response: '整理偏好操作结果',
+  analyze_ambiguity: '分析缺少的信息',
+  generate_clarification: '生成澄清问题'
 }
 
 const INTENT_LABELS: Record<string, string> = {
@@ -60,22 +55,30 @@ const INTENT_LABELS: Record<string, string> = {
   confirmation: '等待确认'
 }
 
+// 偏好方向写反就是把"不感兴趣"标成"感兴趣"，所以识别结果要摆在用户眼前。
+const PREFERENCE_OPERATION_LABELS: Record<string, string> = {
+  like: '标记为感兴趣',
+  dislike: '标记为不感兴趣',
+  'remove:liked': '取消“感兴趣”标记',
+  'remove:disliked': '取消“不感兴趣”标记',
+  'remove:both': '取消偏好标记'
+}
+
 // 这些工具产出的条目数就是用户最关心的中间结果：工具名 -> [输出字段, 文案]。
 const RESULT_COUNT_FACTS: Record<string, [string, (count: number) => string]> = {
   search_arxiv: ['papers', count => `检索到 ${count} 篇论文`],
-  search_arxiv_structured: ['papers', count => `检索到 ${count} 篇论文`],
-  generate_recommendations: ['recommendations', count => `生成 ${count} 条推荐`],
-  recommend_papers: ['recommendations', count => `生成 ${count} 条推荐`]
+  generate_recommendations: ['recommendations', count => `生成 ${count} 条推荐`]
 }
 
-export function getToolLabel(toolName: string | null | undefined) {
+export function getToolLabel(toolName: string | null | undefined, displayLabel?: unknown) {
+  if (typeof displayLabel === 'string' && displayLabel.trim()) return displayLabel.trim()
   const name = String(toolName || '').trim()
   if (!name) return NODE_LABELS.execute_step
   return TOOL_LABELS[name] || `调用工具 ${name}`
 }
 
-function getStepLabel(node: string, toolName?: string | null) {
-  if (node === 'execute_step' && toolName) return getToolLabel(toolName)
+function getStepLabel(node: string, toolName?: string | null, displayLabel?: unknown) {
+  if (node === 'execute_step' && toolName) return getToolLabel(toolName, displayLabel)
   return NODE_LABELS[node] || node
 }
 
@@ -111,6 +114,11 @@ function intentFacts(state: Record<string, any>) {
     facts.push(`理解为：${truncate(state.contextualized_message.trim(), 80)}`)
   }
   if (intent) facts.push(`意图：${INTENT_LABELS[intent] || intent}`)
+  const operation = isRecord(state.preference_operation) ? state.preference_operation : null
+  if (intent === 'preference_action' && operation) {
+    const key = operation.action === 'remove' ? `remove:${operation.remove_scope}` : String(operation.action)
+    if (PREFERENCE_OPERATION_LABELS[key]) facts.push(`操作：${PREFERENCE_OPERATION_LABELS[key]}`)
+  }
   const spec = isRecord(state.search_spec) ? state.search_spec : null
   if (intent === 'arxiv_search' && spec) {
     const concepts = Array.isArray(spec.concepts) ? spec.concepts.filter(isRecord) : []
@@ -137,7 +145,7 @@ function planFacts(state: Record<string, any>) {
   const labels: string[] = []
   for (const step of steps) {
     if (!isRecord(step)) continue
-    const label = step.tool_name ? getToolLabel(step.tool_name) : String(step.action_type || '')
+    const label = step.tool_name ? getToolLabel(step.tool_name, step.display_label) : String(step.action_type || '')
     // 连续重复的步骤（如多次检索）只展示一次，避免计划链过长。
     if (label && labels[labels.length - 1] !== label) labels.push(label)
   }
@@ -147,13 +155,15 @@ function planFacts(state: Record<string, any>) {
 function toolResultFacts(toolCall: Record<string, any> | null, toolName: string | null) {
   const facts: string[] = []
   // 只认后端随 tool_call_end 给出的本步输出条目数；state.paper_count 要到收尾阶段才回填，执行中读到的是 0。
-  // 阶梯检索有多级时逐级列出命中数，让用户看到“严格匹配 0 篇 → 放宽后 N 篇”的过程。
+  // 阶梯检索有多级时逐级列出每级实际收进结果的篇数，让用户看到“严格匹配 0 篇 → 放宽后新增 N 篇”的过程。
+  // 用 new_papers 而不是 total_results：arXiv API 报的命中总数可能多于实际返回的条目，回答里的篇数也按 new_papers 算。
   const attempts = Array.isArray(toolCall?.search_attempts) ? toolCall.search_attempts.filter(isRecord) : []
   if (attempts.length > 1) {
-    for (const attempt of attempts) {
+    attempts.forEach((attempt, index) => {
       const label = String(attempt.label || attempt.level || '检索')
-      facts.push(attempt.ok === false ? `${label}：失败` : `${label}：${Number(attempt.total_results) || 0} 篇`)
-    }
+      const count = Number(attempt.new_papers) || 0
+      facts.push(attempt.ok === false ? `${label}：失败` : `${label}：${index === 0 ? '' : '新增 '}${count} 篇`)
+    })
   }
   const countFact = toolName ? RESULT_COUNT_FACTS[toolName] : undefined
   const counts = isRecord(toolCall?.result_counts) ? toolCall?.result_counts : null
@@ -171,8 +181,58 @@ function toolResultFacts(toolCall: Record<string, any> | null, toolName: string 
   return facts
 }
 
+function closeSubsteps(substeps: AgentProgressSubstep[] | undefined, now: number, lastStatus: AgentProgressStatus = 'success') {
+  if (!substeps?.length) return substeps
+  const lastRunning = substeps.map(substep => substep.status).lastIndexOf('running')
+  return substeps.map((substep, index) => substep.status === 'running'
+    ? { ...substep, status: index === lastRunning ? lastStatus : 'success', endedAt: substep.endedAt ?? now }
+    : substep)
+}
+
 function closeEntry(entry: AgentProgressEntry, status: AgentProgressStatus, now: number): AgentProgressEntry {
-  return { ...entry, status, endedAt: entry.endedAt ?? now }
+  return { ...entry, status, endedAt: entry.endedAt ?? now, substeps: closeSubsteps(entry.substeps, now, status) }
+}
+
+/**
+ * 工具内部阶段：running 表示新阶段开始，同时收掉上一个仍在运行的阶段；
+ * done 只给同名的最近一个阶段收尾并补充结果说明（如"新增 8 段证据"）。
+ */
+function applySubstepProgress(
+  substeps: AgentProgressSubstep[],
+  progress: Record<string, any>,
+  sequence: number,
+  now: number
+): AgentProgressSubstep[] {
+  const stage = typeof progress.stage === 'string' ? progress.stage : ''
+  if (!stage) return substeps
+  const detail = typeof progress.detail === 'string' ? progress.detail.trim() : ''
+  const items = Array.isArray(progress.items)
+    ? progress.items.filter((item: unknown): item is string => typeof item === 'string' && Boolean(item.trim()))
+    : []
+  if (progress.status === 'done') {
+    for (let index = substeps.length - 1; index >= 0; index -= 1) {
+      if (substeps[index].stage !== stage) continue
+      const next = [...substeps]
+      const substep = next[index]
+      next[index] = {
+        ...substep,
+        status: substep.status === 'running' ? 'success' : substep.status,
+        endedAt: substep.endedAt ?? now,
+        facts: mergeFacts(substep.facts, [detail]),
+        ...(items.length ? { items: mergeFacts(substep.items || [], items) } : {})
+      }
+      return next
+    }
+    return substeps
+  }
+  const label = typeof progress.label === 'string' && progress.label.trim() ? progress.label.trim() : stage
+  return [
+    ...(closeSubsteps(substeps, now) || []),
+    {
+      key: `${sequence}-${stage}`, stage, label, status: 'running', facts: detail ? [detail] : [],
+      ...(items.length ? { items } : {}), startedAt: now, endedAt: null
+    }
+  ]
 }
 
 function closeRunningEntries(entries: AgentProgressEntry[], now: number, lastStatus: AgentProgressStatus = 'success') {
@@ -180,6 +240,15 @@ function closeRunningEntries(entries: AgentProgressEntry[], now: number, lastSta
   return entries.map((entry, index) => entry.status === 'running'
     ? closeEntry(entry, index === lastRunning ? lastStatus : 'success', now)
     : entry)
+}
+
+/** 运行中的条目若有正在进行的内部阶段，返回该阶段；时间线标题和慢步骤提示以它为准。 */
+export function getActiveSubstep(entry: AgentProgressEntry | null | undefined) {
+  const substeps = entry?.substeps || []
+  for (let index = substeps.length - 1; index >= 0; index -= 1) {
+    if (substeps[index].status === 'running') return substeps[index]
+  }
+  return null
 }
 
 export function finishRunProgress(progress: AgentRunProgress, now: number, status: 'done' | 'failed' = 'done'): AgentRunProgress {
@@ -225,14 +294,15 @@ export function applyProgressEvent(progress: AgentRunProgress, event: AgentStrea
       const toolCall = isRecord(data.tool_call) ? data.tool_call : null
       const toolName = typeof toolCall?.tool_name === 'string' ? toolCall.tool_name : null
       const targetNode = node || 'execute_step'
+      const label = getStepLabel(targetNode, toolName, toolCall?.display_label)
       const index = findLastEntryIndex(entries, targetNode, true)
       if (index >= 0) {
-        entries[index] = { ...entries[index], toolName, label: getStepLabel(targetNode, toolName) }
+        entries[index] = { ...entries[index], toolName, label }
       } else {
         entries.push({
           key: `${event.sequence}-${targetNode}`,
           node: targetNode,
-          label: getStepLabel(targetNode, toolName),
+          label,
           status: 'running',
           facts: [],
           toolName,
@@ -242,19 +312,27 @@ export function applyProgressEvent(progress: AgentRunProgress, event: AgentStrea
       }
       return { ...progress, entries }
     }
+    case 'tool_progress': {
+      const payload = isRecord(data.progress) ? data.progress : null
+      const index = findLastEntryIndex(entries, node || 'execute_step', true)
+      if (!payload || index < 0) return progress
+      const entry = entries[index]
+      entries[index] = { ...entry, substeps: applySubstepProgress(entry.substeps || [], payload, event.sequence, now) }
+      return { ...progress, entries }
+    }
     case 'tool_call_end': {
       const toolCall = isRecord(data.tool_call) ? data.tool_call : null
       const targetNode = node || 'execute_step'
       const index = findLastEntryIndex(entries, targetNode, false)
       if (index < 0) return progress
       const entry = entries[index]
-      // 结束事件的工具名由执行后的状态推断，可能已指向下一步；优先沿用开始时确定的工具名。
+      // 结束事件的工具名由执行后的状态推断，可能已指向下一步；优先沿用开始时确定的工具名和显示名。
       const toolName = entry.toolName || (typeof toolCall?.tool_name === 'string' && toolCall.tool_name) || null
       const failed = toolCall?.status === 'failed'
       entries[index] = {
         ...entry,
         toolName,
-        label: getStepLabel(targetNode, toolName),
+        label: entry.toolName ? entry.label : getStepLabel(targetNode, toolName, toolCall?.display_label),
         status: failed ? 'failed' : entry.status,
         facts: mergeFacts(entry.facts, toolResultFacts(toolCall, toolName))
       }

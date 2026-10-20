@@ -21,69 +21,11 @@ from .intent_support import _dedupe_preserve_order
 from ..schemas import ToolCallRequest
 from ..state import AgentState
 from ..utils.paper_reference_resolver import _resolve_paper_reference
+from ..utils.preference_action import normalize_preference_operation
 from ..utils.result_utils import _extract_error_message, _result_mapping, _result_ok
 from ..utils.state_utils import _append_step, _coerce_state, _get_execution_plan_step
-from ..utils.text_utils import _matches_any, _normalize_text
+from ..utils.text_utils import _normalize_text
 from .tool_node import execute_tool
-
-
-def _parse_preference_action(message: str) -> Optional[Dict[str, str]]:
-    """从用户输入中提取偏好动作及其移除范围。
-    
-    主要步骤：
-    1. 先归一化文本并处理空输入；
-    2. 识别 remove 场景时进一步区分只撤销 liked、只撤销 disliked，还是两边都删；
-    3. 判断顺序固定为 remove -> dislike -> like，避免“取消喜欢”误命中“喜欢”。
-    
-    输出：返回包含 action 和 remove_scope 的字典；无法识别时返回 None。
-    """
-    text = _normalize_text(message)
-    lowered = text.lower()
-    if not text:
-        return None
-
-    remove_patterns = (
-        r"取消.*喜欢",
-        r"取消.*不喜欢",
-        r"取消.*标记",
-        r"移除.*标记",
-        r"撤销.*喜欢",
-        r"撤销.*不喜欢",
-        r"撤销.*标记",
-        r"\bunlike\b",
-        r"remove\s+like",
-        r"remove\s+dislike",
-    )
-    dislike_patterns = (
-        r"不喜欢",
-        r"不感兴趣",
-        r"标记.*不喜欢",
-        r"标记.*不感兴趣",
-        r"对.*不感兴趣",
-    )
-    like_patterns = (
-        r"喜欢",
-        r"感兴趣",
-        r"标记.*喜欢",
-        r"标记.*感兴趣",
-        r"对.*感兴趣",
-    )
-
-    # 移除偏好时需要知道用户想撤销哪一类标记，默认保守地尝试两边都删除。
-    remove_scope = "both"
-    if _matches_any(text, (r"取消.*喜欢", r"撤销.*喜欢")):
-        remove_scope = "liked"
-    elif _matches_any(text, (r"取消.*不喜欢", r"撤销.*不喜欢")):
-        remove_scope = "disliked"
-
-    # 先判断 remove，再判断 dislike / like，避免“取消喜欢”被误识别成“喜欢”。
-    if _matches_any(text, remove_patterns):
-        return {"action": "remove", "remove_scope": remove_scope}
-    if _matches_any(text, dislike_patterns) or "dislike" in lowered:
-        return {"action": "dislike", "remove_scope": "none"}
-    if _matches_any(text, like_patterns) or "like" in lowered:
-        return {"action": "like", "remove_scope": "none"}
-    return None
 
 
 def _get_plan_step_id(state: AgentState, step_type: str) -> Optional[str]:
@@ -124,7 +66,8 @@ def apply_preference_action(state: Union[AgentState, Mapping[str, Any]]) -> Agen
 
     # 先把偏好动作和论文引用线索拆开；线索未落地到最终论文前不能写入持久化偏好。
     message = _normalize_text(next_state.message or "")
-    parsed_action = _parse_preference_action(message)
+    # 方向取意图识别 LLM 的输出，与 update_preference_store 工具一致。
+    parsed_action = normalize_preference_operation(next_state.preference_operation)
     resolution = _resolve_paper_reference(message, next_state.context or {})
     user_id = str(next_state.user_id or "default").strip() or "default"
     tool_args: Dict[str, Any] = {"user_id": user_id, "message": message}

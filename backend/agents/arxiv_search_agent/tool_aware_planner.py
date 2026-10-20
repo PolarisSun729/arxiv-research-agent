@@ -27,6 +27,7 @@ from .state import AgentState
 from .tool_registry import PLANNER_TOOL_REGISTRY, ToolRegistry
 from .planner_context import build_planner_context
 from services.prompt_context import PromptContextBuilder
+from utils.agent_planner_limits import AGENT_PLANNER_LIMIT_DEFAULTS
 
 
 class PlanDraftConversionError(ValueError):
@@ -57,7 +58,6 @@ class ToolCandidateSelector:
             "normalize_request",
             "build_arxiv_search_spec",
             "search_arxiv",
-            "validate_arxiv_results",
             "rewrite_arxiv_query",
             "personalize_paper_results",
             "synthesize_arxiv_response",
@@ -73,13 +73,11 @@ class ToolCandidateSelector:
             "load_user_profile",
             "load_candidate_papers",
             "generate_recommendations",
-            "validate_recommendations",
             "explain_recommendations",
         },
         "preference_action": {
             "resolve_preference_target",
             "update_preference_store",
-            "verify_preference_update",
             "synthesize_preference_response",
             "analyze_ambiguity",
             "generate_clarification",
@@ -284,9 +282,20 @@ class LLMPlanDraftGenerator:
     不允许 LLM 直接产生 ExecutablePlan 或触达 Executor。
     """
 
-    def __init__(self, generation_service: Optional[Any] = None, *, max_steps: int = 8, timeout_seconds: int = 8) -> None:
+    def __init__(
+        self,
+        generation_service: Optional[Any] = None,
+        *,
+        max_steps: int = AGENT_PLANNER_LIMIT_DEFAULTS["llm_plan_max_steps_per_goal"],
+        timeout_seconds: int = 8,
+        max_search_calls: int = AGENT_PLANNER_LIMIT_DEFAULTS["llm_plan_max_search_calls"],
+        max_index_per_paper: int = AGENT_PLANNER_LIMIT_DEFAULTS["llm_plan_max_index_per_paper"],
+    ) -> None:
         self.generation_service = generation_service
-        self.max_steps = max(1, int(max_steps or 8))
+        # 上限由调用方按 config 传入（planner.plan_step_budget / planner_limit），这里只防非法值。
+        self.max_steps = max(1, int(max_steps or 1))
+        self.max_search_calls = max(1, int(max_search_calls or 1))
+        self.max_index_per_paper = max(1, int(max_index_per_paper or 1))
         self.timeout_seconds = max(1, int(timeout_seconds or 8))
         self.prompt_context_builder = PromptContextBuilder()
         self.last_debug: Dict[str, Any] = {
@@ -295,6 +304,8 @@ class LLMPlanDraftGenerator:
             "invalid_reasons": [],
             "normalized_plan": None,
             "validation_summary": {},
+            # 走到哪一步：llm_call / parse / validate / done；失败时据此区分失败类型（planning_record）。
+            "stage": None,
         }
 
     def generate(
@@ -305,17 +316,21 @@ class LLMPlanDraftGenerator:
         tool_registry: ToolRegistry,
         planner_context: Optional[PlannerContext] = None,
     ) -> PlanDraft:
+        self.last_debug["stage"] = "llm_call"
         if self.generation_service is None:
             raise LLMPlanDraftError("generation service unavailable")
         planner_context = planner_context or _minimal_planner_context(goal, state, tool_registry)
         prompt = self._build_prompt(goal, state, candidate_tools, tool_registry, planner_context)
         raw_text = self._invoke_generation_service(prompt)
+        self.last_debug["stage"] = "parse"
         self.last_debug["raw_llm_plan"] = _safe_debug_text(raw_text)
         self.last_debug["raw_llm_plan_summary"] = _summarize_llm_raw_plan(raw_text)
         payload = self._parse_json_only(raw_text)
         draft = PlanDraft.model_validate(payload)
+        self.last_debug["stage"] = "validate"
         normalized = self._normalize_draft(draft, goal, state, candidate_tools, tool_registry)
         self.last_debug["normalized_plan"] = normalized.model_dump()
+        self.last_debug["stage"] = "done"
         return normalized
 
     def _build_prompt(
@@ -391,6 +406,8 @@ class LLMPlanDraftGenerator:
             },
             "planner_limits": {
                 "max_steps": self.max_steps,
+                "max_search_arxiv_calls": self.max_search_calls,
+                "max_parse_and_index_per_paper": self.max_index_per_paper,
                 # 这里只暴露是否允许规划出 confirmation-required step，
                 # 真正的确认门禁仍由 converter / validator / executor 统一兜底。
                 "allow_human_confirmation": any(tool.requires_confirmation for tool in list(candidate_tools or [])),
@@ -436,7 +453,7 @@ class LLMPlanDraftGenerator:
             "只有 ToolContract.requires_confirmation=true 或 persistent_write 工具才必须标记 requires_confirmation=true；external_call 只写 risk_notes/recovery，不要仅因外部调用要求人工确认。\n"
             "persistent_write 工具只能在目标明确时使用；不确定时选择 clarification 工具。\n"
             "paper_qa 必须先 resolve_paper，再 check_paper_index，再 answer_paper_question。\n"
-            "preference_action 写入必须先 resolve_preference_target，再 update_preference_store，再 verify，再 answer。\n"
+            "preference_action 写入必须先 resolve_preference_target，再 update_preference_store，再 answer。\n"
             "unsupported 请求只能选择 fallback 工具。\n"
             "arxiv_search 的 build_arxiv_search_spec.normalized_request 必须来自 normalize_request 的 step_output；不要绑定 goal.constraints。\n"
             "arxiv_search 的 sort_by 和 sort_order 必须拆成两个字段，不要输出 submittedDate:descending 这类合并字符串。\n"
@@ -494,6 +511,14 @@ class LLMPlanDraftGenerator:
             invalid_reasons.append("LLM draft has no steps")
         if len(steps) > self.max_steps:
             invalid_reasons.append(f"LLM draft exceeds max steps: {len(steps)} > {self.max_steps}")
+        invalid_reasons.extend(
+            _expensive_tool_budget_violations(
+                steps,
+                tool_registry,
+                max_search_calls=self.max_search_calls,
+                max_index_per_paper=self.max_index_per_paper,
+            )
+        )
 
         seen_step_ids: Set[str] = set()
         seen_outputs: Set[str] = set()
@@ -646,7 +671,6 @@ class RuleBasedToolAwarePlanBuilder:
         normalize = self._require_tool(tools_by_name, "normalize_request", required_tags={"search"})
         build_spec = self._require_tool(tools_by_name, "build_arxiv_search_spec", required_tags={"search"})
         search = self._require_tool(tools_by_name, "search_arxiv", required_tags={"search"})
-        validate = self._require_tool(tools_by_name, "validate_arxiv_results", required_tags={"validate"})
         synthesize = self._require_tool(tools_by_name, "synthesize_arxiv_response", required_tags={"answer"})
 
         steps.append(
@@ -680,7 +704,7 @@ class RuleBasedToolAwarePlanBuilder:
                 search,
                 action_type="search",
                 output_key="arxiv_results",
-                reason="search 工具是 arxiv_search 目标的必要外部检索步骤。",
+                reason="search 工具是 arxiv_search 目标的必要外部检索步骤；结果为空或质量低由它自己的失败模式交给恢复层。",
                 depends_on=["build_arxiv_search_spec"],
                 input_bindings=[_binding_dict("search_spec", source_type="step_output", step_id="build_arxiv_search_spec")],
                 retry_policy=(
@@ -690,25 +714,12 @@ class RuleBasedToolAwarePlanBuilder:
                 ),
             )
         )
-        steps.append(
-            self._draft_step(
-                "validate_arxiv_results",
-                validate,
-                action_type="validate",
-                output_key="arxiv_result_quality",
-                reason="用 validate 能力先检查检索质量，后续 response 和 replanner 都依赖这个判断。",
-                depends_on=["search_arxiv"],
-                input_bindings=[_binding_dict("arxiv_results", source_type="step_output", step_id="search_arxiv")],
-            )
-        )
-
         personalize = self._optional_tool(tools_by_name, preferred_name="personalize_paper_results", required_tags={"personalize", "rerank"})
         has_profile_context = _has_any_context_key(state, {"user_memory_summary", "memory_summary", "research_profile"})
-        synthesize_depends_on = ["validate_arxiv_results"]
+        synthesize_depends_on = ["search_arxiv"]
         synthesize_bindings = [
-            _binding_dict("arxiv_result_quality", source_type="step_output", step_id="validate_arxiv_results"),
-            # 回答需要读取阶梯检索记录，才能说明放宽过程或在没结果时列出已尝试的查询。
-            _binding_dict("arxiv_results", source_type="step_output", step_id="search_arxiv", required=False),
+            # 回答需要读取阶梯检索记录，才能说明放宽过程。
+            _binding_dict("arxiv_results", source_type="step_output", step_id="search_arxiv"),
         ]
         if personalize and has_profile_context:
             steps.append(
@@ -831,7 +842,6 @@ class RuleBasedToolAwarePlanBuilder:
         profile = self._require_tool(tools_by_name, "load_user_profile", required_tags={"profile"})
         candidate = self._optional_tool(tools_by_name, preferred_name="load_candidate_papers", required_tags={"recommendation", "retrieve"})
         recommend = self._require_tool(tools_by_name, "generate_recommendations", required_tags={"recommendation"})
-        validate = self._require_tool(tools_by_name, "validate_recommendations", required_tags={"validate", "recommendation"})
         explain = self._require_tool(tools_by_name, "explain_recommendations", required_tags={"answer", "recommendation"})
 
         steps = [
@@ -872,18 +882,9 @@ class RuleBasedToolAwarePlanBuilder:
                     recommend,
                     action_type="search",
                     output_key="recommendation_result",
-                    reason="recommendation 能力负责生成候选推荐，外部调用风险来自 ToolSpec。",
+                    reason="recommendation 能力负责生成候选推荐，外部调用风险来自 ToolSpec；推荐为空即失败，不会把空推荐交给解释步骤。",
                     depends_on=recommend_depends_on,
                     input_bindings=recommend_bindings,
-                ),
-                self._draft_step(
-                    "validate_recommendations",
-                    validate,
-                    action_type="validate",
-                    output_key="validated_recommendations",
-                    reason="推荐结果先校验再解释，避免把空推荐直接交给用户。",
-                    depends_on=["generate_recommendations"],
-                    input_bindings=[_binding_dict("recommendation_result", source_type="step_output", step_id="generate_recommendations")],
                 ),
                 self._draft_step(
                     "explain_recommendations",
@@ -891,8 +892,8 @@ class RuleBasedToolAwarePlanBuilder:
                     action_type="answer",
                     output_key="final_answer",
                     reason="explain 是最终用户回复步骤，缺失时必须 fallback。",
-                    depends_on=["validate_recommendations"],
-                    input_bindings=[_binding_dict("validated_recommendations", source_type="step_output", step_id="validate_recommendations")],
+                    depends_on=["generate_recommendations"],
+                    input_bindings=[_binding_dict("recommendation_result", source_type="step_output", step_id="generate_recommendations")],
                 ),
             ]
         )
@@ -911,7 +912,6 @@ class RuleBasedToolAwarePlanBuilder:
             self._skip_step("update_preference_store", "目标论文不明确，拒绝生成 persistent_write 步骤。")
             return self._build_unclear(goal, state, context, tools_by_name)
         update = self._require_tool(tools_by_name, "update_preference_store", required_tags={"memory_write", "preference"})
-        verify = self._require_tool(tools_by_name, "verify_preference_update", required_tags={"validate", "preference"})
         synthesize = self._require_tool(tools_by_name, "synthesize_preference_response", required_tags={"answer", "preference"})
         if update.side_effect_level != "persistent_write":
             return self._fallback_draft(goal, "preference_action", f"update tool side_effect_level must be persistent_write, got {update.side_effect_level}")
@@ -943,22 +943,13 @@ class RuleBasedToolAwarePlanBuilder:
                 ],
             ),
             self._draft_step(
-                "verify_preference_update",
-                verify,
-                action_type="validate",
-                output_key="verified_preference_update",
-                reason="持久化写入后必须校验结果，再生成用户回复。",
-                depends_on=["update_preference_store"],
-                input_bindings=[_binding_dict("preference_action_result", source_type="step_output", step_id="update_preference_store")],
-            ),
-            self._draft_step(
                 "synthesize_preference_response",
                 synthesize,
                 action_type="answer",
                 output_key="final_answer",
-                reason="把偏好写入结果转换为明确的用户可读反馈。",
-                depends_on=["verify_preference_update"],
-                input_bindings=[_binding_dict("verified_preference_update", source_type="step_output", step_id="verify_preference_update")],
+                reason="把偏好写入结果转换为明确的用户可读反馈；写入失败时 update_preference_store 本身失败，不会走到这里。",
+                depends_on=["update_preference_store"],
+                input_bindings=[_binding_dict("preference_action_result", source_type="step_output", step_id="update_preference_store")],
             ),
         ]
         return self._make_draft(goal, "preference_action", steps)
@@ -1215,17 +1206,6 @@ class PlanDraftConverter:
         if tool.side_effect_level in {"persistent_write", "external_call"} and not _draft_step_has_risk_strategy(draft_step, tool):
             raise PlanDraftConversionError(f"Draft step {draft_step.step_id} uses risky tool {tool_name} without risk strategy")
 
-        confirmation_policy = None
-        if _tool_requires_human_confirmation(tool):
-            # LLM 草稿不是真源：只有 contract 明确要求人工确认的工具才进入确认门，
-            # 避免普通 external_call 检索被模型错标 requires_confirmation 后卡住搜索链路。
-            confirmation_policy = StepPolicy(
-                policy_type="confirmation",
-                mode="explicit_user_confirmation_required",
-                requires_confirmation=True,
-                note=f"{tool_name} requires confirmation before execution",
-            )
-
         return PlanStep(
             step_id=str(draft_step.step_id).strip(),
             action_type=str(draft_step.action_type or "").strip(),
@@ -1236,7 +1216,6 @@ class PlanDraftConverter:
             depends_on=list(draft_step.depends_on or []),
             condition=StepCondition(condition_type="always"),
             retry_policy=draft_step.retry_policy,
-            confirmation_policy=confirmation_policy,
             side_effect_level=tool.side_effect_level,
             status="pending",
         )
@@ -1302,10 +1281,10 @@ def plan_to_draft(plan: ExecutablePlan, *, selected_tools: Sequence[str], fallba
                 risk_level="high" if step.side_effect_level == "persistent_write" else ("medium" if step.side_effect_level == "external_call" else "low"),
                 risk_notes=(
                     f"{step.side_effect_level} step projected from validated legacy template fallback"
-                    if step.side_effect_level in {"persistent_write", "external_call"} or bool(step.confirmation_policy and step.confirmation_policy.requires_confirmation)
+                    if step.side_effect_level in {"persistent_write", "external_call"} or PLANNER_TOOL_REGISTRY.needs_confirmation(step.tool_name)
                     else None
                 ),
-                requires_confirmation=bool(step.confirmation_policy and step.confirmation_policy.requires_confirmation),
+                requires_confirmation=PLANNER_TOOL_REGISTRY.needs_confirmation(step.tool_name),
                 failure_recovery_hint=step.failure_policy.mode if step.failure_policy is not None else None,
                 fallback_reason=fallback_reason,
             )
@@ -1414,6 +1393,60 @@ def _binding_dict(
     }
 
 
+def _expensive_tool_budget_violations(
+    steps: Sequence[PlanDraftStep],
+    tool_registry: ToolRegistry,
+    *,
+    max_search_calls: int,
+    max_index_per_paper: int,
+) -> List[str]:
+    """昂贵工具的次数上限（D4-3 I-6）：search_arxiv 每轮次数、parse_and_index_paper 每篇论文次数。"""
+    reasons: List[str] = []
+    search_calls = sum(1 for step in steps if str(step.tool_name or "").strip() == "search_arxiv")
+    if search_calls > max_search_calls:
+        reasons.append(f"LLM draft exceeds max search_arxiv calls: {search_calls} > {max_search_calls}")
+
+    index_contract = tool_registry.get_contract("parse_and_index_paper")
+    paper_keys = tuple(
+        key
+        for declaration in (index_contract.consumes if index_contract is not None else ())
+        if declaration.semantic_type == "ResolvedPaper"
+        for key in declaration.input_keys
+    ) or ("paper_reference",)
+    index_counts: Dict[str, int] = {}
+    for step in steps:
+        if str(step.tool_name or "").strip() != "parse_and_index_paper":
+            continue
+        paper = _static_paper_identity(step, paper_keys)
+        index_counts[paper] = index_counts.get(paper, 0) + 1
+    for paper, count in index_counts.items():
+        if count > max_index_per_paper:
+            reasons.append(f"LLM draft indexes the same paper ({paper}) {count} times > {max_index_per_paper}")
+    return reasons
+
+
+def _static_paper_identity(step: PlanDraftStep, paper_keys: Sequence[str]) -> str:
+    """不执行计划，只从输入绑定判断建索引的是哪篇论文。
+
+    - literal：取 arxiv_id（去掉版本号），同一 arxiv_id 视为同一篇；
+    - step_output：同一个源步骤产出的论文视为同一篇；
+    - state / context / goal / search_spec：同一个来源键视为同一篇；
+    - 认不出来（没绑定论文输入、literal 里没有 arxiv_id）：全部归为同一篇，宁可多拒绝也不放过重复建索引。
+    不同来源但实际是同一篇（例如 context.selected_paper 和 resolve_paper 解析出的同一篇）静态判断不了，按不同论文放行。
+    """
+    binding = next((item for item in list(step.input_bindings or []) if item.input_key in paper_keys), None)
+    if binding is None:
+        return "unidentified"
+    if binding.source_type == "literal":
+        value = binding.value
+        arxiv_id = value.get("arxiv_id") if isinstance(value, Mapping) else value
+        arxiv_id = re.sub(r"v\d+$", "", str(arxiv_id or "").strip())
+        return f"arxiv:{arxiv_id}" if arxiv_id else "unidentified"
+    if binding.source_type == "step_output":
+        return f"step_output:{str(binding.step_id or '').strip()}"
+    return f"{binding.source_type}:{str(binding.source_key or '').strip()}"
+
+
 def _validate_required_llm_sequence(goal: Goal, steps: Sequence[PlanDraftStep]) -> List[str]:
     """校验 LLM 草稿是否保留关键业务前置步骤。
 
@@ -1446,7 +1479,6 @@ def _validate_required_llm_sequence(goal: Goal, steps: Sequence[PlanDraftStep]) 
             required_tools = [
                 "resolve_preference_target",
                 "update_preference_store",
-                "verify_preference_update",
                 "synthesize_preference_response",
             ]
             for tool_name in required_tools:
@@ -1538,7 +1570,7 @@ def _validate_required_executable_sequence(goal: Goal, steps: Sequence[PlanStep]
             if tool_name not in tool_names:
                 reasons.append(f"paper_qa plan missing required tool {tool_name}")
     if goal_type == "preference_action" and "update_preference_store" in tool_names:
-        for tool_name in ("resolve_preference_target", "verify_preference_update", "synthesize_preference_response"):
+        for tool_name in ("resolve_preference_target", "synthesize_preference_response"):
             if tool_name not in tool_names:
                 reasons.append(f"preference_action plan missing required tool {tool_name}")
     return reasons
@@ -1550,23 +1582,16 @@ def _validate_arxiv_search_executable_sequence(steps: Sequence[PlanStep]) -> Lis
     steps_by_id = {str(step.step_id or "").strip(): step for step in list(steps or []) if str(step.step_id or "").strip()}
     reasons: List[str] = []
     if _is_context_backed_arxiv_sequence(steps):
-        # Artifact skeleton 已经裁剪 candidate_paper_set 时，计划可以直接消费上下文论文；
-        # 但仍必须保留 validate -> synthesize 质量门，不能让回答步骤绕过证据检查。
-        required_tools = ["validate_arxiv_results", "synthesize_arxiv_response"]
-        for tool_name in required_tools:
-            if tool_name not in tool_names:
-                reasons.append(f"context-backed arxiv_search plan missing required tool {tool_name}")
-        reasons.extend(_validate_order(tool_names, required_tools, "context-backed arxiv_search"))
-        synthesize_step = _find_plan_step_by_tool(steps, "synthesize_arxiv_response")
-        if synthesize_step and not _depends_on_tool(synthesize_step, steps, "validate_arxiv_results"):
-            reasons.append("context-backed arxiv_search synthesize_arxiv_response must depend on validate_arxiv_results")
+        # Artifact skeleton 已经裁剪 candidate_paper_set 时，计划直接消费上下文里的非空论文列表，
+        # 不再触发外部检索；回答步骤仍必须存在。
+        if "synthesize_arxiv_response" not in tool_names:
+            reasons.append("context-backed arxiv_search plan missing required tool synthesize_arxiv_response")
         return reasons
 
     required_tools = [
         "normalize_request",
         "build_arxiv_search_spec",
         "search_arxiv",
-        "validate_arxiv_results",
         "synthesize_arxiv_response",
     ]
     for tool_name in required_tools:
@@ -1619,20 +1644,21 @@ def _validate_arxiv_search_executable_sequence(steps: Sequence[PlanStep]) -> Lis
 
 
 def _is_context_backed_arxiv_sequence(steps: Sequence[PlanStep]) -> bool:
+    """没有检索步骤、论文列表以 literal 形式直接来自上下文的搜索计划。"""
     tool_names = {str(step.tool_name or "").strip() for step in list(steps or [])}
     if {"normalize_request", "build_arxiv_search_spec", "search_arxiv"}.intersection(tool_names):
         return False
-    validate_step = _find_plan_step_by_tool(steps, "validate_arxiv_results")
-    if validate_step is None:
-        return False
-    for binding in list(validate_step.input_bindings or []):
-        if str(binding.input_key or "").strip() != "arxiv_results":
+    for step in list(steps or []):
+        if step.tool_name not in {"synthesize_arxiv_response", "personalize_paper_results"}:
             continue
-        if binding.source_type != "literal" or not isinstance(binding.value, Mapping):
-            continue
-        papers = binding.value.get("papers")
-        if isinstance(papers, list) and papers:
-            return True
+        for binding in list(step.input_bindings or []):
+            if str(binding.input_key or "").strip() != "arxiv_results":
+                continue
+            if binding.source_type != "literal" or not isinstance(binding.value, Mapping):
+                continue
+            papers = binding.value.get("papers")
+            if isinstance(papers, list) and papers:
+                return True
     return False
 
 
@@ -1884,15 +1910,6 @@ def _risk_level_for_tool(tool: ToolSpec) -> str:
     if tool.side_effect_level == "external_call" or tool.requires_confirmation:
         return "medium"
     return "low"
-
-
-def _tool_requires_human_confirmation(tool: ToolSpec) -> bool:
-    """判断工具 contract 是否真正需要人工确认。
-
-    PlanDraft 里的 requires_confirmation 可能来自 LLM 对“外部调用风险”的误读；
-    确认门只能由受控 ToolContract 决定，避免普通 arXiv 搜索被错误拦截。
-    """
-    return bool(tool.requires_confirmation or tool.side_effect_level == "persistent_write")
 
 
 __all__ = [

@@ -65,10 +65,6 @@ class PlanValidator:
                     f"does not match tool {step.tool_name} side_effect_level={tool_spec.side_effect_level}"
                 )
 
-            if tool_spec.requires_confirmation and step.confirmation_policy is None:
-                raise PlanValidationError(f"Step {step.step_id} uses confirmation-required tool {step.tool_name} without confirmation_policy")
-            if step.side_effect_level == "persistent_write" and not self._has_confirmation_policy(step):
-                raise PlanValidationError(f"Step {step.step_id} uses persistent_write tool {step.tool_name} without confirmation_policy")
             if step.side_effect_level == "external_call" and not self._has_risk_strategy(step, tool_spec):
                 raise PlanValidationError(f"Step {step.step_id} uses external_call tool {step.tool_name} without retry, failure, recovery, or confirmation policy")
             self._validate_required_inputs(step, tool_spec.input_schema)
@@ -150,12 +146,9 @@ class PlanValidator:
         if binding.source_type == "literal" and binding.required and binding.value is None:
             raise PlanValidationError(f"Step {step.step_id} input {binding.input_key} uses empty required literal")
 
-    def _has_confirmation_policy(self, step: PlanStep) -> bool:
-        return bool(step.confirmation_policy and step.confirmation_policy.requires_confirmation)
-
     def _has_risk_strategy(self, step: PlanStep, tool_spec: Any) -> bool:
         return bool(
-            self._has_confirmation_policy(step)
+            getattr(tool_spec, "requires_confirmation", False)
             or step.retry_policy is not None
             or step.failure_policy is not None
             or bool(getattr(tool_spec, "recovery_policy", None) or {})
@@ -209,7 +202,7 @@ class PlanValidator:
         tool_by_name = {step.tool_name: step for step in steps}
         if "update_preference_store" not in tool_by_name:
             return
-        for tool_name in ("resolve_preference_target", "verify_preference_update", "synthesize_preference_response"):
+        for tool_name in ("resolve_preference_target", "synthesize_preference_response"):
             if tool_name not in tool_by_name:
                 raise PlanValidationError(f"preference_action plan missing required tool {tool_name}")
         update_step = tool_by_name["update_preference_store"]
@@ -218,8 +211,7 @@ class PlanValidator:
         if not self._step_has_binding_from_step(update_step, steps_by_id, "paper_reference", "resolve_preference_target") and not self._step_has_literal_target(update_step, "paper_reference"):
             raise PlanValidationError("preference_action update_preference_store requires explicit paper_reference target")
         self._assert_tool_precedes("resolve_preference_target", "update_preference_store", steps_by_id, steps)
-        self._assert_tool_precedes("update_preference_store", "verify_preference_update", steps_by_id, steps)
-        self._assert_tool_precedes("verify_preference_update", "synthesize_preference_response", steps_by_id, steps)
+        self._assert_tool_precedes("update_preference_store", "synthesize_preference_response", steps_by_id, steps)
 
     def _assert_tool_precedes(self, previous_tool: str, next_tool: str, steps_by_id: Dict[str, PlanStep], steps: List[PlanStep]) -> None:
         position = {step.step_id: index for index, step in enumerate(steps)}

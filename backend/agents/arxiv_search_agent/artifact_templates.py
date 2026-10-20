@@ -247,13 +247,13 @@ def artifact_plan_projection(plan: ArtifactEvidencePlan) -> List[Dict[str, Any]]
 def evidence_tool_mapping(plan: ArtifactEvidencePlan) -> List[Dict[str, Any]]:
     mapping_by_artifact_type = {
         "topic_term_set": ["normalize_request", "build_arxiv_search_spec"],
-        "candidate_paper_set": ["build_arxiv_search_spec", "search_arxiv", "validate_arxiv_results"],
-        "selected_paper_set": ["validate_arxiv_results", "personalize_paper_results", "synthesize_arxiv_response"],
+        "candidate_paper_set": ["build_arxiv_search_spec", "search_arxiv"],
+        "selected_paper_set": ["personalize_paper_results", "synthesize_arxiv_response"],
         "paper_feature_card_set": ["check_paper_index", "answer_paper_question", "assess_paper_qa_quality", "synthesize_arxiv_response"],
-        "comparison_dimension_set": ["validate_arxiv_results", "synthesize_arxiv_response"],
+        "comparison_dimension_set": ["synthesize_arxiv_response"],
         "comparison_matrix": ["synthesize_arxiv_response"],
         "reading_plan": ["personalize_paper_results", "synthesize_arxiv_response"],
-        "gap_hypothesis_set": ["validate_arxiv_results", "synthesize_arxiv_response"],
+        "gap_hypothesis_set": ["synthesize_arxiv_response"],
         "grounded_summary": ["synthesize_arxiv_response", "answer_paper_question"],
         "user_profile_match": ["personalize_paper_results", "synthesize_arxiv_response"],
     }

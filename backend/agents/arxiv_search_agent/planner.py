@@ -8,17 +8,27 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from inspect import signature
+from time import perf_counter
 from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence
 
 from .fallbacks import build_fallback_record
 from .plan_validator import PlanValidator
 from .planner_context import build_planner_context, planner_context_debug
+from .planning_record import (
+    FAILURE_VALIDATION_FAILED,
+    PlanningRecorder,
+    classify_llm_plan_failure,
+    emit_planning_record,
+    failure_reasons,
+    state_run_id,
+)
 from .schemas import ExecutablePlan, Goal, PlanRuntime, PlanStep, StepCondition, StepInputBinding, StepPolicy
 from .state import AgentState
 from .profile_aware_planner import PROFILE_AWARE_TASK_PLANNER_SOURCE, ProfileAwareResearchTaskPlanBuilder, attach_profile_aware_metadata
 from .tool_aware_planner import LLMPlanDraftGenerator, PlanDraftConverter, PlanDraftPlanningError, RuleBasedToolAwarePlanBuilder, ToolCandidateSelector
 from .tool_registry import PLANNER_TOOL_REGISTRY, ToolRegistry
 from .utils.state_utils import _compact_search_spec
+from utils.agent_planner_limits import AGENT_PLANNER_LIMIT_DEFAULTS, planner_limit
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +68,7 @@ def _get_agent_planner_runtime_config() -> Dict[str, Any]:
             "enable_experimental_llm_planner": False,
             "enable_llm_plan_draft": False,
             "llm_plan_timeout": 8,
-            "llm_plan_max_steps": 8,
+            **AGENT_PLANNER_LIMIT_DEFAULTS,
             "enable_artifact_refinement": False,
             "artifact_refinement_timeout": 6,
             "artifact_refinement_max_patches": 12,
@@ -68,6 +78,11 @@ def _get_agent_planner_runtime_config() -> Dict[str, Any]:
             "llm_plan_fallback_to_template": True,
             "expose_planner_debug": True,
         }
+
+
+def plan_step_budget(planner_config: Mapping[str, Any], goal_count: int) -> int:
+    """规划总步数上限 = 每目标步数 × 目标数（D4-3 I-6），总步数不单独配置。"""
+    return planner_limit(planner_config, "llm_plan_max_steps_per_goal") * max(1, int(goal_count or 0))
 
 
 def _normalized_planner_runtime_flags(planner_config: Mapping[str, Any]) -> Dict[str, Any]:
@@ -630,7 +645,7 @@ def _debug_steps_from_plan(plan: ExecutablePlan) -> List[Dict[str, Any]]:
             "adapter": step.tool.adapter,
             "backend_tool_name": step.tool.backend_tool_name,
             "side_effect_level": step.side_effect_level,
-            "requires_confirmation": bool(step.confirmation_policy and step.confirmation_policy.requires_confirmation),
+            "requires_confirmation": PLANNER_TOOL_REGISTRY.needs_confirmation(step.tool_name),
         }
         for step in list(plan.steps or [])
     ]
@@ -649,10 +664,11 @@ def _tool_contract_source_summary(steps: Sequence[PlanStep]) -> Dict[str, Any]:
 
 
 def _confirmation_required_step_ids(plan: ExecutablePlan) -> List[str]:
+    # 和执行器同一口径：按契约判断（I-8），不看计划里的 confirmation_policy。
     return [
         step.step_id
         for step in list(plan.steps or [])
-        if bool(step.confirmation_policy and step.confirmation_policy.requires_confirmation)
+        if PLANNER_TOOL_REGISTRY.needs_confirmation(step.tool_name)
     ]
 
 
@@ -673,12 +689,15 @@ def _fallback_to_template_or_unsupported(
     *,
     reason: str,
     allow_template: bool,
+    recorder: PlanningRecorder,
 ) -> tuple[Goal, ExecutablePlan, Dict[str, Any]]:
     if allow_template:
+        started_at = perf_counter()
         try:
             plan, builder = _build_legacy_template_fallback_plan(goal, state, tool_registry, reason=reason)
             # legacy 模板是最后安全兜底，也必须经过 Validator，不能因为 fallback 就绕过执行边界。
             PlanValidator().validate(plan, tool_registry)
+            recorder.add_attempt("legacy_template", started_at=started_at, ok=True, tools=[step.tool_name for step in plan.steps])
             fallback_record = build_fallback_record(
                 reason,
                 stage="planner",
@@ -705,8 +724,16 @@ def _fallback_to_template_or_unsupported(
             plan, planning_debug = _finalize_plan_debug_and_metadata(goal, plan, planning_debug, runtime_flags)
             return goal, plan, planning_debug
         except Exception as template_exc:
+            recorder.add_attempt(
+                "legacy_template",
+                started_at=started_at,
+                ok=False,
+                failure_kind=FAILURE_VALIDATION_FAILED,
+                reasons=failure_reasons(template_exc, FAILURE_VALIDATION_FAILED),
+            )
             reason = f"{reason}; template fallback failed: {template_exc}"
 
+    started_at = perf_counter()
     unsupported_goal = goal.model_copy(update={"goal_type": "unsupported", "intent": "unsupported", "risk_level": "low"})
     plan, builder = _build_legacy_template_fallback_plan(
         unsupported_goal,
@@ -715,6 +742,7 @@ def _fallback_to_template_or_unsupported(
         reason=reason,
     )
     PlanValidator().validate(plan, tool_registry)
+    recorder.add_attempt("unsupported", started_at=started_at, ok=True, tools=[step.tool_name for step in plan.steps])
     fallback_record = build_fallback_record(
         reason,
         stage="planner",
@@ -740,6 +768,25 @@ def _fallback_to_template_or_unsupported(
     )
     plan, planning_debug = _finalize_plan_debug_and_metadata(unsupported_goal, plan, planning_debug, runtime_flags)
     return unsupported_goal, plan, planning_debug
+
+
+def _record_llm_attempt_failure(recorder: PlanningRecorder, exc: Exception, llm_generator: Any, *, started_at: float) -> None:
+    """按生成器停下的阶段给 LLM 尝试定失败类型；generate 已走完（done）说明是转换或 PlanValidator 没过。"""
+    last_debug = dict(getattr(llm_generator, "last_debug", None) or {})
+    stage = last_debug.get("stage")
+    failure_kind = classify_llm_plan_failure(exc, "validate" if stage == "done" else stage)
+    raw_summary = dict(last_debug.get("raw_llm_plan_summary") or {})
+    # 生成器内部校验的原因单独存成列表；转换 / PlanValidator 的原因从异常里拆。
+    invalid_reasons = list(last_debug.get("invalid_reasons") or []) if stage == "validate" else []
+    recorder.add_attempt(
+        "llm",
+        started_at=started_at,
+        ok=False,
+        failure_kind=failure_kind,
+        reasons=failure_reasons(exc, failure_kind, invalid_reasons=invalid_reasons),
+        tools=list(raw_summary.get("tool_names") or []),
+        step_count=int(raw_summary.get("step_count") or 0),
+    )
 
 
 def _raise_strict_planner_failure(
@@ -791,8 +838,57 @@ def build_executable_plan_for_goal(
 
     build_goal 节点已经把目标作为一等状态写入 AgentState；planning 节点应消费该目标，
     而不是再次从 state 推断，避免图上 goal 节点变成只做展示的空节点。
+    每轮规划留一份 planning_record（D4-7 ⑤），只记录，不影响选哪条路径。
     """
+    recorder = PlanningRecorder(
+        intent=state.intent,
+        goal_type=goal.goal_type,
+        run_id=state_run_id(state),
+        session_id=state.session_id,
+    )
+    try:
+        final_goal, plan, planning_debug = _build_plan_for_goal(
+            goal,
+            state,
+            tool_registry,
+            recorder,
+            enable_tool_aware_planner=enable_tool_aware_planner,
+            enable_llm_plan_draft=enable_llm_plan_draft,
+            enable_artifact_refinement=enable_artifact_refinement,
+            llm_generation_service=llm_generation_service,
+        )
+    except Exception:
+        # llm_only_strict 等路径直接抛错：没有最终计划，也要留下这一轮的尝试。
+        emit_planning_record(recorder.finish(None))
+        raise
+    final_source = planning_debug.get("final_plan_source")
+    record = recorder.finish(_PLAN_RECORD_SOURCES.get(str(final_source or ""), final_source), plan_source_detail=final_source)
+    planning_debug["planning_record"] = record
+    emit_planning_record(record)
+    return final_goal, plan, planning_debug
 
+
+# final_plan_source -> planning_record.plan_source（llm / rule / legacy_template / unsupported）。
+_PLAN_RECORD_SOURCES = {
+    "llm_tool_aware": "llm",
+    "tool_aware_rule_based": "rule",
+    PROFILE_AWARE_TASK_PLANNER_SOURCE: "rule",
+    LEGACY_TEMPLATE_FALLBACK_SOURCE: "legacy_template",
+    UNSUPPORTED_FALLBACK_SOURCE: "unsupported",
+}
+
+
+def _build_plan_for_goal(
+    goal: Goal,
+    state: AgentState,
+    tool_registry: ToolRegistry,
+    recorder: PlanningRecorder,
+    *,
+    enable_tool_aware_planner: Optional[bool],
+    enable_llm_plan_draft: Optional[bool],
+    enable_artifact_refinement: Optional[bool],
+    llm_generation_service: Any,
+) -> tuple[Goal, ExecutablePlan, Dict[str, Any]]:
     planner_config = _get_agent_planner_runtime_config()
     runtime_flags = _normalized_planner_runtime_flags(planner_config)
     if enable_tool_aware_planner is not None:
@@ -862,6 +958,7 @@ def build_executable_plan_for_goal(
             runtime_flags,
             reason=reason,
             allow_template=bool(runtime_flags.get("template_fallback_enabled")),
+            recorder=recorder,
         )
 
     planner_config = _get_agent_planner_runtime_config()
@@ -916,6 +1013,7 @@ def build_executable_plan_for_goal(
             runtime_flags,
             reason=f"missing_required_context: planner_context_build_failed: {exc}",
             allow_template=llm_fallback_to_template,
+            recorder=recorder,
         )
 
     selection = _select_candidate_tools(selector, goal, state, planner_context)
@@ -970,14 +1068,19 @@ def build_executable_plan_for_goal(
             runtime_flags,
             reason="missing_required_context: planner_context_candidate_tools_empty",
             allow_template=llm_fallback_to_template,
+            recorder=recorder,
         )
 
     if llm_enabled:
         planning_debug["llm_plan_attempted"] = True
+        llm_started_at = perf_counter()
         try:
             llm_generator = LLMPlanDraftGenerator(
                 llm_generation_service if llm_generation_service is not None else _resolve_generation_service(),
-                max_steps=int(planner_config.get("llm_plan_max_steps", 8) or 8),
+                # 目标列表还没接入（D4-2），一轮固定按 1 个目标算。
+                max_steps=plan_step_budget(planner_config, goal_count=1),
+                max_search_calls=planner_limit(planner_config, "llm_plan_max_search_calls"),
+                max_index_per_paper=planner_limit(planner_config, "llm_plan_max_index_per_paper"),
                 timeout_seconds=int(planner_config.get("llm_plan_timeout", 8) or 8),
             )
             draft = llm_generator.generate(goal, state, selection.candidate_tools, tool_registry, planner_context)
@@ -987,6 +1090,7 @@ def build_executable_plan_for_goal(
             planning_debug["draft_steps"] = [step.model_dump() for step in list(draft.steps or [])]
             plan = PlanDraftConverter(tool_registry).convert(draft, goal, allowed_tool_names=candidate_tool_names)
             PlanValidator().validate(plan, tool_registry)
+            recorder.add_attempt("llm", started_at=llm_started_at, ok=True, tools=[step.tool_name for step in plan.steps])
             planning_debug.update(
                 {
                     "llm_plan_valid": True,
@@ -1010,6 +1114,7 @@ def build_executable_plan_for_goal(
             plan, planning_debug = _finalize_plan_debug_and_metadata(goal, plan, planning_debug, runtime_flags)
             return goal, plan, planning_debug
         except Exception as exc:
+            _record_llm_attempt_failure(recorder, exc, locals().get("llm_generator"), started_at=llm_started_at)
             invalid_reason = f"llm_planner_validation_failed: {exc}"
             planning_debug["llm_plan_valid"] = False
             planning_debug["llm_plan_invalid_reasons"] = [invalid_reason]
@@ -1044,6 +1149,7 @@ def build_executable_plan_for_goal(
                     runtime_flags,
                     reason=invalid_reason,
                     allow_template=llm_fallback_to_template,
+                    recorder=recorder,
                 )
 
     artifact_refinement_enabled = bool(runtime_flags.get("artifact_refinement_enabled"))
@@ -1058,6 +1164,8 @@ def build_executable_plan_for_goal(
         refinement_timeout_seconds=int(planner_config.get("artifact_refinement_timeout", 6) or 6),
         max_refinement_patches=int(planner_config.get("artifact_refinement_max_patches", 12) or 12),
     )
+    profile_started_at = perf_counter()
+    profile_draft = None
     try:
         profile_draft = profile_builder.build(goal, state, selection.candidate_tools, tool_registry, planner_context)
         planning_debug["profile_aware_planning"] = dict(profile_builder.last_debug or {})
@@ -1078,6 +1186,7 @@ def build_executable_plan_for_goal(
             plan = PlanDraftConverter(tool_registry).convert(profile_draft, goal, allowed_tool_names=candidate_tool_names)
             PlanValidator().validate(plan, tool_registry)
             plan = attach_profile_aware_metadata(plan, profile_draft, profile_builder.last_debug)
+            recorder.add_attempt("rule", started_at=profile_started_at, ok=True, tools=[step.tool_name for step in plan.steps])
             planning_debug.update(
                 {
                     "validation_status": "passed",
@@ -1093,10 +1202,20 @@ def build_executable_plan_for_goal(
             return goal, plan, planning_debug
     except Exception as exc:
         # 增强规划层不能成为执行阻断点；校验失败时保留 debug，然后回到原有 intent-to-tool 规则路线。
+        recorder.add_attempt(
+            "rule",
+            started_at=profile_started_at,
+            ok=False,
+            failure_kind=FAILURE_VALIDATION_FAILED,
+            reasons=failure_reasons(exc, FAILURE_VALIDATION_FAILED),
+            tools=[step.tool_name for step in list(getattr(profile_draft, "steps", None) or [])],
+        )
         profile_debug = dict(getattr(profile_builder, "last_debug", {}) or {})
         profile_debug["error"] = str(exc)
         profile_debug.setdefault("enabled", False)
         planning_debug["profile_aware_planning"] = profile_debug
+    rule_started_at = perf_counter()
+    draft = None
     try:
         rule_builder = RuleBasedToolAwarePlanBuilder()
         draft = rule_builder.build(goal, state, selection.candidate_tools, tool_registry, planner_context)
@@ -1115,6 +1234,7 @@ def build_executable_plan_for_goal(
         planning_debug["draft_steps"] = [step.model_dump() for step in list(draft.steps or [])]
         plan = PlanDraftConverter(tool_registry).convert(draft, goal, allowed_tool_names=candidate_tool_names)
         PlanValidator().validate(plan, tool_registry)
+        recorder.add_attempt("rule", started_at=rule_started_at, ok=True, tools=[step.tool_name for step in plan.steps])
         planning_debug.update(
             {
                 "validation_status": "passed",
@@ -1145,6 +1265,14 @@ def build_executable_plan_for_goal(
         plan, planning_debug = _finalize_plan_debug_and_metadata(goal, plan, planning_debug, runtime_flags)
         return goal, plan, planning_debug
     except Exception as exc:
+        recorder.add_attempt(
+            "rule",
+            started_at=rule_started_at,
+            ok=False,
+            failure_kind=FAILURE_VALIDATION_FAILED,
+            reasons=failure_reasons(exc, FAILURE_VALIDATION_FAILED),
+            tools=[step.tool_name for step in list(getattr(draft, "steps", None) or [])],
+        )
         fallback_reason = f"tool_aware_planner_failed: {exc}"
         return _fallback_to_template_or_unsupported(
             goal,
@@ -1154,6 +1282,7 @@ def build_executable_plan_for_goal(
             runtime_flags,
             reason=fallback_reason,
             allow_template=llm_fallback_to_template,
+            recorder=recorder,
         )
 
 
@@ -1167,4 +1296,5 @@ __all__ = [
     "build_executable_plan",
     "build_executable_plan_for_goal",
     "build_plan_runtime",
+    "plan_step_budget",
 ]

@@ -54,7 +54,6 @@ _LIST_SOURCE_SPECS: Sequence[Dict[str, Any]] = (
     {"path": "recommendations", "source_type": "recommendations", "label": "推荐结果列表", "priority": 80},
     {"path": "candidate_papers", "source_type": "recommendations", "label": "推荐候选列表", "priority": 78},
     {"path": "recommendation_result.recommendations", "source_type": "recommendations", "label": "推荐结果列表", "priority": 76},
-    {"path": "validated_recommendations.recommendations", "source_type": "recommendations", "label": "已校验推荐结果", "priority": 74},
 )
 
 _FOCUS_SOURCE_SPECS: Sequence[Dict[str, Any]] = (
@@ -193,6 +192,97 @@ def resolve_paper_target(
         message=message,
         paper_context=paper_context,
     )
+
+
+def resolve_understood_reference(
+    *,
+    paper_reference: Optional[Mapping[str, Any]],
+    message: str,
+    context: Any,
+    action_type: str = "paper_qa",
+) -> Dict[str, Any]:
+    """把理解阶段 LLM 落地好的论文指代转成目标解析结果。
+
+    paper_reference 由 utils/paper_reference 校验过：papers 里只会是上下文候选里的真实论文。
+    这里只按动作风险决定直接执行、带着假设执行还是追问；没有可用的指代判断时一律追问，
+    不再回退到对原话跑正则。
+    """
+    paper_context = build_paper_context(context)
+    risk_level = _action_risk_level(action_type)
+    reference = dict(paper_reference or {})
+    papers = [dict(paper) for paper in list(reference.get("papers") or []) if isinstance(paper, Mapping)]
+    kind = str(reference.get("kind") or "")
+    hint = {
+        "reference_type": "llm_reference",
+        "value": list(reference.get("keys") or []),
+        "confidence": 0.0,
+        "source": "request_contextualizer",
+        "requires_context": True,
+        "kind": kind or None,
+    }
+    debug = {"context_summary": _context_summary(paper_context), "paper_reference_status": reference.get("status")}
+
+    def _clarify(reason: str, candidates: Sequence[Mapping[str, Any]] = ()) -> Dict[str, Any]:
+        return _build_resolution(
+            status="need_clarification",
+            reference_hint=hint,
+            action_type=action_type,
+            risk_level=risk_level,
+            candidates=candidates,
+            recommended_candidate=None,
+            reason=reason,
+            confidence=0.0,
+            requires_confirmation=False,
+            debug=debug,
+        )
+
+    if _context_expired(context):
+        result = _clarify("context_expired")
+    elif not paper_context.get("all_candidates"):
+        result = _clarify("context_paper_missing")
+    elif reference.get("status") != "success":
+        # LLM 没给出或给错了判断：不猜，追问时把上下文里的论文列出来让用户挑。
+        result = _clarify("reference_understanding_unavailable", paper_context.get("all_candidates") or [])
+    elif kind == "single" and papers:
+        result = _single_candidate_resolution(
+            hint={**hint, "confidence": 0.9},
+            action_type=action_type,
+            risk_level=risk_level,
+            candidates=papers,
+            reason="llm_reference_single",
+            confidence=0.9,
+            debug=debug,
+        )
+    elif kind == "ambiguous" and papers and risk_level != "side_effect":
+        # 问答这类低成本动作：按最可能的那篇执行，并在回答开头说明按哪篇理解，错了用户一句话就能纠正。
+        result = _single_candidate_resolution(
+            hint={**hint, "confidence": 0.6},
+            action_type=action_type,
+            risk_level=risk_level,
+            candidates=papers[:1],
+            reason="llm_reference_ambiguous_assumed",
+            confidence=0.6,
+            debug={**debug, "alternative_candidates": [_candidate_identity_for_log(paper) for paper in papers[1:]]},
+        )
+        result["assumption_note"] = f"我先按《{papers[0].get('title') or papers[0].get('arxiv_id')}》来理解你说的论文，如果不是这篇请告诉我。"
+    elif kind == "ambiguous" and papers:
+        result = _candidate_confirmation_resolution(
+            hint={**hint, "confidence": 0.6},
+            action_type=action_type,
+            risk_level=risk_level,
+            candidates=papers,
+            reason="llm_reference_ambiguous",
+            confidence=0.6,
+            debug=debug,
+        )
+    elif kind == "multiple" and papers:
+        # 当前问答链路一次只针对一篇论文，多篇对比先让用户挑一篇。
+        result = _clarify("reference_multiple_targets", papers)
+    elif kind == "outside":
+        result = _clarify("reference_outside_context")
+    else:
+        result = _clarify("reference_not_mentioned", paper_context.get("all_candidates") or [])
+    return _log_resolution_decision(result, message=message, paper_context=paper_context)
 
 
 def build_paper_context(context: Any) -> Dict[str, Any]:
@@ -944,4 +1034,4 @@ def _context_summary(paper_context: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-__all__ = ["build_paper_context", "resolve_paper_target"]
+__all__ = ["build_paper_context", "resolve_paper_target", "resolve_understood_reference"]

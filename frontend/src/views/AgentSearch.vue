@@ -54,7 +54,7 @@ const {
   restoringConversation,
   startNewConversation,
   refreshChatSessions,
-  restoreConversation,
+  loadConversation,
   switchConversation,
   selectedPaper
 } = useAgentSearchChat()
@@ -81,11 +81,10 @@ onMounted(async () => {
   void store.fetchResearchProfile()
   // 结果卡片上的「已读」读取行为表，进入页面先加载一次。
   store.fetchPaperActions().catch(() => undefined)
-  // URL 指定会话时总是恢复它；带着新问题预填进来的视为开启新对话，不回到上次会话。
+  // 只恢复 URL 指定的会话（刷新、复制链接、浏览器后退）；从菜单进入就是新对话，历史从「历史对话」切回。
   const requestedSessionId = routeSessionId()
-  if (requestedSessionId || !hasPrefill) {
-    const restored = await restoreConversation(requestedSessionId)
-    if (requestedSessionId && !restored) await router.replace({ query: { ...route.query, session: undefined } })
+  if (requestedSessionId && !await loadConversation(requestedSessionId)) {
+    await router.replace({ query: { ...route.query, session: undefined } })
   }
   // 恢复出会话后再启动轮询，这样该会话里仍在跑或已完成待取回的后台任务会接着展示。
   await startWorkContinuationPolling()
@@ -204,13 +203,24 @@ function toAgentUserResultForMessage(response: unknown): AgentUserResult {
   })
 }
 
+// 停在确认卡片上的这一轮本来就没有正文：卡片还在时提示去确认，确认后卡片收起，提示结果在下一条。
+function emptyAnswerText(response: ArxivSearchResponse | null) {
+  if (!response?.interaction) return undefined
+  return visibleInteractionForResponse(response) ? '需要你确认后才会继续，请在下方操作。' : '已处理确认，结果见下一条回复。'
+}
+
 // 回答气泡与论文页共用 RagChatPanel，它靠消息上的 sources / citedSourceIds 渲染正文角标和内嵌图卡；
 // Agent 消息只带完整 response，这里从中取出证据挂到消息上，与证据抽屉同源。
 const chatMessages = computed(() =>
   messages.value.map(item => {
     if (item.role !== 'assistant' || !item.response) return item
     const result = toAgentUserResultForMessage(item.response)
-    return { ...item, sources: result.evidenceSources, citedSourceIds: result.citedSourceIds }
+    return {
+      ...item,
+      sources: result.evidenceSources,
+      citedSourceIds: result.citedSourceIds,
+      emptyText: emptyAnswerText(toAgentResponse(item.response))
+    }
   })
 )
 

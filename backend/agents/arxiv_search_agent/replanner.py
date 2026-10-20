@@ -13,6 +13,20 @@ from .recovery_safety import RecoverySafetyGuard
 from .schemas import ExecutablePlan, ExecutionTrace, Goal, ObservationResult, PlanRuntime, PlanStep
 from .state import AgentState
 from .tool_registry import PLANNER_TOOL_REGISTRY, ToolRegistry
+from utils.agent_planner_limits import planner_limit
+
+
+def _recovery_limits() -> Dict[str, int]:
+    try:
+        from utils.config import get_agent_planner_runtime_config
+
+        config = dict(get_agent_planner_runtime_config())
+    except Exception:
+        config = {}
+    return {
+        key: planner_limit(config, key)
+        for key in ("recovery_max_per_reason", "recovery_max_per_step", "recovery_max_per_turn")
+    }
 
 
 @dataclass(frozen=True)
@@ -35,10 +49,6 @@ class ReplanDecision:
 class Replanner:
     """恢复策略编排器：只串联分类、候选生成、动作选择和 plan patch。"""
 
-    MAX_REASON_REPLANS = 2
-    MAX_STEP_REPLANS = 2
-    MAX_PLAN_REPLANS = 5
-
     def __init__(
         self,
         tool_registry: ToolRegistry = PLANNER_TOOL_REGISTRY,
@@ -50,6 +60,11 @@ class Replanner:
         plan_patcher: Optional[PlanPatcher] = None,
     ) -> None:
         self.tool_registry = tool_registry
+        # 恢复次数上限（D4-3 I-10）来自 config：同一工具同一失败类别 / 同一步 / 每轮总次数。
+        limits = _recovery_limits()
+        self.max_reason_replans = limits["recovery_max_per_reason"]
+        self.max_step_replans = limits["recovery_max_per_step"]
+        self.max_turn_replans = limits["recovery_max_per_turn"]
         self.recovery_policy_registry = recovery_policy_registry
         self.failure_classifier = failure_classifier or FailureClassifier()
         self.recovery_chooser = recovery_chooser or RecoveryChooser(tool_registry=tool_registry)
@@ -76,7 +91,7 @@ class Replanner:
         current_step_count = int(runtime.step_replan_counts.get(failed_or_low_quality_step.step_id, 0) or 0)
         total_replans = sum(int(value or 0) for value in runtime.replan_counts.values())
         # 重规划是质量补救，不是无限重试机制；先做全局限流，再进入策略选择。
-        if current_reason_count >= self.MAX_REASON_REPLANS or current_step_count >= self.MAX_STEP_REPLANS or total_replans >= self.MAX_PLAN_REPLANS:
+        if current_reason_count >= self.max_reason_replans or current_step_count >= self.max_step_replans or total_replans >= self.max_turn_replans:
             limit_reason = f"replan_limit_exceeded:{reason_key}"
             runtime_copy = runtime.model_copy(deep=True)
             runtime_copy.trace.append(
@@ -93,9 +108,9 @@ class Replanner:
                         "reason_replan_count": current_reason_count,
                         "step_replan_count": current_step_count,
                         "turn_replan_count": total_replans,
-                        "max_reason_replans": self.MAX_REASON_REPLANS,
-                        "max_step_replans": self.MAX_STEP_REPLANS,
-                        "max_turn_replans": self.MAX_PLAN_REPLANS,
+                        "max_reason_replans": self.max_reason_replans,
+                        "max_step_replans": self.max_step_replans,
+                        "max_turn_replans": self.max_turn_replans,
                         "fallback_used": True,
                         "fallback_reason": limit_reason,
                     },

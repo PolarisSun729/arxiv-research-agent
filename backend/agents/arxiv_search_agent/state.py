@@ -135,6 +135,11 @@ class AgentState(BaseModel):
     # 例如 selected_paper、last_papers、research_profile、loading_method 等。
     context: Dict[str, Any] = Field(default_factory=dict)
 
+    # [A 执行真源-语义层] 追问改写 LLM 对论文指代的判断，已按候选清单落地成具体论文：
+    # {"status", "kind": none|single|multiple|ambiguous|outside, "keys", "papers", "error"}；
+    # 上下文里没有候选论文时为 None。由执行器注入 resolve_paper，不再从原话里用正则猜指代。
+    paper_reference: Optional[Dict[str, Any]] = None
+
     interaction: Optional[AgentInteraction] = None
 
     # [B 出站响应投影] paper_qa_result 由 _apply_turn_result 从 runtime.outputs 投影得到，
@@ -175,6 +180,10 @@ class AgentState(BaseModel):
     # [B 出站投影] 偏好动作执行后的结果，例如喜欢/不喜欢/取消标记的处理结果；
     # 由 _apply_turn_result 从 runtime.outputs 投影，不作为执行过程真源。
     preference_action_result: Optional[Dict[str, Any]] = None
+
+    # [A 执行真源-语义层] 意图识别 LLM 给出的偏好方向：{"action": like|dislike|remove, "remove_scope": ...}；
+    # 只在 intent 为 preference_action 时有值，由执行器注入 update_preference_store，不从原话再猜一遍。
+    preference_operation: Optional[Dict[str, str]] = None
 
     # debug 保存面向开发排查的中间态与详细错误上下文，不直接面向终端用户。
     debug: Dict[str, Any] = Field(default_factory=dict)

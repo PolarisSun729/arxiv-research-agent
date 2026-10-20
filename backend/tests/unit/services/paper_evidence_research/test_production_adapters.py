@@ -101,12 +101,72 @@ def test_verifier_rejects_supported_label_with_mismatched_citation():
     assert result["assessments"][0]["verdict"] == "citation_mismatch"
 
 
+def test_verifier_settles_uncited_and_visual_claims_without_the_model():
+    prompts = []
+
+    def complete(prompt, **kwargs):
+        prompts.append(prompt)
+        return json.dumps({"assessments": [
+            {"claim_id": "claim-1", "verdict": "supported", "supporting_evidence_ids": ["chunk-1"]},
+        ]})
+
+    request = _verification_request()
+    request.claims += [
+        AnswerClaim(claim_id="claim-uncited", text="没挂引用的结论"),
+        AnswerClaim(claim_id="claim-visual", text="如图所示曲线上升", citation_ids=["chunk-2"],
+                    requires_visual_verification=True),
+    ]
+    result = ResearchClaimVerifier(SimpleNamespace(complete_with_qwen=complete)).verify(request)
+
+    sent_claims = json.loads(prompts[0].rsplit("\n", 1)[-1])["claims"]
+    assert [claim["claim_id"] for claim in sent_claims] == ["claim-1"]
+    # 结论按原主张顺序返回，规则判定的主张同样带上缺失项，供修订提示使用。
+    assert [(item["claim_id"], item["verdict"], item["missing_facets"]) for item in result["assessments"]] == [
+        ("claim-1", "supported", []),
+        ("claim-uncited", "unsupported", ["citation_ids"]),
+        ("claim-visual", "unsupported", ["visual_verification"]),
+    ]
+
+
+def test_verifier_skips_the_model_when_no_claim_has_citations():
+    def complete(prompt, **kwargs):
+        raise AssertionError("不应调用模型")
+
+    request = ClaimVerificationRequest(
+        research_question="方法是什么", draft_version=1,
+        claims=[AnswerClaim(claim_id="claim-1", text="没挂引用的结论")],
+        context_pack=EvidenceContextPack(candidates=[EvidenceCandidate(candidate_id="chunk-1", content="证据一")]),
+    )
+    result = ResearchClaimVerifier(SimpleNamespace(complete_with_qwen=complete)).verify(request)
+
+    assert result["assessments"][0]["verdict"] == "unsupported"
+
+
 @pytest.mark.parametrize("response", ['invalid JSON', '{"assessments": []}'])
 def test_unavailable_verification_is_a_runtime_failure(response):
     provider = SimpleNamespace(complete_with_qwen=lambda *args, **kwargs: response)
     with pytest.raises(PaperEvidenceResearchError) as failure:
         ResearchClaimVerifier(provider).verify(_verification_request())
     assert failure.value.code == "research_verification_failed"
+    # 重试用完才报错，错误原因要写进 detail，否则轨迹里看不出是哪一步坏的。
+    assert failure.value.detail["attempts"] == 3 and failure.value.detail["error"]
+
+
+def test_invalid_verification_output_is_retried_with_feedback():
+    prompts = []
+    replies = iter([
+        json.dumps({"assessments": []}),
+        json.dumps({"assessments": [{"claim_id": "claim-1", "verdict": "supported", "supporting_evidence_ids": ["chunk-1"]}]}),
+    ])
+
+    def complete(prompt, **kwargs):
+        prompts.append(prompt)
+        return next(replies)
+
+    result = ResearchClaimVerifier(SimpleNamespace(complete_with_qwen=complete)).verify(_verification_request())
+
+    assert result["assessments"][0]["verdict"] == "supported"
+    assert "claim-1" in prompts[1].split("上一次输出被拒绝：", 1)[1]
 
 
 def test_uncited_visible_claims_cannot_disappear_before_verification():

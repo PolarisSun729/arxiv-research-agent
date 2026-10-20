@@ -16,6 +16,7 @@ from services.paper_qa.repair_actions import (
     repair_action_input_params,
 )
 from services.paper_qa.qa_observation import build_error_qa_observation
+from .tool_progress import report_tool_progress
 from .tool_result import make_tool_error, make_tool_result, make_tool_trace
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,128 @@ def _apply_qa_recovery_strategy(payload: Dict[str, Any], strategy: Optional[Mapp
         payload["qa_recovery_strategy"] = {**dict(strategy), "repair_actions": sorted(actions), "input_params": input_params}
 
 
+def _clip(text: Any, limit: int = 60) -> str:
+    value = str(text or "").strip()
+    return f"{value[:limit]}…" if len(value) > limit else value
+
+
+_ACTION_LABELS = {"search_paper": "检索", "draft_answer": "撰写回答", "finalize_answer": "定稿", "abstain": "放弃作答"}
+# 门禁拒绝决策的原因；预算类原因出现时研究随即结束，用户需要知道为什么停在这一版。
+_REJECTION_REASONS = {
+    "RETRIEVAL_BUDGET_EXHAUSTED": "检索轮数已用完",
+    "DRAFT_BUDGET_EXHAUSTED": "修订次数已用完",
+    "NO_PROGRESS_LIMIT_REACHED": "继续检索也找不到新证据",
+    "TARGET_NEED_NOT_OPEN": "这个需求已经有证据覆盖",
+    "EVIDENCE_CANDIDATES_EMPTY": "还没有可用的证据",
+    "SEARCH_QUERY_EMPTY": "没有给出检索词",
+}
+
+
+def _need_list(numbers: Any) -> str:
+    return "、".join(f"需求 {int(number)}" for number in numbers or [])
+
+
+def _decision_detail(event: Mapping[str, Any]) -> str:
+    action = event.get("action")
+    if action == "search_paper":
+        return f"→ 检索需求 {event['need_number']}" if event.get("need_number") else "→ 继续检索"
+    if action == "draft_answer":
+        covered = _need_list(event.get("need_numbers"))
+        return ("→ 修订回答" if event.get("revision") else "→ 撰写回答") + (f"，覆盖{covered}" if covered else "")
+    if action == "finalize_answer":
+        return "→ 定稿"
+    if action == "abstain":
+        return "→ 证据不足，放弃作答"
+    return ""
+
+
+def _report_research_progress(event: Mapping[str, Any]) -> None:
+    """把证据研究引擎的阶段事件翻译成给用户看的工具进度；未列出的事件不上报。"""
+    kind = event.get("event")
+    stage = str(event.get("stage") or "")
+    if kind == "stage_started":
+        draft_attempt = int(event.get("draft_attempt") or 1)
+        if stage == "prepare":
+            report_tool_progress(stage, "分析问题、拆分证据需求")
+        elif stage == "decide":
+            report_tool_progress(stage, "规划下一步")
+        elif stage == "search":
+            need = f"需求 {event['need_number']}：" if event.get("need_number") else "查找："
+            report_tool_progress(
+                stage,
+                f"检索论文片段（第 {int(event.get('retrieval_round') or 1)} 轮）",
+                detail=f"{need}{_clip(event['need_description'])}" if event.get("need_description") else None,
+            )
+        elif stage == "draft":
+            report_tool_progress(stage, "撰写回答" if draft_attempt <= 1 else f"修订回答（第 {draft_attempt} 版）")
+        elif stage == "extract_claims":
+            report_tool_progress(stage, "拆分回答要点")
+        elif stage == "verify_claims":
+            report_tool_progress(stage, "逐条核对原文证据")
+    elif kind == "question_analyzed":
+        needs = [need for need in event.get("needs") or [] if isinstance(need, Mapping)]
+        report_tool_progress(
+            "prepare", "", status="done", detail=f"拆出 {int(event.get('need_count') or 0)} 个证据需求",
+            items=[
+                f"需求 {need.get('number')}（{'核心' if need.get('importance') == 'core' else '辅助'}）：{_clip(need.get('description'), 80)}"
+                for need in needs
+            ],
+        )
+    elif kind == "action_decided":
+        detail = _decision_detail(event)
+        if detail:
+            report_tool_progress("decide", "", status="done", detail=detail)
+    elif kind == "action_rejected":
+        action = _ACTION_LABELS.get(str(event.get("action") or ""), "这一步")
+        reason = _REJECTION_REASONS.get(str(event.get("rejection_code") or ""), "决策不合规，需要重新规划")
+        report_tool_progress("decide", "", status="done", detail=f"→ 想{action}，但{reason}")
+    elif kind == "retrieval_completed":
+        if event.get("query"):
+            report_tool_progress("search", "", status="done", detail=f"检索词：{_clip(event['query'])}")
+        duplicates = int(event.get("duplicate_candidate_count") or 0)
+        report_tool_progress(
+            "search", "", status="done",
+            detail=f"新增 {int(event.get('new_candidate_count') or 0)} 段证据" + (f"，{duplicates} 段已有" if duplicates else ""),
+        )
+    elif kind == "draft_created":
+        report_tool_progress("draft", "", status="done")
+    elif kind == "claims_extracted":
+        detail = f"{int(event.get('claim_count') or 0)} 条要点"
+        if event.get("extractor_source") == "rule":
+            # 模型拆分失败退回按标点切句，标题、半句也会当成要点送检，核对结果会偏低。
+            detail += "（模型拆分失败，已按标点切句兜底）"
+        report_tool_progress("extract_claims", "", status="done", detail=detail)
+    elif kind == "claim_verification_completed":
+        supported = int(event.get("supported_count") or 0)
+        total = int(event.get("claim_count") or 0)
+        report_tool_progress(
+            "verify_claims", "", status="done",
+            detail=f"{supported}/{total} 条有原文支持" if total else f"{supported} 条有原文支持",
+        )
+    elif kind == "coverage_projected":
+        total = int(event.get("need_count") or 0)
+        satisfied = len(event.get("satisfied_need_numbers") or [])
+        missing = _need_list(event.get("unsatisfied_need_numbers"))
+        if total:
+            report_tool_progress(
+                "verify_claims", "", status="done",
+                detail=f"需求覆盖 {satisfied}/{total}" + (f"（未覆盖：{missing}）" if missing else ""),
+            )
+
+
+def _answer_with_progress(arxiv_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    # 与 PaperQAService.answer_question 消费同一条执行流，区别只是沿途把阶段进度转给调用方。
+    stream = _get_paper_qa_service().answer_question_with_research_stream(arxiv_id, payload)
+    while True:
+        try:
+            item = next(stream)
+        except StopIteration as stop:
+            return stop.value
+        data = item.get("data") if isinstance(item, Mapping) else None
+        if isinstance(data, Mapping):
+            _report_research_progress(data)
+
+
 def answer_paper_question(
     arxiv_id: str,
     question: str,
@@ -179,7 +302,7 @@ def answer_paper_question(
         # index_strategy 当前只作为 trace/debug 透传，避免恢复路径丢失“为什么复用旧索引”的上下文。
         payload["index_strategy"] = dict(index_strategy)
     try:
-        data = _get_paper_qa_service().answer_question(arxiv_id, payload)
+        data = _answer_with_progress(arxiv_id, payload)
         return make_tool_result(
             ok=True,
             tool_name=tool_name,

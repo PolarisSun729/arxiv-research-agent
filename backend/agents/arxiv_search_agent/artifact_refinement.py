@@ -50,7 +50,6 @@ _KNOWN_TOOL_NAMES = {
     "normalize_request",
     "build_arxiv_search_spec",
     "search_arxiv",
-    "validate_arxiv_results",
     "personalize_paper_results",
     "synthesize_arxiv_response",
     "resolve_paper",

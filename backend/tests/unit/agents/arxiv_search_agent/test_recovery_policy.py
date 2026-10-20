@@ -55,16 +55,45 @@ def test_observer_classifies_empty_search_result() -> None:
     assert "patch_plan" in observation.suggested_recovery_types
 
 
-def test_observer_classifies_low_confidence_validation_result() -> None:
+def test_observer_classifies_empty_search_after_ladder_as_exhausted() -> None:
+    relaxation = {"attempts": [{"level": "strict", "query": "all:rag", "total_results": 0}], "exhausted": True}
     _, _, observation = _observe(
         AgentState(intent="arxiv_search", message="rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="rag")),
-        "validate_arxiv_results",
-        raw_output={"result_count": 2, "warnings": ["tool_failed"]},
+        "search_arxiv",
+        raw_output={"papers": [], "relaxation": relaxation},
+    )
+
+    # 阶梯已在工具内部跑完：仍归为 search_empty，但不再建议 rewrite→search，而是直接兜底。
+    assert observation.status == "empty_result"
+    assert observation.failure_category == "search_empty"
+    assert observation.evidence["ladder_exhausted"] is True
+    assert observation.evidence["relaxation"] == relaxation
+    assert observation.suggested_recovery_types == ["fallback_answer"]
+    assert observation.retryable is False
+
+
+def test_observer_classifies_duplicate_search_results_as_low_confidence() -> None:
+    papers = [{"arxiv_id": f"2401.0000{index}", "title": "RAG survey", "summary": "rag"} for index in range(4)]
+    _, _, observation = _observe(
+        AgentState(intent="arxiv_search", message="rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="rag")),
+        "search_arxiv",
+        raw_output={"papers": papers},
     )
 
     assert observation.status == "low_confidence"
     assert observation.failure_category == "search_low_confidence"
     assert observation.retryable is True
+
+
+def test_observer_classifies_empty_recommendations_as_recommendation_empty() -> None:
+    _, _, observation = _observe(
+        AgentState(intent="recommendation", message="recommend rag papers", context={}),
+        "generate_recommendations",
+        raw_output={"recommendations": []},
+    )
+
+    assert observation.status == "empty_result"
+    assert observation.failure_category == "recommendation_empty"
 
 
 def test_observer_classifies_missing_paper_index_as_user_input_recovery() -> None:
@@ -100,8 +129,13 @@ def test_recovery_policies_generate_explainable_candidates() -> None:
         ),
         (
             AgentState(intent="arxiv_search", message="rag", search_spec=ArxivSearchSpec(intent="arxiv_search", query="rag")),
-            "validate_arxiv_results",
+            "search_arxiv",
             ObservationResult(status="low_confidence", reason="low", failure_category="search_low_confidence"),
+        ),
+        (
+            AgentState(intent="recommendation", message="recommend rag papers", context={}),
+            "generate_recommendations",
+            ObservationResult(status="empty_result", reason="recommendations_empty", failure_category="recommendation_empty"),
         ),
         (
             AgentState(intent="paper_qa", message="method?", context={"selected_paper": {"arxiv_id": "2401.00001"}}),
@@ -306,3 +340,21 @@ def test_tool_timeout_policy_differs_by_tool_type() -> None:
 
     assert search_candidates[0].action_type == "retry_step"
     assert pref_candidates[0].action_type == "fallback_answer"
+
+
+def test_preference_write_failure_is_tool_failure_routed_to_fallback() -> None:
+    preference_adapters = importlib.import_module("backend.agents.arxiv_search_agent.tool_adapters.preference")
+
+    def failing_backend(tool_name: str, **kwargs):
+        return {"ok": False, "tool_name": tool_name, "error": {"code": "db_unavailable", "message": "写入失败"}}
+
+    adapter = preference_adapters.UpdatePreferenceStoreAdapter(failing_backend)
+    result = adapter.execute(
+        preference_adapters.UpdatePreferenceStoreInput(paper_reference={"arxiv_id": "2401.00001"}, message="喜欢这篇论文", preference_operation={"action": "like"})
+    )
+
+    # 原 verify_preference_update 质量门并入写入工具：写入失败即工具失败，归为 tool_runtime_error，不再走澄清。
+    assert result.ok is False
+    assert result.error.error_code == "db_unavailable"
+    assert result.error.suggested_recovery == "fallback_answer"
+    assert observer_module._tool_failure_category(result.error.error_code, result.error.suggested_recovery) == "tool_runtime_error"

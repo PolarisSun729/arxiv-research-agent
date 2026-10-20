@@ -343,6 +343,8 @@ def _ensure_dependency_stubs() -> None:
                 "other": {"vector_original": 0.95, "vector_rewrite": 0.95, "keyword": 0.95},
             }
         }
+    from utils.agent_planner_limits import AGENT_PLANNER_LIMIT_DEFAULTS
+
     config_module.get_agent_planner_runtime_config = lambda: {
         "planner_runtime_mode": "rule_only",
         # 单元测试默认覆盖正式规则型 planner；legacy template fallback 只在显式关闭或失败测试中触发。
@@ -352,7 +354,7 @@ def _ensure_dependency_stubs() -> None:
         "enable_llm_recovery_diagnosis": False,
         "llm_recovery_timeout": 6,
         "llm_plan_timeout": 8,
-        "llm_plan_max_steps": 8,
+        **AGENT_PLANNER_LIMIT_DEFAULTS,
         "enable_artifact_refinement": False,
         "artifact_refinement_timeout": 6,
         "artifact_refinement_max_patches": 12,
