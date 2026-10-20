@@ -54,7 +54,7 @@ const {
   restoringConversation,
   startNewConversation,
   refreshChatSessions,
-  restoreConversation,
+  loadConversation,
   switchConversation,
   selectedPaper
 } = useAgentSearchChat()
@@ -81,11 +81,10 @@ onMounted(async () => {
   void store.fetchResearchProfile()
   // 结果卡片上的「已读」读取行为表，进入页面先加载一次。
   store.fetchPaperActions().catch(() => undefined)
-  // URL 指定会话时总是恢复它；带着新问题预填进来的视为开启新对话，不回到上次会话。
+  // 只恢复 URL 指定的会话（刷新、复制链接、浏览器后退）；从菜单进入就是新对话，历史从「历史对话」切回。
   const requestedSessionId = routeSessionId()
-  if (requestedSessionId || !hasPrefill) {
-    const restored = await restoreConversation(requestedSessionId)
-    if (requestedSessionId && !restored) await router.replace({ query: { ...route.query, session: undefined } })
+  if (requestedSessionId && !await loadConversation(requestedSessionId)) {
+    await router.replace({ query: { ...route.query, session: undefined } })
   }
   // 恢复出会话后再启动轮询，这样该会话里仍在跑或已完成待取回的后台任务会接着展示。
   await startWorkContinuationPolling()

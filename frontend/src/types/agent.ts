@@ -250,13 +250,16 @@ export interface AgentResumeRun {
   result_retrieved_at: string | null
 }
 
+// 落库的回答只保留回放要用的字段，执行过程类字段（工具调用、步骤等）不随流水下发。
+export type AgentReplayResponse = Omit<ArxivSearchResponse, 'plan' | 'tool_calls' | 'next_actions' | 'steps'>
+
 // 后端持久化的对话流水，只用于刷新后还原聊天气泡。
 export interface AgentStoredChatMessage {
   message_id: string
   session_id: string
   role: 'user' | 'assistant'
   content: string
-  response: ArxivSearchResponse | null
+  response: AgentReplayResponse | null
   status: 'completed' | 'error'
   resume_run_id: string | null
   created_at: string

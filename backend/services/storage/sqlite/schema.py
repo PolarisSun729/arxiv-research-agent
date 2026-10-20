@@ -1,5 +1,8 @@
+import json
+
 from services.storage.sqlite.connection import SqliteConnectionProvider
 from services.storage.sqlite.shared import DEFAULT_USER_ID, logger, sql_placeholders
+from services.storage.sqlite.stores.agent_chat_messages import to_replay_response
 
 
 class StorageSchemaMigrator:
@@ -702,9 +705,26 @@ class StorageSchemaMigrator:
             ''')
 
             self._drop_retired_paper_signals(cursor)
+            self._slim_agent_chat_responses(cursor)
 
             conn.commit()
             logger.info("Database tables initialized successfully")
+
+    @staticmethod
+    def _slim_agent_chat_responses(cursor) -> None:
+        """把旧库里整份落库的 Agent 响应裁成回放子集；裁过的行不再带 tool_calls，重复启动不会再扫到。"""
+        rows = cursor.execute(
+            "SELECT message_id, response_json FROM agent_chat_messages WHERE response_json LIKE '%\"tool_calls\"%'"
+        ).fetchall()
+        for message_id, response_json in rows:
+            try:
+                response = json.loads(response_json)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            cursor.execute(
+                "UPDATE agent_chat_messages SET response_json = ? WHERE message_id = ?",
+                (json.dumps(to_replay_response(response), ensure_ascii=False), message_id),
+            )
 
     @staticmethod
     def _drop_retired_paper_signals(cursor) -> None:
