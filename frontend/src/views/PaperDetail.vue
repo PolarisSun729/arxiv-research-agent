@@ -17,6 +17,7 @@ import { buildRemovedClaimsView } from '@/utils/researchProcess'
 import { usePaperRagChat } from '@/composables/usePaperRagChat'
 import { useUserContext } from '@/composables/useUserContext'
 import { usePaperStore } from '@/stores/paperStore'
+import { useAbstractTranslation } from '@/composables/useAbstractTranslation'
 import { qaTurnToRagMessages } from '@/types/ragChat'
 import { downloadApiFile } from '@/api/auth'
 import { getErrorMessage } from '@/api/errors'
@@ -40,6 +41,7 @@ const { isAdmin, canResearch } = useUserContext()
 const paperId = computed(() => route.params.id as string)
 const loading = ref(true)
 const abstractExpanded = ref(false)
+const { displaySummary, isTranslating, translateButtonText, toggleTranslation } = useAbstractTranslation()
 const qaMode = ref(false)
 const creatingIndex = ref(false)
 const qaIndexJob = ref<QaIndexJobResult | null>(null)
@@ -552,15 +554,25 @@ watch(paperId, async () => {
               <el-icon><Document /></el-icon>
               摘要
             </div>
-            <p :class="['abstract-text', { 'clamp-abstract': !abstractExpanded }]">{{ store.currentPaper.summary }}</p>
-            <button
-              v-if="(store.currentPaper.summary || '').length > 420"
-              type="button"
-              class="link-btn"
-              @click="abstractExpanded = !abstractExpanded"
-            >
-              {{ abstractExpanded ? '收起' : '展开全文' }}
-            </button>
+            <p :class="['abstract-text', { 'clamp-abstract': !abstractExpanded }]">{{ displaySummary(store.currentPaper.arxivId, store.currentPaper.summary) }}</p>
+            <div v-if="store.currentPaper.summary" class="abstract-actions">
+              <button
+                v-if="store.currentPaper.summary.length > 420"
+                type="button"
+                class="link-btn"
+                @click="abstractExpanded = !abstractExpanded"
+              >
+                {{ abstractExpanded ? '收起' : '展开全文' }}
+              </button>
+              <button
+                type="button"
+                class="link-btn"
+                :disabled="isTranslating(store.currentPaper.arxivId)"
+                @click="toggleTranslation(store.currentPaper.arxivId)"
+              >
+                {{ translateButtonText(store.currentPaper.arxivId) }}
+              </button>
+            </div>
           </div>
         </div>
 
@@ -1025,6 +1037,17 @@ watch(paperId, async () => {
 
 .link-btn:hover {
   text-decoration: underline;
+}
+
+.link-btn:disabled {
+  color: var(--color-text-3);
+  cursor: default;
+  text-decoration: none;
+}
+
+.abstract-actions {
+  display: flex;
+  gap: 14px;
 }
 
 .hero-aside {
