@@ -211,6 +211,52 @@ def test_resume_run_buffers_node_progress_before_completing(tmp_path, monkeypatc
     assert manager.progress_events(claimed["resume_run_id"], after=1) == progress_seen_at_completion[1:]
 
 
+def test_resume_run_writes_answer_back_to_session_memory(tmp_path, monkeypatch) -> None:
+    """续跑完成后会话记忆要换成续跑的问答结果，下一轮追问才能找到上一轮问答的论文。"""
+    storage = build_storage_container(db_path=str(tmp_path / "session-memory.sqlite"))
+    _prepare_ready_continuation(storage)
+    final_values = {
+        "user_id": "user-1",
+        "session_id": "session-1",
+        "intent": "paper_qa",
+        "answer": "续跑后的回答",
+        "paper_qa_result": {"status": "answered", "arxiv_id": "2401.00001", "answer": "续跑后的回答"},
+    }
+
+    class _GraphAnswered:
+        def get_state(self, _config):
+            return {"values": {"intent": "paper_qa"}, "next": ("finalize",)}
+
+        def stream(self, command, config=None, stream_mode=None):
+            yield ("updates", {"finalize": final_values})
+
+    from backend.agents.arxiv_search_agent import service as runtime_service_module
+
+    saved_states = []
+
+    class _RecordingMemoryService:
+        def save_agent_memory(self, *, user_id, session_id, final_state):
+            saved_states.append({"user_id": user_id, "session_id": session_id, "final_state": final_state})
+
+    monkeypatch.setattr(runtime_service_module, "_build_agent_graph", lambda **_kwargs: _GraphAnswered())
+    monkeypatch.setattr(runtime_service_module, "_resolve_generation_service", lambda: object())
+    monkeypatch.setattr(runtime_service_module, "_build_memory_service", lambda _storage: _RecordingMemoryService())
+    manager = AgentResumeRunManager(storage=storage, background_work_coordinator=object())
+
+    claimed = manager.claim_and_start(
+        "continuation-1",
+        user_id="user-1",
+        session_id="session-1",
+    )
+    run = _wait_for_terminal_run(storage, claimed["resume_run_id"])
+
+    assert run["status"] == "completed"
+    # 挂起时写进会话记忆的是 waiting_interaction；续跑结束必须用续跑后的问答结果覆盖它。
+    assert len(saved_states) == 1
+    assert saved_states[0]["session_id"] == "session-1"
+    assert saved_states[0]["final_state"].paper_qa_result["arxiv_id"] == "2401.00001"
+
+
 @pytest.mark.parametrize("mode,status", [("jwt", "pending"), ("api_key", "pending"), ("jwt", "running")])
 def test_restart_recovery_never_recreates_jwt_authority_from_stored_user_id(tmp_path, monkeypatch, mode, status):
     """真实持久化状态验证：JWT 待运行任务不能在重启后凭旧 user_id 自动恢复执行权限。"""
