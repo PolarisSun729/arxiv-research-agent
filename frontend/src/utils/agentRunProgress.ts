@@ -141,13 +141,15 @@ function planFacts(state: Record<string, any>) {
 function toolResultFacts(toolCall: Record<string, any> | null, toolName: string | null) {
   const facts: string[] = []
   // 只认后端随 tool_call_end 给出的本步输出条目数；state.paper_count 要到收尾阶段才回填，执行中读到的是 0。
-  // 阶梯检索有多级时逐级列出命中数，让用户看到“严格匹配 0 篇 → 放宽后 N 篇”的过程。
+  // 阶梯检索有多级时逐级列出每级实际收进结果的篇数，让用户看到“严格匹配 0 篇 → 放宽后新增 N 篇”的过程。
+  // 用 new_papers 而不是 total_results：arXiv API 报的命中总数可能多于实际返回的条目，回答里的篇数也按 new_papers 算。
   const attempts = Array.isArray(toolCall?.search_attempts) ? toolCall.search_attempts.filter(isRecord) : []
   if (attempts.length > 1) {
-    for (const attempt of attempts) {
+    attempts.forEach((attempt, index) => {
       const label = String(attempt.label || attempt.level || '检索')
-      facts.push(attempt.ok === false ? `${label}：失败` : `${label}：${Number(attempt.total_results) || 0} 篇`)
-    }
+      const count = Number(attempt.new_papers) || 0
+      facts.push(attempt.ok === false ? `${label}：失败` : `${label}：${index === 0 ? '' : '新增 '}${count} 篇`)
+    })
   }
   const countFact = toolName ? RESULT_COUNT_FACTS[toolName] : undefined
   const counts = isRecord(toolCall?.result_counts) ? toolCall?.result_counts : null

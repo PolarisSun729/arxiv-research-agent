@@ -157,14 +157,15 @@ const ladder = replay([
       status: 'success',
       result_counts: { papers: 5 },
       search_attempts: [
-        { level: 'strict', label: '严格匹配', total_results: 0, ok: true },
-        { level: 'drop_inferred_categories', label: '放开推断的分类范围', total_results: 12, ok: true }
+        // arXiv API 报的命中总数可能多于实际返回条目，时间线按实际收进结果的 new_papers 展示，和回答一致。
+        { level: 'strict', label: '严格匹配', total_results: 4, new_papers: 2, ok: true },
+        { level: 'drop_inferred_categories', label: '放开推断的分类范围', total_results: 12, new_papers: 3, ok: true }
       ]
     }
   })
 ])
 assert.deepEqual(ladder.entries[0].facts, ['意图：论文检索', '关键词：RAG / retrieval-augmented generation', '最近 7 天'])
-assert.deepEqual(ladder.entries[1].facts, ['严格匹配：0 篇', '放开推断的分类范围：12 篇', '检索到 5 篇论文'])
+assert.deepEqual(ladder.entries[1].facts, ['严格匹配：2 篇', '放开推断的分类范围：新增 3 篇', '检索到 5 篇论文'])
 
 console.log('agent run progress tests passed')
 
