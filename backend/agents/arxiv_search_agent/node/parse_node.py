@@ -45,6 +45,7 @@ from ..utils.search_spec_builder import (
     _normalize_and_validate_spec,
     _post_process_cleaned_spec,
 )
+from ..utils.preference_action import normalize_preference_operation
 from ..utils.state_utils import _append_step, _coerce_state, _compact_search_spec
 from ..utils.text_utils import _extract_json_block, _matches_any, _normalize_optional_str, _normalize_text
 
@@ -142,7 +143,8 @@ def _normalize_llm_intent_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     1. 归一化 intent，并把未知值降级为 unsupported；
     2. 尝试解析 confidence，失败时保留为 None；
     3. 仅在 arxiv_search 分支下校验 search_spec，其余 intent 只保留元信息；
-    4. 清洗 missing_info、warnings、next_actions 等列表字段。
+    4. 仅在 preference_action 分支下校验偏好方向（preference_operation）；
+    5. 清洗 missing_info、warnings、next_actions 等列表字段。
     
     输出：返回统一的 dict，便于后续决策层同时读取 intent、confidence 和结构化搜索条件。
     """
@@ -177,6 +179,8 @@ def _normalize_llm_intent_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
         "next_actions": next_actions,
         "search_spec": search_spec,
         "search_spec_payload": search_spec_payload,
+        # 偏好方向由 LLM 读整句话给出；取值不合法时为 None，写入工具会拒绝而不是默认写成"感兴趣"。
+        "preference_operation": normalize_preference_operation(payload.get("preference_operation")) if intent == "preference_action" else None,
         "raw": dict(payload),
     }
 
@@ -673,6 +677,8 @@ def _write_parse_search_request_state(
     normalized_state.answer = None
     normalized_state.errors = []
     normalized_state.preference_action_result = None
+    # 只有 LLM 判成偏好动作时才带方向；规则兜底给不出方向，交给写入工具拒绝。
+    normalized_state.preference_operation = (llm_result or {}).get("preference_operation") if intent == "preference_action" else None
     normalized_state.debug = _build_debug_payload(
         message=message,
         final_intent=intent,
@@ -700,6 +706,7 @@ def _write_parse_search_request_state(
             "llm_confidence": normalized_state.llm_confidence,
             "fallback_reason": fallback_reason,
             "search_spec": _compact_search_spec(search_spec),
+            "preference_operation": normalized_state.preference_operation,
             "plan": list(plan),
             "warnings": list(normalized_state.warnings),
             "next_actions": list(next_actions),
@@ -807,6 +814,7 @@ def parse_search_request(
         intent_source=decision["intent_source"],
         fallback_reason=finalized["fallback_reason"],
         search_spec=_compact_search_spec(finalized["search_spec"]),
+        preference_operation=(llm_result or {}).get("preference_operation"),
     )
 
     return _write_parse_search_request_state(

@@ -177,6 +177,8 @@ class ToolExecutionService:
             payload.setdefault("context", context)
         if tool_name in {"load_user_profile", "generate_recommendations", "update_preference_store", "analyze_ambiguity"}:
             payload.setdefault("user_id", state.user_id)
+        if tool_name == "update_preference_store" and state.preference_operation:
+            payload.setdefault("preference_operation", dict(state.preference_operation))
         if tool_name in {"load_user_profile", "generate_recommendations", "answer_paper_question"}:
             payload.setdefault("message", state.message)
         if tool_name in {"answer_paper_question", "check_paper_index", "parse_and_index_paper"}:

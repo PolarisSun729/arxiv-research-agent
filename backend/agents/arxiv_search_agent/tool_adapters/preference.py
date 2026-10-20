@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, Mapping, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from ..utils.preference_action import normalize_preference_operation
 from .base import BaseToolAdapter, backend_tool_error
 from .models import ToolExecutionResult
 
@@ -55,6 +56,8 @@ class UpdatePreferenceStoreInput(BaseModel):
     paper_reference: Optional[Dict[str, Any]] = None
     message: str = ""
     user_id: Optional[str] = None
+    # 意图识别 LLM 给出的方向，由执行器从 state 注入；不在工具契约 input_schema 里，规划器不用绑定它。
+    preference_operation: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="after")
     def _require_target(self) -> "UpdatePreferenceStoreInput":
@@ -156,14 +159,22 @@ class UpdatePreferenceStoreAdapter(BaseToolAdapter[UpdatePreferenceStoreInput, P
 
     def _run(self, tool_input: UpdatePreferenceStoreInput) -> PreferenceActionOutput:
         paper_reference = tool_input.paper_reference or {}
-        message = str(tool_input.message or "")
-        lowered = message.lower()
-        remove_scope = None
-        if any(token in lowered for token in ("取消喜欢", "取消不喜欢", "撤销喜欢", "撤销不喜欢", "unlike", "remove like", "remove dislike")):
-            remove_scope = "disliked" if any(token in lowered for token in ("取消不喜欢", "撤销不喜欢", "remove dislike")) else "liked"
+        parsed = normalize_preference_operation(tool_input.preference_operation)
+        if parsed is None:
+            # 方向判反会把"不感兴趣"写成"感兴趣"；意图识别没给出方向时宁可失败，也不默认写入。
+            return PreferenceActionOutput(
+                status="failed",
+                arxiv_id=tool_input.arxiv_id,
+                title=str((paper_reference or {}).get("title") or "").strip(),
+                message="没能判断要标记为感兴趣还是不感兴趣",
+                paper=dict(paper_reference),
+                error="preference_action_unrecognized",
+                tool_result={"ok": False, "error": {"code": "preference_action_unrecognized", "message": "没能判断要标记为感兴趣还是不感兴趣，请说明是「感兴趣」「不感兴趣」还是「取消标记」"}},
+            )
 
         # 只把真实偏好写入或删除委托给后端工具；兴趣画像/向量重建不在这里伪装同步。
-        if remove_scope:
+        if parsed["action"] == "remove":
+            remove_scope = parsed["remove_scope"]
             tool_result = self.invoke_backend_tool("remove_paper_preference", user_id=tool_input.user_id or "", arxiv_id=tool_input.arxiv_id, remove_scope=remove_scope)
             tool_data = (tool_result or {}).get("data") if isinstance(tool_result, Mapping) else {}
             return PreferenceActionOutput(
@@ -178,7 +189,7 @@ class UpdatePreferenceStoreAdapter(BaseToolAdapter[UpdatePreferenceStoreInput, P
                 tool_result=dict(tool_result or {}),
             )
 
-        liked = not any(token in lowered for token in ("不喜欢", "dislike", "thumbs down"))
+        liked = parsed["action"] == "like"
         tool_result = self.invoke_backend_tool("record_paper_preference", user_id=tool_input.user_id or "", arxiv_id=tool_input.arxiv_id, liked=liked, paper=dict(paper_reference))
         tool_data = (tool_result or {}).get("data") if isinstance(tool_result, Mapping) else {}
         return PreferenceActionOutput(

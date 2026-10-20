@@ -350,7 +350,7 @@ def test_preference_write_failure_is_tool_failure_routed_to_fallback() -> None:
 
     adapter = preference_adapters.UpdatePreferenceStoreAdapter(failing_backend)
     result = adapter.execute(
-        preference_adapters.UpdatePreferenceStoreInput(paper_reference={"arxiv_id": "2401.00001"}, message="喜欢这篇论文")
+        preference_adapters.UpdatePreferenceStoreInput(paper_reference={"arxiv_id": "2401.00001"}, message="喜欢这篇论文", preference_operation={"action": "like"})
     )
 
     # 原 verify_preference_update 质量门并入写入工具：写入失败即工具失败，归为 tool_runtime_error，不再走澄清。

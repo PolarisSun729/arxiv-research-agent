@@ -181,6 +181,10 @@ class AgentState(BaseModel):
     # 由 _apply_turn_result 从 runtime.outputs 投影，不作为执行过程真源。
     preference_action_result: Optional[Dict[str, Any]] = None
 
+    # [A 执行真源-语义层] 意图识别 LLM 给出的偏好方向：{"action": like|dislike|remove, "remove_scope": ...}；
+    # 只在 intent 为 preference_action 时有值，由执行器注入 update_preference_store，不从原话再猜一遍。
+    preference_operation: Optional[Dict[str, str]] = None
+
     # debug 保存面向开发排查的中间态与详细错误上下文，不直接面向终端用户。
     debug: Dict[str, Any] = Field(default_factory=dict)
 

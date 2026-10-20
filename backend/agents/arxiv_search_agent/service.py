@@ -1797,6 +1797,7 @@ def _compact_state(state: Optional[AgentState]) -> Dict[str, Any]:
         "interaction": state.interaction.model_dump(mode="json") if state.interaction is not None else None,
         "paper_qa_result": state.paper_qa_result,
         "preference_action_result": state.preference_action_result,
+        "preference_operation": state.preference_operation,
         "tool_name": state.tool_name,
         "tool_args": _compact_tool_args(state.tool_args),
         "tool_call_count": len(state.tool_calls or []),

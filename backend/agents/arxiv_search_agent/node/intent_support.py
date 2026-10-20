@@ -467,8 +467,14 @@ def _build_llm_prompt_with_profile(message: str, research_profile: Optional[Mapp
         '\"reasoning_summary\":null|string,'
         '\"missing_info\":[],'
         '\"warnings\":[],'
-        '\"next_actions\":[]'
+        '\"next_actions\":[],'
+        '\"preference_operation\":null|{\"action\":\"like|dislike|remove\",\"remove_scope\":null|\"liked|disliked|both\"}'
         "}\n"
+        "Preference rules (fill preference_operation only when intent is preference_action, otherwise null):\n"
+        "- action: like = mark the paper as liked/interesting; dislike = mark it as disliked/not interesting "
+        "('标记为不感兴趣', '不喜欢这篇', 'not interested' are dislike, not like); "
+        "remove = cancel an existing mark ('取消喜欢', '撤销不感兴趣', '取消标记').\n"
+        "- remove_scope: only for remove, which mark to cancel: liked, disliked, or both when the user did not say.\n"
         "Search spec rules:\n"
         "- concepts: the core research objects the user asked about; papers must match every concept, "
         f"so use as few as possible (usually 1-2, at most {MAX_CORE_CONCEPTS}). "
