@@ -203,13 +203,24 @@ function toAgentUserResultForMessage(response: unknown): AgentUserResult {
   })
 }
 
+// 停在确认卡片上的这一轮本来就没有正文：卡片还在时提示去确认，确认后卡片收起，提示结果在下一条。
+function emptyAnswerText(response: ArxivSearchResponse | null) {
+  if (!response?.interaction) return undefined
+  return visibleInteractionForResponse(response) ? '需要你确认后才会继续，请在下方操作。' : '已处理确认，结果见下一条回复。'
+}
+
 // 回答气泡与论文页共用 RagChatPanel，它靠消息上的 sources / citedSourceIds 渲染正文角标和内嵌图卡；
 // Agent 消息只带完整 response，这里从中取出证据挂到消息上，与证据抽屉同源。
 const chatMessages = computed(() =>
   messages.value.map(item => {
     if (item.role !== 'assistant' || !item.response) return item
     const result = toAgentUserResultForMessage(item.response)
-    return { ...item, sources: result.evidenceSources, citedSourceIds: result.citedSourceIds }
+    return {
+      ...item,
+      sources: result.evidenceSources,
+      citedSourceIds: result.citedSourceIds,
+      emptyText: emptyAnswerText(toAgentResponse(item.response))
+    }
   })
 )
 

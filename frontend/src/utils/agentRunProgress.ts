@@ -1,4 +1,4 @@
-import type { AgentProgressEntry, AgentProgressStatus, AgentRunProgress, AgentStreamEvent } from '@/types/agent'
+import type { AgentProgressEntry, AgentProgressStatus, AgentProgressSubstep, AgentRunProgress, AgentStreamEvent } from '@/types/agent'
 import { isRecord } from '@/utils/guards'
 
 // 纯簿记节点：耗时极短、对用户没有信息量，只有失败时才露出到时间线。
@@ -55,6 +55,15 @@ const INTENT_LABELS: Record<string, string> = {
   confirmation: '等待确认'
 }
 
+// 偏好方向写反就是把"不感兴趣"标成"感兴趣"，所以识别结果要摆在用户眼前。
+const PREFERENCE_OPERATION_LABELS: Record<string, string> = {
+  like: '标记为感兴趣',
+  dislike: '标记为不感兴趣',
+  'remove:liked': '取消“感兴趣”标记',
+  'remove:disliked': '取消“不感兴趣”标记',
+  'remove:both': '取消偏好标记'
+}
+
 // 这些工具产出的条目数就是用户最关心的中间结果：工具名 -> [输出字段, 文案]。
 const RESULT_COUNT_FACTS: Record<string, [string, (count: number) => string]> = {
   search_arxiv: ['papers', count => `检索到 ${count} 篇论文`],
@@ -105,6 +114,11 @@ function intentFacts(state: Record<string, any>) {
     facts.push(`理解为：${truncate(state.contextualized_message.trim(), 80)}`)
   }
   if (intent) facts.push(`意图：${INTENT_LABELS[intent] || intent}`)
+  const operation = isRecord(state.preference_operation) ? state.preference_operation : null
+  if (intent === 'preference_action' && operation) {
+    const key = operation.action === 'remove' ? `remove:${operation.remove_scope}` : String(operation.action)
+    if (PREFERENCE_OPERATION_LABELS[key]) facts.push(`操作：${PREFERENCE_OPERATION_LABELS[key]}`)
+  }
   const spec = isRecord(state.search_spec) ? state.search_spec : null
   if (intent === 'arxiv_search' && spec) {
     const concepts = Array.isArray(spec.concepts) ? spec.concepts.filter(isRecord) : []
@@ -167,8 +181,58 @@ function toolResultFacts(toolCall: Record<string, any> | null, toolName: string 
   return facts
 }
 
+function closeSubsteps(substeps: AgentProgressSubstep[] | undefined, now: number, lastStatus: AgentProgressStatus = 'success') {
+  if (!substeps?.length) return substeps
+  const lastRunning = substeps.map(substep => substep.status).lastIndexOf('running')
+  return substeps.map((substep, index) => substep.status === 'running'
+    ? { ...substep, status: index === lastRunning ? lastStatus : 'success', endedAt: substep.endedAt ?? now }
+    : substep)
+}
+
 function closeEntry(entry: AgentProgressEntry, status: AgentProgressStatus, now: number): AgentProgressEntry {
-  return { ...entry, status, endedAt: entry.endedAt ?? now }
+  return { ...entry, status, endedAt: entry.endedAt ?? now, substeps: closeSubsteps(entry.substeps, now, status) }
+}
+
+/**
+ * 工具内部阶段：running 表示新阶段开始，同时收掉上一个仍在运行的阶段；
+ * done 只给同名的最近一个阶段收尾并补充结果说明（如"新增 8 段证据"）。
+ */
+function applySubstepProgress(
+  substeps: AgentProgressSubstep[],
+  progress: Record<string, any>,
+  sequence: number,
+  now: number
+): AgentProgressSubstep[] {
+  const stage = typeof progress.stage === 'string' ? progress.stage : ''
+  if (!stage) return substeps
+  const detail = typeof progress.detail === 'string' ? progress.detail.trim() : ''
+  const items = Array.isArray(progress.items)
+    ? progress.items.filter((item: unknown): item is string => typeof item === 'string' && Boolean(item.trim()))
+    : []
+  if (progress.status === 'done') {
+    for (let index = substeps.length - 1; index >= 0; index -= 1) {
+      if (substeps[index].stage !== stage) continue
+      const next = [...substeps]
+      const substep = next[index]
+      next[index] = {
+        ...substep,
+        status: substep.status === 'running' ? 'success' : substep.status,
+        endedAt: substep.endedAt ?? now,
+        facts: mergeFacts(substep.facts, [detail]),
+        ...(items.length ? { items: mergeFacts(substep.items || [], items) } : {})
+      }
+      return next
+    }
+    return substeps
+  }
+  const label = typeof progress.label === 'string' && progress.label.trim() ? progress.label.trim() : stage
+  return [
+    ...(closeSubsteps(substeps, now) || []),
+    {
+      key: `${sequence}-${stage}`, stage, label, status: 'running', facts: detail ? [detail] : [],
+      ...(items.length ? { items } : {}), startedAt: now, endedAt: null
+    }
+  ]
 }
 
 function closeRunningEntries(entries: AgentProgressEntry[], now: number, lastStatus: AgentProgressStatus = 'success') {
@@ -176,6 +240,15 @@ function closeRunningEntries(entries: AgentProgressEntry[], now: number, lastSta
   return entries.map((entry, index) => entry.status === 'running'
     ? closeEntry(entry, index === lastRunning ? lastStatus : 'success', now)
     : entry)
+}
+
+/** 运行中的条目若有正在进行的内部阶段，返回该阶段；时间线标题和慢步骤提示以它为准。 */
+export function getActiveSubstep(entry: AgentProgressEntry | null | undefined) {
+  const substeps = entry?.substeps || []
+  for (let index = substeps.length - 1; index >= 0; index -= 1) {
+    if (substeps[index].status === 'running') return substeps[index]
+  }
+  return null
 }
 
 export function finishRunProgress(progress: AgentRunProgress, now: number, status: 'done' | 'failed' = 'done'): AgentRunProgress {
@@ -237,6 +310,14 @@ export function applyProgressEvent(progress: AgentRunProgress, event: AgentStrea
           endedAt: null
         })
       }
+      return { ...progress, entries }
+    }
+    case 'tool_progress': {
+      const payload = isRecord(data.progress) ? data.progress : null
+      const index = findLastEntryIndex(entries, node || 'execute_step', true)
+      if (!payload || index < 0) return progress
+      const entry = entries[index]
+      entries[index] = { ...entry, substeps: applySubstepProgress(entry.substeps || [], payload, event.sequence, now) }
       return { ...progress, entries }
     }
     case 'tool_call_end': {

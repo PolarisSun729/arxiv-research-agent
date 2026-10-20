@@ -75,6 +75,20 @@ export interface AgentProgressEntry {
   status: AgentProgressStatus
   facts: string[]
   toolName?: string | null
+  /** 长耗时工具内部的阶段（如论文问答的检索、撰写、核对），来自 tool_progress 事件。 */
+  substeps?: AgentProgressSubstep[]
+  startedAt: number
+  endedAt?: number | null
+}
+
+export interface AgentProgressSubstep {
+  key: string
+  stage: string
+  label: string
+  status: AgentProgressStatus
+  facts: string[]
+  /** 可展开查看的明细，如拆出的各个证据需求；默认折叠，不挤占时间线。 */
+  items?: string[]
   startedAt: number
   endedAt?: number | null
 }
@@ -93,6 +107,7 @@ export interface AgentStreamEvent {
     | 'step_start'
     | 'step_end'
     | 'tool_call_start'
+    | 'tool_progress'
     | 'tool_call_end'
     | 'final_response'
     | 'exception'

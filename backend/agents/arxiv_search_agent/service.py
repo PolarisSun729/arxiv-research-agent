@@ -42,6 +42,7 @@ from .graph import build_arxiv_search_graph
 from .request_contextualizer import build_recent_turns
 from .execution.interaction_runtime import InteractionRuntimeError, InteractionRuntimeService
 from .execution.interactions import AgentInteraction, InteractionResumeRequest
+from .execution.tool_execution import TOOL_PROGRESS_KIND
 from .runtime_checkpoint import (
     CHECKPOINT_STATUS_CANCELLED,
     CHECKPOINT_STATUS_COMPLETED,
@@ -2106,13 +2107,20 @@ class _AgentEventEmitter:
         # 已在 tasks 流里宣告开始、尚未收到 updates 的节点：节点名 -> (active_tool_call, tool_call_started)。
         started_nodes: Dict[str, tuple[Optional[Dict[str, Any]], bool]] = {}
 
-        for stream_item in graph.stream(graph_input, config=graph_config, stream_mode=["tasks", "updates"]):
+        # custom 承载工具执行中途的进度帧；开启后 LangGraph 会在节点运行期间就把这些帧吐出来。
+        for stream_item in graph.stream(graph_input, config=graph_config, stream_mode=["tasks", "updates", "custom"]):
             # 测试替身可能只产出 updates 字典；真实图在多模式下产出 (mode, chunk) 元组。
             if isinstance(stream_item, tuple) and len(stream_item) == 2 and isinstance(stream_item[0], str):
                 stream_mode, chunk = stream_item
             else:
                 stream_mode, chunk = "updates", stream_item
             if not chunk:
+                continue
+
+            if stream_mode == "custom":
+                if isinstance(chunk, Mapping) and chunk.get("kind") == TOOL_PROGRESS_KIND:
+                    progress = {key: value for key, value in chunk.items() if key != "kind"}
+                    yield self.emit("tool_progress", {"step": "execute_step", "progress": progress})
                 continue
 
             if stream_mode == "tasks":

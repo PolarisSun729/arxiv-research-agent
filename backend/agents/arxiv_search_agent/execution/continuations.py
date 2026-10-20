@@ -394,6 +394,8 @@ class AgentResumeRunManager:
                         }
                     ),
                     graph_config,
+                    # 续跑的第一步是把已完成的后台任务结果交回原步骤；放行该步骤，时间线才显示具体工具名而不是笼统的"执行步骤"。
+                    approved_step_id=str(continuation.get("step_id") or "").strip() or None,
                 ):
                     self._publish_progress(resume_run_id, event)
             except Exception as exc:

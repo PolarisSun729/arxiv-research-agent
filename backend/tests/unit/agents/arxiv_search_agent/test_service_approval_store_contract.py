@@ -193,8 +193,8 @@ def test_stream_announces_step_start_before_node_finishes(monkeypatch) -> None:
     class FakeGraph:
         def stream(self, graph_input, config=None, stream_mode=None):
             del config
-            # 真实 LangGraph 在多模式下产出 (mode, chunk)：tasks 的开始事件先于节点执行。
-            assert stream_mode == ["tasks", "updates"]
+            # 真实 LangGraph 在多模式下产出 (mode, chunk)：tasks 的开始事件先于节点执行；custom 承载工具内部进度。
+            assert stream_mode == ["tasks", "updates", "custom"]
             payload = dict(graph_input)
             yield "tasks", {"id": "t1", "name": "parse_search_request", "input": payload, "triggers": ()}
             progress_log.append("node_finished")

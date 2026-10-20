@@ -20,7 +20,8 @@ const {
   createRunProgress,
   finishRunProgress,
   formatElapsed,
-  getActiveEntry
+  getActiveEntry,
+  getActiveSubstep
 } = await import(pathToFileURL(outfile))
 
 let sequence = 0
@@ -179,3 +180,59 @@ const followUp = replay([
   })
 ])
 assert.deepEqual(followUp.entries[0].facts, ['理解为：再多找一些 RAG 的论文，不限时间', '意图：论文检索', '关键词：RAG'])
+
+// 论文问答这类长工具会在执行中途上报内部阶段：新阶段开始时收掉上一阶段，done 只补结果说明，
+// 时间线标题跟着当前阶段走；工具结束时还在跑的阶段一并收尾。
+const qaProgress = (stage, label, status = 'running', detail) => event('tool_progress', {
+  step: 'execute_step',
+  progress: { stage, label, status, ...(detail ? { detail } : {}), step_id: 's3', tool_name: 'answer_paper_question' }
+})
+const qaMidway = replay([
+  event('step_start', { step: 'execute_step' }),
+  event('tool_call_start', { step: 'execute_step', tool_call: { tool_name: 'answer_paper_question', display_label: '基于论文全文回答' } }),
+  qaProgress('prepare', '分析问题、拆分证据需求'),
+  qaProgress('prepare', '', 'done', '拆出 2 个证据需求'),
+  qaProgress('search', '检索论文片段（第 1 轮）', 'running', '查找：方法框架'),
+  qaProgress('search', '', 'done', '新增 8 段证据'),
+  qaProgress('draft', '撰写回答')
+])
+const qaEntry = getActiveEntry(qaMidway)
+assert.equal(qaEntry?.label, '基于论文全文回答')
+assert.deepEqual(qaEntry.substeps.map(item => [item.label, item.status, item.facts]), [
+  ['分析问题、拆分证据需求', 'success', ['拆出 2 个证据需求']],
+  ['检索论文片段（第 1 轮）', 'success', ['查找：方法框架', '新增 8 段证据']],
+  ['撰写回答', 'running', []]
+])
+assert.equal(getActiveSubstep(qaEntry)?.label, '撰写回答')
+
+const qaDone = applyProgressEvent(qaMidway, event('step_end', { step: 'execute_step', status: 'success' }), 99_000)
+assert.ok(qaDone.entries[0].substeps.every(item => item.status === 'success' && item.endedAt))
+assert.equal(getActiveSubstep(qaDone.entries[0]), null)
+
+// 阶段可以附带明细列表（如拆出的各个证据需求），挂在对应子步骤上，由时间线折叠展示。
+const qaWithNeeds = applyProgressEvent(
+  qaMidway,
+  event('tool_progress', {
+    step: 'execute_step',
+    progress: { stage: 'prepare', label: '', status: 'done', items: ['需求 1（核心）：方法框架', '', 3], step_id: 's3' }
+  }),
+  98_000
+)
+assert.deepEqual(getActiveEntry(qaWithNeeds).substeps[0].items, ['需求 1（核心）：方法框架'])
+assert.equal(getActiveEntry(qaWithNeeds).substeps[1].items, undefined)
+
+// 没有运行中的步骤可挂时，迟到的进度帧直接忽略。
+assert.equal(applyProgressEvent(qaDone, qaProgress('verify_claims', '逐条核对原文证据'), 100_000), qaDone)
+
+// 偏好操作的方向来自意图识别，“理解你的问题”直接展示，方向错了用户一眼能看出来。
+const dislike = replay([
+  event('step_start', { step: 'parse_search_request' }),
+  event('step_end', {
+    step: 'parse_search_request',
+    status: 'success',
+    state: { intent: 'preference_action', preference_operation: { action: 'dislike', remove_scope: 'none' } }
+  })
+])
+assert.deepEqual(dislike.entries[0].facts, ['意图：论文偏好操作', '操作：标记为不感兴趣'])
+
+console.log('agent tool progress tests passed')

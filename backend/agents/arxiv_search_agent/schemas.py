@@ -1782,6 +1782,7 @@ class AgentStreamEvent(BaseModel):
         "step_start",
         "step_end",
         "tool_call_start",
+        "tool_progress",
         "tool_call_end",
         "final_response",
         "exception",
