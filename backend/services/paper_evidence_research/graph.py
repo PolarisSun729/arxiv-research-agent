@@ -503,6 +503,7 @@ def _extract_claims_node(state: Any, dependencies: ResearchGraphDependencies) ->
         claim_count=len(next_state.claims),
         # 标明这一版主张出自 LLM 还是规则兜底，排查覆盖异常时先看提取是否降级。
         extractor_source=extracted.get("extractor_source"),
+        extractor_degradation=extracted.get("degradation"),
     )
     return next_state
 

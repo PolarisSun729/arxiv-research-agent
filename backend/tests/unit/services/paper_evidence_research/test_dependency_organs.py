@@ -468,6 +468,12 @@ class TestLlmDecisionPolicy:
         action = LlmDecisionPolicy(FakeGenerationService([reply])).decide(self._context())
         assert action["discard_evidence_ids"] == ["13"]
 
+    def test_numeric_discard_ids_are_read_as_source_ids(self) -> None:
+        # ab-small-0fd7d1b7：模型把 "12" 写成 12，整次决策被判无效、退回规则策略。
+        reply = json.dumps({"action": "draft_answer", "discard_evidence_ids": [12, "35"], "reason_code": "ON_TOPIC"})
+        action = LlmDecisionPolicy(FakeGenerationService([reply])).decide(self._context())
+        assert action["discard_evidence_ids"] == ["12", "35"]
+
     def test_empty_pool_prompt_says_nothing_retrieved(self) -> None:
         service = FakeGenerationService([json.dumps({"action": "abstain", "reason_code": "X"})])
         LlmDecisionPolicy(service).decide(self._context())

@@ -21,12 +21,10 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .draft_segments import is_figure_link_line, split_draft_segments
+
 # 与 services/paper_qa/citation_contract.py 的 _STRICT_MARKER_RE 保持同构。
 _CITATION_MARKER_RE = re.compile(r"\[source:([^\]\s,]+)\]")
-_SEGMENT_SPLIT_RE = re.compile(r"(?<=[。！？!?；;\n])|(?<=\.)(?=\s|$)")
-_TRAILING_CITATIONS_RE = re.compile(
-    r"([。！？!?；;]|\.(?=\s*\[source:))([ \t]*(?:\[source:[^\]\s,]+\][ \t]*)+)"
-)
 _SECTION_LABEL_RE = re.compile(
     r"^(?:#{1,6}\s*)?(?:概述|方法|实验|结果|结论|总结|局限性|回答|Overview|Method|Results|Conclusion)[:：]?$",
     flags=re.IGNORECASE,
@@ -99,7 +97,9 @@ def _strip_leading_markup(line: str) -> str:
 
 
 def _is_structural_line(raw_line: str, body: str) -> bool:
-    """判断一行是否只是排版结构（标题、编号小标题、列表引出句），而非可校验事实。"""
+    """判断一行是否只是排版结构（图注链接、标题、编号小标题、列表引出句），而非可校验事实。"""
+    if is_figure_link_line(raw_line):
+        return True
     if _CITATION_MARKER_RE.search(body):
         return False
     plain = _EMPHASIS_RE.sub("", body).strip()
@@ -135,8 +135,6 @@ class RuleClaimExtractor:
 
     def extract(self, request: Any) -> dict[str, Any]:
         answer = _normalize_markdown(str(getattr(request, "answer", "") or ""))
-        # 把紧随句末的引用移到该句的切分边界内；小数点和 source_id 内的点不会成为边界。
-        answer = _TRAILING_CITATIONS_RE.sub(lambda match: f" {match[2].strip()}{match[1]} ", answer)
         draft_version = int(getattr(request, "draft_version", 1) or 1)
         needs = list(getattr(request, "evidence_needs", []) or [])
         candidates = list(getattr(request, "candidates", []) or [])
@@ -154,7 +152,8 @@ class RuleClaimExtractor:
 
         claims: list[dict[str, Any]] = []
         claim_sequence = 0
-        for segment in _SEGMENT_SPLIT_RE.split(answer):
+        # 切句与 LLM 提取器共用：句末引用归前一句，引号、括号里的标点不切。
+        for segment in (item.text for item in split_draft_segments(answer)):
             citation_ids = _CITATION_MARKER_RE.findall(segment)
             if _SECTION_LABEL_RE.fullmatch(segment.strip()):
                 continue
