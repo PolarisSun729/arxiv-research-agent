@@ -33,6 +33,19 @@ class StorageSchemaMigrator:
                 )
             ''')
 
+            # 摘要译文按论文共享缓存；论文可能只在 OAI 镜像库里，所以不对 arxiv_papers 建外键。
+            # source_hash 是规范化后原文的哈希，摘要被修订时哈希变化，旧译文自然失效。
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS paper_abstract_translations (
+                    arxiv_id TEXT NOT NULL,
+                    target_lang TEXT NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    translated_text TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(arxiv_id, target_lang)
+                )
+            ''')
+
             cursor.execute(f'''
                 CREATE TABLE IF NOT EXISTS user_liked_papers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from services.arxiv.arxiv_search_service import ArxivSearchService
     from services.arxiv.contracts import ArxivSearchBackend
     from services.embedding.embedding_service import EmbeddingConfig, EmbeddingService
+    from services.llm.abstract_translation_service import AbstractTranslationService
     from services.llm.generation_service import GenerationService
     from services.memory import MemoryService
     from services.paper_qa.index_job_manager import IndexJobManager
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
         AgentSessionStore,
         AgentWorkStore,
         InterestVectorStore,
+        PaperAbstractTranslationStore,
         PaperCatalogStore,
         PaperChatMessageStore,
         PaperChatSessionStore,
@@ -72,6 +74,10 @@ def get_storage_container() -> StorageContainer:
 
 def get_paper_catalog_store() -> PaperCatalogStore:
     return get_storage_container().paper_catalog
+
+
+def get_paper_abstract_translation_store() -> PaperAbstractTranslationStore:
+    return get_storage_container().paper_abstract_translations
 
 
 def get_user_preference_store() -> UserPreferenceStore:
@@ -156,6 +162,18 @@ def get_generation_service() -> GenerationService:
     from services.llm.generation_service import GenerationService
 
     return GenerationService()
+
+
+@lru_cache(maxsize=1)
+def get_abstract_translation_service() -> AbstractTranslationService:
+    from services.llm.abstract_translation_service import AbstractTranslationService
+
+    return AbstractTranslationService(
+        generation_service=get_generation_service(),
+        translation_store=get_paper_abstract_translation_store(),
+        paper_catalog_store=get_paper_catalog_store(),
+        oai_database_service=get_oai_database_service(),
+    )
 
 
 @lru_cache(maxsize=1)

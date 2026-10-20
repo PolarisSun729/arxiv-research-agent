@@ -5,7 +5,7 @@ import base64
 import mimetypes
 import io
 from datetime import datetime
-from typing import List, Dict, Optional, Any, Tuple
+from typing import Iterator, List, Dict, Optional, Any, Tuple
 import logging
 from services.llm.call_metrics import record_llm_call, record_llm_usage
 from openai import OpenAI
@@ -450,6 +450,42 @@ class GenerationService:
         except Exception as e:
             logger.error(f"Error completing prompt with Qwen: {str(e)}")
             raise
+
+    def stream_with_qwen(
+        self,
+        prompt: str,
+        model_name: Optional[str] = None,
+        task_type: Optional[str] = None,
+        enable_thinking: bool = False,
+    ) -> Iterator[str]:
+        """单轮流式补全，逐段产出模型输出的文本增量。
+
+        默认关闭思考：面向用户逐字展示的场景开思考会先产出数千 token 推理，首字要等几十秒。
+        """
+        if not QWEN_API_KEY:
+            raise ValueError("Qwen API key not provided")
+
+        model_name = self._resolve_qwen_model_selection(
+            task_type=task_type,
+            model_name=model_name,
+            default_role="small",
+        )["selected_model"]
+        client = OpenAI(api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL)
+        record_llm_call(model=model_name, task_type=task_type or "completion")
+        stream = client.responses.create(
+            model=model_name,
+            input=prompt,
+            stream=True,
+            extra_body={"enable_thinking": enable_thinking},
+        )
+        for event in stream:
+            event_type = getattr(event, "type", "")
+            if event_type == "response.output_text.delta":
+                delta = getattr(event, "delta", "")
+                if delta:
+                    yield delta
+            elif event_type == "response.completed":
+                record_llm_usage(getattr(getattr(event, "response", None), "usage", None))
 
     def rewrite_query_for_retrieval(
         self,
