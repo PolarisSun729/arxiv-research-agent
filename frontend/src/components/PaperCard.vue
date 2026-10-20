@@ -225,9 +225,9 @@ function formatDate(dateStr: string) {
       </span>
     </header>
 
+    <p v-if="authorsDisplay" class="paper-authors" :title="authorsDisplay">{{ authorsDisplay }}</p>
+
     <div class="paper-meta">
-      <span class="meta-authors" :title="authorsDisplay">{{ authorsDisplay }}</span>
-      <span class="meta-sep">·</span>
       <span class="meta-date">{{ formatDate(paper.publishedAt) }}</span>
       <span v-for="cat in paper.categories" :key="cat" class="chip">{{ cat }}</span>
     </div>
@@ -362,6 +362,8 @@ function formatDate(dateStr: string) {
 .paper-card {
   display: flex;
   flex-direction: column;
+  /* 卡片放在 grid/flex 列表里时，默认最小宽度是内容宽度；作者行不换行会把卡片撑出容器。 */
+  min-width: 0;
   padding: 18px 20px 14px;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
@@ -409,16 +411,17 @@ function formatDate(dateStr: string) {
   color: var(--color-text-3);
 }
 
-.meta-authors {
-  max-width: 100%;
+/* 作者单独一行、正常换行；作者特别多时最多两行，完整列表看悬浮提示。 */
+.paper-authors {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  margin-top: 6px;
+  font-size: 13px;
+  line-height: 1.6;
   color: var(--color-text-2);
-}
-
-.meta-sep {
-  color: var(--color-text-4);
+  overflow-wrap: anywhere;
 }
 
 .meta-date {
