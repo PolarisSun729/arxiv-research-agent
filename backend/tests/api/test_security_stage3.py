@@ -54,7 +54,7 @@ def app_factory(monkeypatch, tmp_path):
     def factory(**overrides):
         for name, value in overrides.items():
             monkeypatch.setenv(name, str(value))
-        return importlib.import_module("main").create_app(load_mode="lazy", enable_debug_routes=True)
+        return importlib.import_module("main").create_app(load_mode="lazy")
 
     return factory
 
@@ -111,7 +111,7 @@ def test_password_policy_rejects_weak_and_overlong_bytes(app, password):
     assert password not in response.text
 
 
-@pytest.mark.parametrize("path", ["/api/papers", "/api/auth/me", "/api/paper/p1/evidence-assets/img", "/api/debug/chunks/files"])
+@pytest.mark.parametrize("path", ["/api/papers", "/api/auth/me", "/api/paper/p1/evidence-assets/img", "/api/admin/paper-indexes"])
 def test_api_key_cannot_bypass_jwt_for_any_transport(app, path):
     response = http(app).get(path, headers={"X-API-Key": "old-compatibility-key-" + "a" * 40})
     assert response.status_code == 401 and response.json()["code"] == "missing_token"
@@ -177,7 +177,7 @@ def test_admin_management_revokes_existing_tokens_and_preserves_last_admin(app):
     ("POST", "/api/agent/work-continuations/work/resume/stream"),
     ("POST", "/api/paper/p1/create-qa-index"), ("DELETE", "/api/paper/p1"),
     ("GET", "/api/paper/p1/qa-trace/latest"), ("GET", "/api/paper/p1/qa-diagnose"),
-    ("GET", "/api/debug/chunks/files"), ("POST", "/api/user/research-profile/rebuild"),
+    ("GET", "/api/admin/paper-indexes"), ("POST", "/api/user/research-profile/rebuild"),
 ])
 @pytest.mark.parametrize("role", ["viewer", "guest"])
 def test_roles_deny_sensitive_routes_before_invalid_body_or_dependencies(app, role, method, path):

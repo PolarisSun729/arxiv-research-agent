@@ -152,23 +152,6 @@ class BackendStartupSmokeTests(unittest.TestCase):
             "/api/user/preferences/{user_id}",
         }
         self.assertTrue(expected_paths.issubset(set(routes)))
-        self.assertNotIn("/api/chunks/files", routes)
-        self.assertNotIn("/api/debug/chunks/files", routes)
-
-    def test_debug_chunk_router_is_only_registered_when_enabled(self) -> None:
-        debug_app = self.main.create_app(load_mode="lazy", enable_debug_routes=True)
-        routes = {getattr(route, "path", "") for route in debug_app.routes}
-
-        self.assertIn("/api/debug/chunks/files", routes)
-        self.assertIn("/api/debug/chunks/file/{filename}", routes)
-        self.assertNotIn("/api/chunks/files", routes)
-
-    def test_openapi_excludes_debug_routes_by_default(self) -> None:
-        # 公网不发布文档端点，仍可直接检查应用生成的内部 schema。
-        paths = self.app.openapi()["paths"]
-
-        self.assertNotIn("/api/debug/chunks/files", paths)
-        self.assertNotIn("/api/chunks/files", paths)
 
     def test_basic_api_requests_return_stable_payloads_without_external_services(self) -> None:
         fields_response = self.client.get("/api/arxiv/fields")

@@ -40,7 +40,7 @@ def security_app(monkeypatch):
     monkeypatch.setenv("ALLOWED_ORIGINS", "https://research.example")
     monkeypatch.setenv("ALIYUN_API_KEY", PROVIDER_KEY)
     main = importlib.import_module("main")
-    app = main.create_app(load_mode="lazy", enable_debug_routes=True)
+    app = main.create_app(load_mode="lazy")
     calls = []
 
     def costly_dependency():
@@ -118,7 +118,7 @@ def test_settings_deduplicate_keys_and_do_not_expose_them_in_repr(monkeypatch):
     ("POST", "/api/paper/2401.00001/qa/stream"),
     ("GET", "/api/paper/2401.00001/evidence-assets/figure-1"),
     ("GET", "/api/paper/2401.00001/qa-trace/latest"),
-    ("GET", "/api/debug/chunks/files"), ("GET", "/health/extra"),
+    ("GET", "/api/admin/paper-indexes"), ("GET", "/health/extra"),
 ])
 def test_all_api_entry_types_require_authentication(client, method, path):
     response = client.request(method, path)

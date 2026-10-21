@@ -107,7 +107,9 @@ _register(ADMIN_ROLES, None, [
     ("PATCH", "/api/auth/users/{target_user_id}"), ("PUT", "/api/auth/users/{target_user_id}/quotas"),
     ("DELETE", "/api/paper/{arxiv_id}"), ("GET", "/api/sync-status"), ("GET", "/api/agent/graph"),
     ("GET", "/api/paper/{arxiv_id}/qa-diagnose"), ("GET", "/api/paper/{arxiv_id}/qa-trace/latest"),
-    ("GET", "/api/debug/chunks/files"), ("GET", "/api/debug/chunks/file/{filename}"),
+    # 索引切分/解析产物查看：只读，但会展示整篇论文解析文本和本地索引结构。
+    ("GET", "/api/admin/paper-indexes"), ("GET", "/api/admin/paper-indexes/{arxiv_id}"),
+    ("GET", "/api/admin/paper-indexes/{arxiv_id}/parsed"), ("GET", "/api/admin/paper-indexes/{arxiv_id}/assets/{chunk_id}"),
 ])
 
 

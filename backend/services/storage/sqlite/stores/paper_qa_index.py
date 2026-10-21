@@ -338,6 +338,51 @@ class PaperQAIndexStore(BaseSqliteStore):
             logger.error(f"Error listing paper QA index builds: {str(e)}")
             return []
 
+    def list_paper_qa_indexes(
+        self,
+        *,
+        query: str = "",
+        status: str = "",
+        offset: int = 0,
+        limit: int = 50,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """管理端分页列出所有论文的索引主表记录，附带论文标题和版本数；query 同时匹配 arxiv_id 与标题。"""
+        where_parts: List[str] = []
+        values: List[Any] = []
+        normalized_query = str(query or "").strip()
+        if normalized_query:
+            where_parts.append("(i.arxiv_id LIKE ? OR p.title LIKE ?)")
+            values.extend([f"%{normalized_query}%"] * 2)
+        if status:
+            where_parts.append("i.status = ?")
+            values.append(status)
+        where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        from_sql = "FROM paper_qa_index i LEFT JOIN arxiv_papers p ON p.arxiv_id = i.arxiv_id"
+        columns = (
+            "arxiv_id", "title", "status", "chunk_count", "loading_method", "chunking_strategy",
+            "active_build_id", "indexed_at", "updated_at", "build_count",
+        )
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(f"SELECT COUNT(*) {from_sql} {where_sql}", values)
+                total = int(cursor.fetchone()[0] or 0)
+                cursor.execute(
+                    f"""
+                    SELECT i.arxiv_id, p.title, i.status, i.chunk_count, i.loading_method, i.chunking_strategy,
+                           i.active_build_id, i.indexed_at, i.updated_at,
+                           (SELECT COUNT(*) FROM paper_qa_index_versions v WHERE v.arxiv_id = i.arxiv_id)
+                    {from_sql} {where_sql}
+                    ORDER BY i.updated_at DESC, i.arxiv_id
+                    LIMIT ? OFFSET ?
+                    """,
+                    [*values, max(1, int(limit)), max(0, int(offset))],
+                )
+                return [dict(zip(columns, row)) for row in cursor.fetchall()], total
+        except Exception as e:
+            logger.error(f"Error listing paper QA indexes: {str(e)}")
+            return [], 0
+
     def update_paper_qa_index_build(self, build_id: str, **kwargs) -> bool:
         """按白名单字段部分更新某个构建版本；只改版本表，不影响主表的 active 指针。"""
         try:

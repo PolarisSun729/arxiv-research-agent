@@ -62,7 +62,6 @@ def build_startup_sections(
     *,
     load_mode: str,
     auth_mode: str,
-    debug_routes_enabled: bool,
     jwt_settings: Any = None,
     api_key_count: int = 0,
     allowed_origins: Sequence[str] = (),
@@ -114,7 +113,6 @@ def build_startup_sections(
                 ("arxiv_data_source", cfg.CORE_CONFIG["arxiv_data_source"]),
                 ("arxiv_proxy_url", _mask_url(cfg.CORE_CONFIG["arxiv_proxy_url"])),
                 ("default_user_id", cfg.USER_CONFIG["default_user_id"]),
-                ("debug_routes", debug_routes_enabled),
             ],
         ),
         (

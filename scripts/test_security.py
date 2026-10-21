@@ -120,7 +120,7 @@ def main() -> int:
         "BACKEND_REQUEST_TRACE_DIR": str(runtime / "request-traces"),
         "RETRIEVAL_TRACE_EXPORT_DIR": str(runtime / "retrieval-traces"),
         "AGENT_RUNTIME_CHECKPOINT_BACKEND": "memory", "BACKEND_SERVICE_LOAD_MODE": "lazy",
-        "BACKEND_ACCESS_LOG": "false", "ENABLE_DEBUG_ROUTES": "false",
+        "BACKEND_ACCESS_LOG": "false",
         "ALLOWED_ORIGINS": "https://research.example", "ALIYUN_API_KEY": "",
         "RATE_LIMIT_STORAGE": "memory://", "IP_FILTER_MODE": "disabled",
         "IP_BLACKLIST": "", "IP_WHITELIST": "", "TRUSTED_PROXY_IPS": "",

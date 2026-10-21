@@ -157,6 +157,7 @@ class ChunkingService:
                 loading_method=metadata.get("loading_method", ""),
                 chunking_method=method,
                 pages=normalized_page_map,
+                chunk_size=chunk_size,
             )
         except Exception as e:
             logger.error(f"Error in chunk_text: {str(e)}")
@@ -170,6 +171,7 @@ class ChunkingService:
         loading_method: str,
         chunking_method: str,
         pages: List[Dict[str, Any]],
+        chunk_size: int,
     ) -> dict:
         """统一补齐 chunk 元数据，并对超长 chunk 做二次展开。
 
@@ -180,6 +182,7 @@ class ChunkingService:
             loading_method (str): 上游加载方式。
             chunking_method (str): 当前采用的切分策略。
             pages (List[Dict[str, Any]]): 标准化后的页级结构。
+            chunk_size (int): 本次切分使用的目标词数，随结果写入 chunking_params。
 
         返回:
             dict: 可直接供下游保存或向量化的统一切分结果。
@@ -228,6 +231,13 @@ class ChunkingService:
             "timestamp": datetime.now().isoformat(),
             "pages": pages,
             "chunks": chunks,
+            # 记录本次实际生效的切分参数，落盘后管理端才能对照参数查看切分效果。
+            "chunking_params": {
+                "chunk_size": int(chunk_size),
+                "max_chunk_content_length": MAX_CHUNK_CONTENT_LENGTH,
+                "chunk_overlap_length": CHUNK_OVERLAP_LENGTH,
+                "split_search_window": CHUNKING_CONFIG["split_search_window"],
+            },
         }
 
     def _expand_overlong_chunks(

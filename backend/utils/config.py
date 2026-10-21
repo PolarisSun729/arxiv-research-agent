@@ -80,13 +80,6 @@ CORE_CONFIG: Dict[str, Any] = {
     "service_load_mode": _env_str("BACKEND_SERVICE_LOAD_MODE", "preload"),
 }
 
-DEBUG_ROUTES_CONFIG: Dict[str, Any] = {
-    # 调试路由会读取本地诊断产物，默认关闭，避免生产或演示环境暴露内部文件结构。
-    "enable_debug_routes": _env_bool("ENABLE_DEBUG_ROUTES", False),
-    # chunk 调试接口只返回文本预览，防止一次请求把完整 PDF 解析文本或超大字段暴露出去。
-    "chunk_content_preview_chars": _env_int("DEBUG_CHUNK_CONTENT_PREVIEW_CHARS", 4000),
-}
-
 BACKEND_LOGGING_CONFIG: Dict[str, Any] = {
     # CMD 默认展示请求主时间线；需要深挖时再按模块打开 DEBUG，避免全后端日志一起刷屏。
     "level": (_env_str("BACKEND_LOG_LEVEL", "INFO") or "INFO").upper(),
@@ -866,10 +859,6 @@ GENERATION_CONFIG: Dict[str, Any] = {
 
 def get_chunking_runtime_config() -> Dict[str, Any]:
     return dict(CHUNKING_CONFIG)
-
-
-def get_debug_routes_runtime_config() -> Dict[str, Any]:
-    return dict(DEBUG_ROUTES_CONFIG)
 
 
 def get_backend_logging_runtime_config() -> Dict[str, Any]:

@@ -699,6 +699,7 @@ class PaperQAIndexBuilder:
         document: Dict[str, Any],
         chunking_strategy: str,
         index_version: Optional[str] = None,
+        chunking_params: Optional[Dict[str, Any]] = None,
     ) -> str:
         """保存 chunk 文件（JSON），文件名带 index_version 以免不同版本互相覆盖。
 
@@ -711,6 +712,8 @@ class PaperQAIndexBuilder:
         # retrieval index 是 chunk 之上的派生层，写入调试产物时不改变原 chunks 列表本身。
         document_for_save["retrieval_indexes"] = retrieval_indexes
         document_for_save["retrieval_index_debug"] = summarize_retrieval_indexes(retrieval_indexes)
+        if chunking_params:
+            document_for_save["chunking_params"] = dict(chunking_params)
         chunk_file = loading_service.save_document(
             filename=filename,
             chunks=chunks,
@@ -1498,6 +1501,7 @@ class PaperQAIndexBuilder:
                 document=document,
                 chunking_strategy=chunking_strategy,
                 index_version=index_version,
+                chunking_params=chunked_data.get("chunking_params"),
             )
             artifact_state["chunk_file"] = chunk_file
             self.record_index_stage(arxiv_id, current_stage=current_stage, loading_method=loading_method, build_id=build_id, **artifact_state)
