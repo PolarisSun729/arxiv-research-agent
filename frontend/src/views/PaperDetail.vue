@@ -91,6 +91,8 @@ const quickPrompts = computed(() => [
 
 const hasQaIndex = computed(() => Boolean(qaStatus.value?.has_index))
 const hasActiveQaJob = computed(() => ['pending', 'running'].includes(String(qaIndexJob.value?.status || '')))
+// 删除索引不会改动已结束的构建任务；成功任务建出的索引若已被删除，就不再展示「已完成」，以免和「未建立问答索引」矛盾。
+const showQaJobStatus = computed(() => Boolean(qaIndexJob.value) && !(qaIndexJob.value?.status === 'success' && !hasQaIndex.value))
 const chatTurns = computed(() => qaResults.value)
 const ragChatMessages = computed(() => chatTurns.value.flatMap(qaTurnToRagMessages))
 // Milvus 存的是 RetrievalIndex 向量（非原始 chunk），核对基准是后端按入库规则算出的预期向量数。
@@ -592,7 +594,7 @@ watch(paperId, async () => {
             </el-radio-group>
           </div>
 
-          <div v-if="qaIndexJob" class="aside-block job-status">
+          <div v-if="qaIndexJob && showQaJobStatus" class="aside-block job-status">
             <div class="job-status-head">
               <span :class="['chip', qaIndexJob.status === 'success' ? 'chip--success' : (qaIndexJob.status === 'failed' ? 'chip--danger' : 'chip--warning')]">
                 {{ qaJobStatusText }}
