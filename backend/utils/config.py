@@ -129,8 +129,6 @@ DOCLING_CONFIG: Dict[str, Any] = {
     "legend_title_height": float(_env_str("DOCLING_LEGEND_TITLE_HEIGHT", "12.0")),
     "legend_margin": float(_env_str("DOCLING_LEGEND_MARGIN", "12.0")),
     "table_caption_short_text_limit": _env_int("DOCLING_TABLE_CAPTION_SHORT_TEXT_LIMIT", 8),
-    "normalized_upper_short_length": _env_int("DOCLING_NORMALIZED_UPPER_SHORT_LENGTH", 4),
-    "normalized_heading_length": _env_int("DOCLING_NORMALIZED_HEADING_LENGTH", 80),
     "vertical_gap_multiplier": float(_env_str("DOCLING_VERTICAL_GAP_MULTIPLIER", "1.6")),
     "x_aligned_tolerance": float(_env_str("DOCLING_X_ALIGNED_TOLERANCE", "24.0")),
     "same_column_tolerance": float(_env_str("DOCLING_SAME_COLUMN_TOLERANCE", "80.0")),

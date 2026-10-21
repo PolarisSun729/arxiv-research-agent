@@ -1121,37 +1121,32 @@ class ChunkingService:
         page_start = self._safe_int(item.get("page_start", item.get("page", item.get("page_number"))))
         page_end = self._safe_int(item.get("page_end", page_start))
         order_index = self._safe_int(item.get("order_index", item.get("line_no", item.get("index"))))
-        heading_candidate = self._is_docling_heading_candidate(text, heading_level)
-        caption_labels = {"caption", "table_caption", "figure_caption"}
+        label_key = label.lower()
 
-        # 先基于显式标签和角色判断，再用启发式补足 heading 分类。
-        if label in caption_labels:
+        # 标题只认 Docling 的版面标签：section_header 是章节标题，title 是论文主标题；
+        # text、list_item 等正文不按文字长相升为标题。没有 label 的条目才看 node_kind / role。
+        if label_key in {"caption", "table_caption", "figure_caption"}:
             node_kind = "caption"
-        elif node_kind == "title":
+        elif label_key in {"section_header", "sectionheaderitem"}:
+            node_kind = "section_header"
+        elif label_key in {"title", "titleitem"}:
             node_kind = "title"
-        elif node_kind == "section_header":
-            node_kind = "section_header" if heading_candidate else "paragraph"
-        elif role == "title":
+        elif label_key:
+            node_kind = "paragraph"
+        elif node_kind == "title" or role == "title":
             node_kind = "title"
-        elif role == "heading":
-            node_kind = "section_header" if heading_candidate else "paragraph"
-        elif heading_level is not None:
-            node_kind = "section_header" if heading_candidate else "paragraph"
-        elif heading_candidate:
+        elif node_kind == "section_header" or role == "heading":
             node_kind = "section_header"
         else:
             node_kind = "paragraph"
 
         # 图片/表格上下文中的短文本更可能是说明文字，不应误判为章节标题。
         if self._docling_parent_is_visual_context(parent) and node_kind == "section_header":
-            if label not in caption_labels:
-                node_kind = "paragraph"
-                heading_level = None
+            node_kind = "paragraph"
+            heading_level = None
 
         if not heading_level and node_kind == "section_header":
-            heading_level = self._heading_level({"text": text, "role": "heading"})
-            if heading_level is None:
-                heading_level = 1
+            heading_level = 1
 
         normalized = {
             "text": text,
@@ -1189,44 +1184,16 @@ class ChunkingService:
         return False
 
     def _docling_item_is_heading(self, item: Dict[str, Any]) -> bool:
+        # item 已经过 _normalize_docling_item，node_kind 只由 Docling 标签决定。
         if self._docling_item_is_noise(item):
             return False
-
         node_kind = str(item.get("node_kind", "") or "").strip().lower()
-        if node_kind == "caption":
-            return False
-        if node_kind == "section_header":
-            return True
-        if node_kind == "title":
-            return True
-
-        label = str(item.get("label", "") or "").strip().lower()
-        if label in {"caption", "table_caption", "figure_caption"}:
-            return False
-        if label in {"section_header", "sectionheaderitem"}:
-            return self._is_docling_heading_candidate(str(item.get("text", "") or ""), self._safe_int(item.get("heading_level", item.get("level"))))
-        if label in {"title", "titleitem"}:
-            return True
-
-        parent = str(item.get("parent", "") or "").strip().lower()
-        if self._docling_parent_is_visual_context(parent):
-            return False
-
-        heading_level = item.get("heading_level")
-        text = str(item.get("text", "") or "").strip()
-        if heading_level is not None and text:
-            return self._is_docling_heading_candidate(text, self._safe_int(heading_level))
-        return self._is_docling_heading_candidate(text)
+        return node_kind in {"section_header", "title"}
 
     def _docling_heading_level(self, item: Dict[str, Any]) -> int:
         heading_level = self._safe_int(item.get("heading_level"))
         if heading_level is not None and heading_level > 0:
             return heading_level
-
-        text = str(item.get("text", "") or "").strip()
-        inferred = self._heading_level({"text": text, "role": "heading"}) if text else None
-        if inferred is not None:
-            return int(inferred)
         return 1
 
     def _build_docling_sections(self, docling_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1494,135 +1461,6 @@ class ChunkingService:
 
         flush()
         return chunks
-
-    def _heading_level(self, line: Dict[str, Any]) -> Optional[int]:
-        text = str(line.get("text", "")).strip()
-        if not text:
-            return None
-
-        if line.get("role") == "heading":
-            return int(line.get("heading_level") or 1)
-
-        if line.get("heading_level") is not None:
-            try:
-                return int(line["heading_level"])
-            except (TypeError, ValueError):
-                return 1
-
-        if text in {"Abstract", "References"}:
-            return 1
-
-        numbered_match = re.match(r"^([1-9]\d*(?:\.\d+)*)\s+([A-Z].{0,140})$", text)
-        if numbered_match and len(text) <= 160:
-            prefix = numbered_match.group(1)
-            try:
-                leading_number = int(prefix.split(".")[0])
-            except ValueError:
-                return None
-            if leading_number > 20:
-                return None
-            # Numbered top-level sections such as "1 Introduction" remain level 1.
-            # Numbered subsections such as "2.1 ..." are treated as level 2.
-            if "." in prefix:
-                return 2
-            return 1
-
-        words = text.split()
-        if len(words) > 6 or len(text) > 80:
-            return None
-        if text.endswith((".", ",", ";", ":")):
-            return None
-        if any(ch.isdigit() for ch in text):
-            return None
-        if "," in text or "/" in text:
-            return None
-        if not (text[0].isupper() or text.isupper()):
-            return None
-
-        bbox = line.get("bbox")
-        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
-            line_height = float(bbox[3]) - float(bbox[1])
-        else:
-            line_height = None
-
-        gap_before = line.get("gap_before")
-        gap_after = line.get("gap_after")
-        if not (
-            isinstance(line_height, (int, float))
-            and line_height > 0
-            and isinstance(gap_before, (int, float))
-            and isinstance(gap_after, (int, float))
-            and gap_before >= line_height * 0.75
-            and gap_after >= line_height * 0.6
-        ):
-            return None
-
-        font_size = line.get("font_size")
-        if not (isinstance(font_size, (int, float)) and float(font_size) >= 10.0):
-            return None
-
-        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
-            if float(bbox[0]) > 85.0:
-                return None
-
-        if text.isupper() and len(words) <= 6:
-            return 1
-
-        if len(words) <= 4:
-            return 1
-
-        return None
-
-    def _looks_like_heading_text(self, text: str) -> bool:
-        normalized = str(text or "").strip()
-        if not normalized:
-            return False
-        if len(normalized) > 80:
-            return False
-        if ":" in normalized:
-            return False
-        if normalized.endswith((".", ",", ";")):
-            return False
-        if any(ch.isdigit() for ch in normalized):
-            return False
-        if "," in normalized or "/" in normalized:
-            return False
-        words = normalized.split()
-        if len(words) > 5:
-            return False
-        if len(words) == 1 and normalized.isupper() and len(normalized) <= 4:
-            return False
-        return normalized[0].isupper() or normalized.isupper()
-
-    def _is_docling_numbered_heading_text(self, text: str) -> bool:
-        normalized = str(text or "").strip()
-        if not normalized:
-            return False
-        return bool(
-            re.fullmatch(
-                r"(?:\d+(?:\.\d+)*|[IVXLCM]+\.?|[A-Z]\.?)\s+[A-Z].{0,160}",
-                normalized,
-            )
-        )
-
-    def _is_docling_heading_candidate(self, text: str, heading_level: Optional[int] = None) -> bool:
-        normalized = str(text or "").strip()
-        if not normalized:
-            return False
-
-        if self._is_docling_numbered_heading_text(normalized):
-            return True
-
-        if normalized.lower() in {"abstract", "references", "acknowledgements", "acknowledgments"}:
-            return True
-
-        if self._looks_like_heading_text(normalized):
-            return True
-
-        if heading_level is not None and heading_level > 0 and len(normalized) <= 80:
-            return self._looks_like_heading_text(normalized)
-
-        return False
 
     def _docling_parent_is_visual_context(self, parent: str) -> bool:
         normalized = str(parent or "").strip().lower()

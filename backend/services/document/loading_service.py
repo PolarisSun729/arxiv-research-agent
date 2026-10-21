@@ -1224,7 +1224,7 @@ class LoadingService:
         page_end = max(page_numbers) if page_numbers else page_start
 
         parent = self._stringify_docling_value(getattr(item, "parent", None))
-        node_kind = self._classify_docling_item_kind(label, text, level, content_layer, parent)
+        node_kind = self._classify_docling_item_kind(label, content_layer, parent)
 
         normalized: Dict[str, Any] = {
             "text": text,
@@ -1881,13 +1881,12 @@ class LoadingService:
     def _classify_docling_item_kind(
         self,
         label: Any,
-        text: str,
-        level: Optional[int],
         content_layer: Optional[str],
         parent: Optional[str] = None,
     ) -> str:
+        # 标题只认 Docling 的版面标签：section_header 是章节标题，title 是论文主标题；
+        # text、list_item 等正文不按文字长相升为标题。
         normalized_label = str(label or "").strip().lower()
-        normalized_text = str(text or "").strip()
         normalized_layer = str(content_layer or "").strip().lower()
         normalized_parent = str(parent or "").strip().lower()
 
@@ -1910,9 +1909,6 @@ class LoadingService:
             return "formula"
 
         if normalized_label in {"section_header", "sectionheaderitem"}:
-            return "section_header" if self._is_docling_heading_candidate(normalized_text, level) else "paragraph"
-
-        if self._is_docling_heading_candidate(normalized_text, level):
             return "section_header"
 
         return "paragraph"
@@ -1995,57 +1991,6 @@ class LoadingService:
         if serialized is None:
             return ""
         return str(serialized).strip()
-
-    def _looks_like_heading_text(self, text: str) -> bool:
-        normalized = str(text or "").strip()
-        if not normalized:
-            return False
-        if len(normalized) > 80:
-            return False
-        if ":" in normalized:
-            return False
-        if normalized.endswith((".", ",", ";")):
-            return False
-        if any(ch.isdigit() for ch in normalized):
-            return False
-        if "," in normalized or "/" in normalized:
-            return False
-        words = normalized.split()
-        if len(words) > 5:
-            return False
-        if len(words) == 1 and normalized.isupper() and len(normalized) <= int(DOCLING_CONFIG.get("normalized_upper_short_length", 4)):
-            return False
-        return normalized[0].isupper() or normalized.isupper()
-
-    def _is_docling_numbered_heading_text(self, text: str) -> bool:
-        normalized = str(text or "").strip()
-        if not normalized:
-            return False
-        return bool(
-            re.fullmatch(
-                r"(?:\d+(?:\.\d+)*|[IVXLCM]+\.?|[A-Z]\.?)\s+[A-Z].{0,160}",
-                normalized,
-            )
-        )
-
-    def _is_docling_heading_candidate(self, text: str, level: Optional[int] = None) -> bool:
-        normalized = str(text or "").strip()
-        if not normalized:
-            return False
-
-        if self._is_docling_numbered_heading_text(normalized):
-            return True
-
-        if normalized.lower() in {"abstract", "references", "acknowledgements", "acknowledgments"}:
-            return True
-
-        if self._looks_like_heading_text(normalized):
-            return True
-
-        if level is not None and level > 0 and len(normalized) <= int(DOCLING_CONFIG.get("normalized_heading_length", 80)):
-            return self._looks_like_heading_text(normalized)
-
-        return False
 
     def _is_docling_page_furniture(self, label: Any, content_layer: Any) -> bool:
         """页眉、页脚（含页码）：Docling 放在 furniture 层，标签为 page_header / page_footer。

@@ -154,5 +154,24 @@ class ChunkingServiceDoclingNoiseTests(unittest.TestCase):
         self.assertEqual([item["text"] for item in collected], ["Body paragraph about the threat model and attacker capabilities."])
 
 
+
+class ChunkingServiceDoclingHeadingTests(unittest.TestCase):
+    """章节标题只认 Docling 的 section_header / title 标签，不按文字长相判断。"""
+
+    def test_section_header_label_is_trusted_and_text_is_never_promoted(self) -> None:
+        items = [
+            {"text": "1. Introduction", "label": "section_header", "content_layer": "body", "page_start": 1, "order_index": 1},
+            {"text": "Offline preprocessing", "label": "text", "content_layer": "body", "page_start": 1, "order_index": 2},
+            {"text": "A.1 Hardware Infrastructure", "label": "section_header", "content_layer": "body", "page_start": 9, "order_index": 3},
+            {"text": "User query q", "label": "list_item", "content_layer": "body", "page_start": 9, "order_index": 4},
+            {"text": "Encoder", "label": "section_header", "content_layer": "body", "parent": "#/pictures/0", "page_start": 9, "order_index": 5},
+        ]
+
+        service = ChunkingService()
+        collected = service._collect_docling_items({"docling_text_items": items}, [])
+        headings = [item["text"] for item in collected if service._docling_item_is_heading(item)]
+
+        self.assertEqual(headings, ["1. Introduction", "A.1 Hardware Infrastructure"])
+
 if __name__ == "__main__":
     unittest.main()
