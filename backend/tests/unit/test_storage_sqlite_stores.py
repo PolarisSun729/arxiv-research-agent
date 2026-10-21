@@ -241,21 +241,31 @@ class StorageContainerSqliteTests(unittest.TestCase):
         store = self.storage.paper_qa_index
         self.assertTrue(store.insert_paper_qa_index("2401.00011", status="indexed", chunk_count=7, chunking_strategy="docling_sections"))
         self.assertTrue(store.insert_paper_qa_index("2401.00012", status="failed"))
+        # 首次构建失败时主表停在 not_indexed，列表按最近一个版本改报 first_build_failed；仍在构建的保持 not_indexed。
+        failed_build = store.create_paper_qa_index_build("2401.00013", "docling")
+        self.assertTrue(store.update_paper_qa_index_build(failed_build["build_id"], status="build_failed"))
+        store.create_paper_qa_index_build("2401.00014", "docling")
 
         items, total = store.list_paper_qa_indexes()
-        self.assertEqual(total, 2)
+        self.assertEqual(total, 4)
         by_id = {item["arxiv_id"]: item for item in items}
         self.assertEqual(by_id["2401.00011"]["title"], "Paper 2401.00011")
         self.assertEqual(by_id["2401.00011"]["chunk_count"], 7)
         # 论文库里没有的论文仍要列出，只是没有标题。
         self.assertIsNone(by_id["2401.00012"]["title"])
+        self.assertEqual(by_id["2401.00013"]["status"], "first_build_failed")
+        self.assertEqual(by_id["2401.00014"]["status"], "not_indexed")
 
         items, total = store.list_paper_qa_indexes(query="Paper 2401")
         self.assertEqual([item["arxiv_id"] for item in items], ["2401.00011"])
         items, total = store.list_paper_qa_indexes(status="failed")
         self.assertEqual((total, items[0]["arxiv_id"]), (1, "2401.00012"))
+        items, total = store.list_paper_qa_indexes(status="first_build_failed")
+        self.assertEqual((total, items[0]["arxiv_id"]), (1, "2401.00013"))
+        items, total = store.list_paper_qa_indexes(status="not_indexed")
+        self.assertEqual((total, items[0]["arxiv_id"]), (1, "2401.00014"))
         items, total = store.list_paper_qa_indexes(offset=1, limit=1)
-        self.assertEqual((total, len(items)), (2, 1))
+        self.assertEqual((total, len(items)), (4, 1))
 
     def test_paper_qa_index_build_activation_keeps_single_active_version(self) -> None:
         arxiv_id = "2401.01000"

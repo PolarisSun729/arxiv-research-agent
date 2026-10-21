@@ -346,15 +346,25 @@ class PaperQAIndexStore(BaseSqliteStore):
         offset: int = 0,
         limit: int = 50,
     ) -> Tuple[List[Dict[str, Any]], int]:
-        """管理端分页列出所有论文的索引主表记录，附带论文标题和版本数；query 同时匹配 arxiv_id 与标题。"""
+        """管理端分页列出所有论文的索引主表记录，附带论文标题和版本数；query 同时匹配 arxiv_id 与标题。
+
+        返回的 status 是给管理员看的状态：主表在首次构建成功前一直是 not_indexed，
+        若最近一个版本已经 build_failed，就改报 first_build_failed；status 过滤也按这个状态。
+        """
         where_parts: List[str] = []
         values: List[Any] = []
         normalized_query = str(query or "").strip()
         if normalized_query:
             where_parts.append("(i.arxiv_id LIKE ? OR p.title LIKE ?)")
             values.extend([f"%{normalized_query}%"] * 2)
+        status_sql = (
+            "CASE WHEN i.status = 'not_indexed' AND ("
+            "SELECT v.status FROM paper_qa_index_versions v WHERE v.arxiv_id = i.arxiv_id "
+            "ORDER BY v.created_at DESC, v.rowid DESC LIMIT 1"
+            ") = 'build_failed' THEN 'first_build_failed' ELSE i.status END"
+        )
         if status:
-            where_parts.append("i.status = ?")
+            where_parts.append(f"{status_sql} = ?")
             values.append(status)
         where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
         from_sql = "FROM paper_qa_index i LEFT JOIN arxiv_papers p ON p.arxiv_id = i.arxiv_id"
@@ -369,7 +379,7 @@ class PaperQAIndexStore(BaseSqliteStore):
                 total = int(cursor.fetchone()[0] or 0)
                 cursor.execute(
                     f"""
-                    SELECT i.arxiv_id, p.title, i.status, i.chunk_count, i.loading_method, i.chunking_strategy,
+                    SELECT i.arxiv_id, p.title, {status_sql}, i.chunk_count, i.loading_method, i.chunking_strategy,
                            i.active_build_id, i.indexed_at, i.updated_at,
                            (SELECT COUNT(*) FROM paper_qa_index_versions v WHERE v.arxiv_id = i.arxiv_id)
                     {from_sql} {where_sql}
