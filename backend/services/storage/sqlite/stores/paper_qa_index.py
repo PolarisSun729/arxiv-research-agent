@@ -348,8 +348,9 @@ class PaperQAIndexStore(BaseSqliteStore):
     ) -> Tuple[List[Dict[str, Any]], int]:
         """管理端分页列出所有论文的索引主表记录，附带论文标题和版本数；query 同时匹配 arxiv_id 与标题。
 
-        返回的 status 是给管理员看的状态：主表在首次构建成功前一直是 not_indexed，
-        若最近一个版本已经 build_failed，就改报 first_build_failed；status 过滤也按这个状态。
+        返回的 status 是给管理员看的状态，status 过滤也按它：主表在构建成功前不会变（首次构建是 not_indexed，
+        删除后重建是 deleted），所以这两种情况按最近一个版本改报 building / build_failed。
+        已删除且没有在重建的索引不再列出：删除流程已清掉它的 chunk 文件，没有可看的内容。
         """
         where_parts: List[str] = []
         values: List[Any] = []
@@ -357,12 +358,15 @@ class PaperQAIndexStore(BaseSqliteStore):
         if normalized_query:
             where_parts.append("(i.arxiv_id LIKE ? OR p.title LIKE ?)")
             values.extend([f"%{normalized_query}%"] * 2)
-        status_sql = (
-            "CASE WHEN i.status = 'not_indexed' AND ("
-            "SELECT v.status FROM paper_qa_index_versions v WHERE v.arxiv_id = i.arxiv_id "
-            "ORDER BY v.created_at DESC, v.rowid DESC LIMIT 1"
-            ") = 'build_failed' THEN 'first_build_failed' ELSE i.status END"
+        latest_build_status_sql = (
+            "(SELECT v.status FROM paper_qa_index_versions v WHERE v.arxiv_id = i.arxiv_id "
+            "ORDER BY v.created_at DESC, v.rowid DESC LIMIT 1)"
         )
+        status_sql = (
+            f"CASE WHEN i.status IN ('not_indexed', 'deleted') AND {latest_build_status_sql} IN ('building', 'build_failed') "
+            f"THEN {latest_build_status_sql} ELSE i.status END"
+        )
+        where_parts.append(f"{status_sql} != 'deleted'")
         if status:
             where_parts.append(f"{status_sql} = ?")
             values.append(status)

@@ -12,16 +12,15 @@ import { normalizeServerTimestamp } from '@/utils/format'
 const LIST_PAGE_SIZE = 50
 const CHUNK_PAGE_SIZE = 20
 
-// first_build_failed 由列表接口派生：主表仍是 not_indexed，但最近一个版本已构建失败。
+// 状态由列表接口派生：还没有可用索引时按最近一个版本显示「构建中 / 构建失败」；已删除的索引不在列表里。
 const INDEX_STATUS_LABELS: Record<string, string> = {
   indexed: '已索引',
-  first_build_failed: '首次构建失败',
+  building: '构建中',
+  build_failed: '构建失败',
   failed: '失败',
   not_indexed: '未索引',
-  building: '构建中',
-  deleted: '已删除',
 }
-const FAILED_INDEX_STATUSES = new Set(['failed', 'first_build_failed'])
+const FAILED_INDEX_STATUSES = new Set(['failed', 'build_failed'])
 const BUILD_STATUS_LABELS: Record<string, string> = { active: '生效中', build_success: '已构建', build_failed: '构建失败', building: '构建中', orphaned: '已废弃' }
 const CHUNK_TYPE_LABELS: Record<string, string> = { text: '正文', table: '表格', figure: '图片' }
 const UNAVAILABLE_REASONS: Record<string, string> = {
