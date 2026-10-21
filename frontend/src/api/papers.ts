@@ -645,12 +645,9 @@ export interface CreateQaIndexResult {
   document_markdown_length?: number
 }
 
-export async function createPaperQaIndex(arxivId: string, loadingMethod: string = 'pymupdf'): Promise<CreateQaIndexResult> {
-  return request.post(`/paper/${arxivId}/create-qa-index`, null, {
-    params: {
-      loading_method: loadingMethod
-    }
-  })
+// PDF 只用 Docling 解析，loading_method 交给后端默认值。
+export async function createPaperQaIndex(arxivId: string): Promise<CreateQaIndexResult> {
+  return request.post(`/paper/${arxivId}/create-qa-index`)
 }
 
 export interface QaIndexJobResult {

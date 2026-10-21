@@ -552,7 +552,7 @@ def check_pdf_dependencies() -> DoctorResult:
     return _result(
         "PDF 解析依赖",
         "PASS",
-        "PyMuPDF、Docling、pypdf 均可导入。",
+        "Docling、PyMuPDF（标注与图表裁剪）、pypdf 均可导入。",
         required=True,
         affects_default_tests=False,
         affects_real_runtime=True,

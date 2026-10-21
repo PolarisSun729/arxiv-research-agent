@@ -83,7 +83,7 @@ flowchart TD
 
 ### 2. 证据驱动的论文级 RAG
 
-- 使用 Docling、PyMuPDF 等组件加载并解析论文内容。
+- 使用 Docling 解析论文版面与结构（PyMuPDF 只用于标注 PDF 和裁剪图表）。
 - 构建 chunk、Embedding、稀疏索引和论文级检索资产。
 - 组合向量检索、BM25、关键词、结构化表格等召回路径。
 - 通过候选融合、rerank、上下文扩展和预算控制构造最终上下文。

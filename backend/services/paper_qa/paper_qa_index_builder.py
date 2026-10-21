@@ -147,14 +147,10 @@ class PaperQAIndexBuilder:
         return sorted(str(index_type) for index_type in type_counts if str(index_type).strip())
 
     def validate_loading_method(self, loading_method: str) -> str:
-        """校验并规范化 PDF 加载方式，只允许当前支持的方法；空值回退为 DEFAULT_LOADING_METHOD。
-
-        旧实现空值回退为 pymupdf，与 build_qa_index / 路由层 / IndexJobManager 的默认值 docling 不一致，
-        现统一为同一个常量。
-        """
+        """校验并规范化 PDF 加载方式；只支持 docling，空值回退为 DEFAULT_LOADING_METHOD。"""
         normalized_method = str(loading_method or DEFAULT_LOADING_METHOD).strip().lower()
-        if normalized_method not in {"pymupdf", "docling"}:
-            raise HTTPException(status_code=400, detail="loading_method must be either pymupdf or docling")
+        if normalized_method != "docling":
+            raise HTTPException(status_code=400, detail="loading_method must be docling")
         return normalized_method
 
     def mark_build_processing(self, build_id: str, *, loading_method: str) -> None:
@@ -621,20 +617,15 @@ class PaperQAIndexBuilder:
         document: Dict[str, Any],
         page_map: List[Dict[str, Any]],
     ) -> Tuple[Dict[str, Any], str]:
-        """按指定加载方式对论文内容切块，并返回切块结果与切块策略名。"""
+        """按 Docling 章节结构对论文内容切块，并返回切块结果与切块策略名。"""
         if self.chunking_service_factory is None:
             raise RuntimeError("chunking_service_factory is required")
         chunking_service = self.chunking_service_factory()
         logger.debug("Chunking text...")
         metadata = {"filename": f"{arxiv_id}.pdf", "loading_method": loading_method, "source": f"{arxiv_id}.pdf"}
-        if loading_method == "docling":
-            # Docling 结构更强，优先按章节语义切块，保留表格/图片等结构信息。
-            chunked_data = chunking_service.chunk_docling(document, metadata=metadata, page_map=page_map)
-            chunking_strategy = "docling_sections"
-        else:
-            # PyMuPDF 主要依赖标题层级切块，以保证普通 PDF 也能稳定建索引。
-            chunked_data = chunking_service.chunk_pymupdf(document, method="by_titles", metadata=metadata, page_map=page_map)
-            chunking_strategy = "pymupdf_by_titles"
+        # 按章节语义切块，保留表格/图片等结构信息。
+        chunked_data = chunking_service.chunk_docling(document, metadata=metadata, page_map=page_map)
+        chunking_strategy = "docling_sections"
 
         chunks = chunked_data["chunks"]
         logger.debug("Created %s chunks", len(chunks))
@@ -1334,7 +1325,7 @@ class PaperQAIndexBuilder:
         """执行一次完整的版本化建库，成功时返回新 active 版本的产物摘要。
 
         Args:
-            loading_method: PDF 解析方式（docling / pymupdf）。
+            loading_method: PDF 解析方式，只支持 docling。
             progress_callback: 可选进度回调，签名为 (*, current_stage, progress, message)；回调异常会被吞掉。
             run_id: 仅用于日志关联（例如由 Agent 触发的长任务）。
 

@@ -192,7 +192,7 @@ def describe_chunk_artifact(raw_chunk_file: Any) -> Dict[str, Any]:
 
 
 def project_parsed_document(payload: Mapping[str, Any]) -> Dict[str, Any]:
-    """解析结果：逐页文本（PyMuPDF 与 Docling 都有）和 Docling 导出的整篇 Markdown（PyMuPDF 为空）。"""
+    """解析结果：逐页文本和整篇 Markdown（由过滤后的 Docling 文本项拼成；早期 PyMuPDF 解析的旧索引没有 Markdown）。"""
     pages = []
     for position, page in enumerate(payload.get("pages") or [], start=1):
         if not isinstance(page, Mapping):
