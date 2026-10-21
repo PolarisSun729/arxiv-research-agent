@@ -3,8 +3,6 @@ import type { RouteRecordRaw } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { AUTH_REQUIRED_EVENT, currentUser, getAuthMode, restoreSession } from '@/api/auth'
 
-const debugRoutesEnabled = import.meta.env.VITE_ENABLE_DEBUG_ROUTES === 'true'
-
 const routes: RouteRecordRaw[] = [
   {
     path: '/',
@@ -65,22 +63,18 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/AdminUsers.vue')
   },
   {
+    path: '/admin/indexes',
+    name: 'AdminIndexes',
+    meta: { title: '索引切分', admin: true, jwt: true },
+    component: () => import('@/views/AdminIndexes.vue')
+  },
+  {
     path: '/labeled',
     name: 'LabeledPapers',
     meta: { title: '已标记论文' },
     component: () => import('@/views/LabeledPapers.vue')
   }
 ]
-
-if (debugRoutesEnabled) {
-  // chunk 页面只服务本地排查，默认不进入正式前端路由表。
-  routes.push({
-    path: '/chunks',
-    name: 'Chunks',
-    meta: { title: '调试切片', admin: true },
-    component: () => import('@/views/Chunks.vue')
-  })
-}
 
 // 兜底路由必须最后注册；它同样经过登录守卫，未登录访问未知地址会先去登录页。
 routes.push({
