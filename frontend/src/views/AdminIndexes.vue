@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search } from '@element-plus/icons-vue'
 import AuthenticatedImage from '@/components/AuthenticatedImage.vue'
 import { figureAssetUrl, getPaperIndex, getParsedDocument, listPaperIndexes } from '@/api/adminIndexes'
 import type { IndexedChunk, LengthBucket, PaperIndexBuild, PaperIndexDetail, PaperIndexSummary, ParsedDocument } from '@/api/adminIndexes'
 import { getErrorMessage } from '@/api/errors'
+import { createPaperQaIndex, getLatestPaperQaIndexJob, getPaperQaIndexJob } from '@/api/papers'
+import type { QaIndexJobResult } from '@/api/papers'
 import { normalizeServerTimestamp } from '@/utils/format'
 
 const LIST_PAGE_SIZE = 50
@@ -28,6 +30,9 @@ const UNAVAILABLE_REASONS: Record<string, string> = {
   missing: 'chunk 文件已被清理，或不在当前服务器上。',
   invalid: 'chunk 文件内容无法解析。'
 }
+
+const REBUILD_POLL_MS = 3000
+const ACTIVE_JOB_STATUSES = new Set(['pending', 'running', 'retrying'])
 
 const route = useRoute()
 const router = useRouter()
@@ -84,6 +89,7 @@ async function loadDetail() {
     const result = await getPaperIndex(requestedId, selectedBuildId.value)
     // 快速切换论文时只采用最后一次选择的结果。
     if (requestedId === selectedId.value) detail.value = result
+    void restoreRebuildJob(requestedId)
   } catch (error) {
     detail.value = null
     ElMessage.error(getErrorMessage(error, '索引详情读取失败'))
@@ -215,10 +221,153 @@ watch(activeTab, async tab => {
   finally { loadingParsed.value = false }
 })
 
+// ---- 重建索引：复用建索引接口。后端构建新版本，成功后才切换，构建期间旧索引照常可用 ----
+const rebuildJobs = ref<Record<string, QaIndexJobResult>>({})
+const batchDialogVisible = ref(false)
+const batchSelection = ref<string[]>([])
+const batchSubmitting = ref(false)
+let rebuildPollTimer: number | undefined
+
+function rebuildJob(arxivId: string) {
+  return rebuildJobs.value[arxivId] || null
+}
+
+const selectedRebuildJob = computed(() => rebuildJob(selectedId.value))
+
+function isRebuilding(arxivId: string) {
+  const job = rebuildJob(arxivId)
+  return !!job && ACTIVE_JOB_STATUSES.has(job.status)
+}
+
+function rebuildStatusText(job: QaIndexJobResult) {
+  if (job.status === 'pending' || job.status === 'retrying') return '重建排队中'
+  if (job.status === 'running') return `重建中 ${Math.round(Number(job.progress || 0))}%`
+  if (job.status === 'success') return '重建完成'
+  if (job.status === 'failed') return '重建失败'
+  return job.status
+}
+
+function rebuildChipClass(job: QaIndexJobResult) {
+  if (job.status === 'success') return 'chip--success'
+  if (job.status === 'failed') return 'chip--danger'
+  return 'chip--warning'
+}
+
+function setRebuildJob(job: QaIndexJobResult) {
+  rebuildJobs.value = { ...rebuildJobs.value, [job.arxiv_id]: job }
+}
+
+async function submitRebuild(arxivId: string) {
+  const result = await createPaperQaIndex(arxivId)
+  if (!result.job_id) throw new Error('后端没有返回构建任务')
+  setRebuildJob({
+    job_id: result.job_id,
+    arxiv_id: arxivId,
+    status: result.job_status || 'pending',
+    current_stage: result.current_stage || 'pending',
+    progress: typeof result.progress === 'number' ? result.progress : 0,
+  })
+}
+
+async function rebuildSelected() {
+  const arxivId = selectedId.value
+  if (!arxivId || isRebuilding(arxivId)) return
+  try {
+    await ElMessageBox.confirm(
+      `重新下载 PDF、解析并切分 ${arxivId}，生成新的索引版本。构建期间旧索引照常提供问答，新版本构建成功后才切换。`,
+      '重建索引',
+      { confirmButtonText: '开始重建', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch { return }
+  try {
+    await submitRebuild(arxivId)
+    ElMessage.success('重建任务已提交')
+    scheduleRebuildPoll()
+  } catch (error) { ElMessage.error(getErrorMessage(error, '重建任务提交失败')) }
+}
+
+const rebuildablePapers = computed(() => papers.value.filter(item => !isRebuilding(item.arxiv_id)))
+
+function openBatchDialog() {
+  batchSelection.value = rebuildablePapers.value.map(item => item.arxiv_id)
+  batchDialogVisible.value = true
+}
+
+const batchAllSelected = computed({
+  get: () => batchSelection.value.length > 0 && batchSelection.value.length === rebuildablePapers.value.length,
+  set: (checked: boolean) => {
+    batchSelection.value = checked ? rebuildablePapers.value.map(item => item.arxiv_id) : []
+  },
+})
+
+// 逐篇提交，后台任务排队依次构建；单篇提交失败不影响其余论文。
+async function submitBatchRebuild() {
+  const selection = [...batchSelection.value]
+  if (!selection.length) return
+  batchSubmitting.value = true
+  const failed: string[] = []
+  for (const arxivId of selection) {
+    try { await submitRebuild(arxivId) }
+    catch (error) {
+      failed.push(arxivId)
+      console.warn(`Rebuild submit failed for ${arxivId}:`, error)
+    }
+  }
+  batchSubmitting.value = false
+  batchDialogVisible.value = false
+  const submitted = selection.length - failed.length
+  if (failed.length) ElMessage.warning(`已提交 ${submitted} 篇，${failed.length} 篇提交失败：${failed.join('、')}`)
+  else ElMessage.success(`已提交 ${submitted} 篇重建任务，后台会依次构建`)
+  if (submitted) scheduleRebuildPoll()
+}
+
+function scheduleRebuildPoll() {
+  window.clearTimeout(rebuildPollTimer)
+  rebuildPollTimer = window.setTimeout(() => { void pollRebuildJobs() }, REBUILD_POLL_MS)
+}
+
+async function pollRebuildJobs() {
+  const active = Object.values(rebuildJobs.value).filter(job => ACTIVE_JOB_STATUSES.has(job.status))
+  let finished = false
+  await Promise.all(active.map(async previous => {
+    try {
+      const job = await getPaperQaIndexJob(previous.arxiv_id, previous.job_id)
+      setRebuildJob(job)
+      if (ACTIVE_JOB_STATUSES.has(job.status)) return
+      finished = true
+      if (job.status === 'failed') ElMessage.error(`${job.arxiv_id} 重建失败：${job.error_message || job.current_stage || '未知原因'}`)
+      // 选中的论文重建成功后回到生效版本，显示新的切分结果。
+      if (job.status === 'success' && job.arxiv_id === selectedId.value) {
+        if (selectedBuildId.value) void router.replace({ query: { paper: job.arxiv_id } })
+        else void loadDetail()
+      }
+    } catch (error) {
+      // 暂时性错误（服务重启、网络抖动）下一轮再查，任务仍在后台运行。
+      console.warn(`Rebuild job poll failed for ${previous.arxiv_id}:`, error)
+    }
+  }))
+  if (finished) void loadList()
+  if (Object.values(rebuildJobs.value).some(job => ACTIVE_JOB_STATUSES.has(job.status))) scheduleRebuildPoll()
+}
+
+// 刷新页面后，打开的论文若还有进行中的构建任务，接着显示进度。
+async function restoreRebuildJob(arxivId: string) {
+  if (rebuildJob(arxivId)) return
+  try {
+    const job = await getLatestPaperQaIndexJob(arxivId)
+    if (job?.job_id && ACTIVE_JOB_STATUSES.has(job.status)) {
+      setRebuildJob(job)
+      scheduleRebuildPoll()
+    }
+  } catch { /* 没有任务记录时接口返回 404，忽略 */ }
+}
+
 onMounted(() => {
   void loadList()
   void loadDetail()
 })
+
+onBeforeUnmount(() => window.clearTimeout(rebuildPollTimer))
 </script>
 
 <template>
@@ -226,7 +375,7 @@ onMounted(() => {
     <header class="page-header">
       <div class="page-header__text">
         <h1 class="page-title">索引切分</h1>
-        <p class="page-desc">查看已建索引论文的 chunk 切分结果和 PDF 解析结果，用来判断切分参数是否合适。数据来自索引构建时保存的 chunk 文件，只读。</p>
+        <p class="page-desc">查看已建索引论文的 chunk 切分结果和 PDF 解析结果，用来判断切分参数是否合适。改了解析或切分逻辑后，可以单篇或批量重建索引。</p>
       </div>
     </header>
 
@@ -237,6 +386,7 @@ onMounted(() => {
           <el-select v-model="statusFilter" placeholder="全部状态" clearable aria-label="索引状态" @change="searchList">
             <el-option v-for="(label, value) in INDEX_STATUS_LABELS" :key="value" :label="label" :value="value" />
           </el-select>
+          <el-button :disabled="!papers.length" @click="openBatchDialog">批量重建</el-button>
         </form>
         <div v-loading="loadingList" class="paper-list__items">
           <button
@@ -248,8 +398,13 @@ onMounted(() => {
           >
             <span class="paper-item__head">
               <span class="paper-item__id">{{ item.arxiv_id }}</span>
-              <span :class="['chip', item.status === 'indexed' ? 'chip--success' : FAILED_INDEX_STATUSES.has(item.status) ? 'chip--danger' : '']">
-                {{ INDEX_STATUS_LABELS[item.status] || item.status }}
+              <span class="chip-row">
+                <span v-if="rebuildJob(item.arxiv_id)" :class="['chip', rebuildChipClass(rebuildJob(item.arxiv_id)!)]">
+                  {{ rebuildStatusText(rebuildJob(item.arxiv_id)!) }}
+                </span>
+                <span :class="['chip', item.status === 'indexed' ? 'chip--success' : FAILED_INDEX_STATUSES.has(item.status) ? 'chip--danger' : '']">
+                  {{ INDEX_STATUS_LABELS[item.status] || item.status }}
+                </span>
               </span>
             </span>
             <span class="paper-item__title">{{ item.title || '（论文库中没有标题）' }}</span>
@@ -289,6 +444,21 @@ onMounted(() => {
             >
               <el-option v-for="build in detail.builds" :key="build.build_id" :label="buildLabel(build)" :value="build.build_id" :disabled="!build.has_chunk_file" />
             </el-select>
+            <el-button type="primary" :loading="isRebuilding(detail.arxiv_id)" @click="rebuildSelected">
+              {{ isRebuilding(detail.arxiv_id) ? rebuildStatusText(rebuildJob(detail.arxiv_id)!) : '重建索引' }}
+            </el-button>
+            <div v-if="selectedRebuildJob" class="detail-head__job">
+              <el-progress
+                :percentage="Math.round(Number(selectedRebuildJob.progress || 0))"
+                :stroke-width="6"
+                :status="selectedRebuildJob.status === 'failed' ? 'exception' : selectedRebuildJob.status === 'success' ? 'success' : undefined"
+              />
+              <span class="muted">
+                {{ rebuildStatusText(selectedRebuildJob) }}
+                <template v-if="isRebuilding(detail.arxiv_id) && selectedRebuildJob.current_stage"> · {{ selectedRebuildJob.current_stage }}</template>
+                <template v-if="selectedRebuildJob.error_message"> · {{ selectedRebuildJob.error_message }}</template>
+              </span>
+            </div>
           </div>
 
           <div v-if="unavailableReason" class="surface surface-pad">
@@ -449,6 +619,23 @@ onMounted(() => {
         </template>
       </section>
     </div>
+
+    <el-dialog v-model="batchDialogVisible" title="批量重建索引" width="560px" :close-on-click-modal="!batchSubmitting">
+      <p class="help">从左侧列表当前页选择论文。每篇都会生成新的索引版本，后台依次构建；构建期间旧索引照常提供问答，新版本成功后才切换。</p>
+      <el-checkbox v-model="batchAllSelected" :disabled="batchSubmitting">全选（已选 {{ batchSelection.length }} 篇）</el-checkbox>
+      <el-checkbox-group v-model="batchSelection" class="batch-list" :disabled="batchSubmitting">
+        <el-checkbox v-for="item in papers" :key="item.arxiv_id" :value="item.arxiv_id" :disabled="isRebuilding(item.arxiv_id)">
+          <span class="batch-list__id">{{ item.arxiv_id }}</span>
+          <span class="batch-list__title">{{ item.title || '（论文库中没有标题）' }}</span>
+        </el-checkbox>
+      </el-checkbox-group>
+      <template #footer>
+        <el-button :disabled="batchSubmitting" @click="batchDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="batchSubmitting" :disabled="!batchSelection.length" @click="submitBatchRebuild">
+          重建 {{ batchSelection.length }} 篇
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -575,6 +762,45 @@ onMounted(() => {
 .detail-head__build {
   width: 340px;
   max-width: 100%;
+}
+
+.detail-head__job {
+  display: grid;
+  gap: 4px;
+  flex-basis: 100%;
+  font-size: 12.5px;
+}
+
+.batch-list {
+  display: grid;
+  gap: 2px;
+  max-height: 50vh;
+  margin-top: 8px;
+  overflow-y: auto;
+}
+
+.batch-list :deep(.el-checkbox) {
+  height: auto;
+  margin-right: 0;
+  padding: 4px 0;
+}
+
+.batch-list :deep(.el-checkbox__label) {
+  display: flex;
+  gap: 10px;
+  min-width: 0;
+}
+
+.batch-list__id {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+}
+
+.batch-list__title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-3);
 }
 
 .detail-tabs :deep(.el-tabs__content) {
