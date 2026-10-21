@@ -173,5 +173,42 @@ class ChunkingServiceDoclingHeadingTests(unittest.TestCase):
 
         self.assertEqual(headings, ["1. Introduction", "A.1 Hardware Infrastructure"])
 
+    def test_heading_level_follows_section_numbering(self) -> None:
+        service = ChunkingService()
+        state = {"depth": 0, "appendix": False}
+        cases = [
+            ("Paper Title Before Numbered Sections", 1),
+            ("Abstract", 1),
+            ("3. The Proposed Method", 1),
+            ("3.1. Motivation", 2),
+            ("3.3.1. PARALLEL BRANCH", 3),
+            ("Stage I: Embedding Cosine Similarity", 4),  # 没编号，挂在最近编号章节下一层
+            ("A Simple Approach", 4),  # 进入附录前，单个字母不当编号
+            ("II. RELATED WORK", 1),
+            ("References", 1),
+            ("A Implementation Details", 1),
+            ("A.1 Hardware Infrastructure", 2),
+            ("Reasoning Trace:", 3),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(service._docling_heading_level(text, state), expected)
+
+    def test_heading_only_section_is_merged_into_next_chunk(self) -> None:
+        items = [
+            {"text": "4 Experiments", "label": "section_header", "content_layer": "body", "page_start": 3, "order_index": 1},
+            {"text": "4.1 Setup", "label": "section_header", "content_layer": "body", "page_start": 3, "order_index": 2},
+            {"text": "We evaluate on three multi-hop QA benchmarks.", "label": "text", "content_layer": "body", "page_start": 3, "order_index": 3},
+        ]
+
+        page_map = [{"page": 3, "text": ""}]
+        chunks = ChunkingService().chunk_docling({"docling_text_items": items}, metadata={"filename": "x.pdf"}, page_map=page_map)["chunks"]
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["content"], "4 Experiments\n4.1 Setup\nWe evaluate on three multi-hop QA benchmarks.")
+        self.assertEqual(chunks[0]["metadata"]["section_path"], "4 Experiments > 4.1 Setup")
+        self.assertEqual(chunks[0]["metadata"]["section_level"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

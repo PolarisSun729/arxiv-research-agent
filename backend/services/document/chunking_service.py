@@ -20,6 +20,21 @@ MAX_CHUNK_CONTENT_LENGTH = CHUNKING_CONFIG["max_chunk_content_length"]
 CHUNK_OVERLAP_LENGTH = CHUNKING_CONFIG["chunk_overlap_length"]
 ASSET_SECTION_EMBEDDING_CONFIDENCE_FLOOR = 0.70
 
+# Docling 给的标题 level 都是 1，章节层级改由标题编号推断。
+# 这些标题不带编号，固定回到第 1 层；其中参考文献、附录之后才把单个大写字母当附录编号。
+TOP_LEVEL_HEADINGS = {
+    "abstract", "references", "bibliography", "acknowledgements", "acknowledgments",
+    "acknowledgement", "acknowledgment", "appendix", "appendices", "impact statement",
+    "supplementary material", "supplementary materials",
+}
+APPENDIX_START_HEADINGS = {
+    "references", "bibliography", "appendix", "appendices",
+    "supplementary material", "supplementary materials",
+}
+# 编号前缀：阿拉伯数字（3、3.1、3.3.1.）、附录字母（A、A.1）、带点的罗马数字（II.），后面必须跟文字。
+HEADING_NUMBER_PATTERN = re.compile(r"^(?P<head>\d{1,2}|[A-Z]|[IVX]{2,4})(?P<tail>(?:\.\d{1,2})*)(?P<dot>\.?)\s+[^\W\d_]")
+MAX_TOP_LEVEL_SECTION_NUMBER = 20
+
 
 class ChunkingService:
     """
@@ -410,12 +425,22 @@ class ChunkingService:
             return []
 
         chunks: List[Dict[str, Any]] = []
+        # 只有标题、没有正文的章节（如 "4 Experiments" 后面直接是 "4.1 ..."）不单独成 chunk，
+        # 标题挪到下一个有正文章节的第一个 chunk 开头；文末仍没有正文可挂的标题直接丢弃。
+        pending_headings: List[str] = []
         for section in sections:
+            if section.get("heading_text") and not section.get("body_items"):
+                pending_headings.append(str(section["heading_text"]))
+                continue
+
             # Docling section 已经保留了章节路径和页码范围，适合直接作为主干 chunk。
             section_chunks = self._split_docling_section(section, chunk_size)
             section_part_count = len(section_chunks)
             if not section_part_count:
                 continue
+            if pending_headings:
+                section_chunks[0] = "\n".join(pending_headings + [section_chunks[0]])
+                pending_headings = []
 
             for part_index, part in enumerate(section_chunks, start=1):
                 part_text = part.strip()
@@ -1190,11 +1215,38 @@ class ChunkingService:
         node_kind = str(item.get("node_kind", "") or "").strip().lower()
         return node_kind in {"section_header", "title"}
 
-    def _docling_heading_level(self, item: Dict[str, Any]) -> int:
-        heading_level = self._safe_int(item.get("heading_level"))
-        if heading_level is not None and heading_level > 0:
-            return heading_level
-        return 1
+    def _docling_heading_level(self, heading_text: str, state: Dict[str, Any]) -> int:
+        """按标题编号推断章节层级。
+
+        有编号的按段数定层级（3 → 1，3.1 / A.1 → 2）；固定顶层标题（Abstract、References 等）回到第 1 层；
+        没编号的挂在最近一个编号章节下一层。state 跨标题保存 depth（最近编号章节的层级）和 appendix（是否已进入附录）。
+        """
+        text = str(heading_text or "").strip()
+        if text.rstrip(".:").strip().lower() in TOP_LEVEL_HEADINGS:
+            state["depth"] = 0
+            if text.rstrip(".:").strip().lower() in APPENDIX_START_HEADINGS:
+                state["appendix"] = True
+            return 1
+
+        match = HEADING_NUMBER_PATTERN.match(text)
+        if match:
+            head, tail, dot = match.group("head"), match.group("tail"), match.group("dot")
+            depth = 1 + tail.count(".")
+            if head.isdigit():
+                numbered = int(head) <= MAX_TOP_LEVEL_SECTION_NUMBER
+            elif len(head) > 1:
+                # 多字符罗马数字只认 "II." 这种带点、无子编号的写法。
+                numbered = bool(dot) and not tail
+            else:
+                # 单个大写字母：有子编号（A.1）或已进入附录时才算附录编号，否则可能是 "A Simple ..." 这类普通标题。
+                numbered = bool(tail) or bool(state.get("appendix"))
+                if numbered:
+                    state["appendix"] = True
+            if numbered:
+                state["depth"] = depth
+                return depth
+
+        return int(state.get("depth") or 0) + 1
 
     def _build_docling_sections(self, docling_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """根据归一化后的 Docling item 构建章节树的线性 section 结果。
@@ -1208,6 +1260,7 @@ class ChunkingService:
         sections: List[Dict[str, Any]] = []
         stack: List[Dict[str, Any]] = []
         current_section: Optional[Dict[str, Any]] = None
+        level_state: Dict[str, Any] = {"depth": 0, "appendix": False}
 
         def flush_current_section() -> None:
             nonlocal current_section
@@ -1223,7 +1276,7 @@ class ChunkingService:
 
             if self._docling_item_is_heading(item):
                 heading_text = str(item.get("text", "") or "").strip()
-                heading_level = self._docling_heading_level(item)
+                heading_level = self._docling_heading_level(heading_text, level_state)
 
                 flush_current_section()
 
