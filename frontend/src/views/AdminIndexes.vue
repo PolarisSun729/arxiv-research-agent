@@ -173,6 +173,11 @@ const pagedChunks = computed(() => filteredChunks.value.slice((chunkPage.value -
 
 watch([typeFilter, flagFilter, chunkKeyword], () => { chunkPage.value = 1 })
 
+// 折叠后约 10 行高；字数多或换行多（参考文献、表格）才折叠，短内容完整显示、不加渐隐遮罩。
+function isCollapsible(chunk: IndexedChunk) {
+  return chunk.char_count > 600 || chunk.content.split('\n').length > 10
+}
+
 function toggleExpanded(chunkId: number) {
   const next = new Set(expanded.value)
   if (next.has(chunkId)) next.delete(chunkId)
@@ -397,9 +402,9 @@ onMounted(() => {
                 <AuthenticatedImage v-if="chunk.has_image" :src="imageUrl(chunk)" class="chunk__image">
                   <template #error><span class="muted">原图已不可用</span></template>
                 </AuthenticatedImage>
-                <pre :class="['chunk__content', { 'chunk__content--clamped': !expanded.has(chunk.metadata.chunk_id) }]">{{ chunk.content }}</pre>
+                <pre :class="['chunk__content', { 'chunk__content--clamped': isCollapsible(chunk) && !expanded.has(chunk.metadata.chunk_id) }]">{{ chunk.content }}</pre>
                 <footer class="chunk__foot">
-                  <el-button v-if="chunk.char_count > 600" link type="primary" @click="toggleExpanded(chunk.metadata.chunk_id)">
+                  <el-button v-if="isCollapsible(chunk)" link type="primary" @click="toggleExpanded(chunk.metadata.chunk_id)">
                     {{ expanded.has(chunk.metadata.chunk_id) ? '收起' : '展开全文' }}
                   </el-button>
                   <details class="chunk__meta">
