@@ -91,8 +91,9 @@ const quickPrompts = computed(() => [
 
 const hasQaIndex = computed(() => Boolean(qaStatus.value?.has_index))
 const hasActiveQaJob = computed(() => ['pending', 'running'].includes(String(qaIndexJob.value?.status || '')))
-// 删除索引不会改动已结束的构建任务；成功任务建出的索引若已被删除，就不再展示「已完成」，以免和「未建立问答索引」矛盾。
-const showQaJobStatus = computed(() => Boolean(qaIndexJob.value) && !(qaIndexJob.value?.status === 'success' && !hasQaIndex.value))
+// 任务块只展示构建过程：进行中显示进度，失败显示原因。索引是否可用只看索引状态，
+// 成功的任务只是历史记录（索引之后可能已被删除或替换），不再展示。
+const showQaJobStatus = computed(() => hasActiveQaJob.value || qaIndexJob.value?.status === 'failed')
 const chatTurns = computed(() => qaResults.value)
 const ragChatMessages = computed(() => chatTurns.value.flatMap(qaTurnToRagMessages))
 // Milvus 存的是 RetrievalIndex 向量（非原始 chunk），核对基准是后端按入库规则算出的预期向量数。
@@ -596,7 +597,7 @@ watch(paperId, async () => {
 
           <div v-if="qaIndexJob && showQaJobStatus" class="aside-block job-status">
             <div class="job-status-head">
-              <span :class="['chip', qaIndexJob.status === 'success' ? 'chip--success' : (qaIndexJob.status === 'failed' ? 'chip--danger' : 'chip--warning')]">
+              <span :class="['chip', qaIndexJob.status === 'failed' ? 'chip--danger' : 'chip--warning']">
                 {{ qaJobStatusText }}
               </span>
               <span class="muted">{{ qaStageText }}</span>
@@ -604,7 +605,7 @@ watch(paperId, async () => {
             <el-progress
               :percentage="Number(qaIndexJob.progress || 0)"
               :stroke-width="6"
-              :status="qaIndexJob.status === 'failed' ? 'exception' : (qaIndexJob.status === 'success' ? 'success' : undefined)"
+              :status="qaIndexJob.status === 'failed' ? 'exception' : undefined"
             />
             <div v-if="qaIndexJob.error_message" class="job-error-text">{{ qaIndexJob.error_message }}</div>
             <div v-else-if="qaJobPollFailures > 0" class="muted">暂时无法获取最新进度，正在重试…</div>
