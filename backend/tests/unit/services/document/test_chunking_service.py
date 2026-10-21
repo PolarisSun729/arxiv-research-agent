@@ -139,5 +139,20 @@ class ChunkingServiceAssetSectionTests(unittest.TestCase):
         self.assertIn("2 Results", high_chunk["content"])
 
 
+class ChunkingServiceDoclingNoiseTests(unittest.TestCase):
+    def test_page_header_and_footer_are_dropped_from_docling_items(self) -> None:
+        # 字段值取自真实 Docling 输出：文档对象导出的层是 "ContentLayer.FURNITURE"，原始 JSON 里是 "furniture"。
+        items = [
+            {"text": "Private RAG via Random Projection", "label": "page_header", "content_layer": "ContentLayer.FURNITURE", "role": "text", "page_start": 2, "order_index": 1},
+            {"text": "A PREPRINT", "label": "page_header", "content_layer": "ContentLayer.FURNITURE", "role": "heading", "page_start": 2, "order_index": 2},
+            {"text": "Body paragraph about the threat model and attacker capabilities.", "label": "text", "content_layer": "ContentLayer.BODY", "page_start": 2, "order_index": 3},
+            {"text": "2", "label": "page_footer", "content_layer": "furniture", "page_start": 2, "order_index": 4},
+        ]
+
+        collected = ChunkingService()._collect_docling_items({"docling_text_items": items}, [])
+
+        self.assertEqual([item["text"] for item in collected], ["Body paragraph about the threat model and attacker capabilities."])
+
+
 if __name__ == "__main__":
     unittest.main()

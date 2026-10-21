@@ -1206,7 +1206,7 @@ class LoadingService:
             annotated_pdf.insert_pdf(source_pdf)
 
             page_boxes: Dict[int, List[Dict[str, Any]]] = {}
-            summary_counts = {"title": 0, "body": 0, "picture": 0, "table": 0}
+            summary_counts = {"title": 0, "body": 0, "picture": 0, "table": 0, "furniture": 0}
             raw_docling_data = self._load_json_file(document_json_path) if document_json_path else None
             if raw_docling_data:
                 logger.debug("Docling annotation export will use raw JSON bbox data from %s", document_json_path)
@@ -1336,7 +1336,7 @@ class LoadingService:
         """根据元素类别返回标注颜色、标签和线宽配置。
 
         参数:
-            category (Optional[str]): 元素类别，例如 title、body、picture、table。
+            category (Optional[str]): 元素类别，例如 title、body、picture、table、furniture。
 
         返回:
             Dict[str, Any]: 标注样式配置。
@@ -1348,6 +1348,8 @@ class LoadingService:
             return {"kind": "picture", "label": "图片 / Picture", "color": (0.14, 0.62, 0.34), "line_width": 1.4}
         if normalized == "table":
             return {"kind": "table", "label": "表格 / Table", "color": (0.86, 0.52, 0.12), "line_width": 1.4}
+        if normalized == "furniture":
+            return {"kind": "furniture", "label": "页眉页脚 / Header-Footer", "color": (0.80, 0.20, 0.55), "line_width": 1.2}
         return {"kind": "body", "label": "正文 / Body", "color": (0.32, 0.32, 0.32), "line_width": 0.9}
 
     def _draw_docling_annotation_legend(self, page: Any, legend_entries: List[tuple[str, tuple[float, float, float]]]) -> None:
@@ -1401,7 +1403,7 @@ class LoadingService:
             )
 
             y = legend_rect.y0 + legend_padding + legend_title_height + 1
-            for label, color in deduped_entries[:4]:
+            for label, color in deduped_entries:
                 swatch = fitz.Rect(legend_rect.x0 + legend_padding, y + 2, legend_rect.x0 + legend_padding + 8, y + 10)
                 page.draw_rect(swatch, color=color, fill=color, width=0.8, overlay=True)
                 page.insert_text(
@@ -1529,7 +1531,9 @@ class LoadingService:
         label = str(item.get("label") or "").strip().lower()
         role = str(item.get("role") or "").strip().lower()
         node_kind = str(item.get("node_kind") or "").strip().lower()
-        if label in {"title", "section_header", "sectionheaderitem", "page_header"}:
+        if self._is_docling_page_furniture(label, item.get("content_layer")):
+            return "furniture"
+        if label in {"title", "section_header", "sectionheaderitem"}:
             return "title"
         if role in {"title", "heading"} or node_kind in {"title", "section_header"}:
             return "title"
@@ -2433,7 +2437,7 @@ class LoadingService:
         normalized_layer = str(content_layer or "").strip().lower()
         normalized_parent = str(parent or "").strip().lower()
 
-        if normalized_layer in {"header", "footer"}:
+        if self._is_docling_page_furniture(normalized_label, normalized_layer):
             return "noise"
 
         if self._docling_parent_is_visual_context(normalized_parent):
@@ -2588,6 +2592,16 @@ class LoadingService:
             return self._looks_like_heading_text(normalized)
 
         return False
+
+    def _is_docling_page_furniture(self, label: Any, content_layer: Any) -> bool:
+        """页眉、页脚（含页码）：Docling 放在 furniture 层，标签为 page_header / page_footer。
+
+        content_layer 来自原始 JSON 时是 "furniture"，来自文档对象时是 "ContentLayer.FURNITURE"。
+        """
+        normalized_layer = str(content_layer or "").strip().lower()
+        if normalized_layer.rsplit(".", 1)[-1] == "furniture":
+            return True
+        return str(label or "").strip().lower() in {"page_header", "page_footer"}
 
     def _docling_parent_is_visual_context(self, parent: str) -> bool:
         normalized = str(parent or "").strip().lower()

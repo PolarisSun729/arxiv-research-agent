@@ -1284,7 +1284,7 @@ class ChunkingService:
             parent = str(normalized.get("parent", "") or "").strip().lower()
             if self._docling_parent_is_visual_context(parent):
                 return
-            if str(normalized.get("node_kind", "") or "").strip().lower() in {"visual_text", "noise"}:
+            if self._docling_item_is_noise(normalized):
                 return
             key = (
                 normalized.get("label", ""),
@@ -1414,9 +1414,11 @@ class ChunkingService:
 
         if node_kind in {"noise", "visual_text"}:
             return True
-        if content_layer in {"header", "footer"}:
+        # 页眉、页脚（含页码）：Docling 放在 furniture 层（文档对象导出为 "ContentLayer.FURNITURE"），
+        # 标签为 page_header / page_footer；归一化会重算 node_kind，所以要按原始层和标签判断。
+        if content_layer.rsplit(".", 1)[-1] == "furniture":
             return True
-        if label in {"page_number", "pageheader", "pagefooter"}:
+        if label in {"page_header", "page_footer"}:
             return True
         return False
 
