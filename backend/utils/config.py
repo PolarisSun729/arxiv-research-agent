@@ -811,7 +811,7 @@ GENERATION_CONFIG: Dict[str, Any] = {
     "openai_api_key": _env_str("OPENAI_API_KEY", ""),
     "deepseek_api_key": _env_str("DEEPSEEK_API_KEY", ""),
     # rerank 前的 chunk 压缩/摘要使用独立的生成模型配置。
-    "qwen_rerank_compress_model_name": _env_str("QWEN_RERANK_COMPRESS_MODEL_NAME", "qwen3.6-flash"),
+    "qwen_rerank_compress_model_name": _env_str("QWEN_RERANK_COMPRESS_MODEL_NAME", "qwen3.6-plus"),
     "qwen_rerank_compress_enable_thinking": _env_bool("QWEN_RERANK_COMPRESS_ENABLE_THINKING", False),
     "openai_chat_temperature": float(_env_str("OPENAI_CHAT_TEMPERATURE", "0.7")),
     "openai_chat_max_tokens": _env_int("OPENAI_CHAT_MAX_TOKENS", 512),
@@ -829,24 +829,24 @@ GENERATION_CONFIG: Dict[str, Any] = {
     "qwen_responses_image_target_bytes": _env_int("QWEN_RESPONSES_IMAGE_TARGET_BYTES", 1_500_000),
     # 任务到模型角色的路由表只保留在配置层，业务代码只负责读取，不再硬编码模型名。
     "task_model_roles": {
-        "intent_recognition": "small",  # 解析用户原始输入以识别高层意图
-        "agent_request_contextualization": "small",  # 借最近对话把 Agent 追问改写成可独立理解的请求
-        "intent_routing": "small",  # 决定将意图路由到哪个子 agent 或处理流水线
-        "search_spec_parse": "small",  # 将自然语言搜索请求转换为结构化的搜索规范
-        "preference_action_parse": "small",  # 解析用户的喜欢/不喜欢/收藏等偏好操作
-        "query_rewrite": "small",  # 把问题改写成贴合论文术语的英文检索问句（具体化指代、拆分复合问题）
-        "query_translation": "small",  # 把用户问题译成英文，供原问向量路由检索英文论文
-        "rerank_query": "small",  # 为重排阶段生成或调整查询
-        "prompt_context_compaction": "small",  # 对长证据块做语义压缩，结果仍需最终回答模型基于证据使用
-        "hyde_generation": "small",  # HYDE 风格的伪文档生成（用于查询扩展）
+        "intent_recognition": "large",  # 解析用户原始输入以识别高层意图
+        "agent_request_contextualization": "large",  # 借最近对话把 Agent 追问改写成可独立理解的请求
+        "intent_routing": "large",  # 决定将意图路由到哪个子 agent 或处理流水线
+        "search_spec_parse": "large",  # 将自然语言搜索请求转换为结构化的搜索规范
+        "preference_action_parse": "large",  # 解析用户的喜欢/不喜欢/收藏等偏好操作
+        "query_rewrite": "large",  # 把问题改写成贴合论文术语的英文检索问句（具体化指代、拆分复合问题）
+        "query_translation": "large",  # 把用户问题译成英文，供原问向量路由检索英文论文
+        "rerank_query": "large",  # 为重排阶段生成或调整查询
+        "prompt_context_compaction": "large",  # 对长证据块做语义压缩，结果仍需最终回答模型基于证据使用
+        "hyde_generation": "large",  # HYDE 风格的伪文档生成（用于查询扩展）
         "paper_qa_final_answer": "large",  # 为论文问答生成最终高质量答案
         "paper_summary": "large",  # 生成论文的综合性摘要
         "paper_detail": "large",  # 生成方法或技术细节的详尽说明
         "paper_qa": "large",  # 处理关于具体论文的问答
         "recommendation_generation": "large",  # 生成个性化推荐文本或推荐理由
         "general_generation": "large",  # 用于复杂自然语言输出的一般大模型生成
-        "research_claim_extraction": "small",  # 研究引擎把草稿拆成可校验主张并绑定证据需求（只回片段编号，小模型够用）
-        "research_claim_verification": "small",  # 研究引擎逐条对照引用证据核对主张
+        "research_claim_extraction": "large",  # 研究引擎把草稿拆成可校验主张并绑定证据需求
+        "research_claim_verification": "large",  # 研究引擎逐条对照引用证据核对主张
         "default": "large",  # 当无特定任务映射时的默认模型角色
     },
 }

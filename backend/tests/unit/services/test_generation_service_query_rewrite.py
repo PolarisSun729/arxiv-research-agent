@@ -33,7 +33,7 @@ def test_rewrite_query_returns_cleaned_unique_queries_within_limit(monkeypatch: 
     assert calls[0]["task_type"] == "query_rewrite"
     assert "Question: 用了什么数据集、提升多少？" in calls[0]["prompt"]
     assert "Paper title: Sparse Projection" in calls[0]["prompt"]
-    assert QWEN_TASK_MODEL_ROLES["query_rewrite"] == "small"
+    assert QWEN_TASK_MODEL_ROLES["query_rewrite"] == "large"
     # 低温但不为 0：改写贴着原问，同时保留一点随机性。
     assert 0 < calls[0]["temperature"] < 1
 

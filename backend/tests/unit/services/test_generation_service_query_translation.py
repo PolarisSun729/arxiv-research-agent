@@ -5,7 +5,7 @@ import pytest
 from services.llm.generation_service import QWEN_TASK_MODEL_ROLES, GenerationService
 
 
-def test_translate_query_uses_small_model_task_and_strips_output(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_translate_query_uses_large_model_task_and_strips_output(monkeypatch: pytest.MonkeyPatch) -> None:
     service = GenerationService()
     calls: list[dict] = []
 
@@ -20,4 +20,4 @@ def test_translate_query_uses_small_model_task_and_strips_output(monkeypatch: py
     assert translated == "What distribution do the entries of R follow?"
     assert calls[0]["task_type"] == "query_translation"
     assert "Question: 随机投影矩阵 R 的元素服从什么分布？" in calls[0]["prompt"]
-    assert QWEN_TASK_MODEL_ROLES["query_translation"] == "small"
+    assert QWEN_TASK_MODEL_ROLES["query_translation"] == "large"
