@@ -660,7 +660,7 @@ class LoadingService:
             annotated_pdf.insert_pdf(source_pdf)
 
             page_boxes: Dict[int, List[Dict[str, Any]]] = {}
-            summary_counts = {"title": 0, "body": 0, "picture": 0, "table": 0, "furniture": 0}
+            summary_counts = {"title": 0, "body": 0, "picture": 0, "table": 0, "document_index": 0, "furniture": 0}
             raw_docling_data = self._load_json_file(document_json_path) if document_json_path else None
             if raw_docling_data:
                 logger.debug("Docling annotation export will use raw JSON bbox data from %s", document_json_path)
@@ -790,7 +790,7 @@ class LoadingService:
         """根据元素类别返回标注颜色、标签和线宽配置。
 
         参数:
-            category (Optional[str]): 元素类别，例如 title、body、picture、table、furniture。
+            category (Optional[str]): 元素类别，例如 title、body、picture、table、document_index、furniture。
 
         返回:
             Dict[str, Any]: 标注样式配置。
@@ -802,6 +802,8 @@ class LoadingService:
             return {"kind": "picture", "label": "图片 / Picture", "color": (0.14, 0.62, 0.34), "line_width": 1.4}
         if normalized == "table":
             return {"kind": "table", "label": "表格 / Table", "color": (0.86, 0.52, 0.12), "line_width": 1.4}
+        if normalized == "document_index":
+            return {"kind": "document_index", "label": "目录 / Contents", "color": (0.50, 0.30, 0.78), "line_width": 1.4}
         if normalized == "furniture":
             return {"kind": "furniture", "label": "页眉页脚 / Header-Footer", "color": (0.80, 0.20, 0.55), "line_width": 1.2}
         return {"kind": "body", "label": "正文 / Body", "color": (0.32, 0.32, 0.32), "line_width": 0.9}
@@ -848,28 +850,51 @@ class LoadingService:
             legend_rect = fitz.Rect(left, top, right, bottom)
 
             page.draw_rect(legend_rect, color=(0.72, 0.72, 0.72), fill=(1, 1, 1), width=0.8, overlay=True)
-            page.insert_text(
+            self._insert_docling_legend_text(
+                page,
                 fitz.Point(legend_rect.x0 + legend_padding, legend_rect.y0 + 10),
                 "图例 / Legend",
                 fontsize=8,
                 color=(0.1, 0.1, 0.1),
-                overlay=True,
             )
 
             y = legend_rect.y0 + legend_padding + legend_title_height + 1
             for label, color in deduped_entries:
                 swatch = fitz.Rect(legend_rect.x0 + legend_padding, y + 2, legend_rect.x0 + legend_padding + 8, y + 10)
                 page.draw_rect(swatch, color=color, fill=color, width=0.8, overlay=True)
-                page.insert_text(
+                self._insert_docling_legend_text(
+                    page,
                     fitz.Point(swatch.x1 + 6, y + 9),
                     label,
                     fontsize=7,
                     color=(0.12, 0.12, 0.12),
-                    overlay=True,
                 )
                 y += legend_row_height
         except Exception as exc:
             logger.warning("Failed to draw Docling annotation legend: %s", exc)
+
+    def _insert_docling_legend_text(
+        self,
+        page: Any,
+        point: "fitz.Point",
+        text: str,
+        fontsize: float,
+        color: tuple[float, float, float],
+    ) -> None:
+        """绘制「中文 / English」形式的图例文字。
+
+        默认的 Helvetica 没有汉字，中文会显示成点；china-s 的西文是等宽的，英文会被拉得很开。
+        所以中文部分用 china-s、其余部分用 Helvetica，两者都是 PDF 标准字体，不嵌入字体文件。
+        """
+        cjk_part, separator, latin_part = text.partition(" / ")
+        if not separator:
+            cjk_part, latin_part = "", text
+        x = float(point.x)
+        for segment, fontname in ((cjk_part, "china-s"), (separator + latin_part, "helv")):
+            if not segment:
+                continue
+            page.insert_text(fitz.Point(x, point.y), segment, fontsize=fontsize, fontname=fontname, color=color, overlay=True)
+            x += fitz.get_text_length(segment, fontname=fontname, fontsize=fontsize)
 
     def _collect_docling_bbox_candidates(self, item: Dict[str, Any]) -> List[Dict[str, Any]]:
         """从标准化条目中提取可用于标注的 bbox 候选框。
@@ -943,7 +968,11 @@ class LoadingService:
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                category = self._docling_annotation_category(item) if key == "texts" else default_category
+                # 目录在 Docling JSON 里也放在 tables 下，只靠 label=document_index 区分。
+                if key == "texts" or self._is_docling_document_index(item.get("label")):
+                    category = self._docling_annotation_category(item)
+                else:
+                    category = default_category
                 provenance = item.get("prov") or []
                 if not isinstance(provenance, list):
                     provenance = [provenance]
@@ -977,6 +1006,10 @@ class LoadingService:
         """
         if not isinstance(item, dict):
             return "body"
+
+        # 目录的 asset_kind 也是 table，要先于 asset_kind 判断。
+        if self._is_docling_document_index(item.get("label")):
+            return "document_index"
 
         asset_kind = str(item.get("asset_kind") or "").strip().lower()
         if asset_kind in {"picture", "table"}:
@@ -2001,6 +2034,10 @@ class LoadingService:
         if normalized_layer.rsplit(".", 1)[-1] == "furniture":
             return True
         return str(label or "").strip().lower() in {"page_header", "page_footer"}
+
+    def _is_docling_document_index(self, label: Any) -> bool:
+        """目录（Table of Contents）：Docling 当作表格解析，标签为 document_index。"""
+        return str(label or "").strip().lower().rsplit(".", 1)[-1] == "document_index"
 
     def _docling_parent_is_visual_context(self, parent: str) -> bool:
         normalized = str(parent or "").strip().lower()

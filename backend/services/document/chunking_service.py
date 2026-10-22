@@ -504,6 +504,9 @@ class ChunkingService:
             chunk_type = "figure" if asset_kind == "picture" else ("table" if asset_kind == "table" else "text")
             if chunk_type == "text":
                 continue
+            # 目录（label=document_index）Docling 也放在表格里，只有章节名和页码，不当表格证据入库。
+            if str(asset.get("label", "") or "").strip().lower().rsplit(".", 1)[-1] == "document_index":
+                continue
 
             page_start = int(asset.get("page_start") or asset.get("page") or 1)
             page_end = int(asset.get("page_end") or page_start)
