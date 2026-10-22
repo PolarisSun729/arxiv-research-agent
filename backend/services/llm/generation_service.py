@@ -481,7 +481,8 @@ class GenerationService:
             "Rules:\n"
             "1. Keep the meaning of the question. Do not answer it, and do not add aspects the question does not ask about.\n"
             "2. Take paper terms only from the paper context below; never invent names, datasets, modules, or methods.\n"
-            "3. Write every query in English as a complete question that can be understood on its own.\n"
+            "3. Write every query in English as a complete question that can be understood on its own, "
+            "even when the user's question is in Chinese or another language.\n"
             "4. Keep symbols, variable names, formulas, and abbreviations exactly as written.\n"
             f"5. Return 1 to {max_queries} queries.\n"
             "6. If the question is already specific and asks about only one thing, still return one query: "
@@ -490,7 +491,9 @@ class GenerationService:
             f"Question: {question}\n\n"
             f"Paper title: {title or 'N/A'}\n"
             f"Paper abstract: {abstract[:1800] or 'N/A'}\n"
-            f"Section titles: {', '.join(section_titles[:16]) or 'N/A'}"
+            f"Section titles: {', '.join(section_titles[:16]) or 'N/A'}\n\n"
+            # 语言要求放在紧挨输出的位置再说一遍：中文问题放在最后时，模型容易跟着问题的语言输出。
+            "Answer with the JSON only. Every query must be written in English; do not output any Chinese."
         )
         response = self.complete_with_qwen(
             prompt,
