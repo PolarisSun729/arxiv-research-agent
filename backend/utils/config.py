@@ -845,6 +845,7 @@ GENERATION_CONFIG: Dict[str, Any] = {
         "preference_action_parse": "small",  # 解析用户的喜欢/不喜欢/收藏等偏好操作
         "query_planning": "small",  # 规划多步或多查询的检索策略
         "query_rewrite": "small",  # 重写或规范化查询以提升检索效果
+        "query_translation": "small",  # 把用户问题译成英文，供原问向量路由检索英文论文
         "rerank_query": "small",  # 为重排阶段生成或调整查询
         "prompt_context_compaction": "small",  # 对长证据块做语义压缩，结果仍需最终回答模型基于证据使用
         "hyde_generation": "small",  # HYDE 风格的伪文档生成（用于查询扩展）

@@ -737,6 +737,22 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertEqual(original_calls[0]["texts"], [question])
         self.assertEqual(bundle["embedding_batch"]["original_query_batch"]["instruct"], original_calls[0]["instruct"])
 
+    def test_original_route_embeds_translation_but_keeps_original_as_source(self) -> None:
+        question = "这篇论文的方法框架是什么？"
+        translated = "What is the method framework of the paper?"
+        self.service.query_planner.generation_service.translate_query_for_retrieval = lambda query, **_kwargs: translated
+
+        bundle = self._build_route_bundle(question, enable_hyde=False, enable_keyword_search=False)
+        original_calls = [
+            call for call in self.service.embedding_service.calls
+            if call["method"] == "create_text_embeddings_with_usage" and call.get("instruct")
+        ]
+
+        self.assertEqual(original_calls[0]["texts"], [translated])
+        self.assertTrue(bundle["routes"]["vector_original"])
+        self.assertEqual(bundle["routes"]["vector_original"][0]["chunk_id"], "chunk-method")
+        self.assertEqual({hit["source_query"] for hit in bundle["routes"]["vector_original"]}, {question})
+
     def test_enhancement_route_timeout_is_recorded_without_blocking_pipeline(self) -> None:
         self.service.route_retriever.route_executor.timeouts["keyword"] = 0.01
         original_keyword_retrieve = self.service.route_retriever.keyword_retrieve

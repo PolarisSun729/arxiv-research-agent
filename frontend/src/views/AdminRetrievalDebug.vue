@@ -259,6 +259,13 @@ onMounted(() => { void searchPapers(form.value.arxiv_id) })
                 <span v-if="run.query.intent.confidence !== null" class="muted"> · 置信 {{ fixed(run.query.intent.confidence, 2) }}</span>
               </dd>
             </div>
+            <div v-if="run.query.original_translation?.query">
+              <dt>原问译文</dt>
+              <dd>
+                {{ run.query.original_translation.query }}
+                <span v-if="run.query.original_translation.status === 'error'" class="muted">· 翻译失败，沿用原问：{{ run.query.original_translation.error }}</span>
+              </dd>
+            </div>
             <div>
               <dt>参与召回的查询</dt>
               <dd>

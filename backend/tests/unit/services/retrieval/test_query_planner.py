@@ -15,6 +15,27 @@ class QueryPlannerTests(unittest.TestCase):
             enable_query_rewrite=enable_query_rewrite,
         )
 
+    def test_original_question_translation_is_attached_to_query_views(self) -> None:
+        self.planner.generation_service.translate_query_for_retrieval = lambda query, **_kwargs: "  What is the   method? "
+
+        translation = self._build_bundle("这篇论文的方法是什么？")["query_views"]["original_translation"]
+
+        self.assertEqual(translation["query"], "What is the method?")
+        self.assertEqual(translation["status"], "ok")
+
+    def test_translation_failure_falls_back_to_original_question(self) -> None:
+        def fail(_query, **_kwargs):
+            raise TimeoutError("llm timeout")
+
+        self.planner.generation_service.translate_query_for_retrieval = fail
+        question = "这篇论文的方法是什么？"
+
+        translation = self._build_bundle(question)["query_views"]["original_translation"]
+
+        self.assertEqual(translation["query"], question)
+        self.assertEqual(translation["status"], "error")
+        self.assertIn("llm timeout", translation["error"])
+
     def test_method_question_builds_method_flow_profile(self) -> None:
         bundle = self._build_bundle("What is the method flow and architecture of the paper?")
         profile = bundle["query_profile"]

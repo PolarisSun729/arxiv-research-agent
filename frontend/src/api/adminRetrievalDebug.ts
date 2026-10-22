@@ -78,6 +78,13 @@ export interface RetrievalDebugRun {
   elapsed_ms: number
   query: {
     original: string
+    // 原问向量路由实际检索用的英文译文；status 为 error 时 query 退回原问。
+    original_translation: {
+      query?: string
+      status?: string
+      error?: string
+      latency_ms?: number
+    }
     intent: {
       main_intent: string | null
       sub_intents: string[] | null

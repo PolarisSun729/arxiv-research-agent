@@ -123,6 +123,8 @@ def _query_section(debug: Dict[str, Any]) -> Dict[str, Any]:
     query_profile = debug.get("query_profile") or {}
     return {
         "original": debug.get("original_query") or "",
+        # 原问向量路由实际检索用的英文译文；status 为 error 时退回原问。
+        "original_translation": views.get("original_translation") or {},
         "intent": {key: intent.get(key) for key in _INTENT_KEYS},
         "rewrite_enabled": bool(views.get("enabled")),
         "rewrite_error": views.get("llm_error") or "",

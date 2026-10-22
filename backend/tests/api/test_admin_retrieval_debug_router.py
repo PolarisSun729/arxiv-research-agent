@@ -51,7 +51,7 @@ class _FakePipeline:
                 "original_query": user_query,
                 "intent_profile": {"main_intent": "method", "sub_intents": []},
                 "query_profile": {"keywords": ["lora"]},
-                "query_views": {"enabled": True, "selected_queries": ["q", "q2"], "candidates": [{"query": "q2", "source": "plan", "selected": True, "reason": "kept"}]},
+                "query_views": {"enabled": True, "selected_queries": ["q", "q2"], "candidates": [{"query": "q2", "source": "plan", "selected": True, "reason": "kept"}], "original_translation": {"query": "q-en", "status": "ok", "error": ""}},
                 "route_metrics": {
                     "vector_original": {"status": "ok", "enabled": True, "latency_ms": 12.0},
                     "keyword": {"status": "ok", "enabled": True, "latency_ms": 3.0},
@@ -125,6 +125,7 @@ def test_run_aligns_route_and_stage_ranks_per_chunk(env):
     assert routes["vector_hyde"]["enabled"] is False
     assert body["rerank"]["applied"] is True and body["rerank"]["latency_ms"] == 200.0
     assert body["query"]["selected_queries"] == ["q", "q2"]
+    assert body["query"]["original_translation"]["query"] == "q-en"
 
 
 def test_run_rejects_paper_without_active_index(env):

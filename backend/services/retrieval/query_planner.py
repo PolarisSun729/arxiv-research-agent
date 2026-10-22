@@ -10,6 +10,10 @@
 
 from __future__ import annotations
 
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
+from time import perf_counter
 from typing import Any, Dict, Iterable, List, Optional
 
 from services.intent.intent_service import METHOD_INTENTS, IntentProfile, IntentService
@@ -22,6 +26,8 @@ ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
 QUERY_VIEW_LIMIT = ENHANCED_RETRIEVAL_CONFIG["query_view_limit"]
 # 请求 LLM 生成检索计划时的改写查询条数上限。
 QUERY_PLAN_LIMIT = ENHANCED_RETRIEVAL_CONFIG["query_plan_limit"]
+
+logger = logging.getLogger(__name__)
 
 
 def _clean_str_list(values: Optional[Iterable[Any]]) -> List[str]:
@@ -53,6 +59,25 @@ class QueryPlanner:
         self.config = enhanced_config
         # 规则模块集中提供 query type、stopwords 和 section 偏好，避免 planner 继续复制一份常量。
         self.retrieval_rules = retrieval_rules or RetrievalRules(config=enhanced_config)
+        # 原问翻译与意图识别并发执行，单独的小池子。
+        self._translation_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="query-translation")
+
+    def translate_original_query(self, user_query: str) -> Dict[str, Any]:
+        """把原问译成英文供原问向量路由检索；失败时 query 沿用原问，status/error 记下原因。"""
+        started = perf_counter()
+        result: Dict[str, Any] = {"query": user_query, "status": "ok", "error": "", "latency_ms": 0.0}
+        try:
+            if self.generation_service is None:
+                raise RuntimeError("generation service unavailable")
+            translated = " ".join(str(self.generation_service.translate_query_for_retrieval(user_query) or "").split())
+            if not translated:
+                raise ValueError("empty translation")
+            result["query"] = translated
+        except Exception as exc:
+            logger.warning("Original query translation failed, using the original question: %s", exc)
+            result.update({"status": "error", "error": str(exc)})
+        result["latency_ms"] = round((perf_counter() - started) * 1000, 1)
+        return result
 
     def build_intent_profile(self, user_query: str, paper_context: Optional[Dict[str, Any]] = None) -> IntentProfile:
         """调用意图服务识别问题意图。"""
@@ -217,7 +242,11 @@ class QueryPlanner:
         paper_context: Optional[Dict[str, Any]] = None,
         enable_query_rewrite: bool,
     ) -> Dict[str, Any]:
-        """一次性生成意图、QueryProfile、query views 和 rerank query（检索主流程的入口）。"""
+        """一次性生成意图、QueryProfile、query views 和 rerank query（检索主流程的入口）。
+
+        原问的英文翻译与这些步骤并发，结果放在 query_views["original_translation"]。
+        """
+        translation_future = self._translation_pool.submit(copy_context().run, self.translate_original_query, user_query)
         intent_profile = self.build_intent_profile(user_query, paper_context=paper_context)
         query_profile = self.build_query_profile(
             user_query,
@@ -226,6 +255,7 @@ class QueryPlanner:
             intent_profile=intent_profile,
         )
         query_views = self.build_query_views(user_query, query_profile, enable_query_rewrite)
+        query_views["original_translation"] = translation_future.result()
         rerank_query = self.build_rerank_query(user_query, query_profile)
         return {
             "intent_profile": intent_profile,

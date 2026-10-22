@@ -226,6 +226,8 @@ class RouteRetriever:
             hyde_text,
         ]
         batch_size = ENHANCED_RETRIEVAL_CONFIG.get("query_embedding_batch_size", 20)
+        # 原问路由用英文译文检索英文正文；翻译失败时 planner 已回退为原问。
+        original_query = str((query_views.get("original_translation") or {}).get("query") or user_query)
         original_instruct = str(ENHANCED_RETRIEVAL_CONFIG.get("original_query_embedding_instruct") or "")
         original_embedding_future = None
         if original_instruct:
@@ -233,13 +235,15 @@ class RouteRetriever:
             original_embedding_future = self._embedding_pool.submit(
                 copy_context().run,
                 self.embedding_batcher.build,
-                [user_query],
+                [original_query],
                 provider=embedding_provider,
                 model=embedding_model,
                 dimension=embedding_dimension,
                 batch_size=batch_size,
                 instruct=original_instruct,
             )
+        if not original_instruct:
+            batch_queries.append(original_query)
         embedding_batch = self.embedding_batcher.build(
             batch_queries,
             provider=embedding_provider,
@@ -259,9 +263,10 @@ class RouteRetriever:
             "vector_original",
             lambda: self.vector_retrieve(
                 collection_name=collection_name,
-                query=user_query,
+                query=original_query,
                 top_k=recall_candidate_limit,
                 route_name="vector_original",
+                # 置信度和命中来源仍按用户原问计算，译文只用于向量检索。
                 source_query=user_query,
                 query_profile=query_profile,
                 route_queries=[user_query],

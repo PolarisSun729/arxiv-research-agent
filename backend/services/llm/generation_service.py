@@ -575,6 +575,36 @@ class GenerationService:
             task_type="hyde_generation",
         ).strip()
 
+    def translate_query_for_retrieval(
+        self,
+        question: str,
+        api_key: Optional[str] = None,
+        model_name: Optional[str] = None,
+    ) -> str:
+        """把用户问题译成英文，供原问向量路由检索英文论文正文；问题本身是英文时原样返回。"""
+        prompt = (
+            "Translate the user's question about an English research paper into English, for semantic retrieval over the paper.
+"
+            "Rules:
+"
+            "1. If the question is already in English, return it unchanged.
+"
+            "2. Translate faithfully; do not answer, expand, or add terms that are not in the question.
+"
+            "3. Keep symbols, variable names, formulas, method names, dataset names, and abbreviations exactly as written.
+"
+            "4. Output only the translated question, with no quotes or explanation.
+
+"
+            f"Question: {question}"
+        )
+        return self.complete_with_qwen(
+            prompt,
+            api_key=api_key,
+            model_name=model_name,
+            task_type="query_translation",
+        ).strip()
+
     def _build_evidence_selection_rerank_query(self, original_question: str, intent_profile: Optional[Dict[str, Any]] = None) -> str:
         normalized_question = re.sub(r"\s+", " ", (original_question or "")).strip()
         base_query = (

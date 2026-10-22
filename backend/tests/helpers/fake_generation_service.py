@@ -48,6 +48,10 @@ class FakeGenerationService:
         self._record("generate_hyde_document", query=query, kwargs=kwargs)
         return f"HyDE: {query}"
 
+    def translate_query_for_retrieval(self, query: str, **kwargs: Any) -> str:
+        self._record("translate_query_for_retrieval", query=query, kwargs=kwargs)
+        return query
+
     def compress_chunks_for_rerank(self, chunks: Iterable[dict[str, Any]], **kwargs: Any) -> list[dict[str, Any]]:
         normalized_chunks = [dict(chunk) for chunk in chunks]
         self._record("compress_chunks_for_rerank", chunk_count=len(normalized_chunks), kwargs=kwargs)
