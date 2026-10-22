@@ -339,7 +339,7 @@ class RouteRetriever:
             )
 
         if enable_keyword_search:
-            # keyword route 以用户原问为主，改写问句只做辅助召回；
+            # keyword route 以原问（英文译文）为主，改写问句只做辅助召回；
             # 否则改写里的通用词（如 method/section/framework）会在 BM25 中等权累加并压过真实问题焦点。
             keyword_query_views = self.build_keyword_query_views(
                 user_query=user_query,
@@ -524,8 +524,15 @@ class RouteRetriever:
         query_profile: QueryProfile,
         query_views: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        """统一管理 keyword route 的 query view 来源、去重与权重，避免 rewrite 数量直接放大 BM25。"""
-        raw_views: List[Dict[str, Any]] = [{"query": user_query, "source": "original", "source_index": 0}]
+        """统一管理 keyword route 的 query view 来源、去重与权重，避免 rewrite 数量直接放大 BM25。
+
+        原问 view 用英文译文：论文正文是英文，中文原问在 BM25 倒排里基本命不中。
+        翻译失败时 planner 已把译文退回成原问，这里直接沿用。
+        """
+        original_query = str((query_views.get("original_translation") or {}).get("query") or user_query)
+        raw_views: List[Dict[str, Any]] = [
+            {"query": original_query, "source": "original", "source_index": 0, "original_question": user_query}
+        ]
         for idx, query in enumerate(query_views.get("selected_queries", []) or []):
             raw_views.append({"query": query, "source": "rewrite", "source_index": idx})
 
@@ -593,6 +600,8 @@ class RouteRetriever:
                     "selected": True,
                     "reason": "kept",
                     "merged_views": [],
+                    # 原问 view 记下用户原问，debug 里能对照译文。
+                    **({"original_question": row["original_question"]} if row.get("original_question") else {}),
                 }
             )
 

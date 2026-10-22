@@ -191,6 +191,20 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertEqual(keyword_debug["matched_chunks"][0]["chunk_id"], "chunk-method")
         self.assertIn("body", keyword_debug["matched_chunks"][0]["matched_fields"])
 
+    def test_keyword_original_view_uses_english_translation(self) -> None:
+        question = "这篇论文用了哪些数据集？"
+        self.service.query_planner.generation_service.translate_query_for_retrieval = (
+            lambda query, **kwargs: "Which datasets are used in this paper?"
+        )
+        bundle = self._build_route_bundle(question, enable_query_rewrite=False, enable_hyde=False)
+        original_view = bundle["keyword_debug"]["query_views"][0]
+
+        self.assertEqual(original_view["source"], "original")
+        self.assertEqual(original_view["query"], "Which datasets are used in this paper?")
+        self.assertEqual(original_view["original_question"], question)
+        self.assertEqual(len(bundle["keyword_debug"]["query_views"]), 1)
+        self.assertEqual(bundle["routes"]["keyword"][0]["chunk_id"], "chunk-dataset")
+
     def test_keyword_route_expands_english_plural_dataset_query(self) -> None:
         bundle = self._build_route_bundle("What datasets are used?", enable_hyde=False)
         keyword_debug = bundle["keyword_debug"]
