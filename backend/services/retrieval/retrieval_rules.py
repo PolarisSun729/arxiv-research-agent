@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+import threading
+from typing import Any, Dict, Iterable, List, Optional
+
+import Stemmer
 
 from services.intent.intent_service import EXPERIMENT_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
 from services.retrieval.contracts import legacy_body_index_id
@@ -52,6 +55,21 @@ EN_STOPWORDS = {
     "would",
     "you",
 }
+
+# PyStemmer 的 Stemmer 对象不是线程安全的，检索链路会在线程池里分词，每个线程各持一个。
+_STEMMER_LOCAL = threading.local()
+
+
+def stem_english_tokens(tokens: Iterable[str]) -> List[str]:
+    """Snowball 英文词干化（cats → cat、datasets → dataset、distributions → distribut）。"""
+    stemmer = getattr(_STEMMER_LOCAL, "stemmer", None)
+    if stemmer is None:
+        stemmer = _STEMMER_LOCAL.stemmer = Stemmer.Stemmer("english")
+    return stemmer.stemWords(list(tokens))
+
+
+# 分词结果已经是词干，停用词也按词干比较（does → doe）。
+EN_STOPWORD_STEMS = set(stem_english_tokens(sorted(EN_STOPWORDS)))
 
 # 中文问句里的虚词与“这篇论文/总结一下”等无检索价值的套话。
 ZH_STOPWORDS = {
@@ -108,14 +126,19 @@ class RetrievalRules:
 
     @classmethod
     def tokenize_for_keyword_search(cls, text: str) -> List[str]:
-        """关键词检索分词：英文按字母数字串切分（至少 2 个字符），中文连续片段整体作为一个 token，最后过滤噪声 token。
+        """关键词检索分词：英文按字母数字串切分（至少 2 个字符）后词干化，中文连续片段整体作为一个 token，并过滤噪声 token。
 
+        建索引和查询都走这个函数，单复数、时态等词形差异在两边落到同一个词干上，BM25 才能互相命中。
         关键词路由检索用的是英文译文和英文改写，中文问题到英文正文的桥接交给 LLM，这里不做中文短语切分和词表映射。
         """
         lowered = text.lower()
-        english_tokens = re.findall(r"[a-z0-9][a-z0-9_\-]{1,}", lowered)
-        chinese_tokens = re.findall(r"[\u4e00-\u9fff]{2,}", lowered)
-        return [token for token in english_tokens + chinese_tokens if cls.is_informative_keyword_token(token)]
+        english_tokens = [
+            token for token in re.findall(r"[a-z0-9][a-z0-9_\-]{1,}", lowered) if cls.is_informative_keyword_token(token)
+        ]
+        chinese_tokens = [
+            token for token in re.findall(r"[\u4e00-\u9fff]{2,}", lowered) if cls.is_informative_keyword_token(token)
+        ]
+        return stem_english_tokens(english_tokens) + chinese_tokens
 
     @staticmethod
     def is_informative_keyword_token(token: str) -> bool:
@@ -155,7 +178,10 @@ class RetrievalRules:
         return [
             token
             for token in tokens
-            if self.is_informative_keyword_token(token) and token not in EN_STOPWORDS and token not in ZH_STOPWORDS
+            if self.is_informative_keyword_token(token)
+            and token not in EN_STOPWORDS
+            and token not in EN_STOPWORD_STEMS
+            and token not in ZH_STOPWORDS
         ]
 
     def extract_query_keywords(self, tokens: List[str], limit: Optional[int] = None) -> List[str]:

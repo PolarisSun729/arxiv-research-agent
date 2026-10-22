@@ -75,7 +75,8 @@ RETRIEVAL_INDEX_ARTIFACT_SCHEMA_VERSION = "retrieval_index_artifact_v1"
 DEFAULT_RETRIEVAL_INDEX_ARTIFACT_DIR = "02-retrieval-indexes"
 SPARSE_INDEX_ARTIFACT_SCHEMA_VERSION = "sparse_index_artifact_v1"
 BM25_SCHEMA_VERSION = "field_weighted_bm25_v1"
-KEYWORD_TOKENIZER_VERSION = "retrieval_rules_keyword_tokenizer_v1"
+# v2：英文 token 做 Snowball 词干化、中文不再按词表切分；版本不一致的持久化 sparse 索引不能复用。
+KEYWORD_TOKENIZER_VERSION = "retrieval_rules_keyword_tokenizer_v2"
 KEYWORD_FIELD_WEIGHTS_VERSION = "keyword_field_weights_v1"
 DEFAULT_SPARSE_INDEX_ARTIFACT_DIR = "02-sparse-indexes"
 SPARSE_SOURCE_TYPES = {"chunk", "retrieval_index"}

@@ -16,11 +16,17 @@ from services.retrieval.execution import QueryEmbeddingBatcher, RouteExecutionSu
 from services.retrieval.index_hit_aggregator import IndexHitAggregator
 from services.retrieval.numeric_utils import min_max_normalize, require_float
 from services.retrieval.retrieval_index import CollectionRetrievalIndex, VECTOR_ROUTE_NAMES
+from services.retrieval.retrieval_rules import stem_english_tokens
 from utils.config import get_enhanced_retrieval_runtime_config
 
 ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
 
 logger = logging.getLogger(__name__)
+
+# 方法/数据集/基线等结构词出现在正文开头时给 BM25 加分；查询 token 已经是词干，这里也存词干。
+_BM25_BOOST_STEMS = set(
+    stem_english_tokens(["method", "dataset", "baseline", "ablation", "limitation"])
+)
 
 _CJK_PATTERN = re.compile(r"[一-鿿]")
 
@@ -1211,7 +1217,7 @@ class RouteRetriever:
         doc_len = max(doc_length, 1)
         k1 = ENHANCED_RETRIEVAL_CONFIG["bm25_k1"]
         b = ENHANCED_RETRIEVAL_CONFIG["bm25_b"]
-        boost_tokens = {"method", "methods", "dataset", "datasets", "baseline", "ablation", "limitation", "limitations"}
+        boost_tokens = _BM25_BOOST_STEMS
         score = 0.0
         content_lower = content.lower()
         term_details: List[Dict[str, Any]] = []
