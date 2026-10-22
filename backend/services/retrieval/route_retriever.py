@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import math
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from typing import Any, Callable, Dict, List, Optional
 
 from services.intent.intent_service import EXPERIMENT_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
@@ -80,6 +82,8 @@ class RouteRetriever:
         self.collection_profile_provider = collection_profile_provider
         self.collection_retrieval_index_provider = collection_retrieval_index_provider
         self.embedding_batcher = QueryEmbeddingBatcher(embedding_service=self.embedding_service)
+        # 原问路由带 instruct 的 embedding 与主批并发请求，单独的小池子，不占 route worker。
+        self._embedding_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="query-embedding")
         self.index_hit_aggregator = IndexHitAggregator()
         self.route_executor = RouteExecutionSupport(
             timeouts={
@@ -221,14 +225,34 @@ class RouteRetriever:
             *rewrite_queries,
             hyde_text,
         ]
+        batch_size = ENHANCED_RETRIEVAL_CONFIG.get("query_embedding_batch_size", 20)
+        original_instruct = str(ENHANCED_RETRIEVAL_CONFIG.get("original_query_embedding_instruct") or "")
+        original_embedding_future = None
+        if original_instruct:
+            # 原问路由带查询侧说明，向量与其它路由不通用，单独一批并与主批并发请求。
+            original_embedding_future = self._embedding_pool.submit(
+                copy_context().run,
+                self.embedding_batcher.build,
+                [user_query],
+                provider=embedding_provider,
+                model=embedding_model,
+                dimension=embedding_dimension,
+                batch_size=batch_size,
+                instruct=original_instruct,
+            )
         embedding_batch = self.embedding_batcher.build(
             batch_queries,
             provider=embedding_provider,
             model=embedding_model,
             dimension=embedding_dimension,
-            batch_size=ENHANCED_RETRIEVAL_CONFIG.get("query_embedding_batch_size", 20),
+            batch_size=batch_size,
         )
         embedding_map = embedding_batch["embeddings"]
+        original_embedding_map = embedding_map
+        if original_embedding_future is not None:
+            original_embedding_batch = original_embedding_future.result()
+            original_embedding_map = original_embedding_batch["embeddings"]
+            embedding_batch["debug"]["original_query_batch"] = original_embedding_batch["debug"]
         route_metrics: Dict[str, Any] = {}
         routes: Dict[str, List[Dict[str, Any]]] = {}
         original_result = self.route_executor.run(
@@ -242,7 +266,7 @@ class RouteRetriever:
                 query_profile=query_profile,
                 route_queries=[user_query],
                 collection_profile=collection_profile,
-                embedding_map=embedding_map,
+                embedding_map=original_embedding_map,
             ),
             required=True,
             cache_hit=bool(collection_profile.cache_hit),

@@ -144,8 +144,9 @@ class QueryEmbeddingBatcher:
         model: str,
         dimension: Optional[int],
         batch_size: Optional[int] = None,
+        instruct: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """对去重后的查询一次性生成 embedding。
+        """对去重后的查询一次性生成 embedding；instruct 是查询侧任务说明，同一批查询共用一条。
 
         返回 {"embeddings": {归一化查询: 向量}, "debug": {...}}；embedding 服务出错或返回数量不符时
         embeddings 为空、debug.status 为 error，此时向量 route 查不到向量会各自报错并按 route 失败降级。
@@ -163,6 +164,7 @@ class QueryEmbeddingBatcher:
             "latency_ms": 0.0,
             "status": "ok",
             "error": "",
+            "instruct": instruct or "",
         }
         if not normalized_queries:
             debug["status"] = "empty"
@@ -175,6 +177,7 @@ class QueryEmbeddingBatcher:
                 model=model,
                 dimension=dimension,
                 batch_size=batch_size,
+                instruct=instruct,
             )
             if len(embeddings) != len(normalized_queries):
                 raise ValueError(f"Embedding batch returned {len(embeddings)} vectors for {len(normalized_queries)} queries")

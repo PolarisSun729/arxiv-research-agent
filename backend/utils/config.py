@@ -626,6 +626,12 @@ ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     "route_timeout_rerank_seconds": float(_env_str("RETRIEVAL_ROUTE_TIMEOUT_RERANK_SECONDS", "12")),
     "route_max_workers": _env_int("RETRIEVAL_ROUTE_MAX_WORKERS", 4),
     "query_embedding_batch_size": _env_int("RETRIEVAL_QUERY_EMBEDDING_BATCH_SIZE", 20),
+    # 原问向量路由的查询侧任务说明（DashScope 多模态向量接口的 instruct 参数，官方建议用英文）；
+    # 文档侧建索引时不带说明，留空则原问与其它路由一样不带说明。
+    "original_query_embedding_instruct": _env_str(
+        "RETRIEVAL_ORIGINAL_QUERY_EMBEDDING_INSTRUCT",
+        "Given a question about an academic paper, retrieve passages from the paper that answer the question.",
+    ),
 }
 
 INTENT_ROUTING_CONFIG: Dict[str, Any] = {

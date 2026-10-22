@@ -69,7 +69,7 @@ class FakeEmbeddingService:
     ) -> Tuple[list[list[float]], dict[str, Any]]:
         embeddings = [self._vector_for_text(text) for text in texts]
         usage = {"input_count": len(texts), "token_count": sum(len(str(text or "")) for text in texts)}
-        self._record("create_text_embeddings_with_usage", texts=list(texts), usage=usage)
+        self._record("create_text_embeddings_with_usage", texts=list(texts), usage=usage, instruct=_kwargs.get("instruct"))
         return embeddings, usage
 
     def create_embeddings(

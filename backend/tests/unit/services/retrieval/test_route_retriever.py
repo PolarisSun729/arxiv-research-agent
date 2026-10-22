@@ -723,13 +723,19 @@ class RouteRetrieverTests(unittest.TestCase):
             call for call in self.service.embedding_service.calls
             if call["method"] == "create_text_embeddings_with_usage"
         ]
+        shared_calls = [call for call in embedding_calls if not call.get("instruct")]
+        original_calls = [call for call in embedding_calls if call.get("instruct")]
 
-        self.assertEqual(len(embedding_calls), 1)
+        self.assertEqual(len(shared_calls), 1)
         self.assertGreaterEqual(bundle["embedding_batch"]["batch_size"], 2)
         self.assertEqual(bundle["embedding_batch"]["status"], "ok")
-        self.assertIn(query_bundle["query_profile"].semantic_query, embedding_calls[0]["texts"])
-        self.assertIn(query_bundle["query_profile"].evidence_query, embedding_calls[0]["texts"])
+        self.assertIn(query_bundle["query_profile"].semantic_query, shared_calls[0]["texts"])
+        self.assertIn(query_bundle["query_profile"].evidence_query, shared_calls[0]["texts"])
         self.assertIn("vector_original", bundle["routes"])
+        # 原问路由带查询侧 instruct，单独一批，只含原问本身。
+        self.assertEqual(len(original_calls), 1)
+        self.assertEqual(original_calls[0]["texts"], [question])
+        self.assertEqual(bundle["embedding_batch"]["original_query_batch"]["instruct"], original_calls[0]["instruct"])
 
     def test_enhancement_route_timeout_is_recorded_without_blocking_pipeline(self) -> None:
         self.service.route_retriever.route_executor.timeouts["keyword"] = 0.01
