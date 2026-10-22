@@ -274,6 +274,22 @@ class RetrievalPipeline:
                 context_budget=context_budget,
             )
 
+        stage_chunks = None
+        if options.include_stage_chunks:
+            deduped_routes = fusion_result.deduped_routes
+            stage_chunks = {
+                "routes": deduped_routes,
+                # 正式链路只保留融合前 fused_limit 条；调试页要区分“召回了但被融合截断”和“根本没召回”，
+                # 所以按同一套规则再排一次不截断的完整融合顺序。
+                "fused": self.fusion_service.fuse_routes(
+                    deduped_routes,
+                    sum(len(items) for items in deduped_routes.values()),
+                    query_profile,
+                ),
+                "reranked": rerank_result.reranked_results,
+                "final": final_context_top15,
+            }
+
         trace_path = trace_export.get("json") if isinstance(trace_export, dict) else None
         rerank_debug = rerank_result.rerank_debug if isinstance(rerank_result.rerank_debug, dict) else {}
         context_meta = paper_context if isinstance(paper_context, dict) else {}
@@ -298,6 +314,7 @@ class RetrievalPipeline:
             chunks=final_context_top15,
             debug=debug,
             trace_export=trace_export,
+            stage_chunks=stage_chunks,
         ).to_response()
 
     def _rerank_or_passthrough(

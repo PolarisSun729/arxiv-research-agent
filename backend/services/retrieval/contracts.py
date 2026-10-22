@@ -27,6 +27,8 @@ class RetrievalOptions:
     debug: Optional[bool] = None
     # debug 模式默认还会把检索 trace 落盘；只需要内存中 debug 摘要的调用方显式传 False 跳过写盘。
     export_trace: Optional[bool] = None
+    # 检索调试页要按 chunk 对齐各路召回与各阶段名次，需要原始 chunk 而不是 debug 摘要；只在显式要求时返回。
+    include_stage_chunks: Optional[bool] = None
     memory_context: Optional[Dict[str, Any]] = None
 
 
@@ -98,12 +100,15 @@ class RetrievalPipelineResult:
     chunks: List[Dict[str, Any]]
     debug: Optional[Dict[str, Any]] = None
     trace_export: Optional[Dict[str, str]] = None
+    stage_chunks: Optional[Dict[str, Any]] = None
 
     def to_response(self) -> Dict[str, Any]:
         """转换为接口响应字典；trace_export 同时挂到顶层和 debug 下，兼容两种读取方式。"""
         payload: Dict[str, Any] = {"chunks": self.chunks}
         if self.debug is not None:
             payload["debug"] = self.debug
+        if self.stage_chunks is not None:
+            payload["stage_chunks"] = self.stage_chunks
         if self.trace_export:
             payload["trace_export"] = self.trace_export
             if isinstance(payload.get("debug"), dict):

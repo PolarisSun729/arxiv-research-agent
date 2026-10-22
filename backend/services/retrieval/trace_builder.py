@@ -387,6 +387,7 @@ class RetrievalTraceBuilder:
             "route_rank": item.get("route_rank"),
             "matched_routes": item.get("matched_routes", []),
             "route_scores": item.get("route_scores", {}),
+            "rrf_votes": item.get("rrf_votes", {}),
             "source_query": item.get("source_query"),
             "source_queries": item.get("source_queries", []),
             # keyword route 的 BM25 可解释字段，便于在 debug 里直接看到“为什么召回”。

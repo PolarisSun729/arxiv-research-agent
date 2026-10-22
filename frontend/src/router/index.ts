@@ -69,6 +69,12 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/AdminIndexes.vue')
   },
   {
+    path: '/admin/retrieval-debug',
+    name: 'AdminRetrievalDebug',
+    meta: { title: '检索调试', admin: true, jwt: true },
+    component: () => import('@/views/AdminRetrievalDebug.vue')
+  },
+  {
     path: '/labeled',
     name: 'LabeledPapers',
     meta: { title: '已标记论文' },

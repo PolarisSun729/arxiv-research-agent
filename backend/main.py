@@ -28,6 +28,7 @@ from dependencies import (
     warm_up_services,
 )
 from routers.admin_index_router import router as admin_index_router
+from routers.admin_retrieval_debug_router import router as admin_retrieval_debug_router
 from routers.agent_router import router as agent_router
 from routers.arxiv_router import router as arxiv_router
 from routers.paper_router import router as paper_router
@@ -232,6 +233,7 @@ def create_app(load_mode: str | None = None) -> FastAPI:
     app.include_router(paper_router, prefix="/api", dependencies=api_dependencies)
     app.include_router(qa_router, prefix="/api", dependencies=api_dependencies)
     app.include_router(admin_index_router, prefix="/api", dependencies=api_dependencies)
+    app.include_router(admin_retrieval_debug_router, prefix="/api", dependencies=api_dependencies)
 
     @app.get("/api/auth/check", dependencies=api_dependencies)
     async def check_access_key():

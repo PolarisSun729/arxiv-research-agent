@@ -72,12 +72,21 @@ class ResultFusionService:
                         "route_confidences": {},
                         "source_queries": [],
                         "matched_indexes": [],
+                        "rrf_votes": {},
                     },
                 )
                 # RRF 投票只依赖 route 排名、route 权重和 route confidence，避免提前混入 rerank 语义。
-                vote = weight * route_confidence * (1.0 / (self.rrf_k + rank + 1))
-                vote *= self._table_structured_vote_multiplier(route_name, item)
+                multiplier = self._table_structured_vote_multiplier(route_name, item)
+                vote = weight * route_confidence * (1.0 / (self.rrf_k + rank + 1)) * multiplier
                 entry["score"] += vote
+                # 逐路记下投票的各个因子，排查时能看出融合名次具体由哪一路、哪个因子决定。
+                entry["rrf_votes"][route_name] = {
+                    "rank": rank + 1,
+                    "weight": weight,
+                    "confidence": route_confidence,
+                    "multiplier": multiplier,
+                    "vote": vote,
+                }
                 entry["matched_routes"].append(route_name)
                 entry["route_scores"][route_name] = item.get("route_score")
                 entry["route_confidences"][route_name] = route_confidence
