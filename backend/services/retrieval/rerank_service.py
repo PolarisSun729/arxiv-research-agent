@@ -237,6 +237,7 @@ class RerankService:
                 rerank_limit,
                 top_k,
                 query_profile,
+                original_question=original_question,
             )
             if remote_result is not None:
                 return remote_result
@@ -326,13 +327,15 @@ class RerankService:
 
     def rerank_with_dashscope(
         self,
-        user_query: str,
+        rerank_query: str,
         chunks: List[Dict[str, Any]],
         candidate_chunks: List[Dict[str, Any]],
         rerank_documents: List[str],
         rerank_limit: int,
         top_k: int,
         query_profile: Optional[QueryProfile] = None,
+        *,
+        original_question: str,
     ) -> Optional[Dict[str, Any]]:
         """调用 DashScope rerank 接口；任何失败都返回 None 并把原因写入 _llm_reranker_error，由调用方决定是否兜底。"""
         api_key = self.config_owner.llm_rerank_api_key
@@ -341,7 +344,7 @@ class RerankService:
             return None
         documents = [doc[: self.config_owner.llm_rerank_max_doc_chars] for doc in rerank_documents]
         request_url, payload = self.get_dashscope_rerank_request_spec(
-            user_query=user_query,
+            user_query=rerank_query,
             documents=documents,
             rerank_limit=rerank_limit,
         )
@@ -413,8 +416,8 @@ class RerankService:
                 chunks=chunks,
                 final_chunks=final_chunks,
                 rerank_limit=rerank_limit,
-                rerank_query=user_query,
-                original_question=user_query,
+                rerank_query=rerank_query,
+                original_question=original_question,
                 query_profile=query_profile,
                 candidate_debug=candidate_debug,
                 provider="dashscope",

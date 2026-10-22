@@ -26,6 +26,26 @@ class RerankServiceTests(unittest.TestCase):
         )
         self.query_profile = self.query_bundle["query_profile"]
 
+    def test_dashscope_rerank_debug_keeps_original_question(self) -> None:
+        self.service.llm_rerank_provider = "dashscope"
+        self.service.llm_rerank_api_key = "offline"
+        chunk = self.service.retrieval_rules.normalize_chunk(self.sample_chunks[0])
+        response = mock.Mock()
+        response.json.return_value = {"output": {"results": [{"index": 0, "relevance_score": 0.9}]}}
+
+        with mock.patch("services.retrieval.rerank_service.requests.post", return_value=response):
+            result = self.service.rerank_service.llm_rerank(
+                "Select the passage... Question: What is the method?",
+                [chunk],
+                top_k=1,
+                original_question="这篇论文的方法是什么？",
+                candidate_limit=1,
+            )
+
+        self.assertEqual(result["debug"]["mode"], "dashscope")
+        self.assertEqual(result["debug"]["query"], "Select the passage... Question: What is the method?")
+        self.assertEqual(result["debug"]["original_question"], "这篇论文的方法是什么？")
+
     def test_build_rerank_document_text_uses_asset_metadata_for_figure_table(self) -> None:
         figure_chunk = self.service.retrieval_rules.normalize_chunk(self.sample_chunks[5])
 
