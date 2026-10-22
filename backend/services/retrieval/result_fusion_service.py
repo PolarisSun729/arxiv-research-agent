@@ -305,7 +305,12 @@ class ResultFusionService:
 
     @staticmethod
     def chunk_unique_key(item: Dict[str, Any]) -> str:
-        """生成跨路由的 chunk 唯一键：同一资产/来源/chunk/分片/页码/顺序视为同一个证据。"""
+        """生成跨路由的 chunk 唯一键：同一资产/来源/chunk/分片/页码/顺序视为同一个证据。
+
+        分片标签为空时取 subchunk_label，与向量库入库时的规则一致：关键词索引从 chunk 文件构建，
+        只有 subchunk_label；不补齐的话，同一 chunk 的关键词命中和向量命中键不同，融合时合并不上。
+        超长 chunk 拆出的各段共用 original_chunk_id，只能靠分片标签区分，所以标签不能从键里去掉。
+        """
         return "|".join(
             [
                 str(item.get("chunk_type", "text")),
@@ -313,7 +318,7 @@ class ResultFusionService:
                 str(item.get("asset_path", "")),
                 str(item.get("source", "")),
                 str(item.get("original_chunk_id", item.get("parent_chunk_id", item.get("chunk_id", 0)))),
-                str(item.get("content_part_label", "")),
+                str(item.get("content_part_label") or item.get("subchunk_label") or ""),
                 str(item.get("page_range", "")),
                 str(item.get("order_index", "")),
             ]

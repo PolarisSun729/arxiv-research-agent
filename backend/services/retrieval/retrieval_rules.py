@@ -437,7 +437,8 @@ class RetrievalRules:
         chunk["subchunk_index"] = pick("subchunk_index", 0)
         chunk["subchunk_count"] = pick("subchunk_count", 0)
         chunk["subchunk_label"] = pick("subchunk_label")
-        chunk["content_part_label"] = pick("content_part_label")
+        # 与向量库入库规则一致：分片标签为空时取 subchunk_label（chunk 文件里只有后者）。
+        chunk["content_part_label"] = pick("content_part_label") or chunk["subchunk_label"]
         chunk["section_path"] = pick("section_path")
         chunk["section_title"] = pick("section_title")
         chunk["title"] = pick("title")

@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from services.retrieval.contracts import QueryProfile
 from services.retrieval.numeric_utils import first_float
+from services.retrieval.result_fusion_service import ResultFusionService
 from services.retrieval.table_evidence_formatter import summarize_table_evidence_debug
 from utils.config import get_enhanced_retrieval_runtime_config
 from utils.secret_redaction import redact_sensitive_value
@@ -490,19 +491,8 @@ class RetrievalTraceBuilder:
 
     @staticmethod
     def chunk_unique_key(item: Dict[str, Any]) -> str:
-        """chunk 的稳定唯一键：由类型、资产路径、来源、原始 chunk ID、分片标签、页码和顺序拼成。"""
-        return "|".join(
-            [
-                str(item.get("chunk_type", "text")),
-                str(item.get("asset_kind", "")),
-                str(item.get("asset_path", "")),
-                str(item.get("source", "")),
-                str(item.get("original_chunk_id", item.get("parent_chunk_id", item.get("chunk_id", 0)))),
-                str(item.get("content_part_label", "")),
-                str(item.get("page_range", "")),
-                str(item.get("order_index", "")),
-            ]
-        )
+        """chunk 的稳定唯一键，直接用融合去重的同一份实现，保证 trace、上下文扩展与融合判定一致。"""
+        return ResultFusionService.chunk_unique_key(item)
 
     @staticmethod
     def build_sparse_index_debug(keyword_debug: Optional[Dict[str, Any]]) -> Dict[str, Any]:
