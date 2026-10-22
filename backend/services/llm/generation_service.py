@@ -583,19 +583,12 @@ class GenerationService:
     ) -> str:
         """把用户问题译成英文，供原问向量路由检索英文论文正文；问题本身是英文时原样返回。"""
         prompt = (
-            "Translate the user's question about an English research paper into English, for semantic retrieval over the paper.
-"
-            "Rules:
-"
-            "1. If the question is already in English, return it unchanged.
-"
-            "2. Translate faithfully; do not answer, expand, or add terms that are not in the question.
-"
-            "3. Keep symbols, variable names, formulas, method names, dataset names, and abbreviations exactly as written.
-"
-            "4. Output only the translated question, with no quotes or explanation.
-
-"
+            "Translate the user's question about an English research paper into English, for semantic retrieval over the paper.\n"
+            "Rules:\n"
+            "1. If the question is already in English, return it unchanged.\n"
+            "2. Translate faithfully; do not answer, expand, or add terms that are not in the question.\n"
+            "3. Keep symbols, variable names, formulas, method names, dataset names, and abbreviations exactly as written.\n"
+            "4. Output only the translated question, with no quotes or explanation.\n\n"
             f"Question: {question}"
         )
         return self.complete_with_qwen(
