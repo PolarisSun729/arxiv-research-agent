@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
+from time import perf_counter
 from typing import Any, Callable, Dict, List, Optional
 
 from services.intent.intent_service import EXPERIMENT_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
@@ -19,6 +21,8 @@ from utils.config import get_enhanced_retrieval_runtime_config
 ENHANCED_RETRIEVAL_CONFIG = get_enhanced_retrieval_runtime_config()
 
 logger = logging.getLogger(__name__)
+
+_CJK_PATTERN = re.compile(r"[一-鿿]")
 
 
 def _inactive_route_metric(
@@ -190,23 +194,26 @@ class RouteRetriever:
                 collection_profile=collection_profile,
             )
         intent_profile = query_profile.intent_profile
-        hyde_text = ""
-        hyde_debug: Dict[str, Any] = {"enabled": enable_hyde, "text": "", "source_queries": [], "focus_queries": [], "confidence": 0.0}
-        if enable_hyde:
-            hyde_text = self.generate_hyde_document(user_query, query_profile, query_views["selected_queries"])
-            hyde_debug = {
-                "enabled": True,
-                "text": hyde_text,
-                "source_queries": [user_query, *query_views["selected_queries"]],
-                "focus_queries": query_views["selected_queries"][:2] if query_views["selected_queries"] else [user_query],
-                "confidence": self.route_confidence_builder(
-                    "vector_hyde",
-                    query_profile,
-                    hyde_text or user_query,
-                    route_queries=query_views["selected_queries"] or [user_query],
-                    intent_profile=intent_profile,
-                ),
-            }
+        hyde = (
+            self.generate_hyde_document(user_query)
+            if enable_hyde
+            else {"text": "", "status": "disabled", "error": "", "latency_ms": 0.0}
+        )
+        hyde_text = hyde["text"]
+        hyde_debug: Dict[str, Any] = {
+            "enabled": bool(enable_hyde),
+            # HyDE 只拿原问生成，不用改写问句。
+            "input_query": user_query,
+            **hyde,
+            # 与下面 vector_hyde 路由 vector_retrieve 的参数一致，即融合时实际使用的置信度。
+            "confidence": self.route_confidence_builder(
+                "vector_hyde",
+                query_profile,
+                "hyde",
+                route_queries=[hyde_text],
+                intent_profile=intent_profile,
+            ) if hyde_text else 0.0,
+        }
 
         default_embedding_config = self.embedding_service.get_default_embedding_config()
         embedding_provider = str(collection_profile.embedding_provider or default_embedding_config.provider)
@@ -323,10 +330,12 @@ class RouteRetriever:
             route_metrics["vector_hyde"] = hyde_result.to_metric()
         else:
             routes["vector_hyde"] = []
+            # 关闭时记 disabled；开启时记生成的失败原因（error / invalid_output）。
             route_metrics["vector_hyde"] = _inactive_route_metric(
                 enabled=bool(enable_hyde),
                 cache_hit=bool(collection_profile.cache_hit),
-                fallback_reason="no_hyde_text",
+                fallback_reason=str(hyde["status"]),
+                error=str(hyde["error"]),
             )
 
         if enable_keyword_search:
@@ -752,16 +761,29 @@ class RouteRetriever:
         """小写并压缩空白，用于比较章节标题/路径的实际长度。"""
         return " ".join(str(text or "").strip().lower().split())
 
-    def generate_hyde_document(self, user_query: str, query_profile: QueryProfile, rewritten_queries: List[str]) -> str:
-        """生成 HyDE（假设性答案文档）文本：优先调用生成服务，失败或为空时使用规则模板。"""
-        if self.generation_service is not None:
-            try:
-                text = self.generation_service.generate_hyde_document(user_query)
-                if text and text.strip():
-                    return text.strip()
-            except Exception:
-                pass
-        return self.heuristic_hyde_document(query_profile, rewritten_queries)
+    def generate_hyde_document(self, user_query: str) -> Dict[str, Any]:
+        """让 LLM 按原问写一段假设性论文片段（HyDE），供 vector_hyde 路由检索。
+
+        不做规则兜底：生成失败或为空时 status=error，含中文时 status=invalid_output（正文是英文），
+        两种情况 text 都为空，HyDE 路由直接跳过。
+        """
+        started = perf_counter()
+        result: Dict[str, Any] = {"text": "", "status": "ok", "error": "", "latency_ms": 0.0}
+        try:
+            if self.generation_service is None:
+                raise RuntimeError("generation service unavailable")
+            text = str(self.generation_service.generate_hyde_document(user_query) or "").strip()
+            if not text:
+                raise ValueError("empty hyde document")
+            if _CJK_PATTERN.search(text):
+                result.update({"status": "invalid_output", "error": "hyde document is not in English"})
+            else:
+                result["text"] = text
+        except Exception as exc:
+            logger.warning("HyDE generation failed, skipping the hyde route: %s", exc)
+            result.update({"status": "error", "error": str(exc)})
+        result["latency_ms"] = round((perf_counter() - started) * 1000, 1)
+        return result
 
     def merge_rewrite_hits(self, hits: List[Dict[str, Any]], *, top_k: int) -> List[Dict[str, Any]]:
         """合并多条改写问句的召回：同一 chunk 取最高路由分，按分数重排后截断到 top_k。
@@ -1118,17 +1140,6 @@ class RouteRetriever:
                 top_k=top_k if top_k is not None else len(normalized),
             )
         return normalized
-
-    def heuristic_hyde_document(self, query_profile: QueryProfile, rewritten_queries: List[str]) -> str:
-        """无生成服务时的 HyDE 模板：把改写 query、偏好章节和原问题拼成一段“假想证据”。"""
-        focus = ", ".join(rewritten_queries[:2]) if rewritten_queries else " ".join(query_profile.keywords)
-        preferred_sections = ", ".join(query_profile.section_preferences[:3]) if query_profile.section_preferences else "relevant sections"
-        return (
-            "The paper likely contains a passage that answers the question with concrete evidence, terminology, "
-            f"and section-level details. The most useful chunk is probably near {preferred_sections}. "
-            f"Relevant terms may include: {focus}. The passage should help retrieve the specific evidence needed to answer: "
-            f"{query_profile.original_query}"
-        )
 
     # min-max 归一化；实现统一放在 numeric_utils，这里保留方法名供本类（self.normalize_scores）及外部调用方使用。
     normalize_scores = staticmethod(min_max_normalize)

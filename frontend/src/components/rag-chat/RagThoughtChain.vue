@@ -35,6 +35,15 @@ function formatFusionSummary() {
   return `算法 ${algorithm} · RRF k ${rrfK}`
 }
 
+function formatHyde() {
+  const debug = props.retrievalDebug
+  const text = debug?.hyde?.text || debug?.hyde_text
+  if (text) return text
+  // 开启但生成失败时 text 为空，显示失败原因而不是“未启用”
+  if (debug?.hyde?.enabled) return `生成失败（${debug.hyde.status || 'error'}），HyDE 路由已跳过`
+  return '未启用'
+}
+
 const steps = computed(() => {
   const debug = props.retrievalDebug
   const finalContextCount =
@@ -53,7 +62,7 @@ const steps = computed(() => {
     {
       key: 'hyde',
       title: 'HyDE',
-      content: debug?.hyde?.text || debug?.hyde_text || '未启用'
+      content: formatHyde()
     },
     {
       key: 'keyword',

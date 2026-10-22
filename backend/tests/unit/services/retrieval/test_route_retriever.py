@@ -118,6 +118,38 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertFalse(disabled["hyde_debug"]["enabled"])
         self.assertEqual(disabled["routes"]["vector_hyde"], [])
 
+    def test_hyde_failure_skips_route_without_template_fallback(self) -> None:
+        def fail(query, **kwargs):
+            raise RuntimeError("llm down")
+
+        self.service.route_retriever.generation_service.generate_hyde_document = fail
+        bundle = self._build_route_bundle("Explain the paper method.", enable_hyde=True)
+
+        self.assertEqual(bundle["hyde_text"], "")
+        self.assertEqual(bundle["hyde_debug"]["status"], "error")
+        self.assertEqual(bundle["routes"]["vector_hyde"], [])
+        self.assertEqual(bundle["route_metrics"]["vector_hyde"]["fallback_reason"], "error")
+        self.assertIn("llm down", bundle["route_metrics"]["vector_hyde"]["error"])
+
+    def test_hyde_rejects_chinese_output(self) -> None:
+        self.service.route_retriever.generation_service.generate_hyde_document = lambda query, **kwargs: "本文提出了一种方法。"
+        bundle = self._build_route_bundle("Explain the paper method.", enable_hyde=True)
+
+        self.assertEqual(bundle["hyde_text"], "")
+        self.assertEqual(bundle["hyde_debug"]["status"], "invalid_output")
+        self.assertEqual(bundle["routes"]["vector_hyde"], [])
+        self.assertEqual(bundle["route_metrics"]["vector_hyde"]["fallback_reason"], "invalid_output")
+
+    def test_hyde_debug_confidence_matches_route_confidence(self) -> None:
+        bundle = self._build_route_bundle("Explain the paper method.", enable_hyde=True)
+
+        self.assertEqual(bundle["hyde_debug"]["input_query"], "Explain the paper method.")
+        self.assertNotIn("focus_queries", bundle["hyde_debug"])
+        self.assertAlmostEqual(
+            bundle["hyde_debug"]["confidence"],
+            bundle["routes"]["vector_hyde"][0]["route_confidence"],
+        )
+
     def test_keyword_toggle_controls_keyword_route(self) -> None:
         enabled = self._build_route_bundle("Which dataset benchmark is used?", enable_keyword_search=True)
         disabled = self._build_route_bundle("Which dataset benchmark is used?", enable_keyword_search=False)

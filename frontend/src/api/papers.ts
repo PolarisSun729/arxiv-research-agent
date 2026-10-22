@@ -901,9 +901,14 @@ export interface RetrievalDebugQueryRewrite {
 
 export interface RetrievalDebugHyde {
   enabled?: boolean
+  // HyDE 只用原问生成
+  input_query?: string
   text?: string
-  source_queries?: string[]
-  focus_queries?: string[]
+  // ok / error / invalid_output（含中文）/ disabled；非 ok 时 text 为空、HyDE 路由跳过
+  status?: string
+  error?: string
+  latency_ms?: number
+  confidence?: number
 }
 
 export interface RetrievalDebugKeywordSearch {
