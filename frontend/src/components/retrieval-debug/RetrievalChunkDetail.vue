@@ -236,6 +236,6 @@ function fixed(value: number | null | undefined, digits = 3) {
 
 .outcome--final { background: var(--color-success-soft); border-color: var(--color-success-border); color: var(--color-success); }
 .outcome--expansion { background: var(--color-primary-soft); border-color: var(--color-primary-border); color: var(--color-primary); }
-.outcome--fusion_cut { background: var(--color-danger-soft); border-color: var(--color-danger-border); color: var(--color-danger); }
+.outcome--rerank_cut { background: var(--color-danger-soft); border-color: var(--color-danger-border); color: var(--color-danger); }
 .outcome--rerank_dropped { background: var(--color-warning-soft); border-color: var(--color-warning-border); color: var(--color-warning); }
 </style>

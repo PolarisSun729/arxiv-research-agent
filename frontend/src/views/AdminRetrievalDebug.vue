@@ -8,7 +8,7 @@ import { runRetrievalDebug } from '@/api/adminRetrievalDebug'
 import type { DebugChunkRow, RetrievalDebugRequest, RetrievalDebugRun } from '@/api/adminRetrievalDebug'
 import { getErrorMessage } from '@/api/errors'
 import RetrievalChunkDetail from '@/components/retrieval-debug/RetrievalChunkDetail.vue'
-import { OUTCOME_LABELS, buildDebugExport, chunkOutcome, debugExportFilename, fusedKeepLimit, routeLabel, routeOverlap, routeStats } from '@/utils/retrievalDebug'
+import { OUTCOME_LABELS, buildDebugExport, chunkOutcome, debugExportFilename, rerankKeepLimit, routeLabel, routeOverlap, routeStats } from '@/utils/retrievalDebug'
 import type { ChunkOutcomeCode } from '@/utils/retrievalDebug'
 
 type SwitchKey = 'enable_query_rewrite' | 'enable_hyde' | 'enable_keyword_search' | 'enable_table_structured_route' | 'enable_llm_rerank' | 'enable_context_expansion'
@@ -23,7 +23,7 @@ const SWITCHES: Array<{ key: SwitchKey; label: string }> = [
 ]
 const OUTCOME_FILTERS: Array<{ value: ChunkOutcomeCode | 'all'; label: string }> = [
   { value: 'all', label: '全部' },
-  ...(['final', 'fusion_cut', 'rerank_dropped', 'not_selected', 'expansion'] as const).map(value => ({ value, label: OUTCOME_LABELS[value] }))
+  ...(['final', 'rerank_cut', 'rerank_dropped', 'not_selected', 'expansion'] as const).map(value => ({ value, label: OUTCOME_LABELS[value] }))
 ]
 // 名次表里融合之后的三个阶段列；表头可点击，按该列名次升序排。
 const STAGE_COLUMNS = [
@@ -117,7 +117,7 @@ const overlapRoutes = computed(() => (run.value?.routes || []).filter(item => it
 const overlap = computed(() => run.value ? routeOverlap(run.value, overlapRoutes.value) : [])
 const finalCount = computed(() => run.value?.chunks.filter(row => row.final_rank !== null).length ?? 0)
 const expansionCount = computed(() => run.value ? run.value.chunks.filter(row => chunkOutcome(row, run.value!).code === 'expansion').length : 0)
-const keepLimit = computed(() => run.value ? fusedKeepLimit(run.value) : 0)
+const keepLimit = computed(() => run.value ? rerankKeepLimit(run.value) : 0)
 
 const droppedCandidates = computed(() => (run.value?.query.candidates || []).filter(item => !item.selected))
 
@@ -165,7 +165,7 @@ function ariaSort(key: string) {
   return sortDesc.value ? 'descending' : 'ascending'
 }
 
-// 按融合名次升序时，在保留条数之后画一条截断线，线下的 chunk 不会进入 rerank。
+// 按融合名次升序时，在 rerank 候选上限之后画一条截断线，线下的 chunk 不参与 rerank（rerank 未生效时不画）。
 const cutIndex = computed(() => sortBy.value === 'fused' && !sortDesc.value ? rows.value.findIndex(item => (item.row.fused_rank ?? Infinity) > keepLimit.value) : -1)
 
 const selectedRow = computed(() => run.value?.chunks.find(row => row.key === selectedKey.value) || null)
@@ -242,7 +242,7 @@ onMounted(() => { void searchPapers(form.value.arxiv_id) })
         <span><strong>{{ run.arxiv_id }}</strong> {{ run.title }}</span>
         <span class="muted">耗时 {{ (run.elapsed_ms / 1000).toFixed(1) }}s</span>
         <span class="muted">共 {{ run.chunks.length }} 个 chunk · 检索输出 {{ finalCount }} 个（其中扩展补入 {{ expansionCount }}）· top_k {{ run.config.effective_top_k ?? '—' }}</span>
-        <span class="muted">融合保留 {{ keepLimit }} · rrf_k {{ run.fusion.rrf_k ?? '—' }}</span>
+        <span class="muted">rerank 候选上限 {{ run.config.rerank_candidate_limit ?? '—' }} · rrf_k {{ run.fusion.rrf_k ?? '—' }}</span>
         <span :class="['chip', run.rerank.applied ? 'chip--success' : run.rerank.enabled ? 'chip--warning' : '']">
           rerank {{ run.rerank.applied ? `已生效 · ${run.rerank.mode}` : run.rerank.enabled ? `未生效 · ${run.rerank.reason || run.rerank.mode}` : '关闭' }}
         </span>
@@ -390,7 +390,7 @@ onMounted(() => { void searchPapers(form.value.arxiv_id) })
             <tbody>
               <template v-for="(item, index) in rows" :key="item.row.key">
                 <tr v-if="index === cutIndex" class="cut-line">
-                  <td :colspan="activeRoutes.length + 5">融合只保留前 {{ keepLimit }} 名进入 rerank，以下被截断（只有被扩展按锚点补回的才会出现在输出里）</td>
+                  <td :colspan="activeRoutes.length + 5">只有融合前 {{ keepLimit }} 名参与 rerank，以下未进 rerank（只有被扩展按锚点补回的才会出现在输出里）</td>
                 </tr>
                 <tr :class="{ 'is-selected': item.row.key === selectedKey }" @click="selectedKey = item.row.key">
                   <td class="col-chunk">
@@ -708,7 +708,7 @@ onMounted(() => { void searchPapers(form.value.arxiv_id) })
 
 .outcome--final { background: var(--color-success-soft); border-color: var(--color-success-border); color: var(--color-success); }
 .outcome--expansion { background: var(--color-primary-soft); border-color: var(--color-primary-border); color: var(--color-primary); }
-.outcome--fusion_cut { background: var(--color-danger-soft); border-color: var(--color-danger-border); color: var(--color-danger); }
+.outcome--rerank_cut { background: var(--color-danger-soft); border-color: var(--color-danger-border); color: var(--color-danger); }
 .outcome--rerank_dropped { background: var(--color-warning-soft); border-color: var(--color-warning-border); color: var(--color-warning); }
 
 @media (max-width: 1100px) {

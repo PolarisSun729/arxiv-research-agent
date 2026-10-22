@@ -58,7 +58,7 @@ class _FakePipeline:
                 },
                 "fusion": {"rrf_k": 60, "route_weights": {"vector_original": 1.0, "keyword": 0.5}},
                 "llm_rerank": {"enabled": True, "applied": True, "mode": "remote"},
-                "config": {"effective_top_k": 1, "rrf_candidate_limit": 2},
+                "config": {"effective_top_k": 1, "rerank_candidate_limit": 2},
             },
             "stage_chunks": {"routes": routes, "fused": fused, "reranked": reranked, "final": [reranked[0], expansion]},
         }

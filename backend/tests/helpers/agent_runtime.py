@@ -280,7 +280,7 @@ def _ensure_dependency_stubs() -> None:
             "final_context_top_k": 5,
             "max_final_context_top_k": 10,
             "recall_candidate_limit": 20,
-            "rrf_candidate_limit": 20,
+            "context_expansion_anchor_limit": 20,
             "rerank_candidate_limit": 20,
             "rerank_document_preview_limit": 512,
             "preview_text_limit": 512,

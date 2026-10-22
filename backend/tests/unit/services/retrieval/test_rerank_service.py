@@ -34,7 +34,8 @@ class RerankServiceTests(unittest.TestCase):
         self.assertIn("Figure 2 compares model performance", text)
         self.assertIn("page 6", text)
 
-    def test_build_rerank_document_text_includes_matched_indexes_and_chunk_evidence(self) -> None:
+    def test_build_rerank_document_text_omits_matched_indexes(self) -> None:
+        # 召回命中的索引文本（问题、摘要等）不进 rerank 文档，rerank 只看章节和 chunk 证据。
         method_chunk = dict(self.service.retrieval_rules.normalize_chunk(self.sample_chunks[0]))
         method_chunk["matched_indexes"] = [
             {
@@ -53,9 +54,9 @@ class RerankServiceTests(unittest.TestCase):
 
         text = self.service.rerank_service.build_rerank_document_text(method_chunk)
 
-        self.assertIn("Matched retrieval indexes", text)
-        self.assertIn("type=question", text)
-        self.assertIn("What method framework pipeline is used?", text)
+        self.assertNotIn("Matched retrieval indexes", text)
+        self.assertNotIn("What method framework pipeline is used?", text)
+        self.assertIn("Section:", text)
         self.assertIn("Chunk evidence", text)
         self.assertIn("framework uses a retrieval pipeline", text)
 

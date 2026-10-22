@@ -83,7 +83,7 @@ def load_retrieval_modules() -> Dict[str, Any]:
             "final_context_top_k": 3,
             "max_final_context_top_k": 4,
             "recall_candidate_limit": 8,
-            "rrf_candidate_limit": 6,
+            "context_expansion_anchor_limit": 6,
             "rerank_candidate_limit": 4,
             "sample_limit": 6,
             "build_query_keywords_limit": 12,

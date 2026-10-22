@@ -67,12 +67,16 @@ class RerankService:
         raise AttributeError(name)
 
     def build_rerank_query(self, user_query: str, query_profile: QueryProfile) -> str:
-        """生成 rerank 使用的指令式查询：优先让生成服务改写，失败或为空时使用规则模板兜底。"""
+        """生成 rerank 使用的指令式查询：优先让生成服务改写，失败或为空时使用规则模板兜底。
+
+        问句用原问的英文译文（翻译失败时 planner 已回退为原问），与英文论文正文同语言。
+        """
+        question = query_profile.retrieval_query or user_query
         actual_rerank_query = ""
         if self.generation_service is not None and hasattr(self.generation_service, "build_rerank_query"):
             try:
                 rerank_query = self.generation_service.build_rerank_query(
-                    user_query,
+                    question,
                     intent_profile=query_profile.intent_profile.to_dict(),
                 )
                 if rerank_query and rerank_query.strip():
@@ -80,7 +84,7 @@ class RerankService:
             except Exception as exc:  # pragma: no cover
                 logger.debug("Failed to rewrite rerank query with model: %s", exc)
         if not actual_rerank_query:
-            actual_rerank_query = self.fallback_rerank_query(user_query, query_profile=query_profile)
+            actual_rerank_query = self.fallback_rerank_query(question, query_profile=query_profile)
         logger.debug("original_question=%s", user_query)
         logger.debug("actual_rerank_query=%s", actual_rerank_query)
         return actual_rerank_query
@@ -140,7 +144,11 @@ class RerankService:
         return self._build_multi_index_rerank_document(chunk, content)
 
     def _build_multi_index_rerank_document(self, chunk: Dict[str, object], evidence_text: str) -> str:
-        """把 index 命中摘要拼到 rerank 输入头部，同时保留 chunk 原始证据作为主体。"""
+        """在 chunk 证据前加章节头。
+
+        召回命中了哪些 index（ID、召回分、预览）不放进来：那是召回过程的记录，对相关性判断没用，
+        实测还占了文档近一半长度。
+        """
         max_chars = max(1, int(self.config_owner.llm_rerank_max_doc_chars or 4096))
         prefix_parts: List[str] = []
         section_path = str(chunk.get("section_path", "") or "").strip()
@@ -150,10 +158,6 @@ class RerankService:
         # 图表弱章节锚点已由上游判定不可入 embedding/rerank 时，摘要头也不能重新暴露该章节文本。
         if (section_path or section_title) and not (chunk_type in {"figure", "table"} and not allow_section_anchor):
             prefix_parts.append(f"Section: {section_path or section_title}")
-        matched_index_summary = self._matched_indexes_rerank_summary(chunk)
-        if matched_index_summary:
-            # matched index 是召回解释，不是最终证据；rerank 仍必须看到完整 chunk evidence。
-            prefix_parts.append(f"Matched retrieval indexes:\n{matched_index_summary}")
         if not prefix_parts:
             return self.limit_rerank_text(evidence_text, max_chars)
 
@@ -162,29 +166,6 @@ class RerankService:
         evidence_budget = max(1, max_chars - len(prefix) - len(evidence_header) - 2)
         evidence = self.limit_rerank_text(evidence_text, evidence_budget)
         return self.limit_rerank_text(f"{prefix}\n{evidence_header}\n{evidence}", max_chars)
-
-    def _matched_indexes_rerank_summary(self, chunk: Dict[str, object], *, limit: int = 3) -> str:
-        """把分数最高的前 limit 个命中 index 渲染成多行摘要（类型、ID、分数、文本预览）。"""
-        rows = self._matched_index_rows_for_rerank(chunk)
-        if not rows:
-            return ""
-        lines: List[str] = []
-        for row in rows[: max(1, limit)]:
-            index_type = str(row.get("matched_index_type") or row.get("index_type") or "body")
-            index_id = str(row.get("matched_index_id") or row.get("index_id") or "")
-            score = row.get("matched_index_score")
-            score_text = ""
-            try:
-                if score is not None:
-                    score_text = f" score={float(score):.4f}"
-            except (TypeError, ValueError):
-                score_text = ""
-            text_preview = self.limit_rerank_text(
-                str(row.get("matched_index_text") or row.get("index_text") or ""),
-                240,
-            )
-            lines.append(f"- type={index_type} id={index_id}{score_text}: {text_preview}".strip())
-        return "\n".join(line for line in lines if line)
 
     def _matched_index_rows_for_rerank(self, chunk: Dict[str, object]) -> List[Dict[str, Any]]:
         """取出 chunk 的命中 index 明细，按 index_id 去重后按分数从高到低排序。"""
@@ -229,14 +210,15 @@ class RerankService:
         top_k: int,
         query_profile: Optional[QueryProfile] = None,
         original_question: Optional[str] = None,
-        candidate_limit: Optional[int] = None,
+        *,
+        candidate_limit: int,
     ) -> Dict[str, Any]:
         """对融合后的候选执行 rerank，返回 {"chunks": 前 top_k, "reranked_chunks": 全量, "debug": ...}。
 
         任何一步失败都会走 _fallback_result，保持融合顺序返回，不会让检索整体失败。
         """
         # 参与 rerank 的候选数：不超过候选总数（chunks 为空时为 0），配置值至少按 1 计。
-        rerank_limit = min(len(chunks), max(1, int(candidate_limit or self.config_owner.llm_rerank_candidate_limit)))
+        rerank_limit = min(len(chunks), max(1, int(candidate_limit)))
         limited_chunks = chunks[: max(1, top_k)]
         original_question = original_question or rerank_query
         if not chunks:
@@ -288,7 +270,6 @@ class RerankService:
         try:
             raw_scores = reranker.predict(
                 pairs,
-                prompt=self.config_owner.llm_rerank_prompt,
                 batch_size=self.config_owner.llm_rerank_batch_size,
                 show_progress_bar=False,
                 convert_to_numpy=True,
@@ -521,8 +502,6 @@ class RerankService:
             "documents": documents,
             "top_n": top_n,
         }
-        if self.config_owner.llm_rerank_prompt:
-            payload["instruct"] = self.config_owner.llm_rerank_prompt
         return base_url, payload
 
     @staticmethod
@@ -566,7 +545,7 @@ class RerankService:
                 }.get(main_intent, "")
             if intent_profile.preferred_sections:
                 base_query += f"Favor sections such as: {', '.join(intent_profile.preferred_sections[:4])}. "
-        return f"{base_query}Original question: {normalized_question}" if normalized_question else base_query.rstrip()
+        return f"{base_query}Question: {normalized_question}" if normalized_question else base_query.rstrip()
 
     def _apply_rerank_fields(
         self,
@@ -590,7 +569,6 @@ class RerankService:
                 "fusion_rank": self._fusion_rank(chunk, input_rank),
                 "llm_rerank_score": rerank_score,
                 "llm_rerank_model": model_name,
-                "llm_rerank_prompt": self.config_owner.llm_rerank_prompt,
                 "llm_rerank_input_rank": input_rank,
                 "llm_rerank_returned_index": returned_index,
                 "llm_rerank_document_preview": document_text[: ENHANCED_RETRIEVAL_CONFIG["rerank_document_preview_limit"]],
@@ -712,7 +690,6 @@ class RerankService:
                     "fusion_rank": self._fusion_rank(tail_chunk, idx),
                     "llm_rerank_score": None,
                     "llm_rerank_model": model_name,
-                    "llm_rerank_prompt": self.config_owner.llm_rerank_prompt,
                     "llm_rerank_input_rank": idx,
                     "llm_rerank_rank": None,
                 }

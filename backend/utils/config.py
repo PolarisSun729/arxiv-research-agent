@@ -540,8 +540,11 @@ PAPER_EVIDENCE_RESEARCH_CONFIG: Dict[str, Any] = {
 
 ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     "recall_candidate_limit": _env_int("ENHANCED_RETRIEVAL_RECALL_CANDIDATE_LIMIT", 30),
-    "rrf_candidate_limit": _env_int("ENHANCED_RETRIEVAL_RRF_CANDIDATE_LIMIT", 30),
-    "rerank_candidate_limit": _env_int("ENHANCED_RETRIEVAL_RERANK_CANDIDATE_LIMIT", 30),
+    # 融合结果不截断，按融合顺序取前 rerank_candidate_limit 条送 rerank，其余接在尾部；
+    # 三路各召回 30 条时候选最多约 90 条，默认 90 即几乎总是全量 rerank（rerank 一次请求打完，90 条约 0.9s）。
+    "rerank_candidate_limit": _env_int("ENHANCED_RETRIEVAL_RERANK_CANDIDATE_LIMIT", 90),
+    # 上下文扩展只给 rerank 后前 N 条生成锚点与相邻/图表扩展候选。
+    "context_expansion_anchor_limit": _env_int("ENHANCED_RETRIEVAL_CONTEXT_EXPANSION_ANCHOR_LIMIT", 30),
     "final_context_top_k": _env_int("ENHANCED_RETRIEVAL_FINAL_CONTEXT_TOP_K", 15),
     "max_final_context_top_k": _env_int("ENHANCED_RETRIEVAL_MAX_FINAL_CONTEXT_TOP_K", 30),
     "enable_context_expansion": _env_bool("ENHANCED_RETRIEVAL_ENABLE_CONTEXT_EXPANSION", True),
@@ -726,9 +729,7 @@ RERANK_CONFIG: Dict[str, Any] = {
     "dashscope_api_key": _env_str("RERANK_DASHSCOPE_API_KEY", ALIYUN_API_KEY),
     "base_url": _env_str("RERANK_BASE_URL", _default_rerank_base_url),
     "fallback_local": _env_bool("RERANK_FALLBACK_LOCAL", False),
-    "prompt": _env_str("RERANK_PROMPT", "Retrieve text relevant to the user's query."),
     "batch_size": _env_int("RERANK_BATCH_SIZE", 8),
-    "candidate_limit": _env_int("RERANK_CANDIDATE_LIMIT", 24),
     "max_doc_chars": _env_int("RERANK_MAX_DOC_CHARS", 4096),
     "enable_query_rewrite": _env_bool("ENABLE_QUERY_REWRITE", True),
     "enable_hyde": _env_bool("ENABLE_HYDE", False),
@@ -782,9 +783,7 @@ RETRIEVAL_CONFIG: Dict[str, Any] = {
     "llm_rerank_model_name_or_path": RERANK_CONFIG["model_name"],
     "llm_rerank_local_model_name_or_path": RERANK_CONFIG["local_model_name_or_path"],
     "llm_rerank_batch_size": RERANK_CONFIG["batch_size"],
-    "llm_rerank_candidate_limit": RERANK_CONFIG["candidate_limit"],
     "llm_rerank_max_doc_chars": RERANK_CONFIG["max_doc_chars"],
-    "llm_rerank_prompt": RERANK_CONFIG["prompt"],
     "trace_export_enabled": RERANK_CONFIG["trace_export_enabled"],
     "trace_export_dir": RERANK_CONFIG["trace_export_dir"],
 }

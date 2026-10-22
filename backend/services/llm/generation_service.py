@@ -592,7 +592,7 @@ class GenerationService:
         )
         intent_clause = self._build_intent_rerank_clause(intent_profile)
         if normalized_question:
-            return f"{base_query}{intent_clause}Original question: {normalized_question}"
+            return f"{base_query}{intent_clause}Question: {normalized_question}"
         return f"{base_query}{intent_clause}".rstrip()
 
     def _build_intent_rerank_clause(self, intent_profile: Optional[Dict[str, Any]]) -> str:

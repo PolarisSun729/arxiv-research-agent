@@ -58,10 +58,6 @@ class EnhancedRetrievalService:
             "llm_rerank_model_name_or_path",
             "00-models/Qwen3-VL-Reranker-2B",
         )
-        self.llm_rerank_prompt = RETRIEVAL_CONFIG.get(
-            "llm_rerank_prompt",
-            "Retrieve text relevant to the user's query.",
-        )
         self.llm_rerank_provider = str(RETRIEVAL_CONFIG.get("llm_rerank_provider", "dashscope")).strip().lower()
         self.llm_rerank_api_key = str(RETRIEVAL_CONFIG.get("llm_rerank_api_key", "")).strip()
         self.llm_rerank_base_url = str(
@@ -76,7 +72,6 @@ class EnhancedRetrievalService:
             RETRIEVAL_CONFIG.get("llm_rerank_local_model_name_or_path", "00-models/Qwen3-VL-Reranker-2B")
         ).strip()
         self.llm_rerank_batch_size = int(RETRIEVAL_CONFIG.get("llm_rerank_batch_size", 8))
-        self.llm_rerank_candidate_limit = int(RETRIEVAL_CONFIG.get("llm_rerank_candidate_limit", 24))
         self.llm_rerank_max_doc_chars = int(RETRIEVAL_CONFIG.get("llm_rerank_max_doc_chars", 4096))
         self._llm_reranker_path: Optional[str] = None
         self._llm_reranker_device: Optional[str] = None
@@ -164,8 +159,7 @@ class EnhancedRetrievalService:
             "rerank": {
                 "provider": self.llm_rerank_provider, "model": self.llm_rerank_model_name,
                 "local_model": self.llm_rerank_local_model_name_or_path,
-                "fallback_local": self.llm_rerank_fallback_local, "prompt": self.llm_rerank_prompt,
-                "candidate_limit": self.llm_rerank_candidate_limit, "max_doc_chars": self.llm_rerank_max_doc_chars,
+                "fallback_local": self.llm_rerank_fallback_local, "max_doc_chars": self.llm_rerank_max_doc_chars,
             },
         }
 

@@ -105,8 +105,8 @@ export interface RetrievalDebugRun {
   config: {
     effective_top_k: number | null
     recall_candidate_limit: number | null
-    rrf_candidate_limit: number | null
     rerank_candidate_limit: number | null
+    context_expansion_anchor_limit: number | null
     enable_query_rewrite: boolean | null
     enable_hyde: boolean | null
     enable_keyword_search: boolean | null

@@ -15,7 +15,7 @@ export function routeLabel(name: string) {
   return ROUTE_LABELS[name] || name
 }
 
-export type ChunkOutcomeCode = 'final' | 'expansion' | 'fusion_cut' | 'rerank_dropped' | 'not_selected' | 'not_fused'
+export type ChunkOutcomeCode = 'final' | 'expansion' | 'rerank_cut' | 'rerank_dropped' | 'not_selected' | 'not_fused'
 
 export interface ChunkOutcome {
   code: ChunkOutcomeCode
@@ -26,26 +26,27 @@ export interface ChunkOutcome {
 export const OUTCOME_LABELS: Record<ChunkOutcomeCode, string> = {
   final: '进入检索输出',
   expansion: '扩展补入',
-  fusion_cut: '融合截断',
+  rerank_cut: '未进 rerank',
   rerank_dropped: 'rerank 后落选',
   not_selected: '未入选输出',
   not_fused: '未参与融合'
 }
 
-// 融合阶段实际保留的条数：与后端 fused_limit 同义，取 rrf_candidate_limit 和 top_k 的较大者。
-export function fusedKeepLimit(run: RetrievalDebugRun) {
-  return Math.max(run.config.rrf_candidate_limit ?? 0, run.config.effective_top_k ?? 0)
+// 融合不截断；rerank 生效时只有融合前 rerank_candidate_limit 条参与打分，其余接在尾部、进不了输出。
+export function rerankKeepLimit(run: RetrievalDebugRun) {
+  if (!run.rerank.applied) return Number.POSITIVE_INFINITY
+  return Math.max(run.config.rerank_candidate_limit ?? 0, run.config.effective_top_k ?? 0)
 }
 
 // 一个 chunk 最终停在哪一步；没进检索输出的，按最早把它挡掉的阶段归因。
 export function chunkOutcome(row: DebugChunkRow, run: RetrievalDebugRun): ChunkOutcome {
-  const keepLimit = fusedKeepLimit(run)
+  const keepLimit = rerankKeepLimit(run)
   const fusionKept = row.fused_rank !== null && row.fused_rank <= keepLimit
   let code: ChunkOutcomeCode
   // 融合没保留（或根本没召回）却出现在输出里的，是上下文扩展按锚点补进来的图表、相邻段落。
   if (row.final_rank !== null) code = fusionKept ? 'final' : 'expansion'
   else if (row.fused_rank === null) code = 'not_fused'
-  else if (!fusionKept) code = 'fusion_cut'
+  else if (!fusionKept) code = 'rerank_cut'
   else if (run.rerank.applied && row.rerank_rank !== null) code = 'rerank_dropped'
   else code = 'not_selected'
   return { code, label: OUTCOME_LABELS[code] }

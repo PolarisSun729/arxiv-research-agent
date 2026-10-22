@@ -15,8 +15,8 @@ PREVIEW_CHARS = 160
 _CONFIG_KEYS = (
     "effective_top_k",
     "recall_candidate_limit",
-    "rrf_candidate_limit",
     "rerank_candidate_limit",
+    "context_expansion_anchor_limit",
     "enable_query_rewrite",
     "enable_hyde",
     "enable_keyword_search",
