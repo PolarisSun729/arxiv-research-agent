@@ -32,10 +32,10 @@ class IndexHitAggregator:
         route_name: str,
         top_k: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """把一条路由的 index 级命中聚合成 chunk 级候选，并按首次命中名次排序、截断、归一化分数。
+        """把一条路由的 index 级命中聚合成 chunk 级候选，并按路由分排序、截断、归一化分数。
 
-        排序以 best_rank（该 chunk 最早出现的命中名次）为主，保持路由原有的相对顺序；
-        同名次时再按路由分和原始 index 分倒序。
+        路由分是代表 index 的加权分（原始分 × index 类型权重）加多类型命中 bonus，
+        按它倒序才能让 index 类型权重真正影响名次；同分时按原始 index 分倒序、再按代表命中名次。
         """
         if not hits:
             return []
@@ -132,9 +132,9 @@ class IndexHitAggregator:
 
         candidates.sort(
             key=lambda item: (
-                int(item.get("index_aggregation_best_rank", 0) or 0),
                 -float(item["route_score"]),
                 -float(item["best_matched_index"]["matched_index_score"]),
+                int(item.get("index_aggregation_best_rank", 0) or 0),
             )
         )
         limited = candidates[:top_k] if top_k is not None and top_k > 0 else candidates
