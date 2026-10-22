@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
-from services.intent.intent_service import EXPERIMENT_INTENTS, MAIN_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
+from services.intent.intent_service import EXPERIMENT_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
 from services.retrieval.contracts import legacy_body_index_id
 from utils.config import get_enhanced_retrieval_runtime_config
 
@@ -145,14 +145,6 @@ SECTION_TAG_RULES = {
 # 这些章节通常不是问题的直接证据（附录、提示词、参考文献等），命中时在结构加分里扣分。
 NOISY_SECTION_TAGS = {"appendix", "prompt", "figure", "table", "references"}
 
-# evidence query 末尾追加的“证据导向”提示词，按查询语言选择。
-# 注意：中文版本此前因编码错误被写成了乱码（"璁烘枃" 等，即 UTF-8 字节被按 GBK 解码），现已更正。
-_EVIDENCE_HINT_TERMS = {
-    "zh": ["论文", "证据", "段落"],
-    "default": ["paper", "evidence", "passage"],
-}
-
-
 class RetrievalRules:
     """集中维护检索规则与启发式判断，避免编排层继续持有大段常量和规则分支。"""
 
@@ -232,11 +224,6 @@ class RetrievalRules:
                         expanded.append(synonym)
         return expanded
 
-    def dedupe_terms(self, terms: List[str]) -> str:
-        """归一化后去重（保持首次出现顺序），再用空格拼成一个 query 字符串。"""
-        normalized_terms = (self.normalize_query_text(str(term)) for term in terms)
-        return " ".join(dict.fromkeys(term for term in normalized_terms if term))
-
     def dedupe_list(self, items: List[str]) -> List[str]:
         """按归一化结果去重，但返回原始写法（仅去首尾空白），保持首次出现顺序。"""
         seen_normalized = set()
@@ -263,12 +250,6 @@ class RetrievalRules:
         filtered = self._drop_stopwords(tokens)
         if not filtered:
             filtered = [token for token in tokens if len(token) > 1]
-        return list(dict.fromkeys(filtered))[:limit]
-
-    def extract_paper_terms_from_text(self, text: str, limit: Optional[int] = None) -> List[str]:
-        """从任意文本中抽取论文术语（去停用词、去重、截断）；与查询关键词不同，这里没有兜底。"""
-        limit = int(limit or self.config["extract_paper_terms_limit"])
-        filtered = self._drop_stopwords(self.tokenize_for_keyword_search(text))
         return list(dict.fromkeys(filtered))[:limit]
 
     def build_query_keywords(self, queries: List[str], limit: Optional[int] = None) -> List[str]:
@@ -300,62 +281,6 @@ class RetrievalRules:
         if has_latin:
             return "en"
         return "unknown"
-
-    def preferred_sections_for_main_intent(self, main_intent: str) -> List[str]:
-        """主意图对应的偏好章节；未知意图按 other 处理。"""
-        spec = MAIN_INTENTS.get(main_intent, MAIN_INTENTS["other"])
-        return list(spec["preferred_sections"])
-
-    def main_intent_terms(self, main_intent: str) -> List[str]:
-        """主意图对应的关键词（去重）；未知意图按 other 处理。"""
-        spec = MAIN_INTENTS.get(main_intent, MAIN_INTENTS["other"])
-        return self.dedupe_list([str(item).strip() for item in spec["keywords"] if str(item).strip()])
-
-    def preferred_section_tags_from_plan(self, query_plan: Dict[str, Any], main_intent: str) -> List[str]:
-        """合并 query plan 指定的章节与意图默认章节，去重后最多保留 6 个（plan 中的排在前面）。"""
-        preferred = [str(item).strip() for item in (query_plan.get("preferred_sections", []) or []) if str(item).strip()]
-        preferred.extend(self.preferred_sections_for_main_intent(main_intent))
-        return self.dedupe_list(preferred)[:6]
-
-    @staticmethod
-    def compact_terms(terms: List[str], limit: int) -> List[str]:
-        """去空白、去重后保留前 limit 个词（区分大小写）。"""
-        compacted: List[str] = []
-        for term in terms:
-            normalized = str(term).strip()
-            if normalized and normalized not in compacted:
-                compacted.append(normalized)
-            if len(compacted) >= limit:
-                break
-        return compacted
-
-    def build_semantic_query(self, user_query: str, keywords: List[str], intent_tags: List[str], intent_profile: Optional[Any] = None) -> str:
-        """语义 query：意图改写焦点 + 前 6 个关键词；都没有时用原问分词，最后兜底为归一化原问。"""
-        parts: List[str] = []
-        if intent_profile and getattr(intent_profile, "rewrite_focus", None):
-            parts.extend(intent_profile.rewrite_focus[:4])
-        parts.extend(keywords[:6])
-        if not parts:
-            parts.extend(self.tokenize_for_keyword_search(user_query)[:6])
-        return self.dedupe_terms(parts) or self.normalize_query_text(user_query)
-
-    def build_evidence_query(self, keywords: List[str], intent_tags: List[str], language: str, intent_profile: Optional[Any] = None) -> str:
-        """证据 query：rerank 焦点 + 前 4 个关键词 + 按语言选择的“证据导向”提示词。"""
-        parts: List[str] = []
-        if intent_profile and getattr(intent_profile, "rerank_focus", None):
-            parts.extend(intent_profile.rerank_focus[:4])
-        parts.extend(keywords[:4])
-        parts.extend(_EVIDENCE_HINT_TERMS["zh"] if language == "zh" else _EVIDENCE_HINT_TERMS["default"])
-        return self.dedupe_terms(parts)
-
-    def build_keyword_query(self, keywords: List[str], intent_tags: List[str], intent_profile: Optional[Any] = None) -> str:
-        """关键词 query：前 keyword_parts_limit 个关键词 + 意图改写焦点。"""
-        # 切片得到的是新列表，后续 extend 不会修改调用方传入的 keywords。
-        # （原先这里还有一个 `if not parts: parts = keywords[:limit]` 分支：parts 为空时该切片必然也为空，属于死代码，已删除。）
-        parts = keywords[: self.config["keyword_parts_limit"]]
-        if intent_profile and getattr(intent_profile, "rewrite_focus", None):
-            parts.extend(intent_profile.rewrite_focus[:4])
-        return self.dedupe_terms(parts)
 
     def detect_section_tags(self, content: str) -> List[str]:
         """只看 chunk 前 900 个字符（章节标题通常在开头），按 SECTION_TAG_RULES 打标签。"""

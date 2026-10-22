@@ -539,8 +539,6 @@ PAPER_EVIDENCE_RESEARCH_CONFIG: Dict[str, Any] = {
 }
 
 ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
-    "query_view_limit": _env_int("ENHANCED_RETRIEVAL_QUERY_VIEW_LIMIT", 6),
-    "query_plan_limit": _env_int("ENHANCED_RETRIEVAL_QUERY_PLAN_LIMIT", 5),
     "recall_candidate_limit": _env_int("ENHANCED_RETRIEVAL_RECALL_CANDIDATE_LIMIT", 30),
     "rrf_candidate_limit": _env_int("ENHANCED_RETRIEVAL_RRF_CANDIDATE_LIMIT", 30),
     "rerank_candidate_limit": _env_int("ENHANCED_RETRIEVAL_RERANK_CANDIDATE_LIMIT", 30),
@@ -559,9 +557,6 @@ ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     "retrieval_candidate_max_tokens_soft": _env_int("RETRIEVAL_CANDIDATE_MAX_TOKENS_SOFT", 90000),
     "retrieval_candidate_token_chars_per_token": float(_env_str("RETRIEVAL_CANDIDATE_TOKEN_CHARS_PER_TOKEN", "3.0")),
     "sample_limit": _env_int("ENHANCED_RETRIEVAL_SAMPLE_LIMIT", 24),
-    "merge_candidate_terms_limit": _env_int("ENHANCED_RETRIEVAL_MERGE_CANDIDATE_TERMS_LIMIT", 24),
-    "extract_paper_terms_limit": _env_int("ENHANCED_RETRIEVAL_EXTRACT_PAPER_TERMS_LIMIT", 10),
-    "compact_terms_limit": _env_int("ENHANCED_RETRIEVAL_COMPACT_TERMS_LIMIT", 5),
     "extract_query_keywords_limit": _env_int("ENHANCED_RETRIEVAL_EXTRACT_QUERY_KEYWORDS_LIMIT", 8),
     "build_query_keywords_limit": _env_int("ENHANCED_RETRIEVAL_BUILD_QUERY_KEYWORDS_LIMIT", 12),
     "language_weight_zh_mixed": float(_env_str("ENHANCED_RETRIEVAL_LANGUAGE_WEIGHT_ZH_MIXED", "0.1")),
@@ -591,11 +586,6 @@ ENHANCED_RETRIEVAL_CONFIG: Dict[str, Any] = {
     "preview_text_limit": _env_int("ENHANCED_RETRIEVAL_PREVIEW_TEXT_LIMIT", 100),
     "rerank_document_preview_limit": _env_int("ENHANCED_RETRIEVAL_RERANK_DOCUMENT_PREVIEW_LIMIT", 220),
     "candidate_debug_limit": _env_int("ENHANCED_RETRIEVAL_CANDIDATE_DEBUG_LIMIT", 10),
-    "source_sample_limit": _env_int("ENHANCED_RETRIEVAL_SOURCE_SAMPLE_LIMIT", 6),
-    "source_sample_primary_limit": _env_int("ENHANCED_RETRIEVAL_SOURCE_SAMPLE_PRIMARY_LIMIT", 260),
-    "source_sample_secondary_limit": _env_int("ENHANCED_RETRIEVAL_SOURCE_SAMPLE_SECONDARY_LIMIT", 180),
-    "paper_terms_preview_limit": _env_int("ENHANCED_RETRIEVAL_PAPER_TERMS_PREVIEW_LIMIT", 8),
-    "keyword_parts_limit": _env_int("ENHANCED_RETRIEVAL_KEYWORD_PARTS_LIMIT", 8),
     "sanitize_trace_slug_max_length": _env_int("ENHANCED_RETRIEVAL_SANITIZE_TRACE_SLUG_MAX_LENGTH", 40),
     "query_weight_base_summary_other": float(_env_str("ENHANCED_RETRIEVAL_QUERY_WEIGHT_BASE_SUMMARY_OTHER", "1.05")),
     "query_weight_base_default": float(_env_str("ENHANCED_RETRIEVAL_QUERY_WEIGHT_BASE_DEFAULT", "0.95")),
@@ -826,7 +816,6 @@ GENERATION_CONFIG: Dict[str, Any] = {
     "openai_chat_temperature": float(_env_str("OPENAI_CHAT_TEMPERATURE", "0.7")),
     "openai_chat_max_tokens": _env_int("OPENAI_CHAT_MAX_TOKENS", 512),
     "rewrite_query_max_queries_default": _env_int("REWRITE_QUERY_MAX_QUERIES_DEFAULT", 3),
-    "plan_query_max_queries_default": _env_int("PLAN_QUERY_MAX_QUERIES_DEFAULT", 5),
     # 每次生成的完整上下文与回答落盘到 05-generation-results，仅供调试复盘；
     # 文件含用户问题和回答原文且没有清理机制，默认关闭，排查时再临时打开。
     "save_generation_results": _env_bool("SAVE_GENERATION_RESULTS", False),
@@ -843,8 +832,7 @@ GENERATION_CONFIG: Dict[str, Any] = {
         "intent_routing": "small",  # 决定将意图路由到哪个子 agent 或处理流水线
         "search_spec_parse": "small",  # 将自然语言搜索请求转换为结构化的搜索规范
         "preference_action_parse": "small",  # 解析用户的喜欢/不喜欢/收藏等偏好操作
-        "query_planning": "small",  # 规划多步或多查询的检索策略
-        "query_rewrite": "small",  # 重写或规范化查询以提升检索效果
+        "query_rewrite": "small",  # 把问题改写成贴合论文术语的英文检索问句（具体化指代、拆分复合问题）
         "query_translation": "small",  # 把用户问题译成英文，供原问向量路由检索英文论文
         "rerank_query": "small",  # 为重排阶段生成或调整查询
         "prompt_context_compaction": "small",  # 对长证据块做语义压缩，结果仍需最终回答模型基于证据使用

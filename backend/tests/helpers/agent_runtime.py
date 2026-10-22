@@ -277,8 +277,6 @@ def _ensure_dependency_stubs() -> None:
         }
     if not hasattr(config_module, "get_enhanced_retrieval_runtime_config"):
         config_module.get_enhanced_retrieval_runtime_config = lambda: {
-            "query_view_limit": 5,
-            "query_plan_limit": 5,
             "final_context_top_k": 5,
             "max_final_context_top_k": 10,
             "recall_candidate_limit": 20,
@@ -288,14 +286,6 @@ def _ensure_dependency_stubs() -> None:
             "preview_text_limit": 512,
             "candidate_debug_limit": 10,
             "short_text_preview_limit": 128,
-            "source_sample_limit": 3,
-            "source_sample_primary_limit": 128,
-            "source_sample_secondary_limit": 128,
-            "merge_candidate_terms_limit": 10,
-            "extract_paper_terms_limit": 10,
-            "paper_terms_preview_limit": 10,
-            "compact_terms_limit": 10,
-            "keyword_parts_limit": 8,
             "extract_query_keywords_limit": 8,
             "build_query_keywords_limit": 8,
             "sanitize_trace_slug_max_length": 64,

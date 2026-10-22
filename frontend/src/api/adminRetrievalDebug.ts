@@ -94,8 +94,9 @@ export interface RetrievalDebugRun {
       fallback_reason: string | null
     }
     rewrite_enabled: boolean
+    rewrite_status: string
+    rewrite_latency_ms: number | null
     rewrite_error: string
-    view_queries: Record<string, string>
     selected_queries: string[]
     candidates: QueryCandidate[]
     keywords: string[]

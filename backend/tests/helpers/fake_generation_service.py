@@ -30,15 +30,7 @@ class FakeGenerationService:
 
     def rewrite_query_for_retrieval(self, query: str, **kwargs: Any) -> list[str]:
         self._record("rewrite_query_for_retrieval", query=query, kwargs=kwargs)
-        return [query]
-
-    def plan_queries_for_retrieval(self, query: str, **kwargs: Any) -> dict[str, Any]:
-        self._record("plan_queries_for_retrieval", query=query, kwargs=kwargs)
-        return {
-            "query": query,
-            "rewrites": [query],
-            "strategy": "fake",
-        }
+        return [f"{query} (rewritten)"]
 
     def build_rerank_query(self, query: str, **kwargs: Any) -> str:
         self._record("build_rerank_query", query=query, kwargs=kwargs)

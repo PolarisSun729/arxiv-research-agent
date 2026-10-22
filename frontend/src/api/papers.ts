@@ -890,9 +890,8 @@ export interface RetrievalDebugQueryCandidate {
 export interface RetrievalDebugQueryRewrite {
   enabled?: boolean
   original_query?: string
-  query_plan?: Record<string, any>
+  rewrite_status?: string
   model_queries?: string[]
-  heuristic_queries?: string[]
   selected_queries?: string[]
   selected_keywords?: string[]
   selected_query_details?: RetrievalDebugQueryDetail[]
@@ -946,7 +945,6 @@ export interface RetrievalDebug {
   contextualized_question?: string
   rewritten_queries: string[]
   hyde_text: string
-  query_plan?: Record<string, any>
   query_rewrite?: RetrievalDebugQueryRewrite
   hyde?: RetrievalDebugHyde
   keyword_search?: RetrievalDebugKeywordSearch

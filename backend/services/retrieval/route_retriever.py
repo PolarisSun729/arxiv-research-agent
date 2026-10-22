@@ -212,38 +212,28 @@ class RouteRetriever:
         embedding_provider = str(collection_profile.embedding_provider or default_embedding_config.provider)
         embedding_model = str(collection_profile.embedding_model or default_embedding_config.model_name)
         embedding_dimension = int(collection_profile.vector_dimension) if collection_profile.vector_dimension else None
-        rewrite_queries = query_views["selected_queries"] if query_views["enabled"] and query_views["selected_queries"] else []
-        view_queries = query_views.get("view_queries", {}) or {}
-        # batch 输入显式覆盖 original / semantic / evidence / keyword / rewrite / HyDE 视图；
+        rewrite_queries = query_views["selected_queries"] if query_views["enabled"] else []
         # QueryEmbeddingBatcher 会统一归一化去重，避免不同 route 各自请求 embedding。
-        batch_queries = [
-            user_query,
-            view_queries.get("original", ""),
-            view_queries.get("semantic", ""),
-            view_queries.get("evidence", ""),
-            view_queries.get("keywords", ""),
-            *rewrite_queries,
-            hyde_text,
-        ]
+        batch_queries = [user_query, hyde_text]
         batch_size = ENHANCED_RETRIEVAL_CONFIG.get("query_embedding_batch_size", 20)
         # 原问路由用英文译文检索英文正文；翻译失败时 planner 已回退为原问。
         original_query = str((query_views.get("original_translation") or {}).get("query") or user_query)
         original_instruct = str(ENHANCED_RETRIEVAL_CONFIG.get("original_query_embedding_instruct") or "")
         original_embedding_future = None
         if original_instruct:
-            # 原问路由带查询侧说明，向量与其它路由不通用，单独一批并与主批并发请求。
+            # 原问译文和改写问句都是问句，共用查询侧说明；这批向量与其它路由不通用，单独一批并与主批并发请求。
             original_embedding_future = self._embedding_pool.submit(
                 copy_context().run,
                 self.embedding_batcher.build,
-                [original_query],
+                [original_query, *rewrite_queries],
                 provider=embedding_provider,
                 model=embedding_model,
                 dimension=embedding_dimension,
                 batch_size=batch_size,
                 instruct=original_instruct,
             )
-        if not original_instruct:
-            batch_queries.append(original_query)
+        else:
+            batch_queries.extend([original_query, *rewrite_queries])
         embedding_batch = self.embedding_batcher.build(
             batch_queries,
             provider=embedding_provider,
@@ -294,21 +284,22 @@ class RouteRetriever:
                         query_profile=query_profile,
                         route_queries=rewrite_queries,
                         collection_profile=collection_profile,
-                        embedding_map=embedding_map,
+                        embedding_map=original_embedding_map,
                     ),
                     required=False,
                     cache_hit=bool(collection_profile.cache_hit),
                 )
                 rewrite_route_results.append(rewrite_result)
                 rewrite_hits.extend(rewrite_result.results)
-            routes["vector_rewrite"] = self.fusion_service.dedupe_preserve_order(rewrite_hits)
+            routes["vector_rewrite"] = self.merge_rewrite_hits(rewrite_hits, top_k=recall_candidate_limit)
             route_metrics["vector_rewrite"] = self.combine_route_metrics("vector_rewrite", rewrite_route_results, len(routes["vector_rewrite"]))
         else:
             routes["vector_rewrite"] = []
+            # 改写关闭时记 disabled；开启时记 planner 给出的跳过原因（error / no_rewrite / covered_by_original）。
             route_metrics["vector_rewrite"] = _inactive_route_metric(
-                enabled=False,
+                enabled=bool(query_views["enabled"]),
                 cache_hit=bool(collection_profile.cache_hit),
-                fallback_reason="disabled",
+                fallback_reason=str(query_views.get("rewrite_status") or "disabled") if query_views["enabled"] else "disabled",
             )
 
         if hyde_text:
@@ -339,8 +330,8 @@ class RouteRetriever:
             )
 
         if enable_keyword_search:
-            # keyword route 以用户原问和 planner 的 keyword_query 为主，rewrite/semantic/evidence 只做辅助召回；
-            # 否则通用改写词（如 method/section/framework）会在 BM25 中等权累加并压过真实问题焦点。
+            # keyword route 以用户原问为主，改写问句只做辅助召回；
+            # 否则改写里的通用词（如 method/section/framework）会在 BM25 中等权累加并压过真实问题焦点。
             keyword_query_views = self.build_keyword_query_views(
                 user_query=user_query,
                 query_profile=query_profile,
@@ -525,17 +516,9 @@ class RouteRetriever:
         query_views: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         """统一管理 keyword route 的 query view 来源、去重与权重，避免 rewrite 数量直接放大 BM25。"""
-        raw_views: List[Dict[str, Any]] = []
-        view_queries = query_views.get("view_queries", {}) or {}
-        raw_views.append({"query": user_query, "source": "original", "source_index": 0})
-        raw_views.append({"query": query_profile.keyword_query, "source": "keyword", "source_index": 0})
-        raw_views.append({"query": query_profile.evidence_query, "source": "evidence", "source_index": 0})
-        raw_views.append({"query": query_profile.semantic_query, "source": "semantic", "source_index": 0})
+        raw_views: List[Dict[str, Any]] = [{"query": user_query, "source": "original", "source_index": 0}]
         for idx, query in enumerate(query_views.get("selected_queries", []) or []):
             raw_views.append({"query": query, "source": "rewrite", "source_index": idx})
-        hyde_query = str(view_queries.get("hyde", "") or "").strip()
-        if hyde_query:
-            raw_views.append({"query": hyde_query, "source": "hyde", "source_index": 0})
 
         kept: List[Dict[str, Any]] = []
         for row in raw_views:
@@ -641,14 +624,6 @@ class RouteRetriever:
         normalized = str(source or "rewrite").strip().lower()
         if normalized == "original":
             return 1.22
-        if normalized == "evidence":
-            return 0.78
-        if normalized == "semantic":
-            return 0.48
-        if normalized == "keyword":
-            return 0.9
-        if normalized == "hyde":
-            return 0.34
         if normalized == "rewrite":
             return min(0.3, 0.65 / max(rewrite_count, 1))
         return 0.3
@@ -787,6 +762,27 @@ class RouteRetriever:
             except Exception:
                 pass
         return self.heuristic_hyde_document(query_profile, rewritten_queries)
+
+    def merge_rewrite_hits(self, hits: List[Dict[str, Any]], *, top_k: int) -> List[Dict[str, Any]]:
+        """合并多条改写问句的召回：同一 chunk 取最高路由分，按分数重排后截断到 top_k。
+
+        拆分出的子问题各自召回自己那部分证据，取最高分能让每个子问题的最佳命中都排在前面；
+        直接拼接会让第二条及之后问句的命中全部排到第一条的 top_k 之后。
+        """
+        ordered = sorted(hits, key=lambda item: -float(item["route_score"]))
+        source_queries: Dict[str, List[str]] = {}
+        for item in ordered:
+            queries = source_queries.setdefault(self.fusion_service.chunk_unique_key(item), [])
+            if item.get("source_query") not in queries:
+                queries.append(item.get("source_query"))
+        # dedupe 保留首次出现（即最高分）的命中，其余命中的 index 明细并入 matched_indexes。
+        merged = self.fusion_service.dedupe_route_results(ordered)[:top_k]
+        normalized_scores = self.normalize_scores([float(item["route_score"]) for item in merged])
+        for rank, (item, normalized_score) in enumerate(zip(merged, normalized_scores), start=1):
+            item["route_rank"] = rank
+            item["normalized_route_score"] = float(normalized_score)
+            item["source_queries"] = source_queries[self.fusion_service.chunk_unique_key(item)]
+        return merged
 
     @staticmethod
     def combine_route_metrics(route_name: str, route_results: List[Any], candidate_count: int) -> Dict[str, Any]:
@@ -1125,7 +1121,7 @@ class RouteRetriever:
 
     def heuristic_hyde_document(self, query_profile: QueryProfile, rewritten_queries: List[str]) -> str:
         """无生成服务时的 HyDE 模板：把改写 query、偏好章节和原问题拼成一段“假想证据”。"""
-        focus = ", ".join(rewritten_queries[:2]) if rewritten_queries else query_profile.keyword_query
+        focus = ", ".join(rewritten_queries[:2]) if rewritten_queries else " ".join(query_profile.keywords)
         preferred_sections = ", ".join(query_profile.section_preferences[:3]) if query_profile.section_preferences else "relevant sections"
         return (
             "The paper likely contains a passage that answers the question with concrete evidence, terminology, "
@@ -1174,7 +1170,7 @@ class RouteRetriever:
             "table_structured",
             query_profile,
             user_query,
-            route_queries=[user_query, query_profile.evidence_query, query_profile.keyword_query],
+            route_queries=[user_query],
             intent_profile=query_profile.intent_profile,
         )
         return {

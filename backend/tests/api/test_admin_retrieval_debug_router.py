@@ -26,8 +26,7 @@ def _chunk(chunk_id, route, *, score=0.5, **extra):
 def _query_profile():
     return QueryProfile(
         original_query="q", normalized_query="q", language="en", intent_profile=None, tokens=[], keywords=["lora"],
-        intent_tags=[], paper_terms=[], ambiguity_score=0.0, semantic_query="q", evidence_query="q",
-        keyword_query="q", section_preferences=[], query_plan={},
+        intent_tags=[], ambiguity_score=0.0, section_preferences=[],
     )
 
 
@@ -51,7 +50,7 @@ class _FakePipeline:
                 "original_query": user_query,
                 "intent_profile": {"main_intent": "method", "sub_intents": []},
                 "query_profile": {"keywords": ["lora"]},
-                "query_views": {"enabled": True, "selected_queries": ["q", "q2"], "candidates": [{"query": "q2", "source": "plan", "selected": True, "reason": "kept"}], "original_translation": {"query": "q-en", "status": "ok", "error": ""}},
+                "query_views": {"enabled": True, "selected_queries": ["q", "q2"], "candidates": [{"query": "q2", "source": "rewrite", "selected": True, "reason": "kept"}], "original_translation": {"query": "q-en", "status": "ok", "error": ""}},
                 "route_metrics": {
                     "vector_original": {"status": "ok", "enabled": True, "latency_ms": 12.0},
                     "keyword": {"status": "ok", "enabled": True, "latency_ms": 3.0},

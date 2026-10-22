@@ -32,8 +32,13 @@ const STAGE_COLUMNS = [
   { value: 'final', label: '输出' }
 ]
 const ROUTE_STATUS_LABELS: Record<string, string> = { ok: '正常', disabled: '关闭', timeout: '超时', error: '失败', skipped: '跳过', inactive: '未启用' }
-const QUERY_SOURCE_LABELS: Record<string, string> = { core: '原问派生', plan: 'LLM 改写', heuristic: '规则改写' }
-const QUERY_DROP_REASONS: Record<string, string> = { empty: '为空', same_as_original: '与原问相同', duplicate: '重复', trimmed_to_top_k: '超出条数上限' }
+const QUERY_DROP_REASONS: Record<string, string> = { same_as_original: '与原问或译文相同', duplicate: '重复' }
+// 改写路由没有查询时说明原因；error 由下方的「改写失败」单独展示。
+const REWRITE_SKIP_REASONS: Record<string, string> = {
+  no_rewrite: '问题已足够具体，无需改写，改写路由跳过',
+  covered_by_original: '改写结果与原问译文相同，改写路由跳过',
+  disabled: '改写已关闭',
+}
 
 const route = useRoute()
 const router = useRouter()
@@ -115,10 +120,6 @@ const expansionCount = computed(() => run.value ? run.value.chunks.filter(row =>
 const keepLimit = computed(() => run.value ? fusedKeepLimit(run.value) : 0)
 
 const droppedCandidates = computed(() => (run.value?.query.candidates || []).filter(item => !item.selected))
-function querySource(query: string) {
-  const source = run.value?.query.candidates.find(item => item.query === query)?.source
-  return source ? (QUERY_SOURCE_LABELS[source] || source) : ''
-}
 
 // ---- 名次表 ----
 const outcomeFilter = ref<ChunkOutcomeCode | 'all'>('all')
@@ -267,14 +268,13 @@ onMounted(() => { void searchPapers(form.value.arxiv_id) })
               </dd>
             </div>
             <div>
-              <dt>参与召回的查询</dt>
+              <dt>改写问句</dt>
               <dd>
-                <ol class="query-list">
-                  <li v-for="query in run.query.selected_queries" :key="query">
-                    {{ query }} <span v-if="querySource(query)" class="chip">{{ querySource(query) }}</span>
-                  </li>
+                <ol v-if="run.query.selected_queries.length" class="query-list">
+                  <li v-for="query in run.query.selected_queries" :key="query">{{ query }}</li>
                 </ol>
-                <p v-if="run.query.rewrite_error" class="muted">改写失败：{{ run.query.rewrite_error }}</p>
+                <p v-else-if="REWRITE_SKIP_REASONS[run.query.rewrite_status]" class="muted">{{ REWRITE_SKIP_REASONS[run.query.rewrite_status] }}</p>
+                <p v-if="run.query.rewrite_error" class="muted">改写失败，改写路由跳过：{{ run.query.rewrite_error }}</p>
                 <details v-if="droppedCandidates.length" class="dropped">
                   <summary class="muted">未采用的候选 {{ droppedCandidates.length }} 条</summary>
                   <ul>

@@ -43,7 +43,6 @@ class _KeywordQueryTools:
 def _keyword_query_profile(query: str) -> SimpleNamespace:
     return SimpleNamespace(
         original_query=query,
-        keyword_query=query,
         intent_tags=[],
         intent_profile=SimpleNamespace(main_intent="other"),
     )

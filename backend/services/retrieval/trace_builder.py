@@ -98,7 +98,6 @@ class RetrievalTraceBuilder:
             "original_question": user_query,
             "intent_profile": self.debug_intent_profile(intent_profile),
             "query_profile": self.debug_query_profile(query_profile),
-            "query_plan": query_profile.query_plan,
             "query_views": query_views,
             "rewritten_queries": query_views["selected_queries"],
             "rerank_query": rerank_query,
@@ -305,13 +304,8 @@ class RetrievalTraceBuilder:
             "tokens": query_profile.tokens,
             "keywords": query_profile.keywords,
             "intent_tags": query_profile.intent_tags,
-            "paper_terms": query_profile.paper_terms,
             "ambiguity_score": query_profile.ambiguity_score,
-            "semantic_query": query_profile.semantic_query,
-            "evidence_query": query_profile.evidence_query,
-            "keyword_query": query_profile.keyword_query,
             "section_preferences": query_profile.section_preferences,
-            "query_plan": query_profile.query_plan,
         }
 
     def debug_intent_profile(self, intent_profile: Any) -> Optional[Dict[str, Any]]:

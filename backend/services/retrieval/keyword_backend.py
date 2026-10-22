@@ -620,7 +620,7 @@ class KeywordBackend(ABC):
             "keyword",
             query_profile,
             " | ".join([row["query"] for row in query_views]) if query_views else query_profile.original_query,
-            route_queries=[row["query"] for row in query_views] or [query_profile.keyword_query],
+            route_queries=[row["query"] for row in query_views] or [query_profile.original_query],
             intent_profile=query_profile.intent_profile,
         )
 

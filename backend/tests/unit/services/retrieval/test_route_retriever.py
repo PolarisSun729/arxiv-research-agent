@@ -432,6 +432,10 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertLess(overview_conf, method_conf)
 
     def test_keyword_confidence_drops_when_only_low_idf_token_matches(self) -> None:
+        # 改写问句带上通用词 section，让部分 chunk 只命中这个低 idf 词。
+        self.service.query_planner.generation_service.rewrite_query_for_retrieval = lambda _query, **_kwargs: [
+            "Which method section describes the framework pipeline?"
+        ]
         bundle = self._build_route_bundle(
             "Give an overview and summary of the paper's main contributions.",
             enable_hyde=False,
@@ -729,13 +733,42 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertEqual(len(shared_calls), 1)
         self.assertGreaterEqual(bundle["embedding_batch"]["batch_size"], 2)
         self.assertEqual(bundle["embedding_batch"]["status"], "ok")
-        self.assertIn(query_bundle["query_profile"].semantic_query, shared_calls[0]["texts"])
-        self.assertIn(query_bundle["query_profile"].evidence_query, shared_calls[0]["texts"])
+        self.assertIn(bundle["hyde_text"], shared_calls[0]["texts"])
         self.assertIn("vector_original", bundle["routes"])
-        # 原问路由带查询侧 instruct，单独一批，只含原问本身。
+        # 原问译文和改写问句共用查询侧 instruct，单独一批。
         self.assertEqual(len(original_calls), 1)
-        self.assertEqual(original_calls[0]["texts"], [question])
+        self.assertEqual(original_calls[0]["texts"], [question, *query_bundle["query_views"]["selected_queries"]])
         self.assertEqual(bundle["embedding_batch"]["original_query_batch"]["instruct"], original_calls[0]["instruct"])
+        self.assertTrue(bundle["routes"]["vector_rewrite"])
+
+    def test_rewrite_hits_merge_by_best_score_and_truncate(self) -> None:
+        def hit(chunk_id: str, score: float, query: str) -> dict:
+            return {
+                "chunk_id": chunk_id,
+                "original_chunk_id": chunk_id,
+                "retrieval_route": "vector_rewrite",
+                "route_score": score,
+                "source_query": query,
+            }
+
+        merged = self.service.route_retriever.merge_rewrite_hits(
+            [hit("a", 0.6, "q1"), hit("b", 0.5, "q1"), hit("b", 0.9, "q2"), hit("c", 0.7, "q2")],
+            top_k=2,
+        )
+
+        self.assertEqual([item["chunk_id"] for item in merged], ["b", "c"])
+        self.assertEqual([item["route_rank"] for item in merged], [1, 2])
+        self.assertEqual(merged[0]["route_score"], 0.9)
+        self.assertEqual(merged[0]["source_query"], "q2")
+        self.assertEqual(merged[0]["source_queries"], ["q2", "q1"])
+
+    def test_rewrite_route_is_skipped_with_planner_status_when_no_rewrite(self) -> None:
+        self.service.query_planner.generation_service.rewrite_query_for_retrieval = lambda _query, **_kwargs: []
+
+        bundle = self._build_route_bundle("What is the method framework?", enable_hyde=False, enable_keyword_search=False)
+
+        self.assertEqual(bundle["routes"]["vector_rewrite"], [])
+        self.assertEqual(bundle["route_metrics"]["vector_rewrite"]["fallback_reason"], "no_rewrite")
 
     def test_original_route_embeds_translation_but_keeps_original_as_source(self) -> None:
         question = "这篇论文的方法框架是什么？"
@@ -748,7 +781,9 @@ class RouteRetrieverTests(unittest.TestCase):
             if call["method"] == "create_text_embeddings_with_usage" and call.get("instruct")
         ]
 
-        self.assertEqual(original_calls[0]["texts"], [translated])
+        # instruct 批次先放原问译文，其后才是改写问句。
+        self.assertEqual(original_calls[0]["texts"][0], translated)
+        self.assertNotIn(question, original_calls[0]["texts"])
         self.assertTrue(bundle["routes"]["vector_original"])
         self.assertEqual(bundle["routes"]["vector_original"][0]["chunk_id"], "chunk-method")
         self.assertEqual({hit["source_query"] for hit in bundle["routes"]["vector_original"]}, {question})

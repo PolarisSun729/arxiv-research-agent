@@ -36,13 +36,8 @@ def test_debug_profiles_only_expose_canonical_intent_schema(tmp_path: Path) -> N
         tokens=["method"],
         keywords=["method"],
         intent_tags=["deep_method"],
-        paper_terms=[],
         ambiguity_score=0.1,
-        semantic_query="method",
-        evidence_query="method evidence",
-        keyword_query="method implementation",
         section_preferences=["method"],
-        query_plan={"rewrite_queries": []},
     )
     builder = RetrievalTraceBuilder(
         trace_export_enabled=False,

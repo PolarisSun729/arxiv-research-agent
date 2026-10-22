@@ -127,8 +127,11 @@ def _query_section(debug: Dict[str, Any]) -> Dict[str, Any]:
         "original_translation": views.get("original_translation") or {},
         "intent": {key: intent.get(key) for key in _INTENT_KEYS},
         "rewrite_enabled": bool(views.get("enabled")),
+        # ok / no_rewrite（LLM 判断无需改写）/ covered_by_original（改写都与原问或译文相同）/ error / disabled；
+        # 除 ok 外改写路由都会跳过。
+        "rewrite_status": views.get("rewrite_status") or "",
+        "rewrite_latency_ms": views.get("rewrite_latency_ms"),
         "rewrite_error": views.get("llm_error") or "",
-        "view_queries": views.get("view_queries") or {},
         "selected_queries": list(views.get("selected_queries") or []),
         "candidates": [
             {key: row.get(key) for key in ("query", "source", "selected", "reason")}

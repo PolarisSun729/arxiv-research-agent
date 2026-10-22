@@ -43,13 +43,8 @@ class QueryProfile:
     tokens: List[str]
     keywords: List[str]
     intent_tags: List[str]
-    paper_terms: List[str]
     ambiguity_score: float
-    semantic_query: str
-    evidence_query: str
-    keyword_query: str
     section_preferences: List[str]
-    query_plan: Dict[str, Any]
 
 
 @dataclass
