@@ -293,10 +293,6 @@ class QueryPlanner:
         """统计多条查询中出现最多的关键词。"""
         return self.retrieval_rules.build_query_keywords(queries, limit=limit)
 
-    def expand_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
-        """同义词/缩写扩展关键词 token。"""
-        return self.retrieval_rules.expand_keyword_query_tokens(tokens)
-
     def build_query_term_details(self, queries: List[str]) -> List[Dict[str, Any]]:
         """逐条查询列出去重后的分词结果（debug 用）。"""
         return self.retrieval_rules.build_query_term_details(queries)

@@ -33,10 +33,6 @@ class _KeywordQueryTools:
         return list(tokens)[:limit]
 
     @staticmethod
-    def expand_keyword_query_tokens(tokens: list[str]) -> list[str]:
-        return list(dict.fromkeys(tokens))
-
-    @staticmethod
     def is_informative_keyword_token(token: str) -> bool:
         return len(str(token or "").strip()) > 1
 

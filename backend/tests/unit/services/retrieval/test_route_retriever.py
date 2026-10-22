@@ -177,15 +177,18 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertEqual(figure_hit["chunk_type"], "figure")
         self.assertTrue(figure_hit["keyword_hit_asset_field"])
 
-    def test_keyword_route_expands_chinese_method_query_and_reports_fields(self) -> None:
-        bundle = self._build_route_bundle("这篇论文的方法流程是怎样的？", enable_hyde=False)
+    def test_keyword_route_matches_chinese_query_via_english_translation(self) -> None:
+        self.service.query_planner.generation_service.translate_query_for_retrieval = (
+            lambda query, **kwargs: "What is the method pipeline of this paper?"
+        )
+        bundle = self._build_route_bundle("这篇论文的方法流程是怎样的？", enable_query_rewrite=False, enable_hyde=False)
         keyword_debug = bundle["keyword_debug"]
         keyword_hits = bundle["routes"]["keyword"]
 
         self.assertTrue(keyword_hits)
         self.assertEqual(keyword_hits[0]["chunk_id"], "chunk-method")
-        self.assertIn("method", keyword_debug["expanded_tokens"])
-        self.assertIn("pipeline", keyword_debug["expanded_tokens"])
+        self.assertIn("method", keyword_debug["query_tokens"])
+        self.assertIn("pipeline", keyword_debug["query_tokens"])
         self.assertIn("body", keyword_hits[0]["keyword_match_fields"])
         self.assertFalse(keyword_hits[0]["keyword_hit_asset_field"])
         self.assertEqual(keyword_debug["matched_chunks"][0]["chunk_id"], "chunk-method")
@@ -194,26 +197,24 @@ class RouteRetrieverTests(unittest.TestCase):
     def test_keyword_original_view_uses_english_translation(self) -> None:
         question = "这篇论文用了哪些数据集？"
         self.service.query_planner.generation_service.translate_query_for_retrieval = (
-            lambda query, **kwargs: "Which datasets are used in this paper?"
+            lambda query, **kwargs: "Which dataset is used in this paper?"
         )
         bundle = self._build_route_bundle(question, enable_query_rewrite=False, enable_hyde=False)
         original_view = bundle["keyword_debug"]["query_views"][0]
 
         self.assertEqual(original_view["source"], "original")
-        self.assertEqual(original_view["query"], "Which datasets are used in this paper?")
+        self.assertEqual(original_view["query"], "Which dataset is used in this paper?")
         self.assertEqual(original_view["original_question"], question)
         self.assertEqual(len(bundle["keyword_debug"]["query_views"]), 1)
         self.assertEqual(bundle["routes"]["keyword"][0]["chunk_id"], "chunk-dataset")
 
-    def test_keyword_route_expands_english_plural_dataset_query(self) -> None:
-        bundle = self._build_route_bundle("What datasets are used?", enable_hyde=False)
+    def test_keyword_route_searches_query_tokens_without_expansion(self) -> None:
+        bundle = self._build_route_bundle("What datasets are used?", enable_query_rewrite=False, enable_hyde=False)
         keyword_debug = bundle["keyword_debug"]
-        keyword_hits = bundle["routes"]["keyword"]
 
-        self.assertTrue(keyword_hits)
-        self.assertEqual(keyword_hits[0]["chunk_id"], "chunk-dataset")
-        self.assertIn("dataset", keyword_debug["expanded_tokens"])
-        self.assertIn("corpus", keyword_debug["expanded_tokens"])
+        self.assertIn("datasets", keyword_debug["query_tokens"])
+        self.assertNotIn("corpus", keyword_debug["query_tokens"])
+        self.assertNotIn("expanded_tokens", keyword_debug)
 
     def test_keyword_route_downweights_asset_chunks_for_non_figure_query(self) -> None:
         bundle = self._build_route_bundle("What is the method pipeline?", enable_hyde=False)
@@ -225,7 +226,7 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertEqual(top_asset_hits, [])
 
     def test_keyword_route_debug_contains_query_view_contributions(self) -> None:
-        bundle = self._build_route_bundle("What datasets are used?", enable_hyde=False)
+        bundle = self._build_route_bundle("What dataset is used?", enable_hyde=False)
         keyword_debug = bundle["keyword_debug"]
         top_hit = bundle["routes"]["keyword"][0]
 
@@ -428,7 +429,7 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertLess(dense_score, sparse_score * 1.35)
 
     def test_keyword_result_exposes_bm25_matched_terms_with_idf_and_fields(self) -> None:
-        bundle = self._build_route_bundle("Which datasets and benchmark corpus are used?", enable_hyde=False)
+        bundle = self._build_route_bundle("Which dataset and benchmark corpus are used?", enable_hyde=False)
         top_hit = bundle["routes"]["keyword"][0]
 
         self.assertEqual(top_hit["chunk_id"], "chunk-dataset")

@@ -98,7 +98,7 @@ class BM25sBackend(KeywordBackend):
                 try:
                     rows = self._query_bm25s(
                         bm25s_index=bm25s_index,
-                        query_tokens=view.expanded_tokens,
+                        query_tokens=view.tokens,
                         top_k=top_k,
                         corpus_mapping=corpus_mapping,
                         retrieval_index=retrieval_index,

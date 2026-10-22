@@ -243,10 +243,8 @@ class _PreparedQueryView(NamedTuple):
     source: Any
     query: str
     weight: float
-    # 过滤停用词后的原始 token（只用于 debug 展示）。
+    # 过滤停用词后的 token，直接用于 BM25 检索。
     tokens: List[str]
-    # 同义词/缩写扩展后的 token，真正用于 BM25 检索。
-    expanded_tokens: List[str]
 
 
 class _KeywordRunState:
@@ -263,7 +261,6 @@ class _KeywordRunState:
         self.aggregated: Dict[int, Dict[str, Any]] = {}
         self.per_query_debug: List[Dict[str, Any]] = []
         self.original_query_tokens: List[str] = []
-        self.expanded_query_tokens: List[str] = []
 
     def record_view(
         self,
@@ -282,8 +279,6 @@ class _KeywordRunState:
         """
         for token in view.tokens:
             _append_unique(self.original_query_tokens, token)
-        for token in view.expanded_tokens:
-            _append_unique(self.expanded_query_tokens, token)
 
         if not rows:
             self.per_query_debug.append(self._view_debug_row(view, candidate_count=0, top_hits=[], error=error))
@@ -364,7 +359,6 @@ class _KeywordRunState:
             "source": view.source,
             "weight": view.weight,
             "query_tokens": view.tokens,
-            "expanded_tokens": view.expanded_tokens,
             "candidate_count": candidate_count,
             "top_hits": top_hits,
         }
@@ -389,12 +383,8 @@ class _KeywordRunState:
         return aggregate_keyword_index_hits_to_chunks(ranked, retrieval_index)
 
     def token_debug(self) -> Dict[str, Any]:
-        """汇总所有 view 的 query token，并标记同义词扩展是否真正引入了新词。"""
-        return {
-            "query_tokens": self.original_query_tokens,
-            "expanded_tokens": self.expanded_query_tokens,
-            "query_expansion_applied": bool(set(self.expanded_query_tokens) - set(self.original_query_tokens)),
-        }
+        """汇总所有 view 的 query token。"""
+        return {"query_tokens": self.original_query_tokens}
 
 
 class KeywordBackendResult:
@@ -473,7 +463,7 @@ class KeywordBackend(ABC):
         return _KeywordRunState(rrf_k=_route_retriever().keyword_rrf_k())
 
     def _prepare_query_view(self, query_view: Dict[str, Any]) -> Optional[_PreparedQueryView]:
-        """分词、过滤并扩展一条 query view；没有有效 token 或权重不为正时返回 None（跳过该 view）。"""
+        """分词并过滤一条 query view；没有有效 token 或权重不为正时返回 None（跳过该 view）。"""
         query = str(query_view.get("query", "") or "")
         raw_tokens = self.query_tools.tokenize_for_keyword_search(query)
         tokens = self._filter_keyword_query_tokens(raw_tokens)
@@ -488,7 +478,6 @@ class KeywordBackend(ABC):
             query=query,
             weight=query_weight,
             tokens=tokens,
-            expanded_tokens=self._expand_keyword_query_tokens(tokens),
         )
 
     def _finalize_keyword_retrieval(
@@ -668,13 +657,6 @@ class KeywordBackend(ABC):
         """兼容旧调用名，等价于模块函数 build_keyword_matched_terms。"""
         return build_keyword_matched_terms(term_traces)
 
-    def _expand_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
-        """调用 query_tools 做同义词/缩写扩展；query_tools 未提供该能力时原样返回。"""
-        expander = getattr(self.query_tools, "expand_keyword_query_tokens", None)
-        if callable(expander):
-            return expander(tokens)
-        return tokens
-
     def _filter_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
         """调用 query_tools 过滤停用词、保留关键词（limit 设为 token 数，即只过滤不截断）。"""
         extractor = getattr(self.query_tools, "extract_query_keywords", None)
@@ -775,7 +757,7 @@ class InternalBM25Backend(KeywordBackend):
             if view is None:
                 continue
             rows = self._score_candidates(
-                view.expanded_tokens,
+                view.tokens,
                 field_weights=field_weights,
                 query_profile=query_profile,
                 retrieval_index=retrieval_index,

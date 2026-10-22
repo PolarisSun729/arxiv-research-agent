@@ -77,56 +77,6 @@ ZH_STOPWORDS = {
     "有哪些",
 }
 
-# 中文问法 → 英文论文术语的桥接词表：论文正文多为英文，中文问题需要映射后才能命中 BM25 倒排。
-ZH_QUERY_EXPANSION = {
-    "方法": ["method", "methods", "approach"],
-    "流程": ["pipeline", "workflow", "procedure"],
-    "方法流程": ["method", "approach", "pipeline", "framework", "procedure"],
-    "框架": ["framework", "architecture"],
-    "架构": ["architecture", "framework"],
-    "模型": ["model"],
-    "算法": ["algorithm", "method"],
-    "训练": ["training"],
-    "推理": ["inference"],
-    "实验": ["experiment", "experiments", "evaluation"],
-    "实验设置": ["experiment", "experimental", "setup", "evaluation", "implementation"],
-    "设置": ["setup", "setting", "configuration"],
-    "评估": ["evaluation", "benchmark", "metric"],
-    "指标": ["metric", "metrics", "score"],
-    "数据": ["data", "dataset", "datasets"],
-    "数据集": ["dataset", "datasets", "corpus", "benchmark"],
-    "基准": ["benchmark", "baseline"],
-    "基线": ["baseline", "baselines"],
-    "对比": ["comparison", "compare", "baseline"],
-    "比较": ["comparison", "compare", "baseline"],
-    "消融": ["ablation"],
-    "结果": ["result", "results", "performance"],
-    "性能": ["performance", "result", "results"],
-    "贡献": ["contribution", "contributions", "novelty"],
-    "主要贡献": ["contribution", "contributions", "novelty", "key", "idea"],
-    "创新": ["innovation", "novelty", "contribution"],
-    "局限": ["limitation", "limitations", "weakness"],
-    "不足": ["limitation", "limitations", "weakness"],
-    "未来工作": ["future", "work", "limitations"],
-    "图": ["figure", "fig", "diagram"],
-    "表": ["table"],
-    "图表": ["figure", "table", "chart"],
-}
-
-# 英文单复数与近义术语扩展，弥补 BM25 不做词形还原的问题。
-EN_QUERY_EXPANSION = {
-    "dataset": ["datasets", "data", "corpus", "benchmark"],
-    "datasets": ["dataset", "data", "corpus", "benchmark"],
-    "baseline": ["baselines", "comparison", "experiment"],
-    "baselines": ["baseline", "comparison", "experiment"],
-    "method": ["methods", "approach", "pipeline", "framework"],
-    "methods": ["method", "approach", "pipeline", "framework"],
-    "limitation": ["limitations", "weakness", "future", "work"],
-    "limitations": ["limitation", "weakness", "future", "work"],
-    "contribution": ["contributions", "novelty", "innovation"],
-    "contributions": ["contribution", "novelty", "innovation"],
-}
-
 # 根据 chunk 开头文本识别章节标签：标签 → 触发词（子串匹配）。
 SECTION_TAG_RULES = {
     "abstract": ["abstract"],
@@ -158,28 +108,14 @@ class RetrievalRules:
 
     @classmethod
     def tokenize_for_keyword_search(cls, text: str) -> List[str]:
-        """关键词检索分词：英文按字母数字串切分（至少 2 个字符），中文连续片段再拆出领域短语，最后过滤噪声 token。"""
+        """关键词检索分词：英文按字母数字串切分（至少 2 个字符），中文连续片段整体作为一个 token，最后过滤噪声 token。
+
+        关键词路由检索用的是英文译文和英文改写，中文问题到英文正文的桥接交给 LLM，这里不做中文短语切分和词表映射。
+        """
         lowered = text.lower()
         english_tokens = re.findall(r"[a-z0-9][a-z0-9_\-]{1,}", lowered)
-        chinese_tokens: List[str] = []
-        for segment in re.findall(r"[\u4e00-\u9fff]{2,}", lowered):
-            chinese_tokens.extend(cls.split_chinese_keyword_segment(segment))
+        chinese_tokens = re.findall(r"[\u4e00-\u9fff]{2,}", lowered)
         return [token for token in english_tokens + chinese_tokens if cls.is_informative_keyword_token(token)]
-
-    @staticmethod
-    def split_chinese_keyword_segment(segment: str) -> List[str]:
-        """轻量抽取论文 QA 常用中文短语，避免整句中文只形成一个不可命中的长 token。"""
-        normalized = str(segment or "").strip()
-        if not normalized:
-            return []
-        tokens: List[str] = []
-        for phrase in sorted(ZH_QUERY_EXPANSION, key=len, reverse=True):
-            if phrase in normalized and phrase not in tokens:
-                tokens.append(phrase)
-        # 已命中领域短语时不保留过长整句，防止“这篇论文的方法流程是怎样的”这类问句污染关键词。
-        if normalized not in tokens and not (tokens and len(normalized) > 8):
-            tokens.append(normalized)
-        return tokens
 
     @staticmethod
     def is_informative_keyword_token(token: str) -> bool:
@@ -201,28 +137,6 @@ class RetrievalRules:
         if symbol_count / max(len(normalized), 1) > 0.3:
             return False
         return True
-
-    def expand_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
-        """把中文论文 QA 表达映射到英文论文术语，补齐中文问题到英文正文之间的词项桥接。"""
-        expanded: List[str] = []
-        token_set = set(tokens)
-        compact_query = "".join(token for token in tokens if re.search(r"[\u4e00-\u9fff]", token))
-        for token in tokens:
-            if token not in expanded:
-                expanded.append(token)
-            for synonym in EN_QUERY_EXPANSION.get(token, []):
-                if self.is_informative_keyword_token(synonym) and synonym not in expanded:
-                    expanded.append(synonym)
-            for synonym in ZH_QUERY_EXPANSION.get(token, []):
-                if self.is_informative_keyword_token(synonym) and synonym not in expanded:
-                    expanded.append(synonym)
-        # 正则分词会把连续中文问句作为一个片段；这里额外按子串触发常见问法扩展。
-        for phrase, synonyms in ZH_QUERY_EXPANSION.items():
-            if phrase in token_set or (compact_query and phrase in compact_query):
-                for synonym in synonyms:
-                    if self.is_informative_keyword_token(synonym) and synonym not in expanded:
-                        expanded.append(synonym)
-        return expanded
 
     def dedupe_list(self, items: List[str]) -> List[str]:
         """按归一化结果去重，但返回原始写法（仅去首尾空白），保持首次出现顺序。"""

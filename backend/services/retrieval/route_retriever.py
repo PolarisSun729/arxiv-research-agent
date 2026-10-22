@@ -611,11 +611,10 @@ class RouteRetriever:
         return kept
 
     def normalize_keyword_query_view(self, query: str) -> str:
-        """把 query 归一化为“过滤 + 扩展后的去重小写 token 串”，用于判断两个 query view 是否重复。"""
+        """把 query 归一化为“过滤停用词后的去重小写 token 串”，用于判断两个 query view 是否重复。"""
         tokens = self.filter_keyword_query_tokens(self.query_tools.tokenize_for_keyword_search(query))
-        expanded_tokens = self.expand_keyword_query_tokens(tokens)
         seen: List[str] = []
-        for token in expanded_tokens:
+        for token in tokens:
             normalized = str(token or "").strip().lower()
             if normalized and normalized not in seen:
                 seen.append(normalized)
@@ -929,13 +928,6 @@ class RouteRetriever:
             self._keyword_backend, "backend_name", lambda: "unknown"
         )() + " failed"
         return self._aggregate_keyword_hits(fallback_result.results, debug, top_k=top_k)
-
-    def expand_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
-        """调用 query_tools 做同义词/缩写扩展；query_tools 未提供该能力时原样返回。"""
-        expander = getattr(self.query_tools, "expand_keyword_query_tokens", None)
-        if callable(expander):
-            return expander(tokens)
-        return tokens
 
     def filter_keyword_query_tokens(self, tokens: List[str]) -> List[str]:
         """调用 query_tools 过滤停用词、保留关键词（limit 设为 token 数，即只过滤不截断）。"""
