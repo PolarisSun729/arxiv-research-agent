@@ -98,13 +98,17 @@ class QueryPlanner:
         """调用意图服务识别问题意图。"""
         return self.intent_service.build_intent_profile(user_query, paper_context=paper_context or {})
 
-    def build_query_profile(self, user_query: str, intent_profile: IntentProfile) -> QueryProfile:
-        """构造 QueryProfile：分词与关键词、语言、意图标签和偏好章节（偏好章节只来自意图识别）。"""
-        tokens = self.tokenize_for_keyword_search(user_query)
+    def build_query_profile(self, user_query: str, intent_profile: IntentProfile, retrieval_query: str) -> QueryProfile:
+        """构造 QueryProfile：分词与关键词、语言、意图标签和偏好章节（偏好章节只来自意图识别）。
+
+        分词与关键词取自英文检索问句 retrieval_query，语言仍按原问判断。
+        """
+        tokens = self.tokenize_for_keyword_search(retrieval_query)
         return QueryProfile(
             original_query=user_query,
             normalized_query=self.normalize_query_text(user_query),
-            language=self.detect_language(user_query, tokens),
+            retrieval_query=retrieval_query,
+            language=self.detect_language(user_query, self.tokenize_for_keyword_search(user_query)),
             intent_profile=intent_profile,
             tokens=tokens,
             keywords=self.extract_query_keywords(tokens),
@@ -201,7 +205,8 @@ class QueryPlanner:
                 copy_context().run, self.rewrite_original_query, user_query, paper_context_payload
             )
         intent_profile = self.build_intent_profile(user_query, paper_context=paper_context)
-        query_profile = self.build_query_profile(user_query, intent_profile)
+        translation = translation_future.result()
+        query_profile = self.build_query_profile(user_query, intent_profile, str(translation["query"]))
         rewrite = (
             rewrite_future.result()
             if rewrite_future is not None
@@ -210,7 +215,7 @@ class QueryPlanner:
         query_views = self.build_query_views(
             user_query,
             rewrite,
-            translation_future.result(),
+            translation,
             enable_query_rewrite,
             intent_profile=intent_profile,
         )

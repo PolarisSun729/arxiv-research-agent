@@ -25,7 +25,7 @@ def _chunk(chunk_id, route, *, score=0.5, **extra):
 
 def _query_profile():
     return QueryProfile(
-        original_query="q", normalized_query="q", language="en", intent_profile=None, tokens=[], keywords=["lora"],
+        original_query="q", normalized_query="q", retrieval_query="q", language="en", intent_profile=None, tokens=[], keywords=["lora"],
         intent_tags=[], ambiguity_score=0.0, section_preferences=[],
     )
 

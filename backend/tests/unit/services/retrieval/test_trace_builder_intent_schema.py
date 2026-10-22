@@ -31,6 +31,7 @@ def test_debug_profiles_only_expose_canonical_intent_schema(tmp_path: Path) -> N
     query_profile = QueryProfile(
         original_query=intent_profile.original_query,
         normalized_query=intent_profile.normalized_query,
+        retrieval_query=intent_profile.original_query,
         language="en",
         intent_profile=intent_profile,
         tokens=["method"],

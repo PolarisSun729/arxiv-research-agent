@@ -23,7 +23,7 @@ def _chunk(route: str, **extra):
 
 def _query_profile():
     return QueryProfile(
-        original_query="q", normalized_query="q", language="en", intent_profile=None, tokens=[], keywords=[],
+        original_query="q", normalized_query="q", retrieval_query="q", language="en", intent_profile=None, tokens=[], keywords=[],
         intent_tags=[], ambiguity_score=0.0, section_preferences=[],
     )
 

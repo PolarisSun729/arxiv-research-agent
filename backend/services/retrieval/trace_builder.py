@@ -300,6 +300,7 @@ class RetrievalTraceBuilder:
         return {
             "original_query": query_profile.original_query,
             "normalized_query": query_profile.normalized_query,
+            "retrieval_query": query_profile.retrieval_query,
             "language": query_profile.language,
             "intent_profile": self.debug_intent_profile(query_profile.intent_profile),
             "tokens": query_profile.tokens,

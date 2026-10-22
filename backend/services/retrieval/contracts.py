@@ -38,6 +38,8 @@ class QueryProfile:
 
     original_query: str
     normalized_query: str
+    # 原问的英文译文（翻译失败时为原问）；论文正文是英文，tokens/keywords 和路由置信度都按它计算。
+    retrieval_query: str
     language: str
     intent_profile: Any
     tokens: List[str]

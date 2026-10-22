@@ -252,11 +252,11 @@ class RetrievalRules:
         """估算一条路由对当前问题的可信度，用作 RRF 投票的乘数。
 
         base 由路由类型、问题歧义度和主意图决定（例如方法/实验类问题更信任关键词路由，
-        概述类问题更信任 HyDE）；再乘以“路由 query 与原问的相似度”修正，结果夹在 [floor, 1.0]。
+        概述类问题更信任 HyDE）；再乘以“路由 query 与英文检索问句（原问译文）的相似度”修正，结果夹在 [floor, 1.0]。
         """
         route_queries = route_queries or [source_query]
         source_text = " ".join(route_queries)
-        similarity = self.query_similarity(query_profile.normalized_query, source_text)
+        similarity = self.query_similarity(query_profile.retrieval_query, source_text)
         ambiguity = query_profile.ambiguity_score
         main_intent = str(intent_profile.main_intent if intent_profile else "other")
         # 关键词覆盖度：抽到的关键词越接近上限，关键词类路由越可信。
