@@ -419,14 +419,11 @@ class KeywordBackend(ABC):
         self,
         *,
         query_tools: Any,
-        route_confidence_builder: Any,
         structural_bonus_builder: Any,
         fusion_service: Any,
     ) -> None:
         # 提供分词、停用词过滤、同义词扩展、乱码 token 判断（通常是 QueryPlanner）。
         self.query_tools = query_tools
-        # 计算 keyword 路由的基础置信度（通常是 RetrievalRules.route_confidence）。
-        self.route_confidence_builder = route_confidence_builder
         # 计算 chunk 的结构加分（通常是 RetrievalRules.compute_structural_bonus）。
         self.structural_bonus_builder = structural_bonus_builder
         # 两个后端目前都不直接使用 fusion_service（跨路由融合在 route_retriever 之后完成），
@@ -507,16 +504,13 @@ class KeywordBackend(ABC):
             debug["matched_chunks"] = []
             return [], debug
 
-        base_route_confidence = self._compute_base_confidence(query_views, query_profile)
         results = self._build_keyword_results(
             ranked=ranked,
             top_k=top_k,
-            base_route_confidence=base_route_confidence,
             query_profile=query_profile,
             retrieval_index=retrieval_index,
         )
         debug["keyword_rrf_k"] = state.rrf_k
-        debug["base_route_confidence"] = float(base_route_confidence)
         debug["matched_chunks"] = self._build_matched_chunks_debug(ranked[:top_k], retrieval_index, query_profile)
         return results, debug
 
@@ -525,7 +519,6 @@ class KeywordBackend(ABC):
         *,
         ranked: List[tuple],
         top_k: int,
-        base_route_confidence: float,
         query_profile: Any,
         retrieval_index: Any,
     ) -> List[Dict[str, Any]]:
@@ -558,19 +551,12 @@ class KeywordBackend(ABC):
                 query_profile=query_profile,
                 chunk=chunk,
             )
-            route_confidence = self._adjust_keyword_route_confidence(
-                base_route_confidence,
-                matched_terms=matched_terms,
-                noise_flags=noise_flags,
-                query_profile=query_profile,
-            )
 
             chunk["retrieval_route"] = "keyword"
             chunk["source_query"] = " | ".join([item["query"] for item in query_contributions[:3]])
             chunk["route_rank"] = rank
             chunk["route_score"] = fusion_score
             chunk["normalized_route_score"] = float(normalized_score)
-            chunk["route_confidence"] = float(route_confidence)
             chunk["structural_bonus"] = float(self.structural_bonus_builder(chunk, query_profile))
             chunk["keyword_match_fields"] = main_fields
             chunk["keyword_hit_asset_field"] = any(field in _ASSET_FIELDS for field in main_fields)
@@ -581,7 +567,6 @@ class KeywordBackend(ABC):
             chunk["keyword_matched_terms"] = matched_terms
             chunk["keyword_query_sources"] = query_sources
             chunk["keyword_noise_flags"] = noise_flags
-            chunk["keyword_base_route_confidence"] = float(base_route_confidence)
             # 对外仍是 chunk 候选；index 字段只说明本次 BM25 最强的命中入口，top 列表留给 rerank/debug。
             chunk["retrieval_index_id"] = top_index.get("index_id", document.retrieval_index_id)
             chunk["retrieval_index_type"] = top_index.get("index_type", document.retrieval_index_type)
@@ -602,16 +587,6 @@ class KeywordBackend(ABC):
             results.append(chunk)
 
         return results
-
-    def _compute_base_confidence(self, query_views: List[Dict[str, Any]], query_profile: Any) -> float:
-        """计算 keyword 路由的基础置信度；没有 query view 时退回原始查询和关键词查询。"""
-        return self.route_confidence_builder(
-            "keyword",
-            query_profile,
-            " | ".join([row["query"] for row in query_views]) if query_views else query_profile.original_query,
-            route_queries=[row["query"] for row in query_views] or [query_profile.original_query],
-            intent_profile=query_profile.intent_profile,
-        )
 
     def _build_matched_chunks_debug(
         self, ranked: List[tuple], retrieval_index: Any, query_profile: Any
@@ -679,22 +654,6 @@ class KeywordBackend(ABC):
             query_profile=query_profile,
             chunk=chunk,
             is_informative_token=self._is_informative_token,
-        )
-
-    def _adjust_keyword_route_confidence(
-        self,
-        base_confidence: float,
-        *,
-        matched_terms: List[Dict[str, Any]],
-        noise_flags: List[str],
-        query_profile: Any,
-    ) -> float:
-        """按意图、最高 IDF 和噪声标记调整基础置信度，规则复用 RouteRetriever。"""
-        return _route_retriever().adjust_keyword_route_confidence(
-            base_confidence,
-            matched_terms=matched_terms,
-            noise_flags=noise_flags,
-            query_profile=query_profile,
         )
 
     def _is_informative_token(self, token: str) -> bool:

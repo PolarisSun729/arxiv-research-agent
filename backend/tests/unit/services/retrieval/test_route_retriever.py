@@ -140,15 +140,11 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertEqual(bundle["routes"]["vector_hyde"], [])
         self.assertEqual(bundle["route_metrics"]["vector_hyde"]["fallback_reason"], "invalid_output")
 
-    def test_hyde_debug_confidence_matches_route_confidence(self) -> None:
+    def test_hyde_debug_uses_original_question_only(self) -> None:
         bundle = self._build_route_bundle("Explain the paper method.", enable_hyde=True)
 
         self.assertEqual(bundle["hyde_debug"]["input_query"], "Explain the paper method.")
         self.assertNotIn("focus_queries", bundle["hyde_debug"])
-        self.assertAlmostEqual(
-            bundle["hyde_debug"]["confidence"],
-            bundle["routes"]["vector_hyde"][0]["route_confidence"],
-        )
 
     def test_keyword_toggle_controls_keyword_route(self) -> None:
         enabled = self._build_route_bundle("Which dataset benchmark is used?", enable_keyword_search=True)
@@ -307,7 +303,6 @@ class RouteRetrieverTests(unittest.TestCase):
         )
         backend = InternalBM25Backend(
             query_tools=self.service.query_planner,
-            route_confidence_builder=self.service.retrieval_rules.route_confidence,
             structural_bonus_builder=self.service.retrieval_rules.compute_structural_bonus,
             fusion_service=self.service.fusion_service,
         )
@@ -457,47 +452,9 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertIn("matched_terms", matched)
         self.assertIn("query_sources", matched)
         self.assertIn("noise_flags", matched)
-        self.assertIn("base_route_confidence", bundle["keyword_debug"])
         term = matched["matched_terms"][0]
         self.assertIn("token", term)
         self.assertIn("idf", term)
-
-    def test_keyword_confidence_downweighted_for_overview_versus_method(self) -> None:
-        overview = self._build_route_bundle(
-            "Give an overview and summary of the paper's main contributions.",
-            enable_hyde=False,
-        )
-        method = self._build_route_bundle("What is the method pipeline and framework?", enable_hyde=False)
-
-        overview_conf = overview["routes"]["keyword"][0]["route_confidence"]
-        method_conf = method["routes"]["keyword"][0]["route_confidence"]
-        overview_base = overview["routes"]["keyword"][0]["keyword_base_route_confidence"]
-        method_base = method["routes"]["keyword"][0]["keyword_base_route_confidence"]
-
-        # overview 问题降权后 keyword confidence 应低于其自身基线，并低于 method 问题。
-        self.assertLess(overview_conf, overview_base)
-        self.assertGreaterEqual(method_conf, method_base)
-        self.assertLess(overview_conf, method_conf)
-
-    def test_keyword_confidence_drops_when_only_low_idf_token_matches(self) -> None:
-        # 改写问句带上通用词 section，让部分 chunk 只命中这个低 idf 词。
-        self.service.query_planner.generation_service.rewrite_query_for_retrieval = lambda _query, **_kwargs: [
-            "Which method section describes the framework pipeline?"
-        ]
-        bundle = self._build_route_bundle(
-            "Give an overview and summary of the paper's main contributions.",
-            enable_hyde=False,
-        )
-        keyword_hits = bundle["routes"]["keyword"]
-        section_only = [
-            hit
-            for hit in keyword_hits
-            if len(hit["keyword_matched_terms"]) == 1 and hit["keyword_matched_terms"][0]["idf"] < 1.2
-        ]
-        self.assertTrue(section_only, "expected at least one chunk matching only a low-idf generic token")
-        weak_hit = section_only[0]
-        full_hit = next(hit for hit in keyword_hits if len(hit["keyword_matched_terms"]) > 1)
-        self.assertLess(weak_hit["route_confidence"], full_hit["route_confidence"])
 
     def test_keyword_bm25_does_not_dominate_final_context_for_overview(self) -> None:
         result = self.service.retrieval_pipeline.retrieve(
@@ -646,7 +603,6 @@ class RouteRetrieverTests(unittest.TestCase):
             "source": "paper.pdf",
             "chunk_type": "text",
             "route_score": 0.9,
-            "route_confidence": 0.8,
             "source_query": "method",
         }
         routes = {

@@ -16,7 +16,6 @@ def _chunk(route: str, **extra):
         "content": "chunk body",
         "retrieval_route": route,
         "route_score": 0.5,
-        "route_confidence": 1.0,
         **extra,
     }
 
@@ -58,6 +57,16 @@ class ChunkUniqueKeyTests(unittest.TestCase):
 
         self.assertEqual(len(result.fused_results), 1)
         self.assertEqual(set(result.fused_results[0]["rrf_votes"]), {"vector_original", "keyword"})
+
+    def test_vote_depends_only_on_weight_and_rank(self) -> None:
+        fusion = ResultFusionService(rrf_k=60, route_weights={"vector_original": 0.5})
+        routes = {"vector_original": [_chunk("vector_original", content_part_label="chunk 2 part 1/1", route_confidence=0.1)]}
+
+        result = fusion.fuse(routes, fused_limit=10, raw_limit=10, fused_stage_limit=10, query_profile=_query_profile())
+
+        vote = result.fused_results[0]["rrf_votes"]["vector_original"]
+        self.assertAlmostEqual(vote["vote"], 0.5 / 61)
+        self.assertNotIn("confidence", vote)
 
 
 if __name__ == "__main__":

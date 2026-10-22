@@ -24,13 +24,11 @@ class BM25sBackend(KeywordBackend):
         self,
         *,
         query_tools: Any,
-        route_confidence_builder: Any,
         structural_bonus_builder: Any,
         fusion_service: Any,
     ) -> None:
         super().__init__(
             query_tools=query_tools,
-            route_confidence_builder=route_confidence_builder,
             structural_bonus_builder=structural_bonus_builder,
             fusion_service=fusion_service,
         )

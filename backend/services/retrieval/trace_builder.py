@@ -38,14 +38,12 @@ class RetrievalTraceBuilder:
         trace_export_dir: Path,
         rrf_k: int,
         route_weights: Dict[str, float],
-        route_confidence_builder: Any,
         route_weights_builder: Any,
     ) -> None:
         self.trace_export_enabled = trace_export_enabled
         self.trace_export_dir = trace_export_dir
         self.rrf_k = rrf_k
         self.route_weights = dict(route_weights or {})
-        self.route_confidence_builder = route_confidence_builder
         self.route_weights_builder = route_weights_builder
 
     def build_debug(
@@ -144,16 +142,6 @@ class RetrievalTraceBuilder:
                 "rrf_k": self.rrf_k,
                 "route_weights": self.route_weights_builder(intent_profile),
                 "dedupe_per_route": True,
-                "route_confidence": {
-                    route_name: self.route_confidence_builder(
-                        route_name,
-                        query_profile,
-                        (route_results[0]["source_query"] if route_results else user_query),
-                        route_queries=self.collect_route_queries(route_results, query_views["selected_queries"], user_query),
-                        intent_profile=intent_profile,
-                    )
-                    for route_name, route_results in routes.items()
-                },
             },
             "llm_rerank": rerank_debug,
             "context_expansion": context_expansion,
@@ -377,7 +365,6 @@ class RetrievalTraceBuilder:
             "score": item.get("score"),
             "route_score": item.get("route_score"),
             "normalized_route_score": item.get("normalized_route_score"),
-            "route_confidence": item.get("route_confidence"),
             "structural_bonus": item.get("structural_bonus"),
             "retrieval_route": item.get("retrieval_route"),
             "route_rank": item.get("route_rank"),
@@ -390,7 +377,6 @@ class RetrievalTraceBuilder:
             "bm25_raw_score": item.get("bm25_raw_score"),
             "bm25_fused_score": item.get("bm25_fused_score"),
             "keyword_best_raw_bm25_score": item.get("keyword_best_raw_bm25_score"),
-            "keyword_base_route_confidence": item.get("keyword_base_route_confidence"),
             "keyword_match_fields": item.get("keyword_match_fields", []),
             "keyword_matched_terms": item.get("keyword_matched_terms", []),
             "keyword_query_sources": item.get("keyword_query_sources", []),
@@ -477,18 +463,6 @@ class RetrievalTraceBuilder:
                     self.short_text_preview(chunk.get("asset_summary", ""), ENHANCED_RETRIEVAL_CONFIG["short_text_preview_limit"]),
                     self.short_text_preview(chunk.get("rerank_text", ""), ENHANCED_RETRIEVAL_CONFIG["short_text_preview_limit"]),
                 )
-
-    @staticmethod
-    def collect_route_queries(
-        route_results: List[Dict[str, Any]],
-        fallback_queries: List[str],
-        user_query: str,
-    ) -> List[str]:
-        """某路由实际使用过的查询（取各结果的 source_query）；没有记录时退回改写查询或原问题。"""
-        queries = [item.get("source_query", "") for item in route_results if item.get("source_query")]
-        if queries:
-            return queries
-        return fallback_queries or [user_query]
 
     @staticmethod
     def chunk_unique_key(item: Dict[str, Any]) -> str:

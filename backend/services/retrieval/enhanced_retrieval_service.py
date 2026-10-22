@@ -105,7 +105,6 @@ class EnhancedRetrievalService:
             trace_export_dir=self.trace_export_dir,
             rrf_k=self.rrf_k,
             route_weights=self.route_weights,
-            route_confidence_builder=self.retrieval_rules.route_confidence,
             route_weights_builder=self.fusion_service.route_weights_for_intent,
         )
         self.rerank_service = RerankService(
@@ -131,11 +130,9 @@ class EnhancedRetrievalService:
             fusion_service=self.fusion_service,
             table_structured_retriever=TableStructuredRetriever(
                 query_tools=self.query_planner,
-                route_confidence_builder=self.retrieval_rules.route_confidence,
                 structural_bonus_builder=self.retrieval_rules.compute_structural_bonus,
                 config=ENHANCED_RETRIEVAL_CONFIG,
             ),
-            route_confidence_builder=self.retrieval_rules.route_confidence,
             structural_bonus_builder=self.retrieval_rules.compute_structural_bonus,
             chunk_normalizer=self.retrieval_rules.normalize_chunk,
             memory_flag_reader=self._memory_flag,

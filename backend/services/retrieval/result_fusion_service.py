@@ -52,7 +52,7 @@ class ResultFusionService:
     ) -> List[Dict[str, Any]]:
         """对已去重的各路由结果做加权 RRF 融合，返回融合分最高的 top_k 个 chunk。
 
-        同分时依次比较各路由原始分的最大值、路由置信度的最大值。
+        同分时比较各路由原始分的最大值。
         """
         aggregated: Dict[str, Dict[str, Any]] = {}
         route_weights = self.route_weights_for_intent(query_profile.intent_profile)
@@ -61,7 +61,6 @@ class ResultFusionService:
             for rank, item in enumerate(route_results):
                 item = self.with_matched_index_fields(item, route_name=route_name)
                 chunk_key = self.chunk_unique_key(item)
-                route_confidence = float(item.get("route_confidence", 1.0) or 1.0)
                 entry = aggregated.setdefault(
                     chunk_key,
                     {
@@ -69,27 +68,24 @@ class ResultFusionService:
                         "score": 0.0,
                         "matched_routes": [],
                         "route_scores": {},
-                        "route_confidences": {},
                         "source_queries": [],
                         "matched_indexes": [],
                         "rrf_votes": {},
                     },
                 )
-                # RRF 投票只依赖 route 排名、route 权重和 route confidence，避免提前混入 rerank 语义。
+                # RRF 投票只依赖 route 排名和 route 权重，避免提前混入 rerank 语义。
                 multiplier = self._table_structured_vote_multiplier(route_name, item)
-                vote = weight * route_confidence * (1.0 / (self.rrf_k + rank + 1)) * multiplier
+                vote = weight * (1.0 / (self.rrf_k + rank + 1)) * multiplier
                 entry["score"] += vote
                 # 逐路记下投票的各个因子，排查时能看出融合名次具体由哪一路、哪个因子决定。
                 entry["rrf_votes"][route_name] = {
                     "rank": rank + 1,
                     "weight": weight,
-                    "confidence": route_confidence,
                     "multiplier": multiplier,
                     "vote": vote,
                 }
                 entry["matched_routes"].append(route_name)
                 entry["route_scores"][route_name] = item.get("route_score")
-                entry["route_confidences"][route_name] = route_confidence
                 entry["matched_indexes"] = self.merge_matched_indexes(
                     entry.get("matched_indexes", []),
                     item,
@@ -107,7 +103,6 @@ class ResultFusionService:
             key=lambda item: (
                 float(item.get("score", 0.0)),
                 max(item.get("route_scores", {}).values() or [0.0]),
-                max(item.get("route_confidences", {}).values() or [0.0]),
             ),
             reverse=True,
         )

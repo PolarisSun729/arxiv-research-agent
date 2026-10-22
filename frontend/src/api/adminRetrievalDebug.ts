@@ -17,7 +17,6 @@ export interface RetrievalDebugRequest {
 export interface RrfVote {
   rank: number | null
   weight: number | null
-  confidence: number | null
   multiplier: number | null
   vote: number | null
 }

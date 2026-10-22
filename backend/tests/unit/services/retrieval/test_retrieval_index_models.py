@@ -47,7 +47,6 @@ def _keyword_query_profile(query: str) -> SimpleNamespace:
 def _make_internal_bm25_backend() -> InternalBM25Backend:
     return InternalBM25Backend(
         query_tools=_KeywordQueryTools(),
-        route_confidence_builder=lambda *_args, **_kwargs: 0.7,
         structural_bonus_builder=lambda *_args, **_kwargs: 0.0,
         fusion_service=None,
     )

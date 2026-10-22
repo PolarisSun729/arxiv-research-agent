@@ -45,7 +45,6 @@ def test_debug_profiles_only_expose_canonical_intent_schema(tmp_path: Path) -> N
         trace_export_dir=tmp_path,
         rrf_k=60,
         route_weights={"keyword": 1.0},
-        route_confidence_builder=lambda *args, **kwargs: 1.0,
         route_weights_builder=lambda profile: profile.route_weights,
     )
 

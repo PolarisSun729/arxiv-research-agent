@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import Stemmer
 
-from services.intent.intent_service import EXPERIMENT_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
+from services.intent.intent_service import OVERVIEW_INTENTS
 from services.retrieval.contracts import legacy_body_index_id
 from utils.config import get_enhanced_retrieval_runtime_config
 
@@ -230,68 +230,6 @@ class RetrievalRules:
             if any(pattern in prefix for pattern in patterns):
                 tags.append(tag)
         return tags
-
-    def query_similarity(self, left: str, right: str) -> float:
-        """两段文本关键词集合的 Jaccard 相似度。"""
-        left_tokens = set(self.tokenize_for_keyword_search(left))
-        right_tokens = set(self.tokenize_for_keyword_search(right))
-        if not left_tokens or not right_tokens:
-            return 0.0
-        intersection = len(left_tokens & right_tokens)
-        union = len(left_tokens | right_tokens)
-        return intersection / union if union else 0.0
-
-    def route_confidence(
-        self,
-        route_name: str,
-        query_profile: Any,
-        source_query: str,
-        route_queries: Optional[List[str]] = None,
-        intent_profile: Optional[Any] = None,
-    ) -> float:
-        """估算一条路由对当前问题的可信度，用作 RRF 投票的乘数。
-
-        base 由路由类型、问题歧义度和主意图决定（例如方法/实验类问题更信任关键词路由，
-        概述类问题更信任 HyDE）；再乘以“路由 query 与英文检索问句（原问译文）的相似度”修正，结果夹在 [floor, 1.0]。
-        """
-        route_queries = route_queries or [source_query]
-        source_text = " ".join(route_queries)
-        similarity = self.query_similarity(query_profile.retrieval_query, source_text)
-        ambiguity = query_profile.ambiguity_score
-        main_intent = str(intent_profile.main_intent if intent_profile else "other")
-        # 关键词覆盖度：抽到的关键词越接近上限，关键词类路由越可信。
-        keyword_coverage = min(1.0, len(query_profile.keywords) / self.config["extract_query_keywords_limit"])
-        if route_name == "vector_original":
-            base = self.config["query_weight_base_summary_other"] if main_intent in {*OVERVIEW_INTENTS, "other"} else self.config["query_weight_base_default"]
-        elif route_name == "vector_rewrite":
-            base = self.config["query_weight_base_ambiguous_keyword"] + 0.18 * ambiguity
-            if main_intent in {*METHOD_INTENTS, *EXPERIMENT_INTENTS, "comparison", "dataset"}:
-                base += self.config["route_focus_bonus"]
-        elif route_name == "vector_hyde":
-            base = self.config["query_weight_base_ambiguous_other"] + 0.25 * ambiguity
-            if main_intent in OVERVIEW_INTENTS:
-                base += self.config["route_summary_bonus"]
-        elif route_name == "keyword":
-            base = self.config["query_weight_base_keyword"] + 0.18 * keyword_coverage
-            if main_intent in {*METHOD_INTENTS, *EXPERIMENT_INTENTS, "figure_table"}:
-                base += self.config["route_keyword_bonus"]
-        elif route_name == "table_structured":
-            base = self.config["query_weight_base_keyword"] + 0.22 * keyword_coverage
-            if main_intent in {*EXPERIMENT_INTENTS, "comparison", "figure_table", "dataset"}:
-                base += self.config["route_keyword_bonus"] + 0.06
-        elif route_name == "memory_context":
-            base = 0.42 + 0.2 * ambiguity
-            if main_intent in {*METHOD_INTENTS, *EXPERIMENT_INTENTS, "comparison", "figure_table", "dataset"}:
-                base += 0.08
-        else:
-            base = self.config["query_weight_base_fallback"]
-        return max(
-            self.config["route_default_floor"],
-            min(
-                1.0,
-                base * (self.config["route_confidence_multiplier"] + self.config["route_confidence_similarity_weight"] * similarity),
-            ),
-        )
 
     def compute_structural_bonus(self, chunk: Dict[str, Any], query_profile: Any) -> float:
         """根据章节标签与问题意图给 chunk 一个小幅结构加/减分，结果夹在 [-0.05, 0.12]。

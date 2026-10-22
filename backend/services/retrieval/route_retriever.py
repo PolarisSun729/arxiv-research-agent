@@ -9,7 +9,6 @@ from contextvars import copy_context
 from time import perf_counter
 from typing import Any, Callable, Dict, List, Optional
 
-from services.intent.intent_service import EXPERIMENT_INTENTS, METHOD_INTENTS, OVERVIEW_INTENTS
 from services.retrieval.collection_profile import CollectionRetrievalProfile
 from services.retrieval.contracts import QueryProfile, RetrievalOptions
 from services.retrieval.execution import QueryEmbeddingBatcher, RouteExecutionSupport
@@ -72,7 +71,6 @@ class RouteRetriever:
         query_tools: Any,
         fusion_service: Any,
         table_structured_retriever: Any,
-        route_confidence_builder: Any,
         structural_bonus_builder: Any,
         chunk_normalizer: Any,
         memory_flag_reader: Any,
@@ -85,7 +83,6 @@ class RouteRetriever:
         self.query_tools = query_tools
         self.fusion_service = fusion_service
         self.table_structured_retriever = table_structured_retriever
-        self.route_confidence_builder = route_confidence_builder
         self.structural_bonus_builder = structural_bonus_builder
         self.chunk_normalizer = chunk_normalizer
         self.memory_flag_reader = memory_flag_reader
@@ -125,7 +122,6 @@ class RouteRetriever:
         # 无论配置哪个后端，都先准备好内置 BM25 作为降级目标。
         internal_backend = InternalBM25Backend(
             query_tools=self.query_tools,
-            route_confidence_builder=self.route_confidence_builder,
             structural_bonus_builder=self.structural_bonus_builder,
             fusion_service=self.fusion_service,
         )
@@ -138,7 +134,6 @@ class RouteRetriever:
         try:
             bm25s_backend = BM25sBackend(
                 query_tools=self.query_tools,
-                route_confidence_builder=self.route_confidence_builder,
                 structural_bonus_builder=self.structural_bonus_builder,
                 fusion_service=self.fusion_service,
             )
@@ -199,7 +194,6 @@ class RouteRetriever:
                 collection_name,
                 collection_profile=collection_profile,
             )
-        intent_profile = query_profile.intent_profile
         hyde = (
             self.generate_hyde_document(user_query)
             if enable_hyde
@@ -211,14 +205,6 @@ class RouteRetriever:
             # HyDE 只拿原问生成，不用改写问句。
             "input_query": user_query,
             **hyde,
-            # 与下面 vector_hyde 路由 vector_retrieve 的参数一致，即融合时实际使用的置信度。
-            "confidence": self.route_confidence_builder(
-                "vector_hyde",
-                query_profile,
-                "hyde",
-                route_queries=[hyde_text],
-                intent_profile=intent_profile,
-            ) if hyde_text else 0.0,
         }
 
         default_embedding_config = self.embedding_service.get_default_embedding_config()
@@ -269,10 +255,9 @@ class RouteRetriever:
                 query=original_query,
                 top_k=recall_candidate_limit,
                 route_name="vector_original",
-                # 置信度和命中来源仍按用户原问计算，译文只用于向量检索。
+                # 命中来源仍记用户原问，译文只用于向量检索。
                 source_query=user_query,
                 query_profile=query_profile,
-                route_queries=[user_query],
                 collection_profile=collection_profile,
                 embedding_map=original_embedding_map,
             ),
@@ -295,7 +280,6 @@ class RouteRetriever:
                         route_name="vector_rewrite",
                         source_query=query,
                         query_profile=query_profile,
-                        route_queries=rewrite_queries,
                         collection_profile=collection_profile,
                         embedding_map=original_embedding_map,
                     ),
@@ -325,7 +309,6 @@ class RouteRetriever:
                     route_name="vector_hyde",
                     source_query="hyde",
                     query_profile=query_profile,
-                    route_queries=[hyde_text],
                     collection_profile=collection_profile,
                     embedding_map=embedding_map,
                 ),
@@ -720,50 +703,6 @@ class RouteRetriever:
 
         return flags
 
-    @classmethod
-    def adjust_keyword_route_confidence(
-        cls,
-        base_confidence: float,
-        *,
-        matched_terms: List[Dict[str, Any]],
-        noise_flags: List[str],
-        query_profile: QueryProfile,
-    ) -> float:
-        """结合实际 BM25 命中质量调节 keyword route confidence，而不是只看 query profile。
-
-        - contribution/paper_overview 问题降低 BM25 影响，避免泛词 chunk 压过向量召回；
-        - 方法、实验、数据集、对比和局限类正式 intent 维持或略增，让精确术语补充向量；
-        - 命中质量差（只命中低 IDF/噪声字段）时显著降权。
-        """
-        main_intent = cls.query_main_intent(query_profile)
-        factor = 1.0
-        if main_intent in {*OVERVIEW_INTENTS, "other"}:
-            factor *= 0.82
-        elif main_intent in {*METHOD_INTENTS, *EXPERIMENT_INTENTS, "dataset", "comparison", "limitation"}:
-            factor *= 1.08
-        # figure_table 等其它意图保持 factor 不变（原先这里有一个 factor *= 1.0 的空操作分支，已删除）。
-
-        # 命中质量：以最高 IDF 命中词为代表，越是只命中泛词越要降权。
-        max_idf = max((float(term.get("idf", 0.0) or 0.0) for term in matched_terms), default=0.0)
-        if max_idf < cls.LOW_IDF_THRESHOLD:
-            factor *= 0.55
-        elif max_idf < 1.2:
-            factor *= 0.85
-
-        penalty_flags = {
-            "only_low_idf_terms": 0.6,
-            "no_informative_terms": 0.5,
-            "garbled_tokens": 0.85,
-            "asset_field_only_hit": 0.6,
-            "intent_field_mismatch": 0.7,
-            "short_section_header_only": 0.8,
-        }
-        for flag in noise_flags:
-            factor *= penalty_flags.get(flag, 1.0)
-
-        floor = float(ENHANCED_RETRIEVAL_CONFIG.get("route_default_floor", 0.2))
-        return max(floor * 0.5, min(1.0, float(base_confidence) * factor))
-
     @staticmethod
     def query_main_intent(query_profile: QueryProfile) -> str:
         """取查询的主意图（小写），缺失时为 other。"""
@@ -848,7 +787,6 @@ class RouteRetriever:
         route_name: str,
         source_query: str,
         query_profile: QueryProfile,
-        route_queries: List[str],
         collection_profile: CollectionRetrievalProfile,
         embedding_map: Dict[str, List[float]],
     ) -> List[Dict[str, Any]]:
@@ -864,8 +802,7 @@ class RouteRetriever:
             query_vector=embedding,
             top_k=index_hit_top_k,
         )
-        route_confidence = self.route_confidence_builder(route_name, query_profile, source_query, route_queries=route_queries, intent_profile=query_profile.intent_profile)
-        return self.normalize_route_results(results, route_name, source_query, route_confidence, query_profile, top_k=top_k)
+        return self.normalize_route_results(results, route_name, source_query, query_profile, top_k=top_k)
 
     def _aggregate_keyword_hits(self, hits: List[Dict[str, Any]], debug: Dict[str, Any], *, top_k: int) -> Dict[str, Any]:
         """把关键词后端返回的 index 级命中聚合成 chunk 级候选，并在 debug 中记录聚合前后数量。"""
@@ -915,7 +852,6 @@ class RouteRetriever:
         # 运行期降级到内置 BM25。
         internal_backend = InternalBM25Backend(
             query_tools=self.query_tools,
-            route_confidence_builder=self.route_confidence_builder,
             structural_bonus_builder=self.structural_bonus_builder,
             fusion_service=self.fusion_service,
         )
@@ -1001,7 +937,7 @@ class RouteRetriever:
                     matched_doc_ids.append(doc_id)
                 chunk = retrieval_index.documents[doc_id].chunk
                 route_results.append(self.build_memory_route_chunk(candidate, chunk, memory_context, query_keywords, query_profile))
-        ranked = sorted(route_results, key=lambda item: (float(item.get("memory_score", 0.0) or 0.0), float(item.get("route_confidence", 0.0) or 0.0), float(item.get("structural_bonus", 0.0) or 0.0)), reverse=True)
+        ranked = sorted(route_results, key=lambda item: (float(item.get("memory_score", 0.0) or 0.0), float(item.get("structural_bonus", 0.0) or 0.0)), reverse=True)
         deduped = self.fusion_service.dedupe_route_results(ranked)
         for rank, item in enumerate(deduped[:top_k], start=1):
             item["route_rank"] = rank
@@ -1078,18 +1014,8 @@ class RouteRetriever:
         query_keywords: List[str],
         query_profile: QueryProfile,
     ) -> Dict[str, Any]:
-        """把定位到的 chunk 包装成 memory_context 路由结果；路由置信度上限 0.78，避免记忆证据压过新检索。"""
+        """把定位到的 chunk 包装成 memory_context 路由结果。"""
         memory_score = self.memory_candidate_score(candidate, chunk, query_keywords, query_profile)
-        route_confidence = min(
-            0.78,
-            self.route_confidence_builder(
-                "memory_context",
-                query_profile,
-                str(candidate.get("content_preview", "") or query_profile.original_query),
-                route_queries=[str(candidate.get("content_preview", "") or query_profile.original_query)],
-                intent_profile=query_profile.intent_profile,
-            ) + min(0.18, memory_score * 0.15),
-        )
         memory_chunk = dict(chunk)
         memory_chunk.update(
             {
@@ -1097,7 +1023,6 @@ class RouteRetriever:
                 "source_query": query_profile.original_query,
                 "route_score": float(memory_score),
                 "normalized_route_score": float(min(1.0, memory_score / 1.4)),
-                "route_confidence": float(route_confidence),
                 "structural_bonus": float(self.structural_bonus_builder(memory_chunk, query_profile)),
                 "memory_score": float(memory_score),
                 "memory_reason": str(candidate.get("memory_reason", "") or memory_context.get("reason", "")),
@@ -1114,12 +1039,11 @@ class RouteRetriever:
         results: List[Dict[str, Any]],
         route_name: str,
         source_query: str,
-        route_confidence: float,
         query_profile: QueryProfile,
         *,
         top_k: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """为原始命中补齐路由字段（名次、原始分、归一化分、置信度、结构加分），向量路由再做 index 聚合。"""
+        """为原始命中补齐路由字段（名次、原始分、归一化分、结构加分），向量路由再做 index 聚合。"""
         if not results:
             return []
         # 路由原始分是必填项：缺分说明上游返回结构变了，直接报错，不能当成 0 分继续排序。
@@ -1136,7 +1060,6 @@ class RouteRetriever:
             chunk["route_rank"] = rank
             chunk["route_score"] = raw_score
             chunk["normalized_route_score"] = float(normalized_score)
-            chunk["route_confidence"] = float(route_confidence)
             chunk["structural_bonus"] = float(self.structural_bonus_builder(chunk, query_profile))
             normalized.append(chunk)
         if route_name in VECTOR_ROUTE_NAMES:
@@ -1184,15 +1107,8 @@ class RouteRetriever:
             top_k=top_k,
         )
         raw_results = list(payload.get("results") or [])
-        route_confidence = self.route_confidence_builder(
-            "table_structured",
-            query_profile,
-            user_query,
-            route_queries=[user_query],
-            intent_profile=query_profile.intent_profile,
-        )
         return {
-            "results": self.normalize_route_results(raw_results, "table_structured", user_query, route_confidence, query_profile),
+            "results": self.normalize_route_results(raw_results, "table_structured", user_query, query_profile),
             "debug": payload.get("debug") or {},
         }
 

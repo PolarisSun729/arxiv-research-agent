@@ -35,17 +35,16 @@ function fixed(value: number | null | undefined, digits = 3) {
 
     <section v-if="shares.length">
       <h3 class="block-title">融合投票拆解</h3>
-      <p class="muted formula">票 = 权重 × 置信度 × 1/({{ rrfK }} + 名次) × 表格加权</p>
+      <p class="muted formula">票 = 权重 × 1/({{ rrfK }} + 名次) × 表格加权</p>
       <table class="votes">
         <thead>
-          <tr><th>路由</th><th>名次</th><th>权重</th><th>置信度</th><th>加权</th><th>票</th><th class="votes__share">占比</th></tr>
+          <tr><th>路由</th><th>名次</th><th>权重</th><th>加权</th><th>票</th><th class="votes__share">占比</th></tr>
         </thead>
         <tbody>
           <tr v-for="item in shares" :key="item.route">
             <td>{{ routeLabel(item.route) }}</td>
             <td>{{ item.rank ?? '—' }}</td>
             <td>{{ fixed(item.weight, 2) }}</td>
-            <td>{{ fixed(item.confidence, 2) }}</td>
             <td>{{ fixed(item.multiplier, 2) }}</td>
             <td class="mono">{{ fixed(item.vote, 5) }}</td>
             <td class="votes__share">

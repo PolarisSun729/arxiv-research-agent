@@ -17,7 +17,6 @@ def _chunk(chunk_id, route, *, score=0.5, **extra):
         "content": f"chunk {chunk_id} body",
         "retrieval_route": route,
         "route_score": score,
-        "route_confidence": 1.0,
         "section_path": f"{chunk_id} Section",
         **extra,
     }

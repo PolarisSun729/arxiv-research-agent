@@ -47,20 +47,6 @@ class QueryPlannerTests(unittest.TestCase):
         self.assertEqual(profile.keywords, ["dataset", "evalu"])
         self.assertEqual(profile.language, "zh")
 
-    def test_route_confidence_compares_route_query_with_english_translation(self) -> None:
-        translation = "Which datasets are evaluated?"
-        self.planner.generation_service.translate_query_for_retrieval = lambda query, **_kwargs: translation
-        zh_profile = self._build_bundle("这篇论文用了哪些数据集？")["query_profile"]
-        self.planner.generation_service.translate_query_for_retrieval = lambda query, **_kwargs: query
-        en_profile = self._build_bundle(translation)["query_profile"]
-        rules = self.service.retrieval_rules
-
-        zh_confidence = rules.route_confidence("vector_original", zh_profile, translation, intent_profile=None)
-        en_confidence = rules.route_confidence("vector_original", en_profile, translation, intent_profile=None)
-
-        self.assertEqual(rules.query_similarity(zh_profile.retrieval_query, translation), 1.0)
-        self.assertEqual(zh_confidence, en_confidence)
-
     def test_method_question_builds_method_flow_profile(self) -> None:
         bundle = self._build_bundle("What is the method flow and architecture of the paper?")
         profile = bundle["query_profile"]
