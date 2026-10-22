@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 
 # ---- 缓存 key 的版本号：对应 prompt / 数据结构变更时必须提升，否则会命中旧结果 ----
 LLM_RERANK_TEXT_PROMPT_VERSION = "paper_qa_rerank_text_v1"
-LLM_RETRIEVAL_SUMMARY_PROMPT_VERSION = "paper_qa_retrieval_summary_v1"
-LLM_RETRIEVAL_QUESTIONS_PROMPT_VERSION = "paper_qa_retrieval_questions_v1"
+LLM_RETRIEVAL_SUMMARY_PROMPT_VERSION = "paper_qa_retrieval_summary_v2"
+LLM_RETRIEVAL_QUESTIONS_PROMPT_VERSION = "paper_qa_retrieval_questions_v2"
 EMBEDDING_CACHE_SCHEMA_VERSION = "paper_qa_embedding_v1"
 
 # 图片内容哈希的进程内记忆容量：一次建库的 figure 数量通常远小于该值。
