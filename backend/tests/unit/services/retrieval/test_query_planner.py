@@ -125,12 +125,13 @@ class QueryPlannerTests(unittest.TestCase):
         self.assertIn("bad json", views["llm_error"])
         self.assertEqual(views["selected_queries"], [])
 
-    def test_no_rewrite_needed_leaves_route_without_queries(self) -> None:
-        self.planner.generation_service.rewrite_query_for_retrieval = lambda _query, **_kwargs: []
-        views = self._build_bundle("What distribution do the entries of R follow?")["query_views"]
+    def test_chinese_rewrite_is_dropped_as_invalid_output(self) -> None:
+        self.planner.generation_service.rewrite_query_for_retrieval = lambda _query, **_kwargs: ["这个方法怎么做的？"]
+        views = self._build_bundle("这个方法怎么做的？")["query_views"]
 
-        self.assertEqual(views["rewrite_status"], "no_rewrite")
         self.assertEqual(views["selected_queries"], [])
+        self.assertEqual(views["candidates"][0]["reason"], "not_english")
+        self.assertEqual(views["rewrite_status"], "invalid_output")
 
     def test_rewrite_same_as_translation_or_duplicate_is_dropped(self) -> None:
         self.planner.generation_service.translate_query_for_retrieval = lambda _query, **_kwargs: "What is the method?"

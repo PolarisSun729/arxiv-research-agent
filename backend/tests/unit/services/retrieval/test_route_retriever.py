@@ -762,13 +762,14 @@ class RouteRetrieverTests(unittest.TestCase):
         self.assertEqual(merged[0]["source_query"], "q2")
         self.assertEqual(merged[0]["source_queries"], ["q2", "q1"])
 
-    def test_rewrite_route_is_skipped_with_planner_status_when_no_rewrite(self) -> None:
-        self.service.query_planner.generation_service.rewrite_query_for_retrieval = lambda _query, **_kwargs: []
+    def test_rewrite_route_is_skipped_when_rewrite_matches_translation(self) -> None:
+        question = "What is the method framework?"
+        self.service.query_planner.generation_service.rewrite_query_for_retrieval = lambda _query, **_kwargs: [question]
 
-        bundle = self._build_route_bundle("What is the method framework?", enable_hyde=False, enable_keyword_search=False)
+        bundle = self._build_route_bundle(question, enable_hyde=False, enable_keyword_search=False)
 
         self.assertEqual(bundle["routes"]["vector_rewrite"], [])
-        self.assertEqual(bundle["route_metrics"]["vector_rewrite"]["fallback_reason"], "no_rewrite")
+        self.assertEqual(bundle["route_metrics"]["vector_rewrite"]["fallback_reason"], "covered_by_original")
 
     def test_original_route_embeds_translation_but_keeps_original_as_source(self) -> None:
         question = "这篇论文的方法框架是什么？"

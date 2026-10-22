@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from time import perf_counter
@@ -21,6 +22,8 @@ from services.retrieval.contracts import QueryProfile
 from services.retrieval.retrieval_rules import RetrievalRules
 
 logger = logging.getLogger(__name__)
+# 改写要求输出英文问句；含中文字符的改写视为不合格输出。
+_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 
 
 def _clean_str_list(values: Optional[Iterable[Any]]) -> List[str]:
@@ -75,8 +78,7 @@ class QueryPlanner:
     def rewrite_original_query(self, user_query: str, paper_context: Dict[str, Any]) -> Dict[str, Any]:
         """让 LLM 把原问改写成英文检索问句（具体化模糊指代、拆分复合问题），供改写路由检索。
 
-        不做任何规则兜底：失败时 queries 为空、status=error，改写路由直接跳过；
-        LLM 判断问题已经具体且只问一件事时返回空列表，status=no_rewrite。
+        不做任何规则兜底：失败（含没给出任何问句）时 queries 为空、status=error，改写路由直接跳过。
         """
         started = perf_counter()
         result: Dict[str, Any] = {"queries": [], "status": "ok", "error": "", "latency_ms": 0.0}
@@ -86,8 +88,6 @@ class QueryPlanner:
             result["queries"] = _clean_str_list(
                 self.generation_service.rewrite_query_for_retrieval(user_query, paper_context=paper_context)
             )
-            if not result["queries"]:
-                result["status"] = "no_rewrite"
         except Exception as exc:
             logger.warning("Query rewrite failed, skipping the rewrite route: %s", exc)
             result.update({"status": "error", "error": str(exc)})
@@ -123,8 +123,8 @@ class QueryPlanner:
     ) -> Dict[str, Any]:
         """整理改写路由的查询列表（selected_queries），每条改写的去留原因记录在 candidates 中。
 
-        与原问或原问译文相同的改写会被丢弃，因为原问路由已经召回过；改写关闭、失败、无需改写或全部被丢弃时
-        selected_queries 为空，改写路由跳过，原因记在 rewrite_status。
+        与原问或原问译文相同的改写会被丢弃，因为原问路由已经召回过；含中文的改写不符合输出要求，也丢弃。
+        改写关闭、失败或全部被丢弃时 selected_queries 为空，改写路由跳过，原因记在 rewrite_status。
         """
         covered = {
             self.normalize_query_text(user_query),
@@ -143,7 +143,9 @@ class QueryPlanner:
                 "selected": False,
                 "reason": "kept",
             }
-            if normalized in covered:
+            if _CJK_PATTERN.search(query):
+                row["reason"] = "not_english"
+            elif normalized in covered:
                 row["reason"] = "same_as_original"
             elif normalized in seen:
                 row["reason"] = "duplicate"
@@ -154,7 +156,9 @@ class QueryPlanner:
             candidate_rows.append(row)
         rewrite_status = str(rewrite.get("status") or "")
         if rewrite_status == "ok" and not selected_queries:
-            rewrite_status = "covered_by_original"
+            # 只要有一条和原问/译文重复，就说明这一路能召回的原问路由已经覆盖；否则全是不合格输出。
+            covered_rows = [row for row in candidate_rows if row["reason"] == "same_as_original"]
+            rewrite_status = "covered_by_original" if covered_rows else "invalid_output"
 
         # 返回值与 rewrite_debug 共用同一组字段（关键词与逐词明细只计算一次），rewrite_debug 额外带意图摘要。
         views = {

@@ -816,6 +816,8 @@ GENERATION_CONFIG: Dict[str, Any] = {
     "openai_chat_temperature": float(_env_str("OPENAI_CHAT_TEMPERATURE", "0.7")),
     "openai_chat_max_tokens": _env_int("OPENAI_CHAT_MAX_TOKENS", 512),
     "rewrite_query_max_queries_default": _env_int("REWRITE_QUERY_MAX_QUERIES_DEFAULT", 3),
+    # 原问改写的采样温度：低于默认值让改写贴着原问，但不设为 0，保留一点随机性。
+    "query_rewrite_temperature": float(_env_str("QUERY_REWRITE_TEMPERATURE", "0.3")),
     # 每次生成的完整上下文与回答落盘到 05-generation-results，仅供调试复盘；
     # 文件含用户问题和回答原文且没有清理机制，默认关闭，排查时再临时打开。
     "save_generation_results": _env_bool("SAVE_GENERATION_RESULTS", False),

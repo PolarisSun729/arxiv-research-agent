@@ -28,6 +28,7 @@ QWEN_LARGE_MODEL_NAME = GENERATION_CONFIG["large_qwen_model_name"]
 QWEN_RERANK_COMPRESS_MODEL_NAME = GENERATION_CONFIG["qwen_rerank_compress_model_name"]
 QWEN_RERANK_COMPRESS_ENABLE_THINKING = GENERATION_CONFIG["qwen_rerank_compress_enable_thinking"]
 REWRITE_QUERY_MAX_QUERIES_DEFAULT = GENERATION_CONFIG["rewrite_query_max_queries_default"]
+QUERY_REWRITE_TEMPERATURE = GENERATION_CONFIG["query_rewrite_temperature"]
 QWEN_TASK_MODEL_ROLES = dict(GENERATION_CONFIG.get("task_model_roles", {}))
 
 # DashScope Responses API 会在入站阶段按请求体字节数拒绝超大请求；这里用软限制预留
@@ -393,8 +394,12 @@ class GenerationService:
         enable_thinking: bool = QWEN_RERANK_COMPRESS_ENABLE_THINKING,
         image_inputs: Optional[List[Dict[str, Any]]] = None,
         request_debug: Optional[Dict[str, Any]] = None,
+        temperature: Optional[float] = None,
     ) -> str:
-        """单轮补全；传入 image_inputs 时把图片作为多模态输入附在 prompt 之后，prompt 原样保留不加问答模板。"""
+        """单轮补全；传入 image_inputs 时把图片作为多模态输入附在 prompt 之后，prompt 原样保留不加问答模板。
+
+        temperature 为空时使用模型服务端默认值。
+        """
         try:
             if not api_key:
                 api_key = QWEN_API_KEY
@@ -424,10 +429,12 @@ class GenerationService:
                 if request_debug is not None:
                     request_debug.update(image_debug)
             record_llm_call(model=model_name, task_type=task_type or "completion")
+            sampling = {"temperature": temperature} if temperature is not None else {}
             response = client.responses.create(
                 model=model_name,
                 input=qwen_input,
                 extra_body={"enable_thinking": enable_thinking},
+                **sampling,
             )
             record_llm_usage(getattr(response, "usage", None))
 
@@ -458,7 +465,10 @@ class GenerationService:
         api_key: Optional[str] = None,
         model_name: Optional[str] = None,
     ) -> List[str]:
-        """把问题改写成忠实于原意的英文检索问句：只做模糊指代具体化和复合问题拆分，不需要改写时返回空列表。"""
+        """把问题改写成忠实于原意的英文检索问句：只做模糊指代具体化和复合问题拆分，至少返回一条。
+
+        模型没给出任何问句时抛 ValueError，由调用方跳过改写路由；与原问译文重复的改写由调用方去重。
+        """
         paper_context = paper_context or {}
         title = str(paper_context.get("title", "") or "").strip()
         abstract = str(paper_context.get("abstract", "") or "").strip()
@@ -473,8 +483,9 @@ class GenerationService:
             "2. Take paper terms only from the paper context below; never invent names, datasets, modules, or methods.\n"
             "3. Write every query in English as a complete question that can be understood on its own.\n"
             "4. Keep symbols, variable names, formulas, and abbreviations exactly as written.\n"
-            f"5. Return at most {max_queries} queries.\n"
-            "6. If the question is already specific and asks about only one thing, return an empty list.\n"
+            f"5. Return 1 to {max_queries} queries.\n"
+            "6. If the question is already specific and asks about only one thing, still return one query: "
+            "the question in English, using the paper's own terms where they make it more specific.\n"
             "7. Return JSON only, with this schema: {\"queries\": [\"...\"]}\n\n"
             f"Question: {question}\n\n"
             f"Paper title: {title or 'N/A'}\n"
@@ -486,6 +497,8 @@ class GenerationService:
             api_key=api_key,
             model_name=model_name,
             task_type="query_rewrite",
+            # 保留少量随机性，但改写要贴着原问，不用服务端默认温度。
+            temperature=QUERY_REWRITE_TEMPERATURE,
         )
         data = json.loads(self._extract_json_block(response))
         # 模型偶尔省掉外层对象直接返回数组（如 "[]"），语义相同，按 queries 处理。
@@ -497,6 +510,8 @@ class GenerationService:
             query = " ".join(str(item or "").split())
             if query and query not in queries:
                 queries.append(query)
+        if not queries:
+            raise ValueError("query rewrite returned no queries")
         return queries[:max_queries]
 
     def build_rerank_query(

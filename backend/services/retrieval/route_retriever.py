@@ -295,7 +295,7 @@ class RouteRetriever:
             route_metrics["vector_rewrite"] = self.combine_route_metrics("vector_rewrite", rewrite_route_results, len(routes["vector_rewrite"]))
         else:
             routes["vector_rewrite"] = []
-            # 改写关闭时记 disabled；开启时记 planner 给出的跳过原因（error / no_rewrite / covered_by_original）。
+            # 改写关闭时记 disabled；开启时记 planner 给出的跳过原因（error / covered_by_original / invalid_output）。
             route_metrics["vector_rewrite"] = _inactive_route_metric(
                 enabled=bool(query_views["enabled"]),
                 cache_hit=bool(collection_profile.cache_hit),

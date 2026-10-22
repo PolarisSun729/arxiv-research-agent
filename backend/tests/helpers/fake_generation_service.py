@@ -30,7 +30,8 @@ class FakeGenerationService:
 
     def rewrite_query_for_retrieval(self, query: str, **kwargs: Any) -> list[str]:
         self._record("rewrite_query_for_retrieval", query=query, kwargs=kwargs)
-        return [f"{query} (rewritten)"]
+        # 改写要求输出英文问句，固定返回一条英文问句，避免中文问题的回显被当成不合格输出丢弃。
+        return ["Which passage of the paper answers this question?"]
 
     def build_rerank_query(self, query: str, **kwargs: Any) -> str:
         self._record("build_rerank_query", query=query, kwargs=kwargs)

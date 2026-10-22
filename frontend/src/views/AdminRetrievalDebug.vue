@@ -32,11 +32,11 @@ const STAGE_COLUMNS = [
   { value: 'final', label: '输出' }
 ]
 const ROUTE_STATUS_LABELS: Record<string, string> = { ok: '正常', disabled: '关闭', timeout: '超时', error: '失败', skipped: '跳过', inactive: '未启用' }
-const QUERY_DROP_REASONS: Record<string, string> = { same_as_original: '与原问或译文相同', duplicate: '重复' }
+const QUERY_DROP_REASONS: Record<string, string> = { same_as_original: '与原问或译文相同', duplicate: '重复', not_english: '不是英文' }
 // 改写路由没有查询时说明原因；error 由下方的「改写失败」单独展示。
 const REWRITE_SKIP_REASONS: Record<string, string> = {
-  no_rewrite: '问题已足够具体，无需改写，改写路由跳过',
   covered_by_original: '改写结果与原问译文相同，改写路由跳过',
+  invalid_output: '改写结果都不合格（如不是英文），改写路由跳过',
   disabled: '改写已关闭',
 }
 

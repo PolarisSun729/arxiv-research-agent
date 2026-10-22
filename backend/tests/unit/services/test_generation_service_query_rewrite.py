@@ -34,17 +34,19 @@ def test_rewrite_query_returns_cleaned_unique_queries_within_limit(monkeypatch: 
     assert "Question: 用了什么数据集、提升多少？" in calls[0]["prompt"]
     assert "Paper title: Sparse Projection" in calls[0]["prompt"]
     assert QWEN_TASK_MODEL_ROLES["query_rewrite"] == "small"
+    # 低温但不为 0：改写贴着原问，同时保留一点随机性。
+    assert 0 < calls[0]["temperature"] < 1
 
 
-@pytest.mark.parametrize("response", ['{"queries": []}', "[]"])
-def test_rewrite_query_allows_empty_list(monkeypatch: pytest.MonkeyPatch, response: str) -> None:
+def test_rewrite_query_accepts_bare_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    service, _ = _service_returning(monkeypatch, '["What distribution do the entries of R follow?"]')
+
+    assert service.rewrite_query_for_retrieval("R 的元素服从什么分布？") == ["What distribution do the entries of R follow?"]
+
+
+@pytest.mark.parametrize("response", ['{"queries": []}', "[]", '{"rewrite_queries": ["x"]}'])
+def test_rewrite_query_rejects_response_without_queries(monkeypatch: pytest.MonkeyPatch, response: str) -> None:
     service, _ = _service_returning(monkeypatch, response)
-
-    assert service.rewrite_query_for_retrieval("What distribution do the entries of R follow?") == []
-
-
-def test_rewrite_query_rejects_response_without_queries_list(monkeypatch: pytest.MonkeyPatch) -> None:
-    service, _ = _service_returning(monkeypatch, '{"rewrite_queries": ["x"]}')
 
     with pytest.raises(ValueError):
         service.rewrite_query_for_retrieval("这个方法怎么做的？")
